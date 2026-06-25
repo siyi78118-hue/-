@@ -785,7 +785,23 @@ function openSend(){
   const p=buildPrompt();if(!p){toast('本步不需要发给 AI');return;}
   awaitingStep=AI_STEPS[S.step];
   $('sendText').value=p;copy(p);
-  $('sendModal').classList.add('on');toast('指令已复制，去粘给 Claude');
+  $('sendModal').classList.add('on');
+  const hint=$('sendHint');
+  if(location.protocol.startsWith('http')){
+    if(hint)hint.textContent='正在通过本地桥接自动发给 Claude…';
+    fetch('/__bridge/req',{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:p})
+      .then(r=>{if(!r.ok)throw 0;
+        toast('已自动发给 Claude，无需粘贴');
+        if(hint)hint.innerHTML='✅ 已通过<b>本地桥接</b>自动发给 Claude，<b>无需复制粘贴</b>。回到 Claude 说一句「<b>继续</b>」（若已开自动监听则什么都不用做），结果会自动填回本页。下面这段仅作备份，一般用不到。';
+      })
+      .catch(()=>{
+        toast('指令已复制，粘给 Claude 即可');
+        if(hint)hint.textContent='未检测到本地桥接。下面这段已复制到剪贴板，粘进和 Claude 的对话发送即可。（想免粘贴：用「启动桥接」打开本页）';
+      });
+  }else{
+    if(hint)hint.textContent='双击打开(file://)无法自动投递。下面这段已复制，粘给 Claude 即可。（想免粘贴：用「启动桥接」以 localhost 打开本页）';
+    toast('指令已复制，去粘给 Claude');
+  }
 }
 function applyAIResult(obj,quiet){
   const step=(obj&&obj._step)||awaitingStep;
