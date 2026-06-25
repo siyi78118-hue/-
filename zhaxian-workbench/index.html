@@ -1,0 +1,980 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>谪仙剧本工作台 · 剧本→提示词（即梦/Seedance）</title>
+<style>
+:root{
+  --bg:#0e1116; --card:#11161d; --panel:#141a22; --line:#1d2530;
+  --mint:#5CFFBA; --cyan:#4dd8ff; --lime:#C8FF00; --purple:#b794ff;
+  --amber:#f5a623; --pink:#ff6b9d; --gray:#6b7280; --base:#c2ccd6; --dim:#8794a3;
+  --c-line:#5CFFBA; --c-act:#4dd8ff; --c-emo:#b794ff; --c-cam:#C8FF00;
+  --c-orig:#6b7280; --c-sym:#f5a623; --c-sfx:#ff6b9d;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--base);font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",Segoe UI,sans-serif;
+  -webkit-font-smoothing:antialiased;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+button{font-family:inherit;cursor:pointer;border:none;border-radius:8px;transition:.12s}
+button:active{transform:translateY(1px)}
+input,textarea,select{font-family:inherit;background:#0b0f14;color:var(--base);border:1px solid var(--line);border-radius:8px;padding:8px 10px;outline:none}
+textarea{resize:vertical;width:100%;line-height:1.7}
+input:focus,textarea:focus,select:focus{border-color:var(--cyan)}
+.muted{color:var(--dim)}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:999px;background:#0b0f14;border:1px solid var(--line);color:var(--dim)}
+.pill{display:inline-block;font-size:11px;padding:2px 9px;border-radius:999px;background:rgba(92,255,186,.12);color:var(--mint);border:1px solid rgba(92,255,186,.3)}
+
+/* top bar */
+.topbar{height:54px;flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--line);z-index:20}
+.brand{font-weight:700;color:var(--mint);letter-spacing:.5px;white-space:nowrap}
+.brand small{color:var(--dim);font-weight:400;margin-left:6px}
+.topbar input.proj{width:200px}
+.savedot{width:8px;height:8px;border-radius:50%;background:var(--mint);box-shadow:0 0 6px var(--mint);display:inline-block}
+.spacer{flex:1}
+.btn{background:#0b0f14;color:var(--base);border:1px solid var(--line);padding:7px 13px;font-size:13px}
+.btn:hover{border-color:var(--cyan);color:#fff}
+.btn.mint{background:var(--mint);color:#06281c;border:none;font-weight:700}
+.btn.mint:hover{filter:brightness(1.08)}
+.btn.cyan{background:rgba(77,216,255,.14);color:var(--cyan);border:1px solid rgba(77,216,255,.35)}
+.btn.cyan:hover{background:rgba(77,216,255,.22)}
+.btn.ghost{background:transparent}
+.btn.sm{padding:4px 9px;font-size:12px}
+
+/* body layout */
+.body{flex:1;display:flex;min-height:0}
+.rail{flex:0 0 218px;background:var(--panel);border-right:1px solid var(--line);padding:14px 10px;overflow:auto}
+.progress{height:4px;background:var(--line);border-radius:3px;margin:2px 6px 14px;overflow:hidden}
+.progress > i{display:block;height:100%;background:var(--mint);width:0;transition:.3s}
+.step{display:flex;gap:10px;align-items:flex-start;padding:9px 10px;border-radius:9px;margin-bottom:3px;cursor:pointer;border-left:3px solid transparent}
+.step:hover{background:#0d1219}
+.step.active{background:#0d1219;border-left-color:var(--mint)}
+.step.locked{opacity:.42;cursor:not-allowed}
+.step .no{flex:0 0 22px;height:22px;border-radius:50%;display:grid;place-items:center;font-size:12px;background:#0b0f14;border:1px solid var(--line);color:var(--dim)}
+.step.done .no{background:rgba(92,255,186,.16);border-color:var(--mint);color:var(--mint)}
+.step.active .no{border-color:var(--mint);color:var(--mint)}
+.step .lbl{font-size:13px;line-height:1.35;padding-top:1px}
+.step .lbl b{display:block;color:var(--base);font-weight:600}
+.step.active .lbl b{color:#fff}
+.step .lbl span{font-size:11px;color:var(--dim)}
+.railnav{display:flex;gap:8px;margin:14px 6px 4px}
+.railnav .btn{flex:1;justify-content:center;text-align:center}
+
+.main{flex:1;min-width:0;overflow:auto;padding:22px 26px 90px}
+.head h1{margin:0 0 4px;font-size:21px;color:#fff}
+.head p{margin:0 0 18px;color:var(--dim);max-width:760px}
+.help{display:inline-block;margin-left:8px;font-size:12px;color:var(--cyan);border:1px solid rgba(77,216,255,.3);border-radius:999px;padding:1px 9px;cursor:help}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+.card h3{margin:0 0 10px;font-size:15px;color:#fff}
+.row{display:flex;gap:14px;flex-wrap:wrap}
+.col{flex:1;min-width:280px}
+label.fl{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:1000px){.two{grid-template-columns:1fr}}
+
+/* dialogue options */
+.line-block{border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px;background:#0d1219}
+.line-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}
+.char-chip{font-size:12px;padding:2px 9px;border-radius:999px;background:rgba(77,216,255,.13);color:var(--cyan);border:1px solid rgba(77,216,255,.3)}
+.orig-line{color:var(--gray);text-decoration:line-through;font-size:13px;margin-bottom:8px}
+.opts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+@media(max-width:900px){.opts{grid-template-columns:1fr}}
+.opt{border:1px solid var(--line);border-radius:9px;padding:9px 11px;cursor:pointer;background:#0b0f14;font-size:13px;color:var(--base)}
+.opt:hover{border-color:var(--mint)}
+.opt.sel{border-color:var(--mint);background:rgba(92,255,186,.08);color:#fff}
+.opt .k{font-size:11px;color:var(--dim);display:block;margin-bottom:3px}
+.opt.sel .k{color:var(--mint)}
+.selfedit{margin-top:8px}
+
+/* char / move */
+.char-card{border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:10px;background:#0d1219}
+.char-card .nm{font-weight:600;color:#fff}
+.move-grid{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.move-opt{font-size:12px;padding:4px 10px;border-radius:999px;border:1px solid var(--line);background:#0b0f14;color:var(--dim);cursor:pointer}
+.move-opt.on{border-color:var(--cyan);color:var(--cyan);background:rgba(77,216,255,.12)}
+
+/* beat list generic */
+.beat{border:1px solid var(--line);border-radius:11px;margin-bottom:13px;background:var(--card);overflow:hidden}
+.beat>.bh{display:flex;align-items:center;gap:8px;padding:9px 13px;background:#0d1219;border-bottom:1px solid var(--line)}
+.beat .bh .sc{color:var(--dim);font-size:12px}
+.beat .bd{padding:13px}
+.mode-wen{color:var(--cyan)} .mode-wu{color:var(--lime)}
+.kv{margin:0 0 6px} .kv .k{color:var(--dim);font-size:12px;margin-right:6px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.suggest{font-size:12px;color:var(--purple);background:rgba(183,148,255,.1);border:1px solid rgba(183,148,255,.25);border-radius:7px;padding:5px 9px;margin:3px 0;cursor:pointer}
+.suggest:hover{background:rgba(183,148,255,.2)}
+.warnbox{border:1px solid rgba(245,166,35,.4);background:rgba(245,166,35,.08);color:var(--amber);border-radius:9px;padding:9px 12px;font-size:13px;margin:8px 0}
+.okbox{border:1px solid rgba(92,255,186,.35);background:rgba(92,255,186,.07);color:var(--mint);border-radius:9px;padding:9px 12px;font-size:13px;margin:8px 0}
+
+/* AI bridge bar */
+.actionbar{position:fixed;left:218px;right:0;bottom:0;height:62px;background:var(--panel);border-top:1px solid var(--line);
+  display:flex;align-items:center;gap:12px;padding:0 22px;z-index:15}
+.actionbar .qa{flex:1;font-size:12px;color:var(--dim);display:flex;gap:14px;flex-wrap:wrap}
+.qa b{font-weight:600}
+.qa .ok{color:var(--mint)} .qa .bad{color:var(--amber)}
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;z-index:50}
+.modal-bg.on{display:flex}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;width:min(680px,92vw);max-height:86vh;overflow:auto}
+.modal h3{margin:0 0 6px;color:#fff}
+.modal textarea{height:200px;font-size:12px;font-family:ui-monospace,Consolas,monospace}
+.toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#0b0f14;border:1px solid var(--mint);color:var(--mint);
+  padding:10px 18px;border-radius:10px;z-index:99;opacity:0;transition:.25s;pointer-events:none;box-shadow:0 6px 24px rgba(0,0,0,.5)}
+.toast.show{opacity:1}
+.toast.err{border-color:var(--amber);color:var(--amber)}
+
+/* legend + final */
+.legend{position:sticky;top:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 12px;display:flex;gap:14px;flex-wrap:wrap;align-items:center;z-index:5;margin-bottom:14px}
+.legend .li{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--dim)}
+.legend .sw{width:13px;height:13px;border-radius:4px}
+.legend .toggles{margin-left:auto;display:flex;gap:8px}
+.scene-final{margin-bottom:20px}
+.scene-title{color:var(--mint);font-weight:700;font-size:16px;border-bottom:1px solid var(--line);padding-bottom:6px;margin:18px 0 12px;display:flex;justify-content:space-between;align-items:baseline}
+.scene-title .env{font-size:12px;color:var(--dim);font-weight:400}
+.seg{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:13px 15px;margin-bottom:12px}
+.seg-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.shot{border-left:2px solid var(--line);padding:5px 0 5px 12px;margin:8px 0}
+.shot .shotno{font-size:12px;color:var(--dim);margin-right:8px}
+.c-line{color:var(--c-line);background:rgba(92,255,186,.1);border-radius:3px;padding:1px 5px}
+.c-act{color:var(--c-act);background:rgba(77,216,255,.1);border-radius:3px;padding:1px 5px}
+.c-emo{color:var(--c-emo);background:rgba(183,148,255,.12);border-radius:3px;padding:1px 5px}
+.c-cam{color:var(--c-cam);background:rgba(200,255,0,.1);border-radius:3px;padding:1px 4px;font-weight:600}
+.c-sfx{color:var(--c-sfx);background:rgba(255,107,157,.1);border-radius:3px;padding:1px 5px}
+.c-sym{color:var(--c-sym)}
+.c-orig{color:var(--c-orig);text-decoration:line-through;font-size:12px;margin-left:6px}
+.hide-orig .c-orig{display:none}
+.pure .c-line,.pure .c-act,.pure .c-emo,.pure .c-cam,.pure .c-sfx{background:none;color:var(--base);padding:0;font-weight:400}
+.pure .c-orig{display:none}
+.pure .c-sym{color:var(--base)}
+.copyseg{float:right}
+.empty{color:var(--dim);text-align:center;padding:40px;border:1px dashed var(--line);border-radius:12px}
+code.k{background:#0b0f14;border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:var(--cyan);font-family:ui-monospace,Consolas,monospace;font-size:12px}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">谪仙剧本工作台<small>剧本 → 提示词 · 即梦/Seedance</small></div>
+  <input class="proj" id="projName" placeholder="未命名剧本" title="工程名（点改）">
+  <span class="savedot" id="saveDot" title="已自动保存到本机"></span>
+  <div class="spacer"></div>
+  <button class="btn cyan sm" id="btnPreset">⚙ 预设</button>
+  <button class="btn ghost sm" id="btnLegend">🎨 配色说明</button>
+  <button class="btn sm" id="btnImport">📥 导入工程</button>
+  <button class="btn sm" id="btnExportJson">💾 导出工程</button>
+  <button class="btn cyan sm" id="btnExportHtml">📤 导出成片HTML</button>
+  <button class="btn ghost sm" id="btnReset" title="清空重来">↺</button>
+  <input type="file" id="fileImport" accept=".json,application/json" style="display:none">
+</div>
+
+<div class="body">
+  <div class="rail">
+    <div class="progress"><i id="progFill"></i></div>
+    <div id="stepNav"></div>
+    <div class="railnav">
+      <button class="btn sm" id="btnPrev">← 上一步</button>
+      <button class="btn mint sm" id="btnNext">下一步 →</button>
+    </div>
+  </div>
+  <div class="main" id="main"></div>
+</div>
+
+<div class="actionbar" id="actionbar">
+  <button class="btn cyan" id="btnSend" style="display:none">✨ 发给 AI（本步）</button>
+  <button class="btn" id="btnRead" style="display:none">📥 读取 AI 结果</button>
+  <div class="qa" id="qaStrip"></div>
+</div>
+
+<!-- send modal -->
+<div class="modal-bg" id="sendModal">
+  <div class="modal">
+    <h3>把这段指令发给 AI（Claude）</h3>
+    <p class="muted" id="sendHint">下面这段已自动复制到剪贴板。粘贴进和 Claude 的对话框发送即可（第①步可连同剧本 Word 文档一起拖给 Claude）。Claude 会把结果写进 <code class="k">谪仙工程/ai-out.json</code>，然后你回来点【读取 AI 结果】。</p>
+    <textarea id="sendText" readonly></textarea>
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn mint" id="btnCopySend">复制指令</button>
+      <button class="btn" id="btnDownSend">下载为 .txt</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btnCloseSend">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- paste/read modal -->
+<div class="modal-bg" id="readModal">
+  <div class="modal">
+    <h3>读取 AI 的结果</h3>
+    <p class="muted">优先自动从 <code class="k">谪仙工程/ai-out.json</code> 读取（需用预览服务器 localhost:8765 打开本页）。读不到时，把 Claude 回复里的 JSON 整段粘到下面再「解析」。</p>
+    <div class="okbox" id="readAuto" style="display:none"></div>
+    <textarea id="readText" placeholder="把 Claude 返回的 JSON 粘贴到这里…"></textarea>
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn cyan" id="btnAutoRead">⟳ 自动从文件读取</button>
+      <button class="btn mint" id="btnParseRead">解析并套用</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btnCloseRead">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- import paste modal -->
+<div class="modal-bg" id="importModal">
+  <div class="modal">
+    <h3>导入工程</h3>
+    <p class="muted">从 .json 工程文件恢复进度。也可直接粘贴工程 JSON。</p>
+    <div style="display:flex;gap:10px;margin-bottom:10px">
+      <button class="btn" id="btnPickFile">选择 .json 文件</button>
+    </div>
+    <textarea id="importText" placeholder="或粘贴工程 JSON…"></textarea>
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn mint" id="btnDoImport">导入</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btnCloseImport">关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- preset modal -->
+<div class="modal-bg" id="presetModal">
+  <div class="modal" style="width:min(820px,94vw)">
+    <h3>⚙ 预设管理</h3>
+    <p class="muted">这些预设随工程一起导入 / 导出。每步发给 AI 时会自动把对应预设拼进指令。每个框可直接粘贴，或把 <code class="k">.md / .txt</code> 拖进去。某步「特供预设」留空时，自动回退到对应的全局预设。</p>
+    <div id="presetForm"></div>
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn" id="btnPresetClearStep">清空所有特供</button>
+      <div class="spacer"></div>
+      <button class="btn ghost" id="btnClosePreset">关闭</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+/* ============================================================
+   谪仙剧本工作台 —— 本地单文件工具，不联网、不调 API。
+   依据《Doubao Seedance 2.0 系列提示词指南》。
+   ============================================================ */
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const uid=p=>p+Math.random().toString(36).slice(2,7);
+function toast(m,err){const t=$('toast');t.textContent=m;t.className='toast show'+(err?' err':'');clearTimeout(t._t);t._t=setTimeout(()=>t.className='toast',2200);}
+
+/* ---------- Seedance 规则资料（来自指南，做提示/校验/候选） ---------- */
+const EMOTION_TABLE=[
+ {emotion:"悲伤",external:"低头、肩膀微微颤抖、眼眶泛红、手指无意识地攥紧衣角、泪水在眼眶里打转但没有落下",tag:"官方"},
+ {emotion:"喜悦",external:"嘴角抑制不住地上扬、眉眼舒展、脚步变得轻快、下意识地哼起小曲、忍不住原地转个圈",tag:"官方"},
+ {emotion:"紧张/焦虑",external:"频繁地看手表、手指不停敲击桌面、呼吸急促、眼神闪躲、无意识地啃咬指甲",tag:"官方"},
+ {emotion:"愤怒",external:"双拳紧握、下颌线紧绷、胸口剧烈起伏、眼神如刀般锐利、从牙缝里挤出话语",tag:"官方"},
+ {emotion:"释然",external:"长长地舒了一口气、紧绷的肩膀完全放松下来、脸上露出久违的淡淡的微笑、抬头望向远方",tag:"官方"},
+ {emotion:"决绝",external:"抿紧嘴唇、缓缓闭眼再睁开、眼神由动摇转为坚定、指节因握紧而泛白、一字一顿地开口、转身时步伐不再回头",tag:"扩展"},
+ {emotion:"悲悯",external:"眉头轻蹙、目光低垂柔和、缓缓伸手虚扶、嘴唇微动似有不忍、眼底泛起一层薄薄水光",tag:"扩展"},
+ {emotion:"孤傲",external:"下巴微微抬起、脊背挺直、目光平视前方不与人对视、嘴角一抹若有若无的冷意、负手而立衣袂不动",tag:"扩展"},
+ {emotion:"震惊",external:"瞳孔骤然收缩、上身向后微仰、呼吸一滞、张口却说不出话、手指僵在半空",tag:"扩展"},
+ {emotion:"隐忍",external:"喉结轻轻滚动、牙关微咬使下颌线绷紧、垂在身侧的手缓缓收成拳又松开、眼神压低、长长地吐出一口气",tag:"扩展"},
+ {emotion:"杀意",external:"眼神骤冷如寒潭、瞳孔微缩锁定目标、握剑的手指缓缓收紧、嘴角下压、周身气息陡然一沉",tag:"扩展"},
+ {emotion:"惊惧",external:"脸色发白、瞳孔放大、身体不自觉后退半步、双手微微发抖、呼吸又急又浅、声音发颤",tag:"扩展"},
+ {emotion:"释怀",external:"眉眼缓缓舒展、轻轻摇头自嘲一笑、肩头一松、抬眼望向远方目光清澈平和、轻声叹息后嘴角带笑",tag:"扩展"},
+];
+const MOVE_TYPES=[
+ {k:"walk",label:"步行",hint:"凡人 / 隐于市的谪仙：缓步前行、脚步随心境、双手自然摆动"},
+ {k:"immortal_art",label:"仙法(御剑/踏云/御风)",hint:"高阶仙侠：足尖轻点、身形缓缓升起、衣袂随气流轻摆——写成稳立微移而非狂掠"},
+ {k:"ride",label:"乘骑/乘灵兽",hint:"有坐骑：缓缓勒马、俯身轻拍兽颈，坐骑缓步而非狂奔"},
+ {k:"prop",label:"法器代步(莲台/纸伞/飞舟)",hint:"立于法器悬浮缓移，法器流光缓缓流转，衣袂轻轻向后"},
+ {k:"teleport",label:"瞬移(缩地成寸/虚空挪移)",hint:"拆成 起步—虚化—落定 三拍，缓慢自然虚化重聚、无无序跳变"},
+ {k:"run",label:"奔跑(快步)",hint:"指南规避狂奔——一律写成快步/疾步、到位自然收步站定"},
+ {k:"other",label:"其他/遁术/神识",hint:"土水火遁、神识分身等：本体静止+元素或虚影缓缓析出位移"},
+];
+const MOVE_EXAMPLE={
+ walk:"缓步穿过市集，脚步从容、双手拢于袖中，从驻足凝望自然过渡到迈步前行，衣摆扫过街边摊布",
+ immortal_art:"足尖并拢轻点青色飞剑，单手虚拢宽袖、下颌微抬，身形稳立缓缓向前平移，长袍下摆与束发流苏被气流轻轻向后拖曳",
+ ride:"轻抖缰绳，骏马从静立缓缓起步、四蹄缓步踏过石板，鬃毛随步伐轻摆，身随马背微微起伏",
+ prop:"立于缓缓旋转的青纸伞下，单手拢袖、身形稳立，伞面托着人悬浮平移，伞下流苏被气流轻轻向后拂动",
+ teleport:"前脚缓缓抬起轻踏向前一步，身形边缘化作淡淡光尘缓慢虚化飘散，随即在数丈外轻轻落定、衣袍下摆缓缓垂落归位",
+ run:"快步小跑趋近（疾步而非狂奔），提着衣摆、呼吸略促，到三步外自然收步站定",
+ other:"身形缓缓侧倾，脚下泥土缓缓翻涌包裹、人影渐没，随即数步外缓缓升起凝形、抖落肩头浮土",
+};
+const CAM_SIZES=["远景","全景","中景","近景","特写","大特写"];
+const CAM_MOVES=["固定机位","缓慢推近","缓慢拉远","平稳横移","平稳跟拍","环绕","俯拍","仰拍","手持跟拍","无人机俯瞰","镜头切至…"];
+const CAM_VERBS=["推","拉","摇","移","跟","环绕","俯","仰"]; // 运镜动词，命中≥2 即一镜多运镜
+function multiMove(s){s=s||'';let n=0;CAM_VERBS.forEach(v=>{if(s.indexOf(v)>=0)n++;});return n>1;}
+const HOT_WORDS=["狂奔","狂飙","飞奔","大跳","纵身","凌空翻","翻滚","急速翻","暴冲","疾冲","腾空翻腾","狂掠"]; // 高爆发禁忌
+const STEP_HINTS={
+ 1:"把你按《剧本预设》写好的剧本（Word 文档）拖给 Claude，连同本步指令发给它；Claude 按预设解析成「小集→段」结构写回，点【读取 AI 结果】回填。也可在下方粘贴纯文本剧本兜底。",
+ 2:"给每个段设计「怎么演」的动作（文戏细微动作 / 打戏招式 / 位移）。规则以你在「⚙ 预设」里放的提示词预设（或本步特供预设）为准。",
+ 3:"把抽象情绪换成能被镜头看见的身体细节（眼 / 嘴 / 眉 / 头 / 手）。规则以提示词预设（或本步特供预设）为准。",
+ 4:"精修每句台词：每句给多个方案任你挑，或自己改。这一步只优化台词措辞，不动剧情。",
+ 5:"给每个段排镜头：景别 + 运镜 + 主体动作 + 空间变化 + 音频。规则以提示词预设（或本步特供预设）为准。",
+ 6:"把每段拼成《提示词预设》的五块结构（〔段X〕/ 风格与氛围 / 叙事概要 / 动态描述 / 静态描述 / 技术tag），按小集分集导出，可投喂即梦 / Seedance。",
+};
+const STEP_NAMES=[
+ ["录入·解析","剧本(Word)→小集/段结构"],
+ ["动作设计","文戏·打戏·位移"],
+ ["表情·情绪外化","抽象情绪→身体细节"],
+ ["台词精修","多方案任挑 / 自己改"],
+ ["运镜设计","景别+一镜一运镜"],
+ ["分集出成片","五块提示词 / 按小集导出"],
+];
+const AI_STEPS={1:"parse",2:"action",3:"emotion",4:"dialogue",5:"camera",6:"compile"};
+const STEP_PRESET_SRC={parse:"script",action:"prompt",emotion:"prompt",dialogue:"prompt",camera:"prompt",compile:"prompt"}; // 该步特供为空时回退到的全局预设
+
+/* ---------- 给 AI 的任务模板 ----------
+   注意：具体规则正文不再写死在这里，而是由「⚙ 预设」里你放的预设提供，
+   buildPrompt() 会把对应预设拼到指令头部。下面只保留"本步要干什么 + 输出 schema 约束"。 */
+const T={};
+T.parse=
+"【本步任务：录入·解析】通读我提供的剧本（已按《剧本预设》分好小集 / 段），按预设把它解析成工程 JSON。\n"+
+"- scenes[] = 小集（id S1.., name, summary, beats[]）。\n"+
+"- beats[] = 段（id B1.., mode 'wen'|'wu', hook '🎣'|'💥'|'', narration 客观一句概述, "+
+"presence[] 在场状态[{char,pos,action}], picture 画面块原文(动作领起·台词紧贴), "+
+"lines[] 台词[{id,char,orig,options:[],pick:-1,final:'',lang}]）。\n"+
+"- characters[] = 人物（id C1.., name, bio, moveStyle{primary,desc,appearance}）。\n"+
+"- 台词原文进 lines[].orig，标说话人 char（人物 id 或 NA 旁白）；本步不改台词。\n"+
+"- 给每个 scene/character/beat/line 稳定 id，后续靠它合并；beat 的 actions/emotions/camera 留空数组、compiled 留空对象。\n"+
+"输出完整 JSON（schemaVersion/meta/characters/scenes）。";
+
+T.dialogue=
+"【本步任务：台词精修】对 scenes[].beats[].lines[] 里每条有 orig 的台词，结合该说话人 bio，"+
+"生成多个（建议 3 个）精修方案填入 options，pick 置 -1、final 暂等于 options[0]。\n"+
+"忠于原意、贴合人物、语言统一、适合配音口播（常用字、避开多音字 / 生僻字）；台词只给纯文本不带符号。\n"+
+"只回传整个工程 JSON 对象，只改各 line 的 options/pick/final，其余字段原样保留。";
+
+T.action=
+"【本步任务：动作设计】按【本步预设】的动作规则，为每个 beat 设计动作写进 beats[].actions："+
+"{wen:[]文戏细微动作, fight:[]打戏招式, run:[]奔跑类, move:[{char,from,to,how,desc}]位移}。\n"+
+"只回传整个工程 JSON 对象，只填 / 改各 beat 的 actions，其余原样保留。";
+
+T.emotion=
+"【本步任务：表情·情绪外化】按【本步预设】，把每个 beat 里各人物的抽象情绪换成可被镜头看见的身体细节，"+
+"写进 beats[].emotions：[{char,abstract,external}]。\n"+
+"只回传整个工程 JSON 对象，只填 / 改各 beat 的 emotions，其余原样保留。";
+
+T.camera=
+"【本步任务：运镜设计】按【本步预设】的运镜规则（景别+运镜双对比、一镜一运镜、音频符号 {}<>（）等），"+
+"为每个 beat 排镜头写进 beats[].camera：[{shot,size,move,subjectAction,spaceChange,audio,cut}]。\n"+
+"只回传整个工程 JSON 对象，只填 / 改各 beat 的 camera，其余原样保留。";
+
+T.compile=
+"【本步任务：分集出成片】按【本步预设】（提示词预设的全部条款与自检），把每个 beat 综合其 "+
+"presence/actions/emotions/lines(final)/camera，拼成五块提示词写进 beats[].compiled：\n"+
+"{title, styleAtmos, summary, dynamic, static, techTag}。\n"+
+"- title = 段标题，格式『〔段X · 起止秒数〕段名 · 副名』（X 用中文数字；秒数每段 15s 顺排 0–15 秒 / 15–30 秒…；钩子🎣 / 爆点💥 标末尾，若有）。\n"+
+"- styleAtmos=风格与氛围；summary=叙事概要；dynamic=动态描述（镜头 + 台词 {} 嵌入此块）；static=静态描述；techTag=技术 tag。\n"+
+"- 段号 X 每个小集内部独立从『段一』起。\n"+
+"只回传整个工程 JSON 对象，只填 / 改各 beat 的 compiled，其余原样保留。";
+
+/* ---------- 状态 ---------- */
+const AIPATH="谪仙工程/ai-out.json";
+function blankPresets(){return{script:"",prompt:"",steps:{parse:"",action:"",emotion:"",dialogue:"",camera:"",compile:""}};}
+function blankState(){return{pid:uid('P'),schemaVersion:"1.1",
+  meta:{title:"未命名剧本",genre:"仙侠·谪仙",logline:"",lang:"zh",
+    styleNote:"3D国漫CG仙侠风格，冷调低饱和，电影胶片质感，光影柔和，高清细节丰富",
+    constraints:["保持无字幕，避免生成任何文字或字幕","不要生成Logo","不要生成水印","人物面部和身体比例稳定不变形，全程禁止出现外形着装完全一致的人物，禁止双胞胎分身"]},
+  presets:blankPresets(),
+  characters:[],scenes:[],rawScript:"",rawCharacters:"",step:1};}
+/* 兼容旧工程：补齐 presets 字段 */
+function ensurePresets(){if(!S.presets||typeof S.presets!=='object')S.presets=blankPresets();
+  if(!S.presets.steps)S.presets.steps={};
+  ['parse','action','emotion','dialogue','camera','compile'].forEach(k=>{if(typeof S.presets.steps[k]!=='string')S.presets.steps[k]='';});
+  if(typeof S.presets.script!=='string')S.presets.script='';
+  if(typeof S.presets.prompt!=='string')S.presets.prompt='';
+  if(!(S.step>=1))S.step=1;
+  if(S.step>STEP_NAMES.length)S.step=STEP_NAMES.length;}
+/* 取某步生效的预设：本步特供非空则用它，否则回退对应全局 */
+function presetFor(step){const sp=(S.presets&&S.presets.steps&&S.presets.steps[step]||'').trim();
+  if(sp)return sp;
+  const src=STEP_PRESET_SRC[step]||'prompt';
+  return (S.presets&&S.presets[src]||'').trim();}
+let S=load()||blankState();
+if(!S.pid)S.pid=uid('P');
+ensurePresets();
+let awaitingStep=null, lastHash="";
+
+function save(){try{if(!S.pid)S.pid=uid('P');localStorage.setItem('zhaxian:'+S.pid,JSON.stringify(S));
+  $('saveDot').style.opacity=1;}catch(e){}}
+function load(){try{
+  // 优先上次激活的工程
+  const last=localStorage.getItem('zhaxian:__last');
+  if(last){const v=localStorage.getItem('zhaxian:'+last);if(v)return JSON.parse(v);}
+  // 否则任意一个
+  for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k.startsWith('zhaxian:')&&k!=='zhaxian:__last')return JSON.parse(localStorage.getItem(k));}
+}catch(e){}return null;}
+function persist(){if(!S.pid)S.pid=uid('P');localStorage.setItem('zhaxian:__last',S.pid);save();}
+
+/* ---------- 渲染调度 ---------- */
+function render(){
+  $('projName').value=S.meta.title||'';
+  renderRail();
+  const m=$('main');m.scrollTop;
+  const fn=[null,viewParse,viewAction,viewEmotion,viewDialogue,viewCamera,viewCompile][S.step]||viewParse;
+  m.innerHTML='';m.appendChild(fn());
+  // action bar
+  const ai=AI_STEPS[S.step];
+  $('btnSend').style.display=ai?'':'none';
+  $('btnRead').style.display=ai?'':'none';
+  $('btnSend').textContent= S.step===1?'✨ 发给 AI：解析剧本':'✨ 发给 AI（本步）';
+  renderQA();
+  persist();
+}
+function renderRail(){
+  const nav=$('stepNav');nav.innerHTML='';
+  const unlocked=maxUnlocked();
+  STEP_NAMES.forEach((s,i)=>{const n=i+1;
+    const d=document.createElement('div');
+    d.className='step'+(n===S.step?' active':'')+(n<S.step?' done':'')+(n>unlocked?' locked':'');
+    d.innerHTML=`<div class="no">${n<S.step?'✓':n}</div><div class="lbl"><b>${esc(s[0])}</b><span>${esc(s[1])}</span></div>`;
+    if(n<=unlocked)d.onclick=()=>{S.step=n;render();};
+    nav.appendChild(d);});
+  $('progFill').style.width=Math.round((S.step-1)/(STEP_NAMES.length-1)*100)+'%';
+}
+function maxUnlocked(){
+  // 没解析只开第①步；解析出小集/段后②~⑥全部解锁，方便乱序补内容（有意不做渐进门槛）。
+  return S.scenes.length?STEP_NAMES.length:1;
+}
+function hasOptions(){return S.scenes.some(sc=>sc.beats.some(b=>b.lines.some(l=>l.options&&l.options.length)));}
+function eachBeat(fn){let i=0;S.scenes.forEach(sc=>sc.beats.forEach(b=>fn(b,sc,i++)));}
+function charName(id){const c=S.characters.find(c=>c.id===id||c.name===id);return c?c.name:(id==='NA'?'旁白':id);}
+
+/* ================= 步骤①：录入 · 解析 ================= */
+function viewParse(){
+  const w=el(`<div>
+   <div class="head"><h1>① 录入 · 解析剧本 <span class="help" title="${esc(STEP_HINTS[1])}">这步在干嘛？</span></h1>
+   <p>${esc(STEP_HINTS[1])}</p></div>`);
+  // 预设就绪提示
+  if(!presetFor('parse'))w.appendChild(el(`<div class="warnbox">还没设置《剧本预设》。点右上角 <b>⚙ 预设</b> 把"剧本预设"全文粘进去（或给本步特供预设），AI 才知道按什么规则解析。</div>`));
+  // 元信息
+  const meta=el(`<div class="card"><h3>工程信息</h3>
+    <div class="two">
+      <div><label class="fl">剧名</label><input id="mTitle" value="${esc(S.meta.title)}"></div>
+      <div><label class="fl">题材</label><input id="mGenre" value="${esc(S.meta.genre)}"></div>
+    </div>
+    <label class="fl">一句话梗概 logline</label><input id="mLog" value="${esc(S.meta.logline)}">
+    <div class="two">
+      <div><label class="fl">台词统一语言（不可中英混用）</label>
+        <select id="mLang">${["zh中文","en英文","ja日语","ko韩语","other其他"].map(o=>`<option value="${o.slice(0,2)}" ${S.meta.lang===o.slice(0,2)?'selected':''}>${o.slice(2)}</option>`).join('')}</select></div>
+      <div><label class="fl">全局风格/画质约束词（收尾用）</label><input id="mStyle" value="${esc(S.meta.styleNote)}"></div>
+    </div></div>`);
+  // 录入：主路径 Word→Claude；兜底粘贴
+  const inp=el(`<div class="card"><h3>录入剧本</h3>
+    <div class="okbox" style="margin-top:0">主路径：把你按《剧本预设》写好的<b>剧本 Word 文档拖给 Claude</b>，连同底部「✨ 发给 AI：解析剧本」复制出的指令一起发送 → Claude 解析后写回 → 点「📥 读取 AI 结果」回填。</div>
+    <div id="dropZone" style="border:1px dashed var(--line);border-radius:10px;padding:14px;text-align:center;color:var(--dim);font-size:13px;margin:6px 0 10px">把 <b>.txt / .md</b> 剧本拖到这里读入（.docx 请直接拖给 Claude）</div>
+    <label class="fl">📜 剧本原文（兜底：没用 Word 时把纯文本粘这里，会随指令发给 AI）</label>
+    <textarea id="rawScript" style="height:200px" placeholder="把整本/整集（v2.2 格式）剧本粘到这里…">${esc(S.rawScript)}</textarea>
+    <label class="fl">👤 补充人物小传（可选）</label>
+    <textarea id="rawChar" style="height:90px" placeholder="如：沈砚——谪仙剑修，清冷克制，修为高，话少…">${esc(S.rawCharacters)}</textarea>
+  </div>`);
+  w.append(meta,inp);
+  // 已解析结构预览 + 台词核对
+  if(S.scenes.length){w.appendChild(renderStructurePreview());w.appendChild(renderLineCheck());}
+  // 绑定
+  setTimeout(()=>{
+    bindInput('mTitle',v=>S.meta.title=v);bindInput('mGenre',v=>S.meta.genre=v);
+    bindInput('mLog',v=>S.meta.logline=v);bindInput('mStyle',v=>S.meta.styleNote=v);
+    $('mLang').onchange=e=>{S.meta.lang=e.target.value;save();};
+    bindInput('rawScript',v=>S.rawScript=v);bindInput('rawChar',v=>S.rawCharacters=v);
+    const dz=$('dropZone');if(dz){
+      dz.ondragover=e=>{e.preventDefault();dz.style.borderColor='var(--cyan)';};
+      dz.ondragleave=()=>{dz.style.borderColor='var(--line)';};
+      dz.ondrop=e=>{e.preventDefault();dz.style.borderColor='var(--line)';const f=e.dataTransfer.files[0];if(!f)return;
+        if(/\.(docx|doc)$/i.test(f.name)){toast('网页暂不解析 .docx，请把它直接拖给 Claude',1);return;}
+        const rd=new FileReader();rd.onload=()=>{S.rawScript=rd.result;save();render();toast('已读入：'+f.name);};rd.readAsText(f);};
+    }
+  },0);
+  return w;
+}
+function renderStructurePreview(){
+  const c=el(`<div class="card"><h3>✓ 已解析结构（${S.scenes.length} 小集 · ${countBeats()} 个段 · ${S.characters.length} 人物）</h3></div>`);
+  S.scenes.forEach(sc=>{
+    const box=el(`<div style="margin-bottom:10px"><div style="color:var(--mint);font-weight:600">${esc(sc.name)} <span class="muted" style="font-weight:400">${esc(sc.summary||'')}</span></div></div>`);
+    sc.beats.forEach((b,i)=>{box.appendChild(el(`<div style="padding:5px 0 5px 12px;border-left:2px solid var(--line);margin:5px 0">
+      <span class="tag" style="color:${b.mode==='wu'?'var(--lime)':'var(--cyan)'}">段${i+1} · ${b.mode==='wu'?'武戏·分段':'文戏·长镜头'}${b.hook?' '+esc(b.hook):''}</span>
+      <span class="muted">${esc(b.narration)}</span>
+      ${(b.lines||[]).filter(l=>l.orig).map(l=>`<div style="margin:3px 0 0 4px"><span class="char-chip">${esc(charName(l.char))}</span> <span style="color:var(--base)">${esc(l.orig)}</span></div>`).join('')}
+    </div>`));});
+    c.appendChild(box);
+  });
+  return c;
+}
+function countBeats(){let n=0;eachBeat(()=>n++);return n;}
+
+/* 台词核对（折叠进①）：核对说话人归属、改/补/删台词 */
+function renderLineCheck(){
+  const wrap=el(`<div class="card"><h3>🗣 台词核对（核对说话人归属，可改说话人 / 补 / 删）</h3></div>`);
+  const speakerOpts=()=>S.characters.map(c=>c.name).concat(['旁白']);
+  const setSpeaker=(l,name)=>{if(name==='旁白'){l.char='NA';}else{const c=S.characters.find(c=>c.name===name);l.char=c?c.id:name;}};
+  S.characters.forEach(c=>{
+    const lines=[];eachBeat(b=>b.lines.forEach(l=>{if(l.char===c.id||l.char===c.name)lines.push({l,b});}));
+    const card=el(`<div class="char-card"><div class="nm">${esc(c.name)} <span class="tag">${esc((MOVE_TYPES.find(m=>m.k===(c.moveStyle&&c.moveStyle.primary))||{}).label||'移动方式未定')}</span></div>
+      <div class="muted" style="font-size:12px;margin:3px 0 8px">${esc(c.bio||'（无小传）')}</div></div>`);
+    if(!lines.length)card.appendChild(el(`<div class="muted" style="font-size:12px">— 本角色暂无台词 —</div>`));
+    lines.forEach(({l,b})=>{
+      const r=el(`<div class="line-block"></div>`);
+      const head=el(`<div class="line-head"></div>`);
+      const sp=sel(speakerOpts(),c.name,v=>{setSpeaker(l,v);save();render();});sp.style.width='130px';
+      const del=el(`<button class="btn ghost sm" style="margin-left:auto">✕ 删除</button>`);
+      del.onclick=()=>{const i=b.lines.indexOf(l);if(i>=0)b.lines.splice(i,1);save();render();};
+      head.append('说话人 ',sp,del);r.appendChild(head);
+      const ta=el(`<textarea style="height:46px">${esc(l.orig)}</textarea>`);
+      ta.oninput=()=>{l.orig=ta.value;save();};
+      r.appendChild(ta);card.appendChild(r);
+    });
+    const add=el(`<button class="btn ghost sm">+ 给「${esc(c.name)}」补一句台词</button>`);
+    add.onclick=()=>{let tb=null;eachBeat(b=>{if(!tb&&b.lines.some(l=>l.char===c.id||l.char===c.name))tb=b;});if(!tb)eachBeat(b=>{if(!tb)tb=b;});if(!tb){toast('请先解析出小集/段',1);return;}tb.lines.push({id:uid('L'),char:c.id,orig:'',options:[],pick:-1,final:'',lang:S.meta.lang});save();render();};
+    card.appendChild(add);
+    wrap.appendChild(card);
+  });
+  // 旁白/未归类
+  const na=[];eachBeat(b=>b.lines.forEach(l=>{if(!S.characters.find(c=>c.id===l.char||c.name===l.char))na.push({l,b});}));
+  if(na.length){const card=el(`<div class="char-card"><div class="nm">旁白 / 未归类台词</div></div>`);
+    na.forEach(({l,b})=>{const r=el(`<div class="line-block"></div>`);
+      const head=el(`<div class="line-head"></div>`);
+      const sp=sel(speakerOpts(),'旁白',v=>{setSpeaker(l,v);save();render();});sp.style.width='130px';
+      const del=el(`<button class="btn ghost sm" style="margin-left:auto">✕ 删除</button>`);del.onclick=()=>{const i=b.lines.indexOf(l);if(i>=0)b.lines.splice(i,1);save();render();};
+      head.append('归属 ',sp,del);r.appendChild(head);
+      const ta=el(`<textarea style="height:42px">${esc(l.orig)}</textarea>`);ta.oninput=()=>{l.orig=ta.value;save();};r.appendChild(ta);card.appendChild(r);});
+    wrap.appendChild(card);}
+  return wrap;
+}
+
+/* ================= 步骤④：台词精修 · 多方案 ================= */
+function viewDialogue(){
+  const w=el(`<div><div class="head"><h1>④ 台词精修 · 多方案 <span class="help" title="${esc(STEP_HINTS[4])}">这步在干嘛？</span></h1><p>${esc(STEP_HINTS[4])}</p></div>`);
+  if(!hasOptions())return w.appendChild(el(`<div class="warnbox">还没有精修方案。点底部 <b>✨ 发给 AI（本步）</b>，让 Claude 给每句台词生成多个方案，读取后回到这里挑选。</div>`)),w;
+  S.scenes.forEach(sc=>{
+    const lines=[];sc.beats.forEach(b=>b.lines.forEach(l=>{if(l.options&&l.options.length)lines.push(l);}));
+    if(!lines.length)return;
+    w.appendChild(el(`<div class="scene-title">${esc(sc.name)}<span class="env"></span></div>`));
+    lines.forEach(l=>w.appendChild(dialogueBlock(l)));
+  });
+  return w;
+}
+function dialogueBlock(l){
+  const b=el(`<div class="line-block"><div class="line-head"><span class="char-chip">${esc(charName(l.char))}</span>${l.orig?`<span class="orig-line">原：${esc(l.orig)}</span>`:''}</div></div>`);
+  const opts=el(`<div class="opts"></div>`);
+  (l.options||[]).forEach((o,i)=>{const d=el(`<div class="opt${l.pick===i?' sel':''}"><span class="k">方案${'ABC'[i]||(i+1)}</span>${esc(o)}</div>`);
+    d.onclick=()=>{l.pick=i;l.final=o;save();render();};opts.appendChild(d);});
+  b.appendChild(opts);
+  const se=el(`<div class="selfedit"><label class="fl">✎ 我自己改（填了就以这个为准）</label><textarea style="height:44px" placeholder="不满意三个方案？在这里写最终台词…">${esc(l.pick===-1?l.final:'' )}</textarea></div>`);
+  const ta=se.querySelector('textarea');
+  ta.oninput=()=>{l.final=ta.value;l.pick=-1;save();
+    b.querySelectorAll('.opt').forEach(o=>o.classList.remove('sel'));};
+  b.appendChild(se);
+  return b;
+}
+
+/* ================= 步骤②：动作设计 ================= */
+function viewAction(){
+  const w=el(`<div><div class="head"><h1>② 动作设计 <span class="help" title="${esc(STEP_HINTS[2])}">这步在干嘛？</span></h1><p>${esc(STEP_HINTS[2])}</p></div>`);
+  if(!S.scenes.length)return w.appendChild(emptyHint()),w;
+  // 人物移动方式总表
+  const mv=el(`<div class="card"><h3>🧭 每个人怎么移动（位移签名 · 按修为/性格定）</h3>
+    <p class="muted" style="margin:-4px 0 10px;font-size:12px">仙人御剑/瞬移、凡人走路、有坐骑就乘骑——同一个人全剧统一。Seedance 铁律：仙法/瞬移也要写成低缓可控的小动作，不写炸裂闪现。</p></div>`);
+  S.characters.forEach(c=>{
+    if(!c.moveStyle)c.moveStyle={primary:'walk',desc:''};
+    const cc=el(`<div class="char-card"><div class="nm">${esc(c.name)} <span class="muted" style="font-weight:400;font-size:12px">${esc(c.bio||'')}</span></div>
+      <div class="move-grid"></div>
+      <label class="fl">位移具体写法（低缓连续 + 衣袂发丝等细节 + 过渡衔接）</label></div>`);
+    const grid=cc.querySelector('.move-grid');
+    MOVE_TYPES.forEach(m=>{const o=el(`<div class="move-opt${c.moveStyle.primary===m.k?' on':''}" title="${esc(m.hint)}">${esc(m.label)}</div>`);
+      o.onclick=()=>{c.moveStyle.primary=m.k;if(!c.moveStyle.desc)c.moveStyle.desc=MOVE_EXAMPLE[m.k];save();render();};grid.appendChild(o);});
+    const ta=el(`<textarea style="height:44px" placeholder="${esc(MOVE_EXAMPLE[c.moveStyle.primary]||'')}">${esc(c.moveStyle.desc||'')}</textarea>`);
+    ta.oninput=()=>{c.moveStyle.desc=ta.value;save();};
+    cc.appendChild(ta);mv.appendChild(cc);
+  });
+  w.appendChild(mv);
+  // 各片段动作
+  eachBeat((b,sc)=>{
+    const card=beatCard(b,sc,'动作设计');
+    const bd=card.querySelector('.bd');
+    if(!b.actions)b.actions={wen:[],fight:[],run:[],move:[]};
+    [['wen','文戏动作'],['fight','打戏动作'],['run','奔跑动作']].forEach(([k,lab])=>{
+      bd.appendChild(actionBucket(b,k,lab));
+    });
+    // move 位移
+    const mvbox=el(`<div class="kv"><span class="k">位移 move</span></div>`);
+    (b.actions.move||[]).forEach((mo,i)=>{
+      const r=el(`<div class="line-block"><div class="line-head"><span class="char-chip">${esc(charName(mo.char))}</span><span class="tag">${esc((MOVE_TYPES.find(m=>m.k===mo.how)||{}).label||mo.how||'')}</span> <span class="muted" style="font-size:12px">${esc(mo.from||'')}→${esc(mo.to||'')}</span></div></div>`);
+      const ta=el(`<textarea style="height:40px">${esc(mo.desc||'')}</textarea>`);ta.oninput=()=>{mo.desc=ta.value;save();};
+      r.appendChild(ta);mvbox.appendChild(r);
+    });
+    bd.appendChild(mvbox);
+    // 禁忌词检查
+    const hot=hotWordsIn(b);
+    if(hot.length)bd.appendChild(el(`<div class="warnbox">⚠ 检测到高爆发动作词：<b>${esc(hot.join('、'))}</b> —— Seedance 易崩，建议改成「缓慢/轻柔/连贯小动作」，或用分段拼接表现速度。</div>`));
+    w.appendChild(card);
+  });
+  return w;
+}
+function actionBucket(b,k,lab){
+  const box=el(`<div class="kv"><span class="k">${lab}</span></div>`);
+  (b.actions[k]||[]).forEach((a,i)=>{const r=el(`<div style="display:flex;gap:6px;margin:3px 0"><textarea style="height:38px;flex:1">${esc(a)}</textarea><button class="btn ghost sm">✕</button></div>`);
+    const ta=r.querySelector('textarea');ta.oninput=()=>{b.actions[k][i]=ta.value;save();};
+    r.querySelector('button').onclick=()=>{b.actions[k].splice(i,1);save();render();};box.appendChild(r);});
+  const add=el(`<button class="btn ghost sm">+ 加一条${esc(lab)}</button>`);
+  add.onclick=()=>{(b.actions[k]=b.actions[k]||[]).push('');save();render();};box.appendChild(add);
+  return box;
+}
+function hotWordsIn(b){const txt=JSON.stringify(b.actions||{});return HOT_WORDS.filter(h=>txt.includes(h));}
+
+/* ================= 步骤③：表情·情绪外化 ================= */
+function viewEmotion(){
+  const w=el(`<div><div class="head"><h1>③ 表情 · 情绪外化 <span class="help" title="${esc(STEP_HINTS[3])}">这步在干嘛？</span></h1><p>${esc(STEP_HINTS[3])}</p></div>`);
+  if(!S.scenes.length)return w.appendChild(emptyHint()),w;
+  // 官方情绪参照
+  const ref=el(`<div class="card"><h3>📖 Seedance 官方「情绪外化」参照（点短语可插入）</h3>
+    <p class="muted" style="margin:-4px 0 8px;font-size:12px">把"很悲伤/很愤怒"换成这些能被镜头看见的身体细节。点任意一条会复制到剪贴板，方便填进下面片段。</p>
+    <div class="chips" id="emoRef"></div></div>`);
+  w.appendChild(ref);
+  setTimeout(()=>{const box=$('emoRef');EMOTION_TABLE.forEach(e=>{const c=el(`<div class="suggest" title="${esc(e.external)}">${esc(e.emotion)}${e.tag==='扩展'?' ·扩展':''}</div>`);
+    c.onclick=()=>{copy(e.external);toast('已复制：'+e.emotion+' 的外化写法');};box.appendChild(c);});},0);
+  // 各片段情绪
+  eachBeat((b,sc)=>{
+    const card=beatCard(b,sc,'情绪外化');const bd=card.querySelector('.bd');
+    if(!b.emotions)b.emotions=[];
+    b.emotions.forEach((em,i)=>{
+      const r=el(`<div class="line-block"><div class="line-head"><span class="char-chip">${esc(charName(em.char))}</span><input style="width:120px" value="${esc(em.abstract)}" placeholder="抽象情绪"></div></div>`);
+      r.querySelector('input').oninput=e=>{em.abstract=e.target.value;save();};
+      const ta=el(`<textarea style="height:44px" placeholder="外化为身体细节…">${esc(em.external)}</textarea>`);ta.oninput=()=>{em.external=ta.value;save();};
+      const del=el(`<button class="btn ghost sm" style="margin-top:4px">✕ 删除</button>`);del.onclick=()=>{b.emotions.splice(i,1);save();render();};
+      r.appendChild(ta);r.appendChild(del);bd.appendChild(r);
+    });
+    const add=el(`<button class="btn ghost sm">+ 加一条情绪</button>`);
+    add.onclick=()=>{const c0=(b.lines.find(l=>l.char&&l.char!=='NA')||{}).char||(S.characters[0]||{}).id||'';b.emotions.push({char:c0,abstract:'',external:''});save();render();};
+    bd.appendChild(add);w.appendChild(card);
+  });
+  return w;
+}
+
+/* ================= 步骤⑥：运镜设计 ================= */
+function viewCamera(){
+  const w=el(`<div><div class="head"><h1>⑤ 运镜设计 <span class="help" title="${esc(STEP_HINTS[5])}">这步在干嘛？</span></h1><p>${esc(STEP_HINTS[5])}</p></div>`);
+  if(!S.scenes.length)return w.appendChild(emptyHint()),w;
+  w.appendChild(el(`<div class="card"><h3>🎥 运镜铁律</h3><p class="muted" style="margin:0;font-size:13px">一个镜头只用 <b style="color:var(--lime)">1 种运镜</b>（推拉摇移别叠加）。文戏=连续长镜头（镜头少、运镜平稳）；武戏=分段切换。每镜齐备四要素：①运镜 ②主体动作+表情 ③位置/空间变化 ④音频（台词{}·音效&lt;&gt;·音乐（））。</p></div>`));
+  eachBeat((b,sc)=>{
+    const card=beatCard(b,sc,'运镜');const bd=card.querySelector('.bd');
+    if(!b.camera)b.camera=[];
+    b.camera.forEach((cam,i)=>bd.appendChild(camRow(b,cam,i)));
+    const add=el(`<button class="btn ghost sm">+ 加一个镜头</button>`);
+    add.onclick=()=>{b.camera.push({shot:'镜头'+(b.camera.length+1),size:'中景',move:'固定机位',subjectAction:'',spaceChange:'',audio:'',cut:''});save();render();};
+    bd.appendChild(add);w.appendChild(card);
+  });
+  return w;
+}
+function camRow(b,cam,i){
+  const r=el(`<div class="line-block"></div>`);
+  const head=el(`<div class="line-head"><b style="color:var(--dim)">${esc(cam.shot||('镜头'+(i+1)))}</b></div>`);
+  const selSize=sel(CAM_SIZES,cam.size,v=>{cam.size=v;save();});
+  const selMove=sel(CAM_MOVES,cam.move,v=>{cam.move=v;save();renderCamWarn(r,cam);});
+  selSize.style.width='110px';selMove.style.width='140px';
+  head.append(' 景别 ',selSize,' 运镜 ',selMove);
+  const del=el(`<button class="btn ghost sm">✕</button>`);del.style.marginLeft='auto';del.onclick=()=>{b.camera.splice(i,1);save();render();};
+  head.appendChild(del);r.appendChild(head);
+  r.appendChild(field('主体动作与表情',cam.subjectAction,v=>{cam.subjectAction=v;save();}));
+  r.appendChild(field('位置 / 空间变化',cam.spaceChange,v=>{cam.spaceChange=v;save();}));
+  r.appendChild(field('音频（台词{}·音效<>·音乐（））',cam.audio,v=>{cam.audio=v;save();}));
+  if(b.mode==='wu')r.appendChild(field('切换方式 cut（武戏分段用）',cam.cut,v=>{cam.cut=v;save();}));
+  const warn=el(`<div></div>`);r.appendChild(warn);renderCamWarn(r,cam);
+  return r;
+}
+function renderCamWarn(r,cam){
+  const old=r.querySelector('.camwarn');if(old)old.remove();
+  if(multiMove(cam.move)){const wbox=el(`<div class="warnbox camwarn">⚠ 这一镜似乎写了不止 1 种运镜——Seedance 易抖易崩，建议拆成下一个镜头。</div>`);r.appendChild(wbox);}
+}
+
+/* ================= 步骤⑥：分集出成片（五块提示词） ================= */
+function cnNum(n){const d=['零','一','二','三','四','五','六','七','八','九','十'];
+  if(n<=10)return d[n];if(n<20)return '十'+d[n-10];
+  return (n<100?(d[Math.floor(n/10)]+'十'+(n%10?d[n%10]:'')):String(n));}
+function fallbackTitle(sc,i){const s=i*15,e=(i+1)*15;return '〔段'+cnNum(i+1)+' · '+s+'–'+e+' 秒〕'+(sc.name||'');}
+function hasCompiled(){let y=false;eachBeat(b=>{const c=b.compiled||{};if(c.title||c.dynamic||c.summary)y=true;});return y;}
+function beatFiveText(b,sc,i){
+  const c=b.compiled||{};let o=(c.title||fallbackTitle(sc,i))+'\n';
+  if(c.styleAtmos)o+='风格与氛围：'+c.styleAtmos+'\n';
+  if(c.summary)o+='叙事概要：'+c.summary+'\n';
+  if(c.dynamic)o+='动态描述：'+c.dynamic+'\n';
+  if(c.static)o+='静态描述：'+c.static+'\n';
+  if(c.techTag)o+='技术 tag：'+c.techTag+'\n';
+  return o;
+}
+function sceneFiveText(sc){let o='';sc.beats.forEach((b,i)=>{o+=beatFiveText(b,sc,i)+'\n';});return o;}
+function allFiveText(){let o='';S.scenes.forEach((sc,si)=>{o+='—— 小集'+(si+1)+'：'+(sc.name||'')+' ——\n\n'+sceneFiveText(sc)+'\n';});return o;}
+
+function viewCompile(){
+  const w=el(`<div><div class="head"><h1>⑥ 分集出成片 · 五块提示词 <span class="help" title="${esc(STEP_HINTS[6])}">这步在干嘛？</span></h1><p>${esc(STEP_HINTS[6])}</p></div>`);
+  if(!S.scenes.length)return w.appendChild(emptyHint()),w;
+  if(!presetFor('compile'))w.appendChild(el(`<div class="warnbox">还没设置《提示词预设》。点右上角 <b>⚙ 预设</b> 填入"提示词预设"（或本步特供预设），AI 才能按它拼五块。</div>`));
+  if(!hasCompiled())w.appendChild(el(`<div class="warnbox">还没生成五块。点底部 <b>✨ 发给 AI（本步）</b>，让 Claude 综合前几步把每段拼成五块提示词，读取后回到这里。</div>`));
+  const bar=el(`<div class="legend"><div class="li muted">共 ${S.scenes.length} 小集 · ${countBeats()} 段</div>
+    <div class="toggles">
+      <button class="btn sm" id="cpAll">复制整篇</button>
+      <button class="btn sm" id="dlAll">导出整篇(.txt)</button>
+      <button class="btn cyan sm" id="dlEach">按小集分别导出</button>
+    </div></div>`);
+  w.appendChild(bar);
+  S.scenes.forEach((sc,si)=>w.appendChild(compileScene(sc,si)));
+  setTimeout(()=>{
+    $('cpAll').onclick=()=>{copy(allFiveText());toast('整篇已复制');};
+    $('dlAll').onclick=()=>download((S.meta.title||'谪仙剧本')+'.五块提示词.txt',allFiveText());
+    $('dlEach').onclick=()=>{S.scenes.forEach((sc,si)=>download((S.meta.title||'谪仙剧本')+'.小集'+(si+1)+(sc.name?'.'+sc.name:'')+'.txt',sceneFiveText(sc)));toast('已按小集导出 '+S.scenes.length+' 个文件');};
+  },0);
+  return w;
+}
+function compileScene(sc,si){
+  const box=el(`<div class="scene-final"><div class="scene-title">小集${si+1} · ${esc(sc.name||'')}<span class="env"></span></div></div>`);
+  const cpsc=el(`<button class="btn ghost sm">复制本小集</button>`);cpsc.onclick=()=>{copy(sceneFiveText(sc));toast('本小集已复制');};
+  box.querySelector('.scene-title').appendChild(cpsc);
+  sc.beats.forEach((b,i)=>{
+    const c=b.compiled||{};
+    const seg=el(`<div class="seg"><div class="seg-top"><span class="pill">${esc(c.title||fallbackTitle(sc,i))}</span><button class="btn ghost sm copyseg">复制本段</button></div></div>`);
+    if(!(c.title||c.dynamic||c.summary)){seg.appendChild(el(`<div class="muted" style="font-size:12px">（本段还没生成五块，点「✨ 发给 AI」）</div>`));}
+    else{
+      [['风格与氛围',c.styleAtmos],['叙事概要',c.summary],['动态描述',c.dynamic],['静态描述',c.static],['技术 tag',c.techTag]].forEach(([lab,val])=>{
+        if(!val)return;
+        const sh=el(`<div class="shot"><span class="shotno">${lab}</span></div>`);
+        const span=document.createElement('span');
+        if(lab==='动态描述')span.innerHTML=colorAudio(val);else span.textContent=val;
+        sh.appendChild(span);seg.appendChild(sh);});
+    }
+    seg.querySelector('.copyseg').onclick=()=>{copy(beatFiveText(b,sc,i));toast('本段已复制');};
+    box.appendChild(seg);
+  });
+  return box;
+}
+function colorAudio(a){
+  // 高亮 即梦符号 {} <> （）
+  return esc(a)
+    .replace(/\{([^}]*)\}/g,'<span class="c-sym">{</span><span class="c-line">$1</span><span class="c-sym">}</span>')
+    .replace(/&lt;([^&]*)&gt;/g,'<span class="c-sfx">&lt;$1&gt;</span>')
+    .replace(/（([^）]*)）/g,'<span class="c-sfx">（$1）</span>');
+}
+
+/* ---------- 通用小组件 ---------- */
+function el(h){const t=document.createElement('template');t.innerHTML=h.trim();return t.content.firstChild;}
+function emptyHint(){return el(`<div class="empty">还没有解析好的剧本。请回到 <b style="color:var(--mint)">① 录入·解析</b> 录入剧本并发给 AI 解析。</div>`);}
+function beatCard(b,sc,tag){
+  return el(`<div class="beat"><div class="bh"><span class="pill">${esc(sc.name)}</span><span class="${b.mode==='wu'?'mode-wu':'mode-wen'}">${b.mode==='wu'?'武戏·分段':'文戏·长镜头'}</span><span class="sc">${esc(b.narration||'')}</span></div><div class="bd"></div></div>`);
+}
+function field(label,val,on){const r=el(`<div class="kv"><label class="fl">${esc(label)}</label></div>`);const ta=el(`<textarea style="height:40px">${esc(val||'')}</textarea>`);ta.oninput=()=>on(ta.value);r.appendChild(ta);return r;}
+function sel(arr,val,on){const s=document.createElement('select');arr.forEach(a=>{const o=document.createElement('option');o.value=a;o.textContent=a;if(a===val)o.selected=true;s.appendChild(o);});s.onchange=()=>on(s.value);return s;}
+function bindInput(id,on){const e=$(id);if(e)e.oninput=()=>{on(e.value);save();};}
+function copy(t){try{const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity=0;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove();return true;}catch(e){try{navigator.clipboard.writeText(t);}catch(_){}}}
+
+/* ---------- AI 桥接 ---------- */
+function buildPrompt(){
+  const step=AI_STEPS[S.step];if(!step)return null;
+  const tmpl=T[step]||'';
+  const preset=presetFor(step);
+  const wrapper="【谪仙剧本工作台 · 第"+S.step+"步："+STEP_NAMES[S.step-1][0]+"】\n"+
+    "（工作台指令。规则见下方【本步预设】，严格遵守。请用 Write 工具把结果【纯JSON】写入文件 谪仙工程/ai-out.json，"+
+    "JSON 最外层加一个字段 \"_step\":\""+step+"\"；不要代码围栏、不要任何解释文字，整个文件能被 JSON.parse 直接解析。"+
+    "写完回我一句\"第"+S.step+"步已写入，请点【读取AI结果】\"。若不方便写文件，就把同一段纯 JSON 直接发我。）\n\n"+
+    "【本步预设（规则依据，必须严格遵守）】\n"+(preset||"(⚠ 未设置预设——请在工作台「⚙ 预设」里填入对应预设，或在本对话中补充规则后再让我执行)")+"\n\n";
+  let payload;
+  if(step==='parse'){
+    payload="\n\n【剧本原文】\n"+(S.rawScript||'(空——若我已把剧本 Word 文档拖给你，请以那份文档内容为准)')+
+      "\n\n【补充人物小传】\n"+(S.rawCharacters||'(无)')+
+      "\n\n（统一语言："+S.meta.lang+"；题材："+S.meta.genre+"；剧名："+S.meta.title+"）";
+  }else{
+    payload="\n\n【当前工程数据(JSON)】\n"+JSON.stringify(stripForAI(S));
+  }
+  return wrapper+"【本步任务】\n"+tmpl+payload;
+}
+function stripForAI(s){const c=JSON.parse(JSON.stringify(s));delete c.rawScript;delete c.rawCharacters;delete c.step;delete c.presets;return c;}
+
+function openSend(){
+  const p=buildPrompt();if(!p){toast('本步不需要发给 AI');return;}
+  awaitingStep=AI_STEPS[S.step];
+  $('sendText').value=p;copy(p);
+  $('sendModal').classList.add('on');toast('指令已复制，去粘给 Claude');
+}
+function applyAIResult(obj,quiet){
+  const step=(obj&&obj._step)||awaitingStep;
+  if(!obj||(!obj.scenes&&!obj.characters&&step!=='parse')){if(!quiet)toast('没读到有效结果',1);return false;}
+  try{
+    if(step==='parse'){
+      // 整体替换结构
+      if(obj.meta)S.meta=Object.assign(S.meta,sanitizeMeta(obj.meta));
+      S.characters=(obj.characters||[]).map(normChar);
+      S.scenes=(obj.scenes||[]).map(normScene);
+      S.step=Math.max(S.step,2);
+      toast('已解析：'+S.scenes.length+' 小集 / '+countBeats()+' 段');
+    }else{
+      mergeSection(obj,step);
+      toast('已套用「'+sectionName(step)+'」结果');
+    }
+    awaitingStep=null;save();render();return true;
+  }catch(e){if(!quiet)toast('套用失败：'+e.message,1);return false;}
+}
+function sectionName(s){return{parse:'剧本解析',dialogue:'台词精修',action:'动作设计',emotion:'情绪外化',camera:'运镜设计',compile:'分集成片(五块)'}[s]||s;}
+function mergeSection(obj,step){
+  const map={};(obj.scenes||[]).forEach(sc=>(sc.beats||[]).forEach(b=>map[b.id]=b));
+  eachBeat(b=>{const nb=map[b.id];if(!nb)return;
+    if(step==='dialogue'&&nb.lines){const lm={};nb.lines.forEach(l=>lm[l.id]=l);
+      b.lines.forEach(l=>{const nl=lm[l.id];if(nl&&nl.options&&nl.options.length){l.options=nl.options.slice(0,6);l.pick=-1;l.final=nl.options[0];}});}
+    if(step==='action'&&nb.actions)b.actions=normActions(nb.actions);
+    if(step==='emotion'&&nb.emotions)b.emotions=(nb.emotions||[]).map(e=>({char:e.char||'',abstract:e.abstract||'',external:e.external||''}));
+    if(step==='camera'&&nb.camera)b.camera=(nb.camera||[]).map((c,i)=>({shot:c.shot||('镜头'+(i+1)),size:c.size||'',move:c.move||'',subjectAction:c.subjectAction||'',spaceChange:c.spaceChange||'',audio:c.audio||'',cut:c.cut||''}));
+    if(step==='compile'&&nb.compiled)b.compiled=normCompiled(nb.compiled);
+  });
+}
+function sanitizeMeta(m){const o={};['title','genre','logline','lang','styleNote'].forEach(k=>{if(m[k]!=null)o[k]=m[k];});if(Array.isArray(m.constraints))o.constraints=m.constraints;return o;}
+function normChar(c){return{id:c.id||uid('C'),name:c.name||'角色',bio:c.bio||'',voice:c.voice||'',
+  moveStyle:c.moveStyle&&typeof c.moveStyle==='object'?{primary:c.moveStyle.primary||'walk',desc:c.moveStyle.desc||'',appearance:c.moveStyle.appearance||''}:{primary:'walk',desc:''},refImg:c.refImg||''};}
+function normScene(sc){return{id:sc.id||uid('S'),name:sc.name||'小集',summary:sc.summary||'',beats:(sc.beats||[]).map(normBeat)};}
+function normBeat(b){return{id:b.id||uid('B'),narration:b.narration||'',mode:b.mode==='wu'?'wu':'wen',hook:b.hook||'',
+  presence:Array.isArray(b.presence)?b.presence.map(p=>({char:p.char||'',pos:p.pos||'',action:p.action||''})):[],
+  picture:b.picture||'',
+  lines:(b.lines||[]).map(l=>({id:l.id||uid('L'),char:l.char||'NA',orig:l.orig||'',options:Array.isArray(l.options)?l.options.slice(0,6):[],pick:typeof l.pick==='number'?l.pick:-1,final:l.final||'',lang:l.lang||S.meta.lang})),
+  actions:normActions(b.actions),emotions:Array.isArray(b.emotions)?b.emotions:[],camera:Array.isArray(b.camera)?b.camera:[],
+  compiled:normCompiled(b.compiled)};}
+function normCompiled(c){c=c||{};return{title:c.title||'',styleAtmos:c.styleAtmos||'',summary:c.summary||'',dynamic:c.dynamic||'',static:c.static||'',techTag:c.techTag||''};}
+function normActions(a){a=a||{};return{wen:arr(a.wen),fight:arr(a.fight),run:arr(a.run),move:Array.isArray(a.move)?a.move.map(m=>({char:m.char||'',from:m.from||'',to:m.to||'',how:m.how||'walk',desc:m.desc||''})):[]};}
+function arr(x){return Array.isArray(x)?x.filter(s=>typeof s==='string'):[];}
+
+function parseLoose(txt){
+  if(!txt)return null;txt=txt.trim();
+  // 去掉代码围栏
+  txt=txt.replace(/^```[a-z]*\n?/i,'').replace(/```\s*$/,'');
+  const a=txt.indexOf('{'),b=txt.lastIndexOf('}');
+  if(a>=0&&b>a)txt=txt.slice(a,b+1);
+  return JSON.parse(txt);
+}
+async function autoRead(silent){
+  try{
+    const r=await fetch(AIPATH+'?t='+Date.now(),{cache:'no-store'});
+    if(!r.ok)throw 0;
+    const txt=await r.text();const h=hash(txt);
+    if(silent){ if(h===lastHash)return false; lastHash=h; }   // 后台轮询：标记已见、避免反复套用；手动点【读取】不受 hash 限制，永远可重试
+    const obj=parseLoose(txt);
+    const auto=$('readAuto');if(auto){auto.style.display='';auto.className='okbox';auto.textContent='已从文件读到结果，步骤：'+sectionName(obj._step||awaitingStep||'?');}
+    const ok=applyAIResult(obj,silent);
+    if(ok&&!silent)lastHash=h;
+    else if(!ok&&!silent)toast('文件里的结果套用失败，请检查 JSON 或改用粘贴',1);
+    return ok;
+  }catch(e){if(!silent)toast('读不到文件（请用 localhost:8765 打开，或改用粘贴）',1);return false;}
+}
+function hash(s){let h=0;for(let i=0;i<s.length;i++){h=(h*31+s.charCodeAt(i))|0;}return h;}
+
+/* 后台轮询：localhost 打开时自动套用新结果 */
+setInterval(()=>{if(location.protocol.startsWith('http')&&awaitingStep)autoRead(true);},3000);
+
+/* ---------- 顶部/底部按钮 ---------- */
+$('btnSend').onclick=openSend;
+$('btnRead').onclick=()=>{
+  $('readModal').classList.add('on');$('readText').value='';
+  const auto=$('readAuto');
+  if(location.protocol==='file:'){
+    $('btnAutoRead').style.display='none';
+    auto.className='warnbox';auto.style.display='';
+    auto.textContent='当前是双击打开(file://)，浏览器禁止自动读文件。请把 Claude 回复里的 JSON 整段粘到下面，点【解析并套用】。（想免粘贴：改用 http://localhost:8765/ 打开本页）';
+  }else{
+    $('btnAutoRead').style.display='';
+    auto.className='okbox';auto.style.display='none';
+    autoRead(false);
+  }
+};
+$('btnCopySend').onclick=()=>{copy($('sendText').value);toast('已复制');};
+$('btnDownSend').onclick=()=>download('谪仙-第'+S.step+'步-指令.txt',$('sendText').value);
+$('btnCloseSend').onclick=()=>$('sendModal').classList.remove('on');
+$('btnAutoRead').onclick=()=>autoRead(false);
+$('btnParseRead').onclick=()=>{try{const o=parseLoose($('readText').value);if(applyAIResult(o))$('readModal').classList.remove('on');}catch(e){toast('JSON 解析失败：'+e.message,1);}};
+$('btnCloseRead').onclick=()=>$('readModal').classList.remove('on');
+$('btnPrev').onclick=()=>{if(S.step>1){S.step--;render();}};
+$('btnNext').onclick=()=>{if(S.step<STEP_NAMES.length){S.step++;render();}};
+$('projName').onchange=e=>{S.meta.title=e.target.value||'未命名剧本';persist();};
+$('btnLegend').onclick=()=>showLegendPopup();
+/* ---------- 预设管理 ---------- */
+function presetTA(label,hint,getv,setv){
+  const wrap=el(`<div style="margin:10px 0"><label class="fl">${esc(label)}${hint?` <span class="muted" style="font-size:11px">${esc(hint)}</span>`:''}</label></div>`);
+  const ta=el(`<textarea style="height:110px;font-size:12px" placeholder="粘贴或拖入 .md/.txt…">${esc(getv()||'')}</textarea>`);
+  ta.oninput=()=>{setv(ta.value);save();};
+  ta.ondragover=e=>{e.preventDefault();ta.style.borderColor='var(--cyan)';};
+  ta.ondragleave=()=>{ta.style.borderColor='';};
+  ta.ondrop=e=>{e.preventDefault();ta.style.borderColor='';const f=e.dataTransfer.files[0];if(!f)return;
+    const rd=new FileReader();rd.onload=()=>{ta.value=rd.result;setv(rd.result);save();toast('已载入：'+f.name);};rd.readAsText(f);};
+  wrap.appendChild(ta);return wrap;
+}
+function openPreset(){
+  ensurePresets();
+  const f=$('presetForm');f.innerHTML='';
+  f.appendChild(el(`<div class="pill" style="margin:4px 0">全局预设</div>`));
+  f.appendChild(presetTA('剧本预设（工序① · 用于①录入解析）','解析剧本时的规则',()=>S.presets.script,v=>S.presets.script=v));
+  f.appendChild(presetTA('提示词预设（工序② · 用于②~⑥）','动作/情绪/台词/运镜/成片的规则',()=>S.presets.prompt,v=>S.presets.prompt=v));
+  f.appendChild(el(`<div class="pill" style="margin:14px 0 4px">每步特供预设（留空＝用上面对应的全局）</div>`));
+  [['parse','① 录入解析'],['action','② 动作设计'],['emotion','③ 情绪外化'],['dialogue','④ 台词精修'],['camera','⑤ 运镜设计'],['compile','⑥ 分集成片']].forEach(([k,lab])=>{
+    f.appendChild(presetTA(lab+' 特供预设','',()=>S.presets.steps[k],v=>S.presets.steps[k]=v));
+  });
+  $('presetModal').classList.add('on');
+}
+$('btnPreset').onclick=openPreset;
+$('btnClosePreset').onclick=()=>$('presetModal').classList.remove('on');
+$('btnPresetClearStep').onclick=()=>{if(confirm('清空所有「每步特供预设」？（全局预设保留）')){Object.keys(S.presets.steps).forEach(k=>S.presets.steps[k]='');save();openPreset();toast('已清空特供预设');}};
+function showLegendPopup(){
+  const items=[['优化后台词','var(--c-line)','④ 精修后的台词（{}包裹）'],['动作设计','var(--c-act)','② 肢体动作 + 移动方式'],['情绪外化','var(--c-emo)','③ 抽象情绪 → 身体细节'],['运镜','var(--c-cam)','⑤ 景别+运镜（一镜只一种）'],['音效/音乐','var(--c-sfx)','<音效> （音乐）'],['结构符号','var(--c-sym)','{}〔〕等给模型的标记'],['原文(替换)','var(--c-orig)','被改掉的原句（删除线）']];
+  const bg=el(`<div class="modal-bg on"></div>`);
+  const m=el(`<div class="modal"><h3>🎨 配色说明</h3><p class="muted">成品里不同颜色代表不同改动来源：</p></div>`);
+  items.forEach(([t,c,d])=>m.appendChild(el(`<div style="display:flex;gap:10px;align-items:center;margin:7px 0"><span style="width:16px;height:16px;border-radius:5px;background:${c};flex:0 0 auto"></span><b style="color:${c}">${esc(t)}</b><span class="muted">${esc(d)}</span></div>`)));
+  const btn=el(`<button class="btn ghost" style="margin-top:12px">关闭</button>`);btn.onclick=()=>bg.remove();
+  m.appendChild(btn);bg.appendChild(m);bg.onclick=e=>{if(e.target===bg)bg.remove();};document.body.appendChild(bg);
+}
+$('btnExportJson').onclick=()=>download((S.meta.title||'谪仙剧本')+'.工程.json',JSON.stringify(S,null,2));
+$('btnExportHtml').onclick=exportFinalHtml;
+$('btnReset').onclick=()=>{if(confirm('清空当前工程重新开始？（预设会保留，不影响已导出的文件）')){const keep=S.presets;S=blankState();S.presets=keep;ensurePresets();render();}};
+$('btnImport').onclick=()=>$('importModal').classList.add('on');
+$('btnCloseImport').onclick=()=>$('importModal').classList.remove('on');
+$('btnPickFile').onclick=()=>$('fileImport').click();
+$('fileImport').onchange=e=>{const f=e.target.files[0];if(!f)return;const rd=new FileReader();rd.onload=()=>{$('importText').value=rd.result;};rd.readAsText(f);};
+$('btnDoImport').onclick=()=>{try{const o=JSON.parse($('importText').value);if(!o.scenes)throw new Error('不是有效工程');S=Object.assign(blankState(),o);ensurePresets();$('importModal').classList.remove('on');render();toast('工程已导入');}catch(e){toast('导入失败：'+e.message,1);}};
+
+function download(name,text){const b=new Blob([text],{type:'text/plain;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000);}
+
+/* ---------- 导出独立成片 HTML（五块） ---------- */
+function exportFinalHtml(){
+  if(!S.scenes.length){toast('还没有内容可导出',1);return;}
+  if(!hasCompiled()){toast('还没生成五块——先到⑥点「发给 AI」',1);return;}
+  const body=el(`<div></div>`);S.scenes.forEach((sc,si)=>body.appendChild(compileScene(sc,si)));
+  body.querySelectorAll('button').forEach(b=>b.remove()); // 去掉复制按钮
+  const css=document.querySelector('style').textContent;
+  const html='<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>'+esc(S.meta.title)+' · 谪仙成片</title><style>'+css+
+    '\nbody{display:block;overflow:auto;padding:24px}@media print{:root{--bg:#fff;--base:#111;--card:#fff;--line:#ccc}body{background:#fff}}</style></head><body>'+
+    '<h1 style="color:var(--mint)">'+esc(S.meta.title)+'</h1><p class="muted">'+esc(S.meta.logline)+' · 题材：'+esc(S.meta.genre)+'</p>'+
+    body.innerHTML+'</body></html>';
+  download((S.meta.title||'谪仙剧本')+'.成片五块.html',html);
+  toast('成片 HTML 已导出，可双击用浏览器打开');
+}
+
+/* ---------- QA 自检条 ---------- */
+function renderQA(){
+  const strip=$('qaStrip');if(!S.scenes.length){strip.innerHTML='';return;}
+  const checks=[];
+  // 语言统一
+  const langs=new Set();eachBeat(b=>b.lines.forEach(l=>{if(l.final||l.orig)langs.add(l.lang||S.meta.lang);}));
+  const mix=hasMixedCN_EN();
+  checks.push(['台词语言统一',!mix]);
+  // 一镜一运镜
+  let camOk=true;eachBeat(b=>(b.camera||[]).forEach(c=>{if(multiMove(c.move))camOk=false;}));
+  checks.push(['一镜一运镜',camOk]);
+  // 无高爆发动作
+  let hotOk=true;eachBeat(b=>{if(hotWordsIn(b).length)hotOk=false;});
+  checks.push(['无狂奔大跳剧烈动作',hotOk]);
+  strip.innerHTML='<b>Seedance 自检：</b>'+checks.map(([t,ok])=>`<span class="${ok?'ok':'bad'}">${ok?'✓':'✕'} ${t}</span>`).join('');
+}
+function hasMixedCN_EN(){
+  // 中英混用判定（指南：专有名词除外）。仅当中文句里出现"长度≥3且非全大写缩写"的英文单词才算混用——
+  // 放过 CP/OK/X光 这类缩写与单字母，避免误伤合法专有名词。
+  let mix=false;
+  const test=t=>{ if(!/[一-龥]/.test(t))return false;
+    const words=(t.match(/[A-Za-z]{3,}/g)||[]).filter(w=>!/^[A-Z]+$/.test(w));
+    return words.length>0; };
+  eachBeat(b=>{ b.lines.forEach(l=>{ if(test(l.final||l.orig||''))mix=true; });
+    (b.camera||[]).forEach(c=>{ (String(c.audio||'').match(/\{([^}]*)\}/g)||[]).forEach(seg=>{ if(test(seg))mix=true; }); }); });
+  return mix;
+}
+
+/* esc 关闭弹窗 */
+document.addEventListener('keydown',e=>{if(e.key==='Escape')document.querySelectorAll('.modal-bg.on').forEach(m=>m.classList.remove('on'));});
+
+render();
+</script>
+</body>
+</html>
