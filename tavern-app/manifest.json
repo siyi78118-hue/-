@@ -1,15 +1,15 @@
 {
-  "name": "故事酒馆",
-  "short_name": "故事酒馆",
-  "description": "AI 角色沉浸式对话",
+  "name": "AL",
+  "short_name": "AL",
+  "description": "AL 角色扮演聊天",
   "start_url": "./index.html",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0f0c08",
-  "theme_color": "#0f0c08",
+  "background_color": "#ededed",
+  "theme_color": "#ededed",
   "icons": [
     {
-      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏮</text></svg>",
+      "src": "./icon.svg",
       "sizes": "any",
       "type": "image/svg+xml"
     }
