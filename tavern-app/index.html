@@ -462,7 +462,7 @@ const RP_PRESETS = {
 
 二、聊天格式
 1. 默认回复 1-4 句，像手机聊天一样自然、口语、碎片化。
-2. 可以分多行，像连续发了几条消息；不要写成长篇正文。
+2. 如果要连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
 3. 允许省略号、语气词、短句、反问、试探、岔开话题、嘴硬、沉默感，但必须通过文字本身表达。
 4. 消息末尾不一定要句号，避免过度正式。
 5. 不输出标题、标签、格式说明或系统提示。
@@ -1068,6 +1068,32 @@ function formatMsg(text) {
   if (!text) return '';
   return esc(text).replace(/\n/g, '<br>');
 }
+function splitAssistantOutput(text) {
+  const normalized = String(text || '').replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return [];
+  const parts = normalized
+    .split(/\n+/)
+    .map(part => part.trim())
+    .filter(Boolean);
+  return parts.length ? parts : [normalized];
+}
+function appendAssistantMessages(chat, text, extra = {}) {
+  const parts = splitAssistantOutput(text);
+  const chunks = parts.length ? parts : ['在吗？'];
+  const baseTime = Date.now();
+  chunks.forEach((content, index) => {
+    chat.messages.push({ role: 'assistant', content, time: baseTime + index * 1000, ...extra });
+  });
+  return chunks;
+}
+function renderStreamingDraftHtml(char, content) {
+  const chunks = splitAssistantOutput(content);
+  if (!chunks.length) return '<div class="typing-line" data-streaming-draft="1">对方正在输入...</div>';
+  return chunks.map((chunk, index) => {
+    const cls = index === chunks.length - 1 ? 'msg-wrap streaming' : 'msg-wrap';
+    return `<div class="${cls}" data-streaming-draft="1">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(chunk)}</div></div>`;
+  }).join('');
+}
 function renderMessages() {
   const chat = allChats[currentCharId];
   const char = characters.find(c => c.id === currentCharId);
@@ -1080,15 +1106,14 @@ function renderMessages() {
     if (m.role === 'user') {
       html += `<div class="msg-wrap me"><div class="bubble">${formatMsg(m.content)}</div><div class="msg-avatar">我</div></div>`;
     } else {
-      html += `<div class="msg-wrap">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(m.content)}</div></div>`;
+      const chunks = splitAssistantOutput(m.content);
+      html += (chunks.length ? chunks : [m.content]).map(chunk =>
+        `<div class="msg-wrap">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(chunk)}</div></div>`
+      ).join('');
     }
   });
   if (streamingDraft?.charId === currentCharId) {
-    if (streamingDraft.content) {
-      html += `<div class="msg-wrap streaming" data-streaming-draft="1">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(streamingDraft.content)}</div></div>`;
-    } else {
-      html += '<div class="typing-line" data-streaming-draft="1">对方正在输入...</div>';
-    }
+    html += renderStreamingDraftHtml(char, streamingDraft.content);
   }
   wrap.innerHTML = html;
   scrollChatBottom();
@@ -1100,21 +1125,7 @@ function scrollChatBottom() {
 function updateStreamingDraft(charId, content = '') {
   streamingDraft = { charId, content: String(content || '') };
   if (activeScreen !== 'chat' || currentCharId !== charId) return;
-  const wrap = document.getElementById('chat-messages');
-  if (!wrap) return;
-  const existing = wrap.querySelector('[data-streaming-draft="1"]');
-  const needsBubble = Boolean(streamingDraft.content);
-  const hasBubble = existing?.classList.contains('msg-wrap');
-  if (!existing || needsBubble !== hasBubble) {
-    renderMessages();
-    return;
-  }
-  if (needsBubble) {
-    existing.querySelector('.bubble').innerHTML = formatMsg(streamingDraft.content);
-  } else {
-    existing.textContent = '对方正在输入...';
-  }
-  scrollChatBottom();
+  renderMessages();
 }
 function clearStreamingDraft(charId) {
   if (!streamingDraft || streamingDraft.charId !== charId) return;
@@ -1379,7 +1390,7 @@ async function sendMessage() {
     const memoryPack = await prepareMemoryPack(requestCharId, text);
     const reply = await callAPI(chat, memoryPack, { charId: requestCharId });
     clearStreamingDraft(requestCharId);
-    chat.messages.push({ role: 'assistant', content: reply, time: Date.now() });
+    appendAssistantMessages(chat, reply);
     scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
   } catch (err) {
     clearStreamingDraft(requestCharId);
@@ -1566,7 +1577,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
     const memoryPack = await prepareMemoryPack(charId, query);
     const reply = await callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext });
-    chat.messages.push({ role: 'assistant', content: String(reply || '').trim() || '在吗？', time: Date.now(), proactive: true });
+    appendAssistantMessages(chat, String(reply || '').trim() || '在吗？', { proactive: true });
     chat.lastProactiveAt = Date.now();
     if (activeScreen !== 'chat' || currentCharId !== charId) chat.unread = (chat.unread || 0) + 1;
     DB.set('chats', allChats);
@@ -1629,6 +1640,7 @@ async function callAPI(chat, memoryPack = '', options = {}) {
 主动消息任务：现在不是用户刚发消息，而是你作为${currentChar?.name || '角色'}在合适的空闲时间主动发来一条微信式消息。
 只能输出消息正文，不要写动作、表情、旁白、心理描写、系统说明或定时器说明。
 可以自然参考当前时间、你们的关系、未兑现约定和最近聊天，但不要机械复述时间戳。
+如果想连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
 默认 1-3 句，像真的私聊。`;
   }
   if (settings.systemPrompt) system += '\n\n' + settings.systemPrompt;

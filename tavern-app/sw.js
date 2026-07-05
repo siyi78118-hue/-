@@ -164,6 +164,26 @@ function proactiveRecentMessages(chat, count = 30, now = new Date()) {
   });
 }
 
+function splitAssistantOutput(text) {
+  const normalized = String(text || '').replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return [];
+  const parts = normalized
+    .split(/\n+/)
+    .map(part => part.trim())
+    .filter(Boolean);
+  return parts.length ? parts : [normalized];
+}
+
+function appendAssistantMessages(chat, text, extra = {}) {
+  const parts = splitAssistantOutput(text);
+  const chunks = parts.length ? parts : ['在吗？'];
+  const baseTime = Date.now();
+  chunks.forEach((content, index) => {
+    chat.messages.push({ role: 'assistant', content, time: baseTime + index * 1000, ...extra });
+  });
+  return chunks;
+}
+
 function messageLine(m) {
   return `${m.role === 'user' ? '用户' : '角色'}：${m.content}`;
 }
@@ -239,11 +259,13 @@ async function handleProactivePush(payload) {
 主动消息任务：现在不是用户刚刚发消息后等你回答，而是经过了一段空闲时间后，你作为${char.name}主动给用户发来一条微信式消息。
 你应该根据时间流逝、你上一条说过的话、未解决话题、约定或关系状态主动开口。
 可以延续上一话题、关心用户、提起约定、找一个符合角色的自然话题；长间隔时更像重新打开聊天。
-只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替用户说话。默认 1-3 句。`;
+只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替用户说话。
+如果想连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
+默认 1-3 句。`;
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
   const reply = (await callModel(settings, system, messages)).trim() || '在吗？';
-  chat.messages.push({ role: 'assistant', content: reply, time: Date.now(), proactive: true });
+  const chunks = appendAssistantMessages(chat, reply, { proactive: true });
   chat.unread = (chat.unread || 0) + 1;
   chat.lastProactiveAt = Date.now();
   if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
@@ -252,7 +274,7 @@ async function handleProactivePush(payload) {
   await setMeta('app_state', state);
   await notifyClients({ type: 'al-state-updated', charId, reply });
   await self.registration.showNotification(char.name || 'AL', {
-    body: reply,
+    body: chunks[0] + (chunks.length > 1 ? ' ...' : ''),
     tag: `al-${charId}`,
     data: { charId, url: './index.html' },
     icon: './icon.svg',
