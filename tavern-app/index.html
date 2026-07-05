@@ -83,34 +83,38 @@ button{border:none;background:none;cursor:pointer}
 .plus-item{height:48px;padding:0 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid rgba(255,255,255,.12);font-size:15px}
 .plus-item:active{background:#3e3e3e}
 .plus-item:last-child{border-bottom:none}
-.page-pad{padding:12px 12px 30px;background:#ededed;min-height:100%}
-.hero-panel{margin-bottom:12px;padding:16px;border-radius:10px;background:linear-gradient(135deg,#ffffff,#f7fff9);box-shadow:0 1px 0 rgba(0,0,0,.05);border:1px solid rgba(0,0,0,.04)}
+.page-pad{padding:12px 12px calc(42px + var(--safe-bottom));background:#ededed;min-height:100%}
+.hero-panel{margin-bottom:12px;padding:16px;border-radius:8px;background:#fff;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .hero-title{font-size:20px;font-weight:700;margin-bottom:6px}
 .hero-sub{font-size:13px;color:#777;line-height:1.6}
 .quick-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
-.quick-card{min-height:72px;padding:12px;border-radius:10px;background:#fff;display:flex;align-items:center;gap:10px;box-shadow:0 1px 0 rgba(0,0,0,.05);text-align:left}
-.quick-ico{width:42px;height:42px;border-radius:10px;background:#07c160;color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
+.quick-card{min-height:72px;padding:12px;border-radius:8px;background:#fff;display:flex;align-items:center;gap:10px;box-shadow:0 1px 0 rgba(0,0,0,.04);text-align:left}
+.quick-ico{width:42px;height:42px;border-radius:7px;background:#07c160;color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
 .quick-title{font-size:15px;font-weight:650}.quick-sub{font-size:12px;color:#8a8a8a;margin-top:3px;line-height:1.3}
-.form{padding:12px 0 30px;background:#ededed;min-height:100%}
-.cell-group{background:#fff;margin:0 12px 12px;border-radius:10px;overflow:hidden;box-shadow:0 1px 0 rgba(0,0,0,.05)}
+.form{padding:12px 0 calc(42px + var(--safe-bottom));background:#ededed;min-height:100%}
+.cell-group{background:#fff;margin:0 12px 12px;border-radius:8px;overflow:hidden;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .cell{width:100%;min-height:54px;padding:9px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line2);text-align:left;background:#fff}
 .cell:last-child{border-bottom:none}
 .cell-label{width:96px;color:#191919;font-size:15px;flex-shrink:0}
 .cell-body{flex:1;min-width:0}
+.cell-note{display:block;margin-top:3px;color:#9a9a9a;font-size:12px;line-height:1.35}
+.cell-ico{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;background:#07c160;color:#fff;font-size:16px;flex-shrink:0}
+.cell-ico.blue{background:#5b8def}.cell-ico.orange{background:#ff9f1c}.cell-ico.gray{background:#8f8f8f}.cell-ico.red{background:#fa5151}
 .input,.textarea,.select{width:100%;border:none;outline:none;background:transparent;color:#222;font-size:15px}
 .input::placeholder,.textarea::placeholder{color:#b8b8b8}
 .textarea{min-height:86px;resize:vertical;line-height:1.6;padding:8px 0}
 .select{appearance:none}
 .range{width:100%;accent-color:var(--green)}
-.primary{height:46px;margin:16px 14px 0;border-radius:5px;background:var(--green);color:#fff;font-size:17px;display:flex;align-items:center;justify-content:center}
+.primary{height:46px;margin:16px 14px calc(18px + var(--safe-bottom));border-radius:5px;background:var(--green);color:#fff;font-size:17px;display:flex;align-items:center;justify-content:center}
 .primary:active{background:#06ad56}
 .secondary{height:44px;margin:10px 14px 0;border-radius:5px;background:#fff;color:#111;font-size:16px;display:flex;align-items:center;justify-content:center;border:1px solid var(--line)}
+.secondary:last-child{margin-bottom:calc(18px + var(--safe-bottom))}
 .inline-btn{height:34px;padding:0 12px;border-radius:5px;background:#f1f1f1;color:#111;font-size:13px;white-space:nowrap}
 .inline-btn:active{background:#e6e6e6}
 .model-row{align-items:flex-start}.model-tools{display:flex;gap:8px;margin-top:8px}.model-tools .select{height:34px;padding:0 8px;background:#f7f7f7;border-radius:5px}
 .danger{color:var(--danger)}
 .hint{padding:8px 14px;color:#8a8a8a;font-size:12px;line-height:1.6}
-.file-zone{height:150px;margin:0 0 12px;border:1px dashed #c7d8cc;border-radius:12px;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#666;box-shadow:0 1px 0 rgba(0,0,0,.05)}
+.file-zone{height:150px;margin:0 0 12px;border:1px dashed #c7d8cc;border-radius:8px;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#666;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .file-zone:active{background:#f7f7f7}
 .file-zone .big{font-size:34px}
 .chat-head{background:#ededed}
@@ -127,10 +131,9 @@ button{border:none;background:none;cursor:pointer}
 .msg-wrap.me .bubble:after{content:"";position:absolute;right:-5px;top:13px;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:5px solid var(--green2)}
 .bubble em{font-style:italic;color:#596b4a}
 .time-tip{align-self:center;color:#999;font-size:12px;margin:2px 0}
-.typing{display:flex;gap:4px;padding:12px 2px}
-.typing span{width:6px;height:6px;background:#9a9a9a;border-radius:50%;animation:typing 1.1s infinite ease-in-out}
-.typing span:nth-child(2){animation-delay:.15s}.typing span:nth-child(3){animation-delay:.3s}
-@keyframes typing{0%,80%,100%{opacity:.28;transform:translateY(0)}40%{opacity:1;transform:translateY(-3px)}}
+.typing-line{align-self:center;color:#a3a3a3;font-size:12px;line-height:1.2;margin:-2px 0 2px;opacity:.86}
+.streaming .bubble:after{content:"";display:inline-block;width:1px;height:1em;margin-left:2px;background:#999;vertical-align:-2px;animation:cursorBlink 1s steps(1) infinite}
+@keyframes cursorBlink{0%,45%{opacity:1}46%,100%{opacity:0}}
 .composer{padding:7px 8px calc(7px + var(--safe-bottom));display:flex;align-items:flex-end;gap:8px;background:#f7f7f7;border-top:1px solid #d8d8d8;flex-shrink:0}
 .round-icon{width:34px;height:34px;border:1.5px solid #555;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#555;font-size:18px;flex-shrink:0}
 .chat-input{flex:1;min-height:36px;max-height:106px;padding:7px 9px;border:none;border-radius:4px;outline:none;background:#fff;resize:none;font-size:16px;line-height:1.4}
@@ -139,15 +142,19 @@ button{border:none;background:none;cursor:pointer}
 .profile-top{background:#fff;padding:24px 18px;display:flex;gap:16px;align-items:center;border-bottom:1px solid var(--line)}
 .profile-name{font-size:22px;font-weight:600;margin-bottom:8px}
 .profile-id{font-size:13px;color:#777}
-.profile-card{margin:12px;border-radius:12px;background:#fff;overflow:hidden;box-shadow:0 1px 0 rgba(0,0,0,.05)}
-.profile-cover{height:76px;background:linear-gradient(135deg,#07c160,#89e19a)}
-.profile-card .profile-top{margin-top:-26px;border-bottom:none;background:transparent}
-.moment{background:#fff;margin:0 12px 10px;padding:14px;border-radius:10px;display:flex;gap:10px;box-shadow:0 1px 0 rgba(0,0,0,.05)}
+.profile-card{margin:12px;border-radius:8px;background:#fff;overflow:hidden;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+.profile-cover{height:72px;background:linear-gradient(135deg,#2c2c2c,#5b5b5b)}
+.profile-card .profile-top{margin-top:-24px;border-bottom:none;background:transparent}
+.profile-meta{display:flex;align-items:center;gap:8px;color:#777;font-size:13px}
+.qr-mark{width:18px;height:18px;border:1px solid #aaa;border-radius:3px;background:linear-gradient(90deg,#aaa 2px,transparent 2px) 0 0/6px 6px,linear-gradient(#aaa 2px,transparent 2px) 0 0/6px 6px;opacity:.8}
+.moment{background:#fff;margin:0 12px 10px;padding:14px;border-radius:8px;display:flex;gap:10px;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .moment-body{flex:1;min-width:0}
 .moment-name{color:var(--blue);font-weight:600;font-size:15px}
 .moment-text{margin-top:5px;font-size:15px;line-height:1.55}
-.discover-banner{margin:12px;padding:16px;border-radius:12px;background:linear-gradient(135deg,#111,#3a3a3a);color:#fff}
-.discover-banner .hero-sub{color:rgba(255,255,255,.72)}
+.moments-cover{height:178px;margin-bottom:12px;padding:16px;display:flex;align-items:flex-end;justify-content:space-between;background:linear-gradient(180deg,rgba(0,0,0,.05),rgba(0,0,0,.46)),linear-gradient(135deg,#8fba9b,#526f77 55%,#3d3d3d);color:#fff}
+.moments-title{font-size:22px;font-weight:700;text-shadow:0 1px 3px rgba(0,0,0,.28)}
+.moments-user{display:flex;align-items:center;gap:10px;font-size:15px;text-shadow:0 1px 2px rgba(0,0,0,.24)}
+.discover-tools{margin-bottom:12px}
 .contact-index{height:28px;padding:0 18px;display:flex;align-items:center;color:#888;font-size:13px;background:#ededed}
 @media (max-width: 420px) {
   #app{max-width:none}
@@ -166,14 +173,14 @@ button{border:none;background:none;cursor:pointer}
   .tab{font-size:15px;gap:2px}
   .tab .tab-ico{transform:scale(.9)}
   .page-pad{padding:10px 10px 24px}
-  .hero-panel,.discover-banner,.profile-card,.moment{margin-left:10px;margin-right:10px}
+  .hero-panel,.profile-card,.moment{margin-left:10px;margin-right:10px}
   .cell-group{margin-left:10px;margin-right:10px}
   .quick-grid{gap:8px}
   .quick-card{min-height:66px;padding:10px}
   .cell-label{width:82px}
   .bubble{max-width:76%;font-size:15px}
 }
-.toast{position:fixed;left:50%;top:45%;transform:translate(-50%,-50%);max-width:78%;padding:10px 16px;background:rgba(0,0,0,.72);color:#fff;border-radius:6px;font-size:14px;z-index:200;text-align:center}
+.toast{position:fixed;left:50%;top:45%;transform:translate(-50%,-50%);max-width:78%;padding:10px 16px;background:rgba(0,0,0,.72);color:#fff;border-radius:6px;font-size:14px;z-index:200;text-align:center;white-space:pre-line;line-height:1.45}
 .modal-mask{position:fixed;inset:0;background:rgba(0,0,0,.38);z-index:100;display:none;align-items:flex-end;justify-content:center}
 .modal-mask.show{display:flex}
 .sheet{width:100%;max-width:520px;background:#f7f7f7;border-radius:12px 12px 0 0;padding:14px 0 calc(16px + var(--safe-bottom));max-height:78vh;overflow-y:auto}
@@ -242,13 +249,15 @@ button{border:none;background:none;cursor:pointer}
   <div id="screen-discover" class="screen">
     <div class="topbar"><div class="top-left"></div><div class="top-title">发现</div><div class="top-right"></div></div>
     <div class="scroll" style="background:#ededed">
-      <div class="discover-banner">
-        <div class="hero-title">发现</div>
-        <div class="hero-sub">把角色设定、场景和最近对话变成更像社交软件的动态入口。</div>
+      <div class="moments-cover">
+        <div class="moments-title">朋友圈</div>
+        <div class="moments-user"><span>玩家</span><div class="avatar">我</div></div>
       </div>
-      <div class="list">
-        <button class="row" onclick="openImport()"><div class="avatar" style="background:#ff9f1c">✦</div><div class="row-main"><div class="row-name">素材库</div><div class="row-preview">导入角色卡、头像和开场白</div></div></button>
+      <div class="cell-group discover-tools">
+        <button class="cell" onclick="openImport()"><span class="cell-ico orange">＋</span><div class="cell-body">素材库<span class="cell-note">导入角色卡、头像和开场白</span></div><div class="mini">›</div></button>
+        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="cell-ico blue">忆</span><div class="cell-body">本地记忆<span class="cell-note">查看摘要、事件和向量索引</span></div><div class="mini">›</div></button>
       </div>
+      <div class="contact-index">角色动态</div>
       <div id="moment-list" style="margin-top:8px"></div>
     </div>
     <nav class="tabbar">
@@ -268,16 +277,21 @@ button{border:none;background:none;cursor:pointer}
           <div class="avatar large">我</div>
           <div style="flex:1;min-width:0">
             <div class="profile-name">玩家</div>
-            <div class="profile-id">AL ID：local-player</div>
+            <div class="profile-meta"><span>AL ID：local-player</span><span class="qr-mark"></span></div>
           </div>
           <div class="mini">›</div>
         </div>
       </div>
       <div class="cell-group">
-        <button class="cell" onclick="showScreen('settings')"><div class="cell-body">设置</div><div class="mini">›</div></button>
-        <button class="cell" onclick="openImport()"><div class="cell-body">角色卡</div><div class="mini">›</div></button>
-        <button class="cell" onclick="showScreen('contacts')"><div class="cell-body">我的角色</div><div class="mini">›</div></button>
-        <button class="cell" onclick="clearAllHistory()"><div class="cell-body danger">清空聊天记录</div></button>
+        <button class="cell" onclick="showScreen('settings')"><span class="cell-ico gray">设</span><div class="cell-body">设置<span class="cell-note">接口、预设、主动消息和云闹钟</span></div><div class="mini">›</div></button>
+        <button class="cell" onclick="openImport()"><span class="cell-ico orange">卡</span><div class="cell-body">角色卡<span class="cell-note">导入或新建联系人</span></div><div class="mini">›</div></button>
+      </div>
+      <div class="cell-group">
+        <button class="cell" onclick="showScreen('contacts')"><span class="cell-ico blue">人</span><div class="cell-body">我的角色<span class="cell-note">查看全部联系人</span></div><div class="mini">›</div></button>
+        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="cell-ico">忆</span><div class="cell-body">记忆库<span class="cell-note">本地保存，不上传云端</span></div><div class="mini">›</div></button>
+      </div>
+      <div class="cell-group">
+        <button class="cell" onclick="clearAllHistory()"><span class="cell-ico red">清</span><div class="cell-body danger">清空聊天记录</div></button>
       </div>
     </div>
     <nav class="tabbar">
@@ -369,6 +383,7 @@ button{border:none;background:none;cursor:pointer}
           <div class="cell"><div class="cell-label">全局预设</div><div class="cell-body"><textarea class="textarea" id="set-system-prompt"></textarea></div></div>
           <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
+          <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
           <button class="cell" onclick="manualProactiveMessage()" type="button"><div class="cell-label">测试</div><div class="cell-body">让当前角色主动发一条</div><div class="mini">›</div></button>
         </div>
         <button class="primary" onclick="saveSettings()">保存</button>
@@ -537,6 +552,7 @@ let characters = DB.get('characters', []);
 let allChats = DB.get('chats', {});
 let currentCharId = null;
 let isStreaming = false;
+let streamingDraft = null;
 let lastMainScreen = 'chats';
 let plusOpen = false;
 let activeScreen = 'chats';
@@ -700,15 +716,83 @@ function pad2(n) { return String(n).padStart(2, '0'); }
 function formatStatusTime(date = new Date()) {
   return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
 }
+function getDayPeriod(date = new Date()) {
+  const h = date.getHours();
+  if (h < 5) return { label: '凌晨', range: '00:00-04:59', banned: '早上、上午、中午、下午、傍晚' };
+  if (h < 8) return { label: '清晨', range: '05:00-07:59', banned: '半夜三更、深夜、下午、晚上' };
+  if (h < 11) return { label: '上午', range: '08:00-10:59', banned: '半夜三更、深夜、下午、晚上' };
+  if (h < 13) return { label: '中午', range: '11:00-12:59', banned: '半夜三更、深夜、清晨、晚上' };
+  if (h < 18) return { label: '下午', range: '13:00-17:59', banned: '半夜三更、深夜、凌晨、早上、上午、晚上' };
+  if (h < 22) return { label: '晚上', range: '18:00-21:59', banned: '半夜三更、凌晨、早上、上午、下午' };
+  return { label: '深夜', range: '22:00-23:59', banned: '早上、上午、中午、下午、傍晚' };
+}
 function getTimeContext(date = new Date()) {
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '本地时区';
   const weekday = ['星期日','星期一','星期二','星期三','星期四','星期五','星期六'][date.getDay()];
+  const period = getDayPeriod(date);
   return [
     `当前设备时间：${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`,
+    `当前时段：${period.label}（${period.range}）`,
     `星期：${weekday}`,
     `时区：${tz}`,
-    `时间戳：${date.toISOString()}`
+    `时间戳：${date.toISOString()}`,
+    `时间表达规则：角色不需要刻意报出具体时间；只要涉及时间、时段、作息或类似“半夜三更”的说法，就必须符合当前时段。禁止使用与当前时段矛盾的说法：${period.banned}。`
   ].join('\n');
+}
+function formatFullTime(date = new Date()) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+function formatElapsed(ms) {
+  const minutes = Math.max(0, Math.round((Number(ms) || 0) / 60000));
+  if (minutes < 1) return '不到 1 分钟';
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours < 24) return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
+  const days = Math.floor(hours / 24);
+  const hourRest = hours % 24;
+  return hourRest ? `${days} 天 ${hourRest} 小时` : `${days} 天`;
+}
+function latestMessageByRole(chat, role) {
+  return (chat?.messages || []).slice().reverse().find(m => m.role === role) || null;
+}
+function messageTimeLine(label, msg, now = new Date()) {
+  if (!msg?.time) return `${label}：无`;
+  const at = new Date(msg.time);
+  const elapsed = formatElapsed(now.getTime() - at.getTime());
+  const content = String(msg.content || '').replace(/\s+/g, ' ').slice(0, 120);
+  return `${label}：${formatFullTime(at)}（距现在 ${elapsed}）｜${msg.role === 'user' ? '用户' : '角色'}：${content}`;
+}
+function buildProactiveTimeContext(chat, now = new Date()) {
+  const messages = chat?.messages || [];
+  const last = messages[messages.length - 1] || null;
+  const lastUser = latestMessageByRole(chat, 'user');
+  const lastAssistant = latestMessageByRole(chat, 'assistant');
+  const lastElapsedMinutes = last?.time ? Math.round((now.getTime() - last.time) / 60000) : 0;
+  const mode = lastElapsedMinutes >= 60
+    ? '长间隔重新开口'
+    : lastElapsedMinutes >= 15
+      ? '中等间隔自然续聊'
+      : '短间隔可轻续聊';
+  return [
+    '主动消息时间流逝上下文：',
+    `当前时间：${formatFullTime(now)}`,
+    messageTimeLine('最后一条消息', last, now),
+    messageTimeLine('上一条用户消息', lastUser, now),
+    messageTimeLine('上一条角色消息', lastAssistant, now),
+    `智能策略：${mode}`,
+    '硬性要求：这不是用户刚刚发消息后等你回答，而是隔了一段空闲时间后你主动打开微信来发消息。',
+    '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
+    '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
+    '不要提到系统时间、提示词、后台、推送或定时器。'
+  ].join('\n');
+}
+function proactiveRecentMessages(chat, count = 30, now = new Date()) {
+  return recentMessages(chat, count).map(m => {
+    const at = m.time ? new Date(m.time) : null;
+    const stamp = at ? `发送时间 ${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}` : '发送时间未知';
+    return { role: m.role, content: `【${stamp}】${m.content}` };
+  });
 }
 function updateStatusClock() {
   const el = document.getElementById('device-time');
@@ -732,6 +816,24 @@ function toast(msg, dur = 1800) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), dur);
+}
+function friendlyErrorMessage(err) {
+  const raw = String(err?.message || err || '未知错误');
+  if (/Failed to fetch|NetworkError|Load failed|ERR_FAILED/i.test(raw)) {
+    return '接口连接失败，请检查地址、Key、网络或接口跨域设置';
+  }
+  if (/timeout|timed out|超时/i.test(raw)) return '接口响应超时，请稍后重试或换一个模型';
+  if (/401|403|Unauthorized|Forbidden/i.test(raw)) return '接口鉴权失败，请检查 Key 是否正确';
+  if (/404|Not Found/i.test(raw)) return '接口地址不正确，请确认是否填写到 /v1';
+  if (/429|rate limit/i.test(raw)) return '接口请求过于频繁，请稍后再试';
+  if (/non ISO-8859-1|ByteString|headers/i.test(raw)) return 'Key 含有隐藏字符，请重新粘贴或手动输入';
+  return raw;
+}
+function previewText(text) {
+  const value = String(text || '');
+  if (/Failed to fetch|NetworkError|ERR_FAILED/i.test(value)) return '接口连接失败，请检查设置';
+  if (/^\（.+(?:超时|鉴权失败|接口连接失败|地址不正确|隐藏字符).+\）$/.test(value)) return value.slice(1, -1);
+  return value;
 }
 
 function showScreen(name) {
@@ -760,7 +862,7 @@ function renderChats() {
   const roleRows = characters.map(c => {
     const chat = allChats[c.id];
     const last = chat?.messages?.[chat.messages.length - 1];
-    const preview = last ? last.content : (c.firstMessage || c.description || c.personality || '');
+    const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
     const unread = chat?.unread || 0;
     return { c, last, preview, unread, time: last?.time || 0 };
   }).sort((a,b) => b.time - a.time || a.c.name.localeCompare(b.c.name, 'zh-CN'));
@@ -981,12 +1083,43 @@ function renderMessages() {
       html += `<div class="msg-wrap">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(m.content)}</div></div>`;
     }
   });
+  if (streamingDraft?.charId === currentCharId) {
+    if (streamingDraft.content) {
+      html += `<div class="msg-wrap streaming" data-streaming-draft="1">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(streamingDraft.content)}</div></div>`;
+    } else {
+      html += '<div class="typing-line" data-streaming-draft="1">对方正在输入...</div>';
+    }
+  }
   wrap.innerHTML = html;
   scrollChatBottom();
 }
 function scrollChatBottom() {
   const el = document.getElementById('chat-scroll');
   if (el) el.scrollTop = el.scrollHeight;
+}
+function updateStreamingDraft(charId, content = '') {
+  streamingDraft = { charId, content: String(content || '') };
+  if (activeScreen !== 'chat' || currentCharId !== charId) return;
+  const wrap = document.getElementById('chat-messages');
+  if (!wrap) return;
+  const existing = wrap.querySelector('[data-streaming-draft="1"]');
+  const needsBubble = Boolean(streamingDraft.content);
+  const hasBubble = existing?.classList.contains('msg-wrap');
+  if (!existing || needsBubble !== hasBubble) {
+    renderMessages();
+    return;
+  }
+  if (needsBubble) {
+    existing.querySelector('.bubble').innerHTML = formatMsg(streamingDraft.content);
+  } else {
+    existing.textContent = '对方正在输入...';
+  }
+  scrollChatBottom();
+}
+function clearStreamingDraft(charId) {
+  if (!streamingDraft || streamingDraft.charId !== charId) return;
+  streamingDraft = null;
+  document.querySelectorAll('[data-streaming-draft="1"]').forEach(el => el.remove());
 }
 function autoResize(el) {
   el.style.height = 'auto';
@@ -1232,33 +1365,30 @@ async function sendMessage() {
   const input = document.getElementById('chat-input');
   const text = input.value.trim();
   if (!text || isStreaming || !currentCharId) return;
+  const requestCharId = currentCharId;
   input.value = '';
   input.style.height = 'auto';
   document.getElementById('btn-send').className = 'send inactive';
-  const chat = allChats[currentCharId];
-  cancelCloudProactive(currentCharId);
+  const chat = allChats[requestCharId];
+  cancelCloudProactive(requestCharId);
   chat.messages.push({ role: 'user', content: text, time: Date.now() });
-  renderMessages();
   isStreaming = true;
-  const char = characters.find(c => c.id === currentCharId);
-  const box = document.getElementById('chat-messages');
-  const typing = document.createElement('div');
-  typing.className = 'msg-wrap';
-  typing.innerHTML = `${avatarHtml(char, 'msg-avatar')}<div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>`;
-  box.appendChild(typing);
-  scrollChatBottom();
+  updateStreamingDraft(requestCharId, '');
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
   try {
-    const memoryPack = await prepareMemoryPack(currentCharId, text);
-    const reply = await callAPI(chat, memoryPack);
+    const memoryPack = await prepareMemoryPack(requestCharId, text);
+    const reply = await callAPI(chat, memoryPack, { charId: requestCharId });
+    clearStreamingDraft(requestCharId);
     chat.messages.push({ role: 'assistant', content: reply, time: Date.now() });
-    scheduleCloudProactive(currentCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+    scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
   } catch (err) {
-    chat.messages.push({ role: 'assistant', content: `（${err.message}）`, time: Date.now() });
+    clearStreamingDraft(requestCharId);
+    chat.messages.push({ role: 'assistant', content: `（${friendlyErrorMessage(err)}）`, time: Date.now() });
   }
   isStreaming = false;
   DB.set('chats', allChats);
-  renderMessages();
-  processMemoryAfterTurn(currentCharId).catch(err => console.warn('[AL Memory] update skipped:', err.message));
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] update skipped:', err.message));
 }
 
 function getLatestChatRows() {
@@ -1289,38 +1419,46 @@ function timerUrl(path) {
 }
 async function enableCloudTimer() {
   saveSettings();
-  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-    toast('当前浏览器不支持 Web Push', 2400);
-    return;
+  try {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      toast('当前浏览器不支持 Web Push', 2400);
+      return;
+    }
+    if (!settings.timerEndpoint || !settings.pushPublicKey) {
+      toast('请先填写闹钟地址和推送公钥', 2400);
+      return;
+    }
+    toast('正在绑定云闹钟...', 1400);
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      toast('需要允许通知才能后台提醒', 2400);
+      return;
+    }
+    const reg = await navigator.serviceWorker.ready;
+    let subscription = await reg.pushManager.getSubscription();
+    if (!subscription) {
+      subscription = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(settings.pushPublicKey)
+      });
+    }
+    settings.pushSubscription = subscription.toJSON();
+    settings.cloudTimerEnabled = true;
+    settings.deviceId = ensureDeviceId();
+    DB.set('settings', settings);
+    await mirrorAppStateNow();
+    const resp = await fetchWithTimeout(timerUrl('/register'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: settings.deviceId, subscription: settings.pushSubscription })
+    }, API_TIMEOUT_MS);
+    if (!resp.ok) throw new Error('云闹钟注册失败：' + resp.status);
+    toast('云闹钟已绑定\n之后空闲触发会由云端计时提醒', 3000);
+    const target = currentCharId || getLatestChatRows()[0]?.char?.id;
+    if (target) scheduleCloudProactive(target).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+  } catch (err) {
+    toast('云闹钟绑定失败：' + friendlyErrorMessage(err), 3600);
   }
-  if (!settings.timerEndpoint || !settings.pushPublicKey) {
-    toast('请先填写闹钟地址和推送公钥', 2400);
-    return;
-  }
-  const permission = await Notification.requestPermission();
-  if (permission !== 'granted') {
-    toast('需要允许通知才能后台提醒', 2400);
-    return;
-  }
-  const reg = await navigator.serviceWorker.ready;
-  const subscription = await reg.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: urlBase64ToUint8Array(settings.pushPublicKey)
-  });
-  settings.pushSubscription = subscription.toJSON();
-  settings.cloudTimerEnabled = true;
-  settings.deviceId = ensureDeviceId();
-  DB.set('settings', settings);
-  await mirrorAppStateNow();
-  const resp = await fetchWithTimeout(timerUrl('/register'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceId: settings.deviceId, subscription: settings.pushSubscription })
-  }, API_TIMEOUT_MS);
-  if (!resp.ok) throw new Error('云闹钟注册失败：' + resp.status);
-  toast('云闹钟已绑定');
-  const target = currentCharId || getLatestChatRows()[0]?.char?.id;
-  if (target) scheduleCloudProactive(target).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
 }
 async function scheduleCloudProactive(charId) {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
@@ -1338,6 +1476,40 @@ async function scheduleCloudProactive(charId) {
   }, API_TIMEOUT_MS);
   if (!resp.ok) throw new Error('云闹钟安排失败：' + resp.status);
   return true;
+}
+async function testCloudTimerPush() {
+  saveSettings();
+  if (!settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) {
+    toast('请先绑定本机云闹钟', 2400);
+    return;
+  }
+  const charId = currentCharId || getLatestChatRows()[0]?.char?.id;
+  if (!charId) { toast('先打开一个有聊天记录的会话'); return; }
+  const chat = allChats[charId];
+  if (!chat?.messages?.length) { toast('当前会话还没有聊天记录'); return; }
+  const jobId = `test_${settings.deviceId}_${charId}_${Date.now()}`;
+  chat.pendingProactiveJob = { jobId, dueAt: new Date(Date.now() - 1000).toISOString(), test: true };
+  DB.set('chats', allChats);
+  await mirrorAppStateNow();
+  toast('正在触发云闹钟推送...', 1800);
+  try {
+    const body = { deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive' };
+    const scheduleResp = await fetchWithTimeout(timerUrl('/schedule'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }, API_TIMEOUT_MS);
+    if (!scheduleResp.ok) throw new Error('安排失败：' + scheduleResp.status);
+    const triggerResp = await fetchWithTimeout(timerUrl('/trigger'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    }, API_TIMEOUT_MS);
+    if (!triggerResp.ok) throw new Error('触发失败：' + triggerResp.status);
+    toast('云闹钟已触发，请留意通知', 2600);
+  } catch (err) {
+    toast('云闹钟测试失败：' + friendlyErrorMessage(err), 3600);
+  }
 }
 async function cancelCloudProactive(charId) {
   const chat = allChats[charId];
@@ -1368,6 +1540,13 @@ function findProactiveTarget() {
     return !String(last.content || '').startsWith('（');
   });
 }
+function findDueCloudProactiveTarget() {
+  const now = Date.now();
+  return getLatestChatRows().find(({ chat }) => {
+    const dueAt = chat?.pendingProactiveJob?.dueAt;
+    return dueAt && Date.parse(dueAt) <= now;
+  });
+}
 async function triggerProactiveMessage(charId, manual = false) {
   if (proactiveBusy || isStreaming) return false;
   const char = characters.find(c => c.id === charId);
@@ -1382,20 +1561,22 @@ async function triggerProactiveMessage(charId, manual = false) {
   }
   proactiveBusy = true;
   try {
-    const query = `主动消息触发。\n${getTimeContext()}`;
+    const proactiveNow = new Date();
+    const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
+    const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
     const memoryPack = await prepareMemoryPack(charId, query);
-    const reply = await callAPI(chat, memoryPack, { charId, live: false, proactive: true });
+    const reply = await callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext });
     chat.messages.push({ role: 'assistant', content: String(reply || '').trim() || '在吗？', time: Date.now(), proactive: true });
     chat.lastProactiveAt = Date.now();
     if (activeScreen !== 'chat' || currentCharId !== charId) chat.unread = (chat.unread || 0) + 1;
     DB.set('chats', allChats);
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
     if (activeScreen === 'chats') renderChats();
-    if (manual) toast('已生成主动消息');
+    if (manual) toast('已生成主动消息\n已写入当前会话', 2400);
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] proactive update skipped:', err.message));
     return true;
   } catch (err) {
-    if (manual) toast('主动消息失败：' + err.message, 2600);
+    if (manual) toast('主动消息失败：' + friendlyErrorMessage(err), 3200);
     console.warn('[AL Proactive] skipped:', err.message);
     return false;
   } finally {
@@ -1406,6 +1587,15 @@ async function checkProactiveMessages() {
   if (!settings.proactiveEnabled || settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
   const target = findProactiveTarget();
   if (target) await triggerProactiveMessage(target.char.id, false);
+}
+async function catchUpDueCloudProactive() {
+  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
+  const target = findDueCloudProactiveTarget();
+  if (!target) return;
+  delete target.chat.pendingProactiveJob;
+  DB.set('chats', allChats);
+  await mirrorAppStateNow();
+  await triggerProactiveMessage(target.char.id, false);
 }
 function startProactiveLoop() {
   if (proactiveTimer) {
@@ -1419,7 +1609,7 @@ async function manualProactiveMessage() {
   saveSettings();
   const charId = currentCharId || getLatestChatRows()[0]?.char?.id;
   if (!charId) { toast('先创建并打开一个会话'); return; }
-  toast('正在生成主动消息...', 1000);
+  toast('正在生成主动消息...', 1800);
   await triggerProactiveMessage(charId, true);
 }
 
@@ -1432,11 +1622,20 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext();
   if (memoryPack) system += '\n\n' + memoryPack;
   if (options.proactive) {
-    system += `\n\n主动消息任务：现在不是用户刚发消息，而是你作为${currentChar?.name || '角色'}在合适的空闲时间主动发来一条微信式消息。只能输出消息正文，不要写动作、表情、旁白、心理描写、系统说明或定时器说明。可以自然参考当前时间、你们的关系、未兑现约定和最近聊天。默认 1-3 句，像真的私聊。`;
+    const proactiveNow = options.proactiveNow || new Date();
+    const proactiveTimeContext = options.proactiveTimeContext || buildProactiveTimeContext(chat, proactiveNow);
+    system += `\n\n${proactiveTimeContext}
+
+主动消息任务：现在不是用户刚发消息，而是你作为${currentChar?.name || '角色'}在合适的空闲时间主动发来一条微信式消息。
+只能输出消息正文，不要写动作、表情、旁白、心理描写、系统说明或定时器说明。
+可以自然参考当前时间、你们的关系、未兑现约定和最近聊天，但不要机械复述时间戳。
+默认 1-3 句，像真的私聊。`;
   }
   if (settings.systemPrompt) system += '\n\n' + settings.systemPrompt;
   if (chat.extraPrompt) system += '\n\n' + chat.extraPrompt;
-  const messages = recentMessages(chat, 30).map(m => ({ role: m.role, content: m.content }));
+  const messages = options.proactive
+    ? proactiveRecentMessages(chat, 30, options.proactiveNow || new Date())
+    : recentMessages(chat, 30).map(m => ({ role: m.role, content: m.content }));
   const callOptions = { live: options.live !== false, charId };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
 }
@@ -1469,14 +1668,6 @@ async function callOpenAI(system, messages, options = {}) {
 async function readOpenAIStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
   let result = '', buffer = '';
-  const box = document.getElementById('chat-messages');
-  box.querySelector('.typing')?.closest('.msg-wrap')?.remove();
-  const char = characters.find(c => c.id === charId);
-  const live = document.createElement('div');
-  live.className = 'msg-wrap';
-  live.innerHTML = `${avatarHtml(char, 'msg-avatar')}<div class="bubble"></div>`;
-  box.appendChild(live);
-  const bubble = live.querySelector('.bubble');
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -1488,7 +1679,10 @@ async function readOpenAIStream(resp, charId = currentCharId) {
       if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
       try {
         const delta = JSON.parse(t.slice(6)).choices?.[0]?.delta?.content;
-        if (delta) { result += delta; bubble.innerHTML = formatMsg(result); scrollChatBottom(); }
+        if (delta) {
+          result += delta;
+          updateStreamingDraft(charId, result);
+        }
       } catch {}
     }
   }
@@ -1510,14 +1704,6 @@ async function callClaude(system, messages, options = {}) {
 async function readClaudeStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
   let result = '', buffer = '';
-  const box = document.getElementById('chat-messages');
-  box.querySelector('.typing')?.closest('.msg-wrap')?.remove();
-  const char = characters.find(c => c.id === charId);
-  const live = document.createElement('div');
-  live.className = 'msg-wrap';
-  live.innerHTML = `${avatarHtml(char, 'msg-avatar')}<div class="bubble"></div>`;
-  box.appendChild(live);
-  const bubble = live.querySelector('.bubble');
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
@@ -1531,8 +1717,7 @@ async function readClaudeStream(resp, charId = currentCharId) {
         const json = JSON.parse(t.slice(6));
         if (json.type === 'content_block_delta' && json.delta?.text) {
           result += json.delta.text;
-          bubble.innerHTML = formatMsg(result);
-          scrollChatBottom();
+          updateStreamingDraft(charId, result);
         }
       } catch {}
     }
@@ -1714,7 +1899,7 @@ async function fetchModels(slot = 'chat') {
     toast(`${meta.label}已拉取 ${settings[meta.modelsKey].length} 个模型`);
   } catch (e) {
     renderModelOptions(settings[meta.modelsKey] || [], slot);
-    toast('拉取失败：' + e.message, 2600);
+    toast('拉取失败：' + friendlyErrorMessage(e), 3200);
   }
 }
 async function testConnection(slot = 'chat') {
@@ -1734,7 +1919,7 @@ async function testConnection(slot = 'chat') {
       const r = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${apiKey}` }, body:JSON.stringify({ model, messages:[{ role:'user', content:'Hi' }], max_tokens:10 }) }, API_TIMEOUT_MS);
       toast(r.ok ? `${api.label}连接成功` : `${api.label}连接失败：` + r.status);
     }
-  } catch (e) { toast('连接失败：' + e.message); }
+  } catch (e) { toast('连接失败：' + friendlyErrorMessage(e), 3200); }
 }
 
 async function renderMemoryScreen() {
@@ -1848,6 +2033,7 @@ async function syncFromServiceWorkerState() {
     if (activeScreen === 'contacts') renderContacts();
     if (activeScreen === 'memory') renderMemoryScreen();
   }
+  catchUpDueCloudProactive().catch(err => console.warn('[AL Timer] catch-up skipped:', err.message));
 }
 async function bootApp() {
   await syncFromServiceWorkerState();
@@ -1866,6 +2052,9 @@ async function bootApp() {
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) syncFromServiceWorkerState();
     });
+  }
+  if (typeof window !== 'undefined') {
+    window.addEventListener('focus', () => syncFromServiceWorkerState());
   }
 }
 

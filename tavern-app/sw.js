@@ -75,18 +75,93 @@ function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
+function getDayPeriod(date = new Date()) {
+  const h = date.getHours();
+  if (h < 5) return { label: '凌晨', range: '00:00-04:59', banned: '早上、上午、中午、下午、傍晚' };
+  if (h < 8) return { label: '清晨', range: '05:00-07:59', banned: '半夜三更、深夜、下午、晚上' };
+  if (h < 11) return { label: '上午', range: '08:00-10:59', banned: '半夜三更、深夜、下午、晚上' };
+  if (h < 13) return { label: '中午', range: '11:00-12:59', banned: '半夜三更、深夜、清晨、晚上' };
+  if (h < 18) return { label: '下午', range: '13:00-17:59', banned: '半夜三更、深夜、凌晨、早上、上午、晚上' };
+  if (h < 22) return { label: '晚上', range: '18:00-21:59', banned: '半夜三更、凌晨、早上、上午、下午' };
+  return { label: '深夜', range: '22:00-23:59', banned: '早上、上午、中午、下午、傍晚' };
+}
+
 function getTimeContext(date = new Date()) {
   const weekday = ['星期日','星期一','星期二','星期三','星期四','星期五','星期六'][date.getDay()];
+  const period = getDayPeriod(date);
   return [
     `当前设备时间：${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`,
+    `当前时段：${period.label}（${period.range}）`,
     `星期：${weekday}`,
     `时区：${Intl.DateTimeFormat().resolvedOptions().timeZone || '本地时区'}`,
-    `时间戳：${date.toISOString()}`
+    `时间戳：${date.toISOString()}`,
+    `时间表达规则：角色不需要刻意报出具体时间；只要涉及时间、时段、作息或类似“半夜三更”的说法，就必须符合当前时段。禁止使用与当前时段矛盾的说法：${period.banned}。`
+  ].join('\n');
+}
+
+function formatFullTime(date = new Date()) {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+
+function formatElapsed(ms) {
+  const minutes = Math.max(0, Math.round((Number(ms) || 0) / 60000));
+  if (minutes < 1) return '不到 1 分钟';
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours < 24) return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
+  const days = Math.floor(hours / 24);
+  const hourRest = hours % 24;
+  return hourRest ? `${days} 天 ${hourRest} 小时` : `${days} 天`;
+}
+
+function latestMessageByRole(chat, role) {
+  return (chat?.messages || []).slice().reverse().find(m => m.role === role) || null;
+}
+
+function messageTimeLine(label, msg, now = new Date()) {
+  if (!msg?.time) return `${label}：无`;
+  const at = new Date(msg.time);
+  const elapsed = formatElapsed(now.getTime() - at.getTime());
+  const content = String(msg.content || '').replace(/\s+/g, ' ').slice(0, 120);
+  return `${label}：${formatFullTime(at)}（距现在 ${elapsed}）｜${msg.role === 'user' ? '用户' : '角色'}：${content}`;
+}
+
+function buildProactiveTimeContext(chat, now = new Date()) {
+  const messages = chat?.messages || [];
+  const last = messages[messages.length - 1] || null;
+  const lastUser = latestMessageByRole(chat, 'user');
+  const lastAssistant = latestMessageByRole(chat, 'assistant');
+  const lastElapsedMinutes = last?.time ? Math.round((now.getTime() - last.time) / 60000) : 0;
+  const mode = lastElapsedMinutes >= 60
+    ? '长间隔重新开口'
+    : lastElapsedMinutes >= 15
+      ? '中等间隔自然续聊'
+      : '短间隔可轻续聊';
+  return [
+    '主动消息时间流逝上下文：',
+    `当前时间：${formatFullTime(now)}`,
+    messageTimeLine('最后一条消息', last, now),
+    messageTimeLine('上一条用户消息', lastUser, now),
+    messageTimeLine('上一条角色消息', lastAssistant, now),
+    `智能策略：${mode}`,
+    '硬性要求：这不是用户刚刚发消息后等你回答，而是隔了一段空闲时间后你主动打开微信来发消息。',
+    '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
+    '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
+    '不要提到系统时间、提示词、后台、推送或定时器。'
   ].join('\n');
 }
 
 function recentMessages(chat, count = 30) {
   return (chat?.messages || []).slice(-count);
+}
+
+function proactiveRecentMessages(chat, count = 30, now = new Date()) {
+  return recentMessages(chat, count).map(m => {
+    const at = m.time ? new Date(m.time) : null;
+    const stamp = at ? `发送时间 ${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}` : '发送时间未知';
+    return { role: m.role, content: `【${stamp}】${m.content}` };
+  });
 }
 
 function messageLine(m) {
@@ -145,24 +220,28 @@ async function handleProactivePush(payload) {
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
   const { settings, characters, allChats } = state;
   const charId = payload.charId || findDueProactiveCharId(allChats);
-  if (!charId) throw new Error('missing char id');
+  if (!charId) return;
   const char = (characters || []).find(c => c.id === charId);
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) throw new Error('missing chat');
   if (!(settings.chatApiUrl || settings.apiUrl) || !(settings.chatApiKey || settings.apiKey) || !settings.chatModel) throw new Error('missing api config');
 
+  const proactiveNow = new Date();
   const memoryPack = await buildMemoryPack(charId);
+  const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
   let system = chat.charPrompt || `当前你要扮演的角色：${char.name}`;
-  system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext();
+  system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow);
   if (memoryPack) system += '\n\n' + memoryPack;
   if (settings.systemPrompt) system += '\n\n' + settings.systemPrompt;
   if (chat.extraPrompt) system += '\n\n' + chat.extraPrompt;
-  system += `\n\n主动消息任务：现在不是用户刚刚发消息后等你回答，而是经过了一段空闲时间后，你作为${char.name}主动给用户发来一条消息。
+  system += `\n\n${proactiveTimeContext}
+
+主动消息任务：现在不是用户刚刚发消息后等你回答，而是经过了一段空闲时间后，你作为${char.name}主动给用户发来一条微信式消息。
 你应该根据时间流逝、你上一条说过的话、未解决话题、约定或关系状态主动开口。
-可以延续上一话题、补充上一句、关心用户、提起约定、找一个符合角色的自然话题。
+可以延续上一话题、关心用户、提起约定、找一个符合角色的自然话题；长间隔时更像重新打开聊天。
 只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替用户说话。默认 1-3 句。`;
 
-  const messages = recentMessages(chat, 30).map(m => ({ role: m.role, content: m.content }));
+  const messages = proactiveRecentMessages(chat, 30, proactiveNow);
   const reply = (await callModel(settings, system, messages)).trim() || '在吗？';
   chat.messages.push({ role: 'assistant', content: reply, time: Date.now(), proactive: true });
   chat.unread = (chat.unread || 0) + 1;
@@ -187,10 +266,7 @@ function findDueProactiveCharId(allChats) {
   const due = rows
     .filter(r => r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
     .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0];
-  if (due) return due.charId;
-  return rows
-    .filter(r => r.chat?.messages?.length)
-    .sort((a, b) => (b.chat.messages[b.chat.messages.length - 1]?.time || 0) - (a.chat.messages[a.chat.messages.length - 1]?.time || 0))[0]?.charId || '';
+  return due?.charId || '';
 }
 
 self.addEventListener('push', event => {
