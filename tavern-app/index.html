@@ -1134,8 +1134,46 @@ function uid(prefix) {
 function memoryMetaKey(charId) {
   return `memory_processed_${charId}`;
 }
-function messageLine(m) {
-  return `${m.role === 'user' ? '用户' : '角色'}：${m.content}`;
+function playerName() {
+  return '玩家';
+}
+function charName(char) {
+  return char?.name || '对方';
+}
+function memoryAliasText(text, char) {
+  return String(text || '')
+    .replace(/用户/g, playerName())
+    .replace(/角色/g, charName(char));
+}
+function messageLine(m, char) {
+  return `${m.role === 'user' ? playerName() : charName(char)}：${m.content}`;
+}
+function memoryTextHasSignal(text) {
+  const value = String(text || '');
+  return /(承诺|约定|答应|计划|以后|下次|明天|今晚|周|红包|金额|欠|补偿|道歉|和好|吵|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住|城市|家|学校|公司|重要|不能忘|必须记)/.test(value);
+}
+function memoryTextIsNoise(text) {
+  const value = String(text || '');
+  return /(测试|校对|表快|表慢|几点|现在时间|AI身份|身份争论|是不是AI|名字.*合理|戏太多|科幻片|装神弄鬼|普通寒暄|你好|在吗|又来)/.test(value)
+    && !memoryTextHasSignal(value.replace(/测试|校对|几点|AI身份|身份争论/g, ''));
+}
+function shouldKeepEvent(e) {
+  const type = String(e?.type || '');
+  const importance = Number(e?.importance) || 0;
+  const text = [e?.title, e?.detail, e?.happenedAt, ...(e?.keywords || [])].join(' ');
+  if (!e?.detail || memoryTextIsNoise(text)) return false;
+  if (['promise', 'conflict', 'reconcile', 'preference', 'relationship', 'plan'].includes(type)) return importance >= 3 || memoryTextHasSignal(text);
+  return importance >= 4 && memoryTextHasSignal(text);
+}
+function shouldKeepProfile(p) {
+  const importance = Number(p?.importance) || 0;
+  const text = [p?.title, p?.detail, ...(p?.keywords || [])].join(' ');
+  if (!p?.detail || memoryTextIsNoise(text)) return false;
+  return importance >= 4 || memoryTextHasSignal(text);
+}
+function shouldKeepSummary(summary) {
+  const text = String(summary || '');
+  return text.length >= 20 && !memoryTextIsNoise(text) && memoryTextHasSignal(text);
 }
 function recentMessages(chat, count = 30) {
   return (chat?.messages || []).slice(-count);
@@ -1239,7 +1277,7 @@ async function generateMemoryQuery(char, userInput, messages) {
   const fallback = { query: `${char?.name || ''} ${userInput}`, keywords: [], focus: 'current' };
   if (!settings.memoryModel || !settings.memoryApiUrl || !settings.memoryApiKey) return fallback;
   const system = '你是本地记忆检索助手。只根据用户当前输入和最近聊天，生成用于向量数据库召回的检索查询。只输出 JSON，不参与角色扮演，不回复用户。';
-  const user = `角色：${char?.name || '未知'}\n最近聊天：\n${messages.slice(-8).map(messageLine).join('\n')}\n\n用户当前输入：${userInput}\n\n输出 JSON：{"query":"一句检索查询","keywords":["关键词"],"focus":"需要召回的记忆类型"}`;
+  const user = `双方昵称：${playerName()} / ${charName(char)}\n最近聊天：\n${messages.slice(-8).map(m => messageLine(m, char)).join('\n')}\n\n${playerName()}当前输入：${userInput}\n\n输出 JSON：{"query":"一句检索查询","keywords":["关键词"],"focus":"需要召回的记忆类型"}`;
   try {
     const json = await callMemoryJSON(system, user);
     return { ...fallback, ...json };
@@ -1253,7 +1291,7 @@ async function searchMemoryVectors(charId, queryText, limit = 8) {
   const rows = await MemoryDB.byChar('vectors', charId);
   return rows
     .map(row => ({ ...row, score: cosine(queryVector, row.embedding) }))
-    .filter(row => row.score > 0.18)
+    .filter(row => row.score > 0.18 && !memoryTextIsNoise(row.text))
     .sort((a, b) => (b.score + (b.importance || 0) * 0.015) - (a.score + (a.importance || 0) * 0.015))
     .slice(0, limit);
 }
@@ -1282,39 +1320,44 @@ async function prepareMemoryPack(charId, userInput) {
   const query = await generateMemoryQuery(char, userInput, recent);
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
   const hits = await searchMemoryVectors(charId, queryText);
-  const summaries = (await MemoryDB.byChar('summaries', charId)).sort((a, b) => b.createdAt - a.createdAt).slice(0, 3);
+  const summaries = (await MemoryDB.byChar('summaries', charId))
+    .filter(s => shouldKeepSummary(memoryAliasText(s.content, char)))
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .slice(0, 3);
   const parts = [];
   if (summaries.length) {
-    parts.push('近期增量摘要：\n' + summaries.reverse().map(s => `- ${s.content}`).join('\n'));
+    parts.push('近期增量摘要：\n' + summaries.reverse().map(s => `- ${memoryAliasText(s.content, char)}`).join('\n'));
   }
   if (hits.length) {
-    parts.push('本轮向量召回记忆：\n' + hits.map(h => `- ${h.text}`).join('\n'));
+    parts.push('本轮向量召回记忆：\n' + hits.map(h => `- ${memoryAliasText(h.text, char)}`).join('\n'));
   }
   if (!parts.length) return '';
   return `以下是后台本地记忆库提供给你的参考，只在与当前对话相关时使用。不要提到“记忆库/向量/摘要/系统提示”，不要照搬结构化文字，仍然只输出角色发来的聊天消息。\n\n${parts.join('\n\n')}`;
 }
 async function extractTurnMemory(charId, batch) {
   const char = characters.find(c => c.id === charId);
-  const oldSummaries = (await MemoryDB.byChar('summaries', charId)).sort((a, b) => a.createdAt - b.createdAt).map(s => s.content).join('\n');
+  const oldSummaries = (await MemoryDB.byChar('summaries', charId)).sort((a, b) => a.createdAt - b.createdAt).map(s => memoryAliasText(s.content, char)).join('\n');
   const system = `你是 AL 的本地记忆整理 AI，负责把微信式 RP 聊天提炼为数据库记录。
 只输出 JSON，不要输出解释。
 原则：
-1. 只记录聊天中明确出现或能稳定确认的信息，不编造。
-2. 新摘要必须在旧摘要基础上做加法，不覆盖旧摘要，不省略重要时间节点。
-3. 重要事情和时间节点必须单独进入 events，尤其是承诺、约定、争执、和好、称呼变化、用户雷点、未解决事项。
-4. profile_updates 记录稳定偏好、角色认知、关系状态，不记录一次性闲聊。
-5. 所有 detail 要具体，不要简写成“发生了一些事”。
-6. 这是纯聊天 RP，禁止把动作、神态、环境描写当作事实新增，除非它是用户明确用文字表达的设定。`;
-  const user = `角色：${char?.name || '未知'}
+1. 只记录聊天中明确出现、未来会影响回复的信息，不编造。
+2. 不要记录普通寒暄、临时玩笑、测试对话、时间校对、AI身份争论、一次性吐槽、无后续价值的争辩。
+3. events 只记录重要事件和时间节点：承诺/欠账/约定/计划、争执与和好、关系变化、称呼变化、明确雷点、未解决事项、会影响后续剧情的事实。
+4. profile_updates 只记录稳定资料：${playerName()}或${charName(char)}的年龄、职业、住址城市、长期偏好、边界、关系状态；不记录一次性闲聊。
+5. summary 只概括本轮新增的长期有效信息；如果本轮没有值得长期记忆的内容，summary 返回空字符串，events/profile_updates 返回空数组。
+6. 所有记录必须使用双方昵称“${playerName()}”和“${charName(char)}”，禁止用“用户”“角色”代称。
+7. 所有 detail 要具体，不要简写成“发生了一些事”。
+8. 这是纯聊天 RP，禁止把动作、神态、环境描写当作事实新增，除非它是聊天文字明确表达的设定。`;
+  const user = `双方昵称：${playerName()} / ${charName(char)}
 旧增量摘要：
 ${oldSummaries || '暂无'}
 
 本轮新增聊天：
-${batch.map(messageLine).join('\n')}
+${batch.map(m => messageLine(m, char)).join('\n')}
 
 输出 JSON，格式严格如下：
 {
-  "summary": "本轮新增摘要，120-300字，只写新增事实和关系变化",
+  "summary": "本轮新增摘要，0-200字；只写值得长期记忆的新增事实、约定、关系变化；没有则为空字符串",
   "profile_updates": [
     {"type":"user|character|relationship","title":"短标题","detail":"稳定资料","importance":1-5,"keywords":["关键词"]}
   ],
@@ -1326,20 +1369,35 @@ ${batch.map(messageLine).join('\n')}
 }
 async function storeExtractedMemory(charId, extracted) {
   const now = Date.now();
-  if (extracted.summary) {
-    const item = { id: uid('sum'), charId, content: String(extracted.summary).trim(), createdAt: now };
+  const char = characters.find(c => c.id === charId);
+  const summary = memoryAliasText(extracted.summary, char).trim();
+  if (shouldKeepSummary(summary)) {
+    const item = { id: uid('sum'), charId, content: summary, createdAt: now };
     await MemoryDB.put('summaries', item);
     await saveVector(charId, 'summary', item.id, item.content, ['摘要'], 3);
   }
   for (const p of extracted.profile_updates || []) {
-    if (!p?.detail) continue;
-    const item = { id: uid('pro'), charId, type: p.type || 'relationship', title: p.title || '资料', detail: p.detail, importance: Number(p.importance) || 3, keywords: p.keywords || [], createdAt: now };
+    const normalized = {
+      ...p,
+      title: memoryAliasText(p?.title || '资料', char),
+      detail: memoryAliasText(p?.detail || '', char),
+      keywords: (p?.keywords || []).map(k => memoryAliasText(k, char))
+    };
+    if (!shouldKeepProfile(normalized)) continue;
+    const item = { id: uid('pro'), charId, type: normalized.type || 'relationship', title: normalized.title || '资料', detail: normalized.detail, importance: Number(normalized.importance) || 3, keywords: normalized.keywords || [], createdAt: now };
     await MemoryDB.put('profiles', item);
     await saveVector(charId, 'profile', item.id, memoryTextForVector(item), item.keywords, item.importance);
   }
   for (const e of extracted.events || []) {
-    if (!e?.detail) continue;
-    const item = { id: uid('evt'), charId, happenedAt: e.happenedAt || '未注明', type: e.type || 'fact', title: e.title || '重要事件', detail: e.detail, status: e.status || 'stable', importance: Number(e.importance) || 3, keywords: e.keywords || [], createdAt: now };
+    const normalized = {
+      ...e,
+      happenedAt: memoryAliasText(e?.happenedAt || '未注明', char),
+      title: memoryAliasText(e?.title || '重要事件', char),
+      detail: memoryAliasText(e?.detail || '', char),
+      keywords: (e?.keywords || []).map(k => memoryAliasText(k, char))
+    };
+    if (!shouldKeepEvent(normalized)) continue;
+    const item = { id: uid('evt'), charId, happenedAt: normalized.happenedAt || '未注明', type: normalized.type || 'fact', title: normalized.title || '重要事件', detail: normalized.detail, status: normalized.status || 'stable', importance: Number(normalized.importance) || 3, keywords: normalized.keywords || [], createdAt: now };
     await MemoryDB.put('events', item);
     await saveVector(charId, 'event', item.id, memoryTextForVector(item), item.keywords, item.importance);
   }
@@ -1936,11 +1994,14 @@ async function renderMemoryScreen() {
     MemoryDB.byChar('profiles', charId),
     MemoryDB.byChar('vectors', charId)
   ]);
-  status.textContent = `${char.name}：摘要 ${summaries.length} 条，事件 ${events.length} 条，资料 ${profiles.length} 条，向量 ${vectors.length} 条。`;
+  const visibleEvents = events.filter(shouldKeepEvent);
+  const visibleProfiles = profiles.filter(shouldKeepProfile);
+  const visibleSummaries = summaries.filter(s => shouldKeepSummary(memoryAliasText(s.content, char)));
+  status.textContent = `${char.name}：可用摘要 ${visibleSummaries.length} 条，事件 ${visibleEvents.length} 条，资料 ${visibleProfiles.length} 条。`;
   const rows = [
-    ...events.map(e => ({ kind: '事件', time: e.createdAt, title: e.title, detail: `${e.happenedAt}｜${e.detail}` })),
-    ...profiles.map(p => ({ kind: '资料', time: p.createdAt, title: p.title, detail: p.detail })),
-    ...summaries.map(s => ({ kind: '摘要', time: s.createdAt, title: '增量摘要', detail: s.content }))
+    ...visibleEvents.map(e => ({ kind: '事件', time: e.createdAt, title: memoryAliasText(e.title, char), detail: `${memoryAliasText(e.happenedAt, char)}｜${memoryAliasText(e.detail, char)}` })),
+    ...visibleProfiles.map(p => ({ kind: '资料', time: p.createdAt, title: memoryAliasText(p.title, char), detail: memoryAliasText(p.detail, char) })),
+    ...visibleSummaries.map(s => ({ kind: '摘要', time: s.createdAt, title: '增量摘要', detail: memoryAliasText(s.content, char) }))
   ].sort((a, b) => b.time - a.time).slice(0, 30);
   if (!rows.length) {
     list.innerHTML = '<div class="empty"><div class="empty-ico">⌘</div><div>当前角色还没有入库记忆<br>聊天满记忆间隔后会自动整理</div></div>';
