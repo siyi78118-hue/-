@@ -45,7 +45,7 @@ button{border:none;background:none;cursor:pointer}
 .ico-compass{border:2.5px solid currentColor;border-radius:50%}.ico-compass:before{content:"";position:absolute;left:9px;top:5px;width:9px;height:16px;background:currentColor;clip-path:polygon(50% 0,100% 100%,50% 76%,0 100%)}
 .ico-me:before{content:"";position:absolute;left:8px;top:2px;width:11px;height:11px;border:2px solid currentColor;border-radius:50%;background:#f7f7f7}.ico-me:after{content:"";position:absolute;left:4px;top:17px;width:19px;height:8px;border:2px solid currentColor;border-bottom:none;border-radius:16px 16px 0 0}
 .search-bar{padding:8px 12px;background:var(--page)}
-.search-box{height:34px;border-radius:5px;background:#fff;color:#9a9a9a;display:flex;align-items:center;justify-content:center;gap:6px;font-size:14px}
+.search-box{width:100%;height:34px;border-radius:5px;background:#fff;color:#9a9a9a;display:flex;align-items:center;justify-content:center;gap:6px;font-size:14px}
 .search-box .icon-search:before{border-color:#b4b4b4}.search-box .icon-search:after{background:#b4b4b4}
 .list{background:var(--panel)}
 .row{width:100%;min-height:70px;padding:0 16px;display:flex;align-items:center;gap:12px;border-bottom:none;position:relative;background:#fff;text-align:left}
@@ -88,6 +88,9 @@ button{border:none;background:none;cursor:pointer}
 .mini-menu-icon.file:before{left:3px;top:5px;width:16px;height:13px;border:2px solid #fff;border-radius:2px}.mini-menu-icon.file:after{left:4px;top:3px;width:8px;height:5px;background:#fff;border-radius:2px 2px 0 0}
 .mini-menu-icon.edit:before{left:5px;top:14px;width:14px;height:2px;background:#fff;transform:rotate(-45deg);border-radius:2px}.mini-menu-icon.edit:after{left:5px;top:5px;width:11px;height:11px;border:2px solid #fff;border-radius:2px}
 .mini-menu-icon.gear:before{left:4px;top:4px;width:14px;height:14px;border:3px dotted #fff;border-radius:50%}.mini-menu-icon.gear:after{left:9px;top:9px;width:4px;height:4px;border-radius:50%;background:#fff}
+.mini-menu-icon.scan:before{left:3px;top:3px;width:16px;height:16px;background:linear-gradient(#fff 0 0) left top/7px 2px no-repeat,linear-gradient(#fff 0 0) left top/2px 7px no-repeat,linear-gradient(#fff 0 0) right top/7px 2px no-repeat,linear-gradient(#fff 0 0) right top/2px 7px no-repeat,linear-gradient(#fff 0 0) left bottom/7px 2px no-repeat,linear-gradient(#fff 0 0) left bottom/2px 7px no-repeat,linear-gradient(#fff 0 0) right bottom/7px 2px no-repeat,linear-gradient(#fff 0 0) right bottom/2px 7px no-repeat}.mini-menu-icon.scan:after{left:5px;top:10px;width:12px;height:2px;background:#fff}
+.contact-rail{position:absolute;right:4px;top:142px;bottom:72px;width:18px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;color:#666;font-size:10px;line-height:1;pointer-events:none}
+.contact-rail span{display:block;height:11px}
 .page-pad{padding:8px 0 calc(42px + var(--safe-bottom));background:#ededed;min-height:100%}
 .hero-panel{margin-bottom:12px;padding:16px;border-radius:8px;background:#fff;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .hero-title{font-size:20px;font-weight:700;margin-bottom:6px}
@@ -234,14 +237,9 @@ button{border:none;background:none;cursor:pointer}
     <div class="topbar">
       <div class="top-left"></div>
       <div class="top-title">AL</div>
-      <div class="top-right"><button class="icon-btn" onclick="togglePlusMenu()" title="添加"><span class="icon-plus"></span></button></div>
+      <div class="top-right"><button class="icon-btn" onclick="openSearch('chats')" title="搜索"><span class="icon-search"></span></button><button class="icon-btn" onclick="togglePlusMenu()" title="添加"><span class="icon-plus"></span></button></div>
     </div>
-    <div id="plus-menu" class="plus-menu">
-      <button class="plus-item" onclick="openImport()"><span class="mini-menu-icon file"></span>导入角色</button>
-      <button class="plus-item" onclick="openCreateRole()"><span class="mini-menu-icon edit"></span>新建角色</button>
-      <button class="plus-item" onclick="showScreen('settings')"><span class="mini-menu-icon gear"></span>设置</button>
-    </div>
-    <div class="search-bar"><div class="search-box"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span>搜索</div></div>
+    <div class="search-bar"><button class="search-box" onclick="openSearch('chats')" type="button"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span><span id="search-label-chats">搜索</span></button></div>
     <div class="scroll"><div id="chat-list"></div></div>
     <nav class="tabbar">
       <button class="tab active" data-screen="chats" onclick="showScreen('chats')"><span class="tab-ico ico-chat"></span>AL</button>
@@ -251,6 +249,13 @@ button{border:none;background:none;cursor:pointer}
     </nav>
   </div>
 
+  <div id="plus-menu" class="plus-menu">
+    <button class="plus-item" onclick="showScreen('contacts')"><span class="mini-menu-icon file"></span>发起聊天</button>
+    <button class="plus-item" onclick="openCreateRole()"><span class="mini-menu-icon edit"></span>添加朋友</button>
+    <button class="plus-item" onclick="openImport()"><span class="mini-menu-icon scan"></span>扫一扫</button>
+    <button class="plus-item" onclick="showScreen('settings')"><span class="mini-menu-icon gear"></span>设置</button>
+  </div>
+
   <div id="screen-contacts" class="screen">
     <div class="topbar">
       <div class="top-left"></div>
@@ -258,7 +263,7 @@ button{border:none;background:none;cursor:pointer}
       <div class="top-right"><button class="icon-btn" onclick="openCreateRole()">＋</button></div>
     </div>
     <div class="scroll">
-      <div class="search-bar"><div class="search-box"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span>搜索</div></div>
+      <div class="search-bar"><button class="search-box" onclick="openSearch('contacts')" type="button"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span><span id="search-label-contacts">搜索</span></button></div>
       <div class="wx-group">
         <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-new"></span><div class="cell-body">新的朋友</div></button>
         <button class="cell" onclick="showScreen('chats')"><span class="wx-icon green wx-groupchat"></span><div class="cell-body">群聊</div></button>
@@ -267,6 +272,7 @@ button{border:none;background:none;cursor:pointer}
       </div>
       <div class="contact-index">A</div>
       <div class="list" id="contact-list"></div>
+      <div class="contact-rail"><span>↑</span><span>☆</span><span>A</span><span>B</span><span>C</span><span>D</span><span>E</span><span>F</span><span>G</span><span>H</span><span>I</span><span>J</span><span>K</span><span>L</span><span>M</span><span>N</span><span>O</span><span>P</span><span>Q</span><span>R</span><span>S</span><span>T</span><span>U</span><span>V</span><span>W</span><span>X</span><span>Y</span><span>Z</span><span>#</span></div>
     </div>
     <nav class="tabbar">
       <button class="tab" data-screen="chats" onclick="showScreen('chats')"><span class="tab-ico ico-chat"></span>AL</button>
@@ -277,7 +283,7 @@ button{border:none;background:none;cursor:pointer}
   </div>
 
   <div id="screen-discover" class="screen">
-    <div class="topbar"><div class="top-left"></div><div class="top-title">发现</div><div class="top-right"></div></div>
+    <div class="topbar"><div class="top-left"></div><div class="top-title">发现</div><div class="top-right"><button class="icon-btn" onclick="openSearch('discover')" title="搜索"><span class="icon-search"></span></button><button class="icon-btn" onclick="togglePlusMenu()" title="添加"><span class="icon-plus"></span></button></div></div>
     <div class="scroll" style="background:#ededed">
       <div class="wx-group">
         <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
@@ -631,6 +637,7 @@ function migrateSettings(raw) {
 let settings = migrateSettings(DB.get('settings', DEFAULT_SETTINGS));
 let characters = DB.get('characters', []);
 let allChats = DB.get('chats', {});
+let searchFilters = { chats: '', contacts: '' };
 let currentCharId = null;
 let isStreaming = false;
 let streamingDraft = null;
@@ -943,6 +950,7 @@ function showScreen(name) {
   if (['chats','contacts','discover','me'].includes(name)) lastMainScreen = name;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.screen === name));
   renderPlayerProfile();
+  renderSearchLabels();
   if (name === 'chats') renderChats();
   if (name === 'contacts') renderContacts();
   if (name === 'moments') renderMoments();
@@ -952,6 +960,28 @@ function showScreen(name) {
 function togglePlusMenu() {
   plusOpen = !plusOpen;
   document.getElementById('plus-menu').classList.toggle('show', plusOpen);
+}
+function openSearch(scope = activeScreen) {
+  if (scope === 'discover') {
+    const text = prompt('搜索');
+    if (text) toast('已搜索：' + text.trim());
+    return;
+  }
+  if (!['chats', 'contacts'].includes(scope)) scope = activeScreen === 'contacts' ? 'contacts' : 'chats';
+  const old = searchFilters[scope] || '';
+  const next = prompt('搜索', old) ?? old;
+  searchFilters[scope] = next.trim();
+  renderSearchLabels();
+  if (scope === 'contacts') renderContacts();
+  else renderChats();
+}
+function renderSearchLabels() {
+  for (const scope of ['chats', 'contacts']) {
+    const el = document.getElementById('search-label-' + scope);
+    if (!el) continue;
+    const value = searchFilters[scope];
+    el.textContent = value ? `搜索：${value}` : '搜索';
+  }
 }
 function openImport() { showScreen('import'); }
 function openCreateRole() {
@@ -1044,15 +1074,19 @@ async function handleModalCharAvatar(event) {
 
 function renderChats() {
   const wrap = document.getElementById('chat-list');
+  const keyword = (searchFilters.chats || '').toLowerCase();
   const roleRows = characters.map(c => {
     const chat = allChats[c.id];
     const last = chat?.messages?.[chat.messages.length - 1];
     const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
     const unread = chat?.unread || 0;
     return { c, last, preview, unread, time: last?.time || 0 };
-  }).sort((a,b) => b.time - a.time || a.c.name.localeCompare(b.c.name, 'zh-CN'));
+  }).filter(r => !keyword || [r.c.name, r.preview, r.c.description, r.c.personality].some(v => String(v || '').toLowerCase().includes(keyword)))
+    .sort((a,b) => b.time - a.time || a.c.name.localeCompare(b.c.name, 'zh-CN'));
   if (!roleRows.length) {
-    wrap.innerHTML = '<div class="empty"><div class="empty-ico">💬</div><div>还没有会话<br>点右上角＋新建或导入角色</div></div>';
+    wrap.innerHTML = searchFilters.chats
+      ? '<div class="empty"><div class="empty-ico">⌕</div><div>没有找到相关会话</div></div>'
+      : '<div class="empty"><div class="empty-ico">💬</div><div>还没有会话<br>点右上角＋新建或导入角色</div></div>';
     return;
   }
   const roleHtml = roleRows.map((r, i) => `
@@ -1068,11 +1102,17 @@ function renderChats() {
 }
 function renderContacts() {
   const list = document.getElementById('contact-list');
-  if (!characters.length) {
-    list.innerHTML = '<div class="empty"><div class="empty-ico">👥</div><div>暂无联系人</div></div>';
+  const keyword = (searchFilters.contacts || '').toLowerCase();
+  const rows = characters
+    .filter(c => !keyword || [c.name, c.description, c.personality].some(v => String(v || '').toLowerCase().includes(keyword)))
+    .sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'));
+  if (!rows.length) {
+    list.innerHTML = searchFilters.contacts
+      ? '<div class="empty"><div class="empty-ico">⌕</div><div>没有找到相关联系人</div></div>'
+      : '<div class="empty"><div class="empty-ico">👥</div><div>暂无联系人</div></div>';
     return;
   }
-  list.innerHTML = characters.slice().sort((a,b)=>a.name.localeCompare(b.name,'zh-CN')).map(c => `
+  list.innerHTML = rows.map(c => `
     <button class="row" onclick="openChat('${c.id}')">
       ${avatarHtml(c)}
       <div class="row-main"><div class="row-name">${esc(c.name)}</div><div class="row-preview">${esc(c.description || c.personality || '')}</div></div>
