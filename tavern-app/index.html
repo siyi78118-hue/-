@@ -28,7 +28,7 @@ button{border:none;background:none;cursor:pointer}
 .top-title{font-size:17px;font-weight:600;flex:1;text-align:center;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:0}
 .top-left,.top-right{width:74px;display:flex;align-items:center;gap:8px}
 .top-right{justify-content:flex-end}
-.icon-btn{width:34px;height:34px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:22px;color:#181818}
+.icon-btn{width:34px;height:34px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:22px;color:#181818;position:relative}
 .icon-btn:active{background:#d9d9d9}
 .icon-search,.icon-plus{width:32px;height:32px;position:relative;display:block}
 .icon-search:before{content:"";position:absolute;left:4px;top:3px;width:18px;height:18px;border:3px solid #111;border-radius:50%}.icon-search:after{content:"";position:absolute;left:23px;top:23px;width:11px;height:3px;background:#111;transform:rotate(45deg);transform-origin:left center;border-radius:2px}
@@ -36,21 +36,22 @@ button{border:none;background:none;cursor:pointer}
 .back-btn{justify-content:flex-start;font-size:28px}
 .scroll{flex:1;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;scrollbar-width:none}
 .tabbar{height:58px;padding-bottom:var(--safe-bottom);display:grid;grid-template-columns:repeat(4,1fr);background:#f7f7f7;border-top:1px solid #d8d8d8;flex-shrink:0}
-.tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;color:#111;font-size:12px;line-height:1}
-.tab .tab-ico{width:28px;height:26px;position:relative;display:block;color:#111}
+.tab{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;color:#111;font-size:11px;line-height:1}
+.tab .tab-ico{width:27px;height:25px;position:relative;display:block;color:#111}
 .tab.active{color:var(--green)}
 .tab.active .tab-ico{color:var(--green)}
-.ico-chat:before{content:"";position:absolute;left:2px;top:3px;width:28px;height:21px;background:currentColor;border-radius:50%}.ico-chat:after{content:"";position:absolute;left:8px;top:20px;border-top:9px solid currentColor;border-right:8px solid transparent}
-.ico-contact:before{content:"";position:absolute;left:9px;top:2px;width:14px;height:14px;border:3px solid currentColor;border-radius:50%;background:#f7f7f7}.ico-contact:after{content:"";position:absolute;left:4px;top:18px;width:22px;height:11px;border:3px solid currentColor;border-bottom:none;border-radius:14px 14px 0 0}.ico-contact i{position:absolute;right:0;top:12px;width:12px;height:3px;background:currentColor;box-shadow:0 7px 0 currentColor}
-.ico-compass{border:3px solid currentColor;border-radius:50%}.ico-compass:before{content:"";position:absolute;left:9px;top:5px;width:11px;height:18px;background:currentColor;clip-path:polygon(50% 0,100% 100%,50% 76%,0 100%)}
-.ico-me:before{content:"";position:absolute;left:9px;top:2px;width:14px;height:14px;border:3px solid currentColor;border-radius:50%;background:#f7f7f7}.ico-me:after{content:"";position:absolute;left:4px;top:19px;width:24px;height:10px;border:3px solid currentColor;border-bottom:none;border-radius:16px 16px 0 0}
+.ico-chat:before{content:"";position:absolute;left:2px;top:4px;width:22px;height:17px;background:currentColor;border-radius:13px}.ico-chat:after{content:"";position:absolute;left:8px;top:18px;border-top:7px solid currentColor;border-right:7px solid transparent}
+.ico-contact:before{content:"";position:absolute;left:8px;top:2px;width:11px;height:11px;border:2px solid currentColor;border-radius:50%;background:#f7f7f7}.ico-contact:after{content:"";position:absolute;left:4px;top:16px;width:19px;height:9px;border:2px solid currentColor;border-bottom:none;border-radius:14px 14px 0 0}.ico-contact i{position:absolute;right:0;top:11px;width:10px;height:2px;background:currentColor;box-shadow:0 6px 0 currentColor}
+.ico-compass{border:2.5px solid currentColor;border-radius:50%}.ico-compass:before{content:"";position:absolute;left:9px;top:5px;width:9px;height:16px;background:currentColor;clip-path:polygon(50% 0,100% 100%,50% 76%,0 100%)}
+.ico-me:before{content:"";position:absolute;left:8px;top:2px;width:11px;height:11px;border:2px solid currentColor;border-radius:50%;background:#f7f7f7}.ico-me:after{content:"";position:absolute;left:4px;top:17px;width:19px;height:8px;border:2px solid currentColor;border-bottom:none;border-radius:16px 16px 0 0}
 .search-bar{padding:8px 12px;background:var(--page)}
 .search-box{height:34px;border-radius:5px;background:#fff;color:#9a9a9a;display:flex;align-items:center;justify-content:center;gap:6px;font-size:14px}
+.search-box .icon-search:before{border-color:#b4b4b4}.search-box .icon-search:after{background:#b4b4b4}
 .list{background:var(--panel)}
-.row{width:100%;min-height:72px;padding:0 16px;display:flex;align-items:center;gap:12px;border-bottom:none;position:relative;background:#fff;text-align:left}
-.row:after{content:"";position:absolute;left:78px;right:0;bottom:0;height:1px;background:#eeeeee}
+.row{width:100%;min-height:70px;padding:0 16px;display:flex;align-items:center;gap:12px;border-bottom:none;position:relative;background:#fff;text-align:left}
+.row:after{content:"";position:absolute;left:76px;right:0;bottom:0;height:1px;background:#eeeeee}
 .row:active{background:#ececec}
-.avatar{width:48px;height:48px;border-radius:5px;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden;background:linear-gradient(135deg,#8fd36f,#3fb466);color:#fff;font-size:20px;font-weight:600;position:relative}
+.avatar{width:46px;height:46px;border-radius:4px;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden;background:linear-gradient(135deg,#8fd36f,#3fb466);color:#fff;font-size:19px;font-weight:600;position:relative}
 .avatar.large{width:64px;height:64px;border-radius:7px;font-size:28px}
 .avatar img{width:100%;height:100%;object-fit:cover}
 .avatar-edit{display:flex;align-items:center;gap:12px}
@@ -82,6 +83,11 @@ button{border:none;background:none;cursor:pointer}
 .plus-item{height:48px;padding:0 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid rgba(255,255,255,.12);font-size:15px}
 .plus-item:active{background:#3e3e3e}
 .plus-item:last-child{border-bottom:none}
+.mini-menu-icon{width:22px;height:22px;position:relative;display:inline-block;flex-shrink:0}
+.mini-menu-icon:before,.mini-menu-icon:after{content:"";position:absolute;display:block}
+.mini-menu-icon.file:before{left:3px;top:5px;width:16px;height:13px;border:2px solid #fff;border-radius:2px}.mini-menu-icon.file:after{left:4px;top:3px;width:8px;height:5px;background:#fff;border-radius:2px 2px 0 0}
+.mini-menu-icon.edit:before{left:5px;top:14px;width:14px;height:2px;background:#fff;transform:rotate(-45deg);border-radius:2px}.mini-menu-icon.edit:after{left:5px;top:5px;width:11px;height:11px;border:2px solid #fff;border-radius:2px}
+.mini-menu-icon.gear:before{left:4px;top:4px;width:14px;height:14px;border:3px dotted #fff;border-radius:50%}.mini-menu-icon.gear:after{left:9px;top:9px;width:4px;height:4px;border-radius:50%;background:#fff}
 .page-pad{padding:8px 0 calc(42px + var(--safe-bottom));background:#ededed;min-height:100%}
 .hero-panel{margin-bottom:12px;padding:16px;border-radius:8px;background:#fff;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .hero-title{font-size:20px;font-weight:700;margin-bottom:6px}
@@ -90,14 +96,32 @@ button{border:none;background:none;cursor:pointer}
 .quick-card{min-height:72px;padding:12px;border-radius:8px;background:#fff;display:flex;align-items:center;gap:10px;box-shadow:0 1px 0 rgba(0,0,0,.04);text-align:left}
 .quick-ico{width:42px;height:42px;border-radius:7px;background:#07c160;color:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
 .quick-title{font-size:15px;font-weight:650}.quick-sub{font-size:12px;color:#8a8a8a;margin-top:3px;line-height:1.3}
-.wx-icon{width:38px;height:38px;border-radius:5px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:19px;flex-shrink:0}
-.wx-icon.green{background:#07c160}.wx-icon.orange{background:#fa9d3b}.wx-icon.blue{background:#5b8def}.wx-icon.cyan{background:#20b4ee}.wx-icon.gray{background:#8f8f8f}.wx-icon.red{background:#fa5151}
+.wx-icon{width:32px;height:32px;border-radius:5px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:0;flex-shrink:0;position:relative;overflow:hidden}
+.wx-icon.green{background:#07c160}.wx-icon.orange{background:#fa9d3b}.wx-icon.blue{background:#5b8def}.wx-icon.cyan{background:#20b4ee}.wx-icon.gray{background:#8f8f8f}.wx-icon.red{background:#fa5151}.wx-icon.purple{background:#6467f0}
+.wx-icon:before,.wx-icon:after{content:"";position:absolute;display:block}
+.wx-new:before{left:8px;top:7px;width:10px;height:10px;border:2px solid #fff;border-radius:50%}.wx-new:after{left:15px;top:16px;width:12px;height:7px;border:2px solid #fff;border-bottom:none;border-radius:10px 10px 0 0;box-shadow:-8px 0 0 -2px #fff}
+.wx-groupchat:before{left:7px;top:8px;width:8px;height:8px;border-radius:50%;background:#fff;box-shadow:10px 0 0 #fff}.wx-groupchat:after{left:6px;top:18px;width:20px;height:8px;background:#fff;border-radius:10px 10px 3px 3px}
+.wx-tag:before{left:8px;top:8px;width:16px;height:15px;background:#fff;clip-path:polygon(0 0,74% 0,100% 42%,50% 100%,0 42%)}.wx-tag:after{left:18px;top:11px;width:4px;height:4px;border-radius:50%;background:#5b8def}
+.wx-official:before{left:8px;top:10px;width:14px;height:10px;border:2px solid #fff;border-radius:2px}.wx-official:after{left:12px;top:20px;width:8px;height:3px;background:#fff;box-shadow:0 4px 0 #fff}
+.wx-moments{background:conic-gradient(#2f80ed 0 25%,#07c160 0 50%,#fa9d3b 0 75%,#fa5151 0)}.wx-moments:before{inset:7px;border-radius:50%;background:#fff}.wx-moments:after{inset:12px;border-radius:50%;background:#20b4ee}
+.wx-scan:before{left:7px;top:7px;width:18px;height:18px;background:linear-gradient(#fff 0 0) left top/7px 2px no-repeat,linear-gradient(#fff 0 0) left top/2px 7px no-repeat,linear-gradient(#fff 0 0) right top/7px 2px no-repeat,linear-gradient(#fff 0 0) right top/2px 7px no-repeat,linear-gradient(#fff 0 0) left bottom/7px 2px no-repeat,linear-gradient(#fff 0 0) left bottom/2px 7px no-repeat,linear-gradient(#fff 0 0) right bottom/7px 2px no-repeat,linear-gradient(#fff 0 0) right bottom/2px 7px no-repeat}.wx-scan:after{left:9px;top:15px;width:14px;height:2px;background:#fff}
+.wx-shake:before{left:10px;top:6px;width:12px;height:20px;border:2px solid #fff;border-radius:3px;transform:rotate(-12deg)}.wx-shake:after{left:5px;top:11px;width:5px;height:9px;border-left:2px solid #fff;border-radius:50%;box-shadow:17px 0 0 -1px #fff}
+.wx-eye:before{left:6px;top:10px;width:20px;height:12px;border:2px solid #fff;border-radius:50%}.wx-eye:after{left:13px;top:13px;width:6px;height:6px;border-radius:50%;background:#fff}
+.wx-search-mini:before{left:8px;top:7px;width:11px;height:11px;border:2px solid #fff;border-radius:50%}.wx-search-mini:after{left:19px;top:19px;width:8px;height:2px;background:#fff;transform:rotate(45deg);border-radius:2px}
+.wx-service:before{left:8px;top:8px;width:16px;height:16px;border:2px solid #fff;border-radius:50%}.wx-service:after{left:15px;top:5px;width:2px;height:22px;background:#fff;box-shadow:-7px 10px 0 -1px #fff,7px 10px 0 -1px #fff}
+.wx-favorite:before{left:8px;top:8px;width:16px;height:16px;background:#fff;clip-path:polygon(50% 0,62% 34%,100% 34%,69% 55%,81% 100%,50% 72%,19% 100%,31% 55%,0 34%,38% 34%)}
+.wx-card:before{left:7px;top:9px;width:18px;height:14px;border:2px solid #fff;border-radius:2px}.wx-card:after{left:10px;top:14px;width:12px;height:2px;background:#fff;box-shadow:0 5px 0 #fff}
+.wx-sticker:before{left:8px;top:8px;width:16px;height:16px;border:2px solid #fff;border-radius:50%}.wx-sticker:after{left:12px;top:15px;width:8px;height:4px;border-bottom:2px solid #fff;border-radius:0 0 8px 8px;box-shadow:-4px -4px 0 -1px #fff,4px -4px 0 -1px #fff}
+.wx-setting:before{left:8px;top:8px;width:16px;height:16px;border:3px dotted #fff;border-radius:50%}.wx-setting:after{left:13px;top:13px;width:6px;height:6px;border-radius:50%;background:#fff}
+.wx-clear:before{left:9px;top:9px;width:14px;height:16px;border:2px solid #fff;border-top:none}.wx-clear:after{left:8px;top:6px;width:16px;height:2px;background:#fff;box-shadow:5px -3px 0 -1px #fff}
+.wx-name:before{left:8px;top:7px;width:16px;height:18px;background:#fff;border-radius:2px}.wx-name:after{left:11px;top:11px;width:10px;height:2px;background:#07c160;box-shadow:0 5px 0 #07c160,0 10px 0 #07c160}
+.wx-avatar:before{left:10px;top:7px;width:12px;height:12px;border-radius:50%;background:#fff}.wx-avatar:after{left:7px;top:20px;width:18px;height:8px;background:#fff;border-radius:10px 10px 3px 3px}
 .wx-group{margin:8px 0;background:#fff}
-.wx-group .cell{min-height:54px;padding:8px 16px}
-.wx-group .cell:after{left:66px}
+.wx-group .cell{min-height:50px;padding:8px 16px;border-bottom:none}
+.wx-group .cell:not(:last-child):after{content:"";position:absolute;left:60px;right:0;bottom:0;height:1px;background:var(--line2)}
 .form{padding:12px 0 calc(42px + var(--safe-bottom));background:#ededed;min-height:100%}
 .cell-group{background:#fff;margin:0 12px 12px;border-radius:8px;overflow:hidden;box-shadow:0 1px 0 rgba(0,0,0,.04)}
-.cell{width:100%;min-height:54px;padding:9px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line2);text-align:left;background:#fff}
+.cell{width:100%;min-height:54px;padding:9px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line2);text-align:left;background:#fff;position:relative}
 .cell:last-child{border-bottom:none}
 .cell-label{width:96px;color:#191919;font-size:15px;flex-shrink:0}
 .cell-body{flex:1;min-width:0}
@@ -123,13 +147,13 @@ button{border:none;background:none;cursor:pointer}
 .file-zone .big{font-size:34px}
 .chat-head{background:#ededed}
 .chat-scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;background:#ededed}
-.chat-list{padding:12px 10px 18px;display:flex;flex-direction:column;gap:12px}
+.chat-list{padding:11px 10px 16px;display:flex;flex-direction:column;gap:11px}
 .scenario{align-self:center;max-width:84%;padding:5px 10px;border-radius:4px;background:#d7d7d7;color:#fff;font-size:12px;line-height:1.5;text-align:center}
 .msg-wrap{display:flex;gap:8px;align-items:flex-start}
 .msg-wrap.me{justify-content:flex-end}
-.msg-avatar{width:38px;height:38px;border-radius:4px;flex-shrink:0;overflow:hidden;background:linear-gradient(135deg,#8fd36f,#3fb466);color:#fff;display:flex;align-items:center;justify-content:center;font-size:18px}
+.msg-avatar{width:36px;height:36px;border-radius:4px;flex-shrink:0;overflow:hidden;background:linear-gradient(135deg,#8fd36f,#3fb466);color:#fff;display:flex;align-items:center;justify-content:center;font-size:17px}
 .msg-avatar img{width:100%;height:100%;object-fit:cover}
-.bubble{max-width:min(72%,340px);padding:9px 11px;border-radius:5px;background:var(--bubble);font-size:16px;line-height:1.55;word-break:break-word;position:relative;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+.bubble{max-width:min(72%,340px);padding:8px 10px;border-radius:4px;background:var(--bubble);font-size:16px;line-height:1.52;word-break:break-word;position:relative;box-shadow:0 1px 0 rgba(0,0,0,.035)}
 .msg-wrap:not(.me) .bubble:before{content:"";position:absolute;left:-5px;top:13px;border-top:5px solid transparent;border-bottom:5px solid transparent;border-right:5px solid #fff}
 .msg-wrap.me .bubble{background:var(--green2)}
 .msg-wrap.me .bubble:after{content:"";position:absolute;right:-5px;top:13px;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:5px solid var(--green2)}
@@ -138,9 +162,12 @@ button{border:none;background:none;cursor:pointer}
 .typing-line{align-self:center;color:#a3a3a3;font-size:12px;line-height:1.2;margin:-2px 0 2px;opacity:.86}
 .streaming .bubble:after{content:"";display:inline-block;width:1px;height:1em;margin-left:2px;background:#999;vertical-align:-2px;animation:cursorBlink 1s steps(1) infinite}
 @keyframes cursorBlink{0%,45%{opacity:1}46%,100%{opacity:0}}
-.composer{padding:7px 8px calc(7px + var(--safe-bottom));display:flex;align-items:flex-end;gap:7px;background:#f7f7f7;border-top:1px solid #d8d8d8;flex-shrink:0}
-.round-icon,.composer-tool{width:34px;height:34px;border:1.5px solid #555;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#333;font-size:18px;flex-shrink:0}
-.composer-tool{border:none;font-size:24px}
+.composer{padding:6px 7px calc(6px + var(--safe-bottom));display:flex;align-items:flex-end;gap:7px;background:#f7f7f7;border-top:1px solid #d8d8d8;flex-shrink:0}
+.round-icon,.composer-tool{width:34px;height:34px;border:1.5px solid #555;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#333;font-size:18px;flex-shrink:0;position:relative}
+.composer-tool{border:none;font-size:0}
+.composer-tool.voice:before{content:"";width:17px;height:17px;border:2px solid #333;border-radius:50%;box-shadow:inset 0 -5px 0 -3px #333}.composer-tool.voice:after{content:"";position:absolute;left:15px;top:22px;width:4px;height:5px;border-radius:0 0 4px 4px;background:#333}
+.composer-tool.emoji:before{content:"";width:23px;height:23px;border:2px solid #333;border-radius:50%}.composer-tool.emoji:after{content:"";position:absolute;left:10px;top:17px;width:14px;height:6px;border-bottom:2px solid #333;border-radius:0 0 14px 14px;box-shadow:-3px -5px 0 -1px #333,9px -5px 0 -1px #333}
+.composer-tool.plus:before{content:"";width:24px;height:24px;border:2px solid #333;border-radius:50%}.composer-tool.plus:after{content:"";position:absolute;left:10px;top:16px;width:14px;height:2px;background:#333;box-shadow:6px -6px 0 -6px #333}.composer-tool.plus i{position:absolute;left:16px;top:10px;width:2px;height:14px;background:#333;border-radius:2px}
 .chat-input{flex:1;min-height:36px;max-height:106px;padding:7px 9px;border:none;border-radius:4px;outline:none;background:#fff;resize:none;font-size:16px;line-height:1.4}
 .send{height:34px;min-width:50px;border-radius:4px;background:var(--green);color:#fff;padding:0 12px;font-size:15px}
 .send.inactive{background:#dedede;color:#8c8c8c}
@@ -152,21 +179,22 @@ button{border:none;background:none;cursor:pointer}
 .action-item{display:flex;flex-direction:column;align-items:center;gap:6px;color:#666;font-size:12px}
 .action-item span{width:48px;height:48px;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;color:#333}
 .voice-hold{width:100%;height:36px;border-radius:4px;background:#fff;color:#333;font-size:15px}
-.profile-top{background:#fff;padding:24px 18px;display:flex;gap:16px;align-items:center;border-bottom:1px solid var(--line)}
-.profile-name{font-size:22px;font-weight:600;margin-bottom:8px}
+.profile-top{background:#fff;padding:22px 18px;display:flex;gap:16px;align-items:center;border-bottom:1px solid var(--line)}
+.profile-name{font-size:22px;font-weight:600;margin-bottom:7px}
 .profile-id{font-size:13px;color:#777}
 .profile-card{margin:8px 0;background:#fff;overflow:hidden;box-shadow:none}
 .profile-cover{display:none}
 .profile-card .profile-top{margin-top:0;border-bottom:none;background:#fff}
 .profile-meta{display:flex;align-items:center;gap:8px;color:#777;font-size:13px}
 .qr-mark{width:18px;height:18px;border:1px solid #aaa;border-radius:3px;background:linear-gradient(90deg,#aaa 2px,transparent 2px) 0 0/6px 6px,linear-gradient(#aaa 2px,transparent 2px) 0 0/6px 6px;opacity:.8}
-.moment{background:#fff;margin:0 12px 10px;padding:14px;border-radius:8px;display:flex;gap:10px;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+.moment{background:#fff;margin:0;padding:13px 16px;display:flex;gap:10px;border-bottom:1px solid var(--line2);box-shadow:none}
 .moment-body{flex:1;min-width:0}
 .moment-name{color:var(--blue);font-weight:600;font-size:15px}
 .moment-text{margin-top:5px;font-size:15px;line-height:1.55}
-.moments-cover{height:178px;margin-bottom:12px;padding:16px;display:flex;align-items:flex-end;justify-content:space-between;background:linear-gradient(180deg,rgba(0,0,0,.05),rgba(0,0,0,.46)),linear-gradient(135deg,#8fba9b,#526f77 55%,#3d3d3d);color:#fff}
+.moments-cover{height:220px;margin-bottom:0;padding:0 16px 16px;display:flex;align-items:flex-end;justify-content:flex-end;background:linear-gradient(180deg,rgba(0,0,0,.04),rgba(0,0,0,.45)),linear-gradient(135deg,#9db99a,#526f77 55%,#444);color:#fff}
 .moments-title{font-size:22px;font-weight:700;text-shadow:0 1px 3px rgba(0,0,0,.28)}
-.moments-user{display:flex;align-items:center;gap:10px;font-size:15px;text-shadow:0 1px 2px rgba(0,0,0,.24)}
+.moments-user{display:flex;align-items:center;gap:13px;font-size:15px;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.24);transform:translateY(36px)}
+.moments-user .avatar{border:2px solid #fff}
 .discover-tools{margin-bottom:12px}
 .contact-index{height:28px;padding:0 18px;display:flex;align-items:center;color:#888;font-size:13px;background:#ededed}
 @media (max-width: 420px) {
@@ -209,9 +237,9 @@ button{border:none;background:none;cursor:pointer}
       <div class="top-right"><button class="icon-btn" onclick="togglePlusMenu()" title="添加"><span class="icon-plus"></span></button></div>
     </div>
     <div id="plus-menu" class="plus-menu">
-      <button class="plus-item" onclick="openImport()">📁 导入角色</button>
-      <button class="plus-item" onclick="openCreateRole()">✍️ 新建角色</button>
-      <button class="plus-item" onclick="showScreen('settings')">⚙️ 设置</button>
+      <button class="plus-item" onclick="openImport()"><span class="mini-menu-icon file"></span>导入角色</button>
+      <button class="plus-item" onclick="openCreateRole()"><span class="mini-menu-icon edit"></span>新建角色</button>
+      <button class="plus-item" onclick="showScreen('settings')"><span class="mini-menu-icon gear"></span>设置</button>
     </div>
     <div class="search-bar"><div class="search-box"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span>搜索</div></div>
     <div class="scroll"><div id="chat-list"></div></div>
@@ -232,10 +260,10 @@ button{border:none;background:none;cursor:pointer}
     <div class="scroll">
       <div class="search-bar"><div class="search-box"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span>搜索</div></div>
       <div class="wx-group">
-        <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange">＋</span><div class="cell-body">新的朋友</div></button>
-        <button class="cell" onclick="showScreen('chats')"><span class="wx-icon green">群</span><div class="cell-body">群聊</div></button>
-        <button class="cell" onclick="openImport()"><span class="wx-icon blue">卡</span><div class="cell-body">标签</div></button>
-        <button class="cell" onclick="openImport()"><span class="wx-icon cyan">号</span><div class="cell-body">公众号</div></button>
+        <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-new"></span><div class="cell-body">新的朋友</div></button>
+        <button class="cell" onclick="showScreen('chats')"><span class="wx-icon green wx-groupchat"></span><div class="cell-body">群聊</div></button>
+        <button class="cell" onclick="openImport()"><span class="wx-icon blue wx-tag"></span><div class="cell-body">标签</div></button>
+        <button class="cell" onclick="openImport()"><span class="wx-icon cyan wx-official"></span><div class="cell-body">公众号</div></button>
       </div>
       <div class="contact-index">A</div>
       <div class="list" id="contact-list"></div>
@@ -252,18 +280,16 @@ button{border:none;background:none;cursor:pointer}
     <div class="topbar"><div class="top-left"></div><div class="top-title">发现</div><div class="top-right"></div></div>
     <div class="scroll" style="background:#ededed">
       <div class="wx-group">
-        <button class="cell" onclick="renderMoments()"><span class="wx-icon cyan">◎</span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
+        <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
       </div>
       <div class="wx-group">
-        <button class="cell" onclick="openImport()"><span class="wx-icon blue">扫</span><div class="cell-body">扫一扫</div><div class="mini">›</div></button>
-        <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange">摇</span><div class="cell-body">摇一摇</div><div class="mini">›</div></button>
+        <button class="cell" onclick="openImport()"><span class="wx-icon blue wx-scan"></span><div class="cell-body">扫一扫</div><div class="mini">›</div></button>
+        <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-shake"></span><div class="cell-body">摇一摇</div><div class="mini">›</div></button>
       </div>
       <div class="wx-group">
-        <button class="cell" onclick="showScreen('contacts')"><span class="wx-icon green">看</span><div class="cell-body">看一看</div><div class="mini">›</div></button>
-        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon gray">搜</span><div class="cell-body">搜一搜</div><div class="mini">›</div></button>
+        <button class="cell" onclick="showScreen('contacts')"><span class="wx-icon green wx-eye"></span><div class="cell-body">看一看</div><div class="mini">›</div></button>
+        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon gray wx-search-mini"></span><div class="cell-body">搜一搜</div><div class="mini">›</div></button>
       </div>
-      <div class="contact-index">动态</div>
-      <div id="moment-list" style="margin-top:8px"></div>
     </div>
     <nav class="tabbar">
       <button class="tab" data-screen="chats" onclick="showScreen('chats')"><span class="tab-ico ico-chat"></span>AL</button>
@@ -289,21 +315,21 @@ button{border:none;background:none;cursor:pointer}
       </div>
       <input type="file" id="player-avatar-input" accept="image/*" style="display:none" onchange="handlePlayerAvatar(event)">
       <div class="wx-group">
-        <div class="cell"><span class="wx-icon green">名</span><div class="cell-body"><input class="input" id="player-name-input" placeholder="你的昵称" oninput="schedulePlayerProfileSave()"></div></div>
-        <button class="cell" onclick="choosePlayerAvatar()" type="button"><span class="wx-icon blue">像</span><div class="cell-body"><div class="avatar-edit"><span id="player-avatar-preview" class="avatar">我</span><span>头像</span></div></div><div class="mini">›</div></button>
+        <div class="cell"><span class="wx-icon green wx-name"></span><div class="cell-body"><input class="input" id="player-name-input" placeholder="你的昵称" oninput="schedulePlayerProfileSave()"></div></div>
+        <button class="cell" onclick="choosePlayerAvatar()" type="button"><span class="wx-icon blue wx-avatar"></span><div class="cell-body"><div class="avatar-edit"><span id="player-avatar-preview" class="avatar">我</span><span>头像</span></div></div><div class="mini">›</div></button>
       </div>
       <div class="wx-group">
-        <button class="cell" onclick="showScreen('contacts')"><span class="wx-icon green">服</span><div class="cell-body">服务</div><div class="mini">›</div></button>
+        <button class="cell" onclick="showScreen('contacts')"><span class="wx-icon green wx-service"></span><div class="cell-body">服务</div><div class="mini">›</div></button>
       </div>
       <div class="wx-group">
-        <button class="cell" onclick="openImport()"><span class="wx-icon orange">收</span><div class="cell-body">收藏</div><div class="mini">›</div></button>
-        <button class="cell" onclick="showScreen('discover')"><span class="wx-icon cyan">圈</span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
-        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon blue">卡</span><div class="cell-body">卡包</div><div class="mini">›</div></button>
-        <button class="cell" onclick="manualProactiveMessage()"><span class="wx-icon orange">表</span><div class="cell-body">表情</div><div class="mini">›</div></button>
+        <button class="cell" onclick="openImport()"><span class="wx-icon orange wx-favorite"></span><div class="cell-body">收藏</div><div class="mini">›</div></button>
+        <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
+        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon blue wx-card"></span><div class="cell-body">卡包</div><div class="mini">›</div></button>
+        <button class="cell" onclick="manualProactiveMessage()"><span class="wx-icon orange wx-sticker"></span><div class="cell-body">表情</div><div class="mini">›</div></button>
       </div>
       <div class="wx-group">
-        <button class="cell" onclick="showScreen('settings')"><span class="wx-icon gray">设</span><div class="cell-body">设置</div><div class="mini">›</div></button>
-        <button class="cell" onclick="clearAllHistory()"><span class="wx-icon red">清</span><div class="cell-body danger">清空聊天记录</div></button>
+        <button class="cell" onclick="showScreen('settings')"><span class="wx-icon gray wx-setting"></span><div class="cell-body">设置</div><div class="mini">›</div></button>
+        <button class="cell" onclick="clearAllHistory()"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
       </div>
     </div>
     <nav class="tabbar">
@@ -324,10 +350,10 @@ button{border:none;background:none;cursor:pointer}
     </div>
     <div class="chat-scroll" id="chat-scroll"><div class="chat-list" id="chat-messages"></div></div>
     <div class="composer">
-      <button class="composer-tool" onclick="toggleComposerPanel('voice')" type="button">◉</button>
+      <button class="composer-tool voice" onclick="toggleComposerPanel('voice')" type="button" aria-label="语音"></button>
       <textarea class="chat-input" id="chat-input" rows="1" placeholder="" oninput="autoResize(this)" onkeydown="handleChatKey(event)"></textarea>
-      <button class="composer-tool" onclick="toggleComposerPanel('emoji')" type="button">☺</button>
-      <button class="composer-tool" onclick="toggleComposerPanel('plus')" type="button">⊕</button>
+      <button class="composer-tool emoji" onclick="toggleComposerPanel('emoji')" type="button" aria-label="表情"></button>
+      <button class="composer-tool plus" onclick="toggleComposerPanel('plus')" type="button" aria-label="更多"><i></i></button>
       <button class="send inactive" id="btn-send" onclick="sendMessage()">发送</button>
     </div>
     <div class="composer-panel" id="composer-voice"><button class="voice-hold" onclick="toast('语音消息暂时只作为聊天 UI 展示')">按住 说话</button></div>
@@ -344,6 +370,20 @@ button{border:none;background:none;cursor:pointer}
         <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>文</span>文件</button>
         <button class="action-item" onclick="manualProactiveMessage()"><span>转</span>转账</button>
       </div>
+    </div>
+  </div>
+
+  <div id="screen-moments" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen(lastMainScreen)">‹</button></div>
+      <div class="top-title">朋友圈</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll" style="background:#fff">
+      <div class="moments-cover">
+        <div class="moments-user"><span id="moments-player-name">玩家</span><div id="moments-player-avatar" class="avatar">我</div></div>
+      </div>
+      <div id="moment-list"></div>
     </div>
   </div>
 
@@ -905,7 +945,7 @@ function showScreen(name) {
   renderPlayerProfile();
   if (name === 'chats') renderChats();
   if (name === 'contacts') renderContacts();
-  if (name === 'discover') renderMoments();
+  if (name === 'moments') renderMoments();
   if (name === 'settings') loadSettings();
   if (name === 'memory') renderMemoryScreen();
 }
