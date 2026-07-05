@@ -92,6 +92,7 @@ button{border:none;background:none;cursor:pointer}
 .contact-rail{position:absolute;right:4px;top:142px;bottom:72px;width:18px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;color:#666;font-size:10px;line-height:1;pointer-events:none}
 .contact-rail span{display:block;height:11px}
 .page-pad{padding:8px 0 calc(42px + var(--safe-bottom));background:#ededed;min-height:100%}
+#screen-import .page-pad{min-height:0;padding-bottom:0}
 .hero-panel{margin-bottom:12px;padding:16px;border-radius:8px;background:#fff;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .hero-title{font-size:20px;font-weight:700;margin-bottom:6px}
 .hero-sub{font-size:13px;color:#777;line-height:1.6}
@@ -124,6 +125,7 @@ button{border:none;background:none;cursor:pointer}
 .wx-group .cell:not(:last-child):after{content:"";position:absolute;left:60px;right:0;bottom:0;height:1px;background:var(--line2)}
 .form{padding:12px 0 calc(42px + var(--safe-bottom));background:#ededed;min-height:100%}
 .cell-group{background:#fff;margin:0 12px 12px;border-radius:8px;overflow:hidden;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+.form .cell-group,#screen-import .scroll>.cell-group,#screen-import .page-pad>.wx-group{margin:0 0 10px;border-radius:0;box-shadow:none}
 .cell{width:100%;min-height:54px;padding:9px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line2);text-align:left;background:#fff;position:relative}
 .cell:last-child{border-bottom:none}
 .cell-label{width:96px;color:#191919;font-size:15px;flex-shrink:0}
@@ -400,13 +402,8 @@ button{border:none;background:none;cursor:pointer}
     </div>
     <div class="scroll">
       <div class="page-pad">
-        <div class="hero-panel">
-          <div class="hero-title">角色卡</div>
-          <div class="hero-sub">导入 SillyTavern/TavernAI 角色卡，或直接创建一个适合私聊 RP 的新角色。</div>
-        </div>
-        <div class="file-zone" onclick="document.getElementById('file-input').click()">
-          <div class="big">📁</div>
-          <div>选择 JSON / PNG 角色卡</div>
+        <div class="wx-group">
+          <button class="cell" onclick="document.getElementById('file-input').click()" type="button"><span class="wx-icon blue wx-card"></span><div class="cell-body">导入角色卡<span class="cell-note">JSON / PNG</span></div><div class="mini">›</div></button>
         </div>
         <input type="file" id="file-input" accept=".json,.png" style="display:none" onchange="handleFileImport(event)" multiple>
         <input type="file" id="new-avatar-input" accept="image/*" style="display:none" onchange="handleNewRoleAvatar(event)">
@@ -431,10 +428,6 @@ button{border:none;background:none;cursor:pointer}
     </div>
     <div class="scroll">
       <div class="form">
-        <div class="hero-panel" style="margin:0 12px 12px">
-          <div class="hero-title">API 设置</div>
-          <div class="hero-sub">聊天和记忆可以分别使用不同网站的 API。聊天模型负责回话，记忆模型负责检索关键词、整理摘要和事件。</div>
-        </div>
         <div class="cell-group">
           <div class="contact-index" style="height:30px">聊天接口</div>
           <div class="cell"><div class="cell-label">接口</div><div class="cell-body"><select class="select" id="set-chat-api-type"><option value="openai">OpenAI 兼容</option><option value="claude">Claude</option></select></div></div>
@@ -478,9 +471,8 @@ button{border:none;background:none;cursor:pointer}
     </div>
     <div class="scroll">
       <div class="form">
-        <div class="hero-panel" style="margin:0 12px 12px">
-          <div class="hero-title">本地向量记忆</div>
-          <div class="hero-sub" id="memory-status">IndexedDB 保存摘要、事件、资料和向量索引。</div>
+        <div class="cell-group">
+          <div class="cell"><div class="cell-label">状态</div><div class="cell-body" id="memory-status">IndexedDB 保存摘要、事件、资料和向量索引。</div></div>
         </div>
         <div class="cell-group">
           <button class="cell" onclick="runMemoryNow()" type="button"><div class="cell-label">整理</div><div class="cell-body">立即提炼当前会话</div><div class="mini">›</div></button>
@@ -982,12 +974,15 @@ function renderSearchLabels() {
     el.textContent = value ? `搜索：${value}` : '搜索';
   }
 }
-function openImport() { showScreen('import'); }
+function openImport() {
+  showScreen('import');
+  const scroller = document.querySelector('#screen-import .scroll');
+  if (scroller) scroller.scrollTop = 0;
+}
 function openCreateRole() {
   newRoleAvatarData = '';
   setAvatarPreview('new-avatar-preview', '', '＋');
-  showScreen('import');
-  setTimeout(() => document.getElementById('new-name')?.focus(), 50);
+  openImport();
 }
 function renderPlayerProfile() {
   const name = playerName();
