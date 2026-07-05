@@ -192,6 +192,13 @@ button{border:none;background:none;cursor:pointer}
 .profile-card .profile-top{margin-top:0;border-bottom:none;background:#fff}
 .profile-meta{display:flex;align-items:center;gap:8px;color:#777;font-size:13px}
 .qr-mark{width:18px;height:18px;border:1px solid #aaa;border-radius:3px;background:linear-gradient(90deg,#aaa 2px,transparent 2px) 0 0/6px 6px,linear-gradient(#aaa 2px,transparent 2px) 0 0/6px 6px;opacity:.8}
+.contact-profile-head{padding:28px 18px 24px;background:#fff;display:flex;align-items:center;gap:16px;margin-bottom:8px}
+.contact-profile-head .avatar{width:66px;height:66px;border-radius:6px;font-size:28px}
+.contact-profile-name{font-size:22px;font-weight:600;line-height:1.25;margin-bottom:7px;word-break:break-word}
+.contact-profile-id{color:#777;font-size:13px;line-height:1.45}
+.contact-profile-actions{padding:8px 12px;background:#ededed}
+.contact-profile-actions .primary{margin:8px 2px 10px}
+.profile-detail-text{color:#666;font-size:15px;line-height:1.55;white-space:pre-wrap}
 .chat-info-people{display:flex;gap:18px;padding:22px 18px;background:#fff;margin-bottom:8px}
 .chat-info-person{width:58px;display:flex;flex-direction:column;align-items:center;gap:8px;color:#555;font-size:12px;text-align:center}
 .chat-info-person .avatar{width:52px;height:52px;font-size:22px}
@@ -258,9 +265,8 @@ button{border:none;background:none;cursor:pointer}
 
   <div id="plus-menu" class="plus-menu">
     <button class="plus-item" onclick="showScreen('contacts')"><span class="mini-menu-icon file"></span>发起聊天</button>
-    <button class="plus-item" onclick="openCreateRole()"><span class="mini-menu-icon edit"></span>添加朋友</button>
-    <button class="plus-item" onclick="openImport()"><span class="mini-menu-icon scan"></span>扫一扫</button>
-    <button class="plus-item" onclick="showScreen('settings')"><span class="mini-menu-icon gear"></span>设置</button>
+    <button class="plus-item" onclick="openCreateRole()"><span class="mini-menu-icon edit"></span>新建角色</button>
+    <button class="plus-item" onclick="openImport()"><span class="mini-menu-icon file"></span>导入角色卡</button>
   </div>
 
   <div id="screen-contacts" class="screen">
@@ -272,10 +278,8 @@ button{border:none;background:none;cursor:pointer}
     <div class="scroll">
       <div class="search-bar"><button class="search-box" onclick="openSearch('contacts')" type="button"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span><span id="search-label-contacts">搜索</span></button></div>
       <div class="wx-group">
-        <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-new"></span><div class="cell-body">新的朋友</div></button>
-        <button class="cell" onclick="showScreen('chats')"><span class="wx-icon green wx-groupchat"></span><div class="cell-body">群聊</div></button>
-        <button class="cell" onclick="openImport()"><span class="wx-icon blue wx-tag"></span><div class="cell-body">标签</div></button>
-        <button class="cell" onclick="openImport()"><span class="wx-icon cyan wx-official"></span><div class="cell-body">公众号</div></button>
+        <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-new"></span><div class="cell-body">新建角色</div></button>
+        <button class="cell" onclick="openImport()"><span class="wx-icon blue wx-card"></span><div class="cell-body">导入角色卡</div></button>
       </div>
       <div class="contact-index">A</div>
       <div class="list" id="contact-list"></div>
@@ -289,19 +293,38 @@ button{border:none;background:none;cursor:pointer}
     </nav>
   </div>
 
+  <div id="screen-contact-profile" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('contacts')">‹</button></div>
+      <div class="top-title">个人资料</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll" style="background:#ededed">
+      <div class="contact-profile-head">
+        <div id="profile-char-avatar" class="avatar large"></div>
+        <div style="flex:1;min-width:0">
+          <div class="contact-profile-name" id="profile-char-name"></div>
+          <div class="contact-profile-id" id="profile-char-id"></div>
+        </div>
+      </div>
+      <div class="wx-group">
+        <div class="cell"><div class="cell-label">设置备注和标签</div><div class="cell-body profile-detail-text" id="profile-char-tags"></div></div>
+      </div>
+      <div class="wx-group">
+        <div class="cell"><div class="cell-label">个性签名</div><div class="cell-body profile-detail-text" id="profile-char-desc"></div></div>
+        <div class="cell"><div class="cell-label">更多信息</div><div class="cell-body profile-detail-text" id="profile-char-more"></div></div>
+      </div>
+      <div class="contact-profile-actions">
+        <button class="primary" onclick="messageProfileChar()">发消息</button>
+      </div>
+    </div>
+  </div>
+
   <div id="screen-discover" class="screen">
     <div class="topbar"><div class="top-left"></div><div class="top-title">发现</div><div class="top-right"></div></div>
     <div class="scroll" style="background:#ededed">
       <div class="wx-group">
         <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
-      </div>
-      <div class="wx-group">
-        <button class="cell" onclick="openImport()"><span class="wx-icon blue wx-scan"></span><div class="cell-body">扫一扫</div><div class="mini">›</div></button>
-        <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-shake"></span><div class="cell-body">摇一摇</div><div class="mini">›</div></button>
-      </div>
-      <div class="wx-group">
-        <button class="cell" onclick="showScreen('contacts')"><span class="wx-icon green wx-eye"></span><div class="cell-body">看一看</div><div class="mini">›</div></button>
-        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon gray wx-search-mini"></span><div class="cell-body">搜一搜</div><div class="mini">›</div></button>
       </div>
     </div>
     <nav class="tabbar">
@@ -332,13 +355,7 @@ button{border:none;background:none;cursor:pointer}
         <button class="cell" onclick="choosePlayerAvatar()" type="button"><span class="wx-icon blue wx-avatar"></span><div class="cell-body"><div class="avatar-edit"><span id="player-avatar-preview" class="avatar">我</span><span>头像</span></div></div><div class="mini">›</div></button>
       </div>
       <div class="wx-group">
-        <button class="cell" onclick="showScreen('contacts')"><span class="wx-icon green wx-service"></span><div class="cell-body">服务</div><div class="mini">›</div></button>
-      </div>
-      <div class="wx-group">
-        <button class="cell" onclick="openImport()"><span class="wx-icon orange wx-favorite"></span><div class="cell-body">收藏</div><div class="mini">›</div></button>
         <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
-        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon blue wx-card"></span><div class="cell-body">卡包</div><div class="mini">›</div></button>
-        <button class="cell" onclick="manualProactiveMessage()"><span class="wx-icon orange wx-sticker"></span><div class="cell-body">表情</div><div class="mini">›</div></button>
       </div>
       <div class="wx-group">
         <button class="cell" onclick="showScreen('settings')"><span class="wx-icon gray wx-setting"></span><div class="cell-body">设置</div><div class="mini">›</div></button>
@@ -378,10 +395,8 @@ button{border:none;background:none;cursor:pointer}
     </div>
     <div class="composer-panel" id="composer-plus">
       <div class="action-grid">
-        <button class="action-item" onclick="openImport()"><span>图</span>相册</button>
-        <button class="action-item" onclick="openCreateRole()"><span>拍</span>拍摄</button>
-        <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>文</span>文件</button>
-        <button class="action-item" onclick="manualProactiveMessage()"><span>转</span>转账</button>
+        <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>记</span>记忆库</button>
+        <button class="action-item" onclick="manualProactiveMessage()"><span>主</span>主动消息</button>
       </div>
     </div>
   </div>
@@ -401,10 +416,6 @@ button{border:none;background:none;cursor:pointer}
         <button class="chat-info-person" onclick="choosePlayerAvatar()" type="button">
           <span id="chat-info-player-avatar-preview" class="avatar">我</span>
           <span id="chat-info-player-label">我</span>
-        </button>
-        <button class="chat-info-person" onclick="openCreateRole()" type="button">
-          <span class="avatar">＋</span>
-          <span>添加</span>
         </button>
       </div>
       <input type="file" id="modal-char-avatar-input" accept="image/*" style="display:none" onchange="handleModalCharAvatar(event)">
@@ -505,7 +516,6 @@ button{border:none;background:none;cursor:pointer}
           <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
-          <button class="cell" onclick="manualProactiveMessage()" type="button"><div class="cell-label">测试</div><div class="cell-body">让当前角色主动发一条</div><div class="mini">›</div></button>
         </div>
         <button class="primary" onclick="saveSettings()">保存</button>
         <button class="secondary" onclick="testConnection('chat')">测试聊天连接</button>
@@ -659,6 +669,7 @@ let characters = DB.get('characters', []);
 let allChats = DB.get('chats', {});
 let searchFilters = { chats: '', contacts: '' };
 let currentCharId = null;
+let profileCharId = null;
 let isStreaming = false;
 let streamingDraft = null;
 let lastMainScreen = 'chats';
@@ -977,6 +988,7 @@ function showScreen(name) {
   if (name === 'settings') loadSettings();
   if (name === 'memory') renderMemoryScreen();
   if (name === 'chat-info') renderChatInfo();
+  if (name === 'contact-profile') renderContactProfile();
 }
 function togglePlusMenu() {
   plusOpen = !plusOpen;
@@ -1029,6 +1041,31 @@ function renderChatInfo() {
   if (charPrompt && document.activeElement !== charPrompt) charPrompt.value = chat.charPrompt || '';
   if (extraPrompt && document.activeElement !== extraPrompt) extraPrompt.value = chat.extraPrompt || '';
   renderPlayerProfile();
+}
+function openContactProfile(charId) {
+  const char = characters.find(c => c.id === charId);
+  if (!char) return;
+  profileCharId = charId;
+  showScreen('contact-profile');
+}
+function renderContactProfile() {
+  const char = characters.find(c => c.id === profileCharId);
+  if (!char) return;
+  setAvatarPreview('profile-char-avatar', char.avatarData, char.avatar || char.name?.slice(0, 1) || 'R');
+  const name = document.getElementById('profile-char-name');
+  const id = document.getElementById('profile-char-id');
+  const tags = document.getElementById('profile-char-tags');
+  const desc = document.getElementById('profile-char-desc');
+  const more = document.getElementById('profile-char-more');
+  if (name) name.textContent = char.name || '未命名';
+  if (id) id.textContent = `AL ID：${char.id || 'local-role'}`;
+  if (tags) tags.textContent = Array.isArray(char.tags) && char.tags.length ? char.tags.join('、') : '未设置';
+  if (desc) desc.textContent = char.description || char.personality || '暂无签名';
+  if (more) more.textContent = char.scenario || char.creatorNotes || '暂无更多信息';
+}
+function messageProfileChar() {
+  if (!profileCharId) return;
+  openChat(profileCharId);
 }
 function renderPlayerProfile() {
   const name = playerName();
@@ -1157,7 +1194,7 @@ function renderContacts() {
     return;
   }
   list.innerHTML = rows.map(c => `
-    <button class="row" onclick="openChat('${c.id}')">
+    <button class="row" onclick="openContactProfile('${c.id}')">
       ${avatarHtml(c)}
       <div class="row-main"><div class="row-name">${esc(c.name)}</div><div class="row-preview">${esc(c.description || c.personality || '')}</div></div>
     </button>`).join('');
