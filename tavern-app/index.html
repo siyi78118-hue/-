@@ -183,6 +183,16 @@ button{border:none;background:none;cursor:pointer}
 .action-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;text-align:center}
 .action-item{display:flex;flex-direction:column;align-items:center;gap:6px;color:#666;font-size:12px}
 .action-item span{width:48px;height:48px;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;color:#333}
+.pay-card{width:220px;border-radius:5px;overflow:hidden;background:#f6a23c;color:#fff;box-shadow:0 1px 0 rgba(0,0,0,.05)}
+.pay-card-main{min-height:68px;padding:12px;display:flex;align-items:center;gap:10px}
+.pay-card-icon{width:34px;height:34px;border-radius:4px;background:rgba(255,255,255,.24);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+.pay-card-title{font-size:16px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pay-card-note{font-size:12px;opacity:.86;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pay-card-foot{height:24px;padding:0 10px;background:#fff;color:#999;font-size:11px;display:flex;align-items:center}
+.wallet-head{padding:26px 18px 24px;background:#fff;text-align:center;margin-bottom:8px}
+.wallet-label{font-size:13px;color:#777;margin-bottom:10px}
+.wallet-amount{font-size:42px;font-weight:600;line-height:1;letter-spacing:0}
+.wallet-note{font-size:12px;color:#999;margin-top:12px;line-height:1.5}
 .voice-hold{width:100%;height:36px;border-radius:4px;background:#fff;color:#333;font-size:15px}
 .profile-top{background:#fff;padding:22px 18px;display:flex;gap:16px;align-items:center;border-bottom:1px solid var(--line)}
 .profile-name{font-size:22px;font-weight:600;margin-bottom:7px}
@@ -356,6 +366,7 @@ button{border:none;background:none;cursor:pointer}
       </div>
       <div class="wx-group">
         <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
+        <button class="cell" onclick="showScreen('wallet')"><span class="wx-icon orange wx-card"></span><div class="cell-body">钱包</div><div class="mini" id="me-wallet-preview">¥0.00</div></button>
       </div>
       <div class="wx-group">
         <button class="cell" onclick="showScreen('settings')"><span class="wx-icon gray wx-setting"></span><div class="cell-body">设置</div><div class="mini">›</div></button>
@@ -368,6 +379,26 @@ button{border:none;background:none;cursor:pointer}
       <button class="tab" data-screen="discover" onclick="showScreen('discover')"><span class="tab-ico ico-compass"></span>发现</button>
       <button class="tab active" data-screen="me" onclick="showScreen('me')"><span class="tab-ico ico-me"></span>我</button>
     </nav>
+  </div>
+
+  <div id="screen-wallet" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('me')">‹</button></div>
+      <div class="top-title">钱包</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll" style="background:#ededed">
+      <div class="wallet-head">
+        <div class="wallet-label">零钱余额</div>
+        <div class="wallet-amount" id="wallet-balance">¥0.00</div>
+        <div class="wallet-note">仅用于 AL 角色扮演，不涉及真实支付。</div>
+      </div>
+      <div class="cell-group">
+        <div class="cell"><div class="cell-label">充值金额</div><div class="cell-body"><input class="input" id="wallet-recharge-amount" type="number" min="0" step="0.01" placeholder="随意输入金额"></div></div>
+      </div>
+      <button class="primary" onclick="rechargeWallet()">充值</button>
+      <button class="secondary" onclick="resetWalletBalance()">清零余额</button>
+    </div>
   </div>
 
   <div id="screen-chat" class="screen">
@@ -395,6 +426,8 @@ button{border:none;background:none;cursor:pointer}
     </div>
     <div class="composer-panel" id="composer-plus">
       <div class="action-grid">
+        <button class="action-item" onclick="sendWalletMessage('transfer')"><span>转</span>转账</button>
+        <button class="action-item" onclick="sendWalletMessage('redpacket')"><span>包</span>红包</button>
         <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>记</span>记忆库</button>
         <button class="action-item" onclick="manualProactiveMessage()"><span>主</span>主动消息</button>
       </div>
@@ -639,6 +672,7 @@ const DEFAULT_SETTINGS = {
   playerName: '玩家',
   playerAvatar: '我',
   playerAvatarData: null,
+  walletBalance: 0,
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
@@ -989,6 +1023,7 @@ function showScreen(name) {
   if (name === 'memory') renderMemoryScreen();
   if (name === 'chat-info') renderChatInfo();
   if (name === 'contact-profile') renderContactProfile();
+  if (name === 'wallet') renderWallet();
 }
 function togglePlusMenu() {
   plusOpen = !plusOpen;
@@ -1083,6 +1118,41 @@ function renderPlayerProfile() {
   setAvatarPreview('moments-player-avatar', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
   setAvatarPreview('player-avatar-preview', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
   setAvatarPreview('chat-info-player-avatar-preview', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
+  renderWalletPreview();
+}
+function walletBalance() {
+  return Math.max(0, Number(settings.walletBalance) || 0);
+}
+function formatMoney(value) {
+  return '¥' + (Math.max(0, Number(value) || 0)).toFixed(2);
+}
+function saveWalletBalance(value) {
+  settings.walletBalance = Math.max(0, Math.round((Number(value) || 0) * 100) / 100);
+  DB.set('settings', settings);
+  renderWallet();
+  renderWalletPreview();
+}
+function renderWalletPreview() {
+  const el = document.getElementById('me-wallet-preview');
+  if (el) el.textContent = formatMoney(walletBalance());
+}
+function renderWallet() {
+  const el = document.getElementById('wallet-balance');
+  if (el) el.textContent = formatMoney(walletBalance());
+  renderWalletPreview();
+}
+function rechargeWallet() {
+  const input = document.getElementById('wallet-recharge-amount');
+  const amount = Number(input?.value);
+  if (!Number.isFinite(amount) || amount <= 0) { toast('请输入充值金额'); return; }
+  saveWalletBalance(walletBalance() + amount);
+  if (input) input.value = '';
+  toast('充值成功');
+}
+function resetWalletBalance() {
+  if (!confirm('清零钱包余额？')) return;
+  saveWalletBalance(0);
+  toast('已清零');
 }
 function savePlayerProfile(silent = true, sourceId = '') {
   const input = document.getElementById(sourceId) || document.getElementById('player-name-input') || document.getElementById('chat-info-player-name');
@@ -1378,6 +1448,21 @@ function formatMsg(text) {
   if (!text) return '';
   return esc(text).replace(/\n/g, '<br>');
 }
+function renderPaymentCard(m) {
+  const type = m.payType || m.type;
+  const amount = formatMoney(m.amount);
+  const title = type === 'redpacket' ? `${amount} 红包` : `转账 ${amount}`;
+  const note = m.note || (type === 'redpacket' ? '恭喜发财，大吉大利' : '待对方确认收款');
+  const icon = type === 'redpacket' ? '包' : '¥';
+  return `<div class="pay-card">
+    <div class="pay-card-main"><div class="pay-card-icon">${icon}</div><div style="min-width:0"><div class="pay-card-title">${esc(title)}</div><div class="pay-card-note">${esc(note)}</div></div></div>
+    <div class="pay-card-foot">AL 钱包</div>
+  </div>`;
+}
+function renderMessageBody(m) {
+  if (m.type === 'transfer' || m.type === 'redpacket') return renderPaymentCard(m);
+  return `<div class="bubble">${formatMsg(m.content)}</div>`;
+}
 function splitAssistantOutput(text) {
   const normalized = String(text || '').replace(/\r\n?/g, '\n').trim();
   if (!normalized) return [];
@@ -1414,7 +1499,7 @@ function renderMessages() {
   chat.messages.forEach((m, i) => {
     if (i === 0 || (m.time - (chat.messages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
     if (m.role === 'user') {
-      html += `<div class="msg-wrap me"><div class="bubble">${formatMsg(m.content)}</div>${playerAvatarHtml('msg-avatar')}</div>`;
+      html += `<div class="msg-wrap me">${renderMessageBody(m)}${playerAvatarHtml('msg-avatar')}</div>`;
     } else {
       const chunks = splitAssistantOutput(m.content);
       html += (chunks.length ? chunks : [m.content]).map(chunk =>
@@ -1475,6 +1560,50 @@ function insertEmoji(value) {
   const next = start + value.length;
   input.setSelectionRange?.(next, next);
   autoResize(input);
+}
+async function continueAssistantTurn(requestCharId, userText) {
+  const chat = allChats[requestCharId];
+  isStreaming = true;
+  updateStreamingDraft(requestCharId, '');
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  try {
+    const memoryPack = await prepareMemoryPack(requestCharId, userText);
+    const reply = await callAPI(chat, memoryPack, { charId: requestCharId });
+    clearStreamingDraft(requestCharId);
+    appendAssistantMessages(chat, reply);
+    scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+  } catch (err) {
+    clearStreamingDraft(requestCharId);
+    chat.messages.push({ role: 'assistant', content: `（${friendlyErrorMessage(err)}）`, time: Date.now() });
+  }
+  isStreaming = false;
+  DB.set('chats', allChats);
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  renderChats();
+  processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
+}
+async function sendWalletMessage(kind) {
+  if (!currentCharId || isStreaming) return;
+  const char = characters.find(c => c.id === currentCharId);
+  const label = kind === 'redpacket' ? '红包' : '转账';
+  const raw = prompt(`${label}金额\n当前余额：${formatMoney(walletBalance())}`, '');
+  if (raw === null) return;
+  const amount = Math.round(Number(String(raw).replace(/[¥,\s]/g, '')) * 100) / 100;
+  if (!Number.isFinite(amount) || amount <= 0) { toast('金额不正确'); return; }
+  if (amount > walletBalance()) { toast('余额不足'); return; }
+  const note = (prompt(kind === 'redpacket' ? '红包祝福语（可留空）' : '转账备注（可留空）', '') || '').trim();
+  const chat = allChats[currentCharId];
+  if (!chat) return;
+  cancelCloudProactive(currentCharId);
+  saveWalletBalance(walletBalance() - amount);
+  closeComposerPanels();
+  const content = kind === 'redpacket'
+    ? `${playerName()}给${char?.name || '对方'}发了一个红包：${formatMoney(amount)}${note ? `，备注：${note}` : ''}`
+    : `${playerName()}向${char?.name || '对方'}转账${formatMoney(amount)}${note ? `，备注：${note}` : ''}`;
+  chat.messages.push({ role: 'user', content, type: kind, payType: kind, amount, note, time: Date.now() });
+  DB.set('chats', allChats);
+  renderMessages();
+  await continueAssistantTurn(currentCharId, content);
 }
 function uid(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1774,23 +1903,8 @@ async function sendMessage() {
   const chat = allChats[requestCharId];
   cancelCloudProactive(requestCharId);
   chat.messages.push({ role: 'user', content: text, time: Date.now() });
-  isStreaming = true;
-  updateStreamingDraft(requestCharId, '');
-  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
-  try {
-    const memoryPack = await prepareMemoryPack(requestCharId, text);
-    const reply = await callAPI(chat, memoryPack, { charId: requestCharId });
-    clearStreamingDraft(requestCharId);
-    appendAssistantMessages(chat, reply);
-    scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
-  } catch (err) {
-    clearStreamingDraft(requestCharId);
-    chat.messages.push({ role: 'assistant', content: `（${friendlyErrorMessage(err)}）`, time: Date.now() });
-  }
-  isStreaming = false;
   DB.set('chats', allChats);
-  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
-  processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] update skipped:', err.message));
+  await continueAssistantTurn(requestCharId, text);
 }
 
 function getLatestChatRows() {
