@@ -291,9 +291,8 @@ button{border:none;background:none;cursor:pointer}
         <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-new"></span><div class="cell-body">新建角色</div></button>
         <button class="cell" onclick="openImport()"><span class="wx-icon blue wx-card"></span><div class="cell-body">导入角色卡</div></button>
       </div>
-      <div class="contact-index">A</div>
       <div class="list" id="contact-list"></div>
-      <div class="contact-rail"><span>↑</span><span>☆</span><span>A</span><span>B</span><span>C</span><span>D</span><span>E</span><span>F</span><span>G</span><span>H</span><span>I</span><span>J</span><span>K</span><span>L</span><span>M</span><span>N</span><span>O</span><span>P</span><span>Q</span><span>R</span><span>S</span><span>T</span><span>U</span><span>V</span><span>W</span><span>X</span><span>Y</span><span>Z</span><span>#</span></div>
+      <div class="contact-rail" id="contact-rail"></div>
     </div>
     <nav class="tabbar">
       <button class="tab" data-screen="chats" onclick="showScreen('chats')"><span class="tab-ico ico-chat"></span>AL</button>
@@ -318,7 +317,7 @@ button{border:none;background:none;cursor:pointer}
         </div>
       </div>
       <div class="wx-group">
-        <div class="cell"><div class="cell-label">设置备注和标签</div><div class="cell-body profile-detail-text" id="profile-char-tags"></div></div>
+        <div class="cell"><div class="cell-label">标签</div><div class="cell-body profile-detail-text" id="profile-char-tags"></div></div>
       </div>
       <div class="wx-group">
         <div class="cell"><div class="cell-label">个性签名</div><div class="cell-body profile-detail-text" id="profile-char-desc"></div></div>
@@ -1251,23 +1250,45 @@ function renderChats() {
     </button>`).join('');
   wrap.innerHTML = `<div class="list">${roleHtml}</div>`;
 }
+function contactSortKey(c) {
+  const name = String(c?.name || '').trim();
+  const first = name[0] || '#';
+  const upper = first.toLocaleUpperCase();
+  return /^[A-Z]$/.test(upper) ? upper : '#';
+}
 function renderContacts() {
   const list = document.getElementById('contact-list');
+  const rail = document.getElementById('contact-rail');
   const keyword = (searchFilters.contacts || '').toLowerCase();
   const rows = characters
     .filter(c => !keyword || [c.name, c.description, c.personality].some(v => String(v || '').toLowerCase().includes(keyword)))
-    .sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'));
+    .sort((a,b)=>contactSortKey(a).localeCompare(contactSortKey(b), 'zh-CN') || a.name.localeCompare(b.name,'zh-CN'));
   if (!rows.length) {
     list.innerHTML = searchFilters.contacts
       ? '<div class="empty"><div class="empty-ico">⌕</div><div>没有找到相关联系人</div></div>'
       : '<div class="empty"><div class="empty-ico">👥</div><div>暂无联系人</div></div>';
+    if (rail) rail.innerHTML = '<span>↑</span><span>☆</span><span>#</span>';
     return;
   }
-  list.innerHTML = rows.map(c => `
-    <button class="row" onclick="openContactProfile('${c.id}')">
-      ${avatarHtml(c)}
-      <div class="row-main"><div class="row-name">${esc(c.name)}</div><div class="row-preview">${esc(c.description || c.personality || '')}</div></div>
-    </button>`).join('');
+  const groups = [];
+  rows.forEach(c => {
+    const key = contactSortKey(c);
+    let group = groups[groups.length - 1];
+    if (!group || group.key !== key) {
+      group = { key, rows: [] };
+      groups.push(group);
+    }
+    group.rows.push(c);
+  });
+  if (rail) rail.innerHTML = ['↑', '☆', ...groups.map(g => g.key)].map(k => `<span>${esc(k)}</span>`).join('');
+  list.innerHTML = groups.map(group => `
+    <div class="contact-index">${esc(group.key)}</div>
+    ${group.rows.map(c => `
+      <button class="row" onclick="openContactProfile('${c.id}')">
+        ${avatarHtml(c)}
+        <div class="row-main"><div class="row-name">${esc(c.name)}</div><div class="row-preview">${esc(c.description || c.personality || '')}</div></div>
+      </button>`).join('')}`
+  ).join('');
 }
 function renderMoments() {
   const list = document.getElementById('moment-list');
