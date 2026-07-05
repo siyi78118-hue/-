@@ -184,17 +184,17 @@ function appendAssistantMessages(chat, text, extra = {}) {
   return chunks;
 }
 
-function playerName() {
-  return '玩家';
+function playerName(settings = {}) {
+  return (settings.playerName || '玩家').trim() || '玩家';
 }
 
 function charName(char) {
   return char?.name || '对方';
 }
 
-function memoryAliasText(text, char) {
+function memoryAliasText(text, char, settings = {}) {
   return String(text || '')
-    .replace(/用户/g, playerName())
+    .replace(/用户/g, playerName(settings))
     .replace(/角色/g, charName(char));
 }
 
@@ -230,23 +230,23 @@ function shouldKeepSummary(summary) {
   return text.length >= 20 && !memoryTextIsNoise(text) && memoryTextHasSignal(text);
 }
 
-function messageLine(m, char) {
-  return `${m.role === 'user' ? playerName() : charName(char)}：${m.content}`;
+function messageLine(m, char, settings = {}) {
+  return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
 }
 
-function buildMemoryPack(charId, char) {
+function buildMemoryPack(charId, char, settings = {}) {
   return Promise.all([
     getAll('summaries'),
     getAll('events'),
     getAll('profiles')
   ]).then(([summaries, events, profiles]) => {
-    const latestSummaries = summaries.filter(r => r.charId === charId && shouldKeepSummary(memoryAliasText(r.content, char))).sort((a, b) => b.createdAt - a.createdAt).slice(0, 3).reverse();
+    const latestSummaries = summaries.filter(r => r.charId === charId && shouldKeepSummary(memoryAliasText(r.content, char, settings))).sort((a, b) => b.createdAt - a.createdAt).slice(0, 3).reverse();
     const importantEvents = events.filter(r => r.charId === charId && shouldKeepEvent(r)).sort((a, b) => (b.importance || 0) - (a.importance || 0) || b.createdAt - a.createdAt).slice(0, 8);
     const profileRows = profiles.filter(r => r.charId === charId && shouldKeepProfile(r)).sort((a, b) => (b.importance || 0) - (a.importance || 0) || b.createdAt - a.createdAt).slice(0, 8);
     const parts = [];
-    if (latestSummaries.length) parts.push('近期增量摘要：\n' + latestSummaries.map(s => `- ${memoryAliasText(s.content, char)}`).join('\n'));
-    if (importantEvents.length) parts.push('重要事件和时间节点：\n' + importantEvents.map(e => `- ${memoryAliasText(e.happenedAt || '未注明', char)}｜${memoryAliasText(e.title || '事件', char)}：${memoryAliasText(e.detail, char)}`).join('\n'));
-    if (profileRows.length) parts.push('稳定资料和关系状态：\n' + profileRows.map(p => `- ${memoryAliasText(p.title || p.type || '资料', char)}：${memoryAliasText(p.detail, char)}`).join('\n'));
+    if (latestSummaries.length) parts.push('近期增量摘要：\n' + latestSummaries.map(s => `- ${memoryAliasText(s.content, char, settings)}`).join('\n'));
+    if (importantEvents.length) parts.push('重要事件和时间节点：\n' + importantEvents.map(e => `- ${memoryAliasText(e.happenedAt || '未注明', char, settings)}｜${memoryAliasText(e.title || '事件', char, settings)}：${memoryAliasText(e.detail, char, settings)}`).join('\n'));
+    if (profileRows.length) parts.push('稳定资料和关系状态：\n' + profileRows.map(p => `- ${memoryAliasText(p.title || p.type || '资料', char, settings)}：${memoryAliasText(p.detail, char, settings)}`).join('\n'));
     if (!parts.length) return '';
     return `以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。\n\n${parts.join('\n\n')}`;
   });
@@ -293,7 +293,7 @@ async function handleProactivePush(payload) {
   if (!(settings.chatApiUrl || settings.apiUrl) || !(settings.chatApiKey || settings.apiKey) || !settings.chatModel) throw new Error('missing api config');
 
   const proactiveNow = new Date();
-  const memoryPack = await buildMemoryPack(charId, char);
+  const memoryPack = await buildMemoryPack(charId, char, settings);
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
   let system = chat.charPrompt || `当前你要扮演的角色：${char.name}`;
   system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow);

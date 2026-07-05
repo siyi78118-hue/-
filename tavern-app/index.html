@@ -53,6 +53,8 @@ button{border:none;background:none;cursor:pointer}
 .avatar{width:56px;height:56px;border-radius:5px;display:flex;align-items:center;justify-content:center;flex-shrink:0;overflow:hidden;background:linear-gradient(135deg,#8fd36f,#3fb466);color:#fff;font-size:25px;font-weight:600;font-family:"KaiTi","STKaiti","FangSong",cursive;position:relative}
 .avatar.large{width:64px;height:64px;border-radius:7px;font-size:28px}
 .avatar img{width:100%;height:100%;object-fit:cover}
+.avatar-edit{display:flex;align-items:center;gap:12px}
+.avatar-edit .avatar{width:44px;height:44px;font-size:20px}
 .row-main{flex:1;min-width:0}
 .row-line{display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden}
 .row-name{font-family:"KaiTi","STKaiti","FangSong",cursive;font-size:24px;font-weight:700;line-height:1.18;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -243,7 +245,7 @@ button{border:none;background:none;cursor:pointer}
     <div class="scroll" style="background:#ededed">
       <div class="moments-cover">
         <div class="moments-title">朋友圈</div>
-        <div class="moments-user"><span>玩家</span><div class="avatar">我</div></div>
+        <div class="moments-user"><span id="moments-player-name">玩家</span><div id="moments-player-avatar" class="avatar">我</div></div>
       </div>
       <div class="cell-group discover-tools">
         <button class="cell" onclick="openImport()"><span class="cell-ico orange">＋</span><div class="cell-body">素材库<span class="cell-note">导入角色卡、头像和开场白</span></div><div class="mini">›</div></button>
@@ -266,15 +268,18 @@ button{border:none;background:none;cursor:pointer}
       <div class="profile-card">
         <div class="profile-cover"></div>
         <div class="profile-top">
-          <div class="avatar large">我</div>
+          <div id="me-player-avatar" class="avatar large">我</div>
           <div style="flex:1;min-width:0">
-            <div class="profile-name">玩家</div>
+            <div class="profile-name" id="me-player-name">玩家</div>
             <div class="profile-meta"><span>AL ID：local-player</span><span class="qr-mark"></span></div>
           </div>
           <div class="mini">›</div>
         </div>
       </div>
+      <input type="file" id="player-avatar-input" accept="image/*" style="display:none" onchange="handlePlayerAvatar(event)">
       <div class="cell-group">
+        <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="player-name-input" placeholder="你的昵称" oninput="schedulePlayerProfileSave()"></div></div>
+        <button class="cell" onclick="choosePlayerAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body"><div class="avatar-edit"><span id="player-avatar-preview" class="avatar">我</span><span>选择图片</span></div></div><div class="mini">›</div></button>
         <button class="cell" onclick="showScreen('settings')"><span class="cell-ico gray">设</span><div class="cell-body">设置<span class="cell-note">接口、预设、主动消息和云闹钟</span></div><div class="mini">›</div></button>
         <button class="cell" onclick="openImport()"><span class="cell-ico orange">卡</span><div class="cell-body">角色卡<span class="cell-note">导入或新建联系人</span></div><div class="mini">›</div></button>
       </div>
@@ -326,9 +331,11 @@ button{border:none;background:none;cursor:pointer}
           <div>选择 JSON / PNG 角色卡</div>
         </div>
         <input type="file" id="file-input" accept=".json,.png" style="display:none" onchange="handleFileImport(event)" multiple>
+        <input type="file" id="new-avatar-input" accept="image/*" style="display:none" onchange="handleNewRoleAvatar(event)">
       </div>
       <div class="contact-index">新建角色</div>
       <div class="cell-group">
+        <button class="cell" onclick="chooseNewRoleAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body"><div class="avatar-edit"><span id="new-avatar-preview" class="avatar">＋</span><span>选择图片</span></div></div><div class="mini">›</div></button>
         <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="new-name" placeholder="角色名"></div></div>
         <div class="cell"><div class="cell-label">签名</div><div class="cell-body"><input class="input" id="new-desc" placeholder="一句话设定"></div></div>
         <div class="cell"><div class="cell-label">场景</div><div class="cell-body"><textarea class="textarea" id="new-scenario" placeholder="当前关系、地点、氛围"></textarea></div></div>
@@ -410,6 +417,11 @@ button{border:none;background:none;cursor:pointer}
 <div id="modal-overlay" class="modal-mask" onclick="closeModal(event)">
   <div class="sheet" onclick="event.stopPropagation()">
     <div class="sheet-title">聊天设置</div>
+    <div class="section">角色资料</div>
+    <div class="cell-group">
+      <button class="cell" onclick="chooseModalCharAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body"><div class="avatar-edit"><span id="modal-char-avatar-preview" class="avatar"></span><span>选择图片</span></div></div><div class="mini">›</div></button>
+      <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="modal-char-name" placeholder="角色昵称"></div></div>
+    </div>
     <div class="cell-group">
       <button class="cell" onclick="clearCurrentChat()"><div class="cell-body">清空聊天</div></button>
       <button class="cell" onclick="deleteCurrentRole()"><div class="cell-body danger">删除角色</div></button>
@@ -420,6 +432,7 @@ button{border:none;background:none;cursor:pointer}
       <div class="cell"><div class="cell-body"><textarea class="textarea" id="modal-extra-prompt" placeholder="额外提示词"></textarea></div></div>
     </div>
     <button class="primary" onclick="savePreset()">保存</button>
+    <input type="file" id="modal-char-avatar-input" accept="image/*" style="display:none" onchange="handleModalCharAvatar(event)">
   </div>
 </div>
 
@@ -514,6 +527,9 @@ const DEFAULT_SETTINGS = {
   pushPublicKey: '',
   pushSubscription: null,
   deviceId: '',
+  playerName: '玩家',
+  playerAvatar: '我',
+  playerAvatarData: null,
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
@@ -552,6 +568,9 @@ let proactiveTimer = null;
 let proactiveBusy = false;
 let settingsSaveTimer = null;
 let settingsFormHydrating = false;
+let playerProfileSaveTimer = null;
+let newRoleAvatarData = '';
+let modalCharAvatarData = '';
 
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_STORES = ['summaries', 'events', 'profiles', 'vectors', 'meta'];
@@ -793,6 +812,26 @@ function avatarHtml(c, cls = 'avatar') {
   const content = c?.avatarData ? `<img src="${c.avatarData}" alt="">` : esc(c?.avatar || c?.name?.slice(0,1) || 'R');
   return `<div class="${cls}">${content}</div>`;
 }
+function playerAvatarContent() {
+  return settings.playerAvatarData ? `<img src="${settings.playerAvatarData}" alt="">` : esc(settings.playerAvatar || playerName().slice(0, 1) || '我');
+}
+function playerAvatarHtml(cls = 'avatar') {
+  return `<div class="${cls}">${playerAvatarContent()}</div>`;
+}
+function setAvatarPreview(id, data, fallback = '') {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.innerHTML = data ? `<img src="${data}" alt="">` : esc(fallback);
+}
+function readImageFile(file) {
+  return new Promise((resolve, reject) => {
+    if (!file) return resolve('');
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
+    reader.readAsDataURL(file);
+  });
+}
 function toast(msg, dur = 1800) {
   const old = document.querySelector('.toast');
   if (old) old.remove();
@@ -829,6 +868,7 @@ function showScreen(name) {
   document.getElementById('screen-' + name).classList.add('active');
   if (['chats','contacts','discover','me'].includes(name)) lastMainScreen = name;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.screen === name));
+  renderPlayerProfile();
   if (name === 'chats') renderChats();
   if (name === 'contacts') renderContacts();
   if (name === 'discover') renderMoments();
@@ -840,7 +880,93 @@ function togglePlusMenu() {
   document.getElementById('plus-menu').classList.toggle('show', plusOpen);
 }
 function openImport() { showScreen('import'); }
-function openCreateRole() { showScreen('import'); setTimeout(() => document.getElementById('new-name')?.focus(), 50); }
+function openCreateRole() {
+  newRoleAvatarData = '';
+  setAvatarPreview('new-avatar-preview', '', '＋');
+  showScreen('import');
+  setTimeout(() => document.getElementById('new-name')?.focus(), 50);
+}
+function renderPlayerProfile() {
+  const name = playerName();
+  const input = document.getElementById('player-name-input');
+  if (input && document.activeElement !== input) input.value = name;
+  const nameTargets = ['me-player-name', 'moments-player-name'];
+  nameTargets.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = name;
+  });
+  setAvatarPreview('me-player-avatar', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
+  setAvatarPreview('moments-player-avatar', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
+  setAvatarPreview('player-avatar-preview', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
+}
+function savePlayerProfile(silent = true) {
+  const input = document.getElementById('player-name-input');
+  const name = (input?.value || settings.playerName || '玩家').trim() || '玩家';
+  settings.playerName = name;
+  settings.playerAvatar = name.slice(0, 1) || '我';
+  DB.set('settings', settings);
+  renderPlayerProfile();
+  if (activeScreen === 'chat') renderMessages();
+  if (activeScreen === 'discover') renderMoments();
+  if (!silent) toast('已保存资料');
+}
+function schedulePlayerProfileSave() {
+  if (playerProfileSaveTimer) clearTimeout(playerProfileSaveTimer);
+  playerProfileSaveTimer = setTimeout(() => {
+    playerProfileSaveTimer = null;
+    savePlayerProfile(true);
+  }, 400);
+}
+function choosePlayerAvatar() {
+  document.getElementById('player-avatar-input')?.click();
+}
+async function handlePlayerAvatar(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    settings.playerAvatarData = await readImageFile(file);
+    settings.playerAvatar = playerName().slice(0, 1) || '我';
+    DB.set('settings', settings);
+    renderPlayerProfile();
+    if (activeScreen === 'chat') renderMessages();
+    toast('头像已保存');
+  } catch (err) {
+    toast('头像读取失败：' + err.message, 2600);
+  } finally {
+    event.target.value = '';
+  }
+}
+function chooseNewRoleAvatar() {
+  document.getElementById('new-avatar-input')?.click();
+}
+async function handleNewRoleAvatar(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    newRoleAvatarData = await readImageFile(file);
+    setAvatarPreview('new-avatar-preview', newRoleAvatarData, '＋');
+  } catch (err) {
+    toast('头像读取失败：' + err.message, 2600);
+  } finally {
+    event.target.value = '';
+  }
+}
+function chooseModalCharAvatar() {
+  document.getElementById('modal-char-avatar-input')?.click();
+}
+async function handleModalCharAvatar(event) {
+  const file = event.target.files?.[0];
+  if (!file) return;
+  try {
+    modalCharAvatarData = await readImageFile(file);
+    const char = characters.find(c => c.id === currentCharId);
+    setAvatarPreview('modal-char-avatar-preview', modalCharAvatarData, char?.avatar || char?.name?.slice(0, 1) || 'R');
+  } catch (err) {
+    toast('头像读取失败：' + err.message, 2600);
+  } finally {
+    event.target.value = '';
+  }
+}
 
 function renderChats() {
   const wrap = document.getElementById('chat-list');
@@ -905,11 +1031,13 @@ function createRole() {
     postHistoryInstructions: '',
     tags: [],
     avatar: name.slice(0,1),
-    avatarData: null,
+    avatarData: newRoleAvatarData || null,
   });
   characters.push(char);
   DB.set('characters', characters);
   ['new-name','new-desc','new-scenario','new-first'].forEach(id => document.getElementById(id).value = '');
+  newRoleAvatarData = '';
+  setAvatarPreview('new-avatar-preview', '', '＋');
   toast('已保存');
   openChat(char.id);
 }
@@ -1089,7 +1217,7 @@ function renderMessages() {
   chat.messages.forEach((m, i) => {
     if (i === 0 || (m.time - (chat.messages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
     if (m.role === 'user') {
-      html += `<div class="msg-wrap me"><div class="bubble">${formatMsg(m.content)}</div><div class="msg-avatar">我</div></div>`;
+      html += `<div class="msg-wrap me"><div class="bubble">${formatMsg(m.content)}</div>${playerAvatarHtml('msg-avatar')}</div>`;
     } else {
       const chunks = splitAssistantOutput(m.content);
       html += (chunks.length ? chunks : [m.content]).map(chunk =>
@@ -1135,7 +1263,7 @@ function memoryMetaKey(charId) {
   return `memory_processed_${charId}`;
 }
 function playerName() {
-  return '玩家';
+  return (settings.playerName || '玩家').trim() || '玩家';
 }
 function charName(char) {
   return char?.name || '对方';
@@ -2036,6 +2164,10 @@ async function clearCurrentMemory() {
 function showPresetModal() {
   const chat = allChats[currentCharId];
   if (!chat) return;
+  const char = characters.find(c => c.id === currentCharId);
+  modalCharAvatarData = char?.avatarData || '';
+  document.getElementById('modal-char-name').value = char?.name || '';
+  setAvatarPreview('modal-char-avatar-preview', modalCharAvatarData, char?.avatar || char?.name?.slice(0, 1) || 'R');
   document.getElementById('modal-char-prompt').value = chat.charPrompt || '';
   document.getElementById('modal-extra-prompt').value = chat.extraPrompt || '';
   document.getElementById('modal-overlay').classList.add('show');
@@ -2046,10 +2178,27 @@ function closeModal(e) {
 function savePreset() {
   const chat = allChats[currentCharId];
   if (!chat) return;
+  const char = characters.find(c => c.id === currentCharId);
+  const oldDefaultPrompt = char ? buildCharPrompt({ ...char }) : '';
+  if (char) {
+    const newName = document.getElementById('modal-char-name').value.trim();
+    if (newName) {
+      char.name = newName;
+      char.avatar = char.avatarData ? char.avatar : newName.slice(0, 1);
+    }
+    char.avatarData = modalCharAvatarData || null;
+    if (char.avatarData) char.avatar = char.name.slice(0, 1);
+    normalizeChar(char);
+    DB.set('characters', characters);
+    document.getElementById('chat-title').textContent = char.name;
+  }
   chat.charPrompt = document.getElementById('modal-char-prompt').value.trim();
+  if (char && (!chat.charPrompt || chat.charPrompt === oldDefaultPrompt)) chat.charPrompt = buildCharPrompt(char);
   chat.extraPrompt = document.getElementById('modal-extra-prompt').value.trim();
   DB.set('chats', allChats);
   document.getElementById('modal-overlay').classList.remove('show');
+  renderMessages();
+  if (activeScreen === 'chats') renderChats();
   toast('已保存');
 }
 function clearCurrentChat() {
@@ -2086,15 +2235,18 @@ function clearAllHistory() {
 async function syncFromServiceWorkerState() {
   const changed = await restoreAppStateFromMirror();
   if (changed) {
+    renderPlayerProfile();
     if (activeScreen === 'chat') renderMessages();
     if (activeScreen === 'chats') renderChats();
     if (activeScreen === 'contacts') renderContacts();
+    if (activeScreen === 'discover') renderMoments();
     if (activeScreen === 'memory') renderMemoryScreen();
   }
   catchUpDueCloudProactive().catch(err => console.warn('[AL Timer] catch-up skipped:', err.message));
 }
 async function bootApp() {
   await syncFromServiceWorkerState();
+  renderPlayerProfile();
   startProactiveLoop();
   renderChats();
   await mirrorAppStateNow();
