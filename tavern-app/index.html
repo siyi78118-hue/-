@@ -192,6 +192,12 @@ button{border:none;background:none;cursor:pointer}
 .profile-card .profile-top{margin-top:0;border-bottom:none;background:#fff}
 .profile-meta{display:flex;align-items:center;gap:8px;color:#777;font-size:13px}
 .qr-mark{width:18px;height:18px;border:1px solid #aaa;border-radius:3px;background:linear-gradient(90deg,#aaa 2px,transparent 2px) 0 0/6px 6px,linear-gradient(#aaa 2px,transparent 2px) 0 0/6px 6px;opacity:.8}
+.chat-info-people{display:flex;gap:18px;padding:22px 18px;background:#fff;margin-bottom:8px}
+.chat-info-person{width:58px;display:flex;flex-direction:column;align-items:center;gap:8px;color:#555;font-size:12px;text-align:center}
+.chat-info-person .avatar{width:52px;height:52px;font-size:22px}
+.chat-info-person span{width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chat-info-editor .cell-label{width:74px}
+.chat-info-editor .textarea{min-height:104px}
 .moment{background:#fff;margin:0;padding:13px 16px;display:flex;gap:10px;border-bottom:1px solid var(--line2);box-shadow:none}
 .moment-body{flex:1;min-width:0}
 .moment-name{color:var(--blue);font-weight:600;font-size:15px}
@@ -380,6 +386,51 @@ button{border:none;background:none;cursor:pointer}
     </div>
   </div>
 
+  <div id="screen-chat-info" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('chat')">‹</button></div>
+      <div class="top-title">聊天信息</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll" style="background:#ededed">
+      <div class="chat-info-people">
+        <button class="chat-info-person" onclick="chooseModalCharAvatar()" type="button">
+          <span id="modal-char-avatar-preview" class="avatar"></span>
+          <span id="chat-info-char-label">角色</span>
+        </button>
+        <button class="chat-info-person" onclick="choosePlayerAvatar()" type="button">
+          <span id="chat-info-player-avatar-preview" class="avatar">我</span>
+          <span id="chat-info-player-label">我</span>
+        </button>
+        <button class="chat-info-person" onclick="openCreateRole()" type="button">
+          <span class="avatar">＋</span>
+          <span>添加</span>
+        </button>
+      </div>
+      <input type="file" id="modal-char-avatar-input" accept="image/*" style="display:none" onchange="handleModalCharAvatar(event)">
+      <div class="contact-index">对方资料</div>
+      <div class="cell-group chat-info-editor">
+        <button class="cell" onclick="chooseModalCharAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body">更换角色头像</div><div class="mini">›</div></button>
+        <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="modal-char-name" placeholder="角色昵称"></div></div>
+      </div>
+      <div class="contact-index">我的资料</div>
+      <div class="cell-group chat-info-editor">
+        <button class="cell" onclick="choosePlayerAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body">更换我的头像</div><div class="mini">›</div></button>
+        <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="chat-info-player-name" placeholder="你的昵称" oninput="schedulePlayerProfileSave('chat-info-player-name')"></div></div>
+      </div>
+      <div class="cell-group">
+        <button class="cell" onclick="clearCurrentChat()"><div class="cell-body">清空聊天记录</div></button>
+        <button class="cell" onclick="deleteCurrentRole()"><div class="cell-body danger">删除这个角色</div></button>
+      </div>
+      <div class="contact-index">角色预设</div>
+      <div class="cell-group chat-info-editor">
+        <div class="cell"><div class="cell-body"><textarea class="textarea" id="modal-char-prompt" placeholder="角色长期预设"></textarea></div></div>
+        <div class="cell"><div class="cell-body"><textarea class="textarea" id="modal-extra-prompt" placeholder="本会话额外提示词"></textarea></div></div>
+      </div>
+      <button class="primary" onclick="savePreset()">保存</button>
+    </div>
+  </div>
+
   <div id="screen-moments" class="screen">
     <div class="topbar">
       <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen(lastMainScreen)">‹</button></div>
@@ -481,28 +532,6 @@ button{border:none;background:none;cursor:pointer}
         <div id="memory-list" class="cell-group"></div>
       </div>
     </div>
-  </div>
-</div>
-
-<div id="modal-overlay" class="modal-mask" onclick="closeModal(event)">
-  <div class="sheet" onclick="event.stopPropagation()">
-    <div class="sheet-title">聊天设置</div>
-    <div class="section">角色资料</div>
-    <div class="cell-group">
-      <button class="cell" onclick="chooseModalCharAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body"><div class="avatar-edit"><span id="modal-char-avatar-preview" class="avatar"></span><span>选择图片</span></div></div><div class="mini">›</div></button>
-      <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="modal-char-name" placeholder="角色昵称"></div></div>
-    </div>
-    <div class="cell-group">
-      <button class="cell" onclick="clearCurrentChat()"><div class="cell-body">清空聊天</div></button>
-      <button class="cell" onclick="deleteCurrentRole()"><div class="cell-body danger">删除角色</div></button>
-    </div>
-    <div class="section">预设</div>
-    <div class="cell-group">
-      <div class="cell"><div class="cell-body"><textarea class="textarea" id="modal-char-prompt"></textarea></div></div>
-      <div class="cell"><div class="cell-body"><textarea class="textarea" id="modal-extra-prompt" placeholder="额外提示词"></textarea></div></div>
-    </div>
-    <button class="primary" onclick="savePreset()">保存</button>
-    <input type="file" id="modal-char-avatar-input" accept="image/*" style="display:none" onchange="handleModalCharAvatar(event)">
   </div>
 </div>
 
@@ -947,6 +976,7 @@ function showScreen(name) {
   if (name === 'moments') renderMoments();
   if (name === 'settings') loadSettings();
   if (name === 'memory') renderMemoryScreen();
+  if (name === 'chat-info') renderChatInfo();
 }
 function togglePlusMenu() {
   plusOpen = !plusOpen;
@@ -984,11 +1014,30 @@ function openCreateRole() {
   setAvatarPreview('new-avatar-preview', '', '＋');
   openImport();
 }
+function renderChatInfo() {
+  const chat = allChats[currentCharId];
+  const char = characters.find(c => c.id === currentCharId);
+  if (!chat || !char) return;
+  modalCharAvatarData = char.avatarData || '';
+  const nameInput = document.getElementById('modal-char-name');
+  if (nameInput && document.activeElement !== nameInput) nameInput.value = char.name || '';
+  const charLabel = document.getElementById('chat-info-char-label');
+  if (charLabel) charLabel.textContent = char.name || '角色';
+  setAvatarPreview('modal-char-avatar-preview', modalCharAvatarData, char.avatar || char.name?.slice(0, 1) || 'R');
+  const charPrompt = document.getElementById('modal-char-prompt');
+  const extraPrompt = document.getElementById('modal-extra-prompt');
+  if (charPrompt && document.activeElement !== charPrompt) charPrompt.value = chat.charPrompt || '';
+  if (extraPrompt && document.activeElement !== extraPrompt) extraPrompt.value = chat.extraPrompt || '';
+  renderPlayerProfile();
+}
 function renderPlayerProfile() {
   const name = playerName();
-  const input = document.getElementById('player-name-input');
-  if (input && document.activeElement !== input) input.value = name;
-  const nameTargets = ['me-player-name', 'moments-player-name'];
+  const inputIds = ['player-name-input', 'chat-info-player-name'];
+  inputIds.forEach(id => {
+    const input = document.getElementById(id);
+    if (input && document.activeElement !== input) input.value = name;
+  });
+  const nameTargets = ['me-player-name', 'moments-player-name', 'chat-info-player-label'];
   nameTargets.forEach(id => {
     const el = document.getElementById(id);
     if (el) el.textContent = name;
@@ -996,9 +1045,10 @@ function renderPlayerProfile() {
   setAvatarPreview('me-player-avatar', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
   setAvatarPreview('moments-player-avatar', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
   setAvatarPreview('player-avatar-preview', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
+  setAvatarPreview('chat-info-player-avatar-preview', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
 }
-function savePlayerProfile(silent = true) {
-  const input = document.getElementById('player-name-input');
+function savePlayerProfile(silent = true, sourceId = '') {
+  const input = document.getElementById(sourceId) || document.getElementById('player-name-input') || document.getElementById('chat-info-player-name');
   const name = (input?.value || settings.playerName || '玩家').trim() || '玩家';
   settings.playerName = name;
   settings.playerAvatar = name.slice(0, 1) || '我';
@@ -1008,11 +1058,11 @@ function savePlayerProfile(silent = true) {
   if (activeScreen === 'discover') renderMoments();
   if (!silent) toast('已保存资料');
 }
-function schedulePlayerProfileSave() {
+function schedulePlayerProfileSave(sourceId = '') {
   if (playerProfileSaveTimer) clearTimeout(playerProfileSaveTimer);
   playerProfileSaveTimer = setTimeout(() => {
     playerProfileSaveTimer = null;
-    savePlayerProfile(true);
+    savePlayerProfile(true, sourceId);
   }, 400);
 }
 function choosePlayerAvatar() {
@@ -1276,7 +1326,9 @@ function buildCharPrompt(char) {
   const preset = RP_PRESETS[normalizePresetKey(settings.rpPreset)] || RP_PRESETS.combined;
   if (preset.prompt) prompt += preset.prompt + '\n\n';
   if (char.systemPrompt) prompt += `角色卡系统提示：\n${char.systemPrompt}\n\n`;
+  prompt += `玩家昵称：${playerName()}\n`;
   prompt += `当前你要扮演的角色：${char.name}\n`;
+  prompt += `角色昵称：${char.name}\n`;
   if (char.description) prompt += `角色设定：${char.description}\n`;
   if (char.personality) prompt += `性格：${char.personality}\n`;
   if (char.scenario) prompt += `场景：${char.scenario}\n`;
@@ -1932,6 +1984,7 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   const currentChar = characters.find(c => c.id === charId);
   let system = currentChar ? buildCharPrompt(currentChar) : (chat.charPrompt || '');
   if (chat.charPrompt && chat.charPrompt !== system) system += '\n\n对话专属补充：\n' + chat.charPrompt;
+  system += `\n\n身份称呼：玩家昵称是“${playerName()}”，当前对话角色昵称是“${currentChar?.name || '角色'}”。对话中需要称呼双方时，优先使用这些昵称，不要把他们写成“用户”和“角色”。`;
   system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext();
   if (memoryPack) system += '\n\n' + memoryPack;
   if (options.proactive) {
@@ -2295,16 +2348,10 @@ async function clearCurrentMemory() {
 function showPresetModal() {
   const chat = allChats[currentCharId];
   if (!chat) return;
-  const char = characters.find(c => c.id === currentCharId);
-  modalCharAvatarData = char?.avatarData || '';
-  document.getElementById('modal-char-name').value = char?.name || '';
-  setAvatarPreview('modal-char-avatar-preview', modalCharAvatarData, char?.avatar || char?.name?.slice(0, 1) || 'R');
-  document.getElementById('modal-char-prompt').value = chat.charPrompt || '';
-  document.getElementById('modal-extra-prompt').value = chat.extraPrompt || '';
-  document.getElementById('modal-overlay').classList.add('show');
+  showScreen('chat-info');
 }
 function closeModal(e) {
-  if (e.target.id === 'modal-overlay') document.getElementById('modal-overlay').classList.remove('show');
+  if (e?.target?.id === 'modal-overlay') document.getElementById('modal-overlay')?.classList.remove('show');
 }
 function savePreset() {
   const chat = allChats[currentCharId];
@@ -2327,9 +2374,11 @@ function savePreset() {
   if (char && (!chat.charPrompt || chat.charPrompt === oldDefaultPrompt)) chat.charPrompt = buildCharPrompt(char);
   chat.extraPrompt = document.getElementById('modal-extra-prompt').value.trim();
   DB.set('chats', allChats);
-  document.getElementById('modal-overlay').classList.remove('show');
   renderMessages();
-  if (activeScreen === 'chats') renderChats();
+  renderChats();
+  renderContacts();
+  renderChatInfo();
+  showScreen('chat');
   toast('已保存');
 }
 function clearCurrentChat() {
@@ -2338,8 +2387,8 @@ function clearCurrentChat() {
   allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(char), extraPrompt: allChats[currentCharId]?.extraPrompt || '', unread: 0 };
   if (char?.firstMessage) allChats[currentCharId].messages.push({ role:'assistant', content:char.firstMessage, time:Date.now() });
   DB.set('chats', allChats);
-  document.getElementById('modal-overlay').classList.remove('show');
   renderMessages();
+  showScreen('chat');
 }
 function deleteCurrentRole() {
   if (!currentCharId || !confirm('删除这个角色？')) return;
@@ -2348,7 +2397,6 @@ function deleteCurrentRole() {
   DB.set('characters', characters);
   DB.set('chats', allChats);
   currentCharId = null;
-  document.getElementById('modal-overlay').classList.remove('show');
   showScreen('contacts');
 }
 function openCurrentProfile() {
