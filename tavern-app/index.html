@@ -22,9 +22,6 @@ html,body{height:100%;overflow:hidden;background:#d8d8d8;color:var(--text);font-
 button,input,textarea,select{font:inherit;color:inherit}
 button{border:none;background:none;cursor:pointer}
 #app{width:100%;max-width:520px;height:100%;margin:0 auto;background:var(--page);display:flex;flex-direction:column;position:relative;overflow:hidden}
-.phone-status{height:34px;padding:4px 16px 0;display:flex;align-items:center;justify-content:space-between;background:#ededed;color:#303030;font-family:Arial,sans-serif;font-size:15px;letter-spacing:.1px;flex-shrink:0}
-.status-left,.status-right{display:flex;align-items:center;gap:5px}
-.status-mini{font-size:10px;font-weight:700;line-height:1}.status-pill{height:15px;padding:0 3px;border-radius:2px;background:#4b4b4b;color:#fff;font-size:10px;font-weight:700;display:inline-flex;align-items:center}.signal{width:18px;height:14px;display:inline-flex;align-items:flex-end;gap:2px}.signal i{width:3px;background:#333;border-radius:1px}.signal i:nth-child(1){height:4px}.signal i:nth-child(2){height:7px}.signal i:nth-child(3){height:10px}.signal i:nth-child(4){height:13px}.battery{width:28px;height:14px;border:2px solid #777;border-radius:3px;position:relative}.battery:after{content:"";position:absolute;right:-5px;top:3px;width:3px;height:6px;background:#777;border-radius:0 2px 2px 0}.battery b{display:block;width:17%;height:100%;background:#e43d30}
 .screen{display:none;flex:1;min-height:0;flex-direction:column;background:#fff}
 .screen.active{display:flex}
 .topbar{height:62px;padding:0 18px;display:flex;align-items:center;gap:10px;background:#ededed;border-bottom:1px solid #d7d7d7;flex-shrink:0}
@@ -158,7 +155,6 @@ button{border:none;background:none;cursor:pointer}
 .contact-index{height:28px;padding:0 18px;display:flex;align-items:center;color:#888;font-size:13px;background:#ededed}
 @media (max-width: 420px) {
   #app{max-width:none}
-  .phone-status{height:28px;padding:3px 12px 0;font-size:13px}
   .topbar{height:54px;padding:0 14px}
   .top-title{font-size:20px}
   .top-left,.top-right{width:66px}
@@ -190,10 +186,6 @@ button{border:none;background:none;cursor:pointer}
 </head>
 <body>
 <div id="app">
-  <div class="phone-status">
-    <div class="status-left"><span id="device-time">17:09</span><strong>120</strong><span class="status-mini">Hz</span></div>
-    <div class="status-right"><span>⌁</span><span class="status-pill">HD</span><span>5G</span><span class="signal"><i></i><i></i><i></i><i></i></span><span class="battery"><b></b></span></div>
-  </div>
   <div id="screen-chats" class="screen active">
     <div class="topbar">
       <div class="top-left"></div>
@@ -713,9 +705,6 @@ function assertHeaderSafe(value, label = 'Key') {
   return text;
 }
 function pad2(n) { return String(n).padStart(2, '0'); }
-function formatStatusTime(date = new Date()) {
-  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
-}
 function getDayPeriod(date = new Date()) {
   const h = date.getHours();
   if (h < 5) return { label: '凌晨', range: '00:00-04:59', banned: '早上、上午、中午、下午、傍晚' };
@@ -793,10 +782,6 @@ function proactiveRecentMessages(chat, count = 30, now = new Date()) {
     const stamp = at ? `发送时间 ${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}` : '发送时间未知';
     return { role: m.role, content: `【${stamp}】${m.content}` };
   });
-}
-function updateStatusClock() {
-  const el = document.getElementById('device-time');
-  if (el) el.textContent = formatStatusTime();
 }
 function fmtTime(ts) {
   if (!ts) return '';
@@ -2049,8 +2034,6 @@ async function syncFromServiceWorkerState() {
 }
 async function bootApp() {
   await syncFromServiceWorkerState();
-  updateStatusClock();
-  if (typeof setInterval !== 'undefined') setInterval(updateStatusClock, 1000);
   startProactiveLoop();
   renderChats();
   await mirrorAppStateNow();
