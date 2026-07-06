@@ -772,7 +772,22 @@ const RP_PRESETS = {
 六、去AI感
 1. 不要总结升华，不要鸡汤，不要客服腔，不要解释“我会如何如何”。
 2. 不要使用套路化霸总/爹味/物化表达；关系应保持平等、尊重和角色自己的边界。
-3. 默认使用中文，除非角色设定或用户明确要求其他语言。`
+3. 默认使用中文，除非角色设定或用户明确要求其他语言。
+
+七、私聊内的不同触发情况
+以下都属于同一个微信式 RP 氛围，不是不同人格或不同任务模式，只是当前消息来源不同：
+1. 用户刚发来消息时，按即时私聊回应，直接承接用户上一条。
+2. 角色主动发消息时，要知道这不是用户刚刚提问；根据过去的时间、关系状态、未完成约定或最近情绪，自然重新开口或轻续聊。
+3. 收到红包或转账时，仍然按私聊口吻回应。角色可以收、暂时不收、拒绝、调侃、追问或表达态度，但不能输出支付系统说明。
+4. 红包未领取时不要说已经退还；红包只有 24 小时未领取才会自动退回。转账若拒收则可以退还。
+5. 朋友圈、红包、转账、主动发言等后台事件可以自然成为角色记得的经历，但不要说“系统记录”“后台显示”“记忆库里写着”。
+
+八、动态/朋友圈互动
+1. 朋友圈评论、点赞、发动态仍然服从同一套角色性格、关系连续和纯聊天限制。
+2. 在朋友圈留言时，要像真实朋友圈评论，不要像私聊即时回复；可以点赞、短评或划过。
+3. 角色自己发朋友圈时，不是在对玩家私聊，而是在发一条动态；内容应像真人随手发的朋友圈。
+4. 动态文字和评论都只能是语言本身，禁止动作、神态、心理、旁白、系统说明。
+5. 如果系统要求 JSON，只是为了让后端识别点赞/评论/动态正文，不代表角色知道 JSON 或系统流程。`
   },
   custom: {
     label: '自定义',
@@ -1993,8 +2008,8 @@ function aiNoNarrationRules(char) {
 function buildSceneSystemBase(char, sceneLabel) {
   return `${buildCharPrompt(char)}
 
-AL 场景化内置预设：
-当前场景：${sceneLabel}
+AL 综合内置预设补充：
+当前补充类型：${sceneLabel}
 ${aiNoNarrationRules(char)}
 当前设备时间：
 ${getTimeContext()}`;
@@ -2017,8 +2032,7 @@ function sceneMessagesForAI(chat, count = 30, options = {}) {
   });
 }
 function buildChatSceneSystem(char, chat, options = {}) {
-  const sceneLabel = options.proactive ? '主动私聊' : options.payment ? '支付后私聊回应' : '普通私聊';
-  let system = buildSceneSystemBase(char, sceneLabel);
+  let system = buildSceneSystemBase(char, '微信私聊');
   const basePrompt = buildCharPrompt(char);
   if (chat?.charPrompt && chat.charPrompt !== basePrompt) system += '\n\n对话专属补充：\n' + chat.charPrompt;
   const momentContext = buildMomentChatContext(char.id);
@@ -2030,10 +2044,10 @@ function buildChatSceneSystem(char, chat, options = {}) {
     const redpacketRule = pay.kind === 'redpacket'
       ? '红包真实规则：未领取时不要说已经退还；24 小时未领取才会自动退款。角色可以领取、暂时不领、拒绝但仍显示待领取。'
       : '转账真实规则：角色可以收钱，也可以明确退还；退还会立刻回到玩家余额。';
-    system += `\n\n支付场景任务：
+    system += `\n\n当前触发情况：${playerName()}刚在私聊里发来一笔${payLabel}。
 上一条可见消息是${playerName()}通过 AL 钱包给${char.name}发来的${payLabel}，金额 ${formatMoney(pay.amount)}${pay.note ? `，备注“${pay.note}”` : ''}。
 ${redpacketRule}
-角色要根据性格、关系、金额、备注和最近上下文自然回应。
+这仍然是微信私聊，不是单独的支付任务。角色要根据性格、关系、金额、备注和最近上下文自然回应。
 如果收下，请用聊天口吻表达“收了/领了/那我收下/谢谢”等含义。
 如果不收，请明确表达“不收/不要/你拿回去/我先不领”等含义。
 不要输出支付系统说明，不要替${playerName()}说话，只输出${char.name}的聊天正文。`;
@@ -2043,14 +2057,14 @@ ${redpacketRule}
     const proactiveTimeContext = options.proactiveTimeContext || buildProactiveTimeContext(chat, proactiveNow);
     system += `\n\n${proactiveTimeContext}
 
-主动私聊任务：
+当前触发情况：${char.name}主动发消息。
 现在不是${playerName()}刚发消息后等你回答，而是${char.name}在空闲时间主动打开聊天发消息。
 短间隔可以轻续聊；超过 15 分钟要体现时间流逝；超过 60 分钟默认像重新开口，除非有未完成约定或强情绪必须接住。
 可以自然提起朋友圈、红包、转账、约定或最近事件，但不要机械复述后台材料。
 如果想连续发几条消息，用换行分隔；系统会拆成独立聊天气泡。
 默认 1-3 句，像真人私聊。`;
   } else if (!options.payment) {
-    system += `\n\n普通私聊任务：
+    system += `\n\n当前触发情况：${playerName()}刚在私聊里发来消息。
 这是${playerName()}刚在当前聊天里发来的消息。请按即时私聊自然回应。
 可以记得后台场景事件和长期记忆，但不要把后台事件当成刚刚收到的新消息。`;
   }
@@ -2059,11 +2073,12 @@ ${redpacketRule}
   return system;
 }
 function buildMomentInteractionPayload(char, moment) {
-  const system = `${buildSceneSystemBase(char, '朋友圈点赞/评论')}
+  const system = `${buildSceneSystemBase(char, '朋友圈动态互动')}
 
-朋友圈互动任务：
+当前触发情况：${char.name}在朋友圈看到${playerName()}发的动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是在朋友圈刷到${playerName()}刚发的一条动态。
 你可以选择点赞、留言、或者什么都不做。留言必须像朋友圈评论，不要像聊天框里的即时回复。
+以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
 只允许输出 JSON，不要输出解释：{"like":true/false,"comment":"留言正文或空字符串"}
 规则：
 1. comment 只能是语言本身，禁止动作、神态、心理、旁白、系统说明。
@@ -2081,11 +2096,12 @@ ${buildMomentChatContext(char.id, 6) || '暂无'}
   return { system, messages: [{ role: 'user', content: user }] };
 }
 function buildMomentPostPayload(char, chat) {
-  const system = `${buildSceneSystemBase(char, '角色主动发朋友圈')}
+  const system = `${buildSceneSystemBase(char, '朋友圈发布动态')}
 
-朋友圈发动态任务：
+当前触发情况：${char.name}准备发一条朋友圈动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是自己发一条朋友圈动态。
 动态应该像真人随手发的朋友圈，不要像给${playerName()}的直接回答。
+以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
 只允许输出 JSON，不要输出解释：{"text":"朋友圈正文"}
 规则：
 1. text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
