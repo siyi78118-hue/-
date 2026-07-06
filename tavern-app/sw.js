@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v3';
+const CACHE_NAME = 'rpchat-v4';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 
@@ -331,6 +331,30 @@ async function notifyClients(data) {
   clients.forEach(client => client.postMessage(data));
 }
 
+async function hasVisibleClient() {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  return clients.some(client => client.visibilityState === 'visible' || client.focused);
+}
+
+async function showProactiveWakeNotification(payload = {}) {
+  if (await hasVisibleClient()) return false;
+  await self.registration.showNotification('AL', {
+    body: payload.test ? '正在测试主动消息...' : '有新的主动消息，正在生成...',
+    tag: 'al-proactive-wakeup',
+    renotify: false,
+    data: { charId: payload.charId || '', url: './index.html' },
+    icon: './icon.svg',
+    badge: './icon.svg'
+  });
+  return true;
+}
+
+async function closeProactiveWakeNotification() {
+  if (!self.registration.getNotifications) return;
+  const notes = await self.registration.getNotifications({ tag: 'al-proactive-wakeup' });
+  notes.forEach(note => note.close());
+}
+
 function timerUrl(settings, path) {
   return String(settings.timerEndpoint || '').replace(/\/+$/, '') + path;
 }
@@ -516,9 +540,13 @@ self.addEventListener('push', event => {
       await self.registration.showNotification('AL', { body: '有新的主动消息提醒', icon: './icon.svg' });
       return;
     }
+    let wakeShown = false;
     try {
+      wakeShown = await showProactiveWakeNotification(payload);
       await handleProactivePush(payload);
+      if (wakeShown) await closeProactiveWakeNotification();
     } catch (err) {
+      if (wakeShown) await closeProactiveWakeNotification();
       await self.registration.showNotification('AL', {
         body: '主动消息生成失败，打开 AL 后会继续尝试。',
         tag: 'al-proactive-error',
