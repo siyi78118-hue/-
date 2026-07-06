@@ -2853,7 +2853,7 @@ async function callMemoryJSON(system, user) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
       body: JSON.stringify({ model: settings.memoryModel, system, messages: [{ role: 'user', content: user }], max_tokens: 1800, temperature: 0.2 })
-    }, 30000);
+    }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
     const json = await resp.json();
     text = Array.isArray(json.content) ? json.content.map(p => p.text || '').join('') : (json.content || json.text || '');
@@ -2862,11 +2862,12 @@ async function callMemoryJSON(system, user) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.2, max_tokens: 1800 })
-    }, 30000);
+    }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
     const json = await resp.json();
-    text = json.choices?.[0]?.message?.content || json.output_text || '';
+    text = extractResponseText(json);
   }
+  if (!String(text || '').trim()) throw new Error('记忆 API 返回了空内容，请换更快的记忆模型或检查该模型是否支持文本输出');
   return extractJson(text);
 }
 async function generateMemoryQuery(char, userInput, messages) {
