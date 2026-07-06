@@ -380,6 +380,9 @@ button.profile-top{width:100%;text-align:left}
       <div class="wx-group">
         <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
       </div>
+      <div class="wx-group">
+        <button class="cell" onclick="openSearch('all')"><span class="wx-icon green wx-search-mini"></span><div class="cell-body">搜一搜</div><div class="mini">›</div></button>
+      </div>
     </div>
     <nav class="tabbar">
       <button class="tab" data-screen="chats" onclick="showScreen('chats')"><span class="tab-ico ico-chat"></span>AL</button>
@@ -404,12 +407,14 @@ button.profile-top{width:100%;text-align:left}
         </button>
       </div>
       <div class="wx-group">
+        <button class="cell" onclick="showScreen('wallet')"><span class="wx-icon green wx-service"></span><div class="cell-body">服务</div><div class="mini">›</div></button>
+      </div>
+      <div class="wx-group">
+        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon purple wx-favorite"></span><div class="cell-body">收藏</div><div class="mini">›</div></button>
         <button class="cell" onclick="showScreen('moments')"><span class="wx-icon wx-moments"></span><div class="cell-body">朋友圈</div><div class="mini">›</div></button>
-        <button class="cell" onclick="showScreen('wallet')"><span class="wx-icon orange wx-card"></span><div class="cell-body">钱包</div><div class="mini" id="me-wallet-preview">¥0.00</div></button>
       </div>
       <div class="wx-group">
         <button class="cell" onclick="showScreen('settings')"><span class="wx-icon gray wx-setting"></span><div class="cell-body">设置</div><div class="mini">›</div></button>
-        <button class="cell" onclick="clearAllHistory()"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
       </div>
     </div>
     <nav class="tabbar">
@@ -632,6 +637,9 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
+        </div>
+        <div class="cell-group">
+          <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
         </div>
         <button class="primary" onclick="saveSettings()">保存</button>
         <button class="secondary" onclick="testConnection('chat')">测试聊天连接</button>
