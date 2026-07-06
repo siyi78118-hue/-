@@ -62,6 +62,10 @@ button{border:none;background:none;cursor:pointer}
 .row-preview{font-size:14px;color:#999;line-height:1.25;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .row-time{margin-left:auto;min-width:44px;text-align:right;color:#b2b2b2;font-size:12px;white-space:nowrap}
 .mute{width:18px;height:18px;position:absolute;right:22px;bottom:19px;color:#b6b6b6}.mute:before{content:"";position:absolute;left:2px;top:6px;border-right:8px solid currentColor;border-top:5px solid transparent;border-bottom:5px solid transparent}.mute:after{content:"";position:absolute;left:0;top:0;width:18px;height:18px;border-right:2px solid currentColor;transform:rotate(-35deg)}
+.row.pinned{background:#f7f7f7}
+.switch{width:48px;height:28px;border-radius:14px;background:#d6d6d6;position:relative;flex-shrink:0;transition:.18s}
+.switch:before{content:"";position:absolute;left:2px;top:2px;width:24px;height:24px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.2);transition:.18s}
+.switch.on{background:#07c160}.switch.on:before{transform:translateX(20px)}
 .dot{position:absolute;right:-6px;top:-6px;width:14px;height:14px;border-radius:50%;background:#f45c67}
 .avatar-public{background:#1e95eb}.avatar-public:before{content:"";position:absolute;left:14px;top:16px;width:16px;height:25px;background:#fff;border-radius:16px 4px 16px 4px;transform:rotate(-25deg)}.avatar-public:after{content:"";position:absolute;right:14px;top:16px;width:16px;height:25px;background:#fff;border-radius:4px 16px 4px 16px;transform:rotate(25deg)}
 .avatar-file{background:#31ad4e}.avatar-file:before{content:"";width:28px;height:24px;background:#fff;border-radius:1px}.avatar-file:after{content:"";position:absolute;left:22px;top:23px;border-left:12px solid #31ad4e;border-top:8px solid transparent;border-bottom:8px solid transparent}
@@ -474,6 +478,8 @@ button.profile-top{width:100%;text-align:left}
         <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="chat-info-player-name" placeholder="你的昵称" oninput="schedulePlayerProfileSave('chat-info-player-name')"></div></div>
       </div>
       <div class="cell-group">
+        <button class="cell" onclick="toggleChatPinned()" type="button"><div class="cell-body">置顶聊天</div><span class="switch" id="chat-pinned-switch"></span></button>
+        <button class="cell" onclick="toggleChatMuted()" type="button"><div class="cell-body">消息免打扰</div><span class="switch" id="chat-muted-switch"></span></button>
         <button class="cell" onclick="clearCurrentChat()"><div class="cell-body">清空聊天记录</div></button>
         <button class="cell" onclick="deleteCurrentRole()"><div class="cell-body danger">删除这个角色</div></button>
       </div>
@@ -1130,7 +1136,25 @@ function renderChatInfo() {
   const extraPrompt = document.getElementById('modal-extra-prompt');
   if (charPrompt && document.activeElement !== charPrompt) charPrompt.value = chat.charPrompt || '';
   if (extraPrompt && document.activeElement !== extraPrompt) extraPrompt.value = chat.extraPrompt || '';
+  document.getElementById('chat-pinned-switch')?.classList.toggle('on', !!chat.pinned);
+  document.getElementById('chat-muted-switch')?.classList.toggle('on', !!chat.muted);
   renderPlayerProfile();
+}
+function toggleChatPinned() {
+  const chat = allChats[currentCharId];
+  if (!chat) return;
+  chat.pinned = !chat.pinned;
+  DB.set('chats', allChats);
+  renderChatInfo();
+  renderChats();
+}
+function toggleChatMuted() {
+  const chat = allChats[currentCharId];
+  if (!chat) return;
+  chat.muted = !chat.muted;
+  DB.set('chats', allChats);
+  renderChatInfo();
+  renderChats();
 }
 function openContactProfile(charId) {
   const char = characters.find(c => c.id === charId);
@@ -1286,9 +1310,9 @@ function renderChats() {
     const last = chat?.messages?.[chat.messages.length - 1];
     const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
     const unread = chat?.unread || 0;
-    return { c, last, preview, unread, time: last?.time || 0 };
+    return { c, last, preview, unread, time: last?.time || 0, pinned: !!chat?.pinned, muted: !!chat?.muted };
   }).filter(r => !keyword || [r.c.name, r.preview, r.c.description, r.c.personality].some(v => String(v || '').toLowerCase().includes(keyword)))
-    .sort((a,b) => b.time - a.time || a.c.name.localeCompare(b.c.name, 'zh-CN'));
+    .sort((a,b) => Number(b.pinned) - Number(a.pinned) || b.time - a.time || a.c.name.localeCompare(b.c.name, 'zh-CN'));
   if (!roleRows.length) {
     wrap.innerHTML = searchFilters.chats
       ? '<div class="empty"><div class="empty-ico">⌕</div><div>没有找到相关会话</div></div>'
@@ -1296,13 +1320,13 @@ function renderChats() {
     return;
   }
   const roleHtml = roleRows.map((r, i) => `
-    <button class="row" onclick="openChat('${r.c.id}')">
+    <button class="row ${r.pinned ? 'pinned' : ''}" onclick="openChat('${r.c.id}')">
       ${avatarHtml(r.c)}
       <div class="row-main">
-        <div class="row-line"><div class="row-name">${esc(r.c.name)}</div><div class="row-time">${fmtTime(r.time) || ['17:02','16:57','16:49','16:00','14:55','14:34','11:17'][i % 7]}</div></div>
+        <div class="row-line"><div class="row-name">${esc(r.c.name)}</div><div class="row-time">${fmtTime(r.time) || ''}</div></div>
         <div class="row-line"><div class="row-preview">${esc(r.preview)}</div>${r.unread ? `<span class="badge">${r.unread}</span>` : ''}</div>
       </div>
-      ${i % 3 !== 1 ? '<span class="mute"></span>' : ''}
+      ${r.muted ? '<span class="mute"></span>' : ''}
     </button>`).join('');
   wrap.innerHTML = `<div class="list">${roleHtml}</div>`;
 }
@@ -2628,7 +2652,8 @@ function savePreset() {
 function clearCurrentChat() {
   if (!currentCharId || !confirm('清空当前聊天？')) return;
   const char = characters.find(c => c.id === currentCharId);
-  allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(char), extraPrompt: allChats[currentCharId]?.extraPrompt || '', unread: 0 };
+  const old = allChats[currentCharId] || {};
+  allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(char), extraPrompt: old.extraPrompt || '', unread: 0, pinned: !!old.pinned, muted: !!old.muted };
   if (char?.firstMessage) allChats[currentCharId].messages.push({ role:'assistant', content:char.firstMessage, time:Date.now() });
   DB.set('chats', allChats);
   renderMessages();
