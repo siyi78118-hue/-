@@ -263,6 +263,16 @@ button.profile-top{width:100%;text-align:left}
 .moment-media img{width:100%;height:100%;object-fit:cover}
 .moment-foot{margin-top:8px;display:flex;align-items:center;gap:8px;color:#8b8b8b;font-size:12px}
 .moment-action{margin-left:auto;width:32px;height:20px;border-radius:3px;background:#f0f0f0;color:#576b95;font-weight:700;line-height:18px}
+.moment-reactions{margin-top:8px;background:#f3f3f3;color:#576b95;font-size:13px;line-height:1.45}
+.moment-like-line,.moment-comment{padding:6px 8px;border-bottom:1px solid #e3e3e3}
+.moment-comment:last-child,.moment-like-line:last-child{border-bottom:none}
+.moment-comment b{color:#576b95;font-weight:600}
+.moment-compose{display:none;background:#fff;padding:12px 14px;border-bottom:1px solid var(--line2)}
+.moment-compose.show{display:block}
+.moment-compose textarea{width:100%;min-height:74px;border:none;outline:none;resize:none;font-size:16px;line-height:1.5}
+.moment-compose-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:8px}
+.moment-compose-actions button{height:32px;padding:0 14px;border-radius:4px;background:#f1f1f1;color:#111;font-size:14px}
+.moment-compose-actions .send-moment{background:#07c160;color:#fff}
 .moments-cover{height:248px;margin-bottom:44px;padding:0 16px 16px;position:relative;background:linear-gradient(180deg,rgba(0,0,0,.05),rgba(0,0,0,.48)),linear-gradient(135deg,#9eb6a4 0%,#566f7a 46%,#2f3438 100%);color:#fff}
 .moments-title{font-size:22px;font-weight:700;text-shadow:0 1px 3px rgba(0,0,0,.28)}
 .moments-user{position:absolute;right:16px;bottom:-34px;display:flex;align-items:center;gap:12px;font-size:17px;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.28)}
@@ -599,11 +609,15 @@ button.profile-top{width:100%;text-align:left}
     <div class="topbar">
       <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen(lastMainScreen)">‹</button></div>
       <div class="top-title">朋友圈</div>
-      <div class="top-right"></div>
+      <div class="top-right"><button class="icon-btn" onclick="toggleMomentComposer()" type="button">＋</button></div>
     </div>
     <div class="scroll" style="background:#fff">
       <div class="moments-cover">
         <div class="moments-user"><span id="moments-player-name">玩家</span><div id="moments-player-avatar" class="avatar">我</div></div>
+      </div>
+      <div class="moment-compose" id="moment-compose">
+        <textarea id="moment-compose-input" placeholder="这一刻的想法..."></textarea>
+        <div class="moment-compose-actions"><button onclick="toggleMomentComposer(false)" type="button">取消</button><button class="send-moment" onclick="submitPlayerMoment()" type="button">发表</button></div>
       </div>
       <div id="moment-list"></div>
     </div>
@@ -824,6 +838,7 @@ function migrateSettings(raw) {
 let settings = migrateSettings(DB.get('settings', DEFAULT_SETTINGS));
 let characters = DB.get('characters', []);
 let allChats = DB.get('chats', {});
+let allMoments = DB.get('moments', []);
 let searchFilters = { chats: '', contacts: '' };
 let searchScope = 'chats';
 let searchReturnScreen = 'chats';
@@ -1052,8 +1067,15 @@ function formatElapsed(ms) {
   const hourRest = hours % 24;
   return hourRest ? `${days} 天 ${hourRest} 小时` : `${days} 天`;
 }
+function visibleChatMessages(chat) {
+  return (chat?.messages || []).filter(m => !m.hidden);
+}
+function lastVisibleMessage(chat) {
+  const messages = visibleChatMessages(chat);
+  return messages[messages.length - 1] || null;
+}
 function latestMessageByRole(chat, role) {
-  return (chat?.messages || []).slice().reverse().find(m => m.role === role) || null;
+  return visibleChatMessages(chat).slice().reverse().find(m => m.role === role) || null;
 }
 function messageTimeLine(label, msg, now = new Date()) {
   if (!msg?.time) return `${label}：无`;
@@ -1063,8 +1085,7 @@ function messageTimeLine(label, msg, now = new Date()) {
   return `${label}：${formatFullTime(at)}（距现在 ${elapsed}）｜${msg.role === 'user' ? '用户' : '角色'}：${content}`;
 }
 function buildProactiveTimeContext(chat, now = new Date()) {
-  const messages = chat?.messages || [];
-  const last = messages[messages.length - 1] || null;
+  const last = lastVisibleMessage(chat);
   const lastUser = latestMessageByRole(chat, 'user');
   const lastAssistant = latestMessageByRole(chat, 'assistant');
   const lastElapsedMinutes = last?.time ? Math.round((now.getTime() - last.time) / 60000) : 0;
@@ -1240,7 +1261,7 @@ function chatSearchRows(keyword) {
   const q = searchText(keyword);
   return characters.map(c => {
     const chat = allChats[c.id];
-    const messages = chat?.messages || [];
+    const messages = visibleChatMessages(chat);
     const last = messages[messages.length - 1];
     const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
     const messageHit = messages.slice(-80).reverse().find(m => searchText(m.content).includes(q));
@@ -1258,7 +1279,7 @@ function contactSearchRows(keyword) {
 function currentChatSearchRows(keyword) {
   const q = searchText(keyword);
   const chat = allChats[currentCharId];
-  return (chat?.messages || [])
+  return visibleChatMessages(chat)
     .map((m, index) => ({ m, index }))
     .filter(row => searchText(row.m.content).includes(q))
     .slice(-50)
@@ -1521,7 +1542,7 @@ function renderChats() {
   const keyword = (searchFilters.chats || '').toLowerCase();
   const roleRows = characters.map(c => {
     const chat = allChats[c.id];
-    const last = chat?.messages?.[chat.messages.length - 1];
+    const last = lastVisibleMessage(chat);
     const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
     const unread = chat?.unread || 0;
     return { c, last, preview, unread, time: last?.time || 0, pinned: !!chat?.pinned, muted: !!chat?.muted };
@@ -1617,24 +1638,219 @@ function renderTagsScreen() {
 }
 function renderMoments() {
   const list = document.getElementById('moment-list');
-  if (!characters.length) {
+  const stored = Array.isArray(allMoments) ? allMoments.slice().sort((a, b) => (b.time || 0) - (a.time || 0)) : [];
+  if (!stored.length && !characters.length) {
     list.innerHTML = '<div class="empty"><div class="empty-ico">🖼️</div><div>暂无动态</div></div>';
     return;
   }
-  list.innerHTML = characters.map((c, index) => {
-    const text = c.scenario || c.description || c.personality || c.firstMessage || '今天也在线。';
-    const media = c.avatarData ? `<div class="moment-media"><img src="${c.avatarData}" alt=""></div>` : '';
-    const time = index === 0 ? '刚刚' : `${index + 1}分钟前`;
-    return `<div class="moment">
-      ${avatarHtml(c)}
-      <div class="moment-body">
-        <button class="moment-name" onclick="openContactProfile('${c.id}')" type="button">${esc(c.name)}</button>
-        <div class="moment-text">${esc(text)}</div>
-        ${media}
-        <div class="moment-foot"><span>${time}</span><button class="moment-action" onclick="openChat('${c.id}')" type="button">··</button></div>
-      </div>
-    </div>`;
-  }).join('');
+  const rows = stored.length ? stored : characters.map((c, index) => ({
+    id: `virtual_${c.id}`,
+    authorType: 'char',
+    charId: c.id,
+    text: c.scenario || c.description || c.personality || c.firstMessage || '今天也在线。',
+    time: Date.now() - index * 60000,
+    virtual: true
+  }));
+  list.innerHTML = rows.map(renderMomentItem).join('');
+}
+function momentAuthor(moment) {
+  if (moment.authorType === 'player') return { name: playerName(), avatar: playerAvatarHtml('avatar'), isPlayer: true };
+  const char = characters.find(c => c.id === moment.charId);
+  return { name: charName(char), avatar: avatarHtml(char), char };
+}
+function renderMomentItem(moment) {
+  const author = momentAuthor(moment);
+  const char = author.char;
+  const media = !author.isPlayer && char?.avatarData ? `<div class="moment-media"><img src="${char.avatarData}" alt=""></div>` : '';
+  const likes = (moment.likes || []).map(id => characters.find(c => c.id === id)).filter(Boolean);
+  const comments = moment.comments || [];
+  const reactions = (likes.length || comments.length) ? `<div class="moment-reactions">
+    ${likes.length ? `<div class="moment-like-line">${likes.map(c => esc(c.name)).join('、')}</div>` : ''}
+    ${comments.map(c => `<div class="moment-comment"><b>${esc(c.name || charName(characters.find(ch => ch.id === c.charId)))}</b>：${esc(c.text || '')}</div>`).join('')}
+  </div>` : '';
+  const authorClick = author.isPlayer ? "showScreen('self-profile')" : `openContactProfile('${moment.charId}')`;
+  const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `openChat('${moment.charId}')`;
+  return `<div class="moment">
+    ${author.avatar}
+    <div class="moment-body">
+      <button class="moment-name" onclick="${authorClick}" type="button">${esc(author.name)}</button>
+      <div class="moment-text">${esc(moment.text || '')}</div>
+      ${media}
+      <div class="moment-foot"><span>${fmtTime(moment.time)}</span><button class="moment-action" onclick="${actionClick}" type="button">··</button></div>
+      ${reactions}
+    </div>
+  </div>`;
+}
+function saveMoments() {
+  DB.set('moments', allMoments);
+  if (activeScreen === 'moments') renderMoments();
+}
+function momentSnippet(text, max = 90) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+function ensureChatForChar(charId) {
+  if (!allChats[charId]) allChats[charId] = { messages: [], charPrompt: '', extraPrompt: '', unread: 0 };
+  if (!Array.isArray(allChats[charId].messages)) allChats[charId].messages = [];
+  return allChats[charId];
+}
+function recordMomentMemoryEvent(charId, content, time = Date.now()) {
+  if (!charId || !content) return;
+  const chat = ensureChatForChar(charId);
+  chat.messages.push({
+    role: 'user',
+    hidden: true,
+    time,
+    content: `【朋友圈事件】${content}`
+  });
+}
+function buildMomentChatContext(charId, limit = 8) {
+  if (!Array.isArray(allMoments) || !allMoments.length) return '';
+  const rows = allMoments
+    .filter(moment => {
+      if (moment.authorType === 'player') return true;
+      if (moment.charId === charId) return true;
+      if ((moment.likes || []).includes(charId)) return true;
+      return (moment.comments || []).some(c => c.charId === charId);
+    })
+    .sort((a, b) => (b.time || 0) - (a.time || 0))
+    .slice(0, limit);
+  if (!rows.length) return '';
+  const lines = rows.map(moment => {
+    const author = moment.authorType === 'player' ? playerName() : charName(characters.find(c => c.id === moment.charId));
+    const parts = [`${fmtTime(moment.time)}｜${author}发了朋友圈：“${momentSnippet(moment.text, 80)}”`];
+    if ((moment.likes || []).includes(charId)) parts.push(`${charName(characters.find(c => c.id === charId))}点过赞`);
+    const ownComments = (moment.comments || []).filter(c => c.charId === charId);
+    ownComments.forEach(c => parts.push(`${charName(characters.find(ch => ch.id === charId))}评论过：“${momentSnippet(c.text, 60)}”`));
+    return `- ${parts.join('；')}`;
+  });
+  return `以下是最近朋友圈上下文，角色可以自然记得自己看过、点赞过、评论过或发过的动态；不要提到“系统记录/上下文”。\n${lines.join('\n')}`;
+}
+function toggleMomentComposer(show) {
+  const box = document.getElementById('moment-compose');
+  if (!box) return;
+  const willShow = typeof show === 'boolean' ? show : !box.classList.contains('show');
+  box.classList.toggle('show', willShow);
+  if (willShow) setTimeout(() => document.getElementById('moment-compose-input')?.focus(), 60);
+}
+async function submitPlayerMoment() {
+  const input = document.getElementById('moment-compose-input');
+  const text = (input?.value || '').trim();
+  if (!text) { toast('先写点内容'); return; }
+  const moment = {
+    id: `mom_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    authorType: 'player',
+    text,
+    time: Date.now(),
+    likes: [],
+    comments: [],
+    notifiedCharIds: []
+  };
+  allMoments.unshift(moment);
+  if (input) input.value = '';
+  toggleMomentComposer(false);
+  saveMoments();
+  toast('已发表朋友圈');
+  notifyMomentToCharacters(moment.id).catch(err => {
+    console.warn('[AL Moments] notify skipped:', err.message);
+    toast('朋友圈通知失败：' + friendlyErrorMessage(err), 2800);
+  });
+}
+function hasMomentInteraction(moment, charId) {
+  return (moment.likes || []).includes(charId) || (moment.comments || []).some(c => c.charId === charId);
+}
+async function notifyMomentToCharacters(momentId, manual = false) {
+  const moment = allMoments.find(m => m.id === momentId);
+  if (!moment || moment.authorType !== 'player') return;
+  if (!characters.length) { if (manual) toast('暂无角色可以通知'); return; }
+  if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
+    if (manual) toast('已发表，配置聊天接口后角色才能互动');
+    return;
+  }
+  const targets = characters.filter(char => !hasMomentInteraction(moment, char.id) && !(moment.notifiedCharIds || []).includes(char.id));
+  if (!targets.length) { if (manual) toast('角色已经看过这条动态'); return; }
+  if (manual) toast('正在通知角色...', 1200);
+  for (const char of targets) {
+    try {
+      const result = await callMomentInteractionAI(char, moment);
+      moment.notifiedCharIds = [...new Set([...(moment.notifiedCharIds || []), char.id])];
+      if (result.like) moment.likes = [...new Set([...(moment.likes || []), char.id])];
+      const comment = String(result.comment || '').replace(/\s+/g, ' ').trim();
+      if (comment) {
+        moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: comment.slice(0, 80), time: Date.now() }];
+      }
+      const actions = [];
+      if (result.like) actions.push(`${char.name}点赞了${playerName()}的朋友圈：“${momentSnippet(moment.text)}”`);
+      if (comment) actions.push(`${char.name}评论了${playerName()}的朋友圈：“${momentSnippet(comment, 70)}”`);
+      if (actions.length) recordMomentMemoryEvent(char.id, actions.join('；'), Date.now());
+      saveMoments();
+      if (actions.length) DB.set('chats', allChats);
+    } catch (err) {
+      console.warn('[AL Moments] character skipped:', char.name, err.message);
+    }
+  }
+  if (manual) toast('通知完成');
+}
+async function callMomentInteractionAI(char, moment) {
+  const system = `${buildCharPrompt(char)}
+
+朋友圈互动专用预设：
+你现在不是在私聊回复${playerName()}，而是在朋友圈刷到${playerName()}刚发的一条动态。
+你可以选择点赞、留言、或者什么都不做。留言必须像朋友圈评论，不要像聊天框里的即时回复。
+只允许输出 JSON，不要输出解释：{"like":true/false,"comment":"留言正文或空字符串"}
+规则：
+1. comment 只能是语言本身，禁止动作、神态、心理、旁白、系统说明。
+2. comment 不要称呼“用户/角色”，需要称呼时使用昵称。
+3. 不要每次都评论；关系一般或动态普通时可以只点赞或划过。
+4. 留言默认 4-30 个中文字符，像真人朋友圈评论。`;
+  const user = `当前设备时间：${formatFullTime(new Date())}
+朋友圈作者：${playerName()}
+朋友圈正文：${moment.text}
+已有点赞：${(moment.likes || []).map(id => charName(characters.find(c => c.id === id))).join('、') || '无'}
+已有留言：${(moment.comments || []).map(c => `${c.name}：${c.text}`).join('\n') || '无'}
+
+请以 ${char.name} 的性格决定是否点赞或留言。`;
+  const messages = [{ role: 'user', content: user }];
+  const text = (settings.chatApiType || 'openai') === 'claude'
+    ? await callClaude(system, messages, { live: false, charId: char.id })
+    : await callOpenAI(system, messages, { live: false, charId: char.id });
+  try {
+    const json = extractJson(text);
+    return { like: !!json.like, comment: String(json.comment || '').trim() };
+  } catch {
+    return { like: false, comment: String(text || '').trim() };
+  }
+}
+async function callMomentPostAI(char, chat) {
+  const system = `${buildCharPrompt(char)}
+
+朋友圈发动态专用预设：
+你现在不是在私聊回复${playerName()}，而是以${char.name}的身份自己发一条朋友圈动态。
+这条动态应该像真人随手发的朋友圈，不要像给${playerName()}的直接回答。
+只允许输出 JSON，不要输出解释：{"text":"朋友圈正文"}
+规则：
+1. text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
+2. 不要出现“用户/角色/API/系统/提示词/模型”等说法。
+3. 可以自然参考当前时间、最近聊天、关系和未完成约定，但不要机械复述。
+4. 默认 1-2 句，像朋友圈动态；不要使用换行排版。`;
+  const recent = visibleChatMessages(chat).slice(-12).map(m => messageLine(m, char)).join('\n') || '暂无';
+  const user = `${getTimeContext()}
+
+${buildMomentChatContext(char.id, 6) || '暂无朋友圈上下文'}
+
+最近私聊：
+${recent}
+
+请决定${char.name}现在会不会发一条朋友圈；如果适合，就输出 JSON。`;
+  const messages = [{ role: 'user', content: user }];
+  const text = (settings.chatApiType || 'openai') === 'claude'
+    ? await callClaude(system, messages, { live: false, charId: char.id })
+    : await callOpenAI(system, messages, { live: false, charId: char.id });
+  try {
+    return String(extractJson(text).text || '').replace(/\s+/g, ' ').trim();
+  } catch {
+    return String(text || '').replace(/\s+/g, ' ').trim();
+  }
 }
 
 function createRole() {
@@ -1896,8 +2112,9 @@ function renderMessages() {
   if (refreshPaymentExpirations(chat)) DB.set('chats', allChats);
   let html = '';
   if (char.scenario) html += `<div class="scenario">${esc(char.scenario)}</div>`;
-  chat.messages.forEach((m, i) => {
-    if (i === 0 || (m.time - (chat.messages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
+  const displayMessages = visibleChatMessages(chat);
+  displayMessages.forEach((m, i) => {
+    if (i === 0 || (m.time - (displayMessages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
     if (m.role === 'user') {
       html += `<div class="msg-wrap me">${renderMessageBody(m)}${playerAvatarHtml('msg-avatar')}</div>`;
       const tip = (m.type === 'transfer' || m.type === 'redpacket') ? paymentStatusTip(m, char) : '';
@@ -2114,11 +2331,12 @@ function memoryAliasText(text, char) {
     .replace(/角色/g, charName(char));
 }
 function messageLine(m, char) {
+  if (m.hidden) return `【隐藏事件｜${formatFullTime(new Date(m.time || Date.now()))}】${m.content}`;
   return `${m.role === 'user' ? playerName() : charName(char)}：${m.content}`;
 }
 function memoryTextHasSignal(text) {
   const value = String(text || '');
-  return /(承诺|约定|答应|计划|以后|下次|明天|今晚|周|红包|金额|欠|补偿|道歉|和好|吵|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住|城市|家|学校|公司|重要|不能忘|必须记)/.test(value);
+  return /(承诺|约定|答应|计划|以后|下次|明天|今晚|周|红包|金额|欠|补偿|道歉|和好|吵|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住|城市|家|学校|公司|重要|不能忘|必须记|朋友圈|动态|评论|点赞|留言)/.test(value);
 }
 function memoryTextIsNoise(text) {
   const value = String(text || '');
@@ -2402,7 +2620,7 @@ function getLatestChatRows() {
   return characters
     .map(char => {
       const chat = allChats[char.id];
-      const messages = chat?.messages || [];
+      const messages = visibleChatMessages(chat);
       return { char, chat, last: messages[messages.length - 1] };
     })
     .filter(row => row.chat?.messages?.length && row.last)
@@ -2583,6 +2801,7 @@ async function triggerProactiveMessage(charId, manual = false) {
       return false;
     }
     appendAssistantMessages(chat, replyText, { proactive: true });
+    chat.lastProactiveType = 'chat';
     if (activeScreen !== 'chat' || currentCharId !== charId) chat.unread = (chat.unread || 0) + 1;
     DB.set('chats', allChats);
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
@@ -2604,10 +2823,73 @@ async function triggerProactiveMessage(charId, manual = false) {
     proactiveBusy = false;
   }
 }
+async function triggerProactiveMoment(charId, manual = false) {
+  if (proactiveBusy || isStreaming) return false;
+  const char = characters.find(c => c.id === charId);
+  const chat = allChats[charId];
+  if (!char || !chat?.messages?.length) {
+    if (manual) toast('先打开一个有聊天记录的会话');
+    return false;
+  }
+  if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
+    if (manual) toast('请先配置聊天接口和聊天模型');
+    return false;
+  }
+  proactiveBusy = true;
+  try {
+    const text = momentSnippet(await callMomentPostAI(char, chat), 160);
+    chat.lastProactiveAt = Date.now();
+    chat.lastProactiveType = 'moment';
+    delete chat.pendingProactiveJob;
+    if (isEmptyReplyText(text)) {
+      DB.set('chats', allChats);
+      if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
+      return false;
+    }
+    const now = Date.now();
+    allMoments.unshift({
+      id: `mom_${now}_${Math.random().toString(36).slice(2, 8)}`,
+      authorType: 'char',
+      charId: char.id,
+      text,
+      time: now,
+      likes: [],
+      comments: [],
+      proactive: true
+    });
+    recordMomentMemoryEvent(char.id, `${char.name}在朋友圈发布动态：“${momentSnippet(text)}”`, now);
+    DB.set('chats', allChats);
+    saveMoments();
+    if (activeScreen === 'chats') renderChats();
+    if (manual) toast('已生成角色朋友圈动态', 2200);
+    processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] moment update skipped:', err.message));
+    return true;
+  } catch (err) {
+    if (chat) {
+      chat.lastProactiveAt = Date.now();
+      delete chat.pendingProactiveJob;
+      DB.set('chats', allChats);
+    }
+    if (manual) toast('主动动态失败：' + friendlyErrorMessage(err), 3200);
+    console.warn('[AL Moments] proactive moment skipped:', err.message);
+    return false;
+  } finally {
+    proactiveBusy = false;
+  }
+}
+async function triggerProactiveTarget(target, manual = false) {
+  if (!target?.char?.id) return false;
+  const preferMoment = target.chat?.lastProactiveType === 'chat';
+  if (preferMoment) {
+    const ok = await triggerProactiveMoment(target.char.id, manual);
+    if (ok) return true;
+  }
+  return triggerProactiveMessage(target.char.id, manual);
+}
 async function checkProactiveMessages() {
   if (!settings.proactiveEnabled || settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
   const target = findProactiveTarget();
-  if (target) await triggerProactiveMessage(target.char.id, false);
+  if (target) await triggerProactiveTarget(target, false);
 }
 async function catchUpDueCloudProactive() {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
@@ -2616,7 +2898,7 @@ async function catchUpDueCloudProactive() {
   delete target.chat.pendingProactiveJob;
   DB.set('chats', allChats);
   await mirrorAppStateNow();
-  await triggerProactiveMessage(target.char.id, false);
+  await triggerProactiveTarget(target, false);
 }
 function startProactiveLoop() {
   if (proactiveTimer) {
@@ -2642,6 +2924,8 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   if (chat.charPrompt && chat.charPrompt !== system) system += '\n\n对话专属补充：\n' + chat.charPrompt;
   system += `\n\n身份称呼：玩家昵称是“${playerName()}”，当前对话角色昵称是“${currentChar?.name || '角色'}”。对话中需要称呼双方时，优先使用这些昵称，不要把他们写成“用户”和“角色”。`;
   system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext();
+  const momentContext = buildMomentChatContext(charId);
+  if (momentContext) system += '\n\n' + momentContext;
   if (memoryPack) system += '\n\n' + memoryPack;
   if (options.payment) {
     const pay = options.payment;
