@@ -95,12 +95,29 @@ async function runDueJobs(env) {
 }
 
 async function saveJob(job, env) {
-  await env.AL_TIMER_KV.put(`job:${job.jobId}`, JSON.stringify(job));
+  const previousRaw = await env.AL_TIMER_KV.get(`job:${job.jobId}`);
+  const previous = previousRaw ? JSON.parse(previousRaw) : null;
   const bucketKey = `due:${minuteKey(Date.parse(job.dueAt))}`;
+  if (previous?.dueAt) {
+    const previousBucketKey = `due:${minuteKey(Date.parse(previous.dueAt))}`;
+    if (previousBucketKey !== bucketKey) await removeJobFromBucket(previousBucketKey, job.jobId, env);
+  }
+  await env.AL_TIMER_KV.put(`job:${job.jobId}`, JSON.stringify(job));
   const raw = await env.AL_TIMER_KV.get(bucketKey);
   const ids = raw ? JSON.parse(raw) : [];
   if (!ids.includes(job.jobId)) ids.push(job.jobId);
   await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: 3 * 24 * 60 * 60 });
+}
+
+async function removeJobFromBucket(bucketKey, jobId, env) {
+  const raw = await env.AL_TIMER_KV.get(bucketKey);
+  if (!raw) return;
+  const ids = JSON.parse(raw).filter(id => id !== jobId);
+  if (ids.length) {
+    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: 3 * 24 * 60 * 60 });
+  } else {
+    await env.AL_TIMER_KV.delete(bucketKey);
+  }
 }
 
 async function runDueMinute(env, minute) {

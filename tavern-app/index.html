@@ -904,6 +904,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
+const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 function migrateSettings(raw) {
   const next = { ...DEFAULT_SETTINGS, ...(raw || {}) };
   if (!next.chatApiType) next.chatApiType = raw?.apiType || 'openai';
@@ -3075,14 +3076,21 @@ function hasFutureCloudJob(chat) {
   return Number.isFinite(dueAt) && dueAt > Date.now();
 }
 async function ensureCloudProactiveScheduled(options = {}) {
-  const { force = false } = options;
+  const { force = false, resync = false } = options;
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   const rows = getLatestChatRows();
   if (!rows.length) return false;
   let target = '';
   if (!force) target = rows.find(({ chat }) => !hasFutureCloudJob(chat))?.char?.id || '';
   if (!target) target = (currentCharId && allChats[currentCharId]?.messages?.length ? currentCharId : rows[0].char.id);
-  if (!force && hasFutureCloudJob(allChats[target])) return false;
+  const chat = allChats[target];
+  if (!force && hasFutureCloudJob(chat)) {
+    const lastSync = Number(chat.cloudScheduleSyncedAt || 0);
+    if (resync && (!lastSync || Date.now() - lastSync > CLOUD_TIMER_RESYNC_MS)) {
+      return resubmitCloudProactive(target);
+    }
+    return false;
+  }
   return scheduleCloudProactive(target);
 }
 async function repairCloudTimerScheduleOnce() {
@@ -3099,18 +3107,47 @@ async function scheduleCloudProactive(charId) {
   const chat = allChats[charId];
   if (!chat?.messages?.length) return false;
   ensureDeviceId();
+  const previousJob = chat.pendingProactiveJob ? { ...chat.pendingProactiveJob } : null;
+  const previousSync = chat.cloudScheduleSyncedAt || 0;
   const dueAtMs = Date.now() + Math.max(1, Number(settings.proactiveIdleMinutes) || 30) * 60000;
   const jobId = `pro_${settings.deviceId}_${charId}`;
   chat.pendingProactiveJob = { jobId, dueAt: new Date(dueAtMs).toISOString() };
   DB.set('chats', allChats);
   await mirrorAppStateNow();
+  try {
+    await postCloudSchedule(charId, chat.pendingProactiveJob);
+    chat.cloudScheduleSyncedAt = Date.now();
+    DB.set('chats', allChats);
+    await mirrorAppStateNow();
+  } catch (err) {
+    if (previousJob) chat.pendingProactiveJob = previousJob;
+    else delete chat.pendingProactiveJob;
+    chat.cloudScheduleSyncedAt = previousSync;
+    DB.set('chats', allChats);
+    await mirrorAppStateNow();
+    throw err;
+  }
+  return true;
+}
+async function resubmitCloudProactive(charId) {
+  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
+  const chat = allChats[charId];
+  if (!chat?.messages?.length || !hasFutureCloudJob(chat)) return false;
+  ensureDeviceId();
+  if (!chat.pendingProactiveJob.jobId) chat.pendingProactiveJob.jobId = `pro_${settings.deviceId}_${charId}`;
+  await postCloudSchedule(charId, chat.pendingProactiveJob);
+  chat.cloudScheduleSyncedAt = Date.now();
+  DB.set('chats', allChats);
+  await mirrorAppStateNow();
+  return true;
+}
+async function postCloudSchedule(charId, job) {
   const resp = await fetchWithTimeout(timerUrl('/schedule'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive' })
+    body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId, charId, dueAt: job.dueAt, type: 'proactive' })
   }, API_TIMEOUT_MS);
   if (!resp.ok) throw new Error('云闹钟安排失败：' + resp.status);
-  return true;
 }
 async function testCloudTimerPush() {
   saveSettings();
@@ -3753,6 +3790,7 @@ async function syncFromServiceWorkerState() {
     if (activeScreen === 'memory') renderMemoryScreen();
   }
   catchUpDueCloudProactive().catch(err => console.warn('[AL Timer] catch-up skipped:', err.message));
+  ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
 }
 async function bootApp() {
   await syncFromServiceWorkerState();
@@ -3761,6 +3799,7 @@ async function bootApp() {
   renderChats();
   await mirrorAppStateNow();
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
+  ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {
