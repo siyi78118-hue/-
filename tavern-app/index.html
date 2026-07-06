@@ -727,6 +727,7 @@ let settingsFormHydrating = false;
 let playerProfileSaveTimer = null;
 let newRoleAvatarData = '';
 let modalCharAvatarData = '';
+const EMPTY_REPLY_TEXT = '（对方没有回复）';
 
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_STORES = ['summaries', 'events', 'profiles', 'vectors', 'meta'];
@@ -848,6 +849,7 @@ async function restoreAppStateFromMirror() {
   settings = migrateSettings(mirrored.settings || settings);
   characters = (mirrored.characters || characters).map(normalizeChar);
   allChats = mirrored.allChats || allChats;
+  scrubEmptyReplyMessages(allChats);
   localStorage.setItem('rpchat_settings', JSON.stringify(settings));
   localStorage.setItem('rpchat_characters', JSON.stringify(characters));
   localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
@@ -860,8 +862,25 @@ function normalizeChar(c, i = 0) {
   if (!c.avatar && !c.avatarData) c.avatar = c.name?.slice(0, 1) || 'R';
   return c;
 }
+function isEmptyReplyText(text) {
+  const value = String(text || '').trim();
+  return !value || value === EMPTY_REPLY_TEXT || value === '(对方没有回复)' || value === '对方没有回复';
+}
+function scrubEmptyReplyMessages(chats) {
+  let changed = false;
+  Object.values(chats || {}).forEach(chat => {
+    if (!Array.isArray(chat?.messages)) return;
+    const next = chat.messages.filter(m => !(m.role === 'assistant' && isEmptyReplyText(m.content)));
+    if (next.length !== chat.messages.length) {
+      chat.messages = next;
+      changed = true;
+    }
+  });
+  return changed;
+}
 characters = characters.map(normalizeChar);
 DB.set('characters', characters);
+if (scrubEmptyReplyMessages(allChats)) DB.set('chats', allChats);
 
 function normalizePresetKey(key) {
   return key === 'custom' ? 'custom' : 'combined';
@@ -1008,6 +1027,30 @@ function friendlyErrorMessage(err) {
   if (/429|rate limit/i.test(raw)) return '接口请求过于频繁，请稍后再试';
   if (/non ISO-8859-1|ByteString|headers/i.test(raw)) return 'Key 含有隐藏字符，请重新粘贴或手动输入';
   return raw;
+}
+function textFromContent(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(textFromContent).filter(Boolean).join('');
+  if (typeof value === 'object') {
+    return textFromContent(value.text)
+      || textFromContent(value.content)
+      || textFromContent(value.output_text)
+      || textFromContent(value.message?.content);
+  }
+  return '';
+}
+function extractResponseText(json) {
+  const choice = json?.choices?.[0];
+  return (
+    textFromContent(choice?.message?.content)
+    || textFromContent(choice?.message?.text)
+    || textFromContent(choice?.text)
+    || textFromContent(json?.output_text)
+    || textFromContent(json?.output)
+    || textFromContent(json?.content)
+    || textFromContent(json?.text)
+  ).trim();
 }
 function previewText(text) {
   const value = String(text || '');
@@ -1604,6 +1647,7 @@ async function continueAssistantTurn(requestCharId, userText) {
     const memoryPack = await prepareMemoryPack(requestCharId, userText);
     const reply = await callAPI(chat, memoryPack, { charId: requestCharId });
     clearStreamingDraft(requestCharId);
+    if (isEmptyReplyText(reply)) throw new Error('接口返回空内容，没有生成回复');
     appendAssistantMessages(chat, reply);
     scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
   } catch (err) {
@@ -2115,9 +2159,17 @@ async function triggerProactiveMessage(charId, manual = false) {
     const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
     const memoryPack = await prepareMemoryPack(charId, query);
-    const reply = await callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext });
-    appendAssistantMessages(chat, String(reply || '').trim() || '在吗？', { proactive: true });
+    const reply = await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext });
+    clearStreamingDraft(charId);
+    const replyText = String(reply || '').trim();
     chat.lastProactiveAt = Date.now();
+    delete chat.pendingProactiveJob;
+    if (isEmptyReplyText(replyText)) {
+      DB.set('chats', allChats);
+      if (manual) toast('主动消息没有生成内容，已跳过写入', 2600);
+      return false;
+    }
+    appendAssistantMessages(chat, replyText, { proactive: true });
     if (activeScreen !== 'chat' || currentCharId !== charId) chat.unread = (chat.unread || 0) + 1;
     DB.set('chats', allChats);
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
@@ -2126,6 +2178,12 @@ async function triggerProactiveMessage(charId, manual = false) {
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] proactive update skipped:', err.message));
     return true;
   } catch (err) {
+    clearStreamingDraft(charId);
+    if (chat) {
+      chat.lastProactiveAt = Date.now();
+      delete chat.pendingProactiveJob;
+      DB.set('chats', allChats);
+    }
     if (manual) toast('主动消息失败：' + friendlyErrorMessage(err), 3200);
     console.warn('[AL Proactive] skipped:', err.message);
     return false;
@@ -2215,7 +2273,7 @@ async function callOpenAI(system, messages, options = {}) {
   if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
   if (live) return readOpenAIStream(resp, options.charId);
   const json = await resp.json();
-  return json.choices?.[0]?.message?.content || json.output_text || '（对方没有回复）';
+  return extractResponseText(json);
 }
 async function readOpenAIStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
@@ -2231,14 +2289,15 @@ async function readOpenAIStream(resp, charId = currentCharId) {
       if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
       try {
         const delta = JSON.parse(t.slice(6)).choices?.[0]?.delta?.content;
-        if (delta) {
-          result += delta;
+        const deltaText = textFromContent(delta);
+        if (deltaText) {
+          result += deltaText;
           updateStreamingDraft(charId, result);
         }
       } catch {}
     }
   }
-  return result || '（对方没有回复）';
+  return result.trim();
 }
 async function callClaude(system, messages, options = {}) {
   const live = options.live !== false;
@@ -2251,7 +2310,7 @@ async function callClaude(system, messages, options = {}) {
   if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
   if (live) return readClaudeStream(resp, options.charId);
   const json = await resp.json();
-  return Array.isArray(json.content) ? json.content.map(p => p.text || '').join('') : (json.content || json.text || '（对方没有回复）');
+  return extractResponseText(json);
 }
 async function readClaudeStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
@@ -2274,7 +2333,7 @@ async function readClaudeStream(resp, charId = currentCharId) {
       } catch {}
     }
   }
-  return result || '（对方没有回复）';
+  return result.trim();
 }
 
 function loadSettings() {
