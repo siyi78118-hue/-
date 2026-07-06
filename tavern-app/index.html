@@ -776,6 +776,7 @@ let newRoleAvatarData = '';
 let modalCharAvatarData = '';
 let payDraftKind = 'transfer';
 const EMPTY_REPLY_TEXT = '（对方没有回复）';
+const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_STORES = ['summaries', 'events', 'profiles', 'vectors', 'meta'];
@@ -1596,6 +1597,8 @@ function paymentStatusText(m) {
   const type = m.payType || m.type;
   const status = m.payStatus || 'pending';
   if (status === 'received') return type === 'redpacket' ? '已领取' : '已收钱';
+  if (type === 'redpacket' && status === 'expired') return '已退回';
+  if (type === 'redpacket' && status === 'refused') return '待领取';
   if (status === 'refused') return '已退还';
   return type === 'redpacket' ? '待领取' : '待收钱';
 }
@@ -1604,8 +1607,32 @@ function paymentStatusTip(m, char) {
   const status = m.payStatus || 'pending';
   const name = charName(char);
   if (status === 'received') return type === 'redpacket' ? `${name}领取了你的红包` : `${name}已收钱`;
-  if (status === 'refused') return type === 'redpacket' ? `${name}没有领取，红包已退回零钱` : `${name}已退还转账`;
+  if (type === 'redpacket' && status === 'expired') return '红包24小时未领取，已退回零钱';
+  if (status === 'refused') return type === 'redpacket' ? '' : `${name}已退还转账`;
   return '';
+}
+function refreshPaymentExpirations(chat) {
+  if (!chat?.messages?.length) return false;
+  let changed = false;
+  const now = Date.now();
+  chat.messages.forEach(m => {
+    if ((m.payType || m.type) !== 'redpacket') return;
+    if ((m.payStatus || 'pending') !== 'pending') return;
+    const expiresAt = Number(m.payExpiresAt) || ((Number(m.time) || now) + REDPACKET_EXPIRE_MS);
+    if (!m.payExpiresAt) {
+      m.payExpiresAt = expiresAt;
+      changed = true;
+    }
+    if (now < expiresAt) return;
+    m.payStatus = 'expired';
+    m.payStatusTime = now;
+    if (!m.refunded) {
+      saveWalletBalance(walletBalance() + (Number(m.amount) || 0));
+      m.refunded = true;
+    }
+    changed = true;
+  });
+  return changed;
 }
 function renderPaymentCard(m) {
   const type = m.payType || m.type;
@@ -1655,6 +1682,7 @@ function renderMessages() {
   const char = characters.find(c => c.id === currentCharId);
   const wrap = document.getElementById('chat-messages');
   if (!chat || !char) return;
+  if (refreshPaymentExpirations(chat)) DB.set('chats', allChats);
   let html = '';
   if (char.scenario) html += `<div class="scenario">${esc(char.scenario)}</div>`;
   chat.messages.forEach((m, i) => {
@@ -1731,13 +1759,35 @@ function inferPaymentStatusFromReply(reply) {
   if (/(收下|收了|我收|领了|领取|拿了|收到|收款|谢谢|谢了|多谢|恭敬不如从命|不客气了|那我就收|拆了|点开了)/.test(text)) return 'received';
   return 'pending';
 }
+function latestPendingPayment(chat, preferredId = '') {
+  if (!chat?.messages?.length) return null;
+  const now = Date.now();
+  const explicit = preferredId ? chat.messages.find(m => m.id === preferredId) : null;
+  if (explicit) return explicit;
+  return chat.messages.slice().reverse().find(m => {
+    const type = m.payType || m.type;
+    if (!['transfer', 'redpacket'].includes(type)) return false;
+    if ((m.payStatus || 'pending') !== 'pending') return false;
+    if (type === 'redpacket') {
+      const expiresAt = Number(m.payExpiresAt) || ((Number(m.time) || now) + REDPACKET_EXPIRE_MS);
+      return now < expiresAt;
+    }
+    return true;
+  }) || null;
+}
 function updatePaymentStatusFromReply(chat, paymentMessageId, reply) {
-  if (!chat || !paymentMessageId) return;
-  const msg = chat.messages.find(m => m.id === paymentMessageId);
+  if (!chat) return;
+  refreshPaymentExpirations(chat);
+  const msg = latestPendingPayment(chat, paymentMessageId);
   if (!msg || !['transfer', 'redpacket'].includes(msg.payType || msg.type)) return;
   if ((msg.payStatus || 'pending') !== 'pending') return;
+  const type = msg.payType || msg.type;
   const status = inferPaymentStatusFromReply(reply);
   if (status === 'pending') return;
+  if (type === 'redpacket' && status === 'refused') {
+    msg.payDeclinedAt = Date.now();
+    return;
+  }
   msg.payStatus = status;
   msg.payStatusTime = Date.now();
   if (status === 'refused' && !msg.refunded) {
@@ -1815,7 +1865,19 @@ async function submitPayMessage() {
     ? `${playerName()}给${char?.name || '对方'}发了一个红包：${formatMoney(amount)}${note ? `，备注：${note}` : ''}`
     : `${playerName()}向${char?.name || '对方'}转账${formatMoney(amount)}${note ? `，备注：${note}` : ''}`;
   const paymentMessageId = uid('pay');
-  chat.messages.push({ id: paymentMessageId, role: 'user', content, type: kind, payType: kind, amount, note, payStatus: 'pending', time: Date.now() });
+  const sentAt = Date.now();
+  chat.messages.push({
+    id: paymentMessageId,
+    role: 'user',
+    content,
+    type: kind,
+    payType: kind,
+    amount,
+    note,
+    payStatus: 'pending',
+    payExpiresAt: kind === 'redpacket' ? sentAt + REDPACKET_EXPIRE_MS : null,
+    time: sentAt
+  });
   DB.set('chats', allChats);
   if (amountInput) amountInput.value = '';
   if (noteInput) noteInput.value = '';
