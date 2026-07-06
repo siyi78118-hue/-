@@ -326,6 +326,26 @@ async function notifyClients(data) {
   clients.forEach(client => client.postMessage(data));
 }
 
+function timerUrl(settings, path) {
+  return String(settings.timerEndpoint || '').replace(/\/+$/, '') + path;
+}
+
+async function scheduleNextCloudProactive(state, charId) {
+  const settings = state?.settings || {};
+  const chat = state?.allChats?.[charId];
+  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription || !settings.deviceId || !chat) return false;
+  const dueAtMs = Date.now() + Math.max(1, Number(settings.proactiveIdleMinutes) || 30) * 60000;
+  const jobId = `pro_${settings.deviceId}_${charId}`;
+  chat.pendingProactiveJob = { jobId, dueAt: new Date(dueAtMs).toISOString() };
+  const resp = await fetch(timerUrl(settings, '/schedule'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive' })
+  });
+  if (!resp.ok) throw new Error('schedule failed ' + resp.status);
+  return true;
+}
+
 async function handleProactivePush(payload) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
@@ -375,6 +395,11 @@ async function handleProactivePush(payload) {
     return;
   }
   chat.unread = (chat.unread || 0) + 1;
+  try {
+    await scheduleNextCloudProactive(state, charId);
+  } catch (err) {
+    console.warn('[AL Push] next schedule skipped:', err);
+  }
   state.allChats = allChats;
   state.updatedAt = Date.now();
   await setMeta('app_state', state);

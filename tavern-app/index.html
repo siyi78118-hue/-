@@ -3070,6 +3070,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成主动消息\n已写入当前会话', 2400);
+    scheduleCloudProactive(charId).catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] proactive update skipped:', err.message));
     return true;
   } catch (err) {
@@ -3125,6 +3126,7 @@ async function triggerProactiveMoment(charId, manual = false) {
     saveMoments();
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
+    scheduleCloudProactive(charId).catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
     processMemoryAfterScenario(charId);
     return true;
   } catch (err) {
