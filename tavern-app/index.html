@@ -208,10 +208,12 @@ button{border:none;background:none;cursor:pointer}
 .pay-card-note{font-size:12px;opacity:.86;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pay-card-foot{height:24px;padding:0 10px;background:#fff;color:#999;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:8px}
 .pay-status-tip{align-self:center;max-width:86%;padding:2px 8px;border-radius:3px;background:#d4d4d4;color:#fff;font-size:12px;line-height:1.6;text-align:center}
-.wallet-head{padding:26px 18px 24px;background:#fff;text-align:center;margin-bottom:8px}
-.wallet-label{font-size:13px;color:#777;margin-bottom:10px}
-.wallet-amount{font-size:42px;font-weight:600;line-height:1;letter-spacing:0}
-.wallet-note{font-size:12px;color:#999;margin-top:12px;line-height:1.5}
+.wallet-tools{display:grid;grid-template-columns:repeat(2,1fr);background:#fff;margin-bottom:8px}
+.wallet-tool{height:92px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:15px;color:#111;position:relative}
+.wallet-tool:first-child:after{content:"";position:absolute;right:0;top:18px;bottom:18px;width:1px;background:#f0f0f0}
+.wallet-tool .wx-icon{width:36px;height:36px}
+.wallet-balance-mini{color:#888;font-size:12px;margin-top:-3px}
+.wallet-note{padding:8px 16px 18px;color:#999;font-size:12px;line-height:1.55}
 .pay-target{padding:24px 18px;background:#fff;display:flex;align-items:center;gap:12px;margin-bottom:8px}
 .pay-target .avatar{width:46px;height:46px}
 .pay-target-name{font-size:17px;font-weight:500}
@@ -461,20 +463,21 @@ button.profile-top{width:100%;text-align:left}
   <div id="screen-wallet" class="screen">
     <div class="topbar">
       <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('me')">‹</button></div>
-      <div class="top-title">钱包</div>
+      <div class="top-title">服务</div>
       <div class="top-right"></div>
     </div>
     <div class="scroll" style="background:#ededed">
-      <div class="wallet-head">
-        <div class="wallet-label">零钱余额</div>
-        <div class="wallet-amount" id="wallet-balance">¥0.00</div>
-        <div class="wallet-note">仅用于 AL 角色扮演，不涉及真实支付。</div>
+      <div class="wallet-tools">
+        <button class="wallet-tool" onclick="toast('零钱余额 ' + formatMoney(walletBalance()))" type="button"><span class="wx-icon green wx-card"></span><span>零钱</span><span class="wallet-balance-mini" id="wallet-balance">¥0.00</span></button>
+        <button class="wallet-tool" onclick="focusWalletRecharge()" type="button"><span class="wx-icon orange wx-new"></span><span>充值</span><span class="wallet-balance-mini">给 AL 零钱加钱</span></button>
       </div>
       <div class="cell-group">
+        <div class="cell"><span class="wx-icon green wx-card"></span><div class="cell-body">零钱</div><div class="mini" id="wallet-balance-row">¥0.00</div></div>
         <div class="cell"><div class="cell-label">充值金额</div><div class="cell-body"><input class="input" id="wallet-recharge-amount" type="number" min="0" step="0.01" placeholder="随意输入金额"></div></div>
+        <button class="cell" onclick="rechargeWallet()" type="button"><span class="wx-icon orange wx-new"></span><div class="cell-body">充值</div><div class="mini">›</div></button>
+        <button class="cell" onclick="resetWalletBalance()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清零余额</div></button>
       </div>
-      <button class="primary" onclick="rechargeWallet()">充值</button>
-      <button class="secondary" onclick="resetWalletBalance()">清零余额</button>
+      <div class="wallet-note">仅用于 AL 角色扮演，不涉及真实支付。聊天里的转账和红包会从这里扣除或退回。</div>
     </div>
   </div>
 
@@ -1413,9 +1416,17 @@ function renderWalletPreview() {
   if (el) el.textContent = formatMoney(walletBalance());
 }
 function renderWallet() {
+  const amount = formatMoney(walletBalance());
   const el = document.getElementById('wallet-balance');
-  if (el) el.textContent = formatMoney(walletBalance());
+  if (el) el.textContent = amount;
+  const row = document.getElementById('wallet-balance-row');
+  if (row) row.textContent = amount;
   renderWalletPreview();
+}
+function focusWalletRecharge() {
+  const input = document.getElementById('wallet-recharge-amount');
+  input?.focus();
+  input?.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 function rechargeWallet() {
   const input = document.getElementById('wallet-recharge-amount');
