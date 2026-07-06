@@ -1694,15 +1694,18 @@ function ensureChatForChar(charId) {
   if (!Array.isArray(allChats[charId].messages)) allChats[charId].messages = [];
   return allChats[charId];
 }
-function recordMomentMemoryEvent(charId, content, time = Date.now()) {
+function recordScenarioMemoryEvent(charId, label, content, time = Date.now()) {
   if (!charId || !content) return;
   const chat = ensureChatForChar(charId);
   chat.messages.push({
     role: 'user',
     hidden: true,
     time,
-    content: `【朋友圈事件】${content}`
+    content: `【${label}】${content}`
   });
+}
+function recordMomentMemoryEvent(charId, content, time = Date.now()) {
+  recordScenarioMemoryEvent(charId, '朋友圈事件', content, time);
 }
 function buildMomentChatContext(charId, limit = 8) {
   if (!Array.isArray(allMoments) || !allMoments.length) return '';
@@ -1792,28 +1795,10 @@ async function notifyMomentToCharacters(momentId, manual = false) {
   if (manual) toast('通知完成');
 }
 async function callMomentInteractionAI(char, moment) {
-  const system = `${buildCharPrompt(char)}
-
-朋友圈互动专用预设：
-你现在不是在私聊回复${playerName()}，而是在朋友圈刷到${playerName()}刚发的一条动态。
-你可以选择点赞、留言、或者什么都不做。留言必须像朋友圈评论，不要像聊天框里的即时回复。
-只允许输出 JSON，不要输出解释：{"like":true/false,"comment":"留言正文或空字符串"}
-规则：
-1. comment 只能是语言本身，禁止动作、神态、心理、旁白、系统说明。
-2. comment 不要称呼“用户/角色”，需要称呼时使用昵称。
-3. 不要每次都评论；关系一般或动态普通时可以只点赞或划过。
-4. 留言默认 4-30 个中文字符，像真人朋友圈评论。`;
-  const user = `当前设备时间：${formatFullTime(new Date())}
-朋友圈作者：${playerName()}
-朋友圈正文：${moment.text}
-已有点赞：${(moment.likes || []).map(id => charName(characters.find(c => c.id === id))).join('、') || '无'}
-已有留言：${(moment.comments || []).map(c => `${c.name}：${c.text}`).join('\n') || '无'}
-
-请以 ${char.name} 的性格决定是否点赞或留言。`;
-  const messages = [{ role: 'user', content: user }];
+  const payload = buildMomentInteractionPayload(char, moment);
   const text = (settings.chatApiType || 'openai') === 'claude'
-    ? await callClaude(system, messages, { live: false, charId: char.id })
-    : await callOpenAI(system, messages, { live: false, charId: char.id });
+    ? await callClaude(payload.system, payload.messages, { live: false, charId: char.id })
+    : await callOpenAI(payload.system, payload.messages, { live: false, charId: char.id });
   try {
     const json = extractJson(text);
     return { like: !!json.like, comment: String(json.comment || '').trim() };
@@ -1822,30 +1807,10 @@ async function callMomentInteractionAI(char, moment) {
   }
 }
 async function callMomentPostAI(char, chat) {
-  const system = `${buildCharPrompt(char)}
-
-朋友圈发动态专用预设：
-你现在不是在私聊回复${playerName()}，而是以${char.name}的身份自己发一条朋友圈动态。
-这条动态应该像真人随手发的朋友圈，不要像给${playerName()}的直接回答。
-只允许输出 JSON，不要输出解释：{"text":"朋友圈正文"}
-规则：
-1. text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
-2. 不要出现“用户/角色/API/系统/提示词/模型”等说法。
-3. 可以自然参考当前时间、最近聊天、关系和未完成约定，但不要机械复述。
-4. 默认 1-2 句，像朋友圈动态；不要使用换行排版。`;
-  const recent = visibleChatMessages(chat).slice(-12).map(m => messageLine(m, char)).join('\n') || '暂无';
-  const user = `${getTimeContext()}
-
-${buildMomentChatContext(char.id, 6) || '暂无朋友圈上下文'}
-
-最近私聊：
-${recent}
-
-请决定${char.name}现在会不会发一条朋友圈；如果适合，就输出 JSON。`;
-  const messages = [{ role: 'user', content: user }];
+  const payload = buildMomentPostPayload(char, chat);
   const text = (settings.chatApiType || 'openai') === 'claude'
-    ? await callClaude(system, messages, { live: false, charId: char.id })
-    : await callOpenAI(system, messages, { live: false, charId: char.id });
+    ? await callClaude(payload.system, payload.messages, { live: false, charId: char.id })
+    : await callOpenAI(payload.system, payload.messages, { live: false, charId: char.id });
   try {
     return String(extractJson(text).text || '').replace(/\s+/g, ' ').trim();
   } catch {
@@ -2015,6 +1980,174 @@ function buildCharPrompt(char) {
   if (char.mesExample) prompt += `\n对话示例：\n${char.mesExample}\n`;
   if (char.postHistoryInstructions) prompt += `\n${char.postHistoryInstructions}`;
   return prompt.trim();
+}
+function aiNoNarrationRules(char) {
+  return [
+    `输出身份：只输出${charName(char)}会发出的文字。`,
+    '纯聊天限制：禁止动作描写、神态描写、心理描写、环境描写、旁白、舞台说明、系统说明。',
+    '禁止使用 *动作*、括号动作、第三人称叙述或替玩家说话。',
+    `称呼规则：需要称呼时使用“${playerName()}”和“${charName(char)}”，不要写“用户”“角色”。`,
+    '时间规则：可以自然参考当前时间，但不要说自己看到了系统时间；涉及时段时必须符合当前设备时间。'
+  ].join('\n');
+}
+function buildSceneSystemBase(char, sceneLabel) {
+  return `${buildCharPrompt(char)}
+
+AL 场景化内置预设：
+当前场景：${sceneLabel}
+${aiNoNarrationRules(char)}
+当前设备时间：
+${getTimeContext()}`;
+}
+function formatHiddenEventForAI(m) {
+  return `【后台场景事件｜${formatFullTime(new Date(m.time || Date.now()))}】${m.content}
+注意：这不是${playerName()}刚发来的聊天气泡，而是已经发生过的场景记录。你可以自然记得这件事，但不要提到“系统记录/隐藏事件/后台”。`;
+}
+function sceneMessagesForAI(chat, count = 30, options = {}) {
+  const now = options.now || new Date();
+  return recentMessages(chat, count).map(m => {
+    if (m.hidden) return { role: 'user', content: formatHiddenEventForAI(m) };
+    let content = String(m.content || '');
+    if (options.withTime) {
+      const at = m.time ? new Date(m.time) : null;
+      const stamp = at ? `发送时间 ${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}` : '发送时间未知';
+      content = `【${stamp}】${content}`;
+    }
+    return { role: m.role, content };
+  });
+}
+function buildChatSceneSystem(char, chat, options = {}) {
+  const sceneLabel = options.proactive ? '主动私聊' : options.payment ? '支付后私聊回应' : '普通私聊';
+  let system = buildSceneSystemBase(char, sceneLabel);
+  const basePrompt = buildCharPrompt(char);
+  if (chat?.charPrompt && chat.charPrompt !== basePrompt) system += '\n\n对话专属补充：\n' + chat.charPrompt;
+  const momentContext = buildMomentChatContext(char.id);
+  if (momentContext) system += '\n\n' + momentContext;
+  if (options.memoryPack) system += '\n\n' + options.memoryPack;
+  if (options.payment) {
+    const pay = options.payment;
+    const payLabel = pay.kind === 'redpacket' ? '红包' : '转账';
+    const redpacketRule = pay.kind === 'redpacket'
+      ? '红包真实规则：未领取时不要说已经退还；24 小时未领取才会自动退款。角色可以领取、暂时不领、拒绝但仍显示待领取。'
+      : '转账真实规则：角色可以收钱，也可以明确退还；退还会立刻回到玩家余额。';
+    system += `\n\n支付场景任务：
+上一条可见消息是${playerName()}通过 AL 钱包给${char.name}发来的${payLabel}，金额 ${formatMoney(pay.amount)}${pay.note ? `，备注“${pay.note}”` : ''}。
+${redpacketRule}
+角色要根据性格、关系、金额、备注和最近上下文自然回应。
+如果收下，请用聊天口吻表达“收了/领了/那我收下/谢谢”等含义。
+如果不收，请明确表达“不收/不要/你拿回去/我先不领”等含义。
+不要输出支付系统说明，不要替${playerName()}说话，只输出${char.name}的聊天正文。`;
+  }
+  if (options.proactive) {
+    const proactiveNow = options.proactiveNow || new Date();
+    const proactiveTimeContext = options.proactiveTimeContext || buildProactiveTimeContext(chat, proactiveNow);
+    system += `\n\n${proactiveTimeContext}
+
+主动私聊任务：
+现在不是${playerName()}刚发消息后等你回答，而是${char.name}在空闲时间主动打开聊天发消息。
+短间隔可以轻续聊；超过 15 分钟要体现时间流逝；超过 60 分钟默认像重新开口，除非有未完成约定或强情绪必须接住。
+可以自然提起朋友圈、红包、转账、约定或最近事件，但不要机械复述后台材料。
+如果想连续发几条消息，用换行分隔；系统会拆成独立聊天气泡。
+默认 1-3 句，像真人私聊。`;
+  } else if (!options.payment) {
+    system += `\n\n普通私聊任务：
+这是${playerName()}刚在当前聊天里发来的消息。请按即时私聊自然回应。
+可以记得后台场景事件和长期记忆，但不要把后台事件当成刚刚收到的新消息。`;
+  }
+  if (settings.systemPrompt) system += '\n\n全局补充预设：\n' + settings.systemPrompt;
+  if (chat?.extraPrompt) system += '\n\n当前会话补充：\n' + chat.extraPrompt;
+  return system;
+}
+function buildMomentInteractionPayload(char, moment) {
+  const system = `${buildSceneSystemBase(char, '朋友圈点赞/评论')}
+
+朋友圈互动任务：
+${char.name}现在不是在私聊回复${playerName()}，而是在朋友圈刷到${playerName()}刚发的一条动态。
+你可以选择点赞、留言、或者什么都不做。留言必须像朋友圈评论，不要像聊天框里的即时回复。
+只允许输出 JSON，不要输出解释：{"like":true/false,"comment":"留言正文或空字符串"}
+规则：
+1. comment 只能是语言本身，禁止动作、神态、心理、旁白、系统说明。
+2. comment 不要称呼“用户/角色”，需要称呼时使用昵称。
+3. 不要每次都评论；关系一般或动态普通时可以只点赞或划过。
+4. 留言默认 4-30 个中文字符，像真人朋友圈评论。`;
+  const user = `朋友圈作者：${playerName()}
+朋友圈正文：${moment.text}
+已有点赞：${(moment.likes || []).map(id => charName(characters.find(c => c.id === id))).join('、') || '无'}
+已有留言：${(moment.comments || []).map(c => `${c.name}：${c.text}`).join('\n') || '无'}
+最近相关朋友圈上下文：
+${buildMomentChatContext(char.id, 6) || '暂无'}
+
+请以 ${char.name} 的性格决定是否点赞或留言。`;
+  return { system, messages: [{ role: 'user', content: user }] };
+}
+function buildMomentPostPayload(char, chat) {
+  const system = `${buildSceneSystemBase(char, '角色主动发朋友圈')}
+
+朋友圈发动态任务：
+${char.name}现在不是在私聊回复${playerName()}，而是自己发一条朋友圈动态。
+动态应该像真人随手发的朋友圈，不要像给${playerName()}的直接回答。
+只允许输出 JSON，不要输出解释：{"text":"朋友圈正文"}
+规则：
+1. text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
+2. 不要出现“用户/角色/API/系统/提示词/模型”等说法。
+3. 可以自然参考当前时间、最近聊天、关系和未完成约定，但不要机械复述。
+4. 默认 1-2 句，像朋友圈动态；不要使用换行排版。`;
+  const recent = visibleChatMessages(chat).slice(-12).map(m => messageLine(m, char)).join('\n') || '暂无';
+  const user = `最近朋友圈上下文：
+${buildMomentChatContext(char.id, 6) || '暂无'}
+
+最近私聊：
+${recent}
+
+请决定${char.name}现在会不会发一条朋友圈；如果适合，就输出 JSON。`;
+  return { system, messages: [{ role: 'user', content: user }] };
+}
+function buildMemoryQueryPayload(char, userInput, messages) {
+  const system = `你是 AL 的本地记忆检索助手。
+任务：只根据当前输入、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
+你不参与角色扮演，不回复${playerName()}，不替${charName(char)}说话。
+只输出 JSON，不要输出解释。`;
+  const user = `双方昵称：${playerName()} / ${charName(char)}
+最近聊天与场景事件：
+${messages.slice(-10).map(m => messageLine(m, char)).join('\n')}
+
+当前输入或触发原因：
+${userInput}
+
+输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`;
+  return { system, user };
+}
+function buildMemoryExtractPayload(char, batch, oldSummaries) {
+  const system = `你是 AL 的本地记忆整理 AI，负责把微信式 RP 聊天和后台场景事件提炼为数据库记录。
+只输出 JSON，不要输出解释。
+原则：
+1. 只记录明确出现、未来会影响回复的信息，不编造。
+2. 不要记录普通寒暄、临时玩笑、测试对话、时间校对、AI身份争论、一次性吐槽、无后续价值的争辩。
+3. events 只记录重要事件和时间节点：承诺/欠账/约定/计划、争执与和好、关系变化、称呼变化、明确雷点、未解决事项、红包/转账状态、重要朋友圈互动。
+4. 朋友圈点赞/评论/发动态只有在影响关系、情绪、约定、金钱、身份或后续话题时才长期记录；普通点赞和普通短评不要记录。
+5. profile_updates 只记录稳定资料：${playerName()}或${charName(char)}的年龄、职业、住址城市、长期偏好、边界、关系状态；不记录一次性闲聊。
+6. summary 只概括本轮新增的长期有效信息；如果本轮没有值得长期记忆的内容，summary 返回空字符串，events/profile_updates 返回空数组。
+7. 所有记录必须使用双方昵称“${playerName()}”和“${charName(char)}”，禁止用“用户”“角色”代称。
+8. 所有 detail 要具体，不要简写成“发生了一些事”；重要金额、时间节点、是否领取/拒收、朋友圈评论内容不能省略。
+9. 这是纯聊天 RP，禁止把动作、神态、环境描写当作事实新增，除非它是聊天文字明确表达的设定。`;
+  const user = `双方昵称：${playerName()} / ${charName(char)}
+旧增量摘要：
+${oldSummaries || '暂无'}
+
+本轮新增聊天与后台场景事件：
+${batch.map(m => messageLine(m, char)).join('\n')}
+
+输出 JSON，格式严格如下：
+{
+  "summary": "本轮新增摘要，0-200字；只写值得长期记忆的新增事实、约定、关系变化；没有则为空字符串",
+  "profile_updates": [
+    {"type":"user|character|relationship","title":"短标题","detail":"稳定资料","importance":1-5,"keywords":["关键词"]}
+  ],
+  "events": [
+    {"happenedAt":"明确时间或相对时间","type":"promise|payment|moment|conflict|reconcile|preference|relationship|plan|fact","title":"短标题","detail":"具体事件，不省略关键时间节点","status":"open|done|stable","importance":1-5,"keywords":["关键词"]}
+  ]
+}`;
+  return { system, user };
 }
 function formatMsg(text) {
   if (!text) return '';
@@ -2203,7 +2336,22 @@ function latestPendingPayment(chat, preferredId = '') {
     return true;
   }) || null;
 }
-function updatePaymentStatusFromReply(chat, paymentMessageId, reply) {
+function recordPaymentMemoryEvent(charId, msg, status) {
+  if (!charId || !msg || !['received', 'refused'].includes(status)) return;
+  const char = characters.find(c => c.id === charId);
+  const type = msg.payType || msg.type;
+  const label = type === 'redpacket' ? '红包' : '转账';
+  const amount = formatMoney(msg.amount);
+  const note = msg.note ? `，备注“${msg.note}”` : '';
+  const result = status === 'received'
+    ? `${charName(char)}收下了${playerName()}发来的${label}`
+    : `${charName(char)}没有收下${playerName()}发来的${label}`;
+  const pendingRule = type === 'redpacket' && status === 'refused'
+    ? '；红包仍处于待领取状态，24小时未领取才会自动退回'
+    : '';
+  recordScenarioMemoryEvent(charId, '支付事件', `${result}，金额 ${amount}${note}${pendingRule}。`, Date.now());
+}
+function updatePaymentStatusFromReply(chat, paymentMessageId, reply, charId = currentCharId) {
   if (!chat) return;
   refreshPaymentExpirations(chat);
   const msg = latestPendingPayment(chat, paymentMessageId);
@@ -2214,6 +2362,10 @@ function updatePaymentStatusFromReply(chat, paymentMessageId, reply) {
   if (status === 'pending') return;
   if (type === 'redpacket' && status === 'refused') {
     msg.payDeclinedAt = Date.now();
+    if (msg.payMemoryRecordedStatus !== status) {
+      recordPaymentMemoryEvent(charId, msg, status);
+      msg.payMemoryRecordedStatus = status;
+    }
     return;
   }
   msg.payStatus = status;
@@ -2221,6 +2373,10 @@ function updatePaymentStatusFromReply(chat, paymentMessageId, reply) {
   if (status === 'refused' && !msg.refunded) {
     saveWalletBalance(walletBalance() + (Number(msg.amount) || 0));
     msg.refunded = true;
+  }
+  if (msg.payMemoryRecordedStatus !== status) {
+    recordPaymentMemoryEvent(charId, msg, status);
+    msg.payMemoryRecordedStatus = status;
   }
 }
 async function continueAssistantTurn(requestCharId, userText, options = {}) {
@@ -2234,7 +2390,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     clearStreamingDraft(requestCharId);
     if (isEmptyReplyText(reply)) throw new Error('接口返回空内容，没有生成回复');
     appendAssistantMessages(chat, reply);
-    updatePaymentStatusFromReply(chat, options.paymentMessageId, reply);
+    updatePaymentStatusFromReply(chat, options.paymentMessageId, reply, requestCharId);
     scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
     return reply;
   } catch (err) {
@@ -2462,10 +2618,9 @@ async function callMemoryJSON(system, user) {
 async function generateMemoryQuery(char, userInput, messages) {
   const fallback = { query: `${char?.name || ''} ${userInput}`, keywords: [], focus: 'current' };
   if (!settings.memoryModel || !settings.memoryApiUrl || !settings.memoryApiKey) return fallback;
-  const system = '你是本地记忆检索助手。只根据用户当前输入和最近聊天，生成用于向量数据库召回的检索查询。只输出 JSON，不参与角色扮演，不回复用户。';
-  const user = `双方昵称：${playerName()} / ${charName(char)}\n最近聊天：\n${messages.slice(-8).map(m => messageLine(m, char)).join('\n')}\n\n${playerName()}当前输入：${userInput}\n\n输出 JSON：{"query":"一句检索查询","keywords":["关键词"],"focus":"需要召回的记忆类型"}`;
+  const payload = buildMemoryQueryPayload(char, userInput, messages);
   try {
-    const json = await callMemoryJSON(system, user);
+    const json = await callMemoryJSON(payload.system, payload.user);
     return { ...fallback, ...json };
   } catch (err) {
     console.warn('[AL Memory] query fallback:', err.message);
@@ -2523,35 +2678,8 @@ async function prepareMemoryPack(charId, userInput) {
 async function extractTurnMemory(charId, batch) {
   const char = characters.find(c => c.id === charId);
   const oldSummaries = (await MemoryDB.byChar('summaries', charId)).sort((a, b) => a.createdAt - b.createdAt).map(s => memoryAliasText(s.content, char)).join('\n');
-  const system = `你是 AL 的本地记忆整理 AI，负责把微信式 RP 聊天提炼为数据库记录。
-只输出 JSON，不要输出解释。
-原则：
-1. 只记录聊天中明确出现、未来会影响回复的信息，不编造。
-2. 不要记录普通寒暄、临时玩笑、测试对话、时间校对、AI身份争论、一次性吐槽、无后续价值的争辩。
-3. events 只记录重要事件和时间节点：承诺/欠账/约定/计划、争执与和好、关系变化、称呼变化、明确雷点、未解决事项、会影响后续剧情的事实。
-4. profile_updates 只记录稳定资料：${playerName()}或${charName(char)}的年龄、职业、住址城市、长期偏好、边界、关系状态；不记录一次性闲聊。
-5. summary 只概括本轮新增的长期有效信息；如果本轮没有值得长期记忆的内容，summary 返回空字符串，events/profile_updates 返回空数组。
-6. 所有记录必须使用双方昵称“${playerName()}”和“${charName(char)}”，禁止用“用户”“角色”代称。
-7. 所有 detail 要具体，不要简写成“发生了一些事”。
-8. 这是纯聊天 RP，禁止把动作、神态、环境描写当作事实新增，除非它是聊天文字明确表达的设定。`;
-  const user = `双方昵称：${playerName()} / ${charName(char)}
-旧增量摘要：
-${oldSummaries || '暂无'}
-
-本轮新增聊天：
-${batch.map(m => messageLine(m, char)).join('\n')}
-
-输出 JSON，格式严格如下：
-{
-  "summary": "本轮新增摘要，0-200字；只写值得长期记忆的新增事实、约定、关系变化；没有则为空字符串",
-  "profile_updates": [
-    {"type":"user|character|relationship","title":"短标题","detail":"稳定资料","importance":1-5,"keywords":["关键词"]}
-  ],
-  "events": [
-    {"happenedAt":"明确时间或相对时间","type":"promise|conflict|reconcile|preference|relationship|plan|fact","title":"短标题","detail":"具体事件，不省略关键时间节点","status":"open|done|stable","importance":1-5,"keywords":["关键词"]}
-  ]
-}`;
-  return callMemoryJSON(system, user);
+  const payload = buildMemoryExtractPayload(char, batch, oldSummaries);
+  return callMemoryJSON(payload.system, payload.user);
 }
 async function storeExtractedMemory(charId, extracted) {
   const now = Date.now();
@@ -2920,37 +3048,9 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   if (!settings.chatApiUrl || !settings.chatApiKey) throw new Error('请先在设置中配置聊天接口');
   const charId = options.charId || currentCharId;
   const currentChar = characters.find(c => c.id === charId);
-  let system = currentChar ? buildCharPrompt(currentChar) : (chat.charPrompt || '');
-  if (chat.charPrompt && chat.charPrompt !== system) system += '\n\n对话专属补充：\n' + chat.charPrompt;
-  system += `\n\n身份称呼：玩家昵称是“${playerName()}”，当前对话角色昵称是“${currentChar?.name || '角色'}”。对话中需要称呼双方时，优先使用这些昵称，不要把他们写成“用户”和“角色”。`;
-  system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext();
-  const momentContext = buildMomentChatContext(charId);
-  if (momentContext) system += '\n\n' + momentContext;
-  if (memoryPack) system += '\n\n' + memoryPack;
-  if (options.payment) {
-    const pay = options.payment;
-    const payLabel = pay.kind === 'redpacket' ? '红包' : '转账';
-    system += `\n\n支付场景：上一条消息是${playerName()}通过 AL 钱包给${currentChar?.name || '你'}发来的${payLabel}，金额 ${formatMoney(pay.amount)}${pay.note ? `，备注“${pay.note}”` : ''}。
-你可以根据角色性格、关系和当下情绪选择收下，也可以拒收或退回。
-如果收下，请用自然聊天口吻明确表达“收了/领了/谢谢/那我收下”等含义；如果不收，请明确表达“不收/退回/不要/还给你”等含义。
-不要输出支付系统说明，不要替${playerName()}说话，只输出${currentChar?.name || '角色'}的聊天正文。`;
-  }
-  if (options.proactive) {
-    const proactiveNow = options.proactiveNow || new Date();
-    const proactiveTimeContext = options.proactiveTimeContext || buildProactiveTimeContext(chat, proactiveNow);
-    system += `\n\n${proactiveTimeContext}
-
-主动消息任务：现在不是用户刚发消息，而是你作为${currentChar?.name || '角色'}在合适的空闲时间主动发来一条微信式消息。
-只能输出消息正文，不要写动作、表情、旁白、心理描写、系统说明或定时器说明。
-可以自然参考当前时间、你们的关系、未兑现约定和最近聊天，但不要机械复述时间戳。
-如果想连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
-默认 1-3 句，像真的私聊。`;
-  }
-  if (settings.systemPrompt) system += '\n\n' + settings.systemPrompt;
-  if (chat.extraPrompt) system += '\n\n' + chat.extraPrompt;
-  const messages = options.proactive
-    ? proactiveRecentMessages(chat, 30, options.proactiveNow || new Date())
-    : recentMessages(chat, 30).map(m => ({ role: m.role, content: m.content }));
+  if (!currentChar) throw new Error('找不到当前角色');
+  const system = buildChatSceneSystem(currentChar, chat, { ...options, memoryPack });
+  const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: options.proactiveNow || new Date() });
   const callOptions = { live: options.live !== false, charId };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
 }
