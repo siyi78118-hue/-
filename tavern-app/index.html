@@ -197,6 +197,18 @@ button{border:none;background:none;cursor:pointer}
 .wallet-label{font-size:13px;color:#777;margin-bottom:10px}
 .wallet-amount{font-size:42px;font-weight:600;line-height:1;letter-spacing:0}
 .wallet-note{font-size:12px;color:#999;margin-top:12px;line-height:1.5}
+.pay-target{padding:24px 18px;background:#fff;display:flex;align-items:center;gap:12px;margin-bottom:8px}
+.pay-target .avatar{width:46px;height:46px}
+.pay-target-name{font-size:17px;font-weight:500}
+.pay-target-note{font-size:12px;color:#999;margin-top:4px}
+.pay-amount-box{background:#fff;padding:20px 18px;margin-bottom:8px}
+.pay-amount-label{font-size:13px;color:#555;margin-bottom:14px}
+.pay-amount-line{display:flex;align-items:flex-end;border-bottom:1px solid #dedede;padding-bottom:8px}
+.pay-yuan{font-size:30px;line-height:1;margin-right:8px}
+.pay-input{flex:1;border:none;outline:none;background:transparent;font-size:40px;line-height:1;font-weight:500;min-width:0}
+.pay-input::placeholder{color:#cfcfcf}
+.pay-balance{font-size:12px;color:#999;margin-top:10px}
+.pay-note-input{height:44px;line-height:44px}
 .voice-hold{width:100%;height:36px;border-radius:4px;background:#fff;color:#333;font-size:15px}
 .profile-top{background:#fff;padding:22px 18px;display:flex;gap:16px;align-items:center;border-bottom:1px solid var(--line)}
 button.profile-top{width:100%;text-align:left}
@@ -441,11 +453,37 @@ button.profile-top{width:100%;text-align:left}
     </div>
     <div class="composer-panel" id="composer-plus">
       <div class="action-grid">
-        <button class="action-item" onclick="sendWalletMessage('transfer')"><span>转</span>转账</button>
-        <button class="action-item" onclick="sendWalletMessage('redpacket')"><span>包</span>红包</button>
+        <button class="action-item" onclick="openPayScreen('transfer')"><span>转</span>转账</button>
+        <button class="action-item" onclick="openPayScreen('redpacket')"><span>包</span>红包</button>
         <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>记</span>记忆库</button>
         <button class="action-item" onclick="manualProactiveMessage()"><span>主</span>主动消息</button>
       </div>
+    </div>
+  </div>
+
+  <div id="screen-pay" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('chat')">‹</button></div>
+      <div class="top-title" id="pay-title">转账</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll" style="background:#ededed">
+      <div class="pay-target">
+        <div id="pay-target-avatar" class="avatar"></div>
+        <div style="min-width:0">
+          <div class="pay-target-name" id="pay-target-name"></div>
+          <div class="pay-target-note" id="pay-target-note"></div>
+        </div>
+      </div>
+      <div class="pay-amount-box">
+        <div class="pay-amount-label" id="pay-amount-label">转账金额</div>
+        <div class="pay-amount-line"><span class="pay-yuan">¥</span><input class="pay-input" id="pay-amount-input" type="number" min="0" step="0.01" inputmode="decimal" placeholder="0.00"></div>
+        <div class="pay-balance" id="pay-balance-text">零钱余额 ¥0.00</div>
+      </div>
+      <div class="cell-group">
+        <div class="cell"><div class="cell-label" id="pay-note-label">备注</div><div class="cell-body"><input class="input pay-note-input" id="pay-note-input" placeholder="添加备注"></div></div>
+      </div>
+      <button class="primary" id="pay-submit-btn" onclick="submitPayMessage()">转账</button>
     </div>
   </div>
 
@@ -733,6 +771,7 @@ let settingsFormHydrating = false;
 let playerProfileSaveTimer = null;
 let newRoleAvatarData = '';
 let modalCharAvatarData = '';
+let payDraftKind = 'transfer';
 const EMPTY_REPLY_TEXT = '（对方没有回复）';
 
 const MEMORY_DB_NAME = 'ALMemoryDB';
@@ -1085,6 +1124,7 @@ function showScreen(name) {
   if (name === 'contact-profile') renderContactProfile();
   if (name === 'wallet') renderWallet();
   if (name === 'self-profile') renderPlayerProfile();
+  if (name === 'pay') renderPayScreen();
 }
 function togglePlusMenu() {
   plusOpen = !plusOpen;
@@ -1684,16 +1724,41 @@ async function continueAssistantTurn(requestCharId, userText) {
   renderChats();
   processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
 }
-async function sendWalletMessage(kind) {
-  if (!currentCharId || isStreaming) return;
+function openPayScreen(kind = 'transfer') {
+  if (!currentCharId) { toast('先打开一个会话'); return; }
+  payDraftKind = kind === 'redpacket' ? 'redpacket' : 'transfer';
+  closeComposerPanels();
+  showScreen('pay');
+  const amountInput = document.getElementById('pay-amount-input');
+  const noteInput = document.getElementById('pay-note-input');
+  if (amountInput) amountInput.value = '';
+  if (noteInput) noteInput.value = '';
+  setTimeout(() => amountInput?.focus(), 80);
+}
+function renderPayScreen() {
   const char = characters.find(c => c.id === currentCharId);
-  const label = kind === 'redpacket' ? '红包' : '转账';
-  const raw = prompt(`${label}金额\n当前余额：${formatMoney(walletBalance())}`, '');
-  if (raw === null) return;
-  const amount = Math.round(Number(String(raw).replace(/[¥,\s]/g, '')) * 100) / 100;
+  if (!char) return;
+  const isRed = payDraftKind === 'redpacket';
+  document.getElementById('pay-title').textContent = isRed ? '发红包' : '转账';
+  document.getElementById('pay-amount-label').textContent = isRed ? '红包金额' : '转账金额';
+  document.getElementById('pay-note-label').textContent = isRed ? '祝福语' : '备注';
+  document.getElementById('pay-note-input').placeholder = isRed ? '恭喜发财，大吉大利' : '添加备注';
+  document.getElementById('pay-submit-btn').textContent = isRed ? '塞钱进红包' : '转账';
+  document.getElementById('pay-target-name').textContent = char.name || '对方';
+  document.getElementById('pay-target-note').textContent = isRed ? '发给对方的红包' : '转账给对方';
+  document.getElementById('pay-balance-text').textContent = `零钱余额 ${formatMoney(walletBalance())}`;
+  setAvatarPreview('pay-target-avatar', char.avatarData, char.avatar || char.name?.slice(0, 1) || 'R');
+}
+async function submitPayMessage() {
+  if (!currentCharId || isStreaming) return;
+  const kind = payDraftKind === 'redpacket' ? 'redpacket' : 'transfer';
+  const char = characters.find(c => c.id === currentCharId);
+  const amountInput = document.getElementById('pay-amount-input');
+  const noteInput = document.getElementById('pay-note-input');
+  const amount = Math.round(Number(String(amountInput?.value || '').replace(/[¥,\s]/g, '')) * 100) / 100;
   if (!Number.isFinite(amount) || amount <= 0) { toast('金额不正确'); return; }
   if (amount > walletBalance()) { toast('余额不足'); return; }
-  const note = (prompt(kind === 'redpacket' ? '红包祝福语（可留空）' : '转账备注（可留空）', '') || '').trim();
+  const note = (noteInput?.value || '').trim();
   const chat = allChats[currentCharId];
   if (!chat) return;
   cancelCloudProactive(currentCharId);
@@ -1704,6 +1769,9 @@ async function sendWalletMessage(kind) {
     : `${playerName()}向${char?.name || '对方'}转账${formatMoney(amount)}${note ? `，备注：${note}` : ''}`;
   chat.messages.push({ role: 'user', content, type: kind, payType: kind, amount, note, time: Date.now() });
   DB.set('chats', allChats);
+  if (amountInput) amountInput.value = '';
+  if (noteInput) noteInput.value = '';
+  showScreen('chat');
   renderMessages();
   await continueAssistantTurn(currentCharId, content);
 }
