@@ -526,6 +526,7 @@ button.profile-top{width:100%;text-align:left}
         <button class="action-item" onclick="openPayScreen('redpacket')"><span>包</span>红包</button>
         <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>记</span>记忆库</button>
         <button class="action-item" onclick="manualProactiveMessage()"><span>主</span>主动消息</button>
+        <button class="action-item" onclick="manualProactiveMoment()"><span>圈</span>发动态</button>
       </div>
     </div>
   </div>
@@ -1051,7 +1052,7 @@ let mirrorTimer = null;
 async function mirrorAppStateNow() {
   if (typeof MemoryDB === 'undefined') return;
   const updatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || Date.now();
-  await MemoryDB.setMeta('app_state', { settings, characters, allChats, updatedAt });
+  await MemoryDB.setMeta('app_state', { settings, characters, allChats, allMoments, updatedAt });
 }
 async function mirrorAppState() {
   if (mirrorTimer) clearTimeout(mirrorTimer);
@@ -1070,10 +1071,12 @@ async function restoreAppStateFromMirror() {
   settings = migrateSettings(mirrored.settings || settings);
   characters = (mirrored.characters || characters).map(normalizeChar);
   allChats = mirrored.allChats || allChats;
+  allMoments = Array.isArray(mirrored.allMoments) ? mirrored.allMoments : allMoments;
   scrubEmptyReplyMessages(allChats);
   localStorage.setItem('rpchat_settings', JSON.stringify(settings));
   localStorage.setItem('rpchat_characters', JSON.stringify(characters));
   localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
+  localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
   localStorage.setItem('rpchat_app_state_updated_at', String(mirrored.updatedAt));
   return true;
 }
@@ -1759,7 +1762,7 @@ function renderMomentItem(moment) {
     ${comments.map(c => `<div class="moment-comment"><b>${esc(c.name || charName(characters.find(ch => ch.id === c.charId)))}</b>：${esc(c.text || '')}</div>`).join('')}
   </div>` : '';
   const authorClick = author.isPlayer ? "showScreen('self-profile')" : `openContactProfile('${moment.charId}')`;
-  const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `openChat('${moment.charId}')`;
+  const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `replyToMoment('${moment.id}')`;
   return `<div class="moment">
     ${author.avatar}
     <div class="moment-body">
@@ -1847,8 +1850,8 @@ async function submitPlayerMoment() {
   if (input) input.value = '';
   toggleMomentComposer(false);
   saveMoments();
-  toast('已发表朋友圈');
-  notifyMomentToCharacters(moment.id).catch(err => {
+  toast('已发表朋友圈，正在通知角色...', 1800);
+  notifyMomentToCharacters(moment.id, true).catch(err => {
     console.warn('[AL Moments] notify skipped:', err.message);
     toast('朋友圈通知失败：' + friendlyErrorMessage(err), 2800);
   });
@@ -1919,6 +1922,98 @@ ${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系�
     return String(extractJson(text).text || '').replace(/\s+/g, ' ').trim();
   } catch {
     return String(text || '').replace(/\s+/g, ' ').trim();
+  }
+}
+function createCharacterMoment(charId, text, options = {}) {
+  const char = characters.find(c => c.id === charId);
+  const clean = momentSnippet(text, 160);
+  if (!char || !clean || isEmptyReplyText(clean)) return null;
+  const now = options.time || Date.now();
+  const moment = {
+    id: `mom_${now}_${Math.random().toString(36).slice(2, 8)}`,
+    authorType: 'char',
+    charId: char.id,
+    text: clean,
+    time: now,
+    likes: [],
+    comments: [],
+    proactive: !!options.proactive,
+    fromChat: !!options.fromChat
+  };
+  allMoments.unshift(moment);
+  recordMomentMemoryEvent(char.id, `${char.name}在朋友圈发布动态：“${momentSnippet(clean)}”`, now);
+  DB.set('chats', allChats);
+  saveMoments();
+  processMemoryAfterScenario(char.id);
+  return moment;
+}
+function extractAssistantMomentDirective(text) {
+  const raw = String(text || '').trim();
+  const matches = raw.match(/\{[\s\S]*?\}/g) || [];
+  for (const block of matches) {
+    try {
+      const json = JSON.parse(block);
+      const momentText = String(json.timeline || json.moment || json.post || '').replace(/\s+/g, ' ').trim();
+      if (!momentText) continue;
+      const chatText = raw.replace(block, '').replace(/\n{3,}/g, '\n\n').trim();
+      return { momentText, chatText };
+    } catch {}
+  }
+  return null;
+}
+function applyAssistantMomentDirective(chat, charId, reply) {
+  const directive = extractAssistantMomentDirective(reply);
+  if (!directive) return String(reply || '');
+  const moment = createCharacterMoment(charId, directive.momentText, { fromChat: true });
+  if (moment && activeScreen === 'moments') renderMoments();
+  return directive.chatText || '朋友圈发了。';
+}
+async function replyToMoment(momentId) {
+  const moment = allMoments.find(m => m.id === momentId);
+  if (!moment) return;
+  if (moment.authorType === 'player') {
+    notifyMomentToCharacters(moment.id, true);
+    return;
+  }
+  const char = characters.find(c => c.id === moment.charId);
+  if (!char) return;
+  const text = prompt('评论', '');
+  const comment = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!comment) return;
+  moment.comments = [...(moment.comments || []), { charId: 'player', name: playerName(), text: comment.slice(0, 80), time: Date.now() }];
+  recordMomentMemoryEvent(char.id, `${playerName()}评论了${char.name}的朋友圈：“${momentSnippet(comment, 70)}”`, Date.now());
+  saveMoments();
+  processMemoryAfterScenario(char.id);
+  if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) return;
+  toast('正在等待回复...', 1200);
+  try {
+    const reply = await callMomentReplyAI(char, moment, comment);
+    const clean = momentSnippet(reply, 80);
+    if (clean && !isEmptyReplyText(clean)) {
+      moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: clean, time: Date.now() }];
+      recordMomentMemoryEvent(char.id, `${char.name}回复了${playerName()}的朋友圈评论：“${momentSnippet(clean, 70)}”`, Date.now());
+      saveMoments();
+      processMemoryAfterScenario(char.id);
+    }
+  } catch (err) {
+    toast('回复失败：' + friendlyErrorMessage(err), 2600);
+  }
+}
+async function callMomentReplyAI(char, moment, playerComment) {
+  const memoryQuery = `朋友圈评论回复触发。
+${getTimeContext()}
+${playerName()}刚评论${char.name}的朋友圈：“${momentSnippet(playerComment)}”
+${char.name}需要在朋友圈评论区自然回复，并记得双方此前关系、承诺、红包/转账和重要互动。`;
+  const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
+  const payload = buildMomentReplyPayload(char, moment, playerComment, memoryPack);
+  const text = (settings.chatApiType || 'openai') === 'claude'
+    ? await callClaude(payload.system, payload.messages, { live: false, charId: char.id })
+    : await callOpenAI(payload.system, payload.messages, { live: false, charId: char.id });
+  try {
+    const json = extractJson(text);
+    return String(json.comment || json.reply || '').trim();
+  } catch {
+    return String(text || '').trim();
   }
 }
 
@@ -2207,6 +2302,29 @@ ${buildMomentChatContext(char.id, 6) || '暂无'}
 ${recent}
 
 请决定${char.name}现在会不会发一条朋友圈；如果适合，就输出 JSON。`;
+  return { system, messages: [{ role: 'user', content: user }] };
+}
+function buildMomentReplyPayload(char, moment, playerComment, memoryPack = '') {
+  const system = `${buildSceneSystemBase(char, '朋友圈评论回复')}
+${memoryPack ? `\n${memoryPack}\n` : ''}
+
+当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态。
+${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
+以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
+只允许输出 JSON，不要输出解释：{"comment":"回复评论正文或空字符串"}
+规则：
+1. comment 只能是评论区回复正文，禁止动作、神态、心理、旁白、系统说明。
+2. 不要输出 like/timeline/text 等字段，不要让角色重新发一条朋友圈。
+3. 回复默认 4-35 个中文字符，像真实朋友圈评论区互动。
+4. 可以不回复，comment 为空字符串。`;
+  const user = `朋友圈作者：${char.name}
+朋友圈正文：${moment.text}
+已有评论：
+${(moment.comments || []).map(c => `${c.name || charName(characters.find(ch => ch.id === c.charId))}：${c.text}`).join('\n') || '无'}
+
+${playerName()}刚评论：${playerComment}
+
+请以 ${char.name} 的性格决定是否回复这条评论。`;
   return { system, messages: [{ role: 'user', content: user }] };
 }
 function buildMemoryQueryPayload(char, userInput, messages) {
@@ -2523,11 +2641,12 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     const memoryPack = await prepareMemoryPack(requestCharId, userText);
     const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment });
     clearStreamingDraft(requestCharId);
-    if (isEmptyReplyText(reply)) throw new Error('接口返回空内容，没有生成回复');
-    appendAssistantMessages(chat, reply);
-    updatePaymentStatusFromReply(chat, options.paymentMessageId, reply, requestCharId);
+    const replyText = applyAssistantMomentDirective(chat, requestCharId, reply);
+    if (isEmptyReplyText(replyText)) throw new Error('接口返回空内容，没有生成回复');
+    appendAssistantMessages(chat, replyText);
+    updatePaymentStatusFromReply(chat, options.paymentMessageId, replyText, requestCharId);
     scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
-    return reply;
+    return replyText;
   } catch (err) {
     clearStreamingDraft(requestCharId);
     chat.messages.push({ role: 'assistant', content: `（${friendlyErrorMessage(err)}）`, time: Date.now() });
@@ -3055,7 +3174,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     const memoryPack = await prepareMemoryPack(charId, query);
     const reply = await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext });
     clearStreamingDraft(charId);
-    const replyText = String(reply || '').trim();
+    const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
     chat.lastProactiveAt = Date.now();
     delete chat.pendingProactiveJob;
     if (isEmptyReplyText(replyText)) {
@@ -3110,24 +3229,10 @@ async function triggerProactiveMoment(charId, manual = false) {
       if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
       return false;
     }
-    const now = Date.now();
-    allMoments.unshift({
-      id: `mom_${now}_${Math.random().toString(36).slice(2, 8)}`,
-      authorType: 'char',
-      charId: char.id,
-      text,
-      time: now,
-      likes: [],
-      comments: [],
-      proactive: true
-    });
-    recordMomentMemoryEvent(char.id, `${char.name}在朋友圈发布动态：“${momentSnippet(text)}”`, now);
-    DB.set('chats', allChats);
-    saveMoments();
+    createCharacterMoment(char.id, text, { proactive: true });
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
     scheduleCloudProactive(charId).catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
-    processMemoryAfterScenario(charId);
     return true;
   } catch (err) {
     if (chat) {
@@ -3179,6 +3284,13 @@ async function manualProactiveMessage() {
   if (!charId) { toast('先创建并打开一个会话'); return; }
   toast('正在生成主动消息...', 1800);
   await triggerProactiveMessage(charId, true);
+}
+async function manualProactiveMoment() {
+  saveSettings();
+  const charId = currentCharId || getLatestChatRows()[0]?.char?.id;
+  if (!charId) { toast('先创建并打开一个会话'); return; }
+  toast('正在生成朋友圈...', 1800);
+  await triggerProactiveMoment(charId, true);
 }
 
 async function callAPI(chat, memoryPack = '', options = {}) {
@@ -3608,7 +3720,7 @@ async function syncFromServiceWorkerState() {
     if (activeScreen === 'chat') renderMessages();
     if (activeScreen === 'chats') renderChats();
     if (activeScreen === 'contacts') renderContacts();
-    if (activeScreen === 'discover') renderMoments();
+    if (activeScreen === 'discover' || activeScreen === 'moments') renderMoments();
     if (activeScreen === 'memory') renderMemoryScreen();
   }
   catchUpDueCloudProactive().catch(err => console.warn('[AL Timer] catch-up skipped:', err.message));

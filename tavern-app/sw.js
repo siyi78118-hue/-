@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v2';
+const CACHE_NAME = 'rpchat-v3';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 
@@ -279,6 +279,11 @@ function messageLine(m, char, settings = {}) {
   return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
 }
 
+function momentSnippet(text, max = 90) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+
 function buildMemoryPack(charId, char, settings = {}) {
   return Promise.all([
     getAll('summaries'),
@@ -357,6 +362,10 @@ async function handleProactivePush(payload) {
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) throw new Error('missing chat');
   if (!(settings.chatApiUrl || settings.apiUrl) || !(settings.chatApiKey || settings.apiKey) || !settings.chatModel) throw new Error('missing api config');
+  if (chat.lastProactiveType === 'chat') {
+    const posted = await handleProactiveMomentPush(state, charId, payload);
+    if (posted) return;
+  }
 
   const proactiveNow = new Date();
   const memoryPack = await buildMemoryPack(charId, char, settings);
@@ -395,6 +404,7 @@ async function handleProactivePush(payload) {
     return;
   }
   chat.unread = (chat.unread || 0) + 1;
+  chat.lastProactiveType = 'chat';
   try {
     await scheduleNextCloudProactive(state, charId);
   } catch (err) {
@@ -411,6 +421,78 @@ async function handleProactivePush(payload) {
     icon: './icon.svg',
     badge: './icon.svg'
   });
+}
+
+async function handleProactiveMomentPush(state, charId, payload) {
+  const { settings, characters, allChats } = state;
+  const allMoments = Array.isArray(state.allMoments) ? state.allMoments : [];
+  const char = (characters || []).find(c => c.id === charId);
+  const chat = allChats[charId];
+  if (!char || !chat?.messages?.length) return false;
+  const proactiveNow = new Date();
+  const memoryPack = await buildMemoryPack(charId, char, settings);
+  let system = chat.charPrompt || `当前你要扮演的角色：${char.name}`;
+  system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow);
+  if (memoryPack) system += '\n\n' + memoryPack;
+  if (settings.systemPrompt) system += '\n\n' + settings.systemPrompt;
+  if (chat.extraPrompt) system += '\n\n' + chat.extraPrompt;
+  system += `\n\n朋友圈发布动态任务：
+现在不是在私聊回复用户，而是${char.name}自己发一条朋友圈动态。
+只能输出 JSON，不要输出解释：{"text":"朋友圈正文"}
+text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
+不要出现“用户/角色/API/系统/提示词/模型”等说法。
+可以自然参考当前时间、最近聊天、关系和未完成约定，但不要机械复述。
+默认 1-2 句，像真人朋友圈动态；不要使用换行排版。`;
+  const messages = proactiveRecentMessages(chat, 20, proactiveNow);
+  const raw = (await callModel(settings, system, messages)).trim();
+  let text = '';
+  try {
+    const start = raw.indexOf('{'), end = raw.lastIndexOf('}');
+    const json = JSON.parse(start >= 0 && end > start ? raw.slice(start, end + 1) : raw);
+    text = String(json.text || json.timeline || '').replace(/\s+/g, ' ').trim();
+  } catch {
+    text = raw.replace(/\s+/g, ' ').trim();
+  }
+  text = momentSnippet(text, 160);
+  chat.lastProactiveAt = Date.now();
+  chat.lastProactiveType = 'moment';
+  if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
+  if (!text || isEmptyReplyText(text)) return false;
+  const now = Date.now();
+  allMoments.unshift({
+    id: `mom_${now}_${Math.random().toString(36).slice(2, 8)}`,
+    authorType: 'char',
+    charId,
+    text,
+    time: now,
+    likes: [],
+    comments: [],
+    proactive: true
+  });
+  chat.messages.push({
+    role: 'user',
+    hidden: true,
+    time: now,
+    content: `【朋友圈事件】${char.name}在朋友圈发布动态：“${momentSnippet(text)}”`
+  });
+  try {
+    await scheduleNextCloudProactive(state, charId);
+  } catch (err) {
+    console.warn('[AL Push] next schedule skipped:', err);
+  }
+  state.allChats = allChats;
+  state.allMoments = allMoments;
+  state.updatedAt = Date.now();
+  await setMeta('app_state', state);
+  await notifyClients({ type: 'al-state-updated', charId, moment: true });
+  await self.registration.showNotification(char.name || 'AL', {
+    body: `发了一条朋友圈：${text}`,
+    tag: `al-moment-${charId}`,
+    data: { charId, url: './index.html' },
+    icon: './icon.svg',
+    badge: './icon.svg'
+  });
+  return true;
 }
 
 function findDueProactiveCharId(allChats) {
