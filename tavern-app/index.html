@@ -47,6 +47,18 @@ button{border:none;background:none;cursor:pointer}
 .search-bar{padding:8px 12px;background:var(--page)}
 .search-box{width:100%;height:34px;border-radius:5px;background:#fff;color:#9a9a9a;display:flex;align-items:center;justify-content:center;gap:6px;font-size:14px}
 .search-box .icon-search:before{border-color:#b4b4b4}.search-box .icon-search:after{background:#b4b4b4}
+.search-top{height:52px;padding:8px 12px;background:#ededed;border-bottom:1px solid #d7d7d7;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.search-field{height:36px;flex:1;min-width:0;border-radius:5px;background:#fff;display:flex;align-items:center;gap:6px;padding:0 9px;color:#8a8a8a}
+.search-field .icon-search{transform:scale(.38);width:18px;height:18px;flex-shrink:0}
+.search-field .icon-search:before{border-color:#9c9c9c}.search-field .icon-search:after{background:#9c9c9c}
+.search-input{flex:1;min-width:0;border:none;outline:none;background:transparent;font-size:16px;color:#111;line-height:36px}
+.search-input::-webkit-search-cancel-button{display:none}
+.search-cancel{height:36px;padding:0 2px;color:#576b95;font-size:16px;white-space:nowrap}
+.search-results{background:#ededed;min-height:100%;padding-top:8px}
+.search-section-title{height:30px;padding:8px 16px 0;color:#888;font-size:13px;background:#ededed}
+.search-empty{padding:44px 18px;text-align:center;color:#999;font-size:14px;line-height:1.7}
+.search-hints{padding:24px 16px;color:#888;font-size:14px;line-height:2;text-align:center}
+.search-hit{color:#576b95}
 .list{background:var(--panel)}
 .row{width:100%;min-height:70px;padding:0 16px;display:flex;align-items:center;gap:12px;border-bottom:none;position:relative;background:#fff;text-align:left}
 .row:after{content:"";position:absolute;left:76px;right:0;bottom:0;height:1px;background:#eeeeee}
@@ -297,6 +309,19 @@ button.profile-top{width:100%;text-align:left}
     <button class="plus-item" onclick="showScreen('contacts')"><span class="mini-menu-icon file"></span>发起聊天</button>
     <button class="plus-item" onclick="openCreateRole()"><span class="mini-menu-icon edit"></span>新建角色</button>
     <button class="plus-item" onclick="openImport()"><span class="mini-menu-icon file"></span>导入角色卡</button>
+  </div>
+
+  <div id="screen-search" class="screen">
+    <div class="search-top">
+      <label class="search-field">
+        <span class="icon-search"></span>
+        <input class="search-input" id="global-search-input" type="search" placeholder="搜索" autocomplete="off" oninput="renderSearchScreen()" onkeydown="handleSearchKey(event)">
+      </label>
+      <button class="search-cancel" onclick="closeSearch()" type="button">取消</button>
+    </div>
+    <div class="scroll">
+      <div class="search-results" id="search-results"></div>
+    </div>
   </div>
 
   <div id="screen-contacts" class="screen">
@@ -760,6 +785,8 @@ let settings = migrateSettings(DB.get('settings', DEFAULT_SETTINGS));
 let characters = DB.get('characters', []);
 let allChats = DB.get('chats', {});
 let searchFilters = { chats: '', contacts: '' };
+let searchScope = 'chats';
+let searchReturnScreen = 'chats';
 let currentCharId = null;
 let profileCharId = null;
 let isStreaming = false;
@@ -1129,32 +1156,104 @@ function showScreen(name) {
   if (name === 'wallet') renderWallet();
   if (name === 'self-profile') renderPlayerProfile();
   if (name === 'pay') renderPayScreen();
+  if (name === 'search') renderSearchScreen();
 }
 function togglePlusMenu() {
   plusOpen = !plusOpen;
   document.getElementById('plus-menu').classList.toggle('show', plusOpen);
 }
 function openSearch(scope = activeScreen) {
-  if (scope === 'discover') {
-    const text = prompt('搜索');
-    if (text) toast('已搜索：' + text.trim());
-    return;
-  }
-  if (!['chats', 'contacts'].includes(scope)) scope = activeScreen === 'contacts' ? 'contacts' : 'chats';
-  const old = searchFilters[scope] || '';
-  const next = prompt('搜索', old) ?? old;
-  searchFilters[scope] = next.trim();
-  renderSearchLabels();
-  if (scope === 'contacts') renderContacts();
-  else renderChats();
+  searchScope = ['chats', 'contacts'].includes(scope) ? scope : 'all';
+  searchReturnScreen = activeScreen && activeScreen !== 'search' ? activeScreen : (lastMainScreen || 'chats');
+  const input = document.getElementById('global-search-input');
+  if (input) input.value = '';
+  showScreen('search');
+  renderSearchScreen();
+  setTimeout(() => document.getElementById('global-search-input')?.focus(), 60);
+}
+function closeSearch() {
+  showScreen(searchReturnScreen || lastMainScreen || 'chats');
+}
+function handleSearchKey(event) {
+  if (event.key === 'Escape') closeSearch();
 }
 function renderSearchLabels() {
   for (const scope of ['chats', 'contacts']) {
     const el = document.getElementById('search-label-' + scope);
     if (!el) continue;
-    const value = searchFilters[scope];
-    el.textContent = value ? `搜索：${value}` : '搜索';
+    el.textContent = '搜索';
   }
+}
+function searchText(value) {
+  return String(value || '').toLowerCase();
+}
+function highlightSearch(text, keyword) {
+  const raw = String(text || '');
+  if (!keyword) return esc(raw);
+  const lower = raw.toLowerCase();
+  const idx = lower.indexOf(keyword.toLowerCase());
+  if (idx < 0) return esc(raw);
+  return `${esc(raw.slice(0, idx))}<span class="search-hit">${esc(raw.slice(idx, idx + keyword.length))}</span>${esc(raw.slice(idx + keyword.length))}`;
+}
+function chatSearchRows(keyword) {
+  const q = searchText(keyword);
+  return characters.map(c => {
+    const chat = allChats[c.id];
+    const messages = chat?.messages || [];
+    const last = messages[messages.length - 1];
+    const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
+    const messageHit = messages.slice(-80).reverse().find(m => searchText(m.content).includes(q));
+    const haystack = [c.name, preview, c.description, c.personality, messageHit?.content].map(searchText).join(' ');
+    return { c, chat, last, preview: messageHit ? previewText(messageHit.content) : preview, time: last?.time || 0, haystack };
+  }).filter(r => r.haystack.includes(q))
+    .sort((a, b) => b.time - a.time || a.c.name.localeCompare(b.c.name, 'zh-CN'));
+}
+function contactSearchRows(keyword) {
+  const q = searchText(keyword);
+  return characters
+    .filter(c => [c.name, c.description, c.personality, c.scenario].map(searchText).join(' ').includes(q))
+    .sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
+}
+function renderSearchScreen() {
+  const box = document.getElementById('search-results');
+  const input = document.getElementById('global-search-input');
+  if (!box || !input) return;
+  const keyword = input.value.trim();
+  if (!keyword) {
+    const hint = searchScope === 'contacts' ? '搜索联系人' : searchScope === 'chats' ? '搜索聊天' : '搜索聊天和联系人';
+    box.innerHTML = `<div class="search-hints">${hint}</div>`;
+    return;
+  }
+  const includeChats = searchScope !== 'contacts';
+  const includeContacts = searchScope !== 'chats';
+  const sections = [];
+  if (includeChats) {
+    const rows = chatSearchRows(keyword).slice(0, 20);
+    if (rows.length) {
+      sections.push(`<div class="search-section-title">聊天</div><div class="list">${rows.map(r => `
+        <button class="row" onclick="openChat('${r.c.id}')">
+          ${avatarHtml(r.c)}
+          <div class="row-main">
+            <div class="row-line"><div class="row-name">${highlightSearch(r.c.name, keyword)}</div><div class="row-time">${fmtTime(r.time) || ''}</div></div>
+            <div class="row-preview">${highlightSearch(r.preview, keyword)}</div>
+          </div>
+        </button>`).join('')}</div>`);
+    }
+  }
+  if (includeContacts) {
+    const rows = contactSearchRows(keyword).slice(0, 30);
+    if (rows.length) {
+      sections.push(`<div class="search-section-title">联系人</div><div class="list">${rows.map(c => `
+        <button class="row" onclick="openContactProfile('${c.id}')">
+          ${avatarHtml(c)}
+          <div class="row-main">
+            <div class="row-name">${highlightSearch(c.name, keyword)}</div>
+            <div class="row-preview">${highlightSearch(c.description || c.personality || '点击查看资料', keyword)}</div>
+          </div>
+        </button>`).join('')}</div>`);
+    }
+  }
+  box.innerHTML = sections.length ? sections.join('') : '<div class="search-empty">没有找到相关结果</div>';
 }
 function openImport() {
   showScreen('import');
