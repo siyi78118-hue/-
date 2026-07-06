@@ -3085,9 +3085,12 @@ async function ensureCloudProactiveScheduled(options = {}) {
   return scheduleCloudProactive(target);
 }
 async function repairCloudTimerScheduleOnce() {
-  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || settings.cloudTimerBucketFixV2) return;
+  if (!settings.cloudTimerEnabled || !settings.pushSubscription || settings.cloudTimerBucketFixV2) return;
+  settings.proactiveEnabled = true;
   settings.cloudTimerBucketFixV2 = true;
   DB.set('settings', settings);
+  const proactiveSelect = document.getElementById('set-proactive-enabled');
+  if (proactiveSelect) proactiveSelect.value = 'on';
   await ensureCloudProactiveScheduled({ force: true });
 }
 async function scheduleCloudProactive(charId) {
