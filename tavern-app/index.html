@@ -1793,9 +1793,13 @@ function recordScenarioMemoryEvent(charId, label, content, time = Date.now()) {
     time,
     content: `【${label}】${content}`
   });
+  DB.set('chats', allChats);
 }
 function recordMomentMemoryEvent(charId, content, time = Date.now()) {
   recordScenarioMemoryEvent(charId, '朋友圈事件', content, time);
+}
+function processMemoryAfterScenario(charId) {
+  processMemoryAfterTurn(charId, true).catch(err => console.warn('[AL Memory] scenario update skipped:', err.message));
 }
 function buildMomentChatContext(charId, limit = 8) {
   if (!Array.isArray(allMoments) || !allMoments.length) return '';
@@ -1867,6 +1871,7 @@ async function notifyMomentToCharacters(momentId, manual = false) {
     try {
       const result = await callMomentInteractionAI(char, moment);
       moment.notifiedCharIds = [...new Set([...(moment.notifiedCharIds || []), char.id])];
+      recordMomentMemoryEvent(char.id, `${playerName()}发布了朋友圈：“${momentSnippet(moment.text)}”；${char.name}收到了这条朋友圈通知。`, moment.time || Date.now());
       if (result.like) moment.likes = [...new Set([...(moment.likes || []), char.id])];
       const comment = String(result.comment || '').replace(/\s+/g, ' ').trim();
       if (comment) {
@@ -1877,7 +1882,7 @@ async function notifyMomentToCharacters(momentId, manual = false) {
       if (comment) actions.push(`${char.name}评论了${playerName()}的朋友圈：“${momentSnippet(comment, 70)}”`);
       if (actions.length) recordMomentMemoryEvent(char.id, actions.join('；'), Date.now());
       saveMoments();
-      if (actions.length) DB.set('chats', allChats);
+      processMemoryAfterScenario(char.id);
     } catch (err) {
       console.warn('[AL Moments] character skipped:', char.name, err.message);
     }
@@ -1885,7 +1890,12 @@ async function notifyMomentToCharacters(momentId, manual = false) {
   if (manual) toast('通知完成');
 }
 async function callMomentInteractionAI(char, moment) {
-  const payload = buildMomentInteractionPayload(char, moment);
+  const memoryQuery = `朋友圈互动触发。
+${getTimeContext()}
+${playerName()}刚发布朋友圈：“${momentSnippet(moment.text)}”
+${char.name}需要判断是否点赞或评论，并且要记得双方此前关系、承诺、雷点、红包/转账和朋友圈互动。`;
+  const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
+  const payload = buildMomentInteractionPayload(char, moment, memoryPack);
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, { live: false, charId: char.id })
     : await callOpenAI(payload.system, payload.messages, { live: false, charId: char.id });
@@ -1897,7 +1907,11 @@ async function callMomentInteractionAI(char, moment) {
   }
 }
 async function callMomentPostAI(char, chat) {
-  const payload = buildMomentPostPayload(char, chat);
+  const memoryQuery = `角色朋友圈动态触发。
+${getTimeContext()}
+${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
+  const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
+  const payload = buildMomentPostPayload(char, chat, memoryPack);
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, { live: false, charId: char.id })
     : await callOpenAI(payload.system, payload.messages, { live: false, charId: char.id });
@@ -2147,8 +2161,9 @@ ${redpacketRule}
   if (chat?.extraPrompt) system += '\n\n当前会话补充：\n' + chat.extraPrompt;
   return system;
 }
-function buildMomentInteractionPayload(char, moment) {
+function buildMomentInteractionPayload(char, moment, memoryPack = '') {
   const system = `${buildSceneSystemBase(char, '朋友圈动态互动')}
+${memoryPack ? `\n${memoryPack}\n` : ''}
 
 当前触发情况：${char.name}在朋友圈看到${playerName()}发的动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是在朋友圈刷到${playerName()}刚发的一条动态。
@@ -2170,8 +2185,9 @@ ${buildMomentChatContext(char.id, 6) || '暂无'}
 请以 ${char.name} 的性格决定是否点赞或留言。`;
   return { system, messages: [{ role: 'user', content: user }] };
 }
-function buildMomentPostPayload(char, chat) {
+function buildMomentPostPayload(char, chat, memoryPack = '') {
   const system = `${buildSceneSystemBase(char, '朋友圈发布动态')}
+${memoryPack ? `\n${memoryPack}\n` : ''}
 
 当前触发情况：${char.name}准备发一条朋友圈动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是自己发一条朋友圈动态。
@@ -2468,6 +2484,7 @@ function recordPaymentMemoryEvent(charId, msg, status) {
     ? '；红包仍处于待领取状态，24小时未领取才会自动退回'
     : '';
   recordScenarioMemoryEvent(charId, '支付事件', `${result}，金额 ${amount}${note}${pendingRule}。`, Date.now());
+  processMemoryAfterScenario(charId);
 }
 function updatePaymentStatusFromReply(chat, paymentMessageId, reply, charId = currentCharId) {
   if (!chat) return;
@@ -3108,7 +3125,7 @@ async function triggerProactiveMoment(charId, manual = false) {
     saveMoments();
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
-    processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] moment update skipped:', err.message));
+    processMemoryAfterScenario(charId);
     return true;
   } catch (err) {
     if (chat) {
