@@ -188,11 +188,14 @@ button{border:none;background:none;cursor:pointer}
 .action-item{display:flex;flex-direction:column;align-items:center;gap:6px;color:#666;font-size:12px}
 .action-item span{width:48px;height:48px;border-radius:8px;background:#fff;display:flex;align-items:center;justify-content:center;font-size:22px;color:#333}
 .pay-card{width:220px;border-radius:5px;overflow:hidden;background:#f6a23c;color:#fff;box-shadow:0 1px 0 rgba(0,0,0,.05)}
+.pay-card.received{background:#df8f35}
+.pay-card.refused{background:#b9a18a;color:rgba(255,255,255,.86)}
 .pay-card-main{min-height:68px;padding:12px;display:flex;align-items:center;gap:10px}
 .pay-card-icon{width:34px;height:34px;border-radius:4px;background:rgba(255,255,255,.24);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
 .pay-card-title{font-size:16px;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pay-card-note{font-size:12px;opacity:.86;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pay-card-foot{height:24px;padding:0 10px;background:#fff;color:#999;font-size:11px;display:flex;align-items:center}
+.pay-card-foot{height:24px;padding:0 10px;background:#fff;color:#999;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.pay-status-tip{align-self:center;max-width:86%;padding:2px 8px;border-radius:3px;background:#d4d4d4;color:#fff;font-size:12px;line-height:1.6;text-align:center}
 .wallet-head{padding:26px 18px 24px;background:#fff;text-align:center;margin-bottom:8px}
 .wallet-label{font-size:13px;color:#777;margin-bottom:10px}
 .wallet-amount{font-size:42px;font-weight:600;line-height:1;letter-spacing:0}
@@ -1589,15 +1592,31 @@ function formatMsg(text) {
   if (!text) return '';
   return esc(text).replace(/\n/g, '<br>');
 }
+function paymentStatusText(m) {
+  const type = m.payType || m.type;
+  const status = m.payStatus || 'pending';
+  if (status === 'received') return type === 'redpacket' ? '已领取' : '已收钱';
+  if (status === 'refused') return '已退还';
+  return type === 'redpacket' ? '待领取' : '待收钱';
+}
+function paymentStatusTip(m, char) {
+  const type = m.payType || m.type;
+  const status = m.payStatus || 'pending';
+  const name = charName(char);
+  if (status === 'received') return type === 'redpacket' ? `${name}领取了你的红包` : `${name}已收钱`;
+  if (status === 'refused') return type === 'redpacket' ? `${name}没有领取，红包已退回零钱` : `${name}已退还转账`;
+  return '';
+}
 function renderPaymentCard(m) {
   const type = m.payType || m.type;
   const amount = formatMoney(m.amount);
   const title = type === 'redpacket' ? `${amount} 红包` : `转账 ${amount}`;
   const note = m.note || (type === 'redpacket' ? '恭喜发财，大吉大利' : '待对方确认收款');
   const icon = type === 'redpacket' ? '包' : '¥';
-  return `<div class="pay-card">
+  const status = m.payStatus || 'pending';
+  return `<div class="pay-card ${esc(status)}">
     <div class="pay-card-main"><div class="pay-card-icon">${icon}</div><div style="min-width:0"><div class="pay-card-title">${esc(title)}</div><div class="pay-card-note">${esc(note)}</div></div></div>
-    <div class="pay-card-foot">AL 钱包</div>
+    <div class="pay-card-foot"><span>AL 钱包</span><span>${esc(paymentStatusText(m))}</span></div>
   </div>`;
 }
 function renderMessageBody(m) {
@@ -1615,7 +1634,8 @@ function splitAssistantOutput(text) {
 }
 function appendAssistantMessages(chat, text, extra = {}) {
   const parts = splitAssistantOutput(text);
-  const chunks = parts.length ? parts : ['在吗？'];
+  const chunks = parts.filter(part => !isEmptyReplyText(part));
+  if (!chunks.length) return [];
   const baseTime = Date.now();
   chunks.forEach((content, index) => {
     chat.messages.push({ role: 'assistant', content, time: baseTime + index * 1000, ...extra });
@@ -1641,6 +1661,8 @@ function renderMessages() {
     if (i === 0 || (m.time - (chat.messages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
     if (m.role === 'user') {
       html += `<div class="msg-wrap me">${renderMessageBody(m)}${playerAvatarHtml('msg-avatar')}</div>`;
+      const tip = (m.type === 'transfer' || m.type === 'redpacket') ? paymentStatusTip(m, char) : '';
+      if (tip) html += `<div class="pay-status-tip">${esc(tip)}</div>`;
     } else {
       const chunks = splitAssistantOutput(m.content);
       html += (chunks.length ? chunks : [m.content]).map(chunk =>
@@ -1702,27 +1724,52 @@ function insertEmoji(value) {
   input.setSelectionRange?.(next, next);
   autoResize(input);
 }
-async function continueAssistantTurn(requestCharId, userText) {
+function inferPaymentStatusFromReply(reply) {
+  const text = String(reply || '').replace(/\s+/g, '');
+  if (!text) return 'pending';
+  if (/(不收|不要|别发|别给|退回|退还|还给你|拒收|不领|不拿|拿回去|收不起|用不着|算了吧)/.test(text)) return 'refused';
+  if (/(收下|收了|我收|领了|领取|拿了|收到|收款|谢谢|谢了|多谢|恭敬不如从命|不客气了|那我就收|拆了|点开了)/.test(text)) return 'received';
+  return 'pending';
+}
+function updatePaymentStatusFromReply(chat, paymentMessageId, reply) {
+  if (!chat || !paymentMessageId) return;
+  const msg = chat.messages.find(m => m.id === paymentMessageId);
+  if (!msg || !['transfer', 'redpacket'].includes(msg.payType || msg.type)) return;
+  if ((msg.payStatus || 'pending') !== 'pending') return;
+  const status = inferPaymentStatusFromReply(reply);
+  if (status === 'pending') return;
+  msg.payStatus = status;
+  msg.payStatusTime = Date.now();
+  if (status === 'refused' && !msg.refunded) {
+    saveWalletBalance(walletBalance() + (Number(msg.amount) || 0));
+    msg.refunded = true;
+  }
+}
+async function continueAssistantTurn(requestCharId, userText, options = {}) {
   const chat = allChats[requestCharId];
   isStreaming = true;
   updateStreamingDraft(requestCharId, '');
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
   try {
     const memoryPack = await prepareMemoryPack(requestCharId, userText);
-    const reply = await callAPI(chat, memoryPack, { charId: requestCharId });
+    const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment });
     clearStreamingDraft(requestCharId);
     if (isEmptyReplyText(reply)) throw new Error('接口返回空内容，没有生成回复');
     appendAssistantMessages(chat, reply);
+    updatePaymentStatusFromReply(chat, options.paymentMessageId, reply);
     scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+    return reply;
   } catch (err) {
     clearStreamingDraft(requestCharId);
     chat.messages.push({ role: 'assistant', content: `（${friendlyErrorMessage(err)}）`, time: Date.now() });
+    return '';
+  } finally {
+    isStreaming = false;
+    DB.set('chats', allChats);
+    if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+    renderChats();
+    processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
   }
-  isStreaming = false;
-  DB.set('chats', allChats);
-  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
-  renderChats();
-  processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
 }
 function openPayScreen(kind = 'transfer') {
   if (!currentCharId) { toast('先打开一个会话'); return; }
@@ -1767,13 +1814,14 @@ async function submitPayMessage() {
   const content = kind === 'redpacket'
     ? `${playerName()}给${char?.name || '对方'}发了一个红包：${formatMoney(amount)}${note ? `，备注：${note}` : ''}`
     : `${playerName()}向${char?.name || '对方'}转账${formatMoney(amount)}${note ? `，备注：${note}` : ''}`;
-  chat.messages.push({ role: 'user', content, type: kind, payType: kind, amount, note, time: Date.now() });
+  const paymentMessageId = uid('pay');
+  chat.messages.push({ id: paymentMessageId, role: 'user', content, type: kind, payType: kind, amount, note, payStatus: 'pending', time: Date.now() });
   DB.set('chats', allChats);
   if (amountInput) amountInput.value = '';
   if (noteInput) noteInput.value = '';
   showScreen('chat');
   renderMessages();
-  await continueAssistantTurn(currentCharId, content);
+  await continueAssistantTurn(currentCharId, content, { paymentMessageId, payment: { kind, amount, note } });
 }
 function uid(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -2322,6 +2370,14 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   system += `\n\n身份称呼：玩家昵称是“${playerName()}”，当前对话角色昵称是“${currentChar?.name || '角色'}”。对话中需要称呼双方时，优先使用这些昵称，不要把他们写成“用户”和“角色”。`;
   system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext();
   if (memoryPack) system += '\n\n' + memoryPack;
+  if (options.payment) {
+    const pay = options.payment;
+    const payLabel = pay.kind === 'redpacket' ? '红包' : '转账';
+    system += `\n\n支付场景：上一条消息是${playerName()}通过 AL 钱包给${currentChar?.name || '你'}发来的${payLabel}，金额 ${formatMoney(pay.amount)}${pay.note ? `，备注“${pay.note}”` : ''}。
+你可以根据角色性格、关系和当下情绪选择收下，也可以拒收或退回。
+如果收下，请用自然聊天口吻明确表达“收了/领了/谢谢/那我收下”等含义；如果不收，请明确表达“不收/退回/不要/还给你”等含义。
+不要输出支付系统说明，不要替${playerName()}说话，只输出${currentChar?.name || '角色'}的聊天正文。`;
+  }
   if (options.proactive) {
     const proactiveNow = options.proactiveNow || new Date();
     const proactiveTimeContext = options.proactiveTimeContext || buildProactiveTimeContext(chat, proactiveNow);

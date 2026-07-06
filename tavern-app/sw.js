@@ -174,9 +174,54 @@ function splitAssistantOutput(text) {
   return parts.length ? parts : [normalized];
 }
 
+function isEmptyReplyText(text) {
+  const value = String(text || '').trim();
+  return !value || value === '（对方没有回复）' || value === '(对方没有回复)' || value === '对方没有回复';
+}
+
+function scrubEmptyReplyMessages(allChats) {
+  let changed = false;
+  Object.values(allChats || {}).forEach(chat => {
+    if (!Array.isArray(chat?.messages)) return;
+    const next = chat.messages.filter(m => !(m.role === 'assistant' && isEmptyReplyText(m.content)));
+    if (next.length !== chat.messages.length) {
+      chat.messages = next;
+      changed = true;
+    }
+  });
+  return changed;
+}
+
+function textFromContent(value) {
+  if (value == null) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(textFromContent).filter(Boolean).join('');
+  if (typeof value === 'object') {
+    return textFromContent(value.text)
+      || textFromContent(value.content)
+      || textFromContent(value.output_text)
+      || textFromContent(value.message?.content);
+  }
+  return String(value || '');
+}
+
+function extractResponseText(json) {
+  const choice = json?.choices?.[0] || {};
+  return (
+    textFromContent(choice?.message?.content)
+    || textFromContent(choice?.message?.text)
+    || textFromContent(choice?.text)
+    || textFromContent(json?.output_text)
+    || textFromContent(json?.output)
+    || textFromContent(json?.content)
+    || textFromContent(json?.text)
+  ).trim();
+}
+
 function appendAssistantMessages(chat, text, extra = {}) {
   const parts = splitAssistantOutput(text);
-  const chunks = parts.length ? parts : ['在吗？'];
+  const chunks = parts.filter(part => !isEmptyReplyText(part));
+  if (!chunks.length) return [];
   const baseTime = Date.now();
   chunks.forEach((content, index) => {
     chat.messages.push({ role: 'assistant', content, time: baseTime + index * 1000, ...extra });
@@ -264,7 +309,7 @@ async function callModel(settings, system, messages) {
     });
     if (!resp.ok) throw new Error('API ' + resp.status);
     const json = await resp.json();
-    return Array.isArray(json.content) ? json.content.map(p => p.text || '').join('') : (json.content || json.text || '');
+    return extractResponseText(json);
   }
   const resp = await fetch(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
     method: 'POST',
@@ -273,7 +318,7 @@ async function callModel(settings, system, messages) {
   });
   if (!resp.ok) throw new Error('API ' + resp.status);
   const json = await resp.json();
-  return json.choices?.[0]?.message?.content || json.output_text || '';
+  return extractResponseText(json);
 }
 
 async function notifyClients(data) {
@@ -285,6 +330,7 @@ async function handleProactivePush(payload) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
   const { settings, characters, allChats } = state;
+  scrubEmptyReplyMessages(allChats);
   const charId = payload.charId || findDueProactiveCharId(allChats);
   if (!charId) return;
   const char = (characters || []).find(c => c.id === charId);
@@ -310,11 +356,25 @@ async function handleProactivePush(payload) {
 默认 1-3 句。`;
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
-  const reply = (await callModel(settings, system, messages)).trim() || '在吗？';
-  const chunks = appendAssistantMessages(chat, reply, { proactive: true });
-  chat.unread = (chat.unread || 0) + 1;
+  const reply = (await callModel(settings, system, messages)).trim();
   chat.lastProactiveAt = Date.now();
   if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
+  if (isEmptyReplyText(reply)) {
+    state.allChats = allChats;
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+    await notifyClients({ type: 'al-state-updated', charId, skipped: true });
+    return;
+  }
+  const chunks = appendAssistantMessages(chat, reply, { proactive: true });
+  if (!chunks.length) {
+    state.allChats = allChats;
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+    await notifyClients({ type: 'al-state-updated', charId, skipped: true });
+    return;
+  }
+  chat.unread = (chat.unread || 0) + 1;
   state.allChats = allChats;
   state.updatedAt = Date.now();
   await setMeta('app_state', state);
