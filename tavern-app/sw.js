@@ -501,7 +501,11 @@ function findDueProactiveCharId(allChats) {
   const due = rows
     .filter(r => r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
     .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0];
-  return due?.charId || '';
+  if (due?.charId) return due.charId;
+  const pending = rows
+    .filter(r => r.job?.dueAt)
+    .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0];
+  return pending?.charId || '';
 }
 
 self.addEventListener('push', event => {

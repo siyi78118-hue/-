@@ -3051,8 +3051,11 @@ async function enableCloudTimer() {
     }
     settings.pushSubscription = subscription.toJSON();
     settings.cloudTimerEnabled = true;
+    settings.proactiveEnabled = true;
     settings.deviceId = ensureDeviceId();
     DB.set('settings', settings);
+    const proactiveSelect = document.getElementById('set-proactive-enabled');
+    if (proactiveSelect) proactiveSelect.value = 'on';
     await mirrorAppStateNow();
     const resp = await fetchWithTimeout(timerUrl('/register'), {
       method: 'POST',
@@ -3061,16 +3064,37 @@ async function enableCloudTimer() {
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('云闹钟注册失败：' + resp.status);
     toast('云闹钟已绑定\n之后空闲触发会由云端计时提醒', 3000);
-    const target = currentCharId || getLatestChatRows()[0]?.char?.id;
-    if (target) scheduleCloudProactive(target).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+    ensureCloudProactiveScheduled({ force: true }).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
   } catch (err) {
     toast('云闹钟绑定失败：' + friendlyErrorMessage(err), 3600);
   }
+}
+function hasFutureCloudJob(chat) {
+  const dueAt = Date.parse(chat?.pendingProactiveJob?.dueAt || '');
+  return Number.isFinite(dueAt) && dueAt > Date.now();
+}
+async function ensureCloudProactiveScheduled(options = {}) {
+  const { force = false } = options;
+  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
+  const rows = getLatestChatRows();
+  if (!rows.length) return false;
+  let target = '';
+  if (!force) target = rows.find(({ chat }) => !hasFutureCloudJob(chat))?.char?.id || '';
+  if (!target) target = (currentCharId && allChats[currentCharId]?.messages?.length ? currentCharId : rows[0].char.id);
+  if (!force && hasFutureCloudJob(allChats[target])) return false;
+  return scheduleCloudProactive(target);
+}
+async function repairCloudTimerScheduleOnce() {
+  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || settings.cloudTimerBucketFixV2) return;
+  settings.cloudTimerBucketFixV2 = true;
+  DB.set('settings', settings);
+  await ensureCloudProactiveScheduled({ force: true });
 }
 async function scheduleCloudProactive(charId) {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   const chat = allChats[charId];
   if (!chat?.messages?.length) return false;
+  ensureDeviceId();
   const dueAtMs = Date.now() + Math.max(1, Number(settings.proactiveIdleMinutes) || 30) * 60000;
   const jobId = `pro_${settings.deviceId}_${charId}`;
   chat.pendingProactiveJob = { jobId, dueAt: new Date(dueAtMs).toISOString() };
@@ -3505,6 +3529,7 @@ function saveSettings(options = {}) {
   settings = readSettingsForm();
   DB.set('settings', settings);
   startProactiveLoop();
+  if (!silent) ensureCloudProactiveScheduled().catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
   if (!silent) toast('已保存');
 }
 function scheduleSettingsAutosave() {
@@ -3731,6 +3756,7 @@ async function bootApp() {
   startProactiveLoop();
   renderChats();
   await mirrorAppStateNow();
+  repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {

@@ -109,19 +109,29 @@ async function runDueMinute(env, minute) {
   if (!raw) return;
   const ids = JSON.parse(raw);
   const now = Date.now();
+  const remaining = [];
   for (const jobId of ids) {
     const jobRaw = await env.AL_TIMER_KV.get(`job:${jobId}`);
     if (!jobRaw) continue;
     const job = JSON.parse(jobRaw);
-    if (!job.dueAt || Date.parse(job.dueAt) > now) continue;
+    if (!job.dueAt) continue;
+    const dueAtMs = Date.parse(job.dueAt);
+    if (dueAtMs > now) {
+      remaining.push(jobId);
+      continue;
+    }
     await deliverJob(job, env);
     await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
   }
-  await env.AL_TIMER_KV.delete(bucketKey);
+  if (remaining.length) {
+    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(remaining), { expirationTtl: 3 * 24 * 60 * 60 });
+  } else {
+    await env.AL_TIMER_KV.delete(bucketKey);
+  }
 }
 
 function minuteKey(ms) {
-  return Math.floor(ms / 60000);
+  return Math.ceil(ms / 60000);
 }
 
 async function deliverJob(job, env) {
