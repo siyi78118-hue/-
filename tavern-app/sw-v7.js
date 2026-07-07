@@ -307,11 +307,12 @@ async function callModel(settings, system, messages) {
   const apiType = settings.chatApiType || settings.apiType || 'openai';
   const apiUrl = settings.chatApiUrl || settings.apiUrl || '';
   const apiKey = settings.chatApiKey || settings.apiKey || '';
+  const model = settings.chatModel || settings.model || '';
   if (apiType === 'claude') {
     const resp = await fetch(apiUrl.replace(/\/+$/, '') + '/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: settings.chatModel || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: false })
+      body: JSON.stringify({ model: model || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: false })
     });
     if (!resp.ok) throw new Error('API ' + resp.status);
     const json = await resp.json();
@@ -320,7 +321,7 @@ async function callModel(settings, system, messages) {
   const resp = await fetch(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: settings.chatModel || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: false })
+    body: JSON.stringify({ model: model || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: false })
   });
   if (!resp.ok) throw new Error('API ' + resp.status);
   const json = await resp.json();
@@ -405,7 +406,7 @@ async function handleProactivePush(payload) {
   const char = (characters || []).find(c => c.id === charId);
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) throw new Error('missing chat');
-  if (!(settings.chatApiUrl || settings.apiUrl) || !(settings.chatApiKey || settings.apiKey) || !settings.chatModel) throw new Error('missing api config');
+  if (!(settings.chatApiUrl || settings.apiUrl) || !(settings.chatApiKey || settings.apiKey) || !(settings.chatModel || settings.model)) throw new Error('missing api config');
   const proactiveNow = new Date();
   const memoryPack = await buildMemoryPack(charId, char, settings);
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
