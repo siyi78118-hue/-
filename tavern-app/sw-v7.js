@@ -1,5 +1,5 @@
-const CACHE_NAME = 'rpchat-v6';
-const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v6.js'];
+const CACHE_NAME = 'rpchat-v7';
+const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v7.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 

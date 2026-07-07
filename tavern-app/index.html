@@ -905,6 +905,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
+const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 function migrateSettings(raw) {
   const next = { ...DEFAULT_SETTINGS, ...(raw || {}) };
   if (!next.chatApiType) next.chatApiType = raw?.apiType || 'openai';
@@ -2005,19 +2006,27 @@ async function replyToMoment(momentId) {
   if (!comment) return;
   moment.comments = [...(moment.comments || []), { charId: 'player', name: playerName(), text: comment.slice(0, 80), time: Date.now() }];
   recordMomentMemoryEvent(char.id, `${playerName()}评论了${char.name}的朋友圈：“${momentSnippet(comment, 70)}”`, Date.now());
+  recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`, Date.now());
   saveMoments();
   processMemoryAfterScenario(char.id);
-  if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) return;
+  if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
+    toast('已记录评论；配置聊天接口后角色才能判断是否回复', 2200);
+    return;
+  }
   toast('正在等待回复...', 1200);
   try {
     const reply = await callMomentReplyAI(char, moment, comment);
-    const clean = momentSnippet(reply, 80) || '看到了。';
+    const clean = momentSnippet(reply, 80);
     if (clean && !isEmptyReplyText(clean)) {
       moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: clean, time: Date.now() }];
       recordMomentMemoryEvent(char.id, `${char.name}回复了${playerName()}的朋友圈评论：“${momentSnippet(clean, 70)}”`, Date.now());
       saveMoments();
       processMemoryAfterScenario(char.id);
       toast(`${char.name}回复了你的评论`, 1600);
+    } else {
+      saveMoments();
+      processMemoryAfterScenario(char.id);
+      toast(`${char.name}看到了你的评论`, 1600);
     }
   } catch (err) {
     toast('回复失败：' + friendlyErrorMessage(err), 2600);
@@ -2332,7 +2341,7 @@ function buildMomentReplyPayload(char, moment, playerComment, memoryPack = '') {
   const system = `${buildSceneSystemBase(char, '朋友圈评论回复')}
 ${memoryPack ? `\n${memoryPack}\n` : ''}
 
-当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态。
+当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态，${char.name}已经看到了这条评论。
 ${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
 只允许输出 JSON，不要输出解释：{"comment":"回复评论正文或空字符串"}
@@ -2340,7 +2349,8 @@ ${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
 1. comment 只能是评论区回复正文，禁止动作、神态、心理、旁白、系统说明。
 2. 不要输出 like/timeline/text 等字段，不要让角色重新发一条朋友圈。
 3. 回复默认 4-35 个中文字符，像真实朋友圈评论区互动。
-4. 只要${playerName()}的评论不是纯乱码或明显误触，就必须给一句评论区回复；不要返回空字符串。`;
+4. 可以根据性格、关系、评论内容和当下情绪决定不回复；不回复时 comment 返回空字符串。
+5. 不要用“看到了”“嗯”“已阅”凑回复。只有真的有话要接、调侃、解释、追问或回应情绪时才写 comment。`;
   const user = `朋友圈作者：${char.name}
 朋友圈正文：${moment.text}
 已有评论：
@@ -2669,7 +2679,8 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     if (isEmptyReplyText(replyText)) throw new Error('接口返回空内容，没有生成回复');
     appendAssistantMessages(chat, replyText);
     updatePaymentStatusFromReply(chat, options.paymentMessageId, replyText, requestCharId);
-    scheduleCloudProactive(requestCharId).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+    scheduleCloudProactive(requestCharId, 'chat').catch(err => console.warn('[AL Timer] chat schedule skipped:', err.message));
+    scheduleCloudProactive(requestCharId, 'moment').catch(err => console.warn('[AL Timer] moment schedule skipped:', err.message));
     return replyText;
   } catch (err) {
     clearStreamingDraft(requestCharId);
@@ -2720,7 +2731,7 @@ async function submitPayMessage() {
   const note = (noteInput?.value || '').trim();
   const chat = allChats[currentCharId];
   if (!chat) return;
-  cancelCloudProactive(currentCharId);
+  cancelCloudProactive(currentCharId, 'all');
   saveWalletBalance(walletBalance() - amount);
   closeComposerPanels();
   const content = kind === 'redpacket'
@@ -3017,7 +3028,7 @@ async function sendMessage() {
   input.style.height = 'auto';
   document.getElementById('btn-send').className = 'send inactive';
   const chat = allChats[requestCharId];
-  cancelCloudProactive(requestCharId);
+  cancelCloudProactive(requestCharId, 'all');
   chat.messages.push({ role: 'user', content: text, time: Date.now() });
   DB.set('chats', allChats);
   await continueAssistantTurn(requestCharId, text);
@@ -3094,27 +3105,52 @@ async function enableCloudTimer() {
     toast('云闹钟绑定失败：' + friendlyErrorMessage(err), 3600);
   }
 }
-function hasFutureCloudJob(chat) {
-  const dueAt = Date.parse(chat?.pendingProactiveJob?.dueAt || '');
+function proactiveJobKey(kind = 'chat') {
+  return kind === 'moment' ? 'pendingMomentJob' : 'pendingProactiveJob';
+}
+function proactiveSyncKey(kind = 'chat') {
+  return kind === 'moment' ? 'cloudMomentScheduleSyncedAt' : 'cloudScheduleSyncedAt';
+}
+function proactiveJobPrefix(kind = 'chat') {
+  return kind === 'moment' ? 'mom' : 'pro';
+}
+function proactiveDelayMs(kind = 'chat') {
+  const idleMs = Math.max(1, Number(settings.proactiveIdleMinutes) || 30) * 60000;
+  return kind === 'moment' ? Math.max(2 * 60000, idleMs * 2) : idleMs;
+}
+function proactiveJobId(charId, kind = 'chat') {
+  return `${proactiveJobPrefix(kind)}_${settings.deviceId}_${charId}`;
+}
+function hasFutureCloudJob(chat, kind = 'chat') {
+  const dueAt = Date.parse(chat?.[proactiveJobKey(kind)]?.dueAt || '');
   return Number.isFinite(dueAt) && dueAt > Date.now();
 }
 async function ensureCloudProactiveScheduled(options = {}) {
+  if (options.kind) return ensureCloudProactiveKindScheduled(options.kind, options);
+  let scheduled = false;
+  for (const kind of PROACTIVE_JOB_KINDS) {
+    const ok = await ensureCloudProactiveKindScheduled(kind, options);
+    scheduled = ok || scheduled;
+  }
+  return scheduled;
+}
+async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
   const { force = false, resync = false } = options;
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   const rows = getLatestChatRows();
   if (!rows.length) return false;
   let target = '';
-  if (!force) target = rows.find(({ chat }) => !hasFutureCloudJob(chat))?.char?.id || '';
+  if (!force) target = rows.find(({ chat }) => !hasFutureCloudJob(chat, kind))?.char?.id || '';
   if (!target) target = (currentCharId && allChats[currentCharId]?.messages?.length ? currentCharId : rows[0].char.id);
   const chat = allChats[target];
-  if (!force && hasFutureCloudJob(chat)) {
-    const lastSync = Number(chat.cloudScheduleSyncedAt || 0);
+  if (!force && hasFutureCloudJob(chat, kind)) {
+    const lastSync = Number(chat[proactiveSyncKey(kind)] || 0);
     if (resync && (!lastSync || Date.now() - lastSync > CLOUD_TIMER_RESYNC_MS)) {
-      return resubmitCloudProactive(target);
+      return resubmitCloudProactive(target, kind);
     }
     return false;
   }
-  return scheduleCloudProactive(target);
+  return scheduleCloudProactive(target, kind);
 }
 async function repairCloudTimerScheduleOnce() {
   if (!settings.cloudTimerEnabled || !settings.pushSubscription || settings.cloudTimerBucketFixV2) return;
@@ -3125,50 +3161,54 @@ async function repairCloudTimerScheduleOnce() {
   if (proactiveSelect) proactiveSelect.value = 'on';
   await ensureCloudProactiveScheduled({ force: true });
 }
-async function scheduleCloudProactive(charId) {
+async function scheduleCloudProactive(charId, kind = 'chat') {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   const chat = allChats[charId];
   if (!chat?.messages?.length) return false;
   ensureDeviceId();
-  const previousJob = chat.pendingProactiveJob ? { ...chat.pendingProactiveJob } : null;
-  const previousSync = chat.cloudScheduleSyncedAt || 0;
-  const dueAtMs = Date.now() + Math.max(1, Number(settings.proactiveIdleMinutes) || 30) * 60000;
-  const jobId = `pro_${settings.deviceId}_${charId}`;
-  chat.pendingProactiveJob = { jobId, dueAt: new Date(dueAtMs).toISOString() };
+  const jobKey = proactiveJobKey(kind);
+  const syncKey = proactiveSyncKey(kind);
+  const previousJob = chat[jobKey] ? { ...chat[jobKey] } : null;
+  const previousSync = chat[syncKey] || 0;
+  const dueAtMs = Date.now() + proactiveDelayMs(kind);
+  const jobId = proactiveJobId(charId, kind);
+  chat[jobKey] = { jobId, dueAt: new Date(dueAtMs).toISOString(), kind };
   DB.set('chats', allChats);
   await mirrorAppStateNow();
   try {
-    await postCloudSchedule(charId, chat.pendingProactiveJob);
-    chat.cloudScheduleSyncedAt = Date.now();
+    await postCloudSchedule(charId, chat[jobKey], kind);
+    chat[syncKey] = Date.now();
     DB.set('chats', allChats);
     await mirrorAppStateNow();
   } catch (err) {
-    if (previousJob) chat.pendingProactiveJob = previousJob;
-    else delete chat.pendingProactiveJob;
-    chat.cloudScheduleSyncedAt = previousSync;
+    if (previousJob) chat[jobKey] = previousJob;
+    else delete chat[jobKey];
+    chat[syncKey] = previousSync;
     DB.set('chats', allChats);
     await mirrorAppStateNow();
     throw err;
   }
   return true;
 }
-async function resubmitCloudProactive(charId) {
+async function resubmitCloudProactive(charId, kind = 'chat') {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   const chat = allChats[charId];
-  if (!chat?.messages?.length || !hasFutureCloudJob(chat)) return false;
+  const jobKey = proactiveJobKey(kind);
+  if (!chat?.messages?.length || !hasFutureCloudJob(chat, kind)) return false;
   ensureDeviceId();
-  if (!chat.pendingProactiveJob.jobId) chat.pendingProactiveJob.jobId = `pro_${settings.deviceId}_${charId}`;
-  await postCloudSchedule(charId, chat.pendingProactiveJob);
-  chat.cloudScheduleSyncedAt = Date.now();
+  if (!chat[jobKey].jobId) chat[jobKey].jobId = proactiveJobId(charId, kind);
+  chat[jobKey].kind = kind;
+  await postCloudSchedule(charId, chat[jobKey], kind);
+  chat[proactiveSyncKey(kind)] = Date.now();
   DB.set('chats', allChats);
   await mirrorAppStateNow();
   return true;
 }
-async function postCloudSchedule(charId, job) {
+async function postCloudSchedule(charId, job, kind = 'chat') {
   const resp = await fetchWithTimeout(timerUrl('/schedule'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId, charId, dueAt: job.dueAt, type: 'proactive' })
+    body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId, charId, dueAt: job.dueAt, type: 'proactive', kind })
   }, API_TIMEOUT_MS);
   if (!resp.ok) throw new Error('云闹钟安排失败：' + resp.status);
 }
@@ -3183,12 +3223,12 @@ async function testCloudTimerPush() {
   const chat = allChats[charId];
   if (!chat?.messages?.length) { toast('当前会话还没有聊天记录'); return; }
   const jobId = `test_${settings.deviceId}_${charId}_${Date.now()}`;
-  chat.pendingProactiveJob = { jobId, dueAt: new Date(Date.now() - 1000).toISOString(), test: true };
+  chat.pendingProactiveJob = { jobId, dueAt: new Date(Date.now() - 1000).toISOString(), kind: 'chat', test: true };
   DB.set('chats', allChats);
   await mirrorAppStateNow();
   toast('正在触发云闹钟推送...', 1800);
   try {
-    const body = { deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive' };
+    const body = { deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive', kind: 'chat' };
     const scheduleResp = await fetchWithTimeout(timerUrl('/schedule'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3206,11 +3246,16 @@ async function testCloudTimerPush() {
     toast('云闹钟测试失败：' + friendlyErrorMessage(err), 3600);
   }
 }
-async function cancelCloudProactive(charId) {
+async function cancelCloudProactive(charId, kind = 'chat') {
+  if (kind === 'all') {
+    await Promise.all(PROACTIVE_JOB_KINDS.map(k => cancelCloudProactive(charId, k)));
+    return;
+  }
   const chat = allChats[charId];
-  const jobId = chat?.pendingProactiveJob?.jobId || (settings.deviceId ? `pro_${settings.deviceId}_${charId}` : '');
-  if (chat?.pendingProactiveJob) {
-    delete chat.pendingProactiveJob;
+  const jobKey = proactiveJobKey(kind);
+  const jobId = chat?.[jobKey]?.jobId || (settings.deviceId ? proactiveJobId(charId, kind) : '');
+  if (chat?.[jobKey]) {
+    delete chat[jobKey];
     DB.set('chats', allChats);
   }
   if (!settings.cloudTimerEnabled || !settings.timerEndpoint || !jobId) return;
@@ -3225,20 +3270,32 @@ async function cancelCloudProactive(charId) {
   }
 }
 function findProactiveTarget() {
-  const idleMs = Math.max(1, Number(settings.proactiveIdleMinutes) || 30) * 60000;
+  const idleMs = proactiveDelayMs('chat');
   const now = Date.now();
   return getLatestChatRows().find(({ chat, last }) => {
     const lastAt = last.time || 0;
-    const lastProactiveAt = chat.lastProactiveAt || 0;
+    const lastProactiveAt = chat.lastProactiveChatAt || 0;
     if (!lastAt || now - lastAt < idleMs) return false;
     if (lastProactiveAt && now - lastProactiveAt < idleMs) return false;
     return !String(last.content || '').startsWith('（');
   });
 }
-function findDueCloudProactiveTarget() {
+function findProactiveMomentTarget() {
+  const idleMs = proactiveDelayMs('moment');
   const now = Date.now();
+  return getLatestChatRows().find(({ chat, last }) => {
+    const lastAt = last.time || 0;
+    const lastProactiveAt = chat.lastProactiveMomentAt || 0;
+    if (!lastAt || now - lastAt < idleMs) return false;
+    if (lastProactiveAt && now - lastProactiveAt < idleMs) return false;
+    return !String(last.content || '').startsWith('（');
+  });
+}
+function findDueCloudProactiveTarget(kind = 'chat') {
+  const now = Date.now();
+  const jobKey = proactiveJobKey(kind);
   return getLatestChatRows().find(({ chat }) => {
-    const dueAt = chat?.pendingProactiveJob?.dueAt;
+    const dueAt = chat?.[jobKey]?.dueAt;
     return dueAt && Date.parse(dueAt) <= now;
   });
 }
@@ -3264,10 +3321,12 @@ async function triggerProactiveMessage(charId, manual = false) {
     clearStreamingDraft(charId);
     const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
     chat.lastProactiveAt = Date.now();
+    chat.lastProactiveChatAt = Date.now();
     delete chat.pendingProactiveJob;
     if (isEmptyReplyText(replyText)) {
       DB.set('chats', allChats);
       if (manual) toast('主动消息没有生成内容，已跳过写入', 2600);
+      scheduleCloudProactive(charId, 'chat').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
       return false;
     }
     appendAssistantMessages(chat, replyText, { proactive: true });
@@ -3277,15 +3336,17 @@ async function triggerProactiveMessage(charId, manual = false) {
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成主动消息\n已写入当前会话', 2400);
-    scheduleCloudProactive(charId).catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+    scheduleCloudProactive(charId, 'chat').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] proactive update skipped:', err.message));
     return true;
   } catch (err) {
     clearStreamingDraft(charId);
     if (chat) {
       chat.lastProactiveAt = Date.now();
+      chat.lastProactiveChatAt = Date.now();
       delete chat.pendingProactiveJob;
       DB.set('chats', allChats);
+      scheduleCloudProactive(charId, 'chat').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
     }
     if (manual) toast('主动消息失败：' + friendlyErrorMessage(err), 3200);
     console.warn('[AL Proactive] skipped:', err.message);
@@ -3310,23 +3371,27 @@ async function triggerProactiveMoment(charId, manual = false) {
   try {
     const text = momentSnippet(await callMomentPostAI(char, chat), 160);
     chat.lastProactiveAt = Date.now();
+    chat.lastProactiveMomentAt = Date.now();
     chat.lastProactiveType = 'moment';
-    delete chat.pendingProactiveJob;
+    delete chat.pendingMomentJob;
     if (isEmptyReplyText(text)) {
       DB.set('chats', allChats);
       if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
+      scheduleCloudProactive(charId, 'moment').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
       return false;
     }
     createCharacterMoment(char.id, text, { proactive: true });
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
-    scheduleCloudProactive(charId).catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+    scheduleCloudProactive(charId, 'moment').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
     return true;
   } catch (err) {
     if (chat) {
       chat.lastProactiveAt = Date.now();
-      delete chat.pendingProactiveJob;
+      chat.lastProactiveMomentAt = Date.now();
+      delete chat.pendingMomentJob;
       DB.set('chats', allChats);
+      scheduleCloudProactive(charId, 'moment').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
     }
     if (manual) toast('主动动态失败：' + friendlyErrorMessage(err), 3200);
     console.warn('[AL Moments] proactive moment skipped:', err.message);
@@ -3341,17 +3406,29 @@ async function triggerProactiveTarget(target, manual = false) {
 }
 async function checkProactiveMessages() {
   if (!settings.proactiveEnabled || settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
-  const target = findProactiveTarget();
-  if (target) await triggerProactiveTarget(target, false);
+  const chatTarget = findProactiveTarget();
+  if (chatTarget) await triggerProactiveMessage(chatTarget.char.id, false);
+  if (proactiveBusy || isStreaming) return;
+  const momentTarget = findProactiveMomentTarget();
+  if (momentTarget) await triggerProactiveMoment(momentTarget.char.id, false);
 }
 async function catchUpDueCloudProactive() {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
-  const target = findDueCloudProactiveTarget();
-  if (!target) return;
-  delete target.chat.pendingProactiveJob;
-  DB.set('chats', allChats);
-  await mirrorAppStateNow();
-  await triggerProactiveTarget(target, false);
+  const chatTarget = findDueCloudProactiveTarget('chat');
+  if (chatTarget) {
+    delete chatTarget.chat.pendingProactiveJob;
+    DB.set('chats', allChats);
+    await mirrorAppStateNow();
+    await triggerProactiveMessage(chatTarget.char.id, false);
+  }
+  if (proactiveBusy || isStreaming) return;
+  const momentTarget = findDueCloudProactiveTarget('moment');
+  if (momentTarget) {
+    delete momentTarget.chat.pendingMomentJob;
+    DB.set('chats', allChats);
+    await mirrorAppStateNow();
+    await triggerProactiveMoment(momentTarget.char.id, false);
+  }
 }
 function startProactiveLoop() {
   if (proactiveTimer) {
@@ -3819,7 +3896,7 @@ async function bootApp() {
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw-v6.js').catch(() => {});
+    navigator.serviceWorker.register('sw-v7.js').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
     });
