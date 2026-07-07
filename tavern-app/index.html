@@ -1775,6 +1775,28 @@ function renderMomentItem(moment) {
     </div>
   </div>`;
 }
+function materializeVirtualMoment(momentId) {
+  if (!String(momentId || '').startsWith('virtual_')) return null;
+  const charId = String(momentId).replace(/^virtual_/, '');
+  const char = characters.find(c => c.id === charId);
+  if (!char) return null;
+  const existing = allMoments.find(m => m.virtualSourceId === momentId);
+  if (existing) return existing;
+  const now = Date.now();
+  const moment = {
+    id: `mom_${now}_${Math.random().toString(36).slice(2, 8)}`,
+    virtualSourceId: momentId,
+    authorType: 'char',
+    charId,
+    text: char.scenario || char.description || char.personality || char.firstMessage || '今天也在线。',
+    time: now,
+    likes: [],
+    comments: []
+  };
+  allMoments.unshift(moment);
+  saveMoments();
+  return moment;
+}
 function saveMoments() {
   DB.set('moments', allMoments);
   if (activeScreen === 'moments') renderMoments();
@@ -1970,7 +1992,7 @@ function applyAssistantMomentDirective(chat, charId, reply) {
   return directive.chatText || '朋友圈发了。';
 }
 async function replyToMoment(momentId) {
-  const moment = allMoments.find(m => m.id === momentId);
+  const moment = allMoments.find(m => m.id === momentId) || materializeVirtualMoment(momentId);
   if (!moment) return;
   if (moment.authorType === 'player') {
     notifyMomentToCharacters(moment.id, true);
@@ -1989,12 +2011,13 @@ async function replyToMoment(momentId) {
   toast('正在等待回复...', 1200);
   try {
     const reply = await callMomentReplyAI(char, moment, comment);
-    const clean = momentSnippet(reply, 80);
+    const clean = momentSnippet(reply, 80) || '看到了。';
     if (clean && !isEmptyReplyText(clean)) {
       moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: clean, time: Date.now() }];
       recordMomentMemoryEvent(char.id, `${char.name}回复了${playerName()}的朋友圈评论：“${momentSnippet(clean, 70)}”`, Date.now());
       saveMoments();
       processMemoryAfterScenario(char.id);
+      toast(`${char.name}回复了你的评论`, 1600);
     }
   } catch (err) {
     toast('回复失败：' + friendlyErrorMessage(err), 2600);
@@ -2317,7 +2340,7 @@ ${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
 1. comment 只能是评论区回复正文，禁止动作、神态、心理、旁白、系统说明。
 2. 不要输出 like/timeline/text 等字段，不要让角色重新发一条朋友圈。
 3. 回复默认 4-35 个中文字符，像真实朋友圈评论区互动。
-4. 可以不回复，comment 为空字符串。`;
+4. 只要${playerName()}的评论不是纯乱码或明显误触，就必须给一句评论区回复；不要返回空字符串。`;
   const user = `朋友圈作者：${char.name}
 朋友圈正文：${moment.text}
 已有评论：
@@ -3314,11 +3337,6 @@ async function triggerProactiveMoment(charId, manual = false) {
 }
 async function triggerProactiveTarget(target, manual = false) {
   if (!target?.char?.id) return false;
-  const preferMoment = target.chat?.lastProactiveType === 'chat';
-  if (preferMoment) {
-    const ok = await triggerProactiveMoment(target.char.id, manual);
-    if (ok) return true;
-  }
   return triggerProactiveMessage(target.char.id, manual);
 }
 async function checkProactiveMessages() {
@@ -3801,7 +3819,7 @@ async function bootApp() {
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw-v5.js').catch(() => {});
+    navigator.serviceWorker.register('sw-v6.js').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
     });
