@@ -451,7 +451,16 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat') {
   return true;
 }
 
-async function recoverProactivePushFailure(payload = {}) {
+function shortErrorMessage(err) {
+  const raw = String(err?.message || err || '未知错误');
+  if (/timeout|timed out|超时|连接超时/i.test(raw)) return '接口响应超时';
+  if (/401|403|Unauthorized|Forbidden/i.test(raw)) return '接口鉴权失败';
+  if (/429|rate limit/i.test(raw)) return '请求过于频繁';
+  if (/Failed to fetch|NetworkError|Load failed|ERR_FAILED/i.test(raw)) return '接口连接失败';
+  return raw.slice(0, 80);
+}
+
+async function recoverProactivePushFailure(payload = {}, reason = null) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) return false;
   const allChats = state.allChats;
@@ -464,7 +473,7 @@ async function recoverProactivePushFailure(payload = {}) {
   if (!charId || !chat) return false;
   try {
     await scheduleNextCloudProactive(state, charId, kind);
-    setStateCloudTimerStatus(state, `后台${kind === 'moment' ? '朋友圈' : '私聊'}生成失败，已安排下次重试。`);
+    setStateCloudTimerStatus(state, `后台${kind === 'moment' ? '朋友圈' : '私聊'}生成失败：${shortErrorMessage(reason)}，已安排下次重试。`);
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
@@ -487,6 +496,10 @@ async function handleProactivePush(payload) {
   const charId = dueJob?.charId || '';
   const kind = dueJob?.kind || 'chat';
   if (!charId) return;
+  if (await hasVisibleClient()) {
+    await notifyClients({ type: 'al-run-proactive', charId, kind, jobId: payload.jobId || dueJob.job?.jobId || '' });
+    return;
+  }
   if (kind === 'moment') return handleProactiveMomentPush(state, charId, payload);
   const char = (characters || []).find(c => c.id === charId);
   const chat = allChats[charId];
@@ -679,7 +692,7 @@ self.addEventListener('push', event => {
       if (wakeShown) await closeProactiveWakeNotification();
     } catch (err) {
       if (wakeShown) await closeProactiveWakeNotification();
-      const retryScheduled = await recoverProactivePushFailure(payload).catch(() => false);
+      const retryScheduled = await recoverProactivePushFailure(payload, err).catch(() => false);
       await self.registration.showNotification('AL', {
         body: retryScheduled ? '主动消息生成失败，已安排下次重试。' : '主动消息生成失败，打开 AL 后会继续尝试。',
         tag: 'al-proactive-error',
