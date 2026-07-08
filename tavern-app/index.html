@@ -3518,7 +3518,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     const reply = manual
       ? await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext })
       : await retryTransient(
-          () => callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext }),
+          () => callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext }),
           {
             retries: 2,
             delayMs: 3500,
@@ -3739,6 +3739,7 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   const callOptions = { live: options.live !== false, charId };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
 }
+
 async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -4246,7 +4247,7 @@ async function bootApp() {
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw-v11.js?alarm-due-only=1').catch(() => {});
+    navigator.serviceWorker.register('sw-v11.js?alarm-stream=1').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
       if (event.data?.type === 'al-run-proactive') handleForegroundProactiveRequest(event.data);

@@ -287,6 +287,40 @@ function parseJsonFallbackText(raw) {
   return '';
 }
 
+async function readStreamText(resp) {
+  if (!resp.body?.getReader) {
+    return parseJsonFallbackText(await resp.text());
+  }
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let result = '';
+  let buffer = '';
+  let raw = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    const chunk = decoder.decode(value, { stream: true });
+    raw += chunk;
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
+      try {
+        const parsed = JSON.parse(t.slice(6));
+        const delta = textFromContent(parsed?.choices?.[0]?.delta?.content)
+          || textFromContent(parsed?.delta?.text)
+          || textFromContent(parsed?.content_block?.text)
+          || textFromContent(parsed?.delta?.partial_json);
+        if (delta) result += delta;
+      } catch {}
+    }
+  }
+  if (!result.trim()) result = parseJsonFallbackText(raw + buffer);
+  return result.trim();
+}
+
 async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -384,19 +418,21 @@ function buildMemoryPack(charId, char, settings = {}) {
   });
 }
 
-async function callModel(settings, system, messages) {
+async function callModel(settings, system, messages, options = {}) {
   lastModelResponseDiagnostic = '';
   const apiType = settings.chatApiType || settings.apiType || 'openai';
   const apiUrl = settings.chatApiUrl || settings.apiUrl || '';
   const apiKey = settings.chatApiKey || settings.apiKey || '';
   const model = settings.chatModel || settings.model || '';
+  const useStream = options.stream === true || (apiType !== 'claude' && options.stream !== false);
   if (apiType === 'claude') {
     const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: model || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: false })
+      body: JSON.stringify({ model: model || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: useStream })
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('API ' + resp.status);
+    if (useStream) return readStreamText(resp);
     const raw = await resp.text();
     try {
       const json = JSON.parse(raw);
@@ -412,9 +448,10 @@ async function callModel(settings, system, messages) {
   const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: model || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: false })
+    body: JSON.stringify({ model: model || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: useStream })
   }, API_TIMEOUT_MS);
   if (!resp.ok) throw new Error('API ' + resp.status);
+  if (useStream) return readStreamText(resp);
   const raw = await resp.text();
   try {
     const json = JSON.parse(raw);
@@ -573,7 +610,7 @@ async function handleProactivePush(payload) {
 默认 1-3 句。`;
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
-  const reply = (await callModel(settings, system, messages)).trim();
+  const reply = (await callModel(settings, system, messages, { stream: true })).trim();
   chat.lastProactiveAt = Date.now();
   chat.lastProactiveChatAt = Date.now();
   if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
