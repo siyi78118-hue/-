@@ -47,6 +47,20 @@ self.addEventListener('fetch', e => {
 function openMemoryDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(MEMORY_DB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      const ensure = (name, indexes = []) => {
+        if (!db.objectStoreNames.contains(name)) {
+          const store = db.createObjectStore(name, { keyPath: name === 'meta' ? 'key' : 'id' });
+          indexes.forEach(([idx, key]) => store.createIndex(idx, key, { unique: false }));
+        }
+      };
+      ensure('summaries', [['charId', 'charId'], ['createdAt', 'createdAt']]);
+      ensure('events', [['charId', 'charId'], ['status', 'status'], ['createdAt', 'createdAt']]);
+      ensure('profiles', [['charId', 'charId'], ['type', 'type'], ['createdAt', 'createdAt']]);
+      ensure('vectors', [['charId', 'charId'], ['sourceId', 'sourceId'], ['sourceType', 'sourceType']]);
+      ensure('meta');
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
@@ -54,6 +68,7 @@ function openMemoryDB() {
 
 async function getAll(storeName) {
   const db = await openMemoryDB();
+  if (!db.objectStoreNames.contains(storeName)) return [];
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readonly');
     const req = tx.objectStore(storeName).getAll();
