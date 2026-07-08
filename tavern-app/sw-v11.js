@@ -91,6 +91,13 @@ function compactLogText(text, max = 1200) {
   return value.length > max ? value.slice(0, max - 1) + '…' : value;
 }
 
+function cleanApiKey(value) {
+  return String(value || '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[\r\n\t]/g, '')
+    .trim();
+}
+
 async function recordModelCall(entry = {}) {
   try {
     const startedAt = Number(entry.startedAt) || Date.now();
@@ -149,6 +156,11 @@ function setStateCloudTimerTriggerAck(state, message) {
   if (!state?.settings) return;
   state.settings.cloudTimerLastTriggerAckStatus = message;
   state.settings.cloudTimerLastTriggerAckAt = Date.now();
+}
+
+function setMemoryQueryStatus(settings = {}, message) {
+  settings.lastMemoryQueryStatus = message;
+  settings.lastMemoryQueryAt = Date.now();
 }
 
 function pad2(n) {
@@ -642,13 +654,19 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
 
 async function generateBackgroundMemoryQuery(charId, char, settings = {}, triggerText = '', messages = []) {
   const fallback = { query: `${charName(char)} ${triggerText}`, keywords: memorySignalTerms(triggerText).slice(0, 8), focus: 'current', _memoryAiStatus: 'skipped' };
-  if (!hasBackgroundMemoryApi(settings)) return fallback;
+  if (!hasBackgroundMemoryApi(settings)) {
+    setMemoryQueryStatus(settings, '后台记忆AI筛选跳过：记忆接口未完整配置，已改用本地关键词检索。');
+    return fallback;
+  }
   const payload = buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings);
   try {
     const json = await callBackgroundMemoryJSON(settings, payload.system, payload.user, { scene: 'background-memory-query', charId });
+    const keywordText = (json.keywords || []).slice(0, 5).join('、') || json.query || '已生成检索词';
+    setMemoryQueryStatus(settings, `后台记忆AI已调用；关键词：${keywordText}`);
     return { ...fallback, ...json, _memoryAiStatus: 'ok' };
   } catch (err) {
     console.warn('[AL SW Memory] query fallback:', err.message);
+    setMemoryQueryStatus(settings, `后台记忆AI筛选失败：${err.message}；已改用本地关键词检索。`);
     return { ...fallback, _memoryAiStatus: 'failed' };
   }
 }

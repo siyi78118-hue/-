@@ -5,6 +5,9 @@ import vm from 'node:vm';
 const html = readFileSync('tavern-app/index.html', 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
 assert.ok(script, 'index.html should contain an inline app script');
+const swScript = readFileSync('tavern-app/sw-v11.js', 'utf8');
+assert.match(swScript, /function cleanApiKey\(value\)/);
+assert.match(swScript, /后台记忆AI已调用/);
 
 const storage = new Map();
 const elements = new Map();
