@@ -5,6 +5,7 @@ const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const API_TIMEOUT_MS = 120000;
 const CALL_LOG_LIMIT = 30;
 const VECTOR_DIM = 384;
+const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {
@@ -463,6 +464,10 @@ function charName(char) {
   return char?.name || '对方';
 }
 
+function formatMoney(value) {
+  return '¥' + (Math.round((Number(value) || 0) * 100) / 100).toFixed(2);
+}
+
 function memoryAliasText(text, char, settings = {}) {
   return String(text || '')
     .replace(/用户/g, playerName(settings))
@@ -629,6 +634,66 @@ async function searchMemoryVectors(charId, queryText, limit = 8) {
     .filter(row => row.score > 0.18 && !memoryTextIsNoise(row.text))
     .sort((a, b) => (b.score + (b.importance || 0) * 0.015) - (a.score + (a.importance || 0) * 0.015))
     .slice(0, limit);
+}
+
+async function recordBackgroundRedpacketExpirationMemory(state, charId, msg, now = Date.now()) {
+  if (!state?.settings || !msg || msg.expireMemoryRecorded) return;
+  const char = (state.characters || []).find(c => c.id === charId);
+  const amount = formatMoney(msg.amount);
+  const note = msg.note ? `，备注“${msg.note}”` : '';
+  const detail = `${playerName(state.settings)}发给${charName(char)}的红包 24 小时未领取，已自动退回零钱，金额 ${amount}${note}。`;
+  const id = `evt_redpacket_expired_${msg.id || msg.time || now}`;
+  const item = {
+    id,
+    charId,
+    happenedAt: formatFullTime(new Date(now)),
+    type: 'payment',
+    title: '红包自动退回',
+    detail,
+    status: 'done',
+    importance: 4,
+    keywords: ['红包', '退款', '24小时', '零钱'],
+    createdAt: now
+  };
+  await put('events', item);
+  await put('vectors', {
+    id: `vec_event_${id}`,
+    charId,
+    sourceType: 'event',
+    sourceId: id,
+    text: [item.happenedAt, item.title, item.detail, ...(item.keywords || [])].join('\n'),
+    keywords: item.keywords,
+    importance: item.importance,
+    embedding: localEmbedding([item.title, item.detail, ...(item.keywords || [])].join(' ')),
+    createdAt: now
+  });
+  msg.expireMemoryRecorded = true;
+}
+
+async function refreshBackgroundPaymentExpirations(state, charId) {
+  const chat = state?.allChats?.[charId];
+  if (!state?.settings || !chat?.messages?.length) return false;
+  let changed = false;
+  const now = Date.now();
+  for (const msg of chat.messages) {
+    if ((msg.payType || msg.type) !== 'redpacket') continue;
+    if ((msg.payStatus || 'pending') !== 'pending') continue;
+    const expiresAt = Number(msg.payExpiresAt) || ((Number(msg.time) || now) + REDPACKET_EXPIRE_MS);
+    if (!msg.payExpiresAt) {
+      msg.payExpiresAt = expiresAt;
+      changed = true;
+    }
+    if (now < expiresAt) continue;
+    msg.payStatus = 'expired';
+    msg.payStatusTime = now;
+    if (!msg.refunded) {
+      state.settings.walletBalance = Math.max(0, Math.round(((Number(state.settings.walletBalance) || 0) + (Number(msg.amount) || 0)) * 100) / 100);
+      msg.refunded = true;
+    }
+    await recordBackgroundRedpacketExpirationMemory(state, charId, msg, now);
+    changed = true;
+  }
+  return changed;
 }
 
 function buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings = {}) {
@@ -1010,6 +1075,11 @@ async function handleProactivePush(payload) {
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) throw new Error('missing chat');
   if (!(settings.chatApiUrl || settings.apiUrl) || !(settings.chatApiKey || settings.apiKey) || !(settings.chatModel || settings.model)) throw new Error('missing api config');
+  if (await refreshBackgroundPaymentExpirations(state, charId)) {
+    state.allChats = allChats;
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+  }
   const proactiveNow = new Date();
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
   const memoryQuery = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
@@ -1083,6 +1153,11 @@ async function handleProactiveMomentPush(state, charId, payload) {
   const char = (characters || []).find(c => c.id === charId);
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) return false;
+  if (await refreshBackgroundPaymentExpirations(state, charId)) {
+    state.allChats = allChats;
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+  }
   const proactiveNow = new Date();
   const momentContext = buildBackgroundMomentContext(allMoments, characters, charId, settings, 6);
   const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext(proactiveNow)}\n${charName(char)}准备主动发朋友圈。\n${momentContext}`;

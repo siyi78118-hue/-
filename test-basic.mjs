@@ -13,6 +13,9 @@ assert.match(swScript, /async function searchMemoryVectors\(charId, queryText/);
 assert.match(swScript, /本轮向量召回记忆/);
 assert.doesNotMatch(swScript, /重要事件和时间节点：\\n/);
 assert.doesNotMatch(swScript, /稳定资料和关系状态：\\n/);
+assert.match(swScript, /async function refreshBackgroundPaymentExpirations\(state, charId\)/);
+assert.match(swScript, /evt_redpacket_expired_/);
+assert.match(swScript, /vec_event_\$\{id\}/);
 assert.match(script, /红包 24 小时未领取，已自动退回零钱/);
 
 const storage = new Map();
