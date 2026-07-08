@@ -684,6 +684,7 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
+          <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
         </div>
         <div class="cell-group">
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
@@ -901,6 +902,8 @@ const DEFAULT_SETTINGS = {
   playerAvatar: '我',
   playerAvatarData: null,
   walletBalance: 0,
+  cloudTimerLastStatus: '',
+  cloudTimerLastStatusAt: 0,
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
@@ -3060,20 +3063,53 @@ function urlBase64ToUint8Array(value) {
 function timerUrl(path) {
   return settings.timerEndpoint.replace(/\/+$/, '') + path;
 }
+function cloudTimerStatusText() {
+  const rows = [];
+  if (!settings.proactiveEnabled) rows.push('主动消息未开启。');
+  else if (!settings.cloudTimerEnabled) rows.push('云闹钟未开启。');
+  else if (!settings.pushSubscription) rows.push('云闹钟未绑定本机推送。');
+  else rows.push('云闹钟已开启并绑定。');
+
+  const latest = getLatestChatRows()[0];
+  if (latest?.char?.name) rows.push(`当前目标：${latest.char.name}`);
+  const chatJob = latest?.chat?.pendingProactiveJob;
+  const momentJob = latest?.chat?.pendingMomentJob;
+  if (chatJob?.dueAt) rows.push(`私聊下次：${formatFullTime(new Date(chatJob.dueAt))}`);
+  if (momentJob?.dueAt) rows.push(`朋友圈下次：${formatFullTime(new Date(momentJob.dueAt))}`);
+  if (settings.cloudTimerLastStatus) {
+    const at = settings.cloudTimerLastStatusAt ? formatFullTime(new Date(settings.cloudTimerLastStatusAt)) : '';
+    rows.push(`${at ? at + '｜' : ''}${settings.cloudTimerLastStatus}`);
+  }
+  return rows.join('\n');
+}
+function renderCloudTimerStatus() {
+  const el = document.getElementById('cloud-timer-status');
+  if (el) el.textContent = cloudTimerStatusText();
+}
+function setCloudTimerStatus(message, persist = true) {
+  settings.cloudTimerLastStatus = message;
+  settings.cloudTimerLastStatusAt = Date.now();
+  if (persist) DB.set('settings', settings);
+  renderCloudTimerStatus();
+}
 async function enableCloudTimer() {
-  saveSettings();
+  saveSettings({ silent: true });
+  setCloudTimerStatus('正在绑定云闹钟...', false);
   try {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      setCloudTimerStatus('当前浏览器不支持 Web Push');
       toast('当前浏览器不支持 Web Push', 2400);
       return;
     }
     if (!settings.timerEndpoint || !settings.pushPublicKey) {
+      setCloudTimerStatus('请先填写闹钟地址和推送公钥');
       toast('请先填写闹钟地址和推送公钥', 2400);
       return;
     }
     toast('正在绑定云闹钟...', 1400);
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') {
+      setCloudTimerStatus('通知权限未允许，云闹钟不能后台提醒');
       toast('需要允许通知才能后台提醒', 2400);
       return;
     }
@@ -3099,9 +3135,14 @@ async function enableCloudTimer() {
       body: JSON.stringify({ deviceId: settings.deviceId, subscription: settings.pushSubscription })
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('云闹钟注册失败：' + resp.status);
+    setCloudTimerStatus('云闹钟已绑定，正在安排下一次主动消息。');
     toast('云闹钟已绑定\n之后空闲触发会由云端计时提醒', 3000);
-    ensureCloudProactiveScheduled({ force: true }).catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+    ensureCloudProactiveScheduled({ force: true }).catch(err => {
+      setCloudTimerStatus('云闹钟已绑定，但安排下一次失败：' + friendlyErrorMessage(err));
+      console.warn('[AL Timer] schedule skipped:', err.message);
+    });
   } catch (err) {
+    setCloudTimerStatus('云闹钟绑定失败：' + friendlyErrorMessage(err));
     toast('云闹钟绑定失败：' + friendlyErrorMessage(err), 3600);
   }
 }
@@ -3180,12 +3221,14 @@ async function scheduleCloudProactive(charId, kind = 'chat') {
     chat[syncKey] = Date.now();
     DB.set('chats', allChats);
     await mirrorAppStateNow();
+    setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已安排：${formatFullTime(new Date(chat[jobKey].dueAt))}`);
   } catch (err) {
     if (previousJob) chat[jobKey] = previousJob;
     else delete chat[jobKey];
     chat[syncKey] = previousSync;
     DB.set('chats', allChats);
     await mirrorAppStateNow();
+    setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟安排失败：` + friendlyErrorMessage(err));
     throw err;
   }
   return true;
@@ -3202,6 +3245,7 @@ async function resubmitCloudProactive(charId, kind = 'chat') {
   chat[proactiveSyncKey(kind)] = Date.now();
   DB.set('chats', allChats);
   await mirrorAppStateNow();
+  setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已重新同步：${formatFullTime(new Date(chat[jobKey].dueAt))}`);
   return true;
 }
 async function postCloudSchedule(charId, job, kind = 'chat') {
@@ -3213,15 +3257,25 @@ async function postCloudSchedule(charId, job, kind = 'chat') {
   if (!resp.ok) throw new Error('云闹钟安排失败：' + resp.status);
 }
 async function testCloudTimerPush() {
-  saveSettings();
+  saveSettings({ silent: true });
+  setCloudTimerStatus('正在测试云闹钟推送...', false);
   if (!settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) {
+    setCloudTimerStatus('测试失败：请先绑定本机云闹钟');
     toast('请先绑定本机云闹钟', 2400);
     return;
   }
   const charId = currentCharId || getLatestChatRows()[0]?.char?.id;
-  if (!charId) { toast('先打开一个有聊天记录的会话'); return; }
+  if (!charId) {
+    setCloudTimerStatus('测试失败：没有可触发的会话');
+    toast('先打开一个有聊天记录的会话');
+    return;
+  }
   const chat = allChats[charId];
-  if (!chat?.messages?.length) { toast('当前会话还没有聊天记录'); return; }
+  if (!chat?.messages?.length) {
+    setCloudTimerStatus('测试失败：当前会话还没有聊天记录');
+    toast('当前会话还没有聊天记录');
+    return;
+  }
   const jobId = `test_${settings.deviceId}_${charId}_${Date.now()}`;
   chat.pendingProactiveJob = { jobId, dueAt: new Date(Date.now() - 1000).toISOString(), kind: 'chat', test: true };
   DB.set('chats', allChats);
@@ -3241,8 +3295,10 @@ async function testCloudTimerPush() {
       body: JSON.stringify(body)
     }, API_TIMEOUT_MS);
     if (!triggerResp.ok) throw new Error('触发失败：' + triggerResp.status);
+    setCloudTimerStatus('测试推送已触发，等待浏览器通知或后台生成结果。');
     toast('云闹钟已触发，请留意通知', 2600);
   } catch (err) {
+    setCloudTimerStatus('云闹钟测试失败：' + friendlyErrorMessage(err));
     toast('云闹钟测试失败：' + friendlyErrorMessage(err), 3600);
   }
 }
@@ -3622,6 +3678,7 @@ function loadSettings() {
   onPresetChange(normalizePresetKey(settings.rpPreset), false);
   document.getElementById('set-system-prompt').value = settings.systemPrompt || '';
   settingsFormHydrating = false;
+  renderCloudTimerStatus();
 }
 function getModelSlot(slot = 'chat') {
   return slot === 'memory'
@@ -3711,6 +3768,7 @@ function saveSettings(options = {}) {
   settings = readSettingsForm();
   DB.set('settings', settings);
   startProactiveLoop();
+  renderCloudTimerStatus();
   if (!silent) ensureCloudProactiveScheduled().catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
   if (!silent) toast('已保存');
 }
@@ -3929,6 +3987,7 @@ async function syncFromServiceWorkerState() {
     if (activeScreen === 'contacts') renderContacts();
     if (activeScreen === 'discover' || activeScreen === 'moments') renderMoments();
     if (activeScreen === 'memory') renderMemoryScreen();
+    renderCloudTimerStatus();
   }
   catchUpDueCloudProactive().catch(err => console.warn('[AL Timer] catch-up skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
