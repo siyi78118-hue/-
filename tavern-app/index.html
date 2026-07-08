@@ -3162,6 +3162,10 @@ function cloudTimerStatusText() {
   if (momentLine) rows.push(momentLine);
   const ackLine = statusLine('测试推送确认', settings.cloudTimerLastTestAckStatus, settings.cloudTimerLastTestAckAt);
   if (ackLine) rows.push(ackLine);
+  const chatApiLine = statusLine('聊天接口检测', settings.lastChatApiHealthStatus, settings.lastChatApiHealthAt);
+  if (chatApiLine) rows.push(chatApiLine);
+  const memoryApiLine = statusLine('记忆接口检测', settings.lastMemoryApiHealthStatus, settings.lastMemoryApiHealthAt);
+  if (memoryApiLine) rows.push(memoryApiLine);
   return rows.join('\n');
 }
 function renderCloudTimerStatus() {
@@ -3186,6 +3190,18 @@ function setCloudTimerStatus(message, persist = true, kind = 'general') {
 function setCloudTimerTestAck(message) {
   settings.cloudTimerLastTestAckStatus = message;
   settings.cloudTimerLastTestAckAt = Date.now();
+  DB.set('settings', settings);
+  renderCloudTimerStatus();
+}
+function setApiHealthStatus(slot, message) {
+  const now = Date.now();
+  if (slot === 'memory') {
+    settings.lastMemoryApiHealthStatus = message;
+    settings.lastMemoryApiHealthAt = now;
+  } else {
+    settings.lastChatApiHealthStatus = message;
+    settings.lastChatApiHealthAt = now;
+  }
   DB.set('settings', settings);
   renderCloudTimerStatus();
 }
@@ -4006,17 +4022,28 @@ async function testConnection(slot = 'chat') {
   const apiUrl = settings[api.apiUrlKey] || '';
   const apiKey = assertHeaderSafe(cleanApiKey(settings[api.apiKeyKey] || ''), `${api.label} Key`);
   const model = settings[api.modelKey] || (apiType === 'claude' ? api.fallbackClaudeModel : api.fallbackOpenAIModel);
-  if (!apiUrl || !apiKey) { toast(`请填写${api.label}`); return; }
+  if (!apiUrl || !apiKey) {
+    setApiHealthStatus(slot, `未检测：请填写${api.label}`);
+    toast(`请填写${api.label}`);
+    return;
+  }
   toast(`正在测试${api.label}...`, 900);
   try {
     if (apiType === 'claude') {
       const r = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', { method:'POST', headers:{ 'Content-Type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01' }, body:JSON.stringify({ model, messages:[{ role:'user', content:'Hi' }], max_tokens:10 }) }, API_TIMEOUT_MS);
+      const message = r.ok ? '连接成功' : `连接失败：HTTP ${r.status}`;
+      setApiHealthStatus(slot, message);
       toast(r.ok ? `${api.label}连接成功` : `${api.label}连接失败：` + r.status);
     } else {
       const r = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${apiKey}` }, body:JSON.stringify({ model, messages:[{ role:'user', content:'Hi' }], max_tokens:10 }) }, API_TIMEOUT_MS);
+      const message = r.ok ? '连接成功' : `连接失败：HTTP ${r.status}`;
+      setApiHealthStatus(slot, message);
       toast(r.ok ? `${api.label}连接成功` : `${api.label}连接失败：` + r.status);
     }
-  } catch (e) { toast('连接失败：' + friendlyErrorMessage(e), 3200); }
+  } catch (e) {
+    setApiHealthStatus(slot, '连接失败：' + statusErrorMessage(e));
+    toast('连接失败：' + friendlyErrorMessage(e), 3200);
+  }
 }
 
 async function renderMemoryScreen() {
