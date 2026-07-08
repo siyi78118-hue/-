@@ -2718,7 +2718,16 @@ function paymentStatusTip(m, char) {
   if (status === 'refused') return type === 'redpacket' ? '' : `${name}已退还转账`;
   return '';
 }
-function refreshPaymentExpirations(chat) {
+function recordRedpacketExpirationMemoryEvent(charId, msg) {
+  if (!charId || !msg || msg.expireMemoryRecorded) return;
+  const char = characters.find(c => c.id === charId);
+  const amount = formatMoney(msg.amount);
+  const note = msg.note ? `，备注“${msg.note}”` : '';
+  recordScenarioMemoryEvent(charId, '支付事件', `${playerName()}发给${charName(char)}的红包 24 小时未领取，已自动退回零钱，金额 ${amount}${note}。`, Date.now());
+  msg.expireMemoryRecorded = true;
+  processMemoryAfterScenario(charId);
+}
+function refreshPaymentExpirations(chat, charId = currentCharId) {
   if (!chat?.messages?.length) return false;
   let changed = false;
   const now = Date.now();
@@ -2737,6 +2746,7 @@ function refreshPaymentExpirations(chat) {
       saveWalletBalance(walletBalance() + (Number(m.amount) || 0));
       m.refunded = true;
     }
+    recordRedpacketExpirationMemoryEvent(charId, m);
     changed = true;
   });
   return changed;
@@ -2789,7 +2799,7 @@ function renderMessages() {
   const char = characters.find(c => c.id === currentCharId);
   const wrap = document.getElementById('chat-messages');
   if (!chat || !char) return;
-  if (refreshPaymentExpirations(chat)) DB.set('chats', allChats);
+  if (refreshPaymentExpirations(chat, currentCharId)) DB.set('chats', allChats);
   let html = '';
   if (char.scenario) html += `<div class="scenario">${esc(char.scenario)}</div>`;
   const displayMessages = visibleChatMessages(chat);
@@ -2901,7 +2911,7 @@ function recordPaymentMemoryEvent(charId, msg, status) {
 }
 function updatePaymentStatusFromReply(chat, paymentMessageId, reply, charId = currentCharId) {
   if (!chat) return;
-  refreshPaymentExpirations(chat);
+  refreshPaymentExpirations(chat, charId);
   const msg = latestPendingPayment(chat, paymentMessageId);
   if (!msg || !['transfer', 'redpacket'].includes(msg.payType || msg.type)) return;
   if ((msg.payStatus || 'pending') !== 'pending') return;
