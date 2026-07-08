@@ -8,6 +8,9 @@ assert.ok(script, 'index.html should contain an inline app script');
 const swScript = readFileSync('tavern-app/sw-v11.js', 'utf8');
 assert.match(swScript, /function cleanApiKey\(value\)/);
 assert.match(swScript, /后台记忆AI已调用/);
+assert.match(swScript, /function localEmbedding\(text, dim = VECTOR_DIM\)/);
+assert.match(swScript, /async function searchMemoryVectors\(charId, queryText/);
+assert.match(swScript, /本轮向量召回记忆/);
 
 const storage = new Map();
 const elements = new Map();

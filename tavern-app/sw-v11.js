@@ -4,6 +4,7 @@ const MEMORY_DB_NAME = 'ALMemoryDB';
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const API_TIMEOUT_MS = 120000;
 const CALL_LOG_LIMIT = 30;
+const VECTOR_DIM = 384;
 let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {
@@ -508,6 +509,43 @@ function memoryTextIsNoise(text) {
   return /(测试|校对|表快|表慢|几点|现在时间|AI身份|身份争论|是不是AI|名字.*合理|戏太多|科幻片|装神弄鬼|普通寒暄|你好|在吗|又来)/.test(value)
     && !memoryTextHasSignal(value.replace(/测试|校对|几点|AI身份|身份争论/g, ''));
 }
+function normalizeVector(vec) {
+  const norm = Math.sqrt(vec.reduce((sum, n) => sum + n * n, 0)) || 1;
+  return vec.map(n => n / norm);
+}
+function hashText(value) {
+  let h = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+function localEmbedding(text, dim = VECTOR_DIM) {
+  const vec = new Array(dim).fill(0);
+  const raw = String(text || '').toLowerCase();
+  const tokens = raw.match(/[a-z0-9_]+|[\u4e00-\u9fa5]/g) || [];
+  const grams = [];
+  for (let i = 0; i < tokens.length; i += 1) {
+    grams.push(tokens[i]);
+    if (i < tokens.length - 1) grams.push(tokens[i] + tokens[i + 1]);
+    if (i < tokens.length - 2) grams.push(tokens[i] + tokens[i + 1] + tokens[i + 2]);
+  }
+  (grams.length ? grams : [raw]).forEach((token, i) => {
+    const h = hashText(token);
+    const idx = h % dim;
+    const sign = h & 1 ? 1 : -1;
+    vec[idx] += sign * (i < tokens.length ? 1 : 0.55);
+  });
+  return normalizeVector(vec);
+}
+function cosine(a, b) {
+  const len = Math.min(a?.length || 0, b?.length || 0);
+  if (!len) return 0;
+  let dot = 0;
+  for (let i = 0; i < len; i += 1) dot += a[i] * b[i];
+  return dot;
+}
 function memorySignalTerms(text = '', extraKeywords = []) {
   const value = String(text || '');
   const terms = new Set();
@@ -540,17 +578,17 @@ function searchKeywordMemoryRows(rows = {}, queryText = '', queryKeywords = [], 
   for (const e of rows.events || []) {
     const text = memoryAliasText([e.happenedAt, e.title, e.detail, ...(e.keywords || [])].filter(Boolean).join('｜'), char, settings);
     if (!shouldKeepEvent(e)) continue;
-    candidates.push({ text, importance: e.importance || 3, score: scoreKeywordMemoryText(text, terms, e.importance || 3) });
+    candidates.push({ sourceType: 'event', sourceId: e.id, text, importance: e.importance || 3, score: scoreKeywordMemoryText(text, terms, e.importance || 3) });
   }
   for (const p of rows.profiles || []) {
     const text = memoryAliasText([p.title, p.detail, ...(p.keywords || [])].filter(Boolean).join('｜'), char, settings);
     if (!shouldKeepProfile(p)) continue;
-    candidates.push({ text, importance: p.importance || 3, score: scoreKeywordMemoryText(text, terms, p.importance || 3) });
+    candidates.push({ sourceType: 'profile', sourceId: p.id, text, importance: p.importance || 3, score: scoreKeywordMemoryText(text, terms, p.importance || 3) });
   }
   for (const s of rows.summaries || []) {
     const text = memoryAliasText(s.content, char, settings);
     if (!shouldKeepSummary(text)) continue;
-    candidates.push({ text, importance: 2, score: scoreKeywordMemoryText(text, terms, 2) });
+    candidates.push({ sourceType: 'summary', sourceId: s.id, text, importance: 2, score: scoreKeywordMemoryText(text, terms, 2) });
   }
   return candidates
     .filter(item => item.score >= 1)
@@ -581,6 +619,16 @@ function shouldKeepSummary(summary) {
 
 function messageLine(m, char, settings = {}) {
   return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
+}
+
+async function searchMemoryVectors(charId, queryText, limit = 8) {
+  const queryVector = localEmbedding(queryText);
+  const rows = (await getAll('vectors')).filter(row => row.charId === charId);
+  return rows
+    .map(row => ({ ...row, score: cosine(queryVector, row.embedding) }))
+    .filter(row => row.score > 0.18 && !memoryTextIsNoise(row.text))
+    .sort((a, b) => (b.score + (b.importance || 0) * 0.015) - (a.score + (a.importance || 0) * 0.015))
+    .slice(0, limit);
 }
 
 function buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings = {}) {
@@ -677,18 +725,22 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '') {
   const query = await generateBackgroundMemoryQuery(charId, char, settings, queryText, recent);
   const recallText = [query.query, queryText, ...(query.keywords || [])].filter(Boolean).join(' ');
   return Promise.all([
+    searchMemoryVectors(charId, recallText),
     getAll('summaries'),
     getAll('events'),
     getAll('profiles')
-  ]).then(([summaries, events, profiles]) => {
+  ]).then(([hits, summaries, events, profiles]) => {
     const latestSummaries = summaries.filter(r => r.charId === charId && shouldKeepSummary(memoryAliasText(r.content, char, settings))).sort((a, b) => b.createdAt - a.createdAt).slice(0, 3).reverse();
     const importantEvents = events.filter(r => r.charId === charId && shouldKeepEvent(r)).sort((a, b) => (b.importance || 0) - (a.importance || 0) || b.createdAt - a.createdAt).slice(0, 8);
     const profileRows = profiles.filter(r => r.charId === charId && shouldKeepProfile(r)).sort((a, b) => (b.importance || 0) - (a.importance || 0) || b.createdAt - a.createdAt).slice(0, 8);
+    const vectorKeys = new Set(hits.map(hit => `${hit.sourceType}:${hit.sourceId}`));
     const parts = [];
     if (latestSummaries.length) parts.push('近期增量摘要：\n' + latestSummaries.map(s => `- ${memoryAliasText(s.content, char, settings)}`).join('\n'));
+    if (hits.length) parts.push('本轮向量召回记忆：\n' + hits.map(h => `- ${memoryAliasText(h.text, char, settings)}`).join('\n'));
     if (importantEvents.length) parts.push('重要事件和时间节点：\n' + importantEvents.map(e => `- ${memoryAliasText(e.happenedAt || '未注明', char, settings)}｜${memoryAliasText(e.title || '事件', char, settings)}：${memoryAliasText(e.detail, char, settings)}`).join('\n'));
     if (profileRows.length) parts.push('稳定资料和关系状态：\n' + profileRows.map(p => `- ${memoryAliasText(p.title || p.type || '资料', char, settings)}：${memoryAliasText(p.detail, char, settings)}`).join('\n'));
-    const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, recallText, query.keywords || [], char, settings, 5);
+    const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, recallText, query.keywords || [], char, settings, 5)
+      .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
     if (keywordRows.length) parts.push('当前触发原因命中的本地记忆：\n' + keywordRows.map(row => `- ${row.text}`).join('\n'));
     if (!parts.length) return '';
     return `以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。\n\n${parts.join('\n\n')}`;
