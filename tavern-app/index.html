@@ -908,6 +908,8 @@ const DEFAULT_SETTINGS = {
   cloudTimerLastChatStatusAt: 0,
   cloudTimerLastMomentStatus: '',
   cloudTimerLastMomentStatusAt: 0,
+  lastMemoryQueryStatus: '',
+  lastMemoryQueryAt: 0,
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
@@ -2985,14 +2987,23 @@ async function callMemoryJSON(system, user) {
 }
 async function generateMemoryQuery(char, userInput, messages) {
   const fallback = { query: `${char?.name || ''} ${userInput}`, keywords: [], focus: 'current' };
-  if (!settings.memoryModel || !settings.memoryApiUrl || !settings.memoryApiKey) return fallback;
+  const missing = [];
+  if (!settings.memoryApiUrl) missing.push('地址');
+  if (!settings.memoryApiKey) missing.push('Key');
+  if (!settings.memoryModel) missing.push('模型');
+  if (missing.length) {
+    setMemoryQueryStatus(`跳过记忆AI筛选：记忆接口${missing.join('、')}未配置，已改用本地关键词检索。`);
+    return { ...fallback, _memoryAiStatus: 'skipped' };
+  }
   const payload = buildMemoryQueryPayload(char, userInput, messages);
   try {
+    setMemoryQueryStatus('正在调用记忆AI筛选本轮相关记忆。');
     const json = await callMemoryJSON(payload.system, payload.user);
-    return { ...fallback, ...json };
+    return { ...fallback, ...json, _memoryAiStatus: 'ok' };
   } catch (err) {
     console.warn('[AL Memory] query fallback:', err.message);
-    return fallback;
+    setMemoryQueryStatus(`记忆AI筛选失败：${friendlyErrorMessage(err)}；已改用本地关键词检索。`);
+    return { ...fallback, _memoryAiStatus: 'failed' };
   }
 }
 async function searchMemoryVectors(charId, queryText, limit = 8) {
@@ -3029,6 +3040,10 @@ async function prepareMemoryPack(charId, userInput) {
   const query = await generateMemoryQuery(char, userInput, recent);
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
   const hits = await searchMemoryVectors(charId, queryText);
+  if (query._memoryAiStatus === 'ok') {
+    const keywordText = (query.keywords || []).slice(0, 5).join('、') || query.query || '已生成检索词';
+    setMemoryQueryStatus(`记忆AI已调用；关键词：${keywordText}；向量库召回 ${hits.length} 条。`);
+  }
   const summaries = (await MemoryDB.byChar('summaries', charId))
     .filter(s => shouldKeepSummary(memoryAliasText(s.content, char)))
     .sort((a, b) => b.createdAt - a.createdAt)
@@ -3187,6 +3202,8 @@ function cloudTimerStatusText() {
   if (chatApiLine) rows.push(chatApiLine);
   const memoryApiLine = statusLine('记忆接口检测', settings.lastMemoryApiHealthStatus, settings.lastMemoryApiHealthAt);
   if (memoryApiLine) rows.push(memoryApiLine);
+  const memoryQueryLine = statusLine('记忆筛选', settings.lastMemoryQueryStatus, settings.lastMemoryQueryAt);
+  if (memoryQueryLine) rows.push(memoryQueryLine);
   return rows.join('\n');
 }
 function renderCloudTimerStatus() {
@@ -3229,6 +3246,12 @@ function setApiHealthStatus(slot, message) {
     settings.lastChatApiHealthStatus = message;
     settings.lastChatApiHealthAt = now;
   }
+  DB.set('settings', settings);
+  renderCloudTimerStatus();
+}
+function setMemoryQueryStatus(message) {
+  settings.lastMemoryQueryStatus = message;
+  settings.lastMemoryQueryAt = Date.now();
   DB.set('settings', settings);
   renderCloudTimerStatus();
 }
