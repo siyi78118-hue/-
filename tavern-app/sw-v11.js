@@ -92,6 +92,12 @@ function setStateCloudTimerStatus(state, message, kind = 'general') {
   }
 }
 
+function setStateCloudTimerTriggerAck(state, message) {
+  if (!state?.settings) return;
+  state.settings.cloudTimerLastTriggerAckStatus = message;
+  state.settings.cloudTimerLastTriggerAckAt = Date.now();
+}
+
 function pad2(n) {
   return String(n).padStart(2, '0');
 }
@@ -513,6 +519,9 @@ async function handleProactivePush(payload) {
     await notifyClients({ type: 'al-run-proactive', charId, kind, jobId: payload.jobId || dueJob.job?.jobId || '', test: !!(payload.test || dueJob.job?.test) });
     return;
   }
+  setStateCloudTimerTriggerAck(state, `真实${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已被后台收到。`);
+  state.updatedAt = Date.now();
+  await setMeta('app_state', state);
   if (kind === 'moment') return handleProactiveMomentPush(state, charId, payload);
   const char = (characters || []).find(c => c.id === charId);
   const chat = allChats[charId];

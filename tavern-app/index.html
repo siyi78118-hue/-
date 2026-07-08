@@ -3162,6 +3162,8 @@ function cloudTimerStatusText() {
   if (momentLine) rows.push(momentLine);
   const ackLine = statusLine('测试推送确认', settings.cloudTimerLastTestAckStatus, settings.cloudTimerLastTestAckAt);
   if (ackLine) rows.push(ackLine);
+  const triggerAckLine = statusLine('闹钟触发确认', settings.cloudTimerLastTriggerAckStatus, settings.cloudTimerLastTriggerAckAt);
+  if (triggerAckLine) rows.push(triggerAckLine);
   const chatApiLine = statusLine('聊天接口检测', settings.lastChatApiHealthStatus, settings.lastChatApiHealthAt);
   if (chatApiLine) rows.push(chatApiLine);
   const memoryApiLine = statusLine('记忆接口检测', settings.lastMemoryApiHealthStatus, settings.lastMemoryApiHealthAt);
@@ -3190,6 +3192,12 @@ function setCloudTimerStatus(message, persist = true, kind = 'general') {
 function setCloudTimerTestAck(message) {
   settings.cloudTimerLastTestAckStatus = message;
   settings.cloudTimerLastTestAckAt = Date.now();
+  DB.set('settings', settings);
+  renderCloudTimerStatus();
+}
+function setCloudTimerTriggerAck(message) {
+  settings.cloudTimerLastTriggerAckStatus = message;
+  settings.cloudTimerLastTriggerAckAt = Date.now();
   DB.set('settings', settings);
   renderCloudTimerStatus();
 }
@@ -3659,11 +3667,13 @@ async function handleForegroundProactiveRequest(data = {}) {
     await restoreAppStateFromMirror();
     if (data.kind === 'moment') {
       if (data.test) setCloudTimerTestAck('本机已收到朋友圈测试推送，闹钟链路正常。');
+      setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}朋友圈闹钟已被前台收到。`);
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，朋友圈闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成朋友圈。', true, 'moment');
       if (data.charId) await triggerProactiveMoment(data.charId, false);
       else await catchUpDueCloudProactive();
     } else {
       if (data.test) setCloudTimerTestAck('本机已收到私聊测试推送，闹钟链路正常。');
+      setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}私聊闹钟已被前台收到。`);
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成私聊。', true, 'chat');
       if (data.charId) await triggerProactiveMessage(data.charId, false);
       else await catchUpDueCloudProactive();
