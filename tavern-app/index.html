@@ -951,7 +951,8 @@ let lastMainScreen = 'chats';
 let plusOpen = false;
 let activeScreen = 'chats';
 let proactiveTimer = null;
-let proactiveBusy = false;
+let proactiveChatBusy = false;
+let proactiveMomentBusy = false;
 let foregroundProactiveRequestBusy = false;
 let settingsSaveTimer = null;
 let settingsFormHydrating = false;
@@ -3401,7 +3402,7 @@ function findDueCloudProactiveTarget(kind = 'chat') {
   });
 }
 async function triggerProactiveMessage(charId, manual = false) {
-  if (proactiveBusy || isStreaming) return false;
+  if (proactiveChatBusy || isStreaming) return false;
   const char = characters.find(c => c.id === charId);
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) {
@@ -3412,7 +3413,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     if (manual) toast('请先配置聊天接口和聊天模型');
     return false;
   }
-  proactiveBusy = true;
+  proactiveChatBusy = true;
   try {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊已接到云闹钟，正在生成消息。', true, 'chat');
     const proactiveNow = new Date();
@@ -3458,11 +3459,11 @@ async function triggerProactiveMessage(charId, manual = false) {
     console.warn('[AL Proactive] skipped:', err.message);
     return false;
   } finally {
-    proactiveBusy = false;
+    proactiveChatBusy = false;
   }
 }
 async function triggerProactiveMoment(charId, manual = false) {
-  if (proactiveBusy || isStreaming) return false;
+  if (proactiveMomentBusy) return false;
   const char = characters.find(c => c.id === charId);
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) {
@@ -3473,7 +3474,7 @@ async function triggerProactiveMoment(charId, manual = false) {
     if (manual) toast('请先配置聊天接口和聊天模型');
     return false;
   }
-  proactiveBusy = true;
+  proactiveMomentBusy = true;
   try {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈已接到云闹钟，正在生成动态。', true, 'moment');
     const text = momentSnippet(await callMomentPostAI(char, chat), 160);
@@ -3507,7 +3508,7 @@ async function triggerProactiveMoment(charId, manual = false) {
     console.warn('[AL Moments] proactive moment skipped:', err.message);
     return false;
   } finally {
-    proactiveBusy = false;
+    proactiveMomentBusy = false;
   }
 }
 async function triggerProactiveTarget(target, manual = false) {
@@ -3515,35 +3516,41 @@ async function triggerProactiveTarget(target, manual = false) {
   return triggerProactiveMessage(target.char.id, manual);
 }
 async function checkProactiveMessages() {
-  if (!settings.proactiveEnabled || proactiveBusy || isStreaming) return;
+  if (!settings.proactiveEnabled) return;
   if (settings.cloudTimerEnabled) {
     await catchUpDueCloudProactive();
-    if (proactiveBusy || isStreaming) return;
     ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] foreground resync skipped:', err.message));
     return;
   }
-  const chatTarget = findProactiveTarget();
-  if (chatTarget) await triggerProactiveMessage(chatTarget.char.id, false);
-  if (proactiveBusy || isStreaming) return;
-  const momentTarget = findProactiveMomentTarget();
-  if (momentTarget) await triggerProactiveMoment(momentTarget.char.id, false);
+  const tasks = [];
+  if (!proactiveChatBusy && !isStreaming) {
+    const chatTarget = findProactiveTarget();
+    if (chatTarget) tasks.push(triggerProactiveMessage(chatTarget.char.id, false));
+  }
+  if (!proactiveMomentBusy) {
+    const momentTarget = findProactiveMomentTarget();
+    if (momentTarget) tasks.push(triggerProactiveMoment(momentTarget.char.id, false));
+  }
+  if (tasks.length) await Promise.allSettled(tasks);
 }
 async function catchUpDueCloudProactive() {
-  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
-  const chatTarget = findDueCloudProactiveTarget('chat');
+  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled) return;
+  const tasks = [];
+  const chatTarget = !proactiveChatBusy && !isStreaming ? findDueCloudProactiveTarget('chat') : null;
   if (chatTarget) {
     delete chatTarget.chat.pendingProactiveJob;
     DB.set('chats', allChats);
-    await mirrorAppStateNow();
-    await triggerProactiveMessage(chatTarget.char.id, false);
+    tasks.push(triggerProactiveMessage(chatTarget.char.id, false));
   }
-  if (proactiveBusy || isStreaming) return;
-  const momentTarget = findDueCloudProactiveTarget('moment');
+  const momentTarget = !proactiveMomentBusy ? findDueCloudProactiveTarget('moment') : null;
   if (momentTarget) {
     delete momentTarget.chat.pendingMomentJob;
     DB.set('chats', allChats);
+    tasks.push(triggerProactiveMoment(momentTarget.char.id, false));
+  }
+  if (tasks.length) {
     await mirrorAppStateNow();
-    await triggerProactiveMoment(momentTarget.char.id, false);
+    await Promise.allSettled(tasks);
   }
 }
 async function handleForegroundProactiveRequest(data = {}) {
