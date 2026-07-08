@@ -1270,6 +1270,30 @@ function friendlyErrorMessage(err) {
   if (/non ISO-8859-1|ByteString|headers/i.test(raw)) return 'Key 含有隐藏字符，请重新粘贴或手动输入';
   return raw;
 }
+function isTransientApiError(err) {
+  const raw = String(err?.message || err || '');
+  return /503|502|504|429|rate limit|Failed to fetch|NetworkError|Load failed|ERR_FAILED|timeout|timed out|超时|连接超时/i.test(raw);
+}
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+async function retryTransient(task, options = {}) {
+  const retries = Math.max(0, Number(options.retries) || 0);
+  const delayMs = Math.max(0, Number(options.delayMs) || 0);
+  const onRetry = typeof options.onRetry === 'function' ? options.onRetry : null;
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await task(attempt);
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= retries || !isTransientApiError(err)) throw err;
+      if (onRetry) onRetry(err, attempt + 1, retries);
+      if (delayMs) await sleep(delayMs);
+    }
+  }
+  throw lastErr;
+}
 function timeoutAfter(ms, message) {
   return new Promise((_, reject) => {
     setTimeout(() => reject(new Error(message)), ms);
@@ -1955,11 +1979,11 @@ ${char.name}需要判断是否点赞或评论，并且要记得双方此前关�
     return { like: false, comment: String(text || '').trim() };
   }
 }
-async function callMomentPostAI(char, chat) {
+async function callMomentPostAI(char, chat, options = {}) {
   const memoryQuery = `角色朋友圈动态触发。
 ${getTimeContext()}
 ${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
-  const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
+  const memoryPack = options.memoryPack != null ? options.memoryPack : await prepareMemoryPack(char.id, memoryQuery);
   const payload = buildMomentPostPayload(char, chat, memoryPack);
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, { live: false, charId: char.id })
@@ -2987,12 +3011,12 @@ async function prepareMemoryPack(charId, userInput) {
   if (!parts.length) return '';
   return `以下是后台本地记忆库提供给你的参考，只在与当前对话相关时使用。不要提到“记忆库/向量/摘要/系统提示”，不要照搬结构化文字，仍然只输出角色发来的聊天消息。\n\n${parts.join('\n\n')}`;
 }
-async function prepareProactiveMemoryPack(charId, query) {
+async function prepareProactiveMemoryPack(charId, query, kind = 'chat') {
   try {
     return await withTimeout(prepareMemoryPack(charId, query), PROACTIVE_MEMORY_TIMEOUT_MS, '主动消息记忆检索超时');
   } catch (err) {
     console.warn('[AL Memory] proactive memory skipped:', err.message);
-    if (settings.cloudTimerEnabled) setCloudTimerStatus('主动消息记忆检索较慢，先用最近聊天生成。', true, 'chat');
+    if (settings.cloudTimerEnabled) setCloudTimerStatus('主动消息记忆检索较慢，先用最近聊天生成。', true, kind);
     return '';
   }
 }
@@ -3421,7 +3445,16 @@ async function triggerProactiveMessage(charId, manual = false) {
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
     const memoryPack = manual ? await prepareMemoryPack(charId, query) : await prepareProactiveMemoryPack(charId, query);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊正在请求聊天模型。', true, 'chat');
-    const reply = await callAPI(chat, memoryPack, { charId, live: manual, proactive: true, proactiveNow, proactiveTimeContext });
+    const reply = manual
+      ? await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext })
+      : await retryTransient(
+          () => callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext }),
+          {
+            retries: 2,
+            delayMs: 3500,
+            onRetry: (err, attempt, total) => setCloudTimerStatus(`前台私聊请求失败，正在重试 ${attempt}/${total}：${friendlyErrorMessage(err)}`, true, 'chat')
+          }
+        );
     clearStreamingDraft(charId);
     const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
     chat.lastProactiveAt = Date.now();
@@ -3477,7 +3510,20 @@ async function triggerProactiveMoment(charId, manual = false) {
   proactiveMomentBusy = true;
   try {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈已接到云闹钟，正在生成动态。', true, 'moment');
-    const text = momentSnippet(await callMomentPostAI(char, chat), 160);
+    const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext()}\n${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
+    const memoryPack = manual ? await prepareMemoryPack(charId, memoryQuery) : await prepareProactiveMemoryPack(charId, memoryQuery, 'moment');
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈正在请求聊天模型。', true, 'moment');
+    const rawText = manual
+      ? await callMomentPostAI(char, chat, { memoryPack })
+      : await retryTransient(
+          () => callMomentPostAI(char, chat, { memoryPack }),
+          {
+            retries: 2,
+            delayMs: 3500,
+            onRetry: (err, attempt, total) => setCloudTimerStatus(`前台朋友圈请求失败，正在重试 ${attempt}/${total}：${friendlyErrorMessage(err)}`, true, 'moment')
+          }
+        );
+    const text = momentSnippet(rawText, 160);
     chat.lastProactiveAt = Date.now();
     chat.lastProactiveMomentAt = Date.now();
     chat.lastProactiveType = 'moment';
