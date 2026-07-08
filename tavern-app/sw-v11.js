@@ -510,7 +510,7 @@ async function handleProactivePush(payload) {
   const kind = dueJob?.kind || 'chat';
   if (!charId) return;
   if (await hasVisibleClient()) {
-    await notifyClients({ type: 'al-run-proactive', charId, kind, jobId: payload.jobId || dueJob.job?.jobId || '' });
+    await notifyClients({ type: 'al-run-proactive', charId, kind, jobId: payload.jobId || dueJob.job?.jobId || '', test: !!(payload.test || dueJob.job?.test) });
     return;
   }
   if (kind === 'moment') return handleProactiveMomentPush(state, charId, payload);

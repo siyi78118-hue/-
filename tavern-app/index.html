@@ -3371,7 +3371,7 @@ async function testCloudTimerPush() {
   await mirrorAppStateNow();
   toast('正在触发云闹钟推送...', 1800);
   try {
-    const body = { deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive', kind: 'chat' };
+    const body = { deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive', kind: 'chat', test: true };
     const scheduleResp = await fetchWithTimeout(timerUrl('/schedule'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3634,11 +3634,11 @@ async function handleForegroundProactiveRequest(data = {}) {
   try {
     await restoreAppStateFromMirror();
     if (data.kind === 'moment') {
-      setCloudTimerStatus('云闹钟已触发，正在由前台生成朋友圈。', true, 'moment');
+      setCloudTimerStatus(data.test ? '测试推送已被本机收到，朋友圈闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成朋友圈。', true, 'moment');
       if (data.charId) await triggerProactiveMoment(data.charId, false);
       else await catchUpDueCloudProactive();
     } else {
-      setCloudTimerStatus('云闹钟已触发，正在由前台生成私聊。', true, 'chat');
+      setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成私聊。', true, 'chat');
       if (data.charId) await triggerProactiveMessage(data.charId, false);
       else await catchUpDueCloudProactive();
     }
@@ -4158,7 +4158,7 @@ async function bootApp() {
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw-v11.js').catch(() => {});
+    navigator.serviceWorker.register('sw-v11.js?alarm-ack=1').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
       if (event.data?.type === 'al-run-proactive') handleForegroundProactiveRequest(event.data);

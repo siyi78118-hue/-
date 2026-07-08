@@ -53,6 +53,7 @@ export default {
           dueAt: body.dueAt,
           type: body.type || 'proactive',
           kind: body.kind || (String(body.jobId || '').startsWith('mom_') ? 'moment' : 'chat'),
+          test: !!body.test,
           updatedAt: Date.now()
         };
         await saveJob(job, env);
@@ -74,6 +75,7 @@ export default {
         job.charId = job.charId || body.charId || '';
         job.type = job.type || 'proactive';
         job.kind = job.kind || body.kind || (String(job.jobId || '').startsWith('mom_') ? 'moment' : 'chat');
+        job.test = !!(job.test || body.test);
         const delivered = await deliverJob(job, env);
         return json({ ok: delivered.ok, delivered });
       }
@@ -158,7 +160,7 @@ async function deliverJob(job, env) {
   if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId };
   const { subscription } = JSON.parse(subRaw);
   await sendEmptyPush(subscription, env);
-  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '' };
+  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test };
 }
 
 async function sendEmptyPush(subscription, env) {
