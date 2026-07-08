@@ -99,12 +99,14 @@ globalThis.__appTest = {
   buildMomentInteractionPayload,
   buildMomentPostPayload,
   buildMomentReplyPayload,
+  buildMemoryQueryPayload,
+  buildMemoryExtractPayload,
   memoryAliasText,
   shouldKeepEvent,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, memoryAliasText, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -179,6 +181,16 @@ assert.match(replyPayload.system, /朋友圈评论回复/);
 assert.match(replyPayload.system, /只允许输出 JSON，不要输出解释：\{"comment":"回复评论正文或空字符串"\}/);
 assert.match(replyPayload.system, /记忆：玩家怕冷。/);
 assert.match(replyPayload.messages[0].content, /玩家刚评论：终于能出门了/);
+const memoryQueryPayload = buildMemoryQueryPayload(v2, '你还记得红包吗？', [{ role: 'user', content: '我给你发过红包', time: Date.now() }]);
+assert.match(memoryQueryPayload.system, /本地记忆检索 AI/);
+assert.match(memoryQueryPayload.system, /生成向量数据库召回用的检索查询/);
+assert.match(memoryQueryPayload.system, /只输出 JSON，不要输出解释/);
+assert.match(memoryQueryPayload.user, /当前输入或触发原因：\n你还记得红包吗？/);
+const memoryExtractPayload = buildMemoryExtractPayload(v2, [{ role: 'user', content: '我以后不收你大额红包', time: Date.now() }], '旧摘要');
+assert.match(memoryExtractPayload.system, /本地记忆整理 AI/);
+assert.match(memoryExtractPayload.system, /禁止用“用户”“角色”代称/);
+assert.match(memoryExtractPayload.system, /红包仍待领取/);
+assert.match(memoryExtractPayload.user, /旧增量摘要：\n旧摘要/);
 assert.equal(cleanApiKey(' sk-test\u200b\n　'), 'sk-test');
 assert.match(getTimeContext(new Date('2026-07-04T09:05:03Z')), /当前设备时间/);
 assert.equal(getDayPeriod(new Date('2026-07-04T14:15:00')).label, '下午');

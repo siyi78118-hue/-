@@ -2472,10 +2472,16 @@ ${playerName()}刚评论：${playerComment}
 请以 ${char.name} 的性格决定是否回复这条评论。`;
   return { system, messages: [{ role: 'user', content: user }] };
 }
+function buildMemorySceneSystem(char, sceneLabel, sceneKey, taskRules) {
+  const composer = createPromptComposer(sceneKey);
+  composer.add('memory-role', `你是 AL 的本地记忆${sceneLabel} AI。
+你不参与角色扮演，不回复${playerName()}，不替${charName(char)}说话。`, { priority: 0 });
+  composer.add('memory-task-rules', taskRules, { priority: 20, scenes: [sceneKey] });
+  composer.add('memory-output-format', '只输出 JSON，不要输出解释。', { priority: 90 });
+  return composer.compile();
+}
 function buildMemoryQueryPayload(char, userInput, messages) {
-  const system = `你是 AL 的本地记忆检索助手。
-任务：只根据当前输入、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
-你不参与角色扮演，不回复${playerName()}，不替${charName(char)}说话。
+  const system = buildMemorySceneSystem(char, '检索', 'memory-query', `任务：只根据当前输入、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
 规则 1：query 要围绕当前需要回忆的事实、关系、承诺、红包、朋友圈或雷点。
 正例：${playerName()}问“你还记得刚才红包吗”时，query 写“${playerName()} ${charName(char)} 红包 金额 是否领取 备注”。
 反例：query 写“聊天回复 温柔 继续对话”。
@@ -2485,7 +2491,7 @@ function buildMemoryQueryPayload(char, userInput, messages) {
 规则 3：focus 只标记检索重点，不生成角色回复。
 正例：{"focus":"payment"}
 反例：{"focus":"我会安慰你"}
-只输出 JSON，不要输出解释。`;
+输出 JSON 结构：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`);
   const user = `双方昵称：${playerName()} / ${charName(char)}
 最近聊天与场景事件：
 ${messages.slice(-10).map(m => messageLine(m, char)).join('\n')}
@@ -2497,8 +2503,7 @@ ${userInput}
   return { system, user };
 }
 function buildMemoryExtractPayload(char, batch, oldSummaries) {
-  const system = `你是 AL 的本地记忆整理 AI，负责把微信式 RP 聊天和后台场景事件提炼为数据库记录。
-只输出 JSON，不要输出解释。
+  const system = buildMemorySceneSystem(char, '整理', 'memory-extract', `任务：把微信式 RP 聊天和后台场景事件提炼为本地数据库记录。
 原则：
 1. 只记录明确出现、未来会影响回复的信息，不编造。
 正例：${playerName()}明确说“我住上海”，记录为稳定资料。
@@ -2526,7 +2531,7 @@ function buildMemoryExtractPayload(char, batch, oldSummaries) {
 反例：“两人发生了红包互动。”
 9. 这是纯聊天 RP，禁止把动作、神态、环境描写当作事实新增，除非它是聊天文字明确表达的设定。
 正例：聊天文字说“我以后不收你大额红包”，可以记边界。
-反例：把“他笑了笑”这种动作描写记成事实。`;
+反例：把“他笑了笑”这种动作描写记成事实。`);
   const user = `双方昵称：${playerName()} / ${charName(char)}
 旧增量摘要：
 ${oldSummaries || '暂无'}
