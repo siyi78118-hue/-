@@ -3,6 +3,7 @@ const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const API_TIMEOUT_MS = 120000;
+const CALL_LOG_LIMIT = 30;
 let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {
@@ -76,6 +77,50 @@ async function getMeta(key, fallback = null) {
 
 async function setMeta(key, value) {
   return put('meta', { key, value, updatedAt: Date.now() });
+}
+
+function redactSensitiveText(text) {
+  return String(text || '')
+    .replace(/sk-[A-Za-z0-9_\-]{8,}/g, 'sk-***')
+    .replace(/Bearer\s+[A-Za-z0-9._\-]{8,}/gi, 'Bearer ***')
+    .replace(/x-api-key["':\s]+[A-Za-z0-9._\-]{8,}/gi, 'x-api-key ***');
+}
+
+function compactLogText(text, max = 1200) {
+  const value = redactSensitiveText(text).replace(/\s+/g, ' ').trim();
+  return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+
+async function recordModelCall(entry = {}) {
+  try {
+    const startedAt = Number(entry.startedAt) || Date.now();
+    const messages = Array.isArray(entry.messages) ? entry.messages : [];
+    const logs = await getMeta('call_logs', []);
+    logs.unshift({
+      id: `call_${startedAt}_${Math.random().toString(36).slice(2, 7)}`,
+      at: startedAt,
+      time: formatFullTime(new Date(startedAt)),
+      durationMs: Math.max(0, Date.now() - startedAt),
+      kind: entry.kind || 'chat',
+      scene: entry.scene || '',
+      provider: entry.provider || '',
+      model: entry.model || '',
+      charId: entry.charId || '',
+      ok: entry.ok !== false,
+      empty: !!entry.empty,
+      diagnostic: compactLogText(entry.diagnostic || '', 600),
+      error: compactLogText(entry.error || '', 600),
+      systemChars: String(entry.system || '').length,
+      messageCount: messages.length,
+      memoryChars: Number(entry.memoryChars) || 0,
+      systemPreview: compactLogText(entry.system, 1800),
+      messagesPreview: messages.slice(-4).map(m => ({ role: m.role || '', content: compactLogText(m.content, 360) })),
+      outputPreview: compactLogText(entry.output, 600)
+    });
+    await setMeta('call_logs', logs.slice(0, CALL_LOG_LIMIT));
+  } catch (err) {
+    console.warn('[AL SW CallLog] skipped:', err.message);
+  }
 }
 
 function setStateCloudTimerStatus(state, message, kind = 'general') {
@@ -560,42 +605,80 @@ async function callModel(settings, system, messages, options = {}) {
   const apiKey = settings.chatApiKey || settings.apiKey || '';
   const model = settings.chatModel || settings.model || '';
   const useStream = options.stream === true || (apiType !== 'claude' && options.stream !== false);
+  const startedAt = Date.now();
+  const callBase = {
+    kind: options.kind || 'chat',
+    scene: options.scene || '',
+    provider: apiType,
+    model: model || (apiType === 'claude' ? 'claude-sonnet-4-20250514' : 'gpt-4o'),
+    charId: options.charId || '',
+    memoryChars: options.memoryChars,
+    system,
+    messages,
+    startedAt
+  };
   if (apiType === 'claude') {
-    const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: model || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: useStream })
-    }, API_TIMEOUT_MS);
-    if (!resp.ok) throw new Error('API ' + resp.status);
-    if (useStream) return readStreamText(resp);
+    let resp;
+    try {
+      resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model: model || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: useStream })
+      }, API_TIMEOUT_MS);
+      if (!resp.ok) throw new Error('API ' + resp.status);
+      if (useStream) {
+        const text = await readStreamText(resp);
+        if (!text.trim()) lastModelResponseDiagnostic = lastModelResponseDiagnostic || '流式接口返回为空';
+        await recordModelCall({ ...callBase, ok: true, empty: !text.trim(), diagnostic: lastModelResponseDiagnostic, output: text });
+        return text;
+      }
+    } catch (err) {
+      await recordModelCall({ ...callBase, ok: false, error: err.message });
+      throw err;
+    }
     const raw = await resp.text();
     try {
       const json = JSON.parse(raw);
       const text = extractResponseText(json) || parseJsonFallbackText(raw);
       if (!text.trim()) lastModelResponseDiagnostic = responseDiagnostic(json, raw);
+      await recordModelCall({ ...callBase, ok: true, empty: !text.trim(), diagnostic: lastModelResponseDiagnostic, output: text });
       return text;
     } catch {
       const text = parseJsonFallbackText(raw);
       if (!text.trim()) lastModelResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+      await recordModelCall({ ...callBase, ok: true, empty: !text.trim(), diagnostic: lastModelResponseDiagnostic, output: text });
       return text;
     }
   }
-  const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body: JSON.stringify({ model: model || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: useStream })
-  }, API_TIMEOUT_MS);
-  if (!resp.ok) throw new Error('API ' + resp.status);
-  if (useStream) return readStreamText(resp);
+  let resp;
+  try {
+    resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: model || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: useStream })
+    }, API_TIMEOUT_MS);
+    if (!resp.ok) throw new Error('API ' + resp.status);
+    if (useStream) {
+      const text = await readStreamText(resp);
+      if (!text.trim()) lastModelResponseDiagnostic = lastModelResponseDiagnostic || '流式接口返回为空';
+      await recordModelCall({ ...callBase, ok: true, empty: !text.trim(), diagnostic: lastModelResponseDiagnostic, output: text });
+      return text;
+    }
+  } catch (err) {
+    await recordModelCall({ ...callBase, ok: false, error: err.message });
+    throw err;
+  }
   const raw = await resp.text();
   try {
     const json = JSON.parse(raw);
     const text = extractResponseText(json) || parseJsonFallbackText(raw);
     if (!text.trim()) lastModelResponseDiagnostic = responseDiagnostic(json, raw);
+    await recordModelCall({ ...callBase, ok: true, empty: !text.trim(), diagnostic: lastModelResponseDiagnostic, output: text });
     return text;
   } catch {
     const text = parseJsonFallbackText(raw);
     if (!text.trim()) lastModelResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+    await recordModelCall({ ...callBase, ok: true, empty: !text.trim(), diagnostic: lastModelResponseDiagnostic, output: text });
     return text;
   }
 }
@@ -751,7 +834,13 @@ async function handleProactivePush(payload) {
   const system = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext);
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
-  const reply = (await callModel(settings, system, messages, { stream: true })).trim();
+  const reply = (await callModel(settings, system, messages, {
+    stream: true,
+    kind: 'chat',
+    scene: 'background-proactive-chat',
+    charId,
+    memoryChars: memoryPack.length
+  })).trim();
   chat.lastProactiveAt = Date.now();
   chat.lastProactiveChatAt = Date.now();
   if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
@@ -816,7 +905,12 @@ async function handleProactiveMomentPush(state, charId, payload) {
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
   const system = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
   const messages = proactiveRecentMessages(chat, 20, proactiveNow);
-  const raw = (await callModel(settings, system, messages)).trim();
+  const raw = (await callModel(settings, system, messages, {
+    kind: 'moment',
+    scene: 'background-moment-post',
+    charId,
+    memoryChars: memoryPack.length
+  })).trim();
   let text = '';
   try {
     const start = raw.indexOf('{'), end = raw.lastIndexOf('}');

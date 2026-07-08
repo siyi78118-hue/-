@@ -1415,8 +1415,19 @@ function recordModelCall(entry = {}) {
 function getModelCallLogs() {
   try { return JSON.parse(localStorage.getItem('rpchat_call_logs') || '[]'); } catch { return []; }
 }
+async function getAllModelCallLogs() {
+  let serviceWorkerLogs = [];
+  try {
+    serviceWorkerLogs = await MemoryDB.getMeta('call_logs', []);
+  } catch (err) {
+    console.warn('[AL CallLog] service worker logs unavailable:', err.message);
+  }
+  return [...getModelCallLogs(), ...(Array.isArray(serviceWorkerLogs) ? serviceWorkerLogs : [])]
+    .sort((a, b) => (b.at || 0) - (a.at || 0));
+}
 function clearModelCallLogs() {
   localStorage.removeItem('rpchat_call_logs');
+  if (typeof MemoryDB !== 'undefined') MemoryDB.setMeta('call_logs', []).catch(() => {});
 }
 
 function showScreen(name) {
@@ -4499,6 +4510,7 @@ async function bootApp() {
 bootApp();
 const ALDebug = {
   getModelCallLogs,
+  getAllModelCallLogs,
   clearModelCallLogs
 };
 if (typeof window !== 'undefined') window.ALDebug = ALDebug;
