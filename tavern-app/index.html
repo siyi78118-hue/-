@@ -3374,11 +3374,12 @@ async function triggerProactiveMessage(charId, manual = false) {
   }
   proactiveBusy = true;
   try {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊已接到云闹钟，正在生成消息。');
     const proactiveNow = new Date();
     const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
     const memoryPack = await prepareMemoryPack(charId, query);
-    const reply = await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext });
+    const reply = await callAPI(chat, memoryPack, { charId, live: manual, proactive: true, proactiveNow, proactiveTimeContext });
     clearStreamingDraft(charId);
     const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
     chat.lastProactiveAt = Date.now();
@@ -3433,6 +3434,7 @@ async function triggerProactiveMoment(charId, manual = false) {
   }
   proactiveBusy = true;
   try {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈已接到云闹钟，正在生成动态。');
     const text = momentSnippet(await callMomentPostAI(char, chat), 160);
     chat.lastProactiveAt = Date.now();
     chat.lastProactiveMomentAt = Date.now();
