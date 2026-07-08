@@ -337,6 +337,15 @@ function extractResponseText(json) {
     || textFromContent(json?.text)
   ).trim();
 }
+
+function extractJson(text) {
+  const raw = String(text || '').replace(/```json|```/g, '').trim();
+  try { return JSON.parse(raw); } catch {}
+  const start = raw.indexOf('{'), end = raw.lastIndexOf('}');
+  if (start >= 0 && end > start) return JSON.parse(raw.slice(start, end + 1));
+  throw new Error('记忆模型没有返回 JSON');
+}
+
 function compactRawResponse(raw) {
   return String(raw || '').replace(/\s+/g, ' ').slice(0, 220);
 }
@@ -562,7 +571,93 @@ function messageLine(m, char, settings = {}) {
   return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
 }
 
-function buildMemoryPack(charId, char, settings = {}, queryText = '') {
+function buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings = {}) {
+  const system = `你是 AL 的后台本地记忆检索 AI。
+你不参与角色扮演，不回复${playerName(settings)}，不替${charName(char)}说话。
+任务：只根据当前触发原因、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
+query 要围绕当前需要回忆的事实、关系、承诺、红包、朋友圈或雷点。
+keywords 要短而具体，方便本地记忆库召回。
+只输出 JSON，不要输出解释：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`;
+  const user = `双方昵称：${playerName(settings)} / ${charName(char)}
+最近聊天与场景事件：
+${messages.slice(-10).map(m => messageLine(m, char, settings)).join('\n') || '暂无'}
+
+当前触发原因：
+${triggerText}
+
+输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`;
+  return { system, user };
+}
+
+function hasBackgroundMemoryApi(settings = {}) {
+  return !!((settings.memoryApiUrl || settings.apiUrl) && (settings.memoryApiKey || settings.apiKey) && settings.memoryModel);
+}
+
+async function callBackgroundMemoryJSON(settings = {}, system, user, options = {}) {
+  const apiType = settings.memoryApiType || settings.apiType || 'openai';
+  const apiUrl = settings.memoryApiUrl || settings.apiUrl || '';
+  const apiKey = cleanApiKey(settings.memoryApiKey || settings.apiKey || '');
+  const model = settings.memoryModel || '';
+  if (!apiUrl || !apiKey || !model) throw new Error('memory api not configured');
+  const startedAt = Date.now();
+  const messages = [{ role: 'user', content: user }];
+  let text = '';
+  if (apiType === 'claude') {
+    try {
+      const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+        body: JSON.stringify({ model, system, messages, max_tokens: 900, temperature: 0.2 })
+      }, Math.min(API_TIMEOUT_MS, 45000));
+      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
+      const json = await resp.json();
+      text = Array.isArray(json.content) ? json.content.map(p => p.text || '').join('') : (json.content || json.text || '');
+    } catch (err) {
+      await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: 'claude', model, charId: options.charId || '', system, messages, startedAt, ok: false, error: err.message });
+      throw err;
+    }
+  } else {
+    try {
+      const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: 900 })
+      }, Math.min(API_TIMEOUT_MS, 45000));
+      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
+      const json = await resp.json();
+      text = extractResponseText(json);
+    } catch (err) {
+      await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: 'openai', model, charId: options.charId || '', system, messages, startedAt, ok: false, error: err.message });
+      throw err;
+    }
+  }
+  if (!String(text || '').trim()) {
+    const err = new Error('记忆 API 返回了空内容');
+    await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: apiType, model, charId: options.charId || '', system, messages, startedAt, ok: false, empty: true, diagnostic: err.message });
+    throw err;
+  }
+  await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: apiType, model, charId: options.charId || '', system, messages, startedAt, ok: true, output: text });
+  return extractJson(text);
+}
+
+async function generateBackgroundMemoryQuery(charId, char, settings = {}, triggerText = '', messages = []) {
+  const fallback = { query: `${charName(char)} ${triggerText}`, keywords: memorySignalTerms(triggerText).slice(0, 8), focus: 'current', _memoryAiStatus: 'skipped' };
+  if (!hasBackgroundMemoryApi(settings)) return fallback;
+  const payload = buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings);
+  try {
+    const json = await callBackgroundMemoryJSON(settings, payload.system, payload.user, { scene: 'background-memory-query', charId });
+    return { ...fallback, ...json, _memoryAiStatus: 'ok' };
+  } catch (err) {
+    console.warn('[AL SW Memory] query fallback:', err.message);
+    return { ...fallback, _memoryAiStatus: 'failed' };
+  }
+}
+
+async function buildMemoryPack(charId, char, settings = {}, queryText = '') {
+  const state = await getMeta('app_state', null).catch(() => null);
+  const recent = Array.isArray(state?.allChats?.[charId]?.messages) ? state.allChats[charId].messages.slice(-30) : [];
+  const query = await generateBackgroundMemoryQuery(charId, char, settings, queryText, recent);
+  const recallText = [query.query, queryText, ...(query.keywords || [])].filter(Boolean).join(' ');
   return Promise.all([
     getAll('summaries'),
     getAll('events'),
@@ -575,7 +670,7 @@ function buildMemoryPack(charId, char, settings = {}, queryText = '') {
     if (latestSummaries.length) parts.push('近期增量摘要：\n' + latestSummaries.map(s => `- ${memoryAliasText(s.content, char, settings)}`).join('\n'));
     if (importantEvents.length) parts.push('重要事件和时间节点：\n' + importantEvents.map(e => `- ${memoryAliasText(e.happenedAt || '未注明', char, settings)}｜${memoryAliasText(e.title || '事件', char, settings)}：${memoryAliasText(e.detail, char, settings)}`).join('\n'));
     if (profileRows.length) parts.push('稳定资料和关系状态：\n' + profileRows.map(p => `- ${memoryAliasText(p.title || p.type || '资料', char, settings)}：${memoryAliasText(p.detail, char, settings)}`).join('\n'));
-    const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, queryText, [], char, settings, 5);
+    const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, recallText, query.keywords || [], char, settings, 5);
     if (keywordRows.length) parts.push('当前触发原因命中的本地记忆：\n' + keywordRows.map(row => `- ${row.text}`).join('\n'));
     if (!parts.length) return '';
     return `以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。\n\n${parts.join('\n\n')}`;

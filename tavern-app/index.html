@@ -3239,6 +3239,20 @@ async function generateMemoryQuery(char, userInput, messages) {
   if (!settings.memoryApiKey) missing.push('Key');
   if (!settings.memoryModel) missing.push('模型');
   if (missing.length) {
+    if (settings.memoryApiUrl || settings.memoryApiKey || settings.memoryModel) {
+      recordModelCall({
+        kind: 'memory',
+        scene: 'memory-query',
+        provider: settings.memoryApiType || 'openai',
+        model: settings.memoryModel || '',
+        charId: char?.id || '',
+        ok: false,
+        empty: true,
+        diagnostic: `跳过记忆AI筛选：缺少${missing.join('、')}`,
+        system: '本地记忆检索 AI 未调用',
+        messages: [{ role: 'user', content: String(userInput || '').slice(0, 500) }]
+      });
+    }
     setMemoryQueryStatus(`跳过记忆AI筛选：记忆接口${missing.join('、')}未配置，已改用本地关键词检索。`);
     return { ...fallback, _memoryAiStatus: 'skipped' };
   }

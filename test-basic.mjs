@@ -101,6 +101,7 @@ globalThis.__appTest = {
   buildMomentReplyPayload,
   buildMemoryQueryPayload,
   buildMemoryExtractPayload,
+  generateMemoryQuery,
   memoryAliasText,
   memorySignalTerms,
   scoreKeywordMemoryText,
@@ -115,7 +116,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -241,6 +242,11 @@ assert.match(diagnosticText, /promptBlockDetails=[\s\S]*红包约定/);
 assert.doesNotMatch(diagnosticText, /sk-secret123456/);
 clearModelCallLogs();
 assert.equal(getModelCallLogs().length, 0);
+vm.runInContext("settings.memoryApiUrl='https://memory.example/v1'; settings.memoryApiKey='sk-memory'; settings.memoryModel=''; settings.memoryApiType='openai';", context);
+const skippedMemoryQuery = await generateMemoryQuery(v2, '你还记得红包吗？', []);
+assert.equal(skippedMemoryQuery._memoryAiStatus, 'skipped');
+assert.match(getModelCallLogs()[0].diagnostic, /缺少模型/);
+clearModelCallLogs();
 assert.equal(cleanApiKey(' sk-test\u200b\n　'), 'sk-test');
 assert.match(getTimeContext(new Date('2026-07-04T09:05:03Z')), /当前设备时间/);
 assert.equal(getDayPeriod(new Date('2026-07-04T14:15:00')).label, '下午');
