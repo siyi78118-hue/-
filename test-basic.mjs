@@ -105,11 +105,14 @@ globalThis.__appTest = {
   memorySignalTerms,
   scoreKeywordMemoryText,
   searchKeywordMemoryRows,
+  recordModelCall,
+  getModelCallLogs,
+  clearModelCallLogs,
   shouldKeepEvent,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -202,6 +205,28 @@ const keywordRows = searchKeywordMemoryRows({
   summaries: [],
 }, '你还记得红包吗？', ['红包'], v2);
 assert.equal(keywordRows[0].sourceId, 'evt1');
+recordModelCall({
+  kind: 'chat',
+  scene: 'proactive-chat',
+  provider: 'openai',
+  model: 'gpt-test',
+  charId: 'char-1',
+  system: '系统提示：不要保存 sk-secret123456',
+  messages: [{ role: 'user', content: '你好' }],
+  memoryChars: 12,
+  output: '在。'
+});
+const callLogs = getModelCallLogs();
+assert.equal(callLogs[0].scene, 'proactive-chat');
+assert.equal(callLogs[0].model, 'gpt-test');
+assert.equal(callLogs[0].messageCount, 1);
+assert.equal(callLogs[0].memoryChars, 12);
+assert.match(callLogs[0].systemPreview, /系统提示/);
+assert.doesNotMatch(callLogs[0].systemPreview, /sk-secret123456/);
+assert.match(callLogs[0].systemPreview, /sk-\*\*\*/);
+assert.equal(typeof context.ALDebug.getModelCallLogs, 'function');
+clearModelCallLogs();
+assert.equal(getModelCallLogs().length, 0);
 assert.equal(cleanApiKey(' sk-test\u200b\n　'), 'sk-test');
 assert.match(getTimeContext(new Date('2026-07-04T09:05:03Z')), /当前设备时间/);
 assert.equal(getDayPeriod(new Date('2026-07-04T14:15:00')).label, '下午');
