@@ -95,6 +95,7 @@ async function recordModelCall(entry = {}) {
   try {
     const startedAt = Number(entry.startedAt) || Date.now();
     const messages = Array.isArray(entry.messages) ? entry.messages : [];
+    const promptBlocks = Array.isArray(entry.promptBlocks) ? entry.promptBlocks : [];
     const logs = await getMeta('call_logs', []);
     logs.unshift({
       id: `call_${startedAt}_${Math.random().toString(36).slice(2, 7)}`,
@@ -113,6 +114,12 @@ async function recordModelCall(entry = {}) {
       systemChars: String(entry.system || '').length,
       messageCount: messages.length,
       memoryChars: Number(entry.memoryChars) || 0,
+      promptBlocks: promptBlocks.slice(0, 20).map(block => ({
+        id: compactLogText(block.id || '', 80),
+        priority: Number(block.priority) || 0,
+        chars: Number(block.chars) || 0,
+        preview: compactLogText(block.preview || '', 180)
+      })),
       systemPreview: compactLogText(entry.system, 1800),
       messagesPreview: messages.slice(-4).map(m => ({ role: m.role || '', content: compactLogText(m.content, 360) })),
       outputPreview: compactLogText(entry.output, 600)
@@ -257,8 +264,20 @@ function createPromptComposer(scene) {
         .map(block => block.content)
         .filter(Boolean)
         .join('\n\n');
+    },
+    blocks() {
+      return blocks.slice().sort((a, b) => a.priority - b.priority || String(a.id).localeCompare(String(b.id)));
     }
   };
+}
+
+function promptBlockDiagnostics(blocks = []) {
+  return blocks.map(block => ({
+    id: block.id,
+    priority: block.priority,
+    chars: String(block.content || '').length,
+    preview: compactLogText(block.content, 180)
+  }));
 }
 
 function splitAssistantOutput(text) {
@@ -577,7 +596,7 @@ function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, pr
 只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替${playerName(settings)}说话。
 如果想连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
 默认 1-3 句。`, { priority: 110, scenes: ['proactive-chat'] });
-  return composer.compile();
+  return { system: composer.compile(), promptBlocks: promptBlockDiagnostics(composer.blocks()) };
 }
 
 function buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext = '') {
@@ -595,7 +614,7 @@ text 只能是动态正文，禁止动作、神态、心理、旁白、系统说
 不要出现“用户/角色/API/系统/提示词/模型”等说法。
 可以自然参考当前时间、最近聊天、朋友圈上下文、关系和未完成约定，但不要机械复述。
 默认 1-2 句，像真人朋友圈动态；不要使用换行排版。`, { priority: 100, scenes: ['moment-post'] });
-  return composer.compile();
+  return { system: composer.compile(), promptBlocks: promptBlockDiagnostics(composer.blocks()) };
 }
 
 async function callModel(settings, system, messages, options = {}) {
@@ -613,6 +632,7 @@ async function callModel(settings, system, messages, options = {}) {
     model: model || (apiType === 'claude' ? 'claude-sonnet-4-20250514' : 'gpt-4o'),
     charId: options.charId || '',
     memoryChars: options.memoryChars,
+    promptBlocks: options.promptBlocks,
     system,
     messages,
     startedAt
@@ -831,15 +851,16 @@ async function handleProactivePush(payload) {
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
   const memoryQuery = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
-  const system = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext);
+  const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext);
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
-  const reply = (await callModel(settings, system, messages, {
+  const reply = (await callModel(settings, prompt.system, messages, {
     stream: true,
     kind: 'chat',
     scene: 'background-proactive-chat',
     charId,
-    memoryChars: memoryPack.length
+    memoryChars: memoryPack.length,
+    promptBlocks: prompt.promptBlocks
   })).trim();
   chat.lastProactiveAt = Date.now();
   chat.lastProactiveChatAt = Date.now();
@@ -903,13 +924,14 @@ async function handleProactiveMomentPush(state, charId, payload) {
   const momentContext = buildBackgroundMomentContext(allMoments, characters, charId, settings, 6);
   const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext(proactiveNow)}\n${charName(char)}准备主动发朋友圈。\n${momentContext}`;
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
-  const system = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
+  const prompt = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
   const messages = proactiveRecentMessages(chat, 20, proactiveNow);
-  const raw = (await callModel(settings, system, messages, {
+  const raw = (await callModel(settings, prompt.system, messages, {
     kind: 'moment',
     scene: 'background-moment-post',
     charId,
-    memoryChars: memoryPack.length
+    memoryChars: memoryPack.length,
+    promptBlocks: prompt.promptBlocks
   })).trim();
   let text = '';
   try {

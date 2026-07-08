@@ -1386,6 +1386,7 @@ function recordModelCall(entry = {}) {
   try {
     const startedAt = Number(entry.startedAt) || Date.now();
     const messages = Array.isArray(entry.messages) ? entry.messages : [];
+    const promptBlocks = Array.isArray(entry.promptBlocks) ? entry.promptBlocks : [];
     const logs = JSON.parse(localStorage.getItem('rpchat_call_logs') || '[]');
     logs.unshift({
       id: `call_${startedAt}_${Math.random().toString(36).slice(2, 7)}`,
@@ -1404,6 +1405,12 @@ function recordModelCall(entry = {}) {
       systemChars: String(entry.system || '').length,
       messageCount: messages.length,
       memoryChars: Number(entry.memoryChars) || 0,
+      promptBlocks: promptBlocks.slice(0, 20).map(block => ({
+        id: compactLogText(block.id || '', 80),
+        priority: Number(block.priority) || 0,
+        chars: Number(block.chars) || 0,
+        preview: compactLogText(block.preview || '', 180)
+      })),
       systemPreview: compactLogText(entry.system, 1800),
       messagesPreview: messages.slice(-4).map(m => ({ role: m.role || '', content: compactLogText(m.content, 360) })),
       outputPreview: compactLogText(entry.output, 600)
@@ -1441,6 +1448,12 @@ function formatModelCallStatus(log) {
 }
 function formatModelCallDiagnostic(log, index = 0) {
   if (!log) return '';
+  const blockSummary = Array.isArray(log.promptBlocks) && log.promptBlocks.length
+    ? 'promptBlocks=' + log.promptBlocks.map(block => `${block.id || '?'}@${block.priority || 0}:${block.chars || 0}`).join(', ')
+    : '';
+  const blockDetails = Array.isArray(log.promptBlocks) && log.promptBlocks.length
+    ? 'promptBlockDetails=\n' + log.promptBlocks.map(block => `- ${block.id || '?'}｜priority=${block.priority || 0}｜chars=${block.chars || 0}｜${compactLogText(block.preview || '', 180)}`).join('\n')
+    : '';
   const rows = [
     `#${index + 1} ${log.time || (log.at ? formatFullTime(new Date(log.at)) : '')}`,
     `scene=${log.scene || ''}`,
@@ -1455,6 +1468,8 @@ function formatModelCallDiagnostic(log, index = 0) {
     log.error ? `error=${compactLogText(log.error, 400)}` : '',
     log.diagnostic ? `diagnostic=${compactLogText(log.diagnostic, 400)}` : '',
     log.outputPreview ? `output=${compactLogText(log.outputPreview, 400)}` : '',
+    blockSummary,
+    blockDetails,
     log.systemPreview ? `system=${compactLogText(log.systemPreview, 900)}` : '',
     Array.isArray(log.messagesPreview) && log.messagesPreview.length
       ? 'messages=' + log.messagesPreview.map(m => `${m.role}: ${compactLogText(m.content, 220)}`).join(' / ')
@@ -2118,7 +2133,7 @@ ${playerName()}刚发布朋友圈：“${momentSnippet(moment.text)}”
 ${char.name}需要判断是否点赞或评论，并且要记得双方此前关系、承诺、雷点、红包/转账和朋友圈互动。`;
   const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
   const payload = buildMomentInteractionPayload(char, moment, memoryPack);
-  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-interaction', memoryChars: memoryPack.length };
+  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-interaction', memoryChars: memoryPack.length, promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, callMeta)
     : await callOpenAI(payload.system, payload.messages, callMeta);
@@ -2135,7 +2150,7 @@ ${getTimeContext()}
 ${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
   const memoryPack = options.memoryPack != null ? options.memoryPack : await prepareMemoryPack(char.id, memoryQuery);
   const payload = buildMomentPostPayload(char, chat, memoryPack);
-  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-post', memoryChars: memoryPack.length };
+  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-post', memoryChars: memoryPack.length, promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, callMeta)
     : await callOpenAI(payload.system, payload.messages, callMeta);
@@ -2236,7 +2251,7 @@ ${playerName()}刚评论${char.name}的朋友圈：“${momentSnippet(playerComm
 ${char.name}需要在朋友圈评论区自然回复，并记得双方此前关系、承诺、红包/转账和重要互动。`;
   const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
   const payload = buildMomentReplyPayload(char, moment, playerComment, memoryPack);
-  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-reply', memoryChars: memoryPack.length };
+  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-reply', memoryChars: memoryPack.length, promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, callMeta)
     : await callOpenAI(payload.system, payload.messages, callMeta);
@@ -2455,6 +2470,14 @@ function createPromptComposer(scene) {
     }
   };
 }
+function promptBlockDiagnostics(blocks = []) {
+  return blocks.map(block => ({
+    id: block.id,
+    priority: block.priority,
+    chars: String(block.content || '').length,
+    preview: compactLogText(block.content, 180)
+  }));
+}
 function chatSceneFromOptions(options = {}) {
   if (options.payment) return 'payment';
   if (options.proactive) return 'proactive-chat';
@@ -2517,7 +2540,11 @@ ${redpacketRule}
   }
   composer.add('global-extra-preset', settings.systemPrompt ? '全局补充预设：\n' + settings.systemPrompt : '', { priority: 90 });
   composer.add('chat-extra-prompt', chat?.extraPrompt ? '当前会话补充：\n' + chat.extraPrompt : '', { priority: 100 });
-  return composer.compile();
+  const system = composer.compile();
+  if (options.returnPromptDetails) {
+    return { system, promptBlocks: promptBlockDiagnostics(composer.blocks()) };
+  }
+  return system;
 }
 function buildMomentSceneSystem(char, sceneLabel, sceneKey, memoryPack, sceneRules) {
   const composer = createPromptComposer(sceneKey);
@@ -2525,10 +2552,10 @@ function buildMomentSceneSystem(char, sceneLabel, sceneKey, memoryPack, sceneRul
   composer.add('memory-pack', memoryPack, { priority: 30 });
   composer.add('moment-scene-rules', sceneRules, { priority: 40, scenes: [sceneKey] });
   composer.add('global-extra-preset', settings.systemPrompt ? '全局补充预设：\n' + settings.systemPrompt : '', { priority: 90 });
-  return composer.compile();
+  return { system: composer.compile(), promptBlocks: promptBlockDiagnostics(composer.blocks()) };
 }
 function buildMomentInteractionPayload(char, moment, memoryPack = '') {
-  const system = buildMomentSceneSystem(char, '朋友圈动态互动', 'moment-interaction', memoryPack, `当前触发情况：${char.name}在朋友圈看到${playerName()}发的动态。
+  const prompt = buildMomentSceneSystem(char, '朋友圈动态互动', 'moment-interaction', memoryPack, `当前触发情况：${char.name}在朋友圈看到${playerName()}发的动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是在朋友圈刷到${playerName()}刚发的一条动态。
 你可以选择点赞、留言、或者什么都不做。留言必须像朋友圈评论，不要像聊天框里的即时回复。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
@@ -2546,10 +2573,10 @@ ${char.name}现在不是在私聊回复${playerName()}，而是在朋友圈刷�
 ${buildMomentChatContext(char.id, 6) || '暂无'}
 
 请以 ${char.name} 的性格决定是否点赞或留言。`;
-  return { system, messages: [{ role: 'user', content: user }] };
+  return { system: prompt.system, messages: [{ role: 'user', content: user }], promptBlocks: prompt.promptBlocks };
 }
 function buildMomentPostPayload(char, chat, memoryPack = '') {
-  const system = buildMomentSceneSystem(char, '朋友圈发布动态', 'moment-post', memoryPack, `当前触发情况：${char.name}准备发一条朋友圈动态。
+  const prompt = buildMomentSceneSystem(char, '朋友圈发布动态', 'moment-post', memoryPack, `当前触发情况：${char.name}准备发一条朋友圈动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是自己发一条朋友圈动态。
 动态应该像真人随手发的朋友圈，不要像给${playerName()}的直接回答。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
@@ -2567,10 +2594,10 @@ ${buildMomentChatContext(char.id, 6) || '暂无'}
 ${recent}
 
 请决定${char.name}现在会不会发一条朋友圈；如果适合，就输出 JSON。`;
-  return { system, messages: [{ role: 'user', content: user }] };
+  return { system: prompt.system, messages: [{ role: 'user', content: user }], promptBlocks: prompt.promptBlocks };
 }
 function buildMomentReplyPayload(char, moment, playerComment, memoryPack = '') {
-  const system = buildMomentSceneSystem(char, '朋友圈评论回复', 'moment-reply', memoryPack, `当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态，${char.name}已经看到了这条评论。
+  const prompt = buildMomentSceneSystem(char, '朋友圈评论回复', 'moment-reply', memoryPack, `当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态，${char.name}已经看到了这条评论。
 ${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
 只允许输出 JSON，不要输出解释：{"comment":"回复评论正文或空字符串"}
@@ -2588,7 +2615,7 @@ ${(moment.comments || []).map(c => `${c.name || charName(characters.find(ch => c
 ${playerName()}刚评论：${playerComment}
 
 请以 ${char.name} 的性格决定是否回复这条评论。`;
-  return { system, messages: [{ role: 'user', content: user }] };
+  return { system: prompt.system, messages: [{ role: 'user', content: user }], promptBlocks: prompt.promptBlocks };
 }
 function buildMemorySceneSystem(char, sceneLabel, sceneKey, taskRules) {
   const composer = createPromptComposer(sceneKey);
@@ -4013,10 +4040,11 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   const charId = options.charId || currentCharId;
   const currentChar = characters.find(c => c.id === charId);
   if (!currentChar) throw new Error('找不到当前角色');
-  const system = buildChatSceneSystem(currentChar, chat, { ...options, memoryPack });
+  const prompt = buildChatSceneSystem(currentChar, chat, { ...options, memoryPack, returnPromptDetails: true });
+  const system = prompt.system;
   const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: options.proactiveNow || new Date() });
   const scene = chatSceneFromOptions(options);
-  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, memoryChars: String(memoryPack || '').length };
+  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, memoryChars: String(memoryPack || '').length, promptBlocks: prompt.promptBlocks };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
 }
 
@@ -4083,11 +4111,11 @@ async function callOpenAI(system, messages, options = {}) {
     if (live) {
       const text = await readOpenAIStream(resp, options.charId);
       if (!text.trim()) lastChatResponseDiagnostic = lastChatResponseDiagnostic || '流式接口返回为空';
-      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
       return text;
     }
   } catch (err) {
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: false, error: err.message });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: false, error: err.message });
     throw err;
   }
   const raw = await resp.text();
@@ -4095,12 +4123,12 @@ async function callOpenAI(system, messages, options = {}) {
     const json = JSON.parse(raw);
     const text = extractResponseText(json) || parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = responseDiagnostic(json, raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   } catch {
     const text = parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   }
 }
@@ -4147,11 +4175,11 @@ async function callClaude(system, messages, options = {}) {
     if (live) {
       const text = await readClaudeStream(resp, options.charId);
       if (!text.trim()) lastChatResponseDiagnostic = lastChatResponseDiagnostic || '流式接口返回为空';
-      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
       return text;
     }
   } catch (err) {
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: false, error: err.message });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: false, error: err.message });
     throw err;
   }
   const raw = await resp.text();
@@ -4159,12 +4187,12 @@ async function callClaude(system, messages, options = {}) {
     const json = JSON.parse(raw);
     const text = extractResponseText(json) || parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = responseDiagnostic(json, raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   } catch {
     const text = parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   }
 }
@@ -4576,6 +4604,7 @@ bootApp();
 const ALDebug = {
   getModelCallLogs,
   getAllModelCallLogs,
+  formatModelCallDiagnostic,
   clearModelCallLogs
 };
 if (typeof window !== 'undefined') window.ALDebug = ALDebug;

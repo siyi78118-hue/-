@@ -217,6 +217,7 @@ recordModelCall({
   system: '系统提示：不要保存 sk-secret123456',
   messages: [{ role: 'user', content: '你好' }],
   memoryChars: 12,
+  promptBlocks: [{ id: 'memory-pack', priority: 30, chars: 42, preview: '红包约定' }],
   output: '在。'
 });
 const callLogs = getModelCallLogs();
@@ -224,15 +225,19 @@ assert.equal(callLogs[0].scene, 'proactive-chat');
 assert.equal(callLogs[0].model, 'gpt-test');
 assert.equal(callLogs[0].messageCount, 1);
 assert.equal(callLogs[0].memoryChars, 12);
+assert.equal(callLogs[0].promptBlocks[0].id, 'memory-pack');
 assert.match(callLogs[0].systemPreview, /系统提示/);
 assert.doesNotMatch(callLogs[0].systemPreview, /sk-secret123456/);
 assert.match(callLogs[0].systemPreview, /sk-\*\*\*/);
 assert.equal(typeof context.ALDebug.getModelCallLogs, 'function');
 assert.equal(typeof context.ALDebug.getAllModelCallLogs, 'function');
+assert.equal(typeof context.ALDebug.formatModelCallDiagnostic, 'function');
 assert.equal((await getAllModelCallLogs())[0].scene, 'proactive-chat');
 assert.match(formatModelCallStatus({ time: '2026-07-08 12:00', scene: 'memory-query', model: 'mem-test', empty: true, diagnostic: '空内容' }), /最近调用：2026-07-08 12:00｜memory-query｜mem-test｜空回复｜空内容/);
 const diagnosticText = formatModelCallDiagnostic(callLogs[0]);
 assert.match(diagnosticText, /scene=proactive-chat/);
+assert.match(diagnosticText, /promptBlocks=memory-pack@30:42/);
+assert.match(diagnosticText, /promptBlockDetails=[\s\S]*红包约定/);
 assert.doesNotMatch(diagnosticText, /sk-secret123456/);
 clearModelCallLogs();
 assert.equal(getModelCallLogs().length, 0);
