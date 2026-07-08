@@ -108,12 +108,13 @@ globalThis.__appTest = {
   recordModelCall,
   getModelCallLogs,
   getAllModelCallLogs,
+  formatModelCallStatus,
   clearModelCallLogs,
   shouldKeepEvent,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, getAllModelCallLogs, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -228,6 +229,7 @@ assert.match(callLogs[0].systemPreview, /sk-\*\*\*/);
 assert.equal(typeof context.ALDebug.getModelCallLogs, 'function');
 assert.equal(typeof context.ALDebug.getAllModelCallLogs, 'function');
 assert.equal((await getAllModelCallLogs())[0].scene, 'proactive-chat');
+assert.match(formatModelCallStatus({ time: '2026-07-08 12:00', scene: 'memory-query', model: 'mem-test', empty: true, diagnostic: '空内容' }), /最近调用：2026-07-08 12:00｜memory-query｜mem-test｜空回复｜空内容/);
 clearModelCallLogs();
 assert.equal(getModelCallLogs().length, 0);
 assert.equal(cleanApiKey(' sk-test\u200b\n　'), 'sk-test');

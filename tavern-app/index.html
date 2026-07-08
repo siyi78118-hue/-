@@ -1425,6 +1425,18 @@ async function getAllModelCallLogs() {
   return [...getModelCallLogs(), ...(Array.isArray(serviceWorkerLogs) ? serviceWorkerLogs : [])]
     .sort((a, b) => (b.at || 0) - (a.at || 0));
 }
+function formatModelCallStatus(log) {
+  if (!log) return '';
+  const state = log.ok === false ? '失败' : log.empty ? '空回复' : '成功';
+  const parts = [
+    log.time || (log.at ? formatFullTime(new Date(log.at)) : ''),
+    log.scene || log.kind || '模型调用',
+    log.model || '',
+    state
+  ].filter(Boolean);
+  const note = log.error || log.diagnostic || '';
+  return `最近调用：${parts.join('｜')}${note ? '｜' + compactLogText(note, 80) : ''}`;
+}
 function clearModelCallLogs() {
   localStorage.removeItem('rpchat_call_logs');
   if (typeof MemoryDB !== 'undefined') MemoryDB.setMeta('call_logs', []).catch(() => {});
@@ -3381,9 +3393,18 @@ function cloudTimerStatusText() {
   if (memoryQueryLine) rows.push(memoryQueryLine);
   return rows.join('\n');
 }
-function renderCloudTimerStatus() {
+async function renderCloudTimerStatus() {
   const el = document.getElementById('cloud-timer-status');
-  if (el) el.textContent = cloudTimerStatusText();
+  if (!el) return;
+  const base = cloudTimerStatusText();
+  el.textContent = base;
+  try {
+    const latestCall = (await getAllModelCallLogs())[0];
+    const callLine = formatModelCallStatus(latestCall);
+    if (callLine) el.textContent = `${base}\n${callLine}`;
+  } catch (err) {
+    console.warn('[AL CallLog] status render skipped:', err.message);
+  }
 }
 function setCloudTimerStatus(message, persist = true, kind = 'general') {
   const now = Date.now();
