@@ -692,11 +692,7 @@ function findDueProactiveJob(allChats) {
   const due = rows
     .filter(r => r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
     .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0];
-  if (due?.charId) return { charId: due.charId, kind: due.kind, job: due.job };
-  const pending = rows
-    .filter(r => r.job?.dueAt)
-    .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0];
-  return pending?.charId ? { charId: pending.charId, kind: pending.kind, job: pending.job } : null;
+  return due?.charId ? { charId: due.charId, kind: due.kind, job: due.job } : null;
 }
 
 self.addEventListener('push', event => {
