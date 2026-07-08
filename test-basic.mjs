@@ -11,6 +11,8 @@ assert.match(swScript, /后台记忆AI已调用/);
 assert.match(swScript, /function localEmbedding\(text, dim = VECTOR_DIM\)/);
 assert.match(swScript, /async function searchMemoryVectors\(charId, queryText/);
 assert.match(swScript, /本轮向量召回记忆/);
+assert.doesNotMatch(swScript, /重要事件和时间节点：\\n/);
+assert.doesNotMatch(swScript, /稳定资料和关系状态：\\n/);
 
 const storage = new Map();
 const elements = new Map();

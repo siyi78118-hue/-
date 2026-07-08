@@ -709,8 +709,6 @@ async function generateBackgroundMemoryQuery(charId, char, settings = {}, trigge
   const payload = buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings);
   try {
     const json = await callBackgroundMemoryJSON(settings, payload.system, payload.user, { scene: 'background-memory-query', charId });
-    const keywordText = (json.keywords || []).slice(0, 5).join('、') || json.query || '已生成检索词';
-    setMemoryQueryStatus(settings, `后台记忆AI已调用；关键词：${keywordText}`);
     return { ...fallback, ...json, _memoryAiStatus: 'ok' };
   } catch (err) {
     console.warn('[AL SW Memory] query fallback:', err.message);
@@ -731,14 +729,14 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '') {
     getAll('profiles')
   ]).then(([hits, summaries, events, profiles]) => {
     const latestSummaries = summaries.filter(r => r.charId === charId && shouldKeepSummary(memoryAliasText(r.content, char, settings))).sort((a, b) => b.createdAt - a.createdAt).slice(0, 3).reverse();
-    const importantEvents = events.filter(r => r.charId === charId && shouldKeepEvent(r)).sort((a, b) => (b.importance || 0) - (a.importance || 0) || b.createdAt - a.createdAt).slice(0, 8);
-    const profileRows = profiles.filter(r => r.charId === charId && shouldKeepProfile(r)).sort((a, b) => (b.importance || 0) - (a.importance || 0) || b.createdAt - a.createdAt).slice(0, 8);
     const vectorKeys = new Set(hits.map(hit => `${hit.sourceType}:${hit.sourceId}`));
+    if (query._memoryAiStatus === 'ok') {
+      const keywordText = (query.keywords || []).slice(0, 5).join('、') || query.query || '已生成检索词';
+      setMemoryQueryStatus(settings, `后台记忆AI已调用；关键词：${keywordText}；向量库召回 ${hits.length} 条。`);
+    }
     const parts = [];
     if (latestSummaries.length) parts.push('近期增量摘要：\n' + latestSummaries.map(s => `- ${memoryAliasText(s.content, char, settings)}`).join('\n'));
     if (hits.length) parts.push('本轮向量召回记忆：\n' + hits.map(h => `- ${memoryAliasText(h.text, char, settings)}`).join('\n'));
-    if (importantEvents.length) parts.push('重要事件和时间节点：\n' + importantEvents.map(e => `- ${memoryAliasText(e.happenedAt || '未注明', char, settings)}｜${memoryAliasText(e.title || '事件', char, settings)}：${memoryAliasText(e.detail, char, settings)}`).join('\n'));
-    if (profileRows.length) parts.push('稳定资料和关系状态：\n' + profileRows.map(p => `- ${memoryAliasText(p.title || p.type || '资料', char, settings)}：${memoryAliasText(p.detail, char, settings)}`).join('\n'));
     const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, recallText, query.keywords || [], char, settings, 5)
       .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
     if (keywordRows.length) parts.push('当前触发原因命中的本地记忆：\n' + keywordRows.map(row => `- ${row.text}`).join('\n'));
