@@ -4033,7 +4033,7 @@ async function bootApp() {
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw-v10.js').catch(() => {});
+    navigator.serviceWorker.register('sw-v11.js').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
       if (event.data?.type === 'al-run-proactive') handleForegroundProactiveRequest(event.data);
