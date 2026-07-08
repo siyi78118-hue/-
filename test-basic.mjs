@@ -102,11 +102,14 @@ globalThis.__appTest = {
   buildMemoryQueryPayload,
   buildMemoryExtractPayload,
   memoryAliasText,
+  memorySignalTerms,
+  scoreKeywordMemoryText,
+  searchKeywordMemoryRows,
   shouldKeepEvent,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -191,6 +194,14 @@ assert.match(memoryExtractPayload.system, /本地记忆整理 AI/);
 assert.match(memoryExtractPayload.system, /禁止用“用户”“角色”代称/);
 assert.match(memoryExtractPayload.system, /红包仍待领取/);
 assert.match(memoryExtractPayload.user, /旧增量摘要：\n旧摘要/);
+assert.ok(memorySignalTerms('你还记得红包和周末约定吗？').includes('红包'));
+assert.ok(scoreKeywordMemoryText('玩家承诺给林晚发红包。', ['红包'], 4) > 1);
+const keywordRows = searchKeywordMemoryRows({
+  events: [{ id: 'evt1', type: 'promise', title: '红包约定', detail: '玩家答应林晚回复暗号后发180元红包。', importance: 4, keywords: ['红包', '约定'] }],
+  profiles: [],
+  summaries: [],
+}, '你还记得红包吗？', ['红包'], v2);
+assert.equal(keywordRows[0].sourceId, 'evt1');
 assert.equal(cleanApiKey(' sk-test\u200b\n　'), 'sk-test');
 assert.match(getTimeContext(new Date('2026-07-04T09:05:03Z')), /当前设备时间/);
 assert.equal(getDayPeriod(new Date('2026-07-04T14:15:00')).label, '下午');

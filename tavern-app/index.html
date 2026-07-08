@@ -2904,6 +2904,55 @@ function memoryTextIsNoise(text) {
   return /(测试|校对|表快|表慢|几点|现在时间|AI身份|身份争论|是不是AI|名字.*合理|戏太多|科幻片|装神弄鬼|普通寒暄|你好|在吗|又来)/.test(value)
     && !memoryTextHasSignal(value.replace(/测试|校对|几点|AI身份|身份争论/g, ''));
 }
+function memorySignalTerms(text = '', extraKeywords = []) {
+  const value = String(text || '');
+  const terms = new Set();
+  const signalWords = ['红包', '转账', '收款', '退款', '余额', '约定', '承诺', '答应', '计划', '明天', '今晚', '周末', '下次', '道歉', '和好', '吵架', '生气', '雷点', '边界', '称呼', '关系', '喜欢', '讨厌', '生日', '职业', '城市', '住址', '学校', '公司', '朋友圈', '评论', '点赞'];
+  signalWords.forEach(word => { if (value.includes(word)) terms.add(word); });
+  String(value).split(/[^\p{L}\p{N}]+/gu).forEach(token => {
+    const t = token.trim();
+    if (/^[a-z0-9_-]{2,}$/i.test(t)) terms.add(t.toLowerCase());
+  });
+  (extraKeywords || []).forEach(keyword => {
+    const word = String(keyword || '').trim();
+    if (word && word.length <= 24) terms.add(word);
+  });
+  return [...terms];
+}
+function scoreKeywordMemoryText(text, terms = [], importance = 0) {
+  const value = String(text || '').toLowerCase();
+  if (!value || memoryTextIsNoise(value)) return 0;
+  let score = Math.min(4, Number(importance) || 0) * 0.12;
+  for (const term of terms) {
+    const t = String(term || '').toLowerCase();
+    if (t && value.includes(t)) score += t.length >= 3 ? 1 : 0.7;
+  }
+  return score;
+}
+function searchKeywordMemoryRows(rows = {}, queryText = '', queryKeywords = [], char = null, limit = 5) {
+  const terms = memorySignalTerms(queryText, queryKeywords);
+  if (!terms.length) return [];
+  const candidates = [];
+  for (const e of rows.events || []) {
+    const text = memoryAliasText([e.happenedAt, e.title, e.detail, ...(e.keywords || [])].filter(Boolean).join('｜'), char);
+    if (!shouldKeepEvent(e)) continue;
+    candidates.push({ sourceType: 'event', sourceId: e.id, text, importance: e.importance || 3, score: scoreKeywordMemoryText(text, terms, e.importance || 3) });
+  }
+  for (const p of rows.profiles || []) {
+    const text = memoryAliasText([p.title, p.detail, ...(p.keywords || [])].filter(Boolean).join('｜'), char);
+    if (!shouldKeepProfile(p)) continue;
+    candidates.push({ sourceType: 'profile', sourceId: p.id, text, importance: p.importance || 3, score: scoreKeywordMemoryText(text, terms, p.importance || 3) });
+  }
+  for (const s of rows.summaries || []) {
+    const text = memoryAliasText(s.content, char);
+    if (!shouldKeepSummary(text)) continue;
+    candidates.push({ sourceType: 'summary', sourceId: s.id, text, importance: 2, score: scoreKeywordMemoryText(text, terms, 2) });
+  }
+  return candidates
+    .filter(item => item.score >= 1)
+    .sort((a, b) => b.score - a.score || (b.importance || 0) - (a.importance || 0))
+    .slice(0, limit);
+}
 function shouldKeepEvent(e) {
   const type = String(e?.type || '');
   const importance = Number(e?.importance) || 0;
@@ -3075,12 +3124,20 @@ async function prepareMemoryPack(charId, userInput) {
   const recent = recentMessages(chat, 30);
   const query = await generateMemoryQuery(char, userInput, recent);
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
-  const hits = await searchMemoryVectors(charId, queryText);
+  const [hits, allSummaries, allEvents, allProfiles] = await Promise.all([
+    searchMemoryVectors(charId, queryText),
+    MemoryDB.byChar('summaries', charId),
+    MemoryDB.byChar('events', charId),
+    MemoryDB.byChar('profiles', charId)
+  ]);
   if (query._memoryAiStatus === 'ok') {
     const keywordText = (query.keywords || []).slice(0, 5).join('、') || query.query || '已生成检索词';
     setMemoryQueryStatus(`记忆AI已调用；关键词：${keywordText}；向量库召回 ${hits.length} 条。`);
   }
-  const summaries = (await MemoryDB.byChar('summaries', charId))
+  const vectorKeys = new Set(hits.map(hit => `${hit.sourceType}:${hit.sourceId}`));
+  const keywordHits = searchKeywordMemoryRows({ summaries: allSummaries, events: allEvents, profiles: allProfiles }, queryText, query.keywords || [], char)
+    .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
+  const summaries = allSummaries
     .filter(s => shouldKeepSummary(memoryAliasText(s.content, char)))
     .sort((a, b) => b.createdAt - a.createdAt)
     .slice(0, 3);
@@ -3090,6 +3147,9 @@ async function prepareMemoryPack(charId, userInput) {
   }
   if (hits.length) {
     parts.push('本轮向量召回记忆：\n' + hits.map(h => `- ${memoryAliasText(h.text, char)}`).join('\n'));
+  }
+  if (keywordHits.length) {
+    parts.push('关键词触发记忆：\n' + keywordHits.map(h => `- ${memoryAliasText(h.text, char)}`).join('\n'));
   }
   if (!parts.length) return '';
   return `以下是后台本地记忆库提供给你的参考，只在与当前对话相关时使用。不要提到“记忆库/向量/摘要/系统提示”，不要照搬结构化文字，仍然只输出角色发来的聊天消息。\n\n${parts.join('\n\n')}`;

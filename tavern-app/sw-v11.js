@@ -423,6 +423,55 @@ function memoryTextIsNoise(text) {
   return /(测试|校对|表快|表慢|几点|现在时间|AI身份|身份争论|是不是AI|名字.*合理|戏太多|科幻片|装神弄鬼|普通寒暄|你好|在吗|又来)/.test(value)
     && !memoryTextHasSignal(value.replace(/测试|校对|几点|AI身份|身份争论/g, ''));
 }
+function memorySignalTerms(text = '', extraKeywords = []) {
+  const value = String(text || '');
+  const terms = new Set();
+  const signalWords = ['红包', '转账', '收款', '退款', '余额', '约定', '承诺', '答应', '计划', '明天', '今晚', '周末', '下次', '道歉', '和好', '吵架', '生气', '雷点', '边界', '称呼', '关系', '喜欢', '讨厌', '生日', '职业', '城市', '住址', '学校', '公司', '朋友圈', '评论', '点赞'];
+  signalWords.forEach(word => { if (value.includes(word)) terms.add(word); });
+  String(value).split(/[^\p{L}\p{N}]+/gu).forEach(token => {
+    const t = token.trim();
+    if (/^[a-z0-9_-]{2,}$/i.test(t)) terms.add(t.toLowerCase());
+  });
+  (extraKeywords || []).forEach(keyword => {
+    const word = String(keyword || '').trim();
+    if (word && word.length <= 24) terms.add(word);
+  });
+  return [...terms];
+}
+function scoreKeywordMemoryText(text, terms = [], importance = 0) {
+  const value = String(text || '').toLowerCase();
+  if (!value || memoryTextIsNoise(value)) return 0;
+  let score = Math.min(4, Number(importance) || 0) * 0.12;
+  for (const term of terms) {
+    const t = String(term || '').toLowerCase();
+    if (t && value.includes(t)) score += t.length >= 3 ? 1 : 0.7;
+  }
+  return score;
+}
+function searchKeywordMemoryRows(rows = {}, queryText = '', queryKeywords = [], char = null, settings = {}, limit = 5) {
+  const terms = memorySignalTerms(queryText, queryKeywords);
+  if (!terms.length) return [];
+  const candidates = [];
+  for (const e of rows.events || []) {
+    const text = memoryAliasText([e.happenedAt, e.title, e.detail, ...(e.keywords || [])].filter(Boolean).join('｜'), char, settings);
+    if (!shouldKeepEvent(e)) continue;
+    candidates.push({ text, importance: e.importance || 3, score: scoreKeywordMemoryText(text, terms, e.importance || 3) });
+  }
+  for (const p of rows.profiles || []) {
+    const text = memoryAliasText([p.title, p.detail, ...(p.keywords || [])].filter(Boolean).join('｜'), char, settings);
+    if (!shouldKeepProfile(p)) continue;
+    candidates.push({ text, importance: p.importance || 3, score: scoreKeywordMemoryText(text, terms, p.importance || 3) });
+  }
+  for (const s of rows.summaries || []) {
+    const text = memoryAliasText(s.content, char, settings);
+    if (!shouldKeepSummary(text)) continue;
+    candidates.push({ text, importance: 2, score: scoreKeywordMemoryText(text, terms, 2) });
+  }
+  return candidates
+    .filter(item => item.score >= 1)
+    .sort((a, b) => b.score - a.score || (b.importance || 0) - (a.importance || 0))
+    .slice(0, limit);
+}
 
 function shouldKeepEvent(e) {
   const type = String(e?.type || '');
@@ -449,7 +498,7 @@ function messageLine(m, char, settings = {}) {
   return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
 }
 
-function buildMemoryPack(charId, char, settings = {}) {
+function buildMemoryPack(charId, char, settings = {}, queryText = '') {
   return Promise.all([
     getAll('summaries'),
     getAll('events'),
@@ -462,6 +511,8 @@ function buildMemoryPack(charId, char, settings = {}) {
     if (latestSummaries.length) parts.push('近期增量摘要：\n' + latestSummaries.map(s => `- ${memoryAliasText(s.content, char, settings)}`).join('\n'));
     if (importantEvents.length) parts.push('重要事件和时间节点：\n' + importantEvents.map(e => `- ${memoryAliasText(e.happenedAt || '未注明', char, settings)}｜${memoryAliasText(e.title || '事件', char, settings)}：${memoryAliasText(e.detail, char, settings)}`).join('\n'));
     if (profileRows.length) parts.push('稳定资料和关系状态：\n' + profileRows.map(p => `- ${memoryAliasText(p.title || p.type || '资料', char, settings)}：${memoryAliasText(p.detail, char, settings)}`).join('\n'));
+    const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, queryText, [], char, settings, 5);
+    if (keywordRows.length) parts.push('当前触发原因命中的本地记忆：\n' + keywordRows.map(row => `- ${row.text}`).join('\n'));
     if (!parts.length) return '';
     return `以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。\n\n${parts.join('\n\n')}`;
   });
@@ -677,8 +728,9 @@ async function handleProactivePush(payload) {
   if (!char || !chat?.messages?.length) throw new Error('missing chat');
   if (!(settings.chatApiUrl || settings.apiUrl) || !(settings.chatApiKey || settings.apiKey) || !(settings.chatModel || settings.model)) throw new Error('missing api config');
   const proactiveNow = new Date();
-  const memoryPack = await buildMemoryPack(charId, char, settings);
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
+  const memoryQuery = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
+  const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
   const system = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext);
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
@@ -742,8 +794,9 @@ async function handleProactiveMomentPush(state, charId, payload) {
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) return false;
   const proactiveNow = new Date();
-  const memoryPack = await buildMemoryPack(charId, char, settings);
   const momentContext = buildBackgroundMomentContext(allMoments, characters, charId, settings, 6);
+  const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext(proactiveNow)}\n${charName(char)}准备主动发朋友圈。\n${momentContext}`;
+  const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
   const system = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
   const messages = proactiveRecentMessages(chat, 20, proactiveNow);
   const raw = (await callModel(settings, system, messages)).trim();
