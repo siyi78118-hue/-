@@ -3141,6 +3141,12 @@ function cloudTimerStatusText() {
   const momentJob = latest?.chat?.pendingMomentJob;
   if (chatJob?.dueAt) rows.push(`私聊下次：${formatFullTime(new Date(chatJob.dueAt))}`);
   if (momentJob?.dueAt) rows.push(`朋友圈下次：${formatFullTime(new Date(momentJob.dueAt))}`);
+  if (latest?.chat?.lastProactiveChatFailedAt) {
+    rows.push(`私聊上次失败：${formatFullTime(new Date(latest.chat.lastProactiveChatFailedAt))}${latest.chat.lastProactiveChatError ? '｜' + latest.chat.lastProactiveChatError : ''}`);
+  }
+  if (latest?.chat?.lastProactiveMomentFailedAt) {
+    rows.push(`朋友圈上次失败：${formatFullTime(new Date(latest.chat.lastProactiveMomentFailedAt))}${latest.chat.lastProactiveMomentError ? '｜' + latest.chat.lastProactiveMomentError : ''}`);
+  }
   const statusLine = (label, status, atValue) => {
     if (!status) return '';
     const at = atValue ? formatFullTime(new Date(atValue)) : '';
@@ -3413,7 +3419,7 @@ function findProactiveTarget() {
   const now = Date.now();
   return getLatestChatRows().find(({ chat, last }) => {
     const lastAt = last.time || 0;
-    const lastProactiveAt = chat.lastProactiveChatAt || 0;
+    const lastProactiveAt = Math.max(chat.lastProactiveChatAt || 0, chat.lastProactiveChatFailedAt || 0);
     if (!lastAt || now - lastAt < idleMs) return false;
     if (lastProactiveAt && now - lastProactiveAt < idleMs) return false;
     return !String(last.content || '').startsWith('（');
@@ -3424,7 +3430,7 @@ function findProactiveMomentTarget() {
   const now = Date.now();
   return getLatestChatRows().find(({ chat, last }) => {
     const lastAt = last.time || 0;
-    const lastProactiveAt = chat.lastProactiveMomentAt || 0;
+    const lastProactiveAt = Math.max(chat.lastProactiveMomentAt || 0, chat.lastProactiveMomentFailedAt || 0);
     if (!lastAt || now - lastAt < idleMs) return false;
     if (lastProactiveAt && now - lastProactiveAt < idleMs) return false;
     return !String(last.content || '').startsWith('（');
@@ -3470,16 +3476,20 @@ async function triggerProactiveMessage(charId, manual = false) {
         );
     clearStreamingDraft(charId);
     const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
-    chat.lastProactiveAt = Date.now();
-    chat.lastProactiveChatAt = Date.now();
     delete chat.pendingProactiveJob;
     if (isEmptyReplyText(replyText)) {
+      chat.lastProactiveFailedAt = Date.now();
+      chat.lastProactiveChatFailedAt = Date.now();
+      chat.lastProactiveChatError = '空回复';
       DB.set('chats', allChats);
       if (manual) toast('主动消息没有生成内容，已跳过写入', 2600);
       try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
       if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成了空回复，已跳过并安排下次重试。', true, 'chat');
       return false;
     }
+    chat.lastProactiveAt = Date.now();
+    chat.lastProactiveChatAt = Date.now();
+    delete chat.lastProactiveChatError;
     appendAssistantMessages(chat, replyText, { proactive: true });
     chat.lastProactiveType = 'chat';
     if (activeScreen !== 'chat' || currentCharId !== charId) chat.unread = (chat.unread || 0) + 1;
@@ -3494,8 +3504,9 @@ async function triggerProactiveMessage(charId, manual = false) {
   } catch (err) {
     clearStreamingDraft(charId);
     if (chat) {
-      chat.lastProactiveAt = Date.now();
-      chat.lastProactiveChatAt = Date.now();
+      chat.lastProactiveFailedAt = Date.now();
+      chat.lastProactiveChatFailedAt = Date.now();
+      chat.lastProactiveChatError = technicalErrorMessage(err);
       delete chat.pendingProactiveJob;
       DB.set('chats', allChats);
       try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
@@ -3537,17 +3548,21 @@ async function triggerProactiveMoment(charId, manual = false) {
           }
         );
     const text = momentSnippet(rawText, 160);
-    chat.lastProactiveAt = Date.now();
-    chat.lastProactiveMomentAt = Date.now();
-    chat.lastProactiveType = 'moment';
     delete chat.pendingMomentJob;
     if (isEmptyReplyText(text)) {
+      chat.lastProactiveFailedAt = Date.now();
+      chat.lastProactiveMomentFailedAt = Date.now();
+      chat.lastProactiveMomentError = '空动态';
       DB.set('chats', allChats);
       if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
       try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
       if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成了空动态，已跳过并安排下次重试。', true, 'moment');
       return false;
     }
+    chat.lastProactiveAt = Date.now();
+    chat.lastProactiveMomentAt = Date.now();
+    chat.lastProactiveType = 'moment';
+    delete chat.lastProactiveMomentError;
     createCharacterMoment(char.id, text, { proactive: true });
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
@@ -3556,8 +3571,9 @@ async function triggerProactiveMoment(charId, manual = false) {
     return true;
   } catch (err) {
     if (chat) {
-      chat.lastProactiveAt = Date.now();
-      chat.lastProactiveMomentAt = Date.now();
+      chat.lastProactiveFailedAt = Date.now();
+      chat.lastProactiveMomentFailedAt = Date.now();
+      chat.lastProactiveMomentError = technicalErrorMessage(err);
       delete chat.pendingMomentJob;
       DB.set('chats', allChats);
       try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
