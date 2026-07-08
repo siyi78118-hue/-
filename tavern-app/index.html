@@ -685,6 +685,7 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
+          <button class="cell" onclick="copyModelCallDiagnostics()" type="button"><div class="cell-label">诊断</div><div class="cell-body">复制最近调用</div><div class="mini">›</div></button>
         </div>
         <div class="cell-group">
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
@@ -1408,6 +1409,7 @@ function recordModelCall(entry = {}) {
       outputPreview: compactLogText(entry.output, 600)
     });
     localStorage.setItem('rpchat_call_logs', JSON.stringify(logs.slice(0, CALL_LOG_LIMIT)));
+    if (activeScreen === 'settings') renderCloudTimerStatus();
   } catch (err) {
     console.warn('[AL CallLog] skipped:', err.message);
   }
@@ -1437,9 +1439,51 @@ function formatModelCallStatus(log) {
   const note = log.error || log.diagnostic || '';
   return `最近调用：${parts.join('｜')}${note ? '｜' + compactLogText(note, 80) : ''}`;
 }
+function formatModelCallDiagnostic(log, index = 0) {
+  if (!log) return '';
+  const rows = [
+    `#${index + 1} ${log.time || (log.at ? formatFullTime(new Date(log.at)) : '')}`,
+    `scene=${log.scene || ''}`,
+    `kind=${log.kind || ''}`,
+    `provider=${log.provider || ''}`,
+    `model=${log.model || ''}`,
+    `ok=${log.ok !== false}`,
+    `empty=${!!log.empty}`,
+    `messages=${log.messageCount || 0}`,
+    `systemChars=${log.systemChars || 0}`,
+    `memoryChars=${log.memoryChars || 0}`,
+    log.error ? `error=${compactLogText(log.error, 400)}` : '',
+    log.diagnostic ? `diagnostic=${compactLogText(log.diagnostic, 400)}` : '',
+    log.outputPreview ? `output=${compactLogText(log.outputPreview, 400)}` : '',
+    log.systemPreview ? `system=${compactLogText(log.systemPreview, 900)}` : '',
+    Array.isArray(log.messagesPreview) && log.messagesPreview.length
+      ? 'messages=' + log.messagesPreview.map(m => `${m.role}: ${compactLogText(m.content, 220)}`).join(' / ')
+      : ''
+  ].filter(Boolean);
+  return rows.join('\n');
+}
+async function copyModelCallDiagnostics() {
+  const logs = (await getAllModelCallLogs()).slice(0, 5);
+  if (!logs.length) { toast('还没有模型调用记录'); return; }
+  const text = logs.map(formatModelCallDiagnostic).join('\n\n---\n\n');
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.left = '-9999px';
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand('copy');
+    area.remove();
+  }
+  toast('已复制最近调用诊断');
+}
 function clearModelCallLogs() {
   localStorage.removeItem('rpchat_call_logs');
   if (typeof MemoryDB !== 'undefined') MemoryDB.setMeta('call_logs', []).catch(() => {});
+  if (activeScreen === 'settings') renderCloudTimerStatus();
 }
 
 function showScreen(name) {
