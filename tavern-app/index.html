@@ -907,6 +907,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
+const PROACTIVE_MEMORY_TIMEOUT_MS = 20000;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 function migrateSettings(raw) {
@@ -1263,6 +1264,14 @@ function friendlyErrorMessage(err) {
   if (/429|rate limit/i.test(raw)) return '接口请求过于频繁，请稍后再试';
   if (/non ISO-8859-1|ByteString|headers/i.test(raw)) return 'Key 含有隐藏字符，请重新粘贴或手动输入';
   return raw;
+}
+function timeoutAfter(ms, message) {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(message)), ms);
+  });
+}
+async function withTimeout(promise, ms, message) {
+  return Promise.race([promise, timeoutAfter(ms, message)]);
 }
 function textFromContent(value) {
   if (value == null) return '';
@@ -2973,6 +2982,15 @@ async function prepareMemoryPack(charId, userInput) {
   if (!parts.length) return '';
   return `以下是后台本地记忆库提供给你的参考，只在与当前对话相关时使用。不要提到“记忆库/向量/摘要/系统提示”，不要照搬结构化文字，仍然只输出角色发来的聊天消息。\n\n${parts.join('\n\n')}`;
 }
+async function prepareProactiveMemoryPack(charId, query) {
+  try {
+    return await withTimeout(prepareMemoryPack(charId, query), PROACTIVE_MEMORY_TIMEOUT_MS, '主动消息记忆检索超时');
+  } catch (err) {
+    console.warn('[AL Memory] proactive memory skipped:', err.message);
+    if (settings.cloudTimerEnabled) setCloudTimerStatus('主动消息记忆检索较慢，先用最近聊天生成。');
+    return '';
+  }
+}
 async function extractTurnMemory(charId, batch) {
   const char = characters.find(c => c.id === charId);
   const oldSummaries = (await MemoryDB.byChar('summaries', charId)).sort((a, b) => a.createdAt - b.createdAt).map(s => memoryAliasText(s.content, char)).join('\n');
@@ -3378,7 +3396,8 @@ async function triggerProactiveMessage(charId, manual = false) {
     const proactiveNow = new Date();
     const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
-    const memoryPack = await prepareMemoryPack(charId, query);
+    const memoryPack = manual ? await prepareMemoryPack(charId, query) : await prepareProactiveMemoryPack(charId, query);
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊正在请求聊天模型。');
     const reply = await callAPI(chat, memoryPack, { charId, live: manual, proactive: true, proactiveNow, proactiveTimeContext });
     clearStreamingDraft(charId);
     const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
