@@ -192,6 +192,30 @@ function proactiveRecentMessages(chat, count = 30, now = new Date()) {
   });
 }
 
+function createPromptComposer(scene) {
+  const blocks = [];
+  return {
+    add(id, content, options = {}) {
+      const value = String(content || '').trim();
+      if (!value) return;
+      const scenes = Array.isArray(options.scenes) ? options.scenes : null;
+      if (scenes && !scenes.includes(scene)) return;
+      blocks.push({
+        id,
+        content: value,
+        priority: Number.isFinite(options.priority) ? options.priority : 100
+      });
+    },
+    compile() {
+      return blocks
+        .sort((a, b) => a.priority - b.priority || String(a.id).localeCompare(String(b.id)))
+        .map(block => block.content)
+        .filter(Boolean)
+        .join('\n\n');
+    }
+  };
+}
+
 function splitAssistantOutput(text) {
   const normalized = String(text || '').replace(/\r\n?/g, '\n').trim();
   if (!normalized) return [];
@@ -359,6 +383,36 @@ function memoryAliasText(text, char, settings = {}) {
     .replace(/角色/g, charName(char));
 }
 
+function momentSnippet(text, max = 90) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+
+function buildBackgroundMomentContext(allMoments, characters, charId, settings = {}, limit = 6) {
+  if (!Array.isArray(allMoments) || !allMoments.length) return '';
+  const rows = allMoments
+    .filter(moment => {
+      if (moment.authorType === 'player') return true;
+      if (moment.charId === charId) return true;
+      if ((moment.likes || []).includes(charId)) return true;
+      return (moment.comments || []).some(c => c.charId === charId);
+    })
+    .sort((a, b) => (b.time || 0) - (a.time || 0))
+    .slice(0, limit);
+  if (!rows.length) return '';
+  const lines = rows.map(moment => {
+    const author = moment.authorType === 'player'
+      ? playerName(settings)
+      : charName((characters || []).find(c => c.id === moment.charId));
+    const parts = [`${formatFullTime(new Date(moment.time || Date.now()))}｜${author}发了朋友圈：“${momentSnippet(moment.text, 80)}”`];
+    if ((moment.likes || []).includes(charId)) parts.push(`${charName((characters || []).find(c => c.id === charId))}点过赞`);
+    const ownComments = (moment.comments || []).filter(c => c.charId === charId);
+    ownComments.forEach(c => parts.push(`${charName((characters || []).find(ch => ch.id === charId))}评论过：“${momentSnippet(c.text, 60)}”`));
+    return `- ${parts.join('；')}`;
+  });
+  return `以下是最近朋友圈上下文，角色可以自然记得自己看过、点赞过、评论过或发过的动态；不要提到“系统记录/上下文”。\n${lines.join('\n')}`;
+}
+
 function memoryTextHasSignal(text) {
   const value = String(text || '');
   return /(承诺|约定|答应|计划|以后|下次|明天|今晚|周|红包|金额|欠|补偿|道歉|和好|吵|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住|城市|家|学校|公司|重要|不能忘|必须记)/.test(value);
@@ -395,11 +449,6 @@ function messageLine(m, char, settings = {}) {
   return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
 }
 
-function momentSnippet(text, max = 90) {
-  const value = String(text || '').replace(/\s+/g, ' ').trim();
-  return value.length > max ? value.slice(0, max - 1) + '…' : value;
-}
-
 function buildMemoryPack(charId, char, settings = {}) {
   return Promise.all([
     getAll('summaries'),
@@ -416,6 +465,41 @@ function buildMemoryPack(charId, char, settings = {}) {
     if (!parts.length) return '';
     return `以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。\n\n${parts.join('\n\n')}`;
   });
+}
+
+function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext) {
+  const composer = createPromptComposer('proactive-chat');
+  composer.add('char-prompt', chat.charPrompt || `当前你要扮演的角色：${charName(char)}`, { priority: 0 });
+  composer.add('time-context', '当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow), { priority: 10 });
+  composer.add('memory-pack', memoryPack, { priority: 20 });
+  composer.add('global-extra-preset', settings.systemPrompt ? '全局补充预设：\n' + settings.systemPrompt : '', { priority: 80 });
+  composer.add('chat-extra-prompt', chat.extraPrompt ? '当前会话补充：\n' + chat.extraPrompt : '', { priority: 90 });
+  composer.add('proactive-time-context', proactiveTimeContext, { priority: 100 });
+  composer.add('proactive-task', `主动消息任务：现在不是${playerName(settings)}刚刚发消息后等你回答，而是经过了一段空闲时间后，你作为${charName(char)}主动给${playerName(settings)}发来一条微信式消息。
+你应该根据时间流逝、你上一条说过的话、未解决话题、约定或关系状态主动开口。
+可以延续上一话题、关心${playerName(settings)}、提起约定、找一个符合角色的自然话题；长间隔时更像重新打开聊天。
+只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替${playerName(settings)}说话。
+如果想连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
+默认 1-3 句。`, { priority: 110, scenes: ['proactive-chat'] });
+  return composer.compile();
+}
+
+function buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext = '') {
+  const composer = createPromptComposer('moment-post');
+  composer.add('char-prompt', chat.charPrompt || `当前你要扮演的角色：${charName(char)}`, { priority: 0 });
+  composer.add('time-context', '当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow), { priority: 10 });
+  composer.add('memory-pack', memoryPack, { priority: 20 });
+  composer.add('moment-context', momentContext, { priority: 30 });
+  composer.add('global-extra-preset', settings.systemPrompt ? '全局补充预设：\n' + settings.systemPrompt : '', { priority: 80 });
+  composer.add('chat-extra-prompt', chat.extraPrompt ? '当前会话补充：\n' + chat.extraPrompt : '', { priority: 90 });
+  composer.add('moment-task', `朋友圈发布动态任务：
+现在不是在私聊回复${playerName(settings)}，而是${charName(char)}自己发一条朋友圈动态。
+只能输出 JSON，不要输出解释：{"text":"朋友圈正文"}
+text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
+不要出现“用户/角色/API/系统/提示词/模型”等说法。
+可以自然参考当前时间、最近聊天、朋友圈上下文、关系和未完成约定，但不要机械复述。
+默认 1-2 句，像真人朋友圈动态；不要使用换行排版。`, { priority: 100, scenes: ['moment-post'] });
+  return composer.compile();
 }
 
 async function callModel(settings, system, messages, options = {}) {
@@ -595,19 +679,7 @@ async function handleProactivePush(payload) {
   const proactiveNow = new Date();
   const memoryPack = await buildMemoryPack(charId, char, settings);
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
-  let system = chat.charPrompt || `当前你要扮演的角色：${char.name}`;
-  system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow);
-  if (memoryPack) system += '\n\n' + memoryPack;
-  if (settings.systemPrompt) system += '\n\n' + settings.systemPrompt;
-  if (chat.extraPrompt) system += '\n\n' + chat.extraPrompt;
-  system += `\n\n${proactiveTimeContext}
-
-主动消息任务：现在不是用户刚刚发消息后等你回答，而是经过了一段空闲时间后，你作为${char.name}主动给用户发来一条微信式消息。
-你应该根据时间流逝、你上一条说过的话、未解决话题、约定或关系状态主动开口。
-可以延续上一话题、关心用户、提起约定、找一个符合角色的自然话题；长间隔时更像重新打开聊天。
-只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替用户说话。
-如果想连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
-默认 1-3 句。`;
+  const system = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext);
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
   const reply = (await callModel(settings, system, messages, { stream: true })).trim();
@@ -671,18 +743,8 @@ async function handleProactiveMomentPush(state, charId, payload) {
   if (!char || !chat?.messages?.length) return false;
   const proactiveNow = new Date();
   const memoryPack = await buildMemoryPack(charId, char, settings);
-  let system = chat.charPrompt || `当前你要扮演的角色：${char.name}`;
-  system += '\n\n当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow);
-  if (memoryPack) system += '\n\n' + memoryPack;
-  if (settings.systemPrompt) system += '\n\n' + settings.systemPrompt;
-  if (chat.extraPrompt) system += '\n\n' + chat.extraPrompt;
-  system += `\n\n朋友圈发布动态任务：
-现在不是在私聊回复用户，而是${char.name}自己发一条朋友圈动态。
-只能输出 JSON，不要输出解释：{"text":"朋友圈正文"}
-text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
-不要出现“用户/角色/API/系统/提示词/模型”等说法。
-可以自然参考当前时间、最近聊天、关系和未完成约定，但不要机械复述。
-默认 1-2 句，像真人朋友圈动态；不要使用换行排版。`;
+  const momentContext = buildBackgroundMomentContext(allMoments, characters, charId, settings, 6);
+  const system = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
   const messages = proactiveRecentMessages(chat, 20, proactiveNow);
   const raw = (await callModel(settings, system, messages)).trim();
   let text = '';
