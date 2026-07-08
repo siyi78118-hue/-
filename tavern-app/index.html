@@ -3405,7 +3405,13 @@ async function triggerProactiveTarget(target, manual = false) {
   return triggerProactiveMessage(target.char.id, manual);
 }
 async function checkProactiveMessages() {
-  if (!settings.proactiveEnabled || settings.cloudTimerEnabled || proactiveBusy || isStreaming) return;
+  if (!settings.proactiveEnabled || proactiveBusy || isStreaming) return;
+  if (settings.cloudTimerEnabled) {
+    await catchUpDueCloudProactive();
+    if (proactiveBusy || isStreaming) return;
+    ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] foreground resync skipped:', err.message));
+    return;
+  }
   const chatTarget = findProactiveTarget();
   if (chatTarget) await triggerProactiveMessage(chatTarget.char.id, false);
   if (proactiveBusy || isStreaming) return;
@@ -3476,6 +3482,40 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
     clearTimeout(timer);
   }
 }
+function streamTimeoutError() {
+  return new Error('连接超时');
+}
+async function readStreamChunk(reader, timeoutMs = API_TIMEOUT_MS) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(streamTimeoutError()), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+function parseJsonFallbackText(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  const dataLines = lines
+    .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+    .map(line => line.slice(6).trim())
+    .filter(Boolean);
+  const candidates = dataLines.length ? dataLines : [text];
+  for (const item of candidates.reverse()) {
+    try {
+      const parsed = JSON.parse(item);
+      const value = extractResponseText(parsed);
+      if (value) return value;
+    } catch {}
+  }
+  return '';
+}
 async function callOpenAI(system, messages, options = {}) {
   const live = options.live !== false;
   const chatApiKey = assertHeaderSafe(cleanApiKey(settings.chatApiKey), '聊天接口 Key');
@@ -3491,11 +3531,13 @@ async function callOpenAI(system, messages, options = {}) {
 }
 async function readOpenAIStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
-  let result = '', buffer = '';
+  let result = '', buffer = '', raw = '';
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader, API_TIMEOUT_MS);
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    const chunk = decoder.decode(value, { stream: true });
+    raw += chunk;
+    buffer += chunk;
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
     for (const line of lines) {
@@ -3511,6 +3553,7 @@ async function readOpenAIStream(resp, charId = currentCharId) {
       } catch {}
     }
   }
+  if (!result.trim()) result = parseJsonFallbackText(raw + buffer);
   return result.trim();
 }
 async function callClaude(system, messages, options = {}) {
@@ -3528,11 +3571,13 @@ async function callClaude(system, messages, options = {}) {
 }
 async function readClaudeStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
-  let result = '', buffer = '';
+  let result = '', buffer = '', raw = '';
   while (true) {
-    const { done, value } = await reader.read();
+    const { done, value } = await readStreamChunk(reader, API_TIMEOUT_MS);
     if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    const chunk = decoder.decode(value, { stream: true });
+    raw += chunk;
+    buffer += chunk;
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
     for (const line of lines) {
@@ -3547,6 +3592,7 @@ async function readClaudeStream(resp, charId = currentCharId) {
       } catch {}
     }
   }
+  if (!result.trim()) result = parseJsonFallbackText(raw + buffer);
   return result.trim();
 }
 
@@ -3896,7 +3942,7 @@ async function bootApp() {
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw-v8.js').catch(() => {});
+    navigator.serviceWorker.register('sw-v9.js').catch(() => {});
     navigator.serviceWorker.addEventListener('message', event => {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
     });
