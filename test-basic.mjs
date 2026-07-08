@@ -96,12 +96,15 @@ globalThis.__appTest = {
   createPromptComposer,
   chatSceneFromOptions,
   buildChatSceneSystem,
+  buildMomentInteractionPayload,
+  buildMomentPostPayload,
+  buildMomentReplyPayload,
   memoryAliasText,
   shouldKeepEvent,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, memoryAliasText, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, memoryAliasText, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -160,6 +163,22 @@ const chatSystem = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记
 assert.match(chatSystem, /微信私聊/);
 assert.match(chatSystem, /记忆：林晚和玩家约好周末见。/);
 assert.match(chatSystem, /当前触发情况：玩家刚在私聊里发来消息/);
+const playerMoment = { text: '今天有点想喝热茶。', likes: [], comments: [], time: Date.now(), authorType: 'player' };
+const interactionPayload = buildMomentInteractionPayload(v2, playerMoment, '记忆：林晚刚收过玩家的红包。');
+assert.match(interactionPayload.system, /朋友圈动态互动/);
+assert.match(interactionPayload.system, /只允许输出 JSON，不要输出解释：\{"like":true\/false,"comment":"留言正文或空字符串"\}/);
+assert.match(interactionPayload.system, /记忆：林晚刚收过玩家的红包。/);
+assert.match(interactionPayload.messages[0].content, /朋友圈正文：今天有点想喝热茶。/);
+const postPayload = buildMomentPostPayload(v2, { messages: [] }, '记忆：林晚和玩家约好周末见。');
+assert.match(postPayload.system, /朋友圈发布动态/);
+assert.match(postPayload.system, /只允许输出 JSON，不要输出解释：\{"text":"朋友圈正文"\}/);
+assert.match(postPayload.messages[0].content, /最近私聊/);
+const ownMoment = { text: '雨停了。', comments: [{ name: '玩家', text: '终于能出门了' }], time: Date.now(), authorType: 'character' };
+const replyPayload = buildMomentReplyPayload(v2, ownMoment, '终于能出门了', '记忆：玩家怕冷。');
+assert.match(replyPayload.system, /朋友圈评论回复/);
+assert.match(replyPayload.system, /只允许输出 JSON，不要输出解释：\{"comment":"回复评论正文或空字符串"\}/);
+assert.match(replyPayload.system, /记忆：玩家怕冷。/);
+assert.match(replyPayload.messages[0].content, /玩家刚评论：终于能出门了/);
 assert.equal(cleanApiKey(' sk-test\u200b\n　'), 'sk-test');
 assert.match(getTimeContext(new Date('2026-07-04T09:05:03Z')), /当前设备时间/);
 assert.equal(getDayPeriod(new Date('2026-07-04T14:15:00')).label, '下午');

@@ -2401,11 +2401,16 @@ ${redpacketRule}
   composer.add('chat-extra-prompt', chat?.extraPrompt ? '当前会话补充：\n' + chat.extraPrompt : '', { priority: 100 });
   return composer.compile();
 }
+function buildMomentSceneSystem(char, sceneLabel, sceneKey, memoryPack, sceneRules) {
+  const composer = createPromptComposer(sceneKey);
+  composer.add('scene-base', buildSceneSystemBase(char, sceneLabel), { priority: 0 });
+  composer.add('memory-pack', memoryPack, { priority: 30 });
+  composer.add('moment-scene-rules', sceneRules, { priority: 40, scenes: [sceneKey] });
+  composer.add('global-extra-preset', settings.systemPrompt ? '全局补充预设：\n' + settings.systemPrompt : '', { priority: 90 });
+  return composer.compile();
+}
 function buildMomentInteractionPayload(char, moment, memoryPack = '') {
-  const system = `${buildSceneSystemBase(char, '朋友圈动态互动')}
-${memoryPack ? `\n${memoryPack}\n` : ''}
-
-当前触发情况：${char.name}在朋友圈看到${playerName()}发的动态。
+  const system = buildMomentSceneSystem(char, '朋友圈动态互动', 'moment-interaction', memoryPack, `当前触发情况：${char.name}在朋友圈看到${playerName()}发的动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是在朋友圈刷到${playerName()}刚发的一条动态。
 你可以选择点赞、留言、或者什么都不做。留言必须像朋友圈评论，不要像聊天框里的即时回复。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
@@ -2414,7 +2419,7 @@ ${char.name}现在不是在私聊回复${playerName()}，而是在朋友圈刷�
 1. comment 只能是语言本身，禁止动作、神态、心理、旁白、系统说明。
 2. comment 不要称呼“用户/角色”，需要称呼时使用昵称。
 3. 不要每次都评论；关系一般或动态普通时可以只点赞或划过。
-4. 留言默认 4-30 个中文字符，像真人朋友圈评论。`;
+4. 留言默认 4-30 个中文字符，像真人朋友圈评论。`);
   const user = `朋友圈作者：${playerName()}
 朋友圈正文：${moment.text}
 已有点赞：${(moment.likes || []).map(id => charName(characters.find(c => c.id === id))).join('、') || '无'}
@@ -2426,10 +2431,7 @@ ${buildMomentChatContext(char.id, 6) || '暂无'}
   return { system, messages: [{ role: 'user', content: user }] };
 }
 function buildMomentPostPayload(char, chat, memoryPack = '') {
-  const system = `${buildSceneSystemBase(char, '朋友圈发布动态')}
-${memoryPack ? `\n${memoryPack}\n` : ''}
-
-当前触发情况：${char.name}准备发一条朋友圈动态。
+  const system = buildMomentSceneSystem(char, '朋友圈发布动态', 'moment-post', memoryPack, `当前触发情况：${char.name}准备发一条朋友圈动态。
 ${char.name}现在不是在私聊回复${playerName()}，而是自己发一条朋友圈动态。
 动态应该像真人随手发的朋友圈，不要像给${playerName()}的直接回答。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
@@ -2438,7 +2440,7 @@ ${char.name}现在不是在私聊回复${playerName()}，而是自己发一条�
 1. text 只能是动态正文，禁止动作、神态、心理、旁白、系统说明。
 2. 不要出现“用户/角色/API/系统/提示词/模型”等说法。
 3. 可以自然参考当前时间、最近聊天、关系和未完成约定，但不要机械复述。
-4. 默认 1-2 句，像朋友圈动态；不要使用换行排版。`;
+4. 默认 1-2 句，像朋友圈动态；不要使用换行排版。`);
   const recent = visibleChatMessages(chat).slice(-12).map(m => messageLine(m, char)).join('\n') || '暂无';
   const user = `最近朋友圈上下文：
 ${buildMomentChatContext(char.id, 6) || '暂无'}
@@ -2450,10 +2452,7 @@ ${recent}
   return { system, messages: [{ role: 'user', content: user }] };
 }
 function buildMomentReplyPayload(char, moment, playerComment, memoryPack = '') {
-  const system = `${buildSceneSystemBase(char, '朋友圈评论回复')}
-${memoryPack ? `\n${memoryPack}\n` : ''}
-
-当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态，${char.name}已经看到了这条评论。
+  const system = buildMomentSceneSystem(char, '朋友圈评论回复', 'moment-reply', memoryPack, `当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态，${char.name}已经看到了这条评论。
 ${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
 只允许输出 JSON，不要输出解释：{"comment":"回复评论正文或空字符串"}
@@ -2462,7 +2461,7 @@ ${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
 2. 不要输出 like/timeline/text 等字段，不要让角色重新发一条朋友圈。
 3. 回复默认 4-35 个中文字符，像真实朋友圈评论区互动。
 4. 可以根据性格、关系、评论内容和当下情绪决定不回复；不回复时 comment 返回空字符串。
-5. 不要用“看到了”“嗯”“已阅”凑回复。只有真的有话要接、调侃、解释、追问或回应情绪时才写 comment。`;
+5. 不要用“看到了”“嗯”“已阅”凑回复。只有真的有话要接、调侃、解释、追问或回应情绪时才写 comment。`);
   const user = `朋友圈作者：${char.name}
 朋友圈正文：${moment.text}
 已有评论：
