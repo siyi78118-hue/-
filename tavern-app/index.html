@@ -3160,6 +3160,8 @@ function cloudTimerStatusText() {
   if (chatLine) rows.push(chatLine);
   const momentLine = statusLine('朋友圈结果', settings.cloudTimerLastMomentStatus, settings.cloudTimerLastMomentStatusAt);
   if (momentLine) rows.push(momentLine);
+  const ackLine = statusLine('测试推送确认', settings.cloudTimerLastTestAckStatus, settings.cloudTimerLastTestAckAt);
+  if (ackLine) rows.push(ackLine);
   return rows.join('\n');
 }
 function renderCloudTimerStatus() {
@@ -3179,6 +3181,12 @@ function setCloudTimerStatus(message, persist = true, kind = 'general') {
     settings.cloudTimerLastStatusAt = now;
   }
   if (persist) DB.set('settings', settings);
+  renderCloudTimerStatus();
+}
+function setCloudTimerTestAck(message) {
+  settings.cloudTimerLastTestAckStatus = message;
+  settings.cloudTimerLastTestAckAt = Date.now();
+  DB.set('settings', settings);
   renderCloudTimerStatus();
 }
 async function enableCloudTimer() {
@@ -3634,10 +3642,12 @@ async function handleForegroundProactiveRequest(data = {}) {
   try {
     await restoreAppStateFromMirror();
     if (data.kind === 'moment') {
+      if (data.test) setCloudTimerTestAck('本机已收到朋友圈测试推送，闹钟链路正常。');
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，朋友圈闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成朋友圈。', true, 'moment');
       if (data.charId) await triggerProactiveMoment(data.charId, false);
       else await catchUpDueCloudProactive();
     } else {
+      if (data.test) setCloudTimerTestAck('本机已收到私聊测试推送，闹钟链路正常。');
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成私聊。', true, 'chat');
       if (data.charId) await triggerProactiveMessage(data.charId, false);
       else await catchUpDueCloudProactive();
