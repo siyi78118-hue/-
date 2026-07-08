@@ -3825,6 +3825,22 @@ async function handleForegroundProactiveRequest(data = {}) {
     foregroundProactiveRequestBusy = false;
   }
 }
+async function handleForegroundDueProactiveRequest(data = {}) {
+  if (foregroundProactiveRequestBusy) return;
+  foregroundProactiveRequestBusy = true;
+  try {
+    await restoreAppStateFromMirror();
+    if (data.test) setCloudTimerTestAck('本机已收到云闹钟测试推送，闹钟链路正常。');
+    setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}云闹钟已被前台收到，正在检查所有到期任务。`);
+    if (settings.cloudTimerEnabled) setCloudTimerStatus(`云闹钟已触发，正在补跑 ${Number(data.jobCount) || 0} 个到期任务。`, true);
+    await catchUpDueCloudProactive();
+  } catch (err) {
+    setCloudTimerStatus('前台补跑云闹钟失败：' + friendlyErrorMessage(err));
+    console.warn('[AL Timer] foreground due request failed:', err.message);
+  } finally {
+    foregroundProactiveRequestBusy = false;
+  }
+}
 function startProactiveLoop() {
   if (proactiveTimer) {
     clearInterval(proactiveTimer);
@@ -4370,6 +4386,7 @@ async function bootApp() {
     navigator.serviceWorker.addEventListener('message', event => {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
       if (event.data?.type === 'al-run-proactive') handleForegroundProactiveRequest(event.data);
+      if (event.data?.type === 'al-run-proactive-due') handleForegroundDueProactiveRequest(event.data);
     });
   }
   if (document.addEventListener) {

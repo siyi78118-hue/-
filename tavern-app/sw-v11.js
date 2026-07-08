@@ -709,14 +709,31 @@ async function handleProactivePush(payload) {
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
   const { settings, characters, allChats } = state;
   scrubEmptyReplyMessages(allChats);
-  const dueJob = payload.charId
-    ? { charId: payload.charId, kind: payload.kind === 'moment' ? 'moment' : 'chat' }
-    : findDueProactiveJob(allChats);
+  const dueJobs = payload.charId
+    ? [{ charId: payload.charId, kind: payload.kind === 'moment' ? 'moment' : 'chat', job: null }]
+    : getDueProactiveJobs(allChats);
+  const dueJob = dueJobs[0] || null;
   const charId = dueJob?.charId || '';
   const kind = dueJob?.kind || 'chat';
   if (!charId) return;
   if (await hasVisibleClient()) {
+    if (!payload.charId) {
+      await notifyClients({ type: 'al-run-proactive-due', jobCount: dueJobs.length, test: dueJobs.some(row => row.job?.test) });
+      return;
+    }
     await notifyClients({ type: 'al-run-proactive', charId, kind, jobId: payload.jobId || dueJob.job?.jobId || '', test: !!(payload.test || dueJob.job?.test) });
+    return;
+  }
+  if (!payload.charId && dueJobs.length > 1) {
+    for (const row of dueJobs) {
+      await handleProactivePush({
+        type: 'proactive',
+        charId: row.charId,
+        kind: row.kind,
+        jobId: row.job?.jobId || '',
+        test: !!row.job?.test
+      });
+    }
     return;
   }
   setStateCloudTimerTriggerAck(state, `真实${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已被后台收到。`);
@@ -867,14 +884,18 @@ async function handleProactiveMomentPush(state, charId, payload) {
 }
 
 function findDueProactiveJob(allChats) {
+  return getDueProactiveJobs(allChats)[0] || null;
+}
+
+function getDueProactiveJobs(allChats) {
   const now = Date.now();
   const rows = Object.entries(allChats || {}).flatMap(([charId, chat]) =>
     PROACTIVE_JOB_KINDS.map(kind => ({ charId, kind, chat, job: chat?.[proactiveJobKey(kind)] }))
   );
-  const due = rows
+  return rows
     .filter(r => r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
-    .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0];
-  return due?.charId ? { charId: due.charId, kind: due.kind, job: due.job } : null;
+    .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))
+    .map(row => ({ charId: row.charId, kind: row.kind, job: row.job }));
 }
 
 self.addEventListener('push', event => {
