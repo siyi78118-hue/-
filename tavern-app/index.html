@@ -3386,9 +3386,9 @@ async function triggerProactiveMessage(charId, manual = false) {
     delete chat.pendingProactiveJob;
     if (isEmptyReplyText(replyText)) {
       DB.set('chats', allChats);
-      if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成了空回复，已跳过并安排下次重试。');
       if (manual) toast('主动消息没有生成内容，已跳过写入', 2600);
-      scheduleCloudProactive(charId, 'chat').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+      try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
+      if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成了空回复，已跳过并安排下次重试。');
       return false;
     }
     appendAssistantMessages(chat, replyText, { proactive: true });
@@ -3398,7 +3398,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成主动消息\n已写入当前会话', 2400);
-    scheduleCloudProactive(charId, 'chat').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+    try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台私聊已生成 ${splitAssistantOutput(replyText).filter(part => !isEmptyReplyText(part)).length || 1} 条消息。`);
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] proactive update skipped:', err.message));
     return true;
@@ -3409,7 +3409,7 @@ async function triggerProactiveMessage(charId, manual = false) {
       chat.lastProactiveChatAt = Date.now();
       delete chat.pendingProactiveJob;
       DB.set('chats', allChats);
-      scheduleCloudProactive(charId, 'chat').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+      try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     }
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成失败：' + friendlyErrorMessage(err));
     if (manual) toast('主动消息失败：' + friendlyErrorMessage(err), 3200);
@@ -3440,15 +3440,15 @@ async function triggerProactiveMoment(charId, manual = false) {
     delete chat.pendingMomentJob;
     if (isEmptyReplyText(text)) {
       DB.set('chats', allChats);
-      if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成了空动态，已跳过并安排下次重试。');
       if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
-      scheduleCloudProactive(charId, 'moment').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+      try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
+      if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成了空动态，已跳过并安排下次重试。');
       return false;
     }
     createCharacterMoment(char.id, text, { proactive: true });
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
-    scheduleCloudProactive(charId, 'moment').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+    try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈已发布 1 条动态。');
     return true;
   } catch (err) {
@@ -3457,7 +3457,7 @@ async function triggerProactiveMoment(charId, manual = false) {
       chat.lastProactiveMomentAt = Date.now();
       delete chat.pendingMomentJob;
       DB.set('chats', allChats);
-      scheduleCloudProactive(charId, 'moment').catch(err => console.warn('[AL Timer] reschedule skipped:', err.message));
+      try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     }
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成失败：' + friendlyErrorMessage(err));
     if (manual) toast('主动动态失败：' + friendlyErrorMessage(err), 3200);
