@@ -3510,7 +3510,7 @@ function parseJsonFallbackText(raw) {
   for (const item of candidates.reverse()) {
     try {
       const parsed = JSON.parse(item);
-      const value = extractResponseText(parsed);
+      const value = textFromContent(parsed?.choices?.[0]?.delta?.content) || extractResponseText(parsed);
       if (value) return value;
     } catch {}
   }
