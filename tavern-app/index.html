@@ -1270,6 +1270,19 @@ function friendlyErrorMessage(err) {
   if (/non ISO-8859-1|ByteString|headers/i.test(raw)) return 'Key 含有隐藏字符，请重新粘贴或手动输入';
   return raw;
 }
+function technicalErrorMessage(err) {
+  const raw = String(err?.message || err || '未知错误').replace(/\s+/g, ' ').trim();
+  if (/Failed to fetch|NetworkError|Load failed|ERR_FAILED/i.test(raw)) return '浏览器 fetch 失败，常见原因是接口 CORS、网络不可达、代理拦截或接口域名暂时不可用';
+  if (/timeout|timed out|超时|连接超时/i.test(raw)) return '请求超时';
+  const apiCode = raw.match(/\b(401|403|404|429|500|502|503|504)\b/);
+  if (apiCode) return `API ${apiCode[1]}：${raw.slice(0, 160)}`;
+  return raw.slice(0, 180);
+}
+function statusErrorMessage(err) {
+  const friendly = friendlyErrorMessage(err);
+  const technical = technicalErrorMessage(err);
+  return technical && technical !== friendly ? `${friendly}（详细：${technical}）` : friendly;
+}
 function isTransientApiError(err) {
   const raw = String(err?.message || err || '');
   return /503|502|504|429|rate limit|Failed to fetch|NetworkError|Load failed|ERR_FAILED|timeout|timed out|超时|连接超时/i.test(raw);
@@ -3452,7 +3465,7 @@ async function triggerProactiveMessage(charId, manual = false) {
           {
             retries: 2,
             delayMs: 3500,
-            onRetry: (err, attempt, total) => setCloudTimerStatus(`前台私聊请求失败，正在重试 ${attempt}/${total}：${friendlyErrorMessage(err)}`, true, 'chat')
+            onRetry: (err, attempt, total) => setCloudTimerStatus(`前台私聊请求失败，正在重试 ${attempt}/${total}：${statusErrorMessage(err)}`, true, 'chat')
           }
         );
     clearStreamingDraft(charId);
@@ -3487,9 +3500,9 @@ async function triggerProactiveMessage(charId, manual = false) {
       DB.set('chats', allChats);
       try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     }
-    if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成失败：' + friendlyErrorMessage(err), true, 'chat');
+    if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成失败：' + statusErrorMessage(err), true, 'chat');
     if (manual) toast('主动消息失败：' + friendlyErrorMessage(err), 3200);
-    console.warn('[AL Proactive] skipped:', err.message);
+    console.warn('[AL Proactive] skipped:', technicalErrorMessage(err), err);
     return false;
   } finally {
     proactiveChatBusy = false;
@@ -3520,7 +3533,7 @@ async function triggerProactiveMoment(charId, manual = false) {
           {
             retries: 2,
             delayMs: 3500,
-            onRetry: (err, attempt, total) => setCloudTimerStatus(`前台朋友圈请求失败，正在重试 ${attempt}/${total}：${friendlyErrorMessage(err)}`, true, 'moment')
+            onRetry: (err, attempt, total) => setCloudTimerStatus(`前台朋友圈请求失败，正在重试 ${attempt}/${total}：${statusErrorMessage(err)}`, true, 'moment')
           }
         );
     const text = momentSnippet(rawText, 160);
@@ -3549,9 +3562,9 @@ async function triggerProactiveMoment(charId, manual = false) {
       DB.set('chats', allChats);
       try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     }
-    if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成失败：' + friendlyErrorMessage(err), true, 'moment');
+    if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成失败：' + statusErrorMessage(err), true, 'moment');
     if (manual) toast('主动动态失败：' + friendlyErrorMessage(err), 3200);
-    console.warn('[AL Moments] proactive moment skipped:', err.message);
+    console.warn('[AL Moments] proactive moment skipped:', technicalErrorMessage(err), err);
     return false;
   } finally {
     proactiveMomentBusy = false;
