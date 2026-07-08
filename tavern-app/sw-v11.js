@@ -3,6 +3,7 @@ const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const API_TIMEOUT_MS = 120000;
+let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(APP_SHELL)));
@@ -248,6 +249,24 @@ function extractResponseText(json) {
     || textFromContent(json?.text)
   ).trim();
 }
+function compactRawResponse(raw) {
+  return String(raw || '').replace(/\s+/g, ' ').slice(0, 220);
+}
+function responseDiagnostic(json, raw = '') {
+  const choice = json?.choices?.[0] || {};
+  const message = choice?.message || {};
+  const parts = [];
+  if (choice.finish_reason || choice.finishReason) parts.push(`finish=${choice.finish_reason || choice.finishReason}`);
+  if (json?.candidates?.[0]?.finishReason) parts.push(`finish=${json.candidates[0].finishReason}`);
+  if (json?.promptFeedback?.blockReason) parts.push(`blocked=${json.promptFeedback.blockReason}`);
+  if (message && Object.keys(message).length) parts.push(`message字段=${Object.keys(message).join(',')}`);
+  if (textFromContent(message.reasoning_content || message.reasoning || message.reasoning_text)) parts.push('只发现 reasoning 内容，没有最终正文');
+  const textKeys = ['content', 'text', 'output_text', 'output'].filter(k => json?.[k] != null);
+  if (textKeys.length) parts.push(`顶层字段=${textKeys.join(',')}`);
+  const rawTip = compactRawResponse(raw);
+  if (rawTip) parts.push(`响应片段=${rawTip}`);
+  return parts.join('；') || '接口返回 200，但没有可解析的正文';
+}
 
 function parseJsonFallbackText(raw) {
   const text = String(raw || '').trim();
@@ -366,6 +385,7 @@ function buildMemoryPack(charId, char, settings = {}) {
 }
 
 async function callModel(settings, system, messages) {
+  lastModelResponseDiagnostic = '';
   const apiType = settings.chatApiType || settings.apiType || 'openai';
   const apiUrl = settings.chatApiUrl || settings.apiUrl || '';
   const apiKey = settings.chatApiKey || settings.apiKey || '';
@@ -380,9 +400,13 @@ async function callModel(settings, system, messages) {
     const raw = await resp.text();
     try {
       const json = JSON.parse(raw);
-      return extractResponseText(json) || parseJsonFallbackText(raw);
+      const text = extractResponseText(json) || parseJsonFallbackText(raw);
+      if (!text.trim()) lastModelResponseDiagnostic = responseDiagnostic(json, raw);
+      return text;
     } catch {
-      return parseJsonFallbackText(raw);
+      const text = parseJsonFallbackText(raw);
+      if (!text.trim()) lastModelResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+      return text;
     }
   }
   const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
@@ -394,9 +418,13 @@ async function callModel(settings, system, messages) {
   const raw = await resp.text();
   try {
     const json = JSON.parse(raw);
-    return extractResponseText(json) || parseJsonFallbackText(raw);
+    const text = extractResponseText(json) || parseJsonFallbackText(raw);
+    if (!text.trim()) lastModelResponseDiagnostic = responseDiagnostic(json, raw);
+    return text;
   } catch {
-    return parseJsonFallbackText(raw);
+    const text = parseJsonFallbackText(raw);
+    if (!text.trim()) lastModelResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+    return text;
   }
 }
 
@@ -550,12 +578,13 @@ async function handleProactivePush(payload) {
   chat.lastProactiveChatAt = Date.now();
   if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
   if (isEmptyReplyText(reply)) {
+    const emptyReason = lastModelResponseDiagnostic || '空回复';
     try {
       await scheduleNextCloudProactive(state, charId, 'chat');
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
-    setStateCloudTimerStatus(state, '后台私聊生成了空回复，已跳过并安排下次重试。', 'chat');
+    setStateCloudTimerStatus(state, `后台私聊生成了空回复：${emptyReason}，已跳过并安排下次重试。`, 'chat');
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
@@ -633,12 +662,13 @@ text 只能是动态正文，禁止动作、神态、心理、旁白、系统说
   chat.lastProactiveType = 'moment';
   if (chat.pendingMomentJob?.jobId === payload.jobId || payload.jobId || !payload.kind) delete chat.pendingMomentJob;
   if (!text || isEmptyReplyText(text)) {
+    const emptyReason = lastModelResponseDiagnostic || '空动态';
     try {
       await scheduleNextCloudProactive(state, charId, 'moment');
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
-    setStateCloudTimerStatus(state, '后台朋友圈生成了空动态，已跳过并安排下次重试。', 'moment');
+    setStateCloudTimerStatus(state, `后台朋友圈生成了空动态：${emptyReason}，已跳过并安排下次重试。`, 'moment');
     state.allChats = allChats;
     state.allMoments = allMoments;
     state.updatedAt = Date.now();

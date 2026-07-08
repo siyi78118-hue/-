@@ -954,6 +954,7 @@ let proactiveTimer = null;
 let proactiveChatBusy = false;
 let proactiveMomentBusy = false;
 let foregroundProactiveRequestBusy = false;
+let lastChatResponseDiagnostic = '';
 let settingsSaveTimer = null;
 let settingsFormHydrating = false;
 let playerProfileSaveTimer = null;
@@ -1342,6 +1343,24 @@ function extractResponseText(json) {
     || textFromContent(json?.content)
     || textFromContent(json?.text)
   ).trim();
+}
+function compactRawResponse(raw) {
+  return String(raw || '').replace(/\s+/g, ' ').slice(0, 220);
+}
+function responseDiagnostic(json, raw = '') {
+  const choice = json?.choices?.[0] || {};
+  const message = choice?.message || {};
+  const parts = [];
+  if (choice.finish_reason || choice.finishReason) parts.push(`finish=${choice.finish_reason || choice.finishReason}`);
+  if (json?.candidates?.[0]?.finishReason) parts.push(`finish=${json.candidates[0].finishReason}`);
+  if (json?.promptFeedback?.blockReason) parts.push(`blocked=${json.promptFeedback.blockReason}`);
+  if (message && Object.keys(message).length) parts.push(`message字段=${Object.keys(message).join(',')}`);
+  if (textFromContent(message.reasoning_content || message.reasoning || message.reasoning_text)) parts.push('只发现 reasoning 内容，没有最终正文');
+  const textKeys = ['content', 'text', 'output_text', 'output'].filter(k => json?.[k] != null);
+  if (textKeys.length) parts.push(`顶层字段=${textKeys.join(',')}`);
+  const rawTip = compactRawResponse(raw);
+  if (rawTip) parts.push(`响应片段=${rawTip}`);
+  return parts.join('；') || '接口返回 200，但没有可解析的正文';
 }
 function previewText(text) {
   const value = String(text || '');
@@ -3510,13 +3529,14 @@ async function triggerProactiveMessage(charId, manual = false) {
     const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
     delete chat.pendingProactiveJob;
     if (isEmptyReplyText(replyText)) {
+      const emptyReason = lastChatResponseDiagnostic || '空回复';
       chat.lastProactiveFailedAt = Date.now();
       chat.lastProactiveChatFailedAt = Date.now();
-      chat.lastProactiveChatError = '空回复';
+      chat.lastProactiveChatError = emptyReason;
       DB.set('chats', allChats);
       if (manual) toast('主动消息没有生成内容，已跳过写入', 2600);
       try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
-      if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成了空回复，已跳过并安排下次重试。', true, 'chat');
+      if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台私聊生成了空回复：${emptyReason}，已跳过并安排下次重试。`, true, 'chat');
       return false;
     }
     chat.lastProactiveAt = Date.now();
@@ -3582,13 +3602,14 @@ async function triggerProactiveMoment(charId, manual = false) {
     const text = momentSnippet(rawText, 160);
     delete chat.pendingMomentJob;
     if (isEmptyReplyText(text)) {
+      const emptyReason = lastChatResponseDiagnostic || '空动态';
       chat.lastProactiveFailedAt = Date.now();
       chat.lastProactiveMomentFailedAt = Date.now();
-      chat.lastProactiveMomentError = '空动态';
+      chat.lastProactiveMomentError = emptyReason;
       DB.set('chats', allChats);
       if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
       try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
-      if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成了空动态，已跳过并安排下次重试。', true, 'moment');
+      if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台朋友圈生成了空动态：${emptyReason}，已跳过并安排下次重试。`, true, 'moment');
       return false;
     }
     chat.lastProactiveAt = Date.now();
@@ -3767,6 +3788,7 @@ function parseJsonFallbackText(raw) {
 }
 async function callOpenAI(system, messages, options = {}) {
   const live = options.live !== false;
+  lastChatResponseDiagnostic = '';
   const chatApiKey = assertHeaderSafe(cleanApiKey(settings.chatApiKey), '聊天接口 Key');
   const resp = await fetchWithTimeout(settings.chatApiUrl.replace(/\/+$/, '') + '/chat/completions', {
     method: 'POST',
@@ -3775,8 +3797,17 @@ async function callOpenAI(system, messages, options = {}) {
   });
   if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
   if (live) return readOpenAIStream(resp, options.charId);
-  const json = await resp.json();
-  return extractResponseText(json);
+  const raw = await resp.text();
+  try {
+    const json = JSON.parse(raw);
+    const text = extractResponseText(json) || parseJsonFallbackText(raw);
+    if (!text.trim()) lastChatResponseDiagnostic = responseDiagnostic(json, raw);
+    return text;
+  } catch {
+    const text = parseJsonFallbackText(raw);
+    if (!text.trim()) lastChatResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+    return text;
+  }
 }
 async function readOpenAIStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
@@ -3807,6 +3838,7 @@ async function readOpenAIStream(resp, charId = currentCharId) {
 }
 async function callClaude(system, messages, options = {}) {
   const live = options.live !== false;
+  lastChatResponseDiagnostic = '';
   const chatApiKey = assertHeaderSafe(cleanApiKey(settings.chatApiKey), '聊天接口 Key');
   const resp = await fetchWithTimeout(settings.chatApiUrl.replace(/\/+$/, '') + '/messages', {
     method: 'POST',
@@ -3815,8 +3847,17 @@ async function callClaude(system, messages, options = {}) {
   });
   if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
   if (live) return readClaudeStream(resp, options.charId);
-  const json = await resp.json();
-  return extractResponseText(json);
+  const raw = await resp.text();
+  try {
+    const json = JSON.parse(raw);
+    const text = extractResponseText(json) || parseJsonFallbackText(raw);
+    if (!text.trim()) lastChatResponseDiagnostic = responseDiagnostic(json, raw);
+    return text;
+  } catch {
+    const text = parseJsonFallbackText(raw);
+    if (!text.trim()) lastChatResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+    return text;
+  }
 }
 async function readClaudeStream(resp, charId = currentCharId) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
