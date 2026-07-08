@@ -969,6 +969,7 @@ const EMPTY_REPLY_TEXT = '（对方没有回复）';
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 
 const MEMORY_DB_NAME = 'ALMemoryDB';
+const MEMORY_DB_VERSION = 2;
 const MEMORY_STORES = ['summaries', 'events', 'profiles', 'vectors', 'meta'];
 const VECTOR_DIM = 384;
 const MemoryDB = {
@@ -978,7 +979,7 @@ const MemoryDB = {
     if (typeof indexedDB === 'undefined') return null;
     if (this.dbPromise) return this.dbPromise;
     this.dbPromise = new Promise((resolve, reject) => {
-      const req = indexedDB.open(MEMORY_DB_NAME, 1);
+      const req = indexedDB.open(MEMORY_DB_NAME, MEMORY_DB_VERSION);
       req.onupgradeneeded = () => {
         const db = req.result;
         const ensure = (name, indexes = []) => {

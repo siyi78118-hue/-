@@ -1,6 +1,7 @@
 const CACHE_NAME = 'rpchat-v11';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
+const MEMORY_DB_VERSION = 2;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const API_TIMEOUT_MS = 120000;
 const CALL_LOG_LIMIT = 30;
@@ -46,7 +47,7 @@ self.addEventListener('fetch', e => {
 
 function openMemoryDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(MEMORY_DB_NAME, 1);
+    const req = indexedDB.open(MEMORY_DB_NAME, MEMORY_DB_VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
       const ensure = (name, indexes = []) => {
