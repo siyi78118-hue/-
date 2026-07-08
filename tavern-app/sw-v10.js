@@ -73,6 +73,12 @@ async function setMeta(key, value) {
   return put('meta', { key, value, updatedAt: Date.now() });
 }
 
+function setStateCloudTimerStatus(state, message) {
+  if (!state?.settings) return;
+  state.settings.cloudTimerLastStatus = message;
+  state.settings.cloudTimerLastStatusAt = Date.now();
+}
+
 function pad2(n) {
   return String(n).padStart(2, '0');
 }
@@ -202,6 +208,7 @@ function textFromContent(value) {
     return textFromContent(value.text)
       || textFromContent(value.content)
       || textFromContent(value.output_text)
+      || textFromContent(value.parts)
       || textFromContent(value.message?.content);
   }
   return String(value || '');
@@ -212,12 +219,34 @@ function extractResponseText(json) {
   return (
     textFromContent(choice?.message?.content)
     || textFromContent(choice?.message?.text)
+    || textFromContent(choice?.delta?.content)
     || textFromContent(choice?.text)
+    || textFromContent(json?.candidates?.[0]?.content?.parts)
+    || textFromContent(json?.candidates?.[0]?.content)
     || textFromContent(json?.output_text)
     || textFromContent(json?.output)
     || textFromContent(json?.content)
     || textFromContent(json?.text)
   ).trim();
+}
+
+function parseJsonFallbackText(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return '';
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  const dataLines = lines
+    .filter(line => line.startsWith('data: ') && line !== 'data: [DONE]')
+    .map(line => line.slice(6).trim())
+    .filter(Boolean);
+  const candidates = dataLines.length ? dataLines : [text];
+  for (const item of candidates.reverse()) {
+    try {
+      const parsed = JSON.parse(item);
+      const value = textFromContent(parsed?.choices?.[0]?.delta?.content) || extractResponseText(parsed);
+      if (value) return value;
+    } catch {}
+  }
+  return '';
 }
 
 async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
@@ -329,8 +358,13 @@ async function callModel(settings, system, messages) {
       body: JSON.stringify({ model: model || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: false })
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('API ' + resp.status);
-    const json = await resp.json();
-    return extractResponseText(json);
+    const raw = await resp.text();
+    try {
+      const json = JSON.parse(raw);
+      return extractResponseText(json) || parseJsonFallbackText(raw);
+    } catch {
+      return parseJsonFallbackText(raw);
+    }
   }
   const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
     method: 'POST',
@@ -338,8 +372,13 @@ async function callModel(settings, system, messages) {
     body: JSON.stringify({ model: model || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: false })
   }, API_TIMEOUT_MS);
   if (!resp.ok) throw new Error('API ' + resp.status);
-  const json = await resp.json();
-  return extractResponseText(json);
+  const raw = await resp.text();
+  try {
+    const json = JSON.parse(raw);
+    return extractResponseText(json) || parseJsonFallbackText(raw);
+  } catch {
+    return parseJsonFallbackText(raw);
+  }
 }
 
 async function notifyClients(data) {
@@ -425,6 +464,7 @@ async function recoverProactivePushFailure(payload = {}) {
   if (!charId || !chat) return false;
   try {
     await scheduleNextCloudProactive(state, charId, kind);
+    setStateCloudTimerStatus(state, `后台${kind === 'moment' ? '朋友圈' : '私聊'}生成失败，已安排下次重试。`);
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
@@ -480,6 +520,7 @@ async function handleProactivePush(payload) {
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    setStateCloudTimerStatus(state, '后台私聊生成了空回复，已跳过并安排下次重试。');
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
@@ -493,6 +534,7 @@ async function handleProactivePush(payload) {
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    setStateCloudTimerStatus(state, '后台私聊输出无法拆成有效消息，已安排下次重试。');
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
@@ -506,6 +548,7 @@ async function handleProactivePush(payload) {
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
+  setStateCloudTimerStatus(state, `后台私聊已生成 ${chunks.length} 条消息。`);
   state.allChats = allChats;
   state.updatedAt = Date.now();
   await setMeta('app_state', state);
@@ -560,6 +603,7 @@ text 只能是动态正文，禁止动作、神态、心理、旁白、系统说
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    setStateCloudTimerStatus(state, '后台朋友圈生成了空动态，已跳过并安排下次重试。');
     state.allChats = allChats;
     state.allMoments = allMoments;
     state.updatedAt = Date.now();
@@ -589,6 +633,7 @@ text 只能是动态正文，禁止动作、神态、心理、旁白、系统说
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
+  setStateCloudTimerStatus(state, '后台朋友圈已发布 1 条动态。');
   state.allChats = allChats;
   state.allMoments = allMoments;
   state.updatedAt = Date.now();

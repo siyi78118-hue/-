@@ -1271,6 +1271,7 @@ function textFromContent(value) {
     return textFromContent(value.text)
       || textFromContent(value.content)
       || textFromContent(value.output_text)
+      || textFromContent(value.parts)
       || textFromContent(value.message?.content);
   }
   return '';
@@ -1280,7 +1281,10 @@ function extractResponseText(json) {
   return (
     textFromContent(choice?.message?.content)
     || textFromContent(choice?.message?.text)
+    || textFromContent(choice?.delta?.content)
     || textFromContent(choice?.text)
+    || textFromContent(json?.candidates?.[0]?.content?.parts)
+    || textFromContent(json?.candidates?.[0]?.content)
     || textFromContent(json?.output_text)
     || textFromContent(json?.output)
     || textFromContent(json?.content)
