@@ -1,5 +1,26 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+
+function loadLocalCloudflareToken() {
+  if (process.env.CLOUDFLARE_API_TOKEN) return;
+  const candidates = [
+    join(homedir(), '.codex', 'secrets', 'cloudflare-al-token.env'),
+    join(homedir(), '.cloudflare', 'al-token.env')
+  ];
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    const text = readFileSync(file, 'utf8');
+    const line = text.split(/\r?\n/).find(item => item.trim().startsWith('CLOUDFLARE_API_TOKEN='));
+    if (!line) continue;
+    const token = line.slice(line.indexOf('=') + 1).trim().replace(/^["']|["']$/g, '');
+    if (token) {
+      process.env.CLOUDFLARE_API_TOKEN = token;
+      return;
+    }
+  }
+}
 
 function wranglerCommand() {
   if (process.env.WRANGLER_CMD) return process.env.WRANGLER_CMD;
@@ -18,9 +39,12 @@ if (!args.length) {
   process.exit(2);
 }
 
+loadLocalCloudflareToken();
+
 if (args[0] === 'deploy' && !process.env.CLOUDFLARE_API_TOKEN) {
   console.error('Missing CLOUDFLARE_API_TOKEN. Wrangler deploy cannot run non-interactively without it.');
   console.error('PowerShell: $env:CLOUDFLARE_API_TOKEN="your Cloudflare API token"');
+  console.error('Or save it to %USERPROFILE%\\.codex\\secrets\\cloudflare-al-token.env');
   process.exit(2);
 }
 

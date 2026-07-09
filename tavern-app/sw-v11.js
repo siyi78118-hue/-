@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v35';
+const CACHE_NAME = 'rpchat-v36';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -618,13 +618,23 @@ function buildBackgroundMomentContext(allMoments, characters, charId, settings =
 
 function memoryTextHasSignal(text) {
   const value = String(text || '');
-  return /(承诺|约定|答应|计划|以后|下次|明天|今晚|周|红包|金额|欠|补偿|道歉|和好|吵|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住|城市|家|学校|公司|重要|不能忘|必须记)/.test(value);
+  return /(承诺|约定|答应|计划|以后|下次|明天|今晚|周|红包|转账|收款|领取|拒收|退款|金额|欠|补偿|道歉|和好|吵|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住址|住在|城市|学校|公司|重要|不能忘|必须记|未解决|提醒|朋友圈|动态|评论|点赞|留言)/.test(value);
+}
+
+function memoryTextHasStrongSignal(text) {
+  const value = String(text || '');
+  if (/(承诺|约定|答应|计划|以后|下次|明天|今晚|周末|红包|转账|收款|领取|拒收|退款|金额|欠|补偿|道歉|和好|吵架|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住址|住在|城市|学校|公司|重要|不能忘|必须记|未解决|提醒|拒绝|答复)/.test(value)) return true;
+  return /(朋友圈|动态|评论|点赞|留言)/.test(value)
+    && /(承诺|约定|答应|计划|以后|下次|明天|今晚|周末|红包|转账|收款|领取|拒收|退款|金额|补偿|道歉|和好|吵架|争执|生气|雷点|边界|称呼|关系|喜欢|讨厌|重要|不能忘|必须记|未解决|提醒|拒绝|答复)/.test(value);
 }
 
 function memoryTextIsNoise(text) {
   const value = String(text || '');
-  return /(测试|校对|表快|表慢|几点|现在时间|AI身份|身份争论|是不是AI|名字.*合理|戏太多|科幻片|装神弄鬼|普通寒暄|你好|在吗|又来)/.test(value)
-    && !memoryTextHasSignal(value.replace(/测试|校对|几点|AI身份|身份争论/g, ''));
+  if (/\[语音消息\s*\d+秒，未转文字\]|未提供转文字内容|只能回应“收到语音”这个事实/.test(value)) return true;
+  const lowValueMoment = /(朋友圈|动态|评论|点赞|留言)/.test(value)
+    && /(哈哈|笑|乐|炫耀|普通|随手|测试|无后续|没必要|短评|只点|只评论)/.test(value);
+  const lowValueChat = /(测试|校对|表快|表慢|几点|现在时间|AI身份|身份争论|是不是AI|名字.*合理|戏太多|科幻片|装神弄鬼|普通寒暄|你好|在吗|又来)/.test(value);
+  return (lowValueMoment || lowValueChat) && !memoryTextHasStrongSignal(value);
 }
 function normalizeVector(vec) {
   const norm = Math.sqrt(vec.reduce((sum, n) => sum + n * n, 0)) || 1;
@@ -756,6 +766,7 @@ function shouldKeepEvent(e) {
   const text = [e?.title, e?.detail, e?.happenedAt, ...(e?.keywords || [])].join(' ');
   if (!e?.detail || memoryTextIsNoise(text)) return false;
   if (['promise', 'conflict', 'reconcile', 'preference', 'relationship', 'plan'].includes(type)) return importance >= 3 || memoryTextHasSignal(text);
+  if (['moment', 'fact', 'event'].includes(type)) return importance >= 4 && memoryTextHasStrongSignal(text);
   return importance >= 4 && memoryTextHasSignal(text);
 }
 
@@ -768,7 +779,7 @@ function shouldKeepProfile(p) {
 
 function shouldKeepSummary(summary) {
   const text = String(summary || '');
-  return text.length >= 20 && !memoryTextIsNoise(text) && memoryTextHasSignal(text);
+  return text.length >= 20 && !memoryTextIsNoise(text) && memoryTextHasStrongSignal(text);
 }
 
 function trimMemoryLine(text, max = MEMORY_LINE_CHAR_LIMIT) {
