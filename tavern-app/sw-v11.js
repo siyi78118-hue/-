@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v36';
+const CACHE_NAME = 'rpchat-v37';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -1025,15 +1025,22 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
   }
 }
 
-async function generateBackgroundMemoryQuery(charId, char, settings = {}, triggerText = '', messages = []) {
+function memoryQuerySceneName(scene = 'background-memory-query') {
+  const value = String(scene || '').trim();
+  if (!value || value === 'background-memory-query') return 'background-memory-query';
+  return value.startsWith('background-memory-query-') ? value : `background-memory-query-${value}`;
+}
+
+async function generateBackgroundMemoryQuery(charId, char, settings = {}, triggerText = '', messages = [], scene = 'background-memory-query') {
   const fallback = { query: `${charName(char)} ${triggerText}`, keywords: memorySignalTerms(triggerText).slice(0, 8), focus: 'current', _memoryAiStatus: 'skipped' };
+  const queryScene = memoryQuerySceneName(scene);
   if (!hasBackgroundMemoryApi(settings)) {
     setMemoryQueryStatus(settings, '后台记忆AI筛选跳过：记忆接口未完整配置，已改用本地关键词检索。');
     return fallback;
   }
   const payload = buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings);
   try {
-    const json = await callBackgroundMemoryJSON(settings, payload.system, payload.user, { scene: 'background-memory-query', charId });
+    const json = await callBackgroundMemoryJSON(settings, payload.system, payload.user, { scene: queryScene, charId });
     return { ...fallback, ...json, _memoryAiStatus: 'ok' };
   } catch (err) {
     console.warn('[AL SW Memory] query fallback:', err.message);
@@ -1042,10 +1049,10 @@ async function generateBackgroundMemoryQuery(charId, char, settings = {}, trigge
   }
 }
 
-async function buildMemoryPack(charId, char, settings = {}, queryText = '') {
+async function buildMemoryPack(charId, char, settings = {}, queryText = '', scene = 'background-memory-query') {
   const state = await getMeta('app_state', null).catch(() => null);
   const recent = Array.isArray(state?.allChats?.[charId]?.messages) ? state.allChats[charId].messages.slice(-30) : [];
-  const query = await generateBackgroundMemoryQuery(charId, char, settings, queryText, recent);
+  const query = await generateBackgroundMemoryQuery(charId, char, settings, queryText, recent, scene);
   const recallText = [query.query, queryText, ...(query.keywords || [])].filter(Boolean).join(' ');
   return Promise.all([
     searchMemoryVectors(charId, recallText),
@@ -1372,7 +1379,7 @@ async function handleProactivePush(payload) {
   const proactiveNow = new Date();
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
   const memoryQuery = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
-  const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
+  const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'proactive-chat');
   setStateCloudTimerTrace(state, 'chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
   const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext);
 
@@ -1465,7 +1472,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
   const proactiveNow = new Date();
   const momentContext = buildBackgroundMomentContext(allMoments, characters, charId, settings, 6);
   const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext(proactiveNow)}\n${charName(char)}准备主动发朋友圈。\n${momentContext}`;
-  const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
+  const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'moment-post');
   const prompt = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
   const messages = proactiveRecentMessages(chat, 20, proactiveNow);
   const raw = (await callModel(settings, prompt.system, messages, {

@@ -184,6 +184,7 @@ button{border:none;background:none;cursor:pointer}
 .chat-scroll{flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;background:#ededed}
 .chat-list{padding:11px 10px 16px;display:flex;flex-direction:column;gap:11px}
 .scenario{align-self:center;max-width:84%;padding:5px 10px;border-radius:4px;background:#d7d7d7;color:#fff;font-size:12px;line-height:1.5;text-align:center}
+.system-tip{align-self:center;max-width:84%;padding:2px 6px;color:#999;font-size:12px;line-height:1.5;text-align:center}
 .msg-wrap{display:flex;gap:8px;align-items:flex-start}
 .msg-wrap.me{justify-content:flex-end}
 .msg-avatar{width:36px;height:36px;border-radius:4px;flex-shrink:0;overflow:hidden;background:linear-gradient(135deg,#8fd36f,#3fb466);color:#fff;display:flex;align-items:center;justify-content:center;font-size:17px}
@@ -678,9 +679,9 @@ button.profile-top{width:100%;text-align:left}
       <div class="cell-group">
         <button class="cell" onclick="chooseNewRoleAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body"><div class="avatar-edit"><span id="new-avatar-preview" class="avatar">＋</span><span>选择图片</span></div></div><div class="mini">›</div></button>
         <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="new-name" placeholder="角色名"></div></div>
-        <div class="cell"><div class="cell-label">签名</div><div class="cell-body"><input class="input" id="new-desc" placeholder="一句话设定"></div></div>
-        <div class="cell"><div class="cell-label">场景</div><div class="cell-body"><textarea class="textarea" id="new-scenario" placeholder="当前关系、地点、氛围"></textarea></div></div>
-        <div class="cell"><div class="cell-label">开场白</div><div class="cell-body"><textarea class="textarea" id="new-first" placeholder="第一条消息"></textarea></div></div>
+        <div class="cell"><div class="cell-label">人物</div><div class="cell-body"><textarea class="textarea" id="new-desc" placeholder="年龄、职业、身份、生活状态、重要背景"></textarea></div></div>
+        <div class="cell"><div class="cell-label">说话</div><div class="cell-body"><textarea class="textarea" id="new-personality" placeholder="语气、脾气、聊天习惯、常用称呼"></textarea></div></div>
+        <div class="cell"><div class="cell-label">关系</div><div class="cell-body"><textarea class="textarea" id="new-scenario" placeholder="怎么认识、当前关系、边界、未完成约定"></textarea></div></div>
       </div>
       <button class="primary" onclick="createRole()">保存</button>
     </div>
@@ -984,7 +985,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.22';
+const APP_BUILD_VERSION = '2026-07-09.23';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1400,12 +1401,15 @@ function formatElapsed(ms) {
 function visibleChatMessages(chat) {
   return (chat?.messages || []).filter(m => !m.hidden);
 }
+function conversationMessages(chat) {
+  return visibleChatMessages(chat).filter(m => m.role !== 'system');
+}
 function lastVisibleMessage(chat) {
-  const messages = visibleChatMessages(chat);
+  const messages = conversationMessages(chat);
   return messages[messages.length - 1] || null;
 }
 function latestMessageByRole(chat, role) {
-  return visibleChatMessages(chat).slice().reverse().find(m => m.role === role) || null;
+  return conversationMessages(chat).slice().reverse().find(m => m.role === role) || null;
 }
 function messageTimeLine(label, msg, now = new Date()) {
   if (!msg?.time) return `${label}：无`;
@@ -2680,13 +2684,14 @@ ${char.name}需要在朋友圈评论区自然回复，并记得双方此前关�
 function createRole() {
   const name = document.getElementById('new-name').value.trim();
   if (!name) { toast('请填写昵称'); return; }
+  const now = Date.now();
   const char = normalizeChar({
-    id: 'char_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+    id: 'char_' + now + '_' + Math.random().toString(36).slice(2, 6),
     name,
     description: document.getElementById('new-desc').value.trim(),
-    personality: '',
+    personality: document.getElementById('new-personality').value.trim(),
     scenario: document.getElementById('new-scenario').value.trim(),
-    firstMessage: document.getElementById('new-first').value.trim(),
+    firstMessage: '',
     mesExample: '',
     systemPrompt: '',
     postHistoryInstructions: '',
@@ -2695,8 +2700,15 @@ function createRole() {
     avatarData: newRoleAvatarData || null,
   });
   characters.push(char);
+  allChats[char.id] = {
+    messages: [{ role: 'system', content: `你已添加了${name}，现在可以开始聊天了。`, time: now }],
+    charPrompt: buildCharPrompt(char),
+    extraPrompt: '',
+    unread: 0
+  };
   DB.set('characters', characters);
-  ['new-name','new-desc','new-scenario','new-first'].forEach(id => document.getElementById(id).value = '');
+  DB.set('chats', allChats);
+  ['new-name','new-desc','new-personality','new-scenario'].forEach(id => document.getElementById(id).value = '');
   newRoleAvatarData = '';
   setAvatarPreview('new-avatar-preview', '', '＋');
   toast('已保存');
@@ -2833,8 +2845,8 @@ function buildCharPrompt(char) {
   prompt += `当前你要扮演的角色：${char.name}\n`;
   prompt += `角色昵称：${char.name}\n`;
   if (char.description) prompt += `角色设定：${char.description}\n`;
-  if (char.personality) prompt += `性格：${char.personality}\n`;
-  if (char.scenario) prompt += `场景：${char.scenario}\n`;
+  if (char.personality) prompt += `说话方式与性格：${char.personality}\n`;
+  if (char.scenario) prompt += `关系与相处设定：${char.scenario}\n`;
   if (char.firstMessage) prompt += `开场白参考：${char.firstMessage}\n`;
   if (char.mesExample) prompt += `\n对话示例：\n${char.mesExample}\n`;
   if (char.postHistoryInstructions) prompt += `\n${char.postHistoryInstructions}`;
@@ -3221,10 +3233,13 @@ function renderMessages() {
   if (!chat || !char) return;
   if (refreshPaymentExpirations(chat, currentCharId)) DB.set('chats', allChats);
   let html = '';
-  if (char.scenario) html += `<div class="scenario">${esc(char.scenario)}</div>`;
   const displayMessages = visibleChatMessages(chat);
   displayMessages.forEach((m, i) => {
     if (i === 0 || (m.time - (displayMessages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
+    if (m.role === 'system') {
+      html += `<div class="system-tip">${esc(m.content)}</div>`;
+      return;
+    }
     if (m.role === 'user') {
       html += `<div class="msg-wrap me">${renderMessageBody(m)}${playerAvatarHtml('msg-avatar')}</div>`;
       const tip = (m.type === 'transfer' || m.type === 'redpacket') ? paymentStatusTip(m, char) : '';
@@ -3636,7 +3651,7 @@ function composeMemoryPackSections(prefix, sections = [], budget = MEMORY_PACK_C
   return `${prefix}\n\n${keptSections.join('\n\n')}`;
 }
 function recentMessages(chat, count = 30) {
-  return (chat?.messages || []).slice(-count);
+  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-count);
 }
 function normalizeVector(vec) {
   const norm = Math.sqrt(vec.reduce((sum, n) => sum + n * n, 0)) || 1;
@@ -3772,8 +3787,14 @@ async function callMemoryJSON(system, user, options = {}) {
     throw err;
   }
 }
-async function generateMemoryQuery(char, userInput, messages) {
+function memoryQuerySceneName(scene = 'memory-query') {
+  const value = String(scene || '').trim();
+  if (!value || value === 'memory-query') return 'memory-query';
+  return value.startsWith('memory-query-') ? value : `memory-query-${value}`;
+}
+async function generateMemoryQuery(char, userInput, messages, scene = 'memory-query') {
   const fallback = { query: `${char?.name || ''} ${userInput}`, keywords: [], focus: 'current' };
+  const queryScene = memoryQuerySceneName(scene);
   const missing = [];
   if (!settings.memoryApiUrl) missing.push('地址');
   if (!settings.memoryApiKey) missing.push('Key');
@@ -3782,7 +3803,7 @@ async function generateMemoryQuery(char, userInput, messages) {
     if (settings.memoryApiUrl || settings.memoryApiKey || settings.memoryModel) {
       recordModelCall({
         kind: 'memory',
-        scene: 'memory-query',
+        scene: queryScene,
         provider: settings.memoryApiType || 'openai',
         model: settings.memoryModel || '',
         charId: char?.id || '',
@@ -3798,8 +3819,8 @@ async function generateMemoryQuery(char, userInput, messages) {
   }
   const payload = buildMemoryQueryPayload(char, userInput, messages);
   try {
-    setMemoryQueryStatus('正在调用记忆AI筛选本轮相关记忆。');
-    const json = await callMemoryJSON(payload.system, payload.user, { scene: 'memory-query', charId: char?.id || '' });
+    setMemoryQueryStatus(`正在调用记忆AI筛选本轮相关记忆（${queryScene}）。`);
+    const json = await callMemoryJSON(payload.system, payload.user, { scene: queryScene, charId: char?.id || '' });
     return { ...fallback, ...json, _memoryAiStatus: 'ok' };
   } catch (err) {
     console.warn('[AL Memory] query fallback:', err.message);
@@ -3833,12 +3854,12 @@ async function saveVector(charId, sourceType, sourceId, text, keywords = [], imp
     createdAt: Date.now()
   });
 }
-async function prepareMemoryPack(charId, userInput) {
+async function prepareMemoryPack(charId, userInput, scene = 'chat') {
   const chat = allChats[charId];
   const char = characters.find(c => c.id === charId);
   if (!chat || !char) return '';
   const recent = recentMessages(chat, 30);
-  const query = await generateMemoryQuery(char, userInput, recent);
+  const query = await generateMemoryQuery(char, userInput, recent, scene);
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
   const [hits, allSummaries, allEvents, allProfiles] = await Promise.all([
     searchMemoryVectors(charId, queryText),
@@ -3868,7 +3889,7 @@ async function prepareMemoryPack(charId, userInput) {
 }
 async function prepareMemoryPackSafe(charId, userInput, scene = 'chat') {
   try {
-    return await prepareMemoryPack(charId, userInput);
+    return await prepareMemoryPack(charId, userInput, scene);
   } catch (err) {
     const char = characters.find(c => c.id === charId);
     const message = `记忆检索失败：${friendlyErrorMessage(err)}；已跳过记忆包继续生成。`;
@@ -3890,7 +3911,7 @@ async function prepareMemoryPackSafe(charId, userInput, scene = 'chat') {
 }
 async function prepareProactiveMemoryPack(charId, query, kind = 'chat') {
   try {
-    return await withTimeout(prepareMemoryPack(charId, query), PROACTIVE_MEMORY_TIMEOUT_MS, '主动消息记忆检索超时');
+    return await withTimeout(prepareMemoryPack(charId, query, `proactive-${kind}`), PROACTIVE_MEMORY_TIMEOUT_MS, '主动消息记忆检索超时');
   } catch (err) {
     console.warn('[AL Memory] proactive memory skipped:', err.message);
     setMemoryQueryStatus(`主动消息记忆检索失败：${friendlyErrorMessage(err)}；已改用最近聊天生成。`);
