@@ -421,8 +421,9 @@ button.profile-top{width:100%;text-align:left}
         <div class="cell"><div class="cell-label">标签</div><div class="cell-body profile-detail-text" id="profile-char-tags"></div></div>
       </div>
       <div class="wx-group">
-        <div class="cell"><div class="cell-label">个性签名</div><div class="cell-body profile-detail-text" id="profile-char-desc"></div></div>
-        <div class="cell"><div class="cell-label">更多信息</div><div class="cell-body profile-detail-text" id="profile-char-more"></div></div>
+        <div class="cell"><div class="cell-label">人物设定</div><div class="cell-body profile-detail-text" id="profile-char-desc"></div></div>
+        <div class="cell"><div class="cell-label">说话方式</div><div class="cell-body profile-detail-text" id="profile-char-style"></div></div>
+        <div class="cell"><div class="cell-label">关系</div><div class="cell-body profile-detail-text" id="profile-char-more"></div></div>
       </div>
       <div class="contact-profile-actions">
         <button class="primary" onclick="messageProfileChar()">发消息</button>
@@ -985,7 +986,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.24';
+const APP_BUILD_VERSION = '2026-07-09.25';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -2030,12 +2031,14 @@ function renderContactProfile() {
   const id = document.getElementById('profile-char-id');
   const tags = document.getElementById('profile-char-tags');
   const desc = document.getElementById('profile-char-desc');
+  const style = document.getElementById('profile-char-style');
   const more = document.getElementById('profile-char-more');
   if (name) name.textContent = char.name || '未命名';
   if (id) id.textContent = `AL ID：${char.id || 'local-role'}`;
   if (tags) tags.textContent = Array.isArray(char.tags) && char.tags.length ? char.tags.join('、') : '未设置';
-  if (desc) desc.textContent = char.description || char.personality || '暂无签名';
-  if (more) more.textContent = char.scenario || char.creatorNotes || '暂无更多信息';
+  if (desc) desc.textContent = char.description || '暂无人物设定';
+  if (style) style.textContent = char.personality || '暂无说话方式';
+  if (more) more.textContent = char.scenario || char.creatorNotes || '暂无关系设定';
 }
 function messageProfileChar() {
   if (!profileCharId) return;
