@@ -11,10 +11,10 @@ const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
 const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v30';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v31';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.16';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.17';/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.4';/);
 assert.match(script, /sw-v11\.js\?alarm-stream=1&v=\$\{APP_BUILD_VERSION\}/);
 assert.match(script, /\.then\(reg => reg\.update\?\.\(\)\)/);
@@ -72,6 +72,10 @@ assert.match(script, /记忆检索失败：\$\{friendlyErrorMessage\(err\)\}；�
 assert.match(script, /await prepareMemoryPackSafe\(requestCharId, userText, 'chat'\)/);
 assert.match(script, /await prepareMemoryPackSafe\(char\.id, memoryQuery, 'moment-interaction'\)/);
 assert.match(script, /await prepareMemoryPackSafe\(char\.id, memoryQuery, 'moment-reply'\)/);
+assert.match(html, /onclick="sendVoiceMessage\(\)"/);
+assert.match(script, /async function sendVoiceMessage\(\)/);
+assert.match(script, /function renderVoiceCard\(m\)/);
+assert.match(script, /\[语音消息 \$\{duration\}秒，未转文字\]/);
 assert.match(swScript, /promptBlocks: prompt\.promptBlocks/);
 assert.match(script, /红包 24 小时未领取，已自动退回零钱/);
 assert.match(html, /id="screen-diagnostics"/);
@@ -219,6 +223,7 @@ globalThis.__appTest = {
   textFromContent,
   extractResponseText,
   streamDeltaText,
+  previewText,
   normalizeChar,
   normalizePresetKey,
   resetImportedDeviceBinding,
@@ -246,6 +251,7 @@ globalThis.__appTest = {
   renderMomentComment,
   markMomentCommentSeen,
   markMomentNotifiedToChar,
+  renderVoiceCard,
   buildMemoryQueryPayload,
   buildMemoryExtractPayload,
   generateMemoryQuery,
@@ -263,11 +269,12 @@ globalThis.__appTest = {
   renderDiagnosticsScreen,
   clearModelCallLogs,
   shouldKeepEvent,
+  memoryTextIsNoise,
   cloudTimerTargetCharId,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, previewText, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -316,6 +323,10 @@ assert.equal(extractResponseText({ output: [{ content: [{ type: 'output_text', t
 assert.equal(extractResponseText({ candidates: [{ content: { parts: [{ text: 'Gemini 正文' }] } }] }), 'Gemini 正文');
 assert.equal(streamDeltaText({ candidates: [{ content: { parts: [{ text: 'Gemini 流式正文' }] } }] }), 'Gemini 流式正文');
 assert.equal(streamDeltaText({ choices: [{ message: { content: [{ type: 'text', text: '兼容流式正文' }] } }] }), '兼容流式正文');
+assert.equal(previewText('[语音消息 5秒，未转文字]'), '[语音]');
+assert.match(renderVoiceCard({ type: 'voice', voiceDuration: 5 }), /voice-bubble/);
+assert.match(renderVoiceCard({ type: 'voice', voiceDuration: 5 }), /5''/);
+assert.equal(memoryTextIsNoise('[语音消息 5秒，未转文字]'), true);
 assert.equal(JSON.stringify(splitAssistantOutput('第一句\n\n第二句\r\n第三句')), JSON.stringify(['第一句', '第二句', '第三句']));
 assert.equal(memoryAliasText('用户和角色约好下次继续聊', { name: '林晚' }), '玩家和林晚约好下次继续聊');
 assert.equal(shouldKeepEvent({ type: 'fact', title: '时间校对分歧', detail: '用户说自己这里是48分，角色解释表快了几分钟。', importance: 3, keywords: ['时间校对'] }), false);

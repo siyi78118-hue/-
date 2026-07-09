@@ -241,6 +241,12 @@ button{border:none;background:none;cursor:pointer}
 .pay-balance{font-size:12px;color:#999;margin-top:10px}
 .pay-note-input{height:44px;line-height:44px}
 .voice-hold{width:100%;height:36px;border-radius:4px;background:#fff;color:#333;font-size:15px}
+.voice-bubble{min-width:86px;display:flex;align-items:center;gap:8px}
+.voice-mark{width:16px;height:16px;position:relative;display:inline-block;transform:rotate(180deg)}
+.voice-mark:before,.voice-mark:after{content:"";position:absolute;border:2px solid currentColor;border-left:none;border-top:none;border-radius:0 12px 12px 0}
+.voice-mark:before{left:2px;top:5px;width:6px;height:6px}
+.voice-mark:after{left:2px;top:1px;width:12px;height:14px}
+.voice-duration{font-size:15px;line-height:1}
 .profile-top{background:#fff;padding:22px 18px;display:flex;gap:16px;align-items:center;border-bottom:1px solid var(--line)}
 button.profile-top{width:100%;text-align:left}
 .profile-name{font-size:22px;font-weight:600;margin-bottom:7px}
@@ -534,7 +540,7 @@ button.profile-top{width:100%;text-align:left}
       <button class="composer-tool plus" onclick="toggleComposerPanel('plus')" type="button" aria-label="更多"><i></i></button>
       <button class="send inactive" id="btn-send" onclick="sendMessage()">发送</button>
     </div>
-    <div class="composer-panel" id="composer-voice"><button class="voice-hold" onclick="toast('语音消息暂时只作为聊天 UI 展示')">按住 说话</button></div>
+    <div class="composer-panel" id="composer-voice"><button class="voice-hold" onclick="sendVoiceMessage()" type="button">按住 说话</button></div>
     <div class="composer-panel" id="composer-emoji">
       <div class="emoji-grid">
         <button onclick="insertEmoji('😀')">😀</button><button onclick="insertEmoji('😂')">😂</button><button onclick="insertEmoji('🥺')">🥺</button><button onclick="insertEmoji('😒')">😒</button>
@@ -963,7 +969,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.16';
+const APP_BUILD_VERSION = '2026-07-09.17';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1589,6 +1595,7 @@ function responseDiagnostic(json, raw = '') {
 }
 function previewText(text) {
   const value = String(text || '');
+  if (/^\[语音消息\s*\d+秒，未转文字\]$/.test(value)) return '[语音]';
   if (/Failed to fetch|NetworkError|ERR_FAILED/i.test(value)) return '接口连接失败，请检查设置';
   if (/^\（.+(?:超时|鉴权失败|接口连接失败|地址不正确|隐藏字符).+\）$/.test(value)) return value.slice(1, -1);
   return value;
@@ -3138,8 +3145,13 @@ function renderPaymentCard(m) {
     <div class="pay-card-foot"><span>AL 钱包</span><span>${esc(paymentStatusText(m))}</span></div>
   </div>`;
 }
+function renderVoiceCard(m) {
+  const duration = Math.max(1, Math.min(60, Number(m.voiceDuration) || 4));
+  return `<div class="bubble voice-bubble"><span class="voice-mark"></span><span class="voice-duration">${duration}''</span></div>`;
+}
 function renderMessageBody(m) {
   if (m.type === 'transfer' || m.type === 'redpacket') return renderPaymentCard(m);
+  if (m.type === 'voice') return renderVoiceCard(m);
   return `<div class="bubble">${formatMsg(m.content)}</div>`;
 }
 function splitAssistantOutput(text) {
@@ -3431,6 +3443,7 @@ function memoryTextHasSignal(text) {
 }
 function memoryTextIsNoise(text) {
   const value = String(text || '');
+  if (/\[语音消息\s*\d+秒，未转文字\]|未提供转文字内容|只能回应“收到语音”这个事实/.test(value)) return true;
   return /(测试|校对|表快|表慢|几点|现在时间|AI身份|身份争论|是不是AI|名字.*合理|戏太多|科幻片|装神弄鬼|普通寒暄|你好|在吗|又来)/.test(value)
     && !memoryTextHasSignal(value.replace(/测试|校对|几点|AI身份|身份争论/g, ''));
 }
@@ -3910,6 +3923,23 @@ async function sendMessage() {
   chat.messages.push({ role: 'user', content: text, time: Date.now() });
   DB.set('chats', allChats);
   await continueAssistantTurn(requestCharId, text);
+}
+async function sendVoiceMessage() {
+  if (isStreaming || !currentCharId) return;
+  const requestCharId = currentCharId;
+  const chat = allChats[requestCharId];
+  if (!chat) return;
+  closeComposerPanels();
+  const duration = 2 + Math.floor(Math.random() * 7);
+  const content = `[语音消息 ${duration}秒，未转文字]`;
+  cancelCloudProactive(requestCharId, 'all');
+  chat.messages.push({ role: 'user', type: 'voice', content, voiceDuration: duration, time: Date.now() });
+  DB.set('chats', allChats);
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  await continueAssistantTurn(
+    requestCharId,
+    `${playerName()}发来一条 ${duration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`
+  );
 }
 
 function getLatestChatRows() {
