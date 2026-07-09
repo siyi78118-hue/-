@@ -986,7 +986,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.27';
+const APP_BUILD_VERSION = '2026-07-09.28';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -4755,6 +4755,14 @@ async function cancelCloudProactive(charId, kind = 'chat') {
     console.warn('[AL Timer] cancel skipped:', err.message);
   }
 }
+async function cancelCloudProactiveQuick(charId, reason = '操作') {
+  if (!charId) return;
+  try {
+    await withTimeout(cancelCloudProactive(charId, 'all'), 8000, `${reason}取消云闹钟超时`);
+  } catch (err) {
+    console.warn('[AL Timer] quick cancel skipped:', reason, err.message);
+  }
+}
 function findProactiveTarget() {
   const idleMs = proactiveDelayMs('chat');
   const now = Date.now();
@@ -5630,10 +5638,11 @@ function savePreset() {
   showScreen('chat');
   toast('已保存');
 }
-function clearCurrentChat() {
+async function clearCurrentChat() {
   if (!currentCharId || !confirm('清空当前聊天？')) return;
   const char = characters.find(c => c.id === currentCharId);
   const old = allChats[currentCharId] || {};
+  await cancelCloudProactiveQuick(currentCharId, '清空当前聊天');
   allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(char), extraPrompt: old.extraPrompt || '', unread: 0, pinned: !!old.pinned, muted: !!old.muted };
   if (char?.firstMessage) allChats[currentCharId].messages.push({ role:'assistant', content:char.firstMessage, time:Date.now() });
   DB.set('chats', allChats);
@@ -5644,10 +5653,8 @@ async function deleteCurrentRole() {
   if (!currentCharId || !confirm('删除这个角色？会同时删除它的聊天、云闹钟、本地记忆库和朋友圈痕迹。')) return;
   const deletedId = currentCharId;
   const deletedName = characters.find(c => c.id === deletedId)?.name || '这个角色';
-  const cancelCloudJobs = withTimeout(cancelCloudProactive(deletedId, 'all'), 8000, '取消云闹钟超时')
-    .catch(err => console.warn('[AL Timer] delete role cancel skipped:', err.message));
   await Promise.allSettled([
-    cancelCloudJobs,
+    cancelCloudProactiveQuick(deletedId, '删除角色'),
     MemoryDB.clearChar(deletedId)
   ]);
   removeCharacterMomentTraces(deletedId);
@@ -5668,8 +5675,9 @@ function openCurrentProfile() {
   const char = characters.find(c => c.id === currentCharId);
   if (char) toast(`${char.name}\n${char.description || char.personality || ''}`, 2400);
 }
-function clearAllHistory() {
+async function clearAllHistory() {
   if (!confirm('清空全部聊天记录？')) return;
+  await Promise.allSettled(Object.keys(allChats).map(charId => cancelCloudProactiveQuick(charId, '清空全部聊天')));
   allChats = {};
   DB.set('chats', allChats);
   renderChats();
