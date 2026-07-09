@@ -61,7 +61,7 @@ export default {
       }
       if (request.method === 'POST' && url.pathname === '/cancel') {
         const body = await request.json();
-        if (body.jobId) await env.AL_TIMER_KV.delete(`job:${body.jobId}`);
+        if (body.jobId) await cancelJob(body.jobId, env);
         return json({ ok: true });
       }
       if (request.method === 'POST' && url.pathname === '/trigger') {
@@ -122,6 +122,18 @@ async function removeJobFromBucket(bucketKey, jobId, env) {
   } else {
     await env.AL_TIMER_KV.delete(bucketKey);
   }
+}
+
+async function cancelJob(jobId, env) {
+  const raw = await env.AL_TIMER_KV.get(`job:${jobId}`);
+  if (raw) {
+    const job = JSON.parse(raw);
+    const dueAtMs = Date.parse(job.dueAt || '');
+    if (Number.isFinite(dueAtMs)) {
+      await removeJobFromBucket(`due:${minuteKey(dueAtMs)}`, jobId, env);
+    }
+  }
+  await env.AL_TIMER_KV.delete(`job:${jobId}`);
 }
 
 async function runDueMinute(env, minute) {
