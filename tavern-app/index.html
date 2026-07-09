@@ -699,6 +699,7 @@ button.profile-top{width:100%;text-align:left}
           <div class="cell"><div class="cell-label">全局预设</div><div class="cell-body"><textarea class="textarea" id="set-system-prompt"></textarea></div></div>
           <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
+          <button class="cell" onclick="manualCheckCloudTimerVersion()" type="button"><div class="cell-label">版本</div><div class="cell-body">检测云端 Worker 版本</div><div class="mini">›</div></button>
           <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
@@ -945,7 +946,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.2';
+const APP_BUILD_VERSION = '2026-07-09.3';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.2';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -3786,6 +3787,17 @@ async function checkCloudTimerWorkerVersion({ silent = false } = {}) {
     setCloudWorkerStatus('检测失败：' + friendlyErrorMessage(err));
     return false;
   }
+}
+async function manualCheckCloudTimerVersion() {
+  saveSettings({ silent: true });
+  if (!settings.timerEndpoint) {
+    setCloudWorkerStatus('检测失败：请先填写闹钟地址');
+    toast('请先填写闹钟地址', 2200);
+    return false;
+  }
+  const ok = await checkCloudTimerWorkerVersion();
+  toast(ok ? '云端版本已同步' : '云端版本未同步，请检查部署', ok ? 1600 : 2800);
+  return ok;
 }
 function setCloudTimerTestAck(message) {
   settings.cloudTimerLastTestAckStatus = message;
