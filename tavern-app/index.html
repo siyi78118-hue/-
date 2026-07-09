@@ -755,6 +755,27 @@ button.profile-top{width:100%;text-align:left}
     </div>
   </div>
 
+  <div id="screen-memory-edit" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('memory')">‹</button></div>
+      <div class="top-title" id="memory-edit-title">编辑记忆</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll">
+      <div class="form">
+        <div class="cell-group">
+          <div class="cell"><div class="cell-label">分类</div><div class="cell-body"><select class="select" id="memory-edit-store" onchange="renderMemoryEditorFields()"><option value="profiles">资料</option><option value="events">事件</option><option value="summaries">摘要</option></select></div></div>
+          <div class="cell" id="memory-edit-type-row"><div class="cell-label">类型</div><div class="cell-body"><input class="input" id="memory-edit-type" placeholder="relationship / event"></div></div>
+          <div class="cell" id="memory-edit-time-row"><div class="cell-label">时间节点</div><div class="cell-body"><input class="input" id="memory-edit-happened" placeholder="未注明"></div></div>
+          <div class="cell" id="memory-edit-title-row"><div class="cell-label">标题</div><div class="cell-body"><input class="input" id="memory-edit-entry-title" placeholder="标题"></div></div>
+          <div class="cell"><div class="cell-label" id="memory-edit-detail-label">内容</div><div class="cell-body"><textarea class="textarea" id="memory-edit-detail" placeholder="写入要长期记住的内容"></textarea></div></div>
+        </div>
+        <button class="primary" onclick="saveMemoryEditor()">保存</button>
+        <button class="secondary" onclick="showScreen('memory')">取消</button>
+      </div>
+    </div>
+  </div>
+
   <div id="screen-diagnostics" class="screen">
     <div class="topbar">
       <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('settings')">‹</button></div>
@@ -987,7 +1008,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.36';
+const APP_BUILD_VERSION = '2026-07-09.37';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1065,6 +1086,7 @@ let streamingDraft = null;
 let lastMainScreen = 'chats';
 let memoryReturnScreen = 'settings';
 let memoryTargetCharId = '';
+let memoryEditorState = { storeName: 'profiles', id: '' };
 let plusOpen = false;
 let activeScreen = 'chats';
 let proactiveTimer = null;
@@ -5606,94 +5628,93 @@ async function syncMemoryVector(storeName, item) {
   }
 }
 async function editMemoryItem(storeName, id) {
-  const rows = await MemoryDB.all(storeName);
-  const item = rows.find(row => row.id === id);
-  if (!item) { toast('记忆不存在'); return; }
-  const next = { ...item, updatedAt: Date.now() };
-  if (storeName === 'summaries') {
-    const content = prompt('编辑摘要', item.content || '');
-    if (content == null) return;
-    next.content = content.trim();
-    if (!next.content) { toast('内容不能为空'); return; }
-  } else {
-    const title = prompt('编辑标题', item.title || '');
-    if (title == null) return;
-    const detail = prompt('编辑内容', item.detail || '');
-    if (detail == null) return;
-    next.title = title.trim() || (storeName === 'events' ? '重要事件' : '资料');
-    next.detail = detail.trim();
-    if (storeName === 'events') {
-      const happenedAt = prompt('编辑时间节点', item.happenedAt || '未注明');
-      if (happenedAt == null) return;
-      next.happenedAt = happenedAt.trim() || '未注明';
-    }
-    if (!next.detail) { toast('内容不能为空'); return; }
-  }
-  await MemoryDB.put(storeName, next);
-  await syncMemoryVector(storeName, next);
-  await renderMemoryScreen();
-  toast('记忆已更新');
+  await openMemoryEditor(storeName, id);
 }
 async function addMemoryItem(storeName) {
+  await openMemoryEditor(storeName);
+}
+async function openMemoryEditor(storeName = 'profiles', id = '') {
   const charId = memoryCurrentCharId();
   const char = characters.find(c => c.id === charId);
   if (!charId || !char) { toast('先创建并打开一个角色'); return; }
+  const normalizedStore = ['profiles', 'events', 'summaries'].includes(storeName) ? storeName : 'profiles';
+  const item = id ? (await MemoryDB.all(normalizedStore)).find(row => row.id === id) : null;
+  if (id && !item) { toast('记忆不存在'); return; }
+  memoryEditorState = { storeName: normalizedStore, id: id || '' };
+  showScreen('memory-edit');
+  await renderMemoryEditor(item);
+}
+async function renderMemoryEditor(item = null) {
+  const storeName = memoryEditorState.storeName || 'profiles';
+  const isEdit = !!memoryEditorState.id;
+  const storeEl = document.getElementById('memory-edit-store');
+  const titleEl = document.getElementById('memory-edit-title');
+  const typeEl = document.getElementById('memory-edit-type');
+  const happenedEl = document.getElementById('memory-edit-happened');
+  const entryTitleEl = document.getElementById('memory-edit-entry-title');
+  const detailEl = document.getElementById('memory-edit-detail');
+  if (titleEl) titleEl.textContent = isEdit ? '编辑记忆' : '新增记忆';
+  if (storeEl) {
+    storeEl.value = storeName;
+    storeEl.disabled = isEdit;
+  }
+  if (typeEl) typeEl.value = item?.type || (storeName === 'events' ? 'event' : 'relationship');
+  if (happenedEl) happenedEl.value = item?.happenedAt || '未注明';
+  if (entryTitleEl) entryTitleEl.value = item?.title || (storeName === 'events' ? '重要事件' : '资料');
+  if (detailEl) detailEl.value = storeName === 'summaries' ? (item?.content || '') : (item?.detail || '');
+  renderMemoryEditorFields();
+}
+function renderMemoryEditorFields() {
+  const storeEl = document.getElementById('memory-edit-store');
+  const storeName = storeEl?.value || memoryEditorState.storeName || 'profiles';
+  if (!memoryEditorState.id) memoryEditorState.storeName = storeName;
+  const isSummary = storeName === 'summaries';
+  const isEvent = storeName === 'events';
+  const typeRow = document.getElementById('memory-edit-type-row');
+  const timeRow = document.getElementById('memory-edit-time-row');
+  const titleRow = document.getElementById('memory-edit-title-row');
+  const detailLabel = document.getElementById('memory-edit-detail-label');
+  if (typeRow) typeRow.style.display = isSummary ? 'none' : '';
+  if (timeRow) timeRow.style.display = isEvent ? '' : 'none';
+  if (titleRow) titleRow.style.display = isSummary ? 'none' : '';
+  if (detailLabel) detailLabel.textContent = isSummary ? '摘要' : '内容';
+}
+async function saveMemoryEditor() {
+  const charId = memoryCurrentCharId();
+  const char = characters.find(c => c.id === charId);
+  if (!charId || !char) { toast('先创建并打开一个角色'); return; }
+  const storeName = document.getElementById('memory-edit-store')?.value || memoryEditorState.storeName || 'profiles';
+  const detail = document.getElementById('memory-edit-detail')?.value.trim() || '';
+  if (!detail) { toast('内容不能为空'); return; }
   const now = Date.now();
-  let item = null;
+  const oldItem = memoryEditorState.id ? (await MemoryDB.all(storeName)).find(row => row.id === memoryEditorState.id) : null;
+  let item = oldItem ? { ...oldItem, updatedAt: now } : null;
   if (storeName === 'summaries') {
-    const content = prompt('新增摘要');
-    if (content == null) return;
-    const text = content.trim();
-    if (!text) { toast('内容不能为空'); return; }
-    item = { id: uid('sum'), charId, content: memoryAliasText(text, char), createdAt: now, manual: true };
+    item = item || { id: uid('sum'), charId, createdAt: now, manual: true };
+    item.content = memoryAliasText(detail, char);
   } else if (storeName === 'profiles') {
-    const type = prompt('资料类型', 'relationship');
-    if (type == null) return;
-    const title = prompt('资料标题', '资料');
-    if (title == null) return;
-    const detail = prompt('资料内容');
-    if (detail == null) return;
-    const text = detail.trim();
-    if (!text) { toast('内容不能为空'); return; }
-    item = {
-      id: uid('pro'),
-      charId,
-      type: type.trim() || 'relationship',
-      title: memoryAliasText(title.trim() || '资料', char),
-      detail: memoryAliasText(text, char),
-      importance: 5,
-      keywords: [],
-      createdAt: now,
-      manual: true
-    };
+    item = item || { id: uid('pro'), charId, createdAt: now, manual: true, keywords: [] };
+    item.type = document.getElementById('memory-edit-type')?.value.trim() || 'relationship';
+    item.title = memoryAliasText(document.getElementById('memory-edit-entry-title')?.value.trim() || '资料', char);
+    item.detail = memoryAliasText(detail, char);
+    item.importance = Number(item.importance) || 5;
+    item.keywords = item.keywords || [];
   } else if (storeName === 'events') {
-    const happenedAt = prompt('时间节点', '未注明');
-    if (happenedAt == null) return;
-    const title = prompt('事件标题', '重要事件');
-    if (title == null) return;
-    const detail = prompt('事件内容');
-    if (detail == null) return;
-    const text = detail.trim();
-    if (!text) { toast('内容不能为空'); return; }
-    item = {
-      id: uid('evt'),
-      charId,
-      happenedAt: memoryAliasText(happenedAt.trim() || '未注明', char),
-      type: 'event',
-      title: memoryAliasText(title.trim() || '重要事件', char),
-      detail: memoryAliasText(text, char),
-      status: 'stable',
-      importance: 5,
-      keywords: [],
-      createdAt: now,
-      manual: true
-    };
+    item = item || { id: uid('evt'), charId, createdAt: now, manual: true, keywords: [] };
+    item.type = document.getElementById('memory-edit-type')?.value.trim() || 'event';
+    item.happenedAt = memoryAliasText(document.getElementById('memory-edit-happened')?.value.trim() || '未注明', char);
+    item.title = memoryAliasText(document.getElementById('memory-edit-entry-title')?.value.trim() || '重要事件', char);
+    item.detail = memoryAliasText(detail, char);
+    item.status = item.status || 'stable';
+    item.importance = Number(item.importance) || 5;
+    item.keywords = item.keywords || [];
   }
   if (!item) return;
   await MemoryDB.put(storeName, item);
   await syncMemoryVector(storeName, item);
   await renderMemoryScreen();
-  toast('记忆已新增');
+  showScreen('memory');
+  toast(memoryEditorState.id ? '记忆已更新' : '记忆已新增');
 }
 async function deleteMemoryItem(storeName, id) {
   if (!confirm('删除这条记忆？')) return;
