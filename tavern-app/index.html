@@ -740,6 +740,7 @@ button.profile-top{width:100%;text-align:left}
     <div class="scroll">
       <div class="form">
         <div class="cell-group">
+          <div class="cell"><div class="cell-label">角色</div><div class="cell-body"><select class="select" id="memory-char-select" onchange="switchMemoryChar(this.value)"></select></div></div>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body" id="memory-status">IndexedDB 保存摘要、事件、资料和向量索引。</div></div>
         </div>
         <div class="cell-group">
@@ -986,7 +987,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.35';
+const APP_BUILD_VERSION = '2026-07-09.36';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1063,6 +1064,7 @@ let isStreaming = false;
 let streamingDraft = null;
 let lastMainScreen = 'chats';
 let memoryReturnScreen = 'settings';
+let memoryTargetCharId = '';
 let plusOpen = false;
 let activeScreen = 'chats';
 let proactiveTimer = null;
@@ -1873,6 +1875,7 @@ function closeSearch() {
 }
 function openMemory(returnScreen = activeScreen) {
   memoryReturnScreen = returnScreen && returnScreen !== 'memory' ? returnScreen : 'settings';
+  memoryTargetCharId = currentCharId || memoryTargetCharId || characters[0]?.id || '';
   renderMemoryScreen();
   showScreen('memory');
 }
@@ -5525,7 +5528,14 @@ async function testMemoryQueryPreset() {
 }
 
 async function renderMemoryScreen() {
-  const charId = currentCharId || characters[0]?.id;
+  const selector = document.getElementById('memory-char-select');
+  if (selector) {
+    selector.innerHTML = characters.map(c => `<option value="${esc(c.id)}">${esc(c.name || '未命名')}</option>`).join('');
+  }
+  const validTarget = characters.some(c => c.id === memoryTargetCharId);
+  const charId = validTarget ? memoryTargetCharId : (currentCharId || characters[0]?.id || '');
+  memoryTargetCharId = charId;
+  if (selector) selector.value = charId || '';
   const char = characters.find(c => c.id === charId);
   const list = document.getElementById('memory-list');
   const status = document.getElementById('memory-status');
@@ -5558,6 +5568,13 @@ async function renderMemoryScreen() {
 }
 function memoryLabelMeta(item) {
   return [item.type, item.status, fmtTime(item.createdAt)].filter(Boolean).join(' · ');
+}
+function memoryCurrentCharId() {
+  return memoryTargetCharId || currentCharId || characters[0]?.id || '';
+}
+async function switchMemoryChar(charId) {
+  memoryTargetCharId = charId || '';
+  await renderMemoryScreen();
 }
 function renderMemoryItem(storeName, item) {
   const storeArg = jsArg(storeName);
@@ -5618,7 +5635,7 @@ async function editMemoryItem(storeName, id) {
   toast('记忆已更新');
 }
 async function addMemoryItem(storeName) {
-  const charId = currentCharId || characters[0]?.id;
+  const charId = memoryCurrentCharId();
   const char = characters.find(c => c.id === charId);
   if (!charId || !char) { toast('先创建并打开一个角色'); return; }
   const now = Date.now();
@@ -5693,10 +5710,11 @@ function memorySourceType(storeName) {
 }
 async function runMemoryNow() {
   saveSettings();
-  if (!currentCharId) { toast('先打开一个会话'); return; }
+  const charId = memoryCurrentCharId();
+  if (!charId) { toast('先创建并打开一个角色'); return; }
   toast('正在整理记忆...', 1200);
   try {
-    await processMemoryAfterTurn(currentCharId, true);
+    await processMemoryAfterTurn(charId, true);
     await renderMemoryScreen();
     toast('记忆已入库');
   } catch (err) {
@@ -5704,9 +5722,10 @@ async function runMemoryNow() {
   }
 }
 async function clearCurrentMemory() {
-  if (!currentCharId) { toast('先打开一个会话'); return; }
+  const charId = memoryCurrentCharId();
+  if (!charId) { toast('先创建并打开一个角色'); return; }
   if (!confirm('清空当前角色的本地记忆库？聊天记录不会删除。')) return;
-  await MemoryDB.clearChar(currentCharId);
+  await MemoryDB.clearChar(charId);
   await renderMemoryScreen();
   toast('已清空记忆库');
 }
@@ -5769,6 +5788,7 @@ async function deleteCurrentRole() {
     MemoryDB.clearChar(deletedId)
   ]);
   removeCharacterMomentTraces(deletedId);
+  if (memoryTargetCharId === deletedId) memoryTargetCharId = '';
   characters = characters.filter(c => c.id !== deletedId);
   delete allChats[deletedId];
   DB.set('characters', characters);
