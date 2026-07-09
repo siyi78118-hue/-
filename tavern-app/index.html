@@ -963,7 +963,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.15';
+const APP_BUILD_VERSION = '2026-07-09.16';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -2455,7 +2455,7 @@ async function callMomentInteractionAI(char, moment) {
 ${getTimeContext()}
 ${playerName()}刚发布朋友圈：“${momentSnippet(moment.text)}”
 ${char.name}需要判断是否点赞或评论，并且要记得双方此前关系、承诺、雷点、红包/转账和朋友圈互动。`;
-  const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
+  const memoryPack = await prepareMemoryPackSafe(char.id, memoryQuery, 'moment-interaction');
   const payload = buildMomentInteractionPayload(char, moment, memoryPack);
   const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-interaction', memoryChars: memoryPack.length, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
@@ -2472,7 +2472,7 @@ async function callMomentPostAI(char, chat, options = {}) {
   const memoryQuery = `角色朋友圈动态触发。
 ${getTimeContext()}
 ${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
-  const memoryPack = options.memoryPack != null ? options.memoryPack : await prepareMemoryPack(char.id, memoryQuery);
+  const memoryPack = options.memoryPack != null ? options.memoryPack : await prepareMemoryPackSafe(char.id, memoryQuery, 'moment-post');
   const payload = buildMomentPostPayload(char, chat, memoryPack);
   const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-post', memoryChars: memoryPack.length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
@@ -2624,7 +2624,7 @@ async function callMomentReplyAI(char, moment, playerComment) {
 ${getTimeContext()}
 ${playerName()}刚评论${char.name}的朋友圈：“${momentSnippet(playerComment)}”
 ${char.name}需要在朋友圈评论区自然回复，并记得双方此前关系、承诺、红包/转账和重要互动。`;
-  const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
+  const memoryPack = await prepareMemoryPackSafe(char.id, memoryQuery, 'moment-reply');
   const payload = buildMomentReplyPayload(char, moment, playerComment, memoryPack);
   const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-reply', memoryChars: memoryPack.length, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
@@ -3318,7 +3318,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
   updateStreamingDraft(requestCharId, '');
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
   try {
-    const memoryPack = await prepareMemoryPack(requestCharId, userText);
+    const memoryPack = await prepareMemoryPackSafe(requestCharId, userText, 'chat');
     const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()) });
     clearStreamingDraft(requestCharId);
     const replyText = applyAssistantMomentDirective(chat, requestCharId, reply);
@@ -3810,6 +3810,28 @@ async function prepareMemoryPack(charId, userInput) {
       { title: '关键词触发记忆', priority: 30, lines: keywordHits.map(h => `${memoryAliasText(h.text, char)}${h.reason ? `（触发：${h.reason}）` : ''}`) }
     ]
   );
+}
+async function prepareMemoryPackSafe(charId, userInput, scene = 'chat') {
+  try {
+    return await prepareMemoryPack(charId, userInput);
+  } catch (err) {
+    const char = characters.find(c => c.id === charId);
+    const message = `记忆检索失败：${friendlyErrorMessage(err)}；已跳过记忆包继续生成。`;
+    console.warn('[AL Memory] safe fallback:', err.message);
+    setMemoryQueryStatus(message);
+    recordModelCall({
+      kind: 'memory',
+      scene: `memory-pack-${scene}`,
+      provider: settings.memoryApiType || 'openai',
+      model: settings.memoryModel || '',
+      charId,
+      ok: false,
+      diagnostic: message,
+      system: '本地记忆包组装失败，已降级为空记忆包',
+      messages: [{ role: 'user', content: `${charName(char)}｜${String(userInput || '').slice(0, 500)}` }]
+    });
+    return '';
+  }
 }
 async function prepareProactiveMemoryPack(charId, query, kind = 'chat') {
   try {
@@ -4470,7 +4492,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     const proactiveNow = new Date();
     const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
-    const memoryPack = manual ? await prepareMemoryPack(charId, query) : await prepareProactiveMemoryPack(charId, query);
+    const memoryPack = manual ? await prepareMemoryPackSafe(charId, query, 'manual-proactive-chat') : await prepareProactiveMemoryPack(charId, query);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊正在请求聊天模型。', true, 'chat');
     const reply = manual
@@ -4556,7 +4578,7 @@ async function triggerProactiveMoment(charId, manual = false) {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `收到触发，目标：${char.name || charId}`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈已接到云闹钟，正在生成动态。', true, 'moment');
     const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext()}\n${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
-    const memoryPack = manual ? await prepareMemoryPack(charId, memoryQuery) : await prepareProactiveMemoryPack(charId, memoryQuery, 'moment');
+    const memoryPack = manual ? await prepareMemoryPackSafe(charId, memoryQuery, 'manual-proactive-moment') : await prepareProactiveMemoryPack(charId, memoryQuery, 'moment');
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈正在请求聊天模型。', true, 'moment');
     const rawText = manual
