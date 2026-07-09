@@ -3876,6 +3876,10 @@ function hasFutureCloudJob(chat, kind = 'chat') {
   const dueAt = Date.parse(chat?.[proactiveJobKey(kind)]?.dueAt || '');
   return Number.isFinite(dueAt) && dueAt > Date.now();
 }
+function cloudTimerTargetCharId(rows = []) {
+  if (currentCharId && allChats[currentCharId]?.messages?.length) return currentCharId;
+  return rows[0]?.char?.id || '';
+}
 async function ensureCloudProactiveScheduled(options = {}) {
   if (options.kind) return ensureCloudProactiveKindScheduled(options.kind, options);
   let scheduled = false;
@@ -3890,9 +3894,9 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   const rows = getLatestChatRows();
   if (!rows.length) return false;
-  let target = '';
-  if (!force) target = rows.find(({ chat }) => !hasFutureCloudJob(chat, kind))?.char?.id || '';
-  if (!target) target = (currentCharId && allChats[currentCharId]?.messages?.length ? currentCharId : rows[0].char.id);
+  const target = cloudTimerTargetCharId(rows);
+  if (!target) return false;
+  await cancelOtherCloudJobs(target, kind, rows);
   const chat = allChats[target];
   if (!force && hasFutureCloudJob(chat, kind)) {
     const lastSync = Number(chat[proactiveSyncKey(kind)] || 0);
@@ -3902,6 +3906,25 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
     return false;
   }
   return scheduleCloudProactive(target, kind);
+}
+async function cancelOtherCloudJobs(targetCharId, kind = 'chat', rows = getLatestChatRows()) {
+  const jobKey = proactiveJobKey(kind);
+  const stale = rows
+    .filter(({ char, chat }) => char.id !== targetCharId && chat?.[jobKey]?.jobId)
+    .map(({ char, chat }) => ({ charId: char.id, jobId: chat[jobKey].jobId }));
+  if (!stale.length) return false;
+  for (const item of stale) {
+    const chat = allChats[item.charId];
+    if (chat?.[jobKey]) delete chat[jobKey];
+  }
+  DB.set('chats', allChats);
+  await mirrorAppStateNow();
+  await Promise.allSettled(stale.map(item => fetchWithTimeout(timerUrl('/cancel'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: settings.deviceId, jobId: item.jobId })
+  }, 8000)));
+  return true;
 }
 async function repairCloudTimerScheduleOnce() {
   if (!settings.cloudTimerEnabled || !settings.pushSubscription || settings.cloudTimerBucketFixV2) return;

@@ -13,6 +13,8 @@ assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
 assert.match(script, /const API_TIMEOUT_MS = 120000;/);
 assert.match(script, /const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;/);
 assert.doesNotMatch(swScript, /Math\.min\(API_TIMEOUT_MS,\s*45000\)/);
+assert.doesNotMatch(script, /rows\.find\(\(\{ chat \}\) => !hasFutureCloudJob\(chat, kind\)\)/);
+assert.match(script, /function cancelOtherCloudJobs\(targetCharId, kind = 'chat'/);
 assert.match(swScript, /function cleanApiKey\(value\)/);
 assert.match(swScript, /后台记忆AI已调用/);
 assert.match(swScript, /function localEmbedding\(text, dim = VECTOR_DIM\)/);
@@ -162,10 +164,11 @@ globalThis.__appTest = {
   renderDiagnosticsScreen,
   clearModelCallLogs,
   shouldKeepEvent,
+  cloudTimerTargetCharId,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -369,6 +372,8 @@ const longGapContext = buildProactiveTimeContext(proactiveChat, proactiveNow);
 assert.match(longGapContext, /长间隔重新开口/);
 assert.match(longGapContext, /默认不要直接回答上一条话题/);
 assert.match(proactiveRecentMessages(proactiveChat, 30, proactiveNow)[0].content, /距现在 2 小时/);
+vm.runInContext("currentCharId='current_chat'; allChats={ old_chat:{ messages:[{ role:'user', content:'旧会话', time:1 }] }, current_chat:{ messages:[{ role:'user', content:'当前会话', time:2 }] } };", context);
+assert.equal(cloudTimerTargetCharId([{ char: { id: 'old_chat' }, chat: context.allChats?.old_chat }, { char: { id: 'current_chat' }, chat: context.allChats?.current_chat }]), 'current_chat');
 const promiseVector = localEmbedding('周六晚上语音 承诺 不会消失');
 const similarVector = localEmbedding('你是不是忘了周六语音的约定');
 const differentVector = localEmbedding('今天午饭吃什么');
