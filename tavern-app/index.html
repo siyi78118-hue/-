@@ -985,7 +985,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.23';
+const APP_BUILD_VERSION = '2026-07-09.24';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1522,6 +1522,13 @@ function statusErrorMessage(err) {
   const friendly = friendlyErrorMessage(err);
   const technical = technicalErrorMessage(err);
   return technical && technical !== friendly ? `${friendly}（详细：${technical}）` : friendly;
+}
+function cloudTimerErrorMessage(err) {
+  const raw = String(err?.message || err || '');
+  if (/Failed to fetch|NetworkError|Load failed|ERR_FAILED|timeout|timed out|超时|连接超时/i.test(raw)) {
+    return '云闹钟连接失败：请检查闹钟地址是否为 Worker 地址、手机/浏览器网络是否可访问，或稍后重试';
+  }
+  return '云闹钟检测失败：' + friendlyErrorMessage(err);
 }
 function isTransientApiError(err) {
   const raw = String(err?.message || err || '');
@@ -4346,8 +4353,9 @@ async function fetchCloudTimerLogs() {
     toast('云闹钟日志已读取', 1600);
     return true;
   } catch (err) {
-    setCloudWorkerStatus('日志获取失败：' + friendlyErrorMessage(err));
-    toast('日志获取失败：' + friendlyErrorMessage(err), 2600);
+    const message = cloudTimerErrorMessage(err);
+    setCloudWorkerStatus(message);
+    toast(message, 3000);
     return false;
   }
 }
@@ -4366,7 +4374,7 @@ async function checkCloudTimerWorkerVersion({ silent = false } = {}) {
     if (!silent) setCloudWorkerStatus(`已同步 ${version}\n${cronStatus}`);
     return true;
   } catch (err) {
-    setCloudWorkerStatus('检测失败：' + friendlyErrorMessage(err));
+    setCloudWorkerStatus(cloudTimerErrorMessage(err));
     return false;
   }
 }

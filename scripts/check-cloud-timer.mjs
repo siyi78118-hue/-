@@ -1,6 +1,39 @@
 const EXPECTED_VERSION = '2026-07-09.6';
+const DEFAULT_TIMEOUT_MS = 20000;
 
-const endpoint = (process.argv[2] || process.env.AL_TIMER_ENDPOINT || process.env.TIMER_ENDPOINT || '').replace(/\/+$/, '');
+function normalizeEndpoint(value = '') {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function timeoutMs() {
+  const raw = Number(process.env.AL_TIMER_HEALTH_TIMEOUT_MS || process.env.TIMER_HEALTH_TIMEOUT_MS || 0);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_TIMEOUT_MS;
+}
+
+function friendlyFetchError(err) {
+  const raw = String(err?.message || err || 'unknown error');
+  const cause = String(err?.cause?.message || err?.cause?.code || '');
+  const text = `${raw} ${cause}`;
+  if (/timeout|timed out|UND_ERR_CONNECT_TIMEOUT|AbortError/i.test(text)) {
+    return '连接云闹钟超时：请检查 Worker 地址、本机网络、代理或 DNS。';
+  }
+  if (/fetch failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|NetworkError/i.test(text)) {
+    return '无法连接云闹钟：请检查 Worker 地址是否正确，以及当前终端网络能否访问 workers.dev。';
+  }
+  return raw;
+}
+
+async function fetchHealth(endpoint) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs());
+  try {
+    return await fetch(`${endpoint}/health`, { method: 'GET', signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const endpoint = normalizeEndpoint(process.argv[2] || process.env.AL_TIMER_ENDPOINT || process.env.TIMER_ENDPOINT || '');
 
 if (!endpoint) {
   console.error('Usage: node scripts/check-cloud-timer.mjs <https://worker-url>');
@@ -8,9 +41,21 @@ if (!endpoint) {
   process.exit(2);
 }
 
-const resp = await fetch(`${endpoint}/health`, { method: 'GET' });
+console.log(`Checking cloud timer: ${endpoint}/health`);
+
+let resp;
+try {
+  resp = await fetchHealth(endpoint);
+} catch (err) {
+  console.error(friendlyFetchError(err));
+  console.error(`Raw error: ${String(err?.message || err)}`);
+  if (err?.cause) console.error(`Cause: ${String(err.cause?.code || err.cause?.message || err.cause)}`);
+  process.exit(1);
+}
+
 if (!resp.ok) {
-  console.error(`Cloud timer health failed: HTTP ${resp.status}`);
+  const body = await resp.text().catch(() => '');
+  console.error(`Cloud timer health failed: HTTP ${resp.status}${body ? ` ${body.slice(0, 180)}` : ''}`);
   process.exit(1);
 }
 
