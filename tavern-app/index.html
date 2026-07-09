@@ -960,7 +960,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.11';
+const APP_BUILD_VERSION = '2026-07-09.12';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -3846,14 +3846,21 @@ function setCloudTimerStatus(message, persist = true, kind = 'general') {
 function cloudTraceId(kind = 'chat') {
   return `${kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;
 }
-function setCloudTimerTrace(kind = 'chat', traceId = '', message = '', persist = true) {
+function appendCloudTraceLine(existing = '', traceId = '', message = '') {
   const line = [traceId, message].filter(Boolean).join('｜');
+  if (!line) return '';
+  const rows = String(existing || '').split('\n').map(row => row.trim()).filter(Boolean);
+  const sameTrace = traceId && rows.length && rows[rows.length - 1].startsWith(`${traceId}｜`);
+  const next = sameTrace ? rows.concat(line) : [line];
+  return next.slice(-8).join('\n');
+}
+function setCloudTimerTrace(kind = 'chat', traceId = '', message = '', persist = true) {
   const now = Date.now();
   if (kind === 'moment') {
-    settings.cloudTimerLastMomentTrace = line;
+    settings.cloudTimerLastMomentTrace = appendCloudTraceLine(settings.cloudTimerLastMomentTrace, traceId, message);
     settings.cloudTimerLastMomentTraceAt = now;
   } else {
-    settings.cloudTimerLastChatTrace = line;
+    settings.cloudTimerLastChatTrace = appendCloudTraceLine(settings.cloudTimerLastChatTrace, traceId, message);
     settings.cloudTimerLastChatTraceAt = now;
   }
   if (persist) DB.set('settings', settings);
@@ -4275,27 +4282,37 @@ function findProactiveMomentTarget() {
   });
 }
 function findDueCloudProactiveTarget(kind = 'chat') {
+  return findDueCloudProactiveTargets(kind)[0] || null;
+}
+function findDueCloudProactiveTargets(kind = 'chat') {
   const now = Date.now();
   const jobKey = proactiveJobKey(kind);
-  return getLatestChatRows().find(({ chat }) => {
-    const dueAt = chat?.[jobKey]?.dueAt;
-    return dueAt && Date.parse(dueAt) <= now;
-  });
+  return getLatestChatRows()
+    .filter(({ chat }) => {
+      const dueAt = chat?.[jobKey]?.dueAt;
+      return dueAt && Date.parse(dueAt) <= now;
+    })
+    .sort((a, b) => Date.parse(a.chat[jobKey].dueAt) - Date.parse(b.chat[jobKey].dueAt));
 }
 async function triggerProactiveMessage(charId, manual = false) {
-  if (proactiveChatBusy || isStreaming) return false;
+  const traceId = cloudTraceId('chat');
+  if (proactiveChatBusy || isStreaming) {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `跳过：${proactiveChatBusy ? '上一轮私聊仍在生成' : '当前正在流式回复用户'}`);
+    return false;
+  }
   const char = characters.find(c => c.id === charId);
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `跳过：${!char ? '找不到角色' : '会话没有聊天记录'}（${charId || '无目标'}）`);
     if (manual) toast('先打开一个有聊天记录的会话');
     return false;
   }
   if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, '跳过：聊天接口、Key 或模型未配置完整');
     if (manual) toast('请先配置聊天接口和聊天模型');
     return false;
   }
   proactiveChatBusy = true;
-  const traceId = cloudTraceId('chat');
   try {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `收到触发，目标：${char.name || charId}`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊已接到云闹钟，正在生成消息。', true, 'chat');
@@ -4366,22 +4383,30 @@ async function triggerProactiveMessage(charId, manual = false) {
   }
 }
 async function triggerProactiveMoment(charId, manual = false) {
-  if (proactiveMomentBusy) return false;
+  const traceId = cloudTraceId('moment');
+  if (proactiveMomentBusy) {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, '跳过：上一轮朋友圈仍在生成');
+    return false;
+  }
   const char = characters.find(c => c.id === charId);
   const chat = allChats[charId];
   if (!char || !chat?.messages?.length) {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `跳过：${!char ? '找不到角色' : '会话没有聊天记录'}（${charId || '无目标'}）`);
     if (manual) toast('先打开一个有聊天记录的会话');
     return false;
   }
   if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, '跳过：聊天接口、Key 或模型未配置完整');
     if (manual) toast('请先配置聊天接口和聊天模型');
     return false;
   }
   proactiveMomentBusy = true;
   try {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `收到触发，目标：${char.name || charId}`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈已接到云闹钟，正在生成动态。', true, 'moment');
     const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext()}\n${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
     const memoryPack = manual ? await prepareMemoryPack(charId, memoryQuery) : await prepareProactiveMemoryPack(charId, memoryQuery, 'moment');
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台朋友圈正在请求聊天模型。', true, 'moment');
     const rawText = manual
       ? await callMomentPostAI(char, chat, { memoryPack })
@@ -4394,6 +4419,7 @@ async function triggerProactiveMoment(charId, manual = false) {
           }
         );
     const text = momentSnippet(rawText, 160);
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `模型返回 ${String(rawText || '').trim().length} 字`);
     delete chat.pendingMomentJob;
     if (isEmptyReplyText(text)) {
       const emptyReason = lastChatResponseDiagnostic || '空动态';
@@ -4403,6 +4429,7 @@ async function triggerProactiveMoment(charId, manual = false) {
       DB.set('chats', allChats);
       if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
       try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
+      if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `空动态：${emptyReason}`);
       if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台朋友圈生成了空动态：${emptyReason}，已跳过并安排下次重试。`, true, 'moment');
       return false;
     }
@@ -4414,6 +4441,7 @@ async function triggerProactiveMoment(charId, manual = false) {
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
     try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, '写入完成 1 条朋友圈');
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈已发布 1 条动态。', true, 'moment');
     return true;
   } catch (err) {
@@ -4425,6 +4453,7 @@ async function triggerProactiveMoment(charId, manual = false) {
       DB.set('chats', allChats);
       try { await scheduleCloudProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     }
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `失败：${statusErrorMessage(err)}`);
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成失败：' + statusErrorMessage(err), true, 'moment');
     if (manual) toast('主动动态失败：' + friendlyErrorMessage(err), 3200);
     console.warn('[AL Moments] proactive moment skipped:', technicalErrorMessage(err), err);
@@ -4458,21 +4487,20 @@ async function checkProactiveMessages() {
 async function catchUpDueCloudProactive() {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled) return;
   const tasks = [];
-  const chatTarget = !proactiveChatBusy && !isStreaming ? findDueCloudProactiveTarget('chat') : null;
-  if (chatTarget) {
-    delete chatTarget.chat.pendingProactiveJob;
-    DB.set('chats', allChats);
+  const chatTargets = !proactiveChatBusy && !isStreaming ? findDueCloudProactiveTargets('chat') : [];
+  for (const chatTarget of chatTargets) {
     tasks.push(triggerProactiveMessage(chatTarget.char.id, false));
   }
-  const momentTarget = !proactiveMomentBusy ? findDueCloudProactiveTarget('moment') : null;
-  if (momentTarget) {
-    delete momentTarget.chat.pendingMomentJob;
-    DB.set('chats', allChats);
+  const momentTargets = !proactiveMomentBusy ? findDueCloudProactiveTargets('moment') : [];
+  for (const momentTarget of momentTargets) {
     tasks.push(triggerProactiveMoment(momentTarget.char.id, false));
   }
   if (tasks.length) {
+    setCloudTimerStatus(`前台发现 ${tasks.length} 个本地到期任务，正在补跑。`, true);
     await mirrorAppStateNow();
     await Promise.allSettled(tasks);
+  } else {
+    setCloudTimerStatus('前台检查完成：当前本地没有到期的私聊或朋友圈任务。', true);
   }
 }
 async function handleForegroundProactiveRequest(data = {}) {
@@ -4480,18 +4508,28 @@ async function handleForegroundProactiveRequest(data = {}) {
   foregroundProactiveRequestBusy = true;
   try {
     await restoreAppStateFromMirror();
+    const kind = data.kind === 'moment' ? 'moment' : 'chat';
+    const traceId = cloudTraceId(kind);
+    const jobKey = proactiveJobKey(kind);
+    const localJob = data.charId ? allChats[data.charId]?.[jobKey] : null;
+    const dueAt = localJob?.dueAt ? formatFullTime(new Date(localJob.dueAt)) : '无本地任务';
+    setCloudTimerTrace(kind, traceId, `前台收到 push：kind=${kind}，char=${data.charId || '未指定'}，job=${data.jobId || '未指定'}，due=${dueAt}`);
     if (data.kind === 'moment') {
       if (data.test) setCloudTimerTestAck('本机已收到朋友圈测试推送，闹钟链路正常。');
       setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}朋友圈闹钟已被前台收到。`);
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，朋友圈闹钟链路正常；正在继续请求聊天模型。' : `云闹钟已触发，正在由前台生成朋友圈。${data.fallback ? '（本地未命中到期任务，已用最近任务兜底）' : ''}`, true, 'moment');
-      if (data.charId) await triggerProactiveMoment(data.charId, false);
-      else await catchUpDueCloudProactive();
+      if (data.charId) {
+        const ok = await triggerProactiveMoment(data.charId, false);
+        if (!ok) setCloudTimerTrace('moment', traceId, '前台触发朋友圈未写入内容，详见朋友圈结果或最近调用诊断');
+      } else await catchUpDueCloudProactive();
     } else {
       if (data.test) setCloudTimerTestAck('本机已收到私聊测试推送，闹钟链路正常。');
       setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}私聊闹钟已被前台收到。`);
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : `云闹钟已触发，正在由前台生成私聊。${data.fallback ? '（本地未命中到期任务，已用最近任务兜底）' : ''}`, true, 'chat');
-      if (data.charId) await triggerProactiveMessage(data.charId, false);
-      else await catchUpDueCloudProactive();
+      if (data.charId) {
+        const ok = await triggerProactiveMessage(data.charId, false);
+        if (!ok) setCloudTimerTrace('chat', traceId, '前台触发私聊未写入内容，详见私聊结果或最近调用诊断');
+      } else await catchUpDueCloudProactive();
     }
   } catch (err) {
     setCloudTimerStatus('前台接手云闹钟失败：' + friendlyErrorMessage(err));

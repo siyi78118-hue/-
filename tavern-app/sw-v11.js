@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v25';
+const CACHE_NAME = 'rpchat-v26';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -189,13 +189,20 @@ function setStateCloudTimerTriggerAck(state, message) {
 
 function setStateCloudTimerTrace(state, kind = 'chat', traceId = '', message = '') {
   if (!state?.settings) return;
-  const line = [traceId, message].filter(Boolean).join('｜');
   const now = Date.now();
+  const appendLine = existing => {
+    const line = [traceId, message].filter(Boolean).join('｜');
+    if (!line) return '';
+    const rows = String(existing || '').split('\n').map(row => row.trim()).filter(Boolean);
+    const sameTrace = traceId && rows.length && rows[rows.length - 1].startsWith(`${traceId}｜`);
+    const next = sameTrace ? rows.concat(line) : [line];
+    return next.slice(-8).join('\n');
+  };
   if (kind === 'moment') {
-    state.settings.cloudTimerLastMomentTrace = line;
+    state.settings.cloudTimerLastMomentTrace = appendLine(state.settings.cloudTimerLastMomentTrace);
     state.settings.cloudTimerLastMomentTraceAt = now;
   } else {
-    state.settings.cloudTimerLastChatTrace = line;
+    state.settings.cloudTimerLastChatTrace = appendLine(state.settings.cloudTimerLastChatTrace);
     state.settings.cloudTimerLastChatTraceAt = now;
   }
 }
@@ -1287,7 +1294,11 @@ async function handleProactivePush(payload) {
   const traceId = `${payload.kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;
   scrubEmptyReplyMessages(allChats);
   const exactDueJobs = payload.charId
-    ? [{ charId: payload.charId, kind: payload.kind === 'moment' ? 'moment' : 'chat', job: null }]
+    ? (() => {
+        const kind = payload.kind === 'moment' ? 'moment' : 'chat';
+        const job = allChats[payload.charId]?.[proactiveJobKey(kind)] || null;
+        return [{ charId: payload.charId, kind, job }];
+      })()
     : getDueProactiveJobs(allChats);
   const fallbackJob = !payload.charId && !exactDueJobs.length ? getFallbackProactiveJob(allChats) : null;
   const dueJobs = exactDueJobs.length ? exactDueJobs : (fallbackJob ? [fallbackJob] : []);
@@ -1303,6 +1314,10 @@ async function handleProactivePush(payload) {
     return;
   }
   if (await hasVisibleClient()) {
+    setStateCloudTimerTrace(state, kind, traceId, `后台收到 push，页面可见，转交前台处理；目标：${charId}${dueJob.job?.dueAt ? `，本地 due=${formatFullTime(new Date(dueJob.job.dueAt))}` : '，无本地 due'}`);
+    setStateCloudTimerTriggerAck(state, `${payload.test ? '测试' : '真实'}${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已被后台收到并转交前台。`);
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
     if (!payload.charId && exactDueJobs.length > 1) {
       await notifyClients({ type: 'al-run-proactive-due', jobCount: dueJobs.length, test: dueJobs.some(row => row.job?.test) });
       return;
@@ -1540,12 +1555,11 @@ function latestCloudTargetCharId(allChats) {
 
 function getDueProactiveJobs(allChats) {
   const now = Date.now();
-  const targetCharId = latestCloudTargetCharId(allChats);
   const rows = Object.entries(allChats || {}).flatMap(([charId, chat]) =>
     PROACTIVE_JOB_KINDS.map(kind => ({ charId, kind, chat, job: chat?.[proactiveJobKey(kind)] }))
   );
   return rows
-    .filter(r => (!targetCharId || r.charId === targetCharId) && r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
+    .filter(r => r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
     .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))
     .map(row => ({ charId: row.charId, kind: row.kind, job: row.job }));
 }
