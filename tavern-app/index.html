@@ -711,9 +711,6 @@ button.profile-top{width:100%;text-align:left}
           <div class="cell"><div class="cell-label">全局预设</div><div class="cell-body"><textarea class="textarea" id="set-system-prompt"></textarea></div></div>
           <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
-          <button class="cell" onclick="manualCheckCloudTimerVersion()" type="button"><div class="cell-label">版本</div><div class="cell-body">检测云端 Worker 版本</div><div class="mini">›</div></button>
-          <button class="cell" onclick="fetchCloudTimerLogs()" type="button"><div class="cell-label">日志</div><div class="cell-body">查看云闹钟最近流水</div><div class="mini">›</div></button>
-          <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
         </div>
@@ -724,11 +721,6 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
         </div>
         <button class="primary" onclick="saveSettings()">保存</button>
-        <button class="secondary" onclick="testConnection('chat')">测试聊天连接</button>
-        <button class="secondary" onclick="testConnection('memory')">测试记忆连接</button>
-        <button class="secondary" onclick="testMemoryQueryPreset()">测试记忆筛选</button>
-        <button class="secondary" onclick="manualProactiveMessage()">测试主动私聊</button>
-        <button class="secondary" onclick="manualProactiveMoment()">测试主动朋友圈</button>
       </div>
     </div>
   </div>
@@ -760,8 +752,20 @@ button.profile-top{width:100%;text-align:left}
       <div class="top-right"><button class="top-text-btn" onclick="copyModelCallDiagnostics()" type="button">复制</button></div>
     </div>
     <div class="scroll">
-      <div class="diagnostic-list" id="diagnostic-list">
-        <div class="empty">还没有模型调用记录</div>
+      <div class="form">
+        <div class="cell-group">
+          <button class="cell" onclick="testConnection('chat')" type="button"><div class="cell-label">聊天</div><div class="cell-body">测试聊天连接</div><div class="mini">›</div></button>
+          <button class="cell" onclick="testConnection('memory')" type="button"><div class="cell-label">记忆</div><div class="cell-body">测试记忆连接</div><div class="mini">›</div></button>
+          <button class="cell" onclick="testMemoryQueryPreset()" type="button"><div class="cell-label">筛选</div><div class="cell-body">测试记忆筛选</div><div class="mini">›</div></button>
+          <button class="cell" onclick="manualCheckCloudTimerVersion()" type="button"><div class="cell-label">版本</div><div class="cell-body">检测云端 Worker 版本</div><div class="mini">›</div></button>
+          <button class="cell" onclick="fetchCloudTimerLogs()" type="button"><div class="cell-label">日志</div><div class="cell-body">查看云闹钟最近流水</div><div class="mini">›</div></button>
+          <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
+          <button class="cell" onclick="manualProactiveMessage()" type="button"><div class="cell-label">私聊</div><div class="cell-body">测试主动私聊</div><div class="mini">›</div></button>
+          <button class="cell" onclick="manualProactiveMoment()" type="button"><div class="cell-label">朋友圈</div><div class="cell-body">测试主动朋友圈</div><div class="mini">›</div></button>
+        </div>
+        <div class="diagnostic-list" id="diagnostic-list">
+          <div class="empty">还没有模型调用记录</div>
+        </div>
       </div>
     </div>
   </div>
@@ -973,7 +977,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.31';
+const APP_BUILD_VERSION = '2026-07-09.32';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
