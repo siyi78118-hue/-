@@ -941,7 +941,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const PROACTIVE_MEMORY_TIMEOUT_MS = 20000;
+const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const CALL_LOG_LIMIT = 30;
@@ -3396,6 +3396,7 @@ async function callMemoryJSON(system, user, options = {}) {
   const apiKey = assertHeaderSafe(cleanApiKey(settings[api.apiKeyKey] || ''), `${api.label} Key`);
   if (!apiUrl || !apiKey || !settings.memoryModel) throw new Error('请先配置记忆接口和记忆模型');
   let text = '';
+  let diagnostic = '';
   const startedAt = Date.now();
   const messages = [{ role: 'user', content: user }];
   if (apiType === 'claude') {
@@ -3406,8 +3407,15 @@ async function callMemoryJSON(system, user, options = {}) {
         body: JSON.stringify({ model: settings.memoryModel, system, messages, max_tokens: 1800, temperature: 0.2 })
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
-      const json = await resp.json();
-      text = Array.isArray(json.content) ? json.content.map(p => p.text || '').join('') : (json.content || json.text || '');
+      const raw = await resp.text();
+      try {
+        const json = JSON.parse(raw);
+        text = extractResponseText(json) || parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = responseDiagnostic(json, raw);
+      } catch {
+        text = parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+      }
     } catch (err) {
       recordModelCall({ kind: 'memory', scene: options.scene || '', provider: 'claude', model: settings.memoryModel, charId: options.charId || '', system, messages, startedAt, ok: false, error: err.message });
       throw err;
@@ -3420,20 +3428,33 @@ async function callMemoryJSON(system, user, options = {}) {
         body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: 1800 })
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
-      const json = await resp.json();
-      text = extractResponseText(json);
+      const raw = await resp.text();
+      try {
+        const json = JSON.parse(raw);
+        text = extractResponseText(json) || parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = responseDiagnostic(json, raw);
+      } catch {
+        text = parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+      }
     } catch (err) {
       recordModelCall({ kind: 'memory', scene: options.scene || '', provider: 'openai', model: settings.memoryModel, charId: options.charId || '', system, messages, startedAt, ok: false, error: err.message });
       throw err;
     }
   }
   if (!String(text || '').trim()) {
-    const err = new Error('记忆 API 返回了空内容，请换更快的记忆模型或检查该模型是否支持文本输出');
+    const err = new Error(diagnostic || '记忆 API 返回了空内容，请换更快的记忆模型或检查该模型是否支持文本输出');
     recordModelCall({ kind: 'memory', scene: options.scene || '', provider: apiType, model: settings.memoryModel, charId: options.charId || '', system, messages, startedAt, ok: false, empty: true, diagnostic: err.message });
     throw err;
   }
-  recordModelCall({ kind: 'memory', scene: options.scene || '', provider: apiType, model: settings.memoryModel, charId: options.charId || '', system, messages, startedAt, ok: true, output: text });
-  return extractJson(text);
+  try {
+    const json = extractJson(text);
+    recordModelCall({ kind: 'memory', scene: options.scene || '', provider: apiType, model: settings.memoryModel, charId: options.charId || '', system, messages, startedAt, ok: true, output: text });
+    return json;
+  } catch (err) {
+    recordModelCall({ kind: 'memory', scene: options.scene || '', provider: apiType, model: settings.memoryModel, charId: options.charId || '', system, messages, startedAt, ok: false, diagnostic: '记忆 API 有正文但不是可解析 JSON：' + compactRawResponse(text), output: text });
+    throw err;
+  }
 }
 async function generateMemoryQuery(char, userInput, messages) {
   const fallback = { query: `${char?.name || ''} ${userInput}`, keywords: [], focus: 'current' };

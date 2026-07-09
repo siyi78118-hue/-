@@ -866,16 +866,24 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
   const startedAt = Date.now();
   const messages = [{ role: 'user', content: user }];
   let text = '';
+  let diagnostic = '';
   if (apiType === 'claude') {
     try {
       const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
         body: JSON.stringify({ model, system, messages, max_tokens: 900, temperature: 0.2 })
-      }, Math.min(API_TIMEOUT_MS, 45000));
+      }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
-      const json = await resp.json();
-      text = Array.isArray(json.content) ? json.content.map(p => p.text || '').join('') : (json.content || json.text || '');
+      const raw = await resp.text();
+      try {
+        const json = JSON.parse(raw);
+        text = extractResponseText(json) || parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = responseDiagnostic(json, raw);
+      } catch {
+        text = parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+      }
     } catch (err) {
       await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: 'claude', model, charId: options.charId || '', system, messages, startedAt, ok: false, error: err.message });
       throw err;
@@ -886,22 +894,35 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
         body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: 900 })
-      }, Math.min(API_TIMEOUT_MS, 45000));
+      }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
-      const json = await resp.json();
-      text = extractResponseText(json);
+      const raw = await resp.text();
+      try {
+        const json = JSON.parse(raw);
+        text = extractResponseText(json) || parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = responseDiagnostic(json, raw);
+      } catch {
+        text = parseJsonFallbackText(raw);
+        if (!String(text || '').trim()) diagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
+      }
     } catch (err) {
       await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: 'openai', model, charId: options.charId || '', system, messages, startedAt, ok: false, error: err.message });
       throw err;
     }
   }
   if (!String(text || '').trim()) {
-    const err = new Error('记忆 API 返回了空内容');
+    const err = new Error(diagnostic || '记忆 API 返回了空内容');
     await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: apiType, model, charId: options.charId || '', system, messages, startedAt, ok: false, empty: true, diagnostic: err.message });
     throw err;
   }
-  await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: apiType, model, charId: options.charId || '', system, messages, startedAt, ok: true, output: text });
-  return extractJson(text);
+  try {
+    const json = extractJson(text);
+    await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: apiType, model, charId: options.charId || '', system, messages, startedAt, ok: true, output: text });
+    return json;
+  } catch (err) {
+    await recordModelCall({ kind: 'memory', scene: options.scene || 'background-memory-query', provider: apiType, model, charId: options.charId || '', system, messages, startedAt, ok: false, diagnostic: '记忆 API 有正文但不是可解析 JSON：' + compactRawResponse(text), output: text });
+    throw err;
+  }
 }
 
 async function generateBackgroundMemoryQuery(charId, char, settings = {}, triggerText = '', messages = []) {
