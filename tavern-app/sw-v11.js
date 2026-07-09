@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v42';
+const CACHE_NAME = 'rpchat-v43';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;

@@ -680,9 +680,9 @@ button.profile-top{width:100%;text-align:left}
       <div class="cell-group">
         <button class="cell" onclick="chooseNewRoleAvatar()" type="button"><div class="cell-label">头像</div><div class="cell-body"><div class="avatar-edit"><span id="new-avatar-preview" class="avatar">＋</span><span>选择图片</span></div></div><div class="mini">›</div></button>
         <div class="cell"><div class="cell-label">昵称</div><div class="cell-body"><input class="input" id="new-name" placeholder="角色名"></div></div>
-        <div class="cell"><div class="cell-label">人物</div><div class="cell-body"><textarea class="textarea" id="new-desc" placeholder="年龄、职业、身份、生活状态、重要背景"></textarea></div></div>
-        <div class="cell"><div class="cell-label">说话</div><div class="cell-body"><textarea class="textarea" id="new-personality" placeholder="语气、脾气、聊天习惯、常用称呼"></textarea></div></div>
-        <div class="cell"><div class="cell-label">关系</div><div class="cell-body"><textarea class="textarea" id="new-scenario" placeholder="怎么认识、当前关系、边界、未完成约定"></textarea></div></div>
+        <div class="cell"><div class="cell-label">人物设定</div><div class="cell-body"><textarea class="textarea" id="new-desc" placeholder="年龄、职业/身份、家庭或经历、生活状态、长期目标、雷点"></textarea></div></div>
+        <div class="cell"><div class="cell-label">说话方式</div><div class="cell-body"><textarea class="textarea" id="new-personality" placeholder="语气、脾气、口头禅、聊天习惯、称呼你的方式"></textarea></div></div>
+        <div class="cell"><div class="cell-label">关系设定</div><div class="cell-body"><textarea class="textarea" id="new-scenario" placeholder="怎么认识、当前亲疏、暧昧/朋友/对立、边界或约定"></textarea></div></div>
       </div>
       <button class="primary" onclick="createRole()">保存</button>
     </div>
@@ -986,7 +986,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.28';
+const APP_BUILD_VERSION = '2026-07-09.29';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -2725,7 +2725,7 @@ function createRole() {
   });
   characters.push(char);
   allChats[char.id] = {
-    messages: [{ role: 'system', content: `你已添加了${name}，现在可以开始聊天了。`, time: now }],
+    messages: [friendAddedSystemMessage(char, now)],
     charPrompt: buildCharPrompt(char),
     extraPrompt: '',
     unread: 0
@@ -3499,6 +3499,13 @@ function playerName() {
 }
 function charName(char) {
   return char?.name || '对方';
+}
+function friendAddedSystemMessage(charOrName, time = Date.now()) {
+  const name = typeof charOrName === 'string' ? charOrName : charName(charOrName);
+  return { role: 'system', content: `你已添加了${name}，现在可以开始聊天了。`, time };
+}
+function chatClearedSystemMessage(char, time = Date.now()) {
+  return { role: 'system', content: `你已清空与${charName(char)}的聊天记录。`, time };
 }
 function memoryAliasText(text, char) {
   return String(text || '')
@@ -5643,8 +5650,7 @@ async function clearCurrentChat() {
   const char = characters.find(c => c.id === currentCharId);
   const old = allChats[currentCharId] || {};
   await cancelCloudProactiveQuick(currentCharId, '清空当前聊天');
-  allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(char), extraPrompt: old.extraPrompt || '', unread: 0, pinned: !!old.pinned, muted: !!old.muted };
-  if (char?.firstMessage) allChats[currentCharId].messages.push({ role:'assistant', content:char.firstMessage, time:Date.now() });
+  allChats[currentCharId] = { messages: [chatClearedSystemMessage(char)], charPrompt: buildCharPrompt(char), extraPrompt: old.extraPrompt || '', unread: 0, pinned: !!old.pinned, muted: !!old.muted };
   DB.set('chats', allChats);
   renderMessages();
   showScreen('chat');
