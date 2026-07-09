@@ -743,6 +743,9 @@ button.profile-top{width:100%;text-align:left}
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body" id="memory-status">IndexedDB 保存摘要、事件、资料和向量索引。</div></div>
         </div>
         <div class="cell-group">
+          <button class="cell" onclick="addMemoryItem('profiles')" type="button"><div class="cell-label">新增</div><div class="cell-body">新增资料</div><div class="mini">›</div></button>
+          <button class="cell" onclick="addMemoryItem('events')" type="button"><div class="cell-label">新增</div><div class="cell-body">新增事件</div><div class="mini">›</div></button>
+          <button class="cell" onclick="addMemoryItem('summaries')" type="button"><div class="cell-label">新增</div><div class="cell-body">新增摘要</div><div class="mini">›</div></button>
           <button class="cell" onclick="runMemoryNow()" type="button"><div class="cell-label">整理</div><div class="cell-body">立即提炼当前会话</div><div class="mini">›</div></button>
           <button class="cell" onclick="clearCurrentMemory()" type="button"><div class="cell-label">清理</div><div class="cell-body">清空当前角色记忆</div><div class="mini">›</div></button>
         </div>
@@ -983,7 +986,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.34';
+const APP_BUILD_VERSION = '2026-07-09.35';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -5613,6 +5616,67 @@ async function editMemoryItem(storeName, id) {
   await syncMemoryVector(storeName, next);
   await renderMemoryScreen();
   toast('记忆已更新');
+}
+async function addMemoryItem(storeName) {
+  const charId = currentCharId || characters[0]?.id;
+  const char = characters.find(c => c.id === charId);
+  if (!charId || !char) { toast('先创建并打开一个角色'); return; }
+  const now = Date.now();
+  let item = null;
+  if (storeName === 'summaries') {
+    const content = prompt('新增摘要');
+    if (content == null) return;
+    const text = content.trim();
+    if (!text) { toast('内容不能为空'); return; }
+    item = { id: uid('sum'), charId, content: memoryAliasText(text, char), createdAt: now, manual: true };
+  } else if (storeName === 'profiles') {
+    const type = prompt('资料类型', 'relationship');
+    if (type == null) return;
+    const title = prompt('资料标题', '资料');
+    if (title == null) return;
+    const detail = prompt('资料内容');
+    if (detail == null) return;
+    const text = detail.trim();
+    if (!text) { toast('内容不能为空'); return; }
+    item = {
+      id: uid('pro'),
+      charId,
+      type: type.trim() || 'relationship',
+      title: memoryAliasText(title.trim() || '资料', char),
+      detail: memoryAliasText(text, char),
+      importance: 5,
+      keywords: [],
+      createdAt: now,
+      manual: true
+    };
+  } else if (storeName === 'events') {
+    const happenedAt = prompt('时间节点', '未注明');
+    if (happenedAt == null) return;
+    const title = prompt('事件标题', '重要事件');
+    if (title == null) return;
+    const detail = prompt('事件内容');
+    if (detail == null) return;
+    const text = detail.trim();
+    if (!text) { toast('内容不能为空'); return; }
+    item = {
+      id: uid('evt'),
+      charId,
+      happenedAt: memoryAliasText(happenedAt.trim() || '未注明', char),
+      type: 'event',
+      title: memoryAliasText(title.trim() || '重要事件', char),
+      detail: memoryAliasText(text, char),
+      status: 'stable',
+      importance: 5,
+      keywords: [],
+      createdAt: now,
+      manual: true
+    };
+  }
+  if (!item) return;
+  await MemoryDB.put(storeName, item);
+  await syncMemoryVector(storeName, item);
+  await renderMemoryScreen();
+  toast('记忆已新增');
 }
 async function deleteMemoryItem(storeName, id) {
   if (!confirm('删除这条记忆？')) return;
