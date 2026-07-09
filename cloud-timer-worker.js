@@ -22,7 +22,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.6';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.7';
 const RECENT_EVENT_LIMIT = 40;
 
 export default {
@@ -59,6 +59,9 @@ export default {
           dueAt: body.dueAt,
           type: body.type || 'proactive',
           kind: body.kind || (String(body.jobId || '').startsWith('mom_') ? 'moment' : 'chat'),
+          mode: body.mode === 'dice' ? 'dice' : 'planned',
+          rollChance: Number.isFinite(Number(body.rollChance)) ? Number(body.rollChance) : undefined,
+          diceIntervalMs: Number.isFinite(Number(body.diceIntervalMs)) ? Number(body.diceIntervalMs) : undefined,
           test: !!body.test,
           updatedAt: Date.now()
         };
@@ -214,6 +217,9 @@ async function jobStatus(jobId, deviceId, env) {
       charId: job.charId || '',
       dueAt: job.dueAt || '',
       kind: job.kind || '',
+      mode: job.mode || '',
+      rollChance: job.rollChance,
+      diceIntervalMs: job.diceIntervalMs,
       test: !!job.test,
       updatedAt: job.updatedAt || 0
     } : null
@@ -286,6 +292,9 @@ async function deliverJob(job, env) {
     jobId: job.jobId || '',
     charId: job.charId || '',
     kind: job.kind || 'chat',
+    mode: job.mode || 'planned',
+    rollChance: job.rollChance,
+    diceIntervalMs: job.diceIntervalMs,
     dueAt: job.dueAt || '',
     test: !!job.test
   });

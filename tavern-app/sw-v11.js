@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v54';
+const CACHE_NAME = 'rpchat-v56';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -9,6 +9,8 @@ const VECTOR_DIM = 384;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
 const MEMORY_LINE_CHAR_LIMIT = 360;
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
+const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
+const PROACTIVE_DICE_CHANCE = 0.05;
 let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {
@@ -379,8 +381,22 @@ function splitAssistantOutput(text) {
   return parts.length ? parts : [normalized];
 }
 
+function stripProactiveScheduleDirective(text) {
+  return String(text || '')
+    .replace(/<al_schedule>[\s\S]*?<\/al_schedule>/gi, '')
+    .replace(/\{[\s\S]*?\}/g, block => {
+      try {
+        const json = JSON.parse(block);
+        if (json && typeof json === 'object' && !Array.isArray(json)
+          && ('nextProactiveAt' in json || 'nextProactiveIn' in json || 'nextMessageAt' in json || 'next_message_at' in json || 'nextMessageIn' in json || 'next_message_in' in json)) {
+          return '';
+        }
+      } catch {}
+      return block;
+    });
+}
 function cleanAssistantChatReply(text) {
-  const raw = String(text || '').trim();
+  const raw = stripProactiveScheduleDirective(text).trim();
   if (!raw) return '';
   const jsonLike = raw.replace(/```json|```/g, '').trim();
   try {
@@ -1088,6 +1104,7 @@ function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, pr
   composer.add('chat-extra-prompt', chat.extraPrompt ? '当前会话补充：\n' + chat.extraPrompt : '', { priority: 90 });
   composer.add('proactive-time-context', proactiveTimeContext, { priority: 100 });
   composer.add('proactive-task', `主动消息任务：现在不是${playerName(settings)}刚刚发消息后等你回答，而是经过了一段空闲时间后，你作为${charName(char)}主动给${playerName(settings)}发来一条微信式消息。
+关系语境：${playerName(settings)}已经有一段时间没有继续回复${charName(char)}了。${charName(char)}可以对此有轻微反应，比如试探、嘴硬、换话题、追问、补一句刚才没说完的话，或装作不在意；具体语气必须符合角色性格和双方关系。
 你应该根据时间流逝、你上一条说过的话、未解决话题、约定或关系状态主动开口。
 可以延续上一话题、关心${playerName(settings)}、提起约定、找一个符合角色的自然话题；长间隔时更像重新打开聊天。
 只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替${playerName(settings)}说话。
@@ -1244,23 +1261,35 @@ function proactiveDelayMs(settings, kind = 'chat') {
   const idleMs = Math.max(1, Number(settings.proactiveIdleMinutes) || 30) * 60000;
   return kind === 'moment' ? Math.max(2 * 60000, idleMs * 2) : idleMs;
 }
+function proactiveJobMode(job) {
+  return job?.mode === 'dice' ? 'dice' : 'planned';
+}
+function rollProactiveDice(job = null) {
+  const chance = Math.max(0, Math.min(1, Number(job?.rollChance ?? PROACTIVE_DICE_CHANCE) || 0));
+  return Math.random() < chance;
+}
 function proactiveJobId(settings, charId, kind = 'chat') {
   return `${proactiveJobPrefix(kind)}_${settings.deviceId}_${charId}`;
 }
-async function scheduleNextCloudProactive(state, charId, kind = 'chat') {
+async function scheduleNextCloudProactive(state, charId, kind = 'chat', options = {}) {
   const settings = state?.settings || {};
   const chat = state?.allChats?.[charId];
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription || !settings.deviceId || !chat) return false;
   const jobKey = proactiveJobKey(kind);
   const previousJob = chat[jobKey] ? { ...chat[jobKey] } : null;
-  const dueAtMs = Date.now() + proactiveDelayMs(settings, kind);
+  const mode = options.mode === 'dice' ? 'dice' : 'planned';
+  const dueAtMs = Date.now() + (mode === 'dice' ? (Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS) : proactiveDelayMs(settings, kind));
   const jobId = proactiveJobId(settings, charId, kind);
-  chat[jobKey] = { jobId, dueAt: new Date(dueAtMs).toISOString(), kind };
+  chat[jobKey] = { jobId, dueAt: new Date(dueAtMs).toISOString(), kind, mode };
+  if (mode === 'dice') {
+    chat[jobKey].rollChance = Number(options.rollChance ?? PROACTIVE_DICE_CHANCE);
+    chat[jobKey].diceIntervalMs = Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS;
+  }
   try {
     const resp = await fetchWithTimeout(timerUrl(settings, '/schedule'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind })
+      body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind, mode: proactiveJobMode(chat[jobKey]), rollChance: chat[jobKey].rollChance, diceIntervalMs: chat[jobKey].diceIntervalMs })
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('schedule failed ' + resp.status);
   } catch (err) {
@@ -1292,7 +1321,7 @@ async function recoverProactivePushFailure(payload = {}, reason = null) {
   const chat = allChats[charId];
   if (!charId || !chat) return false;
   try {
-    await scheduleNextCloudProactive(state, charId, kind);
+    await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
     setStateCloudTimerStatus(state, `后台${kind === 'moment' ? '朋友圈' : '私聊'}生成失败：${shortErrorMessage(reason)}，已安排下次重试。`, kind);
     state.allChats = allChats;
     state.updatedAt = Date.now();
@@ -1329,6 +1358,15 @@ async function handleProactivePush(payload) {
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
     await notifyClients({ type: 'al-state-updated', skipped: true });
+    return;
+  }
+  if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(dueJob.job || payload)) {
+    setStateCloudTimerTrace(state, kind, traceId, `后台骰子未抽中，本轮不生成${kind === 'moment' ? '朋友圈' : '私聊'}，10 分钟后再抽。`);
+    await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+    state.allChats = allChats;
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+    await notifyClients({ type: 'al-state-updated', charId, skipped: true });
     return;
   }
   if (await hasVisibleClient()) {
@@ -1402,7 +1440,7 @@ async function handleProactivePush(payload) {
   if (isEmptyReplyText(replyText)) {
     const emptyReason = lastModelResponseDiagnostic || '空回复';
     try {
-      await scheduleNextCloudProactive(state, charId, 'chat');
+      await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
@@ -1417,7 +1455,7 @@ async function handleProactivePush(payload) {
   const chunks = appendAssistantMessages(chat, replyText, { proactive: true });
   if (!chunks.length) {
     try {
-      await scheduleNextCloudProactive(state, charId, 'chat');
+      await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
@@ -1432,7 +1470,7 @@ async function handleProactivePush(payload) {
   chat.unread = (chat.unread || 0) + 1;
   chat.lastProactiveType = 'chat';
   try {
-    await scheduleNextCloudProactive(state, charId, 'chat');
+    await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
@@ -1499,7 +1537,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
   if (!text || isEmptyReplyText(text)) {
     const emptyReason = lastModelResponseDiagnostic || '空动态';
     try {
-      await scheduleNextCloudProactive(state, charId, 'moment');
+      await scheduleNextCloudProactive(state, charId, 'moment', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
@@ -1529,7 +1567,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
     content: `【朋友圈事件】${char.name}在朋友圈发布动态：“${momentSnippet(text)}”`
   });
   try {
-    await scheduleNextCloudProactive(state, charId, 'moment');
+    await scheduleNextCloudProactive(state, charId, 'moment', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
