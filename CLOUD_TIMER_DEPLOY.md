@@ -16,6 +16,19 @@ $env:CLOUDFLARE_API_TOKEN="你的 Cloudflare API Token"
 npm run cloud:deploy
 ```
 
+如果希望部署后自动检查线上版本：
+
+```powershell
+$env:AL_TIMER_ENDPOINT="https://你的-worker地址"
+npm run cloud:deploy
+```
+
+如果只想直接调用 Wrangler 原始命令：
+
+```powershell
+npm run cloud:deploy:raw
+```
+
 ## 检查
 
 部署后检查 `/health` 返回版本是否一致：
