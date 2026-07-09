@@ -77,6 +77,7 @@ export default {
         job.kind = job.kind || body.kind || (String(job.jobId || '').startsWith('mom_') ? 'moment' : 'chat');
         job.test = !!(job.test || body.test);
         const delivered = await deliverJob(job, env);
+        if (job.jobId && !delivered.retry) await cancelJob(job.jobId, env);
         return json({ ok: delivered.ok, delivered });
       }
       return json({ ok: false, error: 'not found' }, 404);

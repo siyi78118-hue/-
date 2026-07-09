@@ -52,6 +52,7 @@ assert.match(cloudTimerWorker, /const bucketKey = `due:\$\{minute\}`/);
 assert.match(cloudTimerWorker, /async function cancelJob\(jobId, env\)/);
 assert.match(cloudTimerWorker, /removeJobFromBucket\(`due:\$\{minuteKey\(dueAtMs\)\}`, jobId, env\)/);
 assert.doesNotMatch(cloudTimerWorker, /if \(body\.jobId\) await env\.AL_TIMER_KV\.delete\(`job:\$\{body\.jobId\}`\)/);
+assert.match(cloudTimerWorker, /if \(job\.jobId && !delivered\.retry\) await cancelJob\(job\.jobId, env\)/);
 assert.match(cloudTimerWorker, /if \(delivered\.retry\)/);
 assert.match(cloudTimerWorker, /resp\.status === 404 \|\| resp\.status === 410/);
 assert.match(cloudTimerWorker, /delete\(`sub:\$\{job\.deviceId\}`\)/);
