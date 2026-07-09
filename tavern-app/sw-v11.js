@@ -201,7 +201,10 @@ function memoryPackBudgetStatus(memoryPack = '') {
   return match ? `记忆预算：已省略 ${match[1]} 条低优先级记忆。` : '';
 }
 function memoryStatusWithBudget(memoryPack = '', baseStatus = '') {
-  return [baseStatus, memoryPackBudgetStatus(memoryPack)].filter(Boolean).join('\n');
+  const base = String(baseStatus || '').trim();
+  const budget = memoryPackBudgetStatus(memoryPack);
+  if (!budget || /记忆预算：已省略/.test(base)) return base;
+  return [base, budget].filter(Boolean).join('\n');
 }
 
 function pad2(n) {

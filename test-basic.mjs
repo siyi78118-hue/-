@@ -272,6 +272,8 @@ assert.match(budgetedPack, /红包约定必须保留/);
 assert.match(budgetedPack, /预算提示：已省略/);
 assert.ok(budgetedPack.length < 320);
 assert.match(memoryStatusWithBudget(budgetedPack, '记忆AI已调用'), /记忆预算：已省略/);
+const wrappedMemoryStatus = memoryStatusWithBudget(budgetedPack, memoryStatusWithBudget(budgetedPack, '记忆AI已调用'));
+assert.equal((wrappedMemoryStatus.match(/记忆预算：已省略/g) || []).length, 1);
 recordModelCall({
   kind: 'chat',
   scene: 'proactive-chat',
