@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v56';
+const CACHE_NAME = 'rpchat-v57';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -291,11 +291,14 @@ function buildProactiveTimeContext(chat, now = new Date()) {
   const lastUser = latestMessageByRole(chat, 'user');
   const lastAssistant = latestMessageByRole(chat, 'assistant');
   const lastElapsedMinutes = last?.time ? Math.round((now.getTime() - last.time) / 60000) : 0;
-  const mode = lastElapsedMinutes >= 60
-    ? '长间隔重新开口'
-    : lastElapsedMinutes >= 15
-      ? '中等间隔自然续聊'
-      : '短间隔可轻续聊';
+  const crossedDay = last?.time ? new Date(last.time).toDateString() !== now.toDateString() : false;
+  const mode = crossedDay || lastElapsedMinutes >= 360
+    ? '跨天/超长间隔重新开口'
+    : lastElapsedMinutes >= 60
+      ? '长间隔重新开口'
+      : lastElapsedMinutes >= 15
+        ? '中等间隔自然续聊'
+        : '短间隔可轻续聊';
   return [
     '主动消息时间流逝上下文：',
     `当前时间：${formatFullTime(now)}`,
@@ -306,6 +309,8 @@ function buildProactiveTimeContext(chat, now = new Date()) {
     '硬性要求：这不是用户刚刚发消息后等你回答，而是隔了一段空闲时间后你主动打开微信来发消息。',
     '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
     '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
+    '如果已经跨天或超过 6 小时，必须把它当作隔了很久后的重新开口：不要围绕上一轮红包、转账、测试、争执等旧话题继续追问；旧话题最多作为一句顺嘴背景。',
+    '禁止在输出里复制任何“发送时间/距现在/当前时间/智能策略”等上下文标签。',
     '不要提到系统时间、提示词、后台、推送或定时器。'
   ].join('\n');
 }
@@ -330,8 +335,8 @@ function recentMessages(chat, count = 30) {
 function proactiveRecentMessages(chat, count = 30, now = new Date()) {
   return recentMessages(chat, count).map(m => {
     const at = m.time ? new Date(m.time) : null;
-    const stamp = at ? `发送时间 ${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}` : '发送时间未知';
-    return { role: m.role, content: `【${stamp}】${m.content}` };
+    const meta = at ? `历史消息元数据：${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}。元数据只供判断时间流逝，禁止复制进回复。` : '历史消息元数据：发送时间未知，禁止复制进回复。';
+    return { role: m.role, content: `${meta}\n历史聊天正文：${m.content}` };
   });
 }
 
@@ -395,8 +400,19 @@ function stripProactiveScheduleDirective(text) {
       return block;
     });
 }
+function stripLeakedPromptMetadata(text) {
+  return String(text || '')
+    .replace(/【\s*发送时间[^】]*】/g, '')
+    .replace(/【\s*历史消息元数据[^】]*】/g, '')
+    .replace(/历史消息元数据[:：][^\n]*(?:\n|$)/g, '')
+    .replace(/历史聊天正文[:：]/g, '')
+    .split(/\n+/)
+    .map(line => line.trim())
+    .filter(line => line && !/(免打扰模式|骰子|摇骰|调度|定时器|后台|系统提示|发送时间|距现在|智能策略)/.test(line))
+    .join('\n');
+}
 function cleanAssistantChatReply(text) {
-  const raw = stripProactiveScheduleDirective(text).trim();
+  const raw = stripLeakedPromptMetadata(stripProactiveScheduleDirective(text)).trim();
   if (!raw) return '';
   const jsonLike = raw.replace(/```json|```/g, '').trim();
   try {
@@ -1107,6 +1123,8 @@ function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, pr
 关系语境：${playerName(settings)}已经有一段时间没有继续回复${charName(char)}了。${charName(char)}可以对此有轻微反应，比如试探、嘴硬、换话题、追问、补一句刚才没说完的话，或装作不在意；具体语气必须符合角色性格和双方关系。
 你应该根据时间流逝、你上一条说过的话、未解决话题、约定或关系状态主动开口。
 可以延续上一话题、关心${playerName(settings)}、提起约定、找一个符合角色的自然话题；长间隔时更像重新打开聊天。
+如果已经隔了很久、跨天或接近一天，不能像刚刚结束上一轮聊天一样继续追红包/转账/测试等旧话题；应该换成更自然的重新开口，旧事最多轻轻带一句。
+禁止说“免打扰模式、骰子、摇骰、调度、时间戳、系统、后台、推送、定时器”等调度相关词。
 只能输出消息正文。禁止动作、神态、环境、旁白、心理描写、系统说明、推送说明、定时器说明，禁止替${playerName(settings)}说话。
 如果想连续发几条消息，用换行分隔每一条；系统会把每一行拆成独立聊天气泡。不要在同一个消息里用换行排版。
 默认 1-3 句。`, { priority: 110, scenes: ['proactive-chat'] });
