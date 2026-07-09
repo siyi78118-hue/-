@@ -739,6 +739,7 @@ button.profile-top{width:100%;text-align:left}
         <button class="primary" onclick="saveSettings()">保存</button>
         <button class="secondary" onclick="testConnection('chat')">测试聊天连接</button>
         <button class="secondary" onclick="testConnection('memory')">测试记忆连接</button>
+        <button class="secondary" onclick="testMemoryQueryPreset()">测试记忆筛选</button>
       </div>
     </div>
   </div>
@@ -983,7 +984,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.20';
+const APP_BUILD_VERSION = '2026-07-09.21';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -5426,6 +5427,56 @@ async function testConnection(slot = 'chat') {
   } catch (e) {
     setApiHealthStatus(slot, '连接失败：' + statusErrorMessage(e));
     toast('连接失败：' + friendlyErrorMessage(e), 3200);
+  }
+}
+async function testMemoryQueryPreset() {
+  saveSettings({ silent: true });
+  const api = getApiSlot('memory');
+  const missing = [];
+  if (!settings.memoryApiUrl) missing.push('地址');
+  if (!settings.memoryApiKey) missing.push('Key');
+  if (!settings.memoryModel) missing.push('模型');
+  if (missing.length) {
+    const message = `记忆筛选未测试：缺少${missing.join('、')}`;
+    setMemoryQueryStatus(message);
+    recordModelCall({
+      kind: 'memory',
+      scene: 'memory-query-test',
+      provider: settings.memoryApiType || 'openai',
+      model: settings.memoryModel || '',
+      charId: currentCharId || '',
+      ok: false,
+      diagnostic: message,
+      system: '记忆筛选测试未调用',
+      messages: [{ role: 'user', content: '请先补全记忆接口配置。' }]
+    });
+    toast(message, 2600);
+    return false;
+  }
+  const char = characters.find(c => c.id === currentCharId) || characters[0] || normalizeChar({ id: 'memory_test', name: '测试', description: '用于测试记忆筛选接口。' });
+  const chat = allChats[char.id] || { messages: [] };
+  const recent = recentMessages(chat, 8);
+  const input = `记忆筛选测试：${playerName()}刚提到红包、朋友圈评论、主动消息和双方关系变化，请判断当前应该召回哪些记忆。`;
+  const payload = buildMemoryQueryPayload(char, input, recent);
+  toast('正在测试记忆筛选...', 1200);
+  setMemoryQueryStatus('正在测试记忆AI筛选预设。');
+  try {
+    const json = await callMemoryJSON(payload.system, payload.user, { scene: 'memory-query-test', charId: char.id });
+    const keywords = Array.isArray(json.keywords) ? json.keywords.slice(0, 5).join('、') : '';
+    const query = String(json.query || '').slice(0, 80);
+    const message = `记忆筛选测试成功：${keywords || query || '已返回 JSON'}`;
+    setMemoryQueryStatus(message);
+    setApiHealthStatus('memory', '记忆筛选 JSON 测试成功');
+    toast('记忆筛选测试成功', 1800);
+    await renderDiagnosticsScreen();
+    return true;
+  } catch (err) {
+    const message = `记忆筛选测试失败：${friendlyErrorMessage(err)}`;
+    setMemoryQueryStatus(message);
+    setApiHealthStatus('memory', message);
+    toast(message, 3200);
+    await renderDiagnosticsScreen();
+    return false;
   }
 }
 

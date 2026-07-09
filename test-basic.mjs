@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v34';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v35';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.20';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.21';/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.6';/);
 assert.match(script, /sw-v11\.js\?alarm-stream=1&v=\$\{APP_BUILD_VERSION\}/);
 assert.match(script, /\.then\(reg => reg\.update\?\.\(\)\)/);
@@ -72,6 +72,9 @@ assert.match(swScript, /diagnostic = responseDiagnostic\(json, raw\)/);
 assert.match(script, /记忆 API 有正文但不是可解析 JSON/);
 assert.match(swScript, /记忆 API 有正文但不是可解析 JSON/);
 assert.match(script, /async function prepareMemoryPackSafe\(charId, userInput, scene = 'chat'\)/);
+assert.match(html, /测试记忆筛选/);
+assert.match(script, /async function testMemoryQueryPreset\(\)/);
+assert.match(script, /scene: 'memory-query-test'/);
 assert.match(script, /记忆检索失败：\$\{friendlyErrorMessage\(err\)\}；已跳过记忆包继续生成。/);
 assert.match(script, /await prepareMemoryPackSafe\(requestCharId, userText, 'chat'\)/);
 assert.match(script, /await prepareMemoryPackSafe\(char\.id, memoryQuery, 'moment-interaction'\)/);
@@ -277,6 +280,7 @@ globalThis.__appTest = {
   buildMemoryQueryPayload,
   buildMemoryExtractPayload,
   generateMemoryQuery,
+  testMemoryQueryPreset,
   memoryAliasText,
   memorySignalTerms,
   scoreKeywordMemoryText,
@@ -296,7 +300,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -489,6 +493,11 @@ vm.runInContext("settings.memoryApiUrl='https://memory.example/v1'; settings.mem
 const skippedMemoryQuery = await generateMemoryQuery(v2, '你还记得红包吗？', []);
 assert.equal(skippedMemoryQuery._memoryAiStatus, 'skipped');
 assert.match(getModelCallLogs()[0].diagnostic, /缺少模型/);
+clearModelCallLogs();
+vm.runInContext("settings.memoryApiUrl=''; settings.memoryApiKey=''; settings.memoryModel='';", context);
+assert.equal(await testMemoryQueryPreset(), false);
+assert.equal(getModelCallLogs()[0].scene, 'memory-query-test');
+assert.match(getModelCallLogs()[0].diagnostic, /缺少地址、Key、模型/);
 clearModelCallLogs();
 assert.equal(cleanApiKey(' sk-test\u200b\n　'), 'sk-test');
 assert.match(getTimeContext(new Date('2026-07-04T09:05:03Z')), /当前设备时间/);
