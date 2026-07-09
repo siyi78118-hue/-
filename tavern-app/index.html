@@ -960,7 +960,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.9';
+const APP_BUILD_VERSION = '2026-07-09.10';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -2419,17 +2419,17 @@ async function replyToMoment(momentId, presetText = '') {
   const commentItem = { id: uid('mcom'), charId: 'player', name: playerName(), text: comment.slice(0, 80), time: Date.now(), seenBy: [] };
   moment.comments = [...(moment.comments || []), commentItem];
   recordMomentMemoryEvent(char.id, `${playerName()}评论了${char.name}的朋友圈：“${momentSnippet(comment, 70)}”`, Date.now());
+  markMomentCommentSeen(moment, commentItem.id, char.id);
+  recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`, Date.now());
   saveMoments();
   processMemoryAfterScenario(char.id);
   if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
-    toast('已记录评论；配置聊天接口后角色才能判断是否回复', 2200);
+    toast('已记录评论；角色已看过，配置聊天接口后才能判断是否回复', 2400);
     return;
   }
   toast('正在等待回复...', 1200);
   try {
     const reply = await callMomentReplyAI(char, moment, comment);
-    markMomentCommentSeen(moment, commentItem.id, char.id);
-    recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`, Date.now());
     const clean = momentSnippet(reply, 80);
     if (clean && !isEmptyReplyText(clean)) {
       moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: clean, time: Date.now() }];
@@ -2444,7 +2444,8 @@ async function replyToMoment(momentId, presetText = '') {
       toast(`${char.name}看到了你的评论`, 1600);
     }
   } catch (err) {
-    toast('回复失败：' + friendlyErrorMessage(err), 2600);
+    saveMoments();
+    toast('回复失败，但角色已看过：' + friendlyErrorMessage(err), 3000);
   }
 }
 async function callMomentReplyAI(char, moment, playerComment) {
