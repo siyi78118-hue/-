@@ -6,6 +6,8 @@ const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const API_TIMEOUT_MS = 120000;
 const CALL_LOG_LIMIT = 30;
 const VECTOR_DIM = 384;
+const MEMORY_PACK_CHAR_BUDGET = 3600;
+const MEMORY_LINE_CHAR_LIMIT = 360;
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 let lastModelResponseDiagnostic = '';
 
@@ -689,6 +691,50 @@ function shouldKeepSummary(summary) {
   return text.length >= 20 && !memoryTextIsNoise(text) && memoryTextHasSignal(text);
 }
 
+function trimMemoryLine(text, max = MEMORY_LINE_CHAR_LIMIT) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  if (value.length <= max) return value;
+  return value.slice(0, Math.max(20, max - 1)) + '…';
+}
+
+function composeMemoryPackSections(prefix, sections = [], budget = MEMORY_PACK_CHAR_BUDGET) {
+  const ordered = sections
+    .map(section => ({
+      title: String(section.title || '').trim(),
+      priority: Number(section.priority) || 100,
+      lines: (section.lines || []).map(line => trimMemoryLine(line)).filter(Boolean)
+    }))
+    .filter(section => section.title && section.lines.length)
+    .sort((a, b) => a.priority - b.priority);
+  if (!ordered.length) return '';
+  const keptSections = [];
+  let used = String(prefix || '').length + 2;
+  let omitted = 0;
+  for (const section of ordered) {
+    const headerCost = section.title.length + 2;
+    if (used + headerCost > budget) {
+      omitted += section.lines.length;
+      continue;
+    }
+    const keptLines = [];
+    used += headerCost;
+    for (const line of section.lines) {
+      const rendered = `- ${line}`;
+      const cost = rendered.length + 1;
+      if (used + cost > budget) {
+        omitted++;
+        continue;
+      }
+      keptLines.push(rendered);
+      used += cost;
+    }
+    if (keptLines.length) keptSections.push(`${section.title}：\n${keptLines.join('\n')}`);
+  }
+  if (!keptSections.length) return '';
+  if (omitted) keptSections.push(`预算提示：已省略 ${omitted} 条低优先级记忆，优先保留近期摘要、向量命中、未完成承诺和关键词强命中。`);
+  return `${prefix}\n\n${keptSections.join('\n\n')}`;
+}
+
 function messageLine(m, char, settings = {}) {
   return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
 }
@@ -866,14 +912,16 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '') {
       const keywordText = (query.keywords || []).slice(0, 5).join('、') || query.query || '已生成检索词';
       setMemoryQueryStatus(settings, `后台记忆AI已调用；关键词：${keywordText}；向量库召回 ${hits.length} 条。`);
     }
-    const parts = [];
-    if (latestSummaries.length) parts.push('近期增量摘要：\n' + latestSummaries.map(s => `- ${memoryAliasText(s.content, char, settings)}`).join('\n'));
-    if (hits.length) parts.push('本轮向量召回记忆：\n' + hits.map(h => `- ${memoryAliasText(h.text, char, settings)}`).join('\n'));
     const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, recallText, query.keywords || [], char, settings, 5)
       .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
-    if (keywordRows.length) parts.push('当前触发原因命中的本地记忆：\n' + keywordRows.map(row => `- ${row.text}${row.reason ? `（触发：${row.reason}）` : ''}`).join('\n'));
-    if (!parts.length) return '';
-    return `以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。\n\n${parts.join('\n\n')}`;
+    return composeMemoryPackSections(
+      '以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。',
+      [
+        { title: '近期增量摘要', priority: 10, lines: latestSummaries.map(s => memoryAliasText(s.content, char, settings)) },
+        { title: '本轮向量召回记忆', priority: 20, lines: hits.map(h => memoryAliasText(h.text, char, settings)) },
+        { title: '当前触发原因命中的本地记忆', priority: 30, lines: keywordRows.map(row => `${row.text}${row.reason ? `（触发：${row.reason}）` : ''}`) }
+      ]
+    );
   });
 }
 

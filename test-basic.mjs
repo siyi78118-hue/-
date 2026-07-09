@@ -139,6 +139,7 @@ globalThis.__appTest = {
   memorySignalTerms,
   scoreKeywordMemoryText,
   searchKeywordMemoryRows,
+  composeMemoryPackSections,
   recordModelCall,
   getModelCallLogs,
   getAllModelCallLogs,
@@ -150,7 +151,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -261,6 +262,14 @@ assert.match(keywordRows[0].reason, /关键词:红包/);
 assert.match(keywordRows[0].reason, /类型:promise/);
 assert.match(keywordRows[0].reason, /未完成/);
 assert.ok(scoreKeywordMemoryText('红包约定｜玩家答应林晚回复暗号后发180元红包。', ['红包'], 4) > 1);
+const budgetedPack = composeMemoryPackSections('记忆前言', [
+  { title: '高优先级', priority: 1, lines: ['红包约定必须保留'] },
+  { title: '低优先级', priority: 90, lines: Array.from({ length: 8 }, (_, i) => `低优先级记忆${i}` + '很长'.repeat(50)) }
+], 220);
+assert.match(budgetedPack, /高优先级/);
+assert.match(budgetedPack, /红包约定必须保留/);
+assert.match(budgetedPack, /预算提示：已省略/);
+assert.ok(budgetedPack.length < 320);
 recordModelCall({
   kind: 'chat',
   scene: 'proactive-chat',
