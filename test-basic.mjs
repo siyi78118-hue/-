@@ -11,10 +11,10 @@ const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
 const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v28';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v29';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.14';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.15';/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.4';/);
 assert.match(script, /sw-v11\.js\?alarm-stream=1&v=\$\{APP_BUILD_VERSION\}/);
 assert.match(script, /\.then\(reg => reg\.update\?\.\(\)\)/);
@@ -78,8 +78,12 @@ assert.match(script, /async function dumpMemoryStores\(\)/);
 assert.match(script, /async function restoreMemoryStores\(memory = \{\}\)/);
 assert.match(script, /async function exportBackup\(\)/);
 assert.match(script, /async function importBackup\(event\)/);
+assert.match(script, /function resetImportedDeviceBinding\(importedSettings\)/);
+assert.match(script, /function clearImportedCloudJobs\(chats = \{\}\)/);
 assert.match(script, /AL-backup-/);
 assert.match(script, /导入会覆盖当前本机设置、角色、聊天、朋友圈和记忆库/);
+assert.match(script, /备份已导入，云闹钟需重新绑定/);
+assert.match(script, /已从备份恢复；云闹钟需要在本机重新绑定。/);
 const cloudTimerWorkerCode = cloudTimerWorker.replace(/\/\/.*$/gm, '');
 assert.doesNotMatch(cloudTimerWorkerCode, /\.list\s*\(/);
 assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-09\.4';/);
@@ -212,6 +216,8 @@ globalThis.__appTest = {
   streamDeltaText,
   normalizeChar,
   normalizePresetKey,
+  resetImportedDeviceBinding,
+  clearImportedCloudJobs,
   fetchModels,
   selectFetchedModel,
   recentMessages,
@@ -256,7 +262,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -468,6 +474,33 @@ const proactiveTrigger = buildProactiveTriggerMessage({ name: '林晚' }, proact
 assert.match(proactiveTrigger, /内部主动触发/);
 assert.match(proactiveTrigger, /这不是玩家发来的聊天消息/);
 assert.match(proactiveTrigger, /主动给玩家发一条微信私聊/);
+const importedSettings = resetImportedDeviceBinding({
+  cloudTimerEnabled: true,
+  timerEndpoint: 'https://timer.example',
+  pushPublicKey: 'BPublic',
+  pushSubscription: { endpoint: 'https://old-device.example' },
+  deviceId: 'old-device',
+  cloudTimerLastChatTrace: 'old trace'
+});
+assert.equal(importedSettings.cloudTimerEnabled, false);
+assert.equal(importedSettings.deviceId, '');
+assert.equal(importedSettings.pushSubscription, null);
+assert.equal(importedSettings.timerEndpoint, 'https://timer.example');
+assert.equal(importedSettings.pushPublicKey, 'BPublic');
+assert.match(importedSettings.cloudTimerLastStatus, /重新绑定/);
+const importedChats = clearImportedCloudJobs({
+  c1: {
+    messages: [],
+    pendingProactiveJob: { jobId: 'old-chat' },
+    pendingMomentJob: { jobId: 'old-moment' },
+    cloudScheduleSyncedAt: 1,
+    cloudMomentScheduleSyncedAt: 2
+  }
+});
+assert.equal('pendingProactiveJob' in importedChats.c1, false);
+assert.equal('pendingMomentJob' in importedChats.c1, false);
+assert.equal('cloudScheduleSyncedAt' in importedChats.c1, false);
+assert.equal('cloudMomentScheduleSyncedAt' in importedChats.c1, false);
 vm.runInContext("currentCharId='current_chat'; allChats={ old_chat:{ messages:[{ role:'user', content:'旧会话', time:1 }] }, current_chat:{ messages:[{ role:'user', content:'当前会话', time:2 }] } };", context);
 assert.equal(cloudTimerTargetCharId([{ char: { id: 'old_chat' }, chat: context.allChats?.old_chat }, { char: { id: 'current_chat' }, chat: context.allChats?.current_chat }]), 'current_chat');
 const promiseVector = localEmbedding('周六晚上语音 承诺 不会消失');

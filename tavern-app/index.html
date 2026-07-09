@@ -963,7 +963,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.14';
+const APP_BUILD_VERSION = '2026-07-09.15';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -992,6 +992,37 @@ function migrateSettings(raw) {
   next.apiUrl = next.chatApiUrl;
   next.apiKey = next.chatApiKey;
   return next;
+}
+function resetImportedDeviceBinding(importedSettings) {
+  const next = migrateSettings(importedSettings || {});
+  next.deviceId = '';
+  next.pushSubscription = null;
+  next.cloudTimerEnabled = false;
+  next.cloudTimerLastStatus = '已从备份恢复；云闹钟需要在本机重新绑定。';
+  next.cloudTimerLastStatusAt = Date.now();
+  next.cloudTimerLastChatStatus = '';
+  next.cloudTimerLastChatStatusAt = 0;
+  next.cloudTimerLastMomentStatus = '';
+  next.cloudTimerLastMomentStatusAt = 0;
+  next.cloudTimerLastChatTrace = '';
+  next.cloudTimerLastChatTraceAt = 0;
+  next.cloudTimerLastMomentTrace = '';
+  next.cloudTimerLastMomentTraceAt = 0;
+  next.cloudTimerLastTriggerAckStatus = '';
+  next.cloudTimerLastTriggerAckAt = 0;
+  next.cloudTimerLastTestAckStatus = '';
+  next.cloudTimerLastTestAckAt = 0;
+  return next;
+}
+function clearImportedCloudJobs(chats = {}) {
+  Object.values(chats || {}).forEach(chat => {
+    if (!chat || typeof chat !== 'object') return;
+    delete chat.pendingProactiveJob;
+    delete chat.pendingMomentJob;
+    delete chat.cloudScheduleSyncedAt;
+    delete chat.cloudMomentScheduleSyncedAt;
+  });
+  return chats;
 }
 let settings = migrateSettings(DB.get('settings', DEFAULT_SETTINGS));
 let characters = DB.get('characters', []);
@@ -1199,9 +1230,9 @@ async function importBackup(event) {
   try {
     const data = JSON.parse(await file.text());
     if (!data || typeof data !== 'object' || data.app !== 'AL') throw new Error('不是 AL 备份文件');
-    settings = migrateSettings(data.settings || {});
+    settings = resetImportedDeviceBinding(data.settings || {});
     characters = Array.isArray(data.characters) ? data.characters.map(normalizeChar) : [];
-    allChats = data.allChats && typeof data.allChats === 'object' ? data.allChats : (data.chats || {});
+    allChats = clearImportedCloudJobs(data.allChats && typeof data.allChats === 'object' ? data.allChats : (data.chats || {}));
     allMoments = Array.isArray(data.allMoments) ? data.allMoments : (Array.isArray(data.moments) ? data.moments : []);
     scrubEmptyReplyMessages(allChats);
     localStorage.setItem('rpchat_settings', JSON.stringify(settings));
@@ -1219,7 +1250,7 @@ async function importBackup(event) {
     fillSettingsForm();
     renderCloudTimerStatus();
     showScreen('chats');
-    toast('备份已导入');
+    toast('备份已导入，云闹钟需重新绑定');
   } catch (err) {
     toast('导入失败：' + friendlyErrorMessage(err), 3600);
   }
