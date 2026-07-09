@@ -597,14 +597,48 @@ function memorySignalTerms(text = '', extraKeywords = []) {
   return [...terms];
 }
 function scoreKeywordMemoryText(text, terms = [], importance = 0) {
+  return keywordMemoryActivation({ text, terms, importance }).score;
+}
+function keywordMemoryActivation({ text = '', terms = [], importance = 0, keywords = [], type = '', status = '', createdAt = 0 } = {}) {
   const value = String(text || '').toLowerCase();
-  if (!value || memoryTextIsNoise(value)) return 0;
+  if (!value || memoryTextIsNoise(value)) return { score: 0, reasons: [] };
+  const reasons = [];
   let score = Math.min(4, Number(importance) || 0) * 0.12;
+  const matched = new Set();
   for (const term of terms) {
     const t = String(term || '').toLowerCase();
-    if (t && value.includes(t)) score += t.length >= 3 ? 1 : 0.7;
+    if (t && value.includes(t)) {
+      matched.add(term);
+      score += t.length >= 3 ? 1 : 0.7;
+    }
   }
-  return score;
+  const keywordMatches = (keywords || []).filter(keyword => {
+    const raw = String(keyword || '').trim();
+    return raw && terms.some(term => String(term || '').toLowerCase() === raw.toLowerCase());
+  });
+  if (keywordMatches.length) {
+    keywordMatches.slice(0, 3).forEach(keyword => matched.add(keyword));
+    score += Math.min(2.4, keywordMatches.length * 1.2);
+    reasons.push(`关键词:${keywordMatches.slice(0, 3).join('/')}`);
+  }
+  const importantTypes = ['promise', 'payment', 'moment', 'conflict', 'reconcile', 'preference', 'relationship', 'plan'];
+  if (importantTypes.includes(String(type || ''))) {
+    score += 0.25;
+    reasons.push(`类型:${type}`);
+  }
+  if (String(status || '') === 'open') {
+    score += 0.35;
+    reasons.push('未完成');
+  }
+  const ageMs = Date.now() - Number(createdAt || 0);
+  if (Number.isFinite(ageMs) && ageMs > 0 && ageMs < 7 * 24 * 60 * 60 * 1000) {
+    score += 0.2;
+    reasons.push('近期');
+  }
+  if (matched.size && !reasons.some(reason => reason.startsWith('关键词:'))) {
+    reasons.push(`命中:${[...matched].slice(0, 3).join('/')}`);
+  }
+  return { score, reasons: reasons.slice(0, 4) };
 }
 function searchKeywordMemoryRows(rows = {}, queryText = '', queryKeywords = [], char = null, settings = {}, limit = 5) {
   const terms = memorySignalTerms(queryText, queryKeywords);
@@ -613,17 +647,20 @@ function searchKeywordMemoryRows(rows = {}, queryText = '', queryKeywords = [], 
   for (const e of rows.events || []) {
     const text = memoryAliasText([e.happenedAt, e.title, e.detail, ...(e.keywords || [])].filter(Boolean).join('｜'), char, settings);
     if (!shouldKeepEvent(e)) continue;
-    candidates.push({ sourceType: 'event', sourceId: e.id, text, importance: e.importance || 3, score: scoreKeywordMemoryText(text, terms, e.importance || 3) });
+    const activation = keywordMemoryActivation({ text, terms, importance: e.importance || 3, keywords: e.keywords || [], type: e.type || 'event', status: e.status || '', createdAt: e.createdAt || 0 });
+    candidates.push({ sourceType: 'event', sourceId: e.id, text, importance: e.importance || 3, score: activation.score, reason: activation.reasons.join('，') });
   }
   for (const p of rows.profiles || []) {
     const text = memoryAliasText([p.title, p.detail, ...(p.keywords || [])].filter(Boolean).join('｜'), char, settings);
     if (!shouldKeepProfile(p)) continue;
-    candidates.push({ sourceType: 'profile', sourceId: p.id, text, importance: p.importance || 3, score: scoreKeywordMemoryText(text, terms, p.importance || 3) });
+    const activation = keywordMemoryActivation({ text, terms, importance: p.importance || 3, keywords: p.keywords || [], type: p.type || 'profile', createdAt: p.createdAt || 0 });
+    candidates.push({ sourceType: 'profile', sourceId: p.id, text, importance: p.importance || 3, score: activation.score, reason: activation.reasons.join('，') });
   }
   for (const s of rows.summaries || []) {
     const text = memoryAliasText(s.content, char, settings);
     if (!shouldKeepSummary(text)) continue;
-    candidates.push({ sourceType: 'summary', sourceId: s.id, text, importance: 2, score: scoreKeywordMemoryText(text, terms, 2) });
+    const activation = keywordMemoryActivation({ text, terms, importance: 2, keywords: s.keywords || [], type: 'summary', createdAt: s.createdAt || 0 });
+    candidates.push({ sourceType: 'summary', sourceId: s.id, text, importance: 2, score: activation.score, reason: activation.reasons.join('，') });
   }
   return candidates
     .filter(item => item.score >= 1)
@@ -834,7 +871,7 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '') {
     if (hits.length) parts.push('本轮向量召回记忆：\n' + hits.map(h => `- ${memoryAliasText(h.text, char, settings)}`).join('\n'));
     const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, recallText, query.keywords || [], char, settings, 5)
       .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
-    if (keywordRows.length) parts.push('当前触发原因命中的本地记忆：\n' + keywordRows.map(row => `- ${row.text}`).join('\n'));
+    if (keywordRows.length) parts.push('当前触发原因命中的本地记忆：\n' + keywordRows.map(row => `- ${row.text}${row.reason ? `（触发：${row.reason}）` : ''}`).join('\n'));
     if (!parts.length) return '';
     return `以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。\n\n${parts.join('\n\n')}`;
   });

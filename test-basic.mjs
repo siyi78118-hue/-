@@ -248,11 +248,15 @@ assert.match(memoryExtractPayload.user, /旧增量摘要：\n旧摘要/);
 assert.ok(memorySignalTerms('你还记得红包和周末约定吗？').includes('红包'));
 assert.ok(scoreKeywordMemoryText('玩家承诺给林晚发红包。', ['红包'], 4) > 1);
 const keywordRows = searchKeywordMemoryRows({
-  events: [{ id: 'evt1', type: 'promise', title: '红包约定', detail: '玩家答应林晚回复暗号后发180元红包。', importance: 4, keywords: ['红包', '约定'] }],
+  events: [{ id: 'evt1', type: 'promise', title: '红包约定', detail: '玩家答应林晚回复暗号后发180元红包。', status: 'open', importance: 4, keywords: ['红包', '约定'] }],
   profiles: [],
   summaries: [],
 }, '你还记得红包吗？', ['红包'], v2);
 assert.equal(keywordRows[0].sourceId, 'evt1');
+assert.match(keywordRows[0].reason, /关键词:红包/);
+assert.match(keywordRows[0].reason, /类型:promise/);
+assert.match(keywordRows[0].reason, /未完成/);
+assert.ok(scoreKeywordMemoryText('红包约定｜玩家答应林晚回复暗号后发180元红包。', ['红包'], 4) > 1);
 recordModelCall({
   kind: 'chat',
   scene: 'proactive-chat',
