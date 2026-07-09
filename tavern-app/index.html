@@ -715,6 +715,9 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
         </div>
         <div class="cell-group">
+          <button class="cell" onclick="exportBackup()" type="button"><div class="cell-label">备份</div><div class="cell-body">导出本机数据<span class="cell-note">含接口配置、聊天、朋友圈和记忆库</span></div><div class="mini">›</div></button>
+          <button class="cell" onclick="document.getElementById('backup-input').click()" type="button"><div class="cell-label">恢复</div><div class="cell-body">导入本机备份<span class="cell-note">覆盖当前本机数据</span></div><div class="mini">›</div></button>
+          <input type="file" id="backup-input" accept="application/json,.json" style="display:none" onchange="importBackup(event)">
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
         </div>
         <button class="primary" onclick="saveSettings()">保存</button>
@@ -960,7 +963,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.12';
+const APP_BUILD_VERSION = '2026-07-09.13';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1106,6 +1109,20 @@ const MemoryDB = {
       req.onerror = () => reject(req.error);
     });
   },
+  async clearStore(storeName) {
+    const db = await this.open();
+    if (!db) {
+      const data = this.readFallback();
+      data[storeName] = [];
+      this.writeFallback(data);
+      return;
+    }
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(storeName, 'readwrite').objectStore(storeName).clear();
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  },
   async getMeta(key, fallback = null) {
     const rows = await this.all('meta');
     return rows.find(r => r.key === key)?.value ?? fallback;
@@ -1124,6 +1141,89 @@ const MemoryDB = {
     await this.remove('meta', memoryMetaKey(charId));
   }
 };
+
+async function dumpMemoryStores() {
+  const memory = {};
+  for (const store of MEMORY_STORES) memory[store] = await MemoryDB.all(store);
+  return memory;
+}
+
+async function restoreMemoryStores(memory = {}) {
+  for (const store of MEMORY_STORES) {
+    await MemoryDB.clearStore(store);
+    const rows = Array.isArray(memory[store]) ? memory[store] : [];
+    for (const row of rows) {
+      if (row && typeof row === 'object') await MemoryDB.put(store, row);
+    }
+  }
+}
+
+function backupFileName(date = new Date()) {
+  return `AL-backup-${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}-${pad2(date.getHours())}${pad2(date.getMinutes())}.json`;
+}
+
+async function exportBackup() {
+  try {
+    await mirrorAppStateNow();
+    const backup = {
+      app: 'AL',
+      version: APP_BUILD_VERSION,
+      exportedAt: new Date().toISOString(),
+      settings,
+      characters,
+      allChats,
+      allMoments,
+      memory: await dumpMemoryStores()
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = backupFileName();
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast('已导出备份，请妥善保存，里面包含接口配置');
+  } catch (err) {
+    toast('导出失败：' + friendlyErrorMessage(err), 3200);
+  }
+}
+
+async function importBackup(event) {
+  const input = event?.target;
+  const file = input?.files?.[0];
+  if (input) input.value = '';
+  if (!file) return;
+  if (!confirm('导入会覆盖当前本机设置、角色、聊天、朋友圈和记忆库。继续？')) return;
+  try {
+    const data = JSON.parse(await file.text());
+    if (!data || typeof data !== 'object' || data.app !== 'AL') throw new Error('不是 AL 备份文件');
+    settings = migrateSettings(data.settings || {});
+    characters = Array.isArray(data.characters) ? data.characters.map(normalizeChar) : [];
+    allChats = data.allChats && typeof data.allChats === 'object' ? data.allChats : (data.chats || {});
+    allMoments = Array.isArray(data.allMoments) ? data.allMoments : (Array.isArray(data.moments) ? data.moments : []);
+    scrubEmptyReplyMessages(allChats);
+    localStorage.setItem('rpchat_settings', JSON.stringify(settings));
+    localStorage.setItem('rpchat_characters', JSON.stringify(characters));
+    localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
+    localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
+    localStorage.setItem('rpchat_app_state_updated_at', String(Date.now()));
+    await restoreMemoryStores(data.memory || {});
+    await mirrorAppStateNow();
+    currentCharId = characters.find(c => allChats[c.id])?.id || characters[0]?.id || null;
+    if (currentCharId && !allChats[currentCharId]) allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(characters.find(c => c.id === currentCharId)), extraPrompt: '', unread: 0 };
+    renderChats();
+    renderContacts();
+    renderMoments();
+    fillSettingsForm();
+    renderCloudTimerStatus();
+    showScreen('chats');
+    toast('备份已导入');
+  } catch (err) {
+    toast('导入失败：' + friendlyErrorMessage(err), 3600);
+  }
+}
 
 let mirrorTimer = null;
 async function mirrorAppStateNow() {
