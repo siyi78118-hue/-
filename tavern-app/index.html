@@ -240,8 +240,12 @@ button{border:none;background:none;cursor:pointer}
 .pay-input::placeholder{color:#cfcfcf}
 .pay-balance{font-size:12px;color:#999;margin-top:10px}
 .pay-note-input{height:44px;line-height:44px}
-.voice-hold{width:100%;height:36px;border-radius:4px;background:#fff;color:#333;font-size:15px}
+.voice-hold{width:100%;height:36px;border-radius:4px;background:#fff;color:#333;font-size:15px;touch-action:none;user-select:none}
+.voice-hold.recording{background:#d9d9d9;color:#111}
 .voice-bubble{min-width:86px;display:flex;align-items:center;gap:8px}
+.voice-body{display:flex;flex-direction:column;gap:5px;min-width:0}
+.voice-main{display:flex;align-items:center;gap:8px}
+.voice-transcript{font-size:14px;line-height:1.45;color:#333;word-break:break-word}
 .voice-mark{width:16px;height:16px;position:relative;display:inline-block;transform:rotate(180deg)}
 .voice-mark:before,.voice-mark:after{content:"";position:absolute;border:2px solid currentColor;border-left:none;border-top:none;border-radius:0 12px 12px 0}
 .voice-mark:before{left:2px;top:5px;width:6px;height:6px}
@@ -540,7 +544,7 @@ button.profile-top{width:100%;text-align:left}
       <button class="composer-tool plus" onclick="toggleComposerPanel('plus')" type="button" aria-label="更多"><i></i></button>
       <button class="send inactive" id="btn-send" onclick="sendMessage()">发送</button>
     </div>
-    <div class="composer-panel" id="composer-voice"><button class="voice-hold" onclick="sendVoiceMessage()" type="button">按住 说话</button></div>
+    <div class="composer-panel" id="composer-voice"><button class="voice-hold" onpointerdown="startVoiceRecording(event)" onpointerup="stopVoiceRecording(event)" onpointercancel="cancelVoiceRecording()" onpointerleave="cancelVoiceRecording(event)" type="button">按住 说话</button></div>
     <div class="composer-panel" id="composer-emoji">
       <div class="emoji-grid">
         <button onclick="insertEmoji('😀')">😀</button><button onclick="insertEmoji('😂')">😂</button><button onclick="insertEmoji('🥺')">🥺</button><button onclick="insertEmoji('😒')">😒</button>
@@ -701,6 +705,11 @@ button.profile-top{width:100%;text-align:left}
           <div class="cell"><div class="cell-label">地址</div><div class="cell-body"><input class="input" id="set-memory-api-url" placeholder="https://memory-api.example/v1"></div></div>
           <div class="cell"><div class="cell-label">Key</div><div class="cell-body"><input class="input" id="set-memory-api-key" type="password" placeholder="sk-..." autocomplete="off" autocapitalize="none" spellcheck="false"></div></div>
           <div class="cell model-row"><div class="cell-label">记忆模型</div><div class="cell-body"><input class="input" id="set-memory-model" placeholder="负责检索、摘要和记忆整理"><div class="model-tools"><select class="select" id="set-memory-model-list" onchange="selectFetchedModel(this.value, 'memory')"><option value="">未拉取模型</option></select><button class="inline-btn" onclick="fetchModels('memory')" type="button">拉取模型</button></div></div></div>
+          <div class="contact-index" style="height:30px">语音转文字</div>
+          <div class="cell"><div class="cell-label">转写</div><div class="cell-body"><select class="select" id="set-voice-transcribe-enabled"><option value="on">开启</option><option value="off">关闭</option></select></div></div>
+          <div class="cell"><div class="cell-label">地址</div><div class="cell-body"><input class="input" id="set-voice-api-url" placeholder="留空则复用聊天接口"></div></div>
+          <div class="cell"><div class="cell-label">Key</div><div class="cell-body"><input class="input" id="set-voice-api-key" type="password" placeholder="留空则复用聊天 Key" autocomplete="off" autocapitalize="none" spellcheck="false"></div></div>
+          <div class="cell"><div class="cell-label">转写模型</div><div class="cell-body"><input class="input" id="set-voice-model" placeholder="whisper-1"></div></div>
         </div>
         <div class="cell-group">
           <div class="cell"><div class="cell-label">Temperature</div><div class="cell-body"><input class="range" id="set-temp" type="range" min="0" max="2" step="0.05" value="0.8" oninput="document.getElementById('temp-val').textContent=this.value"></div><div class="mini" id="temp-val">0.8</div></div>
@@ -933,8 +942,12 @@ const DEFAULT_SETTINGS = {
   memoryApiType: 'openai',
   memoryApiUrl: '',
   memoryApiKey: '',
+  voiceTranscribeEnabled: true,
+  voiceApiUrl: '',
+  voiceApiKey: '',
   chatModel: '',
   memoryModel: '',
+  voiceModel: 'whisper-1',
   chatModels: [],
   memoryModels: [],
   rpPreset: 'combined',
@@ -969,7 +982,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.17';
+const APP_BUILD_VERSION = '2026-07-09.18';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -987,9 +1000,12 @@ function migrateSettings(raw) {
   if (!next.chatApiKey && raw?.apiKey) next.chatApiKey = raw.apiKey;
   if (!next.memoryApiKey && raw?.memoryApiKey) next.memoryApiKey = raw.memoryApiKey;
   if (!next.memoryApiKey && raw?.apiKey) next.memoryApiKey = raw.apiKey;
+  if (!next.voiceApiUrl && raw?.voiceApiUrl) next.voiceApiUrl = raw.voiceApiUrl;
+  if (!next.voiceApiKey && raw?.voiceApiKey) next.voiceApiKey = raw.voiceApiKey;
   if (!next.chatModel && raw?.model) next.chatModel = raw.model;
   if (!next.memoryModel && raw?.memoryModel) next.memoryModel = raw.memoryModel;
   if (!next.memoryModel && raw?.model) next.memoryModel = raw.model;
+  if (!next.voiceModel) next.voiceModel = raw?.voiceModel || 'whisper-1';
   if (!Array.isArray(next.chatModels) || !next.chatModels.length) next.chatModels = Array.isArray(raw?.models) ? raw.models : [];
   if (!Array.isArray(next.memoryModels) || !next.memoryModels.length) next.memoryModels = Array.isArray(raw?.models) ? raw.models : [];
   next.model = next.chatModel;
@@ -1056,6 +1072,11 @@ let playerProfileSaveTimer = null;
 let newRoleAvatarData = '';
 let modalCharAvatarData = '';
 let payDraftKind = 'transfer';
+let voiceRecorder = null;
+let voiceChunks = [];
+let voiceStream = null;
+let voiceStartAt = 0;
+let voiceRecordingCharId = '';
 const EMPTY_REPLY_TEXT = '（对方没有回复）';
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 
@@ -1596,9 +1617,18 @@ function responseDiagnostic(json, raw = '') {
 function previewText(text) {
   const value = String(text || '');
   if (/^\[语音消息\s*\d+秒，未转文字\]$/.test(value)) return '[语音]';
+  if (/^\[语音消息\s*\d+秒\]\s*/.test(value)) return value.replace(/^\[语音消息\s*\d+秒\]\s*/, '[语音] ');
   if (/Failed to fetch|NetworkError|ERR_FAILED/i.test(value)) return '接口连接失败，请检查设置';
   if (/^\（.+(?:超时|鉴权失败|接口连接失败|地址不正确|隐藏字符).+\）$/.test(value)) return value.slice(1, -1);
   return value;
+}
+function messagePreview(m) {
+  if (!m) return '';
+  if (m.type === 'voice') {
+    const transcript = String(m.transcript || '').trim();
+    return transcript ? `[语音] ${transcript}` : '[语音]';
+  }
+  return previewText(m.content);
 }
 function redactSensitiveText(text) {
   return String(text || '')
@@ -1853,10 +1883,10 @@ function chatSearchRows(keyword) {
     const chat = allChats[c.id];
     const messages = visibleChatMessages(chat);
     const last = messages[messages.length - 1];
-    const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
+    const preview = last ? messagePreview(last) : (c.firstMessage || c.description || c.personality || '');
     const messageHit = messages.slice(-80).reverse().find(m => searchText(m.content).includes(q));
     const haystack = [c.name, preview, c.description, c.personality, messageHit?.content].map(searchText).join(' ');
-    return { c, chat, last, preview: messageHit ? previewText(messageHit.content) : preview, time: last?.time || 0, haystack };
+    return { c, chat, last, preview: messageHit ? messagePreview(messageHit) : preview, time: last?.time || 0, haystack };
   }).filter(r => r.haystack.includes(q))
     .sort((a, b) => b.time - a.time || a.c.name.localeCompare(b.c.name, 'zh-CN'));
 }
@@ -1893,7 +1923,7 @@ function renderSearchScreen() {
         ${row.m.role === 'user' ? playerAvatarHtml() : avatarHtml(char)}
         <div class="row-main">
           <div class="row-line"><div class="row-name">${esc(row.m.role === 'user' ? playerName() : charName(char))}</div><div class="row-time">${fmtTime(row.m.time) || ''}</div></div>
-          <div class="row-preview">${highlightSearch(previewText(row.m.content), keyword)}</div>
+          <div class="row-preview">${highlightSearch(messagePreview(row.m), keyword)}</div>
         </div>
       </button>`).join('')}</div>` : '<div class="search-empty">没有找到相关聊天内容</div>';
     return;
@@ -2133,7 +2163,7 @@ function renderChats() {
   const roleRows = characters.map(c => {
     const chat = allChats[c.id];
     const last = lastVisibleMessage(chat);
-    const preview = last ? previewText(last.content) : (c.firstMessage || c.description || c.personality || '');
+    const preview = last ? messagePreview(last) : (c.firstMessage || c.description || c.personality || '');
     const unread = chat?.unread || 0;
     return { c, last, preview, unread, time: last?.time || 0, pinned: !!chat?.pinned, muted: !!chat?.muted };
   }).filter(r => !keyword || [r.c.name, r.preview, r.c.description, r.c.personality].some(v => String(v || '').toLowerCase().includes(keyword)))
@@ -3147,7 +3177,8 @@ function renderPaymentCard(m) {
 }
 function renderVoiceCard(m) {
   const duration = Math.max(1, Math.min(60, Number(m.voiceDuration) || 4));
-  return `<div class="bubble voice-bubble"><span class="voice-mark"></span><span class="voice-duration">${duration}''</span></div>`;
+  const transcript = String(m.transcript || '').trim();
+  return `<div class="bubble voice-bubble"><div class="voice-body"><div class="voice-main"><span class="voice-mark"></span><span class="voice-duration">${duration}''</span></div>${transcript ? `<div class="voice-transcript">${formatMsg(transcript)}</div>` : ''}</div></div>`;
 }
 function renderMessageBody(m) {
   if (m.type === 'transfer' || m.type === 'redpacket') return renderPaymentCard(m);
@@ -3924,22 +3955,187 @@ async function sendMessage() {
   DB.set('chats', allChats);
   await continueAssistantTurn(requestCharId, text);
 }
-async function sendVoiceMessage() {
+function voiceButtonEl() {
+  return document.querySelector('#composer-voice .voice-hold');
+}
+function setVoiceButtonRecording(active, text = '') {
+  const btn = voiceButtonEl();
+  if (!btn) return;
+  btn.classList.toggle('recording', !!active);
+  btn.textContent = text || (active ? '松开 发送' : '按住 说话');
+}
+function preferredAudioMimeType() {
+  if (typeof MediaRecorder === 'undefined' || !MediaRecorder.isTypeSupported) return '';
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+  return candidates.find(type => MediaRecorder.isTypeSupported(type)) || '';
+}
+function voiceFileName(blob) {
+  const type = blob?.type || '';
+  if (type.includes('mp4')) return 'voice.mp4';
+  if (type.includes('ogg')) return 'voice.ogg';
+  if (type.includes('wav')) return 'voice.wav';
+  return 'voice.webm';
+}
+function voiceApiConfig() {
+  return {
+    enabled: settings.voiceTranscribeEnabled !== false,
+    apiUrl: (settings.voiceApiUrl || settings.chatApiUrl || settings.apiUrl || '').replace(/\/+$/, ''),
+    apiKey: cleanApiKey(settings.voiceApiKey || settings.chatApiKey || settings.apiKey || ''),
+    model: settings.voiceModel || 'whisper-1'
+  };
+}
+function extractTranscriptionText(json, raw = '') {
+  return (
+    textFromContent(json?.text)
+    || textFromContent(json?.transcript)
+    || textFromContent(json?.output_text)
+    || textFromContent(json?.result)
+    || extractResponseText(json)
+    || parseJsonFallbackText(raw)
+  ).trim();
+}
+async function transcribeVoiceBlob(blob, duration, charId = currentCharId) {
+  const cfg = voiceApiConfig();
+  if (!cfg.enabled) throw new Error('语音转文字已关闭');
+  if (!cfg.apiUrl || !cfg.apiKey) throw new Error('请先配置语音转文字接口，或填写聊天接口用于复用');
+  const apiKey = assertHeaderSafe(cfg.apiKey, '语音转文字 Key');
+  const startedAt = Date.now();
+  const form = new FormData();
+  form.append('file', blob, voiceFileName(blob));
+  form.append('model', cfg.model);
+  form.append('language', 'zh');
+  try {
+    const resp = await fetchWithTimeout(cfg.apiUrl + '/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+      body: form
+    }, API_TIMEOUT_MS);
+    const raw = await resp.text();
+    if (!resp.ok) throw new Error(`语音接口 ${resp.status}: ${raw.slice(0, 120)}`);
+    let json = null;
+    try { json = JSON.parse(raw); } catch {}
+    const text = json ? extractTranscriptionText(json, raw) : raw.trim();
+    recordModelCall({ kind: 'voice', scene: 'transcription', provider: 'openai', model: cfg.model, charId, startedAt, ok: true, empty: !text, diagnostic: text ? '' : '语音接口返回为空', output: text, messages: [{ role: 'user', content: `[语音 ${duration}秒]` }] });
+    if (!text) throw new Error('语音接口返回为空');
+    return text;
+  } catch (err) {
+    recordModelCall({ kind: 'voice', scene: 'transcription', provider: 'openai', model: cfg.model, charId, startedAt, ok: false, error: err.message, messages: [{ role: 'user', content: `[语音 ${duration}秒]` }] });
+    throw err;
+  }
+}
+async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random() * 7), reason = '') {
   if (isStreaming || !currentCharId) return;
   const requestCharId = currentCharId;
   const chat = allChats[requestCharId];
   if (!chat) return;
   closeComposerPanels();
-  const duration = 2 + Math.floor(Math.random() * 7);
-  const content = `[语音消息 ${duration}秒，未转文字]`;
+  const actualDuration = Math.max(1, Math.min(60, Number(duration) || 4));
+  const content = `[语音消息 ${actualDuration}秒，未转文字]`;
   cancelCloudProactive(requestCharId, 'all');
-  chat.messages.push({ role: 'user', type: 'voice', content, voiceDuration: duration, time: Date.now() });
+  chat.messages.push({ role: 'user', type: 'voice', content, voiceDuration: actualDuration, time: Date.now() });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  if (reason) toast(reason, 2200);
   await continueAssistantTurn(
     requestCharId,
-    `${playerName()}发来一条 ${duration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`
+    `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`
   );
+}
+async function sendVoiceTranscriptMessage(transcript, duration) {
+  if (isStreaming || !currentCharId) return;
+  const text = String(transcript || '').trim();
+  if (!text) return sendVoicePlaceholderMessage(duration, '语音没有识别出文字');
+  const requestCharId = currentCharId;
+  const chat = allChats[requestCharId];
+  if (!chat) return;
+  closeComposerPanels();
+  cancelCloudProactive(requestCharId, 'all');
+  chat.messages.push({ role: 'user', type: 'voice', content: text, transcript: text, voiceDuration: duration, time: Date.now() });
+  DB.set('chats', allChats);
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  await continueAssistantTurn(requestCharId, text);
+}
+async function sendVoiceMessage() {
+  return sendVoicePlaceholderMessage();
+}
+async function startVoiceRecording(event) {
+  event?.preventDefault?.();
+  if (isStreaming || !currentCharId || voiceRecorder) return;
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    await sendVoicePlaceholderMessage(undefined, '当前浏览器不支持录音，已发送语音占位');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mimeType = preferredAudioMimeType();
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    voiceChunks = [];
+    voiceStream = stream;
+    voiceStartAt = Date.now();
+    voiceRecordingCharId = currentCharId;
+    voiceRecorder = recorder;
+    recorder.ondataavailable = e => {
+      if (e.data?.size) voiceChunks.push(e.data);
+    };
+    recorder.start();
+    event?.currentTarget?.setPointerCapture?.(event.pointerId);
+    setVoiceButtonRecording(true);
+  } catch (err) {
+    resetVoiceRecording();
+    toast('录音失败：' + friendlyErrorMessage(err), 2600);
+  }
+}
+function resetVoiceRecording() {
+  try { voiceStream?.getTracks?.().forEach(track => track.stop()); } catch {}
+  voiceRecorder = null;
+  voiceChunks = [];
+  voiceStream = null;
+  voiceStartAt = 0;
+  voiceRecordingCharId = '';
+  setVoiceButtonRecording(false);
+}
+async function stopVoiceRecording(event) {
+  event?.preventDefault?.();
+  const recorder = voiceRecorder;
+  if (!recorder) return;
+  const requestCharId = voiceRecordingCharId || currentCharId;
+  const duration = Math.max(1, Math.round((Date.now() - voiceStartAt) / 1000));
+  setVoiceButtonRecording(true, '正在识别...');
+  try {
+    const chunks = await new Promise(resolve => {
+      recorder.onstop = () => resolve(voiceChunks.slice());
+      if (recorder.state !== 'inactive') recorder.stop();
+      else resolve(voiceChunks.slice());
+    });
+    try { voiceStream?.getTracks?.().forEach(track => track.stop()); } catch {}
+    voiceRecorder = null;
+    voiceStream = null;
+    if (!chunks.length || duration < 1) {
+      resetVoiceRecording();
+      await sendVoicePlaceholderMessage(1, '语音太短，已发送占位');
+      return;
+    }
+    const blob = new Blob(chunks, { type: chunks[0]?.type || preferredAudioMimeType() || 'audio/webm' });
+    voiceChunks = [];
+    voiceStartAt = 0;
+    voiceRecordingCharId = '';
+    const transcript = await transcribeVoiceBlob(blob, duration, requestCharId);
+    if (currentCharId !== requestCharId) currentCharId = requestCharId;
+    setVoiceButtonRecording(false);
+    await sendVoiceTranscriptMessage(transcript, duration);
+  } catch (err) {
+    resetVoiceRecording();
+    await sendVoicePlaceholderMessage(duration, '转文字失败：' + friendlyErrorMessage(err));
+  }
+}
+function cancelVoiceRecording(event) {
+  if (!voiceRecorder) return;
+  event?.preventDefault?.();
+  try {
+    if (voiceRecorder.state !== 'inactive') voiceRecorder.stop();
+  } catch {}
+  resetVoiceRecording();
+  toast('已取消语音', 1000);
 }
 
 function getLatestChatRows() {
@@ -4979,8 +5175,12 @@ function loadSettings() {
   document.getElementById('set-memory-api-type').value = settings.memoryApiType || settings.apiType || 'openai';
   document.getElementById('set-memory-api-url').value = settings.memoryApiUrl || settings.apiUrl || '';
   document.getElementById('set-memory-api-key').value = settings.memoryApiKey || settings.apiKey || '';
+  document.getElementById('set-voice-transcribe-enabled').value = settings.voiceTranscribeEnabled === false ? 'off' : 'on';
+  document.getElementById('set-voice-api-url').value = settings.voiceApiUrl || '';
+  document.getElementById('set-voice-api-key').value = settings.voiceApiKey || '';
   document.getElementById('set-chat-model').value = settings.chatModel || settings.model || '';
   document.getElementById('set-memory-model').value = settings.memoryModel || '';
+  document.getElementById('set-voice-model').value = settings.voiceModel || 'whisper-1';
   renderModelOptions(settings.chatModels || settings.models || [], 'chat');
   renderModelOptions(settings.memoryModels || settings.models || [], 'memory');
   document.getElementById('set-temp').value = settings.temperature || 0.8;
@@ -5048,8 +5248,11 @@ function readSettingsForm() {
   const memoryApiType = document.getElementById('set-memory-api-type').value;
   const memoryApiUrl = document.getElementById('set-memory-api-url').value.trim();
   const memoryApiKeyInput = cleanApiKey(document.getElementById('set-memory-api-key').value);
+  const voiceApiUrl = document.getElementById('set-voice-api-url').value.trim();
+  const voiceApiKeyInput = cleanApiKey(document.getElementById('set-voice-api-key').value);
   const chatApiKey = chatApiKeyInput || settings.chatApiKey || settings.apiKey || '';
   const memoryApiKey = memoryApiKeyInput || settings.memoryApiKey || settings.apiKey || '';
+  const voiceApiKey = voiceApiKeyInput || settings.voiceApiKey || '';
   return {
     ...settings,
     chatApiType,
@@ -5058,11 +5261,15 @@ function readSettingsForm() {
     memoryApiType,
     memoryApiUrl,
     memoryApiKey,
+    voiceTranscribeEnabled: document.getElementById('set-voice-transcribe-enabled').value !== 'off',
+    voiceApiUrl,
+    voiceApiKey,
     apiType: chatApiType,
     apiUrl: chatApiUrl,
     apiKey: chatApiKey,
     chatModel,
     memoryModel,
+    voiceModel: document.getElementById('set-voice-model').value.trim() || 'whisper-1',
     chatModels: settings.chatModels || settings.models || [],
     memoryModels: settings.memoryModels || settings.models || [],
     model: chatModel,
