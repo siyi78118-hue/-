@@ -986,7 +986,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.26';
+const APP_BUILD_VERSION = '2026-07-09.27';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -2363,6 +2363,19 @@ function materializeVirtualMoment(momentId) {
 function saveMoments() {
   DB.set('moments', allMoments);
   if (activeScreen === 'moments') renderMoments();
+}
+function removeCharacterMomentTraces(charId) {
+  if (!charId) return 0;
+  const before = allMoments.length;
+  allMoments = allMoments
+    .filter(moment => !(moment.authorType === 'char' && moment.charId === charId))
+    .map(moment => ({
+      ...moment,
+      notifiedCharIds: (moment.notifiedCharIds || []).filter(id => id !== charId),
+      likes: (moment.likes || []).filter(id => id !== charId),
+      comments: (moment.comments || []).filter(comment => comment.charId !== charId)
+    }));
+  return before - allMoments.length;
 }
 function markMomentCommentSeen(moment, commentId, charId) {
   const comment = (moment?.comments || []).find(c => c.id === commentId);
@@ -5627,14 +5640,29 @@ function clearCurrentChat() {
   renderMessages();
   showScreen('chat');
 }
-function deleteCurrentRole() {
-  if (!currentCharId || !confirm('删除这个角色？')) return;
-  characters = characters.filter(c => c.id !== currentCharId);
-  delete allChats[currentCharId];
+async function deleteCurrentRole() {
+  if (!currentCharId || !confirm('删除这个角色？会同时删除它的聊天、云闹钟、本地记忆库和朋友圈痕迹。')) return;
+  const deletedId = currentCharId;
+  const deletedName = characters.find(c => c.id === deletedId)?.name || '这个角色';
+  const cancelCloudJobs = withTimeout(cancelCloudProactive(deletedId, 'all'), 8000, '取消云闹钟超时')
+    .catch(err => console.warn('[AL Timer] delete role cancel skipped:', err.message));
+  await Promise.allSettled([
+    cancelCloudJobs,
+    MemoryDB.clearChar(deletedId)
+  ]);
+  removeCharacterMomentTraces(deletedId);
+  characters = characters.filter(c => c.id !== deletedId);
+  delete allChats[deletedId];
   DB.set('characters', characters);
   DB.set('chats', allChats);
+  saveMoments();
   currentCharId = null;
+  if (profileCharId === deletedId) profileCharId = '';
+  renderChats();
+  renderContacts();
+  renderMoments();
   showScreen('contacts');
+  toast(`已删除${deletedName}`);
 }
 function openCurrentProfile() {
   const char = characters.find(c => c.id === currentCharId);
