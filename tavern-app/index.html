@@ -558,8 +558,6 @@ button.profile-top{width:100%;text-align:left}
         <button class="action-item" onclick="openPayScreen('transfer')"><span>转</span>转账</button>
         <button class="action-item" onclick="openPayScreen('redpacket')"><span>包</span>红包</button>
         <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>记</span>记忆库</button>
-        <button class="action-item" onclick="manualProactiveMessage()"><span>主</span>主动消息</button>
-        <button class="action-item" onclick="manualProactiveMoment()"><span>圈</span>发动态</button>
       </div>
     </div>
   </div>
@@ -742,6 +740,8 @@ button.profile-top{width:100%;text-align:left}
         <button class="secondary" onclick="testConnection('chat')">测试聊天连接</button>
         <button class="secondary" onclick="testConnection('memory')">测试记忆连接</button>
         <button class="secondary" onclick="testMemoryQueryPreset()">测试记忆筛选</button>
+        <button class="secondary" onclick="manualProactiveMessage()">测试主动私聊</button>
+        <button class="secondary" onclick="manualProactiveMoment()">测试主动朋友圈</button>
       </div>
     </div>
   </div>
@@ -986,7 +986,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.29';
+const APP_BUILD_VERSION = '2026-07-09.30';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
