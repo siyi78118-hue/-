@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v24';
+const CACHE_NAME = 'rpchat-v25';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -370,6 +370,27 @@ function splitAssistantOutput(text) {
     .map(part => part.trim())
     .filter(Boolean);
   return parts.length ? parts : [normalized];
+}
+
+function cleanAssistantChatReply(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return '';
+  const jsonLike = raw.replace(/```json|```/g, '').trim();
+  try {
+    const json = JSON.parse(jsonLike);
+    if (json && typeof json === 'object' && !Array.isArray(json)) {
+      const value = String(json.chat || json.reply || json.message || json.comment || '').replace(/\s+/g, ' ').trim();
+      if (value) return value;
+      if ('like' in json || 'timeline' in json || 'moment' in json || 'post' in json || 'text' in json) return '';
+    }
+  } catch {}
+  return raw.replace(/\{[\s\S]*?\}/g, block => {
+    try {
+      const json = JSON.parse(block);
+      if (json && typeof json === 'object' && !Array.isArray(json) && ('like' in json || 'timeline' in json || 'moment' in json || 'post' in json)) return '';
+    } catch {}
+    return block;
+  }).replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function isEmptyReplyText(text) {
@@ -1341,10 +1362,11 @@ async function handleProactivePush(payload) {
     promptBlocks: prompt.promptBlocks
   })).trim();
   setStateCloudTimerTrace(state, 'chat', traceId, `模型返回 ${reply.length} 字`);
+  const replyText = cleanAssistantChatReply(reply);
   chat.lastProactiveAt = Date.now();
   chat.lastProactiveChatAt = Date.now();
   if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
-  if (isEmptyReplyText(reply)) {
+  if (isEmptyReplyText(replyText)) {
     const emptyReason = lastModelResponseDiagnostic || '空回复';
     try {
       await scheduleNextCloudProactive(state, charId, 'chat');
@@ -1359,7 +1381,7 @@ async function handleProactivePush(payload) {
     await notifyClients({ type: 'al-state-updated', charId, skipped: true });
     return;
   }
-  const chunks = appendAssistantMessages(chat, reply, { proactive: true });
+  const chunks = appendAssistantMessages(chat, replyText, { proactive: true });
   if (!chunks.length) {
     try {
       await scheduleNextCloudProactive(state, charId, 'chat');
