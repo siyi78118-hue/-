@@ -1406,13 +1406,25 @@ function findDueProactiveJob(allChats) {
   return getDueProactiveJobs(allChats)[0] || null;
 }
 
+function latestCloudTargetCharId(allChats) {
+  return Object.entries(allChats || {})
+    .map(([charId, chat]) => {
+      const messages = Array.isArray(chat?.messages) ? chat.messages : [];
+      const last = [...messages].reverse().find(m => !m.hidden) || messages[messages.length - 1];
+      return { charId, time: Number(last?.time || 0), hasMessages: messages.length > 0 };
+    })
+    .filter(row => row.hasMessages)
+    .sort((a, b) => b.time - a.time)[0]?.charId || '';
+}
+
 function getDueProactiveJobs(allChats) {
   const now = Date.now();
+  const targetCharId = latestCloudTargetCharId(allChats);
   const rows = Object.entries(allChats || {}).flatMap(([charId, chat]) =>
     PROACTIVE_JOB_KINDS.map(kind => ({ charId, kind, chat, job: chat?.[proactiveJobKey(kind)] }))
   );
   return rows
-    .filter(r => r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
+    .filter(r => (!targetCharId || r.charId === targetCharId) && r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
     .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))
     .map(row => ({ charId: row.charId, kind: row.kind, job: row.job }));
 }

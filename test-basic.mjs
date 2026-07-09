@@ -15,6 +15,8 @@ assert.match(script, /const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;/);
 assert.doesNotMatch(swScript, /Math\.min\(API_TIMEOUT_MS,\s*45000\)/);
 assert.doesNotMatch(script, /rows\.find\(\(\{ chat \}\) => !hasFutureCloudJob\(chat, kind\)\)/);
 assert.match(script, /function cancelOtherCloudJobs\(targetCharId, kind = 'chat'/);
+assert.match(swScript, /function latestCloudTargetCharId\(allChats\)/);
+assert.match(swScript, /\(\!targetCharId \|\| r\.charId === targetCharId\).*r\.job\?\.dueAt/);
 assert.match(swScript, /function cleanApiKey\(value\)/);
 assert.match(swScript, /后台记忆AI已调用/);
 assert.match(swScript, /function localEmbedding\(text, dim = VECTOR_DIM\)/);
