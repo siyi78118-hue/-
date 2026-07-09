@@ -29,6 +29,9 @@ assert.match(script, /ensure\('meta', \[\['updatedAt', 'updatedAt'\]\]\)/);
 assert.match(script, /returnPromptDetails: true/);
 assert.match(swScript, /promptBlocks: prompt\.promptBlocks/);
 assert.match(script, /红包 24 小时未领取，已自动退回零钱/);
+assert.match(html, /id="screen-diagnostics"/);
+assert.match(html, /查看最近调用/);
+assert.match(script, /function renderDiagnosticsScreen\(\)/);
 const cloudTimerWorkerCode = cloudTimerWorker.replace(/\/\/.*$/gm, '');
 assert.doesNotMatch(cloudTimerWorkerCode, /\.list\s*\(/);
 assert.match(cloudTimerWorker, /const bucketKey = `due:\$\{minute\}`/);
@@ -141,12 +144,13 @@ globalThis.__appTest = {
   getAllModelCallLogs,
   formatModelCallStatus,
   formatModelCallDiagnostic,
+  renderDiagnosticsScreen,
   clearModelCallLogs,
   shouldKeepEvent,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -291,6 +295,10 @@ assert.match(diagnosticText, /memoryStatus=记忆AI已调用/);
 assert.match(diagnosticText, /promptBlocks=memory-pack@30:42/);
 assert.match(diagnosticText, /promptBlockDetails=[\s\S]*红包约定/);
 assert.doesNotMatch(diagnosticText, /sk-secret123456/);
+await renderDiagnosticsScreen();
+assert.match(element('diagnostic-list').innerHTML, /proactive-chat/);
+assert.match(element('diagnostic-list').innerHTML, /记忆AI已调用/);
+assert.match(element('diagnostic-list').innerHTML, /memory-pack/);
 clearModelCallLogs();
 assert.equal(getModelCallLogs().length, 0);
 vm.runInContext("settings.memoryApiUrl='https://memory.example/v1'; settings.memoryApiKey='sk-memory'; settings.memoryModel=''; settings.memoryApiType='openai';", context);

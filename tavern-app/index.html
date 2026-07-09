@@ -30,6 +30,8 @@ button{border:none;background:none;cursor:pointer}
 .top-right{justify-content:flex-end}
 .icon-btn{width:34px;height:34px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:22px;color:#181818;position:relative}
 .icon-btn:active{background:#d9d9d9}
+.top-text-btn{height:34px;padding:0 6px;border-radius:4px;color:#111;font-size:14px}
+.top-text-btn:active{background:#d9d9d9}
 .icon-search,.icon-plus{width:32px;height:32px;position:relative;display:block}
 .icon-search:before{content:"";position:absolute;left:4px;top:3px;width:18px;height:18px;border:3px solid #111;border-radius:50%}.icon-search:after{content:"";position:absolute;left:23px;top:23px;width:11px;height:3px;background:#111;transform:rotate(45deg);transform-origin:left center;border-radius:2px}
 .icon-plus{border:2.5px solid #111;border-radius:50%}.icon-plus:before,.icon-plus:after{content:"";position:absolute;background:#111;border-radius:2px}.icon-plus:before{width:16px;height:2.5px;left:6px;top:12.5px}.icon-plus:after{width:2.5px;height:16px;left:12.5px;top:6px}
@@ -163,6 +165,18 @@ button{border:none;background:none;cursor:pointer}
 .model-row{align-items:flex-start}.model-tools{display:flex;gap:8px;margin-top:8px}.model-tools .select{height:34px;padding:0 8px;background:#f7f7f7;border-radius:5px}
 .danger{color:var(--danger)}
 .hint{padding:8px 14px;color:#8a8a8a;font-size:12px;line-height:1.6}
+.diagnostic-list{padding-bottom:calc(20px + var(--safe-bottom))}
+.diagnostic-item{background:#fff;border-bottom:1px solid var(--line2);padding:13px 14px}
+.diagnostic-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.diagnostic-title{font-size:15px;font-weight:650;color:#111;line-height:1.35}
+.diagnostic-state{font-size:12px;color:#fff;background:#07c160;border-radius:3px;padding:2px 6px;flex-shrink:0}
+.diagnostic-state.state-empty{background:#fa9d3b}.diagnostic-state.state-fail{background:#fa5151}
+.diagnostic-meta{margin-top:4px;color:#8a8a8a;font-size:12px;line-height:1.45}
+.diagnostic-memory{margin-top:8px;color:#576b95;font-size:12px;line-height:1.5;white-space:pre-wrap}
+.diagnostic-section{margin-top:10px}
+.diagnostic-section summary{font-size:13px;color:#576b95;line-height:1.6;list-style:none}
+.diagnostic-section summary::-webkit-details-marker{display:none}
+.diagnostic-pre{margin-top:5px;padding:8px;background:#f7f7f7;color:#555;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;border-radius:4px}
 .file-zone{height:150px;margin:0 0 12px;border:1px dashed #c7d8cc;border-radius:8px;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#666;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .file-zone:active{background:#f7f7f7}
 .file-zone .big{font-size:34px}
@@ -685,7 +699,7 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
-          <button class="cell" onclick="copyModelCallDiagnostics()" type="button"><div class="cell-label">诊断</div><div class="cell-body">复制最近调用</div><div class="mini">›</div></button>
+          <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
         </div>
         <div class="cell-group">
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
@@ -713,6 +727,19 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="clearCurrentMemory()" type="button"><div class="cell-label">清理</div><div class="cell-body">清空当前角色记忆</div><div class="mini">›</div></button>
         </div>
         <div id="memory-list" class="cell-group"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="screen-diagnostics" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('settings')">‹</button></div>
+      <div class="top-title">调用诊断</div>
+      <div class="top-right"><button class="top-text-btn" onclick="copyModelCallDiagnostics()" type="button">复制</button></div>
+    </div>
+    <div class="scroll">
+      <div class="diagnostic-list" id="diagnostic-list">
+        <div class="empty">还没有模型调用记录</div>
       </div>
     </div>
   </div>
@@ -1488,6 +1515,60 @@ function formatModelCallDiagnostic(log, index = 0) {
   ].filter(Boolean);
   return rows.join('\n');
 }
+function diagnosticState(log) {
+  if (log?.ok === false) return { text: '失败', cls: 'state-fail' };
+  if (log?.empty) return { text: '空回复', cls: 'state-empty' };
+  return { text: '成功', cls: '' };
+}
+function renderDiagnosticPromptBlocks(log) {
+  const blocks = Array.isArray(log?.promptBlocks) ? log.promptBlocks : [];
+  if (!blocks.length) return '<div class="diagnostic-pre">无 prompt block 记录</div>';
+  return blocks.map(block => {
+    const title = `${block.id || '?'}｜priority=${block.priority || 0}｜chars=${block.chars || 0}`;
+    return `<div class="diagnostic-pre">${esc(title)}\n${esc(block.preview || '')}</div>`;
+  }).join('');
+}
+function renderDiagnosticMessages(log) {
+  const rows = Array.isArray(log?.messagesPreview) ? log.messagesPreview : [];
+  if (!rows.length) return '<div class="diagnostic-pre">无最近消息记录</div>';
+  return `<div class="diagnostic-pre">${rows.map(m => `${m.role || '?'}: ${m.content || ''}`).map(esc).join('\n')}</div>`;
+}
+async function renderDiagnosticsScreen() {
+  const list = document.getElementById('diagnostic-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty">正在读取最近调用...</div>';
+  const logs = (await getAllModelCallLogs()).slice(0, 8);
+  if (!logs.length) {
+    list.innerHTML = '<div class="empty">还没有模型调用记录</div>';
+    return;
+  }
+  list.innerHTML = logs.map((log, index) => {
+    const state = diagnosticState(log);
+    const note = log.error || log.diagnostic || '';
+    const metaParts = [
+      log.time || '',
+      log.durationMs ? `${Math.round(log.durationMs / 100) / 10}s` : '',
+      log.provider || '',
+      log.messageCount ? `消息 ${log.messageCount}` : '',
+      log.memoryChars ? `记忆 ${log.memoryChars} 字` : ''
+    ].filter(Boolean);
+    return `<div class="diagnostic-item">
+      <div class="diagnostic-head">
+        <div>
+          <div class="diagnostic-title">${esc(log.scene || log.kind || '模型调用')} · ${esc(log.model || '未记录模型')}</div>
+          <div class="diagnostic-meta">${esc(metaParts.join('｜'))}</div>
+        </div>
+        <span class="diagnostic-state ${state.cls}">${state.text}</span>
+      </div>
+      ${log.memoryStatus ? `<div class="diagnostic-memory">${esc(log.memoryStatus)}</div>` : ''}
+      ${note ? `<div class="diagnostic-memory">${esc(note)}</div>` : ''}
+      <details class="diagnostic-section" ${index === 0 ? 'open' : ''}><summary>Prompt blocks</summary>${renderDiagnosticPromptBlocks(log)}</details>
+      <details class="diagnostic-section"><summary>最近消息</summary>${renderDiagnosticMessages(log)}</details>
+      ${log.outputPreview ? `<details class="diagnostic-section"><summary>输出预览</summary><div class="diagnostic-pre">${esc(log.outputPreview)}</div></details>` : ''}
+      ${log.systemPreview ? `<details class="diagnostic-section"><summary>系统提示预览</summary><div class="diagnostic-pre">${esc(log.systemPreview)}</div></details>` : ''}
+    </div>`;
+  }).join('');
+}
 async function copyModelCallDiagnostics() {
   const logs = (await getAllModelCallLogs()).slice(0, 5);
   if (!logs.length) { toast('还没有模型调用记录'); return; }
@@ -1528,6 +1609,7 @@ function showScreen(name) {
   if (name === 'moments') renderMoments();
   if (name === 'settings') loadSettings();
   if (name === 'memory') renderMemoryScreen();
+  if (name === 'diagnostics') renderDiagnosticsScreen();
   if (name === 'tags') renderTagsScreen();
   if (name === 'chat-info') renderChatInfo();
   if (name === 'contact-profile') renderContactProfile();
