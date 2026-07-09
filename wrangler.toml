@@ -1,0 +1,14 @@
+name = "al-cloud-timer"
+main = "cloud-timer-worker.js"
+compatibility_date = "2024-11-01"
+
+kv_namespaces = [
+  { binding = "AL_TIMER_KV", id = "d549d4c0d3574641967988ef7079c208" }
+]
+
+[triggers]
+crons = ["* * * * *"]
+
+[vars]
+VAPID_PUBLIC_KEY = "BNzA_JE2_aSM3ycOIBEOxUfRnzibroYhE_wFNI8c1o4V2E5Ni_uJ5FUbOuXzI8NiyUqpPq2zsMImafstxZQT9QI"
+VAPID_SUBJECT = "mailto:al@example.com"

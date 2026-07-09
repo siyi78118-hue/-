@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "start": "node serve-static.mjs",
+    "test": "node test-basic.mjs",
+    "cloud:deploy": "wrangler deploy",
+    "cloud:health": "node scripts/check-cloud-timer.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.108.0"
+  }
+}
