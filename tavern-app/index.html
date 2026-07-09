@@ -741,6 +741,7 @@ button.profile-top{width:100%;text-align:left}
       <div class="form">
         <div class="cell-group">
           <div class="cell"><div class="cell-label">角色</div><div class="cell-body"><select class="select" id="memory-char-select" onchange="switchMemoryChar(this.value)"></select></div></div>
+          <div class="cell"><div class="cell-label">搜索</div><div class="cell-body"><input class="input" id="memory-search-input" placeholder="搜索资料、事件或摘要" oninput="filterMemoryList(this.value)"></div></div>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body" id="memory-status">IndexedDB 保存摘要、事件、资料和向量索引。</div></div>
         </div>
         <div class="cell-group">
@@ -1009,7 +1010,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.38';
+const APP_BUILD_VERSION = '2026-07-09.39';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1088,6 +1089,7 @@ let lastMainScreen = 'chats';
 let memoryReturnScreen = 'settings';
 let memoryTargetCharId = '';
 let memoryEditorState = { storeName: 'profiles', id: '', lastStoreName: 'profiles' };
+let memoryFilterText = '';
 let plusOpen = false;
 let activeScreen = 'chats';
 let proactiveTimer = null;
@@ -5555,6 +5557,8 @@ async function renderMemoryScreen() {
   if (selector) {
     selector.innerHTML = characters.map(c => `<option value="${esc(c.id)}">${esc(c.name || '未命名')}</option>`).join('');
   }
+  const searchInput = document.getElementById('memory-search-input');
+  if (searchInput && searchInput.value !== memoryFilterText) searchInput.value = memoryFilterText;
   const validTarget = characters.some(c => c.id === memoryTargetCharId);
   const charId = validTarget ? memoryTargetCharId : (currentCharId || characters[0]?.id || '');
   memoryTargetCharId = charId;
@@ -5579,11 +5583,16 @@ async function renderMemoryScreen() {
     { title: '事件', store: 'events', rows: events.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(e => ({ ...e, displayTitle: memoryAliasText(e.title || '重要事件', char), displayDetail: `${memoryAliasText(e.happenedAt || '未注明', char)}｜${memoryAliasText(e.detail || '', char)}`, meta: memoryLabelMeta(e) })) },
     { title: '摘要', store: 'summaries', rows: summaries.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(s => ({ ...s, displayTitle: '增量摘要', displayDetail: memoryAliasText(s.content || '', char), meta: fmtTime(s.createdAt) })) }
   ];
+  const filteredGroups = groups.map(group => ({ ...group, rows: group.rows.filter(row => memoryRowMatches(row, memoryFilterText)) }));
   if (!groups.some(group => group.rows.length)) {
     list.innerHTML = '<div class="empty"><div class="empty-ico">⌘</div><div>当前角色还没有入库记忆<br>聊天满记忆间隔后会自动整理</div></div>';
     return;
   }
-  list.innerHTML = groups.filter(group => group.rows.length).map(group => `
+  if (!filteredGroups.some(group => group.rows.length)) {
+    list.innerHTML = '<div class="empty"><div class="empty-ico">⌕</div><div>没有匹配的记忆</div></div>';
+    return;
+  }
+  list.innerHTML = filteredGroups.filter(group => group.rows.length).map(group => `
     <div class="memory-section">
       <div class="memory-section-title">${esc(group.title)} · ${group.rows.length}</div>
       <div class="cell-group">${group.rows.map(row => renderMemoryItem(group.store, row)).join('')}</div>
@@ -5591,6 +5600,19 @@ async function renderMemoryScreen() {
 }
 function memoryLabelMeta(item) {
   return [item.type, item.status, fmtTime(item.createdAt)].filter(Boolean).join(' · ');
+}
+function memoryRowMatches(row, query = '') {
+  const text = String(query || '').trim().toLowerCase();
+  if (!text) return true;
+  return [row.displayTitle, row.displayDetail, row.meta, row.title, row.detail, row.content, row.happenedAt, row.type, row.status, ...(row.keywords || [])]
+    .filter(Boolean)
+    .join('\n')
+    .toLowerCase()
+    .includes(text);
+}
+function filterMemoryList(value) {
+  memoryFilterText = String(value || '').trim();
+  renderMemoryScreen();
 }
 function memoryCurrentCharId() {
   return memoryTargetCharId || currentCharId || characters[0]?.id || '';
