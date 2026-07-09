@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v16';
+const CACHE_NAME = 'rpchat-v17';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -1230,19 +1230,35 @@ async function handleProactivePush(payload) {
   const { settings, characters, allChats } = state;
   const traceId = `${payload.kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;
   scrubEmptyReplyMessages(allChats);
-  const dueJobs = payload.charId
+  const exactDueJobs = payload.charId
     ? [{ charId: payload.charId, kind: payload.kind === 'moment' ? 'moment' : 'chat', job: null }]
     : getDueProactiveJobs(allChats);
+  const fallbackJob = !payload.charId && !exactDueJobs.length ? getFallbackProactiveJob(allChats) : null;
+  const dueJobs = exactDueJobs.length ? exactDueJobs : (fallbackJob ? [fallbackJob] : []);
   const dueJob = dueJobs[0] || null;
   const charId = dueJob?.charId || '';
   const kind = dueJob?.kind || 'chat';
-  if (!charId) return;
+  if (!charId) {
+    setStateCloudTimerTrace(state, 'chat', traceId, '收到云端 push，但本地没有可触发会话或任务');
+    setStateCloudTimerStatus(state, '后台收到云闹钟，但本地没有可触发会话；请打开 AL 后重新绑定或重新安排。', 'chat');
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+    await notifyClients({ type: 'al-state-updated', skipped: true });
+    return;
+  }
   if (await hasVisibleClient()) {
-    if (!payload.charId) {
+    if (!payload.charId && exactDueJobs.length > 1) {
       await notifyClients({ type: 'al-run-proactive-due', jobCount: dueJobs.length, test: dueJobs.some(row => row.job?.test) });
       return;
     }
-    await notifyClients({ type: 'al-run-proactive', charId, kind, jobId: payload.jobId || dueJob.job?.jobId || '', test: !!(payload.test || dueJob.job?.test) });
+    await notifyClients({
+      type: 'al-run-proactive',
+      charId,
+      kind,
+      jobId: payload.jobId || dueJob.job?.jobId || '',
+      test: !!(payload.test || dueJob.job?.test),
+      fallback: !!fallbackJob
+    });
     return;
   }
   if (!payload.charId && dueJobs.length > 1) {
@@ -1257,7 +1273,7 @@ async function handleProactivePush(payload) {
     }
     return;
   }
-  setStateCloudTimerTrace(state, kind, traceId, `后台收到触发，目标：${charId}`);
+  setStateCloudTimerTrace(state, kind, traceId, `后台收到触发，目标：${charId}${fallbackJob ? '，本地未命中到期任务，已用最近任务兜底' : ''}`);
   setStateCloudTimerTriggerAck(state, `真实${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已被后台收到。`);
   state.updatedAt = Date.now();
   await setMeta('app_state', state);
@@ -1461,6 +1477,21 @@ function getDueProactiveJobs(allChats) {
     .filter(r => (!targetCharId || r.charId === targetCharId) && r.job?.dueAt && Date.parse(r.job.dueAt) <= now)
     .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))
     .map(row => ({ charId: row.charId, kind: row.kind, job: row.job }));
+}
+
+function getFallbackProactiveJob(allChats) {
+  const targetCharId = latestCloudTargetCharId(allChats);
+  const targetChat = targetCharId ? allChats?.[targetCharId] : null;
+  if (!targetCharId || !Array.isArray(targetChat?.messages) || !targetChat.messages.length) return null;
+  const rows = PROACTIVE_JOB_KINDS
+    .map(kind => ({ charId: targetCharId, kind, job: targetChat?.[proactiveJobKey(kind)] }))
+    .filter(row => row.job?.dueAt || row.job?.jobId)
+    .sort((a, b) => {
+      const aTime = Date.parse(a.job?.dueAt || '') || Number.MAX_SAFE_INTEGER;
+      const bTime = Date.parse(b.job?.dueAt || '') || Number.MAX_SAFE_INTEGER;
+      return aTime - bTime;
+    });
+  return rows[0] || { charId: targetCharId, kind: 'chat', job: null, fallback: true };
 }
 
 self.addEventListener('push', event => {

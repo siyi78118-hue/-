@@ -950,7 +950,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.4';
+const APP_BUILD_VERSION = '2026-07-09.5';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.2';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -4368,13 +4368,13 @@ async function handleForegroundProactiveRequest(data = {}) {
     if (data.kind === 'moment') {
       if (data.test) setCloudTimerTestAck('本机已收到朋友圈测试推送，闹钟链路正常。');
       setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}朋友圈闹钟已被前台收到。`);
-      setCloudTimerStatus(data.test ? '测试推送已被本机收到，朋友圈闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成朋友圈。', true, 'moment');
+      setCloudTimerStatus(data.test ? '测试推送已被本机收到，朋友圈闹钟链路正常；正在继续请求聊天模型。' : `云闹钟已触发，正在由前台生成朋友圈。${data.fallback ? '（本地未命中到期任务，已用最近任务兜底）' : ''}`, true, 'moment');
       if (data.charId) await triggerProactiveMoment(data.charId, false);
       else await catchUpDueCloudProactive();
     } else {
       if (data.test) setCloudTimerTestAck('本机已收到私聊测试推送，闹钟链路正常。');
       setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}私聊闹钟已被前台收到。`);
-      setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : '云闹钟已触发，正在由前台生成私聊。', true, 'chat');
+      setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : `云闹钟已触发，正在由前台生成私聊。${data.fallback ? '（本地未命中到期任务，已用最近任务兜底）' : ''}`, true, 'chat');
       if (data.charId) await triggerProactiveMessage(data.charId, false);
       else await catchUpDueCloudProactive();
     }
