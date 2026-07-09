@@ -938,12 +938,15 @@ const DEFAULT_SETTINGS = {
   cloudTimerLastChatStatusAt: 0,
   cloudTimerLastMomentStatus: '',
   cloudTimerLastMomentStatusAt: 0,
+  cloudTimerWorkerStatus: '',
+  cloudTimerWorkerStatusAt: 0,
   lastMemoryQueryStatus: '',
   lastMemoryQueryAt: 0,
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.1';
+const APP_BUILD_VERSION = '2026-07-09.2';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.2';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
@@ -3722,6 +3725,8 @@ function cloudTimerStatusText() {
   if (ackLine) rows.push(ackLine);
   const triggerAckLine = statusLine('闹钟触发确认', settings.cloudTimerLastTriggerAckStatus, settings.cloudTimerLastTriggerAckAt);
   if (triggerAckLine) rows.push(triggerAckLine);
+  const workerLine = statusLine('云闹钟版本', settings.cloudTimerWorkerStatus, settings.cloudTimerWorkerStatusAt);
+  if (workerLine) rows.push(workerLine);
   const chatApiLine = statusLine('聊天接口检测', settings.lastChatApiHealthStatus, settings.lastChatApiHealthAt);
   if (chatApiLine) rows.push(chatApiLine);
   const memoryApiLine = statusLine('记忆接口检测', settings.lastMemoryApiHealthStatus, settings.lastMemoryApiHealthAt);
@@ -3757,6 +3762,30 @@ function setCloudTimerStatus(message, persist = true, kind = 'general') {
   }
   if (persist) DB.set('settings', settings);
   renderCloudTimerStatus();
+}
+function setCloudWorkerStatus(message) {
+  settings.cloudTimerWorkerStatus = message;
+  settings.cloudTimerWorkerStatusAt = Date.now();
+  DB.set('settings', settings);
+  renderCloudTimerStatus();
+}
+async function checkCloudTimerWorkerVersion({ silent = false } = {}) {
+  if (!settings.timerEndpoint) return false;
+  try {
+    const resp = await fetchWithTimeout(timerUrl('/health'), { method: 'GET' }, 15000);
+    if (!resp.ok) throw new Error('health ' + resp.status);
+    const json = await resp.json();
+    const version = String(json.version || '');
+    if (version !== EXPECTED_CLOUD_TIMER_VERSION) {
+      setCloudWorkerStatus(`当前 ${version || '未知'}，期望 ${EXPECTED_CLOUD_TIMER_VERSION}；请重新部署云端 Worker`);
+      return false;
+    }
+    if (!silent) setCloudWorkerStatus(`已同步 ${version}`);
+    return true;
+  } catch (err) {
+    setCloudWorkerStatus('检测失败：' + friendlyErrorMessage(err));
+    return false;
+  }
 }
 function setCloudTimerTestAck(message) {
   settings.cloudTimerLastTestAckStatus = message;
@@ -3817,6 +3846,7 @@ async function enableCloudTimer() {
       toast('请先填写闹钟地址和推送公钥', 2400);
       return;
     }
+    await checkCloudTimerWorkerVersion();
     toast('正在绑定云闹钟...', 1400);
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') {
@@ -3998,6 +4028,7 @@ async function testCloudTimerPush() {
     toast('请先绑定本机云闹钟', 2400);
     return;
   }
+  await checkCloudTimerWorkerVersion();
   const charId = currentCharId || getLatestChatRows()[0]?.char?.id;
   if (!charId) {
     setCloudTimerStatus('测试失败：没有可触发的会话', true, 'chat');

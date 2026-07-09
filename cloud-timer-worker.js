@@ -22,6 +22,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.2';
 
 export default {
   async fetch(request, env) {
@@ -29,7 +30,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === 'GET' && url.pathname === '/health') {
-        return json({ ok: true, service: 'AL cloud timer' });
+        return json({ ok: true, service: 'AL cloud timer', version: CLOUD_TIMER_WORKER_VERSION });
       }
       if (request.method === 'POST' && url.pathname === '/register') {
         const body = await request.json();
