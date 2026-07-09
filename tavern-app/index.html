@@ -960,7 +960,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.10';
+const APP_BUILD_VERSION = '2026-07-09.11';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -2370,12 +2370,32 @@ function extractAssistantMomentDirective(text) {
   }
   return null;
 }
+function cleanAssistantChatReply(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return '';
+  const jsonLike = raw.replace(/```json|```/g, '').trim();
+  try {
+    const json = JSON.parse(jsonLike);
+    if (json && typeof json === 'object' && !Array.isArray(json)) {
+      const value = String(json.chat || json.reply || json.message || json.comment || '').replace(/\s+/g, ' ').trim();
+      if (value) return value;
+      if ('like' in json || 'timeline' in json || 'moment' in json || 'post' in json || 'text' in json) return '';
+    }
+  } catch {}
+  return raw.replace(/\{[\s\S]*?\}/g, block => {
+    try {
+      const json = JSON.parse(block);
+      if (json && typeof json === 'object' && !Array.isArray(json) && ('like' in json || 'timeline' in json || 'moment' in json || 'post' in json)) return '';
+    } catch {}
+    return block;
+  }).replace(/\n{3,}/g, '\n\n').trim();
+}
 function applyAssistantMomentDirective(chat, charId, reply) {
   const directive = extractAssistantMomentDirective(reply);
-  if (!directive) return String(reply || '');
+  if (!directive) return cleanAssistantChatReply(reply);
   const moment = createCharacterMoment(charId, directive.momentText, { fromChat: true });
   if (moment && activeScreen === 'moments') renderMoments();
-  return directive.chatText || '朋友圈发了。';
+  return cleanAssistantChatReply(directive.chatText) || '朋友圈发了。';
 }
 function openMomentReplyBar(momentId) {
   const moment = allMoments.find(m => m.id === momentId) || materializeVirtualMoment(momentId);
