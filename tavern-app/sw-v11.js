@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v23';
+const CACHE_NAME = 'rpchat-v24';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -835,6 +835,41 @@ async function recordBackgroundRedpacketExpirationMemory(state, charId, msg, now
   msg.expireMemoryRecorded = true;
 }
 
+async function recordBackgroundScenarioMemory(state, charId, title, detail, options = {}) {
+  if (!state?.settings || !charId || !detail) return false;
+  const char = (state.characters || []).find(c => c.id === charId);
+  const now = Date.now();
+  const cleanDetail = memoryAliasText(detail, char, state.settings).replace(/\s+/g, ' ').trim();
+  const type = options.type || 'fact';
+  const keywords = options.keywords || memorySignalTerms(cleanDetail).slice(0, 8);
+  const item = {
+    id: `evt_bg_${now}_${Math.random().toString(36).slice(2, 7)}`,
+    charId,
+    happenedAt: formatFullTime(new Date(now)),
+    type,
+    title: memoryAliasText(title || '后台事件', char, state.settings),
+    detail: cleanDetail,
+    status: options.status || 'stable',
+    importance: Number(options.importance) || 4,
+    keywords,
+    createdAt: now
+  };
+  if (!shouldKeepEvent(item)) return false;
+  await put('events', item);
+  await put('vectors', {
+    id: `vec_event_${item.id}`,
+    charId,
+    sourceType: 'event',
+    sourceId: item.id,
+    text: [item.happenedAt, item.title, item.detail, ...(item.keywords || [])].join('\n'),
+    keywords: item.keywords,
+    importance: item.importance,
+    embedding: localEmbedding([item.title, item.detail, ...(item.keywords || [])].join(' ')),
+    createdAt: now
+  });
+  return true;
+}
+
 async function refreshBackgroundPaymentExpirations(state, charId) {
   const chat = state?.allChats?.[charId];
   if (!state?.settings || !chat?.messages?.length) return false;
@@ -1348,6 +1383,13 @@ async function handleProactivePush(payload) {
   }
   setStateCloudTimerTrace(state, 'chat', traceId, `写入完成 ${chunks.length} 条`);
   setStateCloudTimerStatus(state, `后台私聊已生成 ${chunks.length} 条消息。`, 'chat');
+  await recordBackgroundScenarioMemory(
+    state,
+    charId,
+    '后台主动私聊',
+    `${charName(char)}后台主动给${playerName(settings)}发来私聊：“${chunks.join(' / ')}”`,
+    { type: 'fact', keywords: ['主动消息', '私聊', ...memorySignalTerms(chunks.join(' ')).slice(0, 6)] }
+  );
   state.allChats = allChats;
   state.updatedAt = Date.now();
   await setMeta('app_state', state);
@@ -1436,6 +1478,13 @@ async function handleProactiveMomentPush(state, charId, payload) {
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
+  await recordBackgroundScenarioMemory(
+    state,
+    charId,
+    '后台朋友圈动态',
+    `${charName(char)}后台主动发布朋友圈：“${text}”`,
+    { type: 'moment', keywords: ['朋友圈', '动态', ...memorySignalTerms(text).slice(0, 6)] }
+  );
   setStateCloudTimerStatus(state, '后台朋友圈已发布 1 条动态。', 'moment');
   state.allChats = allChats;
   state.allMoments = allMoments;
