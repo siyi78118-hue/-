@@ -22,7 +22,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.5';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.6';
 const RECENT_EVENT_LIMIT = 40;
 
 export default {
@@ -91,7 +91,7 @@ export default {
         job.test = !!(job.test || body.test);
         const delivered = await deliverJob(job, env);
         if (job.jobId && !delivered.retry) await cancelJob(job.jobId, env);
-        await appendEvent(env, { type: 'manual-trigger', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId, kind: job.kind, ok: delivered.ok, reason: delivered.reason || '', retry: !!delivered.retry });
+        await appendEvent(env, { type: 'manual-trigger', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId, kind: job.kind, ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, payload: delivered.payload !== false });
         return json({ ok: delivered.ok, delivered });
       }
       return json({ ok: false, error: 'not found' }, 404);
@@ -248,7 +248,7 @@ async function runDueMinute(env, minute) {
     }
     try {
       const delivered = await deliverJob(job, env);
-      await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || '', retry: !!delivered.retry });
+      await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, payload: delivered.payload !== false });
       if (delivered.retry) {
         stats.retry += 1;
         remaining.push(jobId);
@@ -280,7 +280,15 @@ async function deliverJob(job, env) {
   const subRaw = await env.AL_TIMER_KV.get(`sub:${job.deviceId}`);
   if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
   const { subscription } = JSON.parse(subRaw);
-  const result = await sendEmptyPush(subscription, env);
+  const result = await sendPush(subscription, env, {
+    type: 'proactive',
+    deviceId: job.deviceId || '',
+    jobId: job.jobId || '',
+    charId: job.charId || '',
+    kind: job.kind || 'chat',
+    dueAt: job.dueAt || '',
+    test: !!job.test
+  });
   if (result.expired) {
     await env.AL_TIMER_KV.delete(`sub:${job.deviceId}`);
     return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: false };
@@ -314,6 +322,45 @@ function shortId(value) {
   return text.slice(0, 6) + '...' + text.slice(-5);
 }
 
+async function sendPush(subscription, env, payload = {}) {
+  if (subscription?.keys?.p256dh && subscription?.keys?.auth) {
+    try {
+      const encrypted = await sendEncryptedPush(subscription, env, payload);
+      if (encrypted.ok || encrypted.expired) return encrypted;
+      console.warn('encrypted push failed, falling back to empty push:', encrypted.reason || encrypted.status);
+      const fallback = await sendEmptyPush(subscription, env);
+      return fallback.ok ? { ...fallback, payload: false, fallbackReason: encrypted.reason || String(encrypted.status || '') } : encrypted;
+    } catch (err) {
+      console.warn('encrypted push error, falling back to empty push:', err?.message || err);
+      const fallback = await sendEmptyPush(subscription, env);
+      return fallback.ok ? { ...fallback, payload: false, fallbackReason: String(err?.message || err).slice(0, 120) } : fallback;
+    }
+  }
+  return sendEmptyPush(subscription, env);
+}
+
+async function sendEncryptedPush(subscription, env, payload = {}) {
+  const endpoint = subscription.endpoint;
+  const aud = new URL(endpoint).origin;
+  const jwt = await createVapidJWT(env, aud);
+  const encrypted = await encryptPushPayload(subscription, JSON.stringify(payload));
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      TTL: '60',
+      Urgency: 'high',
+      'Content-Encoding': 'aes128gcm',
+      'Content-Type': 'application/octet-stream',
+      'Content-Length': String(encrypted.byteLength),
+      Authorization: `vapid t=${jwt}, k=${env.VAPID_PUBLIC_KEY}`
+    },
+    body: encrypted
+  });
+  if (resp.status === 404 || resp.status === 410) return { ok: false, expired: true, status: resp.status };
+  if (!resp.ok) return { ok: false, status: resp.status, reason: `push failed ${resp.status}: ${(await resp.text()).slice(0, 120)}` };
+  return { ok: true, status: resp.status, payload: true };
+}
+
 async function sendEmptyPush(subscription, env) {
   const endpoint = subscription.endpoint;
   const aud = new URL(endpoint).origin;
@@ -330,6 +377,47 @@ async function sendEmptyPush(subscription, env) {
   if (resp.status === 404 || resp.status === 410) return { ok: false, expired: true, status: resp.status };
   if (!resp.ok) return { ok: false, status: resp.status, reason: `push failed ${resp.status}: ${(await resp.text()).slice(0, 120)}` };
   return { ok: true, status: resp.status };
+}
+
+async function encryptPushPayload(subscription, payloadText) {
+  const userPublicKeyBytes = base64urlToBytes(subscription.keys.p256dh);
+  const authSecret = base64urlToBytes(subscription.keys.auth);
+  const appServerKeys = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const appServerPublicKeyBytes = new Uint8Array(await crypto.subtle.exportKey('raw', appServerKeys.publicKey));
+  const userPublicKey = await crypto.subtle.importKey('raw', userPublicKeyBytes, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const sharedSecret = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: userPublicKey }, appServerKeys.privateKey, 256));
+  const authPrk = await hkdfExtract(authSecret, sharedSecret);
+  const context = concatBytes(utf8('WebPush: info\0'), userPublicKeyBytes, appServerPublicKeyBytes);
+  const ikm = await hkdfExpand(authPrk, context, 32);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const prk = await hkdfExtract(salt, ikm);
+  const cek = await hkdfExpand(prk, utf8('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = await hkdfExpand(prk, utf8('Content-Encoding: nonce\0'), 12);
+  const key = await crypto.subtle.importKey('raw', cek, { name: 'AES-GCM' }, false, ['encrypt']);
+  const plaintext = concatBytes(utf8(payloadText), new Uint8Array([2]));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce, tagLength: 128 }, key, plaintext));
+  const recordSize = new Uint8Array([0, 0, 16, 0]);
+  const keyLength = new Uint8Array([appServerPublicKeyBytes.byteLength]);
+  return concatBytes(salt, recordSize, keyLength, appServerPublicKeyBytes, ciphertext);
+}
+
+async function hkdfExtract(salt, ikm) {
+  const key = await crypto.subtle.importKey('raw', salt, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await crypto.subtle.sign('HMAC', key, ikm));
+}
+
+async function hkdfExpand(prk, info, length) {
+  const key = await crypto.subtle.importKey('raw', prk, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  let previous = new Uint8Array(0);
+  const chunks = [];
+  let outputLength = 0;
+  for (let counter = 1; outputLength < length; counter++) {
+    const input = concatBytes(previous, info, new Uint8Array([counter]));
+    previous = new Uint8Array(await crypto.subtle.sign('HMAC', key, input));
+    chunks.push(previous);
+    outputLength += previous.byteLength;
+  }
+  return concatBytes(...chunks).slice(0, length);
 }
 
 async function createVapidJWT(env, aud) {
@@ -355,6 +443,30 @@ function json(data, status = 200) {
 
 function base64urlJson(value) {
   return base64url(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+function utf8(value) {
+  return new TextEncoder().encode(value);
+}
+
+function concatBytes(...chunks) {
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function base64urlToBytes(value) {
+  const text = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = text + '='.repeat((4 - text.length % 4) % 4);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
 }
 
 function base64url(bytes) {

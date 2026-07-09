@@ -983,8 +983,8 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.19';
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.5';
+const APP_BUILD_VERSION = '2026-07-09.20';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
@@ -4291,6 +4291,7 @@ function formatCloudTimerEvent(event = {}) {
     event.dueAt ? `due=${fmtTime(event.dueAt)}` : '',
     `结果=${ok}`,
     event.retry ? '会重试' : '',
+    event.payload === false ? '空push兜底' : (event.payload === true ? '带payload' : ''),
     event.reason ? `原因=${String(event.reason).slice(0, 40)}` : '',
     event.jobsSeen != null ? `任务=${Number(event.jobsSeen) || 0}` : '',
     event.delivered != null ? `投递=${Number(event.delivered) || 0}` : ''
