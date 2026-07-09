@@ -764,6 +764,7 @@ button.profile-top{width:100%;text-align:left}
     <div class="scroll">
       <div class="form">
         <div class="cell-group">
+          <div class="cell"><div class="cell-label">角色</div><div class="cell-body" id="memory-edit-char">当前角色</div></div>
           <div class="cell"><div class="cell-label">分类</div><div class="cell-body"><select class="select" id="memory-edit-store" onchange="renderMemoryEditorFields()"><option value="profiles">资料</option><option value="events">事件</option><option value="summaries">摘要</option></select></div></div>
           <div class="cell" id="memory-edit-type-row"><div class="cell-label">类型</div><div class="cell-body"><input class="input" id="memory-edit-type" placeholder="relationship / event"></div></div>
           <div class="cell" id="memory-edit-time-row"><div class="cell-label">时间节点</div><div class="cell-body"><input class="input" id="memory-edit-happened" placeholder="未注明"></div></div>
@@ -1008,7 +1009,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.37';
+const APP_BUILD_VERSION = '2026-07-09.38';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1086,7 +1087,7 @@ let streamingDraft = null;
 let lastMainScreen = 'chats';
 let memoryReturnScreen = 'settings';
 let memoryTargetCharId = '';
-let memoryEditorState = { storeName: 'profiles', id: '' };
+let memoryEditorState = { storeName: 'profiles', id: '', lastStoreName: 'profiles' };
 let plusOpen = false;
 let activeScreen = 'chats';
 let proactiveTimer = null;
@@ -5640,33 +5641,43 @@ async function openMemoryEditor(storeName = 'profiles', id = '') {
   const normalizedStore = ['profiles', 'events', 'summaries'].includes(storeName) ? storeName : 'profiles';
   const item = id ? (await MemoryDB.all(normalizedStore)).find(row => row.id === id) : null;
   if (id && !item) { toast('记忆不存在'); return; }
-  memoryEditorState = { storeName: normalizedStore, id: id || '' };
+  memoryEditorState = { storeName: normalizedStore, id: id || '', lastStoreName: normalizedStore };
   showScreen('memory-edit');
   await renderMemoryEditor(item);
 }
 async function renderMemoryEditor(item = null) {
   const storeName = memoryEditorState.storeName || 'profiles';
   const isEdit = !!memoryEditorState.id;
+  const char = characters.find(c => c.id === memoryCurrentCharId());
+  const charEl = document.getElementById('memory-edit-char');
   const storeEl = document.getElementById('memory-edit-store');
   const titleEl = document.getElementById('memory-edit-title');
   const typeEl = document.getElementById('memory-edit-type');
   const happenedEl = document.getElementById('memory-edit-happened');
   const entryTitleEl = document.getElementById('memory-edit-entry-title');
   const detailEl = document.getElementById('memory-edit-detail');
+  const defaults = memoryEditorDefaults(storeName);
+  if (charEl) charEl.textContent = char ? char.name : '未选择';
   if (titleEl) titleEl.textContent = isEdit ? '编辑记忆' : '新增记忆';
   if (storeEl) {
     storeEl.value = storeName;
     storeEl.disabled = isEdit;
   }
-  if (typeEl) typeEl.value = item?.type || (storeName === 'events' ? 'event' : 'relationship');
-  if (happenedEl) happenedEl.value = item?.happenedAt || '未注明';
-  if (entryTitleEl) entryTitleEl.value = item?.title || (storeName === 'events' ? '重要事件' : '资料');
+  if (typeEl) typeEl.value = item?.type || defaults.type;
+  if (happenedEl) happenedEl.value = item?.happenedAt || defaults.happenedAt;
+  if (entryTitleEl) entryTitleEl.value = item?.title || defaults.title;
   if (detailEl) detailEl.value = storeName === 'summaries' ? (item?.content || '') : (item?.detail || '');
   renderMemoryEditorFields();
+}
+function memoryEditorDefaults(storeName) {
+  if (storeName === 'events') return { type: 'event', title: '重要事件', happenedAt: '未注明' };
+  if (storeName === 'summaries') return { type: '', title: '', happenedAt: '' };
+  return { type: 'relationship', title: '资料', happenedAt: '' };
 }
 function renderMemoryEditorFields() {
   const storeEl = document.getElementById('memory-edit-store');
   const storeName = storeEl?.value || memoryEditorState.storeName || 'profiles';
+  const previousStore = memoryEditorState.lastStoreName || memoryEditorState.storeName || 'profiles';
   if (!memoryEditorState.id) memoryEditorState.storeName = storeName;
   const isSummary = storeName === 'summaries';
   const isEvent = storeName === 'events';
@@ -5674,6 +5685,16 @@ function renderMemoryEditorFields() {
   const timeRow = document.getElementById('memory-edit-time-row');
   const titleRow = document.getElementById('memory-edit-title-row');
   const detailLabel = document.getElementById('memory-edit-detail-label');
+  if (!memoryEditorState.id && previousStore !== storeName) {
+    const defaults = memoryEditorDefaults(storeName);
+    const typeEl = document.getElementById('memory-edit-type');
+    const happenedEl = document.getElementById('memory-edit-happened');
+    const entryTitleEl = document.getElementById('memory-edit-entry-title');
+    if (typeEl) typeEl.value = defaults.type;
+    if (happenedEl) happenedEl.value = defaults.happenedAt;
+    if (entryTitleEl) entryTitleEl.value = defaults.title;
+  }
+  memoryEditorState.lastStoreName = storeName;
   if (typeRow) typeRow.style.display = isSummary ? 'none' : '';
   if (timeRow) timeRow.style.display = isEvent ? '' : 'none';
   if (titleRow) titleRow.style.display = isSummary ? 'none' : '';
