@@ -21,6 +21,10 @@ assert.match(swScript, /evt_redpacket_expired_/);
 assert.match(swScript, /vec_event_\$\{id\}/);
 assert.match(swScript, /req\.onupgradeneeded/);
 assert.match(swScript, /ensure\('vectors'/);
+assert.match(swScript, /deleteObjectStore\('meta'\)/);
+assert.match(swScript, /ensure\('meta', \[\['updatedAt', 'updatedAt'\]\]\)/);
+assert.match(script, /deleteObjectStore\('meta'\)/);
+assert.match(script, /ensure\('meta', \[\['updatedAt', 'updatedAt'\]\]\)/);
 assert.match(script, /红包 24 小时未领取，已自动退回零钱/);
 
 const storage = new Map();

@@ -51,16 +51,24 @@ function openMemoryDB() {
     req.onupgradeneeded = () => {
       const db = req.result;
       const ensure = (name, indexes = []) => {
+        let store;
         if (!db.objectStoreNames.contains(name)) {
-          const store = db.createObjectStore(name, { keyPath: name === 'meta' ? 'key' : 'id' });
-          indexes.forEach(([idx, key]) => store.createIndex(idx, key, { unique: false }));
+          store = db.createObjectStore(name, { keyPath: name === 'meta' ? 'key' : 'id' });
+        } else {
+          store = req.transaction.objectStore(name);
         }
+        indexes.forEach(([idx, key]) => {
+          if (!store.indexNames.contains(idx)) store.createIndex(idx, key, { unique: false });
+        });
       };
       ensure('summaries', [['charId', 'charId'], ['createdAt', 'createdAt']]);
       ensure('events', [['charId', 'charId'], ['status', 'status'], ['createdAt', 'createdAt']]);
       ensure('profiles', [['charId', 'charId'], ['type', 'type'], ['createdAt', 'createdAt']]);
       ensure('vectors', [['charId', 'charId'], ['sourceId', 'sourceId'], ['sourceType', 'sourceType']]);
-      ensure('meta');
+      if (db.objectStoreNames.contains('meta') && req.transaction.objectStore('meta').keyPath !== 'key') {
+        db.deleteObjectStore('meta');
+      }
+      ensure('meta', [['updatedAt', 'updatedAt']]);
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
