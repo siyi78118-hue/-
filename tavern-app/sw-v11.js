@@ -373,6 +373,10 @@ function textFromContent(value) {
       || textFromContent(value.content)
       || textFromContent(value.output_text)
       || textFromContent(value.parts)
+      || textFromContent(value.value)
+      || textFromContent(value.data)
+      || textFromContent(value.response)
+      || textFromContent(value.result)
       || textFromContent(value.message?.content);
   }
   return String(value || '');
@@ -389,6 +393,21 @@ function extractResponseText(json) {
     || textFromContent(json?.candidates?.[0]?.content)
     || textFromContent(json?.output_text)
     || textFromContent(json?.output)
+    || textFromContent(json?.content)
+    || textFromContent(json?.text)
+  ).trim();
+}
+function streamDeltaText(json) {
+  const choice = json?.choices?.[0] || {};
+  return (
+    textFromContent(choice?.delta?.content)
+    || textFromContent(choice?.message?.content)
+    || textFromContent(choice?.text)
+    || textFromContent(json?.delta?.text)
+    || textFromContent(json?.content_block?.text)
+    || textFromContent(json?.candidates?.[0]?.content?.parts)
+    || textFromContent(json?.candidates?.[0]?.content)
+    || textFromContent(json?.output_text)
     || textFromContent(json?.content)
     || textFromContent(json?.text)
   ).trim();
@@ -433,7 +452,7 @@ function parseJsonFallbackText(raw) {
   for (const item of candidates.reverse()) {
     try {
       const parsed = JSON.parse(item);
-      const value = textFromContent(parsed?.choices?.[0]?.delta?.content) || extractResponseText(parsed);
+      const value = streamDeltaText(parsed) || extractResponseText(parsed);
       if (value) return value;
     } catch {}
   }
@@ -462,10 +481,7 @@ async function readStreamText(resp) {
       if (!t || t === 'data: [DONE]' || !t.startsWith('data: ')) continue;
       try {
         const parsed = JSON.parse(t.slice(6));
-        const delta = textFromContent(parsed?.choices?.[0]?.delta?.content)
-          || textFromContent(parsed?.delta?.text)
-          || textFromContent(parsed?.content_block?.text)
-          || textFromContent(parsed?.delta?.partial_json);
+        const delta = streamDeltaText(parsed);
         if (delta) result += delta;
       } catch {}
     }
