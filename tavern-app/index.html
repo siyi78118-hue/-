@@ -289,6 +289,11 @@ button.profile-top{width:100%;text-align:left}
 .moment-compose-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:8px}
 .moment-compose-actions button{height:32px;padding:0 14px;border-radius:4px;background:#f1f1f1;color:#111;font-size:14px}
 .moment-compose-actions .send-moment{background:#07c160;color:#fff}
+.moment-reply-bar{display:none;position:fixed;left:0;right:0;bottom:0;z-index:60;background:#f7f7f7;border-top:1px solid var(--line);padding:8px 10px calc(8px + env(safe-area-inset-bottom));gap:8px;align-items:flex-end}
+.moment-reply-bar.show{display:flex}
+.moment-reply-bar textarea{flex:1;min-height:38px;max-height:96px;border:1px solid var(--line);border-radius:4px;background:#fff;outline:none;resize:none;font-size:16px;line-height:1.4;padding:8px}
+.moment-reply-bar button{height:38px;padding:0 14px;border-radius:4px;background:#e9e9e9;color:#111;font-size:15px}
+.moment-reply-bar .send-moment{background:#07c160;color:#fff}
 .moments-cover{height:248px;margin-bottom:44px;padding:0 16px 16px;position:relative;background:linear-gradient(180deg,rgba(0,0,0,.05),rgba(0,0,0,.48)),linear-gradient(135deg,#9eb6a4 0%,#566f7a 46%,#2f3438 100%);color:#fff}
 .moments-title{font-size:22px;font-weight:700;text-shadow:0 1px 3px rgba(0,0,0,.28)}
 .moments-user{position:absolute;right:16px;bottom:-34px;display:flex;align-items:center;gap:12px;font-size:17px;font-weight:600;text-shadow:0 1px 2px rgba(0,0,0,.28)}
@@ -638,6 +643,11 @@ button.profile-top{width:100%;text-align:left}
       </div>
       <div id="moment-list"></div>
     </div>
+    <div class="moment-reply-bar" id="moment-reply-bar">
+      <button onclick="closeMomentReplyBar()" type="button">取消</button>
+      <textarea id="moment-reply-input" placeholder="评论"></textarea>
+      <button class="send-moment" onclick="submitMomentReply()" type="button">发送</button>
+    </div>
   </div>
 
   <div id="screen-import" class="screen">
@@ -950,7 +960,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.8';
+const APP_BUILD_VERSION = '2026-07-09.9';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -998,6 +1008,7 @@ let proactiveTimer = null;
 let proactiveChatBusy = false;
 let proactiveMomentBusy = false;
 let foregroundProactiveRequestBusy = false;
+let momentReplyTargetId = '';
 let lastChatResponseDiagnostic = '';
 let settingsSaveTimer = null;
 let settingsFormHydrating = false;
@@ -2129,7 +2140,7 @@ function renderMomentItem(moment) {
   const seenNames = momentSeenNames(moment);
   const seenLine = seenNames.length ? `<div class="moment-seen-line">${esc(seenNames.join('、'))}已看过</div>` : '';
   const authorClick = author.isPlayer ? "showScreen('self-profile')" : `openContactProfile('${moment.charId}')`;
-  const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `replyToMoment('${moment.id}')`;
+  const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `openMomentReplyBar('${moment.id}')`;
   return `<div class="moment">
     ${author.avatar}
     <div class="moment-body">
@@ -2366,7 +2377,34 @@ function applyAssistantMomentDirective(chat, charId, reply) {
   if (moment && activeScreen === 'moments') renderMoments();
   return directive.chatText || '朋友圈发了。';
 }
-async function replyToMoment(momentId) {
+function openMomentReplyBar(momentId) {
+  const moment = allMoments.find(m => m.id === momentId) || materializeVirtualMoment(momentId);
+  if (!moment) return;
+  if (moment.authorType === 'player') {
+    notifyMomentToCharacters(moment.id, true);
+    return;
+  }
+  momentReplyTargetId = moment.id;
+  const bar = document.getElementById('moment-reply-bar');
+  const input = document.getElementById('moment-reply-input');
+  if (input) input.value = '';
+  if (bar) bar.classList.add('show');
+  setTimeout(() => input?.focus(), 60);
+}
+function closeMomentReplyBar() {
+  momentReplyTargetId = '';
+  document.getElementById('moment-reply-bar')?.classList.remove('show');
+}
+async function submitMomentReply() {
+  const input = document.getElementById('moment-reply-input');
+  const text = String(input?.value || '').trim();
+  if (!momentReplyTargetId || !text) return;
+  const targetId = momentReplyTargetId;
+  closeMomentReplyBar();
+  if (input) input.value = '';
+  await replyToMoment(targetId, text);
+}
+async function replyToMoment(momentId, presetText = '') {
   const moment = allMoments.find(m => m.id === momentId) || materializeVirtualMoment(momentId);
   if (!moment) return;
   if (moment.authorType === 'player') {
@@ -2375,7 +2413,7 @@ async function replyToMoment(momentId) {
   }
   const char = characters.find(c => c.id === moment.charId);
   if (!char) return;
-  const text = prompt('评论', '');
+  const text = presetText || (typeof prompt === 'function' ? prompt('评论', '') : '');
   const comment = String(text || '').replace(/\s+/g, ' ').trim();
   if (!comment) return;
   const commentItem = { id: uid('mcom'), charId: 'player', name: playerName(), text: comment.slice(0, 80), time: Date.now(), seenBy: [] };
@@ -2400,6 +2438,7 @@ async function replyToMoment(momentId) {
       processMemoryAfterScenario(char.id);
       toast(`${char.name}回复了你的评论`, 1600);
     } else {
+      recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}的朋友圈评论，但没有在评论区回复。`, Date.now());
       saveMoments();
       processMemoryAfterScenario(char.id);
       toast(`${char.name}看到了你的评论`, 1600);
