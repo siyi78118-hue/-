@@ -2228,7 +2228,7 @@ ${playerName()}刚发布朋友圈：“${momentSnippet(moment.text)}”
 ${char.name}需要判断是否点赞或评论，并且要记得双方此前关系、承诺、雷点、红包/转账和朋友圈互动。`;
   const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
   const payload = buildMomentInteractionPayload(char, moment, memoryPack);
-  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-interaction', memoryChars: memoryPack.length, memoryStatus: memoryQuerySnapshot(), promptBlocks: payload.promptBlocks };
+  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-interaction', memoryChars: memoryPack.length, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, callMeta)
     : await callOpenAI(payload.system, payload.messages, callMeta);
@@ -2245,7 +2245,7 @@ ${getTimeContext()}
 ${char.name}准备主动发朋友圈，需要参考此前私聊、双方关系、未完成约定、红包/转账、雷点和重要朋友圈互动。`;
   const memoryPack = options.memoryPack != null ? options.memoryPack : await prepareMemoryPack(char.id, memoryQuery);
   const payload = buildMomentPostPayload(char, chat, memoryPack);
-  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-post', memoryChars: memoryPack.length, memoryStatus: options.memoryStatus || memoryQuerySnapshot(), promptBlocks: payload.promptBlocks };
+  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-post', memoryChars: memoryPack.length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, callMeta)
     : await callOpenAI(payload.system, payload.messages, callMeta);
@@ -2346,7 +2346,7 @@ ${playerName()}刚评论${char.name}的朋友圈：“${momentSnippet(playerComm
 ${char.name}需要在朋友圈评论区自然回复，并记得双方此前关系、承诺、红包/转账和重要互动。`;
   const memoryPack = await prepareMemoryPack(char.id, memoryQuery);
   const payload = buildMomentReplyPayload(char, moment, playerComment, memoryPack);
-  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-reply', memoryChars: memoryPack.length, memoryStatus: memoryQuerySnapshot(), promptBlocks: payload.promptBlocks };
+  const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-reply', memoryChars: memoryPack.length, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, callMeta)
     : await callOpenAI(payload.system, payload.messages, callMeta);
@@ -3039,7 +3039,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
   try {
     const memoryPack = await prepareMemoryPack(requestCharId, userText);
-    const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryQuerySnapshot() });
+    const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()) });
     clearStreamingDraft(requestCharId);
     const replyText = applyAssistantMomentDirective(chat, requestCharId, reply);
     if (isEmptyReplyText(replyText)) throw new Error('接口返回空内容，没有生成回复');
@@ -3722,6 +3722,13 @@ function memoryQuerySnapshot() {
     ? `${settings.lastMemoryQueryAt ? formatFullTime(new Date(settings.lastMemoryQueryAt)) + '｜' : ''}${settings.lastMemoryQueryStatus}`
     : '';
 }
+function memoryPackBudgetStatus(memoryPack = '') {
+  const match = String(memoryPack || '').match(/预算提示：已省略\s*(\d+)\s*条低优先级记忆/);
+  return match ? `记忆预算：已省略 ${match[1]} 条低优先级记忆。` : '';
+}
+function memoryStatusWithBudget(memoryPack = '', baseStatus = '') {
+  return [baseStatus, memoryPackBudgetStatus(memoryPack)].filter(Boolean).join('\n');
+}
 async function enableCloudTimer() {
   saveSettings({ silent: true });
   setCloudTimerStatus('正在绑定云闹钟...', false);
@@ -4244,7 +4251,7 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   const system = prompt.system;
   const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: options.proactiveNow || new Date() });
   const scene = chatSceneFromOptions(options);
-  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, memoryChars: String(memoryPack || '').length, memoryStatus: options.memoryStatus || memoryQuerySnapshot(), promptBlocks: prompt.promptBlocks };
+  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
 }
 

@@ -196,6 +196,13 @@ function memoryQuerySnapshot(settings = {}) {
     ? `${settings.lastMemoryQueryAt ? formatFullTime(new Date(settings.lastMemoryQueryAt)) + '｜' : ''}${settings.lastMemoryQueryStatus}`
     : '';
 }
+function memoryPackBudgetStatus(memoryPack = '') {
+  const match = String(memoryPack || '').match(/预算提示：已省略\s*(\d+)\s*条低优先级记忆/);
+  return match ? `记忆预算：已省略 ${match[1]} 条低优先级记忆。` : '';
+}
+function memoryStatusWithBudget(memoryPack = '', baseStatus = '') {
+  return [baseStatus, memoryPackBudgetStatus(memoryPack)].filter(Boolean).join('\n');
+}
 
 function pad2(n) {
   return String(n).padStart(2, '0');
@@ -1209,6 +1216,7 @@ async function handleProactivePush(payload) {
     scene: 'background-proactive-chat',
     charId,
     memoryChars: memoryPack.length,
+    memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
   chat.lastProactiveAt = Date.now();
@@ -1285,6 +1293,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
     scene: 'background-moment-post',
     charId,
     memoryChars: memoryPack.length,
+    memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
   let text = '';

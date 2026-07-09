@@ -140,6 +140,7 @@ globalThis.__appTest = {
   scoreKeywordMemoryText,
   searchKeywordMemoryRows,
   composeMemoryPackSections,
+  memoryStatusWithBudget,
   recordModelCall,
   getModelCallLogs,
   getAllModelCallLogs,
@@ -151,7 +152,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -270,6 +271,7 @@ assert.match(budgetedPack, /高优先级/);
 assert.match(budgetedPack, /红包约定必须保留/);
 assert.match(budgetedPack, /预算提示：已省略/);
 assert.ok(budgetedPack.length < 320);
+assert.match(memoryStatusWithBudget(budgetedPack, '记忆AI已调用'), /记忆预算：已省略/);
 recordModelCall({
   kind: 'chat',
   scene: 'proactive-chat',
@@ -279,7 +281,7 @@ recordModelCall({
   system: '系统提示：不要保存 sk-secret123456',
   messages: [{ role: 'user', content: '你好' }],
   memoryChars: 12,
-  memoryStatus: '记忆AI已调用；关键词：红包；向量库召回 1 条。',
+  memoryStatus: memoryStatusWithBudget(budgetedPack, '记忆AI已调用；关键词：红包；向量库召回 1 条。'),
   promptBlocks: [{ id: 'memory-pack', priority: 30, chars: 42, preview: '红包约定' }],
   output: '在。'
 });
@@ -289,6 +291,7 @@ assert.equal(callLogs[0].model, 'gpt-test');
 assert.equal(callLogs[0].messageCount, 1);
 assert.equal(callLogs[0].memoryChars, 12);
 assert.match(callLogs[0].memoryStatus, /记忆AI已调用/);
+assert.match(callLogs[0].memoryStatus, /记忆预算：已省略/);
 assert.equal(callLogs[0].promptBlocks[0].id, 'memory-pack');
 assert.match(callLogs[0].systemPreview, /系统提示/);
 assert.doesNotMatch(callLogs[0].systemPreview, /sk-secret123456/);
@@ -301,12 +304,14 @@ assert.match(formatModelCallStatus({ time: '2026-07-08 12:00', scene: 'memory-qu
 const diagnosticText = formatModelCallDiagnostic(callLogs[0]);
 assert.match(diagnosticText, /scene=proactive-chat/);
 assert.match(diagnosticText, /memoryStatus=记忆AI已调用/);
+assert.match(diagnosticText, /记忆预算：已省略/);
 assert.match(diagnosticText, /promptBlocks=memory-pack@30:42/);
 assert.match(diagnosticText, /promptBlockDetails=[\s\S]*红包约定/);
 assert.doesNotMatch(diagnosticText, /sk-secret123456/);
 await renderDiagnosticsScreen();
 assert.match(element('diagnostic-list').innerHTML, /proactive-chat/);
 assert.match(element('diagnostic-list').innerHTML, /记忆AI已调用/);
+assert.match(element('diagnostic-list').innerHTML, /记忆预算：已省略/);
 assert.match(element('diagnostic-list').innerHTML, /memory-pack/);
 clearModelCallLogs();
 assert.equal(getModelCallLogs().length, 0);
