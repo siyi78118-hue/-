@@ -22,7 +22,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.2';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.3';
 
 export default {
   async fetch(request, env) {
@@ -59,6 +59,11 @@ export default {
         };
         await saveJob(job, env);
         return json({ ok: true, dueMinute: minuteKey(dueAtMs) });
+      }
+      if (request.method === 'POST' && url.pathname === '/job-status') {
+        const body = await request.json();
+        if (!body.jobId) throw new Error('missing jobId');
+        return json(await jobStatus(body.jobId, body.deviceId || '', env));
       }
       if (request.method === 'POST' && url.pathname === '/cancel') {
         const body = await request.json();
@@ -136,6 +141,37 @@ async function cancelJob(jobId, env) {
     }
   }
   await env.AL_TIMER_KV.delete(`job:${jobId}`);
+}
+
+async function jobStatus(jobId, deviceId, env) {
+  const raw = await env.AL_TIMER_KV.get(`job:${jobId}`);
+  const job = raw ? JSON.parse(raw) : null;
+  const dueAtMs = Date.parse(job?.dueAt || '');
+  const dueMinute = Number.isFinite(dueAtMs) ? minuteKey(dueAtMs) : null;
+  let bucketHasJob = false;
+  if (dueMinute != null) {
+    const bucketRaw = await env.AL_TIMER_KV.get(`due:${dueMinute}`);
+    const ids = bucketRaw ? JSON.parse(bucketRaw) : [];
+    bucketHasJob = ids.includes(jobId);
+  }
+  const subDeviceId = deviceId || job?.deviceId || '';
+  const subRaw = subDeviceId ? await env.AL_TIMER_KV.get(`sub:${subDeviceId}`) : null;
+  return {
+    ok: true,
+    jobId,
+    exists: !!job,
+    bucketHasJob,
+    subscriptionExists: !!subRaw,
+    dueMinute,
+    nowMinute: Math.floor(Date.now() / 60000),
+    job: job ? {
+      charId: job.charId || '',
+      dueAt: job.dueAt || '',
+      kind: job.kind || '',
+      test: !!job.test,
+      updatedAt: job.updatedAt || 0
+    } : null
+  };
 }
 
 async function runDueMinute(env, minute) {

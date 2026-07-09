@@ -950,8 +950,8 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.5';
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.2';
+const APP_BUILD_VERSION = '2026-07-09.6';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.3';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
@@ -4066,6 +4066,31 @@ async function postCloudSchedule(charId, job, kind = 'chat') {
     body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId, charId, dueAt: job.dueAt, type: 'proactive', kind })
   }, API_TIMEOUT_MS);
   if (!resp.ok) throw new Error('云闹钟安排失败：' + resp.status);
+  verifyCloudJobStatus(charId, job, kind).catch(err => {
+    setCloudTimerTrace(kind, cloudTraceId(kind), `云端任务核验失败：${friendlyErrorMessage(err)}`);
+  });
+}
+async function verifyCloudJobStatus(charId, job, kind = 'chat') {
+  if (!settings.timerEndpoint || !job?.jobId) return false;
+  const resp = await fetchWithTimeout(timerUrl('/job-status'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId })
+  }, 15000);
+  if (!resp.ok) throw new Error('job-status ' + resp.status);
+  const json = await resp.json();
+  const dueText = json.job?.dueAt ? formatFullTime(new Date(json.job.dueAt)) : '未知时间';
+  const ok = !!json.exists && !!json.bucketHasJob && !!json.subscriptionExists;
+  const details = [
+    `云端任务${ok ? '已核验' : '异常'}`,
+    `job=${json.exists ? '存在' : '缺失'}`,
+    `bucket=${json.bucketHasJob ? '存在' : '缺失'}`,
+    `push=${json.subscriptionExists ? '存在' : '缺失'}`,
+    `due=${dueText}`
+  ].join('；');
+  setCloudTimerTrace(kind, cloudTraceId(kind), details);
+  if (!ok) setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}云端任务异常：${details}`, true, kind);
+  return ok;
 }
 async function testCloudTimerPush() {
   saveSettings({ silent: true });

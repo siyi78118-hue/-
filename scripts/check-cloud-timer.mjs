@@ -1,4 +1,4 @@
-const EXPECTED_VERSION = '2026-07-09.2';
+const EXPECTED_VERSION = '2026-07-09.3';
 
 const endpoint = (process.argv[2] || process.env.AL_TIMER_ENDPOINT || process.env.TIMER_ENDPOINT || '').replace(/\/+$/, '');
 
