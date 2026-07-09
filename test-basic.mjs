@@ -10,10 +10,10 @@ const cloudTimerWorker = readFileSync('cloud-timer-worker.js', 'utf8');
 const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
 const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v15';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v16';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.3';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.4';/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.2';/);
 assert.match(script, /sw-v11\.js\?alarm-stream=1&v=\$\{APP_BUILD_VERSION\}/);
 assert.match(script, /\.then\(reg => reg\.update\?\.\(\)\)/);
@@ -26,6 +26,11 @@ assert.match(script, /async function checkCloudTimerWorkerVersion/);
 assert.match(script, /manualCheckCloudTimerVersion\(\)/);
 assert.match(html, /检测云端 Worker 版本/);
 assert.match(script, /云闹钟版本/);
+assert.match(script, /function buildProactiveTriggerMessage/);
+assert.match(script, /私聊链路/);
+assert.match(swScript, /function buildProactiveTriggerMessage/);
+assert.match(swScript, /setStateCloudTimerTrace/);
+assert.match(swScript, /messages\.push\(\{ role: 'user', content: buildProactiveTriggerMessage/);
 assert.match(swScript, /function latestCloudTargetCharId\(allChats\)/);
 assert.match(swScript, /\(\!targetCharId \|\| r\.charId === targetCharId\).*r\.job\?\.dueAt/);
 assert.match(swScript, /function cleanApiKey\(value\)/);
@@ -160,6 +165,7 @@ globalThis.__appTest = {
   getDayPeriod,
   formatElapsed,
   buildProactiveTimeContext,
+  buildProactiveTriggerMessage,
   proactiveRecentMessages,
   splitAssistantOutput,
   createPromptComposer,
@@ -192,7 +198,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -396,6 +402,10 @@ const longGapContext = buildProactiveTimeContext(proactiveChat, proactiveNow);
 assert.match(longGapContext, /长间隔重新开口/);
 assert.match(longGapContext, /默认不要直接回答上一条话题/);
 assert.match(proactiveRecentMessages(proactiveChat, 30, proactiveNow)[0].content, /距现在 2 小时/);
+const proactiveTrigger = buildProactiveTriggerMessage({ name: '林晚' }, proactiveChat, proactiveNow);
+assert.match(proactiveTrigger, /内部主动触发/);
+assert.match(proactiveTrigger, /这不是玩家发来的聊天消息/);
+assert.match(proactiveTrigger, /主动给玩家发一条微信私聊/);
 vm.runInContext("currentCharId='current_chat'; allChats={ old_chat:{ messages:[{ role:'user', content:'旧会话', time:1 }] }, current_chat:{ messages:[{ role:'user', content:'当前会话', time:2 }] } };", context);
 assert.equal(cloudTimerTargetCharId([{ char: { id: 'old_chat' }, chat: context.allChats?.old_chat }, { char: { id: 'current_chat' }, chat: context.allChats?.current_chat }]), 'current_chat');
 const promiseVector = localEmbedding('周六晚上语音 承诺 不会消失');

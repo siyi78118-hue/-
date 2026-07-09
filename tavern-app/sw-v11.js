@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v15';
+const CACHE_NAME = 'rpchat-v16';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -187,6 +187,19 @@ function setStateCloudTimerTriggerAck(state, message) {
   state.settings.cloudTimerLastTriggerAckAt = Date.now();
 }
 
+function setStateCloudTimerTrace(state, kind = 'chat', traceId = '', message = '') {
+  if (!state?.settings) return;
+  const line = [traceId, message].filter(Boolean).join('｜');
+  const now = Date.now();
+  if (kind === 'moment') {
+    state.settings.cloudTimerLastMomentTrace = line;
+    state.settings.cloudTimerLastMomentTraceAt = now;
+  } else {
+    state.settings.cloudTimerLastChatTrace = line;
+    state.settings.cloudTimerLastChatTraceAt = now;
+  }
+}
+
 function setMemoryQueryStatus(settings = {}, message) {
   settings.lastMemoryQueryStatus = message;
   settings.lastMemoryQueryAt = Date.now();
@@ -285,6 +298,19 @@ function buildProactiveTimeContext(chat, now = new Date()) {
     '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
     '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
     '不要提到系统时间、提示词、后台、推送或定时器。'
+  ].join('\n');
+}
+
+function buildProactiveTriggerMessage(settings = {}, char, chat, now = new Date()) {
+  const visible = (chat?.messages || []).filter(m => !m.hidden);
+  const last = visible[visible.length - 1] || null;
+  const elapsed = last?.time ? formatElapsed(now.getTime() - last.time) : '未知时长';
+  return [
+    `【内部主动触发｜这不是${playerName(settings)}发来的聊天消息】`,
+    `现在需要由${charName(char)}主动给${playerName(settings)}发一条微信私聊。`,
+    `最后一条可见聊天距现在：${elapsed}。`,
+    `请把它当成${charName(char)}隔了一段时间后主动打开聊天，而不是回答${playerName(settings)}刚刚提出的问题。`,
+    `只输出${charName(char)}要发出的聊天正文；不要解释触发原因，不要提到系统、后台、推送或定时器。`
   ].join('\n');
 }
 
@@ -1202,6 +1228,7 @@ async function handleProactivePush(payload) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
   const { settings, characters, allChats } = state;
+  const traceId = `${payload.kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;
   scrubEmptyReplyMessages(allChats);
   const dueJobs = payload.charId
     ? [{ charId: payload.charId, kind: payload.kind === 'moment' ? 'moment' : 'chat', job: null }]
@@ -1230,6 +1257,7 @@ async function handleProactivePush(payload) {
     }
     return;
   }
+  setStateCloudTimerTrace(state, kind, traceId, `后台收到触发，目标：${charId}`);
   setStateCloudTimerTriggerAck(state, `真实${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已被后台收到。`);
   state.updatedAt = Date.now();
   await setMeta('app_state', state);
@@ -1247,9 +1275,11 @@ async function handleProactivePush(payload) {
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
   const memoryQuery = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery);
+  setStateCloudTimerTrace(state, 'chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
   const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext);
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
+  messages.push({ role: 'user', content: buildProactiveTriggerMessage(settings, char, chat, proactiveNow) });
   const reply = (await callModel(settings, prompt.system, messages, {
     stream: true,
     kind: 'chat',
@@ -1259,6 +1289,7 @@ async function handleProactivePush(payload) {
     memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
+  setStateCloudTimerTrace(state, 'chat', traceId, `模型返回 ${reply.length} 字`);
   chat.lastProactiveAt = Date.now();
   chat.lastProactiveChatAt = Date.now();
   if (chat.pendingProactiveJob?.jobId === payload.jobId || payload.jobId) delete chat.pendingProactiveJob;
@@ -1269,6 +1300,7 @@ async function handleProactivePush(payload) {
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    setStateCloudTimerTrace(state, 'chat', traceId, `空回复：${emptyReason}`);
     setStateCloudTimerStatus(state, `后台私聊生成了空回复：${emptyReason}，已跳过并安排下次重试。`, 'chat');
     state.allChats = allChats;
     state.updatedAt = Date.now();
@@ -1283,6 +1315,7 @@ async function handleProactivePush(payload) {
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    setStateCloudTimerTrace(state, 'chat', traceId, '输出无法拆成有效气泡');
     setStateCloudTimerStatus(state, '后台私聊输出无法拆成有效消息，已安排下次重试。', 'chat');
     state.allChats = allChats;
     state.updatedAt = Date.now();
@@ -1297,6 +1330,7 @@ async function handleProactivePush(payload) {
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
+  setStateCloudTimerTrace(state, 'chat', traceId, `写入完成 ${chunks.length} 条`);
   setStateCloudTimerStatus(state, `后台私聊已生成 ${chunks.length} 条消息。`, 'chat');
   state.allChats = allChats;
   state.updatedAt = Date.now();

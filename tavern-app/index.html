@@ -939,6 +939,10 @@ const DEFAULT_SETTINGS = {
   cloudTimerLastChatStatusAt: 0,
   cloudTimerLastMomentStatus: '',
   cloudTimerLastMomentStatusAt: 0,
+  cloudTimerLastChatTrace: '',
+  cloudTimerLastChatTraceAt: 0,
+  cloudTimerLastMomentTrace: '',
+  cloudTimerLastMomentTraceAt: 0,
   cloudTimerWorkerStatus: '',
   cloudTimerWorkerStatusAt: 0,
   lastMemoryQueryStatus: '',
@@ -946,7 +950,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.3';
+const APP_BUILD_VERSION = '2026-07-09.4';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.2';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1260,6 +1264,17 @@ function buildProactiveTimeContext(chat, now = new Date()) {
     '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
     '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
     '不要提到系统时间、提示词、后台、推送或定时器。'
+  ].join('\n');
+}
+function buildProactiveTriggerMessage(char, chat, now = new Date()) {
+  const last = lastVisibleMessage(chat);
+  const elapsed = last?.time ? formatElapsed(now.getTime() - last.time) : '未知时长';
+  return [
+    `【内部主动触发｜这不是${playerName()}发来的聊天消息】`,
+    `现在需要由${charName(char)}主动给${playerName()}发一条微信私聊。`,
+    `最后一条可见聊天距现在：${elapsed}。`,
+    `请把它当成${charName(char)}隔了一段时间后主动打开聊天，而不是回答${playerName()}刚刚提出的问题。`,
+    `只输出${charName(char)}要发出的聊天正文；不要解释触发原因，不要提到系统、后台、推送或定时器。`
   ].join('\n');
 }
 function proactiveRecentMessages(chat, count = 30, now = new Date()) {
@@ -3720,8 +3735,12 @@ function cloudTimerStatusText() {
   }
   const chatLine = statusLine('私聊结果', settings.cloudTimerLastChatStatus, settings.cloudTimerLastChatStatusAt);
   if (chatLine) rows.push(chatLine);
+  const chatTraceLine = statusLine('私聊链路', settings.cloudTimerLastChatTrace, settings.cloudTimerLastChatTraceAt);
+  if (chatTraceLine) rows.push(chatTraceLine);
   const momentLine = statusLine('朋友圈结果', settings.cloudTimerLastMomentStatus, settings.cloudTimerLastMomentStatusAt);
   if (momentLine) rows.push(momentLine);
+  const momentTraceLine = statusLine('朋友圈链路', settings.cloudTimerLastMomentTrace, settings.cloudTimerLastMomentTraceAt);
+  if (momentTraceLine) rows.push(momentTraceLine);
   const ackLine = statusLine('测试推送确认', settings.cloudTimerLastTestAckStatus, settings.cloudTimerLastTestAckAt);
   if (ackLine) rows.push(ackLine);
   const triggerAckLine = statusLine('闹钟触发确认', settings.cloudTimerLastTriggerAckStatus, settings.cloudTimerLastTriggerAckAt);
@@ -3760,6 +3779,22 @@ function setCloudTimerStatus(message, persist = true, kind = 'general') {
   } else {
     settings.cloudTimerLastStatus = message;
     settings.cloudTimerLastStatusAt = now;
+  }
+  if (persist) DB.set('settings', settings);
+  renderCloudTimerStatus();
+}
+function cloudTraceId(kind = 'chat') {
+  return `${kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;
+}
+function setCloudTimerTrace(kind = 'chat', traceId = '', message = '', persist = true) {
+  const line = [traceId, message].filter(Boolean).join('｜');
+  const now = Date.now();
+  if (kind === 'moment') {
+    settings.cloudTimerLastMomentTrace = line;
+    settings.cloudTimerLastMomentTraceAt = now;
+  } else {
+    settings.cloudTimerLastChatTrace = line;
+    settings.cloudTimerLastChatTraceAt = now;
   }
   if (persist) DB.set('settings', settings);
   renderCloudTimerStatus();
@@ -4145,12 +4180,15 @@ async function triggerProactiveMessage(charId, manual = false) {
     return false;
   }
   proactiveChatBusy = true;
+  const traceId = cloudTraceId('chat');
   try {
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `收到触发，目标：${char.name || charId}`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊已接到云闹钟，正在生成消息。', true, 'chat');
     const proactiveNow = new Date();
     const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
     const memoryPack = manual ? await prepareMemoryPack(charId, query) : await prepareProactiveMemoryPack(charId, query);
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊正在请求聊天模型。', true, 'chat');
     const reply = manual
       ? await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext })
@@ -4162,6 +4200,7 @@ async function triggerProactiveMessage(charId, manual = false) {
             onRetry: (err, attempt, total) => setCloudTimerStatus(`前台私聊请求失败，正在重试 ${attempt}/${total}：${statusErrorMessage(err)}`, true, 'chat')
           }
         );
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `模型返回 ${String(reply || '').trim().length} 字`);
     clearStreamingDraft(charId);
     const replyText = applyAssistantMomentDirective(chat, charId, reply).trim();
     delete chat.pendingProactiveJob;
@@ -4173,6 +4212,7 @@ async function triggerProactiveMessage(charId, manual = false) {
       DB.set('chats', allChats);
       if (manual) toast('主动消息没有生成内容，已跳过写入', 2600);
       try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
+      if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `空回复：${emptyReason}`);
       if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台私聊生成了空回复：${emptyReason}，已跳过并安排下次重试。`, true, 'chat');
       return false;
     }
@@ -4187,6 +4227,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成主动消息\n已写入当前会话', 2400);
     try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `写入完成 ${splitAssistantOutput(replyText).filter(part => !isEmptyReplyText(part)).length || 1} 条`);
     if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台私聊已生成 ${splitAssistantOutput(replyText).filter(part => !isEmptyReplyText(part)).length || 1} 条消息。`, true, 'chat');
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] proactive update skipped:', err.message));
     return true;
@@ -4200,6 +4241,7 @@ async function triggerProactiveMessage(charId, manual = false) {
       DB.set('chats', allChats);
       try { await scheduleCloudProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] reschedule skipped:', err.message); }
     }
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `失败：${statusErrorMessage(err)}`);
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成失败：' + statusErrorMessage(err), true, 'chat');
     if (manual) toast('主动消息失败：' + friendlyErrorMessage(err), 3200);
     console.warn('[AL Proactive] skipped:', technicalErrorMessage(err), err);
@@ -4389,7 +4431,9 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   if (!currentChar) throw new Error('找不到当前角色');
   const prompt = buildChatSceneSystem(currentChar, chat, { ...options, memoryPack, returnPromptDetails: true });
   const system = prompt.system;
-  const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: options.proactiveNow || new Date() });
+  const proactiveNow = options.proactiveNow || new Date();
+  const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: proactiveNow });
+  if (options.proactive) messages.push({ role: 'user', content: buildProactiveTriggerMessage(currentChar, chat, proactiveNow) });
   const scene = chatSceneFromOptions(options);
   const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
