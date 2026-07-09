@@ -177,6 +177,12 @@ button{border:none;background:none;cursor:pointer}
 .diagnostic-section summary{font-size:13px;color:#576b95;line-height:1.6;list-style:none}
 .diagnostic-section summary::-webkit-details-marker{display:none}
 .diagnostic-pre{margin-top:5px;padding:8px;background:#f7f7f7;color:#555;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;border-radius:4px}
+.memory-section{margin:0 0 10px}
+.memory-section-title{height:30px;padding:6px 14px 0;color:#8a8a8a;font-size:13px;background:#ededed}
+.memory-item{align-items:flex-start}
+.memory-item .cell-label{padding-top:3px}
+.memory-actions{display:flex;gap:8px;margin-top:8px}
+.memory-actions .inline-btn{height:30px;padding:0 10px}
 .file-zone{height:150px;margin:0 0 12px;border:1px dashed #c7d8cc;border-radius:8px;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#666;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .file-zone:active{background:#f7f7f7}
 .file-zone .big{font-size:34px}
@@ -594,7 +600,7 @@ button.profile-top{width:100%;text-align:left}
       <input type="file" id="modal-char-avatar-input" accept="image/*" style="display:none" onchange="handleModalCharAvatar(event)">
       <div class="cell-group">
         <button class="cell" onclick="openSearch('current-chat')" type="button"><div class="cell-body">查找聊天内容</div><div class="mini">›</div></button>
-        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-body">记忆库</div><div class="mini">›</div></button>
+        <button class="cell" onclick="openMemory('chat-info')" type="button"><div class="cell-body">记忆库</div><div class="mini">›</div></button>
         <button class="cell" onclick="toggleChatPinned()" type="button"><div class="cell-body">置顶聊天</div><span class="switch" id="chat-pinned-switch"></span></button>
         <button class="cell" onclick="toggleChatMuted()" type="button"><div class="cell-body">消息免打扰</div><span class="switch" id="chat-muted-switch"></span></button>
       </div>
@@ -709,7 +715,7 @@ button.profile-top{width:100%;text-align:left}
           <div class="cell"><div class="cell-label">推送公钥</div><div class="cell-body"><textarea class="textarea" id="set-push-public-key" placeholder="VAPID public key"></textarea></div></div>
           <div class="cell"><div class="cell-label">RP 预设</div><div class="cell-body"><select class="select" id="set-rp-preset" onchange="onPresetChange(this.value)"><option value="combined">AL 综合 RP</option><option value="custom">自定义</option></select><div class="hint" id="preset-desc" style="padding:6px 0 0"></div></div></div>
           <div class="cell"><div class="cell-label">全局预设</div><div class="cell-body"><textarea class="textarea" id="set-system-prompt"></textarea></div></div>
-          <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
+          <button class="cell" onclick="openMemory('settings')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
@@ -727,7 +733,7 @@ button.profile-top{width:100%;text-align:left}
 
   <div id="screen-memory" class="screen">
     <div class="topbar">
-      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('settings')">‹</button></div>
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen(memoryReturnScreen || 'settings')">‹</button></div>
       <div class="top-title">记忆库</div>
       <div class="top-right"></div>
     </div>
@@ -740,7 +746,7 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="runMemoryNow()" type="button"><div class="cell-label">整理</div><div class="cell-body">立即提炼当前会话</div><div class="mini">›</div></button>
           <button class="cell" onclick="clearCurrentMemory()" type="button"><div class="cell-label">清理</div><div class="cell-body">清空当前角色记忆</div><div class="mini">›</div></button>
         </div>
-        <div id="memory-list" class="cell-group"></div>
+        <div id="memory-list"></div>
       </div>
     </div>
   </div>
@@ -977,7 +983,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.32';
+const APP_BUILD_VERSION = '2026-07-09.34';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1053,6 +1059,7 @@ let profileCharId = null;
 let isStreaming = false;
 let streamingDraft = null;
 let lastMainScreen = 'chats';
+let memoryReturnScreen = 'settings';
 let plusOpen = false;
 let activeScreen = 'chats';
 let proactiveTimer = null;
@@ -1860,6 +1867,11 @@ function openSearch(scope = activeScreen) {
 }
 function closeSearch() {
   showScreen(searchReturnScreen || lastMainScreen || 'chats');
+}
+function openMemory(returnScreen = activeScreen) {
+  memoryReturnScreen = returnScreen && returnScreen !== 'memory' ? returnScreen : 'settings';
+  renderMemoryScreen();
+  showScreen('memory');
 }
 function handleSearchKey(event) {
   if (event.key === 'Escape') closeSearch();
@@ -5520,30 +5532,100 @@ async function renderMemoryScreen() {
     list.innerHTML = '<div class="empty"><div class="empty-ico">⌘</div><div>暂无记忆</div></div>';
     return;
   }
-  const [summaries, events, profiles, vectors] = await Promise.all([
+  const [summaries, events, profiles] = await Promise.all([
     MemoryDB.byChar('summaries', charId),
     MemoryDB.byChar('events', charId),
-    MemoryDB.byChar('profiles', charId),
-    MemoryDB.byChar('vectors', charId)
+    MemoryDB.byChar('profiles', charId)
   ]);
-  const visibleEvents = events.filter(shouldKeepEvent);
-  const visibleProfiles = profiles.filter(shouldKeepProfile);
-  const visibleSummaries = summaries.filter(s => shouldKeepSummary(memoryAliasText(s.content, char)));
-  status.textContent = `${char.name}：可用摘要 ${visibleSummaries.length} 条，事件 ${visibleEvents.length} 条，资料 ${visibleProfiles.length} 条。`;
-  const rows = [
-    ...visibleEvents.map(e => ({ kind: '事件', time: e.createdAt, title: memoryAliasText(e.title, char), detail: `${memoryAliasText(e.happenedAt, char)}｜${memoryAliasText(e.detail, char)}` })),
-    ...visibleProfiles.map(p => ({ kind: '资料', time: p.createdAt, title: memoryAliasText(p.title, char), detail: memoryAliasText(p.detail, char) })),
-    ...visibleSummaries.map(s => ({ kind: '摘要', time: s.createdAt, title: '增量摘要', detail: memoryAliasText(s.content, char) }))
-  ].sort((a, b) => b.time - a.time).slice(0, 30);
-  if (!rows.length) {
+  status.textContent = `${char.name}：摘要 ${summaries.length} 条，事件 ${events.length} 条，资料 ${profiles.length} 条。`;
+  const groups = [
+    { title: '资料', store: 'profiles', rows: profiles.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(p => ({ ...p, displayTitle: memoryAliasText(p.title || '资料', char), displayDetail: memoryAliasText(p.detail || '', char), meta: memoryLabelMeta(p) })) },
+    { title: '事件', store: 'events', rows: events.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(e => ({ ...e, displayTitle: memoryAliasText(e.title || '重要事件', char), displayDetail: `${memoryAliasText(e.happenedAt || '未注明', char)}｜${memoryAliasText(e.detail || '', char)}`, meta: memoryLabelMeta(e) })) },
+    { title: '摘要', store: 'summaries', rows: summaries.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(s => ({ ...s, displayTitle: '增量摘要', displayDetail: memoryAliasText(s.content || '', char), meta: fmtTime(s.createdAt) })) }
+  ];
+  if (!groups.some(group => group.rows.length)) {
     list.innerHTML = '<div class="empty"><div class="empty-ico">⌘</div><div>当前角色还没有入库记忆<br>聊天满记忆间隔后会自动整理</div></div>';
     return;
   }
-  list.innerHTML = rows.map(r => `
-    <div class="cell">
-      <div class="cell-label">${esc(r.kind)}</div>
-      <div class="cell-body"><strong>${esc(r.title || '')}</strong><div class="hint">${esc(r.detail || '')}</div></div>
+  list.innerHTML = groups.filter(group => group.rows.length).map(group => `
+    <div class="memory-section">
+      <div class="memory-section-title">${esc(group.title)} · ${group.rows.length}</div>
+      <div class="cell-group">${group.rows.map(row => renderMemoryItem(group.store, row)).join('')}</div>
     </div>`).join('');
+}
+function memoryLabelMeta(item) {
+  return [item.type, item.status, fmtTime(item.createdAt)].filter(Boolean).join(' · ');
+}
+function renderMemoryItem(storeName, item) {
+  const storeArg = jsArg(storeName);
+  const idArg = jsArg(item.id);
+  return `
+    <div class="cell memory-item">
+      <div class="cell-label">${esc(item.meta || '')}</div>
+      <div class="cell-body">
+        <strong>${esc(item.displayTitle || '')}</strong>
+        <div class="hint">${esc(item.displayDetail || '')}</div>
+        <div class="memory-actions">
+          <button class="inline-btn" onclick="editMemoryItem(${storeArg},${idArg})" type="button">编辑</button>
+          <button class="inline-btn" onclick="deleteMemoryItem(${storeArg},${idArg})" type="button">删除</button>
+        </div>
+      </div>
+    </div>`;
+}
+function jsArg(value) {
+  return esc(JSON.stringify(String(value || '')));
+}
+async function syncMemoryVector(storeName, item) {
+  if (!item?.charId) return;
+  if (storeName === 'summaries') {
+    await saveVector(item.charId, 'summary', item.id, item.content || '', ['摘要'], 3);
+  } else if (storeName === 'profiles') {
+    await saveVector(item.charId, 'profile', item.id, memoryTextForVector(item), item.keywords || [], item.importance || 3);
+  } else if (storeName === 'events') {
+    await saveVector(item.charId, 'event', item.id, memoryTextForVector(item), item.keywords || [], item.importance || 3);
+  }
+}
+async function editMemoryItem(storeName, id) {
+  const rows = await MemoryDB.all(storeName);
+  const item = rows.find(row => row.id === id);
+  if (!item) { toast('记忆不存在'); return; }
+  const next = { ...item, updatedAt: Date.now() };
+  if (storeName === 'summaries') {
+    const content = prompt('编辑摘要', item.content || '');
+    if (content == null) return;
+    next.content = content.trim();
+    if (!next.content) { toast('内容不能为空'); return; }
+  } else {
+    const title = prompt('编辑标题', item.title || '');
+    if (title == null) return;
+    const detail = prompt('编辑内容', item.detail || '');
+    if (detail == null) return;
+    next.title = title.trim() || (storeName === 'events' ? '重要事件' : '资料');
+    next.detail = detail.trim();
+    if (storeName === 'events') {
+      const happenedAt = prompt('编辑时间节点', item.happenedAt || '未注明');
+      if (happenedAt == null) return;
+      next.happenedAt = happenedAt.trim() || '未注明';
+    }
+    if (!next.detail) { toast('内容不能为空'); return; }
+  }
+  await MemoryDB.put(storeName, next);
+  await syncMemoryVector(storeName, next);
+  await renderMemoryScreen();
+  toast('记忆已更新');
+}
+async function deleteMemoryItem(storeName, id) {
+  if (!confirm('删除这条记忆？')) return;
+  await MemoryDB.remove(storeName, id);
+  await MemoryDB.remove('vectors', `vec_${memorySourceType(storeName)}_${id}`);
+  await renderMemoryScreen();
+  toast('记忆已删除');
+}
+function memorySourceType(storeName) {
+  if (storeName === 'summaries') return 'summary';
+  if (storeName === 'profiles') return 'profile';
+  if (storeName === 'events') return 'event';
+  return storeName;
 }
 async function runMemoryNow() {
   saveSettings();
