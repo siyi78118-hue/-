@@ -3,7 +3,7 @@
     "start": "node serve-static.mjs",
     "test": "node test-basic.mjs",
     "cloud:deploy": "node scripts/deploy-cloud-timer.mjs",
-    "cloud:deploy:raw": "wrangler deploy",
+    "cloud:deploy:raw": "node scripts/run-wrangler.mjs deploy",
     "cloud:health": "node scripts/check-cloud-timer.mjs"
   },
   "devDependencies": {
