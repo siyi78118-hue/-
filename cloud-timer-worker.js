@@ -22,7 +22,8 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.4';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.5';
+const RECENT_EVENT_LIMIT = 40;
 
 export default {
   async fetch(request, env) {
@@ -32,6 +33,9 @@ export default {
       if (request.method === 'GET' && url.pathname === '/health') {
         return json({ ok: true, service: 'AL cloud timer', version: CLOUD_TIMER_WORKER_VERSION, cron: await getLastCron(env) });
       }
+      if (request.method === 'GET' && url.pathname === '/logs') {
+        return json({ ok: true, events: await getRecentEvents(env) });
+      }
       if (request.method === 'POST' && url.pathname === '/register') {
         const body = await request.json();
         if (!body.deviceId || !body.subscription?.endpoint) throw new Error('missing deviceId/subscription');
@@ -40,6 +44,7 @@ export default {
           subscription: body.subscription,
           updatedAt: Date.now()
         }));
+        await appendEvent(env, { type: 'register', deviceId: shortId(body.deviceId), ok: true });
         return json({ ok: true });
       }
       if (request.method === 'POST' && url.pathname === '/schedule') {
@@ -58,6 +63,7 @@ export default {
           updatedAt: Date.now()
         };
         await saveJob(job, env);
+        await appendEvent(env, { type: 'schedule', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId, kind: job.kind, dueAt: job.dueAt, ok: true });
         return json({ ok: true, dueMinute: minuteKey(dueAtMs) });
       }
       if (request.method === 'POST' && url.pathname === '/job-status') {
@@ -68,6 +74,7 @@ export default {
       if (request.method === 'POST' && url.pathname === '/cancel') {
         const body = await request.json();
         if (body.jobId) await cancelJob(body.jobId, env);
+        await appendEvent(env, { type: 'cancel', deviceId: shortId(body.deviceId || ''), jobId: body.jobId || '', ok: true });
         return json({ ok: true });
       }
       if (request.method === 'POST' && url.pathname === '/trigger') {
@@ -84,6 +91,7 @@ export default {
         job.test = !!(job.test || body.test);
         const delivered = await deliverJob(job, env);
         if (job.jobId && !delivered.retry) await cancelJob(job.jobId, env);
+        await appendEvent(env, { type: 'manual-trigger', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId, kind: job.kind, ok: delivered.ok, reason: delivered.reason || '', retry: !!delivered.retry });
         return json({ ok: delivered.ok, delivered });
       }
       return json({ ok: false, error: 'not found' }, 404);
@@ -134,6 +142,7 @@ async function runDueJobs(env) {
   } finally {
     summary.finishedAt = Date.now();
     await env.AL_TIMER_KV.put('meta:lastCron', JSON.stringify(summary), { expirationTtl: 3 * 24 * 60 * 60 });
+    await appendEvent(env, { type: 'cron', ok: summary.ok, buckets: summary.buckets, jobsSeen: summary.jobsSeen, delivered: summary.delivered, retry: summary.retry, failed: summary.failed, missing: summary.missing, error: summary.error });
   }
 }
 
@@ -239,6 +248,7 @@ async function runDueMinute(env, minute) {
     }
     try {
       const delivered = await deliverJob(job, env);
+      await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || '', retry: !!delivered.retry });
       if (delivered.retry) {
         stats.retry += 1;
         remaining.push(jobId);
@@ -249,6 +259,7 @@ async function runDueMinute(env, minute) {
       }
     } catch (err) {
       console.warn(`deliver failed for ${jobId}:`, err.message);
+      await appendEvent(env, { type: 'deliver-error', jobId, ok: false, reason: String(err?.message || err).slice(0, 160), retry: true });
       stats.failed += 1;
       remaining.push(jobId);
     }
@@ -276,6 +287,31 @@ async function deliverJob(job, env) {
   }
   if (!result.ok) return { ok: false, reason: result.reason || 'push failed', jobId: job.jobId, retry: true };
   return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false };
+}
+
+async function getRecentEvents(env) {
+  const raw = await env.AL_TIMER_KV.get('meta:recentEvents');
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function appendEvent(env, event) {
+  try {
+    const events = await getRecentEvents(env);
+    events.unshift({
+      at: Date.now(),
+      version: CLOUD_TIMER_WORKER_VERSION,
+      ...event
+    });
+    await env.AL_TIMER_KV.put('meta:recentEvents', JSON.stringify(events.slice(0, RECENT_EVENT_LIMIT)), { expirationTtl: 3 * 24 * 60 * 60 });
+  } catch (err) {
+    console.warn('append event failed:', err?.message || err);
+  }
+}
+
+function shortId(value) {
+  const text = String(value || '');
+  if (text.length <= 14) return text;
+  return text.slice(0, 6) + '...' + text.slice(-5);
 }
 
 async function sendEmptyPush(subscription, env) {

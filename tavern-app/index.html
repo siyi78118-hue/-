@@ -725,6 +725,7 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <button class="cell" onclick="manualCheckCloudTimerVersion()" type="button"><div class="cell-label">版本</div><div class="cell-body">检测云端 Worker 版本</div><div class="mini">›</div></button>
+          <button class="cell" onclick="fetchCloudTimerLogs()" type="button"><div class="cell-label">日志</div><div class="cell-body">查看云闹钟最近流水</div><div class="mini">›</div></button>
           <button class="cell" onclick="testCloudTimerPush()" type="button"><div class="cell-label">闹钟</div><div class="cell-body">测试云闹钟推送</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
@@ -982,8 +983,8 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.18';
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
+const APP_BUILD_VERSION = '2026-07-09.19';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.5';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
@@ -4278,6 +4279,45 @@ function formatCloudCronStatus(cron) {
   const ageText = ageMs >= 0 ? `，距现在 ${formatElapsed(ageMs)}` : '';
   const okText = cron.ok === false ? `异常${cron.error ? '：' + cron.error : ''}` : '正常';
   return `Cron：${okText}，最近 ${formatFullTime(at)}${ageText}；扫桶 ${Number(cron.buckets) || 0}，任务 ${Number(cron.jobsSeen) || 0}，成功 ${Number(cron.delivered) || 0}，重试 ${Number(cron.retry) || 0}，失败 ${Number(cron.failed) || 0}`;
+}
+function formatCloudTimerEvent(event = {}) {
+  const at = event.at ? fmtTime(event.at) : '--:--';
+  const kind = event.kind === 'moment' ? '朋友圈' : (event.kind === 'chat' ? '私聊' : '');
+  const ok = event.ok === false ? '失败' : '成功';
+  const parts = [
+    `${at} ${event.type || 'event'}`,
+    kind,
+    event.jobId ? `job=${String(event.jobId).slice(0, 18)}` : '',
+    event.dueAt ? `due=${fmtTime(event.dueAt)}` : '',
+    `结果=${ok}`,
+    event.retry ? '会重试' : '',
+    event.reason ? `原因=${String(event.reason).slice(0, 40)}` : '',
+    event.jobsSeen != null ? `任务=${Number(event.jobsSeen) || 0}` : '',
+    event.delivered != null ? `投递=${Number(event.delivered) || 0}` : ''
+  ].filter(Boolean);
+  return parts.join('；');
+}
+async function fetchCloudTimerLogs() {
+  saveSettings({ silent: true });
+  if (!settings.timerEndpoint) {
+    setCloudWorkerStatus('日志获取失败：请先填写闹钟地址');
+    toast('请先填写闹钟地址', 2200);
+    return false;
+  }
+  try {
+    const resp = await fetchWithTimeout(timerUrl('/logs'), { method: 'GET' }, 15000);
+    if (!resp.ok) throw new Error('logs ' + resp.status);
+    const json = await resp.json();
+    const events = Array.isArray(json.events) ? json.events : [];
+    const lines = events.slice(0, 12).map(formatCloudTimerEvent);
+    setCloudWorkerStatus(lines.length ? `最近云闹钟日志：\n${lines.join('\n')}` : '最近云闹钟日志为空。');
+    toast('云闹钟日志已读取', 1600);
+    return true;
+  } catch (err) {
+    setCloudWorkerStatus('日志获取失败：' + friendlyErrorMessage(err));
+    toast('日志获取失败：' + friendlyErrorMessage(err), 2600);
+    return false;
+  }
 }
 async function checkCloudTimerWorkerVersion({ silent = false } = {}) {
   if (!settings.timerEndpoint) return false;
