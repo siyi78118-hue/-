@@ -1010,7 +1010,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.39';
+const APP_BUILD_VERSION = '2026-07-09.40';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -5890,8 +5890,7 @@ async function syncFromServiceWorkerState() {
     if (activeScreen === 'memory') renderMemoryScreen();
     renderCloudTimerStatus();
   }
-  catchUpDueCloudProactive().catch(err => console.warn('[AL Timer] catch-up skipped:', err.message));
-  ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
+  checkProactiveMessages().catch(err => console.warn('[AL Timer] immediate proactive check skipped:', err.message));
 }
 async function bootApp() {
   await syncFromServiceWorkerState();
