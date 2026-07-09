@@ -22,7 +22,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.3';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.4';
 
 export default {
   async fetch(request, env) {
@@ -30,7 +30,7 @@ export default {
     const url = new URL(request.url);
     try {
       if (request.method === 'GET' && url.pathname === '/health') {
-        return json({ ok: true, service: 'AL cloud timer', version: CLOUD_TIMER_WORKER_VERSION });
+        return json({ ok: true, service: 'AL cloud timer', version: CLOUD_TIMER_WORKER_VERSION, cron: await getLastCron(env) });
       }
       if (request.method === 'POST' && url.pathname === '/register') {
         const body = await request.json();
@@ -98,11 +98,48 @@ export default {
 };
 
 async function runDueJobs(env) {
-  const nowMinute = Math.floor(Date.now() / 60000);
+  const startedAt = Date.now();
+  const nowMinute = Math.floor(startedAt / 60000);
   const startMinute = nowMinute - 5;
-  for (let minute = startMinute; minute <= nowMinute; minute++) {
-    await runDueMinute(env, minute);
+  const summary = {
+    ok: true,
+    startedAt,
+    finishedAt: 0,
+    startMinute,
+    endMinute: nowMinute,
+    buckets: 0,
+    jobsSeen: 0,
+    delivered: 0,
+    retry: 0,
+    failed: 0,
+    future: 0,
+    missing: 0,
+    error: ''
+  };
+  try {
+    for (let minute = startMinute; minute <= nowMinute; minute++) {
+      const row = await runDueMinute(env, minute);
+      summary.buckets += 1;
+      summary.jobsSeen += row.jobsSeen;
+      summary.delivered += row.delivered;
+      summary.retry += row.retry;
+      summary.failed += row.failed;
+      summary.future += row.future;
+      summary.missing += row.missing;
+    }
+  } catch (err) {
+    summary.ok = false;
+    summary.error = String(err?.message || err).slice(0, 180);
+    throw err;
+  } finally {
+    summary.finishedAt = Date.now();
+    await env.AL_TIMER_KV.put('meta:lastCron', JSON.stringify(summary), { expirationTtl: 3 * 24 * 60 * 60 });
   }
+}
+
+async function getLastCron(env) {
+  const raw = await env.AL_TIMER_KV.get('meta:lastCron');
+  return raw ? JSON.parse(raw) : null;
 }
 
 async function saveJob(job, env) {
@@ -177,29 +214,42 @@ async function jobStatus(jobId, deviceId, env) {
 async function runDueMinute(env, minute) {
   const bucketKey = `due:${minute}`;
   const raw = await env.AL_TIMER_KV.get(bucketKey);
-  if (!raw) return;
+  const stats = { jobsSeen: 0, delivered: 0, retry: 0, failed: 0, future: 0, missing: 0 };
+  if (!raw) return stats;
   const ids = JSON.parse(raw);
+  stats.jobsSeen = ids.length;
   const now = Date.now();
   const remaining = [];
   for (const jobId of ids) {
     const jobRaw = await env.AL_TIMER_KV.get(`job:${jobId}`);
-    if (!jobRaw) continue;
+    if (!jobRaw) {
+      stats.missing += 1;
+      continue;
+    }
     const job = JSON.parse(jobRaw);
-    if (!job.dueAt) continue;
+    if (!job.dueAt) {
+      stats.missing += 1;
+      continue;
+    }
     const dueAtMs = Date.parse(job.dueAt);
     if (dueAtMs > now) {
+      stats.future += 1;
       remaining.push(jobId);
       continue;
     }
     try {
       const delivered = await deliverJob(job, env);
       if (delivered.retry) {
+        stats.retry += 1;
         remaining.push(jobId);
       } else {
+        if (delivered.ok) stats.delivered += 1;
+        else stats.failed += 1;
         await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
       }
     } catch (err) {
       console.warn(`deliver failed for ${jobId}:`, err.message);
+      stats.failed += 1;
       remaining.push(jobId);
     }
   }
@@ -208,6 +258,7 @@ async function runDueMinute(env, minute) {
   } else {
     await env.AL_TIMER_KV.delete(bucketKey);
   }
+  return stats;
 }
 
 function minuteKey(ms) {

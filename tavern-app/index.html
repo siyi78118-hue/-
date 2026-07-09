@@ -950,8 +950,8 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.6';
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.3';
+const APP_BUILD_VERSION = '2026-07-09.7';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
@@ -3805,6 +3805,14 @@ function setCloudWorkerStatus(message) {
   DB.set('settings', settings);
   renderCloudTimerStatus();
 }
+function formatCloudCronStatus(cron) {
+  if (!cron?.finishedAt) return 'Cron：暂无执行记录';
+  const at = new Date(cron.finishedAt);
+  const ageMs = Date.now() - at.getTime();
+  const ageText = ageMs >= 0 ? `，距现在 ${formatElapsed(ageMs)}` : '';
+  const okText = cron.ok === false ? `异常${cron.error ? '：' + cron.error : ''}` : '正常';
+  return `Cron：${okText}，最近 ${formatFullTime(at)}${ageText}；扫桶 ${Number(cron.buckets) || 0}，任务 ${Number(cron.jobsSeen) || 0}，成功 ${Number(cron.delivered) || 0}，重试 ${Number(cron.retry) || 0}，失败 ${Number(cron.failed) || 0}`;
+}
 async function checkCloudTimerWorkerVersion({ silent = false } = {}) {
   if (!settings.timerEndpoint) return false;
   try {
@@ -3812,11 +3820,12 @@ async function checkCloudTimerWorkerVersion({ silent = false } = {}) {
     if (!resp.ok) throw new Error('health ' + resp.status);
     const json = await resp.json();
     const version = String(json.version || '');
+    const cronStatus = formatCloudCronStatus(json.cron);
     if (version !== EXPECTED_CLOUD_TIMER_VERSION) {
-      setCloudWorkerStatus(`当前 ${version || '未知'}，期望 ${EXPECTED_CLOUD_TIMER_VERSION}；请重新部署云端 Worker`);
+      setCloudWorkerStatus(`当前 ${version || '未知'}，期望 ${EXPECTED_CLOUD_TIMER_VERSION}；请重新部署云端 Worker\n${cronStatus}`);
       return false;
     }
-    if (!silent) setCloudWorkerStatus(`已同步 ${version}`);
+    if (!silent) setCloudWorkerStatus(`已同步 ${version}\n${cronStatus}`);
     return true;
   } catch (err) {
     setCloudWorkerStatus('检测失败：' + friendlyErrorMessage(err));
