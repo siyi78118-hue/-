@@ -389,8 +389,6 @@ button.profile-top{width:100%;text-align:left}
       <div class="wx-group">
         <button class="cell" onclick="openCreateRole()"><span class="wx-icon orange wx-new"></span><div class="cell-body">新的朋友</div></button>
         <button class="cell" onclick="openImport()"><span class="wx-icon green wx-groupchat"></span><div class="cell-body">角色卡</div></button>
-        <button class="cell" onclick="showScreen('tags')"><span class="wx-icon blue wx-tag"></span><div class="cell-body">标签</div></button>
-        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')"><span class="wx-icon purple wx-favorite"></span><div class="cell-body">记忆库</div></button>
       </div>
       <div class="list" id="contact-list"></div>
       <div class="contact-rail" id="contact-rail"></div>
@@ -428,17 +426,6 @@ button.profile-top{width:100%;text-align:left}
       <div class="contact-profile-actions">
         <button class="primary" onclick="messageProfileChar()">发消息</button>
       </div>
-    </div>
-  </div>
-
-  <div id="screen-tags" class="screen">
-    <div class="topbar">
-      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('contacts')">‹</button></div>
-      <div class="top-title">标签</div>
-      <div class="top-right"></div>
-    </div>
-    <div class="scroll" style="background:#ededed">
-      <div id="tag-list"></div>
     </div>
   </div>
 
@@ -557,7 +544,6 @@ button.profile-top{width:100%;text-align:left}
       <div class="action-grid">
         <button class="action-item" onclick="openPayScreen('transfer')"><span>转</span>转账</button>
         <button class="action-item" onclick="openPayScreen('redpacket')"><span>包</span>红包</button>
-        <button class="action-item" onclick="renderMemoryScreen();showScreen('memory')"><span>记</span>记忆库</button>
       </div>
     </div>
   </div>
@@ -608,6 +594,7 @@ button.profile-top{width:100%;text-align:left}
       <input type="file" id="modal-char-avatar-input" accept="image/*" style="display:none" onchange="handleModalCharAvatar(event)">
       <div class="cell-group">
         <button class="cell" onclick="openSearch('current-chat')" type="button"><div class="cell-body">查找聊天内容</div><div class="mini">›</div></button>
+        <button class="cell" onclick="renderMemoryScreen();showScreen('memory')" type="button"><div class="cell-body">记忆库</div><div class="mini">›</div></button>
         <button class="cell" onclick="toggleChatPinned()" type="button"><div class="cell-body">置顶聊天</div><span class="switch" id="chat-pinned-switch"></span></button>
         <button class="cell" onclick="toggleChatMuted()" type="button"><div class="cell-body">消息免打扰</div><span class="switch" id="chat-muted-switch"></span></button>
       </div>
@@ -986,7 +973,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.30';
+const APP_BUILD_VERSION = '2026-07-09.31';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1847,7 +1834,6 @@ function showScreen(name) {
   if (name === 'settings') loadSettings();
   if (name === 'memory') renderMemoryScreen();
   if (name === 'diagnostics') renderDiagnosticsScreen();
-  if (name === 'tags') renderTagsScreen();
   if (name === 'chat-info') renderChatInfo();
   if (name === 'contact-profile') renderContactProfile();
   if (name === 'wallet') renderWallet();
@@ -2241,37 +2227,6 @@ function renderContacts() {
         <div class="row-main"><div class="row-name">${esc(c.name)}</div><div class="row-preview">${esc(c.description || c.personality || '')}</div></div>
       </button>`).join('')}`
   ).join('');
-}
-function renderTagsScreen() {
-  const wrap = document.getElementById('tag-list');
-  if (!wrap) return;
-  const tagMap = new Map();
-  characters.forEach(char => {
-    (Array.isArray(char.tags) ? char.tags : [])
-      .map(tag => String(tag || '').trim())
-      .filter(Boolean)
-      .forEach(tag => {
-        if (!tagMap.has(tag)) tagMap.set(tag, []);
-        tagMap.get(tag).push(char);
-      });
-  });
-  if (!tagMap.size) {
-    wrap.innerHTML = '<div class="empty"><div class="empty-ico">#</div><div>暂无标签<br>导入的角色卡带有标签时会显示在这里</div></div>';
-    return;
-  }
-  wrap.innerHTML = [...tagMap.entries()]
-    .sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'))
-    .map(([tag, rows]) => `
-      <div class="section">${esc(tag)}</div>
-      <div class="list">${rows.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN')).map(char => `
-        <button class="row" onclick="openContactProfile('${char.id}')">
-          ${avatarHtml(char)}
-          <div class="row-main">
-            <div class="row-name">${esc(char.name || '未命名')}</div>
-            <div class="row-preview">${esc(char.description || char.personality || '点击查看资料')}</div>
-          </div>
-        </button>`).join('')}</div>
-    `).join('');
 }
 function renderMoments() {
   const list = document.getElementById('moment-list');
