@@ -141,8 +141,17 @@ async function runDueMinute(env, minute) {
       remaining.push(jobId);
       continue;
     }
-    await deliverJob(job, env);
-    await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
+    try {
+      const delivered = await deliverJob(job, env);
+      if (delivered.retry) {
+        remaining.push(jobId);
+      } else {
+        await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
+      }
+    } catch (err) {
+      console.warn(`deliver failed for ${jobId}:`, err.message);
+      remaining.push(jobId);
+    }
   }
   if (remaining.length) {
     await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(remaining), { expirationTtl: 3 * 24 * 60 * 60 });
@@ -157,10 +166,15 @@ function minuteKey(ms) {
 
 async function deliverJob(job, env) {
   const subRaw = await env.AL_TIMER_KV.get(`sub:${job.deviceId}`);
-  if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId };
+  if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
   const { subscription } = JSON.parse(subRaw);
-  await sendEmptyPush(subscription, env);
-  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test };
+  const result = await sendEmptyPush(subscription, env);
+  if (result.expired) {
+    await env.AL_TIMER_KV.delete(`sub:${job.deviceId}`);
+    return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: false };
+  }
+  if (!result.ok) return { ok: false, reason: result.reason || 'push failed', jobId: job.jobId, retry: true };
+  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false };
 }
 
 async function sendEmptyPush(subscription, env) {
@@ -176,9 +190,9 @@ async function sendEmptyPush(subscription, env) {
       Authorization: `vapid t=${jwt}, k=${env.VAPID_PUBLIC_KEY}`
     }
   });
-  if (!resp.ok && resp.status !== 404 && resp.status !== 410) {
-    throw new Error(`push failed ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
-  }
+  if (resp.status === 404 || resp.status === 410) return { ok: false, expired: true, status: resp.status };
+  if (!resp.ok) return { ok: false, status: resp.status, reason: `push failed ${resp.status}: ${(await resp.text()).slice(0, 120)}` };
+  return { ok: true, status: resp.status };
 }
 
 async function createVapidJWT(env, aud) {

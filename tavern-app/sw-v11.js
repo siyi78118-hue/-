@@ -147,6 +147,7 @@ async function recordModelCall(entry = {}) {
       systemChars: String(entry.system || '').length,
       messageCount: messages.length,
       memoryChars: Number(entry.memoryChars) || 0,
+      memoryStatus: compactLogText(entry.memoryStatus || '', 240),
       promptBlocks: promptBlocks.slice(0, 20).map(block => ({
         id: compactLogText(block.id || '', 80),
         priority: Number(block.priority) || 0,
@@ -187,6 +188,11 @@ function setStateCloudTimerTriggerAck(state, message) {
 function setMemoryQueryStatus(settings = {}, message) {
   settings.lastMemoryQueryStatus = message;
   settings.lastMemoryQueryAt = Date.now();
+}
+function memoryQuerySnapshot(settings = {}) {
+  return settings.lastMemoryQueryStatus
+    ? `${settings.lastMemoryQueryAt ? formatFullTime(new Date(settings.lastMemoryQueryAt)) + '｜' : ''}${settings.lastMemoryQueryStatus}`
+    : '';
 }
 
 function pad2(n) {
@@ -884,6 +890,7 @@ async function callModel(settings, system, messages, options = {}) {
     model: model || (apiType === 'claude' ? 'claude-sonnet-4-20250514' : 'gpt-4o'),
     charId: options.charId || '',
     memoryChars: options.memoryChars,
+    memoryStatus: options.memoryStatus || memoryQuerySnapshot(settings),
     promptBlocks: options.promptBlocks,
     system,
     messages,

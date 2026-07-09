@@ -6,6 +6,7 @@ const html = readFileSync('tavern-app/index.html', 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
 assert.ok(script, 'index.html should contain an inline app script');
 const swScript = readFileSync('tavern-app/sw-v11.js', 'utf8');
+const cloudTimerWorker = readFileSync('cloud-timer-worker.js', 'utf8');
 assert.match(swScript, /const CACHE_NAME = 'rpchat-v12';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
@@ -28,6 +29,12 @@ assert.match(script, /ensure\('meta', \[\['updatedAt', 'updatedAt'\]\]\)/);
 assert.match(script, /returnPromptDetails: true/);
 assert.match(swScript, /promptBlocks: prompt\.promptBlocks/);
 assert.match(script, /红包 24 小时未领取，已自动退回零钱/);
+const cloudTimerWorkerCode = cloudTimerWorker.replace(/\/\/.*$/gm, '');
+assert.doesNotMatch(cloudTimerWorkerCode, /\.list\s*\(/);
+assert.match(cloudTimerWorker, /const bucketKey = `due:\$\{minute\}`/);
+assert.match(cloudTimerWorker, /if \(delivered\.retry\)/);
+assert.match(cloudTimerWorker, /resp\.status === 404 \|\| resp\.status === 410/);
+assert.match(cloudTimerWorker, /delete\(`sub:\$\{job\.deviceId\}`\)/);
 
 const storage = new Map();
 const elements = new Map();
@@ -255,6 +262,7 @@ recordModelCall({
   system: '系统提示：不要保存 sk-secret123456',
   messages: [{ role: 'user', content: '你好' }],
   memoryChars: 12,
+  memoryStatus: '记忆AI已调用；关键词：红包；向量库召回 1 条。',
   promptBlocks: [{ id: 'memory-pack', priority: 30, chars: 42, preview: '红包约定' }],
   output: '在。'
 });
@@ -263,6 +271,7 @@ assert.equal(callLogs[0].scene, 'proactive-chat');
 assert.equal(callLogs[0].model, 'gpt-test');
 assert.equal(callLogs[0].messageCount, 1);
 assert.equal(callLogs[0].memoryChars, 12);
+assert.match(callLogs[0].memoryStatus, /记忆AI已调用/);
 assert.equal(callLogs[0].promptBlocks[0].id, 'memory-pack');
 assert.match(callLogs[0].systemPreview, /系统提示/);
 assert.doesNotMatch(callLogs[0].systemPreview, /sk-secret123456/);
@@ -274,6 +283,7 @@ assert.equal((await getAllModelCallLogs())[0].scene, 'proactive-chat');
 assert.match(formatModelCallStatus({ time: '2026-07-08 12:00', scene: 'memory-query', model: 'mem-test', empty: true, diagnostic: '空内容' }), /最近调用：2026-07-08 12:00｜memory-query｜mem-test｜空回复｜空内容/);
 const diagnosticText = formatModelCallDiagnostic(callLogs[0]);
 assert.match(diagnosticText, /scene=proactive-chat/);
+assert.match(diagnosticText, /memoryStatus=记忆AI已调用/);
 assert.match(diagnosticText, /promptBlocks=memory-pack@30:42/);
 assert.match(diagnosticText, /promptBlockDetails=[\s\S]*红包约定/);
 assert.doesNotMatch(diagnosticText, /sk-secret123456/);
