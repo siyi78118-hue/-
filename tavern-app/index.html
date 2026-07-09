@@ -733,7 +733,7 @@ button.profile-top{width:100%;text-align:left}
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
         </div>
         <div class="cell-group">
-          <button class="cell" onclick="exportBackup()" type="button"><div class="cell-label">备份</div><div class="cell-body">导出本机数据<span class="cell-note">含接口配置、聊天、朋友圈和记忆库</span></div><div class="mini">›</div></button>
+          <button class="cell" onclick="exportBackup()" type="button"><div class="cell-label">备份</div><div class="cell-body">导出本机数据<span class="cell-note">含 API Key、聊天、朋友圈和记忆库</span></div><div class="mini">›</div></button>
           <button class="cell" onclick="document.getElementById('backup-input').click()" type="button"><div class="cell-label">恢复</div><div class="cell-body">导入本机备份<span class="cell-note">覆盖当前本机数据</span></div><div class="mini">›</div></button>
           <input type="file" id="backup-input" accept="application/json,.json" style="display:none" onchange="importBackup(event)">
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
@@ -986,7 +986,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.25';
+const APP_BUILD_VERSION = '2026-07-09.26';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.6';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1225,6 +1225,7 @@ function backupFileName(date = new Date()) {
 }
 
 async function exportBackup() {
+  if (!confirm('备份文件会包含聊天接口、记忆接口、语音接口的地址和 API Key，以及聊天、朋友圈和本地记忆库。请只保存在自己的设备上。继续导出？')) return;
   try {
     await mirrorAppStateNow();
     const backup = {
@@ -1246,7 +1247,7 @@ async function exportBackup() {
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toast('已导出备份，请妥善保存，里面包含接口配置');
+    toast('已导出备份，请妥善保存，里面包含 API Key');
   } catch (err) {
     toast('导出失败：' + friendlyErrorMessage(err), 3200);
   }
