@@ -142,6 +142,9 @@ globalThis.__appTest = {
   buildMomentInteractionPayload,
   buildMomentPostPayload,
   buildMomentReplyPayload,
+  momentSeenNames,
+  renderMomentComment,
+  markMomentCommentSeen,
   buildMemoryQueryPayload,
   buildMemoryExtractPayload,
   generateMemoryQuery,
@@ -162,7 +165,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -257,6 +260,11 @@ assert.match(replyPayload.system, /只允许输出 JSON，不要输出解释：\
 assert.match(replyPayload.system, /记忆：玩家怕冷。/);
 assert.match(replyPayload.messages[0].content, /玩家刚评论：终于能出门了/);
 assert.ok(blockIds(replyPayload).includes('memory-pack'));
+vm.runInContext("characters = [{ id: 'char_seen', name: '林晚' }, { id: 'char_liked', name: '谢韫' }];", context);
+assert.equal(JSON.stringify(momentSeenNames({ authorType: 'player', notifiedCharIds: ['char_seen', 'char_liked'], likes: ['char_liked'], comments: [] })), JSON.stringify(['林晚']));
+const seenCommentMoment = { authorType: 'char', charId: 'char_seen', comments: [{ id: 'c1', charId: 'player', name: '玩家', text: '我来评论一下', seenBy: [] }] };
+assert.equal(markMomentCommentSeen(seenCommentMoment, 'c1', 'char_seen'), true);
+assert.match(renderMomentComment(seenCommentMoment.comments[0], seenCommentMoment), /已看过/);
 const memoryQueryPayload = buildMemoryQueryPayload(v2, '你还记得红包吗？', [{ role: 'user', content: '我给你发过红包', time: Date.now() }]);
 assert.match(memoryQueryPayload.system, /本地记忆检索 AI/);
 assert.match(memoryQueryPayload.system, /生成向量数据库召回用的检索查询/);

@@ -281,6 +281,8 @@ button.profile-top{width:100%;text-align:left}
 .moment-like-line,.moment-comment{padding:6px 8px;border-bottom:1px solid #e3e3e3}
 .moment-comment:last-child,.moment-like-line:last-child{border-bottom:none}
 .moment-comment b{color:#576b95;font-weight:600}
+.moment-seen{margin-left:6px;color:#9a9a9a;font-size:12px}
+.moment-seen-line{margin-top:6px;color:#9a9a9a;font-size:12px}
 .moment-compose{display:none;background:#fff;padding:12px 14px;border-bottom:1px solid var(--line2)}
 .moment-compose.show{display:block}
 .moment-compose textarea{width:100%;min-height:74px;border:none;outline:none;resize:none;font-size:16px;line-height:1.5}
@@ -2077,6 +2079,23 @@ function momentAuthor(moment) {
   const char = characters.find(c => c.id === moment.charId);
   return { name: charName(char), avatar: avatarHtml(char), char };
 }
+function momentSeenNames(moment) {
+  if (moment.authorType !== 'player') return [];
+  const interacted = new Set([...(moment.likes || []), ...(moment.comments || []).map(c => c.charId).filter(Boolean)]);
+  return [...new Set(moment.notifiedCharIds || [])]
+    .filter(id => id && !interacted.has(id))
+    .map(id => charName(characters.find(c => c.id === id)))
+    .filter(Boolean);
+}
+function renderMomentComment(comment, moment) {
+  const name = comment.name || charName(characters.find(ch => ch.id === comment.charId));
+  const seen = comment.charId === 'player'
+    && moment.authorType === 'char'
+    && (comment.seenBy || []).includes(moment.charId)
+      ? '<span class="moment-seen">已看过</span>'
+      : '';
+  return `<div class="moment-comment"><b>${esc(name)}</b>：${esc(comment.text || '')}${seen}</div>`;
+}
 function renderMomentItem(moment) {
   const author = momentAuthor(moment);
   const char = author.char;
@@ -2085,8 +2104,10 @@ function renderMomentItem(moment) {
   const comments = moment.comments || [];
   const reactions = (likes.length || comments.length) ? `<div class="moment-reactions">
     ${likes.length ? `<div class="moment-like-line">${likes.map(c => esc(c.name)).join('、')}</div>` : ''}
-    ${comments.map(c => `<div class="moment-comment"><b>${esc(c.name || charName(characters.find(ch => ch.id === c.charId)))}</b>：${esc(c.text || '')}</div>`).join('')}
+    ${comments.map(c => renderMomentComment(c, moment)).join('')}
   </div>` : '';
+  const seenNames = momentSeenNames(moment);
+  const seenLine = seenNames.length ? `<div class="moment-seen-line">${esc(seenNames.join('、'))}已看过</div>` : '';
   const authorClick = author.isPlayer ? "showScreen('self-profile')" : `openContactProfile('${moment.charId}')`;
   const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `replyToMoment('${moment.id}')`;
   return `<div class="moment">
@@ -2097,6 +2118,7 @@ function renderMomentItem(moment) {
       ${media}
       <div class="moment-foot"><span>${fmtTime(moment.time)}</span><button class="moment-action" onclick="${actionClick}" type="button">··</button></div>
       ${reactions}
+      ${seenLine}
     </div>
   </div>`;
 }
@@ -2125,6 +2147,12 @@ function materializeVirtualMoment(momentId) {
 function saveMoments() {
   DB.set('moments', allMoments);
   if (activeScreen === 'moments') renderMoments();
+}
+function markMomentCommentSeen(moment, commentId, charId) {
+  const comment = (moment?.comments || []).find(c => c.id === commentId);
+  if (!comment || !charId) return false;
+  comment.seenBy = [...new Set([...(comment.seenBy || []), charId])];
+  return true;
 }
 function momentSnippet(text, max = 90) {
   const value = String(text || '').replace(/\s+/g, ' ').trim();
@@ -2330,9 +2358,9 @@ async function replyToMoment(momentId) {
   const text = prompt('评论', '');
   const comment = String(text || '').replace(/\s+/g, ' ').trim();
   if (!comment) return;
-  moment.comments = [...(moment.comments || []), { charId: 'player', name: playerName(), text: comment.slice(0, 80), time: Date.now() }];
+  const commentItem = { id: uid('mcom'), charId: 'player', name: playerName(), text: comment.slice(0, 80), time: Date.now(), seenBy: [] };
+  moment.comments = [...(moment.comments || []), commentItem];
   recordMomentMemoryEvent(char.id, `${playerName()}评论了${char.name}的朋友圈：“${momentSnippet(comment, 70)}”`, Date.now());
-  recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`, Date.now());
   saveMoments();
   processMemoryAfterScenario(char.id);
   if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
@@ -2342,6 +2370,8 @@ async function replyToMoment(momentId) {
   toast('正在等待回复...', 1200);
   try {
     const reply = await callMomentReplyAI(char, moment, comment);
+    markMomentCommentSeen(moment, commentItem.id, char.id);
+    recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`, Date.now());
     const clean = momentSnippet(reply, 80);
     if (clean && !isEmptyReplyText(clean)) {
       moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: clean, time: Date.now() }];
