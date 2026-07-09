@@ -950,7 +950,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.7';
+const APP_BUILD_VERSION = '2026-07-09.8';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -3840,7 +3840,8 @@ async function manualCheckCloudTimerVersion() {
     return false;
   }
   const ok = await checkCloudTimerWorkerVersion();
-  toast(ok ? '云端版本已同步' : '云端版本未同步，请检查部署', ok ? 1600 : 2800);
+  if (ok) await verifyCurrentCloudJobs();
+  toast(ok ? '云端状态已检查' : '云端版本未同步，请检查部署', ok ? 1800 : 2800);
   return ok;
 }
 function setCloudTimerTestAck(message) {
@@ -4100,6 +4101,26 @@ async function verifyCloudJobStatus(charId, job, kind = 'chat') {
   setCloudTimerTrace(kind, cloudTraceId(kind), details);
   if (!ok) setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}云端任务异常：${details}`, true, kind);
   return ok;
+}
+async function verifyCurrentCloudJobs() {
+  const latest = getLatestChatRows()[0];
+  const chat = latest?.chat;
+  if (!chat) {
+    setCloudTimerStatus('当前没有可核验的云端任务。');
+    return false;
+  }
+  const checks = [];
+  for (const kind of PROACTIVE_JOB_KINDS) {
+    const job = chat[proactiveJobKey(kind)];
+    if (job?.jobId) {
+      checks.push(verifyCloudJobStatus(latest.char.id, job, kind));
+    } else {
+      setCloudTimerTrace(kind, cloudTraceId(kind), '当前本地没有待核验的云端任务');
+    }
+  }
+  if (!checks.length) return false;
+  await Promise.allSettled(checks);
+  return true;
 }
 async function testCloudTimerPush() {
   saveSettings({ silent: true });
