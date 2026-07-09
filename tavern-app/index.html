@@ -963,7 +963,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.13';
+const APP_BUILD_VERSION = '2026-07-09.14';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.4';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -2366,22 +2366,38 @@ async function submitPlayerMoment() {
 function hasMomentInteraction(moment, charId) {
   return (moment.likes || []).includes(charId) || (moment.comments || []).some(c => c.charId === charId);
 }
+function markMomentNotifiedToChar(moment, char) {
+  if (!moment || !char?.id) return false;
+  const hadSeen = (moment.notifiedCharIds || []).includes(char.id);
+  moment.notifiedCharIds = [...new Set([...(moment.notifiedCharIds || []), char.id])];
+  if (!hadSeen) {
+    recordMomentMemoryEvent(char.id, `${playerName()}发布了朋友圈：“${momentSnippet(moment.text)}”；${char.name}看到了这条朋友圈。`, moment.time || Date.now());
+  }
+  return !hadSeen;
+}
 async function notifyMomentToCharacters(momentId, manual = false) {
   const moment = allMoments.find(m => m.id === momentId);
   if (!moment || moment.authorType !== 'player') return;
   if (!characters.length) { if (manual) toast('暂无角色可以通知'); return; }
+  const unseenTargets = characters.filter(char => !(moment.notifiedCharIds || []).includes(char.id));
   if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
-    if (manual) toast('已发表，配置聊天接口后角色才能互动');
+    for (const char of unseenTargets) {
+      if (markMomentNotifiedToChar(moment, char)) processMemoryAfterScenario(char.id);
+    }
+    saveMoments();
+    if (manual) toast('角色已看过，配置聊天接口后才能判断是否点赞或回复');
     return;
   }
   const targets = characters.filter(char => !hasMomentInteraction(moment, char.id) && !(moment.notifiedCharIds || []).includes(char.id));
   if (!targets.length) { if (manual) toast('角色已经看过这条动态'); return; }
   if (manual) toast('正在通知角色...', 1200);
   for (const char of targets) {
+    markMomentNotifiedToChar(moment, char);
+    saveMoments();
+    processMemoryAfterScenario(char.id);
     try {
       const result = await callMomentInteractionAI(char, moment);
-      moment.notifiedCharIds = [...new Set([...(moment.notifiedCharIds || []), char.id])];
-      recordMomentMemoryEvent(char.id, `${playerName()}发布了朋友圈：“${momentSnippet(moment.text)}”；${char.name}收到了这条朋友圈通知。`, moment.time || Date.now());
+      if (moment.notifyFailures) delete moment.notifyFailures[char.id];
       if (result.like) moment.likes = [...new Set([...(moment.likes || []), char.id])];
       const comment = String(result.comment || '').replace(/\s+/g, ' ').trim();
       if (comment) {
@@ -2394,6 +2410,10 @@ async function notifyMomentToCharacters(momentId, manual = false) {
       saveMoments();
       processMemoryAfterScenario(char.id);
     } catch (err) {
+      moment.notifyFailures = { ...(moment.notifyFailures || {}), [char.id]: friendlyErrorMessage(err) };
+      recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}的朋友圈，但本次点赞/评论判断失败：${friendlyErrorMessage(err)}`, Date.now());
+      saveMoments();
+      processMemoryAfterScenario(char.id);
       console.warn('[AL Moments] character skipped:', char.name, err.message);
     }
   }

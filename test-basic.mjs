@@ -11,10 +11,10 @@ const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
 const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v27';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v28';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.13';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-09\.14';/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.4';/);
 assert.match(script, /sw-v11\.js\?alarm-stream=1&v=\$\{APP_BUILD_VERSION\}/);
 assert.match(script, /\.then\(reg => reg\.update\?\.\(\)\)/);
@@ -114,7 +114,10 @@ assert.match(script, /function openMomentReplyBar\(momentId\)/);
 assert.match(script, /async function submitMomentReply\(\)/);
 assert.match(script, /openMomentReplyBar\('\$\{moment\.id\}'\)/);
 assert.match(script, /没有在评论区回复/);
+assert.match(script, /function markMomentNotifiedToChar\(moment, char\)/);
+assert.match(script, /markMomentNotifiedToChar\(moment, char\);\s*saveMoments\(\);\s*processMemoryAfterScenario\(char\.id\);/);
 assert.match(script, /角色已看过，配置聊天接口后才能判断是否回复/);
+assert.match(script, /角色已看过，配置聊天接口后才能判断是否点赞或回复/);
 assert.match(script, /回复失败，但角色已看过/);
 assert.match(script, /function cleanAssistantChatReply\(text\)/);
 assert.match(swScript, /function cleanAssistantChatReply\(text\)/);
@@ -231,6 +234,7 @@ globalThis.__appTest = {
   momentSeenNames,
   renderMomentComment,
   markMomentCommentSeen,
+  markMomentNotifiedToChar,
   buildMemoryQueryPayload,
   buildMemoryExtractPayload,
   generateMemoryQuery,
@@ -252,7 +256,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, normalizeChar, normalizePresetKey, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -352,6 +356,10 @@ assert.equal(JSON.stringify(momentSeenNames({ authorType: 'player', notifiedChar
 const seenCommentMoment = { authorType: 'char', charId: 'char_seen', comments: [{ id: 'c1', charId: 'player', name: '玩家', text: '我来评论一下', seenBy: [] }] };
 assert.equal(markMomentCommentSeen(seenCommentMoment, 'c1', 'char_seen'), true);
 assert.match(renderMomentComment(seenCommentMoment.comments[0], seenCommentMoment), /已看过/);
+const playerPostSeen = { authorType: 'player', text: '今天不想说话。', notifiedCharIds: [], likes: [], comments: [], time: Date.now() };
+assert.equal(markMomentNotifiedToChar(playerPostSeen, { id: 'char_seen', name: '林晚' }), true);
+assert.equal(JSON.stringify(playerPostSeen.notifiedCharIds), JSON.stringify(['char_seen']));
+assert.match(JSON.parse(storage.get('rpchat_chats')).char_seen.messages.at(-1).content, /林晚看到了这条朋友圈/);
 const memoryQueryPayload = buildMemoryQueryPayload(v2, '你还记得红包吗？', [{ role: 'user', content: '我给你发过红包', time: Date.now() }]);
 assert.match(memoryQueryPayload.system, /本地记忆检索 AI/);
 assert.match(memoryQueryPayload.system, /生成向量数据库召回用的检索查询/);
