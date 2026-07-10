@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v77';
+const CACHE_NAME = 'rpchat-v78';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -751,6 +751,21 @@ function charName(char) {
   return char?.name || '对方';
 }
 
+function stripStagePersonaBlock(prompt = '') {
+  return String(prompt || '').replace(/\s*<al_current_stage_persona>[\s\S]*?<\/al_current_stage_persona>\s*/g, '\n\n').trim();
+}
+
+function backgroundStagePersonaBlock(char, settings = {}) {
+  const config = char?.stagePersona;
+  if (!config || config.enabled === false || !Array.isArray(config.stages)) return '';
+  const stage = config.stages.find(item => item?.id === config.currentStage) || config.stages[0];
+  if (!stage?.content) return '';
+  const content = String(stage.content)
+    .replaceAll('{{char}}', charName(char))
+    .replaceAll('{{player}}', playerName(settings));
+  return `<al_current_stage_persona>\n当前关系阶段：${stage.label || stage.id}\n以下仅为当前阶段生效的人设补充，优先于初始关系描述中已经过时的亲疏程度，但不得改变角色的核心身份、经历、雷点和稳定性格。\n${content}\n</al_current_stage_persona>`;
+}
+
 function formatMoney(value) {
   return '¥' + (Math.round((Number(value) || 0) * 100) / 100).toFixed(2);
 }
@@ -1320,7 +1335,8 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '', scen
 function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext, triggerMode = 'planned') {
   const composer = createPromptComposer('proactive-chat');
   const normalizedTriggerMode = normalizeProactiveTriggerMode(triggerMode);
-  composer.add('char-prompt', chat.charPrompt || `当前你要扮演的角色：${charName(char)}`, { priority: 0 });
+  composer.add('char-prompt', stripStagePersonaBlock(chat.charPrompt || `当前你要扮演的角色：${charName(char)}`), { priority: 0 });
+  composer.add('stage-persona', backgroundStagePersonaBlock(char, settings), { priority: 5 });
   composer.add('time-context', '当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow), { priority: 10 });
   composer.add('memory-pack', memoryPack, { priority: 20 });
   const pendingPayment = latestPendingPayment(chat);
@@ -1347,7 +1363,8 @@ function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, pr
 
 function buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext = '') {
   const composer = createPromptComposer('moment-post');
-  composer.add('char-prompt', chat.charPrompt || `当前你要扮演的角色：${charName(char)}`, { priority: 0 });
+  composer.add('char-prompt', stripStagePersonaBlock(chat.charPrompt || `当前你要扮演的角色：${charName(char)}`), { priority: 0 });
+  composer.add('stage-persona', backgroundStagePersonaBlock(char, settings), { priority: 5 });
   composer.add('time-context', '当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow), { priority: 10 });
   composer.add('memory-pack', memoryPack, { priority: 20 });
   composer.add('moment-context', momentContext, { priority: 30 });

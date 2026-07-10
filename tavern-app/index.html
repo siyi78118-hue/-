@@ -183,6 +183,13 @@ button{border:none;background:none;cursor:pointer}
 .memory-item .cell-label{padding-top:3px}
 .memory-actions{display:flex;gap:8px;margin-top:8px}
 .memory-actions .inline-btn{height:30px;padding:0 10px}
+.stage-current{font-size:16px;font-weight:600;color:#111}
+.stage-meta{margin-top:5px;color:#888;font-size:12px;line-height:1.5}
+.stage-editor-text{min-height:220px}
+.stage-history-item{padding:11px 14px;background:#fff;border-bottom:1px solid var(--line2)}
+.stage-history-item:last-child{border-bottom:none}
+.stage-history-title{font-size:14px;color:#222;line-height:1.45}
+.stage-history-meta{margin-top:4px;color:#999;font-size:12px;line-height:1.45}
 .file-zone{height:150px;margin:0 0 12px;border:1px dashed #c7d8cc;border-radius:8px;background:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#666;box-shadow:0 1px 0 rgba(0,0,0,.04)}
 .file-zone:active{background:#f7f7f7}
 .file-zone .big{font-size:34px}
@@ -461,10 +468,36 @@ button.cell:active{background:#ececec}
         <div class="cell"><div class="cell-label">人物设定</div><div class="cell-body profile-detail-text" id="profile-char-desc"></div></div>
         <div class="cell"><div class="cell-label">说话方式</div><div class="cell-body profile-detail-text" id="profile-char-style"></div></div>
         <div class="cell"><div class="cell-label">关系</div><div class="cell-body profile-detail-text" id="profile-char-more"></div></div>
+        <button class="cell" onclick="openStagePersonas(profileCharId, 'contact-profile')" type="button"><div class="cell-label">关系阶段</div><div class="cell-body profile-detail-text" id="profile-char-stage"></div><div class="mini">›</div></button>
       </div>
       <div class="contact-profile-actions">
         <button class="primary" onclick="messageProfileChar()">发消息</button>
       </div>
+    </div>
+  </div>
+
+  <div id="screen-stage-personas" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="closeStagePersonas()">‹</button></div>
+      <div class="top-title">阶段人设</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll" style="background:#ededed">
+      <div class="contact-index">当前关系</div>
+      <div class="cell-group">
+        <div class="cell"><div class="cell-label">角色</div><div class="cell-body" id="stage-char-name"></div></div>
+        <div class="cell"><div class="cell-label">当前阶段</div><div class="cell-body"><select class="select" id="stage-current-select"></select></div></div>
+        <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="stage-current" id="stage-current-label"></div><div class="stage-meta" id="stage-current-meta"></div></div></div>
+      </div>
+      <div class="contact-index">阶段世界书</div>
+      <div class="cell-group">
+        <div class="cell"><div class="cell-label">编辑阶段</div><div class="cell-body"><select class="select" id="stage-edit-select" onchange="switchStagePersonaEditor(this.value)"></select></div></div>
+        <div class="cell"><div class="cell-body"><textarea class="textarea stage-editor-text" id="stage-persona-content"></textarea></div></div>
+      </div>
+      <button class="primary" onclick="saveStagePersonas()">保存</button>
+      <button class="secondary" id="stage-rollback-btn" onclick="rollbackStagePersona()" type="button">撤销上次阶段切换</button>
+      <div class="contact-index">变化记录</div>
+      <div id="stage-history-list"></div>
     </div>
   </div>
 
@@ -628,6 +661,7 @@ button.cell:active{background:#ececec}
       <div class="cell-group">
         <button class="cell" onclick="openSearch('current-chat')" type="button"><div class="cell-body">查找聊天内容</div><div class="mini">›</div></button>
         <button class="cell" onclick="openMemory('chat-info')" type="button"><div class="cell-body">记忆库</div><div class="mini">›</div></button>
+        <button class="cell" onclick="openStagePersonas(currentCharId, 'chat-info')" type="button"><div class="cell-body">阶段人设</div><div class="mini" id="chat-stage-label">初识 ›</div></button>
         <button class="cell" onclick="toggleChatPinned()" type="button"><div class="cell-body">置顶聊天</div><span class="switch" id="chat-pinned-switch"></span></button>
         <button class="cell" onclick="toggleChatMuted()" type="button"><div class="cell-body">消息免打扰</div><span class="switch" id="chat-muted-switch"></span></button>
       </div>
@@ -1048,7 +1082,7 @@ const RP_PRESETS = {
   },
   custom: {
     label: '自定义',
-    desc: '只使用你在全局预设里填写的内容。',
+    desc: '完整保留 AL 综合 RP 规则，并追加你在全局预设里填写的内容。',
     prompt: ''
   }
 };
@@ -1103,7 +1137,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.63';
+const APP_BUILD_VERSION = '2026-07-10.64';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-10.9';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1195,6 +1229,10 @@ let memoryReturnScreen = 'settings';
 let memoryTargetCharId = '';
 let memoryEditorState = { storeName: 'profiles', id: '', lastStoreName: 'profiles' };
 let memoryFilterText = '';
+let stagePersonaReturnScreen = 'chat-info';
+let stagePersonaTargetCharId = '';
+let stagePersonaEditorDraft = null;
+let stagePersonaEditorStageId = 'new';
 let plusOpen = false;
 let activeScreen = 'chats';
 let proactiveTimer = null;
@@ -1484,9 +1522,102 @@ async function restoreAppStateFromMirror() {
   return true;
 }
 
+const RELATIONSHIP_STAGE_DEFS = [
+  { id: 'new', label: '初识' },
+  { id: 'acquainted', label: '认识' },
+  { id: 'familiar', label: '熟悉' },
+  { id: 'close', label: '亲近' },
+  { id: 'committed', label: '关系确立' }
+];
+function defaultStagePersonaContent(stageId) {
+  const rows = {
+    new: `当前是初识阶段。{{char}}只把{{player}}视为刚认识的人，保持正常社交边界，不默认信任、暧昧或亲密。可以因为好奇继续聊天，但不主动交代大量隐私，也不接受越级称呼和关系。
+正例：对方突然亲昵称呼时，可以自然纠正、反问或岔开，同时保留继续聊天的余地。
+反例：刚加好友就主动撒娇、吃醋、查岗、表白，或把所有话题都冷淡堵死。`,
+    acquainted: `当前是认识阶段。{{char}}已经确认{{player}}不是一次性路人，愿意维持联系，对常见话题更自然，也会记住部分细节；仍保留私人边界，不把普通友好直接解释成暧昧。
+正例：可以偶尔追问近况、接住旧话题，或对前后不一致的细节进行轻微调侃。
+反例：仍像第一次聊天般处处客套，或因为一次关心就突然产生强烈依赖。`,
+    familiar: `当前是熟悉阶段。双方已经形成较稳定的聊天习惯。{{char}}可以更随意、更主动地分享日常，称呼和玩笑更自然，也更愿意表达关心与不满；核心性格和边界仍然保持。
+正例：注意到{{player}}反常时会主动问一句，也可以自然提起共同经历和内部玩笑。
+反例：把熟悉直接等同恋爱，擅自宣布占有关系，或者完全丢掉初始性格变成通用温柔陪伴者。`,
+    close: `当前是亲近阶段。{{char}}已经把{{player}}放在明显重要的位置，允许更深的情绪交流、依赖、试探或暧昧，但正式关系仍以双方明确表达为准。对疏远和失约会更敏感，表达方式必须符合角色本人的性格。
+正例：可以承认想念、介意或担心，也可以试探未来安排，但保留角色自己的节奏。
+反例：没有双方确认就默认恋人身份，机械吃醋、过度查岗，或每句话都围绕感情。`,
+    committed: `当前是关系确立阶段。双方已经明确确认了稳定关系，{{char}}可以自然使用双方认可的称呼，把{{player}}纳入日常安排和长期考虑，在关心、亲密、争执与和好时表现出已有共同经历的连续性。
+正例：亲密表达不再每次都试探，遇到问题优先基于双方既有约定沟通。
+反例：关系确立后失去独立人格、无条件顺从，或每轮都重复宣示爱意和归属。`
+  };
+  return rows[stageId] || rows.new;
+}
+function createDefaultStagePersonaConfig(char = {}) {
+  const now = Number(char.createdAt) || Date.now();
+  return {
+    version: 1,
+    enabled: true,
+    currentStage: 'new',
+    stages: RELATIONSHIP_STAGE_DEFS.map(def => ({ ...def, content: defaultStagePersonaContent(def.id) })),
+    state: {
+      since: now,
+      reason: '角色创建时的初始关系',
+      confidence: 1,
+      evidenceMessageIds: []
+    },
+    history: []
+  };
+}
+function normalizeStagePersonaConfig(char = {}) {
+  const source = char.stagePersona && typeof char.stagePersona === 'object' ? char.stagePersona : createDefaultStagePersonaConfig(char);
+  const sourceStages = Array.isArray(source.stages) ? source.stages : [];
+  const stages = RELATIONSHIP_STAGE_DEFS.map(def => {
+    const existing = sourceStages.find(item => item?.id === def.id) || source.stages?.[def.id];
+    return {
+      id: def.id,
+      label: String(existing?.label || def.label),
+      content: String(existing?.content || defaultStagePersonaContent(def.id)).trim()
+    };
+  });
+  const validIds = new Set(stages.map(stage => stage.id));
+  const currentStage = validIds.has(source.currentStage) ? source.currentStage : 'new';
+  char.stagePersona = {
+    version: 1,
+    enabled: source.enabled !== false,
+    currentStage,
+    stages,
+    state: {
+      since: Number(source.state?.since) || Number(char.createdAt) || Date.now(),
+      reason: String(source.state?.reason || '角色创建时的初始关系'),
+      confidence: Math.max(0, Math.min(1, Number(source.state?.confidence) || 1)),
+      evidenceMessageIds: Array.isArray(source.state?.evidenceMessageIds) ? source.state.evidenceMessageIds.filter(Boolean).slice(-12) : []
+    },
+    history: Array.isArray(source.history) ? source.history.slice(-30) : []
+  };
+  return char.stagePersona;
+}
+function stagePersonaFor(char, stageId = '') {
+  const config = normalizeStagePersonaConfig(char || {});
+  return config.stages.find(stage => stage.id === (stageId || config.currentStage)) || config.stages[0];
+}
+function currentStagePersonaBlock(char) {
+  if (!char) return '';
+  const config = normalizeStagePersonaConfig(char);
+  if (!config.enabled) return '';
+  const stage = stagePersonaFor(char);
+  const content = String(stage.content || '')
+    .replaceAll('{{char}}', charName(char))
+    .replaceAll('{{player}}', playerName());
+  return `<al_current_stage_persona>\n当前关系阶段：${stage.label}\n以下仅为当前阶段生效的人设补充，优先于初始关系描述中已经过时的亲疏程度，但不得改变角色的核心身份、经历、雷点和稳定性格。\n${content}\n</al_current_stage_persona>`;
+}
+function stripStagePersonaBlock(prompt = '') {
+  return String(prompt || '').replace(/\s*<al_current_stage_persona>[\s\S]*?<\/al_current_stage_persona>\s*/g, '\n\n').trim();
+}
+function stageLabel(char, stageId = '') {
+  return stagePersonaFor(char, stageId)?.label || '初识';
+}
 function normalizeChar(c, i = 0) {
   if (!c.id) c.id = 'char_' + Date.now() + '_' + i;
   if (!c.avatar && !c.avatarData) c.avatar = c.name?.slice(0, 1) || 'R';
+  if (!c.createdAt) c.createdAt = Date.now();
+  normalizeStagePersonaConfig(c);
   return c;
 }
 function isEmptyReplyText(text) {
@@ -2129,6 +2260,7 @@ function showScreen(name) {
   if (name === 'moments') renderMoments();
   if (name === 'settings') loadSettings();
   if (name === 'memory') renderMemoryScreen();
+  if (name === 'stage-personas') renderStagePersonaScreen();
   if (name === 'diagnostics') renderDiagnosticsScreen();
   if (name === 'chat-info') renderChatInfo();
   if (name === 'contact-profile') renderContactProfile();
@@ -2286,6 +2418,8 @@ function renderChatInfo() {
   const extraPrompt = document.getElementById('modal-extra-prompt');
   if (charPrompt && document.activeElement !== charPrompt) charPrompt.value = chat.charPrompt || '';
   if (extraPrompt && document.activeElement !== extraPrompt) extraPrompt.value = chat.extraPrompt || '';
+  const chatStageLabel = document.getElementById('chat-stage-label');
+  if (chatStageLabel) chatStageLabel.textContent = `${stageLabel(char)} ›`;
   document.getElementById('chat-pinned-switch')?.classList.toggle('on', !!chat.pinned);
   document.getElementById('chat-muted-switch')?.classList.toggle('on', !!chat.muted);
   renderPlayerProfile();
@@ -2327,12 +2461,133 @@ function renderContactProfile() {
   const desc = document.getElementById('profile-char-desc');
   const style = document.getElementById('profile-char-style');
   const more = document.getElementById('profile-char-more');
+  const stage = document.getElementById('profile-char-stage');
   if (name) name.textContent = char.name || '未命名';
   if (id) id.textContent = `AL ID：${char.id || 'local-role'}`;
   if (tags) tags.textContent = Array.isArray(char.tags) && char.tags.length ? char.tags.join('、') : '未设置';
   if (desc) desc.textContent = char.description || '暂无人物设定';
   if (style) style.textContent = char.personality || '暂无说话方式';
   if (more) more.textContent = char.scenario || char.creatorNotes || '暂无关系设定';
+  if (stage) stage.textContent = stageLabel(char);
+}
+function cloneStagePersonaConfig(char) {
+  return JSON.parse(JSON.stringify(normalizeStagePersonaConfig(char)));
+}
+function openStagePersonas(charId, returnScreen = activeScreen) {
+  const char = characters.find(c => c.id === charId);
+  if (!char) return;
+  stagePersonaTargetCharId = charId;
+  stagePersonaReturnScreen = returnScreen && returnScreen !== 'stage-personas' ? returnScreen : 'chat-info';
+  stagePersonaEditorDraft = cloneStagePersonaConfig(char);
+  stagePersonaEditorStageId = stagePersonaEditorDraft.currentStage || 'new';
+  showScreen('stage-personas');
+}
+function closeStagePersonas() {
+  stagePersonaEditorDraft = null;
+  showScreen(stagePersonaReturnScreen || 'chat-info');
+}
+function storeVisibleStagePersonaDraft() {
+  if (!stagePersonaEditorDraft) return;
+  const textarea = document.getElementById('stage-persona-content');
+  const stage = stagePersonaEditorDraft.stages.find(item => item.id === stagePersonaEditorStageId);
+  if (textarea && stage) stage.content = textarea.value.trim();
+}
+function switchStagePersonaEditor(stageId) {
+  storeVisibleStagePersonaDraft();
+  if (!stagePersonaEditorDraft?.stages.some(stage => stage.id === stageId)) return;
+  stagePersonaEditorStageId = stageId;
+  renderStagePersonaEditorContent();
+}
+function previewCurrentStageSelection(stageId) {
+  if (!stagePersonaEditorDraft?.stages.some(stage => stage.id === stageId)) return;
+  stagePersonaEditorDraft.currentStage = stageId;
+  const label = document.getElementById('stage-current-label');
+  if (label) label.textContent = stagePersonaEditorDraft.stages.find(stage => stage.id === stageId)?.label || stageId;
+}
+function renderStagePersonaEditorContent() {
+  const select = document.getElementById('stage-edit-select');
+  const textarea = document.getElementById('stage-persona-content');
+  if (!stagePersonaEditorDraft || !select || !textarea) return;
+  select.value = stagePersonaEditorStageId;
+  textarea.value = stagePersonaEditorDraft.stages.find(stage => stage.id === stagePersonaEditorStageId)?.content || '';
+}
+function renderStagePersonaScreen() {
+  const char = characters.find(c => c.id === stagePersonaTargetCharId);
+  if (!char) return;
+  if (!stagePersonaEditorDraft) stagePersonaEditorDraft = cloneStagePersonaConfig(char);
+  const draft = stagePersonaEditorDraft;
+  const options = draft.stages.map(stage => `<option value="${esc(stage.id)}">${esc(stage.label)}</option>`).join('');
+  const currentSelect = document.getElementById('stage-current-select');
+  const editSelect = document.getElementById('stage-edit-select');
+  if (currentSelect) {
+    currentSelect.innerHTML = options;
+    currentSelect.value = draft.currentStage;
+    currentSelect.onchange = () => previewCurrentStageSelection(currentSelect.value);
+  }
+  if (editSelect) editSelect.innerHTML = options;
+  const current = draft.stages.find(stage => stage.id === draft.currentStage) || draft.stages[0];
+  document.getElementById('stage-char-name').textContent = char.name || '角色';
+  document.getElementById('stage-current-label').textContent = current?.label || '初识';
+  const since = draft.state?.since ? formatFullTime(new Date(draft.state.since)) : '时间未知';
+  document.getElementById('stage-current-meta').textContent = `${since}｜${draft.state?.reason || '暂无变化原因'}`;
+  renderStagePersonaEditorContent();
+  const history = document.getElementById('stage-history-list');
+  const rows = (draft.history || []).slice().reverse();
+  history.innerHTML = rows.length ? rows.map(item => `<div class="stage-history-item">
+    <div class="stage-history-title">${esc(stageLabel(char, item.from))} → ${esc(stageLabel(char, item.to))}</div>
+    <div class="stage-history-meta">${esc(item.at ? formatFullTime(new Date(item.at)) : '时间未知')}｜${esc(item.reason || '未填写原因')}</div>
+  </div>`).join('') : '<div class="empty" style="padding:30px 20px">暂无阶段变化</div>';
+  const rollback = document.getElementById('stage-rollback-btn');
+  if (rollback) rollback.disabled = !rows.length;
+}
+function commitStagePersonaConfig(char, nextConfig, changeReason = '') {
+  const oldPrompt = buildCharPrompt(char);
+  const oldStage = normalizeStagePersonaConfig(char).currentStage;
+  char.stagePersona = nextConfig;
+  const normalized = normalizeStagePersonaConfig(char);
+  const nextStage = normalized.currentStage;
+  if (oldStage !== nextStage) {
+    normalized.history.push({
+      from: oldStage,
+      to: nextStage,
+      at: Date.now(),
+      reason: changeReason || '玩家手动调整关系阶段',
+      evidenceMessageIds: [],
+      source: 'manual'
+    });
+    normalized.history = normalized.history.slice(-30);
+    normalized.state = { since: Date.now(), reason: changeReason || '玩家手动调整关系阶段', confidence: 1, evidenceMessageIds: [] };
+  }
+  refreshStoredCharacterPrompt(char, oldPrompt);
+  DB.set('characters', characters);
+  DB.set('chats', allChats);
+}
+function saveStagePersonas() {
+  const char = characters.find(c => c.id === stagePersonaTargetCharId);
+  if (!char || !stagePersonaEditorDraft) return;
+  storeVisibleStagePersonaDraft();
+  const selected = document.getElementById('stage-current-select')?.value;
+  if (selected) stagePersonaEditorDraft.currentStage = selected;
+  commitStagePersonaConfig(char, stagePersonaEditorDraft);
+  stagePersonaEditorDraft = cloneStagePersonaConfig(char);
+  renderContactProfile();
+  renderChatInfo();
+  toast('阶段人设已保存');
+  closeStagePersonas();
+}
+function rollbackStagePersona() {
+  if (!stagePersonaEditorDraft?.history?.length) return;
+  storeVisibleStagePersonaDraft();
+  const last = stagePersonaEditorDraft.history.pop();
+  stagePersonaEditorDraft.currentStage = last.from;
+  stagePersonaEditorDraft.state = {
+    since: Date.now(),
+    reason: `撤销：${last.reason || '上次阶段切换'}`,
+    confidence: 1,
+    evidenceMessageIds: []
+  };
+  renderStagePersonaScreen();
+  toast('已回退，保存后生效');
 }
 function messageProfileChar() {
   if (!profileCharId) return;
@@ -3310,7 +3565,8 @@ function openChat(charId) {
 }
 function buildCharPrompt(char) {
   let prompt = '';
-  const preset = RP_PRESETS[normalizePresetKey(settings.rpPreset)] || RP_PRESETS.combined;
+  // 完整 RP 规则是所有场景的固定底座；自定义内容只能追加，不能替换或裁剪它。
+  const preset = RP_PRESETS.combined;
   if (preset.prompt) prompt += preset.prompt + '\n\n';
   if (char.systemPrompt) prompt += `角色卡系统提示：\n${char.systemPrompt}\n\n`;
   prompt += `玩家昵称：${playerName()}\n`;
@@ -3319,10 +3575,24 @@ function buildCharPrompt(char) {
   if (char.description) prompt += `角色设定：${char.description}\n`;
   if (char.personality) prompt += `说话方式与性格：${char.personality}\n`;
   if (char.scenario) prompt += `关系与相处设定：${char.scenario}\n`;
+  const stagePersona = currentStagePersonaBlock(char);
+  if (stagePersona) prompt += `\n${stagePersona}\n`;
   if (char.firstMessage) prompt += `开场白参考：${char.firstMessage}\n`;
   if (char.mesExample) prompt += `\n对话示例：\n${char.mesExample}\n`;
   if (char.postHistoryInstructions) prompt += `\n${char.postHistoryInstructions}`;
   return prompt.trim();
+}
+function isGeneratedCharacterPrompt(prompt = '', char = null) {
+  const value = String(prompt || '');
+  if (!value.trim()) return true;
+  return value.includes('最高优先级：只输出聊天消息本身') && value.includes(`当前你要扮演的角色：${charName(char)}`);
+}
+function refreshStoredCharacterPrompt(char, oldPrompt = '') {
+  const chat = allChats[char?.id];
+  if (!chat || !char) return;
+  if (!chat.charPrompt || chat.charPrompt === oldPrompt || isGeneratedCharacterPrompt(chat.charPrompt, char)) {
+    chat.charPrompt = buildCharPrompt(char);
+  }
 }
 function aiNoNarrationRules(char) {
   return [
@@ -3403,7 +3673,8 @@ function buildChatSceneSystem(char, chat, options = {}) {
   const composer = createPromptComposer(scene);
   composer.add('scene-base', buildSceneSystemBase(char, '微信私聊'), { priority: 0 });
   const basePrompt = buildCharPrompt(char);
-  composer.add('chat-specific-prompt', chat?.charPrompt && chat.charPrompt !== basePrompt ? '对话专属补充：\n' + chat.charPrompt : '', { priority: 10 });
+  const customChatPrompt = chat?.charPrompt && chat.charPrompt !== basePrompt && !isGeneratedCharacterPrompt(chat.charPrompt, char) ? chat.charPrompt : '';
+  composer.add('chat-specific-prompt', customChatPrompt ? '对话专属补充：\n' + customChatPrompt : '', { priority: 10 });
   const momentContext = buildMomentChatContext(char.id);
   composer.add('moment-context', momentContext, { priority: 20 });
   composer.add('memory-pack', options.memoryPack, { priority: 30 });
@@ -3563,7 +3834,10 @@ function buildMemorySceneSystem(char, sceneLabel, sceneKey, taskRules) {
   return composer.compile();
 }
 function buildMemoryQueryPayload(char, userInput, messages) {
-  const system = buildMemorySceneSystem(char, '检索', 'memory-query', `任务：只根据当前输入、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
+  const stageConfig = normalizeStagePersonaConfig(char);
+  const currentStage = stagePersonaFor(char);
+  const stageCatalog = stageConfig.stages.map(stage => `${stage.id}=${stage.label}`).join('，');
+  const system = buildMemorySceneSystem(char, '检索', 'memory-query', `任务一：根据当前输入、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
 规则 1：玩家当前输入或当前触发原因是最高优先级。先判断这次说话真正需要什么记忆，再使用最近30条聊天消除指代歧义。
 正例：${playerName()}说“昨天那件事你想好了吗”，结合最近30条确认“那件事”指红包是否领取，再检索对应红包。
 反例：${playerName()}只说“今天天气不错”，却因为最近30条出现过红包就检索并继续催红包。
@@ -3579,15 +3853,28 @@ function buildMemoryQueryPayload(char, userInput, messages) {
 规则 5：focus 只标记检索重点，不生成角色回复。
 正例：{"focus":"payment"}
 反例：{"focus":"我会安慰你"}
-输出 JSON 结构：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`);
+任务二：复核当前关系阶段，只返回阶段判断，不编写或改写阶段人设正文。
+规则 6：阶段只能依据双方已经发生的互动变化，不能依据消息数量、玩家单方面要求或模型猜测。
+正例：双方经过多次持续交流，已经自然分享私人日常并形成稳定联系，可以从 acquainted 建议为 familiar，并列出证据消息 ID。
+反例：玩家单方面说“你是我女朋友”，角色尚未接受，却直接建议 committed。
+规则 7：普通友好、一次玩笑、一次红包、一次关心、临时生气都不足以改变长期阶段。只有明确的双方关系确认或明确结束关系可标记 explicitMutualChange=true。
+正例：角色明确接受表白，双方确认恋爱关系，可以建议进入 committed。
+反例：角色只说“你人还不错”，不能因此跨阶段。
+规则 8：不确定时必须保持 currentStage，confidence 不得虚高。阶段变化至少给出最近30条中真实存在的 evidenceMessageIds。
+输出 JSON 结构：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","relationshipStage":{"current":"当前阶段ID","recommended":"建议阶段ID","confidence":0到1,"reason":"判断原因","evidenceMessageIds":["消息ID"],"explicitMutualChange":false}}`);
   const user = `双方昵称：${playerName()} / ${charName(char)}
+初始关系设定：${char.scenario || '未填写'}
+当前关系阶段：${currentStage.id}=${currentStage.label}
+可用阶段顺序：${stageCatalog}
+当前阶段开始时间：${formatFullTime(new Date(stageConfig.state?.since || Date.now()))}
+当前阶段形成原因：${stageConfig.state?.reason || '暂无'}
 固定最近30条聊天与场景事件（仅用于判断当前输入是否指向旧内容，不得自行续写）：
-${messages.slice(-30).map(m => messageLine(m, char)).join('\n')}
+${messages.slice(-30).map(m => memoryEvidenceLine(m, char)).join('\n')}
 
 当前输入或触发原因：
 ${userInput}
 
-输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`;
+输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","relationshipStage":{"current":"${currentStage.id}","recommended":"${currentStage.id}","confidence":0.5,"reason":"保持或变化的原因","evidenceMessageIds":[],"explicitMutualChange":false}}`;
   return { system, user };
 }
 function buildMemoryExtractPayload(char, batch, oldSummaries) {
@@ -4292,6 +4579,9 @@ function messageLine(m, char) {
   if (m.hidden) return `【消息时间｜${timeText}】【隐藏事件】${m.content}`;
   return `【消息时间｜${timeText}】${m.role === 'user' ? playerName() : charName(char)}：${m.content}`;
 }
+function memoryEvidenceLine(m, char) {
+  return `【消息ID｜${m?.id || 'unknown'}】${messageLine(m, char)}`;
+}
 function memoryTextHasSignal(text) {
   const value = String(text || '');
   return /(承诺|约定|答应|计划|以后|下次|明天|今晚|周|红包|转账|收款|领取|拒收|退款|金额|欠|补偿|道歉|和好|吵|争执|生气|雷点|不喜欢|介意|边界|称呼|关系|喜欢|讨厌|职业|年龄|生日|住址|住在|城市|学校|公司|重要|不能忘|必须记|未解决|提醒|朋友圈|动态|评论|点赞|留言)/.test(value);
@@ -4648,12 +4938,72 @@ async function saveVector(charId, sourceType, sourceId, text, keywords = [], imp
     createdAt: Date.now()
   });
 }
+async function applyRelationshipStageReview(char, chat, review, recent = []) {
+  if (!char || !chat || !review || typeof review !== 'object') return false;
+  const config = normalizeStagePersonaConfig(char);
+  const validIds = config.stages.map(stage => stage.id);
+  const current = config.currentStage;
+  const recommended = String(review.recommended || review.stage || current);
+  if (!validIds.includes(recommended) || recommended === current) return false;
+  const confidence = Math.max(0, Math.min(1, Number(review.confidence) || 0));
+  if (confidence < 0.82) return false;
+  ensureChatMessageIds(chat);
+  const availableIds = new Set(recent.map(message => message.id).filter(Boolean));
+  const evidenceMessageIds = [...new Set((Array.isArray(review.evidenceMessageIds) ? review.evidenceMessageIds : []).map(String))]
+    .filter(id => availableIds.has(id))
+    .slice(-12);
+  const explicitMutualChange = review.explicitMutualChange === true;
+  if (evidenceMessageIds.length < (explicitMutualChange ? 1 : 2)) return false;
+  const fromIndex = validIds.indexOf(current);
+  const toIndex = validIds.indexOf(recommended);
+  if (Math.abs(toIndex - fromIndex) > 1 && !explicitMutualChange) return false;
+  const reason = String(review.reason || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+  if (!reason) return false;
+  const oldPrompt = buildCharPrompt(char);
+  const now = Date.now();
+  config.currentStage = recommended;
+  config.state = { since: now, reason, confidence, evidenceMessageIds };
+  config.history.push({
+    from: current,
+    to: recommended,
+    at: now,
+    reason,
+    evidenceMessageIds,
+    confidence,
+    source: 'memory-ai'
+  });
+  config.history = config.history.slice(-30);
+  char.stagePersona = config;
+  refreshStoredCharacterPrompt(char, oldPrompt);
+  DB.set('characters', characters);
+  DB.set('chats', allChats);
+  const fromLabel = config.stages.find(stage => stage.id === current)?.label || current;
+  const toLabel = config.stages.find(stage => stage.id === recommended)?.label || recommended;
+  const event = {
+    id: uid('evt_stage'),
+    charId: char.id,
+    happenedAt: formatFullTime(new Date(now)),
+    type: 'relationship',
+    title: `关系阶段：${fromLabel} → ${toLabel}`,
+    detail: `${charName(char)}与${playerName()}的关系由“${fromLabel}”进入“${toLabel}”。依据：${reason}`,
+    status: 'stable',
+    importance: 5,
+    keywords: ['关系阶段', fromLabel, toLabel],
+    sourceMessageIds: evidenceMessageIds,
+    createdAt: now
+  };
+  await MemoryDB.put('events', event);
+  await saveVector(char.id, 'event', event.id, memoryTextForVector(event), event.keywords, event.importance);
+  return true;
+}
 async function prepareMemoryPack(charId, userInput, scene = 'chat', options = {}) {
   const chat = allChats[charId];
   const char = characters.find(c => c.id === charId);
   if (!chat || !char) return '';
+  ensureChatMessageIds(chat);
   const recent = recentMessages(chat, 30);
   const query = await generateMemoryQuery(char, userInput, recent, scene, options);
+  await applyRelationshipStageReview(char, chat, query.relationshipStage || query.stageReview, recent);
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
   const [hits, allSummaries, allEvents, allProfiles] = await Promise.all([
     searchMemoryVectors(charId, queryText),

@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v77';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v78';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.63';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.64';/);
 assert.match(html, /id="emoji-tabs"/);
 assert.match(html, /id="emoji-grid"/);
 assert.match(script, /const EMOJI_CATEGORIES = \[/);
@@ -44,8 +44,20 @@ assert.match(script, /function recentMessages\(chat, count = 30\) \{[\s\S]*slice
 assert.match(swScript, /function recentMessages\(chat, count = 30\) \{[\s\S]*slice\(-Math\.max\(1, Number\(count\) \|\| 30\)\)/);
 assert.match(script, /return recentMessages\(chat, count\)\.map\(m =>/);
 assert.match(swScript, /return recentMessages\(chat, count\)\.map\(m =>/);
-assert.match(script, /messages\.slice\(-30\)\.map\(m => messageLine\(m, char\)\)/);
+assert.match(script, /messages\.slice\(-30\)\.map\(m => memoryEvidenceLine\(m, char\)\)/);
 assert.match(swScript, /messages\.slice\(-30\)\.map\(m => messageLine\(m, char, settings\)\)/);
+assert.match(script, /const RELATIONSHIP_STAGE_DEFS = \[/);
+assert.match(script, /function currentStagePersonaBlock\(char\)/);
+assert.match(script, /if \(preset\.prompt\) prompt \+= preset\.prompt \+ '\\n\\n';/);
+assert.match(script, /<al_current_stage_persona>/);
+assert.match(script, /relationshipStage/);
+assert.match(script, /async function applyRelationshipStageReview\(char, chat, review, recent = \[\]\)/);
+assert.match(script, /confidence < 0\.82/);
+assert.match(script, /evidenceMessageIds\.length < \(explicitMutualChange \? 1 : 2\)/);
+assert.match(html, /id="screen-stage-personas"/);
+assert.match(html, /onclick="openStagePersonas\(currentCharId, 'chat-info'\)"/);
+assert.match(swScript, /function backgroundStagePersonaBlock\(char, settings = \{\}\)/);
+assert.match(swScript, /composer\.add\('stage-persona', backgroundStagePersonaBlock\(char, settings\)/);
 assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat', \{ signal: controller\.signal \}\)/);
 assert.match(script, /chat\.pendingReply = \{[\s\S]*userMessageId/);
 assert.match(script, /function resumePendingAssistantTurns\(\)/);
@@ -716,6 +728,55 @@ const v2 = parseCharacterCard({
 assert.equal(v2.name, '林晚');
 assert.equal(v2.firstMessage, '欢迎回来。');
 assert.deepEqual(v2.tags, ['测试', 'V2']);
+
+const stagedChar = normalizeChar({
+  id: 'char_stage_test',
+  name: '许弥',
+  description: '21岁，工业设计专业学生。',
+  personality: '慢热、敏锐，偶尔调侃。',
+  scenario: '偶遇后刚加上的陌生人。',
+});
+const initialStagePrompt = buildCharPrompt(stagedChar);
+assert.ok(initialStagePrompt.startsWith(RP_PRESETS.combined.prompt), '完整综合 RP 规则必须始终位于角色提示词开头');
+assert.match(initialStagePrompt, /当前关系阶段：初识/);
+assert.doesNotMatch(initialStagePrompt, /双方已经形成较稳定的聊天习惯/);
+assert.equal((initialStagePrompt.match(/<al_current_stage_persona>/g) || []).length, 1, '每轮只能注入一个当前阶段世界书');
+stagedChar.stagePersona.currentStage = 'familiar';
+const familiarStagePrompt = buildCharPrompt(stagedChar);
+assert.match(familiarStagePrompt, /当前关系阶段：熟悉/);
+assert.match(familiarStagePrompt, /双方已经形成较稳定的聊天习惯/);
+assert.doesNotMatch(familiarStagePrompt, /当前是初识阶段/);
+vm.runInContext("settings.rpPreset='custom';", context);
+assert.ok(buildCharPrompt(stagedChar).startsWith(RP_PRESETS.combined.prompt), '自定义模式也不能裁剪完整综合 RP 规则');
+vm.runInContext("settings.rpPreset='combined';", context);
+const stageQueryPayload = buildMemoryQueryPayload(stagedChar, '你还记得我们刚认识的时候吗', [
+  { id: 'stage-msg-1', role: 'user', content: '刚认识的时候你很客气', time: Date.now() - 1000 },
+  { id: 'stage-msg-2', role: 'assistant', content: '现在也没多不客气', time: Date.now() },
+]);
+assert.match(stageQueryPayload.user, /【消息ID｜stage-msg-1】/);
+assert.match(stageQueryPayload.user, /当前关系阶段：familiar=熟悉/);
+assert.match(stageQueryPayload.system, /explicitMutualChange/);
+const stageReviewProbe = await vm.runInContext(`(async () => {
+  const char = normalizeChar({ id: 'stage-review-char', name: '许弥', scenario: '刚认识的陌生人' });
+  const messages = [
+    { id: 'evidence-1', role: 'user', content: '最近每天都在聊', time: Date.now() - 2000 },
+    { id: 'evidence-2', role: 'assistant', content: '确实比刚认识的时候熟多了', time: Date.now() - 1000 }
+  ];
+  const chat = { messages, charPrompt: buildCharPrompt(char) };
+  characters = [char];
+  allChats = { [char.id]: chat };
+  const rejected = await applyRelationshipStageReview(char, chat, {
+    recommended: 'acquainted', confidence: 0.95, reason: '只有一条证据', evidenceMessageIds: ['evidence-1'], explicitMutualChange: false
+  }, messages);
+  const accepted = await applyRelationshipStageReview(char, chat, {
+    recommended: 'acquainted', confidence: 0.95, reason: '双方持续交流并明确比初识更熟悉', evidenceMessageIds: ['evidence-1', 'evidence-2'], explicitMutualChange: false
+  }, messages);
+  return { rejected, accepted, currentStage: char.stagePersona.currentStage, historyLength: char.stagePersona.history.length };
+})()`, context);
+assert.equal(stageReviewProbe.rejected, false, '普通阶段变化只有一条证据时必须拒绝');
+assert.equal(stageReviewProbe.accepted, true, '满足置信度和双证据时应切换相邻阶段');
+assert.equal(stageReviewProbe.currentStage, 'acquainted');
+assert.equal(stageReviewProbe.historyLength, 1);
 
 const v1 = parseCharacterCard({
   name: '旧卡角色',
