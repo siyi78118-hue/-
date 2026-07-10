@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v66';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v67';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.52';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.53';/);
 assert.match(html, /\.primary\{width:calc\(100% - 28px\);/);
 assert.doesNotMatch(html, />发起聊天<\/button>/);
 assert.doesNotMatch(html, /class="wallet-tools"/);
@@ -363,7 +363,14 @@ assert.match(script, /当前本地没有待核验的云端任务/);
 assert.match(script, /云端任务核验失败/);
 assert.match(html, /id="moment-reply-bar"/);
 assert.match(script, /function openMomentReplyBar\(momentId\)/);
+assert.match(script, /function openMomentCommentReply\(momentId, commentId\)/);
 assert.match(script, /async function submitMomentReply\(\)/);
+assert.match(script, /replyToMoment\(targetId, text, \{ targetCommentId, targetCharId \}\)/);
+assert.match(script, /const momentNotificationFlights = new Map\(\);/);
+assert.match(script, /moment\.notifyFailures\?\.\[char\.id\]/);
+assert.match(script, /互动失败，点右侧 ·· 重试/);
+assert.match(script, /replyToCommentId: commentItem\.id/);
+assert.match(script, /replyToCharId: char\.id/);
 assert.match(script, /openMomentReplyBar\('\$\{moment\.id\}'\)/);
 assert.match(script, /没有在评论区回复/);
 assert.match(script, /function markMomentNotifiedToChar\(moment, char\)/);
@@ -562,6 +569,22 @@ assert.equal(memoryQueueProbe.samePromise, true, '同一角色的并发整理请
 assert.equal(memoryQueueProbe.maxActive, 1, '同一角色不得并发执行两个记忆整理批次');
 assert.equal(memoryQueueProbe.calls, 2, '整理期间的新请求应合并为一次后续检查');
 
+const momentNotifyProbe = await vm.runInContext(`(async () => {
+  const original = runMomentNotification;
+  let calls = 0;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  runMomentNotification = async () => { calls++; await gate; return true; };
+  const first = notifyMomentToCharacters('moment-flight');
+  const second = notifyMomentToCharacters('moment-flight');
+  release();
+  await Promise.all([first, second]);
+  runMomentNotification = original;
+  return { calls, samePromise: first === second };
+})()`, context);
+assert.equal(momentNotifyProbe.samePromise, true, '同一条朋友圈的重复通知应复用同一任务');
+assert.equal(momentNotifyProbe.calls, 1, '自动通知和手动点击不得重复调用角色 AI');
+
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
   data: {
@@ -721,10 +744,15 @@ const replyPayload = buildMomentReplyPayload(v2, ownMoment, '终于能出门了'
 assert.match(replyPayload.system, /朋友圈评论回复/);
 assert.match(replyPayload.system, /只允许输出 JSON，不要输出解释：\{"comment":"回复评论正文或空字符串"\}/);
 assert.match(replyPayload.system, /记忆：玩家怕冷。/);
-assert.match(replyPayload.messages[0].content, /玩家刚评论：终于能出门了/);
+assert.match(replyPayload.messages[0].content, /玩家刚发来的评论区文字：终于能出门了/);
 assert.ok(blockIds(replyPayload).includes('memory-pack'));
+const playerMomentThread = { authorType: 'player', text: '今天有点想喝热茶。', comments: [{ id: 'char-comment', charId: 'char_seen', name: '林晚', text: '少喝冰的。' }] };
+const threadReplyPayload = buildMomentReplyPayload(v2, playerMomentThread, '知道啦', '记忆：玩家胃不好。', { targetComment: playerMomentThread.comments[0] });
+assert.match(threadReplyPayload.system, /回复了林晚此前在玩家朋友圈下的评论/);
+assert.match(threadReplyPayload.messages[0].content, /本次回复的是林晚此前的评论：少喝冰的/);
 vm.runInContext("characters = [{ id: 'char_seen', name: '林晚' }, { id: 'char_liked', name: '谢韫' }];", context);
 assert.equal(JSON.stringify(momentSeenNames({ authorType: 'player', notifiedCharIds: ['char_seen', 'char_liked'], likes: ['char_liked'], comments: [] })), JSON.stringify(['林晚']));
+assert.match(renderMomentComment({ id: 'clickable-comment', charId: 'char_seen', name: '林晚', text: '少喝冰的。' }, { id: 'player-moment', authorType: 'player', comments: [] }), /openMomentCommentReply/);
 const seenCommentMoment = { authorType: 'char', charId: 'char_seen', comments: [{ id: 'c1', charId: 'player', name: '玩家', text: '我来评论一下', seenBy: [] }] };
 assert.equal(markMomentCommentSeen(seenCommentMoment, 'c1', 'char_seen'), true);
 assert.match(renderMomentComment(seenCommentMoment.comments[0], seenCommentMoment), /已看过/);
@@ -732,6 +760,43 @@ const playerPostSeen = { authorType: 'player', text: '今天不想说话。', no
 assert.equal(markMomentNotifiedToChar(playerPostSeen, { id: 'char_seen', name: '林晚' }), true);
 assert.equal(JSON.stringify(playerPostSeen.notifiedCharIds), JSON.stringify(['char_seen']));
 assert.match(JSON.parse(storage.get('rpchat_chats')).char_seen.messages.at(-1).content, /林晚看到了这条朋友圈/);
+const momentThreadProbe = await vm.runInContext(`(async () => {
+  const oldCharacters = characters;
+  const oldMoments = allMoments;
+  const oldChats = allChats;
+  const oldSettings = settings;
+  const oldProcess = processMemoryAfterScenario;
+  characters = [{ id: 'thread-char', name: '林晚' }];
+  allMoments = [{
+    id: 'thread-moment',
+    authorType: 'player',
+    text: '今天有点想喝热茶。',
+    time: Date.now(),
+    likes: [],
+    comments: [{ id: 'thread-comment', charId: 'thread-char', name: '林晚', text: '少喝冰的。', time: Date.now() }]
+  }];
+  allChats = {};
+  settings = { ...settings, chatApiUrl: '', chatApiKey: '', chatModel: '' };
+  processMemoryAfterScenario = () => {};
+  await replyToMoment('thread-moment', '知道啦', { targetCommentId: 'thread-comment', targetCharId: 'thread-char' });
+  const playerReply = allMoments[0].comments.at(-1);
+  const result = {
+    replyToCharId: playerReply.replyToCharId,
+    replyToName: playerReply.replyToName,
+    seenBy: playerReply.seenBy,
+    eventText: allChats['thread-char']?.messages?.map(row => row.content).join('\\n') || ''
+  };
+  characters = oldCharacters;
+  allMoments = oldMoments;
+  allChats = oldChats;
+  settings = oldSettings;
+  processMemoryAfterScenario = oldProcess;
+  return result;
+})()`, context);
+assert.equal(momentThreadProbe.replyToCharId, 'thread-char');
+assert.equal(momentThreadProbe.replyToName, '林晚');
+assert.equal(JSON.stringify(momentThreadProbe.seenBy), JSON.stringify(['thread-char']));
+assert.match(momentThreadProbe.eventText, /玩家回复了林晚在自己朋友圈下的评论/);
 const memoryQueryPayload = buildMemoryQueryPayload(v2, '你还记得红包吗？', [{ role: 'user', content: '我给你发过红包', time: Date.now() }]);
 assert.match(memoryQueryPayload.system, /本地记忆检索 AI/);
 assert.match(memoryQueryPayload.system, /生成向量数据库召回用的检索查询/);

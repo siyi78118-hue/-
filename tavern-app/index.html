@@ -290,7 +290,7 @@ button.profile-top{width:100%;text-align:left}
 .moment-foot{margin-top:8px;display:flex;align-items:center;gap:8px;color:#8b8b8b;font-size:12px}
 .moment-action{margin-left:auto;width:32px;height:20px;border-radius:3px;background:#f0f0f0;color:#576b95;font-weight:700;line-height:18px}
 .moment-reactions{margin-top:8px;background:#f3f3f3;color:#576b95;font-size:13px;line-height:1.45}
-.moment-like-line,.moment-comment{padding:6px 8px;border-bottom:1px solid #e3e3e3}
+.moment-like-line,.moment-comment{width:100%;padding:6px 8px;border-bottom:1px solid #e3e3e3;text-align:left}
 .moment-comment:last-child,.moment-like-line:last-child{border-bottom:none}
 .moment-comment b{color:#576b95;font-weight:600}
 .moment-seen{margin-left:6px;color:#9a9a9a;font-size:12px}
@@ -997,7 +997,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.52';
+const APP_BUILD_VERSION = '2026-07-10.53';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1089,8 +1089,11 @@ let proactiveChatBusy = false;
 let proactiveMomentBusy = false;
 const memoryExtractionStates = new Map();
 const memoryExtractionEpochs = new Map();
+const momentNotificationFlights = new Map();
 let foregroundProactiveRequestBusy = false;
 let momentReplyTargetId = '';
+let momentReplyCommentId = '';
+let momentReplyCharId = '';
 let lastChatResponseDiagnostic = '';
 let settingsSaveTimer = null;
 let settingsFormHydrating = false;
@@ -2346,14 +2349,23 @@ function momentSeenNames(moment) {
     .map(id => charName(characters.find(c => c.id === id)))
     .filter(Boolean);
 }
+function momentCommentKey(comment, index = 0) {
+  return String(comment?.id || `legacy_${comment?.time || index}`);
+}
+function findMomentComment(moment, commentId) {
+  return (moment?.comments || []).find((comment, index) => momentCommentKey(comment, index) === String(commentId || '')) || null;
+}
 function renderMomentComment(comment, moment) {
   const name = comment.name || charName(characters.find(ch => ch.id === comment.charId));
-  const seen = comment.charId === 'player'
-    && moment.authorType === 'char'
-    && (comment.seenBy || []).includes(moment.charId)
-      ? '<span class="moment-seen">已看过</span>'
-      : '';
-  return `<div class="moment-comment"><b>${esc(name)}</b>：${esc(comment.text || '')}${seen}</div>`;
+  const replyLabel = comment.replyToName ? ` 回复 <b>${esc(comment.replyToName)}</b>` : '';
+  const seenNames = comment.charId === 'player'
+    ? (comment.seenBy || []).map(id => charName(characters.find(ch => ch.id === id))).filter(Boolean)
+    : [];
+  const seen = seenNames.length ? `<span class="moment-seen">${esc([...new Set(seenNames)].join('、'))}已看过</span>` : '';
+  const targetChar = comment.charId !== 'player' ? characters.find(ch => ch.id === comment.charId) : null;
+  const click = targetChar ? ` onclick="openMomentCommentReply(${jsArg(moment.id)},${jsArg(momentCommentKey(comment, (moment.comments || []).indexOf(comment)))})"` : '';
+  const tag = targetChar ? 'button' : 'div';
+  return `<${tag} class="moment-comment"${click}${targetChar ? ' type="button"' : ''}><b>${esc(name)}</b>${replyLabel}：${esc(comment.text || '')}${seen}</${tag}>`;
 }
 function renderMomentItem(moment) {
   const author = momentAuthor(moment);
@@ -2367,6 +2379,8 @@ function renderMomentItem(moment) {
   </div>` : '';
   const seenNames = momentSeenNames(moment);
   const seenLine = seenNames.length ? `<div class="moment-seen-line">${esc(seenNames.join('、'))}已看过</div>` : '';
+  const failedNames = Object.keys(moment.notifyFailures || {}).map(id => charName(characters.find(c => c.id === id))).filter(Boolean);
+  const failureLine = failedNames.length ? `<div class="moment-seen-line">${esc(failedNames.join('、'))}互动失败，点右侧 ·· 重试</div>` : '';
   const authorClick = author.isPlayer ? "openSelfProfile('moments')" : `openContactProfile('${moment.charId}')`;
   const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `openMomentReplyBar('${moment.id}')`;
   return `<div class="moment">
@@ -2378,6 +2392,7 @@ function renderMomentItem(moment) {
       <div class="moment-foot"><span>${fmtTime(moment.time)}</span><button class="moment-action" onclick="${actionClick}" type="button">··</button></div>
       ${reactions}
       ${seenLine}
+      ${failureLine}
     </div>
   </div>`;
 }
@@ -2421,7 +2436,7 @@ function removeCharacterMomentTraces(charId) {
   return before - allMoments.length;
 }
 function markMomentCommentSeen(moment, commentId, charId) {
-  const comment = (moment?.comments || []).find(c => c.id === commentId);
+  const comment = findMomentComment(moment, commentId);
   if (!comment || !charId) return false;
   comment.seenBy = [...new Set([...(comment.seenBy || []), charId])];
   return true;
@@ -2468,8 +2483,12 @@ function buildMomentChatContext(charId, limit = 8) {
     const author = moment.authorType === 'player' ? playerName() : charName(characters.find(c => c.id === moment.charId));
     const parts = [`${fmtTime(moment.time)}｜${author}发了朋友圈：“${momentSnippet(moment.text, 80)}”`];
     if ((moment.likes || []).includes(charId)) parts.push(`${charName(characters.find(c => c.id === charId))}点过赞`);
-    const ownComments = (moment.comments || []).filter(c => c.charId === charId);
-    ownComments.forEach(c => parts.push(`${charName(characters.find(ch => ch.id === charId))}评论过：“${momentSnippet(c.text, 60)}”`));
+    const threadComments = (moment.comments || []).filter(c => c.charId === charId || (c.charId === 'player' && (moment.charId === charId || c.replyToCharId === charId)));
+    threadComments.forEach(c => {
+      const speaker = c.charId === 'player' ? playerName() : charName(characters.find(ch => ch.id === charId));
+      const repliedTo = c.replyToName ? `回复${c.replyToName}` : '评论';
+      parts.push(`${speaker}${repliedTo}：“${momentSnippet(c.text, 60)}”`);
+    });
     return `- ${parts.join('；')}`;
   });
   return `以下是最近朋友圈上下文，角色可以自然记得自己看过、点赞过、评论过或发过的动态；不要提到“系统记录/上下文”。\n${lines.join('\n')}`;
@@ -2512,11 +2531,25 @@ function markMomentNotifiedToChar(moment, char) {
   const hadSeen = (moment.notifiedCharIds || []).includes(char.id);
   moment.notifiedCharIds = [...new Set([...(moment.notifiedCharIds || []), char.id])];
   if (!hadSeen) {
-    recordMomentMemoryEvent(char.id, `${playerName()}发布了朋友圈：“${momentSnippet(moment.text)}”；${char.name}看到了这条朋友圈。`, moment.time || Date.now());
+    const seenAt = Date.now();
+    moment.seenAtBy = { ...(moment.seenAtBy || {}), [char.id]: seenAt };
+    recordMomentMemoryEvent(char.id, `${playerName()}发布了朋友圈：“${momentSnippet(moment.text)}”；${char.name}看到了这条朋友圈。`, seenAt);
   }
   return !hadSeen;
 }
-async function notifyMomentToCharacters(momentId, manual = false) {
+function notifyMomentToCharacters(momentId, manual = false) {
+  const existing = momentNotificationFlights.get(momentId);
+  if (existing) {
+    if (manual) toast('这条朋友圈正在通知角色...', 1600);
+    return existing;
+  }
+  const flight = runMomentNotification(momentId, manual).finally(() => {
+    if (momentNotificationFlights.get(momentId) === flight) momentNotificationFlights.delete(momentId);
+  });
+  momentNotificationFlights.set(momentId, flight);
+  return flight;
+}
+async function runMomentNotification(momentId, manual = false) {
   const moment = allMoments.find(m => m.id === momentId);
   if (!moment || moment.authorType !== 'player') return;
   if (!characters.length) { if (manual) toast('暂无角色可以通知'); return; }
@@ -2529,7 +2562,11 @@ async function notifyMomentToCharacters(momentId, manual = false) {
     if (manual) toast('角色已看过，配置聊天接口后才能判断是否点赞或回复');
     return;
   }
-  const targets = characters.filter(char => !hasMomentInteraction(moment, char.id) && !(moment.notifiedCharIds || []).includes(char.id));
+  const targets = characters.filter(char => {
+    if (hasMomentInteraction(moment, char.id)) return false;
+    const seen = (moment.notifiedCharIds || []).includes(char.id);
+    return !seen || !!moment.notifyFailures?.[char.id];
+  });
   if (!targets.length) { if (manual) toast('角色已经看过这条动态'); return; }
   if (manual) toast('正在通知角色...', 1200);
   for (const char of targets) {
@@ -2542,7 +2579,7 @@ async function notifyMomentToCharacters(momentId, manual = false) {
       if (result.like) moment.likes = [...new Set([...(moment.likes || []), char.id])];
       const comment = String(result.comment || '').replace(/\s+/g, ' ').trim();
       if (comment) {
-        moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: comment.slice(0, 80), time: Date.now() }];
+        moment.comments = [...(moment.comments || []), { id: uid('mcom'), charId: char.id, name: char.name, text: comment.slice(0, 80), time: Date.now() }];
       }
       const actions = [];
       if (result.like) actions.push(`${char.name}点赞了${playerName()}的朋友圈：“${momentSnippet(moment.text)}”`);
@@ -2743,14 +2780,38 @@ function openMomentReplyBar(momentId) {
     return;
   }
   momentReplyTargetId = moment.id;
+  momentReplyCommentId = '';
+  momentReplyCharId = moment.charId || '';
   const bar = document.getElementById('moment-reply-bar');
   const input = document.getElementById('moment-reply-input');
-  if (input) input.value = '';
+  if (input) {
+    input.value = '';
+    input.placeholder = `评论 ${charName(characters.find(c => c.id === moment.charId))}`;
+  }
+  if (bar) bar.classList.add('show');
+  setTimeout(() => input?.focus(), 60);
+}
+function openMomentCommentReply(momentId, commentId) {
+  const moment = allMoments.find(m => m.id === momentId) || materializeVirtualMoment(momentId);
+  const comment = findMomentComment(moment, commentId);
+  const char = comment?.charId && comment.charId !== 'player' ? characters.find(c => c.id === comment.charId) : null;
+  if (!moment || !comment || !char) return;
+  momentReplyTargetId = moment.id;
+  momentReplyCommentId = momentCommentKey(comment, (moment.comments || []).indexOf(comment));
+  momentReplyCharId = char.id;
+  const bar = document.getElementById('moment-reply-bar');
+  const input = document.getElementById('moment-reply-input');
+  if (input) {
+    input.value = '';
+    input.placeholder = `回复 ${char.name}`;
+  }
   if (bar) bar.classList.add('show');
   setTimeout(() => input?.focus(), 60);
 }
 function closeMomentReplyBar() {
   momentReplyTargetId = '';
+  momentReplyCommentId = '';
+  momentReplyCharId = '';
   document.getElementById('moment-reply-bar')?.classList.remove('show');
 }
 async function submitMomentReply() {
@@ -2758,27 +2819,47 @@ async function submitMomentReply() {
   const text = String(input?.value || '').trim();
   if (!momentReplyTargetId || !text) return;
   const targetId = momentReplyTargetId;
+  const targetCommentId = momentReplyCommentId;
+  const targetCharId = momentReplyCharId;
   closeMomentReplyBar();
   if (input) input.value = '';
-  await replyToMoment(targetId, text);
+  await replyToMoment(targetId, text, { targetCommentId, targetCharId });
 }
-async function replyToMoment(momentId, presetText = '') {
+async function replyToMoment(momentId, presetText = '', options = {}) {
   const moment = allMoments.find(m => m.id === momentId) || materializeVirtualMoment(momentId);
   if (!moment) return;
-  if (moment.authorType === 'player') {
+  const targetComment = options.targetCommentId ? findMomentComment(moment, options.targetCommentId) : null;
+  const targetCharId = options.targetCharId || targetComment?.charId || (moment.authorType === 'char' ? moment.charId : '');
+  if (moment.authorType === 'player' && !targetCharId) {
     notifyMomentToCharacters(moment.id, true);
     return;
   }
-  const char = characters.find(c => c.id === moment.charId);
+  const char = characters.find(c => c.id === targetCharId);
   if (!char) return;
   const text = presetText || (typeof prompt === 'function' ? prompt('评论', '') : '');
   const comment = String(text || '').replace(/\s+/g, ' ').trim();
   if (!comment) return;
-  const commentItem = { id: uid('mcom'), charId: 'player', name: playerName(), text: comment.slice(0, 80), time: Date.now(), seenBy: [] };
+  const commentItem = {
+    id: uid('mcom'),
+    charId: 'player',
+    name: playerName(),
+    text: comment.slice(0, 80),
+    time: Date.now(),
+    seenBy: [],
+    replyToCommentId: targetComment ? momentCommentKey(targetComment, (moment.comments || []).indexOf(targetComment)) : '',
+    replyToCharId: char.id,
+    replyToName: targetComment ? (targetComment.name || char.name) : ''
+  };
   moment.comments = [...(moment.comments || []), commentItem];
-  recordMomentMemoryEvent(char.id, `${playerName()}评论了${char.name}的朋友圈：“${momentSnippet(comment, 70)}”`, Date.now());
+  const playerAction = moment.authorType === 'player'
+    ? `${playerName()}回复了${char.name}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`
+    : `${playerName()}评论了${char.name}的朋友圈：“${momentSnippet(comment, 70)}”`;
+  recordMomentMemoryEvent(char.id, playerAction, Date.now());
   markMomentCommentSeen(moment, commentItem.id, char.id);
-  recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`, Date.now());
+  const seenAction = moment.authorType === 'player'
+    ? `${char.name}看到了${playerName()}对自己此前朋友圈评论的回复：“${momentSnippet(comment, 70)}”`
+    : `${char.name}看到了${playerName()}在自己朋友圈下的评论：“${momentSnippet(comment, 70)}”`;
+  recordMomentMemoryEvent(char.id, seenAction, Date.now());
   saveMoments();
   processMemoryAfterScenario(char.id);
   if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
@@ -2787,11 +2868,11 @@ async function replyToMoment(momentId, presetText = '') {
   }
   toast('正在等待回复...', 1200);
   try {
-    const reply = await callMomentReplyAI(char, moment, comment);
+    const reply = await callMomentReplyAI(char, moment, comment, { targetComment, playerComment: commentItem });
     const clean = momentSnippet(reply, 80);
     if (clean && !isEmptyReplyText(clean)) {
-      moment.comments = [...(moment.comments || []), { charId: char.id, name: char.name, text: clean, time: Date.now() }];
-      recordMomentMemoryEvent(char.id, `${char.name}回复了${playerName()}的朋友圈评论：“${momentSnippet(clean, 70)}”`, Date.now());
+      moment.comments = [...(moment.comments || []), { id: uid('mcom'), charId: char.id, name: char.name, text: clean, time: Date.now(), replyToCommentId: commentItem.id, replyToCharId: 'player', replyToName: playerName() }];
+      recordMomentMemoryEvent(char.id, `${char.name}在朋友圈评论区回复了${playerName()}：“${momentSnippet(clean, 70)}”`, Date.now());
       saveMoments();
       processMemoryAfterScenario(char.id);
       toast(`${char.name}回复了你的评论`, 1600);
@@ -2806,13 +2887,16 @@ async function replyToMoment(momentId, presetText = '') {
     toast('回复失败，但角色已看过：' + friendlyErrorMessage(err), 3000);
   }
 }
-async function callMomentReplyAI(char, moment, playerComment) {
+async function callMomentReplyAI(char, moment, playerComment, threadContext = {}) {
+  const sceneDescription = moment.authorType === 'player'
+    ? `${playerName()}回复了${char.name}在自己朋友圈下的评论：“${momentSnippet(playerComment)}”`
+    : `${playerName()}刚评论${char.name}的朋友圈：“${momentSnippet(playerComment)}”`;
   const memoryQuery = `朋友圈评论回复触发。
 ${getTimeContext()}
-${playerName()}刚评论${char.name}的朋友圈：“${momentSnippet(playerComment)}”
+${sceneDescription}
 ${char.name}需要在朋友圈评论区自然回复，并记得双方此前关系、承诺、红包/转账和重要互动。`;
   const memoryPack = await prepareMemoryPackSafe(char.id, memoryQuery, 'moment-reply');
-  const payload = buildMomentReplyPayload(char, moment, playerComment, memoryPack);
+  const payload = buildMomentReplyPayload(char, moment, playerComment, memoryPack, threadContext);
   const callMeta = { live: false, charId: char.id, kind: 'moment', scene: 'moment-reply', memoryChars: memoryPack.length, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), promptBlocks: payload.promptBlocks };
   const text = (settings.chatApiType || 'openai') === 'claude'
     ? await callClaude(payload.system, payload.messages, callMeta)
@@ -3178,23 +3262,32 @@ ${recent}
 请决定${char.name}现在会不会发一条朋友圈；如果适合，就输出 JSON。`;
   return { system: prompt.system, messages: [{ role: 'user', content: user }], promptBlocks: prompt.promptBlocks };
 }
-function buildMomentReplyPayload(char, moment, playerComment, memoryPack = '') {
-  const prompt = buildMomentSceneSystem(char, '朋友圈评论回复', 'moment-reply', memoryPack, `当前触发情况：${playerName()}刚在朋友圈评论了${char.name}的动态，${char.name}已经看到了这条评论。
-${char.name}现在是在朋友圈评论区回复，不是在私聊里回复。
+function buildMomentReplyPayload(char, moment, playerComment, memoryPack = '', threadContext = {}) {
+  const playerOwnMoment = moment.authorType === 'player';
+  const triggerDescription = playerOwnMoment
+    ? `${playerName()}刚回复了${char.name}此前在${playerName()}朋友圈下的评论，${char.name}已经看到了这条回复。`
+    : `${playerName()}刚在朋友圈评论了${char.name}的动态，${char.name}已经看到了这条评论。`;
+  const prompt = buildMomentSceneSystem(char, '朋友圈评论回复', 'moment-reply', memoryPack, `当前触发情况：${triggerDescription}
+${char.name}现在是在同一条朋友圈的评论区继续互动，不是在私聊里回复。
 以下 JSON 要求只是后端识别格式，不代表角色知道系统流程。
 只允许输出 JSON，不要输出解释：{"comment":"回复评论正文或空字符串"}
 规则：
 1. comment 只能是评论区回复正文，禁止动作、神态、心理、旁白、系统说明。
-2. 不要输出 like/timeline/text 等字段，不要让角色重新发一条朋友圈。
+2. 不要输出 like/timeline/text 等字段，不要让角色重新发一条朋友圈，也不要假装这是私聊。
 3. 回复默认 4-35 个中文字符，像真实朋友圈评论区互动。
 4. 可以根据性格、关系、评论内容和当下情绪决定不回复；不回复时 comment 返回空字符串。
 5. 不要用“看到了”“嗯”“已阅”凑回复。只有真的有话要接、调侃、解释、追问或回应情绪时才写 comment。`);
-  const user = `朋友圈作者：${char.name}
+  const authorName = playerOwnMoment ? playerName() : char.name;
+  const targetLine = threadContext.targetComment?.text
+    ? `本次回复的是${char.name}此前的评论：${threadContext.targetComment.text}`
+    : `本次是${playerName()}对动态发来的新评论。`;
+  const user = `朋友圈作者：${authorName}
 朋友圈正文：${moment.text}
 已有评论：
 ${(moment.comments || []).map(c => `${c.name || charName(characters.find(ch => ch.id === c.charId))}：${c.text}`).join('\n') || '无'}
 
-${playerName()}刚评论：${playerComment}
+${targetLine}
+${playerName()}刚发来的评论区文字：${playerComment}
 
 请以 ${char.name} 的性格决定是否回复这条评论。`;
   return { system: prompt.system, messages: [{ role: 'user', content: user }], promptBlocks: prompt.promptBlocks };

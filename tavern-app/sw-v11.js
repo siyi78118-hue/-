@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v66';
+const CACHE_NAME = 'rpchat-v67';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -693,8 +693,12 @@ function buildBackgroundMomentContext(allMoments, characters, charId, settings =
       : charName((characters || []).find(c => c.id === moment.charId));
     const parts = [`${formatFullTime(new Date(moment.time || Date.now()))}｜${author}发了朋友圈：“${momentSnippet(moment.text, 80)}”`];
     if ((moment.likes || []).includes(charId)) parts.push(`${charName((characters || []).find(c => c.id === charId))}点过赞`);
-    const ownComments = (moment.comments || []).filter(c => c.charId === charId);
-    ownComments.forEach(c => parts.push(`${charName((characters || []).find(ch => ch.id === charId))}评论过：“${momentSnippet(c.text, 60)}”`));
+    const threadComments = (moment.comments || []).filter(c => c.charId === charId || (c.charId === 'player' && (moment.charId === charId || c.replyToCharId === charId)));
+    threadComments.forEach(c => {
+      const speaker = c.charId === 'player' ? playerName(settings) : charName((characters || []).find(ch => ch.id === charId));
+      const repliedTo = c.replyToName ? `回复${c.replyToName}` : '评论';
+      parts.push(`${speaker}${repliedTo}：“${momentSnippet(c.text, 60)}”`);
+    });
     return `- ${parts.join('；')}`;
   });
   return `以下是最近朋友圈上下文，角色可以自然记得自己看过、点赞过、评论过或发过的动态；不要提到“系统记录/上下文”。\n${lines.join('\n')}`;
