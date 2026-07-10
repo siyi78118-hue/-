@@ -1,9 +1,10 @@
-const CACHE_NAME = 'rpchat-v60';
+const CACHE_NAME = 'rpchat-v61';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const API_TIMEOUT_MS = 120000;
+const MEMORY_MAX_TOKENS = 4096;
 const CALL_LOG_LIMIT = 30;
 const VECTOR_DIM = 384;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
@@ -496,7 +497,14 @@ function streamDeltaText(json) {
     || textFromContent(json?.output_text)
     || textFromContent(json?.content)
     || textFromContent(json?.text)
-  ).trim();
+  );
+}
+function mergeStreamText(current = '', incoming = '') {
+  const before = String(current || '');
+  const next = String(incoming || '');
+  if (!next) return before;
+  if (next === before || (next.length > before.length && next.startsWith(before))) return next;
+  return before + next;
 }
 
 function extractJson(text) {
@@ -568,7 +576,7 @@ async function readStreamText(resp) {
       try {
         const parsed = JSON.parse(t.slice(6));
         const delta = streamDeltaText(parsed);
-        if (delta) result += delta;
+        if (delta) result = mergeStreamText(result, delta);
       } catch {}
     }
   }
@@ -986,13 +994,13 @@ ${triggerText}
 }
 
 function hasBackgroundMemoryApi(settings = {}) {
-  return !!((settings.memoryApiUrl || settings.apiUrl) && (settings.memoryApiKey || settings.apiKey) && settings.memoryModel);
+  return !!(settings.memoryApiUrl && settings.memoryApiKey && settings.memoryModel);
 }
 
 async function callBackgroundMemoryJSON(settings = {}, system, user, options = {}) {
-  const apiType = settings.memoryApiType || settings.apiType || 'openai';
-  const apiUrl = settings.memoryApiUrl || settings.apiUrl || '';
-  const apiKey = cleanApiKey(settings.memoryApiKey || settings.apiKey || '');
+  const apiType = settings.memoryApiType || 'openai';
+  const apiUrl = settings.memoryApiUrl || '';
+  const apiKey = cleanApiKey(settings.memoryApiKey || '');
   const model = settings.memoryModel || '';
   if (!apiUrl || !apiKey || !model) throw new Error('memory api not configured');
   const startedAt = Date.now();
@@ -1004,7 +1012,7 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
       const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model, system, messages, max_tokens: 900, temperature: 0.2 })
+        body: JSON.stringify({ model, system, messages, max_tokens: MEMORY_MAX_TOKENS, temperature: 0.2 })
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
@@ -1025,7 +1033,7 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
       const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: 900 })
+        body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: MEMORY_MAX_TOKENS })
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();

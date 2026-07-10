@@ -1010,9 +1010,10 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.46';
+const APP_BUILD_VERSION = '2026-07-10.47';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
+const MEMORY_MAX_TOKENS = 4096;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
@@ -3820,26 +3821,7 @@ function localEmbedding(text, dim = VECTOR_DIM) {
   return normalizeVector(vec);
 }
 async function createEmbedding(text) {
-  const api = getApiSlot('memory');
-  const apiType = settings[api.apiTypeKey] || 'openai';
-  const apiUrl = settings[api.apiUrlKey] || '';
-  const apiKey = assertHeaderSafe(cleanApiKey(settings[api.apiKeyKey] || ''), `${api.label} Key`);
-  if (apiType === 'openai' && apiUrl && apiKey && settings.memoryModel) {
-    try {
-      const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/embeddings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({ model: settings.memoryModel, input: text })
-      }, API_TIMEOUT_MS);
-      if (resp.ok) {
-        const json = await resp.json();
-        const vector = json.data?.[0]?.embedding || json.embedding;
-        if (Array.isArray(vector) && vector.length) return normalizeVector(vector.map(Number));
-      }
-    } catch (err) {
-      console.warn('[AL Memory] embedding fallback:', err.message);
-    }
-  }
+  // 记忆模型只负责生成检索词；向量始终留在设备本地，避免误把聊天模型当嵌入模型调用。
   return localEmbedding(text);
 }
 function cosine(a, b) {
@@ -3871,7 +3853,7 @@ async function callMemoryJSON(system, user, options = {}) {
       const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: settings.memoryModel, system, messages, max_tokens: 1800, temperature: 0.2 })
+        body: JSON.stringify({ model: settings.memoryModel, system, messages, max_tokens: MEMORY_MAX_TOKENS, temperature: 0.2 })
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
@@ -3892,7 +3874,7 @@ async function callMemoryJSON(system, user, options = {}) {
       const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: 1800 })
+        body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: MEMORY_MAX_TOKENS })
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();

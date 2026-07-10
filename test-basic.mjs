@@ -12,10 +12,19 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v60';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v61';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.46';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.47';/);
+assert.match(script, /const MEMORY_MAX_TOKENS = 4096;/);
+assert.match(swScript, /const MEMORY_MAX_TOKENS = 4096;/);
+assert.doesNotMatch(script, /\/embeddings/);
+assert.match(script, /async function createEmbedding\(text\) \{[\s\S]*return localEmbedding\(text\);/);
+assert.match(swScript, /return !!\(settings\.memoryApiUrl && settings\.memoryApiKey && settings\.memoryModel\);/);
+assert.doesNotMatch(swScript, /settings\.memoryApiUrl \|\| settings\.apiUrl/);
+assert.doesNotMatch(swScript, /settings\.memoryApiKey \|\| settings\.apiKey/);
+assert.match(swScript, /function mergeStreamText\(current = '', incoming = ''\)/);
+assert.match(swScript, /result = mergeStreamText\(result, delta\)/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.7';/);
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
 assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
@@ -410,6 +419,7 @@ const context = {
     querySelectorAll: () => [],
   },
 };
+const modelListFetch = context.fetch;
 
 vm.createContext(context);
 vm.runInContext(`${script}
@@ -432,6 +442,7 @@ globalThis.__appTest = {
   selectFetchedModel,
   recentMessages,
   localEmbedding,
+  createEmbedding,
   cosine,
   cleanApiKey,
   getTimeContext,
@@ -479,7 +490,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -684,6 +695,24 @@ vm.runInContext("settings.memoryApiUrl='https://memory.example/v1'; settings.mem
 const skippedMemoryQuery = await generateMemoryQuery(v2, '你还记得红包吗？', []);
 assert.equal(skippedMemoryQuery._memoryAiStatus, 'skipped');
 assert.match(getModelCallLogs()[0].diagnostic, /缺少模型/);
+clearModelCallLogs();
+context.fetch = async (url, options = {}) => {
+  fetchCalls.push({ url: String(url), options });
+  return {
+    ok: true,
+    text: async () => JSON.stringify({ choices: [{ message: { content: '{"query":"红包约定","keywords":["红包","约定"],"focus":"payment"}' } }] })
+  };
+};
+vm.runInContext("settings.memoryApiUrl='https://memory.example/v1'; settings.memoryApiKey='sk-memory'; settings.memoryModel='memory-chat-model'; settings.memoryApiType='openai';", context);
+const memoryNetworkStart = fetchCalls.length;
+const successfulMemoryQuery = await generateMemoryQuery(v2, '你还记得红包吗？', []);
+assert.equal(successfulMemoryQuery._memoryAiStatus, 'ok');
+assert.equal(fetchCalls.length, memoryNetworkStart + 1);
+assert.match(fetchCalls.at(-1).url, /\/chat\/completions$/);
+const memoryNetworkAfterQuery = fetchCalls.length;
+await createEmbedding('红包约定');
+assert.equal(fetchCalls.length, memoryNetworkAfterQuery, '本地向量化不得额外调用记忆 API');
+context.fetch = modelListFetch;
 clearModelCallLogs();
 vm.runInContext("settings.memoryApiUrl=''; settings.memoryApiKey=''; settings.memoryModel='';", context);
 assert.equal(await testMemoryQueryPreset(), false);
