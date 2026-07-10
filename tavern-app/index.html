@@ -156,9 +156,9 @@ button{border:none;background:none;cursor:pointer}
 .textarea{min-height:86px;resize:vertical;line-height:1.6;padding:8px 0}
 .select{appearance:none}
 .range{width:100%;accent-color:var(--green)}
-.primary{height:46px;margin:16px 14px calc(18px + var(--safe-bottom));border-radius:5px;background:var(--green);color:#fff;font-size:17px;display:flex;align-items:center;justify-content:center}
+.primary{width:calc(100% - 28px);height:46px;margin:16px 14px calc(18px + var(--safe-bottom));border-radius:5px;background:var(--green);color:#fff;font-size:17px;display:flex;align-items:center;justify-content:center}
 .primary:active{background:#06ad56}
-.secondary{height:44px;margin:10px 14px 0;border-radius:5px;background:#fff;color:#111;font-size:16px;display:flex;align-items:center;justify-content:center;border:1px solid var(--line)}
+.secondary{width:calc(100% - 28px);height:44px;margin:10px 14px 0;border-radius:5px;background:#fff;color:#111;font-size:16px;display:flex;align-items:center;justify-content:center;border:1px solid var(--line)}
 .secondary:last-child{margin-bottom:calc(18px + var(--safe-bottom))}
 .inline-btn{height:34px;padding:0 12px;border-radius:5px;background:#f1f1f1;color:#111;font-size:13px;white-space:nowrap}
 .inline-btn:active{background:#e6e6e6}
@@ -229,11 +229,6 @@ button{border:none;background:none;cursor:pointer}
 .pay-card-note{font-size:12px;opacity:.86;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pay-card-foot{height:24px;padding:0 10px;background:#fff;color:#999;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:8px}
 .pay-status-tip{align-self:center;max-width:86%;padding:2px 8px;border-radius:3px;background:#d4d4d4;color:#fff;font-size:12px;line-height:1.6;text-align:center}
-.wallet-tools{display:grid;grid-template-columns:repeat(2,1fr);background:#fff;margin-bottom:8px}
-.wallet-tool{height:92px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-size:15px;color:#111;position:relative}
-.wallet-tool:first-child:after{content:"";position:absolute;right:0;top:18px;bottom:18px;width:1px;background:#f0f0f0}
-.wallet-tool .wx-icon{width:36px;height:36px}
-.wallet-balance-mini{color:#888;font-size:12px;margin-top:-3px}
 .wallet-note{padding:8px 16px 18px;color:#999;font-size:12px;line-height:1.55}
 .pay-target{padding:24px 18px;background:#fff;display:flex;align-items:center;gap:12px;margin-bottom:8px}
 .pay-target .avatar{width:46px;height:46px}
@@ -272,7 +267,7 @@ button.profile-top{width:100%;text-align:left}
 .contact-profile-name{font-size:22px;font-weight:600;line-height:1.25;margin-bottom:7px;word-break:break-word}
 .contact-profile-id{color:#777;font-size:13px;line-height:1.45}
 .contact-profile-actions{padding:8px 12px;background:#ededed}
-.contact-profile-actions .primary{margin:8px 2px 10px}
+.contact-profile-actions .primary{width:calc(100% - 4px);margin:8px 2px 10px}
 .profile-detail-text{color:#666;font-size:15px;line-height:1.55;white-space:pre-wrap}
 .chat-info-people{display:flex;gap:18px;padding:22px 18px;background:#fff;margin-bottom:8px}
 .chat-info-person{width:58px;display:flex;flex-direction:column;align-items:center;gap:8px;color:#555;font-size:12px;text-align:center}
@@ -366,7 +361,6 @@ button.profile-top{width:100%;text-align:left}
   </div>
 
   <div id="plus-menu" class="plus-menu">
-    <button class="plus-item" onclick="showScreen('contacts')"><span class="mini-menu-icon file"></span>发起聊天</button>
     <button class="plus-item" onclick="openCreateRole()"><span class="mini-menu-icon edit"></span>新建角色</button>
     <button class="plus-item" onclick="openImport()"><span class="mini-menu-icon file"></span>导入角色卡</button>
   </div>
@@ -388,7 +382,7 @@ button.profile-top{width:100%;text-align:left}
     <div class="topbar">
       <div class="top-left"></div>
       <div class="top-title">通讯录</div>
-      <div class="top-right"><button class="icon-btn" onclick="openCreateRole()">＋</button></div>
+      <div class="top-right"></div>
     </div>
     <div class="scroll">
       <div class="search-bar"><button class="search-box" onclick="openSearch('contacts')" type="button"><span class="icon-search" style="transform:scale(.42);width:18px;height:18px"></span><span id="search-label-contacts">搜索</span></button></div>
@@ -409,7 +403,7 @@ button.profile-top{width:100%;text-align:left}
 
   <div id="screen-contact-profile" class="screen">
     <div class="topbar">
-      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('contacts')">‹</button></div>
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen(contactProfileReturnScreen || 'contacts')">‹</button></div>
       <div class="top-title">个人资料</div>
       <div class="top-right"></div>
     </div>
@@ -458,7 +452,7 @@ button.profile-top{width:100%;text-align:left}
     <div class="scroll" style="background:#ededed">
       <div class="profile-card">
         <div class="profile-cover"></div>
-        <button class="profile-top" onclick="showScreen('self-profile')" type="button">
+        <button class="profile-top" onclick="openSelfProfile('me')" type="button">
           <div id="me-player-avatar" class="avatar large">我</div>
           <div style="flex:1;min-width:0">
             <div class="profile-name" id="me-player-name">玩家</div>
@@ -488,7 +482,7 @@ button.profile-top{width:100%;text-align:left}
 
   <div id="screen-self-profile" class="screen">
     <div class="topbar">
-      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('me')">‹</button></div>
+      <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen(selfProfileReturnScreen || 'me')">‹</button></div>
       <div class="top-title">个人信息</div>
       <div class="top-right"></div>
     </div>
@@ -509,10 +503,6 @@ button.profile-top{width:100%;text-align:left}
       <div class="top-right"></div>
     </div>
     <div class="scroll" style="background:#ededed">
-      <div class="wallet-tools">
-        <button class="wallet-tool" onclick="toast('零钱余额 ' + formatMoney(walletBalance()))" type="button"><span class="wx-icon green wx-card"></span><span>零钱</span><span class="wallet-balance-mini" id="wallet-balance">¥0.00</span></button>
-        <button class="wallet-tool" onclick="focusWalletRecharge()" type="button"><span class="wx-icon orange wx-new"></span><span>充值</span><span class="wallet-balance-mini">给 AL 零钱加钱</span></button>
-      </div>
       <div class="cell-group">
         <div class="cell"><span class="wx-icon green wx-card"></span><div class="cell-body">零钱</div><div class="mini" id="wallet-balance-row">¥0.00</div></div>
         <div class="cell"><div class="cell-label">充值金额</div><div class="cell-body"><input class="input" id="wallet-recharge-amount" type="number" min="0" step="0.01" placeholder="随意输入金额"></div></div>
@@ -592,7 +582,7 @@ button.profile-top{width:100%;text-align:left}
           <span id="modal-char-avatar-preview" class="avatar"></span>
           <span id="chat-info-char-label">角色</span>
         </button>
-        <button class="chat-info-person" onclick="showScreen('self-profile')" type="button">
+        <button class="chat-info-person" onclick="openSelfProfile('chat-info')" type="button">
           <span id="chat-info-player-avatar-preview" class="avatar">我</span>
           <span id="chat-info-player-label">我</span>
         </button>
@@ -726,7 +716,6 @@ button.profile-top{width:100%;text-align:left}
           <input type="file" id="backup-input" accept="application/json,.json" style="display:none" onchange="importBackup(event)">
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
         </div>
-        <button class="primary" onclick="saveSettings()">保存</button>
       </div>
     </div>
   </div>
@@ -745,9 +734,7 @@ button.profile-top{width:100%;text-align:left}
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body" id="memory-status">IndexedDB 保存摘要、事件、资料和向量索引。</div></div>
         </div>
         <div class="cell-group">
-          <button class="cell" onclick="addMemoryItem('profiles')" type="button"><div class="cell-label">新增</div><div class="cell-body">新增资料</div><div class="mini">›</div></button>
-          <button class="cell" onclick="addMemoryItem('events')" type="button"><div class="cell-label">新增</div><div class="cell-body">新增事件</div><div class="mini">›</div></button>
-          <button class="cell" onclick="addMemoryItem('summaries')" type="button"><div class="cell-label">新增</div><div class="cell-body">新增摘要</div><div class="mini">›</div></button>
+          <button class="cell" onclick="addMemoryItem('profiles')" type="button"><div class="cell-label">新增</div><div class="cell-body">新增记忆</div><div class="mini">›</div></button>
           <button class="cell" onclick="runMemoryNow()" type="button"><div class="cell-label">整理</div><div class="cell-body">立即提炼当前会话</div><div class="mini">›</div></button>
           <button class="cell" onclick="clearCurrentMemory()" type="button"><div class="cell-label">清理</div><div class="cell-body">清空当前角色记忆</div><div class="mini">›</div></button>
         </div>
@@ -1010,7 +997,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.48';
+const APP_BUILD_VERSION = '2026-07-10.50';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1089,6 +1076,8 @@ let profileCharId = null;
 let isStreaming = false;
 let streamingDraft = null;
 let lastMainScreen = 'chats';
+let contactProfileReturnScreen = 'contacts';
+let selfProfileReturnScreen = 'me';
 let memoryReturnScreen = 'settings';
 let memoryTargetCharId = '';
 let memoryEditorState = { storeName: 'profiles', id: '', lastStoreName: 'profiles' };
@@ -2069,8 +2058,13 @@ function toggleChatMuted() {
 function openContactProfile(charId) {
   const char = characters.find(c => c.id === charId);
   if (!char) return;
+  contactProfileReturnScreen = activeScreen && activeScreen !== 'contact-profile' ? activeScreen : 'contacts';
   profileCharId = charId;
   showScreen('contact-profile');
+}
+function openSelfProfile(returnScreen = activeScreen) {
+  selfProfileReturnScreen = returnScreen && returnScreen !== 'self-profile' ? returnScreen : 'me';
+  showScreen('self-profile');
 }
 function renderContactProfile() {
   const char = characters.find(c => c.id === profileCharId);
@@ -2109,7 +2103,6 @@ function renderPlayerProfile() {
   setAvatarPreview('moments-player-avatar', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
   setAvatarPreview('player-avatar-preview', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
   setAvatarPreview('chat-info-player-avatar-preview', settings.playerAvatarData, settings.playerAvatar || name.slice(0, 1) || '我');
-  renderWalletPreview();
 }
 function walletBalance() {
   return Math.max(0, Number(settings.walletBalance) || 0);
@@ -2121,24 +2114,11 @@ function saveWalletBalance(value) {
   settings.walletBalance = Math.max(0, Math.round((Number(value) || 0) * 100) / 100);
   DB.set('settings', settings);
   renderWallet();
-  renderWalletPreview();
-}
-function renderWalletPreview() {
-  const el = document.getElementById('me-wallet-preview');
-  if (el) el.textContent = formatMoney(walletBalance());
 }
 function renderWallet() {
   const amount = formatMoney(walletBalance());
-  const el = document.getElementById('wallet-balance');
-  if (el) el.textContent = amount;
   const row = document.getElementById('wallet-balance-row');
   if (row) row.textContent = amount;
-  renderWalletPreview();
-}
-function focusWalletRecharge() {
-  const input = document.getElementById('wallet-recharge-amount');
-  input?.focus();
-  input?.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 function rechargeWallet() {
   const input = document.getElementById('wallet-recharge-amount');
@@ -2341,7 +2321,7 @@ function renderMomentItem(moment) {
   </div>` : '';
   const seenNames = momentSeenNames(moment);
   const seenLine = seenNames.length ? `<div class="moment-seen-line">${esc(seenNames.join('、'))}已看过</div>` : '';
-  const authorClick = author.isPlayer ? "showScreen('self-profile')" : `openContactProfile('${moment.charId}')`;
+  const authorClick = author.isPlayer ? "openSelfProfile('moments')" : `openContactProfile('${moment.charId}')`;
   const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `openMomentReplyBar('${moment.id}')`;
   return `<div class="moment">
     ${author.avatar}
