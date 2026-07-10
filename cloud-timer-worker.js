@@ -13,17 +13,19 @@
 // role prompts, summaries, or API keys.
 //
 // Important quota note:
-// Workers KV Free has a very small daily quota for list operations. Do not scan
-// jobs with KV.list() every minute. Jobs are bucketed by due minute so the cron
-// path only performs direct KV.get() calls.
+// Workers KV Free has a very small daily quota. Do not scan jobs with KV.list()
+// every minute. Dice jobs arrive with their successful roll already precomputed,
+// so empty 10-minute rolls do not create KV writes or wake the phone.
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-09.7';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-10.9';
 const RECENT_EVENT_LIMIT = 40;
+const IDLE_CRON_HEARTBEAT_MINUTES = 10;
+const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 export default {
   async fetch(request, env) {
@@ -62,6 +64,8 @@ export default {
           mode: body.mode === 'dice' ? 'dice' : 'planned',
           rollChance: Number.isFinite(Number(body.rollChance)) ? Number(body.rollChance) : undefined,
           diceIntervalMs: Number.isFinite(Number(body.diceIntervalMs)) ? Number(body.diceIntervalMs) : undefined,
+          diceRolls: Number.isFinite(Number(body.diceRolls)) ? Number(body.diceRolls) : undefined,
+          dicePrecomputed: !!body.dicePrecomputed,
           test: !!body.test,
           updatedAt: Date.now()
         };
@@ -144,8 +148,14 @@ async function runDueJobs(env) {
     throw err;
   } finally {
     summary.finishedAt = Date.now();
-    await env.AL_TIMER_KV.put('meta:lastCron', JSON.stringify(summary), { expirationTtl: 3 * 24 * 60 * 60 });
-    await appendEvent(env, { type: 'cron', ok: summary.ok, buckets: summary.buckets, jobsSeen: summary.jobsSeen, delivered: summary.delivered, retry: summary.retry, failed: summary.failed, missing: summary.missing, error: summary.error });
+    const hasActivity = !summary.ok || summary.jobsSeen > 0 || summary.delivered > 0 || summary.retry > 0 || summary.failed > 0 || summary.missing > 0;
+    const heartbeatDue = nowMinute % IDLE_CRON_HEARTBEAT_MINUTES === 0;
+    if (hasActivity || heartbeatDue) {
+      await env.AL_TIMER_KV.put('meta:lastCron', JSON.stringify(summary), { expirationTtl: 3 * 24 * 60 * 60 });
+    }
+    if (hasActivity) {
+      await appendEvent(env, { type: 'cron', ok: summary.ok, buckets: summary.buckets, jobsSeen: summary.jobsSeen, delivered: summary.delivered, retry: summary.retry, failed: summary.failed, missing: summary.missing, error: summary.error });
+    }
   }
 }
 
@@ -166,7 +176,7 @@ async function saveJob(job, env) {
   const raw = await env.AL_TIMER_KV.get(bucketKey);
   const ids = raw ? JSON.parse(raw) : [];
   if (!ids.includes(job.jobId)) ids.push(job.jobId);
-  await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: 3 * 24 * 60 * 60 });
+  await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
 }
 
 async function removeJobFromBucket(bucketKey, jobId, env) {
@@ -174,7 +184,7 @@ async function removeJobFromBucket(bucketKey, jobId, env) {
   if (!raw) return;
   const ids = JSON.parse(raw).filter(id => id !== jobId);
   if (ids.length) {
-    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: 3 * 24 * 60 * 60 });
+    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
   } else {
     await env.AL_TIMER_KV.delete(bucketKey);
   }
@@ -220,6 +230,8 @@ async function jobStatus(jobId, deviceId, env) {
       mode: job.mode || '',
       rollChance: job.rollChance,
       diceIntervalMs: job.diceIntervalMs,
+      diceRolls: job.diceRolls,
+      dicePrecomputed: !!job.dicePrecomputed,
       test: !!job.test,
       updatedAt: job.updatedAt || 0
     } : null
@@ -271,7 +283,7 @@ async function runDueMinute(env, minute) {
     }
   }
   if (remaining.length) {
-    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(remaining), { expirationTtl: 3 * 24 * 60 * 60 });
+    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(remaining), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
   } else {
     await env.AL_TIMER_KV.delete(bucketKey);
   }
@@ -295,6 +307,8 @@ async function deliverJob(job, env) {
     mode: job.mode || 'planned',
     rollChance: job.rollChance,
     diceIntervalMs: job.diceIntervalMs,
+    diceRolls: job.diceRolls,
+    dicePrecomputed: !!job.dicePrecomputed,
     dueAt: job.dueAt || '',
     test: !!job.test
   });

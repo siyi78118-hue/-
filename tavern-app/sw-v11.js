@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v68';
+const CACHE_NAME = 'rpchat-v69';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -14,6 +14,7 @@ const MEMORY_LINE_CHAR_LIMIT = 360;
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
+const PROACTIVE_DICE_MAX_ROLLS = 432;
 let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {
@@ -1365,7 +1366,22 @@ function proactiveDelayMs(settings, kind = 'chat') {
 function proactiveJobMode(job) {
   return job?.mode === 'dice' ? 'dice' : 'planned';
 }
+function proactiveDicePlan(options = {}, now = Date.now(), randomValue = Math.random()) {
+  const intervalMs = Math.max(60000, Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS);
+  const rawChance = Number(options.rollChance ?? PROACTIVE_DICE_CHANCE);
+  const chance = Number.isFinite(rawChance) ? Math.max(0, Math.min(1, rawChance)) : PROACTIVE_DICE_CHANCE;
+  const rawRandom = Number(randomValue);
+  const random = Number.isFinite(rawRandom) ? Math.max(0, Math.min(1 - Number.EPSILON, rawRandom)) : Math.random();
+  let rolls = 1;
+  if (chance <= 0) rolls = PROACTIVE_DICE_MAX_ROLLS;
+  else if (chance < 1) rolls = Math.floor(Math.log(1 - random) / Math.log(1 - chance)) + 1;
+  rolls = Math.max(1, Math.min(PROACTIVE_DICE_MAX_ROLLS, rolls));
+  const parsedNow = now instanceof Date ? now.getTime() : Number(now);
+  const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+  return { dueAt: new Date(nowMs + rolls * intervalMs), rolls, intervalMs, rollChance: chance };
+}
 function rollProactiveDice(job = null) {
+  if (job?.dicePrecomputed) return true;
   const chance = Math.max(0, Math.min(1, Number(job?.rollChance ?? PROACTIVE_DICE_CHANCE) || 0));
   return Math.random() < chance;
 }
@@ -1390,18 +1406,21 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
   const jobKey = proactiveJobKey(kind);
   const previousJob = chat[jobKey] ? { ...chat[jobKey] } : null;
   const mode = options.mode === 'dice' ? 'dice' : 'planned';
-  const dueAtMs = Date.now() + (mode === 'dice' ? (Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS) : proactiveDelayMs(settings, kind));
+  const dicePlan = mode === 'dice' ? proactiveDicePlan(options) : null;
+  const dueAtMs = dicePlan?.dueAt.getTime() || (Date.now() + proactiveDelayMs(settings, kind));
   const jobId = proactiveJobId(settings, charId, kind);
   chat[jobKey] = { jobId, dueAt: new Date(dueAtMs).toISOString(), kind, mode };
   if (mode === 'dice') {
-    chat[jobKey].rollChance = Number(options.rollChance ?? PROACTIVE_DICE_CHANCE);
-    chat[jobKey].diceIntervalMs = Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS;
+    chat[jobKey].rollChance = dicePlan.rollChance;
+    chat[jobKey].diceIntervalMs = dicePlan.intervalMs;
+    chat[jobKey].diceRolls = dicePlan.rolls;
+    chat[jobKey].dicePrecomputed = true;
   }
   try {
     const resp = await fetchWithTimeout(timerUrl(settings, '/schedule'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind, mode: proactiveJobMode(chat[jobKey]), rollChance: chat[jobKey].rollChance, diceIntervalMs: chat[jobKey].diceIntervalMs })
+      body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind, mode: proactiveJobMode(chat[jobKey]), rollChance: chat[jobKey].rollChance, diceIntervalMs: chat[jobKey].diceIntervalMs, diceRolls: chat[jobKey].diceRolls, dicePrecomputed: !!chat[jobKey].dicePrecomputed })
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('schedule failed ' + resp.status);
     if (previousJob?.jobId && previousJob.jobId !== chat[jobKey].jobId) {

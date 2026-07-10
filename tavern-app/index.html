@@ -997,13 +997,14 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.54';
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
+const APP_BUILD_VERSION = '2026-07-10.55';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-10.9';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
+const PROACTIVE_DICE_MAX_ROLLS = 432;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const CALL_LOG_LIMIT = 30;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
@@ -5004,7 +5005,22 @@ function proactiveDefaultScheduleOptions(kind = 'chat', chat = null) {
     ? { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE }
     : { mode: 'planned' };
 }
+function proactiveDicePlan(options = {}, now = Date.now(), randomValue = Math.random()) {
+  const intervalMs = Math.max(60000, Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS);
+  const rawChance = Number(options.rollChance ?? PROACTIVE_DICE_CHANCE);
+  const chance = Number.isFinite(rawChance) ? Math.max(0, Math.min(1, rawChance)) : PROACTIVE_DICE_CHANCE;
+  const rawRandom = Number(randomValue);
+  const random = Number.isFinite(rawRandom) ? Math.max(0, Math.min(1 - Number.EPSILON, rawRandom)) : Math.random();
+  let rolls = 1;
+  if (chance <= 0) rolls = PROACTIVE_DICE_MAX_ROLLS;
+  else if (chance < 1) rolls = Math.floor(Math.log(1 - random) / Math.log(1 - chance)) + 1;
+  rolls = Math.max(1, Math.min(PROACTIVE_DICE_MAX_ROLLS, rolls));
+  const parsedNow = now instanceof Date ? now.getTime() : Number(now);
+  const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
+  return { dueAt: new Date(nowMs + rolls * intervalMs), rolls, intervalMs, rollChance: chance };
+}
 function rollProactiveDice(kind = 'chat', job = null) {
+  if (job?.dicePrecomputed) return true;
   const chance = Math.max(0, Math.min(1, Number(job?.rollChance ?? PROACTIVE_DICE_CHANCE) || 0));
   return Math.random() < chance;
 }
@@ -5099,14 +5115,15 @@ async function scheduleCloudProactive(charId, kind = 'chat', options = {}) {
   const previousJob = chat[jobKey] ? { ...chat[jobKey] } : null;
   const previousSync = chat[syncKey] || 0;
   const mode = options.mode === 'dice' ? 'dice' : 'planned';
-  const dueAt = mode === 'dice'
-    ? new Date(Date.now() + (Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS))
-    : clampProactiveDueAt(options.dueAt, kind);
+  const dicePlan = mode === 'dice' ? proactiveDicePlan(options) : null;
+  const dueAt = dicePlan?.dueAt || clampProactiveDueAt(options.dueAt, kind);
   const jobId = proactiveJobId(charId, kind);
   chat[jobKey] = { jobId, dueAt: dueAt.toISOString(), kind, mode };
   if (mode === 'dice') {
-    chat[jobKey].rollChance = Number(options.rollChance ?? PROACTIVE_DICE_CHANCE);
-    chat[jobKey].diceIntervalMs = Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS;
+    chat[jobKey].rollChance = dicePlan.rollChance;
+    chat[jobKey].diceIntervalMs = dicePlan.intervalMs;
+    chat[jobKey].diceRolls = dicePlan.rolls;
+    chat[jobKey].dicePrecomputed = true;
   }
   DB.set('chats', allChats);
   if (!cloudTimerTransportReady()) return true;
@@ -5150,7 +5167,7 @@ async function postCloudSchedule(charId, job, kind = 'chat') {
   const resp = await fetchWithTimeout(timerUrl('/schedule'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId, charId, dueAt: job.dueAt, type: 'proactive', kind, mode: proactiveJobMode(job), rollChance: job.rollChance, diceIntervalMs: job.diceIntervalMs })
+    body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId, charId, dueAt: job.dueAt, type: 'proactive', kind, mode: proactiveJobMode(job), rollChance: job.rollChance, diceIntervalMs: job.diceIntervalMs, diceRolls: job.diceRolls, dicePrecomputed: !!job.dicePrecomputed })
   }, API_TIMEOUT_MS);
   if (!resp.ok) throw new Error('云闹钟安排失败：' + resp.status);
   verifyCloudJobStatus(charId, job, kind).catch(err => {
