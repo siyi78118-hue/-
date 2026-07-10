@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v73';
+const CACHE_NAME = 'rpchat-v74';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -1006,7 +1006,10 @@ function composeMemoryPackSections(prefix, sections = [], budget = MEMORY_PACK_C
 }
 
 function messageLine(m, char, settings = {}) {
-  return `${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
+  const timestamp = Number(m?.time);
+  const timeText = Number.isFinite(timestamp) && timestamp > 0 ? formatFullTime(new Date(timestamp)) : '时间未知';
+  if (m?.hidden) return `【消息时间｜${timeText}】【隐藏事件】${m.content}`;
+  return `【消息时间｜${timeText}】${m.role === 'user' ? playerName(settings) : charName(char)}：${m.content}`;
 }
 
 async function searchMemoryVectors(charId, queryText, limit = 8) {
@@ -1297,7 +1300,6 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '', scen
     getAll('events'),
     getAll('profiles')
   ]).then(([hits, summaries, events, profiles]) => {
-    const latestSummaries = summaries.filter(r => r.charId === charId && shouldKeepSummary(memoryAliasText(r.content, char, settings))).sort((a, b) => b.createdAt - a.createdAt).slice(0, 3).reverse();
     const vectorKeys = new Set(hits.map(hit => `${hit.sourceType}:${hit.sourceId}`));
     if (query._memoryAiStatus === 'ok') {
       const keywordText = (query.keywords || []).slice(0, 5).join('、') || query.query || '已生成检索词';
@@ -1306,11 +1308,10 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '', scen
     const keywordRows = searchKeywordMemoryRows({ summaries, events, profiles }, recallText, query.keywords || [], char, settings, 5)
       .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
     return composeMemoryPackSections(
-      '以下是手机本地记忆库提供给你的参考。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。',
+      '以下是记忆AI根据本次触发原因筛选出的手机本地记忆补充。不要提到记忆库、系统、推送或后台，只把它自然转化成角色发来的微信消息。',
       [
-        { title: '近期增量摘要', priority: 10, lines: latestSummaries.map(s => memoryAliasText(s.content, char, settings)) },
-        { title: '本轮向量召回记忆', priority: 20, lines: hits.map(h => memoryAliasText(h.text, char, settings)) },
-        { title: '当前触发原因命中的本地记忆', priority: 30, lines: keywordRows.map(row => `${row.text}${row.reason ? `（触发：${row.reason}）` : ''}`) }
+        { title: '本轮相关记忆', priority: 10, lines: hits.map(h => memoryAliasText(h.text, char, settings)) },
+        { title: '关键词补充记忆', priority: 20, lines: keywordRows.map(row => `${row.text}${row.reason ? `（触发：${row.reason}）` : ''}`) }
       ]
     );
   });

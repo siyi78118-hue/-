@@ -12,10 +12,27 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v73';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v74';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.59';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.60';/);
+assert.match(script, /const MEMORY_BATCH_SIZE = 30;/);
+assert.doesNotMatch(html, /id="set-memory-interval"/);
+assert.match(script, /const interval = MEMORY_BATCH_SIZE;/);
+assert.match(script, /memoryInterval: MEMORY_BATCH_SIZE/);
+assert.match(script, /function processMemoryAfterScenario\(charId\) \{\s*processMemoryAfterTurn\(charId\)/);
+assert.match(script, /function resolveMemoryEventTime\(event, batch = \[\]\)/);
+assert.match(script, /sourceMessageIds/);
+assert.match(script, /事件发生时间必须来自本批消息前面的“消息时间”/);
+assert.match(script, /happenedAt: resolveMemoryEventTime\(e, sourceBatch\)/);
+assert.match(script, /storeExtractedMemory\(charId, extracted, batch\)/);
+assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat'\);[\s\S]*const reply = await callAPI\(chat, memoryPack,[\s\S]*appendAssistantMessages\(chat, replyText\)/);
+assert.match(script, /const messages = sceneMessagesForAI\(chat, 30,/);
+assert.match(script, /finally \{[\s\S]*processMemoryAfterTurn\(requestCharId\)/);
+assert.doesNotMatch(script, /title: '近期增量摘要'/);
+assert.doesNotMatch(swScript, /title: '近期增量摘要'/);
+assert.match(script, /记忆AI根据玩家本次发言筛选出的本地记忆补充/);
+assert.match(swScript, /记忆AI根据本次触发原因筛选出的手机本地记忆补充/);
 assert.doesNotMatch(script, /CHAT_HISTORY_CHAR_BUDGET|PROACTIVE_HISTORY_CHAR_BUDGET/);
 assert.doesNotMatch(swScript, /CHAT_HISTORY_CHAR_BUDGET|PROACTIVE_HISTORY_CHAR_BUDGET/);
 assert.match(script, /function recentMessages\(chat, count = 30\) \{[\s\S]*slice\(-Math\.max\(1, Number\(count\) \|\| 30\)\)/);
@@ -182,7 +199,7 @@ assert.match(swScript, /function cleanApiKey\(value\)/);
 assert.match(swScript, /后台记忆AI已调用/);
 assert.match(swScript, /function localEmbedding\(text, dim = VECTOR_DIM\)/);
 assert.match(swScript, /async function searchMemoryVectors\(charId, queryText/);
-assert.match(swScript, /本轮向量召回记忆/);
+assert.match(swScript, /本轮相关记忆/);
 assert.doesNotMatch(swScript, /重要事件和时间节点：\\n/);
 assert.doesNotMatch(swScript, /稳定资料和关系状态：\\n/);
 assert.match(swScript, /async function refreshBackgroundPaymentExpirations\(state, charId\)/);
@@ -592,6 +609,9 @@ globalThis.__appTest = {
   extractTranscriptionText,
   buildMemoryQueryPayload,
   buildMemoryExtractPayload,
+  messageLine,
+  resolveMemoryEventTime,
+  memorySummaryHasRelativeTime,
   generateMemoryQuery,
   testMemoryQueryPreset,
   memoryAliasText,
@@ -618,7 +638,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, RP_PRESETS } = context.__appTest;
 
 const memoryQueueProbe = await vm.runInContext(`(async () => {
   const original = processMemoryBatch;
@@ -960,6 +980,21 @@ assert.match(memoryExtractPayload.system, /本地记忆整理 AI/);
 assert.match(memoryExtractPayload.system, /禁止用“用户”“角色”代称/);
 assert.match(memoryExtractPayload.system, /红包仍待领取/);
 assert.match(memoryExtractPayload.user, /旧增量摘要：\n旧摘要/);
+const yesterdayPaymentTime = new Date('2026-07-09T22:03:00+08:00').getTime();
+const yesterdayBatch = [
+  { role: 'user', content: '我给你发了500元红包', time: yesterdayPaymentTime },
+  { role: 'assistant', content: '我晚点再领', time: yesterdayPaymentTime + 60000 }
+];
+const datedExtractPayload = buildMemoryExtractPayload(v2, yesterdayBatch, '');
+assert.match(datedExtractPayload.user, /\[M01\] 【消息时间｜2026-07-09 22:03】玩家：我给你发了500元红包/);
+assert.match(datedExtractPayload.system, /整理发生在 2026-07-10，但红包消息标注为 2026-07-09 22:03/);
+assert.match(datedExtractPayload.user, /"sourceMessageIds":\["M01"\]/);
+assert.equal(resolveMemoryEventTime({ sourceMessageIds: ['M01'], happenedAt: '2026-07-10 22:03', title: '500元红包', detail: '玩家给林晚发了500元红包', keywords: ['红包'] }, yesterdayBatch), '2026-07-09 22:03', '后端必须用来源消息时间覆盖模型误写的今天');
+assert.equal(resolveMemoryEventTime({ sourceMessageIds: [], happenedAt: '今天', title: '500元红包', detail: '玩家给林晚发了500元红包', keywords: ['红包'] }, yesterdayBatch), '2026-07-09 22:03', '缺少来源编号时应根据事件文字匹配原消息时间');
+assert.equal(resolveMemoryEventTime({ sourceMessageIds: [], happenedAt: '2026-07-10 12:00', title: '完全无关事件', detail: '没有任何原文依据', keywords: [] }, yesterdayBatch), '未注明', '无法定位来源时不得默认使用模型给出的整理当天');
+assert.equal(memorySummaryHasRelativeTime('昨天玩家发了红包'), true);
+assert.equal(memorySummaryHasRelativeTime('2026-07-09 22:03 玩家发了红包'), false);
+assert.match(messageLine(yesterdayBatch[0], v2), /【消息时间｜2026-07-09 22:03】玩家：/);
 assert.ok(memorySignalTerms('你还记得红包和周末约定吗？').includes('红包'));
 assert.ok(scoreKeywordMemoryText('玩家承诺给林晚发红包。', ['红包'], 4) > 1);
 const keywordRows = searchKeywordMemoryRows({
@@ -1218,7 +1253,6 @@ element('set-chat-model').value = '';
 element('set-memory-model').value = '';
 element('set-temp').value = '0.8';
 element('set-max-tokens').value = '1000';
-element('set-memory-interval').value = '30';
 element('set-proactive-enabled').value = 'on';
 element('set-proactive-minutes').value = '5';
 element('set-cloud-timer-enabled').value = 'on';

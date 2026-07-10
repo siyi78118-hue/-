@@ -697,7 +697,6 @@ button.profile-top{width:100%;text-align:left}
         <div class="cell-group">
           <div class="cell"><div class="cell-label">Temperature</div><div class="cell-body"><input class="range" id="set-temp" type="range" min="0" max="2" step="0.05" value="0.8" oninput="document.getElementById('temp-val').textContent=this.value"></div><div class="mini" id="temp-val">0.8</div></div>
           <div class="cell"><div class="cell-label">长度</div><div class="cell-body"><input class="input" id="set-max-tokens" type="number" value="1000"></div></div>
-          <div class="cell"><div class="cell-label">记忆间隔</div><div class="cell-body"><input class="input" id="set-memory-interval" type="number" min="10" step="5" value="30"></div><div class="mini">条</div></div>
           <div class="cell"><div class="cell-label">主动消息</div><div class="cell-body"><select class="select" id="set-proactive-enabled"><option value="off">关闭</option><option value="on">开启</option></select></div></div>
           <div class="cell"><div class="cell-label">空闲触发</div><div class="cell-body"><input class="input" id="set-proactive-minutes" type="number" min="1" step="1" value="30"></div><div class="mini">分钟</div></div>
           <div class="cell"><div class="cell-label">云闹钟</div><div class="cell-body"><select class="select" id="set-cloud-timer-enabled"><option value="off">关闭</option><option value="on">开启</option></select></div></div>
@@ -997,10 +996,11 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.59';
+const APP_BUILD_VERSION = '2026-07-10.60';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-10.9';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
+const MEMORY_BATCH_SIZE = 30;
 const CLOUD_TIMER_RESYNC_MS = 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
@@ -2508,7 +2508,7 @@ function recordMomentMemoryEvent(charId, content, time = Date.now()) {
   recordScenarioMemoryEvent(charId, '朋友圈事件', content, time);
 }
 function processMemoryAfterScenario(charId) {
-  processMemoryAfterTurn(charId, true).catch(err => console.warn('[AL Memory] scenario update skipped:', err.message));
+  processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] scenario update skipped:', err.message));
 }
 function buildMomentChatContext(charId, limit = 8) {
   if (!Array.isArray(allMoments) || !allMoments.length) return '';
@@ -3459,13 +3459,26 @@ function buildMemoryExtractPayload(char, batch, oldSummaries) {
 反例：“两人发生了红包互动。”
 9. 这是纯聊天 RP，禁止把动作、神态、环境描写当作事实新增，除非它是聊天文字明确表达的设定。
 正例：聊天文字说“我以后不收你大额红包”，可以记边界。
-反例：把“他笑了笑”这种动作描写记成事实。`);
+反例：把“他笑了笑”这种动作描写记成事实。
+10. 事件发生时间必须来自本批消息前面的“消息时间”，不能使用本次整理时间代替，也不能凭当前日期猜测。
+正例：整理发生在 2026-07-10，但红包消息标注为 2026-07-09 22:03，happenedAt 必须写“2026-07-09 22:03”。
+反例：因为现在是 2026-07-10，就把昨天的红包写成“2026-07-10”或“今天”。
+11. 每个 event 必须填写 sourceMessageIds，引用直接证明该事件的消息编号。happenedAt 必须等于第一条关键来源消息的绝对时间，格式为 YYYY-MM-DD HH:mm。
+正例：事件由 [M03] 首次确认，输出 "sourceMessageIds":["M03"]，并使用 [M03] 的消息时间。
+反例：不填写来源编号，或引用与事件无关的消息。
+12. summary 和 detail 涉及时间时使用绝对日期；禁止写“今天、昨天、前天、刚才、今晚、明天”等会随整理日期变化的相对时间。若原话是“明天”，应根据该消息的绝对时间换算并同时保留语义。
+正例：[M05] 时间为 2026-07-09 20:00，原话“明天提醒我”，detail 写“约定于 2026-07-10 提醒”。
+反例：整理时直接写“明天提醒”。
+13. 无法从来源消息确定事件发生时间时，happenedAt 写“未注明”，禁止默认成整理当天。`);
+  const extractedAt = new Date();
+  const extractedTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || '本地时区';
   const user = `双方昵称：${playerName()} / ${charName(char)}
+本次整理执行时间：${formatFullTime(extractedAt)}｜时区：${extractedTimeZone}（只表示整理发生时间，绝不是事件默认发生时间）
 旧增量摘要：
 ${oldSummaries || '暂无'}
 
-本轮新增聊天与后台场景事件：
-${batch.map(m => messageLine(m, char)).join('\n')}
+本轮新增聊天与后台场景事件（每条都带不可更改的来源编号与绝对时间）：
+${batch.map((m, index) => `[M${String(index + 1).padStart(2, '0')}] ${messageLine(m, char)}`).join('\n')}
 
 输出 JSON，格式严格如下：
 {
@@ -3474,7 +3487,7 @@ ${batch.map(m => messageLine(m, char)).join('\n')}
     {"type":"user|character|relationship","title":"短标题","detail":"稳定资料","importance":1-5,"keywords":["关键词"]}
   ],
   "events": [
-    {"happenedAt":"明确时间或相对时间","type":"promise|payment|moment|conflict|reconcile|preference|relationship|plan|fact","title":"短标题","detail":"具体事件，不省略关键时间节点","status":"open|done|stable","importance":1-5,"keywords":["关键词"]}
+    {"sourceMessageIds":["M01"],"happenedAt":"YYYY-MM-DD HH:mm 或 未注明","type":"promise|payment|moment|conflict|reconcile|preference|relationship|plan|fact","title":"短标题","detail":"具体事件，不省略关键时间节点","status":"open|done|stable","importance":1-5,"keywords":["关键词"]}
   ]
 }`;
   return { system, user };
@@ -3885,8 +3898,10 @@ function memoryAliasText(text, char) {
     .replace(/角色/g, charName(char));
 }
 function messageLine(m, char) {
-  if (m.hidden) return `【隐藏事件｜${formatFullTime(new Date(m.time || Date.now()))}】${m.content}`;
-  return `${m.role === 'user' ? playerName() : charName(char)}：${m.content}`;
+  const timestamp = Number(m?.time);
+  const timeText = Number.isFinite(timestamp) && timestamp > 0 ? formatFullTime(new Date(timestamp)) : '时间未知';
+  if (m.hidden) return `【消息时间｜${timeText}】【隐藏事件】${m.content}`;
+  return `【消息时间｜${timeText}】${m.role === 'user' ? playerName() : charName(char)}：${m.content}`;
 }
 function memoryTextHasSignal(text) {
   const value = String(text || '');
@@ -4261,16 +4276,11 @@ async function prepareMemoryPack(charId, userInput, scene = 'chat') {
   const vectorKeys = new Set(hits.map(hit => `${hit.sourceType}:${hit.sourceId}`));
   const keywordHits = searchKeywordMemoryRows({ summaries: allSummaries, events: allEvents, profiles: allProfiles }, queryText, query.keywords || [], char)
     .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
-  const summaries = allSummaries
-    .filter(s => shouldKeepSummary(memoryAliasText(s.content, char)))
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .slice(0, 3);
   return composeMemoryPackSections(
-    '以下是后台本地记忆库提供给你的参考，只在与当前对话相关时使用。不要提到“记忆库/向量/摘要/系统提示”，不要照搬结构化文字，仍然只输出角色发来的聊天消息。',
+    '以下是记忆AI根据玩家本次发言筛选出的本地记忆补充，只在与当前对话相关时使用。不要提到“记忆库/向量/摘要/系统提示”，不要照搬结构化文字，仍然只输出角色发来的聊天消息。',
     [
-      { title: '近期增量摘要', priority: 10, lines: summaries.reverse().map(s => memoryAliasText(s.content, char)) },
-      { title: '本轮向量召回记忆', priority: 20, lines: hits.map(h => memoryAliasText(h.text, char)) },
-      { title: '关键词触发记忆', priority: 30, lines: keywordHits.map(h => `${memoryAliasText(h.text, char)}${h.reason ? `（触发：${h.reason}）` : ''}`) }
+      { title: '本轮相关记忆', priority: 10, lines: hits.map(h => memoryAliasText(h.text, char)) },
+      { title: '关键词补充记忆', priority: 20, lines: keywordHits.map(h => `${memoryAliasText(h.text, char)}${h.reason ? `（触发：${h.reason}）` : ''}`) }
     ]
   );
 }
@@ -4348,6 +4358,42 @@ function memoryNumbersCompatible(a, b) {
   const right = memoryNumbers(b);
   if (!left.size || !right.size) return true;
   return [...left].some(value => right.has(value));
+}
+function memorySourceMessageIndex(sourceId, batchLength = 0) {
+  const match = String(sourceId || '').trim().match(/^M(\d{1,3})$/i);
+  if (!match) return -1;
+  const index = Number(match[1]) - 1;
+  return index >= 0 && index < batchLength ? index : -1;
+}
+function memoryEventSourceScore(event, message) {
+  const eventText = [event?.title, event?.detail, ...(event?.keywords || [])].filter(Boolean).join(' ');
+  const messageText = String(message?.content || '');
+  const terms = memorySignalTerms(eventText).filter(term => term.length >= 2);
+  let score = terms.reduce((sum, term) => sum + (messageText.includes(term) ? Math.min(3, term.length) : 0), 0);
+  const eventNumbers = memoryNumbers(eventText);
+  const messageNumbers = memoryNumbers(messageText);
+  eventNumbers.forEach(value => { if (messageNumbers.has(value)) score += 4; });
+  return score;
+}
+function resolveMemoryEventTime(event, batch = []) {
+  const sourceIds = Array.isArray(event?.sourceMessageIds) ? event.sourceMessageIds : [];
+  for (const sourceId of sourceIds) {
+    const index = memorySourceMessageIndex(sourceId, batch.length);
+    const timestamp = index >= 0 ? Number(batch[index]?.time) : NaN;
+    if (Number.isFinite(timestamp) && timestamp > 0) return formatFullTime(new Date(timestamp));
+  }
+  let best = null;
+  for (const message of batch) {
+    const timestamp = Number(message?.time);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) continue;
+    const score = memoryEventSourceScore(event, message);
+    if (!best || score > best.score) best = { score, timestamp };
+  }
+  if (best?.score > 0) return formatFullTime(new Date(best.timestamp));
+  return '未注明';
+}
+function memorySummaryHasRelativeTime(text) {
+  return /(?:今天|昨日|昨天|前天|刚才|方才|今晚|明天|后天|这两天|那天)/.test(String(text || ''));
 }
 function memoryEventTimeCompatible(existing, incoming) {
   const before = String(existing?.happenedAt || '').trim();
@@ -4456,7 +4502,7 @@ async function compactCharacterMemory(charId) {
   }
   return stats;
 }
-async function storeExtractedMemory(charId, extracted) {
+async function storeExtractedMemory(charId, extracted, sourceBatch = []) {
   const now = Date.now();
   const char = characters.find(c => c.id === charId);
   const [summaryRows, profileRows, eventRows] = await Promise.all([
@@ -4465,7 +4511,7 @@ async function storeExtractedMemory(charId, extracted) {
     MemoryDB.byChar('events', charId)
   ]);
   const summary = memoryAliasText(extracted.summary, char).trim();
-  if (shouldKeepSummary(summary)) {
+  if (shouldKeepSummary(summary) && !memorySummaryHasRelativeTime(summary)) {
     const item = { id: uid('sum'), charId, content: summary, createdAt: now };
     await upsertMemoryItem('summaries', item, summaryRows);
   }
@@ -4483,7 +4529,7 @@ async function storeExtractedMemory(charId, extracted) {
   for (const e of extracted.events || []) {
     const normalized = {
       ...e,
-      happenedAt: memoryAliasText(e?.happenedAt || '未注明', char),
+      happenedAt: resolveMemoryEventTime(e, sourceBatch),
       title: memoryAliasText(e?.title || '重要事件', char),
       detail: memoryAliasText(e?.detail || '', char),
       keywords: (e?.keywords || []).map(k => memoryAliasText(k, char))
@@ -4497,7 +4543,7 @@ async function storeExtractedMemory(charId, extracted) {
 async function processMemoryBatch(charId, force = false) {
   const chat = allChats[charId];
   if (!chat?.messages?.length) return false;
-  const interval = Math.max(10, Number(settings.memoryInterval) || 30);
+  const interval = MEMORY_BATCH_SIZE;
   const batchEnd = chat.messages.length;
   const storedCursor = await MemoryDB.getMeta(memoryMetaKey(charId), 0);
   const processed = normalizeMemoryProcessedCursor(storedCursor, batchEnd);
@@ -4516,7 +4562,7 @@ async function processMemoryBatch(charId, force = false) {
       await setMemoryExtractStatus(charId, 'stale', '聊天或记忆库已重置，本次旧整理结果已丢弃。', { processedFrom: processed, processedTo: batchEnd, batchSize: batch.length });
       return false;
     }
-    await storeExtractedMemory(charId, extracted);
+    await storeExtractedMemory(charId, extracted, batch);
     if (epoch !== memoryExtractionEpoch(charId) || allChats[charId] !== chat) return false;
     await MemoryDB.setMeta(memoryMetaKey(charId), batchEnd);
     await setMemoryExtractStatus(charId, 'done', `已整理 ${batch.length} 条消息，后续新增消息会进入下一批。`, { processedFrom: processed, processedTo: batchEnd, batchSize: batch.length });
@@ -5944,7 +5990,6 @@ function loadSettings() {
   document.getElementById('set-temp').value = settings.temperature || 0.8;
   document.getElementById('temp-val').textContent = settings.temperature || 0.8;
   document.getElementById('set-max-tokens').value = settings.maxTokens || 1000;
-  document.getElementById('set-memory-interval').value = settings.memoryInterval || 30;
   document.getElementById('set-proactive-enabled').value = settings.proactiveEnabled ? 'on' : 'off';
   document.getElementById('set-proactive-minutes').value = settings.proactiveIdleMinutes || 30;
   document.getElementById('set-cloud-timer-enabled').value = settings.cloudTimerEnabled ? 'on' : 'off';
@@ -6035,7 +6080,7 @@ function readSettingsForm() {
     rpPreset: normalizePresetKey(document.getElementById('set-rp-preset').value),
     temperature: Number(document.getElementById('set-temp').value) || 0.8,
     maxTokens: Number(document.getElementById('set-max-tokens').value) || 1000,
-    memoryInterval: Math.max(10, Number(document.getElementById('set-memory-interval').value) || 30),
+    memoryInterval: MEMORY_BATCH_SIZE,
     proactiveEnabled: document.getElementById('set-proactive-enabled').value === 'on',
     proactiveIdleMinutes: Math.max(1, Number(document.getElementById('set-proactive-minutes').value) || 30),
     cloudTimerEnabled: document.getElementById('set-cloud-timer-enabled').value === 'on',
