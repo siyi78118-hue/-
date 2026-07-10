@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v57';
+const CACHE_NAME = 'rpchat-v58';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -1289,6 +1289,17 @@ function rollProactiveDice(job = null) {
 function proactiveJobId(settings, charId, kind = 'chat') {
   return `${proactiveJobPrefix(kind)}_${settings.deviceId}_${charId}`;
 }
+function proactivePayloadMatchesJob(payload = {}, job = null) {
+  if (!payload.charId) return true;
+  if (!job) return false;
+  if (payload.jobId && job.jobId && payload.jobId !== job.jobId) return false;
+  if (payload.dueAt && job.dueAt) {
+    const payloadDueAt = Date.parse(payload.dueAt);
+    const localDueAt = Date.parse(job.dueAt);
+    if (Number.isFinite(payloadDueAt) && Number.isFinite(localDueAt) && Math.abs(payloadDueAt - localDueAt) > 1000) return false;
+  }
+  return true;
+}
 async function scheduleNextCloudProactive(state, charId, kind = 'chat', options = {}) {
   const settings = state?.settings || {};
   const chat = state?.allChats?.[charId];
@@ -1378,13 +1389,12 @@ async function handleProactivePush(payload) {
     await notifyClients({ type: 'al-state-updated', skipped: true });
     return;
   }
-  if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(dueJob.job || payload)) {
-    setStateCloudTimerTrace(state, kind, traceId, `后台骰子未抽中，本轮不生成${kind === 'moment' ? '朋友圈' : '私聊'}，10 分钟后再抽。`);
-    await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+  if (!payload.test && !proactivePayloadMatchesJob(payload, dueJob.job)) {
+    setStateCloudTimerTrace(state, kind, traceId, '忽略已被新任务替换的旧推送，避免沿用过期话题。');
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
-    await notifyClients({ type: 'al-state-updated', charId, skipped: true });
+    await notifyClients({ type: 'al-state-updated', charId, stalePushSkipped: true });
     return;
   }
   if (await hasVisibleClient()) {
@@ -1404,6 +1414,15 @@ async function handleProactivePush(payload) {
       test: !!(payload.test || dueJob.job?.test),
       fallback: !!fallbackJob
     });
+    return;
+  }
+  if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(dueJob.job || payload)) {
+    setStateCloudTimerTrace(state, kind, traceId, `后台骰子未抽中，本轮不生成${kind === 'moment' ? '朋友圈' : '私聊'}，10 分钟后再抽。`);
+    await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+    state.allChats = allChats;
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+    await notifyClients({ type: 'al-state-updated', charId, skipped: true });
     return;
   }
   if (!payload.charId && dueJobs.length > 1) {

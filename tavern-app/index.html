@@ -1010,7 +1010,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-09.43';
+const APP_BUILD_VERSION = '2026-07-10.44';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -3484,7 +3484,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     appendAssistantMessages(chat, replyText);
     updatePaymentStatusFromReply(chat, options.paymentMessageId, replyText, requestCharId);
     schedulePlannedChatFromReply(requestCharId, proactiveSchedule).catch(err => console.warn('[AL Timer] planned chat schedule skipped:', err.message));
-    scheduleDiceProactive(requestCharId, 'moment').catch(err => console.warn('[AL Timer] moment dice schedule skipped:', err.message));
+    ensureDiceProactiveScheduled(requestCharId, 'moment').catch(err => console.warn('[AL Timer] moment dice schedule skipped:', err.message));
     return replyText;
   } catch (err) {
     clearStreamingDraft(requestCharId);
@@ -4613,6 +4613,11 @@ function clampProactiveDueAt(dateLike, kind = 'chat') {
 function proactiveJobMode(job) {
   return job?.mode === 'dice' ? 'dice' : 'planned';
 }
+function proactiveDefaultScheduleOptions(kind = 'chat') {
+  return kind === 'moment'
+    ? { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE }
+    : { mode: 'planned' };
+}
 function rollProactiveDice(kind = 'chat', job = null) {
   const chance = Math.max(0, Math.min(1, Number(job?.rollChance ?? PROACTIVE_DICE_CHANCE) || 0));
   return Math.random() < chance;
@@ -4644,7 +4649,7 @@ function ensureOpenedChatProactive(charId) {
       if (job?.dueAt && Date.parse(job.dueAt) <= Date.now()) {
         runDueProactiveTarget({ char: characters.find(c => c.id === charId), chat }, kind).catch(err => console.warn(`[AL Timer] open-chat ${kind} due skipped:`, err.message));
       } else if (!hasFutureCloudJob(chat, kind)) {
-        scheduleCloudProactive(charId, kind).catch(err => console.warn(`[AL Timer] open-chat ${kind} schedule skipped:`, err.message));
+        scheduleCloudProactive(charId, kind, proactiveDefaultScheduleOptions(kind)).catch(err => console.warn(`[AL Timer] open-chat ${kind} schedule skipped:`, err.message));
       }
       continue;
     }
@@ -4683,7 +4688,7 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
     }
     return false;
   }
-  return scheduleCloudProactive(target, kind);
+  return scheduleCloudProactive(target, kind, proactiveDefaultScheduleOptions(kind));
 }
 async function cancelOtherCloudJobs(targetCharId, kind = 'chat', rows = getLatestChatRows()) {
   const jobKey = proactiveJobKey(kind);
@@ -4904,8 +4909,14 @@ async function schedulePlannedChatFromReply(charId, directive = null) {
 async function scheduleDiceProactive(charId, kind = 'chat') {
   return scheduleCloudProactive(charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
 }
-async function enterProactiveDiceMode(charId) {
-  await Promise.allSettled(PROACTIVE_JOB_KINDS.map(kind => scheduleDiceProactive(charId, kind)));
+async function ensureDiceProactiveScheduled(charId, kind = 'chat') {
+  const chat = allChats[charId];
+  const existingJob = chat?.[proactiveJobKey(kind)];
+  if (existingJob?.jobId || existingJob?.dueAt) return false;
+  return scheduleDiceProactive(charId, kind);
+}
+async function enterProactiveDiceMode(charId, kind = 'chat') {
+  return scheduleDiceProactive(charId, kind);
 }
 function findProactiveTarget() {
   const idleMs = proactiveDelayMs('chat');
@@ -5002,7 +5013,7 @@ async function triggerProactiveMessage(charId, manual = false) {
       chat.lastProactiveChatError = emptyReason;
       DB.set('chats', allChats);
       if (manual) toast('主动消息没有生成内容，已跳过写入', 2600);
-      try { await scheduleDiceProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] chat dice reschedule skipped:', err.message); }
+      if (!manual) try { await scheduleDiceProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] chat dice reschedule skipped:', err.message); }
       if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `空回复：${emptyReason}`);
       if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台私聊生成了空回复：${emptyReason}，已跳过并安排下次重试。`, true, 'chat');
       return false;
@@ -5017,7 +5028,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成主动消息\n已写入当前会话', 2400);
-    try { await enterProactiveDiceMode(charId); } catch (err) { console.warn('[AL Timer] dice mode skipped:', err.message); }
+    if (!manual) try { await enterProactiveDiceMode(charId, 'chat'); } catch (err) { console.warn('[AL Timer] chat dice mode skipped:', err.message); }
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `写入完成 ${splitAssistantOutput(replyText).filter(part => !isEmptyReplyText(part)).length || 1} 条`);
     if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台私聊已生成 ${splitAssistantOutput(replyText).filter(part => !isEmptyReplyText(part)).length || 1} 条消息。`, true, 'chat');
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] proactive update skipped:', err.message));
@@ -5030,7 +5041,7 @@ async function triggerProactiveMessage(charId, manual = false) {
       chat.lastProactiveChatError = technicalErrorMessage(err);
       delete chat.pendingProactiveJob;
       DB.set('chats', allChats);
-      try { await scheduleDiceProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] chat dice reschedule skipped:', err.message); }
+      if (!manual) try { await scheduleDiceProactive(charId, 'chat'); } catch (err) { console.warn('[AL Timer] chat dice reschedule skipped:', err.message); }
     }
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `失败：${statusErrorMessage(err)}`);
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台私聊生成失败：' + statusErrorMessage(err), true, 'chat');
@@ -5087,7 +5098,7 @@ async function triggerProactiveMoment(charId, manual = false) {
       chat.lastProactiveMomentError = emptyReason;
       DB.set('chats', allChats);
       if (manual) toast('主动动态没有生成内容，已跳过写入', 2600);
-      try { await scheduleDiceProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] moment dice reschedule skipped:', err.message); }
+      if (!manual) try { await scheduleDiceProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] moment dice reschedule skipped:', err.message); }
       if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `空动态：${emptyReason}`);
       if (settings.cloudTimerEnabled) setCloudTimerStatus(`前台朋友圈生成了空动态：${emptyReason}，已跳过并安排下次重试。`, true, 'moment');
       return false;
@@ -5099,7 +5110,7 @@ async function triggerProactiveMoment(charId, manual = false) {
     createCharacterMoment(char.id, text, { proactive: true });
     if (activeScreen === 'chats') renderChats();
     if (manual) toast('已生成角色朋友圈动态', 2200);
-    try { await enterProactiveDiceMode(charId); } catch (err) { console.warn('[AL Timer] dice mode skipped:', err.message); }
+    if (!manual) try { await enterProactiveDiceMode(charId, 'moment'); } catch (err) { console.warn('[AL Timer] moment dice mode skipped:', err.message); }
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, '写入完成 1 条朋友圈');
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈已发布 1 条动态。', true, 'moment');
     return true;
@@ -5110,7 +5121,7 @@ async function triggerProactiveMoment(charId, manual = false) {
       chat.lastProactiveMomentError = technicalErrorMessage(err);
       delete chat.pendingMomentJob;
       DB.set('chats', allChats);
-      try { await scheduleDiceProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] moment dice reschedule skipped:', err.message); }
+      if (!manual) try { await scheduleDiceProactive(charId, 'moment'); } catch (err) { console.warn('[AL Timer] moment dice reschedule skipped:', err.message); }
     }
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('moment', traceId, `失败：${statusErrorMessage(err)}`);
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台朋友圈生成失败：' + statusErrorMessage(err), true, 'moment');
