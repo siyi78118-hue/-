@@ -12,14 +12,18 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v61';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v62';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.47';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.48';/);
 assert.match(script, /const MEMORY_MAX_TOKENS = 4096;/);
 assert.match(swScript, /const MEMORY_MAX_TOKENS = 4096;/);
 assert.doesNotMatch(script, /\/embeddings/);
 assert.match(script, /async function createEmbedding\(text\) \{[\s\S]*return localEmbedding\(text\);/);
+assert.match(script, /async function compactCharacterMemory\(charId\)/);
+assert.match(script, /item\.manual = true;/);
+assert.match(script, /await upsertMemoryItem\('profiles', item, profileRows\)/);
+assert.match(script, /await upsertMemoryItem\('events', item, eventRows\)/);
 assert.match(swScript, /return !!\(settings\.memoryApiUrl && settings\.memoryApiKey && settings\.memoryModel\);/);
 assert.doesNotMatch(swScript, /settings\.memoryApiUrl \|\| settings\.apiUrl/);
 assert.doesNotMatch(swScript, /settings\.memoryApiKey \|\| settings\.apiKey/);
@@ -484,13 +488,16 @@ globalThis.__appTest = {
   clearModelCallLogs,
   shouldKeepEvent,
   memoryTextIsNoise,
+  memoryTextSimilarity,
+  findMemoryMergeCandidate,
+  mergeMemoryItems,
   cloudTimerTargetCharId,
   proactiveJobId,
   proactiveDefaultScheduleOptions,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -557,6 +564,23 @@ assert.equal(extractTranscriptionText({ text: '转写正文' }), '转写正文')
 assert.equal(extractTranscriptionText({ transcript: '兼容转写' }), '兼容转写');
 assert.equal(memoryTextIsNoise('[语音消息 5秒，未转文字]'), true);
 assert.equal(memoryTextIsNoise('测试点赞了朋友圈，只评论哈哈，没有后续意义。'), true);
+assert.ok(memoryTextSimilarity('姜答应周末提醒测试交稿', '姜答应周末提醒测试交稿。') > 0.95);
+const manualProfile = { id: 'manual_profile', charId: 'char-1', type: 'user', title: '居住城市', detail: '姜目前住在上海', keywords: ['城市', '上海'], manual: true, createdAt: 1 };
+const incomingProfile = { id: 'auto_profile', charId: 'char-1', type: 'user', title: '居住城市', detail: '姜目前住在上海市', keywords: ['城市', '上海'], createdAt: 2 };
+assert.equal(findMemoryMergeCandidate([manualProfile], incomingProfile, 'profiles')?.id, 'manual_profile');
+assert.equal(mergeMemoryItems(manualProfile, incomingProfile, 'profiles'), manualProfile, '手动编辑的记忆不得被 AI 覆盖');
+const pendingPayment = { id: 'payment_500', charId: 'char-1', type: 'payment', title: '500元红包', detail: '姜给测试发了500元红包，仍待领取', status: 'open', keywords: ['红包', '500元'], createdAt: 1 };
+const receivedPayment = { id: 'payment_500_done', charId: 'char-1', type: 'payment', title: '500元红包', detail: '测试领取了姜发的500元红包', status: 'done', keywords: ['红包', '500元'], createdAt: 2 };
+assert.equal(findMemoryMergeCandidate([pendingPayment], receivedPayment, 'events')?.id, 'payment_500');
+const mergedPayment = mergeMemoryItems(pendingPayment, receivedPayment, 'events', 3);
+assert.equal(mergedPayment.id, 'payment_500');
+assert.equal(mergedPayment.status, 'done');
+assert.match(mergedPayment.detail, /仍待领取.*后续：.*领取/);
+const otherAmount = { ...receivedPayment, id: 'payment_100_done', title: '100元红包', detail: '测试领取了姜发的100元红包', keywords: ['红包', '100元'] };
+assert.equal(findMemoryMergeCandidate([pendingPayment], otherAmount, 'events'), null, '金额不同的事件不得误合并');
+const datedPendingPayment = { ...pendingPayment, happenedAt: '2026-07-10 12:00' };
+const datedOtherAmount = { ...otherAmount, happenedAt: '2026-07-10 12:00' };
+assert.equal(findMemoryMergeCandidate([datedPendingPayment], datedOtherAmount, 'events'), null, '相同日期数字不能掩盖金额差异');
 assert.equal(JSON.stringify(splitAssistantOutput('第一句\n\n第二句\r\n第三句')), JSON.stringify(['第一句', '第二句', '第三句']));
 assert.equal(memoryAliasText('用户和角色约好下次继续聊', { name: '林晚' }), '玩家和林晚约好下次继续聊');
 assert.equal(shouldKeepEvent({ type: 'fact', title: '时间校对分歧', detail: '用户说自己这里是48分，角色解释表快了几分钟。', importance: 3, keywords: ['时间校对'] }), false);

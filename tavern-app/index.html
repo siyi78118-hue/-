@@ -1010,7 +1010,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.47';
+const APP_BUILD_VERSION = '2026-07-10.48';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -4043,14 +4043,162 @@ async function extractTurnMemory(charId, batch) {
   const payload = buildMemoryExtractPayload(char, batch, oldSummaries);
   return callMemoryJSON(payload.system, payload.user, { scene: 'memory-extract', charId });
 }
+function normalizeMemoryComparable(text) {
+  return String(text || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+function memoryTextSimilarity(a, b) {
+  const left = normalizeMemoryComparable(a);
+  const right = normalizeMemoryComparable(b);
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+  const grams = value => {
+    if (value.length < 2) return new Set([value]);
+    const set = new Set();
+    for (let i = 0; i < value.length - 1; i++) set.add(value.slice(i, i + 2));
+    return set;
+  };
+  const aGrams = grams(left);
+  const bGrams = grams(right);
+  let overlap = 0;
+  aGrams.forEach(token => { if (bGrams.has(token)) overlap++; });
+  return (2 * overlap) / (aGrams.size + bGrams.size || 1);
+}
+function memoryKeywordOverlap(a = [], b = []) {
+  const left = new Set((a || []).map(normalizeMemoryComparable).filter(Boolean));
+  const right = new Set((b || []).map(normalizeMemoryComparable).filter(Boolean));
+  if (!left.size || !right.size) return 0;
+  let overlap = 0;
+  left.forEach(token => { if (right.has(token)) overlap++; });
+  return overlap / Math.min(left.size, right.size);
+}
+function memoryNumbers(text) {
+  return new Set(String(text || '').match(/\d+(?:\.\d+)?/g) || []);
+}
+function memoryNumbersCompatible(a, b) {
+  const left = memoryNumbers(a);
+  const right = memoryNumbers(b);
+  if (!left.size || !right.size) return true;
+  return [...left].some(value => right.has(value));
+}
+function memoryEventTimeCompatible(existing, incoming) {
+  const before = String(existing?.happenedAt || '').trim();
+  const next = String(incoming?.happenedAt || '').trim();
+  if (!before || !next || before === '未注明' || next === '未注明') return true;
+  if (memoryTextSimilarity(before, next) >= 0.8) return true;
+  return existing?.status === 'open' && incoming?.status === 'done';
+}
+function memoryEntryText(storeName, item = {}) {
+  if (storeName === 'summaries') return item.content || '';
+  return [item.title, item.detail, item.happenedAt, ...(item.keywords || [])].filter(Boolean).join(' ');
+}
+function findMemoryMergeCandidate(rows = [], incoming = {}, storeName = 'events') {
+  const incomingText = memoryEntryText(storeName, incoming);
+  return rows.find(row => {
+    const rowText = memoryEntryText(storeName, row);
+    const detailSimilarity = memoryTextSimilarity(storeName === 'summaries' ? row.content : row.detail, storeName === 'summaries' ? incoming.content : incoming.detail);
+    if (storeName === 'summaries') return memoryTextSimilarity(rowText, incomingText) >= 0.92;
+    if (String(row.type || '') !== String(incoming.type || '')) return false;
+    if (storeName === 'events' && !memoryNumbersCompatible([row.title, row.detail].join(' '), [incoming.title, incoming.detail].join(' '))) return false;
+    if (storeName === 'events' && !memoryEventTimeCompatible(row, incoming)) return false;
+    if (detailSimilarity >= 0.88) return true;
+    const titleSimilarity = memoryTextSimilarity(row.title, incoming.title);
+    const keywordOverlap = memoryKeywordOverlap(row.keywords, incoming.keywords);
+    const relatedDetailThreshold = storeName === 'events' ? 0.35 : 0.58;
+    return titleSimilarity >= 0.94 && keywordOverlap >= 0.5 && detailSimilarity >= relatedDetailThreshold;
+  }) || null;
+}
+function mergeMemoryKeywords(a = [], b = []) {
+  return [...new Set([...(a || []), ...(b || [])].map(value => String(value || '').trim()).filter(Boolean))].slice(0, 12);
+}
+function mergeMemoryDetail(oldDetail, newDetail, storeName) {
+  const before = String(oldDetail || '').trim();
+  const next = String(newDetail || '').trim();
+  if (!before) return next;
+  if (!next || before === next) return before;
+  if (before.includes(next)) return before;
+  if (next.includes(before)) return next;
+  if (storeName === 'profiles') return next;
+  return `${before}；后续：${next}`.slice(0, 800);
+}
+function mergeMemoryItems(existing, incoming, storeName, now = Date.now()) {
+  if (existing?.manual) return existing;
+  if (storeName === 'summaries') return { ...existing, updatedAt: now };
+  const merged = {
+    ...existing,
+    ...incoming,
+    id: existing.id,
+    charId: existing.charId,
+    createdAt: existing.createdAt || incoming.createdAt || now,
+    updatedAt: now,
+    manual: false,
+    importance: Math.max(Number(existing.importance) || 0, Number(incoming.importance) || 0, 3),
+    keywords: mergeMemoryKeywords(existing.keywords, incoming.keywords),
+    detail: mergeMemoryDetail(existing.detail, incoming.detail, storeName)
+  };
+  if (storeName === 'events') {
+    if (existing.happenedAt && existing.happenedAt !== '未注明') merged.happenedAt = existing.happenedAt;
+    if (incoming.status === 'done') merged.status = 'done';
+    else if (existing.status === 'open' && incoming.status !== 'done') merged.status = 'open';
+  }
+  return merged;
+}
+async function upsertMemoryItem(storeName, item, rows) {
+  const match = findMemoryMergeCandidate(rows, item, storeName);
+  if (match?.manual) return { item: match, created: false, protected: true };
+  const saved = match ? mergeMemoryItems(match, item, storeName) : item;
+  await MemoryDB.put(storeName, saved);
+  await syncMemoryVector(storeName, saved);
+  if (!match) rows.push(saved);
+  else rows.splice(rows.findIndex(row => row.id === match.id), 1, saved);
+  return { item: saved, created: !match, protected: false };
+}
+async function removeMemoryItemData(storeName, item) {
+  await MemoryDB.remove(storeName, item.id);
+  await MemoryDB.remove('vectors', `vec_${memorySourceType(storeName)}_${item.id}`);
+}
+async function compactCharacterMemory(charId) {
+  const stats = { removed: 0, merged: 0 };
+  for (const storeName of ['summaries', 'profiles', 'events']) {
+    const rows = (await MemoryDB.byChar(storeName, charId)).sort((a, b) => Number(b.manual) - Number(a.manual) || (a.createdAt || 0) - (b.createdAt || 0));
+    const kept = [];
+    for (const row of rows) {
+      const match = findMemoryMergeCandidate(kept, row, storeName);
+      if (!match) { kept.push(row); continue; }
+      if (match.manual) {
+        if (row.manual) { kept.push(row); continue; }
+        await removeMemoryItemData(storeName, row);
+        stats.removed++;
+        continue;
+      }
+      if (row.manual) {
+        await removeMemoryItemData(storeName, match);
+        kept.splice(kept.findIndex(item => item.id === match.id), 1, row);
+        stats.removed++;
+        continue;
+      }
+      const merged = mergeMemoryItems(match, row, storeName);
+      await MemoryDB.put(storeName, merged);
+      await syncMemoryVector(storeName, merged);
+      await removeMemoryItemData(storeName, row);
+      kept.splice(kept.findIndex(item => item.id === match.id), 1, merged);
+      stats.removed++;
+      stats.merged++;
+    }
+  }
+  return stats;
+}
 async function storeExtractedMemory(charId, extracted) {
   const now = Date.now();
   const char = characters.find(c => c.id === charId);
+  const [summaryRows, profileRows, eventRows] = await Promise.all([
+    MemoryDB.byChar('summaries', charId),
+    MemoryDB.byChar('profiles', charId),
+    MemoryDB.byChar('events', charId)
+  ]);
   const summary = memoryAliasText(extracted.summary, char).trim();
   if (shouldKeepSummary(summary)) {
     const item = { id: uid('sum'), charId, content: summary, createdAt: now };
-    await MemoryDB.put('summaries', item);
-    await saveVector(charId, 'summary', item.id, item.content, ['摘要'], 3);
+    await upsertMemoryItem('summaries', item, summaryRows);
   }
   for (const p of extracted.profile_updates || []) {
     const normalized = {
@@ -4061,8 +4209,7 @@ async function storeExtractedMemory(charId, extracted) {
     };
     if (!shouldKeepProfile(normalized)) continue;
     const item = { id: uid('pro'), charId, type: normalized.type || 'relationship', title: normalized.title || '资料', detail: normalized.detail, importance: Number(normalized.importance) || 3, keywords: normalized.keywords || [], createdAt: now };
-    await MemoryDB.put('profiles', item);
-    await saveVector(charId, 'profile', item.id, memoryTextForVector(item), item.keywords, item.importance);
+    await upsertMemoryItem('profiles', item, profileRows);
   }
   for (const e of extracted.events || []) {
     const normalized = {
@@ -4074,9 +4221,9 @@ async function storeExtractedMemory(charId, extracted) {
     };
     if (!shouldKeepEvent(normalized)) continue;
     const item = { id: uid('evt'), charId, happenedAt: normalized.happenedAt || '未注明', type: normalized.type || 'fact', title: normalized.title || '重要事件', detail: normalized.detail, status: normalized.status || 'stable', importance: Number(normalized.importance) || 3, keywords: normalized.keywords || [], createdAt: now };
-    await MemoryDB.put('events', item);
-    await saveVector(charId, 'event', item.id, memoryTextForVector(item), item.keywords, item.importance);
+    await upsertMemoryItem('events', item, eventRows);
   }
+  await compactCharacterMemory(charId);
 }
 async function processMemoryAfterTurn(charId, force = false) {
   const chat = allChats[charId];
@@ -5731,7 +5878,7 @@ async function renderMemoryScreen() {
   const groups = [
     { title: '资料', store: 'profiles', rows: profiles.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(p => ({ ...p, displayTitle: memoryAliasText(p.title || '资料', char), displayDetail: memoryAliasText(p.detail || '', char), meta: memoryLabelMeta(p) })) },
     { title: '事件', store: 'events', rows: events.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(e => ({ ...e, displayTitle: memoryAliasText(e.title || '重要事件', char), displayDetail: `${memoryAliasText(e.happenedAt || '未注明', char)}｜${memoryAliasText(e.detail || '', char)}`, meta: memoryLabelMeta(e) })) },
-    { title: '摘要', store: 'summaries', rows: summaries.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(s => ({ ...s, displayTitle: '增量摘要', displayDetail: memoryAliasText(s.content || '', char), meta: fmtTime(s.createdAt) })) }
+    { title: '摘要', store: 'summaries', rows: summaries.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(s => ({ ...s, displayTitle: '增量摘要', displayDetail: memoryAliasText(s.content || '', char), meta: memoryLabelMeta(s) })) }
   ];
   const filteredGroups = groups.map(group => ({ ...group, rows: group.rows.filter(row => memoryRowMatches(row, memoryFilterText)) }));
   if (!groups.some(group => group.rows.length)) {
@@ -5749,7 +5896,7 @@ async function renderMemoryScreen() {
     </div>`).join('');
 }
 function memoryLabelMeta(item) {
-  return [item.type, item.status, fmtTime(item.createdAt)].filter(Boolean).join(' · ');
+  return [item.manual ? '手动' : 'AI', item.type, item.status, fmtTime(item.updatedAt || item.createdAt)].filter(Boolean).join(' · ');
 }
 function memoryRowMatches(row, query = '') {
   const text = String(query || '').trim().toLowerCase();
@@ -5903,6 +6050,8 @@ async function saveMemoryEditor() {
     item.keywords = item.keywords || [];
   }
   if (!item) return;
+  item.manual = true;
+  item.updatedAt = now;
   await MemoryDB.put(storeName, item);
   await syncMemoryVector(storeName, item);
   await renderMemoryScreen();
@@ -5929,8 +6078,9 @@ async function runMemoryNow() {
   toast('正在整理记忆...', 1200);
   try {
     await processMemoryAfterTurn(charId, true);
+    const compacted = await compactCharacterMemory(charId);
     await renderMemoryScreen();
-    toast('记忆已入库');
+    toast(compacted.removed ? `记忆已整理，合并或移除 ${compacted.removed} 条重复项` : '记忆已整理，没有发现重复项');
   } catch (err) {
     toast('整理失败：' + err.message, 2600);
   }
