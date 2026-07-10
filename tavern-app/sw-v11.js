@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v70';
+const CACHE_NAME = 'rpchat-v72';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -309,20 +309,42 @@ function proactiveConversationState(chat, now = new Date()) {
   };
 }
 
+function chatHasUnansweredProactive(chat) {
+  return proactiveConversationState(chat).proactiveSinceLastUser.length > 0;
+}
+
+function expectedProactiveChatMode(chat) {
+  return chatHasUnansweredProactive(chat) ? 'dice' : 'planned';
+}
+
+function proactiveJobMatchesConversationStage(chat, job = null) {
+  return proactiveJobMode(job) === expectedProactiveChatMode(chat);
+}
+
+function proactiveHistoryMode(chat, now = new Date()) {
+  const state = proactiveConversationState(chat, now);
+  const elapsed = state.lastElapsedMs == null ? 0 : state.lastElapsedMs;
+  if (elapsed >= 24 * 60 * 60 * 1000) return 'fresh-start';
+  if (elapsed >= 6 * 60 * 60 * 1000 || (state.crossedDay && elapsed >= 2 * 60 * 60 * 1000)) return 'archive';
+  return 'recent';
+}
+
 function latestMessageByRole(chat, role) {
   return visibleConversationMessages(chat).slice().reverse().find(m => m.role === role) || null;
 }
 
-function messageTimeLine(label, msg, now = new Date()) {
+function messageTimeLine(label, msg, now = new Date(), includeContent = true) {
   if (!msg?.time) return `${label}：无`;
   const at = new Date(msg.time);
   const elapsed = formatElapsed(now.getTime() - at.getTime());
   const content = String(msg.content || '').replace(/\s+/g, ' ').slice(0, 120);
-  return `${label}：${formatFullTime(at)}（距现在 ${elapsed}）｜${msg.role === 'user' ? '用户' : '角色'}：${content}`;
+  return `${label}：${formatFullTime(at)}（距现在 ${elapsed}）｜${msg.role === 'user' ? '用户' : '角色'}${includeContent && content ? `：${content}` : ''}`;
 }
 
 function buildProactiveTimeContext(chat, now = new Date(), triggerMode = 'planned') {
   const state = proactiveConversationState(chat, now);
+  const historyMode = proactiveHistoryMode(chat, now);
+  const includeContent = historyMode === 'recent';
   const lastElapsedMinutes = state.lastElapsedMs == null ? 0 : Math.round(state.lastElapsedMs / 60000);
   const mode = state.crossedDay || lastElapsedMinutes >= 360
     ? '跨天/超长间隔重新开口'
@@ -341,12 +363,13 @@ function buildProactiveTimeContext(chat, now = new Date(), triggerMode = 'planne
   return [
     '主动消息时间流逝上下文：',
     `当前时间：${formatFullTime(now)}`,
-    messageTimeLine('最后一条真实聊天消息', state.last, now),
-    messageTimeLine('上一条玩家消息', state.lastUser, now),
-    messageTimeLine('上一条角色消息', state.lastAssistant, now),
+    messageTimeLine('最后一条真实聊天消息', state.last, now, includeContent),
+    messageTimeLine('上一条玩家消息', state.lastUser, now, includeContent),
+    messageTimeLine('上一条角色消息', state.lastAssistant, now, includeContent),
     `主动阶段：${stage}`,
     `未回复状态：${unanswered}`,
     `智能策略：${mode}`,
+    `历史上下文策略：${historyMode === 'fresh-start' ? '上一轮已经自然结束，不提供旧聊天正文，以当前时段重新开口' : historyMode === 'archive' ? '旧聊天只作为过往存档，不作为当前待回复内容' : '近期聊天可供自然衔接'}`,
     '硬性要求：这不是用户刚刚发消息后等你回答，而是隔了一段空闲时间后你主动打开微信来发消息。',
     '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
     '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
@@ -397,8 +420,30 @@ function recentMessages(chat, count = 30, charBudget = CHAT_HISTORY_CHAR_BUDGET)
   return kept;
 }
 
-function proactiveRecentMessages(chat, count = 30, now = new Date()) {
-  return recentMessages(chat, count, PROACTIVE_HISTORY_CHAR_BUDGET).map(m => {
+function proactiveRecentMessages(chat, count = 30, now = new Date(), settings = {}) {
+  const rows = recentMessages(chat, count, PROACTIVE_HISTORY_CHAR_BUDGET);
+  const historyMode = proactiveHistoryMode(chat, now);
+  if (historyMode === 'fresh-start') {
+    return rows
+      .filter(m => m.hidden && m.time && now.getTime() - Number(m.time) <= 24 * 60 * 60 * 1000)
+      .slice(-4)
+      .map(m => ({
+        role: 'user',
+        content: `【后台场景事件｜${formatFullTime(new Date(m.time || Date.now()))}】${m.content}\n注意：这不是玩家刚发来的聊天气泡，而是已经发生过的场景记录。只能自然记住，不能把它当作最新私聊。`
+      }));
+  }
+  if (historyMode === 'archive') {
+    const archive = rows.slice(-8).map(m => {
+      const at = m.time ? formatFullTime(new Date(m.time)) : '时间未知';
+      const role = m.hidden ? '场景事件' : (m.role === 'user' ? playerName(settings) : '角色');
+      return `${at}｜${role}：${String(m.content || '').replace(/\s+/g, ' ').slice(0, 160)}`;
+    }).join('\n');
+    return archive ? [{
+      role: 'user',
+      content: `【过往聊天存档，不是刚收到的新消息】\n${archive}\n这些内容只用于保持人物关系和事实连续性。上一轮闲聊已经过去较久，不要直接回答其中任何一句，也不要把旧红包、转账、测试或争执当成当前话题。`
+    }] : [];
+  }
+  return rows.map(m => {
     if (m.hidden) {
       return {
         role: 'user',
@@ -409,6 +454,23 @@ function proactiveRecentMessages(chat, count = 30, now = new Date()) {
     const meta = at ? `历史消息元数据：${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}。元数据只供判断时间流逝，禁止复制进回复。` : '历史消息元数据：发送时间未知，禁止复制进回复。';
     return { role: m.role, content: `${meta}\n历史聊天正文：${m.content}` };
   });
+}
+
+function buildProactiveMemoryQuery(chat, settings = {}, now = new Date(), triggerMode = 'planned') {
+  const state = proactiveConversationState(chat, now);
+  const historyMode = proactiveHistoryMode(chat, now);
+  const elapsed = state.lastElapsedMs == null ? '未知时长' : formatElapsed(state.lastElapsedMs);
+  return [
+    '主动消息记忆检索。',
+    getTimeContext(now),
+    `当前阶段：${normalizeProactiveTriggerMode(triggerMode) === 'dice' ? '玩家尚未回复先前主动消息后的随机再联系' : '玩家最后一次回复后的计划追发'}`,
+    `距离最后一条真实聊天：${elapsed}。`,
+    historyMode === 'fresh-start'
+      ? '上一轮闲聊已自然结束。只检索人物关系、长期设定、重要约定和近期重要事件，不要把旧闲聊当成尚待回答的问题。'
+      : historyMode === 'archive'
+        ? '聊天已有明显时间间隔。检索关系与未完成的重要事项，但不要放大上一轮普通闲聊。'
+        : '可以检索与近期话题直接相关的记忆。'
+  ].join('\n');
 }
 
 function createPromptComposer(scene) {
@@ -460,6 +522,7 @@ function splitAssistantOutput(text) {
 function stripProactiveScheduleDirective(text) {
   return String(text || '')
     .replace(/<al_schedule>[\s\S]*?<\/al_schedule>/gi, '')
+    .replace(/<al_schedule>[\s\S]*$/gi, '')
     .replace(/\{[\s\S]*?\}/g, block => {
       try {
         const json = JSON.parse(block);
@@ -471,18 +534,55 @@ function stripProactiveScheduleDirective(text) {
       return block;
     });
 }
+function normalizePaymentDirectiveStatus(value) {
+  const status = String(value || '').trim().toLowerCase();
+  if (['received', 'receive', 'accepted', 'accept', 'claimed', 'claim', 'collected', 'done'].includes(status)) return 'received';
+  if (['refused', 'refuse', 'declined', 'decline', 'rejected', 'reject', 'returned', 'return'].includes(status)) return 'refused';
+  if (['pending', 'wait', 'waiting', 'later', 'undecided', 'open'].includes(status)) return 'pending';
+  return '';
+}
+function extractPaymentStatusDirective(text) {
+  const raw = String(text || '');
+  const tagged = raw.match(/<al_payment>([\s\S]*?)<\/al_payment>/i);
+  const candidates = tagged ? [{ block: tagged[1], tagged: true }] : [];
+  (raw.match(/\{[\s\S]*?\}/g) || []).forEach(block => {
+    if (/paymentStatus|payment_status/i.test(block)) candidates.push({ block, tagged: false });
+  });
+  for (const candidate of candidates) {
+    try {
+      const json = JSON.parse(String(candidate.block).trim());
+      const value = candidate.tagged ? (json.status || json.paymentStatus || json.payment_status) : (json.paymentStatus || json.payment_status);
+      const status = normalizePaymentDirectiveStatus(value);
+      if (status) return { status, raw: candidate.block };
+    } catch {}
+  }
+  return null;
+}
+function stripPaymentStatusDirective(text) {
+  return String(text || '')
+    .replace(/<al_payment>[\s\S]*?<\/al_payment>/gi, '')
+    .replace(/<al_payment>[\s\S]*$/gi, '')
+    .replace(/\{[\s\S]*?\}/g, block => {
+      try {
+        const json = JSON.parse(block);
+        if (json && typeof json === 'object' && !Array.isArray(json) && ('paymentStatus' in json || 'payment_status' in json)) return '';
+      } catch {}
+      return block;
+    });
+}
 function stripLeakedPromptMetadata(text) {
   return String(text || '')
     .replace(/[【[]\s*(?:发送时间|历史消息元数据)[^】\]]*[】\]]\s*/g, '')
+    .replace(/[【[]\s*(?:发送时间|历史消息元数据)[^\n]*$/g, '')
     .replace(/历史消息元数据[:：][^\n]*(?:\n|$)/g, '')
     .replace(/历史聊天正文[:：]/g, '')
     .split(/\n+/)
     .map(line => line.trim())
-    .filter(line => line && !/(免打扰模式|骰子|摇骰|调度|定时器|后台|系统提示|发送时间|距现在|智能策略)/.test(line))
+    .filter(line => line && !/(免打扰模式|骰子|摇骰|调度|定时器|后台|系统提示|发送时间|距现在|智能策略|主动消息时间流逝上下文|主动阶段|未回复状态|历史上下文策略)/.test(line))
     .join('\n');
 }
 function cleanAssistantChatReply(text) {
-  const raw = stripLeakedPromptMetadata(stripProactiveScheduleDirective(text)).trim();
+  const raw = stripLeakedPromptMetadata(stripPaymentStatusDirective(stripProactiveScheduleDirective(text))).trim();
   if (!raw) return '';
   const jsonLike = raw.replace(/```json|```/g, '').trim();
   try {
@@ -1048,6 +1148,60 @@ async function refreshBackgroundPaymentExpirations(state, charId) {
   return changed;
 }
 
+function latestPendingPayment(chat) {
+  if (!chat?.messages?.length) return null;
+  const now = Date.now();
+  return chat.messages.slice().reverse().find(message => {
+    const type = message.payType || message.type;
+    if (!['transfer', 'redpacket'].includes(type)) return false;
+    if ((message.payStatus || 'pending') !== 'pending') return false;
+    if (type !== 'redpacket') return true;
+    const expiresAt = Number(message.payExpiresAt) || ((Number(message.time) || now) + REDPACKET_EXPIRE_MS);
+    return now < expiresAt;
+  }) || null;
+}
+
+function inferPaymentStatusFromReply(reply) {
+  const text = String(reply || '').replace(/\s+/g, '');
+  if (!text) return 'pending';
+  if (/(不是不收|并非不收|没说不收|先放着|先别催|等会儿|等会|晚点|过会儿|回头再|想清楚|考虑一下|先问清楚|为什么发|怎么突然)/.test(text)) return 'pending';
+  if (/(不收|不要|别发|别给|退回|退还|还给你|拒收|不领|不拿|拿回去|收不起|用不着|算了吧)/.test(text)) return 'refused';
+  if (/(收下|收了|我收|领了|领取|拿了|收到|收款|谢谢|谢了|多谢|恭敬不如从命|不客气了|那我就收|拆了|点开了)/.test(text)) return 'received';
+  return 'pending';
+}
+
+async function updateBackgroundPaymentStatusFromReply(state, charId, reply, explicitStatus = '') {
+  const chat = state?.allChats?.[charId];
+  const message = latestPendingPayment(chat);
+  if (!message) return false;
+  const status = normalizePaymentDirectiveStatus(explicitStatus) || inferPaymentStatusFromReply(reply);
+  if (status === 'pending') return false;
+  const char = (state.characters || []).find(row => row.id === charId);
+  const type = message.payType || message.type;
+  const label = type === 'redpacket' ? '红包' : '转账';
+  const note = message.note ? `，备注“${message.note}”` : '';
+  const now = Date.now();
+  if (type === 'redpacket' && status === 'refused') {
+    message.payDeclinedAt = now;
+  } else {
+    message.payStatus = status;
+    message.payStatusTime = now;
+    if (status === 'refused' && !message.refunded) {
+      state.settings.walletBalance = Math.max(0, Math.round(((Number(state.settings.walletBalance) || 0) + (Number(message.amount) || 0)) * 100) / 100);
+      message.refunded = true;
+    }
+  }
+  if (message.payMemoryRecordedStatus !== status) {
+    const result = status === 'received'
+      ? `${charName(char)}收下了${playerName(state.settings)}发来的${label}`
+      : `${charName(char)}没有收下${playerName(state.settings)}发来的${label}`;
+    const pendingRule = type === 'redpacket' && status === 'refused' ? '；红包仍处于待领取状态，24小时未领取才会自动退回' : '';
+    await recordBackgroundScenarioMemory(state, charId, '支付事件', `${result}，金额 ${formatMoney(message.amount)}${note}${pendingRule}。`, { type: 'payment', keywords: [label, status === 'received' ? '领取' : '拒收'] });
+    message.payMemoryRecordedStatus = status;
+  }
+  return true;
+}
+
 function buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings = {}) {
   const system = `你是 AL 的后台本地记忆检索 AI。
 你不参与角色扮演，不回复${playerName(settings)}，不替${charName(char)}说话。
@@ -1198,6 +1352,12 @@ function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, pr
   composer.add('char-prompt', chat.charPrompt || `当前你要扮演的角色：${charName(char)}`, { priority: 0 });
   composer.add('time-context', '当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow), { priority: 10 });
   composer.add('memory-pack', memoryPack, { priority: 20 });
+  const pendingPayment = latestPendingPayment(chat);
+  if (pendingPayment) {
+    const label = (pendingPayment.payType || pendingPayment.type) === 'redpacket' ? '红包' : '转账';
+    composer.add('pending-payment-context', `当前会话仍有一笔${playerName(settings)}发给${charName(char)}的${label}等待处理，金额 ${formatMoney(pendingPayment.amount)}${pendingPayment.note ? `，备注“${pendingPayment.note}”` : ''}。
+如果本条消息明确已经领取/收下，正文后输出 <al_payment>{"status":"received"}</al_payment>；明确拒收/退还则输出 refused；犹豫、晚点处理或没有决定则输出 pending。这个标签只供后端更新支付 UI，禁止解释。红包拒绝后仍待领取，24 小时未领取才退回；转账拒收会立即退回。`, { priority: 30 });
+  }
   composer.add('global-extra-preset', settings.systemPrompt ? '全局补充预设：\n' + settings.systemPrompt : '', { priority: 80 });
   composer.add('chat-extra-prompt', chat.extraPrompt ? '当前会话补充：\n' + chat.extraPrompt : '', { priority: 90 });
   composer.add('proactive-time-context', proactiveTimeContext, { priority: 100 });
@@ -1490,7 +1650,9 @@ async function handleProactivePush(payload) {
   const dueJob = dueJobs[0] || null;
   const charId = dueJob?.charId || '';
   const kind = dueJob?.kind || 'chat';
-  const triggerMode = proactiveJobMode(dueJob?.job || payload);
+  const triggerMode = kind === 'chat' && allChats[charId]
+    ? expectedProactiveChatMode(allChats[charId])
+    : proactiveJobMode(dueJob?.job || payload);
   if (!charId) {
     setStateCloudTimerTrace(state, 'chat', traceId, '收到云端 push，但本地没有可触发会话或任务');
     setStateCloudTimerStatus(state, '后台收到云闹钟，但本地没有可触发会话；请打开 AL 后重新绑定或重新安排。', 'chat');
@@ -1505,6 +1667,18 @@ async function handleProactivePush(payload) {
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
     await notifyClients({ type: 'al-state-updated', charId, stalePushSkipped: true });
+    return;
+  }
+  if (kind === 'chat' && !payload.test && !proactiveJobMatchesConversationStage(allChats[charId], dueJob.job)) {
+    const expectedMode = expectedProactiveChatMode(allChats[charId]);
+    setStateCloudTimerTrace(state, kind, traceId, `忽略阶段不匹配的${proactiveJobMode(dueJob.job) === 'dice' ? '随机抽取' : '计划追发'}任务，已按当前会话改排为${expectedMode === 'dice' ? '随机抽取' : '计划追发'}。`);
+    await scheduleNextCloudProactive(state, charId, kind, expectedMode === 'dice'
+      ? { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE }
+      : { mode: 'planned' });
+    state.allChats = allChats;
+    state.updatedAt = Date.now();
+    await setMeta('app_state', state);
+    await notifyClients({ type: 'al-state-updated', charId, stageMismatchSkipped: true });
     return;
   }
   if (await hasVisibleClient()) {
@@ -1564,12 +1738,12 @@ async function handleProactivePush(payload) {
   }
   const proactiveNow = new Date();
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow, triggerMode);
-  const memoryQuery = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
+  const memoryQuery = buildProactiveMemoryQuery(chat, settings, proactiveNow, triggerMode);
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'proactive-chat');
   setStateCloudTimerTrace(state, 'chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
   const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext, triggerMode);
 
-  const messages = proactiveRecentMessages(chat, 30, proactiveNow);
+  const messages = proactiveRecentMessages(chat, 30, proactiveNow, settings);
   const historyOmitted = Math.max(0, recentMessageCandidateCount(chat, 30) - messages.length);
   messages.push({ role: 'user', content: buildProactiveTriggerMessage(settings, char, chat, proactiveNow, triggerMode) });
   const reply = (await callModel(settings, prompt.system, messages, {
@@ -1583,6 +1757,7 @@ async function handleProactivePush(payload) {
     promptBlocks: prompt.promptBlocks
   })).trim();
   setStateCloudTimerTrace(state, 'chat', traceId, `模型返回 ${reply.length} 字`);
+  const paymentDirective = extractPaymentStatusDirective(reply);
   const replyText = cleanAssistantChatReply(reply);
   chat.lastProactiveAt = Date.now();
   chat.lastProactiveChatAt = Date.now();
@@ -1619,6 +1794,7 @@ async function handleProactivePush(payload) {
   }
   chat.unread = (chat.unread || 0) + 1;
   chat.lastProactiveType = 'chat';
+  await updateBackgroundPaymentStatusFromReply(state, charId, replyText, paymentDirective?.status);
   try {
     await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
   } catch (err) {
@@ -1662,7 +1838,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
   const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext(proactiveNow)}\n${charName(char)}准备主动发朋友圈。\n${momentContext}`;
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'moment-post');
   const prompt = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
-  const messages = proactiveRecentMessages(chat, 20, proactiveNow);
+  const messages = proactiveRecentMessages(chat, 20, proactiveNow, settings);
   const historyOmitted = Math.max(0, recentMessageCandidateCount(chat, 20) - messages.length);
   const raw = (await callModel(settings, prompt.system, messages, {
     kind: 'moment',
