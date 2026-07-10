@@ -12,10 +12,18 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v67';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v68';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.53';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.54';/);
+assert.match(script, /const CHAT_HISTORY_CHAR_BUDGET = 12000;/);
+assert.match(script, /const PROACTIVE_HISTORY_CHAR_BUDGET = 9000;/);
+assert.match(swScript, /const CHAT_HISTORY_CHAR_BUDGET = 12000;/);
+assert.match(swScript, /const PROACTIVE_HISTORY_CHAR_BUDGET = 9000;/);
+assert.match(script, /function messageContextCost\(message\)/);
+assert.match(swScript, /function messageContextCost\(message\)/);
+assert.match(script, /recentMessages\(chat, count, PROACTIVE_HISTORY_CHAR_BUDGET\)/);
+assert.match(swScript, /recentMessages\(chat, count, PROACTIVE_HISTORY_CHAR_BUDGET\)/);
 assert.match(html, /\.primary\{width:calc\(100% - 28px\);/);
 assert.doesNotMatch(html, />发起聊天<\/button>/);
 assert.doesNotMatch(html, /class="wallet-tools"/);
@@ -266,7 +274,7 @@ assert.match(script, /你已添加了\$\{name\}，现在可以开始聊天了。
 assert.match(script, /function chatClearedSystemMessage/);
 assert.match(script, /你已清空与\$\{charName\(char\)\}的聊天记录。/);
 assert.match(script, /function conversationMessages\(chat\)/);
-assert.match(script, /filter\(m => m\.role !== 'system'\)\.slice\(-count\)/);
+assert.match(script, /function recentMessages\(chat, count = 30, charBudget = CHAT_HISTORY_CHAR_BUDGET\)/);
 assert.match(script, /function removeCharacterMomentTraces\(charId\)/);
 assert.match(script, /async function cancelCloudProactiveQuick\(charId, reason = '操作'\)/);
 assert.match(script, /await withTimeout\(cancelCloudProactive\(charId, 'all'\), 8000, `\$\{reason\}取消云闹钟超时`\)/);
@@ -625,6 +633,20 @@ assert.ok(RP_PRESETS.combined.prompt.includes('拆成独立聊天气泡'));
 assert.equal(normalizePresetKey('story'), 'combined');
 assert.equal(normalizePresetKey('custom'), 'custom');
 
+const contextBudgetChat = {
+  messages: [
+    { role: 'system', content: '系统消息不发送' },
+    { role: 'user', content: '旧'.repeat(80) },
+    { role: 'assistant', content: '中'.repeat(80) },
+    { role: 'user', content: '新'.repeat(80) }
+  ]
+};
+assert.equal(recentMessages(contextBudgetChat, 30, 150).map(row => row.content[0]).join(''), '新', '上下文预算应从最新消息向前保留连续尾部');
+assert.equal(recentMessages(contextBudgetChat, 2, 1000).map(row => row.content[0]).join(''), '中新', '条数上限仍应生效');
+const oversizedLatest = recentMessages({ messages: [{ role: 'user', content: '最'.repeat(500) }] }, 30, 120);
+assert.equal(oversizedLatest.length, 1, '即使最新消息超过预算，也必须完整保留');
+assert.equal(oversizedLatest[0].content.length, 500, '不得截断玩家最新一条消息');
+
 assert.equal(formatMsg('<b>*动作*</b>\n台词'), '&lt;b&gt;*动作*&lt;/b&gt;<br>台词');
 assert.equal(textFromContent([{ type: 'output_text', text: 'Responses 正文' }]), 'Responses 正文');
 assert.equal(textFromContent({ value: { text: '嵌套正文' } }), '嵌套正文');
@@ -838,6 +860,7 @@ recordModelCall({
   charId: 'char-1',
   system: '系统提示：不要保存 sk-secret123456',
   messages: [{ role: 'user', content: '你好' }],
+  historyOmitted: 2,
   memoryChars: 12,
   memoryStatus: memoryStatusWithBudget(budgetedPack, '记忆AI已调用；关键词：红包；向量库召回 1 条。'),
   promptBlocks: [{ id: 'memory-pack', priority: 30, chars: 42, preview: '红包约定' }],
@@ -847,6 +870,8 @@ const callLogs = getModelCallLogs();
 assert.equal(callLogs[0].scene, 'proactive-chat');
 assert.equal(callLogs[0].model, 'gpt-test');
 assert.equal(callLogs[0].messageCount, 1);
+assert.equal(callLogs[0].messageChars, 2);
+assert.equal(callLogs[0].historyOmitted, 2);
 assert.equal(callLogs[0].memoryChars, 12);
 assert.match(callLogs[0].memoryStatus, /记忆AI已调用/);
 assert.match(callLogs[0].memoryStatus, /记忆预算：已省略/);
@@ -862,6 +887,8 @@ assert.match(formatModelCallStatus({ time: '2026-07-08 12:00', scene: 'memory-qu
 const diagnosticText = formatModelCallDiagnostic(callLogs[0]);
 assert.match(diagnosticText, /scene=proactive-chat/);
 assert.match(diagnosticText, /memoryStatus=记忆AI已调用/);
+assert.match(diagnosticText, /messageChars=2/);
+assert.match(diagnosticText, /historyOmitted=2/);
 assert.match(diagnosticText, /记忆预算：已省略/);
 assert.match(diagnosticText, /promptBlocks=memory-pack@30:42/);
 assert.match(diagnosticText, /promptBlockDetails=[\s\S]*红包约定/);

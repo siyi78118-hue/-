@@ -997,7 +997,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.53';
+const APP_BUILD_VERSION = '2026-07-10.54';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1007,6 +1007,8 @@ const PROACTIVE_DICE_CHANCE = 0.05;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const CALL_LOG_LIMIT = 30;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
+const CHAT_HISTORY_CHAR_BUDGET = 12000;
+const PROACTIVE_HISTORY_CHAR_BUDGET = 9000;
 const MEMORY_LINE_CHAR_LIMIT = 360;
 function migrateSettings(raw) {
   const next = { ...DEFAULT_SETTINGS, ...(raw || {}) };
@@ -1528,7 +1530,7 @@ function buildProactiveTriggerMessage(char, chat, now = new Date(), triggerMode 
   ].join('\n');
 }
 function proactiveRecentMessages(chat, count = 30, now = new Date()) {
-  return recentMessages(chat, count).map(m => {
+  return recentMessages(chat, count, PROACTIVE_HISTORY_CHAR_BUDGET).map(m => {
     if (m.hidden) return { role: 'user', content: formatHiddenEventForAI(m) };
     const at = m.time ? new Date(m.time) : null;
     const meta = at ? `历史消息元数据：${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}。元数据只供判断时间流逝，禁止复制进回复。` : '历史消息元数据：发送时间未知，禁止复制进回复。';
@@ -1758,6 +1760,8 @@ function recordModelCall(entry = {}) {
       error: compactLogText(entry.error || '', 600),
       systemChars: String(entry.system || '').length,
       messageCount: messages.length,
+      messageChars: messages.reduce((sum, message) => sum + String(message?.content || '').length, 0),
+      historyOmitted: Math.max(0, Number(entry.historyOmitted) || 0),
       memoryChars: Number(entry.memoryChars) || 0,
       memoryStatus: compactLogText(entry.memoryStatus || '', 240),
       promptBlocks: promptBlocks.slice(0, 20).map(block => ({
@@ -1818,6 +1822,8 @@ function formatModelCallDiagnostic(log, index = 0) {
     `ok=${log.ok !== false}`,
     `empty=${!!log.empty}`,
     `messages=${log.messageCount || 0}`,
+    `messageChars=${log.messageChars || 0}`,
+    `historyOmitted=${log.historyOmitted || 0}`,
     `systemChars=${log.systemChars || 0}`,
     `memoryChars=${log.memoryChars || 0}`,
     log.memoryStatus ? `memoryStatus=${compactLogText(log.memoryStatus, 240)}` : '',
@@ -3942,8 +3948,26 @@ function composeMemoryPackSections(prefix, sections = [], budget = MEMORY_PACK_C
   if (omitted) keptSections.push(`预算提示：已省略 ${omitted} 条低优先级记忆，优先保留近期摘要、向量命中、未完成承诺和关键词强命中。`);
   return `${prefix}\n\n${keptSections.join('\n\n')}`;
 }
-function recentMessages(chat, count = 30) {
-  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-count);
+function messageContextCost(message) {
+  return String(message?.content || '').length + 32;
+}
+function recentMessageCandidateCount(chat, count = 30) {
+  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30)).length;
+}
+function recentMessages(chat, count = 30, charBudget = CHAT_HISTORY_CHAR_BUDGET) {
+  const rows = (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30));
+  const parsedBudget = Number(charBudget);
+  const budget = Number.isFinite(parsedBudget) && parsedBudget > 0 ? parsedBudget : CHAT_HISTORY_CHAR_BUDGET;
+  const kept = [];
+  let used = 0;
+  for (let index = rows.length - 1; index >= 0; index--) {
+    const row = rows[index];
+    const cost = messageContextCost(row);
+    if (kept.length && used + cost > budget) break;
+    kept.unshift(row);
+    used += cost;
+  }
+  return kept;
 }
 function normalizeVector(vec) {
   const norm = Math.sqrt(vec.reduce((sum, n) => sum + n * n, 0)) || 1;
@@ -5599,9 +5623,10 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   const system = prompt.system;
   const proactiveNow = options.proactiveNow || new Date();
   const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: proactiveNow });
+  const selectedHistoryCount = messages.length;
   if (options.proactive) messages.push({ role: 'user', content: buildProactiveTriggerMessage(currentChar, chat, proactiveNow, options.proactiveTriggerMode) });
   const scene = chatSceneFromOptions(options);
-  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
+  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, historyOmitted: Math.max(0, recentMessageCandidateCount(chat, 30) - selectedHistoryCount), memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
 }
 

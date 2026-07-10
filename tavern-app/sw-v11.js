@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v67';
+const CACHE_NAME = 'rpchat-v68';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -8,6 +8,8 @@ const MEMORY_MAX_TOKENS = 4096;
 const CALL_LOG_LIMIT = 30;
 const VECTOR_DIM = 384;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
+const CHAT_HISTORY_CHAR_BUDGET = 12000;
+const PROACTIVE_HISTORY_CHAR_BUDGET = 9000;
 const MEMORY_LINE_CHAR_LIMIT = 360;
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
@@ -151,6 +153,8 @@ async function recordModelCall(entry = {}) {
       error: compactLogText(entry.error || '', 600),
       systemChars: String(entry.system || '').length,
       messageCount: messages.length,
+      messageChars: messages.reduce((sum, message) => sum + String(message?.content || '').length, 0),
+      historyOmitted: Math.max(0, Number(entry.historyOmitted) || 0),
       memoryChars: Number(entry.memoryChars) || 0,
       memoryStatus: compactLogText(entry.memoryStatus || '', 240),
       promptBlocks: promptBlocks.slice(0, 20).map(block => ({
@@ -368,12 +372,32 @@ function buildProactiveTriggerMessage(settings = {}, char, chat, now = new Date(
   ].join('\n');
 }
 
-function recentMessages(chat, count = 30) {
-  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-count);
+function messageContextCost(message) {
+  return String(message?.content || '').length + 32;
+}
+
+function recentMessageCandidateCount(chat, count = 30) {
+  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30)).length;
+}
+
+function recentMessages(chat, count = 30, charBudget = CHAT_HISTORY_CHAR_BUDGET) {
+  const rows = (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30));
+  const parsedBudget = Number(charBudget);
+  const budget = Number.isFinite(parsedBudget) && parsedBudget > 0 ? parsedBudget : CHAT_HISTORY_CHAR_BUDGET;
+  const kept = [];
+  let used = 0;
+  for (let index = rows.length - 1; index >= 0; index--) {
+    const row = rows[index];
+    const cost = messageContextCost(row);
+    if (kept.length && used + cost > budget) break;
+    kept.unshift(row);
+    used += cost;
+  }
+  return kept;
 }
 
 function proactiveRecentMessages(chat, count = 30, now = new Date()) {
-  return recentMessages(chat, count).map(m => {
+  return recentMessages(chat, count, PROACTIVE_HISTORY_CHAR_BUDGET).map(m => {
     if (m.hidden) {
       return {
         role: 'user',
@@ -1223,6 +1247,7 @@ async function callModel(settings, system, messages, options = {}) {
     charId: options.charId || '',
     memoryChars: options.memoryChars,
     memoryStatus: options.memoryStatus || memoryQuerySnapshot(settings),
+    historyOmitted: options.historyOmitted,
     promptBlocks: options.promptBlocks,
     system,
     messages,
@@ -1526,6 +1551,7 @@ async function handleProactivePush(payload) {
   const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext, triggerMode);
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow);
+  const historyOmitted = Math.max(0, recentMessageCandidateCount(chat, 30) - messages.length);
   messages.push({ role: 'user', content: buildProactiveTriggerMessage(settings, char, chat, proactiveNow, triggerMode) });
   const reply = (await callModel(settings, prompt.system, messages, {
     stream: true,
@@ -1533,6 +1559,7 @@ async function handleProactivePush(payload) {
     scene: 'background-proactive-chat',
     charId,
     memoryChars: memoryPack.length,
+    historyOmitted,
     memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
@@ -1617,11 +1644,13 @@ async function handleProactiveMomentPush(state, charId, payload) {
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'moment-post');
   const prompt = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
   const messages = proactiveRecentMessages(chat, 20, proactiveNow);
+  const historyOmitted = Math.max(0, recentMessageCandidateCount(chat, 20) - messages.length);
   const raw = (await callModel(settings, prompt.system, messages, {
     kind: 'moment',
     scene: 'background-moment-post',
     charId,
     memoryChars: memoryPack.length,
+    historyOmitted,
     memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
