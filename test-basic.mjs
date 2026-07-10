@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v59';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v60';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.45';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.46';/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.7';/);
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
 assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
@@ -328,6 +328,8 @@ assert.match(script, /角色已看过，配置聊天接口后才能判断是否�
 assert.match(script, /角色已看过，配置聊天接口后才能判断是否点赞或回复/);
 assert.match(script, /回复失败，但角色已看过/);
 assert.match(script, /function cleanAssistantChatReply\(text\)/);
+assert.match(script, /function cleanStreamingDraftText\(text\)/);
+assert.match(script, /result = mergeStreamText\(result, deltaText\)/);
 assert.match(swScript, /function cleanAssistantChatReply\(text\)/);
 assert.match(swScript, /const replyText = cleanAssistantChatReply\(reply\)/);
 assert.match(swScript, /appendAssistantMessages\(chat, replyText/);
@@ -418,6 +420,8 @@ globalThis.__appTest = {
   textFromContent,
   extractResponseText,
   streamDeltaText,
+  mergeStreamText,
+  cleanStreamingDraftText,
   previewText,
   messagePreview,
   normalizeChar,
@@ -475,7 +479,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -524,6 +528,14 @@ assert.equal(extractResponseText({ output: [{ content: [{ type: 'output_text', t
 assert.equal(extractResponseText({ candidates: [{ content: { parts: [{ text: 'Gemini 正文' }] } }] }), 'Gemini 正文');
 assert.equal(streamDeltaText({ candidates: [{ content: { parts: [{ text: 'Gemini 流式正文' }] } }] }), 'Gemini 流式正文');
 assert.equal(streamDeltaText({ choices: [{ message: { content: [{ type: 'text', text: '兼容流式正文' }] } }] }), '兼容流式正文');
+assert.equal(streamDeltaText({ choices: [{ delta: { content: ' world' } }] }), ' world');
+assert.equal(mergeStreamText('Hello', ' world'), 'Hello world');
+assert.equal(mergeStreamText('你好', '你好，今天怎么样'), '你好，今天怎么样');
+assert.equal(cleanStreamingDraftText('你好\n<al_s'), '你好');
+assert.equal(cleanStreamingDraftText('你好\n<al_schedule>{"nextProactiveAt":"2026-07-10T12:00:00+08:00"}'), '你好');
+assert.equal(cleanStreamingDraftText('你好\n【发送时'), '你好');
+assert.equal(cleanStreamingDraftText('你好\n{"timeline":"今天天气很好"'), '你好');
+assert.equal(cleanStreamingDraftText('正常聊天正文'), '正常聊天正文');
 assert.equal(previewText('[语音消息 5秒，未转文字]'), '[语音]');
 assert.equal(previewText('[语音消息 5秒] 今晚早点睡'), '[语音] 今晚早点睡');
 assert.equal(messagePreview({ type: 'voice', transcript: '今晚早点睡', voiceDuration: 5 }), '[语音] 今晚早点睡');

@@ -1010,7 +1010,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.45';
+const APP_BUILD_VERSION = '2026-07-10.46';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
@@ -1644,7 +1644,14 @@ function streamDeltaText(json) {
     || textFromContent(json?.output_text)
     || textFromContent(json?.content)
     || textFromContent(json?.text)
-  ).trim();
+  );
+}
+function mergeStreamText(current = '', incoming = '') {
+  const before = String(current || '');
+  const next = String(incoming || '');
+  if (!next) return before;
+  if (next === before || (next.length > before.length && next.startsWith(before))) return next;
+  return before + next;
 }
 function compactRawResponse(raw) {
   return String(raw || '').replace(/\s+/g, ' ').slice(0, 220);
@@ -2671,6 +2678,30 @@ function cleanAssistantChatReply(text) {
     return block;
   }).replace(/\n{3,}/g, '\n\n').trim();
 }
+function cleanStreamingDraftText(text) {
+  const raw = String(text || '');
+  const lower = raw.toLowerCase();
+  let visible = raw;
+  const hiddenMarkers = [
+    '<al_schedule>',
+    '【发送时间',
+    '【历史消息元数据',
+    '历史消息元数据',
+    '历史聊天正文',
+    '{"nextproactiveat"',
+    '{"nextmessageat"',
+    '{"timeline"',
+    '{"moment"',
+    '{"post"'
+  ];
+  for (const marker of hiddenMarkers) {
+    const start = lower.lastIndexOf(marker[0]);
+    if (start < 0) continue;
+    const tail = lower.slice(start).trim();
+    if (marker.startsWith(tail) || tail.startsWith(marker)) visible = visible.slice(0, start);
+  }
+  return stripLeakedPromptMetadata(stripProactiveScheduleDirective(visible)).trim();
+}
 function applyAssistantMomentDirective(chat, charId, reply) {
   const directive = extractAssistantMomentDirective(reply);
   if (!directive) return cleanAssistantChatReply(reply);
@@ -3316,7 +3347,7 @@ function appendAssistantMessages(chat, text, extra = {}) {
   return chunks;
 }
 function renderStreamingDraftHtml(char, content) {
-  const chunks = splitAssistantOutput(content);
+  const chunks = splitAssistantOutput(cleanStreamingDraftText(content));
   if (!chunks.length) return '<div class="typing-line" data-streaming-draft="1">对方正在输入...</div>';
   return chunks.map((chunk, index) => {
     const cls = index === chunks.length - 1 ? 'msg-wrap streaming' : 'msg-wrap';
@@ -5343,7 +5374,7 @@ async function readOpenAIStream(resp, charId = currentCharId) {
       try {
         const deltaText = streamDeltaText(JSON.parse(t.slice(6)));
         if (deltaText) {
-          result += deltaText;
+          result = mergeStreamText(result, deltaText);
           updateStreamingDraft(charId, result);
         }
       } catch {}
@@ -5407,7 +5438,7 @@ async function readClaudeStream(resp, charId = currentCharId) {
         const json = JSON.parse(t.slice(6));
         const deltaText = streamDeltaText(json);
         if (deltaText) {
-          result += deltaText;
+          result = mergeStreamText(result, deltaText);
           updateStreamingDraft(charId, result);
         }
       } catch {}
