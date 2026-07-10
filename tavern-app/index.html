@@ -997,11 +997,11 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.55';
+const APP_BUILD_VERSION = '2026-07-10.56';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-10.9';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
-const CLOUD_TIMER_RESYNC_MS = 5 * 60 * 1000;
+const CLOUD_TIMER_RESYNC_MS = 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
 const PROACTIVE_DICE_MAX_ROLLS = 432;
@@ -4692,12 +4692,18 @@ function cloudTimerStatusText() {
   else if (!settings.pushSubscription) rows.push('云闹钟未绑定本机推送。');
   else rows.push('云闹钟已开启并绑定。');
 
-  const latest = getLatestChatRows()[0];
-  if (latest?.char?.name) rows.push(`当前目标：${latest.char.name}`);
-  const chatJob = latest?.chat?.pendingProactiveJob;
-  const momentJob = latest?.chat?.pendingMomentJob;
-  if (chatJob?.dueAt) rows.push(`私聊下次（${proactiveModeLabel(chatJob)}）：${formatFullTime(new Date(chatJob.dueAt))}`);
-  if (momentJob?.dueAt) rows.push(`朋友圈下次（${proactiveModeLabel(momentJob)}）：${formatFullTime(new Date(momentJob.dueAt))}`);
+  const chatRows = getLatestChatRows();
+  const managedIds = new Set(chatRows.filter(row => row.chat?.pendingProactiveJob?.dueAt || row.chat?.pendingMomentJob?.dueAt).map(row => row.char.id));
+  if (chatRows.length) rows.push(`主动角色：${managedIds.size}/${chatRows.length} 个会话`);
+  const nextJob = kind => chatRows
+    .map(row => ({ char: row.char, job: row.chat?.[proactiveJobKey(kind)] }))
+    .filter(row => row.job?.dueAt)
+    .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0] || null;
+  const nextChat = nextJob('chat');
+  const nextMoment = nextJob('moment');
+  if (nextChat) rows.push(`最近私聊（${nextChat.char.name}｜${proactiveModeLabel(nextChat.job)}）：${formatFullTime(new Date(nextChat.job.dueAt))}`);
+  if (nextMoment) rows.push(`最近朋友圈（${nextMoment.char.name}｜${proactiveModeLabel(nextMoment.job)}）：${formatFullTime(new Date(nextMoment.job.dueAt))}`);
+  const latest = chatRows[0];
   if (latest?.chat?.lastProactiveChatFailedAt) {
     rows.push(`私聊上次失败：${formatFullTime(new Date(latest.chat.lastProactiveChatFailedAt))}${latest.chat.lastProactiveChatError ? '｜' + latest.chat.lastProactiveChatError : ''}`);
   }
@@ -5046,10 +5052,6 @@ function ensureOpenedChatProactive(charId) {
     }
   }
 }
-function cloudTimerTargetCharId(rows = []) {
-  if (currentCharId && allChats[currentCharId]?.messages?.length) return currentCharId;
-  return rows[0]?.char?.id || '';
-}
 async function ensureCloudProactiveScheduled(options = {}) {
   if (options.kind) return ensureCloudProactiveKindScheduled(options.kind, options);
   let scheduled = false;
@@ -5064,37 +5066,31 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   const rows = getLatestChatRows();
   if (!rows.length) return false;
-  const target = cloudTimerTargetCharId(rows);
-  if (!target) return false;
-  await cancelOtherCloudJobs(target, kind, rows);
-  const chat = allChats[target];
-  if (!force && hasFutureCloudJob(chat, kind)) {
-    const lastSync = Number(chat[proactiveSyncKey(kind)] || 0);
-    if (resync && (!lastSync || Date.now() - lastSync > CLOUD_TIMER_RESYNC_MS)) {
-      return resubmitCloudProactive(target, kind);
+  let changed = false;
+  for (const { char, chat } of rows) {
+    try {
+      if (!force && hasFutureCloudJob(chat, kind)) {
+        const syncKey = proactiveSyncKey(kind);
+        const lastSync = Number(chat[syncKey] || 0);
+        if (resync && (!lastSync || Date.now() - lastSync > CLOUD_TIMER_RESYNC_MS)) {
+          const job = chat[proactiveJobKey(kind)];
+          const exists = await verifyCloudJobStatus(char.id, job, kind);
+          if (exists) {
+            chat[syncKey] = Date.now();
+            DB.set('chats', allChats);
+            await mirrorAppStateNow();
+          } else {
+            changed = await resubmitCloudProactive(char.id, kind) || changed;
+          }
+        }
+        continue;
+      }
+      changed = await scheduleCloudProactive(char.id, kind, proactiveDefaultScheduleOptions(kind, chat)) || changed;
+    } catch (err) {
+      console.warn(`[AL Timer] ${char.name || char.id} ${kind} schedule skipped:`, err.message);
     }
-    return false;
   }
-  return scheduleCloudProactive(target, kind, proactiveDefaultScheduleOptions(kind, chat));
-}
-async function cancelOtherCloudJobs(targetCharId, kind = 'chat', rows = getLatestChatRows()) {
-  const jobKey = proactiveJobKey(kind);
-  const stale = rows
-    .filter(({ char, chat }) => char.id !== targetCharId && chat?.[jobKey]?.jobId)
-    .map(({ char, chat }) => ({ charId: char.id, jobId: chat[jobKey].jobId }));
-  if (!stale.length) return false;
-  for (const item of stale) {
-    const chat = allChats[item.charId];
-    if (chat?.[jobKey]) delete chat[jobKey];
-  }
-  DB.set('chats', allChats);
-  await mirrorAppStateNow();
-  await Promise.allSettled(stale.map(item => fetchWithTimeout(timerUrl('/cancel'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceId: settings.deviceId, jobId: item.jobId })
-  }, 8000)));
-  return true;
+  return changed;
 }
 async function repairCloudTimerScheduleOnce() {
   if (!settings.cloudTimerEnabled || !settings.pushSubscription || settings.cloudTimerBucketFixV2) return;
@@ -5197,19 +5193,16 @@ async function verifyCloudJobStatus(charId, job, kind = 'chat') {
   return ok;
 }
 async function verifyCurrentCloudJobs() {
-  const latest = getLatestChatRows()[0];
-  const chat = latest?.chat;
-  if (!chat) {
+  const rows = getLatestChatRows();
+  if (!rows.length) {
     setCloudTimerStatus('当前没有可核验的云端任务。');
     return false;
   }
   const checks = [];
-  for (const kind of PROACTIVE_JOB_KINDS) {
-    const job = chat[proactiveJobKey(kind)];
-    if (job?.jobId) {
-      checks.push(verifyCloudJobStatus(latest.char.id, job, kind));
-    } else {
-      setCloudTimerTrace(kind, cloudTraceId(kind), '当前本地没有待核验的云端任务');
+  for (const { char, chat } of rows) {
+    for (const kind of PROACTIVE_JOB_KINDS) {
+      const job = chat[proactiveJobKey(kind)];
+      if (job?.jobId) checks.push(verifyCloudJobStatus(char.id, job, kind));
     }
   }
   if (!checks.length) return false;
@@ -5522,14 +5515,14 @@ async function checkProactiveMessages() {
 async function ensureLocalProactiveScheduled() {
   if (!settings.proactiveEnabled || cloudTimerTransportReady()) return false;
   const rows = getLatestChatRows();
-  const target = cloudTimerTargetCharId(rows);
-  const chat = target ? allChats[target] : null;
-  if (!chat) return false;
+  if (!rows.length) return false;
   let scheduled = false;
-  for (const kind of PROACTIVE_JOB_KINDS) {
-    const job = chat[proactiveJobKey(kind)];
-    if (job?.jobId || job?.dueAt) continue;
-    scheduled = await scheduleCloudProactive(target, kind, proactiveDefaultScheduleOptions(kind, chat)) || scheduled;
+  for (const { char, chat } of rows) {
+    for (const kind of PROACTIVE_JOB_KINDS) {
+      const job = chat[proactiveJobKey(kind)];
+      if (job?.jobId || job?.dueAt) continue;
+      scheduled = await scheduleCloudProactive(char.id, kind, proactiveDefaultScheduleOptions(kind, chat)) || scheduled;
+    }
   }
   return scheduled;
 }

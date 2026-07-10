@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v69';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v70';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.55';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.56';/);
 assert.match(script, /const CHAT_HISTORY_CHAR_BUDGET = 12000;/);
 assert.match(script, /const PROACTIVE_HISTORY_CHAR_BUDGET = 9000;/);
 assert.match(swScript, /const CHAT_HISTORY_CHAR_BUDGET = 12000;/);
@@ -59,6 +59,7 @@ assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-10\.9';/);
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
 assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
 assert.match(script, /const PROACTIVE_DICE_MAX_ROLLS = 432;/);
+assert.match(script, /const CLOUD_TIMER_RESYNC_MS = 60 \* 60 \* 1000;/);
 assert.match(script, /function proactiveDicePlan\(options = \{\}, now = Date\.now\(\), randomValue = Math\.random\(\)\)/);
 assert.match(swScript, /function proactiveDicePlan\(options = \{\}, now = Date\.now\(\), randomValue = Math\.random\(\)\)/);
 assert.match(script, /if \(job\?\.dicePrecomputed\) return true;/);
@@ -71,7 +72,11 @@ assert.match(script, /const API_TIMEOUT_MS = 120000;/);
 assert.match(script, /const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;/);
 assert.doesNotMatch(swScript, /Math\.min\(API_TIMEOUT_MS,\s*45000\)/);
 assert.doesNotMatch(script, /rows\.find\(\(\{ chat \}\) => !hasFutureCloudJob\(chat, kind\)\)/);
-assert.match(script, /function cancelOtherCloudJobs\(targetCharId, kind = 'chat'/);
+assert.doesNotMatch(script, /function cancelOtherCloudJobs\(/);
+assert.match(script, /for \(const \{ char, chat \} of rows\) \{/);
+assert.match(script, /const exists = await verifyCloudJobStatus\(char\.id, job, kind\)/);
+assert.match(script, /changed = await resubmitCloudProactive\(char\.id, kind\) \|\| changed/);
+assert.match(script, /主动角色：\$\{managedIds\.size\}\/\$\{chatRows\.length\} 个会话/);
 assert.match(script, /function ensureOpenedChatProactive\(charId\)/);
 assert.match(script, /ensureOpenedChatProactive\(charId\)/);
 assert.match(script, /open-chat \$\{kind\} due skipped/);
@@ -98,7 +103,7 @@ assert.match(script, /chatHasUnansweredProactive\(chat\)/);
 assert.match(script, /triggerProactiveMessage\(target\.char\.id, false, proactiveJobMode\(job\)\)/);
 assert.match(script, /triggerProactiveMessage\(data\.charId, false, proactiveJobMode\(localJob \|\| data\)\)/);
 assert.match(script, /function proactiveModeLabel\(job\)/);
-assert.match(script, /私聊下次（\$\{proactiveModeLabel\(chatJob\)\}）/);
+assert.match(script, /最近私聊（\$\{nextChat\.char\.name\}｜\$\{proactiveModeLabel\(nextChat\.job\)\}）/);
 assert.doesNotMatch(script, /cancelCloudProactive\(requestCharId, 'all'\)/);
 assert.doesNotMatch(script, /cancelCloudProactive\(currentCharId, 'all'\)/);
 assert.match(swScript, /function visibleConversationMessages\(chat\)/);
@@ -352,7 +357,7 @@ assert.match(cloudTimerWorker, /rollChance: job\.rollChance/);
 assert.match(cloudTimerWorker, /diceRolls: job\.diceRolls/);
 assert.match(cloudTimerWorker, /dicePrecomputed: !!job\.dicePrecomputed/);
 assert.doesNotMatch(cloudTimerWorker, /AL_TIMER_KV\.list/);
-const cloudWorkerModule = await import(`./cloud-timer-worker.js?quota-test=${Date.now()}`);
+const cloudWorkerModule = await import(`data:text/javascript;base64,${Buffer.from(cloudTimerWorker).toString('base64')}`);
 const idleCronWrites = [];
 const idleCronWaits = [];
 const idleCronEnv = {
@@ -398,7 +403,7 @@ assert.match(cloudTimerWorker, /async function jobStatus\(jobId, deviceId, env\)
 assert.match(script, /async function verifyCloudJobStatus\(charId, job, kind = 'chat'\)/);
 assert.match(script, /async function verifyCurrentCloudJobs\(\)/);
 assert.match(script, /await verifyCurrentCloudJobs\(\)/);
-assert.match(script, /当前本地没有待核验的云端任务/);
+assert.match(script, /当前没有可核验的云端任务/);
 assert.match(script, /云端任务核验失败/);
 assert.match(html, /id="moment-reply-bar"/);
 assert.match(script, /function openMomentReplyBar\(momentId\)/);
@@ -574,14 +579,13 @@ globalThis.__appTest = {
   memoryTextSimilarity,
   findMemoryMergeCandidate,
   mergeMemoryItems,
-  cloudTimerTargetCharId,
   proactiveJobId,
   proactiveDefaultScheduleOptions,
   proactiveDicePlan,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, stripLeakedPromptMetadata, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, stripLeakedPromptMetadata, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, RP_PRESETS } = context.__appTest;
 
 const memoryQueueProbe = await vm.runInContext(`(async () => {
   const original = processMemoryBatch;
@@ -1059,8 +1063,46 @@ assert.equal('pendingProactiveJob' in importedChats.c1, false);
 assert.equal('pendingMomentJob' in importedChats.c1, false);
 assert.equal('cloudScheduleSyncedAt' in importedChats.c1, false);
 assert.equal('cloudMomentScheduleSyncedAt' in importedChats.c1, false);
-vm.runInContext("currentCharId='current_chat'; allChats={ old_chat:{ messages:[{ role:'user', content:'旧会话', time:1 }] }, current_chat:{ messages:[{ role:'user', content:'当前会话', time:2 }] } };", context);
-assert.equal(cloudTimerTargetCharId([{ char: { id: 'old_chat' }, chat: context.allChats?.old_chat }, { char: { id: 'current_chat' }, chat: context.allChats?.current_chat }]), 'current_chat');
+const multiRoleScheduleProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedCharacters = characters;
+  const savedChats = allChats;
+  const savedSchedule = scheduleCloudProactive;
+  const savedVerify = verifyCloudJobStatus;
+  const savedResubmit = resubmitCloudProactive;
+  const savedMirror = mirrorAppStateNow;
+  const calls = [];
+  const verifies = [];
+  const resubmits = [];
+  settings = { ...settings, proactiveEnabled: true, cloudTimerEnabled: true, timerEndpoint: 'https://timer.example', pushSubscription: { endpoint: 'https://push.example' } };
+  characters = [{ id: 'role_a', name: '甲' }, { id: 'role_b', name: '乙' }];
+  const future = new Date(Date.now() + 3600000).toISOString();
+  allChats = {
+    role_a: { messages: [{ role: 'user', content: '甲会话', time: 1 }] },
+    role_b: { messages: [{ role: 'user', content: '乙会话', time: 2 }] }
+  };
+  scheduleCloudProactive = async (charId, kind) => { calls.push(charId + ':' + kind); return true; };
+  await ensureCloudProactiveScheduled({ force: true });
+  allChats.role_a.pendingProactiveJob = { jobId: 'a-job', dueAt: future, kind: 'chat', mode: 'dice', dicePrecomputed: true };
+  allChats.role_b.pendingProactiveJob = { jobId: 'b-job', dueAt: future, kind: 'chat', mode: 'dice', dicePrecomputed: true };
+  allChats.role_a.cloudScheduleSyncedAt = 0;
+  allChats.role_b.cloudScheduleSyncedAt = 0;
+  verifyCloudJobStatus = async charId => { verifies.push(charId); return true; };
+  resubmitCloudProactive = async charId => { resubmits.push(charId); return true; };
+  mirrorAppStateNow = async () => true;
+  await ensureCloudProactiveKindScheduled('chat', { resync: true });
+  settings = savedSettings;
+  characters = savedCharacters;
+  allChats = savedChats;
+  scheduleCloudProactive = savedSchedule;
+  verifyCloudJobStatus = savedVerify;
+  resubmitCloudProactive = savedResubmit;
+  mirrorAppStateNow = savedMirror;
+  return { calls, verifies, resubmits };
+})()`, context);
+assert.equal(multiRoleScheduleProbe.calls.sort().join(','), 'role_a:chat,role_a:moment,role_b:chat,role_b:moment', '云端补排必须为每个已有会话分别保留私聊与朋友圈任务');
+assert.equal(multiRoleScheduleProbe.verifies.sort().join(','), 'role_a,role_b', '过期同步标记应逐角色做只读核验');
+assert.equal(multiRoleScheduleProbe.resubmits.length, 0, '云端任务存在时不得重复写入');
 const promiseVector = localEmbedding('周六晚上语音 承诺 不会消失');
 const similarVector = localEmbedding('你是不是忘了周六语音的约定');
 const differentVector = localEmbedding('今天午饭吃什么');
