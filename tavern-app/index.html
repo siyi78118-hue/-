@@ -997,7 +997,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.50';
+const APP_BUILD_VERSION = '2026-07-10.51';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1433,6 +1433,36 @@ function lastVisibleMessage(chat) {
 function latestMessageByRole(chat, role) {
   return conversationMessages(chat).slice().reverse().find(m => m.role === role) || null;
 }
+function normalizeProactiveTriggerMode(value = 'planned') {
+  if (value === 'dice') return 'dice';
+  if (value === 'manual') return 'manual';
+  return 'planned';
+}
+function proactiveConversationState(chat, now = new Date()) {
+  const messages = conversationMessages(chat);
+  const last = messages[messages.length - 1] || null;
+  const lastUserIndex = messages.map(m => m.role).lastIndexOf('user');
+  const afterLastUser = lastUserIndex >= 0 ? messages.slice(lastUserIndex + 1) : messages;
+  const assistantSinceLastUser = afterLastUser.filter(m => m.role === 'assistant');
+  const proactiveSinceLastUser = assistantSinceLastUser.filter(m => m.proactive && m.proactiveMode !== 'manual');
+  const lastUser = lastUserIndex >= 0 ? messages[lastUserIndex] : null;
+  const lastAssistant = [...messages].reverse().find(m => m.role === 'assistant') || null;
+  const elapsedFrom = msg => msg?.time ? Math.max(0, now.getTime() - Number(msg.time)) : null;
+  return {
+    messages,
+    last,
+    lastUser,
+    lastAssistant,
+    assistantSinceLastUser,
+    proactiveSinceLastUser,
+    lastElapsedMs: elapsedFrom(last),
+    userElapsedMs: elapsedFrom(lastUser),
+    crossedDay: !!(last?.time && new Date(last.time).toDateString() !== now.toDateString())
+  };
+}
+function chatHasUnansweredProactive(chat) {
+  return proactiveConversationState(chat).proactiveSinceLastUser.length > 0;
+}
 function messageTimeLine(label, msg, now = new Date()) {
   if (!msg?.time) return `${label}：无`;
   const at = new Date(msg.time);
@@ -1440,47 +1470,60 @@ function messageTimeLine(label, msg, now = new Date()) {
   const content = String(msg.content || '').replace(/\s+/g, ' ').slice(0, 120);
   return `${label}：${formatFullTime(at)}（距现在 ${elapsed}）｜${msg.role === 'user' ? '用户' : '角色'}：${content}`;
 }
-function buildProactiveTimeContext(chat, now = new Date()) {
-  const last = lastVisibleMessage(chat);
-  const lastUser = latestMessageByRole(chat, 'user');
-  const lastAssistant = latestMessageByRole(chat, 'assistant');
-  const lastElapsedMinutes = last?.time ? Math.round((now.getTime() - last.time) / 60000) : 0;
-  const crossedDay = last?.time ? new Date(last.time).toDateString() !== now.toDateString() : false;
-  const mode = crossedDay || lastElapsedMinutes >= 360
+function buildProactiveTimeContext(chat, now = new Date(), triggerMode = 'planned') {
+  const state = proactiveConversationState(chat, now);
+  const lastElapsedMinutes = state.lastElapsedMs == null ? 0 : Math.round(state.lastElapsedMs / 60000);
+  const mode = state.crossedDay || lastElapsedMinutes >= 360
     ? '跨天/超长间隔重新开口'
     : lastElapsedMinutes >= 60
       ? '长间隔重新开口'
       : lastElapsedMinutes >= 15
         ? '中等间隔自然续聊'
         : '短间隔可轻续聊';
+  const normalizedTriggerMode = normalizeProactiveTriggerMode(triggerMode);
+  const stage = normalizedTriggerMode === 'dice'
+    ? '随机再联系阶段：在角色已经主动追发过之后，玩家仍未回复；这不是第一轮计划追发。'
+    : normalizedTriggerMode === 'manual'
+      ? '手动测试阶段：按真实主动消息规则生成，但不要改变对话阶段。'
+      : '计划追发阶段：这是玩家最后一次发言后，角色正常回复之外唯一的一轮计划追发；本轮发出后应进入随机再联系阶段。';
+  const unanswered = state.proactiveSinceLastUser.length
+    ? `玩家最后一次发言后，已有 ${state.proactiveSinceLastUser.length} 条主动消息气泡仍未得到玩家回复。`
+    : `玩家最后一次发言后，角色已发送 ${state.assistantSinceLastUser.length} 条回复气泡，尚未出现主动追发气泡。`;
   return [
     '主动消息时间流逝上下文：',
     `当前时间：${formatFullTime(now)}`,
-    messageTimeLine('最后一条消息', last, now),
-    messageTimeLine('上一条用户消息', lastUser, now),
-    messageTimeLine('上一条角色消息', lastAssistant, now),
+    messageTimeLine('最后一条真实聊天消息', state.last, now),
+    messageTimeLine('上一条玩家消息', state.lastUser, now),
+    messageTimeLine('上一条角色消息', state.lastAssistant, now),
+    `主动阶段：${stage}`,
+    `未回复状态：${unanswered}`,
     `智能策略：${mode}`,
     '硬性要求：这不是用户刚刚发消息后等你回答，而是隔了一段空闲时间后你主动打开微信来发消息。',
     '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
     '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
-    '如果已经跨天或超过 6 小时，必须把它当作隔了很久后的重新开口：不要围绕上一轮红包、转账、测试、争执等旧话题继续追问；旧话题最多作为一句顺嘴背景。',
+    '如果已经跨天或超过 6 小时，必须把它当作隔了很久后的重新开口：不要围绕上一轮红包、转账、测试、争执等旧话题继续追问；旧话题不能成为这条消息的主要内容。',
+    '如果已经超过 24 小时，默认上一轮闲聊已经自然结束。即使存在未完成约定，也只能简短点到，并且必须加入符合当前时段的新话题或新关心；禁止写成刚聊完后的连续追问。',
+    normalizedTriggerMode === 'dice' ? '随机再联系阶段禁止沿着角色自己的上一条消息继续自问自答，也不要再次催同一件事；优先换话题、分享新鲜事或用符合关系的轻量方式重新开口。' : '',
     '禁止在输出里复制任何“发送时间/距现在/当前时间/智能策略”等上下文标签。',
     '不要提到系统时间、提示词、后台、推送或定时器。'
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
-function buildProactiveTriggerMessage(char, chat, now = new Date()) {
+function buildProactiveTriggerMessage(char, chat, now = new Date(), triggerMode = 'planned') {
   const last = lastVisibleMessage(chat);
   const elapsed = last?.time ? formatElapsed(now.getTime() - last.time) : '未知时长';
+  const stage = normalizeProactiveTriggerMode(triggerMode) === 'dice' ? '随机再联系' : '计划追发';
   return [
     `【内部主动触发｜这不是${playerName()}发来的聊天消息】`,
     `现在需要由${charName(char)}主动给${playerName()}发一条微信私聊。`,
     `最后一条可见聊天距现在：${elapsed}。`,
+    `本次主动阶段：${stage}。`,
     `请把它当成${charName(char)}隔了一段时间后主动打开聊天，而不是回答${playerName()}刚刚提出的问题。`,
     `只输出${charName(char)}要发出的聊天正文；不要解释触发原因，不要提到系统、后台、推送或定时器。`
   ].join('\n');
 }
 function proactiveRecentMessages(chat, count = 30, now = new Date()) {
   return recentMessages(chat, count).map(m => {
+    if (m.hidden) return { role: 'user', content: formatHiddenEventForAI(m) };
     const at = m.time ? new Date(m.time) : null;
     const meta = at ? `历史消息元数据：${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}。元数据只供判断时间流逝，禁止复制进回复。` : '历史消息元数据：发送时间未知，禁止复制进回复。';
     return { role: m.role, content: `${meta}\n历史聊天正文：${m.content}` };
@@ -2630,8 +2673,7 @@ function stripProactiveScheduleDirective(text) {
 }
 function stripLeakedPromptMetadata(text) {
   return String(text || '')
-    .replace(/【\s*发送时间[^】]*】/g, '')
-    .replace(/【\s*历史消息元数据[^】]*】/g, '')
+    .replace(/[【[]\s*(?:发送时间|历史消息元数据)[^】\]]*[】\]]\s*/g, '')
     .replace(/历史消息元数据[:：][^\n]*(?:\n|$)/g, '')
     .replace(/历史聊天正文[:：]/g, '')
     .split(/\n+/)
@@ -3053,13 +3095,15 @@ nextProactiveAt 表示如果${playerName()}接下来一直没有回复，${char.
   }
   if (options.proactive) {
     const proactiveNow = options.proactiveNow || new Date();
-    const proactiveTimeContext = options.proactiveTimeContext || buildProactiveTimeContext(chat, proactiveNow);
+    const proactiveTriggerMode = normalizeProactiveTriggerMode(options.proactiveTriggerMode);
+    const proactiveTimeContext = options.proactiveTimeContext || buildProactiveTimeContext(chat, proactiveNow, proactiveTriggerMode);
     composer.add('proactive-time-context', proactiveTimeContext, { priority: 38, scenes: ['proactive-chat'] });
     composer.add('proactive-scene', `当前触发情况：${char.name}主动发消息。
 现在不是${playerName()}刚发消息后等你回答，而是${char.name}在空闲时间主动打开聊天发消息。
+当前主动阶段：${proactiveTriggerMode === 'dice' ? '随机再联系。角色已经主动追发过，而玩家仍未回复；禁止把这次写成第一轮追问，也禁止沿着角色自己的上一句话继续自问自答。' : proactiveTriggerMode === 'manual' ? '手动测试。仍须遵守真实主动消息的时间流逝规则。' : '计划追发。这是正常回复后唯一的一轮计划主动消息；不要输出下一次发送时间，发送后系统会切换到随机再联系。'}
 关系语境：${playerName()}已经有一段时间没有继续回复${char.name}了。${char.name}可以对此有轻微反应，比如试探、嘴硬、换话题、追问、补一句刚才没说完的话，或装作不在意；具体语气必须符合角色性格和双方关系。
 短间隔可以轻续聊；超过 15 分钟要体现时间流逝；超过 60 分钟默认像重新开口，除非有未完成约定或强情绪必须接住。
-如果已经隔了很久、跨天或接近一天，不能像刚刚结束上一轮聊天一样继续追红包/转账/测试等旧话题；应该换成更自然的重新开口，旧事最多轻轻带一句。
+如果已经隔了很久、跨天或接近一天，不能像刚刚结束上一轮聊天一样继续追红包/转账/测试等旧话题；应该换成更自然的重新开口，旧事不能成为主要内容。超过 24 小时时，必须加入符合当前时段的新话题或新关心。
 可以自然提起朋友圈、红包、转账、约定或最近事件，但不要机械复述后台材料。
 禁止说“免打扰模式、骰子、摇骰、调度、时间戳、系统、后台、推送、定时器”等调度相关词。
 如果想连续发几条消息，用换行分隔；系统会拆成独立聊天气泡。
@@ -3547,7 +3591,7 @@ async function submitPayMessage() {
   const note = (noteInput?.value || '').trim();
   const chat = allChats[currentCharId];
   if (!chat) return;
-  cancelCloudProactive(currentCharId, 'all');
+  cancelCloudProactive(currentCharId, 'chat');
   saveWalletBalance(walletBalance() - amount);
   closeComposerPanels();
   const content = kind === 'redpacket'
@@ -4227,7 +4271,7 @@ async function sendMessage() {
   input.style.height = 'auto';
   document.getElementById('btn-send').className = 'send inactive';
   const chat = allChats[requestCharId];
-  cancelCloudProactive(requestCharId, 'all');
+  cancelCloudProactive(requestCharId, 'chat');
   chat.messages.push({ role: 'user', content: text, time: Date.now() });
   DB.set('chats', allChats);
   await continueAssistantTurn(requestCharId, text);
@@ -4308,7 +4352,7 @@ async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random
   closeComposerPanels();
   const actualDuration = Math.max(1, Math.min(60, Number(duration) || 4));
   const content = `[语音消息 ${actualDuration}秒，未转文字]`;
-  cancelCloudProactive(requestCharId, 'all');
+  cancelCloudProactive(requestCharId, 'chat');
   chat.messages.push({ role: 'user', type: 'voice', content, voiceDuration: actualDuration, time: Date.now() });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
@@ -4326,7 +4370,7 @@ async function sendVoiceTranscriptMessage(transcript, duration) {
   const chat = allChats[requestCharId];
   if (!chat) return;
   closeComposerPanels();
-  cancelCloudProactive(requestCharId, 'all');
+  cancelCloudProactive(requestCharId, 'chat');
   chat.messages.push({ role: 'user', type: 'voice', content: text, transcript: text, voiceDuration: duration, time: Date.now() });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
@@ -4452,8 +4496,8 @@ function cloudTimerStatusText() {
   if (latest?.char?.name) rows.push(`当前目标：${latest.char.name}`);
   const chatJob = latest?.chat?.pendingProactiveJob;
   const momentJob = latest?.chat?.pendingMomentJob;
-  if (chatJob?.dueAt) rows.push(`私聊下次：${formatFullTime(new Date(chatJob.dueAt))}`);
-  if (momentJob?.dueAt) rows.push(`朋友圈下次：${formatFullTime(new Date(momentJob.dueAt))}`);
+  if (chatJob?.dueAt) rows.push(`私聊下次（${proactiveModeLabel(chatJob)}）：${formatFullTime(new Date(chatJob.dueAt))}`);
+  if (momentJob?.dueAt) rows.push(`朋友圈下次（${proactiveModeLabel(momentJob)}）：${formatFullTime(new Date(momentJob.dueAt))}`);
   if (latest?.chat?.lastProactiveChatFailedAt) {
     rows.push(`私聊上次失败：${formatFullTime(new Date(latest.chat.lastProactiveChatFailedAt))}${latest.chat.lastProactiveChatError ? '｜' + latest.chat.lastProactiveChatError : ''}`);
   }
@@ -4753,8 +4797,11 @@ function clampProactiveDueAt(dateLike, kind = 'chat') {
 function proactiveJobMode(job) {
   return job?.mode === 'dice' ? 'dice' : 'planned';
 }
-function proactiveDefaultScheduleOptions(kind = 'chat') {
-  return kind === 'moment'
+function proactiveModeLabel(job) {
+  return proactiveJobMode(job) === 'dice' ? '随机抽取' : '计划追发';
+}
+function proactiveDefaultScheduleOptions(kind = 'chat', chat = null) {
+  return kind === 'moment' || (kind === 'chat' && chatHasUnansweredProactive(chat))
     ? { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE }
     : { mode: 'planned' };
 }
@@ -4780,7 +4827,7 @@ function ensureOpenedChatProactive(charId) {
     if (job?.dueAt && Date.parse(job.dueAt) <= Date.now()) {
       runDueProactiveTarget({ char: characters.find(c => c.id === charId), chat }, kind).catch(err => console.warn(`[AL Timer] open-chat ${kind} due skipped:`, err.message));
     } else if (!hasFutureCloudJob(chat, kind)) {
-      scheduleCloudProactive(charId, kind, proactiveDefaultScheduleOptions(kind)).catch(err => console.warn(`[AL Timer] open-chat ${kind} schedule skipped:`, err.message));
+      scheduleCloudProactive(charId, kind, proactiveDefaultScheduleOptions(kind, chat)).catch(err => console.warn(`[AL Timer] open-chat ${kind} schedule skipped:`, err.message));
     }
   }
 }
@@ -4813,7 +4860,7 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
     }
     return false;
   }
-  return scheduleCloudProactive(target, kind, proactiveDefaultScheduleOptions(kind));
+  return scheduleCloudProactive(target, kind, proactiveDefaultScheduleOptions(kind, chat));
 }
 async function cancelOtherCloudJobs(targetCharId, kind = 'chat', rows = getLatestChatRows()) {
   const jobKey = proactiveJobKey(kind);
@@ -4873,7 +4920,7 @@ async function scheduleCloudProactive(charId, kind = 'chat', options = {}) {
     chat[syncKey] = Date.now();
     DB.set('chats', allChats);
     await mirrorAppStateNow();
-    setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已安排：${formatFullTime(new Date(chat[jobKey].dueAt))}`, true, kind);
+    setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已安排（${proactiveModeLabel(chat[jobKey])}）：${formatFullTime(new Date(chat[jobKey].dueAt))}`, true, kind);
   } catch (err) {
     if (previousJob) chat[jobKey] = previousJob;
     else delete chat[jobKey];
@@ -4897,7 +4944,7 @@ async function resubmitCloudProactive(charId, kind = 'chat') {
   chat[proactiveSyncKey(kind)] = Date.now();
   DB.set('chats', allChats);
   await mirrorAppStateNow();
-  setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已重新同步：${formatFullTime(new Date(chat[jobKey].dueAt))}`, true, kind);
+  setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已重新同步（${proactiveModeLabel(chat[jobKey])}）：${formatFullTime(new Date(chat[jobKey].dueAt))}`, true, kind);
   return true;
 }
 async function postCloudSchedule(charId, job, kind = 'chat') {
@@ -5075,9 +5122,9 @@ async function runDueProactiveTarget(target, kind = 'chat') {
   }
   return kind === 'moment'
     ? triggerProactiveMoment(target.char.id, false)
-    : triggerProactiveMessage(target.char.id, false);
+    : triggerProactiveMessage(target.char.id, false, proactiveJobMode(job));
 }
-async function triggerProactiveMessage(charId, manual = false) {
+async function triggerProactiveMessage(charId, manual = false, triggerMode = 'planned') {
   const traceId = cloudTraceId('chat');
   if (proactiveChatBusy || isStreaming) {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `跳过：${proactiveChatBusy ? '上一轮私聊仍在生成' : '当前正在流式回复用户'}`);
@@ -5100,15 +5147,16 @@ async function triggerProactiveMessage(charId, manual = false) {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `收到触发，目标：${char.name || charId}`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊已接到云闹钟，正在生成消息。', true, 'chat');
     const proactiveNow = new Date();
-    const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow);
+    const proactiveTriggerMode = manual ? 'manual' : normalizeProactiveTriggerMode(triggerMode);
+    const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow, proactiveTriggerMode);
     const query = `主动消息触发。\n${getTimeContext(proactiveNow)}\n${proactiveTimeContext}`;
     const memoryPack = manual ? await prepareMemoryPackSafe(charId, query, 'manual-proactive-chat') : await prepareProactiveMemoryPack(charId, query);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊正在请求聊天模型。', true, 'chat');
     const reply = manual
-      ? await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext })
+      ? await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode })
       : await retryTransient(
-          () => callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext }),
+          () => callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode }),
           {
             retries: 2,
             delayMs: 3500,
@@ -5134,7 +5182,7 @@ async function triggerProactiveMessage(charId, manual = false) {
     chat.lastProactiveAt = Date.now();
     chat.lastProactiveChatAt = Date.now();
     delete chat.lastProactiveChatError;
-    appendAssistantMessages(chat, replyText, { proactive: true });
+    appendAssistantMessages(chat, replyText, { proactive: true, proactiveMode: proactiveTriggerMode });
     chat.lastProactiveType = 'chat';
     if (activeScreen !== 'chat' || currentCharId !== charId) chat.unread = (chat.unread || 0) + 1;
     DB.set('chats', allChats);
@@ -5265,7 +5313,7 @@ async function ensureLocalProactiveScheduled() {
   for (const kind of PROACTIVE_JOB_KINDS) {
     const job = chat[proactiveJobKey(kind)];
     if (job?.jobId || job?.dueAt) continue;
-    scheduled = await scheduleCloudProactive(target, kind, proactiveDefaultScheduleOptions(kind)) || scheduled;
+    scheduled = await scheduleCloudProactive(target, kind, proactiveDefaultScheduleOptions(kind, chat)) || scheduled;
   }
   return scheduled;
 }
@@ -5298,7 +5346,7 @@ async function handleForegroundProactiveRequest(data = {}) {
     const jobKey = proactiveJobKey(kind);
     const localJob = data.charId ? allChats[data.charId]?.[jobKey] : null;
     const dueAt = localJob?.dueAt ? formatFullTime(new Date(localJob.dueAt)) : '无本地任务';
-    setCloudTimerTrace(kind, traceId, `前台收到 push：kind=${kind}，char=${data.charId || '未指定'}，job=${data.jobId || '未指定'}，due=${dueAt}`);
+    setCloudTimerTrace(kind, traceId, `前台收到 push：kind=${kind}，mode=${proactiveModeLabel(localJob || data)}，char=${data.charId || '未指定'}，job=${data.jobId || '未指定'}，due=${dueAt}`);
     if (proactiveJobMode(localJob || data) === 'dice' && data.charId && !rollProactiveDice(kind, localJob || data)) {
       setCloudTimerTrace(kind, traceId, '骰子未抽中，本轮不调用模型，已安排下一轮');
       await scheduleDiceProactive(data.charId, kind);
@@ -5317,7 +5365,7 @@ async function handleForegroundProactiveRequest(data = {}) {
       setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}私聊闹钟已被前台收到。`);
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : `云闹钟已触发，正在由前台生成私聊。${data.fallback ? '（本地未命中到期任务，已用最近任务兜底）' : ''}`, true, 'chat');
       if (data.charId) {
-        const ok = await triggerProactiveMessage(data.charId, false);
+        const ok = await triggerProactiveMessage(data.charId, false, proactiveJobMode(localJob || data));
         if (!ok) setCloudTimerTrace('chat', traceId, '前台触发私聊未写入内容，详见私聊结果或最近调用诊断');
       } else await catchUpDueCloudProactive();
     }
@@ -5376,7 +5424,7 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   const system = prompt.system;
   const proactiveNow = options.proactiveNow || new Date();
   const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: proactiveNow });
-  if (options.proactive) messages.push({ role: 'user', content: buildProactiveTriggerMessage(currentChar, chat, proactiveNow) });
+  if (options.proactive) messages.push({ role: 'user', content: buildProactiveTriggerMessage(currentChar, chat, proactiveNow, options.proactiveTriggerMode) });
   const scene = chatSceneFromOptions(options);
   const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
