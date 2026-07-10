@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v74';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v76';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.60';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.62';/);
 assert.match(script, /const MEMORY_BATCH_SIZE = 30;/);
 assert.doesNotMatch(html, /id="set-memory-interval"/);
 assert.match(script, /const interval = MEMORY_BATCH_SIZE;/);
@@ -26,7 +26,7 @@ assert.match(script, /sourceMessageIds/);
 assert.match(script, /事件发生时间必须来自本批消息前面的“消息时间”/);
 assert.match(script, /happenedAt: resolveMemoryEventTime\(e, sourceBatch\)/);
 assert.match(script, /storeExtractedMemory\(charId, extracted, batch\)/);
-assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat'\);[\s\S]*const reply = await callAPI\(chat, memoryPack,[\s\S]*appendAssistantMessages\(chat, replyText\)/);
+assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat', \{ signal: controller\.signal \}\);[\s\S]*const reply = await callAPI\(chat, memoryPack,[\s\S]*appendAssistantMessages\(chat, replyText, \{ replyToMessageId: userMessageId \}\)/);
 assert.match(script, /const messages = sceneMessagesForAI\(chat, 30,/);
 assert.match(script, /finally \{[\s\S]*processMemoryAfterTurn\(requestCharId\)/);
 assert.doesNotMatch(script, /title: '近期增量摘要'/);
@@ -41,8 +41,22 @@ assert.match(script, /return recentMessages\(chat, count\)\.map\(m =>/);
 assert.match(swScript, /return recentMessages\(chat, count\)\.map\(m =>/);
 assert.match(script, /messages\.slice\(-30\)\.map\(m => messageLine\(m, char\)\)/);
 assert.match(swScript, /messages\.slice\(-30\)\.map\(m => messageLine\(m, char, settings\)\)/);
-assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat'\)/);
-assert.match(script, /const query = await generateMemoryQuery\(char, userInput, recent, scene\)/);
+assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat', \{ signal: controller\.signal \}\)/);
+assert.match(script, /chat\.pendingReply = \{[\s\S]*userMessageId/);
+assert.match(script, /function resumePendingAssistantTurns\(\)/);
+assert.match(script, /function mergeLocalPendingReplies\(remoteChats = \{\}, localChats = \{\}\)/);
+assert.match(script, /function preservePendingRepliesForUnload\(\)/);
+assert.match(script, /window\.addEventListener\('pagehide', preservePendingRepliesForUnload\)/);
+assert.match(script, /window\.addEventListener\('pageshow'/);
+assert.match(script, /resumePendingAssistantTurns\(\);/);
+assert.match(script, /active\.controller\.abort\('message-retracted'\)/);
+assert.match(script, /function retractMessage\(charId, messageId\)/);
+assert.match(script, /function deleteChatMessage\(charId, messageId\)/);
+assert.match(script, /replyToMessageId: userMessageId/);
+assert.doesNotMatch(script, /content: `（\$\{friendlyErrorMessage\(err\)\}）`/);
+assert.match(html, /data-memory-action="edit"/);
+assert.match(script, /function bindMemoryListActions\(list\)/);
+assert.match(script, /const query = await generateMemoryQuery\(char, userInput, recent, scene, options\)/);
 assert.match(swScript, /const query = await generateBackgroundMemoryQuery\(charId, char, settings, queryText, recent, scene\)/);
 assert.match(html, /\.primary\{width:calc\(100% - 28px\);/);
 assert.doesNotMatch(html, />发起聊天<\/button>/);
@@ -219,8 +233,8 @@ assert.match(script, /diagnostic = responseDiagnostic\(json, raw\)/);
 assert.match(swScript, /diagnostic = responseDiagnostic\(json, raw\)/);
 assert.match(script, /记忆 API 有正文但不是可解析 JSON/);
 assert.match(swScript, /记忆 API 有正文但不是可解析 JSON/);
-assert.match(script, /async function prepareMemoryPackSafe\(charId, userInput, scene = 'chat'\)/);
-assert.match(script, /return await prepareMemoryPack\(charId, userInput, scene\)/);
+assert.match(script, /async function prepareMemoryPackSafe\(charId, userInput, scene = 'chat', options = \{\}\)/);
+assert.match(script, /return await prepareMemoryPack\(charId, userInput, scene, options\)/);
 assert.match(script, /prepareMemoryPack\(charId, query, `proactive-\$\{kind\}`\)/);
 assert.match(swScript, /buildMemoryPack\(charId, char, settings, memoryQuery, 'proactive-chat'\)/);
 assert.match(swScript, /buildMemoryPack\(charId, char, settings, memoryQuery, 'moment-post'\)/);
@@ -348,7 +362,7 @@ assert.match(html, /测试记忆筛选/);
 assert.match(script, /async function testMemoryQueryPreset\(\)/);
 assert.match(script, /scene: 'memory-query-test'/);
 assert.match(script, /记忆检索失败：\$\{friendlyErrorMessage\(err\)\}；已跳过记忆包继续生成。/);
-assert.match(script, /await prepareMemoryPackSafe\(requestCharId, userText, 'chat'\)/);
+assert.match(script, /await prepareMemoryPackSafe\(requestCharId, userText, 'chat', \{ signal: controller\.signal \}\)/);
 assert.match(script, /await prepareMemoryPackSafe\(char\.id, memoryQuery, 'moment-interaction'\)/);
 assert.match(script, /await prepareMemoryPackSafe\(char\.id, memoryQuery, 'moment-reply'\)/);
 assert.match(html, /onpointerdown="startVoiceRecording\(event\)"/);
@@ -567,6 +581,7 @@ globalThis.__appTest = {
   clearImportedCloudJobs,
   normalizeMemoryProcessedCursor,
   memoryRelevantMessages,
+  mergeLocalPendingReplies,
   fetchModels,
   selectFetchedModel,
   recentMessages,
@@ -638,7 +653,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, RP_PRESETS } = context.__appTest;
 
 const memoryQueueProbe = await vm.runInContext(`(async () => {
   const original = processMemoryBatch;
@@ -732,6 +747,21 @@ const contextBudgetChat = {
 };
 assert.equal(recentMessages(contextBudgetChat, 30).map(row => row.content[0]).join(''), '旧中新', '最近30条不得再因字符预算丢失');
 assert.equal(recentMessages(contextBudgetChat, 2).map(row => row.content[0]).join(''), '中新', '条数上限仍应生效');
+const retractedContextChat = {
+  messages: [
+    { id: 'keep', role: 'user', content: '保留' },
+    { id: 'withdrawn', role: 'user', content: '撤回内容', retracted: true },
+    { id: 'deleted', role: 'assistant', content: '删除内容', deleted: true }
+  ]
+};
+assert.deepEqual(recentMessages(retractedContextChat, 30).map(row => row.id), ['keep'], '撤回和删除消息不得再发送给AI');
+assert.deepEqual(memoryRelevantMessages(retractedContextChat.messages).map(row => row.id), ['keep'], '撤回和删除消息不得进入记忆整理');
+const mergedPending = mergeLocalPendingReplies(
+  { c1: { messages: [{ id: 'old', role: 'assistant', content: '旧镜像', time: 1 }] } },
+  { c1: { messages: [{ id: 'pending-user', role: 'user', content: '待回复', time: 2, replyState: 'pending' }], pendingReply: { userMessageId: 'pending-user', userText: '待回复', state: 'running', updatedAt: 20 } } }
+);
+assert.equal(mergedPending.c1.pendingReply.state, 'pending', '镜像恢复时必须保留并重置本机待回复任务');
+assert.equal(mergedPending.c1.messages.some(row => row.id === 'pending-user'), true, '镜像恢复时必须合并尚未回复的本机消息');
 const oversizedLatest = recentMessages({ messages: [{ role: 'user', content: '最'.repeat(500) }] }, 30);
 assert.equal(oversizedLatest.length, 1, '即使最新消息很长，也必须完整保留');
 assert.equal(oversizedLatest[0].content.length, 500, '不得截断玩家最新一条消息');

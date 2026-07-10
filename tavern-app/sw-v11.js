@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v74';
+const CACHE_NAME = 'rpchat-v76';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -278,7 +278,7 @@ function formatElapsed(ms) {
 }
 
 function visibleConversationMessages(chat) {
-  return (chat?.messages || []).filter(m => !m.hidden && m.role !== 'system');
+  return (chat?.messages || []).filter(m => !m.hidden && !m.deleted && !m.retracted && m.role !== 'system');
 }
 
 function normalizeProactiveTriggerMode(value = 'planned') {
@@ -397,11 +397,11 @@ function buildProactiveTriggerMessage(settings = {}, char, chat, now = new Date(
 }
 
 function recentMessageCandidateCount(chat, count = 30) {
-  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30)).length;
+  return (chat?.messages || []).filter(m => !m.deleted && !m.retracted && m.role !== 'system').slice(-Math.max(1, Number(count) || 30)).length;
 }
 
 function recentMessages(chat, count = 30) {
-  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30));
+  return (chat?.messages || []).filter(m => !m.deleted && !m.retracted && m.role !== 'system').slice(-Math.max(1, Number(count) || 30));
 }
 
 function proactiveRecentMessages(chat, count = 30, now = new Date(), settings = {}) {

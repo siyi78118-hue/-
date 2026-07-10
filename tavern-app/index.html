@@ -202,6 +202,11 @@ button{border:none;background:none;cursor:pointer}
 .bubble em{font-style:italic;color:#596b4a}
 .time-tip{align-self:center;color:#999;font-size:12px;margin:2px 0}
 .typing-line{align-self:center;color:#a3a3a3;font-size:12px;line-height:1.2;margin:-2px 0 2px;opacity:.86}
+.message-failed{font-size:11px;color:#d64b3f;text-align:right;margin:-5px 50px 2px 0}
+.message-action-sheet{width:100%;max-width:520px;padding:0 0 calc(10px + var(--safe-bottom));background:#f7f7f7}
+.message-action-sheet button{display:block;width:100%;height:54px;border:0;border-bottom:1px solid #e5e5e5;background:#fff;font-size:16px;color:#111}
+.message-action-sheet button.danger{color:#d64b3f}
+.message-action-cancel{margin-top:8px!important;border-bottom:0!important}
 .streaming .bubble:after{content:"";display:inline-block;width:1px;height:1em;margin-left:2px;background:#999;vertical-align:-2px;animation:cursorBlink 1s steps(1) infinite}
 @keyframes cursorBlink{0%,45%{opacity:1}46%,100%{opacity:0}}
 .composer{padding:6px 7px calc(6px + var(--safe-bottom));display:flex;align-items:flex-end;gap:7px;background:#f7f7f7;border-top:1px solid #d8d8d8;flex-shrink:0}
@@ -790,6 +795,13 @@ button.profile-top{width:100%;text-align:left}
   </div>
 </div>
 
+<div id="message-action-mask" class="modal-mask" onclick="closeMessageActions(event)">
+  <div class="message-action-sheet" role="dialog" aria-label="消息操作" onclick="event.stopPropagation()">
+    <div id="message-action-buttons"></div>
+    <button class="message-action-cancel" type="button" onclick="closeMessageActions()">取消</button>
+  </div>
+</div>
+
 <script>
 const DB = {
   get(k, def = null) { try { const v = localStorage.getItem('rpchat_' + k) ?? localStorage.getItem('tavern_' + k); return v ? JSON.parse(v) : def } catch { return def } },
@@ -996,7 +1008,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.60';
+const APP_BUILD_VERSION = '2026-07-10.62';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-10.9';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1076,6 +1088,11 @@ let currentCharId = null;
 let profileCharId = null;
 let isStreaming = false;
 let streamingDraft = null;
+const activeChatRequests = new Map();
+let messageActionTarget = null;
+let messageLongPressTimer = null;
+let messageLongPressStart = null;
+let pageIsUnloading = false;
 let lastMainScreen = 'chats';
 let contactProfileReturnScreen = 'contacts';
 let selfProfileReturnScreen = 'me';
@@ -1330,14 +1347,38 @@ async function mirrorAppState() {
     }, 60);
   });
 }
+function mergeLocalPendingReplies(remoteChats = {}, localChats = {}) {
+  const merged = remoteChats && typeof remoteChats === 'object' ? remoteChats : {};
+  Object.entries(localChats || {}).forEach(([charId, localChat]) => {
+    const localPending = localChat?.pendingReply;
+    if (!localPending || !['pending', 'running'].includes(localPending.state)) return;
+    const localMessage = messageById(localChat, localPending.userMessageId);
+    if (!messageAvailableToAI(localMessage)) return;
+    const remoteChat = merged[charId] || {};
+    const messagesById = new Map();
+    [...(remoteChat.messages || []), ...(localChat.messages || [])].forEach(message => {
+      ensureMessageIdentity(message);
+      messagesById.set(message.id, message);
+    });
+    const messages = [...messagesById.values()].sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
+    Object.entries(remoteChat).forEach(([key, value]) => {
+      if (!['messages', 'pendingReply'].includes(key)) localChat[key] = value;
+    });
+    localChat.messages = messages;
+    localChat.pendingReply = { ...localPending, state: 'pending' };
+    merged[charId] = localChat;
+  });
+  return merged;
+}
 async function restoreAppStateFromMirror() {
   const mirrored = await MemoryDB.getMeta('app_state', null);
   if (!mirrored?.updatedAt) return false;
   const localUpdatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0;
   if (mirrored.updatedAt <= localUpdatedAt) return false;
+  const localChats = allChats;
   settings = migrateSettings(mirrored.settings || settings);
   characters = (mirrored.characters || characters).map(normalizeChar);
-  allChats = mirrored.allChats || allChats;
+  allChats = mergeLocalPendingReplies(mirrored.allChats || allChats, localChats);
   allMoments = Array.isArray(mirrored.allMoments) ? mirrored.allMoments : allMoments;
   scrubEmptyReplyMessages(allChats);
   localStorage.setItem('rpchat_settings', JSON.stringify(settings));
@@ -1427,11 +1468,34 @@ function formatElapsed(ms) {
   const hourRest = hours % 24;
   return hourRest ? `${days} 天 ${hourRest} 小时` : `${days} 天`;
 }
+function ensureMessageIdentity(message) {
+  if (!message || typeof message !== 'object') return false;
+  if (message.id) return false;
+  message.id = uid('msg');
+  return true;
+}
+function ensureChatMessageIds(chat) {
+  let changed = false;
+  (chat?.messages || []).forEach(message => { changed = ensureMessageIdentity(message) || changed; });
+  return changed;
+}
+function messageAvailableToAI(message) {
+  return !!message && !message.deleted && !message.retracted;
+}
+function messageById(chat, messageId) {
+  return (chat?.messages || []).find(message => message.id === messageId) || null;
+}
+function pendingReplyMessage(chat) {
+  const pending = chat?.pendingReply;
+  if (!pending?.userMessageId) return null;
+  const message = messageById(chat, pending.userMessageId);
+  return messageAvailableToAI(message) ? message : null;
+}
 function visibleChatMessages(chat) {
-  return (chat?.messages || []).filter(m => !m.hidden);
+  return (chat?.messages || []).filter(m => !m.hidden && !m.deleted);
 }
 function conversationMessages(chat) {
-  return visibleChatMessages(chat).filter(m => m.role !== 'system');
+  return visibleChatMessages(chat).filter(m => m.role !== 'system' && messageAvailableToAI(m));
 }
 function lastVisibleMessage(chat) {
   const messages = conversationMessages(chat);
@@ -3139,8 +3203,9 @@ function openChat(charId) {
   document.getElementById('chat-title').textContent = char.name;
   if (!allChats[charId]) {
     allChats[charId] = { messages: [], charPrompt: buildCharPrompt(char), extraPrompt: '', unread: 0 };
-    if (char.firstMessage) allChats[charId].messages.push({ role: 'assistant', content: char.firstMessage, time: Date.now() });
+    if (char.firstMessage) allChats[charId].messages.push({ id: uid('msg'), role: 'assistant', content: char.firstMessage, time: Date.now() });
   }
+  ensureChatMessageIds(allChats[charId]);
   allChats[charId].unread = 0;
   DB.set('chats', allChats);
   renderMessages();
@@ -3584,7 +3649,7 @@ function appendAssistantMessages(chat, text, extra = {}) {
   if (!chunks.length) return [];
   const baseTime = Date.now();
   chunks.forEach((content, index) => {
-    chat.messages.push({ role: 'assistant', content, time: baseTime + index * 1000, ...extra });
+    chat.messages.push({ id: uid('msg'), role: 'assistant', content, time: baseTime + index * 1000, ...extra });
   });
   return chunks;
 }
@@ -3606,25 +3671,34 @@ function renderMessages() {
   const displayMessages = visibleChatMessages(chat);
   displayMessages.forEach((m, i) => {
     if (i === 0 || (m.time - (displayMessages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
+    const messageAttrs = `data-message-id="${esc(m.id || '')}"`;
+    if (m.retracted) {
+      html += `<div class="system-tip" ${messageAttrs}>你撤回了一条消息</div>`;
+      return;
+    }
     if (m.role === 'system') {
-      html += `<div class="system-tip">${esc(m.content)}</div>`;
+      html += `<div class="system-tip" ${messageAttrs}>${esc(m.content)}</div>`;
       return;
     }
     if (m.role === 'user') {
-      html += `<div class="msg-wrap me">${renderMessageBody(m)}${playerAvatarHtml('msg-avatar')}</div>`;
+      html += `<div class="msg-wrap me" ${messageAttrs}>${renderMessageBody(m)}${playerAvatarHtml('msg-avatar')}</div>`;
+      if (m.replyState === 'failed') html += `<div class="message-failed">未收到回复</div>`;
       const tip = (m.type === 'transfer' || m.type === 'redpacket') ? paymentStatusTip(m, char) : '';
       if (tip) html += `<div class="pay-status-tip">${esc(tip)}</div>`;
     } else {
       const chunks = splitAssistantOutput(m.content);
       html += (chunks.length ? chunks : [m.content]).map(chunk =>
-        `<div class="msg-wrap">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(chunk)}</div></div>`
+        `<div class="msg-wrap" ${messageAttrs}>${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(chunk)}</div></div>`
       ).join('');
     }
   });
   if (streamingDraft?.charId === currentCharId) {
     html += renderStreamingDraftHtml(char, streamingDraft.content);
+  } else if (pendingReplyMessage(chat) && ['pending', 'running'].includes(chat.pendingReply?.state)) {
+    html += renderStreamingDraftHtml(char, '');
   }
   wrap.innerHTML = html;
+  bindMessageActions(wrap);
   scrollChatBottom();
 }
 function scrollChatBottom() {
@@ -3640,6 +3714,106 @@ function clearStreamingDraft(charId) {
   if (!streamingDraft || streamingDraft.charId !== charId) return;
   streamingDraft = null;
   document.querySelectorAll('[data-streaming-draft="1"]').forEach(el => el.remove());
+}
+function bindMessageActions(root) {
+  root?.querySelectorAll?.('[data-message-id]').forEach(element => {
+    const messageId = element.dataset.messageId;
+    if (!messageId) return;
+    element.addEventListener('pointerdown', event => startMessageLongPress(event, messageId));
+    element.addEventListener('pointermove', cancelMessageLongPressOnMove);
+    element.addEventListener('pointerup', cancelMessageLongPress);
+    element.addEventListener('pointercancel', cancelMessageLongPress);
+    element.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      cancelMessageLongPress();
+      openMessageActions(messageId);
+    });
+  });
+}
+function startMessageLongPress(event, messageId) {
+  if (event.button != null && event.button !== 0) return;
+  cancelMessageLongPress();
+  messageLongPressStart = { x: event.clientX || 0, y: event.clientY || 0 };
+  messageLongPressTimer = setTimeout(() => {
+    messageLongPressTimer = null;
+    navigator.vibrate?.(18);
+    openMessageActions(messageId);
+  }, 520);
+}
+function cancelMessageLongPressOnMove(event) {
+  if (!messageLongPressStart) return;
+  if (Math.abs((event.clientX || 0) - messageLongPressStart.x) > 8 || Math.abs((event.clientY || 0) - messageLongPressStart.y) > 8) cancelMessageLongPress();
+}
+function cancelMessageLongPress() {
+  if (messageLongPressTimer) clearTimeout(messageLongPressTimer);
+  messageLongPressTimer = null;
+  messageLongPressStart = null;
+}
+function openMessageActions(messageId) {
+  const chat = allChats[currentCharId];
+  const message = messageById(chat, messageId);
+  if (!chat || !message) return;
+  messageActionTarget = { charId: currentCharId, messageId };
+  const buttons = document.getElementById('message-action-buttons');
+  if (!buttons) return;
+  buttons.innerHTML = message.role === 'user' && !message.retracted
+    ? '<button type="button" onclick="retractSelectedMessage()">撤回</button><button class="danger" type="button" onclick="deleteSelectedMessage()">删除</button>'
+    : '<button class="danger" type="button" onclick="deleteSelectedMessage()">删除</button>';
+  document.getElementById('message-action-mask')?.classList.add('show');
+}
+function closeMessageActions(event) {
+  if (event && event.target?.id !== 'message-action-mask') return;
+  document.getElementById('message-action-mask')?.classList.remove('show');
+  messageActionTarget = null;
+}
+function abortPendingReply(charId, messageId) {
+  const active = activeChatRequests.get(charId);
+  if (active?.userMessageId === messageId) active.controller.abort('message-retracted');
+  const chat = allChats[charId];
+  if (chat?.pendingReply?.userMessageId === messageId) delete chat.pendingReply;
+  clearStreamingDraft(charId);
+}
+async function adjustMemoryCursorAfterDeletion(charId, deletedIndex) {
+  await invalidateMemoryExtraction(charId);
+  const stored = await MemoryDB.getMeta(memoryMetaKey(charId), 0);
+  const cursor = Math.max(0, Number(stored) || 0);
+  if (deletedIndex < cursor) await MemoryDB.setMeta(memoryMetaKey(charId), Math.max(0, cursor - 1));
+}
+async function retractMessage(charId, messageId) {
+  const chat = allChats[charId];
+  const message = messageById(chat, messageId);
+  if (!chat || !message || message.role !== 'user' || message.retracted) return false;
+  abortPendingReply(charId, messageId);
+  message.retracted = true;
+  message.retractedAt = Date.now();
+  delete message.replyState;
+  delete message.replyError;
+  DB.set('chats', allChats);
+  if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
+  renderChats();
+  return true;
+}
+async function deleteChatMessage(charId, messageId) {
+  const chat = allChats[charId];
+  const index = (chat?.messages || []).findIndex(message => message.id === messageId);
+  if (!chat || index < 0) return false;
+  abortPendingReply(charId, messageId);
+  chat.messages.splice(index, 1);
+  DB.set('chats', allChats);
+  await adjustMemoryCursorAfterDeletion(charId, index);
+  if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
+  renderChats();
+  return true;
+}
+async function retractSelectedMessage() {
+  const target = messageActionTarget;
+  closeMessageActions();
+  if (target && await retractMessage(target.charId, target.messageId)) toast('已撤回');
+}
+async function deleteSelectedMessage() {
+  const target = messageActionTarget;
+  closeMessageActions();
+  if (target && await deleteChatMessage(target.charId, target.messageId)) toast('已删除');
 }
 function autoResize(el) {
   el.style.height = 'auto';
@@ -3745,34 +3919,129 @@ function updatePaymentStatusFromReply(chat, paymentMessageId, reply, charId = cu
 }
 async function continueAssistantTurn(requestCharId, userText, options = {}) {
   const chat = allChats[requestCharId];
+  if (!chat) return '';
+  ensureChatMessageIds(chat);
+  const userMessageId = options.userMessageId || chat.pendingReply?.userMessageId || latestMessageByRole(chat, 'user')?.id || '';
+  const userMessage = messageById(chat, userMessageId);
+  if (!messageAvailableToAI(userMessage)) return '';
+  const existing = activeChatRequests.get(requestCharId);
+  if (existing) return existing.promise;
+  const requestToken = uid('turn');
+  const controller = new AbortController();
+  const storedOptions = {
+    paymentMessageId: options.paymentMessageId || '',
+    payment: options.payment || null
+  };
+  chat.pendingReply = {
+    userMessageId,
+    userText: String(userText || userMessage.content || ''),
+    options: storedOptions,
+    state: 'running',
+    requestToken,
+    createdAt: Number(chat.pendingReply?.createdAt) || Date.now(),
+    updatedAt: Date.now()
+  };
+  userMessage.replyState = 'pending';
+  delete userMessage.replyError;
+  DB.set('chats', allChats);
   isStreaming = true;
   updateStreamingDraft(requestCharId, '');
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
-  try {
-    try { await mirrorAppStateNow(); } catch (err) { console.warn('[AL Timer] user turn state mirror skipped:', err.message); }
-    const memoryPack = await prepareMemoryPackSafe(requestCharId, userText, 'chat');
-    const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()) });
-    clearStreamingDraft(requestCharId);
-    const proactiveSchedule = extractProactiveScheduleDirective(reply);
-    const paymentDirective = extractPaymentStatusDirective(reply);
-    const replyText = applyAssistantMomentDirective(chat, requestCharId, reply);
-    if (isEmptyReplyText(replyText)) throw new Error('接口返回空内容，没有生成回复');
-    appendAssistantMessages(chat, replyText);
-    updatePaymentStatusFromReply(chat, options.paymentMessageId, replyText, requestCharId, paymentDirective?.status);
-    schedulePlannedChatFromReply(requestCharId, proactiveSchedule).catch(err => console.warn('[AL Timer] planned chat schedule skipped:', err.message));
-    ensureDiceProactiveScheduled(requestCharId, 'moment').catch(err => console.warn('[AL Timer] moment dice schedule skipped:', err.message));
-    return replyText;
-  } catch (err) {
-    clearStreamingDraft(requestCharId);
-    chat.messages.push({ role: 'assistant', content: `（${friendlyErrorMessage(err)}）`, time: Date.now() });
-    return '';
-  } finally {
-    isStreaming = false;
-    DB.set('chats', allChats);
-    if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
-    renderChats();
-    processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
-  }
+  let completed = false;
+  const run = (async () => {
+    try {
+      try { await mirrorAppStateNow(); } catch (err) { console.warn('[AL Timer] user turn state mirror skipped:', err.message); }
+      const memoryPack = await prepareMemoryPackSafe(requestCharId, userText, 'chat', { signal: controller.signal });
+      if (controller.signal.aborted || !messageAvailableToAI(userMessage)) return '';
+      const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), signal: controller.signal });
+      clearStreamingDraft(requestCharId);
+      if (controller.signal.aborted || !messageAvailableToAI(userMessage) || chat.pendingReply?.requestToken !== requestToken) return '';
+      const proactiveSchedule = extractProactiveScheduleDirective(reply);
+      const paymentDirective = extractPaymentStatusDirective(reply);
+      const replyText = applyAssistantMomentDirective(chat, requestCharId, reply);
+      if (isEmptyReplyText(replyText)) throw new Error('接口返回空内容，没有生成回复');
+      appendAssistantMessages(chat, replyText, { replyToMessageId: userMessageId });
+      updatePaymentStatusFromReply(chat, options.paymentMessageId, replyText, requestCharId, paymentDirective?.status);
+      schedulePlannedChatFromReply(requestCharId, proactiveSchedule).catch(err => console.warn('[AL Timer] planned chat schedule skipped:', err.message));
+      ensureDiceProactiveScheduled(requestCharId, 'moment').catch(err => console.warn('[AL Timer] moment dice schedule skipped:', err.message));
+      delete chat.pendingReply;
+      delete userMessage.replyState;
+      completed = true;
+      return replyText;
+    } catch (err) {
+      clearStreamingDraft(requestCharId);
+      if (controller.signal.aborted || !messageAvailableToAI(userMessage) || chat.pendingReply?.requestToken !== requestToken) return '';
+      if (pageIsUnloading || err?.name === 'AbortError') {
+        chat.pendingReply.state = 'pending';
+        chat.pendingReply.updatedAt = Date.now();
+        userMessage.replyState = 'pending';
+        delete userMessage.replyError;
+        return '';
+      }
+      chat.pendingReply.state = 'failed';
+      chat.pendingReply.updatedAt = Date.now();
+      chat.pendingReply.error = friendlyErrorMessage(err);
+      userMessage.replyState = 'failed';
+      userMessage.replyError = friendlyErrorMessage(err);
+      return '';
+    } finally {
+      if (activeChatRequests.get(requestCharId)?.requestToken === requestToken) activeChatRequests.delete(requestCharId);
+      isStreaming = activeChatRequests.size > 0;
+      DB.set('chats', allChats);
+      if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+      renderChats();
+      if (completed) processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
+    }
+  })();
+  activeChatRequests.set(requestCharId, { requestToken, userMessageId, controller, promise: run });
+  return run;
+}
+function createPendingUserMessage(chat, content, extra = {}) {
+  const message = { id: uid('msg'), role: 'user', content, time: Date.now(), replyState: 'pending', ...extra };
+  chat.messages.push(message);
+  chat.pendingReply = {
+    userMessageId: message.id,
+    userText: String(content || ''),
+    options: {},
+    state: 'pending',
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+  return message;
+}
+function resumePendingAssistantTurns() {
+  Object.entries(allChats || {}).forEach(([charId, chat]) => {
+    ensureChatMessageIds(chat);
+    const pending = chat?.pendingReply;
+    if (!pending || !['pending', 'running'].includes(pending.state) || activeChatRequests.has(charId)) return;
+    const message = pendingReplyMessage(chat);
+    if (!message || (chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === message.id)) {
+      delete chat.pendingReply;
+      if (message) delete message.replyState;
+      DB.set('chats', allChats);
+      return;
+    }
+    pending.state = 'pending';
+    pending.updatedAt = Date.now();
+    const savedOptions = pending.options || {};
+    setTimeout(() => continueAssistantTurn(charId, pending.userText || message.content, { ...savedOptions, userMessageId: message.id, resumed: true }), 80);
+  });
+}
+function preservePendingRepliesForUnload() {
+  pageIsUnloading = true;
+  let changed = false;
+  activeChatRequests.forEach((active, charId) => {
+    const chat = allChats[charId];
+    if (!chat?.pendingReply || chat.pendingReply.userMessageId !== active.userMessageId) return;
+    chat.pendingReply.state = 'pending';
+    chat.pendingReply.updatedAt = Date.now();
+    const message = messageById(chat, active.userMessageId);
+    if (message) message.replyState = 'pending';
+    changed = true;
+  });
+  if (!changed) return;
+  localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
+  localStorage.setItem('rpchat_app_state_updated_at', String(Date.now()));
 }
 function openPayScreen(kind = 'transfer') {
   if (!currentCharId) { toast('先打开一个会话'); return; }
@@ -3819,10 +4088,8 @@ async function submitPayMessage() {
     : `${playerName()}向${char?.name || '对方'}转账${formatMoney(amount)}${note ? `，备注：${note}` : ''}`;
   const paymentMessageId = uid('pay');
   const sentAt = Date.now();
-  chat.messages.push({
+  const paymentMessage = createPendingUserMessage(chat, content, {
     id: paymentMessageId,
-    role: 'user',
-    content,
     type: kind,
     payType: kind,
     amount,
@@ -3831,12 +4098,13 @@ async function submitPayMessage() {
     payExpiresAt: kind === 'redpacket' ? sentAt + REDPACKET_EXPIRE_MS : null,
     time: sentAt
   });
+  chat.pendingReply.options = { paymentMessageId, payment: { kind, amount, note } };
   DB.set('chats', allChats);
   if (amountInput) amountInput.value = '';
   if (noteInput) noteInput.value = '';
   showScreen('chat');
   renderMessages();
-  await continueAssistantTurn(currentCharId, content, { paymentMessageId, payment: { kind, amount, note } });
+  await continueAssistantTurn(currentCharId, content, { userMessageId: paymentMessage.id, paymentMessageId, payment: { kind, amount, note } });
 }
 function uid(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -3868,7 +4136,7 @@ function normalizeMemoryProcessedCursor(value, messageCount) {
   return cursor >= 0 && cursor <= count ? cursor : 0;
 }
 function memoryRelevantMessages(messages = []) {
-  return messages.filter(message => message && message.role !== 'system');
+  return messages.filter(message => message && message.role !== 'system' && messageAvailableToAI(message));
 }
 async function setMemoryExtractStatus(charId, state, message, extra = {}) {
   if (!charId) return;
@@ -4069,10 +4337,10 @@ function composeMemoryPackSections(prefix, sections = [], budget = MEMORY_PACK_C
   return `${prefix}\n\n${keptSections.join('\n\n')}`;
 }
 function recentMessageCandidateCount(chat, count = 30) {
-  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30)).length;
+  return (chat?.messages || []).filter(m => m.role !== 'system' && messageAvailableToAI(m)).slice(-Math.max(1, Number(count) || 30)).length;
 }
 function recentMessages(chat, count = 30) {
-  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30));
+  return (chat?.messages || []).filter(m => m.role !== 'system' && messageAvailableToAI(m)).slice(-Math.max(1, Number(count) || 30));
 }
 function normalizeVector(vec) {
   const norm = Math.sqrt(vec.reduce((sum, n) => sum + n * n, 0)) || 1;
@@ -4137,7 +4405,8 @@ async function callMemoryJSON(system, user, options = {}) {
       const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: settings.memoryModel, system, messages, max_tokens: MEMORY_MAX_TOKENS, temperature: 0.2 })
+        body: JSON.stringify({ model: settings.memoryModel, system, messages, max_tokens: MEMORY_MAX_TOKENS, temperature: 0.2 }),
+        signal: options.signal
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
@@ -4158,7 +4427,8 @@ async function callMemoryJSON(system, user, options = {}) {
       const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: MEMORY_MAX_TOKENS })
+        body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: MEMORY_MAX_TOKENS }),
+        signal: options.signal
       }, API_TIMEOUT_MS);
       if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
@@ -4194,7 +4464,7 @@ function memoryQuerySceneName(scene = 'memory-query') {
   if (!value || value === 'memory-query') return 'memory-query';
   return value.startsWith('memory-query-') ? value : `memory-query-${value}`;
 }
-async function generateMemoryQuery(char, userInput, messages, scene = 'memory-query') {
+async function generateMemoryQuery(char, userInput, messages, scene = 'memory-query', options = {}) {
   const fallback = { query: `${char?.name || ''} ${userInput}`, keywords: [], focus: 'current' };
   const queryScene = memoryQuerySceneName(scene);
   const missing = [];
@@ -4222,9 +4492,10 @@ async function generateMemoryQuery(char, userInput, messages, scene = 'memory-qu
   const payload = buildMemoryQueryPayload(char, userInput, messages);
   try {
     setMemoryQueryStatus(`正在调用记忆AI筛选本轮相关记忆（${queryScene}）。`);
-    const json = await callMemoryJSON(payload.system, payload.user, { scene: queryScene, charId: char?.id || '' });
+    const json = await callMemoryJSON(payload.system, payload.user, { scene: queryScene, charId: char?.id || '', signal: options.signal });
     return { ...fallback, ...json, _memoryAiStatus: 'ok' };
   } catch (err) {
+    if (options.signal?.aborted || err?.name === 'AbortError') throw err;
     console.warn('[AL Memory] query fallback:', err.message);
     setMemoryQueryStatus(`记忆AI筛选失败：${friendlyErrorMessage(err)}；已改用本地关键词检索。`);
     return { ...fallback, _memoryAiStatus: 'failed' };
@@ -4256,12 +4527,12 @@ async function saveVector(charId, sourceType, sourceId, text, keywords = [], imp
     createdAt: Date.now()
   });
 }
-async function prepareMemoryPack(charId, userInput, scene = 'chat') {
+async function prepareMemoryPack(charId, userInput, scene = 'chat', options = {}) {
   const chat = allChats[charId];
   const char = characters.find(c => c.id === charId);
   if (!chat || !char) return '';
   const recent = recentMessages(chat, 30);
-  const query = await generateMemoryQuery(char, userInput, recent, scene);
+  const query = await generateMemoryQuery(char, userInput, recent, scene, options);
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
   const [hits, allSummaries, allEvents, allProfiles] = await Promise.all([
     searchMemoryVectors(charId, queryText),
@@ -4284,10 +4555,11 @@ async function prepareMemoryPack(charId, userInput, scene = 'chat') {
     ]
   );
 }
-async function prepareMemoryPackSafe(charId, userInput, scene = 'chat') {
+async function prepareMemoryPackSafe(charId, userInput, scene = 'chat', options = {}) {
   try {
-    return await prepareMemoryPack(charId, userInput, scene);
+    return await prepareMemoryPack(charId, userInput, scene, options);
   } catch (err) {
+    if (options.signal?.aborted || err?.name === 'AbortError') throw err;
     const char = characters.find(c => c.id === charId);
     const message = `记忆检索失败：${friendlyErrorMessage(err)}；已跳过记忆包继续生成。`;
     console.warn('[AL Memory] safe fallback:', err.message);
@@ -4607,9 +4879,10 @@ async function sendMessage() {
   document.getElementById('btn-send').className = 'send inactive';
   const chat = allChats[requestCharId];
   cancelCloudProactive(requestCharId, 'chat');
-  chat.messages.push({ role: 'user', content: text, time: Date.now() });
+  const message = createPendingUserMessage(chat, text);
   DB.set('chats', allChats);
-  await continueAssistantTurn(requestCharId, text);
+  renderMessages();
+  await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
 }
 function voiceButtonEl() {
   return document.querySelector('#composer-voice .voice-hold');
@@ -4688,13 +4961,14 @@ async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random
   const actualDuration = Math.max(1, Math.min(60, Number(duration) || 4));
   const content = `[语音消息 ${actualDuration}秒，未转文字]`;
   cancelCloudProactive(requestCharId, 'chat');
-  chat.messages.push({ role: 'user', type: 'voice', content, voiceDuration: actualDuration, time: Date.now() });
+  const message = createPendingUserMessage(chat, content, { type: 'voice', voiceDuration: actualDuration });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
   if (reason) toast(reason, 2200);
   await continueAssistantTurn(
     requestCharId,
     `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`
+    , { userMessageId: message.id }
   );
 }
 async function sendVoiceTranscriptMessage(transcript, duration) {
@@ -4706,10 +4980,10 @@ async function sendVoiceTranscriptMessage(transcript, duration) {
   if (!chat) return;
   closeComposerPanels();
   cancelCloudProactive(requestCharId, 'chat');
-  chat.messages.push({ role: 'user', type: 'voice', content: text, transcript: text, voiceDuration: duration, time: Date.now() });
+  const message = createPendingUserMessage(chat, text, { type: 'voice', transcript: text, voiceDuration: duration });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
-  await continueAssistantTurn(requestCharId, text);
+  await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
 }
 async function sendVoiceMessage() {
   return sendVoicePlaceholderMessage();
@@ -5791,16 +6065,33 @@ async function callAPI(chat, memoryPack = '', options = {}) {
   const selectedHistoryCount = messages.length;
   if (options.proactive) messages.push({ role: 'user', content: buildProactiveTriggerMessage(currentChar, chat, proactiveNow, options.proactiveTriggerMode) });
   const scene = chatSceneFromOptions(options);
-  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, historyOmitted: Math.max(0, recentMessageCandidateCount(chat, 30) - selectedHistoryCount), memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
+  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, signal: options.signal, historyOmitted: Math.max(0, recentMessageCandidateCount(chat, 30) - selectedHistoryCount), memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
   return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
 }
 
 async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const timeoutController = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; timeoutController.abort(); }, timeoutMs);
+  const externalSignal = options?.signal;
+  let signal = timeoutController.signal;
+  if (externalSignal) {
+    if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+      signal = AbortSignal.any([externalSignal, timeoutController.signal]);
+    } else {
+      const combined = new AbortController();
+      const forwardExternal = () => combined.abort(externalSignal.reason);
+      const forwardTimeout = () => combined.abort(timeoutController.signal.reason);
+      if (externalSignal.aborted) forwardExternal();
+      else externalSignal.addEventListener('abort', forwardExternal, { once: true });
+      timeoutController.signal.addEventListener('abort', forwardTimeout, { once: true });
+      signal = combined.signal;
+    }
+  }
   try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
+    return await fetch(url, { ...options, signal });
   } catch (err) {
+    if (err.name === 'AbortError' && externalSignal?.aborted && !timedOut) throw err;
     if (err.name === 'AbortError') throw new Error('连接超时');
     if (/ISO-8859-1|headers|ByteString/i.test(err.message || '')) throw new Error('请求头里有非英文特殊字符，请重新粘贴纯文本 API Key');
     throw err;
@@ -5811,17 +6102,29 @@ async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
 function streamTimeoutError() {
   return new Error('连接超时');
 }
-async function readStreamChunk(reader, timeoutMs = API_TIMEOUT_MS) {
+async function readStreamChunk(reader, timeoutMs = API_TIMEOUT_MS, signal = null) {
   let timer = null;
+  let abortHandler = null;
   try {
-    return await Promise.race([
+    const waits = [
       reader.read(),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(streamTimeoutError()), timeoutMs);
       })
-    ]);
+    ];
+    if (signal) waits.push(new Promise((_, reject) => {
+      abortHandler = () => {
+        const error = new Error('消息已撤回');
+        error.name = 'AbortError';
+        reject(error);
+      };
+      if (signal.aborted) abortHandler();
+      else signal.addEventListener('abort', abortHandler, { once: true });
+    }));
+    return await Promise.race(waits);
   } finally {
     if (timer) clearTimeout(timer);
+    if (abortHandler && signal) signal.removeEventListener('abort', abortHandler);
   }
 }
 function parseJsonFallbackText(raw) {
@@ -5852,11 +6155,12 @@ async function callOpenAI(system, messages, options = {}) {
     resp = await fetchWithTimeout(settings.chatApiUrl.replace(/\/+$/, '') + '/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${chatApiKey}` },
-      body: JSON.stringify({ model: settings.chatModel || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: live })
+      body: JSON.stringify({ model: settings.chatModel || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: live }),
+      signal: options.signal
     });
     if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
     if (live) {
-      const text = await readOpenAIStream(resp, options.charId);
+      const text = await readOpenAIStream(resp, options.charId, options.signal);
       if (!text.trim()) lastChatResponseDiagnostic = lastChatResponseDiagnostic || '流式接口返回为空';
       recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
       return text;
@@ -5879,11 +6183,11 @@ async function callOpenAI(system, messages, options = {}) {
     return text;
   }
 }
-async function readOpenAIStream(resp, charId = currentCharId) {
+async function readOpenAIStream(resp, charId = currentCharId, signal = null) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
   let result = '', buffer = '', raw = '';
   while (true) {
-    const { done, value } = await readStreamChunk(reader, API_TIMEOUT_MS);
+    const { done, value } = await readStreamChunk(reader, API_TIMEOUT_MS, signal);
     if (done) break;
     const chunk = decoder.decode(value, { stream: true });
     raw += chunk;
@@ -5915,11 +6219,12 @@ async function callClaude(system, messages, options = {}) {
     resp = await fetchWithTimeout(settings.chatApiUrl.replace(/\/+$/, '') + '/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': chatApiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: settings.chatModel || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: live })
+      body: JSON.stringify({ model: settings.chatModel || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: live }),
+      signal: options.signal
     });
     if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
     if (live) {
-      const text = await readClaudeStream(resp, options.charId);
+      const text = await readClaudeStream(resp, options.charId, options.signal);
       if (!text.trim()) lastChatResponseDiagnostic = lastChatResponseDiagnostic || '流式接口返回为空';
       recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
       return text;
@@ -5942,11 +6247,11 @@ async function callClaude(system, messages, options = {}) {
     return text;
   }
 }
-async function readClaudeStream(resp, charId = currentCharId) {
+async function readClaudeStream(resp, charId = currentCharId, signal = null) {
   const reader = resp.body.getReader(), decoder = new TextDecoder();
   let result = '', buffer = '', raw = '';
   while (true) {
-    const { done, value } = await readStreamChunk(reader, API_TIMEOUT_MS);
+    const { done, value } = await readStreamChunk(reader, API_TIMEOUT_MS, signal);
     if (done) break;
     const chunk = decoder.decode(value, { stream: true });
     raw += chunk;
@@ -6292,6 +6597,7 @@ async function renderMemoryScreen() {
       <div class="memory-section-title">${esc(group.title)} · ${group.rows.length}</div>
       <div class="cell-group">${group.rows.map(row => renderMemoryItem(group.store, row)).join('')}</div>
     </div>`).join('');
+  bindMemoryListActions(list);
 }
 function memoryLabelMeta(item) {
   return [item.manual ? '手动' : 'AI', item.type, item.status, fmtTime(item.updatedAt || item.createdAt)].filter(Boolean).join(' · ');
@@ -6317,8 +6623,6 @@ async function switchMemoryChar(charId) {
   await renderMemoryScreen();
 }
 function renderMemoryItem(storeName, item) {
-  const storeArg = jsArg(storeName);
-  const idArg = jsArg(item.id);
   return `
     <div class="cell memory-item">
       <div class="cell-label">${esc(item.meta || '')}</div>
@@ -6326,14 +6630,33 @@ function renderMemoryItem(storeName, item) {
         <strong>${esc(item.displayTitle || '')}</strong>
         <div class="hint">${esc(item.displayDetail || '')}</div>
         <div class="memory-actions">
-          <button class="inline-btn" onclick="editMemoryItem(${storeArg},${idArg})" type="button">编辑</button>
-          <button class="inline-btn" onclick="deleteMemoryItem(${storeArg},${idArg})" type="button">删除</button>
+          <button class="inline-btn" data-memory-action="edit" data-memory-store="${esc(storeName)}" data-memory-id="${esc(item.id)}" type="button">编辑</button>
+          <button class="inline-btn" data-memory-action="delete" data-memory-store="${esc(storeName)}" data-memory-id="${esc(item.id)}" type="button">删除</button>
         </div>
       </div>
     </div>`;
 }
 function jsArg(value) {
   return esc(JSON.stringify(String(value || '')));
+}
+function bindMemoryListActions(list) {
+  list?.querySelectorAll?.('[data-memory-action]').forEach(button => {
+    button.addEventListener('click', async event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const { memoryAction, memoryStore, memoryId } = button.dataset;
+      button.disabled = true;
+      try {
+        if (memoryAction === 'edit') await editMemoryItem(memoryStore, memoryId);
+        if (memoryAction === 'delete') await deleteMemoryItem(memoryStore, memoryId);
+      } catch (err) {
+        console.error('[AL Memory] memory action failed:', err);
+        toast('记忆操作失败：' + friendlyErrorMessage(err), 2600);
+      } finally {
+        button.disabled = false;
+      }
+    });
+  });
 }
 async function syncMemoryVector(storeName, item) {
   if (!item?.charId) return;
@@ -6356,7 +6679,7 @@ async function openMemoryEditor(storeName = 'profiles', id = '') {
   const char = characters.find(c => c.id === charId);
   if (!charId || !char) { toast('先创建并打开一个角色'); return; }
   const normalizedStore = ['profiles', 'events', 'summaries'].includes(storeName) ? storeName : 'profiles';
-  const item = id ? (await MemoryDB.all(normalizedStore)).find(row => row.id === id) : null;
+  const item = id ? (await MemoryDB.all(normalizedStore)).find(row => String(row.id) === String(id)) : null;
   if (id && !item) { toast('记忆不存在'); return; }
   memoryEditorState = { storeName: normalizedStore, id: id || '', lastStoreName: normalizedStore };
   showScreen('memory-edit');
@@ -6425,7 +6748,7 @@ async function saveMemoryEditor() {
   const detail = document.getElementById('memory-edit-detail')?.value.trim() || '';
   if (!detail) { toast('内容不能为空'); return; }
   const now = Date.now();
-  const oldItem = memoryEditorState.id ? (await MemoryDB.all(storeName)).find(row => row.id === memoryEditorState.id) : null;
+  const oldItem = memoryEditorState.id ? (await MemoryDB.all(storeName)).find(row => String(row.id) === String(memoryEditorState.id)) : null;
   let item = oldItem ? { ...oldItem, updatedAt: now } : null;
   if (storeName === 'summaries') {
     item = item || { id: uid('sum'), charId, createdAt: now, manual: true };
@@ -6452,7 +6775,6 @@ async function saveMemoryEditor() {
   item.updatedAt = now;
   await MemoryDB.put(storeName, item);
   await syncMemoryVector(storeName, item);
-  await renderMemoryScreen();
   showScreen('memory');
   toast(memoryEditorState.id ? '记忆已更新' : '记忆已新增');
 }
@@ -6605,10 +6927,14 @@ async function syncFromServiceWorkerState() {
 }
 async function bootApp() {
   await syncFromServiceWorkerState();
+  let chatStateChanged = false;
+  Object.values(allChats || {}).forEach(chat => { chatStateChanged = ensureChatMessageIds(chat) || chatStateChanged; });
+  if (chatStateChanged) DB.set('chats', allChats);
   renderPlayerProfile();
   startProactiveLoop();
   renderChats();
   await mirrorAppStateNow();
+  resumePendingAssistantTurns();
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
@@ -6623,11 +6949,17 @@ async function bootApp() {
   }
   if (document.addEventListener) {
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) syncFromServiceWorkerState();
+      if (!document.hidden) syncFromServiceWorkerState().then(() => resumePendingAssistantTurns());
     });
   }
   if (typeof window !== 'undefined') {
-    window.addEventListener('focus', () => syncFromServiceWorkerState());
+    window.addEventListener('pagehide', preservePendingRepliesForUnload);
+    window.addEventListener('beforeunload', preservePendingRepliesForUnload);
+    window.addEventListener('pageshow', () => {
+      pageIsUnloading = false;
+      resumePendingAssistantTurns();
+    });
+    window.addEventListener('focus', () => syncFromServiceWorkerState().then(() => resumePendingAssistantTurns()));
   }
 }
 
