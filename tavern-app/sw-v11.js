@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v72';
+const CACHE_NAME = 'rpchat-v73';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -8,8 +8,6 @@ const MEMORY_MAX_TOKENS = 4096;
 const CALL_LOG_LIMIT = 30;
 const VECTOR_DIM = 384;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
-const CHAT_HISTORY_CHAR_BUDGET = 12000;
-const PROACTIVE_HISTORY_CHAR_BUDGET = 9000;
 const MEMORY_LINE_CHAR_LIMIT = 360;
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
@@ -369,7 +367,9 @@ function buildProactiveTimeContext(chat, now = new Date(), triggerMode = 'planne
     `主动阶段：${stage}`,
     `未回复状态：${unanswered}`,
     `智能策略：${mode}`,
-    `历史上下文策略：${historyMode === 'fresh-start' ? '上一轮已经自然结束，不提供旧聊天正文，以当前时段重新开口' : historyMode === 'archive' ? '旧聊天只作为过往存档，不作为当前待回复内容' : '近期聊天可供自然衔接'}`,
+    `历史上下文策略：${historyMode === 'fresh-start' ? '最近30条仍完整保留，但上一轮已自然结束；除非当前话题明确关联，否则以当前时段重新开口' : historyMode === 'archive' ? '最近30条仍完整保留，旧聊天作为过往事实而不是刚收到的待回复内容' : '近期聊天可供自然衔接'}`,
+    '最近30条聊天会完整提供给你，它们都是已经发生过的事实，不能遗忘或篡改。时间间隔只决定你现在怎样开口，不代表删除这些事实。',
+    '如果当前情境或玩家最近发言明确指向昨天或更早的内容，可以自然接续；如果没有明确关联，不要仅因旧话题出现在30条记录中就继续追问。',
     '硬性要求：这不是用户刚刚发消息后等你回答，而是隔了一段空闲时间后你主动打开微信来发消息。',
     '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
     '如果距离最后一条消息超过 60 分钟，默认不要直接回答上一条话题；除非上一条包含未完成约定、强烈情绪或必须接住的关键信息，否则应像重新开口一样发起自然消息。',
@@ -396,54 +396,16 @@ function buildProactiveTriggerMessage(settings = {}, char, chat, now = new Date(
   ].join('\n');
 }
 
-function messageContextCost(message) {
-  return String(message?.content || '').length + 32;
-}
-
 function recentMessageCandidateCount(chat, count = 30) {
   return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30)).length;
 }
 
-function recentMessages(chat, count = 30, charBudget = CHAT_HISTORY_CHAR_BUDGET) {
-  const rows = (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30));
-  const parsedBudget = Number(charBudget);
-  const budget = Number.isFinite(parsedBudget) && parsedBudget > 0 ? parsedBudget : CHAT_HISTORY_CHAR_BUDGET;
-  const kept = [];
-  let used = 0;
-  for (let index = rows.length - 1; index >= 0; index--) {
-    const row = rows[index];
-    const cost = messageContextCost(row);
-    if (kept.length && used + cost > budget) break;
-    kept.unshift(row);
-    used += cost;
-  }
-  return kept;
+function recentMessages(chat, count = 30) {
+  return (chat?.messages || []).filter(m => m.role !== 'system').slice(-Math.max(1, Number(count) || 30));
 }
 
 function proactiveRecentMessages(chat, count = 30, now = new Date(), settings = {}) {
-  const rows = recentMessages(chat, count, PROACTIVE_HISTORY_CHAR_BUDGET);
-  const historyMode = proactiveHistoryMode(chat, now);
-  if (historyMode === 'fresh-start') {
-    return rows
-      .filter(m => m.hidden && m.time && now.getTime() - Number(m.time) <= 24 * 60 * 60 * 1000)
-      .slice(-4)
-      .map(m => ({
-        role: 'user',
-        content: `【后台场景事件｜${formatFullTime(new Date(m.time || Date.now()))}】${m.content}\n注意：这不是玩家刚发来的聊天气泡，而是已经发生过的场景记录。只能自然记住，不能把它当作最新私聊。`
-      }));
-  }
-  if (historyMode === 'archive') {
-    const archive = rows.slice(-8).map(m => {
-      const at = m.time ? formatFullTime(new Date(m.time)) : '时间未知';
-      const role = m.hidden ? '场景事件' : (m.role === 'user' ? playerName(settings) : '角色');
-      return `${at}｜${role}：${String(m.content || '').replace(/\s+/g, ' ').slice(0, 160)}`;
-    }).join('\n');
-    return archive ? [{
-      role: 'user',
-      content: `【过往聊天存档，不是刚收到的新消息】\n${archive}\n这些内容只用于保持人物关系和事实连续性。上一轮闲聊已经过去较久，不要直接回答其中任何一句，也不要把旧红包、转账、测试或争执当成当前话题。`
-    }] : [];
-  }
-  return rows.map(m => {
+  return recentMessages(chat, count).map(m => {
     if (m.hidden) {
       return {
         role: 'user',
@@ -460,15 +422,19 @@ function buildProactiveMemoryQuery(chat, settings = {}, now = new Date(), trigge
   const state = proactiveConversationState(chat, now);
   const historyMode = proactiveHistoryMode(chat, now);
   const elapsed = state.lastElapsedMs == null ? '未知时长' : formatElapsed(state.lastElapsedMs);
+  const latestPlayerText = String(state.lastUser?.content || '').replace(/\s+/g, ' ').slice(0, 300) || '无';
+  const latestCharacterText = String(state.lastAssistant?.content || '').replace(/\s+/g, ' ').slice(0, 300) || '无';
   return [
     '主动消息记忆检索。',
     getTimeContext(now),
     `当前阶段：${normalizeProactiveTriggerMode(triggerMode) === 'dice' ? '玩家尚未回复先前主动消息后的随机再联系' : '玩家最后一次回复后的计划追发'}`,
     `距离最后一条真实聊天：${elapsed}。`,
+    `最近一条玩家消息：${latestPlayerText}`,
+    `最近一条角色消息：${latestCharacterText}`,
     historyMode === 'fresh-start'
-      ? '上一轮闲聊已自然结束。只检索人物关系、长期设定、重要约定和近期重要事件，不要把旧闲聊当成尚待回答的问题。'
+      ? '时间已经过去较久。根据最近一条玩家消息判断是否需要召回昨天或更早的内容：有明确关联就召回，没有关联就不要强行延续旧话题。'
       : historyMode === 'archive'
-        ? '聊天已有明显时间间隔。检索关系与未完成的重要事项，但不要放大上一轮普通闲聊。'
+        ? '聊天已有明显时间间隔。根据玩家最近发言筛选相关记忆；有关联可以继续旧事，没有关联则优先关系、约定和当前时段。'
         : '可以检索与近期话题直接相关的记忆。'
   ].join('\n');
 }
@@ -1205,13 +1171,17 @@ async function updateBackgroundPaymentStatusFromReply(state, charId, reply, expl
 function buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings = {}) {
   const system = `你是 AL 的后台本地记忆检索 AI。
 你不参与角色扮演，不回复${playerName(settings)}，不替${charName(char)}说话。
-任务：只根据当前触发原因、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
+任务：只根据当前触发原因、固定最近30条聊天和后台场景事件，生成向量数据库召回用的检索查询。
+当前触发原因或玩家最近一条发言优先级最高。最近30条只用于消除“昨天那件事”等指代歧义，不代表其中每个旧话题都要召回。
+正例：当前触发原因明确提到“昨天的红包”，检索红包金额、是否领取和备注。
+反例：当前是新话题，却仅因30条里出现过红包就继续召回并催问红包。
+有关联时可以召回昨天或更早的记忆；没有关联时不要强行带入旧内容。
 query 要围绕当前需要回忆的事实、关系、承诺、红包、朋友圈或雷点。
 keywords 要短而具体，方便本地记忆库召回。
 只输出 JSON，不要输出解释：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`;
   const user = `双方昵称：${playerName(settings)} / ${charName(char)}
-最近聊天与场景事件：
-${messages.slice(-10).map(m => messageLine(m, char, settings)).join('\n') || '暂无'}
+固定最近30条聊天与场景事件（仅用于判断当前触发是否指向旧内容）：
+${messages.slice(-30).map(m => messageLine(m, char, settings)).join('\n') || '暂无'}
 
 当前触发原因：
 ${triggerText}
