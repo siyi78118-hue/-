@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v58';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v59';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.44';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.45';/);
 assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09\.7';/);
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
 assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
@@ -26,10 +26,9 @@ assert.match(script, /const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;/);
 assert.doesNotMatch(swScript, /Math\.min\(API_TIMEOUT_MS,\s*45000\)/);
 assert.doesNotMatch(script, /rows\.find\(\(\{ chat \}\) => !hasFutureCloudJob\(chat, kind\)\)/);
 assert.match(script, /function cancelOtherCloudJobs\(targetCharId, kind = 'chat'/);
-assert.match(script, /function isChatProactiveDue\(chat, kind = 'chat'\)/);
 assert.match(script, /function ensureOpenedChatProactive\(charId\)/);
 assert.match(script, /ensureOpenedChatProactive\(charId\)/);
-assert.match(script, /open-chat \$\{kind\} trigger skipped/);
+assert.match(script, /open-chat \$\{kind\} due skipped/);
 assert.match(script, /function parseProactiveScheduleTime\(value, now = new Date\(\)\)/);
 assert.match(script, /function extractProactiveScheduleDirective\(text, now = new Date\(\)\)/);
 assert.match(script, /function stripProactiveScheduleDirective\(text\)/);
@@ -51,6 +50,12 @@ assert.match(script, /if \(!manual\) try \{ await enterProactiveDiceMode\(charId
 assert.match(script, /proactiveDefaultScheduleOptions\(kind\)/);
 assert.match(swScript, /function proactivePayloadMatchesJob\(payload = \{\}, job = null\)/);
 assert.match(swScript, /忽略已被新任务替换的旧推送/);
+assert.match(script, /Date\.now\(\)\.toString\(36\).*Math\.random\(\)\.toString\(36\)/);
+assert.match(swScript, /Date\.now\(\)\.toString\(36\).*Math\.random\(\)\.toString\(36\)/);
+assert.match(script, /cancelCloudJobId\(previousJob\.jobId\)/);
+assert.match(swScript, /jobId: previousJob\.jobId/);
+assert.match(script, /async function ensureLocalProactiveScheduled\(\)/);
+assert.match(script, /await ensureLocalProactiveScheduled\(\);\s*await catchUpDueCloudProactive\(\);/);
 const visibleHandoffIndex = swScript.indexOf("if (await hasVisibleClient())");
 const backgroundDiceIndex = swScript.indexOf("if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(dueJob.job || payload))");
 assert.ok(visibleHandoffIndex >= 0 && backgroundDiceIndex > visibleHandoffIndex, '页面可见时应只由前台抽一次骰子');
@@ -465,10 +470,12 @@ globalThis.__appTest = {
   shouldKeepEvent,
   memoryTextIsNoise,
   cloudTimerTargetCharId,
+  proactiveJobId,
+  proactiveDefaultScheduleOptions,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -682,6 +689,13 @@ assert.equal(formatElapsed(5 * 60000), '5 分钟');
 assert.equal(formatElapsed(2 * 60 * 60000), '2 小时');
 assert.equal(recentMessages({ messages: Array.from({ length: 35 }, (_, i) => ({ content: String(i) })) }, 30)[0].content, '5');
 const proactiveNow = new Date('2026-07-04T12:00:00');
+const proactiveJobA = proactiveJobId('char_timer_test', 'chat');
+const proactiveJobB = proactiveJobId('char_timer_test', 'chat');
+assert.notEqual(proactiveJobA, proactiveJobB, '连续安排必须使用不同任务 ID，旧取消请求不能误删新任务');
+assert.match(proactiveJobA, /^pro_.*_char_timer_test_[a-z0-9]+_[a-z0-9]+$/);
+assert.equal(proactiveDefaultScheduleOptions('chat').mode, 'planned');
+assert.equal(proactiveDefaultScheduleOptions('moment').mode, 'dice');
+assert.equal(proactiveDefaultScheduleOptions('moment').rollChance, 0.05);
 const proactiveChat = {
   messages: [
     { role: 'user', content: '你知道现在几点了吗？', time: new Date('2026-07-04T10:00:00').getTime() },

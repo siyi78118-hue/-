@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v58';
+const CACHE_NAME = 'rpchat-v59';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -1287,7 +1287,7 @@ function rollProactiveDice(job = null) {
   return Math.random() < chance;
 }
 function proactiveJobId(settings, charId, kind = 'chat') {
-  return `${proactiveJobPrefix(kind)}_${settings.deviceId}_${charId}`;
+  return `${proactiveJobPrefix(kind)}_${settings.deviceId}_${charId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 function proactivePayloadMatchesJob(payload = {}, job = null) {
   if (!payload.charId) return true;
@@ -1321,6 +1321,13 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
       body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind, mode: proactiveJobMode(chat[jobKey]), rollChance: chat[jobKey].rollChance, diceIntervalMs: chat[jobKey].diceIntervalMs })
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('schedule failed ' + resp.status);
+    if (previousJob?.jobId && previousJob.jobId !== chat[jobKey].jobId) {
+      await fetchWithTimeout(timerUrl(settings, '/cancel'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: settings.deviceId, jobId: previousJob.jobId })
+      }, 8000).catch(err => console.warn('[AL Push] stale job cleanup skipped:', err));
+    }
   } catch (err) {
     if (previousJob) chat[jobKey] = previousJob;
     else delete chat[jobKey];
