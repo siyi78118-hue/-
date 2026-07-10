@@ -997,7 +997,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-10.51';
+const APP_BUILD_VERSION = '2026-07-10.52';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-09.7';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1087,6 +1087,8 @@ let activeScreen = 'chats';
 let proactiveTimer = null;
 let proactiveChatBusy = false;
 let proactiveMomentBusy = false;
+const memoryExtractionStates = new Map();
+const memoryExtractionEpochs = new Map();
 let foregroundProactiveRequestBusy = false;
 let momentReplyTargetId = '';
 let lastChatResponseDiagnostic = '';
@@ -1221,6 +1223,7 @@ const MemoryDB = {
       for (const row of rows) await this.remove(store, row.id);
     }
     await this.remove('meta', memoryMetaKey(charId));
+    await this.remove('meta', memoryExtractStatusKey(charId));
   }
 };
 
@@ -3624,6 +3627,41 @@ function uid(prefix) {
 function memoryMetaKey(charId) {
   return `memory_processed_${charId}`;
 }
+function memoryExtractStatusKey(charId) {
+  return `memory_extract_status_${charId}`;
+}
+function memoryExtractionEpoch(charId) {
+  return Number(memoryExtractionEpochs.get(charId) || 0);
+}
+function invalidateMemoryExtraction(charId) {
+  if (!charId) return Promise.resolve(false);
+  const active = memoryExtractionStates.get(charId);
+  memoryExtractionEpochs.set(charId, memoryExtractionEpoch(charId) + 1);
+  if (active) {
+    active.cancelled = true;
+    active.requested = false;
+    active.force = false;
+  }
+  memoryExtractionStates.delete(charId);
+  return active?.promise ? active.promise.catch(() => false) : Promise.resolve(false);
+}
+function normalizeMemoryProcessedCursor(value, messageCount) {
+  const count = Math.max(0, Number(messageCount) || 0);
+  const cursor = Math.floor(Number(value) || 0);
+  return cursor >= 0 && cursor <= count ? cursor : 0;
+}
+function memoryRelevantMessages(messages = []) {
+  return messages.filter(message => message && message.role !== 'system');
+}
+async function setMemoryExtractStatus(charId, state, message, extra = {}) {
+  if (!charId) return;
+  await MemoryDB.setMeta(memoryExtractStatusKey(charId), {
+    state,
+    message: String(message || ''),
+    updatedAt: Date.now(),
+    ...extra
+  });
+}
 function playerName() {
   return (settings.playerName || '玩家').trim() || '玩家';
 }
@@ -4249,18 +4287,62 @@ async function storeExtractedMemory(charId, extracted) {
   }
   await compactCharacterMemory(charId);
 }
-async function processMemoryAfterTurn(charId, force = false) {
+async function processMemoryBatch(charId, force = false) {
   const chat = allChats[charId];
-  if (!chat?.messages?.length) return;
+  if (!chat?.messages?.length) return false;
   const interval = Math.max(10, Number(settings.memoryInterval) || 30);
-  const processed = Number(await MemoryDB.getMeta(memoryMetaKey(charId), 0)) || 0;
-  const pending = chat.messages.length - processed;
-  if (!force && pending < interval) return;
-  const batch = chat.messages.slice(Math.max(0, processed), chat.messages.length);
-  if (!batch.length) return;
-  const extracted = await extractTurnMemory(charId, batch);
-  await storeExtractedMemory(charId, extracted);
-  await MemoryDB.setMeta(memoryMetaKey(charId), chat.messages.length);
+  const batchEnd = chat.messages.length;
+  const storedCursor = await MemoryDB.getMeta(memoryMetaKey(charId), 0);
+  const processed = normalizeMemoryProcessedCursor(storedCursor, batchEnd);
+  const batch = memoryRelevantMessages(chat.messages.slice(processed, batchEnd));
+  if (!force && batch.length < interval) return false;
+  if (!batch.length) {
+    await MemoryDB.setMeta(memoryMetaKey(charId), batchEnd);
+    await setMemoryExtractStatus(charId, 'idle', '当前没有需要整理的新聊天消息。', { processedTo: batchEnd, batchSize: 0 });
+    return false;
+  }
+  const epoch = memoryExtractionEpoch(charId);
+  await setMemoryExtractStatus(charId, 'running', `正在整理 ${batch.length} 条新增消息。`, { processedFrom: processed, processedTo: batchEnd, batchSize: batch.length });
+  try {
+    const extracted = await extractTurnMemory(charId, batch);
+    if (epoch !== memoryExtractionEpoch(charId) || allChats[charId] !== chat) {
+      await setMemoryExtractStatus(charId, 'stale', '聊天或记忆库已重置，本次旧整理结果已丢弃。', { processedFrom: processed, processedTo: batchEnd, batchSize: batch.length });
+      return false;
+    }
+    await storeExtractedMemory(charId, extracted);
+    if (epoch !== memoryExtractionEpoch(charId) || allChats[charId] !== chat) return false;
+    await MemoryDB.setMeta(memoryMetaKey(charId), batchEnd);
+    await setMemoryExtractStatus(charId, 'done', `已整理 ${batch.length} 条消息，后续新增消息会进入下一批。`, { processedFrom: processed, processedTo: batchEnd, batchSize: batch.length });
+    return true;
+  } catch (err) {
+    await setMemoryExtractStatus(charId, 'failed', `整理失败：${friendlyErrorMessage(err)}；游标未前移，下次会重试同一批。`, { processedFrom: processed, processedTo: batchEnd, batchSize: batch.length });
+    throw err;
+  }
+}
+function processMemoryAfterTurn(charId, force = false) {
+  if (!charId) return Promise.resolve(false);
+  let state = memoryExtractionStates.get(charId);
+  if (!state) {
+    state = { requested: false, force: false, cancelled: false, promise: null };
+    memoryExtractionStates.set(charId, state);
+  }
+  if (state.cancelled) return Promise.resolve(false);
+  state.requested = true;
+  state.force = state.force || !!force;
+  if (state.promise) return state.promise;
+  state.promise = (async () => {
+    let changed = false;
+    while (state.requested && !state.cancelled) {
+      const runForce = state.force;
+      state.requested = false;
+      state.force = false;
+      changed = await processMemoryBatch(charId, runForce) || changed;
+    }
+    return changed;
+  })().finally(() => {
+    if (memoryExtractionStates.get(charId) === state) memoryExtractionStates.delete(charId);
+  });
+  return state.promise;
 }
 async function sendMessage() {
   const input = document.getElementById('chat-input');
@@ -5897,12 +5979,18 @@ async function renderMemoryScreen() {
     list.innerHTML = '<div class="empty"><div class="empty-ico">⌘</div><div>暂无记忆</div></div>';
     return;
   }
-  const [summaries, events, profiles] = await Promise.all([
+  const [summaries, events, profiles, extractStatus, storedCursor] = await Promise.all([
     MemoryDB.byChar('summaries', charId),
     MemoryDB.byChar('events', charId),
-    MemoryDB.byChar('profiles', charId)
+    MemoryDB.byChar('profiles', charId),
+    MemoryDB.getMeta(memoryExtractStatusKey(charId), null),
+    MemoryDB.getMeta(memoryMetaKey(charId), 0)
   ]);
-  status.textContent = `${char.name}：摘要 ${summaries.length} 条，事件 ${events.length} 条，资料 ${profiles.length} 条。`;
+  const chatMessages = allChats[charId]?.messages || [];
+  const cursor = normalizeMemoryProcessedCursor(storedCursor, chatMessages.length);
+  const pendingCount = memoryRelevantMessages(chatMessages.slice(cursor)).length;
+  const extractLine = extractStatus?.message ? `｜最近整理：${extractStatus.message}` : '';
+  status.textContent = `${char.name}：摘要 ${summaries.length} 条，事件 ${events.length} 条，资料 ${profiles.length} 条｜待整理 ${pendingCount} 条${extractLine}`;
   const groups = [
     { title: '资料', store: 'profiles', rows: profiles.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(p => ({ ...p, displayTitle: memoryAliasText(p.title || '资料', char), displayDetail: memoryAliasText(p.detail || '', char), meta: memoryLabelMeta(p) })) },
     { title: '事件', store: 'events', rows: events.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).map(e => ({ ...e, displayTitle: memoryAliasText(e.title || '重要事件', char), displayDetail: `${memoryAliasText(e.happenedAt || '未注明', char)}｜${memoryAliasText(e.detail || '', char)}`, meta: memoryLabelMeta(e) })) },
@@ -6117,6 +6205,7 @@ async function clearCurrentMemory() {
   const charId = memoryCurrentCharId();
   if (!charId) { toast('先创建并打开一个角色'); return; }
   if (!confirm('清空当前角色的本地记忆库？聊天记录不会删除。')) return;
+  await invalidateMemoryExtraction(charId);
   await MemoryDB.clearChar(charId);
   await renderMemoryScreen();
   toast('已清空记忆库');
@@ -6165,8 +6254,13 @@ async function clearCurrentChat() {
   if (!currentCharId || !confirm('清空当前聊天？')) return;
   const char = characters.find(c => c.id === currentCharId);
   const old = allChats[currentCharId] || {};
-  await cancelCloudProactiveQuick(currentCharId, '清空当前聊天');
+  await Promise.all([
+    cancelCloudProactiveQuick(currentCharId, '清空当前聊天'),
+    invalidateMemoryExtraction(currentCharId)
+  ]);
   allChats[currentCharId] = { messages: [chatClearedSystemMessage(char)], charPrompt: buildCharPrompt(char), extraPrompt: old.extraPrompt || '', unread: 0, pinned: !!old.pinned, muted: !!old.muted };
+  await MemoryDB.setMeta(memoryMetaKey(currentCharId), 0);
+  await setMemoryExtractStatus(currentCharId, 'idle', '聊天已清空，增量整理游标已复位。', { processedTo: 0, batchSize: 0 });
   DB.set('chats', allChats);
   renderMessages();
   showScreen('chat');
@@ -6175,6 +6269,7 @@ async function deleteCurrentRole() {
   if (!currentCharId || !confirm('删除这个角色？会同时删除它的聊天、云闹钟、本地记忆库和朋友圈痕迹。')) return;
   const deletedId = currentCharId;
   const deletedName = characters.find(c => c.id === deletedId)?.name || '这个角色';
+  await invalidateMemoryExtraction(deletedId);
   await Promise.allSettled([
     cancelCloudProactiveQuick(deletedId, '删除角色'),
     MemoryDB.clearChar(deletedId)
@@ -6200,7 +6295,13 @@ function openCurrentProfile() {
 }
 async function clearAllHistory() {
   if (!confirm('清空全部聊天记录？')) return;
-  await Promise.allSettled(Object.keys(allChats).map(charId => cancelCloudProactiveQuick(charId, '清空全部聊天')));
+  const clearedCharIds = Object.keys(allChats);
+  await Promise.allSettled(clearedCharIds.map(charId => invalidateMemoryExtraction(charId)));
+  await Promise.allSettled(clearedCharIds.flatMap(charId => [
+    cancelCloudProactiveQuick(charId, '清空全部聊天'),
+    MemoryDB.setMeta(memoryMetaKey(charId), 0),
+    setMemoryExtractStatus(charId, 'idle', '全部聊天记录已清空，增量整理游标已复位。', { processedTo: 0, batchSize: 0 })
+  ]));
   allChats = {};
   DB.set('chats', allChats);
   renderChats();

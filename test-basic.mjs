@@ -12,10 +12,10 @@ const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
 const cloudTimerHealthScript = readFileSync('scripts/check-cloud-timer.mjs', 'utf8');
 const cloudTimerDeployScript = readFileSync('scripts/deploy-cloud-timer.mjs', 'utf8');
 const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v65';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v66';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.51';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-10\.52';/);
 assert.match(html, /\.primary\{width:calc\(100% - 28px\);/);
 assert.doesNotMatch(html, />发起聊天<\/button>/);
 assert.doesNotMatch(html, /class="wallet-tools"/);
@@ -31,9 +31,17 @@ assert.match(swScript, /const MEMORY_MAX_TOKENS = 4096;/);
 assert.doesNotMatch(script, /\/embeddings/);
 assert.match(script, /async function createEmbedding\(text\) \{[\s\S]*return localEmbedding\(text\);/);
 assert.match(script, /async function compactCharacterMemory\(charId\)/);
+assert.match(script, /const memoryExtractionStates = new Map\(\);/);
+assert.match(script, /async function processMemoryBatch\(charId, force = false\)/);
+assert.match(script, /const batchEnd = chat\.messages\.length;/);
+assert.match(script, /MemoryDB\.setMeta\(memoryMetaKey\(charId\), batchEnd\)/);
+assert.doesNotMatch(script, /MemoryDB\.setMeta\(memoryMetaKey\(charId\), chat\.messages\.length\)/);
+assert.match(script, /游标未前移，下次会重试同一批/);
+assert.match(script, /invalidateMemoryExtraction\(currentCharId\)/);
 assert.match(script, /item\.manual = true;/);
 assert.match(script, /await upsertMemoryItem\('profiles', item, profileRows\)/);
 assert.match(script, /await upsertMemoryItem\('events', item, eventRows\)/);
+assert.match(script, /this\.remove\('meta', memoryExtractStatusKey\(charId\)\)/);
 assert.match(swScript, /return !!\(settings\.memoryApiUrl && settings\.memoryApiKey && settings\.memoryModel\);/);
 assert.doesNotMatch(swScript, /settings\.memoryApiUrl \|\| settings\.apiUrl/);
 assert.doesNotMatch(swScript, /settings\.memoryApiKey \|\| settings\.apiKey/);
@@ -263,7 +271,10 @@ assert.match(script, /function removeCharacterMomentTraces\(charId\)/);
 assert.match(script, /async function cancelCloudProactiveQuick\(charId, reason = '操作'\)/);
 assert.match(script, /await withTimeout\(cancelCloudProactive\(charId, 'all'\), 8000, `\$\{reason\}取消云闹钟超时`\)/);
 assert.match(script, /async function clearCurrentChat\(\)/);
-assert.match(script, /await cancelCloudProactiveQuick\(currentCharId, '清空当前聊天'\)/);
+assert.match(script, /cancelCloudProactiveQuick\(currentCharId, '清空当前聊天'\)/);
+assert.match(script, /invalidateMemoryExtraction\(currentCharId\)/);
+assert.match(script, /MemoryDB\.setMeta\(memoryMetaKey\(currentCharId\), 0\)/);
+assert.match(script, /聊天已清空，增量整理游标已复位/);
 assert.match(script, /messages: \[chatClearedSystemMessage\(char\)\]/);
 assert.doesNotMatch(script, /role:'assistant', content:char\.firstMessage/);
 assert.match(script, /async function deleteCurrentRole\(\)/);
@@ -462,6 +473,8 @@ globalThis.__appTest = {
   normalizePresetKey,
   resetImportedDeviceBinding,
   clearImportedCloudJobs,
+  normalizeMemoryProcessedCursor,
+  memoryRelevantMessages,
   fetchModels,
   selectFetchedModel,
   recentMessages,
@@ -521,7 +534,33 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, stripLeakedPromptMetadata, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, stripLeakedPromptMetadata, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, cloudTimerTargetCharId, proactiveJobId, proactiveDefaultScheduleOptions, RP_PRESETS } = context.__appTest;
+
+const memoryQueueProbe = await vm.runInContext(`(async () => {
+  const original = processMemoryBatch;
+  let active = 0;
+  let maxActive = 0;
+  let calls = 0;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  processMemoryBatch = async () => {
+    calls++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await gate;
+    active--;
+    return true;
+  };
+  const first = processMemoryAfterTurn('queue-probe');
+  const second = processMemoryAfterTurn('queue-probe');
+  release();
+  await Promise.all([first, second]);
+  processMemoryBatch = original;
+  return { calls, maxActive, samePromise: first === second };
+})()`, context);
+assert.equal(memoryQueueProbe.samePromise, true, '同一角色的并发整理请求应复用同一条队列');
+assert.equal(memoryQueueProbe.maxActive, 1, '同一角色不得并发执行两个记忆整理批次');
+assert.equal(memoryQueueProbe.calls, 2, '整理期间的新请求应合并为一次后续检查');
 
 const v2 = parseCharacterCard({
   spec: 'chara_card_v2',
@@ -831,6 +870,14 @@ const proactiveTrigger = buildProactiveTriggerMessage({ name: '林晚' }, proact
 assert.match(proactiveTrigger, /内部主动触发/);
 assert.match(proactiveTrigger, /这不是玩家发来的聊天消息/);
 assert.match(proactiveTrigger, /主动给玩家发一条微信私聊/);
+assert.equal(normalizeMemoryProcessedCursor(12, 5), 0, '聊天被清空或缩短后，旧记忆游标必须复位');
+assert.equal(normalizeMemoryProcessedCursor(3, 5), 3);
+assert.deepEqual(memoryRelevantMessages([
+  { role: 'system', content: '系统提示' },
+  { role: 'user', content: '玩家消息' },
+  { role: 'assistant', content: '角色消息' },
+  { role: 'user', content: '朋友圈隐藏事件', hidden: true }
+]).map(row => row.content), ['玩家消息', '角色消息', '朋友圈隐藏事件']);
 const importedSettings = resetImportedDeviceBinding({
   cloudTimerEnabled: true,
   timerEndpoint: 'https://timer.example',
