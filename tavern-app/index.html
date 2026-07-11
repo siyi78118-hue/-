@@ -1175,7 +1175,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-11.68';
+const APP_BUILD_VERSION = '2026-07-11.69';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-11.10';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
@@ -6095,16 +6095,18 @@ async function requestNativeFcmToken() {
   const PushNotifications = window.Capacitor?.Plugins?.PushNotifications;
   if (!isNativeApp() || !PushNotifications?.register) throw new Error('当前不是支持 FCM 的安卓 App');
   await ensureNativePushListeners();
+  setCloudTimerStatus('绑定步骤 1/3：正在检查通知权限。');
   let permission = await PushNotifications.checkPermissions();
   if (permission.receive === 'prompt' || permission.receive === 'prompt-with-rationale') permission = await PushNotifications.requestPermissions();
   if (permission.receive !== 'granted') throw new Error('通知权限未允许');
+  setCloudTimerStatus('绑定步骤 2/3：正在连接 Firebase 获取 FCM Token，首次安装可能需要一两分钟。');
   const tokenPromise = new Promise((resolve, reject) => {
     nativePushRegistrationWaiter = { resolve, reject };
     setTimeout(() => {
       if (!nativePushRegistrationWaiter) return;
       nativePushRegistrationWaiter = null;
-      reject(new Error('等待 FCM 注册超时'));
-    }, 30000);
+      reject(new Error('等待 FCM Token 超时，请确认 Google Play 服务可以联网后重试'));
+    }, API_TIMEOUT_MS);
   });
   await PushNotifications.register();
   return tokenPromise;
@@ -6113,6 +6115,7 @@ async function enableNativeCloudTimer() {
   if (!settings.timerEndpoint) throw new Error('请先填写闹钟地址');
   const token = await requestNativeFcmToken();
   if (!token) throw new Error('没有取得 FCM 推送地址');
+  setCloudTimerStatus('绑定步骤 3/3：已取得 FCM Token，正在注册云端 Worker。');
   settings.deviceId = ensureDeviceId();
   settings.nativeFcmToken = token;
   settings.pushTransport = 'fcm';
