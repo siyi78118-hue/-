@@ -784,6 +784,9 @@ button.cell:active{background:#ececec}
           <button class="cell" onclick="exportBackup()" type="button"><div class="cell-label">备份</div><div class="cell-body">导出本机数据<span class="cell-note">含 API Key、聊天、朋友圈和记忆库</span></div><div class="mini">›</div></button>
           <button class="cell" onclick="document.getElementById('backup-input').click()" type="button"><div class="cell-label">恢复</div><div class="cell-body">导入本机备份<span class="cell-note">覆盖当前本机数据</span></div><div class="mini">›</div></button>
           <input type="file" id="backup-input" accept="application/json,.json" style="display:none" onchange="importBackup(event)">
+          <button class="cell" onclick="exportChatBackup()" type="button"><div class="cell-label">聊天备份</div><div class="cell-body">只导出聊天数据<span class="cell-note">不含 API 地址、Key 和设备设置</span></div><div class="mini">›</div></button>
+          <button class="cell" onclick="document.getElementById('chat-backup-input').click()" type="button"><div class="cell-label">聊天恢复</div><div class="cell-body">恢复聊天数据<span class="cell-note">保留当前接口和云闹钟设置</span></div><div class="mini">›</div></button>
+          <input type="file" id="chat-backup-input" accept="application/json,.json" style="display:none" onchange="importChatBackup(event)">
           <button class="cell" onclick="clearAllHistory()" type="button"><span class="wx-icon red wx-clear"></span><div class="cell-body danger">清空聊天记录</div></button>
         </div>
       </div>
@@ -1171,7 +1174,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-11.66';
+const APP_BUILD_VERSION = '2026-07-11.67';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-11.10';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1436,12 +1439,15 @@ async function restoreMemoryStores(memory = {}) {
 function backupFileName(date = new Date()) {
   return `AL-backup-${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}-${pad2(date.getHours())}${pad2(date.getMinutes())}.json`;
 }
+function chatBackupFileName(date = new Date()) {
+  return `AL-chat-${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}-${pad2(date.getHours())}${pad2(date.getMinutes())}.json`;
+}
 
 function isNativeApp() {
   return typeof window !== 'undefined' && Boolean(window.Capacitor?.isNativePlatform?.());
 }
 
-async function shareNativeBackup(fileName, jsonText) {
+async function shareNativeBackup(fileName, jsonText, options = {}) {
   const Filesystem = window.Capacitor?.Plugins?.Filesystem;
   const Share = window.Capacitor?.Plugins?.Share;
   if (!isNativeApp() || !Filesystem?.writeFile || !Share?.share) return false;
@@ -1453,12 +1459,51 @@ async function shareNativeBackup(fileName, jsonText) {
     recursive: true
   });
   await Share.share({
-    title: 'AL 本机备份',
-    text: '此文件包含 AL 的本机设置、角色、聊天、朋友圈、记忆库和 API Key，请妥善保存。',
+    title: options.title || 'AL 本机备份',
+    text: options.text || '此文件包含 AL 的本机设置、角色、聊天、朋友圈、记忆库和 API Key，请妥善保存。',
     url: saved.uri,
     dialogTitle: '保存或发送 AL 备份'
   });
   return true;
+}
+
+async function downloadBackupJson(fileName, jsonText, nativeOptions = {}) {
+  if (await shareNativeBackup(fileName, jsonText, nativeOptions)) return 'native';
+  const blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return 'web';
+}
+
+async function dumpChatMemoryStores() {
+  const memory = {};
+  for (const store of ['summaries', 'events', 'profiles', 'vectors']) memory[store] = await MemoryDB.all(store);
+  memory.meta = (await MemoryDB.all('meta')).filter(row =>
+    /^memory_processed_|^memory_extract_status_/.test(String(row?.key || ''))
+  );
+  return memory;
+}
+
+async function restoreChatMemoryStores(memory = {}) {
+  for (const store of ['summaries', 'events', 'profiles', 'vectors']) {
+    await MemoryDB.clearStore(store);
+    for (const row of (Array.isArray(memory[store]) ? memory[store] : [])) {
+      if (row && typeof row === 'object') await MemoryDB.put(store, row);
+    }
+  }
+  const existingMeta = await MemoryDB.all('meta');
+  for (const row of existingMeta) {
+    if (/^memory_processed_|^memory_extract_status_/.test(String(row?.key || ''))) await MemoryDB.remove('meta', row.key);
+  }
+  for (const row of (Array.isArray(memory.meta) ? memory.meta : [])) {
+    if (row && /^memory_processed_|^memory_extract_status_/.test(String(row.key || ''))) await MemoryDB.put('meta', row);
+  }
 }
 
 async function exportBackup() {
@@ -1477,22 +1522,75 @@ async function exportBackup() {
     };
     const jsonText = JSON.stringify(backup, null, 2);
     const fileName = backupFileName();
-    if (await shareNativeBackup(fileName, jsonText)) {
+    if (await downloadBackupJson(fileName, jsonText) === 'native') {
       toast('已打开安卓分享面板，请保存备份文件');
       return;
     }
-    const blob = new Blob([jsonText], { type: 'application/json;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
     toast('已导出备份，请妥善保存，里面包含 API Key');
   } catch (err) {
     toast('导出失败：' + friendlyErrorMessage(err), 3200);
+  }
+}
+
+async function exportChatBackup() {
+  try {
+    const backup = {
+      app: 'AL-chat-history',
+      version: APP_BUILD_VERSION,
+      exportedAt: new Date().toISOString(),
+      characters,
+      allChats,
+      allMoments,
+      memory: await dumpChatMemoryStores()
+    };
+    const jsonText = JSON.stringify(backup, null, 2);
+    const mode = await downloadBackupJson(chatBackupFileName(), jsonText, {
+      title: 'AL 聊天数据备份',
+      text: '此文件只包含角色、头像、聊天、朋友圈和本地记忆，不包含 API 地址、Key、钱包、设备或云闹钟设置。'
+    });
+    toast(mode === 'native' ? '已打开安卓分享面板，请保存聊天备份' : '聊天数据已导出，不包含 API Key');
+  } catch (err) {
+    toast('聊天备份导出失败：' + friendlyErrorMessage(err), 3200);
+  }
+}
+
+async function importChatBackup(event) {
+  const input = event?.target;
+  const file = input?.files?.[0];
+  if (input) input.value = '';
+  if (!file) return;
+  if (!confirm('恢复会替换当前角色、聊天、朋友圈和记忆库，但保留 API、钱包、设备与云闹钟设置。继续？')) return;
+  try {
+    const data = JSON.parse(await file.text());
+    if (!data || typeof data !== 'object' || data.app !== 'AL-chat-history') throw new Error('不是 AL 聊天数据备份');
+    await Promise.allSettled(Object.keys(allChats || {}).flatMap(charId =>
+      PROACTIVE_JOB_KINDS.map(kind => cancelCloudProactive(charId, kind))
+    ));
+    characters = Array.isArray(data.characters) ? data.characters.map(normalizeChar) : [];
+    allChats = clearImportedCloudJobs(data.allChats && typeof data.allChats === 'object' ? data.allChats : {});
+    allMoments = Array.isArray(data.allMoments) ? data.allMoments : [];
+    scrubEmptyReplyMessages(allChats);
+    localStorage.setItem('rpchat_characters', JSON.stringify(characters));
+    localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
+    localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
+    localStorage.setItem('rpchat_app_state_updated_at', String(Date.now()));
+    await restoreChatMemoryStores(data.memory || {});
+    currentCharId = characters.find(char => allChats[char.id])?.id || characters[0]?.id || null;
+    if (currentCharId && !allChats[currentCharId]) {
+      const char = characters.find(item => item.id === currentCharId);
+      allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(char), extraPrompt: '', unread: 0 };
+      localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
+    }
+    await mirrorAppStateNow();
+    renderChats();
+    renderContacts();
+    renderMoments();
+    renderCloudTimerStatus();
+    showScreen('chats');
+    ensureCloudProactiveScheduled({ force: true }).catch(err => console.warn('[AL Timer] restored chat schedule skipped:', err.message));
+    toast('聊天数据已恢复，当前 API Key 和云闹钟设置未改变', 3000);
+  } catch (err) {
+    toast('聊天数据恢复失败：' + friendlyErrorMessage(err), 3600);
   }
 }
 
