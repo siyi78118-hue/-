@@ -67,7 +67,7 @@ jobs:
         working-directory: android
         run: chmod +x gradlew
 
-      - name: Build installable release APK
+      - name: Build release and compatibility APKs
         working-directory: android
         env:
           AL_VERSION_CODE: ${{ github.run_number }}
@@ -76,13 +76,22 @@ jobs:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --no-daemon
+        run: ./gradlew assembleRelease assembleDebug --no-daemon
+
+      - name: Verify APK signatures
+        working-directory: android
+        run: |
+          BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs app/build/outputs/apk/release/app-release.apk
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AL-android-release
-          path: android/app/build/outputs/apk/release/app-release.apk
+          name: AL-android-installers
+          path: |
+            android/app/build/outputs/apk/release/app-release.apk
+            android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -93,6 +102,7 @@ jobs:
         run: |
           gh release create "android-v${{ github.run_number }}" \
             --title "AL Android 1.0.${{ github.run_number }}" \
-            --notes "AL Android 自动更新版本 1.0.${{ github.run_number }}" \
+            --notes "AL Android 自动更新版本 1.0.${{ github.run_number }}。app-release.apk 为正式包；app-debug.apk 为使用同一固定证书签名的兼容安装包。" \
             --latest \
-            "android/app/build/outputs/apk/release/app-release.apk#AL-1.0.${{ github.run_number }}.apk"
+            "android/app/build/outputs/apk/release/app-release.apk#AL-1.0.${{ github.run_number }}-release.apk" \
+            "android/app/build/outputs/apk/debug/app-debug.apk#AL-1.0.${{ github.run_number }}-compat.apk"
