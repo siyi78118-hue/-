@@ -1147,6 +1147,8 @@ const DEFAULT_SETTINGS = {
   timerEndpoint: '',
   pushPublicKey: '',
   pushSubscription: null,
+  nativeFcmToken: '',
+  pushTransport: '',
   deviceId: '',
   playerName: '玩家',
   playerAvatar: '我',
@@ -1169,8 +1171,8 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-11.65';
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-10.9';
+const APP_BUILD_VERSION = '2026-07-11.66';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-11.10';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -1211,6 +1213,8 @@ function resetImportedDeviceBinding(importedSettings) {
   const next = migrateSettings(importedSettings || {});
   next.deviceId = '';
   next.pushSubscription = null;
+  next.nativeFcmToken = '';
+  next.pushTransport = '';
   next.cloudTimerEnabled = false;
   next.cloudTimerLastStatus = '已从备份恢复；云闹钟需要在本机重新绑定。';
   next.cloudTimerLastStatusAt = Date.now();
@@ -1434,7 +1438,7 @@ function backupFileName(date = new Date()) {
 }
 
 function isNativeApp() {
-  return Boolean(window.Capacitor?.isNativePlatform?.());
+  return typeof window !== 'undefined' && Boolean(window.Capacitor?.isNativePlatform?.());
 }
 
 async function shareNativeBackup(fileName, jsonText) {
@@ -1528,10 +1532,88 @@ async function importBackup(event) {
 }
 
 let mirrorTimer = null;
+function nativeBackgroundRunner() {
+  return isNativeApp()
+    ? (window.Capacitor?.Plugins?.CapacitorBackgroundRunner || window.Capacitor?.Plugins?.BackgroundRunner)
+    : null;
+}
+async function buildNativeBackgroundSnapshot() {
+  const memory = await dumpMemoryStores();
+  if (Array.isArray(memory.meta)) {
+    memory.meta = memory.meta.filter(row => !['app_state', 'call_logs'].includes(row?.key));
+  }
+  const prepared = {};
+  for (const char of characters) {
+    const chat = allChats[char.id];
+    if (!chat?.messages?.length) continue;
+    const mode = expectedProactiveChatMode(chat);
+    const now = new Date();
+    const chatPrompt = buildChatSceneSystem(char, chat, {
+      proactive: true,
+      proactiveNow: now,
+      proactiveTriggerMode: mode,
+      proactiveTimeContext: buildProactiveTimeContext(chat, now, mode),
+      memoryPack: '',
+      returnPromptDetails: true
+    });
+    const momentPrompt = buildMomentPostPayload(char, chat, '');
+    prepared[char.id] = {
+      charName: char.name || 'AL',
+      playerName: playerName(),
+      chatSystem: chatPrompt.system,
+      chatMessages: sceneMessagesForAI(chat, 30, { withTime: true, now }),
+      momentSystem: momentPrompt.system,
+      momentMessages: momentPrompt.messages
+    };
+  }
+  return { settings, characters, allChats, allMoments, memory, prepared, updatedAt: Date.now() };
+}
+async function syncNativeBackgroundState() {
+  const runner = nativeBackgroundRunner();
+  if (!runner?.dispatchEvent) return false;
+  const state = await buildNativeBackgroundSnapshot();
+  await runner.dispatchEvent({
+    label: 'com.siyi.al.background',
+    event: 'syncState',
+    details: { state: JSON.stringify(state) }
+  });
+  return true;
+}
+async function restoreNativeBackgroundState() {
+  const runner = nativeBackgroundRunner();
+  if (!runner?.dispatchEvent) return false;
+  const result = await runner.dispatchEvent({
+    label: 'com.siyi.al.background',
+    event: 'readState',
+    details: {}
+  });
+  const nativeState = typeof result?.state === 'string' ? JSON.parse(result.state) : result?.state;
+  const localUpdatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0;
+  if (!nativeState?.updatedAt || nativeState.updatedAt <= localUpdatedAt) return false;
+  settings = migrateSettings(nativeState.settings || settings);
+  characters = (nativeState.characters || characters).map(normalizeChar);
+  allChats = mergeLocalPendingReplies(nativeState.allChats || allChats, allChats);
+  allMoments = Array.isArray(nativeState.allMoments) ? nativeState.allMoments : allMoments;
+  scrubEmptyReplyMessages(allChats);
+  localStorage.setItem('rpchat_settings', JSON.stringify(settings));
+  localStorage.setItem('rpchat_characters', JSON.stringify(characters));
+  localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
+  localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
+  localStorage.setItem('rpchat_app_state_updated_at', String(nativeState.updatedAt));
+  if (nativeState.memory) {
+    for (const store of ['summaries', 'events', 'profiles', 'vectors']) {
+      if (!Array.isArray(nativeState.memory[store])) continue;
+      await MemoryDB.clearStore(store);
+      for (const row of nativeState.memory[store]) if (row && typeof row === 'object') await MemoryDB.put(store, row);
+    }
+  }
+  return true;
+}
 async function mirrorAppStateNow() {
   if (typeof MemoryDB === 'undefined') return;
   const updatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || Date.now();
   await MemoryDB.setMeta('app_state', { settings, characters, allChats, allMoments, updatedAt });
+  try { await syncNativeBackgroundState(); } catch (err) { console.warn('[AL Native] state sync skipped:', err.message); }
 }
 async function mirrorAppState() {
   if (mirrorTimer) clearTimeout(mirrorTimer);
@@ -5832,6 +5914,77 @@ async function manualCheckCloudTimerVersion() {
   toast(ok ? '云端状态已检查' : '云端版本未同步，请检查部署', ok ? 1800 : 2800);
   return ok;
 }
+let nativePushListenersReady = false;
+let nativePushRegistrationWaiter = null;
+async function ensureNativePushListeners() {
+  const PushNotifications = window.Capacitor?.Plugins?.PushNotifications;
+  if (!isNativeApp() || !PushNotifications?.addListener || nativePushListenersReady) return;
+  nativePushListenersReady = true;
+  await PushNotifications.addListener('registration', token => {
+    settings.nativeFcmToken = String(token?.value || '');
+    settings.pushTransport = 'fcm';
+    settings.pushSubscription = settings.nativeFcmToken ? { transport: 'fcm', token: settings.nativeFcmToken } : null;
+    DB.set('settings', settings);
+    nativePushRegistrationWaiter?.resolve?.(settings.nativeFcmToken);
+    nativePushRegistrationWaiter = null;
+  });
+  await PushNotifications.addListener('registrationError', error => {
+    const message = error?.error || error?.message || 'FCM 注册失败';
+    nativePushRegistrationWaiter?.reject?.(new Error(message));
+    nativePushRegistrationWaiter = null;
+    setCloudTimerStatus('FCM 注册失败：' + message);
+  });
+  await PushNotifications.addListener('pushNotificationReceived', () => {
+    setCloudTimerStatus('本机已收到 FCM 唤醒，后台正在生成消息。');
+    setTimeout(() => syncFromServiceWorkerState(), 2500);
+    setTimeout(() => syncFromServiceWorkerState(), 10000);
+  });
+  await PushNotifications.addListener('pushNotificationActionPerformed', async event => {
+    await syncFromServiceWorkerState();
+    const charId = event?.notification?.data?.charId;
+    if (charId && allChats[charId]) openChat(charId);
+  });
+}
+async function requestNativeFcmToken() {
+  const PushNotifications = window.Capacitor?.Plugins?.PushNotifications;
+  if (!isNativeApp() || !PushNotifications?.register) throw new Error('当前不是支持 FCM 的安卓 App');
+  await ensureNativePushListeners();
+  let permission = await PushNotifications.checkPermissions();
+  if (permission.receive === 'prompt' || permission.receive === 'prompt-with-rationale') permission = await PushNotifications.requestPermissions();
+  if (permission.receive !== 'granted') throw new Error('通知权限未允许');
+  const tokenPromise = new Promise((resolve, reject) => {
+    nativePushRegistrationWaiter = { resolve, reject };
+    setTimeout(() => {
+      if (!nativePushRegistrationWaiter) return;
+      nativePushRegistrationWaiter = null;
+      reject(new Error('等待 FCM 注册超时'));
+    }, 30000);
+  });
+  await PushNotifications.register();
+  return tokenPromise;
+}
+async function enableNativeCloudTimer() {
+  if (!settings.timerEndpoint) throw new Error('请先填写闹钟地址');
+  const token = await requestNativeFcmToken();
+  if (!token) throw new Error('没有取得 FCM 推送地址');
+  settings.deviceId = ensureDeviceId();
+  settings.nativeFcmToken = token;
+  settings.pushTransport = 'fcm';
+  settings.pushSubscription = { transport: 'fcm', token };
+  settings.cloudTimerEnabled = true;
+  settings.proactiveEnabled = true;
+  DB.set('settings', settings);
+  const resp = await fetchWithTimeout(timerUrl('/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: settings.deviceId, transport: 'fcm', fcmToken: token })
+  }, API_TIMEOUT_MS);
+  if (!resp.ok) throw new Error('FCM 云闹钟注册失败：' + resp.status);
+  await mirrorAppStateNow();
+  await ensureCloudProactiveScheduled({ force: true });
+  setCloudTimerStatus('安卓原生 FCM 已绑定；AL 关闭后也可由系统唤醒。');
+  return true;
+}
 function setCloudTimerTestAck(message) {
   settings.cloudTimerLastTestAckStatus = message;
   settings.cloudTimerLastTestAckAt = Date.now();
@@ -5881,6 +6034,12 @@ async function enableCloudTimer() {
   saveSettings({ silent: true });
   setCloudTimerStatus('正在绑定云闹钟...', false);
   try {
+    if (isNativeApp()) {
+      await checkCloudTimerWorkerVersion();
+      await enableNativeCloudTimer();
+      toast('原生云闹钟已绑定\n关闭 AL 后也可以收到主动消息', 3200);
+      return;
+    }
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
       setCloudTimerStatus('当前浏览器不支持 Web Push');
       toast('当前浏览器不支持 Web Push', 2400);
@@ -7458,7 +7617,11 @@ async function clearAllHistory() {
 }
 
 async function syncFromServiceWorkerState() {
-  const changed = await restoreAppStateFromMirror();
+  const nativeChanged = await restoreNativeBackgroundState().catch(err => {
+    console.warn('[AL Native] state restore skipped:', err.message);
+    return false;
+  });
+  const changed = await restoreAppStateFromMirror() || nativeChanged;
   if (changed) {
     renderPlayerProfile();
     if (activeScreen === 'chat') renderMessages();
@@ -7471,6 +7634,7 @@ async function syncFromServiceWorkerState() {
   checkProactiveMessages().catch(err => console.warn('[AL Timer] immediate proactive check skipped:', err.message));
 }
 async function bootApp() {
+  if (isNativeApp()) await ensureNativePushListeners().catch(err => console.warn('[AL Native] push listeners skipped:', err.message));
   await syncFromServiceWorkerState();
   let chatStateChanged = false;
   Object.values(allChats || {}).forEach(chat => { chatStateChanged = ensureChatMessageIds(chat) || chatStateChanged; });

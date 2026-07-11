@@ -5,6 +5,9 @@
 // - Secret VAPID_PRIVATE_JWK: P-256 private JWK JSON string with x/y/d
 // - Variable VAPID_PUBLIC_KEY: base64url VAPID public key
 // - Variable VAPID_SUBJECT: e.g. mailto:you@example.com
+// - Secret FIREBASE_PRIVATE_KEY: Firebase service-account RSA private key PEM
+// - Variable FIREBASE_PROJECT_ID: Firebase project id
+// - Variable FIREBASE_CLIENT_EMAIL: Firebase service-account client email
 //
 // Cron trigger: every 1 minute.
 //
@@ -22,7 +25,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-10.9';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-11.10';
 const RECENT_EVENT_LIMIT = 40;
 const IDLE_CRON_HEARTBEAT_MINUTES = 10;
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -40,14 +43,19 @@ export default {
       }
       if (request.method === 'POST' && url.pathname === '/register') {
         const body = await request.json();
-        if (!body.deviceId || !body.subscription?.endpoint) throw new Error('missing deviceId/subscription');
+        const isFcm = body.transport === 'fcm' || !!body.fcmToken;
+        if (!body.deviceId || (!isFcm && !body.subscription?.endpoint) || (isFcm && !body.fcmToken)) {
+          throw new Error('missing deviceId/push target');
+        }
         await env.AL_TIMER_KV.put(`sub:${body.deviceId}`, JSON.stringify({
           deviceId: body.deviceId,
-          subscription: body.subscription,
+          transport: isFcm ? 'fcm' : 'webpush',
+          fcmToken: isFcm ? String(body.fcmToken) : '',
+          subscription: isFcm ? null : body.subscription,
           updatedAt: Date.now()
         }));
-        await appendEvent(env, { type: 'register', deviceId: shortId(body.deviceId), ok: true });
-        return json({ ok: true });
+        await appendEvent(env, { type: 'register', deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', ok: true });
+        return json({ ok: true, transport: isFcm ? 'fcm' : 'webpush' });
       }
       if (request.method === 'POST' && url.pathname === '/schedule') {
         const body = await request.json();
@@ -297,8 +305,8 @@ function minuteKey(ms) {
 async function deliverJob(job, env) {
   const subRaw = await env.AL_TIMER_KV.get(`sub:${job.deviceId}`);
   if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
-  const { subscription } = JSON.parse(subRaw);
-  const result = await sendPush(subscription, env, {
+  const target = JSON.parse(subRaw);
+  const result = await sendPush(target, env, {
     type: 'proactive',
     deviceId: job.deviceId || '',
     jobId: job.jobId || '',
@@ -345,7 +353,11 @@ function shortId(value) {
   return text.slice(0, 6) + '...' + text.slice(-5);
 }
 
-async function sendPush(subscription, env, payload = {}) {
+async function sendPush(target, env, payload = {}) {
+  if (target?.transport === 'fcm' || target?.fcmToken) {
+    return sendFcmPush(target.fcmToken, env, payload);
+  }
+  const subscription = target?.subscription || target;
   if (subscription?.keys?.p256dh && subscription?.keys?.auth) {
     try {
       const encrypted = await sendEncryptedPush(subscription, env, payload);
@@ -360,6 +372,97 @@ async function sendPush(subscription, env, payload = {}) {
     }
   }
   return sendEmptyPush(subscription, env);
+}
+
+let cachedFirebaseAccessToken = null;
+
+async function sendFcmPush(fcmToken, env, payload = {}) {
+  if (!fcmToken) return { ok: false, expired: true, reason: 'missing fcm token' };
+  if (!env.FIREBASE_PROJECT_ID || !env.FIREBASE_CLIENT_EMAIL || !env.FIREBASE_PRIVATE_KEY) {
+    return { ok: false, reason: 'firebase service account is not configured' };
+  }
+  const accessToken = await getFirebaseAccessToken(env);
+  const stringData = {};
+  for (const [key, value] of Object.entries(payload || {})) {
+    if (value !== undefined && value !== null) stringData[key] = typeof value === 'string' ? value : JSON.stringify(value);
+  }
+  const resp = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(env.FIREBASE_PROJECT_ID)}/messages:send`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      message: {
+        token: fcmToken,
+        data: stringData,
+        android: {
+          priority: 'high',
+          ttl: '120s'
+        }
+      }
+    })
+  });
+  const raw = await resp.text();
+  if (resp.status === 404 || /UNREGISTERED|registration-token-not-registered/i.test(raw)) {
+    return { ok: false, expired: true, status: resp.status, reason: 'fcm token expired' };
+  }
+  if (!resp.ok) return { ok: false, status: resp.status, reason: `fcm failed ${resp.status}: ${raw.slice(0, 180)}` };
+  return { ok: true, status: resp.status, payload: true, transport: 'fcm' };
+}
+
+async function getFirebaseAccessToken(env) {
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedFirebaseAccessToken?.token && cachedFirebaseAccessToken.expiresAt > now + 60) {
+    return cachedFirebaseAccessToken.token;
+  }
+  const assertion = await createFirebaseServiceAccountJWT(env, now);
+  const resp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion
+    })
+  });
+  const json = await resp.json();
+  if (!resp.ok || !json.access_token) throw new Error(`firebase oauth failed ${resp.status}: ${JSON.stringify(json).slice(0, 180)}`);
+  cachedFirebaseAccessToken = {
+    token: json.access_token,
+    expiresAt: now + Math.max(60, Number(json.expires_in) || 3600)
+  };
+  return json.access_token;
+}
+
+async function createFirebaseServiceAccountJWT(env, now = Math.floor(Date.now() / 1000)) {
+  const header = base64urlJson({ alg: 'RS256', typ: 'JWT' });
+  const claims = base64urlJson({
+    iss: env.FIREBASE_CLIENT_EMAIL,
+    sub: env.FIREBASE_CLIENT_EMAIL,
+    aud: 'https://oauth2.googleapis.com/token',
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    iat: now,
+    exp: now + 3600
+  });
+  const unsigned = `${header}.${claims}`;
+  const keyBytes = pemToBytes(env.FIREBASE_PRIVATE_KEY);
+  const key = await crypto.subtle.importKey(
+    'pkcs8',
+    keyBytes,
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = new Uint8Array(await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, utf8(unsigned)));
+  return `${unsigned}.${base64url(signature)}`;
+}
+
+function pemToBytes(value) {
+  const base64 = String(value || '')
+    .replace(/\\n/g, '\n')
+    .replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s+/g, '');
+  const binary = atob(base64);
+  return Uint8Array.from(binary, ch => ch.charCodeAt(0));
 }
 
 async function sendEncryptedPush(subscription, env, payload = {}) {
