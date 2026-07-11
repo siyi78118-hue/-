@@ -3167,8 +3167,8 @@ function renderMomentComment(comment, moment) {
 }
 function renderMomentItem(moment) {
   const author = momentAuthor(moment);
-  const char = author.char;
-  const media = !author.isPlayer && char?.avatarData ? `<div class="moment-media"><img src="${char.avatarData}" alt=""></div>` : '';
+  const mediaUrl = String(moment.imageData || '').trim();
+  const media = mediaUrl ? `<div class="moment-media"><img src="${esc(mediaUrl)}" alt="动态配图"></div>` : '';
   const likes = (moment.likes || []).map(id => characters.find(c => c.id === id)).filter(Boolean);
   const comments = moment.comments || [];
   const reactions = (likes.length || comments.length) ? `<div class="moment-reactions">

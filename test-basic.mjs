@@ -513,6 +513,8 @@ assert.match(script, /await verifyCurrentCloudJobs\(\)/);
 assert.match(script, /当前没有可核验的云端任务/);
 assert.match(script, /云端任务核验失败/);
 assert.match(html, /id="moment-reply-bar"/);
+assert.doesNotMatch(script, /!author\.isPlayer && char\?\.avatarData/, '角色头像不得被自动当成每条朋友圈的配图');
+assert.match(script, /const mediaUrl = String\(moment\.imageData \|\| ''\)\.trim\(\)/, '朋友圈配图必须来自动态自身的数据');
 assert.match(script, /function openMomentReplyBar\(momentId\)/);
 assert.match(script, /function openMomentCommentReply\(momentId, commentId\)/);
 assert.match(script, /async function submitMomentReply\(\)/);
