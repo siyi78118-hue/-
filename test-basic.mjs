@@ -21,12 +21,15 @@ const androidWorkflow = readFileSync('.github/workflows/android-apk.yml', 'utf8'
 assert.match(swScript, /const CACHE_NAME = 'rpchat-v79';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-11\.70';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-11\.71';/);
 assert.match(script, /等待 FCM Token 超时，请确认 Google Play 服务可以联网后重试/);
 assert.match(script, /\}, API_TIMEOUT_MS\);/);
 assert.match(script, /绑定步骤 3\/3：已取得 FCM Token/);
 assert.match(html, /onclick="checkForAppUpdate\(\)"/);
 assert.match(script, /const ANDROID_RELEASE_API = 'https:\/\/api\.github\.com\/repos\/siyi78118-hue\/-\/releases\/latest';/);
+assert.match(script, /raw\.githubusercontent\.com\/siyi78118-hue\/-\/main\/android-update\.json/);
+assert.match(script, /async function fetchLatestAndroidRelease\(\)/);
+assert.match(script, /GitHub 更新服务暂时限流/);
 assert.match(script, /async function checkForAppUpdate\(\)/);
 assert.match(script, /覆盖安装会保留聊天、记忆和 API 设置/);
 assert.equal(capacitorConfig.appId, 'com.siyi.al');

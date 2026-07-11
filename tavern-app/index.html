@@ -1226,8 +1226,12 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-11.70';
+const APP_BUILD_VERSION = '2026-07-11.71';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
+const ANDROID_UPDATE_MANIFEST_URLS = [
+  'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
+  'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@main/android-update.json'
+];
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-11.10';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1523,24 +1527,52 @@ async function openExternalUrl(url) {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
+async function fetchLatestAndroidRelease() {
+  const failures = [];
+  for (const url of ANDROID_UPDATE_MANIFEST_URLS) {
+    try {
+      const response = await fetch(`${url}?t=${Date.now()}`, { cache: 'no-store' });
+      if (!response.ok) throw new Error(`版本清单 ${response.status}`);
+      const manifest = await response.json();
+      const latestBuild = Number(manifest.latestBuild || manifest.build || 0);
+      const releaseUrl = String(manifest.releaseUrl || '').trim();
+      if (!latestBuild || !releaseUrl) throw new Error('版本清单内容不完整');
+      return { latestBuild, releaseUrl, version: String(manifest.version || `1.0.${latestBuild}`) };
+    } catch (err) {
+      failures.push(err);
+    }
+  }
+  try {
+    const response = await fetch(ANDROID_RELEASE_API, { cache: 'no-store', headers: { Accept: 'application/vnd.github+json' } });
+    if (!response.ok) {
+      if (response.status === 403 || response.status === 429) throw new Error('GitHub 更新服务暂时限流');
+      throw new Error(`GitHub 更新服务 ${response.status}`);
+    }
+    const release = await response.json();
+    const latestBuild = Number(String(release.tag_name || '').match(/^android-v(\d+)$/)?.[1] || 0);
+    if (!latestBuild || !release.html_url) throw new Error('没有找到安卓安装包');
+    return { latestBuild, releaseUrl: release.html_url, version: `1.0.${latestBuild}` };
+  } catch (err) {
+    failures.push(err);
+  }
+  throw failures.at(-1) || new Error('无法读取版本信息');
+}
+
 async function checkForAppUpdate() {
   try {
     toast('正在检查更新…');
-    const [info, response] = await Promise.all([
+    const [info, release] = await Promise.all([
       getInstalledAppInfo(),
-      fetch(ANDROID_RELEASE_API, { cache: 'no-store', headers: { Accept: 'application/vnd.github+json' } })
+      fetchLatestAndroidRelease()
     ]);
-    if (!response.ok) throw new Error(`GitHub ${response.status}`);
-    const release = await response.json();
-    const latestBuild = Number(String(release.tag_name || '').match(/^android-v(\d+)$/)?.[1] || 0);
+    const latestBuild = release.latestBuild;
     const currentBuild = Number(info.build || 0);
     if (isNativeApp() && latestBuild && currentBuild >= latestBuild) {
       toast(`已经是最新版 ${info.version}`);
       return;
     }
-    if (!release.html_url) throw new Error('没有找到安卓安装包');
     if (isNativeApp() && latestBuild && !confirm(`发现新版本 1.0.${latestBuild}，打开下载页更新？\n\n覆盖安装会保留聊天、记忆和 API 设置。`)) return;
-    await openExternalUrl(release.html_url);
+    await openExternalUrl(release.releaseUrl);
   } catch (err) {
     toast('检查更新失败：' + friendlyErrorMessage(err), 3200);
   }
