@@ -45,6 +45,10 @@ jobs:
       - name: Sync bundled web assets
         run: npx cap sync android
 
+      - name: Make Gradle wrapper executable
+        working-directory: android
+        run: chmod +x gradlew
+
       - name: Build installable debug APK
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon
