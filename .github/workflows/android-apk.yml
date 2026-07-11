@@ -1,5 +1,8 @@
 name: Build Android APK
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
   push:
@@ -14,7 +17,7 @@ on:
       - ".github/workflows/android-apk.yml"
 
 jobs:
-  build-debug-apk:
+  build-release-apk:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -50,6 +53,13 @@ jobs:
             printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | base64 --decode > android/app/google-services.json
           fi
 
+      - name: Restore stable Android signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/al-release.p12
+
       - name: Sync bundled web assets
         run: npx cap sync android
 
@@ -57,14 +67,32 @@ jobs:
         working-directory: android
         run: chmod +x gradlew
 
-      - name: Build installable debug APK
+      - name: Build installable release APK
         working-directory: android
-        run: ./gradlew assembleDebug --no-daemon
+        env:
+          AL_VERSION_CODE: ${{ github.run_number }}
+          AL_VERSION_NAME: 1.0.${{ github.run_number }}
+          ANDROID_KEYSTORE_PATH: al-release.p12
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: AL-android-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: AL-android-release
+          path: android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish Android update
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "android-v${{ github.run_number }}" \
+            --title "AL Android 1.0.${{ github.run_number }}" \
+            --notes "AL Android 自动更新版本 1.0.${{ github.run_number }}" \
+            --latest \
+            "android/app/build/outputs/apk/release/app-release.apk#AL-1.0.${{ github.run_number }}.apk"

@@ -779,6 +779,7 @@ button.cell:active{background:#ececec}
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
+          <button class="cell" onclick="checkForAppUpdate()" type="button"><div class="cell-label">版本</div><div class="cell-body">检查更新<span class="cell-note" id="app-version-note">正在读取当前版本</span></div><div class="mini">›</div></button>
         </div>
         <div class="cell-group">
           <button class="cell" onclick="exportBackup()" type="button"><div class="cell-label">备份</div><div class="cell-body">导出本机数据<span class="cell-note">含 API Key、聊天、朋友圈和记忆库</span></div><div class="mini">›</div></button>
@@ -1174,7 +1175,8 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-11.67';
+const APP_BUILD_VERSION = '2026-07-11.68';
+const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-11.10';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
@@ -1445,6 +1447,52 @@ function chatBackupFileName(date = new Date()) {
 
 function isNativeApp() {
   return typeof window !== 'undefined' && Boolean(window.Capacitor?.isNativePlatform?.());
+}
+
+async function getInstalledAppInfo() {
+  const App = window.Capacitor?.Plugins?.App;
+  if (!isNativeApp() || !App?.getInfo) return { version: APP_BUILD_VERSION, build: '0' };
+  return App.getInfo();
+}
+
+async function refreshAppVersionDisplay() {
+  const note = document.getElementById('app-version-note');
+  if (!note) return;
+  try {
+    const info = await getInstalledAppInfo();
+    note.textContent = isNativeApp() ? `当前 ${info.version}（${info.build}）` : `网页 ${APP_BUILD_VERSION}`;
+  } catch (_) {
+    note.textContent = `当前 ${APP_BUILD_VERSION}`;
+  }
+}
+
+async function openExternalUrl(url) {
+  const Browser = window.Capacitor?.Plugins?.Browser;
+  if (isNativeApp() && Browser?.open) return Browser.open({ url });
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+async function checkForAppUpdate() {
+  try {
+    toast('正在检查更新…');
+    const [info, response] = await Promise.all([
+      getInstalledAppInfo(),
+      fetch(ANDROID_RELEASE_API, { cache: 'no-store', headers: { Accept: 'application/vnd.github+json' } })
+    ]);
+    if (!response.ok) throw new Error(`GitHub ${response.status}`);
+    const release = await response.json();
+    const latestBuild = Number(String(release.tag_name || '').match(/^android-v(\d+)$/)?.[1] || 0);
+    const currentBuild = Number(info.build || 0);
+    if (isNativeApp() && latestBuild && currentBuild >= latestBuild) {
+      toast(`已经是最新版 ${info.version}`);
+      return;
+    }
+    if (!release.html_url) throw new Error('没有找到安卓安装包');
+    if (isNativeApp() && latestBuild && !confirm(`发现新版本 1.0.${latestBuild}，打开下载页更新？\n\n覆盖安装会保留聊天、记忆和 API 设置。`)) return;
+    await openExternalUrl(release.html_url);
+  } catch (err) {
+    toast('检查更新失败：' + friendlyErrorMessage(err), 3200);
+  }
 }
 
 async function shareNativeBackup(fileName, jsonText, options = {}) {
@@ -7732,6 +7780,7 @@ async function syncFromServiceWorkerState() {
   checkProactiveMessages().catch(err => console.warn('[AL Timer] immediate proactive check skipped:', err.message));
 }
 async function bootApp() {
+  refreshAppVersionDisplay();
   if (isNativeApp()) await ensureNativePushListeners().catch(err => console.warn('[AL Native] push listeners skipped:', err.message));
   await syncFromServiceWorkerState();
   let chatStateChanged = false;
