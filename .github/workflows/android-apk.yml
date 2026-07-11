@@ -106,3 +106,33 @@ jobs:
             --latest \
             "android/app/build/outputs/apk/release/app-release.apk#AL-1.0.${{ github.run_number }}-release.apk" \
             "android/app/build/outputs/apk/debug/app-debug.apk#AL-1.0.${{ github.run_number }}-compat.apk"
+
+      - name: Publish automatic update manifest
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MANIFEST=$(printf '{\n  "latestBuild": %s,\n  "version": "1.0.%s",\n  "releaseUrl": "https://github.com/%s/releases/download/android-v%s/app-release.apk"\n}\n' \
+            "${{ github.run_number }}" \
+            "${{ github.run_number }}" \
+            "${{ github.repository }}" \
+            "${{ github.run_number }}")
+          if ! gh api "repos/${{ github.repository }}/git/ref/heads/update-channel" >/dev/null 2>&1; then
+            gh api --method POST "repos/${{ github.repository }}/git/refs" \
+              -f ref='refs/heads/update-channel' \
+              -f sha='${{ github.sha }}'
+          fi
+          EXISTING_SHA=$(gh api "repos/${{ github.repository }}/contents/android-update.json?ref=update-channel" --jq '.sha' 2>/dev/null || true)
+          CONTENT=$(printf '%s' "$MANIFEST" | base64 -w 0)
+          if [ -n "$EXISTING_SHA" ]; then
+            gh api --method PUT "repos/${{ github.repository }}/contents/android-update.json" \
+              -f message="Update Android channel to 1.0.${{ github.run_number }}" \
+              -f content="$CONTENT" \
+              -f branch='update-channel' \
+              -f sha="$EXISTING_SHA"
+          else
+            gh api --method PUT "repos/${{ github.repository }}/contents/android-update.json" \
+              -f message="Create Android update channel at 1.0.${{ github.run_number }}" \
+              -f content="$CONTENT" \
+              -f branch='update-channel'
+          fi
