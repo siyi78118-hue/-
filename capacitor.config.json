@@ -1,0 +1,12 @@
+{
+  "appId": "com.siyi.al",
+  "appName": "AL",
+  "webDir": "tavern-app",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "backgroundColor": "#ededed"
+  }
+}

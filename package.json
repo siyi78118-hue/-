@@ -2,11 +2,23 @@
   "scripts": {
     "start": "node serve-static.mjs",
     "test": "node test-basic.mjs",
+    "android:sync": "cap sync android",
+    "android:copy": "cap copy android",
+    "android:open": "cap open android",
+    "android:debug": "cap sync android && cd android && gradlew.bat assembleDebug",
     "cloud:deploy": "node scripts/deploy-cloud-timer.mjs",
     "cloud:deploy:raw": "node scripts/run-wrangler.mjs deploy",
     "cloud:health": "node scripts/check-cloud-timer.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.108.0"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.4.1",
+    "@capacitor/app": "^8.1.0",
+    "@capacitor/cli": "^8.4.1",
+    "@capacitor/core": "^8.4.1",
+    "@capacitor/filesystem": "^8.1.2",
+    "@capacitor/share": "^8.0.1"
   }
 }
