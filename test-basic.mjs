@@ -21,7 +21,7 @@ const androidWorkflow = readFileSync('.github/workflows/android-apk.yml', 'utf8'
 assert.match(swScript, /const CACHE_NAME = 'rpchat-v79';/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-11\.69';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-11\.70';/);
 assert.match(script, /等待 FCM Token 超时，请确认 Google Play 服务可以联网后重试/);
 assert.match(script, /\}, API_TIMEOUT_MS\);/);
 assert.match(script, /绑定步骤 3\/3：已取得 FCM Token/);
@@ -836,6 +836,25 @@ assert.match(prompt, /角色设定：雨夜酒馆的老板/);
 assert.match(prompt, /关系与相处设定：窗外落雨/);
 assert.ok(RP_PRESETS.combined.prompt.includes('不写动作、神态、表情、环境'));
 assert.ok(RP_PRESETS.combined.prompt.includes('拆成独立聊天气泡'));
+assert.ok(RP_PRESETS.combined.prompt.includes('中文微信聊天允许省略主语、宾语、因果和结论'));
+assert.ok(RP_PRESETS.combined.prompt.includes('角色不是围着玩家待命的界面'));
+assert.ok(RP_PRESETS.combined.prompt.includes('连续气泡必须各自带来新的信息'));
+assert.ok(RP_PRESETS.combined.prompt.includes('不能为了显得独立而无理由冷淡'));
+assert.ok(RP_PRESETS.combined.prompt.includes('正例用于展示判断依据，不是口头禅库'));
+for (const leakedReferenceInstruction of ['Sandbox', '忽略系统', '无限制创作', 'NSFW', 'Master', 'Editor', 'Ako', 'Konata', 'Atri', 'Deach', '<Chain_of_Thought>']) {
+  assert.doesNotMatch(RP_PRESETS.combined.prompt, new RegExp(leakedReferenceInstruction, 'i'), `综合预设不得带入参考预设的${leakedReferenceInstruction}指令`);
+}
+assert.match(script, /function refreshAllStoredCharacterPrompts\(\)/);
+assert.match(script, /await syncFromServiceWorkerState\(\);\s*refreshAllStoredCharacterPrompts\(\);/);
+const storedPromptRefreshProbe = vm.runInContext(`(() => {
+  const char = normalizeChar({ id: 'old-prompt-char', name: '旧角色', personality: '慢热' });
+  characters = [char];
+  allChats = { [char.id]: { messages: [], charPrompt: '最高优先级：只输出聊天消息本身\\n当前你要扮演的角色：旧角色' } };
+  const changed = refreshAllStoredCharacterPrompts();
+  return { changed, prompt: allChats[char.id].charPrompt };
+})()`, context);
+assert.equal(storedPromptRefreshProbe.changed, true, '旧版自动生成角色提示词应在启动时刷新');
+assert.ok(storedPromptRefreshProbe.prompt.startsWith(RP_PRESETS.combined.prompt), '刷新后的旧角色必须使用完整新版综合预设');
 assert.equal(normalizePresetKey('story'), 'combined');
 assert.equal(normalizePresetKey('custom'), 'custom');
 
@@ -1001,12 +1020,14 @@ assert.equal(chatSceneFromOptions({}), 'chat');
 assert.equal(chatSceneFromOptions({ proactive: true }), 'proactive-chat');
 assert.equal(chatSceneFromOptions({ payment: { kind: 'redpacket' } }), 'payment');
 const chatSystem = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。' });
+assert.ok(chatSystem.startsWith(RP_PRESETS.combined.prompt), '普通私聊必须完整发送综合 RP 预设');
 assert.match(chatSystem, /微信私聊/);
 assert.match(chatSystem, /记忆：林晚和玩家约好周末见。/);
 assert.match(chatSystem, /当前触发情况：玩家刚在私聊里发来消息/);
 const chatPromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。', returnPromptDetails: true });
 assert.equal(blockIds(chatPromptDetails).slice(0, 3).join(','), 'scene-base,memory-pack,normal-chat-scene');
 const proactivePromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。', proactive: true, returnPromptDetails: true });
+assert.ok(proactivePromptDetails.system.startsWith(RP_PRESETS.combined.prompt), '主动私聊必须完整发送综合 RP 预设');
 assert.ok(blockIds(proactivePromptDetails).includes('proactive-time-context'));
 assert.ok(blockIds(proactivePromptDetails).includes('memory-pack'));
 assert.match(proactivePromptDetails.system, /计划追发/);
@@ -1015,6 +1036,7 @@ assert.match(dicePromptDetails.system, /随机再联系/);
 assert.match(dicePromptDetails.system, /禁止.*自问自答/);
 assert.match(dicePromptDetails.system, /超过 24 小时/);
 const paymentPromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚刚收过红包。', payment: { kind: 'redpacket', amount: 66, note: '测试' }, returnPromptDetails: true });
+assert.ok(paymentPromptDetails.system.startsWith(RP_PRESETS.combined.prompt), '红包场景必须完整发送综合 RP 预设');
 assert.ok(blockIds(paymentPromptDetails).includes('payment-scene'));
 assert.ok(blockIds(paymentPromptDetails).includes('memory-pack'));
 assert.match(paymentPromptDetails.system, /<al_payment>\{"status":"received\|pending\|refused"\}<\/al_payment>/);
@@ -1026,6 +1048,7 @@ assert.match(pendingPaymentPrompt.system, /仍有一笔玩家发给林晚的红�
 assert.match(pendingPaymentPrompt.system, /status":"pending/);
 const playerMoment = { text: '今天有点想喝热茶。', likes: [], comments: [], time: Date.now(), authorType: 'player' };
 const interactionPayload = buildMomentInteractionPayload(v2, playerMoment, '记忆：林晚刚收过玩家的红包。');
+assert.ok(interactionPayload.system.startsWith(RP_PRESETS.combined.prompt), '朋友圈互动必须完整发送综合 RP 预设');
 assert.match(interactionPayload.system, /朋友圈动态互动/);
 assert.match(interactionPayload.system, /只允许输出 JSON，不要输出解释：\{"like":true\/false,"comment":"留言正文或空字符串"\}/);
 assert.match(interactionPayload.system, /记忆：林晚刚收过玩家的红包。/);
