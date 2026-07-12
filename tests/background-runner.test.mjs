@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 
 const runnerSource = readFileSync('tavern-app/runners/al-background.js', 'utf8');
 
-function createHarness({ queue, failChat = false, pendingUserReplies = [] } = {}) {
+function createHarness({ queue, failChat = false, pendingUserReplies = [], chatContent = '刚看到\n还没睡？' } = {}) {
   const rows = new Map();
   const handlers = new Map();
   const fetchCalls = [];
@@ -92,7 +92,7 @@ function createHarness({ queue, failChat = false, pendingUserReplies = [] } = {}
         ok: true,
         status: 200,
         headers: { get: () => 'application/json' },
-        text: async () => JSON.stringify({ choices: [{ message: { content: isMoment ? '{"text":"刚忙完，出去透口气"}' : '刚看到\n还没睡？' } }] })
+        text: async () => JSON.stringify({ choices: [{ message: { content: isMoment ? '{"text":"刚忙完，出去透口气"}' : chatContent } }] })
       };
     }
   };
@@ -202,4 +202,32 @@ test('queueUserReply persists a task independently from general state snapshots'
   assert.equal(queue.length, 1);
   assert.equal(queue[0].taskId, 'reply-user-9');
   assert.equal(queue[0].status, 'pending');
+});
+
+test('a user reply can contain text emoji and one hidden incoming payment directive', async () => {
+  const now = Date.now();
+  const task = { taskId: 'reply-user-pay', charId: 'char-a', userMessageId: 'user-pay', userText: '发工资啦', createdAt: now, status: 'pending' };
+  const harness = createHarness({
+    pendingUserReplies: [task],
+    chatContent: '那请你喝奶茶🧋\n<al_send_payment>{"type":"redpacket","amount":18.8,"note":"奶茶钱"}</al_send_payment>'
+  });
+  const state = JSON.parse(harness.rows.get('state_json'));
+  state.allChats['char-a'].messages.push({ id: 'user-pay', role: 'user', content: '发工资啦', time: now, replyState: 'pending' });
+  state.allChats['char-a'].pendingReply = { userMessageId: 'user-pay', userText: '发工资啦', state: 'pending' };
+  harness.rows.set('state_json', JSON.stringify(state));
+
+  await harness.dispatch('pendingUserReply');
+
+  const saved = JSON.parse(harness.rows.get('state_json'));
+  const replies = saved.allChats['char-a'].messages.filter(row => row.replyToMessageId === 'user-pay');
+  assert.equal(replies.filter(row => row.type === 'redpacket').length, 1);
+  const payment = replies.find(row => row.type === 'redpacket');
+  assert.equal(payment.role, 'assistant');
+  assert.equal(payment.payDirection, 'incoming');
+  assert.equal(payment.amount, 18.8);
+  assert.equal(payment.note, '奶茶钱');
+  assert.equal(payment.payStatus, 'pending');
+  assert.ok(saved.memory.events.some(row => row.type === 'payment' && /18\.8/.test(row.detail)), 'AI 发出支付也必须进入本地记忆事件');
+  assert.match(replies.find(row => !row.type).content, /🧋/);
+  assert.equal(replies.some(row => /al_send_payment/.test(row.content || '')), false);
 });

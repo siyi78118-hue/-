@@ -211,6 +211,10 @@ assert.match(script, /function extractProactiveScheduleDirective\(text, now = ne
 assert.match(script, /function stripProactiveScheduleDirective\(text\)/);
 assert.match(script, /function extractPaymentStatusDirective\(text\)/);
 assert.match(script, /function stripPaymentStatusDirective\(text\)/);
+assert.match(script, /function extractAssistantPaymentDirective\(text\)/);
+assert.match(script, /function stripAssistantPaymentDirective\(text\)/);
+assert.match(script, /<al_send_payment>\{"type":"redpacket\|transfer","amount":正数,"note":"备注"\}<\/al_send_payment>/);
+assert.match(script, /Emoji 可以自然夹在文字里，也可以单独成为一条消息/);
 assert.match(script, /<al_payment>\{\"status\":\"received\|pending\|refused\"\}<\/al_payment>/);
 assert.match(script, /updatePaymentStatusFromReply\(chat, options\.paymentMessageId, replyText, requestCharId, paymentDirective\?\.status\)/);
 assert.match(script, /updatePaymentStatusFromReply\(chat, '', replyText, charId, paymentDirective\?\.status\)/);
@@ -781,10 +785,20 @@ globalThis.__appTest = {
   proactiveDicePlan,
   buildAndroidUserReplyTask,
   retryFailedReply,
+  extractAssistantPaymentDirective,
+  stripAssistantPaymentDirective,
+  claimIncomingPayment,
+  refuseIncomingPayment,
+  refreshPaymentExpirations,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, RP_PRESETS } = context.__appTest;
+
+const aiPaymentText = '拿去买杯喝的😏\n<al_send_payment>{"type":"redpacket","amount":20.5,"note":"奶茶"}</al_send_payment>';
+assert.deepEqual(JSON.parse(JSON.stringify(extractAssistantPaymentDirective(aiPaymentText))), { type: 'redpacket', amount: 20.5, note: '奶茶' });
+assert.equal(stripAssistantPaymentDirective(aiPaymentText), '拿去买杯喝的😏');
+assert.equal(extractAssistantPaymentDirective('<al_send_payment>{"type":"transfer","amount":0,"note":"坏数据"}</al_send_payment>'), null);
 
 const durableTask = buildAndroidUserReplyTask('char-a', 'message-a', '刚忙完', { paymentMessageId: 'pay-a', payment: { kind: 'redpacket', amount: 8.8, note: '晚安' } }, 1234);
 assert.equal(durableTask.taskId, 'reply_message-a');
@@ -838,6 +852,56 @@ assert.equal(retryProbe.before, retryProbe.after, '重新发送不得复制玩�
 assert.equal(retryProbe.calls[0].options.userMessageId, 'retry-user');
 assert.equal(retryProbe.calls[0].options.paymentMessageId, 'pay-original');
 assert.equal(retryProbe.message.replyState, 'pending');
+
+const incomingPaymentProbe = vm.runInContext(`(() => {
+  const savedSettings = settings;
+  const savedChats = allChats;
+  const savedScreen = activeScreen;
+  settings = { ...settings, walletBalance: 10 };
+  activeScreen = 'settings';
+  allChats = {
+    pay_char: {
+      messages: [{ id: 'incoming-pay', role: 'assistant', type: 'redpacket', payType: 'redpacket', payDirection: 'incoming', amount: 12.5, note: '给你的', payStatus: 'pending', payExpiresAt: Date.now() + 60000, time: Date.now() }]
+    }
+  };
+  const first = claimIncomingPayment('pay_char', 'incoming-pay');
+  const afterFirst = walletBalance();
+  const second = claimIncomingPayment('pay_char', 'incoming-pay');
+  const afterSecond = walletBalance();
+  const status = allChats.pay_char.messages[0].payStatus;
+  settings = savedSettings;
+  allChats = savedChats;
+  activeScreen = savedScreen;
+  return { first, second, afterFirst, afterSecond, status };
+})()`, context);
+assert.equal(incomingPaymentProbe.first, true);
+assert.equal(incomingPaymentProbe.second, false);
+assert.equal(incomingPaymentProbe.afterFirst, 22.5);
+assert.equal(incomingPaymentProbe.afterSecond, 22.5, '重复领取不得重复入账');
+assert.equal(incomingPaymentProbe.status, 'received');
+
+const expiredIncomingPaymentProbe = vm.runInContext(`(() => {
+  const savedSettings = settings;
+  const savedChats = allChats;
+  const savedScreen = activeScreen;
+  settings = { ...settings, walletBalance: 30 };
+  activeScreen = 'settings';
+  allChats = {
+    pay_char: {
+      messages: [{ id: 'expired-pay', role: 'assistant', type: 'transfer', payType: 'transfer', payDirection: 'incoming', amount: 50, payStatus: 'pending', payExpiresAt: Date.now() - 1, time: Date.now() - REDPACKET_EXPIRE_MS - 1 }]
+    }
+  };
+  const refused = refuseIncomingPayment('pay_char', 'expired-pay');
+  const message = { ...allChats.pay_char.messages[0] };
+  const balance = walletBalance();
+  settings = savedSettings;
+  allChats = savedChats;
+  activeScreen = savedScreen;
+  return { refused, message, balance };
+})()`, context);
+assert.equal(expiredIncomingPaymentProbe.refused, false, '过期后不能再执行拒收动作');
+assert.equal(expiredIncomingPaymentProbe.message.payStatus, 'expired');
+assert.equal(expiredIncomingPaymentProbe.balance, 30, '过期不得增加玩家余额');
 
 const memoryQueueProbe = await vm.runInContext(`(async () => {
   const original = processMemoryBatch;
@@ -1156,7 +1220,7 @@ assert.match(chatSystem, /微信私聊/);
 assert.match(chatSystem, /记忆：林晚和玩家约好周末见。/);
 assert.match(chatSystem, /当前触发情况：玩家刚在私聊里发来消息/);
 const chatPromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。', returnPromptDetails: true });
-assert.equal(blockIds(chatPromptDetails).slice(0, 3).join(','), 'scene-base,memory-pack,normal-chat-scene');
+assert.equal(blockIds(chatPromptDetails).slice(0, 4).join(','), 'scene-base,memory-pack,rich-chat-actions,normal-chat-scene');
 const proactivePromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。', proactive: true, returnPromptDetails: true });
 assert.ok(proactivePromptDetails.system.startsWith(RP_PRESETS.combined.prompt), '主动私聊必须完整发送综合 RP 预设');
 assert.ok(blockIds(proactivePromptDetails).includes('proactive-time-context'));

@@ -218,9 +218,47 @@ function cleanReply(text) {
   return String(text || '')
     .replace(/<al_schedule>[\s\S]*?<\/al_schedule>/gi, '')
     .replace(/<al_payment>[\s\S]*?<\/al_payment>/gi, '')
+    .replace(/<al_send_payment>[\s\S]*?<\/al_send_payment>/gi, '')
     .replace(/^```(?:json)?|```$/gim, '')
     .replace(/^【发送时间[^】]*】\s*/gm, '')
     .trim();
+}
+
+function extractAssistantPaymentDirective(text) {
+  const match = String(text || '').match(/<al_send_payment>([\s\S]*?)<\/al_send_payment>/i);
+  if (!match) return null;
+  try {
+    const json = JSON.parse(match[1].trim());
+    const type = String(json.type || '').trim().toLowerCase();
+    const amount = Math.round(Number(json.amount) * 100) / 100;
+    if (!['redpacket', 'transfer'].includes(type) || !Number.isFinite(amount) || amount <= 0) return null;
+    return { type, amount, note: String(json.note || '').replace(/\s+/g, ' ').trim().slice(0, 80) };
+  } catch {
+    return null;
+  }
+}
+
+function appendIncomingPayment(chat, directive, sourceId, extra = {}) {
+  if (!chat || !directive || !sourceId) return null;
+  const id = `incoming_${directive.type}_${sourceId}`;
+  const existing = (chat.messages || []).find(message => message.id === id);
+  if (existing) return existing;
+  const time = Date.now();
+  const message = {
+    id,
+    role: 'assistant',
+    type: directive.type,
+    payType: directive.type,
+    payDirection: 'incoming',
+    amount: directive.amount,
+    note: directive.note || '',
+    payStatus: 'pending',
+    payExpiresAt: time + 24 * 60 * 60 * 1000,
+    time,
+    ...extra
+  };
+  chat.messages.push(message);
+  return message;
 }
 
 function splitReply(text) {
@@ -290,7 +328,14 @@ function appendMemoryEvent(state, charId, title, detail, type) {
   state.memory = state.memory || {};
   state.memory.events = Array.isArray(state.memory.events) ? state.memory.events : [];
   const at = new Date().toISOString();
-  state.memory.events.push({ id: `evt_bg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, charId, happenedAt: at, type, title, detail, status: 'stable', importance: 3, keywords: type === 'moment' ? ['朋友圈', '主动动态'] : ['主动消息', '私聊'], createdAt: Date.now() });
+  const keywords = type === 'moment' ? ['朋友圈', '主动动态'] : type === 'payment' ? ['支付', '红包', '转账'] : ['主动消息', '私聊'];
+  state.memory.events.push({ id: `evt_bg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`, charId, happenedAt: at, type, title, detail, status: 'stable', importance: type === 'payment' ? 4 : 3, keywords, createdAt: Date.now() });
+}
+
+function appendIncomingPaymentMemory(state, charId, char, player, directive) {
+  if (!directive) return;
+  const label = directive.type === 'redpacket' ? '红包' : '转账';
+  appendMemoryEvent(state, charId, `${char.name}发出${label}`, `${char.name}给${player}发来${label}，金额 ${directive.amount}${directive.note ? `，备注“${directive.note}”` : ''}，当前等待领取。`, 'payment');
 }
 
 async function runChat(state, payload, char, chat, prepared) {
@@ -301,10 +346,13 @@ async function runChat(state, payload, char, chat, prepared) {
   const messages = visibleMessages(chat, 30, now);
   messages.push({ role: 'user', content: `【内部主动触发，不是${prepared.playerName}发来的消息】现在由${char.name}主动发一段微信私聊。${payload.mode === 'dice' ? `${prepared.playerName}仍未回复此前的主动消息，不要自问自答，也不要机械催促。` : ''}只输出${char.name}真正发送的文字。` });
   const raw = await callModel(apiConfig(state.settings || {}, 'chat'), system, messages, Number(state.settings?.maxTokens) || 1000);
+  const assistantPayment = extractAssistantPaymentDirective(raw);
   const chunks = splitReply(raw);
-  if (!chunks.length) throw new Error('chat model returned empty reply');
+  if (!chunks.length && !assistantPayment) throw new Error('chat model returned empty reply');
   const base = Date.now();
   chunks.forEach((content, index) => chat.messages.push({ id: `msg_bg_${base}_${index}`, role: 'assistant', content, time: base + index * 700, proactive: true, proactiveMode: payload.mode === 'dice' ? 'dice' : 'planned' }));
+  appendIncomingPayment(chat, assistantPayment, payload.jobId || `proactive_${base}`, { proactive: true, proactiveMode: payload.mode === 'dice' ? 'dice' : 'planned' });
+  appendIncomingPaymentMemory(state, payload.charId, char, prepared.playerName, assistantPayment);
   chat.unread = (Number(chat.unread) || 0) + chunks.length;
   chat.lastProactiveAt = base;
   chat.lastProactiveChatAt = base;
@@ -312,7 +360,8 @@ async function runChat(state, payload, char, chat, prepared) {
   delete chat.pendingProactiveJob;
   appendMemoryEvent(state, payload.charId, '主动私聊', `${char.name}在${new Date(base).toISOString()}主动发来：“${chunks.join(' / ')}”`, 'fact');
   await scheduleNext(state, payload.charId, 'chat');
-  notify(char.name || 'AL', chunks[0] + (chunks.length > 1 ? ' ...' : ''), payload, false);
+  const notificationBody = chunks[0] || (assistantPayment?.type === 'redpacket' ? '发来一个红包' : '发来一笔转账');
+  notify(char.name || 'AL', notificationBody + (chunks.length > 1 ? ' ...' : ''), payload, false);
 }
 
 function parseMomentText(raw) {
@@ -392,8 +441,9 @@ async function runUserReply(state, task) {
   const system = `${prepared.userReplySystem}${memoryPack ? `\n\n【记忆 AI 本次筛选结果】\n${memoryPack}` : ''}\n\n当前设备时间：${formatLocalTime(now)}。只输出${char.name}真正发出的微信消息。`;
   const messages = visibleMessages(chat, 30, now);
   const raw = await callModel(apiConfig(state.settings || {}, 'chat'), system, messages, Number(state.settings?.maxTokens) || 1000);
+  const assistantPayment = extractAssistantPaymentDirective(raw);
   const chunks = splitReply(raw);
-  if (!chunks.length) throw new Error('chat model returned empty reply');
+  if (!chunks.length && !assistantPayment) throw new Error('chat model returned empty reply');
   const base = Date.now();
   chunks.forEach((content, index) => chat.messages.push({
     id: `msg_reply_${task.userMessageId}_${index}`,
@@ -402,13 +452,16 @@ async function runUserReply(state, task) {
     time: base + index * 700,
     replyToMessageId: task.userMessageId
   }));
+  appendIncomingPayment(chat, assistantPayment, task.userMessageId, { replyToMessageId: task.userMessageId });
+  appendIncomingPaymentMemory(state, task.charId, char, prepared.playerName, assistantPayment);
   delete chat.pendingReply;
   delete userMessage.replyState;
   delete userMessage.replyError;
   task.status = 'done';
   task.completedAt = base;
   task.error = '';
-  if (!appIsActive()) notify(char.name || 'AL', chunks[0] + (chunks.length > 1 ? ' ...' : ''), { ...task, jobId: task.taskId, kind: 'reply' }, false);
+  const notificationBody = chunks[0] || (assistantPayment?.type === 'redpacket' ? '发来一个红包' : '发来一笔转账');
+  if (!appIsActive()) notify(char.name || 'AL', notificationBody + (chunks.length > 1 ? ' ...' : ''), { ...task, jobId: task.taskId, kind: 'reply' }, false);
   return chunks;
 }
 
