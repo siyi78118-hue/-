@@ -1231,7 +1231,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-12.74';
+const APP_BUILD_VERSION = '2026-07-12.75';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -1533,6 +1533,18 @@ async function openExternalUrl(url) {
   const Browser = window.Capacitor?.Plugins?.Browser;
   if (isNativeApp() && Browser?.open) return Browser.open({ url });
   window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+async function closeStaleUpdateBrowser() {
+  if (typeof window === 'undefined') return false;
+  const Browser = window.Capacitor?.Plugins?.Browser;
+  if (!isNativeApp() || !Browser?.close) return false;
+  try {
+    await Browser.close();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function fetchLatestAndroidRelease() {
@@ -2465,12 +2477,39 @@ function fmtTime(ts) {
   const sameDay = d.toDateString() === n.toDateString();
   return sameDay ? d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
 }
+const avatarObjectUrlCache = new Map();
+function cachedAvatarObjectUrl(cacheKey, dataUrl) {
+  const source = String(dataUrl || '');
+  if (!source || !source.startsWith('data:') || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return source;
+  const key = String(cacheKey || 'avatar');
+  const cached = avatarObjectUrlCache.get(key);
+  if (cached?.source === source) return cached.url;
+  if (cached?.url) URL.revokeObjectURL(cached.url);
+  try {
+    const comma = source.indexOf(',');
+    if (comma < 0) return source;
+    const header = source.slice(5, comma);
+    const payload = source.slice(comma + 1);
+    const mime = header.split(';')[0] || 'image/jpeg';
+    const binary = /;base64/i.test(header) ? atob(payload) : decodeURIComponent(payload);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    avatarObjectUrlCache.set(key, { source, url });
+    return url;
+  } catch (err) {
+    console.warn('[AL Avatar] object URL fallback:', err.message);
+    return source;
+  }
+}
 function avatarHtml(c, cls = 'avatar') {
-  const content = c?.avatarData ? `<img src="${c.avatarData}" alt="">` : esc(c?.avatar || c?.name?.slice(0,1) || 'R');
+  const src = c?.avatarData ? cachedAvatarObjectUrl(`char:${c.id || c.name || 'unknown'}`, c.avatarData) : '';
+  const content = src ? `<img src="${src}" alt="">` : esc(c?.avatar || c?.name?.slice(0,1) || 'R');
   return `<div class="${cls}">${content}</div>`;
 }
 function playerAvatarContent() {
-  return settings.playerAvatarData ? `<img src="${settings.playerAvatarData}" alt="">` : esc(settings.playerAvatar || playerName().slice(0, 1) || '我');
+  const src = settings.playerAvatarData ? cachedAvatarObjectUrl('player', settings.playerAvatarData) : '';
+  return src ? `<img src="${src}" alt="">` : esc(settings.playerAvatar || playerName().slice(0, 1) || '我');
 }
 function playerAvatarHtml(cls = 'avatar') {
   return `<div class="${cls}">${playerAvatarContent()}</div>`;
@@ -8325,8 +8364,15 @@ async function syncFromServiceWorkerState() {
   checkProactiveMessages().catch(err => console.warn('[AL Timer] immediate proactive check skipped:', err.message));
 }
 async function bootApp() {
+  await closeStaleUpdateBrowser();
   refreshAppVersionDisplay();
   if (isNativeApp()) await ensureNativePushListeners().catch(err => console.warn('[AL Native] push listeners skipped:', err.message));
+  if (isNativeApp()) {
+    const App = window.Capacitor?.Plugins?.App;
+    App?.addListener?.('appStateChange', state => {
+      if (state?.isActive) closeStaleUpdateBrowser();
+    });
+  }
   refreshNativeCloudRegistration().catch(err => console.warn('[AL Native] cloud capability refresh skipped:', err.message));
   await syncFromServiceWorkerState();
   refreshAllStoredCharacterPrompts();
