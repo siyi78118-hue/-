@@ -130,6 +130,23 @@ function cleanApiKey(value) {
     .trim();
 }
 
+function apiEndpoint(value, route) {
+  const raw = String(value || '').trim();
+  if (!/^https?:\/\//i.test(raw)) throw new Error('invalid API base URL');
+  const parsed = new URL(raw);
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '').replace(/\/(?:chat\/completions|messages|models)$/i, '');
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString().replace(/\/+$/, '') + '/' + String(route || '').replace(/^\/+/, '');
+}
+
+function rejectHtmlApiResponse(raw, response, endpoint = '') {
+  const contentType = String(response?.headers?.get?.('content-type') || '');
+  if (/text\/html/i.test(contentType) || /^\s*(?:<!doctype\s+html|<html\b)/i.test(String(raw || ''))) {
+    throw new Error(`API returned HTML page${endpoint ? `: ${endpoint}` : ''}`);
+  }
+}
+
 async function recordModelCall(entry = {}) {
   try {
     const startedAt = Number(entry.startedAt) || Date.now();
@@ -1224,13 +1241,15 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
   let diagnostic = '';
   if (apiType === 'claude') {
     try {
-      const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
+      const endpoint = apiEndpoint(apiUrl, 'messages');
+      const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
         body: JSON.stringify({ model, system, messages, max_tokens: MEMORY_MAX_TOKENS, temperature: 0.2 })
       }, API_TIMEOUT_MS);
-      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
+      rejectHtmlApiResponse(raw, resp, endpoint);
+      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${raw.slice(0, 120)}`);
       try {
         const json = JSON.parse(raw);
         text = extractResponseText(json) || parseJsonFallbackText(raw);
@@ -1245,13 +1264,15 @@ async function callBackgroundMemoryJSON(settings = {}, system, user, options = {
     }
   } else {
     try {
-      const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
+      const endpoint = apiEndpoint(apiUrl, 'chat/completions');
+      const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
         body: JSON.stringify({ model, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: MEMORY_MAX_TOKENS })
       }, API_TIMEOUT_MS);
-      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
+      rejectHtmlApiResponse(raw, resp, endpoint);
+      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${raw.slice(0, 120)}`);
       try {
         const json = JSON.parse(raw);
         text = extractResponseText(json) || parseJsonFallbackText(raw);
@@ -1405,11 +1426,13 @@ async function callModel(settings, system, messages, options = {}) {
   if (apiType === 'claude') {
     let resp;
     try {
-      resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
+      const endpoint = apiEndpoint(apiUrl, 'messages');
+      resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
         body: JSON.stringify({ model: model || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: useStream })
       }, API_TIMEOUT_MS);
+      rejectHtmlApiResponse('', resp, endpoint);
       if (!resp.ok) throw new Error('API ' + resp.status);
       if (useStream) {
         const text = await readStreamText(resp);
@@ -1422,6 +1445,7 @@ async function callModel(settings, system, messages, options = {}) {
       throw err;
     }
     const raw = await resp.text();
+    rejectHtmlApiResponse(raw, resp);
     try {
       const json = JSON.parse(raw);
       const text = extractResponseText(json) || parseJsonFallbackText(raw);
@@ -1437,11 +1461,13 @@ async function callModel(settings, system, messages, options = {}) {
   }
   let resp;
   try {
-    resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
+    const endpoint = apiEndpoint(apiUrl, 'chat/completions');
+    resp = await fetchWithTimeout(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
       body: JSON.stringify({ model: model || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: useStream })
     }, API_TIMEOUT_MS);
+    rejectHtmlApiResponse('', resp, endpoint);
     if (!resp.ok) throw new Error('API ' + resp.status);
     if (useStream) {
       const text = await readStreamText(resp);
@@ -1454,6 +1480,7 @@ async function callModel(settings, system, messages, options = {}) {
     throw err;
   }
   const raw = await resp.text();
+  rejectHtmlApiResponse(raw, resp);
   try {
     const json = JSON.parse(raw);
     const text = extractResponseText(json) || parseJsonFallbackText(raw);

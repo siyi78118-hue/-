@@ -1,5 +1,5 @@
 const RUNNER_STATE_KEY = 'state_json';
-const PENDING_PUSH_KEY = 'pending_push';
+const PENDING_PUSH_QUEUE_KEY = 'pending_push_queue';
 const DICE_INTERVAL_MS = 10 * 60 * 1000;
 const DICE_CHANCE = 0.05;
 const MAX_DICE_ROLLS = 432;
@@ -22,6 +22,26 @@ function readJson(key, fallback = null) {
 function writeState(state) {
   state.updatedAt = Date.now();
   CapacitorKV.set(RUNNER_STATE_KEY, JSON.stringify(state));
+}
+
+function pendingPushQueue() {
+  const queue = readJson(PENDING_PUSH_QUEUE_KEY, []);
+  return Array.isArray(queue) ? queue : [];
+}
+
+function dequeuePendingPush() {
+  const queue = pendingPushQueue();
+  const payload = queue.shift() || null;
+  CapacitorKV.set(PENDING_PUSH_QUEUE_KEY, JSON.stringify(queue));
+  return payload;
+}
+
+function requeuePendingPush(payload) {
+  if (!payload) return;
+  const queue = pendingPushQueue();
+  const jobId = String(payload.jobId || '');
+  if (!jobId || !queue.some(item => String(item?.jobId || '') === jobId)) queue.unshift(payload);
+  CapacitorKV.set(PENDING_PUSH_QUEUE_KEY, JSON.stringify(queue));
 }
 
 function asBool(value) {
@@ -89,6 +109,13 @@ function cleanKey(value) {
   return String(value || '').replace(/[\u200B-\u200D\uFEFF\r\n\t]/g, '').trim();
 }
 
+function apiEndpoint(value, route) {
+  const raw = String(value || '').trim();
+  if (!/^https?:\/\//i.test(raw)) throw new Error('API address must be an absolute URL');
+  const base = raw.split(/[?#]/, 1)[0].replace(/\/+$/, '').replace(/\/(?:chat\/completions|messages|models)$/i, '');
+  return base + '/' + String(route || '').replace(/^\/+/, '');
+}
+
 function extractText(value) {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) return value.map(item => extractText(item?.text ?? item?.content ?? item)).join('');
@@ -112,7 +139,7 @@ async function callModel(config, system, messages, maxTokens) {
   const url = String(config.url || '').replace(/\/+$/, '');
   const key = cleanKey(config.key);
   if (!url || !key || !config.model) throw new Error('API config missing');
-  const endpoint = type === 'claude' ? `${url}/messages` : `${url}/chat/completions`;
+  const endpoint = apiEndpoint(url, type === 'claude' ? 'messages' : 'chat/completions');
   const headers = type === 'claude'
     ? { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' }
     : { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
@@ -122,6 +149,9 @@ async function callModel(config, system, messages, maxTokens) {
   const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) });
   const raw = await response.text();
   if (!response.ok) throw new Error(`API ${response.status}: ${raw.slice(0, 160)}`);
+  if (/text\/html/i.test(String(response.headers?.get?.('content-type') || '')) || /^\s*(?:<!doctype\s+html|<html\b)/i.test(raw)) {
+    throw new Error(`API returned HTML page: ${endpoint}`);
+  }
   let json;
   try { json = JSON.parse(raw); } catch { return raw.trim(); }
   return responseText(json);
@@ -163,9 +193,14 @@ async function retrieveMemory(state, charId, query) {
   const config = apiConfig(state.settings || {}, 'memory');
   if (!config.url || !config.key || !config.model) return fallbackMemoryPack(rows);
   const system = `你是 AL 的记忆检索 AI。根据当前任务，从候选记忆中挑选真正有助于角色本次行为的内容。\n必须保留事件发生时间，禁止把昨天改写成今天。\n不要把无关琐事塞入结果。不要使用“用户、角色”代称，保留双方昵称。\n只输出选中的记忆，每行一条；没有相关记忆可输出“无相关记忆”。`;
-  const output = await callModel(config, system, [{ role: 'user', content: `当前任务：\n${query}\n\n候选记忆：\n${candidates}` }], 1400);
-  if (!output || /无相关记忆/.test(output)) return '';
-  return output.slice(0, 5000);
+  try {
+    const output = await callModel(config, system, [{ role: 'user', content: `当前任务：\n${query}\n\n候选记忆：\n${candidates}` }], 1400);
+    if (!output || /无相关记忆/.test(output)) return '';
+    return output.slice(0, 5000);
+  } catch (err) {
+    console.warn('[AL Background] memory API fallback:', err?.message || err);
+    return fallbackMemoryPack(rows);
+  }
 }
 
 function cleanReply(text) {
@@ -212,6 +247,22 @@ async function scheduleNext(state, charId, kind) {
     body: JSON.stringify({ deviceId: settings.deviceId, charId, type: 'proactive', ...job })
   });
   if (!response.ok) throw new Error(`schedule ${response.status}`);
+}
+
+async function acknowledgeCloudJob(state, payload, outcome = 'generated') {
+  const settings = state?.settings || {};
+  if (!settings.timerEndpoint || !settings.deviceId || !payload?.jobId) return false;
+  try {
+    const response = await fetch(`${String(settings.timerEndpoint).replace(/\/+$/, '')}/ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: settings.deviceId, jobId: payload.jobId, charId: payload.charId || '', kind: payload.kind || 'chat', outcome })
+    });
+    return response.ok;
+  } catch (err) {
+    console.warn('[AL Background] cloud ack failed:', err?.message || err);
+    return false;
+  }
 }
 
 function appendMemoryEvent(state, charId, title, detail, type) {
@@ -285,7 +336,12 @@ async function runRemoteNotification(payload) {
   if (!char || !chat?.messages?.length || !prepared) throw new Error('character background snapshot missing');
   const jobKey = payload.kind === 'moment' ? 'pendingMomentJob' : 'pendingProactiveJob';
   const localJob = chat[jobKey];
-  if (!asBool(payload.test) && payload.jobId && localJob?.jobId && payload.jobId !== localJob.jobId) return;
+  if (!asBool(payload.test) && payload.jobId && localJob?.jobId && payload.jobId !== localJob.jobId) {
+    await acknowledgeCloudJob(state, payload, 'stale');
+    return;
+  }
+  state.settings.cloudTimerLastStatus = `FCM 后台已收到${payload.kind === 'moment' ? '朋友圈' : '私聊'}任务，正在生成。`;
+  state.settings.cloudTimerLastStatusAt = Date.now();
   try {
     if (payload.kind === 'moment') await runMoment(state, payload, char, chat, prepared);
     else await runChat(state, payload, char, chat, prepared);
@@ -300,6 +356,7 @@ async function runRemoteNotification(payload) {
   } finally {
     writeState(state);
   }
+  await acknowledgeCloudJob(state, payload, 'generated');
 }
 
 addEventListener('syncState', (resolve, reject, args) => {
@@ -319,10 +376,14 @@ addEventListener('readState', (resolve, reject) => {
 });
 
 addEventListener('remoteNotification', (resolve, reject) => {
-  const payload = readJson(PENDING_PUSH_KEY, {});
+  const payload = dequeuePendingPush();
+  if (!payload) {
+    resolve({ ok: true, skipped: true });
+    return;
+  }
   runRemoteNotification(payload)
-    .then(() => { CapacitorKV.remove(PENDING_PUSH_KEY); resolve({ ok: true }); })
-    .catch(err => { console.error('[AL Background]', err); reject(err); });
+    .then(() => resolve({ ok: true, jobId: payload.jobId || '' }))
+    .catch(err => { requeuePendingPush(payload); console.error('[AL Background]', err); reject(err); });
 });
 
 addEventListener('backgroundTick', (resolve) => resolve({ ok: true }));

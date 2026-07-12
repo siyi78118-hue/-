@@ -25,10 +25,11 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-11.10';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-12.11';
 const RECENT_EVENT_LIMIT = 40;
 const IDLE_CRON_HEARTBEAT_MINUTES = 10;
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
+const FCM_ACK_MAX_ATTEMPTS = 8;
 
 export default {
   async fetch(request, env) {
@@ -52,6 +53,7 @@ export default {
           transport: isFcm ? 'fcm' : 'webpush',
           fcmToken: isFcm ? String(body.fcmToken) : '',
           subscription: isFcm ? null : body.subscription,
+          backgroundAck: isFcm ? Math.max(0, Number(body.capabilities?.backgroundAck) || 0) : 0,
           updatedAt: Date.now()
         }));
         await appendEvent(env, { type: 'register', deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', ok: true });
@@ -92,6 +94,16 @@ export default {
         await appendEvent(env, { type: 'cancel', deviceId: shortId(body.deviceId || ''), jobId: body.jobId || '', ok: true });
         return json({ ok: true });
       }
+      if (request.method === 'POST' && url.pathname === '/ack') {
+        const body = await request.json();
+        if (!body.jobId || !body.deviceId) throw new Error('missing jobId/deviceId');
+        const raw = await env.AL_TIMER_KV.get(`job:${body.jobId}`);
+        const job = raw ? JSON.parse(raw) : null;
+        if (job && job.deviceId !== body.deviceId) throw new Error('device mismatch');
+        await cancelJob(body.jobId, env);
+        await appendEvent(env, { type: 'ack', deviceId: shortId(body.deviceId || job?.deviceId || ''), jobId: body.jobId, charId: body.charId || job?.charId || '', kind: body.kind || job?.kind || '', outcome: body.outcome || 'generated', ok: true });
+        return json({ ok: true, acknowledged: !!job });
+      }
       if (request.method === 'POST' && url.pathname === '/trigger') {
         const body = await request.json();
         if (!body.deviceId) throw new Error('missing deviceId');
@@ -105,7 +117,8 @@ export default {
         job.kind = job.kind || body.kind || (String(job.jobId || '').startsWith('mom_') ? 'moment' : 'chat');
         job.test = !!(job.test || body.test);
         const delivered = await deliverJob(job, env);
-        if (job.jobId && !delivered.retry) await cancelJob(job.jobId, env);
+        if (job.jobId && !delivered.retry && !delivered.awaitingAck) await cancelJob(job.jobId, env);
+        if (job.jobId && delivered.awaitingAck) await deferForFcmAck(job, env);
         await appendEvent(env, { type: 'manual-trigger', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId, kind: job.kind, ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, payload: delivered.payload !== false });
         return json({ ok: delivered.ok, delivered });
       }
@@ -274,8 +287,12 @@ async function runDueMinute(env, minute) {
     }
     try {
       const delivered = await deliverJob(job, env);
-      await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, payload: delivered.payload !== false });
-      if (delivered.retry) {
+      await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, awaitingAck: !!delivered.awaitingAck, payload: delivered.payload !== false });
+      if (delivered.awaitingAck) {
+        stats.delivered += 1;
+        const deferred = await deferForFcmAck(job, env);
+        if (!deferred) stats.failed += 1;
+      } else if (delivered.retry) {
         stats.retry += 1;
         remaining.push(jobId);
       } else {
@@ -302,6 +319,25 @@ function minuteKey(ms) {
   return Math.ceil(ms / 60000);
 }
 
+async function deferForFcmAck(job, env) {
+  const attempts = Math.max(0, Number(job.deliveryAttempts) || 0) + 1;
+  if (attempts > FCM_ACK_MAX_ATTEMPTS) {
+    await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
+    await appendEvent(env, { type: 'ack-timeout', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', attempts, ok: false, reason: 'phone did not acknowledge background generation' });
+    return false;
+  }
+  const delayMinutes = Math.min(60, 5 * Math.pow(2, Math.min(4, attempts - 1)));
+  await saveJob({
+    ...job,
+    dueAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
+    deliveryAttempts: attempts,
+    awaitingAck: true,
+    lastPushedAt: Date.now(),
+    updatedAt: Date.now()
+  }, env);
+  return true;
+}
+
 async function deliverJob(job, env) {
   const subRaw = await env.AL_TIMER_KV.get(`sub:${job.deviceId}`);
   if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
@@ -325,7 +361,7 @@ async function deliverJob(job, env) {
     return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: false };
   }
   if (!result.ok) return { ok: false, reason: result.reason || 'push failed', jobId: job.jobId, retry: true };
-  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false };
+  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false, awaitingAck: result.transport === 'fcm' && Number(target.backgroundAck) >= 1, transport: result.transport || '' };
 }
 
 async function getRecentEvents(env) {

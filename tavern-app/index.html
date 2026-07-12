@@ -1233,7 +1233,7 @@ const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
   'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@update-channel/android-update.json'
 ];
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-11.10';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-12.11';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -2029,6 +2029,30 @@ function assertHeaderSafe(value, label = 'Key') {
     if (text.charCodeAt(i) > 255) throw new Error(`${label} 含有中文、全角空格或不可见特殊字符，请重新复制纯文本 Key`);
   }
   return text;
+}
+function normalizeApiBaseUrl(value, label = '接口') {
+  const raw = String(value || '').trim();
+  if (!raw) throw new Error(`${label}地址为空`);
+  if (!/^https?:\/\//i.test(raw)) throw new Error(`${label}地址必须是以 http:// 或 https:// 开头的完整地址`);
+  let parsed;
+  try { parsed = new URL(raw); } catch { throw new Error(`${label}地址格式不正确`); }
+  const path = parsed.pathname.replace(/\/+$/, '');
+  if (/github\.io$/i.test(parsed.hostname) && /\/tavern-app(?:\/|$)/i.test(path)) {
+    throw new Error(`${label}地址指向了 AL 网页，不是模型接口；请重新填写服务商提供的 API 地址`);
+  }
+  parsed.pathname = path.replace(/\/(?:chat\/completions|messages|models)$/i, '');
+  parsed.search = '';
+  parsed.hash = '';
+  return parsed.toString().replace(/\/+$/, '');
+}
+function apiEndpoint(value, route, label = '接口') {
+  return normalizeApiBaseUrl(value, label) + '/' + String(route || '').replace(/^\/+/, '');
+}
+function throwIfHtmlApiResponse(raw, response, label, endpoint) {
+  const contentType = String(response?.headers?.get?.('content-type') || '');
+  if (/text\/html/i.test(contentType) || /^\s*(?:<!doctype\s+html|<html\b)/i.test(String(raw || ''))) {
+    throw new Error(`${label}请求落到了网页而不是模型接口：${endpoint}。请检查地址是否填写了正确的 API 根路径`);
+  }
 }
 function pad2(n) { return String(n).padStart(2, '0'); }
 function getDayPeriod(date = new Date()) {
@@ -5211,14 +5235,16 @@ async function callMemoryJSON(system, user, options = {}) {
   const messages = [{ role: 'user', content: user }];
   if (apiType === 'claude') {
     try {
-      const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', {
+      const endpoint = apiEndpoint(apiUrl, 'messages', api.label);
+      const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
         body: JSON.stringify({ model: settings.memoryModel, system, messages, max_tokens: MEMORY_MAX_TOKENS, temperature: 0.2 }),
         signal: options.signal
       }, API_TIMEOUT_MS);
-      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
+      throwIfHtmlApiResponse(raw, resp, api.label, endpoint);
+      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${raw.slice(0, 120)}`);
       try {
         const json = JSON.parse(raw);
         text = extractResponseText(json) || parseJsonFallbackText(raw);
@@ -5233,14 +5259,16 @@ async function callMemoryJSON(system, user, options = {}) {
     }
   } else {
     try {
-      const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', {
+      const endpoint = apiEndpoint(apiUrl, 'chat/completions', api.label);
+      const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
         body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: MEMORY_MAX_TOKENS }),
         signal: options.signal
       }, API_TIMEOUT_MS);
-      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
       const raw = await resp.text();
+      throwIfHtmlApiResponse(raw, resp, api.label, endpoint);
+      if (!resp.ok) throw new Error(`记忆 API ${resp.status}: ${raw.slice(0, 120)}`);
       try {
         const json = JSON.parse(raw);
         text = extractResponseText(json) || parseJsonFallbackText(raw);
@@ -6095,6 +6123,8 @@ function formatCloudTimerEvent(event = {}) {
     event.dueAt ? `due=${fmtTime(event.dueAt)}` : '',
     `结果=${ok}`,
     event.retry ? '会重试' : '',
+    event.awaitingAck ? '等待手机回执' : '',
+    event.outcome ? `回执=${String(event.outcome).slice(0, 24)}` : '',
     event.payload === false ? '空push兜底' : (event.payload === true ? '带payload' : ''),
     event.reason ? `原因=${String(event.reason).slice(0, 40)}` : '',
     event.jobsSeen != null ? `任务=${Number(event.jobsSeen) || 0}` : '',
@@ -6207,6 +6237,22 @@ async function requestNativeFcmToken() {
   await PushNotifications.register();
   return tokenPromise;
 }
+async function registerNativeCloudTarget(token) {
+  if (!settings.timerEndpoint || !settings.deviceId || !token) return false;
+  const resp = await fetchWithTimeout(timerUrl('/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: settings.deviceId, transport: 'fcm', fcmToken: token, capabilities: { backgroundAck: 1 } })
+  }, API_TIMEOUT_MS);
+  if (!resp.ok) throw new Error('FCM 云闹钟注册失败：' + resp.status);
+  return true;
+}
+async function refreshNativeCloudRegistration() {
+  if (!isNativeApp() || !settings.cloudTimerEnabled || !settings.nativeFcmToken || !settings.timerEndpoint) return false;
+  settings.deviceId = ensureDeviceId();
+  await registerNativeCloudTarget(settings.nativeFcmToken);
+  return true;
+}
 async function enableNativeCloudTimer() {
   if (!settings.timerEndpoint) throw new Error('请先填写闹钟地址');
   const token = await requestNativeFcmToken();
@@ -6219,12 +6265,7 @@ async function enableNativeCloudTimer() {
   settings.cloudTimerEnabled = true;
   settings.proactiveEnabled = true;
   DB.set('settings', settings);
-  const resp = await fetchWithTimeout(timerUrl('/register'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ deviceId: settings.deviceId, transport: 'fcm', fcmToken: token })
-  }, API_TIMEOUT_MS);
-  if (!resp.ok) throw new Error('FCM 云闹钟注册失败：' + resp.status);
+  await registerNativeCloudTarget(token);
   await mirrorAppStateNow();
   await ensureCloudProactiveScheduled({ force: true });
   setCloudTimerStatus('安卓原生 FCM 已绑定；AL 关闭后也可由系统唤醒。');
@@ -7393,9 +7434,12 @@ async function fetchModels(slot = 'chat') {
     const headers = apiType === 'claude'
       ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
       : { 'Authorization': `Bearer ${apiKey}` };
-    const resp = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/models', { method: 'GET', headers }, API_TIMEOUT_MS);
+    const endpoint = apiEndpoint(apiUrl, 'models', api.label);
+    const resp = await fetchWithTimeout(endpoint, { method: 'GET', headers }, API_TIMEOUT_MS);
+    const rawText = await resp.text();
+    throwIfHtmlApiResponse(rawText, resp, api.label, endpoint);
     if (!resp.ok) throw new Error('模型接口返回 ' + resp.status);
-    const json = await resp.json();
+    const json = JSON.parse(rawText);
     const raw = Array.isArray(json) ? json : (json.data || json.models || []);
     const models = raw.map(m => typeof m === 'string' ? m : (m.id || m.name || m.display_name)).filter(Boolean);
     if (!models.length) throw new Error('未读取到模型列表');
@@ -7429,12 +7473,18 @@ async function testConnection(slot = 'chat') {
   toast(`正在测试${api.label}...`, 900);
   try {
     if (apiType === 'claude') {
-      const r = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/messages', { method:'POST', headers:{ 'Content-Type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01' }, body:JSON.stringify({ model, messages:[{ role:'user', content:'Hi' }], max_tokens:10 }) }, API_TIMEOUT_MS);
+      const endpoint = apiEndpoint(apiUrl, 'messages', api.label);
+      const r = await fetchWithTimeout(endpoint, { method:'POST', headers:{ 'Content-Type':'application/json', 'x-api-key':apiKey, 'anthropic-version':'2023-06-01' }, body:JSON.stringify({ model, messages:[{ role:'user', content:'Hi' }], max_tokens:10 }) }, API_TIMEOUT_MS);
+      const raw = await r.text();
+      throwIfHtmlApiResponse(raw, r, api.label, endpoint);
       const message = r.ok ? '连接成功' : `连接失败：HTTP ${r.status}`;
       setApiHealthStatus(slot, message);
       toast(r.ok ? `${api.label}连接成功` : `${api.label}连接失败：` + r.status);
     } else {
-      const r = await fetchWithTimeout(apiUrl.replace(/\/+$/, '') + '/chat/completions', { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${apiKey}` }, body:JSON.stringify({ model, messages:[{ role:'user', content:'Hi' }], max_tokens:10 }) }, API_TIMEOUT_MS);
+      const endpoint = apiEndpoint(apiUrl, 'chat/completions', api.label);
+      const r = await fetchWithTimeout(endpoint, { method:'POST', headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${apiKey}` }, body:JSON.stringify({ model, messages:[{ role:'user', content:'Hi' }], max_tokens:10 }) }, API_TIMEOUT_MS);
+      const raw = await r.text();
+      throwIfHtmlApiResponse(raw, r, api.label, endpoint);
       const message = r.ok ? '连接成功' : `连接失败：HTTP ${r.status}`;
       setApiHealthStatus(slot, message);
       toast(r.ok ? `${api.label}连接成功` : `${api.label}连接失败：` + r.status);
@@ -7881,6 +7931,7 @@ async function syncFromServiceWorkerState() {
 async function bootApp() {
   refreshAppVersionDisplay();
   if (isNativeApp()) await ensureNativePushListeners().catch(err => console.warn('[AL Native] push listeners skipped:', err.message));
+  refreshNativeCloudRegistration().catch(err => console.warn('[AL Native] cloud capability refresh skipped:', err.message));
   await syncFromServiceWorkerState();
   refreshAllStoredCharacterPrompts();
   let chatStateChanged = false;
