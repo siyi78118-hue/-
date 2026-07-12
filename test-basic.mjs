@@ -31,11 +31,11 @@ assert.match(androidReplyQueuePlugin, /getString\("taskId"\)/);
 assert.match(androidReplyQueuePlugin, /putString\("event",\s*"pendingUserReply"\)/);
 assert.match(androidReplyQueuePlugin, /setRequiredNetworkType\(NetworkType\.CONNECTED\)/);
 assert.match(androidReplyQueuePlugin, /enqueueUniqueWork\([\s\S]*ExistingWorkPolicy\.KEEP/);
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v80';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v81';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-12\.73';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-12\.74';/);
 assert.match(script, /等待 FCM Token 超时，请确认 Google Play 服务可以联网后重试/);
 assert.match(script, /\}, API_TIMEOUT_MS\);/);
 assert.match(script, /绑定步骤 3\/3：已取得 FCM Token/);
@@ -104,6 +104,7 @@ assert.match(script, /window\.Capacitor\?\.Plugins\?\.AlReplyQueue/);
 assert.match(script, /queuePlugin\?\.enqueue/);
 assert.match(script, /if \(isNativeApp\(\)\) return queueAndroidUserReply\(requestCharId, message\.id/);
 assert.match(script, /const reply = await callAPI\(chat, memoryPack, \{[\s\S]*live: false/);
+assert.doesNotMatch(script, /callAPI\(chat, memoryPack, \{ charId, live: true, proactive: true/);
 assert.doesNotMatch(script, /await mirrorAppStateNow\(\); \} catch \(err\) \{ console\.warn\('\[AL Timer\] user turn state mirror skipped/);
 assert.match(script, /const messages = sceneMessagesForAI\(chat, 30,/);
 assert.match(script, /finally \{[\s\S]*processMemoryAfterTurn\(requestCharId\)/);
@@ -790,10 +791,11 @@ globalThis.__appTest = {
   claimIncomingPayment,
   refuseIncomingPayment,
   refreshPaymentExpirations,
+  mirrorAppState,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
 
 const aiPaymentText = '拿去买杯喝的😏\n<al_send_payment>{"type":"redpacket","amount":20.5,"note":"奶茶"}</al_send_payment>';
 assert.deepEqual(JSON.parse(JSON.stringify(extractAssistantPaymentDirective(aiPaymentText))), { type: 'redpacket', amount: 20.5, note: '奶茶' });
@@ -902,6 +904,37 @@ const expiredIncomingPaymentProbe = vm.runInContext(`(() => {
 assert.equal(expiredIncomingPaymentProbe.refused, false, '过期后不能再执行拒收动作');
 assert.equal(expiredIncomingPaymentProbe.message.payStatus, 'expired');
 assert.equal(expiredIncomingPaymentProbe.balance, 30, '过期不得增加玩家余额');
+
+const mirrorSingleFlightProbe = await vm.runInContext(`(async () => {
+  const savedMirrorNow = mirrorAppStateNow;
+  const savedPendingCounter = pendingNativeReplyCount;
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  mirrorAppStateNow = async () => {
+    calls++;
+    active++;
+    maxActive = Math.max(maxActive, active);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    active--;
+  };
+  pendingNativeReplyCount = () => 0;
+  if (mirrorTimer) clearTimeout(mirrorTimer);
+  mirrorTimer = null;
+  mirrorRunning = null;
+  mirrorRequested = false;
+  mirrorWaiters = [];
+  const results = await Promise.race([
+    Promise.all([mirrorAppState(), mirrorAppState(), mirrorAppState()]).then(() => 'done'),
+    new Promise(resolve => setTimeout(() => resolve('timeout'), 500))
+  ]);
+  mirrorAppStateNow = savedMirrorNow;
+  pendingNativeReplyCount = savedPendingCounter;
+  return { results, calls, maxActive };
+})()`, context);
+assert.equal(mirrorSingleFlightProbe.results, 'done', '合并掉的镜像调用也必须结束 Promise');
+assert.ok(mirrorSingleFlightProbe.calls <= 2, '三次同时调用最多只允许当前批次与一次合并补跑');
+assert.equal(mirrorSingleFlightProbe.maxActive, 1, '整库镜像不得并发');
 
 const memoryQueueProbe = await vm.runInContext(`(async () => {
   const original = processMemoryBatch;

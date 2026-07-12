@@ -1229,7 +1229,7 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-12.73';
+const APP_BUILD_VERSION = '2026-07-12.74';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -1767,6 +1767,9 @@ async function importBackup(event) {
 }
 
 let mirrorTimer = null;
+let mirrorRunning = null;
+let mirrorRequested = false;
+let mirrorWaiters = [];
 function nativeBackgroundRunner() {
   return isNativeApp()
     ? (window.Capacitor?.Plugins?.CapacitorBackgroundRunner || window.Capacitor?.Plugins?.BackgroundRunner)
@@ -1881,6 +1884,7 @@ function stopNativeReplyPollingIfIdle() {
   nativeReplyPollTimer = null;
   nativeReplyQueuedIds.clear();
   isStreaming = false;
+  if (mirrorRequested || mirrorWaiters.length) scheduleAppStateMirror();
   return true;
 }
 
@@ -1987,13 +1991,38 @@ async function mirrorAppStateNow() {
   try { await syncNativeBackgroundState(); } catch (err) { console.warn('[AL Native] state sync skipped:', err.message); }
 }
 async function mirrorAppState() {
-  if (mirrorTimer) clearTimeout(mirrorTimer);
-  return new Promise(resolve => {
-    mirrorTimer = setTimeout(() => {
-      mirrorTimer = null;
-      mirrorAppStateNow().finally(resolve);
-    }, 60);
+  mirrorRequested = true;
+  const promise = new Promise((resolve, reject) => {
+    mirrorWaiters.push({ resolve, reject });
   });
+  scheduleAppStateMirror();
+  return promise;
+}
+function scheduleAppStateMirror(delay = 60) {
+  if (mirrorTimer || mirrorRunning) return;
+  mirrorTimer = setTimeout(runScheduledAppStateMirror, delay);
+}
+async function runScheduledAppStateMirror() {
+  if (mirrorTimer) clearTimeout(mirrorTimer);
+  mirrorTimer = null;
+  if (mirrorRunning) return;
+  if (typeof pendingNativeReplyCount === 'function' && pendingNativeReplyCount() > 0) {
+    return;
+  }
+  if (!mirrorRequested) return;
+  mirrorRequested = false;
+  const batch = mirrorWaiters;
+  mirrorWaiters = [];
+  mirrorRunning = mirrorAppStateNow();
+  try {
+    await mirrorRunning;
+    batch.forEach(waiter => waiter.resolve(true));
+  } catch (err) {
+    batch.forEach(waiter => waiter.reject(err));
+  } finally {
+    mirrorRunning = null;
+    if (mirrorRequested || mirrorWaiters.length) scheduleAppStateMirror();
+  }
 }
 function mergeLocalPendingReplies(remoteChats = {}, localChats = {}) {
   const remote = remoteChats && typeof remoteChats === 'object' ? remoteChats : {};
@@ -7092,9 +7121,9 @@ async function triggerProactiveMessage(charId, manual = false, triggerMode = 'pl
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊正在请求聊天模型。', true, 'chat');
     const reply = manual
-      ? await callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode })
+      ? await callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode })
       : await retryTransient(
-          () => callAPI(chat, memoryPack, { charId, live: true, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode }),
+          () => callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode }),
           {
             retries: 2,
             delayMs: 3500,
