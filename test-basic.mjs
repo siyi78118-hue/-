@@ -144,6 +144,8 @@ assert.match(script, /function retractMessage\(charId, messageId\)/);
 assert.match(script, /function deleteChatMessage\(charId, messageId\)/);
 assert.match(script, /replyToMessageId: userMessageId/);
 assert.doesNotMatch(script, /content: `（\$\{friendlyErrorMessage\(err\)\}）`/);
+assert.match(html, /class="message-retry"/);
+assert.match(script, /async function retryFailedReply\(charId, userMessageId\)/);
 assert.match(html, /data-memory-action="edit"/);
 assert.match(script, /function bindMemoryListActions\(list\)/);
 assert.match(script, /const query = await generateMemoryQuery\(char, userInput, recent, scene, options\)/);
@@ -778,10 +780,11 @@ globalThis.__appTest = {
   proactiveDefaultScheduleOptions,
   proactiveDicePlan,
   buildAndroidUserReplyTask,
+  retryFailedReply,
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, RP_PRESETS } = context.__appTest;
 
 const durableTask = buildAndroidUserReplyTask('char-a', 'message-a', '刚忙完', { paymentMessageId: 'pay-a', payment: { kind: 'redpacket', amount: 8.8, note: '晚安' } }, 1234);
 assert.equal(durableTask.taskId, 'reply_message-a');
@@ -807,6 +810,34 @@ const completedNativeMerge = mergeLocalPendingReplies({
 });
 assert.equal(completedNativeMerge['char-a'].pendingReply, undefined, '后台已经回复后不得恢复前台旧 pending 状态');
 assert.equal(completedNativeMerge['char-a'].messages.filter(row => row.replyToMessageId === 'message-a').length, 1);
+
+const retryProbe = await vm.runInContext(`(async () => {
+  const savedChats = allChats;
+  const savedContinue = continueAssistantTurn;
+  const savedScreen = activeScreen;
+  const calls = [];
+  allChats = {
+    retry_char: {
+      messages: [{ id: 'retry-user', role: 'user', content: '再试一次', time: 1, replyState: 'failed', replyError: 'timeout' }],
+      pendingReply: { userMessageId: 'retry-user', userText: '再试一次', state: 'failed', options: { paymentMessageId: 'pay-original' } }
+    }
+  };
+  activeScreen = 'settings';
+  continueAssistantTurn = async (charId, text, options) => { calls.push({ charId, text, options }); return 'ok'; };
+  const before = allChats.retry_char.messages.length;
+  const result = await retryFailedReply('retry_char', 'retry-user');
+  const after = allChats.retry_char.messages.length;
+  const message = { ...allChats.retry_char.messages[0] };
+  allChats = savedChats;
+  continueAssistantTurn = savedContinue;
+  activeScreen = savedScreen;
+  return { result, before, after, calls, message };
+})()`, context);
+assert.equal(retryProbe.result, true);
+assert.equal(retryProbe.before, retryProbe.after, '重新发送不得复制玩家气泡');
+assert.equal(retryProbe.calls[0].options.userMessageId, 'retry-user');
+assert.equal(retryProbe.calls[0].options.paymentMessageId, 'pay-original');
+assert.equal(retryProbe.message.replyState, 'pending');
 
 const memoryQueueProbe = await vm.runInContext(`(async () => {
   const original = processMemoryBatch;
