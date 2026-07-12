@@ -6,6 +6,7 @@ process.env.TZ = 'Asia/Shanghai';
 
 const html = readFileSync('tavern-app/index.html', 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
+const apiEndpointHelper = readFileSync('tavern-app/lib/api-endpoint.js', 'utf8');
 assert.ok(script, 'index.html should contain an inline app script');
 const swScript = readFileSync('tavern-app/sw-v11.js', 'utf8');
 const cloudTimerWorker = readFileSync('cloud-timer-worker.js', 'utf8');
@@ -36,7 +37,8 @@ assert.match(script, /GitHub 更新服务暂时限流/);
 assert.match(script, /async function checkForAppUpdate\(\)/);
 assert.match(script, /覆盖安装会保留聊天、记忆和 API 设置/);
 assert.match(script, /function normalizeApiBaseUrl\(value, label = '接口'\)/);
-assert.match(script, /请求落到了网页而不是模型接口/);
+assert.match(html, /<script src="lib\/api-endpoint\.js"><\/script>/);
+assert.match(apiEndpointHelper, /请求落到了网页而不是模型接口/);
 assert.match(script, /capabilities: \{ backgroundAck: 1 \}/);
 assert.match(script, /refreshNativeCloudRegistration\(\)/);
 assert.match(swScript, /API returned HTML page/);
@@ -655,6 +657,7 @@ const context = {
     removeItem: key => storage.delete(key),
   },
   navigator: {},
+  location: { origin: 'https://localhost' },
   document: {
     body: element('body'),
     createElement: () => element(`created-${elements.size}`),
@@ -666,7 +669,7 @@ const context = {
 const modelListFetch = context.fetch;
 
 vm.createContext(context);
-vm.runInContext(`${script}
+vm.runInContext(`${apiEndpointHelper}\n${script}
 globalThis.__appTest = {
   parseCharacterCard,
   buildCharPrompt,
