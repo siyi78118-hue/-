@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 
@@ -20,7 +20,17 @@ const androidManifest = readFileSync('android/app/src/main/AndroidManifest.xml',
 const androidBuildGradle = readFileSync('android/app/build.gradle', 'utf8');
 const androidWorkflow = readFileSync('.github/workflows/android-apk.yml', 'utf8');
 const androidFcmService = readFileSync('android/app/src/main/java/com/siyi/al/AlFirebaseMessagingService.java', 'utf8');
+const androidMainActivity = readFileSync('android/app/src/main/java/com/siyi/al/MainActivity.java', 'utf8');
+const androidReplyQueuePath = 'android/app/src/main/java/com/siyi/al/AlReplyQueuePlugin.java';
+const androidReplyQueuePlugin = existsSync(androidReplyQueuePath) ? readFileSync(androidReplyQueuePath, 'utf8') : '';
 const nativeBackgroundRunner = readFileSync('tavern-app/runners/al-background.js', 'utf8');
+assert.match(androidMainActivity, /registerPlugin\(AlReplyQueuePlugin\.class\)/);
+assert.match(androidReplyQueuePlugin, /@CapacitorPlugin\(name\s*=\s*"AlReplyQueue"\)/);
+assert.match(androidReplyQueuePlugin, /@PluginMethod[\s\S]*void enqueue\(PluginCall call\)/);
+assert.match(androidReplyQueuePlugin, /getString\("taskId"\)/);
+assert.match(androidReplyQueuePlugin, /putString\("event",\s*"pendingUserReply"\)/);
+assert.match(androidReplyQueuePlugin, /setRequiredNetworkType\(NetworkType\.CONNECTED\)/);
+assert.match(androidReplyQueuePlugin, /enqueueUniqueWork\([\s\S]*ExistingWorkPolicy\.KEEP/);
 assert.match(swScript, /const CACHE_NAME = 'rpchat-v80';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
