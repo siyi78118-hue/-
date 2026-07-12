@@ -1,5 +1,6 @@
 const RUNNER_STATE_KEY = 'state_json';
 const PENDING_PUSH_QUEUE_KEY = 'pending_push_queue';
+const PENDING_USER_REPLY_QUEUE_KEY = 'pending_user_reply_queue';
 const DICE_INTERVAL_MS = 10 * 60 * 1000;
 const DICE_CHANCE = 0.05;
 const MAX_DICE_ROLLS = 432;
@@ -347,9 +348,13 @@ async function runMoment(state, payload, char, chat, prepared) {
   notify(char.name || 'AL', `发了一条朋友圈：${text}`, payload, true);
 }
 
-function userReplyTaskRows(state) {
-  state.pendingUserReplies = Array.isArray(state.pendingUserReplies) ? state.pendingUserReplies : [];
-  return state.pendingUserReplies;
+function userReplyTaskRows() {
+  const rows = readJson(PENDING_USER_REPLY_QUEUE_KEY, []);
+  return Array.isArray(rows) ? rows : [];
+}
+
+function writeUserReplyTaskRows(rows) {
+  CapacitorKV.set(PENDING_USER_REPLY_QUEUE_KEY, JSON.stringify(Array.isArray(rows) ? rows.slice(-30) : []));
 }
 
 function userMessageForTask(chat, task) {
@@ -410,15 +415,18 @@ async function runUserReply(state, task) {
 async function runPendingUserReplies() {
   const state = readJson(RUNNER_STATE_KEY, null);
   if (!state?.settings || !state?.allChats) throw new Error('local background snapshot missing');
-  const task = userReplyTaskRows(state).find(item => item?.status === 'pending' || item?.status === 'running');
+  const tasks = userReplyTaskRows();
+  const task = tasks.find(item => item?.status === 'pending' || item?.status === 'running');
   if (!task) return [];
   const chat = state.allChats?.[task.charId];
   const userMessage = userMessageForTask(chat, task);
   task.status = 'running';
   task.startedAt = Date.now();
+  writeUserReplyTaskRows(tasks);
   writeState(state);
   try {
     const chunks = await runUserReply(state, task);
+    writeUserReplyTaskRows(tasks);
     writeState(state);
     return chunks;
   } catch (err) {
@@ -435,6 +443,7 @@ async function runPendingUserReplies() {
       userMessage.replyError = task.error;
     }
     notify('AL', '回复生成失败，点此重试', { ...task, jobId: task.taskId, kind: 'reply' }, false);
+    writeUserReplyTaskRows(tasks);
     writeState(state);
     throw err;
   }
@@ -518,6 +527,23 @@ addEventListener('pendingUserReply', (resolve, reject) => {
   runPendingUserReplies()
     .then(chunks => resolve({ ok: true, count: chunks.length }))
     .catch(err => { console.error('[AL Background Reply]', err); reject(err); });
+});
+
+addEventListener('queueUserReply', (resolve, reject, args) => {
+  try {
+    const raw = args?.task || args?.dataArgs?.task;
+    const task = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!task?.taskId || !task?.charId || !task?.userMessageId) throw new Error('reply task missing');
+    const rows = userReplyTaskRows();
+    const index = rows.findIndex(item => item?.taskId === task.taskId);
+    const next = { ...task, status: 'pending', error: '', queuedAt: Date.now() };
+    if (index >= 0) rows[index] = next;
+    else rows.push(next);
+    writeUserReplyTaskRows(rows);
+    resolve({ ok: true, taskId: next.taskId });
+  } catch (err) {
+    reject(err);
+  }
 });
 
 addEventListener('backgroundTick', (resolve) => resolve({ ok: true }));

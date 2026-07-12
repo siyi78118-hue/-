@@ -48,7 +48,6 @@ function createHarness({ queue, failChat = false, pendingUserReplies = [] } = {}
         momentMessages: [{ role: 'user', content: '根据现在的生活发一条朋友圈。' }]
       }
     },
-    pendingUserReplies,
     updatedAt: now
   };
   rows.set('state_json', JSON.stringify(state));
@@ -56,6 +55,7 @@ function createHarness({ queue, failChat = false, pendingUserReplies = [] } = {}
     { type: 'proactive', deviceId: 'device-a', charId: 'char-a', jobId: 'chat-job', kind: 'chat', mode: 'planned' },
     { type: 'proactive', deviceId: 'device-a', charId: 'char-a', jobId: 'moment-job', kind: 'moment', mode: 'dice' }
   ]));
+  rows.set('pending_user_reply_queue', JSON.stringify(pendingUserReplies));
 
   const context = {
     console,
@@ -104,10 +104,10 @@ function createHarness({ queue, failChat = false, pendingUserReplies = [] } = {}
     rows,
     fetchCalls,
     notifications,
-    async dispatch(name) {
+    async dispatch(name, args = {}) {
       const handler = handlers.get(name);
       assert.ok(handler, `missing handler ${name}`);
-      return new Promise((resolve, reject) => handler(resolve, reject, {}));
+      return new Promise((resolve, reject) => handler(resolve, reject, args));
     }
   };
 }
@@ -160,7 +160,7 @@ test('a pending user reply runs memory before chat and persists one reply for th
   const replies = saved.allChats['char-a'].messages.filter(row => row.replyToMessageId === 'user-2');
   assert.equal(replies.length, 2);
   assert.deepEqual(replies.map(row => row.content), ['刚看到', '还没睡？']);
-  assert.equal(saved.pendingUserReplies[0].status, 'done');
+  assert.equal(JSON.parse(harness.rows.get('pending_user_reply_queue'))[0].status, 'done');
   assert.equal(saved.allChats['char-a'].pendingReply, undefined);
   assert.equal(saved.allChats['char-a'].messages.find(row => row.id === 'user-2').replyState, undefined);
   const modelCalls = harness.fetchCalls.filter(row => /memory\.example|chat\.example/.test(row.url));
@@ -186,9 +186,20 @@ test('a failed pending user reply remains retryable and uses the ordinary reply 
   await assert.rejects(harness.dispatch('pendingUserReply'), /chat provider offline/);
 
   const saved = JSON.parse(harness.rows.get('state_json'));
-  assert.equal(saved.pendingUserReplies[0].status, 'failed');
+  assert.equal(JSON.parse(harness.rows.get('pending_user_reply_queue'))[0].status, 'failed');
   assert.equal(saved.allChats['char-a'].messages.find(row => row.id === 'user-2').replyState, 'failed');
   assert.match(saved.allChats['char-a'].messages.find(row => row.id === 'user-2').replyError, /chat provider offline/);
   assert.equal(harness.notifications.at(-1).body, '回复生成失败，点此重试');
   assert.doesNotMatch(harness.notifications.at(-1).body, /主动消息/);
+});
+
+test('queueUserReply persists a task independently from general state snapshots', async () => {
+  const harness = createHarness({ pendingUserReplies: [] });
+  await harness.dispatch('queueUserReply', {
+    task: JSON.stringify({ taskId: 'reply-user-9', charId: 'char-a', userMessageId: 'user-9', userText: '回来了吗', status: 'pending' })
+  });
+  const queue = JSON.parse(harness.rows.get('pending_user_reply_queue'));
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0].taskId, 'reply-user-9');
+  assert.equal(queue[0].status, 'pending');
 });

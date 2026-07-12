@@ -1355,6 +1355,8 @@ let voiceChunks = [];
 let voiceStream = null;
 let voiceStartAt = 0;
 let voiceRecordingCharId = '';
+let nativeReplyPollTimer = null;
+const nativeReplyQueuedIds = new Set();
 const EMPTY_REPLY_TEXT = '（对方没有回复）';
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 
@@ -1768,8 +1770,8 @@ function nativeBackgroundRunner() {
     ? (window.Capacitor?.Plugins?.CapacitorBackgroundRunner || window.Capacitor?.Plugins?.BackgroundRunner)
     : null;
 }
-async function buildNativeBackgroundSnapshot() {
-  const memory = await dumpMemoryStores();
+async function buildNativeBackgroundSnapshot(options = {}) {
+  const memory = options.memory || await dumpMemoryStores();
   if (Array.isArray(memory.meta)) {
     memory.meta = memory.meta.filter(row => !['app_state', 'call_logs'].includes(row?.key));
   }
@@ -1787,10 +1789,15 @@ async function buildNativeBackgroundSnapshot() {
       memoryPack: '',
       returnPromptDetails: true
     });
+    const userReplyPrompt = buildChatSceneSystem(char, chat, {
+      memoryPack: '',
+      returnPromptDetails: true
+    });
     const momentPrompt = buildMomentPostPayload(char, chat, '');
     prepared[char.id] = {
       charName: char.name || 'AL',
       playerName: playerName(),
+      userReplySystem: userReplyPrompt.system,
       chatSystem: chatPrompt.system,
       chatMessages: sceneMessagesForAI(chat, 30, { withTime: true, now }),
       momentSystem: momentPrompt.system,
@@ -1799,16 +1806,147 @@ async function buildNativeBackgroundSnapshot() {
   }
   return { settings, characters, allChats, allMoments, memory, prepared, updatedAt: Date.now() };
 }
-async function syncNativeBackgroundState() {
+async function syncNativeBackgroundState(stateOverride = null) {
   const runner = nativeBackgroundRunner();
   if (!runner?.dispatchEvent) return false;
-  const state = await buildNativeBackgroundSnapshot();
+  const state = stateOverride || await buildNativeBackgroundSnapshot();
   await runner.dispatchEvent({
     label: 'com.siyi.al.background',
     event: 'syncState',
     details: { state: JSON.stringify(state) }
   });
   return true;
+}
+
+function buildAndroidUserReplyTask(charId, userMessageId, userText, options = {}, createdAt = Date.now()) {
+  return {
+    taskId: `reply_${userMessageId}`,
+    charId,
+    userMessageId,
+    userText: String(userText || ''),
+    options: {
+      paymentMessageId: options.paymentMessageId || '',
+      payment: options.payment || null
+    },
+    status: 'pending',
+    createdAt
+  };
+}
+
+async function dumpCharacterMemoryForRunner(charId) {
+  const [summaries, events, profiles] = await Promise.all([
+    MemoryDB.byChar('summaries', charId),
+    MemoryDB.byChar('events', charId),
+    MemoryDB.byChar('profiles', charId)
+  ]);
+  return { summaries, events, profiles, vectors: [], meta: [] };
+}
+
+async function buildAndroidUserReplySnapshot(charId, task) {
+  const char = characters.find(item => item.id === charId);
+  const chat = allChats[charId];
+  if (!char || !chat) throw new Error('找不到待回复的角色或会话');
+  const memory = await dumpCharacterMemoryForRunner(charId);
+  const snapshot = await buildNativeBackgroundSnapshot({ memory });
+  const prompt = buildChatSceneSystem(char, chat, {
+    payment: task.options?.payment || null,
+    memoryPack: '',
+    returnPromptDetails: true
+  });
+  snapshot.prepared[charId] = {
+    ...(snapshot.prepared[charId] || {}),
+    charName: char.name || 'AL',
+    playerName: playerName(),
+    userReplySystem: prompt.system
+  };
+  return snapshot;
+}
+
+function nativeReplyQueuePlugin() {
+  return isNativeApp() ? window.Capacitor?.Plugins?.AlReplyQueue : null;
+}
+
+function pendingNativeReplyCount() {
+  return Object.values(allChats || {}).filter(chat => {
+    const pending = chat?.pendingReply;
+    return pending && ['pending', 'running'].includes(pending.state);
+  }).length;
+}
+
+function stopNativeReplyPollingIfIdle() {
+  if (pendingNativeReplyCount()) return false;
+  if (nativeReplyPollTimer) clearInterval(nativeReplyPollTimer);
+  nativeReplyPollTimer = null;
+  nativeReplyQueuedIds.clear();
+  isStreaming = false;
+  return true;
+}
+
+async function reconcileNativeReplyState() {
+  const changed = await restoreNativeBackgroundState().catch(err => {
+    console.warn('[AL Native Reply] state restore skipped:', err.message);
+    return false;
+  });
+  if (!changed) return false;
+  resumePendingAssistantTurns();
+  stopNativeReplyPollingIfIdle();
+  if (activeScreen === 'chat') renderMessages();
+  renderChats();
+  return true;
+}
+
+function startNativeReplyPolling() {
+  if (!isNativeApp() || nativeReplyPollTimer) return;
+  nativeReplyPollTimer = setInterval(() => {
+    reconcileNativeReplyState().catch(err => console.warn('[AL Native Reply] poll skipped:', err.message));
+  }, 1000);
+}
+
+async function queueAndroidUserReply(charId, userMessageId, options = {}) {
+  const chat = allChats[charId];
+  const userMessage = messageById(chat, userMessageId);
+  if (!chat || !messageAvailableToAI(userMessage)) return false;
+  if ((chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === userMessageId)) return true;
+  const runner = nativeBackgroundRunner();
+  const queuePlugin = nativeReplyQueuePlugin();
+  if (!runner?.dispatchEvent || !queuePlugin?.enqueue) throw new Error('安卓后台回复组件不可用，请更新或重新安装 AL');
+  const task = buildAndroidUserReplyTask(charId, userMessageId, userMessage.content, options, Number(chat.pendingReply?.createdAt) || Date.now());
+  chat.pendingReply = {
+    userMessageId,
+    userText: task.userText,
+    options: task.options,
+    state: 'pending',
+    createdAt: task.createdAt,
+    updatedAt: Date.now()
+  };
+  userMessage.replyState = 'pending';
+  delete userMessage.replyError;
+  nativeReplyQueuedIds.add(task.taskId);
+  isStreaming = true;
+  DB.set('chats', allChats);
+  if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
+  try {
+    const snapshot = await buildAndroidUserReplySnapshot(charId, task);
+    await syncNativeBackgroundState(snapshot);
+    await runner.dispatchEvent({
+      label: 'com.siyi.al.background',
+      event: 'queueUserReply',
+      details: { task: JSON.stringify(task) }
+    });
+    await queuePlugin.enqueue({ taskId: task.taskId, charId });
+    startNativeReplyPolling();
+    return true;
+  } catch (err) {
+    nativeReplyQueuedIds.delete(task.taskId);
+    chat.pendingReply.state = 'failed';
+    chat.pendingReply.error = friendlyErrorMessage(err);
+    userMessage.replyState = 'failed';
+    userMessage.replyError = friendlyErrorMessage(err);
+    isStreaming = false;
+    DB.set('chats', allChats);
+    if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
+    return false;
+  }
 }
 async function restoreNativeBackgroundState() {
   const runner = nativeBackgroundRunner();
@@ -1856,19 +1994,28 @@ async function mirrorAppState() {
   });
 }
 function mergeLocalPendingReplies(remoteChats = {}, localChats = {}) {
-  const merged = remoteChats && typeof remoteChats === 'object' ? remoteChats : {};
+  const remote = remoteChats && typeof remoteChats === 'object' ? remoteChats : {};
+  const merged = { ...(localChats || {}), ...remote };
   Object.entries(localChats || {}).forEach(([charId, localChat]) => {
     const localPending = localChat?.pendingReply;
     if (!localPending || !['pending', 'running'].includes(localPending.state)) return;
     const localMessage = messageById(localChat, localPending.userMessageId);
     if (!messageAvailableToAI(localMessage)) return;
-    const remoteChat = merged[charId] || {};
+    const remoteChat = remote[charId] || {};
     const messagesById = new Map();
-    [...(remoteChat.messages || []), ...(localChat.messages || [])].forEach(message => {
+    [...(localChat.messages || []), ...(remoteChat.messages || [])].forEach(message => {
       ensureMessageIdentity(message);
       messagesById.set(message.id, message);
     });
     const messages = [...messagesById.values()].sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
+    const remoteAnswered = messages.some(message => message.role === 'assistant' && message.replyToMessageId === localPending.userMessageId);
+    const remoteUserMessage = messages.find(message => message.id === localPending.userMessageId);
+    const remoteFailed = remoteUserMessage?.replyState === 'failed' || remoteChat.pendingReply?.state === 'failed';
+    if (remoteAnswered || remoteFailed) {
+      merged[charId] = { ...localChat, ...remoteChat, messages };
+      if (remoteAnswered) delete merged[charId].pendingReply;
+      return;
+    }
     Object.entries(remoteChat).forEach(([key, value]) => {
       if (!['messages', 'pendingReply'].includes(key)) localChat[key] = value;
     });
@@ -4766,10 +4913,10 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
   let completed = false;
   const run = (async () => {
     try {
-      try { await mirrorAppStateNow(); } catch (err) { console.warn('[AL Timer] user turn state mirror skipped:', err.message); }
+      mirrorAppState().catch(err => console.warn('[AL State] user turn mirror skipped:', err.message));
       const memoryPack = await prepareMemoryPackSafe(requestCharId, userText, 'chat', { signal: controller.signal });
       if (controller.signal.aborted || !messageAvailableToAI(userMessage)) return '';
-      const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), signal: controller.signal });
+      const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), signal: controller.signal, live: false });
       clearStreamingDraft(requestCharId);
       if (controller.signal.aborted || !messageAvailableToAI(userMessage) || chat.pendingReply?.requestToken !== requestToken) return '';
       const proactiveSchedule = extractProactiveScheduleDirective(reply);
@@ -4840,7 +4987,13 @@ function resumePendingAssistantTurns() {
     pending.state = 'pending';
     pending.updatedAt = Date.now();
     const savedOptions = pending.options || {};
-    setTimeout(() => continueAssistantTurn(charId, pending.userText || message.content, { ...savedOptions, userMessageId: message.id, resumed: true }), 80);
+    if (isNativeApp()) {
+      const taskId = `reply_${message.id}`;
+      if (nativeReplyQueuedIds.has(taskId)) return;
+      setTimeout(() => queueAndroidUserReply(charId, message.id, savedOptions), 80);
+    } else {
+      setTimeout(() => continueAssistantTurn(charId, pending.userText || message.content, { ...savedOptions, userMessageId: message.id, resumed: true }), 80);
+    }
   });
 }
 function preservePendingRepliesForUnload() {
@@ -4920,6 +5073,7 @@ async function submitPayMessage() {
   if (noteInput) noteInput.value = '';
   showScreen('chat');
   renderMessages();
+  if (isNativeApp()) return queueAndroidUserReply(currentCharId, paymentMessage.id, { paymentMessageId, payment: { kind, amount, note } });
   await continueAssistantTurn(currentCharId, content, { userMessageId: paymentMessage.id, paymentMessageId, payment: { kind, amount, note } });
 }
 function uid(prefix) {
@@ -5765,6 +5919,7 @@ async function sendMessage() {
   const message = createPendingUserMessage(chat, text);
   DB.set('chats', allChats);
   renderMessages();
+  if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
   await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
 }
 function voiceButtonEl() {
@@ -5848,6 +6003,7 @@ async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
   if (reason) toast(reason, 2200);
+  if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
   await continueAssistantTurn(
     requestCharId,
     `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`
@@ -5866,6 +6022,7 @@ async function sendVoiceTranscriptMessage(transcript, duration) {
   const message = createPendingUserMessage(chat, text, { type: 'voice', transcript: text, voiceDuration: duration });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
   await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
 }
 async function sendVoiceMessage() {
