@@ -1809,7 +1809,7 @@ async function buildNativeBackgroundSnapshot(options = {}) {
       momentMessages: momentPrompt.messages
     };
   }
-  return { settings, characters, allChats, allMoments, memory, prepared, updatedAt: Date.now() };
+  return { settings, characters, allChats, allMoments, memory, memoryScope: options.memoryScope || null, prepared, updatedAt: Date.now() };
 }
 async function syncNativeBackgroundState(stateOverride = null) {
   const runner = nativeBackgroundRunner();
@@ -1844,7 +1844,7 @@ async function dumpCharacterMemoryForRunner(charId) {
     MemoryDB.byChar('events', charId),
     MemoryDB.byChar('profiles', charId)
   ]);
-  return { summaries, events, profiles, vectors: [], meta: [] };
+  return { summaries, events, profiles };
 }
 
 async function buildAndroidUserReplySnapshot(charId, task) {
@@ -1852,7 +1852,7 @@ async function buildAndroidUserReplySnapshot(charId, task) {
   const chat = allChats[charId];
   if (!char || !chat) throw new Error('找不到待回复的角色或会话');
   const memory = await dumpCharacterMemoryForRunner(charId);
-  const snapshot = await buildNativeBackgroundSnapshot({ memory });
+  const snapshot = await buildNativeBackgroundSnapshot({ memory, memoryScope: { type: 'character', charId } });
   const prompt = buildChatSceneSystem(char, chat, {
     payment: task.options?.payment || null,
     memoryPack: '',
@@ -1989,15 +1989,31 @@ async function restoreNativeBackgroundState() {
   localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
   localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
   localStorage.setItem('rpchat_app_state_updated_at', String(nativeState.updatedAt));
-  if (nativeState.memory) {
-    for (const store of ['summaries', 'events', 'profiles', 'vectors']) {
-      if (!Array.isArray(nativeState.memory[store])) continue;
-      await MemoryDB.clearStore(store);
-      for (const row of nativeState.memory[store]) if (row && typeof row === 'object') await MemoryDB.put(store, row);
-    }
-  }
+  await restoreNativeMemory(nativeState);
   completedReplyCharIds.forEach(charId => processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native reply update skipped:', err.message)));
   return true;
+}
+
+async function restoreNativeMemory(nativeState = {}) {
+  const memory = nativeState?.memory;
+  if (!memory || typeof memory !== 'object') return;
+  const scopedCharId = nativeState.memoryScope?.type === 'character'
+    ? String(nativeState.memoryScope.charId || '')
+    : '';
+  for (const store of ['summaries', 'events', 'profiles', 'vectors']) {
+    if (!Array.isArray(memory[store])) continue;
+    const incoming = memory[store].filter(row => row && typeof row === 'object');
+    if (!scopedCharId) {
+      await MemoryDB.clearStore(store);
+      for (const row of incoming) await MemoryDB.put(store, row);
+      continue;
+    }
+    const preserved = (await MemoryDB.all(store)).filter(row => row.charId !== scopedCharId);
+    await MemoryDB.clearStore(store);
+    for (const row of [...preserved, ...incoming.filter(row => row.charId === scopedCharId)]) {
+      await MemoryDB.put(store, row);
+    }
+  }
 }
 async function mirrorAppStateNow() {
   if (typeof MemoryDB === 'undefined') return;
