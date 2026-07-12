@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 
 const runnerSource = readFileSync('tavern-app/runners/al-background.js', 'utf8');
 
-function createHarness({ queue, failChat = false, pendingUserReplies = [], chatContent = '刚看到\n还没睡？', exposeUrl = true } = {}) {
+function createHarness({ queue, failChat = false, failNotifications = false, pendingUserReplies = [], chatContent = '刚看到\n还没睡？', exposeUrl = true } = {}) {
   const rows = new Map();
   const handlers = new Map();
   const fetchCalls = [];
@@ -68,7 +68,10 @@ function createHarness({ queue, failChat = false, pendingUserReplies = [], chatC
       remove(key) { rows.delete(key); }
     },
     CapacitorNotifications: {
-      schedule(items) { notifications.push(...items); }
+      schedule(items) {
+        if (failNotifications) throw new Error('notifications unavailable');
+        notifications.push(...items);
+      }
     },
     addEventListener(name, handler) { handlers.set(name, handler); },
     fetch: async (url, options = {}) => {
@@ -269,4 +272,22 @@ test('a pending reply works in the Android headless runtime without a browser UR
   const saved = JSON.parse(harness.rows.get('state_json'));
   assert.ok(saved.allChats['char-a'].messages.some(row => row.replyToMessageId === 'user-no-url'));
   assert.ok(harness.fetchCalls.some(row => row.url === 'https://chat.example/v1/chat/completions'));
+});
+
+test('notification failure never turns a completed background reply into a failed reply', async () => {
+  const now = Date.now();
+  const task = { taskId: 'reply-notify-fail', charId: 'char-a', userMessageId: 'user-notify-fail', userText: '忙完了吗', createdAt: now, status: 'pending' };
+  const harness = createHarness({ pendingUserReplies: [task], failNotifications: true });
+  const state = JSON.parse(harness.rows.get('state_json'));
+  state.allChats['char-a'].messages.push({ id: 'user-notify-fail', role: 'user', content: '忙完了吗', time: now, replyState: 'pending' });
+  state.allChats['char-a'].pendingReply = { userMessageId: 'user-notify-fail', userText: '忙完了吗', state: 'pending' };
+  harness.rows.set('state_json', JSON.stringify(state));
+
+  await harness.dispatch('pendingUserReply');
+
+  const saved = JSON.parse(harness.rows.get('state_json'));
+  const userMessage = saved.allChats['char-a'].messages.find(row => row.id === 'user-notify-fail');
+  assert.equal(userMessage.replyState, undefined);
+  assert.ok(saved.allChats['char-a'].messages.some(row => row.replyToMessageId === 'user-notify-fail'));
+  assert.equal(JSON.parse(harness.rows.get('pending_user_reply_queue'))[0].status, 'done');
 });

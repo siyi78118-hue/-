@@ -212,6 +212,8 @@ button{border:none;background:none;cursor:pointer}
 .message-failed{font-size:11px;color:#d64b3f;text-align:right;margin:-5px 50px 2px 0}
 .message-retry{margin-left:6px;padding:2px 5px;color:#576b95;font-size:11px;line-height:1.2;border-radius:3px;background:transparent}
 .message-retry:active{background:rgba(87,107,149,.1)}
+.message-failure-reason{margin-left:2px;padding:2px 5px;color:#576b95;font-size:11px;line-height:1.2;border-radius:3px;background:transparent}
+.message-failure-reason:active{background:rgba(87,107,149,.1)}
 .message-action-sheet{width:100%;max-width:520px;padding:0 0 calc(10px + var(--safe-bottom));background:#f7f7f7}
 .message-action-sheet button{display:block;width:100%;height:54px;border:0;border-bottom:1px solid #e5e5e5;background:#fff;font-size:16px;color:#111}
 .message-action-sheet button.danger{color:#d64b3f}
@@ -4832,7 +4834,7 @@ function renderMessages() {
     }
     if (m.role === 'user') {
       html += `<div class="msg-wrap me" ${messageAttrs}>${renderMessageBody(m)}${playerAvatarHtml('msg-avatar')}</div>`;
-      if (m.replyState === 'failed') html += `<div class="message-failed">未收到回复<button class="message-retry" type="button" onclick="retryFailedReply(currentCharId,'${esc(m.id || '')}')">重新发送</button></div>`;
+      if (m.replyState === 'failed') html += `<div class="message-failed">未收到回复<button class="message-failure-reason" type="button" onclick="showReplyFailureReason(currentCharId,'${esc(m.id || '')}')">查看原因</button><button class="message-retry" type="button" onclick="retryFailedReply(currentCharId,'${esc(m.id || '')}')">重新发送</button></div>`;
       const tip = (m.type === 'transfer' || m.type === 'redpacket') ? paymentStatusTip(m, char) : '';
       if (tip) html += `<div class="pay-status-tip">${esc(tip)}</div>`;
     } else {
@@ -5211,6 +5213,13 @@ async function retryFailedReply(charId, userMessageId) {
   if (isNativeApp()) return queueAndroidUserReply(charId, userMessageId, savedOptions);
   await continueAssistantTurn(charId, chat.pendingReply.userText, { ...savedOptions, userMessageId, resumed: true });
   return true;
+}
+function showReplyFailureReason(charId, messageId) {
+  const chat = allChats[charId];
+  const message = messageById(chat, messageId);
+  const reason = String(message?.replyError || (chat?.pendingReply?.userMessageId === messageId ? chat.pendingReply.error : '') || '没有记录到具体错误').trim();
+  toast(`失败原因：${reason}`, 5200);
+  return reason;
 }
 function resumePendingAssistantTurns() {
   Object.entries(allChats || {}).forEach(([charId, chat]) => {

@@ -158,6 +158,8 @@ assert.match(script, /replyToMessageId: userMessageId/);
 assert.doesNotMatch(script, /content: `（\$\{friendlyErrorMessage\(err\)\}）`/);
 assert.match(html, /class="message-retry"/);
 assert.match(script, /async function retryFailedReply\(charId, userMessageId\)/);
+assert.match(html, /class="message-failure-reason"/);
+assert.match(script, /function showReplyFailureReason\(charId, messageId\)/);
 assert.match(html, /data-memory-action="edit"/);
 assert.match(script, /function bindMemoryListActions\(list\)/);
 assert.match(script, /const query = await generateMemoryQuery\(char, userInput, recent, scene, options\)/);

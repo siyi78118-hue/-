@@ -289,7 +289,13 @@ function notificationId(seed) {
 }
 
 function notify(title, body, payload, moment) {
-  CapacitorNotifications.schedule([{ id: notificationId(payload.jobId || `${payload.charId}:${Date.now()}`), title, body, group: moment ? 'al-moments' : 'al-chat', autoCancel: true, extra: { charId: payload.charId || '', kind: payload.kind || 'chat' } }]);
+  try {
+    CapacitorNotifications.schedule([{ id: notificationId(payload.jobId || `${payload.charId}:${Date.now()}`), title, body, group: moment ? 'al-moments' : 'al-chat', autoCancel: true, extra: { charId: payload.charId || '', kind: payload.kind || 'chat' } }]);
+    return true;
+  } catch (err) {
+    console.warn('[AL Background] notification skipped:', err?.message || err);
+    return false;
+  }
 }
 
 function appIsActive() {
