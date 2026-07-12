@@ -236,6 +236,16 @@ function notify(title, body, payload, moment) {
   CapacitorNotifications.schedule([{ id: notificationId(payload.jobId || `${payload.charId}:${Date.now()}`), title, body, group: moment ? 'al-moments' : 'al-chat', autoCancel: true, extra: { charId: payload.charId || '', kind: payload.kind || 'chat' } }]);
 }
 
+function appIsActive() {
+  try {
+    const state = CapacitorApp?.getState?.();
+    const parsed = typeof state === 'string' ? JSON.parse(state) : state;
+    return !!parsed?.isActive;
+  } catch {
+    return false;
+  }
+}
+
 function geometricDicePlan(now = Date.now()) {
   const random = Math.max(Number.EPSILON, Math.min(1 - Number.EPSILON, Math.random()));
   const rolls = Math.max(1, Math.min(MAX_DICE_ROLLS, Math.floor(Math.log(1 - random) / Math.log(1 - DICE_CHANCE)) + 1));
@@ -337,6 +347,99 @@ async function runMoment(state, payload, char, chat, prepared) {
   notify(char.name || 'AL', `发了一条朋友圈：${text}`, payload, true);
 }
 
+function userReplyTaskRows(state) {
+  state.pendingUserReplies = Array.isArray(state.pendingUserReplies) ? state.pendingUserReplies : [];
+  return state.pendingUserReplies;
+}
+
+function userMessageForTask(chat, task) {
+  return (chat?.messages || []).find(message => message.id === task.userMessageId && message.role === 'user');
+}
+
+function taskAlreadyAnswered(chat, task) {
+  return (chat?.messages || []).some(message => message.role === 'assistant' && message.replyToMessageId === task.userMessageId);
+}
+
+async function runUserReply(state, task) {
+  const char = (state.characters || []).find(item => item.id === task.charId);
+  const chat = state.allChats?.[task.charId];
+  const prepared = state.prepared?.[task.charId];
+  const userMessage = userMessageForTask(chat, task);
+  if (!char || !chat || !prepared?.userReplySystem || !userMessage) throw new Error('user reply snapshot missing');
+  if (userMessage.deleted || userMessage.retracted) {
+    task.status = 'done';
+    task.completedAt = Date.now();
+    delete chat.pendingReply;
+    return [];
+  }
+  if (taskAlreadyAnswered(chat, task)) {
+    task.status = 'done';
+    task.completedAt = Date.now();
+    delete chat.pendingReply;
+    delete userMessage.replyState;
+    delete userMessage.replyError;
+    return [];
+  }
+
+  const now = new Date();
+  const query = `${prepared.playerName}刚在${formatLocalTime(now)}对${char.name}说：“${String(task.userText || userMessage.content || '').slice(0, 500)}”。筛选本轮真正相关的人物资料、承诺、关系变化、近期情绪和未完成事件。`;
+  const memoryPack = await retrieveMemory(state, task.charId, query);
+  const system = `${prepared.userReplySystem}${memoryPack ? `\n\n【记忆 AI 本次筛选结果】\n${memoryPack}` : ''}\n\n当前设备时间：${formatLocalTime(now)}。只输出${char.name}真正发出的微信消息。`;
+  const messages = visibleMessages(chat, 30, now);
+  const raw = await callModel(apiConfig(state.settings || {}, 'chat'), system, messages, Number(state.settings?.maxTokens) || 1000);
+  const chunks = splitReply(raw);
+  if (!chunks.length) throw new Error('chat model returned empty reply');
+  const base = Date.now();
+  chunks.forEach((content, index) => chat.messages.push({
+    id: `msg_reply_${task.userMessageId}_${index}`,
+    role: 'assistant',
+    content,
+    time: base + index * 700,
+    replyToMessageId: task.userMessageId
+  }));
+  delete chat.pendingReply;
+  delete userMessage.replyState;
+  delete userMessage.replyError;
+  task.status = 'done';
+  task.completedAt = base;
+  task.error = '';
+  if (!appIsActive()) notify(char.name || 'AL', chunks[0] + (chunks.length > 1 ? ' ...' : ''), { ...task, jobId: task.taskId, kind: 'reply' }, false);
+  return chunks;
+}
+
+async function runPendingUserReplies() {
+  const state = readJson(RUNNER_STATE_KEY, null);
+  if (!state?.settings || !state?.allChats) throw new Error('local background snapshot missing');
+  const task = userReplyTaskRows(state).find(item => item?.status === 'pending' || item?.status === 'running');
+  if (!task) return [];
+  const chat = state.allChats?.[task.charId];
+  const userMessage = userMessageForTask(chat, task);
+  task.status = 'running';
+  task.startedAt = Date.now();
+  writeState(state);
+  try {
+    const chunks = await runUserReply(state, task);
+    writeState(state);
+    return chunks;
+  } catch (err) {
+    task.status = 'failed';
+    task.error = String(err?.message || err).slice(0, 300);
+    task.failedAt = Date.now();
+    if (chat?.pendingReply) {
+      chat.pendingReply.state = 'failed';
+      chat.pendingReply.error = task.error;
+      chat.pendingReply.updatedAt = Date.now();
+    }
+    if (userMessage) {
+      userMessage.replyState = 'failed';
+      userMessage.replyError = task.error;
+    }
+    notify('AL', '回复生成失败，点此重试', { ...task, jobId: task.taskId, kind: 'reply' }, false);
+    writeState(state);
+    throw err;
+  }
+}
+
 async function runRemoteNotification(payload) {
   const state = readJson(RUNNER_STATE_KEY, null);
   if (!state?.settings || !state?.allChats) throw new Error('local background snapshot missing');
@@ -409,6 +512,12 @@ addEventListener('remoteNotification', (resolve, reject) => {
   drainPendingPushQueue()
     .then(jobIds => resolve({ ok: true, jobIds }))
     .catch(err => { console.error('[AL Background]', err); reject(err); });
+});
+
+addEventListener('pendingUserReply', (resolve, reject) => {
+  runPendingUserReplies()
+    .then(chunks => resolve({ ok: true, count: chunks.length }))
+    .catch(err => { console.error('[AL Background Reply]', err); reject(err); });
 });
 
 addEventListener('backgroundTick', (resolve) => resolve({ ok: true }));
