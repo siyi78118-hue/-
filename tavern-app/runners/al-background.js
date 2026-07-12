@@ -115,16 +115,33 @@ function apiEndpoint(value, route) {
   const raw = String(value || '').trim();
   if (!raw) throw new Error('API 地址为空');
   if (!/^https?:\/\//i.test(raw)) throw new Error('API address must be an absolute URL');
-  let parsed;
-  try { parsed = new URL(raw); } catch { throw new Error('API 地址格式不正确'); }
-  if (/github\.io$/i.test(parsed.hostname) && /\/(?:[^/]+\/)*tavern-app(?:\/|$)/i.test(parsed.pathname)) {
+  let hostname = '';
+  let pathname = '';
+  let base = '';
+  if (typeof URL === 'function') {
+    let parsed;
+    try { parsed = new URL(raw); } catch { throw new Error('API 地址格式不正确'); }
+    hostname = parsed.hostname;
+    pathname = parsed.pathname;
+    parsed.search = '';
+    parsed.hash = '';
+    base = parsed.toString().replace(/\/+$/, '');
+  } else {
+    const match = raw.match(/^(https?):\/\/([^/?#]+)(\/[^?#]*)?(?:\?[^#]*)?(?:#.*)?$/i);
+    if (!match) throw new Error('API 地址格式不正确');
+    const authority = match[2];
+    const hostPort = authority.slice(authority.lastIndexOf('@') + 1);
+    hostname = hostPort.startsWith('[')
+      ? hostPort.slice(1, hostPort.indexOf(']'))
+      : hostPort.split(':')[0];
+    pathname = match[3] || '';
+    base = `${match[1].toLowerCase()}://${authority}${pathname}`.replace(/\/+$/, '');
+  }
+  if (/github\.io$/i.test(hostname) && /\/(?:[^/]+\/)*tavern-app(?:\/|$)/i.test(pathname)) {
     throw new Error('API 地址指向了 AL 页面，不是模型接口');
   }
-  parsed.pathname = parsed.pathname.replace(/\/+$/, '').replace(/\/(?:chat\/completions|messages|models)$/i, '');
-  parsed.search = '';
-  parsed.hash = '';
-  const base = parsed.toString().replace(/\/+$/, '');
-  return base + '/' + String(route || '').replace(/^\/+/, '');
+  base = base.replace(/\/(?:chat\/completions|messages|models)$/i, '');
+  return base.replace(/\/+$/, '') + '/' + String(route || '').replace(/^\/+/, '');
 }
 
 function extractText(value) {

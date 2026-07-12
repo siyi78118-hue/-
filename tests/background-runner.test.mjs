@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 
 const runnerSource = readFileSync('tavern-app/runners/al-background.js', 'utf8');
 
-function createHarness({ queue, failChat = false, pendingUserReplies = [], chatContent = '刚看到\n还没睡？' } = {}) {
+function createHarness({ queue, failChat = false, pendingUserReplies = [], chatContent = '刚看到\n还没睡？', exposeUrl = true } = {}) {
   const rows = new Map();
   const handlers = new Map();
   const fetchCalls = [];
@@ -62,7 +62,6 @@ function createHarness({ queue, failChat = false, pendingUserReplies = [], chatC
     Date,
     Math,
     JSON,
-    URL,
     CapacitorKV: {
       get(key) { return rows.get(key) ?? null; },
       set(key, value) { rows.set(key, String(value)); },
@@ -96,6 +95,7 @@ function createHarness({ queue, failChat = false, pendingUserReplies = [], chatC
       };
     }
   };
+  if (exposeUrl) context.URL = URL;
   vm.createContext(context);
   vm.runInContext(runnerSource, context);
 
@@ -253,4 +253,20 @@ test('a background voice placeholder sends its hidden no-invention context to th
   const chatCall = harness.fetchCalls.find(row => row.url === 'https://chat.example/v1/chat/completions');
   assert.ok(chatCall);
   assert.match(chatCall.body.messages[0].content, /不能编造语音里的具体内容/);
+});
+
+test('a pending reply works in the Android headless runtime without a browser URL global', async () => {
+  const now = Date.now();
+  const task = { taskId: 'reply-no-url', charId: 'char-a', userMessageId: 'user-no-url', userText: '还在吗', createdAt: now, status: 'pending' };
+  const harness = createHarness({ pendingUserReplies: [task], exposeUrl: false });
+  const state = JSON.parse(harness.rows.get('state_json'));
+  state.allChats['char-a'].messages.push({ id: 'user-no-url', role: 'user', content: '还在吗', time: now, replyState: 'pending' });
+  state.allChats['char-a'].pendingReply = { userMessageId: 'user-no-url', userText: '还在吗', state: 'pending' };
+  harness.rows.set('state_json', JSON.stringify(state));
+
+  await harness.dispatch('pendingUserReply');
+
+  const saved = JSON.parse(harness.rows.get('state_json'));
+  assert.ok(saved.allChats['char-a'].messages.some(row => row.replyToMessageId === 'user-no-url'));
+  assert.ok(harness.fetchCalls.some(row => row.url === 'https://chat.example/v1/chat/completions'));
 });
