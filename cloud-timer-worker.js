@@ -119,6 +119,7 @@ export default {
         const delivered = await deliverJob(job, env);
         if (job.jobId && !delivered.retry && !delivered.awaitingAck) await cancelJob(job.jobId, env);
         if (job.jobId && delivered.awaitingAck) await deferForFcmAck(job, env);
+        if (job.jobId && delivered.retry) await deferForDeliveryRetry(job, env, delivered.reason || 'push failed');
         await appendEvent(env, { type: 'manual-trigger', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId, kind: job.kind, ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, payload: delivered.payload !== false });
         return json({ ok: delivered.ok, delivered });
       }
@@ -294,7 +295,8 @@ async function runDueMinute(env, minute) {
         if (!deferred) stats.failed += 1;
       } else if (delivered.retry) {
         stats.retry += 1;
-        remaining.push(jobId);
+        const deferred = await deferForDeliveryRetry(job, env, delivered.reason || 'push failed');
+        if (!deferred) stats.failed += 1;
       } else {
         if (delivered.ok) stats.delivered += 1;
         else stats.failed += 1;
@@ -303,8 +305,9 @@ async function runDueMinute(env, minute) {
     } catch (err) {
       console.warn(`deliver failed for ${jobId}:`, err.message);
       await appendEvent(env, { type: 'deliver-error', jobId, ok: false, reason: String(err?.message || err).slice(0, 160), retry: true });
-      stats.failed += 1;
-      remaining.push(jobId);
+      const deferred = await deferForDeliveryRetry(job, env, err?.message || String(err));
+      if (deferred) stats.retry += 1;
+      else stats.failed += 1;
     }
   }
   if (remaining.length) {
@@ -322,7 +325,7 @@ function minuteKey(ms) {
 async function deferForFcmAck(job, env) {
   const attempts = Math.max(0, Number(job.deliveryAttempts) || 0) + 1;
   if (attempts > FCM_ACK_MAX_ATTEMPTS) {
-    await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
+    await cancelJob(job.jobId, env);
     await appendEvent(env, { type: 'ack-timeout', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', attempts, ok: false, reason: 'phone did not acknowledge background generation' });
     return false;
   }
@@ -333,6 +336,34 @@ async function deferForFcmAck(job, env) {
     deliveryAttempts: attempts,
     awaitingAck: true,
     lastPushedAt: Date.now(),
+    updatedAt: Date.now()
+  }, env);
+  return true;
+}
+
+async function deferForDeliveryRetry(job, env, reason = '') {
+  const attempts = Math.max(0, Number(job.deliveryAttempts) || 0) + 1;
+  if (attempts > FCM_ACK_MAX_ATTEMPTS) {
+    await cancelJob(job.jobId, env);
+    await appendEvent(env, {
+      type: 'delivery-timeout',
+      deviceId: shortId(job.deviceId),
+      jobId: job.jobId,
+      charId: job.charId || '',
+      kind: job.kind || '',
+      attempts,
+      ok: false,
+      reason: String(reason || 'push retry limit reached').slice(0, 160)
+    });
+    return false;
+  }
+  const delayMinutes = Math.min(30, 2 * Math.pow(2, Math.min(4, attempts - 1)));
+  await saveJob({
+    ...job,
+    dueAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
+    deliveryAttempts: attempts,
+    awaitingAck: false,
+    lastDeliveryError: String(reason || '').slice(0, 160),
     updatedAt: Date.now()
   }, env);
   return true;
