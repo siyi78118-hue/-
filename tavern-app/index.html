@@ -1901,6 +1901,19 @@ async function reconcileNativeReplyState() {
   return true;
 }
 
+function completedNativeReplyCharIds(remoteChats = {}, localChats = {}) {
+  return Object.entries(localChats || {}).flatMap(([charId, localChat]) => {
+    const pending = localChat?.pendingReply;
+    if (!pending || !['pending', 'running'].includes(pending.state)) return [];
+    const remoteChat = remoteChats?.[charId];
+    if (!remoteChat) return [];
+    const answered = (remoteChat.messages || []).some(message =>
+      message?.role === 'assistant' && message.replyToMessageId === pending.userMessageId
+    );
+    return answered ? [charId] : [];
+  });
+}
+
 function startNativeReplyPolling() {
   if (!isNativeApp() || nativeReplyPollTimer) return;
   nativeReplyPollTimer = setInterval(() => {
@@ -1916,7 +1929,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
   const runner = nativeBackgroundRunner();
   const queuePlugin = nativeReplyQueuePlugin();
   if (!runner?.dispatchEvent || !queuePlugin?.enqueue) throw new Error('安卓后台回复组件不可用，请更新或重新安装 AL');
-  const task = buildAndroidUserReplyTask(charId, userMessageId, userMessage.content, options, Number(chat.pendingReply?.createdAt) || Date.now());
+  const task = buildAndroidUserReplyTask(charId, userMessageId, options.userText || chat.pendingReply?.userText || userMessage.content, options, Number(chat.pendingReply?.createdAt) || Date.now());
   chat.pendingReply = {
     userMessageId,
     userText: task.userText,
@@ -1965,6 +1978,7 @@ async function restoreNativeBackgroundState() {
   const nativeState = typeof result?.state === 'string' ? JSON.parse(result.state) : result?.state;
   const localUpdatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0;
   if (!nativeState?.updatedAt || nativeState.updatedAt <= localUpdatedAt) return false;
+  const completedReplyCharIds = completedNativeReplyCharIds(nativeState.allChats || {}, allChats);
   settings = migrateSettings(nativeState.settings || settings);
   characters = (nativeState.characters || characters).map(normalizeChar);
   allChats = mergeLocalPendingReplies(nativeState.allChats || allChats, allChats);
@@ -1982,6 +1996,7 @@ async function restoreNativeBackgroundState() {
       for (const row of nativeState.memory[store]) if (row && typeof row === 'object') await MemoryDB.put(store, row);
     }
   }
+  completedReplyCharIds.forEach(charId => processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native reply update skipped:', err.message)));
   return true;
 }
 async function mirrorAppStateNow() {
@@ -6212,10 +6227,11 @@ async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
   if (reason) toast(reason, 2200);
-  if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
+  const voicePrompt = `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`;
+  if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, { userText: voicePrompt });
   await continueAssistantTurn(
     requestCharId,
-    `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`
+    voicePrompt
     , { userMessageId: message.id }
   );
 }

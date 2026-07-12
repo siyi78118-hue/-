@@ -231,3 +231,26 @@ test('a user reply can contain text emoji and one hidden incoming payment direct
   assert.match(replies.find(row => !row.type).content, /🧋/);
   assert.equal(replies.some(row => /al_send_payment/.test(row.content || '')), false);
 });
+
+test('a background voice placeholder sends its hidden no-invention context to the chat model', async () => {
+  const now = Date.now();
+  const task = {
+    taskId: 'reply-user-voice',
+    charId: 'char-a',
+    userMessageId: 'user-voice',
+    userText: '姜隽倚发来一条 4 秒语音，但没有提供转文字内容。许弥只能回应“收到语音”这个事实，不能编造语音里的具体内容。',
+    createdAt: now,
+    status: 'pending'
+  };
+  const harness = createHarness({ pendingUserReplies: [task] });
+  const state = JSON.parse(harness.rows.get('state_json'));
+  state.allChats['char-a'].messages.push({ id: 'user-voice', role: 'user', content: '[语音消息 4秒，未转文字]', time: now, replyState: 'pending' });
+  state.allChats['char-a'].pendingReply = { userMessageId: 'user-voice', userText: task.userText, state: 'pending' };
+  harness.rows.set('state_json', JSON.stringify(state));
+
+  await harness.dispatch('pendingUserReply');
+
+  const chatCall = harness.fetchCalls.find(row => row.url === 'https://chat.example/v1/chat/completions');
+  assert.ok(chatCall);
+  assert.match(chatCall.body.messages[0].content, /不能编造语音里的具体内容/);
+});

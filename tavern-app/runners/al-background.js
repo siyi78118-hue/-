@@ -436,9 +436,13 @@ async function runUserReply(state, task) {
   }
 
   const now = new Date();
-  const query = `${prepared.playerName}刚在${formatLocalTime(now)}对${char.name}说：“${String(task.userText || userMessage.content || '').slice(0, 500)}”。筛选本轮真正相关的人物资料、承诺、关系变化、近期情绪和未完成事件。`;
+  const taskUserText = String(task.userText || userMessage.content || '').trim();
+  const query = `${prepared.playerName}刚在${formatLocalTime(now)}对${char.name}说：“${taskUserText.slice(0, 500)}”。筛选本轮真正相关的人物资料、承诺、关系变化、近期情绪和未完成事件。`;
   const memoryPack = await retrieveMemory(state, task.charId, query);
-  const system = `${prepared.userReplySystem}${memoryPack ? `\n\n【记忆 AI 本次筛选结果】\n${memoryPack}` : ''}\n\n当前设备时间：${formatLocalTime(now)}。只输出${char.name}真正发出的微信消息。`;
+  const hiddenTaskContext = taskUserText && taskUserText !== String(userMessage.content || '').trim()
+    ? `\n\n【本条消息的隐藏输入说明】\n${taskUserText}`
+    : '';
+  const system = `${prepared.userReplySystem}${memoryPack ? `\n\n【记忆 AI 本次筛选结果】\n${memoryPack}` : ''}${hiddenTaskContext}\n\n当前设备时间：${formatLocalTime(now)}。只输出${char.name}真正发出的微信消息。`;
   const messages = visibleMessages(chat, 30, now);
   const raw = await callModel(apiConfig(state.settings || {}, 'chat'), system, messages, Number(state.settings?.maxTokens) || 1000);
   const assistantPayment = extractAssistantPaymentDirective(raw);
