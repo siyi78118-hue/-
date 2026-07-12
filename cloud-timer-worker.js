@@ -25,7 +25,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-12.11';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-12.12';
 const RECENT_EVENT_LIMIT = 40;
 const IDLE_CRON_HEARTBEAT_MINUTES = 10;
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;

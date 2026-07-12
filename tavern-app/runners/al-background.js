@@ -3,6 +3,7 @@ const PENDING_PUSH_QUEUE_KEY = 'pending_push_queue';
 const DICE_INTERVAL_MS = 10 * 60 * 1000;
 const DICE_CHANCE = 0.05;
 const MAX_DICE_ROLLS = 432;
+const MAX_PUSHES_PER_WAKE = 8;
 
 function kvGet(key) {
   const result = CapacitorKV.get(key);
@@ -111,8 +112,17 @@ function cleanKey(value) {
 
 function apiEndpoint(value, route) {
   const raw = String(value || '').trim();
+  if (!raw) throw new Error('API 地址为空');
   if (!/^https?:\/\//i.test(raw)) throw new Error('API address must be an absolute URL');
-  const base = raw.split(/[?#]/, 1)[0].replace(/\/+$/, '').replace(/\/(?:chat\/completions|messages|models)$/i, '');
+  let parsed;
+  try { parsed = new URL(raw); } catch { throw new Error('API 地址格式不正确'); }
+  if (/github\.io$/i.test(parsed.hostname) && /\/(?:[^/]+\/)*tavern-app(?:\/|$)/i.test(parsed.pathname)) {
+    throw new Error('API 地址指向了 AL 页面，不是模型接口');
+  }
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '').replace(/\/(?:chat\/completions|messages|models)$/i, '');
+  parsed.search = '';
+  parsed.hash = '';
+  const base = parsed.toString().replace(/\/+$/, '');
   return base + '/' + String(route || '').replace(/^\/+/, '');
 }
 
@@ -148,10 +158,10 @@ async function callModel(config, system, messages, maxTokens) {
     : { model: config.model, messages: [{ role: 'system', content: system }, ...messages], max_tokens: maxTokens || 1000, temperature: Number(config.temperature) || 0.8, stream: false };
   const response = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body) });
   const raw = await response.text();
-  if (!response.ok) throw new Error(`API ${response.status}: ${raw.slice(0, 160)}`);
   if (/text\/html/i.test(String(response.headers?.get?.('content-type') || '')) || /^\s*(?:<!doctype\s+html|<html\b)/i.test(raw)) {
     throw new Error(`API returned HTML page: ${endpoint}`);
   }
+  if (!response.ok) throw new Error(`API ${response.status}: ${raw.slice(0, 160)}`);
   let json;
   try { json = JSON.parse(raw); } catch { return raw.trim(); }
   return responseText(json);
@@ -350,13 +360,29 @@ async function runRemoteNotification(payload) {
   } catch (err) {
     state.settings.cloudTimerLastStatus = `FCM 后台生成失败：${String(err?.message || err).slice(0, 180)}`;
     state.settings.cloudTimerLastStatusAt = Date.now();
-    try { await scheduleNext(state, payload.charId, payload.kind === 'moment' ? 'moment' : 'chat'); } catch {}
     notify('AL', '主动消息生成失败，已安排稍后重试。', payload, false);
     throw err;
   } finally {
     writeState(state);
   }
   await acknowledgeCloudJob(state, payload, 'generated');
+}
+
+async function drainPendingPushQueue() {
+  const initialCount = Math.min(MAX_PUSHES_PER_WAKE, pendingPushQueue().length);
+  const completed = [];
+  for (let index = 0; index < initialCount; index++) {
+    const payload = dequeuePendingPush();
+    if (!payload) break;
+    try {
+      await runRemoteNotification(payload);
+      completed.push(String(payload.jobId || ''));
+    } catch (err) {
+      requeuePendingPush(payload);
+      throw err;
+    }
+  }
+  return completed;
 }
 
 addEventListener('syncState', (resolve, reject, args) => {
@@ -376,14 +402,13 @@ addEventListener('readState', (resolve, reject) => {
 });
 
 addEventListener('remoteNotification', (resolve, reject) => {
-  const payload = dequeuePendingPush();
-  if (!payload) {
+  if (!pendingPushQueue().length) {
     resolve({ ok: true, skipped: true });
     return;
   }
-  runRemoteNotification(payload)
-    .then(() => resolve({ ok: true, jobId: payload.jobId || '' }))
-    .catch(err => { requeuePendingPush(payload); console.error('[AL Background]', err); reject(err); });
+  drainPendingPushQueue()
+    .then(jobIds => resolve({ ok: true, jobIds }))
+    .catch(err => { console.error('[AL Background]', err); reject(err); });
 });
 
 addEventListener('backgroundTick', (resolve) => resolve({ ok: true }));
