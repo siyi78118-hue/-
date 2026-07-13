@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
-public final class RoomExecutionStore implements ExecutionStore {
+public final class RoomExecutionStore implements ExecutionStore, ExecutionEngineStore {
     private final AlExecutionDatabase database;
     private final AlExecutionDao dao;
 
@@ -145,6 +145,57 @@ public final class RoomExecutionStore implements ExecutionStore {
     @Override
     public List<ChangeEventEntity> changesAfter(long cursor, int limit) {
         return dao.changesAfter(cursor, Math.max(1, Math.min(limit, 500)));
+    }
+
+    @Override
+    public ChatTurnEntity claimNext(long now) {
+        return dao.nextQueuedTurn();
+    }
+
+    @Override
+    public List<ExecutionAttemptEntity> recoverableAttempts() {
+        return dao.recoverableAttempts();
+    }
+
+    @Override
+    public void markStage(
+        String turnId,
+        String attemptId,
+        TurnState state,
+        AttemptStage stage,
+        long now
+    ) {
+        dao.markStage(turnId, attemptId, state.name(), stage.name(), now);
+    }
+
+    @Override
+    public void saveMemoryResult(String turnId, String attemptId, String memory, long now) {
+        dao.saveMemoryCheckpoint(turnId, attemptId, memory, now);
+    }
+
+    @Override
+    public void saveRawReply(String turnId, String attemptId, String rawReply, long now) {
+        dao.saveRawReplyCheckpoint(turnId, attemptId, rawReply, now);
+    }
+
+    @Override
+    public void markInterrupted(String turnId, String attemptId, String code, long now) {
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            if (!attemptId.equals(turn.activeAttemptId)) {
+                throw new StaleAttemptException(turnId, attemptId);
+            }
+            dao.markTurnFailed(turnId, attemptId, TurnState.INTERRUPTED.name(), now);
+            dao.markAttemptFailed(
+                attemptId,
+                TurnState.INTERRUPTED.name(),
+                code,
+                "The process stopped while the chat request outcome was unknown",
+                true,
+                now
+            );
+            insertTurnChange(turnId, "TURN_INTERRUPTED", now);
+        });
     }
 
     private ChatTurnEntity requireTurn(String turnId) {

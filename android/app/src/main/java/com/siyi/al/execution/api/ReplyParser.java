@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 public final class ReplyParser {
@@ -27,11 +28,15 @@ public final class ReplyParser {
             String type = payment.optString("type", "").toLowerCase(Locale.ROOT);
             double amount = Math.round(payment.optDouble("amount", 0) * 100.0) / 100.0;
             if (("redpacket".equals(type) || "transfer".equals(type)) && amount > 0) {
-                JSONObject payload = new JSONObject();
-                payload.put("type", type);
-                payload.put("amount", amount);
-                payload.put("note", payment.optString("note", "").replaceAll("\\s+", " ").trim());
-                add(parts, turnId, attemptId, type.toUpperCase(Locale.ROOT), "", payload.toString());
+                try {
+                    JSONObject payload = new JSONObject();
+                    payload.put("type", type);
+                    payload.put("amount", amount);
+                    payload.put("note", payment.optString("note", "").replaceAll("\\s+", " ").trim());
+                    add(parts, turnId, attemptId, type.toUpperCase(Locale.ROOT), "", payload.toString());
+                } catch (JSONException ignored) {
+                    // Invalid structured payment data must not discard the visible text reply.
+                }
             }
         }
         return new ParsedReply(parts);

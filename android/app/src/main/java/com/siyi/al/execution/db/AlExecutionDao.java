@@ -43,6 +43,12 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM execution_attempts WHERE turnId = :turnId ORDER BY sequence DESC")
     List<ExecutionAttemptEntity> attempts(String turnId);
 
+    @Query("SELECT * FROM chat_turns WHERE state = 'QUEUED' AND deletedAt IS NULL ORDER BY CASE kind WHEN 'DIRECT_REPLY' THEN 0 WHEN 'PROACTIVE_CHAT' THEN 1 ELSE 2 END, createdAt ASC LIMIT 1")
+    ChatTurnEntity nextQueuedTurn();
+
+    @Query("SELECT * FROM execution_attempts WHERE state IN ('MEMORY_RUNNING', 'MEMORY_DONE', 'CHAT_RUNNING', 'CHAT_DONE') ORDER BY startedAt ASC")
+    List<ExecutionAttemptEntity> recoverableAttempts();
+
     @Query("SELECT COALESCE(MAX(sequence), 0) FROM execution_attempts WHERE turnId = :turnId")
     int maxAttemptSequence(String turnId);
 
@@ -78,6 +84,48 @@ public interface AlExecutionDao {
 
     @Query("UPDATE execution_attempts SET state = :state, errorCode = :code, errorDetail = :detail, retryable = :retryable, heartbeatAt = :now, finishedAt = :now WHERE attemptId = :attemptId")
     int markAttemptFailed(String attemptId, String state, String code, String detail, boolean retryable, long now);
+
+    @Transaction
+    default void markStage(
+        String turnId,
+        String attemptId,
+        String state,
+        String stage,
+        long now
+    ) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null || attemptId == null || !attemptId.equals(turn.activeAttemptId)) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+        if (updateTurnState(turnId, attemptId, state, now) != 1
+            || updateAttemptStage(attemptId, stage, state, now) != 1) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+    }
+
+    @Transaction
+    default void saveMemoryCheckpoint(String turnId, String attemptId, String memory, long now) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null || !attemptId.equals(turn.activeAttemptId)) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+        if (saveMemoryResult(attemptId, memory, now) != 1
+            || updateTurnState(turnId, attemptId, "MEMORY_DONE", now) != 1) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+    }
+
+    @Transaction
+    default void saveRawReplyCheckpoint(String turnId, String attemptId, String rawReply, long now) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null || !attemptId.equals(turn.activeAttemptId)) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+        if (saveRawReply(attemptId, rawReply, now) != 1
+            || updateTurnState(turnId, attemptId, "CHAT_DONE", now) != 1) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+    }
 
     @Query("SELECT * FROM change_events WHERE cursor > :cursor ORDER BY cursor ASC LIMIT :limit")
     List<ChangeEventEntity> changesAfter(long cursor, int limit);
