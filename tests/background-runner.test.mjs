@@ -5,11 +5,12 @@ import { readFileSync } from 'node:fs';
 
 const runnerSource = readFileSync('tavern-app/runners/al-background.js', 'utf8');
 
-function createHarness({ queue, failChat = false, failNotifications = false, pendingUserReplies = [], chatContent = '刚看到\n还没睡？', exposeUrl = true } = {}) {
+function createHarness({ queue, failChat = false, failScheduleCount = 0, failNotifications = false, pendingUserReplies = [], chatContent = '刚看到\n还没睡？', exposeUrl = true } = {}) {
   const rows = new Map();
   const handlers = new Map();
   const fetchCalls = [];
   const notifications = [];
+  let remainingScheduleFailures = Math.max(0, Number(failScheduleCount) || 0);
   const now = Date.now();
   const state = {
     settings: {
@@ -78,6 +79,10 @@ function createHarness({ queue, failChat = false, failNotifications = false, pen
       const body = options.body ? JSON.parse(options.body) : null;
       fetchCalls.push({ url: String(url), body });
       if (String(url).startsWith('https://timer.example/')) {
+        if (remainingScheduleFailures > 0 && String(url).endsWith('/schedule')) {
+          remainingScheduleFailures--;
+          return { ok: false, status: 503, headers: { get: () => 'application/json' }, text: async () => '{"ok":false}' };
+        }
         return { ok: true, status: 200, headers: { get: () => 'application/json' }, text: async () => '{"ok":true}' };
       }
       if (String(url).startsWith('https://memory.example/')) {
@@ -138,6 +143,36 @@ test('a failed generation remains queued and is not acknowledged', async () => {
   assert.deepEqual(JSON.parse(harness.rows.get('pending_push_queue')).map(row => row.jobId), ['chat-job']);
   assert.equal(harness.fetchCalls.some(row => row.url === 'https://timer.example/ack'), false);
   assert.equal(harness.fetchCalls.some(row => row.url === 'https://timer.example/schedule'), false, '失败任务由原云任务重试，不得另建随机任务');
+  assert.match(harness.notifications.at(-1).body, /chat provider offline/, '真正的生成错误必须出现在失败通知中');
+});
+
+test('a next-schedule retry never regenerates an already completed proactive message', async () => {
+  const harness = createHarness({
+    failScheduleCount: 1,
+    queue: [{ type: 'proactive', deviceId: 'device-a', charId: 'char-a', jobId: 'chat-job', kind: 'chat', mode: 'planned' }]
+  });
+
+  await assert.rejects(harness.dispatch('remoteNotification'), /schedule 503/);
+
+  const firstSaved = JSON.parse(harness.rows.get('state_json'));
+  assert.equal(firstSaved.allChats['char-a'].messages.filter(row => row.proactive && row.role === 'assistant').length, 2);
+  assert.deepEqual(JSON.parse(harness.rows.get('pending_push_queue')).map(row => row.jobId), ['chat-job']);
+  assert.equal(harness.fetchCalls.some(row => row.url === 'https://timer.example/ack'), false);
+  assert.equal(harness.notifications.length, 1);
+  assert.equal(harness.notifications[0].title, '许弥');
+  assert.doesNotMatch(harness.notifications[0].body, /生成失败/);
+
+  await harness.dispatch('remoteNotification');
+
+  const saved = JSON.parse(harness.rows.get('state_json'));
+  assert.equal(saved.allChats['char-a'].messages.filter(row => row.proactive && row.role === 'assistant').length, 2, '重试排程时不得再调用模型生成重复消息');
+  assert.deepEqual(JSON.parse(harness.rows.get('pending_push_queue')), []);
+  const scheduleCalls = harness.fetchCalls.filter(row => row.url === 'https://timer.example/schedule');
+  assert.equal(scheduleCalls.length, 2);
+  assert.equal(scheduleCalls[0].body.jobId, scheduleCalls[1].body.jobId, '网络结果不明时重试必须复用同一排程任务 ID');
+  assert.equal(scheduleCalls[0].body.dueAt, scheduleCalls[1].body.dueAt, '排程重试不得改变原定到期时间');
+  assert.ok(harness.fetchCalls.some(row => row.url === 'https://timer.example/ack'));
+  assert.equal(harness.notifications.length, 1, '重试排程时不得重复通知');
 });
 
 test('the headless runner rejects an AL page as a model API root', () => {

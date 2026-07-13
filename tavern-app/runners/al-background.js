@@ -314,21 +314,42 @@ function geometricDicePlan(now = Date.now()) {
   return { dueAt: new Date(now + rolls * DICE_INTERVAL_MS), rolls };
 }
 
-async function scheduleNext(state, charId, kind) {
+async function scheduleNext(state, charId, kind, sourceJobId = '') {
   const settings = state.settings || {};
   const chat = state.allChats?.[charId];
   if (!chat || !settings.timerEndpoint || !settings.deviceId || !settings.cloudTimerEnabled) return;
-  const plan = geometricDicePlan();
-  const prefix = kind === 'moment' ? 'mom' : 'pro';
-  const jobId = `${prefix}_${settings.deviceId}_${charId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  const job = { jobId, dueAt: plan.dueAt.toISOString(), kind, mode: 'dice', rollChance: DICE_CHANCE, diceIntervalMs: DICE_INTERVAL_MS, diceRolls: plan.rolls, dicePrecomputed: true };
-  chat[kind === 'moment' ? 'pendingMomentJob' : 'pendingProactiveJob'] = job;
+  const pendingField = kind === 'moment' ? 'pendingMomentJob' : 'pendingProactiveJob';
+  const draftField = kind === 'moment' ? 'pendingNextMomentSchedule' : 'pendingNextProactiveSchedule';
+  let job = chat[draftField];
+  if (!job || String(job.sourceJobId || '') !== String(sourceJobId || '')) {
+    const plan = geometricDicePlan();
+    const prefix = kind === 'moment' ? 'mom' : 'pro';
+    const jobId = `${prefix}_${settings.deviceId}_${charId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    job = { jobId, dueAt: plan.dueAt.toISOString(), kind, mode: 'dice', rollChance: DICE_CHANCE, diceIntervalMs: DICE_INTERVAL_MS, diceRolls: plan.rolls, dicePrecomputed: true, sourceJobId: String(sourceJobId || '') };
+    chat[draftField] = job;
+  }
   const response = await fetch(`${String(settings.timerEndpoint).replace(/\/+$/, '')}/schedule`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ deviceId: settings.deviceId, charId, type: 'proactive', ...job })
   });
   if (!response.ok) throw new Error(`schedule ${response.status}`);
+  chat[pendingField] = job;
+  delete chat[draftField];
+}
+
+function completedJobField(kind) {
+  return kind === 'moment' ? 'lastGeneratedMomentJobId' : 'lastGeneratedProactiveJobId';
+}
+
+function proactiveJobAlreadyGenerated(chat, payload) {
+  const jobId = String(payload?.jobId || '');
+  return !!jobId && String(chat?.[completedJobField(payload?.kind)] || '') === jobId;
+}
+
+function markProactiveJobGenerated(chat, payload) {
+  if (!chat || !payload?.jobId) return;
+  chat[completedJobField(payload.kind)] = String(payload.jobId);
 }
 
 async function acknowledgeCloudJob(state, payload, outcome = 'generated') {
@@ -382,9 +403,10 @@ async function runChat(state, payload, char, chat, prepared) {
   chat.lastProactiveType = 'chat';
   delete chat.pendingProactiveJob;
   appendMemoryEvent(state, payload.charId, '主动私聊', `${char.name}在${new Date(base).toISOString()}主动发来：“${chunks.join(' / ')}”`, 'fact');
-  await scheduleNext(state, payload.charId, 'chat');
+  markProactiveJobGenerated(chat, payload);
   const notificationBody = chunks[0] || (assistantPayment?.type === 'redpacket' ? '发来一个红包' : '发来一笔转账');
   notify(char.name || 'AL', notificationBody + (chunks.length > 1 ? ' ...' : ''), payload, false);
+  await scheduleNext(state, payload.charId, 'chat', payload.jobId);
 }
 
 function parseMomentText(raw) {
@@ -416,8 +438,9 @@ async function runMoment(state, payload, char, chat, prepared) {
   chat.lastProactiveType = 'moment';
   delete chat.pendingMomentJob;
   appendMemoryEvent(state, payload.charId, '主动朋友圈', `${char.name}在${new Date(at).toISOString()}发布朋友圈：“${text}”`, 'moment');
-  await scheduleNext(state, payload.charId, 'moment');
+  markProactiveJobGenerated(chat, payload);
   notify(char.name || 'AL', `发了一条朋友圈：${text}`, payload, true);
+  await scheduleNext(state, payload.charId, 'moment', payload.jobId);
 }
 
 function userReplyTaskRows() {
@@ -545,14 +568,23 @@ async function runRemoteNotification(payload) {
   state.settings.cloudTimerLastStatus = `FCM 后台已收到${payload.kind === 'moment' ? '朋友圈' : '私聊'}任务，正在生成。`;
   state.settings.cloudTimerLastStatusAt = Date.now();
   try {
-    if (payload.kind === 'moment') await runMoment(state, payload, char, chat, prepared);
-    else await runChat(state, payload, char, chat, prepared);
-    state.settings.cloudTimerLastStatus = `FCM 后台${payload.kind === 'moment' ? '朋友圈' : '私聊'}已生成。`;
+    if (proactiveJobAlreadyGenerated(chat, payload)) {
+      await scheduleNext(state, payload.charId, payload.kind === 'moment' ? 'moment' : 'chat', payload.jobId);
+      state.settings.cloudTimerLastStatus = `FCM 后台${payload.kind === 'moment' ? '朋友圈' : '私聊'}已生成，下一次排程已补齐。`;
+    } else {
+      if (payload.kind === 'moment') await runMoment(state, payload, char, chat, prepared);
+      else await runChat(state, payload, char, chat, prepared);
+      state.settings.cloudTimerLastStatus = `FCM 后台${payload.kind === 'moment' ? '朋友圈' : '私聊'}已生成。`;
+    }
     state.settings.cloudTimerLastStatusAt = Date.now();
   } catch (err) {
-    state.settings.cloudTimerLastStatus = `FCM 后台生成失败：${String(err?.message || err).slice(0, 180)}`;
+    const generated = proactiveJobAlreadyGenerated(chat, payload);
+    const reason = String(err?.message || err).replace(/\s+/g, ' ').trim().slice(0, 90) || '未知错误';
+    state.settings.cloudTimerLastStatus = generated
+      ? `FCM 后台消息已生成，但下一次排程失败，等待重试：${reason}`
+      : `FCM 后台生成失败：${reason}`;
     state.settings.cloudTimerLastStatusAt = Date.now();
-    notify('AL', '主动消息生成失败，已安排稍后重试。', payload, false);
+    if (!generated) notify('AL', `主动消息生成失败：${reason}`, payload, false);
     throw err;
   } finally {
     writeState(state);
