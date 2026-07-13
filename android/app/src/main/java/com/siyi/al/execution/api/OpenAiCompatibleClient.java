@@ -117,7 +117,12 @@ public final class OpenAiCompatibleClient {
         if (value instanceof JSONArray) {
             JSONArray array = (JSONArray) value;
             StringBuilder result = new StringBuilder();
-            for (int i = 0; i < array.length(); i++) result.append(contentText(array.get(i)));
+            for (int i = 0; i < array.length(); i++) {
+                String part = contentText(array.get(i));
+                if (part.isEmpty()) continue;
+                if (result.length() > 0) result.append('\n');
+                result.append(part);
+            }
             return result.toString();
         }
         if (value instanceof JSONObject) {

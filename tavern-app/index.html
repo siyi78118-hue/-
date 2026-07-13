@@ -1232,7 +1232,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-13.79';
+const APP_BUILD_VERSION = '2026-07-13.80';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -2034,10 +2034,12 @@ async function reconcileNativeReplyState() {
     console.warn('[AL Native Execution] reconcile skipped:', err.message);
     return false;
   });
-  const mirrorChanged = await restoreNativeBackgroundState().catch(err => {
-    console.warn('[AL Native Reply] state restore skipped:', err.message);
-    return false;
-  });
+  const mirrorChanged = shouldRestoreLegacyNativeBackground(!!nativeExecutionPlugin()?.getTurn)
+    ? await restoreNativeBackgroundState().catch(err => {
+        console.warn('[AL Native Reply] state restore skipped:', err.message);
+        return false;
+      })
+    : false;
   const changed = executionChanged || mirrorChanged;
   if (!changed) return false;
   resumePendingAssistantTurns();
@@ -2049,6 +2051,46 @@ async function reconcileNativeReplyState() {
 
 function nativePartPayload(part) {
   try { return JSON.parse(part?.payloadJson || '{}'); } catch { return {}; }
+}
+function nativeReplyTextParts(result) {
+  return (Array.isArray(result?.replyParts) ? result.replyParts : [])
+    .filter(part => part?.type === 'TEXT' && String(part.content || '').trim())
+    .slice()
+    .sort((a, b) => Number(a.sequence) - Number(b.sequence))
+    .map(part => ({
+      replyPartId: String(part.replyPartId || `${result?.turnId || 'turn'}:${Number(part.sequence) || 0}`),
+      sequence: Number(part.sequence) || 0,
+      content: String(part.content || '').trim()
+    }));
+}
+function appendNativeReplyTextParts(chat, result, extra = {}) {
+  const appended = [];
+  for (const part of nativeReplyTextParts(result)) {
+    if ((chat?.messages || []).some(message => message.sourceReplyPartId === part.replyPartId)) continue;
+    appended.push(...appendAssistantMessages(chat, part.content, {
+      ...extra,
+      sourceTurnId: `native:${result.turnId}`,
+      sourceReplyPartId: part.replyPartId
+    }));
+  }
+  return appended;
+}
+function nativePendingStateIsCurrent(chat, userMessage, result) {
+  const pending = chat?.pendingReply;
+  const state = String(result?.state || result?.storedState || '');
+  return !!pending
+    && pending.nativeTurnId === result?.turnId
+    && pending.state === 'running'
+    && pending.nativeState === state
+    && Number(pending.nativeUpdatedAt) === Number(result?.updatedAt)
+    && userMessage?.replyState === 'pending';
+}
+function nativePendingReplyNeedsSubmission(pending, messageId, queuedIds = nativeReplyQueuedIds) {
+  if (pending?.nativeTurnId) return false;
+  return !queuedIds.has(nativeTurnIdForMessage(messageId));
+}
+function shouldRestoreLegacyNativeBackground(nativeExecutionAvailable) {
+  return !nativeExecutionAvailable;
 }
 async function applyNativeExecutionTurn(result) {
   const charId = result?.characterId;
@@ -2105,13 +2147,17 @@ async function applyNativeExecutionTurn(result) {
   if (state === 'COMPLETED') {
     const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
     const alreadyAnswered = (chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === userMessage.id);
-    const text = parts.filter(part => part.type === 'TEXT').map(part => String(part.content || '').trim()).filter(Boolean).join('\n');
-    if (!alreadyAnswered && text) appendAssistantMessages(chat, text, { replyToMessageId: userMessage.id });
+    const text = nativeReplyTextParts(result).map(part => part.content).join('\n');
+    const appendedText = alreadyAnswered ? [] : appendNativeReplyTextParts(chat, result, { replyToMessageId: userMessage.id });
     const sentPayment = parts.find(part => ['REDPACKET', 'TRANSFER'].includes(part.type));
+    let appendedPayment = null;
     if (!alreadyAnswered && sentPayment) {
       const payload = nativePartPayload(sentPayment);
-      appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { replyToMessageId: userMessage.id });
+      appendedPayment = appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { replyToMessageId: userMessage.id, sourceTurnId: `native:${result.turnId}` });
     }
+    const ownedPending = chat.pendingReply?.nativeTurnId === result.turnId;
+    const changed = appendedText.length > 0 || !!appendedPayment || ownedPending || userMessage.replyState === 'pending' || !!userMessage.replyError;
+    if (!changed) return false;
     const paymentStatus = parts.find(part => part.type === 'PAYMENT_STATUS');
     const schedule = parts.find(part => part.type === 'SCHEDULE');
     const pendingOptions = chat.pendingReply?.userMessageId === userMessage.id ? (chat.pendingReply.options || {}) : {};
@@ -2138,8 +2184,18 @@ async function applyNativeExecutionTurn(result) {
     if (chat.pendingReply?.userMessageId === userMessage.id) delete chat.pendingReply;
     nativeReplyQueuedIds.delete(result.turnId);
   } else {
+    if (nativePendingStateIsCurrent(chat, userMessage, result)) return false;
     userMessage.replyState = 'pending';
-    chat.pendingReply = { ...(chat.pendingReply || {}), userMessageId: userMessage.id, userText: userMessage.content, state: 'running', nativeTurnId: result.turnId, updatedAt: Date.now() };
+    chat.pendingReply = {
+      ...(chat.pendingReply || {}),
+      userMessageId: userMessage.id,
+      userText: userMessage.content,
+      state: 'running',
+      nativeTurnId: result.turnId,
+      nativeState: state,
+      nativeUpdatedAt: Number(result.updatedAt) || 0,
+      updatedAt: Date.now()
+    };
   }
   DB.set('chats', allChats);
   return true;
@@ -5113,8 +5169,22 @@ function splitAssistantOutput(text) {
   const parts = normalized
     .split(/\n+/)
     .map(part => part.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .flatMap(splitLongAssistantBubble);
   return parts.length ? parts : [normalized];
+}
+function splitLongAssistantBubble(content) {
+  const text = String(content || '').trim();
+  if (text.length <= 48) return text ? [text] : [];
+  const sentences = text.match(/[^。！？!?]+[。！？!?]+|[^。！？!?]+$/g)?.map(row => row.trim()).filter(Boolean) || [];
+  if (sentences.length < 3) return [text];
+  const bubbles = [];
+  for (let index = 0; index < sentences.length; index += 1) {
+    let sentence = sentences[index];
+    if (sentence.length < 9 && index + 1 < sentences.length) sentence += sentences[++index];
+    bubbles.push(sentence);
+  }
+  return bubbles;
 }
 function appendAssistantMessages(chat, text, extra = {}) {
   const parts = splitAssistantOutput(text);
@@ -5634,14 +5704,21 @@ function resumePendingAssistantTurns() {
       DB.set('chats', allChats);
       return;
     }
-    pending.state = 'pending';
-    pending.updatedAt = Date.now();
     const savedOptions = pending.options || {};
     if (isNativeApp()) {
-      const taskId = `reply_${message.id}`;
-      if (nativeReplyQueuedIds.has(taskId)) return;
+      if (pending.nativeTurnId) {
+        nativeReplyQueuedIds.add(pending.nativeTurnId);
+        startNativeReplyPolling();
+        return;
+      }
+      if (!nativePendingReplyNeedsSubmission(pending, message.id)) return;
+      pending.state = 'pending';
+      pending.updatedAt = Date.now();
+      nativeReplyQueuedIds.add(nativeTurnIdForMessage(message.id));
       setTimeout(() => queueAndroidUserReply(charId, message.id, savedOptions), 80);
     } else {
+      pending.state = 'pending';
+      pending.updatedAt = Date.now();
       setTimeout(() => continueAssistantTurn(charId, pending.userText || message.content, { ...savedOptions, userMessageId: message.id, resumed: true }), 80);
     }
   });
@@ -8712,11 +8789,18 @@ async function clearAllHistory() {
 }
 
 async function syncFromServiceWorkerState() {
-  const nativeChanged = await restoreNativeBackgroundState().catch(err => {
-    console.warn('[AL Native] state restore skipped:', err.message);
+  const nativeChanged = shouldRestoreLegacyNativeBackground(!!nativeExecutionPlugin()?.getTurn)
+    ? await restoreNativeBackgroundState().catch(err => {
+        console.warn('[AL Native] state restore skipped:', err.message);
+        return false;
+      })
+    : false;
+  const mirrorChanged = await restoreAppStateFromMirror();
+  const executionChanged = await reconcileNativeExecutionTurns().catch(err => {
+    console.warn('[AL Native Execution] foreground reconcile skipped:', err.message);
     return false;
   });
-  const changed = await restoreAppStateFromMirror() || nativeChanged;
+  const changed = mirrorChanged || nativeChanged || executionChanged;
   if (changed) {
     renderPlayerProfile();
     if (activeScreen === 'chat') renderMessages();

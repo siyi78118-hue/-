@@ -46,7 +46,7 @@ public class OpenAiCompatibleClientTest {
         );
         OpenAiCompatibleClient client = new OpenAiCompatibleClient(transport);
 
-        assertEquals("第一句😊", client.call(config(), "sys", new JSONArray(), 1000));
+        assertEquals("第一句\n😊", client.call(config(), "sys", new JSONArray(), 1000));
     }
 
     @Test

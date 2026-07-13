@@ -34,6 +34,21 @@ public class ReplyParserTest {
     }
 
     @Test
+    public void separatesLongUnbrokenMultiSentenceReplyIntoChatBubbles() {
+        ParsedReply parsed = parser.parse(
+            "自己的软件？听起来你还挺厉害。无非就是哪天让你请杯冷萃。又不是攒着卖钱，你紧张什么？快十一点半了，修完赶紧回去。",
+            "turn-long",
+            "attempt-long"
+        );
+
+        assertEquals(4, parsed.parts.size());
+        assertEquals("自己的软件？听起来你还挺厉害。", parsed.parts.get(0).content);
+        assertEquals("无非就是哪天让你请杯冷萃。", parsed.parts.get(1).content);
+        assertEquals("又不是攒着卖钱，你紧张什么？", parsed.parts.get(2).content);
+        assertEquals("快十一点半了，修完赶紧回去。", parsed.parts.get(3).content);
+    }
+
+    @Test
     public void removesLeakedTimeMetadataAndNoReplyPlaceholder() {
         ParsedReply parsed = parser.parse(
             "【发送时间 2026-07-13 15:30】下午好\n（对方没有回复）",

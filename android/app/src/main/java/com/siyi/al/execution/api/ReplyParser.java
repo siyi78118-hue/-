@@ -13,7 +13,9 @@ public final class ReplyParser {
     private static final Pattern PAYMENT_STATUS = Pattern.compile("<al_payment>([\\s\\S]*?)</al_payment>", Pattern.CASE_INSENSITIVE);
     private static final Pattern SCHEDULE = Pattern.compile("<al_schedule>([\\s\\S]*?)</al_schedule>", Pattern.CASE_INSENSITIVE);
     private static final Pattern NO_REPLY = Pattern.compile("^[（(]?对方没有回复[）)]?[。！!]?$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SENTENCE = Pattern.compile("[^。！？!?]+[。！？!?]+|[^。！？!?]+$");
     private static final int MAX_TEXT_PARTS = 12;
+    private static final int LONG_SINGLE_BUBBLE = 48;
 
     public ParsedReply parse(String raw, String turnId, String attemptId) {
         String source = raw == null ? "" : raw;
@@ -25,7 +27,10 @@ public final class ReplyParser {
         for (String line : clean.split("\\n+")) {
             String content = line.trim();
             if (content.isEmpty() || NO_REPLY.matcher(content).matches()) continue;
-            add(parts, turnId, attemptId, "TEXT", content, "{}");
+            for (String bubble : bubbleChunks(content)) {
+                add(parts, turnId, attemptId, "TEXT", bubble, "{}");
+                if (parts.size() >= MAX_TEXT_PARTS) break;
+            }
             if (parts.size() >= MAX_TEXT_PARTS) break;
         }
         if (payment != null) {
@@ -77,6 +82,33 @@ public final class ReplyParser {
             .replaceAll("(?m)^```(?:json)?|```$", "")
             .replaceAll("(?m)^(?:【|\\[)\\s*(?:发送时间|历史消息元数据).*?(?:】|\\])\\s*", "")
             .trim();
+    }
+
+    private static List<String> bubbleChunks(String content) {
+        List<String> sentences = new ArrayList<>();
+        if (content.length() <= LONG_SINGLE_BUBBLE) {
+            sentences.add(content);
+            return sentences;
+        }
+        Matcher matcher = SENTENCE.matcher(content);
+        while (matcher.find()) {
+            String sentence = matcher.group().trim();
+            if (!sentence.isEmpty()) sentences.add(sentence);
+        }
+        if (sentences.size() < 3) {
+            sentences.clear();
+            sentences.add(content);
+            return sentences;
+        }
+        List<String> bubbles = new ArrayList<>();
+        for (int i = 0; i < sentences.size(); i++) {
+            String sentence = sentences.get(i);
+            if (sentence.length() < 9 && i + 1 < sentences.size()) {
+                sentence += sentences.get(++i);
+            }
+            bubbles.add(sentence);
+        }
+        return bubbles;
     }
 
     private static void add(List<ParsedReplyPart> parts, String turnId, String attemptId, String type, String content, String payloadJson) {
