@@ -46,7 +46,7 @@ public class ReplyParserTest {
     }
 
     @Test
-    public void preservesHiddenScheduleAndPaymentStatusAsMetadata() {
+    public void preservesHiddenScheduleAndPaymentStatusAsMetadata() throws Exception {
         ParsedReply parsed = parser.parse(
             "行，那我收下了。\n<al_payment>{\"status\":\"received\"}</al_payment>\n" +
                 "<al_schedule>{\"nextProactiveAt\":\"2026-07-13T18:30:00+08:00\"}</al_schedule>",
