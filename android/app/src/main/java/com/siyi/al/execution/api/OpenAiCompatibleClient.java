@@ -16,17 +16,22 @@ public final class OpenAiCompatibleClient {
 
     public String call(ApiConfig config, String system, JSONArray messages, int maxTokens) throws IOException {
         validateHeaderValue(config.apiKey);
-        JSONObject request = new JSONObject();
-        JSONArray requestMessages = new JSONArray();
-        requestMessages.put(new JSONObject().put("role", "system").put("content", system == null ? "" : system));
-        if (messages != null) {
-            for (int i = 0; i < messages.length(); i++) requestMessages.put(messages.get(i));
+        JSONObject request;
+        try {
+            request = new JSONObject();
+            JSONArray requestMessages = new JSONArray();
+            requestMessages.put(new JSONObject().put("role", "system").put("content", system == null ? "" : system));
+            if (messages != null) {
+                for (int i = 0; i < messages.length(); i++) requestMessages.put(messages.get(i));
+            }
+            request.put("model", config.model);
+            request.put("messages", requestMessages);
+            request.put("temperature", config.temperature);
+            request.put("max_tokens", Math.max(1, maxTokens));
+            request.put("stream", false);
+        } catch (JSONException error) {
+            throw new ApiProtocolException("REQUEST_JSON", "Unable to encode the model request");
         }
-        request.put("model", config.model);
-        request.put("messages", requestMessages);
-        request.put("temperature", config.temperature);
-        request.put("max_tokens", Math.max(1, maxTokens));
-        request.put("stream", false);
 
         Map<String, String> headers = new LinkedHashMap<>();
         headers.put("Content-Type", "application/json; charset=utf-8");
