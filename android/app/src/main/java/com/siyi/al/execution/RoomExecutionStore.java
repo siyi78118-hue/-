@@ -126,6 +126,22 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     @Override
+    public void cancelTurn(String turnId, long now, boolean deleted) {
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            if (dao.replyPartCount(turnId) > 0 || TurnState.COMPLETED.name().equals(turn.state)) {
+                throw new TurnAlreadyCompletedException(turnId);
+            }
+            String attemptId = turn.activeAttemptId;
+            if (dao.cancelTurn(turnId, now, deleted) != 1) {
+                throw new IllegalStateException("Unable to cancel turn " + turnId);
+            }
+            if (attemptId != null) dao.cancelAttempt(attemptId, now);
+            insertTurnChange(turnId, deleted ? "TURN_DELETED" : "TURN_CANCELLED", now);
+        });
+    }
+
+    @Override
     public ChatTurnEntity turn(String turnId) {
         return dao.turn(turnId);
     }

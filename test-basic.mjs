@@ -31,6 +31,7 @@ const executionStorePath = 'android/app/src/main/java/com/siyi/al/execution/Room
 const secretStorePath = 'android/app/src/main/java/com/siyi/al/execution/secure/AlSecretStore.java';
 const executionServicePath = 'android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java';
 const bootReceiverPath = 'android/app/src/main/java/com/siyi/al/execution/AlBootReceiver.java';
+const executionPluginPath = 'android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java';
 assert.match(androidVariablesGradle, /roomVersion\s*=\s*'2\.8\.4'/);
 assert.match(androidBuildGradle, /androidx\.room:room-runtime:\$roomVersion/);
 assert.match(androidBuildGradle, /annotationProcessor\s+"androidx\.room:room-compiler:\$roomVersion"/);
@@ -40,10 +41,12 @@ assert.ok(existsSync(executionStorePath), 'atomic native execution store should 
 assert.ok(existsSync(secretStorePath), 'native encrypted API secret store should exist');
 assert.ok(existsSync(executionServicePath), 'sticky native execution service should exist');
 assert.ok(existsSync(bootReceiverPath), 'boot recovery receiver should exist');
+assert.ok(existsSync(executionPluginPath), 'native execution Capacitor bridge should exist');
 const executionDao = existsSync(executionDaoPath) ? readFileSync(executionDaoPath, 'utf8') : '';
 const executionStore = existsSync(executionStorePath) ? readFileSync(executionStorePath, 'utf8') : '';
 const secretStore = existsSync(secretStorePath) ? readFileSync(secretStorePath, 'utf8') : '';
 const executionService = existsSync(executionServicePath) ? readFileSync(executionServicePath, 'utf8') : '';
+const executionPlugin = existsSync(executionPluginPath) ? readFileSync(executionPluginPath, 'utf8') : '';
 assert.match(executionDao, /@Transaction[\s\S]*commitReply/);
 assert.match(executionStore, /activeAttemptId[\s\S]*StaleAttemptException/);
 assert.match(executionStore, /startRetry\(String turnId/);
@@ -60,6 +63,11 @@ assert.match(androidManifest, /AlBootReceiver[\s\S]*BOOT_COMPLETED/);
 assert.match(executionService, /START_STICKY/);
 assert.match(executionService, /newSingleThreadExecutor/);
 assert.match(executionService, /WakeLock/);
+assert.match(androidMainActivity, /registerPlugin\(AlExecutionPlugin\.class\)/);
+assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
+for (const method of ['saveApiConfig', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince']) {
+  assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
+}
 assert.match(androidMainActivity, /registerPlugin\(AlReplyQueuePlugin\.class\)/);
 assert.match(androidReplyQueuePlugin, /@CapacitorPlugin\(name\s*=\s*"AlReplyQueue"\)/);
 assert.match(androidReplyQueuePlugin, /@PluginMethod[\s\S]*void enqueue\(PluginCall call\)/);

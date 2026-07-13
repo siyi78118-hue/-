@@ -7,6 +7,7 @@ import com.siyi.al.execution.AlExecutionService;
 public class MainActivity extends BridgeActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        registerPlugin(AlExecutionPlugin.class);
         registerPlugin(AlReplyQueuePlugin.class);
         super.onCreate(savedInstanceState);
         try {

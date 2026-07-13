@@ -29,6 +29,8 @@ public interface ExecutionStore {
         long now
     );
 
+    void cancelTurn(String turnId, long now, boolean deleted);
+
     ChatTurnEntity turn(String turnId);
 
     List<ReplyPartEntity> replyParts(String turnId);

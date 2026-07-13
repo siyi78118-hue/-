@@ -44,6 +44,7 @@ public class RoomExecutionStoreTest {
 
         ExecutionAttemptEntity retry = store.startRetry("turn-1", 3L);
         assertNotEquals(firstAttempt, retry.attemptId);
+        prepareChatDone("turn-1", retry.attemptId);
 
         store.commitReply(
             "turn-1",
@@ -73,6 +74,7 @@ public class RoomExecutionStoreTest {
             )
         );
 
+        prepareChatDone("turn-2", activeAttempt);
         store.commitReply(
             "turn-2",
             activeAttempt,
@@ -87,6 +89,32 @@ public class RoomExecutionStoreTest {
         store.submitTurn(submission("turn-3", "msg-3"));
         store.submitTurn(submission("turn-3", "msg-3"));
         assertEquals(1, database.executionDao().attempts("turn-3").size());
+    }
+
+    @Test
+    public void cancelledTurnRejectsLateReplyCommit() {
+        store.submitTurn(submission("turn-4", "msg-4"));
+        String cancelledAttempt = store.activeAttempt("turn-4").attemptId;
+
+        store.cancelTurn("turn-4", 2L, false);
+
+        assertThrows(
+            StaleAttemptException.class,
+            () -> store.commitReply(
+                "turn-4",
+                cancelledAttempt,
+                Collections.singletonList(textPart("turn-4", cancelledAttempt, "迟到回复")),
+                3L
+            )
+        );
+        assertEquals(TurnState.CANCELLED, store.displayState("turn-4"));
+    }
+
+    private void prepareChatDone(String turnId, String attemptId) {
+        store.markStage(turnId, attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, 3L);
+        store.saveMemoryResult(turnId, attemptId, "无相关记忆", 3L);
+        store.markStage(turnId, attemptId, TurnState.CHAT_RUNNING, AttemptStage.CHAT, 3L);
+        store.saveRawReply(turnId, attemptId, "模型原始回复", 3L);
     }
 
     private static TurnSubmission submission(String turnId, String messageId) {

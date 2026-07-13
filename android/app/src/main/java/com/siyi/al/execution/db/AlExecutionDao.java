@@ -73,7 +73,7 @@ public interface AlExecutionDao {
     @Query("UPDATE execution_attempts SET rawReply = :rawReply, stage = 'COMMIT', state = 'CHAT_DONE', heartbeatAt = :now WHERE attemptId = :attemptId")
     int saveRawReply(String attemptId, String rawReply, long now);
 
-    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId")
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId AND state = 'CHAT_DONE'")
     int completeTurn(String turnId, String attemptId, long now);
 
     @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId")
@@ -84,6 +84,12 @@ public interface AlExecutionDao {
 
     @Query("UPDATE execution_attempts SET state = :state, errorCode = :code, errorDetail = :detail, retryable = :retryable, heartbeatAt = :now, finishedAt = :now WHERE attemptId = :attemptId")
     int markAttemptFailed(String attemptId, String state, String code, String detail, boolean retryable, long now);
+
+    @Query("UPDATE chat_turns SET state = 'CANCELLED', activeAttemptId = NULL, updatedAt = :now, cancelledAt = :now, deletedAt = CASE WHEN :deleted = 1 THEN :now ELSE deletedAt END WHERE turnId = :turnId AND state != 'COMPLETED'")
+    int cancelTurn(String turnId, long now, boolean deleted);
+
+    @Query("UPDATE execution_attempts SET state = 'CANCELLED', stage = 'FINISHED', heartbeatAt = :now, finishedAt = :now, errorCode = 'CANCELLED', retryable = 0 WHERE attemptId = :attemptId")
+    int cancelAttempt(String attemptId, long now);
 
     @Transaction
     default void markStage(
@@ -106,7 +112,7 @@ public interface AlExecutionDao {
     @Transaction
     default void saveMemoryCheckpoint(String turnId, String attemptId, String memory, long now) {
         ChatTurnEntity turn = turn(turnId);
-        if (turn == null || !attemptId.equals(turn.activeAttemptId)) {
+        if (turn == null || !attemptId.equals(turn.activeAttemptId) || !"MEMORY_RUNNING".equals(turn.state)) {
             throw new StaleAttemptException(turnId, attemptId);
         }
         if (saveMemoryResult(attemptId, memory, now) != 1
@@ -118,7 +124,7 @@ public interface AlExecutionDao {
     @Transaction
     default void saveRawReplyCheckpoint(String turnId, String attemptId, String rawReply, long now) {
         ChatTurnEntity turn = turn(turnId);
-        if (turn == null || !attemptId.equals(turn.activeAttemptId)) {
+        if (turn == null || !attemptId.equals(turn.activeAttemptId) || !"CHAT_RUNNING".equals(turn.state)) {
             throw new StaleAttemptException(turnId, attemptId);
         }
         if (saveRawReply(attemptId, rawReply, now) != 1
@@ -138,7 +144,7 @@ public interface AlExecutionDao {
         long now
     ) {
         ChatTurnEntity turn = turn(turnId);
-        if (turn == null || attemptId == null || !attemptId.equals(turn.activeAttemptId)) {
+        if (turn == null || attemptId == null || !attemptId.equals(turn.activeAttemptId) || !"CHAT_DONE".equals(turn.state)) {
             throw new StaleAttemptException(turnId, attemptId);
         }
         if (replyPartCount(turnId) == 0) {
