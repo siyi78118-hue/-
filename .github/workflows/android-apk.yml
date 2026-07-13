@@ -71,6 +71,7 @@ jobs:
       - name: Run native Android checks
         working-directory: android
         run: |
+          set +e
           set -o pipefail
           ./gradlew testDebugUnitTest assembleDebugAndroidTest --no-daemon 2>&1 | tee native-check.log
           status=${PIPESTATUS[0]}
