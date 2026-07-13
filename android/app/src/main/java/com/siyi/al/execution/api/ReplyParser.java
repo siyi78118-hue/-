@@ -1,0 +1,72 @@
+package com.siyi.al.execution.api;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.json.JSONObject;
+
+public final class ReplyParser {
+    private static final Pattern PAYMENT = Pattern.compile("<al_send_payment>([\\s\\S]*?)</al_send_payment>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern NO_REPLY = Pattern.compile("^[（(]?对方没有回复[）)]?[。！!]?$", Pattern.CASE_INSENSITIVE);
+    private static final int MAX_TEXT_PARTS = 12;
+
+    public ParsedReply parse(String raw, String turnId, String attemptId) {
+        String source = raw == null ? "" : raw;
+        List<ParsedReplyPart> parts = new ArrayList<>();
+        JSONObject payment = payment(source);
+        String clean = clean(source);
+        for (String line : clean.split("\\n+")) {
+            String content = line.trim();
+            if (content.isEmpty() || NO_REPLY.matcher(content).matches()) continue;
+            add(parts, turnId, attemptId, "TEXT", content, "{}");
+            if (parts.size() >= MAX_TEXT_PARTS) break;
+        }
+        if (payment != null) {
+            String type = payment.optString("type", "").toLowerCase(Locale.ROOT);
+            double amount = Math.round(payment.optDouble("amount", 0) * 100.0) / 100.0;
+            if (("redpacket".equals(type) || "transfer".equals(type)) && amount > 0) {
+                JSONObject payload = new JSONObject();
+                payload.put("type", type);
+                payload.put("amount", amount);
+                payload.put("note", payment.optString("note", "").replaceAll("\\s+", " ").trim());
+                add(parts, turnId, attemptId, type.toUpperCase(Locale.ROOT), "", payload.toString());
+            }
+        }
+        return new ParsedReply(parts);
+    }
+
+    private static JSONObject payment(String source) {
+        Matcher match = PAYMENT.matcher(source);
+        if (!match.find()) return null;
+        try {
+            return new JSONObject(match.group(1).trim());
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String clean(String source) {
+        return PAYMENT.matcher(source)
+            .replaceAll("")
+            .replaceAll("(?is)<al_schedule>[\\s\\S]*?</al_schedule>", "")
+            .replaceAll("(?is)<al_payment>[\\s\\S]*?</al_payment>", "")
+            .replaceAll("(?m)^```(?:json)?|```$", "")
+            .replaceAll("(?m)^(?:【|\\[)\\s*(?:发送时间|历史消息元数据).*?(?:】|\\])\\s*", "")
+            .trim();
+    }
+
+    private static void add(List<ParsedReplyPart> parts, String turnId, String attemptId, String type, String content, String payloadJson) {
+        int sequence = parts.size();
+        parts.add(new ParsedReplyPart(
+            "part_" + turnId + "_" + sequence,
+            turnId,
+            attemptId,
+            sequence,
+            type,
+            content,
+            payloadJson
+        ));
+    }
+}
