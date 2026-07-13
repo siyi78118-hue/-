@@ -25,7 +25,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-12.12';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-13.13';
 const RECENT_EVENT_LIMIT = 40;
 const IDLE_CRON_HEARTBEAT_MINUTES = 10;
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -465,7 +465,7 @@ async function sendFcmPush(fcmToken, env, payload = {}) {
         data: stringData,
         android: {
           priority: 'high',
-          ttl: '120s'
+          ttl: '86400s'
         }
       }
     })

@@ -1231,14 +1231,15 @@ const DEFAULT_SETTINGS = {
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
-const APP_BUILD_VERSION = '2026-07-12.75';
+const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
+const APP_BUILD_VERSION = '2026-07-13.76';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
   'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
   'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@update-channel/android-update.json'
 ];
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-12.12';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-13.13';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -1991,19 +1992,24 @@ async function restoreNativeBackgroundState() {
   });
   const nativeState = typeof result?.state === 'string' ? JSON.parse(result.state) : result?.state;
   const localUpdatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0;
-  if (!nativeState?.updatedAt || nativeState.updatedAt <= localUpdatedAt) return false;
+  if (!nativeState?.updatedAt) return false;
+  const nativeIsNewer = Number(nativeState.updatedAt) > localUpdatedAt;
+  const hasMissingContent = nativeStateHasMissingChatContent(nativeState, allChats, allMoments);
+  if (!nativeIsNewer && !hasMissingContent) return false;
   const completedReplyCharIds = completedNativeReplyCharIds(nativeState.allChats || {}, allChats);
-  settings = migrateSettings(nativeState.settings || settings);
-  characters = (nativeState.characters || characters).map(normalizeChar);
-  allChats = mergeLocalPendingReplies(nativeState.allChats || allChats, allChats);
-  allMoments = Array.isArray(nativeState.allMoments) ? nativeState.allMoments : allMoments;
+  if (nativeIsNewer) {
+    settings = migrateSettings(nativeState.settings || settings);
+    characters = (nativeState.characters || characters).map(normalizeChar);
+  }
+  allChats = mergeLocalPendingReplies(nativeState.allChats || {}, allChats, { preferRemote: nativeIsNewer });
+  allMoments = mergeRowsByIdentity(nativeState.allMoments || [], allMoments, nativeIsNewer);
   scrubEmptyReplyMessages(allChats);
   localStorage.setItem('rpchat_settings', JSON.stringify(settings));
   localStorage.setItem('rpchat_characters', JSON.stringify(characters));
   localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
   localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
-  localStorage.setItem('rpchat_app_state_updated_at', String(nativeState.updatedAt));
-  await restoreNativeMemory(nativeState);
+  localStorage.setItem('rpchat_app_state_updated_at', String(nativeIsNewer ? nativeState.updatedAt : Date.now()));
+  if (nativeIsNewer) await restoreNativeMemory(nativeState);
   completedReplyCharIds.forEach(charId => processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native reply update skipped:', err.message)));
   return true;
 }
@@ -2069,35 +2075,73 @@ async function runScheduledAppStateMirror() {
     if (mirrorRequested || mirrorWaiters.length) scheduleAppStateMirror();
   }
 }
-function mergeLocalPendingReplies(remoteChats = {}, localChats = {}) {
+function mergeRowsByIdentity(remoteRows = [], localRows = [], preferRemote = true) {
+  const rows = new Map();
+  const ordered = preferRemote ? [...(localRows || []), ...(remoteRows || [])] : [...(remoteRows || []), ...(localRows || [])];
+  ordered.forEach((row, index) => {
+    if (!row || typeof row !== 'object') return;
+    const key = String(row.id || `${row.role || row.authorType || 'row'}:${Number(row.time) || index}:${row.content || row.text || ''}`);
+    rows.set(key, row);
+  });
+  return [...rows.values()].sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
+}
+
+function nativeStateHasMissingChatContent(nativeState = {}, localChats = {}, localMoments = []) {
+  const localMessageIds = new Set(Object.values(localChats || {}).flatMap(chat =>
+    (chat?.messages || []).map(message => String(message?.id || '')).filter(Boolean)
+  ));
+  if (Object.values(nativeState?.allChats || {}).some(chat =>
+    (chat?.messages || []).some(message => message?.id && !localMessageIds.has(String(message.id)))
+  )) return true;
+  const localMomentIds = new Set((localMoments || []).map(moment => String(moment?.id || '')).filter(Boolean));
+  return (nativeState?.allMoments || []).some(moment => moment?.id && !localMomentIds.has(String(moment.id)));
+}
+
+function mergeLocalPendingReplies(remoteChats = {}, localChats = {}, options = {}) {
   const remote = remoteChats && typeof remoteChats === 'object' ? remoteChats : {};
-  const merged = { ...(localChats || {}), ...remote };
-  Object.entries(localChats || {}).forEach(([charId, localChat]) => {
-    const localPending = localChat?.pendingReply;
-    if (!localPending || !['pending', 'running'].includes(localPending.state)) return;
-    const localMessage = messageById(localChat, localPending.userMessageId);
-    if (!messageAvailableToAI(localMessage)) return;
+  const preferRemote = options.preferRemote !== false;
+  const merged = {};
+  const charIds = new Set([...Object.keys(localChats || {}), ...Object.keys(remote)]);
+  charIds.forEach(charId => {
+    const localChat = localChats?.[charId] || {};
     const remoteChat = remote[charId] || {};
-    const messagesById = new Map();
-    [...(localChat.messages || []), ...(remoteChat.messages || [])].forEach(message => {
-      ensureMessageIdentity(message);
-      messagesById.set(message.id, message);
-    });
-    const messages = [...messagesById.values()].sort((a, b) => (Number(a.time) || 0) - (Number(b.time) || 0));
-    const remoteAnswered = messages.some(message => message.role === 'assistant' && message.replyToMessageId === localPending.userMessageId);
-    const remoteUserMessage = messages.find(message => message.id === localPending.userMessageId);
-    const remoteFailed = remoteUserMessage?.replyState === 'failed' || remoteChat.pendingReply?.state === 'failed';
-    if (remoteAnswered || remoteFailed) {
-      merged[charId] = { ...localChat, ...remoteChat, messages };
-      if (remoteAnswered) delete merged[charId].pendingReply;
+    const base = preferRemote ? { ...localChat, ...remoteChat } : { ...remoteChat, ...localChat };
+    const messages = mergeRowsByIdentity(remoteChat.messages || [], localChat.messages || [], preferRemote);
+    base.messages = messages;
+    const localPending = localChat?.pendingReply;
+    if (!localPending || !['pending', 'running'].includes(localPending.state)) {
+      merged[charId] = base;
       return;
     }
-    Object.entries(remoteChat).forEach(([key, value]) => {
-      if (!['messages', 'pendingReply'].includes(key)) localChat[key] = value;
-    });
-    localChat.messages = messages;
-    localChat.pendingReply = { ...localPending, state: 'pending' };
-    merged[charId] = localChat;
+    const localMessage = messageById(localChat, localPending.userMessageId);
+    if (!messageAvailableToAI(localMessage)) {
+      merged[charId] = base;
+      return;
+    }
+    const remoteAnswered = messages.some(message => message.role === 'assistant' && message.replyToMessageId === localPending.userMessageId);
+    const mergedUserMessage = messages.find(message => message.id === localPending.userMessageId);
+    const remoteUserMessage = messageById(remoteChat, localPending.userMessageId);
+    const remoteFailed = remoteUserMessage?.replyState === 'failed' || remoteChat.pendingReply?.state === 'failed';
+    if (remoteAnswered) {
+      delete base.pendingReply;
+      if (mergedUserMessage) {
+        delete mergedUserMessage.replyState;
+        delete mergedUserMessage.replyError;
+      }
+      merged[charId] = base;
+      return;
+    }
+    if (remoteFailed) {
+      base.pendingReply = { ...localPending, ...(remoteChat.pendingReply || {}), state: 'failed' };
+      if (mergedUserMessage) {
+        mergedUserMessage.replyState = 'failed';
+        mergedUserMessage.replyError = remoteUserMessage?.replyError || remoteChat.pendingReply?.error || '后台回复失败';
+      }
+      merged[charId] = base;
+      return;
+    }
+    base.pendingReply = { ...localPending, state: 'pending' };
+    merged[charId] = base;
   });
   return merged;
 }
@@ -5260,9 +5304,36 @@ function showReplyFailureReason(charId, messageId) {
   toast(`失败原因：${reason}`, 5200);
   return reason;
 }
+function expireStalePendingReply(chat, now = Date.now()) {
+  const pending = chat?.pendingReply;
+  if (!pending || !['pending', 'running'].includes(pending.state)) return false;
+  const message = pendingReplyMessage(chat);
+  if (!message) return false;
+  if ((chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === message.id)) {
+    delete chat.pendingReply;
+    delete message.replyState;
+    delete message.replyError;
+    return true;
+  }
+  const startedAt = Number(pending.createdAt || pending.updatedAt || message.time) || now;
+  if (now - startedAt < NATIVE_REPLY_STALE_MS) return false;
+  const error = '后台回复超时，请点击重新发送';
+  pending.state = 'failed';
+  pending.error = error;
+  pending.updatedAt = now;
+  message.replyState = 'failed';
+  message.replyError = error;
+  nativeReplyQueuedIds.delete(`reply_${message.id}`);
+  isStreaming = false;
+  return true;
+}
 function resumePendingAssistantTurns() {
   Object.entries(allChats || {}).forEach(([charId, chat]) => {
     ensureChatMessageIds(chat);
+    if (expireStalePendingReply(chat)) {
+      DB.set('chats', allChats);
+      return;
+    }
     const pending = chat?.pendingReply;
     if (!pending || !['pending', 'running'].includes(pending.state) || activeChatRequests.has(charId)) return;
     const message = pendingReplyMessage(chat);

@@ -98,3 +98,41 @@ test('an accepted FCM push stays pending until the matching phone acknowledges i
   assert.equal(acknowledged.status, 200);
   assert.equal(await env.AL_TIMER_KV.get('job:ack-job'), null);
 });
+
+test('FCM uses the documented Android high priority value and survives short offline periods', async () => {
+  const fcmRequests = [];
+  const originalFetch = globalThis.fetch;
+  const isolatedSource = readFileSync('cloud-timer-worker.js', 'utf8').replace(
+    'const accessToken = await getFirebaseAccessToken(env);',
+    "const accessToken = 'test-access-token';"
+  );
+  const isolatedWorker = await import(`data:text/javascript;base64,${Buffer.from(isolatedSource).toString('base64')}#fcm-payload-test`);
+  globalThis.fetch = async (url, options = {}) => {
+    fcmRequests.push({ url: String(url), options });
+    return new Response('{"name":"projects/test/messages/1"}', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  };
+  try {
+    const env = envFor();
+    const register = await post(env, '/register', {
+      deviceId: 'device-fcm',
+      transport: 'fcm',
+      fcmToken: 'token-fcm',
+      capabilities: { backgroundAck: 1 }
+    });
+    assert.equal(register.status, 200);
+    const trigger = await isolatedWorker.default.fetch(new Request('https://worker.example/trigger', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: 'device-fcm', charId: 'char-a', jobId: 'fcm-job', kind: 'chat' })
+    }), env);
+    assert.equal(trigger.status, 200);
+    const body = JSON.parse(fcmRequests[0].options.body);
+    assert.equal(body.message.android.priority, 'high');
+    assert.equal(body.message.android.ttl, '86400s');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

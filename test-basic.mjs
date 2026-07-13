@@ -31,11 +31,11 @@ assert.match(androidReplyQueuePlugin, /getString\("taskId"\)/);
 assert.match(androidReplyQueuePlugin, /putString\("event",\s*"pendingUserReply"\)/);
 assert.match(androidReplyQueuePlugin, /setRequiredNetworkType\(NetworkType\.CONNECTED\)/);
 assert.match(androidReplyQueuePlugin, /enqueueUniqueWork\([\s\S]*ExistingWorkPolicy\.KEEP/);
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v82';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v83';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-12\.75';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-13\.76';/);
 assert.match(script, /等待 FCM Token 超时，请确认 Google Play 服务可以联网后重试/);
 assert.match(script, /\}, API_TIMEOUT_MS\);/);
 assert.match(script, /绑定步骤 3\/3：已取得 FCM Token/);
@@ -146,7 +146,7 @@ assert.match(swScript, /composer\.add\('stage-persona', backgroundStagePersonaBl
 assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat', \{ signal: controller\.signal \}\)/);
 assert.match(script, /chat\.pendingReply = \{[\s\S]*userMessageId/);
 assert.match(script, /function resumePendingAssistantTurns\(\)/);
-assert.match(script, /function mergeLocalPendingReplies\(remoteChats = \{\}, localChats = \{\}\)/);
+assert.match(script, /function mergeLocalPendingReplies\(remoteChats = \{\}, localChats = \{\}, options = \{\}\)/);
 assert.match(script, /function preservePendingRepliesForUnload\(\)/);
 assert.match(script, /window\.addEventListener\('pagehide', preservePendingRepliesForUnload\)/);
 assert.match(script, /window\.addEventListener\('pageshow'/);
@@ -201,7 +201,7 @@ assert.doesNotMatch(swScript, /settings\.memoryApiUrl \|\| settings\.apiUrl/);
 assert.doesNotMatch(swScript, /settings\.memoryApiKey \|\| settings\.apiKey/);
 assert.match(swScript, /function mergeStreamText\(current = '', incoming = ''\)/);
 assert.match(swScript, /result = mergeStreamText\(result, delta\)/);
-assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-12\.12';/);
+assert.match(script, /const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-13\.13';/);
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
 assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
 assert.match(script, /const PROACTIVE_DICE_MAX_ROLLS = 432;/);
@@ -513,7 +513,7 @@ assert.match(script, /备份已导入，云闹钟需重新绑定/);
 assert.match(script, /已从备份恢复；云闹钟需要在本机重新绑定。/);
 const cloudTimerWorkerCode = cloudTimerWorker.replace(/\/\/.*$/gm, '');
 assert.doesNotMatch(cloudTimerWorkerCode, /\.list\s*\(/);
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-12\.12';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-13\.13';/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
 assert.match(cloudTimerWorker, /async function deferForFcmAck/);
@@ -521,6 +521,7 @@ assert.match(cloudTimerWorker, /awaitingAck: result\.transport === 'fcm' && Numb
 assert.match(cloudTimerWorker, /firebase\.messaging/);
 assert.match(script, /async function enableNativeCloudTimer/);
 assert.match(script, /async function restoreNativeBackgroundState/);
+assert.match(script, /String\(nativeIsNewer \? nativeState\.updatedAt : Date\.now\(\)\)/);
 assert.match(cloudTimerWorker, /const IDLE_CRON_HEARTBEAT_MINUTES = 10;/);
 assert.match(cloudTimerWorker, /const JOB_BUCKET_TTL_SECONDS = 7 \* 24 \* 60 \* 60;/);
 assert.match(cloudTimerWorker, /const hasActivity = !summary\.ok \|\| summary\.jobsSeen > 0/);
@@ -735,6 +736,8 @@ globalThis.__appTest = {
   normalizeMemoryProcessedCursor,
   memoryRelevantMessages,
   mergeLocalPendingReplies,
+  nativeStateHasMissingChatContent,
+  expireStalePendingReply,
   fetchModels,
   selectFetchedModel,
   recentMessages,
@@ -814,7 +817,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
 
 const aiPaymentText = '拿去买杯喝的😏\n<al_send_payment>{"type":"redpacket","amount":20.5,"note":"奶茶"}</al_send_payment>';
 assert.deepEqual(JSON.parse(JSON.stringify(extractAssistantPaymentDirective(aiPaymentText))), { type: 'redpacket', amount: 20.5, note: '奶茶' });
@@ -845,6 +848,48 @@ const completedNativeMerge = mergeLocalPendingReplies({
 });
 assert.equal(completedNativeMerge['char-a'].pendingReply, undefined, '后台已经回复后不得恢复前台旧 pending 状态');
 assert.equal(completedNativeMerge['char-a'].messages.filter(row => row.replyToMessageId === 'message-a').length, 1);
+assert.equal(nativeStateHasMissingChatContent({
+  allChats: {
+    'char-a': {
+      messages: [
+        { id: 'message-a', role: 'user', content: '什么时候欠你两个了', time: 1 },
+        { id: 'reply-a', role: 'assistant', content: '昨晚说的那次', time: 2, replyToMessageId: 'message-a' }
+      ]
+    }
+  }
+}, {
+  'char-a': {
+    messages: [{ id: 'message-a', role: 'user', content: '什么时候欠你两个了', time: 1, replyState: 'pending' }],
+    pendingReply: { userMessageId: 'message-a', state: 'pending' }
+  }
+}), true, '即使后台快照时间较旧，只要含本地缺失回复也必须恢复');
+const staleNativeMerge = mergeLocalPendingReplies({
+  'char-a': {
+    messages: [
+      { id: 'message-a', role: 'user', content: '什么时候欠你两个了', time: 1 },
+      { id: 'reply-a', role: 'assistant', content: '昨晚那次', time: 2, replyToMessageId: 'message-a' }
+    ]
+  }
+}, {
+  'char-a': {
+    messages: [
+      { id: 'message-a', role: 'user', content: '什么时候欠你两个了', time: 1, replyState: 'pending' },
+      { id: 'newer-local', role: 'assistant', content: '本地较新的主动消息', time: 3, proactive: true }
+    ],
+    pendingReply: { userMessageId: 'message-a', state: 'pending' }
+  }
+}, { preferRemote: false });
+assert.equal(staleNativeMerge['char-a'].pendingReply, undefined, '较旧后台快照中的真实回复也必须结束 pending');
+assert.equal(staleNativeMerge['char-a'].messages.some(row => row.id === 'reply-a'), true, '后台回复必须进入界面');
+assert.equal(staleNativeMerge['char-a'].messages.some(row => row.id === 'newer-local'), true, '恢复后台回复不能覆盖本地较新消息');
+const stalePendingChat = {
+  messages: [{ id: 'stale-user', role: 'user', content: '还在吗', time: 1, replyState: 'pending' }],
+  pendingReply: { userMessageId: 'stale-user', state: 'pending', createdAt: 1, updatedAt: 1 }
+};
+assert.equal(expireStalePendingReply(stalePendingChat, 10 * 60 * 1000), true);
+assert.equal(stalePendingChat.pendingReply.state, 'failed');
+assert.equal(stalePendingChat.messages[0].replyState, 'failed');
+assert.match(stalePendingChat.messages[0].replyError, /后台回复超时/);
 
 const retryProbe = await vm.runInContext(`(async () => {
   const savedChats = allChats;
