@@ -1232,7 +1232,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-13.77';
+const APP_BUILD_VERSION = '2026-07-13.78';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -7263,6 +7263,7 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
   for (const { char, chat } of rows) {
     try {
       if (!force && hasFutureCloudJob(chat, kind)) {
+        await syncNativeProactiveSnapshot(char.id, kind, chat[proactiveJobKey(kind)]);
         const syncKey = proactiveSyncKey(kind);
         const lastSync = Number(chat[syncKey] || 0);
         if (resync && (!lastSync || Date.now() - lastSync > CLOUD_TIMER_RESYNC_MS)) {

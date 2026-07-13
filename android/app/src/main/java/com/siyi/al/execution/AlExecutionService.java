@@ -15,6 +15,9 @@ import androidx.core.app.NotificationManagerCompat;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import com.siyi.al.execution.api.HttpResponse;
+import com.siyi.al.execution.api.UrlConnectionTransport;
+import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -108,7 +111,9 @@ public final class AlExecutionService extends Service {
 
     private void notifyCompletedTurns() {
         SharedPreferences notified = getSharedPreferences("al.execution.notifications", MODE_PRIVATE);
+        SharedPreferences acknowledged = getSharedPreferences("al.execution.cloud-acks", MODE_PRIVATE);
         for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
+            acknowledgeCloudTurn(turn, acknowledged);
             String key = "turn." + turn.turnId;
             if (notified.getBoolean(key, false)) continue;
             String title = characterName(turn);
@@ -122,6 +127,34 @@ public final class AlExecutionService extends Service {
             } catch (SecurityException ignored) {
                 // Android 13+ will deliver after the user grants notification permission.
             }
+        }
+    }
+
+    private void acknowledgeCloudTurn(ChatTurnEntity turn, SharedPreferences acknowledged) {
+        if (turn.cloudJobId == null || turn.cloudJobId.trim().isEmpty()) return;
+        String key = "turn." + turn.turnId;
+        if (acknowledged.getBoolean(key, false)) return;
+        try {
+            JSONObject snapshot = new JSONObject(turn.snapshotJson);
+            String endpoint = snapshot.optString("timerEndpoint", "").replaceAll("/+$", "");
+            String deviceId = snapshot.optString("deviceId", "").trim();
+            if (endpoint.isEmpty() || deviceId.isEmpty()) return;
+            JSONObject body = new JSONObject();
+            body.put("deviceId", deviceId);
+            body.put("jobId", turn.cloudJobId);
+            body.put("charId", turn.characterId);
+            body.put("kind", TurnKind.PROACTIVE_MOMENT.name().equals(turn.kind) ? "moment" : "chat");
+            body.put("outcome", "generated-native");
+            HttpResponse response = new UrlConnectionTransport().post(
+                endpoint + "/ack",
+                Collections.singletonMap("Content-Type", "application/json; charset=utf-8"),
+                body.toString()
+            );
+            if (response.status >= 200 && response.status < 300) {
+                acknowledged.edit().putBoolean(key, true).apply();
+            }
+        } catch (Exception ignored) {
+            // Keep the ack pending. The sticky service retries it on the next kick.
         }
     }
 

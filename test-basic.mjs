@@ -66,6 +66,8 @@ assert.match(executionService, /WakeLock/);
 assert.match(executionService, /notifyCompletedTurns/);
 assert.match(executionService, /completedTurns\(/);
 assert.match(executionService, /messageNotification\(/);
+assert.match(executionService, /acknowledgeCloudTurn\(/, 'completed native cloud turns must acknowledge the Worker');
+assert.match(executionService, /\/ack/, 'native cloud acknowledgement must use the Worker ack endpoint');
 assert.match(androidMainActivity, /registerPlugin\(AlExecutionPlugin\.class\)/);
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince']) {
@@ -81,6 +83,7 @@ assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
 assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');
 assert.match(html, /async function scheduleCloudProactive[\s\S]{0,5000}syncNativeProactiveSnapshot\(/, 'native snapshot must exist before a cloud timer is scheduled');
+assert.match(html, /if \(!force && hasFutureCloudJob\(chat, kind\)\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must receive native snapshots after an app upgrade');
 assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_push_queue/, 'FCM must wake the Room execution engine directly');
 assert.match(androidFcmService, /latestSnapshot\(/);
 assert.match(androidFcmService, /submitTurn\(/);
@@ -93,7 +96,7 @@ assert.match(swScript, /const CACHE_NAME = 'rpchat-v84';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-13\.77';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-13\.78';/);
 assert.match(script, /等待 FCM Token 超时，请确认 Google Play 服务可以联网后重试/);
 assert.match(script, /\}, API_TIMEOUT_MS\);/);
 assert.match(script, /绑定步骤 3\/3：已取得 FCM Token/);
