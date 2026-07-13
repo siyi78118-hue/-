@@ -60,4 +60,25 @@ public final class AlNotificationFactory {
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build();
     }
+
+    public Notification messageNotification(String title, String text, int requestCode) {
+        Intent open = new Intent(context, MainActivity.class)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent pending = PendingIntent.getActivity(
+            context,
+            requestCode,
+            open,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+        return new NotificationCompat.Builder(context, MESSAGE_CHANNEL)
+            .setSmallIcon(R.drawable.ic_al_notification)
+            .setContentTitle(title == null || title.trim().isEmpty() ? "AL" : title.trim())
+            .setContentText(text == null || text.trim().isEmpty() ? "收到一条新消息" : text.trim())
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
+            .setContentIntent(pending)
+            .setAutoCancel(true)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build();
+    }
 }

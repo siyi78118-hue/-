@@ -4,21 +4,29 @@ import android.app.ForegroundServiceStartNotAllowedException;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.core.content.ContextCompat;
+import androidx.core.app.NotificationManagerCompat;
+import com.siyi.al.execution.db.AlExecutionDatabase;
+import com.siyi.al.execution.db.ChatTurnEntity;
+import com.siyi.al.execution.db.ReplyPartEntity;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.json.JSONObject;
 
 public final class AlExecutionService extends Service {
     private static final long WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L;
     private final AtomicBoolean draining = new AtomicBoolean(false);
     private ExecutorService executor;
     private ExecutionEngine engine;
+    private AlExecutionDatabase database;
+    private AlNotificationFactory notifications;
     private PowerManager.WakeLock wakeLock;
     private volatile boolean recoveryComplete;
 
@@ -38,11 +46,12 @@ public final class AlExecutionService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
-        AlNotificationFactory notifications = new AlNotificationFactory(this);
+        notifications = new AlNotificationFactory(this);
         notifications.ensureChannels();
         startForeground(AlNotificationFactory.GUARD_NOTIFICATION_ID, notifications.guardNotification());
         executor = Executors.newSingleThreadExecutor();
         engine = ExecutionRuntime.create(this);
+        database = AlExecutionDatabase.get(this);
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AL:Execution");
         wakeLock.setReferenceCounted(false);
@@ -85,6 +94,7 @@ public final class AlExecutionService extends Service {
                 while (!Thread.currentThread().isInterrupted() && engine.runNext()) {
                     // Drain the single Room-backed queue before sleeping again.
                 }
+                notifyCompletedTurns();
             } finally {
                 if (wakeLock.isHeld()) wakeLock.release();
                 draining.set(false);
@@ -94,6 +104,42 @@ public final class AlExecutionService extends Service {
 
     private void acquireWakeLock() {
         if (!wakeLock.isHeld()) wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS);
+    }
+
+    private void notifyCompletedTurns() {
+        SharedPreferences notified = getSharedPreferences("al.execution.notifications", MODE_PRIVATE);
+        for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
+            String key = "turn." + turn.turnId;
+            if (notified.getBoolean(key, false)) continue;
+            String title = characterName(turn);
+            String text = notificationText(turn);
+            try {
+                NotificationManagerCompat.from(this).notify(
+                    72000 + Math.abs(turn.turnId.hashCode() % 20000),
+                    notifications.messageNotification(title, text, turn.turnId.hashCode())
+                );
+                notified.edit().putBoolean(key, true).apply();
+            } catch (SecurityException ignored) {
+                // Android 13+ will deliver after the user grants notification permission.
+            }
+        }
+    }
+
+    private String notificationText(ChatTurnEntity turn) {
+        for (ReplyPartEntity part : database.executionDao().replyParts(turn.turnId)) {
+            if ("TEXT".equals(part.type) && part.content != null && !part.content.trim().isEmpty()) return part.content.trim();
+            if ("REDPACKET".equals(part.type)) return "给你发了一个红包";
+            if ("TRANSFER".equals(part.type)) return "向你发起了一笔转账";
+        }
+        return "收到一条新消息";
+    }
+
+    private static String characterName(ChatTurnEntity turn) {
+        try {
+            String value = new JSONObject(turn.snapshotJson).optString("characterName", "").trim();
+            if (!value.isEmpty()) return value;
+        } catch (Exception ignored) {}
+        return "AL";
     }
 
     private static boolean isForegroundStartRestricted(RuntimeException error) {

@@ -1882,8 +1882,67 @@ async function buildAndroidUserReplySnapshot(charId, task) {
   return snapshot;
 }
 
-function nativeReplyQueuePlugin() {
-  return isNativeApp() ? window.Capacitor?.Plugins?.AlReplyQueue : null;
+function nativeExecutionPlugin() {
+  return isNativeApp() ? window.Capacitor?.Plugins?.AlExecution : null;
+}
+function nativeTurnIdForMessage(messageId) {
+  return `turn_${String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+}
+async function saveNativeExecutionApiConfigs() {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.saveApiConfig) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
+  if ((settings.chatApiType || 'openai') !== 'openai' || (settings.memoryApiType || 'openai') !== 'openai') {
+    throw new Error('当前原生后台执行仅支持 OpenAI 兼容接口');
+  }
+  const configs = [
+    { configId: 'chat-v1', baseUrl: settings.chatApiUrl, apiKey: cleanApiKey(settings.chatApiKey), model: settings.chatModel, temperature: 0.8 },
+    { configId: 'memory-v1', baseUrl: settings.memoryApiUrl, apiKey: cleanApiKey(settings.memoryApiKey), model: settings.memoryModel, temperature: 0.2 }
+  ];
+  for (const config of configs) {
+    if (!config.baseUrl || !config.apiKey || !config.model) throw new Error(`${config.configId === 'chat-v1' ? '聊天' : '记忆'}接口配置不完整`);
+    await plugin.saveApiConfig(config);
+  }
+}
+function nativeMemoryCandidateText(memory = {}, char = null) {
+  const rows = ['summaries', 'events', 'profiles'].flatMap(type =>
+    (Array.isArray(memory[type]) ? memory[type] : []).map(row => ({
+      type,
+      at: row.happenedAt || row.updatedAt || row.createdAt || '',
+      importance: Number(row.importance) || 0,
+      text: memoryAliasText(memoryTextForVector(row), char)
+    }))
+  ).filter(row => row.text && !memoryTextIsNoise(row.text));
+  rows.sort((a, b) => b.importance - a.importance || String(b.at).localeCompare(String(a.at)));
+  let used = 0;
+  return rows.slice(0, 160).filter(row => {
+    used += row.text.length;
+    return used <= 28000;
+  }).map(row => `[${row.type}｜${row.at || '时间未知'}] ${row.text}`).join('\n');
+}
+async function buildNativeExecutionSnapshot(charId, task) {
+  const char = characters.find(item => item.id === charId);
+  const chat = allChats[charId];
+  if (!char || !chat) throw new Error('找不到待回复的角色或会话');
+  const recent = sceneMessagesForAI(chat, 30);
+  const memory = await dumpCharacterMemoryForRunner(charId);
+  const candidates = nativeMemoryCandidateText(memory, char) || '本地记忆库暂无可用记录。';
+  const prompt = buildChatSceneSystem(char, chat, {
+    payment: task.options?.payment || null,
+    memoryPack: '',
+    returnPromptDetails: true
+  });
+  return {
+    characterName: charName(char),
+    memoryConfigId: 'memory-v1',
+    chatConfigId: 'chat-v1',
+    memorySystem: `你是 AL 的记忆筛选 AI。根据玩家本次消息和固定最近30条原文，从候选记忆中只挑选确实会改变本轮理解、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替角色回复玩家。只输出给聊天 AI 的简洁记忆补充，不输出 JSON。`,
+    memoryMessages: [{ role: 'user', content: `双方昵称：${playerName()} / ${charName(char)}\n玩家本次消息：${task.userText}\n\n固定最近30条原文：\n${recent.map((row, index) => `${index + 1}. ${row.role}: ${row.content}`).join('\n')}\n\n候选本地记忆：\n${candidates}` }],
+    memoryMaxTokens: 1400,
+    chatSystem: prompt.system,
+    chatMessages: recent,
+    chatMaxTokens: 1200,
+    createdAt: new Date().toISOString()
+  };
 }
 
 function pendingNativeReplyCount() {
@@ -1904,16 +1963,84 @@ function stopNativeReplyPollingIfIdle() {
 }
 
 async function reconcileNativeReplyState() {
-  const changed = await restoreNativeBackgroundState().catch(err => {
+  const executionChanged = await reconcileNativeExecutionTurns().catch(err => {
+    console.warn('[AL Native Execution] reconcile skipped:', err.message);
+    return false;
+  });
+  const mirrorChanged = await restoreNativeBackgroundState().catch(err => {
     console.warn('[AL Native Reply] state restore skipped:', err.message);
     return false;
   });
+  const changed = executionChanged || mirrorChanged;
   if (!changed) return false;
   resumePendingAssistantTurns();
   stopNativeReplyPollingIfIdle();
   if (activeScreen === 'chat') renderMessages();
   renderChats();
   return true;
+}
+
+function nativePartPayload(part) {
+  try { return JSON.parse(part?.payloadJson || '{}'); } catch { return {}; }
+}
+async function applyNativeExecutionTurn(result) {
+  const charId = result?.characterId;
+  const chat = allChats[charId];
+  const userMessage = messageById(chat, result?.sourceMessageId);
+  if (!chat || !userMessage) return false;
+  const state = String(result.state || result.storedState || '');
+  if (state === 'COMPLETED') {
+    const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
+    const alreadyAnswered = (chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === userMessage.id);
+    const text = parts.filter(part => part.type === 'TEXT').map(part => String(part.content || '').trim()).filter(Boolean).join('\n');
+    if (!alreadyAnswered && text) appendAssistantMessages(chat, text, { replyToMessageId: userMessage.id });
+    const sentPayment = parts.find(part => ['REDPACKET', 'TRANSFER'].includes(part.type));
+    if (!alreadyAnswered && sentPayment) {
+      const payload = nativePartPayload(sentPayment);
+      appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { replyToMessageId: userMessage.id });
+    }
+    const paymentStatus = parts.find(part => part.type === 'PAYMENT_STATUS');
+    const schedule = parts.find(part => part.type === 'SCHEDULE');
+    const pendingOptions = chat.pendingReply?.userMessageId === userMessage.id ? (chat.pendingReply.options || {}) : {};
+    if (paymentStatus) updatePaymentStatusFromReply(chat, pendingOptions.paymentMessageId, text, charId, nativePartPayload(paymentStatus).status);
+    if (schedule) {
+      const at = parseProactiveScheduleTime(nativePartPayload(schedule).nextProactiveAt);
+      schedulePlannedChatFromReply(charId, at ? { dueAt: at } : null).catch(err => console.warn('[AL Timer] native schedule skipped:', err.message));
+    }
+    ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment schedule skipped:', err.message));
+    delete userMessage.replyState;
+    delete userMessage.replyError;
+    if (chat.pendingReply?.userMessageId === userMessage.id) delete chat.pendingReply;
+    nativeReplyQueuedIds.delete(result.turnId);
+    processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native turn extraction skipped:', err.message));
+  } else if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
+    const reason = String(result.errorDetail || result.errorCode || '后台回复失败');
+    userMessage.replyState = 'failed';
+    userMessage.replyError = reason;
+    chat.pendingReply = { ...(chat.pendingReply || {}), userMessageId: userMessage.id, userText: userMessage.content, state: 'failed', error: reason, nativeTurnId: result.turnId, updatedAt: Date.now() };
+    nativeReplyQueuedIds.delete(result.turnId);
+  } else if (state === 'CANCELLED') {
+    delete userMessage.replyState;
+    delete userMessage.replyError;
+    if (chat.pendingReply?.userMessageId === userMessage.id) delete chat.pendingReply;
+    nativeReplyQueuedIds.delete(result.turnId);
+  } else {
+    userMessage.replyState = 'pending';
+    chat.pendingReply = { ...(chat.pendingReply || {}), userMessageId: userMessage.id, userText: userMessage.content, state: 'running', nativeTurnId: result.turnId, updatedAt: Date.now() };
+  }
+  DB.set('chats', allChats);
+  return true;
+}
+async function reconcileNativeExecutionTurns() {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.getTurn) return false;
+  const pending = Object.values(allChats || {}).flatMap(chat => chat?.pendingReply?.nativeTurnId ? [chat.pendingReply.nativeTurnId] : []);
+  let changed = false;
+  for (const turnId of [...new Set(pending)]) {
+    try { changed = await applyNativeExecutionTurn(await plugin.getTurn({ turnId })) || changed; }
+    catch (err) { console.warn('[AL Native Execution] getTurn failed:', turnId, err.message); }
+  }
+  return changed;
 }
 
 function completedNativeReplyCharIds(remoteChats = {}, localChats = {}) {
@@ -1941,37 +2068,42 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
   const userMessage = messageById(chat, userMessageId);
   if (!chat || !messageAvailableToAI(userMessage)) return false;
   if ((chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === userMessageId)) return true;
-  const runner = nativeBackgroundRunner();
-  const queuePlugin = nativeReplyQueuePlugin();
-  if (!runner?.dispatchEvent || !queuePlugin?.enqueue) throw new Error('安卓后台回复组件不可用，请更新或重新安装 AL');
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.submitTurn) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
   const task = buildAndroidUserReplyTask(charId, userMessageId, options.userText || chat.pendingReply?.userText || userMessage.content, options, Number(chat.pendingReply?.createdAt) || Date.now());
+  const turnId = nativeTurnIdForMessage(userMessageId);
   chat.pendingReply = {
     userMessageId,
     userText: task.userText,
     options: task.options,
     state: 'pending',
     createdAt: task.createdAt,
-    updatedAt: Date.now()
+    updatedAt: Date.now(),
+    nativeTurnId: turnId
   };
   userMessage.replyState = 'pending';
   delete userMessage.replyError;
-  nativeReplyQueuedIds.add(task.taskId);
+  nativeReplyQueuedIds.add(turnId);
   isStreaming = true;
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
   try {
-    const snapshot = await buildAndroidUserReplySnapshot(charId, task);
-    await syncNativeBackgroundState(snapshot);
-    await runner.dispatchEvent({
-      label: 'com.siyi.al.background',
-      event: 'queueUserReply',
-      details: { task: JSON.stringify(task) }
+    await saveNativeExecutionApiConfigs();
+    const snapshot = await buildNativeExecutionSnapshot(charId, task);
+    const result = await plugin.submitTurn({
+      turnId,
+      characterId: charId,
+      sourceMessageId: userMessageId,
+      kind: 'DIRECT_REPLY',
+      inputJson: JSON.stringify({ userText: task.userText, options: task.options }),
+      snapshotJson: JSON.stringify(snapshot),
+      createdAt: task.createdAt
     });
-    await queuePlugin.enqueue({ taskId: task.taskId, charId });
+    await applyNativeExecutionTurn(result);
     startNativeReplyPolling();
     return true;
   } catch (err) {
-    nativeReplyQueuedIds.delete(task.taskId);
+    nativeReplyQueuedIds.delete(turnId);
     chat.pendingReply.state = 'failed';
     chat.pendingReply.error = friendlyErrorMessage(err);
     userMessage.replyState = 'failed';
@@ -5001,10 +5133,19 @@ function closeMessageActions(event) {
   document.getElementById('message-action-mask')?.classList.remove('show');
   messageActionTarget = null;
 }
-function abortPendingReply(charId, messageId) {
+function abortPendingReply(charId, messageId, deleted = false) {
   const active = activeChatRequests.get(charId);
   if (active?.userMessageId === messageId) active.controller.abort('message-retracted');
   const chat = allChats[charId];
+  const nativeTurnId = chat?.pendingReply?.userMessageId === messageId
+    ? chat.pendingReply.nativeTurnId
+    : nativeTurnIdForMessage(messageId);
+  const plugin = nativeExecutionPlugin();
+  if (isNativeApp() && nativeTurnId && plugin?.cancelTurn) {
+    plugin.cancelTurn({ turnId: nativeTurnId, deleted }).catch(err => {
+      if (!/completed|Unknown turn/i.test(String(err?.message || err))) console.warn('[AL Native Execution] cancel skipped:', err.message);
+    });
+  }
   if (chat?.pendingReply?.userMessageId === messageId) delete chat.pendingReply;
   clearStreamingDraft(charId);
 }
@@ -5018,7 +5159,7 @@ async function retractMessage(charId, messageId) {
   const chat = allChats[charId];
   const message = messageById(chat, messageId);
   if (!chat || !message || message.role !== 'user' || message.retracted) return false;
-  abortPendingReply(charId, messageId);
+  abortPendingReply(charId, messageId, false);
   message.retracted = true;
   message.retractedAt = Date.now();
   delete message.replyState;
@@ -5032,7 +5173,7 @@ async function deleteChatMessage(charId, messageId) {
   const chat = allChats[charId];
   const index = (chat?.messages || []).findIndex(message => message.id === messageId);
   if (!chat || index < 0) return false;
-  abortPendingReply(charId, messageId);
+  abortPendingReply(charId, messageId, true);
   chat.messages.splice(index, 1);
   DB.set('chats', allChats);
   await adjustMemoryCursorAfterDeletion(charId, index);
@@ -5293,7 +5434,27 @@ async function retryFailedReply(charId, userMessageId) {
   delete message.replyError;
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
-  if (isNativeApp()) return queueAndroidUserReply(charId, userMessageId, savedOptions);
+  if (isNativeApp()) {
+    const plugin = nativeExecutionPlugin();
+    const turnId = oldPending?.nativeTurnId || nativeTurnIdForMessage(userMessageId);
+    chat.pendingReply.nativeTurnId = turnId;
+    try {
+      await saveNativeExecutionApiConfigs();
+      const result = await plugin.retryTurn({ turnId });
+      await applyNativeExecutionTurn(result);
+      startNativeReplyPolling();
+      return true;
+    } catch (err) {
+      const reason = friendlyErrorMessage(err);
+      chat.pendingReply.state = 'failed';
+      chat.pendingReply.error = reason;
+      message.replyState = 'failed';
+      message.replyError = reason;
+      DB.set('chats', allChats);
+      if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
+      return false;
+    }
+  }
   await continueAssistantTurn(charId, chat.pendingReply.userText, { ...savedOptions, userMessageId, resumed: true });
   return true;
 }
@@ -5307,6 +5468,7 @@ function showReplyFailureReason(charId, messageId) {
 function expireStalePendingReply(chat, now = Date.now()) {
   const pending = chat?.pendingReply;
   if (!pending || !['pending', 'running'].includes(pending.state)) return false;
+  if (pending.nativeTurnId && isNativeApp()) return false;
   const message = pendingReplyMessage(chat);
   if (!message) return false;
   if ((chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === message.id)) {

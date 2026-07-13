@@ -63,18 +63,22 @@ assert.match(androidManifest, /AlBootReceiver[\s\S]*BOOT_COMPLETED/);
 assert.match(executionService, /START_STICKY/);
 assert.match(executionService, /newSingleThreadExecutor/);
 assert.match(executionService, /WakeLock/);
+assert.match(executionService, /notifyCompletedTurns/);
+assert.match(executionService, /completedTurns\(/);
+assert.match(executionService, /messageNotification\(/);
 assert.match(androidMainActivity, /registerPlugin\(AlExecutionPlugin\.class\)/);
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 for (const method of ['saveApiConfig', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(androidMainActivity, /registerPlugin\(AlReplyQueuePlugin\.class\)/);
-assert.match(androidReplyQueuePlugin, /@CapacitorPlugin\(name\s*=\s*"AlReplyQueue"\)/);
-assert.match(androidReplyQueuePlugin, /@PluginMethod[\s\S]*void enqueue\(PluginCall call\)/);
-assert.match(androidReplyQueuePlugin, /getString\("taskId"\)/);
-assert.match(androidReplyQueuePlugin, /putString\("event",\s*"pendingUserReply"\)/);
-assert.match(androidReplyQueuePlugin, /setRequiredNetworkType\(NetworkType\.CONNECTED\)/);
-assert.match(androidReplyQueuePlugin, /enqueueUniqueWork\([\s\S]*ExistingWorkPolicy\.KEEP/);
+assert.match(html, /function\s+nativeExecutionPlugin\(\)/, 'web UI should use the native Room execution bridge');
+assert.match(html, /nativeExecutionPlugin\(\)[\s\S]{0,12000}\.submitTurn\(/, 'native sends should submit a durable Room turn');
+const nativeQueueBody = html.match(/async function queueAndroidUserReply\([\s\S]*?\n}\nasync function restoreNativeBackgroundState/)?.[0] || '';
+assert.doesNotMatch(nativeQueueBody, /nativeBackgroundRunner\(|AlReplyQueue|dispatchEvent\(/, 'native user replies must not fork into the legacy runner queue');
+assert.match(nativeQueueBody, /buildNativeExecutionSnapshot\(/, 'native user replies should carry an immutable execution snapshot');
+assert.match(html, /async function retryFailedReply[\s\S]{0,5000}plugin\.retryTurn\(/, 'native retry must create a fresh Room attempt');
+assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(/, 'retract and delete should cancel the native turn');
+assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
 assert.match(swScript, /const CACHE_NAME = 'rpchat-v84';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
@@ -153,8 +157,6 @@ assert.doesNotMatch(script, /return \{ summaries, events, profiles, vectors: \[\
 assert.match(script, /function completedNativeReplyCharIds\(remoteChats = \{\}, localChats = \{\}\)/);
 assert.match(script, /const completedReplyCharIds = completedNativeReplyCharIds\(nativeState\.allChats \|\| \{\}, allChats\);/);
 assert.match(script, /completedReplyCharIds\.forEach\(charId => processMemoryAfterTurn\(charId\)/);
-assert.match(script, /window\.Capacitor\?\.Plugins\?\.AlReplyQueue/);
-assert.match(script, /queuePlugin\?\.enqueue/);
 assert.match(script, /buildAndroidUserReplyTask\(charId, userMessageId, options\.userText \|\| chat\.pendingReply\?\.userText \|\| userMessage\.content/);
 assert.match(script, /queueAndroidUserReply\(requestCharId, message\.id, \{ userText: voicePrompt \}\)/);
 assert.match(script, /if \(isNativeApp\(\)\) return queueAndroidUserReply\(requestCharId, message\.id/);

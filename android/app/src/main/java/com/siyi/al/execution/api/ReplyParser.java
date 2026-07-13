@@ -10,6 +10,8 @@ import org.json.JSONObject;
 
 public final class ReplyParser {
     private static final Pattern PAYMENT = Pattern.compile("<al_send_payment>([\\s\\S]*?)</al_send_payment>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern PAYMENT_STATUS = Pattern.compile("<al_payment>([\\s\\S]*?)</al_payment>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SCHEDULE = Pattern.compile("<al_schedule>([\\s\\S]*?)</al_schedule>", Pattern.CASE_INSENSITIVE);
     private static final Pattern NO_REPLY = Pattern.compile("^[（(]?对方没有回复[）)]?[。！!]?$", Pattern.CASE_INSENSITIVE);
     private static final int MAX_TEXT_PARTS = 12;
 
@@ -17,6 +19,8 @@ public final class ReplyParser {
         String source = raw == null ? "" : raw;
         List<ParsedReplyPart> parts = new ArrayList<>();
         JSONObject payment = payment(source);
+        JSONObject paymentStatus = directive(PAYMENT_STATUS, source);
+        JSONObject schedule = directive(SCHEDULE, source);
         String clean = clean(source);
         for (String line : clean.split("\\n+")) {
             String content = line.trim();
@@ -39,11 +43,24 @@ public final class ReplyParser {
                 }
             }
         }
+        if (paymentStatus != null) {
+            String status = paymentStatus.optString("status", "").toLowerCase(Locale.ROOT);
+            if ("received".equals(status) || "pending".equals(status) || "refused".equals(status)) {
+                add(parts, turnId, attemptId, "PAYMENT_STATUS", "", paymentStatus.toString());
+            }
+        }
+        if (schedule != null && !schedule.optString("nextProactiveAt", "").trim().isEmpty()) {
+            add(parts, turnId, attemptId, "SCHEDULE", "", schedule.toString());
+        }
         return new ParsedReply(parts);
     }
 
     private static JSONObject payment(String source) {
-        Matcher match = PAYMENT.matcher(source);
+        return directive(PAYMENT, source);
+    }
+
+    private static JSONObject directive(Pattern pattern, String source) {
+        Matcher match = pattern.matcher(source);
         if (!match.find()) return null;
         try {
             return new JSONObject(match.group(1).trim());

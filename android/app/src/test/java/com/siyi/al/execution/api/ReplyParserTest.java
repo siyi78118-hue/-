@@ -44,4 +44,24 @@ public class ReplyParserTest {
         assertEquals(1, parsed.parts.size());
         assertEquals("下午好", parsed.parts.get(0).content);
     }
+
+    @Test
+    public void preservesHiddenScheduleAndPaymentStatusAsMetadata() {
+        ParsedReply parsed = parser.parse(
+            "行，那我收下了。\n<al_payment>{\"status\":\"received\"}</al_payment>\n" +
+                "<al_schedule>{\"nextProactiveAt\":\"2026-07-13T18:30:00+08:00\"}</al_schedule>",
+            "turn-4",
+            "attempt-4"
+        );
+
+        assertEquals(3, parsed.parts.size());
+        assertEquals("TEXT", parsed.parts.get(0).type);
+        assertEquals("PAYMENT_STATUS", parsed.parts.get(1).type);
+        assertEquals("received", new org.json.JSONObject(parsed.parts.get(1).payloadJson).getString("status"));
+        assertEquals("SCHEDULE", parsed.parts.get(2).type);
+        assertEquals(
+            "2026-07-13T18:30:00+08:00",
+            new org.json.JSONObject(parsed.parts.get(2).payloadJson).getString("nextProactiveAt")
+        );
+    }
 }
