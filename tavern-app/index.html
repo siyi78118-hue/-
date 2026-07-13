@@ -1945,6 +1945,73 @@ async function buildNativeExecutionSnapshot(charId, task) {
   };
 }
 
+async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.saveProactiveSnapshot) return false;
+  const char = characters.find(item => item.id === charId);
+  const chat = allChats[charId];
+  if (!char || !chat) throw new Error('找不到主动任务对应的角色或会话');
+  await saveNativeExecutionApiConfigs();
+
+  const now = new Date();
+  const memory = await dumpCharacterMemoryForRunner(charId);
+  const candidates = nativeMemoryCandidateText(memory, char) || '本地记忆库暂无可用记录。';
+  const triggerMode = normalizeProactiveTriggerMode(job?.mode || 'planned');
+  let chatSystem = '';
+  let chatMessages = [];
+  let memoryQuery = '';
+  if (kind === 'moment') {
+    const payload = buildMomentPostPayload(char, chat, '');
+    chatSystem = payload.system;
+    chatMessages = payload.messages;
+    memoryQuery = `角色朋友圈主动发布触发。\n${getTimeContext(now)}\n${charName(char)}准备主动发朋友圈。筛选会影响动态内容的关系、约定、近期经历、雷点和重要朋友圈互动。`;
+  } else {
+    const prompt = buildChatSceneSystem(char, chat, {
+      proactive: true,
+      proactiveNow: now,
+      proactiveTriggerMode: triggerMode,
+      proactiveTimeContext: buildProactiveTimeContext(chat, now, triggerMode),
+      memoryPack: '',
+      returnPromptDetails: true
+    });
+    chatSystem = prompt.system;
+    chatMessages = proactiveRecentMessages(chat, 30, now);
+    chatMessages.push({ role: 'user', content: buildProactiveTriggerMessage(char, chat, now, triggerMode) });
+    memoryQuery = buildProactiveMemoryQuery(chat, now, triggerMode);
+  }
+  const snapshot = {
+    characterName: charName(char),
+    playerName: playerName(),
+    memoryConfigId: 'memory-v1',
+    chatConfigId: 'chat-v1',
+    memorySystem: `你是 AL 的记忆筛选 AI。当前是${kind === 'moment' ? '角色主动发布朋友圈' : '角色主动发起私聊'}场景。只从候选记忆中挑选确实会改变本次表达、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替角色输出正文。只输出给聊天 AI 的简洁记忆补充。`,
+    memoryMessages: [{ role: 'user', content: `${memoryQuery}\n\n候选本地记忆：\n${candidates}` }],
+    memoryMaxTokens: 1400,
+    chatSystem,
+    chatMessages,
+    chatMaxTokens: kind === 'moment' ? 500 : 1200,
+    proactiveKind: kind,
+    proactiveMode: triggerMode,
+    cloudJobId: job?.jobId || '',
+    timerEndpoint: settings.timerEndpoint || '',
+    deviceId: settings.deviceId || '',
+    createdAt: now.toISOString()
+  };
+  await plugin.saveProactiveSnapshot({
+    snapshotId: `${charId}:${kind}`,
+    characterId: charId,
+    characterName: charName(char),
+    playerName: playerName(),
+    systemPrompt: kind === 'chat' ? chatSystem : '',
+    momentSystemPrompt: kind === 'moment' ? chatSystem : '',
+    chatConfigId: 'chat-v1',
+    memoryConfigId: 'memory-v1',
+    snapshotJson: JSON.stringify(snapshot),
+    createdAt: Date.now()
+  });
+  return true;
+}
+
 function pendingNativeReplyCount() {
   return Object.values(allChats || {}).filter(chat => {
     const pending = chat?.pendingReply;
@@ -1986,8 +2053,54 @@ function nativePartPayload(part) {
 async function applyNativeExecutionTurn(result) {
   const charId = result?.characterId;
   const chat = allChats[charId];
+  const kind = String(result?.kind || 'DIRECT_REPLY');
+  if (!chat) return false;
+  if (kind === 'PROACTIVE_CHAT' || kind === 'PROACTIVE_MOMENT') {
+    const state = String(result.state || result.storedState || '');
+    const sourceTurnId = `native:${result.turnId}`;
+    if (state === 'COMPLETED') {
+      const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
+      const text = parts.filter(part => part.type === 'TEXT').map(part => String(part.content || '').trim()).filter(Boolean).join('\n');
+      if (kind === 'PROACTIVE_MOMENT') {
+        const exists = (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
+        if (!exists && text) createCharacterMoment(charId, text, { proactive: true, sourceTurnId });
+        delete chat.pendingMomentJob;
+        chat.lastProactiveMomentAt = Number(result.completedAt) || Date.now();
+        ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment reschedule skipped:', err.message));
+      } else {
+        const exists = (chat.messages || []).some(row => row.role === 'assistant' && row.sourceTurnId === sourceTurnId);
+        if (!exists && text) appendAssistantMessages(chat, text, { proactive: true, proactiveMode: 'native', sourceTurnId });
+        const sentPayment = parts.find(part => ['REDPACKET', 'TRANSFER'].includes(part.type));
+        if (!exists && sentPayment) {
+          const payload = nativePartPayload(sentPayment);
+          appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { proactive: true, proactiveMode: 'native', sourceTurnId, sourceReplyId: sourceTurnId });
+        }
+        delete chat.pendingProactiveJob;
+        chat.lastProactiveAt = Number(result.completedAt) || Date.now();
+        chat.lastProactiveChatAt = chat.lastProactiveAt;
+        if (!exists && (text || sentPayment) && (activeScreen !== 'chat' || currentCharId !== charId)) chat.unread = (chat.unread || 0) + 1;
+        ensureDiceProactiveScheduled(charId, 'chat').catch(err => console.warn('[AL Timer] native chat reschedule skipped:', err.message));
+        processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native proactive extraction skipped:', err.message));
+      }
+      DB.set('chats', allChats);
+      return true;
+    }
+    if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
+      const reason = String(result.errorDetail || result.errorCode || '原生主动生成失败');
+      if (kind === 'PROACTIVE_MOMENT') {
+        chat.lastProactiveMomentFailedAt = Date.now();
+        chat.lastProactiveMomentError = reason;
+      } else {
+        chat.lastProactiveChatFailedAt = Date.now();
+        chat.lastProactiveChatError = reason;
+      }
+      DB.set('chats', allChats);
+      return true;
+    }
+    return false;
+  }
   const userMessage = messageById(chat, result?.sourceMessageId);
-  if (!chat || !userMessage) return false;
+  if (!userMessage) return false;
   const state = String(result.state || result.storedState || '');
   if (state === 'COMPLETED') {
     const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
@@ -2034,8 +2147,23 @@ async function applyNativeExecutionTurn(result) {
 async function reconcileNativeExecutionTurns() {
   const plugin = nativeExecutionPlugin();
   if (!plugin?.getTurn) return false;
-  const pending = Object.values(allChats || {}).flatMap(chat => chat?.pendingReply?.nativeTurnId ? [chat.pendingReply.nativeTurnId] : []);
+  const cursorKey = 'rpchat_native_execution_cursor';
+  let cursor = Number(localStorage.getItem(cursorKey)) || 0;
   let changed = false;
+  if (plugin.changesSince) {
+    const page = await plugin.changesSince({ cursor, limit: 200 });
+    for (const event of Array.isArray(page?.changes) ? page.changes : []) {
+      try {
+        changed = await applyNativeExecutionTurn(await plugin.getTurn({ turnId: event.turnId })) || changed;
+        cursor = Math.max(cursor, Number(event.cursor) || 0);
+        localStorage.setItem(cursorKey, String(cursor));
+      } catch (err) {
+        console.warn('[AL Native Execution] change apply failed:', event.turnId, err.message);
+        break;
+      }
+    }
+  }
+  const pending = Object.values(allChats || {}).flatMap(chat => chat?.pendingReply?.nativeTurnId ? [chat.pendingReply.nativeTurnId] : []);
   for (const turnId of [...new Set(pending)]) {
     try { changed = await applyNativeExecutionTurn(await plugin.getTurn({ turnId })) || changed; }
     catch (err) { console.warn('[AL Native Execution] getTurn failed:', turnId, err.message); }
@@ -3912,7 +4040,8 @@ function createCharacterMoment(charId, text, options = {}) {
     likes: [],
     comments: [],
     proactive: !!options.proactive,
-    fromChat: !!options.fromChat
+    fromChat: !!options.fromChat,
+    sourceTurnId: options.sourceTurnId || ''
   };
   allMoments.unshift(moment);
   recordMomentMemoryEvent(char.id, `${char.name}在朋友圈发布动态：“${momentSnippet(clean)}”`, now);
@@ -7189,6 +7318,7 @@ async function scheduleCloudProactive(charId, kind = 'chat', options = {}) {
   if (!cloudTimerTransportReady()) return true;
   await mirrorAppStateNow();
   try {
+    await syncNativeProactiveSnapshot(charId, kind, chat[jobKey]);
     await postCloudSchedule(charId, chat[jobKey], kind);
     if (previousJob?.jobId && previousJob.jobId !== chat[jobKey].jobId) {
       cancelCloudJobId(previousJob.jobId).catch(err => console.warn('[AL Timer] stale job cleanup skipped:', err.message));
@@ -7216,6 +7346,7 @@ async function resubmitCloudProactive(charId, kind = 'chat') {
   ensureDeviceId();
   if (!chat[jobKey].jobId) chat[jobKey].jobId = proactiveJobId(charId, kind);
   chat[jobKey].kind = kind;
+  await syncNativeProactiveSnapshot(charId, kind, chat[jobKey]);
   await postCloudSchedule(charId, chat[jobKey], kind);
   chat[proactiveSyncKey(kind)] = Date.now();
   DB.set('chats', allChats);

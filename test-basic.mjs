@@ -68,7 +68,7 @@ assert.match(executionService, /completedTurns\(/);
 assert.match(executionService, /messageNotification\(/);
 assert.match(androidMainActivity, /registerPlugin\(AlExecutionPlugin\.class\)/);
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
-for (const method of ['saveApiConfig', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince']) {
+for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
 assert.match(html, /function\s+nativeExecutionPlugin\(\)/, 'web UI should use the native Room execution bridge');
@@ -79,6 +79,16 @@ assert.match(nativeQueueBody, /buildNativeExecutionSnapshot\(/, 'native user rep
 assert.match(html, /async function retryFailedReply[\s\S]{0,5000}plugin\.retryTurn\(/, 'native retry must create a fresh Room attempt');
 assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(/, 'retract and delete should cancel the native turn');
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
+assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');
+assert.match(html, /async function scheduleCloudProactive[\s\S]{0,5000}syncNativeProactiveSnapshot\(/, 'native snapshot must exist before a cloud timer is scheduled');
+assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_push_queue/, 'FCM must wake the Room execution engine directly');
+assert.match(androidFcmService, /latestSnapshot\(/);
+assert.match(androidFcmService, /submitTurn\(/);
+assert.match(androidFcmService, /AlExecutionService\.requestRun\(/);
+assert.match(html, /async function reconcileNativeExecutionTurns[\s\S]{0,2500}plugin\.changesSince\(/, 'web UI must consume Room changes created while WebView was absent');
+assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_CHAT/, 'native proactive chat results must be applied to chat UI');
+assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_MOMENT/, 'native proactive moment results must be applied to moments UI');
+assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(swScript, /const CACHE_NAME = 'rpchat-v84';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
@@ -105,8 +115,6 @@ assert.match(nativeBackgroundRunner, /memory API fallback/);
 assert.match(nativeBackgroundRunner, /acknowledgeCloudJob/);
 assert.match(nativeBackgroundRunner, /dequeuePendingPush/);
 assert.match(nativeBackgroundRunner, /addEventListener\('pendingUserReply'/);
-assert.match(androidFcmService, /pending_push_queue/);
-assert.match(androidFcmService, /ExistingWorkPolicy\.APPEND_OR_REPLACE/);
 assert.equal(capacitorConfig.appId, 'com.siyi.al');
 assert.equal(capacitorConfig.webDir, 'tavern-app');
 assert.equal(capacitorConfig.server?.url, undefined, 'Android App 不得依赖远程网站首页');

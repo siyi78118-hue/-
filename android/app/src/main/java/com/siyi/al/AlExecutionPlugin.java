@@ -14,6 +14,7 @@ import com.siyi.al.execution.api.ApiConfig;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
+import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.secure.AlSecretStore;
@@ -54,6 +55,29 @@ public final class AlExecutionPlugin extends Plugin {
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("configId", configId);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void saveProactiveSnapshot(PluginCall call) {
+        execute(call, () -> {
+            CharacterSnapshotEntity snapshot = new CharacterSnapshotEntity();
+            snapshot.snapshotId = required(call, "snapshotId");
+            snapshot.characterId = required(call, "characterId");
+            snapshot.characterName = call.getString("characterName", "AL");
+            snapshot.playerName = call.getString("playerName", "我");
+            snapshot.systemPrompt = call.getString("systemPrompt", "");
+            snapshot.momentSystemPrompt = call.getString("momentSystemPrompt", "");
+            snapshot.contextJson = required(call, "snapshotJson");
+            snapshot.chatConfigId = call.getString("chatConfigId", "chat-v1");
+            snapshot.memoryConfigId = call.getString("memoryConfigId", "memory-v1");
+            Long createdAt = call.getLong("createdAt", System.currentTimeMillis());
+            snapshot.createdAt = createdAt == null ? System.currentTimeMillis() : createdAt;
+            AlExecutionDatabase.get(getContext()).executionDao().upsertSnapshot(snapshot);
+            JSObject result = new JSObject();
+            result.put("saved", true);
+            result.put("snapshotId", snapshot.snapshotId);
             return result;
         });
     }

@@ -37,6 +37,9 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM chat_turns WHERE sourceMessageId = :sourceMessageId LIMIT 1")
     ChatTurnEntity turnBySourceMessage(String sourceMessageId);
 
+    @Query("SELECT * FROM character_snapshots WHERE snapshotId = :snapshotId LIMIT 1")
+    CharacterSnapshotEntity latestSnapshot(String snapshotId);
+
     @Query("SELECT * FROM execution_attempts WHERE attemptId = :attemptId LIMIT 1")
     ExecutionAttemptEntity attempt(String attemptId);
 
