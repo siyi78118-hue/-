@@ -37,14 +37,21 @@ public class TurnStateMachineTest {
     }
 
     @Test
-    public void cancelledAndFinalFailuresAreTerminal() {
+    public void cancelledTurnIsTerminal() {
         assertThrows(
             IllegalStateException.class,
             () -> TurnStateMachine.requireTransition(TurnState.CANCELLED, TurnState.QUEUED)
         );
-        assertThrows(
-            IllegalStateException.class,
-            () -> TurnStateMachine.requireTransition(TurnState.FAILED_FINAL, TurnState.QUEUED)
-        );
+    }
+
+    @Test
+    public void retryOnlyStartsFromFailedOrInterruptedState() {
+        assertEquals(true, TurnStateMachine.canStartRetry(TurnState.FAILED_RETRYABLE));
+        assertEquals(true, TurnStateMachine.canStartRetry(TurnState.FAILED_FINAL));
+        assertEquals(true, TurnStateMachine.canStartRetry(TurnState.INTERRUPTED));
+        TurnStateMachine.requireTransition(TurnState.FAILED_FINAL, TurnState.QUEUED);
+        assertEquals(false, TurnStateMachine.canStartRetry(TurnState.QUEUED));
+        assertEquals(false, TurnStateMachine.canStartRetry(TurnState.CHAT_RUNNING));
+        assertEquals(false, TurnStateMachine.canStartRetry(TurnState.COMPLETED));
     }
 }

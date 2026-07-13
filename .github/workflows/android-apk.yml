@@ -68,6 +68,10 @@ jobs:
         working-directory: android
         run: chmod +x gradlew
 
+      - name: Run native Android checks
+        working-directory: android
+        run: ./gradlew testDebugUnitTest assembleDebugAndroidTest --no-daemon
+
       - name: Build release and compatibility APKs
         working-directory: android
         env:

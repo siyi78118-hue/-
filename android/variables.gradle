@@ -15,4 +15,5 @@ ext {
     cordovaAndroidVersion = '14.0.1'
     workManagerVersion = '2.11.0'
     firebaseMessagingVersion = '25.0.1'
+    roomVersion = '2.8.4'
 }

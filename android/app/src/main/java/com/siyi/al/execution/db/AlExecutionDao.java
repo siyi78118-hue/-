@@ -1,0 +1,110 @@
+package com.siyi.al.execution.db;
+
+import androidx.room.Dao;
+import androidx.room.Insert;
+import androidx.room.OnConflictStrategy;
+import androidx.room.Query;
+import androidx.room.Transaction;
+import com.siyi.al.execution.StaleAttemptException;
+import java.util.List;
+
+@Dao
+public interface AlExecutionDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertTurn(ChatTurnEntity turn);
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    void insertAttempt(ExecutionAttemptEntity attempt);
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    void insertReplyParts(List<ReplyPartEntity> parts);
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    void upsertMemory(List<MemoryRecordEntity> rows);
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    void upsertSnapshot(CharacterSnapshotEntity snapshot);
+
+    @Insert
+    long insertDiagnostic(DiagnosticEntity diagnostic);
+
+    @Insert
+    long insertChange(ChangeEventEntity change);
+
+    @Query("SELECT * FROM chat_turns WHERE turnId = :turnId LIMIT 1")
+    ChatTurnEntity turn(String turnId);
+
+    @Query("SELECT * FROM chat_turns WHERE sourceMessageId = :sourceMessageId LIMIT 1")
+    ChatTurnEntity turnBySourceMessage(String sourceMessageId);
+
+    @Query("SELECT * FROM execution_attempts WHERE attemptId = :attemptId LIMIT 1")
+    ExecutionAttemptEntity attempt(String attemptId);
+
+    @Query("SELECT * FROM execution_attempts WHERE turnId = :turnId ORDER BY sequence DESC")
+    List<ExecutionAttemptEntity> attempts(String turnId);
+
+    @Query("SELECT COALESCE(MAX(sequence), 0) FROM execution_attempts WHERE turnId = :turnId")
+    int maxAttemptSequence(String turnId);
+
+    @Query("SELECT * FROM reply_parts WHERE turnId = :turnId ORDER BY sequence ASC")
+    List<ReplyPartEntity> replyParts(String turnId);
+
+    @Query("SELECT COUNT(*) FROM reply_parts WHERE turnId = :turnId")
+    int replyPartCount(String turnId);
+
+    @Query("UPDATE chat_turns SET activeAttemptId = :attemptId, state = 'QUEUED', updatedAt = :now, completedAt = NULL WHERE turnId = :turnId")
+    int activateAttempt(String turnId, String attemptId, long now);
+
+    @Query("UPDATE chat_turns SET state = :state, updatedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId")
+    int updateTurnState(String turnId, String attemptId, String state, long now);
+
+    @Query("UPDATE execution_attempts SET stage = :stage, state = :state, heartbeatAt = :now WHERE attemptId = :attemptId")
+    int updateAttemptStage(String attemptId, String stage, String state, long now);
+
+    @Query("UPDATE execution_attempts SET memoryResult = :memoryResult, stage = 'CHAT', state = 'MEMORY_DONE', heartbeatAt = :now WHERE attemptId = :attemptId")
+    int saveMemoryResult(String attemptId, String memoryResult, long now);
+
+    @Query("UPDATE execution_attempts SET rawReply = :rawReply, stage = 'COMMIT', state = 'CHAT_DONE', heartbeatAt = :now WHERE attemptId = :attemptId")
+    int saveRawReply(String attemptId, String rawReply, long now);
+
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId")
+    int completeTurn(String turnId, String attemptId, long now);
+
+    @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId")
+    int completeAttempt(String attemptId, long now);
+
+    @Query("UPDATE chat_turns SET state = :state, updatedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId")
+    int markTurnFailed(String turnId, String attemptId, String state, long now);
+
+    @Query("UPDATE execution_attempts SET state = :state, errorCode = :code, errorDetail = :detail, retryable = :retryable, heartbeatAt = :now, finishedAt = :now WHERE attemptId = :attemptId")
+    int markAttemptFailed(String attemptId, String state, String code, String detail, boolean retryable, long now);
+
+    @Query("SELECT * FROM change_events WHERE cursor > :cursor ORDER BY cursor ASC LIMIT :limit")
+    List<ChangeEventEntity> changesAfter(long cursor, int limit);
+
+    @Transaction
+    default void commitReply(
+        String turnId,
+        String attemptId,
+        List<ReplyPartEntity> parts,
+        long now
+    ) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null || attemptId == null || !attemptId.equals(turn.activeAttemptId)) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+        if (replyPartCount(turnId) == 0) {
+            insertReplyParts(parts);
+        }
+        if (completeTurn(turnId, attemptId, now) != 1) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+        completeAttempt(attemptId, now);
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "REPLY_COMMITTED";
+        change.payloadJson = "{\"turnId\":\"" + turnId + "\"}";
+        change.createdAt = now;
+        insertChange(change);
+    }
+}

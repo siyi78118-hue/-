@@ -49,6 +49,10 @@ public final class TurnStateMachine {
             EnumSet.of(TurnState.QUEUED, TurnState.CANCELLED)
         );
         LEGAL.put(
+            TurnState.FAILED_FINAL,
+            EnumSet.of(TurnState.QUEUED, TurnState.CANCELLED)
+        );
+        LEGAL.put(
             TurnState.INTERRUPTED,
             EnumSet.of(TurnState.QUEUED, TurnState.CANCELLED)
         );
@@ -65,5 +69,11 @@ public final class TurnStateMachine {
 
     public static TurnState deriveDisplayState(boolean hasReply, TurnState stored) {
         return hasReply ? TurnState.COMPLETED : stored;
+    }
+
+    public static boolean canStartRetry(TurnState state) {
+        return state == TurnState.FAILED_RETRYABLE
+            || state == TurnState.FAILED_FINAL
+            || state == TurnState.INTERRUPTED;
     }
 }
