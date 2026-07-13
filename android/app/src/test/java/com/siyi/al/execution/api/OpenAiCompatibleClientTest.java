@@ -4,6 +4,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import org.json.JSONArray;
 import org.junit.Test;
@@ -45,6 +47,34 @@ public class OpenAiCompatibleClientTest {
         OpenAiCompatibleClient client = new OpenAiCompatibleClient(transport);
 
         assertEquals("第一句😊", client.call(config(), "sys", new JSONArray(), 1000));
+    }
+
+    @Test
+    public void retriesWithoutTemperatureWhenModelRejectsDeprecatedParameter() throws Exception {
+        List<String> bodies = new ArrayList<>();
+        HttpTransport transport = new HttpTransport() {
+            private int calls;
+
+            @Override
+            public HttpResponse post(String url, Map<String, String> headers, String body) {
+                bodies.add(body);
+                calls++;
+                if (calls == 1) {
+                    return new HttpResponse(
+                        400,
+                        "application/json",
+                        "{\"error\":{\"message\":\"`temperature` is deprecated for this model.\",\"type\":\"invalid_request_error\",\"param\":\"temperature\"}}"
+                    );
+                }
+                return new HttpResponse(200, "application/json", "{\"choices\":[{\"message\":{\"content\":\"补发成功\"}}]}");
+            }
+        };
+        OpenAiCompatibleClient client = new OpenAiCompatibleClient(transport);
+
+        assertEquals("补发成功", client.call(config(), "sys", new JSONArray(), 1000));
+        assertEquals(2, bodies.size());
+        assertEquals(true, bodies.get(0).contains("\"temperature\""));
+        assertFalse(bodies.get(1).contains("\"temperature\""));
     }
 
     private static ApiConfig config() {

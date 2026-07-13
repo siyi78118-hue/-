@@ -38,7 +38,23 @@ public final class OpenAiCompatibleClient {
         headers.put("Accept", "application/json");
         headers.put("Authorization", "Bearer " + config.apiKey);
         HttpResponse response = transport.post(endpoint(config.baseUrl), headers, request.toString());
+        if (rejectsTemperature(response)) {
+            request.remove("temperature");
+            response = transport.post(endpoint(config.baseUrl), headers, request.toString());
+        }
         return parseResponse(response);
+    }
+
+    private static boolean rejectsTemperature(HttpResponse response) {
+        if (response.status != 400) return false;
+        String body = response.body.toLowerCase();
+        if (!body.contains("temperature")) return false;
+        return body.contains("deprecated")
+            || body.contains("unsupported")
+            || body.contains("not supported")
+            || body.contains("invalid_request_error")
+            || body.contains("\"param\":\"temperature\"")
+            || body.contains("\"param\": \"temperature\"");
     }
 
     static String endpoint(String baseUrl) {
