@@ -18,13 +18,14 @@ const wranglerRunScript = readFileSync('scripts/run-wrangler.mjs', 'utf8');
 const capacitorConfig = JSON.parse(readFileSync('capacitor.config.json', 'utf8'));
 const androidManifest = readFileSync('android/app/src/main/AndroidManifest.xml', 'utf8');
 const androidBuildGradle = readFileSync('android/app/build.gradle', 'utf8');
+const androidCapacitorBuildGradle = readFileSync('android/app/capacitor.build.gradle', 'utf8');
 const androidVariablesGradle = readFileSync('android/variables.gradle', 'utf8');
 const androidWorkflow = readFileSync('.github/workflows/android-apk.yml', 'utf8');
 const androidFcmService = readFileSync('android/app/src/main/java/com/siyi/al/AlFirebaseMessagingService.java', 'utf8');
 const androidMainActivity = readFileSync('android/app/src/main/java/com/siyi/al/MainActivity.java', 'utf8');
 const androidReplyQueuePath = 'android/app/src/main/java/com/siyi/al/AlReplyQueuePlugin.java';
 const androidReplyQueuePlugin = existsSync(androidReplyQueuePath) ? readFileSync(androidReplyQueuePath, 'utf8') : '';
-const nativeBackgroundRunner = readFileSync('tavern-app/runners/al-background.js', 'utf8');
+const nativeBackgroundRunnerPath = 'tavern-app/runners/al-background.js';
 const executionDbPath = 'android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java';
 const executionDaoPath = 'android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java';
 const executionStorePath = 'android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java';
@@ -71,6 +72,13 @@ assert.match(executionService, /messageNotification\(/);
 assert.match(executionService, /acknowledgeCloudTurn\(/, 'completed native cloud turns must acknowledge the Worker');
 assert.match(executionService, /\/ack/, 'native cloud acknowledgement must use the Worker ack endpoint');
 assert.match(androidMainActivity, /registerPlugin\(AlExecutionPlugin\.class\)/);
+assert.equal(packageJson.dependencies?.['@capacitor/background-runner'], undefined, 'unstable QuickJS background runner must not ship beside the Room execution engine');
+assert.equal(capacitorConfig.plugins?.BackgroundRunner, undefined, 'Capacitor config must not instantiate the retired QuickJS runner');
+assert.doesNotMatch(androidCapacitorBuildGradle, /capacitor-background-runner/, 'Android build must not package libJSEngine from the retired runner');
+assert.doesNotMatch(androidMainActivity, /AlReplyQueuePlugin/, 'MainActivity must not register the retired runner queue');
+assert.equal(existsSync(androidReplyQueuePath), false, 'retired RunnerWorker bridge must be removed');
+assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS runner source must be removed');
+assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
@@ -82,7 +90,7 @@ assert.match(html, /plugin\.unappliedCompletedTurns\(/, 'foreground reconciliati
 assert.match(html, /await\s+plugin\.acknowledgeUiApplied\(/, 'the web UI must acknowledge a native result only after applying it');
 assert.match(html, /function\s+nativeExecutionPlugin\(\)/, 'web UI should use the native Room execution bridge');
 assert.match(html, /nativeExecutionPlugin\(\)[\s\S]{0,12000}\.submitTurn\(/, 'native sends should submit a durable Room turn');
-const nativeQueueBody = html.match(/async function queueAndroidUserReply\([\s\S]*?\n}\nasync function restoreNativeBackgroundState/)?.[0] || '';
+const nativeQueueBody = html.match(/async function queueAndroidUserReply\([\s\S]*?\n}\nasync function mirrorAppStateNow/)?.[0] || '';
 assert.doesNotMatch(nativeQueueBody, /nativeBackgroundRunner\(|AlReplyQueue|dispatchEvent\(/, 'native user replies must not fork into the legacy runner queue');
 assert.match(nativeQueueBody, /buildNativeExecutionSnapshot\(/, 'native user replies should carry an immutable execution snapshot');
 assert.match(html, /async function retryFailedReply[\s\S]{0,5000}plugin\.retryTurn\(/, 'native retry must create a fresh Room attempt');
@@ -135,10 +143,6 @@ assert.match(apiEndpointHelper, /请求落到了网页而不是模型接口/);
 assert.match(script, /capabilities: \{ backgroundAck: 1 \}/);
 assert.match(script, /refreshNativeCloudRegistration\(\)/);
 assert.match(swScript, /API returned HTML page/);
-assert.match(nativeBackgroundRunner, /memory API fallback/);
-assert.match(nativeBackgroundRunner, /acknowledgeCloudJob/);
-assert.match(nativeBackgroundRunner, /dequeuePendingPush/);
-assert.match(nativeBackgroundRunner, /addEventListener\('pendingUserReply'/);
 assert.equal(capacitorConfig.appId, 'com.siyi.al');
 assert.equal(capacitorConfig.webDir, 'tavern-app');
 assert.equal(capacitorConfig.server?.url, undefined, 'Android App 不得依赖远程网站首页');
@@ -179,16 +183,8 @@ assert.match(script, /事件发生时间必须来自本批消息前面的“消�
 assert.match(script, /happenedAt: resolveMemoryEventTime\(e, sourceBatch\)/);
 assert.match(script, /storeExtractedMemory\(charId, extracted, batch\)/);
 assert.match(script, /async function queueAndroidUserReply\(charId, userMessageId, options = \{\}\)/);
-assert.match(script, /async function buildAndroidUserReplySnapshot\(charId, task\)/);
-assert.match(script, /memoryScope: options\.memoryScope \|\| null/);
-assert.match(script, /buildNativeBackgroundSnapshot\(\{ memory, memoryScope: \{ type: 'character', charId \} \}\)/);
-assert.match(script, /async function restoreNativeMemory\(nativeState = \{\}\)/);
-assert.match(script, /const scopedCharId = nativeState\.memoryScope\?\.type === 'character'/);
-assert.match(script, /const preserved = \(await MemoryDB\.all\(store\)\)\.filter\(row => row\.charId !== scopedCharId\)/);
+assert.match(script, /async function buildNativeExecutionSnapshot\(charId, task\)/);
 assert.doesNotMatch(script, /return \{ summaries, events, profiles, vectors: \[\], meta: \[\] \};/);
-assert.match(script, /function completedNativeReplyCharIds\(remoteChats = \{\}, localChats = \{\}\)/);
-assert.match(script, /const completedReplyCharIds = completedNativeReplyCharIds\(nativeState\.allChats \|\| \{\}, allChats\);/);
-assert.match(script, /completedReplyCharIds\.forEach\(charId => processMemoryAfterTurn\(charId\)/);
 assert.match(script, /buildAndroidUserReplyTask\(charId, userMessageId, options\.userText \|\| chat\.pendingReply\?\.userText \|\| userMessage\.content/);
 assert.match(script, /queueAndroidUserReply\(requestCharId, message\.id, \{ userText: voicePrompt \}\)/);
 assert.match(script, /if \(isNativeApp\(\)\) return queueAndroidUserReply\(requestCharId, message\.id/);
@@ -598,8 +594,6 @@ assert.match(cloudTimerWorker, /async function deferForFcmAck/);
 assert.match(cloudTimerWorker, /awaitingAck: result\.transport === 'fcm' && Number\(target\.backgroundAck\) >= 1/);
 assert.match(cloudTimerWorker, /firebase\.messaging/);
 assert.match(script, /async function enableNativeCloudTimer/);
-assert.match(script, /async function restoreNativeBackgroundState/);
-assert.match(script, /String\(nativeIsNewer \? nativeState\.updatedAt : Date\.now\(\)\)/);
 assert.match(cloudTimerWorker, /const IDLE_CRON_HEARTBEAT_MINUTES = 10;/);
 assert.match(cloudTimerWorker, /const JOB_BUCKET_TTL_SECONDS = 7 \* 24 \* 60 \* 60;/);
 assert.match(cloudTimerWorker, /const hasActivity = !summary\.ok \|\| summary\.jobsSeen > 0/);
@@ -851,7 +845,6 @@ globalThis.__appTest = {
   drainNativeUiInbox,
   nativePendingStateIsCurrent,
   nativePendingReplyNeedsSubmission,
-  shouldRestoreLegacyNativeBackground,
   createPromptComposer,
   chatSceneFromOptions,
   buildChatSceneSystem,
@@ -904,7 +897,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, shouldRestoreLegacyNativeBackground, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
 
 const aiPaymentText = '拿去买杯喝的😏\n<al_send_payment>{"type":"redpacket","amount":20.5,"note":"奶茶"}</al_send_payment>';
 assert.deepEqual(JSON.parse(JSON.stringify(extractAssistantPaymentDirective(aiPaymentText))), { type: 'redpacket', amount: 20.5, note: '奶茶' });
@@ -1462,8 +1455,6 @@ assert.equal(nativePendingStateIsCurrent(currentNativeChat, { replyState: 'pendi
 assert.equal(nativePendingReplyNeedsSubmission(currentNativeChat.pendingReply, 'message-a', new Set()), false, '已有原生 turn 的等待任务不得重新提交');
 assert.equal(nativePendingReplyNeedsSubmission({ state: 'pending' }, 'message-a', new Set(['turn_message-a'])), false, '已在本地排队集合中的任务不得重复提交');
 assert.equal(nativePendingReplyNeedsSubmission({ state: 'pending' }, 'message-a', new Set()), true);
-assert.equal(shouldRestoreLegacyNativeBackground(true), false, '原生执行层启用时旧后台镜像不得覆盖 Room 回复');
-assert.equal(shouldRestoreLegacyNativeBackground(false), true);
 assert.equal(memoryAliasText('用户和角色约好下次继续聊', { name: '林晚' }), '玩家和林晚约好下次继续聊');
 assert.equal(shouldKeepEvent({ type: 'fact', title: '时间校对分歧', detail: '用户说自己这里是48分，角色解释表快了几分钟。', importance: 3, keywords: ['时间校对'] }), false);
 assert.equal(shouldKeepEvent({ type: 'moment', title: '普通朋友圈点赞', detail: '林晚给玩家朋友圈点了赞，只评论“哈哈”。', importance: 4, keywords: ['朋友圈', '点赞'] }), false);

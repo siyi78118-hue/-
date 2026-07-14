@@ -1789,59 +1789,6 @@ let mirrorTimer = null;
 let mirrorRunning = null;
 let mirrorRequested = false;
 let mirrorWaiters = [];
-function nativeBackgroundRunner() {
-  return isNativeApp()
-    ? (window.Capacitor?.Plugins?.CapacitorBackgroundRunner || window.Capacitor?.Plugins?.BackgroundRunner)
-    : null;
-}
-async function buildNativeBackgroundSnapshot(options = {}) {
-  const memory = options.memory || await dumpMemoryStores();
-  if (Array.isArray(memory.meta)) {
-    memory.meta = memory.meta.filter(row => !['app_state', 'call_logs'].includes(row?.key));
-  }
-  const prepared = {};
-  for (const char of characters) {
-    const chat = allChats[char.id];
-    if (!chat?.messages?.length) continue;
-    const mode = expectedProactiveChatMode(chat);
-    const now = new Date();
-    const chatPrompt = buildChatSceneSystem(char, chat, {
-      proactive: true,
-      proactiveNow: now,
-      proactiveTriggerMode: mode,
-      proactiveTimeContext: buildProactiveTimeContext(chat, now, mode),
-      memoryPack: '',
-      returnPromptDetails: true
-    });
-    const userReplyPrompt = buildChatSceneSystem(char, chat, {
-      memoryPack: '',
-      returnPromptDetails: true
-    });
-    const momentPrompt = buildMomentPostPayload(char, chat, '');
-    prepared[char.id] = {
-      charName: char.name || 'AL',
-      playerName: playerName(),
-      userReplySystem: userReplyPrompt.system,
-      chatSystem: chatPrompt.system,
-      chatMessages: sceneMessagesForAI(chat, 30, { withTime: true, now }),
-      momentSystem: momentPrompt.system,
-      momentMessages: momentPrompt.messages
-    };
-  }
-  return { settings, characters, allChats, allMoments, memory, memoryScope: options.memoryScope || null, prepared, updatedAt: Date.now() };
-}
-async function syncNativeBackgroundState(stateOverride = null) {
-  const runner = nativeBackgroundRunner();
-  if (!runner?.dispatchEvent) return false;
-  const state = stateOverride || await buildNativeBackgroundSnapshot();
-  await runner.dispatchEvent({
-    label: 'com.siyi.al.background',
-    event: 'syncState',
-    details: { state: JSON.stringify(state) }
-  });
-  return true;
-}
-
 function buildAndroidUserReplyTask(charId, userMessageId, userText, options = {}, createdAt = Date.now()) {
   return {
     taskId: `reply_${userMessageId}`,
@@ -1864,26 +1811,6 @@ async function dumpCharacterMemoryForRunner(charId) {
     MemoryDB.byChar('profiles', charId)
   ]);
   return { summaries, events, profiles };
-}
-
-async function buildAndroidUserReplySnapshot(charId, task) {
-  const char = characters.find(item => item.id === charId);
-  const chat = allChats[charId];
-  if (!char || !chat) throw new Error('找不到待回复的角色或会话');
-  const memory = await dumpCharacterMemoryForRunner(charId);
-  const snapshot = await buildNativeBackgroundSnapshot({ memory, memoryScope: { type: 'character', charId } });
-  const prompt = buildChatSceneSystem(char, chat, {
-    payment: task.options?.payment || null,
-    memoryPack: '',
-    returnPromptDetails: true
-  });
-  snapshot.prepared[charId] = {
-    ...(snapshot.prepared[charId] || {}),
-    charName: char.name || 'AL',
-    playerName: playerName(),
-    userReplySystem: prompt.system
-  };
-  return snapshot;
 }
 
 function nativeExecutionPlugin() {
@@ -2043,13 +1970,7 @@ async function reconcileNativeReplyState() {
     console.warn('[AL Native Execution] reconcile skipped:', err.message);
     return false;
   });
-  const mirrorChanged = shouldRestoreLegacyNativeBackground(!!nativeExecutionPlugin()?.getTurn)
-    ? await restoreNativeBackgroundState().catch(err => {
-        console.warn('[AL Native Reply] state restore skipped:', err.message);
-        return false;
-      })
-    : false;
-  const changed = executionChanged || mirrorChanged;
+  const changed = executionChanged;
   if (!changed) return false;
   resumePendingAssistantTurns();
   stopNativeReplyPollingIfIdle();
@@ -2099,9 +2020,6 @@ function nativePendingStateIsCurrent(chat, userMessage, result) {
 function nativePendingReplyNeedsSubmission(pending, messageId, queuedIds = nativeReplyQueuedIds) {
   if (pending?.nativeTurnId) return false;
   return !queuedIds.has(nativeTurnIdForMessage(messageId));
-}
-function shouldRestoreLegacyNativeBackground(nativeExecutionAvailable) {
-  return !nativeExecutionAvailable;
 }
 function nativeTurnHasUiLanding(result) {
   const chat = allChats[result?.characterId];
@@ -2297,19 +2215,6 @@ async function reconcileNativeExecutionTurns() {
   return changed;
 }
 
-function completedNativeReplyCharIds(remoteChats = {}, localChats = {}) {
-  return Object.entries(localChats || {}).flatMap(([charId, localChat]) => {
-    const pending = localChat?.pendingReply;
-    if (!pending || !['pending', 'running'].includes(pending.state)) return [];
-    const remoteChat = remoteChats?.[charId];
-    if (!remoteChat) return [];
-    const answered = (remoteChat.messages || []).some(message =>
-      message?.role === 'assistant' && message.replyToMessageId === pending.userMessageId
-    );
-    return answered ? [charId] : [];
-  });
-}
-
 function startNativeReplyPolling() {
   if (!isNativeApp() || nativeReplyPollTimer) return;
   nativeReplyPollTimer = setInterval(() => {
@@ -2368,64 +2273,10 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     return false;
   }
 }
-async function restoreNativeBackgroundState() {
-  const runner = nativeBackgroundRunner();
-  if (!runner?.dispatchEvent) return false;
-  const result = await runner.dispatchEvent({
-    label: 'com.siyi.al.background',
-    event: 'readState',
-    details: {}
-  });
-  const nativeState = typeof result?.state === 'string' ? JSON.parse(result.state) : result?.state;
-  const localUpdatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0;
-  if (!nativeState?.updatedAt) return false;
-  const nativeIsNewer = Number(nativeState.updatedAt) > localUpdatedAt;
-  const hasMissingContent = nativeStateHasMissingChatContent(nativeState, allChats, allMoments);
-  if (!nativeIsNewer && !hasMissingContent) return false;
-  const completedReplyCharIds = completedNativeReplyCharIds(nativeState.allChats || {}, allChats);
-  if (nativeIsNewer) {
-    settings = migrateSettings(nativeState.settings || settings);
-    characters = (nativeState.characters || characters).map(normalizeChar);
-  }
-  allChats = mergeLocalPendingReplies(nativeState.allChats || {}, allChats, { preferRemote: nativeIsNewer });
-  allMoments = mergeRowsByIdentity(nativeState.allMoments || [], allMoments, nativeIsNewer);
-  scrubEmptyReplyMessages(allChats);
-  localStorage.setItem('rpchat_settings', JSON.stringify(settings));
-  localStorage.setItem('rpchat_characters', JSON.stringify(characters));
-  localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
-  localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
-  localStorage.setItem('rpchat_app_state_updated_at', String(nativeIsNewer ? nativeState.updatedAt : Date.now()));
-  if (nativeIsNewer) await restoreNativeMemory(nativeState);
-  completedReplyCharIds.forEach(charId => processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native reply update skipped:', err.message)));
-  return true;
-}
-
-async function restoreNativeMemory(nativeState = {}) {
-  const memory = nativeState?.memory;
-  if (!memory || typeof memory !== 'object') return;
-  const scopedCharId = nativeState.memoryScope?.type === 'character'
-    ? String(nativeState.memoryScope.charId || '')
-    : '';
-  for (const store of ['summaries', 'events', 'profiles', 'vectors']) {
-    if (!Array.isArray(memory[store])) continue;
-    const incoming = memory[store].filter(row => row && typeof row === 'object');
-    if (!scopedCharId) {
-      await MemoryDB.clearStore(store);
-      for (const row of incoming) await MemoryDB.put(store, row);
-      continue;
-    }
-    const preserved = (await MemoryDB.all(store)).filter(row => row.charId !== scopedCharId);
-    await MemoryDB.clearStore(store);
-    for (const row of [...preserved, ...incoming.filter(row => row.charId === scopedCharId)]) {
-      await MemoryDB.put(store, row);
-    }
-  }
-}
 async function mirrorAppStateNow() {
   if (typeof MemoryDB === 'undefined') return;
   const updatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || Date.now();
   await MemoryDB.setMeta('app_state', { settings, characters, allChats, allMoments, updatedAt });
-  try { await syncNativeBackgroundState(); } catch (err) { console.warn('[AL Native] state sync skipped:', err.message); }
 }
 async function mirrorAppState() {
   mirrorRequested = true;
@@ -8914,18 +8765,12 @@ async function clearAllHistory() {
 }
 
 async function syncFromServiceWorkerState() {
-  const nativeChanged = shouldRestoreLegacyNativeBackground(!!nativeExecutionPlugin()?.getTurn)
-    ? await restoreNativeBackgroundState().catch(err => {
-        console.warn('[AL Native] state restore skipped:', err.message);
-        return false;
-      })
-    : false;
   const mirrorChanged = await restoreAppStateFromMirror();
   const executionChanged = await reconcileNativeExecutionTurns().catch(err => {
     console.warn('[AL Native Execution] foreground reconcile skipped:', err.message);
     return false;
   });
-  const changed = mirrorChanged || nativeChanged || executionChanged;
+  const changed = mirrorChanged || executionChanged;
   if (changed) {
     renderPlayerProfile();
     if (activeScreen === 'chat') renderMessages();

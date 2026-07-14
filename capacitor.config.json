@@ -12,14 +12,6 @@
   "plugins": {
     "PushNotifications": {
       "presentationOptions": ["sound", "alert", "banner", "list"]
-    },
-    "BackgroundRunner": {
-      "label": "com.siyi.al.background",
-      "src": "runners/al-background.js",
-      "event": "backgroundTick",
-      "repeat": false,
-      "interval": 15,
-      "autoStart": false
     }
   }
 }
