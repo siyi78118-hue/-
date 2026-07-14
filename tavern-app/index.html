@@ -1236,7 +1236,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-14.82';
+const APP_BUILD_VERSION = '2026-07-14.83';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -1954,13 +1954,22 @@ function pendingNativeReplyCount() {
   }).length;
 }
 
+function refreshChatSendButton() {
+  const input = document.getElementById('chat-input');
+  const button = document.getElementById('btn-send');
+  if (!input || !button) return;
+  button.className = input.value.trim() && !isStreaming ? 'send' : 'send inactive';
+}
+
 function stopNativeReplyPollingIfIdle() {
-  if (pendingNativeReplyCount()) return false;
-  if (isNativeApp() && nativeExecutionPlugin()?.unappliedCompletedTurns) return false;
-  if (nativeReplyPollTimer) clearInterval(nativeReplyPollTimer);
-  nativeReplyPollTimer = null;
-  nativeReplyQueuedIds.clear();
-  isStreaming = false;
+  isStreaming = activeChatRequests.size > 0 || pendingNativeReplyCount() > 0;
+  refreshChatSendButton();
+  if (isStreaming) return false;
+  if (!(isNativeApp() && nativeExecutionPlugin()?.unappliedCompletedTurns)) {
+    if (nativeReplyPollTimer) clearInterval(nativeReplyPollTimer);
+    nativeReplyPollTimer = null;
+    nativeReplyQueuedIds.clear();
+  }
   if (mirrorRequested || mirrorWaiters.length) scheduleAppStateMirror();
   return true;
 }
@@ -1971,9 +1980,9 @@ async function reconcileNativeReplyState() {
     return false;
   });
   const changed = executionChanged;
+  stopNativeReplyPollingIfIdle();
   if (!changed) return false;
   resumePendingAssistantTurns();
-  stopNativeReplyPollingIfIdle();
   if (activeScreen === 'chat') renderMessages();
   renderChats();
   return true;
@@ -2259,6 +2268,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
       createdAt: task.createdAt
     });
     await applyNativeExecutionTurn(result);
+    stopNativeReplyPollingIfIdle();
     startNativeReplyPolling();
     return true;
   } catch (err) {
@@ -2268,6 +2278,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     userMessage.replyState = 'failed';
     userMessage.replyError = friendlyErrorMessage(err);
     isStreaming = false;
+    refreshChatSendButton();
     DB.set('chats', allChats);
     if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
     return false;
@@ -5355,7 +5366,7 @@ async function deleteSelectedMessage() {
 function autoResize(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 106) + 'px';
-  document.getElementById('btn-send').className = el.value.trim() && !isStreaming ? 'send' : 'send inactive';
+  refreshChatSendButton();
 }
 function handleChatKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -5553,6 +5564,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     } finally {
       if (activeChatRequests.get(requestCharId)?.requestToken === requestToken) activeChatRequests.delete(requestCharId);
       isStreaming = activeChatRequests.size > 0;
+      refreshChatSendButton();
       DB.set('chats', allChats);
       if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
       renderChats();
@@ -5648,6 +5660,7 @@ function expireStalePendingReply(chat, now = Date.now()) {
   message.replyError = error;
   nativeReplyQueuedIds.delete(`reply_${message.id}`);
   isStreaming = false;
+  refreshChatSendButton();
   return true;
 }
 function resumePendingAssistantTurns() {
