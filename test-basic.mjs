@@ -117,11 +117,11 @@ assert.ok(
   'foreground restore must consume Room execution results after older web mirrors so completed replies always win'
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v87';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v88';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-14\.83';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-14\.84';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(script, /sendTemperature:\s*settings\.chatTemperatureEnabled !== false/, 'native chat config must persist the temperature switch');
@@ -845,6 +845,7 @@ globalThis.__appTest = {
   drainNativeUiInbox,
   nativePendingStateIsCurrent,
   nativePendingReplyNeedsSubmission,
+  nativePendingReplyText,
   stopNativeReplyPollingIfIdle,
   createPromptComposer,
   chatSceneFromOptions,
@@ -898,7 +899,182 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
+
+assert.equal(vm.runInContext('typeof captureChatScrollState', context), 'function', 'chat rendering must expose scroll-state capture');
+assert.equal(vm.runInContext('typeof restoreChatScrollState', context), 'function', 'chat rendering must expose scroll-state restoration');
+const scrollStateProbe = vm.runInContext(`(() => {
+  let anchorTop = 140;
+  const anchor = {
+    dataset: { messageId: 'message-old' },
+    getBoundingClientRect: () => ({ top: anchorTop, bottom: anchorTop + 60 })
+  };
+  const scroller = {
+    scrollTop: 320,
+    scrollHeight: 1800,
+    clientHeight: 600,
+    getBoundingClientRect: () => ({ top: 100, bottom: 700 }),
+    querySelectorAll: () => [anchor],
+    querySelector: selector => selector.includes('message-old') ? anchor : null
+  };
+  const state = captureChatScrollState(scroller);
+  anchorTop = 205;
+  restoreChatScrollState(scroller, state);
+  const preservedScrollTop = scroller.scrollTop;
+  restoreChatScrollState(scroller, state, { forceBottom: true });
+  return { state, preservedScrollTop, forcedScrollTop: scroller.scrollTop };
+})()`, context);
+assert.equal(scrollStateProbe.state.messageId, 'message-old');
+assert.equal(scrollStateProbe.preservedScrollTop, 385, 'refresh must retain the visible message pixel offset');
+assert.equal(scrollStateProbe.forcedScrollTop, 1800, 'explicit player-send rendering may scroll to the bottom');
+const duplicateAnchorProbe = vm.runInContext(`(() => {
+  let firstTop = 20;
+  let secondTop = 140;
+  const first = { dataset: { messageId: 'split-reply' }, getBoundingClientRect: () => ({ top: firstTop, bottom: firstTop + 60 }) };
+  const second = { dataset: { messageId: 'split-reply' }, getBoundingClientRect: () => ({ top: secondTop, bottom: secondTop + 60 }) };
+  const scroller = {
+    scrollTop: 320,
+    scrollHeight: 1800,
+    getBoundingClientRect: () => ({ top: 100, bottom: 700 }),
+    querySelectorAll: () => [first, second]
+  };
+  const state = captureChatScrollState(scroller);
+  secondTop = 205;
+  restoreChatScrollState(scroller, state);
+  return { occurrence: state.occurrence, scrollTop: scroller.scrollTop };
+})()`, context);
+assert.equal(duplicateAnchorProbe.occurrence, 1, 'split assistant bubbles need a stable occurrence index');
+assert.equal(duplicateAnchorProbe.scrollTop, 385, 'scroll restoration must select the same split bubble, not the first duplicate ID');
+const composerPanelSource = script.match(/function toggleComposerPanel\(kind\)[\s\S]*?\n}/)?.[0] || '';
+assert.doesNotMatch(composerPanelSource, /scrollChatBottom/, 'opening an emoji or tool panel must not steal the player scroll position');
+assert.match(script, /async function submitPayMessage\(\)[\s\S]*?renderMessages\(\{ forceBottom: true \}\)/, 'a player payment message must explicitly scroll to the new bubble');
+assert.match(script, /async function sendVoicePlaceholderMessage[\s\S]*?renderMessages\(\{ forceBottom: true \}\)/, 'a player voice placeholder must explicitly scroll to the new bubble');
+assert.match(script, /async function sendVoiceTranscriptMessage[\s\S]*?renderMessages\(\{ forceBottom: true \}\)/, 'a transcribed player voice message must explicitly scroll to the new bubble');
+
+assert.equal(vm.runInContext('typeof stagePlayerMessage', context), 'function', 'chat must support locally staged player bubbles');
+assert.equal(vm.runInContext('typeof commitStagedBatch', context), 'function', 'chat must support atomic batch completion');
+const stagedBatchProbe = vm.runInContext(`(() => {
+  const chat = { messages: [] };
+  const first = stagePlayerMessage(chat, '第一段', {}, 1000);
+  const second = stagePlayerMessage(chat, '第二段', {}, 2000);
+  const third = stagePlayerMessage(chat, '第三段', {}, 3000);
+  const visibleBeforeCommit = conversationMessages(chat).map(row => row.content);
+  const batchBeforeCommit = currentStagedBatch(chat);
+  const committed = commitStagedBatch(chat, 4000);
+  return {
+    ids: [first.batchId, second.batchId, third.batchId],
+    sequences: [first.batchSequence, second.batchSequence, third.batchSequence],
+    visibleBeforeCommit,
+    stagedIds: batchBeforeCommit.messageIds,
+    committedIds: committed.messageIds,
+    sourceMessageId: committed.sourceMessage.id,
+    visibleAfterCommit: conversationMessages(chat).map(row => row.content),
+    stagedBatchAfterCommit: chat.stagedBatch || null
+  };
+})()`, context);
+assert.equal(new Set(stagedBatchProbe.ids).size, 1, 'one composition session must share one batch ID');
+assert.deepEqual(JSON.parse(JSON.stringify(stagedBatchProbe.sequences)), [0, 1, 2]);
+assert.deepEqual(JSON.parse(JSON.stringify(stagedBatchProbe.visibleBeforeCommit)), [], 'staged bubbles must remain invisible to AI context');
+assert.equal(stagedBatchProbe.stagedIds.length, 3);
+assert.deepEqual(JSON.parse(JSON.stringify(stagedBatchProbe.committedIds)), JSON.parse(JSON.stringify(stagedBatchProbe.stagedIds)));
+assert.equal(stagedBatchProbe.sourceMessageId, stagedBatchProbe.stagedIds[2]);
+assert.deepEqual(JSON.parse(JSON.stringify(stagedBatchProbe.visibleAfterCommit)), ['第一段', '第二段', '第三段']);
+assert.equal(stagedBatchProbe.stagedBatchAfterCommit, null);
+
+const stagedEditProbe = await vm.runInContext(`(async () => {
+  const savedChats = allChats;
+  const savedScreen = activeScreen;
+  allChats = { staged_edit: { messages: [] } };
+  activeScreen = 'chats';
+  const chat = allChats.staged_edit;
+  const first = stagePlayerMessage(chat, '准备撤回', {}, 1000);
+  const second = stagePlayerMessage(chat, '保留这一段', {}, 2000);
+  await MemoryDB.setMeta(memoryMetaKey('staged_edit'), 5);
+  await retractMessage('staged_edit', first.id);
+  const idsAfterRetract = [...(chat.stagedBatch?.messageIds || [])];
+  await deleteChatMessage('staged_edit', second.id);
+  const memoryCursorAfterDelete = await MemoryDB.getMeta(memoryMetaKey('staged_edit'), 0);
+  const stagedBatchAfterDelete = chat.stagedBatch || null;
+  allChats = savedChats;
+  activeScreen = savedScreen;
+  return { firstId: first.id, secondId: second.id, idsAfterRetract, stagedBatchAfterDelete, memoryCursorAfterDelete };
+})()`, context);
+assert.deepEqual(JSON.parse(JSON.stringify(stagedEditProbe.idsAfterRetract)), [stagedEditProbe.secondId], 'retracting a staged bubble must remove it from the pending batch');
+assert.equal(stagedEditProbe.stagedBatchAfterDelete, null, 'deleting the final staged bubble must clear the batch');
+assert.equal(stagedEditProbe.memoryCursorAfterDelete, 5, 'deleting a staged bubble must not move the committed-memory cursor');
+
+const stagedSendProbe = await vm.runInContext(`(async () => {
+  const savedChats = allChats;
+  const savedCharacters = characters;
+  const savedCharId = currentCharId;
+  const savedScreen = activeScreen;
+  const savedContinue = continueAssistantTurn;
+  const modelCalls = [];
+  allChats = { batch_send: { messages: [] } };
+  characters = [{ id: 'batch_send', name: '批次角色', avatar: '批' }];
+  currentCharId = 'batch_send';
+  activeScreen = 'chat';
+  isStreaming = false;
+  continueAssistantTurn = async (...args) => { modelCalls.push(args); return '不应调用'; };
+  document.getElementById('chat-input').value = '第一段';
+  await sendMessage();
+  const result = {
+    modelCallCount: modelCalls.length,
+    messageCount: allChats.batch_send.messages.length,
+    deliveryState: allChats.batch_send.messages[0]?.deliveryState,
+    pendingReply: allChats.batch_send.pendingReply || null,
+    inputValue: document.getElementById('chat-input').value
+  };
+  continueAssistantTurn = savedContinue;
+  allChats = savedChats;
+  characters = savedCharacters;
+  currentCharId = savedCharId;
+  activeScreen = savedScreen;
+  return result;
+})()`, context);
+assert.equal(stagedSendProbe.modelCallCount, 0, 'ordinary send must not call the AI before 发送结束');
+assert.equal(stagedSendProbe.messageCount, 1);
+assert.equal(stagedSendProbe.deliveryState, 'staged');
+assert.equal(stagedSendProbe.pendingReply, null);
+assert.equal(stagedSendProbe.inputValue, '');
+
+assert.equal(vm.runInContext('typeof finishStagedBatch', context), 'function', '发送结束 must have an explicit batch commit command');
+const finishBatchProbe = await vm.runInContext(`(async () => {
+  const savedChats = allChats;
+  const savedCharacters = characters;
+  const savedCharId = currentCharId;
+  const savedScreen = activeScreen;
+  const savedContinue = continueAssistantTurn;
+  const calls = [];
+  allChats = { batch_finish: { messages: [] } };
+  characters = [{ id: 'batch_finish', name: '批次角色', avatar: '批' }];
+  currentCharId = 'batch_finish';
+  activeScreen = 'chat';
+  isStreaming = false;
+  continueAssistantTurn = async (...args) => { calls.push(args); return '已回复'; };
+  const first = stagePlayerMessage(allChats.batch_finish, '第一段', {}, 1000);
+  const second = stagePlayerMessage(allChats.batch_finish, '第二段', {}, 2000);
+  await finishStagedBatch('batch_finish');
+  const result = {
+    callCount: calls.length,
+    callText: calls[0]?.[1],
+    callSourceId: calls[0]?.[2]?.userMessageId,
+    messageIds: [first.id, second.id],
+    states: allChats.batch_finish.messages.map(row => row.deliveryState),
+    pending: allChats.batch_finish.pendingReply ? { ...allChats.batch_finish.pendingReply } : null
+  };
+  continueAssistantTurn = savedContinue;
+  allChats = savedChats;
+  characters = savedCharacters;
+  currentCharId = savedCharId;
+  activeScreen = savedScreen;
+  return result;
+})()`, context);
+assert.equal(finishBatchProbe.callCount, 1, '发送结束 must create exactly one AI turn');
+assert.equal(finishBatchProbe.callText, '第一段\n第二段');
+assert.equal(finishBatchProbe.callSourceId, finishBatchProbe.messageIds[1]);
+assert.deepEqual(JSON.parse(JSON.stringify(finishBatchProbe.states)), ['sent', 'sent']);
+assert.deepEqual(JSON.parse(JSON.stringify(finishBatchProbe.pending.batchMessageIds)), JSON.parse(JSON.stringify(finishBatchProbe.messageIds)));
 
 const aiPaymentText = '拿去买杯喝的😏\n<al_send_payment>{"type":"redpacket","amount":20.5,"note":"奶茶"}</al_send_payment>';
 assert.deepEqual(JSON.parse(JSON.stringify(extractAssistantPaymentDirective(aiPaymentText))), { type: 'redpacket', amount: 20.5, note: '奶茶' });
@@ -913,6 +1089,12 @@ assert.equal(durableTask.userText, '刚忙完');
 assert.equal(durableTask.status, 'pending');
 assert.equal(durableTask.createdAt, 1234);
 assert.equal(durableTask.options.paymentMessageId, 'pay-a');
+const batchedDurableTask = buildAndroidUserReplyTask('char-a', 'message-c', '第一段\n第二段', {
+  batchId: 'batch-a',
+  batchMessageIds: ['message-b', 'message-c']
+}, 2345);
+assert.equal(batchedDurableTask.options.batchId, 'batch-a');
+assert.deepEqual(JSON.parse(JSON.stringify(batchedDurableTask.options.batchMessageIds)), ['message-b', 'message-c'], 'native task must persist every committed bubble ID');
 
 const completedNativeMerge = mergeLocalPendingReplies({
   'char-a': {
@@ -980,7 +1162,7 @@ const retryProbe = await vm.runInContext(`(async () => {
   allChats = {
     retry_char: {
       messages: [{ id: 'retry-user', role: 'user', content: '再试一次', time: 1, replyState: 'failed', replyError: 'timeout' }],
-      pendingReply: { userMessageId: 'retry-user', userText: '再试一次', state: 'failed', options: { paymentMessageId: 'pay-original' } }
+      pendingReply: { userMessageId: 'retry-user', userText: '第一段\\n再试一次', state: 'failed', batchId: 'retry-batch', batchMessageIds: ['retry-first', 'retry-user'], options: { paymentMessageId: 'pay-original', batchId: 'retry-batch', batchMessageIds: ['retry-first', 'retry-user'] } }
     }
   };
   activeScreen = 'settings';
@@ -998,6 +1180,8 @@ assert.equal(retryProbe.result, true);
 assert.equal(retryProbe.before, retryProbe.after, '重新发送不得复制玩家气泡');
 assert.equal(retryProbe.calls[0].options.userMessageId, 'retry-user');
 assert.equal(retryProbe.calls[0].options.paymentMessageId, 'pay-original');
+assert.equal(retryProbe.calls[0].options.batchId, 'retry-batch');
+assert.deepEqual(JSON.parse(JSON.stringify(retryProbe.calls[0].options.batchMessageIds)), ['retry-first', 'retry-user']);
 assert.equal(retryProbe.message.replyState, 'pending');
 
 const incomingPaymentProbe = vm.runInContext(`(() => {
@@ -1450,12 +1634,15 @@ const inboxChanged = await drainNativeUiInbox(
 assert.equal(inboxChanged, true);
 assert.deepEqual(inboxCalls, ['apply:older', 'ack:older', 'apply:newer', 'ack:newer'], '一次同步必须按完成时间排空全部积压结果');
 const currentNativeChat = {
-  pendingReply: { nativeTurnId: 'turn-message-a', state: 'running', nativeState: 'CHAT_RUNNING', nativeUpdatedAt: 99 }
+  pendingReply: { nativeTurnId: 'turn-message-a', nativeAcceptedAt: 98, state: 'running', nativeState: 'CHAT_RUNNING', nativeUpdatedAt: 99 }
 };
 assert.equal(nativePendingStateIsCurrent(currentNativeChat, { replyState: 'pending' }, { turnId: 'turn-message-a', state: 'CHAT_RUNNING', updatedAt: 99 }), true);
 assert.equal(nativePendingReplyNeedsSubmission(currentNativeChat.pendingReply, 'message-a', new Set()), false, '已有原生 turn 的等待任务不得重新提交');
+assert.equal(nativePendingReplyNeedsSubmission({ nativeTurnId: 'turn-message-a', state: 'pending' }, 'message-a', new Set()), true, '原生尚未确认接收前杀进程，重启后必须用确定性 ID 安全重投');
 assert.equal(nativePendingReplyNeedsSubmission({ state: 'pending' }, 'message-a', new Set(['turn_message-a'])), false, '已在本地排队集合中的任务不得重复提交');
 assert.equal(nativePendingReplyNeedsSubmission({ state: 'pending' }, 'message-a', new Set()), true);
+assert.equal(nativePendingReplyText({ pendingReply: { userMessageId: 'message-a', userText: '第一段\n第二段' } }, { id: 'message-a', content: '第二段' }), '第一段\n第二段', '原生状态同步不得把整批文本覆盖成最后一个气泡');
+assert.equal(nativePendingReplyText({ pendingReply: { userMessageId: 'other', userText: '别的任务' } }, { id: 'message-a', content: '当前消息' }), '当前消息');
 const nativeSendUnlockProbe = vm.runInContext(`(() => {
   allChats = {};
   isStreaming = true;

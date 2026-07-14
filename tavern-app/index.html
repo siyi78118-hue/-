@@ -230,6 +230,10 @@ button{border:none;background:none;cursor:pointer}
 .chat-input{flex:1;min-height:38px;max-height:106px;padding:8px 10px;border:none;border-radius:5px;outline:none;background:#fff;resize:none;font-size:16px;line-height:1.4;box-shadow:inset 0 0 0 1px rgba(0,0,0,.025)}
 .send{height:38px;min-width:52px;border-radius:5px;background:var(--green);color:#fff;padding:0 12px;font-size:15px}
 .send.inactive{background:#dedede;color:#8c8c8c}
+.batch-finish-bar{display:none;justify-content:flex-end;padding:6px 8px;background:#f7f7f7;border-top:1px solid #e2e2e2;flex-shrink:0}
+.batch-finish-bar.show{display:flex}
+.batch-finish{height:34px;border-radius:5px;background:var(--green);color:#fff;padding:0 14px;font-size:14px}
+.batch-finish:disabled{background:#dedede;color:#8c8c8c}
 .composer-panel{display:none;background:#f7f7f7;border-top:1px solid #e2e2e2;padding:12px 12px calc(16px + var(--safe-bottom));flex-shrink:0}
 .composer-panel.show{display:block}
 .emoji-tabs{height:36px;margin:-4px 0 9px;display:grid;grid-template-columns:repeat(5,1fr);border-bottom:1px solid #e4e4e4}
@@ -598,6 +602,7 @@ button.cell:active{background:#ececec}
       </div>
     </div>
     <div class="chat-scroll" id="chat-scroll"><div class="chat-list" id="chat-messages"></div></div>
+    <div class="batch-finish-bar" id="batch-finish-bar"><button class="batch-finish" id="btn-finish-batch" onclick="finishStagedBatch()" type="button">发送结束</button></div>
     <div class="composer">
       <button class="composer-tool voice" onclick="toggleComposerPanel('voice')" type="button" aria-label="语音"></button>
       <textarea class="chat-input" id="chat-input" rows="1" placeholder="" oninput="autoResize(this)" onkeydown="handleChatKey(event)"></textarea>
@@ -1236,7 +1241,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-14.83';
+const APP_BUILD_VERSION = '2026-07-14.84';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -1797,7 +1802,9 @@ function buildAndroidUserReplyTask(charId, userMessageId, userText, options = {}
     userText: String(userText || ''),
     options: {
       paymentMessageId: options.paymentMessageId || '',
-      payment: options.payment || null
+      payment: options.payment || null,
+      batchId: options.batchId || '',
+      batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : []
     },
     status: 'pending',
     createdAt
@@ -1959,6 +1966,15 @@ function refreshChatSendButton() {
   const button = document.getElementById('btn-send');
   if (!input || !button) return;
   button.className = input.value.trim() && !isStreaming ? 'send' : 'send inactive';
+  refreshFinishBatchButton();
+}
+function refreshFinishBatchButton() {
+  const bar = document.getElementById('batch-finish-bar');
+  const button = document.getElementById('btn-finish-batch');
+  if (!bar || !button) return;
+  const batch = currentStagedBatch(allChats?.[currentCharId]);
+  bar.classList.toggle('show', !!batch);
+  button.disabled = !batch || isStreaming;
 }
 
 function stopNativeReplyPollingIfIdle() {
@@ -2027,8 +2043,13 @@ function nativePendingStateIsCurrent(chat, userMessage, result) {
     && userMessage?.replyState === 'pending';
 }
 function nativePendingReplyNeedsSubmission(pending, messageId, queuedIds = nativeReplyQueuedIds) {
-  if (pending?.nativeTurnId) return false;
-  return !queuedIds.has(nativeTurnIdForMessage(messageId));
+  if (pending?.nativeTurnId && pending?.nativeAcceptedAt) return false;
+  return !queuedIds.has(pending?.nativeTurnId || nativeTurnIdForMessage(messageId));
+}
+function nativePendingReplyText(chat, userMessage) {
+  const pending = chat?.pendingReply;
+  if (pending?.userMessageId === userMessage?.id && pending.userText) return String(pending.userText);
+  return String(userMessage?.content || '');
 }
 function nativeTurnHasUiLanding(result) {
   const chat = allChats[result?.characterId];
@@ -2173,7 +2194,7 @@ async function applyNativeExecutionTurn(result) {
     const reason = String(result.errorDetail || result.errorCode || '后台回复失败');
     userMessage.replyState = 'failed';
     userMessage.replyError = reason;
-    chat.pendingReply = { ...(chat.pendingReply || {}), userMessageId: userMessage.id, userText: userMessage.content, state: 'failed', error: reason, nativeTurnId: result.turnId, updatedAt: Date.now() };
+    chat.pendingReply = { ...(chat.pendingReply || {}), userMessageId: userMessage.id, userText: nativePendingReplyText(chat, userMessage), state: 'failed', error: reason, nativeTurnId: result.turnId, updatedAt: Date.now() };
     nativeReplyQueuedIds.delete(result.turnId);
   } else if (state === 'CANCELLED') {
     delete userMessage.replyState;
@@ -2186,7 +2207,7 @@ async function applyNativeExecutionTurn(result) {
     chat.pendingReply = {
       ...(chat.pendingReply || {}),
       userMessageId: userMessage.id,
-      userText: userMessage.content,
+      userText: nativePendingReplyText(chat, userMessage),
       state: 'running',
       nativeTurnId: result.turnId,
       nativeState: state,
@@ -2244,6 +2265,8 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     userMessageId,
     userText: task.userText,
     options: task.options,
+    batchId: task.options.batchId || '',
+    batchMessageIds: [...task.options.batchMessageIds],
     state: 'pending',
     createdAt: task.createdAt,
     updatedAt: Date.now(),
@@ -2267,6 +2290,10 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
       snapshotJson: JSON.stringify(snapshot),
       createdAt: task.createdAt
     });
+    if (chat.pendingReply?.nativeTurnId === turnId) {
+      chat.pendingReply.nativeAcceptedAt = Date.now();
+      DB.set('chats', allChats);
+    }
     await applyNativeExecutionTurn(result);
     stopNativeReplyPollingIfIdle();
     startNativeReplyPolling();
@@ -2604,8 +2631,70 @@ function ensureChatMessageIds(chat) {
   (chat?.messages || []).forEach(message => { changed = ensureMessageIdentity(message) || changed; });
   return changed;
 }
+function currentStagedBatch(chat) {
+  if (!chat?.stagedBatch?.batchId) return null;
+  const batchId = chat.stagedBatch.batchId;
+  const messageIds = (chat.messages || [])
+    .filter(message => message.batchId === batchId && message.deliveryState === 'staged' && !message.deleted && !message.retracted)
+    .sort((a, b) => Number(a.batchSequence) - Number(b.batchSequence))
+    .map(message => message.id);
+  if (!messageIds.length) {
+    delete chat.stagedBatch;
+    return null;
+  }
+  chat.stagedBatch.messageIds = messageIds;
+  return chat.stagedBatch;
+}
+function stagePlayerMessage(chat, content, extra = {}, now = Date.now()) {
+  if (!chat) return null;
+  const batch = currentStagedBatch(chat) || {
+    batchId: uid('batch'),
+    messageIds: [],
+    createdAt: now
+  };
+  chat.stagedBatch = batch;
+  const message = {
+    id: uid('msg'),
+    role: 'user',
+    content: String(content || ''),
+    time: now,
+    batchId: batch.batchId,
+    batchSequence: batch.messageIds.length,
+    deliveryState: 'staged',
+    ...extra
+  };
+  chat.messages = Array.isArray(chat.messages) ? chat.messages : [];
+  chat.messages.push(message);
+  batch.messageIds.push(message.id);
+  return message;
+}
+function removeMessageFromStagedBatch(chat, messageId) {
+  const batch = currentStagedBatch(chat);
+  if (!batch || !batch.messageIds.includes(messageId)) return false;
+  batch.messageIds = batch.messageIds.filter(id => id !== messageId);
+  if (!batch.messageIds.length) delete chat.stagedBatch;
+  return true;
+}
+function commitStagedBatch(chat, committedAt = Date.now()) {
+  const batch = currentStagedBatch(chat);
+  if (!batch) return null;
+  const messages = batch.messageIds.map(id => messageById(chat, id)).filter(Boolean);
+  for (const message of messages) {
+    message.deliveryState = 'sent';
+    message.batchCommittedAt = committedAt;
+  }
+  const committed = {
+    batchId: batch.batchId,
+    messageIds: messages.map(message => message.id),
+    messages,
+    sourceMessage: messages[messages.length - 1],
+    committedAt
+  };
+  delete chat.stagedBatch;
+  return committed;
+}
 function messageAvailableToAI(message) {
-  return !!message && !message.deleted && !message.retracted;
+  return !!message && !message.deleted && !message.retracted && message.deliveryState !== 'staged';
 }
 function messageById(chat, messageId) {
   return (chat?.messages || []).find(message => message.id === messageId) || null;
@@ -4510,7 +4599,7 @@ function openChat(charId) {
   ensureChatMessageIds(allChats[charId]);
   allChats[charId].unread = 0;
   DB.set('chats', allChats);
-  renderMessages();
+  renderMessages({ forceBottom: true });
   showScreen('chat');
   setTimeout(scrollChatBottom, 50);
   ensureOpenedChatProactive(charId);
@@ -5200,11 +5289,51 @@ function renderStreamingDraftHtml(char, content) {
     return `<div class="${cls}" data-streaming-draft="1">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(chunk)}</div></div>`;
   }).join('');
 }
-function renderMessages() {
+function captureChatScrollState(el) {
+  if (!el) return null;
+  const scrollTop = Number(el.scrollTop) || 0;
+  if (typeof el.getBoundingClientRect !== 'function' || typeof el.querySelectorAll !== 'function') {
+    return { messageId: '', offset: 0, scrollTop };
+  }
+  const viewport = el.getBoundingClientRect();
+  const nodes = Array.from(el.querySelectorAll('[data-message-id]'));
+  const anchor = nodes.find(node => {
+    if (!node?.dataset?.messageId || typeof node.getBoundingClientRect !== 'function') return false;
+    return node.getBoundingClientRect().bottom > viewport.top;
+  });
+  if (!anchor) return { messageId: '', offset: 0, scrollTop };
+  return {
+    messageId: anchor.dataset.messageId,
+    occurrence: nodes.filter(node => node?.dataset?.messageId === anchor.dataset.messageId).indexOf(anchor),
+    offset: anchor.getBoundingClientRect().top - viewport.top,
+    scrollTop
+  };
+}
+function restoreChatScrollState(el, state, options = {}) {
+  if (!el) return;
+  if (options.forceBottom) {
+    el.scrollTop = el.scrollHeight;
+    return;
+  }
+  if (!state) return;
+  const matchingAnchors = state.messageId && typeof el.querySelectorAll === 'function'
+    ? Array.from(el.querySelectorAll('[data-message-id]')).filter(node => node?.dataset?.messageId === state.messageId)
+    : [];
+  const anchor = matchingAnchors[Math.max(0, Number(state.occurrence) || 0)] || null;
+  if (anchor && typeof anchor.getBoundingClientRect === 'function' && typeof el.getBoundingClientRect === 'function') {
+    const nextOffset = anchor.getBoundingClientRect().top - el.getBoundingClientRect().top;
+    el.scrollTop = (Number(el.scrollTop) || 0) + nextOffset - state.offset;
+    return;
+  }
+  el.scrollTop = state.scrollTop;
+}
+function renderMessages(options = {}) {
   const chat = allChats[currentCharId];
   const char = characters.find(c => c.id === currentCharId);
   const wrap = document.getElementById('chat-messages');
   if (!chat || !char) return;
+  const scrollEl = document.getElementById('chat-scroll');
+  const scrollState = captureChatScrollState(scrollEl);
   if (refreshPaymentExpirations(chat, currentCharId)) DB.set('chats', allChats);
   let html = '';
   const displayMessages = visibleChatMessages(chat);
@@ -5238,7 +5367,8 @@ function renderMessages() {
   }
   wrap.innerHTML = html;
   bindMessageActions(wrap);
-  scrollChatBottom();
+  restoreChatScrollState(scrollEl, scrollState, options);
+  refreshFinishBatchButton();
 }
 function scrollChatBottom() {
   const el = document.getElementById('chat-scroll');
@@ -5334,6 +5464,7 @@ async function retractMessage(charId, messageId) {
   abortPendingReply(charId, messageId, false);
   message.retracted = true;
   message.retractedAt = Date.now();
+  removeMessageFromStagedBatch(chat, messageId);
   delete message.replyState;
   delete message.replyError;
   DB.set('chats', allChats);
@@ -5345,10 +5476,12 @@ async function deleteChatMessage(charId, messageId) {
   const chat = allChats[charId];
   const index = (chat?.messages || []).findIndex(message => message.id === messageId);
   if (!chat || index < 0) return false;
+  const countedByMemory = messageAvailableToAI(chat.messages[index]);
   abortPendingReply(charId, messageId, true);
+  removeMessageFromStagedBatch(chat, messageId);
   chat.messages.splice(index, 1);
   DB.set('chats', allChats);
-  await adjustMemoryCursorAfterDeletion(charId, index);
+  if (countedByMemory) await adjustMemoryCursorAfterDeletion(charId, index);
   if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
   renderChats();
   return true;
@@ -5387,7 +5520,6 @@ function toggleComposerPanel(kind) {
     if (kind === 'emoji') renderEmojiPanel();
     target.classList.add('show');
   }
-  setTimeout(scrollChatBottom, 50);
 }
 function insertEmoji(value) {
   const input = document.getElementById('chat-input');
@@ -5504,12 +5636,16 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
   const controller = new AbortController();
   const storedOptions = {
     paymentMessageId: options.paymentMessageId || '',
-    payment: options.payment || null
+    payment: options.payment || null,
+    batchId: options.batchId || '',
+    batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : []
   };
   chat.pendingReply = {
     userMessageId,
     userText: String(userText || userMessage.content || ''),
     options: storedOptions,
+    batchId: storedOptions.batchId,
+    batchMessageIds: [...storedOptions.batchMessageIds],
     state: 'running',
     requestToken,
     createdAt: Number(chat.pendingReply?.createdAt) || Date.now(),
@@ -5681,7 +5817,7 @@ function resumePendingAssistantTurns() {
     }
     const savedOptions = pending.options || {};
     if (isNativeApp()) {
-      if (pending.nativeTurnId) {
+      if (pending.nativeTurnId && pending.nativeAcceptedAt) {
         nativeReplyQueuedIds.add(pending.nativeTurnId);
         startNativeReplyPolling();
         return;
@@ -5774,7 +5910,7 @@ async function submitPayMessage() {
   if (amountInput) amountInput.value = '';
   if (noteInput) noteInput.value = '';
   showScreen('chat');
-  renderMessages();
+  renderMessages({ forceBottom: true });
   if (isNativeApp()) return queueAndroidUserReply(currentCharId, paymentMessage.id, { paymentMessageId, payment: { kind, amount, note } });
   await continueAssistantTurn(currentCharId, content, { userMessageId: paymentMessage.id, paymentMessageId, payment: { kind, amount, note } });
 }
@@ -6617,12 +6753,40 @@ async function sendMessage() {
   input.style.height = 'auto';
   document.getElementById('btn-send').className = 'send inactive';
   const chat = allChats[requestCharId];
-  cancelCloudProactive(requestCharId, 'chat');
-  const message = createPendingUserMessage(chat, text);
+  stagePlayerMessage(chat, text);
   DB.set('chats', allChats);
-  renderMessages();
-  if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
-  await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
+  renderMessages({ forceBottom: true });
+  refreshChatSendButton();
+  return true;
+}
+async function finishStagedBatch(charId = currentCharId) {
+  if (!charId || isStreaming) return false;
+  const chat = allChats[charId];
+  const committed = commitStagedBatch(chat);
+  if (!committed?.sourceMessage) return false;
+  const batchMessageIds = [...committed.messageIds];
+  const userText = committed.messages.map(message => String(message.content || '').trim()).filter(Boolean).join('\n');
+  const sourceMessage = committed.sourceMessage;
+  const options = { batchId: committed.batchId, batchMessageIds };
+  chat.pendingReply = {
+    userMessageId: sourceMessage.id,
+    sourceMessageId: sourceMessage.id,
+    userText,
+    batchId: committed.batchId,
+    batchMessageIds,
+    options,
+    state: 'pending',
+    createdAt: committed.committedAt,
+    updatedAt: Date.now()
+  };
+  sourceMessage.replyState = 'pending';
+  cancelCloudProactive(charId, 'chat');
+  DB.set('chats', allChats);
+  refreshFinishBatchButton();
+  if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
+  if (isNativeApp()) return queueAndroidUserReply(charId, sourceMessage.id, { ...options, userText });
+  await continueAssistantTurn(charId, userText, { ...options, userMessageId: sourceMessage.id });
+  return true;
 }
 function voiceButtonEl() {
   return document.querySelector('#composer-voice .voice-hold');
@@ -6703,7 +6867,7 @@ async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random
   cancelCloudProactive(requestCharId, 'chat');
   const message = createPendingUserMessage(chat, content, { type: 'voice', voiceDuration: actualDuration });
   DB.set('chats', allChats);
-  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (reason) toast(reason, 2200);
   const voicePrompt = `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`;
   if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, { userText: voicePrompt });
@@ -6724,7 +6888,7 @@ async function sendVoiceTranscriptMessage(transcript, duration) {
   cancelCloudProactive(requestCharId, 'chat');
   const message = createPendingUserMessage(chat, text, { type: 'voice', transcript: text, voiceDuration: duration });
   DB.set('chats', allChats);
-  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
+  if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
   await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
 }
