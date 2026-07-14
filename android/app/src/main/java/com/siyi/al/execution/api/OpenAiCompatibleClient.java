@@ -26,7 +26,7 @@ public final class OpenAiCompatibleClient {
             }
             request.put("model", config.model);
             request.put("messages", requestMessages);
-            request.put("temperature", config.temperature);
+            if (config.temperature != null) request.put("temperature", config.temperature);
             request.put("max_tokens", Math.max(1, maxTokens));
             request.put("stream", false);
         } catch (JSONException error) {

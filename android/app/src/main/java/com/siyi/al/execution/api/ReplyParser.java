@@ -15,7 +15,7 @@ public final class ReplyParser {
     private static final Pattern NO_REPLY = Pattern.compile("^[（(]?对方没有回复[）)]?[。！!]?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern SENTENCE = Pattern.compile("[^。！？!?]+[。！？!?]+|[^。！？!?]+$");
     private static final int MAX_TEXT_PARTS = 12;
-    private static final int LONG_SINGLE_BUBBLE = 48;
+    private static final int LONG_SINGLE_BUBBLE = 30;
 
     public ParsedReply parse(String raw, String turnId, String attemptId) {
         String source = raw == null ? "" : raw;
@@ -23,7 +23,7 @@ public final class ReplyParser {
         JSONObject payment = payment(source);
         JSONObject paymentStatus = directive(PAYMENT_STATUS, source);
         JSONObject schedule = directive(SCHEDULE, source);
-        String clean = clean(source);
+        String clean = unwrapTextJson(clean(source));
         for (String line : clean.split("\\n+")) {
             String content = line.trim();
             if (content.isEmpty() || NO_REPLY.matcher(content).matches()) continue;
@@ -95,7 +95,7 @@ public final class ReplyParser {
             String sentence = matcher.group().trim();
             if (!sentence.isEmpty()) sentences.add(sentence);
         }
-        if (sentences.size() < 3) {
+        if (sentences.size() < 2) {
             sentences.clear();
             sentences.add(content);
             return sentences;
@@ -109,6 +109,18 @@ public final class ReplyParser {
             bubbles.add(sentence);
         }
         return bubbles;
+    }
+
+    private static String unwrapTextJson(String source) {
+        String candidate = source.trim();
+        try {
+            JSONObject object = new JSONObject(candidate);
+            Object text = object.opt("text");
+            if (text instanceof String) return ((String) text).replaceAll("\\s+", " ").trim();
+        } catch (JSONException ignored) {
+            // Ordinary chat text is not JSON and should pass through unchanged.
+        }
+        return source;
     }
 
     private static void add(List<ParsedReplyPart> parts, String turnId, String attemptId, String type, String content, String payloadJson) {

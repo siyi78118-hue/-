@@ -758,11 +758,13 @@ button.cell:active{background:#ececec}
           <div class="cell"><div class="cell-label">地址</div><div class="cell-body"><input class="input" id="set-chat-api-url" placeholder="https://chat-api.example/v1"></div></div>
           <div class="cell"><div class="cell-label">Key</div><div class="cell-body"><input class="input" id="set-chat-api-key" type="password" placeholder="sk-..." autocomplete="off" autocapitalize="none" spellcheck="false"></div></div>
           <div class="cell model-row"><div class="cell-label">聊天模型</div><div class="cell-body"><input class="input" id="set-chat-model" placeholder="负责角色回复"><div class="model-tools"><select class="select" id="set-chat-model-list" onchange="selectFetchedModel(this.value, 'chat')"><option value="">未拉取模型</option></select><button class="inline-btn" onclick="fetchModels('chat')" type="button">拉取模型</button></div></div></div>
+          <div class="cell"><div class="cell-label">聊天温度</div><div class="cell-body"><select class="select" id="set-chat-temperature-enabled"><option value="on">发送参数</option><option value="off">不发送</option></select></div></div>
           <div class="contact-index" style="height:30px">记忆接口</div>
           <div class="cell"><div class="cell-label">接口</div><div class="cell-body"><select class="select" id="set-memory-api-type"><option value="openai">OpenAI 兼容</option><option value="claude">Claude</option></select></div></div>
           <div class="cell"><div class="cell-label">地址</div><div class="cell-body"><input class="input" id="set-memory-api-url" placeholder="https://memory-api.example/v1"></div></div>
           <div class="cell"><div class="cell-label">Key</div><div class="cell-body"><input class="input" id="set-memory-api-key" type="password" placeholder="sk-..." autocomplete="off" autocapitalize="none" spellcheck="false"></div></div>
           <div class="cell model-row"><div class="cell-label">记忆模型</div><div class="cell-body"><input class="input" id="set-memory-model" placeholder="负责检索、摘要和记忆整理"><div class="model-tools"><select class="select" id="set-memory-model-list" onchange="selectFetchedModel(this.value, 'memory')"><option value="">未拉取模型</option></select><button class="inline-btn" onclick="fetchModels('memory')" type="button">拉取模型</button></div></div></div>
+          <div class="cell"><div class="cell-label">记忆温度</div><div class="cell-body"><select class="select" id="set-memory-temperature-enabled"><option value="on">发送参数</option><option value="off">不发送</option></select></div></div>
           <div class="contact-index" style="height:30px">语音转文字</div>
           <div class="cell"><div class="cell-label">转写</div><div class="cell-body"><select class="select" id="set-voice-transcribe-enabled"><option value="on">开启</option><option value="off">关闭</option></select></div></div>
           <div class="cell"><div class="cell-label">地址</div><div class="cell-body"><input class="input" id="set-voice-api-url" placeholder="留空则复用聊天接口"></div></div>
@@ -770,7 +772,7 @@ button.cell:active{background:#ececec}
           <div class="cell"><div class="cell-label">转写模型</div><div class="cell-body"><input class="input" id="set-voice-model" placeholder="whisper-1"></div></div>
         </div>
         <div class="cell-group">
-          <div class="cell"><div class="cell-label">Temperature</div><div class="cell-body"><input class="range" id="set-temp" type="range" min="0" max="2" step="0.05" value="0.8" oninput="document.getElementById('temp-val').textContent=this.value"></div><div class="mini" id="temp-val">0.8</div></div>
+          <div class="cell"><div class="cell-label">聊天温度值</div><div class="cell-body"><input class="range" id="set-temp" type="range" min="0" max="2" step="0.05" value="0.8" oninput="document.getElementById('temp-val').textContent=this.value"></div><div class="mini" id="temp-val">0.8</div></div>
           <div class="cell"><div class="cell-label">长度</div><div class="cell-body"><input class="input" id="set-max-tokens" type="number" value="1000"></div></div>
           <div class="cell"><div class="cell-label">主动消息</div><div class="cell-body"><select class="select" id="set-proactive-enabled"><option value="off">关闭</option><option value="on">开启</option></select></div></div>
           <div class="cell"><div class="cell-label">空闲触发</div><div class="cell-body"><input class="input" id="set-proactive-minutes" type="number" min="1" step="1" value="30"></div><div class="mini">分钟</div></div>
@@ -1199,6 +1201,8 @@ const DEFAULT_SETTINGS = {
   memoryModels: [],
   rpPreset: 'combined',
   temperature: 0.8,
+  chatTemperatureEnabled: true,
+  memoryTemperatureEnabled: true,
   maxTokens: 1000,
   memoryInterval: 30,
   proactiveEnabled: false,
@@ -1232,7 +1236,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-13.80';
+const APP_BUILD_VERSION = '2026-07-14.81';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -1885,6 +1889,11 @@ async function buildAndroidUserReplySnapshot(charId, task) {
 function nativeExecutionPlugin() {
   return isNativeApp() ? window.Capacitor?.Plugins?.AlExecution : null;
 }
+function withOptionalTemperature(payload, enabled, value) {
+  const body = { ...(payload || {}) };
+  if (enabled !== false) body.temperature = Number(value);
+  return body;
+}
 function nativeTurnIdForMessage(messageId) {
   return `turn_${String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
@@ -1895,8 +1904,8 @@ async function saveNativeExecutionApiConfigs() {
     throw new Error('当前原生后台执行仅支持 OpenAI 兼容接口');
   }
   const configs = [
-    { configId: 'chat-v1', baseUrl: settings.chatApiUrl, apiKey: cleanApiKey(settings.chatApiKey), model: settings.chatModel, temperature: 0.8 },
-    { configId: 'memory-v1', baseUrl: settings.memoryApiUrl, apiKey: cleanApiKey(settings.memoryApiKey), model: settings.memoryModel, temperature: 0.2 }
+    { configId: 'chat-v1', baseUrl: settings.chatApiUrl, apiKey: cleanApiKey(settings.chatApiKey), model: settings.chatModel, temperature: Number(settings.temperature) || 0.8, sendTemperature: settings.chatTemperatureEnabled !== false },
+    { configId: 'memory-v1', baseUrl: settings.memoryApiUrl, apiKey: cleanApiKey(settings.memoryApiKey), model: settings.memoryModel, temperature: 0.2, sendTemperature: settings.memoryTemperatureEnabled !== false }
   ];
   for (const config of configs) {
     if (!config.baseUrl || !config.apiKey || !config.model) throw new Error(`${config.configId === 'chat-v1' ? '聊天' : '记忆'}接口配置不完整`);
@@ -1975,8 +1984,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
       returnPromptDetails: true
     });
     chatSystem = prompt.system;
-    chatMessages = proactiveRecentMessages(chat, 30, now);
-    chatMessages.push({ role: 'user', content: buildProactiveTriggerMessage(char, chat, now, triggerMode) });
+    chatMessages = nativeProactiveChatMessages(char, chat, now, triggerMode);
     memoryQuery = buildProactiveMemoryQuery(chat, now, triggerMode);
   }
   const snapshot = {
@@ -2092,6 +2100,21 @@ function nativePendingReplyNeedsSubmission(pending, messageId, queuedIds = nativ
 function shouldRestoreLegacyNativeBackground(nativeExecutionAvailable) {
   return !nativeExecutionAvailable;
 }
+function extractMomentPostText(raw) {
+  const source = String(raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+  if (!source) return '';
+  const candidates = [source];
+  const start = source.indexOf('{');
+  const end = source.lastIndexOf('}');
+  if (start >= 0 && end > start && (start !== 0 || end !== source.length - 1)) candidates.push(source.slice(start, end + 1));
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed.text === 'string') return parsed.text.replace(/\s+/g, ' ').trim();
+    } catch {}
+  }
+  return source.replace(/\s+/g, ' ').trim();
+}
 async function applyNativeExecutionTurn(result) {
   const charId = result?.characterId;
   const chat = allChats[charId];
@@ -2105,7 +2128,8 @@ async function applyNativeExecutionTurn(result) {
       const text = parts.filter(part => part.type === 'TEXT').map(part => String(part.content || '').trim()).filter(Boolean).join('\n');
       if (kind === 'PROACTIVE_MOMENT') {
         const exists = (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
-        if (!exists && text) createCharacterMoment(charId, text, { proactive: true, sourceTurnId });
+        const momentText = extractMomentPostText(text);
+        if (!exists && momentText) createCharacterMoment(charId, momentText, { proactive: true, sourceTurnId });
         delete chat.pendingMomentJob;
         chat.lastProactiveMomentAt = Number(result.completedAt) || Date.now();
         ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment reschedule skipped:', err.message));
@@ -2810,6 +2834,11 @@ function proactiveRecentMessages(chat, count = 30, now = new Date()) {
     const meta = at ? `历史消息元数据：${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}。元数据只供判断时间流逝，禁止复制进回复。` : '历史消息元数据：发送时间未知，禁止复制进回复。';
     return { role: m.role, content: `${meta}\n历史聊天正文：${m.content}` };
   });
+}
+function nativeProactiveChatMessages(char, chat, now = new Date(), triggerMode = 'planned') {
+  const messages = proactiveRecentMessages(chat, 29, now);
+  messages.push({ role: 'user', content: buildProactiveTriggerMessage(char, chat, now, triggerMode) });
+  return messages;
 }
 function buildProactiveMemoryQuery(chat, now = new Date(), triggerMode = 'planned') {
   const state = proactiveConversationState(chat, now);
@@ -5175,9 +5204,9 @@ function splitAssistantOutput(text) {
 }
 function splitLongAssistantBubble(content) {
   const text = String(content || '').trim();
-  if (text.length <= 48) return text ? [text] : [];
+  if (text.length <= 30) return text ? [text] : [];
   const sentences = text.match(/[^。！？!?]+[。！？!?]+|[^。！？!?]+$/g)?.map(row => row.trim()).filter(Boolean) || [];
-  if (sentences.length < 3) return [text];
+  if (sentences.length < 2) return [text];
   const bubbles = [];
   for (let index = 0; index < sentences.length; index += 1) {
     let sentence = sentences[index];
@@ -6106,7 +6135,7 @@ async function callMemoryJSON(system, user, options = {}) {
       const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({ model: settings.memoryModel, system, messages, max_tokens: MEMORY_MAX_TOKENS, temperature: 0.2 }),
+        body: JSON.stringify(withOptionalTemperature({ model: settings.memoryModel, system, messages, max_tokens: MEMORY_MAX_TOKENS }, settings.memoryTemperatureEnabled !== false, 0.2)),
         signal: options.signal
       }, API_TIMEOUT_MS);
       const raw = await resp.text();
@@ -6130,7 +6159,7 @@ async function callMemoryJSON(system, user, options = {}) {
       const resp = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-        body: JSON.stringify({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], temperature: 0.2, max_tokens: MEMORY_MAX_TOKENS }),
+        body: JSON.stringify(withOptionalTemperature({ model: settings.memoryModel, messages: [{ role: 'system', content: system }, ...messages], max_tokens: MEMORY_MAX_TOKENS }, settings.memoryTemperatureEnabled !== false, 0.2)),
         signal: options.signal
       }, API_TIMEOUT_MS);
       const raw = await resp.text();
@@ -8019,13 +8048,23 @@ async function callOpenAI(system, messages, options = {}) {
   const startedAt = Date.now();
   let resp;
   try {
-    resp = await fetchWithTimeout(settings.chatApiUrl.replace(/\/+$/, '') + '/chat/completions', {
+    const endpoint = settings.chatApiUrl.replace(/\/+$/, '') + '/chat/completions';
+    const requestBody = withOptionalTemperature({ model: settings.chatModel || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], max_tokens: Number(settings.maxTokens) || 1000, stream: live }, settings.chatTemperatureEnabled !== false, Number(settings.temperature) || 0.8);
+    const request = () => fetchWithTimeout(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${chatApiKey}` },
-      body: JSON.stringify({ model: settings.chatModel || 'gpt-4o', messages: [{ role: 'system', content: system }, ...messages], temperature: Number(settings.temperature) || 0.8, max_tokens: Number(settings.maxTokens) || 1000, stream: live }),
+      body: JSON.stringify(requestBody),
       signal: options.signal
     });
-    if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
+    resp = await request();
+    if (!resp.ok) {
+      const errorText = await resp.text();
+      const rejectsTemperature = resp.status === 400 && Object.hasOwn(requestBody, 'temperature') && /temperature/i.test(errorText) && /(deprecated|unsupported|not supported|invalid_request_error)/i.test(errorText);
+      if (!rejectsTemperature) throw new Error(`API ${resp.status}: ${errorText.slice(0, 120)}`);
+      delete requestBody.temperature;
+      resp = await request();
+      if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
+    }
     if (live) {
       const text = await readOpenAIStream(resp, options.charId, options.signal);
       if (!text.trim()) lastChatResponseDiagnostic = lastChatResponseDiagnostic || '流式接口返回为空';
@@ -8086,7 +8125,7 @@ async function callClaude(system, messages, options = {}) {
     resp = await fetchWithTimeout(settings.chatApiUrl.replace(/\/+$/, '') + '/messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': chatApiKey, 'anthropic-version': '2023-06-01' },
-      body: JSON.stringify({ model: settings.chatModel || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, temperature: Number(settings.temperature) || 0.8, stream: live }),
+      body: JSON.stringify(withOptionalTemperature({ model: settings.chatModel || 'claude-sonnet-4-20250514', system, messages, max_tokens: Number(settings.maxTokens) || 1000, stream: live }, settings.chatTemperatureEnabled !== false, Number(settings.temperature) || 0.8)),
       signal: options.signal
     });
     if (!resp.ok) throw new Error(`API ${resp.status}: ${(await resp.text()).slice(0, 120)}`);
@@ -8156,6 +8195,8 @@ function loadSettings() {
   document.getElementById('set-voice-api-key').value = settings.voiceApiKey || '';
   document.getElementById('set-chat-model').value = settings.chatModel || settings.model || '';
   document.getElementById('set-memory-model').value = settings.memoryModel || '';
+  document.getElementById('set-chat-temperature-enabled').value = settings.chatTemperatureEnabled === false ? 'off' : 'on';
+  document.getElementById('set-memory-temperature-enabled').value = settings.memoryTemperatureEnabled === false ? 'off' : 'on';
   document.getElementById('set-voice-model').value = settings.voiceModel || 'whisper-1';
   renderModelOptions(settings.chatModels || settings.models || [], 'chat');
   renderModelOptions(settings.memoryModels || settings.models || [], 'memory');
@@ -8244,6 +8285,8 @@ function readSettingsForm() {
     apiKey: chatApiKey,
     chatModel,
     memoryModel,
+    chatTemperatureEnabled: document.getElementById('set-chat-temperature-enabled').value !== 'off',
+    memoryTemperatureEnabled: document.getElementById('set-memory-temperature-enabled').value !== 'off',
     voiceModel: document.getElementById('set-voice-model').value.trim() || 'whisper-1',
     chatModels: settings.chatModels || settings.models || [],
     memoryModels: settings.memoryModels || settings.models || [],

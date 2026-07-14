@@ -4,9 +4,9 @@ public final class ApiConfig {
     public final String baseUrl;
     public final String apiKey;
     public final String model;
-    public final double temperature;
+    public final Double temperature;
 
-    public ApiConfig(String baseUrl, String apiKey, String model, double temperature) {
+    public ApiConfig(String baseUrl, String apiKey, String model, Double temperature) {
         this.baseUrl = requireText(baseUrl, "baseUrl");
         this.apiKey = requireText(apiKey, "apiKey");
         this.model = requireText(model, "model");

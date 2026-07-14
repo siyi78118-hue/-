@@ -77,6 +77,20 @@ public class OpenAiCompatibleClientTest {
         assertFalse(bodies.get(1).contains("\"temperature\""));
     }
 
+    @Test
+    public void omitsTemperatureWithoutMakingARejectedFirstRequestWhenDisabled() throws Exception {
+        FakeTransport transport = new FakeTransport(
+            200,
+            "application/json",
+            "{\"choices\":[{\"message\":{\"content\":\"直接成功\"}}]}"
+        );
+        OpenAiCompatibleClient client = new OpenAiCompatibleClient(transport);
+
+        ApiConfig disabled = new ApiConfig("https://api.example.com/v1", "secret", "model-1", null);
+        assertEquals("直接成功", client.call(disabled, "sys", new JSONArray(), 1000));
+        assertFalse(transport.lastBody.contains("\"temperature\""));
+    }
+
     private static ApiConfig config() {
         return new ApiConfig("https://api.example.com/v1", "secret", "model-1", 0.8);
     }

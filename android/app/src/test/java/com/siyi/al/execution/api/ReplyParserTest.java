@@ -49,6 +49,31 @@ public class ReplyParserTest {
     }
 
     @Test
+    public void separatesMediumTwoSentenceReplyIntoChatBubbles() {
+        ParsedReply parsed = parser.parse(
+            "还在纠结，食堂大概率还是那碗看不出内容的盖浇饭。有点想点外卖，但打开软件又开始决定困难。",
+            "turn-medium",
+            "attempt-medium"
+        );
+
+        assertEquals(2, parsed.parts.size());
+        assertEquals("还在纠结，食堂大概率还是那碗看不出内容的盖浇饭。", parsed.parts.get(0).content);
+        assertEquals("有点想点外卖，但打开软件又开始决定困难。", parsed.parts.get(1).content);
+    }
+
+    @Test
+    public void unwrapsMomentTextJsonInsteadOfShowingTheWrapper() {
+        ParsedReply parsed = parser.parse(
+            "{\"text\":\"今晚早点睡。\"}",
+            "turn-moment",
+            "attempt-moment"
+        );
+
+        assertEquals(1, parsed.parts.size());
+        assertEquals("今晚早点睡。", parsed.parts.get(0).content);
+    }
+
+    @Test
     public void removesLeakedTimeMetadataAndNoReplyPlaceholder() {
         ParsedReply parsed = parser.parse(
             "【发送时间 2026-07-13 15:30】下午好\n（对方没有回复）",

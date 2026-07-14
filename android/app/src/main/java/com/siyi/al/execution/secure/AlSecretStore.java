@@ -28,7 +28,7 @@ public final class AlSecretStore {
         put(configId, "baseUrl", config.baseUrl);
         put(configId, "apiKey", config.apiKey);
         put(configId, "model", config.model);
-        put(configId, "temperature", Double.toString(config.temperature));
+        put(configId, "temperature", config.temperature == null ? "disabled" : Double.toString(config.temperature));
     }
 
     public synchronized ApiConfig loadApiConfig(String configId) {
@@ -37,11 +37,13 @@ public final class AlSecretStore {
         String model = get(configId, "model");
         String temperature = get(configId, "temperature");
         if (baseUrl == null || apiKey == null || model == null) return null;
-        double parsedTemperature;
-        try {
-            parsedTemperature = Double.parseDouble(temperature == null ? "0.8" : temperature);
-        } catch (NumberFormatException ignored) {
-            parsedTemperature = 0.8;
+        Double parsedTemperature = null;
+        if (!"disabled".equals(temperature)) {
+            try {
+                parsedTemperature = Double.parseDouble(temperature == null ? "0.8" : temperature);
+            } catch (NumberFormatException ignored) {
+                parsedTemperature = 0.8;
+            }
         }
         return new ApiConfig(baseUrl, apiKey, model, parsedTemperature);
     }

@@ -44,12 +44,13 @@ public final class AlExecutionPlugin extends Plugin {
     public void saveApiConfig(PluginCall call) {
         execute(call, () -> {
             String configId = required(call, "configId");
+            Boolean sendTemperature = call.getBoolean("sendTemperature", true);
             Double temperature = call.getDouble("temperature", 0.8);
             ApiConfig config = new ApiConfig(
                 required(call, "baseUrl"),
                 required(call, "apiKey"),
                 required(call, "model"),
-                temperature == null ? 0.8 : temperature
+                Boolean.FALSE.equals(sendTemperature) ? null : (temperature == null ? 0.8 : temperature)
             );
             secrets.saveApiConfig(configId, config);
             JSObject result = new JSObject();
