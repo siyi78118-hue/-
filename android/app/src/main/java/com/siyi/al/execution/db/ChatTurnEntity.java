@@ -27,6 +27,7 @@ public class ChatTurnEntity {
     public long createdAt;
     public long updatedAt;
     @Nullable public Long completedAt;
+    @Nullable public Long uiAppliedAt;
     @Nullable public Long cancelledAt;
     @Nullable public Long deletedAt;
 }

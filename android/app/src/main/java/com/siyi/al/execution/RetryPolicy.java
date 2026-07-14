@@ -2,6 +2,8 @@ package com.siyi.al.execution;
 
 import com.siyi.al.execution.api.ApiProtocolException;
 import java.net.ConnectException;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 
 public final class RetryPolicy {
@@ -13,6 +15,12 @@ public final class RetryPolicy {
                 || "HTTP_503".equals(code)
                 || "HTTP_504".equals(code);
             return new Decision(code, retryable);
+        }
+        if (error instanceof SocketTimeoutException) {
+            return new Decision("NETWORK_TIMEOUT", true);
+        }
+        if (error instanceof SocketException) {
+            return new Decision("NETWORK_INTERRUPTED", true);
         }
         if (error instanceof UnknownHostException || error instanceof ConnectException) {
             return new Decision("NETWORK_UNREACHABLE", true);

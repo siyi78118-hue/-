@@ -38,4 +38,8 @@ public interface ExecutionStore {
     TurnState displayState(String turnId);
 
     List<ChangeEventEntity> changesAfter(long cursor, int limit);
+
+    List<ChatTurnEntity> unappliedCompletedTurns(int limit);
+
+    void acknowledgeUiApplied(String turnId, long now);
 }

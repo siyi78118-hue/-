@@ -164,6 +164,29 @@ public final class AlExecutionPlugin extends Plugin {
         });
     }
 
+    @PluginMethod
+    public void unappliedCompletedTurns(PluginCall call) {
+        execute(call, () -> {
+            Integer limit = call.getInt("limit", 200);
+            JSArray turns = new JSArray();
+            for (ChatTurnEntity turn : store.unappliedCompletedTurns(limit == null ? 200 : limit)) {
+                turns.put(turnResult(turn));
+            }
+            JSObject result = new JSObject();
+            result.put("turns", turns);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void acknowledgeUiApplied(PluginCall call) {
+        execute(call, () -> {
+            String turnId = required(call, "turnId");
+            store.acknowledgeUiApplied(turnId, System.currentTimeMillis());
+            return turnResult(store.turn(turnId));
+        });
+    }
+
     private JSObject turnResult(ChatTurnEntity turn) {
         JSObject result = new JSObject();
         result.put("turnId", turn.turnId);
@@ -176,6 +199,7 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("createdAt", turn.createdAt);
         result.put("updatedAt", turn.updatedAt);
         result.put("completedAt", turn.completedAt);
+        result.put("uiAppliedAt", turn.uiAppliedAt);
         ExecutionAttemptEntity attempt = store.activeAttempt(turn.turnId);
         if (attempt != null) {
             result.put("attemptId", attempt.attemptId);

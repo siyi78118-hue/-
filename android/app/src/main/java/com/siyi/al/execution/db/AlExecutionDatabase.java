@@ -4,6 +4,8 @@ import android.content.Context;
 import androidx.room.Database;
 import androidx.room.Room;
 import androidx.room.RoomDatabase;
+import androidx.room.migration.Migration;
+import androidx.sqlite.db.SupportSQLiteDatabase;
 
 @Database(
     entities = {
@@ -15,11 +17,17 @@ import androidx.room.RoomDatabase;
         DiagnosticEntity.class,
         ChangeEventEntity.class
     },
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
     private static volatile AlExecutionDatabase instance;
+    private static final Migration MIGRATION_1_2 = new Migration(1, 2) {
+        @Override
+        public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("ALTER TABLE chat_turns ADD COLUMN uiAppliedAt INTEGER");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -31,7 +39,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         context.getApplicationContext(),
                         AlExecutionDatabase.class,
                         "al-execution.db"
-                    ).build();
+                    ).addMigrations(MIGRATION_1_2).build();
                 }
             }
         }

@@ -10,6 +10,7 @@ import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import java.util.Map;
+import org.json.JSONObject;
 
 public class AlFirebaseMessagingService extends MessagingService {
     @Override
@@ -27,6 +28,7 @@ public class AlFirebaseMessagingService extends MessagingService {
         AlExecutionDatabase database = AlExecutionDatabase.get(this);
         CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(characterId + ":" + kindName);
         if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) return;
+        if (!matchesSnapshotJob(snapshot, jobId)) return;
 
         String safeJobId = jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
         TurnKind kind = "moment".equals(kindName) ? TurnKind.PROACTIVE_MOMENT : TurnKind.PROACTIVE_CHAT;
@@ -42,6 +44,17 @@ public class AlFirebaseMessagingService extends MessagingService {
             System.currentTimeMillis()
         ));
         AlExecutionService.requestRun(this);
+    }
+
+    static boolean matchesSnapshotJob(CharacterSnapshotEntity snapshot, String jobId) {
+        String incoming = text(jobId);
+        if (snapshot == null || incoming.isEmpty()) return false;
+        try {
+            String current = text(new JSONObject(snapshot.contextJson).optString("cloudJobId", ""));
+            return !current.isEmpty() && current.equals(incoming);
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private static String text(String value) {

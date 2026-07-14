@@ -52,6 +52,12 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT 50")
     List<ChatTurnEntity> completedTurns();
 
+    @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL AND uiAppliedAt IS NULL ORDER BY completedAt ASC LIMIT :limit")
+    List<ChatTurnEntity> unappliedCompletedTurns(int limit);
+
+    @Query("UPDATE chat_turns SET uiAppliedAt = :now WHERE turnId = :turnId AND state = 'COMPLETED' AND uiAppliedAt IS NULL")
+    int acknowledgeUiApplied(String turnId, long now);
+
     @Query("SELECT * FROM execution_attempts WHERE state IN ('MEMORY_RUNNING', 'MEMORY_DONE', 'CHAT_RUNNING', 'CHAT_DONE') ORDER BY startedAt ASC")
     List<ExecutionAttemptEntity> recoverableAttempts();
 
@@ -64,7 +70,7 @@ public interface AlExecutionDao {
     @Query("SELECT COUNT(*) FROM reply_parts WHERE turnId = :turnId")
     int replyPartCount(String turnId);
 
-    @Query("UPDATE chat_turns SET activeAttemptId = :attemptId, state = 'QUEUED', updatedAt = :now, completedAt = NULL WHERE turnId = :turnId")
+    @Query("UPDATE chat_turns SET activeAttemptId = :attemptId, state = 'QUEUED', updatedAt = :now, completedAt = NULL, uiAppliedAt = NULL WHERE turnId = :turnId")
     int activateAttempt(String turnId, String attemptId, long now);
 
     @Query("UPDATE chat_turns SET state = :state, updatedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId")
@@ -79,7 +85,7 @@ public interface AlExecutionDao {
     @Query("UPDATE execution_attempts SET rawReply = :rawReply, stage = 'COMMIT', state = 'CHAT_DONE', heartbeatAt = :now WHERE attemptId = :attemptId")
     int saveRawReply(String attemptId, String rawReply, long now);
 
-    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId AND state = 'CHAT_DONE'")
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now, uiAppliedAt = NULL WHERE turnId = :turnId AND activeAttemptId = :attemptId AND state = 'CHAT_DONE'")
     int completeTurn(String turnId, String attemptId, long now);
 
     @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId")

@@ -7,8 +7,11 @@ import com.siyi.al.execution.api.ReplyParser;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.List;
+import java.util.Locale;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -63,7 +66,7 @@ public final class ExecutionEngine {
             if (state == TurnState.MEMORY_RUNNING) {
                 String memory = models.call(
                     snapshot.getString("memoryConfigId"),
-                    snapshot.getString("memorySystem"),
+                    withExecutionTime(snapshot.getString("memorySystem"), clock.now()),
                     snapshot.optJSONArray("memoryMessages") == null ? new JSONArray() : snapshot.getJSONArray("memoryMessages"),
                     snapshot.optInt("memoryMaxTokens", 1400)
                 );
@@ -75,7 +78,7 @@ public final class ExecutionEngine {
                 store.markStage(turn.turnId, attempt.attemptId, TurnState.CHAT_RUNNING, AttemptStage.CHAT, clock.now());
                 String rawReply = models.call(
                     snapshot.getString("chatConfigId"),
-                    withMemory(snapshot.getString("chatSystem"), attempt.memoryResult),
+                    withExecutionTime(withMemory(snapshot.getString("chatSystem"), attempt.memoryResult), clock.now()),
                     exactChatMessages(snapshot),
                     snapshot.optInt("chatMaxTokens", 1000)
                 );
@@ -129,13 +132,27 @@ public final class ExecutionEngine {
     private static JSONArray exactChatMessages(JSONObject snapshot) {
         JSONArray source = snapshot.optJSONArray("chatMessages");
         if (source == null) return new JSONArray();
-        if (source.length() > 30) throw new IllegalArgumentException("chatMessages must contain exactly the selected latest 30 or fewer messages");
-        return source;
+        int start = Math.max(0, source.length() - 30);
+        JSONArray selected = new JSONArray();
+        for (int index = start; index < source.length(); index++) selected.put(source.opt(index));
+        return selected;
     }
 
     private static String withMemory(String fullSystemPrompt, String memory) {
         String selected = memory == null || memory.trim().isEmpty() ? "无相关记忆" : memory.trim();
         return fullSystemPrompt + "\n\n【记忆 AI 本轮筛选结果】\n" + selected + "\n以上事件时间必须按记录理解，不得把昨天改写成今天。";
+    }
+
+    private static String withExecutionTime(String system, long now) {
+        Calendar calendar = Calendar.getInstance();
+        calendar.setTimeInMillis(now);
+        int hour = calendar.get(Calendar.HOUR_OF_DAY);
+        String period = hour < 5 ? "凌晨" : hour < 9 ? "早上" : hour < 12 ? "上午" : hour < 14 ? "中午" : hour < 18 ? "下午" : hour < 23 ? "晚上" : "深夜";
+        String formatted = new SimpleDateFormat("yyyy-MM-dd HH:mm EEEE", Locale.SIMPLIFIED_CHINESE).format(calendar.getTime());
+        return system
+            + "\n\n【原生执行时钟｜最高时间优先级】\n"
+            + "当前设备时间：" + formatted + "（" + period + "）。\n"
+            + "这是模型真正执行本轮任务的时间。若快照、历史消息或旧话题中的时间与这里冲突，必须以这里为当前时间；历史内容仍按其原日期理解，禁止把昨天说成今天、把下午说成半夜。";
     }
 
     private ExecutionAttemptEntity requireActiveAttempt(ChatTurnEntity turn) {

@@ -164,6 +164,20 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     @Override
+    public List<ChatTurnEntity> unappliedCompletedTurns(int limit) {
+        return dao.unappliedCompletedTurns(Math.max(1, Math.min(limit, 500)));
+    }
+
+    @Override
+    public void acknowledgeUiApplied(String turnId, long now) {
+        ChatTurnEntity turn = requireTurn(turnId);
+        if (turn.uiAppliedAt != null) return;
+        if (dao.acknowledgeUiApplied(turnId, now) != 1) {
+            throw new IllegalStateException("Unable to acknowledge UI result for " + turnId);
+        }
+    }
+
+    @Override
     public ChatTurnEntity claimNext(long now) {
         return dao.nextQueuedTurn();
     }

@@ -62,6 +62,34 @@ public class ReplyParserTest {
     }
 
     @Test
+    public void restoresChineseChatBubblesWhenProviderFlattensLineBreaksToSpaces() {
+        ParsedReply parsed = parser.parse(
+            "手机静音躺床上，能十分钟摸回来已经是极限了 我又不是客服，还得主动巡逻你在不在😌 想聊天白天聊，凌晨两点的聊天质量堪忧 你现在这状态，明天上班就是行尸走肉 快睡，这是姐姐令箭，不接受反驳",
+            "turn-spaces",
+            "attempt-spaces"
+        );
+
+        assertEquals(5, parsed.parts.size());
+        assertEquals("手机静音躺床上，能十分钟摸回来已经是极限了", parsed.parts.get(0).content);
+        assertEquals("我又不是客服，还得主动巡逻你在不在😌", parsed.parts.get(1).content);
+        assertEquals("想聊天白天聊，凌晨两点的聊天质量堪忧", parsed.parts.get(2).content);
+        assertEquals("你现在这状态，明天上班就是行尸走肉", parsed.parts.get(3).content);
+        assertEquals("快睡，这是姐姐令箭，不接受反驳", parsed.parts.get(4).content);
+    }
+
+    @Test
+    public void discardsProviderEndTurnControlMarker() {
+        ParsedReply parsed = parser.parse(
+            "正文还在这里\nend_turn",
+            "turn-marker",
+            "attempt-marker"
+        );
+
+        assertEquals(1, parsed.parts.size());
+        assertEquals("正文还在这里", parsed.parts.get(0).content);
+    }
+
+    @Test
     public void unwrapsMomentTextJsonInsteadOfShowingTheWrapper() {
         ParsedReply parsed = parser.parse(
             "{\"text\":\"今晚早点睡。\"}",

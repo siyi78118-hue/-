@@ -13,6 +13,10 @@ public final class ReplyParser {
     private static final Pattern PAYMENT_STATUS = Pattern.compile("<al_payment>([\\s\\S]*?)</al_payment>", Pattern.CASE_INSENSITIVE);
     private static final Pattern SCHEDULE = Pattern.compile("<al_schedule>([\\s\\S]*?)</al_schedule>", Pattern.CASE_INSENSITIVE);
     private static final Pattern NO_REPLY = Pattern.compile("^[（(]?对方没有回复[）)]?[。！!]?$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern CONTROL_MARKER_SUFFIX = Pattern.compile(
+        "(?:^|\\s+)(?:<\\s*)?(?:end[\\s_-]*turn|turn[\\s_-]*end)(?:\\s*>)?\\s*$",
+        Pattern.CASE_INSENSITIVE
+    );
     private static final Pattern SENTENCE = Pattern.compile("[^。！？!?]+[。！？!?]+|[^。！？!?]+$");
     private static final int MAX_TEXT_PARTS = 12;
     private static final int LONG_SINGLE_BUBBLE = 30;
@@ -25,7 +29,7 @@ public final class ReplyParser {
         JSONObject schedule = directive(SCHEDULE, source);
         String clean = unwrapTextJson(clean(source));
         for (String line : clean.split("\\n+")) {
-            String content = line.trim();
+            String content = CONTROL_MARKER_SUFFIX.matcher(line.trim()).replaceFirst("").trim();
             if (content.isEmpty() || NO_REPLY.matcher(content).matches()) continue;
             for (String bubble : bubbleChunks(content)) {
                 add(parts, turnId, attemptId, "TEXT", bubble, "{}");
@@ -85,6 +89,21 @@ public final class ReplyParser {
     }
 
     private static List<String> bubbleChunks(String content) {
+        if (content.length() <= LONG_SINGLE_BUBBLE) {
+            List<String> single = new ArrayList<>();
+            single.add(content);
+            return single;
+        }
+        List<String> flattenedLines = splitFlattenedChineseLines(content);
+        if (flattenedLines.size() > 1) {
+            List<String> bubbles = new ArrayList<>();
+            for (String line : flattenedLines) bubbles.addAll(sentenceChunks(line));
+            return bubbles;
+        }
+        return sentenceChunks(content);
+    }
+
+    private static List<String> sentenceChunks(String content) {
         List<String> sentences = new ArrayList<>();
         if (content.length() <= LONG_SINGLE_BUBBLE) {
             sentences.add(content);
@@ -109,6 +128,50 @@ public final class ReplyParser {
             bubbles.add(sentence);
         }
         return bubbles;
+    }
+
+    private static List<String> splitFlattenedChineseLines(String content) {
+        List<String> chunks = new ArrayList<>();
+        int start = 0;
+        int index = 0;
+        while (index < content.length()) {
+            int codePoint = content.codePointAt(index);
+            if (!Character.isWhitespace(codePoint) && !Character.isSpaceChar(codePoint)) {
+                index += Character.charCount(codePoint);
+                continue;
+            }
+            int whitespaceStart = index;
+            while (index < content.length()) {
+                int whitespace = content.codePointAt(index);
+                if (!Character.isWhitespace(whitespace) && !Character.isSpaceChar(whitespace)) break;
+                index += Character.charCount(whitespace);
+            }
+            if (whitespaceStart <= start || index >= content.length()) continue;
+            int left = content.codePointBefore(whitespaceStart);
+            int right = content.codePointAt(index);
+            if (isChineseMessageBoundaryLeft(left) && isHan(right)) {
+                String chunk = content.substring(start, whitespaceStart).trim();
+                if (!chunk.isEmpty()) chunks.add(chunk);
+                start = index;
+            }
+        }
+        String tail = content.substring(start).trim();
+        if (!tail.isEmpty()) chunks.add(tail);
+        if (chunks.size() < 2) {
+            chunks.clear();
+            chunks.add(content);
+        }
+        return chunks;
+    }
+
+    private static boolean isChineseMessageBoundaryLeft(int codePoint) {
+        return isHan(codePoint)
+            || (codePoint >= 0x1F300 && codePoint <= 0x1FAFF)
+            || "。！？!?…".indexOf(codePoint) >= 0;
+    }
+
+    private static boolean isHan(int codePoint) {
+        return Character.UnicodeScript.of(codePoint) == Character.UnicodeScript.HAN;
     }
 
     private static String unwrapTextJson(String source) {

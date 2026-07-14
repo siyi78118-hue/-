@@ -110,6 +110,23 @@ public class RoomExecutionStoreTest {
         assertEquals(TurnState.CANCELLED, store.displayState("turn-4"));
     }
 
+    @Test
+    public void completedTurnRemainsInUiInboxUntilAcknowledged() {
+        store.submitTurn(submission("turn-ui-inbox", "msg-ui-inbox"));
+        String attemptId = store.activeAttempt("turn-ui-inbox").attemptId;
+        prepareChatDone("turn-ui-inbox", attemptId);
+        store.commitReply(
+            "turn-ui-inbox",
+            attemptId,
+            Collections.singletonList(textPart("turn-ui-inbox", attemptId, "通知已经收到的正文")),
+            10L
+        );
+
+        assertEquals(1, store.unappliedCompletedTurns(10).size());
+        store.acknowledgeUiApplied("turn-ui-inbox", 11L);
+        assertEquals(0, store.unappliedCompletedTurns(10).size());
+    }
+
     private void prepareChatDone(String turnId, String attemptId) {
         store.markStage(turnId, attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, 3L);
         store.saveMemoryResult(turnId, attemptId, "无相关记忆", 3L);
