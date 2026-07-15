@@ -25,9 +25,9 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-15.14';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-15.15';
 const RECENT_EVENT_LIMIT = 40;
-const IDLE_CRON_HEARTBEAT_MINUTES = 10;
+const IDLE_CRON_HEARTBEAT_MINUTES = 60;
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
 const FCM_ACK_MAX_ATTEMPTS = 8;
 
@@ -56,7 +56,7 @@ export default {
           backgroundAck: isFcm ? Math.max(0, Number(body.capabilities?.backgroundAck) || 0) : 0,
           updatedAt: Date.now()
         }));
-        await appendEvent(env, { type: 'register', deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', ok: true });
+        logWorkerEvent('register', { deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', ok: true });
         return json({ ok: true, transport: isFcm ? 'fcm' : 'webpush' });
       }
       if (request.method === 'POST' && url.pathname === '/schedule') {
@@ -80,7 +80,7 @@ export default {
           updatedAt: Date.now()
         };
         await saveJob(job, env);
-        await appendEvent(env, { type: 'schedule', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId, kind: job.kind, dueAt: job.dueAt, ok: true });
+        logWorkerEvent('schedule', { deviceId: shortId(job.deviceId), jobId: shortId(job.jobId), charId: shortId(job.charId), kind: job.kind, dueAt: job.dueAt, ok: true });
         return json({ ok: true, dueMinute: minuteKey(dueAtMs) });
       }
       if (request.method === 'POST' && url.pathname === '/job-status') {
@@ -140,7 +140,19 @@ export default {
       }
       return json({ ok: false, error: 'not found' }, 404);
     } catch (err) {
-      return json({ ok: false, error: err.message }, 400);
+      const failure = classifyWorkerError(err);
+      logWorkerEvent('request-error', {
+        path: url.pathname,
+        status: failure.status,
+        code: failure.code,
+        error: failure.error
+      }, 'error');
+      return json({
+        ok: false,
+        error: failure.error,
+        code: failure.code,
+        ...(failure.retryAt ? { retryAt: failure.retryAt } : {})
+      }, failure.status);
     }
   },
 
@@ -502,6 +514,36 @@ function shortId(value) {
   const text = String(value || '');
   if (text.length <= 14) return text;
   return text.slice(0, 6) + '...' + text.slice(-5);
+}
+
+function classifyWorkerError(err, now = Date.now()) {
+  const message = String(err?.message || err || 'unknown error').slice(0, 240);
+  if (/KV put\(\) limit exceeded for the day/i.test(message)) {
+    const current = new Date(now);
+    const retryAt = new Date(Date.UTC(
+      current.getUTCFullYear(),
+      current.getUTCMonth(),
+      current.getUTCDate() + 1
+    )).toISOString();
+    return {
+      status: 429,
+      code: 'KV_DAILY_WRITE_LIMIT',
+      error: 'Cloudflare KV daily write limit exceeded.',
+      retryAt
+    };
+  }
+  return { status: 400, code: 'REQUEST_FAILED', error: message, retryAt: '' };
+}
+
+function logWorkerEvent(type, fields = {}, level = 'log') {
+  const entry = JSON.stringify({
+    service: 'al-cloud-timer',
+    version: CLOUD_TIMER_WORKER_VERSION,
+    type,
+    ...fields
+  });
+  const logger = level === 'error' ? console.error : console.log;
+  logger(entry);
 }
 
 async function sendPush(target, env, payload = {}) {

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rpchat-v88';
+const CACHE_NAME = 'rpchat-v89';
 const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './lib/api-endpoint.js', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
@@ -1583,10 +1583,31 @@ function proactivePayloadMatchesJob(payload = {}, job = null) {
   }
   return true;
 }
+function cloudTimerDefaultQuotaRetryAt(now = Date.now()) {
+  const current = new Date(now);
+  return new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate() + 1)).toISOString();
+}
+function cloudTimerQuotaPauseActive(settings, now = Date.now()) {
+  const retryAt = Date.parse(settings?.cloudTimerQuotaRetryAt || '');
+  return Number.isFinite(retryAt) && retryAt > now;
+}
+function isCloudTimerQuotaError(err) {
+  return err?.code === 'KV_DAILY_WRITE_LIMIT' || /KV put\(\) limit exceeded for the day|KV daily write limit exceeded/i.test(String(err?.message || err || ''));
+}
+async function cloudTimerResponseError(resp) {
+  let payload = null;
+  try { payload = await resp.json(); } catch (_) {}
+  const err = new Error(String(payload?.error || `schedule failed ${resp.status}`));
+  err.code = String(payload?.code || '');
+  err.retryAt = String(payload?.retryAt || '');
+  err.httpStatus = resp.status;
+  return err;
+}
 async function scheduleNextCloudProactive(state, charId, kind = 'chat', options = {}) {
   const settings = state?.settings || {};
   const chat = state?.allChats?.[charId];
   if (!automaticTasksEnabled(settings) || !settings.timerEndpoint || !settings.pushSubscription || !settings.deviceId || !chat) return false;
+  if (cloudTimerQuotaPauseActive(settings)) return false;
   if (!(await automaticTasksStillEnabled())) return false;
   const jobKey = proactiveJobKey(kind);
   const previousJob = chat[jobKey] ? { ...chat[jobKey] } : null;
@@ -1607,7 +1628,8 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind, mode: proactiveJobMode(chat[jobKey]), rollChance: chat[jobKey].rollChance, diceIntervalMs: chat[jobKey].diceIntervalMs, diceRolls: chat[jobKey].diceRolls, dicePrecomputed: !!chat[jobKey].dicePrecomputed })
     }, API_TIMEOUT_MS);
-    if (!resp.ok) throw new Error('schedule failed ' + resp.status);
+    if (!resp.ok) throw await cloudTimerResponseError(resp);
+    delete settings.cloudTimerQuotaRetryAt;
     if (!(await automaticTasksStillEnabled())) {
       await fetchWithTimeout(timerUrl(settings, '/cancel'), {
         method: 'POST',
@@ -1626,6 +1648,13 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
       }, 8000).catch(err => console.warn('[AL Push] stale job cleanup skipped:', err));
     }
   } catch (err) {
+    if (isCloudTimerQuotaError(err)) {
+      settings.cloudTimerQuotaRetryAt = err.retryAt || cloudTimerDefaultQuotaRetryAt();
+      setStateCloudTimerStatus(state, `Cloudflare KV 今日写入额度已用完；本地${kind === 'moment' ? '朋友圈' : '私聊'}任务已保留，额度重置后自动同步。`, kind);
+      state.updatedAt = Date.now();
+      await setMeta('app_state', state);
+      return true;
+    }
     if (previousJob) chat[jobKey] = previousJob;
     else delete chat[jobKey];
     throw err;

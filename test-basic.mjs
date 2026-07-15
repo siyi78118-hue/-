@@ -117,11 +117,11 @@ assert.ok(
   'foreground restore must consume Room execution results after older web mirrors so completed replies always win'
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v88';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v89';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-14\.84';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-15\.85';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(script, /sendTemperature:\s*settings\.chatTemperatureEnabled !== false/, 'native chat config must persist the temperature switch');
@@ -601,7 +601,7 @@ const runDueJobsSource = cloudTimerWorkerCode.slice(
   cloudTimerWorkerCode.indexOf('async function getLastCron')
 );
 assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-15\.14';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-15\.15';/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
@@ -609,7 +609,7 @@ assert.match(cloudTimerWorker, /async function deferForFcmAck/);
 assert.match(cloudTimerWorker, /awaitingAck: result\.transport === 'fcm' && Number\(target\.backgroundAck\) >= 1/);
 assert.match(cloudTimerWorker, /firebase\.messaging/);
 assert.match(script, /async function enableNativeCloudTimer/);
-assert.match(cloudTimerWorker, /const IDLE_CRON_HEARTBEAT_MINUTES = 10;/);
+assert.match(cloudTimerWorker, /const IDLE_CRON_HEARTBEAT_MINUTES = 60;/);
 assert.match(cloudTimerWorker, /const JOB_BUCKET_TTL_SECONDS = 7 \* 24 \* 60 \* 60;/);
 assert.match(cloudTimerWorker, /const hasActivity = !summary\.ok \|\| summary\.jobsSeen > 0/);
 assert.match(cloudTimerWorker, /const heartbeatDue = nowMinute % IDLE_CRON_HEARTBEAT_MINUTES === 0;/);
@@ -675,7 +675,7 @@ assert.match(cloudTimerDeployScript, /WRANGLER_CMD/);
 assert.match(wranglerRunScript, /Tools\\\\bin\\\\wrangler\.cmd/);
 assert.match(wranglerRunScript, /Missing CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-15\.14'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-15\.15'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);

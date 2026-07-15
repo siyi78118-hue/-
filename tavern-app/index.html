@@ -1238,20 +1238,21 @@ const DEFAULT_SETTINGS = {
   cloudTimerLastMomentTraceAt: 0,
   cloudTimerWorkerStatus: '',
   cloudTimerWorkerStatusAt: 0,
+  cloudTimerQuotaRetryAt: '',
   lastMemoryQueryStatus: '',
   lastMemoryQueryAt: 0,
   systemPrompt: ''
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-14.84';
+const APP_BUILD_VERSION = '2026-07-15.85';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
   'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
   'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@update-channel/android-update.json'
 ];
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-15.14';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-15.15';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -1309,6 +1310,7 @@ function resetImportedDeviceBinding(importedSettings) {
   next.cloudTimerLastTriggerAckAt = 0;
   next.cloudTimerLastTestAckStatus = '';
   next.cloudTimerLastTestAckAt = 0;
+  next.cloudTimerQuotaRetryAt = '';
   return next;
 }
 function clearImportedCloudJobs(chats = {}) {
@@ -1326,7 +1328,7 @@ function clearAutomaticTaskSettings(current = {}) {
   [
     'cloudTimerLastStatus', 'cloudTimerLastChatStatus', 'cloudTimerLastMomentStatus',
     'cloudTimerLastChatTrace', 'cloudTimerLastMomentTrace',
-    'cloudTimerLastTriggerAckStatus', 'cloudTimerLastTestAckStatus'
+    'cloudTimerLastTriggerAckStatus', 'cloudTimerLastTestAckStatus', 'cloudTimerQuotaRetryAt'
   ].forEach(key => { next[key] = ''; });
   [
     'cloudTimerLastStatusAt', 'cloudTimerLastChatStatusAt', 'cloudTimerLastMomentStatusAt',
@@ -7486,8 +7488,43 @@ function rollProactiveDice(kind = 'chat', job = null) {
 function proactiveJobId(charId, kind = 'chat') {
   return `${proactiveJobPrefix(kind)}_${settings.deviceId}_${charId}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
+function cloudTimerDefaultQuotaRetryAt(now = Date.now()) {
+  const current = new Date(now);
+  return new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate() + 1)).toISOString();
+}
+function isCloudTimerQuotaError(err) {
+  return err?.code === 'KV_DAILY_WRITE_LIMIT' || /KV put\(\) limit exceeded for the day|KV daily write limit exceeded/i.test(String(err?.message || err || ''));
+}
+function cloudTimerQuotaPauseActive(now = Date.now()) {
+  const retryAt = Date.parse(settings.cloudTimerQuotaRetryAt || '');
+  return Number.isFinite(retryAt) && retryAt > now;
+}
+function cloudTimerQuotaRetryLabel(retryAt = settings.cloudTimerQuotaRetryAt) {
+  const parsed = Date.parse(retryAt || '');
+  return Number.isFinite(parsed) ? formatFullTime(new Date(parsed)) : '北京时间次日 08:00';
+}
+function clearCloudTimerQuotaPause() {
+  if (!settings.cloudTimerQuotaRetryAt) return;
+  settings.cloudTimerQuotaRetryAt = '';
+  DB.set('settings', settings);
+}
+async function cloudTimerResponseError(resp, label = '云闹钟请求失败') {
+  let payload = null;
+  try { payload = await resp.json(); } catch (_) {}
+  const code = String(payload?.code || '');
+  const retryAt = String(payload?.retryAt || '');
+  const raw = String(payload?.error || '').trim();
+  const message = code === 'KV_DAILY_WRITE_LIMIT'
+    ? `Cloudflare KV 今日写入额度已用完，将于 ${cloudTimerQuotaRetryLabel(retryAt || cloudTimerDefaultQuotaRetryAt())} 自动重试`
+    : (raw || `HTTP ${resp.status}`);
+  const err = new Error(`${label}：${message}`);
+  err.code = code;
+  err.retryAt = retryAt;
+  err.httpStatus = resp.status;
+  return err;
+}
 function cloudTimerTransportReady() {
-  return !!(settings.cloudTimerEnabled && settings.timerEndpoint && settings.pushSubscription);
+  return !!(settings.cloudTimerEnabled && settings.timerEndpoint && settings.pushSubscription && !cloudTimerQuotaPauseActive());
 }
 function hasFutureCloudJob(chat, kind = 'chat') {
   const dueAt = Date.parse(chat?.[proactiveJobKey(kind)]?.dueAt || '');
@@ -7517,6 +7554,7 @@ async function ensureCloudProactiveScheduled(options = {}) {
 async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
   const { force = false, resync = false } = options;
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
+  if (cloudTimerQuotaPauseActive()) return false;
   const rows = getLatestChatRows();
   if (!rows.length) return false;
   let changed = false;
@@ -7589,6 +7627,19 @@ async function scheduleCloudProactive(charId, kind = 'chat', options = {}) {
     await mirrorAppStateNow();
     setCloudTimerStatus(`${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已安排（${proactiveModeLabel(chat[jobKey])}）：${formatFullTime(new Date(chat[jobKey].dueAt))}`, true, kind);
   } catch (err) {
+    if (isCloudTimerQuotaError(err)) {
+      const retryAt = err.retryAt || cloudTimerDefaultQuotaRetryAt();
+      settings.cloudTimerQuotaRetryAt = retryAt;
+      chat[syncKey] = 0;
+      DB.set('settings', settings);
+      DB.set('chats', allChats);
+      await mirrorAppStateNow();
+      const subject = kind === 'moment' ? '朋友圈' : '私聊';
+      const detail = `Cloudflare KV 今日写入额度已用完；本地${subject}任务已保留，将于 ${cloudTimerQuotaRetryLabel(retryAt)} 自动同步云端`;
+      setCloudTimerStatus(detail, true, kind);
+      setCloudTimerTrace(kind, cloudTraceId(kind), detail);
+      return true;
+    }
     if (previousJob) chat[jobKey] = previousJob;
     else delete chat[jobKey];
     chat[syncKey] = previousSync;
@@ -7621,7 +7672,8 @@ async function postCloudSchedule(charId, job, kind = 'chat') {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId, charId, dueAt: job.dueAt, type: 'proactive', kind, mode: proactiveJobMode(job), rollChance: job.rollChance, diceIntervalMs: job.diceIntervalMs, diceRolls: job.diceRolls, dicePrecomputed: !!job.dicePrecomputed })
   }, API_TIMEOUT_MS);
-  if (!resp.ok) throw new Error('云闹钟安排失败：' + resp.status);
+  if (!resp.ok) throw await cloudTimerResponseError(resp, '云闹钟安排失败');
+  clearCloudTimerQuotaPause();
   verifyCloudJobStatus(charId, job, kind).catch(err => {
     setCloudTimerTrace(kind, cloudTraceId(kind), `云端任务核验失败：${friendlyErrorMessage(err)}`);
   });
