@@ -868,6 +868,9 @@ button.cell:active{background:#ececec}
           <button class="cell" onclick="manualProactiveMessage()" type="button"><div class="cell-label">私聊</div><div class="cell-body">测试主动私聊</div><div class="mini">›</div></button>
           <button class="cell" onclick="manualProactiveMoment()" type="button"><div class="cell-label">朋友圈</div><div class="cell-body">测试主动朋友圈</div><div class="mini">›</div></button>
         </div>
+        <div class="cell-group">
+          <button class="cell" id="clear-all-automatic-tasks" onclick="clearAllAutomaticTasks()" type="button"><div class="cell-label danger">紧急清空全部自动任务</div><div class="cell-body">保留聊天、角色、配置和云闹钟绑定</div><div class="mini">›</div></button>
+        </div>
         <div class="diagnostic-list" id="diagnostic-list">
           <div class="empty">还没有模型调用记录</div>
         </div>
@@ -1317,6 +1320,40 @@ function clearImportedCloudJobs(chats = {}) {
     delete chat.cloudMomentScheduleSyncedAt;
   });
   return chats;
+}
+function clearAutomaticTaskSettings(current = {}) {
+  const next = { ...current, proactiveEnabled: false, cloudTimerEnabled: false };
+  [
+    'cloudTimerLastStatus', 'cloudTimerLastChatStatus', 'cloudTimerLastMomentStatus',
+    'cloudTimerLastChatTrace', 'cloudTimerLastMomentTrace',
+    'cloudTimerLastTriggerAckStatus', 'cloudTimerLastTestAckStatus'
+  ].forEach(key => { next[key] = ''; });
+  [
+    'cloudTimerLastStatusAt', 'cloudTimerLastChatStatusAt', 'cloudTimerLastMomentStatusAt',
+    'cloudTimerLastChatTraceAt', 'cloudTimerLastMomentTraceAt',
+    'cloudTimerLastTriggerAckAt', 'cloudTimerLastTestAckAt'
+  ].forEach(key => { next[key] = 0; });
+  return next;
+}
+function automaticTasksEnabled(currentSettings = {}) {
+  return currentSettings.proactiveEnabled === true && currentSettings.cloudTimerEnabled === true;
+}
+function clearAutomaticTaskChatState(chats = {}) {
+  const next = JSON.parse(JSON.stringify(chats || {}));
+  let clearedChatJobs = 0;
+  let clearedMomentJobs = 0;
+  Object.values(next).forEach(chat => {
+    if (!chat || typeof chat !== 'object') return;
+    if (chat.pendingProactiveJob) clearedChatJobs += 1;
+    if (chat.pendingMomentJob) clearedMomentJobs += 1;
+    [
+      'pendingProactiveJob', 'pendingMomentJob',
+      'cloudScheduleSyncedAt', 'cloudMomentScheduleSyncedAt',
+      'lastProactiveFailedAt', 'lastProactiveChatFailedAt', 'lastProactiveMomentFailedAt',
+      'lastProactiveChatError', 'lastProactiveMomentError'
+    ].forEach(key => delete chat[key]);
+  });
+  return { chats: next, clearedChatJobs, clearedMomentJobs };
 }
 let settings = migrateSettings(DB.get('settings', DEFAULT_SETTINGS));
 let characters = DB.get('characters', []);
@@ -1935,6 +1972,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     proactiveKind: kind,
     proactiveMode: triggerMode,
     cloudJobId: job?.jobId || '',
+    automaticTasksEnabled: automaticTasksEnabled(settings),
     timerEndpoint: settings.timerEndpoint || '',
     deviceId: settings.deviceId || '',
     createdAt: now.toISOString()
@@ -3084,6 +3122,12 @@ function redactSensitiveText(text) {
 function compactLogText(text, max = 1200) {
   const value = redactSensitiveText(text).replace(/\s+/g, ' ').trim();
   return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+function isAutomaticTaskCallLog(log = {}) {
+  const scene = String(log.scene || '').toLowerCase();
+  return scene.includes('proactive')
+    || scene.includes('moment-post')
+    || scene.includes('background-memory-query-proactive');
 }
 function recordModelCall(entry = {}) {
   try {
@@ -7703,6 +7747,97 @@ async function cancelCloudProactiveQuick(charId, reason = '操作') {
     await withTimeout(cancelCloudProactive(charId, 'all'), 8000, `${reason}取消云闹钟超时`);
   } catch (err) {
     console.warn('[AL Timer] quick cancel skipped:', reason, err.message);
+  }
+}
+function automaticTaskCleanupLayerText(label, row) {
+  if (row?.ok) return `${label}：完成`;
+  if (row?.skipped) return `${label}：不适用`;
+  return `${label}：失败｜${row?.error || '未知错误'}`;
+}
+function showAutomaticTaskCleanupReport(report = {}) {
+  const allOk = report.web?.ok && (report.native?.ok || report.native?.skipped) && report.cloud?.ok;
+  const message = allOk
+    ? '已清空全部自动任务并暂停调度。云闹钟绑定已保留；重新开启“主动消息”和“云闹钟”即可恢复。'
+    : [
+        '自动任务已停止，部分清理步骤需要重试。',
+        automaticTaskCleanupLayerText('本地网页', report.web),
+        automaticTaskCleanupLayerText('Android 原生', report.native),
+        automaticTaskCleanupLayerText('云端', report.cloud)
+      ].join('\n');
+  setCloudTimerStatus(message, true);
+  toast(message, allOk ? 3600 : 5200);
+}
+async function clearAllAutomaticTasks() {
+  if (!confirm('将关闭主动消息和云闹钟，并清空本机与云端的全部主动私聊、朋友圈任务。聊天、角色、记忆、API 配置和设备绑定不会删除。继续？')) return null;
+  const button = document.getElementById('clear-all-automatic-tasks');
+  if (button?.disabled) return null;
+  if (button) button.disabled = true;
+  const report = {
+    web: { ok: false },
+    native: { ok: !isNativeApp(), skipped: !isNativeApp() },
+    cloud: { ok: false }
+  };
+  try {
+    settings = clearAutomaticTaskSettings(settings);
+    const local = clearAutomaticTaskChatState(allChats);
+    allChats = local.chats;
+    DB.set('settings', settings);
+    DB.set('chats', allChats);
+    const proactiveSelect = document.getElementById('set-proactive-enabled');
+    const cloudTimerSelect = document.getElementById('set-cloud-timer-enabled');
+    if (proactiveSelect) proactiveSelect.value = 'off';
+    if (cloudTimerSelect) cloudTimerSelect.value = 'off';
+    startProactiveLoop();
+
+    const localLogs = getModelCallLogs().filter(log => !isAutomaticTaskCallLog(log));
+    localStorage.setItem('rpchat_call_logs', JSON.stringify(localLogs));
+    try {
+      const serviceWorkerLogs = await MemoryDB.getMeta('call_logs', []);
+      await MemoryDB.setMeta('call_logs', (Array.isArray(serviceWorkerLogs) ? serviceWorkerLogs : []).filter(log => !isAutomaticTaskCallLog(log)));
+    } catch (err) {
+      console.warn('[AL Cleanup] call-log cleanup skipped:', err.message);
+    }
+    await mirrorAppStateNow();
+    report.web = {
+      ok: true,
+      clearedChatJobs: local.clearedChatJobs,
+      clearedMomentJobs: local.clearedMomentJobs
+    };
+
+    const plugin = nativeExecutionPlugin();
+    if (plugin?.clearAutomaticTasks) {
+      try {
+        report.native = { ok: true, ...(await plugin.clearAutomaticTasks()) };
+      } catch (err) {
+        report.native = { ok: false, error: friendlyErrorMessage(err) };
+      }
+    } else if (isNativeApp()) {
+      report.native = { ok: false, error: '当前安装包不支持批量清理，请安装包含此功能的新版本' };
+    }
+
+    if (!settings.deviceId || !settings.timerEndpoint) {
+      report.cloud = { ok: true, skipped: true };
+    } else {
+      try {
+        const response = await fetchWithTimeout(timerUrl('/cancel-device-tasks'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceId: settings.deviceId })
+        }, API_TIMEOUT_MS);
+        const result = await response.json();
+        if (!response.ok || !result.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        report.cloud = result;
+      } catch (err) {
+        report.cloud = { ok: false, error: friendlyErrorMessage(err) };
+      }
+    }
+
+    renderCloudTimerStatus();
+    renderDiagnosticsScreen().catch(err => console.warn('[AL Cleanup] diagnostics refresh skipped:', err.message));
+    showAutomaticTaskCleanupReport(report);
+    return report;
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 async function schedulePlannedChatFromReply(charId, directive = null) {

@@ -9,6 +9,7 @@ import androidx.room.Room;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import com.siyi.al.execution.db.AlExecutionDatabase;
+import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import java.util.Collections;
@@ -127,6 +128,53 @@ public class RoomExecutionStoreTest {
         assertEquals(0, store.unappliedCompletedTurns(10).size());
     }
 
+    @Test
+    public void clearAutomaticTasksCancelsOnlyProactiveWork() {
+        store.submitTurn(submission("direct", "direct-msg", TurnKind.DIRECT_REPLY));
+        store.submitTurn(submission("chat-auto", "chat-auto-msg", TurnKind.PROACTIVE_CHAT));
+        store.submitTurn(submission("moment-auto", "moment-auto-msg", TurnKind.PROACTIVE_MOMENT));
+
+        AutomaticTaskCleanupResult result = store.clearAutomaticTasks(20L);
+
+        assertEquals(2, result.cancelledTurns);
+        assertEquals(2, result.cancelledAttempts);
+        assertEquals(TurnState.QUEUED, store.displayState("direct"));
+        assertEquals(TurnState.CANCELLED, store.displayState("chat-auto"));
+        assertEquals(TurnState.CANCELLED, store.displayState("moment-auto"));
+    }
+
+    @Test
+    public void clearAutomaticTasksSuppressesCompletedInboxAndDeletesSnapshots() {
+        store.submitTurn(submission("completed-auto", "completed-auto-msg", TurnKind.PROACTIVE_MOMENT));
+        String attemptId = store.activeAttempt("completed-auto").attemptId;
+        prepareChatDone("completed-auto", attemptId);
+        store.commitReply(
+            "completed-auto",
+            attemptId,
+            Collections.singletonList(textPart("completed-auto", attemptId, "旧朋友圈")),
+            12L
+        );
+        CharacterSnapshotEntity snapshot = new CharacterSnapshotEntity();
+        snapshot.snapshotId = "char-1:moment";
+        snapshot.characterId = "char-1";
+        snapshot.characterName = "角色";
+        snapshot.playerName = "我";
+        snapshot.systemPrompt = "";
+        snapshot.momentSystemPrompt = "";
+        snapshot.contextJson = "{\"cloudJobId\":\"old\"}";
+        snapshot.chatConfigId = "chat-v1";
+        snapshot.memoryConfigId = "memory-v1";
+        snapshot.createdAt = 1L;
+        database.executionDao().upsertSnapshot(snapshot);
+
+        AutomaticTaskCleanupResult result = store.clearAutomaticTasks(20L);
+
+        assertEquals(1, result.acknowledgedCompletedTurns);
+        assertEquals(1, result.deletedSnapshots);
+        assertEquals(0, store.unappliedCompletedTurns(10).size());
+        assertEquals(null, database.executionDao().latestSnapshot("char-1:moment"));
+    }
+
     private void prepareChatDone(String turnId, String attemptId) {
         store.markStage(turnId, attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, 3L);
         store.saveMemoryResult(turnId, attemptId, "无相关记忆", 3L);
@@ -135,11 +183,15 @@ public class RoomExecutionStoreTest {
     }
 
     private static TurnSubmission submission(String turnId, String messageId) {
+        return submission(turnId, messageId, TurnKind.DIRECT_REPLY);
+    }
+
+    private static TurnSubmission submission(String turnId, String messageId, TurnKind kind) {
         return new TurnSubmission(
             turnId,
             "char-1",
             messageId,
-            TurnKind.DIRECT_REPLY,
+            kind,
             "{\"text\":\"你好\"}",
             "{\"messages\":[]}",
             null,

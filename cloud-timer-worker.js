@@ -25,7 +25,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-13.13';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-15.14';
 const RECENT_EVENT_LIMIT = 40;
 const IDLE_CRON_HEARTBEAT_MINUTES = 10;
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -87,6 +87,21 @@ export default {
         const body = await request.json();
         if (!body.jobId) throw new Error('missing jobId');
         return json(await jobStatus(body.jobId, body.deviceId || '', env));
+      }
+      if (request.method === 'POST' && url.pathname === '/cancel-device-tasks') {
+        const body = await request.json();
+        const deviceId = String(body.deviceId || '');
+        const result = await cancelDeviceAutomaticTasks(deviceId, env);
+        await appendEvent(env, {
+          type: 'cancel-device-tasks',
+          deviceId: shortId(deviceId),
+          momentJobsDeleted: result.momentJobsDeleted,
+          chatJobsDeleted: result.chatJobsDeleted,
+          dueReferencesDeleted: result.dueReferencesDeleted,
+          dueBucketsDeleted: result.dueBucketsDeleted,
+          ok: true
+        });
+        return json(result);
       }
       if (request.method === 'POST' && url.pathname === '/cancel') {
         const body = await request.json();
@@ -222,6 +237,75 @@ async function cancelJob(jobId, env) {
     }
   }
   await env.AL_TIMER_KV.delete(`job:${jobId}`);
+}
+
+async function listKvKeys(env, prefix) {
+  const names = [];
+  let cursor;
+  do {
+    const page = await env.AL_TIMER_KV.list({ prefix, ...(cursor ? { cursor } : {}) });
+    names.push(...(page.keys || []).map(row => row.name));
+    cursor = page.list_complete ? '' : page.cursor;
+  } while (cursor);
+  return names;
+}
+
+function validDeviceId(value) {
+  return /^[A-Za-z0-9_-]{6,128}$/.test(String(value || ''));
+}
+
+function isDeviceAutomaticJobId(jobId, deviceId) {
+  const value = String(jobId || '');
+  return value.startsWith(`mom_${deviceId}_`) || value.startsWith(`pro_${deviceId}_`);
+}
+
+async function cancelDeviceAutomaticTasks(deviceId, env) {
+  if (!validDeviceId(deviceId)) throw new Error('invalid deviceId');
+  const prefixes = [
+    { prefix: `job:mom_${deviceId}_`, kind: 'moment' },
+    { prefix: `job:pro_${deviceId}_`, kind: 'chat' }
+  ];
+  let momentJobsDeleted = 0;
+  let chatJobsDeleted = 0;
+
+  for (const row of prefixes) {
+    const keys = await listKvKeys(env, row.prefix);
+    for (const key of keys) {
+      const raw = await env.AL_TIMER_KV.get(key);
+      const job = raw ? JSON.parse(raw) : null;
+      if (!job || job.deviceId !== deviceId || job.test) continue;
+      await env.AL_TIMER_KV.delete(key);
+      if (row.kind === 'moment') momentJobsDeleted += 1;
+      else chatJobsDeleted += 1;
+    }
+  }
+
+  let dueReferencesDeleted = 0;
+  let dueBucketsDeleted = 0;
+  const dueKeys = await listKvKeys(env, 'due:');
+  for (const key of dueKeys) {
+    const raw = await env.AL_TIMER_KV.get(key);
+    const ids = raw ? JSON.parse(raw) : [];
+    const remaining = ids.filter(id => !isDeviceAutomaticJobId(id, deviceId));
+    dueReferencesDeleted += ids.length - remaining.length;
+    if (remaining.length === ids.length) continue;
+    if (remaining.length) {
+      await env.AL_TIMER_KV.put(key, JSON.stringify(remaining), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
+    } else {
+      await env.AL_TIMER_KV.delete(key);
+      dueBucketsDeleted += 1;
+    }
+  }
+
+  return {
+    ok: true,
+    deviceId,
+    momentJobsDeleted,
+    chatJobsDeleted,
+    dueReferencesDeleted,
+    dueBucketsDeleted,
+    subscriptionPreserved: !!(await env.AL_TIMER_KV.get(`sub:${deviceId}`))
+  };
 }
 
 async function jobStatus(jobId, deviceId, env) {

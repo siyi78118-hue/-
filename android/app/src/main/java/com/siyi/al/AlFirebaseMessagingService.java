@@ -28,7 +28,7 @@ public class AlFirebaseMessagingService extends MessagingService {
         AlExecutionDatabase database = AlExecutionDatabase.get(this);
         CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(characterId + ":" + kindName);
         if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) return;
-        if (!matchesSnapshotJob(snapshot, jobId)) return;
+        if (!snapshotAllowsAutomaticTask(snapshot, jobId)) return;
 
         String safeJobId = jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
         TurnKind kind = "moment".equals(kindName) ? TurnKind.PROACTIVE_MOMENT : TurnKind.PROACTIVE_CHAT;
@@ -52,6 +52,15 @@ public class AlFirebaseMessagingService extends MessagingService {
         try {
             String current = text(new JSONObject(snapshot.contextJson).optString("cloudJobId", ""));
             return !current.isEmpty() && current.equals(incoming);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    static boolean snapshotAllowsAutomaticTask(CharacterSnapshotEntity snapshot, String jobId) {
+        if (!matchesSnapshotJob(snapshot, jobId)) return false;
+        try {
+            return new JSONObject(snapshot.contextJson).optBoolean("automaticTasksEnabled", true);
         } catch (Exception ignored) {
             return false;
         }

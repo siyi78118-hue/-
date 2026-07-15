@@ -456,6 +456,11 @@ assert.doesNotMatch(html, /id="screen-tags"/);
 assert.doesNotMatch(script, /function renderTagsScreen/);
 assert.match(html, /测试主动私聊/);
 assert.match(html, /测试主动朋友圈/);
+assert.match(html, /id="clear-all-automatic-tasks"/);
+assert.match(html, /紧急清空全部自动任务/);
+assert.match(html, /保留聊天、角色、配置和云闹钟绑定/);
+assert.match(script, /async function clearAllAutomaticTasks\(\)/);
+assert.match(script, /\/cancel-device-tasks/);
 const settingsHtml = html.slice(html.indexOf('id="screen-settings"'), html.indexOf('<div id="screen-memory"'));
 assert.match(settingsHtml, /openMemory\('settings'\)/);
 assert.match(settingsHtml, /showScreen\('diagnostics'\)/);
@@ -586,8 +591,13 @@ assert.match(script, /导入会覆盖当前本机设置、角色、聊天、朋�
 assert.match(script, /备份已导入，云闹钟需重新绑定/);
 assert.match(script, /已从备份恢复；云闹钟需要在本机重新绑定。/);
 const cloudTimerWorkerCode = cloudTimerWorker.replace(/\/\/.*$/gm, '');
-assert.doesNotMatch(cloudTimerWorkerCode, /\.list\s*\(/);
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-13\.13';/);
+const runDueJobsSource = cloudTimerWorkerCode.slice(
+  cloudTimerWorkerCode.indexOf('async function runDueJobs'),
+  cloudTimerWorkerCode.indexOf('async function getLastCron')
+);
+assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-15\.14';/);
+assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
 assert.match(cloudTimerWorker, /async function deferForFcmAck/);
@@ -600,13 +610,12 @@ assert.match(cloudTimerWorker, /const hasActivity = !summary\.ok \|\| summary\.j
 assert.match(cloudTimerWorker, /const heartbeatDue = nowMinute % IDLE_CRON_HEARTBEAT_MINUTES === 0;/);
 assert.match(cloudTimerWorker, /if \(hasActivity \|\| heartbeatDue\)/);
 assert.match(cloudTimerWorker, /if \(hasActivity\) \{\s*await appendEvent/);
-assert.equal((cloudTimerWorker.match(/expirationTtl: JOB_BUCKET_TTL_SECONDS/g) || []).length, 3);
+assert.equal((cloudTimerWorker.match(/expirationTtl: JOB_BUCKET_TTL_SECONDS/g) || []).length, 4);
 assert.match(cloudTimerWorker, /version: CLOUD_TIMER_WORKER_VERSION/);
 assert.match(cloudTimerWorker, /mode: body\.mode === 'dice' \? 'dice' : 'planned'/);
 assert.match(cloudTimerWorker, /rollChance: job\.rollChance/);
 assert.match(cloudTimerWorker, /diceRolls: job\.diceRolls/);
 assert.match(cloudTimerWorker, /dicePrecomputed: !!job\.dicePrecomputed/);
-assert.doesNotMatch(cloudTimerWorker, /AL_TIMER_KV\.list/);
 const cloudWorkerModule = await import(`data:text/javascript;base64,${Buffer.from(cloudTimerWorker).toString('base64')}`);
 const idleCronWrites = [];
 const idleCronWaits = [];
@@ -661,7 +670,7 @@ assert.match(cloudTimerDeployScript, /WRANGLER_CMD/);
 assert.match(wranglerRunScript, /Tools\\\\bin\\\\wrangler\.cmd/);
 assert.match(wranglerRunScript, /Missing CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-12\.12'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-15\.14'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);
@@ -805,6 +814,9 @@ globalThis.__appTest = {
   normalizePresetKey,
   resetImportedDeviceBinding,
   clearImportedCloudJobs,
+  clearAutomaticTaskSettings,
+  clearAutomaticTaskChatState,
+  isAutomaticTaskCallLog,
   normalizeMemoryProcessedCursor,
   memoryRelevantMessages,
   mergeLocalPendingReplies,
@@ -900,6 +912,58 @@ globalThis.__appTest = {
 };`, context);
 
 const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
+
+const automaticCleanupProbe = vm.runInContext(`(() => {
+  const currentSettings = {
+    proactiveEnabled: true,
+    cloudTimerEnabled: true,
+    deviceId: 'device-a',
+    pushSubscription: { transport: 'fcm', token: 'keep-token' },
+    nativeFcmToken: 'keep-token',
+    pushTransport: 'fcm',
+    chatApiKey: 'keep-chat-key',
+    cloudTimerLastMomentStatus: '旧朋友圈错误',
+    cloudTimerLastMomentStatusAt: 123
+  };
+  const currentChats = {
+    char1: {
+      messages: [{ role: 'user', content: '保留消息' }],
+      pendingProactiveJob: { jobId: 'pro-a' },
+      pendingMomentJob: { jobId: 'mom-a' },
+      cloudScheduleSyncedAt: 1,
+      cloudMomentScheduleSyncedAt: 2,
+      lastProactiveMomentFailedAt: 3,
+      lastProactiveMomentError: '旧错误'
+    }
+  };
+  return JSON.stringify({
+    settings: clearAutomaticTaskSettings(currentSettings),
+    result: clearAutomaticTaskChatState(currentChats),
+    logFlags: [
+      isAutomaticTaskCallLog({ scene: 'proactive-moment' }),
+      isAutomaticTaskCallLog({ scene: 'background-memory-query-moment-post' }),
+      isAutomaticTaskCallLog({ scene: 'chat' })
+    ]
+  });
+})()`, context);
+const automaticCleanup = JSON.parse(automaticCleanupProbe);
+assert.equal(automaticCleanup.settings.proactiveEnabled, false);
+assert.equal(automaticCleanup.settings.cloudTimerEnabled, false);
+assert.equal(automaticCleanup.settings.pushSubscription.token, 'keep-token');
+assert.equal(automaticCleanup.settings.nativeFcmToken, 'keep-token');
+assert.equal(automaticCleanup.settings.pushTransport, 'fcm');
+assert.equal(automaticCleanup.settings.chatApiKey, 'keep-chat-key');
+assert.equal(automaticCleanup.settings.cloudTimerLastMomentStatus, '');
+assert.equal(automaticCleanup.settings.cloudTimerLastMomentStatusAt, 0);
+assert.equal(automaticCleanup.result.chats.char1.messages[0].content, '保留消息');
+assert.equal('pendingProactiveJob' in automaticCleanup.result.chats.char1, false);
+assert.equal('pendingMomentJob' in automaticCleanup.result.chats.char1, false);
+assert.equal('cloudScheduleSyncedAt' in automaticCleanup.result.chats.char1, false);
+assert.equal('cloudMomentScheduleSyncedAt' in automaticCleanup.result.chats.char1, false);
+assert.equal('lastProactiveMomentError' in automaticCleanup.result.chats.char1, false);
+assert.equal(automaticCleanup.result.clearedChatJobs, 1);
+assert.equal(automaticCleanup.result.clearedMomentJobs, 1);
+assert.deepEqual(automaticCleanup.logFlags, [true, true, false]);
 
 assert.equal(vm.runInContext('typeof captureChatScrollState', context), 'function', 'chat rendering must expose scroll-state capture');
 assert.equal(vm.runInContext('typeof restoreChatScrollState', context), 'function', 'chat rendering must expose scroll-state restoration');

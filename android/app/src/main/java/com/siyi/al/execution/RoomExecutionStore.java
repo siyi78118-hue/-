@@ -141,6 +141,17 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         });
     }
 
+    public AutomaticTaskCleanupResult clearAutomaticTasks(long now) {
+        int[] counts = new int[4];
+        database.runInTransaction(() -> {
+            counts[1] = dao.cancelAutomaticAttempts(now);
+            counts[0] = dao.cancelAutomaticTurns(now);
+            counts[2] = dao.acknowledgeCompletedAutomaticTurns(now);
+            counts[3] = dao.deleteProactiveSnapshots();
+        });
+        return new AutomaticTaskCleanupResult(counts[0], counts[1], counts[2], counts[3]);
+    }
+
     @Override
     public ChatTurnEntity turn(String turnId) {
         return dao.turn(turnId);

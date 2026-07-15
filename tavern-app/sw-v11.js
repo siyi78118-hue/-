@@ -111,6 +111,15 @@ async function setMeta(key, value) {
   return put('meta', { key, value, updatedAt: Date.now() });
 }
 
+function automaticTasksEnabled(currentSettings = {}) {
+  return currentSettings.proactiveEnabled === true && currentSettings.cloudTimerEnabled === true;
+}
+
+async function automaticTasksStillEnabled() {
+  const current = await getMeta('app_state', null).catch(() => null);
+  return automaticTasksEnabled(current?.settings || {});
+}
+
 function redactSensitiveText(text) {
   return String(text || '')
     .replace(/sk-[A-Za-z0-9_\-]{8,}/g, 'sk-***')
@@ -1577,7 +1586,8 @@ function proactivePayloadMatchesJob(payload = {}, job = null) {
 async function scheduleNextCloudProactive(state, charId, kind = 'chat', options = {}) {
   const settings = state?.settings || {};
   const chat = state?.allChats?.[charId];
-  if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription || !settings.deviceId || !chat) return false;
+  if (!automaticTasksEnabled(settings) || !settings.timerEndpoint || !settings.pushSubscription || !settings.deviceId || !chat) return false;
+  if (!(await automaticTasksStillEnabled())) return false;
   const jobKey = proactiveJobKey(kind);
   const previousJob = chat[jobKey] ? { ...chat[jobKey] } : null;
   const mode = options.mode === 'dice' ? 'dice' : 'planned';
@@ -1598,6 +1608,16 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
       body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind, mode: proactiveJobMode(chat[jobKey]), rollChance: chat[jobKey].rollChance, diceIntervalMs: chat[jobKey].diceIntervalMs, diceRolls: chat[jobKey].diceRolls, dicePrecomputed: !!chat[jobKey].dicePrecomputed })
     }, API_TIMEOUT_MS);
     if (!resp.ok) throw new Error('schedule failed ' + resp.status);
+    if (!(await automaticTasksStillEnabled())) {
+      await fetchWithTimeout(timerUrl(settings, '/cancel'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceId: settings.deviceId, jobId })
+      }, 8000).catch(err => console.warn('[AL Push] disabled job cleanup skipped:', err));
+      if (previousJob) chat[jobKey] = previousJob;
+      else delete chat[jobKey];
+      return false;
+    }
     if (previousJob?.jobId && previousJob.jobId !== chat[jobKey].jobId) {
       await fetchWithTimeout(timerUrl(settings, '/cancel'), {
         method: 'POST',
@@ -1625,6 +1645,7 @@ function shortErrorMessage(err) {
 async function recoverProactivePushFailure(payload = {}, reason = null) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) return false;
+  if (!automaticTasksEnabled(state.settings)) return false;
   const allChats = state.allChats;
   const dueJob = payload.charId
     ? { charId: payload.charId, kind: payload.kind === 'moment' ? 'moment' : 'chat' }
@@ -1634,7 +1655,9 @@ async function recoverProactivePushFailure(payload = {}, reason = null) {
   const chat = allChats[charId];
   if (!charId || !chat) return false;
   try {
+    if (!(await automaticTasksStillEnabled())) return false;
     await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+    if (!(await automaticTasksStillEnabled())) return false;
     setStateCloudTimerStatus(state, `后台${kind === 'moment' ? '朋友圈' : '私聊'}生成失败：${shortErrorMessage(reason)}，已安排下次重试。`, kind);
     state.allChats = allChats;
     state.updatedAt = Date.now();
@@ -1650,6 +1673,7 @@ async function recoverProactivePushFailure(payload = {}, reason = null) {
 async function handleProactivePush(payload) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
+  if (!automaticTasksEnabled(state.settings)) return false;
   const { settings, characters, allChats } = state;
   const traceId = `${payload.kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;
   scrubEmptyReplyMessages(allChats);
@@ -1672,6 +1696,7 @@ async function handleProactivePush(payload) {
     setStateCloudTimerTrace(state, 'chat', traceId, '收到云端 push，但本地没有可触发会话或任务');
     setStateCloudTimerStatus(state, '后台收到云闹钟，但本地没有可触发会话；请打开 AL 后重新绑定或重新安排。', 'chat');
     state.updatedAt = Date.now();
+    if (!(await automaticTasksStillEnabled())) return false;
     await setMeta('app_state', state);
     await notifyClients({ type: 'al-state-updated', skipped: true });
     return;
@@ -1680,6 +1705,7 @@ async function handleProactivePush(payload) {
     setStateCloudTimerTrace(state, kind, traceId, '忽略已被新任务替换的旧推送，避免沿用过期话题。');
     state.allChats = allChats;
     state.updatedAt = Date.now();
+    if (!(await automaticTasksStillEnabled())) return false;
     await setMeta('app_state', state);
     await notifyClients({ type: 'al-state-updated', charId, stalePushSkipped: true });
     return;
@@ -1690,6 +1716,7 @@ async function handleProactivePush(payload) {
     await scheduleNextCloudProactive(state, charId, kind, expectedMode === 'dice'
       ? { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE }
       : { mode: 'planned' });
+    if (!(await automaticTasksStillEnabled())) return false;
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
@@ -1700,6 +1727,7 @@ async function handleProactivePush(payload) {
     setStateCloudTimerTrace(state, kind, traceId, `后台收到 push，mode=${triggerMode}，页面可见，转交前台处理；目标：${charId}${dueJob.job?.dueAt ? `，本地 due=${formatFullTime(new Date(dueJob.job.dueAt))}` : '，无本地 due'}`);
     setStateCloudTimerTriggerAck(state, `${payload.test ? '测试' : '真实'}${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已被后台收到并转交前台。`);
     state.updatedAt = Date.now();
+    if (!(await automaticTasksStillEnabled())) return false;
     await setMeta('app_state', state);
     if (!payload.charId && exactDueJobs.length > 1) {
       await notifyClients({ type: 'al-run-proactive-due', jobCount: dueJobs.length, test: dueJobs.some(row => row.job?.test) });
@@ -1719,6 +1747,7 @@ async function handleProactivePush(payload) {
   if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(dueJob.job || payload)) {
     setStateCloudTimerTrace(state, kind, traceId, `后台骰子未抽中，本轮不生成${kind === 'moment' ? '朋友圈' : '私聊'}，10 分钟后再抽。`);
     await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+    if (!(await automaticTasksStillEnabled())) return false;
     state.allChats = allChats;
     state.updatedAt = Date.now();
     await setMeta('app_state', state);
@@ -1740,6 +1769,7 @@ async function handleProactivePush(payload) {
   setStateCloudTimerTrace(state, kind, traceId, `后台收到触发，mode=${triggerMode}，目标：${charId}${fallbackJob ? '，本地未命中到期任务，已用最近任务兜底' : ''}`);
   setStateCloudTimerTriggerAck(state, `真实${kind === 'moment' ? '朋友圈' : '私聊'}闹钟已被后台收到。`);
   state.updatedAt = Date.now();
+  if (!(await automaticTasksStillEnabled())) return false;
   await setMeta('app_state', state);
   if (kind === 'moment') return handleProactiveMomentPush(state, charId, payload);
   const char = (characters || []).find(c => c.id === charId);
@@ -1749,12 +1779,14 @@ async function handleProactivePush(payload) {
   if (await refreshBackgroundPaymentExpirations(state, charId)) {
     state.allChats = allChats;
     state.updatedAt = Date.now();
+    if (!(await automaticTasksStillEnabled())) return false;
     await setMeta('app_state', state);
   }
   const proactiveNow = new Date();
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow, triggerMode);
   const memoryQuery = buildProactiveMemoryQuery(chat, settings, proactiveNow, triggerMode);
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'proactive-chat');
+  if (!(await automaticTasksStillEnabled())) return false;
   setStateCloudTimerTrace(state, 'chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
   const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext, triggerMode);
 
@@ -1771,6 +1803,7 @@ async function handleProactivePush(payload) {
     memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
+  if (!(await automaticTasksStillEnabled())) return false;
   setStateCloudTimerTrace(state, 'chat', traceId, `模型返回 ${reply.length} 字`);
   const paymentDirective = extractPaymentStatusDirective(reply);
   const replyText = cleanAssistantChatReply(reply);
@@ -1784,6 +1817,7 @@ async function handleProactivePush(payload) {
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    if (!(await automaticTasksStillEnabled())) return false;
     setStateCloudTimerTrace(state, 'chat', traceId, `空回复：${emptyReason}`);
     setStateCloudTimerStatus(state, `后台私聊生成了空回复：${emptyReason}，已跳过并安排下次重试。`, 'chat');
     state.allChats = allChats;
@@ -1799,6 +1833,7 @@ async function handleProactivePush(payload) {
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    if (!(await automaticTasksStillEnabled())) return false;
     setStateCloudTimerTrace(state, 'chat', traceId, '输出无法拆成有效气泡');
     setStateCloudTimerStatus(state, '后台私聊输出无法拆成有效消息，已安排下次重试。', 'chat');
     state.allChats = allChats;
@@ -1810,11 +1845,13 @@ async function handleProactivePush(payload) {
   chat.unread = (chat.unread || 0) + 1;
   chat.lastProactiveType = 'chat';
   await updateBackgroundPaymentStatusFromReply(state, charId, replyText, paymentDirective?.status);
+  if (!(await automaticTasksStillEnabled())) return false;
   try {
     await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
+  if (!(await automaticTasksStillEnabled())) return false;
   setStateCloudTimerTrace(state, 'chat', traceId, `写入完成 ${chunks.length} 条`);
   setStateCloudTimerStatus(state, `后台私聊已生成 ${chunks.length} 条消息。`, 'chat');
   await recordBackgroundScenarioMemory(
@@ -1824,6 +1861,7 @@ async function handleProactivePush(payload) {
     `${charName(char)}后台主动给${playerName(settings)}发来私聊：“${chunks.join(' / ')}”`,
     { type: 'fact', keywords: ['主动消息', '私聊', ...memorySignalTerms(chunks.join(' ')).slice(0, 6)] }
   );
+  if (!(await automaticTasksStillEnabled())) return false;
   state.allChats = allChats;
   state.updatedAt = Date.now();
   await setMeta('app_state', state);
@@ -1839,6 +1877,7 @@ async function handleProactivePush(payload) {
 
 async function handleProactiveMomentPush(state, charId, payload) {
   const { settings, characters, allChats } = state;
+  if (!automaticTasksEnabled(settings)) return false;
   const allMoments = Array.isArray(state.allMoments) ? state.allMoments : [];
   const char = (characters || []).find(c => c.id === charId);
   const chat = allChats[charId];
@@ -1846,12 +1885,14 @@ async function handleProactiveMomentPush(state, charId, payload) {
   if (await refreshBackgroundPaymentExpirations(state, charId)) {
     state.allChats = allChats;
     state.updatedAt = Date.now();
+    if (!(await automaticTasksStillEnabled())) return false;
     await setMeta('app_state', state);
   }
   const proactiveNow = new Date();
   const momentContext = buildBackgroundMomentContext(allMoments, characters, charId, settings, 6);
   const memoryQuery = `角色朋友圈动态触发。\n${getTimeContext(proactiveNow)}\n${charName(char)}准备主动发朋友圈。\n${momentContext}`;
   const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'moment-post');
+  if (!(await automaticTasksStillEnabled())) return false;
   const prompt = buildBackgroundMomentPostSystem(settings, char, chat, memoryPack, proactiveNow, momentContext);
   const messages = proactiveRecentMessages(chat, 20, proactiveNow, settings);
   const historyOmitted = Math.max(0, recentMessageCandidateCount(chat, 20) - messages.length);
@@ -1864,6 +1905,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
     memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
+  if (!(await automaticTasksStillEnabled())) return false;
   let text = '';
   try {
     const start = raw.indexOf('{'), end = raw.lastIndexOf('}');
@@ -1884,6 +1926,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
+    if (!(await automaticTasksStillEnabled())) return false;
     setStateCloudTimerStatus(state, `后台朋友圈生成了空动态：${emptyReason}，已跳过并安排下次重试。`, 'moment');
     state.allChats = allChats;
     state.allMoments = allMoments;
@@ -1914,6 +1957,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
+  if (!(await automaticTasksStillEnabled())) return false;
   await recordBackgroundScenarioMemory(
     state,
     charId,
@@ -1921,6 +1965,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
     `${charName(char)}后台主动发布朋友圈：“${text}”`,
     { type: 'moment', keywords: ['朋友圈', '动态', ...memorySignalTerms(text).slice(0, 6)] }
   );
+  if (!(await automaticTasksStillEnabled())) return false;
   setStateCloudTimerStatus(state, '后台朋友圈已发布 1 条动态。', 'moment');
   state.allChats = allChats;
   state.allMoments = allMoments;
@@ -1986,6 +2031,7 @@ self.addEventListener('push', event => {
       await self.registration.showNotification('AL', { body: '有新的主动消息提醒', icon: './icon.svg' });
       return;
     }
+    if (!(await automaticTasksStillEnabled())) return;
     let wakeShown = false;
     try {
       wakeShown = await showProactiveWakeNotification(payload);
@@ -1993,6 +2039,7 @@ self.addEventListener('push', event => {
       if (wakeShown) await closeProactiveWakeNotification();
     } catch (err) {
       if (wakeShown) await closeProactiveWakeNotification();
+      if (!(await automaticTasksStillEnabled())) return;
       const retryScheduled = await recoverProactivePushFailure(payload, err).catch(() => false);
       await self.registration.showNotification('AL', {
         body: retryScheduled ? '主动消息生成失败，已安排下次重试。' : '主动消息生成失败，打开 AL 后会继续尝试。',

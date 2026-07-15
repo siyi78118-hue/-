@@ -1,5 +1,6 @@
 package com.siyi.al;
 
+import android.content.Intent;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -7,6 +8,8 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.siyi.al.execution.AlExecutionService;
+import com.siyi.al.execution.AlExecutionWakeWorker;
+import com.siyi.al.execution.AutomaticTaskCleanupResult;
 import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -123,6 +126,21 @@ public final class AlExecutionPlugin extends Plugin {
             Boolean deleted = call.getBoolean("deleted", false);
             store.cancelTurn(turnId, System.currentTimeMillis(), Boolean.TRUE.equals(deleted));
             return turnResult(store.turn(turnId));
+        });
+    }
+
+    @PluginMethod
+    public void clearAutomaticTasks(PluginCall call) {
+        execute(call, () -> {
+            AutomaticTaskCleanupResult cleanup = store.clearAutomaticTasks(System.currentTimeMillis());
+            AlExecutionWakeWorker.cancel(getContext());
+            getContext().stopService(new Intent(getContext(), AlExecutionService.class));
+            JSObject result = new JSObject();
+            result.put("cancelledTurns", cleanup.cancelledTurns);
+            result.put("cancelledAttempts", cleanup.cancelledAttempts);
+            result.put("acknowledgedCompletedTurns", cleanup.acknowledgedCompletedTurns);
+            result.put("deletedSnapshots", cleanup.deletedSnapshots);
+            return result;
         });
     }
 

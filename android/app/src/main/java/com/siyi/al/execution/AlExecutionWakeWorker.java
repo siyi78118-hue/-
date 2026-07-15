@@ -52,4 +52,8 @@ public final class AlExecutionWakeWorker extends Worker {
             builder.build()
         );
     }
+
+    public static void cancel(Context context) {
+        WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(WORK_NAME);
+    }
 }

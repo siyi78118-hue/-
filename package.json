@@ -1,7 +1,7 @@
 {
   "scripts": {
     "start": "node serve-static.mjs",
-    "test": "node test-basic.mjs",
+    "test": "node test-basic.mjs && node test-cloud-device-cleanup.mjs && node test-sw-automatic-task-guard.mjs",
     "android:sync": "cap sync android",
     "android:copy": "cap copy android",
     "android:open": "cap open android",

@@ -16,4 +16,12 @@ public class AlFirebaseMessagingServiceTest {
         assertFalse(AlFirebaseMessagingService.matchesSnapshotJob(snapshot, "job-old"));
         assertFalse(AlFirebaseMessagingService.matchesSnapshotJob(snapshot, ""));
     }
+
+    @Test
+    public void rejectsSnapshotWhenAutomaticTasksAreDisabled() {
+        CharacterSnapshotEntity snapshot = new CharacterSnapshotEntity();
+        snapshot.contextJson = "{\"cloudJobId\":\"job-current\",\"automaticTasksEnabled\":false}";
+
+        assertFalse(AlFirebaseMessagingService.snapshotAllowsAutomaticTask(snapshot, "job-current"));
+    }
 }

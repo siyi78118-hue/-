@@ -103,6 +103,18 @@ public interface AlExecutionDao {
     @Query("UPDATE execution_attempts SET state = 'CANCELLED', stage = 'FINISHED', heartbeatAt = :now, finishedAt = :now, errorCode = 'CANCELLED', retryable = 0 WHERE attemptId = :attemptId")
     int cancelAttempt(String attemptId, long now);
 
+    @Query("UPDATE execution_attempts SET state = 'CANCELLED', stage = 'FINISHED', heartbeatAt = :now, finishedAt = :now, errorCode = 'CANCELLED', retryable = 0 WHERE turnId IN (SELECT turnId FROM chat_turns WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT') AND state != 'COMPLETED') AND state NOT IN ('COMPLETED','CANCELLED')")
+    int cancelAutomaticAttempts(long now);
+
+    @Query("UPDATE chat_turns SET state = 'CANCELLED', activeAttemptId = NULL, updatedAt = :now, cancelledAt = :now WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT') AND state NOT IN ('COMPLETED','CANCELLED')")
+    int cancelAutomaticTurns(long now);
+
+    @Query("UPDATE chat_turns SET uiAppliedAt = :now WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT') AND state = 'COMPLETED' AND uiAppliedAt IS NULL")
+    int acknowledgeCompletedAutomaticTurns(long now);
+
+    @Query("DELETE FROM character_snapshots")
+    int deleteProactiveSnapshots();
+
     @Transaction
     default void markStage(
         String turnId,
