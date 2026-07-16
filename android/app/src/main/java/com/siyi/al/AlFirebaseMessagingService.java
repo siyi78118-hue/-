@@ -26,7 +26,10 @@ public class AlFirebaseMessagingService extends MessagingService {
         if (characterId.isEmpty() || jobId.isEmpty()) return;
 
         AlExecutionDatabase database = AlExecutionDatabase.get(this);
-        CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(characterId + ":" + kindName);
+        CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(snapshotId(characterId, kindName, jobId));
+        if (snapshot == null) {
+            snapshot = database.executionDao().latestSnapshot(characterId + ":" + kindName);
+        }
         if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) return;
         if (!snapshotAllowsAutomaticTask(snapshot, jobId)) return;
 
@@ -44,6 +47,10 @@ public class AlFirebaseMessagingService extends MessagingService {
             System.currentTimeMillis()
         ));
         AlExecutionService.requestRun(this);
+    }
+
+    static String snapshotId(String characterId, String kindName, String jobId) {
+        return text(characterId) + ":" + text(kindName) + ":" + text(jobId);
     }
 
     static boolean matchesSnapshotJob(CharacterSnapshotEntity snapshot, String jobId) {

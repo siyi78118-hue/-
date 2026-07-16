@@ -1930,6 +1930,12 @@ async function buildNativeExecutionSnapshot(charId, task) {
   };
 }
 
+function nativeProactiveSnapshotIds(charId, kind = 'chat', job = null) {
+  const base = `${charId}:${kind}`;
+  const jobId = String(job?.jobId || '').trim();
+  return jobId ? [base, `${base}:${jobId}`] : [base];
+}
+
 async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
   const plugin = nativeExecutionPlugin();
   if (!plugin?.saveProactiveSnapshot) return false;
@@ -1982,8 +1988,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     deviceId: settings.deviceId || '',
     createdAt: now.toISOString()
   };
-  await plugin.saveProactiveSnapshot({
-    snapshotId: `${charId}:${kind}`,
+  const record = {
     characterId: charId,
     characterName: charName(char),
     playerName: playerName(),
@@ -1993,7 +1998,10 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     memoryConfigId: 'memory-v1',
     snapshotJson: JSON.stringify(snapshot),
     createdAt: Date.now()
-  });
+  };
+  for (const snapshotId of nativeProactiveSnapshotIds(charId, kind, job)) {
+    await plugin.saveProactiveSnapshot({ snapshotId, ...record });
+  }
   return true;
 }
 
