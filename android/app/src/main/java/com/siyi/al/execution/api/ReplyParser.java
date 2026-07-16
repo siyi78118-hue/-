@@ -12,6 +12,7 @@ public final class ReplyParser {
     private static final Pattern PAYMENT = Pattern.compile("<al_send_payment>([\\s\\S]*?)</al_send_payment>", Pattern.CASE_INSENSITIVE);
     private static final Pattern PAYMENT_STATUS = Pattern.compile("<al_payment>([\\s\\S]*?)</al_payment>", Pattern.CASE_INSENSITIVE);
     private static final Pattern SCHEDULE = Pattern.compile("<al_schedule>([\\s\\S]*?)</al_schedule>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern PLAN = Pattern.compile("<al_plan>([\\s\\S]*?)</al_plan>", Pattern.CASE_INSENSITIVE);
     private static final Pattern NO_REPLY = Pattern.compile("^[（(]?对方没有回复[）)]?[。！!]?$", Pattern.CASE_INSENSITIVE);
     private static final Pattern CONTROL_MARKER_SUFFIX = Pattern.compile(
         "(?:^|\\s+)(?:<\\s*)?(?:end[\\s_-]*turn|turn[\\s_-]*end)(?:\\s*>)?\\s*$",
@@ -28,6 +29,7 @@ public final class ReplyParser {
         JSONObject payment = payment(source);
         JSONObject paymentStatus = directive(PAYMENT_STATUS, source);
         JSONObject schedule = directive(SCHEDULE, source);
+        JSONObject plan = directive(PLAN, source);
         String clean = unwrapTextJson(clean(source));
         for (String line : clean.split("\\n+")) {
             String content = CONTROL_MARKER_SUFFIX.matcher(line.trim()).replaceFirst("").trim();
@@ -61,6 +63,9 @@ public final class ReplyParser {
         if (schedule != null && !schedule.optString("nextProactiveAt", "").trim().isEmpty()) {
             add(parts, turnId, attemptId, "SCHEDULE", "", schedule.toString());
         }
+        if (plan != null && plan.optJSONArray("operations") != null && plan.optJSONArray("operations").length() > 0) {
+            add(parts, turnId, attemptId, "PLAN", "", plan.toString());
+        }
         return new ParsedReply(parts);
     }
 
@@ -89,6 +94,7 @@ public final class ReplyParser {
         return PAYMENT.matcher(source)
             .replaceAll("")
             .replaceAll("(?is)<al_schedule>[\\s\\S]*?</al_schedule>", "")
+            .replaceAll("(?is)<al_plan>[\\s\\S]*?</al_plan>", "")
             .replaceAll("(?is)<al_payment>[\\s\\S]*?</al_payment>", "")
             .replaceAll("(?m)^```(?:json)?|```$", "")
             .replaceAll("(?m)^(?:【|\\[)\\s*(?:发送时间|历史消息元数据).*?(?:】|\\])\\s*", "")

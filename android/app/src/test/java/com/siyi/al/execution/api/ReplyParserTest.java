@@ -2,6 +2,7 @@ package com.siyi.al.execution.api;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
@@ -48,6 +49,33 @@ public class ReplyParserTest {
         for (ParsedReplyPart part : parsed.parts) restored.append(part.content.replace("\n", ""));
         assertEquals(source.toString().replace("\n", ""), restored.toString());
         assertEquals("第12段回复。\n第13段回复。\n第14段回复。\n第15段回复。\n第16段回复。", parsed.parts.get(11).content);
+    }
+
+    @Test
+    public void emitsPlanPartWithoutLeakingDirective() {
+        ParsedReply parsed = parser.parse(
+            "早。\n我九点再找你。\n<al_plan>{\"operations\":[{\"op\":\"create\",\"type\":\"private_message\"}]}</al_plan>",
+            "turn-plan",
+            "attempt-plan"
+        );
+
+        assertEquals(3, parsed.parts.size());
+        assertEquals("早。", parsed.parts.get(0).content);
+        assertEquals("我九点再找你。", parsed.parts.get(1).content);
+        assertEquals("PLAN", parsed.parts.get(2).type);
+        assertTrue(parsed.parts.get(2).payloadJson.contains("operations"));
+    }
+
+    @Test
+    public void invalidPlanJsonKeepsVisibleReply() {
+        ParsedReply parsed = parser.parse(
+            "知道了。<al_plan>{bad}</al_plan>",
+            "turn-plan-invalid",
+            "attempt-plan-invalid"
+        );
+
+        assertEquals(1, parsed.parts.size());
+        assertEquals("知道了。", parsed.parts.get(0).content);
     }
 
     @Test

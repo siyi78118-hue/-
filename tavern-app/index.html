@@ -888,6 +888,7 @@ button.cell:active{background:#ececec}
 
 <script src="lib/api-endpoint.js"></script>
 <script src="./lib/role-plan-domain.js"></script>
+<script src="./lib/role-plan-repository.js"></script>
 <script>
 const DB = {
   get(k, def = null) { try { const v = localStorage.getItem('rpchat_' + k) ?? localStorage.getItem('tavern_' + k); return v ? JSON.parse(v) : def } catch { return def } },
@@ -1543,6 +1544,67 @@ const MemoryDB = {
   }
 };
 
+let rolePlanRepositoryInstance = null;
+const rolePlanCache = new Map();
+function rolePlanUid() {
+  return `plan_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+}
+function getRolePlanRepository() {
+  if (!rolePlanRepositoryInstance) {
+    rolePlanRepositoryInstance = globalThis.ALRolePlanRepository.create({
+      domain: globalThis.ALRolePlans,
+      nativePlugin: nativeExecutionPlugin(),
+      metaStore: MemoryDB,
+      uid: rolePlanUid
+    });
+  }
+  return rolePlanRepositoryInstance;
+}
+async function refreshRolePlanCache(charId) {
+  if (!charId) return [];
+  const plans = await getRolePlanRepository().list(charId, { includeTerminal: true });
+  rolePlanCache.set(charId, plans);
+  return plans;
+}
+async function refreshAllRolePlanCaches() {
+  await Promise.allSettled((characters || []).map(char => refreshRolePlanCache(char.id)));
+}
+function rolePlanCatalogForPrompt(charId) {
+  const rows = (rolePlanCache.get(charId) || []).filter(plan => ['active', 'paused', 'running', 'failed'].includes(plan.status));
+  if (!rows.length) return '无有效计划';
+  return rows.slice(0, 50).map(plan => [
+    `planId=${plan.planId}`,
+    plan.title || plan.intent || '未命名计划',
+    plan.type,
+    plan.status,
+    plan.nextRunAt ? formatFullTime(new Date(plan.nextRunAt)) : '无下一次时间'
+  ].join('｜')).join('\n');
+}
+function roleScheduleContextForPrompt(charId, now = Date.now()) {
+  if (!globalThis.ALRolePlans?.scheduleContext) return '';
+  const rows = globalThis.ALRolePlans.scheduleContext(rolePlanCache.get(charId) || [], charId, now);
+  if (!rows.length) return '';
+  return `当前角色日程：\n${rows.map(row => `${row.title || '日程'}：${row.intent || ''}`).join('\n')}`;
+}
+async function applyRolePlanOperations(charId, operations, evidenceMessageIds = []) {
+  if (!Array.isArray(operations) || !operations.length) return { changed: false, rejected: [] };
+  const enriched = operations.map(operation => ({
+    ...operation,
+    evidenceMessageIds: Array.from(new Set([...(operation.evidenceMessageIds || []), ...evidenceMessageIds])).slice(0, 12)
+  }));
+  const result = await getRolePlanRepository().apply(charId, enriched);
+  rolePlanCache.set(charId, result.plans || []);
+  if (typeof syncRolePlanCloudJobs === 'function') syncRolePlanCloudJobs(charId).catch(err => console.warn('[AL RolePlan] cloud sync skipped:', err.message));
+  return result;
+}
+async function applyNativePlanParts(charId, parts, sourceTurnId) {
+  parts = Array.isArray(parts) ? parts : [];
+  for (const part of parts.filter(part => part.type === 'PLAN')) {
+    const payload = nativePartPayload(part);
+    await applyRolePlanOperations(charId, payload.operations, [sourceTurnId]);
+  }
+}
+
 async function dumpMemoryStores() {
   const memory = {};
   for (const store of MEMORY_STORES) memory[store] = await MemoryDB.all(store);
@@ -2177,6 +2239,7 @@ async function applyNativeExecutionTurn(result) {
     const sourceTurnId = `native:${result.turnId}`;
     if (state === 'COMPLETED') {
       const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
+      await applyNativePlanParts(charId, parts, result.turnId);
       const text = parts.filter(part => part.type === 'TEXT').map(part => String(part.content || '').trim()).filter(Boolean).join('\n');
       const completedAt = Number(result.completedAt) || Number(result.createdAt) || Date.now();
       if (kind === 'PROACTIVE_MOMENT') {
@@ -2225,6 +2288,7 @@ async function applyNativeExecutionTurn(result) {
   const state = String(result.state || result.storedState || '');
   if (state === 'COMPLETED') {
     const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
+    await applyNativePlanParts(charId, parts, result.turnId);
     const alreadyAnswered = (chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === userMessage.id);
     const text = nativeReplyTextParts(result).map(part => part.content).join('\n');
     const appendedText = alreadyAnswered ? [] : appendNativeReplyTextParts(chat, result, { replyToMessageId: userMessage.id });
@@ -4279,6 +4343,22 @@ function stripProactiveScheduleDirective(text) {
       return block;
     });
 }
+function extractRolePlanDirective(text) {
+  const match = String(text || '').match(/<al_plan>([\s\S]*?)<\/al_plan>/i);
+  if (!match) return { operations: [] };
+  try {
+    const value = JSON.parse(match[1]);
+    return { operations: Array.isArray(value?.operations) ? value.operations : [] };
+  } catch {
+    return { operations: [], error: 'PLAN_JSON_INVALID' };
+  }
+}
+function stripRolePlanDirective(text) {
+  return String(text || '')
+    .replace(/<al_plan>[\s\S]*?<\/al_plan>/gi, '')
+    .replace(/<al_plan>[\s\S]*$/gi, '')
+    .trim();
+}
 function normalizePaymentDirectiveStatus(value) {
   const status = String(value || '').trim().toLowerCase();
   if (['received', 'receive', 'accepted', 'accept', 'claimed', 'claim', 'collected', 'done'].includes(status)) return 'received';
@@ -4346,7 +4426,7 @@ function stripLeakedPromptMetadata(text) {
     .join('\n');
 }
 function cleanAssistantChatReply(text) {
-  const raw = stripLeakedPromptMetadata(stripAssistantPaymentDirective(stripPaymentStatusDirective(stripProactiveScheduleDirective(text)))).trim();
+  const raw = stripLeakedPromptMetadata(stripAssistantPaymentDirective(stripPaymentStatusDirective(stripProactiveScheduleDirective(stripRolePlanDirective(text))))).trim();
   if (!raw) return '';
   const jsonLike = raw.replace(/```json|```/g, '').trim();
   try {
@@ -4370,6 +4450,7 @@ function cleanStreamingDraftText(text) {
   const lower = raw.toLowerCase();
   let visible = raw;
   const hiddenMarkers = [
+    '<al_plan>',
     '<al_schedule>',
     '<al_payment>',
     '【发送时间',
@@ -4389,7 +4470,7 @@ function cleanStreamingDraftText(text) {
     const tail = lower.slice(start).trim();
     if (marker.startsWith(tail) || tail.startsWith(marker)) visible = visible.slice(0, start);
   }
-  return stripLeakedPromptMetadata(stripPaymentStatusDirective(stripProactiveScheduleDirective(visible))).trim();
+  return stripLeakedPromptMetadata(stripPaymentStatusDirective(stripProactiveScheduleDirective(stripRolePlanDirective(visible)))).trim();
 }
 function applyAssistantMomentDirective(chat, charId, reply) {
   const directive = extractAssistantMomentDirective(reply);
@@ -4819,6 +4900,15 @@ function buildChatSceneSystem(char, chat, options = {}) {
   const momentContext = buildMomentChatContext(char.id);
   composer.add('moment-context', momentContext, { priority: 20 });
   composer.add('memory-pack', options.memoryPack, { priority: 30 });
+  composer.add('role-schedule-context', roleScheduleContextForPrompt(char.id), { priority: 31 });
+  composer.add('role-plan-contract', `角色可以自主安排未来私聊、朋友圈和自己的日程。
+当前有效计划目录：
+${rolePlanCatalogForPrompt(char.id)}
+若本轮确实需要创建、修改、取消、暂停、恢复或完成计划，在可见回复最后输出：
+<al_plan>{"operations":[{"op":"create|update|cancel|pause|resume|complete","planId":"修改操作引用已有ID","type":"private_message|moment_post|role_schedule","source":"spoken|accepted_request|private_decision","title":"短标题","intent":"计划目的","schedule":{"kind":"once|daily|weekly|monthly|interval"},"timeConfidence":"explicit|inferred"}]}</al_plan>
+创建操作不需要 planId；修改类操作必须引用目录中的 planId。明确取消、改期或事实冲突才能修改已有计划，“不想上班”不等于“不上班了”。
+一次性时间使用 schedule.at 的完整 ISO 时间；每天使用 schedule.time；每周增加 weekdays（0=周日）；每月增加 day；间隔计划使用 startsAt 和 intervalMs。所有时间按手机本地时间理解。
+允许角色生成没有说出口的 private_decision，但必须符合人设和真实动机；没有计划变化时不要输出标签。隐藏标签不是聊天内容，不得解释。`, { priority: 45, scenes: ['chat', 'payment', 'proactive-chat'] });
   composer.add('rich-chat-actions', `Emoji 与支付能力：
 Emoji 可以自然夹在文字里，也可以单独成为一条消息；是否使用、用哪个、使用频率都由${char.name}的性格、关系阶段和当前语境决定。
 正例：聊到好笑的事时回复“你还挺得意😂”，或单独另发一条“🙄”。
@@ -5754,6 +5844,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
       const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), signal: controller.signal, live: false });
       clearStreamingDraft(requestCharId);
       if (controller.signal.aborted || !messageAvailableToAI(userMessage) || chat.pendingReply?.requestToken !== requestToken) return '';
+      const rolePlanDirective = extractRolePlanDirective(reply);
       const proactiveSchedule = extractProactiveScheduleDirective(reply);
       const paymentDirective = extractPaymentStatusDirective(reply);
       const assistantPaymentDirective = extractAssistantPaymentDirective(reply);
@@ -5763,6 +5854,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
       const assistantPaymentMessage = appendAssistantPaymentMessage(chat, assistantPaymentDirective, { replyToMessageId: userMessageId });
       if (assistantPaymentMessage) recordScenarioMemoryEvent(requestCharId, '支付事件', `${charName(characters.find(c => c.id === requestCharId))}给${playerName()}发来${assistantPaymentDirective.type === 'redpacket' ? '红包' : '转账'}，金额 ${formatMoney(assistantPaymentDirective.amount)}${assistantPaymentDirective.note ? `，备注“${assistantPaymentDirective.note}”` : ''}，当前等待领取。`, assistantPaymentMessage.time);
       updatePaymentStatusFromReply(chat, options.paymentMessageId, replyText, requestCharId, paymentDirective?.status);
+      applyRolePlanOperations(requestCharId, rolePlanDirective.operations, [userMessageId]).catch(err => console.warn('[AL RolePlan] reply plan skipped:', err.message));
       schedulePlannedChatFromReply(requestCharId, proactiveSchedule).catch(err => console.warn('[AL Timer] planned chat schedule skipped:', err.message));
       ensureDiceProactiveScheduled(requestCharId, 'moment').catch(err => console.warn('[AL Timer] moment dice schedule skipped:', err.message));
       delete chat.pendingReply;
@@ -9229,6 +9321,7 @@ async function bootApp() {
   }
   refreshNativeCloudRegistration().catch(err => console.warn('[AL Native] cloud capability refresh skipped:', err.message));
   await syncFromServiceWorkerState({ checkProactive: false });
+  await refreshAllRolePlanCaches();
   refreshAllStoredCharacterPrompts();
   let chatStateChanged = false;
   Object.values(allChats || {}).forEach(chat => { chatStateChanged = ensureChatMessageIds(chat) || chatStateChanged; });
