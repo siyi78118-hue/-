@@ -24,6 +24,7 @@ public final class ReplyParser {
     public ParsedReply parse(String raw, String turnId, String attemptId) {
         String source = raw == null ? "" : raw;
         List<ParsedReplyPart> parts = new ArrayList<>();
+        List<String> textBubbles = new ArrayList<>();
         JSONObject payment = payment(source);
         JSONObject paymentStatus = directive(PAYMENT_STATUS, source);
         JSONObject schedule = directive(SCHEDULE, source);
@@ -31,11 +32,10 @@ public final class ReplyParser {
         for (String line : clean.split("\\n+")) {
             String content = CONTROL_MARKER_SUFFIX.matcher(line.trim()).replaceFirst("").trim();
             if (content.isEmpty() || NO_REPLY.matcher(content).matches()) continue;
-            for (String bubble : bubbleChunks(content)) {
-                add(parts, turnId, attemptId, "TEXT", bubble, "{}");
-                if (parts.size() >= MAX_TEXT_PARTS) break;
-            }
-            if (parts.size() >= MAX_TEXT_PARTS) break;
+            textBubbles.addAll(bubbleChunks(content));
+        }
+        for (String bubble : collapseTextBubbles(textBubbles)) {
+            add(parts, turnId, attemptId, "TEXT", bubble, "{}");
         }
         if (payment != null) {
             String type = payment.optString("type", "").toLowerCase(Locale.ROOT);
@@ -62,6 +62,13 @@ public final class ReplyParser {
             add(parts, turnId, attemptId, "SCHEDULE", "", schedule.toString());
         }
         return new ParsedReply(parts);
+    }
+
+    private static List<String> collapseTextBubbles(List<String> bubbles) {
+        if (bubbles.size() <= MAX_TEXT_PARTS) return bubbles;
+        List<String> collapsed = new ArrayList<>(bubbles.subList(0, MAX_TEXT_PARTS - 1));
+        collapsed.add(String.join("\n", bubbles.subList(MAX_TEXT_PARTS - 1, bubbles.size())));
+        return collapsed;
     }
 
     private static JSONObject payment(String source) {

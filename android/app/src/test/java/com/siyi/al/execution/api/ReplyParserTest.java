@@ -34,6 +34,23 @@ public class ReplyParserTest {
     }
 
     @Test
+    public void preservesAllTextWhenReplyExceedsTheTwelveBubbleStorageLimit() {
+        StringBuilder source = new StringBuilder();
+        for (int index = 1; index <= 16; index++) {
+            if (index > 1) source.append('\n');
+            source.append("第").append(index).append("段回复。");
+        }
+
+        ParsedReply parsed = parser.parse(source.toString(), "turn-overflow", "attempt-overflow");
+
+        assertEquals(12, parsed.parts.size());
+        StringBuilder restored = new StringBuilder();
+        for (ParsedReplyPart part : parsed.parts) restored.append(part.content.replace("\n", ""));
+        assertEquals(source.toString().replace("\n", ""), restored.toString());
+        assertEquals("第12段回复。\n第13段回复。\n第14段回复。\n第15段回复。\n第16段回复。", parsed.parts.get(11).content);
+    }
+
+    @Test
     public void separatesLongUnbrokenMultiSentenceReplyIntoChatBubbles() {
         ParsedReply parsed = parser.parse(
             "自己的软件？听起来你还挺厉害。无非就是哪天让你请杯冷萃。又不是攒着卖钱，你紧张什么？快十一点半了，修完赶紧回去。",
