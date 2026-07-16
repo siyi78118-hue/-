@@ -5,6 +5,7 @@ import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
+import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import java.util.List;
@@ -49,6 +50,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
             dao.insertAttempt(newAttempt(turn.turnId, attemptId, 1, now));
             insertTurnChange(turn.turnId, "TURN_QUEUED", now);
+            insertDiagnostic(turn.turnId, attemptId, "INFO", "TURN_QUEUED", turn.kind, now);
             result.set(turn);
         });
         return result.get();
@@ -105,6 +107,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             dao.markTurnFailed(turnId, attemptId, state, now);
             dao.markAttemptFailed(attemptId, state, code, detail, retryable, now);
             insertTurnChange(turnId, "TURN_FAILED", now);
+            insertDiagnostic(turnId, attemptId, "ERROR", "TURN_FAILED", code + ": " + detail, now);
         });
     }
 
@@ -174,6 +177,21 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return dao.changesAfter(cursor, Math.max(1, Math.min(limit, 500)));
     }
 
+    public List<DiagnosticEntity> latestDiagnostics(int limit) {
+        return dao.latestDiagnostics(Math.max(1, Math.min(limit, 500)));
+    }
+
+    public void recordDiagnostic(
+        String turnId,
+        String attemptId,
+        String level,
+        String code,
+        String detail,
+        long now
+    ) {
+        insertDiagnostic(turnId, attemptId, level, code, detail, now);
+    }
+
     @Override
     public List<ChatTurnEntity> unappliedCompletedTurns(int limit) {
         return dao.unappliedCompletedTurns(Math.max(1, Math.min(limit, 500)));
@@ -207,16 +225,22 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         long now
     ) {
         dao.markStage(turnId, attemptId, state.name(), stage.name(), now);
+        String code = state == TurnState.MEMORY_RUNNING ? "MEMORY_STARTED"
+            : state == TurnState.CHAT_RUNNING ? "CHAT_STARTED"
+            : "STAGE_CHANGED";
+        insertDiagnostic(turnId, attemptId, "INFO", code, state.name(), now);
     }
 
     @Override
     public void saveMemoryResult(String turnId, String attemptId, String memory, long now) {
         dao.saveMemoryCheckpoint(turnId, attemptId, memory, now);
+        insertDiagnostic(turnId, attemptId, "INFO", "MEMORY_DONE", "memory checkpoint saved", now);
     }
 
     @Override
     public void saveRawReply(String turnId, String attemptId, String rawReply, long now) {
         dao.saveRawReplyCheckpoint(turnId, attemptId, rawReply, now);
+        insertDiagnostic(turnId, attemptId, "INFO", "CHAT_DONE", "chat checkpoint saved", now);
     }
 
     @Override
@@ -252,6 +276,36 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         change.payloadJson = "{\"turnId\":\"" + turnId + "\"}";
         change.createdAt = now;
         dao.insertChange(change);
+    }
+
+    private void insertDiagnostic(
+        String turnId,
+        String attemptId,
+        String level,
+        String code,
+        String detail,
+        long now
+    ) {
+        DiagnosticEntity diagnostic = new DiagnosticEntity();
+        diagnostic.turnId = limit(turnId, 96);
+        diagnostic.attemptId = limit(attemptId, 128);
+        diagnostic.level = limit(level == null ? "INFO" : level, 16);
+        diagnostic.code = limit(code == null ? "UNKNOWN" : code, 64);
+        diagnostic.detail = limit(redact(detail), 600);
+        diagnostic.createdAt = now > 0 ? now : System.currentTimeMillis();
+        dao.insertDiagnostic(diagnostic);
+    }
+
+    private static String redact(String value) {
+        if (value == null) return "";
+        return value
+            .replaceAll("sk-[A-Za-z0-9_-]{8,}", "sk-***")
+            .replaceAll("(?i)Bearer\\s+[A-Za-z0-9._~-]{8,}", "Bearer ***");
+    }
+
+    private static String limit(String value, int maxLength) {
+        String safe = value == null ? "" : value;
+        return safe.length() <= maxLength ? safe : safe.substring(0, maxLength);
     }
 
     private static ExecutionAttemptEntity newAttempt(

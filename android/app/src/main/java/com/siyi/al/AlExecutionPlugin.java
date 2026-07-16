@@ -18,6 +18,7 @@ import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
+import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.secure.AlSecretStore;
@@ -202,6 +203,28 @@ public final class AlExecutionPlugin extends Plugin {
             String turnId = required(call, "turnId");
             store.acknowledgeUiApplied(turnId, System.currentTimeMillis());
             return turnResult(store.turn(turnId));
+        });
+    }
+
+    @PluginMethod
+    public void nativeDiagnostics(PluginCall call) {
+        execute(call, () -> {
+            Integer limit = call.getInt("limit", 100);
+            JSArray diagnostics = new JSArray();
+            for (DiagnosticEntity row : store.latestDiagnostics(limit == null ? 100 : limit)) {
+                JSObject item = new JSObject();
+                item.put("diagnosticId", row.diagnosticId);
+                item.put("turnId", row.turnId);
+                item.put("attemptId", row.attemptId);
+                item.put("level", row.level);
+                item.put("code", row.code);
+                item.put("detail", row.detail);
+                item.put("createdAt", row.createdAt);
+                diagnostics.put(item);
+            }
+            JSObject result = new JSObject();
+            result.put("diagnostics", diagnostics);
+            return result;
         });
     }
 

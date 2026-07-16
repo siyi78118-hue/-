@@ -2007,9 +2007,13 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
 
 function pendingNativeReplyCount() {
   return Object.values(allChats || {}).filter(chat => {
-    const pending = chat?.pendingReply;
-    return pending && ['pending', 'running'].includes(pending.state);
+    return chatHasPendingDirectReply(chat);
   }).length;
+}
+
+function chatHasPendingDirectReply(chat) {
+  const pending = chat?.pendingReply;
+  return !!pending && ['pending', 'running'].includes(pending.state);
 }
 
 function refreshChatSendButton() {
@@ -3266,11 +3270,32 @@ async function renderDiagnosticsScreen() {
   if (!list) return;
   list.innerHTML = '<div class="empty">正在读取最近调用...</div>';
   const logs = (await getAllModelCallLogs()).slice(0, 8);
-  if (!logs.length) {
+  const plugin = nativeExecutionPlugin();
+  const nativePage = plugin?.nativeDiagnostics
+    ? await plugin.nativeDiagnostics({ limit: 30 }).catch(err => {
+        console.warn('[AL Native Execution] diagnostics skipped:', err.message);
+        return { diagnostics: [] };
+      })
+    : { diagnostics: [] };
+  const nativeRows = Array.isArray(nativePage?.diagnostics) ? nativePage.diagnostics : [];
+  if (!logs.length && !nativeRows.length) {
     list.innerHTML = '<div class="empty">还没有模型调用记录</div>';
     return;
   }
-  list.innerHTML = logs.map((log, index) => {
+  const nativeHtml = nativeRows.length ? `<div class="diagnostic-item">
+    <div class="diagnostic-head">
+      <div>
+        <div class="diagnostic-title">安卓原生执行链</div>
+        <div class="diagnostic-meta">最近 ${nativeRows.length} 条检查点</div>
+      </div>
+      <span class="diagnostic-state ${nativeRows.some(row => row.level === 'ERROR') ? 'state-fail' : ''}">${nativeRows.some(row => row.level === 'ERROR') ? '有错误' : '已记录'}</span>
+    </div>
+    <div class="diagnostic-pre">${nativeRows.map(row => {
+      const time = row.createdAt ? new Date(row.createdAt).toLocaleString('zh-CN', { hour12: false }) : '未知时间';
+      return `${time}｜${row.code || 'UNKNOWN'}｜${row.turnId || '-'}${row.detail ? `｜${row.detail}` : ''}`;
+    }).map(esc).join('\n')}</div>
+  </div>` : '';
+  list.innerHTML = nativeHtml + logs.map((log, index) => {
     const state = diagnosticState(log);
     const note = log.error || log.diagnostic || '';
     const metaParts = [
@@ -7975,6 +8000,10 @@ async function triggerProactiveMessage(charId, manual = false, triggerMode = 'pl
   }
   const char = characters.find(c => c.id === charId);
   const chat = allChats[charId];
+  if (!manual && chatHasPendingDirectReply(chat)) {
+    if (settings.cloudTimerEnabled) setCloudTimerTrace('chat', traceId, '跳过：玩家手动消息仍在等待原生回复');
+    return false;
+  }
   if (!char || !chat?.messages?.length) {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `跳过：${!char ? '找不到角色' : '会话没有聊天记录'}（${charId || '无目标'}）`);
     if (manual) toast('先打开一个有聊天记录的会话');
@@ -9156,7 +9185,7 @@ async function clearAllHistory() {
   toast('已清空');
 }
 
-async function syncFromServiceWorkerState() {
+async function syncFromServiceWorkerState(options = {}) {
   const mirrorChanged = await restoreAppStateFromMirror();
   const executionChanged = await reconcileNativeExecutionTurns().catch(err => {
     console.warn('[AL Native Execution] foreground reconcile skipped:', err.message);
@@ -9172,7 +9201,9 @@ async function syncFromServiceWorkerState() {
     if (activeScreen === 'memory') renderMemoryScreen();
     renderCloudTimerStatus();
   }
-  checkProactiveMessages().catch(err => console.warn('[AL Timer] immediate proactive check skipped:', err.message));
+  if (options.checkProactive !== false) {
+    checkProactiveMessages().catch(err => console.warn('[AL Timer] immediate proactive check skipped:', err.message));
+  }
 }
 async function bootApp() {
   await closeStaleUpdateBrowser();
@@ -9183,12 +9214,15 @@ async function bootApp() {
     App?.addListener?.('appStateChange', state => {
       if (state?.isActive) {
         closeStaleUpdateBrowser();
-        syncFromServiceWorkerState().then(() => resumePendingAssistantTurns());
+        syncFromServiceWorkerState({ checkProactive: false }).then(() => {
+          resumePendingAssistantTurns();
+          checkProactiveMessages().catch(err => console.warn('[AL Timer] foreground proactive check skipped:', err.message));
+        });
       }
     });
   }
   refreshNativeCloudRegistration().catch(err => console.warn('[AL Native] cloud capability refresh skipped:', err.message));
-  await syncFromServiceWorkerState();
+  await syncFromServiceWorkerState({ checkProactive: false });
   refreshAllStoredCharacterPrompts();
   let chatStateChanged = false;
   Object.values(allChats || {}).forEach(chat => { chatStateChanged = ensureChatMessageIds(chat) || chatStateChanged; });
@@ -9199,6 +9233,7 @@ async function bootApp() {
   renderChats();
   await mirrorAppStateNow();
   resumePendingAssistantTurns();
+  checkProactiveMessages().catch(err => console.warn('[AL Timer] boot proactive check skipped:', err.message));
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
   if ('serviceWorker' in navigator) {
@@ -9213,7 +9248,10 @@ async function bootApp() {
   }
   if (document.addEventListener) {
     document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) syncFromServiceWorkerState().then(() => resumePendingAssistantTurns());
+      if (!document.hidden) syncFromServiceWorkerState({ checkProactive: false }).then(() => {
+        resumePendingAssistantTurns();
+        checkProactiveMessages().catch(err => console.warn('[AL Timer] visibility proactive check skipped:', err.message));
+      });
     });
   }
   if (typeof window !== 'undefined') {
@@ -9223,7 +9261,10 @@ async function bootApp() {
       pageIsUnloading = false;
       resumePendingAssistantTurns();
     });
-    window.addEventListener('focus', () => syncFromServiceWorkerState().then(() => resumePendingAssistantTurns()));
+    window.addEventListener('focus', () => syncFromServiceWorkerState({ checkProactive: false }).then(() => {
+      resumePendingAssistantTurns();
+      checkProactiveMessages().catch(err => console.warn('[AL Timer] focus proactive check skipped:', err.message));
+    }));
   }
 }
 

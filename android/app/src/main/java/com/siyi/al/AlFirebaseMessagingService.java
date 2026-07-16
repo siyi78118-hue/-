@@ -26,25 +26,34 @@ public class AlFirebaseMessagingService extends MessagingService {
         if (characterId.isEmpty() || jobId.isEmpty()) return;
 
         AlExecutionDatabase database = AlExecutionDatabase.get(this);
+        RoomExecutionStore store = new RoomExecutionStore(database);
+        String safeJobId = jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
+        String turnId = "cloud_" + safeJobId;
+        long now = System.currentTimeMillis();
+        store.recordDiagnostic(turnId, null, "INFO", "FCM_RECEIVED", kindName + ":" + jobId, now);
         CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(snapshotId(characterId, kindName, jobId));
         if (snapshot == null) {
             snapshot = database.executionDao().latestSnapshot(characterId + ":" + kindName);
         }
-        if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) return;
-        if (!snapshotAllowsAutomaticTask(snapshot, jobId)) return;
+        if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) {
+            store.recordDiagnostic(turnId, null, "WARN", "SNAPSHOT_MISSING", kindName + ":" + jobId, now);
+            return;
+        }
+        if (!snapshotAllowsAutomaticTask(snapshot, jobId)) {
+            store.recordDiagnostic(turnId, null, "WARN", "JOB_MISMATCH", kindName + ":" + jobId, now);
+            return;
+        }
 
-        String safeJobId = jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
         TurnKind kind = "moment".equals(kindName) ? TurnKind.PROACTIVE_MOMENT : TurnKind.PROACTIVE_CHAT;
-        RoomExecutionStore store = new RoomExecutionStore(database);
         store.submitTurn(new TurnSubmission(
-            "cloud_" + safeJobId,
+            turnId,
             characterId,
-            "cloud_" + safeJobId,
+            turnId,
             kind,
             "{}",
             snapshot.contextJson,
             jobId,
-            System.currentTimeMillis()
+            now
         ));
         AlExecutionService.requestRun(this);
     }

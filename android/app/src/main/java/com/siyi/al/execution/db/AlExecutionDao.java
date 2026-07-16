@@ -160,6 +160,9 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM change_events WHERE cursor > :cursor ORDER BY cursor ASC LIMIT :limit")
     List<ChangeEventEntity> changesAfter(long cursor, int limit);
 
+    @Query("SELECT * FROM diagnostics ORDER BY createdAt DESC, diagnosticId DESC LIMIT :limit")
+    List<DiagnosticEntity> latestDiagnostics(int limit);
+
     @Transaction
     default void commitReply(
         String turnId,

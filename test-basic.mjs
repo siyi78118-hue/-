@@ -80,9 +80,10 @@ assert.equal(existsSync(androidReplyQueuePath), false, 'retired RunnerWorker bri
 assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS runner source must be removed');
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
-for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied']) {
+for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
+assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /state\s*=\s*'COMPLETED'[\s\S]{0,240}uiAppliedAt\s+IS\s+NULL/, 'Room must keep a durable inbox of completed turns not yet applied to the UI');
 assert.match(executionDao, /acknowledgeUiApplied/, 'Room must expose an explicit UI acknowledgement');
 assert.match(executionPlugin, /unappliedCompletedTurns[\s\S]{0,1800}turnResult/, 'native bridge must return full unapplied turn results');
@@ -99,6 +100,8 @@ assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.native
 assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');
 assert.match(html, /async function scheduleCloudProactive[\s\S]{0,5000}syncNativeProactiveSnapshot\(/, 'native snapshot must exist before a cloud timer is scheduled');
 assert.match(html, /if \(!force && hasFutureCloudJob\(chat, kind\) && proactiveJobUsesCurrentDicePolicy\(kind, chat\[proactiveJobKey\(kind\)\]\)\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must receive native snapshots after an app upgrade');
+assert.match(html, /async function triggerProactiveMessage[\s\S]{0,1400}chatHasPendingDirectReply\(chat\)/, 'foreground proactive chat must not replace a pending direct reply');
+assert.match(html, /await syncFromServiceWorkerState\(\{ checkProactive: false \}\)[\s\S]{0,1400}resumePendingAssistantTurns\(\)[\s\S]{0,300}checkProactiveMessages\(\)/, 'boot must resume direct replies before proactive catch-up');
 assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_push_queue/, 'FCM must wake the Room execution engine directly');
 assert.match(androidFcmService, /latestSnapshot\(/);
 assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'FCM must reject a cloud job replaced by a newer snapshot');
@@ -109,7 +112,7 @@ assert.match(retryPolicy, /SocketException[\s\S]*NETWORK_INTERRUPTED[\s\S]*true/
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_CHAT/, 'native proactive chat results must be applied to chat UI');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_MOMENT/, 'native proactive moment results must be applied to moments UI');
 const foregroundSyncSource = html.slice(
-  html.indexOf('async function syncFromServiceWorkerState()'),
+  html.indexOf('async function syncFromServiceWorkerState('),
   html.indexOf('async function bootApp()')
 );
 assert.ok(
@@ -912,6 +915,7 @@ globalThis.__appTest = {
   proactiveDicePlan,
   proactiveJobUsesCurrentDicePolicy,
   nativeProactiveSnapshotIds,
+  chatHasPendingDirectReply,
   buildAndroidUserReplyTask,
   retryFailedReply,
   extractAssistantPaymentDirective,
@@ -923,7 +927,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, proactiveJobUsesCurrentDicePolicy, nativeProactiveSnapshotIds, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, proactiveJobUsesCurrentDicePolicy, nativeProactiveSnapshotIds, chatHasPendingDirectReply, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
 
 assert.deepEqual(
   Array.from(nativeProactiveSnapshotIds('char-1', 'chat', { jobId: 'pro-123' })),
@@ -933,6 +937,9 @@ assert.deepEqual(
   Array.from(nativeProactiveSnapshotIds('char-1', 'moment', null)),
   ['char-1:moment']
 );
+assert.equal(chatHasPendingDirectReply({ pendingReply: { state: 'running', nativeTurnId: 'turn-1' } }), true);
+assert.equal(chatHasPendingDirectReply({ pendingReply: { state: 'failed', nativeTurnId: 'turn-1' } }), false);
+assert.equal(chatHasPendingDirectReply({}), false);
 
 const automaticCleanupProbe = vm.runInContext(`(() => {
   const currentSettings = {
@@ -1487,7 +1494,7 @@ for (const leakedReferenceInstruction of ['Sandbox', '忽略系统', '无限制�
   assert.doesNotMatch(RP_PRESETS.combined.prompt, new RegExp(leakedReferenceInstruction, 'i'), `综合预设不得带入参考预设的${leakedReferenceInstruction}指令`);
 }
 assert.match(script, /function refreshAllStoredCharacterPrompts\(\)/);
-assert.match(script, /await syncFromServiceWorkerState\(\);\s*refreshAllStoredCharacterPrompts\(\);/);
+assert.match(script, /await syncFromServiceWorkerState\(\{ checkProactive: false \}\);\s*refreshAllStoredCharacterPrompts\(\);/);
 const storedPromptRefreshProbe = vm.runInContext(`(() => {
   const char = normalizeChar({ id: 'old-prompt-char', name: '旧角色', personality: '慢热' });
   characters = [char];

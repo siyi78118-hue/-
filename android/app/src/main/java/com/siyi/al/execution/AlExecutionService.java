@@ -28,6 +28,7 @@ public final class AlExecutionService extends Service {
     private ExecutorService executor;
     private ExecutionEngine engine;
     private AlExecutionDatabase database;
+    private RoomExecutionStore executionStore;
     private AlNotificationFactory notifications;
     private PowerManager.WakeLock wakeLock;
 
@@ -53,6 +54,7 @@ public final class AlExecutionService extends Service {
         executor = Executors.newSingleThreadExecutor();
         engine = ExecutionRuntime.create(this);
         database = AlExecutionDatabase.get(this);
+        executionStore = new RoomExecutionStore(database);
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AL:Execution");
         wakeLock.setReferenceCounted(false);
@@ -155,8 +157,12 @@ public final class AlExecutionService extends Service {
             );
             if (response.status >= 200 && response.status < 300) {
                 acknowledged.edit().putBoolean(key, true).apply();
+                executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "INFO", "ACK_OK", "status=" + response.status, System.currentTimeMillis());
+            } else {
+                executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ACK_FAILED", "status=" + response.status, System.currentTimeMillis());
             }
-        } catch (Exception ignored) {
+        } catch (Exception error) {
+            executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ACK_FAILED", error.getMessage(), System.currentTimeMillis());
             // Keep the ack pending. The sticky service retries it on the next kick.
         }
     }
