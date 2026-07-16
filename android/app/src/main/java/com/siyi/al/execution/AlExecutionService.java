@@ -20,18 +20,16 @@ import com.siyi.al.execution.api.UrlConnectionTransport;
 import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONObject;
 
 public final class AlExecutionService extends Service {
     private static final long WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L;
-    private final AtomicBoolean draining = new AtomicBoolean(false);
+    private final ExecutionDrainGate drainGate = new ExecutionDrainGate();
     private ExecutorService executor;
     private ExecutionEngine engine;
     private AlExecutionDatabase database;
     private AlNotificationFactory notifications;
     private PowerManager.WakeLock wakeLock;
-    private volatile boolean recoveryComplete;
 
     public static void requestRun(Context context) {
         Context app = context.getApplicationContext();
@@ -75,6 +73,7 @@ public final class AlExecutionService extends Service {
     @Override
     public void onDestroy() {
         if (executor != null) executor.shutdownNow();
+        drainGate.close();
         if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
         super.onDestroy();
     }
@@ -86,21 +85,25 @@ public final class AlExecutionService extends Service {
     }
 
     private void kick() {
-        if (!draining.compareAndSet(false, true)) return;
+        if (!drainGate.request()) return;
         executor.execute(() -> {
             acquireWakeLock();
             try {
-                if (!recoveryComplete) {
+                boolean continueDraining;
+                do {
                     engine.recoverInterruptedWork();
-                    recoveryComplete = true;
-                }
-                while (!Thread.currentThread().isInterrupted() && engine.runNext()) {
-                    // Drain the single Room-backed queue before sleeping again.
-                }
-                notifyCompletedTurns();
+                    while (!Thread.currentThread().isInterrupted() && engine.runNext()) {
+                        // Drain the single Room-backed queue before checking for a concurrent wake.
+                    }
+                    notifyCompletedTurns();
+                    continueDraining = !Thread.currentThread().isInterrupted() && drainGate.finishCycle();
+                } while (continueDraining);
+            } catch (RuntimeException error) {
+                boolean restart = drainGate.abortCycle();
+                if (restart && executor != null && !executor.isShutdown()) kick();
+                throw error;
             } finally {
                 if (wakeLock.isHeld()) wakeLock.release();
-                draining.set(false);
             }
         });
     }
