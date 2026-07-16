@@ -73,8 +73,8 @@ try {
 }
 assert.equal(
   idleKv.puts.filter(row => row.key === 'meta:lastCron').length,
-  1,
-  'sixty idle cron invocations must persist at most one health heartbeat'
+  0,
+  'idle cron health must use Workers Logs instead of consuming KV writes'
 );
 
 const scheduleKv = new FakeKV();
@@ -91,6 +91,13 @@ assert.equal(
   false,
   'routine schedule success must not spend another KV write on diagnostics'
 );
+const logsResponse = await cloudTimerWorker.fetch(new Request('https://worker.example/logs'), envFor(scheduleKv));
+const logsJson = await logsResponse.json();
+assert.deepEqual(logsJson.events, [], 'the compatibility logs endpoint must not persist diagnostic events in KV');
+
+const wrangler = await readFile(new URL('./wrangler.toml', import.meta.url), 'utf8');
+assert.match(wrangler, /\[observability\][\s\S]*enabled\s*=\s*true/,
+  'Workers Logs must be enabled after removing diagnostic KV writes');
 
 const html = await readFile(new URL('./tavern-app/index.html', import.meta.url), 'utf8');
 const serviceWorker = await readFile(new URL('./tavern-app/sw-v11.js', import.meta.url), 'utf8');
@@ -108,5 +115,7 @@ assert.match(html, /cloudTimerQuotaPauseActive\(\)/,
   'foreground recovery must suppress repeated cloud writes before quota reset');
 assert.match(serviceWorker, /isCloudTimerQuotaError\(err\)[\s\S]*cloudTimerQuotaRetryAt[\s\S]*return true;/,
   'service-worker recovery must preserve its local job when the daily quota is exhausted');
+assert.match(html, /async function registerNativeCloudTarget\([\s\S]*?clearCloudTimerQuotaPause\(\)/,
+  'a successful native re-registration must clear a stale local quota pause after storage migration');
 
 console.log('Cloud timer quota recovery tests passed.');

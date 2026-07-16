@@ -13,6 +13,9 @@ const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
 const PROACTIVE_DICE_MAX_ROLLS = 432;
+const MOMENT_DICE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const MOMENT_DICE_CHANCE = 0.10;
+const MOMENT_DICE_MAX_ROLLS = 56;
 let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {
@@ -1550,23 +1553,29 @@ function proactiveDelayMs(settings, kind = 'chat') {
 function proactiveJobMode(job) {
   return job?.mode === 'dice' ? 'dice' : 'planned';
 }
+function proactiveDiceOptions(kind = 'chat') {
+  return kind === 'moment'
+    ? { mode: 'dice', intervalMs: MOMENT_DICE_INTERVAL_MS, rollChance: MOMENT_DICE_CHANCE, maxRolls: MOMENT_DICE_MAX_ROLLS }
+    : { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE, maxRolls: PROACTIVE_DICE_MAX_ROLLS };
+}
 function proactiveDicePlan(options = {}, now = Date.now(), randomValue = Math.random()) {
   const intervalMs = Math.max(60000, Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS);
   const rawChance = Number(options.rollChance ?? PROACTIVE_DICE_CHANCE);
   const chance = Number.isFinite(rawChance) ? Math.max(0, Math.min(1, rawChance)) : PROACTIVE_DICE_CHANCE;
+  const maxRolls = Math.max(1, Math.floor(Number(options.maxRolls) || PROACTIVE_DICE_MAX_ROLLS));
   const rawRandom = Number(randomValue);
   const random = Number.isFinite(rawRandom) ? Math.max(0, Math.min(1 - Number.EPSILON, rawRandom)) : Math.random();
   let rolls = 1;
-  if (chance <= 0) rolls = PROACTIVE_DICE_MAX_ROLLS;
+  if (chance <= 0) rolls = maxRolls;
   else if (chance < 1) rolls = Math.floor(Math.log(1 - random) / Math.log(1 - chance)) + 1;
-  rolls = Math.max(1, Math.min(PROACTIVE_DICE_MAX_ROLLS, rolls));
+  rolls = Math.max(1, Math.min(maxRolls, rolls));
   const parsedNow = now instanceof Date ? now.getTime() : Number(now);
   const nowMs = Number.isFinite(parsedNow) ? parsedNow : Date.now();
-  return { dueAt: new Date(nowMs + rolls * intervalMs), rolls, intervalMs, rollChance: chance };
+  return { dueAt: new Date(nowMs + rolls * intervalMs), rolls, intervalMs, rollChance: chance, maxRolls };
 }
-function rollProactiveDice(job = null) {
+function rollProactiveDice(kind = 'chat', job = null) {
   if (job?.dicePrecomputed) return true;
-  const chance = Math.max(0, Math.min(1, Number(job?.rollChance ?? PROACTIVE_DICE_CHANCE) || 0));
+  const chance = Math.max(0, Math.min(1, Number(job?.rollChance ?? proactiveDiceOptions(kind).rollChance) || 0));
   return Math.random() < chance;
 }
 function proactiveJobId(settings, charId, kind = 'chat') {
@@ -1621,6 +1630,7 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
     chat[jobKey].diceIntervalMs = dicePlan.intervalMs;
     chat[jobKey].diceRolls = dicePlan.rolls;
     chat[jobKey].dicePrecomputed = true;
+    chat[jobKey].maxRolls = dicePlan.maxRolls;
   }
   try {
     const resp = await fetchWithTimeout(timerUrl(settings, '/schedule'), {
@@ -1685,7 +1695,7 @@ async function recoverProactivePushFailure(payload = {}, reason = null) {
   if (!charId || !chat) return false;
   try {
     if (!(await automaticTasksStillEnabled())) return false;
-    await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+    await scheduleNextCloudProactive(state, charId, kind, proactiveDiceOptions(kind));
     if (!(await automaticTasksStillEnabled())) return false;
     setStateCloudTimerStatus(state, `后台${kind === 'moment' ? '朋友圈' : '私聊'}生成失败：${shortErrorMessage(reason)}，已安排下次重试。`, kind);
     state.allChats = allChats;
@@ -1743,7 +1753,7 @@ async function handleProactivePush(payload) {
     const expectedMode = expectedProactiveChatMode(allChats[charId]);
     setStateCloudTimerTrace(state, kind, traceId, `忽略阶段不匹配的${proactiveJobMode(dueJob.job) === 'dice' ? '随机抽取' : '计划追发'}任务，已按当前会话改排为${expectedMode === 'dice' ? '随机抽取' : '计划追发'}。`);
     await scheduleNextCloudProactive(state, charId, kind, expectedMode === 'dice'
-      ? { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE }
+      ? proactiveDiceOptions(kind)
       : { mode: 'planned' });
     if (!(await automaticTasksStillEnabled())) return false;
     state.allChats = allChats;
@@ -1773,9 +1783,9 @@ async function handleProactivePush(payload) {
     });
     return;
   }
-  if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(dueJob.job || payload)) {
-    setStateCloudTimerTrace(state, kind, traceId, `后台骰子未抽中，本轮不生成${kind === 'moment' ? '朋友圈' : '私聊'}，10 分钟后再抽。`);
-    await scheduleNextCloudProactive(state, charId, kind, { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+  if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(kind, dueJob.job || payload)) {
+    setStateCloudTimerTrace(state, kind, traceId, `后台骰子未抽中，本轮不生成${kind === 'moment' ? '朋友圈，6 小时后再抽' : '私聊，10 分钟后再抽'}。`);
+    await scheduleNextCloudProactive(state, charId, kind, proactiveDiceOptions(kind));
     if (!(await automaticTasksStillEnabled())) return false;
     state.allChats = allChats;
     state.updatedAt = Date.now();
@@ -1842,7 +1852,7 @@ async function handleProactivePush(payload) {
   if (isEmptyReplyText(replyText)) {
     const emptyReason = lastModelResponseDiagnostic || '空回复';
     try {
-      await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+      await scheduleNextCloudProactive(state, charId, 'chat', proactiveDiceOptions('chat'));
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
@@ -1858,7 +1868,7 @@ async function handleProactivePush(payload) {
   const chunks = appendAssistantMessages(chat, replyText, { proactive: true, proactiveMode: triggerMode });
   if (!chunks.length) {
     try {
-      await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+      await scheduleNextCloudProactive(state, charId, 'chat', proactiveDiceOptions('chat'));
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
@@ -1876,7 +1886,7 @@ async function handleProactivePush(payload) {
   await updateBackgroundPaymentStatusFromReply(state, charId, replyText, paymentDirective?.status);
   if (!(await automaticTasksStillEnabled())) return false;
   try {
-    await scheduleNextCloudProactive(state, charId, 'chat', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+    await scheduleNextCloudProactive(state, charId, 'chat', proactiveDiceOptions('chat'));
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }
@@ -1951,7 +1961,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
   if (!text || isEmptyReplyText(text)) {
     const emptyReason = lastModelResponseDiagnostic || '空动态';
     try {
-      await scheduleNextCloudProactive(state, charId, 'moment', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+      await scheduleNextCloudProactive(state, charId, 'moment', proactiveDiceOptions('moment'));
     } catch (err) {
       console.warn('[AL Push] next schedule skipped:', err);
     }
@@ -1982,7 +1992,7 @@ async function handleProactiveMomentPush(state, charId, payload) {
     content: `【朋友圈事件】${char.name}在朋友圈发布动态：“${momentSnippet(text)}”`
   });
   try {
-    await scheduleNextCloudProactive(state, charId, 'moment', { mode: 'dice', intervalMs: PROACTIVE_DICE_INTERVAL_MS, rollChance: PROACTIVE_DICE_CHANCE });
+    await scheduleNextCloudProactive(state, charId, 'moment', proactiveDiceOptions('moment'));
   } catch (err) {
     console.warn('[AL Push] next schedule skipped:', err);
   }

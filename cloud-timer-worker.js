@@ -25,11 +25,10 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-15.15';
-const RECENT_EVENT_LIMIT = 40;
-const IDLE_CRON_HEARTBEAT_MINUTES = 60;
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-16.16';
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
 const FCM_ACK_MAX_ATTEMPTS = 8;
+let lastCronSummary = null;
 
 export default {
   async fetch(request, env) {
@@ -40,7 +39,7 @@ export default {
         return json({ ok: true, service: 'AL cloud timer', version: CLOUD_TIMER_WORKER_VERSION, cron: await getLastCron(env) });
       }
       if (request.method === 'GET' && url.pathname === '/logs') {
-        return json({ ok: true, events: await getRecentEvents(env) });
+        return json({ ok: true, events: [], source: 'workers-logs' });
       }
       if (request.method === 'POST' && url.pathname === '/register') {
         const body = await request.json();
@@ -48,16 +47,21 @@ export default {
         if (!body.deviceId || (!isFcm && !body.subscription?.endpoint) || (isFcm && !body.fcmToken)) {
           throw new Error('missing deviceId/push target');
         }
-        await env.AL_TIMER_KV.put(`sub:${body.deviceId}`, JSON.stringify({
+        const target = {
           deviceId: body.deviceId,
           transport: isFcm ? 'fcm' : 'webpush',
           fcmToken: isFcm ? String(body.fcmToken) : '',
           subscription: isFcm ? null : body.subscription,
           backgroundAck: isFcm ? Math.max(0, Number(body.capabilities?.backgroundAck) || 0) : 0,
           updatedAt: Date.now()
-        }));
-        logWorkerEvent('register', { deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', ok: true });
-        return json({ ok: true, transport: isFcm ? 'fcm' : 'webpush' });
+        };
+        const subscriptionKey = `sub:${body.deviceId}`;
+        const previousTargetRaw = await env.AL_TIMER_KV.get(subscriptionKey);
+        const previousTarget = previousTargetRaw ? JSON.parse(previousTargetRaw) : null;
+        const idempotent = samePushTarget(previousTarget, target);
+        if (!idempotent) await env.AL_TIMER_KV.put(subscriptionKey, JSON.stringify(target));
+        logWorkerEvent('register', { deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', idempotent, ok: true });
+        return json({ ok: true, transport: isFcm ? 'fcm' : 'webpush', idempotent });
       }
       if (request.method === 'POST' && url.pathname === '/schedule') {
         const body = await request.json();
@@ -79,9 +83,9 @@ export default {
           test: !!body.test,
           updatedAt: Date.now()
         };
-        await saveJob(job, env);
-        logWorkerEvent('schedule', { deviceId: shortId(job.deviceId), jobId: shortId(job.jobId), charId: shortId(job.charId), kind: job.kind, dueAt: job.dueAt, ok: true });
-        return json({ ok: true, dueMinute: minuteKey(dueAtMs) });
+        const saved = await saveJob(job, env);
+        logWorkerEvent('schedule', { deviceId: shortId(job.deviceId), jobId: shortId(job.jobId), charId: shortId(job.charId), kind: job.kind, dueAt: job.dueAt, idempotent: !!saved.idempotent, replacedJobId: shortId(saved.replacedJobId), ok: true });
+        return json({ ok: true, dueMinute: minuteKey(dueAtMs), idempotent: !!saved.idempotent, replacedJobId: saved.replacedJobId || '' });
       }
       if (request.method === 'POST' && url.pathname === '/job-status') {
         const body = await request.json();
@@ -197,35 +201,59 @@ async function runDueJobs(env) {
     throw err;
   } finally {
     summary.finishedAt = Date.now();
+    lastCronSummary = summary;
     const hasActivity = !summary.ok || summary.jobsSeen > 0 || summary.delivered > 0 || summary.retry > 0 || summary.failed > 0 || summary.missing > 0;
-    const heartbeatDue = nowMinute % IDLE_CRON_HEARTBEAT_MINUTES === 0;
-    if (hasActivity || heartbeatDue) {
-      await env.AL_TIMER_KV.put('meta:lastCron', JSON.stringify(summary), { expirationTtl: 3 * 24 * 60 * 60 });
-    }
-    if (hasActivity) {
-      await appendEvent(env, { type: 'cron', ok: summary.ok, buckets: summary.buckets, jobsSeen: summary.jobsSeen, delivered: summary.delivered, retry: summary.retry, failed: summary.failed, missing: summary.missing, error: summary.error });
-    }
+    if (hasActivity) logWorkerEvent('cron', { ok: summary.ok, buckets: summary.buckets, jobsSeen: summary.jobsSeen, delivered: summary.delivered, retry: summary.retry, failed: summary.failed, missing: summary.missing, error: summary.error });
   }
 }
 
 async function getLastCron(env) {
-  const raw = await env.AL_TIMER_KV.get('meta:lastCron');
-  return raw ? JSON.parse(raw) : null;
+  return lastCronSummary;
+}
+
+function logicalTaskKey(job) {
+  if (job?.test) return `active:test:${encodeURIComponent(String(job.deviceId || ''))}:${encodeURIComponent(String(job.jobId || ''))}`;
+  return `active:${encodeURIComponent(String(job.deviceId || ''))}:${encodeURIComponent(String(job.charId || ''))}:${encodeURIComponent(String(job.kind || 'chat'))}`;
+}
+
+function sameScheduledJob(left, right) {
+  if (!left || !right) return false;
+  const fields = ['deviceId', 'jobId', 'charId', 'dueAt', 'type', 'kind', 'mode', 'rollChance', 'diceIntervalMs', 'diceRolls', 'dicePrecomputed', 'test'];
+  return fields.every(field => (left[field] ?? null) === (right[field] ?? null));
+}
+
+function samePushTarget(left, right) {
+  if (!left || !right) return false;
+  return left.deviceId === right.deviceId
+    && left.transport === right.transport
+    && String(left.fcmToken || '') === String(right.fcmToken || '')
+    && Number(left.backgroundAck || 0) === Number(right.backgroundAck || 0)
+    && JSON.stringify(left.subscription || null) === JSON.stringify(right.subscription || null);
 }
 
 async function saveJob(job, env) {
+  const activeKey = logicalTaskKey(job);
+  const activeJobId = String(await env.AL_TIMER_KV.get(activeKey) || '');
   const previousRaw = await env.AL_TIMER_KV.get(`job:${job.jobId}`);
   const previous = previousRaw ? JSON.parse(previousRaw) : null;
+  if (activeJobId === job.jobId && sameScheduledJob(previous, job)) {
+    return { idempotent: true, replacedJobId: '' };
+  }
   const bucketKey = `due:${minuteKey(Date.parse(job.dueAt))}`;
+  await env.AL_TIMER_KV.put(`job:${job.jobId}`, JSON.stringify(job));
+  const raw = await env.AL_TIMER_KV.get(bucketKey);
+  const ids = raw ? JSON.parse(raw) : [];
+  if (!ids.includes(job.jobId)) {
+    ids.push(job.jobId);
+    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
+  }
+  if (activeJobId !== job.jobId) await env.AL_TIMER_KV.put(activeKey, job.jobId);
   if (previous?.dueAt) {
     const previousBucketKey = `due:${minuteKey(Date.parse(previous.dueAt))}`;
     if (previousBucketKey !== bucketKey) await removeJobFromBucket(previousBucketKey, job.jobId, env);
   }
-  await env.AL_TIMER_KV.put(`job:${job.jobId}`, JSON.stringify(job));
-  const raw = await env.AL_TIMER_KV.get(bucketKey);
-  const ids = raw ? JSON.parse(raw) : [];
-  if (!ids.includes(job.jobId)) ids.push(job.jobId);
-  await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
+  if (activeJobId && activeJobId !== job.jobId) await cancelJob(activeJobId, env);
+  return { idempotent: false, replacedJobId: activeJobId && activeJobId !== job.jobId ? activeJobId : '' };
 }
 
 async function removeJobFromBucket(bucketKey, jobId, env) {
@@ -247,6 +275,8 @@ async function cancelJob(jobId, env) {
     if (Number.isFinite(dueAtMs)) {
       await removeJobFromBucket(`due:${minuteKey(dueAtMs)}`, jobId, env);
     }
+    const activeKey = logicalTaskKey(job);
+    if (await env.AL_TIMER_KV.get(activeKey) === jobId) await env.AL_TIMER_KV.delete(activeKey);
   }
   await env.AL_TIMER_KV.delete(`job:${jobId}`);
 }
@@ -286,7 +316,7 @@ async function cancelDeviceAutomaticTasks(deviceId, env) {
       const raw = await env.AL_TIMER_KV.get(key);
       const job = raw ? JSON.parse(raw) : null;
       if (!job || job.deviceId !== deviceId || job.test) continue;
-      await env.AL_TIMER_KV.delete(key);
+      await cancelJob(job.jobId, env);
       if (row.kind === 'moment') momentJobsDeleted += 1;
       else chatJobsDeleted += 1;
     }
@@ -377,9 +407,15 @@ async function runDueMinute(env, minute) {
       continue;
     }
     const dueAtMs = Date.parse(job.dueAt);
+    const activeJobId = String(await env.AL_TIMER_KV.get(logicalTaskKey(job)) || '');
+    if (activeJobId && activeJobId !== job.jobId) {
+      stats.missing += 1;
+      await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
+      continue;
+    }
     if (dueAtMs > now) {
       stats.future += 1;
-      remaining.push(jobId);
+      if (minuteKey(dueAtMs) === minute) remaining.push(jobId);
       continue;
     }
     try {
@@ -396,7 +432,7 @@ async function runDueMinute(env, minute) {
       } else {
         if (delivered.ok) stats.delivered += 1;
         else stats.failed += 1;
-        await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
+        await clearJobRecord(job, env);
       }
     } catch (err) {
       console.warn(`deliver failed for ${jobId}:`, err.message);
@@ -412,6 +448,12 @@ async function runDueMinute(env, minute) {
     await env.AL_TIMER_KV.delete(bucketKey);
   }
   return stats;
+}
+
+async function clearJobRecord(job, env) {
+  await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
+  const activeKey = logicalTaskKey(job);
+  if (await env.AL_TIMER_KV.get(activeKey) === job.jobId) await env.AL_TIMER_KV.delete(activeKey);
 }
 
 function minuteKey(ms) {
@@ -492,22 +534,11 @@ async function deliverJob(job, env) {
 }
 
 async function getRecentEvents(env) {
-  const raw = await env.AL_TIMER_KV.get('meta:recentEvents');
-  return raw ? JSON.parse(raw) : [];
+  return [];
 }
 
 async function appendEvent(env, event) {
-  try {
-    const events = await getRecentEvents(env);
-    events.unshift({
-      at: Date.now(),
-      version: CLOUD_TIMER_WORKER_VERSION,
-      ...event
-    });
-    await env.AL_TIMER_KV.put('meta:recentEvents', JSON.stringify(events.slice(0, RECENT_EVENT_LIMIT)), { expirationTtl: 3 * 24 * 60 * 60 });
-  } catch (err) {
-    console.warn('append event failed:', err?.message || err);
-  }
+  logWorkerEvent(event?.type || 'event', { at: Date.now(), ...event }, event?.ok === false ? 'error' : 'log');
 }
 
 function shortId(value) {

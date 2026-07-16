@@ -3,11 +3,15 @@ main = "cloud-timer-worker.js"
 compatibility_date = "2024-11-01"
 
 kv_namespaces = [
-  { binding = "AL_TIMER_KV", id = "d549d4c0d3574641967988ef7079c208" }
+  { binding = "AL_TIMER_KV", id = "02034f8dcc6a437cb8d9659494a583ec" }
 ]
 
 [triggers]
 crons = ["* * * * *"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
 
 [vars]
 VAPID_PUBLIC_KEY = "BNzA_JE2_aSM3ycOIBEOxUfRnzibroYhE_wFNI8c1o4V2E5Ni_uJ5FUbOuXzI8NiyUqpPq2zsMImafstxZQT9QI"

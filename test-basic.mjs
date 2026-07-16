@@ -98,7 +98,7 @@ assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
 assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');
 assert.match(html, /async function scheduleCloudProactive[\s\S]{0,5000}syncNativeProactiveSnapshot\(/, 'native snapshot must exist before a cloud timer is scheduled');
-assert.match(html, /if \(!force && hasFutureCloudJob\(chat, kind\)\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must receive native snapshots after an app upgrade');
+assert.match(html, /if \(!force && hasFutureCloudJob\(chat, kind\) && proactiveJobUsesCurrentDicePolicy\(kind, chat\[proactiveJobKey\(kind\)\]\)\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must receive native snapshots after an app upgrade');
 assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_push_queue/, 'FCM must wake the Room execution engine directly');
 assert.match(androidFcmService, /latestSnapshot\(/);
 assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'FCM must reject a cloud job replaced by a newer snapshot');
@@ -121,7 +121,7 @@ assert.match(swScript, /const CACHE_NAME = 'rpchat-v89';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-15\.85';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-16\.86';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(script, /sendTemperature:\s*settings\.chatTemperatureEnabled !== false/, 'native chat config must persist the temperature switch');
@@ -284,6 +284,12 @@ assert.equal(appCloudTimerVersion, healthCloudTimerVersion, 'app and health chec
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
 assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
 assert.match(script, /const PROACTIVE_DICE_MAX_ROLLS = 432;/);
+assert.match(script, /const MOMENT_DICE_INTERVAL_MS = 6 \* 60 \* 60 \* 1000;/);
+assert.match(script, /const MOMENT_DICE_CHANCE = 0\.10;/);
+assert.match(script, /const MOMENT_DICE_MAX_ROLLS = 56;/);
+assert.match(swScript, /const MOMENT_DICE_INTERVAL_MS = 6 \* 60 \* 60 \* 1000;/);
+assert.match(swScript, /const MOMENT_DICE_CHANCE = 0\.10;/);
+assert.match(swScript, /const MOMENT_DICE_MAX_ROLLS = 56;/);
 assert.match(script, /const CLOUD_TIMER_RESYNC_MS = 60 \* 60 \* 1000;/);
 assert.match(script, /function proactiveDicePlan\(options = \{\}, now = Date\.now\(\), randomValue = Math\.random\(\)\)/);
 assert.match(swScript, /function proactiveDicePlan\(options = \{\}, now = Date\.now\(\), randomValue = Math\.random\(\)\)/);
@@ -369,7 +375,7 @@ assert.match(swScript, /jobId: previousJob\.jobId/);
 assert.match(script, /async function ensureLocalProactiveScheduled\(\)/);
 assert.match(script, /await ensureLocalProactiveScheduled\(\);\s*await catchUpDueCloudProactive\(\);/);
 const visibleHandoffIndex = swScript.indexOf("if (await hasVisibleClient())");
-const backgroundDiceIndex = swScript.indexOf("if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(dueJob.job || payload))");
+const backgroundDiceIndex = swScript.indexOf("if (proactiveJobMode(dueJob.job || payload) === 'dice' && !rollProactiveDice(kind, dueJob.job || payload))");
 assert.ok(visibleHandoffIndex >= 0 && backgroundDiceIndex > visibleHandoffIndex, '页面可见时应只由前台抽一次骰子');
 assert.match(script, /function rollProactiveDice\(kind = 'chat', job = null\)/);
 assert.match(script, /骰子未抽中/);
@@ -601,7 +607,7 @@ const runDueJobsSource = cloudTimerWorkerCode.slice(
   cloudTimerWorkerCode.indexOf('async function getLastCron')
 );
 assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-15\.15';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-16\.16';/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
@@ -609,13 +615,12 @@ assert.match(cloudTimerWorker, /async function deferForFcmAck/);
 assert.match(cloudTimerWorker, /awaitingAck: result\.transport === 'fcm' && Number\(target\.backgroundAck\) >= 1/);
 assert.match(cloudTimerWorker, /firebase\.messaging/);
 assert.match(script, /async function enableNativeCloudTimer/);
-assert.match(cloudTimerWorker, /const IDLE_CRON_HEARTBEAT_MINUTES = 60;/);
 assert.match(cloudTimerWorker, /const JOB_BUCKET_TTL_SECONDS = 7 \* 24 \* 60 \* 60;/);
 assert.match(cloudTimerWorker, /const hasActivity = !summary\.ok \|\| summary\.jobsSeen > 0/);
-assert.match(cloudTimerWorker, /const heartbeatDue = nowMinute % IDLE_CRON_HEARTBEAT_MINUTES === 0;/);
-assert.match(cloudTimerWorker, /if \(hasActivity \|\| heartbeatDue\)/);
-assert.match(cloudTimerWorker, /if \(hasActivity\) \{\s*await appendEvent/);
-assert.equal((cloudTimerWorker.match(/expirationTtl: JOB_BUCKET_TTL_SECONDS/g) || []).length, 4);
+assert.doesNotMatch(runDueJobsSource, /AL_TIMER_KV\.put/, 'cron health and logs must not consume KV writes');
+assert.match(cloudTimerWorker, /if \(hasActivity\) logWorkerEvent\('cron'/);
+assert.doesNotMatch(cloudTimerWorker, /meta:lastCron|meta:recentEvents/);
+assert.ok((cloudTimerWorker.match(/expirationTtl: JOB_BUCKET_TTL_SECONDS/g) || []).length >= 3);
 assert.match(cloudTimerWorker, /version: CLOUD_TIMER_WORKER_VERSION/);
 assert.match(cloudTimerWorker, /mode: body\.mode === 'dice' \? 'dice' : 'planned'/);
 assert.match(cloudTimerWorker, /rollChance: job\.rollChance/);
@@ -660,8 +665,8 @@ assert.equal(ackResponse.status, 200);
 assert.equal(ackStore.has('job:ack-job'), false, '手机成功回执后必须删除云端任务');
 assert.equal(ackStore.has(`due:${ackMinute}`), false, '手机成功回执后必须移出到期桶');
 assert.match(cloudTimerWorker, /url\.pathname === '\/logs'/);
-assert.match(cloudTimerWorker, /meta:recentEvents/);
 assert.match(cloudTimerWorker, /async function appendEvent\(env, event\)/);
+assert.match(cloudTimerWorker, /source: 'workers-logs'/);
 assert.match(cloudTimerWorker, /async function sendEncryptedPush\(subscription, env, payload = \{\}\)/);
 assert.match(cloudTimerWorker, /async function encryptPushPayload\(subscription, payloadText\)/);
 assert.match(cloudTimerWorker, /'Content-Encoding': 'aes128gcm'/);
@@ -675,7 +680,7 @@ assert.match(cloudTimerDeployScript, /WRANGLER_CMD/);
 assert.match(wranglerRunScript, /Tools\\\\bin\\\\wrangler\.cmd/);
 assert.match(wranglerRunScript, /Missing CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-15\.15'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-16\.16'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);
@@ -683,8 +688,8 @@ assert.match(cloudTimerDeployDoc, /AL_TIMER_ENDPOINT/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy:raw/);
 assert.match(cloudTimerDeployDoc, /job=存在/);
 assert.match(cloudTimerDeployDoc, /Cron 核验/);
-assert.match(cloudTimerWorker, /meta:lastCron/);
 assert.match(cloudTimerWorker, /async function getLastCron\(env\)/);
+assert.match(cloudTimerWorker, /let lastCronSummary = null/);
 assert.match(script, /function formatCloudCronStatus\(cron\)/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/job-status'/);
 assert.match(cloudTimerWorker, /async function jobStatus\(jobId, deviceId, env\)/);
@@ -905,6 +910,7 @@ globalThis.__appTest = {
   proactiveJobId,
   proactiveDefaultScheduleOptions,
   proactiveDicePlan,
+  proactiveJobUsesCurrentDicePolicy,
   buildAndroidUserReplyTask,
   retryFailedReply,
   extractAssistantPaymentDirective,
@@ -916,7 +922,7 @@ globalThis.__appTest = {
   RP_PRESETS,
 };`, context);
 
-const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
+const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, proactiveJobUsesCurrentDicePolicy, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
 
 const automaticCleanupProbe = vm.runInContext(`(() => {
   const currentSettings = {
@@ -1989,7 +1995,11 @@ assert.notEqual(proactiveJobA, proactiveJobB, '连续安排必须使用不同任
 assert.match(proactiveJobA, /^pro_.*_char_timer_test_[a-z0-9]+_[a-z0-9]+$/);
 assert.equal(proactiveDefaultScheduleOptions('chat').mode, 'planned');
 assert.equal(proactiveDefaultScheduleOptions('moment').mode, 'dice');
-assert.equal(proactiveDefaultScheduleOptions('moment').rollChance, 0.05);
+assert.equal(proactiveDefaultScheduleOptions('moment').intervalMs, 6 * 60 * 60 * 1000);
+assert.equal(proactiveDefaultScheduleOptions('moment').rollChance, 0.10);
+assert.equal(proactiveDefaultScheduleOptions('moment').maxRolls, 56);
+assert.equal(proactiveJobUsesCurrentDicePolicy('moment', { mode: 'dice', diceIntervalMs: 600000, rollChance: 0.05, maxRolls: 432 }), false, '旧朋友圈骰子任务必须在升级后重排');
+assert.equal(proactiveJobUsesCurrentDicePolicy('moment', { mode: 'dice', diceIntervalMs: 6 * 60 * 60 * 1000, rollChance: 0.10, maxRolls: 56 }), true, '新朋友圈骰子任务不得重复重排');
 const firstDiceRoll = proactiveDicePlan({ intervalMs: 600000, rollChance: 0.05 }, 0, 0);
 assert.equal(firstDiceRoll.rolls, 1);
 assert.equal(firstDiceRoll.dueAt.getTime(), 600000);
@@ -1998,6 +2008,9 @@ assert.equal(medianDiceRoll.rolls, 14, '5% 独立抽签的中位命中轮次应�
 assert.equal(medianDiceRoll.dueAt.getTime(), 14 * 600000);
 assert.equal(proactiveDicePlan({ rollChance: 1 }, 0, 0.99).rolls, 1);
 assert.equal(proactiveDicePlan({ rollChance: 0 }, 0, 0.99).rolls, 432, '零概率和极端尾部必须受最长三天保护');
+const latestMomentPlan = proactiveDicePlan(proactiveDefaultScheduleOptions('moment'), 0, 1 - Number.EPSILON);
+assert.equal(latestMomentPlan.rolls, 56, '朋友圈随机等待最长只能达到 56 轮');
+assert.equal(latestMomentPlan.dueAt.getTime(), 14 * 24 * 60 * 60 * 1000, '朋友圈最迟必须在 14 天时触发');
 const diceScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;
@@ -2019,6 +2032,20 @@ assert.equal(diceScheduleProbe.job.rollChance, 0.05);
 assert.equal(diceScheduleProbe.job.diceIntervalMs, 600000);
 assert.ok(Math.abs(Date.parse(diceScheduleProbe.job.dueAt) - diceScheduleProbe.startedAt - diceScheduleProbe.job.diceRolls * 600000) < 2000);
 assert.equal(diceScheduleProbe.legacyZeroChanceResult, false, '旧骰子任务仍需在到点时兼容抽签');
+const momentDiceScheduleProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedChats = allChats;
+  settings = { ...settings, proactiveEnabled: true, cloudTimerEnabled: false, deviceId: 'moment-dice-device' };
+  allChats = { moment_dice_char: { messages: [{ role: 'user', content: '测试朋友圈随机任务', time: Date.now() }] } };
+  await scheduleDiceProactive('moment_dice_char', 'moment');
+  const job = { ...allChats.moment_dice_char.pendingMomentJob };
+  settings = savedSettings;
+  allChats = savedChats;
+  return job;
+})()`, context);
+assert.equal(momentDiceScheduleProbe.rollChance, 0.10);
+assert.equal(momentDiceScheduleProbe.diceIntervalMs, 6 * 60 * 60 * 1000);
+assert.ok(momentDiceScheduleProbe.diceRolls >= 1 && momentDiceScheduleProbe.diceRolls <= 56);
 assert.equal(diceScheduleProbe.precomputedZeroChanceResult, true, '预抽任务到点后不得再次抽签');
 const proactiveChat = {
   messages: [
