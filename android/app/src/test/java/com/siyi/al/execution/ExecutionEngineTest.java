@@ -47,6 +47,31 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void ordinaryDrainResumesMemoryDoneAtChatStage() throws Exception {
+        FakeStore store = new FakeStore(turn("MEMORY_DONE", null), attempt("MEMORY_DONE", null));
+        store.attempt.memoryResult = "已筛选记忆";
+        RecordingGateway gateway = new RecordingGateway();
+        ExecutionEngine engine = engine(store, gateway);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(Collections.singletonList("chat"), gateway.calls);
+        assertEquals(TurnState.COMPLETED.name(), store.turn.state);
+    }
+
+    @Test
+    public void ordinaryDrainCommitsChatDoneWithoutCallingModel() throws Exception {
+        FakeStore store = new FakeStore(turn("CHAT_DONE", "已经生成😊"), attempt("CHAT_DONE", "已经生成😊"));
+        RecordingGateway gateway = new RecordingGateway();
+        ExecutionEngine engine = engine(store, gateway);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(0, gateway.calls.size());
+        assertEquals(TurnState.COMPLETED.name(), store.turn.state);
+    }
+
+    @Test
     public void processDeathDuringUnknownChatCallBecomesInterrupted() throws Exception {
         FakeStore store = new FakeStore(turn("CHAT_RUNNING", null), attempt("CHAT_RUNNING", null));
         RecordingGateway gateway = new RecordingGateway();
@@ -145,7 +170,10 @@ public class ExecutionEngineTest {
         }
 
         @Override public ChatTurnEntity claimNext(long now) {
-            return TurnState.QUEUED.name().equals(turn.state) ? turn : null;
+            TurnState state = TurnState.valueOf(turn.state);
+            return state == TurnState.QUEUED || state == TurnState.MEMORY_DONE || state == TurnState.CHAT_DONE
+                ? turn
+                : null;
         }
 
         @Override public List<ExecutionAttemptEntity> recoverableAttempts() {

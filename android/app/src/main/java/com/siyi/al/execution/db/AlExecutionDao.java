@@ -46,8 +46,8 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM execution_attempts WHERE turnId = :turnId ORDER BY sequence DESC")
     List<ExecutionAttemptEntity> attempts(String turnId);
 
-    @Query("SELECT * FROM chat_turns WHERE state = 'QUEUED' AND deletedAt IS NULL ORDER BY CASE kind WHEN 'DIRECT_REPLY' THEN 0 WHEN 'PROACTIVE_CHAT' THEN 1 ELSE 2 END, createdAt ASC LIMIT 1")
-    ChatTurnEntity nextQueuedTurn();
+    @Query("SELECT * FROM chat_turns WHERE state IN ('QUEUED','MEMORY_DONE','CHAT_DONE') AND deletedAt IS NULL ORDER BY CASE kind WHEN 'DIRECT_REPLY' THEN 0 WHEN 'PROACTIVE_CHAT' THEN 1 ELSE 2 END, createdAt ASC LIMIT 1")
+    ChatTurnEntity nextRunnableTurn();
 
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT 50")
     List<ChatTurnEntity> completedTurns();

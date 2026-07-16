@@ -190,7 +190,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     @Override
     public ChatTurnEntity claimNext(long now) {
-        return dao.nextQueuedTurn();
+        return dao.nextRunnableTurn();
     }
 
     @Override
