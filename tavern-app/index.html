@@ -887,6 +887,7 @@ button.cell:active{background:#ececec}
 </div>
 
 <script src="lib/api-endpoint.js"></script>
+<script src="./lib/role-plan-domain.js"></script>
 <script>
 const DB = {
   get(k, def = null) { try { const v = localStorage.getItem('rpchat_' + k) ?? localStorage.getItem('tavern_' + k); return v ? JSON.parse(v) : def } catch { return def } },
