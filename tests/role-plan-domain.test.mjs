@@ -121,3 +121,17 @@ test('returns only current role schedules as prompt context', () => {
   assert.equal(rows.length, 1);
   assert.equal(rows[0].planId, 'work');
 });
+
+test('resuming a missed recurring plan advances it to a future occurrence', () => {
+  const now = Date.parse('2026-07-18T10:00:00+08:00');
+  const plans = [{
+    planId: 'daily', characterId: 'char-a', type: 'private_message', source: 'spoken', status: 'paused',
+    title: '早安', intent: '每天早安', schedule: { kind: 'daily', time: '09:00' },
+    nextRunAt: Date.parse('2026-07-17T09:00:00+08:00')
+  }];
+  const result = domain.applyOperations(plans, [], [{ op: 'resume', planId: 'daily' }], {
+    charId: 'char-a', now, uid: () => 'history-resume'
+  });
+  assert.equal(result.plans[0].status, 'active');
+  assert.equal(result.plans[0].nextRunAt, Date.parse('2026-07-19T09:00:00+08:00'));
+});

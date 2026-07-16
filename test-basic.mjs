@@ -7,6 +7,7 @@ process.env.TZ = 'Asia/Shanghai';
 const html = readFileSync('tavern-app/index.html', 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
 const apiEndpointHelper = readFileSync('tavern-app/lib/api-endpoint.js', 'utf8');
+const rolePlanDomain = readFileSync('tavern-app/lib/role-plan-domain.js', 'utf8');
 assert.ok(script, 'index.html should contain an inline app script');
 const swScript = readFileSync('tavern-app/sw-v11.js', 'utf8');
 const cloudTimerWorker = readFileSync('cloud-timer-worker.js', 'utf8');
@@ -34,6 +35,8 @@ const executionServicePath = 'android/app/src/main/java/com/siyi/al/execution/Al
 const retryPolicyPath = 'android/app/src/main/java/com/siyi/al/execution/RetryPolicy.java';
 const bootReceiverPath = 'android/app/src/main/java/com/siyi/al/execution/AlBootReceiver.java';
 const executionPluginPath = 'android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java';
+const rolePlanEntityPath = 'android/app/src/main/java/com/siyi/al/execution/db/RolePlanEntity.java';
+const rolePlanHistoryEntityPath = 'android/app/src/main/java/com/siyi/al/execution/db/RolePlanHistoryEntity.java';
 assert.match(androidVariablesGradle, /roomVersion\s*=\s*'2\.8\.4'/);
 assert.match(androidBuildGradle, /androidx\.room:room-runtime:\$roomVersion/);
 assert.match(androidBuildGradle, /annotationProcessor\s+"androidx\.room:room-compiler:\$roomVersion"/);
@@ -44,6 +47,8 @@ assert.ok(existsSync(secretStorePath), 'native encrypted API secret store should
 assert.ok(existsSync(executionServicePath), 'sticky native execution service should exist');
 assert.ok(existsSync(bootReceiverPath), 'boot recovery receiver should exist');
 assert.ok(existsSync(executionPluginPath), 'native execution Capacitor bridge should exist');
+assert.ok(existsSync(rolePlanEntityPath), 'role plans should survive WebView restarts in Room');
+assert.ok(existsSync(rolePlanHistoryEntityPath), 'role plan mutations should retain local history in Room');
 const executionDao = existsSync(executionDaoPath) ? readFileSync(executionDaoPath, 'utf8') : '';
 const executionStore = existsSync(executionStorePath) ? readFileSync(executionStorePath, 'utf8') : '';
 const secretStore = existsSync(secretStorePath) ? readFileSync(secretStorePath, 'utf8') : '';
@@ -71,6 +76,8 @@ assert.match(executionService, /completedTurns\(/);
 assert.match(executionService, /messageNotification\(/);
 assert.match(executionService, /acknowledgeCloudTurn\(/, 'completed native cloud turns must acknowledge the Worker');
 assert.match(executionService, /\/ack/, 'native cloud acknowledgement must use the Worker ack endpoint');
+assert.match(executionService, /continueRolePlan\(/, 'recurring role plans must schedule their next occurrence without reopening the WebView');
+assert.match(executionService, /ROLE_PLAN_MOMENT/, 'role-plan moment acknowledgements must retain their output kind');
 assert.match(androidMainActivity, /registerPlugin\(AlExecutionPlugin\.class\)/);
 assert.equal(packageJson.dependencies?.['@capacitor/background-runner'], undefined, 'unstable QuickJS background runner must not ship beside the Room execution engine');
 assert.equal(capacitorConfig.plugins?.BackgroundRunner, undefined, 'Capacitor config must not instantiate the retired QuickJS runner');
@@ -80,13 +87,16 @@ assert.equal(existsSync(androidReplyQueuePath), false, 'retired RunnerWorker bri
 assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS runner source must be removed');
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
-for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics']) {
+for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*3[\s\S]*MIGRATION_2_3/, 'Room must migrate existing installs without destructive reset');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
+assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
 assert.match(executionDao, /state\s*=\s*'COMPLETED'[\s\S]{0,240}uiAppliedAt\s+IS\s+NULL/, 'Room must keep a durable inbox of completed turns not yet applied to the UI');
 assert.match(executionDao, /acknowledgeUiApplied/, 'Room must expose an explicit UI acknowledgement');
 assert.match(executionPlugin, /unappliedCompletedTurns[\s\S]{0,1800}turnResult/, 'native bridge must return full unapplied turn results');
+assert.match(executionPlugin, /result\.put\("inputJson",\s*turn\.inputJson\)/, 'native role-plan results must expose their minimal occurrence identifiers');
 assert.match(html, /plugin\.unappliedCompletedTurns\(/, 'foreground reconciliation must scan the durable native UI inbox');
 assert.match(html, /await\s+plugin\.acknowledgeUiApplied\(/, 'the web UI must acknowledge a native result only after applying it');
 assert.match(html, /function\s+nativeExecutionPlugin\(\)/, 'web UI should use the native Room execution bridge');
@@ -94,7 +104,7 @@ assert.match(html, /nativeExecutionPlugin\(\)[\s\S]{0,12000}\.submitTurn\(/, 'na
 assert.match(script, /const MAX_CHAT_OUTPUT_TOKENS = 8192;/, 'all chat paths should share a high output-token ceiling');
 assert.match(script, /maxTokens:\s*MAX_CHAT_OUTPUT_TOKENS/, 'new settings should default to the shared high output limit');
 assert.match(script, /chatMaxTokens:\s*normalizedChatMaxTokens\(settings\.maxTokens\)/, 'native user replies should inherit the shared high output limit');
-assert.equal((script.match(/chatMaxTokens:\s*normalizedChatMaxTokens\(settings\.maxTokens\)/g) || []).length, 2, 'native user, proactive, and moment replies should use the same high output limit');
+assert.equal((script.match(/chatMaxTokens:\s*normalizedChatMaxTokens\(settings\.maxTokens\)/g) || []).length, 3, 'native user, proactive, moment, and role-plan replies should use the same high output limit');
 assert.match(script, /max_tokens:\s*normalizedChatMaxTokens\(settings\.maxTokens\)/, 'foreground API calls should use the same high output limit');
 const nativeQueueBody = html.match(/async function queueAndroidUserReply\([\s\S]*?\n}\nasync function mirrorAppStateNow/)?.[0] || '';
 assert.doesNotMatch(nativeQueueBody, /nativeBackgroundRunner\(|AlReplyQueue|dispatchEvent\(/, 'native user replies must not fork into the legacy runner queue');
@@ -112,10 +122,12 @@ assert.match(androidFcmService, /latestSnapshot\(/);
 assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'FCM must reject a cloud job replaced by a newer snapshot');
 assert.match(androidFcmService, /submitTurn\(/);
 assert.match(androidFcmService, /AlExecutionService\.requestRun\(/);
+assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'stale role-plan cloud wakes must be rejected after a plan is rescheduled');
 assert.match(html, /async function reconcileNativeExecutionTurns[\s\S]{0,2500}plugin\.changesSince\(/, 'web UI must consume Room changes created while WebView was absent');
 assert.match(retryPolicy, /SocketException[\s\S]*NETWORK_INTERRUPTED[\s\S]*true/, 'native execution must retain retryable connection interruptions');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_CHAT/, 'native proactive chat results must be applied to chat UI');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_MOMENT/, 'native proactive moment results must be applied to moments UI');
+assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,1200}ROLE_PLAN_CHAT/, 'native role-plan results must be applied through the durable UI inbox');
 const foregroundSyncSource = html.slice(
   html.indexOf('async function syncFromServiceWorkerState('),
   html.indexOf('async function bootApp()')
@@ -125,7 +137,8 @@ assert.ok(
   'foreground restore must consume Room execution results after older web mirrors so completed replies always win'
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v92';/);
+assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v93';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -133,12 +146,20 @@ assert.match(html, /<script src="\.\/lib\/role-plan-repository\.js"><\/script>/,
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-repository\.js[^\]]*\]/, 'role plan repository must be available offline');
 assert.match(script, /function getRolePlanRepository\(\)/, 'app must create one role plan repository over native Room or IndexedDB');
 assert.match(script, /async function applyRolePlanOperations\(/, 'chat and native results must persist hidden plan operations');
+assert.match(script, /async function syncRolePlanCloudJobs\(/, 'effective role plans must receive independent cloud wakes');
+assert.match(rolePlanDomain, /occurrenceId[\s\S]{0,500}type:\s*'role-plan'/, 'role-plan cloud payload must carry its idempotent occurrence identifier');
+assert.match(script, /rolePlanSnapshotId\(charId, plan\.planId\)/, 'Android must receive a stable per-plan execution snapshot');
 assert.match(script, /role-plan-contract/, 'chat prompt must describe the hidden role plan contract');
 assert.match(script, /const rolePlanDirective = extractRolePlanDirective\(reply\)[\s\S]{0,1800}applyRolePlanOperations\(/, 'foreground replies must apply their hidden plans after reply persistence');
 assert.match(script, /parts\.filter\(part => part\.type === 'PLAN'\)/, 'native reply plan parts must be reconciled into the schedule');
+assert.match(html, /id="screen-role-plans"/, 'character settings must expose a dedicated schedule screen');
+assert.match(html, /onclick="openRolePlans\(/, 'character profile and chat settings should open the schedule');
+assert.match(script, /async function renderRolePlansScreen\(/, 'the schedule screen must render persisted plans');
+assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be able to pause, resume, and cancel plans');
+assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-16\.88';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-16\.89';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(script, /sendTemperature:\s*settings\.chatTemperatureEnabled !== false/, 'native chat config must persist the temperature switch');
@@ -624,7 +645,7 @@ const runDueJobsSource = cloudTimerWorkerCode.slice(
   cloudTimerWorkerCode.indexOf('async function getLastCron')
 );
 assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-16\.16';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-16\.17';/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
@@ -697,7 +718,7 @@ assert.match(cloudTimerDeployScript, /WRANGLER_CMD/);
 assert.match(wranglerRunScript, /Tools\\\\bin\\\\wrangler\.cmd/);
 assert.match(wranglerRunScript, /Missing CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-16\.16'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-16\.17'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);

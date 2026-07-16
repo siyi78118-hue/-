@@ -9,6 +9,10 @@ import org.junit.Test;
 
 public class AlFirebaseMessagingServiceTest {
     @Test
+    public void rolePlanSnapshotUsesStablePlanIdentifier() {
+        assertEquals("char-a:role-plan:plan-a", AlFirebaseMessagingService.rolePlanSnapshotId("char-a", "plan-a"));
+    }
+    @Test
     public void cloudJobUsesJobSpecificSnapshotId() {
         assertEquals(
             "char-1:chat:pro-123",

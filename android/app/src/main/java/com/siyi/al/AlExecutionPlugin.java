@@ -21,10 +21,15 @@ import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import com.siyi.al.execution.db.RolePlanEntity;
+import com.siyi.al.execution.db.RolePlanHistoryEntity;
 import com.siyi.al.execution.secure.AlSecretStore;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 @CapacitorPlugin(name = "AlExecution")
 public final class AlExecutionPlugin extends Plugin {
@@ -228,12 +233,82 @@ public final class AlExecutionPlugin extends Plugin {
         });
     }
 
+    @PluginMethod
+    public void listRolePlans(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            Boolean includeTerminal = call.getBoolean("includeTerminal", true);
+            JSArray plans = new JSArray();
+            for (RolePlanEntity row : AlExecutionDatabase.get(getContext()).executionDao().rolePlans(characterId)) {
+                if (Boolean.FALSE.equals(includeTerminal) && ("completed".equals(row.status) || "cancelled".equals(row.status))) continue;
+                plans.put(new JSObject(row.planJson));
+            }
+            JSObject result = new JSObject();
+            result.put("plans", plans);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void replaceRolePlans(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            JSONArray planValues = new JSONArray(call.getString("plansJson", "[]"));
+            JSONArray historyValues = new JSONArray(call.getString("historyJson", "[]"));
+            List<RolePlanEntity> plans = new ArrayList<>();
+            List<RolePlanHistoryEntity> history = new ArrayList<>();
+            for (int index = 0; index < planValues.length(); index += 1) {
+                JSONObject value = planValues.getJSONObject(index);
+                RolePlanEntity row = new RolePlanEntity();
+                row.planId = requiredJson(value, "planId");
+                row.characterId = characterId;
+                row.status = value.optString("status", "active");
+                row.planJson = value.toString();
+                row.nextRunAt = value.has("nextRunAt") && !value.isNull("nextRunAt") ? value.optLong("nextRunAt") : null;
+                row.updatedAt = value.optLong("updatedAt", System.currentTimeMillis());
+                plans.add(row);
+            }
+            for (int index = 0; index < historyValues.length(); index += 1) {
+                JSONObject value = historyValues.getJSONObject(index);
+                RolePlanHistoryEntity row = new RolePlanHistoryEntity();
+                row.historyId = requiredJson(value, "historyId");
+                row.planId = requiredJson(value, "planId");
+                row.historyJson = value.toString();
+                row.createdAt = value.optLong("createdAt", System.currentTimeMillis());
+                history.add(row);
+            }
+            AlExecutionDatabase.get(getContext()).executionDao().replaceRolePlans(characterId, plans, history);
+            JSObject result = new JSObject();
+            result.put("saved", true);
+            result.put("count", plans.size());
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void rolePlanHistory(PluginCall call) {
+        execute(call, () -> {
+            String planId = required(call, "planId");
+            Integer requestedLimit = call.getInt("limit", 100);
+            int limit = Math.max(1, Math.min(requestedLimit == null ? 100 : requestedLimit, 200));
+            JSArray history = new JSArray();
+            for (RolePlanHistoryEntity row : AlExecutionDatabase.get(getContext()).executionDao().rolePlanHistory(planId, limit)) {
+                history.put(new JSObject(row.historyJson));
+            }
+            JSObject result = new JSObject();
+            result.put("history", history);
+            return result;
+        });
+    }
+
     private JSObject turnResult(ChatTurnEntity turn) {
         JSObject result = new JSObject();
         result.put("turnId", turn.turnId);
         result.put("characterId", turn.characterId);
         result.put("sourceMessageId", turn.sourceMessageId);
         result.put("kind", turn.kind);
+        result.put("inputJson", turn.inputJson);
+        result.put("cloudJobId", turn.cloudJobId);
         result.put("storedState", turn.state);
         result.put("state", store.displayState(turn.turnId).name());
         result.put("activeAttemptId", turn.activeAttemptId);
@@ -278,6 +353,12 @@ public final class AlExecutionPlugin extends Plugin {
         String value = call.getString(name);
         if (value == null || value.trim().isEmpty()) throw new IllegalArgumentException(name + " is required");
         return value.trim();
+    }
+
+    private static String requiredJson(JSONObject value, String name) {
+        String result = value.optString(name, "").trim();
+        if (result.isEmpty()) throw new IllegalArgumentException(name + " is required");
+        return result;
     }
 
     private interface Operation {

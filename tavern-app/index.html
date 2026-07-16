@@ -149,6 +149,9 @@ button{border:none;background:none;cursor:pointer}
 .cell-label{width:96px;color:#191919;font-size:15px;flex-shrink:0}
 .cell-body{flex:1;min-width:0}
 .cell-note{display:block;margin-top:3px;color:#9a9a9a;font-size:12px;line-height:1.35}
+.plan-card{margin:0 12px 10px;padding:14px;background:#fff;border-radius:8px;box-shadow:0 1px 0 rgba(0,0,0,.04)}
+.plan-card-title{font-size:16px;font-weight:650;line-height:1.4}.plan-card-meta{margin-top:6px;color:#888;font-size:12px;line-height:1.55}.plan-card-intent{margin-top:8px;color:#333;font-size:14px;line-height:1.55;white-space:pre-wrap}
+.plan-card-actions{display:flex;gap:8px;margin-top:12px}.plan-card-actions button{padding:7px 12px;border-radius:5px;background:#f2f2f2;color:#444;font-size:13px}.plan-card-actions .danger{color:#fa5151}
 .cell-ico{width:28px;height:28px;border-radius:6px;display:flex;align-items:center;justify-content:center;background:#07c160;color:#fff;font-size:16px;flex-shrink:0}
 .cell-ico.blue{background:#5b8def}.cell-ico.orange{background:#ff9f1c}.cell-ico.gray{background:#8f8f8f}.cell-ico.red{background:#fa5151}
 .input,.textarea,.select{width:100%;border:none;outline:none;background:transparent;color:#222;font-size:15px}
@@ -477,10 +480,33 @@ button.cell:active{background:#ececec}
         <div class="cell"><div class="cell-label">说话方式</div><div class="cell-body profile-detail-text" id="profile-char-style"></div></div>
         <div class="cell"><div class="cell-label">关系</div><div class="cell-body profile-detail-text" id="profile-char-more"></div></div>
         <button class="cell" onclick="openStagePersonas(profileCharId, 'contact-profile')" type="button"><div class="cell-label">关系阶段</div><div class="cell-body profile-detail-text" id="profile-char-stage"></div><div class="mini">›</div></button>
+        <button class="cell" onclick="openRolePlans(profileCharId, 'contact-profile')" type="button"><div class="cell-label">安排表</div><div class="cell-body profile-detail-text">角色承诺、日程与主动消息</div><div class="mini">›</div></button>
       </div>
       <div class="contact-profile-actions">
         <button class="primary" onclick="messageProfileChar()">发消息</button>
       </div>
+    </div>
+  </div>
+
+  <div id="screen-role-plans" class="screen">
+    <div class="topbar">
+      <div class="top-left"><button class="icon-btn back-btn" onclick="closeRolePlans()">‹</button></div>
+      <div class="top-title">安排表</div>
+      <div class="top-right"></div>
+    </div>
+    <div class="scroll" style="background:#ededed">
+      <div class="contact-index" id="role-plan-character-name">角色安排</div>
+      <div id="role-plan-list"></div>
+      <details class="chat-info-advanced" id="role-plan-editor">
+        <summary class="cell"><div class="cell-body">添加安排</div><div class="mini more">›</div></summary>
+        <div class="cell-group chat-info-editor">
+          <div class="cell"><div class="cell-label">类型</div><div class="cell-body"><select class="select" id="role-plan-type"><option value="private_message">主动私聊</option><option value="moment_post">发布朋友圈</option><option value="role_schedule">角色日程</option></select></div></div>
+          <div class="cell"><div class="cell-label">标题</div><div class="cell-body"><input class="input" id="role-plan-title" placeholder="例如：早安"></div></div>
+          <div class="cell"><div class="cell-label">内容</div><div class="cell-body"><textarea class="textarea" id="role-plan-intent" placeholder="角色到时准备做什么"></textarea></div></div>
+          <div class="cell"><div class="cell-label">时间</div><div class="cell-body"><input class="input" id="role-plan-at" type="datetime-local"></div></div>
+        </div>
+        <button class="primary" onclick="createRolePlanFromUi()" type="button">保存安排</button>
+      </details>
     </div>
   </div>
 
@@ -671,6 +697,7 @@ button.cell:active{background:#ececec}
         <button class="cell" onclick="openSearch('current-chat')" type="button"><div class="cell-body">查找聊天内容</div><div class="mini">›</div></button>
         <button class="cell" onclick="openMemory('chat-info')" type="button"><div class="cell-body">记忆库</div><div class="mini">›</div></button>
         <button class="cell" onclick="openStagePersonas(currentCharId, 'chat-info')" type="button"><div class="cell-body">阶段人设</div><div class="mini" id="chat-stage-label">初识 ›</div></button>
+        <button class="cell" onclick="openRolePlans(currentCharId, 'chat-info')" type="button"><div class="cell-body">安排表</div><div class="mini">›</div></button>
         <button class="cell" onclick="toggleChatPinned()" type="button"><div class="cell-body">置顶聊天</div><span class="switch" id="chat-pinned-switch"></span></button>
         <button class="cell" onclick="toggleChatMuted()" type="button"><div class="cell-body">消息免打扰</div><span class="switch" id="chat-muted-switch"></span></button>
       </div>
@@ -1248,14 +1275,14 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-16.88';
+const APP_BUILD_VERSION = '2026-07-16.89';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
   'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
   'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@update-channel/android-update.json'
 ];
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-16.16';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-16.17';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -1392,6 +1419,8 @@ let memoryEditorState = { storeName: 'profiles', id: '', lastStoreName: 'profile
 let memoryFilterText = '';
 let stagePersonaReturnScreen = 'chat-info';
 let stagePersonaTargetCharId = '';
+let rolePlansReturnScreen = 'chat-info';
+let rolePlansTargetCharId = '';
 let stagePersonaEditorDraft = null;
 let stagePersonaEditorStageId = 'new';
 let plusOpen = false;
@@ -1603,6 +1632,95 @@ async function applyNativePlanParts(charId, parts, sourceTurnId) {
     const payload = nativePartPayload(part);
     await applyRolePlanOperations(charId, payload.operations, [sourceTurnId]);
   }
+}
+
+function rolePlanTypeLabel(type) {
+  return ({ private_message: '主动私聊', moment_post: '朋友圈', role_schedule: '角色日程' })[type] || '安排';
+}
+function rolePlanSourceLabel(source) {
+  return ({ spoken: '角色承诺', accepted_request: '接受请求', private_decision: '角色自行决定', user_created: '手动添加' })[source] || '聊天生成';
+}
+function rolePlanStatusLabel(status) {
+  return ({ active: '待执行', paused: '已暂停', running: '执行中', failed: '待重试', completed: '已完成', cancelled: '已取消' })[status] || status || '未知';
+}
+function localDateTimeInputValue(at) {
+  const date = new Date(at);
+  if (!Number.isFinite(date.getTime())) return '';
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 16);
+}
+function openRolePlans(charId, returnScreen = activeScreen) {
+  if (!characters.some(char => char.id === charId)) return;
+  rolePlansTargetCharId = charId;
+  rolePlansReturnScreen = returnScreen && returnScreen !== 'role-plans' ? returnScreen : 'chat-info';
+  showScreen('role-plans');
+}
+function closeRolePlans() {
+  showScreen(rolePlansReturnScreen || 'chat-info');
+}
+async function renderRolePlansScreen() {
+  const list = document.getElementById('role-plan-list');
+  if (!list || !rolePlansTargetCharId) return;
+  const char = characters.find(item => item.id === rolePlansTargetCharId);
+  document.getElementById('role-plan-character-name').textContent = `${charName(char)}的安排`;
+  list.innerHTML = '<div class="empty">正在读取安排...</div>';
+  const plans = await refreshRolePlanCache(rolePlansTargetCharId);
+  const effective = plans.filter(plan => !['completed', 'cancelled'].includes(plan.status));
+  const archived = plans.filter(plan => ['completed', 'cancelled'].includes(plan.status));
+  const card = plan => {
+    const time = plan.nextRunAt ? formatFullTime(new Date(Number(plan.nextRunAt))) : '没有下一次时间';
+    const primary = plan.status === 'paused'
+      ? `<button onclick="mutateRolePlanFromUi('${plan.planId}','resume')" type="button">恢复</button>`
+      : (['active', 'failed'].includes(plan.status) ? `<button onclick="mutateRolePlanFromUi('${plan.planId}','pause')" type="button">暂停</button>` : '');
+    const cancel = !['completed', 'cancelled'].includes(plan.status)
+      ? `<button class="danger" onclick="mutateRolePlanFromUi('${plan.planId}','cancel')" type="button">取消</button>`
+      : '';
+    return `<div class="plan-card">
+      <div class="plan-card-title">${esc(plan.title || plan.intent || '未命名安排')}</div>
+      <div class="plan-card-meta">${esc(rolePlanTypeLabel(plan.type))}｜${esc(rolePlanStatusLabel(plan.status))}｜${esc(rolePlanSourceLabel(plan.source))}<br>${esc(time)}</div>
+      <div class="plan-card-intent">${esc(plan.intent || '')}</div>
+      ${(primary || cancel) ? `<div class="plan-card-actions">${primary}${cancel}</div>` : ''}
+    </div>`;
+  };
+  list.innerHTML = effective.length
+    ? effective.map(card).join('')
+    : '<div class="empty">暂无待执行安排。角色在聊天里作出明确承诺后，会自动记录在这里。</div>';
+  if (archived.length) list.innerHTML += `<div class="contact-index">已结束</div>${archived.slice(0, 20).map(card).join('')}`;
+  const at = document.getElementById('role-plan-at');
+  if (at && !at.value) at.value = localDateTimeInputValue(Date.now() + 60 * 60 * 1000);
+}
+async function mutateRolePlanFromUi(planId, action) {
+  if (!rolePlansTargetCharId || !planId) return;
+  if (action === 'cancel' && !confirm('取消这项安排？已经生成的聊天消息不会删除。')) return;
+  const result = await applyRolePlanOperations(rolePlansTargetCharId, [{ op: action, planId, reason: '用户在安排表中操作' }]);
+  if (result.rejected?.length) toast('操作失败：' + result.rejected[0].detail, 2600);
+  await renderRolePlansScreen();
+}
+async function createRolePlanFromUi() {
+  const charId = rolePlansTargetCharId;
+  const type = document.getElementById('role-plan-type')?.value || 'private_message';
+  const title = document.getElementById('role-plan-title')?.value.trim() || '';
+  const intent = document.getElementById('role-plan-intent')?.value.trim() || '';
+  const atValue = document.getElementById('role-plan-at')?.value || '';
+  const at = new Date(atValue).getTime();
+  if (!charId || !intent || !Number.isFinite(at) || at <= Date.now()) {
+    toast('请填写安排内容和未来时间', 2600);
+    return;
+  }
+  const result = await applyRolePlanOperations(charId, [{
+    op: 'create', type, source: 'user_created', origin: 'user', title: title || intent.slice(0, 30), intent,
+    sourceQuote: intent, schedule: { kind: 'once', at: new Date(at).toISOString() }, timeConfidence: 'explicit'
+  }]);
+  if (result.rejected?.length) {
+    toast('保存失败：' + result.rejected[0].detail, 2800);
+    return;
+  }
+  document.getElementById('role-plan-title').value = '';
+  document.getElementById('role-plan-intent').value = '';
+  document.getElementById('role-plan-at').value = localDateTimeInputValue(Date.now() + 60 * 60 * 1000);
+  document.getElementById('role-plan-editor').open = false;
+  await renderRolePlansScreen();
+  toast('安排已保存');
 }
 
 async function dumpMemoryStores() {
@@ -2073,6 +2191,129 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
   return true;
 }
 
+function rolePlanSnapshotId(charId, planId) {
+  return `${charId}:role-plan:${planId}`;
+}
+
+async function saveNativeRolePlanSnapshot(charId, plan, job) {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.saveProactiveSnapshot) return false;
+  const char = characters.find(item => item.id === charId);
+  const chat = allChats[charId];
+  if (!char || !chat) throw new Error('找不到角色计划对应的角色或会话');
+  await saveNativeExecutionApiConfigs();
+
+  const now = new Date();
+  const scheduledAt = new Date(Number(plan.nextRunAt));
+  const memory = await dumpCharacterMemoryForRunner(charId);
+  const candidates = nativeMemoryCandidateText(memory, char) || '本地记忆库暂无可用记录。';
+  const isMoment = plan.type === 'moment_post';
+  const planContext = [
+    `这是角色此前确定的计划：${plan.title || plan.intent}`,
+    `原始意图：${plan.intent}`,
+    `原定执行时间：${formatFullTime(scheduledAt)}`,
+    `现在时间：${formatFullTime(now)}`,
+    '请结合最新聊天、人物设定和记忆自然执行该计划。不要提到计划表、定时器、系统任务或后台唤醒；如果语境已经明显变化，应按角色当下判断自然调整表达。'
+  ].join('\n');
+  let chatSystem = '';
+  let chatMessages = [];
+  if (isMoment) {
+    const payload = buildMomentPostPayload(char, chat, '');
+    chatSystem = `${payload.system}\n\n${planContext}`;
+    chatMessages = payload.messages;
+  } else {
+    const prompt = buildChatSceneSystem(char, chat, {
+      proactive: true,
+      proactiveNow: now,
+      proactiveTriggerMode: 'planned',
+      proactiveTimeContext: planContext,
+      memoryPack: '',
+      returnPromptDetails: true
+    });
+    chatSystem = `${prompt.system}\n\n${planContext}`;
+    chatMessages = nativeProactiveChatMessages(char, chat, now, 'planned');
+  }
+  const snapshot = {
+    characterName: charName(char),
+    playerName: playerName(),
+    memoryConfigId: 'memory-v1',
+    chatConfigId: 'chat-v1',
+    memorySystem: `你是 AL 的记忆筛选 AI。当前要执行角色此前确定的一项安排。只从候选记忆中挑选会改变本次表达、称呼、边界、约定、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，不要代替角色输出正文。`,
+    memoryMessages: [{ role: 'user', content: `${planContext}\n\n候选本地记忆：\n${candidates}` }],
+    memoryMaxTokens: 1400,
+    chatSystem,
+    chatMessages,
+    chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
+    rolePlanId: plan.planId,
+    rolePlan: { ...plan, cloudJobId: job.jobId },
+    proactiveKind: isMoment ? 'moment' : 'chat',
+    cloudJobId: job.jobId,
+    automaticTasksEnabled: automaticTasksEnabled(settings),
+    timerEndpoint: settings.timerEndpoint || '',
+    deviceId: settings.deviceId || '',
+    createdAt: now.toISOString()
+  };
+  await plugin.saveProactiveSnapshot({
+    snapshotId: rolePlanSnapshotId(charId, plan.planId),
+    characterId: charId,
+    characterName: charName(char),
+    playerName: playerName(),
+    systemPrompt: isMoment ? '' : chatSystem,
+    momentSystemPrompt: isMoment ? chatSystem : '',
+    chatConfigId: 'chat-v1',
+    memoryConfigId: 'memory-v1',
+    snapshotJson: JSON.stringify(snapshot),
+    createdAt: Date.now()
+  });
+  return true;
+}
+
+const syncingRolePlanChars = new Set();
+async function syncRolePlanCloudJobs(charId) {
+  if (!charId || syncingRolePlanChars.has(charId)) return false;
+  syncingRolePlanChars.add(charId);
+  try {
+    const plans = await refreshRolePlanCache(charId);
+    if (!cloudTimerTransportReady() || !automaticTasksEnabled(settings)) return false;
+    ensureDeviceId();
+    let changed = false;
+    for (const plan of plans) {
+      const runnable = plan.type !== 'role_schedule'
+        && plan.status === 'active'
+        && Number.isFinite(Number(plan.nextRunAt))
+        && Number(plan.nextRunAt) > Date.now();
+      if (!runnable) {
+        if (plan.cloudJobId) {
+          const cancelled = await cancelCloudJobId(plan.cloudJobId);
+          if (cancelled) {
+            const result = await getRolePlanRepository().apply(charId, [{ op: 'update', planId: plan.planId, patch: { cloudJobId: null } }]);
+            rolePlanCache.set(charId, result.plans || plans);
+            changed = true;
+          }
+        }
+        continue;
+      }
+      const job = globalThis.ALRolePlans.cloudJob(plan, settings.deviceId);
+      await saveNativeRolePlanSnapshot(charId, plan, job);
+      if (plan.cloudJobId === job.jobId) continue;
+      const resp = await fetchWithTimeout(timerUrl('/schedule'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(job)
+      }, API_TIMEOUT_MS);
+      if (!resp.ok) throw await cloudTimerResponseError(resp, '角色安排同步失败');
+      clearCloudTimerQuotaPause();
+      if (plan.cloudJobId && plan.cloudJobId !== job.jobId) await cancelCloudJobId(plan.cloudJobId);
+      const result = await getRolePlanRepository().apply(charId, [{ op: 'update', planId: plan.planId, patch: { cloudJobId: job.jobId, lastErrorCode: null } }]);
+      rolePlanCache.set(charId, result.plans || plans);
+      changed = true;
+    }
+    return changed;
+  } finally {
+    syncingRolePlanChars.delete(charId);
+  }
+}
+
 function pendingNativeReplyCount() {
   return Object.values(allChats || {}).filter(chat => {
     return chatHasPendingDirectReply(chat);
@@ -2179,10 +2420,10 @@ function nativeTurnHasUiLanding(result) {
   if (!chat) return false;
   const kind = String(result?.kind || 'DIRECT_REPLY');
   const sourceTurnId = `native:${result?.turnId || ''}`;
-  if (kind === 'PROACTIVE_MOMENT') {
+  if (['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind)) {
     return (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
   }
-  if (kind === 'PROACTIVE_CHAT') {
+  if (['PROACTIVE_CHAT', 'ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE'].includes(kind)) {
     return (chat.messages || []).some(message => message.sourceTurnId === sourceTurnId);
   }
   const userMessage = messageById(chat, result?.sourceMessageId);
@@ -2229,12 +2470,32 @@ function extractMomentPostText(raw) {
   }
   return source.replace(/\s+/g, ' ').trim();
 }
+async function completeRolePlanFromNativeResult(result) {
+  let trigger = {};
+  try { trigger = JSON.parse(result?.inputJson || '{}'); } catch {}
+  const charId = result?.characterId;
+  const planId = String(trigger.planId || '');
+  if (!charId || !planId) return false;
+  const plans = await refreshRolePlanCache(charId);
+  const plan = plans.find(row => row.planId === planId);
+  if (!plan) return false;
+  const scheduledFor = Date.parse(trigger.dueAt || '') || Number(plan.nextRunAt) || Date.now();
+  if (['completed', 'cancelled'].includes(plan.status)) return true;
+  if (Number(plan.nextRunAt) > scheduledFor && plan.cloudJobId) return true;
+  const nextRunAt = globalThis.ALRolePlans.nextOccurrence(plan.schedule, scheduledFor);
+  const mutation = nextRunAt
+    ? { op: 'update', planId, patch: { nextRunAt, status: 'active', cloudJobId: null, lastRunAt: Date.now(), lastErrorCode: null } }
+    : { op: 'complete', planId, reason: '计划已执行' };
+  await applyRolePlanOperations(charId, [mutation], [result.turnId]);
+  return true;
+}
 async function applyNativeExecutionTurn(result) {
   const charId = result?.characterId;
   const chat = allChats[charId];
   const kind = String(result?.kind || 'DIRECT_REPLY');
   if (!chat) return false;
-  if (kind === 'PROACTIVE_CHAT' || kind === 'PROACTIVE_MOMENT') {
+  const rolePlanTurn = ['ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind);
+  if (kind === 'PROACTIVE_CHAT' || kind === 'PROACTIVE_MOMENT' || rolePlanTurn) {
     const state = String(result.state || result.storedState || '');
     const sourceTurnId = `native:${result.turnId}`;
     if (state === 'COMPLETED') {
@@ -2242,13 +2503,16 @@ async function applyNativeExecutionTurn(result) {
       await applyNativePlanParts(charId, parts, result.turnId);
       const text = parts.filter(part => part.type === 'TEXT').map(part => String(part.content || '').trim()).filter(Boolean).join('\n');
       const completedAt = Number(result.completedAt) || Number(result.createdAt) || Date.now();
-      if (kind === 'PROACTIVE_MOMENT') {
+      const momentTurn = kind === 'PROACTIVE_MOMENT' || kind === 'ROLE_PLAN_MOMENT' || kind === 'ROLE_PLAN_MOMENT_PRIVATE';
+      if (momentTurn) {
         const exists = (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
         const momentText = extractMomentPostText(text);
         if (!exists && momentText) createCharacterMoment(charId, momentText, { proactive: true, sourceTurnId, time: completedAt });
-        delete chat.pendingMomentJob;
-        chat.lastProactiveMomentAt = completedAt;
-        ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment reschedule skipped:', err.message));
+        if (!rolePlanTurn) {
+          delete chat.pendingMomentJob;
+          chat.lastProactiveMomentAt = completedAt;
+          ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment reschedule skipped:', err.message));
+        }
       } else {
         const appendedText = text
           ? appendNativeReplyTextParts(chat, result, { proactive: true, proactiveMode: 'native' })
@@ -2259,19 +2523,22 @@ async function applyNativeExecutionTurn(result) {
           const payload = nativePartPayload(sentPayment);
           appendedPayment = appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { proactive: true, proactiveMode: 'native', sourceTurnId, sourceReplyId: sourceTurnId, time: Number(sentPayment.createdAt) || completedAt });
         }
-        delete chat.pendingProactiveJob;
-        chat.lastProactiveAt = completedAt;
-        chat.lastProactiveChatAt = chat.lastProactiveAt;
+        if (!rolePlanTurn) {
+          delete chat.pendingProactiveJob;
+          chat.lastProactiveAt = completedAt;
+          chat.lastProactiveChatAt = chat.lastProactiveAt;
+        }
         if ((appendedText.length || appendedPayment) && (activeScreen !== 'chat' || currentCharId !== charId)) chat.unread = (chat.unread || 0) + 1;
-        ensureDiceProactiveScheduled(charId, 'chat').catch(err => console.warn('[AL Timer] native chat reschedule skipped:', err.message));
+        if (!rolePlanTurn) ensureDiceProactiveScheduled(charId, 'chat').catch(err => console.warn('[AL Timer] native chat reschedule skipped:', err.message));
         processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native proactive extraction skipped:', err.message));
       }
+      if (rolePlanTurn) await completeRolePlanFromNativeResult(result);
       DB.set('chats', allChats);
       return true;
     }
     if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
       const reason = String(result.errorDetail || result.errorCode || '原生主动生成失败');
-      if (kind === 'PROACTIVE_MOMENT') {
+      if (kind === 'PROACTIVE_MOMENT' || kind === 'ROLE_PLAN_MOMENT' || kind === 'ROLE_PLAN_MOMENT_PRIVATE') {
         chat.lastProactiveMomentFailedAt = Date.now();
         chat.lastProactiveMomentError = reason;
       } else {
@@ -2315,6 +2582,7 @@ async function applyNativeExecutionTurn(result) {
     if (chat.pendingReply?.userMessageId === userMessage.id) delete chat.pendingReply;
     nativeReplyQueuedIds.delete(result.turnId);
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native turn extraction skipped:', err.message));
+    syncRolePlanCloudJobs(charId).catch(err => console.warn('[AL RolePlan] native snapshot refresh skipped:', err.message));
   } else if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
     const reason = String(result.errorDetail || result.errorCode || '后台回复失败');
     userMessage.replyState = 'failed';
@@ -3433,6 +3701,7 @@ function showScreen(name) {
   if (name === 'settings') loadSettings();
   if (name === 'memory') renderMemoryScreen();
   if (name === 'stage-personas') renderStagePersonaScreen();
+  if (name === 'role-plans') renderRolePlansScreen();
   if (name === 'diagnostics') renderDiagnosticsScreen();
   if (name === 'chat-info') renderChatInfo();
   if (name === 'contact-profile') renderContactProfile();
@@ -5884,7 +6153,10 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
       DB.set('chats', allChats);
       if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages();
       renderChats();
-      if (completed) processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
+      if (completed) {
+        processMemoryAfterTurn(requestCharId).catch(err => console.warn('[AL Memory] skipped:', err.message));
+        syncRolePlanCloudJobs(requestCharId).catch(err => console.warn('[AL RolePlan] snapshot refresh skipped:', err.message));
+      }
     }
   })();
   activeChatRequests.set(requestCharId, { requestToken, userMessageId, controller, promise: run });
@@ -7459,6 +7731,7 @@ async function enableNativeCloudTimer() {
   await registerNativeCloudTarget(token);
   await mirrorAppStateNow();
   await ensureCloudProactiveScheduled({ force: true });
+  await Promise.allSettled(characters.map(char => syncRolePlanCloudJobs(char.id)));
   setCloudTimerStatus('安卓原生 FCM 已绑定；AL 关闭后也可由系统唤醒。');
   return true;
 }
@@ -7564,6 +7837,7 @@ async function enableCloudTimer() {
       setCloudTimerStatus('云闹钟已绑定，但安排下一次失败：' + friendlyErrorMessage(err));
       console.warn('[AL Timer] schedule skipped:', err.message);
     });
+    Promise.allSettled(characters.map(char => syncRolePlanCloudJobs(char.id))).catch(() => {});
   } catch (err) {
     setCloudTimerStatus('云闹钟绑定失败：' + friendlyErrorMessage(err));
     toast('云闹钟绑定失败：' + friendlyErrorMessage(err), 3600);
@@ -7971,7 +8245,7 @@ function showAutomaticTaskCleanupReport(report = {}) {
   toast(message, allOk ? 3600 : 5200);
 }
 async function clearAllAutomaticTasks() {
-  if (!confirm('将关闭主动消息和云闹钟，并清空本机与云端的全部主动私聊、朋友圈任务。聊天、角色、记忆、API 配置和设备绑定不会删除。继续？')) return null;
+  if (!confirm('将关闭主动消息和云闹钟，并清空本机与云端的全部主动私聊、朋友圈和角色安排。聊天、角色、记忆、API 配置和设备绑定不会删除。继续？')) return null;
   const button = document.getElementById('clear-all-automatic-tasks');
   if (button?.disabled) return null;
   if (button) button.disabled = true;
@@ -7991,6 +8265,11 @@ async function clearAllAutomaticTasks() {
     if (proactiveSelect) proactiveSelect.value = 'off';
     if (cloudTimerSelect) cloudTimerSelect.value = 'off';
     startProactiveLoop();
+
+    await Promise.all(characters.map(async char => {
+      await getRolePlanRepository().replace(char.id, [], []);
+      rolePlanCache.set(char.id, []);
+    }));
 
     const localLogs = getModelCallLogs().filter(log => !isAutomaticTaskCallLog(log));
     localStorage.setItem('rpchat_call_logs', JSON.stringify(localLogs));
@@ -9247,8 +9526,10 @@ async function deleteCurrentRole() {
   await invalidateMemoryExtraction(deletedId);
   await Promise.allSettled([
     cancelCloudProactiveQuick(deletedId, '删除角色'),
-    MemoryDB.clearChar(deletedId)
+    MemoryDB.clearChar(deletedId),
+    getRolePlanRepository().replace(deletedId, [], [])
   ]);
+  rolePlanCache.delete(deletedId);
   removeCharacterMomentTraces(deletedId);
   if (memoryTargetCharId === deletedId) memoryTargetCharId = '';
   characters = characters.filter(c => c.id !== deletedId);
@@ -9335,6 +9616,7 @@ async function bootApp() {
   checkProactiveMessages().catch(err => console.warn('[AL Timer] boot proactive check skipped:', err.message));
   repairCloudTimerScheduleOnce().catch(err => console.warn('[AL Timer] repair skipped:', err.message));
   ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] resync skipped:', err.message));
+  Promise.allSettled(characters.map(char => syncRolePlanCloudJobs(char.id))).catch(() => {});
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register(`sw-v11.js?alarm-stream=1&v=${APP_BUILD_VERSION}`)
       .then(reg => reg.update?.())

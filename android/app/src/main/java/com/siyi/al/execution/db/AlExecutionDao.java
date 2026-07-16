@@ -25,6 +25,12 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     void upsertSnapshot(CharacterSnapshotEntity snapshot);
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    void upsertRolePlans(List<RolePlanEntity> plans);
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    void upsertRolePlanHistory(List<RolePlanHistoryEntity> history);
+
     @Insert
     long insertDiagnostic(DiagnosticEntity diagnostic);
 
@@ -40,13 +46,25 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM character_snapshots WHERE snapshotId = :snapshotId LIMIT 1")
     CharacterSnapshotEntity latestSnapshot(String snapshotId);
 
+    @Query("SELECT * FROM role_plans WHERE characterId = :characterId ORDER BY CASE WHEN nextRunAt IS NULL THEN 1 ELSE 0 END, nextRunAt ASC, updatedAt DESC")
+    List<RolePlanEntity> rolePlans(String characterId);
+
+    @Query("SELECT * FROM role_plan_history WHERE planId = :planId ORDER BY createdAt DESC LIMIT :limit")
+    List<RolePlanHistoryEntity> rolePlanHistory(String planId, int limit);
+
+    @Query("DELETE FROM role_plan_history WHERE planId IN (SELECT planId FROM role_plans WHERE characterId = :characterId)")
+    int deleteRolePlanHistoryForCharacter(String characterId);
+
+    @Query("DELETE FROM role_plans WHERE characterId = :characterId")
+    int deleteRolePlansForCharacter(String characterId);
+
     @Query("SELECT * FROM execution_attempts WHERE attemptId = :attemptId LIMIT 1")
     ExecutionAttemptEntity attempt(String attemptId);
 
     @Query("SELECT * FROM execution_attempts WHERE turnId = :turnId ORDER BY sequence DESC")
     List<ExecutionAttemptEntity> attempts(String turnId);
 
-    @Query("SELECT * FROM chat_turns WHERE state IN ('QUEUED','MEMORY_DONE','CHAT_DONE') AND deletedAt IS NULL ORDER BY CASE kind WHEN 'DIRECT_REPLY' THEN 0 WHEN 'PROACTIVE_CHAT' THEN 1 ELSE 2 END, createdAt ASC LIMIT 1")
+    @Query("SELECT * FROM chat_turns WHERE state IN ('QUEUED','MEMORY_DONE','CHAT_DONE') AND deletedAt IS NULL ORDER BY CASE kind WHEN 'DIRECT_REPLY' THEN 0 WHEN 'ROLE_PLAN_CHAT' THEN 1 WHEN 'ROLE_PLAN_MOMENT' THEN 1 WHEN 'ROLE_PLAN_CHAT_PRIVATE' THEN 2 WHEN 'ROLE_PLAN_MOMENT_PRIVATE' THEN 2 WHEN 'PROACTIVE_CHAT' THEN 3 WHEN 'PROACTIVE_MOMENT' THEN 4 ELSE 5 END, createdAt ASC LIMIT 1")
     ChatTurnEntity nextRunnableTurn();
 
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT 50")
@@ -103,17 +121,25 @@ public interface AlExecutionDao {
     @Query("UPDATE execution_attempts SET state = 'CANCELLED', stage = 'FINISHED', heartbeatAt = :now, finishedAt = :now, errorCode = 'CANCELLED', retryable = 0 WHERE attemptId = :attemptId")
     int cancelAttempt(String attemptId, long now);
 
-    @Query("UPDATE execution_attempts SET state = 'CANCELLED', stage = 'FINISHED', heartbeatAt = :now, finishedAt = :now, errorCode = 'CANCELLED', retryable = 0 WHERE turnId IN (SELECT turnId FROM chat_turns WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT') AND state != 'COMPLETED') AND state NOT IN ('COMPLETED','CANCELLED')")
+    @Query("UPDATE execution_attempts SET state = 'CANCELLED', stage = 'FINISHED', heartbeatAt = :now, finishedAt = :now, errorCode = 'CANCELLED', retryable = 0 WHERE turnId IN (SELECT turnId FROM chat_turns WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT','ROLE_PLAN_CHAT','ROLE_PLAN_MOMENT','ROLE_PLAN_CHAT_PRIVATE','ROLE_PLAN_MOMENT_PRIVATE') AND state != 'COMPLETED') AND state NOT IN ('COMPLETED','CANCELLED')")
     int cancelAutomaticAttempts(long now);
 
-    @Query("UPDATE chat_turns SET state = 'CANCELLED', activeAttemptId = NULL, updatedAt = :now, cancelledAt = :now WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT') AND state NOT IN ('COMPLETED','CANCELLED')")
+    @Query("UPDATE chat_turns SET state = 'CANCELLED', activeAttemptId = NULL, updatedAt = :now, cancelledAt = :now WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT','ROLE_PLAN_CHAT','ROLE_PLAN_MOMENT','ROLE_PLAN_CHAT_PRIVATE','ROLE_PLAN_MOMENT_PRIVATE') AND state NOT IN ('COMPLETED','CANCELLED')")
     int cancelAutomaticTurns(long now);
 
-    @Query("UPDATE chat_turns SET uiAppliedAt = :now WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT') AND state = 'COMPLETED' AND uiAppliedAt IS NULL")
+    @Query("UPDATE chat_turns SET uiAppliedAt = :now WHERE kind IN ('PROACTIVE_CHAT','PROACTIVE_MOMENT','ROLE_PLAN_CHAT','ROLE_PLAN_MOMENT','ROLE_PLAN_CHAT_PRIVATE','ROLE_PLAN_MOMENT_PRIVATE') AND state = 'COMPLETED' AND uiAppliedAt IS NULL")
     int acknowledgeCompletedAutomaticTurns(long now);
 
     @Query("DELETE FROM character_snapshots")
     int deleteProactiveSnapshots();
+
+    @Transaction
+    default void replaceRolePlans(String characterId, List<RolePlanEntity> plans, List<RolePlanHistoryEntity> history) {
+        deleteRolePlanHistoryForCharacter(characterId);
+        deleteRolePlansForCharacter(characterId);
+        if (plans != null && !plans.isEmpty()) upsertRolePlans(plans);
+        if (history != null && !history.isEmpty()) upsertRolePlanHistory(history);
+    }
 
     @Transaction
     default void markStage(

@@ -16,6 +16,10 @@ public class AlFirebaseMessagingService extends MessagingService {
     @Override
     public void onMessageReceived(@NonNull RemoteMessage remoteMessage) {
         Map<String, String> data = remoteMessage.getData();
+        if ("role-plan".equals(data.get("type"))) {
+            handleRolePlan(data);
+            return;
+        }
         if (!"proactive".equals(data.get("type"))) {
             super.onMessageReceived(remoteMessage);
             return;
@@ -56,6 +60,56 @@ public class AlFirebaseMessagingService extends MessagingService {
             now
         ));
         AlExecutionService.requestRun(this);
+    }
+
+    private void handleRolePlan(Map<String, String> data) {
+        String characterId = text(data.get("charId"));
+        String planId = text(data.get("planId"));
+        String occurrenceId = text(data.get("occurrenceId"));
+        String jobId = text(data.get("jobId"));
+        String kindName = text(data.get("kind"));
+        if (characterId.isEmpty() || planId.isEmpty() || occurrenceId.isEmpty() || jobId.isEmpty()) return;
+        if ("role_schedule".equals(kindName)) return;
+
+        AlExecutionDatabase database = AlExecutionDatabase.get(this);
+        RoomExecutionStore store = new RoomExecutionStore(database);
+        String turnId = "cloud_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
+        long now = System.currentTimeMillis();
+        store.recordDiagnostic(turnId, null, "INFO", "ROLE_PLAN_FCM", planId + ":" + occurrenceId, now);
+        CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(rolePlanSnapshotId(characterId, planId));
+        if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) {
+            store.recordDiagnostic(turnId, null, "WARN", "ROLE_PLAN_SNAPSHOT_MISSING", planId, now);
+            return;
+        }
+        if (!matchesSnapshotJob(snapshot, jobId)) {
+            store.recordDiagnostic(turnId, null, "WARN", "ROLE_PLAN_JOB_MISMATCH", planId + ":" + jobId, now);
+            return;
+        }
+        try {
+            JSONObject context = new JSONObject(snapshot.contextJson);
+            if (!planId.equals(text(context.optString("rolePlanId", "")))) return;
+        } catch (Exception ignored) {
+            return;
+        }
+        boolean privateDecision = "private_decision".equals(text(data.get("source")));
+        TurnKind kind = "moment_post".equals(kindName)
+            ? (privateDecision ? TurnKind.ROLE_PLAN_MOMENT_PRIVATE : TurnKind.ROLE_PLAN_MOMENT)
+            : (privateDecision ? TurnKind.ROLE_PLAN_CHAT_PRIVATE : TurnKind.ROLE_PLAN_CHAT);
+        store.submitTurn(new TurnSubmission(
+            turnId,
+            characterId,
+            turnId,
+            kind,
+            new JSONObject(data).toString(),
+            snapshot.contextJson,
+            jobId,
+            now
+        ));
+        AlExecutionService.requestRun(this);
+    }
+
+    static String rolePlanSnapshotId(String characterId, String planId) {
+        return text(characterId) + ":role-plan:" + text(planId);
     }
 
     static String snapshotId(String characterId, String kindName, String jobId) {

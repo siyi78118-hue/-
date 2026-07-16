@@ -12,7 +12,7 @@
 // Cron trigger: every 1 minute.
 //
 // This worker stores only timer metadata and push subscriptions:
-// { deviceId, jobId, charId, dueAt, type }. It does not store chat, memory,
+// { deviceId, jobId, charId, dueAt, type, planId, occurrenceId, source }. It does not store chat, memory,
 // role prompts, summaries, or API keys.
 //
 // Important quota note:
@@ -25,7 +25,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-16.16';
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-16.17';
 const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
 const FCM_ACK_MAX_ATTEMPTS = 8;
 let lastCronSummary = null;
@@ -66,6 +66,11 @@ export default {
       if (request.method === 'POST' && url.pathname === '/schedule') {
         const body = await request.json();
         if (!body.deviceId || !body.jobId || !body.dueAt) throw new Error('missing deviceId/jobId/dueAt');
+        if (body.type === 'role-plan') {
+          const privateFields = ['intent', 'sourceQuote', 'messages', 'memory', 'prompt', 'apiKey', 'authorization'];
+          if (privateFields.some(field => body[field] != null)) throw new Error('ROLE_PLAN_PAYLOAD_NOT_MINIMAL');
+          if (!body.planId || !body.occurrenceId || !body.charId) throw new Error('missing role plan identifiers');
+        }
         const dueAtMs = Date.parse(body.dueAt);
         if (!Number.isFinite(dueAtMs)) throw new Error('invalid dueAt');
         const job = {
@@ -75,6 +80,9 @@ export default {
           dueAt: body.dueAt,
           type: body.type || 'proactive',
           kind: body.kind || (String(body.jobId || '').startsWith('mom_') ? 'moment' : 'chat'),
+          planId: body.type === 'role-plan' ? String(body.planId || '') : undefined,
+          occurrenceId: body.type === 'role-plan' ? String(body.occurrenceId || '') : undefined,
+          source: body.type === 'role-plan' ? String(body.source || '') : undefined,
           mode: body.mode === 'dice' ? 'dice' : 'planned',
           rollChance: Number.isFinite(Number(body.rollChance)) ? Number(body.rollChance) : undefined,
           diceIntervalMs: Number.isFinite(Number(body.diceIntervalMs)) ? Number(body.diceIntervalMs) : undefined,
@@ -101,6 +109,7 @@ export default {
           deviceId: shortId(deviceId),
           momentJobsDeleted: result.momentJobsDeleted,
           chatJobsDeleted: result.chatJobsDeleted,
+          rolePlanJobsDeleted: result.rolePlanJobsDeleted,
           dueReferencesDeleted: result.dueReferencesDeleted,
           dueBucketsDeleted: result.dueBucketsDeleted,
           ok: true
@@ -213,12 +222,13 @@ async function getLastCron(env) {
 
 function logicalTaskKey(job) {
   if (job?.test) return `active:test:${encodeURIComponent(String(job.deviceId || ''))}:${encodeURIComponent(String(job.jobId || ''))}`;
+  if (job?.type === 'role-plan') return `active:role-plan:${encodeURIComponent(String(job.deviceId || ''))}:${encodeURIComponent(String(job.jobId || ''))}`;
   return `active:${encodeURIComponent(String(job.deviceId || ''))}:${encodeURIComponent(String(job.charId || ''))}:${encodeURIComponent(String(job.kind || 'chat'))}`;
 }
 
 function sameScheduledJob(left, right) {
   if (!left || !right) return false;
-  const fields = ['deviceId', 'jobId', 'charId', 'dueAt', 'type', 'kind', 'mode', 'rollChance', 'diceIntervalMs', 'diceRolls', 'dicePrecomputed', 'test'];
+  const fields = ['deviceId', 'jobId', 'charId', 'dueAt', 'type', 'kind', 'planId', 'occurrenceId', 'source', 'mode', 'rollChance', 'diceIntervalMs', 'diceRolls', 'dicePrecomputed', 'test'];
   return fields.every(field => (left[field] ?? null) === (right[field] ?? null));
 }
 
@@ -298,17 +308,19 @@ function validDeviceId(value) {
 
 function isDeviceAutomaticJobId(jobId, deviceId) {
   const value = String(jobId || '');
-  return value.startsWith(`mom_${deviceId}_`) || value.startsWith(`pro_${deviceId}_`);
+  return value.startsWith(`mom_${deviceId}_`) || value.startsWith(`pro_${deviceId}_`) || value.startsWith(`rpl_${deviceId}_`);
 }
 
 async function cancelDeviceAutomaticTasks(deviceId, env) {
   if (!validDeviceId(deviceId)) throw new Error('invalid deviceId');
   const prefixes = [
     { prefix: `job:mom_${deviceId}_`, kind: 'moment' },
-    { prefix: `job:pro_${deviceId}_`, kind: 'chat' }
+    { prefix: `job:pro_${deviceId}_`, kind: 'chat' },
+    { prefix: `job:rpl_${deviceId}_`, kind: 'role-plan' }
   ];
   let momentJobsDeleted = 0;
   let chatJobsDeleted = 0;
+  let rolePlanJobsDeleted = 0;
 
   for (const row of prefixes) {
     const keys = await listKvKeys(env, row.prefix);
@@ -318,6 +330,7 @@ async function cancelDeviceAutomaticTasks(deviceId, env) {
       if (!job || job.deviceId !== deviceId || job.test) continue;
       await cancelJob(job.jobId, env);
       if (row.kind === 'moment') momentJobsDeleted += 1;
+      else if (row.kind === 'role-plan') rolePlanJobsDeleted += 1;
       else chatJobsDeleted += 1;
     }
   }
@@ -344,6 +357,7 @@ async function cancelDeviceAutomaticTasks(deviceId, env) {
     deviceId,
     momentJobsDeleted,
     chatJobsDeleted,
+    rolePlanJobsDeleted,
     dueReferencesDeleted,
     dueBucketsDeleted,
     subscriptionPreserved: !!(await env.AL_TIMER_KV.get(`sub:${deviceId}`))
@@ -512,11 +526,14 @@ async function deliverJob(job, env) {
   if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
   const target = JSON.parse(subRaw);
   const result = await sendPush(target, env, {
-    type: 'proactive',
+    type: job.type === 'role-plan' ? 'role-plan' : 'proactive',
     deviceId: job.deviceId || '',
     jobId: job.jobId || '',
     charId: job.charId || '',
     kind: job.kind || 'chat',
+    planId: job.planId || '',
+    occurrenceId: job.occurrenceId || '',
+    source: job.source || '',
     mode: job.mode || 'planned',
     rollChance: job.rollChance,
     diceIntervalMs: job.diceIntervalMs,

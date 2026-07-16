@@ -55,12 +55,14 @@ const fixture = createPaginatedKv([
   ['sub:device-b', '{"deviceId":"device-b"}'],
   ['job:mom_device-a_char-1_a', '{"deviceId":"device-a","jobId":"mom_device-a_char-1_a","kind":"moment"}'],
   ['job:pro_device-a_char-1_b', '{"deviceId":"device-a","jobId":"pro_device-a_char-1_b","kind":"chat"}'],
+  ['job:rpl_device-a_plan-1_200', '{"deviceId":"device-a","jobId":"rpl_device-a_plan-1_200","type":"role-plan","kind":"private_message"}'],
   ['job:mom_device-b_char-2_c', '{"deviceId":"device-b","jobId":"mom_device-b_char-2_c","kind":"moment"}'],
   ['job:test_device-a_char-1_d', '{"deviceId":"device-a","jobId":"test_device-a_char-1_d","kind":"chat","test":true}'],
   ['due:100', '["mom_device-a_char-1_a","mom_device-b_char-2_c"]'],
   ['due:101', '["pro_device-a_char-1_b"]'],
   ['due:102', '["mom_device-a_char-1_orphan"]'],
-  ['due:103', '["test_device-a_char-1_d"]']
+  ['due:103', '["test_device-a_char-1_d"]'],
+  ['due:104', '["rpl_device-a_plan-1_200"]']
 ]);
 const env = { AL_TIMER_KV: fixture.binding };
 
@@ -77,12 +79,14 @@ assert.deepEqual(result, {
   deviceId: 'device-a',
   momentJobsDeleted: 1,
   chatJobsDeleted: 1,
-  dueReferencesDeleted: 3,
-  dueBucketsDeleted: 2,
+  rolePlanJobsDeleted: 1,
+  dueReferencesDeleted: 4,
+  dueBucketsDeleted: 3,
   subscriptionPreserved: true
 });
 assert.equal(fixture.store.has('job:mom_device-a_char-1_a'), false);
 assert.equal(fixture.store.has('job:pro_device-a_char-1_b'), false);
+assert.equal(fixture.store.has('job:rpl_device-a_plan-1_200'), false);
 assert.equal(fixture.store.has('job:mom_device-b_char-2_c'), true);
 assert.equal(fixture.store.has('job:test_device-a_char-1_d'), true);
 assert.equal(fixture.store.has('sub:device-a'), true);
@@ -107,6 +111,7 @@ assert.deepEqual(await repeatedResponse.json(), {
   deviceId: 'device-a',
   momentJobsDeleted: 0,
   chatJobsDeleted: 0,
+  rolePlanJobsDeleted: 0,
   dueReferencesDeleted: 0,
   dueBucketsDeleted: 0,
   subscriptionPreserved: true

@@ -14,7 +14,9 @@ import androidx.core.content.ContextCompat;
 import androidx.core.app.NotificationManagerCompat;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.ChatTurnEntity;
+import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.api.HttpResponse;
 import com.siyi.al.execution.api.UrlConnectionTransport;
 import java.util.Collections;
@@ -117,8 +119,10 @@ public final class AlExecutionService extends Service {
     private void notifyCompletedTurns() {
         SharedPreferences notified = getSharedPreferences("al.execution.notifications", MODE_PRIVATE);
         SharedPreferences acknowledged = getSharedPreferences("al.execution.cloud-acks", MODE_PRIVATE);
+        SharedPreferences continued = getSharedPreferences("al.execution.role-plan-continuations", MODE_PRIVATE);
         for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
             acknowledgeCloudTurn(turn, acknowledged);
+            continueRolePlan(turn, continued);
             String key = "turn." + turn.turnId;
             if (notified.getBoolean(key, false)) continue;
             String title = characterName(turn);
@@ -148,7 +152,10 @@ public final class AlExecutionService extends Service {
             body.put("deviceId", deviceId);
             body.put("jobId", turn.cloudJobId);
             body.put("charId", turn.characterId);
-            body.put("kind", TurnKind.PROACTIVE_MOMENT.name().equals(turn.kind) ? "moment" : "chat");
+            boolean moment = TurnKind.PROACTIVE_MOMENT.name().equals(turn.kind)
+                || TurnKind.ROLE_PLAN_MOMENT.name().equals(turn.kind)
+                || TurnKind.ROLE_PLAN_MOMENT_PRIVATE.name().equals(turn.kind);
+            body.put("kind", moment ? "moment" : "chat");
             body.put("outcome", "generated-native");
             HttpResponse response = new UrlConnectionTransport().post(
                 endpoint + "/ack",
@@ -165,6 +172,105 @@ public final class AlExecutionService extends Service {
             executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ACK_FAILED", error.getMessage(), System.currentTimeMillis());
             // Keep the ack pending. The sticky service retries it on the next kick.
         }
+    }
+
+    private void continueRolePlan(ChatTurnEntity turn, SharedPreferences continued) {
+        if (!isRolePlanKind(turn.kind) || turn.cloudJobId == null || turn.cloudJobId.trim().isEmpty()) return;
+        String continuationKey = "turn." + turn.turnId;
+        if (continued.getBoolean(continuationKey, false)) return;
+        try {
+            JSONObject snapshot = new JSONObject(turn.snapshotJson);
+            JSONObject plan = snapshot.optJSONObject("rolePlan");
+            JSONObject schedule = plan == null ? null : plan.optJSONObject("schedule");
+            String planId = plan == null ? "" : plan.optString("planId", "").trim();
+            String endpoint = snapshot.optString("timerEndpoint", "").replaceAll("/+$", "");
+            String deviceId = snapshot.optString("deviceId", "").trim();
+            if (plan == null || schedule == null || planId.isEmpty() || endpoint.isEmpty() || deviceId.isEmpty()) return;
+
+            long after = Math.max(System.currentTimeMillis(), plan.optLong("nextRunAt", System.currentTimeMillis()));
+            Long nextRunAt = RolePlanSchedule.nextOccurrence(schedule, after);
+            long now = System.currentTimeMillis();
+            if (nextRunAt == null) {
+                plan.put("status", "completed");
+                plan.put("completedAt", now);
+                plan.put("lastRunAt", now);
+                plan.put("cloudJobId", JSONObject.NULL);
+                persistRolePlanContinuation(turn, snapshot, plan, null, now);
+                continued.edit().putBoolean(continuationKey, true).apply();
+                return;
+            }
+
+            String safeDeviceId = safeId(deviceId);
+            String safePlanId = safeId(planId);
+            String jobId = "rpl_" + safeDeviceId + "_" + safePlanId + "_" + nextRunAt;
+            JSONObject body = new JSONObject();
+            body.put("deviceId", safeDeviceId);
+            body.put("jobId", jobId);
+            body.put("planId", planId);
+            body.put("occurrenceId", planId + ":" + nextRunAt);
+            body.put("charId", turn.characterId);
+            body.put("dueAt", isoTime(nextRunAt));
+            body.put("type", "role-plan");
+            body.put("kind", plan.optString("type", "private_message"));
+            body.put("source", plan.optString("source", "spoken"));
+            HttpResponse response = new UrlConnectionTransport().post(
+                endpoint + "/schedule",
+                Collections.singletonMap("Content-Type", "application/json; charset=utf-8"),
+                body.toString()
+            );
+            if (response.status < 200 || response.status >= 300) {
+                executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ROLE_PLAN_RESCHEDULE_FAILED", "status=" + response.status, now);
+                return;
+            }
+            plan.put("status", "active");
+            plan.put("nextRunAt", nextRunAt);
+            plan.put("lastRunAt", now);
+            plan.put("cloudJobId", jobId);
+            plan.put("updatedAt", now);
+            persistRolePlanContinuation(turn, snapshot, plan, jobId, now);
+            continued.edit().putBoolean(continuationKey, true).apply();
+            executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "INFO", "ROLE_PLAN_RESCHEDULED", jobId, now);
+        } catch (Exception error) {
+            executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ROLE_PLAN_RESCHEDULE_FAILED", error.getMessage(), System.currentTimeMillis());
+        }
+    }
+
+    private void persistRolePlanContinuation(ChatTurnEntity turn, JSONObject snapshot, JSONObject plan, String jobId, long now) throws Exception {
+        RolePlanEntity row = new RolePlanEntity();
+        row.planId = plan.getString("planId");
+        row.characterId = turn.characterId;
+        row.status = plan.optString("status", "active");
+        row.nextRunAt = plan.has("nextRunAt") && !plan.isNull("nextRunAt") ? plan.optLong("nextRunAt") : null;
+        row.updatedAt = now;
+        row.planJson = plan.toString();
+        database.executionDao().upsertRolePlans(Collections.singletonList(row));
+
+        snapshot.put("rolePlan", plan);
+        snapshot.put("cloudJobId", jobId == null ? "" : jobId);
+        String snapshotId = turn.characterId + ":role-plan:" + row.planId;
+        CharacterSnapshotEntity stable = database.executionDao().latestSnapshot(snapshotId);
+        if (stable != null) {
+            stable.contextJson = snapshot.toString();
+            stable.createdAt = now;
+            database.executionDao().upsertSnapshot(stable);
+        }
+    }
+
+    private static boolean isRolePlanKind(String kind) {
+        return TurnKind.ROLE_PLAN_CHAT.name().equals(kind)
+            || TurnKind.ROLE_PLAN_MOMENT.name().equals(kind)
+            || TurnKind.ROLE_PLAN_CHAT_PRIVATE.name().equals(kind)
+            || TurnKind.ROLE_PLAN_MOMENT_PRIVATE.name().equals(kind);
+    }
+
+    private static String safeId(String value) {
+        return value == null ? "" : value.trim().replaceAll("[^a-zA-Z0-9_-]", "_");
+    }
+
+    private static String isoTime(long value) {
+        java.text.SimpleDateFormat formatter = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", java.util.Locale.US);
+        formatter.setTimeZone(java.util.TimeZone.getTimeZone("UTC"));
+        return formatter.format(new java.util.Date(value));
     }
 
     private String notificationText(ChatTurnEntity turn) {

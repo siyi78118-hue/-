@@ -101,7 +101,7 @@
       return list(characterId, { includeTerminal: true });
     }
 
-    return { list, apply, mutate, history, scheduleContext, reconcile };
+    return { list, apply, mutate, replace, history, scheduleContext, reconcile };
   }
 
   root.ALRolePlanRepository = { create, PLANS_KEY, HISTORY_KEY };

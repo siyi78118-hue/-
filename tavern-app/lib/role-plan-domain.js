@@ -213,7 +213,14 @@
       }
       if (operation.op === 'cancel') Object.assign(target, { status: 'cancelled', cancelledAt: now });
       if (operation.op === 'pause') target.status = 'paused';
-      if (operation.op === 'resume') target.status = 'active';
+      if (operation.op === 'resume') {
+        if (Number(target.nextRunAt) <= now) {
+          const resumedAt = nextOccurrence(target.schedule, now - 1);
+          if (Number.isFinite(resumedAt)) target.nextRunAt = resumedAt;
+          else target.lastErrorCode = 'PLAN_TIME_EXPIRED';
+        }
+        target.status = Number(target.nextRunAt) > now ? 'active' : 'failed';
+      }
       if (operation.op === 'complete') Object.assign(target, { status: 'completed', completedAt: now });
       target.updatedAt = now;
       nextHistory.push({

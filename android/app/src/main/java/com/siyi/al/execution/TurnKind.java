@@ -2,6 +2,10 @@ package com.siyi.al.execution;
 
 public enum TurnKind {
     DIRECT_REPLY,
+    ROLE_PLAN_CHAT,
+    ROLE_PLAN_MOMENT,
+    ROLE_PLAN_CHAT_PRIVATE,
+    ROLE_PLAN_MOMENT_PRIVATE,
     PROACTIVE_CHAT,
     PROACTIVE_MOMENT
 }
