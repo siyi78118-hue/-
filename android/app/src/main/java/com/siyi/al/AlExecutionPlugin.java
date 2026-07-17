@@ -1,6 +1,5 @@
 package com.siyi.al;
 
-import android.content.Intent;
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -23,6 +22,8 @@ import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanHistoryEntity;
+import com.siyi.al.execution.RolePlanAlarmScheduler;
+import com.siyi.al.execution.AutomaticTaskAlarmScheduler;
 import com.siyi.al.execution.secure.AlSecretStore;
 import java.util.ArrayList;
 import java.util.List;
@@ -80,11 +81,20 @@ public final class AlExecutionPlugin extends Plugin {
             snapshot.systemPrompt = call.getString("systemPrompt", "");
             snapshot.momentSystemPrompt = call.getString("momentSystemPrompt", "");
             snapshot.contextJson = required(call, "snapshotJson");
+            JSONObject context = new JSONObject(snapshot.contextJson);
+            snapshot.scheduledFor = context.has("scheduledFor") && !context.isNull("scheduledFor") ? context.optLong("scheduledFor") : null;
+            snapshot.automaticKind = context.optString("proactiveKind", "");
+            snapshot.cloudJobId = context.optString("cloudJobId", "").trim();
+            snapshot.automaticTasksEnabled = context.optBoolean("automaticTasksEnabled", false);
+            snapshot.jobSnapshot = !snapshot.cloudJobId.isEmpty() && snapshot.snapshotId.endsWith(":" + snapshot.cloudJobId);
             snapshot.chatConfigId = call.getString("chatConfigId", "chat-v1");
             snapshot.memoryConfigId = call.getString("memoryConfigId", "memory-v1");
             Long createdAt = call.getLong("createdAt", System.currentTimeMillis());
             snapshot.createdAt = createdAt == null ? System.currentTimeMillis() : createdAt;
             AlExecutionDatabase.get(getContext()).executionDao().upsertSnapshot(snapshot);
+            if (snapshot.jobSnapshot && snapshot.scheduledFor != null && snapshot.automaticTasksEnabled) {
+                AutomaticTaskAlarmScheduler.schedule(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
+            }
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("snapshotId", snapshot.snapshotId);
@@ -140,7 +150,8 @@ public final class AlExecutionPlugin extends Plugin {
         execute(call, () -> {
             AutomaticTaskCleanupResult cleanup = store.clearAutomaticTasks(System.currentTimeMillis());
             AlExecutionWakeWorker.cancel(getContext());
-            getContext().stopService(new Intent(getContext(), AlExecutionService.class));
+            AlBackgroundCoordinator.ensureScheduled(getContext());
+            AlExecutionService.requestRun(getContext());
             JSObject result = new JSObject();
             result.put("cancelledTurns", cleanup.cancelledTurns);
             result.put("cancelledAttempts", cleanup.cancelledAttempts);
@@ -278,6 +289,7 @@ public final class AlExecutionPlugin extends Plugin {
                 history.add(row);
             }
             AlExecutionDatabase.get(getContext()).executionDao().replaceRolePlans(characterId, plans, history);
+            RolePlanAlarmScheduler.rescheduleAll(getContext());
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("count", plans.size());

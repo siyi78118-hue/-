@@ -1,7 +1,7 @@
 // Cloudflare Worker: AL cloud timer.
 //
 // Bindings required:
-// - KV namespace: AL_TIMER_KV
+// - D1 database: AL_TIMER_DB
 // - Secret VAPID_PRIVATE_JWK: P-256 private JWK JSON string with x/y/d
 // - Variable VAPID_PUBLIC_KEY: base64url VAPID public key
 // - Variable VAPID_SUBJECT: e.g. mailto:you@example.com
@@ -15,18 +15,15 @@
 // { deviceId, jobId, charId, dueAt, type, planId, occurrenceId, source }. It does not store chat, memory,
 // role prompts, summaries, or API keys.
 //
-// Important quota note:
-// Workers KV Free has a very small daily quota. Do not scan jobs with KV.list()
-// every minute. Dice jobs arrive with their successful roll already precomputed,
-// so empty 10-minute rolls do not create KV writes or wake the phone.
+// Timer rows live in D1. Cron queries the indexed due_at column directly; no
+// KV due buckets or active-pointer keys are written.
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-16.17';
-const JOB_BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
+const CLOUD_TIMER_WORKER_VERSION = '2026-07-17.18';
 const FCM_ACK_MAX_ATTEMPTS = 8;
 let lastCronSummary = null;
 
@@ -55,11 +52,8 @@ export default {
           backgroundAck: isFcm ? Math.max(0, Number(body.capabilities?.backgroundAck) || 0) : 0,
           updatedAt: Date.now()
         };
-        const subscriptionKey = `sub:${body.deviceId}`;
-        const previousTargetRaw = await env.AL_TIMER_KV.get(subscriptionKey);
-        const previousTarget = previousTargetRaw ? JSON.parse(previousTargetRaw) : null;
-        const idempotent = samePushTarget(previousTarget, target);
-        if (!idempotent) await env.AL_TIMER_KV.put(subscriptionKey, JSON.stringify(target));
+        const saved = await timerStore(env).saveSubscription(target);
+        const idempotent = !!saved.idempotent;
         logWorkerEvent('register', { deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', idempotent, ok: true });
         return json({ ok: true, transport: isFcm ? 'fcm' : 'webpush', idempotent });
       }
@@ -87,6 +81,7 @@ export default {
           rollChance: Number.isFinite(Number(body.rollChance)) ? Number(body.rollChance) : undefined,
           diceIntervalMs: Number.isFinite(Number(body.diceIntervalMs)) ? Number(body.diceIntervalMs) : undefined,
           diceRolls: Number.isFinite(Number(body.diceRolls)) ? Number(body.diceRolls) : undefined,
+          maxRolls: Number.isFinite(Number(body.maxRolls)) ? Number(body.maxRolls) : undefined,
           dicePrecomputed: !!body.dicePrecomputed,
           test: !!body.test,
           updatedAt: Date.now()
@@ -125,8 +120,7 @@ export default {
       if (request.method === 'POST' && url.pathname === '/ack') {
         const body = await request.json();
         if (!body.jobId || !body.deviceId) throw new Error('missing jobId/deviceId');
-        const raw = await env.AL_TIMER_KV.get(`job:${body.jobId}`);
-        const job = raw ? JSON.parse(raw) : null;
+        const job = await timerStore(env).getJob(body.jobId);
         if (job && job.deviceId !== body.deviceId) throw new Error('device mismatch');
         await cancelJob(body.jobId, env);
         await appendEvent(env, { type: 'ack', deviceId: shortId(body.deviceId || job?.deviceId || ''), jobId: body.jobId, charId: body.charId || job?.charId || '', kind: body.kind || job?.kind || '', outcome: body.outcome || 'generated', ok: true });
@@ -135,9 +129,8 @@ export default {
       if (request.method === 'POST' && url.pathname === '/trigger') {
         const body = await request.json();
         if (!body.deviceId) throw new Error('missing deviceId');
-        const job = body.jobId
-          ? JSON.parse(await env.AL_TIMER_KV.get(`job:${body.jobId}`) || JSON.stringify(body))
-          : body;
+        const storedJob = body.jobId ? await timerStore(env).getJob(body.jobId) : null;
+        const job = storedJob || body;
         job.deviceId = job.deviceId || body.deviceId;
         job.jobId = job.jobId || body.jobId || `manual:${body.deviceId}:${Date.now()}`;
         job.charId = job.charId || body.charId || '';
@@ -177,7 +170,7 @@ export default {
 async function runDueJobs(env) {
   const startedAt = Date.now();
   const nowMinute = Math.floor(startedAt / 60000);
-  const startMinute = nowMinute - 5;
+  const startMinute = nowMinute;
   const summary = {
     ok: true,
     startedAt,
@@ -194,15 +187,29 @@ async function runDueJobs(env) {
     error: ''
   };
   try {
-    for (let minute = startMinute; minute <= nowMinute; minute++) {
-      const row = await runDueMinute(env, minute);
-      summary.buckets += 1;
-      summary.jobsSeen += row.jobsSeen;
-      summary.delivered += row.delivered;
-      summary.retry += row.retry;
-      summary.failed += row.failed;
-      summary.future += row.future;
-      summary.missing += row.missing;
+    const store = timerStore(env);
+    const jobs = await store.dueJobs(startedAt, 100);
+    summary.buckets = 1;
+    summary.jobsSeen = jobs.length;
+    for (const job of jobs) {
+      try {
+        const delivered = await deliverJob(job, env);
+        await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, awaitingAck: !!delivered.awaitingAck, payload: delivered.payload !== false });
+        if (delivered.awaitingAck) {
+          summary.delivered += 1;
+          if (!await deferForFcmAck(job, env)) summary.failed += 1;
+        } else if (delivered.retry) {
+          summary.retry += 1;
+          if (!await deferForDeliveryRetry(job, env, delivered.reason || 'push failed')) summary.failed += 1;
+        } else {
+          delivered.ok ? summary.delivered += 1 : summary.failed += 1;
+          await clearJobRecord(job, env);
+        }
+      } catch (err) {
+        await appendEvent(env, { type: 'deliver-error', jobId: job.jobId, ok: false, reason: String(err?.message || err).slice(0, 160), retry: true });
+        if (await deferForDeliveryRetry(job, env, err?.message || String(err))) summary.retry += 1;
+        else summary.failed += 1;
+      }
     }
   } catch (err) {
     summary.ok = false;
@@ -211,13 +218,91 @@ async function runDueJobs(env) {
   } finally {
     summary.finishedAt = Date.now();
     lastCronSummary = summary;
+    try {
+      const store = timerStore(env);
+      if (store.saveCronSummary) await store.saveCronSummary(summary);
+    } catch (metaError) {
+      console.warn('failed to persist cron summary:', metaError?.message || metaError);
+    }
     const hasActivity = !summary.ok || summary.jobsSeen > 0 || summary.delivered > 0 || summary.retry > 0 || summary.failed > 0 || summary.missing > 0;
     if (hasActivity) logWorkerEvent('cron', { ok: summary.ok, buckets: summary.buckets, jobsSeen: summary.jobsSeen, delivered: summary.delivered, retry: summary.retry, failed: summary.failed, missing: summary.missing, error: summary.error });
   }
 }
 
 async function getLastCron(env) {
-  return lastCronSummary;
+  if (lastCronSummary) return lastCronSummary;
+  const store = timerStore(env);
+  return store.getCronSummary ? await store.getCronSummary() : null;
+}
+
+function timerStore(env) {
+  if (env?.AL_TIMER_STORE) return env.AL_TIMER_STORE;
+  if (!env?.AL_TIMER_DB) throw new Error('AL_TIMER_DB binding is missing');
+  return createD1TimerStore(env.AL_TIMER_DB);
+}
+
+function createD1TimerStore(db) {
+  const parseJob = row => row?.payload_json ? JSON.parse(row.payload_json) : null;
+  return {
+    async getSubscription(deviceId) {
+      const row = await db.prepare('SELECT target_json FROM timer_devices WHERE device_id = ?1').bind(deviceId).first();
+      return row?.target_json ? JSON.parse(row.target_json) : null;
+    },
+    async saveSubscription(target) {
+      const previous = await this.getSubscription(target.deviceId);
+      const idempotent = samePushTarget(previous, target);
+      if (!idempotent) {
+        await db.prepare(`INSERT INTO timer_devices (device_id, transport, target_json, background_ack, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5)
+          ON CONFLICT(device_id) DO UPDATE SET transport=excluded.transport, target_json=excluded.target_json,
+          background_ack=excluded.background_ack, updated_at=excluded.updated_at`)
+          .bind(target.deviceId, target.transport, JSON.stringify(target), Number(target.backgroundAck || 0), target.updatedAt).run();
+      }
+      return { idempotent };
+    },
+    async deleteSubscription(deviceId) {
+      const result = await db.prepare('DELETE FROM timer_devices WHERE device_id = ?1').bind(deviceId).run();
+      return Number(result?.meta?.changes || 0) > 0;
+    },
+    async getJob(jobId) {
+      return parseJob(await db.prepare('SELECT payload_json FROM timer_jobs WHERE job_id = ?1').bind(jobId).first());
+    },
+    async saveJob(job, logicalKey) {
+      const activeRow = await db.prepare('SELECT job_id, payload_json FROM timer_jobs WHERE logical_key = ?1').bind(logicalKey).first();
+      const active = parseJob(activeRow);
+      const previous = await this.getJob(job.jobId);
+      if (active?.jobId === job.jobId && sameScheduledJob(previous, job)) return { idempotent: true, replacedJobId: '' };
+      await db.prepare(`INSERT OR REPLACE INTO timer_jobs
+        (job_id, logical_key, device_id, char_id, type, kind, plan_id, occurrence_id, source,
+         due_at, payload_json, delivery_attempts, awaiting_ack, test, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`)
+        .bind(job.jobId, logicalKey, job.deviceId, job.charId || '', job.type || 'proactive', job.kind || 'chat',
+          job.planId || null, job.occurrenceId || null, job.source || null, Date.parse(job.dueAt), JSON.stringify(job),
+          Number(job.deliveryAttempts || 0), job.awaitingAck ? 1 : 0, job.test ? 1 : 0, Number(job.updatedAt || Date.now())).run();
+      return { idempotent: false, replacedJobId: active?.jobId && active.jobId !== job.jobId ? active.jobId : '' };
+    },
+    async deleteJob(jobId) {
+      const result = await db.prepare('DELETE FROM timer_jobs WHERE job_id = ?1').bind(jobId).run();
+      return Number(result?.meta?.changes || 0) > 0;
+    },
+    async dueJobs(now, limit = 100) {
+      const result = await db.prepare('SELECT payload_json FROM timer_jobs WHERE due_at <= ?1 ORDER BY due_at ASC LIMIT ?2').bind(now, limit).all();
+      return (result?.results || []).map(parseJob).filter(Boolean);
+    },
+    async deviceJobs(deviceId) {
+      const result = await db.prepare('SELECT payload_json FROM timer_jobs WHERE device_id = ?1 ORDER BY due_at ASC').bind(deviceId).all();
+      return (result?.results || []).map(parseJob).filter(Boolean);
+    },
+    async getCronSummary() {
+      const row = await db.prepare("SELECT value_json FROM timer_meta WHERE meta_key = 'last_cron'").first();
+      return row?.value_json ? JSON.parse(row.value_json) : null;
+    },
+    async saveCronSummary(summary) {
+      await db.prepare(`INSERT INTO timer_meta (meta_key, value_json, updated_at) VALUES ('last_cron', ?1, ?2)
+        ON CONFLICT(meta_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at`)
+        .bind(JSON.stringify(summary), Date.now()).run();
+    }
+  };
 }
 
 function logicalTaskKey(job) {
@@ -228,7 +313,7 @@ function logicalTaskKey(job) {
 
 function sameScheduledJob(left, right) {
   if (!left || !right) return false;
-  const fields = ['deviceId', 'jobId', 'charId', 'dueAt', 'type', 'kind', 'planId', 'occurrenceId', 'source', 'mode', 'rollChance', 'diceIntervalMs', 'diceRolls', 'dicePrecomputed', 'test'];
+  const fields = ['deviceId', 'jobId', 'charId', 'dueAt', 'type', 'kind', 'planId', 'occurrenceId', 'source', 'mode', 'rollChance', 'diceIntervalMs', 'diceRolls', 'maxRolls', 'dicePrecomputed', 'test'];
   return fields.every(field => (left[field] ?? null) === (right[field] ?? null));
 }
 
@@ -242,64 +327,11 @@ function samePushTarget(left, right) {
 }
 
 async function saveJob(job, env) {
-  const activeKey = logicalTaskKey(job);
-  const activeJobId = String(await env.AL_TIMER_KV.get(activeKey) || '');
-  const previousRaw = await env.AL_TIMER_KV.get(`job:${job.jobId}`);
-  const previous = previousRaw ? JSON.parse(previousRaw) : null;
-  if (activeJobId === job.jobId && sameScheduledJob(previous, job)) {
-    return { idempotent: true, replacedJobId: '' };
-  }
-  const bucketKey = `due:${minuteKey(Date.parse(job.dueAt))}`;
-  await env.AL_TIMER_KV.put(`job:${job.jobId}`, JSON.stringify(job));
-  const raw = await env.AL_TIMER_KV.get(bucketKey);
-  const ids = raw ? JSON.parse(raw) : [];
-  if (!ids.includes(job.jobId)) {
-    ids.push(job.jobId);
-    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
-  }
-  if (activeJobId !== job.jobId) await env.AL_TIMER_KV.put(activeKey, job.jobId);
-  if (previous?.dueAt) {
-    const previousBucketKey = `due:${minuteKey(Date.parse(previous.dueAt))}`;
-    if (previousBucketKey !== bucketKey) await removeJobFromBucket(previousBucketKey, job.jobId, env);
-  }
-  if (activeJobId && activeJobId !== job.jobId) await cancelJob(activeJobId, env);
-  return { idempotent: false, replacedJobId: activeJobId && activeJobId !== job.jobId ? activeJobId : '' };
-}
-
-async function removeJobFromBucket(bucketKey, jobId, env) {
-  const raw = await env.AL_TIMER_KV.get(bucketKey);
-  if (!raw) return;
-  const ids = JSON.parse(raw).filter(id => id !== jobId);
-  if (ids.length) {
-    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(ids), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
-  } else {
-    await env.AL_TIMER_KV.delete(bucketKey);
-  }
+  return timerStore(env).saveJob(job, logicalTaskKey(job));
 }
 
 async function cancelJob(jobId, env) {
-  const raw = await env.AL_TIMER_KV.get(`job:${jobId}`);
-  if (raw) {
-    const job = JSON.parse(raw);
-    const dueAtMs = Date.parse(job.dueAt || '');
-    if (Number.isFinite(dueAtMs)) {
-      await removeJobFromBucket(`due:${minuteKey(dueAtMs)}`, jobId, env);
-    }
-    const activeKey = logicalTaskKey(job);
-    if (await env.AL_TIMER_KV.get(activeKey) === jobId) await env.AL_TIMER_KV.delete(activeKey);
-  }
-  await env.AL_TIMER_KV.delete(`job:${jobId}`);
-}
-
-async function listKvKeys(env, prefix) {
-  const names = [];
-  let cursor;
-  do {
-    const page = await env.AL_TIMER_KV.list({ prefix, ...(cursor ? { cursor } : {}) });
-    names.push(...(page.keys || []).map(row => row.name));
-    cursor = page.list_complete ? '' : page.cursor;
-  } while (cursor);
-  return names;
+  await timerStore(env).deleteJob(jobId);
 }
 
 function validDeviceId(value) {
@@ -313,43 +345,16 @@ function isDeviceAutomaticJobId(jobId, deviceId) {
 
 async function cancelDeviceAutomaticTasks(deviceId, env) {
   if (!validDeviceId(deviceId)) throw new Error('invalid deviceId');
-  const prefixes = [
-    { prefix: `job:mom_${deviceId}_`, kind: 'moment' },
-    { prefix: `job:pro_${deviceId}_`, kind: 'chat' },
-    { prefix: `job:rpl_${deviceId}_`, kind: 'role-plan' }
-  ];
+  const store = timerStore(env);
   let momentJobsDeleted = 0;
   let chatJobsDeleted = 0;
   let rolePlanJobsDeleted = 0;
-
-  for (const row of prefixes) {
-    const keys = await listKvKeys(env, row.prefix);
-    for (const key of keys) {
-      const raw = await env.AL_TIMER_KV.get(key);
-      const job = raw ? JSON.parse(raw) : null;
-      if (!job || job.deviceId !== deviceId || job.test) continue;
-      await cancelJob(job.jobId, env);
-      if (row.kind === 'moment') momentJobsDeleted += 1;
-      else if (row.kind === 'role-plan') rolePlanJobsDeleted += 1;
-      else chatJobsDeleted += 1;
-    }
-  }
-
-  let dueReferencesDeleted = 0;
-  let dueBucketsDeleted = 0;
-  const dueKeys = await listKvKeys(env, 'due:');
-  for (const key of dueKeys) {
-    const raw = await env.AL_TIMER_KV.get(key);
-    const ids = raw ? JSON.parse(raw) : [];
-    const remaining = ids.filter(id => !isDeviceAutomaticJobId(id, deviceId));
-    dueReferencesDeleted += ids.length - remaining.length;
-    if (remaining.length === ids.length) continue;
-    if (remaining.length) {
-      await env.AL_TIMER_KV.put(key, JSON.stringify(remaining), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
-    } else {
-      await env.AL_TIMER_KV.delete(key);
-      dueBucketsDeleted += 1;
-    }
+  for (const job of await store.deviceJobs(deviceId)) {
+    if (job.test || !isDeviceAutomaticJobId(job.jobId, deviceId)) continue;
+    await store.deleteJob(job.jobId);
+    if (job.type === 'role-plan') rolePlanJobsDeleted += 1;
+    else if (job.kind === 'moment') momentJobsDeleted += 1;
+    else chatJobsDeleted += 1;
   }
 
   return {
@@ -358,31 +363,26 @@ async function cancelDeviceAutomaticTasks(deviceId, env) {
     momentJobsDeleted,
     chatJobsDeleted,
     rolePlanJobsDeleted,
-    dueReferencesDeleted,
-    dueBucketsDeleted,
-    subscriptionPreserved: !!(await env.AL_TIMER_KV.get(`sub:${deviceId}`))
+    dueReferencesDeleted: momentJobsDeleted + chatJobsDeleted + rolePlanJobsDeleted,
+    dueBucketsDeleted: 0,
+    subscriptionPreserved: !!(await store.getSubscription(deviceId))
   };
 }
 
 async function jobStatus(jobId, deviceId, env) {
-  const raw = await env.AL_TIMER_KV.get(`job:${jobId}`);
-  const job = raw ? JSON.parse(raw) : null;
+  const store = timerStore(env);
+  const job = await store.getJob(jobId);
   const dueAtMs = Date.parse(job?.dueAt || '');
   const dueMinute = Number.isFinite(dueAtMs) ? minuteKey(dueAtMs) : null;
-  let bucketHasJob = false;
-  if (dueMinute != null) {
-    const bucketRaw = await env.AL_TIMER_KV.get(`due:${dueMinute}`);
-    const ids = bucketRaw ? JSON.parse(bucketRaw) : [];
-    bucketHasJob = ids.includes(jobId);
-  }
+  const bucketHasJob = !!job;
   const subDeviceId = deviceId || job?.deviceId || '';
-  const subRaw = subDeviceId ? await env.AL_TIMER_KV.get(`sub:${subDeviceId}`) : null;
+  const subscription = subDeviceId ? await store.getSubscription(subDeviceId) : null;
   return {
     ok: true,
     jobId,
     exists: !!job,
     bucketHasJob,
-    subscriptionExists: !!subRaw,
+    subscriptionExists: !!subscription,
     dueMinute,
     nowMinute: Math.floor(Date.now() / 60000),
     job: job ? {
@@ -400,74 +400,8 @@ async function jobStatus(jobId, deviceId, env) {
   };
 }
 
-async function runDueMinute(env, minute) {
-  const bucketKey = `due:${minute}`;
-  const raw = await env.AL_TIMER_KV.get(bucketKey);
-  const stats = { jobsSeen: 0, delivered: 0, retry: 0, failed: 0, future: 0, missing: 0 };
-  if (!raw) return stats;
-  const ids = JSON.parse(raw);
-  stats.jobsSeen = ids.length;
-  const now = Date.now();
-  const remaining = [];
-  for (const jobId of ids) {
-    const jobRaw = await env.AL_TIMER_KV.get(`job:${jobId}`);
-    if (!jobRaw) {
-      stats.missing += 1;
-      continue;
-    }
-    const job = JSON.parse(jobRaw);
-    if (!job.dueAt) {
-      stats.missing += 1;
-      continue;
-    }
-    const dueAtMs = Date.parse(job.dueAt);
-    const activeJobId = String(await env.AL_TIMER_KV.get(logicalTaskKey(job)) || '');
-    if (activeJobId && activeJobId !== job.jobId) {
-      stats.missing += 1;
-      await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
-      continue;
-    }
-    if (dueAtMs > now) {
-      stats.future += 1;
-      if (minuteKey(dueAtMs) === minute) remaining.push(jobId);
-      continue;
-    }
-    try {
-      const delivered = await deliverJob(job, env);
-      await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, awaitingAck: !!delivered.awaitingAck, payload: delivered.payload !== false });
-      if (delivered.awaitingAck) {
-        stats.delivered += 1;
-        const deferred = await deferForFcmAck(job, env);
-        if (!deferred) stats.failed += 1;
-      } else if (delivered.retry) {
-        stats.retry += 1;
-        const deferred = await deferForDeliveryRetry(job, env, delivered.reason || 'push failed');
-        if (!deferred) stats.failed += 1;
-      } else {
-        if (delivered.ok) stats.delivered += 1;
-        else stats.failed += 1;
-        await clearJobRecord(job, env);
-      }
-    } catch (err) {
-      console.warn(`deliver failed for ${jobId}:`, err.message);
-      await appendEvent(env, { type: 'deliver-error', jobId, ok: false, reason: String(err?.message || err).slice(0, 160), retry: true });
-      const deferred = await deferForDeliveryRetry(job, env, err?.message || String(err));
-      if (deferred) stats.retry += 1;
-      else stats.failed += 1;
-    }
-  }
-  if (remaining.length) {
-    await env.AL_TIMER_KV.put(bucketKey, JSON.stringify(remaining), { expirationTtl: JOB_BUCKET_TTL_SECONDS });
-  } else {
-    await env.AL_TIMER_KV.delete(bucketKey);
-  }
-  return stats;
-}
-
 async function clearJobRecord(job, env) {
-  await env.AL_TIMER_KV.delete(`job:${job.jobId}`);
-  const activeKey = logicalTaskKey(job);
-  if (await env.AL_TIMER_KV.get(activeKey) === job.jobId) await env.AL_TIMER_KV.delete(activeKey);
+  await timerStore(env).deleteJob(job.jobId);
 }
 
 function minuteKey(ms) {
@@ -522,9 +456,9 @@ async function deferForDeliveryRetry(job, env, reason = '') {
 }
 
 async function deliverJob(job, env) {
-  const subRaw = await env.AL_TIMER_KV.get(`sub:${job.deviceId}`);
-  if (!subRaw) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
-  const target = JSON.parse(subRaw);
+  const store = timerStore(env);
+  const target = await store.getSubscription(job.deviceId);
+  if (!target) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
   const result = await sendPush(target, env, {
     type: job.type === 'role-plan' ? 'role-plan' : 'proactive',
     deviceId: job.deviceId || '',
@@ -538,12 +472,13 @@ async function deliverJob(job, env) {
     rollChance: job.rollChance,
     diceIntervalMs: job.diceIntervalMs,
     diceRolls: job.diceRolls,
+    maxRolls: job.maxRolls,
     dicePrecomputed: !!job.dicePrecomputed,
     dueAt: job.dueAt || '',
     test: !!job.test
   });
   if (result.expired) {
-    await env.AL_TIMER_KV.delete(`sub:${job.deviceId}`);
+    await store.deleteSubscription(job.deviceId);
     return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: false };
   }
   if (!result.ok) return { ok: false, reason: result.reason || 'push failed', jobId: job.jobId, retry: true };
@@ -579,6 +514,11 @@ function classifyWorkerError(err, now = Date.now()) {
       error: 'Cloudflare KV daily write limit exceeded.',
       retryAt
     };
+  }
+  if (/D1.*(?:limit|quota)|(?:limit|quota).*D1/i.test(message)) {
+    const current = new Date(now);
+    const retryAt = new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate() + 1)).toISOString();
+    return { status: 429, code: 'D1_DAILY_LIMIT', error: 'Cloudflare D1 daily limit exceeded.', retryAt };
   }
   return { status: 400, code: 'REQUEST_FAILED', error: message, retryAt: '' };
 }

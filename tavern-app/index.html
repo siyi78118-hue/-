@@ -1282,7 +1282,7 @@ const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
   'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@update-channel/android-update.json'
 ];
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-16.17';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-17.18';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -1623,7 +1623,15 @@ async function applyRolePlanOperations(charId, operations, evidenceMessageIds = 
   }));
   const result = await getRolePlanRepository().apply(charId, enriched);
   rolePlanCache.set(charId, result.plans || []);
-  if (typeof syncRolePlanCloudJobs === 'function') syncRolePlanCloudJobs(charId).catch(err => console.warn('[AL RolePlan] cloud sync skipped:', err.message));
+  if (typeof syncRolePlanCloudJobs === 'function') {
+    try {
+      const sync = await syncRolePlanCloudJobs(charId);
+      result.cloudSyncFailed = !!sync?.failed;
+    } catch (err) {
+      result.cloudSyncFailed = true;
+      console.warn('[AL RolePlan] cloud sync skipped:', err.message);
+    }
+  }
   return result;
 }
 async function applyNativePlanParts(charId, parts, sourceTurnId) {
@@ -1642,6 +1650,11 @@ function rolePlanSourceLabel(source) {
 }
 function rolePlanStatusLabel(status) {
   return ({ active: '待执行', paused: '已暂停', running: '执行中', failed: '待重试', completed: '已完成', cancelled: '已取消' })[status] || status || '未知';
+}
+function rolePlanCloudStatusLabel(plan) {
+  if (plan.type === 'role_schedule') return '仅本地日程';
+  return ({ synced: '云端已确认', syncing: '正在同步', pending: '等待云端同步', failed: '云端同步失败，本地仍会执行' })[plan.cloudSyncState]
+    || (plan.cloudJobId ? '云端待核验' : '等待云端同步');
 }
 function localDateTimeInputValue(at) {
   const date = new Date(at);
@@ -1677,7 +1690,7 @@ async function renderRolePlansScreen() {
       : '';
     return `<div class="plan-card">
       <div class="plan-card-title">${esc(plan.title || plan.intent || '未命名安排')}</div>
-      <div class="plan-card-meta">${esc(rolePlanTypeLabel(plan.type))}｜${esc(rolePlanStatusLabel(plan.status))}｜${esc(rolePlanSourceLabel(plan.source))}<br>${esc(time)}</div>
+      <div class="plan-card-meta">${esc(rolePlanTypeLabel(plan.type))}｜${esc(rolePlanStatusLabel(plan.status))}｜${esc(rolePlanSourceLabel(plan.source))}<br>${esc(time)}<br>${esc(rolePlanCloudStatusLabel(plan))}</div>
       <div class="plan-card-intent">${esc(plan.intent || '')}</div>
       ${(primary || cancel) ? `<div class="plan-card-actions">${primary}${cancel}</div>` : ''}
     </div>`;
@@ -1720,7 +1733,7 @@ async function createRolePlanFromUi() {
   document.getElementById('role-plan-at').value = localDateTimeInputValue(Date.now() + 60 * 60 * 1000);
   document.getElementById('role-plan-editor').open = false;
   await renderRolePlansScreen();
-  toast('安排已保存');
+  toast(result.cloudSyncFailed ? '安排已保存在本机；云端同步失败，将由后台保护补跑' : '安排已保存并同步');
 }
 
 async function dumpMemoryStores() {
@@ -2168,7 +2181,10 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
     proactiveKind: kind,
     proactiveMode: triggerMode,
+    proactiveJob: job ? { ...job } : null,
+    continuationDice: proactiveDiceOptions(kind),
     cloudJobId: job?.jobId || '',
+    scheduledFor: job?.dueAt ? Date.parse(job.dueAt) : null,
     automaticTasksEnabled: automaticTasksEnabled(settings),
     timerEndpoint: settings.timerEndpoint || '',
     deviceId: settings.deviceId || '',
@@ -2248,6 +2264,7 @@ async function saveNativeRolePlanSnapshot(charId, plan, job) {
     rolePlan: { ...plan, cloudJobId: job.jobId },
     proactiveKind: isMoment ? 'moment' : 'chat',
     cloudJobId: job.jobId,
+    scheduledFor: Number(plan.nextRunAt),
     automaticTasksEnabled: automaticTasksEnabled(settings),
     timerEndpoint: settings.timerEndpoint || '',
     deviceId: settings.deviceId || '',
@@ -2274,9 +2291,15 @@ async function syncRolePlanCloudJobs(charId) {
   syncingRolePlanChars.add(charId);
   try {
     const plans = await refreshRolePlanCache(charId);
-    if (!cloudTimerTransportReady() || !automaticTasksEnabled(settings)) return false;
+    if (!cloudTimerTransportReady() || !automaticTasksEnabled(settings)) {
+      for (const plan of plans.filter(row => row.type !== 'role_schedule' && row.status === 'active')) {
+        await patchRolePlanCloudState(charId, plan.planId, { cloudSyncState: 'pending', lastErrorCode: 'CLOUD_TRANSPORT_NOT_READY' });
+      }
+      return { changed: false, failed: true };
+    }
     ensureDeviceId();
     let changed = false;
+    let failed = false;
     for (const plan of plans) {
       const runnable = plan.type !== 'role_schedule'
         && plan.status === 'active'
@@ -2295,23 +2318,44 @@ async function syncRolePlanCloudJobs(charId) {
       }
       const job = globalThis.ALRolePlans.cloudJob(plan, settings.deviceId);
       await saveNativeRolePlanSnapshot(charId, plan, job);
-      if (plan.cloudJobId === job.jobId) continue;
-      const resp = await fetchWithTimeout(timerUrl('/schedule'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(job)
-      }, API_TIMEOUT_MS);
-      if (!resp.ok) throw await cloudTimerResponseError(resp, '角色安排同步失败');
-      clearCloudTimerQuotaPause();
-      if (plan.cloudJobId && plan.cloudJobId !== job.jobId) await cancelCloudJobId(plan.cloudJobId);
-      const result = await getRolePlanRepository().apply(charId, [{ op: 'update', planId: plan.planId, patch: { cloudJobId: job.jobId, lastErrorCode: null } }]);
-      rolePlanCache.set(charId, result.plans || plans);
-      changed = true;
+      await patchRolePlanCloudState(charId, plan.planId, { cloudSyncState: 'syncing', lastErrorCode: null });
+      try {
+        let verified = false;
+        if (plan.cloudJobId === job.jobId) {
+          const statusResp = await fetchWithTimeout(timerUrl('/job-status'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceId: settings.deviceId, jobId: job.jobId })
+          }, 15000);
+          if (statusResp.ok) {
+            const status = await statusResp.json();
+            verified = !!status.exists && !!status.bucketHasJob && !!status.subscriptionExists;
+          }
+        }
+        if (!verified) {
+          const resp = await fetchWithTimeout(timerUrl('/schedule'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(job)
+          }, API_TIMEOUT_MS);
+          if (!resp.ok) throw await cloudTimerResponseError(resp, '角色安排同步失败');
+        }
+        clearCloudTimerQuotaPause();
+        if (plan.cloudJobId && plan.cloudJobId !== job.jobId) await cancelCloudJobId(plan.cloudJobId);
+        await patchRolePlanCloudState(charId, plan.planId, { cloudJobId: job.jobId, cloudSyncState: 'synced', lastErrorCode: null });
+        changed = true;
+      } catch (err) {
+        failed = true;
+        await patchRolePlanCloudState(charId, plan.planId, { cloudSyncState: 'failed', lastErrorCode: err.code || 'CLOUD_SYNC_FAILED' });
+      }
     }
-    return changed;
+    return { changed, failed };
   } finally {
     syncingRolePlanChars.delete(charId);
   }
+}
+
+async function patchRolePlanCloudState(charId, planId, patch) {
+  const result = await getRolePlanRepository().apply(charId, [{ op: 'update', planId, patch }]);
+  rolePlanCache.set(charId, result.plans || rolePlanCache.get(charId) || []);
+  return result;
 }
 
 function pendingNativeReplyCount() {
@@ -7917,7 +7961,8 @@ function cloudTimerDefaultQuotaRetryAt(now = Date.now()) {
   return new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth(), current.getUTCDate() + 1)).toISOString();
 }
 function isCloudTimerQuotaError(err) {
-  return err?.code === 'KV_DAILY_WRITE_LIMIT' || /KV put\(\) limit exceeded for the day|KV daily write limit exceeded/i.test(String(err?.message || err || ''));
+  return ['KV_DAILY_WRITE_LIMIT', 'D1_DAILY_LIMIT'].includes(err?.code)
+    || /KV put\(\) limit exceeded for the day|KV daily write limit exceeded|D1 daily limit exceeded/i.test(String(err?.message || err || ''));
 }
 function cloudTimerQuotaPauseActive(now = Date.now()) {
   const retryAt = Date.parse(settings.cloudTimerQuotaRetryAt || '');
@@ -7938,8 +7983,8 @@ async function cloudTimerResponseError(resp, label = '云闹钟请求失败') {
   const code = String(payload?.code || '');
   const retryAt = String(payload?.retryAt || '');
   const raw = String(payload?.error || '').trim();
-  const message = code === 'KV_DAILY_WRITE_LIMIT'
-    ? `Cloudflare KV 今日写入额度已用完，将于 ${cloudTimerQuotaRetryLabel(retryAt || cloudTimerDefaultQuotaRetryAt())} 自动重试`
+  const message = ['KV_DAILY_WRITE_LIMIT', 'D1_DAILY_LIMIT'].includes(code)
+    ? `Cloudflare ${code === 'D1_DAILY_LIMIT' ? 'D1' : 'KV'} 今日写入额度已用完，将于 ${cloudTimerQuotaRetryLabel(retryAt || cloudTimerDefaultQuotaRetryAt())} 自动重试`
     : (raw || `HTTP ${resp.status}`);
   const err = new Error(`${label}：${message}`);
   err.code = code;

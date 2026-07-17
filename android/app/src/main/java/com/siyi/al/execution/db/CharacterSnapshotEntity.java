@@ -7,7 +7,10 @@ import androidx.room.PrimaryKey;
 
 @Entity(
     tableName = "character_snapshots",
-    indices = @Index(value = {"characterId", "createdAt"})
+    indices = {
+        @Index(value = {"characterId", "createdAt"}),
+        @Index(value = {"cloudJobId", "scheduledFor"})
+    }
 )
 public class CharacterSnapshotEntity {
     @PrimaryKey @NonNull public String snapshotId = "";
@@ -20,4 +23,9 @@ public class CharacterSnapshotEntity {
     @NonNull public String chatConfigId = "";
     @NonNull public String memoryConfigId = "";
     public long createdAt;
+    public Long scheduledFor;
+    public String automaticKind;
+    public String cloudJobId;
+    public boolean automaticTasksEnabled;
+    public boolean jobSnapshot;
 }

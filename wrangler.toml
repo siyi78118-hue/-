@@ -2,9 +2,11 @@ name = "al-cloud-timer"
 main = "cloud-timer-worker.js"
 compatibility_date = "2024-11-01"
 
-kv_namespaces = [
-  { binding = "AL_TIMER_KV", id = "02034f8dcc6a437cb8d9659494a583ec" }
-]
+[[d1_databases]]
+binding = "AL_TIMER_DB"
+database_name = "al-cloud-timer"
+database_id = "67138e1d-9fa9-447d-add8-569db95405f1"
+migrations_dir = "migrations"
 
 [triggers]
 crons = ["* * * * *"]

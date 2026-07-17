@@ -4,6 +4,11 @@ import androidx.annotation.NonNull;
 import com.capacitorjs.plugins.pushnotifications.MessagingService;
 import com.google.firebase.messaging.RemoteMessage;
 import com.siyi.al.execution.AlExecutionService;
+import com.siyi.al.execution.AlExecutionWakeWorker;
+import com.siyi.al.execution.AlNotificationFactory;
+import com.siyi.al.execution.RolePlanCoordinator;
+import com.siyi.al.execution.RolePlanOccurrenceKey;
+import androidx.core.app.NotificationManagerCompat;
 import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -17,7 +22,7 @@ public class AlFirebaseMessagingService extends MessagingService {
     public void onMessageReceived(@NonNull RemoteMessage remoteMessage) {
         Map<String, String> data = remoteMessage.getData();
         if ("role-plan".equals(data.get("type"))) {
-            handleRolePlan(data);
+            handleRolePlan(data, remoteMessage);
             return;
         }
         if (!"proactive".equals(data.get("type"))) {
@@ -35,6 +40,7 @@ public class AlFirebaseMessagingService extends MessagingService {
         String turnId = "cloud_" + safeJobId;
         long now = System.currentTimeMillis();
         store.recordDiagnostic(turnId, null, "INFO", "FCM_RECEIVED", kindName + ":" + jobId, now);
+        store.recordDiagnostic(turnId, null, "INFO", "FCM_PRIORITY", priorityDetail(remoteMessage), now);
         CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(snapshotId(characterId, kindName, jobId));
         if (snapshot == null) {
             snapshot = database.executionDao().latestSnapshot(characterId + ":" + kindName);
@@ -59,10 +65,11 @@ public class AlFirebaseMessagingService extends MessagingService {
             jobId,
             now
         ));
-        AlExecutionService.requestRun(this);
+        showPending(turnId, snapshot.characterName);
+        AlExecutionWakeWorker.enqueue(this);
     }
 
-    private void handleRolePlan(Map<String, String> data) {
+    private void handleRolePlan(Map<String, String> data, RemoteMessage remoteMessage) {
         String characterId = text(data.get("charId"));
         String planId = text(data.get("planId"));
         String occurrenceId = text(data.get("occurrenceId"));
@@ -76,6 +83,7 @@ public class AlFirebaseMessagingService extends MessagingService {
         String turnId = "cloud_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
         long now = System.currentTimeMillis();
         store.recordDiagnostic(turnId, null, "INFO", "ROLE_PLAN_FCM", planId + ":" + occurrenceId, now);
+        store.recordDiagnostic(turnId, null, "INFO", "FCM_PRIORITY", priorityDetail(remoteMessage), now);
         CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(rolePlanSnapshotId(characterId, planId));
         if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) {
             store.recordDiagnostic(turnId, null, "WARN", "ROLE_PLAN_SNAPSHOT_MISSING", planId, now);
@@ -91,21 +99,10 @@ public class AlFirebaseMessagingService extends MessagingService {
         } catch (Exception ignored) {
             return;
         }
-        boolean privateDecision = "private_decision".equals(text(data.get("source")));
-        TurnKind kind = "moment_post".equals(kindName)
-            ? (privateDecision ? TurnKind.ROLE_PLAN_MOMENT_PRIVATE : TurnKind.ROLE_PLAN_MOMENT)
-            : (privateDecision ? TurnKind.ROLE_PLAN_CHAT_PRIVATE : TurnKind.ROLE_PLAN_CHAT);
-        store.submitTurn(new TurnSubmission(
-            turnId,
-            characterId,
-            turnId,
-            kind,
-            new JSONObject(data).toString(),
-            snapshot.contextJson,
-            jobId,
-            now
-        ));
-        AlExecutionService.requestRun(this);
+        if (!new RolePlanCoordinator(this).dispatchCurrent(planId, jobId, now)) return;
+        String occurrenceTurnId = "plan_" + occurrenceId.replaceAll("[^a-zA-Z0-9_-]", "_");
+        showPending(occurrenceTurnId, snapshot.characterName);
+        AlExecutionWakeWorker.enqueue(this);
     }
 
     static String rolePlanSnapshotId(String characterId, String planId) {
@@ -138,5 +135,22 @@ public class AlFirebaseMessagingService extends MessagingService {
 
     private static String text(String value) {
         return value == null ? "" : value.trim();
+    }
+
+    private static String priorityDetail(RemoteMessage message) {
+        return "original=" + message.getOriginalPriority() + ";delivered=" + message.getPriority();
+    }
+
+    private void showPending(String turnId, String title) {
+        try {
+            AlNotificationFactory factory = new AlNotificationFactory(this);
+            factory.ensureChannels();
+            NotificationManagerCompat.from(this).notify(
+                AlNotificationFactory.messageNotificationId(turnId),
+                factory.pendingMessageNotification(title, turnId.hashCode())
+            );
+        } catch (SecurityException ignored) {
+            // Notification permission may be disabled; execution still continues.
+        }
     }
 }

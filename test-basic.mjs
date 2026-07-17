@@ -87,10 +87,11 @@ assert.equal(existsSync(androidReplyQueuePath), false, 'retired RunnerWorker bri
 assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS runner source must be removed');
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
+assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopService\(/, 'clearing automatic tasks must not stop the 24-hour background guard');
 for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*3[\s\S]*MIGRATION_2_3/, 'Room must migrate existing installs without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*5[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5/, 'Room must migrate existing installs without destructive reset');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
 assert.match(executionDao, /state\s*=\s*'COMPLETED'[\s\S]{0,240}uiAppliedAt\s+IS\s+NULL/, 'Room must keep a durable inbox of completed turns not yet applied to the UI');
@@ -121,7 +122,7 @@ assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_pu
 assert.match(androidFcmService, /latestSnapshot\(/);
 assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'FCM must reject a cloud job replaced by a newer snapshot');
 assert.match(androidFcmService, /submitTurn\(/);
-assert.match(androidFcmService, /AlExecutionService\.requestRun\(/);
+assert.match(androidFcmService, /AlExecutionWakeWorker\.enqueue\(/, 'FCM must extend execution through expedited WorkManager');
 assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'stale role-plan cloud wakes must be rejected after a plan is rescheduled');
 assert.match(html, /async function reconcileNativeExecutionTurns[\s\S]{0,2500}plugin\.changesSince\(/, 'web UI must consume Room changes created while WebView was absent');
 assert.match(retryPolicy, /SocketException[\s\S]*NETWORK_INTERRUPTED[\s\S]*true/, 'native execution must retain retryable connection interruptions');
@@ -645,7 +646,7 @@ const runDueJobsSource = cloudTimerWorkerCode.slice(
   cloudTimerWorkerCode.indexOf('async function getLastCron')
 );
 assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-16\.17';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-17\.18';/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
@@ -653,55 +654,46 @@ assert.match(cloudTimerWorker, /async function deferForFcmAck/);
 assert.match(cloudTimerWorker, /awaitingAck: result\.transport === 'fcm' && Number\(target\.backgroundAck\) >= 1/);
 assert.match(cloudTimerWorker, /firebase\.messaging/);
 assert.match(script, /async function enableNativeCloudTimer/);
-assert.match(cloudTimerWorker, /const JOB_BUCKET_TTL_SECONDS = 7 \* 24 \* 60 \* 60;/);
+assert.match(cloudTimerWorker, /AL_TIMER_DB binding is missing/);
+assert.match(readFileSync(new URL('./migrations/0001_timer_store.sql', import.meta.url), 'utf8'), /idx_timer_jobs_due_at/);
 assert.match(cloudTimerWorker, /const hasActivity = !summary\.ok \|\| summary\.jobsSeen > 0/);
 assert.doesNotMatch(runDueJobsSource, /AL_TIMER_KV\.put/, 'cron health and logs must not consume KV writes');
 assert.match(cloudTimerWorker, /if \(hasActivity\) logWorkerEvent\('cron'/);
 assert.doesNotMatch(cloudTimerWorker, /meta:lastCron|meta:recentEvents/);
-assert.ok((cloudTimerWorker.match(/expirationTtl: JOB_BUCKET_TTL_SECONDS/g) || []).length >= 3);
+assert.doesNotMatch(cloudTimerWorker, /AL_TIMER_KV\.(?:put|delete|list)/, 'timer task writes must use D1');
 assert.match(cloudTimerWorker, /version: CLOUD_TIMER_WORKER_VERSION/);
 assert.match(cloudTimerWorker, /mode: body\.mode === 'dice' \? 'dice' : 'planned'/);
 assert.match(cloudTimerWorker, /rollChance: job\.rollChance/);
 assert.match(cloudTimerWorker, /diceRolls: job\.diceRolls/);
 assert.match(cloudTimerWorker, /dicePrecomputed: !!job\.dicePrecomputed/);
 const cloudWorkerModule = await import(`data:text/javascript;base64,${Buffer.from(cloudTimerWorker).toString('base64')}`);
-const idleCronWrites = [];
 const idleCronWaits = [];
 const idleCronEnv = {
-  AL_TIMER_KV: {
-    async get() { return null; },
-    async put(key, value, options) { idleCronWrites.push({ key, value, options }); },
-    async delete() {}
+  AL_TIMER_STORE: {
+    async dueJobs() { return []; }
   }
 };
 await cloudWorkerModule.default.scheduled({}, idleCronEnv, { waitUntil(promise) { idleCronWaits.push(promise); } });
 await Promise.all(idleCronWaits);
-assert.equal(idleCronWrites.some(row => row.key === 'meta:recentEvents'), false, '空闲 cron 不得每分钟写流水');
-assert.ok(idleCronWrites.filter(row => row.key === 'meta:lastCron').length <= 1, '空闲 cron 只能按心跳节流写一次状态');
+assert.equal(idleCronWaits.length, 1, '空闲 cron 只执行一次索引查询，不写健康流水');
 const ackDueAt = new Date(Date.now() + 60000).toISOString();
-const ackMinute = Math.ceil(Date.parse(ackDueAt) / 60000);
-const ackStore = new Map([
-  ['job:ack-job', JSON.stringify({ jobId: 'ack-job', deviceId: 'device-a', charId: 'char-a', kind: 'chat', dueAt: ackDueAt })],
-  [`due:${ackMinute}`, JSON.stringify(['ack-job'])]
-]);
+const ackStore = new Map([['ack-job', { jobId: 'ack-job', deviceId: 'device-a', charId: 'char-a', kind: 'chat', dueAt: ackDueAt }]]);
 const ackEnv = {
-  AL_TIMER_KV: {
-    async get(key) { return ackStore.get(key) ?? null; },
-    async put(key, value) { ackStore.set(key, value); },
-    async delete(key) { ackStore.delete(key); }
+  AL_TIMER_STORE: {
+    async getJob(jobId) { return ackStore.get(jobId) ?? null; },
+    async deleteJob(jobId) { return ackStore.delete(jobId); }
   }
 };
 const wrongAckResponse = await cloudWorkerModule.default.fetch(new Request('https://worker.example/ack', {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deviceId: 'device-b', jobId: 'ack-job' })
 }), ackEnv);
 assert.equal(wrongAckResponse.status, 400, '其他设备不得确认并删除任务');
-assert.equal(ackStore.has('job:ack-job'), true);
+assert.equal(ackStore.has('ack-job'), true);
 const ackResponse = await cloudWorkerModule.default.fetch(new Request('https://worker.example/ack', {
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ deviceId: 'device-a', jobId: 'ack-job', outcome: 'generated' })
 }), ackEnv);
 assert.equal(ackResponse.status, 200);
-assert.equal(ackStore.has('job:ack-job'), false, '手机成功回执后必须删除云端任务');
-assert.equal(ackStore.has(`due:${ackMinute}`), false, '手机成功回执后必须移出到期桶');
+assert.equal(ackStore.has('ack-job'), false, '手机成功回执后必须删除云端任务');
 assert.match(cloudTimerWorker, /url\.pathname === '\/logs'/);
 assert.match(cloudTimerWorker, /async function appendEvent\(env, event\)/);
 assert.match(cloudTimerWorker, /source: 'workers-logs'/);
@@ -718,7 +710,7 @@ assert.match(cloudTimerDeployScript, /WRANGLER_CMD/);
 assert.match(wranglerRunScript, /Tools\\\\bin\\\\wrangler\.cmd/);
 assert.match(wranglerRunScript, /Missing CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-16\.17'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-17\.18'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);
@@ -763,15 +755,15 @@ assert.match(swScript, /const replyText = cleanAssistantChatReply\(reply\)/);
 assert.match(swScript, /appendAssistantMessages\(chat, replyText/);
 assert.match(script, /'like' in json \|\| 'timeline' in json/);
 assert.match(script, /return cleanAssistantChatReply\(reply\)/);
-assert.match(cloudTimerWorker, /const bucketKey = `due:\$\{minute\}`/);
+assert.match(cloudTimerWorker, /store\.dueJobs\(startedAt, 100\)/, 'cron must query the indexed D1 due time');
 assert.match(cloudTimerWorker, /async function cancelJob\(jobId, env\)/);
-assert.match(cloudTimerWorker, /removeJobFromBucket\(`due:\$\{minuteKey\(dueAtMs\)\}`, jobId, env\)/);
-assert.doesNotMatch(cloudTimerWorker, /if \(body\.jobId\) await env\.AL_TIMER_KV\.delete\(`job:\$\{body\.jobId\}`\)/);
+assert.match(cloudTimerWorker, /timerStore\(env\)\.deleteJob\(jobId\)/);
+assert.doesNotMatch(cloudTimerWorker, /AL_TIMER_KV\.delete/);
 assert.match(cloudTimerWorker, /if \(job\.jobId && !delivered\.retry && !delivered\.awaitingAck\) await cancelJob\(job\.jobId, env\)/);
 assert.match(cloudTimerWorker, /if \(delivered\.awaitingAck\)/);
 assert.match(cloudTimerWorker, /else if \(delivered\.retry\)/);
 assert.match(cloudTimerWorker, /resp\.status === 404 \|\| resp\.status === 410/);
-assert.match(cloudTimerWorker, /delete\(`sub:\$\{job\.deviceId\}`\)/);
+assert.match(cloudTimerWorker, /deleteSubscription\(job\.deviceId\)/);
 
 const storage = new Map();
 const elements = new Map();

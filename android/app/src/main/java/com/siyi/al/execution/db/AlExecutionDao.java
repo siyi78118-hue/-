@@ -31,6 +31,9 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     void upsertRolePlanHistory(List<RolePlanHistoryEntity> history);
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertRolePlanOccurrence(RolePlanOccurrenceEntity occurrence);
+
     @Insert
     long insertDiagnostic(DiagnosticEntity diagnostic);
 
@@ -46,8 +49,32 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM character_snapshots WHERE snapshotId = :snapshotId LIMIT 1")
     CharacterSnapshotEntity latestSnapshot(String snapshotId);
 
+    @Query("SELECT * FROM character_snapshots WHERE jobSnapshot = 1 AND automaticTasksEnabled = 1 AND scheduledFor IS NOT NULL AND scheduledFor <= :now AND cloudJobId IS NOT NULL AND cloudJobId != '' ORDER BY scheduledFor ASC LIMIT :limit")
+    List<CharacterSnapshotEntity> dueAutomaticSnapshots(long now, int limit);
+
     @Query("SELECT * FROM role_plans WHERE characterId = :characterId ORDER BY CASE WHEN nextRunAt IS NULL THEN 1 ELSE 0 END, nextRunAt ASC, updatedAt DESC")
     List<RolePlanEntity> rolePlans(String characterId);
+
+    @Query("SELECT * FROM role_plans WHERE planId = :planId LIMIT 1")
+    RolePlanEntity rolePlan(String planId);
+
+    @Query("SELECT * FROM role_plans WHERE status = 'active' AND nextRunAt IS NOT NULL AND nextRunAt <= :now ORDER BY nextRunAt ASC LIMIT :limit")
+    List<RolePlanEntity> dueRolePlans(long now, int limit);
+
+    @Query("SELECT * FROM role_plans WHERE status = 'active' AND nextRunAt IS NOT NULL ORDER BY nextRunAt ASC LIMIT 100")
+    List<RolePlanEntity> dueOrFutureActiveRolePlans();
+
+    @Query("SELECT * FROM role_plan_occurrences WHERE occurrenceId = :occurrenceId LIMIT 1")
+    RolePlanOccurrenceEntity rolePlanOccurrence(String occurrenceId);
+
+    @Query("SELECT * FROM role_plan_occurrences WHERE turnId = :turnId LIMIT 1")
+    RolePlanOccurrenceEntity rolePlanOccurrenceByTurn(String turnId);
+
+    @Query("UPDATE role_plan_occurrences SET state = 'COMPLETED', completedAt = :now, updatedAt = :now, errorCode = '' WHERE occurrenceId = :occurrenceId AND state != 'COMPLETED'")
+    int completeRolePlanOccurrence(String occurrenceId, long now);
+
+    @Query("UPDATE role_plan_occurrences SET state = 'FAILED', errorCode = :code, updatedAt = :now WHERE occurrenceId = :occurrenceId")
+    int failRolePlanOccurrence(String occurrenceId, String code, long now);
 
     @Query("SELECT * FROM role_plan_history WHERE planId = :planId ORDER BY createdAt DESC LIMIT :limit")
     List<RolePlanHistoryEntity> rolePlanHistory(String planId, int limit);

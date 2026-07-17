@@ -81,4 +81,26 @@ public final class AlNotificationFactory {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build();
     }
+
+    public Notification pendingMessageNotification(String title, int requestCode) {
+        Intent open = new Intent(context, MainActivity.class)
+            .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+        PendingIntent pending = PendingIntent.getActivity(
+            context, requestCode, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+        );
+        return new NotificationCompat.Builder(context, MESSAGE_CHANNEL)
+            .setSmallIcon(R.drawable.ic_al_notification)
+            .setContentTitle(title == null || title.trim().isEmpty() ? "AL" : title.trim())
+            .setContentText("正在生成角色消息…")
+            .setContentIntent(pending)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build();
+    }
+
+    public static int messageNotificationId(String turnId) {
+        return 72000 + Math.abs(String.valueOf(turnId).hashCode() % 20000);
+    }
 }

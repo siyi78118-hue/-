@@ -1601,7 +1601,8 @@ function cloudTimerQuotaPauseActive(settings, now = Date.now()) {
   return Number.isFinite(retryAt) && retryAt > now;
 }
 function isCloudTimerQuotaError(err) {
-  return err?.code === 'KV_DAILY_WRITE_LIMIT' || /KV put\(\) limit exceeded for the day|KV daily write limit exceeded/i.test(String(err?.message || err || ''));
+  return ['KV_DAILY_WRITE_LIMIT', 'D1_DAILY_LIMIT'].includes(err?.code)
+    || /KV put\(\) limit exceeded for the day|KV daily write limit exceeded|D1 daily limit exceeded/i.test(String(err?.message || err || ''));
 }
 async function cloudTimerResponseError(resp) {
   let payload = null;
