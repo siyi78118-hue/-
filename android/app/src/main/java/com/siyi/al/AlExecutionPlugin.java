@@ -6,6 +6,7 @@ import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.siyi.al.execution.AlBackgroundCoordinator;
 import com.siyi.al.execution.AlExecutionService;
 import com.siyi.al.execution.AlExecutionWakeWorker;
 import com.siyi.al.execution.AutomaticTaskCleanupResult;
