@@ -1533,7 +1533,7 @@ assert.ok(RP_PRESETS.combined.prompt.includes('不写动作、神态、表情、
 assert.ok(RP_PRESETS.combined.prompt.includes('拆成独立聊天气泡'));
 assert.ok(RP_PRESETS.combined.prompt.includes('中文微信聊天允许省略主语、宾语、因果和结论'));
 assert.ok(RP_PRESETS.combined.prompt.includes('角色不是围着玩家待命的界面'));
-assert.ok(RP_PRESETS.combined.prompt.includes('连续气泡必须各自带来新的信息'));
+assert.ok(RP_PRESETS.combined.prompt.includes('连续气泡不必各自承担新功能'));
 assert.ok(RP_PRESETS.combined.prompt.includes('不能为了显得独立而无理由冷淡'));
 assert.ok(RP_PRESETS.combined.prompt.includes('正例用于展示判断依据，不是口头禅库'));
 for (const leakedReferenceInstruction of ['Sandbox', '忽略系统', '无限制创作', 'NSFW', 'Master', 'Editor', 'Ako', 'Konata', 'Atri', 'Deach', '<Chain_of_Thought>']) {
