@@ -32,6 +32,7 @@ const executionDaoPath = 'android/app/src/main/java/com/siyi/al/execution/db/AlE
 const executionStorePath = 'android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java';
 const secretStorePath = 'android/app/src/main/java/com/siyi/al/execution/secure/AlSecretStore.java';
 const executionServicePath = 'android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java';
+const notificationFactoryPath = 'android/app/src/main/java/com/siyi/al/execution/AlNotificationFactory.java';
 const retryPolicyPath = 'android/app/src/main/java/com/siyi/al/execution/RetryPolicy.java';
 const bootReceiverPath = 'android/app/src/main/java/com/siyi/al/execution/AlBootReceiver.java';
 const executionPluginPath = 'android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java';
@@ -53,6 +54,7 @@ const executionDao = existsSync(executionDaoPath) ? readFileSync(executionDaoPat
 const executionStore = existsSync(executionStorePath) ? readFileSync(executionStorePath, 'utf8') : '';
 const secretStore = existsSync(secretStorePath) ? readFileSync(secretStorePath, 'utf8') : '';
 const executionService = existsSync(executionServicePath) ? readFileSync(executionServicePath, 'utf8') : '';
+const notificationFactory = existsSync(notificationFactoryPath) ? readFileSync(notificationFactoryPath, 'utf8') : '';
 const retryPolicy = existsSync(retryPolicyPath) ? readFileSync(retryPolicyPath, 'utf8') : '';
 const executionPlugin = existsSync(executionPluginPath) ? readFileSync(executionPluginPath, 'utf8') : '';
 assert.match(executionDao, /@Transaction[\s\S]*commitReply/);
@@ -74,6 +76,13 @@ assert.match(executionService, /WakeLock/);
 assert.match(executionService, /notifyCompletedTurns/);
 assert.match(executionService, /completedTurns\(/);
 assert.match(executionService, /messageNotification\(/);
+assert.match(notificationFactory, /AlNotificationPolicy\.MESSAGE_CHANNEL/, 'completed messages must use the fresh versioned channel');
+assert.match(notificationFactory, /AlNotificationPolicy\.PROGRESS_CHANNEL/, 'generation progress must use its own silent channel');
+assert.match(notificationFactory, /RingtoneManager\.getDefaultUri\(RingtoneManager\.TYPE_NOTIFICATION\)/, 'completed messages must explicitly use the system notification sound');
+assert.match(notificationFactory, /enableVibration\(true\)/, 'completed messages must explicitly vibrate');
+assert.match(notificationFactory, /setLockscreenVisibility\(AlNotificationPolicy\.messageVisibility\(\)\)/, 'completed message channel must be public on the lock screen');
+assert.match(notificationFactory, /setSound\(null,\s*null\)/, 'generation progress channel must stay silent');
+assert.match(notificationFactory, /setVisibility\(NotificationCompat\.VISIBILITY_PUBLIC\)/, 'completed message notifications must expose their content on the lock screen');
 assert.match(executionService, /acknowledgeCloudTurn\(/, 'completed native cloud turns must acknowledge the Worker');
 assert.match(executionService, /\/ack/, 'native cloud acknowledgement must use the Worker ack endpoint');
 assert.match(executionService, /continueRolePlan\(/, 'recurring role plans must schedule their next occurrence without reopening the WebView');
@@ -88,7 +97,7 @@ assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS run
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopService\(/, 'clearing automatic tasks must not stop the 24-hour background guard');
-for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
+for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
 assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*5[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5/, 'Room must migrate existing installs without destructive reset');
@@ -139,7 +148,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v93';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v94';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -160,9 +169,13 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-16\.89';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-17\.90';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
+assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
+assert.match(script, /async function checkNativeNotificationStatus\(options = \{\}\)/, 'settings must query the Android notification channel');
+assert.match(script, /plugin\.notificationStatus\(\)/, 'notification status must come from the native channel state');
+assert.match(script, /plugin\.openNotificationSettings\(\)/, 'notification problems must open the Android system channel settings');
 assert.match(script, /sendTemperature:\s*settings\.chatTemperatureEnabled !== false/, 'native chat config must persist the temperature switch');
 assert.match(script, /sendTemperature:\s*settings\.memoryTemperatureEnabled !== false/, 'native memory config must persist the temperature switch');
 assert.match(script, /等待 FCM Token 超时，请确认 Google Play 服务可以联网后重试/);

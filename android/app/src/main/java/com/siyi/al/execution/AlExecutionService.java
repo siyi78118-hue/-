@@ -415,12 +415,7 @@ public final class AlExecutionService extends Service {
     }
 
     private String notificationText(ChatTurnEntity turn) {
-        for (ReplyPartEntity part : database.executionDao().replyParts(turn.turnId)) {
-            if ("TEXT".equals(part.type) && part.content != null && !part.content.trim().isEmpty()) return part.content.trim();
-            if ("REDPACKET".equals(part.type)) return "给你发了一个红包";
-            if ("TRANSFER".equals(part.type)) return "向你发起了一笔转账";
-        }
-        return "收到一条新消息";
+        return AlNotificationText.fromParts(database.executionDao().replyParts(turn.turnId));
     }
 
     private static String characterName(ChatTurnEntity turn) {

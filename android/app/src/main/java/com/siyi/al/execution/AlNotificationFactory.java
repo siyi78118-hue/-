@@ -6,14 +6,15 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.media.AudioAttributes;
 import android.os.Build;
+import android.media.RingtoneManager;
 import androidx.core.app.NotificationCompat;
 import com.siyi.al.MainActivity;
 import com.siyi.al.R;
 
 public final class AlNotificationFactory {
     public static final String GUARD_CHANNEL = "al_guard";
-    public static final String MESSAGE_CHANNEL = "al_messages";
     public static final int GUARD_NOTIFICATION_ID = 71001;
     private final Context context;
 
@@ -32,12 +33,32 @@ public final class AlNotificationFactory {
         guard.setDescription("保持聊天任务在锁屏和切换应用后继续运行");
         guard.setShowBadge(false);
         NotificationChannel messages = new NotificationChannel(
-            MESSAGE_CHANNEL,
+            AlNotificationPolicy.MESSAGE_CHANNEL,
             "AL 新消息",
-            NotificationManager.IMPORTANCE_HIGH
+            AlNotificationPolicy.messageImportance()
         );
+        AudioAttributes messageAudio = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build();
+        messages.setDescription("角色消息完成后的声音、震动和锁屏提醒");
+        messages.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION), messageAudio);
+        messages.enableVibration(true);
+        messages.setVibrationPattern(new long[]{0L, 240L, 120L, 240L});
+        messages.setLockscreenVisibility(AlNotificationPolicy.messageVisibility());
+        NotificationChannel progress = new NotificationChannel(
+            AlNotificationPolicy.PROGRESS_CHANNEL,
+            "AL 消息生成进度",
+            AlNotificationPolicy.progressImportance()
+        );
+        progress.setDescription("显示角色消息正在生成，不发出声音或震动");
+        progress.setSound(null, null);
+        progress.enableVibration(false);
+        progress.setShowBadge(false);
+        progress.setLockscreenVisibility(AlNotificationPolicy.progressVisibility());
         manager.createNotificationChannel(guard);
         manager.createNotificationChannel(messages);
+        manager.createNotificationChannel(progress);
     }
 
     public Notification guardNotification() {
@@ -62,6 +83,8 @@ public final class AlNotificationFactory {
     }
 
     public Notification messageNotification(String title, String text, int requestCode) {
+        String safeTitle = title == null || title.trim().isEmpty() ? "AL" : title.trim();
+        String safeText = text == null || text.trim().isEmpty() ? "收到一条新消息" : text.trim();
         Intent open = new Intent(context, MainActivity.class)
             .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
         PendingIntent pending = PendingIntent.getActivity(
@@ -70,14 +93,16 @@ public final class AlNotificationFactory {
             open,
             PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
-        return new NotificationCompat.Builder(context, MESSAGE_CHANNEL)
+        return new NotificationCompat.Builder(context, AlNotificationPolicy.MESSAGE_CHANNEL)
             .setSmallIcon(R.drawable.ic_al_notification)
-            .setContentTitle(title == null || title.trim().isEmpty() ? "AL" : title.trim())
-            .setContentText(text == null || text.trim().isEmpty() ? "收到一条新消息" : text.trim())
-            .setStyle(new NotificationCompat.BigTextStyle().bigText(text))
+            .setContentTitle(safeTitle)
+            .setContentText(safeText)
+            .setStyle(new NotificationCompat.BigTextStyle().bigText(safeText))
             .setContentIntent(pending)
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build();
     }
@@ -88,15 +113,17 @@ public final class AlNotificationFactory {
         PendingIntent pending = PendingIntent.getActivity(
             context, requestCode, open, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
         );
-        return new NotificationCompat.Builder(context, MESSAGE_CHANNEL)
+        return new NotificationCompat.Builder(context, AlNotificationPolicy.PROGRESS_CHANNEL)
             .setSmallIcon(R.drawable.ic_al_notification)
             .setContentTitle(title == null || title.trim().isEmpty() ? "AL" : title.trim())
             .setContentText("正在生成角色消息…")
             .setContentIntent(pending)
             .setOnlyAlertOnce(true)
             .setOngoing(true)
+            .setSilent(true)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .build();
     }
 

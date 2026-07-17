@@ -816,6 +816,8 @@ button.cell:active{background:#ececec}
           <button class="cell" onclick="openMemory('settings')" type="button"><div class="cell-label">记忆库</div><div class="cell-body">本地向量数据库</div><div class="mini">›</div></button>
           <button class="cell" onclick="enableCloudTimer()" type="button"><div class="cell-label">推送</div><div class="cell-body">绑定本机云闹钟</div><div class="mini">›</div></button>
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
+          <button class="cell" id="native-notification-status-row" onclick="checkNativeNotificationStatus({ toastResult: true })" type="button" style="display:none"><div class="cell-label">通知</div><div class="cell-body" id="native-notification-status">检查消息提醒</div><div class="mini">›</div></button>
+          <button class="cell" id="native-notification-settings-row" onclick="openNativeNotificationSettings()" type="button" style="display:none"><div class="cell-label">系统</div><div class="cell-body">打开 AL 通知设置</div><div class="mini">›</div></button>
           <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
           <button class="cell" onclick="checkForAppUpdate()" type="button"><div class="cell-label">版本</div><div class="cell-body">检查更新<span class="cell-note" id="app-version-note">正在读取当前版本</span></div><div class="mini">›</div></button>
         </div>
@@ -1275,7 +1277,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-16.89';
+const APP_BUILD_VERSION = '2026-07-17.90';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -2063,6 +2065,41 @@ async function dumpCharacterMemoryForRunner(charId) {
 
 function nativeExecutionPlugin() {
   return isNativeApp() ? window.Capacitor?.Plugins?.AlExecution : null;
+}
+async function checkNativeNotificationStatus(options = {}) {
+  const plugin = nativeExecutionPlugin();
+  const statusRow = document.getElementById('native-notification-status-row');
+  const settingsRow = document.getElementById('native-notification-settings-row');
+  const label = document.getElementById('native-notification-status');
+  const available = Boolean(plugin?.notificationStatus && plugin?.openNotificationSettings);
+  if (statusRow) statusRow.style.display = available ? '' : 'none';
+  if (!available) {
+    if (settingsRow) settingsRow.style.display = 'none';
+    return null;
+  }
+  if (label) label.textContent = '正在检查消息提醒…';
+  try {
+    const status = await plugin.notificationStatus();
+    if (label) label.textContent = status?.summary || '通知状态未知';
+    if (settingsRow) settingsRow.style.display = status?.healthy ? 'none' : '';
+    if (options.toastResult) toast(status?.summary || '通知状态未知');
+    return status;
+  } catch (err) {
+    const message = `通知检查失败：${err?.message || err}`;
+    if (label) label.textContent = message;
+    if (settingsRow) settingsRow.style.display = '';
+    if (options.toastResult) toast(message);
+    return null;
+  }
+}
+async function openNativeNotificationSettings() {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.openNotificationSettings) return;
+  try {
+    await plugin.openNotificationSettings();
+  } catch (err) {
+    toast(`无法打开通知设置：${err?.message || err}`);
+  }
 }
 function withOptionalTemperature(payload, enabled, value) {
   const body = { ...(payload || {}) };
@@ -8989,6 +9026,7 @@ function loadSettings() {
   document.getElementById('set-system-prompt').value = settings.systemPrompt || '';
   settingsFormHydrating = false;
   renderCloudTimerStatus();
+  checkNativeNotificationStatus().catch(err => console.warn('[AL Notification] status skipped:', err.message));
 }
 function getModelSlot(slot = 'chat') {
   return slot === 'memory'

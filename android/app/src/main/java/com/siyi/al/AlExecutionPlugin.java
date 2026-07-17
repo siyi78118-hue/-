@@ -9,6 +9,7 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import com.siyi.al.execution.AlBackgroundCoordinator;
 import com.siyi.al.execution.AlExecutionService;
 import com.siyi.al.execution.AlExecutionWakeWorker;
+import com.siyi.al.execution.AlNotificationStatus;
 import com.siyi.al.execution.AutomaticTaskCleanupResult;
 import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
@@ -241,6 +242,34 @@ public final class AlExecutionPlugin extends Plugin {
             }
             JSObject result = new JSObject();
             result.put("diagnostics", diagnostics);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void notificationStatus(PluginCall call) {
+        execute(call, () -> {
+            AlNotificationStatus.Snapshot status = AlNotificationStatus.inspect(getContext());
+            JSObject result = new JSObject();
+            result.put("permissionGranted", status.permissionGranted);
+            result.put("appEnabled", status.appEnabled);
+            result.put("channelExists", status.channelExists);
+            result.put("importance", status.importance);
+            result.put("hasSound", status.hasSound);
+            result.put("vibrationEnabled", status.vibrationEnabled);
+            result.put("lockscreenVisibility", status.lockscreenVisibility);
+            result.put("healthy", status.healthy);
+            result.put("summary", status.summary);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void openNotificationSettings(PluginCall call) {
+        execute(call, () -> {
+            getContext().startActivity(AlNotificationStatus.settingsIntent(getContext()));
+            JSObject result = new JSObject();
+            result.put("opened", true);
             return result;
         });
     }
