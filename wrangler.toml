@@ -8,6 +8,10 @@ database_name = "al-cloud-timer"
 database_id = "67138e1d-9fa9-447d-add8-569db95405f1"
 migrations_dir = "migrations"
 
+[[services]]
+binding = "YUQI_RELAY_SERVICE"
+service = "al-yuqi-relay"
+
 [triggers]
 crons = ["* * * * *"]
 
@@ -18,3 +22,5 @@ head_sampling_rate = 1
 [vars]
 VAPID_PUBLIC_KEY = "BNzA_JE2_aSM3ycOIBEOxUfRnzibroYhE_wFNI8c1o4V2E5Ni_uJ5FUbOuXzI8NiyUqpPq2zsMImafstxZQT9QI"
 VAPID_SUBJECT = "mailto:al@example.com"
+RELAY_DAILY_BYTE_BUDGET = "10485760"
+RELAY_DAILY_WRITE_BUDGET = "10000"

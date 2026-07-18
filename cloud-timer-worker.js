@@ -21,7 +21,7 @@
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type'
+  'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Yuqi-Registration'
 };
 const CLOUD_TIMER_WORKER_VERSION = '2026-07-17.18';
 const FCM_ACK_MAX_ATTEMPTS = 8;
@@ -31,6 +31,10 @@ export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') return new Response('', { headers: CORS });
     const url = new URL(request.url);
+    if (url.pathname.startsWith('/bridge/')) {
+      if (!env.YUQI_RELAY_SERVICE) return json({ ok: false, error: 'Yuqi relay service is not bound' }, 503);
+      return env.YUQI_RELAY_SERVICE.fetch(request);
+    }
     try {
       if (request.method === 'GET' && url.pathname === '/health') {
         return json({ ok: true, service: 'AL cloud timer', version: CLOUD_TIMER_WORKER_VERSION, cron: await getLastCron(env) });

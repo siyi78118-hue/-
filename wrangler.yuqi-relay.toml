@@ -1,0 +1,25 @@
+name = "al-yuqi-relay"
+main = "yuqi-relay-worker.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "AL_TIMER_DB"
+database_name = "al-cloud-timer"
+database_id = "67138e1d-9fa9-447d-add8-569db95405f1"
+migrations_dir = "migrations"
+
+[[durable_objects.bindings]]
+name = "YUQI_RELAY"
+class_name = "YuqiRelaySocket"
+
+[[migrations]]
+tag = "yuqi-relay-v1"
+new_sqlite_classes = ["YuqiRelaySocket"]
+
+[vars]
+RELAY_DAILY_BYTE_BUDGET = "10485760"
+RELAY_DAILY_WRITE_BUDGET = "10000"
+
+[observability]
+enabled = true
+head_sampling_rate = 1

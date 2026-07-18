@@ -1,14 +1,16 @@
 {
   "scripts": {
     "start": "node serve-static.mjs",
-    "test": "node --test tests/rp-preset-contract.test.mjs && node --test tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs tests/cloud-timer-d1.test.mjs && node test-basic.mjs && node test-sw-automatic-task-guard.mjs",
+    "test": "node --test tests/rp-preset-contract.test.mjs && node --test tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs tests/cloud-timer-d1.test.mjs tests/yuqi-relay-worker.test.mjs && node test-basic.mjs && node test-sw-automatic-task-guard.mjs",
     "android:sync": "cap sync android",
     "android:copy": "cap copy android",
     "android:open": "cap open android",
     "android:debug": "cap sync android && cd android && gradlew.bat assembleDebug",
     "cloud:deploy": "node scripts/deploy-cloud-timer.mjs",
     "cloud:deploy:raw": "node scripts/run-wrangler.mjs deploy",
-    "cloud:health": "node scripts/check-cloud-timer.mjs"
+    "cloud:health": "node scripts/check-cloud-timer.mjs",
+    "cloud:relay:test": "node --test tests/yuqi-relay-worker.test.mjs",
+    "cloud:relay:deploy": "node scripts/run-wrangler.mjs deploy --config wrangler.yuqi-relay.toml"
   },
   "devDependencies": {
     "wrangler": "^4.108.0"
