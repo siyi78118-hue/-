@@ -1,4 +1,8 @@
 node_modules/
+.toolchains/
+yuqi-runtime/data/
+yuqi-runtime/config.json
+yuqi-runtime/*.sqlite*
 .npm-cache/
 .wrangler/
 .codex/
