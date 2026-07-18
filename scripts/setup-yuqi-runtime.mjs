@@ -25,12 +25,20 @@ function secureWriteFile(path, content) {
 }
 
 export function findLanAddress(interfaces = networkInterfaces()) {
-  for (const addresses of Object.values(interfaces)) {
+  const candidates = [];
+  for (const [name, addresses] of Object.entries(interfaces)) {
     for (const address of addresses || []) {
-      if (address.family === 'IPv4' && !address.internal && !address.address.startsWith('169.254.')) return address.address;
+      if (address.family !== 'IPv4' || address.internal || address.address.startsWith('169.254.')) continue;
+      const octets = address.address.split('.').map(Number);
+      const privateSubnet = octets[0] === 10
+        || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31)
+        || (octets[0] === 192 && octets[1] === 168);
+      const virtual = /vpn|virtual|radmin|tailscale|zerotier|vmware|hyper-v|wsl/i.test(name);
+      candidates.push({ address: address.address, score: (privateSubnet ? 100 : 0) - (virtual ? 50 : 0) });
     }
   }
-  return '127.0.0.1';
+  candidates.sort((left, right) => right.score - left.score);
+  return candidates[0]?.address || '127.0.0.1';
 }
 
 export function buildPairingBundle(config) {

@@ -6,7 +6,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import { createMemorySnapshot } from '../scripts/backup-yuqi-memory.mjs';
-import { buildPairingBundle, setupYuqiRuntime } from '../scripts/setup-yuqi-runtime.mjs';
+import { buildPairingBundle, findLanAddress, setupYuqiRuntime } from '../scripts/setup-yuqi-runtime.mjs';
 
 test('pairing bundle contains only the phone bridge fields', () => {
   const bundle = buildPairingBundle({
@@ -24,6 +24,14 @@ test('pairing bundle contains only the phone bridge fields', () => {
     'lanUrl', 'mode', 'pairingSecret', 'schemaVersion'
   ].sort());
   assert.equal(bundle.schemaVersion, 1);
+});
+
+test('LAN discovery prefers a real private subnet over a virtual public-range adapter', () => {
+  const address = findLanAddress({
+    'Radmin VPN': [{ family: 'IPv4', internal: false, address: '26.229.60.5' }],
+    WLAN: [{ family: 'IPv4', internal: false, address: '192.168.1.9' }]
+  });
+  assert.equal(address, '192.168.1.9');
 });
 
 test('memory backup is a readable SQLite snapshot', () => {
