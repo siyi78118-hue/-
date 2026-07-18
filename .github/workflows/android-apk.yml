@@ -62,7 +62,9 @@ jobs:
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/al-release.p12
 
       - name: Sync bundled web assets
-        run: npx cap sync android
+        run: |
+          node scripts/generate-yuqi-network-policy.mjs
+          npx cap sync android
 
       - name: Make Gradle wrapper executable
         working-directory: android

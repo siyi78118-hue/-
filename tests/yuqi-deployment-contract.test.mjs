@@ -100,3 +100,14 @@ test('cloud deploy applies D1, sets registration secret, deploys both workers an
   }
   assert.doesNotMatch(deploy, /console\.log\([^\n]*(registrationSecret|deviceToken)/);
 });
+
+test('Android permits cleartext only for the generated private LAN host', () => {
+  const manifest = readFileSync('android/app/src/main/AndroidManifest.xml', 'utf8');
+  const policy = readFileSync('android/app/src/main/res/xml/network_security_config.xml', 'utf8');
+  const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
+  assert.match(manifest, /android:networkSecurityConfig="@xml\/network_security_config"/);
+  assert.match(policy, /<base-config cleartextTrafficPermitted="false"/);
+  assert.match(policy, /<domain-config cleartextTrafficPermitted="true"/);
+  assert.match(policy, />192\.168\.1\.9<\/domain>/);
+  assert.match(packageJson.scripts['android:debug'], /generate-yuqi-network-policy/);
+});
