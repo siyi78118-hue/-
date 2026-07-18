@@ -21,9 +21,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         RolePlanOccurrenceEntity.class,
         RawMessageEntity.class,
         EvidenceFactEntity.class,
-        SyncCursorEntity.class
+        SyncCursorEntity.class,
+        YuqiAnnotationEntity.class
     },
-    version = 6,
+    version = 7,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
@@ -73,6 +74,13 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             database.execSQL("CREATE TABLE IF NOT EXISTS `yuqi_sync_cursors` (`peerId` TEXT NOT NULL, `ackSeq` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`peerId`))");
         }
     };
+    private static final Migration MIGRATION_6_7 = new Migration(6, 7) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `yuqi_annotations` (`annotationId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `sourceMessageId` TEXT, `presetVersion` TEXT NOT NULL, `userCorrection` TEXT NOT NULL, `desiredBehavior` TEXT NOT NULL, `status` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `syncSeq` INTEGER NOT NULL, `checksum` TEXT NOT NULL, PRIMARY KEY(`annotationId`))");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_yuqi_annotations_status_createdAt` ON `yuqi_annotations` (`status`, `createdAt`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_yuqi_annotations_turnId` ON `yuqi_annotations` (`turnId`)");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -84,7 +92,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         context.getApplicationContext(),
                         AlExecutionDatabase.class,
                         "al-execution.db"
-                    ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6).build();
+                    ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7).build();
                 }
             }
         }

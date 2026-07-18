@@ -69,7 +69,18 @@ export function createYuqiServer({
 
   async function handle(request, response, rawBody) {
     if (request.method === 'GET' && request.url === '/v1/health') {
-      return json(response, 200, { ok: true, service: 'yuqi-runtime', version: 1 });
+      const roleThreads = Object.fromEntries(['memory', 'brain', 'supervisor'].map(role => [
+        role,
+        typeof store.getSession === 'function' ? !!store.getSession(role) : false
+      ]));
+      return json(response, 200, {
+        ok: true,
+        service: 'yuqi-runtime',
+        version: 1,
+        roleThreads,
+        presetVersion: typeof store.getCurrentPresetVersion === 'function' ? store.getCurrentPresetVersion() : '',
+        contextLimit: 200
+      });
     }
     const auth = authenticate(request, rawBody);
     if (!auth.ok) return json(response, auth.status, { ok: false, error: auth.error });

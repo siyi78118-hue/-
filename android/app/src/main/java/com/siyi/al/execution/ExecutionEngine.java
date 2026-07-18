@@ -162,7 +162,7 @@ public final class ExecutionEngine {
     private static JSONArray exactChatMessages(JSONObject snapshot) {
         JSONArray source = snapshot.optJSONArray("chatMessages");
         if (source == null) return new JSONArray();
-        int start = Math.max(0, source.length() - 30);
+        int start = Math.max(0, source.length() - 200);
         JSONArray selected = new JSONArray();
         for (int index = start; index < source.length(); index++) selected.put(source.opt(index));
         return selected;

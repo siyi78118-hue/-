@@ -97,11 +97,11 @@ assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS run
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopService\(/, 'clearing automatic tasks must not stop the 24-hour background guard');
-for (const method of ['saveApiConfig', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
+for (const method of ['saveApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*6[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6/, 'Room must migrate existing installs through the Yuqi mirror schema without destructive reset');
-assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors/, 'Room v6 must retain raw messages, evidence facts, and sync cursors on the phone');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*7[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7/, 'Room must migrate existing installs through the Yuqi annotation schema without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors[\s\S]*yuqi_annotations/, 'Room v7 must retain raw messages, evidence facts, sync cursors, and annotations on the phone');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
 assert.match(executionDao, /state\s*=\s*'COMPLETED'[\s\S]{0,240}uiAppliedAt\s+IS\s+NULL/, 'Room must keep a durable inbox of completed turns not yet applied to the UI');
@@ -252,12 +252,12 @@ assert.match(script, /记忆AI根据玩家本次发言筛选出的本地记忆�
 assert.match(swScript, /记忆AI根据本次触发原因筛选出的手机本地记忆补充/);
 assert.doesNotMatch(script, /CHAT_HISTORY_CHAR_BUDGET|PROACTIVE_HISTORY_CHAR_BUDGET/);
 assert.doesNotMatch(swScript, /CHAT_HISTORY_CHAR_BUDGET|PROACTIVE_HISTORY_CHAR_BUDGET/);
-assert.match(script, /function recentMessages\(chat, count = 30\) \{[\s\S]*slice\(-Math\.max\(1, Number\(count\) \|\| 30\)\)/);
-assert.match(swScript, /function recentMessages\(chat, count = 30\) \{[\s\S]*slice\(-Math\.max\(1, Number\(count\) \|\| 30\)\)/);
+assert.match(script, /const NORMAL_RAW_CONTEXT_LIMIT = 200;[\s\S]*function recentMessages\(chat, count = NORMAL_RAW_CONTEXT_LIMIT\)/);
+assert.match(swScript, /const NORMAL_RAW_CONTEXT_LIMIT = 200;[\s\S]*function recentMessages\(chat, count = NORMAL_RAW_CONTEXT_LIMIT\)/);
 assert.match(script, /return recentMessages\(chat, count\)\.map\(m =>/);
 assert.match(swScript, /return recentMessages\(chat, count\)\.map\(m =>/);
-assert.match(script, /messages\.slice\(-30\)\.map\(m => memoryEvidenceLine\(m, char\)\)/);
-assert.match(swScript, /messages\.slice\(-30\)\.map\(m => messageLine\(m, char, settings\)\)/);
+assert.match(script, /messages\.slice\(-NORMAL_RAW_CONTEXT_LIMIT\)\.map\(m => memoryEvidenceLine\(m, char\)\)/);
+assert.match(swScript, /messages\.slice\(-NORMAL_RAW_CONTEXT_LIMIT\)\.map\(m => messageLine\(m, char, settings\)\)/);
 assert.match(script, /const RELATIONSHIP_STAGE_DEFS = \[/);
 assert.match(script, /function currentStagePersonaBlock\(char\)/);
 assert.match(script, /if \(preset\.prompt\) prompt \+= preset\.prompt \+ '\\n\\n';/);
@@ -599,7 +599,7 @@ assert.match(script, /你已添加了\$\{name\}，现在可以开始聊天了。
 assert.match(script, /function chatClearedSystemMessage/);
 assert.match(script, /你已清空与\$\{charName\(char\)\}的聊天记录。/);
 assert.match(script, /function conversationMessages\(chat\)/);
-assert.match(script, /function recentMessages\(chat, count = 30\)/);
+assert.match(script, /function recentMessages\(chat, count = NORMAL_RAW_CONTEXT_LIMIT\)/);
 assert.match(script, /function removeCharacterMomentTraces\(charId\)/);
 assert.match(script, /async function cancelCloudProactiveQuick\(charId, reason = '操作'\)/);
 assert.match(script, /await withTimeout\(cancelCloudProactive\(charId, 'all'\), 8000, `\$\{reason\}取消云闹钟超时`\)/);
@@ -1916,13 +1916,13 @@ assert.match(memoryQueryPayload.system, /生成向量数据库召回用的检索
 assert.match(memoryQueryPayload.system, /只输出 JSON，不要输出解释/);
 assert.match(memoryQueryPayload.user, /当前输入或触发原因：\n你还记得红包吗？/);
 assert.match(memoryQueryPayload.system, /玩家当前输入或当前触发原因是最高优先级/);
-assert.match(memoryQueryPayload.system, /只说“今天天气不错”，却因为最近30条出现过红包就检索并继续催红包/);
-const memoryThirtyMessages = Array.from({ length: 35 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `记忆上下文${index}`, time: index + 1 }));
-const memoryThirtyPayload = buildMemoryQueryPayload(v2, '昨天那件事呢？', memoryThirtyMessages);
-assert.doesNotMatch(memoryThirtyPayload.user, /记忆上下文4(?:\D|$)/);
-assert.match(memoryThirtyPayload.user, /记忆上下文5/);
-assert.match(memoryThirtyPayload.user, /记忆上下文34/);
-assert.match(memoryThirtyPayload.user, /当前输入或触发原因：\n昨天那件事呢？/);
+assert.match(memoryQueryPayload.system, /只说“今天天气不错”，却因为最近200条出现过红包就检索并继续催红包/);
+const memoryTwoHundredMessages = Array.from({ length: 205 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `记忆上下文${index}`, time: index + 1 }));
+const memoryTwoHundredPayload = buildMemoryQueryPayload(v2, '昨天那件事呢？', memoryTwoHundredMessages);
+assert.doesNotMatch(memoryTwoHundredPayload.user, /记忆上下文4(?:\D|$)/);
+assert.match(memoryTwoHundredPayload.user, /记忆上下文5/);
+assert.match(memoryTwoHundredPayload.user, /记忆上下文204/);
+assert.match(memoryTwoHundredPayload.user, /当前输入或触发原因：\n昨天那件事呢？/);
 const memoryExtractPayload = buildMemoryExtractPayload(v2, [{ role: 'user', content: '我以后不收你大额红包', time: Date.now() }], '旧摘要');
 assert.match(memoryExtractPayload.system, /本地记忆整理 AI/);
 assert.match(memoryExtractPayload.system, /禁止用“用户”“角色”代称/);

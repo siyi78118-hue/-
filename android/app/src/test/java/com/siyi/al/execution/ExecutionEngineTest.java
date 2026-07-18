@@ -30,7 +30,7 @@ public class ExecutionEngineTest {
         assertEquals(2, store.replyParts.size());
         assertTrue(gateway.chatSystem.contains("昨天约好周六语音"));
         assertTrue(gateway.chatSystem.contains("原生执行时钟"));
-        assertEquals(30, gateway.chatMessageCount);
+        assertEquals(200, gateway.chatMessageCount);
         assertEquals("消息5", gateway.firstChatMessage);
     }
 
@@ -144,7 +144,7 @@ public class ExecutionEngineTest {
         snapshot.put("chatMaxTokens", 1000);
         snapshot.put("memoryMessages", new JSONArray().put(message("user", "候选记忆")));
         JSONArray chatMessages = new JSONArray();
-        for (int i = 0; i < 35; i++) chatMessages.put(message(i % 2 == 0 ? "user" : "assistant", "消息" + i));
+        for (int i = 0; i < 205; i++) chatMessages.put(message(i % 2 == 0 ? "user" : "assistant", "消息" + i));
         snapshot.put("chatMessages", chatMessages);
         return snapshot;
     }

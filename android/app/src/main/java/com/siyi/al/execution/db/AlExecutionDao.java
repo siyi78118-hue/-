@@ -49,6 +49,9 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     void upsertSyncCursor(SyncCursorEntity cursor);
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertYuqiAnnotation(YuqiAnnotationEntity annotation);
+
     @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId ORDER BY sentAt DESC LIMIT :limit")
     List<RawMessageEntity> recentRawMessages(String characterId, int limit);
 
@@ -57,6 +60,21 @@ public interface AlExecutionDao {
 
     @Query("SELECT COALESCE(MAX(syncSeq), 0) FROM yuqi_raw_messages")
     long maxRawSyncSeq();
+
+    @Query("SELECT COALESCE(MAX(syncSeq), 0) FROM yuqi_annotations")
+    long maxAnnotationSyncSeq();
+
+    @Query("SELECT * FROM yuqi_annotations WHERE syncSeq > :afterSeq ORDER BY syncSeq ASC, annotationId ASC LIMIT :limit")
+    List<YuqiAnnotationEntity> annotationsAfterSync(long afterSeq, int limit);
+
+    @Query("SELECT COUNT(*) FROM yuqi_annotations WHERE status = 'proposed'")
+    int pendingYuqiAnnotationCount();
+
+    @Query("SELECT COUNT(*) FROM yuqi_raw_messages WHERE syncSeq > :afterSeq")
+    int rawMessageCountAfterSync(long afterSeq);
+
+    @Query("SELECT COUNT(*) FROM yuqi_evidence_facts WHERE status = 'verified'")
+    int verifiedYuqiFactCount();
 
     @Query("SELECT * FROM yuqi_evidence_facts WHERE characterId = :characterId ORDER BY updatedAt DESC")
     List<EvidenceFactEntity> evidenceFacts(String characterId);

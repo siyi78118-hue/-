@@ -23,16 +23,18 @@ final class ExecutionRuntime {
             secrets,
             new OpenAiCompatibleClient(new UrlConnectionTransport())
         );
-        BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
-        FallbackJournal fallbackJournal = new FallbackJournal(database.executionDao(), bridgeConfig.deviceId);
-        BridgeClient bridgeClient = new BridgeClient(bridgeConfig, fallbackJournal);
-        gateway.setBridgeRouter(new BridgeRouter(
-            bridgeConfig,
-            bridgeClient.lanRoute(),
-            bridgeClient.cloudRoute(),
-            gateway::executeFallback,
-            new RoomBridgeMirror(database.executionDao(), bridgeConfig.deviceId)
-        ));
+        gateway.setBridgeRouterProvider(() -> {
+            BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
+            FallbackJournal fallbackJournal = new FallbackJournal(database.executionDao(), bridgeConfig.deviceId);
+            BridgeClient bridgeClient = new BridgeClient(bridgeConfig, fallbackJournal);
+            return new BridgeRouter(
+                bridgeConfig,
+                bridgeClient.lanRoute(),
+                bridgeClient.cloudRoute(),
+                gateway::executeFallback,
+                new RoomBridgeMirror(database.executionDao(), bridgeConfig.deviceId)
+            );
+        });
         return new ExecutionEngine(store, gateway, new ReplyParser(), System::currentTimeMillis);
     }
 }

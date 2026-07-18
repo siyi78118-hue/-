@@ -3,9 +3,12 @@ package com.siyi.al.execution.bridge;
 import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.db.SyncCursorEntity;
+import com.siyi.al.execution.db.YuqiAnnotationEntity;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Comparator;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -22,7 +25,14 @@ public final class FallbackJournal {
     public JSONObject pendingPacket(int limit) throws Exception {
         SyncCursorEntity cursor = dao.syncCursor(PC_PEER);
         long afterSeq = cursor == null ? 0L : cursor.ackSeq;
-        return buildPacket(deviceId, afterSeq, dao.rawMessagesAfterSync("yuqi", afterSeq, Math.max(1, Math.min(1000, limit))));
+        int safeLimit = Math.max(1, Math.min(1000, limit));
+        return buildPacket(
+            deviceId,
+            afterSeq,
+            dao.rawMessagesAfterSync("yuqi", afterSeq, safeLimit),
+            dao.annotationsAfterSync(afterSeq, safeLimit),
+            safeLimit
+        );
     }
 
     public void acknowledge(long seq) {
@@ -37,7 +47,17 @@ public final class FallbackJournal {
     }
 
     static JSONObject buildPacket(String deviceId, long afterSeq, List<RawMessageEntity> messages) throws Exception {
-        JSONArray entries = new JSONArray();
+        return buildPacket(deviceId, afterSeq, messages, java.util.Collections.emptyList(), 1000);
+    }
+
+    private static JSONObject buildPacket(
+        String deviceId,
+        long afterSeq,
+        List<RawMessageEntity> messages,
+        List<YuqiAnnotationEntity> annotations,
+        int limit
+    ) throws Exception {
+        ArrayList<JSONObject> ordered = new ArrayList<>();
         long lastSeq = afterSeq;
         for (RawMessageEntity message : messages) {
             JSONObject payload = messagePayload(message);
@@ -49,14 +69,43 @@ public final class FallbackJournal {
                 .put("payload", payload)
                 .put("checksum", sha256(canonical(payload)))
                 .put("createdAt", message.sentAt);
+            ordered.add(entry);
+        }
+        for (YuqiAnnotationEntity annotation : annotations) {
+            JSONObject payload = annotationPayload(annotation);
+            ordered.add(new JSONObject()
+                .put("seq", annotation.syncSeq)
+                .put("entityType", "annotation")
+                .put("entityId", annotation.annotationId)
+                .put("operation", "insert")
+                .put("payload", payload)
+                .put("checksum", sha256(canonical(payload)))
+                .put("createdAt", annotation.createdAt));
+        }
+        ordered.sort(Comparator.comparingLong(value -> value.optLong("seq")));
+        JSONArray entries = new JSONArray();
+        for (int index = 0; index < Math.min(limit, ordered.size()); index += 1) {
+            JSONObject entry = ordered.get(index);
             entries.put(entry);
-            lastSeq = Math.max(lastSeq, message.syncSeq);
+            lastSeq = Math.max(lastSeq, entry.optLong("seq"));
         }
         return new JSONObject()
             .put("peerId", deviceId)
             .put("lastCommonSeq", afterSeq)
             .put("lastSeq", lastSeq)
             .put("entries", entries);
+    }
+
+    private static JSONObject annotationPayload(YuqiAnnotationEntity value) throws Exception {
+        return new JSONObject()
+            .put("annotationId", value.annotationId)
+            .put("createdAt", value.createdAt)
+            .put("desiredBehavior", value.desiredBehavior)
+            .put("presetVersion", value.presetVersion)
+            .put("sourceMessageId", value.sourceMessageId == null ? JSONObject.NULL : value.sourceMessageId)
+            .put("status", value.status)
+            .put("turnId", value.turnId)
+            .put("userCorrection", value.userCorrection);
     }
 
     private static JSONObject messagePayload(RawMessageEntity value) throws Exception {

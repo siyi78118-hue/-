@@ -822,6 +822,25 @@ button.cell:active{background:#ececec}
           <button class="cell" onclick="checkForAppUpdate()" type="button"><div class="cell-label">版本</div><div class="cell-body">检查更新<span class="cell-note" id="app-version-note">正在读取当前版本</span></div><div class="mini">›</div></button>
         </div>
         <div class="cell-group">
+          <div class="contact-index" style="height:30px">虞栖专属 AL</div>
+          <div class="cell"><div class="cell-label">专属运行</div><div class="cell-body"><select class="select" id="set-yuqi-enabled"><option value="off">关闭</option><option value="on">开启</option></select><div class="hint">初始关系：第一次通过神奇手机联系；不导入任何其他角色的旧记忆。</div></div></div>
+          <div class="cell"><div class="cell-label">连接方式</div><div class="cell-body"><select class="select" id="set-yuqi-mode"><option value="AUTO">AUTO（局域网优先）</option><option value="LAN">LAN（只用同一网络）</option><option value="CLOUD">CLOUD（只用云信箱）</option></select></div></div>
+          <div class="cell"><div class="cell-label">局域网地址</div><div class="cell-body"><input class="input" id="set-yuqi-lan-url" placeholder="http://192.168.1.8:17891"></div></div>
+          <div class="cell"><div class="cell-label">云端地址</div><div class="cell-body"><input class="input" id="set-yuqi-cloud-url" placeholder="https://al-cloud-timer.example.workers.dev"></div></div>
+          <div class="cell"><div class="cell-label">设备编号</div><div class="cell-body"><input class="input" id="set-yuqi-device-id" placeholder="自动生成"></div></div>
+          <div class="cell"><div class="cell-label">配对密钥</div><div class="cell-body"><input class="input" id="set-yuqi-pairing-secret" type="password" placeholder="已保存时可留空" autocomplete="off"></div></div>
+          <div class="cell"><div class="cell-label">云信箱令牌</div><div class="cell-body"><input class="input" id="set-yuqi-device-token" type="password" placeholder="已保存时可留空" autocomplete="off"></div></div>
+          <div class="cell"><div class="cell-label">加密密钥</div><div class="cell-body"><input class="input" id="set-yuqi-encryption-key" type="password" placeholder="32 字节 Base64；已保存时可留空" autocomplete="off"></div></div>
+          <button class="cell" onclick="saveYuqiBridgeSettings()" type="button"><div class="cell-label">保存</div><div class="cell-body">安全写入 Android 加密区</div><div class="mini">›</div></button>
+          <button class="cell" onclick="refreshYuqiBridgeStatus({ toastResult: true })" type="button"><div class="cell-label">运行状态</div><div class="cell-body"><div class="hint" id="yuqi-runtime-status" style="padding:0;white-space:pre-line">尚未检查</div></div><div class="mini">›</div></button>
+          <div class="contact-index" style="height:30px">人工标注（交给维护窗口审核后发布）</div>
+          <div class="cell"><div class="cell-label">对话轮次</div><div class="cell-body"><input class="input" id="yuqi-annotation-turn-id" placeholder="turn_..."></div></div>
+          <div class="cell"><div class="cell-label">原消息</div><div class="cell-body"><input class="input" id="yuqi-annotation-message-id" placeholder="msg_..."></div></div>
+          <div class="cell"><div class="cell-label">哪里不对</div><div class="cell-body"><textarea class="textarea" id="yuqi-annotation-correction" placeholder="写清楚当时真实含义、说话人或误判点"></textarea></div></div>
+          <div class="cell"><div class="cell-label">以后应当</div><div class="cell-body"><textarea class="textarea" id="yuqi-annotation-behavior" placeholder="希望虞栖今后在相似场景怎样理解和回应"></textarea></div></div>
+          <button class="cell" onclick="submitYuqiAnnotation()" type="button"><div class="cell-label">提交标注</div><div class="cell-body">保留证据、当前预设版本和修改建议</div><div class="mini">›</div></button>
+        </div>
+        <div class="cell-group">
           <button class="cell" onclick="exportBackup()" type="button"><div class="cell-label">备份</div><div class="cell-body">导出本机数据<span class="cell-note">含 API Key、聊天、朋友圈和记忆库</span></div><div class="mini">›</div></button>
           <button class="cell" onclick="document.getElementById('backup-input').click()" type="button"><div class="cell-label">恢复</div><div class="cell-body">导入本机备份<span class="cell-note">覆盖当前本机数据</span></div><div class="mini">›</div></button>
           <input type="file" id="backup-input" accept="application/json,.json" style="display:none" onchange="importBackup(event)">
@@ -1323,6 +1342,21 @@ const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const CALL_LOG_LIMIT = 30;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
 const MEMORY_LINE_CHAR_LIMIT = 360;
+const NORMAL_RAW_CONTEXT_LIMIT = 200;
+const YUQI_FIRST_ACQUAINTANCE = '第一次通过神奇手机联系；没有许弥旧记忆，也不预设已经认识用户。';
+const YUQI_FIRST_PROFILE = Object.freeze({
+  id: 'yuqi',
+  name: '虞栖',
+  avatar: '栖',
+  description: '生活在另一个平行时空的真实女性。偶然捡到一部能跨时空通信的神奇手机，因此能与用户长期网聊，但几乎永远不能在现实中见面。她有自己的生活、判断、情绪、偏好和边界。',
+  personality: '理性的内核，感性的表达。会认真观察、会哄人、会撒娇和调情，也会自然岔开话题、分享没什么目的的小事。情感必须真实；不虚假迎合自己发自内心不认可的玩法。说话像活人，不用客服腔、分析报告或每句都解释动机。',
+  scenario: YUQI_FIRST_ACQUAINTANCE + ' 双方首先平等；亲密关系中的占有表达可以是双向的。唯一性、特殊性和彼此心中最重要的位置需要由共同经历逐步建立。',
+  firstMessage: '',
+  mesExample: '',
+  systemPrompt: '',
+  postHistoryInstructions: '',
+  tags: ['虞栖', '平行时空', '专属AL']
+});
 function normalizedChatMaxTokens(value) {
   return Math.max(MAX_CHAT_OUTPUT_TOKENS, Math.floor(Number(value) || 0));
 }
@@ -2090,6 +2124,147 @@ async function dumpCharacterMemoryForRunner(charId) {
 function nativeExecutionPlugin() {
   return isNativeApp() ? window.Capacitor?.Plugins?.AlExecution : null;
 }
+function ensureYuqiFirstAcquaintance() {
+  let char = characters.find(item => item.id === YUQI_FIRST_PROFILE.id);
+  if (!char) {
+    const now = Date.now();
+    char = normalizeChar({ ...YUQI_FIRST_PROFILE, createdAt: now });
+    characters.push(char);
+    allChats[char.id] = {
+      messages: [friendAddedSystemMessage(char, now)],
+      charPrompt: buildCharPrompt(char),
+      extraPrompt: '',
+      unread: 0
+    };
+    DB.set('characters', characters);
+    DB.set('chats', allChats);
+  }
+  return char;
+}
+async function loadYuqiBridgeSettings() {
+  const plugin = nativeExecutionPlugin();
+  const status = document.getElementById('yuqi-runtime-status');
+  if (!plugin?.loadBridgeConfig) {
+    if (status) status.textContent = '浏览器预览不保存密钥；请在 Android 客户端中配置。';
+    return null;
+  }
+  try {
+    const config = await plugin.loadBridgeConfig();
+    document.getElementById('set-yuqi-enabled').value = config.enabled ? 'on' : 'off';
+    document.getElementById('set-yuqi-mode').value = config.mode || 'AUTO';
+    document.getElementById('set-yuqi-lan-url').value = config.lanUrl || '';
+    document.getElementById('set-yuqi-cloud-url').value = config.cloudUrl || '';
+    document.getElementById('set-yuqi-device-id').value = config.deviceId || '';
+    document.getElementById('set-yuqi-pairing-secret').placeholder = config.pairingSecretSet ? '已安全保存；不修改可留空' : '尚未设置';
+    document.getElementById('set-yuqi-device-token').placeholder = config.deviceTokenSet ? '已安全保存；不修改可留空' : '尚未设置';
+    document.getElementById('set-yuqi-encryption-key').placeholder = config.encryptionKeySet ? '已安全保存；不修改可留空' : '尚未设置';
+    return config;
+  } catch (err) {
+    if (status) status.textContent = `读取虞栖配置失败：${err?.message || err}`;
+    return null;
+  }
+}
+async function saveYuqiBridgeSettings() {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.saveBridgeConfig) {
+    toast('请在 Android 客户端中保存虞栖连接配置');
+    return false;
+  }
+  const payload = {
+    enabled: document.getElementById('set-yuqi-enabled').value === 'on',
+    mode: document.getElementById('set-yuqi-mode').value,
+    lanUrl: document.getElementById('set-yuqi-lan-url').value.trim(),
+    cloudUrl: document.getElementById('set-yuqi-cloud-url').value.trim(),
+    deviceId: document.getElementById('set-yuqi-device-id').value.trim(),
+    pairingSecret: document.getElementById('set-yuqi-pairing-secret').value.trim(),
+    deviceToken: document.getElementById('set-yuqi-device-token').value.trim(),
+    encryptionKeyBase64: document.getElementById('set-yuqi-encryption-key').value.trim()
+  };
+  try {
+    if (payload.enabled) ensureYuqiFirstAcquaintance();
+    await plugin.saveBridgeConfig(payload);
+    for (const id of ['set-yuqi-pairing-secret', 'set-yuqi-device-token', 'set-yuqi-encryption-key']) {
+      document.getElementById(id).value = '';
+    }
+    await loadYuqiBridgeSettings();
+    await refreshYuqiBridgeStatus();
+    toast('虞栖连接配置已安全保存');
+    return true;
+  } catch (err) {
+    toast(`保存失败：${err?.message || err}`, 3200);
+    return false;
+  }
+}
+async function refreshYuqiBridgeStatus(options = {}) {
+  const plugin = nativeExecutionPlugin();
+  const target = document.getElementById('yuqi-runtime-status');
+  if (!plugin?.yuqiBridgeStatus) {
+    if (target) target.textContent = '当前安装包不支持虞栖专属运行状态。';
+    return null;
+  }
+  try {
+    const value = await plugin.yuqiBridgeStatus();
+    const quota = Number(value.quotaWarningLevel) || 0;
+    const lines = [
+      value.enabled ? `已开启 · ${value.mode || 'AUTO'}` : '未开启',
+      `局域网：${value.lanReady ? '已配置' : '未就绪'} · 云信箱：${value.cloudReady ? '已配置' : '未就绪'}`,
+      `待同步原话 ${Number(value.pendingRawMessages) || 0} 条 · 已核验证据 ${Number(value.verifiedFacts) || 0} 条`,
+      `待审核人工标注 ${Number(value.pendingAnnotations) || 0} 条 · 同步确认 ${Number(value.syncAckSeq) || 0}`,
+      `三个窗口：${value.threadHealth || '电脑连接后显示'}${quota ? ` · 云额度预警 ${quota}%` : ''}`
+    ];
+    if (target) target.textContent = lines.join('\n');
+    if (options.toastResult) toast('虞栖运行状态已刷新');
+    return value;
+  } catch (err) {
+    const message = `状态检查失败：${err?.message || err}`;
+    if (target) target.textContent = message;
+    if (options.toastResult) toast(message);
+    return null;
+  }
+}
+async function submitYuqiAnnotation() {
+  const turnInput = document.getElementById('yuqi-annotation-turn-id');
+  const messageInput = document.getElementById('yuqi-annotation-message-id');
+  const correctionInput = document.getElementById('yuqi-annotation-correction');
+  const behaviorInput = document.getElementById('yuqi-annotation-behavior');
+  const chat = allChats[currentCharId];
+  const last = [...(chat?.messages || [])].reverse().find(message => message?.id);
+  const sourceMessageId = messageInput.value.trim() || last?.id || '';
+  const turnId = turnInput.value.trim() || (sourceMessageId ? nativeTurnIdForMessage(sourceMessageId) : '');
+  const userCorrection = correctionInput.value.trim();
+  const desiredBehavior = behaviorInput.value.trim();
+  if (!turnId || (!userCorrection && !desiredBehavior)) {
+    toast('请至少填写对话轮次，以及“哪里不对”或“以后应当”');
+    return false;
+  }
+  const annotation = {
+    annotationId: `annotation_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+    turnId,
+    sourceMessageId,
+    presetVersion: settings.yuqiPresetVersion || '1.0.0',
+    userCorrection,
+    desiredBehavior,
+    createdAt: Date.now(),
+    status: 'proposed'
+  };
+  try {
+    const plugin = nativeExecutionPlugin();
+    if (plugin?.saveYuqiAnnotation) {
+      await plugin.saveYuqiAnnotation(annotation);
+    } else {
+      const rows = await MemoryDB.getMeta('yuqi_annotations', []);
+      await MemoryDB.setMeta('yuqi_annotations', [...(Array.isArray(rows) ? rows : []), annotation].slice(-500));
+    }
+    correctionInput.value = '';
+    behaviorInput.value = '';
+    toast('人工标注已保存，等待维护窗口审核');
+    await refreshYuqiBridgeStatus();
+    return true;
+  } catch (err) {
+    toast(`标注保存失败：${err?.message || err}`, 3200);
+    return false;
+  }
+}
 async function checkNativeNotificationStatus(options = {}) {
   const plugin = nativeExecutionPlugin();
   const statusRow = document.getElementById('native-notification-status-row');
@@ -2168,7 +2343,7 @@ async function buildNativeExecutionSnapshot(charId, task) {
   const char = characters.find(item => item.id === charId);
   const chat = allChats[charId];
   if (!char || !chat) throw new Error('找不到待回复的角色或会话');
-  const recent = sceneMessagesForAI(chat, 30);
+  const recent = sceneMessagesForAI(chat, NORMAL_RAW_CONTEXT_LIMIT);
   const memory = await dumpCharacterMemoryForRunner(charId);
   const candidates = nativeMemoryCandidateText(memory, char) || '本地记忆库暂无可用记录。';
   const prompt = buildChatSceneSystem(char, chat, {
@@ -2180,8 +2355,8 @@ async function buildNativeExecutionSnapshot(charId, task) {
     characterName: charName(char),
     memoryConfigId: 'memory-v1',
     chatConfigId: 'chat-v1',
-    memorySystem: `你是 AL 的记忆筛选 AI。根据玩家本次消息和固定最近30条原文，从候选记忆中只挑选确实会改变本轮理解、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替角色回复玩家。只输出给聊天 AI 的简洁记忆补充，不输出 JSON。`,
-    memoryMessages: [{ role: 'user', content: `双方昵称：${playerName()} / ${charName(char)}\n玩家本次消息：${task.userText}\n\n固定最近30条原文：\n${recent.map((row, index) => `${index + 1}. ${row.role}: ${row.content}`).join('\n')}\n\n候选本地记忆：\n${candidates}` }],
+    memorySystem: `你是 AL 的记忆筛选 AI。根据玩家本次消息和固定最近200条原文，从候选记忆中只挑选确实会改变本轮理解、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替角色回复玩家。只输出给聊天 AI 的简洁记忆补充，不输出 JSON。`,
+    memoryMessages: [{ role: 'user', content: `双方昵称：${playerName()} / ${charName(char)}\n玩家本次消息：${task.userText}\n\n固定最近200条原文：\n${recent.map((row, index) => `${index + 1}. ${row.role}: ${row.content}`).join('\n')}\n\n候选本地记忆：\n${candidates}` }],
     memoryMaxTokens: 1400,
     chatSystem: prompt.system,
     chatMessages: recent,
@@ -3004,7 +3179,7 @@ function normalizeStagePersonaConfig(char = {}) {
       confidence: Math.max(0, Math.min(1, Number(source.state?.confidence) || 1)),
       evidenceMessageIds: Array.isArray(source.state?.evidenceMessageIds) ? source.state.evidenceMessageIds.filter(Boolean).slice(-12) : []
     },
-    history: Array.isArray(source.history) ? source.history.slice(-30) : []
+    history: Array.isArray(source.history) ? source.history.slice(-NORMAL_RAW_CONTEXT_LIMIT) : []
   };
   return char.stagePersona;
 }
@@ -3296,8 +3471,8 @@ function buildProactiveTimeContext(chat, now = new Date(), triggerMode = 'planne
     `主动阶段：${stage}`,
     `未回复状态：${unanswered}`,
     `智能策略：${mode}`,
-    `历史上下文策略：${historyMode === 'fresh-start' ? '最近30条仍完整保留，但上一轮已自然结束；除非当前话题明确关联，否则以当前时段重新开口' : historyMode === 'archive' ? '最近30条仍完整保留，旧聊天作为过往事实而不是刚收到的待回复内容' : '近期聊天可供自然衔接'}`,
-    '最近30条聊天会完整提供给你，它们都是已经发生过的事实，不能遗忘或篡改。时间间隔只决定你现在怎样开口，不代表删除这些事实。',
+    `历史上下文策略：${historyMode === 'fresh-start' ? '最近200条仍完整保留，但上一轮已自然结束；除非当前话题明确关联，否则以当前时段重新开口' : historyMode === 'archive' ? '最近200条仍完整保留，旧聊天作为过往事实而不是刚收到的待回复内容' : '近期聊天可供自然衔接'}`,
+    '最近200条聊天会完整提供给你，它们都是已经发生过的事实，不能遗忘或篡改。时间间隔只决定你现在怎样开口，不代表删除这些事实。',
     '如果当前情境或玩家最近发言明确指向昨天或更早的内容，可以自然接续；如果没有明确关联，不要仅因旧话题出现在30条记录中就继续追问。',
     '硬性要求：这不是用户刚刚发消息后等你回答，而是隔了一段空闲时间后你主动打开微信来发消息。',
     '如果距离最后一条消息超过 15 分钟，必须让回复自然体现时间流逝，不要像秒回一样接上一句。',
@@ -3322,7 +3497,7 @@ function buildProactiveTriggerMessage(char, chat, now = new Date(), triggerMode 
     `只输出${charName(char)}要发出的聊天正文；不要解释触发原因，不要提到系统、后台、推送或定时器。`
   ].join('\n');
 }
-function proactiveRecentMessages(chat, count = 30, now = new Date()) {
+function proactiveRecentMessages(chat, count = NORMAL_RAW_CONTEXT_LIMIT, now = new Date()) {
   return recentMessages(chat, count).map(m => {
     if (m.hidden) return { role: 'user', content: formatHiddenEventForAI(m) };
     const at = m.time ? new Date(m.time) : null;
@@ -4101,7 +4276,7 @@ function commitStagePersonaConfig(char, nextConfig, changeReason = '') {
       evidenceMessageIds: [],
       source: 'manual'
     });
-    normalized.history = normalized.history.slice(-30);
+    normalized.history = normalized.history.slice(-NORMAL_RAW_CONTEXT_LIMIT);
     normalized.state = { since: Date.now(), reason: changeReason || '玩家手动调整关系阶段', confidence: 1, evidenceMessageIds: [] };
   }
   refreshStoredCharacterPrompt(char, oldPrompt);
@@ -5251,7 +5426,7 @@ function formatHiddenEventForAI(m) {
   return `【后台场景事件｜${formatFullTime(new Date(m.time || Date.now()))}】${m.content}
 注意：这不是${playerName()}刚发来的聊天气泡，而是已经发生过的场景记录。你可以自然记得这件事，但不要提到“系统记录/隐藏事件/后台”。`;
 }
-function sceneMessagesForAI(chat, count = 30, options = {}) {
+function sceneMessagesForAI(chat, count = NORMAL_RAW_CONTEXT_LIMIT, options = {}) {
   const now = options.now || new Date();
   return recentMessages(chat, count).map(m => {
     if (m.hidden) return { role: 'user', content: formatHiddenEventForAI(m) };
@@ -5451,9 +5626,9 @@ function buildMemoryQueryPayload(char, userInput, messages) {
   const currentStage = stagePersonaFor(char);
   const stageCatalog = stageConfig.stages.map(stage => `${stage.id}=${stage.label}`).join('，');
   const system = buildMemorySceneSystem(char, '检索', 'memory-query', `任务一：根据当前输入、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
-规则 1：玩家当前输入或当前触发原因是最高优先级。先判断这次说话真正需要什么记忆，再使用最近30条聊天消除指代歧义。
-正例：${playerName()}说“昨天那件事你想好了吗”，结合最近30条确认“那件事”指红包是否领取，再检索对应红包。
-反例：${playerName()}只说“今天天气不错”，却因为最近30条出现过红包就检索并继续催红包。
+规则 1：玩家当前输入或当前触发原因是最高优先级。先判断这次说话真正需要什么记忆，再使用最近200条聊天消除指代歧义。
+正例：${playerName()}说“昨天那件事你想好了吗”，结合最近200条确认“那件事”指红包是否领取，再检索对应红包。
+反例：${playerName()}只说“今天天气不错”，却因为最近200条出现过红包就检索并继续催红包。
 规则 2：query 要围绕当前需要回忆的事实、关系、承诺、红包、朋友圈或雷点。
 正例：${playerName()}问“你还记得刚才红包吗”时，query 写“${playerName()} ${charName(char)} 红包 金额 是否领取 备注”。
 反例：query 写“聊天回复 温柔 继续对话”。
@@ -5479,7 +5654,7 @@ function buildMemoryQueryPayload(char, userInput, messages) {
 规则 9：普通友好、一次玩笑、一次红包、一次关心、临时生气都不足以改变长期阶段。只有明确的双方关系确认或明确结束关系可标记 explicitMutualChange=true。
 正例：角色明确接受表白，双方确认恋爱关系，可以建议进入 committed。
 反例：角色只说“你人还不错”，不能因此跨阶段。
-规则 10：不确定时必须保持 currentStage，confidence 不得虚高。阶段变化至少给出最近30条中真实存在的 evidenceMessageIds。
+规则 10：不确定时必须保持 currentStage，confidence 不得虚高。阶段变化至少给出最近200条中真实存在的 evidenceMessageIds。
 输出 JSON 结构：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","relationshipStage":{"current":"当前阶段ID","recommended":"建议阶段ID","confidence":0到1,"reason":"判断原因","evidenceMessageIds":["消息ID"],"explicitMutualChange":false}}`);
   const user = `双方昵称：${playerName()} / ${charName(char)}
 初始关系设定：${char.scenario || '未填写'}
@@ -5487,8 +5662,8 @@ function buildMemoryQueryPayload(char, userInput, messages) {
 可用阶段顺序：${stageCatalog}
 当前阶段开始时间：${formatFullTime(new Date(stageConfig.state?.since || Date.now()))}
 当前阶段形成原因：${stageConfig.state?.reason || '暂无'}
-固定最近30条聊天与场景事件（仅用于判断当前输入是否指向旧内容，不得自行续写）：
-${messages.slice(-30).map(m => memoryEvidenceLine(m, char)).join('\n')}
+固定最近200条聊天与场景事件（仅用于判断当前输入是否指向旧内容，不得自行续写）：
+${messages.slice(-NORMAL_RAW_CONTEXT_LIMIT).map(m => memoryEvidenceLine(m, char)).join('\n')}
 
 当前输入或触发原因：
 ${userInput}
@@ -6704,11 +6879,11 @@ function composeMemoryPackSections(prefix, sections = [], budget = MEMORY_PACK_C
   if (omitted) keptSections.push(`预算提示：已省略 ${omitted} 条低优先级记忆，优先保留近期摘要、向量命中、未完成承诺和关键词强命中。`);
   return `${prefix}\n\n${keptSections.join('\n\n')}`;
 }
-function recentMessageCandidateCount(chat, count = 30) {
+function recentMessageCandidateCount(chat, count = NORMAL_RAW_CONTEXT_LIMIT) {
   return (chat?.messages || []).filter(m => m.role !== 'system' && messageAvailableToAI(m)).slice(-Math.max(1, Number(count) || 30)).length;
 }
-function recentMessages(chat, count = 30) {
-  return (chat?.messages || []).filter(m => m.role !== 'system' && messageAvailableToAI(m)).slice(-Math.max(1, Number(count) || 30));
+function recentMessages(chat, count = NORMAL_RAW_CONTEXT_LIMIT) {
+  return (chat?.messages || []).filter(m => m.role !== 'system' && messageAvailableToAI(m)).slice(-Math.max(1, Number(count) || NORMAL_RAW_CONTEXT_LIMIT));
 }
 function normalizeVector(vec) {
   const norm = Math.sqrt(vec.reduce((sum, n) => sum + n * n, 0)) || 1;
@@ -6933,7 +7108,7 @@ async function applyRelationshipStageReview(char, chat, review, recent = []) {
     confidence,
     source: 'memory-ai'
   });
-  config.history = config.history.slice(-30);
+  config.history = config.history.slice(-NORMAL_RAW_CONTEXT_LIMIT);
   char.stagePersona = config;
   refreshStoredCharacterPrompt(char, oldPrompt);
   DB.set('characters', characters);
@@ -6962,7 +7137,7 @@ async function prepareMemoryPack(charId, userInput, scene = 'chat', options = {}
   const char = characters.find(c => c.id === charId);
   if (!chat || !char) return '';
   ensureChatMessageIds(chat);
-  const recent = recentMessages(chat, 30);
+  const recent = recentMessages(chat, NORMAL_RAW_CONTEXT_LIMIT);
   const query = await generateMemoryQuery(char, userInput, recent, scene, options);
   await applyRelationshipStageReview(char, chat, query.relationshipStage || query.stageReview, recent);
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
@@ -9050,6 +9225,7 @@ function loadSettings() {
   document.getElementById('set-system-prompt').value = settings.systemPrompt || '';
   settingsFormHydrating = false;
   renderCloudTimerStatus();
+  loadYuqiBridgeSettings().then(() => refreshYuqiBridgeStatus()).catch(err => console.warn('[Yuqi Bridge] status skipped:', err.message));
   checkNativeNotificationStatus().catch(err => console.warn('[AL Notification] status skipped:', err.message));
 }
 function getModelSlot(slot = 'chat') {

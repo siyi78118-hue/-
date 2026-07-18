@@ -121,3 +121,23 @@ test('invalid sync checksums stop reconciliation before facts can be promoted', 
   );
   assert.equal(store.getSyncCursor('phone_a'), 10);
 }));
+
+test('imports an evidence-linked human annotation for later preset publication', async () => withStore(async store => {
+  const payload = {
+    annotationId: 'annotation_phone_1', turnId: 'turn_phone_11', sourceMessageId: 'msg_fallback_11',
+    presetVersion: '1.0.0', userCorrection: '这句是调侃，不是正式索取。',
+    desiredBehavior: '先结合前后文判断玩笑，再决定是否写入稳定记忆。', status: 'proposed', createdAt: 1784400002000
+  };
+  const entry = {
+    seq: 13, entityType: 'annotation', entityId: payload.annotationId, operation: 'insert', payload,
+    checksum: contentHash(payload), createdAt: payload.createdAt
+  };
+  const reconciler = new YuqiReconciler({
+    store,
+    codex: { async runTurn() { throw new AssertionError('annotation-only sync does not need a role turn'); } }
+  });
+  const result = await reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 12, entries: [entry] });
+  assert.equal(result.importedAnnotations, 1);
+  assert.equal(store.getAnnotation('annotation_phone_1').sourceMessageId, 'msg_fallback_11');
+  assert.equal(store.getAnnotation('annotation_phone_1').status, 'proposed');
+}));

@@ -15,6 +15,9 @@ import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.api.ApiConfig;
+import com.siyi.al.execution.bridge.BridgeConfig;
+import com.siyi.al.execution.bridge.BridgeMode;
+import com.siyi.al.execution.bridge.BridgeStatusProbe;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
@@ -24,6 +27,8 @@ import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanHistoryEntity;
+import com.siyi.al.execution.db.SyncCursorEntity;
+import com.siyi.al.execution.db.YuqiAnnotationEntity;
 import com.siyi.al.execution.RolePlanAlarmScheduler;
 import com.siyi.al.execution.AutomaticTaskAlarmScheduler;
 import com.siyi.al.execution.secure.AlSecretStore;
@@ -31,6 +36,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.UUID;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -68,6 +74,92 @@ public final class AlExecutionPlugin extends Plugin {
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("configId", configId);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void saveBridgeConfig(PluginCall call) {
+        execute(call, () -> {
+            BridgeConfig current = secrets.loadBridgeConfig();
+            String deviceId = optional(call, "deviceId", current.deviceId);
+            if (deviceId.isEmpty()) deviceId = "device_" + UUID.randomUUID().toString().replace("-", "");
+            BridgeConfig config = new BridgeConfig(
+                Boolean.TRUE.equals(call.getBoolean("enabled", current.enabled)),
+                BridgeMode.parse(optional(call, "mode", current.mode.name())),
+                optional(call, "lanUrl", current.lanUrl),
+                optional(call, "cloudUrl", current.cloudUrl),
+                deviceId,
+                optional(call, "pairingSecret", current.pairingSecret),
+                optional(call, "deviceToken", current.deviceToken),
+                optional(call, "encryptionKeyBase64", current.encryptionKeyBase64),
+                integer(call, "connectTimeoutMs", current.connectTimeoutMs),
+                integer(call, "readTimeoutMs", current.readTimeoutMs),
+                integer(call, "cloudPollAttempts", current.cloudPollAttempts),
+                integer(call, "cloudPollIntervalMs", current.cloudPollIntervalMs)
+            );
+            secrets.saveBridgeConfig(config);
+            return bridgeConfigResult(config);
+        });
+    }
+
+    @PluginMethod
+    public void loadBridgeConfig(PluginCall call) {
+        execute(call, () -> bridgeConfigResult(secrets.loadBridgeConfig()));
+    }
+
+    @PluginMethod
+    public void yuqiBridgeStatus(PluginCall call) {
+        execute(call, () -> {
+            BridgeConfig config = secrets.loadBridgeConfig();
+            SyncCursorEntity cursor = AlExecutionDatabase.get(getContext()).executionDao().syncCursor("yuqi_pc");
+            long ackSeq = cursor == null ? 0L : cursor.ackSeq;
+            BridgeStatusProbe.Snapshot live = BridgeStatusProbe.probe(config);
+            JSObject result = bridgeConfigResult(config);
+            result.put("lanReady", config.hasLan());
+            result.put("cloudReady", config.hasCloud());
+            result.put("syncAckSeq", ackSeq);
+            result.put("pendingRawMessages", AlExecutionDatabase.get(getContext()).executionDao().rawMessageCountAfterSync(ackSeq));
+            result.put("verifiedFacts", AlExecutionDatabase.get(getContext()).executionDao().verifiedYuqiFactCount());
+            result.put("pendingAnnotations", AlExecutionDatabase.get(getContext()).executionDao().pendingYuqiAnnotationCount());
+            result.put("lanOnline", live.lanOnline);
+            result.put("cloudOnline", live.cloudOnline);
+            result.put("quotaWarningLevel", live.quotaWarningLevel);
+            result.put("threadHealth", live.threadHealth);
+            result.put("presetVersion", live.presetVersion);
+            result.put("lanError", live.lanError);
+            result.put("cloudError", live.cloudError);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void saveYuqiAnnotation(PluginCall call) {
+        execute(call, () -> {
+            String correction = optional(call, "userCorrection", "");
+            String desiredBehavior = optional(call, "desiredBehavior", "");
+            if (correction.isEmpty() && desiredBehavior.isEmpty()) throw new IllegalArgumentException("annotation content is required");
+            YuqiAnnotationEntity annotation = new YuqiAnnotationEntity();
+            annotation.annotationId = optional(call, "annotationId", "annotation_" + UUID.randomUUID().toString().replace("-", ""));
+            annotation.turnId = required(call, "turnId");
+            String sourceMessageId = optional(call, "sourceMessageId", "");
+            annotation.sourceMessageId = sourceMessageId.isEmpty() ? null : sourceMessageId;
+            annotation.presetVersion = optional(call, "presetVersion", "1.0.0");
+            annotation.userCorrection = correction;
+            annotation.desiredBehavior = desiredBehavior;
+            annotation.status = "proposed";
+            annotation.createdAt = System.currentTimeMillis();
+            annotation.syncSeq = Math.max(
+                AlExecutionDatabase.get(getContext()).executionDao().maxRawSyncSeq(),
+                AlExecutionDatabase.get(getContext()).executionDao().maxAnnotationSyncSeq()
+            ) + 1L;
+            annotation.checksum = annotation.annotationId;
+            long inserted = AlExecutionDatabase.get(getContext()).executionDao().insertYuqiAnnotation(annotation);
+            JSObject result = new JSObject();
+            result.put("saved", inserted != -1L);
+            result.put("annotationId", annotation.annotationId);
+            result.put("syncSeq", annotation.syncSeq);
+            result.put("presetVersion", annotation.presetVersion);
             return result;
         });
     }
@@ -395,6 +487,33 @@ public final class AlExecutionPlugin extends Plugin {
         String value = call.getString(name);
         if (value == null || value.trim().isEmpty()) throw new IllegalArgumentException(name + " is required");
         return value.trim();
+    }
+
+    private static String optional(PluginCall call, String name, String fallback) {
+        String value = call.getString(name);
+        return value == null || value.trim().isEmpty() ? (fallback == null ? "" : fallback) : value.trim();
+    }
+
+    private static int integer(PluginCall call, String name, int fallback) {
+        Integer value = call.getInt(name, fallback);
+        return value == null ? fallback : value;
+    }
+
+    private static JSObject bridgeConfigResult(BridgeConfig config) {
+        JSObject result = new JSObject();
+        result.put("enabled", config.enabled);
+        result.put("mode", config.mode.name());
+        result.put("lanUrl", config.lanUrl);
+        result.put("cloudUrl", config.cloudUrl);
+        result.put("deviceId", config.deviceId);
+        result.put("pairingSecretSet", !config.pairingSecret.isEmpty());
+        result.put("deviceTokenSet", !config.deviceToken.isEmpty());
+        result.put("encryptionKeySet", !config.encryptionKeyBase64.isEmpty());
+        result.put("connectTimeoutMs", config.connectTimeoutMs);
+        result.put("readTimeoutMs", config.readTimeoutMs);
+        result.put("cloudPollAttempts", config.cloudPollAttempts);
+        result.put("cloudPollIntervalMs", config.cloudPollIntervalMs);
+        return result;
     }
 
     private static String requiredJson(JSONObject value, String name) {

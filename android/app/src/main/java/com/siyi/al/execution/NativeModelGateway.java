@@ -7,11 +7,13 @@ import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeRouter;
 import org.json.JSONArray;
 import org.json.JSONObject;
+import java.util.function.Supplier;
 
 public final class NativeModelGateway implements TurnBridgeGateway {
     private final AlSecretStore secrets;
     private final OpenAiCompatibleClient client;
     private volatile BridgeRouter bridgeRouter;
+    private volatile Supplier<BridgeRouter> bridgeRouterProvider;
 
     public NativeModelGateway(AlSecretStore secrets, OpenAiCompatibleClient client) {
         this.secrets = secrets;
@@ -22,15 +24,24 @@ public final class NativeModelGateway implements TurnBridgeGateway {
         this.bridgeRouter = bridgeRouter;
     }
 
+    public void setBridgeRouterProvider(Supplier<BridgeRouter> provider) {
+        this.bridgeRouterProvider = provider;
+    }
+
+    private BridgeRouter currentBridgeRouter() {
+        Supplier<BridgeRouter> provider = bridgeRouterProvider;
+        return provider == null ? bridgeRouter : provider.get();
+    }
+
     @Override
     public boolean hasBridge() {
-        BridgeRouter current = bridgeRouter;
+        BridgeRouter current = currentBridgeRouter();
         return current != null && current.isEnabled();
     }
 
     @Override
     public BridgeResult executeBridgeTurn(TurnSubmission submission) throws Exception {
-        BridgeRouter current = bridgeRouter;
+        BridgeRouter current = currentBridgeRouter();
         if (current == null) throw new IllegalStateException("Bridge router is not configured");
         return current.execute(submission);
     }

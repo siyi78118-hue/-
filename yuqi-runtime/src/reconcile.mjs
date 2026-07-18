@@ -17,7 +17,7 @@ function validateEntries(entries) {
     previous = Number(entry.seq);
     if (seen.has(entry.seq)) throw new Error('duplicate sync sequence');
     seen.add(entry.seq);
-    if (entry.entityType !== 'message') continue;
+    if (!['message', 'annotation'].includes(entry.entityType)) continue;
     if (entry.checksum !== contentHash(entry.payload)) throw new Error(`sync checksum mismatch at ${entry.seq}`);
   }
 }
@@ -42,6 +42,7 @@ export class YuqiReconciler {
         peerId,
         ackSeq: acknowledged,
         importedMessages: 0,
+        importedAnnotations: 0,
         reconciledFallbackTurns: [],
         suppressedReplies: 0,
         deliverReplies: []
@@ -49,7 +50,14 @@ export class YuqiReconciler {
     }
 
     const imported = [];
+    const importedAnnotations = [];
     for (const entry of pending) {
+      if (entry.entityType === 'annotation' && entry.operation !== 'delete') {
+        const existing = this.store.getAnnotation(entry.entityId);
+        const saved = this.store.putAnnotation(entry.payload);
+        if (!existing) importedAnnotations.push(saved);
+        continue;
+      }
       if (entry.entityType !== 'message' || entry.operation === 'delete') continue;
       const before = this.store.getMessage(entry.entityId);
       const saved = this.store.putMessage(entry.payload);
@@ -93,6 +101,7 @@ export class YuqiReconciler {
       peerId,
       ackSeq,
       importedMessages: imported.length,
+      importedAnnotations: importedAnnotations.length,
       reconciledFallbackTurns: fallbackTurns,
       suppressedReplies,
       deliverReplies: []
