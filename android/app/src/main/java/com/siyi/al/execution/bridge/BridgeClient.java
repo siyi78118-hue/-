@@ -23,9 +23,15 @@ import org.json.JSONObject;
 public final class BridgeClient {
     private static final SecureRandom RANDOM = new SecureRandom();
     private final BridgeConfig config;
+    private final FallbackJournal journal;
 
     public BridgeClient(BridgeConfig config) {
+        this(config, null);
+    }
+
+    public BridgeClient(BridgeConfig config, FallbackJournal journal) {
         this.config = config == null ? BridgeConfig.disabled() : config;
+        this.journal = journal;
     }
 
     public BridgeRouter.RouteClient lanRoute() { return this::sendLan; }
@@ -75,7 +81,10 @@ public final class BridgeClient {
                         try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
                         catch (Exception ignored) { continue; }
                         JSONObject decoded = new JSONObject(plaintext);
-                        if (!submission.turnId.equals(decoded.optString("turnId"))) continue;
+                        if (!submission.turnId.equals(decoded.optString("turnId"))) {
+                            acknowledgeCloud(item.optString("messageId"));
+                            continue;
+                        }
                         acknowledgeCloud(item.optString("messageId"));
                         return parseRuntimeReply("cloud", plaintext);
                     }
@@ -103,7 +112,7 @@ public final class BridgeClient {
         message.put("recipientId", submission.characterId);
         if (!message.has("content")) message.put("content", input.optString("text", ""));
         if (!message.has("sentAt")) message.put("sentAt", submission.createdAt);
-        return new JSONObject()
+        JSONObject envelope = new JSONObject()
             .put("protocolVersion", 1)
             .put("turnId", submission.turnId)
             .put("characterId", submission.characterId)
@@ -111,10 +120,13 @@ public final class BridgeClient {
             .put("deviceSeq", input.optLong("deviceSeq", Math.max(1L, submission.createdAt)))
             .put("createdAt", Math.max(1L, submission.createdAt))
             .put("message", message);
+        if (journal != null) envelope.put("recovery", journal.pendingPacket(1000));
+        return envelope;
     }
 
     private BridgeResult parseRuntimeReply(String origin, String raw) throws Exception {
         JSONObject root = new JSONObject(raw);
+        if (journal != null) journal.acknowledge(root.optLong("recoveryAckSeq", 0L));
         JSONObject reply = root.optJSONObject("reply");
         if (reply == null && root.optJSONObject("result") != null) reply = root.optJSONObject("result").optJSONObject("reply");
         String content = reply == null ? root.optString("replyText", "") : reply.optString("content", "");

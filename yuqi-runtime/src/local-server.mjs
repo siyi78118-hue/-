@@ -30,6 +30,7 @@ export function createYuqiServer({
   secret,
   store,
   orchestrator,
+  reconciler = null,
   clock = Date.now,
   maxBodyBytes = 256 * 1024,
   maxClockSkewMs = 5 * 60 * 1000
@@ -80,8 +81,13 @@ export function createYuqiServer({
     }
 
     if (request.method === 'POST' && url.pathname === '/v1/turns') {
+      let recoveryAckSeq = 0;
+      if (reconciler && body?.recovery && Array.isArray(body.recovery.entries)) {
+        const recovery = await reconciler.reconcileFrom(body.recovery);
+        recoveryAckSeq = recovery.ackSeq;
+      }
       const result = await orchestrator.process(body);
-      return json(response, 201, { ok: true, ...result });
+      return json(response, 201, { ok: true, ...result, recoveryAckSeq });
     }
     const turnMatch = /^\/v1\/turns\/([^/]+)$/.exec(url.pathname);
     if (request.method === 'GET' && turnMatch) {

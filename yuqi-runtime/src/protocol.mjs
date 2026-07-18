@@ -55,7 +55,15 @@ export function validateEnvelope(value) {
   if (!value || typeof value !== 'object') throw new Error('invalid envelope');
   if (value.protocolVersion !== 1) throw new Error('invalid protocolVersion');
 
-  const envelope = structuredClone(value);
+  const envelope = {
+    protocolVersion: value.protocolVersion,
+    turnId: value.turnId,
+    characterId: value.characterId,
+    deviceId: value.deviceId,
+    deviceSeq: value.deviceSeq,
+    createdAt: value.createdAt,
+    message: value.message ? structuredClone(value.message) : value.message
+  };
   requireId(envelope.turnId, 'turnId', 'turn_');
   requireId(envelope.characterId, 'characterId');
   requireId(envelope.deviceId, 'deviceId');
@@ -81,4 +89,3 @@ export function validateEnvelope(value) {
   if (message.content.length > 100_000) throw new Error('message content too large');
   return envelope;
 }
-

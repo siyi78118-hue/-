@@ -92,3 +92,38 @@ test('rejects stale, tampered, and oversized requests', async () => {
     await server.close();
   }
 });
+
+test('reconciles the phone journal before processing the new turn and returns its acknowledgement', async () => {
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { getSyncDelta: () => [], ackSync: () => 0 },
+    reconciler: {
+      async reconcileFrom(packet) {
+        events.push(`reconcile:${packet.peerId}`);
+        return { ackSeq: 88 };
+      }
+    },
+    orchestrator: {
+      async process(value) {
+        events.push(`turn:${value.turnId}`);
+        return { turnId: value.turnId, reply: { content: '收到' } };
+      }
+    }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const result = await call(server.address().port, {
+      method: 'POST', path: '/v1/turns', secret: 'test-pairing-secret', nonce: 'recovery-nonce',
+      body: {
+        protocolVersion: 1, turnId: 'turn_phone_88',
+        recovery: { peerId: 'phone_a', lastCommonSeq: 80, entries: [] }
+      }
+    });
+    assert.equal(result.status, 201);
+    assert.equal(result.body.recoveryAckSeq, 88);
+    assert.deepEqual(events, ['reconcile:phone_a', 'turn:turn_phone_88']);
+  } finally {
+    await server.close();
+  }
+});

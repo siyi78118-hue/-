@@ -235,6 +235,14 @@ export class YuqiStore {
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS suppressed_messages (
+        message_id TEXT PRIMARY KEY,
+        authoritative_message_id TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(message_id) REFERENCES messages(message_id)
+      );
     `);
 
     const factColumns = new Set(this.db.prepare('PRAGMA table_info(facts)').all().map(row => row.name));
@@ -421,7 +429,10 @@ export class YuqiStore {
     const safeLimit = Math.max(1, Math.min(5000, Number(limit) || 200));
     return this.db.prepare(`
       SELECT * FROM (
-        SELECT * FROM messages WHERE character_id = ? ORDER BY sent_at DESC, message_id DESC LIMIT ?
+        SELECT * FROM messages
+        WHERE character_id = ?
+          AND message_id NOT IN (SELECT message_id FROM suppressed_messages)
+        ORDER BY sent_at DESC, message_id DESC LIMIT ?
       ) ORDER BY sent_at ASC, message_id ASC
     `).all(characterId, safeLimit).map(mapMessage);
   }
@@ -437,6 +448,7 @@ export class YuqiStore {
     const rows = this.db.prepare(`
       SELECT * FROM messages
       WHERE character_id = ?
+        AND message_id NOT IN (SELECT message_id FROM suppressed_messages)
       ORDER BY sent_at ASC, message_id ASC
     `).all(message.characterId).map(mapMessage);
     const index = rows.findIndex(item => item.messageId === messageId);
@@ -517,6 +529,31 @@ export class YuqiStore {
 
   getSyncCursor(peerId) {
     return Number(this.db.prepare('SELECT ack_seq FROM sync_cursors WHERE peer_id = ?').get(peerId)?.ack_seq || 0);
+  }
+
+  suppressCompetingReplies(turnId, authoritativeMessageId) {
+    const authoritative = this.getMessage(authoritativeMessageId);
+    if (!authoritative || authoritative.turnId !== turnId || authoritative.speakerType !== 'character') {
+      throw new Error('authoritative reply not found');
+    }
+    const candidates = this.db.prepare(`
+      SELECT message_id FROM messages
+      WHERE turn_id = ? AND speaker_type = 'character' AND message_id != ?
+        AND origin != 'fallback'
+    `).all(turnId, authoritativeMessageId);
+    let suppressed = 0;
+    for (const row of candidates) {
+      const result = this.db.prepare(`
+        INSERT OR IGNORE INTO suppressed_messages(message_id, authoritative_message_id, reason, created_at)
+        VALUES (?, ?, 'fallback_reply_was_delivered', ?)
+      `).run(row.message_id, authoritativeMessageId, now());
+      suppressed += Number(result.changes || 0);
+    }
+    return suppressed;
+  }
+
+  isMessageSuppressed(messageId) {
+    return !!this.db.prepare('SELECT 1 AS found FROM suppressed_messages WHERE message_id = ?').get(messageId);
   }
 
   setSession(role, threadId) {

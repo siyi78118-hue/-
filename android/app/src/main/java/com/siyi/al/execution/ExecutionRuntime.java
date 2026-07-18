@@ -9,6 +9,7 @@ import com.siyi.al.execution.secure.AlSecretStore;
 import com.siyi.al.execution.bridge.BridgeClient;
 import com.siyi.al.execution.bridge.BridgeConfig;
 import com.siyi.al.execution.bridge.BridgeRouter;
+import com.siyi.al.execution.bridge.FallbackJournal;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
 
 final class ExecutionRuntime {
@@ -23,7 +24,8 @@ final class ExecutionRuntime {
             new OpenAiCompatibleClient(new UrlConnectionTransport())
         );
         BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
-        BridgeClient bridgeClient = new BridgeClient(bridgeConfig);
+        FallbackJournal fallbackJournal = new FallbackJournal(database.executionDao(), bridgeConfig.deviceId);
+        BridgeClient bridgeClient = new BridgeClient(bridgeConfig, fallbackJournal);
         gateway.setBridgeRouter(new BridgeRouter(
             bridgeConfig,
             bridgeClient.lanRoute(),

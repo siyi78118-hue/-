@@ -5,5 +5,13 @@
   "databasePath": "data/yuqi-runtime.sqlite",
   "codexCommand": "codex",
   "codexArgs": ["app-server"],
-  "codexRuntimeDirectory": "."
+  "codexRuntimeDirectory": ".",
+  "cloudRelay": {
+    "enabled": false,
+    "url": "https://al-cloud-timer.example.workers.dev",
+    "deviceId": "replace-with-device-id",
+    "deviceToken": "replace-with-a-long-random-device-token",
+    "encryptionKeyBase64": "replace-with-a-random-32-byte-base64-key",
+    "pollIntervalMs": 1500
+  }
 }

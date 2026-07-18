@@ -34,7 +34,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.deviceId = deviceId;
         entity.deviceSeq = input.optLong("deviceSeq", Math.max(1L, submission.createdAt));
         entity.checksum = sha256(canonical(entity));
-        entity.syncSeq = submission.createdAt;
+        entity.syncSeq = nextSyncSeq();
         dao.insertRawMessage(entity);
     }
 
@@ -52,8 +52,12 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.deviceId = result.fallback ? deviceId + ":fallback" : "pc:" + deviceId;
         entity.deviceSeq = Math.max(1L, entity.sentAt);
         entity.checksum = sha256(canonical(entity));
-        entity.syncSeq = entity.sentAt;
+        entity.syncSeq = nextSyncSeq();
         dao.insertRawMessage(entity);
+    }
+
+    private long nextSyncSeq() {
+        return Math.max(1L, dao.maxRawSyncSeq() + 1L);
     }
 
     private static String canonical(RawMessageEntity value) {

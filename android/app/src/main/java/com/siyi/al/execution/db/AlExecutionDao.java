@@ -52,6 +52,12 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId ORDER BY sentAt DESC LIMIT :limit")
     List<RawMessageEntity> recentRawMessages(String characterId, int limit);
 
+    @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId AND syncSeq > :afterSeq ORDER BY syncSeq ASC, messageId ASC LIMIT :limit")
+    List<RawMessageEntity> rawMessagesAfterSync(String characterId, long afterSeq, int limit);
+
+    @Query("SELECT COALESCE(MAX(syncSeq), 0) FROM yuqi_raw_messages")
+    long maxRawSyncSeq();
+
     @Query("SELECT * FROM yuqi_evidence_facts WHERE characterId = :characterId ORDER BY updatedAt DESC")
     List<EvidenceFactEntity> evidenceFacts(String characterId);
 
