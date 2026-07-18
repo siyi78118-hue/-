@@ -36,6 +36,14 @@ async function register(env, deviceId = 'device_123456', token = 'device-token-1
   }), env));
 }
 
+test('health check declares the ciphertext-only relay without authentication', async () => {
+  const result = await jsonResponse(await relayWorker.fetch(request('/bridge/health'), envFixture()));
+  assert.equal(result.status, 200);
+  assert.equal(result.body.ok, true);
+  assert.equal(result.body.service, 'yuqi-relay');
+  assert.equal(result.body.storage, 'ciphertext-only');
+});
+
 test('registers a device but stores only a token hash', async () => {
   const env = envFixture();
   const result = await register(env);

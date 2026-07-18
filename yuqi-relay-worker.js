@@ -3,6 +3,7 @@ const PRIVATE_FIELDS = new Set([
   'systemPrompt', 'apiKey', 'authorization', 'plaintext'
 ]);
 const DIRECTIONS = new Set(['phone_to_pc', 'pc_to_phone']);
+const YUQI_RELAY_VERSION = '2026-07-19.1';
 const CORS = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET,POST,OPTIONS',
@@ -174,6 +175,9 @@ const relayWorker = {
     if (request.method === 'OPTIONS') return new Response('', { headers: CORS });
     const url = new URL(request.url);
     try {
+      if (request.method === 'GET' && url.pathname === '/bridge/health') {
+        return json({ ok: true, service: 'yuqi-relay', version: YUQI_RELAY_VERSION, storage: 'ciphertext-only' });
+      }
       if (request.method === 'POST' && url.pathname === '/bridge/register') return handleRegister(request, env);
       if (request.method === 'POST' && url.pathname === '/bridge/enqueue') return handleEnqueue(request, env);
       if (request.method === 'GET' && url.pathname === '/bridge/poll') return handlePoll(request, env, url);
