@@ -82,6 +82,24 @@ function mapFact(row) {
   };
 }
 
+function mapPresetVersion(row) {
+  if (!row) return null;
+  return parseJson(row.manifest_json, null);
+}
+
+function mapAnnotation(row) {
+  if (!row) return null;
+  return {
+    ...parseJson(row.annotation_json, {}),
+    annotationId: row.annotation_id,
+    turnId: row.turn_id,
+    sourceMessageId: row.source_message_id || null,
+    presetVersion: row.preset_version,
+    status: row.status,
+    createdAt: row.created_at
+  };
+}
+
 export class YuqiStore {
   constructor(filename) {
     if (!filename) throw new Error('database filename is required');
@@ -210,6 +228,12 @@ export class YuqiStore {
         level TEXT NOT NULL,
         detail_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS runtime_state (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
       );
     `);
 
@@ -495,5 +519,71 @@ export class YuqiStore {
 
   getSession(role) {
     return String(this.db.prepare('SELECT thread_id FROM sessions WHERE role = ?').get(role)?.thread_id || '');
+  }
+
+  putPresetVersion(version) {
+    if (!version?.version || !version.checksum) throw new Error('invalid preset version');
+    const manifestJson = canonicalJson(version);
+    const existing = this.db.prepare('SELECT manifest_json FROM preset_versions WHERE version = ?').get(version.version);
+    if (existing) {
+      if (existing.manifest_json !== manifestJson) throw new Error('preset version conflict');
+      return version;
+    }
+    this.db.prepare(`
+      INSERT INTO preset_versions(version, parent_version, manifest_json, checksum, published_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(version.version, version.parentVersion || null, manifestJson, version.checksum, version.publishedAt || now());
+    return version;
+  }
+
+  getPresetVersion(version) {
+    return mapPresetVersion(this.db.prepare('SELECT * FROM preset_versions WHERE version = ?').get(version));
+  }
+
+  listPresetVersions() {
+    return this.db.prepare('SELECT * FROM preset_versions ORDER BY published_at ASC, version ASC').all().map(mapPresetVersion);
+  }
+
+  setCurrentPresetVersion(version) {
+    if (!this.getPresetVersion(version)) throw new Error('preset version not found');
+    this.db.prepare(`
+      INSERT INTO runtime_state(key, value, updated_at) VALUES ('current_preset_version', ?, ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+    `).run(version, now());
+    return version;
+  }
+
+  getCurrentPresetVersion() {
+    return String(this.db.prepare("SELECT value FROM runtime_state WHERE key = 'current_preset_version'").get()?.value || '');
+  }
+
+  putAnnotation(annotation) {
+    if (!annotation?.annotationId || !annotation.turnId || !annotation.presetVersion) throw new Error('invalid annotation');
+    const payload = canonicalJson(annotation);
+    const existing = this.db.prepare('SELECT annotation_json FROM annotations WHERE annotation_id = ?').get(annotation.annotationId);
+    if (existing) {
+      if (existing.annotation_json !== payload) throw new Error('annotation conflict');
+      return annotation;
+    }
+    this.db.prepare(`
+      INSERT INTO annotations(
+        annotation_id, turn_id, source_message_id, preset_version,
+        annotation_json, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      annotation.annotationId, annotation.turnId, annotation.sourceMessageId || null,
+      annotation.presetVersion, payload, annotation.status || 'proposed', annotation.createdAt || now()
+    );
+    return annotation;
+  }
+
+  getAnnotation(annotationId) {
+    return mapAnnotation(this.db.prepare('SELECT * FROM annotations WHERE annotation_id = ?').get(annotationId));
+  }
+
+  updateAnnotationStatus(annotationId, status) {
+    const result = this.db.prepare('UPDATE annotations SET status = ? WHERE annotation_id = ?').run(status, annotationId);
+    if (Number(result.changes) !== 1) throw new Error('annotation not found');
+    return this.getAnnotation(annotationId);
   }
 }
