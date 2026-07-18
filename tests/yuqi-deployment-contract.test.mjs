@@ -111,3 +111,12 @@ test('Android permits cleartext only for the generated private LAN host', () => 
   assert.match(policy, />192\.168\.1\.9<\/domain>/);
   assert.match(packageJson.scripts['android:debug'], /generate-yuqi-network-policy/);
 });
+
+test('firewall helper is restricted to TCP 17891 on private local subnets', () => {
+  const helper = readFileSync('scripts/enable-yuqi-lan-firewall.ps1', 'utf8');
+  assert.match(helper, /-Protocol TCP/);
+  assert.match(helper, /-LocalPort 17891/);
+  assert.match(helper, /-Profile Private/);
+  assert.match(helper, /-RemoteAddress LocalSubnet/);
+  assert.doesNotMatch(helper, /-Profile Any|-RemoteAddress Any/);
+});

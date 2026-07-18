@@ -14,6 +14,7 @@
     "cloud:relay:deploy": "node scripts/run-wrangler.mjs deploy --config wrangler.yuqi-relay.toml",
     "yuqi:setup": "node scripts/setup-yuqi-runtime.mjs",
     "yuqi:start": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-yuqi-background.ps1",
+    "yuqi:lan:enable": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/enable-yuqi-lan-firewall.ps1",
     "yuqi:backup": "node scripts/backup-yuqi-memory.mjs yuqi-runtime/config.json",
     "yuqi:verify": "node scripts/verify-yuqi-runtime.mjs",
     "yuqi:cloud:deploy": "node scripts/deploy-yuqi-cloud.mjs"
