@@ -60,6 +60,28 @@ function mapMessage(row) {
   };
 }
 
+function mapFact(row) {
+  if (!row) return null;
+  const stored = parseJson(row.fact_json, null);
+  if (stored) return stored;
+  return {
+    factId: row.fact_id,
+    characterId: row.character_id,
+    subjectId: row.subject_id,
+    predicate: row.predicate,
+    object: parseJson(row.object_json, null),
+    evidenceMode: row.evidence_mode,
+    sourceMessageIds: parseJson(row.source_message_ids_json, []),
+    exactQuotes: parseJson(row.exact_quotes_json, []),
+    status: row.status,
+    confidence: row.confidence,
+    supersedes: row.supersedes || null,
+    origin: row.origin,
+    createdAt: row.created_at,
+    verifiedAt: row.verified_at
+  };
+}
+
 export class YuqiStore {
   constructor(filename) {
     if (!filename) throw new Error('database filename is required');
@@ -190,6 +212,9 @@ export class YuqiStore {
         created_at INTEGER NOT NULL
       );
     `);
+
+    const factColumns = new Set(this.db.prepare('PRAGMA table_info(facts)').all().map(row => row.name));
+    if (!factColumns.has('fact_json')) this.db.exec('ALTER TABLE facts ADD COLUMN fact_json TEXT;');
   }
 
   transaction(run) {
@@ -365,6 +390,24 @@ export class YuqiStore {
     `).all(characterId, safeLimit).map(mapMessage);
   }
 
+  getMessage(messageId) {
+    return mapMessage(this.db.prepare('SELECT * FROM messages WHERE message_id = ?').get(messageId));
+  }
+
+  getMessageContext(messageId, radius = 1) {
+    const message = this.getMessage(messageId);
+    if (!message) return [];
+    const safeRadius = Math.max(0, Math.min(20, Number(radius) || 0));
+    const rows = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE character_id = ?
+      ORDER BY sent_at ASC, message_id ASC
+    `).all(message.characterId).map(mapMessage);
+    const index = rows.findIndex(item => item.messageId === messageId);
+    if (index < 0) return [];
+    return rows.slice(Math.max(0, index - safeRadius), index + safeRadius + 1);
+  }
+
   putFact(fact) {
     if (!fact?.factId || !fact.characterId || !fact.subjectId || !fact.predicate) throw new Error('invalid fact');
     const normalized = {
@@ -386,18 +429,27 @@ export class YuqiStore {
         INSERT INTO facts(
           fact_id, character_id, subject_id, predicate, object_json, evidence_mode,
           source_message_ids_json, exact_quotes_json, status, confidence, supersedes,
-          origin, checksum, created_at, verified_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          origin, checksum, created_at, verified_at, fact_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         normalized.factId, normalized.characterId, normalized.subjectId, normalized.predicate,
         canonicalJson(normalized.object ?? null), normalized.evidenceMode || 'uncertain',
         canonicalJson(normalized.sourceMessageIds), canonicalJson(normalized.exactQuotes),
         normalized.status, normalized.confidence, normalized.supersedes || null,
-        normalized.origin, checksum, normalized.createdAt || now(), normalized.verifiedAt || null
+        normalized.origin, checksum, normalized.createdAt || now(), normalized.verifiedAt || null,
+        canonicalJson(normalized)
       );
       this.appendSync('fact', normalized.factId, 'insert', normalized);
       return normalized;
     });
+  }
+
+
+  listFacts(characterId, { status } = {}) {
+    const rows = status
+      ? this.db.prepare('SELECT * FROM facts WHERE character_id = ? AND status = ? ORDER BY created_at ASC, fact_id ASC').all(characterId, status)
+      : this.db.prepare('SELECT * FROM facts WHERE character_id = ? ORDER BY created_at ASC, fact_id ASC').all(characterId);
+    return rows.map(mapFact);
   }
 
   getSyncDelta(afterSeq = 0, limit = 500) {
