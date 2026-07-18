@@ -430,5 +430,18 @@ export class YuqiStore {
   getSyncCursor(peerId) {
     return Number(this.db.prepare('SELECT ack_seq FROM sync_cursors WHERE peer_id = ?').get(peerId)?.ack_seq || 0);
   }
-}
 
+  setSession(role, threadId) {
+    if (!['memory', 'brain', 'supervisor'].includes(role)) throw new Error('invalid session role');
+    if (!String(threadId || '').trim()) throw new Error('invalid thread id');
+    this.db.prepare(`
+      INSERT INTO sessions(role, thread_id, updated_at) VALUES (?, ?, ?)
+      ON CONFLICT(role) DO UPDATE SET thread_id = excluded.thread_id, updated_at = excluded.updated_at
+    `).run(role, String(threadId), now());
+    return String(threadId);
+  }
+
+  getSession(role) {
+    return String(this.db.prepare('SELECT thread_id FROM sessions WHERE role = ?').get(role)?.thread_id || '');
+  }
+}
