@@ -333,6 +333,18 @@ export class YuqiStore {
     });
   }
 
+  claimTurnById(turnId, workerId) {
+    if (!workerId) throw new Error('workerId is required');
+    const result = this.db.prepare(`
+      UPDATE turns SET state = 'memory_running', worker_id = ?, updated_at = ?
+      WHERE turn_id = ? AND state = 'queued'
+    `).run(workerId, now(), turnId);
+    if (Number(result.changes) !== 1) return null;
+    const turn = this.getTurn(turnId);
+    this.appendSync('turn', turnId, 'state', turn);
+    return turn;
+  }
+
   advanceTurn(turnId, expectedState, nextState, patch = {}) {
     if (!TURN_STATES.includes(expectedState) || !TURN_STATES.includes(nextState)) {
       throw new Error('unknown turn state');
@@ -585,5 +597,14 @@ export class YuqiStore {
     const result = this.db.prepare('UPDATE annotations SET status = ? WHERE annotation_id = ?').run(status, annotationId);
     if (Number(result.changes) !== 1) throw new Error('annotation not found');
     return this.getAnnotation(annotationId);
+  }
+
+  putDiagnostic({ turnId = null, stage, level = 'info', detail = {} }) {
+    if (!stage) throw new Error('diagnostic stage is required');
+    const result = this.db.prepare(`
+      INSERT INTO diagnostics(turn_id, stage, level, detail_json, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(turnId, stage, level, canonicalJson(detail), now());
+    return Number(result.lastInsertRowid);
   }
 }
