@@ -17,6 +17,8 @@ test('Yuqi controls expose secure AUTO, LAN, and CLOUD bridge settings', () => {
   assert.match(plugin, /void\s+saveBridgeConfig\(PluginCall call\)/);
   assert.match(plugin, /void\s+loadBridgeConfig\(PluginCall call\)/);
   assert.match(plugin, /void\s+yuqiBridgeStatus\(PluginCall call\)/);
+  assert.match(html, /set-yuqi-pairing-code/);
+  assert.match(html, /importYuqiPairingCode/);
 });
 
 test('normal direct and background context is 200 raw messages', () => {

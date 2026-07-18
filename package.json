@@ -1,16 +1,20 @@
 {
   "scripts": {
     "start": "node serve-static.mjs",
-    "test": "node --test tests/rp-preset-contract.test.mjs && node --test tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs tests/cloud-timer-d1.test.mjs tests/yuqi-relay-worker.test.mjs && node test-basic.mjs && node test-sw-automatic-task-guard.mjs",
+    "test": "node --test tests/rp-preset-contract.test.mjs && node --test tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs tests/cloud-timer-d1.test.mjs tests/yuqi-relay-worker.test.mjs tests/yuqi-ui-contract.test.mjs tests/yuqi-deployment-contract.test.mjs && node --test yuqi-runtime/test/*.test.mjs && node test-basic.mjs && node test-sw-automatic-task-guard.mjs",
     "android:sync": "cap sync android",
     "android:copy": "cap copy android",
     "android:open": "cap open android",
-    "android:debug": "cap sync android && cd android && gradlew.bat assembleDebug",
+    "android:debug": "cap sync android && cd android && gradlew.bat assembleDebug --no-problems-report",
     "cloud:deploy": "node scripts/deploy-cloud-timer.mjs",
     "cloud:deploy:raw": "node scripts/run-wrangler.mjs deploy",
     "cloud:health": "node scripts/check-cloud-timer.mjs",
     "cloud:relay:test": "node --test tests/yuqi-relay-worker.test.mjs",
-    "cloud:relay:deploy": "node scripts/run-wrangler.mjs deploy --config wrangler.yuqi-relay.toml"
+    "cloud:relay:deploy": "node scripts/run-wrangler.mjs deploy --config wrangler.yuqi-relay.toml",
+    "yuqi:setup": "node scripts/setup-yuqi-runtime.mjs",
+    "yuqi:start": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-yuqi-background.ps1",
+    "yuqi:backup": "node scripts/backup-yuqi-memory.mjs yuqi-runtime/config.json",
+    "yuqi:verify": "node scripts/verify-yuqi-runtime.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.108.0"

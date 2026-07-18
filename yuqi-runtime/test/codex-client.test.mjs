@@ -56,6 +56,8 @@ test('starts and persists a thread when a role has no session', async () => fixt
   assert.equal(result.threadId, 'thr_new_1');
   assert.equal(store.getSession('brain'), 'thr_new_1');
   assert.deepEqual(methods(logFile), ['initialize', 'initialized', 'thread/start', 'turn/start']);
+  const started = readFileSync(logFile, 'utf8').trim().split(/\r?\n/).map(line => JSON.parse(line)).find(item => item.method === 'thread/start');
+  assert.equal(started.params.sandbox, 'read-only');
 }));
 
 test('keeps the three role sessions isolated', async () => fixture(async ({ client, store }) => {
@@ -74,4 +76,3 @@ test('collects only the final agent message from the matching turn', async () =>
   assert.equal(result.text, 'reply:hello');
   assert.equal(result.turnId, 'turn_fake_1');
 }));
-

@@ -244,7 +244,7 @@ export class CodexAppServerClient {
       : await this.request('thread/start', {
           cwd: this.cwd,
           approvalPolicy: 'never',
-          sandbox: 'readOnly'
+          sandbox: 'read-only'
         });
     const threadId = result?.thread?.id;
     if (!threadId) throw new CodexProtocolError(`${stored ? 'thread/resume' : 'thread/start'} returned no thread id`);

@@ -831,6 +831,8 @@ button.cell:active{background:#ececec}
           <div class="cell"><div class="cell-label">配对密钥</div><div class="cell-body"><input class="input" id="set-yuqi-pairing-secret" type="password" placeholder="已保存时可留空" autocomplete="off"></div></div>
           <div class="cell"><div class="cell-label">云信箱令牌</div><div class="cell-body"><input class="input" id="set-yuqi-device-token" type="password" placeholder="已保存时可留空" autocomplete="off"></div></div>
           <div class="cell"><div class="cell-label">加密密钥</div><div class="cell-body"><input class="input" id="set-yuqi-encryption-key" type="password" placeholder="32 字节 Base64；已保存时可留空" autocomplete="off"></div></div>
+          <div class="cell"><div class="cell-label">一键配对</div><div class="cell-body"><textarea class="textarea" id="set-yuqi-pairing-code" placeholder="粘贴电脑生成的 YUQI1: 配对码"></textarea></div></div>
+          <button class="cell" onclick="importYuqiPairingCode()" type="button"><div class="cell-label">导入配对码</div><div class="cell-body">自动填写并安全保存连接参数</div><div class="mini">›</div></button>
           <button class="cell" onclick="saveYuqiBridgeSettings()" type="button"><div class="cell-label">保存</div><div class="cell-body">安全写入 Android 加密区</div><div class="mini">›</div></button>
           <button class="cell" onclick="refreshYuqiBridgeStatus({ toastResult: true })" type="button"><div class="cell-label">运行状态</div><div class="cell-body"><div class="hint" id="yuqi-runtime-status" style="padding:0;white-space:pre-line">尚未检查</div></div><div class="mini">›</div></button>
           <div class="contact-index" style="height:30px">人工标注（交给维护窗口审核后发布）</div>
@@ -2193,6 +2195,34 @@ async function saveYuqiBridgeSettings() {
   } catch (err) {
     toast(`保存失败：${err?.message || err}`, 3200);
     return false;
+  }
+}
+function decodeYuqiPairingCode(value) {
+  const text = String(value || '').trim();
+  if (!text.startsWith('YUQI1:')) throw new Error('配对码格式不正确');
+  const encoded = text.slice(6).replace(/-/g, '+').replace(/_/g, '/');
+  const padded = encoded + '='.repeat((4 - encoded.length % 4) % 4);
+  const bytes = Uint8Array.from(atob(padded), char => char.charCodeAt(0));
+  const bundle = JSON.parse(new TextDecoder().decode(bytes));
+  if (bundle.schemaVersion !== 1 || !bundle.deviceId || !bundle.pairingSecret) throw new Error('配对码内容不完整');
+  return bundle;
+}
+async function importYuqiPairingCode() {
+  try {
+    const bundle = decodeYuqiPairingCode(document.getElementById('set-yuqi-pairing-code').value);
+    document.getElementById('set-yuqi-enabled').value = bundle.enabled === false ? 'off' : 'on';
+    document.getElementById('set-yuqi-mode').value = bundle.mode || 'AUTO';
+    document.getElementById('set-yuqi-lan-url').value = bundle.lanUrl || '';
+    document.getElementById('set-yuqi-cloud-url').value = bundle.cloudUrl || '';
+    document.getElementById('set-yuqi-device-id').value = bundle.deviceId || '';
+    document.getElementById('set-yuqi-pairing-secret').value = bundle.pairingSecret || '';
+    document.getElementById('set-yuqi-device-token').value = bundle.deviceToken || '';
+    document.getElementById('set-yuqi-encryption-key').value = bundle.encryptionKeyBase64 || '';
+    await saveYuqiBridgeSettings();
+    document.getElementById('set-yuqi-pairing-code').value = '';
+    toast('虞栖连接已一键配对');
+  } catch (error) {
+    toast(error?.message || '配对码导入失败');
   }
 }
 async function refreshYuqiBridgeStatus(options = {}) {
