@@ -92,3 +92,11 @@ test('secret files use inherited ACLs instead of Unix mode flags on Windows', ()
   assert.match(setup, /process\.platform === 'win32'/);
   assert.match(setup, /function secureWriteFile/);
 });
+
+test('cloud deploy applies D1, sets registration secret, deploys both workers and registers the device', () => {
+  const deploy = readFileSync('scripts/deploy-yuqi-cloud.mjs', 'utf8');
+  for (const fragment of ['d1', 'migrations', 'RELAY_REGISTRATION_SECRET', 'wrangler.yuqi-relay.toml', 'wrangler.toml', '/bridge/register']) {
+    assert.ok(deploy.includes(fragment), `missing ${fragment}`);
+  }
+  assert.doesNotMatch(deploy, /console\.log\([^\n]*(registrationSecret|deviceToken)/);
+});
