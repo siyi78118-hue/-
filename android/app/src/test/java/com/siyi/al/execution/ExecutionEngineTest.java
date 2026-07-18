@@ -5,6 +5,7 @@ import static org.junit.Assert.assertTrue;
 
 import com.siyi.al.execution.api.ParsedReply;
 import com.siyi.al.execution.api.ReplyParser;
+import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
@@ -31,6 +32,20 @@ public class ExecutionEngineTest {
         assertTrue(gateway.chatSystem.contains("原生执行时钟"));
         assertEquals(30, gateway.chatMessageCount);
         assertEquals("消息5", gateway.firstChatMessage);
+    }
+
+    @Test
+    public void enabledBridgeCompletesTheWholeTurnWithoutCallingLegacyStages() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        BridgedGateway gateway = new BridgedGateway();
+        ExecutionEngine engine = new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(1, gateway.bridgeCalls);
+        assertEquals(0, gateway.legacyCalls);
+        assertEquals("memory,chat,commit", String.join(",", store.events));
+        assertEquals("虞栖从电脑回复", store.replyParts.get(0).content);
     }
 
     @Test
@@ -155,6 +170,23 @@ public class ExecutionEngineTest {
             chatMessageCount = messages.length();
             firstChatMessage = messages.length() == 0 ? "" : messages.optJSONObject(0).optString("content");
             return "第一句😊\n第二句";
+        }
+    }
+
+    private static final class BridgedGateway implements TurnBridgeGateway {
+        int bridgeCalls;
+        int legacyCalls;
+
+        @Override public boolean hasBridge() { return true; }
+
+        @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+            bridgeCalls += 1;
+            return BridgeResult.success("lan", "虞栖从电脑回复");
+        }
+
+        @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+            legacyCalls += 1;
+            return "不应调用";
         }
     }
 

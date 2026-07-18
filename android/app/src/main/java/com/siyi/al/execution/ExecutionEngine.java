@@ -7,6 +7,7 @@ import com.siyi.al.execution.api.ReplyParser;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import com.siyi.al.execution.bridge.BridgeResult;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
@@ -59,6 +60,11 @@ public final class ExecutionEngine {
         try {
             JSONObject snapshot = new JSONObject(turn.snapshotJson);
             TurnState state = TurnState.valueOf(turn.state);
+            if (state == TurnState.QUEUED && models instanceof TurnBridgeGateway
+                && ((TurnBridgeGateway) models).hasBridge()) {
+                processBridgedTurn(turn, attempt, (TurnBridgeGateway) models);
+                return;
+            }
             if (state == TurnState.QUEUED) {
                 store.markStage(turn.turnId, attempt.attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, clock.now());
                 state = TurnState.MEMORY_RUNNING;
@@ -104,6 +110,30 @@ public final class ExecutionEngine {
                 // A completed or retried turn always wins over this failure.
             }
         }
+    }
+
+    private void processBridgedTurn(ChatTurnEntity turn, ExecutionAttemptEntity attempt, TurnBridgeGateway gateway) throws Exception {
+        store.markStage(turn.turnId, attempt.attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, clock.now());
+        TurnSubmission submission = new TurnSubmission(
+            turn.turnId,
+            turn.characterId,
+            turn.sourceMessageId,
+            TurnKind.valueOf(turn.kind),
+            turn.inputJson,
+            turn.snapshotJson,
+            turn.cloudJobId,
+            turn.createdAt
+        );
+        BridgeResult result = gateway.executeBridgeTurn(submission);
+        JSONObject checkpoint = new JSONObject()
+            .put("origin", result.origin)
+            .put("fallback", result.fallback)
+            .put("attemptedRoutes", new JSONArray(result.attemptedRoutes));
+        store.saveMemoryResult(turn.turnId, attempt.attemptId, checkpoint.toString(), clock.now());
+        store.markStage(turn.turnId, attempt.attemptId, TurnState.CHAT_RUNNING, AttemptStage.CHAT, clock.now());
+        store.saveRawReply(turn.turnId, attempt.attemptId, result.replyText, clock.now());
+        attempt.rawReply = result.replyText;
+        commitStoredReply(turn, attempt);
     }
 
     private void commitStoredReply(ChatTurnEntity turn, ExecutionAttemptEntity attempt) throws Exception {

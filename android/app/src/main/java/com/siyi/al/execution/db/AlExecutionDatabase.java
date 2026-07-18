@@ -18,9 +18,12 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         ChangeEventEntity.class,
         RolePlanEntity.class,
         RolePlanHistoryEntity.class,
-        RolePlanOccurrenceEntity.class
+        RolePlanOccurrenceEntity.class,
+        RawMessageEntity.class,
+        EvidenceFactEntity.class,
+        SyncCursorEntity.class
     },
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
@@ -58,6 +61,18 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             database.execSQL("CREATE INDEX IF NOT EXISTS `index_character_snapshots_cloudJobId_scheduledFor` ON `character_snapshots` (`cloudJobId`, `scheduledFor`)");
         }
     };
+    private static final Migration MIGRATION_5_6 = new Migration(5, 6) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `yuqi_raw_messages` (`messageId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `speakerId` TEXT NOT NULL, `speakerType` TEXT NOT NULL, `recipientId` TEXT NOT NULL, `content` TEXT NOT NULL, `sentAt` INTEGER NOT NULL, `origin` TEXT NOT NULL, `deviceId` TEXT NOT NULL, `deviceSeq` INTEGER NOT NULL, `checksum` TEXT NOT NULL, `syncSeq` INTEGER NOT NULL, PRIMARY KEY(`messageId`))");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_yuqi_raw_messages_characterId_sentAt` ON `yuqi_raw_messages` (`characterId`, `sentAt`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_yuqi_raw_messages_turnId` ON `yuqi_raw_messages` (`turnId`)");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_yuqi_raw_messages_deviceId_deviceSeq` ON `yuqi_raw_messages` (`deviceId`, `deviceSeq`)");
+            database.execSQL("CREATE TABLE IF NOT EXISTS `yuqi_evidence_facts` (`factId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `subjectId` TEXT NOT NULL, `predicate` TEXT NOT NULL, `objectJson` TEXT NOT NULL, `evidenceMode` TEXT NOT NULL, `sourceMessageIdsJson` TEXT NOT NULL, `exactQuotesJson` TEXT NOT NULL, `status` TEXT NOT NULL, `confidence` REAL NOT NULL, `origin` TEXT NOT NULL, `checksum` TEXT NOT NULL, `updatedAt` INTEGER NOT NULL, `syncSeq` INTEGER NOT NULL, PRIMARY KEY(`factId`))");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_yuqi_evidence_facts_characterId_status` ON `yuqi_evidence_facts` (`characterId`, `status`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_yuqi_evidence_facts_subjectId_predicate` ON `yuqi_evidence_facts` (`subjectId`, `predicate`)");
+            database.execSQL("CREATE TABLE IF NOT EXISTS `yuqi_sync_cursors` (`peerId` TEXT NOT NULL, `ackSeq` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`peerId`))");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -69,7 +84,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         context.getApplicationContext(),
                         AlExecutionDatabase.class,
                         "al-execution.db"
-                    ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5).build();
+                    ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6).build();
                 }
             }
         }

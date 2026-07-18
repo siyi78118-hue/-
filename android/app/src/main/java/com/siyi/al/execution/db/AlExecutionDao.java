@@ -40,6 +40,24 @@ public interface AlExecutionDao {
     @Insert
     long insertChange(ChangeEventEntity change);
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertRawMessage(RawMessageEntity message);
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    void upsertEvidenceFacts(List<EvidenceFactEntity> facts);
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    void upsertSyncCursor(SyncCursorEntity cursor);
+
+    @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId ORDER BY sentAt DESC LIMIT :limit")
+    List<RawMessageEntity> recentRawMessages(String characterId, int limit);
+
+    @Query("SELECT * FROM yuqi_evidence_facts WHERE characterId = :characterId ORDER BY updatedAt DESC")
+    List<EvidenceFactEntity> evidenceFacts(String characterId);
+
+    @Query("SELECT * FROM yuqi_sync_cursors WHERE peerId = :peerId LIMIT 1")
+    SyncCursorEntity syncCursor(String peerId);
+
     @Query("SELECT * FROM chat_turns WHERE turnId = :turnId LIMIT 1")
     ChatTurnEntity turn(String turnId);
 

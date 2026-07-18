@@ -1,0 +1,69 @@
+package com.siyi.al.execution.bridge;
+
+import com.siyi.al.execution.TurnSubmission;
+import com.siyi.al.execution.db.AlExecutionDao;
+import com.siyi.al.execution.db.RawMessageEntity;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import org.json.JSONObject;
+
+public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
+    private final AlExecutionDao dao;
+    private final String deviceId;
+
+    public RoomBridgeMirror(AlExecutionDao dao, String deviceId) {
+        this.dao = dao;
+        this.deviceId = deviceId == null || deviceId.trim().isEmpty() ? "phone" : deviceId.trim();
+    }
+
+    @Override public void persistSubmission(TurnSubmission submission) throws Exception {
+        JSONObject input = new JSONObject(submission.inputJson);
+        JSONObject raw = input.optJSONObject("message");
+        String content = raw == null ? input.optString("text", "") : raw.optString("content", "");
+        if (content.trim().isEmpty()) throw new IllegalArgumentException("raw user message is empty");
+        RawMessageEntity entity = new RawMessageEntity();
+        entity.messageId = submission.sourceMessageId;
+        entity.turnId = submission.turnId;
+        entity.characterId = submission.characterId;
+        entity.speakerId = "user";
+        entity.speakerType = "user";
+        entity.recipientId = submission.characterId;
+        entity.content = content;
+        entity.sentAt = raw == null ? submission.createdAt : raw.optLong("sentAt", submission.createdAt);
+        entity.origin = "phone";
+        entity.deviceId = deviceId;
+        entity.deviceSeq = input.optLong("deviceSeq", Math.max(1L, submission.createdAt));
+        entity.checksum = sha256(canonical(entity));
+        entity.syncSeq = submission.createdAt;
+        dao.insertRawMessage(entity);
+    }
+
+    @Override public void persistReply(TurnSubmission submission, BridgeResult result) throws Exception {
+        RawMessageEntity entity = new RawMessageEntity();
+        entity.messageId = "msg_reply_" + sha256(submission.turnId).substring(0, 24);
+        entity.turnId = submission.turnId;
+        entity.characterId = submission.characterId;
+        entity.speakerId = submission.characterId;
+        entity.speakerType = "character";
+        entity.recipientId = "user";
+        entity.content = result.replyText;
+        entity.sentAt = System.currentTimeMillis();
+        entity.origin = result.fallback ? "fallback" : "codex";
+        entity.deviceId = result.fallback ? deviceId + ":fallback" : "pc:" + deviceId;
+        entity.deviceSeq = Math.max(1L, entity.sentAt);
+        entity.checksum = sha256(canonical(entity));
+        entity.syncSeq = entity.sentAt;
+        dao.insertRawMessage(entity);
+    }
+
+    private static String canonical(RawMessageEntity value) {
+        return value.messageId + "\n" + value.turnId + "\n" + value.speakerId + "\n" + value.content + "\n" + value.sentAt;
+    }
+
+    private static String sha256(String value) throws Exception {
+        byte[] hash = MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8));
+        StringBuilder out = new StringBuilder();
+        for (byte item : hash) out.append(String.format("%02x", item & 0xff));
+        return out.toString();
+    }
+}

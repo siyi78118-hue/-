@@ -6,6 +6,8 @@ import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.util.Base64;
 import com.siyi.al.execution.api.ApiConfig;
+import com.siyi.al.execution.bridge.BridgeConfig;
+import com.siyi.al.execution.bridge.BridgeMode;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import javax.crypto.Cipher;
@@ -54,6 +56,45 @@ public final class AlSecretStore {
             editor.remove(storageKey(configId, field));
         }
         editor.apply();
+    }
+
+    public synchronized void saveBridgeConfig(BridgeConfig config) {
+        put("yuqi-bridge", "enabled", Boolean.toString(config.enabled));
+        put("yuqi-bridge", "mode", config.mode.name());
+        put("yuqi-bridge", "lanUrl", config.lanUrl);
+        put("yuqi-bridge", "cloudUrl", config.cloudUrl);
+        put("yuqi-bridge", "deviceId", config.deviceId);
+        put("yuqi-bridge", "pairingSecret", config.pairingSecret);
+        put("yuqi-bridge", "deviceToken", config.deviceToken);
+        put("yuqi-bridge", "encryptionKey", config.encryptionKeyBase64);
+        put("yuqi-bridge", "connectTimeoutMs", Integer.toString(config.connectTimeoutMs));
+        put("yuqi-bridge", "readTimeoutMs", Integer.toString(config.readTimeoutMs));
+        put("yuqi-bridge", "cloudPollAttempts", Integer.toString(config.cloudPollAttempts));
+        put("yuqi-bridge", "cloudPollIntervalMs", Integer.toString(config.cloudPollIntervalMs));
+    }
+
+    public synchronized BridgeConfig loadBridgeConfig() {
+        String enabled = get("yuqi-bridge", "enabled");
+        if (enabled == null) return BridgeConfig.disabled();
+        return new BridgeConfig(
+            Boolean.parseBoolean(enabled),
+            BridgeMode.parse(get("yuqi-bridge", "mode")),
+            get("yuqi-bridge", "lanUrl"),
+            get("yuqi-bridge", "cloudUrl"),
+            get("yuqi-bridge", "deviceId"),
+            get("yuqi-bridge", "pairingSecret"),
+            get("yuqi-bridge", "deviceToken"),
+            get("yuqi-bridge", "encryptionKey"),
+            parseInt(get("yuqi-bridge", "connectTimeoutMs"), 1200),
+            parseInt(get("yuqi-bridge", "readTimeoutMs"), 90000),
+            parseInt(get("yuqi-bridge", "cloudPollAttempts"), 60),
+            parseInt(get("yuqi-bridge", "cloudPollIntervalMs"), 1000)
+        );
+    }
+
+    private static int parseInt(String value, int fallback) {
+        try { return Integer.parseInt(value == null ? "" : value); }
+        catch (NumberFormatException ignored) { return fallback; }
     }
 
     private void put(String configId, String field, String value) {
