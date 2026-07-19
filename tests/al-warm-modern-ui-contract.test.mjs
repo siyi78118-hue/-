@@ -489,9 +489,9 @@ test('keeps long content and 360-to-520 layouts structurally stable', () => {
   assert.match(css, /@media\s*\(min-width:\s*520px\)\s*\{[\s\S]*?\.moment-reply-bar\s*\{[\s\S]*?max-width\s*:\s*520px[\s\S]*?left\s*:\s*50%[\s\S]*?transform\s*:\s*translateX\(-50%\)/);
 });
 
-test('pins the warm-modern Android release to version 1.0.73', () => {
-  assert.match(html, /const APP_BUILD_VERSION = '2026-07-19\.93';/);
-  assert.match(basicTest, /const APP_BUILD_VERSION = '2026-07-19\\\.93';/);
-  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "73"/);
-  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.73"/);
+test('pins the adaptive Yuqi Android release to version 1.0.74', () => {
+  assert.match(html, /const APP_BUILD_VERSION = '2026-07-20\.94';/);
+  assert.match(basicTest, /const APP_BUILD_VERSION = '2026-07-20\\\.94';/);
+  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "74"/);
+  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.74"/);
 });
