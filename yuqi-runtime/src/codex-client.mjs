@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 
+import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
+
 const ROLES = new Set(['memory', 'brain', 'supervisor']);
 
 export class CodexProtocolError extends Error {
@@ -271,7 +273,10 @@ export class CodexAppServerClient {
       threadId,
       clientUserMessageId: options.clientUserMessageId || `yuqi_${role}_${randomUUID()}`,
       input: [{ type: 'text', text }],
-      approvalPolicy: 'never'
+      approvalPolicy: 'never',
+      model: options.model || 'gpt-5.6-sol',
+      effort: options.effort || 'high',
+      outputSchema: options.outputSchema || ROLE_OUTPUT_SCHEMAS[role]
     });
     const turnId = result?.turn?.id;
     if (!turnId) throw new CodexProtocolError('turn/start returned no turn id');

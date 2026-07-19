@@ -34,13 +34,17 @@ async function fixture(run) {
 }
 
 function methods(logFile) {
+  return protocolLines(logFile)
+    .filter(item => item.method)
+    .map(item => item.method);
+}
+
+function protocolLines(logFile) {
   return readFileSync(logFile, 'utf8')
     .trim()
     .split(/\r?\n/)
     .filter(Boolean)
-    .map(line => JSON.parse(line))
-    .filter(item => item.method)
-    .map(item => item.method);
+    .map(line => JSON.parse(line));
 }
 
 test('initializes once and resumes a stored role thread', async () => fixture(async ({ client, store, logFile }) => {
@@ -75,4 +79,27 @@ test('collects only the final agent message from the matching turn', async () =>
   const result = await client.runTurn('brain', 'hello');
   assert.equal(result.text, 'reply:hello');
   assert.equal(result.turnId, 'turn_fake_1');
+}));
+
+test('pins the approved model, high effort, and a strict schema for every brain turn', async () => fixture(async ({ client, logFile }) => {
+  await client.runTurn('brain', 'draft one reply');
+  const started = protocolLines(logFile).find(item => item.method === 'turn/start');
+  assert.equal(started.params.model, 'gpt-5.6-sol');
+  assert.equal(started.params.effort, 'high');
+  assert.deepEqual(started.params.outputSchema.required, ['reply', 'usedFactIds']);
+  assert.equal(started.params.outputSchema.additionalProperties, false);
+  assert.equal(started.params.outputSchema.properties.reply.minLength, 1);
+}));
+
+test('memory candidate objects use the strict nested schema required by the real App Server', async () => fixture(async ({ client, logFile }) => {
+  await client.runTurn('memory', 'retrieve evidence');
+  const started = protocolLines(logFile).find(item => item.method === 'turn/start');
+  const candidate = started.params.outputSchema.properties.candidates.items;
+  assert.equal(candidate.additionalProperties, false);
+  assert.deepEqual(candidate.required, [
+    'factId', 'characterId', 'subjectId', 'predicate', 'object', 'evidenceMode',
+    'sourceMessageIds', 'exactQuotes', 'type', 'promisedBy', 'promisedTo', 'confidence',
+    'supersedes', 'origin', 'createdAt', 'verifiedAt'
+  ]);
+  assert.equal(candidate.properties.exactQuotes.items.additionalProperties, false);
 }));
