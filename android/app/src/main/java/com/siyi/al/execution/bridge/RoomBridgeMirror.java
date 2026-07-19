@@ -1,6 +1,7 @@
 package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.TurnSubmission;
+import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.RawMessageEntity;
 import java.nio.charset.StandardCharsets;
@@ -17,6 +18,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
     }
 
     @Override public void persistSubmission(TurnSubmission submission) throws Exception {
+        if (submission.kind != TurnKind.DIRECT_REPLY) return;
         JSONObject raw = BridgeInput.userMessage(submission);
         String content = raw.optString("content", "");
         if (content.trim().isEmpty()) throw new IllegalArgumentException("raw user message is empty");
@@ -47,7 +49,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.recipientId = "user";
         entity.content = result.replyText;
         entity.sentAt = System.currentTimeMillis();
-        entity.origin = result.fallback ? "fallback" : "codex";
+        entity.origin = result.origin;
         entity.deviceId = result.fallback ? deviceId + ":fallback" : "pc:" + deviceId;
         entity.deviceSeq = Math.max(1L, entity.sentAt);
         entity.checksum = sha256(canonical(entity));

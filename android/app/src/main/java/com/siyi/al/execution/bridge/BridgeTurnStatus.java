@@ -11,11 +11,12 @@ final class BridgeTurnStatus {
     final String replyText;
     final long retryAfterMs;
     final long recoveryAckSeq;
+    final String origin;
     final String raw;
 
     private BridgeTurnStatus(
         String turnId, String state, boolean terminal, boolean allowFallback,
-        String errorCode, String replyText, long retryAfterMs, long recoveryAckSeq, String raw
+        String errorCode, String replyText, long retryAfterMs, long recoveryAckSeq, String origin, String raw
     ) {
         this.turnId = turnId;
         this.state = state;
@@ -25,6 +26,7 @@ final class BridgeTurnStatus {
         this.replyText = replyText;
         this.retryAfterMs = Math.max(100L, Math.min(10_000L, retryAfterMs <= 0L ? 1_500L : retryAfterMs));
         this.recoveryAckSeq = Math.max(0L, recoveryAckSeq);
+        this.origin = origin == null ? "" : origin.trim();
         this.raw = raw;
     }
 
@@ -44,6 +46,7 @@ final class BridgeTurnStatus {
             replyText,
             root.optLong("retryAfterMs", 1_500L),
             root.optLong("recoveryAckSeq", 0L),
+            root.optString("origin", reply == null ? "" : reply.optString("origin", "")),
             raw
         );
     }
@@ -53,6 +56,6 @@ final class BridgeTurnStatus {
 
     BridgeResult toResult(String route) {
         if (!committed()) throw new IllegalStateException("bridge turn is not committed");
-        return BridgeResult.success(route, replyText, raw);
+        return BridgeResult.success(origin.isEmpty() ? route : origin, replyText, raw);
     }
 }

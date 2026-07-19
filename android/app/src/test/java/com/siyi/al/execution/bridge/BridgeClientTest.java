@@ -62,6 +62,7 @@ public class BridgeClientTest {
         BridgeResult result = client.sendLan(directSubmission(1784400000000L));
 
         assertEquals("你好呀", result.replyText);
+        assertEquals("codex", result.origin);
         assertEquals(3, transport.targets.size());
         assertTrue(transport.targets.get(0).endsWith("/v2/turns"));
         assertTrue(transport.targets.get(1).endsWith("/v2/turns/turn_phone_1"));

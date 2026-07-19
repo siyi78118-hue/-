@@ -12,7 +12,10 @@ import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import com.siyi.al.execution.db.RawMessageEntity;
+import com.siyi.al.execution.bridge.RoomBridgeMirror;
 import java.util.Collections;
+import org.json.JSONObject;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -80,6 +83,36 @@ public class RoomExecutionStoreTest {
 
         assertEquals(repairedInput, store.turn("turn-repair").inputJson);
         assertEquals(repairedSnapshot, store.turn("turn-repair").snapshotJson);
+    }
+
+    @Test
+    public void legacyRetryPersistsExactlyOneCanonicalUserMessage() throws Exception {
+        TurnSubmission broken = new TurnSubmission(
+            "turn-legacy", "char-1", "msg-legacy", TurnKind.DIRECT_REPLY,
+            "{}", "{\"messages\":[]}", null, 1L
+        );
+        store.submitTurn(broken);
+        String firstAttempt = store.activeAttempt("turn-legacy").attemptId;
+        store.markFailed("turn-legacy", firstAttempt, "INVALID_INPUT", "raw user message is empty", true, 2L);
+        String input = "{\"message\":{\"messageId\":\"msg-legacy\",\"content\":\"你好\",\"sentAt\":1},\"deviceSeq\":1}";
+        String snapshot = "{\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}";
+
+        store.startRetry("turn-legacy", 3L, input, snapshot);
+        TurnSubmission repaired = new TurnSubmission(
+            "turn-legacy", "char-1", "msg-legacy", TurnKind.DIRECT_REPLY,
+            input, snapshot, null, 1L
+        );
+        RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), "phone_test");
+        mirror.persistSubmission(repaired);
+        mirror.persistSubmission(repaired);
+
+        assertEquals("你好", new JSONObject(store.turn("turn-legacy").inputJson)
+            .getJSONObject("message").getString("content"));
+        int userRows = 0;
+        for (RawMessageEntity row : database.executionDao().recentRawMessages("char-1", 20)) {
+            if ("turn-legacy".equals(row.turnId) && "user".equals(row.speakerId)) userRows += 1;
+        }
+        assertEquals(1, userRows);
     }
 
     @Test

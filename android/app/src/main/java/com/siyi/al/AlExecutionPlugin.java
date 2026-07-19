@@ -224,6 +224,15 @@ public final class AlExecutionPlugin extends Plugin {
             String turnId = required(call, "turnId");
             String inputJson = call.getString("inputJson");
             String snapshotJson = call.getString("snapshotJson");
+            ChatTurnEntity existing = store.turn(turnId);
+            if (existing == null) throw new IllegalArgumentException("Unknown turn: " + turnId);
+            if (TurnKind.DIRECT_REPLY.name().equals(existing.kind) && !hasDirectUserContent(existing.inputJson)) {
+                inputJson = required(call, "inputJson");
+                snapshotJson = required(call, "snapshotJson");
+                if (!hasDirectUserContent(inputJson)) {
+                    throw new IllegalArgumentException("retry inputJson must contain the original user message");
+                }
+            }
             ExecutionAttemptEntity attempt = store.startRetry(turnId, System.currentTimeMillis(), inputJson, snapshotJson);
             AlExecutionService.requestRun(getContext());
             JSObject result = turnResult(store.turn(turnId));
@@ -536,6 +545,19 @@ public final class AlExecutionPlugin extends Plugin {
         String result = value.optString(name, "").trim();
         if (result.isEmpty()) throw new IllegalArgumentException(name + " is required");
         return result;
+    }
+
+    private static boolean hasDirectUserContent(String inputJson) {
+        try {
+            JSONObject input = new JSONObject(inputJson == null ? "{}" : inputJson);
+            JSONObject message = input.optJSONObject("message");
+            String content = message == null ? "" : message.optString("content", "");
+            if (content.trim().isEmpty()) content = input.optString("userText", "");
+            if (content.trim().isEmpty()) content = input.optString("text", "");
+            return !content.trim().isEmpty();
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private interface Operation {
