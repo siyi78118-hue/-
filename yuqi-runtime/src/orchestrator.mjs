@@ -2,6 +2,7 @@ import { commitVerifiedFacts } from './evidence-memory.mjs';
 import { contentHash } from './protocol.mjs';
 import { buildEvidencePack } from './retrieval.mjs';
 import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
+import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route-policy.mjs';
 
 const BACKSTAGE_LEAK = /\bAI\b|人工智能|语言模型|大模型|提示词|记忆库|系统指令|内部思考|作为.{0,8}模型/i;
 
@@ -25,7 +26,10 @@ export function hardValidateReply(reply) {
 }
 
 export class YuqiOrchestrator {
-  constructor({ store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200 }) {
+  constructor({
+    store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
+    roleProfiles = DEFAULT_PROFILES
+  }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
     this.presets = presets;
@@ -33,10 +37,19 @@ export class YuqiOrchestrator {
     this.workerId = workerId;
     this.clock = clock;
     this.contextLimit = Math.max(1, Math.min(5000, Number(contextLimit) || 200));
+    this.roleProfiles = roleProfiles;
   }
 
   accept(envelope) {
-    return this.store.submitTurn(envelope);
+    const submitted = this.store.submitTurn(envelope);
+    if (submitted.state === 'queued' && (!submitted.routeReasons || submitted.routeReasons.length === 0)) {
+      const decision = selectTurnRoute({
+        envelope,
+        recentMessages: this.store.listMessages(envelope.characterId, this.contextLimit)
+      });
+      return this.store.setTurnRoute(submitted.turnId, decision.route, decision.reasons);
+    }
+    return submitted;
   }
 
   async process(envelope) {
@@ -76,7 +89,11 @@ export class YuqiOrchestrator {
           const draft = parseRoleJson(current.brainDraftJson, 'brain');
           const hard = hardValidateReply(draft.reply);
           if (!hard.ok) throw new Error(`hard validation failed: ${hard.issues.map(issue => issue.code).join(', ')}`);
-          this.store.advanceTurn(turnId, 'brain_done', 'supervisor_running');
+          this.store.advanceTurn(
+            turnId,
+            'brain_done',
+            current.route === 'fast' ? 'approved' : 'supervisor_running'
+          );
           continue;
         }
         if (current.state === 'supervisor_running') {
@@ -117,9 +134,26 @@ export class YuqiOrchestrator {
         : { currentTrigger: envelope.trigger, triggerIsNotUserEvidence: true }),
       recentMessages
     };
-    const memoryResult = await this.runStructuredRole(
-      'memory', memoryRequest, `${envelope.turnId}_memory`
+    let current = this.store.getTurn(envelope.turnId);
+    const initialRoute = current.route === 'fast' ? 'fast' : 'deep';
+    let memoryResult = await this.runStructuredRole(
+      'memory', memoryRequest, `${envelope.turnId}_memory`,
+      roleExecutionProfile(initialRoute, 'memory', this.roleProfiles),
+      initialRoute === 'fast' ? 'memory_fast' : 'memory_deep'
     );
+    if (initialRoute === 'fast' && memoryResult.requiresDeepMemory === true) {
+      const reasons = Array.isArray(memoryResult.escalationReasons)
+        ? memoryResult.escalationReasons.map(String)
+        : ['memory_role_requested'];
+      this.store.setTurnRoute(envelope.turnId, 'fast_to_deep', reasons.length ? reasons : ['memory_role_requested']);
+      memoryResult = await this.runStructuredRole(
+        'memory', { ...memoryRequest, task: 'deep_retrieve_and_extract_evidence', fastMemoryReview: memoryResult },
+        `${envelope.turnId}_memory_deep`,
+        roleExecutionProfile('deep', 'memory', this.roleProfiles),
+        'memory_deep'
+      );
+      current = this.store.getTurn(envelope.turnId);
+    }
     const candidates = Array.isArray(memoryResult.candidates) ? memoryResult.candidates : [];
     const committedFacts = commitVerifiedFacts(this.store, candidates, recentMessages);
     const memoryPacket = {
@@ -129,7 +163,11 @@ export class YuqiOrchestrator {
         verified: committedFacts.verified.map(item => item.fact.factId),
         provisional: committedFacts.provisional.map(item => item.fact.factId),
         rejected: committedFacts.rejected.map(item => item.fact?.factId || null).filter(Boolean)
-      }
+      },
+      requiresDeepMemory: memoryResult.requiresDeepMemory === true,
+      escalationReasons: Array.isArray(memoryResult.escalationReasons) ? memoryResult.escalationReasons.map(String) : [],
+      speakerAmbiguity: memoryResult.speakerAmbiguity === true,
+      commitmentRisk: memoryResult.commitmentRisk === true
     };
     this.store.advanceTurn(envelope.turnId, 'memory_running', 'memory_done', {
       memoryPacketJson: JSON.stringify(memoryPacket)
@@ -162,7 +200,8 @@ export class YuqiOrchestrator {
       } : {})
     };
     const attempt = previousSupervisor?.approved === false ? 2 : 1;
-    const draft = await this.runBrain(envelope.turnId, brainRequest, attempt);
+    const route = current.route === 'fast' ? 'fast' : 'deep';
+    const draft = await this.runBrain(envelope.turnId, brainRequest, attempt, route);
     this.store.advanceTurn(envelope.turnId, 'brain_running', 'brain_done', {
       brainDraftJson: JSON.stringify(draft)
     });
@@ -187,7 +226,9 @@ export class YuqiOrchestrator {
       draft
     };
     const reviewed = await this.runStructuredRole(
-      'supervisor', supervisorRequest, `${envelope.turnId}_supervisor_${attempt}`
+      'supervisor', supervisorRequest, `${envelope.turnId}_supervisor_${attempt}`,
+      roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
+      `supervisor_${attempt}`
     );
     const supervisorResult = { ...reviewed, attempt };
     if (supervisorResult.approved === true) {
@@ -237,15 +278,23 @@ export class YuqiOrchestrator {
     return true;
   }
 
-  async runBrain(turnId, request, attempt = 1) {
-    const result = await this.runStructuredRole('brain', request, `${turnId}_brain_${attempt}`);
+  async runBrain(turnId, request, attempt = 1, route = 'deep') {
+    const result = await this.runStructuredRole(
+      'brain', request, `${turnId}_brain_${attempt}`,
+      roleExecutionProfile(route, 'brain', this.roleProfiles),
+      `brain_${attempt}`
+    );
     if (typeof result.reply !== 'string') throw new Error('brain reply is missing');
     return result;
   }
 
-  async runStructuredRole(role, request, clientUserMessageId) {
+  async runStructuredRole(role, request, clientUserMessageId, profile, stage = role) {
+    if (!profile?.model || !profile?.effort) throw new Error(`missing execution profile for ${role}`);
+    const turnId = clientUserMessageId.replace(/_(memory(?:_deep)?|brain_\d+|supervisor_\d+)$/, '');
+    this.store.beginStage(turnId, stage, profile.model, profile.effort, this.clock());
     let invalidOutput = '';
-    for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
       const payload = attempt === 1 ? request : {
         ...request,
         protocolRepair: {
@@ -254,19 +303,22 @@ export class YuqiOrchestrator {
           invalidOutput: invalidOutput.slice(0, 2_000)
         }
       };
-      const response = await this.codex.runTurn(role, JSON.stringify(payload), {
+        const response = await this.codex.runTurn(role, JSON.stringify(payload), {
         clientUserMessageId: attempt === 1 ? clientUserMessageId : `${clientUserMessageId}_protocol_${attempt}`,
         outputSchema: ROLE_OUTPUT_SCHEMAS[role],
-        model: 'gpt-5.6-sol',
-        effort: 'high'
-      });
-      invalidOutput = String(response.text || '');
-      try {
-        return parseRoleJson(invalidOutput, role);
-      } catch (error) {
-        if (attempt === 2 || !String(error.message).startsWith(`${role} returned invalid`)) throw error;
+          model: profile.model,
+          effort: profile.effort
+        });
+        invalidOutput = String(response.text || '');
+        try {
+          return parseRoleJson(invalidOutput, role);
+        } catch (error) {
+          if (attempt === 2 || !String(error.message).startsWith(`${role} returned invalid`)) throw error;
+        }
       }
+      throw new Error(`${role} returned invalid structured output twice`);
+    } finally {
+      this.store.finishStage(turnId, stage, this.clock());
     }
-    throw new Error(`${role} returned invalid structured output twice`);
   }
 }

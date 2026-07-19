@@ -29,7 +29,13 @@ const codex = new CodexAppServerClient({
   args: config.codexArgs || ['app-server'],
   cwd: config.codexRuntimeDirectory || runtimeDir
 });
-const orchestrator = new YuqiOrchestrator({ store, presets, codex, contextLimit: 200 });
+const orchestrator = new YuqiOrchestrator({
+  store,
+  presets,
+  codex,
+  contextLimit: 200,
+  roleProfiles: config.roleProfiles
+});
 const reconciler = new YuqiReconciler({ store, codex });
 const dispatcher = new TurnDispatcher({ store, orchestrator });
 const server = createYuqiServer({ secret: config.pairingSecret, store, orchestrator, dispatcher, reconciler });

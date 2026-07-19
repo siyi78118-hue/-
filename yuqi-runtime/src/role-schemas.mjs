@@ -54,8 +54,15 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
     candidates: {
       type: 'array',
       items: factCandidateSchema
-    }
-  }, ['query', 'keywords', 'candidates']),
+    },
+    requiresDeepMemory: { type: 'boolean' },
+    escalationReasons: stringArray(),
+    speakerAmbiguity: { type: 'boolean' },
+    commitmentRisk: { type: 'boolean' }
+  }, [
+    'query', 'keywords', 'candidates', 'requiresDeepMemory', 'escalationReasons',
+    'speakerAmbiguity', 'commitmentRisk'
+  ]),
   brain: objectSchema({
     reply: { type: 'string', minLength: 1 },
     usedFactIds: stringArray()

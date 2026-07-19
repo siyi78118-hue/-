@@ -82,13 +82,51 @@ const normalOutputs = () => ({
   supervisor: ['{"approved":true,"issues":[]}']
 });
 
-test('runs memory, brain, hard check, supervisor and commits exactly one reply', async () => {
+test('fast route runs Terra memory and Sol brain without supervisor', async () => {
   await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
     const result = await orchestrator.process(envelope());
-    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain']);
+    assert.deepEqual(codex.calls.map(call => [call.options.model, call.options.effort]), [
+      ['gpt-5.6-terra', 'medium'],
+      ['gpt-5.6-sol', 'medium']
+    ]);
+    assert.equal(store.getTurn(result.turnId).route, 'fast');
     assert.equal(result.reply.speakerId, 'yuqi');
     assert.equal(result.reply.content, '你好。我是虞栖，你呢？');
     assert.equal(store.getTurn(result.turnId).state, 'committed');
+    assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 1);
+  });
+});
+
+test('deep relationship route runs Sol memory, Sol brain and Terra supervisor', async () => {
+  await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(2, '你答应过的呢'));
+    assert.deepEqual(codex.calls.map(call => [call.role, call.options.model, call.options.effort]), [
+      ['memory', 'gpt-5.6-sol', 'medium'],
+      ['brain', 'gpt-5.6-sol', 'medium'],
+      ['supervisor', 'gpt-5.6-terra', 'medium']
+    ]);
+    assert.equal(store.getTurn(result.turnId).route, 'deep');
+  });
+});
+
+test('fast memory escalation starts a new Sol memory turn before brain', async () => {
+  await withFixture({
+    memory: [
+      '{"query":"在吗","keywords":[],"candidates":[],"requiresDeepMemory":true,"escalationReasons":["commitment_context"],"speakerAmbiguity":false,"commitmentRisk":true}',
+      '{"query":"在吗","keywords":[],"candidates":[],"requiresDeepMemory":false,"escalationReasons":[],"speakerAmbiguity":false,"commitmentRisk":false}'
+    ],
+    brain: ['{"reply":"我在呢。","usedFactIds":[]}'],
+    supervisor: ['{"approved":true,"issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(3, '在吗'));
+    assert.deepEqual(codex.calls.map(call => [call.role, call.options.model]), [
+      ['memory', 'gpt-5.6-terra'],
+      ['memory', 'gpt-5.6-sol'],
+      ['brain', 'gpt-5.6-sol'],
+      ['supervisor', 'gpt-5.6-terra']
+    ]);
+    assert.equal(store.getTurn(result.turnId).route, 'fast_to_deep');
     assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 1);
   });
 });
@@ -137,7 +175,7 @@ test('supervisor rejection asks the brain to rewrite once under the same preset'
       '{"approved":true,"issues":[]}'
     ]
   }, async ({ codex, orchestrator }) => {
-    const result = await orchestrator.process(envelope());
+    const result = await orchestrator.process(envelope(40, '你答应过要认真回复我的'));
     assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor', 'brain', 'supervisor']);
     assert.equal(result.reply.content, '你好呀。我叫虞栖，你怎么称呼？');
   });
