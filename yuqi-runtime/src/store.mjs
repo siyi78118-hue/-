@@ -327,6 +327,17 @@ export class YuqiStore {
     return mapTurn(this.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turnId));
   }
 
+  listRecoverableTurns() {
+    return this.db.prepare(`
+      SELECT * FROM turns
+      WHERE state IN (
+        'queued', 'memory_running', 'memory_done', 'brain_running',
+        'brain_done', 'supervisor_running', 'approved'
+      )
+      ORDER BY created_at ASC, turn_id ASC
+    `).all().map(mapTurn);
+  }
+
   claimTurn(workerId) {
     if (!workerId) throw new Error('workerId is required');
     return this.transaction(() => {

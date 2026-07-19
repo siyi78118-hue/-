@@ -26,10 +26,34 @@ function safeEqual(left, right) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function parseStoredJson(value) {
+  try { return value ? JSON.parse(value) : null; } catch { return null; }
+}
+
+function publicTurnStatus(turn) {
+  if (!turn) return null;
+  const committed = ['committed', 'delivered', 'completed'].includes(turn.state);
+  const failed = ['failed', 'fallback'].includes(turn.state);
+  const result = parseStoredJson(turn.replyJson);
+  const error = parseStoredJson(turn.errorJson);
+  return {
+    turnId: turn.turnId,
+    state: turn.state,
+    terminal: committed || failed,
+    allowFallback: failed,
+    reply: committed ? result?.reply || null : null,
+    errorCode: failed ? String(error?.code || error?.name || 'YUQI_ROLE_FAILED') : '',
+    origin: committed ? String(result?.reply?.origin || turn.origin || 'codex') : String(turn.origin || 'codex'),
+    updatedAt: Number(turn.updatedAt || 0),
+    retryAfterMs: committed || failed ? 0 : 1500
+  };
+}
+
 export function createYuqiServer({
   secret,
   store,
   orchestrator,
+  dispatcher = null,
   reconciler = null,
   clock = Date.now,
   maxBodyBytes = 256 * 1024,
@@ -99,6 +123,22 @@ export function createYuqiServer({
       }
       const result = await orchestrator.process(body);
       return json(response, 201, { ok: true, ...result, recoveryAckSeq });
+    }
+    if (request.method === 'POST' && url.pathname === '/v2/turns') {
+      if (!dispatcher || typeof dispatcher.accept !== 'function') {
+        return json(response, 503, { ok: false, error: 'turn dispatcher is unavailable' });
+      }
+      const turn = dispatcher.accept(body);
+      const status = publicTurnStatus(turn);
+      return json(response, status.terminal ? 200 : 202, { ok: true, accepted: true, ...status });
+    }
+    const v2TurnMatch = /^\/v2\/turns\/([^/]+)$/.exec(url.pathname);
+    if (request.method === 'GET' && v2TurnMatch) {
+      const turn = store.getTurn(decodeURIComponent(v2TurnMatch[1]));
+      const status = publicTurnStatus(turn);
+      return status
+        ? json(response, 200, { ok: true, ...status })
+        : json(response, 404, { ok: false, error: 'turn not found' });
     }
     const turnMatch = /^\/v1\/turns\/([^/]+)$/.exec(url.pathname);
     if (request.method === 'GET' && turnMatch) {

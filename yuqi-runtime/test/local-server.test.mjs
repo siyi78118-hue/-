@@ -127,3 +127,69 @@ test('reconciles the phone journal before processing the new turn and returns it
     await server.close();
   }
 });
+
+test('v2 accepts a background turn immediately and exposes signed polling status', async () => {
+  const accepted = [];
+  let stored = {
+    turnId: 'turn_phone_async_1', state: 'queued', origin: 'codex',
+    replyJson: null, errorJson: null, updatedAt: 1784400000000
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: {
+      getTurn: () => stored,
+      getSyncDelta: () => [],
+      ackSync: () => 0
+    },
+    orchestrator: { process: async () => { throw new Error('v2 must not call synchronous process'); } },
+    dispatcher: {
+      accept(value) {
+        accepted.push(value.turnId);
+        return stored;
+      }
+    }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const payload = {
+      protocolVersion: 2,
+      turnId: 'turn_phone_async_1',
+      characterId: 'yuqi',
+      deviceId: 'phone_a',
+      deviceSeq: 1,
+      createdAt: 1784400000000,
+      kind: 'DIRECT_REPLY',
+      message: {
+        messageId: 'msg_phone_async_1', speakerId: 'user', speakerType: 'user',
+        recipientId: 'yuqi', content: '你好', sentAt: 1784400000000
+      }
+    };
+    const submitted = await call(server.address().port, {
+      method: 'POST', path: '/v2/turns', body: payload,
+      secret: 'test-pairing-secret', nonce: 'async-submit'
+    });
+    assert.equal(submitted.status, 202);
+    assert.equal(submitted.body.terminal, false);
+    assert.deepEqual(accepted, ['turn_phone_async_1']);
+
+    stored = {
+      ...stored,
+      state: 'committed',
+      replyJson: JSON.stringify({
+        turnId: stored.turnId,
+        reply: { content: '你好呀', origin: 'codex' }
+      }),
+      updatedAt: 1784400001000
+    };
+    const polled = await call(server.address().port, {
+      method: 'GET', path: '/v2/turns/turn_phone_async_1',
+      secret: 'test-pairing-secret', nonce: 'async-poll'
+    });
+    assert.equal(polled.status, 200);
+    assert.equal(polled.body.terminal, true);
+    assert.equal(polled.body.reply.content, '你好呀');
+    assert.equal(polled.body.origin, 'codex');
+  } finally {
+    await server.close();
+  }
+});

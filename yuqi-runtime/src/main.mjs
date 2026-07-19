@@ -9,6 +9,7 @@ import { YuqiOrchestrator } from './orchestrator.mjs';
 import { PresetRegistry } from './preset-registry.mjs';
 import { YuqiReconciler } from './reconcile.mjs';
 import { YuqiStore } from './store.mjs';
+import { TurnDispatcher } from './turn-dispatcher.mjs';
 import { createSystemCloudFetch } from '../../scripts/cloud-http.mjs';
 
 const runtimeDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -29,7 +30,8 @@ const codex = new CodexAppServerClient({
 });
 const orchestrator = new YuqiOrchestrator({ store, presets, codex, contextLimit: 200 });
 const reconciler = new YuqiReconciler({ store, codex });
-const server = createYuqiServer({ secret: config.pairingSecret, store, orchestrator, reconciler });
+const dispatcher = new TurnDispatcher({ store, orchestrator });
+const server = createYuqiServer({ secret: config.pairingSecret, store, orchestrator, dispatcher, reconciler });
 const cloudPump = config.cloudRelay?.enabled ? new CloudRelayPump({
   relayUrl: config.cloudRelay.url,
   deviceId: config.cloudRelay.deviceId,
@@ -41,6 +43,7 @@ const cloudPump = config.cloudRelay?.enabled ? new CloudRelayPump({
 }) : null;
 
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });
+dispatcher.recover();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
 const address = server.address();
 process.stdout.write(`Yuqi runtime listening on ${address.address}:${address.port}\n`);

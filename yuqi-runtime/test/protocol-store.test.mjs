@@ -183,6 +183,25 @@ test('state transitions use compare-and-set semantics', () => withStore(({ store
   assert.equal(advanced.state, 'memory_done');
 }));
 
+test('lists every nonterminal turn for dispatcher recovery and excludes committed turns', () => withStore(({ store }) => {
+  const first = store.submitTurn(validEnvelope());
+  const second = store.submitTurn(validV2Envelope({
+    turnId: 'turn_device2_2',
+    deviceSeq: 2,
+    message: { ...validV2Envelope().message, messageId: 'msg_device2_2' }
+  }));
+  store.claimTurnById(first.turnId, 'worker-a');
+  store.claimTurnById(second.turnId, 'worker-a');
+  store.advanceTurn(second.turnId, 'memory_running', 'memory_done', { memoryPacketJson: '{}' });
+  store.advanceTurn(second.turnId, 'memory_done', 'brain_running');
+  store.advanceTurn(second.turnId, 'brain_running', 'brain_done', { brainDraftJson: '{"reply":"ok"}' });
+  store.advanceTurn(second.turnId, 'brain_done', 'supervisor_running');
+  store.advanceTurn(second.turnId, 'supervisor_running', 'approved', { supervisorJson: '{"approved":true}' });
+  store.advanceTurn(second.turnId, 'approved', 'committed', { replyJson: '{"reply":{"content":"ok"}}' });
+
+  assert.deepEqual(store.listRecoverableTurns().map(turn => turn.turnId), [first.turnId]);
+}));
+
 test('sync deltas are ordered, checksummed, and acknowledged independently', () => withStore(({ store }) => {
   store.submitTurn(validEnvelope());
   store.putMessage({
