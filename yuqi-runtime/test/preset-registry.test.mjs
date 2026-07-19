@@ -30,6 +30,26 @@ test('loads a checksummed immutable seed version', () => withRegistry(registry =
   assert.deepEqual(current.changedModules.sort(), ['brain', 'memory', 'supervisor']);
 }));
 
+test('reopens a durable seed without changing its publication manifest', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yuqi-presets-reopen-'));
+  const databasePath = join(dir, 'runtime.sqlite');
+  let secondStore;
+  try {
+    const firstStore = new YuqiStore(databasePath);
+    const first = new PresetRegistry({ presetDir, store: firstStore, clock: () => 1000 }).current();
+    firstStore.close();
+
+    secondStore = new YuqiStore(databasePath);
+    const reopened = new PresetRegistry({ presetDir, store: secondStore, clock: () => 2000 }).current();
+    assert.deepEqual(reopened, first);
+    secondStore.close();
+    secondStore = null;
+  } finally {
+    secondStore?.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('brain prompt starts at first acquaintance without hidden user history', () => withRegistry(registry => {
   const prompt = registry.compileFor('brain', { stage: 'initial', revealedFactIds: [] });
   assert.match(prompt, /活生生的人/);

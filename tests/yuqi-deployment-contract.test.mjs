@@ -6,7 +6,9 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import { createMemorySnapshot } from '../scripts/backup-yuqi-memory.mjs';
+import { requestCloudJson } from '../scripts/cloud-http.mjs';
 import { buildPairingBundle, findLanAddress, setupYuqiRuntime } from '../scripts/setup-yuqi-runtime.mjs';
+import { resolveWranglerInvocation } from '../scripts/wrangler-invocation.mjs';
 
 test('pairing bundle contains only the phone bridge fields', () => {
   const bundle = buildPairingBundle({
@@ -99,6 +101,52 @@ test('cloud deploy applies D1, sets registration secret, deploys both workers an
     assert.ok(deploy.includes(fragment), `missing ${fragment}`);
   }
   assert.doesNotMatch(deploy, /console\.log\([^\n]*(registrationSecret|deviceToken)/);
+});
+
+test('Wrangler uses its JavaScript CLI without a shell when the project path contains spaces', () => {
+  const invocation = resolveWranglerInvocation({
+    cwd: 'C:\\Users\\PC\\Documents\\Codex\\New project',
+    platform: 'win32',
+    execPath: 'C:\\Program Files\\nodejs\\node.exe',
+    fileExists: path => path.endsWith('node_modules\\wrangler\\bin\\wrangler.js'),
+    env: {}
+  });
+  assert.equal(invocation.command, 'C:\\Program Files\\nodejs\\node.exe');
+  assert.equal(invocation.shell, false);
+  assert.deepEqual(invocation.prefixArgs, [
+    'C:\\Users\\PC\\Documents\\Codex\\New project\\node_modules\\wrangler\\bin\\wrangler.js'
+  ]);
+});
+
+test('Wrangler runner allows the official OAuth session to authenticate deploys', () => {
+  const runner = readFileSync('scripts/run-wrangler.mjs', 'utf8');
+  assert.doesNotMatch(runner, /Missing CLOUDFLARE_API_TOKEN/);
+  assert.doesNotMatch(runner, /args\[0\] === 'deploy' && !process\.env\.CLOUDFLARE_API_TOKEN/);
+});
+
+test('Windows cloud requests keep registration secrets out of process arguments', async () => {
+  let captured;
+  const result = await requestCloudJson('https://example.workers.dev/bridge/register', {
+    method: 'POST',
+    headers: { 'x-yuqi-registration': 'top-secret' },
+    body: { deviceId: 'device-a', deviceToken: 'token-a' }
+  }, {
+    platform: 'win32',
+    spawnSync: (command, args, options) => {
+      captured = { command, args, input: options.input };
+      return { status: 0, stdout: '{"ok":true}', stderr: '' };
+    }
+  });
+  assert.equal(result.ok, true);
+  assert.equal(captured.command, 'powershell.exe');
+  assert.doesNotMatch(captured.args.join(' '), /top-secret|token-a/);
+  assert.match(captured.input, /top-secret/);
+});
+
+test('runtime verifier uses the system cloud transport and requires cloud health when enabled', () => {
+  const verifier = readFileSync('scripts/verify-yuqi-runtime.mjs', 'utf8');
+  assert.match(verifier, /requestCloudJson/);
+  assert.match(verifier, /!config\.cloudRelay\.enabled \|\| cloudRelayReady/);
 });
 
 test('Android permits cleartext only for the generated private LAN host', () => {

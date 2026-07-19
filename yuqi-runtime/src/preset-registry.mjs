@@ -33,6 +33,17 @@ export class PresetRegistry {
       modules[role] = readFileSync(join(this.presetDir, filename), 'utf8').trim();
     }
     const checksum = contentHash({ version: manifest.currentVersion, modules });
+    const existing = this.store.getPresetVersion(manifest.currentVersion);
+    if (existing) {
+      const isSameSeed = existing.parentVersion === null
+        && existing.characterId === manifest.characterId
+        && existing.checksum === checksum
+        && existing.annotationIds.length === 0
+        && existing.rollbackOf === null;
+      if (!isSameSeed) throw new Error('preset seed conflict');
+      if (!this.store.getCurrentPresetVersion()) this.store.setCurrentPresetVersion(existing.version);
+      return;
+    }
     const seed = {
       version: manifest.currentVersion,
       parentVersion: null,

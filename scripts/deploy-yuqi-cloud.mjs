@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
 import { setupYuqiRuntime } from './setup-yuqi-runtime.mjs';
+import { requestCloudJson } from './cloud-http.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const runtimeDir = join(root, 'yuqi-runtime');
@@ -32,22 +33,19 @@ wrangler(['secret', 'put', 'RELAY_REGISTRATION_SECRET', '--config', relayConfig]
 wrangler(['deploy', '--config', relayConfig]);
 wrangler(['deploy', '--config', timerConfig]);
 
-const registration = await fetch(`${cloudUrl}/bridge/register`, {
+const registrationBody = await requestCloudJson(`${cloudUrl}/bridge/register`, {
   method: 'POST',
   headers: { 'content-type': 'application/json', 'x-yuqi-registration': registrationSecret },
-  body: JSON.stringify({
+  body: {
     deviceId: current.cloudRelay.deviceId,
     deviceToken: current.cloudRelay.deviceToken
-  }),
-  signal: AbortSignal.timeout(30_000)
+  }
 });
-const registrationBody = await registration.json().catch(() => ({}));
-if (!registration.ok || registrationBody.ok !== true) throw new Error(`Device registration failed (${registration.status})`);
+if (registrationBody.ok !== true) throw new Error('Device registration failed');
 
-const health = await fetch(`${cloudUrl}/bridge/health`, { signal: AbortSignal.timeout(30_000) });
-const healthBody = await health.json().catch(() => ({}));
-if (!health.ok || healthBody.ok !== true || healthBody.storage !== 'ciphertext-only') {
-  throw new Error(`Relay health check failed (${health.status})`);
+const healthBody = await requestCloudJson(`${cloudUrl}/bridge/health`);
+if (healthBody.ok !== true || healthBody.storage !== 'ciphertext-only') {
+  throw new Error('Relay health check failed');
 }
 
 setupYuqiRuntime({ runtimeDir, vaultDir, cloudUrl, cloudEnabled: true });
