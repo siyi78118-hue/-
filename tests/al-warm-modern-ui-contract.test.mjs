@@ -118,3 +118,116 @@ test('does not fabricate backstage systems as visible conversations', () => {
     />\s*(?:\u8bb0\u5fc6\u5907\u4efd|\u5c0fg|Codex|\u6a21\u578b\u7a97\u53e3)\s*</i
   );
 });
+
+test('styles every real chat surface with the warm modern hierarchy', () => {
+  for (const selector of [
+    '.chat-head',
+    '.chat-scroll',
+    '.chat-list',
+    '.scenario',
+    '.system-tip',
+    '.msg-wrap',
+    '.msg-wrap.me',
+    '.msg-avatar',
+    '.bubble',
+    '.msg-wrap:not(.me) .bubble',
+    '.msg-wrap.me .bubble',
+    '.time-tip',
+    '.typing-line',
+    '.message-failed',
+    '.message-retry',
+    '.message-failure-reason',
+    '.batch-finish-bar',
+    '.batch-finish',
+    '.composer',
+    '.composer-tool',
+    '.chat-input',
+    '.send',
+    '.composer-panel',
+    '.emoji-tabs',
+    '.emoji-tab',
+    '.emoji-grid',
+    '.action-grid',
+    '.action-item',
+    '.voice-hold'
+  ]) {
+    assert.ok(declarationsFor(selector), `missing real CSS rule for ${selector}`);
+  }
+
+  assertDeclaration('.chat-head', /background\s*:\s*var\(--wm-surface\)/);
+  assertDeclaration('.chat-scroll', /background\s*:\s*var\(--wm-chat\)/);
+  assertDeclaration('.chat-list', /gap\s*:\s*12px/);
+  assertDeclaration('.scenario', /background\s*:\s*rgba\(71\s*,\s*121\s*,\s*100\s*,\s*0?\.12\)/);
+  assertDeclaration('.system-tip', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.msg-avatar', /border-radius\s*:\s*11px/);
+  assertDeclaration('.bubble', /max-width\s*:\s*min\(76%\s*,\s*340px\)/);
+  assertDeclaration('.msg-wrap:not(.me) .bubble', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.msg-wrap.me .bubble', /background\s*:\s*var\(--wm-outgoing\)/);
+  assertDeclaration('.message-failed', /color\s*:\s*var\(--wm-danger\)/);
+  assertDeclaration('.message-retry', /color\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.message-failure-reason', /color\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.composer', /background\s*:\s*var\(--wm-surface\)/);
+  assertDeclaration('.chat-input', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.send', /background\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.composer-panel', /background\s*:\s*var\(--wm-surface\)/);
+  assertDeclaration('.emoji-tab', /min-height\s*:\s*44px/);
+  assertDeclaration('.action-item', /min-height\s*:\s*72px/);
+});
+
+test('keeps every real chat control comfortably touchable', () => {
+  for (const selector of ['.composer-tool', '.send', '.batch-finish', '.message-retry', '.message-failure-reason', '.emoji-tab', '.voice-hold']) {
+    assertDeclaration(selector, /min-height\s*:\s*(?:44|48)px/);
+  }
+  assertDeclaration('.composer-tool', /min-width\s*:\s*44px/);
+  assertDeclaration('.send', /min-width\s*:\s*56px/);
+  assertDeclaration('.emoji-grid button', /min-height\s*:\s*44px/);
+  assertDeclaration('.action-item span', /width\s*:\s*52px/);
+  assertDeclaration('.action-item span', /height\s*:\s*52px/);
+
+  for (const deadSelector of ['.chat-composer', '.chat-tool', '.chat-send']) {
+    assert.equal(declarationsFor(deadSelector), '', `dead selector must not be an acceptance anchor: ${deadSelector}`);
+  }
+});
+
+test('styles the complete contact profile and chat-info selector audit', () => {
+  for (const selector of [
+    '.contact-rail',
+    '.contact-index',
+    '.contact-profile-head',
+    '.contact-profile-name',
+    '.contact-profile-id',
+    '.contact-profile-actions',
+    '.contact-profile-actions .primary',
+    '.profile-detail-text',
+    '.profile-card',
+    '.profile-top',
+    '.profile-name',
+    '.profile-meta',
+    '.profile-id',
+    '.chat-info-people',
+    '.chat-info-person',
+    '.chat-info-advanced',
+    '.chat-info-advanced summary',
+    '.chat-info-editor'
+  ]) {
+    assert.ok(declarationsFor(selector), `missing real CSS rule for ${selector}`);
+  }
+
+  assertDeclaration('.contact-index', /background\s*:\s*var\(--wm-page\)/);
+  assertDeclaration('.contact-profile-head', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.contact-profile-name', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.contact-profile-id', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.contact-profile-actions', /background\s*:\s*var\(--wm-page\)/);
+  assertDeclaration('.contact-profile-actions .primary', /min-height\s*:\s*48px/);
+  assertDeclaration('.profile-detail-text', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.profile-card', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.profile-top', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.profile-name', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.profile-meta', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.profile-id', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.chat-info-people', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.chat-info-person', /min-height\s*:\s*72px/);
+  assertDeclaration('.chat-info-advanced', /background\s*:\s*transparent/);
+  assertDeclaration('.chat-info-advanced summary', /min-height\s*:\s*44px/);
+  assertDeclaration('.chat-info-editor', /background\s*:\s*var\(--wm-card\)/);
+});

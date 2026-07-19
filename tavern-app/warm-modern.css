@@ -253,3 +253,344 @@ body {
 #screen-moments > .scroll {
   background: var(--wm-page) !important;
 }
+
+/* Chat: quiet, intimate surfaces over the existing messaging contract. */
+.chat-head {
+  background: var(--wm-surface);
+  border-color: var(--wm-line);
+}
+
+.chat-scroll {
+  background: var(--wm-chat);
+}
+
+.chat-list {
+  padding: 14px 11px 20px;
+  gap: 12px;
+}
+
+.scenario {
+  max-width: 84%;
+  padding: 6px 11px;
+  border-radius: var(--wm-radius-sm);
+  background: rgba(71, 121, 100, 0.12);
+  color: var(--wm-muted);
+}
+
+.system-tip {
+  padding: 3px 8px;
+  color: var(--wm-muted);
+}
+
+.msg-wrap {
+  gap: 9px;
+}
+
+.msg-wrap.me {
+  justify-content: flex-end;
+}
+
+.msg-avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: var(--wm-jade);
+  box-shadow: inset 0 0 0 1px rgba(42, 48, 45, 0.05);
+}
+
+.bubble {
+  max-width: min(76%, 340px);
+  padding: 9px 11px;
+  border-radius: 12px;
+  color: var(--wm-text);
+  box-shadow: 0 1px 2px rgba(42, 48, 45, 0.045);
+}
+
+.msg-wrap:not(.me) .bubble {
+  background: var(--wm-card);
+  border-top-left-radius: 4px;
+}
+
+.msg-wrap.me .bubble {
+  background: var(--wm-outgoing);
+  border-top-right-radius: 4px;
+}
+
+.msg-wrap:not(.me) .bubble:before,
+.msg-wrap.me .bubble:after {
+  display: none;
+}
+
+.time-tip,
+.typing-line {
+  color: var(--wm-muted);
+}
+
+.message-failed {
+  margin: 0 50px 2px 0;
+  color: var(--wm-danger);
+}
+
+.message-retry,
+.message-failure-reason {
+  display: inline-flex;
+  min-height: 44px;
+  padding: 0 8px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  color: var(--wm-jade);
+}
+
+.message-retry:active,
+.message-failure-reason:active {
+  background: rgba(71, 121, 100, 0.10);
+}
+
+.batch-finish-bar {
+  padding: 7px 10px;
+  background: var(--wm-surface);
+  border-color: var(--wm-line);
+}
+
+.batch-finish {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 16px;
+  border-radius: 12px;
+  background: var(--wm-jade);
+}
+
+.composer {
+  padding: 7px 8px calc(7px + var(--safe-bottom));
+  background: var(--wm-surface);
+  border-color: var(--wm-line);
+}
+
+.composer-tool {
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 12px;
+  color: var(--wm-text);
+}
+
+.composer-tool:active {
+  background: rgba(71, 121, 100, 0.10);
+}
+
+.composer-tool.voice:after {
+  left: 20px;
+  top: 27px;
+}
+
+.composer-tool.emoji:after {
+  left: 15px;
+  top: 22px;
+}
+
+.composer-tool.plus:after {
+  left: 15px;
+  top: 21px;
+}
+
+.composer-tool.plus i {
+  left: 21px;
+  top: 15px;
+}
+
+.chat-input {
+  min-height: 44px;
+  padding: 10px 11px;
+  border-radius: 12px;
+  background: var(--wm-card);
+  color: var(--wm-text);
+  box-shadow: inset 0 0 0 1px rgba(42, 48, 45, 0.035);
+}
+
+.send {
+  min-width: 56px;
+  min-height: 44px;
+  height: 44px;
+  padding: 0 13px;
+  border-radius: 12px;
+  background: var(--wm-jade);
+  color: #ffffff;
+}
+
+.send.inactive {
+  background: #d8ddd9;
+  color: var(--wm-muted);
+}
+
+.composer-panel {
+  padding: 12px 12px calc(16px + var(--safe-bottom));
+  background: var(--wm-surface);
+  border-color: var(--wm-line);
+}
+
+.emoji-tabs {
+  min-height: 44px;
+  height: 44px;
+  border-color: var(--wm-line);
+}
+
+.emoji-tab {
+  min-height: 44px;
+  height: 44px;
+  color: var(--wm-muted);
+}
+
+.emoji-tab.active {
+  color: var(--wm-text);
+}
+
+.emoji-tab.active:after {
+  background: var(--wm-jade);
+}
+
+.emoji-grid {
+  height: 188px;
+  grid-auto-rows: 44px;
+  gap: 3px 4px;
+}
+
+.emoji-grid button {
+  min-height: 44px;
+  height: 44px;
+  border-radius: 10px;
+}
+
+.emoji-grid button:active {
+  background: rgba(71, 121, 100, 0.10);
+}
+
+.action-grid {
+  gap: 12px;
+}
+
+.action-item {
+  min-height: 72px;
+  padding: 4px 0;
+  color: var(--wm-muted);
+}
+
+.action-item span {
+  width: 52px;
+  height: 52px;
+  border-radius: 14px;
+  background: var(--wm-card);
+  border-color: var(--wm-line);
+  color: var(--wm-text);
+}
+
+.voice-hold {
+  min-height: 48px;
+  height: 48px;
+  border-radius: 12px;
+  background: var(--wm-card);
+  color: var(--wm-text);
+}
+
+.voice-hold.recording {
+  background: var(--wm-outgoing);
+  color: var(--wm-text);
+}
+
+/* Relationships: people stay prominent; advanced editing stays subordinate. */
+.contact-rail {
+  color: var(--wm-faint);
+}
+
+.contact-index {
+  height: 32px;
+  padding: 0 18px;
+  background: var(--wm-page);
+  color: var(--wm-muted);
+}
+
+.contact-profile-head {
+  padding: 28px 18px 24px;
+  background: var(--wm-card);
+  border-bottom: 1px solid var(--wm-line);
+}
+
+.contact-profile-head .avatar,
+.chat-info-person .avatar {
+  border-radius: 16px;
+}
+
+.contact-profile-name {
+  color: var(--wm-text);
+  font-weight: 650;
+}
+
+.contact-profile-id {
+  color: var(--wm-muted);
+}
+
+.contact-profile-actions {
+  padding: 8px 12px;
+  background: var(--wm-page);
+}
+
+.contact-profile-actions .primary {
+  width: 100%;
+  min-height: 48px;
+  margin: 8px 0 10px;
+}
+
+.profile-detail-text {
+  color: var(--wm-muted);
+}
+
+.profile-card {
+  margin: 10px 0;
+  background: var(--wm-card);
+  border-bottom: 1px solid var(--wm-line);
+}
+
+.profile-top {
+  min-height: 100px;
+  background: var(--wm-card);
+  border-color: var(--wm-line);
+}
+
+.profile-name {
+  color: var(--wm-text);
+  font-weight: 650;
+}
+
+.profile-meta,
+.profile-id {
+  color: var(--wm-muted);
+}
+
+.chat-info-people {
+  gap: 18px;
+  padding: 22px 18px;
+  background: var(--wm-card);
+  border-bottom: 1px solid var(--wm-line);
+}
+
+.chat-info-person {
+  width: 64px;
+  min-height: 72px;
+  padding: 4px 0;
+  color: var(--wm-muted);
+}
+
+.chat-info-advanced {
+  margin: 14px 0 0;
+  background: transparent;
+}
+
+.chat-info-advanced summary {
+  min-height: 44px;
+  color: var(--wm-muted);
+}
+
+.chat-info-editor {
+  background: var(--wm-card);
+}
