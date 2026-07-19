@@ -1099,3 +1099,192 @@ body {
   background: rgba(114, 122, 117, 0.14);
   color: var(--wm-muted);
 }
+
+/* Foreground surfaces: keep transient actions distinct from conversations. */
+.toast {
+  z-index: 220;
+  width: max-content;
+  max-width: min(calc(100vw - 32px), 420px);
+  padding: 11px 16px;
+  border-radius: 12px;
+  background: rgba(42, 48, 45, 0.90);
+  color: #ffffff;
+  box-shadow: var(--wm-shadow-float);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.modal-mask {
+  z-index: 180;
+  padding-top: env(safe-area-inset-top, 0px);
+  background: rgba(42, 48, 45, 0.38);
+  backdrop-filter: blur(2px);
+}
+
+.message-action-sheet {
+  max-height: min(78vh, 620px);
+  padding-bottom: calc(10px + env(safe-area-inset-bottom, 0px));
+  overflow-y: auto;
+  border-radius: 18px 18px 0 0;
+  background: var(--wm-surface);
+  box-shadow: 0 -12px 32px rgba(42, 48, 45, 0.16);
+}
+
+.message-action-sheet button {
+  min-height: 54px;
+  height: auto;
+  padding: 13px 18px;
+  border-color: var(--wm-line);
+  background: var(--wm-card);
+  color: var(--wm-text);
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.message-action-sheet button.danger {
+  color: var(--wm-danger);
+}
+
+.message-action-cancel {
+  margin-top: 8px !important;
+  border-top: 1px solid var(--wm-line) !important;
+}
+
+.plus-menu {
+  z-index: 170;
+  width: min(184px, calc(100vw - 24px));
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: #303834;
+  box-shadow: var(--wm-shadow-float);
+}
+
+.plus-menu::before {
+  border-bottom-color: #303834;
+}
+
+.plus-item {
+  min-height: 48px;
+  height: auto;
+  padding: 12px 16px;
+  border-color: rgba(255, 255, 255, 0.10);
+  color: #ffffff;
+  line-height: 1.4;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.plus-item:active {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+/* Keyboard users get the same clear state cues as touch users. */
+.icon-btn:focus-visible,
+.top-text-btn:focus-visible,
+.tab:focus-visible,
+.search-box:focus-visible,
+.search-input:focus-visible,
+.composer-tool:focus-visible,
+.chat-input:focus-visible,
+.send:focus-visible,
+.moment-name:focus-visible,
+.moment-action:focus-visible,
+.moment-compose-actions button:focus-visible,
+.moment-reply-bar button:focus-visible,
+.plus-item:focus-visible,
+.message-action-sheet button:focus-visible {
+  outline: 3px solid rgba(71, 121, 100, 0.42);
+  outline-offset: 2px;
+}
+
+.tab {
+  min-height: 44px;
+}
+
+.tabbar {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.composer {
+  padding-bottom: calc(7px + env(safe-area-inset-bottom, 0px));
+}
+
+.moment-reply-bar {
+  padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
+}
+
+.bubble,
+.moment-text,
+.moment-comment,
+.diagnostic-pre,
+.plus-item {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@media (max-width: 380px) {
+  .topbar {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .top-left,
+  .top-right {
+    width: 96px;
+    min-width: 96px;
+    flex-basis: 96px;
+    gap: 4px;
+  }
+
+  .top-title {
+    font-size: 16px;
+  }
+
+  .composer {
+    gap: 4px;
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+
+  .composer-tool {
+    width: 44px;
+    min-width: 44px;
+  }
+
+  .chat-input {
+    min-width: 0;
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  .send {
+    min-width: 56px;
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+}
+
+@media (min-width: 520px) {
+  .moment-reply-bar {
+    width: 100%;
+    max-width: 520px;
+    right: auto;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

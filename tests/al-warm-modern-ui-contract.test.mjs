@@ -423,3 +423,66 @@ test('warms wallet and payment surfaces while preserving their real states', () 
   assertDeclaration('.pay-card-foot', /color\s*:\s*var\(--wm-muted\)/);
   assertDeclaration('.pay-status-tip', /color\s*:\s*var\(--wm-muted\)/);
 });
+
+test('styles only real overlays as warm, safe, touchable foreground surfaces', () => {
+  for (const selector of [
+    '.toast',
+    '.modal-mask',
+    '.message-action-sheet',
+    '.message-action-sheet button',
+    '.message-action-cancel',
+    '.plus-menu',
+    '.plus-item'
+  ]) {
+    assert.ok(declarationsFor(selector), `missing real overlay CSS rule for ${selector}`);
+  }
+
+  assertDeclaration('.toast', /z-index\s*:\s*220/);
+  assertDeclaration('.toast', /overflow-wrap\s*:\s*anywhere/);
+  assertDeclaration('.modal-mask', /z-index\s*:\s*180/);
+  assertDeclaration('.message-action-sheet', /background\s*:\s*var\(--wm-surface\)/);
+  assertDeclaration('.message-action-sheet', /env\(safe-area-inset-bottom\s*,\s*0px\)/);
+  assertDeclaration('.message-action-sheet button', /min-height\s*:\s*54px/);
+  assertDeclaration('.message-action-cancel', /margin-top\s*:\s*8px\s*!important/);
+  assertDeclaration('.plus-menu', /z-index\s*:\s*170/);
+  assertDeclaration('.plus-item', /min-height\s*:\s*48px/);
+  assert.equal(declarationsFor('.sheet'), '', 'dead .sheet selector must not be an acceptance anchor');
+});
+
+test('exposes visible keyboard focus on the real primary interaction paths', () => {
+  for (const selector of [
+    '.icon-btn:focus-visible',
+    '.top-text-btn:focus-visible',
+    '.tab:focus-visible',
+    '.search-box:focus-visible',
+    '.search-input:focus-visible',
+    '.composer-tool:focus-visible',
+    '.chat-input:focus-visible',
+    '.send:focus-visible',
+    '.moment-name:focus-visible',
+    '.moment-action:focus-visible',
+    '.moment-compose-actions button:focus-visible',
+    '.moment-reply-bar button:focus-visible',
+    '.plus-item:focus-visible',
+    '.message-action-sheet button:focus-visible'
+  ]) {
+    assertDeclaration(selector, /outline\s*:\s*3px\s+solid\s+rgba\(71\s*,\s*121\s*,\s*100\s*,\s*0?\.42\)/);
+    assertDeclaration(selector, /outline-offset\s*:\s*2px/);
+  }
+});
+
+test('honors device safe areas and reduced-motion preferences', () => {
+  assertDeclaration('.tabbar', /env\(safe-area-inset-bottom\s*,\s*0px\)/);
+  assertDeclaration('.composer', /env\(safe-area-inset-bottom\s*,\s*0px\)/);
+  assertDeclaration('.moment-reply-bar', /env\(safe-area-inset-bottom\s*,\s*0px\)/);
+  assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?animation-duration\s*:\s*0\.01ms\s*!important[\s\S]*?transition-duration\s*:\s*0\.01ms\s*!important[\s\S]*?scroll-behavior\s*:\s*auto\s*!important/);
+});
+
+test('keeps long content and 360-to-520 layouts structurally stable', () => {
+  for (const selector of ['.bubble', '.moment-text', '.moment-comment', '.diagnostic-pre', '.plus-item']) {
+    assertDeclaration(selector, /overflow-wrap\s*:\s*anywhere/);
+  }
+
+  assert.match(css, /@media\s*\(max-width:\s*380px\)\s*\{[\s\S]*?\.top-left\s*,\s*\.top-right\s*\{[\s\S]*?width\s*:\s*96px[\s\S]*?min-width\s*:\s*96px[\s\S]*?flex-basis\s*:\s*96px[\s\S]*?\.composer\s*\{[\s\S]*?gap\s*:\s*4px[\s\S]*?\.chat-input\s*\{[\s\S]*?min-width\s*:\s*0/);
+  assert.match(css, /@media\s*\(min-width:\s*520px\)\s*\{[\s\S]*?\.moment-reply-bar\s*\{[\s\S]*?max-width\s*:\s*520px[\s\S]*?left\s*:\s*50%[\s\S]*?transform\s*:\s*translateX\(-50%\)/);
+});
