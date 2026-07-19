@@ -138,6 +138,10 @@ test('v2 accepts a background turn immediately and exposes signed polling status
     secret: 'test-pairing-secret',
     store: {
       getTurn: () => stored,
+      getTurnStages: () => [{
+        stage: 'memory', ordinal: 1, model: 'gpt-5.6-terra', effort: 'medium',
+        startedAt: 1784400000000, finishedAt: null, durationMs: null
+      }],
       getSyncDelta: () => [],
       ackSync: () => 0
     },
@@ -170,6 +174,8 @@ test('v2 accepts a background turn immediately and exposes signed polling status
     });
     assert.equal(submitted.status, 202);
     assert.equal(submitted.body.terminal, false);
+    assert.equal(submitted.body.displayStage, '正在翻一下我们以前说过的话…');
+    assert.equal(submitted.body.stageModel, 'gpt-5.6-terra');
     assert.deepEqual(accepted, ['turn_phone_async_1']);
 
     stored = {

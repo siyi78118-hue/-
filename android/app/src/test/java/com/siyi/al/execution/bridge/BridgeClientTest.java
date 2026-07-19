@@ -70,6 +70,23 @@ public class BridgeClientTest {
         assertFalse(transport.nonces.get(1).equals(transport.nonces.get(2)));
     }
 
+    @Test public void bridgeStatusParsesRouteStageModelAndDurations() throws Exception {
+        BridgeTurnStatus status = BridgeTurnStatus.parse(
+            "{\"turnId\":\"turn_phone_1\",\"state\":\"memory_running\",\"terminal\":false,"
+                + "\"route\":\"fast\",\"displayStage\":\"正在翻一下我们以前说过的话…\","
+                + "\"technicalStage\":\"memory\",\"stageModel\":\"gpt-5.6-terra\","
+                + "\"stageEffort\":\"medium\",\"stageElapsedMs\":600,\"totalElapsedMs\":800}",
+            "turn_phone_1"
+        );
+        assertEquals("fast", status.route);
+        assertEquals("正在翻一下我们以前说过的话…", status.displayStage);
+        assertEquals("memory", status.technicalStage);
+        assertEquals("gpt-5.6-terra", status.stageModel);
+        assertEquals("medium", status.stageEffort);
+        assertEquals(600L, status.stageElapsedMs);
+        assertEquals(800L, status.totalElapsedMs);
+    }
+
     private static TurnSubmission directSubmission(long createdAt) {
         return new TurnSubmission(
             "turn_phone_1", "yuqi", "msg_phone_1", TurnKind.DIRECT_REPLY,

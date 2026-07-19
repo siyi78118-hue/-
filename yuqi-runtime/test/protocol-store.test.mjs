@@ -11,6 +11,7 @@ import {
   validateEnvelope
 } from '../src/protocol.mjs';
 import { YuqiStore } from '../src/store.mjs';
+import { publicTurnStatus } from '../src/turn-status.mjs';
 
 function validEnvelope(overrides = {}) {
   return {
@@ -181,6 +182,44 @@ test('state transitions use compare-and-set semantics', () => withStore(({ store
     memoryPacketJson: '{"facts":[]}'
   });
   assert.equal(advanced.state, 'memory_done');
+}));
+
+test('persists the selected route and completed stage timings', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  store.setTurnRoute(turn.turnId, 'fast', ['ordinary_chat']);
+  store.beginStage(turn.turnId, 'memory', 'gpt-5.6-terra', 'medium', 1000);
+  store.finishStage(turn.turnId, 'memory', 1450);
+
+  const saved = store.getTurn(turn.turnId);
+  assert.equal(saved.route, 'fast');
+  assert.deepEqual(saved.routeReasons, ['ordinary_chat']);
+  assert.deepEqual(store.getTurnStages(turn.turnId), [{
+    stage: 'memory',
+    ordinal: 1,
+    model: 'gpt-5.6-terra',
+    effort: 'medium',
+    startedAt: 1000,
+    finishedAt: 1450,
+    durationMs: 450
+  }]);
+}));
+
+test('public turn status separates immersive copy from technical details', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  store.setTurnRoute(turn.turnId, 'fast', ['ordinary_chat']);
+  store.beginStage(turn.turnId, 'memory', 'gpt-5.6-terra', 'medium', 1784400000000);
+
+  const status = publicTurnStatus(store.getTurn(turn.turnId), {
+    stages: store.getTurnStages(turn.turnId),
+    clock: () => 1784400000600
+  });
+  assert.equal(status.route, 'fast');
+  assert.equal(status.displayStage, '正在翻一下我们以前说过的话…');
+  assert.equal(status.technicalStage, 'memory');
+  assert.equal(status.stageModel, 'gpt-5.6-terra');
+  assert.equal(status.stageEffort, 'medium');
+  assert.equal(status.stageElapsedMs, 600);
+  assert.equal(status.totalElapsedMs, 600);
 }));
 
 test('lists every nonterminal turn for dispatcher recovery and excludes committed turns', () => withStore(({ store }) => {

@@ -29,6 +29,8 @@ function mapTurn(row) {
     deviceSeq: row.device_seq,
     sourceMessageId: row.source_message_id,
     state: row.state,
+    route: row.route || 'deep',
+    routeReasons: parseJson(row.route_reasons_json, []),
     workerId: row.worker_id || '',
     origin: row.origin,
     memoryPacketJson: row.memory_packet_json,
@@ -58,6 +60,19 @@ function mapMessage(row) {
     deviceId: row.device_id || '',
     deviceSeq: row.device_seq ?? null,
     checksum: row.checksum
+  };
+}
+
+function mapTurnStage(row) {
+  if (!row) return null;
+  return {
+    stage: row.stage,
+    ordinal: row.ordinal,
+    model: row.model || '',
+    effort: row.effort || '',
+    startedAt: row.started_at,
+    finishedAt: row.finished_at ?? null,
+    durationMs: row.duration_ms ?? null
   };
 }
 
@@ -161,6 +176,21 @@ export class YuqiStore {
         UNIQUE(device_id, device_seq)
       );
       CREATE INDEX IF NOT EXISTS idx_turns_state_created ON turns(state, created_at);
+
+      CREATE TABLE IF NOT EXISTS turn_stages (
+        turn_id TEXT NOT NULL,
+        stage TEXT NOT NULL,
+        ordinal INTEGER NOT NULL,
+        model TEXT,
+        effort TEXT,
+        started_at INTEGER NOT NULL,
+        finished_at INTEGER,
+        duration_ms INTEGER,
+        PRIMARY KEY(turn_id, stage, ordinal),
+        FOREIGN KEY(turn_id) REFERENCES turns(turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_turn_stages_turn_ordinal
+        ON turn_stages(turn_id, ordinal);
 
       CREATE TABLE IF NOT EXISTS messages (
         message_id TEXT PRIMARY KEY,
@@ -281,6 +311,9 @@ export class YuqiStore {
 
     const factColumns = new Set(this.db.prepare('PRAGMA table_info(facts)').all().map(row => row.name));
     if (!factColumns.has('fact_json')) this.db.exec('ALTER TABLE facts ADD COLUMN fact_json TEXT;');
+    const turnColumns = new Set(this.db.prepare('PRAGMA table_info(turns)').all().map(row => row.name));
+    if (!turnColumns.has('route')) this.db.exec("ALTER TABLE turns ADD COLUMN route TEXT NOT NULL DEFAULT 'deep';");
+    if (!turnColumns.has('route_reasons_json')) this.db.exec("ALTER TABLE turns ADD COLUMN route_reasons_json TEXT NOT NULL DEFAULT '[]';");
   }
 
   transaction(run) {
@@ -358,6 +391,59 @@ export class YuqiStore {
 
   getTurn(turnId) {
     return mapTurn(this.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turnId));
+  }
+
+  setTurnRoute(turnId, route, reasons = []) {
+    if (!['fast', 'deep', 'fast_to_deep'].includes(route)) throw new Error('invalid turn route');
+    const result = this.db.prepare(`
+      UPDATE turns SET route = ?, route_reasons_json = ?, updated_at = ? WHERE turn_id = ?
+    `).run(route, canonicalJson([...new Set(reasons.map(String))]), now(), turnId);
+    if (Number(result.changes) !== 1) throw new Error('turn not found');
+    return this.getTurn(turnId);
+  }
+
+  beginStage(turnId, stage, model = null, effort = null, startedAt = now()) {
+    if (!String(stage || '').trim()) throw new Error('stage is required');
+    if (!this.getTurn(turnId)) throw new Error('turn not found');
+    const active = this.db.prepare(`
+      SELECT * FROM turn_stages
+      WHERE turn_id = ? AND stage = ? AND finished_at IS NULL
+      ORDER BY ordinal DESC LIMIT 1
+    `).get(turnId, stage);
+    if (active) return mapTurnStage(active);
+    const ordinal = Number(this.db.prepare(
+      'SELECT COALESCE(MAX(ordinal), 0) AS value FROM turn_stages WHERE turn_id = ?'
+    ).get(turnId)?.value || 0) + 1;
+    this.db.prepare(`
+      INSERT INTO turn_stages(turn_id, stage, ordinal, model, effort, started_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(turnId, stage, ordinal, model, effort, Number(startedAt));
+    return mapTurnStage(this.db.prepare(
+      'SELECT * FROM turn_stages WHERE turn_id = ? AND stage = ? AND ordinal = ?'
+    ).get(turnId, stage, ordinal));
+  }
+
+  finishStage(turnId, stage, finishedAt = now()) {
+    const active = this.db.prepare(`
+      SELECT * FROM turn_stages
+      WHERE turn_id = ? AND stage = ? AND finished_at IS NULL
+      ORDER BY ordinal DESC LIMIT 1
+    `).get(turnId, stage);
+    if (!active) return null;
+    const durationMs = Math.max(0, Number(finishedAt) - Number(active.started_at));
+    this.db.prepare(`
+      UPDATE turn_stages SET finished_at = ?, duration_ms = ?
+      WHERE turn_id = ? AND stage = ? AND ordinal = ?
+    `).run(Number(finishedAt), durationMs, turnId, stage, active.ordinal);
+    return mapTurnStage(this.db.prepare(
+      'SELECT * FROM turn_stages WHERE turn_id = ? AND stage = ? AND ordinal = ?'
+    ).get(turnId, stage, active.ordinal));
+  }
+
+  getTurnStages(turnId) {
+    return this.db.prepare(`
+      SELECT * FROM turn_stages WHERE turn_id = ? ORDER BY ordinal ASC
+    `).all(turnId).map(mapTurnStage);
   }
 
   listRecoverableTurns() {

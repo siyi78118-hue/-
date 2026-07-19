@@ -108,13 +108,17 @@ export function createYuqiServer({
         return json(response, 503, { ok: false, error: 'turn dispatcher is unavailable' });
       }
       const turn = dispatcher.accept(body);
-      const status = publicTurnStatus(turn);
+      const status = publicTurnStatus(turn, {
+        stages: typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : []
+      });
       return json(response, status.terminal ? 200 : 202, { ok: true, accepted: true, ...status });
     }
     const v2TurnMatch = /^\/v2\/turns\/([^/]+)$/.exec(url.pathname);
     if (request.method === 'GET' && v2TurnMatch) {
       const turn = store.getTurn(decodeURIComponent(v2TurnMatch[1]));
-      const status = publicTurnStatus(turn);
+      const status = publicTurnStatus(turn, {
+        stages: turn && typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : []
+      });
       return status
         ? json(response, 200, { ok: true, ...status })
         : json(response, 404, { ok: false, error: 'turn not found' });
