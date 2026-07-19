@@ -49,6 +49,19 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void recoveredMemoryRunningBridgeResumesTheSameRemoteTurnWithoutLegacyStages() throws Exception {
+        FakeStore store = new FakeStore(turn("MEMORY_RUNNING", null), attempt("MEMORY_RUNNING", null));
+        BridgedGateway gateway = new BridgedGateway();
+        ExecutionEngine engine = new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L);
+
+        engine.recoverInterruptedWork();
+
+        assertEquals(1, gateway.bridgeCalls);
+        assertEquals(0, gateway.legacyCalls);
+        assertEquals(TurnState.COMPLETED.name(), store.turn.state);
+    }
+
+    @Test
     public void storedChatDoneResultResumesWithoutCallingModelAgain() throws Exception {
         FakeStore store = new FakeStore(turn("CHAT_DONE", "已经生成😊"), attempt("CHAT_DONE", "已经生成😊"));
         RecordingGateway gateway = new RecordingGateway();

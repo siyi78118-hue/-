@@ -5,9 +5,21 @@ import java.net.ConnectException;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
+import com.siyi.al.execution.bridge.BridgeDeadlineException;
+import com.siyi.al.execution.bridge.BridgeFinalException;
+import com.siyi.al.execution.bridge.BridgePendingException;
 
 public final class RetryPolicy {
     public Decision classify(Throwable error) {
+        if (error instanceof BridgePendingException) {
+            return new Decision("BRIDGE_PENDING", true);
+        }
+        if (error instanceof BridgeDeadlineException) {
+            return new Decision("BRIDGE_DEADLINE", true);
+        }
+        if (error instanceof BridgeFinalException) {
+            return new Decision(((BridgeFinalException) error).code(), false);
+        }
         if (error instanceof ApiProtocolException) {
             String code = ((ApiProtocolException) error).code();
             boolean retryable = "HTTP_429".equals(code)

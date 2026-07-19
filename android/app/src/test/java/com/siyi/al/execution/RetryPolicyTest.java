@@ -5,6 +5,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import com.siyi.al.execution.bridge.BridgePendingException;
 import org.junit.Test;
 
 public class RetryPolicyTest {
@@ -21,6 +22,13 @@ public class RetryPolicyTest {
     public void socketTimeoutIsRetryable() {
         RetryPolicy.Decision decision = policy.classify(new SocketTimeoutException("Read timed out"));
         assertEquals("NETWORK_TIMEOUT", decision.code);
+        assertTrue(decision.retryable);
+    }
+
+    @Test
+    public void pendingDedicatedBridgeTurnRemainsRetryable() {
+        RetryPolicy.Decision decision = policy.classify(new BridgePendingException("cloud still working"));
+        assertEquals("BRIDGE_PENDING", decision.code);
         assertTrue(decision.retryable);
     }
 }

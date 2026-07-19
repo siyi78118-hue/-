@@ -62,6 +62,40 @@ public class BridgeRouterTest {
         assertFalse(result.fallback);
     }
 
+    @Test public void transientLanAndCloudFailuresNeverInvokeFallbackBeforeDeadline() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeRouter router = router(
+            BridgeMode.AUTO,
+            events,
+            value -> { events.add("lan"); throw new BridgePendingException("LAN temporarily unreachable"); },
+            value -> { events.add("cloud"); throw new BridgePendingException("cloud result still pending"); },
+            fallback("fallback", events)
+        );
+
+        try {
+            router.execute(submission());
+            throw new AssertionError("expected BridgePendingException");
+        } catch (BridgePendingException expected) {
+            assertEquals(Arrays.asList("mirror-user", "lan", "cloud"), events);
+        }
+    }
+
+    @Test public void explicitFinalFailureMayAuthorizeTheLegacyFallback() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeRouter router = router(
+            BridgeMode.LAN,
+            events,
+            value -> { events.add("lan"); throw new BridgeFinalException("ROLE_FAILED", true); },
+            succeeding("cloud", events),
+            fallback("fallback", events)
+        );
+
+        BridgeResult result = router.execute(submission());
+
+        assertEquals(Arrays.asList("lan", "fallback"), result.attemptedRoutes);
+        assertTrue(result.fallback);
+    }
+
     private static BridgeRouter router(
         BridgeMode mode,
         List<String> events,

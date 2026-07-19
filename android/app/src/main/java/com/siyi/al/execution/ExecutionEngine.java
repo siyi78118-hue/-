@@ -60,7 +60,7 @@ public final class ExecutionEngine {
         try {
             JSONObject snapshot = new JSONObject(turn.snapshotJson);
             TurnState state = TurnState.valueOf(turn.state);
-            if (state == TurnState.QUEUED && models instanceof TurnBridgeGateway
+            if ((state == TurnState.QUEUED || state == TurnState.MEMORY_RUNNING) && models instanceof TurnBridgeGateway
                 && ((TurnBridgeGateway) models).hasBridge()) {
                 processBridgedTurn(turn, attempt, (TurnBridgeGateway) models);
                 return;
@@ -113,7 +113,9 @@ public final class ExecutionEngine {
     }
 
     private void processBridgedTurn(ChatTurnEntity turn, ExecutionAttemptEntity attempt, TurnBridgeGateway gateway) throws Exception {
-        store.markStage(turn.turnId, attempt.attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, clock.now());
+        if (TurnState.valueOf(turn.state) == TurnState.QUEUED) {
+            store.markStage(turn.turnId, attempt.attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, clock.now());
+        }
         TurnSubmission submission = new TurnSubmission(
             turn.turnId,
             turn.characterId,

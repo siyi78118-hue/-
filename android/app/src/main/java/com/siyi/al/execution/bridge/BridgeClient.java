@@ -7,6 +7,9 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.SocketException;
+import java.net.SocketTimeoutException;
+import java.net.UnknownHostException;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -61,7 +64,7 @@ public final class BridgeClient {
     public BridgeRouter.RouteClient cloudRoute() { return this::sendCloud; }
 
     public BridgeResult sendLan(TurnSubmission submission) throws Exception {
-        if (!config.hasLan()) throw new IllegalStateException("LAN bridge is not configured");
+        if (!config.hasLan()) throw new BridgeFinalException("LAN_BRIDGE_NOT_CONFIGURED", true);
         long deadline = deadline(submission);
         String path = "/v2/turns";
         String body = wireEnvelope(submission).toString();
@@ -69,7 +72,7 @@ public final class BridgeClient {
         requireSuccess(response, "LAN submit");
         BridgeTurnStatus status = BridgeTurnStatus.parse(response.body, submission.turnId);
         while (!status.terminal) {
-            sleepForPoll(deadline, status.retryAfterMs);
+            sleepForPoll(submission.turnId, deadline, status.retryAfterMs);
             path = "/v2/turns/" + URLEncoder.encode(submission.turnId, "UTF-8");
             response = signedLan("GET", path, "");
             requireSuccess(response, "LAN poll");
@@ -77,11 +80,11 @@ public final class BridgeClient {
         }
         acknowledgeRecovery(status);
         if (status.committed()) return status.toResult("lan");
-        throw new IllegalStateException("LAN bridge final failure: " + status.errorCode);
+        throw new BridgeFinalException(status.errorCode, status.allowFallback);
     }
 
     public BridgeResult sendCloud(TurnSubmission submission) throws Exception {
-        if (!config.hasCloud()) throw new IllegalStateException("cloud bridge is not configured");
+        if (!config.hasCloud()) throw new BridgeFinalException("CLOUD_BRIDGE_NOT_CONFIGURED", true);
         long deadline = deadline(submission);
         JSONObject wire = wireEnvelope(submission);
         Encrypted encrypted = encrypt(wire.toString());
@@ -94,7 +97,7 @@ public final class BridgeClient {
             .put("ciphertext", encrypted.ciphertext)
             .put("nonce", encrypted.nonce)
             .put("expiresAt", clock.now() + 24L * 60L * 60L * 1000L);
-        HttpResult enqueued = transport.request(
+        HttpResult enqueued = request(
             "POST", config.cloudUrl + "/bridge/enqueue", enqueue.toString(), bearerHeaders()
         );
         requireSuccess(enqueued, "cloud enqueue");
@@ -103,7 +106,7 @@ public final class BridgeClient {
         String pollTarget = config.cloudUrl + "/bridge/poll?deviceId=" + encodedDevice
             + "&direction=pc_to_phone&limit=50";
         while (clock.now() < deadline) {
-            HttpResult polled = transport.request("GET", pollTarget, "", bearerHeaders());
+            HttpResult polled = request("GET", pollTarget, "", bearerHeaders());
             requireSuccess(polled, "cloud poll");
             JSONArray messages = new JSONObject(polled.body).optJSONArray("messages");
             if (messages != null) {
@@ -120,13 +123,13 @@ public final class BridgeClient {
                     acknowledgeRecovery(status);
                     if (status.committed()) return status.toResult("cloud");
                     if (status.failedFinal()) {
-                        throw new IllegalStateException("cloud bridge final failure: " + status.errorCode);
+                        throw new BridgeFinalException(status.errorCode, status.allowFallback);
                     }
                 }
             }
-            sleepForPoll(deadline, config.cloudPollIntervalMs);
+            sleepForPoll(submission.turnId, deadline, config.cloudPollIntervalMs);
         }
-        throw new IllegalStateException("cloud bridge reply deadline exceeded");
+        throw new BridgeDeadlineException(submission.turnId);
     }
 
     public static String signLanRequest(
@@ -147,7 +150,7 @@ public final class BridgeClient {
     private HttpResult signedLan(String method, String path, String body) throws Exception {
         long timestamp = clock.now();
         String nonce = UUID.randomUUID().toString().replace("-", "");
-        return transport.request(method, config.lanUrl + path, body, new String[][] {
+        return request(method, config.lanUrl + path, body, new String[][] {
             {"X-Yuqi-Timestamp", Long.toString(timestamp)},
             {"X-Yuqi-Nonce", nonce},
             {"X-Yuqi-Signature", signLanRequest(config.pairingSecret, method, path, timestamp, nonce, body)}
@@ -160,9 +163,9 @@ public final class BridgeClient {
         return result < createdAt ? Long.MAX_VALUE : result;
     }
 
-    private void sleepForPoll(long deadline, long requestedMs) throws Exception {
+    private void sleepForPoll(String turnId, long deadline, long requestedMs) throws Exception {
         long remaining = deadline - clock.now();
-        if (remaining <= 0L) throw new IllegalStateException("bridge turn deadline exceeded");
+        if (remaining <= 0L) throw new BridgeDeadlineException(turnId);
         sleeper.sleep(Math.min(remaining, Math.max(1L, requestedMs)));
     }
 
@@ -170,9 +173,24 @@ public final class BridgeClient {
         if (journal != null) journal.acknowledge(status.recoveryAckSeq);
     }
 
-    private static void requireSuccess(HttpResult response, String operation) {
+    private static void requireSuccess(HttpResult response, String operation) throws Exception {
         if (response.status < 200 || response.status >= 300) {
-            throw new IllegalStateException(operation + " HTTP " + response.status);
+            if (response.status == 408 || response.status == 425 || response.status == 429 || response.status >= 500) {
+                throw new BridgePendingException(operation + " HTTP " + response.status);
+            }
+            throw new BridgeFinalException(operation.toUpperCase().replace(' ', '_') + "_HTTP_" + response.status, true);
+        }
+    }
+
+    private HttpResult request(String method, String target, String body, String[][] headers) throws Exception {
+        try {
+            return transport.request(method, target, body, headers);
+        } catch (BridgePendingException | BridgeFinalException | BridgeDeadlineException error) {
+            throw error;
+        } catch (SocketTimeoutException | UnknownHostException | SocketException error) {
+            throw new BridgePendingException("bridge network is temporarily unavailable", error);
+        } catch (java.io.IOException error) {
+            throw new BridgePendingException("bridge transport failed", error);
         }
     }
 
@@ -180,7 +198,7 @@ public final class BridgeClient {
         if (messageId.isEmpty()) return;
         JSONObject ack = new JSONObject().put("deviceId", config.deviceId)
             .put("messageIds", new JSONArray().put(messageId));
-        HttpResult response = transport.request(
+        HttpResult response = request(
             "POST", config.cloudUrl + "/bridge/ack", ack.toString(), bearerHeaders()
         );
         requireSuccess(response, "cloud ack");
