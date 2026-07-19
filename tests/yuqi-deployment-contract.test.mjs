@@ -118,6 +118,21 @@ test('Wrangler uses its JavaScript CLI without a shell when the project path con
   ]);
 });
 
+test('Wrangler uses POSIX paths when the requested platform is Linux', () => {
+  const invocation = resolveWranglerInvocation({
+    cwd: '/home/runner/work/al',
+    platform: 'linux',
+    execPath: '/usr/bin/node',
+    fileExists: path => path === '/home/runner/work/al/node_modules/wrangler/bin/wrangler.js',
+    env: {}
+  });
+  assert.equal(invocation.command, '/usr/bin/node');
+  assert.equal(invocation.shell, false);
+  assert.deepEqual(invocation.prefixArgs, [
+    '/home/runner/work/al/node_modules/wrangler/bin/wrangler.js'
+  ]);
+});
+
 test('Wrangler runner allows the official OAuth session to authenticate deploys', () => {
   const runner = readFileSync('scripts/run-wrangler.mjs', 'utf8');
   assert.doesNotMatch(runner, /Missing CLOUDFLARE_API_TOKEN/);

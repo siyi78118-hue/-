@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { posix, win32 } from 'node:path';
 
 export function resolveWranglerInvocation(options = {}) {
   const cwd = options.cwd || process.cwd();
@@ -8,7 +8,8 @@ export function resolveWranglerInvocation(options = {}) {
   const env = options.env || process.env;
   const fileExists = options.fileExists || existsSync;
 
-  const localCli = join(cwd, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
+  const pathApi = platform === 'win32' ? win32 : posix;
+  const localCli = pathApi.join(cwd, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
   if (fileExists(localCli)) {
     return { command: execPath, prefixArgs: [localCli], shell: false };
   }
