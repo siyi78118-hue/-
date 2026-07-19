@@ -31,6 +31,14 @@ input.on('line', line => {
     return;
   }
   if (message.method === 'thread/resume') {
+    if (message.params.threadId === 'thr_missing') {
+      write({ id: message.id, error: { code: -32001, message: 'no rollout found for thread id thr_missing' } });
+      return;
+    }
+    if (message.params.threadId === 'thr_denied') {
+      write({ id: message.id, error: { code: -32002, message: 'permission denied' } });
+      return;
+    }
     write({ id: message.id, result: { thread: { id: message.params.threadId, status: { type: 'idle' } } } });
     return;
   }
@@ -51,4 +59,3 @@ input.on('line', line => {
   }
   write({ id: message.id, error: { code: -32601, message: `unknown method ${message.method}` } });
 });
-

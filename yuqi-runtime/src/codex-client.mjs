@@ -23,6 +23,12 @@ export class CodexTurnError extends Error {
   }
 }
 
+function isMissingRolloutError(error) {
+  if (!(error instanceof CodexProtocolError)) return false;
+  const message = [error.message, error.details?.message].filter(Boolean).join('\n');
+  return /\bno rollout found for thread id\b/i.test(message);
+}
+
 export class CodexAppServerClient {
   constructor(options = {}) {
     this.command = options.command || 'codex';
@@ -241,16 +247,27 @@ export class CodexAppServerClient {
   async ensureThreadInternal(role) {
     await this.start();
     const stored = this.store?.getSession?.(role) || '';
-    const result = stored
-      ? await this.request('thread/resume', { threadId: stored })
-      : await this.request('thread/start', {
-          cwd: this.cwd,
-          approvalPolicy: 'never',
-          sandbox: 'read-only'
-        });
+    if (!stored) return this.startRoleThread(role);
+    try {
+      const result = await this.request('thread/resume', { threadId: stored });
+      const threadId = result?.thread?.id;
+      if (!threadId) throw new CodexProtocolError('thread/resume returned no thread id');
+      return threadId;
+    } catch (error) {
+      if (!isMissingRolloutError(error)) throw error;
+      return this.startRoleThread(role);
+    }
+  }
+
+  async startRoleThread(role) {
+    const result = await this.request('thread/start', {
+      cwd: this.cwd,
+      approvalPolicy: 'never',
+      sandbox: 'read-only'
+    });
     const threadId = result?.thread?.id;
-    if (!threadId) throw new CodexProtocolError(`${stored ? 'thread/resume' : 'thread/start'} returned no thread id`);
-    if (!stored) this.store?.setSession?.(role, threadId);
+    if (!threadId) throw new CodexProtocolError('thread/start returned no thread id');
+    this.store?.setSession?.(role, threadId);
     return threadId;
   }
 

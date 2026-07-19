@@ -64,6 +64,23 @@ test('starts and persists a thread when a role has no session', async () => fixt
   assert.equal(started.params.sandbox, 'read-only');
 }));
 
+test('replaces a stored role thread only when its rollout no longer exists', async () => fixture(async ({ client, store, logFile }) => {
+  store.setSession('memory', 'thr_missing');
+  const result = await client.runTurn('memory', 'find evidence');
+  assert.equal(result.threadId, 'thr_new_1');
+  assert.equal(store.getSession('memory'), 'thr_new_1');
+  assert.deepEqual(methods(logFile), [
+    'initialize', 'initialized', 'thread/resume', 'thread/start', 'turn/start'
+  ]);
+}));
+
+test('does not replace a stored role thread for unrelated resume errors', async () => fixture(async ({ client, store, logFile }) => {
+  store.setSession('memory', 'thr_denied');
+  await assert.rejects(client.runTurn('memory', 'find evidence'), /permission denied/);
+  assert.equal(store.getSession('memory'), 'thr_denied');
+  assert.deepEqual(methods(logFile), ['initialize', 'initialized', 'thread/resume']);
+}));
+
 test('keeps the three role sessions isolated', async () => fixture(async ({ client, store }) => {
   const memory = await client.runTurn('memory', 'm');
   const brain = await client.runTurn('brain', 'b');
