@@ -25,6 +25,7 @@ import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanHistoryEntity;
 import com.siyi.al.execution.db.SyncCursorEntity;
@@ -193,6 +194,63 @@ public final class AlExecutionPlugin extends Plugin {
             JSObject result = new JSObject();
             result.put("saved", true);
             result.put("snapshotId", snapshot.snapshotId);
+            return result;
+        });
+    }
+
+    @PluginMethod
+    public void ingestVisibleMessages(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            JSONArray values = new JSONArray(call.getString("messagesJson", "[]"));
+            int inserted = 0;
+            long nextSeq = Math.max(
+                AlExecutionDatabase.get(getContext()).executionDao().maxRawSyncSeq(),
+                AlExecutionDatabase.get(getContext()).executionDao().maxAnnotationSyncSeq()
+            ) + 1L;
+            for (int index = 0; index < values.length(); index += 1) {
+                JSONObject value = values.getJSONObject(index);
+                String messageId = requiredJson(value, "messageId");
+                if (AlExecutionDatabase.get(getContext()).executionDao().rawMessage(messageId) != null) continue;
+                String speakerType = value.optString("speakerType", "").trim();
+                String speakerId = value.optString("speakerId", "").trim();
+                if ("user".equals(speakerType) && !"user".equals(speakerId)) {
+                    throw new IllegalArgumentException("user speaker attribution mismatch");
+                }
+                if ("character".equals(speakerType) && !characterId.equals(speakerId)) {
+                    throw new IllegalArgumentException("character speaker attribution mismatch");
+                }
+                if (!"user".equals(speakerType) && !"character".equals(speakerType)) {
+                    throw new IllegalArgumentException("speakerType is invalid");
+                }
+                RawMessageEntity row = new RawMessageEntity();
+                row.messageId = messageId;
+                row.turnId = value.optString("turnId", "turn_legacy_" + messageId).trim();
+                if (row.turnId.isEmpty()) row.turnId = "turn_legacy_" + messageId;
+                row.characterId = characterId;
+                row.speakerId = speakerId;
+                row.speakerType = speakerType;
+                row.recipientId = "user".equals(speakerType) ? characterId : "user";
+                row.content = requiredJson(value, "content");
+                row.sentAt = Math.max(1L, value.optLong("sentAt", System.currentTimeMillis()));
+                row.origin = value.optString("origin", "user".equals(speakerType) ? "phone" : "legacy_fallback");
+                row.deviceId = secrets.loadBridgeConfig().deviceId + ":visible";
+                row.deviceSeq = nextSeq;
+                row.syncSeq = nextSeq;
+                row.checksum = messageId;
+                if (AlExecutionDatabase.get(getContext()).executionDao().insertRawMessage(row) != -1L) {
+                    inserted += 1;
+                    nextSeq += 1L;
+                }
+            }
+            JSObject result = new JSObject();
+            result.put("saved", true);
+            result.put("inserted", inserted);
+            result.put("pending", AlExecutionDatabase.get(getContext()).executionDao().rawMessageCountAfterSync(
+                AlExecutionDatabase.get(getContext()).executionDao().syncCursor("yuqi_pc") == null
+                    ? 0L
+                    : AlExecutionDatabase.get(getContext()).executionDao().syncCursor("yuqi_pc").ackSeq
+            ));
             return result;
         });
     }
@@ -479,6 +537,22 @@ public final class AlExecutionPlugin extends Plugin {
                 } catch (Exception ignored) {
                     // Ordinary memory-model output is not a bridge checkpoint.
                 }
+            }
+        }
+        DiagnosticEntity bridgeStatus = store.latestBridgeStatus(turn.turnId);
+        if (bridgeStatus != null && bridgeStatus.detail != null && !bridgeStatus.detail.trim().isEmpty()) {
+            try {
+                JSONObject status = new JSONObject(bridgeStatus.detail);
+                result.put("bridgeStatusCode", "BRIDGE_STATUS");
+                result.put("route", status.optString("route", ""));
+                result.put("displayStage", status.optString("displayStage", ""));
+                result.put("technicalStage", status.optString("technicalStage", ""));
+                result.put("stageModel", status.optString("stageModel", ""));
+                result.put("stageEffort", status.optString("stageEffort", ""));
+                result.put("stageElapsedMs", status.optLong("stageElapsedMs", 0L));
+                result.put("totalElapsedMs", status.optLong("totalElapsedMs", 0L));
+            } catch (Exception ignored) {
+                // A malformed progress row stays available in diagnostics without breaking the turn result.
             }
         }
         JSArray parts = new JSArray();

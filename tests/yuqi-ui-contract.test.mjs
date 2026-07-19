@@ -70,3 +70,58 @@ test('native completed replies retain bridge provenance without changing bubble 
   assert.match(html, /replyFallback:\s*result\?\.fallback\s*===\s*true/);
   assert.match(html, /replyAttemptedRoutes:\s*Array\.isArray\(result\?\.attemptedRoutes\)/);
 });
+
+test('Android foreground proactive chat enters the native PROACTIVE_CHAT queue', () => {
+  assert.match(html, /async function\s+queueAndroidProactiveTurn\(/);
+  assert.match(html, /kind:\s*'PROACTIVE_CHAT'/);
+  assert.match(html, /await\s+syncYuqiVisibleHistory\(charId/);
+  const proactive = html.slice(
+    html.indexOf('async function triggerProactiveMessage'),
+    html.indexOf('async function triggerProactiveMoment')
+  );
+  assert.match(proactive, /if\s*\(isNativeApp\(\)\)\s*\{\s*return\s+queueAndroidProactiveTurn/);
+  assert.ok(
+    proactive.indexOf('if (isNativeApp())') < proactive.indexOf('prepareProactiveMemoryPack'),
+    'native delegation must happen before the legacy memory/chat API path'
+  );
+});
+
+test('phone-visible history is ingested before direct and proactive bridge submission', () => {
+  assert.match(html, /async function\s+syncYuqiVisibleHistory\(/);
+  assert.match(plugin, /void\s+ingestVisibleMessages\(PluginCall call\)/);
+  const direct = html.slice(
+    html.indexOf('async function queueAndroidUserReply'),
+    html.indexOf('async function mirrorAppStateNow')
+  );
+  assert.match(direct, /await\s+syncYuqiVisibleHistory\(charId/);
+});
+
+test('Android Service Worker proactive pushes defer to native execution before model calls', () => {
+  const proactiveWorker = worker.slice(
+    worker.indexOf('async function handleProactivePush'),
+    worker.indexOf('async function handleProactiveMomentPush')
+  );
+  assert.match(proactiveWorker, /isAndroidNativeDelivery\(payload\)/);
+  assert.match(proactiveWorker, /AL_NATIVE_PROACTIVE_DUE/);
+  assert.ok(
+    proactiveWorker.indexOf('isAndroidNativeDelivery(payload)') < proactiveWorker.indexOf('callModel('),
+    'Android native guard must run before legacy model generation'
+  );
+});
+
+test('immersive bridge progress uses natural copy while diagnostics retain technical fields', () => {
+  assert.match(html, /function\s+yuqiImmersiveProgressText\(/);
+  assert.match(html, /正在翻一下我们以前说过的话/);
+  assert.match(html, /正在认真想/);
+  assert.match(html, /快好了/);
+  const immersive = html.slice(
+    html.indexOf('function yuqiImmersiveProgressText'),
+    html.indexOf('function stableLegacyVisibleMessageId')
+  );
+  assert.doesNotMatch(immersive, /gpt-|terra|sol|提示词|记忆库/i);
+  assert.match(plugin, /BRIDGE_STATUS/);
+  assert.match(plugin, /stageModel/);
+  assert.match(plugin, /stageEffort/);
+  assert.match(plugin, /stageElapsedMs/);
+  assert.match(plugin, /totalElapsedMs/);
+});

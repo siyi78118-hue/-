@@ -57,7 +57,11 @@ public class BridgeClientTest {
             "{\"ok\":true,\"turnId\":\"turn_phone_1\",\"state\":\"committed\",\"terminal\":true,"
                 + "\"reply\":{\"content\":\"你好呀\",\"origin\":\"codex\"},\"recoveryAckSeq\":0}"));
         MutableTime time = new MutableTime(1784400000000L);
-        BridgeClient client = new BridgeClient(config("http://lan.example"), null, transport, time, time);
+        List<String> statuses = new ArrayList<>();
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport, time, time,
+            (turnId, raw) -> statuses.add(turnId + ":" + statusState(raw))
+        );
 
         BridgeResult result = client.sendLan(directSubmission(1784400000000L));
 
@@ -68,6 +72,9 @@ public class BridgeClientTest {
         assertTrue(transport.targets.get(1).endsWith("/v2/turns/turn_phone_1"));
         assertTrue(transport.targets.get(2).endsWith("/v2/turns/turn_phone_1"));
         assertFalse(transport.nonces.get(1).equals(transport.nonces.get(2)));
+        assertEquals(3, statuses.size());
+        assertEquals("turn_phone_1:queued", statuses.get(0));
+        assertEquals("turn_phone_1:committed", statuses.get(2));
     }
 
     @Test public void bridgeStatusParsesRouteStageModelAndDurations() throws Exception {
@@ -92,6 +99,14 @@ public class BridgeClientTest {
             "turn_phone_1", "yuqi", "msg_phone_1", TurnKind.DIRECT_REPLY,
             "{\"userText\":\"你好\",\"deviceSeq\":1}", "{}", null, createdAt
         );
+    }
+
+    private static String statusState(String raw) {
+        try {
+            return new JSONObject(raw).optString("state");
+        } catch (Exception error) {
+            throw new AssertionError(error);
+        }
     }
 
     private static BridgeConfig config(String lanUrl) {

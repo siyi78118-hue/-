@@ -8,6 +8,7 @@ import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.RawMessageEntity;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import org.junit.Test;
 
@@ -39,6 +40,21 @@ public class RoomBridgeMirrorTest {
         assertEquals("yuqi", inserted.get(0).speakerId);
         assertEquals("character", inserted.get(0).speakerType);
         assertEquals("cloud", inserted.get(0).origin);
+    }
+
+    @Test public void fallbackReplyUsesTheRecoverableFallbackOrigin() throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        RoomBridgeMirror mirror = new RoomBridgeMirror(dao(inserted), "phone_a");
+        TurnSubmission turn = new TurnSubmission(
+            "turn_phone_2", "yuqi", "msg_phone_2", TurnKind.DIRECT_REPLY,
+            "{\"text\":\"你好\"}", "{}", null, 1784400000100L
+        );
+        BridgeResult fallback = BridgeResult.success("chat-api", "我在。")
+            .routed(Arrays.asList("lan", "cloud", "fallback"), true);
+
+        mirror.persistReply(turn, fallback);
+
+        assertEquals("fallback", inserted.get(0).origin);
     }
 
     private static AlExecutionDao dao(List<RawMessageEntity> inserted) {

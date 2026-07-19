@@ -2486,7 +2486,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
   for (const snapshotId of nativeProactiveSnapshotIds(charId, kind, job)) {
     await plugin.saveProactiveSnapshot({ snapshotId, ...record });
   }
-  return true;
+  return { snapshot, record };
 }
 
 function rolePlanSnapshotId(charId, planId) {
@@ -2738,6 +2738,10 @@ function nativePendingStateIsCurrent(chat, userMessage, result) {
     && pending.state === 'running'
     && pending.nativeState === state
     && Number(pending.nativeUpdatedAt) === Number(result?.updatedAt)
+    && String(pending.bridgeDisplayStage || '') === String(result?.displayStage || '')
+    && String(pending.bridgeTechnicalStage || '') === String(result?.technicalStage || '')
+    && Number(pending.bridgeStageElapsedMs || 0) === Number(result?.stageElapsedMs || 0)
+    && Number(pending.bridgeTotalElapsedMs || 0) === Number(result?.totalElapsedMs || 0)
     && userMessage?.replyState === 'pending';
 }
 function nativePendingReplyNeedsSubmission(pending, messageId, queuedIds = nativeReplyQueuedIds) {
@@ -2939,6 +2943,13 @@ async function applyNativeExecutionTurn(result) {
       nativeTurnId: result.turnId,
       nativeState: state,
       nativeUpdatedAt: Number(result.updatedAt) || 0,
+      bridgeRoute: String(result.route || ''),
+      bridgeDisplayStage: String(result.displayStage || ''),
+      bridgeTechnicalStage: String(result.technicalStage || ''),
+      bridgeStageModel: String(result.stageModel || ''),
+      bridgeStageEffort: String(result.stageEffort || ''),
+      bridgeStageElapsedMs: Number(result.stageElapsedMs) || 0,
+      bridgeTotalElapsedMs: Number(result.totalElapsedMs) || 0,
       updatedAt: Date.now()
     };
   }
@@ -2979,6 +2990,87 @@ function startNativeReplyPolling() {
   }, 3000);
 }
 
+function yuqiImmersiveProgressText(pending = {}) {
+  const display = String(pending?.bridgeDisplayStage || pending?.displayStage || '').trim();
+  if (display) return display;
+  const stage = String(pending?.bridgeTechnicalStage || pending?.technicalStage || pending?.nativeState || '').toLowerCase();
+  if (stage.includes('memory')) return '正在翻一下我们以前说过的话…';
+  if (stage.includes('supervisor') || stage.includes('approved') || stage.includes('committing')) return '快好了…';
+  return '正在认真想…';
+}
+
+function stableLegacyVisibleMessageId(charId, message, index) {
+  if (message?.id) return String(message.id).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const source = `${charId}|${message?.role || ''}|${Number(message?.time) || 0}|${String(message?.content || '')}|${index}`;
+  let hash = 2166136261;
+  for (let cursor = 0; cursor < source.length; cursor += 1) {
+    hash ^= source.charCodeAt(cursor);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `msg_legacy_${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+async function syncYuqiVisibleHistory(charId, excludedMessageIds = new Set()) {
+  if (!isNativeApp()) return { saved: false, inserted: 0 };
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.ingestVisibleMessages) return { saved: false, inserted: 0 };
+  const chat = allChats[charId];
+  if (!chat) return { saved: false, inserted: 0 };
+  const messages = (chat.messages || []).flatMap((message, index) => {
+    if (!['user', 'assistant'].includes(message?.role) || !String(message?.content || '').trim()) return [];
+    const messageId = stableLegacyVisibleMessageId(charId, message, index);
+    if (excludedMessageIds.has(messageId) || excludedMessageIds.has(message?.id)) return [];
+    const characterMessage = message.role === 'assistant';
+    if (characterMessage && String(message.sourceTurnId || '').startsWith('native:')) return [];
+    const sourceTurnId = String(message.sourceTurnId || '').replace(/^native:/, '');
+    return [{
+      messageId,
+      turnId: sourceTurnId || `turn_legacy_${messageId}`,
+      speakerId: characterMessage ? charId : 'user',
+      speakerType: characterMessage ? 'character' : 'user',
+      content: String(message.content).trim(),
+      sentAt: Math.max(1, Number(message.time) || Date.now()),
+      origin: characterMessage ? String(message.replyOrigin || 'legacy_fallback') : 'phone'
+    }];
+  });
+  if (!messages.length) return { saved: true, inserted: 0 };
+  return plugin.ingestVisibleMessages({ characterId: charId, messagesJson: JSON.stringify(messages) });
+}
+
+async function queueAndroidProactiveTurn(charId, job = null, triggerMode = 'planned') {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.submitTurn) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
+  await syncYuqiVisibleHistory(charId);
+  const scheduledFor = Math.max(1, Date.parse(job?.dueAt || '') || Date.now());
+  const rawJobId = String(job?.jobId || `manual_${charId}_${scheduledFor}`);
+  const safeJobId = rawJobId.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const turnId = `cloud_${safeJobId}`;
+  const built = await syncNativeProactiveSnapshot(charId, 'chat', {
+    ...(job || {}),
+    jobId: rawJobId,
+    dueAt: new Date(scheduledFor).toISOString(),
+    mode: triggerMode
+  });
+  const result = await plugin.submitTurn({
+    turnId,
+    characterId: charId,
+    sourceMessageId: turnId,
+    kind: 'PROACTIVE_CHAT',
+    cloudJobId: rawJobId,
+    inputJson: JSON.stringify({
+      reason: 'proactive_chat',
+      triggerMode,
+      scheduledFor,
+      deviceSeq: scheduledFor
+    }),
+    snapshotJson: JSON.stringify(built?.snapshot || {}),
+    createdAt: Date.now()
+  });
+  await applyNativeExecutionTurn(result);
+  startNativeReplyPolling();
+  return true;
+}
+
 async function queueAndroidUserReply(charId, userMessageId, options = {}) {
   const chat = allChats[charId];
   const userMessage = messageById(chat, userMessageId);
@@ -2986,6 +3078,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
   if ((chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === userMessageId)) return true;
   const plugin = nativeExecutionPlugin();
   if (!plugin?.submitTurn) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
+  await syncYuqiVisibleHistory(charId, new Set([userMessageId]));
   const task = buildAndroidUserReplyTask(charId, userMessageId, options.userText || chat.pendingReply?.userText || userMessage.content, options, Number(chat.pendingReply?.createdAt) || Date.now());
   const turnId = nativeTurnIdForMessage(userMessageId);
   chat.pendingReply = {
@@ -3053,7 +3146,14 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
 async function mirrorAppStateNow() {
   if (typeof MemoryDB === 'undefined') return;
   const updatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || Date.now();
-  await MemoryDB.setMeta('app_state', { settings, characters, allChats, allMoments, updatedAt });
+  await MemoryDB.setMeta('app_state', {
+    settings,
+    characters,
+    allChats,
+    allMoments,
+    nativeExecution: isNativeApp(),
+    updatedAt
+  });
 }
 async function mirrorAppState() {
   mirrorRequested = true;
@@ -3950,6 +4050,29 @@ function renderDiagnosticMessages(log) {
   if (!rows.length) return '<div class="diagnostic-pre">无最近消息记录</div>';
   return `<div class="diagnostic-pre">${rows.map(m => `${m.role || '?'}: ${m.content || ''}`).map(esc).join('\n')}</div>`;
 }
+function formatNativeDiagnosticRow(row = {}) {
+  const time = row.createdAt ? new Date(row.createdAt).toLocaleString('zh-CN', { hour12: false }) : '未知时间';
+  if (row.code !== 'BRIDGE_STATUS') {
+    return `${time}｜${row.code || 'UNKNOWN'}｜${row.turnId || '-'}${row.detail ? `｜${row.detail}` : ''}`;
+  }
+  try {
+    const status = JSON.parse(row.detail || '{}');
+    const seconds = value => `${Math.round((Number(value) || 0) / 100) / 10}s`;
+    return [
+      time,
+      '桥接进度',
+      row.turnId || '-',
+      status.route ? `通道=${status.route}` : '',
+      status.technicalStage ? `阶段=${status.technicalStage}` : '',
+      status.stageModel ? `模型=${status.stageModel}` : '',
+      status.stageEffort ? `思考=${status.stageEffort}` : '',
+      `本阶段=${seconds(status.stageElapsedMs)}`,
+      `总计=${seconds(status.totalElapsedMs)}`
+    ].filter(Boolean).join('｜');
+  } catch {
+    return `${time}｜桥接进度｜${row.turnId || '-'}｜${row.detail || '状态内容无法解析'}`;
+  }
+}
 async function renderDiagnosticsScreen() {
   const list = document.getElementById('diagnostic-list');
   if (!list) return;
@@ -3976,8 +4099,7 @@ async function renderDiagnosticsScreen() {
       <span class="diagnostic-state ${nativeRows.some(row => row.level === 'ERROR') ? 'state-fail' : ''}">${nativeRows.some(row => row.level === 'ERROR') ? '有错误' : '已记录'}</span>
     </div>
     <div class="diagnostic-pre">${nativeRows.map(row => {
-      const time = row.createdAt ? new Date(row.createdAt).toLocaleString('zh-CN', { hour12: false }) : '未知时间';
-      return `${time}｜${row.code || 'UNKNOWN'}｜${row.turnId || '-'}${row.detail ? `｜${row.detail}` : ''}`;
+      return formatNativeDiagnosticRow(row);
     }).map(esc).join('\n')}</div>
   </div>` : '';
   list.innerHTML = nativeHtml + logs.map((log, index) => {
@@ -6075,9 +6197,9 @@ function appendAssistantPaymentMessage(chat, directive, extra = {}) {
   insertChatMessageChronologically(chat, message);
   return message;
 }
-function renderStreamingDraftHtml(char, content) {
+function renderStreamingDraftHtml(char, content, pendingText = '') {
   const chunks = splitAssistantOutput(cleanStreamingDraftText(content));
-  if (!chunks.length) return '<div class="typing-line" data-streaming-draft="1">对方正在输入...</div>';
+  if (!chunks.length) return `<div class="typing-line" data-streaming-draft="1">${esc(pendingText || '正在认真想…')}</div>`;
   return chunks.map((chunk, index) => {
     const cls = index === chunks.length - 1 ? 'msg-wrap streaming' : 'msg-wrap';
     return `<div class="${cls}" data-streaming-draft="1">${avatarHtml(char, 'msg-avatar')}<div class="bubble">${formatMsg(chunk)}</div></div>`;
@@ -6157,7 +6279,7 @@ function renderMessages(options = {}) {
   if (streamingDraft?.charId === currentCharId) {
     html += renderStreamingDraftHtml(char, streamingDraft.content);
   } else if (pendingReplyMessage(chat) && ['pending', 'running'].includes(chat.pendingReply?.state)) {
-    html += renderStreamingDraftHtml(char, '');
+    html += renderStreamingDraftHtml(char, '', yuqiImmersiveProgressText(chat.pendingReply));
   }
   wrap.innerHTML = html;
   bindMessageActions(wrap);
@@ -8752,6 +8874,13 @@ async function triggerProactiveMessage(charId, manual = false, triggerMode = 'pl
     if (manual) toast('先打开一个有聊天记录的会话');
     return false;
   }
+  if (isNativeApp()) {
+    return queueAndroidProactiveTurn(
+      charId,
+      manual ? null : chat.pendingProactiveJob,
+      manual ? 'manual' : triggerMode
+    );
+  }
   if (!settings.chatApiUrl || !settings.chatApiKey || !settings.chatModel) {
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, '跳过：聊天接口、Key 或模型未配置完整');
     if (manual) toast('请先配置聊天接口和聊天模型');
@@ -9975,6 +10104,9 @@ async function bootApp() {
   let chatStateChanged = false;
   Object.values(allChats || {}).forEach(chat => { chatStateChanged = ensureChatMessageIds(chat) || chatStateChanged; });
   if (chatStateChanged) DB.set('chats', allChats);
+  if (isNativeApp()) {
+    await Promise.allSettled(characters.map(char => syncYuqiVisibleHistory(char.id)));
+  }
   renderPlayerProfile();
   startProactiveLoop();
   startNativeReplyPolling();
@@ -9993,6 +10125,7 @@ async function bootApp() {
       if (event.data?.type === 'al-state-updated') syncFromServiceWorkerState();
       if (event.data?.type === 'al-run-proactive') handleForegroundProactiveRequest(event.data);
       if (event.data?.type === 'al-run-proactive-due') handleForegroundDueProactiveRequest(event.data);
+      if (event.data?.type === 'AL_NATIVE_PROACTIVE_DUE') handleForegroundProactiveRequest(event.data);
     });
   }
   if (document.addEventListener) {

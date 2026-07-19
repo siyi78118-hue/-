@@ -24,6 +24,10 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class BridgeClient {
+    public interface StatusListener {
+        void onStatus(String turnId, String raw);
+    }
+
     interface Transport {
         HttpResult request(String method, String target, String body, String[][] headers) throws Exception;
     }
@@ -43,21 +47,30 @@ public final class BridgeClient {
     private final Transport transport;
     private final Clock clock;
     private final Sleeper sleeper;
+    private final StatusListener statusListener;
 
     public BridgeClient(BridgeConfig config) {
         this(config, null);
     }
 
     public BridgeClient(BridgeConfig config, FallbackJournal journal) {
-        this(config, journal, null, System::currentTimeMillis, Thread::sleep);
+        this(config, journal, null);
     }
 
-    BridgeClient(BridgeConfig config, FallbackJournal journal, Transport transport, Clock clock, Sleeper sleeper) {
+    public BridgeClient(BridgeConfig config, FallbackJournal journal, StatusListener statusListener) {
+        this(config, journal, null, System::currentTimeMillis, Thread::sleep, statusListener);
+    }
+
+    BridgeClient(
+        BridgeConfig config, FallbackJournal journal, Transport transport, Clock clock, Sleeper sleeper,
+        StatusListener statusListener
+    ) {
         this.config = config == null ? BridgeConfig.disabled() : config;
         this.journal = journal;
         this.transport = transport == null ? this::http : transport;
         this.clock = clock == null ? System::currentTimeMillis : clock;
         this.sleeper = sleeper == null ? Thread::sleep : sleeper;
+        this.statusListener = statusListener;
     }
 
     public BridgeRouter.RouteClient lanRoute() { return this::sendLan; }
@@ -71,14 +84,17 @@ public final class BridgeClient {
         HttpResult response = signedLan("POST", path, body);
         requireSuccess(response, "LAN submit");
         BridgeTurnStatus status = BridgeTurnStatus.parse(response.body, submission.turnId);
+        reportStatus(status);
+        acknowledgeRecovery(status);
         while (!status.terminal) {
             sleepForPoll(submission.turnId, deadline, status.retryAfterMs);
             path = "/v2/turns/" + URLEncoder.encode(submission.turnId, "UTF-8");
             response = signedLan("GET", path, "");
             requireSuccess(response, "LAN poll");
             status = BridgeTurnStatus.parse(response.body, submission.turnId);
+            reportStatus(status);
+            acknowledgeRecovery(status);
         }
-        acknowledgeRecovery(status);
         if (status.committed()) return status.toResult("lan");
         throw new BridgeFinalException(status.errorCode, status.allowFallback);
     }
@@ -119,6 +135,7 @@ public final class BridgeClient {
                     JSONObject decoded = new JSONObject(plaintext);
                     if (!submission.turnId.equals(decoded.optString("turnId"))) continue;
                     BridgeTurnStatus status = BridgeTurnStatus.parse(plaintext, submission.turnId);
+                    reportStatus(status);
                     acknowledgeCloud(item.optString("messageId"));
                     acknowledgeRecovery(status);
                     if (status.committed()) return status.toResult("cloud");
@@ -171,6 +188,15 @@ public final class BridgeClient {
 
     private void acknowledgeRecovery(BridgeTurnStatus status) {
         if (journal != null) journal.acknowledge(status.recoveryAckSeq);
+    }
+
+    private void reportStatus(BridgeTurnStatus status) {
+        if (statusListener == null || status == null) return;
+        try {
+            statusListener.onStatus(status.turnId, status.raw);
+        } catch (Exception ignored) {
+            // Progress reporting is observational and must never break reply delivery.
+        }
     }
 
     private static void requireSuccess(HttpResult response, String operation) throws Exception {

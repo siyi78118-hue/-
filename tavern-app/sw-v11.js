@@ -1711,9 +1711,27 @@ async function recoverProactivePushFailure(payload = {}, reason = null) {
   }
 }
 
+function isAndroidNativeDelivery(payload = {}) {
+  return payload.nativeExecution === true
+    || payload.platform === 'android'
+    || payload.delivery === 'native';
+}
+
 async function handleProactivePush(payload) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
+  if (isAndroidNativeDelivery(payload) || state.nativeExecution === true) {
+    await setMeta('pending_native_proactive', { payload, receivedAt: Date.now() });
+    await notifyClients({
+      type: 'AL_NATIVE_PROACTIVE_DUE',
+      charId: payload.charId || '',
+      kind: payload.kind === 'moment' ? 'moment' : 'chat',
+      mode: payload.mode || 'planned',
+      jobId: payload.jobId || '',
+      nativeExecution: true
+    });
+    return true;
+  }
   if (!automaticTasksEnabled(state.settings)) return false;
   const { settings, characters, allChats } = state;
   const traceId = `${payload.kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;

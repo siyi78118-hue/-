@@ -55,6 +55,9 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId ORDER BY sentAt DESC LIMIT :limit")
     List<RawMessageEntity> recentRawMessages(String characterId, int limit);
 
+    @Query("SELECT * FROM yuqi_raw_messages WHERE messageId = :messageId LIMIT 1")
+    RawMessageEntity rawMessage(String messageId);
+
     @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId AND syncSeq > :afterSeq ORDER BY syncSeq ASC, messageId ASC LIMIT :limit")
     List<RawMessageEntity> rawMessagesAfterSync(String characterId, long afterSeq, int limit);
 
@@ -260,6 +263,9 @@ public interface AlExecutionDao {
 
     @Query("SELECT * FROM diagnostics ORDER BY createdAt DESC, diagnosticId DESC LIMIT :limit")
     List<DiagnosticEntity> latestDiagnostics(int limit);
+
+    @Query("SELECT * FROM diagnostics WHERE turnId = :turnId AND code = 'BRIDGE_STATUS' ORDER BY createdAt DESC, diagnosticId DESC LIMIT 1")
+    DiagnosticEntity latestBridgeStatus(String turnId);
 
     @Transaction
     default void commitReply(

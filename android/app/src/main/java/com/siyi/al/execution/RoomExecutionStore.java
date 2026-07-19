@@ -195,6 +195,10 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return dao.latestDiagnostics(Math.max(1, Math.min(limit, 500)));
     }
 
+    public DiagnosticEntity latestBridgeStatus(String turnId) {
+        return dao.latestBridgeStatus(turnId);
+    }
+
     public void recordDiagnostic(
         String turnId,
         String attemptId,

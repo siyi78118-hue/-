@@ -49,7 +49,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.recipientId = "user";
         entity.content = result.replyText;
         entity.sentAt = System.currentTimeMillis();
-        entity.origin = result.origin;
+        entity.origin = result.fallback ? "fallback" : result.origin;
         entity.deviceId = result.fallback ? deviceId + ":fallback" : "pc:" + deviceId;
         entity.deviceSeq = Math.max(1L, entity.sentAt);
         entity.checksum = sha256(canonical(entity));

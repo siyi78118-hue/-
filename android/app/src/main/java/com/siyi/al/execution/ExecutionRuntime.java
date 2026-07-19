@@ -26,7 +26,13 @@ final class ExecutionRuntime {
         gateway.setBridgeRouterProvider(() -> {
             BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
             FallbackJournal fallbackJournal = new FallbackJournal(database.executionDao(), bridgeConfig.deviceId);
-            BridgeClient bridgeClient = new BridgeClient(bridgeConfig, fallbackJournal);
+            BridgeClient bridgeClient = new BridgeClient(
+                bridgeConfig,
+                fallbackJournal,
+                (turnId, raw) -> store.recordDiagnostic(
+                    turnId, null, "INFO", "BRIDGE_STATUS", raw, System.currentTimeMillis()
+                )
+            );
             return new BridgeRouter(
                 bridgeConfig,
                 bridgeClient.lanRoute(),
