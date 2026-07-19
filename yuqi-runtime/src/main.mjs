@@ -9,6 +9,7 @@ import { YuqiOrchestrator } from './orchestrator.mjs';
 import { PresetRegistry } from './preset-registry.mjs';
 import { YuqiReconciler } from './reconcile.mjs';
 import { YuqiStore } from './store.mjs';
+import { createSystemCloudFetch } from '../../scripts/cloud-http.mjs';
 
 const runtimeDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const configPath = resolve(process.argv[2] || join(runtimeDir, 'config.json'));
@@ -35,7 +36,8 @@ const cloudPump = config.cloudRelay?.enabled ? new CloudRelayPump({
   deviceToken: config.cloudRelay.deviceToken,
   encryptionKeyBase64: config.cloudRelay.encryptionKeyBase64,
   orchestrator,
-  reconciler
+  reconciler,
+  fetchImpl: createSystemCloudFetch()
 }) : null;
 
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });

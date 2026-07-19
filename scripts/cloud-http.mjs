@@ -64,3 +64,27 @@ export async function requestCloudJson(url, options = {}, dependencies = {}) {
   if (!response.ok) throw new Error(`Cloud HTTP request failed (${response.status})`);
   return responseBody;
 }
+
+export function createSystemCloudFetch(dependencies = {}) {
+  return async function systemCloudFetch(url, options = {}) {
+    let body;
+    if (options.body !== undefined && options.body !== null) {
+      if (typeof options.body === 'string') {
+        try { body = JSON.parse(options.body); } catch { body = options.body; }
+      } else {
+        body = options.body;
+      }
+    }
+    const requestOptions = {
+      method: options.method || 'GET',
+      headers: Object.fromEntries(new Headers(options.headers || {}).entries()),
+      timeoutMs: Number(options.timeoutMs || 30_000),
+      ...(body === undefined ? {} : { body })
+    };
+    const payload = await requestCloudJson(String(url), requestOptions, dependencies);
+    return new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    });
+  };
+}

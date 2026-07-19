@@ -6,7 +6,7 @@ import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 
 import { createMemorySnapshot } from '../scripts/backup-yuqi-memory.mjs';
-import { requestCloudJson } from '../scripts/cloud-http.mjs';
+import { createSystemCloudFetch, requestCloudJson } from '../scripts/cloud-http.mjs';
 import { buildPairingBundle, findLanAddress, setupYuqiRuntime } from '../scripts/setup-yuqi-runtime.mjs';
 import { resolveWranglerInvocation } from '../scripts/wrangler-invocation.mjs';
 
@@ -155,6 +155,27 @@ test('cloud round-trip verifier encrypts a non-chat probe and acknowledges it', 
   assert.match(verifier, /direction: 'pc_to_phone'/);
   assert.match(verifier, /\/bridge\/ack/);
   assert.match(verifier, /plaintextFieldsStored: false/);
+});
+
+test('runtime cloud pump receives the Windows system-network fetch adapter', async () => {
+  let capturedInput = '';
+  const fetchImpl = createSystemCloudFetch({
+    platform: 'win32',
+    spawnSync: (_command, _args, options) => {
+      capturedInput = options.input;
+      return { status: 0, stdout: '{"ok":true}', stderr: '' };
+    }
+  });
+  const response = await fetchImpl('https://example.workers.dev/bridge/enqueue', {
+    method: 'POST',
+    headers: { authorization: 'Bearer device-token' },
+    body: JSON.stringify({ deviceId: 'device-a' })
+  });
+  assert.equal(response.ok, true);
+  assert.equal((await response.json()).ok, true);
+  assert.deepEqual(JSON.parse(JSON.parse(capturedInput).body), { deviceId: 'device-a' });
+  const main = readFileSync('yuqi-runtime/src/main.mjs', 'utf8');
+  assert.match(main, /fetchImpl: createSystemCloudFetch\(\)/);
 });
 
 test('Android permits cleartext only for the generated private LAN host', () => {
