@@ -64,7 +64,10 @@ export class YuqiReconciler {
       if (!before) imported.push(saved);
     }
 
-    const fallbackReplies = imported.filter(message => message.speakerType === 'character' && message.origin === 'fallback');
+    const fallbackReplies = imported.filter(message =>
+      message.speakerType === 'character'
+      && ['fallback', 'legacy_fallback'].includes(message.origin)
+    );
     const fallbackTurns = [...new Set(fallbackReplies.map(message => message.turnId))];
     let suppressedReplies = 0;
     for (const reply of fallbackReplies) {
@@ -82,7 +85,11 @@ export class YuqiReconciler {
           rule: 'Read exact raw messages, preserve speaker attribution, and propose evidence-backed facts. Do not draft or resend a chat reply.',
           fallbackTurnIds: fallbackTurns,
           exactRawMessages
-        }), { clientUserMessageId: `reconcile_${peerId}_${pending.at(-1).seq}` });
+        }), {
+          clientUserMessageId: `reconcile_${peerId}_${pending.at(-1).seq}`,
+          model: 'gpt-5.6-sol',
+          effort: 'medium'
+        });
         const parsed = parseRoleJson(response.text);
         commitVerifiedFacts(this.store, Array.isArray(parsed.candidates) ? parsed.candidates : [], exactRawMessages);
       }

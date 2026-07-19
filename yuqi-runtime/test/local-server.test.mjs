@@ -199,3 +199,50 @@ test('v2 accepts a background turn immediately and exposes signed polling status
     await server.close();
   }
 });
+
+test('v2 reconciles phone-only messages before accepting the new turn', async () => {
+  const events = [];
+  const stored = {
+    turnId: 'turn_phone_async_recovery', state: 'queued', origin: 'codex', route: 'fast',
+    routeReasons: [], replyJson: null, errorJson: null, createdAt: 1784400000000, updatedAt: 1784400000000
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { getTurn: () => stored, getTurnStages: () => [], getSyncDelta: () => [], ackSync: () => 0 },
+    reconciler: {
+      async reconcileFrom(packet) {
+        events.push(`reconcile:${packet.peerId}`);
+        return { ackSeq: 23 };
+      }
+    },
+    dispatcher: {
+      accept(value) {
+        events.push(`turn:${value.turnId}`);
+        return stored;
+      }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const result = await call(server.address().port, {
+      method: 'POST', path: '/v2/turns', secret: 'test-pairing-secret', nonce: 'v2-recovery',
+      body: {
+        protocolVersion: 2,
+        turnId: stored.turnId,
+        characterId: 'yuqi', deviceId: 'phone_a', deviceSeq: 24, createdAt: 1784400000000,
+        kind: 'DIRECT_REPLY',
+        message: {
+          messageId: 'msg_phone_async_recovery', speakerId: 'user', speakerType: 'user',
+          recipientId: 'yuqi', content: '继续说', sentAt: 1784400000000
+        },
+        recovery: { peerId: 'phone_a', lastCommonSeq: 20, entries: [] }
+      }
+    });
+    assert.equal(result.status, 202);
+    assert.equal(result.body.recoveryAckSeq, 23);
+    assert.deepEqual(events, ['reconcile:phone_a', `turn:${stored.turnId}`]);
+  } finally {
+    await server.close();
+  }
+});

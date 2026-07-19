@@ -47,8 +47,8 @@ function fallbackBatch() {
 test('replays exact fallback messages through memory and never creates a second reply', async () => withStore(async store => {
   const roleCalls = [];
   const codex = {
-    async runTurn(role, input) {
-      roleCalls.push({ role, input: JSON.parse(input) });
+      async runTurn(role, input, options) {
+        roleCalls.push({ role, input: JSON.parse(input), options });
       return { text: JSON.stringify({ candidates: [] }) };
     }
   };
@@ -59,9 +59,38 @@ test('replays exact fallback messages through memory and never creates a second 
   assert.deepEqual(result.deliverReplies, []);
   assert.deepEqual(result.reconciledFallbackTurns, ['turn_phone_11']);
   assert.deepEqual(roleCalls.map(call => call.role), ['memory']);
+  assert.equal(roleCalls[0].options.model, 'gpt-5.6-sol');
+  assert.equal(roleCalls[0].options.effort, 'medium');
   assert.equal(roleCalls[0].input.exactRawMessages[0].speakerId, 'user');
   assert.equal(roleCalls[0].input.exactRawMessages[1].speakerId, 'yuqi');
   assert.equal(store.getSyncCursor('phone_a'), 12);
+}));
+
+test('reconciles legacy frontend fallback messages as character memory without drafting a reply', async () => withStore(async store => {
+  const calls = [];
+  const reconciler = new YuqiReconciler({
+    store,
+    codex: {
+      async runTurn(role, input) {
+        calls.push({ role, input: JSON.parse(input) });
+        return { text: '{"candidates":[]}' };
+      }
+    }
+  });
+  const legacy = messageEntry(21, {
+    messageId: 'msg_legacy_0241', turnId: 'turn_legacy_0241', characterId: 'yuqi',
+    speakerId: 'yuqi', speakerType: 'character', recipientId: 'user',
+    content: '猜错了也没关系，就是突然好奇', sentAt: 1784496060000,
+    origin: 'legacy_fallback', deviceId: 'phone_a:legacy', deviceSeq: 21
+  });
+
+  const result = await reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 20, entries: [legacy] });
+
+  assert.equal(result.importedMessages, 1);
+  assert.deepEqual(result.deliverReplies, []);
+  assert.deepEqual(calls.map(call => call.role), ['memory']);
+  assert.equal(calls[0].input.exactRawMessages[0].speakerId, 'yuqi');
+  assert.equal(store.getMessage('msg_legacy_0241').origin, 'legacy_fallback');
 }));
 
 test('duplicate recovery batches are idempotent and do not rerun memory', async () => withStore(async store => {

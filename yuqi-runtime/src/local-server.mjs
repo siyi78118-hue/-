@@ -107,11 +107,21 @@ export function createYuqiServer({
       if (!dispatcher || typeof dispatcher.accept !== 'function') {
         return json(response, 503, { ok: false, error: 'turn dispatcher is unavailable' });
       }
+      let recoveryAckSeq = 0;
+      if (reconciler && body?.recovery && Array.isArray(body.recovery.entries)) {
+        const recovery = await reconciler.reconcileFrom(body.recovery);
+        recoveryAckSeq = Number(recovery.ackSeq || 0);
+      }
       const turn = dispatcher.accept(body);
       const status = publicTurnStatus(turn, {
         stages: typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : []
       });
-      return json(response, status.terminal ? 200 : 202, { ok: true, accepted: true, ...status });
+      return json(response, status.terminal ? 200 : 202, {
+        ok: true,
+        accepted: true,
+        ...status,
+        recoveryAckSeq
+      });
     }
     const v2TurnMatch = /^\/v2\/turns\/([^/]+)$/.exec(url.pathname);
     if (request.method === 'GET' && v2TurnMatch) {
