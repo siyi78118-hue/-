@@ -143,10 +143,12 @@ test('Windows cloud requests keep registration secrets out of process arguments'
   assert.match(captured.input, /top-secret/);
 });
 
-test('runtime verifier uses the system cloud transport and requires cloud health when enabled', () => {
+test('runtime verifier is deterministic and covers cloud relay plus Android contracts', () => {
   const verifier = readFileSync('scripts/verify-yuqi-runtime.mjs', 'utf8');
-  assert.match(verifier, /requestCloudJson/);
-  assert.match(verifier, /!config\.cloudRelay\.enabled \|\| cloudRelayReady/);
+  assert.match(verifier, /'relay-tests'/);
+  assert.match(verifier, /'android-jvm-tests'/);
+  assert.match(verifier, /'protocol-v2-contract'/);
+  assert.doesNotMatch(verifier, /deviceToken|pairingSecret/);
 });
 
 test('cloud round-trip verifier encrypts a non-chat probe and acknowledges it', () => {
@@ -176,7 +178,8 @@ test('runtime cloud pump receives the Windows system-network fetch adapter', asy
   assert.equal((await response.json()).ok, true);
   assert.deepEqual(JSON.parse(JSON.parse(capturedInput).body), { deviceId: 'device-a' });
   const main = readFileSync('yuqi-runtime/src/main.mjs', 'utf8');
-  assert.match(main, /fetchImpl: createSystemCloudFetch\(\)/);
+  assert.match(main, /const cloudFetch = config\.cloudRelay\?\.enabled \? createSystemCloudFetch\(\) : null/);
+  assert.equal((main.match(/fetchImpl: cloudFetch/g) || []).length, 2);
 });
 
 test('Android permits cleartext only for the generated private LAN host', () => {
