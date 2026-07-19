@@ -13,6 +13,7 @@ public final class BridgeConfig {
     public final int readTimeoutMs;
     public final int cloudPollAttempts;
     public final int cloudPollIntervalMs;
+    public final int turnDeadlineMs;
 
     public BridgeConfig(
         boolean enabled,
@@ -28,6 +29,26 @@ public final class BridgeConfig {
         int cloudPollAttempts,
         int cloudPollIntervalMs
     ) {
+        this(enabled, mode, lanUrl, cloudUrl, deviceId, pairingSecret, deviceToken,
+            encryptionKeyBase64, connectTimeoutMs, readTimeoutMs, cloudPollAttempts,
+            cloudPollIntervalMs, 1_200_000);
+    }
+
+    public BridgeConfig(
+        boolean enabled,
+        BridgeMode mode,
+        String lanUrl,
+        String cloudUrl,
+        String deviceId,
+        String pairingSecret,
+        String deviceToken,
+        String encryptionKeyBase64,
+        int connectTimeoutMs,
+        int readTimeoutMs,
+        int cloudPollAttempts,
+        int cloudPollIntervalMs,
+        int turnDeadlineMs
+    ) {
         this.enabled = enabled;
         this.mode = mode == null ? BridgeMode.AUTO : mode;
         this.lanUrl = trimTrailingSlash(lanUrl);
@@ -40,6 +61,7 @@ public final class BridgeConfig {
         this.readTimeoutMs = clamp(readTimeoutMs, 500, 180_000, 90_000);
         this.cloudPollAttempts = clamp(cloudPollAttempts, 1, 240, 60);
         this.cloudPollIntervalMs = clamp(cloudPollIntervalMs, 100, 10_000, 1_000);
+        this.turnDeadlineMs = clamp(turnDeadlineMs, 60_000, 3_600_000, 1_200_000);
     }
 
     public static BridgeConfig disabled() {

@@ -29,4 +29,36 @@ final class BridgeInput {
     static long deviceSeq(TurnSubmission submission) throws Exception {
         return source(submission).optLong("deviceSeq", Math.max(1L, submission.createdAt));
     }
+
+    static JSONObject envelope(TurnSubmission submission, BridgeConfig config) throws Exception {
+        JSONObject envelope = new JSONObject()
+            .put("protocolVersion", 2)
+            .put("turnId", submission.turnId)
+            .put("characterId", submission.characterId)
+            .put("deviceId", config.deviceId)
+            .put("deviceSeq", deviceSeq(submission))
+            .put("createdAt", Math.max(1L, submission.createdAt))
+            .put("kind", submission.kind.name());
+        if (submission.kind == com.siyi.al.execution.TurnKind.DIRECT_REPLY) {
+            envelope.put("message", userMessage(submission));
+            return envelope;
+        }
+
+        JSONObject input = source(submission);
+        JSONObject snapshot = new JSONObject(submission.snapshotJson);
+        String triggerId = submission.sourceMessageId.startsWith("trigger_")
+            ? submission.sourceMessageId
+            : "trigger_" + submission.sourceMessageId;
+        JSONObject context = new JSONObject()
+            .put("input", input)
+            .put("snapshot", snapshot);
+        if (submission.cloudJobId != null) context.put("cloudJobId", submission.cloudJobId);
+        envelope.put("trigger", new JSONObject()
+            .put("triggerId", triggerId)
+            .put("triggerType", submission.kind.name().toLowerCase(java.util.Locale.ROOT))
+            .put("scheduledFor", Math.max(1L, input.optLong("scheduledFor", submission.createdAt)))
+            .put("executedAt", Math.max(1L, submission.createdAt))
+            .put("context", context));
+        return envelope;
+    }
 }

@@ -21,17 +21,40 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class BridgeClient {
+    interface Transport {
+        HttpResult request(String method, String target, String body, String[][] headers) throws Exception;
+    }
+
+    interface Clock { long now(); }
+    interface Sleeper { void sleep(long millis) throws Exception; }
+
+    static final class HttpResult {
+        final int status;
+        final String body;
+        HttpResult(int status, String body) { this.status = status; this.body = body; }
+    }
+
     private static final SecureRandom RANDOM = new SecureRandom();
     private final BridgeConfig config;
     private final FallbackJournal journal;
+    private final Transport transport;
+    private final Clock clock;
+    private final Sleeper sleeper;
 
     public BridgeClient(BridgeConfig config) {
         this(config, null);
     }
 
     public BridgeClient(BridgeConfig config, FallbackJournal journal) {
+        this(config, journal, null, System::currentTimeMillis, Thread::sleep);
+    }
+
+    BridgeClient(BridgeConfig config, FallbackJournal journal, Transport transport, Clock clock, Sleeper sleeper) {
         this.config = config == null ? BridgeConfig.disabled() : config;
         this.journal = journal;
+        this.transport = transport == null ? this::http : transport;
+        this.clock = clock == null ? System::currentTimeMillis : clock;
+        this.sleeper = sleeper == null ? Thread::sleep : sleeper;
     }
 
     public BridgeRouter.RouteClient lanRoute() { return this::sendLan; }
@@ -39,21 +62,27 @@ public final class BridgeClient {
 
     public BridgeResult sendLan(TurnSubmission submission) throws Exception {
         if (!config.hasLan()) throw new IllegalStateException("LAN bridge is not configured");
-        String path = "/v1/turns";
+        long deadline = deadline(submission);
+        String path = "/v2/turns";
         String body = wireEnvelope(submission).toString();
-        long timestamp = System.currentTimeMillis();
-        String nonce = UUID.randomUUID().toString().replace("-", "");
-        HttpResult response = http("POST", config.lanUrl + path, body, new String[][] {
-            {"X-Yuqi-Timestamp", Long.toString(timestamp)},
-            {"X-Yuqi-Nonce", nonce},
-            {"X-Yuqi-Signature", signLanRequest(config.pairingSecret, "POST", path, timestamp, nonce, body)}
-        });
-        if (response.status < 200 || response.status >= 300) throw new IllegalStateException("LAN bridge HTTP " + response.status);
-        return parseRuntimeReply("lan", response.body);
+        HttpResult response = signedLan("POST", path, body);
+        requireSuccess(response, "LAN submit");
+        BridgeTurnStatus status = BridgeTurnStatus.parse(response.body, submission.turnId);
+        while (!status.terminal) {
+            sleepForPoll(deadline, status.retryAfterMs);
+            path = "/v2/turns/" + URLEncoder.encode(submission.turnId, "UTF-8");
+            response = signedLan("GET", path, "");
+            requireSuccess(response, "LAN poll");
+            status = BridgeTurnStatus.parse(response.body, submission.turnId);
+        }
+        acknowledgeRecovery(status);
+        if (status.committed()) return status.toResult("lan");
+        throw new IllegalStateException("LAN bridge final failure: " + status.errorCode);
     }
 
     public BridgeResult sendCloud(TurnSubmission submission) throws Exception {
         if (!config.hasCloud()) throw new IllegalStateException("cloud bridge is not configured");
+        long deadline = deadline(submission);
         JSONObject wire = wireEnvelope(submission);
         Encrypted encrypted = encrypt(wire.toString());
         String relayMessageId = "relay_" + sha256(submission.turnId).substring(0, 24);
@@ -64,38 +93,45 @@ public final class BridgeClient {
             .put("direction", "phone_to_pc")
             .put("ciphertext", encrypted.ciphertext)
             .put("nonce", encrypted.nonce)
-            .put("expiresAt", System.currentTimeMillis() + 24L * 60L * 60L * 1000L);
-        HttpResult enqueued = http("POST", config.cloudUrl + "/bridge/enqueue", enqueue.toString(), bearerHeaders());
-        if (enqueued.status < 200 || enqueued.status >= 300) throw new IllegalStateException("cloud enqueue HTTP " + enqueued.status);
+            .put("expiresAt", clock.now() + 24L * 60L * 60L * 1000L);
+        HttpResult enqueued = transport.request(
+            "POST", config.cloudUrl + "/bridge/enqueue", enqueue.toString(), bearerHeaders()
+        );
+        requireSuccess(enqueued, "cloud enqueue");
 
         String encodedDevice = URLEncoder.encode(config.deviceId, "UTF-8");
-        for (int attempt = 0; attempt < config.cloudPollAttempts; attempt += 1) {
-            HttpResult polled = http("GET", config.cloudUrl + "/bridge/poll?deviceId=" + encodedDevice + "&direction=pc_to_phone&limit=50", "", bearerHeaders());
-            if (polled.status >= 200 && polled.status < 300) {
-                JSONArray messages = new JSONObject(polled.body).optJSONArray("messages");
-                if (messages != null) {
-                    for (int index = 0; index < messages.length(); index += 1) {
-                        JSONObject item = messages.optJSONObject(index);
-                        if (item == null) continue;
-                        String plaintext;
-                        try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
-                        catch (Exception ignored) { continue; }
-                        JSONObject decoded = new JSONObject(plaintext);
-                        if (!submission.turnId.equals(decoded.optString("turnId"))) {
-                            acknowledgeCloud(item.optString("messageId"));
-                            continue;
-                        }
-                        acknowledgeCloud(item.optString("messageId"));
-                        return parseRuntimeReply("cloud", plaintext);
+        String pollTarget = config.cloudUrl + "/bridge/poll?deviceId=" + encodedDevice
+            + "&direction=pc_to_phone&limit=50";
+        while (clock.now() < deadline) {
+            HttpResult polled = transport.request("GET", pollTarget, "", bearerHeaders());
+            requireSuccess(polled, "cloud poll");
+            JSONArray messages = new JSONObject(polled.body).optJSONArray("messages");
+            if (messages != null) {
+                for (int index = 0; index < messages.length(); index += 1) {
+                    JSONObject item = messages.optJSONObject(index);
+                    if (item == null) continue;
+                    String plaintext;
+                    try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
+                    catch (Exception ignored) { continue; }
+                    JSONObject decoded = new JSONObject(plaintext);
+                    if (!submission.turnId.equals(decoded.optString("turnId"))) continue;
+                    BridgeTurnStatus status = BridgeTurnStatus.parse(plaintext, submission.turnId);
+                    acknowledgeCloud(item.optString("messageId"));
+                    acknowledgeRecovery(status);
+                    if (status.committed()) return status.toResult("cloud");
+                    if (status.failedFinal()) {
+                        throw new IllegalStateException("cloud bridge final failure: " + status.errorCode);
                     }
                 }
             }
-            if (attempt + 1 < config.cloudPollAttempts) Thread.sleep(config.cloudPollIntervalMs);
+            sleepForPoll(deadline, config.cloudPollIntervalMs);
         }
-        throw new IllegalStateException("cloud bridge reply timed out");
+        throw new IllegalStateException("cloud bridge reply deadline exceeded");
     }
 
-    public static String signLanRequest(String secret, String method, String path, long timestamp, String nonce, String body) throws Exception {
+    public static String signLanRequest(
+        String secret, String method, String path, long timestamp, String nonce, String body
+    ) throws Exception {
         String canonical = timestamp + "\n" + nonce + "\n" + method.toUpperCase() + "\n" + path + "\n" + sha256(body);
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
@@ -103,34 +139,51 @@ public final class BridgeClient {
     }
 
     private JSONObject wireEnvelope(TurnSubmission submission) throws Exception {
-        JSONObject message = BridgeInput.userMessage(submission);
-        JSONObject envelope = new JSONObject()
-            .put("protocolVersion", 1)
-            .put("turnId", submission.turnId)
-            .put("characterId", submission.characterId)
-            .put("deviceId", config.deviceId)
-            .put("deviceSeq", BridgeInput.deviceSeq(submission))
-            .put("createdAt", Math.max(1L, submission.createdAt))
-            .put("message", message);
+        JSONObject envelope = BridgeInput.envelope(submission, config);
         if (journal != null) envelope.put("recovery", journal.pendingPacket(1000));
         return envelope;
     }
 
-    private BridgeResult parseRuntimeReply(String origin, String raw) throws Exception {
-        JSONObject root = new JSONObject(raw);
-        if (journal != null) journal.acknowledge(root.optLong("recoveryAckSeq", 0L));
-        JSONObject reply = root.optJSONObject("reply");
-        if (reply == null && root.optJSONObject("result") != null) reply = root.optJSONObject("result").optJSONObject("reply");
-        String content = reply == null ? root.optString("replyText", "") : reply.optString("content", "");
-        if (content.trim().isEmpty()) throw new IllegalStateException("runtime reply content is empty");
-        return BridgeResult.success(origin, content, raw);
+    private HttpResult signedLan(String method, String path, String body) throws Exception {
+        long timestamp = clock.now();
+        String nonce = UUID.randomUUID().toString().replace("-", "");
+        return transport.request(method, config.lanUrl + path, body, new String[][] {
+            {"X-Yuqi-Timestamp", Long.toString(timestamp)},
+            {"X-Yuqi-Nonce", nonce},
+            {"X-Yuqi-Signature", signLanRequest(config.pairingSecret, method, path, timestamp, nonce, body)}
+        });
+    }
+
+    private long deadline(TurnSubmission submission) {
+        long createdAt = Math.max(1L, submission.createdAt);
+        long result = createdAt + (long) config.turnDeadlineMs;
+        return result < createdAt ? Long.MAX_VALUE : result;
+    }
+
+    private void sleepForPoll(long deadline, long requestedMs) throws Exception {
+        long remaining = deadline - clock.now();
+        if (remaining <= 0L) throw new IllegalStateException("bridge turn deadline exceeded");
+        sleeper.sleep(Math.min(remaining, Math.max(1L, requestedMs)));
+    }
+
+    private void acknowledgeRecovery(BridgeTurnStatus status) {
+        if (journal != null) journal.acknowledge(status.recoveryAckSeq);
+    }
+
+    private static void requireSuccess(HttpResult response, String operation) {
+        if (response.status < 200 || response.status >= 300) {
+            throw new IllegalStateException(operation + " HTTP " + response.status);
+        }
     }
 
     private void acknowledgeCloud(String messageId) throws Exception {
         if (messageId.isEmpty()) return;
-        JSONObject ack = new JSONObject().put("deviceId", config.deviceId).put("messageIds", new JSONArray().put(messageId));
-        HttpResult response = http("POST", config.cloudUrl + "/bridge/ack", ack.toString(), bearerHeaders());
-        if (response.status < 200 || response.status >= 300) throw new IllegalStateException("cloud ack HTTP " + response.status);
+        JSONObject ack = new JSONObject().put("deviceId", config.deviceId)
+            .put("messageIds", new JSONArray().put(messageId));
+        HttpResult response = transport.request(
+            "POST", config.cloudUrl + "/bridge/ack", ack.toString(), bearerHeaders()
+        );
+        requireSuccess(response, "cloud ack");
     }
 
     private String[][] bearerHeaders() {
@@ -145,7 +198,10 @@ public final class BridgeClient {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
         byte[] ciphertext = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
-        return new Encrypted(Base64.encodeToString(ciphertext, Base64.NO_WRAP), Base64.encodeToString(nonce, Base64.NO_WRAP));
+        return new Encrypted(
+            Base64.encodeToString(ciphertext, Base64.NO_WRAP),
+            Base64.encodeToString(nonce, Base64.NO_WRAP)
+        );
     }
 
     private String decrypt(String ciphertextBase64, String nonceBase64) throws Exception {
@@ -197,11 +253,5 @@ public final class BridgeClient {
         final String ciphertext;
         final String nonce;
         Encrypted(String ciphertext, String nonce) { this.ciphertext = ciphertext; this.nonce = nonce; }
-    }
-
-    private static final class HttpResult {
-        final int status;
-        final String body;
-        HttpResult(int status, String body) { this.status = status; this.body = body; }
     }
 }

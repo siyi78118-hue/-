@@ -71,6 +71,7 @@ public final class AlSecretStore {
         put("yuqi-bridge", "readTimeoutMs", Integer.toString(config.readTimeoutMs));
         put("yuqi-bridge", "cloudPollAttempts", Integer.toString(config.cloudPollAttempts));
         put("yuqi-bridge", "cloudPollIntervalMs", Integer.toString(config.cloudPollIntervalMs));
+        put("yuqi-bridge", "turnDeadlineMs", Integer.toString(config.turnDeadlineMs));
     }
 
     public synchronized BridgeConfig loadBridgeConfig() {
@@ -88,7 +89,8 @@ public final class AlSecretStore {
             parseInt(get("yuqi-bridge", "connectTimeoutMs"), 1200),
             parseInt(get("yuqi-bridge", "readTimeoutMs"), 90000),
             parseInt(get("yuqi-bridge", "cloudPollAttempts"), 60),
-            parseInt(get("yuqi-bridge", "cloudPollIntervalMs"), 1000)
+            parseInt(get("yuqi-bridge", "cloudPollIntervalMs"), 1000),
+            parseInt(get("yuqi-bridge", "turnDeadlineMs"), 1200000)
         );
     }
 

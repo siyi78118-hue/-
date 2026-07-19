@@ -96,7 +96,8 @@ public final class AlExecutionPlugin extends Plugin {
                 integer(call, "connectTimeoutMs", current.connectTimeoutMs),
                 integer(call, "readTimeoutMs", current.readTimeoutMs),
                 integer(call, "cloudPollAttempts", current.cloudPollAttempts),
-                integer(call, "cloudPollIntervalMs", current.cloudPollIntervalMs)
+                integer(call, "cloudPollIntervalMs", current.cloudPollIntervalMs),
+                integer(call, "turnDeadlineMs", current.turnDeadlineMs)
             );
             secrets.saveBridgeConfig(config);
             return bridgeConfigResult(config);
@@ -527,6 +528,7 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("readTimeoutMs", config.readTimeoutMs);
         result.put("cloudPollAttempts", config.cloudPollAttempts);
         result.put("cloudPollIntervalMs", config.cloudPollIntervalMs);
+        result.put("turnDeadlineMs", config.turnDeadlineMs);
         return result;
     }
 
