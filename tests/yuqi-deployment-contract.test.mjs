@@ -152,6 +152,7 @@ test('runtime verifier uses the system cloud transport and requires cloud health
 test('cloud round-trip verifier encrypts a non-chat probe and acknowledges it', () => {
   const verifier = readFileSync('scripts/verify-yuqi-cloud-roundtrip.mjs', 'utf8');
   assert.match(verifier, /encryptRelayPayload/);
+  assert.match(verifier, /createSystemCloudFetch/);
   assert.match(verifier, /direction: 'pc_to_phone'/);
   assert.match(verifier, /\/bridge\/ack/);
   assert.match(verifier, /plaintextFieldsStored: false/);

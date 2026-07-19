@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { requestCloudJson } from './cloud-http.mjs';
+import { createSystemCloudFetch } from './cloud-http.mjs';
 import { decryptRelayPayload, encryptRelayPayload } from '../yuqi-runtime/src/cloud-relay-pump.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -25,6 +25,17 @@ const headers = {
 };
 let enqueued = false;
 let deleted = false;
+const cloudFetch = createSystemCloudFetch();
+
+async function requestCloudJson(url, options = {}) {
+  const response = await cloudFetch(url, {
+    method: options.method || 'GET',
+    headers: options.headers || {},
+    ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) })
+  });
+  if (!response.ok) throw new Error(`cloud HTTP request failed (${response.status})`);
+  return response.json();
+}
 
 async function acknowledge() {
   const result = await requestCloudJson(`${baseUrl}/bridge/ack`, {
