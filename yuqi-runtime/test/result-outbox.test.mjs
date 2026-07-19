@@ -98,3 +98,40 @@ test('persists a terminal cloud reply until relay delivery succeeds without leak
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('delivers a LAN-accepted terminal turn through Cloud later without changing the turn or duplicating the reply', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yuqi-cross-route-'));
+  const store = new YuqiStore(join(dir, 'runtime.sqlite'));
+  try {
+    const accepted = store.submitTurn(envelope());
+    commit(store, accepted.turnId);
+    const beforeCloud = store.getTurn(accepted.turnId);
+
+    store.registerCloudDelivery(accepted.turnId, 'phone_cloud', 88);
+    const deliveries = [];
+    const outbox = new ResultOutbox({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+      deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+      fetchImpl: async (_url, options) => {
+        deliveries.push(JSON.parse(options.body));
+        return Response.json({ ok: true }, { status: 201 });
+      }
+    });
+
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 1, failed: 0, waiting: 0 });
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 0, waiting: 0 });
+    assert.equal(deliveries.length, 1);
+
+    const afterCloud = store.getTurn(accepted.turnId);
+    assert.equal(afterCloud.turnId, beforeCloud.turnId);
+    assert.equal(afterCloud.envelopeChecksum, beforeCloud.envelopeChecksum);
+    assert.equal(afterCloud.replyJson, beforeCloud.replyJson);
+    const decoded = decryptRelayPayload(deliveries[0], keyBase64);
+    assert.equal(decoded.turnId, accepted.turnId);
+    assert.equal(decoded.reply.messageId, JSON.parse(beforeCloud.replyJson).reply.messageId);
+    assert.equal(decoded.recoveryAckSeq, 88);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

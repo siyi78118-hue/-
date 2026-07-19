@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "verifiedAt": "2026-07-19T19:16:00+08:00",
+  "release": {
+    "packageName": "com.siyi.al",
+    "versionCode": 72,
+    "versionName": "1.0.72",
+    "artifact": "artifacts/AL-1.0.72-yuqi-async-verified.apk",
+    "sizeBytes": 7484331,
+    "sha256": "b1bd46a4009bf92f94f6a29d66663906cd1a7cd7b8446f7a0d191197c894f2eb",
+    "installedArtifactHashMatchedBuildOutput": true
+  },
+  "automatedVerification": {
+    "yuqiVerify": {
+      "passed": 6,
+      "failed": 0,
+      "checks": [
+        "node-runtime-tests",
+        "relay-tests",
+        "android-jvm-tests",
+        "protocol-v2-contract",
+        "no-empty-user-trigger",
+        "version-contract"
+      ]
+    },
+    "projectRegression": {
+      "applicationAndCloudTests": 46,
+      "runtimeTests": 59,
+      "failures": 0,
+      "basicAppChecks": "passed",
+      "serviceWorkerGuard": "passed"
+    },
+    "androidJvm": {
+      "javaMajor": 21,
+      "failures": 0
+    }
+  },
+  "realThreeRoleE2E": {
+    "isolatedRuntimePort": 17892,
+    "formalRuntimeTouchedDuringTest": false,
+    "initialMatrix": {
+      "directMessage": "passed",
+      "automaticTrigger": "passed",
+      "processRecovery": "passed"
+    },
+    "exactReleaseArtifactSmoke": {
+      "directMessage": "passed",
+      "automaticTrigger": "passed",
+      "tests": 2,
+      "failures": 0,
+      "durationSeconds": 55.465
+    },
+    "phoneLedger": {
+      "completedTurns": 2,
+      "replyParts": 2,
+      "directUserRows": 1,
+      "automaticUserRows": 0,
+      "characterRows": 2,
+      "replyOrigin": "codex",
+      "fallbackReplies": 0,
+      "databaseSha256": "894f1afc8259232e68a4df1adf7a7b71b02f0b61b98bbe25d515423a465e0ae4"
+    }
+  },
+  "durability": {
+    "roleSessions": [
+      "memory",
+      "brain",
+      "supervisor"
+    ],
+    "sourceCommittedTurns": 3,
+    "sourceMessages": 5,
+    "sourceAndSnapshotLedgerSha256": "db8c68dd880ba7acb57dba7670ea8209e5ee5dfc8f297a0fb4b8bd6fd2fac4a4",
+    "snapshot": "artifacts/snapshots/yuqi-memory-20260719-110817Z.sqlite",
+    "snapshotSha256": "415820da27c061de10a702d2810699a1e6203dae720c9cc57756546dead16140",
+    "restoreAudit": "passed"
+  },
+  "idempotency": {
+    "lanAcceptedThenCloudDelivered": "passed",
+    "sameTurnId": true,
+    "sameEnvelopeChecksum": true,
+    "sameReply": true,
+    "duplicateDeliveries": 0,
+    "fallbackReconciliationWithoutSecondReply": "passed"
+  },
+  "privacy": {
+    "chatContentsIncluded": false,
+    "pairingSecretsIncluded": false,
+    "internalRoleReasoningIncluded": false
+  }
+}
