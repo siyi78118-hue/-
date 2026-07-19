@@ -150,7 +150,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v94';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v95';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');

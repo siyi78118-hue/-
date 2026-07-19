@@ -7,7 +7,7 @@
   },
   "android": {
     "allowMixedContent": false,
-    "backgroundColor": "#ededed"
+    "backgroundColor": "#f3f0ea"
   },
   "plugins": {
     "PushNotifications": {

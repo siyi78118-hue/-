@@ -1,0 +1,19 @@
+:root {
+  --wm-page: #f3f0ea;
+  --wm-surface: #faf8f3;
+  --wm-card: #ffffff;
+  --wm-chat: #eef0eb;
+  --wm-jade: #477964;
+  --wm-jade-pressed: #3c6856;
+  --wm-outgoing: #b8d9c6;
+  --wm-text: #2a302d;
+  --wm-muted: #727a75;
+  --wm-faint: #a4aaa6;
+  --wm-line: #e6e1d8;
+  --wm-danger: #c95d57;
+  --wm-unread: #d86a64;
+  --wm-radius-sm: 10px;
+  --wm-radius-md: 14px;
+  --wm-radius-lg: 18px;
+  --wm-shadow-float: 0 14px 34px rgba(42, 48, 45, 0.14);
+}
