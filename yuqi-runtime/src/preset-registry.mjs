@@ -12,6 +12,16 @@ function nextPatch(version) {
   return `${match[1]}.${match[2]}.${Number(match[3]) + 1}`;
 }
 
+function compareVersions(left, right) {
+  const a = String(left || '').split('.').map(Number);
+  const b = String(right || '').split('.').map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const delta = (a[index] || 0) - (b[index] || 0);
+    if (delta) return delta;
+  }
+  return 0;
+}
+
 function clone(value) {
   return structuredClone(value);
 }
@@ -56,7 +66,12 @@ export class PresetRegistry {
       publishedAt: this.clock()
     };
     this.store.putPresetVersion(seed);
-    if (!this.store.getCurrentPresetVersion()) this.store.setCurrentPresetVersion(seed.version);
+    const currentVersion = this.store.getCurrentPresetVersion();
+    const current = currentVersion ? this.store.getPresetVersion(currentVersion) : null;
+    const currentIsUnannotatedSeed = current && current.parentVersion === null && current.annotationIds.length === 0;
+    if (!currentVersion || (currentIsUnannotatedSeed && compareVersions(currentVersion, seed.version) < 0)) {
+      this.store.setCurrentPresetVersion(seed.version);
+    }
   }
 
   current() {

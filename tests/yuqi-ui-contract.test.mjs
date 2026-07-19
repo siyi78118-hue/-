@@ -30,7 +30,13 @@ test('normal direct and background context is 200 raw messages', () => {
 
 test('Yuqi begins at first acquaintance without a Xu Mi memory migration', () => {
   assert.match(html, /YUQI_FIRST_ACQUAINTANCE/);
-  assert.match(html, /第一次通过神奇手机联系/);
+  assert.match(html, /双方的手机意外建立了与另一个平行世界的联系/);
+  assert.match(html, /profileVersion:\s*'1\.1\.0'/);
+  assert.match(html, /24岁，生活在另一个平行世界的现代临江城市/);
+  assert.match(html, /目前双方处于初识阶段/);
+  assert.match(html, /唯一的爱人和心中最重要的人/);
+  assert.match(html, /char\.profileVersion\s*!==\s*YUQI_FIRST_PROFILE\.profileVersion/);
+  assert.doesNotMatch(html, /神奇手机/);
   assert.doesNotMatch(html, /迁移许弥|导入许弥|xu\s*mi.*memory/i);
 });
 
