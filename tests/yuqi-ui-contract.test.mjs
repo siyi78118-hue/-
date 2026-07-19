@@ -48,3 +48,10 @@ test('manual annotations retain evidence and preset version for the maintenance 
   assert.match(plugin, /void\s+saveYuqiAnnotation\(PluginCall call\)/);
   assert.match(plugin, /presetVersion/);
 });
+
+test('native direct replies submit a canonical attributed user message', () => {
+  assert.match(html, /inputJson:\s*JSON\.stringify\(\{[\s\S]*?message:\s*\{[\s\S]*?messageId:\s*userMessageId/);
+  assert.match(html, /speakerId:\s*'user'[\s\S]*?speakerType:\s*'user'/);
+  assert.match(html, /content:\s*task\.userText/);
+  assert.match(html, /sentAt:\s*Number\(userMessage\.time\)\s*\|\|\s*task\.createdAt/);
+});

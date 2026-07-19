@@ -17,9 +17,8 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
     }
 
     @Override public void persistSubmission(TurnSubmission submission) throws Exception {
-        JSONObject input = new JSONObject(submission.inputJson);
-        JSONObject raw = input.optJSONObject("message");
-        String content = raw == null ? input.optString("text", "") : raw.optString("content", "");
+        JSONObject raw = BridgeInput.userMessage(submission);
+        String content = raw.optString("content", "");
         if (content.trim().isEmpty()) throw new IllegalArgumentException("raw user message is empty");
         RawMessageEntity entity = new RawMessageEntity();
         entity.messageId = submission.sourceMessageId;
@@ -29,10 +28,10 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.speakerType = "user";
         entity.recipientId = submission.characterId;
         entity.content = content;
-        entity.sentAt = raw == null ? submission.createdAt : raw.optLong("sentAt", submission.createdAt);
+        entity.sentAt = raw.optLong("sentAt", submission.createdAt);
         entity.origin = "phone";
         entity.deviceId = deviceId;
-        entity.deviceSeq = input.optLong("deviceSeq", Math.max(1L, submission.createdAt));
+        entity.deviceSeq = BridgeInput.deviceSeq(submission);
         entity.checksum = sha256(canonical(entity));
         entity.syncSeq = nextSyncSeq();
         dao.insertRawMessage(entity);

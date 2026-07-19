@@ -3004,7 +3004,19 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
       characterId: charId,
       sourceMessageId: userMessageId,
       kind: 'DIRECT_REPLY',
-      inputJson: JSON.stringify({ userText: task.userText, options: task.options }),
+      inputJson: JSON.stringify({
+        userText: task.userText,
+        options: task.options,
+        message: {
+          messageId: userMessageId,
+          speakerId: 'user',
+          speakerType: 'user',
+          recipientId: charId,
+          content: task.userText,
+          sentAt: Number(userMessage.time) || task.createdAt
+        },
+        deviceSeq: Math.max(1, task.createdAt)
+      }),
       snapshotJson: JSON.stringify(snapshot),
       createdAt: task.createdAt
     });

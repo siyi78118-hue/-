@@ -103,21 +103,13 @@ public final class BridgeClient {
     }
 
     private JSONObject wireEnvelope(TurnSubmission submission) throws Exception {
-        JSONObject input = new JSONObject(submission.inputJson);
-        JSONObject source = input.optJSONObject("message");
-        JSONObject message = source == null ? new JSONObject() : new JSONObject(source.toString());
-        if (!message.has("messageId")) message.put("messageId", submission.sourceMessageId);
-        message.put("speakerId", "user");
-        message.put("speakerType", "user");
-        message.put("recipientId", submission.characterId);
-        if (!message.has("content")) message.put("content", input.optString("text", ""));
-        if (!message.has("sentAt")) message.put("sentAt", submission.createdAt);
+        JSONObject message = BridgeInput.userMessage(submission);
         JSONObject envelope = new JSONObject()
             .put("protocolVersion", 1)
             .put("turnId", submission.turnId)
             .put("characterId", submission.characterId)
             .put("deviceId", config.deviceId)
-            .put("deviceSeq", input.optLong("deviceSeq", Math.max(1L, submission.createdAt)))
+            .put("deviceSeq", BridgeInput.deviceSeq(submission))
             .put("createdAt", Math.max(1L, submission.createdAt))
             .put("message", message);
         if (journal != null) envelope.put("recovery", journal.pendingPacket(1000));
