@@ -594,3 +594,508 @@ body {
 .chat-info-editor {
   background: var(--wm-card);
 }
+
+/* Secondary forms: familiar controls, generous targets, and one shared surface system. */
+.form .cell-group {
+  margin: 0 12px 12px;
+  background: var(--wm-card);
+  border: 1px solid var(--wm-line);
+  border-radius: var(--wm-radius-md);
+  box-shadow: 0 1px 0 rgba(42, 48, 45, 0.035);
+}
+
+.input {
+  min-height: 44px;
+  color: var(--wm-text);
+}
+
+.textarea {
+  min-height: 96px;
+  padding: 10px 0;
+  background: var(--wm-card);
+  color: var(--wm-text);
+}
+
+.select {
+  min-height: 44px;
+  color: var(--wm-text);
+}
+
+.range {
+  min-height: 44px;
+  accent-color: var(--wm-jade);
+}
+
+.model-row {
+  background: var(--wm-card);
+}
+
+.model-tools {
+  gap: 10px;
+  align-items: center;
+}
+
+.model-tools .select {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 10px;
+  border-radius: 11px;
+  background: var(--wm-page);
+  box-shadow: inset 0 0 0 1px var(--wm-line);
+}
+
+.inline-btn {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: 11px;
+  background: var(--wm-surface);
+  color: var(--wm-text);
+  box-shadow: inset 0 0 0 1px var(--wm-line);
+}
+
+.inline-btn:active {
+  background: rgba(71, 121, 100, 0.10);
+}
+
+#screen-import .page-pad {
+  padding: 14px 12px calc(28px + var(--safe-bottom));
+  background: var(--wm-page);
+}
+
+#screen-import .page-pad > .wx-group {
+  margin: 0 0 12px;
+  background: var(--wm-card);
+  border: 1px solid var(--wm-line);
+  border-radius: var(--wm-radius-md);
+  overflow: hidden;
+}
+
+#screen-import .page-pad > .wx-group .cell {
+  min-height: 56px;
+  background: var(--wm-card);
+}
+
+/* Plans, stages, memory, and diagnostics: human meaning first, machinery second. */
+.plan-card {
+  margin: 0 12px 12px;
+  padding: 16px;
+  background: var(--wm-card);
+  border: 1px solid var(--wm-line);
+  border-radius: var(--wm-radius-md);
+  box-shadow: 0 4px 14px rgba(42, 48, 45, 0.045);
+}
+
+.plan-card-title {
+  color: var(--wm-text);
+  font-weight: 650;
+}
+
+.plan-card-meta {
+  color: var(--wm-muted);
+}
+
+.plan-card-intent {
+  color: var(--wm-text);
+}
+
+.plan-card-actions {
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.plan-card-actions button {
+  min-height: 44px;
+  padding: 0 15px;
+  border-radius: 11px;
+  background: var(--wm-surface);
+  color: var(--wm-text);
+  box-shadow: inset 0 0 0 1px var(--wm-line);
+}
+
+.plan-card-actions .danger {
+  color: var(--wm-danger);
+}
+
+.stage-current {
+  color: var(--wm-text);
+  font-weight: 650;
+}
+
+.stage-meta {
+  color: var(--wm-muted);
+}
+
+.stage-editor-text {
+  min-height: 220px;
+  background: var(--wm-card);
+}
+
+.stage-history-item {
+  margin: 0 12px 10px;
+  padding: 13px 15px;
+  background: var(--wm-card);
+  border: 1px solid var(--wm-line);
+  border-radius: var(--wm-radius-md);
+}
+
+.stage-history-title {
+  color: var(--wm-text);
+  font-weight: 560;
+}
+
+.stage-history-meta {
+  color: var(--wm-muted);
+}
+
+.memory-section {
+  margin: 0 0 12px;
+}
+
+.memory-section-title {
+  min-height: 36px;
+  height: auto;
+  padding: 10px 15px 7px;
+  background: var(--wm-page);
+  color: var(--wm-muted);
+}
+
+.memory-item {
+  background: var(--wm-card);
+}
+
+.memory-actions {
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.memory-actions .inline-btn {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 13px;
+}
+
+.diagnostic-list {
+  padding: 0 12px calc(24px + var(--safe-bottom));
+}
+
+.diagnostic-item {
+  margin-bottom: 12px;
+  padding: 15px;
+  background: var(--wm-card);
+  border: 1px solid var(--wm-line);
+  border-radius: var(--wm-radius-md);
+}
+
+.diagnostic-title {
+  color: var(--wm-text);
+}
+
+.diagnostic-state {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: var(--wm-jade);
+}
+
+.diagnostic-state.state-empty {
+  background: var(--wm-muted);
+}
+
+.diagnostic-state.state-fail {
+  background: var(--wm-danger);
+}
+
+.diagnostic-meta,
+.diagnostic-memory {
+  color: var(--wm-muted);
+}
+
+.diagnostic-section {
+  margin-top: 8px;
+  border-top: 1px solid var(--wm-line);
+}
+
+.diagnostic-section summary {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  color: var(--wm-muted);
+}
+
+.diagnostic-pre {
+  max-height: 260px;
+  padding: 10px;
+  overflow: auto;
+  border-radius: 10px;
+  background: var(--wm-page);
+  color: var(--wm-muted);
+  font-size: 11.5px;
+}
+
+/* Moments: intimate social content with quieter chrome and reachable actions. */
+.moments-cover {
+  height: 230px;
+  margin-bottom: 48px;
+  background: linear-gradient(145deg, var(--wm-jade) 0%, #6d8b7d 48%, var(--wm-text) 100%);
+}
+
+.moments-user {
+  right: 18px;
+  bottom: -36px;
+  color: #ffffff;
+}
+
+.moments-user .avatar {
+  width: 72px;
+  height: 72px;
+  border: 3px solid var(--wm-card);
+  border-radius: 16px;
+  box-shadow: 0 8px 20px rgba(42, 48, 45, 0.16);
+}
+
+.moment {
+  padding: 17px 15px 15px;
+  gap: 11px;
+  background: var(--wm-card);
+  border-color: var(--wm-line);
+}
+
+.moment .avatar {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+}
+
+.moment-body {
+  color: var(--wm-text);
+}
+
+.moment-name {
+  display: inline-flex;
+  min-height: 44px;
+  margin: -9px 0 -7px;
+  align-items: center;
+  color: var(--wm-jade);
+  font-weight: 650;
+}
+
+.moment-text {
+  color: var(--wm-text);
+}
+
+.moment-media {
+  border-radius: 12px;
+  background: var(--wm-page);
+}
+
+.moment-foot {
+  min-height: 44px;
+  margin-top: 4px;
+  color: var(--wm-muted);
+}
+
+.moment-action {
+  width: 44px;
+  height: 44px;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 11px;
+  background: var(--wm-surface);
+  color: var(--wm-jade);
+  line-height: 42px;
+}
+
+.moment-reactions {
+  margin-top: 4px;
+  border-radius: 10px;
+  background: var(--wm-surface);
+  color: var(--wm-text);
+}
+
+.moment-like-line,
+.moment-comment {
+  display: flex;
+  min-height: 44px;
+  padding: 9px 10px;
+  align-items: center;
+  border-color: var(--wm-line);
+}
+
+.moment-comment b {
+  color: var(--wm-jade);
+}
+
+.moment-seen,
+.moment-seen-line {
+  color: var(--wm-muted);
+}
+
+.moment-compose {
+  padding: 14px;
+  background: var(--wm-card);
+  border-color: var(--wm-line);
+}
+
+.moment-compose textarea {
+  min-height: 96px;
+  padding: 11px;
+  border-radius: 12px;
+  background: var(--wm-page);
+  color: var(--wm-text);
+}
+
+.moment-compose-actions {
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.moment-compose-actions button {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 16px;
+  border-radius: 11px;
+  background: var(--wm-surface);
+  color: var(--wm-text);
+  box-shadow: inset 0 0 0 1px var(--wm-line);
+}
+
+.moment-compose-actions .send-moment {
+  background: var(--wm-jade);
+  color: #ffffff;
+  box-shadow: none;
+}
+
+.moment-reply-bar {
+  padding: 8px 10px calc(8px + var(--safe-bottom));
+  background: var(--wm-surface);
+  border-color: var(--wm-line);
+}
+
+.moment-reply-bar textarea {
+  min-height: 44px;
+  border-color: var(--wm-line);
+  border-radius: 12px;
+  background: var(--wm-card);
+  color: var(--wm-text);
+}
+
+.moment-reply-bar button {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 14px;
+  border-radius: 11px;
+  background: var(--wm-surface);
+  color: var(--wm-text);
+}
+
+.moment-reply-bar .send-moment {
+  background: var(--wm-jade);
+  color: #ffffff;
+}
+
+/* Wallet and in-chat payment: clear states without pulling focus from the relationship. */
+.wallet-note {
+  padding: 10px 17px 20px;
+  color: var(--wm-muted);
+}
+
+.pay-target {
+  padding: 24px 18px;
+  background: var(--wm-card);
+  border-bottom: 1px solid var(--wm-line);
+}
+
+.pay-target .avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+}
+
+.pay-target-name {
+  color: var(--wm-text);
+  font-weight: 650;
+}
+
+.pay-target-note {
+  color: var(--wm-muted);
+}
+
+.pay-amount-box {
+  padding: 22px 18px;
+  background: var(--wm-card);
+  border-bottom: 1px solid var(--wm-line);
+}
+
+.pay-amount-label {
+  color: var(--wm-muted);
+}
+
+.pay-amount-line {
+  min-height: 54px;
+  border-color: var(--wm-line);
+}
+
+.pay-yuan,
+.pay-input {
+  color: var(--wm-text);
+}
+
+.pay-input::placeholder {
+  color: var(--wm-faint);
+}
+
+.pay-balance {
+  color: var(--wm-muted);
+}
+
+.pay-note-input {
+  min-height: 44px;
+  height: 44px;
+}
+
+.pay-card {
+  min-height: 92px;
+  border-radius: 12px;
+  background: var(--wm-jade);
+  box-shadow: 0 4px 12px rgba(42, 48, 45, 0.09);
+}
+
+.pay-card.received {
+  background: var(--wm-jade-pressed);
+}
+
+.pay-card.refused {
+  background: var(--wm-muted);
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.pay-card-main {
+  min-height: 68px;
+}
+
+.pay-card-icon {
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.20);
+}
+
+.pay-card-title {
+  color: #ffffff;
+}
+
+.pay-card-note {
+  color: rgba(255, 255, 255, 0.86);
+}
+
+.pay-card-foot {
+  min-height: 28px;
+  height: 28px;
+  background: var(--wm-card);
+  color: var(--wm-muted);
+}
+
+.pay-status-tip {
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(114, 122, 117, 0.14);
+  color: var(--wm-muted);
+}

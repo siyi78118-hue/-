@@ -231,3 +231,195 @@ test('styles the complete contact profile and chat-info selector audit', () => {
   assertDeclaration('.chat-info-advanced summary', /min-height\s*:\s*44px/);
   assertDeclaration('.chat-info-editor', /background\s*:\s*var\(--wm-card\)/);
 });
+
+test('warms real forms, model controls, and the import page without invented anchors', () => {
+  for (const selector of [
+    '.form',
+    '.form .cell-group',
+    '.input',
+    '.textarea',
+    '.select',
+    '.range',
+    '.model-row',
+    '.model-tools',
+    '.model-tools .select',
+    '.inline-btn',
+    '#screen-import .page-pad',
+    '#screen-import .page-pad > .wx-group',
+    '#screen-import .page-pad > .wx-group .cell'
+  ]) {
+    assert.ok(declarationsFor(selector), `missing real CSS rule for ${selector}`);
+  }
+
+  assertDeclaration('.form', /background\s*:\s*var\(--wm-page\)/);
+  assertDeclaration('.form .cell-group', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.input', /min-height\s*:\s*44px/);
+  assertDeclaration('.textarea', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.select', /min-height\s*:\s*44px/);
+  assertDeclaration('.range', /accent-color\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.model-row', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.model-tools', /gap\s*:\s*10px/);
+  assertDeclaration('.model-tools .select', /min-height\s*:\s*44px/);
+  assertDeclaration('.inline-btn', /min-height\s*:\s*44px/);
+  assertDeclaration('#screen-import .page-pad', /background\s*:\s*var\(--wm-page\)/);
+  assertDeclaration('#screen-import .page-pad > .wx-group', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('#screen-import .page-pad > .wx-group .cell', /min-height\s*:\s*56px/);
+});
+
+test('gives schedules, stages, memory, and diagnostics a calm information hierarchy', () => {
+  for (const selector of [
+    '.plan-card',
+    '.plan-card-title',
+    '.plan-card-meta',
+    '.plan-card-intent',
+    '.plan-card-actions',
+    '.plan-card-actions button',
+    '.stage-current',
+    '.stage-meta',
+    '.stage-editor-text',
+    '.stage-history-item',
+    '.stage-history-title',
+    '.stage-history-meta',
+    '.memory-section',
+    '.memory-section-title',
+    '.memory-item',
+    '.memory-actions',
+    '.memory-actions .inline-btn',
+    '.diagnostic-list',
+    '.diagnostic-item',
+    '.diagnostic-title',
+    '.diagnostic-state',
+    '.diagnostic-state.state-fail',
+    '.diagnostic-meta',
+    '.diagnostic-memory',
+    '.diagnostic-section',
+    '.diagnostic-section summary',
+    '.diagnostic-pre'
+  ]) {
+    assert.ok(declarationsFor(selector), `missing real CSS rule for ${selector}`);
+  }
+
+  assertDeclaration('.plan-card', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.plan-card-title', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.plan-card-meta', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.plan-card-intent', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.plan-card-actions button', /min-height\s*:\s*44px/);
+  assertDeclaration('.stage-current', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.stage-meta', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.stage-editor-text', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.stage-history-item', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.stage-history-title', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.stage-history-meta', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.memory-section-title', /background\s*:\s*var\(--wm-page\)/);
+  assertDeclaration('.memory-item', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.memory-actions .inline-btn', /min-height\s*:\s*44px/);
+  assertDeclaration('.diagnostic-item', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.diagnostic-title', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.diagnostic-state', /background\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.diagnostic-state.state-fail', /background\s*:\s*var\(--wm-danger\)/);
+  assertDeclaration('.diagnostic-meta', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.diagnostic-memory', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.diagnostic-section summary', /min-height\s*:\s*44px/);
+  assertDeclaration('.diagnostic-pre', /background\s*:\s*var\(--wm-page\)/);
+  assertDeclaration('.diagnostic-pre', /color\s*:\s*var\(--wm-muted\)/);
+});
+
+test('styles real moments controls as warm social surfaces with accessible targets', () => {
+  for (const selector of [
+    '.moments-cover',
+    '.moments-user',
+    '.moments-user .avatar',
+    '.moment',
+    '.moment .avatar',
+    '.moment-body',
+    '.moment-name',
+    '.moment-text',
+    '.moment-media',
+    '.moment-foot',
+    '.moment-action',
+    '.moment-reactions',
+    '.moment-like-line',
+    '.moment-comment',
+    '.moment-seen',
+    '.moment-seen-line',
+    '.moment-compose',
+    '.moment-compose textarea',
+    '.moment-compose-actions',
+    '.moment-compose-actions button',
+    '.moment-compose-actions .send-moment',
+    '.moment-reply-bar',
+    '.moment-reply-bar textarea',
+    '.moment-reply-bar button',
+    '.moment-reply-bar .send-moment'
+  ]) {
+    assert.ok(declarationsFor(selector), `missing real CSS rule for ${selector}`);
+  }
+
+  assertDeclaration('.moment', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.moment', /border-color\s*:\s*var\(--wm-line\)/);
+  assertDeclaration('.moment .avatar', /border-radius\s*:\s*12px/);
+  assertDeclaration('.moment-name', /color\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.moment-name', /min-height\s*:\s*44px/);
+  assertDeclaration('.moment-text', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.moment-foot', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.moment-action', /min-width\s*:\s*44px/);
+  assertDeclaration('.moment-action', /min-height\s*:\s*44px/);
+  assertDeclaration('.moment-reactions', /background\s*:\s*var\(--wm-surface\)/);
+  assertDeclaration('.moment-like-line', /min-height\s*:\s*44px/);
+  assertDeclaration('.moment-comment', /min-height\s*:\s*44px/);
+  assertDeclaration('.moment-compose', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.moment-compose-actions button', /min-height\s*:\s*44px/);
+  assertDeclaration('.moment-compose-actions .send-moment', /background\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.moment-reply-bar', /background\s*:\s*var\(--wm-surface\)/);
+  assertDeclaration('.moment-reply-bar textarea', /min-height\s*:\s*44px/);
+  assertDeclaration('.moment-reply-bar button', /min-height\s*:\s*44px/);
+  assertDeclaration('.moment-reply-bar .send-moment', /background\s*:\s*var\(--wm-jade\)/);
+});
+
+test('warms wallet and payment surfaces while preserving their real states', () => {
+  for (const selector of [
+    '.wallet-note',
+    '.pay-target',
+    '.pay-target .avatar',
+    '.pay-target-name',
+    '.pay-target-note',
+    '.pay-amount-box',
+    '.pay-amount-label',
+    '.pay-amount-line',
+    '.pay-yuan',
+    '.pay-input',
+    '.pay-input::placeholder',
+    '.pay-balance',
+    '.pay-note-input',
+    '.pay-card',
+    '.pay-card.received',
+    '.pay-card.refused',
+    '.pay-card-main',
+    '.pay-card-icon',
+    '.pay-card-title',
+    '.pay-card-note',
+    '.pay-card-foot',
+    '.pay-status-tip'
+  ]) {
+    assert.ok(declarationsFor(selector), `missing real CSS rule for ${selector}`);
+  }
+
+  assertDeclaration('.wallet-note', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.pay-target', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.pay-target-name', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.pay-target-note', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.pay-amount-box', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.pay-amount-label', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.pay-amount-line', /border-color\s*:\s*var\(--wm-line\)/);
+  assertDeclaration('.pay-yuan', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.pay-input', /color\s*:\s*var\(--wm-text\)/);
+  assertDeclaration('.pay-balance', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.pay-note-input', /min-height\s*:\s*44px/);
+  assertDeclaration('.pay-card', /background\s*:\s*var\(--wm-jade\)/);
+  assertDeclaration('.pay-card', /min-height\s*:\s*92px/);
+  assertDeclaration('.pay-card.received', /background\s*:\s*var\(--wm-jade-pressed\)/);
+  assertDeclaration('.pay-card.refused', /background\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.pay-card-foot', /background\s*:\s*var\(--wm-card\)/);
+  assertDeclaration('.pay-card-foot', /color\s*:\s*var\(--wm-muted\)/);
+  assertDeclaration('.pay-status-tip', /color\s*:\s*var\(--wm-muted\)/);
+});
