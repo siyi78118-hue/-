@@ -114,6 +114,7 @@ test('Android permits cleartext only for the generated private LAN host', () => 
 
 test('firewall helper is restricted to TCP 17891 on private local subnets', () => {
   const helper = readFileSync('scripts/enable-yuqi-lan-firewall.ps1', 'utf8');
+  assert.match(helper, /^[\x00-\x7F]*$/, 'Windows PowerShell 5 must be able to read this BOM-less script');
   assert.match(helper, /-Protocol TCP/);
   assert.match(helper, /-LocalPort 17891/);
   assert.match(helper, /-Profile Private/);
