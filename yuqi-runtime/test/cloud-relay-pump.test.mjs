@@ -22,6 +22,21 @@ const envelope = {
   recovery: { peerId: 'phone_cloud', lastCommonSeq: 0, entries: [] }
 };
 
+const v2Envelope = {
+  protocolVersion: 2,
+  turnId: 'turn_phone_cloud_v2_1',
+  characterId: 'yuqi',
+  deviceId: 'phone_cloud',
+  deviceSeq: 2,
+  createdAt: 1784400000002,
+  kind: 'DIRECT_REPLY',
+  message: {
+    messageId: 'msg_phone_cloud_v2_1', speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+    content: '换到云端继续', sentAt: 1784400000002
+  },
+  recovery: { peerId: 'phone_cloud', lastCommonSeq: 0, entries: [] }
+};
+
 function relayFixture(payload = envelope) {
   const encrypted = encryptRelayPayload(payload, keyBase64, Buffer.alloc(12, 3));
   const state = { inbound: [{ messageId: 'relay_phone_cloud_1', ...encrypted }], enqueued: [], acked: [] };
@@ -88,4 +103,40 @@ test('uses deterministic output identity so duplicate cloud delivery cannot crea
   await pump.pumpOnce();
   assert.equal(relay.state.enqueued[0].messageId, relay.state.enqueued[1].messageId);
   assert.equal(relay.state.enqueued[0].idempotencyKey, relay.state.enqueued[1].idempotencyKey);
+});
+
+test('v2 cloud ingress acknowledges after durable dispatch without waiting for the reply', async () => {
+  const relay = relayFixture(v2Envelope);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: {
+      accept(value) {
+        events.push(`accept:${value.turnId}`);
+        return { turnId: value.turnId, state: 'queued' };
+      }
+    },
+    store: {
+      registerCloudDelivery(turnId, peerId, recoveryAckSeq) {
+        events.push(`delivery:${turnId}:${peerId}:${recoveryAckSeq}`);
+      }
+    },
+    reconciler: {
+      async reconcileFrom(value) { events.push(`reconcile:${value.peerId}`); return { ackSeq: 55 }; }
+    },
+    outbox: { async flushOnce() { events.push('outbox'); return { delivered: 0 }; } }
+  });
+
+  const result = await pump.pumpOnce();
+
+  assert.equal(result.processed, 1);
+  assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+  assert.equal(relay.state.enqueued.length, 0);
+  assert.deepEqual(events, [
+    'reconcile:phone_cloud',
+    'accept:turn_phone_cloud_v2_1',
+    'delivery:turn_phone_cloud_v2_1:phone_cloud:55',
+    'outbox'
+  ]);
 });

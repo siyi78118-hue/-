@@ -202,6 +202,24 @@ test('lists every nonterminal turn for dispatcher recovery and excludes committe
   assert.deepEqual(store.listRecoverableTurns().map(turn => turn.turnId), [first.turnId]);
 }));
 
+test('persists one cloud delivery target per turn and peer across reopening', () => withStore(({ store, file }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  store.registerCloudDelivery(turn.turnId, 'phone_peer', 44);
+  store.registerCloudDelivery(turn.turnId, 'phone_peer', 44);
+  assert.equal(store.listCloudDeliveries(turn.turnId).length, 1);
+
+  store.close();
+  const reopened = new YuqiStore(file);
+  try {
+    const [delivery] = reopened.listCloudDeliveries(turn.turnId);
+    assert.equal(delivery.peerId, 'phone_peer');
+    assert.equal(delivery.recoveryAckSeq, 44);
+    assert.equal(delivery.state, 'waiting');
+  } finally {
+    reopened.close();
+  }
+}));
+
 test('sync deltas are ordered, checksummed, and acknowledged independently', () => withStore(({ store }) => {
   store.submitTurn(validEnvelope());
   store.putMessage({

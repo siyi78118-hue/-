@@ -6,7 +6,7 @@ function keyBytes(value) {
   return key;
 }
 
-function stableId(prefix, value) {
+export function stableId(prefix, value) {
   return `${prefix}_${createHash('sha256').update(String(value), 'utf8').digest('hex').slice(0, 24)}`;
 }
 
@@ -42,7 +42,10 @@ export class CloudRelayPump {
     deviceId,
     deviceToken,
     encryptionKeyBase64,
-    orchestrator,
+    orchestrator = null,
+    dispatcher = null,
+    store = null,
+    outbox = null,
     reconciler = null,
     fetchImpl = globalThis.fetch,
     clock = Date.now
@@ -50,13 +53,19 @@ export class CloudRelayPump {
     if (!String(relayUrl || '').startsWith('https://')) throw new Error('relayUrl must use HTTPS');
     if (!/^[A-Za-z0-9_-]{6,128}$/.test(String(deviceId || ''))) throw new Error('invalid cloud deviceId');
     if (String(deviceToken || '').length < 16) throw new Error('invalid cloud device token');
-    if (!orchestrator || typeof orchestrator.process !== 'function') throw new Error('orchestrator is required');
+    const hasLegacy = orchestrator && typeof orchestrator.process === 'function';
+    const hasV2 = dispatcher && typeof dispatcher.accept === 'function'
+      && store && typeof store.registerCloudDelivery === 'function';
+    if (!hasLegacy && !hasV2) throw new Error('orchestrator or durable dispatcher is required');
     keyBytes(encryptionKeyBase64);
     this.relayUrl = String(relayUrl).replace(/\/+$/, '');
     this.deviceId = String(deviceId);
     this.deviceToken = String(deviceToken);
     this.encryptionKeyBase64 = String(encryptionKeyBase64);
     this.orchestrator = orchestrator;
+    this.dispatcher = dispatcher;
+    this.store = store;
+    this.outbox = outbox;
     this.reconciler = reconciler;
     this.fetch = fetchImpl;
     this.clock = clock;
@@ -90,6 +99,20 @@ export class CloudRelayPump {
             const recovery = await this.reconciler.reconcileFrom(envelope.recovery);
             recoveryAckSeq = recovery.ackSeq;
           }
+          if (Number(envelope.protocolVersion) >= 2) {
+            if (!this.dispatcher || !this.store) throw new Error('durable dispatcher is unavailable');
+            const turn = this.dispatcher.accept(envelope);
+            const peerId = String(envelope.recovery?.peerId || envelope.deviceId || this.deviceId);
+            this.store.registerCloudDelivery(turn.turnId, peerId, recoveryAckSeq);
+            const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {
+              method: 'POST', headers: this.headers(true),
+              body: JSON.stringify({ deviceId: this.deviceId, messageIds: [message.messageId] })
+            });
+            if (!acked.ok) throw new Error(`cloud relay ack HTTP ${acked.status}`);
+            summary.processed += 1;
+            continue;
+          }
+          if (!this.orchestrator) throw new Error('legacy orchestrator is unavailable');
           const result = await this.orchestrator.process(envelope);
           const replyPayload = { ok: true, ...result, recoveryAckSeq };
           const encrypted = encryptRelayPayload(replyPayload, this.encryptionKeyBase64);
@@ -115,6 +138,7 @@ export class CloudRelayPump {
           summary.failed += 1;
         }
       }
+      if (this.outbox && typeof this.outbox.flushOnce === 'function') await this.outbox.flushOnce();
       return summary;
     } finally {
       this.running = false;

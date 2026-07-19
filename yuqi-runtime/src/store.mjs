@@ -101,6 +101,22 @@ function mapAnnotation(row) {
   };
 }
 
+function mapCloudDelivery(row) {
+  if (!row) return null;
+  return {
+    turnId: row.turn_id,
+    peerId: row.peer_id,
+    recoveryAckSeq: row.recovery_ack_seq,
+    state: row.state,
+    payloadJson: row.payload_json,
+    checksum: row.checksum || '',
+    attempts: row.attempts,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    deliveredAt: row.delivered_at
+  };
+}
+
 export class YuqiStore {
   constructor(filename) {
     if (!filename) throw new Error('database filename is required');
@@ -197,6 +213,23 @@ export class YuqiStore {
         ack_seq INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS cloud_deliveries (
+        turn_id TEXT NOT NULL,
+        peer_id TEXT NOT NULL,
+        recovery_ack_seq INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'waiting',
+        payload_json TEXT,
+        checksum TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        PRIMARY KEY(turn_id, peer_id),
+        FOREIGN KEY(turn_id) REFERENCES turns(turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_cloud_deliveries_state_updated
+        ON cloud_deliveries(state, updated_at);
 
       CREATE TABLE IF NOT EXISTS sessions (
         role TEXT PRIMARY KEY,
@@ -336,6 +369,79 @@ export class YuqiStore {
       )
       ORDER BY created_at ASC, turn_id ASC
     `).all().map(mapTurn);
+  }
+
+  registerCloudDelivery(turnId, peerId, recoveryAckSeq = 0) {
+    if (!this.getTurn(turnId)) throw new Error('turn not found');
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(peerId || ''))) throw new Error('invalid cloud peer');
+    const ackSeq = Math.max(0, Number(recoveryAckSeq) || 0);
+    const timestamp = now();
+    this.db.prepare(`
+      INSERT INTO cloud_deliveries(
+        turn_id, peer_id, recovery_ack_seq, state, attempts, created_at, updated_at
+      ) VALUES (?, ?, ?, 'waiting', 0, ?, ?)
+      ON CONFLICT(turn_id, peer_id) DO UPDATE SET
+        recovery_ack_seq = MAX(cloud_deliveries.recovery_ack_seq, excluded.recovery_ack_seq),
+        updated_at = excluded.updated_at
+    `).run(turnId, String(peerId), ackSeq, timestamp, timestamp);
+    return mapCloudDelivery(this.db.prepare(
+      'SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?'
+    ).get(turnId, String(peerId)));
+  }
+
+  listCloudDeliveries(turnId) {
+    return this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id ASC
+    `).all(turnId).map(mapCloudDelivery);
+  }
+
+  listPendingCloudDeliveries(limit = 50) {
+    const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
+    return this.db.prepare(`
+      SELECT * FROM cloud_deliveries
+      WHERE state IN ('waiting', 'pending')
+      ORDER BY updated_at ASC, turn_id ASC, peer_id ASC LIMIT ?
+    `).all(safeLimit).map(mapCloudDelivery);
+  }
+
+  prepareCloudDelivery(turnId, peerId, payload) {
+    const payloadJson = canonicalJson(payload);
+    const checksum = contentHash(payload);
+    const existing = this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+    `).get(turnId, peerId);
+    if (!existing) throw new Error('cloud delivery not found');
+    if (existing.checksum && existing.checksum !== checksum) throw new Error('cloud delivery checksum conflict');
+    if (existing.state !== 'delivered') {
+      this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'pending', payload_json = ?, checksum = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ?
+      `).run(payloadJson, checksum, now(), turnId, peerId);
+    }
+    return mapCloudDelivery(this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+    `).get(turnId, peerId));
+  }
+
+  markCloudDeliveryAttempt(turnId, peerId) {
+    const result = this.db.prepare(`
+      UPDATE cloud_deliveries SET attempts = attempts + 1, updated_at = ?
+      WHERE turn_id = ? AND peer_id = ? AND state = 'pending'
+    `).run(now(), turnId, peerId);
+    if (Number(result.changes) !== 1) throw new Error('pending cloud delivery not found');
+  }
+
+  markCloudDeliveryDelivered(turnId, peerId, checksum) {
+    const timestamp = now();
+    const result = this.db.prepare(`
+      UPDATE cloud_deliveries SET state = 'delivered', delivered_at = ?, updated_at = ?
+      WHERE turn_id = ? AND peer_id = ? AND state = 'pending' AND checksum = ?
+    `).run(timestamp, timestamp, turnId, peerId, checksum);
+    if (Number(result.changes) !== 1) throw new Error('cloud delivery acknowledgement conflict');
+    return mapCloudDelivery(this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+    `).get(turnId, peerId));
   }
 
   claimTurn(workerId) {

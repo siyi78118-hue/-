@@ -1,6 +1,8 @@
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 
+import { publicTurnStatus } from './turn-status.mjs';
+
 function bodyHash(body) {
   return createHash('sha256').update(String(body || ''), 'utf8').digest('hex');
 }
@@ -24,29 +26,6 @@ function safeEqual(left, right) {
   const a = Buffer.from(String(left || ''), 'utf8');
   const b = Buffer.from(String(right || ''), 'utf8');
   return a.length === b.length && timingSafeEqual(a, b);
-}
-
-function parseStoredJson(value) {
-  try { return value ? JSON.parse(value) : null; } catch { return null; }
-}
-
-function publicTurnStatus(turn) {
-  if (!turn) return null;
-  const committed = ['committed', 'delivered', 'completed'].includes(turn.state);
-  const failed = ['failed', 'fallback'].includes(turn.state);
-  const result = parseStoredJson(turn.replyJson);
-  const error = parseStoredJson(turn.errorJson);
-  return {
-    turnId: turn.turnId,
-    state: turn.state,
-    terminal: committed || failed,
-    allowFallback: failed,
-    reply: committed ? result?.reply || null : null,
-    errorCode: failed ? String(error?.code || error?.name || 'YUQI_ROLE_FAILED') : '',
-    origin: committed ? String(result?.reply?.origin || turn.origin || 'codex') : String(turn.origin || 'codex'),
-    updatedAt: Number(turn.updatedAt || 0),
-    retryAfterMs: committed || failed ? 0 : 1500
-  };
 }
 
 export function createYuqiServer({
