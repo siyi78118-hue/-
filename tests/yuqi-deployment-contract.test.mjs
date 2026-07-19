@@ -149,6 +149,14 @@ test('runtime verifier uses the system cloud transport and requires cloud health
   assert.match(verifier, /!config\.cloudRelay\.enabled \|\| cloudRelayReady/);
 });
 
+test('cloud round-trip verifier encrypts a non-chat probe and acknowledges it', () => {
+  const verifier = readFileSync('scripts/verify-yuqi-cloud-roundtrip.mjs', 'utf8');
+  assert.match(verifier, /encryptRelayPayload/);
+  assert.match(verifier, /direction: 'pc_to_phone'/);
+  assert.match(verifier, /\/bridge\/ack/);
+  assert.match(verifier, /plaintextFieldsStored: false/);
+});
+
 test('Android permits cleartext only for the generated private LAN host', () => {
   const manifest = readFileSync('android/app/src/main/AndroidManifest.xml', 'utf8');
   const policy = readFileSync('android/app/src/main/res/xml/network_security_config.xml', 'utf8');
