@@ -8,7 +8,9 @@
     "artifact": "artifacts/AL-1.0.72-yuqi-async-verified.apk",
     "sizeBytes": 7484331,
     "sha256": "b1bd46a4009bf92f94f6a29d66663906cd1a7cd7b8446f7a0d191197c894f2eb",
-    "installedArtifactHashMatchedBuildOutput": true
+    "installedArtifactHashMatchedBuildOutput": true,
+    "upgradeFromVersionCode": 71,
+    "signingCertificateMatchedPreviousApk": true
   },
   "automatedVerification": {
     "yuqiVerify": {
