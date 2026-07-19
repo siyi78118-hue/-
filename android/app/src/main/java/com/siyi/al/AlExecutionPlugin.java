@@ -221,7 +221,9 @@ public final class AlExecutionPlugin extends Plugin {
     public void retryTurn(PluginCall call) {
         execute(call, () -> {
             String turnId = required(call, "turnId");
-            ExecutionAttemptEntity attempt = store.startRetry(turnId, System.currentTimeMillis());
+            String inputJson = call.getString("inputJson");
+            String snapshotJson = call.getString("snapshotJson");
+            ExecutionAttemptEntity attempt = store.startRetry(turnId, System.currentTimeMillis(), inputJson, snapshotJson);
             AlExecutionService.requestRun(getContext());
             JSObject result = turnResult(store.turn(turnId));
             result.put("attemptId", attempt.attemptId);
@@ -456,6 +458,18 @@ public final class AlExecutionPlugin extends Plugin {
             result.put("errorCode", attempt.errorCode);
             result.put("errorDetail", attempt.errorDetail);
             result.put("retryable", attempt.retryable);
+            if (attempt.memoryResult != null && !attempt.memoryResult.trim().isEmpty()) {
+                try {
+                    JSONObject checkpoint = new JSONObject(attempt.memoryResult);
+                    if (checkpoint.has("origin")) {
+                        result.put("origin", checkpoint.optString("origin", ""));
+                        result.put("fallback", checkpoint.optBoolean("fallback", false));
+                        result.put("attemptedRoutes", checkpoint.optJSONArray("attemptedRoutes") == null ? new JSONArray() : checkpoint.optJSONArray("attemptedRoutes"));
+                    }
+                } catch (Exception ignored) {
+                    // Ordinary memory-model output is not a bridge checkpoint.
+                }
+            }
         }
         JSArray parts = new JSArray();
         for (ReplyPartEntity part : store.replyParts(turn.turnId)) {

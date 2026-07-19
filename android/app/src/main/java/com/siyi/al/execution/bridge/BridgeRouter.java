@@ -1,6 +1,7 @@
 package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.TurnSubmission;
+import com.siyi.al.execution.TurnKind;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -35,7 +36,9 @@ public final class BridgeRouter {
     public boolean isEnabled() { return config.enabled; }
 
     public BridgeResult execute(TurnSubmission submission) throws Exception {
-        mirror.persistSubmission(submission);
+        if (submission.kind == TurnKind.DIRECT_REPLY) {
+            mirror.persistSubmission(submission);
+        }
         List<String> routes = new ArrayList<>();
         List<Exception> failures = new ArrayList<>();
 

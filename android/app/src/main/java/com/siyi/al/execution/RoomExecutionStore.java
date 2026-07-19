@@ -58,6 +58,11 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     @Override
     public ExecutionAttemptEntity startRetry(String turnId, long now) {
+        return startRetry(turnId, now, null, null);
+    }
+
+    @Override
+    public ExecutionAttemptEntity startRetry(String turnId, long now, String inputJson, String snapshotJson) {
         AtomicReference<ExecutionAttemptEntity> result = new AtomicReference<>();
         database.runInTransaction(() -> {
             ChatTurnEntity turn = requireTurn(turnId);
@@ -67,6 +72,15 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             TurnState currentState = TurnState.valueOf(turn.state);
             if (!TurnStateMachine.canStartRetry(currentState)) {
                 throw new IllegalStateException("Turn is not retryable while " + currentState);
+            }
+            boolean replacesPayload = inputJson != null || snapshotJson != null;
+            if (replacesPayload) {
+                if (inputJson == null || inputJson.trim().isEmpty() || snapshotJson == null || snapshotJson.trim().isEmpty()) {
+                    throw new IllegalArgumentException("retry inputJson and snapshotJson are both required");
+                }
+                if (dao.replaceRetryPayload(turnId, inputJson, snapshotJson, now) != 1) {
+                    throw new IllegalStateException("Unable to replace retry payload for " + turnId);
+                }
             }
             int sequence = dao.maxAttemptSequence(turnId) + 1;
             String attemptId = newAttemptId(turnId, sequence);

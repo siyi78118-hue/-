@@ -59,6 +59,30 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void retryCanReplaceCorruptInputAndSnapshotBeforeNewAttempt() {
+        TurnSubmission broken = new TurnSubmission(
+            "turn-repair",
+            "char-1",
+            "msg-repair",
+            TurnKind.DIRECT_REPLY,
+            "{}",
+            "{\"messages\":[]}",
+            null,
+            1L
+        );
+        store.submitTurn(broken);
+        String firstAttempt = store.activeAttempt("turn-repair").attemptId;
+        store.markFailed("turn-repair", firstAttempt, "INVALID_INPUT", "raw user message is empty", true, 2L);
+        String repairedInput = "{\"message\":{\"speakerId\":\"user\",\"content\":\"hello\"}}";
+        String repairedSnapshot = "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}";
+
+        store.startRetry("turn-repair", 3L, repairedInput, repairedSnapshot);
+
+        assertEquals(repairedInput, store.turn("turn-repair").inputJson);
+        assertEquals(repairedSnapshot, store.turn("turn-repair").snapshotJson);
+    }
+
+    @Test
     public void lateOldAttemptCannotCommitAfterRetry() {
         store.submitTurn(submission("turn-2", "msg-2"));
         String oldAttempt = store.activeAttempt("turn-2").attemptId;

@@ -45,6 +45,23 @@ public class BridgeRouterTest {
         assertEquals(Arrays.asList("cloud", "fallback"), cloud.attemptedRoutes);
     }
 
+    @Test public void proactiveTurnWithoutUserMessageSkipsUserMirrorAndStillUsesLan() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeConfig config = new BridgeConfig(true, BridgeMode.LAN, "http://192.168.1.8:17891", "https://relay.example", "device_123456", "pairing-secret-123", "device-token-123456", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 500, 2000, 2, 1);
+        BridgeRouter.MessageMirror mirror = new BridgeRouter.MessageMirror() {
+            @Override public void persistSubmission(TurnSubmission value) { events.add("mirror-user"); }
+            @Override public void persistReply(TurnSubmission value, BridgeResult result) { events.add("mirror-reply"); }
+        };
+        BridgeRouter router = new BridgeRouter(config, succeeding("lan", events), failing("cloud", events), fallback("fallback", events), mirror);
+        TurnSubmission proactive = new TurnSubmission("turn_proactive_1", "yuqi", "job_proactive_1", TurnKind.PROACTIVE_CHAT, "{}", "{}", "job_1", 1784400000000L);
+
+        BridgeResult result = router.execute(proactive);
+
+        assertEquals(Arrays.asList("lan", "mirror-reply"), events);
+        assertEquals("lan", result.origin);
+        assertFalse(result.fallback);
+    }
+
     private static BridgeRouter router(
         BridgeMode mode,
         List<String> events,

@@ -160,6 +160,9 @@ public interface AlExecutionDao {
     @Query("UPDATE chat_turns SET activeAttemptId = :attemptId, state = 'QUEUED', updatedAt = :now, completedAt = NULL, uiAppliedAt = NULL WHERE turnId = :turnId")
     int activateAttempt(String turnId, String attemptId, long now);
 
+    @Query("UPDATE chat_turns SET inputJson = :inputJson, snapshotJson = :snapshotJson, updatedAt = :now WHERE turnId = :turnId AND state IN ('FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED')")
+    int replaceRetryPayload(String turnId, String inputJson, String snapshotJson, long now);
+
     @Query("UPDATE chat_turns SET state = :state, updatedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId")
     int updateTurnState(String turnId, String attemptId, String state, long now);
 

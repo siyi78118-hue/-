@@ -2708,12 +2708,20 @@ function nativeReplyTextParts(result) {
       createdAt: Number(part.createdAt) || Number(result?.completedAt) || Number(result?.createdAt) || Date.now()
     }));
 }
+function nativeReplyProvenance(result) {
+  return {
+    replyOrigin: String(result?.origin || ''),
+    replyFallback: result?.fallback === true,
+    replyAttemptedRoutes: Array.isArray(result?.attemptedRoutes) ? [...result.attemptedRoutes] : []
+  };
+}
 function appendNativeReplyTextParts(chat, result, extra = {}) {
   const appended = [];
   for (const part of nativeReplyTextParts(result)) {
     if ((chat?.messages || []).some(message => message.sourceReplyPartId === part.replyPartId)) continue;
     appended.push(...appendAssistantMessages(chat, part.content, {
       ...extra,
+      ...nativeReplyProvenance(result),
       time: part.createdAt,
       sourceTurnId: `native:${result.turnId}`,
       sourceReplyPartId: part.replyPartId
@@ -2832,7 +2840,7 @@ async function applyNativeExecutionTurn(result) {
       if (momentTurn) {
         const exists = (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
         const momentText = extractMomentPostText(text);
-        if (!exists && momentText) createCharacterMoment(charId, momentText, { proactive: true, sourceTurnId, time: completedAt });
+        if (!exists && momentText) createCharacterMoment(charId, momentText, { proactive: true, sourceTurnId, ...nativeReplyProvenance(result), time: completedAt });
         if (!rolePlanTurn) {
           delete chat.pendingMomentJob;
           chat.lastProactiveMomentAt = completedAt;
@@ -2846,7 +2854,7 @@ async function applyNativeExecutionTurn(result) {
         let appendedPayment = null;
         if (sentPayment) {
           const payload = nativePartPayload(sentPayment);
-          appendedPayment = appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { proactive: true, proactiveMode: 'native', sourceTurnId, sourceReplyId: sourceTurnId, time: Number(sentPayment.createdAt) || completedAt });
+          appendedPayment = appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { proactive: true, proactiveMode: 'native', sourceTurnId, sourceReplyId: sourceTurnId, ...nativeReplyProvenance(result), time: Number(sentPayment.createdAt) || completedAt });
         }
         if (!rolePlanTurn) {
           delete chat.pendingProactiveJob;
@@ -2888,7 +2896,7 @@ async function applyNativeExecutionTurn(result) {
     let appendedPayment = null;
     if (!alreadyAnswered && sentPayment) {
       const payload = nativePartPayload(sentPayment);
-      appendedPayment = appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { replyToMessageId: userMessage.id, sourceTurnId: `native:${result.turnId}`, time: Number(sentPayment.createdAt) || Number(result.completedAt) || Date.now() });
+      appendedPayment = appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { replyToMessageId: userMessage.id, sourceTurnId: `native:${result.turnId}`, ...nativeReplyProvenance(result), time: Number(sentPayment.createdAt) || Number(result.completedAt) || Date.now() });
     }
     const ownedPending = chat.pendingReply?.nativeTurnId === result.turnId;
     const changed = appendedText.length > 0 || !!appendedPayment || ownedPending || userMessage.replyState === 'pending' || !!userMessage.replyError;
@@ -6539,7 +6547,25 @@ async function retryFailedReply(charId, userMessageId) {
     chat.pendingReply.nativeTurnId = turnId;
     try {
       await saveNativeExecutionApiConfigs();
-      const result = await plugin.retryTurn({ turnId });
+      const task = buildAndroidUserReplyTask(charId, userMessageId, chat.pendingReply.userText, savedOptions, chat.pendingReply.createdAt);
+      const snapshot = await buildNativeExecutionSnapshot(charId, task);
+      const result = await plugin.retryTurn({
+        turnId,
+        inputJson: JSON.stringify({
+          userText: task.userText,
+          options: task.options,
+          message: {
+            messageId: userMessageId,
+            speakerId: 'user',
+            speakerType: 'user',
+            recipientId: charId,
+            content: task.userText,
+            sentAt: Number(message.time) || task.createdAt
+          },
+          deviceSeq: Math.max(1, task.createdAt)
+        }),
+        snapshotJson: JSON.stringify(snapshot)
+      });
       await applyNativeExecutionTurn(result);
       startNativeReplyPolling();
       return true;

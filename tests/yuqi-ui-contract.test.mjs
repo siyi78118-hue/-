@@ -55,3 +55,18 @@ test('native direct replies submit a canonical attributed user message', () => {
   assert.match(html, /content:\s*task\.userText/);
   assert.match(html, /sentAt:\s*Number\(userMessage\.time\)\s*\|\|\s*task\.createdAt/);
 });
+
+test('native retry repairs a legacy failed turn with current canonical input and snapshot', () => {
+  const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
+  assert.match(retry, /const\s+task\s*=\s*buildAndroidUserReplyTask/);
+  assert.match(retry, /const\s+snapshot\s*=\s*await\s+buildNativeExecutionSnapshot\(charId,\s*task\)/);
+  assert.match(retry, /plugin\.retryTurn\(\{[\s\S]*?turnId[\s\S]*?inputJson:[\s\S]*?speakerId:\s*'user'[\s\S]*?content:\s*task\.userText[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
+});
+
+test('native completed replies retain bridge provenance without changing bubble copy', () => {
+  assert.match(plugin, /result\.put\("origin",[\s\S]*result\.put\("fallback",[\s\S]*result\.put\("attemptedRoutes",/);
+  assert.match(html, /function\s+nativeReplyProvenance\(result\)/);
+  assert.match(html, /replyOrigin:\s*String\(result\?\.origin/);
+  assert.match(html, /replyFallback:\s*result\?\.fallback\s*===\s*true/);
+  assert.match(html, /replyAttemptedRoutes:\s*Array\.isArray\(result\?\.attemptedRoutes\)/);
+});

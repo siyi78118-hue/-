@@ -11,6 +11,8 @@ public interface ExecutionStore {
 
     ExecutionAttemptEntity startRetry(String turnId, long now);
 
+    ExecutionAttemptEntity startRetry(String turnId, long now, String inputJson, String snapshotJson);
+
     ExecutionAttemptEntity activeAttempt(String turnId);
 
     void markFailed(
