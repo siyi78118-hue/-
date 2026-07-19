@@ -6,6 +6,8 @@ const html = readFileSync('tavern-app/index.html', 'utf8');
 const worker = readFileSync('tavern-app/sw-v11.js', 'utf8');
 const manifest = JSON.parse(readFileSync('tavern-app/manifest.json', 'utf8'));
 const capacitor = JSON.parse(readFileSync('capacitor.config.json', 'utf8'));
+const basicTest = readFileSync('test-basic.mjs', 'utf8');
+const androidBuild = readFileSync('android/app/build.gradle', 'utf8');
 const screenIds = [...html.matchAll(/id="(screen-[^"]+)"/g)].map(match => match[1]);
 const css = readFileSync('tavern-app/warm-modern.css', 'utf8');
 const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
@@ -485,4 +487,11 @@ test('keeps long content and 360-to-520 layouts structurally stable', () => {
 
   assert.match(css, /@media\s*\(max-width:\s*380px\)\s*\{[\s\S]*?\.top-left\s*,\s*\.top-right\s*\{[\s\S]*?width\s*:\s*96px[\s\S]*?min-width\s*:\s*96px[\s\S]*?flex-basis\s*:\s*96px[\s\S]*?\.composer\s*\{[\s\S]*?gap\s*:\s*4px[\s\S]*?\.chat-input\s*\{[\s\S]*?min-width\s*:\s*0/);
   assert.match(css, /@media\s*\(min-width:\s*520px\)\s*\{[\s\S]*?\.moment-reply-bar\s*\{[\s\S]*?max-width\s*:\s*520px[\s\S]*?left\s*:\s*50%[\s\S]*?transform\s*:\s*translateX\(-50%\)/);
+});
+
+test('pins the warm-modern Android release to version 1.0.73', () => {
+  assert.match(html, /const APP_BUILD_VERSION = '2026-07-19\.93';/);
+  assert.match(basicTest, /const APP_BUILD_VERSION = '2026-07-19\\\.93';/);
+  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "73"/);
+  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.73"/);
 });
