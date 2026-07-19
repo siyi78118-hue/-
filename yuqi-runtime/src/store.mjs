@@ -36,6 +36,7 @@ function mapTurn(row) {
     supervisorJson: row.supervisor_json,
     replyJson: row.reply_json,
     errorJson: row.error_json,
+    envelopeJson: row.envelope_json,
     envelopeChecksum: row.envelope_checksum,
     createdAt: row.created_at,
     updatedAt: row.updated_at

@@ -31,14 +31,33 @@ function envelope(seq = 1, content = '你好') {
   };
 }
 
+function triggerEnvelope(seq = 20) {
+  return {
+    protocolVersion: 2,
+    turnId: `turn_phone_trigger_${seq}`,
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq: seq,
+    createdAt: 1784400000000 + seq,
+    kind: 'PROACTIVE_CHAT',
+    trigger: {
+      triggerId: `trigger_phone_${seq}`,
+      triggerType: 'proactive_chat',
+      scheduledFor: 1784399999000 + seq,
+      executedAt: 1784400000000 + seq,
+      context: { reason: 'scheduled_check_in' }
+    }
+  };
+}
+
 class FakeCodex {
   constructor(outputs = {}) {
     this.outputs = Object.fromEntries(Object.entries(outputs).map(([role, values]) => [role, [...values]]));
     this.calls = [];
   }
 
-  async runTurn(role, input) {
-    this.calls.push({ role, input: JSON.parse(input) });
+  async runTurn(role, input, options = {}) {
+    this.calls.push({ role, input: JSON.parse(input), options });
     const text = this.outputs[role]?.shift();
     if (text === undefined) throw new Error(`missing fake output for ${role}`);
     return { text };
@@ -121,5 +140,52 @@ test('supervisor rejection asks the brain to rewrite once under the same preset'
     const result = await orchestrator.process(envelope());
     assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor', 'brain', 'supervisor']);
     assert.equal(result.reply.content, '你好呀。我叫虞栖，你怎么称呼？');
+  });
+});
+
+test('resumes at brain without repeating memory when a memory checkpoint exists', async () => {
+  await withFixture({
+    brain: ['{"reply":"继续回复","usedFactIds":[]}'],
+    supervisor: ['{"approved":true,"issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    const accepted = store.submitTurn(envelope(30));
+    store.claimTurnById(accepted.turnId, 'crashed-worker');
+    store.advanceTurn(accepted.turnId, 'memory_running', 'memory_done', {
+      memoryPacketJson: '{"query":"你好","keywords":[],"committedFacts":{"verified":[],"provisional":[],"rejected":[]}}'
+    });
+
+    const result = await orchestrator.run(accepted.turnId);
+
+    assert.equal(result.reply.content, '继续回复');
+    assert.deepEqual(codex.calls.map(call => call.role), ['brain', 'supervisor']);
+  });
+});
+
+test('repairs one invalid brain response under the strict schema before failing the turn', async () => {
+  await withFixture({
+    memory: ['{"query":"你好","keywords":[],"candidates":[]}'],
+    brain: ['收到，看起来链路很顺畅。', '{"reply":"你好呀","usedFactIds":[]}'],
+    supervisor: ['{"approved":true,"issues":[]}']
+  }, async ({ codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(31));
+    const brainCalls = codex.calls.filter(call => call.role === 'brain');
+    assert.equal(result.reply.content, '你好呀');
+    assert.equal(brainCalls.length, 2);
+    assert.ok(brainCalls.every(call => call.options.outputSchema));
+    assert.equal(brainCalls[1].input.protocolRepair.attempt, 2);
+  });
+});
+
+test('automatic trigger reaches brain as currentTrigger and never becomes user evidence', async () => {
+  await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(triggerEnvelope());
+    const memory = codex.calls.find(call => call.role === 'memory').input;
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    assert.equal(result.reply.speakerId, 'yuqi');
+    assert.equal(memory.currentMessageId, undefined);
+    assert.equal(memory.currentTrigger.triggerId, 'trigger_phone_20');
+    assert.equal(brain.currentUserMessage, undefined);
+    assert.equal(brain.currentTrigger.triggerType, 'proactive_chat');
+    assert.equal(store.listMessages('yuqi').filter(message => message.speakerType === 'user').length, 0);
   });
 });
