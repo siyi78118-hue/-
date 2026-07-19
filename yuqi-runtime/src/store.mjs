@@ -274,6 +274,7 @@ export class YuqiStore {
   submitTurn(input) {
     const envelope = validateEnvelope(input);
     const envelopeChecksum = contentHash(envelope);
+    const sourceMessageId = envelope.message?.messageId || envelope.trigger?.triggerId || '';
     const existing = this.getTurn(envelope.turnId);
     if (existing) {
       if (existing.envelopeChecksum !== envelopeChecksum) throw new Error('turn checksum conflict');
@@ -283,19 +284,21 @@ export class YuqiStore {
     const sequenceOwner = this.db.prepare(
       'SELECT turn_id, source_message_id FROM turns WHERE device_id = ? AND device_seq = ?'
     ).get(envelope.deviceId, envelope.deviceSeq);
-    if (sequenceOwner && sequenceOwner.source_message_id !== envelope.message.messageId) {
+    if (sequenceOwner && sequenceOwner.source_message_id !== sourceMessageId) {
       throw new Error('device sequence conflict');
     }
 
     return this.transaction(() => {
-      this.putMessageInternal({
-        ...envelope.message,
-        turnId: envelope.turnId,
-        characterId: envelope.characterId,
-        origin: 'phone',
-        deviceId: envelope.deviceId,
-        deviceSeq: envelope.deviceSeq
-      });
+      if (envelope.message) {
+        this.putMessageInternal({
+          ...envelope.message,
+          turnId: envelope.turnId,
+          characterId: envelope.characterId,
+          origin: 'phone',
+          deviceId: envelope.deviceId,
+          deviceSeq: envelope.deviceSeq
+        });
+      }
 
       this.db.prepare(`
         INSERT INTO turns(
@@ -307,7 +310,7 @@ export class YuqiStore {
         envelope.characterId,
         envelope.deviceId,
         envelope.deviceSeq,
-        envelope.message.messageId,
+        sourceMessageId,
         canonicalJson(envelope),
         envelopeChecksum,
         envelope.createdAt,

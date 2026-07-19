@@ -32,6 +32,46 @@ function validEnvelope(overrides = {}) {
   };
 }
 
+function validV2Envelope(overrides = {}) {
+  return {
+    protocolVersion: 2,
+    turnId: 'turn_device2_1',
+    characterId: 'yuqi',
+    deviceId: 'device2',
+    deviceSeq: 1,
+    createdAt: 1784400000000,
+    kind: 'DIRECT_REPLY',
+    message: {
+      messageId: 'msg_device2_1',
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: '你好',
+      sentAt: 1784400000000
+    },
+    ...overrides
+  };
+}
+
+function validTriggerEnvelope(overrides = {}) {
+  return {
+    protocolVersion: 2,
+    turnId: 'turn_device2_proactive_1',
+    characterId: 'yuqi',
+    deviceId: 'device2',
+    deviceSeq: 2,
+    createdAt: 1784400001000,
+    kind: 'PROACTIVE_CHAT',
+    trigger: {
+      triggerId: 'trigger_device2_proactive_1',
+      triggerType: 'proactive_chat',
+      scheduledFor: 1784400000000,
+      executedAt: 1784400001000
+    },
+    ...overrides
+  };
+}
+
 function withStore(run) {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-store-'));
   const file = join(dir, 'runtime.sqlite');
@@ -58,6 +98,28 @@ test('rejects an envelope whose speaker identity conflicts with its type', () =>
     }
   });
   assert.throws(() => validateEnvelope(value), /speaker mismatch/i);
+});
+
+test('protocol v2 direct turn preserves the exact user message and kind', () => {
+  const value = validateEnvelope(validV2Envelope());
+  assert.equal(value.protocolVersion, 2);
+  assert.equal(value.kind, 'DIRECT_REPLY');
+  assert.equal(value.message.speakerId, 'user');
+  assert.equal(value.message.content, '你好');
+  assert.equal(value.trigger, undefined);
+});
+
+test('protocol v2 automatic turn persists a trigger without creating a user message', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validTriggerEnvelope());
+  assert.equal(turn.sourceMessageId, 'trigger_device2_proactive_1');
+  assert.equal(store.listMessages('yuqi', 10).length, 0);
+}));
+
+test('protocol v2 automatic turn rejects a fabricated user message', () => {
+  assert.throws(
+    () => validateEnvelope(validTriggerEnvelope({ message: validV2Envelope().message })),
+    /automatic turn cannot contain a message/i
+  );
 });
 
 test('accepts only known durable turn states', () => {
@@ -141,4 +203,3 @@ test('sync deltas are ordered, checksummed, and acknowledged independently', () 
   assert.equal(store.ackSync('phone', delta.at(-1).seq), delta.at(-1).seq);
   assert.equal(store.getSyncCursor('phone'), delta.at(-1).seq);
 }));
-

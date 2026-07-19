@@ -16,6 +16,23 @@ export const TURN_STATES = Object.freeze([
 ]);
 
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const DIRECT_KINDS = new Set(['DIRECT_REPLY']);
+const AUTOMATIC_KINDS = new Set([
+  'ROLE_PLAN_CHAT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_CHAT_PRIVATE',
+  'ROLE_PLAN_MOMENT_PRIVATE',
+  'PROACTIVE_CHAT',
+  'PROACTIVE_MOMENT'
+]);
+const TRIGGER_TYPES = new Set([
+  'role_plan_chat',
+  'role_plan_moment',
+  'role_plan_chat_private',
+  'role_plan_moment_private',
+  'proactive_chat',
+  'proactive_moment'
+]);
 
 function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -53,7 +70,7 @@ function requireTimestamp(value, label) {
 
 export function validateEnvelope(value) {
   if (!value || typeof value !== 'object') throw new Error('invalid envelope');
-  if (value.protocolVersion !== 1) throw new Error('invalid protocolVersion');
+  if (![1, 2].includes(value.protocolVersion)) throw new Error('invalid protocolVersion');
 
   const envelope = {
     protocolVersion: value.protocolVersion,
@@ -72,7 +89,25 @@ export function validateEnvelope(value) {
   }
   requireTimestamp(envelope.createdAt, 'createdAt');
 
-  const message = envelope.message;
+  if (envelope.protocolVersion === 2) {
+    envelope.kind = String(value.kind || '');
+    if (DIRECT_KINDS.has(envelope.kind)) {
+      if (value.trigger !== undefined) throw new Error('direct turn cannot contain a trigger');
+    } else if (AUTOMATIC_KINDS.has(envelope.kind)) {
+      if (value.message !== undefined) throw new Error('automatic turn cannot contain a message');
+      delete envelope.message;
+      envelope.trigger = validateTrigger(value.trigger);
+      return envelope;
+    } else {
+      throw new Error('invalid turn kind');
+    }
+  }
+
+  validateUserMessage(envelope.message, envelope);
+  return envelope;
+}
+
+function validateUserMessage(message, envelope) {
   if (!message || typeof message !== 'object') throw new Error('invalid message');
   requireId(message.messageId, 'messageId', 'msg_');
   requireId(message.speakerId, 'speakerId');
@@ -87,5 +122,26 @@ export function validateEnvelope(value) {
   }
   if (typeof message.content !== 'string' || !message.content.trim()) throw new Error('empty message content');
   if (message.content.length > 100_000) throw new Error('message content too large');
-  return envelope;
+  return message;
+}
+
+function validateTrigger(trigger) {
+  if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) throw new Error('invalid trigger');
+  const normalized = {
+    triggerId: String(trigger.triggerId || ''),
+    triggerType: String(trigger.triggerType || ''),
+    scheduledFor: Number(trigger.scheduledFor),
+    executedAt: Number(trigger.executedAt)
+  };
+  requireId(normalized.triggerId, 'triggerId', 'trigger_');
+  if (!TRIGGER_TYPES.has(normalized.triggerType)) throw new Error('invalid triggerType');
+  requireTimestamp(normalized.scheduledFor, 'scheduledFor');
+  requireTimestamp(normalized.executedAt, 'executedAt');
+  if (trigger.context !== undefined) {
+    if (!trigger.context || typeof trigger.context !== 'object' || Array.isArray(trigger.context)) {
+      throw new Error('invalid trigger context');
+    }
+    normalized.context = structuredClone(trigger.context);
+  }
+  return normalized;
 }
