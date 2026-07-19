@@ -16,4 +16,240 @@
   --wm-radius-md: 14px;
   --wm-radius-lg: 18px;
   --wm-shadow-float: 0 14px 34px rgba(42, 48, 45, 0.14);
+
+  /* Keep the existing application contract while routing it through the new palette. */
+  --page: var(--wm-page);
+  --panel: var(--wm-card);
+  --line: var(--wm-line);
+  --line2: var(--wm-line);
+  --text: var(--wm-text);
+  --muted: var(--wm-muted);
+  --muted2: var(--wm-faint);
+  --green: var(--wm-jade);
+  --green2: var(--wm-outgoing);
+  --danger: var(--wm-danger);
+  --header: var(--wm-surface);
+  --tab: var(--wm-surface);
+  --bubble: var(--wm-card);
+  --radius: var(--wm-radius-sm);
+}
+
+html,
+body {
+  background: #dedbd4;
+  color: var(--wm-text);
+}
+
+#app,
+.screen,
+.page-pad,
+.form {
+  background: var(--wm-page);
+}
+
+.screen {
+  color: var(--wm-text);
+}
+
+.topbar {
+  height: 56px;
+  padding: 0 16px;
+  background: rgba(250, 248, 243, 0.97);
+  border-color: var(--wm-line);
+  color: var(--wm-text);
+  backdrop-filter: saturate(130%) blur(14px);
+}
+
+.top-title {
+  font-weight: 650;
+  letter-spacing: 0.01em;
+}
+
+.top-left,
+.top-right {
+  width: 96px;
+  min-width: 96px;
+  flex: 0 0 96px;
+}
+
+.icon-btn,
+.top-text-btn {
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 12px;
+  color: var(--wm-text);
+}
+
+.icon-btn:active,
+.top-text-btn:active {
+  background: rgba(71, 121, 100, 0.10);
+}
+
+.tabbar {
+  height: 62px;
+  background: rgba(250, 248, 243, 0.98);
+  border-color: var(--wm-line);
+  color: var(--wm-muted);
+  backdrop-filter: saturate(130%) blur(14px);
+}
+
+.tab,
+.tab .tab-ico {
+  color: var(--wm-muted);
+}
+
+.tab.active,
+.tab.active .tab-ico {
+  color: var(--wm-jade);
+}
+
+.search-bar,
+.search-top,
+.search-results,
+.search-section-title {
+  background: var(--wm-page);
+}
+
+.search-box,
+.search-field {
+  min-height: 44px;
+  border-radius: 12px;
+  background: var(--wm-card);
+  color: var(--wm-faint);
+  box-shadow: inset 0 0 0 1px rgba(42, 48, 45, 0.035);
+}
+
+.search-input {
+  color: var(--wm-text);
+}
+
+.search-input::placeholder {
+  color: var(--wm-faint);
+}
+
+.search-cancel {
+  min-width: 44px;
+  min-height: 44px;
+  color: var(--wm-jade);
+}
+
+.list,
+.wx-group,
+.cell-group {
+  background: var(--wm-card);
+}
+
+.row {
+  min-height: 72px;
+  padding: 0 16px;
+  gap: 12px;
+  background: var(--wm-card);
+  color: var(--wm-text);
+}
+
+.row:after {
+  background: var(--wm-line);
+}
+
+.row:active,
+.cell:active {
+  background: #f5f2ec;
+}
+
+.row.pinned {
+  background: var(--wm-surface);
+}
+
+.row-name {
+  color: var(--wm-text);
+  font-weight: 520;
+}
+
+.row-preview,
+.row-time,
+.mini,
+.cell-note {
+  color: var(--wm-muted);
+}
+
+.form {
+  padding-top: 14px;
+}
+
+.cell-group,
+.wx-group {
+  border-radius: var(--wm-radius-md);
+  box-shadow: 0 1px 0 rgba(42, 48, 45, 0.035);
+}
+
+.cell {
+  min-height: 56px;
+  padding: 10px 16px;
+  gap: 12px;
+  background: var(--wm-card);
+  border-color: var(--wm-line);
+  color: var(--wm-text);
+}
+
+.cell-label {
+  color: var(--wm-text);
+}
+
+.input,
+.textarea,
+.select {
+  color: var(--wm-text);
+}
+
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--wm-faint);
+}
+
+.primary {
+  min-height: 48px;
+  border-radius: 12px;
+  background: var(--wm-jade);
+  color: #ffffff;
+  box-shadow: 0 6px 16px rgba(71, 121, 100, 0.18);
+}
+
+.primary:active {
+  background: var(--wm-jade-pressed);
+}
+
+.secondary {
+  min-height: 46px;
+  border-radius: 12px;
+  background: var(--wm-card);
+  border-color: var(--wm-line);
+  color: var(--wm-text);
+}
+
+.switch {
+  background: #d8d9d5;
+  box-shadow: inset 0 0 0 1px rgba(42, 48, 45, 0.04);
+}
+
+.switch.on {
+  background: var(--wm-jade);
+}
+
+.avatar {
+  border-radius: 12px;
+  background-color: var(--wm-jade);
+  box-shadow: inset 0 0 0 1px rgba(42, 48, 45, 0.05);
+}
+
+#screen-contact-profile > .scroll,
+#screen-role-plans > .scroll,
+#screen-stage-personas > .scroll,
+#screen-discover > .scroll,
+#screen-me > .scroll,
+#screen-self-profile > .scroll,
+#screen-wallet > .scroll,
+#screen-pay > .scroll,
+#screen-chat-info > .scroll,
+#screen-moments > .scroll {
+  background: var(--wm-page) !important;
 }
