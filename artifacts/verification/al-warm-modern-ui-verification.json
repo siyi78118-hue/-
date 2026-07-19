@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "release": {
+    "package": "com.siyi.al",
+    "versionCode": 73,
+    "versionName": "1.0.73",
+    "webBuildVersion": "2026-07-19.93",
+    "artifact": "artifacts/AL-1.0.73-warm-modern-ui-verified.apk",
+    "sha256": "D5436F445772B06641D1C83AA0F48225E218E32B542A6460B080D66FB5636095",
+    "signingCertificateSha256": "383a167eb6c9264500c44c77f701c8176e15f997b726f7dd945350439b0a1a29",
+    "signingCertificateMatchedPreviousApk": true,
+    "installedVersionVerified": true
+  },
+  "assetHashes": [
+    {
+      "asset": "index.html",
+      "source": "9C81AB0BCE80828BE272E9FDDDF5653B9B0A423BC585936B44BAED5D4EF55A9D",
+      "capacitor": "9C81AB0BCE80828BE272E9FDDDF5653B9B0A423BC585936B44BAED5D4EF55A9D",
+      "apk": "9C81AB0BCE80828BE272E9FDDDF5653B9B0A423BC585936B44BAED5D4EF55A9D"
+    },
+    {
+      "asset": "warm-modern.css",
+      "source": "AB58D25C9A07B24D204F135986A7BE68B5462285560656F26440C1A23406253D",
+      "capacitor": "AB58D25C9A07B24D204F135986A7BE68B5462285560656F26440C1A23406253D",
+      "apk": "AB58D25C9A07B24D204F135986A7BE68B5462285560656F26440C1A23406253D"
+    }
+  ],
+  "ui": {
+    "screens": 19,
+    "viewports": [
+      "360x800",
+      "393x873",
+      "520x900"
+    ],
+    "hostedProbeCount": 57,
+    "installedApkProbeCount": 57,
+    "boundaryFailures": 0,
+    "horizontalOverflow": 0,
+    "backstageConversationRows": 0,
+    "manualInstalledVisualSmoke": "passed"
+  },
+  "tests": {
+    "explicitContractCommand": "node --test tests/al-warm-modern-ui-contract.test.mjs tests/al-warm-modern-cdp-contract.test.mjs",
+    "contractFailures": 0,
+    "regressionFailures": 0,
+    "yuqiVerifierFailures": 0,
+    "exactApkSmoke": "passed"
+  },
+  "privacy": {
+    "chatContentIncluded": false,
+    "secretsIncluded": false,
+    "internalReasoningIncluded": false
+  }
+}

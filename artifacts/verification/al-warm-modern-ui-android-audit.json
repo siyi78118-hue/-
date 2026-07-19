@@ -1,0 +1,5630 @@
+{
+  "schemaVersion": 1,
+  "viewports": [
+    "360x800",
+    "393x873",
+    "520x900"
+  ],
+  "screenCount": 19,
+  "probeCount": 57,
+  "expectedProbeCount": 57,
+  "aggregateFailures": {
+    "horizontalOverflow": 0,
+    "viewportClipping": 0,
+    "topbarOverlap": 0,
+    "scrollTopReachable": 0,
+    "scrollBottomReachable": 0,
+    "footerClipping": 0,
+    "touchTargetFailures": 0,
+    "warmModernStylesheetMissing": 0,
+    "legacyGrayBackground": 0,
+    "backstageConversationRows": 0
+  },
+  "backstageConversationRows": 0,
+  "failedProbes": [],
+  "probes": [
+    {
+      "screenId": "screen-chats",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 738,
+          "width": 360,
+          "height": 682
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 260,
+            "top": 5.62,
+            "right": 304,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [
+          {
+            "left": 0,
+            "top": 738,
+            "right": 360,
+            "bottom": 800,
+            "width": 360,
+            "height": 62
+          }
+        ],
+        "touchTargets": [
+          {
+            "left": 260,
+            "top": 5.62,
+            "right": 304,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-search",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 52,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 748
+        },
+        "topbar": null,
+        "title": null,
+        "sideControls": [],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 304,
+            "top": 3.62,
+            "right": 348,
+            "bottom": 47.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chat",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": null,
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": null,
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [
+          {
+            "left": 0,
+            "top": 741.24,
+            "right": 360,
+            "bottom": 800,
+            "width": 360,
+            "height": 58.76
+          }
+        ],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 6,
+            "top": 749,
+            "right": 50,
+            "bottom": 793,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 202,
+            "top": 749,
+            "right": 246,
+            "bottom": 793,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 250,
+            "top": 749,
+            "right": 294,
+            "bottom": 793,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 298,
+            "top": 749,
+            "right": 354,
+            "bottom": 793,
+            "width": 56,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chat-info",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 1346.95,
+            "right": 346,
+            "bottom": 1394.95,
+            "width": 332,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-contacts",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 738,
+          "width": 360,
+          "height": 682
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 738,
+            "right": 360,
+            "bottom": 800,
+            "width": 360,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-contact-profile",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 12,
+            "top": 514.76,
+            "right": 348,
+            "bottom": 562.76,
+            "width": 336,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-discover",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 738,
+          "width": 360,
+          "height": 682
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 738,
+            "right": 360,
+            "bottom": 800,
+            "width": 360,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-moments",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-me",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 738,
+          "width": 360,
+          "height": 682
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 738,
+            "right": 360,
+            "bottom": 800,
+            "width": 360,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-self-profile",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-settings",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 251.26,
+            "top": 357.05,
+            "right": 331.24,
+            "bottom": 401.05,
+            "width": 79.98,
+            "height": 44
+          },
+          {
+            "left": 251.26,
+            "top": 762.86,
+            "right": 331.24,
+            "bottom": 806.86,
+            "width": 79.98,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 3142
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-import",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 711.86,
+            "right": 346,
+            "bottom": 759.86,
+            "width": 332,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-role-plans",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 485.24,
+            "right": 346,
+            "bottom": 533.24,
+            "width": 332,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-stage-personas",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 634.48,
+            "right": 346,
+            "bottom": 682.48,
+            "width": 332,
+            "height": 48
+          },
+          {
+            "left": 14,
+            "top": 700.48,
+            "right": 346,
+            "bottom": 746.48,
+            "width": 332,
+            "height": 46
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-memory",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-memory-edit",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 523.52,
+            "right": 346,
+            "bottom": 571.52,
+            "width": 332,
+            "height": 48
+          },
+          {
+            "left": 14,
+            "top": 589.52,
+            "right": 346,
+            "bottom": 635.52,
+            "width": 332,
+            "height": 46
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-diagnostics",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 308,
+            "top": 5.62,
+            "right": 352,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 43
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-wallet",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-pay",
+      "viewport": "360x800",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 360,
+          "height": 800
+        },
+        "document": {
+          "clientWidth": 360,
+          "clientHeight": 800,
+          "scrollWidth": 360,
+          "scrollHeight": 800
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 800
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 360,
+          "bottom": 800,
+          "width": 360,
+          "height": 744
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 360,
+          "bottom": 56,
+          "width": 360,
+          "height": 56
+        },
+        "title": {
+          "left": 114,
+          "top": 16,
+          "right": 246,
+          "bottom": 39.24,
+          "width": 132,
+          "height": 23.24
+        },
+        "sideControls": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 8,
+            "top": 5.62,
+            "right": 52,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 420.76,
+            "right": 346,
+            "bottom": 468.76,
+            "width": 332,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chats",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 811.14,
+          "width": 393.14,
+          "height": 755.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 281.14,
+            "top": 5.62,
+            "right": 325.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [
+          {
+            "left": 0,
+            "top": 811.14,
+            "right": 393.14,
+            "bottom": 873.14,
+            "width": 393.14,
+            "height": 62
+          }
+        ],
+        "touchTargets": [
+          {
+            "left": 281.14,
+            "top": 5.62,
+            "right": 325.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-search",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 52,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 821.14
+        },
+        "topbar": null,
+        "title": null,
+        "sideControls": [],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 337.14,
+            "top": 3.62,
+            "right": 381.14,
+            "bottom": 47.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chat",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": null,
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": null,
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [
+          {
+            "left": 0,
+            "top": 814.38,
+            "right": 393.14,
+            "bottom": 873.14,
+            "width": 393.14,
+            "height": 58.76
+          }
+        ],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 8,
+            "top": 822.14,
+            "right": 52,
+            "bottom": 866.14,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 229.14,
+            "top": 822.14,
+            "right": 273.14,
+            "bottom": 866.14,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 279.14,
+            "top": 822.14,
+            "right": 323.14,
+            "bottom": 866.14,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 329.14,
+            "top": 822.14,
+            "right": 385.14,
+            "bottom": 866.14,
+            "width": 56,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chat-info",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 1346.95,
+            "right": 379.14,
+            "bottom": 1394.95,
+            "width": 365.14,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-contacts",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 811.14,
+          "width": 393.14,
+          "height": 755.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 811.14,
+            "right": 393.14,
+            "bottom": 873.14,
+            "width": 393.14,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-contact-profile",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 12,
+            "top": 514.76,
+            "right": 381.14,
+            "bottom": 562.76,
+            "width": 369.14,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-discover",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 811.14,
+          "width": 393.14,
+          "height": 755.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 811.14,
+            "right": 393.14,
+            "bottom": 873.14,
+            "width": 393.14,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-moments",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-me",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 811.14,
+          "width": 393.14,
+          "height": 755.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 811.14,
+            "right": 393.14,
+            "bottom": 873.14,
+            "width": 393.14,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-self-profile",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-settings",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 284.4,
+            "top": 357.05,
+            "right": 364.38,
+            "bottom": 401.05,
+            "width": 79.98,
+            "height": 44
+          },
+          {
+            "left": 284.4,
+            "top": 762.86,
+            "right": 364.38,
+            "bottom": 806.86,
+            "width": 79.98,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 3058
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-import",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 711.86,
+            "right": 379.14,
+            "bottom": 759.86,
+            "width": 365.14,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-role-plans",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 485.24,
+            "right": 379.14,
+            "bottom": 533.24,
+            "width": 365.14,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-stage-personas",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 634.48,
+            "right": 379.14,
+            "bottom": 682.48,
+            "width": 365.14,
+            "height": 48
+          },
+          {
+            "left": 14,
+            "top": 700.48,
+            "right": 379.14,
+            "bottom": 746.48,
+            "width": 365.14,
+            "height": 46
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-memory",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-memory-edit",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 523.52,
+            "right": 379.14,
+            "bottom": 571.52,
+            "width": 365.14,
+            "height": 48
+          },
+          {
+            "left": 14,
+            "top": 589.52,
+            "right": 379.14,
+            "bottom": 635.52,
+            "width": 365.14,
+            "height": 46
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-diagnostics",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 333.14,
+            "top": 5.62,
+            "right": 377.14,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-wallet",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-pay",
+      "viewport": "393x873",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 393,
+          "height": 873
+        },
+        "document": {
+          "clientWidth": 393,
+          "clientHeight": 873,
+          "scrollWidth": 393,
+          "scrollHeight": 873
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 873.14
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 393.14,
+          "bottom": 873.14,
+          "width": 393.14,
+          "height": 817.14
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 393.14,
+          "bottom": 56,
+          "width": 393.14,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 271.14,
+          "bottom": 40,
+          "width": 149.14,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 420.76,
+            "right": 379.14,
+            "bottom": 468.76,
+            "width": 365.14,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chats",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 838.19,
+          "width": 520,
+          "height": 782.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 408,
+            "top": 5.62,
+            "right": 452,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [
+          {
+            "left": 0,
+            "top": 838.19,
+            "right": 520,
+            "bottom": 900.19,
+            "width": 520,
+            "height": 62
+          }
+        ],
+        "touchTargets": [
+          {
+            "left": 408,
+            "top": 5.62,
+            "right": 452,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-search",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 52,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 848.19
+        },
+        "topbar": null,
+        "title": null,
+        "sideControls": [],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 464,
+            "top": 3.62,
+            "right": 508,
+            "bottom": 47.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chat",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": null,
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": null,
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [
+          {
+            "left": 0,
+            "top": 841.43,
+            "right": 520,
+            "bottom": 900.19,
+            "width": 520,
+            "height": 58.76
+          }
+        ],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 8,
+            "top": 849.19,
+            "right": 52,
+            "bottom": 893.19,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 356,
+            "top": 849.19,
+            "right": 400,
+            "bottom": 893.19,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 406,
+            "top": 849.19,
+            "right": 450,
+            "bottom": 893.19,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 456,
+            "top": 849.19,
+            "right": 512,
+            "bottom": 893.19,
+            "width": 56,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-chat-info",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 1346.95,
+            "right": 506,
+            "bottom": 1394.95,
+            "width": 492,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-contacts",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 838.19,
+          "width": 520,
+          "height": 782.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 838.19,
+            "right": 520,
+            "bottom": 900.19,
+            "width": 520,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-contact-profile",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 12,
+            "top": 514.76,
+            "right": 508,
+            "bottom": 562.76,
+            "width": 496,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-discover",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 838.19,
+          "width": 520,
+          "height": 782.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 838.19,
+            "right": 520,
+            "bottom": 900.19,
+            "width": 520,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-moments",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-me",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 838.19,
+          "width": 520,
+          "height": 782.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [],
+        "footers": [
+          {
+            "left": 0,
+            "top": 838.19,
+            "right": 520,
+            "bottom": 900.19,
+            "width": 520,
+            "height": 62
+          }
+        ],
+        "touchTargets": [],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-self-profile",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-settings",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 411.26,
+            "top": 357.05,
+            "right": 491.24,
+            "bottom": 401.05,
+            "width": 79.98,
+            "height": 44
+          },
+          {
+            "left": 411.26,
+            "top": 762.86,
+            "right": 491.24,
+            "bottom": 806.86,
+            "width": 79.98,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 3001
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-import",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 711.86,
+            "right": 506,
+            "bottom": 759.86,
+            "width": 492,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-role-plans",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 485.24,
+            "right": 506,
+            "bottom": 533.24,
+            "width": 492,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-stage-personas",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 634.48,
+            "right": 506,
+            "bottom": 682.48,
+            "width": 492,
+            "height": 48
+          },
+          {
+            "left": 14,
+            "top": 700.48,
+            "right": 506,
+            "bottom": 746.48,
+            "width": 492,
+            "height": 46
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-memory",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-memory-edit",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 523.52,
+            "right": 506,
+            "bottom": 571.52,
+            "width": 492,
+            "height": 48
+          },
+          {
+            "left": 14,
+            "top": 589.52,
+            "right": 506,
+            "bottom": 635.52,
+            "width": 492,
+            "height": 46
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-diagnostics",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 460,
+            "top": 5.62,
+            "right": 504,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-wallet",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    },
+    {
+      "screenId": "screen-pay",
+      "viewport": "520x900",
+      "boundaries": {
+        "horizontalOverflow": false,
+        "viewportClipping": false,
+        "topbarOverlap": false,
+        "scrollTopReachable": true,
+        "scrollBottomReachable": true,
+        "footerClipping": false,
+        "touchTargetFailures": 0,
+        "warmModernStylesheetMissing": false,
+        "legacyGrayBackground": false,
+        "backstageConversationRows": 0
+      },
+      "bounds": {
+        "viewport": {
+          "width": 520,
+          "height": 900
+        },
+        "document": {
+          "clientWidth": 520,
+          "clientHeight": 900,
+          "scrollWidth": 520,
+          "scrollHeight": 900
+        },
+        "app": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "activeScreen": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 900.19
+        },
+        "scroll": {
+          "left": 0,
+          "top": 56,
+          "right": 520,
+          "bottom": 900.19,
+          "width": 520,
+          "height": 844.19
+        },
+        "topbar": {
+          "left": 0,
+          "top": 0,
+          "right": 520,
+          "bottom": 56,
+          "width": 520,
+          "height": 56
+        },
+        "title": {
+          "left": 122,
+          "top": 15.24,
+          "right": 398,
+          "bottom": 40,
+          "width": 276,
+          "height": 24.76
+        },
+        "sideControls": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          }
+        ],
+        "footers": [],
+        "touchTargets": [
+          {
+            "left": 16,
+            "top": 5.62,
+            "right": 60,
+            "bottom": 49.62,
+            "width": 44,
+            "height": 44
+          },
+          {
+            "left": 14,
+            "top": 420.76,
+            "right": 506,
+            "bottom": 468.76,
+            "width": 492,
+            "height": 48
+          }
+        ],
+        "scrollMaximum": 0
+      },
+      "failureTypes": []
+    }
+  ],
+  "chatContentsIncluded": false,
+  "matrixComplete": true
+}
