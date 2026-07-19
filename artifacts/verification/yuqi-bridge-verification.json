@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "verifiedAt": "2026-07-19T19:16:00+08:00",
+  "verifiedAt": "2026-07-19T19:22:00+08:00",
   "release": {
     "packageName": "com.siyi.al",
     "versionCode": 72,
@@ -81,6 +81,26 @@
     "sameReply": true,
     "duplicateDeliveries": 0,
     "fallbackReconciliationWithoutSecondReply": "passed"
+  },
+  "formalDeployment": {
+    "port": 17891,
+    "preRestartSnapshot": "yuqi-memory-20260719-111954Z.sqlite",
+    "health": "passed",
+    "roleThreadsRestored": [
+      "memory",
+      "brain",
+      "supervisor"
+    ],
+    "presetVersion": "1.1.0",
+    "contextLimit": 200,
+    "startupErrors": 0
+  },
+  "cloudRoundTrip": {
+    "encryptedProbeEnqueued": true,
+    "decryptedLocally": true,
+    "plaintextFieldsStored": false,
+    "acknowledgedAndDeleted": true,
+    "chatOrMemoryCreated": false
   },
   "privacy": {
     "chatContentsIncluded": false,
