@@ -74,6 +74,7 @@ export class CloudRelayPump {
     this.timer = null;
     this.running = false;
     this.lastDiagnosticAt = 0;
+    this.messageDiagnosticTimes = new Map();
     this.relayStatus = {
       enabled: true,
       proxyEnabled: this.proxyEnabled,
@@ -129,8 +130,9 @@ export class CloudRelayPump {
       const payload = await response.json();
       const messages = Array.isArray(payload.messages) ? payload.messages : [];
       for (const message of messages) {
+        let envelope = null;
         try {
-          const envelope = decryptRelayPayload(message, this.encryptionKeyBase64);
+          envelope = decryptRelayPayload(message, this.encryptionKeyBase64);
           let recoveryAckSeq = 0;
           if (this.reconciler && envelope.recovery && Array.isArray(envelope.recovery.entries)) {
             const recovery = await this.reconciler.reconcileFrom(envelope.recovery);
@@ -189,8 +191,22 @@ export class CloudRelayPump {
           });
           if (!acked.ok) throw new Error(`cloud relay ack HTTP ${acked.status}`);
           summary.processed += 1;
-        } catch {
+        } catch (error) {
           summary.failed += 1;
+          const now = this.clock();
+          const relayMessageId = String(message?.messageId || '').slice(0, 128);
+          const previous = Number(this.messageDiagnosticTimes.get(relayMessageId) || 0);
+          if (this.store?.putDiagnostic && (previous === 0 || now - previous >= 60_000)) {
+            const raw = String(error?.message || error || 'cloud relay message failed');
+            const safeMessage = raw.replaceAll(this.deviceToken, '[redacted]').slice(0, 160);
+            this.store.putDiagnostic({
+              turnId: envelope?.turnId || null,
+              stage: 'cloud_relay_message',
+              level: 'error',
+              detail: { relayMessageId, message: safeMessage }
+            });
+            this.messageDiagnosticTimes.set(relayMessageId, now);
+          }
         }
       }
       if (this.outbox && typeof this.outbox.flushOnce === 'function') await this.outbox.flushOnce();

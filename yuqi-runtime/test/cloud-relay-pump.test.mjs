@@ -97,15 +97,25 @@ test('decrypts a phone envelope, reconciles first, and enqueues one opaque reply
 
 test('does not acknowledge input when a role fails, so recovery can retry it', async () => {
   const relay = relayFixture();
+  const diagnostics = [];
   const pump = new CloudRelayPump({
     relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
     encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
-    orchestrator: { async process() { throw new Error('supervisor unavailable'); } }
+    orchestrator: { async process() { throw new Error('supervisor unavailable'); } },
+    store: { putDiagnostic(value) { diagnostics.push(value); } },
+    clock: () => 1784512000000
   });
   const result = await pump.pumpOnce();
   assert.equal(result.failed, 1);
   assert.deepEqual(relay.state.acked, []);
   assert.equal(relay.state.enqueued.length, 0);
+  assert.equal(diagnostics.length, 1);
+  assert.equal(diagnostics[0].turnId, envelope.turnId);
+  assert.equal(diagnostics[0].stage, 'cloud_relay_message');
+  assert.deepEqual(diagnostics[0].detail, {
+    relayMessageId: 'relay_phone_cloud_1',
+    message: 'supervisor unavailable'
+  });
 });
 
 test('poll failure remains unacknowledged and becomes visible in relay status', async () => {
