@@ -1,0 +1,179 @@
+name: Publish External Android APK
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: Draft release tag containing source.apk
+        required: true
+        type: string
+      version_code:
+        description: Android versionCode to publish
+        required: true
+        type: string
+      source_sha256:
+        description: Expected SHA-256 of source.apk
+        required: true
+        type: string
+
+concurrency:
+  group: al-external-android-apk-release
+  cancel-in-progress: false
+
+jobs:
+  resign-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      EXPECTED_PACKAGE: com.siyi.al
+      EXPECTED_VERSION_CODE: "74"
+      EXPECTED_VERSION_NAME: "1.0.74"
+      EXPECTED_SOURCE_SHA256: 358FC28355725B4DDE625E8BEC5122A1D0042F7DEE360E02AF0426141CA15425
+      EXPECTED_SOURCE_SIGNER_SHA256: 383A167EB6C9264500C44C77F701C8176E15F997B726F7DD945350439B0A1A29
+      EXPECTED_TARGET_SIGNER_SHA256: 5761277E3BDF4A64236C3BAD569DE6A07666581F643167D01E37F13E9E832B2B
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate requested release
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          SOURCE_SHA256: ${{ inputs.source_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_TAG" = "android-v74-source-20260720"
+          test "$VERSION_CODE" = "$EXPECTED_VERSION_CODE"
+          test "$(printf '%s' "$SOURCE_SHA256" | tr '[:lower:]' '[:upper:]')" = "$EXPECTED_SOURCE_SHA256"
+          CURRENT_MANIFEST="$(gh api -H 'Accept: application/vnd.github.raw+json' 'repos/${{ github.repository }}/contents/android-update.json?ref=update-channel')"
+          CURRENT_BUILD="$(printf '%s' "$CURRENT_MANIFEST" | jq -r '.latestBuild // 0')"
+          if [ "$CURRENT_BUILD" -ge "$EXPECTED_VERSION_CODE" ]; then
+            echo "current update build is not lower than requested build" >&2
+            exit 1
+          fi
+
+      - name: Download source APK
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p input output signing
+          gh release download "$SOURCE_TAG" --repo '${{ github.repository }}' --pattern source.apk --dir input
+          test -s input/source.apk
+
+      - name: Validate source APK
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS_DIR="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          AAPT="$BUILD_TOOLS_DIR/aapt"
+          APKSIGNER="$BUILD_TOOLS_DIR/apksigner"
+          ZIPALIGN="$BUILD_TOOLS_DIR/zipalign"
+          test -x "$AAPT"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
+          printf 'AAPT=%s\nAPKSIGNER=%s\nZIPALIGN=%s\n' "$AAPT" "$APKSIGNER" "$ZIPALIGN" >> "$GITHUB_ENV"
+
+          ACTUAL_SHA256="$(sha256sum input/source.apk | awk '{print toupper($1)}')"
+          test "$ACTUAL_SHA256" = "$EXPECTED_SOURCE_SHA256"
+          BADGING="$("$AAPT" dump badging input/source.apk)"
+          printf '%s\n' "$BADGING" | grep -F "package: name='$EXPECTED_PACKAGE' versionCode='$EXPECTED_VERSION_CODE' versionName='$EXPECTED_VERSION_NAME'"
+          "$APKSIGNER" verify --verbose --print-certs input/source.apk
+          SOURCE_SIGNER_SHA256="$("$APKSIGNER" verify --print-certs input/source.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr '[:lower:]' '[:upper:]')"
+          test "$SOURCE_SIGNER_SHA256" = "$EXPECTED_SOURCE_SIGNER_SHA256"
+
+      - name: Restore stable Android signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEYSTORE_BASE64"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > signing/al-release.p12
+          test -s signing/al-release.p12
+
+      - name: Align and resign APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEYSTORE_PASSWORD"
+          test -n "$ANDROID_KEY_ALIAS"
+          test -n "$ANDROID_KEY_PASSWORD"
+          "$ZIPALIGN" -f -p 4 input/source.apk output/aligned.apk
+          "$APKSIGNER" sign \
+            --ks signing/al-release.p12 \
+            --ks-type PKCS12 \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --v1-signing-enabled false \
+            --v2-signing-enabled true \
+            --out output/app-release.apk \
+            output/aligned.apk
+
+      - name: Validate resigned APK
+        run: |
+          set -euo pipefail
+          "$ZIPALIGN" -c -p 4 output/app-release.apk
+          "$APKSIGNER" verify --verbose --print-certs output/app-release.apk
+          TARGET_SIGNER_SHA256="$("$APKSIGNER" verify --print-certs output/app-release.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr '[:lower:]' '[:upper:]')"
+          test "$TARGET_SIGNER_SHA256" = "$EXPECTED_TARGET_SIGNER_SHA256"
+          BADGING="$("$AAPT" dump badging output/app-release.apk)"
+          printf '%s\n' "$BADGING" | grep -F "package: name='$EXPECTED_PACKAGE' versionCode='$EXPECTED_VERSION_CODE' versionName='$EXPECTED_VERSION_NAME'"
+          python - <<'PY'
+          import hashlib
+          import zipfile
+
+          def payload(path):
+              with zipfile.ZipFile(path) as archive:
+                  return {
+                      name: hashlib.sha256(archive.read(name)).hexdigest()
+                      for name in archive.namelist()
+                      if not name.upper().startswith("META-INF/")
+                  }
+
+          source = payload("input/source.apk")
+          resigned = payload("output/app-release.apk")
+          if source.keys() != resigned.keys():
+              raise SystemExit("APK entry list differs")
+          if source != resigned:
+              raise SystemExit("APK payload differs")
+          PY
+          sha256sum output/app-release.apk > output/app-release.apk.sha256
+
+      - name: Publish Android release
+        run: |
+          set -euo pipefail
+          TAG="android-v$EXPECTED_VERSION_CODE"
+          if gh release view "$TAG" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            gh release upload "$TAG" output/app-release.apk --repo '${{ github.repository }}' --clobber
+            gh release edit "$TAG" --repo '${{ github.repository }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证 1.0.74 成品使用现有 AL 正式证书重新签名，可通过应用内更新覆盖安装。" --latest
+          else
+            gh release create "$TAG" --repo '${{ github.repository }}' --target '${{ github.sha }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证 1.0.74 成品使用现有 AL 正式证书重新签名，可通过应用内更新覆盖安装。" --latest "output/app-release.apk#AL-$EXPECTED_VERSION_NAME-release.apk"
+          fi
+          ASSET_NAME="$(gh release view "$TAG" --repo '${{ github.repository }}' --json assets --jq '.assets[] | select(.name == "app-release.apk") | .name')"
+          test "$ASSET_NAME" = "app-release.apk"
+
+      - name: Publish automatic update manifest
+        run: |
+          set -euo pipefail
+          MANIFEST=$(printf '{\n  "latestBuild": %s,\n  "version": "%s",\n  "releaseUrl": "https://github.com/%s/releases/download/android-v%s/app-release.apk"\n}\n' \
+            "$EXPECTED_VERSION_CODE" \
+            "$EXPECTED_VERSION_NAME" \
+            '${{ github.repository }}' \
+            "$EXPECTED_VERSION_CODE")
+          EXISTING_SHA=$(gh api "repos/${{ github.repository }}/contents/android-update.json?ref=update-channel" --jq '.sha')
+          CONTENT=$(printf '%s' "$MANIFEST" | base64 -w 0)
+          gh api --method PUT "repos/${{ github.repository }}/contents/android-update.json" \
+            -f message="Update Android channel to $EXPECTED_VERSION_NAME" \
+            -f content="$CONTENT" \
+            -f branch='update-channel' \
+            -f sha="$EXISTING_SHA"
+
+      - name: Remove temporary source release
+        if: success()
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: gh release delete "$SOURCE_TAG" --repo '${{ github.repository }}' --cleanup-tag --yes
