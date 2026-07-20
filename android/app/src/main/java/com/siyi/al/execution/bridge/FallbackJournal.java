@@ -136,7 +136,7 @@ public final class FallbackJournal {
             for (int index = 0; index < keys.size(); index += 1) {
                 if (index > 0) output.append(',');
                 String key = keys.get(index);
-                output.append(JSONObject.quote(key)).append(':').append(canonical(object.get(key)));
+                output.append(jsonQuote(key)).append(':').append(canonical(object.get(key)));
             }
             return output.append('}').toString();
         }
@@ -149,9 +149,16 @@ public final class FallbackJournal {
             }
             return output.append(']').toString();
         }
-        if (value instanceof String) return JSONObject.quote((String) value);
+        if (value instanceof String) return jsonQuote((String) value);
         if (value instanceof Boolean || value instanceof Number) return String.valueOf(value);
-        return JSONObject.quote(String.valueOf(value));
+        return jsonQuote(String.valueOf(value));
+    }
+
+    private static String jsonQuote(String value) {
+        // JSONObject follows an older JSON convention and escapes '/', while
+        // JavaScript JSON.stringify does not. The bridge checksum is shared
+        // across Android and Node, so use the JavaScript canonical form.
+        return JSONObject.quote(value).replace("\\/", "/");
     }
 
     private static String sha256(String value) throws Exception {

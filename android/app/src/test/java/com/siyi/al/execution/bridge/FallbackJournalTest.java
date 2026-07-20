@@ -23,6 +23,23 @@ public class FallbackJournalTest {
         );
     }
 
+    @Test public void checksumMatchesJavascriptCanonicalJsonWhenContentContainsClosingTag() throws Exception {
+        RawMessageEntity reply = message(
+            "msg_slash",
+            "yuqi",
+            "character",
+            "fallback",
+            12L,
+            "<al_schedule>{\"next\":\"later\"}</al_schedule>"
+        );
+        JSONObject packet = FallbackJournal.buildPacket("phone_a", 11L, Arrays.asList(reply));
+
+        assertEquals(
+            "05ad0d2a6abc19e6b6aa7b0b1af1b2e4dfe891107e7c8415864241b364b41af5",
+            packet.getJSONArray("entries").getJSONObject(0).getString("checksum")
+        );
+    }
+
     private static RawMessageEntity message(String id, String speakerId, String speakerType, String origin, long seq, String content) {
         RawMessageEntity value = new RawMessageEntity();
         value.messageId = id;

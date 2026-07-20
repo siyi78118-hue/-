@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { contentHash } from '../src/protocol.mjs';
+import { canonicalJson, contentHash } from '../src/protocol.mjs';
 import { YuqiReconciler } from '../src/reconcile.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
@@ -149,6 +150,29 @@ test('invalid sync checksums stop reconciliation before facts can be promoted', 
     /checksum/
   );
   assert.equal(store.getSyncCursor('phone_a'), 10);
+}));
+
+test('accepts the exact legacy Android checksum that escaped forward slashes', async () => withStore(async store => {
+  const payload = {
+    messageId: 'msg_legacy_slash', turnId: 'turn_legacy_slash', characterId: 'yuqi',
+    speakerId: 'yuqi', speakerType: 'character', recipientId: 'user',
+    content: '<al_schedule>{"next":"later"}</al_schedule>', sentAt: 1784400003000,
+    origin: 'legacy_fallback', deviceId: 'phone_a:legacy', deviceSeq: 14
+  };
+  const legacyChecksum = createHash('sha256')
+    .update(canonicalJson(payload).replaceAll('/', '\\/'), 'utf8')
+    .digest('hex');
+  const entry = { ...messageEntry(14, payload), checksum: legacyChecksum };
+  const reconciler = new YuqiReconciler({
+    store,
+    codex: { async runTurn() { return { text: '{"candidates":[]}' }; } }
+  });
+
+  const result = await reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 13, entries: [entry] });
+
+  assert.equal(result.importedMessages, 1);
+  assert.equal(store.getMessage('msg_legacy_slash').content, payload.content);
+  assert.equal(store.getSyncCursor('phone_a'), 14);
 }));
 
 test('imports an evidence-linked human annotation for later preset publication', async () => withStore(async store => {

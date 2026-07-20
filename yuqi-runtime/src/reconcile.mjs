@@ -1,11 +1,19 @@
+import { createHash } from 'node:crypto';
+
 import { commitVerifiedFacts } from './evidence-memory.mjs';
-import { contentHash } from './protocol.mjs';
+import { canonicalJson, contentHash } from './protocol.mjs';
 
 function parseRoleJson(text) {
   const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   const value = JSON.parse(source);
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('memory recovery returned invalid JSON');
   return value;
+}
+
+function legacyAndroidContentHash(value) {
+  return createHash('sha256')
+    .update(canonicalJson(value).replaceAll('/', '\\/'), 'utf8')
+    .digest('hex');
 }
 
 function validateEntries(entries) {
@@ -18,7 +26,10 @@ function validateEntries(entries) {
     if (seen.has(entry.seq)) throw new Error('duplicate sync sequence');
     seen.add(entry.seq);
     if (!['message', 'annotation'].includes(entry.entityType)) continue;
-    if (entry.checksum !== contentHash(entry.payload)) throw new Error(`sync checksum mismatch at ${entry.seq}`);
+    const checksum = String(entry.checksum || '');
+    if (checksum !== contentHash(entry.payload) && checksum !== legacyAndroidContentHash(entry.payload)) {
+      throw new Error(`sync checksum mismatch at ${entry.seq}`);
+    }
   }
 }
 
