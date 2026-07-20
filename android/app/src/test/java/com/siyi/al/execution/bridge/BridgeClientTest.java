@@ -47,6 +47,17 @@ public class BridgeClientTest {
             .getJSONObject("snapshot").getString("relationshipStage"));
     }
 
+    @Test public void legacyInternalAutomaticIdGetsAProtocolSafeTurnPrefix() throws Exception {
+        TurnSubmission submission = new TurnSubmission(
+            "cloud_proactive_job_1", "yuqi", "trigger_proactive_1", TurnKind.PROACTIVE_CHAT,
+            "{\"scheduledFor\":1784400000000}", "{}", "job_1", 1784400000100L
+        );
+
+        JSONObject envelope = BridgeInput.envelope(submission, config("http://lan.example"));
+
+        assertEquals("turn_cloud_proactive_job_1", envelope.getString("turnId"));
+    }
+
     @Test public void lanAcceptedTurnPollsWithFreshSignedGetsUntilCommitted() throws Exception {
         FakeTransport transport = new FakeTransport();
         transport.responses.add(new BridgeClient.HttpResult(202,

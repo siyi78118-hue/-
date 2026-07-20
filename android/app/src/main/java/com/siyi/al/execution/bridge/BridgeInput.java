@@ -31,9 +31,14 @@ final class BridgeInput {
     }
 
     static JSONObject envelope(TurnSubmission submission, BridgeConfig config) throws Exception {
+        String wireTurnId = submission.turnId.startsWith("turn_")
+            ? submission.turnId
+            : (submission.kind == com.siyi.al.execution.TurnKind.DIRECT_REPLY
+                ? submission.turnId
+                : "turn_" + submission.turnId);
         JSONObject envelope = new JSONObject()
             .put("protocolVersion", 2)
-            .put("turnId", submission.turnId)
+            .put("turnId", wireTurnId)
             .put("characterId", submission.characterId)
             .put("deviceId", config.deviceId)
             .put("deviceSeq", deviceSeq(submission))

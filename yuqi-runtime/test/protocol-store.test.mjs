@@ -116,6 +116,15 @@ test('protocol v2 automatic turn persists a trigger without creating a user mess
   assert.equal(store.listMessages('yuqi', 10).length, 0);
 }));
 
+test('normalizes authenticated legacy Android automatic turn IDs without widening direct-message IDs', () => {
+  const automatic = validateEnvelope(validTriggerEnvelope({ turnId: 'cloud_proactive_job_1' }));
+  assert.equal(automatic.turnId, 'turn_cloud_proactive_job_1');
+  assert.throws(
+    () => validateEnvelope(validV2Envelope({ turnId: 'cloud_direct_1' })),
+    /invalid turnId/i
+  );
+});
+
 test('protocol v2 automatic turn rejects a fabricated user message', () => {
   assert.throws(
     () => validateEnvelope(validTriggerEnvelope({ message: validV2Envelope().message })),

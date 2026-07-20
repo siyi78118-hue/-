@@ -72,9 +72,15 @@ export function validateEnvelope(value) {
   if (!value || typeof value !== 'object') throw new Error('invalid envelope');
   if (![1, 2].includes(value.protocolVersion)) throw new Error('invalid protocolVersion');
 
+  const incomingKind = value.protocolVersion === 2 ? String(value.kind || '') : '';
+  const incomingTurnId = String(value.turnId || '');
+  const legacyAutomaticTurnId = value.protocolVersion === 2
+    && AUTOMATIC_KINDS.has(incomingKind)
+    && /^(?:cloud|plan)_/.test(incomingTurnId);
+
   const envelope = {
     protocolVersion: value.protocolVersion,
-    turnId: value.turnId,
+    turnId: legacyAutomaticTurnId ? `turn_${incomingTurnId}` : value.turnId,
     characterId: value.characterId,
     deviceId: value.deviceId,
     deviceSeq: value.deviceSeq,
@@ -90,7 +96,7 @@ export function validateEnvelope(value) {
   requireTimestamp(envelope.createdAt, 'createdAt');
 
   if (envelope.protocolVersion === 2) {
-    envelope.kind = String(value.kind || '');
+    envelope.kind = incomingKind;
     if (DIRECT_KINDS.has(envelope.kind)) {
       if (value.trigger !== undefined) throw new Error('direct turn cannot contain a trigger');
     } else if (AUTOMATIC_KINDS.has(envelope.kind)) {
