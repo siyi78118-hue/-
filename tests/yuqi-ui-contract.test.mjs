@@ -52,7 +52,7 @@ test('manual annotations retain evidence and preset version for the maintenance 
 test('native direct replies submit a canonical attributed user message', () => {
   assert.match(html, /inputJson:\s*JSON\.stringify\(\{[\s\S]*?message:\s*\{[\s\S]*?messageId:\s*userMessageId/);
   assert.match(html, /speakerId:\s*'user'[\s\S]*?speakerType:\s*'user'/);
-  assert.match(html, /content:\s*task\.userText/);
+  assert.match(html, /content:\s*messageContentForAI\(userMessage\)/, '桥接原话库必须持久化引用归属和用户本次正文');
   assert.match(html, /sentAt:\s*Number\(userMessage\.time\)\s*\|\|\s*task\.createdAt/);
 });
 
@@ -60,7 +60,7 @@ test('native retry repairs a legacy failed turn with current canonical input and
   const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
   assert.match(retry, /const\s+task\s*=\s*buildAndroidUserReplyTask/);
   assert.match(retry, /const\s+snapshot\s*=\s*await\s+buildNativeExecutionSnapshot\(charId,\s*task\)/);
-  assert.match(retry, /plugin\.retryTurn\(\{[\s\S]*?turnId[\s\S]*?inputJson:[\s\S]*?speakerId:\s*'user'[\s\S]*?content:\s*task\.userText[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
+  assert.match(retry, /plugin\.retryTurn\(\{[\s\S]*?turnId[\s\S]*?inputJson:[\s\S]*?speakerId:\s*'user'[\s\S]*?content:\s*messageContentForAI\(message\)[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
 });
 
 test('native completed replies retain bridge provenance without changing bubble copy', () => {

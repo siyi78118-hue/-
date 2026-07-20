@@ -999,6 +999,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(context.buildMessageQuote(
 });
 assert.match(context.quoteContextText(quotedAssistantText), /speakerType=assistant/);
 assert.match(context.quoteContextText(quotedAssistantText), /speakerId=yuqi/);
+assert.match(context.quoteContextText(quotedAssistantText), /messageId=assistant-source/, '桥接和记忆必须能回溯被引用的原消息证据');
 assert.match(context.messageContentForAI({ role: 'user', content: '那你记住', quote: quotedAssistantText }), /用户本次正文：那你记住/);
 assert.match(context.messageContentForAI({ role: 'user', content: '那你记住', quote: quotedAssistantText }), /虞栖原话：我会记得这件事/);
 assert.match(messageLine({ role: 'user', content: '那你记住', time: 20, quote: quotedAssistantText }, { id: 'yuqi', name: '虞栖' }), /speakerType=assistant/, '记忆整理必须保留引用说话人结构化归属');

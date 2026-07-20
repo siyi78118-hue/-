@@ -3120,7 +3120,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
           speakerId: 'user',
           speakerType: 'user',
           recipientId: charId,
-          content: task.userText,
+          content: messageContentForAI(userMessage),
           quote: userMessage.quote || null,
           sentAt: Number(userMessage.time) || task.createdAt
         },
@@ -3567,9 +3567,10 @@ function buildMessageQuote(message, char) {
 }
 function quoteContextText(quote) {
   if (!quote?.content || quote.speakerType !== 'assistant') return '';
+  const messageId = String(quote.messageId || '');
   const speakerId = String(quote.speakerId || '');
   const speakerName = String(quote.speakerName || '对方');
-  return `【引用元数据｜speakerType=assistant｜speakerId=${speakerId}｜speakerName=${speakerName}】${speakerName}原话：${String(quote.content)}`;
+  return `【引用元数据｜messageId=${messageId}｜speakerType=assistant｜speakerId=${speakerId}｜speakerName=${speakerName}】${speakerName}原话：${String(quote.content)}`;
 }
 function messageContentForAI(message) {
   const content = String(message?.content || '');
@@ -6814,7 +6815,7 @@ async function retryFailedReply(charId, userMessageId) {
             speakerId: 'user',
             speakerType: 'user',
             recipientId: charId,
-            content: task.userText,
+            content: messageContentForAI(message),
             quote: message.quote || null,
             sentAt: Number(message.time) || task.createdAt
           },
