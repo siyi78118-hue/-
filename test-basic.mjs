@@ -977,6 +977,32 @@ globalThis.__appTest = {
 
 const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, proactiveJobUsesCurrentDicePolicy, nativeProactiveSnapshotIds, chatHasPendingDirectReply, extractRolePlanDirective, stripRolePlanDirective, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
 
+const quotedAssistantText = context.buildMessageQuote(
+  { id: 'assistant-source', role: 'assistant', content: '我会记得这件事', time: 10 },
+  { id: 'yuqi', name: '虞栖' }
+);
+assert.deepEqual(JSON.parse(JSON.stringify(quotedAssistantText)), {
+  messageId: 'assistant-source',
+  speakerId: 'yuqi',
+  speakerType: 'assistant',
+  speakerName: '虞栖',
+  contentType: 'text',
+  content: '我会记得这件事'
+});
+assert.equal(context.buildMessageQuote({ id: 'user-source', role: 'user', content: '我说的' }, { id: 'yuqi', name: '虞栖' }), null, '用户自己的消息不能作为本功能的引用目标');
+assert.equal(context.buildMessageQuote({ id: 'gone-source', role: 'assistant', content: '已撤回', retracted: true }, { id: 'yuqi', name: '虞栖' }), null, '撤回消息不能被引用');
+assert.deepEqual(JSON.parse(JSON.stringify(context.buildMessageQuote(
+  { id: 'voice-source', role: 'assistant', type: 'voice', transcript: '这是语音转写' },
+  { id: 'yuqi', name: '虞栖' }
+))), {
+  messageId: 'voice-source', speakerId: 'yuqi', speakerType: 'assistant', speakerName: '虞栖', contentType: 'voice', content: '这是语音转写'
+});
+assert.match(context.quoteContextText(quotedAssistantText), /speakerType=assistant/);
+assert.match(context.quoteContextText(quotedAssistantText), /speakerId=yuqi/);
+assert.match(context.messageContentForAI({ role: 'user', content: '那你记住', quote: quotedAssistantText }), /用户本次正文：那你记住/);
+assert.match(context.messageContentForAI({ role: 'user', content: '那你记住', quote: quotedAssistantText }), /虞栖原话：我会记得这件事/);
+assert.match(messageLine({ role: 'user', content: '那你记住', time: 20, quote: quotedAssistantText }, { id: 'yuqi', name: '虞栖' }), /speakerType=assistant/, '记忆整理必须保留引用说话人结构化归属');
+
 assert.deepEqual(
   Array.from(nativeProactiveSnapshotIds('char-1', 'chat', { jobId: 'pro-123' })),
   ['char-1:chat', 'char-1:chat:pro-123']

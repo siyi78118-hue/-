@@ -3028,7 +3028,7 @@ async function syncYuqiVisibleHistory(charId, excludedMessageIds = new Set()) {
       turnId: sourceTurnId || `turn_legacy_${messageId}`,
       speakerId: characterMessage ? charId : 'user',
       speakerType: characterMessage ? 'character' : 'user',
-      content: String(message.content).trim(),
+      content: messageContentForAI(message).trim(),
       sentAt: Math.max(1, Number(message.time) || Date.now()),
       origin: characterMessage ? String(message.replyOrigin || 'legacy_fallback') : 'phone'
     }];
@@ -3535,6 +3535,40 @@ function commitStagedBatch(chat, committedAt = Date.now()) {
 }
 function messageAvailableToAI(message) {
   return !!message && !message.deleted && !message.retracted && message.deliveryState !== 'staged';
+}
+function buildMessageQuote(message, char) {
+  if (!message || message.role !== 'assistant' || message.hidden || !messageAvailableToAI(message)) return null;
+  const contentType = String(message.type || message.payType || 'text');
+  let content = '';
+  if (contentType === 'voice') {
+    content = String(message.transcript || '').trim() || '[语音]';
+  } else if (contentType === 'redpacket' || contentType === 'transfer') {
+    const label = contentType === 'redpacket' ? '红包' : '转账';
+    content = `${label} ${formatMoney(message.amount)}${message.note ? `，${String(message.note).trim()}` : ''}`;
+  } else {
+    content = String(message.content || '').trim();
+  }
+  if (!content) return null;
+  return {
+    messageId: String(message.id || ''),
+    speakerId: String(char?.id || ''),
+    speakerType: 'assistant',
+    speakerName: charName(char),
+    contentType,
+    content
+  };
+}
+function quoteContextText(quote) {
+  if (!quote?.content || quote.speakerType !== 'assistant') return '';
+  const speakerId = String(quote.speakerId || '');
+  const speakerName = String(quote.speakerName || '对方');
+  return `【引用元数据｜speakerType=assistant｜speakerId=${speakerId}｜speakerName=${speakerName}】${speakerName}原话：${String(quote.content)}`;
+}
+function messageContentForAI(message) {
+  const content = String(message?.content || '');
+  if (message?.role !== 'user') return content;
+  const quote = quoteContextText(message.quote);
+  return quote ? `${quote}\n用户本次正文：${content}` : content;
 }
 function messageById(chat, messageId) {
   return (chat?.messages || []).find(message => message.id === messageId) || null;
@@ -5619,7 +5653,7 @@ function sceneMessagesForAI(chat, count = NORMAL_RAW_CONTEXT_LIMIT, options = {}
   const now = options.now || new Date();
   return recentMessages(chat, count).map(m => {
     if (m.hidden) return { role: 'user', content: formatHiddenEventForAI(m) };
-    let content = String(m.content || '');
+    let content = messageContentForAI(m);
     if (options.withTime) {
       const at = m.time ? new Date(m.time) : null;
       const stamp = at ? `发送时间 ${formatFullTime(at)}，距现在 ${formatElapsed(now.getTime() - at.getTime())}` : '发送时间未知';
@@ -6916,7 +6950,7 @@ function messageLine(m, char) {
   const timestamp = Number(m?.time);
   const timeText = Number.isFinite(timestamp) && timestamp > 0 ? formatFullTime(new Date(timestamp)) : '时间未知';
   if (m.hidden) return `【消息时间｜${timeText}】【隐藏事件】${m.content}`;
-  return `【消息时间｜${timeText}】${m.role === 'user' ? playerName() : charName(char)}：${m.content}`;
+  return `【消息时间｜${timeText}】${m.role === 'user' ? playerName() : charName(char)}：${messageContentForAI(m)}`;
 }
 function memoryEvidenceLine(m, char) {
   return `【消息ID｜${m?.id || 'unknown'}】${messageLine(m, char)}`;
