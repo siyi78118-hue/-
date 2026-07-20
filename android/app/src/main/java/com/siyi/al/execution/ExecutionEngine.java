@@ -116,6 +116,7 @@ public final class ExecutionEngine {
         if (TurnState.valueOf(turn.state) == TurnState.QUEUED) {
             store.markStage(turn.turnId, attempt.attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, clock.now());
         }
+        long deadlineAnchor = Math.max(turn.createdAt, attempt.startedAt);
         TurnSubmission submission = new TurnSubmission(
             turn.turnId,
             turn.characterId,
@@ -124,7 +125,7 @@ public final class ExecutionEngine {
             turn.inputJson,
             turn.snapshotJson,
             turn.cloudJobId,
-            turn.createdAt
+            deadlineAnchor
         );
         BridgeResult result = gateway.executeBridgeTurn(submission);
         JSONObject checkpoint = new JSONObject()

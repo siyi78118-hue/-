@@ -62,6 +62,22 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void bridgedRetryUsesTheFreshAttemptTimeForItsDeadline() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.createdAt = 1L;
+        ExecutionAttemptEntity retry = attempt("QUEUED", null);
+        retry.sequence = 2;
+        retry.startedAt = 5_000L;
+        FakeStore store = new FakeStore(turn, retry);
+        BridgedGateway gateway = new BridgedGateway();
+        ExecutionEngine engine = new ExecutionEngine(store, gateway, new ReplyParser(), () -> 6_000L);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(5_000L, gateway.submissionCreatedAt);
+    }
+
+    @Test
     public void storedChatDoneResultResumesWithoutCallingModelAgain() throws Exception {
         FakeStore store = new FakeStore(turn("CHAT_DONE", "已经生成😊"), attempt("CHAT_DONE", "已经生成😊"));
         RecordingGateway gateway = new RecordingGateway();
@@ -189,11 +205,13 @@ public class ExecutionEngineTest {
     private static final class BridgedGateway implements TurnBridgeGateway {
         int bridgeCalls;
         int legacyCalls;
+        long submissionCreatedAt;
 
         @Override public boolean hasBridge() { return true; }
 
         @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
             bridgeCalls += 1;
+            submissionCreatedAt = submission.createdAt;
             return BridgeResult.success("lan", "虞栖从电脑回复");
         }
 
