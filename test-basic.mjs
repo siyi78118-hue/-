@@ -101,7 +101,7 @@ assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopServic
 for (const method of ['saveApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*7[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7/, 'Room must migrate existing installs through the Yuqi annotation schema without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*8[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8/, 'Room must migrate existing installs through the Yuqi phone-receipt schema without destructive reset');
 assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors[\s\S]*yuqi_annotations/, 'Room v7 must retain raw messages, evidence facts, sync cursors, and annotations on the phone');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
