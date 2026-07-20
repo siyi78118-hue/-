@@ -38,7 +38,6 @@ const orchestrator = new YuqiOrchestrator({
 });
 const reconciler = new YuqiReconciler({ store, codex });
 const dispatcher = new TurnDispatcher({ store, orchestrator });
-const server = createYuqiServer({ secret: config.pairingSecret, store, orchestrator, dispatcher, reconciler });
 const explicitProxy = config.cloudRelay?.proxy?.enabled === true;
 const cloudFetch = config.cloudRelay?.enabled
   ? (explicitProxy ? globalThis.fetch : createSystemCloudFetch())
@@ -51,7 +50,7 @@ const resultOutbox = config.cloudRelay?.enabled ? new ResultOutbox({
   store,
   fetchImpl: cloudFetch
 }) : null;
-const cloudPump = config.cloudRelay?.enabled ? new CloudRelayPump({
+let cloudPump = config.cloudRelay?.enabled ? new CloudRelayPump({
   relayUrl: config.cloudRelay.url,
   deviceId: config.cloudRelay.deviceId,
   deviceToken: config.cloudRelay.deviceToken,
@@ -64,6 +63,22 @@ const cloudPump = config.cloudRelay?.enabled ? new CloudRelayPump({
   fetchImpl: cloudFetch,
   proxyEnabled: explicitProxy
 }) : null;
+const server = createYuqiServer({
+  secret: config.pairingSecret,
+  store,
+  orchestrator,
+  dispatcher,
+  reconciler,
+  getCloudRelayStatus: () => cloudPump?.status() || {
+    enabled: false,
+    proxyEnabled: explicitProxy,
+    connected: false,
+    lastSuccessAt: 0,
+    lastErrorAt: 0,
+    lastError: '',
+    pendingProcessed: 0
+  }
+});
 
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });
 dispatcher.recover();

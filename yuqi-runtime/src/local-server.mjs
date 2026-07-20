@@ -34,6 +34,7 @@ export function createYuqiServer({
   orchestrator,
   dispatcher = null,
   reconciler = null,
+  getCloudRelayStatus = null,
   clock = Date.now,
   maxBodyBytes = 256 * 1024,
   maxClockSkewMs = 5 * 60 * 1000
@@ -82,7 +83,18 @@ export function createYuqiServer({
         version: 1,
         roleThreads,
         presetVersion: typeof store.getCurrentPresetVersion === 'function' ? store.getCurrentPresetVersion() : '',
-        contextLimit: 200
+        contextLimit: 200,
+        cloudRelay: typeof getCloudRelayStatus === 'function'
+          ? getCloudRelayStatus()
+          : {
+              enabled: false,
+              proxyEnabled: false,
+              connected: false,
+              lastSuccessAt: 0,
+              lastErrorAt: 0,
+              lastError: '',
+              pendingProcessed: 0
+            }
       });
     }
     const auth = authenticate(request, rawBody);

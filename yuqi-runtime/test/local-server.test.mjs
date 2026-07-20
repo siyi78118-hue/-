@@ -66,6 +66,33 @@ test('serves health and accepts one signed turn without exposing unsigned APIs',
   }
 });
 
+test('health exposes only the non-sensitive cloud relay connection summary', async () => {
+  const relayStatus = {
+    enabled: true,
+    proxyEnabled: true,
+    connected: false,
+    lastSuccessAt: 0,
+    lastErrorAt: 1784512000000,
+    lastError: 'connect timeout',
+    pendingProcessed: 0
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { getSyncDelta: () => [], ackSync: () => 0, getSession: () => null },
+    orchestrator: { process: async () => ({}) },
+    getCloudRelayStatus: () => relayStatus
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const health = await call(server.address().port, { path: '/v1/health' });
+    assert.equal(health.status, 200);
+    assert.deepEqual(health.body.cloudRelay, relayStatus);
+    assert.equal(JSON.stringify(health.body).includes('device-token'), false);
+  } finally {
+    await server.close();
+  }
+});
+
 test('rejects stale, tampered, and oversized requests', async () => {
   const server = createYuqiServer({
     secret: 'test-pairing-secret',
