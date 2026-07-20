@@ -83,6 +83,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
     };
     private static final Migration MIGRATION_7_8 = new Migration(7, 8) {
         @Override public void migrate(SupportSQLiteDatabase database) {
+            // PC-origin replies are inbound copies; only phone-authored rows belong in recovery uploads.
             database.execSQL(
                 "UPDATE yuqi_raw_messages SET syncSeq = 0 "
                     + "WHERE speakerType = 'character' AND deviceId LIKE 'pc:%' AND origin != 'fallback'"
