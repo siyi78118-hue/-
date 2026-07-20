@@ -630,6 +630,10 @@ button.cell:active{background:#ececec}
     </div>
     <div class="chat-scroll" id="chat-scroll"><div class="chat-list" id="chat-messages"></div></div>
     <div class="batch-finish-bar" id="batch-finish-bar"><button class="batch-finish" id="btn-finish-batch" onclick="finishStagedBatch()" type="button">发送结束</button></div>
+    <div class="chat-quote-preview" id="chat-quote-preview" hidden>
+      <div class="chat-quote-preview-copy"><b id="chat-quote-name"></b><span id="chat-quote-text"></span></div>
+      <button type="button" onclick="clearSelectedQuote()" aria-label="取消引用">×</button>
+    </div>
     <div class="composer">
       <button class="composer-tool voice" onclick="toggleComposerPanel('voice')" type="button" aria-label="语音"></button>
       <textarea class="chat-input" id="chat-input" rows="1" placeholder="" oninput="autoResize(this)" onkeydown="handleChatKey(event)"></textarea>
@@ -1471,6 +1475,7 @@ let isStreaming = false;
 let streamingDraft = null;
 const activeChatRequests = new Map();
 let messageActionTarget = null;
+let selectedMessageQuote = null;
 let messageLongPressTimer = null;
 let messageLongPressStart = null;
 let pageIsUnloading = false;
@@ -3115,6 +3120,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
           speakerType: 'user',
           recipientId: charId,
           content: task.userText,
+          quote: userMessage.quote || null,
           sentAt: Number(userMessage.time) || task.createdAt
         },
         deviceSeq: Math.max(1, task.createdAt)
@@ -5531,6 +5537,7 @@ async function parsePNGCard(file) {
 function openChat(charId) {
   const char = characters.find(c => c.id === charId);
   if (!char) return;
+  clearSelectedQuote();
   currentCharId = charId;
   document.getElementById('chat-title').textContent = char.name;
   if (!allChats[charId]) {
@@ -6135,10 +6142,15 @@ function renderVoiceCard(m) {
   const transcript = String(m.transcript || '').trim();
   return `<div class="bubble voice-bubble"><div class="voice-body"><div class="voice-main"><span class="voice-mark"></span><span class="voice-duration">${duration}''</span></div>${transcript ? `<div class="voice-transcript">${formatMsg(transcript)}</div>` : ''}</div></div>`;
 }
+function renderQuoteCard(quote) {
+  if (!quote?.content || quote.speakerType !== 'assistant') return '';
+  return `<div class="message-quote"><b>${esc(quote.speakerName || '对方')}</b><span>${esc(quote.content)}</span></div>`;
+}
 function renderMessageBody(m) {
-  if (m.type === 'transfer' || m.type === 'redpacket') return renderPaymentCard(m);
-  if (m.type === 'voice') return renderVoiceCard(m);
-  return `<div class="bubble">${formatMsg(m.content)}</div>`;
+  const quote = renderQuoteCard(m.quote);
+  if (m.type === 'transfer' || m.type === 'redpacket') return `${quote}${renderPaymentCard(m)}`;
+  if (m.type === 'voice') return `${quote}${renderVoiceCard(m)}`;
+  return `<div class="bubble">${quote}${formatMsg(m.content)}</div>`;
 }
 function splitAssistantOutput(text) {
   const normalized = String(text || '').replace(/\r\n?/g, '\n').trim();
@@ -6377,13 +6389,56 @@ function openMessageActions(messageId) {
   if (!buttons) return;
   buttons.innerHTML = message.role === 'user' && !message.retracted
     ? '<button type="button" onclick="retractSelectedMessage()">撤回</button><button class="danger" type="button" onclick="deleteSelectedMessage()">删除</button>'
-    : '<button class="danger" type="button" onclick="deleteSelectedMessage()">删除</button>';
+    : message.role === 'assistant' && messageAvailableToAI(message)
+      ? '<button type="button" onclick="selectSelectedMessageQuote()">引用</button><button class="danger" type="button" onclick="deleteSelectedMessage()">删除</button>'
+      : '<button class="danger" type="button" onclick="deleteSelectedMessage()">删除</button>';
   document.getElementById('message-action-mask')?.classList.add('show');
 }
 function closeMessageActions(event) {
   if (event && event.target?.id !== 'message-action-mask') return;
   document.getElementById('message-action-mask')?.classList.remove('show');
   messageActionTarget = null;
+}
+function renderQuotePreview() {
+  const root = document.getElementById('chat-quote-preview');
+  if (!root) return;
+  const active = selectedMessageQuote?.charId === currentCharId ? selectedMessageQuote.quote : null;
+  root.hidden = !active;
+  const name = document.getElementById('chat-quote-name');
+  const text = document.getElementById('chat-quote-text');
+  if (name) name.textContent = active?.speakerName || '';
+  if (text) text.textContent = active?.content || '';
+}
+function clearSelectedQuote() {
+  selectedMessageQuote = null;
+  renderQuotePreview();
+}
+function selectMessageQuote(charId, messageId) {
+  const chat = allChats[charId];
+  const char = characters.find(item => item.id === charId);
+  const quote = buildMessageQuote(messageById(chat, messageId), char);
+  if (!chat || !char || charId !== currentCharId || !quote) return false;
+  selectedMessageQuote = { charId, quote };
+  closeComposerPanels();
+  renderQuotePreview();
+  document.getElementById('chat-input')?.focus?.();
+  return true;
+}
+function selectSelectedMessageQuote() {
+  const target = messageActionTarget;
+  closeMessageActions();
+  return target ? selectMessageQuote(target.charId, target.messageId) : false;
+}
+function validatedSelectedQuote(charId) {
+  const selected = selectedMessageQuote;
+  if (!selected || selected.charId !== charId) return null;
+  const chat = allChats[charId];
+  const char = characters.find(item => item.id === charId);
+  const quote = buildMessageQuote(messageById(chat, selected.quote?.messageId), char);
+  if (quote) return quote;
+  clearSelectedQuote();
+  toast('原消息已不可引用，请重新选择');
+  return null;
 }
 function abortPendingReply(charId, messageId, deleted = false) {
   const active = activeChatRequests.get(charId);
@@ -6717,6 +6772,7 @@ async function retryFailedReply(charId, userMessageId) {
             speakerType: 'user',
             recipientId: charId,
             content: task.userText,
+            quote: message.quote || null,
             sentAt: Number(message.time) || task.createdAt
           },
           deviceSeq: Math.max(1, task.createdAt)
@@ -7726,7 +7782,9 @@ async function sendMessage() {
   input.style.height = 'auto';
   document.getElementById('btn-send').className = 'send inactive';
   const chat = allChats[requestCharId];
-  stagePlayerMessage(chat, text);
+  const quote = validatedSelectedQuote(requestCharId);
+  const staged = stagePlayerMessage(chat, text, quote ? { quote } : {});
+  if (staged) clearSelectedQuote();
   DB.set('chats', allChats);
   renderMessages({ forceBottom: true });
   refreshChatSendButton();

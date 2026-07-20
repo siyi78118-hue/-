@@ -1002,6 +1002,35 @@ assert.match(context.quoteContextText(quotedAssistantText), /speakerId=yuqi/);
 assert.match(context.messageContentForAI({ role: 'user', content: '那你记住', quote: quotedAssistantText }), /用户本次正文：那你记住/);
 assert.match(context.messageContentForAI({ role: 'user', content: '那你记住', quote: quotedAssistantText }), /虞栖原话：我会记得这件事/);
 assert.match(messageLine({ role: 'user', content: '那你记住', time: 20, quote: quotedAssistantText }, { id: 'yuqi', name: '虞栖' }), /speakerType=assistant/, '记忆整理必须保留引用说话人结构化归属');
+assert.match(html, /id="chat-quote-preview"/, '聊天输入区必须提供引用预览');
+assert.match(script, /function selectMessageQuote\(charId, messageId\)/, '必须通过真实消息构造待发送引用');
+assert.match(script, /onclick="selectSelectedMessageQuote\(\)"/, '长按虞栖消息菜单必须提供引用入口');
+assert.match(script, /stagePlayerMessage\(chat, text, quote \? \{ quote \} : \{\}\)/, '发送消息时必须把引用快照存入用户消息');
+assert.match(script, /quote:\s*userMessage\.quote \|\| null/, '原生首次发送必须传递引用快照');
+assert.match(script, /quote:\s*message\.quote \|\| null/, '原生重试必须传递同一引用快照');
+const quoteUiProbe = vm.runInContext(`(() => {
+  const oldCharacters = characters;
+  const oldChats = allChats;
+  const oldCurrentCharId = currentCharId;
+  characters = [{ id: 'quote-char', name: '虞栖' }];
+  allChats = { 'quote-char': { messages: [{ id: 'quote-source', role: 'assistant', content: '这句话要留下', time: 10 }] } };
+  currentCharId = 'quote-char';
+  const selected = selectMessageQuote('quote-char', 'quote-source');
+  const quote = selectedMessageQuote?.quote;
+  allChats['quote-char'].messages.splice(0, 1);
+  const rendered = renderMessageBody({ role: 'user', content: '我引用它', quote });
+  const invalid = selectMessageQuote('quote-char', 'missing-source');
+  characters = oldCharacters;
+  allChats = oldChats;
+  currentCharId = oldCurrentCharId;
+  selectedMessageQuote = null;
+  return { selected, invalid, quote, rendered };
+})()`, context);
+assert.equal(quoteUiProbe.selected, true);
+assert.equal(quoteUiProbe.invalid, false);
+assert.equal(quoteUiProbe.quote.speakerId, 'quote-char');
+assert.match(quoteUiProbe.rendered, /虞栖/);
+assert.match(quoteUiProbe.rendered, /这句话要留下/, '删除源消息后已发送的引用仍必须显示快照');
 
 assert.deepEqual(
   Array.from(nativeProactiveSnapshotIds('char-1', 'chat', { jobId: 'pro-123' })),
