@@ -86,6 +86,21 @@ public class BridgeClientTest {
         ));
     }
 
+    @Test public void backlogFailureMustBePersistedBeforeItIsAcknowledged() throws Exception {
+        List<String> persisted = new ArrayList<>();
+        String raw = "{\"turnId\":\"turn_phone_old\",\"state\":\"failed\",\"terminal\":true,"
+            + "\"errorCode\":\"INTERNAL_PRIVATE_CODE\"}";
+
+        boolean saved = BridgeClient.persistBacklogFailure(value -> {
+            persisted.add(value);
+            return true;
+        }, raw);
+
+        assertTrue(saved);
+        assertEquals(1, persisted.size());
+        assertEquals("turn_phone_old", new JSONObject(persisted.get(0)).getString("turnId"));
+    }
+
     @Test public void lanAcceptedTurnPollsWithFreshSignedGetsUntilCommitted() throws Exception {
         FakeTransport transport = new FakeTransport();
         transport.responses.add(new BridgeClient.HttpResult(202,

@@ -4,8 +4,6 @@ import { buildEvidencePack } from './retrieval.mjs';
 import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route-policy.mjs';
 
-const BACKSTAGE_LEAK = /\bAI\b|人工智能|语言模型|大模型|提示词|记忆库|系统指令|内部思考|作为.{0,8}模型/i;
-
 function parseRoleJson(text, role) {
   const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   let value;
@@ -21,8 +19,13 @@ export function hardValidateReply(reply) {
   const text = String(reply || '').trim();
   if (!text) issues.push({ code: 'EMPTY_REPLY', message: 'reply is empty' });
   if (text.length > 20_000) issues.push({ code: 'REPLY_TOO_LARGE', message: 'reply is too large' });
-  if (BACKSTAGE_LEAK.test(text)) issues.push({ code: 'BACKSTAGE_LEAK', message: 'reply exposes backstage concepts' });
   return { ok: issues.length === 0, issues };
+}
+
+function repairReplyForDelivery(reply) {
+  const text = String(reply || '').trim();
+  if (!text) return '刚才那句话没发出来，你再跟我说一次？';
+  return text.length > 20_000 ? text.slice(0, 20_000) : text;
 }
 
 export class YuqiOrchestrator {
@@ -88,11 +91,20 @@ export class YuqiOrchestrator {
         if (current.state === 'brain_done') {
           const draft = parseRoleJson(current.brainDraftJson, 'brain');
           const hard = hardValidateReply(draft.reply);
-          if (!hard.ok) throw new Error(`hard validation failed: ${hard.issues.map(issue => issue.code).join(', ')}`);
+          const repairedDraft = hard.ok ? draft : { ...draft, reply: repairReplyForDelivery(draft.reply) };
+          if (!hard.ok) {
+            this.store.putDiagnostic({
+              turnId,
+              stage: 'brain_done',
+              level: 'warning',
+              detail: { action: 'reply_repaired_for_delivery', issues: hard.issues.map(issue => issue.code) }
+            });
+          }
           this.store.advanceTurn(
             turnId,
             'brain_done',
-            current.route === 'fast' ? 'approved' : 'supervisor_running'
+            current.route === 'fast' ? 'approved' : 'supervisor_running',
+            { brainDraftJson: JSON.stringify(repairedDraft) }
           );
           continue;
         }
@@ -237,7 +249,18 @@ export class YuqiOrchestrator {
       });
       return;
     }
-    if (attempt >= 2) throw new Error('supervisor rejected reply twice');
+    if (attempt >= 2) {
+      this.store.putDiagnostic({
+        turnId: envelope.turnId,
+        stage: 'supervisor_running',
+        level: 'warning',
+        detail: { action: 'rewritten_reply_sent_after_review', issues: supervisorResult.issues || [] }
+      });
+      this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
+        supervisorJson: JSON.stringify({ ...supervisorResult, acceptedAfterRewrite: true })
+      });
+      return;
+    }
     this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'brain_running', {
       supervisorJson: JSON.stringify(supervisorResult)
     });

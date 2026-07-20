@@ -69,11 +69,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         JSONObject response = new JSONObject(raw == null ? "{}" : raw);
         JSONObject reply = response.optJSONObject("reply");
         String remoteTurnId = response.optString("turnId", "").trim();
-        if (reply == null || remoteTurnId.isEmpty()) return false;
-        String content = reply.optString("content", "").trim();
-        String messageId = reply.optString("messageId", "").trim();
-        long sentAt = reply.optLong("sentAt", 0L);
-        if (content.isEmpty() || messageId.isEmpty() || sentAt <= 0L) return false;
+        if (remoteTurnId.isEmpty()) return false;
 
         String localTurnId = remoteTurnId.startsWith("turn_cloud_")
             ? remoteTurnId.substring("turn_".length())
@@ -83,6 +79,25 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
             localTurnId = remoteTurnId;
             turn = dao.turn(localTurnId);
         }
+
+        if (reply == null) {
+            String remoteState = response.optString("state", "").trim();
+            if (turn == null || !response.optBoolean("terminal", false) || !"failed".equals(remoteState)) {
+                return false;
+            }
+            boolean retryable = response.optBoolean("allowFallback", false);
+            return dao.importCloudBacklogFailure(
+                localTurnId,
+                retryable ? "FAILED_RETRYABLE" : "FAILED_FINAL",
+                "REMOTE_REPLY_FAILED",
+                "回复暂时没有送达，请重试",
+                System.currentTimeMillis()
+            );
+        }
+        String content = reply.optString("content", "").trim();
+        String messageId = reply.optString("messageId", "").trim();
+        long sentAt = reply.optLong("sentAt", 0L);
+        if (content.isEmpty() || messageId.isEmpty() || sentAt <= 0L) return false;
 
         String characterId = reply.optString("characterId", "").trim();
         if (characterId.isEmpty() && turn != null) characterId = turn.characterId;

@@ -269,6 +269,43 @@ test('persists one cloud delivery target per turn and peer across reopening', ()
   }
 }));
 
+test('recovers a failed brain draft as one committed reply and resets cloud delivery', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validTriggerEnvelope());
+  store.claimTurnById(turn.turnId, 'worker-a');
+  store.advanceTurn(turn.turnId, 'memory_running', 'memory_done', { memoryPacketJson: '{}' });
+  store.advanceTurn(turn.turnId, 'memory_done', 'brain_running');
+  store.advanceTurn(turn.turnId, 'brain_running', 'brain_done', {
+    brainDraftJson: JSON.stringify({ reply: '原来是AI短剧。小团队还负责得多，难怪你忙成这样😂', usedFactIds: [] })
+  });
+  store.advanceTurn(turn.turnId, 'brain_done', 'failed', {
+    errorJson: JSON.stringify({ name: 'Error', message: 'hard validation failed: BACKSTAGE_LEAK' })
+  });
+  store.registerCloudDelivery(turn.turnId, 'phone_peer', 42);
+  const failedDelivery = store.prepareCloudDelivery(turn.turnId, 'phone_peer', {
+    turnId: turn.turnId, state: 'failed', terminal: true
+  });
+  store.markCloudDeliveryAttempt(turn.turnId, 'phone_peer');
+  store.markCloudDeliveryMailboxed(turn.turnId, 'phone_peer', failedDelivery.checksum);
+
+  const recovered = store.recoverFailedDraft(turn.turnId, {
+    peerId: 'phone_peer', sentAt: 1784400004000
+  });
+  const repeated = store.recoverFailedDraft(turn.turnId, {
+    peerId: 'phone_peer', sentAt: 1784400005000
+  });
+  const [delivery] = store.listCloudDeliveries(turn.turnId);
+
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.result.reply.content, '原来是AI短剧。小团队还负责得多，难怪你忙成这样😂');
+  assert.equal(store.getTurn(turn.turnId).state, 'committed');
+  assert.equal(store.getMessage(recovered.result.reply.messageId)?.turnId, turn.turnId);
+  assert.equal(delivery.state, 'waiting');
+  assert.equal(delivery.recoveryAckSeq, 42);
+  assert.equal(delivery.checksum, '');
+  assert.equal(repeated.recovered, false);
+  assert.equal(repeated.result.reply.messageId, recovered.result.reply.messageId);
+}));
+
 test('a proactive reply stays outside shared memory until the phone confirms persistence', () => withStore(({ store }) => {
   const turn = store.submitTurn(validTriggerEnvelope());
   const reply = store.putMessage({

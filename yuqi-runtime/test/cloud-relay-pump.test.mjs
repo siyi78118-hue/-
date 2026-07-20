@@ -228,6 +228,43 @@ test('v2 cloud ingress acknowledges after durable dispatch without waiting for t
   ]);
 });
 
+test('v2 duplicate checksum conflict keeps the authoritative turn and acknowledges the relay envelope', async () => {
+  const relay = relayFixture(v2Envelope);
+  const events = [];
+  const authoritative = { turnId: v2Envelope.turnId, state: 'failed' };
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: {
+      accept() { throw new Error('turn checksum conflict'); }
+    },
+    store: {
+      getTurn(turnId) {
+        events.push(`lookup:${turnId}`);
+        return authoritative;
+      },
+      registerCloudDelivery(turnId, peerId, recoveryAckSeq) {
+        events.push(`delivery:${turnId}:${peerId}:${recoveryAckSeq}`);
+      },
+      putDiagnostic(value) { events.push(`diagnostic:${value.stage}:${value.detail.state}`); }
+    },
+    reconciler: { async reconcileFrom() { return { ackSeq: 61 }; } },
+    outbox: { async flushOnce() { events.push('outbox'); return { delivered: 1 }; } }
+  });
+
+  const result = await pump.pumpOnce();
+
+  assert.equal(result.processed, 1);
+  assert.equal(result.failed, 0);
+  assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+  assert.deepEqual(events, [
+    'lookup:turn_phone_cloud_v2_1',
+    'diagnostic:duplicate_turn_payload_ignored:failed',
+    'delivery:turn_phone_cloud_v2_1:phone_cloud:61',
+    'outbox'
+  ]);
+});
+
 test('a phone delivery receipt confirms memory without dispatching a chat turn', async () => {
   const receipt = {
     type: 'DELIVERY_RECEIPT',

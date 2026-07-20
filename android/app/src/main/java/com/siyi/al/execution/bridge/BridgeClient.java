@@ -219,12 +219,21 @@ public final class BridgeClient {
             String disposition = classifyCloudResult(null, decoded);
             if ("BACKLOG_COMMITTED".equals(disposition)) {
                 if (processBacklogCommitted(decoded, decoded.toString())) processed += 1;
+            } else if ("BACKLOG_FAILED".equals(disposition)) {
+                if (persistBacklogFailure(inboxConsumer, decoded.toString())) {
+                    acknowledgeCloud(item.optString("messageId"));
+                    processed += 1;
+                }
             } else {
                 acknowledgeCloud(item.optString("messageId"));
                 processed += 1;
             }
         }
         return processed;
+    }
+
+    static boolean persistBacklogFailure(CloudInboxConsumer consumer, String raw) throws Exception {
+        return consumer != null && consumer.persist(raw);
     }
 
     public boolean confirmCloudResult(String responseJson) throws Exception {

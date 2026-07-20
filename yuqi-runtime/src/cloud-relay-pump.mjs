@@ -175,7 +175,23 @@ export class CloudRelayPump {
           }
           if (Number(envelope.protocolVersion) >= 2) {
             if (!this.dispatcher || !this.store) throw new Error('durable dispatcher is unavailable');
-            const turn = this.dispatcher.accept(envelope);
+            let turn;
+            try {
+              turn = this.dispatcher.accept(envelope);
+            } catch (error) {
+              const checksumConflict = /turn checksum conflict/i.test(String(error?.message || error));
+              const authoritative = checksumConflict && typeof this.store.getTurn === 'function'
+                ? this.store.getTurn(String(envelope.turnId || ''))
+                : null;
+              if (!authoritative) throw error;
+              turn = authoritative;
+              this.store.putDiagnostic?.({
+                turnId: turn.turnId,
+                stage: 'duplicate_turn_payload_ignored',
+                level: 'info',
+                detail: { state: String(turn.state || 'unknown') }
+              });
+            }
             const peerId = String(envelope.recovery?.peerId || envelope.deviceId || this.deviceId);
             this.store.registerCloudDelivery(turn.turnId, peerId, recoveryAckSeq);
             const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {

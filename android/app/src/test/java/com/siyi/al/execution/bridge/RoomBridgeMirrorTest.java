@@ -153,6 +153,27 @@ public class RoomBridgeMirrorTest {
         assertEquals(insertedTurns.get(0).turnId, imported.get(imported.size() - 1).turnId);
     }
 
+    @Test public void oldCloudFailureEndsTheOriginalPendingTurnWithSafeText() throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<String> failures = new ArrayList<>();
+        ChatTurnEntity turn = new ChatTurnEntity();
+        turn.turnId = "turn_phone_failed_1";
+        turn.characterId = "yuqi";
+        turn.state = "CHAT_RUNNING";
+        turn.activeAttemptId = "attempt_phone_failed_1";
+        RoomBridgeMirror mirror = new RoomBridgeMirror(daoWithFailures(inserted, turn, failures), "phone_a");
+        String raw = "{\"turnId\":\"turn_phone_failed_1\",\"state\":\"failed\",\"terminal\":true,"
+            + "\"allowFallback\":false,\"errorCode\":\"BACKSTAGE_LEAK\"}";
+
+        boolean saved = mirror.persistCloudInboxReply(raw);
+
+        assertEquals(true, saved);
+        assertEquals(0, inserted.size());
+        assertEquals(Arrays.asList(
+            "turn_phone_failed_1|FAILED_FINAL|REMOTE_REPLY_FAILED|回复暂时没有送达，请重试"
+        ), failures);
+    }
+
     private static AlExecutionDao dao(List<RawMessageEntity> inserted) {
         return dao(inserted, new ArrayList<>(), null);
     }
@@ -192,6 +213,31 @@ public class RoomBridgeMirrorTest {
                 if ("importCloudBacklogReply".equals(method.getName())) {
                     imported.add((ReplyPartEntity) args[1]);
                     if (blockedTurnId != null && blockedTurnId.equals(args[0])) return false;
+                    return true;
+                }
+                Class<?> type = method.getReturnType();
+                if (type == long.class) return 0L;
+                if (type == int.class) return 0;
+                if (type == boolean.class) return false;
+                return null;
+            }
+        );
+    }
+
+    private static AlExecutionDao daoWithFailures(
+        List<RawMessageEntity> inserted, ChatTurnEntity turn, List<String> failures
+    ) {
+        return (AlExecutionDao) Proxy.newProxyInstance(
+            AlExecutionDao.class.getClassLoader(),
+            new Class<?>[] { AlExecutionDao.class },
+            (proxy, method, args) -> {
+                if ("turn".equals(method.getName())) return turn.turnId.equals(args[0]) ? turn : null;
+                if ("insertRawMessage".equals(method.getName())) {
+                    inserted.add((RawMessageEntity) args[0]);
+                    return 1L;
+                }
+                if ("importCloudBacklogFailure".equals(method.getName())) {
+                    failures.add(args[0] + "|" + args[1] + "|" + args[2] + "|" + args[3]);
                     return true;
                 }
                 Class<?> type = method.getReturnType();

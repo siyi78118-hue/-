@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { YuqiOrchestrator } from '../src/orchestrator.mjs';
+import { hardValidateReply, YuqiOrchestrator } from '../src/orchestrator.mjs';
 import { PresetRegistry } from '../src/preset-registry.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
@@ -153,14 +153,37 @@ test('passes at most 200 recent raw messages with stable speaker identities', as
   });
 });
 
-test('hard validation blocks backstage leakage before supervisor', async () => {
-  const outputs = normalOutputs();
-  outputs.brain = ['{"reply":"我是一个AI模型，刚检查了记忆库。","usedFactIds":[]}'];
-  await withFixture(outputs, async ({ store, codex, orchestrator }) => {
-    await assert.rejects(() => orchestrator.process(envelope()), /hard validation/i);
-    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain']);
-    assert.equal(store.getTurn('turn_phone_1').state, 'failed');
-  });
+test('runtime validation allows AI topics and AI self-identification', async () => {
+  for (const [index, reply] of [
+    '原来是AI短剧。小团队还负责得多，难怪你忙成这样。',
+    '我是一个AI模型，刚检查了记忆库。'
+  ].entries()) {
+    const outputs = normalOutputs();
+    outputs.brain = [JSON.stringify({ reply, usedFactIds: [] })];
+    await withFixture(outputs, async ({ store, orchestrator }) => {
+      const result = await orchestrator.process(envelope(index + 50, '制作ai短剧'));
+      assert.equal(result.reply.content, reply);
+      assert.equal(store.getTurn(result.turnId).state, 'committed');
+    });
+  }
+});
+
+test('runtime validation still rejects technically undeliverable replies', () => {
+  assert.deepEqual(hardValidateReply('').issues.map(issue => issue.code), ['EMPTY_REPLY']);
+  assert.deepEqual(hardValidateReply('x'.repeat(20_001)).issues.map(issue => issue.code), ['REPLY_TOO_LARGE']);
+});
+
+test('technically undeliverable replies are repaired and committed instead of failing the turn', async () => {
+  for (const [index, reply] of ['', 'x'.repeat(20_001)].entries()) {
+    const outputs = normalOutputs();
+    outputs.brain = [JSON.stringify({ reply, usedFactIds: [] })];
+    await withFixture(outputs, async ({ store, orchestrator }) => {
+      const result = await orchestrator.process(envelope(index + 60, '继续'));
+      assert.ok(result.reply.content.trim());
+      assert.ok(result.reply.content.length <= 20_000);
+      assert.equal(store.getTurn(result.turnId).state, 'committed');
+    });
+  }
 });
 
 test('supervisor rejection asks the brain to rewrite once under the same preset', async () => {
@@ -178,6 +201,24 @@ test('supervisor rejection asks the brain to rewrite once under the same preset'
     const result = await orchestrator.process(envelope(40, '你答应过要认真回复我的'));
     assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor', 'brain', 'supervisor']);
     assert.equal(result.reply.content, '你好呀。我叫虞栖，你怎么称呼？');
+  });
+});
+
+test('a second supervisor rejection records the review but sends the rewritten reply', async () => {
+  await withFixture({
+    memory: ['{"query":"hello","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"reply":"first draft","usedFactIds":[]}',
+      '{"reply":"rewritten draft","usedFactIds":[]}'
+    ],
+    supervisor: [
+      '{"approved":false,"issues":[{"code":"TONE","message":"rewrite"}]}',
+      '{"approved":false,"issues":[{"code":"TONE","message":"still imperfect"}]}'
+    ]
+  }, async ({ store, orchestrator }) => {
+    const result = await orchestrator.process(triggerEnvelope(61));
+    assert.equal(result.reply.content, 'rewritten draft');
+    assert.equal(store.getTurn(result.turnId).state, 'committed');
   });
 });
 

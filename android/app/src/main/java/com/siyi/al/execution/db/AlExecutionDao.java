@@ -196,6 +196,12 @@ public interface AlExecutionDao {
     @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :completedAt, finishedAt = :completedAt, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId")
     int completeImportedCloudAttempt(String attemptId, long completedAt);
 
+    @Query("UPDATE chat_turns SET state = :state, updatedAt = :now WHERE turnId = :turnId AND state != 'COMPLETED'")
+    int failImportedCloudTurn(String turnId, String state, long now);
+
+    @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = :state, errorCode = :code, errorDetail = :detail, retryable = :retryable, heartbeatAt = :now, finishedAt = :now WHERE attemptId = :attemptId")
+    int failImportedCloudAttempt(String attemptId, String state, String code, String detail, boolean retryable, long now);
+
     @Query("UPDATE chat_turns SET state = 'CANCELLED', activeAttemptId = NULL, updatedAt = :now, cancelledAt = :now, deletedAt = CASE WHEN :deleted = 1 THEN :now ELSE deletedAt END WHERE turnId = :turnId AND state != 'COMPLETED'")
     int cancelTurn(String turnId, long now, boolean deleted);
 
@@ -324,6 +330,36 @@ public interface AlExecutionDao {
         change.type = "REPLY_COMMITTED";
         change.payloadJson = "{\"turnId\":\"" + turnId + "\",\"origin\":\"cloud_backfill\"}";
         change.createdAt = completedAt;
+        insertChange(change);
+        return true;
+    }
+
+    @Transaction
+    default boolean importCloudBacklogFailure(
+        String turnId,
+        String state,
+        String code,
+        String detail,
+        long now
+    ) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null || "COMPLETED".equals(turn.state)) return false;
+        if (failImportedCloudTurn(turnId, state, now) != 1) return false;
+        if (turn.activeAttemptId != null && !turn.activeAttemptId.isEmpty()) {
+            failImportedCloudAttempt(
+                turn.activeAttemptId,
+                state,
+                code,
+                detail,
+                "FAILED_RETRYABLE".equals(state),
+                now
+            );
+        }
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "TURN_FAILED";
+        change.payloadJson = "{\"turnId\":\"" + turnId + "\"}";
+        change.createdAt = now;
         insertChange(change);
         return true;
     }

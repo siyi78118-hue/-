@@ -2833,6 +2833,10 @@ async function completeRolePlanFromNativeResult(result) {
   await applyRolePlanOperations(charId, [mutation], [result.turnId]);
   return true;
 }
+function nativeReplyFailureMessage(kind = 'DIRECT_REPLY') {
+  return kind === 'DIRECT_REPLY' ? '回复暂时没有送达，请重试' : '这次主动消息暂时没有送达，系统会继续重试';
+}
+
 async function applyNativeExecutionTurn(result) {
   const charId = result?.characterId;
   const chat = allChats[charId];
@@ -2881,7 +2885,7 @@ async function applyNativeExecutionTurn(result) {
       return true;
     }
     if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
-      const reason = String(result.errorDetail || result.errorCode || '原生主动生成失败');
+      const reason = nativeReplyFailureMessage(kind);
       if (kind === 'PROACTIVE_MOMENT' || kind === 'ROLE_PLAN_MOMENT' || kind === 'ROLE_PLAN_MOMENT_PRIVATE') {
         chat.lastProactiveMomentFailedAt = Date.now();
         chat.lastProactiveMomentError = reason;
@@ -2928,7 +2932,7 @@ async function applyNativeExecutionTurn(result) {
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native turn extraction skipped:', err.message));
     syncRolePlanCloudJobs(charId).catch(err => console.warn('[AL RolePlan] native snapshot refresh skipped:', err.message));
   } else if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
-    const reason = String(result.errorDetail || result.errorCode || '后台回复失败');
+    const reason = nativeReplyFailureMessage(kind);
     userMessage.replyState = 'failed';
     userMessage.replyError = reason;
     chat.pendingReply = { ...(chat.pendingReply || {}), userMessageId: userMessage.id, userText: nativePendingReplyText(chat, userMessage), state: 'failed', error: reason, nativeTurnId: result.turnId, updatedAt: Date.now() };
@@ -3140,9 +3144,9 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
   } catch (err) {
     nativeReplyQueuedIds.delete(turnId);
     chat.pendingReply.state = 'failed';
-    chat.pendingReply.error = friendlyErrorMessage(err);
+    chat.pendingReply.error = nativeReplyFailureMessage('DIRECT_REPLY');
     userMessage.replyState = 'failed';
-    userMessage.replyError = friendlyErrorMessage(err);
+    userMessage.replyError = nativeReplyFailureMessage('DIRECT_REPLY');
     isStreaming = false;
     refreshChatSendButton();
     DB.set('chats', allChats);
@@ -6744,9 +6748,9 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
       }
       chat.pendingReply.state = 'failed';
       chat.pendingReply.updatedAt = Date.now();
-      chat.pendingReply.error = friendlyErrorMessage(err);
+      chat.pendingReply.error = nativeReplyFailureMessage('DIRECT_REPLY');
       userMessage.replyState = 'failed';
-      userMessage.replyError = friendlyErrorMessage(err);
+      userMessage.replyError = nativeReplyFailureMessage('DIRECT_REPLY');
       return '';
     } finally {
       if (activeChatRequests.get(requestCharId)?.requestToken === requestToken) activeChatRequests.delete(requestCharId);

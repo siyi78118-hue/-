@@ -508,6 +508,71 @@ export class YuqiStore {
     `).all(safeLimit).map(mapCloudDelivery);
   }
 
+  recoverFailedDraft(turnId, { peerId, sentAt = null } = {}) {
+    const current = this.getTurn(turnId);
+    if (!current) throw new Error('turn not found');
+    if (current.state === 'committed' && current.replyJson) {
+      return { recovered: false, result: parseJson(current.replyJson, null) };
+    }
+    if (current.state !== 'failed') throw new Error('turn is not failed');
+    const draft = parseJson(current.brainDraftJson, null);
+    const content = String(draft?.reply || '').trim();
+    if (!content) throw new Error('failed turn has no recoverable brain draft');
+    const envelope = parseJson(current.envelopeJson, null);
+    if (!envelope) throw new Error('turn envelope is invalid');
+    const targetPeer = String(peerId || current.deviceId || '');
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(targetPeer)) throw new Error('invalid cloud peer');
+    const timestamp = Math.max(1, Number(sentAt) || Number(current.updatedAt) || now());
+
+    return this.transaction(() => {
+      const message = this.putMessageInternal({
+        messageId: `msg_yuqi_${contentHash(turnId).slice(0, 24)}`,
+        turnId,
+        characterId: current.characterId,
+        speakerId: current.characterId,
+        speakerType: 'character',
+        recipientId: 'user',
+        content,
+        sentAt: timestamp,
+        origin: 'codex'
+      });
+      if (['PROACTIVE_CHAT', 'PROACTIVE_MOMENT'].includes(String(envelope.kind || ''))) {
+        this.quarantinePendingReply(message.messageId);
+      }
+      const result = {
+        turnId,
+        presetVersion: this.getCurrentPresetVersion(),
+        reply: message,
+        usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds.map(String) : []
+      };
+      const updated = this.db.prepare(`
+        UPDATE turns
+        SET state = 'committed', reply_json = ?, error_json = NULL, updated_at = ?
+        WHERE turn_id = ? AND state = 'failed'
+      `).run(JSON.stringify(result), now(), turnId);
+      if (Number(updated.changes) !== 1) throw new Error('failed turn recovery conflict');
+
+      const deliveryTimestamp = now();
+      this.db.prepare(`
+        INSERT INTO cloud_deliveries(
+          turn_id, peer_id, recovery_ack_seq, state, attempts, created_at, updated_at
+        ) VALUES (?, ?, 0, 'waiting', 0, ?, ?)
+        ON CONFLICT(turn_id, peer_id) DO UPDATE SET
+          state = 'waiting', payload_json = NULL, checksum = NULL, attempts = 0,
+          updated_at = excluded.updated_at, delivered_at = NULL, confirmed_at = NULL
+      `).run(turnId, targetPeer, deliveryTimestamp, deliveryTimestamp);
+      const savedTurn = this.getTurn(turnId);
+      this.appendSync('turn', turnId, 'state', savedTurn);
+      this.putDiagnostic({
+        turnId,
+        stage: 'failed_draft_recovered',
+        level: 'info',
+        detail: { peerId: targetPeer, messageId: message.messageId }
+      });
+      return { recovered: true, result };
+    });
+  }
+
   prepareCloudDelivery(turnId, peerId, payload) {
     const payloadJson = canonicalJson(payload);
     const checksum = contentHash(payload);
