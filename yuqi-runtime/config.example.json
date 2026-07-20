@@ -24,6 +24,11 @@
     "deviceId": "replace-with-device-id",
     "deviceToken": "replace-with-a-long-random-device-token",
     "encryptionKeyBase64": "replace-with-a-random-32-byte-base64-key",
-    "pollIntervalMs": 1500
+    "pollIntervalMs": 1500,
+    "proxy": {
+      "enabled": false,
+      "url": "http://127.0.0.1:10809",
+      "noProxy": "127.0.0.1,localhost,::1"
+    }
   }
 }

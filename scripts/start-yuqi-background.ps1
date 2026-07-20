@@ -23,10 +23,36 @@ $stdoutPath = Join-Path $logsDir 'yuqi-runtime.stdout.log'
 $stderrPath = Join-Path $logsDir 'yuqi-runtime.stderr.log'
 $mainArgument = Quote-ProcessArgument (Join-Path $projectRoot 'yuqi-runtime\src\main.mjs')
 $configArgument = Quote-ProcessArgument $configPath
-$process = Start-Process -FilePath (Get-Command node).Source `
-  -ArgumentList @($mainArgument, $configArgument) `
-  -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
-  -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+$nodeArguments = @($mainArgument, $configArgument)
+$proxyEnabled = $null -ne $config.cloudRelay.proxy -and $config.cloudRelay.proxy.enabled -eq $true
+$previousProxyEnvironment = @{}
+if ($proxyEnabled) {
+  $proxyUri = [Uri][string]$config.cloudRelay.proxy.url
+  if ($proxyUri.Scheme -notin @('http', 'https') -or $proxyUri.Host -notin @('127.0.0.1', 'localhost', '::1')) {
+    throw 'Yuqi cloud proxy must be a loopback HTTP or HTTPS URL.'
+  }
+  foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY')) {
+    $previousProxyEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+  }
+  $env:HTTP_PROXY = $proxyUri.AbsoluteUri.TrimEnd('/')
+  $env:HTTPS_PROXY = $proxyUri.AbsoluteUri.TrimEnd('/')
+  $noProxy = [string]$config.cloudRelay.proxy.noProxy
+  if ([string]::IsNullOrWhiteSpace($noProxy)) { $noProxy = '127.0.0.1,localhost,::1' }
+  $env:NO_PROXY = $noProxy
+  $nodeArguments = @('--use-env-proxy', $mainArgument, $configArgument)
+}
+try {
+  $process = Start-Process -FilePath (Get-Command node).Source `
+    -ArgumentList $nodeArguments `
+    -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
+    -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+} finally {
+  if ($proxyEnabled) {
+    foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY')) {
+      [Environment]::SetEnvironmentVariable($name, $previousProxyEnvironment[$name], 'Process')
+    }
+  }
+}
 Set-Content -LiteralPath (Join-Path $vaultRoot 'yuqi-runtime.pid') -Value $process.Id -Encoding ASCII
 
 for ($attempt = 0; $attempt -lt 30; $attempt++) {

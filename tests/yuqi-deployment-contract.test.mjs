@@ -84,6 +84,21 @@ test('Windows launcher quotes project paths containing spaces', () => {
   assert.match(launcher, /Quote-ProcessArgument \$configPath/);
 });
 
+test('Yuqi launcher gives only the runtime process the configured VPN proxy', () => {
+  const launcher = readFileSync('scripts/start-yuqi-background.ps1', 'utf8');
+  assert.match(launcher, /\$env:HTTP_PROXY/);
+  assert.match(launcher, /\$env:HTTPS_PROXY/);
+  assert.match(launcher, /\$env:NO_PROXY/);
+  assert.match(launcher, /--use-env-proxy/);
+  assert.match(launcher, /cloudRelay\.proxy\.enabled/);
+});
+
+test('runtime uses native proxy-aware fetch only for explicit proxy mode', () => {
+  const main = readFileSync('yuqi-runtime/src/main.mjs', 'utf8');
+  assert.match(main, /config\.cloudRelay\?\.proxy\?\.enabled\s*===\s*true/);
+  assert.match(main, /explicitProxy\s*\?\s*globalThis\.fetch\s*:\s*createSystemCloudFetch\(\)/);
+});
+
 test('Android build disables the Gradle problems-report collision on Windows', () => {
   const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
   assert.match(packageJson.scripts['android:debug'], /--no-problems-report/);
@@ -193,7 +208,7 @@ test('runtime cloud pump receives the Windows system-network fetch adapter', asy
   assert.equal((await response.json()).ok, true);
   assert.deepEqual(JSON.parse(JSON.parse(capturedInput).body), { deviceId: 'device-a' });
   const main = readFileSync('yuqi-runtime/src/main.mjs', 'utf8');
-  assert.match(main, /const cloudFetch = config\.cloudRelay\?\.enabled \? createSystemCloudFetch\(\) : null/);
+  assert.match(main, /explicitProxy\s*\?\s*globalThis\.fetch\s*:\s*createSystemCloudFetch\(\)/);
   assert.equal((main.match(/fetchImpl: cloudFetch/g) || []).length, 2);
 });
 
