@@ -215,6 +215,9 @@ assert.match(androidWorkflow, /gh release create "android-v\$\{\{ github\.run_nu
 assert.match(androidWorkflow, /Publish automatic update manifest/);
 assert.match(androidWorkflow, /refs\/heads\/update-channel/);
 assert.match(androidWorkflow, /releases\/download\/android-v%s\/app-release\.apk/);
+assert.match(androidWorkflow, /Publish branch-signed APK handoff/);
+assert.match(androidWorkflow, /BRANCH='signed-builds'/);
+assert.match(androidWorkflow, /AL-1\.0\.\$\{\{ github\.run_number \}\}-release\.apk/);
 assert.match(script, /async function shareNativeBackup\(fileName, jsonText, options = \{\}\)/);
 assert.match(script, /async function exportChatBackup\(\)/);
 assert.match(script, /app: 'AL-chat-history'/);

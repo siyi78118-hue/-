@@ -111,6 +111,36 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      - name: Publish branch-signed APK handoff
+        if: github.ref == 'refs/heads/codex/al-tdd'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH='signed-builds'
+          TARGET_PATH="artifacts/AL-1.0.${{ github.run_number }}-release.apk"
+          if ! gh api "repos/${{ github.repository }}/git/ref/heads/$BRANCH" >/dev/null 2>&1; then
+            gh api --method POST "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/heads/$BRANCH" \
+              -f sha='${{ github.sha }}'
+          fi
+          EXISTING_SHA=$(gh api "repos/${{ github.repository }}/contents/$TARGET_PATH?ref=$BRANCH" --jq '.sha' 2>/dev/null || true)
+          base64 -w 0 android/app/build/outputs/apk/release/app-release.apk > /tmp/al-release.b64
+          if [ -n "$EXISTING_SHA" ]; then
+            jq -n \
+              --rawfile content /tmp/al-release.b64 \
+              --arg message "Publish AL 1.0.${{ github.run_number }} signed APK" \
+              --arg branch "$BRANCH" \
+              --arg sha "$EXISTING_SHA" \
+              '{message:$message,content:$content,branch:$branch,sha:$sha}' > /tmp/al-release.json
+          else
+            jq -n \
+              --rawfile content /tmp/al-release.b64 \
+              --arg message "Publish AL 1.0.${{ github.run_number }} signed APK" \
+              --arg branch "$BRANCH" \
+              '{message:$message,content:$content,branch:$branch}' > /tmp/al-release.json
+          fi
+          gh api --method PUT "repos/${{ github.repository }}/contents/$TARGET_PATH" --input /tmp/al-release.json
+
       - name: Publish Android update
         if: github.ref == 'refs/heads/main'
         env:
