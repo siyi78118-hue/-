@@ -58,6 +58,16 @@ public class BridgeClientTest {
         assertEquals("turn_cloud_proactive_job_1", envelope.getString("turnId"));
     }
 
+    @Test public void cloudProactiveMatchesTheCanonicalWireTurnId() throws Exception {
+        TurnSubmission submission = new TurnSubmission(
+            "cloud_proactive_job_1", "yuqi", "trigger_proactive_1", TurnKind.PROACTIVE_CHAT,
+            "{\"scheduledFor\":1784400000000}", "{}", "job_1", 1784400000000L
+        );
+
+        assertTrue(BridgeClient.matchesTurn(submission, "turn_cloud_proactive_job_1"));
+        assertFalse(BridgeClient.matchesTurn(submission, "turn_cloud_some_other_job"));
+    }
+
     @Test public void lanAcceptedTurnPollsWithFreshSignedGetsUntilCommitted() throws Exception {
         FakeTransport transport = new FakeTransport();
         transport.responses.add(new BridgeClient.HttpResult(202,

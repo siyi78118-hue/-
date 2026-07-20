@@ -76,23 +76,29 @@ public final class BridgeClient {
     public BridgeRouter.RouteClient lanRoute() { return this::sendLan; }
     public BridgeRouter.RouteClient cloudRoute() { return this::sendCloud; }
 
+    static boolean matchesTurn(TurnSubmission submission, String remoteTurnId) {
+        return BridgeInput.wireTurnId(submission).equals(remoteTurnId);
+    }
+
     public BridgeResult sendLan(TurnSubmission submission) throws Exception {
         if (!config.hasLan()) throw new BridgeFinalException("LAN_BRIDGE_NOT_CONFIGURED", true);
         long deadline = deadline(submission);
         String path = "/v2/turns";
-        String body = wireEnvelope(submission).toString();
+        JSONObject wire = wireEnvelope(submission);
+        String wireTurnId = wire.getString("turnId");
+        String body = wire.toString();
         HttpResult response = signedLan("POST", path, body);
         requireSuccess(response, "LAN submit");
-        BridgeTurnStatus status = BridgeTurnStatus.parse(response.body, submission.turnId);
-        reportStatus(status);
+        BridgeTurnStatus status = BridgeTurnStatus.parse(response.body, wireTurnId);
+        reportStatus(submission.turnId, status);
         acknowledgeRecovery(status);
         while (!status.terminal) {
             sleepForPoll(submission.turnId, deadline, status.retryAfterMs);
-            path = "/v2/turns/" + URLEncoder.encode(submission.turnId, "UTF-8");
+            path = "/v2/turns/" + URLEncoder.encode(wireTurnId, "UTF-8");
             response = signedLan("GET", path, "");
             requireSuccess(response, "LAN poll");
-            status = BridgeTurnStatus.parse(response.body, submission.turnId);
-            reportStatus(status);
+            status = BridgeTurnStatus.parse(response.body, wireTurnId);
+            reportStatus(submission.turnId, status);
             acknowledgeRecovery(status);
         }
         if (status.committed()) return status.toResult("lan");
@@ -103,6 +109,7 @@ public final class BridgeClient {
         if (!config.hasCloud()) throw new BridgeFinalException("CLOUD_BRIDGE_NOT_CONFIGURED", true);
         long deadline = deadline(submission);
         JSONObject wire = wireEnvelope(submission);
+        String wireTurnId = wire.getString("turnId");
         Encrypted encrypted = encrypt(wire.toString());
         String relayMessageId = "relay_" + sha256(submission.turnId).substring(0, 24);
         JSONObject enqueue = new JSONObject()
@@ -133,9 +140,9 @@ public final class BridgeClient {
                     try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
                     catch (Exception ignored) { continue; }
                     JSONObject decoded = new JSONObject(plaintext);
-                    if (!submission.turnId.equals(decoded.optString("turnId"))) continue;
-                    BridgeTurnStatus status = BridgeTurnStatus.parse(plaintext, submission.turnId);
-                    reportStatus(status);
+                    if (!matchesTurn(submission, decoded.optString("turnId"))) continue;
+                    BridgeTurnStatus status = BridgeTurnStatus.parse(plaintext, wireTurnId);
+                    reportStatus(submission.turnId, status);
                     acknowledgeCloud(item.optString("messageId"));
                     acknowledgeRecovery(status);
                     if (status.committed()) return status.toResult("cloud");
@@ -190,10 +197,10 @@ public final class BridgeClient {
         if (journal != null) journal.acknowledge(status.recoveryAckSeq);
     }
 
-    private void reportStatus(BridgeTurnStatus status) {
+    private void reportStatus(String localTurnId, BridgeTurnStatus status) {
         if (statusListener == null || status == null) return;
         try {
-            statusListener.onStatus(status.turnId, status.raw);
+            statusListener.onStatus(localTurnId, status.raw);
         } catch (Exception ignored) {
             // Progress reporting is observational and must never break reply delivery.
         }

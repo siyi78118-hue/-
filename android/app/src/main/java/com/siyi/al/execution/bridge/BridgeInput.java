@@ -30,12 +30,16 @@ final class BridgeInput {
         return source(submission).optLong("deviceSeq", Math.max(1L, submission.createdAt));
     }
 
-    static JSONObject envelope(TurnSubmission submission, BridgeConfig config) throws Exception {
-        String wireTurnId = submission.turnId.startsWith("turn_")
+    static String wireTurnId(TurnSubmission submission) {
+        return submission.turnId.startsWith("turn_")
             ? submission.turnId
             : (submission.kind == com.siyi.al.execution.TurnKind.DIRECT_REPLY
                 ? submission.turnId
                 : "turn_" + submission.turnId);
+    }
+
+    static JSONObject envelope(TurnSubmission submission, BridgeConfig config) throws Exception {
+        String wireTurnId = wireTurnId(submission);
         JSONObject envelope = new JSONObject()
             .put("protocolVersion", 2)
             .put("turnId", wireTurnId)

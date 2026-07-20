@@ -69,8 +69,21 @@ export function commitVerifiedFacts(store, candidates, rawMessages) {
   const result = { verified: [], provisional: [], rejected: [] };
   for (const candidate of candidates || []) {
     const validation = validateFactCandidate(candidate, rawMessages);
-    result[validation.status].push(validation);
-    if (validation.status !== 'rejected') store.putFact(validation.fact);
+    if (validation.status === 'rejected') {
+      result.rejected.push(validation);
+      continue;
+    }
+    try {
+      store.putFact(validation.fact);
+      result[validation.status].push(validation);
+    } catch (error) {
+      if (String(error?.message || error) !== 'fact checksum conflict') throw error;
+      result.rejected.push({
+        status: 'rejected',
+        reasons: [...validation.reasons, 'fact identity conflict with an existing stored fact'],
+        fact: normalizeCandidate(validation.fact, 'rejected')
+      });
+    }
   }
   return result;
 }

@@ -157,6 +157,17 @@ test('commits verified facts and keeps ambiguous facts provisional', () => withS
   assert.equal(store.listFacts('yuqi', { status: 'provisional' }).length, 1);
 }));
 
+test('a repeated model fact ID cannot fail the whole reply turn', () => withStore(store => {
+  commitVerifiedFacts(store, [promiseCandidate()], messages);
+
+  const result = commitVerifiedFacts(store, [promiseCandidate({ confidence: 0.77 })], messages);
+
+  assert.equal(result.verified.length, 0);
+  assert.equal(result.rejected.length, 1);
+  assert.match(result.rejected[0].reasons.join(' '), /identity conflict/i);
+  assert.equal(store.listFacts('yuqi').length, 1);
+}));
+
 test('retrieval pack includes speaker, exact quote, and neighboring context', () => withStore(store => {
   commitVerifiedFacts(store, [promiseCandidate()], messages);
   const pack = buildEvidencePack(store, {
@@ -170,4 +181,3 @@ test('retrieval pack includes speaker, exact quote, and neighboring context', ()
   assert.equal(pack.facts[0].evidence[0].text, '我答应你，明天晚上会回来找你');
   assert.deepEqual(pack.facts[0].evidence[0].context.map(item => item.messageId), ['msg_1', 'msg_2', 'msg_3']);
 }));
-
