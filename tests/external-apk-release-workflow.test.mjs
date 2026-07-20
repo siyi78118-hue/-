@@ -42,6 +42,8 @@ test('工作流先验证原包，再恢复密钥、重签和验证正式证书',
   assert.match(workflow, /ANDROID_KEYSTORE_BASE64:\s*\$\{\{\s*secrets\.ANDROID_KEYSTORE_BASE64\s*\}\}/);
   assert.match(workflow, /ZIPALIGN[\s\S]+APKSIGNER[\s\S]+sign/);
   assert.match(workflow, /EXPECTED_TARGET_SIGNER_SHA256/);
+  const digestParsers = workflow.match(/sed -n 's\/\^\.\*certificate SHA-256 digest: \/\/p'/g) ?? [];
+  assert.equal(digestParsers.length, 2, '源证书和正式证书都应兼容新版 apksigner 输出前缀');
 });
 
 test('工作流比较重签前后的 APK 内容且最后才更新清单', () => {

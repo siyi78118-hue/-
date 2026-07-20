@@ -101,7 +101,7 @@ jobs:
           BADGING="$("$AAPT" dump badging input/source.apk)"
           printf '%s\n' "$BADGING" | grep -F "package: name='$EXPECTED_PACKAGE' versionCode='$EXPECTED_VERSION_CODE' versionName='$EXPECTED_VERSION_NAME'"
           "$APKSIGNER" verify --verbose --print-certs input/source.apk
-          SOURCE_SIGNER_SHA256="$("$APKSIGNER" verify --print-certs input/source.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr '[:lower:]' '[:upper:]')"
+          SOURCE_SIGNER_SHA256="$("$APKSIGNER" verify --print-certs input/source.apk | sed -n 's/^.*certificate SHA-256 digest: //p' | head -n 1 | tr '[:lower:]' '[:upper:]')"
           test "$SOURCE_SIGNER_SHA256" = "$EXPECTED_SOURCE_SIGNER_SHA256"
 
       - name: Restore stable Android signing key
@@ -140,7 +140,7 @@ jobs:
           set -euo pipefail
           "$ZIPALIGN" -c -p 4 output/app-release.apk
           "$APKSIGNER" verify --verbose --print-certs output/app-release.apk
-          TARGET_SIGNER_SHA256="$("$APKSIGNER" verify --print-certs output/app-release.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | tr '[:lower:]' '[:upper:]')"
+          TARGET_SIGNER_SHA256="$("$APKSIGNER" verify --print-certs output/app-release.apk | sed -n 's/^.*certificate SHA-256 digest: //p' | head -n 1 | tr '[:lower:]' '[:upper:]')"
           test "$TARGET_SIGNER_SHA256" = "$EXPECTED_TARGET_SIGNER_SHA256"
           BADGING="$("$AAPT" dump badging output/app-release.apk)"
           printf '%s\n' "$BADGING" | grep -F "package: name='$EXPECTED_PACKAGE' versionCode='$EXPECTED_VERSION_CODE' versionName='$EXPECTED_VERSION_NAME'"
