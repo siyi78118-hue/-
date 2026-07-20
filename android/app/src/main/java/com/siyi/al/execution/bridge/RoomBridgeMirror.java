@@ -83,12 +83,16 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
             localTurnId = remoteTurnId;
             turn = dao.turn(localTurnId);
         }
-        if (turn == null) return false;
+
+        String characterId = reply.optString("characterId", "").trim();
+        if (characterId.isEmpty() && turn != null) characterId = turn.characterId;
+        if (characterId.isEmpty()) characterId = response.optString("characterId", "").trim();
+        if (characterId.isEmpty()) return false;
 
         RawMessageEntity entity = new RawMessageEntity();
         entity.messageId = messageId;
         entity.turnId = remoteTurnId;
-        entity.characterId = reply.optString("characterId", turn.characterId);
+        entity.characterId = characterId;
         entity.speakerId = entity.characterId;
         entity.speakerType = "character";
         entity.recipientId = "user";
@@ -101,18 +105,55 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.syncSeq = 0L;
         dao.insertRawMessage(entity);
 
+        if (turn != null) {
+            ReplyPartEntity originalPart = backlogPart(messageId, localTurnId, turn.activeAttemptId, content, sentAt);
+            if (dao.importCloudBacklogReply(localTurnId, originalPart, sentAt)) return true;
+        }
+
+        String digest = sha256(messageId).substring(0, 24);
+        String backfillTurnId = "cloud_backfill_" + digest;
+        ChatTurnEntity backfillTurn = dao.turn(backfillTurnId);
+        if (backfillTurn == null) {
+            backfillTurn = new ChatTurnEntity();
+            backfillTurn.turnId = backfillTurnId;
+            backfillTurn.characterId = characterId;
+            backfillTurn.sourceMessageId = "source_cloud_backfill_" + digest;
+            backfillTurn.cloudJobId = null;
+            backfillTurn.kind = TurnKind.PROACTIVE_CHAT.name();
+            backfillTurn.state = "COMPLETED";
+            backfillTurn.activeAttemptId = null;
+            backfillTurn.inputJson = new JSONObject()
+                .put("source", "cloud_backfill")
+                .put("remoteTurnId", remoteTurnId)
+                .toString();
+            backfillTurn.snapshotJson = new JSONObject()
+                .put("characterId", characterId)
+                .toString();
+            backfillTurn.createdAt = sentAt;
+            backfillTurn.updatedAt = sentAt;
+            backfillTurn.completedAt = sentAt;
+            backfillTurn.uiAppliedAt = null;
+            dao.insertTurn(backfillTurn);
+        }
+        ReplyPartEntity independentPart = backlogPart(messageId, backfillTurnId, null, content, sentAt);
+        return dao.importCloudBacklogReply(backfillTurnId, independentPart, sentAt);
+    }
+
+    private static ReplyPartEntity backlogPart(
+        String messageId, String turnId, String attemptId, String content, long sentAt
+    ) throws Exception {
         ReplyPartEntity part = new ReplyPartEntity();
         part.replyPartId = "reply_backfill_" + sha256(messageId).substring(0, 24);
-        part.turnId = localTurnId;
-        part.attemptId = turn.activeAttemptId == null || turn.activeAttemptId.isEmpty()
-            ? "attempt_backfill_" + sha256(localTurnId).substring(0, 24)
-            : turn.activeAttemptId;
+        part.turnId = turnId;
+        part.attemptId = attemptId == null || attemptId.isEmpty()
+            ? "attempt_backfill_" + sha256(turnId).substring(0, 24)
+            : attemptId;
         part.sequence = 0;
         part.type = "TEXT";
         part.content = content;
         part.payloadJson = "{}";
         part.createdAt = sentAt;
-        return dao.importCloudBacklogReply(localTurnId, part, sentAt);
+        return part;
     }
 
     private long nextSyncSeq() {

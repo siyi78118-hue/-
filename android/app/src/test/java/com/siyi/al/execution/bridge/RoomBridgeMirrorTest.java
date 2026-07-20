@@ -12,6 +12,8 @@ import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.LinkedHashMap;
 import org.junit.Test;
 
 public class RoomBridgeMirrorTest {
@@ -106,6 +108,51 @@ public class RoomBridgeMirrorTest {
         assertEquals(0L, inserted.get(0).syncSeq);
     }
 
+    @Test public void oldCloudReplyCreatesIndependentTurnWhenOriginalTurnIsMissing() throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<ReplyPartEntity> imported = new ArrayList<>();
+        List<ChatTurnEntity> insertedTurns = new ArrayList<>();
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            dao(inserted, imported, insertedTurns, null, null), "phone_a"
+        );
+        String raw = "{\"turnId\":\"turn_cloud_proactive_missing\",\"state\":\"committed\","
+            + "\"terminal\":true,\"reply\":{\"messageId\":\"msg_yuqi_missing_1\","
+            + "\"characterId\":\"yuqi\",\"content\":\"迟到但必须显示的消息\","
+            + "\"sentAt\":1784390001000,\"origin\":\"codex\"}}";
+
+        boolean saved = mirror.persistCloudInboxReply(raw);
+
+        assertEquals(true, saved);
+        assertEquals(1, insertedTurns.size());
+        assertEquals("COMPLETED", insertedTurns.get(0).state);
+        assertEquals(1, imported.size());
+        assertEquals(insertedTurns.get(0).turnId, imported.get(0).turnId);
+    }
+
+    @Test public void oldCloudReplyUsesIndependentTurnWhenOriginalAlreadyHasFallbackReply() throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<ReplyPartEntity> imported = new ArrayList<>();
+        List<ChatTurnEntity> insertedTurns = new ArrayList<>();
+        ChatTurnEntity oldTurn = new ChatTurnEntity();
+        oldTurn.turnId = "cloud_proactive_job_conflict";
+        oldTurn.characterId = "yuqi";
+        oldTurn.state = "COMPLETED";
+        oldTurn.activeAttemptId = "attempt_fallback";
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            dao(inserted, imported, insertedTurns, oldTurn, oldTurn.turnId), "phone_a"
+        );
+        String raw = "{\"turnId\":\"turn_cloud_proactive_job_conflict\",\"state\":\"committed\","
+            + "\"terminal\":true,\"reply\":{\"messageId\":\"msg_yuqi_pc_truth\","
+            + "\"characterId\":\"yuqi\",\"content\":\"电脑端真正生成的消息\","
+            + "\"sentAt\":1784390002000,\"origin\":\"codex\"}}";
+
+        boolean saved = mirror.persistCloudInboxReply(raw);
+
+        assertEquals(true, saved);
+        assertEquals(1, insertedTurns.size());
+        assertEquals(insertedTurns.get(0).turnId, imported.get(imported.size() - 1).turnId);
+    }
+
     private static AlExecutionDao dao(List<RawMessageEntity> inserted) {
         return dao(inserted, new ArrayList<>(), null);
     }
@@ -113,6 +160,18 @@ public class RoomBridgeMirrorTest {
     private static AlExecutionDao dao(
         List<RawMessageEntity> inserted, List<ReplyPartEntity> imported, ChatTurnEntity turn
     ) {
+        return dao(inserted, imported, new ArrayList<>(), turn, null);
+    }
+
+    private static AlExecutionDao dao(
+        List<RawMessageEntity> inserted,
+        List<ReplyPartEntity> imported,
+        List<ChatTurnEntity> insertedTurns,
+        ChatTurnEntity turn,
+        String blockedTurnId
+    ) {
+        Map<String, ChatTurnEntity> turns = new LinkedHashMap<>();
+        if (turn != null) turns.put(turn.turnId, turn);
         return (AlExecutionDao) Proxy.newProxyInstance(
             AlExecutionDao.class.getClassLoader(),
             new Class<?>[] { AlExecutionDao.class },
@@ -122,10 +181,17 @@ public class RoomBridgeMirrorTest {
                     return 1L;
                 }
                 if ("turn".equals(method.getName())) {
-                    return turn != null && turn.turnId.equals(args[0]) ? turn : null;
+                    return turns.get((String) args[0]);
+                }
+                if ("insertTurn".equals(method.getName())) {
+                    ChatTurnEntity value = (ChatTurnEntity) args[0];
+                    insertedTurns.add(value);
+                    turns.put(value.turnId, value);
+                    return 1L;
                 }
                 if ("importCloudBacklogReply".equals(method.getName())) {
                     imported.add((ReplyPartEntity) args[1]);
+                    if (blockedTurnId != null && blockedTurnId.equals(args[0])) return false;
                     return true;
                 }
                 Class<?> type = method.getReturnType();

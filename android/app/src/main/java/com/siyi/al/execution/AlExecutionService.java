@@ -171,9 +171,8 @@ public final class AlExecutionService extends Service {
         try {
             com.siyi.al.execution.db.ExecutionAttemptEntity attempt = executionStore.activeAttempt(turn.turnId);
             if (attempt == null || attempt.memoryResult == null || attempt.memoryResult.trim().isEmpty()) return;
-            JSONObject checkpoint = new JSONObject(attempt.memoryResult);
-            JSONObject response = checkpoint.optJSONObject("bridgeResponse");
-            if (response == null || response.optString("_relayMessageId", "").trim().isEmpty()) return;
+            JSONObject response = BridgeReceiptCheckpoint.extract(attempt.memoryResult);
+            if (response == null) return;
             if (ExecutionRuntime.confirmCloudResult(this, response.toString())) {
                 confirmed.edit().putBoolean(key, true).apply();
                 executionStore.recordDiagnostic(
