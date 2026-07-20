@@ -1933,6 +1933,92 @@ const playerPostSeen = { authorType: 'player', text: '今天不想说话。', no
 assert.equal(markMomentNotifiedToChar(playerPostSeen, { id: 'char_seen', name: '林晚' }), true);
 assert.equal(JSON.stringify(playerPostSeen.notifiedCharIds), JSON.stringify(['char_seen']));
 assert.match(JSON.parse(storage.get('rpchat_chats')).char_seen.messages.at(-1).content, /林晚看到了这条朋友圈/);
+assert.match(script, /function openPlayerMomentActions\(momentId\)/, '用户自己的动态必须提供动作菜单');
+assert.match(script, /删除这条动态？朋友圈将不再显示，但已经看过的人仍可能记得。/, '删除动态前必须说明真实记忆边界');
+const momentDeletionProbe = await vm.runInContext(`(async () => {
+  const oldCharacters = characters;
+  const oldMoments = allMoments;
+  const oldChats = allChats;
+  const oldActiveScreen = activeScreen;
+  characters = [{ id: 'seen-char', name: '虞栖' }, { id: 'unseen-char', name: '未看者' }];
+  allChats = {
+    'seen-char': { messages: [{ id: 'seen-memory', role: 'user', hidden: true, content: '【朋友圈事件】虞栖看过这条动态' }] },
+    'unseen-char': { messages: [] }
+  };
+  allMoments = [
+    { id: 'delete-player', authorType: 'player', text: '准备删除', notifiedCharIds: ['seen-char'], likes: ['seen-char'], comments: [] },
+    { id: 'keep-char', authorType: 'char', charId: 'seen-char', text: '角色动态', likes: [], comments: [] }
+  ];
+  activeScreen = 'chats';
+  const beforeSeen = allChats['seen-char'].messages.length;
+  const beforeUnseen = allChats['unseen-char'].messages.length;
+  const deleted = await deletePlayerMoment('delete-player');
+  const deleteCharacter = await deletePlayerMoment('keep-char');
+  const repeated = await deletePlayerMoment('delete-player');
+  const result = {
+    deleted,
+    deleteCharacter,
+    repeated,
+    remainingIds: allMoments.map(row => row.id),
+    seenMessages: allChats['seen-char'].messages.length,
+    unseenMessages: allChats['unseen-char'].messages.length,
+    beforeSeen,
+    beforeUnseen
+  };
+  characters = oldCharacters;
+  allMoments = oldMoments;
+  allChats = oldChats;
+  activeScreen = oldActiveScreen;
+  return result;
+})()`, context);
+assert.equal(momentDeletionProbe.deleted, true);
+assert.equal(momentDeletionProbe.deleteCharacter, false, '不能删除虞栖或其他角色发布的动态');
+assert.equal(momentDeletionProbe.repeated, false, '重复删除必须幂等');
+assert.deepEqual(Array.from(momentDeletionProbe.remainingIds), ['keep-char']);
+assert.equal(momentDeletionProbe.seenMessages, momentDeletionProbe.beforeSeen, '删除不能抹掉或重复写入已看过角色的经历');
+assert.equal(momentDeletionProbe.unseenMessages, momentDeletionProbe.beforeUnseen, '未看过的角色不能因删除获得任何记忆');
+const momentDeletionRaceProbe = await vm.runInContext(`(async () => {
+  const oldCharacters = characters;
+  const oldMoments = allMoments;
+  const oldChats = allChats;
+  const oldSettings = settings;
+  const oldCall = callMomentInteractionAI;
+  const oldProcess = processMemoryAfterScenario;
+  const oldActiveScreen = activeScreen;
+  let resolveInteraction;
+  const raceMoment = { id: 'race-player', authorType: 'player', text: '异步删除测试', notifiedCharIds: [], likes: [], comments: [] };
+  characters = [{ id: 'race-char', name: '虞栖' }];
+  allMoments = [raceMoment];
+  allChats = { 'race-char': { messages: [] } };
+  settings = { ...settings, chatApiUrl: 'https://example.test/v1', chatApiKey: 'key', chatModel: 'model' };
+  activeScreen = 'chats';
+  processMemoryAfterScenario = () => {};
+  callMomentInteractionAI = () => new Promise(resolve => { resolveInteraction = resolve; });
+  const flight = runMomentNotification('race-player');
+  const messagesAtDelete = allChats['race-char'].messages.length;
+  await deletePlayerMoment('race-player');
+  resolveInteraction({ like: true, comment: '这条迟到评论不能落盘' });
+  await flight;
+  const result = {
+    momentCount: allMoments.length,
+    likes: raceMoment.likes.length,
+    comments: raceMoment.comments.length,
+    messagesAtDelete,
+    messagesAfter: allChats['race-char'].messages.length
+  };
+  characters = oldCharacters;
+  allMoments = oldMoments;
+  allChats = oldChats;
+  settings = oldSettings;
+  callMomentInteractionAI = oldCall;
+  processMemoryAfterScenario = oldProcess;
+  activeScreen = oldActiveScreen;
+  return result;
+})()`, context);
+assert.equal(momentDeletionRaceProbe.momentCount, 0);
+assert.equal(momentDeletionRaceProbe.likes, 0, '动态删除后迟到点赞不能写回');
+assert.equal(momentDeletionRaceProbe.comments, 0, '动态删除后迟到评论不能写回');
+assert.equal(momentDeletionRaceProbe.messagesAfter, momentDeletionRaceProbe.messagesAtDelete, '动态删除后迟到结果不能新增记忆事件');
 const momentThreadProbe = await vm.runInContext(`(async () => {
   const oldCharacters = characters;
   const oldMoments = allMoments;

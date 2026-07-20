@@ -1475,6 +1475,7 @@ let isStreaming = false;
 let streamingDraft = null;
 const activeChatRequests = new Map();
 let messageActionTarget = null;
+let momentActionTargetId = '';
 let selectedMessageQuote = null;
 let messageLongPressTimer = null;
 let messageLongPressStart = null;
@@ -4789,7 +4790,7 @@ function renderMomentItem(moment) {
   const failedNames = Object.keys(moment.notifyFailures || {}).map(id => charName(characters.find(c => c.id === id))).filter(Boolean);
   const failureLine = failedNames.length ? `<div class="moment-seen-line">${esc(failedNames.join('、'))}互动失败，点右侧 ·· 重试</div>` : '';
   const authorClick = author.isPlayer ? "openSelfProfile('moments')" : `openContactProfile('${moment.charId}')`;
-  const actionClick = author.isPlayer ? `notifyMomentToCharacters('${moment.id}', true)` : `openMomentReplyBar('${moment.id}')`;
+  const actionClick = author.isPlayer ? `openPlayerMomentActions('${moment.id}')` : `openMomentReplyBar('${moment.id}')`;
   return `<div class="moment">
     ${author.avatar}
     <div class="moment-body">
@@ -4829,6 +4830,42 @@ function materializeVirtualMoment(momentId) {
 function saveMoments() {
   DB.set('moments', allMoments);
   if (activeScreen === 'moments') renderMoments();
+}
+function momentStillCurrent(momentId, expectedMoment) {
+  return allMoments.find(moment => moment.id === momentId) === expectedMoment;
+}
+function openPlayerMomentActions(momentId) {
+  const moment = allMoments.find(item => item.id === momentId);
+  if (!moment || moment.authorType !== 'player' || moment.virtual) return false;
+  momentActionTargetId = momentId;
+  messageActionTarget = null;
+  const buttons = document.getElementById('message-action-buttons');
+  if (!buttons) return false;
+  buttons.innerHTML = '<button type="button" onclick="notifySelectedPlayerMoment()">通知角色</button><button class="danger" type="button" onclick="confirmDeleteSelectedPlayerMoment()">删除动态</button>';
+  document.getElementById('message-action-mask')?.classList.add('show');
+  return true;
+}
+function notifySelectedPlayerMoment() {
+  const momentId = momentActionTargetId;
+  closeMessageActions();
+  return momentId ? notifyMomentToCharacters(momentId, true) : false;
+}
+async function deletePlayerMoment(momentId) {
+  const index = allMoments.findIndex(moment => moment.id === momentId && moment.authorType === 'player' && !moment.virtual);
+  if (index < 0) return false;
+  allMoments.splice(index, 1);
+  momentNotificationFlights.delete(momentId);
+  saveMoments();
+  mirrorAppState().catch(err => console.warn('[AL State] deleted moment mirror skipped:', err.message));
+  return true;
+}
+async function confirmDeleteSelectedPlayerMoment() {
+  const momentId = momentActionTargetId;
+  closeMessageActions();
+  if (!momentId || !confirm('删除这条动态？朋友圈将不再显示，但已经看过的人仍可能记得。')) return false;
+  const deleted = await deletePlayerMoment(momentId);
+  if (deleted) toast('动态已删除');
+  return deleted;
 }
 function removeCharacterMomentTraces(charId) {
   if (!charId) return 0;
@@ -4978,11 +5015,13 @@ async function runMomentNotification(momentId, manual = false) {
   if (!targets.length) { if (manual) toast('角色已经看过这条动态'); return; }
   if (manual) toast('正在通知角色...', 1200);
   for (const char of targets) {
+    if (!momentStillCurrent(momentId, moment)) return;
     markMomentNotifiedToChar(moment, char);
     saveMoments();
     processMemoryAfterScenario(char.id);
     try {
       const result = await callMomentInteractionAI(char, moment);
+      if (!momentStillCurrent(momentId, moment)) return;
       if (moment.notifyFailures) delete moment.notifyFailures[char.id];
       if (result.like) moment.likes = [...new Set([...(moment.likes || []), char.id])];
       const comment = String(result.comment || '').replace(/\s+/g, ' ').trim();
@@ -4996,6 +5035,7 @@ async function runMomentNotification(momentId, manual = false) {
       saveMoments();
       processMemoryAfterScenario(char.id);
     } catch (err) {
+      if (!momentStillCurrent(momentId, moment)) return;
       moment.notifyFailures = { ...(moment.notifyFailures || {}), [char.id]: friendlyErrorMessage(err) };
       recordMomentMemoryEvent(char.id, `${char.name}看到了${playerName()}的朋友圈，但本次点赞/评论判断失败：${friendlyErrorMessage(err)}`, Date.now());
       saveMoments();
@@ -5003,7 +5043,7 @@ async function runMomentNotification(momentId, manual = false) {
       console.warn('[AL Moments] character skipped:', char.name, err.message);
     }
   }
-  if (manual) toast('通知完成');
+  if (manual && momentStillCurrent(momentId, moment)) toast('通知完成');
 }
 async function callMomentInteractionAI(char, moment) {
   const memoryQuery = `朋友圈互动触发。
@@ -6121,6 +6161,7 @@ function refuseIncomingPayment(charId, messageId) {
 function openIncomingPaymentActions(charId, messageId) {
   const message = incomingPaymentMessage(charId, messageId);
   if (!message || (message.payStatus || 'pending') !== 'pending') return;
+  momentActionTargetId = '';
   messageActionTarget = { charId, messageId };
   const buttons = document.getElementById('message-action-buttons');
   if (!buttons) return;
@@ -6384,6 +6425,7 @@ function openMessageActions(messageId) {
   const chat = allChats[currentCharId];
   const message = messageById(chat, messageId);
   if (!chat || !message) return;
+  momentActionTargetId = '';
   messageActionTarget = { charId: currentCharId, messageId };
   const buttons = document.getElementById('message-action-buttons');
   if (!buttons) return;
@@ -6398,6 +6440,7 @@ function closeMessageActions(event) {
   if (event && event.target?.id !== 'message-action-mask') return;
   document.getElementById('message-action-mask')?.classList.remove('show');
   messageActionTarget = null;
+  momentActionTargetId = '';
 }
 function renderQuotePreview() {
   const root = document.getElementById('chat-quote-preview');
