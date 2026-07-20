@@ -54,7 +54,7 @@ test('工作流比较重签前后的 APK 内容且最后才更新清单', () => 
     'name: Remove temporary source release'
   );
   assert.match(workflow, /"latestBuild": %s/);
-  assert.match(workflow, /releases\/download\/android-v%s\/app-release\.apk/);
+  assert.match(workflow, /releases\/download\/android-v\$EXPECTED_VERSION_CODE\/app-release\.apk/);
 });
 
 test('工作流包含版本防回退门禁和发布串行锁', () => {
@@ -62,4 +62,24 @@ test('工作流包含版本防回退门禁和发布串行锁', () => {
   assert.match(workflow, /cancel-in-progress:\s*false/);
   assert.match(workflow, /CURRENT_BUILD/);
   assert.match(workflow, /current update build.*not lower than requested build/i);
+});
+
+test('GitHub Release 附件故障时可从临时 Git 引用读取原包', () => {
+  assert.match(workflow, /source_ref:/);
+  assert.match(workflow, /SOURCE_REF:\s*\$\{\{\s*inputs\.source_ref\s*\}\}/);
+  assert.match(workflow, /actions\/checkout@v4/);
+  assert.match(workflow, /ref:\s*\$\{\{\s*inputs\.source_ref\s*\}\}/);
+  assert.match(workflow, /source-repo\/source\.apk/);
+});
+
+test('Release 上传失败时把正式签名 APK 发布到更新分支', () => {
+  assert.match(workflow, /release_asset_published/);
+  assert.match(workflow, /update-channel-repo\/app-release-v74\.apk/);
+  assert.match(workflow, /raw\.githubusercontent\.com/);
+  assertOrdered(
+    'name: Validate resigned APK',
+    'name: Publish Android release',
+    'name: Publish signed APK fallback',
+    'name: Publish automatic update manifest'
+  );
 });

@@ -10,6 +10,10 @@ on:
         description: Draft release tag containing source.apk
         required: true
         type: string
+      source_ref:
+        description: Temporary Git ref containing source.apk when release uploads are unavailable
+        required: true
+        type: string
       version_code:
         description: Android versionCode to publish
         required: true
@@ -39,11 +43,13 @@ jobs:
       - name: Validate requested release
         env:
           SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
           VERSION_CODE: ${{ inputs.version_code }}
           SOURCE_SHA256: ${{ inputs.source_sha256 }}
         run: |
           set -euo pipefail
           test "$SOURCE_TAG" = "android-v74-source-20260720"
+          test "$SOURCE_REF" = "codex/android-v74-source"
           test "$VERSION_CODE" = "$EXPECTED_VERSION_CODE"
           test "$(printf '%s' "$SOURCE_SHA256" | tr '[:lower:]' '[:upper:]')" = "$EXPECTED_SOURCE_SHA256"
           CURRENT_MANIFEST="$(gh api -H 'Accept: application/vnd.github.raw+json' 'repos/${{ github.repository }}/contents/android-update.json?ref=update-channel')"
@@ -53,13 +59,29 @@ jobs:
             exit 1
           fi
 
+      - name: Checkout temporary source ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          path: source-repo
+          fetch-depth: 1
+
+      - name: Checkout automatic update channel
+        uses: actions/checkout@v4
+        with:
+          ref: update-channel
+          path: update-channel-repo
+          fetch-depth: 1
+
       - name: Download source APK
         env:
           SOURCE_TAG: ${{ inputs.source_tag }}
         run: |
           set -euo pipefail
           mkdir -p input output signing
-          gh release download "$SOURCE_TAG" --repo '${{ github.repository }}' --pattern source.apk --dir input
+          if ! gh release download "$SOURCE_TAG" --repo '${{ github.repository }}' --pattern source.apk --dir input; then
+            cp source-repo/source.apk input/source.apk
+          fi
           test -s input/source.apk
 
       - name: Validate source APK
@@ -144,26 +166,59 @@ jobs:
           sha256sum output/app-release.apk > output/app-release.apk.sha256
 
       - name: Publish Android release
+        id: publish_release
         run: |
           set -euo pipefail
           TAG="android-v$EXPECTED_VERSION_CODE"
+          RELEASE_ASSET_PUBLISHED=false
+          set +e
           if gh release view "$TAG" --repo '${{ github.repository }}' >/dev/null 2>&1; then
             gh release upload "$TAG" output/app-release.apk --repo '${{ github.repository }}' --clobber
-            gh release edit "$TAG" --repo '${{ github.repository }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证 1.0.74 成品使用现有 AL 正式证书重新签名，可通过应用内更新覆盖安装。" --latest
+            RELEASE_RESULT=$?
+            if [ "$RELEASE_RESULT" -eq 0 ]; then
+              gh release edit "$TAG" --repo '${{ github.repository }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证 1.0.74 成品使用现有 AL 正式证书重新签名，可通过应用内更新覆盖安装。" --latest
+              RELEASE_RESULT=$?
+            fi
           else
             gh release create "$TAG" --repo '${{ github.repository }}' --target '${{ github.sha }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证 1.0.74 成品使用现有 AL 正式证书重新签名，可通过应用内更新覆盖安装。" --latest "output/app-release.apk#AL-$EXPECTED_VERSION_NAME-release.apk"
+            RELEASE_RESULT=$?
           fi
-          ASSET_NAME="$(gh release view "$TAG" --repo '${{ github.repository }}' --json assets --jq '.assets[] | select(.name == "app-release.apk") | .name')"
-          test "$ASSET_NAME" = "app-release.apk"
+          if [ "$RELEASE_RESULT" -eq 0 ]; then
+            ASSET_NAME="$(gh release view "$TAG" --repo '${{ github.repository }}' --json assets --jq '.assets[] | select(.name == "app-release.apk") | .name')"
+            if [ "$ASSET_NAME" = "app-release.apk" ]; then
+              RELEASE_ASSET_PUBLISHED=true
+            fi
+          fi
+          if [ "$RELEASE_ASSET_PUBLISHED" != true ]; then
+            gh release delete "$TAG" --repo '${{ github.repository }}' --cleanup-tag --yes >/dev/null 2>&1 || true
+          fi
+          set -e
+          echo "release_asset_published=$RELEASE_ASSET_PUBLISHED" >> "$GITHUB_OUTPUT"
+
+      - name: Publish signed APK fallback
+        if: steps.publish_release.outputs.release_asset_published != 'true'
+        run: |
+          set -euo pipefail
+          cp output/app-release.apk update-channel-repo/app-release-v74.apk
+          cd update-channel-repo
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add app-release-v74.apk
+          git commit -m "Publish AL Android $EXPECTED_VERSION_NAME fallback APK"
+          git push origin HEAD:update-channel
 
       - name: Publish automatic update manifest
         run: |
           set -euo pipefail
-          MANIFEST=$(printf '{\n  "latestBuild": %s,\n  "version": "%s",\n  "releaseUrl": "https://github.com/%s/releases/download/android-v%s/app-release.apk"\n}\n' \
+          if [ '${{ steps.publish_release.outputs.release_asset_published }}' = 'true' ]; then
+            RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/android-v$EXPECTED_VERSION_CODE/app-release.apk"
+          else
+            RELEASE_URL="https://raw.githubusercontent.com/${{ github.repository }}/update-channel/app-release-v74.apk"
+          fi
+          MANIFEST=$(printf '{\n  "latestBuild": %s,\n  "version": "%s",\n  "releaseUrl": "%s"\n}\n' \
             "$EXPECTED_VERSION_CODE" \
             "$EXPECTED_VERSION_NAME" \
-            '${{ github.repository }}' \
-            "$EXPECTED_VERSION_CODE")
+            "$RELEASE_URL")
           EXISTING_SHA=$(gh api "repos/${{ github.repository }}/contents/android-update.json?ref=update-channel" --jq '.sha')
           CONTENT=$(printf '%s' "$MANIFEST" | base64 -w 0)
           gh api --method PUT "repos/${{ github.repository }}/contents/android-update.json" \
@@ -176,4 +231,7 @@ jobs:
         if: success()
         env:
           SOURCE_TAG: ${{ inputs.source_tag }}
-        run: gh release delete "$SOURCE_TAG" --repo '${{ github.repository }}' --cleanup-tag --yes
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          gh release delete "$SOURCE_TAG" --repo '${{ github.repository }}' --cleanup-tag --yes || true
+          gh api --method DELETE "repos/${{ github.repository }}/git/refs/heads/$SOURCE_REF" || true
