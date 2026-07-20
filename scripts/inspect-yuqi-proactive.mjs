@@ -3,7 +3,9 @@ import { resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 const root = resolve(import.meta.dirname, '..');
-const configPath = resolve(process.argv[2] || `${root}/yuqi-runtime/config.json`);
+const argumentsList = process.argv.slice(2);
+const brief = argumentsList.includes('--brief');
+const configPath = resolve(argumentsList.find(value => value !== '--brief') || `${root}/yuqi-runtime/config.json`);
 const config = JSON.parse(readFileSync(configPath, 'utf8'));
 const db = new DatabaseSync(resolve(config.databasePath), { readOnly: true });
 
@@ -59,16 +61,37 @@ try {
     GROUP BY turn_id, speaker_type, origin
     ORDER BY turn_id DESC, speaker_type
   `);
+  const proactiveMessages = rows(`
+    SELECT datetime(t.created_at / 1000, 'unixepoch', 'localtime') AS createdAt,
+           t.turn_id AS turnId, t.state,
+           m.message_id AS messageId, m.content
+    FROM turns t
+    LEFT JOIN messages m
+      ON m.turn_id = t.turn_id AND m.speaker_type = 'character'
+    WHERE json_extract(t.envelope_json, '$.kind') = 'PROACTIVE_CHAT'
+    ORDER BY t.created_at DESC
+    LIMIT 40
+  `);
 
-  process.stdout.write(`${JSON.stringify({
+  const report = {
     databasePath: config.databasePath,
     recentTurns: turns,
     proactiveTurns: turns.filter(row => row.kind === 'PROACTIVE_CHAT'),
     stages,
     deliveries,
     messageCounts,
+    proactiveMessages,
     diagnostics
-  }, null, 2)}\n`);
+  };
+  if (brief) {
+    report.recentTurns = report.recentTurns.filter(row => row.kind === 'PROACTIVE_CHAT' && row.state === 'committed');
+    report.proactiveTurns = report.recentTurns;
+    report.stages = [];
+    report.messageCounts = [];
+    report.diagnostics = [];
+    report.proactiveMessages = report.proactiveMessages.filter(row => row.messageId);
+  }
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 } finally {
   db.close();
 }

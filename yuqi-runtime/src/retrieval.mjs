@@ -22,7 +22,9 @@ export function buildEvidencePack(store, { characterId, query = '', keywords = [
     ...(keywords || []).map(item => String(item).toLowerCase())
   ].filter(Boolean))];
   const safeLimit = Math.max(1, Math.min(100, Number(limit) || 12));
-  const ranked = store.listFacts(characterId)
+  const ranked = (typeof store.listRetrievableFacts === 'function'
+    ? store.listRetrievableFacts(characterId)
+    : store.listFacts(characterId))
     .map(fact => ({ fact, score: scoreFact(fact, terms) }))
     .filter(item => item.score > 0)
     .sort((left, right) => right.score - left.score || right.fact.confidence - left.fact.confidence)

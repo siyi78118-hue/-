@@ -256,11 +256,14 @@ export class YuqiOrchestrator {
       sentAt: this.clock(),
       origin: 'codex'
     };
-    this.store.putMessage(reply);
+    const savedReply = this.store.putMessage(reply);
+    if (['PROACTIVE_CHAT', 'PROACTIVE_MOMENT'].includes(envelope.kind)) {
+      this.store.quarantinePendingReply(savedReply.messageId);
+    }
     const result = {
       turnId: envelope.turnId,
       presetVersion: this.presets.current().version,
-      reply,
+      reply: savedReply,
       usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
     };
     this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {

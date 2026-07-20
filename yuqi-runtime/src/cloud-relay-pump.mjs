@@ -133,6 +133,23 @@ export class CloudRelayPump {
         let envelope = null;
         try {
           envelope = decryptRelayPayload(message, this.encryptionKeyBase64);
+          if (envelope.type === 'DELIVERY_RECEIPT') {
+            if (!this.store || typeof this.store.confirmCloudDelivery !== 'function') {
+              throw new Error('delivery receipt store is unavailable');
+            }
+            this.store.confirmCloudDelivery(
+              String(envelope.turnId || ''),
+              String(envelope.peerId || this.deviceId),
+              envelope
+            );
+            const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {
+              method: 'POST', headers: this.headers(true),
+              body: JSON.stringify({ deviceId: this.deviceId, messageIds: [message.messageId] })
+            });
+            if (!acked.ok) throw new Error(`cloud relay ack HTTP ${acked.status}`);
+            summary.processed += 1;
+            continue;
+          }
           let recoveryAckSeq = 0;
           if (this.reconciler && envelope.recovery && Array.isArray(envelope.recovery.entries)) {
             const recovery = await this.reconciler.reconcileFrom(envelope.recovery);

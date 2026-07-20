@@ -28,6 +28,10 @@ public final class BridgeClient {
         void onStatus(String turnId, String raw);
     }
 
+    public interface CloudInboxConsumer {
+        boolean persist(String raw) throws Exception;
+    }
+
     interface Transport {
         HttpResult request(String method, String target, String body, String[][] headers) throws Exception;
     }
@@ -48,6 +52,7 @@ public final class BridgeClient {
     private final Clock clock;
     private final Sleeper sleeper;
     private final StatusListener statusListener;
+    private final CloudInboxConsumer inboxConsumer;
 
     public BridgeClient(BridgeConfig config) {
         this(config, null);
@@ -58,12 +63,26 @@ public final class BridgeClient {
     }
 
     public BridgeClient(BridgeConfig config, FallbackJournal journal, StatusListener statusListener) {
-        this(config, journal, null, System::currentTimeMillis, Thread::sleep, statusListener);
+        this(config, journal, null, System::currentTimeMillis, Thread::sleep, statusListener, null);
+    }
+
+    public BridgeClient(
+        BridgeConfig config, FallbackJournal journal, StatusListener statusListener,
+        CloudInboxConsumer inboxConsumer
+    ) {
+        this(config, journal, null, System::currentTimeMillis, Thread::sleep, statusListener, inboxConsumer);
     }
 
     BridgeClient(
         BridgeConfig config, FallbackJournal journal, Transport transport, Clock clock, Sleeper sleeper,
         StatusListener statusListener
+    ) {
+        this(config, journal, transport, clock, sleeper, statusListener, null);
+    }
+
+    BridgeClient(
+        BridgeConfig config, FallbackJournal journal, Transport transport, Clock clock, Sleeper sleeper,
+        StatusListener statusListener, CloudInboxConsumer inboxConsumer
     ) {
         this.config = config == null ? BridgeConfig.disabled() : config;
         this.journal = journal;
@@ -71,6 +90,7 @@ public final class BridgeClient {
         this.clock = clock == null ? System::currentTimeMillis : clock;
         this.sleeper = sleeper == null ? Thread::sleep : sleeper;
         this.statusListener = statusListener;
+        this.inboxConsumer = inboxConsumer;
     }
 
     public BridgeRouter.RouteClient lanRoute() { return this::sendLan; }
@@ -78,6 +98,16 @@ public final class BridgeClient {
 
     static boolean matchesTurn(TurnSubmission submission, String remoteTurnId) {
         return BridgeInput.wireTurnId(submission).equals(remoteTurnId);
+    }
+
+    static String classifyCloudResult(TurnSubmission submission, JSONObject decoded) {
+        String remoteTurnId = decoded.optString("turnId", "");
+        boolean current = submission != null && matchesTurn(submission, remoteTurnId);
+        JSONObject reply = decoded.optJSONObject("reply");
+        boolean committed = decoded.optBoolean("terminal", false)
+            && reply != null && !reply.optString("content", "").trim().isEmpty();
+        if (current) return committed ? "CURRENT_COMMITTED" : "CURRENT_FAILED";
+        return committed ? "BACKLOG_COMMITTED" : "BACKLOG_FAILED";
     }
 
     public BridgeResult sendLan(TurnSubmission submission) throws Exception {
@@ -140,13 +170,24 @@ public final class BridgeClient {
                     try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
                     catch (Exception ignored) { continue; }
                     JSONObject decoded = new JSONObject(plaintext);
-                    if (!matchesTurn(submission, decoded.optString("turnId"))) continue;
-                    BridgeTurnStatus status = BridgeTurnStatus.parse(plaintext, wireTurnId);
+                    decoded.put("_relayMessageId", item.optString("messageId"));
+                    decoded.put("_deliveryRoute", "cloud");
+                    String decorated = decoded.toString();
+                    String disposition = classifyCloudResult(submission, decoded);
+                    if ("BACKLOG_COMMITTED".equals(disposition)) {
+                        processBacklogCommitted(decoded, decorated);
+                        continue;
+                    }
+                    if ("BACKLOG_FAILED".equals(disposition)) {
+                        acknowledgeCloud(item.optString("messageId"));
+                        continue;
+                    }
+                    BridgeTurnStatus status = BridgeTurnStatus.parse(decorated, wireTurnId);
                     reportStatus(submission.turnId, status);
-                    acknowledgeCloud(item.optString("messageId"));
                     acknowledgeRecovery(status);
                     if (status.committed()) return status.toResult("cloud");
                     if (status.failedFinal()) {
+                        acknowledgeCloud(item.optString("messageId"));
                         throw new BridgeFinalException(status.errorCode, status.allowFallback);
                     }
                 }
@@ -154,6 +195,84 @@ public final class BridgeClient {
             sleepForPoll(submission.turnId, deadline, config.cloudPollIntervalMs);
         }
         throw new BridgeDeadlineException(submission.turnId);
+    }
+
+    public int drainCloudInbox() throws Exception {
+        if (!config.hasCloud() || inboxConsumer == null) return 0;
+        String encodedDevice = URLEncoder.encode(config.deviceId, "UTF-8");
+        String pollTarget = config.cloudUrl + "/bridge/poll?deviceId=" + encodedDevice
+            + "&direction=pc_to_phone&limit=50";
+        HttpResult polled = request("GET", pollTarget, "", bearerHeaders());
+        requireSuccess(polled, "cloud poll");
+        JSONArray messages = new JSONObject(polled.body).optJSONArray("messages");
+        int processed = 0;
+        if (messages == null) return processed;
+        for (int index = 0; index < messages.length(); index += 1) {
+            JSONObject item = messages.optJSONObject(index);
+            if (item == null) continue;
+            String plaintext;
+            try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
+            catch (Exception ignored) { continue; }
+            JSONObject decoded = new JSONObject(plaintext);
+            decoded.put("_relayMessageId", item.optString("messageId"));
+            decoded.put("_deliveryRoute", "cloud");
+            String disposition = classifyCloudResult(null, decoded);
+            if ("BACKLOG_COMMITTED".equals(disposition)) {
+                if (processBacklogCommitted(decoded, decoded.toString())) processed += 1;
+            } else {
+                acknowledgeCloud(item.optString("messageId"));
+                processed += 1;
+            }
+        }
+        return processed;
+    }
+
+    public boolean confirmCloudResult(String responseJson) throws Exception {
+        JSONObject decoded = new JSONObject(responseJson == null ? "{}" : responseJson);
+        String relayMessageId = decoded.optString("_relayMessageId", "").trim();
+        if (relayMessageId.isEmpty()) return false;
+        publishDeliveryReceipt(decoded);
+        acknowledgeCloud(relayMessageId);
+        return true;
+    }
+
+    private boolean processBacklogCommitted(JSONObject decoded, String raw) throws Exception {
+        if (inboxConsumer == null || !inboxConsumer.persist(raw)) return false;
+        publishDeliveryReceipt(decoded);
+        acknowledgeCloud(decoded.optString("_relayMessageId"));
+        return true;
+    }
+
+    private void publishDeliveryReceipt(JSONObject decoded) throws Exception {
+        JSONObject reply = decoded.optJSONObject("reply");
+        if (reply == null) throw new IllegalStateException("cloud reply is missing");
+        String turnId = decoded.optString("turnId", "").trim();
+        String messageId = reply.optString("messageId", "").trim();
+        String content = reply.optString("content", "");
+        if (turnId.isEmpty() || messageId.isEmpty() || content.trim().isEmpty()) {
+            throw new IllegalStateException("cloud reply identity is incomplete");
+        }
+        JSONObject receipt = new JSONObject()
+            .put("type", "DELIVERY_RECEIPT")
+            .put("peerId", config.deviceId)
+            .put("turnId", turnId)
+            .put("messageId", messageId)
+            .put("contentSha256", sha256(content))
+            .put("receivedAt", clock.now());
+        Encrypted encrypted = encrypt(receipt.toString());
+        String identity = turnId + ":" + messageId;
+        JSONObject output = new JSONObject()
+            .put("deviceId", config.deviceId)
+            .put("messageId", "receipt_" + sha256(identity).substring(0, 24))
+            .put("idempotencyKey", "receipt_" + sha256(identity).substring(0, 24))
+            .put("direction", "phone_to_pc")
+            .put("ciphertext", encrypted.ciphertext)
+            .put("nonce", encrypted.nonce)
+            .put("expiresAt", clock.now() + 24L * 60L * 60L * 1000L);
+        HttpResult response = request(
+            "POST", config.cloudUrl + "/bridge/enqueue", output.toString(), bearerHeaders()
+        );
+        requireSuccess(response, "delivery receipt enqueue");
     }
 
     public static String signLanRequest(

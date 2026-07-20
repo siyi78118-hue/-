@@ -3,7 +3,9 @@ package com.siyi.al.execution.bridge;
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.db.AlExecutionDao;
+import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
+import com.siyi.al.execution.db.ReplyPartEntity;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import org.json.JSONObject;
@@ -40,21 +42,77 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
     }
 
     @Override public void persistReply(TurnSubmission submission, BridgeResult result) throws Exception {
+        JSONObject response = new JSONObject(result.responseJson == null ? "{}" : result.responseJson);
+        JSONObject remoteReply = response.optJSONObject("reply");
         RawMessageEntity entity = new RawMessageEntity();
-        entity.messageId = "msg_reply_" + sha256(submission.turnId).substring(0, 24);
-        entity.turnId = submission.turnId;
+        entity.messageId = remoteReply == null
+            ? "msg_reply_" + sha256(submission.turnId).substring(0, 24)
+            : remoteReply.optString("messageId", "msg_reply_" + sha256(submission.turnId).substring(0, 24));
+        entity.turnId = response.optString("turnId", submission.turnId);
         entity.characterId = submission.characterId;
         entity.speakerId = submission.characterId;
         entity.speakerType = "character";
         entity.recipientId = "user";
         entity.content = result.replyText;
-        entity.sentAt = System.currentTimeMillis();
+        entity.sentAt = remoteReply == null
+            ? System.currentTimeMillis()
+            : remoteReply.optLong("sentAt", System.currentTimeMillis());
         entity.origin = result.fallback ? "fallback" : result.origin;
         entity.deviceId = result.fallback ? deviceId + ":fallback" : "pc:" + deviceId;
         entity.deviceSeq = Math.max(1L, entity.sentAt);
         entity.checksum = sha256(canonical(entity));
-        entity.syncSeq = nextSyncSeq();
+        entity.syncSeq = result.fallback ? nextSyncSeq() : 0L;
         dao.insertRawMessage(entity);
+    }
+
+    public boolean persistCloudInboxReply(String raw) throws Exception {
+        JSONObject response = new JSONObject(raw == null ? "{}" : raw);
+        JSONObject reply = response.optJSONObject("reply");
+        String remoteTurnId = response.optString("turnId", "").trim();
+        if (reply == null || remoteTurnId.isEmpty()) return false;
+        String content = reply.optString("content", "").trim();
+        String messageId = reply.optString("messageId", "").trim();
+        long sentAt = reply.optLong("sentAt", 0L);
+        if (content.isEmpty() || messageId.isEmpty() || sentAt <= 0L) return false;
+
+        String localTurnId = remoteTurnId.startsWith("turn_cloud_")
+            ? remoteTurnId.substring("turn_".length())
+            : remoteTurnId;
+        ChatTurnEntity turn = dao.turn(localTurnId);
+        if (turn == null && !localTurnId.equals(remoteTurnId)) {
+            localTurnId = remoteTurnId;
+            turn = dao.turn(localTurnId);
+        }
+        if (turn == null) return false;
+
+        RawMessageEntity entity = new RawMessageEntity();
+        entity.messageId = messageId;
+        entity.turnId = remoteTurnId;
+        entity.characterId = reply.optString("characterId", turn.characterId);
+        entity.speakerId = entity.characterId;
+        entity.speakerType = "character";
+        entity.recipientId = "user";
+        entity.content = content;
+        entity.sentAt = sentAt;
+        entity.origin = reply.optString("origin", "codex");
+        entity.deviceId = "pc:" + deviceId;
+        entity.deviceSeq = Math.max(1L, sentAt);
+        entity.checksum = sha256(canonical(entity));
+        entity.syncSeq = 0L;
+        dao.insertRawMessage(entity);
+
+        ReplyPartEntity part = new ReplyPartEntity();
+        part.replyPartId = "reply_backfill_" + sha256(messageId).substring(0, 24);
+        part.turnId = localTurnId;
+        part.attemptId = turn.activeAttemptId == null || turn.activeAttemptId.isEmpty()
+            ? "attempt_backfill_" + sha256(localTurnId).substring(0, 24)
+            : turn.activeAttemptId;
+        part.sequence = 0;
+        part.type = "TEXT";
+        part.content = content;
+        part.payloadJson = "{}";
+        part.createdAt = sentAt;
+        return dao.importCloudBacklogReply(localTurnId, part, sentAt);
     }
 
     private long nextSyncSeq() {

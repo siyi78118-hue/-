@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import { TURN_STATES, canonicalJson, contentHash, validateEnvelope } from './protocol.mjs';
@@ -128,7 +129,8 @@ function mapCloudDelivery(row) {
     attempts: row.attempts,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
-    deliveredAt: row.delivered_at
+    deliveredAt: row.delivered_at,
+    confirmedAt: row.confirmed_at ?? null
   };
 }
 
@@ -314,6 +316,22 @@ export class YuqiStore {
     const turnColumns = new Set(this.db.prepare('PRAGMA table_info(turns)').all().map(row => row.name));
     if (!turnColumns.has('route')) this.db.exec("ALTER TABLE turns ADD COLUMN route TEXT NOT NULL DEFAULT 'deep';");
     if (!turnColumns.has('route_reasons_json')) this.db.exec("ALTER TABLE turns ADD COLUMN route_reasons_json TEXT NOT NULL DEFAULT '[]';");
+    const deliveryColumns = new Set(this.db.prepare('PRAGMA table_info(cloud_deliveries)').all().map(row => row.name));
+    if (!deliveryColumns.has('confirmed_at')) this.db.exec('ALTER TABLE cloud_deliveries ADD COLUMN confirmed_at INTEGER;');
+    this.db.exec(`
+      UPDATE cloud_deliveries
+      SET state = 'mailboxed'
+      WHERE state = 'delivered' AND confirmed_at IS NULL;
+
+      INSERT OR IGNORE INTO suppressed_messages(message_id, authoritative_message_id, reason, created_at)
+      SELECT m.message_id, m.message_id, 'pending_phone_receipt', CAST(strftime('%s','now') AS INTEGER) * 1000
+      FROM messages m
+      JOIN turns t ON t.turn_id = m.turn_id
+      JOIN cloud_deliveries d ON d.turn_id = t.turn_id
+      WHERE m.speaker_type = 'character'
+        AND json_extract(t.envelope_json, '$.kind') IN ('PROACTIVE_CHAT', 'PROACTIVE_MOMENT')
+        AND d.state != 'confirmed';
+    `);
   }
 
   transaction(run) {
@@ -519,15 +537,54 @@ export class YuqiStore {
   }
 
   markCloudDeliveryDelivered(turnId, peerId, checksum) {
+    return this.markCloudDeliveryMailboxed(turnId, peerId, checksum);
+  }
+
+  markCloudDeliveryMailboxed(turnId, peerId, checksum) {
     const timestamp = now();
     const result = this.db.prepare(`
-      UPDATE cloud_deliveries SET state = 'delivered', delivered_at = ?, updated_at = ?
+      UPDATE cloud_deliveries SET state = 'mailboxed', delivered_at = ?, updated_at = ?
       WHERE turn_id = ? AND peer_id = ? AND state = 'pending' AND checksum = ?
     `).run(timestamp, timestamp, turnId, peerId, checksum);
     if (Number(result.changes) !== 1) throw new Error('cloud delivery acknowledgement conflict');
     return mapCloudDelivery(this.db.prepare(`
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, peerId));
+  }
+
+  confirmCloudDelivery(turnId, peerId, receipt) {
+    const message = this.getMessage(String(receipt?.messageId || ''));
+    if (!message || message.turnId !== turnId || message.speakerType !== 'character') {
+      throw new Error('delivery receipt message mismatch');
+    }
+    const expectedHash = createHash('sha256').update(message.content, 'utf8').digest('hex');
+    if (String(receipt?.contentSha256 || '') !== expectedHash) {
+      throw new Error('delivery receipt content checksum mismatch');
+    }
+    const delivery = this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+    `).get(turnId, String(peerId));
+    if (!delivery) throw new Error('cloud delivery not found');
+    if (delivery.state === 'confirmed') return mapCloudDelivery(delivery);
+    if (!['mailboxed', 'delivered'].includes(delivery.state)) {
+      throw new Error('cloud delivery is not awaiting a phone receipt');
+    }
+    const confirmedAt = Math.max(1, Number(receipt?.receivedAt) || now());
+    return this.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'confirmed', confirmed_at = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND state IN ('mailboxed', 'delivered')
+      `).run(confirmedAt, now(), turnId, String(peerId));
+      if (Number(result.changes) !== 1) throw new Error('cloud delivery confirmation conflict');
+      this.db.prepare(`
+        DELETE FROM suppressed_messages
+        WHERE message_id = ? AND reason = 'pending_phone_receipt'
+      `).run(message.messageId);
+      return mapCloudDelivery(this.db.prepare(`
+        SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+      `).get(turnId, String(peerId)));
+    });
   }
 
   claimTurn(workerId) {
@@ -707,6 +764,15 @@ export class YuqiStore {
     return rows.map(mapFact);
   }
 
+  listRetrievableFacts(characterId, options = {}) {
+    const suppressed = new Set(this.db.prepare(
+      'SELECT message_id FROM suppressed_messages'
+    ).all().map(row => row.message_id));
+    return this.listFacts(characterId, options).filter(fact =>
+      !(fact.sourceMessageIds || []).some(messageId => suppressed.has(messageId))
+    );
+  }
+
   getSyncDelta(afterSeq = 0, limit = 500) {
     const safeLimit = Math.max(1, Math.min(5000, Number(limit) || 500));
     return this.db.prepare(`
@@ -761,6 +827,16 @@ export class YuqiStore {
 
   isMessageSuppressed(messageId) {
     return !!this.db.prepare('SELECT 1 AS found FROM suppressed_messages WHERE message_id = ?').get(messageId);
+  }
+
+  quarantinePendingReply(messageId) {
+    const message = this.getMessage(messageId);
+    if (!message || message.speakerType !== 'character') throw new Error('pending reply not found');
+    this.db.prepare(`
+      INSERT OR IGNORE INTO suppressed_messages(message_id, authoritative_message_id, reason, created_at)
+      VALUES (?, ?, 'pending_phone_receipt', ?)
+    `).run(message.messageId, message.messageId, now());
+    return message;
   }
 
   setSession(role, threadId) {

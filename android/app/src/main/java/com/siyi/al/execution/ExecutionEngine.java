@@ -132,6 +132,8 @@ public final class ExecutionEngine {
             .put("origin", result.origin)
             .put("fallback", result.fallback)
             .put("attemptedRoutes", new JSONArray(result.attemptedRoutes));
+        JSONObject bridgeResponse = new JSONObject(result.responseJson == null ? "{}" : result.responseJson);
+        if (bridgeResponse.has("_relayMessageId")) checkpoint.put("bridgeResponse", bridgeResponse);
         store.saveMemoryResult(turn.turnId, attempt.attemptId, checkpoint.toString(), clock.now());
         store.markStage(turn.turnId, attempt.attemptId, TurnState.CHAT_RUNNING, AttemptStage.CHAT, clock.now());
         store.saveRawReply(turn.turnId, attempt.attemptId, result.replyText, clock.now());

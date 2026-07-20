@@ -66,10 +66,17 @@ public final class AlExecutionService extends Service {
         recoveryScheduler = Executors.newSingleThreadScheduledExecutor();
         recoveryScheduler.scheduleWithFixedDelay(() -> {
             try {
+                int imported = ExecutionRuntime.drainCloudInbox(this);
+                if (imported > 0) {
+                    executionStore.recordDiagnostic(
+                        "cloud-inbox", null, "INFO", "CLOUD_INBOX_IMPORTED",
+                        "count=" + imported, System.currentTimeMillis()
+                    );
+                }
                 new RolePlanCoordinator(database).dispatchDue(System.currentTimeMillis());
                 new AutomaticTaskCoordinator(database).dispatchDue(System.currentTimeMillis());
                 kick();
-            } catch (RuntimeException error) {
+            } catch (Exception error) {
                 executionStore.recordDiagnostic("background-scan", null, "WARN", "BACKGROUND_SCAN_FAILED", error.getMessage(), System.currentTimeMillis());
             }
         }, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS, TimeUnit.SECONDS);
@@ -135,7 +142,9 @@ public final class AlExecutionService extends Service {
         SharedPreferences acknowledged = getSharedPreferences("al.execution.cloud-acks", MODE_PRIVATE);
         SharedPreferences continued = getSharedPreferences("al.execution.role-plan-continuations", MODE_PRIVATE);
         SharedPreferences proactiveContinued = getSharedPreferences("al.execution.proactive-continuations", MODE_PRIVATE);
+        SharedPreferences bridgeReceipts = getSharedPreferences("al.execution.bridge-receipts", MODE_PRIVATE);
         for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
+            confirmBridgeDelivery(turn, bridgeReceipts);
             acknowledgeCloudTurn(turn, acknowledged);
             continueAutomaticTask(turn, proactiveContinued);
             continueRolePlan(turn, continued);
@@ -153,6 +162,30 @@ public final class AlExecutionService extends Service {
             } catch (SecurityException ignored) {
                 // Android 13+ will deliver after the user grants notification permission.
             }
+        }
+    }
+
+    private void confirmBridgeDelivery(ChatTurnEntity turn, SharedPreferences confirmed) {
+        String key = "turn." + turn.turnId;
+        if (confirmed.getBoolean(key, false)) return;
+        try {
+            com.siyi.al.execution.db.ExecutionAttemptEntity attempt = executionStore.activeAttempt(turn.turnId);
+            if (attempt == null || attempt.memoryResult == null || attempt.memoryResult.trim().isEmpty()) return;
+            JSONObject checkpoint = new JSONObject(attempt.memoryResult);
+            JSONObject response = checkpoint.optJSONObject("bridgeResponse");
+            if (response == null || response.optString("_relayMessageId", "").trim().isEmpty()) return;
+            if (ExecutionRuntime.confirmCloudResult(this, response.toString())) {
+                confirmed.edit().putBoolean(key, true).apply();
+                executionStore.recordDiagnostic(
+                    turn.turnId, turn.activeAttemptId, "INFO", "PHONE_RECEIPT_SENT",
+                    response.optString("_relayMessageId", ""), System.currentTimeMillis()
+                );
+            }
+        } catch (Exception error) {
+            executionStore.recordDiagnostic(
+                turn.turnId, turn.activeAttemptId, "WARN", "PHONE_RECEIPT_PENDING",
+                error.getMessage(), System.currentTimeMillis()
+            );
         }
     }
 

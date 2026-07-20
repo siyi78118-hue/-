@@ -26,21 +26,43 @@ final class ExecutionRuntime {
         gateway.setBridgeRouterProvider(() -> {
             BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
             FallbackJournal fallbackJournal = new FallbackJournal(database.executionDao(), bridgeConfig.deviceId);
+            RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), bridgeConfig.deviceId);
             BridgeClient bridgeClient = new BridgeClient(
                 bridgeConfig,
                 fallbackJournal,
                 (turnId, raw) -> store.recordDiagnostic(
                     turnId, null, "INFO", "BRIDGE_STATUS", raw, System.currentTimeMillis()
-                )
+                ),
+                mirror::persistCloudInboxReply
             );
             return new BridgeRouter(
                 bridgeConfig,
                 bridgeClient.lanRoute(),
                 bridgeClient.cloudRoute(),
                 gateway::executeFallback,
-                new RoomBridgeMirror(database.executionDao(), bridgeConfig.deviceId)
+                mirror
             );
         });
         return new ExecutionEngine(store, gateway, new ReplyParser(), System::currentTimeMillis);
+    }
+
+    static int drainCloudInbox(Context context) throws Exception {
+        AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        AlSecretStore secrets = new AlSecretStore(context);
+        BridgeConfig config = secrets.loadBridgeConfig();
+        if (!config.hasCloud()) return 0;
+        FallbackJournal journal = new FallbackJournal(database.executionDao(), config.deviceId);
+        RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), config.deviceId);
+        BridgeClient client = new BridgeClient(config, journal, null, mirror::persistCloudInboxReply);
+        return client.drainCloudInbox();
+    }
+
+    static boolean confirmCloudResult(Context context, String responseJson) throws Exception {
+        AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        AlSecretStore secrets = new AlSecretStore(context);
+        BridgeConfig config = secrets.loadBridgeConfig();
+        if (!config.hasCloud()) return false;
+        FallbackJournal journal = new FallbackJournal(database.executionDao(), config.deviceId);
+        return new BridgeClient(config, journal).confirmCloudResult(responseJson);
     }
 }

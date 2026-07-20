@@ -24,7 +24,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         SyncCursorEntity.class,
         YuqiAnnotationEntity.class
     },
-    version = 7,
+    version = 8,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
@@ -81,6 +81,14 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             database.execSQL("CREATE INDEX IF NOT EXISTS `index_yuqi_annotations_turnId` ON `yuqi_annotations` (`turnId`)");
         }
     };
+    private static final Migration MIGRATION_7_8 = new Migration(7, 8) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL(
+                "UPDATE yuqi_raw_messages SET syncSeq = 0 "
+                    + "WHERE speakerType = 'character' AND deviceId LIKE 'pc:%' AND origin != 'fallback'"
+            );
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -92,7 +100,10 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         context.getApplicationContext(),
                         AlExecutionDatabase.class,
                         "al-execution.db"
-                    ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7).build();
+                    ).addMigrations(
+                        MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
+                        MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8
+                    ).build();
                 }
             }
         }

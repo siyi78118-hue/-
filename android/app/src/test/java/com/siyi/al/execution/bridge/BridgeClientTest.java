@@ -68,6 +68,24 @@ public class BridgeClientTest {
         assertFalse(BridgeClient.matchesTurn(submission, "turn_cloud_some_other_job"));
     }
 
+    @Test public void oldCommittedCloudResultIsCollectedEvenWhenAnotherTurnIsActive() throws Exception {
+        TurnSubmission current = new TurnSubmission(
+            "cloud_proactive_job_new", "yuqi", "trigger_proactive_new", TurnKind.PROACTIVE_CHAT,
+            "{}", "{}", "job_new", 1784400000000L
+        );
+        JSONObject old = new JSONObject()
+            .put("turnId", "turn_cloud_proactive_job_old")
+            .put("state", "committed")
+            .put("terminal", true)
+            .put("reply", new JSONObject().put("messageId", "msg_yuqi_old").put("content", "旧消息"));
+
+        assertEquals("BACKLOG_COMMITTED", BridgeClient.classifyCloudResult(current, old));
+        assertEquals("CURRENT_COMMITTED", BridgeClient.classifyCloudResult(
+            current,
+            new JSONObject(old.toString()).put("turnId", "turn_cloud_proactive_job_new")
+        ));
+    }
+
     @Test public void lanAcceptedTurnPollsWithFreshSignedGetsUntilCommitted() throws Exception {
         FakeTransport transport = new FakeTransport();
         transport.responses.add(new BridgeClient.HttpResult(202,

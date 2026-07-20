@@ -227,3 +227,35 @@ test('v2 cloud ingress acknowledges after durable dispatch without waiting for t
     'outbox'
   ]);
 });
+
+test('a phone delivery receipt confirms memory without dispatching a chat turn', async () => {
+  const receipt = {
+    type: 'DELIVERY_RECEIPT',
+    turnId: 'turn_phone_cloud_v2_1',
+    messageId: 'msg_yuqi_phone_cloud_v2_1',
+    contentSha256: 'a'.repeat(64),
+    receivedAt: 1784400009000
+  };
+  const relay = relayFixture(receipt);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: { accept() { events.push('dispatch'); throw new Error('receipt must not dispatch'); } },
+    store: {
+      registerCloudDelivery() {},
+      confirmCloudDelivery(turnId, peerId, value) {
+        events.push(`confirm:${turnId}:${peerId}:${value.messageId}`);
+        return { state: 'confirmed' };
+      }
+    }
+  });
+
+  const result = await pump.pumpOnce();
+
+  assert.equal(result.processed, 1);
+  assert.deepEqual(events, [
+    'confirm:turn_phone_cloud_v2_1:phone_cloud:msg_yuqi_phone_cloud_v2_1'
+  ]);
+  assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+});

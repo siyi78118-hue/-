@@ -190,6 +190,12 @@ public interface AlExecutionDao {
     @Query("UPDATE execution_attempts SET state = :state, errorCode = :code, errorDetail = :detail, retryable = :retryable, heartbeatAt = :now, finishedAt = :now WHERE attemptId = :attemptId")
     int markAttemptFailed(String attemptId, String state, String code, String detail, boolean retryable, long now);
 
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :completedAt, completedAt = :completedAt, uiAppliedAt = NULL, cancelledAt = NULL, deletedAt = NULL WHERE turnId = :turnId")
+    int completeImportedCloudTurn(String turnId, long completedAt);
+
+    @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :completedAt, finishedAt = :completedAt, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId")
+    int completeImportedCloudAttempt(String attemptId, long completedAt);
+
     @Query("UPDATE chat_turns SET state = 'CANCELLED', activeAttemptId = NULL, updatedAt = :now, cancelledAt = :now, deletedAt = CASE WHEN :deleted = 1 THEN :now ELSE deletedAt END WHERE turnId = :turnId AND state != 'COMPLETED'")
     int cancelTurn(String turnId, long now, boolean deleted);
 
@@ -291,5 +297,34 @@ public interface AlExecutionDao {
         change.payloadJson = "{\"turnId\":\"" + turnId + "\"}";
         change.createdAt = now;
         insertChange(change);
+    }
+
+    @Transaction
+    default boolean importCloudBacklogReply(String turnId, ReplyPartEntity part, long completedAt) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null) return false;
+        List<ReplyPartEntity> existing = replyParts(turnId);
+        if (!existing.isEmpty()) {
+            for (ReplyPartEntity value : existing) {
+                if (value.replyPartId.equals(part.replyPartId) && value.content.equals(part.content)) return true;
+            }
+            return false;
+        }
+        String state = turn.state == null ? "" : turn.state;
+        if (!("FAILED_RETRYABLE".equals(state) || "FAILED_FINAL".equals(state)
+            || "INTERRUPTED".equals(state) || "CANCELLED".equals(state)
+            || "COMPLETED".equals(state))) return false;
+        insertReplyParts(java.util.Collections.singletonList(part));
+        if (completeImportedCloudTurn(turnId, completedAt) != 1) return false;
+        if (turn.activeAttemptId != null && !turn.activeAttemptId.isEmpty()) {
+            completeImportedCloudAttempt(turn.activeAttemptId, completedAt);
+        }
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "REPLY_COMMITTED";
+        change.payloadJson = "{\"turnId\":\"" + turnId + "\",\"origin\":\"cloud_backfill\"}";
+        change.createdAt = completedAt;
+        insertChange(change);
+        return true;
     }
 }

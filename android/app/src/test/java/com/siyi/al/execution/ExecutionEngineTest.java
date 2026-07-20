@@ -46,6 +46,8 @@ public class ExecutionEngineTest {
         assertEquals(0, gateway.legacyCalls);
         assertEquals("memory,chat,commit", String.join(",", store.events));
         assertEquals("虞栖从电脑回复", store.replyParts.get(0).content);
+        JSONObject checkpoint = new JSONObject(store.attempt.memoryResult);
+        assertEquals("relay_pc_1", checkpoint.getJSONObject("bridgeResponse").getString("_relayMessageId"));
     }
 
     @Test
@@ -212,7 +214,12 @@ public class ExecutionEngineTest {
         @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
             bridgeCalls += 1;
             submissionCreatedAt = submission.createdAt;
-            return BridgeResult.success("lan", "虞栖从电脑回复");
+            return BridgeResult.success(
+                "cloud",
+                "虞栖从电脑回复",
+                "{\"turnId\":\"turn-1\",\"_relayMessageId\":\"relay_pc_1\","
+                    + "\"reply\":{\"messageId\":\"msg_yuqi_1\",\"content\":\"虞栖从电脑回复\"}}"
+            );
         }
 
         @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {

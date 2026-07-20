@@ -64,7 +64,7 @@ export class ResultOutbox {
             body: JSON.stringify(output)
           });
           if (!response.ok) throw new Error(`cloud relay enqueue HTTP ${response.status}`);
-          this.store.markCloudDeliveryDelivered(target.turnId, target.peerId, delivery.checksum);
+          this.store.markCloudDeliveryMailboxed(target.turnId, target.peerId, delivery.checksum);
           summary.delivered += 1;
         } catch {
           summary.failed += 1;

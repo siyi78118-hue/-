@@ -92,7 +92,8 @@ test('persists a terminal cloud reply until relay delivery succeeds without leak
     assert.equal(decoded.recoveryAckSeq, 77);
     assert.equal('presetVersion' in decoded, false);
     assert.equal('usedFactIds' in decoded, false);
-    assert.equal(store.listCloudDeliveries(turn.turnId)[0].state, 'delivered');
+    assert.equal(store.listCloudDeliveries(turn.turnId)[0].state, 'mailboxed');
+    assert.equal(store.listCloudDeliveries(turn.turnId)[0].confirmedAt, null);
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });

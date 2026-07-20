@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -266,6 +267,58 @@ test('persists one cloud delivery target per turn and peer across reopening', ()
   } finally {
     reopened.close();
   }
+}));
+
+test('a proactive reply stays outside shared memory until the phone confirms persistence', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validTriggerEnvelope());
+  const reply = store.putMessage({
+    messageId: 'msg_yuqi_pending_phone_1',
+    turnId: turn.turnId,
+    characterId: 'yuqi',
+    speakerId: 'yuqi',
+    speakerType: 'character',
+    recipientId: 'user',
+    content: '这是只在手机确认后才算说过的话',
+    sentAt: 1784400002000,
+    origin: 'codex'
+  });
+
+  store.quarantinePendingReply(reply.messageId);
+  store.registerCloudDelivery(turn.turnId, 'phone_peer', 0);
+  const prepared = store.prepareCloudDelivery(turn.turnId, 'phone_peer', { turnId: turn.turnId });
+  store.markCloudDeliveryAttempt(turn.turnId, 'phone_peer');
+  store.markCloudDeliveryMailboxed(turn.turnId, 'phone_peer', prepared.checksum);
+
+  assert.equal(store.listMessages('yuqi', 20).some(message => message.messageId === reply.messageId), false);
+
+  const confirmed = store.confirmCloudDelivery(turn.turnId, 'phone_peer', {
+    messageId: reply.messageId,
+    contentSha256: createHash('sha256').update(reply.content, 'utf8').digest('hex'),
+    receivedAt: 1784400003000
+  });
+
+  assert.equal(confirmed.state, 'confirmed');
+  assert.equal(store.listMessages('yuqi', 20).some(message => message.messageId === reply.messageId), true);
+}));
+
+test('facts supported by an unconfirmed reply stay outside retrieval', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validTriggerEnvelope());
+  const reply = store.putMessage({
+    messageId: 'msg_yuqi_pending_fact_1', turnId: turn.turnId, characterId: 'yuqi',
+    speakerId: 'yuqi', speakerType: 'character', recipientId: 'user',
+    content: '我说我已经买了饭团', sentAt: 1784400002000, origin: 'codex'
+  });
+  store.putFact({
+    factId: 'fact_pending_delivery_1', characterId: 'yuqi', subjectId: 'yuqi',
+    predicate: 'bought', object: { item: '饭团' }, evidenceMode: 'exact',
+    sourceMessageIds: [reply.messageId], exactQuotes: [{ messageId: reply.messageId, text: reply.content }],
+    status: 'verified', confidence: 0.99, origin: 'memory'
+  });
+
+  store.quarantinePendingReply(reply.messageId);
+
+  assert.deepEqual(store.listRetrievableFacts('yuqi'), []);
+  assert.equal(store.listFacts('yuqi').length, 1);
 }));
 
 test('sync deltas are ordered, checksummed, and acknowledged independently', () => withStore(({ store }) => {
