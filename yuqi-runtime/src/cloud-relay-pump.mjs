@@ -47,6 +47,7 @@ export class CloudRelayPump {
     store = null,
     outbox = null,
     reconciler = null,
+    proxyEnabled = false,
     fetchImpl = globalThis.fetch,
     clock = Date.now
   }) {
@@ -67,10 +68,46 @@ export class CloudRelayPump {
     this.store = store;
     this.outbox = outbox;
     this.reconciler = reconciler;
+    this.proxyEnabled = proxyEnabled === true;
     this.fetch = fetchImpl;
     this.clock = clock;
     this.timer = null;
     this.running = false;
+    this.lastDiagnosticAt = 0;
+    this.relayStatus = {
+      enabled: true,
+      proxyEnabled: this.proxyEnabled,
+      connected: false,
+      lastSuccessAt: 0,
+      lastErrorAt: 0,
+      lastError: '',
+      pendingProcessed: 0
+    };
+  }
+
+  status() {
+    return { ...this.relayStatus };
+  }
+
+  recordPollFailure(error) {
+    const now = this.clock();
+    const raw = String(error?.message || error || 'cloud relay poll failed');
+    const safeMessage = raw.replaceAll(this.deviceToken, '[redacted]').slice(0, 160);
+    this.relayStatus = {
+      ...this.relayStatus,
+      connected: false,
+      lastErrorAt: now,
+      lastError: safeMessage,
+      pendingProcessed: 0
+    };
+    if (this.store?.putDiagnostic && (this.lastDiagnosticAt === 0 || now - this.lastDiagnosticAt >= 60_000)) {
+      this.store.putDiagnostic({
+        stage: 'cloud_relay_poll',
+        level: 'error',
+        detail: { message: safeMessage, proxyEnabled: this.proxyEnabled }
+      });
+      this.lastDiagnosticAt = now;
+    }
   }
 
   headers(withJson = false) {
@@ -82,9 +119,9 @@ export class CloudRelayPump {
   }
 
   async pumpOnce() {
-    if (this.running) return { processed: 0, failed: 0, skipped: true };
+    if (this.running) return { processed: 0, failed: 0, suppressed: 0, skipped: true };
     this.running = true;
-    const summary = { processed: 0, failed: 0, skipped: false };
+    const summary = { processed: 0, failed: 0, suppressed: 0, skipped: false };
     try {
       const url = `${this.relayUrl}/bridge/poll?deviceId=${encodeURIComponent(this.deviceId)}&direction=phone_to_pc&limit=50`;
       const response = await this.fetch(url, { headers: this.headers() });
@@ -98,6 +135,24 @@ export class CloudRelayPump {
           if (this.reconciler && envelope.recovery && Array.isArray(envelope.recovery.entries)) {
             const recovery = await this.reconciler.reconcileFrom(envelope.recovery);
             recoveryAckSeq = recovery.ackSeq;
+          }
+          const ageMs = this.clock() - Number(envelope.createdAt || 0);
+          const staleProactive = envelope.kind === 'PROACTIVE_CHAT' && ageMs > 30 * 60 * 1000;
+          if (staleProactive) {
+            this.store?.putDiagnostic?.({
+              turnId: envelope.turnId,
+              stage: 'stale_proactive_suppressed',
+              level: 'info',
+              detail: { ageMs }
+            });
+            const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {
+              method: 'POST', headers: this.headers(true),
+              body: JSON.stringify({ deviceId: this.deviceId, messageIds: [message.messageId] })
+            });
+            if (!acked.ok) throw new Error(`cloud relay ack HTTP ${acked.status}`);
+            summary.processed += 1;
+            summary.suppressed += 1;
+            continue;
           }
           if (Number(envelope.protocolVersion) >= 2) {
             if (!this.dispatcher || !this.store) throw new Error('durable dispatcher is unavailable');
@@ -139,7 +194,17 @@ export class CloudRelayPump {
         }
       }
       if (this.outbox && typeof this.outbox.flushOnce === 'function') await this.outbox.flushOnce();
+      this.relayStatus = {
+        ...this.relayStatus,
+        connected: true,
+        lastSuccessAt: this.clock(),
+        lastError: '',
+        pendingProcessed: summary.processed
+      };
       return summary;
+    } catch (error) {
+      this.recordPollFailure(error);
+      throw error;
     } finally {
       this.running = false;
     }
