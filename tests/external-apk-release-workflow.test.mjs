@@ -23,11 +23,11 @@ test('外部 APK 发布工作流存在且只能手动触发', () => {
   assert.doesNotMatch(workflow, /^\s+schedule:/m);
 });
 
-test('工作流锁定未签名 1.0.80 的身份、原始哈希和正式证书', () => {
+test('工作流锁定未签名 1.0.84 的身份、原始哈希和正式证书', () => {
   assert.match(workflow, /EXPECTED_PACKAGE:\s*com\.siyi\.al/);
-  assert.match(workflow, /EXPECTED_VERSION_CODE:\s*["']?80["']?/);
-  assert.match(workflow, /EXPECTED_VERSION_NAME:\s*["']?1\.0\.80["']?/);
-  assert.match(workflow, /9AC694FB4858B999927218CE23D2ADB4C16D516A321634DC535E323F337A7139/i);
+  assert.match(workflow, /EXPECTED_VERSION_CODE:\s*["']?84["']?/);
+  assert.match(workflow, /EXPECTED_VERSION_NAME:\s*["']?1\.0\.84["']?/);
+  assert.match(workflow, /ABBC5057785795799A377C2DF292B31DD5A6CCF728B408EA8496B349AC6841A8/i);
   assert.match(workflow, /5761277E3BDF4A64236C3BAD569DE6A07666581F643167D01E37F13E9E832B2B/i);
   assert.doesNotMatch(workflow, /EXPECTED_SOURCE_SIGNER_SHA256/);
 });
@@ -93,8 +93,8 @@ test('工作流包含版本防回退门禁和发布串行锁', () => {
 test('GitHub Release 附件故障时可从临时 Git 引用读取原包', () => {
   assert.match(workflow, /source_ref:/);
   assert.match(workflow, /SOURCE_REF:\s*\$\{\{\s*inputs\.source_ref\s*\}\}/);
-  assert.match(workflow, /codex\/android-v80-source/);
-  assert.match(workflow, /android-v80-source-20260721/);
+  assert.match(workflow, /codex\/android-v84-source/);
+  assert.match(workflow, /android-v84-source-20260722/);
   assert.match(workflow, /actions\/checkout@v4/);
   assert.match(workflow, /ref:\s*\$\{\{\s*inputs\.source_ref\s*\}\}/);
   assert.match(workflow, /source-repo\/source\.apk/);
@@ -102,8 +102,8 @@ test('GitHub Release 附件故障时可从临时 Git 引用读取原包', () => 
 
 test('Release 上传失败时把正式签名 APK 发布到更新分支', () => {
   assert.match(workflow, /release_asset_published/);
-  assert.match(workflow, /update-channel-repo\/app-release-v80\.apk/);
-  assert.match(workflow, /app-release-v80\.apk/);
+  assert.match(workflow, /update-channel-repo\/app-release-v84\.apk/);
+  assert.match(workflow, /app-release-v84\.apk/);
   assert.match(workflow, /raw\.githubusercontent\.com/);
   assertOrdered(
     'name: Validate resigned APK',
