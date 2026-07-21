@@ -64,9 +64,10 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
     'speakerAmbiguity', 'commitmentRisk'
   ]),
   brain: objectSchema({
-    reply: { type: 'string', minLength: 1 },
+    action: { type: 'string', enum: ['send', 'skip'] },
+    reply: { type: 'string' },
     usedFactIds: stringArray()
-  }, ['reply', 'usedFactIds']),
+  }, ['action', 'reply', 'usedFactIds']),
   supervisor: objectSchema({
     approved: { type: 'boolean' },
     issues: {

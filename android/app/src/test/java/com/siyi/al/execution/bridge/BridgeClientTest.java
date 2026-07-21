@@ -148,6 +148,18 @@ public class BridgeClientTest {
         assertEquals(800L, status.totalElapsedMs);
     }
 
+    @Test public void terminalSkipIsACommittedBridgeResultWithoutReplyText() throws Exception {
+        BridgeTurnStatus status = BridgeTurnStatus.parse(
+            "{\"turnId\":\"turn_phone_1\",\"state\":\"committed\",\"terminal\":true,\"action\":\"skip\",\"reply\":null}",
+            "turn_phone_1"
+        );
+        assertTrue(status.skipped());
+        assertFalse(status.failedFinal());
+        BridgeResult result = status.toResult("cloud");
+        assertTrue(result.skipped);
+        assertEquals("", result.replyText);
+    }
+
     private static TurnSubmission directSubmission(long createdAt) {
         return new TurnSubmission(
             "turn_phone_1", "yuqi", "msg_phone_1", TurnKind.DIRECT_REPLY,

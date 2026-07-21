@@ -25,6 +25,7 @@ export function hardValidateReply(reply) {
 export function normalizeBrainDraft(draft) {
   const normalized = {
     ...(draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}),
+    action: draft?.action === 'skip' ? 'skip' : 'send',
     reply: String(draft?.reply || '').trim(),
     usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : []
   };
@@ -33,11 +34,41 @@ export function normalizeBrainDraft(draft) {
     try { nested = JSON.parse(normalized.reply); } catch { break; }
     if (!nested || typeof nested !== 'object' || Array.isArray(nested) || typeof nested.reply !== 'string') break;
     normalized.reply = nested.reply.trim();
+    if (nested.action === 'skip') normalized.action = 'skip';
     if (!normalized.usedFactIds.length && Array.isArray(nested.usedFactIds)) {
       normalized.usedFactIds = nested.usedFactIds.map(String);
     }
   }
   return normalized;
+}
+
+function isAutomaticKind(kind) {
+  return ['ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_PRIVATE', 'PROACTIVE_CHAT', 'PROACTIVE_MOMENT'].includes(kind);
+}
+
+export function buildInteractionState(envelope, recentMessages) {
+  const messages = [...recentMessages].sort((left, right) => Number(left.sentAt || 0) - Number(right.sentAt || 0));
+  const computedAt = Number(envelope.trigger?.executedAt || envelope.createdAt || Date.now());
+  const lastMessage = messages.at(-1) || null;
+  const lastUserMessage = [...messages].reverse().find(message => message.speakerId === 'user') || null;
+  const lastYuqiMessage = [...messages].reverse().find(message => message.speakerId === envelope.characterId) || null;
+  const unansweredOutgoingCount = lastUserMessage
+    ? messages.filter(message => message.speakerId === envelope.characterId && Number(message.sentAt || 0) > Number(lastUserMessage.sentAt || 0)).length
+    : messages.filter(message => message.speakerId === envelope.characterId).length;
+  const elapsed = message => message ? Math.max(0, computedAt - Number(message.sentAt || computedAt)) : null;
+  return {
+    computedAt,
+    lastMessageId: lastMessage?.messageId || null,
+    lastSpeakerId: lastMessage?.speakerId || null,
+    lastUserMessageId: lastUserMessage?.messageId || null,
+    lastYuqiMessageId: lastYuqiMessage?.messageId || null,
+    silenceMsSinceLastMessage: elapsed(lastMessage),
+    silenceMsSinceLastUserMessage: elapsed(lastUserMessage),
+    silenceMsSinceLastYuqiMessage: elapsed(lastYuqiMessage),
+    unansweredOutgoingCount,
+    waitingForUserReply: unansweredOutgoingCount > 0,
+    triggerSnapshotIsAdvisory: Boolean(envelope.trigger?.context?.snapshot)
+  };
 }
 
 function repairReplyForDelivery(reply, kind = 'DIRECT_REPLY') {
@@ -111,9 +142,23 @@ export class YuqiOrchestrator {
           continue;
         }
         if (current.state === 'brain_done') {
-          const draft = parseRoleJson(current.brainDraftJson, 'brain');
+          let draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
+          if (draft.action === 'skip' && !isAutomaticKind(envelope.kind)) {
+            draft = { ...draft, action: 'send', reply: repairReplyForDelivery('', envelope.kind) };
+          }
+          if (draft.action === 'skip') {
+            this.store.advanceTurn(
+              turnId, 'brain_done', current.route === 'fast' ? 'approved' : 'supervisor_running',
+              { brainDraftJson: JSON.stringify(draft) }
+            );
+            continue;
+          }
           const hard = hardValidateReply(draft.reply);
-          const repairedDraft = hard.ok ? draft : { ...draft, reply: repairReplyForDelivery(draft.reply, envelope.kind) };
+          const repairedDraft = hard.ok
+            ? draft
+            : isAutomaticKind(envelope.kind) && !String(draft.reply || '').trim()
+              ? { ...draft, action: 'skip', reply: '' }
+              : { ...draft, action: 'send', reply: repairReplyForDelivery(draft.reply, envelope.kind) };
           if (!hard.ok) {
             this.store.putDiagnostic({
               turnId,
@@ -210,6 +255,7 @@ export class YuqiOrchestrator {
 
   async completeBrain(envelope, current) {
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const interactionState = buildInteractionState(envelope, recentMessages);
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
@@ -227,6 +273,7 @@ export class YuqiOrchestrator {
       }),
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
       recentMessages,
+      interactionState,
       evidencePack,
       ...(previousSupervisor?.approved === false ? {
         rejectedDraft: previousDraft,
@@ -243,6 +290,8 @@ export class YuqiOrchestrator {
 
   async completeSupervisor(envelope, current) {
     const draft = parseRoleJson(current.brainDraftJson, 'brain');
+    const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const interactionState = buildInteractionState(envelope, recentMessages);
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
@@ -256,6 +305,8 @@ export class YuqiOrchestrator {
       task: 'review_yuqi_reply',
       preset: this.presets.compileFor('supervisor', { stage: 'initial' }),
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
+      recentMessages,
+      interactionState,
       evidencePack,
       draft
     };
@@ -276,12 +327,16 @@ export class YuqiOrchestrator {
         turnId: envelope.turnId,
         stage: 'supervisor_running',
         level: 'warning',
-        detail: { action: 'rewritten_reply_sent_after_review', issues: supervisorResult.issues || [] }
+        detail: { action: 'supervisor_veto_after_rewrites', issues: supervisorResult.issues || [] }
       });
-      this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
-        supervisorJson: JSON.stringify({ ...supervisorResult, acceptedAfterRewrite: true })
-      });
-      return;
+      if (isAutomaticKind(envelope.kind)) {
+        this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
+          supervisorJson: JSON.stringify({ ...supervisorResult, vetoed: true }),
+          brainDraftJson: JSON.stringify({ ...draft, action: 'skip', reply: '' })
+        });
+        return;
+      }
+      throw new Error('supervisor rejected the reply after three rewrites');
     }
     this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'brain_running', {
       supervisorJson: JSON.stringify(supervisorResult)
@@ -289,7 +344,18 @@ export class YuqiOrchestrator {
   }
 
   commitApproved(envelope, current) {
-    const draft = parseRoleJson(current.brainDraftJson, 'brain');
+    const draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
+    if (draft.action === 'skip' && isAutomaticKind(envelope.kind)) {
+      const result = {
+        turnId: envelope.turnId,
+        presetVersion: this.presets.current().version,
+        action: 'skip',
+        reply: null,
+        usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
+      };
+      this.store.advanceTurn(envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) });
+      return result;
+    }
     const reply = {
       messageId: `msg_yuqi_${contentHash(envelope.turnId).slice(0, 24)}`,
       turnId: envelope.turnId,
@@ -308,6 +374,7 @@ export class YuqiOrchestrator {
     const result = {
       turnId: envelope.turnId,
       presetVersion: this.presets.current().version,
+      action: 'send',
       reply: savedReply,
       usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
     };

@@ -81,6 +81,9 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         }
 
         if (reply == null) {
+            if (response.optBoolean("terminal", false) && "skip".equals(response.optString("action", ""))) {
+                return turn != null && dao.importCloudBacklogSkip(localTurnId, System.currentTimeMillis());
+            }
             String remoteState = response.optString("state", "").trim();
             if (turn == null || !response.optBoolean("terminal", false) || !"failed".equals(remoteState)) {
                 return false;

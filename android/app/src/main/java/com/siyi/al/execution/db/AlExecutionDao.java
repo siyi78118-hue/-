@@ -181,6 +181,9 @@ public interface AlExecutionDao {
     @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now, uiAppliedAt = NULL WHERE turnId = :turnId AND activeAttemptId = :attemptId AND state = 'CHAT_DONE'")
     int completeTurn(String turnId, String attemptId, long now);
 
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now, uiAppliedAt = NULL WHERE turnId = :turnId AND activeAttemptId = :attemptId AND state = 'CHAT_RUNNING'")
+    int completeSkippedTurn(String turnId, String attemptId, long now);
+
     @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId")
     int completeAttempt(String attemptId, long now);
 
@@ -306,6 +309,24 @@ public interface AlExecutionDao {
     }
 
     @Transaction
+    default void commitSkip(String turnId, String attemptId, long now) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null || attemptId == null || !attemptId.equals(turn.activeAttemptId) || !"CHAT_RUNNING".equals(turn.state)) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+        if (replyPartCount(turnId) != 0 || completeSkippedTurn(turnId, attemptId, now) != 1) {
+            throw new StaleAttemptException(turnId, attemptId);
+        }
+        completeAttempt(attemptId, now);
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "TURN_SKIPPED";
+        change.payloadJson = "{\"turnId\":\"" + turnId + "\",\"action\":\"skip\"}";
+        change.createdAt = now;
+        insertChange(change);
+    }
+
+    @Transaction
     default boolean importCloudBacklogReply(String turnId, ReplyPartEntity part, long completedAt) {
         ChatTurnEntity turn = turn(turnId);
         if (turn == null) return false;
@@ -364,6 +385,23 @@ public interface AlExecutionDao {
         change.turnId = turnId;
         change.type = "TURN_FAILED";
         change.payloadJson = "{\"turnId\":\"" + turnId + "\"}";
+        change.createdAt = now;
+        insertChange(change);
+        return true;
+    }
+
+    @Transaction
+    default boolean importCloudBacklogSkip(String turnId, long now) {
+        ChatTurnEntity turn = turn(turnId);
+        if (turn == null || replyPartCount(turnId) != 0) return false;
+        if (!"COMPLETED".equals(turn.state) && completeImportedCloudTurn(turnId, now) != 1) return false;
+        if (turn.activeAttemptId != null && !turn.activeAttemptId.isEmpty()) {
+            completeImportedCloudAttempt(turn.activeAttemptId, now);
+        }
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "TURN_SKIPPED";
+        change.payloadJson = "{\"turnId\":\"" + turnId + "\",\"action\":\"skip\",\"origin\":\"cloud_backfill\"}";
         change.createdAt = now;
         insertChange(change);
         return true;

@@ -27,6 +27,7 @@ export function publicTurnStatus(turn, { stages = [], clock = Date.now } = {}) {
     state: turn.state,
     terminal: committed || failed,
     allowFallback: failed,
+    action: committed ? String(result?.action || (result?.reply ? 'send' : 'skip')) : '',
     reply: committed ? result?.reply || null : null,
     errorCode: failed ? String(error?.code || error?.name || 'YUQI_ROLE_FAILED') : '',
     origin: committed ? String(result?.reply?.origin || turn.origin || 'codex') : String(turn.origin || 'codex'),

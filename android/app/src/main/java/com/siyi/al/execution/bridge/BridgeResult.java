@@ -10,24 +10,30 @@ public final class BridgeResult {
     public final String responseJson;
     public final List<String> attemptedRoutes;
     public final boolean fallback;
+    public final boolean skipped;
 
-    private BridgeResult(String origin, String replyText, String responseJson, List<String> attemptedRoutes, boolean fallback) {
+    private BridgeResult(String origin, String replyText, String responseJson, List<String> attemptedRoutes, boolean fallback, boolean skipped) {
         this.origin = origin == null ? "" : origin;
         this.replyText = replyText == null ? "" : replyText;
         this.responseJson = responseJson == null ? "{}" : responseJson;
         this.attemptedRoutes = Collections.unmodifiableList(new ArrayList<>(attemptedRoutes));
         this.fallback = fallback;
+        this.skipped = skipped;
     }
 
     public static BridgeResult success(String origin, String replyText) {
-        return new BridgeResult(origin, replyText, "{}", Collections.singletonList(origin), "fallback".equals(origin));
+        return new BridgeResult(origin, replyText, "{}", Collections.singletonList(origin), "fallback".equals(origin), false);
     }
 
     public static BridgeResult success(String origin, String replyText, String responseJson) {
-        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin));
+        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false);
+    }
+
+    public static BridgeResult skipped(String origin, String responseJson) {
+        return new BridgeResult(origin, "", responseJson, Collections.singletonList(origin), false, true);
     }
 
     BridgeResult routed(List<String> routes, boolean usedFallback) {
-        return new BridgeResult(origin, replyText, responseJson, routes, usedFallback);
+        return new BridgeResult(origin, replyText, responseJson, routes, usedFallback, skipped);
     }
 }

@@ -14,6 +14,7 @@ public interface ExecutionEngineStore {
     void saveMemoryResult(String turnId, String attemptId, String memory, long now);
     void saveRawReply(String turnId, String attemptId, String rawReply, long now);
     void commitReply(String turnId, String attemptId, List<ReplyPartEntity> parts, long now);
+    void commitSkip(String turnId, String attemptId, long now);
     void markInterrupted(String turnId, String attemptId, String code, long now);
     void markFailed(String turnId, String attemptId, String code, String detail, boolean retryable, long now);
 }

@@ -198,6 +198,23 @@ public class RoomBridgeMirrorTest {
         ), failures);
     }
 
+    @Test public void cloudAutomaticSkipCompletesTheOriginalTurnWithoutAReplyBubble() throws Exception {
+        List<String> skips = new ArrayList<>();
+        ChatTurnEntity turn = new ChatTurnEntity();
+        turn.turnId = "cloud_proactive_skip_1";
+        turn.characterId = "yuqi";
+        turn.state = "CHAT_RUNNING";
+        turn.activeAttemptId = "attempt_skip_1";
+        RoomBridgeMirror mirror = new RoomBridgeMirror(daoWithSkips(turn, skips), "phone_a");
+        String raw = "{\"turnId\":\"turn_cloud_proactive_skip_1\",\"state\":\"committed\","
+            + "\"terminal\":true,\"action\":\"skip\",\"reply\":null}";
+
+        boolean saved = mirror.persistCloudInboxReply(raw);
+
+        assertEquals(true, saved);
+        assertEquals(Arrays.asList("cloud_proactive_skip_1"), skips);
+    }
+
     private static AlExecutionDao dao(List<RawMessageEntity> inserted) {
         return dao(inserted, new ArrayList<>(), null);
     }
@@ -262,6 +279,25 @@ public class RoomBridgeMirrorTest {
                 }
                 if ("importCloudBacklogFailure".equals(method.getName())) {
                     failures.add(args[0] + "|" + args[1] + "|" + args[2] + "|" + args[3]);
+                    return true;
+                }
+                Class<?> type = method.getReturnType();
+                if (type == long.class) return 0L;
+                if (type == int.class) return 0;
+                if (type == boolean.class) return false;
+                return null;
+            }
+        );
+    }
+
+    private static AlExecutionDao daoWithSkips(ChatTurnEntity turn, List<String> skips) {
+        return (AlExecutionDao) Proxy.newProxyInstance(
+            AlExecutionDao.class.getClassLoader(),
+            new Class<?>[] { AlExecutionDao.class },
+            (proxy, method, args) -> {
+                if ("turn".equals(method.getName())) return turn.turnId.equals(args[0]) ? turn : null;
+                if ("importCloudBacklogSkip".equals(method.getName())) {
+                    skips.add((String) args[0]);
                     return true;
                 }
                 Class<?> type = method.getReturnType();

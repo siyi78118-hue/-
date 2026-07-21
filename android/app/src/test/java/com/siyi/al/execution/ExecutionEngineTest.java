@@ -51,6 +51,25 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void bridgedAutomaticSkipCompletesWithoutCreatingReplyParts() throws Exception {
+        ChatTurnEntity value = turn("QUEUED", null);
+        value.kind = TurnKind.PROACTIVE_CHAT.name();
+        FakeStore store = new FakeStore(value, attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) { return BridgeResult.skipped("codex", "{}"); }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) { throw new AssertionError(); }
+        };
+        ExecutionEngine engine = new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L);
+
+        assertTrue(engine.runNext());
+
+        assertEquals("memory,skip", String.join(",", store.events));
+        assertEquals(TurnState.COMPLETED.name(), store.turn.state);
+        assertTrue(store.replyParts.isEmpty());
+    }
+
+    @Test
     public void recoveredMemoryRunningBridgeResumesTheSameRemoteTurnWithoutLegacyStages() throws Exception {
         FakeStore store = new FakeStore(turn("MEMORY_RUNNING", null), attempt("MEMORY_RUNNING", null));
         BridgedGateway gateway = new BridgedGateway();
@@ -276,6 +295,12 @@ public class ExecutionEngineTest {
         @Override public void commitReply(String turnId, String attemptId, List<ReplyPartEntity> parts, long now) {
             events.add("commit");
             replyParts.addAll(parts);
+            turn.state = TurnState.COMPLETED.name();
+            attempt.state = TurnState.COMPLETED.name();
+        }
+
+        @Override public void commitSkip(String turnId, String attemptId, long now) {
+            events.add("skip");
             turn.state = TurnState.COMPLETED.name();
             attempt.state = TurnState.COMPLETED.name();
         }

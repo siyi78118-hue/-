@@ -186,7 +186,7 @@ test('technically undeliverable replies are repaired and committed instead of fa
   }
 });
 
-test('a nested empty brain envelope never becomes visible chat JSON', async () => {
+test('an automatic empty brain envelope becomes a deliberate skip without a visible fallback message', async () => {
   await withFixture({
     memory: ['{"query":"主动联系","keywords":[],"candidates":[]}'],
     brain: ['{"reply":"{\\"reply\\":\\"\\",\\"usedFactIds\\":[]}","usedFactIds":[]}'],
@@ -194,9 +194,10 @@ test('a nested empty brain envelope never becomes visible chat JSON', async () =
   }, async ({ store, orchestrator }) => {
     const result = await orchestrator.process(triggerEnvelope(62));
 
-    assert.notEqual(result.reply.content, '{"reply":"","usedFactIds":[]}');
-    assert.ok(result.reply.content.trim());
+    assert.equal(result.action, 'skip');
+    assert.equal(result.reply, null);
     assert.equal(store.getTurn(result.turnId).state, 'committed');
+    assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 0);
   });
 });
 
@@ -218,7 +219,7 @@ test('supervisor rejection asks the brain to rewrite once under the same preset'
   });
 });
 
-test('a third supervisor rejection records the review but sends the final rewritten reply', async () => {
+test('a third supervisor rejection vetoes an automatic message instead of force-sending it', async () => {
   await withFixture({
     memory: ['{"query":"hello","keywords":[],"candidates":[]}'],
     brain: [
@@ -233,8 +234,22 @@ test('a third supervisor rejection records the review but sends the final rewrit
     ]
   }, async ({ store, orchestrator }) => {
     const result = await orchestrator.process(triggerEnvelope(61));
-    assert.equal(result.reply.content, 'final rewritten draft');
+    assert.equal(result.action, 'skip');
+    assert.equal(result.reply, null);
     assert.equal(store.getTurn(result.turnId).state, 'committed');
+    assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 0);
+  });
+});
+
+test('an automatic brain may deliberately stay silent', async () => {
+  await withFixture({
+    memory: ['{"query":"check in","keywords":[],"candidates":[]}'],
+    brain: ['{"action":"skip","reply":"","usedFactIds":[]}'],
+    supervisor: ['{"approved":true,"issues":[]}']
+  }, async ({ store, orchestrator }) => {
+    const result = await orchestrator.process(triggerEnvelope(64));
+    assert.deepEqual({ action: result.action, reply: result.reply }, { action: 'skip', reply: null });
+    assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 0);
   });
 });
 
@@ -298,11 +313,40 @@ test('automatic trigger reaches brain as currentTrigger and never becomes user e
     const result = await orchestrator.process(triggerEnvelope());
     const memory = codex.calls.find(call => call.role === 'memory').input;
     const brain = codex.calls.find(call => call.role === 'brain').input;
+    const supervisor = codex.calls.find(call => call.role === 'supervisor').input;
     assert.equal(result.reply.speakerId, 'yuqi');
     assert.equal(memory.currentMessageId, undefined);
     assert.equal(memory.currentTrigger.triggerId, 'trigger_phone_20');
     assert.equal(brain.currentUserMessage, undefined);
     assert.equal(brain.currentTrigger.triggerType, 'proactive_chat');
+    assert.match(brain.preset, /action.*skip.*不发送|不发送.*action.*skip/s);
+    assert.equal(brain.interactionState.computedAt, 1784400000020);
+    assert.equal(brain.interactionState.unansweredOutgoingCount, 0);
+    assert.deepEqual(supervisor.recentMessages, brain.recentMessages);
+    assert.deepEqual(supervisor.interactionState, brain.interactionState);
+    assert.match(supervisor.preset, /监督.*skip|skip.*监督/s);
     assert.equal(store.listMessages('yuqi').filter(message => message.speakerType === 'user').length, 0);
+  });
+});
+
+test('automatic interaction state is recomputed from current stored messages instead of a stale trigger snapshot', async () => {
+  await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
+    store.putMessage({
+      messageId: 'msg_user_live', turnId: 'turn_live_1', characterId: 'yuqi', speakerId: 'user',
+      speakerType: 'user', recipientId: 'yuqi', content: '晚点聊', sentAt: 1784390000000, origin: 'phone'
+    });
+    store.putMessage({
+      messageId: 'msg_yuqi_live', turnId: 'turn_live_2', characterId: 'yuqi', speakerId: 'yuqi',
+      speakerType: 'character', recipientId: 'user', content: '好', sentAt: 1784395000000, origin: 'codex'
+    });
+    const trigger = triggerEnvelope(65);
+    trigger.trigger.context = { snapshot: { lastMessageAt: 1, unansweredOutgoingCount: 0 } };
+    await orchestrator.process(trigger);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    assert.equal(brain.interactionState.lastMessageId, 'msg_yuqi_live');
+    assert.equal(brain.interactionState.unansweredOutgoingCount, 1);
+    assert.equal(brain.interactionState.waitingForUserReply, true);
+    assert.equal(brain.interactionState.silenceMsSinceLastMessage, 5_000_065);
+    assert.equal(brain.interactionState.triggerSnapshotIsAdvisory, true);
   });
 });

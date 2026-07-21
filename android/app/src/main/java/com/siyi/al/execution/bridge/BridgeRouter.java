@@ -97,6 +97,7 @@ public final class BridgeRouter {
     }
 
     private BridgeResult finish(TurnSubmission submission, BridgeResult result) throws Exception {
+        if (result.skipped) return result;
         if (result.replyText.trim().isEmpty()) throw new IllegalStateException("bridge returned an empty reply");
         mirror.persistReply(submission, result);
         return result;

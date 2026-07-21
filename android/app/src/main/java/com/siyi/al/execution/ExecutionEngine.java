@@ -136,6 +136,10 @@ public final class ExecutionEngine {
         if (bridgeResponse.has("_relayMessageId")) checkpoint.put("bridgeResponse", bridgeResponse);
         store.saveMemoryResult(turn.turnId, attempt.attemptId, checkpoint.toString(), clock.now());
         store.markStage(turn.turnId, attempt.attemptId, TurnState.CHAT_RUNNING, AttemptStage.CHAT, clock.now());
+        if (result.skipped) {
+            store.commitSkip(turn.turnId, attempt.attemptId, clock.now());
+            return;
+        }
         store.saveRawReply(turn.turnId, attempt.attemptId, result.replyText, clock.now());
         attempt.rawReply = result.replyText;
         commitStoredReply(turn, attempt);

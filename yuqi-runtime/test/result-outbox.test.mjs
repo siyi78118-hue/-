@@ -136,3 +136,39 @@ test('delivers a LAN-accepted terminal turn through Cloud later without changing
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('delivers an automatic skip as a successful terminal action without inventing reply text', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yuqi-skip-outbox-'));
+  const store = new YuqiStore(join(dir, 'runtime.sqlite'));
+  try {
+    const automatic = { ...envelope(), kind: 'PROACTIVE_CHAT', message: undefined, trigger: {
+      triggerId: 'trigger_skip_1', triggerType: 'proactive_chat', scheduledFor: 1784400000000, executedAt: 1784400000091,
+      context: { reason: 'scheduled_check_in' }
+    } };
+    const accepted = store.submitTurn(automatic);
+    store.registerCloudDelivery(accepted.turnId, 'phone_cloud', 90);
+    store.claimTurnById(accepted.turnId, 'worker-outbox');
+    store.advanceTurn(accepted.turnId, 'memory_running', 'memory_done', { memoryPacketJson: '{}' });
+    store.advanceTurn(accepted.turnId, 'memory_done', 'brain_running');
+    store.advanceTurn(accepted.turnId, 'brain_running', 'brain_done', { brainDraftJson: '{}' });
+    store.advanceTurn(accepted.turnId, 'brain_done', 'supervisor_running');
+    store.advanceTurn(accepted.turnId, 'supervisor_running', 'approved', { supervisorJson: '{}' });
+    store.advanceTurn(accepted.turnId, 'approved', 'committed', {
+      replyJson: JSON.stringify({ turnId: accepted.turnId, action: 'skip', reply: null })
+    });
+    let payload;
+    const outbox = new ResultOutbox({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64, store,
+      fetchImpl: async (_url, options) => { payload = JSON.parse(options.body); return Response.json({ ok: true }, { status: 201 }); }
+    });
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 1, failed: 0, waiting: 0 });
+    const decoded = decryptRelayPayload(payload, keyBase64);
+    assert.equal(decoded.action, 'skip');
+    assert.equal(decoded.reply, null);
+    assert.equal(decoded.terminal, true);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

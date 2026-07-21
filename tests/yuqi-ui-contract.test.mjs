@@ -8,6 +8,16 @@ const plugin = readFileSync('android/app/src/main/java/com/siyi/al/AlExecutionPl
 const executionStore = readFileSync('android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java', 'utf8');
 const executionDao = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java', 'utf8');
 const worker = readFileSync('tavern-app/sw-v11.js', 'utf8');
+const corePreset = readFileSync('tavern-app/lib/yuqi-core-preset.js', 'utf8');
+
+test('every phone-side Yuqi scene composes the synchronized core preset after the combined RP foundation', () => {
+  assert.match(html, /<script src="\.\/lib\/yuqi-core-preset\.js"><\/script>/);
+  assert.match(corePreset, /globalThis\.AL_YUQI_CORE_PROMPT/);
+  const builder = html.slice(html.indexOf('function buildCharPrompt'), html.indexOf('function isGeneratedCharacterPrompt'));
+  assert.match(builder, /char\.id\s*===\s*'yuqi'/);
+  assert.match(builder, /globalThis\.AL_YUQI_CORE_PROMPT/);
+  assert.ok(builder.indexOf('preset.prompt') < builder.indexOf('globalThis.AL_YUQI_CORE_PROMPT'));
+});
 
 test('Yuqi controls expose secure AUTO, LAN, and CLOUD bridge settings', () => {
   for (const id of [

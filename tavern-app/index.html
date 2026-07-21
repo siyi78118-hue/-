@@ -1328,7 +1328,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-21.95';
+const APP_BUILD_VERSION = '2026-07-22.96';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -5667,6 +5667,11 @@ function buildCharPrompt(char) {
   // 完整 RP 规则是所有场景的固定底座；自定义内容只能追加，不能替换或裁剪它。
   const preset = RP_PRESETS.combined;
   if (preset.prompt) prompt += preset.prompt + '\n\n';
+  if (char.id === 'yuqi') {
+    const corePrompt = String(globalThis.AL_YUQI_CORE_PROMPT || '').trim();
+    if (!corePrompt) throw new Error('虞栖核心人物预设缺失，请先同步预设资源');
+    prompt += `虞栖核心人物预设（所有虞栖可见内容必传）：\n${corePrompt}\n\n`;
+  }
   if (char.systemPrompt) prompt += `角色卡系统提示：\n${char.systemPrompt}\n\n`;
   prompt += `玩家昵称：${playerName()}\n`;
   prompt += `当前你要扮演的角色：${char.name}\n`;

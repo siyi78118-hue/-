@@ -149,6 +149,13 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     @Override
+    public void commitSkip(String turnId, String attemptId, long now) {
+        ChatTurnEntity turn = requireTurn(turnId);
+        if (!attemptId.equals(turn.activeAttemptId)) throw new StaleAttemptException(turnId, attemptId);
+        dao.commitSkip(turnId, attemptId, now);
+    }
+
+    @Override
     public void cancelTurn(String turnId, long now, boolean deleted) {
         database.runInTransaction(() -> {
             ChatTurnEntity turn = requireTurn(turnId);

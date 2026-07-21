@@ -62,6 +62,22 @@ public class BridgeRouterTest {
         assertFalse(result.fallback);
     }
 
+    @Test public void deliberateAutomaticSkipCompletesWithoutMirroringAnEmptyReply() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeConfig config = new BridgeConfig(true, BridgeMode.LAN, "http://192.168.1.8:17891", "https://relay.example", "device_123456", "pairing-secret-123", "device-token-123456", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 500, 2000, 2, 1);
+        BridgeRouter.MessageMirror mirror = new BridgeRouter.MessageMirror() {
+            @Override public void persistSubmission(TurnSubmission value) { events.add("mirror-user"); }
+            @Override public void persistReply(TurnSubmission value, BridgeResult result) { events.add("mirror-reply"); }
+        };
+        BridgeRouter router = new BridgeRouter(config, value -> { events.add("lan"); return BridgeResult.skipped("codex", "{}"); }, failing("cloud", events), fallback("fallback", events), mirror);
+        TurnSubmission proactive = new TurnSubmission("turn_proactive_skip", "yuqi", "job_skip", TurnKind.PROACTIVE_CHAT, "{}", "{}", "job_skip", 1784400000000L);
+
+        BridgeResult result = router.execute(proactive);
+
+        assertTrue(result.skipped);
+        assertEquals(Arrays.asList("lan"), events);
+    }
+
     @Test public void transientLanAndCloudFailuresNeverInvokeFallbackBeforeDeadline() throws Exception {
         List<String> events = new ArrayList<>();
         BridgeRouter router = router(

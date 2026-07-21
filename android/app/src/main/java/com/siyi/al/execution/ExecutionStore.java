@@ -31,6 +31,8 @@ public interface ExecutionStore {
         long now
     );
 
+    void commitSkip(String turnId, String attemptId, long now);
+
     void cancelTurn(String turnId, long now, boolean deleted);
 
     ChatTurnEntity turn(String turnId);
