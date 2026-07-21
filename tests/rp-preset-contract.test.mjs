@@ -8,6 +8,15 @@ const match = source.match(/combined:\s*\{[\s\S]*?prompt:\s*`([\s\S]*?)`\s*\r?\n
 assert.ok(match, '应能从 index.html 提取 AL 综合 RP 预设');
 const prompt = match[1];
 
+test('AL 综合 RP 与虞栖核心预设生成跨端必传资产', () => {
+  const runtimeFoundation = readFileSync(new URL('../yuqi-runtime/presets/al-combined-rp.md', import.meta.url), 'utf8').trim();
+  const runtimeCore = readFileSync(new URL('../yuqi-runtime/presets/yuqi-core.md', import.meta.url), 'utf8').trim();
+  const browserCore = readFileSync(new URL('../tavern-app/lib/yuqi-core-preset.js', import.meta.url), 'utf8').trim();
+  assert.equal(runtimeFoundation.replaceAll('\\n', '\n'), prompt.replaceAll('\\n', '\n').trim());
+  assert.equal(browserCore, `globalThis.AL_YUQI_CORE_PROMPT = ${JSON.stringify(runtimeCore)};`);
+  assert.match(source, /<script src="\.\/lib\/yuqi-core-preset\.js"><\/script>\s*<script>/);
+});
+
 test('保留第一轮确认的聊天底座', () => {
   assert.match(prompt, /独立生活/);
   assert.match(prompt, /省略主语、宾语、因果和结论/);

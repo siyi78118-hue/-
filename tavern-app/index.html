@@ -944,6 +944,7 @@ button.cell:active{background:#ececec}
 <script src="lib/api-endpoint.js"></script>
 <script src="./lib/role-plan-domain.js"></script>
 <script src="./lib/role-plan-repository.js"></script>
+<script src="./lib/yuqi-core-preset.js"></script>
 <script>
 const DB = {
   get(k, def = null) { try { const v = localStorage.getItem('rpchat_' + k) ?? localStorage.getItem('tavern_' + k); return v ? JSON.parse(v) : def } catch { return def } },
