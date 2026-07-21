@@ -3393,7 +3393,9 @@ function isEmptyReplyText(text) {
 }
 const KNOWN_LEAKED_NATIVE_TURN_IDS = new Set([
   'native:turn_cloud_pro_dev_q6kzt72oymqmrge8f9x_yuqi_mru7to3g_d0qgwl',
-  'native:turn_cloud_pro_dev_q6kzt72oymqmrge8f9x_yuqi_native_mru87xq4'
+  'native:turn_cloud_pro_dev_q6kzt72oymqmrge8f9x_yuqi_native_mru87xq4',
+  'native:cloud_backfill_8ab238352447c110cb4fd7dd',
+  'native:cloud_backfill_849cd4bbf59b290244ea0a64'
 ]);
 function isLeakedNativeReplyEnvelope(message) {
   if (message?.role !== 'assistant') return false;

@@ -153,6 +153,30 @@ public class RoomBridgeMirrorTest {
         assertEquals(insertedTurns.get(0).turnId, imported.get(imported.size() - 1).turnId);
     }
 
+    @Test public void currentCloudReplyDoesNotCreateABackfillTurnWhileItsOriginalTurnIsRunning() throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<ReplyPartEntity> imported = new ArrayList<>();
+        List<ChatTurnEntity> insertedTurns = new ArrayList<>();
+        ChatTurnEntity runningTurn = new ChatTurnEntity();
+        runningTurn.turnId = "turn_msg_phone_current";
+        runningTurn.characterId = "yuqi";
+        runningTurn.state = "CHAT_RUNNING";
+        runningTurn.activeAttemptId = "attempt_current";
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            dao(inserted, imported, insertedTurns, runningTurn, runningTurn.turnId), "phone_a"
+        );
+        String raw = "{\"turnId\":\"turn_msg_phone_current\",\"state\":\"committed\","
+            + "\"terminal\":true,\"reply\":{\"messageId\":\"msg_yuqi_current\","
+            + "\"characterId\":\"yuqi\",\"content\":\"only one visible reply\","
+            + "\"sentAt\":1784390003000,\"origin\":\"codex\"}}";
+
+        boolean saved = mirror.persistCloudInboxReply(raw);
+
+        assertEquals(false, saved);
+        assertEquals(0, imported.size());
+        assertEquals(0, insertedTurns.size());
+    }
+
     @Test public void oldCloudFailureEndsTheOriginalPendingTurnWithSafeText() throws Exception {
         List<RawMessageEntity> inserted = new ArrayList<>();
         List<String> failures = new ArrayList<>();

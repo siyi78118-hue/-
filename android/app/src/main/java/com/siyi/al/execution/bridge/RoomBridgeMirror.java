@@ -121,6 +121,12 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         dao.insertRawMessage(entity);
 
         if (turn != null) {
+            String state = turn.state == null ? "" : turn.state;
+            if (!("FAILED_RETRYABLE".equals(state) || "FAILED_FINAL".equals(state)
+                || "INTERRUPTED".equals(state) || "CANCELLED".equals(state)
+                || "COMPLETED".equals(state))) {
+                return false;
+            }
             ReplyPartEntity originalPart = backlogPart(messageId, localTurnId, turn.activeAttemptId, content, sentAt);
             if (dao.importCloudBacklogReply(localTurnId, originalPart, sentAt)) return true;
         }

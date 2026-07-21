@@ -86,6 +86,11 @@ test('startup cleanup removes only empty native reply envelopes from assistant b
   assert.match(html, /isLeakedNativeReplyEnvelope\(m\)/);
 });
 
+test('startup cleanup removes the two duplicate cloud backfill turns already shown on the phone', () => {
+  assert.match(html, /native:cloud_backfill_8ab238352447c110cb4fd7dd/);
+  assert.match(html, /native:cloud_backfill_849cd4bbf59b290244ea0a64/);
+});
+
 test('Android foreground proactive chat enters the native PROACTIVE_CHAT queue', () => {
   assert.match(html, /async function\s+queueAndroidProactiveTurn\(/);
   assert.match(html, /kind:\s*'PROACTIVE_CHAT'/);
