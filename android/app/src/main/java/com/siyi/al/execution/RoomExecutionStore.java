@@ -112,14 +112,20 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     ) {
         database.runInTransaction(() -> {
             ChatTurnEntity turn = requireTurn(turnId);
-            if (!attemptId.equals(turn.activeAttemptId)) {
+            if (!attemptId.equals(turn.activeAttemptId)
+                || TurnState.COMPLETED.name().equals(turn.state)
+                || dao.replyPartCount(turnId) > 0) {
                 throw new StaleAttemptException(turnId, attemptId);
             }
             String state = retryable
                 ? TurnState.FAILED_RETRYABLE.name()
                 : TurnState.FAILED_FINAL.name();
-            dao.markTurnFailed(turnId, attemptId, state, now);
-            dao.markAttemptFailed(attemptId, state, code, detail, retryable, now);
+            if (dao.markTurnFailed(turnId, attemptId, state, now) != 1) {
+                throw new StaleAttemptException(turnId, attemptId);
+            }
+            if (dao.markAttemptFailed(attemptId, state, code, detail, retryable, now) != 1) {
+                throw new StaleAttemptException(turnId, attemptId);
+            }
             insertTurnChange(turnId, "TURN_FAILED", now);
             insertDiagnostic(turnId, attemptId, "ERROR", "TURN_FAILED", code + ": " + detail, now);
         });

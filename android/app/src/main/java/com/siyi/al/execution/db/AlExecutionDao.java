@@ -184,10 +184,10 @@ public interface AlExecutionDao {
     @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId")
     int completeAttempt(String attemptId, long now);
 
-    @Query("UPDATE chat_turns SET state = :state, updatedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId")
+    @Query("UPDATE chat_turns SET state = :state, updatedAt = :now WHERE turnId = :turnId AND activeAttemptId = :attemptId AND state != 'COMPLETED'")
     int markTurnFailed(String turnId, String attemptId, String state, long now);
 
-    @Query("UPDATE execution_attempts SET state = :state, errorCode = :code, errorDetail = :detail, retryable = :retryable, heartbeatAt = :now, finishedAt = :now WHERE attemptId = :attemptId")
+    @Query("UPDATE execution_attempts SET state = :state, errorCode = :code, errorDetail = :detail, retryable = :retryable, heartbeatAt = :now, finishedAt = :now WHERE attemptId = :attemptId AND state != 'COMPLETED'")
     int markAttemptFailed(String attemptId, String state, String code, String detail, boolean retryable, long now);
 
     @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :completedAt, completedAt = :completedAt, uiAppliedAt = NULL, cancelledAt = NULL, deletedAt = NULL WHERE turnId = :turnId")
@@ -310,17 +310,22 @@ public interface AlExecutionDao {
         ChatTurnEntity turn = turn(turnId);
         if (turn == null) return false;
         List<ReplyPartEntity> existing = replyParts(turnId);
+        boolean replyAlreadyStored = false;
         if (!existing.isEmpty()) {
             for (ReplyPartEntity value : existing) {
-                if (value.replyPartId.equals(part.replyPartId) && value.content.equals(part.content)) return true;
+                if (value.replyPartId.equals(part.replyPartId) && value.content.equals(part.content)) {
+                    replyAlreadyStored = true;
+                    break;
+                }
             }
-            return false;
+            if (!replyAlreadyStored) return false;
         }
         String state = turn.state == null ? "" : turn.state;
         if (!("FAILED_RETRYABLE".equals(state) || "FAILED_FINAL".equals(state)
             || "INTERRUPTED".equals(state) || "CANCELLED".equals(state)
             || "COMPLETED".equals(state))) return false;
-        insertReplyParts(java.util.Collections.singletonList(part));
+        if (!replyAlreadyStored) insertReplyParts(java.util.Collections.singletonList(part));
+        if ("COMPLETED".equals(state) && replyAlreadyStored) return true;
         if (completeImportedCloudTurn(turnId, completedAt) != 1) return false;
         if (turn.activeAttemptId != null && !turn.activeAttemptId.isEmpty()) {
             completeImportedCloudAttempt(turn.activeAttemptId, completedAt);

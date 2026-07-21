@@ -5,6 +5,8 @@ import test from 'node:test';
 const html = readFileSync('tavern-app/index.html', 'utf8');
 const engine = readFileSync('android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java', 'utf8');
 const plugin = readFileSync('android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java', 'utf8');
+const executionStore = readFileSync('android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java', 'utf8');
+const executionDao = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java', 'utf8');
 const worker = readFileSync('tavern-app/sw-v11.js', 'utf8');
 
 test('Yuqi controls expose secure AUTO, LAN, and CLOUD bridge settings', () => {
@@ -89,6 +91,34 @@ test('startup cleanup removes only empty native reply envelopes from assistant b
 test('startup cleanup removes the two duplicate cloud backfill turns already shown on the phone', () => {
   assert.match(html, /native:cloud_backfill_8ab238352447c110cb4fd7dd/);
   assert.match(html, /native:cloud_backfill_849cd4bbf59b290244ea0a64/);
+});
+
+test('a late bridge failure cannot overwrite a reply that already completed', () => {
+  const markFailed = executionStore.slice(
+    executionStore.indexOf('public void markFailed('),
+    executionStore.indexOf('@Override\n    public void commitReply(')
+  );
+  assert.match(markFailed, /TurnState\.COMPLETED\.name\(\)\.equals\(turn\.state\)/);
+  assert.match(markFailed, /throw new StaleAttemptException\(turnId, attemptId\)/);
+  assert.match(executionDao, /UPDATE chat_turns SET state = :state[^\n]+state != 'COMPLETED'/);
+});
+
+test('a previously stored late reply repairs a stale failed turn instead of returning early', () => {
+  const importReply = executionDao.slice(
+    executionDao.indexOf('default boolean importCloudBacklogReply('),
+    executionDao.indexOf('default boolean importCloudBacklogFailure(')
+  );
+  assert.match(importReply, /boolean\s+replyAlreadyStored/);
+  assert.match(importReply, /replyAlreadyStored[\s\S]*completeImportedCloudTurn/);
+  assert.doesNotMatch(importReply, /value\.replyPartId\.equals\(part\.replyPartId\)[^\n]+return true/);
+});
+
+test('startup repairs the known delivered reply that still carries a failed badge', () => {
+  assert.match(html, /function\s+repairKnownDeliveredReplyStates\(chats\)/);
+  assert.match(html, /native:cloud_backfill_b64cf8b2ea6e81b54e9b8f3b/);
+  assert.match(html, /turn_msg_1784629780470_5kv9vd/);
+  assert.match(html, /delete userMessage\.replyState/);
+  assert.match(html, /delete userMessage\.replyError/);
 });
 
 test('Android foreground proactive chat enters the native PROACTIVE_CHAT queue', () => {

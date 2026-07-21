@@ -1327,7 +1327,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-20.94';
+const APP_BUILD_VERSION = '2026-07-21.95';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -2042,6 +2042,7 @@ async function importChatBackup(event) {
     allChats = clearImportedCloudJobs(data.allChats && typeof data.allChats === 'object' ? data.allChats : {});
     allMoments = Array.isArray(data.allMoments) ? data.allMoments : [];
     scrubEmptyReplyMessages(allChats);
+    repairKnownDeliveredReplyStates(allChats);
     localStorage.setItem('rpchat_characters', JSON.stringify(characters));
     localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
     localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
@@ -2080,6 +2081,7 @@ async function importBackup(event) {
     allChats = clearImportedCloudJobs(data.allChats && typeof data.allChats === 'object' ? data.allChats : (data.chats || {}));
     allMoments = Array.isArray(data.allMoments) ? data.allMoments : (Array.isArray(data.moments) ? data.moments : []);
     scrubEmptyReplyMessages(allChats);
+    repairKnownDeliveredReplyStates(allChats);
     localStorage.setItem('rpchat_settings', JSON.stringify(settings));
     localStorage.setItem('rpchat_characters', JSON.stringify(characters));
     localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
@@ -3281,6 +3283,7 @@ async function restoreAppStateFromMirror() {
   allChats = mergeLocalPendingReplies(mirrored.allChats || allChats, localChats);
   allMoments = Array.isArray(mirrored.allMoments) ? mirrored.allMoments : allMoments;
   scrubEmptyReplyMessages(allChats);
+  repairKnownDeliveredReplyStates(allChats);
   localStorage.setItem('rpchat_settings', JSON.stringify(settings));
   localStorage.setItem('rpchat_characters', JSON.stringify(characters));
   localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
@@ -3397,6 +3400,15 @@ const KNOWN_LEAKED_NATIVE_TURN_IDS = new Set([
   'native:cloud_backfill_8ab238352447c110cb4fd7dd',
   'native:cloud_backfill_849cd4bbf59b290244ea0a64'
 ]);
+const KNOWN_DELIVERED_REPLY_REPAIRS = [
+  {
+    userMessageId: 'msg_1784629780470_5kv9vd',
+    sourceTurnIds: new Set([
+      'native:turn_msg_1784629780470_5kv9vd',
+      'native:cloud_backfill_b64cf8b2ea6e81b54e9b8f3b'
+    ])
+  }
+];
 function isLeakedNativeReplyEnvelope(message) {
   if (message?.role !== 'assistant') return false;
   const sourceTurnId = String(message.sourceTurnId || '');
@@ -3426,9 +3438,38 @@ function scrubEmptyReplyMessages(chats) {
   });
   return changed;
 }
+function repairKnownDeliveredReplyStates(chats) {
+  let changed = false;
+  Object.values(chats || {}).forEach(chat => {
+    if (!Array.isArray(chat?.messages)) return;
+    KNOWN_DELIVERED_REPLY_REPAIRS.forEach(repair => {
+      const userMessage = chat.messages.find(message => message?.id === repair.userMessageId && message?.role === 'user');
+      if (!userMessage) return;
+      const delivered = chat.messages.filter(message =>
+        message?.role === 'assistant' && repair.sourceTurnIds.has(String(message.sourceTurnId || ''))
+      );
+      if (!delivered.length) return;
+      delivered.forEach(message => {
+        if (message.replyToMessageId === userMessage.id) return;
+        message.replyToMessageId = userMessage.id;
+        changed = true;
+      });
+      if (userMessage.replyState || userMessage.replyError) changed = true;
+      delete userMessage.replyState;
+      delete userMessage.replyError;
+      if (chat.pendingReply?.userMessageId === userMessage.id) {
+        delete chat.pendingReply;
+        changed = true;
+      }
+    });
+  });
+  return changed;
+}
 characters = characters.map(normalizeChar);
 DB.set('characters', characters);
-if (scrubEmptyReplyMessages(allChats)) DB.set('chats', allChats);
+const scrubbedEmptyReplies = scrubEmptyReplyMessages(allChats);
+const repairedDeliveredReplies = repairKnownDeliveredReplyStates(allChats);
+if (scrubbedEmptyReplies || repairedDeliveredReplies) DB.set('chats', allChats);
 if (characters.some(char => char.id === YUQI_FIRST_PROFILE.id)) ensureYuqiFirstAcquaintance();
 
 function normalizePresetKey(key) {
