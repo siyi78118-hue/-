@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { contentHash } from './protocol.mjs';
 
 const ROLES = new Set(['brain', 'memory', 'supervisor']);
+const MODULES = new Set(['foundation', ...ROLES]);
 const HIDDEN_BIOGRAPHY = /许弥|焦虑依恋|用户过去|用户曾经|原生家庭|隐藏画像|未透露.{0,10}(经历|事实)/i;
 
 function nextPatch(version) {
@@ -39,8 +40,11 @@ export class PresetRegistry {
     const manifest = JSON.parse(readFileSync(join(this.presetDir, 'manifest.json'), 'utf8'));
     const modules = {};
     for (const [role, filename] of Object.entries(manifest.modules || {})) {
-      if (!ROLES.has(role)) throw new Error(`unknown preset role: ${role}`);
+      if (!MODULES.has(role)) throw new Error(`unknown preset role: ${role}`);
       modules[role] = readFileSync(join(this.presetDir, filename), 'utf8').trim();
+    }
+    for (const role of MODULES) {
+      if (!String(modules[role] || '').trim()) throw new Error(`missing preset module: ${role}`);
     }
     const checksum = contentHash({ version: manifest.currentVersion, modules });
     const existing = this.store.getPresetVersion(manifest.currentVersion);
@@ -86,8 +90,18 @@ export class PresetRegistry {
     const preset = this.current();
     const stage = String(scene.stage || 'initial');
     const revealedFactIds = Array.isArray(scene.revealedFactIds) ? scene.revealedFactIds : [];
+    const roleModules = role === 'memory'
+      ? [preset.modules.memory]
+      : role === 'brain'
+        ? [preset.modules.foundation, preset.modules.brain]
+        : [
+            preset.modules.supervisor,
+            '## 本轮权威生成预设\n以下内容是被监督回复实际使用的完整生成预设，必须据此复核人物一致性。',
+            preset.modules.foundation,
+            preset.modules.brain,
+          ];
     return [
-      preset.modules[role],
+      ...roleModules,
       '',
       '## 本轮运行边界',
       `当前关系阶段：${stage === 'initial' ? '初次认识' : stage}`,

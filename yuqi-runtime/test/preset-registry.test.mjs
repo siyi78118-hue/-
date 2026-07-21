@@ -25,9 +25,9 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.1.1');
+  assert.equal(current.version, '1.2.0');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
-  assert.deepEqual(current.changedModules.sort(), ['brain', 'memory', 'supervisor']);
+  assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
 
 test('reopens a durable seed without changing its publication manifest', () => {
@@ -64,7 +64,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.1.1');
+    assert.equal(registry.current().version, '1.2.0');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -73,6 +73,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
 test('brain prompt starts at first acquaintance without hidden user history', () => withRegistry(registry => {
   const prompt = registry.compileFor('brain', { stage: 'initial', revealedFactIds: [] });
+  assert.ok(prompt.indexOf('你正在进行中文手机私聊式角色扮演') < prompt.indexOf('# 虞栖核心人物预设'));
   assert.match(prompt, /活生生的人/);
   assert.match(prompt, /一次意外.*手机.*平行世界.*联系/s);
   assert.match(prompt, /24岁.*现代临江城市/s);
@@ -97,12 +98,15 @@ test('brain preset keeps proactive delivery decisions out of visible chat text',
   assert.match(prompt, /不要把.*JSON.*塞进.*回复/s);
 }));
 
-test('each runtime role receives only its relevant module', () => withRegistry(registry => {
+test('memory stays isolated while supervisor receives the authoritative generation presets', () => withRegistry(registry => {
   const memory = registry.compileFor('memory', { stage: 'initial' });
   const supervisor = registry.compileFor('supervisor', { stage: 'initial' });
   assert.match(memory, /原始消息 ID|原话证据/);
+  assert.doesNotMatch(memory, /你正在进行中文手机私聊式角色扮演/);
   assert.doesNotMatch(memory, /你可以称自己想占有对方/);
   assert.match(supervisor, /说话者归属|越界知识/);
+  assert.match(supervisor, /你正在进行中文手机私聊式角色扮演/);
+  assert.match(supervisor, /# 虞栖核心人物预设/);
   assert.doesNotMatch(supervisor, /候选事实抽取格式/);
 }));
 
@@ -117,16 +121,16 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.1.2');
-  assert.equal(published.parentVersion, '1.1.1');
+  assert.equal(published.version, '1.2.1');
+  assert.equal(published.parentVersion, '1.2.0');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 2);
 
-  const rollback = registry.rollback('1.1.1');
-  assert.equal(rollback.version, '1.1.3');
-  assert.equal(rollback.parentVersion, '1.1.2');
-  assert.equal(rollback.rollbackOf, '1.1.1');
+  const rollback = registry.rollback('1.2.0');
+  assert.equal(rollback.version, '1.2.2');
+  assert.equal(rollback.parentVersion, '1.2.1');
+  assert.equal(rollback.rollbackOf, '1.2.0');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 3);
 }));
