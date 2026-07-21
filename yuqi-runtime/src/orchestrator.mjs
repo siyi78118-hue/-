@@ -22,9 +22,31 @@ export function hardValidateReply(reply) {
   return { ok: issues.length === 0, issues };
 }
 
-function repairReplyForDelivery(reply) {
+export function normalizeBrainDraft(draft) {
+  const normalized = {
+    ...(draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}),
+    reply: String(draft?.reply || '').trim(),
+    usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : []
+  };
+  for (let depth = 0; depth < 3 && normalized.reply.startsWith('{') && normalized.reply.endsWith('}'); depth += 1) {
+    let nested;
+    try { nested = JSON.parse(normalized.reply); } catch { break; }
+    if (!nested || typeof nested !== 'object' || Array.isArray(nested) || typeof nested.reply !== 'string') break;
+    normalized.reply = nested.reply.trim();
+    if (!normalized.usedFactIds.length && Array.isArray(nested.usedFactIds)) {
+      normalized.usedFactIds = nested.usedFactIds.map(String);
+    }
+  }
+  return normalized;
+}
+
+function repairReplyForDelivery(reply, kind = 'DIRECT_REPLY') {
   const text = String(reply || '').trim();
-  if (!text) return '刚才那句话没发出来，你再跟我说一次？';
+  if (!text) {
+    return kind === 'DIRECT_REPLY'
+      ? '刚才那句话没发出来，你再跟我说一次？'
+      : '等你有空再聊。';
+  }
   return text.length > 20_000 ? text.slice(0, 20_000) : text;
 }
 
@@ -69,7 +91,7 @@ export class YuqiOrchestrator {
     const envelope = JSON.parse(current.envelopeJson);
 
     try {
-      for (let step = 0; step < 12; step += 1) {
+      for (let step = 0; step < 16; step += 1) {
         current = this.store.getTurn(turnId);
         if (current.state === 'queued') {
           current = this.store.claimTurnById(turnId, this.workerId);
@@ -91,7 +113,7 @@ export class YuqiOrchestrator {
         if (current.state === 'brain_done') {
           const draft = parseRoleJson(current.brainDraftJson, 'brain');
           const hard = hardValidateReply(draft.reply);
-          const repairedDraft = hard.ok ? draft : { ...draft, reply: repairReplyForDelivery(draft.reply) };
+          const repairedDraft = hard.ok ? draft : { ...draft, reply: repairReplyForDelivery(draft.reply, envelope.kind) };
           if (!hard.ok) {
             this.store.putDiagnostic({
               turnId,
@@ -211,7 +233,7 @@ export class YuqiOrchestrator {
         supervisorIssues: Array.isArray(previousSupervisor.issues) ? previousSupervisor.issues : []
       } : {})
     };
-    const attempt = previousSupervisor?.approved === false ? 2 : 1;
+    const attempt = Number(previousSupervisor?.attempt || 0) + 1;
     const route = current.route === 'fast' ? 'fast' : 'deep';
     const draft = await this.runBrain(envelope.turnId, brainRequest, attempt, route);
     this.store.advanceTurn(envelope.turnId, 'brain_running', 'brain_done', {
@@ -249,7 +271,7 @@ export class YuqiOrchestrator {
       });
       return;
     }
-    if (attempt >= 2) {
+    if (attempt >= 3) {
       this.store.putDiagnostic({
         turnId: envelope.turnId,
         stage: 'supervisor_running',
@@ -311,7 +333,7 @@ export class YuqiOrchestrator {
       `brain_${attempt}`
     );
     if (typeof result.reply !== 'string') throw new Error('brain reply is missing');
-    return result;
+    return normalizeBrainDraft(result);
   }
 
   async runStructuredRole(role, request, clientUserMessageId, profile, stage = role) {

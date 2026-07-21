@@ -186,6 +186,20 @@ test('technically undeliverable replies are repaired and committed instead of fa
   }
 });
 
+test('a nested empty brain envelope never becomes visible chat JSON', async () => {
+  await withFixture({
+    memory: ['{"query":"主动联系","keywords":[],"candidates":[]}'],
+    brain: ['{"reply":"{\\"reply\\":\\"\\",\\"usedFactIds\\":[]}","usedFactIds":[]}'],
+    supervisor: ['{"approved":true,"issues":[]}']
+  }, async ({ store, orchestrator }) => {
+    const result = await orchestrator.process(triggerEnvelope(62));
+
+    assert.notEqual(result.reply.content, '{"reply":"","usedFactIds":[]}');
+    assert.ok(result.reply.content.trim());
+    assert.equal(store.getTurn(result.turnId).state, 'committed');
+  });
+});
+
 test('supervisor rejection asks the brain to rewrite once under the same preset', async () => {
   await withFixture({
     memory: ['{"query":"你好","keywords":[],"candidates":[]}'],
@@ -204,21 +218,45 @@ test('supervisor rejection asks the brain to rewrite once under the same preset'
   });
 });
 
-test('a second supervisor rejection records the review but sends the rewritten reply', async () => {
+test('a third supervisor rejection records the review but sends the final rewritten reply', async () => {
   await withFixture({
     memory: ['{"query":"hello","keywords":[],"candidates":[]}'],
     brain: [
       '{"reply":"first draft","usedFactIds":[]}',
-      '{"reply":"rewritten draft","usedFactIds":[]}'
+      '{"reply":"rewritten draft","usedFactIds":[]}',
+      '{"reply":"final rewritten draft","usedFactIds":[]}'
     ],
     supervisor: [
       '{"approved":false,"issues":[{"code":"TONE","message":"rewrite"}]}',
-      '{"approved":false,"issues":[{"code":"TONE","message":"still imperfect"}]}'
+      '{"approved":false,"issues":[{"code":"TONE","message":"still imperfect"}]}',
+      '{"approved":false,"issues":[{"code":"TONE","message":"still rejected"}]}'
     ]
   }, async ({ store, orchestrator }) => {
     const result = await orchestrator.process(triggerEnvelope(61));
-    assert.equal(result.reply.content, 'rewritten draft');
+    assert.equal(result.reply.content, 'final rewritten draft');
     assert.equal(store.getTurn(result.turnId).state, 'committed');
+  });
+});
+
+test('a second supervisor rejection requests one final rewrite instead of sending the rejected draft', async () => {
+  await withFixture({
+    memory: ['{"query":"回见","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"reply":"不追发消息。","usedFactIds":[]}',
+      '{"reply":"留出各自上班的空档。","usedFactIds":[]}',
+      '{"reply":"去忙吧，等你有空再聊。","usedFactIds":[]}'
+    ],
+    supervisor: [
+      '{"approved":false,"issues":[{"code":"INTERNAL_FORMAT_LEAKAGE","message":"不是聊天正文"}]}',
+      '{"approved":false,"issues":[{"code":"INTERNAL_FORMAT_LEAKAGE","message":"仍是内部决定"}]}',
+      '{"approved":true,"issues":[]}'
+    ]
+  }, async ({ codex, orchestrator }) => {
+    const result = await orchestrator.process(triggerEnvelope(63));
+
+    assert.equal(result.reply.content, '去忙吧，等你有空再聊。');
+    assert.equal(codex.calls.filter(call => call.role === 'brain').length, 3);
+    assert.equal(codex.calls.filter(call => call.role === 'supervisor').length, 3);
   });
 });
 

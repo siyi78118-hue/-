@@ -3391,11 +3391,32 @@ function isEmptyReplyText(text) {
   const value = String(text || '').trim();
   return !value || value === EMPTY_REPLY_TEXT || value === '(对方没有回复)' || value === '对方没有回复';
 }
+const KNOWN_LEAKED_NATIVE_TURN_IDS = new Set([
+  'native:turn_cloud_pro_dev_q6kzt72oymqmrge8f9x_yuqi_mru7to3g_d0qgwl',
+  'native:turn_cloud_pro_dev_q6kzt72oymqmrge8f9x_yuqi_native_mru87xq4'
+]);
+function isLeakedNativeReplyEnvelope(message) {
+  if (message?.role !== 'assistant') return false;
+  const sourceTurnId = String(message.sourceTurnId || '');
+  if (!sourceTurnId.startsWith('native:')) return false;
+  if (KNOWN_LEAKED_NATIVE_TURN_IDS.has(sourceTurnId)) return true;
+  try {
+    const parsed = JSON.parse(String(message.content || '').trim());
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return false;
+    const keys = Object.keys(parsed);
+    return keys.length > 0
+      && keys.every(key => key === 'reply' || key === 'usedFactIds')
+      && parsed.reply === ''
+      && Array.isArray(parsed.usedFactIds);
+  } catch {
+    return false;
+  }
+}
 function scrubEmptyReplyMessages(chats) {
   let changed = false;
   Object.values(chats || {}).forEach(chat => {
     if (!Array.isArray(chat?.messages)) return;
-    const next = chat.messages.filter(m => !(m.role === 'assistant' && isEmptyReplyText(m.content)));
+    const next = chat.messages.filter(m => !(m.role === 'assistant' && isEmptyReplyText(m.content)) && !isLeakedNativeReplyEnvelope(m));
     if (next.length !== chat.messages.length) {
       chat.messages = next;
       changed = true;

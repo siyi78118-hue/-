@@ -25,7 +25,7 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.1.0');
+  assert.equal(current.version, '1.1.1');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'memory', 'supervisor']);
 }));
@@ -64,7 +64,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.1.0');
+    assert.equal(registry.current().version, '1.1.1');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -90,6 +90,13 @@ test('core preset preserves equality, uniqueness, and emotionally genuine speech
   assert.match(prompt, /调情来自真实的心动和兴趣/);
 }));
 
+test('brain preset keeps proactive delivery decisions out of visible chat text', () => withRegistry(registry => {
+  const prompt = registry.compileFor('brain', { stage: 'initial' });
+  assert.match(prompt, /主动联系.*聊天正文/s);
+  assert.match(prompt, /不要输出.*不追发消息.*内部决定/s);
+  assert.match(prompt, /不要把.*JSON.*塞进.*回复/s);
+}));
+
 test('each runtime role receives only its relevant module', () => withRegistry(registry => {
   const memory = registry.compileFor('memory', { stage: 'initial' });
   const supervisor = registry.compileFor('supervisor', { stage: 'initial' });
@@ -110,16 +117,16 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.1.1');
-  assert.equal(published.parentVersion, '1.1.0');
+  assert.equal(published.version, '1.1.2');
+  assert.equal(published.parentVersion, '1.1.1');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 2);
 
-  const rollback = registry.rollback('1.1.0');
-  assert.equal(rollback.version, '1.1.2');
-  assert.equal(rollback.parentVersion, '1.1.1');
-  assert.equal(rollback.rollbackOf, '1.1.0');
+  const rollback = registry.rollback('1.1.1');
+  assert.equal(rollback.version, '1.1.3');
+  assert.equal(rollback.parentVersion, '1.1.2');
+  assert.equal(rollback.rollbackOf, '1.1.1');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 3);
 }));

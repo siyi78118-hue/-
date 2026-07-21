@@ -71,6 +71,21 @@ test('native completed replies retain bridge provenance without changing bubble 
   assert.match(html, /replyAttemptedRoutes:\s*Array\.isArray\(result\?\.attemptedRoutes\)/);
 });
 
+test('startup cleanup removes only empty native reply envelopes from assistant bubbles', () => {
+  assert.match(html, /function\s+isLeakedNativeReplyEnvelope\(message\)/);
+  const cleanup = html.slice(
+    html.indexOf('function isLeakedNativeReplyEnvelope'),
+    html.indexOf('function scrubEmptyReplyMessages')
+  );
+  assert.match(cleanup, /message\?\.role\s*!==\s*'assistant'/);
+  assert.match(cleanup, /startsWith\('native:'\)/);
+  assert.match(cleanup, /KNOWN_LEAKED_NATIVE_TURN_IDS\.has\(sourceTurnId\)/);
+  assert.match(cleanup, /JSON\.parse\(/);
+  assert.match(cleanup, /parsed\.reply\s*===\s*''/);
+  assert.match(cleanup, /Array\.isArray\(parsed\.usedFactIds\)/);
+  assert.match(html, /isLeakedNativeReplyEnvelope\(m\)/);
+});
+
 test('Android foreground proactive chat enters the native PROACTIVE_CHAT queue', () => {
   assert.match(html, /async function\s+queueAndroidProactiveTurn\(/);
   assert.match(html, /kind:\s*'PROACTIVE_CHAT'/);
