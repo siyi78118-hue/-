@@ -58,6 +58,33 @@ const relationshipStageReviewSchema = {
   }, ['current', 'recommended', 'confidence', 'reason', 'evidenceMessageIds', 'explicitMutualChange']), { type: 'null' }]
 };
 
+const conversationFrameSchema = objectSchema({
+  surfaceAct: { type: 'string' },
+  intentHypotheses: {
+    type: 'array',
+    items: objectSchema({
+      intent: { type: 'string' },
+      confidence: { type: 'number' },
+      evidenceMessageIds: stringArray()
+    }, ['intent', 'confidence', 'evidenceMessageIds'])
+  },
+  interactionMode: { type: 'string' },
+  emotionalTone: { type: 'string' },
+  relationshipMove: { type: 'string' },
+  initiative: objectSchema({
+    topicIntroducedBy: { type: 'string' },
+    suggestedNextCarrier: { type: 'string' },
+    reason: { type: 'string' }
+  }, ['topicIntroducedBy', 'suggestedNextCarrier', 'reason']),
+  activeHooks: stringArray(),
+  ambiguities: stringArray(),
+  responseRisks: stringArray(),
+  needsNuanceReview: { type: 'boolean' }
+}, [
+  'surfaceAct', 'intentHypotheses', 'interactionMode', 'emotionalTone', 'relationshipMove',
+  'initiative', 'activeHooks', 'ambiguities', 'responseRisks', 'needsNuanceReview'
+]);
+
 export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
   memory: objectSchema({
     query: { type: 'string' },
@@ -70,10 +97,11 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
     escalationReasons: stringArray(),
     speakerAmbiguity: { type: 'boolean' },
     commitmentRisk: { type: 'boolean' },
-    relationshipStageReview: relationshipStageReviewSchema
+    relationshipStageReview: relationshipStageReviewSchema,
+    conversationFrame: conversationFrameSchema
   }, [
     'query', 'keywords', 'candidates', 'requiresDeepMemory', 'escalationReasons',
-    'speakerAmbiguity', 'commitmentRisk', 'relationshipStageReview'
+    'speakerAmbiguity', 'commitmentRisk', 'relationshipStageReview', 'conversationFrame'
   ]),
   brain: objectSchema({
     action: { type: 'string', enum: ['send', 'skip'] },

@@ -38,6 +38,7 @@ export class CodexAppServerClient {
     this.store = options.store;
     this.requestTimeoutMs = Number(options.requestTimeoutMs) || 15_000;
     this.turnTimeoutMs = Number(options.turnTimeoutMs) || 180_000;
+    this.maxRoleTurns = Math.max(1, Number(options.maxRoleTurns) || 24);
     this.clientInfo = options.clientInfo || {
       name: 'yuqi_al_bridge',
       title: 'Yuqi AL Bridge',
@@ -246,8 +247,10 @@ export class CodexAppServerClient {
 
   async ensureThreadInternal(role) {
     await this.start();
-    const stored = this.store?.getSession?.(role) || '';
+    const sessionState = this.store?.getSessionState?.(role) || null;
+    const stored = sessionState?.threadId || this.store?.getSession?.(role) || '';
     if (!stored) return this.startRoleThread(role);
+    if (Number(sessionState?.turnCount || 0) >= this.maxRoleTurns) return this.startRoleThread(role);
     try {
       const result = await this.request('thread/resume', { threadId: stored });
       const threadId = result?.thread?.id;
@@ -297,6 +300,7 @@ export class CodexAppServerClient {
     });
     const turnId = result?.turn?.id;
     if (!turnId) throw new CodexProtocolError('turn/start returned no turn id');
+    this.store?.incrementSessionTurnCount?.(role);
     const key = `${threadId}:${turnId}`;
 
     const early = this.earlyCompletions.get(key);

@@ -11,7 +11,7 @@ import { YuqiStore } from '../src/store.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const fakeServer = join(here, 'fixtures', 'fake-app-server.mjs');
 
-async function fixture(run) {
+async function fixture(run, options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-codex-client-'));
   const logFile = join(dir, 'protocol.jsonl');
   const store = new YuqiStore(join(dir, 'runtime.sqlite'));
@@ -22,7 +22,8 @@ async function fixture(run) {
     store,
     env: { ...process.env, FAKE_APP_SERVER_LOG: logFile },
     requestTimeoutMs: 2_000,
-    turnTimeoutMs: 2_000
+    turnTimeoutMs: 2_000,
+    ...options
   });
   try {
     await run({ client, store, logFile });
@@ -92,6 +93,18 @@ test('keeps the three role sessions isolated', async () => fixture(async ({ clie
   assert.equal(store.getSession('supervisor'), supervisor.threadId);
 }));
 
+test('rotates a dedicated role thread after the configured successful turn count', async () => fixture(async ({ client, store, logFile }) => {
+  const first = await client.runTurn('brain', 'one');
+  const second = await client.runTurn('brain', 'two');
+  const third = await client.runTurn('brain', 'three');
+
+  assert.equal(second.threadId, first.threadId);
+  assert.notEqual(third.threadId, first.threadId);
+  assert.equal(store.getSession('brain'), third.threadId);
+  assert.deepEqual(store.getSessionState('brain'), { threadId: third.threadId, turnCount: 1 });
+  assert.equal(methods(logFile).filter(method => method === 'thread/start').length, 2);
+}, { maxRoleTurns: 2 }));
+
 test('collects only the final agent message from the matching turn', async () => fixture(async ({ client }) => {
   const result = await client.runTurn('brain', 'hello');
   assert.equal(result.text, 'reply:hello');
@@ -120,4 +133,21 @@ test('memory candidate objects use the strict nested schema required by the real
     'supersedes', 'origin', 'createdAt', 'verifiedAt'
   ]);
   assert.equal(candidate.properties.exactQuotes.items.additionalProperties, false);
+}));
+
+test('memory schema requires an evidence-linked ephemeral conversation frame', async () => fixture(async ({ client, logFile }) => {
+  await client.runTurn('memory', 'understand the current turn');
+  const started = protocolLines(logFile).find(item => item.method === 'turn/start');
+  const schema = started.params.outputSchema;
+  const frame = schema.properties.conversationFrame;
+
+  assert.ok(schema.required.includes('conversationFrame'));
+  assert.deepEqual(frame.required, [
+    'surfaceAct', 'intentHypotheses', 'interactionMode', 'emotionalTone', 'relationshipMove',
+    'initiative', 'activeHooks', 'ambiguities', 'responseRisks', 'needsNuanceReview'
+  ]);
+  assert.deepEqual(frame.properties.intentHypotheses.items.required, [
+    'intent', 'confidence', 'evidenceMessageIds'
+  ]);
+  assert.equal(frame.additionalProperties, false);
 }));

@@ -551,3 +551,16 @@ test('sync deltas are ordered, checksummed, and acknowledged independently', () 
   assert.equal(store.ackSync('phone', delta.at(-1).seq), delta.at(-1).seq);
   assert.equal(store.getSyncCursor('phone'), delta.at(-1).seq);
 }));
+
+test('role session turn counts reset and increment independently', () => withStore(({ store }) => {
+  store.setSession('brain', 'thr_brain');
+  assert.deepEqual(store.getSessionState('brain'), { threadId: 'thr_brain', turnCount: 0 });
+
+  store.incrementSessionTurnCount('brain');
+  store.incrementSessionTurnCount('brain');
+  assert.deepEqual(store.getSessionState('brain'), { threadId: 'thr_brain', turnCount: 2 });
+
+  store.setSession('brain', 'thr_replacement');
+  assert.deepEqual(store.getSessionState('brain'), { threadId: 'thr_replacement', turnCount: 0 });
+  assert.equal(store.getSessionState('memory'), null);
+}));

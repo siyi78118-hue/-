@@ -100,6 +100,75 @@ const normalOutputs = () => ({
   supervisor: ['{"approved":true,"issues":[]}']
 });
 
+function conversationFrame(overrides = {}) {
+  return {
+    surfaceAct: 'brief continuation',
+    intentHypotheses: [{
+      intent: 'keep the exchange moving without introducing a new topic',
+      confidence: 0.78,
+      evidenceMessageIds: ['msg_phone_11']
+    }],
+    interactionMode: 'light_conversation',
+    emotionalTone: 'playful',
+    relationshipMove: 'invite_continuation',
+    initiative: {
+      topicIntroducedBy: 'yuqi',
+      suggestedNextCarrier: 'yuqi',
+      reason: 'the user is responding to the existing hook'
+    },
+    activeHooks: ['continue the existing exchange'],
+    ambiguities: ['literal and relational readings are both possible'],
+    responseRisks: ['merely classifying or scoring the message'],
+    needsNuanceReview: false,
+    ...overrides
+  };
+}
+
+test('ephemeral conversation frame reaches the brain but never becomes a durable fact', async () => {
+  const frame = conversationFrame();
+  await withFixture({
+    memory: [JSON.stringify({
+      query: 'continue', keywords: ['continue'], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: ['{"action":"send","reply":"Then I will keep going.","paymentAction":null,"usedFactIds":[],"momentAction":null}']
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(11, 'go on'));
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    const memoryPacket = JSON.parse(store.getTurn(result.turnId).memoryPacketJson);
+
+    assert.deepEqual(brain.conversationFrame, frame);
+    assert.deepEqual(memoryPacket.conversationFrame, frame);
+    assert.equal(store.listFacts('yuqi').some(fact => fact.predicate === 'possibleIntent'), false);
+  });
+});
+
+test('a nuanced fast turn upgrades to supervisor without repeating memory', async () => {
+  const frame = conversationFrame({
+    interactionMode: 'ambiguous_banter',
+    ambiguities: ['literal and affiliative readings remain plausible'],
+    responseRisks: ['answering only the surface wording'],
+    needsNuanceReview: true
+  });
+  await withFixture({
+    memory: [JSON.stringify({
+      query: 'brief response', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: ['{"action":"send","reply":"I caught the tone; I will carry this one.","paymentAction":null,"usedFactIds":[],"momentAction":null}'],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(12, 'sure, go ahead'));
+
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    assert.equal(codex.calls.filter(call => call.role === 'memory').length, 1);
+    assert.equal(store.getTurn(result.turnId).route, 'fast_to_deep');
+    assert.ok(store.getTurn(result.turnId).routeReasons.includes('conversation_nuance'));
+  });
+});
+
 test('fast route runs Terra memory and Sol brain without supervisor', async () => {
   await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
     const result = await orchestrator.process(envelope());
@@ -180,7 +249,7 @@ test('fast memory escalation starts a new Sol memory turn before brain', async (
   });
 });
 
-test('passes at most 200 recent raw messages with stable speaker identities', async () => {
+test('keeps 200 evidence messages but gives brain and supervisor 24 deduplicated history messages', async () => {
   await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
     for (let index = 1; index <= 205; index += 1) {
       store.putMessage({
@@ -195,10 +264,20 @@ test('passes at most 200 recent raw messages with stable speaker identities', as
         origin: 'phone'
       });
     }
-    await orchestrator.process(envelope());
+    const input = envelope();
+    orchestrator.accept(input);
+    store.setTurnRoute(input.turnId, 'deep', ['context_window_test']);
+    await orchestrator.run(input.turnId);
     const memoryInput = codex.calls.find(call => call.role === 'memory').input;
+    const brainInput = codex.calls.find(call => call.role === 'brain').input;
+    const supervisorInput = codex.calls.find(call => call.role === 'supervisor').input;
     assert.equal(memoryInput.recentMessages.length, 200);
     assert.ok(memoryInput.recentMessages.every(message => message.messageId && message.speakerId));
+    assert.equal(brainInput.recentMessages.length, 24);
+    assert.equal(supervisorInput.recentMessages.length, 24);
+    assert.equal(brainInput.recentMessages.some(message => message.messageId === input.message.messageId), false);
+    assert.equal(supervisorInput.recentMessages.some(message => message.messageId === input.message.messageId), false);
+    assert.equal(brainInput.currentUserMessage.messageId, input.message.messageId);
   });
 });
 

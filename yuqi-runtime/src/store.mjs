@@ -266,6 +266,7 @@ export class YuqiStore {
       CREATE TABLE IF NOT EXISTS sessions (
         role TEXT PRIMARY KEY,
         thread_id TEXT NOT NULL,
+        turn_count INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL
       );
 
@@ -318,6 +319,8 @@ export class YuqiStore {
     if (!turnColumns.has('route_reasons_json')) this.db.exec("ALTER TABLE turns ADD COLUMN route_reasons_json TEXT NOT NULL DEFAULT '[]';");
     const deliveryColumns = new Set(this.db.prepare('PRAGMA table_info(cloud_deliveries)').all().map(row => row.name));
     if (!deliveryColumns.has('confirmed_at')) this.db.exec('ALTER TABLE cloud_deliveries ADD COLUMN confirmed_at INTEGER;');
+    const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(sessions)').all().map(row => row.name));
+    if (!sessionColumns.has('turn_count')) this.db.exec('ALTER TABLE sessions ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0;');
     this.db.exec(`
       UPDATE cloud_deliveries
       SET state = 'mailboxed'
@@ -978,14 +981,31 @@ export class YuqiStore {
     if (!['memory', 'brain', 'supervisor'].includes(role)) throw new Error('invalid session role');
     if (!String(threadId || '').trim()) throw new Error('invalid thread id');
     this.db.prepare(`
-      INSERT INTO sessions(role, thread_id, updated_at) VALUES (?, ?, ?)
-      ON CONFLICT(role) DO UPDATE SET thread_id = excluded.thread_id, updated_at = excluded.updated_at
+      INSERT INTO sessions(role, thread_id, turn_count, updated_at) VALUES (?, ?, 0, ?)
+      ON CONFLICT(role) DO UPDATE SET
+        thread_id = excluded.thread_id,
+        turn_count = 0,
+        updated_at = excluded.updated_at
     `).run(role, String(threadId), now());
     return String(threadId);
   }
 
   getSession(role) {
     return String(this.db.prepare('SELECT thread_id FROM sessions WHERE role = ?').get(role)?.thread_id || '');
+  }
+
+  getSessionState(role) {
+    const row = this.db.prepare('SELECT thread_id, turn_count FROM sessions WHERE role = ?').get(role);
+    if (!row) return null;
+    return { threadId: String(row.thread_id), turnCount: Number(row.turn_count || 0) };
+  }
+
+  incrementSessionTurnCount(role) {
+    const result = this.db.prepare(`
+      UPDATE sessions SET turn_count = turn_count + 1, updated_at = ? WHERE role = ?
+    `).run(now(), role);
+    if (!result.changes) throw new Error('session not found');
+    return this.getSessionState(role);
   }
 
   putPresetVersion(version) {

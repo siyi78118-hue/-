@@ -5,6 +5,7 @@ import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route-policy.mjs';
 import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stage.mjs';
 import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
+import { buildGenerationWindow } from './conversation-context.mjs';
 
 function parseRoleJson(text, role) {
   const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
@@ -76,6 +77,35 @@ function normalizeSupervisorResult(reviewed) {
     ? reviewed.decision
     : legacyDecision || 'reject';
   return { ...reviewed, decision, approved: decision === 'approve' };
+}
+
+function normalizeConversationFrame(frame) {
+  const source = frame && typeof frame === 'object' && !Array.isArray(frame) ? frame : {};
+  const initiative = source.initiative && typeof source.initiative === 'object' && !Array.isArray(source.initiative)
+    ? source.initiative
+    : {};
+  return {
+    surfaceAct: String(source.surfaceAct || ''),
+    intentHypotheses: Array.isArray(source.intentHypotheses)
+      ? source.intentHypotheses.map(item => ({
+          intent: String(item?.intent || ''),
+          confidence: Math.max(0, Math.min(1, Number(item?.confidence) || 0)),
+          evidenceMessageIds: Array.isArray(item?.evidenceMessageIds) ? item.evidenceMessageIds.map(String) : []
+        })).filter(item => item.intent)
+      : [],
+    interactionMode: String(source.interactionMode || ''),
+    emotionalTone: String(source.emotionalTone || ''),
+    relationshipMove: String(source.relationshipMove || ''),
+    initiative: {
+      topicIntroducedBy: String(initiative.topicIntroducedBy || 'unclear'),
+      suggestedNextCarrier: String(initiative.suggestedNextCarrier || 'unclear'),
+      reason: String(initiative.reason || '')
+    },
+    activeHooks: Array.isArray(source.activeHooks) ? source.activeHooks.map(String) : [],
+    ambiguities: Array.isArray(source.ambiguities) ? source.ambiguities.map(String) : [],
+    responseRisks: Array.isArray(source.responseRisks) ? source.responseRisks.map(String) : [],
+    needsNuanceReview: source.needsNuanceReview === true
+  };
 }
 
 function elapsedText(value) {
@@ -162,7 +192,7 @@ function repairReplyForDelivery(reply, kind = 'DIRECT_REPLY') {
 export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
-    roleProfiles = DEFAULT_PROFILES
+    generationContextLimit = 24, roleProfiles = DEFAULT_PROFILES
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
@@ -171,6 +201,7 @@ export class YuqiOrchestrator {
     this.workerId = workerId;
     this.clock = clock;
     this.contextLimit = Math.max(1, Math.min(5000, Number(contextLimit) || 200));
+    this.generationContextLimit = Math.max(1, Math.min(200, Number(generationContextLimit) || 24));
     this.roleProfiles = roleProfiles;
   }
 
@@ -321,6 +352,12 @@ export class YuqiOrchestrator {
       );
       current = this.store.getTurn(envelope.turnId);
     }
+    const conversationFrame = normalizeConversationFrame(memoryResult.conversationFrame);
+    current = this.store.getTurn(envelope.turnId);
+    if (current.route === 'fast' && conversationFrame.needsNuanceReview) {
+      this.store.setTurnRoute(envelope.turnId, 'fast_to_deep', ['conversation_nuance']);
+      current = this.store.getTurn(envelope.turnId);
+    }
     const candidates = Array.isArray(memoryResult.candidates) ? memoryResult.candidates : [];
     const committedFacts = commitVerifiedFacts(this.store, candidates, recentMessages);
     const relationship = resolveRelationshipStage(
@@ -339,6 +376,7 @@ export class YuqiOrchestrator {
       speakerAmbiguity: memoryResult.speakerAmbiguity === true,
       commitmentRisk: memoryResult.commitmentRisk === true,
       relationshipStageReview: memoryResult.relationshipStageReview || null,
+      conversationFrame,
       effectiveRelationshipStage: relationship.stage,
       relationshipStageAction: relationship.action
     };
@@ -348,7 +386,11 @@ export class YuqiOrchestrator {
   }
 
   async completeBrain(envelope, current) {
-    const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const stateMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const recentMessages = buildGenerationWindow(stateMessages, {
+      currentMessageId: envelope.message?.messageId,
+      limit: this.generationContextLimit
+    });
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     const baseScene = sceneFromEnvelope(envelope);
     const scene = {
@@ -356,7 +398,7 @@ export class YuqiOrchestrator {
       relationshipStage: memoryPacket.effectiveRelationshipStage || baseScene.relationshipStage
     };
     const interactionState = buildAuthoritativeInteractionState({
-      envelope, messages: recentMessages, currentStage: scene.relationshipStage, now: this.clock()
+      envelope, messages: stateMessages, currentStage: scene.relationshipStage, now: this.clock()
     });
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
@@ -380,6 +422,7 @@ export class YuqiOrchestrator {
       recentMessages,
       interactionState,
       evidencePack,
+      conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
       ...(previousSupervisor?.decision === 'rewrite' ? {
         rejectedDraft: previousDraft,
         supervisorIssues: Array.isArray(previousSupervisor.issues) ? previousSupervisor.issues : []
@@ -395,7 +438,11 @@ export class YuqiOrchestrator {
 
   async completeSupervisor(envelope, current) {
     const draft = parseRoleJson(current.brainDraftJson, 'brain');
-    const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const stateMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const recentMessages = buildGenerationWindow(stateMessages, {
+      currentMessageId: envelope.message?.messageId,
+      limit: this.generationContextLimit
+    });
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     const baseScene = sceneFromEnvelope(envelope);
     const scene = {
@@ -403,7 +450,7 @@ export class YuqiOrchestrator {
       relationshipStage: memoryPacket.effectiveRelationshipStage || baseScene.relationshipStage
     };
     const interactionState = buildAuthoritativeInteractionState({
-      envelope, messages: recentMessages, currentStage: scene.relationshipStage, now: this.clock()
+      envelope, messages: stateMessages, currentStage: scene.relationshipStage, now: this.clock()
     });
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
@@ -422,6 +469,7 @@ export class YuqiOrchestrator {
       recentMessages,
       interactionState,
       evidencePack,
+      conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
       draft
     };
     const reviewed = await this.runStructuredRole(
