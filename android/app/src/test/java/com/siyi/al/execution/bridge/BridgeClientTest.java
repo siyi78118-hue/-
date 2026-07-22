@@ -63,6 +63,23 @@ public class BridgeClientTest {
         assertEquals("pending", payment.getString("status"));
     }
 
+    @Test public void directTurnPreservesTheDynamicRelationshipSceneForThePcRuntime() throws Exception {
+        TurnSubmission submission = new TurnSubmission(
+            "turn_phone_scene_1", "yuqi", "msg_phone_scene_1", TurnKind.DIRECT_REPLY,
+            "{\"message\":{\"messageId\":\"msg_phone_scene_1\",\"content\":\"在吗\",\"sentAt\":1784713105609}}",
+            "{\"scene\":{\"playerName\":\"姜隽倚\",\"characterName\":\"虞栖\","
+                + "\"relationshipStage\":{\"id\":\"familiar\",\"label\":\"熟悉\",\"content\":\"稳定联系\"},"
+                + "\"conversationExtraPrompt\":\"今天很忙\"}}", null, 1784713105609L
+        );
+
+        JSONObject scene = BridgeInput.envelope(submission, config("http://lan.example"))
+            .getJSONObject("context").getJSONObject("scene");
+
+        assertEquals("姜隽倚", scene.getString("playerName"));
+        assertEquals("familiar", scene.getJSONObject("relationshipStage").getString("id"));
+        assertEquals("今天很忙", scene.getString("conversationExtraPrompt"));
+    }
+
     @Test public void proactiveEnvelopeContainsATriggerAndNeverFabricatesAUserMessage() throws Exception {
         TurnSubmission submission = new TurnSubmission(
             "turn_proactive_1", "yuqi", "trigger_proactive_1", TurnKind.PROACTIVE_CHAT,

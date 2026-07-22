@@ -144,6 +144,12 @@ public final class ExecutionEngine {
         if ("received".equals(result.paymentStatus) || "refused".equals(result.paymentStatus) || "pending".equals(result.paymentStatus)) {
             bridgedReply += "\n<al_payment>" + new JSONObject().put("status", result.paymentStatus).toString() + "</al_payment>";
         }
+        if (!result.relationshipStageActionJson.isEmpty()) {
+            bridgedReply += "\n<al_relationship_stage>" + result.relationshipStageActionJson + "</al_relationship_stage>";
+        }
+        if (!result.momentActionJson.isEmpty()) {
+            bridgedReply += "\n<al_moment_action>" + result.momentActionJson + "</al_moment_action>";
+        }
         store.saveRawReply(turn.turnId, attempt.attemptId, bridgedReply, clock.now());
         attempt.rawReply = bridgedReply;
         commitStoredReply(turn, attempt);

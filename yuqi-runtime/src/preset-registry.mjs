@@ -88,7 +88,13 @@ export class PresetRegistry {
   compileFor(role, scene = {}) {
     if (!ROLES.has(role)) throw new Error(`unknown preset role: ${role}`);
     const preset = this.current();
-    const stage = String(scene.stage || 'initial');
+    const dynamic = scene.scene && typeof scene.scene === 'object' ? scene.scene : scene;
+    const relationshipStage = dynamic.relationshipStage && typeof dynamic.relationshipStage === 'object'
+      ? dynamic.relationshipStage
+      : { id: String(scene.stage || 'new'), label: scene.stage === 'initial' ? '初识' : String(scene.stage || '初识'), content: '' };
+    const stageId = String(relationshipStage.id || 'new');
+    const stageLabel = String(relationshipStage.label || (stageId === 'initial' || stageId === 'new' ? '初识' : stageId));
+    const stageContent = String(relationshipStage.content || '').trim();
     const revealedFactIds = Array.isArray(scene.revealedFactIds) ? scene.revealedFactIds : [];
     const roleModules = role === 'memory'
       ? [preset.modules.memory]
@@ -104,10 +110,16 @@ export class PresetRegistry {
       ...roleModules,
       '',
       '## 本轮运行边界',
-      `当前关系阶段：${stage === 'initial' ? '初次认识' : stage}`,
+      `当前关系阶段：${stageLabel}（${stageId === 'initial' ? 'new' : stageId}）`,
+      stageContent ? `当前阶段人设补充：\n${stageContent}` : '',
+      dynamic.playerName ? `玩家昵称：${dynamic.playerName}` : '',
+      dynamic.characterName ? `角色昵称：${dynamic.characterName}` : '',
+      dynamic.kind ? `当前场景：${dynamic.kind}` : '',
+      dynamic.globalExtraPrompt ? `全局补充：\n${dynamic.globalExtraPrompt}` : '',
+      dynamic.conversationExtraPrompt ? `当前会话补充：\n${dynamic.conversationExtraPrompt}` : '',
       `允许引用的已揭示事实 ID：${revealedFactIds.length ? revealedFactIds.join(', ') : '无'}`,
       `当前预设版本：${preset.version}`
-    ].join('\n');
+    ].filter(Boolean).join('\n');
   }
 
   proposeAnnotation(annotation) {

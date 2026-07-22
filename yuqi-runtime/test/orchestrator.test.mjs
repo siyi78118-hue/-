@@ -50,6 +50,24 @@ function triggerEnvelope(seq = 20) {
   };
 }
 
+function stagedEnvelope(seq = 90) {
+  const value = envelope(seq, '我们好像比刚认识时熟多了');
+  value.protocolVersion = 2;
+  value.kind = 'DIRECT_REPLY';
+  value.context = {
+    scene: {
+      playerName: '阿予',
+      characterName: '虞栖',
+      relationshipStage: { id: 'new', label: '初识', content: '谨慎、保留。' },
+      stageCatalog: [
+        { id: 'new', label: '初识', content: '谨慎、保留。' },
+        { id: 'acquainted', label: '熟悉', content: '已有共同经历，语气自然。' }
+      ]
+    }
+  };
+  return value;
+}
+
 class FakeCodex {
   constructor(outputs = {}) {
     this.outputs = Object.fromEntries(Object.entries(outputs).map(([role, values]) => [role, [...values]]));
@@ -107,6 +125,37 @@ test('deep relationship route runs Sol memory, Sol brain and Terra supervisor', 
       ['supervisor', 'gpt-5.6-terra', 'medium']
     ]);
     assert.equal(store.getTurn(result.turnId).route, 'deep');
+  });
+});
+
+test('an evidence-backed stage review becomes the authoritative scene for brain, supervisor and result', async () => {
+  const staged = stagedEnvelope();
+  await withFixture({
+    memory: [JSON.stringify({
+      query: '关系阶段', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: {
+        current: 'new', recommended: 'acquainted', confidence: 0.91,
+        reason: '双方已有多次真实交流', evidenceMessageIds: [staged.message.messageId, 'msg_stage_history'],
+        explicitMutualChange: false
+      }
+    })],
+    brain: ['{"action":"send","reply":"确实，已经不像刚认识了。","paymentAction":null,"usedFactIds":[]}'],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    store.putMessage({
+      messageId: 'msg_stage_history', turnId: 'turn_stage_history', characterId: 'yuqi', speakerId: 'yuqi',
+      speakerType: 'character', recipientId: 'user', content: '上次的聊天', sentAt: staged.message.sentAt - 1000, origin: 'codex'
+    });
+    orchestrator.accept(staged);
+    store.setTurnRoute(staged.turnId, 'deep', ['relationship_stage_test']);
+    const result = await orchestrator.run(staged.turnId);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    const supervisor = codex.calls.find(call => call.role === 'supervisor').input;
+    assert.equal(brain.scene.relationshipStage.id, 'acquainted');
+    assert.match(brain.preset, /已有共同经历/);
+    assert.equal(supervisor.scene.relationshipStage.id, 'acquainted');
+    assert.equal(result.relationshipStageAction.to, 'acquainted');
   });
 });
 
@@ -249,6 +298,25 @@ test('an automatic brain may deliberately stay silent', async () => {
   }, async ({ store, orchestrator }) => {
     const result = await orchestrator.process(triggerEnvelope(64));
     assert.deepEqual({ action: result.action, reply: result.reply }, { action: 'skip', reply: null });
+    assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 0);
+  });
+});
+
+test('moment interaction is handled by the chat brain as a structured phone action, not a private message', async () => {
+  const momentTurn = triggerEnvelope(96);
+  momentTurn.kind = 'MOMENT_INTERACTION';
+  momentTurn.trigger.triggerType = 'moment_interaction';
+  momentTurn.trigger.context.input = { moment: { id: 'moment_96', text: '新买的乌龙奶茶' } };
+  await withFixture({
+    memory: ['{"query":"moment","keywords":[],"candidates":[]}'],
+    brain: ['{"action":"send","reply":"","paymentAction":null,"usedFactIds":[],"momentAction":{"momentId":"moment_96","like":true,"comment":"这杯看着确实不错","replyToCommentId":null}}'],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(momentTurn);
+    assert.equal(result.momentAction.momentId, 'moment_96');
+    assert.equal(result.momentAction.like, true);
+    assert.equal(result.reply, null);
+    assert.equal(codex.calls.find(call => call.role === 'brain').input.currentTrigger.context.input.moment.id, 'moment_96');
     assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 0);
   });
 });

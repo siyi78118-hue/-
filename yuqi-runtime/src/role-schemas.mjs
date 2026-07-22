@@ -47,6 +47,17 @@ const factCandidateSchema = objectSchema({
   'supersedes', 'origin', 'createdAt', 'verifiedAt'
 ]);
 
+const relationshipStageReviewSchema = {
+  anyOf: [objectSchema({
+    current: { type: 'string' },
+    recommended: { type: 'string' },
+    confidence: { type: 'number' },
+    reason: { type: 'string' },
+    evidenceMessageIds: stringArray(),
+    explicitMutualChange: { type: 'boolean' }
+  }, ['current', 'recommended', 'confidence', 'reason', 'evidenceMessageIds', 'explicitMutualChange']), { type: 'null' }]
+};
+
 export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
   memory: objectSchema({
     query: { type: 'string' },
@@ -58,10 +69,11 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
     requiresDeepMemory: { type: 'boolean' },
     escalationReasons: stringArray(),
     speakerAmbiguity: { type: 'boolean' },
-    commitmentRisk: { type: 'boolean' }
+    commitmentRisk: { type: 'boolean' },
+    relationshipStageReview: relationshipStageReviewSchema
   }, [
     'query', 'keywords', 'candidates', 'requiresDeepMemory', 'escalationReasons',
-    'speakerAmbiguity', 'commitmentRisk'
+    'speakerAmbiguity', 'commitmentRisk', 'relationshipStageReview'
   ]),
   brain: objectSchema({
     action: { type: 'string', enum: ['send', 'skip'] },
@@ -70,10 +82,16 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
       { type: 'string', enum: ['received', 'refused', 'pending'] },
       { type: 'null' }
     ] },
-    usedFactIds: stringArray()
-  }, ['action', 'reply', 'paymentAction', 'usedFactIds']),
+    usedFactIds: stringArray(),
+    momentAction: { anyOf: [objectSchema({
+      momentId: { type: 'string' },
+      like: { type: 'boolean' },
+      comment: { type: 'string' },
+      replyToCommentId: nullable('string')
+    }, ['momentId', 'like', 'comment', 'replyToCommentId']), { type: 'null' }] }
+  }, ['action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction']),
   supervisor: objectSchema({
-    approved: { type: 'boolean' },
+    decision: { type: 'string', enum: ['approve', 'rewrite', 'skip', 'reject'] },
     issues: {
       type: 'array',
       items: objectSchema({
@@ -81,5 +99,5 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
         message: { type: 'string' }
       }, ['code', 'message'])
     }
-  }, ['approved', 'issues'])
+  }, ['decision', 'issues'])
 });

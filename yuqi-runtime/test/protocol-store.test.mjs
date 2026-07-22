@@ -137,6 +137,43 @@ test('protocol v2 direct turn preserves validated pending payment context', () =
   });
 });
 
+test('protocol v2 direct turn preserves a validated dynamic relationship scene', () => {
+  const envelope = validateEnvelope(validV2Envelope({
+    context: {
+      scene: {
+        playerName: '姜隽倚',
+        characterName: '虞栖',
+        relationshipStage: {
+          id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。',
+          since: 1784300000000, reason: '持续交流', confidence: 0.9
+        },
+        conversationExtraPrompt: '她今天有点忙。',
+        globalExtraPrompt: '保持自然。',
+        stageCatalog: [
+          { id: 'new', label: '初识', content: '保持普通社交边界。' },
+          { id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。' }
+        ],
+        ignoredBackstageField: 'must not survive'
+      }
+    }
+  }));
+
+  assert.deepEqual(envelope.context.scene, {
+    playerName: '姜隽倚',
+    characterName: '虞栖',
+    relationshipStage: {
+      id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。',
+      since: 1784300000000, reason: '持续交流', confidence: 0.9
+    },
+    conversationExtraPrompt: '她今天有点忙。',
+    globalExtraPrompt: '保持自然。',
+    stageCatalog: [
+      { id: 'new', label: '初识', content: '保持普通社交边界。' },
+      { id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。' }
+    ]
+  });
+});
+
 test('public committed status exposes the structured payment action', () => {
   const status = publicTurnStatus({
     turnId: 'turn_payment_status_1',

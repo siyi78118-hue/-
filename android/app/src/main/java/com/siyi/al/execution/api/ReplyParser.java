@@ -11,6 +11,8 @@ import org.json.JSONObject;
 public final class ReplyParser {
     private static final Pattern PAYMENT = Pattern.compile("<al_send_payment>([\\s\\S]*?)</al_send_payment>", Pattern.CASE_INSENSITIVE);
     private static final Pattern PAYMENT_STATUS = Pattern.compile("<al_payment>([\\s\\S]*?)</al_payment>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern RELATIONSHIP_STAGE = Pattern.compile("<al_relationship_stage>([\\s\\S]*?)</al_relationship_stage>", Pattern.CASE_INSENSITIVE);
+    private static final Pattern MOMENT_ACTION = Pattern.compile("<al_moment_action>([\\s\\S]*?)</al_moment_action>", Pattern.CASE_INSENSITIVE);
     private static final Pattern SCHEDULE = Pattern.compile("<al_schedule>([\\s\\S]*?)</al_schedule>", Pattern.CASE_INSENSITIVE);
     private static final Pattern PLAN = Pattern.compile("<al_plan>([\\s\\S]*?)</al_plan>", Pattern.CASE_INSENSITIVE);
     private static final Pattern NO_REPLY = Pattern.compile("^[（(]?对方没有回复[）)]?[。！!]?$", Pattern.CASE_INSENSITIVE);
@@ -28,6 +30,8 @@ public final class ReplyParser {
         List<String> textBubbles = new ArrayList<>();
         JSONObject payment = payment(source);
         JSONObject paymentStatus = directive(PAYMENT_STATUS, source);
+        JSONObject relationshipStage = directive(RELATIONSHIP_STAGE, source);
+        JSONObject momentAction = directive(MOMENT_ACTION, source);
         JSONObject schedule = directive(SCHEDULE, source);
         JSONObject plan = directive(PLAN, source);
         String clean = unwrapTextJson(clean(source));
@@ -59,6 +63,13 @@ public final class ReplyParser {
             if ("received".equals(status) || "pending".equals(status) || "refused".equals(status)) {
                 add(parts, turnId, attemptId, "PAYMENT_STATUS", "", paymentStatus.toString());
             }
+        }
+        if (relationshipStage != null && !relationshipStage.optString("to", "").trim().isEmpty()) {
+            add(parts, turnId, attemptId, "RELATIONSHIP_STAGE", "", relationshipStage.toString());
+        }
+        if (momentAction != null && !momentAction.optString("momentId", "").trim().isEmpty()
+            && (momentAction.optBoolean("like", false) || !momentAction.optString("comment", "").trim().isEmpty())) {
+            add(parts, turnId, attemptId, "MOMENT_ACTION", "", momentAction.toString());
         }
         if (schedule != null && !schedule.optString("nextProactiveAt", "").trim().isEmpty()) {
             add(parts, turnId, attemptId, "SCHEDULE", "", schedule.toString());
@@ -96,6 +107,8 @@ public final class ReplyParser {
             .replaceAll("(?is)<al_schedule>[\\s\\S]*?</al_schedule>", "")
             .replaceAll("(?is)<al_plan>[\\s\\S]*?</al_plan>", "")
             .replaceAll("(?is)<al_payment>[\\s\\S]*?</al_payment>", "")
+            .replaceAll("(?is)<al_relationship_stage>[\\s\\S]*?</al_relationship_stage>", "")
+            .replaceAll("(?is)<al_moment_action>[\\s\\S]*?</al_moment_action>", "")
             .replaceAll("(?m)^```(?:json)?|```$", "")
             .replaceAll("(?m)^(?:【|\\[)\\s*(?:发送时间|历史消息元数据).*?(?:】|\\])\\s*", "")
             .trim();

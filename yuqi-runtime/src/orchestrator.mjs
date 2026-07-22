@@ -3,6 +3,8 @@ import { contentHash } from './protocol.mjs';
 import { buildEvidencePack } from './retrieval.mjs';
 import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route-policy.mjs';
+import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stage.mjs';
+import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
 
 function parseRoleJson(text, role) {
   const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
@@ -31,6 +33,14 @@ export function normalizeBrainDraft(draft) {
     action: draft?.action === 'skip' ? 'skip' : 'send',
     reply: String(draft?.reply || '').trim(),
     paymentAction,
+    momentAction: draft?.momentAction && typeof draft.momentAction === 'object' && !Array.isArray(draft.momentAction)
+      ? {
+          momentId: String(draft.momentAction.momentId || ''),
+          like: draft.momentAction.like === true,
+          comment: String(draft.momentAction.comment || '').trim().slice(0, 1000),
+          replyToCommentId: draft.momentAction.replyToCommentId ? String(draft.momentAction.replyToCommentId) : null
+        }
+      : null,
     usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : []
   };
   for (let depth = 0; depth < 3 && normalized.reply.startsWith('{') && normalized.reply.endsWith('}'); depth += 1) {
@@ -49,8 +59,23 @@ export function normalizeBrainDraft(draft) {
   return normalized;
 }
 
-function isAutomaticKind(kind) {
-  return ['ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_PRIVATE', 'PROACTIVE_CHAT', 'PROACTIVE_MOMENT'].includes(kind);
+function isMomentKind(kind) {
+  return kind === 'MOMENT_INTERACTION' || kind === 'MOMENT_REPLY';
+}
+
+export function isAutomaticKind(kind) {
+  return [
+    'ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE',
+    'PROACTIVE_CHAT', 'PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'
+  ].includes(kind);
+}
+
+function normalizeSupervisorResult(reviewed) {
+  const legacyDecision = reviewed?.approved === true ? 'approve' : reviewed?.approved === false ? 'rewrite' : null;
+  const decision = ['approve', 'rewrite', 'skip', 'reject'].includes(reviewed?.decision)
+    ? reviewed.decision
+    : legacyDecision || 'reject';
+  return { ...reviewed, decision, approved: decision === 'approve' };
 }
 
 function elapsedText(value) {
@@ -75,6 +100,8 @@ function delayClass(milliseconds) {
 }
 
 export function buildInteractionState(envelope, recentMessages, computedAt = Date.now()) {
+  return buildAuthoritativeInteractionState({ envelope, messages: recentMessages, now: computedAt });
+  /* istanbul ignore next -- retained temporarily for source-level compatibility */
   const messages = [...recentMessages].sort((left, right) => Number(left.sentAt || 0) - Number(right.sentAt || 0));
   const currentTime = Number(computedAt || Date.now());
   const sourceOccurredAt = Number(
@@ -208,7 +235,11 @@ export class YuqiOrchestrator {
             );
             continue;
           }
-          const hard = hardValidateReply(draft.reply);
+          const validMomentAction = isMomentKind(envelope.kind)
+            && draft.momentAction?.momentId
+            && (draft.momentAction.like || draft.momentAction.comment);
+          if (isMomentKind(envelope.kind) && !validMomentAction) draft = { ...draft, action: 'skip', reply: '' };
+          const hard = validMomentAction ? { ok: true, issues: [] } : hardValidateReply(draft.reply);
           const repairedDraft = hard.ok
             ? draft
             : isAutomaticKind(envelope.kind) && !String(draft.reply || '').trim()
@@ -260,9 +291,11 @@ export class YuqiOrchestrator {
 
   async completeMemory(envelope) {
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const scene = sceneFromEnvelope(envelope);
     const memoryRequest = {
       task: envelope.message ? 'retrieve_and_extract_evidence' : 'retrieve_context_for_trigger',
-      preset: this.presets.compileFor('memory', { stage: 'initial' }),
+      preset: this.presets.compileFor('memory', { scene: { ...scene, kind: envelope.kind } }),
+      scene,
       ...(envelope.message
         ? { currentMessageId: envelope.message.messageId }
         : { currentTrigger: envelope.trigger, triggerIsNotUserEvidence: true }),
@@ -290,6 +323,9 @@ export class YuqiOrchestrator {
     }
     const candidates = Array.isArray(memoryResult.candidates) ? memoryResult.candidates : [];
     const committedFacts = commitVerifiedFacts(this.store, candidates, recentMessages);
+    const relationship = resolveRelationshipStage(
+      scene, memoryResult.relationshipStageReview, recentMessages, this.clock()
+    );
     const memoryPacket = {
       query: String(memoryResult.query || envelope.message?.content || envelope.trigger?.triggerType || ''),
       keywords: Array.isArray(memoryResult.keywords) ? memoryResult.keywords.map(String) : [],
@@ -301,7 +337,10 @@ export class YuqiOrchestrator {
       requiresDeepMemory: memoryResult.requiresDeepMemory === true,
       escalationReasons: Array.isArray(memoryResult.escalationReasons) ? memoryResult.escalationReasons.map(String) : [],
       speakerAmbiguity: memoryResult.speakerAmbiguity === true,
-      commitmentRisk: memoryResult.commitmentRisk === true
+      commitmentRisk: memoryResult.commitmentRisk === true,
+      relationshipStageReview: memoryResult.relationshipStageReview || null,
+      effectiveRelationshipStage: relationship.stage,
+      relationshipStageAction: relationship.action
     };
     this.store.advanceTurn(envelope.turnId, 'memory_running', 'memory_done', {
       memoryPacketJson: JSON.stringify(memoryPacket)
@@ -310,28 +349,38 @@ export class YuqiOrchestrator {
 
   async completeBrain(envelope, current) {
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
-    const interactionState = buildInteractionState(envelope, recentMessages, this.clock());
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
+    const baseScene = sceneFromEnvelope(envelope);
+    const scene = {
+      ...baseScene,
+      relationshipStage: memoryPacket.effectiveRelationshipStage || baseScene.relationshipStage
+    };
+    const interactionState = buildAuthoritativeInteractionState({
+      envelope, messages: recentMessages, currentStage: scene.relationshipStage, now: this.clock()
+    });
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
       query: memoryPacket.query,
       keywords: memoryPacket.keywords,
       limit: 12
     });
-    const previousSupervisor = current.supervisorJson ? parseRoleJson(current.supervisorJson, 'supervisor') : null;
+    const previousSupervisor = current.supervisorJson
+      ? normalizeSupervisorResult(parseRoleJson(current.supervisorJson, 'supervisor'))
+      : null;
     const previousDraft = current.brainDraftJson ? parseRoleJson(current.brainDraftJson, 'brain') : null;
     const brainRequest = {
-      task: previousSupervisor?.approved === false ? 'rewrite_as_yuqi' : 'reply_as_yuqi',
+      task: previousSupervisor?.decision === 'rewrite' ? 'rewrite_as_yuqi' : 'reply_as_yuqi',
       preset: this.presets.compileFor('brain', {
-        stage: 'initial',
+        scene: { ...scene, kind: envelope.kind },
         revealedFactIds: evidencePack.facts.map(fact => fact.factId)
       }),
+      scene,
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       recentMessages,
       interactionState,
       evidencePack,
-      ...(previousSupervisor?.approved === false ? {
+      ...(previousSupervisor?.decision === 'rewrite' ? {
         rejectedDraft: previousDraft,
         supervisorIssues: Array.isArray(previousSupervisor.issues) ? previousSupervisor.issues : []
       } : {})
@@ -347,8 +396,15 @@ export class YuqiOrchestrator {
   async completeSupervisor(envelope, current) {
     const draft = parseRoleJson(current.brainDraftJson, 'brain');
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
-    const interactionState = buildInteractionState(envelope, recentMessages, this.clock());
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
+    const baseScene = sceneFromEnvelope(envelope);
+    const scene = {
+      ...baseScene,
+      relationshipStage: memoryPacket.effectiveRelationshipStage || baseScene.relationshipStage
+    };
+    const interactionState = buildAuthoritativeInteractionState({
+      envelope, messages: recentMessages, currentStage: scene.relationshipStage, now: this.clock()
+    });
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
       query: memoryPacket.query,
@@ -359,7 +415,8 @@ export class YuqiOrchestrator {
     const attempt = Number(previous?.attempt || 0) + 1;
     const supervisorRequest = {
       task: 'review_yuqi_reply',
-      preset: this.presets.compileFor('supervisor', { stage: 'initial' }),
+      preset: this.presets.compileFor('supervisor', { scene: { ...scene, kind: envelope.kind } }),
+      scene,
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       recentMessages,
@@ -372,12 +429,30 @@ export class YuqiOrchestrator {
       roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
       `supervisor_${attempt}`
     );
-    const supervisorResult = { ...reviewed, attempt };
-    if (supervisorResult.approved === true) {
+    const supervisorResult = { ...normalizeSupervisorResult(reviewed), attempt };
+    if (supervisorResult.decision === 'approve') {
       this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
         supervisorJson: JSON.stringify(supervisorResult)
       });
       return;
+    }
+    if (supervisorResult.decision === 'skip') {
+      if (!isAutomaticKind(envelope.kind)) throw new Error('supervisor cannot skip a direct reply');
+      this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
+        supervisorJson: JSON.stringify(supervisorResult),
+        brainDraftJson: JSON.stringify({ ...draft, action: 'skip', reply: '' })
+      });
+      return;
+    }
+    if (supervisorResult.decision === 'reject') {
+      if (isAutomaticKind(envelope.kind)) {
+        this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
+          supervisorJson: JSON.stringify(supervisorResult),
+          brainDraftJson: JSON.stringify({ ...draft, action: 'skip', reply: '' })
+        });
+        return;
+      }
+      throw new Error('supervisor rejected the reply');
     }
     if (attempt >= 3) {
       this.store.putDiagnostic({
@@ -402,12 +477,29 @@ export class YuqiOrchestrator {
 
   commitApproved(envelope, current) {
     const draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
+    const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     if (draft.action === 'skip' && isAutomaticKind(envelope.kind)) {
       const result = {
         turnId: envelope.turnId,
         presetVersion: this.presets.current().version,
         action: 'skip',
         paymentAction: null,
+        reply: null,
+        usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
+        relationshipStageAction: memoryPacket.relationshipStageAction || null,
+        momentAction: null
+      };
+      this.store.advanceTurn(envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) });
+      return result;
+    }
+    if (isMomentKind(envelope.kind)) {
+      const result = {
+        turnId: envelope.turnId,
+        presetVersion: this.presets.current().version,
+        action: 'send',
+        paymentAction: null,
+        relationshipStageAction: memoryPacket.relationshipStageAction || null,
+        momentAction: draft.momentAction,
         reply: null,
         usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
       };
@@ -435,7 +527,9 @@ export class YuqiOrchestrator {
       action: 'send',
       paymentAction: resolvedPaymentAction(envelope, draft),
       reply: savedReply,
-      usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
+      usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
+      relationshipStageAction: memoryPacket.relationshipStageAction || null,
+      momentAction: null
     };
     this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
       replyJson: JSON.stringify(result)

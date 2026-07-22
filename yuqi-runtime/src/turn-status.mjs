@@ -31,6 +31,12 @@ export function publicTurnStatus(turn, { stages = [], clock = Date.now } = {}) {
     paymentAction: committed && ['received', 'refused', 'pending'].includes(result?.paymentAction)
       ? result.paymentAction
       : null,
+    relationshipStageAction: committed && result?.relationshipStageAction && typeof result.relationshipStageAction === 'object'
+      ? result.relationshipStageAction
+      : null,
+    momentAction: committed && result?.momentAction && typeof result.momentAction === 'object'
+      ? result.momentAction
+      : null,
     reply: committed ? result?.reply || null : null,
     errorCode: failed ? String(error?.code || error?.name || 'YUQI_ROLE_FAILED') : '',
     origin: committed ? String(result?.reply?.origin || turn.origin || 'codex') : String(turn.origin || 'codex'),

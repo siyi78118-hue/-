@@ -23,7 +23,9 @@ const AUTOMATIC_KINDS = new Set([
   'ROLE_PLAN_CHAT_PRIVATE',
   'ROLE_PLAN_MOMENT_PRIVATE',
   'PROACTIVE_CHAT',
-  'PROACTIVE_MOMENT'
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY'
 ]);
 const TRIGGER_TYPES = new Set([
   'role_plan_chat',
@@ -31,7 +33,9 @@ const TRIGGER_TYPES = new Set([
   'role_plan_chat_private',
   'role_plan_moment_private',
   'proactive_chat',
-  'proactive_moment'
+  'proactive_moment',
+  'moment_interaction',
+  'moment_reply'
 ]);
 
 function canonicalize(value) {
@@ -118,7 +122,9 @@ function validateDirectContext(context) {
   if (!context || typeof context !== 'object' || Array.isArray(context)) {
     throw new Error('invalid direct context');
   }
-  if (context.payment === undefined) return {};
+  const normalized = {};
+  if (context.scene !== undefined) normalized.scene = validateScene(context.scene);
+  if (context.payment === undefined) return normalized;
   const payment = context.payment;
   if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
     throw new Error('invalid payment context');
@@ -133,7 +139,56 @@ function validateDirectContext(context) {
   if (note.length > 500) throw new Error('payment note too large');
   requireId(messageId, 'payment messageId');
   if (!['pending', 'received', 'refused'].includes(status)) throw new Error('invalid payment status');
-  return { payment: { kind, amount, note, messageId, status } };
+  normalized.payment = { kind, amount, note, messageId, status };
+  return normalized;
+}
+
+function limitedText(value, maximum) {
+  const text = String(value || '').trim();
+  if (text.length > maximum) throw new Error('scene text too large');
+  return text;
+}
+
+function validateScene(scene) {
+  if (!scene || typeof scene !== 'object' || Array.isArray(scene)) throw new Error('invalid scene');
+  const sourceStage = scene.relationshipStage;
+  if (!sourceStage || typeof sourceStage !== 'object' || Array.isArray(sourceStage)) {
+    throw new Error('invalid relationship stage');
+  }
+  const id = limitedText(sourceStage.id || 'new', 64);
+  if (!ID_PATTERN.test(id)) throw new Error('invalid relationship stage id');
+  const catalog = Array.isArray(scene.stageCatalog) ? scene.stageCatalog.slice(0, 20).map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('invalid stage catalog');
+    const stageId = limitedText(item.id, 64);
+    if (!ID_PATTERN.test(stageId)) throw new Error('invalid stage catalog id');
+    return {
+      id: stageId,
+      label: limitedText(item.label || stageId, 80),
+      content: limitedText(item.content, 12_000)
+    };
+  }) : [];
+  if (!catalog.some(item => item.id === id)) {
+    catalog.unshift({
+      id,
+      label: limitedText(sourceStage.label || id, 80),
+      content: limitedText(sourceStage.content, 12_000)
+    });
+  }
+  return {
+    playerName: limitedText(scene.playerName || '用户', 120),
+    characterName: limitedText(scene.characterName || '虞栖', 120),
+    relationshipStage: {
+      id,
+      label: limitedText(sourceStage.label || id, 80),
+      content: limitedText(sourceStage.content, 12_000),
+      since: Math.max(0, Number(sourceStage.since) || 0),
+      reason: limitedText(sourceStage.reason, 500),
+      confidence: Math.max(0, Math.min(1, Number(sourceStage.confidence) || 0))
+    },
+    conversationExtraPrompt: limitedText(scene.conversationExtraPrompt, 12_000),
+    globalExtraPrompt: limitedText(scene.globalExtraPrompt, 12_000),
+    stageCatalog: catalog
+  };
 }
 
 function validateUserMessage(message, envelope) {
@@ -174,6 +229,8 @@ function validateTrigger(trigger) {
       throw new Error('invalid trigger context');
     }
     normalized.context = structuredClone(trigger.context);
+    const suppliedScene = trigger.context.scene || trigger.context.snapshot?.scene;
+    if (suppliedScene !== undefined) normalized.context.scene = validateScene(suppliedScene);
   }
   return normalized;
 }

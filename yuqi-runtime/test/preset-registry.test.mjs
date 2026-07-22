@@ -25,7 +25,7 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.2.2');
+  assert.equal(current.version, '1.3.0');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
@@ -64,7 +64,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.2.2');
+    assert.equal(registry.current().version, '1.3.0');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -89,6 +89,23 @@ test('core preset preserves equality, uniqueness, and emotionally genuine speech
   assert.match(prompt, /唯一的爱人和心中最重要的人/);
   assert.match(prompt, /理性的内核.*感性/s);
   assert.match(prompt, /调情来自真实的心动和兴趣/);
+}));
+
+test('all role prompts receive the authoritative dynamic relationship stage', () => withRegistry(registry => {
+  const scene = {
+    kind: 'DIRECT_REPLY',
+    playerName: '姜隽倚',
+    characterName: '虞栖',
+    relationshipStage: { id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。' },
+    conversationExtraPrompt: '今天回复可以短一点。',
+    globalExtraPrompt: '不要客服腔。'
+  };
+  for (const role of ['memory', 'brain', 'supervisor']) {
+    const prompt = registry.compileFor(role, { scene });
+    assert.match(prompt, /当前关系阶段：熟悉（familiar）/);
+    assert.match(prompt, /双方已经形成稳定聊天习惯/);
+    assert.match(prompt, /姜隽倚/);
+  }
 }));
 
 test('brain preset supports silent proactive decisions without leaking them into visible chat text', () => withRegistry(registry => {
@@ -122,16 +139,16 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.2.3');
-  assert.equal(published.parentVersion, '1.2.2');
+  assert.equal(published.version, '1.3.1');
+  assert.equal(published.parentVersion, '1.3.0');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 2);
 
-  const rollback = registry.rollback('1.2.2');
-  assert.equal(rollback.version, '1.2.4');
-  assert.equal(rollback.parentVersion, '1.2.3');
-  assert.equal(rollback.rollbackOf, '1.2.2');
+  const rollback = registry.rollback('1.3.0');
+  assert.equal(rollback.version, '1.3.2');
+  assert.equal(rollback.parentVersion, '1.3.1');
+  assert.equal(rollback.rollbackOf, '1.3.0');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 3);
 }));

@@ -2394,6 +2394,25 @@ function nativeMemoryCandidateText(memory = {}, char = null) {
     return used <= 28000;
   }).map(row => `[${row.type}｜${row.at || '时间未知'}] ${row.text}`).join('\n');
 }
+function buildYuqiDynamicScene(char, chat) {
+  const config = normalizeStagePersonaConfig(char);
+  const stage = stagePersonaFor(char, config.currentStage) || config.stages[0];
+  return {
+    playerName: playerName(),
+    characterName: charName(char),
+    relationshipStage: {
+      id: stage?.id || 'new',
+      label: stage?.label || '初识',
+      content: String(stage?.content || ''),
+      since: Number(config.state?.since) || Date.now(),
+      reason: String(config.state?.reason || ''),
+      confidence: Math.max(0, Math.min(1, Number(config.state?.confidence) || 0))
+    },
+    conversationExtraPrompt: String(chat?.extraPrompt || ''),
+    globalExtraPrompt: String(settings.systemPrompt || ''),
+    stageCatalog: config.stages.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') }))
+  };
+}
 async function buildNativeExecutionSnapshot(charId, task) {
   const char = characters.find(item => item.id === charId);
   const chat = allChats[charId];
@@ -2407,6 +2426,7 @@ async function buildNativeExecutionSnapshot(charId, task) {
     returnPromptDetails: true
   });
   return {
+    scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
     memoryConfigId: 'memory-v1',
     chatConfigId: 'chat-v1',
@@ -2460,6 +2480,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     memoryQuery = buildProactiveMemoryQuery(chat, now, triggerMode);
   }
   const snapshot = {
+    scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
     playerName: playerName(),
     memoryConfigId: 'memory-v1',
@@ -2541,6 +2562,7 @@ async function saveNativeRolePlanSnapshot(charId, plan, job) {
     chatMessages = nativeProactiveChatMessages(char, chat, now, 'planned');
   }
   const snapshot = {
+    scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
     playerName: playerName(),
     memoryConfigId: 'memory-v1',
@@ -2840,14 +2862,81 @@ function nativeReplyFailureMessage(kind = 'DIRECT_REPLY') {
   return kind === 'DIRECT_REPLY' ? '回复暂时没有送达，请重试' : '这次主动消息暂时没有送达，系统会继续重试';
 }
 
+function applyNativeRelationshipStagePart(charId, part, turnId) {
+  if (!part) return false;
+  const char = characters.find(item => item.id === charId);
+  if (!char) return false;
+  const action = nativePartPayload(part);
+  const config = normalizeStagePersonaConfig(char);
+  const sourceTurnId = String(turnId || '');
+  if (config.history.some(item => item.sourceTurnId === sourceTurnId)) return false;
+  const target = config.stages.find(stage => stage.id === action.to);
+  if (!target || config.currentStage !== action.from) return false;
+  const oldPrompt = buildCharPrompt(char);
+  config.currentStage = target.id;
+  config.state = {
+    since: Number(action.changedAt) || Date.now(),
+    reason: String(action.reason || '').slice(0, 500),
+    confidence: Number(action.confidence) || 0,
+    evidenceMessageIds: Array.isArray(action.evidenceMessageIds) ? action.evidenceMessageIds.map(String) : []
+  };
+  config.history.push({
+    from: action.from, to: action.to, at: config.state.since, reason: config.state.reason,
+    confidence: config.state.confidence, evidenceMessageIds: config.state.evidenceMessageIds,
+    explicitMutualChange: action.explicitMutualChange === true, source: 'yuqi-runtime', sourceTurnId
+  });
+  config.history = config.history.slice(-NORMAL_RAW_CONTEXT_LIMIT);
+  char.stagePersona = config;
+  refreshStoredCharacterPrompt(char, oldPrompt);
+  DB.set('characters', characters);
+  DB.set('chats', allChats);
+  return true;
+}
+
+function applyNativeMomentActionPart(charId, part, turnId) {
+  if (!part) return false;
+  const action = nativePartPayload(part);
+  const moment = allMoments.find(item => item.id === action.momentId) || materializeVirtualMoment(action.momentId);
+  if (!moment) return false;
+  moment.nativeActionTurnIds = Array.isArray(moment.nativeActionTurnIds) ? moment.nativeActionTurnIds : [];
+  if (moment.nativeActionTurnIds.includes(turnId)) return false;
+  const char = characters.find(item => item.id === charId);
+  if (!char) return false;
+  if (action.like) moment.likes = [...new Set([...(moment.likes || []), charId])];
+  const comment = String(action.comment || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+  if (comment) {
+    moment.comments = [...(moment.comments || []), {
+      id: `mcom_native_${String(turnId).replace(/[^a-zA-Z0-9_-]/g, '_')}`,
+      charId, name: char.name, text: comment, time: Date.now(), sourceTurnId: turnId,
+      replyToCommentId: String(action.replyToCommentId || ''), replyToCharId: action.replyToCommentId ? 'player' : '',
+      replyToName: action.replyToCommentId ? playerName() : ''
+    }];
+  }
+  moment.nativeActionTurnIds.push(turnId);
+  if (moment.notifyFailures) delete moment.notifyFailures[charId];
+  saveMoments();
+  processMemoryAfterScenario(charId);
+  if (activeScreen === 'moments') renderMoments();
+  return true;
+}
+
 async function applyNativeExecutionTurn(result) {
   const charId = result?.characterId;
   const chat = allChats[charId];
   const kind = String(result?.kind || 'DIRECT_REPLY');
   if (!chat) return false;
+  const state = String(result.state || result.storedState || '');
+  const allParts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
+  if (state === 'COMPLETED') {
+    applyNativeRelationshipStagePart(charId, allParts.find(part => part.type === 'RELATIONSHIP_STAGE'), result.turnId);
+  }
+  if (['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(kind)) {
+    if (state !== 'COMPLETED') return false;
+    applyNativeMomentActionPart(charId, allParts.find(part => part.type === 'MOMENT_ACTION'), result.turnId);
+    return true;
+  }
   const rolePlanTurn = ['ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind);
   if (kind === 'PROACTIVE_CHAT' || kind === 'PROACTIVE_MOMENT' || rolePlanTurn) {
-    const state = String(result.state || result.storedState || '');
     const sourceTurnId = `native:${result.turnId}`;
     if (state === 'COMPLETED') {
       const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
@@ -2903,7 +2992,6 @@ async function applyNativeExecutionTurn(result) {
   }
   const userMessage = messageById(chat, result?.sourceMessageId);
   if (!userMessage) return false;
-  const state = String(result.state || result.storedState || '');
   if (state === 'COMPLETED') {
     const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
     await applyNativePlanParts(charId, parts, result.turnId);
@@ -3086,6 +3174,41 @@ async function queueAndroidProactiveTurn(charId, job = null, triggerMode = 'plan
     }),
     snapshotJson: JSON.stringify(built?.snapshot || {}),
     createdAt: Date.now()
+  });
+  await applyNativeExecutionTurn(result);
+  startNativeReplyPolling();
+  return true;
+}
+
+async function queueYuqiMomentTurn(charId, moment, kind, context = {}) {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.submitTurn) throw new Error('Android native execution is unavailable');
+  await saveNativeExecutionApiConfigs();
+  await syncYuqiVisibleHistory(charId);
+  const createdAt = Date.now();
+  const contextId = String(context.playerComment?.id || context.replyToCommentId || 'interaction');
+  const stable = `${moment.id}_${contextId}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const turnId = `moment_${kind.toLowerCase()}_${stable}`;
+  const sourceMessageId = `trigger_${turnId}`;
+  const built = await syncNativeProactiveSnapshot(charId, 'moment', {
+    jobId: turnId, dueAt: new Date(createdAt).toISOString(), mode: kind.toLowerCase()
+  });
+  const input = {
+    reason: kind.toLowerCase(), scheduledFor: createdAt, deviceSeq: createdAt,
+    moment: {
+      id: moment.id, authorType: moment.authorType, charId: moment.charId || '',
+      text: String(moment.text || ''), likes: [...(moment.likes || [])],
+      comments: (moment.comments || []).map(item => ({
+        id: item.id, charId: item.charId, name: item.name, text: item.text,
+        replyToCommentId: item.replyToCommentId || ''
+      }))
+    },
+    playerComment: context.playerComment || null,
+    replyToCommentId: context.replyToCommentId || null
+  };
+  const result = await plugin.submitTurn({
+    turnId, characterId: charId, sourceMessageId, kind,
+    inputJson: JSON.stringify(input), snapshotJson: JSON.stringify(built?.snapshot || {}), createdAt
   });
   await applyNativeExecutionTurn(result);
   startNativeReplyPolling();
@@ -5101,6 +5224,10 @@ async function runMomentNotification(momentId, manual = false) {
     saveMoments();
     processMemoryAfterScenario(char.id);
     try {
+      if (char.id === 'yuqi' && isNativeApp() && nativeExecutionPlugin()?.submitTurn) {
+        await queueYuqiMomentTurn(char.id, moment, 'MOMENT_INTERACTION');
+        continue;
+      }
       const result = await callMomentInteractionAI(char, moment);
       if (!momentStillCurrent(momentId, moment)) return;
       if (moment.notifyFailures) delete moment.notifyFailures[char.id];
@@ -5474,6 +5601,13 @@ async function replyToMoment(momentId, presetText = '', options = {}) {
   }
   toast('正在等待回复...', 1200);
   try {
+    if (char.id === 'yuqi' && isNativeApp() && nativeExecutionPlugin()?.submitTurn) {
+      await queueYuqiMomentTurn(char.id, moment, 'MOMENT_REPLY', {
+        playerComment: commentItem,
+        replyToCommentId: commentItem.id
+      });
+      return;
+    }
     const reply = await callMomentReplyAI(char, moment, comment, { targetComment, playerComment: commentItem });
     const clean = momentSnippet(reply, 80);
     if (clean && !isEmptyReplyText(clean)) {

@@ -58,8 +58,12 @@ final class BridgeInput {
         if (submission.kind == com.siyi.al.execution.TurnKind.DIRECT_REPLY) {
             envelope.put("message", userMessage(submission));
             JSONObject input = source(submission);
+            JSONObject snapshot = new JSONObject(submission.snapshotJson);
             JSONObject options = input.optJSONObject("options");
             JSONObject suppliedPayment = options == null ? null : options.optJSONObject("payment");
+            JSONObject context = new JSONObject();
+            JSONObject scene = snapshot.optJSONObject("scene");
+            if (scene != null) context.put("scene", new JSONObject(scene.toString()));
             if (suppliedPayment != null) {
                 String kind = suppliedPayment.optString("kind", suppliedPayment.optString("type", "")).trim().toLowerCase(java.util.Locale.ROOT);
                 double amount = Math.round(suppliedPayment.optDouble("amount", 0) * 100.0) / 100.0;
@@ -71,9 +75,10 @@ final class BridgeInput {
                         .put("note", suppliedPayment.optString("note", "").replaceAll("\\s+", " ").trim())
                         .put("messageId", messageId)
                         .put("status", suppliedPayment.optString("status", "pending").trim().toLowerCase(java.util.Locale.ROOT));
-                    envelope.put("context", new JSONObject().put("payment", payment));
+                    context.put("payment", payment);
                 }
             }
+            if (context.length() > 0) envelope.put("context", context);
             return envelope;
         }
 
@@ -85,6 +90,8 @@ final class BridgeInput {
         JSONObject context = new JSONObject()
             .put("input", input)
             .put("snapshot", snapshot);
+        JSONObject scene = snapshot.optJSONObject("scene");
+        if (scene != null) context.put("scene", new JSONObject(scene.toString()));
         if (submission.cloudJobId != null) context.put("cloudJobId", submission.cloudJobId);
         envelope.put("trigger", new JSONObject()
             .put("triggerId", triggerId)

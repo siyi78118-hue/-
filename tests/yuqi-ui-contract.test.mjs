@@ -68,6 +68,22 @@ test('native direct replies submit a canonical attributed user message', () => {
   assert.match(html, /sentAt:\s*Number\(userMessage\.time\)\s*\|\|\s*task\.createdAt/);
 });
 
+test('native snapshots expose the current Yuqi dynamic scene separately from fixed RP', () => {
+  assert.match(html, /function\s+buildYuqiDynamicScene\(char,\s*chat\)/);
+  const builder = html.slice(
+    html.indexOf('function buildYuqiDynamicScene'),
+    html.indexOf('async function buildNativeExecutionSnapshot')
+  );
+  assert.match(builder, /relationshipStage/);
+  assert.match(builder, /conversationExtraPrompt/);
+  assert.match(builder, /stageCatalog/);
+  const snapshot = html.slice(
+    html.indexOf('async function buildNativeExecutionSnapshot'),
+    html.indexOf('function nativeProactiveSnapshotIds')
+  );
+  assert.match(snapshot, /scene:\s*buildYuqiDynamicScene\(char,\s*chat\)/);
+});
+
 test('native retry repairs a legacy failed turn with current canonical input and snapshot', () => {
   const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
   assert.match(retry, /const\s+task\s*=\s*buildAndroidUserReplyTask/);
