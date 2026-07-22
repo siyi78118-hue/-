@@ -331,6 +331,17 @@ export class YuqiStore {
       WHERE m.speaker_type = 'character'
         AND json_extract(t.envelope_json, '$.kind') IN ('PROACTIVE_CHAT', 'PROACTIVE_MOMENT')
         AND d.state != 'confirmed';
+
+      INSERT OR IGNORE INTO suppressed_messages(message_id, authoritative_message_id, reason, created_at)
+      SELECT legacy.message_id, canonical.message_id, 'legacy_payment_id_alias', CAST(strftime('%s','now') AS INTEGER) * 1000
+      FROM messages legacy
+      JOIN messages canonical ON canonical.message_id = 'msg_' || legacy.message_id
+      WHERE substr(legacy.message_id, 1, 4) = 'pay_'
+        AND legacy.speaker_type = 'user'
+        AND canonical.speaker_type = 'user'
+        AND legacy.character_id = canonical.character_id
+        AND legacy.content = canonical.content
+        AND legacy.turn_id = canonical.turn_id;
     `);
   }
 
@@ -375,7 +386,7 @@ export class YuqiStore {
 
     return this.transaction(() => {
       if (envelope.message) {
-        this.putMessageInternal({
+        const savedMessage = this.putMessageInternal({
           ...envelope.message,
           turnId: envelope.turnId,
           characterId: envelope.characterId,
@@ -383,6 +394,21 @@ export class YuqiStore {
           deviceId: envelope.deviceId,
           deviceSeq: envelope.deviceSeq
         });
+        if (savedMessage.messageId.startsWith('msg_pay_')) {
+          const legacyMessageId = savedMessage.messageId.slice(4);
+          const legacy = this.getMessage(legacyMessageId);
+          if (
+            legacy?.speakerType === 'user'
+            && legacy.characterId === savedMessage.characterId
+            && legacy.content === savedMessage.content
+            && legacy.turnId === savedMessage.turnId
+          ) {
+            this.db.prepare(`
+              INSERT OR IGNORE INTO suppressed_messages(message_id, authoritative_message_id, reason, created_at)
+              VALUES (?, ?, 'legacy_payment_id_alias', ?)
+            `).run(legacyMessageId, savedMessage.messageId, now());
+          }
+        }
       }
 
       this.db.prepare(`

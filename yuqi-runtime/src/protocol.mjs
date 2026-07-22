@@ -115,6 +115,9 @@ export function validateEnvelope(value) {
 
 function validateUserMessage(message, envelope) {
   if (!message || typeof message !== 'object') throw new Error('invalid message');
+  if (/^pay_[A-Za-z0-9_-]+$/.test(String(message.messageId || ''))) {
+    message.messageId = `msg_${message.messageId}`;
+  }
   requireId(message.messageId, 'messageId', 'msg_');
   requireId(message.speakerId, 'speakerId');
   requireId(message.recipientId, 'recipientId');

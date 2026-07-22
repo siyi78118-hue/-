@@ -1328,7 +1328,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-22.96';
+const APP_BUILD_VERSION = '2026-07-22.97';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -1343,9 +1343,9 @@ const CLOUD_TIMER_RESYNC_MS = 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
 const PROACTIVE_DICE_MAX_ROLLS = 432;
-const MOMENT_DICE_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const MOMENT_DICE_CHANCE = 0.10;
-const MOMENT_DICE_MAX_ROLLS = 56;
+const MOMENT_DICE_INTERVAL_MS = 2 * 60 * 60 * 1000;
+const MOMENT_DICE_CHANCE = 0.20;
+const MOMENT_DICE_MAX_ROLLS = 12;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
 const CALL_LOG_LIMIT = 30;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
@@ -2922,7 +2922,15 @@ async function applyNativeExecutionTurn(result) {
     const paymentStatus = parts.find(part => part.type === 'PAYMENT_STATUS');
     const schedule = parts.find(part => part.type === 'SCHEDULE');
     const pendingOptions = chat.pendingReply?.userMessageId === userMessage.id ? (chat.pendingReply.options || {}) : {};
-    if (paymentStatus) updatePaymentStatusFromReply(chat, pendingOptions.paymentMessageId, text, charId, nativePartPayload(paymentStatus).status);
+    if (pendingOptions.paymentMessageId) {
+      updatePaymentStatusFromReply(
+        chat,
+        pendingOptions.paymentMessageId,
+        text,
+        charId,
+        paymentStatus ? nativePartPayload(paymentStatus).status : ''
+      );
+    }
     if (schedule) {
       const at = parseProactiveScheduleTime(nativePartPayload(schedule).nextProactiveAt);
       schedulePlannedChatFromReply(charId, at ? { dueAt: at } : null).catch(err => console.warn('[AL Timer] native schedule skipped:', err.message));
@@ -3598,6 +3606,9 @@ function commitStagedBatch(chat, committedAt = Date.now()) {
   for (const message of messages) {
     message.deliveryState = 'sent';
     message.batchCommittedAt = committedAt;
+    if ((message.payType || message.type) === 'redpacket') {
+      message.payExpiresAt = committedAt + REDPACKET_EXPIRE_MS;
+    }
   }
   const committed = {
     batchId: batch.batchId,
@@ -6151,6 +6162,7 @@ function refreshPaymentExpirations(chat, charId = currentCharId) {
       }
       return;
     }
+    if (m.deliveryState === 'staged') return;
     if ((m.payType || m.type) !== 'redpacket') return;
     if ((m.payStatus || 'pending') !== 'pending') return;
     const expiresAt = Number(m.payExpiresAt) || ((Number(m.time) || now) + REDPACKET_EXPIRE_MS);
@@ -6580,10 +6592,21 @@ async function adjustMemoryCursorAfterDeletion(charId, deletedIndex) {
   const cursor = Math.max(0, Number(stored) || 0);
   if (deletedIndex < cursor) await MemoryDB.setMeta(memoryMetaKey(charId), Math.max(0, cursor - 1));
 }
+function refundStagedOutgoingPayment(message) {
+  if (!message || message.role !== 'user' || message.deliveryState !== 'staged') return false;
+  if (!['redpacket', 'transfer'].includes(message.payType || message.type) || message.refunded) return false;
+  const amount = Math.max(0, Number(message.amount) || 0);
+  if (amount > 0) saveWalletBalance(walletBalance() + amount);
+  message.refunded = true;
+  message.payStatus = 'cancelled';
+  message.payStatusTime = Date.now();
+  return true;
+}
 async function retractMessage(charId, messageId) {
   const chat = allChats[charId];
   const message = messageById(chat, messageId);
   if (!chat || !message || message.role !== 'user' || message.retracted) return false;
+  refundStagedOutgoingPayment(message);
   abortPendingReply(charId, messageId, false);
   message.retracted = true;
   message.retractedAt = Date.now();
@@ -6600,6 +6623,7 @@ async function deleteChatMessage(charId, messageId) {
   const index = (chat?.messages || []).findIndex(message => message.id === messageId);
   if (!chat || index < 0) return false;
   const countedByMemory = messageAvailableToAI(chat.messages[index]);
+  refundStagedOutgoingPayment(chat.messages[index]);
   abortPendingReply(charId, messageId, true);
   removeMessageFromStagedBatch(chat, messageId);
   chat.messages.splice(index, 1);
@@ -7040,26 +7064,24 @@ async function submitPayMessage() {
   const content = kind === 'redpacket'
     ? `${playerName()}给${char?.name || '对方'}发了一个红包：${formatMoney(amount)}${note ? `，备注：${note}` : ''}`
     : `${playerName()}向${char?.name || '对方'}转账${formatMoney(amount)}${note ? `，备注：${note}` : ''}`;
-  const paymentMessageId = uid('pay');
   const sentAt = Date.now();
-  const paymentMessage = createPendingUserMessage(chat, content, {
-    id: paymentMessageId,
+  stagePlayerMessage(chat, content, {
     type: kind,
     payType: kind,
     amount,
     note,
     payStatus: 'pending',
-    payExpiresAt: kind === 'redpacket' ? sentAt + REDPACKET_EXPIRE_MS : null,
+    payExpiresAt: null,
     time: sentAt
   });
-  chat.pendingReply.options = { paymentMessageId, payment: { kind, amount, note } };
   DB.set('chats', allChats);
   if (amountInput) amountInput.value = '';
   if (noteInput) noteInput.value = '';
   showScreen('chat');
   renderMessages({ forceBottom: true });
-  if (isNativeApp()) return queueAndroidUserReply(currentCharId, paymentMessage.id, { paymentMessageId, payment: { kind, amount, note } });
-  await continueAssistantTurn(currentCharId, content, { userMessageId: paymentMessage.id, paymentMessageId, payment: { kind, amount, note } });
+  refreshChatSendButton();
+  refreshFinishBatchButton();
+  return true;
 }
 function uid(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -7916,7 +7938,18 @@ async function finishStagedBatch(charId = currentCharId) {
   const batchMessageIds = [...committed.messageIds];
   const userText = committed.messages.map(message => String(message.content || '').trim()).filter(Boolean).join('\n');
   const sourceMessage = committed.sourceMessage;
-  const options = { batchId: committed.batchId, batchMessageIds };
+  const paymentMessage = committed.messages.slice().reverse().find(message =>
+    ['redpacket', 'transfer'].includes(message.payType || message.type)
+  );
+  const kind = paymentMessage?.payType || paymentMessage?.type || '';
+  const options = {
+    batchId: committed.batchId,
+    batchMessageIds,
+    ...(paymentMessage ? {
+      paymentMessageId: paymentMessage.id,
+      payment: { kind: kind, amount: Number(paymentMessage.amount) || 0, note: String(paymentMessage.note || '') }
+    } : {})
+  };
   chat.pendingReply = {
     userMessageId: sourceMessage.id,
     sourceMessageId: sourceMessage.id,

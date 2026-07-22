@@ -14,9 +14,9 @@ const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 const PROACTIVE_DICE_INTERVAL_MS = 10 * 60 * 1000;
 const PROACTIVE_DICE_CHANCE = 0.05;
 const PROACTIVE_DICE_MAX_ROLLS = 432;
-const MOMENT_DICE_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const MOMENT_DICE_CHANCE = 0.10;
-const MOMENT_DICE_MAX_ROLLS = 56;
+const MOMENT_DICE_INTERVAL_MS = 2 * 60 * 60 * 1000;
+const MOMENT_DICE_CHANCE = 0.20;
+const MOMENT_DICE_MAX_ROLLS = 12;
 let lastModelResponseDiagnostic = '';
 
 self.addEventListener('install', e => {

@@ -17,13 +17,20 @@ final class BridgeInput {
         String content = message.optString("content", "");
         if (content.trim().isEmpty()) content = input.optString("text", "");
         if (content.trim().isEmpty()) content = input.optString("userText", "");
-        message.put("messageId", message.optString("messageId", submission.sourceMessageId));
+        message.put("messageId", wireMessageId(message.optString("messageId", submission.sourceMessageId)));
         message.put("speakerId", "user");
         message.put("speakerType", "user");
         message.put("recipientId", submission.characterId);
         message.put("content", content);
         message.put("sentAt", message.optLong("sentAt", submission.createdAt));
         return message;
+    }
+
+    static String wireMessageId(String value) {
+        String messageId = value == null ? "" : value.trim();
+        if (messageId.startsWith("msg_")) return messageId;
+        if (messageId.startsWith("pay_")) return "msg_" + messageId;
+        return messageId;
     }
 
     static long deviceSeq(TurnSubmission submission) throws Exception {

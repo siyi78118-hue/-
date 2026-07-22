@@ -82,7 +82,17 @@ function withStore(run) {
     return run({ store, file });
   } finally {
     store.close();
-    rmSync(dir, { recursive: true, force: true });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        if (error?.code !== 'EPERM') throw error;
+        if (attempt === 9 && process.platform === 'win32') break;
+        if (attempt === 9) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      }
+    }
   }
 }
 
@@ -110,6 +120,51 @@ test('protocol v2 direct turn preserves the exact user message and kind', () => 
   assert.equal(value.message.content, '你好');
   assert.equal(value.trigger, undefined);
 });
+
+test('protocol v2 accepts legacy payment ids by canonicalizing them before validation', () => {
+  const value = validateEnvelope(validV2Envelope({
+    turnId: 'turn_pay_1784713105609_3qb4xo',
+    message: {
+      ...validV2Envelope().message,
+      messageId: 'pay_1784713105609_3qb4xo',
+      content: '姜隽倚给虞栖发了一个红包：¥20.00'
+    }
+  }));
+
+  assert.equal(value.message.messageId, 'msg_pay_1784713105609_3qb4xo');
+});
+
+test('canonical payment recovery suppresses the already-ingested legacy alias', () => withStore(({ store }) => {
+  store.putMessage({
+    messageId: 'pay_1784713105609_3qb4xo',
+    turnId: 'turn_pay_1784713105609_3qb4xo',
+    characterId: 'yuqi',
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: 'yuqi',
+    content: '姜隽倚给虞栖发了一个红包：¥20.00',
+    sentAt: 1784713109805,
+    origin: 'phone',
+    deviceId: 'device2',
+    deviceSeq: 1784713105609
+  });
+  store.submitTurn(validV2Envelope({
+    turnId: 'turn_pay_1784713105609_3qb4xo',
+    deviceSeq: 1784713105609,
+    createdAt: 1784713105609,
+    message: {
+      ...validV2Envelope().message,
+      messageId: 'pay_1784713105609_3qb4xo',
+      content: '姜隽倚给虞栖发了一个红包：¥20.00',
+      sentAt: 1784713105609
+    }
+  }));
+
+  assert.deepEqual(store.listMessages('yuqi', 10).map(message => message.messageId), [
+    'msg_pay_1784713105609_3qb4xo'
+  ]);
+  assert.equal(store.isMessageSuppressed('pay_1784713105609_3qb4xo'), true);
+}));
 
 test('protocol v2 automatic turn persists a trigger without creating a user message', () => withStore(({ store }) => {
   const turn = store.submitTurn(validTriggerEnvelope());

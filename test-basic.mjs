@@ -171,7 +171,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-22\.96';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-22\.97';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -341,12 +341,12 @@ assert.equal(appCloudTimerVersion, healthCloudTimerVersion, 'app and health chec
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
 assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
 assert.match(script, /const PROACTIVE_DICE_MAX_ROLLS = 432;/);
-assert.match(script, /const MOMENT_DICE_INTERVAL_MS = 6 \* 60 \* 60 \* 1000;/);
-assert.match(script, /const MOMENT_DICE_CHANCE = 0\.10;/);
-assert.match(script, /const MOMENT_DICE_MAX_ROLLS = 56;/);
-assert.match(swScript, /const MOMENT_DICE_INTERVAL_MS = 6 \* 60 \* 60 \* 1000;/);
-assert.match(swScript, /const MOMENT_DICE_CHANCE = 0\.10;/);
-assert.match(swScript, /const MOMENT_DICE_MAX_ROLLS = 56;/);
+assert.match(script, /const MOMENT_DICE_INTERVAL_MS = 2 \* 60 \* 60 \* 1000;/);
+assert.match(script, /const MOMENT_DICE_CHANCE = 0\.20;/);
+assert.match(script, /const MOMENT_DICE_MAX_ROLLS = 12;/);
+assert.match(swScript, /const MOMENT_DICE_INTERVAL_MS = 2 \* 60 \* 60 \* 1000;/);
+assert.match(swScript, /const MOMENT_DICE_CHANCE = 0\.20;/);
+assert.match(swScript, /const MOMENT_DICE_MAX_ROLLS = 12;/);
 assert.match(script, /const CLOUD_TIMER_RESYNC_MS = 60 \* 60 \* 1000;/);
 assert.match(script, /function proactiveDicePlan\(options = \{\}, now = Date\.now\(\), randomValue = Math\.random\(\)\)/);
 assert.match(swScript, /function proactiveDicePlan\(options = \{\}, now = Date\.now\(\), randomValue = Math\.random\(\)\)/);
@@ -2206,11 +2206,11 @@ assert.notEqual(proactiveJobA, proactiveJobB, '连续安排必须使用不同任
 assert.match(proactiveJobA, /^pro_.*_char_timer_test_[a-z0-9]+_[a-z0-9]+$/);
 assert.equal(proactiveDefaultScheduleOptions('chat').mode, 'planned');
 assert.equal(proactiveDefaultScheduleOptions('moment').mode, 'dice');
-assert.equal(proactiveDefaultScheduleOptions('moment').intervalMs, 6 * 60 * 60 * 1000);
-assert.equal(proactiveDefaultScheduleOptions('moment').rollChance, 0.10);
-assert.equal(proactiveDefaultScheduleOptions('moment').maxRolls, 56);
+assert.equal(proactiveDefaultScheduleOptions('moment').intervalMs, 2 * 60 * 60 * 1000);
+assert.equal(proactiveDefaultScheduleOptions('moment').rollChance, 0.20);
+assert.equal(proactiveDefaultScheduleOptions('moment').maxRolls, 12);
 assert.equal(proactiveJobUsesCurrentDicePolicy('moment', { mode: 'dice', diceIntervalMs: 600000, rollChance: 0.05, maxRolls: 432 }), false, '旧朋友圈骰子任务必须在升级后重排');
-assert.equal(proactiveJobUsesCurrentDicePolicy('moment', { mode: 'dice', diceIntervalMs: 6 * 60 * 60 * 1000, rollChance: 0.10, maxRolls: 56 }), true, '新朋友圈骰子任务不得重复重排');
+assert.equal(proactiveJobUsesCurrentDicePolicy('moment', { mode: 'dice', diceIntervalMs: 2 * 60 * 60 * 1000, rollChance: 0.20, maxRolls: 12 }), true, '新朋友圈骰子任务不得重复重排');
 const firstDiceRoll = proactiveDicePlan({ intervalMs: 600000, rollChance: 0.05 }, 0, 0);
 assert.equal(firstDiceRoll.rolls, 1);
 assert.equal(firstDiceRoll.dueAt.getTime(), 600000);
@@ -2220,8 +2220,8 @@ assert.equal(medianDiceRoll.dueAt.getTime(), 14 * 600000);
 assert.equal(proactiveDicePlan({ rollChance: 1 }, 0, 0.99).rolls, 1);
 assert.equal(proactiveDicePlan({ rollChance: 0 }, 0, 0.99).rolls, 432, '零概率和极端尾部必须受最长三天保护');
 const latestMomentPlan = proactiveDicePlan(proactiveDefaultScheduleOptions('moment'), 0, 1 - Number.EPSILON);
-assert.equal(latestMomentPlan.rolls, 56, '朋友圈随机等待最长只能达到 56 轮');
-assert.equal(latestMomentPlan.dueAt.getTime(), 14 * 24 * 60 * 60 * 1000, '朋友圈最迟必须在 14 天时触发');
+assert.equal(latestMomentPlan.rolls, 12, '朋友圈随机等待最长只能达到 12 轮');
+assert.equal(latestMomentPlan.dueAt.getTime(), 24 * 60 * 60 * 1000, '朋友圈最迟必须在 24 小时时触发');
 const diceScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;
@@ -2254,9 +2254,9 @@ const momentDiceScheduleProbe = await vm.runInContext(`(async () => {
   allChats = savedChats;
   return job;
 })()`, context);
-assert.equal(momentDiceScheduleProbe.rollChance, 0.10);
-assert.equal(momentDiceScheduleProbe.diceIntervalMs, 6 * 60 * 60 * 1000);
-assert.ok(momentDiceScheduleProbe.diceRolls >= 1 && momentDiceScheduleProbe.diceRolls <= 56);
+assert.equal(momentDiceScheduleProbe.rollChance, 0.20);
+assert.equal(momentDiceScheduleProbe.diceIntervalMs, 2 * 60 * 60 * 1000);
+assert.ok(momentDiceScheduleProbe.diceRolls >= 1 && momentDiceScheduleProbe.diceRolls <= 12);
 assert.equal(diceScheduleProbe.precomputedZeroChanceResult, true, '预抽任务到点后不得再次抽签');
 const proactiveChat = {
   messages: [

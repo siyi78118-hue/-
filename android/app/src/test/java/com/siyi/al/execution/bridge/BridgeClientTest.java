@@ -32,6 +32,18 @@ public class BridgeClientTest {
         assertEquals("你好 我是姜隽侑", envelope.getJSONObject("message").getString("content"));
     }
 
+    @Test public void legacyPaymentMessageIdGetsACanonicalWirePrefix() throws Exception {
+        TurnSubmission submission = new TurnSubmission(
+            "turn_pay_1784713105609_3qb4xo", "yuqi", "pay_1784713105609_3qb4xo", TurnKind.DIRECT_REPLY,
+            "{\"message\":{\"messageId\":\"pay_1784713105609_3qb4xo\",\"content\":\"姜隽倚给虞栖发了一个红包：¥20.00\",\"sentAt\":1784713105609},\"deviceSeq\":1784713105609}",
+            "{}", null, 1784713105609L
+        );
+
+        JSONObject envelope = BridgeInput.envelope(submission, config("http://lan.example"));
+
+        assertEquals("msg_pay_1784713105609_3qb4xo", envelope.getJSONObject("message").getString("messageId"));
+    }
+
     @Test public void proactiveEnvelopeContainsATriggerAndNeverFabricatesAUserMessage() throws Exception {
         TurnSubmission submission = new TurnSubmission(
             "turn_proactive_1", "yuqi", "trigger_proactive_1", TurnKind.PROACTIVE_CHAT,
