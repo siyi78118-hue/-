@@ -66,8 +66,12 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
   brain: objectSchema({
     action: { type: 'string', enum: ['send', 'skip'] },
     reply: { type: 'string' },
+    paymentAction: { anyOf: [
+      { type: 'string', enum: ['received', 'refused', 'pending'] },
+      { type: 'null' }
+    ] },
     usedFactIds: stringArray()
-  }, ['action', 'reply', 'usedFactIds']),
+  }, ['action', 'reply', 'paymentAction', 'usedFactIds']),
   supervisor: objectSchema({
     approved: { type: 'boolean' },
     issues: {

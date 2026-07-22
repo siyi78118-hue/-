@@ -140,8 +140,12 @@ public final class ExecutionEngine {
             store.commitSkip(turn.turnId, attempt.attemptId, clock.now());
             return;
         }
-        store.saveRawReply(turn.turnId, attempt.attemptId, result.replyText, clock.now());
-        attempt.rawReply = result.replyText;
+        String bridgedReply = result.replyText;
+        if ("received".equals(result.paymentStatus) || "refused".equals(result.paymentStatus) || "pending".equals(result.paymentStatus)) {
+            bridgedReply += "\n<al_payment>" + new JSONObject().put("status", result.paymentStatus).toString() + "</al_payment>";
+        }
+        store.saveRawReply(turn.turnId, attempt.attemptId, bridgedReply, clock.now());
+        attempt.rawReply = bridgedReply;
         commitStoredReply(turn, attempt);
     }
 

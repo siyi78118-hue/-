@@ -64,12 +64,12 @@ class FakeCodex {
   }
 }
 
-function withFixture(outputs, run) {
+function withFixture(outputs, run, { clock = () => 1784400000000 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-orchestrator-'));
   const store = new YuqiStore(join(dir, 'runtime.sqlite'));
   const presets = new PresetRegistry({ presetDir, store, clock: () => 1784400000000 });
   const codex = new FakeCodex(outputs);
-  const orchestrator = new YuqiOrchestrator({ store, presets, codex, workerId: 'test-worker' });
+  const orchestrator = new YuqiOrchestrator({ store, presets, codex, workerId: 'test-worker', clock });
   return Promise.resolve(run({ store, presets, codex, orchestrator })).finally(() => {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -326,7 +326,7 @@ test('automatic trigger reaches brain as currentTrigger and never becomes user e
     assert.deepEqual(supervisor.interactionState, brain.interactionState);
     assert.match(supervisor.preset, /监督.*skip|skip.*监督/s);
     assert.equal(store.listMessages('yuqi').filter(message => message.speakerType === 'user').length, 0);
-  });
+  }, { clock: () => 1784400000020 });
 });
 
 test('automatic interaction state is recomputed from current stored messages instead of a stale trigger snapshot', async () => {
@@ -348,5 +348,70 @@ test('automatic interaction state is recomputed from current stored messages ins
     assert.equal(brain.interactionState.waitingForUserReply, true);
     assert.equal(brain.interactionState.silenceMsSinceLastMessage, 5_000_065);
     assert.equal(brain.interactionState.triggerSnapshotIsAdvisory, true);
+  }, { clock: () => 1784400000065 });
+});
+
+test('a delayed direct reply is grounded in the actual processing time instead of the old message time', async () => {
+  const sentAt = 1784713105609;
+  const processingAt = sentAt + (2 * 60 * 60 * 1000) + (39 * 60 * 1000);
+  const delayed = envelope(66, '请你喝一杯');
+  delayed.createdAt = sentAt;
+  delayed.message.sentAt = sentAt;
+
+  await withFixture(normalOutputs(), async ({ codex, orchestrator }) => {
+    await orchestrator.process(delayed);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    assert.equal(brain.interactionState.computedAt, processingAt);
+    assert.equal(brain.interactionState.sourceOccurredAt, sentAt);
+    assert.equal(brain.interactionState.processingDelayMs, 9_540_000);
+    assert.equal(brain.interactionState.processingDelayText, '2小时39分钟');
+    assert.equal(brain.interactionState.replyFromPresent, true);
+  }, { clock: () => processingAt });
+});
+
+test('a payment reply commits the structured payment action beside visible text', async () => {
+  const paymentEnvelope = envelope(67, '姜隽倚给虞栖发了一个红包：¥20.00，备注：请你喝一杯');
+  paymentEnvelope.protocolVersion = 2;
+  paymentEnvelope.kind = 'DIRECT_REPLY';
+  paymentEnvelope.context = {
+    payment: {
+      kind: 'redpacket', amount: 20, note: '请你喝一杯',
+      messageId: 'pay_1784713105609_3qb4xo', status: 'pending'
+    }
+  };
+  const outputs = normalOutputs();
+  outputs.brain = [JSON.stringify({
+    action: 'send',
+    reply: '你还真请啊😂\n那我就收了',
+    paymentAction: 'received',
+    usedFactIds: []
+  })];
+
+  await withFixture(outputs, async ({ codex, orchestrator }) => {
+    const result = await orchestrator.process(paymentEnvelope);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    assert.equal(brain.currentPayment.status, 'pending');
+    assert.equal(result.paymentAction, 'received');
+    assert.equal(result.reply.content, '你还真请啊😂\n那我就收了');
+  });
+});
+
+test('accepting the same envelope again requeues a transient brain timeout', async () => {
+  const input = envelope(68, '睡了吗？');
+  await withFixture(normalOutputs(), async ({ store, orchestrator }) => {
+    const turn = orchestrator.accept(input);
+    store.claimTurnById(turn.turnId, 'worker-a');
+    store.advanceTurn(turn.turnId, 'memory_running', 'memory_done', {
+      memoryPacketJson: JSON.stringify({ query: '睡了吗？', candidates: [] })
+    });
+    store.advanceTurn(turn.turnId, 'memory_done', 'brain_running');
+    store.advanceTurn(turn.turnId, 'brain_running', 'failed', {
+      errorJson: JSON.stringify({ name: 'CodexTurnError', message: 'Codex turn timed out' })
+    });
+
+    const retried = orchestrator.accept(input);
+
+    assert.equal(retried.state, 'memory_done');
+    assert.equal(retried.errorJson, null);
   });
 });

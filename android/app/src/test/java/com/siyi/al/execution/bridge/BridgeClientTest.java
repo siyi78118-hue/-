@@ -44,6 +44,25 @@ public class BridgeClientTest {
         assertEquals("msg_pay_1784713105609_3qb4xo", envelope.getJSONObject("message").getString("messageId"));
     }
 
+    @Test public void directPaymentPreservesStructuredPendingStateForThePcRuntime() throws Exception {
+        TurnSubmission submission = new TurnSubmission(
+            "turn_pay_1784713105609_3qb4xo", "yuqi", "pay_1784713105609_3qb4xo", TurnKind.DIRECT_REPLY,
+            "{\"message\":{\"messageId\":\"pay_1784713105609_3qb4xo\",\"content\":\"红包\",\"sentAt\":1784713105609},"
+                + "\"options\":{\"paymentMessageId\":\"pay_1784713105609_3qb4xo\","
+                + "\"payment\":{\"kind\":\"redpacket\",\"amount\":20,\"note\":\"请你喝一杯\",\"status\":\"pending\"}}}",
+            "{}", null, 1784713105609L
+        );
+
+        JSONObject payment = BridgeInput.envelope(submission, config("http://lan.example"))
+            .getJSONObject("context").getJSONObject("payment");
+
+        assertEquals("redpacket", payment.getString("kind"));
+        assertEquals(20.0, payment.getDouble("amount"), 0.001);
+        assertEquals("请你喝一杯", payment.getString("note"));
+        assertEquals("pay_1784713105609_3qb4xo", payment.getString("messageId"));
+        assertEquals("pending", payment.getString("status"));
+    }
+
     @Test public void proactiveEnvelopeContainsATriggerAndNeverFabricatesAUserMessage() throws Exception {
         TurnSubmission submission = new TurnSubmission(
             "turn_proactive_1", "yuqi", "trigger_proactive_1", TurnKind.PROACTIVE_CHAT,
@@ -170,6 +189,18 @@ public class BridgeClientTest {
         BridgeResult result = status.toResult("cloud");
         assertTrue(result.skipped);
         assertEquals("", result.replyText);
+    }
+
+    @Test public void committedPaymentDecisionBecomesABridgePaymentStatus() throws Exception {
+        BridgeTurnStatus status = BridgeTurnStatus.parse(
+            "{\"turnId\":\"turn_phone_1\",\"state\":\"committed\",\"terminal\":true,"
+                + "\"action\":\"send\",\"paymentAction\":\"received\","
+                + "\"reply\":{\"content\":\"那我就收了\"}}",
+            "turn_phone_1"
+        );
+
+        BridgeResult result = status.toResult("cloud");
+        assertEquals("received", result.paymentStatus);
     }
 
     private static TurnSubmission directSubmission(long createdAt) {

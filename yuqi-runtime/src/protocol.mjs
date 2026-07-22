@@ -99,6 +99,7 @@ export function validateEnvelope(value) {
     envelope.kind = incomingKind;
     if (DIRECT_KINDS.has(envelope.kind)) {
       if (value.trigger !== undefined) throw new Error('direct turn cannot contain a trigger');
+      if (value.context !== undefined) envelope.context = validateDirectContext(value.context);
     } else if (AUTOMATIC_KINDS.has(envelope.kind)) {
       if (value.message !== undefined) throw new Error('automatic turn cannot contain a message');
       delete envelope.message;
@@ -111,6 +112,28 @@ export function validateEnvelope(value) {
 
   validateUserMessage(envelope.message, envelope);
   return envelope;
+}
+
+function validateDirectContext(context) {
+  if (!context || typeof context !== 'object' || Array.isArray(context)) {
+    throw new Error('invalid direct context');
+  }
+  if (context.payment === undefined) return {};
+  const payment = context.payment;
+  if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
+    throw new Error('invalid payment context');
+  }
+  const kind = String(payment.kind || '');
+  const amount = Number(payment.amount);
+  const note = String(payment.note || '').trim();
+  const messageId = String(payment.messageId || '');
+  const status = String(payment.status || 'pending');
+  if (!['redpacket', 'transfer'].includes(kind)) throw new Error('invalid payment kind');
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('invalid payment amount');
+  if (note.length > 500) throw new Error('payment note too large');
+  requireId(messageId, 'payment messageId');
+  if (!['pending', 'received', 'refused'].includes(status)) throw new Error('invalid payment status');
+  return { payment: { kind, amount, note, messageId, status } };
 }
 
 function validateUserMessage(message, envelope) {

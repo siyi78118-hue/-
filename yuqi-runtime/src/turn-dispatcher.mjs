@@ -21,7 +21,15 @@ export class TurnDispatcher {
     if (!turn) throw new Error('turn not found');
     if (TERMINAL_STATES.has(turn.state)) return Promise.resolve(turn);
     const task = Promise.resolve()
-      .then(() => this.orchestrator.run(turnId))
+      .then(async () => {
+        try {
+          return await this.orchestrator.run(turnId);
+        } catch (error) {
+          const recovery = this.store.requeueTransientFailedTurn?.(turnId);
+          if (!recovery?.requeued) throw error;
+          return this.orchestrator.run(turnId);
+        }
+      })
       .finally(() => this.inflight.delete(turnId));
     task.catch(() => {});
     this.inflight.set(turnId, task);

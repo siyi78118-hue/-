@@ -8,6 +8,7 @@ final class BridgeTurnStatus {
     final boolean terminal;
     final boolean allowFallback;
     final String action;
+    final String paymentStatus;
     final String errorCode;
     final String replyText;
     final long retryAfterMs;
@@ -24,7 +25,7 @@ final class BridgeTurnStatus {
 
     private BridgeTurnStatus(
         String turnId, String state, boolean terminal, boolean allowFallback,
-        String errorCode, String action, String replyText, long retryAfterMs, long recoveryAckSeq, String origin,
+        String errorCode, String action, String paymentStatus, String replyText, long retryAfterMs, long recoveryAckSeq, String origin,
         String route, String displayStage, String technicalStage, String stageModel, String stageEffort,
         long stageElapsedMs, long totalElapsedMs, String raw
     ) {
@@ -34,6 +35,7 @@ final class BridgeTurnStatus {
         this.allowFallback = allowFallback;
         this.errorCode = errorCode;
         this.action = action == null ? "" : action.trim();
+        this.paymentStatus = paymentStatus == null ? "" : paymentStatus.trim();
         this.replyText = replyText;
         this.retryAfterMs = Math.max(100L, Math.min(10_000L, retryAfterMs <= 0L ? 1_500L : retryAfterMs));
         this.recoveryAckSeq = Math.max(0L, recoveryAckSeq);
@@ -62,6 +64,7 @@ final class BridgeTurnStatus {
             root.optBoolean("allowFallback", false),
             root.optString("errorCode", ""),
             root.optString("action", replyText.isEmpty() ? "" : "send"),
+            root.optString("paymentAction", ""),
             replyText,
             root.optLong("retryAfterMs", 1_500L),
             root.optLong("recoveryAckSeq", 0L),
@@ -84,6 +87,6 @@ final class BridgeTurnStatus {
     BridgeResult toResult(String route) {
         if (!committed() && !skipped()) throw new IllegalStateException("bridge turn is not committed");
         if (skipped()) return BridgeResult.skipped(origin.isEmpty() ? route : origin, raw);
-        return BridgeResult.success(origin.isEmpty() ? route : origin, replyText, raw);
+        return BridgeResult.success(origin.isEmpty() ? route : origin, replyText, raw, paymentStatus);
     }
 }

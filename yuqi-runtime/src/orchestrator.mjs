@@ -23,10 +23,14 @@ export function hardValidateReply(reply) {
 }
 
 export function normalizeBrainDraft(draft) {
+  const paymentAction = ['received', 'refused', 'pending'].includes(draft?.paymentAction)
+    ? draft.paymentAction
+    : null;
   const normalized = {
     ...(draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}),
     action: draft?.action === 'skip' ? 'skip' : 'send',
     reply: String(draft?.reply || '').trim(),
+    paymentAction,
     usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : []
   };
   for (let depth = 0; depth < 3 && normalized.reply.startsWith('{') && normalized.reply.endsWith('}'); depth += 1) {
@@ -35,6 +39,9 @@ export function normalizeBrainDraft(draft) {
     if (!nested || typeof nested !== 'object' || Array.isArray(nested) || typeof nested.reply !== 'string') break;
     normalized.reply = nested.reply.trim();
     if (nested.action === 'skip') normalized.action = 'skip';
+    if (['received', 'refused', 'pending'].includes(nested.paymentAction)) {
+      normalized.paymentAction = nested.paymentAction;
+    }
     if (!normalized.usedFactIds.length && Array.isArray(nested.usedFactIds)) {
       normalized.usedFactIds = nested.usedFactIds.map(String);
     }
@@ -46,18 +53,50 @@ function isAutomaticKind(kind) {
   return ['ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_PRIVATE', 'PROACTIVE_CHAT', 'PROACTIVE_MOMENT'].includes(kind);
 }
 
-export function buildInteractionState(envelope, recentMessages) {
+function elapsedText(value) {
+  const milliseconds = Math.max(0, Number(value) || 0);
+  const minutes = Math.floor(milliseconds / 60_000);
+  if (minutes < 1) return '不到1分钟';
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (hours < 24) return `${hours}小时${remainingMinutes ? `${remainingMinutes}分钟` : ''}`;
+  const days = Math.floor(hours / 24);
+  const remainingHours = hours % 24;
+  return `${days}天${remainingHours ? `${remainingHours}小时` : ''}`;
+}
+
+function delayClass(milliseconds) {
+  if (milliseconds < 5 * 60_000) return 'immediate';
+  if (milliseconds < 60 * 60_000) return 'minutes';
+  if (milliseconds < 6 * 60 * 60_000) return 'hours';
+  if (milliseconds < 24 * 60 * 60_000) return 'same_day_long_gap';
+  return 'day_or_more';
+}
+
+export function buildInteractionState(envelope, recentMessages, computedAt = Date.now()) {
   const messages = [...recentMessages].sort((left, right) => Number(left.sentAt || 0) - Number(right.sentAt || 0));
-  const computedAt = Number(envelope.trigger?.executedAt || envelope.createdAt || Date.now());
+  const currentTime = Number(computedAt || Date.now());
+  const sourceOccurredAt = Number(
+    envelope.message?.sentAt || envelope.trigger?.executedAt || envelope.trigger?.scheduledFor || envelope.createdAt || currentTime
+  );
+  const processingDelayMs = Math.max(0, currentTime - sourceOccurredAt);
   const lastMessage = messages.at(-1) || null;
   const lastUserMessage = [...messages].reverse().find(message => message.speakerId === 'user') || null;
   const lastYuqiMessage = [...messages].reverse().find(message => message.speakerId === envelope.characterId) || null;
   const unansweredOutgoingCount = lastUserMessage
     ? messages.filter(message => message.speakerId === envelope.characterId && Number(message.sentAt || 0) > Number(lastUserMessage.sentAt || 0)).length
     : messages.filter(message => message.speakerId === envelope.characterId).length;
-  const elapsed = message => message ? Math.max(0, computedAt - Number(message.sentAt || computedAt)) : null;
+  const elapsed = message => message ? Math.max(0, currentTime - Number(message.sentAt || currentTime)) : null;
   return {
-    computedAt,
+    computedAt: currentTime,
+    computedAtIso: new Date(currentTime).toISOString(),
+    sourceOccurredAt,
+    sourceOccurredAtIso: new Date(sourceOccurredAt).toISOString(),
+    processingDelayMs,
+    processingDelayText: elapsedText(processingDelayMs),
+    processingDelayClass: delayClass(processingDelayMs),
+    replyFromPresent: true,
     lastMessageId: lastMessage?.messageId || null,
     lastSpeakerId: lastMessage?.speakerId || null,
     lastUserMessageId: lastUserMessage?.messageId || null,
@@ -69,6 +108,18 @@ export function buildInteractionState(envelope, recentMessages) {
     waitingForUserReply: unansweredOutgoingCount > 0,
     triggerSnapshotIsAdvisory: Boolean(envelope.trigger?.context?.snapshot)
   };
+}
+
+function inferredPaymentAction(text) {
+  const value = String(text || '');
+  if (/(?:不收|不领|拒收|退给你|还给你|你拿回去)/.test(value)) return 'refused';
+  if (/(?:那我就收|我收下|收了|领了|领取了|点开了|拆了)/.test(value)) return 'received';
+  return null;
+}
+
+function resolvedPaymentAction(envelope, draft) {
+  if (!envelope.context?.payment) return null;
+  return inferredPaymentAction(draft.reply) || draft.paymentAction || 'pending';
 }
 
 function repairReplyForDelivery(reply, kind = 'DIRECT_REPLY') {
@@ -97,7 +148,11 @@ export class YuqiOrchestrator {
   }
 
   accept(envelope) {
-    const submitted = this.store.submitTurn(envelope);
+    let submitted = this.store.submitTurn(envelope);
+    if (submitted.state === 'failed') {
+      const recovery = this.store.requeueTransientFailedTurn(submitted.turnId);
+      if (recovery.requeued) submitted = recovery.turn;
+    }
     if (submitted.state === 'queued' && (!submitted.routeReasons || submitted.routeReasons.length === 0)) {
       const decision = selectTurnRoute({
         envelope,
@@ -255,7 +310,7 @@ export class YuqiOrchestrator {
 
   async completeBrain(envelope, current) {
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
-    const interactionState = buildInteractionState(envelope, recentMessages);
+    const interactionState = buildInteractionState(envelope, recentMessages, this.clock());
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
@@ -272,6 +327,7 @@ export class YuqiOrchestrator {
         revealedFactIds: evidencePack.facts.map(fact => fact.factId)
       }),
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
+      ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       recentMessages,
       interactionState,
       evidencePack,
@@ -291,7 +347,7 @@ export class YuqiOrchestrator {
   async completeSupervisor(envelope, current) {
     const draft = parseRoleJson(current.brainDraftJson, 'brain');
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
-    const interactionState = buildInteractionState(envelope, recentMessages);
+    const interactionState = buildInteractionState(envelope, recentMessages, this.clock());
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     const evidencePack = buildEvidencePack(this.store, {
       characterId: envelope.characterId,
@@ -305,6 +361,7 @@ export class YuqiOrchestrator {
       task: 'review_yuqi_reply',
       preset: this.presets.compileFor('supervisor', { stage: 'initial' }),
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
+      ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       recentMessages,
       interactionState,
       evidencePack,
@@ -350,6 +407,7 @@ export class YuqiOrchestrator {
         turnId: envelope.turnId,
         presetVersion: this.presets.current().version,
         action: 'skip',
+        paymentAction: null,
         reply: null,
         usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
       };
@@ -375,6 +433,7 @@ export class YuqiOrchestrator {
       turnId: envelope.turnId,
       presetVersion: this.presets.current().version,
       action: 'send',
+      paymentAction: resolvedPaymentAction(envelope, draft),
       reply: savedReply,
       usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
     };

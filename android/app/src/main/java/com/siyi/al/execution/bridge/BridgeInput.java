@@ -57,6 +57,23 @@ final class BridgeInput {
             .put("kind", submission.kind.name());
         if (submission.kind == com.siyi.al.execution.TurnKind.DIRECT_REPLY) {
             envelope.put("message", userMessage(submission));
+            JSONObject input = source(submission);
+            JSONObject options = input.optJSONObject("options");
+            JSONObject suppliedPayment = options == null ? null : options.optJSONObject("payment");
+            if (suppliedPayment != null) {
+                String kind = suppliedPayment.optString("kind", suppliedPayment.optString("type", "")).trim().toLowerCase(java.util.Locale.ROOT);
+                double amount = Math.round(suppliedPayment.optDouble("amount", 0) * 100.0) / 100.0;
+                String messageId = options.optString("paymentMessageId", submission.sourceMessageId).trim();
+                if (("redpacket".equals(kind) || "transfer".equals(kind)) && amount > 0 && !messageId.isEmpty()) {
+                    JSONObject payment = new JSONObject()
+                        .put("kind", kind)
+                        .put("amount", amount)
+                        .put("note", suppliedPayment.optString("note", "").replaceAll("\\s+", " ").trim())
+                        .put("messageId", messageId)
+                        .put("status", suppliedPayment.optString("status", "pending").trim().toLowerCase(java.util.Locale.ROOT));
+                    envelope.put("context", new JSONObject().put("payment", payment));
+                }
+            }
             return envelope;
         }
 

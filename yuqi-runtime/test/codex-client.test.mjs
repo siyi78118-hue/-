@@ -103,7 +103,7 @@ test('pins the approved model, high effort, and a strict schema for every brain 
   const started = protocolLines(logFile).find(item => item.method === 'turn/start');
   assert.equal(started.params.model, 'gpt-5.6-sol');
   assert.equal(started.params.effort, 'high');
-  assert.deepEqual(started.params.outputSchema.required, ['action', 'reply', 'usedFactIds']);
+  assert.deepEqual(started.params.outputSchema.required, ['action', 'reply', 'paymentAction', 'usedFactIds']);
   assert.equal(started.params.outputSchema.additionalProperties, false);
   assert.deepEqual(started.params.outputSchema.properties.action.enum, ['send', 'skip']);
   assert.equal(started.params.outputSchema.properties.reply.type, 'string');

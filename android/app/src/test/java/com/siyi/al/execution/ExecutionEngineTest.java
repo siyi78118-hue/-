@@ -70,6 +70,26 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void bridgedPaymentDecisionCommitsVisibleTextAndPaymentStatusTogether() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                return BridgeResult.success("codex", "那我就收了", "{}", "received");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) { throw new AssertionError(); }
+        };
+        ExecutionEngine engine = new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(2, store.replyParts.size());
+        assertEquals("TEXT", store.replyParts.get(0).type);
+        assertEquals("PAYMENT_STATUS", store.replyParts.get(1).type);
+        assertEquals("received", new JSONObject(store.replyParts.get(1).payloadJson).getString("status"));
+    }
+
+    @Test
     public void recoveredMemoryRunningBridgeResumesTheSameRemoteTurnWithoutLegacyStages() throws Exception {
         FakeStore store = new FakeStore(turn("MEMORY_RUNNING", null), attempt("MEMORY_RUNNING", null));
         BridgedGateway gateway = new BridgedGateway();

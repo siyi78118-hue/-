@@ -121,6 +121,41 @@ test('protocol v2 direct turn preserves the exact user message and kind', () => 
   assert.equal(value.trigger, undefined);
 });
 
+test('protocol v2 direct turn preserves validated pending payment context', () => {
+  const envelope = validateEnvelope(validV2Envelope({
+    context: {
+      payment: {
+        kind: 'redpacket', amount: 20, note: '请你喝一杯',
+        messageId: 'pay_1784713105609_3qb4xo', status: 'pending'
+      }
+    }
+  }));
+
+  assert.deepEqual(envelope.context.payment, {
+    kind: 'redpacket', amount: 20, note: '请你喝一杯',
+    messageId: 'pay_1784713105609_3qb4xo', status: 'pending'
+  });
+});
+
+test('public committed status exposes the structured payment action', () => {
+  const status = publicTurnStatus({
+    turnId: 'turn_payment_status_1',
+    state: 'committed',
+    origin: 'codex',
+    route: 'fast',
+    routeReasons: [],
+    createdAt: 1000,
+    updatedAt: 2000,
+    replyJson: JSON.stringify({
+      action: 'send',
+      paymentAction: 'received',
+      reply: { content: '那我就收了', origin: 'codex' }
+    })
+  }, { clock: () => 2000 });
+
+  assert.equal(status.paymentAction, 'received');
+});
+
 test('protocol v2 accepts legacy payment ids by canonicalizing them before validation', () => {
   const value = validateEnvelope(validV2Envelope({
     turnId: 'turn_pay_1784713105609_3qb4xo',
@@ -359,6 +394,52 @@ test('recovers a failed brain draft as one committed reply and resets cloud deli
   assert.equal(delivery.checksum, '');
   assert.equal(repeated.recovered, false);
   assert.equal(repeated.result.reply.messageId, recovered.result.reply.messageId);
+}));
+
+test('requeues a transient brain timeout from the completed memory checkpoint', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  store.claimTurnById(turn.turnId, 'worker-a');
+  store.advanceTurn(turn.turnId, 'memory_running', 'memory_done', {
+    memoryPacketJson: JSON.stringify({ query: '睡了吗？', candidates: [] })
+  });
+  store.advanceTurn(turn.turnId, 'memory_done', 'brain_running');
+  store.advanceTurn(turn.turnId, 'brain_running', 'failed', {
+    errorJson: JSON.stringify({ name: 'CodexTurnError', message: 'Codex turn timed out' })
+  });
+  store.registerCloudDelivery(turn.turnId, 'phone_peer', 42);
+  const failedDelivery = store.prepareCloudDelivery(turn.turnId, 'phone_peer', {
+    turnId: turn.turnId, state: 'failed', terminal: true
+  });
+  store.markCloudDeliveryAttempt(turn.turnId, 'phone_peer');
+  store.markCloudDeliveryMailboxed(turn.turnId, 'phone_peer', failedDelivery.checksum);
+
+  const recovered = store.requeueTransientFailedTurn(turn.turnId);
+  const saved = store.getTurn(turn.turnId);
+  const [delivery] = store.listCloudDeliveries(turn.turnId);
+
+  assert.equal(recovered.requeued, true);
+  assert.equal(saved.state, 'memory_done');
+  assert.deepEqual(JSON.parse(saved.memoryPacketJson), { query: '睡了吗？', candidates: [] });
+  assert.equal(saved.workerId, '');
+  assert.equal(saved.errorJson, null);
+  assert.equal(delivery.state, 'waiting');
+  assert.equal(delivery.recoveryAckSeq, 42);
+  assert.equal(delivery.checksum, '');
+  assert.equal(delivery.attempts, 0);
+  assert.equal(store.requeueTransientFailedTurn(turn.turnId).requeued, false);
+}));
+
+test('does not requeue a permanent orchestration failure', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  store.claimTurnById(turn.turnId, 'worker-a');
+  store.advanceTurn(turn.turnId, 'memory_running', 'failed', {
+    errorJson: JSON.stringify({ name: 'Error', message: 'invalid memory packet' })
+  });
+
+  const result = store.requeueTransientFailedTurn(turn.turnId);
+
+  assert.equal(result.requeued, false);
+  assert.equal(store.getTurn(turn.turnId).state, 'failed');
 }));
 
 test('a proactive reply stays outside shared memory until the phone confirms persistence', () => withStore(({ store }) => {

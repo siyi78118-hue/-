@@ -56,3 +56,40 @@ test('recover schedules every persisted nonterminal turn', async () => {
   await dispatcher.idle();
   assert.deepEqual(runs.sort(), ['turn_recover_1', 'turn_recover_2']);
 });
+
+test('a transient Codex timeout is automatically retried once from its checkpoint', async () => {
+  let runs = 0;
+  let requeues = 0;
+  const turn = { turnId: 'turn_timeout_1', state: 'memory_done' };
+  const store = {
+    getTurn: () => turn,
+    listRecoverableTurns: () => [],
+    requeueTransientFailedTurn() {
+      requeues += 1;
+      turn.state = 'memory_done';
+      return { requeued: true, turn: { ...turn } };
+    }
+  };
+  const dispatcher = new TurnDispatcher({
+    store,
+    orchestrator: {
+      accept: () => turn,
+      async run() {
+        runs += 1;
+        if (runs === 1) {
+          turn.state = 'failed';
+          throw new Error('Codex turn timed out');
+        }
+        turn.state = 'committed';
+        return { turnId: turn.turnId };
+      }
+    }
+  });
+
+  dispatcher.schedule(turn.turnId);
+  await dispatcher.idle();
+
+  assert.equal(runs, 2);
+  assert.equal(requeues, 1);
+  assert.equal(turn.state, 'committed');
+});
