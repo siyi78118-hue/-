@@ -33,9 +33,9 @@ jobs:
     timeout-minutes: 15
     env:
       EXPECTED_PACKAGE: com.siyi.al
-      EXPECTED_VERSION_CODE: "84"
-      EXPECTED_VERSION_NAME: "1.0.84"
-      EXPECTED_SOURCE_SHA256: ABBC5057785795799A377C2DF292B31DD5A6CCF728B408EA8496B349AC6841A8
+      EXPECTED_VERSION_CODE: "87"
+      EXPECTED_VERSION_NAME: "1.0.87"
+      EXPECTED_SOURCE_SHA256: F1BA04A68E0EC9FC330942E785201DDC929FCCED019F9F2D285402355A3D2D78
       EXPECTED_TARGET_SIGNER_SHA256: 5761277E3BDF4A64236C3BAD569DE6A07666581F643167D01E37F13E9E832B2B
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -47,8 +47,8 @@ jobs:
           SOURCE_SHA256: ${{ inputs.source_sha256 }}
         run: |
           set -euo pipefail
-          test "$SOURCE_TAG" = "android-v84-source-20260722"
-          test "$SOURCE_REF" = "codex/android-v84-source"
+          test "$SOURCE_TAG" = "android-v87-source-20260723"
+          test "$SOURCE_REF" = "codex/android-v87-source"
           test "$VERSION_CODE" = "$EXPECTED_VERSION_CODE"
           test "$(printf '%s' "$SOURCE_SHA256" | tr '[:lower:]' '[:upper:]')" = "$EXPECTED_SOURCE_SHA256"
           CURRENT_MANIFEST="$(gh api -H 'Accept: application/vnd.github.raw+json' 'repos/${{ github.repository }}/contents/android-update.json?ref=update-channel')"
@@ -180,11 +180,11 @@ jobs:
             gh release upload "$TAG" output/app-release.apk --repo '${{ github.repository }}' --clobber
             RELEASE_RESULT=$?
             if [ "$RELEASE_RESULT" -eq 0 ]; then
-              gh release edit "$TAG" --repo '${{ github.repository }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证未签名 1.0.84 APK 使用现有 AL 正式证书签名，可通过应用内更新覆盖安装。" --latest
+              gh release edit "$TAG" --repo '${{ github.repository }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证未签名 1.0.87 APK 使用现有 AL 正式证书签名，可通过应用内更新覆盖安装。" --latest
               RELEASE_RESULT=$?
             fi
           else
-            gh release create "$TAG" --repo '${{ github.repository }}' --target '${{ github.sha }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证未签名 1.0.84 APK 使用现有 AL 正式证书签名，可通过应用内更新覆盖安装。" --latest output/app-release.apk
+            gh release create "$TAG" --repo '${{ github.repository }}' --target '${{ github.sha }}' --title "AL Android $EXPECTED_VERSION_NAME" --notes "AL Android $EXPECTED_VERSION_NAME。该安装包由用户提供的已验证未签名 1.0.87 APK 使用现有 AL 正式证书签名，可通过应用内更新覆盖安装。" --latest output/app-release.apk
             RELEASE_RESULT=$?
           fi
           if [ "$RELEASE_RESULT" -eq 0 ]; then
@@ -203,11 +203,11 @@ jobs:
         if: steps.publish_release.outputs.release_asset_published != 'true'
         run: |
           set -euo pipefail
-          cp output/app-release.apk update-channel-repo/app-release-v84.apk
+          cp output/app-release.apk update-channel-repo/app-release-v87.apk
           cd update-channel-repo
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add app-release-v84.apk
+          git add app-release-v87.apk
           if ! git diff --cached --quiet; then
             git commit -m "Publish AL Android $EXPECTED_VERSION_NAME fallback APK"
           fi
@@ -219,7 +219,7 @@ jobs:
           if [ '${{ steps.publish_release.outputs.release_asset_published }}' = 'true' ]; then
             RELEASE_URL="https://github.com/${{ github.repository }}/releases/download/android-v$EXPECTED_VERSION_CODE/app-release.apk"
           else
-            RELEASE_URL="https://raw.githubusercontent.com/${{ github.repository }}/update-channel/app-release-v84.apk"
+            RELEASE_URL="https://raw.githubusercontent.com/${{ github.repository }}/update-channel/app-release-v87.apk"
           fi
           MANIFEST=$(printf '{\n  "latestBuild": %s,\n  "version": "%s",\n  "releaseUrl": "%s"\n}\n' \
             "$EXPECTED_VERSION_CODE" \
