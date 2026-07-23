@@ -1,12 +1,12 @@
 {
-  "verifiedAt": "2026-07-23T17:45:27.5776301+08:00",
+  "verifiedAt": "2026-07-23T18:13:13.7164524+08:00",
   "branch": "codex/al-tdd",
-  "presetVersion": "1.6.0",
+  "presetVersion": "1.7.0",
   "checks": {
     "javascript": {
       "command": "npm.cmd test",
       "status": "passed",
-      "nodeTestCount": 202,
+      "nodeTestCount": 208,
       "additionalScriptChecks": [
         "basic app checks passed",
         "Service Worker automatic-task guard tests passed"
@@ -20,11 +20,11 @@
     },
     "runtime": {
       "restartStatus": "passed",
-      "pid": 31588,
+      "pid": 26352,
       "health": {
         "ok": true,
         "service": "yuqi-runtime",
-        "presetVersion": "1.6.0",
+        "presetVersion": "1.7.0",
         "contextLimit": 200,
         "roleThreads": {
           "memory": true,
@@ -32,6 +32,12 @@
           "supervisor": true
         },
         "cloudRelayConnected": true
+      },
+      "lifePlanner": {
+        "decisionRole": "brain",
+        "sourceTurnId": "life_plan_49ba0ee9a13baeabcb86b92d",
+        "status": "persisted",
+        "legacyFixedTemplateRetired": true
       }
     }
   },
@@ -40,7 +46,9 @@
     "conversation gap excludes the current message batch and model processing delay",
     "open-topic interruption state reaches memory, brain, and supervisor",
     "persistent life episodes survive restart and catch up without overlap",
-    "approved user-influenced life adjustments commit with the reply",
+    "the chat brain owns a persistent 6-24 hour life plan and replans only when the remaining horizon is under 6 hours",
+    "approved user-influenced life adjustments commit atomically with direct replies and moment interactions",
+    "life decisions on the fast route are upgraded to supervisor review",
     "base closeness and conflict/cooling/repair phase advance independently from verified evidence"
   ],
   "controlledVisibleTurn": null,
