@@ -89,6 +89,13 @@ test('legacy fixed-template future episodes are retired so the chat brain can ta
 
     assert.equal(store.getLifeEpisode('life_legacy_template').status, 'cancelled');
     assert.equal(context.needsPlan, true);
+    assert.doesNotThrow(() => store.putLifePlan('yuqi', [{
+      episodeId: 'life_chat_brain_replacement',
+      kind: 'personal',
+      title: '聊天小 G 重新安排的生活',
+      startAt: now,
+      endAt: now + 8 * 60 * 60_000
+    }], { sourceTurnId: 'life_plan_replacement' }));
   });
 });
 

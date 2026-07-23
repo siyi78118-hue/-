@@ -1092,7 +1092,7 @@ export class YuqiStore {
         }
         const overlap = this.db.prepare(`
           SELECT episode_id FROM life_episodes
-          WHERE character_id = ? AND start_at < ? AND end_at > ?
+          WHERE character_id = ? AND status != 'cancelled' AND start_at < ? AND end_at > ?
           LIMIT 1
         `).get(safeCharacterId, episode.endAt, episode.startAt);
         if (overlap && !incomingIds.has(overlap.episode_id)) throw new Error('life episode overlap');
