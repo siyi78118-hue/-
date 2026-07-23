@@ -80,6 +80,24 @@ public class BridgeClientTest {
         assertEquals("今天很忙", scene.getString("conversationExtraPrompt"));
     }
 
+    @Test public void directTurnCarriesTheWholeCurrentMessageBatchBoundary() throws Exception {
+        TurnSubmission submission = new TurnSubmission(
+            "turn_phone_batch_1", "yuqi", "msg_batch_2", TurnKind.DIRECT_REPLY,
+            "{\"message\":{\"messageId\":\"msg_batch_2\",\"content\":\"现在回来了\",\"sentAt\":1784787600000},"
+                + "\"options\":{\"batchId\":\"batch_1\",\"batchMessageIds\":[\"msg_batch_1\",\"msg_batch_2\"]}}",
+            "{}", null, 1784787605000L
+        );
+
+        JSONObject currentBatch = BridgeInput.envelope(submission, config("http://lan.example"))
+            .getJSONObject("context").getJSONObject("currentBatch");
+
+        assertEquals("batch_1", currentBatch.getString("batchId"));
+        assertEquals(2, currentBatch.getJSONArray("messageIds").length());
+        assertEquals("msg_batch_1", currentBatch.getJSONArray("messageIds").getString(0));
+        assertEquals(1784787600000L, currentBatch.getLong("startedAt"));
+        assertEquals(1784787605000L, currentBatch.getLong("committedAt"));
+    }
+
     @Test public void proactiveEnvelopeContainsATriggerAndNeverFabricatesAUserMessage() throws Exception {
         TurnSubmission submission = new TurnSubmission(
             "turn_proactive_1", "yuqi", "trigger_proactive_1", TurnKind.PROACTIVE_CHAT,

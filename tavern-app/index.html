@@ -2120,7 +2120,9 @@ function buildAndroidUserReplyTask(charId, userMessageId, userText, options = {}
       paymentMessageId: options.paymentMessageId || '',
       payment: options.payment || null,
       batchId: options.batchId || '',
-      batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : []
+      batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : [],
+      batchStartedAt: Math.max(1, Number(options.batchStartedAt) || Number(createdAt) || Date.now()),
+      batchCommittedAt: Math.max(1, Number(options.batchCommittedAt) || Number(createdAt) || Date.now())
     },
     status: 'pending',
     createdAt
@@ -3259,6 +3261,8 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     options: task.options,
     batchId: task.options.batchId || '',
     batchMessageIds: [...task.options.batchMessageIds],
+    batchStartedAt: task.options.batchStartedAt,
+    batchCommittedAt: task.options.batchCommittedAt,
     state: 'pending',
     createdAt: task.createdAt,
     updatedAt: Date.now(),
@@ -6962,7 +6966,9 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     paymentMessageId: options.paymentMessageId || '',
     payment: options.payment || null,
     batchId: options.batchId || '',
-    batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : []
+    batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : [],
+    batchStartedAt: Math.max(1, Number(options.batchStartedAt) || Number(chat.pendingReply?.createdAt) || Date.now()),
+    batchCommittedAt: Math.max(1, Number(options.batchCommittedAt) || Number(chat.pendingReply?.updatedAt) || Date.now())
   };
   chat.pendingReply = {
     userMessageId,
@@ -6970,6 +6976,8 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     options: storedOptions,
     batchId: storedOptions.batchId,
     batchMessageIds: [...storedOptions.batchMessageIds],
+    batchStartedAt: storedOptions.batchStartedAt,
+    batchCommittedAt: storedOptions.batchCommittedAt,
     state: 'running',
     requestToken,
     createdAt: Number(chat.pendingReply?.createdAt) || Date.now(),
@@ -8122,6 +8130,8 @@ async function finishStagedBatch(charId = currentCharId) {
   const options = {
     batchId: committed.batchId,
     batchMessageIds,
+    batchStartedAt: Number(committed.messages?.[0]?.time) || committed.committedAt,
+    batchCommittedAt: committed.committedAt,
     ...(paymentMessage ? {
       paymentMessageId: paymentMessage.id,
       payment: { kind: kind, amount: Number(paymentMessage.amount) || 0, note: String(paymentMessage.note || '') }

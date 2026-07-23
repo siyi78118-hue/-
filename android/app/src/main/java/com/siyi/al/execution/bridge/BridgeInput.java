@@ -1,6 +1,7 @@
 package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.TurnSubmission;
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 final class BridgeInput {
@@ -62,6 +63,25 @@ final class BridgeInput {
             JSONObject options = input.optJSONObject("options");
             JSONObject suppliedPayment = options == null ? null : options.optJSONObject("payment");
             JSONObject context = new JSONObject();
+            JSONArray suppliedMessageIds = options == null ? null : options.optJSONArray("batchMessageIds");
+            JSONArray messageIds = suppliedMessageIds == null
+                ? new JSONArray()
+                : new JSONArray(suppliedMessageIds.toString());
+            String currentMessageId = envelope.getJSONObject("message").getString("messageId");
+            if (messageIds.length() == 0) messageIds.put(currentMessageId);
+            long messageSentAt = envelope.getJSONObject("message").getLong("sentAt");
+            JSONObject currentBatch = new JSONObject()
+                .put("batchId", options == null
+                    ? "batch_" + currentMessageId
+                    : options.optString("batchId", "batch_" + currentMessageId))
+                .put("messageIds", messageIds)
+                .put("startedAt", options == null
+                    ? messageSentAt
+                    : options.optLong("batchStartedAt", messageSentAt))
+                .put("committedAt", options == null
+                    ? submission.createdAt
+                    : options.optLong("batchCommittedAt", submission.createdAt));
+            context.put("currentBatch", currentBatch);
             JSONObject scene = snapshot.optJSONObject("scene");
             if (scene != null) context.put("scene", new JSONObject(scene.toString()));
             if (suppliedPayment != null) {

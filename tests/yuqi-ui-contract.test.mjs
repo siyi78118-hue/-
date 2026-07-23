@@ -68,6 +68,22 @@ test('native direct replies submit a canonical attributed user message', () => {
   assert.match(html, /sentAt:\s*Number\(userMessage\.time\)\s*\|\|\s*task\.createdAt/);
 });
 
+test('native direct replies preserve the complete current batch time boundary', () => {
+  const builder = html.slice(
+    html.indexOf('function buildAndroidUserReplyTask'),
+    html.indexOf('async function dumpCharacterMemoryForRunner')
+  );
+  assert.match(builder, /batchMessageIds/);
+  assert.match(builder, /batchStartedAt/);
+  assert.match(builder, /batchCommittedAt/);
+  const commit = html.slice(
+    html.indexOf('async function finishStagedBatch'),
+    html.indexOf('async function sendInput')
+  );
+  assert.match(commit, /batchStartedAt:\s*Number\(committed\.messages\?\.\[0\]\?\.time\)/);
+  assert.match(commit, /batchCommittedAt:\s*committed\.committedAt/);
+});
+
 test('native snapshots expose the current Yuqi dynamic scene separately from fixed RP', () => {
   assert.match(html, /function\s+buildYuqiDynamicScene\(char,\s*chat\)/);
   const builder = html.slice(

@@ -323,6 +323,9 @@ export class YuqiOrchestrator {
   async completeMemory(envelope) {
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
     const scene = sceneFromEnvelope(envelope);
+    const interactionState = buildAuthoritativeInteractionState({
+      envelope, messages: recentMessages, currentStage: scene.relationshipStage, now: this.clock()
+    });
     const memoryRequest = {
       task: envelope.message ? 'retrieve_and_extract_evidence' : 'retrieve_context_for_trigger',
       preset: this.presets.compileFor('memory', { scene: { ...scene, kind: envelope.kind } }),
@@ -330,7 +333,8 @@ export class YuqiOrchestrator {
       ...(envelope.message
         ? { currentMessageId: envelope.message.messageId }
         : { currentTrigger: envelope.trigger, triggerIsNotUserEvidence: true }),
-      recentMessages
+      recentMessages,
+      interactionState
     };
     let current = this.store.getTurn(envelope.turnId);
     const initialRoute = current.route === 'fast' ? 'fast' : 'deep';
