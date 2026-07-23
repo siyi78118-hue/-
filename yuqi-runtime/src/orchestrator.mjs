@@ -84,6 +84,18 @@ function normalizeConversationFrame(frame) {
   const initiative = source.initiative && typeof source.initiative === 'object' && !Array.isArray(source.initiative)
     ? source.initiative
     : {};
+  const priorTopic = source.priorTopic && typeof source.priorTopic === 'object' && !Array.isArray(source.priorTopic)
+    ? source.priorTopic
+    : {};
+  const interruption = source.interruption && typeof source.interruption === 'object' && !Array.isArray(source.interruption)
+    ? source.interruption
+    : {};
+  const priorTopicStatus = ['closed', 'open', 'uncertain'].includes(priorTopic.status)
+    ? priorTopic.status
+    : 'uncertain';
+  const waitingOn = ['user', 'yuqi', 'either', 'none', 'unclear'].includes(priorTopic.waitingOn)
+    ? priorTopic.waitingOn
+    : 'unclear';
   return {
     surfaceAct: String(source.surfaceAct || ''),
     intentHypotheses: Array.isArray(source.intentHypotheses)
@@ -100,6 +112,19 @@ function normalizeConversationFrame(frame) {
       topicIntroducedBy: String(initiative.topicIntroducedBy || 'unclear'),
       suggestedNextCarrier: String(initiative.suggestedNextCarrier || 'unclear'),
       reason: String(initiative.reason || '')
+    },
+    priorTopic: {
+      status: priorTopicStatus,
+      summary: String(priorTopic.summary || ''),
+      waitingOn,
+      evidenceMessageIds: Array.isArray(priorTopic.evidenceMessageIds)
+        ? priorTopic.evidenceMessageIds.map(String)
+        : [],
+      reason: String(priorTopic.reason || '')
+    },
+    interruption: {
+      requiresReaction: interruption.requiresReaction === true,
+      reactionReason: String(interruption.reactionReason || '')
     },
     activeHooks: Array.isArray(source.activeHooks) ? source.activeHooks.map(String) : [],
     ambiguities: Array.isArray(source.ambiguities) ? source.ambiguities.map(String) : [],

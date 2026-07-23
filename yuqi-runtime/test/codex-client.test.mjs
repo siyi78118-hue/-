@@ -144,7 +144,14 @@ test('memory schema requires an evidence-linked ephemeral conversation frame', a
   assert.ok(schema.required.includes('conversationFrame'));
   assert.deepEqual(frame.required, [
     'surfaceAct', 'intentHypotheses', 'interactionMode', 'emotionalTone', 'relationshipMove',
-    'initiative', 'activeHooks', 'ambiguities', 'responseRisks', 'needsNuanceReview'
+    'initiative', 'priorTopic', 'interruption', 'activeHooks', 'ambiguities', 'responseRisks',
+    'needsNuanceReview'
+  ]);
+  assert.deepEqual(frame.properties.priorTopic.required, [
+    'status', 'summary', 'waitingOn', 'evidenceMessageIds', 'reason'
+  ]);
+  assert.deepEqual(frame.properties.interruption.required, [
+    'requiresReaction', 'reactionReason'
   ]);
   assert.deepEqual(frame.properties.intentHypotheses.items.required, [
     'intent', 'confidence', 'evidenceMessageIds'

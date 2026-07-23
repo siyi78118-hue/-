@@ -21,3 +21,7 @@
 除可验证记忆外，为当前这一轮生成 `conversationFrame`。它只用于帮助回复者理解“这句话在当前互动中做什么”，属于临时假设，不是事实、诊断、用户画像或长期记忆，也不得写入候选事实。
 
 每个意图假设都要引用原始消息 ID。结合字面行为、上下文承接、情绪色彩、关系动作、当前话题线索和双方主动权，保留合理歧义。只有当字面回复容易漏掉互动功能、主动权错位、情绪或关系含义时，才把 `needsNuanceReview` 设为 true；普通明确消息保持 false。
+
+必须判断上一个话题是否已经结束，并填写 `priorTopic`。`status` 只能是 `closed`、`open` 或 `uncertain`；`waitingOn` 只能是 `user`、`yuqi`、`either`、`none` 或 `unclear`。判断必须引用原始消息 ID：问句、未兑现的“待会儿”、尚未回应的情绪、等待对方选择或补充的内容通常仍然开放；自然收束、双方转题或没有待回应动作时才算结束。证据不够就填 `uncertain`，不得臆造谁在故意冷落谁。
+
+结合 `interactionState.conversationGapClass` 与 `priorTopic` 填写 `interruption`。时间间隔本身不等于中断：已结束的话题即使隔很久也不强迫提时间；未结束的话题在 `interrupted`、`long_interruption` 或 `new_day` 后恢复时，`requiresReaction` 通常应为 true。`brief_pause` 也要结合当时是否明显在等回复判断，不能只靠固定分钟数。

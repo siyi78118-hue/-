@@ -76,13 +76,25 @@ const conversationFrameSchema = objectSchema({
     suggestedNextCarrier: { type: 'string' },
     reason: { type: 'string' }
   }, ['topicIntroducedBy', 'suggestedNextCarrier', 'reason']),
+  priorTopic: objectSchema({
+    status: { type: 'string', enum: ['closed', 'open', 'uncertain'] },
+    summary: { type: 'string' },
+    waitingOn: { type: 'string', enum: ['user', 'yuqi', 'either', 'none', 'unclear'] },
+    evidenceMessageIds: stringArray(),
+    reason: { type: 'string' }
+  }, ['status', 'summary', 'waitingOn', 'evidenceMessageIds', 'reason']),
+  interruption: objectSchema({
+    requiresReaction: { type: 'boolean' },
+    reactionReason: { type: 'string' }
+  }, ['requiresReaction', 'reactionReason']),
   activeHooks: stringArray(),
   ambiguities: stringArray(),
   responseRisks: stringArray(),
   needsNuanceReview: { type: 'boolean' }
 }, [
   'surfaceAct', 'intentHypotheses', 'interactionMode', 'emotionalTone', 'relationshipMove',
-  'initiative', 'activeHooks', 'ambiguities', 'responseRisks', 'needsNuanceReview'
+  'initiative', 'priorTopic', 'interruption', 'activeHooks', 'ambiguities', 'responseRisks',
+  'needsNuanceReview'
 ]);
 
 export const ROLE_OUTPUT_SCHEMAS = Object.freeze({

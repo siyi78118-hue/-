@@ -116,6 +116,17 @@ function conversationFrame(overrides = {}) {
       suggestedNextCarrier: 'yuqi',
       reason: 'the user is responding to the existing hook'
     },
+    priorTopic: {
+      status: 'open',
+      summary: 'Yuqi was waiting for the user to continue the topic',
+      waitingOn: 'user',
+      evidenceMessageIds: ['msg_phone_11'],
+      reason: 'the preceding exchange contains an unanswered hook'
+    },
+    interruption: {
+      requiresReaction: true,
+      reactionReason: 'an open topic resumed after a meaningful gap'
+    },
     activeHooks: ['continue the existing exchange'],
     ambiguities: ['literal and relational readings are both possible'],
     responseRisks: ['merely classifying or scoring the message'],
@@ -163,6 +174,7 @@ test('a nuanced fast turn upgrades to supervisor without repeating memory', asyn
     const result = await orchestrator.process(envelope(12, 'sure, go ahead'));
 
     assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    assert.deepEqual(codex.calls.find(call => call.role === 'supervisor').input.conversationFrame, frame);
     assert.equal(codex.calls.filter(call => call.role === 'memory').length, 1);
     assert.equal(store.getTurn(result.turnId).route, 'fast_to_deep');
     assert.ok(store.getTurn(result.turnId).routeReasons.includes('conversation_nuance'));
