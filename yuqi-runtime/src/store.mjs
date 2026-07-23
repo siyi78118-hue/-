@@ -1059,7 +1059,7 @@ export class YuqiStore {
   putLifePlanInternal(characterId, episodes, { sourceTurnId = null } = {}) {
     const safeCharacterId = String(characterId || '');
     if (!safeCharacterId || !Array.isArray(episodes)) throw new Error('invalid life plan');
-    const forbiddenKinds = /(?:accident|illness|hospital|job_loss|identity_change|new_relationship)/i;
+    const forbiddenKinds = /(?:accident|illness|hospital|job_loss|identity_change|new_relationship|事故|生病|疾病|住院|失业|辞职|新恋情|身份变化)/i;
     const normalized = episodes.map(item => {
       const episode = {
         episodeId: String(item?.episodeId || ''),
@@ -1073,7 +1073,9 @@ export class YuqiStore {
       if (!episode.episodeId || !episode.kind || !episode.title || !(episode.endAt > episode.startAt)) {
         throw new Error('invalid life episode');
       }
-      if (forbiddenKinds.test(episode.kind)) throw new Error('forbidden life episode kind');
+      if (forbiddenKinds.test(`${episode.kind} ${episode.title}`)) {
+        throw new Error('forbidden life episode kind');
+      }
       return episode;
     }).sort((left, right) => left.startAt - right.startAt || left.episodeId.localeCompare(right.episodeId));
     for (let index = 1; index < normalized.length; index += 1) {
@@ -1144,9 +1146,24 @@ export class YuqiStore {
         WHEN start_at <= ? AND end_at > ? THEN 'active'
         ELSE 'planned'
       END, updated_at = ?
-      WHERE character_id = ?
+      WHERE character_id = ? AND status != 'cancelled'
     `).run(Number(at), Number(at), Number(at), now(), characterId);
     return this.getCharacterLifeState(characterId);
+  }
+
+  retireLegacyGeneratedLifeEpisodes(characterId, at = now()) {
+    const result = this.db.prepare(`
+      UPDATE life_episodes
+      SET status = 'cancelled',
+          adjustment_reason = 'retired_fixed_template_for_chat_brain_planning',
+          updated_at = ?
+      WHERE character_id = ?
+        AND status != 'cancelled'
+        AND end_at > ?
+        AND source_turn_id IS NULL
+        AND json_extract(payload_json, '$.planVersion') = 'life-v1'
+    `).run(Number(at), characterId, Number(at));
+    return Number(result.changes || 0);
   }
 
   applyLifeAdjustment(characterId, adjustment, sourceTurnId, appliedAt = now()) {

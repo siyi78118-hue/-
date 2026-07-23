@@ -82,17 +82,90 @@ class FakeCodex {
   }
 }
 
-function withFixture(outputs, run, { clock = () => 1784400000000 } = {}) {
+function withFixture(outputs, run, {
+  clock = () => 1784400000000,
+  lifePlanningEnabled = false
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-orchestrator-'));
   const store = new YuqiStore(join(dir, 'runtime.sqlite'));
   const presets = new PresetRegistry({ presetDir, store, clock: () => 1784400000000 });
   const codex = new FakeCodex(outputs);
-  const orchestrator = new YuqiOrchestrator({ store, presets, codex, workerId: 'test-worker', clock });
+  const orchestrator = new YuqiOrchestrator({
+    store, presets, codex, workerId: 'test-worker', clock, lifePlanningEnabled
+  });
   return Promise.resolve(run({ store, presets, codex, orchestrator })).finally(() => {
     store.close();
     rmSync(dir, { recursive: true, force: true });
   });
 }
+
+test('chat brain plans the next life window only when the approved horizon is short', async () => {
+  const startAt = 1784400000000;
+  await withFixture({
+    brain: [JSON.stringify({
+      action: 'skip',
+      reply: '',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: null,
+      lifePlan: {
+        planKey: 'yuqi-plan-window-1',
+        episodes: [{
+          episodeId: 'life_ai_work',
+          kind: 'work',
+          title: '把今天剩下的稿件处理完',
+          startAt,
+          endAt: startAt + 8 * 60 * 60_000
+        }]
+      },
+      lifeAdjustment: null
+    })]
+  }, async ({ store, codex, orchestrator }) => {
+    const first = await orchestrator.ensureLifePlan('yuqi', startAt);
+    const second = await orchestrator.ensureLifePlan('yuqi', startAt + 60_000);
+
+    assert.equal(first.planned, true);
+    assert.equal(second.planned, false);
+    assert.equal(store.listLifeEpisodes('yuqi')[0].episodeId, 'life_ai_work');
+    assert.equal(codex.calls.length, 1);
+    assert.equal(codex.calls[0].role, 'brain');
+    assert.equal(codex.calls[0].input.task, 'plan_yuqi_life');
+  }, { lifePlanningEnabled: true });
+});
+
+test('an invalid visible planning response is rejected and enters a ten-minute retry cooldown', async () => {
+  const startAt = 1784400000000;
+  await withFixture({
+    brain: [JSON.stringify({
+      action: 'send',
+      reply: '我要开始规划生活了。',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: null,
+      lifePlan: {
+        planKey: 'bad-visible-plan',
+        episodes: [{
+          episodeId: 'life_bad_visible',
+          kind: 'work',
+          title: '处理稿件',
+          startAt,
+          endAt: startAt + 8 * 60 * 60_000
+        }]
+      },
+      lifeAdjustment: null
+    })]
+  }, async ({ store, codex, orchestrator }) => {
+    await assert.rejects(
+      orchestrator.ensureLifePlan('yuqi', startAt),
+      /planning task must stay silent/
+    );
+    const retry = await orchestrator.ensureLifePlan('yuqi', startAt + 60_000);
+
+    assert.equal(retry.reason, 'retry_cooldown');
+    assert.equal(store.listLifeEpisodes('yuqi').length, 0);
+    assert.equal(codex.calls.length, 1);
+  }, { lifePlanningEnabled: true });
+});
 
 const normalOutputs = () => ({
   memory: ['{"query":"你好","keywords":["你好"],"candidates":[]}'],
@@ -150,7 +223,8 @@ test('ephemeral conversation frame reaches the brain but never becomes a durable
     const memoryPacket = JSON.parse(store.getTurn(result.turnId).memoryPacketJson);
 
     assert.deepEqual(brain.conversationFrame, frame);
-    assert.equal(brain.lifeContext.current.kind, 'sleep');
+    assert.equal(brain.lifeContext.current, null);
+    assert.equal(brain.lifeContext.needsPlan, true);
     assert.deepEqual(memoryPacket.conversationFrame, frame);
     assert.equal(store.listFacts('yuqi').some(fact => fact.predicate === 'possibleIntent'), false);
   });
@@ -164,9 +238,16 @@ test('an approved reply may reschedule Yuqi own plan and the decision persists',
       escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
       relationshipStageReview: null, conversationFrame: frame
     })],
-    brain: ['placeholder']
+    brain: ['placeholder'],
+    supervisor: ['{"decision":"approve","issues":[]}']
   }, async ({ store, codex, orchestrator }) => {
-    orchestrator.lifeSimulation.ensureHorizon('yuqi', 1784400000000);
+    store.putLifePlan('yuqi', [{
+      episodeId: 'life_direct_personal',
+      kind: 'personal',
+      title: '散步',
+      startAt: 1784428800000,
+      endAt: 1784432400000
+    }]);
     const personal = store.listLifeEpisodes('yuqi').find(item => item.kind === 'personal');
     codex.outputs.brain[0] = JSON.stringify({
       action: 'send',
@@ -189,6 +270,90 @@ test('an approved reply may reschedule Yuqi own plan and the decision persists',
     const adjusted = store.getLifeEpisode(personal.episodeId);
     assert.equal(adjusted.startAt, personal.startAt + 60 * 60_000);
     assert.equal(adjusted.sourceTurnId, 'turn_phone_13');
+  });
+});
+
+test('a fast reply containing a life decision is upgraded to supervisor before commit', async () => {
+  const frame = conversationFrame();
+  await withFixture({
+    memory: [JSON.stringify({
+      query: 'stay', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: [JSON.stringify({
+      action: 'send',
+      reply: '那我把散步推迟一会儿。',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: null,
+      lifePlan: null,
+      lifeAdjustment: {
+        type: 'reschedule',
+        targetEpisodeId: 'life_fast_personal',
+        startAt: 1784432400000,
+        endAt: 1784436000000,
+        reason: '虞栖自己决定晚一点散步'
+      }
+    })],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    store.putLifePlan('yuqi', [{
+      episodeId: 'life_fast_personal',
+      kind: 'personal',
+      title: '散步',
+      startAt: 1784428800000,
+      endAt: 1784432400000
+    }]);
+
+    await orchestrator.process(envelope(14, '再陪我一会儿'));
+
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    assert.equal(store.getTurn('turn_phone_14').route, 'fast_to_deep');
+  });
+});
+
+test('a supervised moment interaction commits its matching life adjustment', async () => {
+  const momentTurn = triggerEnvelope(97);
+  momentTurn.kind = 'MOMENT_INTERACTION';
+  momentTurn.trigger.triggerType = 'moment_interaction';
+  momentTurn.trigger.context.input = { moment: { id: 'moment_97', text: '今晚散步吗' } };
+  await withFixture({
+    memory: ['{"query":"moment","keywords":[],"candidates":[]}'],
+    brain: [JSON.stringify({
+      action: 'send',
+      reply: '',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: {
+        momentId: 'moment_97',
+        like: false,
+        comment: '晚一点去，先把手上的稿子收掉',
+        replyToCommentId: null
+      },
+      lifePlan: null,
+      lifeAdjustment: {
+        type: 'reschedule',
+        targetEpisodeId: 'life_moment_walk',
+        startAt: 1784432400000,
+        endAt: 1784436000000,
+        reason: '虞栖决定晚一点散步'
+      }
+    })],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, orchestrator }) => {
+    store.putLifePlan('yuqi', [{
+      episodeId: 'life_moment_walk',
+      kind: 'personal',
+      title: '散步',
+      startAt: 1784428800000,
+      endAt: 1784432400000
+    }]);
+
+    await orchestrator.process(momentTurn);
+
+    assert.equal(store.getLifeEpisode('life_moment_walk').startAt, 1784432400000);
+    assert.equal(store.getLifeEpisode('life_moment_walk').sourceTurnId, momentTurn.turnId);
   });
 });
 

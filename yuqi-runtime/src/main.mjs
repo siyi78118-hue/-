@@ -84,19 +84,18 @@ const server = createYuqiServer({
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });
 dispatcher.recover();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
-orchestrator.lifeSimulation.advanceTo('yuqi', Date.now());
-const lifeBoundaryTimer = setInterval(() => {
-  try {
-    orchestrator.lifeSimulation.advanceTo('yuqi', Date.now());
-  } catch (error) {
+function checkLifePlanning() {
+  orchestrator.ensureLifePlan('yuqi', Date.now()).catch(error => {
     store.putDiagnostic({
       turnId: null,
-      stage: 'life_boundary',
+      stage: 'life_planning',
       level: 'error',
       detail: { name: error.name, message: error.message }
     });
-  }
-}, 60_000);
+  });
+}
+checkLifePlanning();
+const lifeBoundaryTimer = setInterval(checkLifePlanning, 60_000);
 lifeBoundaryTimer.unref?.();
 const address = server.address();
 process.stdout.write(`Yuqi runtime listening on ${address.address}:${address.port}\n`);

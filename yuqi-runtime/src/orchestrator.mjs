@@ -230,10 +230,18 @@ function repairReplyForDelivery(reply, kind = 'DIRECT_REPLY') {
   return text.length > 20_000 ? text.slice(0, 20_000) : text;
 }
 
+function hasLifeDecision(draft) {
+  return Boolean(
+    draft?.lifePlan?.episodes?.length
+    || (draft?.lifeAdjustment?.type && draft.lifeAdjustment.type !== 'none')
+  );
+}
+
 export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
-    generationContextLimit = 24, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null
+    generationContextLimit = 24, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null,
+    lifePlanningEnabled = true
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
@@ -245,6 +253,10 @@ export class YuqiOrchestrator {
     this.generationContextLimit = Math.max(1, Math.min(200, Number(generationContextLimit) || 24));
     this.roleProfiles = roleProfiles;
     this.lifeSimulation = lifeSimulation || new LifeSimulationCoordinator({ store });
+    this.lifePlanningEnabled = lifePlanningEnabled !== false;
+    this.lifePlanningPromises = new Map();
+    this.lifePlanningRetryAfter = new Map();
+    this.brainRolePromise = null;
   }
 
   accept(envelope) {
@@ -266,6 +278,99 @@ export class YuqiOrchestrator {
   async process(envelope) {
     const submitted = this.accept(envelope);
     return this.run(submitted.turnId);
+  }
+
+  async withBrainRoleLock(operation) {
+    const previous = this.brainRolePromise || Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    this.brainRolePromise = current;
+    try {
+      return await current;
+    } finally {
+      if (this.brainRolePromise === current) this.brainRolePromise = null;
+    }
+  }
+
+  async ensureLifePlan(characterId, at = this.clock()) {
+    const now = Number(at);
+    const context = this.lifeSimulation.advanceTo(characterId, now);
+    if (!this.lifePlanningEnabled) return { planned: false, reason: 'disabled', context };
+    if (!context.needsPlan) return { planned: false, reason: 'horizon_sufficient', context };
+    if (Number(this.lifePlanningRetryAfter.get(characterId) || 0) > now) {
+      return { planned: false, reason: 'retry_cooldown', context };
+    }
+    if (this.lifePlanningPromises.has(characterId)) return this.lifePlanningPromises.get(characterId);
+
+    const planKey = `life_plan_${contentHash({
+      characterId,
+      planWindowStartAt: context.planWindowStartAt,
+      presetVersion: this.presets.current().version
+    }).slice(0, 24)}`;
+    const operation = this.withBrainRoleLock(async () => {
+      const profile = roleExecutionProfile('deep', 'brain', this.roleProfiles);
+      const request = {
+        task: 'plan_yuqi_life',
+        preset: this.presets.compileFor('brain', { scene: { kind: 'LIFE_PLANNING' } }),
+        characterId,
+        planKey,
+        lifeContext: context,
+        planningWindow: {
+          startAt: context.planWindowStartAt,
+          targetEndAt: context.targetPlanEndAt,
+          minimumCoverageMs: 6 * 60 * 60_000,
+          maximumCoverageMs: 24 * 60 * 60_000
+        }
+      };
+      try {
+        const response = await this.codex.runTurn('brain', JSON.stringify(request), {
+          clientUserMessageId: planKey,
+          outputSchema: ROLE_OUTPUT_SCHEMAS.brain,
+          model: profile.model,
+          effort: profile.effort
+        });
+        const draft = normalizeBrainDraft(parseRoleJson(response.text, 'brain'));
+        if (draft.action !== 'skip' || draft.reply || draft.momentAction || draft.lifeAdjustment) {
+          throw new Error('chat brain planning task must stay silent');
+        }
+        const episodes = Array.isArray(draft.lifePlan?.episodes) ? draft.lifePlan.episodes : [];
+        const ordered = episodes
+          .map(item => ({ ...item, startAt: Number(item.startAt), endAt: Number(item.endAt) }))
+          .sort((left, right) => left.startAt - right.startAt);
+        if (!ordered.length || ordered.length > 12) throw new Error('chat brain returned an invalid life plan size');
+        if (ordered[0].startAt < context.planWindowStartAt) throw new Error('chat brain life plan starts in the past');
+        if (ordered[0].startAt - context.planWindowStartAt > 60 * 60_000) {
+          throw new Error('chat brain life plan leaves a large initial gap');
+        }
+        for (let index = 1; index < ordered.length; index += 1) {
+          if (ordered[index].startAt < ordered[index - 1].endAt) {
+            throw new Error('chat brain life plan overlaps');
+          }
+        }
+        const coverageMs = ordered.at(-1).endAt - ordered[0].startAt;
+        if (coverageMs < 6 * 60 * 60_000 || coverageMs > 24 * 60 * 60_000) {
+          throw new Error('chat brain life plan coverage is outside the allowed window');
+        }
+        this.store.putLifePlan(characterId, ordered, { sourceTurnId: planKey });
+        this.lifePlanningRetryAfter.delete(characterId);
+        return {
+          planned: true,
+          planKey,
+          episodes: this.store.listLifeEpisodes(characterId, { from: context.planWindowStartAt }),
+          context: this.lifeSimulation.advanceTo(characterId, now)
+        };
+      } catch (error) {
+        this.lifePlanningRetryAfter.set(characterId, now + 10 * 60_000);
+        throw error;
+      }
+    });
+    this.lifePlanningPromises.set(characterId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.lifePlanningPromises.get(characterId) === operation) {
+        this.lifePlanningPromises.delete(characterId);
+      }
+    }
   }
 
   async run(turnId) {
@@ -302,6 +407,10 @@ export class YuqiOrchestrator {
             draft = { ...draft, action: 'send', reply: repairReplyForDelivery('', envelope.kind) };
           }
           if (draft.action === 'skip') {
+            if (current.route === 'fast' && hasLifeDecision(draft)) {
+              this.store.setTurnRoute(turnId, 'fast_to_deep', ['life_decision']);
+              current = this.store.getTurn(turnId);
+            }
             this.store.advanceTurn(
               turnId, 'brain_done', current.route === 'fast' ? 'approved' : 'supervisor_running',
               { brainDraftJson: JSON.stringify(draft) }
@@ -325,6 +434,10 @@ export class YuqiOrchestrator {
               level: 'warning',
               detail: { action: 'reply_repaired_for_delivery', issues: hard.issues.map(issue => issue.code) }
             });
+          }
+          if (current.route === 'fast' && hasLifeDecision(repairedDraft)) {
+            this.store.setTurnRoute(turnId, 'fast_to_deep', ['life_decision']);
+            current = this.store.getTurn(turnId);
           }
           this.store.advanceTurn(
             turnId,
@@ -363,6 +476,16 @@ export class YuqiOrchestrator {
   }
 
   async completeMemory(envelope) {
+    try {
+      await this.ensureLifePlan(envelope.characterId, this.clock());
+    } catch (error) {
+      this.store.putDiagnostic({
+        turnId: envelope.turnId,
+        stage: 'life_planning',
+        level: 'warning',
+        detail: { name: error.name, message: error.message }
+      });
+    }
     const lifeContext = this.lifeSimulation.advanceTo(envelope.characterId, this.clock());
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
     const scene = sceneFromEnvelope(envelope);
@@ -578,32 +701,65 @@ export class YuqiOrchestrator {
     const draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
     if (draft.action === 'skip' && isAutomaticKind(envelope.kind)) {
-      const result = {
-        turnId: envelope.turnId,
-        presetVersion: this.presets.current().version,
-        action: 'skip',
-        paymentAction: null,
-        reply: null,
-        usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
-        relationshipStageAction: memoryPacket.relationshipStageAction || null,
-        momentAction: null
-      };
-      this.store.advanceTurn(envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) });
-      return result;
+      return this.store.transaction(() => {
+        if (draft.lifeAdjustment?.type && draft.lifeAdjustment.type !== 'none') {
+          throw new Error('PLAN_REPLY_MISMATCH: a silent action cannot change an existing plan');
+        }
+        if (draft.lifePlan?.episodes?.length) {
+          this.store.putLifePlanInternal(envelope.characterId, draft.lifePlan.episodes, {
+            sourceTurnId: envelope.turnId
+          });
+        }
+        const result = {
+          turnId: envelope.turnId,
+          presetVersion: this.presets.current().version,
+          action: 'skip',
+          paymentAction: null,
+          reply: null,
+          usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
+          relationshipStageAction: memoryPacket.relationshipStageAction || null,
+          lifePlanApplied: Boolean(draft.lifePlan?.episodes?.length),
+          lifeAdjustment: null,
+          momentAction: null
+        };
+        this.store.advanceTurn(
+          envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
+        );
+        return result;
+      });
     }
     if (isMomentKind(envelope.kind)) {
-      const result = {
-        turnId: envelope.turnId,
-        presetVersion: this.presets.current().version,
-        action: 'send',
-        paymentAction: null,
-        relationshipStageAction: memoryPacket.relationshipStageAction || null,
-        momentAction: draft.momentAction,
-        reply: null,
-        usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
-      };
-      this.store.advanceTurn(envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) });
-      return result;
+      return this.store.transaction(() => {
+        if (draft.lifePlan?.episodes?.length) {
+          this.store.putLifePlanInternal(envelope.characterId, draft.lifePlan.episodes, {
+            sourceTurnId: envelope.turnId
+          });
+        }
+        const lifeAdjustment = draft.lifeAdjustment?.type && draft.lifeAdjustment.type !== 'none'
+          ? this.store.applyLifeAdjustment(
+              envelope.characterId, draft.lifeAdjustment, envelope.turnId, this.clock()
+            )
+          : null;
+        const result = {
+          turnId: envelope.turnId,
+          presetVersion: this.presets.current().version,
+          action: 'send',
+          paymentAction: null,
+          relationshipStageAction: memoryPacket.relationshipStageAction || null,
+          momentAction: draft.momentAction,
+          lifePlanApplied: Boolean(draft.lifePlan?.episodes?.length),
+          lifeAdjustment: lifeAdjustment ? {
+            type: draft.lifeAdjustment.type,
+            episodeId: lifeAdjustment.episodeId
+          } : null,
+          reply: null,
+          usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
+        };
+        this.store.advanceTurn(
+          envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
+        );
+        return result;
+      });
     }
     const reply = {
       messageId: `msg_yuqi_${contentHash(envelope.turnId).slice(0, 24)}`,
@@ -639,6 +795,7 @@ export class YuqiOrchestrator {
         reply: savedReply,
         usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
         relationshipStageAction: memoryPacket.relationshipStageAction || null,
+        lifePlanApplied: Boolean(draft.lifePlan?.episodes?.length),
         lifeAdjustment: lifeAdjustment ? {
           type: draft.lifeAdjustment.type,
           episodeId: lifeAdjustment.episodeId
@@ -662,11 +819,11 @@ export class YuqiOrchestrator {
   }
 
   async runBrain(turnId, request, attempt = 1, route = 'deep') {
-    const result = await this.runStructuredRole(
+    const result = await this.withBrainRoleLock(() => this.runStructuredRole(
       'brain', request, `${turnId}_brain_${attempt}`,
       roleExecutionProfile(route, 'brain', this.roleProfiles),
       `brain_${attempt}`
-    );
+    ));
     if (typeof result.reply !== 'string') throw new Error('brain reply is missing');
     return normalizeBrainDraft(result);
   }
