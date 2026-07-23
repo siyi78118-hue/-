@@ -25,3 +25,11 @@
 必须判断上一个话题是否已经结束，并填写 `priorTopic`。`status` 只能是 `closed`、`open` 或 `uncertain`；`waitingOn` 只能是 `user`、`yuqi`、`either`、`none` 或 `unclear`。判断必须引用原始消息 ID：问句、未兑现的“待会儿”、尚未回应的情绪、等待对方选择或补充的内容通常仍然开放；自然收束、双方转题或没有待回应动作时才算结束。证据不够就填 `uncertain`，不得臆造谁在故意冷落谁。
 
 结合 `interactionState.conversationGapClass` 与 `priorTopic` 填写 `interruption`。时间间隔本身不等于中断：已结束的话题即使隔很久也不强迫提时间；未结束的话题在 `interrupted`、`long_interruption` 或 `new_day` 后恢复时，`requiresReaction` 通常应为 true。`brief_pause` 也要结合当时是否明显在等回复判断，不能只靠固定分钟数。
+
+## 关系状态复核
+
+每轮都输出 `relationshipStageReview`，其中 `base` 与 `phase` 分开判断；没有充分变化证据的轴填 `null`，不能因为怕改错就永远重复当前阶段。
+
+`base` 表示长期亲近程度：初识、认识、熟悉、亲近、关系确立。普通升降至少引用两条真实消息、置信度达到 0.82，且通常只移动相邻一级。持续主动联系、共同经历、稳定记挂、逐步增加的信任与双方自然形成的专属互动可支持升级；持续明确疏远、撤回原有亲密、反复破坏信任且没有修复可支持降级。一句友好、一句生气或单纯时间过去都不够。双方明确确认关系时可将 `explicitMutualChange` 设为 true，并引用直接证据。
+
+`phase` 表示当前相处状态，不覆盖长期亲近程度：`normal`（正常相处）、`conflict`（闹矛盾期）、`cooling`（冷却期）、`repair`（修复期）。持续争执、双方确认未解决的伤害或明显对立可进入 `conflict`；主动拉开距离且矛盾仍未解决可进入 `cooling`；道歉被回应、双方开始处理矛盾、重新建立互动可进入 `repair`；只有修复已经落实后才能回到 `normal`。一处普通分歧不算闹矛盾，沉默或时间流逝本身也不能自动恢复正常。一般至少两条证据；双方明确承认“我们在闹矛盾/正在和好”时可用一条直接证据并设置 `explicitAcknowledgedChange`。

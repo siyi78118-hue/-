@@ -47,15 +47,29 @@ const factCandidateSchema = objectSchema({
   'supersedes', 'origin', 'createdAt', 'verifiedAt'
 ]);
 
-const relationshipStageReviewSchema = {
-  anyOf: [objectSchema({
+const baseRelationshipReviewSchema = objectSchema({
     current: { type: 'string' },
     recommended: { type: 'string' },
     confidence: { type: 'number' },
     reason: { type: 'string' },
     evidenceMessageIds: stringArray(),
     explicitMutualChange: { type: 'boolean' }
-  }, ['current', 'recommended', 'confidence', 'reason', 'evidenceMessageIds', 'explicitMutualChange']), { type: 'null' }]
+  }, ['current', 'recommended', 'confidence', 'reason', 'evidenceMessageIds', 'explicitMutualChange']);
+
+const phaseRelationshipReviewSchema = objectSchema({
+  current: { type: 'string' },
+  recommended: { type: 'string' },
+  confidence: { type: 'number' },
+  reason: { type: 'string' },
+  evidenceMessageIds: stringArray(),
+  explicitAcknowledgedChange: { type: 'boolean' }
+}, ['current', 'recommended', 'confidence', 'reason', 'evidenceMessageIds', 'explicitAcknowledgedChange']);
+
+const relationshipStageReviewSchema = {
+  anyOf: [objectSchema({
+    base: { anyOf: [baseRelationshipReviewSchema, { type: 'null' }] },
+    phase: { anyOf: [phaseRelationshipReviewSchema, { type: 'null' }] }
+  }, ['base', 'phase']), { type: 'null' }]
 };
 
 const conversationFrameSchema = objectSchema({

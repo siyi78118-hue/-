@@ -79,6 +79,19 @@ public class ReplyParserTest {
     }
 
     @Test
+    public void emitsRelationshipStageWhenOnlyNestedAxisActionsExist() {
+        ParsedReply parsed = parser.parse(
+            "我还在生气。<al_relationship_stage>{\"baseAction\":null,\"phaseAction\":{\"from\":\"normal\",\"to\":\"conflict\"}}</al_relationship_stage>",
+            "turn-stage",
+            "attempt-stage"
+        );
+
+        assertEquals(2, parsed.parts.size());
+        assertEquals("RELATIONSHIP_STAGE", parsed.parts.get(1).type);
+        assertTrue(parsed.parts.get(1).payloadJson.contains("phaseAction"));
+    }
+
+    @Test
     public void separatesLongUnbrokenMultiSentenceReplyIntoChatBubbles() {
         ParsedReply parsed = parser.parse(
             "自己的软件？听起来你还挺厉害。无非就是哪天让你请杯冷萃。又不是攒着卖钱，你紧张什么？快十一点半了，修完赶紧回去。",

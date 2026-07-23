@@ -64,7 +64,11 @@ public final class ReplyParser {
                 add(parts, turnId, attemptId, "PAYMENT_STATUS", "", paymentStatus.toString());
             }
         }
-        if (relationshipStage != null && !relationshipStage.optString("to", "").trim().isEmpty()) {
+        if (relationshipStage != null && (
+            !relationshipStage.optString("to", "").trim().isEmpty()
+                || relationshipStage.optJSONObject("baseAction") != null
+                || relationshipStage.optJSONObject("phaseAction") != null
+        )) {
             add(parts, turnId, attemptId, "RELATIONSHIP_STAGE", "", relationshipStage.toString());
         }
         if (momentAction != null && !momentAction.optString("momentId", "").trim().isEmpty()

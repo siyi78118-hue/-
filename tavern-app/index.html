@@ -2401,20 +2401,25 @@ function nativeMemoryCandidateText(memory = {}, char = null) {
 function buildYuqiDynamicScene(char, chat) {
   const config = normalizeStagePersonaConfig(char);
   const stage = stagePersonaFor(char, config.currentStage) || config.stages[0];
+  const phase = config.phases.find(item => item.id === config.currentPhase) || config.phases[0];
   return {
     playerName: playerName(),
     characterName: charName(char),
     relationshipStage: {
       id: stage?.id || 'new',
-      label: stage?.label || '初识',
-      content: String(stage?.content || ''),
+      label: `${stage?.label || '初识'}${phase?.id === 'normal' ? '' : ` · ${phase?.label || ''}`}`,
+      content: [String(stage?.content || ''), phase?.id === 'normal' ? '' : String(phase?.content || '')].filter(Boolean).join('\n'),
       since: Number(config.state?.since) || Date.now(),
       reason: String(config.state?.reason || ''),
-      confidence: Math.max(0, Math.min(1, Number(config.state?.confidence) || 0))
+      confidence: Math.max(0, Math.min(1, Number(config.state?.confidence) || 0)),
+      base: { ...stage, ...config.state },
+      phase: { ...phase, ...config.phaseState }
     },
     conversationExtraPrompt: String(chat?.extraPrompt || ''),
     globalExtraPrompt: String(settings.systemPrompt || ''),
-    stageCatalog: config.stages.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') }))
+    stageCatalog: config.stages.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') })),
+    phaseCatalog: config.phases.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') })),
+    currentPhase: config.currentPhase
   };
 }
 async function buildNativeExecutionSnapshot(charId, task) {
@@ -2889,20 +2894,38 @@ function applyNativeRelationshipStagePart(charId, part, turnId) {
   const config = normalizeStagePersonaConfig(char);
   const sourceTurnId = String(turnId || '');
   if (config.history.some(item => item.sourceTurnId === sourceTurnId)) return false;
-  const target = config.stages.find(stage => stage.id === action.to);
-  if (!target || config.currentStage !== action.from) return false;
+  const baseAction = action.baseAction || (action.to ? action : null);
+  const phaseAction = action.phaseAction || null;
+  const baseTarget = baseAction ? config.stages.find(stage => stage.id === baseAction.to) : null;
+  const phaseTarget = phaseAction ? config.phases.find(phase => phase.id === phaseAction.to) : null;
+  if (!baseAction && !phaseAction) return false;
+  if (baseAction && (!baseTarget || config.currentStage !== baseAction.from)) return false;
+  if (phaseAction && (!phaseTarget || config.currentPhase !== phaseAction.from)) return false;
   const oldPrompt = buildCharPrompt(char);
-  config.currentStage = target.id;
-  config.state = {
-    since: Number(action.changedAt) || Date.now(),
-    reason: String(action.reason || '').slice(0, 500),
-    confidence: Number(action.confidence) || 0,
-    evidenceMessageIds: Array.isArray(action.evidenceMessageIds) ? action.evidenceMessageIds.map(String) : []
-  };
+  if (baseAction) {
+    config.currentStage = baseTarget.id;
+    config.state = {
+      since: Number(baseAction.changedAt || action.changedAt) || Date.now(),
+      reason: String(baseAction.reason || action.reason || '').slice(0, 500),
+      confidence: Number(baseAction.confidence || action.confidence) || 0,
+      evidenceMessageIds: Array.isArray(baseAction.evidenceMessageIds) ? baseAction.evidenceMessageIds.map(String) : []
+    };
+  }
+  if (phaseAction) {
+    config.currentPhase = phaseTarget.id;
+    config.phaseState = {
+      since: Number(phaseAction.changedAt || action.changedAt) || Date.now(),
+      reason: String(phaseAction.reason || '').slice(0, 500),
+      confidence: Number(phaseAction.confidence) || 0,
+      evidenceMessageIds: Array.isArray(phaseAction.evidenceMessageIds) ? phaseAction.evidenceMessageIds.map(String) : []
+    };
+  }
   config.history.push({
-    from: action.from, to: action.to, at: config.state.since, reason: config.state.reason,
-    confidence: config.state.confidence, evidenceMessageIds: config.state.evidenceMessageIds,
-    explicitMutualChange: action.explicitMutualChange === true, source: 'yuqi-runtime', sourceTurnId
+    from: baseAction?.from, to: baseAction?.to,
+    phaseFrom: phaseAction?.from, phaseTo: phaseAction?.to,
+    at: Number(action.changedAt) || Date.now(),
+    reason: String(baseAction?.reason || phaseAction?.reason || action.reason || ''),
+    baseAction, phaseAction, source: 'yuqi-runtime', sourceTurnId
   });
   config.history = config.history.slice(-NORMAL_RAW_CONTEXT_LIMIT);
   char.stagePersona = config;
@@ -3463,6 +3486,12 @@ const RELATIONSHIP_STAGE_DEFS = [
   { id: 'close', label: '亲近' },
   { id: 'committed', label: '关系确立' }
 ];
+const RELATIONSHIP_PHASE_DEFS = [
+  { id: 'normal', label: '正常相处', content: '' },
+  { id: 'conflict', label: '闹矛盾期', content: '熟悉 · 闹矛盾期不是重新变成陌生人；保留已有在意和共同经历，但回应带着尚未解决的冲突。' },
+  { id: 'cooling', label: '冷却期', content: '双方暂时拉开一点距离，情绪和矛盾仍有余波，不强行恢复亲密。' },
+  { id: 'repair', label: '修复期', content: '双方正在处理矛盾、恢复信任，靠近要保留前因和过程。' }
+];
 function defaultStagePersonaContent(stageId) {
   const rows = {
     new: `当前是初识阶段。{{char}}只把{{player}}视为刚认识的人，保持正常社交边界，不默认信任、暧昧或亲密。可以因为好奇继续聊天，但不主动交代大量隐私，也不接受越级称呼和关系。
@@ -3486,13 +3515,21 @@ function defaultStagePersonaContent(stageId) {
 function createDefaultStagePersonaConfig(char = {}) {
   const now = Number(char.createdAt) || Date.now();
   return {
-    version: 1,
+    version: 2,
     enabled: true,
     currentStage: 'new',
+    currentPhase: 'normal',
     stages: RELATIONSHIP_STAGE_DEFS.map(def => ({ ...def, content: defaultStagePersonaContent(def.id) })),
+    phases: RELATIONSHIP_PHASE_DEFS.map(def => ({ ...def })),
     state: {
       since: now,
       reason: '角色创建时的初始关系',
+      confidence: 1,
+      evidenceMessageIds: []
+    },
+    phaseState: {
+      since: now,
+      reason: '默认正常相处',
       confidence: 1,
       evidenceMessageIds: []
     },
@@ -3512,16 +3549,31 @@ function normalizeStagePersonaConfig(char = {}) {
   });
   const validIds = new Set(stages.map(stage => stage.id));
   const currentStage = validIds.has(source.currentStage) ? source.currentStage : 'new';
+  const sourcePhases = Array.isArray(source.phases) ? source.phases : [];
+  const phases = RELATIONSHIP_PHASE_DEFS.map(def => {
+    const existing = sourcePhases.find(item => item?.id === def.id);
+    return { id: def.id, label: String(existing?.label || def.label), content: String(existing?.content ?? def.content) };
+  });
+  const validPhaseIds = new Set(phases.map(phase => phase.id));
+  const currentPhase = validPhaseIds.has(source.currentPhase) ? source.currentPhase : 'normal';
   char.stagePersona = {
-    version: 1,
+    version: 2,
     enabled: source.enabled !== false,
     currentStage,
+    currentPhase,
     stages,
+    phases,
     state: {
       since: Number(source.state?.since) || Number(char.createdAt) || Date.now(),
       reason: String(source.state?.reason || '角色创建时的初始关系'),
       confidence: Math.max(0, Math.min(1, Number(source.state?.confidence) || 1)),
       evidenceMessageIds: Array.isArray(source.state?.evidenceMessageIds) ? source.state.evidenceMessageIds.filter(Boolean).slice(-12) : []
+    },
+    phaseState: {
+      since: Number(source.phaseState?.since) || Number(char.createdAt) || Date.now(),
+      reason: String(source.phaseState?.reason || '默认正常相处'),
+      confidence: Math.max(0, Math.min(1, Number(source.phaseState?.confidence) || 1)),
+      evidenceMessageIds: Array.isArray(source.phaseState?.evidenceMessageIds) ? source.phaseState.evidenceMessageIds.filter(Boolean).slice(-12) : []
     },
     history: Array.isArray(source.history) ? source.history.slice(-NORMAL_RAW_CONTEXT_LIMIT) : []
   };
@@ -3536,10 +3588,13 @@ function currentStagePersonaBlock(char) {
   const config = normalizeStagePersonaConfig(char);
   if (!config.enabled) return '';
   const stage = stagePersonaFor(char);
+  const phase = config.phases.find(item => item.id === config.currentPhase) || config.phases[0];
   const content = String(stage.content || '')
     .replaceAll('{{char}}', charName(char))
     .replaceAll('{{player}}', playerName());
-  return `<al_current_stage_persona>\n当前关系阶段：${stage.label}\n以下仅为当前阶段生效的人设补充，优先于初始关系描述中已经过时的亲疏程度，但不得改变角色的核心身份、经历、雷点和稳定性格。\n${content}\n</al_current_stage_persona>`;
+  const phaseContent = String(phase?.content || '').replaceAll('{{char}}', charName(char)).replaceAll('{{player}}', playerName());
+  const combinedLabel = `${stage.label}${phase?.id === 'normal' ? '' : ` · ${phase.label}`}`;
+  return `<al_current_stage_persona>\n当前关系阶段：${combinedLabel}\n以下仅为当前阶段生效的人设补充，优先于初始关系描述中已经过时的亲疏程度，但不得改变角色的核心身份、经历、雷点和稳定性格。\n${content}${phaseContent ? `\n当前相处状态：${phaseContent}` : ''}\n</al_current_stage_persona>`;
 }
 function stripStagePersonaBlock(prompt = '') {
   return String(prompt || '').replace(/\s*<al_current_stage_persona>[\s\S]*?<\/al_current_stage_persona>\s*/g, '\n\n').trim();
@@ -4689,7 +4744,11 @@ function previewCurrentStageSelection(stageId) {
   if (!stagePersonaEditorDraft?.stages.some(stage => stage.id === stageId)) return;
   stagePersonaEditorDraft.currentStage = stageId;
   const label = document.getElementById('stage-current-label');
-  if (label) label.textContent = stagePersonaEditorDraft.stages.find(stage => stage.id === stageId)?.label || stageId;
+  const phase = stagePersonaEditorDraft.phases?.find(item => item.id === stagePersonaEditorDraft.currentPhase);
+  if (label) {
+    const baseLabel = stagePersonaEditorDraft.stages.find(stage => stage.id === stageId)?.label || stageId;
+    label.textContent = `${baseLabel}${phase?.id === 'normal' ? '' : ` · ${phase?.label || ''}`}`;
+  }
 }
 function renderStagePersonaEditorContent() {
   const select = document.getElementById('stage-edit-select');
@@ -4714,7 +4773,9 @@ function renderStagePersonaScreen() {
   if (editSelect) editSelect.innerHTML = options;
   const current = draft.stages.find(stage => stage.id === draft.currentStage) || draft.stages[0];
   document.getElementById('stage-char-name').textContent = char.name || '角色';
-  document.getElementById('stage-current-label').textContent = current?.label || '初识';
+  const currentPhase = draft.phases?.find(item => item.id === draft.currentPhase);
+  document.getElementById('stage-current-label').textContent =
+    `${current?.label || '初识'}${currentPhase?.id === 'normal' ? '' : ` · ${currentPhase?.label || ''}`}`;
   const since = draft.state?.since ? formatFullTime(new Date(draft.state.since)) : '时间未知';
   document.getElementById('stage-current-meta').textContent = `${since}｜${draft.state?.reason || '暂无变化原因'}`;
   renderStagePersonaEditorContent();

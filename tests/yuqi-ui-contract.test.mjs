@@ -93,11 +93,24 @@ test('native snapshots expose the current Yuqi dynamic scene separately from fix
   assert.match(builder, /relationshipStage/);
   assert.match(builder, /conversationExtraPrompt/);
   assert.match(builder, /stageCatalog/);
+  assert.match(builder, /phaseCatalog/);
+  assert.match(builder, /currentPhase/);
   const snapshot = html.slice(
     html.indexOf('async function buildNativeExecutionSnapshot'),
     html.indexOf('function nativeProactiveSnapshotIds')
   );
   assert.match(snapshot, /scene:\s*buildYuqiDynamicScene\(char,\s*chat\)/);
+});
+
+test('native relationship writeback applies base and phase actions atomically', () => {
+  const source = html.slice(
+    html.indexOf('function applyNativeRelationshipStagePart'),
+    html.indexOf('function applyNativeMomentActionPart')
+  );
+  assert.match(source, /action\.baseAction/);
+  assert.match(source, /action\.phaseAction/);
+  assert.match(source, /config\.currentPhase/);
+  assert.match(html, /熟悉 · 闹矛盾期/);
 });
 
 test('native retry repairs a legacy failed turn with current canonical input and snapshot', () => {

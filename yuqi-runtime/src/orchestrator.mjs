@@ -225,7 +225,7 @@ function repairReplyForDelivery(reply, kind = 'DIRECT_REPLY') {
   if (!text) {
     return kind === 'DIRECT_REPLY'
       ? '刚才那句话没发出来，你再跟我说一次？'
-      : '等你有空再聊。';
+      : '';
   }
   return text.length > 20_000 ? text.slice(0, 20_000) : text;
 }

@@ -57,3 +57,88 @@ test('accepts an explicit mutual relationship confirmation with one real source'
   assert.equal(result.action.from, 'new');
   assert.equal(result.action.to, 'committed');
 });
+
+test('tracks conflict as a separate phase without erasing familiar closeness', () => {
+  const familiarScene = {
+    ...scene,
+    relationshipStage: {
+      base: { id: 'familiar', label: '熟悉', content: '已经形成稳定聊天习惯。' },
+      phase: { id: 'normal', label: '正常相处', content: '' }
+    },
+    phaseCatalog: [
+      { id: 'normal', label: '正常相处', content: '' },
+      { id: 'conflict', label: '闹矛盾期', content: '仍在意，但有未解决冲突。' },
+      { id: 'cooling', label: '冷却期', content: '暂时拉开一点距离。' },
+      { id: 'repair', label: '修复期', content: '双方正在重新靠近。' }
+    ]
+  };
+  const result = resolveRelationshipStage(familiarScene, {
+    base: null,
+    phase: {
+      current: 'normal',
+      recommended: 'conflict',
+      confidence: 0.91,
+      reason: '双方明确围绕同一件事持续争执且情绪尚未解决',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitAcknowledgedChange: false
+    }
+  }, messages, 3000);
+
+  assert.equal(result.stage.base.id, 'familiar');
+  assert.equal(result.stage.phase.id, 'conflict');
+  assert.equal(result.stage.label, '熟悉 · 闹矛盾期');
+  assert.equal(result.action.baseAction, null);
+  assert.equal(result.action.phaseAction.to, 'conflict');
+});
+
+test('one disagreement does not enter conflict and elapsed time alone cannot repair it', () => {
+  const conflictScene = {
+    ...scene,
+    relationshipStage: {
+      base: { id: 'familiar', label: '熟悉', content: '' },
+      phase: { id: 'conflict', label: '闹矛盾期', content: '' }
+    }
+  };
+  const oneMessage = resolveRelationshipStage(conflictScene, {
+    base: null,
+    phase: {
+      recommended: 'cooling',
+      confidence: 0.95,
+      reason: '刚刚有一句不同意见',
+      evidenceMessageIds: ['msg_1'],
+      explicitAcknowledgedChange: false
+    }
+  }, messages, 3000);
+  assert.equal(oneMessage.stage.phase.id, 'conflict');
+
+  const timeOnly = resolveRelationshipStage(conflictScene, {
+    base: null,
+    phase: {
+      recommended: 'normal',
+      confidence: 0.99,
+      reason: '已经过去很久了',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitAcknowledgedChange: false
+    }
+  }, messages, 3000);
+  assert.equal(timeOnly.stage.phase.id, 'conflict');
+});
+
+test('sustained evidence permits an adjacent base regression', () => {
+  const familiarScene = {
+    ...scene,
+    relationshipStage: { id: 'familiar', label: '熟悉', content: '' }
+  };
+  const result = resolveRelationshipStage(familiarScene, {
+    base: {
+      current: 'familiar',
+      recommended: 'acquainted',
+      confidence: 0.87,
+      reason: '双方持续明确拉开距离并撤回原有亲密互动',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitMutualChange: false
+    },
+    phase: null
+  }, messages, 3000);
+  assert.equal(result.stage.base.id, 'acquainted');
+});
