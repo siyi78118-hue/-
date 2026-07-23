@@ -6,6 +6,7 @@ import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route
 import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stage.mjs';
 import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
 import { buildGenerationWindow } from './conversation-context.mjs';
+import { LifeSimulationCoordinator } from './life-simulation.mjs';
 
 function parseRoleJson(text, role) {
   const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
@@ -40,6 +41,21 @@ export function normalizeBrainDraft(draft) {
           like: draft.momentAction.like === true,
           comment: String(draft.momentAction.comment || '').trim().slice(0, 1000),
           replyToCommentId: draft.momentAction.replyToCommentId ? String(draft.momentAction.replyToCommentId) : null
+        }
+      : null,
+    lifePlan: draft?.lifePlan && typeof draft.lifePlan === 'object' && !Array.isArray(draft.lifePlan)
+      ? {
+          planKey: String(draft.lifePlan.planKey || ''),
+          episodes: Array.isArray(draft.lifePlan.episodes) ? draft.lifePlan.episodes : []
+        }
+      : null,
+    lifeAdjustment: draft?.lifeAdjustment && typeof draft.lifeAdjustment === 'object' && !Array.isArray(draft.lifeAdjustment)
+      ? {
+          type: String(draft.lifeAdjustment.type || 'none'),
+          targetEpisodeId: String(draft.lifeAdjustment.targetEpisodeId || ''),
+          startAt: draft.lifeAdjustment.startAt === null ? null : Number(draft.lifeAdjustment.startAt),
+          endAt: draft.lifeAdjustment.endAt === null ? null : Number(draft.lifeAdjustment.endAt),
+          reason: String(draft.lifeAdjustment.reason || '')
         }
       : null,
     usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : []
@@ -217,7 +233,7 @@ function repairReplyForDelivery(reply, kind = 'DIRECT_REPLY') {
 export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
-    generationContextLimit = 24, roleProfiles = DEFAULT_PROFILES
+    generationContextLimit = 24, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
@@ -228,6 +244,7 @@ export class YuqiOrchestrator {
     this.contextLimit = Math.max(1, Math.min(5000, Number(contextLimit) || 200));
     this.generationContextLimit = Math.max(1, Math.min(200, Number(generationContextLimit) || 24));
     this.roleProfiles = roleProfiles;
+    this.lifeSimulation = lifeSimulation || new LifeSimulationCoordinator({ store });
   }
 
   accept(envelope) {
@@ -346,6 +363,7 @@ export class YuqiOrchestrator {
   }
 
   async completeMemory(envelope) {
+    const lifeContext = this.lifeSimulation.advanceTo(envelope.characterId, this.clock());
     const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
     const scene = sceneFromEnvelope(envelope);
     const interactionState = buildAuthoritativeInteractionState({
@@ -359,7 +377,8 @@ export class YuqiOrchestrator {
         ? { currentMessageId: envelope.message.messageId }
         : { currentTrigger: envelope.trigger, triggerIsNotUserEvidence: true }),
       recentMessages,
-      interactionState
+      interactionState,
+      lifeContext
     };
     let current = this.store.getTurn(envelope.turnId);
     const initialRoute = current.route === 'fast' ? 'fast' : 'deep';
@@ -407,7 +426,8 @@ export class YuqiOrchestrator {
       relationshipStageReview: memoryResult.relationshipStageReview || null,
       conversationFrame,
       effectiveRelationshipStage: relationship.stage,
-      relationshipStageAction: relationship.action
+      relationshipStageAction: relationship.action,
+      lifeContext
     };
     this.store.advanceTurn(envelope.turnId, 'memory_running', 'memory_done', {
       memoryPacketJson: JSON.stringify(memoryPacket)
@@ -450,6 +470,7 @@ export class YuqiOrchestrator {
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       recentMessages,
       interactionState,
+      lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
       evidencePack,
       conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
       ...(previousSupervisor?.decision === 'rewrite' ? {
@@ -497,6 +518,7 @@ export class YuqiOrchestrator {
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       recentMessages,
       interactionState,
+      lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
       evidencePack,
       conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
       draft
@@ -594,24 +616,40 @@ export class YuqiOrchestrator {
       sentAt: this.clock(),
       origin: 'codex'
     };
-    const savedReply = this.store.putMessage(reply);
-    if (['PROACTIVE_CHAT', 'PROACTIVE_MOMENT'].includes(envelope.kind)) {
-      this.store.quarantinePendingReply(savedReply.messageId);
-    }
-    const result = {
-      turnId: envelope.turnId,
-      presetVersion: this.presets.current().version,
-      action: 'send',
-      paymentAction: resolvedPaymentAction(envelope, draft),
-      reply: savedReply,
-      usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
-      relationshipStageAction: memoryPacket.relationshipStageAction || null,
-      momentAction: null
-    };
-    this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
-      replyJson: JSON.stringify(result)
+    return this.store.transaction(() => {
+      if (draft.lifePlan?.episodes?.length) {
+        this.store.putLifePlanInternal(envelope.characterId, draft.lifePlan.episodes, {
+          sourceTurnId: envelope.turnId
+        });
+      }
+      const lifeAdjustment = draft.lifeAdjustment?.type && draft.lifeAdjustment.type !== 'none'
+        ? this.store.applyLifeAdjustment(
+            envelope.characterId, draft.lifeAdjustment, envelope.turnId, this.clock()
+          )
+        : null;
+      const savedReply = this.store.putMessageInternal(reply);
+      if (['PROACTIVE_CHAT', 'PROACTIVE_MOMENT'].includes(envelope.kind)) {
+        this.store.quarantinePendingReply(savedReply.messageId);
+      }
+      const result = {
+        turnId: envelope.turnId,
+        presetVersion: this.presets.current().version,
+        action: 'send',
+        paymentAction: resolvedPaymentAction(envelope, draft),
+        reply: savedReply,
+        usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
+        relationshipStageAction: memoryPacket.relationshipStageAction || null,
+        lifeAdjustment: lifeAdjustment ? {
+          type: draft.lifeAdjustment.type,
+          episodeId: lifeAdjustment.episodeId
+        } : null,
+        momentAction: null
+      };
+      this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
+        replyJson: JSON.stringify(result)
+      });
+      return result;
     });
-    return result;
   }
 
   cancel(turnId) {

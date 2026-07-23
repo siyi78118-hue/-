@@ -84,6 +84,20 @@ const server = createYuqiServer({
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });
 dispatcher.recover();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
+orchestrator.lifeSimulation.advanceTo('yuqi', Date.now());
+const lifeBoundaryTimer = setInterval(() => {
+  try {
+    orchestrator.lifeSimulation.advanceTo('yuqi', Date.now());
+  } catch (error) {
+    store.putDiagnostic({
+      turnId: null,
+      stage: 'life_boundary',
+      level: 'error',
+      detail: { name: error.name, message: error.message }
+    });
+  }
+}, 60_000);
+lifeBoundaryTimer.unref?.();
 const address = server.address();
 process.stdout.write(`Yuqi runtime listening on ${address.address}:${address.port}\n`);
 
@@ -91,6 +105,7 @@ let stopping = false;
 async function stop() {
   if (stopping) return;
   stopping = true;
+  clearInterval(lifeBoundaryTimer);
   try { cloudPump?.stop(); } catch {}
   try { await server.close(); } catch {}
   try { await codex.stop(); } catch {}

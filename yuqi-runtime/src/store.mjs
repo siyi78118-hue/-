@@ -134,6 +134,36 @@ function mapCloudDelivery(row) {
   };
 }
 
+function mapLifeEpisode(row) {
+  if (!row) return null;
+  return {
+    episodeId: row.episode_id,
+    characterId: row.character_id,
+    kind: row.kind,
+    title: row.title,
+    startAt: row.start_at,
+    endAt: row.end_at,
+    status: row.status,
+    payload: parseJson(row.payload_json, {}),
+    checksum: row.checksum,
+    sourceTurnId: row.source_turn_id || null,
+    adjustmentReason: row.adjustment_reason || '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapCharacterLifeState(row) {
+  if (!row) return null;
+  return {
+    characterId: row.character_id,
+    currentEpisodeId: row.current_episode_id || null,
+    revision: row.revision,
+    lastAdvancedAt: row.last_advanced_at,
+    state: parseJson(row.state_json, {})
+  };
+}
+
 export class YuqiStore {
   constructor(filename) {
     if (!filename) throw new Error('database filename is required');
@@ -309,6 +339,33 @@ export class YuqiStore {
         reason TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         FOREIGN KEY(message_id) REFERENCES messages(message_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS life_episodes (
+        episode_id TEXT PRIMARY KEY,
+        character_id TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        title TEXT NOT NULL,
+        start_at INTEGER NOT NULL,
+        end_at INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'planned',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        checksum TEXT NOT NULL,
+        source_turn_id TEXT,
+        adjustment_reason TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_life_episodes_character_time
+        ON life_episodes(character_id, start_at, end_at);
+
+      CREATE TABLE IF NOT EXISTS character_life_state (
+        character_id TEXT PRIMARY KEY,
+        current_episode_id TEXT,
+        revision INTEGER NOT NULL DEFAULT 0,
+        last_advanced_at INTEGER NOT NULL,
+        state_json TEXT NOT NULL DEFAULT '{}',
+        updated_at INTEGER NOT NULL
       );
     `);
 
@@ -975,6 +1032,166 @@ export class YuqiStore {
       VALUES (?, ?, 'pending_phone_receipt', ?)
     `).run(message.messageId, message.messageId, now());
     return message;
+  }
+
+  getLifeEpisode(episodeId) {
+    return mapLifeEpisode(this.db.prepare('SELECT * FROM life_episodes WHERE episode_id = ?').get(episodeId));
+  }
+
+  listLifeEpisodes(characterId, { from = null, to = null } = {}) {
+    const clauses = ['character_id = ?'];
+    const values = [String(characterId)];
+    if (from !== null) {
+      clauses.push('end_at > ?');
+      values.push(Number(from));
+    }
+    if (to !== null) {
+      clauses.push('start_at < ?');
+      values.push(Number(to));
+    }
+    return this.db.prepare(`
+      SELECT * FROM life_episodes
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY start_at ASC, episode_id ASC
+    `).all(...values).map(mapLifeEpisode);
+  }
+
+  putLifePlanInternal(characterId, episodes, { sourceTurnId = null } = {}) {
+    const safeCharacterId = String(characterId || '');
+    if (!safeCharacterId || !Array.isArray(episodes)) throw new Error('invalid life plan');
+    const forbiddenKinds = /(?:accident|illness|hospital|job_loss|identity_change|new_relationship)/i;
+    const normalized = episodes.map(item => {
+      const episode = {
+        episodeId: String(item?.episodeId || ''),
+        characterId: safeCharacterId,
+        kind: String(item?.kind || ''),
+        title: String(item?.title || ''),
+        startAt: Number(item?.startAt),
+        endAt: Number(item?.endAt),
+        payload: item?.payload && typeof item.payload === 'object' && !Array.isArray(item.payload) ? item.payload : {}
+      };
+      if (!episode.episodeId || !episode.kind || !episode.title || !(episode.endAt > episode.startAt)) {
+        throw new Error('invalid life episode');
+      }
+      if (forbiddenKinds.test(episode.kind)) throw new Error('forbidden life episode kind');
+      return episode;
+    }).sort((left, right) => left.startAt - right.startAt || left.episodeId.localeCompare(right.episodeId));
+    for (let index = 1; index < normalized.length; index += 1) {
+      if (normalized[index].startAt < normalized[index - 1].endAt) throw new Error('life episode overlap');
+    }
+
+    const incomingIds = new Set(normalized.map(item => item.episodeId));
+    for (const episode of normalized) {
+        const checksum = contentHash(episode);
+        const existing = this.getLifeEpisode(episode.episodeId);
+        if (existing) {
+          if (existing.checksum !== checksum) throw new Error('life episode checksum conflict');
+          continue;
+        }
+        const overlap = this.db.prepare(`
+          SELECT episode_id FROM life_episodes
+          WHERE character_id = ? AND start_at < ? AND end_at > ?
+          LIMIT 1
+        `).get(safeCharacterId, episode.endAt, episode.startAt);
+        if (overlap && !incomingIds.has(overlap.episode_id)) throw new Error('life episode overlap');
+        const timestamp = now();
+        this.db.prepare(`
+          INSERT INTO life_episodes(
+            episode_id, character_id, kind, title, start_at, end_at, status,
+            payload_json, checksum, source_turn_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?)
+        `).run(
+          episode.episodeId, safeCharacterId, episode.kind, episode.title,
+          episode.startAt, episode.endAt, canonicalJson(episode.payload), checksum,
+          sourceTurnId, timestamp, timestamp
+        );
+    }
+    return normalized.map(item => this.getLifeEpisode(item.episodeId));
+  }
+
+  putLifePlan(characterId, episodes, options = {}) {
+    return this.transaction(() => this.putLifePlanInternal(characterId, episodes, options));
+  }
+
+  getCharacterLifeState(characterId) {
+    return mapCharacterLifeState(
+      this.db.prepare('SELECT * FROM character_life_state WHERE character_id = ?').get(characterId)
+    );
+  }
+
+  advanceLifeState(characterId, at, state = {}) {
+    const current = this.getCharacterLifeState(characterId);
+    const episode = this.db.prepare(`
+      SELECT episode_id FROM life_episodes
+      WHERE character_id = ? AND start_at <= ? AND end_at > ?
+      ORDER BY start_at DESC LIMIT 1
+    `).get(characterId, Number(at), Number(at));
+    const revision = Number(current?.revision || 0) + 1;
+    this.db.prepare(`
+      INSERT INTO character_life_state(
+        character_id, current_episode_id, revision, last_advanced_at, state_json, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(character_id) DO UPDATE SET
+        current_episode_id = excluded.current_episode_id,
+        revision = excluded.revision,
+        last_advanced_at = MAX(character_life_state.last_advanced_at, excluded.last_advanced_at),
+        state_json = excluded.state_json,
+        updated_at = excluded.updated_at
+    `).run(characterId, episode?.episode_id || null, revision, Number(at), canonicalJson(state), now());
+    this.db.prepare(`
+      UPDATE life_episodes SET status = CASE
+        WHEN end_at <= ? THEN 'completed'
+        WHEN start_at <= ? AND end_at > ? THEN 'active'
+        ELSE 'planned'
+      END, updated_at = ?
+      WHERE character_id = ?
+    `).run(Number(at), Number(at), Number(at), now(), characterId);
+    return this.getCharacterLifeState(characterId);
+  }
+
+  applyLifeAdjustment(characterId, adjustment, sourceTurnId, appliedAt = now()) {
+    const type = String(adjustment?.type || 'none');
+    if (type === 'none') return null;
+    const target = this.getLifeEpisode(String(adjustment?.targetEpisodeId || ''));
+    if (!target || target.characterId !== characterId) throw new Error('life adjustment target not found');
+    if (!['reschedule', 'shorten', 'extend', 'cancel'].includes(type)) throw new Error('invalid life adjustment');
+    if (type === 'cancel') {
+      this.db.prepare(`
+        UPDATE life_episodes SET status = 'cancelled', source_turn_id = ?,
+          adjustment_reason = ?, updated_at = ? WHERE episode_id = ?
+      `).run(sourceTurnId, String(adjustment.reason || ''), Number(appliedAt), target.episodeId);
+      return this.getLifeEpisode(target.episodeId);
+    }
+    const startAt = type === 'reschedule' ? Number(adjustment.startAt) : target.startAt;
+    const endAt = ['reschedule', 'shorten', 'extend'].includes(type)
+      ? Number(adjustment.endAt)
+      : target.endAt;
+    if (!(endAt > startAt)) throw new Error('invalid adjusted life episode');
+    const overlap = this.db.prepare(`
+      SELECT episode_id FROM life_episodes
+      WHERE character_id = ? AND episode_id != ? AND status != 'cancelled'
+        AND start_at < ? AND end_at > ?
+      LIMIT 1
+    `).get(characterId, target.episodeId, endAt, startAt);
+    if (overlap) throw new Error('life adjustment overlap');
+    const canonical = {
+      episodeId: target.episodeId,
+      characterId,
+      kind: target.kind,
+      title: target.title,
+      startAt,
+      endAt,
+      payload: target.payload
+    };
+    this.db.prepare(`
+      UPDATE life_episodes SET start_at = ?, end_at = ?, checksum = ?,
+        source_turn_id = ?, adjustment_reason = ?, updated_at = ?
+      WHERE episode_id = ?
+    `).run(
+      startAt, endAt, contentHash(canonical), sourceTurnId,
+      String(adjustment.reason || ''), Number(appliedAt), target.episodeId
+    );
+    return this.getLifeEpisode(target.episodeId);
   }
 
   setSession(role, threadId) {

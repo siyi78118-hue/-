@@ -128,8 +128,30 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
       like: { type: 'boolean' },
       comment: { type: 'string' },
       replyToCommentId: nullable('string')
-    }, ['momentId', 'like', 'comment', 'replyToCommentId']), { type: 'null' }] }
-  }, ['action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction']),
+    }, ['momentId', 'like', 'comment', 'replyToCommentId']), { type: 'null' }] },
+    lifePlan: { anyOf: [objectSchema({
+      planKey: { type: 'string' },
+      episodes: {
+        type: 'array',
+        items: objectSchema({
+          episodeId: { type: 'string' },
+          kind: { type: 'string' },
+          title: { type: 'string' },
+          startAt: { type: 'number' },
+          endAt: { type: 'number' }
+        }, ['episodeId', 'kind', 'title', 'startAt', 'endAt'])
+      }
+    }, ['planKey', 'episodes']), { type: 'null' }] },
+    lifeAdjustment: { anyOf: [objectSchema({
+      type: { type: 'string', enum: ['none', 'reschedule', 'shorten', 'extend', 'cancel'] },
+      targetEpisodeId: { type: 'string' },
+      startAt: { anyOf: [{ type: 'number' }, { type: 'null' }] },
+      endAt: { anyOf: [{ type: 'number' }, { type: 'null' }] },
+      reason: { type: 'string' }
+    }, ['type', 'targetEpisodeId', 'startAt', 'endAt', 'reason']), { type: 'null' }] }
+  }, [
+    'action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction', 'lifePlan', 'lifeAdjustment'
+  ]),
   supervisor: objectSchema({
     decision: { type: 'string', enum: ['approve', 'rewrite', 'skip', 'reject'] },
     issues: {

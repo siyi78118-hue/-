@@ -150,8 +150,45 @@ test('ephemeral conversation frame reaches the brain but never becomes a durable
     const memoryPacket = JSON.parse(store.getTurn(result.turnId).memoryPacketJson);
 
     assert.deepEqual(brain.conversationFrame, frame);
+    assert.equal(brain.lifeContext.current.kind, 'sleep');
     assert.deepEqual(memoryPacket.conversationFrame, frame);
     assert.equal(store.listFacts('yuqi').some(fact => fact.predicate === 'possibleIntent'), false);
+  });
+});
+
+test('an approved reply may reschedule Yuqi own plan and the decision persists', async () => {
+  const frame = conversationFrame();
+  await withFixture({
+    memory: [JSON.stringify({
+      query: 'change plan', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: ['placeholder']
+  }, async ({ store, codex, orchestrator }) => {
+    orchestrator.lifeSimulation.ensureHorizon('yuqi', 1784400000000);
+    const personal = store.listLifeEpisodes('yuqi').find(item => item.kind === 'personal');
+    codex.outputs.brain[0] = JSON.stringify({
+      action: 'send',
+      reply: '那我晚一点再去散步，先陪你把这件事聊完。',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: null,
+      lifePlan: null,
+      lifeAdjustment: {
+        type: 'reschedule',
+        targetEpisodeId: personal.episodeId,
+        startAt: personal.startAt + 60 * 60_000,
+        endAt: personal.endAt + 60 * 60_000,
+        reason: '虞栖自己决定晚一点散步'
+      }
+    });
+
+    await orchestrator.process(envelope(13, '你先别走，陪我说会儿话'));
+
+    const adjusted = store.getLifeEpisode(personal.episodeId);
+    assert.equal(adjusted.startAt, personal.startAt + 60 * 60_000);
+    assert.equal(adjusted.sourceTurnId, 'turn_phone_13');
   });
 });
 
