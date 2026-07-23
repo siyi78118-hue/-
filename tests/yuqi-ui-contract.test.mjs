@@ -99,6 +99,22 @@ test('native completed replies retain bridge provenance without changing bubble 
   assert.match(html, /replyAttemptedRoutes:\s*Array\.isArray\(result\?\.attemptedRoutes\)/);
 });
 
+test('native completed turns are serialized across submit, poll, inbox, and foreground replay', () => {
+  assert.match(html, /let\s+nativeExecutionReconcilePromise\s*=\s*null/);
+  assert.match(html, /const\s+nativeTurnApplyPromises\s*=\s*new Map\(\)/);
+  assert.match(html, /function\s+withNativeTurnApplyLock\(turnId,\s*operation\)/);
+  assert.match(html, /async function\s+applyNativeExecutionTurnUnlocked\(result\)/);
+  assert.match(html, /function\s+applyNativeExecutionTurn\(result\)\s*\{\s*return\s+withNativeTurnApplyLock\(result\?\.turnId,\s*\(\)\s*=>\s*applyNativeExecutionTurnUnlocked\(result\)\)/);
+  assert.match(html, /if\s*\(nativeExecutionReconcilePromise\)\s*return\s+nativeExecutionReconcilePromise/);
+});
+
+test('native text bubbles use deterministic per-turn part and chunk identities', () => {
+  assert.match(html, /function\s+nativeReplyBubbleId\(turnId,\s*replyPartId,\s*chunkIndex\)/);
+  assert.match(html, /nativeReplyBubbleId\(result\.turnId,\s*part\.replyPartId,\s*index\)/);
+  assert.match(html, /if\s*\(messageById\(chat,\s*messageId\)\)\s*return/);
+  assert.match(html, /sourceReplyChunkId/);
+});
+
 test('startup cleanup removes only empty native reply envelopes from assistant bubbles', () => {
   assert.match(html, /function\s+isLeakedNativeReplyEnvelope\(message\)/);
   const cleanup = html.slice(

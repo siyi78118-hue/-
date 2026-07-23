@@ -1519,7 +1519,9 @@ let voiceStream = null;
 let voiceStartAt = 0;
 let voiceRecordingCharId = '';
 let nativeReplyPollTimer = null;
+let nativeExecutionReconcilePromise = null;
 const nativeReplyQueuedIds = new Set();
+const nativeTurnApplyPromises = new Map();
 const EMPTY_REPLY_TEXT = '（对方没有回复）';
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 
@@ -2747,6 +2749,10 @@ function nativeReplyProvenance(result) {
     replyAttemptedRoutes: Array.isArray(result?.attemptedRoutes) ? [...result.attemptedRoutes] : []
   };
 }
+function nativeReplyBubbleId(turnId, replyPartId, chunkIndex) {
+  const safe = value => String(value || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `native_${safe(turnId)}_${safe(replyPartId)}_${Math.max(0, Number(chunkIndex) || 0)}`;
+}
 function appendNativeReplyTextParts(chat, result, extra = {}) {
   const appended = [];
   for (const part of nativeReplyTextParts(result)) {
@@ -2756,10 +2762,21 @@ function appendNativeReplyTextParts(chat, result, extra = {}) {
       ...nativeReplyProvenance(result),
       time: part.createdAt,
       sourceTurnId: `native:${result.turnId}`,
-      sourceReplyPartId: part.replyPartId
+      sourceReplyPartId: part.replyPartId,
+      sourceReplyChunkIdFactory: index => `${part.replyPartId}:${index}`,
+      messageIdFactory: index => nativeReplyBubbleId(result.turnId, part.replyPartId, index)
     }));
   }
   return appended;
+}
+function withNativeTurnApplyLock(turnId, operation) {
+  const key = String(turnId || '');
+  const previous = nativeTurnApplyPromises.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+  nativeTurnApplyPromises.set(key, current);
+  return current.finally(() => {
+    if (nativeTurnApplyPromises.get(key) === current) nativeTurnApplyPromises.delete(key);
+  });
 }
 function nativePendingStateIsCurrent(chat, userMessage, result) {
   const pending = chat?.pendingReply;
@@ -2920,7 +2937,7 @@ function applyNativeMomentActionPart(charId, part, turnId) {
   return true;
 }
 
-async function applyNativeExecutionTurn(result) {
+async function applyNativeExecutionTurnUnlocked(result) {
   const charId = result?.characterId;
   const chat = allChats[charId];
   const kind = String(result?.kind || 'DIRECT_REPLY');
@@ -3065,7 +3082,10 @@ async function applyNativeExecutionTurn(result) {
   DB.set('chats', allChats);
   return true;
 }
-async function reconcileNativeExecutionTurns() {
+function applyNativeExecutionTurn(result) {
+  return withNativeTurnApplyLock(result?.turnId, () => applyNativeExecutionTurnUnlocked(result));
+}
+async function reconcileNativeExecutionTurnsUnlocked() {
   const plugin = nativeExecutionPlugin();
   if (!plugin?.getTurn) return false;
   const cursorKey = 'rpchat_native_execution_cursor';
@@ -3090,6 +3110,14 @@ async function reconcileNativeExecutionTurns() {
     catch (err) { console.warn('[AL Native Execution] getTurn failed:', turnId, err.message); }
   }
   return changed;
+}
+function reconcileNativeExecutionTurns() {
+  if (nativeExecutionReconcilePromise) return nativeExecutionReconcilePromise;
+  const current = reconcileNativeExecutionTurnsUnlocked();
+  nativeExecutionReconcilePromise = current;
+  return current.finally(() => {
+    if (nativeExecutionReconcilePromise === current) nativeExecutionReconcilePromise = null;
+  });
 }
 
 function startNativeReplyPolling() {
@@ -6472,12 +6500,27 @@ function appendAssistantMessages(chat, text, extra = {}) {
   if (!chunks.length) return [];
   const explicitTime = Number(extra.time);
   const baseTime = Number.isFinite(explicitTime) && explicitTime > 0 ? explicitTime : Date.now();
+  const messageIdFactory = typeof extra.messageIdFactory === 'function' ? extra.messageIdFactory : null;
+  const sourceReplyChunkIdFactory = typeof extra.sourceReplyChunkIdFactory === 'function' ? extra.sourceReplyChunkIdFactory : null;
   const messageExtra = { ...extra };
   delete messageExtra.time;
+  delete messageExtra.messageIdFactory;
+  delete messageExtra.sourceReplyChunkIdFactory;
+  const appended = [];
   chunks.forEach((content, index) => {
-    insertChatMessageChronologically(chat, { id: uid('msg'), role: 'assistant', content, time: baseTime + index * 1000, ...messageExtra });
+    const messageId = messageIdFactory ? String(messageIdFactory(index, content) || '') : uid('msg');
+    if (messageById(chat, messageId)) return;
+    insertChatMessageChronologically(chat, {
+      id: messageId,
+      role: 'assistant',
+      content,
+      time: baseTime + index * 1000,
+      ...messageExtra,
+      ...(sourceReplyChunkIdFactory ? { sourceReplyChunkId: String(sourceReplyChunkIdFactory(index, content) || '') } : {})
+    });
+    appended.push(content);
   });
-  return chunks;
+  return appended;
 }
 function appendAssistantPaymentMessage(chat, directive, extra = {}) {
   if (!chat || !directive) return null;
