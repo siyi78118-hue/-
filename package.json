@@ -3,7 +3,7 @@
     "presets:sync": "node scripts/sync-yuqi-preset-assets.mjs",
     "presets:check": "node scripts/sync-yuqi-preset-assets.mjs --check",
     "start": "node serve-static.mjs",
-    "test": "npm run presets:check && node --test tests/rp-preset-contract.test.mjs && node --test tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs tests/cloud-timer-d1.test.mjs tests/yuqi-relay-worker.test.mjs tests/yuqi-ui-contract.test.mjs tests/yuqi-deployment-contract.test.mjs tests/payment-batch-bridge-contract.test.mjs && node --test yuqi-runtime/test/*.test.mjs && node test-basic.mjs && node test-sw-automatic-task-guard.mjs",
+    "test": "npm run presets:check && node --test tests/rp-preset-contract.test.mjs && node --test tests/android-unsigned-release-contract.test.mjs tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs tests/cloud-timer-d1.test.mjs tests/yuqi-relay-worker.test.mjs tests/yuqi-ui-contract.test.mjs tests/yuqi-deployment-contract.test.mjs tests/payment-batch-bridge-contract.test.mjs && node --test yuqi-runtime/test/*.test.mjs && node test-basic.mjs && node test-sw-automatic-task-guard.mjs",
     "android:sync": "npm run presets:sync && cap sync android",
     "android:copy": "npm run presets:sync && cap copy android",
     "android:open": "cap open android",
