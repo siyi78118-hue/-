@@ -2,12 +2,17 @@ package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.TurnKind;
+import com.siyi.al.execution.api.ParsedReply;
+import com.siyi.al.execution.api.ParsedReplyPart;
+import com.siyi.al.execution.api.ReplyParser;
 import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.List;
 import org.json.JSONObject;
 
 public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
@@ -123,6 +128,8 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         entity.syncSeq = 0L;
         dao.insertRawMessage(entity);
 
+        if (completedTurnAlreadyContainsReply(turn, content)) return true;
+
         if (turn != null) {
             String state = turn.state == null ? "" : turn.state;
             if (!("FAILED_RETRYABLE".equals(state) || "FAILED_FINAL".equals(state)
@@ -161,6 +168,26 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         }
         ReplyPartEntity independentPart = backlogPart(messageId, backfillTurnId, null, content, sentAt);
         return dao.importCloudBacklogReply(backfillTurnId, independentPart, sentAt);
+    }
+
+    private boolean completedTurnAlreadyContainsReply(ChatTurnEntity turn, String content) {
+        if (turn == null || !"COMPLETED".equals(turn.state)) return false;
+        List<ReplyPartEntity> stored = dao.replyParts(turn.turnId);
+        if (stored == null || stored.isEmpty()) return false;
+        List<String> storedText = new ArrayList<>();
+        for (ReplyPartEntity part : stored) {
+            if ("TEXT".equals(part.type)) storedText.add(part.content);
+        }
+        ParsedReply parsed = new ReplyParser().parse(
+            content,
+            turn.turnId,
+            turn.activeAttemptId == null ? "attempt_cloud_compare" : turn.activeAttemptId
+        );
+        List<String> incomingText = new ArrayList<>();
+        for (ParsedReplyPart part : parsed.parts) {
+            if ("TEXT".equals(part.type)) incomingText.add(part.content);
+        }
+        return !incomingText.isEmpty() && storedText.equals(incomingText);
     }
 
     private static ReplyPartEntity backlogPart(

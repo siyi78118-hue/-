@@ -153,6 +153,36 @@ public class RoomBridgeMirrorTest {
         assertEquals(insertedTurns.get(0).turnId, imported.get(imported.size() - 1).turnId);
     }
 
+    @Test public void repeatedCloudInboxDeliveryDoesNotBackfillTheSameCompletedReplyTwice() throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<ChatTurnEntity> insertedTurns = new ArrayList<>();
+        ChatTurnEntity completedTurn = new ChatTurnEntity();
+        completedTurn.turnId = "turn_msg_phone_duplicate";
+        completedTurn.characterId = "yuqi";
+        completedTurn.state = "COMPLETED";
+        completedTurn.activeAttemptId = "attempt_duplicate";
+        ReplyPartEntity existingReply = new ReplyPartEntity();
+        existingReply.replyPartId = "part_turn_msg_phone_duplicate_0";
+        existingReply.turnId = completedTurn.turnId;
+        existingReply.attemptId = completedTurn.activeAttemptId;
+        existingReply.sequence = 0;
+        existingReply.type = "TEXT";
+        existingReply.content = "同一句回复";
+        existingReply.payloadJson = "{}";
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            daoWithStoredReply(inserted, insertedTurns, completedTurn, existingReply), "phone_a"
+        );
+        String raw = "{\"turnId\":\"turn_msg_phone_duplicate\",\"state\":\"committed\","
+            + "\"terminal\":true,\"reply\":{\"messageId\":\"msg_yuqi_duplicate\","
+            + "\"characterId\":\"yuqi\",\"content\":\"同一句回复\","
+            + "\"sentAt\":1784390002500,\"origin\":\"codex\"}}";
+
+        boolean saved = mirror.persistCloudInboxReply(raw);
+
+        assertEquals(true, saved);
+        assertEquals(0, insertedTurns.size());
+    }
+
     @Test public void currentCloudReplyDoesNotCreateABackfillTurnWhileItsOriginalTurnIsRunning() throws Exception {
         List<RawMessageEntity> inserted = new ArrayList<>();
         List<ReplyPartEntity> imported = new ArrayList<>();
@@ -280,6 +310,46 @@ public class RoomBridgeMirrorTest {
                 if ("importCloudBacklogFailure".equals(method.getName())) {
                     failures.add(args[0] + "|" + args[1] + "|" + args[2] + "|" + args[3]);
                     return true;
+                }
+                Class<?> type = method.getReturnType();
+                if (type == long.class) return 0L;
+                if (type == int.class) return 0;
+                if (type == boolean.class) return false;
+                return null;
+            }
+        );
+    }
+
+    private static AlExecutionDao daoWithStoredReply(
+        List<RawMessageEntity> inserted,
+        List<ChatTurnEntity> insertedTurns,
+        ChatTurnEntity turn,
+        ReplyPartEntity existingReply
+    ) {
+        Map<String, ChatTurnEntity> turns = new LinkedHashMap<>();
+        turns.put(turn.turnId, turn);
+        return (AlExecutionDao) Proxy.newProxyInstance(
+            AlExecutionDao.class.getClassLoader(),
+            new Class<?>[] { AlExecutionDao.class },
+            (proxy, method, args) -> {
+                if ("insertRawMessage".equals(method.getName())) {
+                    inserted.add((RawMessageEntity) args[0]);
+                    return 1L;
+                }
+                if ("turn".equals(method.getName())) return turns.get((String) args[0]);
+                if ("replyParts".equals(method.getName())) {
+                    return turn.turnId.equals(args[0])
+                        ? Arrays.asList(existingReply)
+                        : new ArrayList<ReplyPartEntity>();
+                }
+                if ("insertTurn".equals(method.getName())) {
+                    ChatTurnEntity value = (ChatTurnEntity) args[0];
+                    insertedTurns.add(value);
+                    turns.put(value.turnId, value);
+                    return 1L;
+                }
+                if ("importCloudBacklogReply".equals(method.getName())) {
+                    return !turn.turnId.equals(args[0]);
                 }
                 Class<?> type = method.getReturnType();
                 if (type == long.class) return 0L;
