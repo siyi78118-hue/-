@@ -497,16 +497,26 @@ button.cell:active{background:#ececec}
     </div>
     <div class="scroll" style="background:#ededed">
       <div class="contact-index" id="role-plan-character-name">角色安排</div>
+      <div class="cell-group">
+        <div class="cell"><div class="cell-label">查看</div><div class="cell-body"><select class="select" id="role-plan-filter" onchange="renderRolePlansScreen()"><option value="upcoming">待执行</option><option value="recurring">重复安排</option><option value="history">已结束与历史</option><option value="all">全部</option></select></div></div>
+      </div>
       <div id="role-plan-list"></div>
       <details class="chat-info-advanced" id="role-plan-editor">
-        <summary class="cell"><div class="cell-body">添加安排</div><div class="mini more">›</div></summary>
+        <summary class="cell"><div class="cell-body" id="role-plan-editor-title">添加安排</div><div class="mini more">›</div></summary>
         <div class="cell-group chat-info-editor">
           <div class="cell"><div class="cell-label">类型</div><div class="cell-body"><select class="select" id="role-plan-type"><option value="private_message">主动私聊</option><option value="moment_post">发布朋友圈</option><option value="role_schedule">角色日程</option></select></div></div>
           <div class="cell"><div class="cell-label">标题</div><div class="cell-body"><input class="input" id="role-plan-title" placeholder="例如：早安"></div></div>
           <div class="cell"><div class="cell-label">内容</div><div class="cell-body"><textarea class="textarea" id="role-plan-intent" placeholder="角色到时准备做什么"></textarea></div></div>
-          <div class="cell"><div class="cell-label">时间</div><div class="cell-body"><input class="input" id="role-plan-at" type="datetime-local"></div></div>
+          <div class="cell"><div class="cell-label">重复</div><div class="cell-body"><select class="select" id="role-plan-schedule-kind" onchange="refreshRolePlanScheduleEditor()"><option value="once">仅一次</option><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option><option value="interval">固定间隔</option></select></div></div>
+          <div class="cell" id="role-plan-at-row"><div class="cell-label">时间</div><div class="cell-body"><input class="input" id="role-plan-at" type="datetime-local"></div></div>
+          <div class="cell" id="role-plan-time-row" hidden><div class="cell-label">时刻</div><div class="cell-body"><input class="input" id="role-plan-time" type="time" value="09:00"></div></div>
+          <div class="cell" id="role-plan-weekdays-row" hidden><div class="cell-label">星期</div><div class="cell-body"><input class="input" id="role-plan-weekdays" placeholder="1,2,3,4,5（周一到周五）"></div></div>
+          <div class="cell" id="role-plan-month-day-row" hidden><div class="cell-label">每月几号</div><div class="cell-body"><input class="input" id="role-plan-month-day" type="number" min="1" max="31" value="1"></div></div>
+          <div class="cell" id="role-plan-interval-row" hidden><div class="cell-label">间隔分钟</div><div class="cell-body"><input class="input" id="role-plan-interval-minutes" type="number" min="5" value="60"></div></div>
+          <div class="cell"><div class="cell-label">日程时长</div><div class="cell-body"><input class="input" id="role-plan-duration-minutes" type="number" min="1" placeholder="仅角色日程需要，例如 60 分钟"></div></div>
         </div>
-        <button class="primary" onclick="createRolePlanFromUi()" type="button">保存安排</button>
+        <button class="primary" id="role-plan-save-button" onclick="saveRolePlanFromUi()" type="button">保存安排</button>
+        <button class="secondary" id="role-plan-edit-cancel" onclick="resetRolePlanEditor()" type="button" hidden>取消编辑</button>
       </details>
     </div>
   </div>
@@ -1492,6 +1502,7 @@ let stagePersonaReturnScreen = 'chat-info';
 let stagePersonaTargetCharId = '';
 let rolePlansReturnScreen = 'chat-info';
 let rolePlansTargetCharId = '';
+let rolePlanEditingId = '';
 let stagePersonaEditorDraft = null;
 let stagePersonaEditorStageId = 'new';
 let plusOpen = false;
@@ -1664,7 +1675,22 @@ function getRolePlanRepository() {
 }
 async function refreshRolePlanCache(charId) {
   if (!charId) return [];
-  const plans = await getRolePlanRepository().list(charId, { includeTerminal: true });
+  let plans = await getRolePlanRepository().list(charId, { includeTerminal: true });
+  const now = Date.now();
+  const scheduleOperations = plans
+    .filter(plan => plan.type === 'role_schedule' && plan.status === 'active')
+    .flatMap(plan => {
+      const state = globalThis.ALRolePlans.roleScheduleState(plan, now);
+      if (state.expired) return [{ op: 'complete', planId: plan.planId, reason: '角色日程已自然结束' }];
+      if (Number.isFinite(state.nextRunAt) && Number(plan.nextRunAt) !== Number(state.nextRunAt)) {
+        return [{ op: 'update', planId: plan.planId, patch: { nextRunAt: state.nextRunAt }, reason: '推进到下一次角色日程' }];
+      }
+      return [];
+    });
+  if (scheduleOperations.length) {
+    const reconciled = await getRolePlanRepository().apply(charId, scheduleOperations);
+    plans = reconciled.plans || plans;
+  }
   rolePlanCache.set(charId, plans);
   return plans;
 }
@@ -1751,8 +1777,19 @@ async function renderRolePlansScreen() {
   document.getElementById('role-plan-character-name').textContent = `${charName(char)}的安排`;
   list.innerHTML = '<div class="empty">正在读取安排...</div>';
   const plans = await refreshRolePlanCache(rolePlansTargetCharId);
-  const effective = plans.filter(plan => !['completed', 'cancelled'].includes(plan.status));
-  const archived = plans.filter(plan => ['completed', 'cancelled'].includes(plan.status));
+  const filter = document.getElementById('role-plan-filter')?.value || 'upcoming';
+  const terminal = plan => ['completed', 'cancelled'].includes(plan.status);
+  const shown = plans.filter(plan => {
+    if (filter === 'history') return terminal(plan);
+    if (filter === 'recurring') return !terminal(plan) && plan.schedule?.kind && plan.schedule.kind !== 'once';
+    if (filter === 'upcoming') return !terminal(plan);
+    return true;
+  });
+  const historyEntries = await Promise.all(shown.map(async plan => [
+    plan.planId,
+    await getRolePlanRepository().history(plan.planId, 20)
+  ]));
+  const historyByPlan = new Map(historyEntries);
   const card = plan => {
     const time = plan.nextRunAt ? formatFullTime(new Date(Number(plan.nextRunAt))) : '没有下一次时间';
     const primary = plan.status === 'paused'
@@ -1761,19 +1798,55 @@ async function renderRolePlansScreen() {
     const cancel = !['completed', 'cancelled'].includes(plan.status)
       ? `<button class="danger" onclick="mutateRolePlanFromUi('${plan.planId}','cancel')" type="button">取消</button>`
       : '';
+    const edit = !terminal(plan)
+      ? `<button onclick="editRolePlanFromUi('${plan.planId}')" type="button">编辑</button>`
+      : '';
+    const runNow = !terminal(plan) && plan.type !== 'role_schedule'
+      ? `<button onclick="runRolePlanNowFromUi('${plan.planId}')" type="button">${plan.status === 'failed' ? '重试' : '立即执行'}</button>`
+      : '';
+    const remove = terminal(plan)
+      ? `<button class="danger" onclick="deleteRolePlanFromUi('${plan.planId}')" type="button">删除</button>`
+      : '';
+    const history = historyByPlan.get(plan.planId) || [];
+    const historyHtml = history.length
+      ? `<details class="plan-card-history"><summary>变化记录（${history.length}）</summary>${history.map(row => {
+          const detail = (() => { try { return JSON.parse(row.detailJson || '{}'); } catch { return {}; } })();
+          return `<div class="plan-card-meta">${esc(formatFullTime(new Date(Number(row.createdAt) || Date.now())))}｜${esc(row.operation || '更新')} ${esc(detail.reason || detail.title || '')}</div>`;
+        }).join('')}</details>`
+      : '';
     return `<div class="plan-card">
       <div class="plan-card-title">${esc(plan.title || plan.intent || '未命名安排')}</div>
-      <div class="plan-card-meta">${esc(rolePlanTypeLabel(plan.type))}｜${esc(rolePlanStatusLabel(plan.status))}｜${esc(rolePlanSourceLabel(plan.source))}<br>${esc(time)}<br>${esc(rolePlanCloudStatusLabel(plan))}</div>
+      <div class="plan-card-meta">${esc(rolePlanTypeLabel(plan.type))}｜${esc(rolePlanStatusLabel(plan.status))}｜${esc(rolePlanSourceLabel(plan.source))}<br>${esc(time)}｜${esc(rolePlanScheduleLabel(plan.schedule))}<br>${esc(rolePlanCloudStatusLabel(plan))}</div>
       <div class="plan-card-intent">${esc(plan.intent || '')}</div>
-      ${(primary || cancel) ? `<div class="plan-card-actions">${primary}${cancel}</div>` : ''}
+      ${historyHtml}
+      ${(primary || cancel || edit || runNow || remove) ? `<div class="plan-card-actions">${runNow}${edit}${primary}${cancel}${remove}</div>` : ''}
     </div>`;
   };
-  list.innerHTML = effective.length
-    ? effective.map(card).join('')
-    : '<div class="empty">暂无待执行安排。角色在聊天里作出明确承诺后，会自动记录在这里。</div>';
-  if (archived.length) list.innerHTML += `<div class="contact-index">已结束</div>${archived.slice(0, 20).map(card).join('')}`;
+  list.innerHTML = shown.length
+    ? shown.map(card).join('')
+    : `<div class="empty">${filter === 'history' ? '暂无已结束安排。' : '暂无符合条件的安排。角色在聊天里作出明确承诺后，会自动记录在这里。'}</div>`;
   const at = document.getElementById('role-plan-at');
   if (at && !at.value) at.value = localDateTimeInputValue(Date.now() + 60 * 60 * 1000);
+  refreshRolePlanScheduleEditor();
+}
+function rolePlanScheduleLabel(schedule = {}) {
+  if (schedule.kind === 'daily') return `每天 ${schedule.time || ''}`;
+  if (schedule.kind === 'weekly') return `每周 ${(schedule.weekdays || []).join(',')} ${schedule.time || ''}`;
+  if (schedule.kind === 'monthly') return `每月 ${schedule.day || ''} 日 ${schedule.time || ''}`;
+  if (schedule.kind === 'interval') return `每 ${Math.round(Number(schedule.intervalMs || 0) / 60000)} 分钟`;
+  return '仅一次';
+}
+function refreshRolePlanScheduleEditor() {
+  const kind = document.getElementById('role-plan-schedule-kind')?.value || 'once';
+  const show = (id, visible) => {
+    const row = document.getElementById(id);
+    if (row) row.hidden = !visible;
+  };
+  show('role-plan-at-row', kind === 'once' || kind === 'interval');
+  show('role-plan-time-row', ['daily', 'weekly', 'monthly'].includes(kind));
+  show('role-plan-weekdays-row', kind === 'weekly');
+  show('role-plan-month-day-row', kind === 'monthly');
+  show('role-plan-interval-row', kind === 'interval');
 }
 async function mutateRolePlanFromUi(planId, action) {
   if (!rolePlansTargetCharId || !planId) return;
@@ -1782,31 +1855,127 @@ async function mutateRolePlanFromUi(planId, action) {
   if (result.rejected?.length) toast('操作失败：' + result.rejected[0].detail, 2600);
   await renderRolePlansScreen();
 }
-async function createRolePlanFromUi() {
+function rolePlanScheduleFromEditor() {
+  const kind = document.getElementById('role-plan-schedule-kind')?.value || 'once';
+  const atValue = document.getElementById('role-plan-at')?.value || '';
+  const at = new Date(atValue).getTime();
+  if (kind === 'once') return Number.isFinite(at) ? { kind, at: new Date(at).toISOString() } : null;
+  if (kind === 'interval') {
+    const intervalMs = Number(document.getElementById('role-plan-interval-minutes')?.value) * 60000;
+    return Number.isFinite(at) && intervalMs >= 300000
+      ? { kind, startsAt: new Date(at).toISOString(), intervalMs }
+      : null;
+  }
+  const time = document.getElementById('role-plan-time')?.value || '';
+  if (!/^\d{2}:\d{2}$/.test(time)) return null;
+  if (kind === 'daily') return { kind, time };
+  if (kind === 'weekly') {
+    const weekdays = Array.from(new Set(String(document.getElementById('role-plan-weekdays')?.value || '')
+      .split(',').map(Number).filter(day => Number.isInteger(day) && day >= 0 && day <= 6)));
+    return weekdays.length ? { kind, time, weekdays } : null;
+  }
+  const day = Number(document.getElementById('role-plan-month-day')?.value);
+  return Number.isInteger(day) && day >= 1 && day <= 31 ? { kind, time, day } : null;
+}
+async function saveRolePlanFromUi() {
   const charId = rolePlansTargetCharId;
   const type = document.getElementById('role-plan-type')?.value || 'private_message';
   const title = document.getElementById('role-plan-title')?.value.trim() || '';
   const intent = document.getElementById('role-plan-intent')?.value.trim() || '';
-  const atValue = document.getElementById('role-plan-at')?.value || '';
-  const at = new Date(atValue).getTime();
-  if (!charId || !intent || !Number.isFinite(at) || at <= Date.now()) {
-    toast('请填写安排内容和未来时间', 2600);
+  const schedule = rolePlanScheduleFromEditor();
+  const nextRunAt = schedule ? globalThis.ALRolePlans.nextOccurrence(schedule, Date.now() - 1) : null;
+  const durationMs = Math.max(0, Number(document.getElementById('role-plan-duration-minutes')?.value) || 0) * 60000;
+  if (!charId || !intent || !schedule || !Number.isFinite(nextRunAt) || nextRunAt <= Date.now()) {
+    toast('请填写安排内容和有效的未来时间/重复规则', 2600);
     return;
   }
-  const result = await applyRolePlanOperations(charId, [{
-    op: 'create', type, source: 'user_created', origin: 'user', title: title || intent.slice(0, 30), intent,
-    sourceQuote: intent, schedule: { kind: 'once', at: new Date(at).toISOString() }, timeConfidence: 'explicit'
-  }]);
+  if (type === 'role_schedule' && durationMs < 60000) {
+    toast('角色日程需要填写时长', 2600);
+    return;
+  }
+  const values = {
+    type, title: title || intent.slice(0, 30), intent, schedule,
+    ...(type === 'role_schedule' ? { durationMs } : {})
+  };
+  const operation = rolePlanEditingId
+    ? { op: 'update', planId: rolePlanEditingId, patch: values, reason: '用户编辑安排' }
+    : {
+        op: 'create', ...values, source: 'user_created', origin: 'user',
+        sourceQuote: intent, timeConfidence: 'explicit'
+      };
+  const result = await applyRolePlanOperations(charId, [operation]);
   if (result.rejected?.length) {
     toast('保存失败：' + result.rejected[0].detail, 2800);
     return;
   }
+  resetRolePlanEditor();
+  await renderRolePlansScreen();
+  toast(result.cloudSyncFailed ? '安排已保存在本机；云端同步失败，将由后台保护补跑' : '安排已保存并同步');
+}
+async function createRolePlanFromUi() {
+  return saveRolePlanFromUi();
+}
+function resetRolePlanEditor() {
+  rolePlanEditingId = '';
   document.getElementById('role-plan-title').value = '';
   document.getElementById('role-plan-intent').value = '';
   document.getElementById('role-plan-at').value = localDateTimeInputValue(Date.now() + 60 * 60 * 1000);
+  document.getElementById('role-plan-schedule-kind').value = 'once';
+  document.getElementById('role-plan-time').value = '09:00';
+  document.getElementById('role-plan-weekdays').value = '';
+  document.getElementById('role-plan-month-day').value = '1';
+  document.getElementById('role-plan-interval-minutes').value = '60';
+  document.getElementById('role-plan-duration-minutes').value = '';
+  document.getElementById('role-plan-editor-title').textContent = '添加安排';
+  document.getElementById('role-plan-save-button').textContent = '保存安排';
+  document.getElementById('role-plan-edit-cancel').hidden = true;
   document.getElementById('role-plan-editor').open = false;
+  refreshRolePlanScheduleEditor();
+}
+function editRolePlanFromUi(planId) {
+  const plan = (rolePlanCache.get(rolePlansTargetCharId) || []).find(row => row.planId === planId);
+  if (!plan) return;
+  rolePlanEditingId = planId;
+  document.getElementById('role-plan-type').value = plan.type || 'private_message';
+  document.getElementById('role-plan-title').value = plan.title || '';
+  document.getElementById('role-plan-intent').value = plan.intent || '';
+  document.getElementById('role-plan-schedule-kind').value = plan.schedule?.kind || 'once';
+  document.getElementById('role-plan-at').value = localDateTimeInputValue(plan.schedule?.at || plan.schedule?.startsAt || plan.nextRunAt);
+  document.getElementById('role-plan-time').value = plan.schedule?.time || '09:00';
+  document.getElementById('role-plan-weekdays').value = (plan.schedule?.weekdays || []).join(',');
+  document.getElementById('role-plan-month-day').value = plan.schedule?.day || 1;
+  document.getElementById('role-plan-interval-minutes').value = Math.max(5, Math.round(Number(plan.schedule?.intervalMs || 3600000) / 60000));
+  document.getElementById('role-plan-duration-minutes').value = plan.durationMs ? Math.round(Number(plan.durationMs) / 60000) : '';
+  document.getElementById('role-plan-editor-title').textContent = '编辑安排';
+  document.getElementById('role-plan-save-button').textContent = '保存修改';
+  document.getElementById('role-plan-edit-cancel').hidden = false;
+  document.getElementById('role-plan-editor').open = true;
+  refreshRolePlanScheduleEditor();
+}
+async function runRolePlanNowFromUi(planId) {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.runRolePlanNow) {
+    toast('立即执行需要在 Android 应用中使用', 2600);
+    return;
+  }
+  const plan = (rolePlanCache.get(rolePlansTargetCharId) || []).find(row => row.planId === planId);
+  if (plan?.status === 'failed') {
+    const resumed = await applyRolePlanOperations(rolePlansTargetCharId, [{ op: 'resume', planId, reason: '用户手动重试' }]);
+    if (resumed.rejected?.length) {
+      toast('重试失败：' + resumed.rejected[0].detail, 2600);
+      return;
+    }
+  }
+  await syncRolePlanCloudJobs(rolePlansTargetCharId);
+  const result = await plugin.runRolePlanNow({ planId });
+  toast(result?.queued ? '已加入执行队列' : '暂时无法执行，请检查安排状态和本机快照', 2800);
   await renderRolePlansScreen();
-  toast(result.cloudSyncFailed ? '安排已保存在本机；云端同步失败，将由后台保护补跑' : '安排已保存并同步');
+}
+async function deleteRolePlanFromUi(planId) {
+  if (!confirm('永久删除这项已结束安排及其历史记录？')) return;
+  const result = await applyRolePlanOperations(rolePlansTargetCharId, [{ op: 'delete', planId, reason: '用户删除已结束安排' }]);
+  if (result.rejected?.length) toast('删除失败：' + result.rejected[0].detail, 2600);
+  await renderRolePlansScreen();
 }
 
 async function dumpMemoryStores() {
@@ -2417,6 +2586,9 @@ function buildYuqiDynamicScene(char, chat) {
     },
     conversationExtraPrompt: String(chat?.extraPrompt || ''),
     globalExtraPrompt: String(settings.systemPrompt || ''),
+    rolePlanCatalog: rolePlanCatalogForPrompt(char.id),
+    roleScheduleContext: roleScheduleContextForPrompt(char.id),
+    momentContext: buildMomentChatContext(char.id),
     stageCatalog: config.stages.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') })),
     phaseCatalog: config.phases.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') })),
     currentPhase: config.currentPhase
@@ -2613,20 +2785,26 @@ async function syncRolePlanCloudJobs(charId) {
   syncingRolePlanChars.add(charId);
   try {
     const plans = await refreshRolePlanCache(charId);
+    ensureDeviceId();
+    const runnablePlans = plans.filter(plan => (
+      plan.type !== 'role_schedule'
+      && plan.status === 'active'
+      && Number.isFinite(Number(plan.nextRunAt))
+      && Number(plan.nextRunAt) > Date.now()
+    ));
+    for (const plan of runnablePlans) {
+      await saveNativeRolePlanSnapshot(charId, plan, globalThis.ALRolePlans.cloudJob(plan, settings.deviceId));
+    }
     if (!cloudTimerTransportReady() || !automaticTasksEnabled(settings)) {
-      for (const plan of plans.filter(row => row.type !== 'role_schedule' && row.status === 'active')) {
+      for (const plan of runnablePlans) {
         await patchRolePlanCloudState(charId, plan.planId, { cloudSyncState: 'pending', lastErrorCode: 'CLOUD_TRANSPORT_NOT_READY' });
       }
       return { changed: false, failed: true };
     }
-    ensureDeviceId();
     let changed = false;
     let failed = false;
     for (const plan of plans) {
-      const runnable = plan.type !== 'role_schedule'
-        && plan.status === 'active'
-        && Number.isFinite(Number(plan.nextRunAt))
-        && Number(plan.nextRunAt) > Date.now();
+      const runnable = runnablePlans.some(row => row.planId === plan.planId);
       if (!runnable) {
         if (plan.cloudJobId) {
           const cancelled = await cancelCloudJobId(plan.cloudJobId);
@@ -2639,7 +2817,6 @@ async function syncRolePlanCloudJobs(charId) {
         continue;
       }
       const job = globalThis.ALRolePlans.cloudJob(plan, settings.deviceId);
-      await saveNativeRolePlanSnapshot(charId, plan, job);
       await patchRolePlanCloudState(charId, plan.planId, { cloudSyncState: 'syncing', lastErrorCode: null });
       try {
         let verified = false;
@@ -2872,9 +3049,9 @@ async function completeRolePlanFromNativeResult(result) {
   const plans = await refreshRolePlanCache(charId);
   const plan = plans.find(row => row.planId === planId);
   if (!plan) return false;
-  const scheduledFor = Date.parse(trigger.dueAt || '') || Number(plan.nextRunAt) || Date.now();
+  const scheduledFor = Number(trigger.scheduledFor) || Date.parse(trigger.dueAt || '') || Number(plan.nextRunAt) || Date.now();
   if (['completed', 'cancelled'].includes(plan.status)) return true;
-  if (Number(plan.nextRunAt) > scheduledFor && plan.cloudJobId) return true;
+  if (Number(plan.lastScheduledFor) >= scheduledFor || Number(plan.nextRunAt) > scheduledFor) return true;
   const nextRunAt = globalThis.ALRolePlans.nextOccurrence(plan.schedule, scheduledFor);
   const mutation = nextRunAt
     ? { op: 'update', planId, patch: { nextRunAt, status: 'active', cloudJobId: null, lastRunAt: Date.now(), lastErrorCode: null } }

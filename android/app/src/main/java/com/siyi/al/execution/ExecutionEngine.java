@@ -150,6 +150,10 @@ public final class ExecutionEngine {
         if (!result.momentActionJson.isEmpty()) {
             bridgedReply += "\n<al_moment_action>" + result.momentActionJson + "</al_moment_action>";
         }
+        if (!result.rolePlanOperationsJson.isEmpty()) {
+            bridgedReply += "\n<al_plan>" + new JSONObject()
+                .put("operations", new JSONArray(result.rolePlanOperationsJson)).toString() + "</al_plan>";
+        }
         store.saveRawReply(turn.turnId, attempt.attemptId, bridgedReply, clock.now());
         attempt.rawReply = bridgedReply;
         commitStoredReply(turn, attempt);

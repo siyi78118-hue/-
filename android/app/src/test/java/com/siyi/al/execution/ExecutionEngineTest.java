@@ -90,6 +90,34 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void bridgedPlanOnlyDecisionCommitsOneHiddenPlanPartWithoutInventingText() throws Exception {
+        ChatTurnEntity value = turn("QUEUED", null);
+        value.kind = TurnKind.PROACTIVE_CHAT.name();
+        FakeStore store = new FakeStore(value, attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                return BridgeResult.success(
+                    "codex", "", "{}", "", "", "",
+                    "[{\"op\":\"cancel\",\"planId\":\"plan_old\"}]"
+                );
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError();
+            }
+        };
+        ExecutionEngine engine = new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(1, store.replyParts.size());
+        assertEquals("PLAN", store.replyParts.get(0).type);
+        assertTrue(store.replyParts.get(0).content.isEmpty());
+        assertEquals("cancel", new JSONObject(store.replyParts.get(0).payloadJson)
+            .getJSONArray("operations").getJSONObject(0).getString("op"));
+    }
+
+    @Test
     public void recoveredMemoryRunningBridgeResumesTheSameRemoteTurnWithoutLegacyStages() throws Exception {
         FakeStore store = new FakeStore(turn("MEMORY_RUNNING", null), attempt("MEMORY_RUNNING", null));
         BridgedGateway gateway = new BridgedGateway();

@@ -68,6 +68,23 @@ function stagedEnvelope(seq = 90) {
   return value;
 }
 
+function rolePlanEnvelope(seq = 91) {
+  const value = envelope(seq, '明天下午三点提醒我把稿子发给编辑');
+  value.protocolVersion = 2;
+  value.kind = 'DIRECT_REPLY';
+  value.context = {
+    scene: {
+      playerName: '阿予',
+      characterName: '虞栖',
+      relationshipStage: { id: 'familiar', label: '熟悉', content: '已有共同经历。' },
+      stageCatalog: [{ id: 'familiar', label: '熟悉', content: '已有共同经历。' }],
+      rolePlanCatalog: 'plan_old | private_message | ACTIVE | 今天 18:00 | 提醒吃饭',
+      roleScheduleContext: '今天 18:00 提醒吃饭。'
+    }
+  };
+  return value;
+}
+
 class FakeCodex {
   constructor(outputs = {}) {
     this.outputs = Object.fromEntries(Object.entries(outputs).map(([role, values]) => [role, [...values]]));
@@ -310,6 +327,56 @@ test('a fast reply containing a life decision is upgraded to supervisor before c
 
     assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
     assert.equal(store.getTurn('turn_phone_14').route, 'fast_to_deep');
+  });
+});
+
+test('a conversational plan decision is supervised, delivered as a hidden operation, and kept out of durable chat', async () => {
+  const input = rolePlanEnvelope();
+  const operations = [{
+    op: 'create',
+    type: 'private_message',
+    source: 'accepted_request',
+    title: '提醒把稿子发给编辑',
+    intent: '到时间后结合最新上下文，自然提醒阿予把稿子发给编辑',
+    sourceQuote: '明天下午三点提醒我把稿子发给编辑',
+    evidenceMessageIds: [input.message.messageId],
+    schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' },
+    timeConfidence: 'explicit'
+  }];
+  await withFixture({
+    memory: [JSON.stringify({
+      query: '提醒发稿', keywords: ['发稿'], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: conversationFrame()
+    })],
+    brain: [JSON.stringify({
+      action: 'send',
+      reply: '好，我记着。明天下午三点提醒你。',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: null,
+      lifePlan: null,
+      lifeAdjustment: null,
+      rolePlanOperationsJson: JSON.stringify(operations)
+    })],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(input);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    const supervisor = codex.calls.find(call => call.role === 'supervisor').input;
+    const saved = store.listMessages('yuqi').find(message => message.speakerId === 'yuqi');
+
+    assert.equal(brain.scene.rolePlanCatalog, input.context.scene.rolePlanCatalog);
+    assert.equal(brain.scene.roleScheduleContext, input.context.scene.roleScheduleContext);
+    assert.equal(supervisor.scene.rolePlanCatalog, input.context.scene.rolePlanCatalog);
+    assert.deepEqual(supervisor.draft.rolePlanOperations, operations);
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    assert.equal(store.getTurn(input.turnId).route, 'fast_to_deep');
+    assert.ok(store.getTurn(input.turnId).routeReasons.includes('role_plan_decision'));
+    assert.deepEqual(result.rolePlanOperations, operations);
+    assert.doesNotMatch(result.reply.content, /<al_plan>/);
+    assert.equal(saved.content, '好，我记着。明天下午三点提醒你。');
+    assert.doesNotMatch(saved.content, /<al_plan>/);
   });
 });
 
@@ -614,6 +681,32 @@ test('moment interaction is handled by the chat brain as a structured phone acti
   });
 });
 
+test('a proactive moment is returned as a public post without entering private-chat memory', async () => {
+  const momentTurn = triggerEnvelope(98);
+  momentTurn.kind = 'PROACTIVE_MOMENT';
+  momentTurn.trigger.triggerType = 'proactive_moment';
+  await withFixture({
+    memory: ['{"query":"moment post","keywords":[],"candidates":[]}'],
+    brain: [JSON.stringify({
+      action: 'send',
+      reply: '下班路上的风，终于有点像夏天了。',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: null,
+      lifePlan: null,
+      lifeAdjustment: null,
+      rolePlanOperationsJson: '[]'
+    })],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(momentTurn);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    assert.equal(result.reply.content, '下班路上的风，终于有点像夏天了。');
+    assert.match(brain.preset, /朋友圈动态正文/);
+    assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 0);
+  });
+});
+
 test('a second supervisor rejection requests one final rewrite instead of sending the rejected draft', async () => {
   await withFixture({
     memory: ['{"query":"回见","keywords":[],"candidates":[]}'],
@@ -688,6 +781,38 @@ test('automatic trigger reaches brain as currentTrigger and never becomes user e
     assert.match(supervisor.preset, /监督.*skip|skip.*监督/s);
     assert.equal(store.listMessages('yuqi').filter(message => message.speakerType === 'user').length, 0);
   }, { clock: () => 1784400000020 });
+});
+
+test('a scheduled role-plan turn exposes the exact plan occurrence to brain and supervisor', async () => {
+  const trigger = triggerEnvelope(67);
+  trigger.kind = 'ROLE_PLAN_CHAT';
+  trigger.trigger.triggerType = 'role_plan_chat';
+  trigger.trigger.context = {
+    input: {
+      planId: 'plan_tea',
+      occurrenceId: 'plan_tea:1784400000067',
+      scheduledFor: 1784400000067,
+      executedAt: 1784400300067
+    },
+    snapshot: {
+      rolePlan: {
+        planId: 'plan_tea',
+        type: 'private_message',
+        source: 'accepted_request',
+        intent: '提醒用户喝茶',
+        schedule: { kind: 'daily', time: '15:00' }
+      },
+      timingContext: 'scheduledFor=1784400000067;executedAt=1784400300067;delayMs=300000'
+    }
+  };
+  await withFixture(normalOutputs(), async ({ codex, orchestrator }) => {
+    await orchestrator.process(trigger);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    const supervisor = codex.calls.find(call => call.role === 'supervisor').input;
+    assert.equal(brain.currentRolePlanExecution.plan.planId, 'plan_tea');
+    assert.equal(brain.currentRolePlanExecution.occurrence.occurrenceId, 'plan_tea:1784400000067');
+    assert.equal(supervisor.currentRolePlanExecution.plan.intent, '提醒用户喝茶');
+  }, { clock: () => 1784400300067 });
 });
 
 test('automatic interaction state is recomputed from current stored messages instead of a stale trigger snapshot', async () => {

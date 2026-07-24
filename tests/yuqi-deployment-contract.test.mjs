@@ -185,6 +185,7 @@ test('cloud round-trip verifier encrypts a non-chat probe and acknowledges it', 
   const verifier = readFileSync('scripts/verify-yuqi-cloud-roundtrip.mjs', 'utf8');
   assert.match(verifier, /encryptRelayPayload/);
   assert.match(verifier, /createSystemCloudFetch/);
+  assert.match(verifier, /cloud\.proxy\?\.enabled\s*===\s*true\s*\?\s*globalThis\.fetch/);
   assert.match(verifier, /direction: 'pc_to_phone'/);
   assert.match(verifier, /\/bridge\/ack/);
   assert.match(verifier, /plaintextFieldsStored: false/);

@@ -162,9 +162,11 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
       startAt: { anyOf: [{ type: 'number' }, { type: 'null' }] },
       endAt: { anyOf: [{ type: 'number' }, { type: 'null' }] },
       reason: { type: 'string' }
-    }, ['type', 'targetEpisodeId', 'startAt', 'endAt', 'reason']), { type: 'null' }] }
+    }, ['type', 'targetEpisodeId', 'startAt', 'endAt', 'reason']), { type: 'null' }] },
+    rolePlanOperationsJson: { type: 'string' }
   }, [
-    'action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction', 'lifePlan', 'lifeAdjustment'
+    'action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction', 'lifePlan', 'lifeAdjustment',
+    'rolePlanOperationsJson'
   ]),
   supervisor: objectSchema({
     decision: { type: 'string', enum: ['approve', 'rewrite', 'skip', 'reject'] },

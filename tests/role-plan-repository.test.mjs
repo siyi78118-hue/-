@@ -25,7 +25,8 @@ test('persists plans and history in IndexedDB meta fallback', async () => {
 
   await repo.apply('char-a', [{
     op: 'create', type: 'role_schedule', source: 'user_created', origin: 'user',
-    title: '上班', intent: '正在工作', schedule: { kind: 'once', at: '2026-07-17T10:00:00+08:00' }, timeConfidence: 'explicit'
+    title: '上班', intent: '正在工作', schedule: { kind: 'once', at: '2026-07-17T10:00:00+08:00' },
+    durationMs: 8 * 60 * 60 * 1000, timeConfidence: 'explicit'
   }]);
 
   assert.equal((await repo.list('char-a')).length, 1);

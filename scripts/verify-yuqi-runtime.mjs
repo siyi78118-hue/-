@@ -83,8 +83,8 @@ record('android-jvm-tests', () => {
   const javaHome = findJava21Home();
   const gradle = process.platform === 'win32' ? (process.env.ComSpec || 'cmd.exe') : './gradlew';
   const gradleArgs = process.platform === 'win32'
-    ? ['/d', '/s', '/c', 'gradlew.bat', ':app:testDebugUnitTest', '--no-problems-report', '--no-daemon']
-    : [':app:testDebugUnitTest', '--no-problems-report', '--no-daemon'];
+    ? ['/d', '/s', '/c', 'gradlew.bat', '-I', 'isolated-build.init.gradle', ':app:testDebugUnitTest', '--no-problems-report', '--no-daemon']
+    : ['-I', 'isolated-build.init.gradle', ':app:testDebugUnitTest', '--no-problems-report', '--no-daemon'];
   return {
     javaMajor: 21,
     ...command(gradle, gradleArgs, {

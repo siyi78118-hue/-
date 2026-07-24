@@ -122,6 +122,63 @@ test('returns only current role schedules as prompt context', () => {
   assert.equal(rows[0].planId, 'work');
 });
 
+test('recurring role schedules are active only inside their current duration window', () => {
+  const plans = [{
+    planId: 'daily-work',
+    characterId: 'char-a',
+    type: 'role_schedule',
+    status: 'active',
+    title: '编辑部工作',
+    intent: '正在编辑部处理稿件',
+    schedule: { kind: 'daily', time: '09:00' },
+    durationMs: 8 * 60 * 60 * 1000
+  }];
+  assert.equal(
+    domain.scheduleContext(plans, 'char-a', Date.parse('2026-07-17T10:30:00+08:00')).length,
+    1
+  );
+  assert.equal(
+    domain.scheduleContext(plans, 'char-a', Date.parse('2026-07-17T18:30:00+08:00')).length,
+    0
+  );
+});
+
+test('role schedules require an explicit positive duration', () => {
+  const result = domain.applyOperations([], [], [{
+    op: 'create',
+    type: 'role_schedule',
+    source: 'private_decision',
+    title: '去编辑部',
+    intent: '在编辑部工作',
+    schedule: { kind: 'daily', time: '09:00' },
+    timeConfidence: 'explicit'
+  }], {
+    charId: 'char-a',
+    now: Date.parse('2026-07-17T08:00:00+08:00'),
+    uid: () => 'work'
+  });
+  assert.equal(result.rejected[0].code, 'PLAN_DURATION_REQUIRED');
+});
+
+test('role schedule state exposes its active window, next recurrence, and terminal expiry', () => {
+  const daily = {
+    planId: 'daily-work', type: 'role_schedule', status: 'active',
+    schedule: { kind: 'daily', time: '09:00' }, durationMs: 8 * 60 * 60 * 1000
+  };
+  const state = domain.roleScheduleState(daily, Date.parse('2026-07-17T10:30:00+08:00'));
+  assert.equal(state.active, true);
+  assert.equal(state.nextRunAt, Date.parse('2026-07-18T09:00:00+08:00'));
+
+  const once = {
+    planId: 'once-work', type: 'role_schedule', status: 'active',
+    schedule: { kind: 'once', at: '2026-07-17T09:00:00+08:00' }, durationMs: 60 * 60 * 1000
+  };
+  assert.equal(
+    domain.roleScheduleState(once, Date.parse('2026-07-17T11:00:00+08:00')).expired,
+    true
+  );
+});
+
 test('resuming a missed recurring plan advances it to a future occurrence', () => {
   const now = Date.parse('2026-07-18T10:00:00+08:00');
   const plans = [{
@@ -134,4 +191,25 @@ test('resuming a missed recurring plan advances it to a future occurrence', () =
   });
   assert.equal(result.plans[0].status, 'active');
   assert.equal(result.plans[0].nextRunAt, Date.parse('2026-07-19T09:00:00+08:00'));
+});
+
+test('deletes only a terminal plan together with its history', () => {
+  const plans = [
+    { planId: 'done', characterId: 'char-a', type: 'private_message', status: 'completed' },
+    { planId: 'active', characterId: 'char-a', type: 'private_message', status: 'active' }
+  ];
+  const history = [
+    { historyId: 'h-done', planId: 'done', operation: 'complete' },
+    { historyId: 'h-active', planId: 'active', operation: 'create' }
+  ];
+  const rejected = domain.applyOperations(plans, history, [{ op: 'delete', planId: 'active' }], {
+    charId: 'char-a', now: 1000, uid: () => 'history-delete'
+  });
+  assert.equal(rejected.rejected[0].code, 'PLAN_DELETE_ACTIVE');
+
+  const result = domain.applyOperations(plans, history, [{ op: 'delete', planId: 'done' }], {
+    charId: 'char-a', now: 1000, uid: () => 'history-delete'
+  });
+  assert.deepEqual(result.plans.map(plan => plan.planId), ['active']);
+  assert.deepEqual(result.history.map(row => row.historyId), ['h-active']);
 });

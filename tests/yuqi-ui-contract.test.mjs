@@ -95,11 +95,37 @@ test('native snapshots expose the current Yuqi dynamic scene separately from fix
   assert.match(builder, /stageCatalog/);
   assert.match(builder, /phaseCatalog/);
   assert.match(builder, /currentPhase/);
+  assert.match(builder, /rolePlanCatalog:\s*rolePlanCatalogForPrompt\(char\.id\)/);
+  assert.match(builder, /roleScheduleContext:\s*roleScheduleContextForPrompt\(char\.id\)/);
+  assert.match(builder, /momentContext:\s*buildMomentChatContext\(char\.id\)/);
   const snapshot = html.slice(
     html.indexOf('async function buildNativeExecutionSnapshot'),
     html.indexOf('function nativeProactiveSnapshotIds')
   );
   assert.match(snapshot, /scene:\s*buildYuqiDynamicScene\(char,\s*chat\)/);
+});
+
+test('active role plans always persist a native execution snapshot before optional cloud scheduling', () => {
+  const sync = html.slice(
+    html.indexOf('async function syncRolePlanCloudJobs'),
+    html.indexOf('async function patchRolePlanCloudState')
+  );
+  const snapshotAt = sync.indexOf('saveNativeRolePlanSnapshot');
+  const cloudGateAt = sync.indexOf('cloudTimerTransportReady');
+  assert.ok(snapshotAt >= 0, 'local role-plan snapshot must be written');
+  assert.ok(cloudGateAt >= 0, 'cloud transport gate must remain explicit');
+  assert.ok(snapshotAt < cloudGateAt, 'local durability must not depend on cloud transport readiness');
+});
+
+test('phone role-plan landing recognizes native advancement and never skips a second recurrence', () => {
+  const completion = html.slice(
+    html.indexOf('async function completeRolePlanFromNativeResult'),
+    html.indexOf('function nativeReplyFailureMessage')
+  );
+  assert.match(completion, /Number\(trigger\.scheduledFor\)/);
+  assert.match(completion, /Number\(plan\.lastScheduledFor\)\s*>=\s*scheduledFor/);
+  assert.match(completion, /Number\(plan\.nextRunAt\)\s*>\s*scheduledFor/);
+  assert.doesNotMatch(completion, /nextRunAt\)\s*>\s*scheduledFor\s*&&\s*plan\.cloudJobId/);
 });
 
 test('native relationship writeback applies base and phase actions atomically', () => {

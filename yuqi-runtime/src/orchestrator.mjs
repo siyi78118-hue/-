@@ -26,6 +26,28 @@ export function hardValidateReply(reply) {
   return { ok: issues.length === 0, issues };
 }
 
+function normalizeRolePlanOperations(value) {
+  let source = value;
+  if (typeof source === 'string') {
+    const text = source.trim();
+    if (!text || text === '[]') return [];
+    try { source = JSON.parse(text); } catch {
+      throw new Error('brain returned invalid rolePlanOperationsJson');
+    }
+  }
+  if (!Array.isArray(source)) return [];
+  const allowed = new Set(['create', 'update', 'cancel', 'pause', 'resume', 'complete']);
+  return source.slice(0, 12).map(operation => {
+    if (!operation || typeof operation !== 'object' || Array.isArray(operation)) {
+      throw new Error('brain returned invalid role plan operation');
+    }
+    const normalized = JSON.parse(JSON.stringify(operation));
+    normalized.op = String(normalized.op || '');
+    if (!allowed.has(normalized.op)) throw new Error('brain returned unknown role plan operation');
+    return normalized;
+  });
+}
+
 export function normalizeBrainDraft(draft) {
   const paymentAction = ['received', 'refused', 'pending'].includes(draft?.paymentAction)
     ? draft.paymentAction
@@ -58,7 +80,10 @@ export function normalizeBrainDraft(draft) {
           reason: String(draft.lifeAdjustment.reason || '')
         }
       : null,
-    usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : []
+    usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : [],
+    rolePlanOperations: normalizeRolePlanOperations(
+      draft?.rolePlanOperationsJson ?? draft?.rolePlanOperations
+    )
   };
   for (let depth = 0; depth < 3 && normalized.reply.startsWith('{') && normalized.reply.endsWith('}'); depth += 1) {
     let nested;
@@ -78,6 +103,29 @@ export function normalizeBrainDraft(draft) {
 
 function isMomentKind(kind) {
   return kind === 'MOMENT_INTERACTION' || kind === 'MOMENT_REPLY';
+}
+
+function isMomentPostKind(kind) {
+  return ['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind);
+}
+
+function currentRolePlanExecution(envelope) {
+  if (!String(envelope?.kind || '').startsWith('ROLE_PLAN_')) return null;
+  const context = envelope.trigger?.context || {};
+  const snapshot = context.snapshot && typeof context.snapshot === 'object' ? context.snapshot : {};
+  const input = context.input && typeof context.input === 'object' ? context.input : {};
+  const plan = snapshot.rolePlan && typeof snapshot.rolePlan === 'object' ? snapshot.rolePlan : null;
+  return {
+    plan,
+    occurrence: {
+      planId: String(input.planId || plan?.planId || ''),
+      occurrenceId: String(input.occurrenceId || ''),
+      scheduledFor: Number(input.scheduledFor || envelope.trigger?.scheduledFor || 0),
+      executedAt: Number(input.executedAt || envelope.trigger?.executedAt || 0)
+    },
+    timingContext: String(snapshot.timingContext || ''),
+    delayMs: Math.max(0, Number(snapshot.delayMs) || 0)
+  };
 }
 
 export function isAutomaticKind(kind) {
@@ -407,8 +455,11 @@ export class YuqiOrchestrator {
             draft = { ...draft, action: 'send', reply: repairReplyForDelivery('', envelope.kind) };
           }
           if (draft.action === 'skip') {
-            if (current.route === 'fast' && hasLifeDecision(draft)) {
-              this.store.setTurnRoute(turnId, 'fast_to_deep', ['life_decision']);
+            if (current.route === 'fast' && (hasLifeDecision(draft) || draft.rolePlanOperations.length)) {
+              this.store.setTurnRoute(turnId, 'fast_to_deep', [
+                ...(hasLifeDecision(draft) ? ['life_decision'] : []),
+                ...(draft.rolePlanOperations.length ? ['role_plan_decision'] : [])
+              ]);
               current = this.store.getTurn(turnId);
             }
             this.store.advanceTurn(
@@ -435,8 +486,11 @@ export class YuqiOrchestrator {
               detail: { action: 'reply_repaired_for_delivery', issues: hard.issues.map(issue => issue.code) }
             });
           }
-          if (current.route === 'fast' && hasLifeDecision(repairedDraft)) {
-            this.store.setTurnRoute(turnId, 'fast_to_deep', ['life_decision']);
+          if (current.route === 'fast' && (hasLifeDecision(repairedDraft) || repairedDraft.rolePlanOperations.length)) {
+            this.store.setTurnRoute(turnId, 'fast_to_deep', [
+              ...(hasLifeDecision(repairedDraft) ? ['life_decision'] : []),
+              ...(repairedDraft.rolePlanOperations.length ? ['role_plan_decision'] : [])
+            ]);
             current = this.store.getTurn(turnId);
           }
           this.store.advanceTurn(
@@ -591,6 +645,7 @@ export class YuqiOrchestrator {
       scene,
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
+      ...(currentRolePlanExecution(envelope) ? { currentRolePlanExecution: currentRolePlanExecution(envelope) } : {}),
       recentMessages,
       interactionState,
       lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
@@ -610,7 +665,7 @@ export class YuqiOrchestrator {
   }
 
   async completeSupervisor(envelope, current) {
-    const draft = parseRoleJson(current.brainDraftJson, 'brain');
+    const draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
     const stateMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
     const recentMessages = buildGenerationWindow(stateMessages, {
       currentMessageId: envelope.message?.messageId,
@@ -639,6 +694,7 @@ export class YuqiOrchestrator {
       scene,
       ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
+      ...(currentRolePlanExecution(envelope) ? { currentRolePlanExecution: currentRolePlanExecution(envelope) } : {}),
       recentMessages,
       interactionState,
       lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
@@ -713,14 +769,15 @@ export class YuqiOrchestrator {
         const result = {
           turnId: envelope.turnId,
           presetVersion: this.presets.current().version,
-          action: 'skip',
+          action: draft.rolePlanOperations.length ? 'send' : 'skip',
           paymentAction: null,
           reply: null,
           usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
           relationshipStageAction: memoryPacket.relationshipStageAction || null,
           lifePlanApplied: Boolean(draft.lifePlan?.episodes?.length),
           lifeAdjustment: null,
-          momentAction: null
+          momentAction: null,
+          rolePlanOperations: draft.rolePlanOperations
         };
         this.store.advanceTurn(
           envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
@@ -747,6 +804,7 @@ export class YuqiOrchestrator {
           paymentAction: null,
           relationshipStageAction: memoryPacket.relationshipStageAction || null,
           momentAction: draft.momentAction,
+          rolePlanOperations: draft.rolePlanOperations,
           lifePlanApplied: Boolean(draft.lifePlan?.episodes?.length),
           lifeAdjustment: lifeAdjustment ? {
             type: draft.lifeAdjustment.type,
@@ -758,6 +816,50 @@ export class YuqiOrchestrator {
         this.store.advanceTurn(
           envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
         );
+        return result;
+      });
+    }
+    if (isMomentPostKind(envelope.kind)) {
+      return this.store.transaction(() => {
+        if (draft.lifePlan?.episodes?.length) {
+          this.store.putLifePlanInternal(envelope.characterId, draft.lifePlan.episodes, {
+            sourceTurnId: envelope.turnId
+          });
+        }
+        const lifeAdjustment = draft.lifeAdjustment?.type && draft.lifeAdjustment.type !== 'none'
+          ? this.store.applyLifeAdjustment(
+              envelope.characterId, draft.lifeAdjustment, envelope.turnId, this.clock()
+            )
+          : null;
+        const result = {
+          turnId: envelope.turnId,
+          presetVersion: this.presets.current().version,
+          action: 'send',
+          paymentAction: null,
+          reply: {
+            messageId: `msg_yuqi_${contentHash(envelope.turnId).slice(0, 24)}`,
+            turnId: envelope.turnId,
+            characterId: envelope.characterId,
+            speakerId: envelope.characterId,
+            speakerType: 'character',
+            recipientId: 'public_moments',
+            content: draft.reply.trim(),
+            sentAt: this.clock(),
+            origin: 'codex'
+          },
+          usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
+          relationshipStageAction: memoryPacket.relationshipStageAction || null,
+          lifePlanApplied: Boolean(draft.lifePlan?.episodes?.length),
+          lifeAdjustment: lifeAdjustment ? {
+            type: draft.lifeAdjustment.type,
+            episodeId: lifeAdjustment.episodeId
+          } : null,
+          momentAction: null,
+          rolePlanOperations: draft.rolePlanOperations
+        };
+        this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
+          replyJson: JSON.stringify(result)
+        });
         return result;
       });
     }
@@ -800,7 +902,8 @@ export class YuqiOrchestrator {
           type: draft.lifeAdjustment.type,
           episodeId: lifeAdjustment.episodeId
         } : null,
-        momentAction: null
+        momentAction: null,
+        rolePlanOperations: draft.rolePlanOperations
       };
       this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
         replyJson: JSON.stringify(result)

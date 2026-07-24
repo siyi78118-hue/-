@@ -117,7 +117,8 @@ test('pins the approved model, high effort, and a strict schema for every brain 
   assert.equal(started.params.model, 'gpt-5.6-sol');
   assert.equal(started.params.effort, 'high');
   assert.deepEqual(started.params.outputSchema.required, [
-    'action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction', 'lifePlan', 'lifeAdjustment'
+    'action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction', 'lifePlan', 'lifeAdjustment',
+    'rolePlanOperationsJson'
   ]);
   assert.equal(started.params.outputSchema.additionalProperties, false);
   assert.deepEqual(started.params.outputSchema.properties.action.enum, ['send', 'skip']);
@@ -125,6 +126,7 @@ test('pins the approved model, high effort, and a strict schema for every brain 
   assert.deepEqual(started.params.outputSchema.properties.lifeAdjustment.anyOf[0].required, [
     'type', 'targetEpisodeId', 'startAt', 'endAt', 'reason'
   ]);
+  assert.equal(started.params.outputSchema.properties.rolePlanOperationsJson.type, 'string');
 }));
 
 test('memory candidate objects use the strict nested schema required by the real App Server', async () => fixture(async ({ client, logFile }) => {

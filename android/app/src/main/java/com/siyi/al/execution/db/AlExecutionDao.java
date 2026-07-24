@@ -115,6 +115,9 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM role_plan_occurrences WHERE turnId = :turnId LIMIT 1")
     RolePlanOccurrenceEntity rolePlanOccurrenceByTurn(String turnId);
 
+    @Query("SELECT o.* FROM role_plan_occurrences o INNER JOIN chat_turns t ON t.turnId = o.turnId WHERE o.state = 'CLAIMED' AND t.state IN ('FAILED_FINAL', 'CANCELLED') ORDER BY o.updatedAt ASC LIMIT :limit")
+    List<RolePlanOccurrenceEntity> failedRolePlanOccurrences(int limit);
+
     @Query("UPDATE role_plan_occurrences SET state = 'COMPLETED', completedAt = :now, updatedAt = :now, errorCode = '' WHERE occurrenceId = :occurrenceId AND state != 'COMPLETED'")
     int completeRolePlanOccurrence(String occurrenceId, long now);
 

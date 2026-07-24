@@ -14,8 +14,9 @@ public final class BridgeResult {
     public final String paymentStatus;
     public final String relationshipStageActionJson;
     public final String momentActionJson;
+    public final String rolePlanOperationsJson;
 
-    private BridgeResult(String origin, String replyText, String responseJson, List<String> attemptedRoutes, boolean fallback, boolean skipped, String paymentStatus, String relationshipStageActionJson, String momentActionJson) {
+    private BridgeResult(String origin, String replyText, String responseJson, List<String> attemptedRoutes, boolean fallback, boolean skipped, String paymentStatus, String relationshipStageActionJson, String momentActionJson, String rolePlanOperationsJson) {
         this.origin = origin == null ? "" : origin;
         this.replyText = replyText == null ? "" : replyText;
         this.responseJson = responseJson == null ? "{}" : responseJson;
@@ -25,29 +26,34 @@ public final class BridgeResult {
         this.paymentStatus = paymentStatus == null ? "" : paymentStatus.trim();
         this.relationshipStageActionJson = relationshipStageActionJson == null ? "" : relationshipStageActionJson.trim();
         this.momentActionJson = momentActionJson == null ? "" : momentActionJson.trim();
+        this.rolePlanOperationsJson = rolePlanOperationsJson == null ? "" : rolePlanOperationsJson.trim();
     }
 
     public static BridgeResult success(String origin, String replyText) {
-        return new BridgeResult(origin, replyText, "{}", Collections.singletonList(origin), "fallback".equals(origin), false, "", "", "");
+        return new BridgeResult(origin, replyText, "{}", Collections.singletonList(origin), "fallback".equals(origin), false, "", "", "", "");
     }
 
     public static BridgeResult success(String origin, String replyText, String responseJson) {
-        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false, "", "", "");
+        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false, "", "", "", "");
     }
 
     public static BridgeResult success(String origin, String replyText, String responseJson, String paymentStatus) {
-        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false, paymentStatus, "", "");
+        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false, paymentStatus, "", "", "");
     }
 
     public static BridgeResult success(String origin, String replyText, String responseJson, String paymentStatus, String relationshipStageActionJson, String momentActionJson) {
-        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false, paymentStatus, relationshipStageActionJson, momentActionJson);
+        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false, paymentStatus, relationshipStageActionJson, momentActionJson, "");
+    }
+
+    public static BridgeResult success(String origin, String replyText, String responseJson, String paymentStatus, String relationshipStageActionJson, String momentActionJson, String rolePlanOperationsJson) {
+        return new BridgeResult(origin, replyText, responseJson, Collections.singletonList(origin), "fallback".equals(origin), false, paymentStatus, relationshipStageActionJson, momentActionJson, rolePlanOperationsJson);
     }
 
     public static BridgeResult skipped(String origin, String responseJson) {
-        return new BridgeResult(origin, "", responseJson, Collections.singletonList(origin), false, true, "", "", "");
+        return new BridgeResult(origin, "", responseJson, Collections.singletonList(origin), false, true, "", "", "", "");
     }
 
     BridgeResult routed(List<String> routes, boolean usedFallback) {
-        return new BridgeResult(origin, replyText, responseJson, routes, usedFallback, skipped, paymentStatus, relationshipStageActionJson, momentActionJson);
+        return new BridgeResult(origin, replyText, responseJson, routes, usedFallback, skipped, paymentStatus, relationshipStageActionJson, momentActionJson, rolePlanOperationsJson);
     }
 }

@@ -10,6 +10,7 @@ yuqi-runtime/*.sqlite*
 android/.gradle/
 android/build/
 android/app/build/
+.gradle-isolated-build/
 android/local.properties
 android/app/google-services.json
 android/app/*.p12

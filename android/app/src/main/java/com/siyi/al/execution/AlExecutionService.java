@@ -143,12 +143,14 @@ public final class AlExecutionService extends Service {
         SharedPreferences continued = getSharedPreferences("al.execution.role-plan-continuations", MODE_PRIVATE);
         SharedPreferences proactiveContinued = getSharedPreferences("al.execution.proactive-continuations", MODE_PRIVATE);
         SharedPreferences bridgeReceipts = getSharedPreferences("al.execution.bridge-receipts", MODE_PRIVATE);
+        RolePlanCoordinator rolePlanCoordinator = new RolePlanCoordinator(this);
+        rolePlanCoordinator.reconcileFailedTurns(System.currentTimeMillis());
         for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
             confirmBridgeDelivery(turn, bridgeReceipts);
             acknowledgeCloudTurn(turn, acknowledged);
             continueAutomaticTask(turn, proactiveContinued);
             continueRolePlan(turn, continued);
-            new RolePlanCoordinator(database).completeForTurn(turn.turnId, System.currentTimeMillis());
+            rolePlanCoordinator.completeForTurn(turn.turnId, System.currentTimeMillis());
             String key = "turn." + turn.turnId;
             if (notified.getBoolean(key, false)) continue;
             String title = characterName(turn);

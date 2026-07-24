@@ -505,6 +505,19 @@ public final class AlExecutionPlugin extends Plugin {
         });
     }
 
+    @PluginMethod
+    public void runRolePlanNow(PluginCall call) {
+        execute(call, () -> {
+            String planId = required(call, "planId");
+            boolean queued = new com.siyi.al.execution.RolePlanCoordinator(getContext())
+                .runNow(planId, System.currentTimeMillis());
+            if (queued) AlExecutionService.requestRun(getContext());
+            JSObject result = new JSObject();
+            result.put("queued", queued);
+            return result;
+        });
+    }
+
     private JSObject turnResult(ChatTurnEntity turn) {
         JSObject result = new JSObject();
         result.put("turnId", turn.turnId);

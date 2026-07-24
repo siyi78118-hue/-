@@ -144,15 +144,31 @@ test('protocol v2 direct turn preserves a validated dynamic relationship scene',
         playerName: '姜隽倚',
         characterName: '虞栖',
         relationshipStage: {
-          id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。',
-          since: 1784300000000, reason: '持续交流', confidence: 0.9
+          id: 'familiar', label: '熟悉 · 闹矛盾期', content: '双方已经形成稳定聊天习惯。\n仍有矛盾。',
+          since: 1784300000000, reason: '持续交流', confidence: 0.9,
+          base: {
+            id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。',
+            since: 1784300000000, reason: '持续交流', confidence: 0.9
+          },
+          phase: {
+            id: 'conflict', label: '闹矛盾期', content: '仍有矛盾。',
+            since: 1784390000000, reason: '连续两轮争执', confidence: 0.88
+          }
         },
         conversationExtraPrompt: '她今天有点忙。',
         globalExtraPrompt: '保持自然。',
+        rolePlanCatalog: 'plan_tea | private_message | 2026-07-24 18:30 | ACTIVE | 提醒喝茶',
+        roleScheduleContext: '今天 18:30 提醒喝茶；明天 09:00 去编辑部。',
+        momentContext: '虞栖：下班路上的风，终于有点像夏天了。',
         stageCatalog: [
           { id: 'new', label: '初识', content: '保持普通社交边界。' },
           { id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。' }
         ],
+        phaseCatalog: [
+          { id: 'normal', label: '正常相处', content: '' },
+          { id: 'conflict', label: '闹矛盾期', content: '仍有矛盾。' }
+        ],
+        currentPhase: 'conflict',
         ignoredBackstageField: 'must not survive'
       }
     }
@@ -162,15 +178,31 @@ test('protocol v2 direct turn preserves a validated dynamic relationship scene',
     playerName: '姜隽倚',
     characterName: '虞栖',
     relationshipStage: {
-      id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。',
-      since: 1784300000000, reason: '持续交流', confidence: 0.9
+      id: 'familiar', label: '熟悉 · 闹矛盾期', content: '双方已经形成稳定聊天习惯。\n仍有矛盾。',
+      since: 1784300000000, reason: '持续交流', confidence: 0.9,
+      base: {
+        id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。',
+        since: 1784300000000, reason: '持续交流', confidence: 0.9
+      },
+      phase: {
+        id: 'conflict', label: '闹矛盾期', content: '仍有矛盾。',
+        since: 1784390000000, reason: '连续两轮争执', confidence: 0.88
+      }
     },
     conversationExtraPrompt: '她今天有点忙。',
     globalExtraPrompt: '保持自然。',
+    rolePlanCatalog: 'plan_tea | private_message | 2026-07-24 18:30 | ACTIVE | 提醒喝茶',
+    roleScheduleContext: '今天 18:30 提醒喝茶；明天 09:00 去编辑部。',
+    momentContext: '虞栖：下班路上的风，终于有点像夏天了。',
     stageCatalog: [
       { id: 'new', label: '初识', content: '保持普通社交边界。' },
       { id: 'familiar', label: '熟悉', content: '双方已经形成稳定聊天习惯。' }
-    ]
+    ],
+    phaseCatalog: [
+      { id: 'normal', label: '正常相处', content: '' },
+      { id: 'conflict', label: '闹矛盾期', content: '仍有矛盾。' }
+    ],
+    currentPhase: 'conflict'
   });
 });
 
@@ -186,11 +218,13 @@ test('public committed status exposes the structured payment action', () => {
     replyJson: JSON.stringify({
       action: 'send',
       paymentAction: 'received',
+      rolePlanOperations: [{ op: 'cancel', planId: 'plan_old' }],
       reply: { content: '那我就收了', origin: 'codex' }
     })
   }, { clock: () => 2000 });
 
   assert.equal(status.paymentAction, 'received');
+  assert.deepEqual(status.rolePlanOperations, [{ op: 'cancel', planId: 'plan_old' }]);
 });
 
 test('protocol v2 accepts legacy payment ids by canonicalizing them before validation', () => {

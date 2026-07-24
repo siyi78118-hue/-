@@ -117,6 +117,9 @@ export class PresetRegistry {
       dynamic.kind ? `当前场景：${dynamic.kind}` : '',
       dynamic.globalExtraPrompt ? `全局补充：\n${dynamic.globalExtraPrompt}` : '',
       dynamic.conversationExtraPrompt ? `当前会话补充：\n${dynamic.conversationExtraPrompt}` : '',
+      dynamic.rolePlanCatalog ? `当前有效安排目录：\n${dynamic.rolePlanCatalog}` : '当前有效安排目录：无',
+      dynamic.roleScheduleContext ? `当前生效的角色日程：\n${dynamic.roleScheduleContext}` : '当前生效的角色日程：无',
+      dynamic.momentContext ? `最近朋友圈上下文：\n${dynamic.momentContext}` : '最近朋友圈上下文：无',
       `允许引用的已揭示事实 ID：${revealedFactIds.length ? revealedFactIds.join(', ') : '无'}`,
       `当前预设版本：${preset.version}`
     ].filter(Boolean).join('\n');

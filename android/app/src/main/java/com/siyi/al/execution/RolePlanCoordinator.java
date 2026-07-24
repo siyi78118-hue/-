@@ -7,26 +7,33 @@ import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanOccurrenceEntity;
 import java.util.List;
+import java.util.Collections;
 import org.json.JSONObject;
 
 public final class RolePlanCoordinator {
     private final AlExecutionDatabase database;
     private final RoomExecutionStore store;
+    private final Context context;
 
     public RolePlanCoordinator(Context context) {
-        this(AlExecutionDatabase.get(context));
+        this(AlExecutionDatabase.get(context), context.getApplicationContext());
     }
 
     RolePlanCoordinator(AlExecutionDatabase database) {
+        this(database, null);
+    }
+
+    private RolePlanCoordinator(AlExecutionDatabase database, Context context) {
         this.database = database;
         this.store = new RoomExecutionStore(database);
+        this.context = context;
     }
 
     public int dispatchDue(long now) {
         int queued = 0;
         List<RolePlanEntity> plans = database.executionDao().dueRolePlans(now, 50);
         for (RolePlanEntity plan : plans) {
-            if (plan.nextRunAt != null && claimAndQueue(plan, plan.nextRunAt, cloudJobId(plan), now)) queued += 1;
+            if (plan.nextRunAt != null && claimAndQueue(plan, plan.nextRunAt, cloudJobId(plan), now, false)) queued += 1;
         }
         return queued;
     }
@@ -34,24 +41,105 @@ public final class RolePlanCoordinator {
     public boolean dispatch(String planId, long scheduledFor, String jobId, long now) {
         RolePlanEntity plan = database.executionDao().rolePlan(planId);
         if (plan == null || plan.nextRunAt == null || plan.nextRunAt.longValue() != scheduledFor) return false;
-        return claimAndQueue(plan, scheduledFor, jobId, now);
+        return claimAndQueue(plan, scheduledFor, jobId, now, false);
     }
 
     public boolean dispatchCurrent(String planId, String jobId, long now) {
         RolePlanEntity plan = database.executionDao().rolePlan(planId);
-        return plan != null && plan.nextRunAt != null && claimAndQueue(plan, plan.nextRunAt, jobId, now);
+        return plan != null && plan.nextRunAt != null && claimAndQueue(plan, plan.nextRunAt, jobId, now, false);
+    }
+
+    public boolean runNow(String planId, long now) {
+        RolePlanEntity plan = database.executionDao().rolePlan(planId);
+        return plan != null && claimAndQueue(plan, now, "manual_" + safe(planId) + "_" + now, now, true);
     }
 
     public void completeForTurn(String turnId, long now) {
         RolePlanOccurrenceEntity occurrence = database.executionDao().rolePlanOccurrenceByTurn(turnId);
-        if (occurrence != null) database.executionDao().completeRolePlanOccurrence(occurrence.occurrenceId, now);
+        if (occurrence == null || "COMPLETED".equals(occurrence.state)) return;
+        final Long[] nextAlarm = new Long[] { null };
+        database.runInTransaction(() -> {
+            RolePlanEntity plan = database.executionDao().rolePlan(occurrence.planId);
+            if (plan != null
+                && "active".equals(plan.status)
+                && plan.nextRunAt != null
+                && plan.nextRunAt.longValue() == occurrence.scheduledFor) {
+                try {
+                    RolePlanCompletion.Result advanced = RolePlanCompletion.advance(
+                        new JSONObject(plan.planJson), occurrence.scheduledFor, now
+                    );
+                    plan.status = advanced.status;
+                    plan.nextRunAt = advanced.nextRunAt;
+                    plan.updatedAt = now;
+                    plan.planJson = advanced.planJson.toString();
+                    database.executionDao().upsertRolePlans(Collections.singletonList(plan));
+                    updateSnapshotPlan(plan, advanced.planJson, now);
+                    nextAlarm[0] = advanced.nextRunAt;
+                } catch (Exception error) {
+                    throw new IllegalStateException("ROLE_PLAN_ADVANCE_FAILED", error);
+                }
+            }
+            database.executionDao().completeRolePlanOccurrence(occurrence.occurrenceId, now);
+        });
+        if (context != null && nextAlarm[0] != null) {
+            RolePlanAlarmScheduler.schedule(context, occurrence.planId, nextAlarm[0]);
+        }
     }
 
-    private boolean claimAndQueue(RolePlanEntity plan, long scheduledFor, String jobId, long now) {
+    public int reconcileFailedTurns(long now) {
+        int failed = 0;
+        for (RolePlanOccurrenceEntity occurrence : database.executionDao().failedRolePlanOccurrences(50)) {
+            database.runInTransaction(() -> {
+                RolePlanEntity plan = database.executionDao().rolePlan(occurrence.planId);
+                if (plan != null
+                    && "active".equals(plan.status)
+                    && plan.nextRunAt != null
+                    && plan.nextRunAt.longValue() == occurrence.scheduledFor) {
+                    try {
+                        RolePlanCompletion.Result marked = RolePlanCompletion.fail(
+                            new JSONObject(plan.planJson), occurrence.scheduledFor, now, "TURN_FAILED_FINAL"
+                        );
+                        plan.status = marked.status;
+                        plan.nextRunAt = marked.nextRunAt;
+                        plan.updatedAt = now;
+                        plan.planJson = marked.planJson.toString();
+                        database.executionDao().upsertRolePlans(Collections.singletonList(plan));
+                        updateSnapshotPlan(plan, marked.planJson, now);
+                    } catch (Exception error) {
+                        throw new IllegalStateException("ROLE_PLAN_FAILURE_RECONCILE_FAILED", error);
+                    }
+                }
+                database.executionDao().failRolePlanOccurrence(
+                    occurrence.occurrenceId, "TURN_FAILED_FINAL", now
+                );
+            });
+            failed += 1;
+        }
+        return failed;
+    }
+
+    private void updateSnapshotPlan(RolePlanEntity plan, JSONObject planJson, long now) throws Exception {
+        String snapshotId = plan.characterId + ":role-plan:" + plan.planId;
+        CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(snapshotId);
+        if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) return;
+        JSONObject contextJson = new JSONObject(snapshot.contextJson);
+        contextJson.put("rolePlan", planJson);
+        contextJson.put("scheduledFor", plan.nextRunAt == null ? JSONObject.NULL : plan.nextRunAt);
+        contextJson.put("cloudJobId", "");
+        snapshot.contextJson = contextJson.toString();
+        snapshot.scheduledFor = plan.nextRunAt;
+        snapshot.cloudJobId = "";
+        snapshot.createdAt = now;
+        database.executionDao().upsertSnapshot(snapshot);
+    }
+
+    private boolean claimAndQueue(RolePlanEntity plan, long scheduledFor, String jobId, long now, boolean force) {
         try {
             JSONObject planJson = new JSONObject(plan.planJson);
             String type = planJson.optString("type", "");
-            if (!RolePlanRecoveryPolicy.claimable(plan.status, type, scheduledFor, now)) return false;
+            boolean runnableType = "private_message".equals(type) || "moment_post".equals(type);
+            if (force ? (!"active".equals(plan.status) || !runnableType)
+                : !RolePlanRecoveryPolicy.claimable(plan.status, type, scheduledFor, now)) return false;
             CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(plan.characterId + ":role-plan:" + plan.planId);
             if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) {
                 store.recordDiagnostic("plan_" + safe(plan.planId), null, "WARN", "ROLE_PLAN_SNAPSHOT_MISSING", plan.planId, now);

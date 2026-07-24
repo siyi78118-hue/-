@@ -1,0 +1,5 @@
+gradle.beforeProject { project ->
+    def safePath = project.projectDir.absolutePath
+        .replaceAll('[^A-Za-z0-9._-]+', '_')
+    project.layout.buildDirectory.set(new File('C:/Users/PC/Documents/Codex/New project/.gradle-isolated-build', safePath))
+}

@@ -37,6 +37,9 @@ export function publicTurnStatus(turn, { stages = [], clock = Date.now } = {}) {
     momentAction: committed && result?.momentAction && typeof result.momentAction === 'object'
       ? result.momentAction
       : null,
+    rolePlanOperations: committed && Array.isArray(result?.rolePlanOperations)
+      ? result.rolePlanOperations
+      : [],
     reply: committed ? result?.reply || null : null,
     errorCode: failed ? String(error?.code || error?.name || 'YUQI_ROLE_FAILED') : '',
     origin: committed ? String(result?.reply?.origin || turn.origin || 'codex') : String(turn.origin || 'codex'),

@@ -4,7 +4,7 @@
   const EFFECTIVE_STATUSES = new Set(['active', 'paused', 'running', 'failed']);
   const PLAN_TYPES = new Set(['private_message', 'moment_post', 'role_schedule']);
   const PLAN_SOURCES = new Set(['spoken', 'accepted_request', 'private_decision', 'user_created']);
-  const PLAN_OPERATIONS = new Set(['create', 'update', 'cancel', 'pause', 'resume', 'complete']);
+  const PLAN_OPERATIONS = new Set(['create', 'update', 'cancel', 'pause', 'resume', 'complete', 'delete']);
   const ACTIVE_LIMIT = 50;
   const MIN_SEND_GAP_MS = 5 * 60 * 1000;
 
@@ -120,6 +120,10 @@
     if (!PLAN_TYPES.has(value.type) || !PLAN_SOURCES.has(value.source)) {
       return { ok: false, code: 'PLAN_ENUM_INVALID', detail: 'invalid type or source' };
     }
+    const durationMs = Number(value.durationMs);
+    if (value.type === 'role_schedule' && (!Number.isFinite(durationMs) || durationMs < 60 * 1000)) {
+      return { ok: false, code: 'PLAN_DURATION_REQUIRED', detail: 'role_schedule requires durationMs' };
+    }
     const now = Number(context.now);
     const nextRunAt = nextOccurrence(value.schedule, now - 1);
     if (!Number.isFinite(nextRunAt) || nextRunAt <= now) {
@@ -152,7 +156,7 @@
 
   function applyOperations(plans, history, operations, context = {}) {
     const nextPlans = copy(Array.isArray(plans) ? plans : []);
-    const nextHistory = copy(Array.isArray(history) ? history : []);
+    let nextHistory = copy(Array.isArray(history) ? history : []);
     const rejected = [];
     const now = Number(context.now) || Date.now();
     const uid = typeof context.uid === 'function' ? context.uid : () => `plan_${now}_${Math.random().toString(36).slice(2, 8)}`;
@@ -201,15 +205,39 @@
         rejected.push({ ok: false, code: 'PLAN_TARGET_MISSING', detail: operation.planId });
         continue;
       }
+      if (operation.op === 'delete') {
+        if (!['completed', 'cancelled'].includes(target.status)) {
+          rejected.push({ ok: false, code: 'PLAN_DELETE_ACTIVE', detail: operation.planId });
+          continue;
+        }
+        nextPlans.splice(nextPlans.indexOf(target), 1);
+        nextHistory = nextHistory.filter(row => row.planId !== target.planId);
+        changed = true;
+        continue;
+      }
       if (operation.op === 'update') {
         const patch = copy(operation.patch || {});
         delete patch.planId;
         delete patch.characterId;
-        Object.assign(target, patch);
+        const nextType = patch.type || target.type;
+        if (!PLAN_TYPES.has(nextType)) {
+          rejected.push({ ok: false, code: 'PLAN_ENUM_INVALID', detail: 'invalid type' });
+          continue;
+        }
+        const durationMs = Number(patch.durationMs ?? target.durationMs);
+        if (nextType === 'role_schedule' && (!Number.isFinite(durationMs) || durationMs < 60 * 1000)) {
+          rejected.push({ ok: false, code: 'PLAN_DURATION_REQUIRED', detail: 'role_schedule requires durationMs' });
+          continue;
+        }
         if (patch.schedule) {
           const recalculated = nextOccurrence(patch.schedule, now - 1);
-          if (Number.isFinite(recalculated)) target.nextRunAt = recalculated;
+          if (!Number.isFinite(recalculated) || recalculated <= now) {
+            rejected.push({ ok: false, code: 'PLAN_TIME_INVALID', detail: 'schedule has no future occurrence' });
+            continue;
+          }
+          patch.nextRunAt = nextType === 'role_schedule' ? recalculated : Math.max(recalculated, now + MIN_SEND_GAP_MS);
         }
+        Object.assign(target, patch);
       }
       if (operation.op === 'cancel') Object.assign(target, { status: 'cancelled', cancelledAt: now });
       if (operation.op === 'pause') target.status = 'paused';
@@ -240,10 +268,64 @@
     const now = Number(nowMs);
     return (Array.isArray(plans) ? plans : []).filter(plan => {
       if (plan?.characterId !== characterId || plan?.type !== 'role_schedule' || plan?.status !== 'active') return false;
-      const startedAt = Number(plan.startedAt ?? plan.nextRunAt);
-      const endsAt = plan.endsAt == null ? Number.POSITIVE_INFINITY : Number(plan.endsAt);
-      return Number.isFinite(startedAt) && startedAt <= now && endsAt > now;
+      return roleScheduleState(plan, now).active;
     });
+  }
+
+  function roleScheduleState(plan, nowMs) {
+    const now = Number(nowMs);
+    const durationMs = Number(plan?.durationMs);
+    const recurringStart = durationMs > 0 ? occurrenceStartAt(plan?.schedule, now) : null;
+    const startedAt = Number(recurringStart ?? plan?.startedAt ?? plan?.nextRunAt);
+    const endsAt = recurringStart != null && durationMs > 0
+      ? startedAt + durationMs
+      : (plan?.endsAt == null ? Number.POSITIVE_INFINITY : Number(plan.endsAt));
+    const active = Number.isFinite(startedAt) && startedAt <= now && endsAt > now;
+    const nextRunAt = nextOccurrence(plan?.schedule, now);
+    const explicitlyBounded = plan?.schedule?.kind === 'once' || Boolean(plan?.schedule?.endsAt);
+    return {
+      active,
+      startedAt: Number.isFinite(startedAt) ? startedAt : null,
+      endsAt: Number.isFinite(endsAt) ? endsAt : null,
+      nextRunAt,
+      expired: !active && nextRunAt == null && explicitlyBounded
+    };
+  }
+
+  function occurrenceStartAt(schedule, now) {
+    const rule = schedule && typeof schedule === 'object' ? schedule : {};
+    const startsAt = rule.startsAt ? Date.parse(rule.startsAt) : Number.NEGATIVE_INFINITY;
+    const endsAt = rule.endsAt ? Date.parse(rule.endsAt) : Number.POSITIVE_INFINITY;
+    let candidate = null;
+    if (rule.kind === 'once') candidate = Date.parse(rule.at);
+    if (rule.kind === 'interval') {
+      const anchor = Date.parse(rule.startsAt);
+      const intervalMs = Number(rule.intervalMs);
+      if (Number.isFinite(anchor) && intervalMs >= MIN_SEND_GAP_MS && now >= anchor) {
+        candidate = anchor + Math.floor((now - anchor) / intervalMs) * intervalMs;
+      }
+    }
+    if (rule.kind === 'daily') candidate = localCandidate(now, rule.time);
+    if (rule.kind === 'weekly') {
+      const weekdays = new Set((Array.isArray(rule.weekdays) ? rule.weekdays : []).map(Number));
+      const today = localCandidate(now, rule.time);
+      if (weekdays.has(new Date(now).getDay())) candidate = today;
+    }
+    if (rule.kind === 'monthly') {
+      const day = Number(rule.day);
+      const base = new Date(now);
+      if (Number.isInteger(day) && day >= 1 && day <= 31) {
+        const lastDay = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
+        const monthDay = new Date(base.getFullYear(), base.getMonth(), Math.min(day, lastDay), 0, 0, 0, 0);
+        candidate = localCandidate(monthDay.getTime(), rule.time);
+      }
+    }
+    return Number.isFinite(candidate)
+      && candidate <= now
+      && candidate >= startsAt
+      && candidate <= endsAt
+      ? candidate
+      : null;
   }
 
   function cloudJob(plan, deviceId) {
@@ -272,6 +354,7 @@
     occurrenceId,
     effectivePlans,
     scheduleContext,
+    roleScheduleState,
     cloudJob
   };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

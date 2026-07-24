@@ -174,6 +174,49 @@ function validateScene(scene) {
       content: limitedText(sourceStage.content, 12_000)
     });
   }
+  const phaseCatalog = Array.isArray(scene.phaseCatalog) ? scene.phaseCatalog.slice(0, 20).map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('invalid phase catalog');
+    const phaseId = limitedText(item.id, 64);
+    if (!ID_PATTERN.test(phaseId)) throw new Error('invalid phase catalog id');
+    return {
+      id: phaseId,
+      label: limitedText(item.label || phaseId, 80),
+      content: limitedText(item.content, 12_000)
+    };
+  }) : [{ id: 'normal', label: '正常相处', content: '' }];
+  const sourceBase = sourceStage.base && typeof sourceStage.base === 'object' && !Array.isArray(sourceStage.base)
+    ? sourceStage.base
+    : sourceStage;
+  const sourcePhase = sourceStage.phase && typeof sourceStage.phase === 'object' && !Array.isArray(sourceStage.phase)
+    ? sourceStage.phase
+    : (scene.relationshipPhase && typeof scene.relationshipPhase === 'object' ? scene.relationshipPhase : {});
+  const baseId = limitedText(sourceBase.id || id, 64);
+  if (!ID_PATTERN.test(baseId)) throw new Error('invalid relationship base id');
+  const phaseId = limitedText(sourcePhase.id || scene.currentPhase || 'normal', 64);
+  if (!ID_PATTERN.test(phaseId)) throw new Error('invalid relationship phase id');
+  if (!phaseCatalog.some(item => item.id === phaseId)) {
+    phaseCatalog.unshift({
+      id: phaseId,
+      label: limitedText(sourcePhase.label || phaseId, 80),
+      content: limitedText(sourcePhase.content, 12_000)
+    });
+  }
+  const base = {
+    id: baseId,
+    label: limitedText(sourceBase.label || baseId, 80),
+    content: limitedText(sourceBase.content, 12_000),
+    since: Math.max(0, Number(sourceBase.since ?? sourceStage.since) || 0),
+    reason: limitedText(sourceBase.reason ?? sourceStage.reason, 500),
+    confidence: Math.max(0, Math.min(1, Number(sourceBase.confidence ?? sourceStage.confidence) || 0))
+  };
+  const phase = {
+    id: phaseId,
+    label: limitedText(sourcePhase.label || phaseId, 80),
+    content: limitedText(sourcePhase.content, 12_000),
+    since: Math.max(0, Number(sourcePhase.since) || 0),
+    reason: limitedText(sourcePhase.reason, 500),
+    confidence: Math.max(0, Math.min(1, Number(sourcePhase.confidence) || 0))
+  };
   return {
     playerName: limitedText(scene.playerName || '用户', 120),
     characterName: limitedText(scene.characterName || '虞栖', 120),
@@ -183,11 +226,18 @@ function validateScene(scene) {
       content: limitedText(sourceStage.content, 12_000),
       since: Math.max(0, Number(sourceStage.since) || 0),
       reason: limitedText(sourceStage.reason, 500),
-      confidence: Math.max(0, Math.min(1, Number(sourceStage.confidence) || 0))
+      confidence: Math.max(0, Math.min(1, Number(sourceStage.confidence) || 0)),
+      base,
+      phase
     },
     conversationExtraPrompt: limitedText(scene.conversationExtraPrompt, 12_000),
     globalExtraPrompt: limitedText(scene.globalExtraPrompt, 12_000),
-    stageCatalog: catalog
+    rolePlanCatalog: limitedText(scene.rolePlanCatalog, 20_000),
+    roleScheduleContext: limitedText(scene.roleScheduleContext, 12_000),
+    momentContext: limitedText(scene.momentContext, 20_000),
+    stageCatalog: catalog,
+    phaseCatalog,
+    currentPhase: phaseId
   };
 }
 

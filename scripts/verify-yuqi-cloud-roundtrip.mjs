@@ -25,7 +25,7 @@ const headers = {
 };
 let enqueued = false;
 let deleted = false;
-const cloudFetch = createSystemCloudFetch();
+const cloudFetch = cloud.proxy?.enabled === true ? globalThis.fetch : createSystemCloudFetch();
 
 async function requestCloudJson(url, options = {}) {
   const response = await cloudFetch(url, {

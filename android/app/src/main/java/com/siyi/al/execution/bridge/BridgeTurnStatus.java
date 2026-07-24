@@ -11,6 +11,7 @@ final class BridgeTurnStatus {
     final String paymentStatus;
     final String relationshipStageActionJson;
     final String momentActionJson;
+    final String rolePlanOperationsJson;
     final String errorCode;
     final String replyText;
     final long retryAfterMs;
@@ -27,7 +28,7 @@ final class BridgeTurnStatus {
 
     private BridgeTurnStatus(
         String turnId, String state, boolean terminal, boolean allowFallback,
-        String errorCode, String action, String paymentStatus, String relationshipStageActionJson, String momentActionJson, String replyText, long retryAfterMs, long recoveryAckSeq, String origin,
+        String errorCode, String action, String paymentStatus, String relationshipStageActionJson, String momentActionJson, String rolePlanOperationsJson, String replyText, long retryAfterMs, long recoveryAckSeq, String origin,
         String route, String displayStage, String technicalStage, String stageModel, String stageEffort,
         long stageElapsedMs, long totalElapsedMs, String raw
     ) {
@@ -40,6 +41,7 @@ final class BridgeTurnStatus {
         this.paymentStatus = paymentStatus == null ? "" : paymentStatus.trim();
         this.relationshipStageActionJson = relationshipStageActionJson == null ? "" : relationshipStageActionJson.trim();
         this.momentActionJson = momentActionJson == null ? "" : momentActionJson.trim();
+        this.rolePlanOperationsJson = rolePlanOperationsJson == null ? "" : rolePlanOperationsJson.trim();
         this.replyText = replyText;
         this.retryAfterMs = Math.max(100L, Math.min(10_000L, retryAfterMs <= 0L ? 1_500L : retryAfterMs));
         this.recoveryAckSeq = Math.max(0L, recoveryAckSeq);
@@ -71,6 +73,7 @@ final class BridgeTurnStatus {
             root.optString("paymentAction", ""),
             root.optJSONObject("relationshipStageAction") == null ? "" : root.optJSONObject("relationshipStageAction").toString(),
             root.optJSONObject("momentAction") == null ? "" : root.optJSONObject("momentAction").toString(),
+            nonEmptyArrayJson(root, "rolePlanOperations"),
             replyText,
             root.optLong("retryAfterMs", 1_500L),
             root.optLong("recoveryAckSeq", 0L),
@@ -86,13 +89,18 @@ final class BridgeTurnStatus {
         );
     }
 
-    boolean committed() { return terminal && "send".equals(action) && (!replyText.isEmpty() || !momentActionJson.isEmpty()); }
+    private static String nonEmptyArrayJson(JSONObject root, String key) {
+        org.json.JSONArray value = root.optJSONArray(key);
+        return value == null || value.length() == 0 ? "" : value.toString();
+    }
+
+    boolean committed() { return terminal && "send".equals(action) && (!replyText.isEmpty() || !momentActionJson.isEmpty() || !rolePlanOperationsJson.isEmpty()); }
     boolean skipped() { return terminal && "skip".equals(action); }
     boolean failedFinal() { return terminal && !committed() && !skipped(); }
 
     BridgeResult toResult(String route) {
         if (!committed() && !skipped()) throw new IllegalStateException("bridge turn is not committed");
         if (skipped()) return BridgeResult.skipped(origin.isEmpty() ? route : origin, raw);
-        return BridgeResult.success(origin.isEmpty() ? route : origin, replyText, raw, paymentStatus, relationshipStageActionJson, momentActionJson);
+        return BridgeResult.success(origin.isEmpty() ? route : origin, replyText, raw, paymentStatus, relationshipStageActionJson, momentActionJson, rolePlanOperationsJson);
     }
 }
