@@ -116,12 +116,19 @@ public final class AlExecutionService extends Service {
             try {
                 boolean continueDraining;
                 do {
+                    executionStore.recoverDueRetries(System.currentTimeMillis());
                     engine.recoverInterruptedWork();
                     while (!Thread.currentThread().isInterrupted() && engine.runNext()) {
                         // Drain the single Room-backed queue before checking for a concurrent wake.
                     }
                     notifyCompletedTurns();
-                    continueDraining = !Thread.currentThread().isInterrupted() && drainGate.finishCycle();
+                    RetryRecoveryResult retries = executionStore.recoverDueRetries(System.currentTimeMillis());
+                    if (retries.nextDelaySeconds >= 0L) {
+                        AlExecutionWakeWorker.enqueue(this, retries.nextDelaySeconds);
+                    }
+                    boolean wakeRequested = drainGate.finishCycle();
+                    continueDraining = !Thread.currentThread().isInterrupted()
+                        && (retries.restarted > 0 || wakeRequested);
                 } while (continueDraining);
             } catch (RuntimeException error) {
                 boolean restart = drainGate.abortCycle();

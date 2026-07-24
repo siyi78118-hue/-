@@ -8,7 +8,9 @@ import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -101,6 +103,44 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return turn.activeAttemptId == null ? null : dao.attempt(turn.activeAttemptId);
     }
 
+    public RetryRecoveryResult recoverDueRetries(long now) {
+        int restarted = 0;
+        long nextDelaySeconds = -1L;
+        Map<String, Long> latestDirectCreatedAtByCharacter = new HashMap<>();
+        for (ChatTurnEntity turn : dao.retryableTurns()) {
+            if (TurnKind.DIRECT_REPLY.name().equals(turn.kind)) {
+                Long latestCreatedAt = latestDirectCreatedAtByCharacter.get(turn.characterId);
+                if (latestCreatedAt == null) {
+                    ChatTurnEntity latest = dao.latestDirectTurn(turn.characterId);
+                    latestCreatedAt = latest == null ? turn.createdAt : latest.createdAt;
+                    latestDirectCreatedAtByCharacter.put(turn.characterId, latestCreatedAt);
+                }
+                if (turn.createdAt < latestCreatedAt) continue;
+            }
+            if (turn.activeAttemptId == null) continue;
+            ExecutionAttemptEntity attempt = dao.attempt(turn.activeAttemptId);
+            if (attempt == null || !attempt.retryable) continue;
+            long delaySeconds = AlBackgroundPolicy.transientRetryDelaySeconds(attempt.sequence);
+            if (delaySeconds < 0L) continue;
+            long failedAt = attempt.finishedAt == null ? turn.updatedAt : attempt.finishedAt;
+            long dueAt = failedAt + delaySeconds * 1000L;
+            if (dueAt <= now) {
+                try {
+                    startRetry(turn.turnId, now);
+                    restarted += 1;
+                } catch (IllegalStateException ignored) {
+                    // A foreground retry or a late completion won the race.
+                }
+                continue;
+            }
+            long remaining = Math.max(1L, (dueAt - now + 999L) / 1000L);
+            if (nextDelaySeconds < 0L || remaining < nextDelaySeconds) {
+                nextDelaySeconds = remaining;
+            }
+        }
+        return new RetryRecoveryResult(restarted, nextDelaySeconds);
+    }
+
     @Override
     public void markFailed(
         String turnId,
@@ -117,17 +157,22 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 || dao.replyPartCount(turnId) > 0) {
                 throw new StaleAttemptException(turnId, attemptId);
             }
-            String state = retryable
+            ExecutionAttemptEntity failedAttempt = dao.attempt(attemptId);
+            boolean effectiveRetryable = retryable
+                && failedAttempt != null
+                && AlBackgroundPolicy.transientRetryDelaySeconds(failedAttempt.sequence) >= 0L;
+            String state = effectiveRetryable
                 ? TurnState.FAILED_RETRYABLE.name()
                 : TurnState.FAILED_FINAL.name();
             if (dao.markTurnFailed(turnId, attemptId, state, now) != 1) {
                 throw new StaleAttemptException(turnId, attemptId);
             }
-            if (dao.markAttemptFailed(attemptId, state, code, detail, retryable, now) != 1) {
+            if (dao.markAttemptFailed(attemptId, state, code, detail, effectiveRetryable, now) != 1) {
                 throw new StaleAttemptException(turnId, attemptId);
             }
             insertTurnChange(turnId, "TURN_FAILED", now);
-            insertDiagnostic(turnId, attemptId, "ERROR", "TURN_FAILED", code + ": " + detail, now);
+            String diagnosticCode = retryable && !effectiveRetryable ? "TURN_RETRY_EXHAUSTED" : "TURN_FAILED";
+            insertDiagnostic(turnId, attemptId, "ERROR", diagnosticCode, code + ": " + detail, now);
         });
     }
 

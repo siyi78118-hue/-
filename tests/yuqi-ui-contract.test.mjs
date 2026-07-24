@@ -7,6 +7,7 @@ const engine = readFileSync('android/app/src/main/java/com/siyi/al/execution/Exe
 const plugin = readFileSync('android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java', 'utf8');
 const executionStore = readFileSync('android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java', 'utf8');
 const executionDao = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java', 'utf8');
+const executionService = readFileSync('android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java', 'utf8');
 const worker = readFileSync('tavern-app/sw-v11.js', 'utf8');
 const corePreset = readFileSync('tavern-app/lib/yuqi-core-preset.js', 'utf8');
 
@@ -198,6 +199,22 @@ test('a late bridge failure cannot overwrite a reply that already completed', ()
   assert.match(markFailed, /TurnState\.COMPLETED\.name\(\)\.equals\(turn\.state\)/);
   assert.match(markFailed, /throw new StaleAttemptException\(turnId, attemptId\)/);
   assert.match(executionDao, /UPDATE chat_turns SET state = :state[^\n]+state != 'COMPLETED'/);
+});
+
+test('retryable Android bridge failures stay pending and are recovered in the background', () => {
+  const applyTurn = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  assert.match(applyTurn, /state === 'FAILED_RETRYABLE'/);
+  assert.doesNotMatch(applyTurn, /\['FAILED_RETRYABLE',\s*'FAILED_FINAL',\s*'INTERRUPTED'\]/);
+  assert.match(applyTurn, /userMessage\.replyState = 'pending'/);
+  assert.match(applyTurn, /网络不稳定，正在重新送达/);
+  assert.match(executionDao, /state = 'FAILED_RETRYABLE'/);
+  assert.match(executionStore, /recoverDueRetries\(long now\)/);
+  assert.match(executionStore, /latestDirectCreatedAtByCharacter/);
+  assert.match(executionService, /executionStore\.recoverDueRetries\(System\.currentTimeMillis\(\)\)/);
+  assert.match(executionService, /AlExecutionWakeWorker\.enqueue\(this,\s*retries\.nextDelaySeconds\)/);
 });
 
 test('a previously stored late reply repairs a stale failed turn instead of returning early', () => {

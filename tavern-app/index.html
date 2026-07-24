@@ -3195,7 +3195,10 @@ async function applyNativeExecutionTurnUnlocked(result) {
       DB.set('chats', allChats);
       return true;
     }
-    if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
+    if (state === 'FAILED_RETRYABLE') {
+      return false;
+    }
+    if (['FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
       const reason = nativeReplyFailureMessage(kind);
       if (kind === 'PROACTIVE_MOMENT' || kind === 'ROLE_PLAN_MOMENT' || kind === 'ROLE_PLAN_MOMENT_PRIVATE') {
         chat.lastProactiveMomentFailedAt = Date.now();
@@ -3249,7 +3252,25 @@ async function applyNativeExecutionTurnUnlocked(result) {
     nativeReplyQueuedIds.delete(result.turnId);
     processMemoryAfterTurn(charId).catch(err => console.warn('[AL Memory] native turn extraction skipped:', err.message));
     syncRolePlanCloudJobs(charId).catch(err => console.warn('[AL RolePlan] native snapshot refresh skipped:', err.message));
-  } else if (['FAILED_RETRYABLE', 'FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
+  } else if (state === 'FAILED_RETRYABLE') {
+    userMessage.replyState = 'pending';
+    delete userMessage.replyError;
+    chat.pendingReply = {
+      ...(chat.pendingReply || {}),
+      userMessageId: userMessage.id,
+      userText: nativePendingReplyText(chat, userMessage),
+      state: 'running',
+      nativeTurnId: result.turnId,
+      nativeState: state,
+      nativeUpdatedAt: Number(result.updatedAt) || 0,
+      bridgeDisplayStage: '网络不稳定，正在重新送达…',
+      bridgeTechnicalStage: String(result.technicalStage || 'retry_wait'),
+      bridgeStageElapsedMs: Number(result.stageElapsedMs) || 0,
+      bridgeTotalElapsedMs: Number(result.totalElapsedMs) || 0,
+      updatedAt: Date.now()
+    };
+    nativeReplyQueuedIds.add(result.turnId);
+  } else if (['FAILED_FINAL', 'INTERRUPTED'].includes(state)) {
     const reason = nativeReplyFailureMessage(kind);
     userMessage.replyState = 'failed';
     userMessage.replyError = reason;

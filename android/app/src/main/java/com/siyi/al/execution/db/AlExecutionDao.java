@@ -142,6 +142,12 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM chat_turns WHERE state IN ('QUEUED','MEMORY_DONE','CHAT_DONE') AND deletedAt IS NULL ORDER BY CASE kind WHEN 'DIRECT_REPLY' THEN 0 WHEN 'ROLE_PLAN_CHAT' THEN 1 WHEN 'ROLE_PLAN_MOMENT' THEN 1 WHEN 'ROLE_PLAN_CHAT_PRIVATE' THEN 2 WHEN 'ROLE_PLAN_MOMENT_PRIVATE' THEN 2 WHEN 'PROACTIVE_CHAT' THEN 3 WHEN 'PROACTIVE_MOMENT' THEN 4 ELSE 5 END, createdAt ASC LIMIT 1")
     ChatTurnEntity nextRunnableTurn();
 
+    @Query("SELECT * FROM chat_turns WHERE state = 'FAILED_RETRYABLE' AND deletedAt IS NULL ORDER BY updatedAt ASC")
+    List<ChatTurnEntity> retryableTurns();
+
+    @Query("SELECT * FROM chat_turns WHERE kind = 'DIRECT_REPLY' AND characterId = :characterId AND deletedAt IS NULL ORDER BY createdAt DESC LIMIT 1")
+    ChatTurnEntity latestDirectTurn(String characterId);
+
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT 50")
     List<ChatTurnEntity> completedTurns();
 

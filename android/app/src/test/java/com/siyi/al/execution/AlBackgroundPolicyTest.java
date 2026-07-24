@@ -20,6 +20,14 @@ public class AlBackgroundPolicyTest {
     }
 
     @Test
+    public void transientBridgeFailuresUseBoundedBackoff() {
+        assertEquals(15L, AlBackgroundPolicy.transientRetryDelaySeconds(1));
+        assertEquals(60L, AlBackgroundPolicy.transientRetryDelaySeconds(2));
+        assertEquals(300L, AlBackgroundPolicy.transientRetryDelaySeconds(3));
+        assertEquals(-1L, AlBackgroundPolicy.transientRetryDelaySeconds(4));
+    }
+
+    @Test
     public void occurrenceIdentifierIsStableAcrossWakeSources() {
         assertEquals("plan-a:1784278800000", RolePlanOccurrenceKey.of("plan-a", 1784278800000L));
         assertEquals(
