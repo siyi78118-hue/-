@@ -34,6 +34,20 @@ test('Yuqi controls expose secure AUTO, LAN, and CLOUD bridge settings', () => {
   assert.match(html, /importYuqiPairingCode/);
 });
 
+test('Yuqi Bridge submission does not require ordinary chat or memory AI settings', () => {
+  const sync = html.slice(
+    html.indexOf('async function saveNativeExecutionApiConfigs'),
+    html.indexOf('function nativeMemoryCandidateText')
+  );
+  assert.doesNotMatch(sync, /接口配置不完整/);
+  assert.doesNotMatch(sync, /当前原生后台执行仅支持 OpenAI 兼容接口/);
+  assert.match(sync, /config\.apiType === 'openai'/);
+  assert.match(sync, /await plugin\.saveApiConfig\(config\)/);
+  assert.match(sync, /await plugin\.removeApiConfig\(\{ configId: config\.configId \}\)/);
+  assert.match(plugin, /void\s+removeApiConfig\(PluginCall call\)/);
+  assert.match(plugin, /secrets\.removeApiConfig\(configId\)/);
+});
+
 test('normal direct and background context is 200 raw messages', () => {
   assert.match(engine, /source\.length\(\)\s*-\s*200/);
   assert.match(html, /const NORMAL_RAW_CONTEXT_LIMIT = 200;/);

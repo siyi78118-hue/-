@@ -2538,17 +2538,17 @@ function nativeTurnIdForMessage(messageId) {
 }
 async function saveNativeExecutionApiConfigs() {
   const plugin = nativeExecutionPlugin();
-  if (!plugin?.saveApiConfig) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
-  if ((settings.chatApiType || 'openai') !== 'openai' || (settings.memoryApiType || 'openai') !== 'openai') {
-    throw new Error('当前原生后台执行仅支持 OpenAI 兼容接口');
-  }
+  if (!plugin?.saveApiConfig || !plugin?.removeApiConfig) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
   const configs = [
-    { configId: 'chat-v1', baseUrl: settings.chatApiUrl, apiKey: cleanApiKey(settings.chatApiKey), model: settings.chatModel, temperature: Number(settings.temperature) || 0.8, sendTemperature: settings.chatTemperatureEnabled !== false },
-    { configId: 'memory-v1', baseUrl: settings.memoryApiUrl, apiKey: cleanApiKey(settings.memoryApiKey), model: settings.memoryModel, temperature: 0.2, sendTemperature: settings.memoryTemperatureEnabled !== false }
+    { configId: 'chat-v1', apiType: settings.chatApiType || 'openai', baseUrl: settings.chatApiUrl, apiKey: cleanApiKey(settings.chatApiKey), model: settings.chatModel, temperature: Number(settings.temperature) || 0.8, sendTemperature: settings.chatTemperatureEnabled !== false },
+    { configId: 'memory-v1', apiType: settings.memoryApiType || 'openai', baseUrl: settings.memoryApiUrl, apiKey: cleanApiKey(settings.memoryApiKey), model: settings.memoryModel, temperature: 0.2, sendTemperature: settings.memoryTemperatureEnabled !== false }
   ];
   for (const config of configs) {
-    if (!config.baseUrl || !config.apiKey || !config.model) throw new Error(`${config.configId === 'chat-v1' ? '聊天' : '记忆'}接口配置不完整`);
-    await plugin.saveApiConfig(config);
+    if (config.apiType === 'openai' && config.baseUrl && config.apiKey && config.model) {
+      await plugin.saveApiConfig(config);
+    } else {
+      await plugin.removeApiConfig({ configId: config.configId });
+    }
   }
 }
 function nativeMemoryCandidateText(memory = {}, char = null) {

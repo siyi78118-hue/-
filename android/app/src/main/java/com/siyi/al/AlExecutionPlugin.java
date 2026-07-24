@@ -80,6 +80,18 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void removeApiConfig(PluginCall call) {
+        execute(call, () -> {
+            String configId = required(call, "configId");
+            secrets.removeApiConfig(configId);
+            JSObject result = new JSObject();
+            result.put("removed", true);
+            result.put("configId", configId);
+            return result;
+        });
+    }
+
+    @PluginMethod
     public void saveBridgeConfig(PluginCall call) {
         execute(call, () -> {
             BridgeConfig current = secrets.loadBridgeConfig();
