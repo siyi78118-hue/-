@@ -95,6 +95,7 @@ class FakeCodex {
     this.calls.push({ role, input: JSON.parse(input), options });
     const text = this.outputs[role]?.shift();
     if (text === undefined) throw new Error(`missing fake output for ${role}`);
+    if (text instanceof Error) throw text;
     return { text };
   }
 }
@@ -188,6 +189,54 @@ const normalOutputs = () => ({
   memory: ['{"query":"你好","keywords":["你好"],"candidates":[]}'],
   brain: ['{"reply":"你好。我是虞栖，你呢？","usedFactIds":[]}'],
   supervisor: ['{"approved":true,"issues":[]}']
+});
+
+test('a capacity error switches the same role to its alternate model once', async () => {
+  const capacityError = Object.assign(
+    new Error('Selected model is at capacity. Please try a different model.'),
+    { name: 'CodexTurnError' }
+  );
+  await withFixture({
+    memory: [capacityError, '{"query":"你好","keywords":["你好"],"candidates":[]}']
+  }, async ({ codex, orchestrator }) => {
+    orchestrator.accept(envelope(97));
+    const result = await orchestrator.runStructuredRole(
+      'memory',
+      { task: 'retrieve' },
+      'turn_phone_97_memory',
+      { model: 'gpt-5.6-sol', effort: 'medium' },
+      'memory_deep'
+    );
+
+    assert.equal(result.query, '你好');
+    assert.deepEqual(codex.calls.map(call => call.options.model), [
+      'gpt-5.6-sol',
+      'gpt-5.6-terra'
+    ]);
+  });
+});
+
+test('an account usage limit never rotates through alternate models', async () => {
+  const usageError = Object.assign(
+    new Error('You have 0 weighted tokens left. Purchase more credits.'),
+    { name: 'CodexTurnError' }
+  );
+  await withFixture({
+    memory: [usageError]
+  }, async ({ codex, orchestrator }) => {
+    orchestrator.accept(envelope(98));
+    await assert.rejects(
+      orchestrator.runStructuredRole(
+        'memory',
+        { task: 'retrieve' },
+        'turn_phone_98_memory',
+        { model: 'gpt-5.6-sol', effort: 'medium' },
+        'memory_deep'
+      ),
+      /purchase more credits/i
+    );
+    assert.deepEqual(codex.calls.map(call => call.options.model), ['gpt-5.6-sol']);
+  });
 });
 
 function conversationFrame(overrides = {}) {

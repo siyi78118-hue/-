@@ -443,9 +443,36 @@ export class YuqiStore {
     if (sequenceOwner && sequenceOwner.source_message_id !== sourceMessageId) {
       throw new Error('device sequence conflict');
     }
+    const retry = envelope.context?.retry || null;
+    let canonicalRetryMessage = null;
+    if (retry) {
+      if (!envelope.message || retry.canonicalMessageId !== sourceMessageId) {
+        throw new Error('retry canonical message mismatch');
+      }
+      const previousTurn = this.getTurn(retry.retryOfTurnId);
+      if (
+        !previousTurn
+        || previousTurn.characterId !== envelope.characterId
+        || previousTurn.deviceId !== envelope.deviceId
+        || previousTurn.sourceMessageId !== sourceMessageId
+      ) {
+        throw new Error('retry turn lineage mismatch');
+      }
+      canonicalRetryMessage = this.getMessage(retry.canonicalMessageId);
+      if (
+        !canonicalRetryMessage
+        || canonicalRetryMessage.characterId !== envelope.characterId
+        || canonicalRetryMessage.deviceId !== envelope.deviceId
+        || canonicalRetryMessage.speakerType !== 'user'
+        || canonicalRetryMessage.content !== envelope.message.content
+        || Number(canonicalRetryMessage.sentAt) !== Number(envelope.message.sentAt)
+      ) {
+        throw new Error('retry canonical message conflict');
+      }
+    }
 
     return this.transaction(() => {
-      if (envelope.message) {
+      if (envelope.message && !canonicalRetryMessage) {
         const savedMessage = this.putMessageInternal({
           ...envelope.message,
           turnId: envelope.turnId,
@@ -664,9 +691,10 @@ export class YuqiStore {
     if (!current) throw new Error('turn not found');
     if (current.state !== 'failed') return { requeued: false, turn: current };
     const failure = parseJson(current.errorJson, {});
-    const isCodexTimeout = String(failure?.name || '') === 'CodexTurnError'
-      && /(?:timed out|timeout)/i.test(String(failure?.message || ''));
-    if (!isCodexTimeout) return { requeued: false, turn: current };
+    const isTransientCodexFailure = String(failure?.name || '') === 'CodexTurnError'
+      && /(?:timed out|timeout|selected model is at capacity|model.+capacity|capacity.+model)/i
+        .test(String(failure?.message || ''));
+    if (!isTransientCodexFailure) return { requeued: false, turn: current };
 
     const checkpoint = current.brainDraftJson
       ? 'brain_done'

@@ -121,7 +121,8 @@ assert.match(script, /max_tokens:\s*normalizedChatMaxTokens\(settings\.maxTokens
 const nativeQueueBody = html.match(/async function queueAndroidUserReply\([\s\S]*?\n}\nasync function mirrorAppStateNow/)?.[0] || '';
 assert.doesNotMatch(nativeQueueBody, /nativeBackgroundRunner\(|AlReplyQueue|dispatchEvent\(/, 'native user replies must not fork into the legacy runner queue');
 assert.match(nativeQueueBody, /buildNativeExecutionSnapshot\(/, 'native user replies should carry an immutable execution snapshot');
-assert.match(html, /async function retryFailedReply[\s\S]{0,5000}plugin\.retryTurn\(/, 'native retry must create a fresh Room attempt');
+assert.match(html, /async function retryFailedReply[\s\S]{0,1200}nativeRetryTurnIdForMessage\([\s\S]{0,5000}plugin\.submitTurn\(/, 'native retry must create a fresh Room turn');
+assert.doesNotMatch(html.match(/async function retryFailedReply[\s\S]*?function showReplyFailureReason/)?.[0] || '', /plugin\.retryTurn\(/, 'manual retry must not reuse a terminal Room turn');
 assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(/, 'retract and delete should cancel the native turn');
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
 assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');

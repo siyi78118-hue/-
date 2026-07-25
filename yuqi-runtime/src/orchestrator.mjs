@@ -991,6 +991,8 @@ export class YuqiOrchestrator {
     const turnId = clientUserMessageId.replace(/_(memory(?:_deep)?|brain_\d+|supervisor_\d+)$/, '');
     this.store.beginStage(turnId, stage, profile.model, profile.effort, this.clock());
     let invalidOutput = '';
+    let activeProfile = profile;
+    let capacityFallbackUsed = false;
     try {
       for (let attempt = 1; attempt <= 2; attempt += 1) {
       const payload = attempt === 1 ? request : {
@@ -1001,12 +1003,39 @@ export class YuqiOrchestrator {
           invalidOutput: invalidOutput.slice(0, 2_000)
         }
       };
-        const response = await this.codex.runTurn(role, JSON.stringify(payload), {
-        clientUserMessageId: attempt === 1 ? clientUserMessageId : `${clientUserMessageId}_protocol_${attempt}`,
-        outputSchema: ROLE_OUTPUT_SCHEMAS[role],
-          model: profile.model,
-          effort: profile.effort
-        });
+        const baseMessageId = attempt === 1 ? clientUserMessageId : `${clientUserMessageId}_protocol_${attempt}`;
+        let response;
+        try {
+          response = await this.codex.runTurn(role, JSON.stringify(payload), {
+            clientUserMessageId: baseMessageId,
+            outputSchema: ROLE_OUTPUT_SCHEMAS[role],
+            model: activeProfile.model,
+            effort: activeProfile.effort
+          });
+        } catch (error) {
+          const alternate = capacityFallbackUsed ? null : fallbackRoleProfile(activeProfile);
+          if (!isModelCapacityError(error) || !alternate) throw error;
+          capacityFallbackUsed = true;
+          this.store.putDiagnostic({
+            turnId,
+            stage: 'model_capacity_failover',
+            level: 'warn',
+            detail: {
+              role,
+              failedModel: activeProfile.model,
+              fallbackModel: alternate.model,
+              effort: alternate.effort,
+              error: 'model_capacity'
+            }
+          });
+          activeProfile = alternate;
+          response = await this.codex.runTurn(role, JSON.stringify(payload), {
+            clientUserMessageId: `${baseMessageId}_capacity_fallback`,
+            outputSchema: ROLE_OUTPUT_SCHEMAS[role],
+            model: activeProfile.model,
+            effort: activeProfile.effort
+          });
+        }
         invalidOutput = String(response.text || '');
         try {
           return parseRoleJson(invalidOutput, role);
@@ -1019,4 +1048,15 @@ export class YuqiOrchestrator {
       this.store.finishStage(turnId, stage, this.clock());
     }
   }
+}
+export function isModelCapacityError(error) {
+  return String(error?.name || '') === 'CodexTurnError'
+    && /(?:selected model is at capacity|model.+capacity|capacity.+model)/i.test(String(error?.message || ''));
+}
+
+export function fallbackRoleProfile(profile) {
+  const model = String(profile?.model || '');
+  if (model.includes('gpt-5.6-sol')) return { ...profile, model: 'gpt-5.6-terra' };
+  if (model.includes('gpt-5.6-terra')) return { ...profile, model: 'gpt-5.6-sol' };
+  return null;
 }

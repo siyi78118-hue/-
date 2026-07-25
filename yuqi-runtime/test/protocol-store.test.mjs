@@ -121,6 +121,46 @@ test('protocol v2 direct turn preserves the exact user message and kind', () => 
   assert.equal(value.trigger, undefined);
 });
 
+test('protocol v2 preserves validated retry lineage for a direct turn', () => {
+  const value = validateEnvelope(validV2Envelope({
+    context: {
+      retry: {
+        retryOfTurnId: 'turn_device2_original',
+        canonicalMessageId: 'msg_device2_1'
+      }
+    }
+  }));
+  assert.deepEqual(value.context.retry, {
+    retryOfTurnId: 'turn_device2_original',
+    canonicalMessageId: 'msg_device2_1'
+  });
+});
+
+test('a retry creates a new turn while reusing one canonical user message', () => {
+  withStore(({ store }) => {
+    store.migrate();
+    const original = validV2Envelope();
+    store.submitTurn(original);
+    const retry = validV2Envelope({
+      turnId: 'turn_device2_retry_1',
+      deviceSeq: 2,
+      createdAt: original.createdAt + 1_000,
+      context: {
+        retry: {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: original.message.messageId
+        }
+      }
+    });
+
+    const saved = store.submitTurn(retry);
+
+    assert.equal(saved.turnId, retry.turnId);
+    assert.equal(saved.sourceMessageId, original.message.messageId);
+    assert.equal(store.listMessages('yuqi', 20).filter(row => row.speakerType === 'user').length, 1);
+  });
+});
+
 test('protocol v2 direct turn preserves validated pending payment context', () => {
   const envelope = validateEnvelope(validV2Envelope({
     context: {
@@ -498,6 +538,32 @@ test('requeues a transient brain timeout from the completed memory checkpoint', 
   assert.equal(delivery.checksum, '');
   assert.equal(delivery.attempts, 0);
   assert.equal(store.requeueTransientFailedTurn(turn.turnId).requeued, false);
+}));
+
+test('requeues a model-capacity failure and resets its stale cloud delivery', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  store.claimTurnById(turn.turnId, 'worker-a');
+  store.advanceTurn(turn.turnId, 'memory_running', 'failed', {
+    errorJson: JSON.stringify({
+      name: 'CodexTurnError',
+      message: 'Selected model is at capacity. Please try a different model.'
+    })
+  });
+  store.registerCloudDelivery(turn.turnId, 'phone_peer', 43);
+  const failedDelivery = store.prepareCloudDelivery(turn.turnId, 'phone_peer', {
+    turnId: turn.turnId, state: 'failed', terminal: true
+  });
+  store.markCloudDeliveryAttempt(turn.turnId, 'phone_peer');
+  store.markCloudDeliveryMailboxed(turn.turnId, 'phone_peer', failedDelivery.checksum);
+
+  const recovered = store.requeueTransientFailedTurn(turn.turnId);
+  const [delivery] = store.listCloudDeliveries(turn.turnId);
+
+  assert.equal(recovered.requeued, true);
+  assert.equal(recovered.turn.state, 'queued');
+  assert.equal(delivery.state, 'waiting');
+  assert.equal(delivery.checksum, '');
+  assert.equal(delivery.attempts, 0);
 }));
 
 test('requeues a usage-limit failure only after an explicit operator recovery', () => withStore(({ store }) => {

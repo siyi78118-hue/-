@@ -63,6 +63,10 @@ final class BridgeInput {
             JSONObject options = input.optJSONObject("options");
             JSONObject suppliedPayment = options == null ? null : options.optJSONObject("payment");
             JSONObject context = new JSONObject();
+            JSONObject suppliedRetry = input.optJSONObject("retry");
+            if (suppliedRetry != null) {
+                context.put("retry", new JSONObject(suppliedRetry.toString()));
+            }
             JSONArray suppliedMessageIds = options == null ? null : options.optJSONArray("batchMessageIds");
             JSONArray messageIds = suppliedMessageIds == null
                 ? new JSONArray()

@@ -2536,6 +2536,10 @@ function withOptionalTemperature(payload, enabled, value) {
 function nativeTurnIdForMessage(messageId) {
   return `turn_${String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
+function nativeRetryTurnIdForMessage(messageId) {
+  const source = String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(-48);
+  return `turn_retry_${source}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
+}
 async function saveNativeExecutionApiConfigs() {
   const plugin = nativeExecutionPlugin();
   if (!plugin?.saveApiConfig || !plugin?.removeApiConfig) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
@@ -3139,6 +3143,23 @@ function applyNativeMomentActionPart(charId, part, turnId) {
   return true;
 }
 
+function nativeDirectTurnIsSuperseded(chat, result) {
+  if (String(result?.kind || 'DIRECT_REPLY') !== 'DIRECT_REPLY') return false;
+  const sourceMessageId = String(result?.sourceMessageId || '');
+  const active = chat?.pendingReply;
+  if (
+    active?.userMessageId === sourceMessageId
+    && active?.nativeTurnId
+    && active.nativeTurnId !== result?.turnId
+  ) return true;
+  const replies = (chat?.messages || []).filter(
+    row => row.role === 'assistant' && row.replyToMessageId === sourceMessageId
+  );
+  if (!replies.length) return false;
+  const sourceTurnId = `native:${result?.turnId || ''}`;
+  return !replies.some(row => row.sourceTurnId === sourceTurnId);
+}
+
 async function applyNativeExecutionTurnUnlocked(result) {
   const charId = result?.characterId;
   const chat = allChats[charId];
@@ -3146,6 +3167,10 @@ async function applyNativeExecutionTurnUnlocked(result) {
   if (!chat) return false;
   const state = String(result.state || result.storedState || '');
   const allParts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
+  if (nativeDirectTurnIsSuperseded(chat, result)) {
+    nativeReplyQueuedIds.delete(result?.turnId);
+    return false;
+  }
   if (state === 'COMPLETED') {
     applyNativeRelationshipStagePart(charId, allParts.find(part => part.type === 'RELATIONSHIP_STAGE'), result.turnId);
   }
@@ -7327,31 +7352,42 @@ async function retryFailedReply(charId, userMessageId) {
   if (activeChatRequests.has(charId)) return false;
   const oldPending = chat.pendingReply?.userMessageId === userMessageId ? chat.pendingReply : null;
   const savedOptions = oldPending?.options || {};
+  const retryStartedAt = Date.now();
+  const nativeRetry = isNativeApp();
+  const retryOfTurnId = nativeRetry ? (oldPending?.nativeTurnId || nativeTurnIdForMessage(userMessageId)) : '';
+  const turnId = nativeRetry ? nativeRetryTurnIdForMessage(userMessageId) : '';
   chat.pendingReply = {
     userMessageId,
     userText: String(oldPending?.userText || message.content || ''),
     options: savedOptions,
     state: 'pending',
-    createdAt: Number(oldPending?.createdAt) || Date.now(),
-    updatedAt: Date.now()
+    createdAt: retryStartedAt,
+    updatedAt: retryStartedAt,
+    ...(nativeRetry ? { nativeTurnId: turnId, retryOfTurnId } : {})
   };
   message.replyState = 'pending';
   delete message.replyError;
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
-  if (isNativeApp()) {
+  if (nativeRetry) {
     const plugin = nativeExecutionPlugin();
-    const turnId = oldPending?.nativeTurnId || nativeTurnIdForMessage(userMessageId);
-    chat.pendingReply.nativeTurnId = turnId;
+    nativeReplyQueuedIds.add(turnId);
     try {
       await saveNativeExecutionApiConfigs();
       const task = buildAndroidUserReplyTask(charId, userMessageId, chat.pendingReply.userText, savedOptions, chat.pendingReply.createdAt);
       const snapshot = await buildNativeExecutionSnapshot(charId, task);
-      const result = await plugin.retryTurn({
+      const result = await plugin.submitTurn({
         turnId,
+        characterId: charId,
+        sourceMessageId: userMessageId,
+        kind: 'DIRECT_REPLY',
         inputJson: JSON.stringify({
           userText: task.userText,
           options: task.options,
+          retry: {
+            retryOfTurnId,
+            canonicalMessageId: userMessageId
+          },
           message: {
             messageId: userMessageId,
             speakerId: 'user',
@@ -7363,12 +7399,19 @@ async function retryFailedReply(charId, userMessageId) {
           },
           deviceSeq: Math.max(1, task.createdAt)
         }),
-        snapshotJson: JSON.stringify(snapshot)
+        snapshotJson: JSON.stringify(snapshot),
+        createdAt: task.createdAt
       });
+      if (chat.pendingReply?.nativeTurnId === turnId) {
+        chat.pendingReply.nativeAcceptedAt = Date.now();
+        DB.set('chats', allChats);
+      }
       await applyNativeExecutionTurn(result);
       startNativeReplyPolling();
       return true;
     } catch (err) {
+      nativeReplyQueuedIds.delete(turnId);
+      if (chat.pendingReply?.nativeTurnId !== turnId) return false;
       const reason = friendlyErrorMessage(err);
       chat.pendingReply.state = 'failed';
       chat.pendingReply.error = reason;

@@ -124,22 +124,34 @@ function validateDirectContext(context) {
   }
   const normalized = {};
   if (context.scene !== undefined) normalized.scene = validateScene(context.scene);
-  if (context.payment === undefined) return normalized;
-  const payment = context.payment;
-  if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
-    throw new Error('invalid payment context');
+  if (context.retry !== undefined) {
+    const retry = context.retry;
+    if (!retry || typeof retry !== 'object' || Array.isArray(retry)) {
+      throw new Error('invalid retry context');
+    }
+    const retryOfTurnId = String(retry.retryOfTurnId || '');
+    const canonicalMessageId = String(retry.canonicalMessageId || '');
+    requireId(retryOfTurnId, 'retryOfTurnId', 'turn_');
+    requireId(canonicalMessageId, 'canonicalMessageId');
+    normalized.retry = { retryOfTurnId, canonicalMessageId };
   }
-  const kind = String(payment.kind || '');
-  const amount = Number(payment.amount);
-  const note = String(payment.note || '').trim();
-  const messageId = String(payment.messageId || '');
-  const status = String(payment.status || 'pending');
-  if (!['redpacket', 'transfer'].includes(kind)) throw new Error('invalid payment kind');
-  if (!Number.isFinite(amount) || amount <= 0) throw new Error('invalid payment amount');
-  if (note.length > 500) throw new Error('payment note too large');
-  requireId(messageId, 'payment messageId');
-  if (!['pending', 'received', 'refused'].includes(status)) throw new Error('invalid payment status');
-  normalized.payment = { kind, amount, note, messageId, status };
+  if (context.payment !== undefined) {
+    const payment = context.payment;
+    if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
+      throw new Error('invalid payment context');
+    }
+    const kind = String(payment.kind || '');
+    const amount = Number(payment.amount);
+    const note = String(payment.note || '').trim();
+    const messageId = String(payment.messageId || '');
+    const status = String(payment.status || 'pending');
+    if (!['redpacket', 'transfer'].includes(kind)) throw new Error('invalid payment kind');
+    if (!Number.isFinite(amount) || amount <= 0) throw new Error('invalid payment amount');
+    if (note.length > 500) throw new Error('payment note too large');
+    requireId(messageId, 'payment messageId');
+    if (!['pending', 'received', 'refused'].includes(status)) throw new Error('invalid payment status');
+    normalized.payment = { kind, amount, note, messageId, status };
+  }
   return normalized;
 }
 

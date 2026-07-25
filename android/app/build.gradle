@@ -7,8 +7,8 @@ android {
         applicationId "com.siyi.al"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode Integer.parseInt(System.getenv("AL_VERSION_CODE") ?: "94")
-        versionName System.getenv("AL_VERSION_NAME") ?: "1.0.94"
+        versionCode Integer.parseInt(System.getenv("AL_VERSION_CODE") ?: "95")
+        versionName System.getenv("AL_VERSION_NAME") ?: "1.0.95"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.

@@ -165,11 +165,26 @@ test('native relationship writeback applies base and phase actions atomically', 
   assert.match(html, /熟悉 · 闹矛盾期/);
 });
 
-test('native retry repairs a legacy failed turn with current canonical input and snapshot', () => {
+test('native retry creates a fresh execution turn for the canonical message', () => {
   const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
   assert.match(retry, /const\s+task\s*=\s*buildAndroidUserReplyTask/);
   assert.match(retry, /const\s+snapshot\s*=\s*await\s+buildNativeExecutionSnapshot\(charId,\s*task\)/);
-  assert.match(retry, /plugin\.retryTurn\(\{[\s\S]*?turnId[\s\S]*?inputJson:[\s\S]*?speakerId:\s*'user'[\s\S]*?content:\s*messageContentForAI\(message\)[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
+  assert.match(retry, /const\s+retryOfTurnId\s*=/);
+  assert.match(retry, /nativeRetryTurnIdForMessage\(userMessageId\)/);
+  assert.match(retry, /plugin\.submitTurn\(\{[\s\S]*?turnId[\s\S]*?inputJson:[\s\S]*?retryOfTurnId[\s\S]*?canonicalMessageId:\s*userMessageId[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
+  assert.doesNotMatch(retry, /plugin\.retryTurn/);
+});
+
+test('a superseded direct turn cannot render or apply actions', () => {
+  const apply = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  assert.match(apply, /function\s+nativeDirectTurnIsSuperseded|nativeDirectTurnIsSuperseded\(/);
+  assert.ok(
+    apply.indexOf('nativeDirectTurnIsSuperseded') < apply.indexOf('applyNativeRelationshipStagePart'),
+    'superseded direct turns must be rejected before any action is applied'
+  );
 });
 
 test('native completed replies retain bridge provenance without changing bubble copy', () => {
