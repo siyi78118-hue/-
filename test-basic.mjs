@@ -340,8 +340,8 @@ assert.ok(appCloudTimerVersion, 'app must declare its expected cloud timer versi
 assert.equal(appCloudTimerVersion, workerCloudTimerVersion, 'app and deployed Worker source must expect the same version');
 assert.equal(appCloudTimerVersion, healthCloudTimerVersion, 'app and health checker must expect the same Worker version');
 assert.match(script, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
-assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.05;/);
-assert.match(script, /const PROACTIVE_DICE_MAX_ROLLS = 432;/);
+assert.match(script, /const PROACTIVE_DICE_CHANCE = 0\.15;/);
+assert.match(script, /const PROACTIVE_DICE_MAX_ROLLS = 144;/);
 assert.match(script, /const MOMENT_DICE_INTERVAL_MS = 2 \* 60 \* 60 \* 1000;/);
 assert.match(script, /const MOMENT_DICE_CHANCE = 0\.20;/);
 assert.match(script, /const MOMENT_DICE_MAX_ROLLS = 12;/);
@@ -2219,7 +2219,7 @@ const medianDiceRoll = proactiveDicePlan({ intervalMs: 600000, rollChance: 0.05 
 assert.equal(medianDiceRoll.rolls, 14, '5% 独立抽签的中位命中轮次应为第 14 轮');
 assert.equal(medianDiceRoll.dueAt.getTime(), 14 * 600000);
 assert.equal(proactiveDicePlan({ rollChance: 1 }, 0, 0.99).rolls, 1);
-assert.equal(proactiveDicePlan({ rollChance: 0 }, 0, 0.99).rolls, 432, '零概率和极端尾部必须受最长三天保护');
+assert.equal(proactiveDicePlan({ rollChance: 0 }, 0, 0.99).rolls, 144, '零概率和极端尾部必须受最长一天保护');
 const latestMomentPlan = proactiveDicePlan(proactiveDefaultScheduleOptions('moment'), 0, 1 - Number.EPSILON);
 assert.equal(latestMomentPlan.rolls, 12, '朋友圈随机等待最长只能达到 12 轮');
 assert.equal(latestMomentPlan.dueAt.getTime(), 24 * 60 * 60 * 1000, '朋友圈最迟必须在 24 小时时触发');
@@ -2239,8 +2239,8 @@ const diceScheduleProbe = await vm.runInContext(`(async () => {
 })()`, context);
 assert.equal(diceScheduleProbe.job.mode, 'dice');
 assert.equal(diceScheduleProbe.job.dicePrecomputed, true);
-assert.ok(diceScheduleProbe.job.diceRolls >= 1 && diceScheduleProbe.job.diceRolls <= 432);
-assert.equal(diceScheduleProbe.job.rollChance, 0.05);
+assert.ok(diceScheduleProbe.job.diceRolls >= 1 && diceScheduleProbe.job.diceRolls <= 144);
+assert.equal(diceScheduleProbe.job.rollChance, 0.15);
 assert.equal(diceScheduleProbe.job.diceIntervalMs, 600000);
 assert.ok(Math.abs(Date.parse(diceScheduleProbe.job.dueAt) - diceScheduleProbe.startedAt - diceScheduleProbe.job.diceRolls * 600000) < 2000);
 assert.equal(diceScheduleProbe.legacyZeroChanceResult, false, '旧骰子任务仍需在到点时兼容抽签');

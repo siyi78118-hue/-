@@ -4,17 +4,31 @@ import test from 'node:test';
 
 const source = readFileSync(new URL('../tavern-app/index.html', import.meta.url), 'utf8');
 const match = source.match(/combined:\s*\{[\s\S]*?prompt:\s*`([\s\S]*?)`\s*\r?\n\s*\},\s*\r?\n\s*custom:/);
+const runtimeCore = readFileSync(new URL('../yuqi-runtime/presets/yuqi-core.md', import.meta.url), 'utf8').trim();
+const memoryManager = readFileSync(new URL('../yuqi-runtime/presets/memory-manager.md', import.meta.url), 'utf8').trim();
 
 assert.ok(match, '应能从 index.html 提取 AL 综合 RP 预设');
 const prompt = match[1];
 
 test('AL 综合 RP 与虞栖核心预设生成跨端必传资产', () => {
   const runtimeFoundation = readFileSync(new URL('../yuqi-runtime/presets/al-combined-rp.md', import.meta.url), 'utf8').trim();
-  const runtimeCore = readFileSync(new URL('../yuqi-runtime/presets/yuqi-core.md', import.meta.url), 'utf8').trim();
   const browserCore = readFileSync(new URL('../tavern-app/lib/yuqi-core-preset.js', import.meta.url), 'utf8').trim();
   assert.equal(runtimeFoundation.replaceAll('\\n', '\n'), prompt.replaceAll('\\n', '\n').trim());
   assert.equal(browserCore, `globalThis.AL_YUQI_CORE_PROMPT = ${JSON.stringify(runtimeCore)};`);
   assert.match(source, /<script src="\.\/lib\/yuqi-core-preset\.js"><\/script>\s*<script>/);
+});
+
+test('动态关系阶段是虞栖当前关系的唯一权威', () => {
+  assert.doesNotMatch(runtimeCore, /目前双方处于初识阶段/);
+  assert.match(runtimeCore, /scene\.relationshipStage[\s\S]*唯一[\s\S]*当前关系/);
+});
+
+test('关系复核明确按跨时段累计互动推进各长期阶段', () => {
+  assert.match(memoryManager, /最近 200 条[\s\S]*累计/);
+  assert.match(memoryManager, /初识[^]*两个不同(?:的)?时段[^]*认识/);
+  assert.match(memoryManager, /认识[^]*三个不同(?:的)?时段[^]*熟悉/);
+  assert.match(memoryManager, /熟悉[^]*持续[^]*(?:信任|脆弱|优先级)[^]*亲近/);
+  assert.match(memoryManager, /关系确立[^]*双方明确确认/);
 });
 
 test('保留第一轮确认的聊天底座', () => {

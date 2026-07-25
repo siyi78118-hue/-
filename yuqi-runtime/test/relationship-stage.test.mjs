@@ -36,7 +36,7 @@ test('accepts an adjacent evidence-backed stage progression at the threshold', (
 
 test('rejects low confidence, fabricated evidence and a non-mutual multi-stage jump', () => {
   for (const review of [
-    { recommended: 'acquainted', confidence: 0.81, evidenceMessageIds: ['msg_1', 'msg_2'] },
+    { recommended: 'acquainted', confidence: 0.77, evidenceMessageIds: ['msg_1', 'msg_2'] },
     { recommended: 'acquainted', confidence: 0.99, evidenceMessageIds: ['msg_fake', 'msg_2'] },
     { recommended: 'close', confidence: 0.99, evidenceMessageIds: ['msg_1', 'msg_2'] }
   ]) {
@@ -141,4 +141,97 @@ test('sustained evidence permits an adjacent base regression', () => {
     phase: null
   }, messages, 3000);
   assert.equal(result.stage.base.id, 'acquainted');
+});
+
+test('uses progressively stricter confidence thresholds for deeper base stages', () => {
+  const catalog = scene.stageCatalog;
+  const cases = [
+    { from: 'new', to: 'acquainted', rejected: 0.77, accepted: 0.78 },
+    { from: 'acquainted', to: 'familiar', rejected: 0.79, accepted: 0.80 },
+    { from: 'familiar', to: 'close', rejected: 0.83, accepted: 0.84 }
+  ];
+  for (const row of cases) {
+    const currentScene = {
+      ...scene,
+      relationshipStage: { id: row.from, label: row.from, content: '' },
+      stageCatalog: catalog
+    };
+    const review = confidence => ({
+      current: row.from,
+      recommended: row.to,
+      confidence,
+      reason: '跨时段累计互动已经支持相邻阶段变化',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitMutualChange: false
+    });
+    assert.equal(resolveRelationshipStage(currentScene, review(row.rejected), messages, 3000).stage.id, row.from);
+    assert.equal(resolveRelationshipStage(currentScene, review(row.accepted), messages, 3000).stage.id, row.to);
+  }
+});
+
+test('entering committed requires explicit mutual confirmation and 0.88 confidence', () => {
+  const closeScene = {
+    ...scene,
+    relationshipStage: { id: 'close', label: '亲近', content: '' }
+  };
+  const review = (confidence, explicitMutualChange) => ({
+    current: 'close',
+    recommended: 'committed',
+    confidence,
+    reason: '双方明确确认稳定关系',
+    evidenceMessageIds: ['msg_1', 'msg_2'],
+    explicitMutualChange
+  });
+  assert.equal(resolveRelationshipStage(closeScene, review(0.95, false), messages, 3000).stage.id, 'close');
+  assert.equal(resolveRelationshipStage(closeScene, review(0.87, true), messages, 3000).stage.id, 'close');
+  assert.equal(resolveRelationshipStage(closeScene, review(0.88, true), messages, 3000).stage.id, 'committed');
+});
+
+test('phase changes follow the approved directed state graph', () => {
+  const phaseCatalog = [
+    { id: 'normal', label: '正常相处', content: '' },
+    { id: 'conflict', label: '闹矛盾期', content: '' },
+    { id: 'cooling', label: '冷却期', content: '' },
+    { id: 'repair', label: '修复期', content: '' }
+  ];
+  const resolve = (from, to, confidence = 0.80, explicitAcknowledgedChange = false, evidenceMessageIds = ['msg_1', 'msg_2']) =>
+    resolveRelationshipStage({
+      ...scene,
+      relationshipStage: {
+        base: { id: 'familiar', label: '熟悉', content: '' },
+        phase: { id: from, label: from, content: '' }
+      },
+      phaseCatalog
+    }, {
+      base: null,
+      phase: {
+        current: from,
+        recommended: to,
+        confidence,
+        reason: '原始消息显示当前相处状态已经发生变化',
+        evidenceMessageIds,
+        explicitAcknowledgedChange
+      }
+    }, messages, 3000).stage.phase.id;
+
+  for (const [from, to] of [
+    ['normal', 'conflict'],
+    ['conflict', 'cooling'],
+    ['conflict', 'repair'],
+    ['cooling', 'conflict'],
+    ['cooling', 'repair'],
+    ['repair', 'normal'],
+    ['repair', 'conflict'],
+    ['repair', 'cooling']
+  ]) assert.equal(resolve(from, to), to, `${from} -> ${to} should be allowed`);
+
+  for (const [from, to] of [
+    ['normal', 'cooling'],
+    ['normal', 'repair'],
+    ['conflict', 'normal'],
+    ['cooling', 'normal']
+  ]) assert.equal(resolve(from, to), from, `${from} -> ${to} should be rejected`);
+
+  assert.equal(resolve('normal', 'conflict', 0.79), 'normal');
+  assert.equal(resolve('normal', 'conflict', 0.78, true, ['msg_1']), 'conflict');
 });

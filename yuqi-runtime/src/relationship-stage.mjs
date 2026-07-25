@@ -70,6 +70,26 @@ function realEvidence(review, available) {
   )].filter(id => available.has(id)).slice(-12);
 }
 
+function baseConfidenceThreshold(currentId, targetId, ids) {
+  const currentIndex = ids.indexOf(currentId);
+  const targetIndex = ids.indexOf(targetId);
+  const depth = Math.max(currentIndex, targetIndex);
+  if (depth <= 1) return 0.78;
+  if (depth === 2) return 0.80;
+  if (depth === 3) return 0.84;
+  return 0.88;
+}
+
+function phaseTransitionAllowed(currentId, targetId) {
+  const graph = {
+    normal: new Set(['conflict']),
+    conflict: new Set(['cooling', 'repair']),
+    cooling: new Set(['conflict', 'repair']),
+    repair: new Set(['normal', 'conflict', 'cooling'])
+  };
+  return graph[currentId]?.has(targetId) === true;
+}
+
 function resolveBase(current, catalog, review, available, now) {
   if (!review || typeof review !== 'object' || Array.isArray(review)) return { value: current, action: null };
   const ids = catalog.map(item => item.id);
@@ -78,12 +98,14 @@ function resolveBase(current, catalog, review, available, now) {
   const evidenceMessageIds = realEvidence(review, available);
   const explicitMutualChange = review.explicitMutualChange === true;
   const reason = String(review.reason || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+  const threshold = baseConfidenceThreshold(current.id, recommended, ids);
   if (
     !ids.includes(recommended)
     || recommended === current.id
-    || confidence < 0.82
+    || confidence < threshold
     || evidenceMessageIds.length < (explicitMutualChange ? 1 : 2)
     || (!explicitMutualChange && Math.abs(ids.indexOf(recommended) - ids.indexOf(current.id)) > 1)
+    || (recommended === 'committed' && !explicitMutualChange)
     || !reason
   ) return { value: current, action: null };
   const target = catalog.find(item => item.id === recommended);
@@ -116,14 +138,14 @@ function resolvePhase(current, catalog, review, available, now) {
   const evidenceMessageIds = realEvidence(review, available);
   const explicitAcknowledgedChange = review.explicitAcknowledgedChange === true;
   const reason = String(review.reason || '').replace(/\s+/g, ' ').trim().slice(0, 500);
-  const skipsRepair = current.id === 'conflict' && recommended === 'normal';
+  const threshold = explicitAcknowledgedChange ? 0.78 : 0.80;
   if (
     !ids.includes(recommended)
     || recommended === current.id
-    || confidence < 0.82
+    || confidence < threshold
     || evidenceMessageIds.length < (explicitAcknowledgedChange ? 1 : 2)
     || !reason
-    || skipsRepair
+    || !phaseTransitionAllowed(current.id, recommended)
   ) return { value: current, action: null };
   const target = catalog.find(item => item.id === recommended);
   const value = {

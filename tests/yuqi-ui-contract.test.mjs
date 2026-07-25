@@ -55,6 +55,17 @@ test('normal direct and background context is 200 raw messages', () => {
   assert.doesNotMatch(html, /固定最近30条|最近30条聊天会完整提供/);
 });
 
+test('private proactive chat uses the approved higher consideration cadence on foreground and worker paths', () => {
+  for (const source of [html, worker]) {
+    assert.match(source, /const PROACTIVE_DICE_INTERVAL_MS = 10 \* 60 \* 1000;/);
+    assert.match(source, /const PROACTIVE_DICE_CHANCE = 0\.15;/);
+    assert.match(source, /const PROACTIVE_DICE_MAX_ROLLS = 144;/);
+    assert.match(source, /const MOMENT_DICE_INTERVAL_MS = 2 \* 60 \* 60 \* 1000;/);
+    assert.match(source, /const MOMENT_DICE_CHANCE = 0\.20;/);
+    assert.match(source, /const MOMENT_DICE_MAX_ROLLS = 12;/);
+  }
+});
+
 test('Yuqi begins at first acquaintance without a Xu Mi memory migration', () => {
   assert.match(html, /YUQI_FIRST_ACQUAINTANCE/);
   assert.match(html, /双方的手机意外建立了与另一个平行世界的联系/);
