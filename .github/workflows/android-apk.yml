@@ -16,6 +16,9 @@ on:
     paths:
       - "android/**"
       - "tavern-app/**"
+      - "yuqi-runtime/**"
+      - "tests/**"
+      - "test-basic.mjs"
       - "capacitor.config.json"
       - "package.json"
       - "package-lock.json"
