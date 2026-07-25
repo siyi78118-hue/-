@@ -111,6 +111,57 @@ const conversationFrameSchema = objectSchema({
   'needsNuanceReview'
 ]);
 
+const rewriteResolutionSchema = objectSchema({
+  resolvedIssueIds: stringArray(),
+  resolutionNotes: {
+    type: 'array',
+    items: objectSchema({
+      issueId: { type: 'string' },
+      strategy: { type: 'string' },
+      result: { type: 'string' }
+    }, ['issueId', 'strategy', 'result'])
+  },
+  formedCharacterFacts: {
+    type: 'array',
+    items: objectSchema({
+      predicate: {
+        type: 'string',
+        enum: [
+          'currently_reading',
+          'current_meal',
+          'current_activity',
+          'minor_preference',
+          'minor_encounter',
+          'daily_detail'
+        ]
+      },
+      summary: { type: 'string' },
+      detailsJson: { type: 'string' },
+      evidenceQuote: { type: 'string' }
+    }, ['predicate', 'summary', 'detailsJson', 'evidenceQuote'])
+  }
+}, ['resolvedIssueIds', 'resolutionNotes', 'formedCharacterFacts']);
+
+const supervisorIssueSchema = objectSchema({
+  issueId: { type: 'string' },
+  code: { type: 'string' },
+  severity: { type: 'string', enum: ['hard', 'soft'] },
+  message: { type: 'string' },
+  mustPreserve: stringArray(),
+  mustChange: stringArray(),
+  allowedStrategies: stringArray(),
+  acceptanceCriteria: stringArray()
+}, [
+  'issueId',
+  'code',
+  'severity',
+  'message',
+  'mustPreserve',
+  'mustChange',
+  'allowedStrategies',
+  'acceptanceCriteria'
+]);
+
 export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
   memory: objectSchema({
     query: { type: 'string' },
@@ -163,19 +214,21 @@ export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
       endAt: { anyOf: [{ type: 'number' }, { type: 'null' }] },
       reason: { type: 'string' }
     }, ['type', 'targetEpisodeId', 'startAt', 'endAt', 'reason']), { type: 'null' }] },
-    rolePlanOperationsJson: { type: 'string' }
+    rolePlanOperationsJson: { type: 'string' },
+    rewriteResolution: {
+      anyOf: [rewriteResolutionSchema, { type: 'null' }]
+    }
   }, [
     'action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction', 'lifePlan', 'lifeAdjustment',
-    'rolePlanOperationsJson'
+    'rolePlanOperationsJson', 'rewriteResolution'
   ]),
   supervisor: objectSchema({
     decision: { type: 'string', enum: ['approve', 'rewrite', 'skip', 'reject'] },
+    reviewedIssueIds: stringArray(),
+    resolvedIssueIds: stringArray(),
     issues: {
       type: 'array',
-      items: objectSchema({
-        code: { type: 'string' },
-        message: { type: 'string' }
-      }, ['code', 'message'])
+      items: supervisorIssueSchema
     }
-  }, ['decision', 'issues'])
+  }, ['decision', 'reviewedIssueIds', 'resolvedIssueIds', 'issues'])
 });
