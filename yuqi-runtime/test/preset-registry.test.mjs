@@ -25,7 +25,7 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.8.2');
+  assert.equal(current.version, '1.8.3');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
@@ -64,7 +64,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.8.2');
+    assert.equal(registry.current().version, '1.8.3');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -128,6 +128,20 @@ test('memory stays isolated while supervisor receives the authoritative generati
   assert.doesNotMatch(supervisor, /候选事实抽取格式/);
 }));
 
+test('brain and supervisor presets define an executable closed rewrite handshake', () => withRegistry(registry => {
+  const brain = registry.compileFor('brain', { stage: 'initial' });
+  const supervisor = registry.compileFor('supervisor', { stage: 'initial' });
+
+  assert.match(brain, /rewriteContract/);
+  assert.match(brain, /rewriteResolution/);
+  assert.match(brain, /formedCharacterFacts/);
+  assert.match(supervisor, /mustPreserve/);
+  assert.match(supervisor, /allowedStrategies/);
+  assert.match(supervisor, /acceptanceCriteria/);
+  assert.match(supervisor, /不得.*新增.*软性问题|软性问题.*不得.*新增/s);
+  assert.match(supervisor, /直接私聊.*必须.*可发送|可发送.*直接私聊/s);
+}));
+
 test('publishes an annotation as a child version and can roll back immutably', () => withRegistry((registry, store) => {
   const proposal = registry.proposeAnnotation({
     annotationId: 'ann_1',
@@ -139,16 +153,16 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.8.3');
-  assert.equal(published.parentVersion, '1.8.2');
+  assert.equal(published.version, '1.8.4');
+  assert.equal(published.parentVersion, '1.8.3');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 2);
 
-  const rollback = registry.rollback('1.8.2');
-  assert.equal(rollback.version, '1.8.4');
-  assert.equal(rollback.parentVersion, '1.8.3');
-  assert.equal(rollback.rollbackOf, '1.8.2');
+  const rollback = registry.rollback('1.8.3');
+  assert.equal(rollback.version, '1.8.5');
+  assert.equal(rollback.parentVersion, '1.8.4');
+  assert.equal(rollback.rollbackOf, '1.8.3');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 3);
 }));
