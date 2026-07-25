@@ -118,7 +118,7 @@ test('pins the approved model, high effort, and a strict schema for every brain 
   assert.equal(started.params.effort, 'high');
   assert.deepEqual(started.params.outputSchema.required, [
     'action', 'reply', 'paymentAction', 'usedFactIds', 'momentAction', 'lifePlan', 'lifeAdjustment',
-    'rolePlanOperationsJson'
+    'rolePlanOperationsJson', 'rewriteResolution'
   ]);
   assert.equal(started.params.outputSchema.additionalProperties, false);
   assert.deepEqual(started.params.outputSchema.properties.action.enum, ['send', 'skip']);
@@ -127,6 +127,10 @@ test('pins the approved model, high effort, and a strict schema for every brain 
     'type', 'targetEpisodeId', 'startAt', 'endAt', 'reason'
   ]);
   assert.equal(started.params.outputSchema.properties.rolePlanOperationsJson.type, 'string');
+  assert.deepEqual(
+    started.params.outputSchema.properties.rewriteResolution.anyOf[0].required,
+    ['resolvedIssueIds', 'resolutionNotes', 'formedCharacterFacts']
+  );
 }));
 
 test('memory candidate objects use the strict nested schema required by the real App Server', async () => fixture(async ({ client, logFile }) => {
