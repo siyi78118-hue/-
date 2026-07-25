@@ -500,6 +500,40 @@ test('requeues a transient brain timeout from the completed memory checkpoint', 
   assert.equal(store.requeueTransientFailedTurn(turn.turnId).requeued, false);
 }));
 
+test('requeues a usage-limit failure only after an explicit operator recovery', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  store.claimTurnById(turn.turnId, 'worker-a');
+  store.advanceTurn(turn.turnId, 'memory_running', 'memory_done', {
+    memoryPacketJson: JSON.stringify({ query: '接受红包吗？', candidates: [] })
+  });
+  store.advanceTurn(turn.turnId, 'memory_done', 'brain_running');
+  store.advanceTurn(turn.turnId, 'brain_running', 'failed', {
+    errorJson: JSON.stringify({
+      name: 'CodexTurnError',
+      message: "You've hit your usage limit. Try again later."
+    })
+  });
+  store.registerCloudDelivery(turn.turnId, 'phone_peer', 42);
+  const failedDelivery = store.prepareCloudDelivery(turn.turnId, 'phone_peer', {
+    turnId: turn.turnId, state: 'failed', terminal: true
+  });
+  store.markCloudDeliveryAttempt(turn.turnId, 'phone_peer');
+  store.markCloudDeliveryMailboxed(turn.turnId, 'phone_peer', failedDelivery.checksum);
+
+  const recovered = store.requeueUsageLimitFailedTurn(turn.turnId);
+  const saved = store.getTurn(turn.turnId);
+  const [delivery] = store.listCloudDeliveries(turn.turnId);
+
+  assert.equal(recovered.requeued, true);
+  assert.equal(saved.state, 'memory_done');
+  assert.deepEqual(JSON.parse(saved.memoryPacketJson), { query: '接受红包吗？', candidates: [] });
+  assert.equal(saved.errorJson, null);
+  assert.equal(delivery.state, 'waiting');
+  assert.equal(delivery.recoveryAckSeq, 42);
+  assert.equal(delivery.checksum, '');
+  assert.equal(delivery.attempts, 0);
+}));
+
 test('does not requeue a permanent orchestration failure', () => withStore(({ store }) => {
   const turn = store.submitTurn(validV2Envelope());
   store.claimTurnById(turn.turnId, 'worker-a');

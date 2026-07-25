@@ -703,6 +703,50 @@ export class YuqiStore {
     });
   }
 
+  requeueUsageLimitFailedTurn(turnId) {
+    const current = this.getTurn(turnId);
+    if (!current) throw new Error('turn not found');
+    if (current.state !== 'failed') return { requeued: false, turn: current };
+    const failure = parseJson(current.errorJson, {});
+    const isUsageLimit = String(failure?.name || '') === 'CodexTurnError'
+      && /(?:usage limit|purchase more credits|额度)/i.test(String(failure?.message || ''));
+    if (!isUsageLimit) return { requeued: false, turn: current };
+
+    const checkpoint = current.brainDraftJson
+      ? 'brain_done'
+      : current.memoryPacketJson
+        ? 'memory_done'
+        : 'queued';
+
+    return this.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE turns
+        SET state = ?, worker_id = NULL, error_json = NULL,
+            brain_draft_json = CASE WHEN ? = 'memory_done' OR ? = 'queued' THEN NULL ELSE brain_draft_json END,
+            supervisor_json = NULL, reply_json = NULL, updated_at = ?
+        WHERE turn_id = ? AND state = 'failed'
+      `).run(checkpoint, checkpoint, checkpoint, now(), turnId);
+      if (Number(result.changes) !== 1) {
+        return { requeued: false, turn: this.getTurn(turnId) };
+      }
+      this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'waiting', payload_json = NULL, checksum = NULL, attempts = 0,
+            updated_at = ?, delivered_at = NULL, confirmed_at = NULL
+        WHERE turn_id = ?
+      `).run(now(), turnId);
+      const savedTurn = this.getTurn(turnId);
+      this.appendSync('turn', turnId, 'state', savedTurn);
+      this.putDiagnostic({
+        turnId,
+        stage: 'usage_limit_turn_requeued',
+        level: 'info',
+        detail: { checkpoint, failure }
+      });
+      return { requeued: true, turn: savedTurn };
+    });
+  }
+
   prepareCloudDelivery(turnId, peerId, payload) {
     const payloadJson = canonicalJson(payload);
     const checksum = contentHash(payload);
