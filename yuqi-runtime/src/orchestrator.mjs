@@ -7,6 +7,13 @@ import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stag
 import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
 import { buildGenerationWindow } from './conversation-context.mjs';
 import { LifeSimulationCoordinator } from './life-simulation.mjs';
+import {
+  characterFactCandidatesForReply,
+  hasHighPriorityIssues,
+  normalizeRewriteResolution,
+  normalizeSupervisorResult,
+  rewriteContractForBrain
+} from './rewrite-contract.mjs';
 
 function parseRoleJson(text, role) {
   const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
@@ -81,6 +88,7 @@ export function normalizeBrainDraft(draft) {
         }
       : null,
     usedFactIds: Array.isArray(draft?.usedFactIds) ? draft.usedFactIds.map(String) : [],
+    rewriteResolution: normalizeRewriteResolution(draft?.rewriteResolution),
     rolePlanOperations: normalizeRolePlanOperations(
       draft?.rolePlanOperationsJson ?? draft?.rolePlanOperations
     )
@@ -133,14 +141,6 @@ export function isAutomaticKind(kind) {
     'ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE',
     'PROACTIVE_CHAT', 'PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'
   ].includes(kind);
-}
-
-function normalizeSupervisorResult(reviewed) {
-  const legacyDecision = reviewed?.approved === true ? 'approve' : reviewed?.approved === false ? 'rewrite' : null;
-  const decision = ['approve', 'rewrite', 'skip', 'reject'].includes(reviewed?.decision)
-    ? reviewed.decision
-    : legacyDecision || 'reject';
-  return { ...reviewed, decision, approved: decision === 'approve' };
 }
 
 function normalizeConversationFrame(frame) {
@@ -633,7 +633,10 @@ export class YuqiOrchestrator {
       limit: 12
     });
     const previousSupervisor = current.supervisorJson
-      ? normalizeSupervisorResult(parseRoleJson(current.supervisorJson, 'supervisor'))
+      ? normalizeSupervisorResult(parseRoleJson(current.supervisorJson, 'supervisor'), {
+          attempt: Number(parseRoleJson(current.supervisorJson, 'supervisor').attempt || 1),
+          direct: !isAutomaticKind(envelope.kind)
+        })
       : null;
     const previousDraft = current.brainDraftJson ? parseRoleJson(current.brainDraftJson, 'brain') : null;
     const brainRequest = {
@@ -653,7 +656,8 @@ export class YuqiOrchestrator {
       conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
       ...(previousSupervisor?.decision === 'rewrite' ? {
         rejectedDraft: previousDraft,
-        supervisorIssues: Array.isArray(previousSupervisor.issues) ? previousSupervisor.issues : []
+        supervisorIssues: Array.isArray(previousSupervisor.issues) ? previousSupervisor.issues : [],
+        rewriteContract: rewriteContractForBrain(previousSupervisor)
       } : {})
     };
     const attempt = Number(previousSupervisor?.attempt || 0) + 1;
@@ -686,7 +690,13 @@ export class YuqiOrchestrator {
       keywords: memoryPacket.keywords,
       limit: 12
     });
-    const previous = current.supervisorJson ? parseRoleJson(current.supervisorJson, 'supervisor') : null;
+    const previousRaw = current.supervisorJson ? parseRoleJson(current.supervisorJson, 'supervisor') : null;
+    const previous = previousRaw
+      ? normalizeSupervisorResult(previousRaw, {
+          attempt: Number(previousRaw.attempt || 1),
+          direct: !isAutomaticKind(envelope.kind)
+        })
+      : null;
     const attempt = Number(previous?.attempt || 0) + 1;
     const supervisorRequest = {
       task: 'review_yuqi_reply',
@@ -700,14 +710,20 @@ export class YuqiOrchestrator {
       lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
       evidencePack,
       conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
-      draft
+      draft,
+      previousReview: previous,
+      rewriteResolution: draft.rewriteResolution
     };
     const reviewed = await this.runStructuredRole(
       'supervisor', supervisorRequest, `${envelope.turnId}_supervisor_${attempt}`,
       roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
       `supervisor_${attempt}`
     );
-    const supervisorResult = { ...normalizeSupervisorResult(reviewed), attempt };
+    const supervisorResult = normalizeSupervisorResult(reviewed, {
+      attempt,
+      previous,
+      direct: !isAutomaticKind(envelope.kind)
+    });
     if (supervisorResult.decision === 'approve') {
       this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
         supervisorJson: JSON.stringify(supervisorResult)
@@ -746,7 +762,38 @@ export class YuqiOrchestrator {
         });
         return;
       }
-      throw new Error('supervisor rejected the reply after three rewrites');
+      if (hasHighPriorityIssues(supervisorResult) && attempt === 3) {
+        this.store.putDiagnostic({
+          turnId: envelope.turnId,
+          stage: 'hard_repair_requested',
+          level: 'warning',
+          detail: {
+            attempt,
+            issueIds: supervisorResult.issues.map(issue => issue.issueId)
+          }
+        });
+        this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'brain_running', {
+          supervisorJson: JSON.stringify({ ...supervisorResult, finalHardRepair: true })
+        });
+        return;
+      }
+      const fallbackStage = hasHighPriorityIssues(supervisorResult)
+        ? 'hard_repair_fallback_selected'
+        : 'soft_issue_fallback_selected';
+      this.store.putDiagnostic({
+        turnId: envelope.turnId,
+        stage: fallbackStage,
+        level: 'warning',
+        detail: {
+          attempt,
+          issueIds: supervisorResult.issues.map(issue => issue.issueId),
+          selectedDraft: draft.reply
+        }
+      });
+      this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
+        supervisorJson: JSON.stringify({ ...supervisorResult, fallbackSelected: true })
+      });
+      return;
     }
     this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'brain_running', {
       supervisorJson: JSON.stringify(supervisorResult)
@@ -874,7 +921,7 @@ export class YuqiOrchestrator {
       sentAt: this.clock(),
       origin: 'codex'
     };
-    return this.store.transaction(() => {
+    const committedResult = this.store.transaction(() => {
       if (draft.lifePlan?.episodes?.length) {
         this.store.putLifePlanInternal(envelope.characterId, draft.lifePlan.episodes, {
           sourceTurnId: envelope.turnId
@@ -910,6 +957,14 @@ export class YuqiOrchestrator {
       });
       return result;
     });
+    const formedCharacterFacts = characterFactCandidatesForReply(
+      draft.rewriteResolution,
+      committedResult.reply
+    );
+    if (formedCharacterFacts.length) {
+      commitVerifiedFacts(this.store, formedCharacterFacts, [committedResult.reply]);
+    }
+    return committedResult;
   }
 
   cancel(turnId) {

@@ -76,7 +76,7 @@ export function normalizeSupervisorResult(reviewed, {
   let decision = ['approve', 'rewrite', 'skip', 'reject'].includes(reviewed?.decision)
     ? reviewed.decision
     : legacyDecision || 'reject';
-  if (direct && decision === 'reject') decision = 'rewrite';
+  if (direct && ['reject', 'skip'].includes(decision)) decision = 'rewrite';
 
   const occurrences = new Map();
   const issues = [];

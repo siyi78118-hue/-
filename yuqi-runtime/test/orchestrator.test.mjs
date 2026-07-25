@@ -628,6 +628,153 @@ test('supervisor rejection asks the brain to rewrite once under the same preset'
   });
 });
 
+test('supervisor gives the next brain an executable stable rewrite contract and reviews its resolution', async () => {
+  await withFixture({
+    memory: ['{"query":"看什么书","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"reply":"一本悬疑小说。","usedFactIds":[]}',
+      JSON.stringify({
+        reply: '我在看《长夜难明》，刚翻到一半。',
+        usedFactIds: [],
+        rewriteResolution: {
+          resolvedIssueIds: ['CURRENT_INTERACTION_MISS:1'],
+          resolutionNotes: [{
+            issueId: 'CURRENT_INTERACTION_MISS:1',
+            strategy: '补全虞栖自己的低风险生活细节',
+            result: '已经正面回答书名'
+          }],
+          formedCharacterFacts: [{
+            predicate: 'currently_reading',
+            summary: '虞栖正在读《长夜难明》',
+            detailsJson: '{"title":"长夜难明"}',
+            evidenceQuote: '我在看《长夜难明》'
+          }]
+        }
+      })
+    ],
+    supervisor: [
+      JSON.stringify({
+        decision: 'rewrite',
+        reviewedIssueIds: [],
+        resolvedIssueIds: [],
+        issues: [{
+          issueId: 'CURRENT_INTERACTION_MISS:1',
+          code: 'CURRENT_INTERACTION_MISS',
+          severity: 'soft',
+          message: '没有回答书名',
+          mustPreserve: ['不编造用户事实'],
+          mustChange: ['回答虞栖正在看的书'],
+          allowedStrategies: ['补全虞栖自己的低风险生活细节'],
+          acceptanceCriteria: ['正文出现具体书名']
+        }]
+      }),
+      JSON.stringify({
+        decision: 'approve',
+        reviewedIssueIds: ['CURRENT_INTERACTION_MISS:1'],
+        resolvedIssueIds: ['CURRENT_INTERACTION_MISS:1'],
+        issues: []
+      })
+    ]
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(401, '你答应过如实说，现在在看什么书？'));
+    const brainCalls = codex.calls.filter(call => call.role === 'brain');
+    const supervisorCalls = codex.calls.filter(call => call.role === 'supervisor');
+
+    assert.equal(
+      brainCalls[1].input.rewriteContract.issues[0].issueId,
+      'CURRENT_INTERACTION_MISS:1'
+    );
+    assert.deepEqual(
+      supervisorCalls[1].input.rewriteResolution.resolvedIssueIds,
+      ['CURRENT_INTERACTION_MISS:1']
+    );
+    assert.equal(result.reply.content, '我在看《长夜难明》，刚翻到一半。');
+    assert.equal(
+      store.listFacts('yuqi', { status: 'verified' })
+        .some(fact => fact.predicate === 'currently_reading'),
+      true
+    );
+  });
+});
+
+test('three soft supervisor rewrites never swallow a direct reply', async () => {
+  const issue = message => JSON.stringify({
+    decision: 'rewrite',
+    reviewedIssueIds: ['CURRENT_INTERACTION_MISS:1'],
+    resolvedIssueIds: [],
+    issues: [{
+      issueId: 'CURRENT_INTERACTION_MISS:1',
+      code: 'CURRENT_INTERACTION_MISS',
+      severity: 'soft',
+      message,
+      mustPreserve: ['不编造用户事实'],
+      mustChange: ['直接回应'],
+      allowedStrategies: ['用虞栖自己的自然口吻回答'],
+      acceptanceCriteria: ['可见正文回应当前消息']
+    }]
+  });
+  await withFixture({
+    memory: ['{"query":"如实汇报","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"reply":"第一版。","usedFactIds":[]}',
+      '{"reply":"第二版。","usedFactIds":[]}',
+      '{"reply":"第三版，已经直接回答。","usedFactIds":[]}'
+    ],
+    supervisor: [
+      issue('还不够直接'),
+      issue('仍需调整'),
+      issue('还可以更自然')
+    ]
+  }, async ({ store, orchestrator }) => {
+    const result = await orchestrator.process(envelope(402, '你答应过如实汇报'));
+    const diagnostic = store.db.prepare(
+      'SELECT stage FROM diagnostics WHERE turn_id = ? ORDER BY diagnostic_id DESC LIMIT 1'
+    ).get(result.turnId);
+
+    assert.equal(result.reply.content, '第三版，已经直接回答。');
+    assert.equal(store.getTurn(result.turnId).state, 'committed');
+    assert.equal(diagnostic.stage, 'soft_issue_fallback_selected');
+  });
+});
+
+test('a direct hard issue gets one final repair and still returns a complete visible reply', async () => {
+  const issue = JSON.stringify({
+    decision: 'rewrite',
+    reviewedIssueIds: ['SPEAKER_ATTRIBUTION:1'],
+    resolvedIssueIds: [],
+    issues: [{
+      issueId: 'SPEAKER_ATTRIBUTION:1',
+      code: 'SPEAKER_ATTRIBUTION',
+      severity: 'hard',
+      message: '说话者归属仍需修复',
+      mustPreserve: ['当前问题'],
+      mustChange: ['只用虞栖自身口吻陈述'],
+      allowedStrategies: ['删除错误归属并重写'],
+      acceptanceCriteria: ['没有把虞栖的话挂到用户头上']
+    }]
+  });
+  await withFixture({
+    memory: ['{"query":"你刚说什么","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"reply":"第一版。","usedFactIds":[]}',
+      '{"reply":"第二版。","usedFactIds":[]}',
+      '{"reply":"第三版。","usedFactIds":[]}',
+      '{"reply":"我刚才说的是：我会认真听你讲。","usedFactIds":[]}'
+    ],
+    supervisor: [issue, issue, issue, issue]
+  }, async ({ store, codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(403, '你答应过认真听，你刚刚说什么？'));
+    const stages = store.db.prepare(
+      'SELECT stage FROM diagnostics WHERE turn_id = ? ORDER BY diagnostic_id ASC'
+    ).all(result.turnId).map(row => row.stage);
+
+    assert.equal(result.reply.content, '我刚才说的是：我会认真听你讲。');
+    assert.equal(codex.calls.filter(call => call.role === 'brain').length, 4);
+    assert.ok(stages.includes('hard_repair_requested'));
+    assert.ok(stages.includes('hard_repair_fallback_selected'));
+  });
+});
+
 test('a third supervisor rejection vetoes an automatic message instead of force-sending it', async () => {
   await withFixture({
     memory: ['{"query":"hello","keywords":[],"candidates":[]}'],
