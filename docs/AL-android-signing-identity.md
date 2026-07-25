@@ -8,7 +8,7 @@
 - SHA-1：`a8dd34425dbe211eb04296248cbc1cf79f90d45d`
 - MD5：`85170fe0cfb129a7e2d9c2fe92f32e18`
 - 公钥：RSA 3072 位
-- APK 签名方案：v2、v3
+- 当前正式 APK 签名方案：v2
 
 ## 发布硬性要求
 

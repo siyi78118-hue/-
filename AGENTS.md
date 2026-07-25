@@ -22,3 +22,10 @@
 - 本机工具快捷方式存放在 `shortcuts/`。
 - 桌面只保留用户明确需要放在桌面的备份，以及用户原有文件；不得把一般项目产物堆放在桌面。
 - 不移动、删除或覆盖无法确认归属的用户文件。
+
+## Android 正式签名
+
+- 正式可覆盖安装 APK 必须遵循 `docs/AL-android-signing-runbook.md`。
+- 默认不依赖 GitHub Connector、浏览器登录或 `gh` CLI；使用本机已有 GitHub 凭据和 GitHub REST API 触发、监督、下载固定证书构建产物。
+- 本机没有正式私钥时，不得把普通未签名 APK、调试签名 APK 或临时证书 APK 冒充正式包。
+- 交付前必须核对包名、versionCode、versionName、APK 签名有效性、正式证书 SHA-256 以及文件 SHA-256。
