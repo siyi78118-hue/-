@@ -117,6 +117,31 @@ function withFixture(outputs, run, {
   });
 }
 
+function commitProactiveResult(store, seq, action = 'skip') {
+  const saved = store.submitTurn(triggerEnvelope(seq));
+  store.claimTurnById(saved.turnId, 'history-worker');
+  store.advanceTurn(saved.turnId, 'memory_running', 'memory_done', {
+    memoryPacketJson: JSON.stringify({ query: 'historical proactive task' })
+  });
+  store.advanceTurn(saved.turnId, 'memory_done', 'brain_running');
+  store.advanceTurn(saved.turnId, 'brain_running', 'brain_done', {
+    brainDraftJson: JSON.stringify({
+      action,
+      reply: action === 'skip' ? '' : '之前发出的一条主动消息',
+      usedFactIds: []
+    })
+  });
+  store.advanceTurn(saved.turnId, 'brain_done', 'approved');
+  store.advanceTurn(saved.turnId, 'approved', 'committed', {
+    replyJson: JSON.stringify({
+      turnId: saved.turnId,
+      action,
+      reply: action === 'skip' ? null : { content: '之前发出的一条主动消息' }
+    })
+  });
+  return saved;
+}
+
 test('chat brain plans the next life window only when the approved horizon is short', async () => {
   const startAt = 1784400000000;
   await withFixture({
@@ -858,6 +883,31 @@ test('an automatic brain may deliberately stay silent', async () => {
   });
 });
 
+test('proactive skip budget rewrites a forbidden brain skip into a visible message', async () => {
+  await withFixture({
+    memory: ['{"query":"check in","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"action":"skip","reply":"","usedFactIds":[]}',
+      '{"action":"send","reply":"我刚忙完，忽然想起你。","usedFactIds":[],"rewriteResolution":{"resolvedIssueIds":["PROACTIVE_DELIVERY_REQUIRED:1"]}}'
+    ],
+    supervisor: ['{"decision":"approve","approved":true,"issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    commitProactiveResult(store, 70, 'skip');
+
+    const result = await orchestrator.process(triggerEnvelope(71));
+    const brainCalls = codex.calls.filter(call => call.role === 'brain');
+
+    assert.equal(brainCalls[0].input.deliveryPolicy.skipAllowed, false);
+    assert.equal(brainCalls[1].input.task, 'rewrite_as_yuqi');
+    assert.equal(
+      brainCalls[1].input.rewriteContract.issues[0].code,
+      'PROACTIVE_DELIVERY_REQUIRED'
+    );
+    assert.equal(result.action, 'send');
+    assert.equal(result.reply.content, '我刚忙完，忽然想起你。');
+  });
+});
+
 test('moment interaction is handled by the chat brain as a structured phone action, not a private message', async () => {
   const momentTurn = triggerEnvelope(96);
   momentTurn.kind = 'MOMENT_INTERACTION';
@@ -899,6 +949,7 @@ test('a proactive moment is returned as a public post without entering private-c
     const brain = codex.calls.find(call => call.role === 'brain').input;
     assert.equal(result.reply.content, '下班路上的风，终于有点像夏天了。');
     assert.match(brain.preset, /朋友圈动态正文/);
+    assert.equal(brain.deliveryPolicy, undefined);
     assert.equal(store.listMessages('yuqi').filter(message => message.speakerId === 'yuqi').length, 0);
   });
 });
@@ -1008,6 +1059,8 @@ test('a scheduled role-plan turn exposes the exact plan occurrence to brain and 
     assert.equal(brain.currentRolePlanExecution.plan.planId, 'plan_tea');
     assert.equal(brain.currentRolePlanExecution.occurrence.occurrenceId, 'plan_tea:1784400000067');
     assert.equal(supervisor.currentRolePlanExecution.plan.intent, '提醒用户喝茶');
+    assert.equal(brain.deliveryPolicy, undefined);
+    assert.equal(supervisor.deliveryPolicy, undefined);
   }, { clock: () => 1784400300067 });
 });
 

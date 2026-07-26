@@ -285,6 +285,23 @@ function hasLifeDecision(draft) {
   );
 }
 
+function proactiveDeliveryRewrite(previous = null, attempt = 1, originalDecision = 'skip') {
+  return normalizeSupervisorResult({
+    decision: 'rewrite',
+    approved: false,
+    originalDecision,
+    issues: [{
+      code: 'PROACTIVE_DELIVERY_REQUIRED',
+      severity: 'soft',
+      message: '本轮主动私聊需要形成自然可见正文，不要以沉默结束',
+      mustPreserve: ['事实、身份、时间、关系状态和生活连续性'],
+      mustChange: ['把空草稿改成虞栖此刻真实想发的一条消息'],
+      allowedStrategies: ['分享生活片段', '自然换话题', '轻量试探', '重新开口'],
+      acceptanceCriteria: ['reply 是非空可见正文', '不解释系统规则']
+    }]
+  }, { attempt, previous, direct: false });
+}
+
 export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
@@ -321,6 +338,34 @@ export class YuqiOrchestrator {
       return this.store.setTurnRoute(submitted.turnId, decision.route, decision.reasons);
     }
     return submitted;
+  }
+
+  deliveryPolicyFor(envelope) {
+    if (envelope.kind !== 'PROACTIVE_CHAT') return null;
+    try {
+      return this.store.getProactiveChatDeliveryPolicy(envelope.characterId);
+    } catch (error) {
+      const fallback = {
+        kind: 'proactive_chat',
+        windowSize: 4,
+        maxSkips: 1,
+        usedSkips: 0,
+        skipAllowed: true,
+        inspectedTurnIds: [],
+        resetAfterTurnId: null
+      };
+      this.store.putDiagnostic({
+        turnId: envelope.turnId,
+        stage: 'proactive_delivery_policy',
+        level: 'warning',
+        detail: {
+          action: 'policy_read_failed',
+          message: error.message,
+          skipAllowed: true
+        }
+      });
+      return fallback;
+    }
   }
 
   async process(envelope) {
@@ -453,6 +498,38 @@ export class YuqiOrchestrator {
           let draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
           if (draft.action === 'skip' && !isAutomaticKind(envelope.kind)) {
             draft = { ...draft, action: 'send', reply: repairReplyForDelivery('', envelope.kind) };
+          }
+          const deliveryPolicy = this.deliveryPolicyFor(envelope);
+          if (draft.action === 'skip' && deliveryPolicy?.skipAllowed === false) {
+            const previousRaw = current.supervisorJson
+              ? parseRoleJson(current.supervisorJson, 'supervisor')
+              : null;
+            const previous = previousRaw
+              ? normalizeSupervisorResult(previousRaw, {
+                  attempt: Number(previousRaw.attempt || 1),
+                  direct: false
+                })
+              : null;
+            const review = proactiveDeliveryRewrite(
+              previous,
+              Number(previous?.attempt || 0) + 1,
+              'brain_skip'
+            );
+            this.store.putDiagnostic({
+              turnId,
+              stage: 'proactive_skip_rewrite_requested',
+              level: 'warning',
+              detail: {
+                policy: deliveryPolicy,
+                modelDecision: 'skip',
+                rewriteAttempt: review.attempt
+              }
+            });
+            this.store.advanceTurn(turnId, 'brain_done', 'brain_running', {
+              brainDraftJson: JSON.stringify(draft),
+              supervisorJson: JSON.stringify(review)
+            });
+            continue;
           }
           if (draft.action === 'skip') {
             if (current.route === 'fast' && (hasLifeDecision(draft) || draft.rolePlanOperations.length)) {
@@ -639,6 +716,7 @@ export class YuqiOrchestrator {
         })
       : null;
     const previousDraft = current.brainDraftJson ? parseRoleJson(current.brainDraftJson, 'brain') : null;
+    const deliveryPolicy = this.deliveryPolicyFor(envelope);
     const brainRequest = {
       task: previousSupervisor?.decision === 'rewrite' ? 'rewrite_as_yuqi' : 'reply_as_yuqi',
       preset: this.presets.compileFor('brain', {
@@ -654,6 +732,7 @@ export class YuqiOrchestrator {
       lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
       evidencePack,
       conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
+      ...(deliveryPolicy ? { deliveryPolicy } : {}),
       ...(previousSupervisor?.decision === 'rewrite' ? {
         rejectedDraft: previousDraft,
         supervisorIssues: Array.isArray(previousSupervisor.issues) ? previousSupervisor.issues : [],
@@ -698,6 +777,7 @@ export class YuqiOrchestrator {
         })
       : null;
     const attempt = Number(previous?.attempt || 0) + 1;
+    const deliveryPolicy = this.deliveryPolicyFor(envelope);
     const supervisorRequest = {
       task: 'review_yuqi_reply',
       preset: this.presets.compileFor('supervisor', { scene: { ...scene, kind: envelope.kind } }),
@@ -710,6 +790,7 @@ export class YuqiOrchestrator {
       lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
       evidencePack,
       conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
+      ...(deliveryPolicy ? { deliveryPolicy } : {}),
       draft,
       previousReview: previous,
       rewriteResolution: draft.rewriteResolution
