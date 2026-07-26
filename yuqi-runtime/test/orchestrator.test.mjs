@@ -908,6 +908,87 @@ test('proactive skip budget rewrites a forbidden brain skip into a visible messa
   });
 });
 
+test('proactive skip budget turns a supervisor skip into actionable brain feedback', async () => {
+  await withFixture({
+    memory: ['{"query":"check in","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"action":"send","reply":"刚才想发点什么，又觉得算了。","usedFactIds":[]}',
+      '{"action":"send","reply":"忙完抬头的时候，窗外居然已经黑了。","usedFactIds":[],"rewriteResolution":{"resolvedIssueIds":["PROACTIVE_DELIVERY_REQUIRED:1"]}}'
+    ],
+    supervisor: [
+      '{"decision":"skip","approved":false,"issues":[]}',
+      '{"decision":"approve","approved":true,"issues":[]}'
+    ]
+  }, async ({ store, codex, orchestrator }) => {
+    commitProactiveResult(store, 72, 'skip');
+
+    const result = await orchestrator.process(triggerEnvelope(73));
+    const brainCalls = codex.calls.filter(call => call.role === 'brain');
+
+    assert.equal(brainCalls[1].input.task, 'rewrite_as_yuqi');
+    assert.equal(
+      brainCalls[1].input.supervisorIssues[0].code,
+      'PROACTIVE_DELIVERY_REQUIRED'
+    );
+    assert.equal(result.action, 'send');
+    assert.equal(result.reply.content, '忙完抬头的时候，窗外居然已经黑了。');
+  });
+});
+
+test('proactive skip budget selects the last visible draft after repeated soft supervisor skips', async () => {
+  await withFixture({
+    memory: ['{"query":"check in","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"action":"send","reply":"第一版主动消息","usedFactIds":[]}',
+      '{"action":"send","reply":"第二版主动消息","usedFactIds":[],"rewriteResolution":{"resolvedIssueIds":["PROACTIVE_DELIVERY_REQUIRED:1"]}}',
+      '{"action":"send","reply":"第三版主动消息","usedFactIds":[],"rewriteResolution":{"resolvedIssueIds":["PROACTIVE_DELIVERY_REQUIRED:1"]}}'
+    ],
+    supervisor: [
+      '{"decision":"skip","approved":false,"issues":[]}',
+      '{"decision":"skip","approved":false,"issues":[]}',
+      '{"decision":"skip","approved":false,"issues":[]}'
+    ]
+  }, async ({ store, orchestrator }) => {
+    commitProactiveResult(store, 74, 'skip');
+
+    const result = await orchestrator.process(triggerEnvelope(75));
+    const diagnostics = store.db.prepare(
+      'SELECT stage FROM diagnostics WHERE turn_id = ? ORDER BY diagnostic_id ASC'
+    ).all(result.turnId);
+
+    assert.equal(result.action, 'send');
+    assert.equal(result.reply.content, '第三版主动消息');
+    assert.ok(diagnostics.some(
+      entry => entry.stage === 'proactive_soft_fallback_selected'
+    ));
+  });
+});
+
+test('proactive skip budget blocks hard safety failures instead of committing silence', async () => {
+  await withFixture({
+    memory: ['{"query":"check in","keywords":[],"candidates":[]}'],
+    brain: [
+      '{"action":"send","reply":"第一版含内部格式","usedFactIds":[]}',
+      '{"action":"send","reply":"第二版仍含内部格式","usedFactIds":[]}',
+      '{"action":"send","reply":"第三版仍含内部格式","usedFactIds":[]}'
+    ],
+    supervisor: [
+      '{"decision":"rewrite","issues":[{"code":"INTERNAL_FORMAT_LEAKAGE","severity":"hard","message":"仍包含内部格式"}]}',
+      '{"decision":"rewrite","issues":[{"code":"INTERNAL_FORMAT_LEAKAGE","severity":"hard","message":"仍包含内部格式"}]}',
+      '{"decision":"rewrite","issues":[{"code":"INTERNAL_FORMAT_LEAKAGE","severity":"hard","message":"仍包含内部格式"}]}'
+    ]
+  }, async ({ store, orchestrator }) => {
+    commitProactiveResult(store, 76, 'skip');
+    const current = triggerEnvelope(77);
+
+    await assert.rejects(
+      orchestrator.process(current),
+      /PROACTIVE_DELIVERY_BLOCKED/
+    );
+    assert.equal(store.getTurn(current.turnId).state, 'failed');
+  });
+});
+
 test('moment interaction is handled by the chat brain as a structured phone action, not a private message', async () => {
   const momentTurn = triggerEnvelope(96);
   momentTurn.kind = 'MOMENT_INTERACTION';

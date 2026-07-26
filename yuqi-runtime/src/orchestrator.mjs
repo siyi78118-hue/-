@@ -800,11 +800,28 @@ export class YuqiOrchestrator {
       roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
       `supervisor_${attempt}`
     );
-    const supervisorResult = normalizeSupervisorResult(reviewed, {
+    let supervisorResult = normalizeSupervisorResult(reviewed, {
       attempt,
       previous,
       direct: !isAutomaticKind(envelope.kind)
     });
+    if (
+      deliveryPolicy?.skipAllowed === false
+      && ['skip', 'reject'].includes(supervisorResult.decision)
+    ) {
+      const originalDecision = supervisorResult.decision;
+      supervisorResult = proactiveDeliveryRewrite(previous, attempt, originalDecision);
+      this.store.putDiagnostic({
+        turnId: envelope.turnId,
+        stage: 'proactive_supervisor_rewrite_requested',
+        level: 'warning',
+        detail: {
+          policy: deliveryPolicy,
+          originalDecision,
+          rewriteAttempt: attempt
+        }
+      });
+    }
     if (supervisorResult.decision === 'approve') {
       this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
         supervisorJson: JSON.stringify(supervisorResult)
@@ -836,6 +853,36 @@ export class YuqiOrchestrator {
         level: 'warning',
         detail: { action: 'supervisor_veto_after_rewrites', issues: supervisorResult.issues || [] }
       });
+      if (deliveryPolicy?.skipAllowed === false) {
+        if (hasHighPriorityIssues(supervisorResult) || !String(draft.reply || '').trim()) {
+          this.store.putDiagnostic({
+            turnId: envelope.turnId,
+            stage: 'proactive_delivery_blocked',
+            level: 'error',
+            detail: {
+              policy: deliveryPolicy,
+              issueIds: supervisorResult.issues.map(issue => issue.issueId),
+              hardIssue: hasHighPriorityIssues(supervisorResult),
+              visibleDraft: Boolean(String(draft.reply || '').trim())
+            }
+          });
+          throw new Error('PROACTIVE_DELIVERY_BLOCKED: no safe visible reply after rewrites');
+        }
+        this.store.putDiagnostic({
+          turnId: envelope.turnId,
+          stage: 'proactive_soft_fallback_selected',
+          level: 'warning',
+          detail: {
+            policy: deliveryPolicy,
+            issueIds: supervisorResult.issues.map(issue => issue.issueId),
+            selectedDraft: draft.reply
+          }
+        });
+        this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
+          supervisorJson: JSON.stringify({ ...supervisorResult, fallbackSelected: true })
+        });
+        return;
+      }
       if (isAutomaticKind(envelope.kind)) {
         this.store.advanceTurn(envelope.turnId, 'supervisor_running', 'approved', {
           supervisorJson: JSON.stringify({ ...supervisorResult, vetoed: true }),
