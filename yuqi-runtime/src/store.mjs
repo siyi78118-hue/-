@@ -524,6 +524,44 @@ export class YuqiStore {
     return mapTurn(this.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turnId));
   }
 
+  getProactiveChatDeliveryPolicy(characterId, { windowSize = 4, maxSkips = 1 } = {}) {
+    const safeWindowSize = Math.max(1, Math.min(20, Number(windowSize) || 4));
+    const parsedMaxSkips = Number(maxSkips);
+    const safeMaxSkips = Math.max(
+      0,
+      Math.min(safeWindowSize, Number.isFinite(parsedMaxSkips) ? parsedMaxSkips : 1)
+    );
+    const reset = this.db.prepare(`
+      SELECT t.turn_id, t.created_at
+      FROM messages m
+      JOIN turns t ON t.turn_id = m.turn_id
+      WHERE m.character_id = ? AND m.speaker_type = 'user'
+      ORDER BY t.created_at DESC
+      LIMIT 1
+    `).get(characterId);
+    const resetAt = reset?.created_at === undefined ? -1 : Number(reset.created_at);
+    const rows = this.db.prepare(`
+      SELECT turn_id, reply_json
+      FROM turns
+      WHERE character_id = ?
+        AND state IN ('committed', 'delivered', 'completed')
+        AND json_extract(envelope_json, '$.kind') = 'PROACTIVE_CHAT'
+        AND created_at > ?
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(characterId, resetAt, safeWindowSize);
+    const usedSkips = rows.filter(row => parseJson(row.reply_json, {})?.action === 'skip').length;
+    return {
+      kind: 'proactive_chat',
+      windowSize: safeWindowSize,
+      maxSkips: safeMaxSkips,
+      usedSkips,
+      skipAllowed: usedSkips < safeMaxSkips,
+      inspectedTurnIds: rows.map(row => row.turn_id),
+      resetAfterTurnId: reset?.turn_id || null
+    };
+  }
+
   setTurnRoute(turnId, route, reasons = []) {
     if (!['fast', 'deep', 'fast_to_deep'].includes(route)) throw new Error('invalid turn route');
     const result = this.db.prepare(`

@@ -96,6 +96,46 @@ function withStore(run) {
   }
 }
 
+function commitAutomaticTurn(store, {
+  seq,
+  kind = 'PROACTIVE_CHAT',
+  action = 'send',
+  state = 'committed'
+}) {
+  const createdAt = 1784400000000 + seq * 1000;
+  const saved = store.submitTurn(validTriggerEnvelope({
+    turnId: `turn_policy_${kind.toLowerCase()}_${seq}`,
+    deviceSeq: seq,
+    createdAt,
+    kind,
+    trigger: {
+      triggerId: `trigger_policy_${kind.toLowerCase()}_${seq}`,
+      triggerType: kind.toLowerCase(),
+      scheduledFor: createdAt - 1000,
+      executedAt: createdAt
+    }
+  }));
+  store.claimTurnById(saved.turnId, 'worker-policy');
+  if (state === 'failed') {
+    store.advanceTurn(saved.turnId, 'memory_running', 'failed', {
+      errorJson: JSON.stringify({ name: 'Error', message: 'intentional failure' })
+    });
+    return store.getTurn(saved.turnId);
+  }
+  store.advanceTurn(saved.turnId, 'memory_running', 'memory_done', {
+    memoryPacketJson: JSON.stringify({ query: 'proactive policy test' })
+  });
+  store.advanceTurn(saved.turnId, 'memory_done', 'brain_running');
+  store.advanceTurn(saved.turnId, 'brain_running', 'brain_done', {
+    brainDraftJson: JSON.stringify({ action, reply: action === 'skip' ? '' : '一条主动消息' })
+  });
+  store.advanceTurn(saved.turnId, 'brain_done', 'approved');
+  store.advanceTurn(saved.turnId, 'approved', 'committed', {
+    replyJson: JSON.stringify({ turnId: saved.turnId, action, reply: action === 'skip' ? null : {} })
+  });
+  return store.getTurn(saved.turnId);
+}
+
 test('canonical JSON and hash are stable across object key order', () => {
   assert.equal(canonicalJson({ b: 2, a: { d: 4, c: 3 } }), canonicalJson({ a: { c: 3, d: 4 }, b: 2 }));
   assert.equal(contentHash({ b: 2, a: 1 }), contentHash({ a: 1, b: 2 }));
@@ -663,6 +703,70 @@ test('facts supported by an unconfirmed reply stay outside retrieval', () => wit
 
   assert.deepEqual(store.listRetrievableFacts('yuqi'), []);
   assert.equal(store.listFacts('yuqi').length, 1);
+}));
+
+test('proactive chat delivery policy allows at most one committed skip in the latest four turns', () => withStore(({ store }) => {
+  store.submitTurn(validV2Envelope({
+    turnId: 'turn_policy_direct_1',
+    deviceSeq: 1,
+    createdAt: 1784400001000,
+    message: {
+      ...validV2Envelope().message,
+      messageId: 'msg_policy_direct_1',
+      sentAt: 1784400001000
+    }
+  }));
+  commitAutomaticTurn(store, { seq: 2, action: 'send' });
+  commitAutomaticTurn(store, { seq: 3, action: 'skip' });
+  commitAutomaticTurn(store, { seq: 4, action: 'send' });
+  commitAutomaticTurn(store, { seq: 5, action: 'send' });
+
+  const policy = store.getProactiveChatDeliveryPolicy('yuqi');
+
+  assert.equal(policy.kind, 'proactive_chat');
+  assert.equal(policy.windowSize, 4);
+  assert.equal(policy.maxSkips, 1);
+  assert.equal(policy.usedSkips, 1);
+  assert.equal(policy.skipAllowed, false);
+  assert.deepEqual(policy.inspectedTurnIds, [
+    'turn_policy_proactive_chat_5',
+    'turn_policy_proactive_chat_4',
+    'turn_policy_proactive_chat_3',
+    'turn_policy_proactive_chat_2'
+  ]);
+  assert.equal(policy.resetAfterTurnId, 'turn_policy_direct_1');
+}));
+
+test('proactive chat delivery policy resets after a new canonical direct user message', () => withStore(({ store }) => {
+  commitAutomaticTurn(store, { seq: 2, action: 'skip' });
+  store.submitTurn(validV2Envelope({
+    turnId: 'turn_policy_direct_reset',
+    deviceSeq: 6,
+    createdAt: 1784400006000,
+    message: {
+      ...validV2Envelope().message,
+      messageId: 'msg_policy_direct_reset',
+      sentAt: 1784400006000
+    }
+  }));
+
+  const policy = store.getProactiveChatDeliveryPolicy('yuqi');
+
+  assert.equal(policy.usedSkips, 0);
+  assert.equal(policy.skipAllowed, true);
+  assert.deepEqual(policy.inspectedTurnIds, []);
+  assert.equal(policy.resetAfterTurnId, 'turn_policy_direct_reset');
+}));
+
+test('proactive chat delivery policy ignores failed turns and other automatic kinds', () => withStore(({ store }) => {
+  commitAutomaticTurn(store, { seq: 2, action: 'skip', state: 'failed' });
+  commitAutomaticTurn(store, { seq: 3, action: 'skip', kind: 'PROACTIVE_MOMENT' });
+
+  const policy = store.getProactiveChatDeliveryPolicy('yuqi');
+
+  assert.equal(policy.usedSkips, 0);
+  assert.equal(policy.skipAllowed, true);
+  assert.deepEqual(policy.inspectedTurnIds, []);
 }));
 
 test('sync deltas are ordered, checksummed, and acknowledged independently', () => withStore(({ store }) => {
