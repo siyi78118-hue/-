@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "currentVersion": "1.8.3",
+  "currentVersion": "1.8.4",
   "characterId": "yuqi",
   "modules": {
     "foundation": "al-combined-rp.md",

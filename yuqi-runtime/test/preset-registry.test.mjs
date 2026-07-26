@@ -25,7 +25,7 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.8.3');
+  assert.equal(current.version, '1.8.4');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
@@ -64,7 +64,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.8.3');
+    assert.equal(registry.current().version, '1.8.4');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -116,6 +116,19 @@ test('brain preset supports silent proactive decisions without leaking them into
   assert.match(prompt, /不要把.*JSON.*塞进.*reply/s);
 }));
 
+test('brain and supervisor honor a general proactive delivery policy without literal phrase rules', () => withRegistry(registry => {
+  const brain = registry.compileFor('brain', { stage: 'initial' });
+  const supervisor = registry.compileFor('supervisor', { stage: 'initial' });
+
+  assert.match(brain, /deliveryPolicy/);
+  assert.match(brain, /skipAllowed/);
+  assert.match(brain, /不要求服从用户的字面命令/);
+  assert.match(supervisor, /deliveryPolicy\.skipAllowed=false/);
+  assert.match(supervisor, /PROACTIVE_DELIVERY_REQUIRED/);
+  assert.doesNotMatch(brain, /暂时不理你|你自己去玩/);
+  assert.doesNotMatch(supervisor, /暂时不理你|你自己去玩/);
+}));
+
 test('memory stays isolated while supervisor receives the authoritative generation presets', () => withRegistry(registry => {
   const memory = registry.compileFor('memory', { stage: 'initial' });
   const supervisor = registry.compileFor('supervisor', { stage: 'initial' });
@@ -153,16 +166,16 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.8.4');
-  assert.equal(published.parentVersion, '1.8.3');
+  assert.equal(published.version, '1.8.5');
+  assert.equal(published.parentVersion, '1.8.4');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 2);
 
-  const rollback = registry.rollback('1.8.3');
-  assert.equal(rollback.version, '1.8.5');
-  assert.equal(rollback.parentVersion, '1.8.4');
-  assert.equal(rollback.rollbackOf, '1.8.3');
+  const rollback = registry.rollback('1.8.4');
+  assert.equal(rollback.version, '1.8.6');
+  assert.equal(rollback.parentVersion, '1.8.5');
+  assert.equal(rollback.rollbackOf, '1.8.4');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 3);
 }));
