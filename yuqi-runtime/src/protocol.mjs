@@ -271,7 +271,53 @@ function validateUserMessage(message, envelope) {
   }
   if (typeof message.content !== 'string' || !message.content.trim()) throw new Error('empty message content');
   if (message.content.length > 100_000) throw new Error('message content too large');
+  if (message.attachments !== undefined) {
+    message.attachments = validateImageAttachments(message.attachments, message.messageId);
+  }
   return message;
+}
+
+function validateImageAttachments(attachments, messageId) {
+  if (!Array.isArray(attachments) || attachments.length !== 1) {
+    throw new Error('direct message supports exactly one image attachment');
+  }
+  const source = attachments[0];
+  if (!source || typeof source !== 'object' || Array.isArray(source) || source.kind !== 'image') {
+    throw new Error('invalid image attachment');
+  }
+  const attachmentId = String(source.attachmentId || '');
+  requireId(attachmentId, 'attachmentId', 'att_');
+  if (String(source.messageId || '') !== messageId) throw new Error('image attachment message mismatch');
+  const mime = String(source.mime || '').toLowerCase();
+  if (!['image/jpeg', 'image/png', 'image/webp'].includes(mime)) throw new Error('invalid image attachment MIME');
+  const match = new RegExp(`^data:${mime.replace('/', '\\/')};base64,([A-Za-z0-9+/]+={0,2})$`, 'i')
+    .exec(String(source.dataUrl || ''));
+  if (!match) throw new Error('invalid image attachment data URL');
+  const decoded = Buffer.from(match[1], 'base64');
+  if (!decoded.length || decoded.length > 96 * 1024) throw new Error('image attachment exceeds 96KB');
+  if (Number(source.bytes) !== decoded.length) throw new Error('image attachment byte count mismatch');
+  const signatureValid = mime === 'image/jpeg'
+    ? decoded[0] === 0xff && decoded[1] === 0xd8 && decoded[2] === 0xff
+    : mime === 'image/png'
+      ? decoded.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+      : decoded.subarray(0, 4).toString('ascii') === 'RIFF' && decoded.subarray(8, 12).toString('ascii') === 'WEBP';
+  if (!signatureValid) throw new Error('invalid image attachment signature');
+  const width = Number(source.width);
+  const height = Number(source.height);
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1 || width > 8192 || height > 8192) {
+    throw new Error('invalid image attachment dimensions');
+  }
+  return [{
+    attachmentId,
+    messageId,
+    kind: 'image',
+    mime,
+    name: String(source.name || 'image').replace(/[^\p{L}\p{N}._ -]/gu, '_').slice(0, 120),
+    width,
+    height,
+    bytes: decoded.length,
+    dataUrl: String(source.dataUrl)
+  }];
 }
 
 function validateTrigger(trigger) {

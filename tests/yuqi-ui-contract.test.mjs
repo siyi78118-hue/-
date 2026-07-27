@@ -94,6 +94,19 @@ test('native direct replies submit a canonical attributed user message', () => {
   assert.match(html, /sentAt:\s*Number\(userMessage\.time\)\s*\|\|\s*task\.createdAt/);
 });
 
+test('chat composer stages compressed user images and forwards them as canonical attachments', () => {
+  assert.match(html, /id="chat-image-input"[^>]+accept="image\/\*"/);
+  assert.match(html, /onclick="chooseChatImage\(\)"/);
+  assert.match(html, />图片<\/button>/);
+  assert.match(html, /async function\s+compressChatImage\(/);
+  assert.match(html, /async function\s+handleChatImage\(/);
+  assert.match(html, /type:\s*'image'/);
+  assert.match(html, /imageData:/);
+  assert.match(html, /class="chat-image-message"/);
+  assert.match(html, /attachments:\s*\(task\.options\.attachments/);
+  assert.match(html, /const\s+batchAttachments\s*=\s*committed\.messages\.flatMap\(messageAttachmentsForAI\)/);
+});
+
 test('native direct replies preserve the complete current batch time boundary', () => {
   const builder = html.slice(
     html.indexOf('function buildAndroidUserReplyTask'),

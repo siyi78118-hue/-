@@ -7,6 +7,7 @@ import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stag
 import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
 import { buildGenerationWindow } from './conversation-context.mjs';
 import { LifeSimulationCoordinator } from './life-simulation.mjs';
+import { materializeImageAttachments } from './image-attachments.mjs';
 import {
   characterFactCandidatesForReply,
   hasHighPriorityIssues,
@@ -322,6 +323,7 @@ export class YuqiOrchestrator {
     this.lifePlanningPromises = new Map();
     this.lifePlanningRetryAfter = new Map();
     this.brainRolePromise = null;
+    this.turnImagePaths = new Map();
   }
 
   accept(envelope) {
@@ -473,6 +475,12 @@ export class YuqiOrchestrator {
     if (['delivered', 'completed'].includes(current.state) && current.replyJson) return JSON.parse(current.replyJson);
     if (['failed', 'fallback'].includes(current.state)) throw new Error(`turn is already ${current.state}`);
     const envelope = JSON.parse(current.envelopeJson);
+    const rawAttachments = Array.isArray(envelope.message?.attachments) ? envelope.message.attachments : [];
+    const preparedImages = await materializeImageAttachments(rawAttachments, { turnId });
+    if (preparedImages.paths.length) {
+      this.turnImagePaths.set(turnId, preparedImages.paths);
+      envelope.message.attachments = rawAttachments.map(({ dataUrl, ...metadata }) => metadata);
+    }
 
     try {
       for (let step = 0; step < 16; step += 1) {
@@ -603,6 +611,9 @@ export class YuqiOrchestrator {
         detail: { name: error.name, message: error.message }
       });
       throw error;
+    } finally {
+      this.turnImagePaths.delete(turnId);
+      await preparedImages.cleanup();
     }
   }
 
@@ -1138,7 +1149,8 @@ export class YuqiOrchestrator {
             clientUserMessageId: baseMessageId,
             outputSchema: ROLE_OUTPUT_SCHEMAS[role],
             model: activeProfile.model,
-            effort: activeProfile.effort
+            effort: activeProfile.effort,
+            localImagePaths: this.turnImagePaths.get(turnId) || []
           });
         } catch (error) {
           const alternate = capacityFallbackUsed ? null : fallbackRoleProfile(activeProfile);
@@ -1161,7 +1173,8 @@ export class YuqiOrchestrator {
             clientUserMessageId: `${baseMessageId}_capacity_fallback`,
             outputSchema: ROLE_OUTPUT_SCHEMAS[role],
             model: activeProfile.model,
-            effort: activeProfile.effort
+            effort: activeProfile.effort,
+            localImagePaths: this.turnImagePaths.get(turnId) || []
           });
         }
         invalidOutput = String(response.text || '');

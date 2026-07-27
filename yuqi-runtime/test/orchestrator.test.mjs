@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -214,6 +214,38 @@ const normalOutputs = () => ({
   memory: ['{"query":"你好","keywords":["你好"],"candidates":[]}'],
   brain: ['{"reply":"你好。我是虞栖，你呢？","usedFactIds":[]}'],
   supervisor: ['{"approved":true,"issues":[]}']
+});
+
+const JPEG_1X1 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==';
+
+test('a direct image is shown to every role as a local image without leaking base64 into role text', async () => {
+  await withFixture(normalOutputs(), async ({ codex, orchestrator }) => {
+    const request = stagedEnvelope(199);
+    request.message.content = '[图片]';
+    request.message.attachments = [{
+      attachmentId: 'att_msg_phone_199',
+      messageId: request.message.messageId,
+      kind: 'image',
+      mime: 'image/jpeg',
+      name: 'one.jpg',
+      width: 1,
+      height: 1,
+      bytes: Buffer.from(JPEG_1X1, 'base64').length,
+      dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
+    }];
+    orchestrator.accept(request);
+    await orchestrator.run(request.turnId);
+
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain']);
+    for (const call of codex.calls) {
+      assert.equal(call.options.localImagePaths.length, 1);
+      assert.equal(existsSync(call.options.localImagePaths[0]), false, 'image temp file must be cleaned after the turn');
+      assert.doesNotMatch(JSON.stringify(call.input), /base64,/);
+    }
+    const brainMessage = codex.calls.find(call => call.role === 'brain').input.currentUserMessage;
+    assert.equal(brainMessage.attachments[0].attachmentId, 'att_msg_phone_199');
+    assert.equal('dataUrl' in brainMessage.attachments[0], false);
+  });
 });
 
 test('a capacity error switches the same role to its alternate model once', async () => {

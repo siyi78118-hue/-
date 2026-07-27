@@ -55,6 +55,53 @@ function validV2Envelope(overrides = {}) {
   };
 }
 
+const JPEG_1X1 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==';
+
+test('direct messages accept one bounded raster image attachment and normalize its metadata', () => {
+  const value = validV2Envelope();
+  value.message.attachments = [{
+    attachmentId: 'att_msg_device2_1',
+    messageId: value.message.messageId,
+    kind: 'image',
+    mime: 'image/jpeg',
+    name: 'one.jpg',
+    width: 1,
+    height: 1,
+    bytes: Buffer.from(JPEG_1X1, 'base64').length,
+    dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
+  }];
+  const normalized = validateEnvelope(value);
+  assert.equal(normalized.message.attachments.length, 1);
+  assert.equal(normalized.message.attachments[0].mime, 'image/jpeg');
+  assert.match(normalized.message.attachments[0].dataUrl, /^data:image\/jpeg;base64,/);
+});
+
+test('direct messages reject oversized, forged, or multiple image attachments before persistence', () => {
+  const make = attachments => {
+    const value = validV2Envelope();
+    value.message.attachments = attachments;
+    return value;
+  };
+  const valid = {
+    attachmentId: 'att_msg_device2_1',
+    messageId: 'msg_device2_1',
+    kind: 'image',
+    mime: 'image/jpeg',
+    name: 'one.jpg',
+    width: 1,
+    height: 1,
+    bytes: Buffer.from(JPEG_1X1, 'base64').length,
+    dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
+  };
+  assert.throws(() => validateEnvelope(make([valid, { ...valid, attachmentId: 'att_second' }])), /one image/i);
+  assert.throws(() => validateEnvelope(make([{ ...valid, mime: 'image/svg+xml' }])), /image attachment/i);
+  assert.throws(() => validateEnvelope(make([{
+    ...valid,
+    bytes: Buffer.from('not jpeg').length,
+    dataUrl: `data:image/jpeg;base64,${Buffer.from('not jpeg').toString('base64')}`
+  }])), /signature/i);
+});
+
 function validTriggerEnvelope(overrides = {}) {
   return {
     protocolVersion: 2,

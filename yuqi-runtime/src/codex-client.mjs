@@ -288,11 +288,19 @@ export class CodexAppServerClient {
   async runTurnInternal(role, input, options) {
     const text = typeof input === 'string' ? input : JSON.stringify(input);
     if (!text.trim()) throw new Error('Codex turn input is empty');
+    const localImagePaths = [...new Set(
+      (Array.isArray(options.localImagePaths) ? options.localImagePaths : [])
+        .map(path => String(path || '').trim())
+        .filter(Boolean)
+    )];
     const threadId = await this.ensureThread(role);
     const result = await this.request('turn/start', {
       threadId,
       clientUserMessageId: options.clientUserMessageId || `yuqi_${role}_${randomUUID()}`,
-      input: [{ type: 'text', text }],
+      input: [
+        { type: 'text', text },
+        ...localImagePaths.map(path => ({ type: 'localImage', path }))
+      ],
       approvalPolicy: 'never',
       model: options.model || 'gpt-5.6-sol',
       effort: options.effort || 'high',

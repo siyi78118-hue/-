@@ -111,6 +111,17 @@ test('collects only the final agent message from the matching turn', async () =>
   assert.equal(result.turnId, 'turn_fake_1');
 }));
 
+test('adds validated local image paths after the text input for multimodal role turns', async () => fixture(async ({ client, logFile }) => {
+  await client.runTurn('brain', 'look at this image', {
+    localImagePaths: ['C:\\tmp\\yuqi-image-1.jpg']
+  });
+  const started = protocolLines(logFile).find(item => item.method === 'turn/start');
+  assert.deepEqual(started.params.input, [
+    { type: 'text', text: 'look at this image' },
+    { type: 'localImage', path: 'C:\\tmp\\yuqi-image-1.jpg' }
+  ]);
+}));
+
 test('pins the approved model, high effort, and a strict schema for every brain turn', async () => fixture(async ({ client, logFile }) => {
   await client.runTurn('brain', 'draft one reply');
   const started = protocolLines(logFile).find(item => item.method === 'turn/start');
