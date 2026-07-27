@@ -390,6 +390,20 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void recentCompletedTurns(PluginCall call) {
+        execute(call, () -> {
+            Integer limit = call.getInt("limit", 50);
+            JSArray turns = new JSArray();
+            for (ChatTurnEntity turn : store.recentCompletedTurns(limit == null ? 50 : limit)) {
+                turns.put(turnResult(turn));
+            }
+            JSObject result = new JSObject();
+            result.put("turns", turns);
+            return result;
+        });
+    }
+
+    @PluginMethod
     public void acknowledgeUiApplied(PluginCall call) {
         execute(call, () -> {
             String turnId = required(call, "turnId");

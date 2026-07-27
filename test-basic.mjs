@@ -98,7 +98,7 @@ assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS run
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopService\(/, 'clearing automatic tasks must not stop the 24-hour background guard');
-for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
+for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
 assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*8[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8/, 'Room must migrate existing installs through the Yuqi phone-receipt schema without destructive reset');
@@ -107,9 +107,11 @@ assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limi
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
 assert.match(executionDao, /state\s*=\s*'COMPLETED'[\s\S]{0,240}uiAppliedAt\s+IS\s+NULL/, 'Room must keep a durable inbox of completed turns not yet applied to the UI');
 assert.match(executionDao, /acknowledgeUiApplied/, 'Room must expose an explicit UI acknowledgement');
+assert.match(executionDao, /state\s*=\s*'COMPLETED'\s+AND\s+deletedAt\s+IS\s+NULL\s+ORDER\s+BY\s+completedAt\s+DESC\s+LIMIT\s+:limit/, 'Room must retain a bounded recovery view even after UI acknowledgement');
 assert.match(executionPlugin, /unappliedCompletedTurns[\s\S]{0,1800}turnResult/, 'native bridge must return full unapplied turn results');
 assert.match(executionPlugin, /result\.put\("inputJson",\s*turn\.inputJson\)/, 'native role-plan results must expose their minimal occurrence identifiers');
 assert.match(html, /plugin\.unappliedCompletedTurns\(/, 'foreground reconciliation must scan the durable native UI inbox');
+assert.match(html, /plugin\.recentCompletedTurns\(\{\s*limit:\s*50\s*\}\)/, 'foreground reconciliation must self-heal acknowledged native replies whose bubbles are absent');
 assert.match(html, /await\s+plugin\.acknowledgeUiApplied\(/, 'the web UI must acknowledge a native result only after applying it');
 assert.match(html, /function\s+nativeExecutionPlugin\(\)/, 'web UI should use the native Room execution bridge');
 assert.match(html, /nativeExecutionPlugin\(\)[\s\S]{0,12000}\.submitTurn\(/, 'native sends should submit a durable Room turn');

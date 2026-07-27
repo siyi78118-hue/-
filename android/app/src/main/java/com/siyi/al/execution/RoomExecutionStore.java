@@ -274,6 +274,11 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     @Override
+    public List<ChatTurnEntity> recentCompletedTurns(int limit) {
+        return dao.recentCompletedTurns(Math.max(1, Math.min(limit, 50)));
+    }
+
+    @Override
     public void acknowledgeUiApplied(String turnId, long now) {
         ChatTurnEntity turn = requireTurn(turnId);
         if (turn.uiAppliedAt != null) return;

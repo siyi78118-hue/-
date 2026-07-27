@@ -45,5 +45,7 @@ public interface ExecutionStore {
 
     List<ChatTurnEntity> unappliedCompletedTurns(int limit);
 
+    List<ChatTurnEntity> recentCompletedTurns(int limit);
+
     void acknowledgeUiApplied(String turnId, long now);
 }
