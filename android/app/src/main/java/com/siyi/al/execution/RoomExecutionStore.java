@@ -27,7 +27,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     public ChatTurnEntity submitTurn(TurnSubmission submission) {
         AtomicReference<ChatTurnEntity> result = new AtomicReference<>();
         database.runInTransaction(() -> {
-            ChatTurnEntity existing = dao.turnBySourceMessage(submission.sourceMessageId);
+            ChatTurnEntity existing = dao.turn(submission.turnId);
             if (existing != null) {
                 result.set(existing);
                 return;
@@ -47,7 +47,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             turn.createdAt = now;
             turn.updatedAt = now;
             if (dao.insertTurn(turn) == -1L) {
-                result.set(dao.turnBySourceMessage(submission.sourceMessageId));
+                result.set(dao.turn(submission.turnId));
                 return;
             }
             dao.insertAttempt(newAttempt(turn.turnId, attemptId, 1, now));

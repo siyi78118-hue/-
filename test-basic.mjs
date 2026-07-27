@@ -101,7 +101,7 @@ assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopServic
 for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*8[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8/, 'Room must migrate existing installs through the Yuqi phone-receipt schema without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*9[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9/, 'Room must migrate existing installs through the native fresh-retry schema without destructive reset');
 assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors[\s\S]*yuqi_annotations/, 'Room v7 must retain raw messages, evidence facts, sync cursors, and annotations on the phone');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
@@ -174,7 +174,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-22\.97';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-27\.102';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');

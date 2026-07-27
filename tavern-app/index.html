@@ -1401,7 +1401,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-22.97';
+const APP_BUILD_VERSION = '2026-07-27.102';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -3224,15 +3224,27 @@ function applyNativeMomentActionPart(charId, part, turnId) {
   return true;
 }
 
+function nativePendingRetryLineage(pending) {
+  return [...new Set([
+    ...(Array.isArray(pending?.retryLineageTurnIds) ? pending.retryLineageTurnIds : []),
+    pending?.retryOfTurnId
+  ].filter(Boolean).map(String))];
+}
+
 function nativeDirectTurnIsSuperseded(chat, result) {
   if (String(result?.kind || 'DIRECT_REPLY') !== 'DIRECT_REPLY') return false;
   const sourceMessageId = String(result?.sourceMessageId || '');
+  const resultTurnId = String(result?.turnId || '');
   const active = chat?.pendingReply;
   if (
     active?.userMessageId === sourceMessageId
     && active?.nativeTurnId
-    && active.nativeTurnId !== result?.turnId
-  ) return true;
+    && active.nativeTurnId !== resultTurnId
+  ) {
+    const completedRetryAncestor = String(result?.state || '') === 'COMPLETED'
+      && nativePendingRetryLineage(active).includes(resultTurnId);
+    if (!completedRetryAncestor) return true;
+  }
   const replies = (chat?.messages || []).filter(
     row => row.role === 'assistant' && row.replyToMessageId === sourceMessageId
   );
@@ -7585,6 +7597,10 @@ async function retryFailedReply(charId, userMessageId) {
   const retryStartedAt = Date.now();
   const nativeRetry = isNativeApp();
   const retryOfTurnId = nativeRetry ? (oldPending?.nativeTurnId || nativeTurnIdForMessage(userMessageId)) : '';
+  const retryLineageTurnIds = nativeRetry ? [...new Set([
+    ...(Array.isArray(oldPending?.retryLineageTurnIds) ? oldPending.retryLineageTurnIds : []),
+    retryOfTurnId
+  ].filter(Boolean).map(String))].slice(-20) : [];
   const turnId = nativeRetry ? nativeRetryTurnIdForMessage(userMessageId) : '';
   chat.pendingReply = {
     userMessageId,
@@ -7593,7 +7609,7 @@ async function retryFailedReply(charId, userMessageId) {
     state: 'pending',
     createdAt: retryStartedAt,
     updatedAt: retryStartedAt,
-    ...(nativeRetry ? { nativeTurnId: turnId, retryOfTurnId } : {})
+    ...(nativeRetry ? { nativeTurnId: turnId, retryOfTurnId, retryLineageTurnIds } : {})
   };
   message.replyState = 'pending';
   delete message.replyError;
@@ -7632,6 +7648,9 @@ async function retryFailedReply(charId, userMessageId) {
         snapshotJson: JSON.stringify(snapshot),
         createdAt: task.createdAt
       });
+      if (String(result?.turnId || '') !== turnId) {
+        throw new Error(`原生后台返回了错误的重试任务：${String(result?.turnId || 'unknown')}`);
+      }
       if (chat.pendingReply?.nativeTurnId === turnId) {
         chat.pendingReply.nativeAcceptedAt = Date.now();
         DB.set('chats', allChats);
