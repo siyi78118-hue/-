@@ -211,6 +211,8 @@ button{border:none;background:none;cursor:pointer}
 .msg-wrap.me .bubble:after{content:"";position:absolute;right:-5px;top:13px;border-top:5px solid transparent;border-bottom:5px solid transparent;border-left:5px solid var(--green2)}
 .bubble em{font-style:italic;color:#596b4a}
 .time-tip{align-self:center;color:#999;font-size:12px;margin:2px 0}
+.chat-load-older{align-self:center;min-height:32px;padding:6px 14px;border-radius:16px;color:#576b95;background:rgba(255,255,255,.72);font-size:13px;line-height:20px}
+.chat-load-older:active{background:#dedede}
 .typing-line{align-self:center;color:#a3a3a3;font-size:12px;line-height:1.2;margin:-2px 0 2px;opacity:.86}
 .message-failed{font-size:11px;color:#d64b3f;text-align:right;margin:-5px 50px 2px 0}
 .message-retry{margin-left:6px;padding:2px 5px;color:#576b95;font-size:11px;line-height:1.2;border-radius:3px;background:transparent}
@@ -1597,6 +1599,9 @@ let nativeExecutionReconcilePromise = null;
 let lastNativeCompletedRecoveryAt = 0;
 const nativeReplyQueuedIds = new Set();
 const nativeTurnApplyPromises = new Map();
+const CHAT_RENDER_WINDOW_SIZE = 120;
+const CHAT_RENDER_PAGE_SIZE = 120;
+const chatRenderLimits = new Map();
 const EMPTY_REPLY_TEXT = '（对方没有回复）';
 const REDPACKET_EXPIRE_MS = 24 * 60 * 60 * 1000;
 
@@ -3039,10 +3044,11 @@ function nativePendingStateIsCurrent(chat, userMessage, result) {
     && pending.state === 'running'
     && pending.nativeState === state
     && Number(pending.nativeUpdatedAt) === Number(result?.updatedAt)
+    && String(pending.bridgeRoute || '') === String(result?.route || '')
     && String(pending.bridgeDisplayStage || '') === String(result?.displayStage || '')
     && String(pending.bridgeTechnicalStage || '') === String(result?.technicalStage || '')
-    && Number(pending.bridgeStageElapsedMs || 0) === Number(result?.stageElapsedMs || 0)
-    && Number(pending.bridgeTotalElapsedMs || 0) === Number(result?.totalElapsedMs || 0)
+    && String(pending.bridgeStageModel || '') === String(result?.stageModel || '')
+    && String(pending.bridgeStageEffort || '') === String(result?.stageEffort || '')
     && userMessage?.replyState === 'pending';
 }
 function nativePendingReplyNeedsSubmission(pending, messageId, queuedIds = nativeReplyQueuedIds) {
@@ -3332,6 +3338,10 @@ async function applyNativeExecutionTurnUnlocked(result) {
   }
   const userMessage = messageById(chat, result?.sourceMessageId);
   if (!userMessage) return false;
+  if (
+    !['COMPLETED', 'FAILED_FINAL', 'INTERRUPTED', 'CANCELLED'].includes(state)
+    && nativePendingStateIsCurrent(chat, userMessage, result)
+  ) return false;
   if (state === 'COMPLETED') {
     const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
     await applyNativePlanParts(charId, parts, result.turnId);
@@ -3381,8 +3391,11 @@ async function applyNativeExecutionTurnUnlocked(result) {
       nativeTurnId: result.turnId,
       nativeState: state,
       nativeUpdatedAt: Number(result.updatedAt) || 0,
+      bridgeRoute: String(result.route || ''),
       bridgeDisplayStage: '网络不稳定，正在重新送达…',
       bridgeTechnicalStage: String(result.technicalStage || 'retry_wait'),
+      bridgeStageModel: String(result.stageModel || ''),
+      bridgeStageEffort: String(result.stageEffort || ''),
       bridgeStageElapsedMs: Number(result.stageElapsedMs) || 0,
       bridgeTotalElapsedMs: Number(result.totalElapsedMs) || 0,
       updatedAt: Date.now()
@@ -3400,7 +3413,6 @@ async function applyNativeExecutionTurnUnlocked(result) {
     if (chat.pendingReply?.userMessageId === userMessage.id) delete chat.pendingReply;
     nativeReplyQueuedIds.delete(result.turnId);
   } else {
-    if (nativePendingStateIsCurrent(chat, userMessage, result)) return false;
     userMessage.replyState = 'pending';
     chat.pendingReply = {
       ...(chat.pendingReply || {}),
@@ -4221,6 +4233,29 @@ function pendingReplyMessage(chat) {
 }
 function visibleChatMessages(chat) {
   return (chat?.messages || []).filter(m => !m.hidden && !m.deleted);
+}
+function selectChatRenderWindow(messages, limit = CHAT_RENDER_WINDOW_SIZE) {
+  const visible = (messages || []).filter(message => !message?.hidden && !message?.deleted);
+  const safeLimit = Math.max(1, Math.floor(Number(limit) || CHAT_RENDER_WINDOW_SIZE));
+  const start = Math.max(0, visible.length - safeLimit);
+  return {
+    messages: visible.slice(start),
+    hiddenCount: start,
+    totalVisible: visible.length
+  };
+}
+function chatRenderWindow(chat, charId = currentCharId) {
+  const limit = chatRenderLimits.get(charId) || CHAT_RENDER_WINDOW_SIZE;
+  return selectChatRenderWindow(chat?.messages, limit);
+}
+function loadOlderChatMessages(charId = currentCharId) {
+  const chat = allChats[charId];
+  if (!chat || charId !== currentCharId) return false;
+  const current = chatRenderLimits.get(charId) || CHAT_RENDER_WINDOW_SIZE;
+  const total = visibleChatMessages(chat).length;
+  chatRenderLimits.set(charId, Math.min(total, current + CHAT_RENDER_PAGE_SIZE));
+  renderMessages();
+  return true;
 }
 function conversationMessages(chat) {
   return visibleChatMessages(chat).filter(m => m.role !== 'system' && messageAvailableToAI(m));
@@ -6355,6 +6390,7 @@ function openChat(charId) {
     if (char.firstMessage) allChats[charId].messages.push({ id: uid('msg'), role: 'assistant', content: char.firstMessage, time: Date.now() });
   }
   ensureChatMessageIds(allChats[charId]);
+  chatRenderLimits.set(charId, CHAT_RENDER_WINDOW_SIZE);
   allChats[charId].unread = 0;
   DB.set('chats', allChats);
   renderMessages({ forceBottom: true });
@@ -7132,8 +7168,11 @@ function renderMessages(options = {}) {
   const scrollEl = document.getElementById('chat-scroll');
   const scrollState = captureChatScrollState(scrollEl);
   if (refreshPaymentExpirations(chat, currentCharId)) DB.set('chats', allChats);
-  let html = '';
-  const displayMessages = visibleChatMessages(chat);
+  const renderWindow = chatRenderWindow(chat, currentCharId);
+  const displayMessages = renderWindow.messages;
+  let html = renderWindow.hiddenCount > 0
+    ? `<button class="chat-load-older" type="button" onclick="loadOlderChatMessages(currentCharId)">加载更早的 ${Math.min(CHAT_RENDER_PAGE_SIZE, renderWindow.hiddenCount)} 条消息</button>`
+    : '';
   displayMessages.forEach((m, i) => {
     if (i === 0 || (m.time - (displayMessages[i-1]?.time || 0) > 300000)) html += `<div class="time-tip">${fmtTime(m.time)}</div>`;
     const messageAttrs = `data-message-id="${esc(m.id || '')}"`;
@@ -7182,18 +7221,29 @@ function clearStreamingDraft(charId) {
   document.querySelectorAll('[data-streaming-draft="1"]').forEach(el => el.remove());
 }
 function bindMessageActions(root) {
-  root?.querySelectorAll?.('[data-message-id]').forEach(element => {
-    const messageId = element.dataset.messageId;
+  if (!root || typeof root.addEventListener !== 'function') return;
+  if (root.dataset?.messageActionsBound === '1' || root.__messageActionsBound === true) return;
+  if (root.dataset) root.dataset.messageActionsBound = '1';
+  else root.__messageActionsBound = true;
+  const messageElementForEvent = event => {
+    const element = typeof event.target?.closest === 'function'
+      ? event.target.closest('[data-message-id]')
+      : null;
+    return element && root.contains(element) ? element : null;
+  };
+  root.addEventListener('pointerdown', event => {
+    const messageId = messageElementForEvent(event)?.dataset?.messageId;
+    if (messageId) startMessageLongPress(event, messageId);
+  });
+  root.addEventListener('pointermove', cancelMessageLongPressOnMove);
+  root.addEventListener('pointerup', cancelMessageLongPress);
+  root.addEventListener('pointercancel', cancelMessageLongPress);
+  root.addEventListener('contextmenu', event => {
+    const messageId = messageElementForEvent(event)?.dataset?.messageId;
     if (!messageId) return;
-    element.addEventListener('pointerdown', event => startMessageLongPress(event, messageId));
-    element.addEventListener('pointermove', cancelMessageLongPressOnMove);
-    element.addEventListener('pointerup', cancelMessageLongPress);
-    element.addEventListener('pointercancel', cancelMessageLongPress);
-    element.addEventListener('contextmenu', event => {
-      event.preventDefault();
-      cancelMessageLongPress();
-      openMessageActions(messageId);
-    });
+    event.preventDefault();
+    cancelMessageLongPress();
+    openMessageActions(messageId);
   });
 }
 function startMessageLongPress(event, messageId) {
