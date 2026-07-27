@@ -1,6 +1,6 @@
 # Yuqi Canonical Chibi Design Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Generate one canonical modern Q-style full-body turnaround of Yuqi using Yuqi's own visual description as the authoritative prompt.
 
@@ -31,22 +31,22 @@
 - Consumes: `docs/superpowers/specs/2026-07-27-yuqi-canonical-chibi-design.md`
 - Produces: The canonical visual reference for future Yuqi emoji and character assets.
 
-- [ ] **Step 1: Generate one turnaround sheet**
+- [x] **Step 1: Generate one turnaround sheet**
 
 Use the built-in image generation tool with the original user image labelled as a style/layout reference only. Normalize Yuqi's exact prompt into a production prompt without introducing a hair clip, bag, skirt, long coat, office suit, large eyes, heavy makeup, or new accessory.
 
-- [ ] **Step 2: Inspect identity and expression**
+- [x] **Step 2: Inspect identity and expression**
 
 Verify that Yuqi reads as approximately 24, has naturally sized eyes, clean facial features, an intelligent alert gaze, and a faintly defiant half-smile rather than a sweet or cute performance.
 
-- [ ] **Step 3: Inspect outfit and turnaround**
+- [x] **Step 3: Inspect outfit and turnaround**
 
 Verify exactly three aligned full-body views in front/side/back order. Confirm the same below-shoulder black hair, thin knit top, deep-navy short jacket, black straight trousers, and simple shoes in all three views.
 
-- [ ] **Step 4: Save the accepted output**
+- [x] **Step 4: Save the accepted output**
 
 Copy the generated PNG to `artifacts/yuqi-character-design/yuqi-canonical-by-yuqi.png`, preserving the earlier A, B, and C exploration images.
 
-- [ ] **Step 5: Deliver the result**
+- [x] **Step 5: Deliver the result**
 
 Render the final PNG inline and provide its clickable absolute project path. State that the built-in image generation path was used and summarize the canonical prompt constraints.
