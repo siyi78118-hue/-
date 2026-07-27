@@ -103,7 +103,8 @@ test('chat composer stages compressed user images and forwards them as canonical
   assert.match(html, /type:\s*'image'/);
   assert.match(html, /imageData:/);
   assert.match(html, /class="chat-image-message"/);
-  assert.match(html, /attachments:\s*\(task\.options\.attachments/);
+  assert.match(html, /const\s+wireAttachments\s*=\s*\(task\.options\.attachments/);
+  assert.match(html, /\.\.\.\(wireAttachments\.length\s*\?\s*\{\s*attachments:\s*wireAttachments\s*\}\s*:\s*\{\s*\}\)/);
   assert.match(html, /const\s+batchAttachments\s*=\s*committed\.messages\.flatMap\(messageAttachmentsForAI\)/);
 });
 
