@@ -218,6 +218,21 @@ test('native completed turns are serialized across submit, poll, inbox, and fore
   assert.match(html, /if\s*\(nativeExecutionReconcilePromise\)\s*return\s+nativeExecutionReconcilePromise/);
 });
 
+test('acknowledged native completions remain recoverable until their exact bubble exists', () => {
+  assert.match(executionDao, /state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT :limit/);
+  assert.match(executionStore, /recentCompletedTurns\(int limit\)/);
+  assert.match(plugin, /void\s+recentCompletedTurns\(PluginCall call\)/);
+  assert.match(html, /async function\s+replayRecentNativeCompletedTurns\(/);
+  assert.match(html, /plugin\.recentCompletedTurns\(\{\s*limit:\s*50\s*\}\)/);
+  assert.match(html, /changed\s*=\s*await\s+replayRecentNativeCompletedTurns\(plugin\)\s*\|\|\s*changed/);
+  const landing = html.slice(
+    html.indexOf('function nativeTurnHasUiLanding'),
+    html.indexOf('async function drainNativeUiInbox')
+  );
+  assert.match(landing, /message\.sourceTurnId\s*===\s*sourceTurnId/);
+  assert.doesNotMatch(landing, /message\.replyToMessageId\s*===\s*userMessage\.id/);
+});
+
 test('native text bubbles use deterministic per-turn part and chunk identities', () => {
   assert.match(html, /function\s+nativeReplyBubbleId\(turnId,\s*replyPartId,\s*chunkIndex\)/);
   assert.match(html, /nativeReplyBubbleId\(result\.turnId,\s*part\.replyPartId,\s*index\)/);

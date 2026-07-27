@@ -154,6 +154,9 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL AND uiAppliedAt IS NULL ORDER BY completedAt ASC LIMIT :limit")
     List<ChatTurnEntity> unappliedCompletedTurns(int limit);
 
+    @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT :limit")
+    List<ChatTurnEntity> recentCompletedTurns(int limit);
+
     @Query("UPDATE chat_turns SET uiAppliedAt = :now WHERE turnId = :turnId AND state = 'COMPLETED' AND uiAppliedAt IS NULL")
     int acknowledgeUiApplied(String turnId, long now);
 

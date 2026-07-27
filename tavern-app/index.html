@@ -1594,6 +1594,7 @@ let voiceStartAt = 0;
 let voiceRecordingCharId = '';
 let nativeReplyPollTimer = null;
 let nativeExecutionReconcilePromise = null;
+let lastNativeCompletedRecoveryAt = 0;
 const nativeReplyQueuedIds = new Set();
 const nativeTurnApplyPromises = new Map();
 const EMPTY_REPLY_TEXT = '（对方没有回复）';
@@ -3064,12 +3065,7 @@ function nativeTurnHasUiLanding(result) {
   if (['PROACTIVE_CHAT', 'ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE'].includes(kind)) {
     return (chat.messages || []).some(message => message.sourceTurnId === sourceTurnId);
   }
-  const userMessage = messageById(chat, result?.sourceMessageId);
-  if (!userMessage) return false;
-  return (chat.messages || []).some(message =>
-    message.sourceTurnId === sourceTurnId
-    || (message.role === 'assistant' && message.replyToMessageId === userMessage.id)
-  );
+  return (chat.messages || []).some(message => message.sourceTurnId === sourceTurnId);
 }
 async function drainNativeUiInbox(
   plugin,
@@ -3089,6 +3085,27 @@ async function drainNativeUiInbox(
       await plugin.acknowledgeUiApplied({ turnId: result.turnId });
     } catch (err) {
       console.warn('[AL Native Execution] inbox item deferred:', result?.turnId, err.message);
+    }
+  }
+  return changed;
+}
+async function replayRecentNativeCompletedTurns(
+  plugin,
+  applyTurn = applyNativeExecutionTurn,
+  hasLanded = nativeTurnHasUiLanding
+) {
+  if (!plugin?.recentCompletedTurns) return false;
+  const page = await plugin.recentCompletedTurns({ limit: 50 });
+  const turns = (Array.isArray(page?.turns) ? page.turns : [])
+    .slice()
+    .sort((a, b) => Number(a.completedAt || a.createdAt) - Number(b.completedAt || b.createdAt));
+  let changed = false;
+  for (const result of turns) {
+    if (hasLanded(result)) continue;
+    try {
+      changed = await applyTurn(result) || changed;
+    } catch (err) {
+      console.warn('[AL Native Execution] completed recovery deferred:', result?.turnId, err.message);
     }
   }
   return changed;
@@ -3403,6 +3420,11 @@ async function reconcileNativeExecutionTurnsUnlocked() {
   const cursorKey = 'rpchat_native_execution_cursor';
   let cursor = Number(localStorage.getItem(cursorKey)) || 0;
   let changed = await drainNativeUiInbox(plugin);
+  const now = Date.now();
+  if (now - lastNativeCompletedRecoveryAt >= 60 * 1000) {
+    lastNativeCompletedRecoveryAt = now;
+    changed = await replayRecentNativeCompletedTurns(plugin) || changed;
+  }
   if (plugin.changesSince) {
     const page = await plugin.changesSince({ cursor, limit: 200 });
     for (const event of Array.isArray(page?.changes) ? page.changes : []) {
