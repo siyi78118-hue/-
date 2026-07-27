@@ -9,7 +9,7 @@ import androidx.room.PrimaryKey;
 @Entity(
     tableName = "chat_turns",
     indices = {
-        @Index(value = {"sourceMessageId"}, unique = true),
+        @Index(value = {"sourceMessageId"}),
         @Index(value = {"cloudJobId"}, unique = true),
         @Index(value = {"state", "createdAt"})
     }

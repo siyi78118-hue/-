@@ -150,6 +150,17 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void freshRetryTurnCanShareCanonicalSourceMessage() {
+        store.submitTurn(submission("turn-original", "msg-shared"));
+        store.submitTurn(submission("turn-retry", "msg-shared"));
+
+        assertEquals("turn-original", store.turn("turn-original").turnId);
+        assertEquals("turn-retry", store.turn("turn-retry").turnId);
+        assertEquals(1, database.executionDao().attempts("turn-original").size());
+        assertEquals(1, database.executionDao().attempts("turn-retry").size());
+    }
+
+    @Test
     public void cancelledTurnRejectsLateReplyCommit() {
         store.submitTurn(submission("turn-4", "msg-4"));
         String cancelledAttempt = store.activeAttempt("turn-4").attemptId;

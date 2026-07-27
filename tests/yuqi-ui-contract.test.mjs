@@ -7,6 +7,8 @@ const engine = readFileSync('android/app/src/main/java/com/siyi/al/execution/Exe
 const plugin = readFileSync('android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java', 'utf8');
 const executionStore = readFileSync('android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java', 'utf8');
 const executionDao = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java', 'utf8');
+const executionDatabase = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java', 'utf8');
+const chatTurnEntity = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/ChatTurnEntity.java', 'utf8');
 const executionService = readFileSync('android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java', 'utf8');
 const worker = readFileSync('tavern-app/sw-v11.js', 'utf8');
 const corePreset = readFileSync('tavern-app/lib/yuqi-core-preset.js', 'utf8');
@@ -187,6 +189,66 @@ test('native retry creates a fresh execution turn for the canonical message', ()
   assert.match(retry, /nativeRetryTurnIdForMessage\(userMessageId\)/);
   assert.match(retry, /plugin\.submitTurn\(\{[\s\S]*?turnId[\s\S]*?inputJson:[\s\S]*?retryOfTurnId[\s\S]*?canonicalMessageId:\s*userMessageId[\s\S]*?snapshotJson:\s*JSON\.stringify\(snapshot\)/);
   assert.doesNotMatch(retry, /plugin\.retryTurn/);
+});
+
+test('Room persists fresh retry turns and only deduplicates an exact turn id', () => {
+  assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
+  assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
+  assert.match(executionDatabase, /version\s*=\s*9/);
+  assert.match(executionDatabase, /new Migration\(8,\s*9\)/);
+  assert.match(executionDatabase, /DROP INDEX IF EXISTS `index_chat_turns_sourceMessageId`/);
+  assert.match(executionDatabase, /CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId`/);
+  const submit = executionStore.slice(
+    executionStore.indexOf('public ChatTurnEntity submitTurn'),
+    executionStore.indexOf('public ExecutionAttemptEntity startRetry')
+  );
+  assert.match(submit, /dao\.turn\(submission\.turnId\)/);
+  assert.doesNotMatch(submit, /dao\.turnBySourceMessage\(submission\.sourceMessageId\)/);
+});
+
+test('native retry is accepted only when Room returns the requested turn id', () => {
+  const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
+  assert.match(retry, /String\(result\?\.turnId\s*\|\|\s*''\)\s*!==\s*turnId/);
+  assert.match(retry, /throw new Error\(/);
+  assert.ok(
+    retry.indexOf("String(result?.turnId || '') !== turnId") < retry.indexOf('nativeAcceptedAt'),
+    'a mismatched native turn must be rejected before the retry is marked accepted'
+  );
+});
+
+test('a completed retry ancestor wins over its pending descendant', () => {
+  const lineageStart = html.indexOf('function nativePendingRetryLineage');
+  const supersededStart = html.indexOf('function nativeDirectTurnIsSuperseded');
+  const applyStart = html.indexOf('async function applyNativeExecutionTurnUnlocked');
+  assert.ok(lineageStart >= 0 && supersededStart > lineageStart && applyStart > supersededStart);
+  const makeHelpers = new Function(
+    `${html.slice(lineageStart, supersededStart)}
+     ${html.slice(supersededStart, applyStart)}
+     return { nativePendingRetryLineage, nativeDirectTurnIsSuperseded };`
+  );
+  const { nativeDirectTurnIsSuperseded } = makeHelpers();
+  const chat = {
+    pendingReply: {
+      userMessageId: 'msg-1',
+      nativeTurnId: 'turn-retry-2',
+      retryOfTurnId: 'turn-retry-1',
+      retryLineageTurnIds: ['turn-original', 'turn-retry-1']
+    },
+    messages: []
+  };
+
+  assert.equal(nativeDirectTurnIsSuperseded(chat, {
+    kind: 'DIRECT_REPLY',
+    state: 'COMPLETED',
+    sourceMessageId: 'msg-1',
+    turnId: 'turn-original'
+  }), false);
+  assert.equal(nativeDirectTurnIsSuperseded(chat, {
+    kind: 'DIRECT_REPLY',
+    state: 'COMPLETED',
+    sourceMessageId: 'msg-1',
+    turnId: 'turn-unrelated'
+  }), true);
 });
 
 test('a superseded direct turn cannot render or apply actions', () => {
