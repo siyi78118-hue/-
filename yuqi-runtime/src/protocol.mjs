@@ -272,7 +272,11 @@ function validateUserMessage(message, envelope) {
   if (typeof message.content !== 'string' || !message.content.trim()) throw new Error('empty message content');
   if (message.content.length > 100_000) throw new Error('message content too large');
   if (message.attachments !== undefined) {
-    message.attachments = validateImageAttachments(message.attachments, message.messageId);
+    if (Array.isArray(message.attachments) && message.attachments.length === 0) {
+      delete message.attachments;
+    } else {
+      message.attachments = validateImageAttachments(message.attachments, message.messageId);
+    }
   }
   return message;
 }

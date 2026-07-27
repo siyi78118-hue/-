@@ -3531,6 +3531,10 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     const snapshot = await buildNativeExecutionSnapshot(charId, task);
     const wireOptions = { ...task.options };
     delete wireOptions.attachments;
+    const wireAttachments = (task.options.attachments?.length
+      ? task.options.attachments
+      : messageAttachmentsForAI(userMessage))
+      .map(item => ({ ...item, messageId: userMessageId }));
     const result = await plugin.submitTurn({
       turnId,
       characterId: charId,
@@ -3545,8 +3549,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
           speakerType: 'user',
           recipientId: charId,
           content: messageContentForAI(userMessage),
-          attachments: (task.options.attachments || messageAttachmentsForAI(userMessage))
-            .map(item => ({ ...item, messageId: userMessageId })),
+          ...(wireAttachments.length ? { attachments: wireAttachments } : {}),
           quote: userMessage.quote || null,
           sentAt: Number(userMessage.time) || task.createdAt
         },

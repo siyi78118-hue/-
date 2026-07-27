@@ -13,9 +13,9 @@ test('release builds remain unsigned when the formal keystore is unavailable', (
 });
 
 test('formal signing uses the explicit Android release version instead of the workflow run number', () => {
-  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "98"/);
-  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.98"/);
-  assert.match(androidWorkflow, /AL_RELEASE_VERSION_CODE:\s*98/);
-  assert.match(androidWorkflow, /AL_RELEASE_VERSION_NAME:\s*1\.0\.98/);
+  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "99"/);
+  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.99"/);
+  assert.match(androidWorkflow, /AL_RELEASE_VERSION_CODE:\s*99/);
+  assert.match(androidWorkflow, /AL_RELEASE_VERSION_NAME:\s*1\.0\.99/);
   assert.doesNotMatch(androidWorkflow, /github\.run_number/);
 });
