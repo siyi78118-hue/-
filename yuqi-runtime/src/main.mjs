@@ -34,7 +34,7 @@ const orchestrator = new YuqiOrchestrator({
   presets,
   codex,
   contextLimit: 200,
-  generationContextLimit: 24,
+  generationContextLimit: 20,
   roleProfiles: config.roleProfiles
 });
 const reconciler = new YuqiReconciler({ store, codex });

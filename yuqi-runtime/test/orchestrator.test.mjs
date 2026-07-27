@@ -604,7 +604,7 @@ test('fast memory escalation starts a new Sol memory turn before brain', async (
   });
 });
 
-test('keeps 200 evidence messages but gives brain and supervisor 24 deduplicated history messages', async () => {
+test('keeps 200 evidence messages but gives brain and supervisor 20 complete history messages', async () => {
   await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
     for (let index = 1; index <= 205; index += 1) {
       store.putMessage({
@@ -628,8 +628,8 @@ test('keeps 200 evidence messages but gives brain and supervisor 24 deduplicated
     const supervisorInput = codex.calls.find(call => call.role === 'supervisor').input;
     assert.equal(memoryInput.recentMessages.length, 200);
     assert.ok(memoryInput.recentMessages.every(message => message.messageId && message.speakerId));
-    assert.equal(brainInput.recentMessages.length, 24);
-    assert.equal(supervisorInput.recentMessages.length, 24);
+    assert.equal(brainInput.recentMessages.length, 20);
+    assert.equal(supervisorInput.recentMessages.length, 20);
     assert.equal(brainInput.recentMessages.some(message => message.messageId === input.message.messageId), false);
     assert.equal(supervisorInput.recentMessages.some(message => message.messageId === input.message.messageId), false);
     assert.equal(brainInput.currentUserMessage.messageId, input.message.messageId);

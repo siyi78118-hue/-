@@ -734,10 +734,10 @@ test('proactive chat delivery policy allows at most one committed skip in the la
     'turn_policy_proactive_chat_3',
     'turn_policy_proactive_chat_2'
   ]);
-  assert.equal(policy.resetAfterTurnId, 'turn_policy_direct_1');
+  assert.equal(policy.resetAfterTurnId, null);
 }));
 
-test('proactive chat delivery policy resets after a new canonical direct user message', () => withStore(({ store }) => {
+test('proactive chat delivery policy is not reset by a new canonical direct user message', () => withStore(({ store }) => {
   commitAutomaticTurn(store, { seq: 2, action: 'skip' });
   store.submitTurn(validV2Envelope({
     turnId: 'turn_policy_direct_reset',
@@ -752,10 +752,10 @@ test('proactive chat delivery policy resets after a new canonical direct user me
 
   const policy = store.getProactiveChatDeliveryPolicy('yuqi');
 
-  assert.equal(policy.usedSkips, 0);
-  assert.equal(policy.skipAllowed, true);
-  assert.deepEqual(policy.inspectedTurnIds, []);
-  assert.equal(policy.resetAfterTurnId, 'turn_policy_direct_reset');
+  assert.equal(policy.usedSkips, 1);
+  assert.equal(policy.skipAllowed, false);
+  assert.deepEqual(policy.inspectedTurnIds, ['turn_policy_proactive_chat_2']);
+  assert.equal(policy.resetAfterTurnId, null);
 }));
 
 test('proactive chat delivery policy ignores failed turns and other automatic kinds', () => withStore(({ store }) => {

@@ -305,7 +305,7 @@ function proactiveDeliveryRewrite(previous = null, attempt = 1, originalDecision
 export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
-    generationContextLimit = 24, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null,
+    generationContextLimit = 20, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null,
     lifePlanningEnabled = true
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
@@ -315,7 +315,7 @@ export class YuqiOrchestrator {
     this.workerId = workerId;
     this.clock = clock;
     this.contextLimit = Math.max(1, Math.min(5000, Number(contextLimit) || 200));
-    this.generationContextLimit = Math.max(1, Math.min(200, Number(generationContextLimit) || 24));
+    this.generationContextLimit = Math.max(1, Math.min(200, Number(generationContextLimit) || 20));
     this.roleProfiles = roleProfiles;
     this.lifeSimulation = lifeSimulation || new LifeSimulationCoordinator({ store });
     this.lifePlanningEnabled = lifePlanningEnabled !== false;

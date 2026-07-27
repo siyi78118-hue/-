@@ -531,25 +531,15 @@ export class YuqiStore {
       0,
       Math.min(safeWindowSize, Number.isFinite(parsedMaxSkips) ? parsedMaxSkips : 1)
     );
-    const reset = this.db.prepare(`
-      SELECT t.turn_id, t.created_at
-      FROM messages m
-      JOIN turns t ON t.turn_id = m.turn_id
-      WHERE m.character_id = ? AND m.speaker_type = 'user'
-      ORDER BY t.created_at DESC
-      LIMIT 1
-    `).get(characterId);
-    const resetAt = reset?.created_at === undefined ? -1 : Number(reset.created_at);
     const rows = this.db.prepare(`
       SELECT turn_id, reply_json
       FROM turns
       WHERE character_id = ?
         AND state IN ('committed', 'delivered', 'completed')
         AND json_extract(envelope_json, '$.kind') = 'PROACTIVE_CHAT'
-        AND created_at > ?
       ORDER BY created_at DESC
       LIMIT ?
-    `).all(characterId, resetAt, safeWindowSize);
+    `).all(characterId, safeWindowSize);
     const usedSkips = rows.filter(row => parseJson(row.reply_json, {})?.action === 'skip').length;
     return {
       kind: 'proactive_chat',
@@ -558,7 +548,7 @@ export class YuqiStore {
       usedSkips,
       skipAllowed: usedSkips < safeMaxSkips,
       inspectedTurnIds: rows.map(row => row.turn_id),
-      resetAfterTurnId: reset?.turn_id || null
+      resetAfterTurnId: null
     };
   }
 
