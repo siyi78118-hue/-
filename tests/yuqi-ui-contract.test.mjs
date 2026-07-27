@@ -280,6 +280,94 @@ test('native completed turns are serialized across submit, poll, inbox, and fore
   assert.match(html, /if\s*\(nativeExecutionReconcilePromise\)\s*return\s+nativeExecutionReconcilePromise/);
 });
 
+test('long chats mount only the latest 120 visible messages and expand in bounded pages', () => {
+  assert.match(html, /const CHAT_RENDER_WINDOW_SIZE = 120;/);
+  assert.match(html, /const CHAT_RENDER_PAGE_SIZE = 120;/);
+  const selectStart = html.indexOf('function selectChatRenderWindow');
+  const windowStart = html.indexOf('function chatRenderWindow');
+  assert.ok(selectStart >= 0 && windowStart > selectStart);
+  const selectChatRenderWindow = new Function(
+    `${html.slice(selectStart, windowStart)}
+     return selectChatRenderWindow;`
+  )();
+  const messages = Array.from({ length: 1900 }, (_, index) => ({
+    id: `msg-${index}`,
+    role: index % 2 ? 'assistant' : 'user',
+    content: `message ${index}`
+  }));
+  messages[50].hidden = true;
+  messages[60].deleted = true;
+
+  const initial = selectChatRenderWindow(messages, 120);
+  assert.equal(initial.messages.length, 120);
+  assert.equal(initial.hiddenCount, 1778);
+  assert.equal(initial.messages[0].id, 'msg-1780');
+  const expanded = selectChatRenderWindow(messages, 240);
+  assert.equal(expanded.messages.length, 240);
+  assert.equal(expanded.messages[0].id, 'msg-1660');
+
+  const renderer = html.slice(html.indexOf('function renderMessages'), html.indexOf('function scrollChatBottom'));
+  assert.match(renderer, /const\s+renderWindow\s*=\s*chatRenderWindow\(chat,\s*currentCharId\)/);
+  assert.match(renderer, /loadOlderChatMessages\(currentCharId\)/);
+  assert.doesNotMatch(renderer, /const\s+displayMessages\s*=\s*visibleChatMessages\(chat\)/);
+  const opener = html.slice(html.indexOf('function openChat'), html.indexOf('function buildCharPrompt'));
+  assert.match(opener, /chatRenderLimits\.set\(charId,\s*CHAT_RENDER_WINDOW_SIZE\)/);
+});
+
+test('chat message actions use one delegated listener set instead of rebinding every bubble', () => {
+  const binding = html.slice(html.indexOf('function bindMessageActions'), html.indexOf('function startMessageLongPress'));
+  assert.match(binding, /root\.dataset\.messageActionsBound/);
+  assert.match(binding, /root\.addEventListener\('pointerdown'/);
+  assert.match(binding, /closest\('\[data-message-id\]'\)/);
+  assert.doesNotMatch(binding, /querySelectorAll/);
+  assert.doesNotMatch(binding, /\.forEach\(/);
+});
+
+test('native polling ignores elapsed-counter-only changes', () => {
+  const currentStart = html.indexOf('function nativePendingStateIsCurrent');
+  const needsSubmissionStart = html.indexOf('function nativePendingReplyNeedsSubmission');
+  assert.ok(currentStart >= 0 && needsSubmissionStart > currentStart);
+  const nativePendingStateIsCurrent = new Function(
+    `${html.slice(currentStart, needsSubmissionStart)}
+     return nativePendingStateIsCurrent;`
+  )();
+  const chat = {
+    pendingReply: {
+      nativeTurnId: 'turn-1',
+      state: 'running',
+      nativeState: 'CHAT_RUNNING',
+      nativeUpdatedAt: 10,
+      bridgeRoute: 'cloud',
+      bridgeDisplayStage: '正在想',
+      bridgeTechnicalStage: 'chat',
+      bridgeStageModel: 'model',
+      bridgeStageEffort: 'high',
+      bridgeStageElapsedMs: 1000,
+      bridgeTotalElapsedMs: 2000
+    }
+  };
+  const result = {
+    turnId: 'turn-1',
+    state: 'CHAT_RUNNING',
+    updatedAt: 10,
+    route: 'cloud',
+    displayStage: '正在想',
+    technicalStage: 'chat',
+    stageModel: 'model',
+    stageEffort: 'high',
+    stageElapsedMs: 4000,
+    totalElapsedMs: 5000
+  };
+  assert.equal(nativePendingStateIsCurrent(chat, { replyState: 'pending' }, result), true);
+  const apply = html.slice(
+    html.indexOf('const userMessage = messageById(chat, result?.sourceMessageId)'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  const currentCheckAt = apply.indexOf('nativePendingStateIsCurrent(chat, userMessage, result)');
+  const retryableAt = apply.indexOf("state === 'FAILED_RETRYABLE'");
+  assert.ok(currentCheckAt >= 0 && currentCheckAt < retryableAt, 'all nonterminal states must share the no-op guard');
+});
+
 test('acknowledged native completions remain recoverable until their exact bubble exists', () => {
   assert.match(executionDao, /state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT :limit/);
   assert.match(executionStore, /recentCompletedTurns\(int limit\)/);
