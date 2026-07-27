@@ -6,6 +6,7 @@ const source = readFileSync(new URL('../tavern-app/index.html', import.meta.url)
 const match = source.match(/combined:\s*\{[\s\S]*?prompt:\s*`([\s\S]*?)`\s*\r?\n\s*\},\s*\r?\n\s*custom:/);
 const runtimeCore = readFileSync(new URL('../yuqi-runtime/presets/yuqi-core.md', import.meta.url), 'utf8').trim();
 const memoryManager = readFileSync(new URL('../yuqi-runtime/presets/memory-manager.md', import.meta.url), 'utf8').trim();
+const presetManifest = JSON.parse(readFileSync(new URL('../yuqi-runtime/presets/manifest.json', import.meta.url), 'utf8'));
 
 assert.ok(match, '应能从 index.html 提取 AL 综合 RP 预设');
 const prompt = match[1];
@@ -86,4 +87,19 @@ test('移除与第二轮结论冲突的旧规则', () => {
   assert.doesNotMatch(prompt, /优先保留一个主要意图/);
   assert.doesNotMatch(prompt, /聊过几次且相处顺利后，角色主动说“下周那家店，你还去不去”/);
   assert.doesNotMatch(prompt, /普通邀约可以直接说“下周哪天”/);
+});
+
+test('第四轮让主动消息先判断沉默前因并把 skip 作为后备', () => {
+  assert.match(prompt, /先判断玩家未回复的前因/);
+  assert.match(prompt, /上一条主动消息的力度/);
+  assert.match(prompt, /skip 只是后备选项/);
+  assert.match(prompt, /经过数小时、隔夜或跨天后/);
+  assert.match(prompt, /仍会继续上课、工作、吃饭、休息/);
+  assert.match(prompt, /连续多次无理由不回/);
+});
+
+test('第四轮按整个发送回合判断完整性并登记 1.9.0', () => {
+  assert.match(prompt, /完整性按整个发送回合判断/);
+  assert.match(prompt, /同一回合内的多个气泡可以互相承接/);
+  assert.equal(presetManifest.currentVersion, '1.9.0');
 });

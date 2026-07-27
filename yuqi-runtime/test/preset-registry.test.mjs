@@ -25,7 +25,7 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.8.4');
+  assert.equal(current.version, '1.9.0');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
@@ -64,7 +64,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.8.4');
+    assert.equal(registry.current().version, '1.9.0');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -166,16 +166,16 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.8.5');
-  assert.equal(published.parentVersion, '1.8.4');
+  assert.equal(published.version, '1.9.1');
+  assert.equal(published.parentVersion, '1.9.0');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 2);
 
-  const rollback = registry.rollback('1.8.4');
-  assert.equal(rollback.version, '1.8.6');
-  assert.equal(rollback.parentVersion, '1.8.5');
-  assert.equal(rollback.rollbackOf, '1.8.4');
+  const rollback = registry.rollback('1.9.0');
+  assert.equal(rollback.version, '1.9.2');
+  assert.equal(rollback.parentVersion, '1.9.1');
+  assert.equal(rollback.rollbackOf, '1.9.0');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 3);
 }));
