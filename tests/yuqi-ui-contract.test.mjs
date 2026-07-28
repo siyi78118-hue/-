@@ -50,11 +50,13 @@ test('Yuqi Bridge submission does not require ordinary chat or memory AI setting
   assert.match(plugin, /secrets\.removeApiConfig\(configId\)/);
 });
 
-test('normal direct and background context is 200 raw messages', () => {
-  assert.match(engine, /source\.length\(\)\s*-\s*200/);
+test('memory evidence is 200 raw messages while chat generation is capped at 30', () => {
+  assert.match(engine, /source\.length\(\)\s*-\s*30/);
   assert.match(html, /const NORMAL_RAW_CONTEXT_LIMIT = 200;/);
   assert.match(worker, /const NORMAL_RAW_CONTEXT_LIMIT = 200;/);
-  assert.doesNotMatch(html, /固定最近30条|最近30条聊天会完整提供/);
+  assert.match(html, /const memoryRecent = sceneMessagesForAI\(chat, NORMAL_RAW_CONTEXT_LIMIT\)/);
+  assert.match(html, /const chatRecent = sceneMessagesForAI\(chat, 30\)/);
+  assert.match(html, /const messages = sceneMessagesForAI\(chat, 30,/);
 });
 
 test('private proactive chat uses the approved higher consideration cadence on foreground and worker paths', () => {
@@ -464,7 +466,7 @@ test('Android foreground proactive chat enters the native PROACTIVE_CHAT queue',
   );
   assert.match(proactive, /if\s*\(isNativeApp\(\)\)\s*\{\s*return\s+queueAndroidProactiveTurn/);
   assert.ok(
-    proactive.indexOf('if (isNativeApp())') < proactive.indexOf('prepareProactiveMemoryPack'),
+    proactive.indexOf('if (isNativeApp())') < proactive.indexOf('prepareConversationContextSafe'),
     'native delegation must happen before the legacy memory/chat API path'
   );
 });

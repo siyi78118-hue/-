@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const source = readFileSync('tavern-app/sw-v11.js', 'utf8');
+const directorSource = readFileSync('tavern-app/lib/live-chat-director.js', 'utf8');
 
 assert.match(source, /function automaticTasksEnabled\(currentSettings\s*=\s*\{\}\)/);
 assert.match(source, /async function automaticTasksStillEnabled\(\)/);
@@ -15,6 +16,7 @@ const context = vm.createContext({
   fetch: async () => { throw new Error('unexpected fetch'); },
   setTimeout,
   clearTimeout,
+  importScripts() {},
   caches: {
     open: async () => ({ addAll: async () => {}, put: async () => {} }),
     keys: async () => [],
@@ -35,6 +37,8 @@ const context = vm.createContext({
   }
 });
 
+vm.runInContext(directorSource, context, { filename: 'tavern-app/lib/live-chat-director.js' });
+context.self.ALLiveChatDirector = context.ALLiveChatDirector;
 vm.runInContext(source, context, { filename: 'tavern-app/sw-v11.js' });
 vm.runInContext('globalThis.__originalScheduleNextCloudProactive = scheduleNextCloudProactive;', context);
 

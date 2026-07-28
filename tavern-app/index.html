@@ -961,6 +961,7 @@ button.cell:active{background:#ececec}
 <script src="lib/api-endpoint.js"></script>
 <script src="./lib/role-plan-domain.js"></script>
 <script src="./lib/role-plan-repository.js"></script>
+<script src="./lib/live-chat-director.js"></script>
 <script src="./lib/yuqi-core-preset.js"></script>
 <script>
 const DB = {
@@ -1403,7 +1404,7 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-27.102';
+const APP_BUILD_VERSION = '2026-07-28.103';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -2668,11 +2669,19 @@ function buildYuqiDynamicScene(char, chat) {
     currentPhase: config.currentPhase
   };
 }
+function nativeDirectorMemorySystem(char, scene) {
+  return `你是 AL 的记忆筛选 AI。根据本轮触发和固定最近200条原文，从候选记忆中只挑选确实会改变本轮理解、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆时 memoryPack 写“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替${charName(char)}回复${playerName()}。
+同时生成本轮隐藏导演卡，只描述${charName(char)}此刻的理解、情绪、边界和回复方向。允许有证据的潜台词判断；证据不足时按字面含义和保守边界处理。
+只输出 JSON：
+{"memoryPack":"本轮相关记忆或无相关记忆","director":{"schemaVersion":1,"scene":"${scene}","timeGap":"instant|short|hours|overnight|days","silenceCause":"not_applicable|natural_pause|temporary_absence|conflict|explicit_distance|repeated_unexplained|uncertain","previousContactPressure":"none|low|medium|high","relationshipStageId":"new|acquainted|familiar|close|committed","playerIntent":"简短判断","playerIntentConfidence":0,"currentMood":"","moodCause":"","stanceTowardPlayer":"","ownLifeFocus":"","noticedPoint":"","replyImpulse":"answer|share|tease|refuse|check_in|repair|pause|skip","contactPressure":"low|medium|high","openingNeeded":false,"recommendedDirection":"","avoid":[],"evidenceMessageIds":[],"confidence":0}}
+director 不是台词提纲，不得写${charName(char)}要直接发送的句子。`;
+}
 async function buildNativeExecutionSnapshot(charId, task) {
   const char = characters.find(item => item.id === charId);
   const chat = allChats[charId];
   if (!char || !chat) throw new Error('找不到待回复的角色或会话');
-  const recent = sceneMessagesForAI(chat, NORMAL_RAW_CONTEXT_LIMIT);
+  const memoryRecent = sceneMessagesForAI(chat, NORMAL_RAW_CONTEXT_LIMIT);
+  const chatRecent = sceneMessagesForAI(chat, 30);
   const memory = await dumpCharacterMemoryForRunner(charId);
   const candidates = nativeMemoryCandidateText(memory, char) || '本地记忆库暂无可用记录。';
   const prompt = buildChatSceneSystem(char, chat, {
@@ -2680,18 +2689,22 @@ async function buildNativeExecutionSnapshot(charId, task) {
     memoryPack: '',
     returnPromptDetails: true
   });
+  const now = new Date();
+  const nativeScene = task.options?.payment ? 'payment' : 'chat';
   return {
     scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
+    playerName: playerName(),
     memoryConfigId: 'memory-v1',
     chatConfigId: 'chat-v1',
-    memorySystem: `你是 AL 的记忆筛选 AI。根据玩家本次消息和固定最近200条原文，从候选记忆中只挑选确实会改变本轮理解、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替角色回复玩家。只输出给聊天 AI 的简洁记忆补充，不输出 JSON。`,
-    memoryMessages: [{ role: 'user', content: `双方昵称：${playerName()} / ${charName(char)}\n玩家本次消息：${task.userText}\n\n固定最近200条原文：\n${recent.map((row, index) => `${index + 1}. ${row.role}: ${row.content}`).join('\n')}\n\n候选本地记忆：\n${candidates}` }],
+    memorySystem: nativeDirectorMemorySystem(char, nativeScene),
+    memoryMessages: [{ role: 'user', content: `双方昵称：${playerName()} / ${charName(char)}\n玩家本次消息：${task.userText}\n\n固定最近200条原文：\n${memoryRecent.map((row, index) => `${index + 1}. ${row.role}: ${row.content}`).join('\n')}\n\n候选本地记忆：\n${candidates}` }],
     memoryMaxTokens: 1400,
     chatSystem: prompt.system,
-    chatMessages: recent,
+    chatMessages: chatRecent,
+    directorContext: directorContextForChat(char, memoryRecent, nativeScene, now),
     chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
-    createdAt: new Date().toISOString()
+    createdAt: now.toISOString()
   };
 }
 
@@ -2740,11 +2753,14 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     playerName: playerName(),
     memoryConfigId: 'memory-v1',
     chatConfigId: 'chat-v1',
-    memorySystem: `你是 AL 的记忆筛选 AI。当前是${kind === 'moment' ? '角色主动发布朋友圈' : '角色主动发起私聊'}场景。只从候选记忆中挑选确实会改变本次表达、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替角色输出正文。只输出给聊天 AI 的简洁记忆补充。`,
+    memorySystem: kind === 'moment'
+      ? `你是 AL 的记忆筛选 AI。当前是角色主动发布朋友圈场景。只从候选记忆中挑选确实会改变本次表达、称呼、边界、约定、金钱、关系或话题选择的记录。没有相关记忆就只输出“无相关记忆”。保留事件原始日期和双方昵称，禁止把昨天写成今天，禁止代替角色输出正文。只输出给聊天 AI 的简洁记忆补充。`
+      : nativeDirectorMemorySystem(char, 'proactive-chat'),
     memoryMessages: [{ role: 'user', content: `${memoryQuery}\n\n候选本地记忆：\n${candidates}` }],
     memoryMaxTokens: 1400,
     chatSystem,
     chatMessages,
+    directorContext: kind === 'chat' ? directorContextForChat(char, sceneMessagesForAI(chat, NORMAL_RAW_CONTEXT_LIMIT), 'proactive-chat', now) : null,
     chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
     proactiveKind: kind,
     proactiveMode: triggerMode,
@@ -4786,6 +4802,13 @@ function recordModelCall(entry = {}) {
       historyOmitted: Math.max(0, Number(entry.historyOmitted) || 0),
       memoryChars: Number(entry.memoryChars) || 0,
       memoryStatus: compactLogText(entry.memoryStatus || '', 240),
+      directorSource: compactLogText(entry.directorSource || '', 32),
+      directorScene: compactLogText(entry.directorScene || '', 32),
+      directorConfidence: Math.max(0, Math.min(1, Number(entry.directorConfidence) || 0)),
+      directorPreview: compactLogText(entry.directorPreview || '', 180),
+      qualityCodes: (Array.isArray(entry.qualityCodes) ? entry.qualityCodes : []).map(code => compactLogText(code, 60)).slice(0, 12),
+      rewriteAttempted: entry.rewriteAttempted === true,
+      rewriteOutcome: compactLogText(entry.rewriteOutcome || 'not-needed', 32),
       promptBlocks: promptBlocks.slice(0, 20).map(block => ({
         id: compactLogText(block.id || '', 80),
         priority: Number(block.priority) || 0,
@@ -6531,6 +6554,10 @@ function buildChatSceneSystem(char, chat, options = {}) {
   composer.add('moment-context', momentContext, { priority: 20 });
   composer.add('memory-pack', options.memoryPack, { priority: 30 });
   composer.add('role-schedule-context', roleScheduleContextForPrompt(char.id), { priority: 31 });
+  composer.add('live-director-card', options.directorText, {
+    priority: 32,
+    scenes: ['chat', 'proactive-chat']
+  });
   composer.add('role-plan-contract', `角色可以自主安排未来私聊、朋友圈和自己的日程。
 当前有效计划目录：
 ${rolePlanCatalogForPrompt(char.id)}
@@ -6702,10 +6729,43 @@ function buildMemorySceneSystem(char, sceneLabel, sceneKey, taskRules) {
   composer.add('memory-output-format', '只输出 JSON，不要输出解释。', { priority: 90 });
   return composer.compile();
 }
-function buildMemoryQueryPayload(char, userInput, messages) {
+function inferPreviousContactPressure(messages = []) {
+  const visible = (Array.isArray(messages) ? messages : []).filter(messageAvailableToAI);
+  const lastUserIndex = visible.map(row => row.role).lastIndexOf('user');
+  const assistantSinceUser = visible.slice(lastUserIndex + 1)
+    .filter(row => row.role === 'assistant' && row.proactive && row.proactiveMode !== 'manual');
+  if (!assistantSinceUser.length) return 'none';
+  const text = assistantSinceUser.map(row => String(row.content || '')).join('\n');
+  const directRequest = /(?:回我|理我|说话|在吗|怎么不回|为什么不回)/.test(text);
+  const complaint = /(?:又不回|一直不回|每次都|算了|随便你|当我没说|不想理我)/.test(text);
+  if (assistantSinceUser.length >= 2 && (directRequest || complaint)) return 'high';
+  if (directRequest || complaint) return 'medium';
+  return 'low';
+}
+function directorContextForChat(char, messages, scene, now = new Date()) {
+  const visible = (Array.isArray(messages) ? messages : []).filter(messageAvailableToAI);
+  const last = visible.at(-1);
+  const lastUser = [...visible].reverse().find(row => row.role === 'user');
+  const lastAssistant = [...visible].reverse().find(row => row.role === 'assistant');
+  return {
+    scene: scene === 'proactive-chat' ? 'proactive-chat' : scene === 'payment' ? 'payment' : 'chat',
+    nowMs: now.getTime(),
+    lastMessageAt: Number(last?.time) || 0,
+    lastUserAt: Number(lastUser?.time) || 0,
+    lastAssistantAt: Number(lastAssistant?.time) || 0,
+    lastAssistantText: String(lastAssistant?.content || ''),
+    latestMessageIds: visible.slice(-NORMAL_RAW_CONTEXT_LIMIT).map(row => row.id).filter(Boolean),
+    relationshipStageId: stagePersonaFor(char).id,
+    previousContactPressure: inferPreviousContactPressure(visible)
+  };
+}
+function buildMemoryQueryPayload(char, userInput, messages, options = {}) {
   const stageConfig = normalizeStagePersonaConfig(char);
   const currentStage = stagePersonaFor(char);
   const stageCatalog = stageConfig.stages.map(stage => `${stage.id}=${stage.label}`).join('，');
+  const scene = options.scene === 'proactive-chat' ? 'proactive-chat' : 'chat';
+  const now = options.now instanceof Date ? options.now : new Date();
+  const directorContext = options.directorContext || directorContextForChat(char, messages, scene, now);
   const system = buildMemorySceneSystem(char, '检索', 'memory-query', `任务一：根据当前输入、最近聊天和后台场景事件，生成向量数据库召回用的检索查询。
 规则 1：玩家当前输入或当前触发原因是最高优先级。先判断这次说话真正需要什么记忆，再使用最近200条聊天消除指代歧义。
 正例：${playerName()}说“昨天那件事你想好了吗”，结合最近200条确认“那件事”指红包是否领取，再检索对应红包。
@@ -6736,20 +6796,29 @@ function buildMemoryQueryPayload(char, userInput, messages) {
 正例：角色明确接受表白，双方确认恋爱关系，可以建议进入 committed。
 反例：角色只说“你人还不错”，不能因此跨阶段。
 规则 10：不确定时必须保持 currentStage，confidence 不得虚高。阶段变化至少给出最近200条中真实存在的 evidenceMessageIds。
-输出 JSON 结构：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","relationshipStage":{"current":"当前阶段ID","recommended":"建议阶段ID","confidence":0到1,"reason":"判断原因","evidenceMessageIds":["消息ID"],"explicitMutualChange":false}}`);
+任务三：生成本轮隐藏导演卡。它只描述角色当前理解、情绪、边界和回复方向，不写可直接发送的台词。
+普通私聊只判断玩家当前消息；主动私聊还要判断未回复前因、上一轮联系压力和真实时间间隔。
+允许有证据的潜台词判断，但低置信度时必须按字面含义和保守边界处理。
+导演卡不是台词提纲，不得写可直接复制发送的句子；所有意图、情绪原因和沉默原因必须由最近原文、时间或记忆支持。
+director 必须包含：schemaVersion、scene、timeGap、silenceCause、previousContactPressure、relationshipStageId、playerIntent、playerIntentConfidence、currentMood、moodCause、stanceTowardPlayer、ownLifeFocus、noticedPoint、replyImpulse、contactPressure、openingNeeded、recommendedDirection、avoid、evidenceMessageIds、confidence。
+输出 JSON 结构：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","relationshipStage":{"current":"当前阶段ID","recommended":"建议阶段ID","confidence":0到1,"reason":"判断原因","evidenceMessageIds":["消息ID"],"explicitMutualChange":false},"director":{"schemaVersion":1,"scene":"chat|proactive-chat","timeGap":"instant|short|hours|overnight|days","silenceCause":"not_applicable|natural_pause|temporary_absence|conflict|explicit_distance|repeated_unexplained|uncertain","previousContactPressure":"none|low|medium|high","relationshipStageId":"new|acquainted|familiar|close|committed","playerIntent":"简短判断","playerIntentConfidence":0到1,"currentMood":"最多24字","moodCause":"最多48字","stanceTowardPlayer":"最多36字","ownLifeFocus":"最多48字或空字符串","noticedPoint":"最多48字","replyImpulse":"answer|share|tease|refuse|check_in|repair|pause|skip","contactPressure":"low|medium|high","openingNeeded":false,"recommendedDirection":"只写方向，最多80字","avoid":["最多5项"],"evidenceMessageIds":["消息ID"],"confidence":0到1}}`);
   const user = `双方昵称：${playerName()} / ${charName(char)}
 初始关系设定：${char.scenario || '未填写'}
 当前关系阶段：${currentStage.id}=${currentStage.label}
 可用阶段顺序：${stageCatalog}
 当前阶段开始时间：${formatFullTime(new Date(stageConfig.state?.since || Date.now()))}
 当前阶段形成原因：${stageConfig.state?.reason || '暂无'}
+本轮场景：${scene}
+当前设备时间：${formatFullTime(now)}（${getDayPeriod(now)}）
+距离最后一条消息：${directorContext.lastMessageAt ? formatElapsed(now.getTime() - directorContext.lastMessageAt) : '无可用记录'}
+上一轮联系压力：${directorContext.previousContactPressure}
 固定最近200条聊天与场景事件（仅用于判断当前输入是否指向旧内容，不得自行续写）：
 ${messages.slice(-NORMAL_RAW_CONTEXT_LIMIT).map(m => memoryEvidenceLine(m, char)).join('\n')}
 
 当前输入或触发原因：
 ${userInput}
 
-输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","relationshipStage":{"current":"${currentStage.id}","recommended":"${currentStage.id}","confidence":0.5,"reason":"保持或变化的原因","evidenceMessageIds":[],"explicitMutualChange":false}}`;
+输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","relationshipStage":{"current":"${currentStage.id}","recommended":"${currentStage.id}","confidence":0.5,"reason":"保持或变化的原因","evidenceMessageIds":[],"explicitMutualChange":false},"director":{"schemaVersion":1,"scene":"${scene}","timeGap":"instant","silenceCause":"${scene === 'chat' ? 'not_applicable' : 'uncertain'}","previousContactPressure":"${directorContext.previousContactPressure}","relationshipStageId":"${currentStage.id}","playerIntent":"","playerIntentConfidence":0,"currentMood":"","moodCause":"","stanceTowardPlayer":"","ownLifeFocus":"","noticedPoint":"","replyImpulse":"${scene === 'chat' ? 'answer' : 'share'}","contactPressure":"low","openingNeeded":false,"recommendedDirection":"","avoid":[],"evidenceMessageIds":[],"confidence":0}}`;
   return { system, user };
 }
 function buildMemoryExtractPayload(char, batch, oldSummaries) {
@@ -7569,9 +7638,24 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
   const run = (async () => {
     try {
       mirrorAppState().catch(err => console.warn('[AL State] user turn mirror skipped:', err.message));
-      const memoryPack = await prepareMemoryPackSafe(requestCharId, userText, 'chat', { signal: controller.signal });
+      const conversationContext = await prepareConversationContextSafe(
+        requestCharId,
+        userText,
+        'chat',
+        { signal: controller.signal }
+      );
       if (controller.signal.aborted || !messageAvailableToAI(userMessage)) return '';
-      const reply = await callAPI(chat, memoryPack, { charId: requestCharId, payment: options.payment, memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot()), signal: controller.signal, live: false });
+      const request = buildChatRequest(chat, conversationContext, {
+        charId: requestCharId,
+        payment: options.payment,
+        signal: controller.signal,
+        live: false
+      });
+      const rawReply = await executeChatRequest(request);
+      const quality = await ensureForegroundReplyQuality(rawReply, request, conversationContext, {
+        signal: controller.signal
+      });
+      const reply = quality.reply;
       clearStreamingDraft(requestCharId);
       if (controller.signal.aborted || !messageAvailableToAI(userMessage) || chat.pendingReply?.requestToken !== requestToken) return '';
       const rolePlanDirective = extractRolePlanDirective(reply);
@@ -8259,7 +8343,7 @@ async function generateMemoryQuery(char, userInput, messages, scene = 'memory-qu
     setMemoryQueryStatus(`跳过记忆AI筛选：记忆接口${missing.join('、')}未配置，已改用本地关键词检索。`);
     return { ...fallback, _memoryAiStatus: 'skipped' };
   }
-  const payload = buildMemoryQueryPayload(char, userInput, messages);
+  const payload = buildMemoryQueryPayload(char, userInput, messages, options);
   try {
     setMemoryQueryStatus(`正在调用记忆AI筛选本轮相关记忆（${queryScene}）。`);
     const json = await callMemoryJSON(payload.system, payload.user, { scene: queryScene, charId: char?.id || '', signal: options.signal });
@@ -8355,14 +8439,7 @@ async function applyRelationshipStageReview(char, chat, review, recent = []) {
   await saveVector(char.id, 'event', event.id, memoryTextForVector(event), event.keywords, event.importance);
   return true;
 }
-async function prepareMemoryPack(charId, userInput, scene = 'chat', options = {}) {
-  const chat = allChats[charId];
-  const char = characters.find(c => c.id === charId);
-  if (!chat || !char) return '';
-  ensureChatMessageIds(chat);
-  const recent = recentMessages(chat, NORMAL_RAW_CONTEXT_LIMIT);
-  const query = await generateMemoryQuery(char, userInput, recent, scene, options);
-  await applyRelationshipStageReview(char, chat, query.relationshipStage || query.stageReview, recent);
+async function recallMemoryPackFromQuery(charId, char, query, userInput) {
   const queryText = [query.query, userInput, ...(query.keywords || [])].filter(Boolean).join(' ');
   const [hits, allSummaries, allEvents, allProfiles] = await Promise.all([
     searchMemoryVectors(charId, queryText),
@@ -8375,8 +8452,12 @@ async function prepareMemoryPack(charId, userInput, scene = 'chat', options = {}
     setMemoryQueryStatus(`记忆AI已调用；关键词：${keywordText}；向量库召回 ${hits.length} 条。`);
   }
   const vectorKeys = new Set(hits.map(hit => `${hit.sourceType}:${hit.sourceId}`));
-  const keywordHits = searchKeywordMemoryRows({ summaries: allSummaries, events: allEvents, profiles: allProfiles }, queryText, query.keywords || [], char)
-    .filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
+  const keywordHits = searchKeywordMemoryRows(
+    { summaries: allSummaries, events: allEvents, profiles: allProfiles },
+    queryText,
+    query.keywords || [],
+    char
+  ).filter(hit => !vectorKeys.has(`${hit.sourceType}:${hit.sourceId}`));
   return composeMemoryPackSections(
     '以下是记忆AI根据玩家本次发言筛选出的本地记忆补充。它们不是必须逐条提起：只有确实能帮助理解、回应、称呼、处理约定或保持关系连续时才自然使用；与本轮无关的旧事保持沉默。不要提到“记忆库/向量/摘要/系统提示”，不要照搬结构化文字，仍然只输出角色发来的聊天消息。',
     [
@@ -8385,12 +8466,50 @@ async function prepareMemoryPack(charId, userInput, scene = 'chat', options = {}
     ]
   );
 }
-async function prepareMemoryPackSafe(charId, userInput, scene = 'chat', options = {}) {
+async function prepareConversationContext(charId, userInput, scene = 'chat', options = {}) {
+  const chat = allChats[charId];
+  const char = characters.find(c => c.id === charId);
+  if (!chat || !char) throw new Error('找不到记忆检索对应的角色或会话');
+  ensureChatMessageIds(chat);
+  const recent = recentMessages(chat, NORMAL_RAW_CONTEXT_LIMIT);
+  const normalizedScene = scene.includes('proactive') ? 'proactive-chat' : 'chat';
+  const now = options.now instanceof Date ? options.now : new Date();
+  const directorContext = options.directorContext || directorContextForChat(char, recent, normalizedScene, now);
+  const query = await generateMemoryQuery(char, userInput, recent, scene, {
+    ...options,
+    scene: normalizedScene,
+    now,
+    directorContext
+  });
+  await applyRelationshipStageReview(char, chat, query.relationshipStage || query.stageReview, recent);
+  const normalized = ALLiveChatDirector.normalizeDirectorCard(query.director, directorContext);
+  const memoryPack = await recallMemoryPackFromQuery(charId, char, query, userInput);
+  return {
+    memoryPack,
+    directorCard: normalized.card,
+    directorText: ALLiveChatDirector.formatDirectorCard(normalized.card, {
+      playerName: playerName(),
+      characterName: charName(char)
+    }),
+    directorSource: normalized.source === 'invalid' ? 'fallback' : normalized.source,
+    directorIssues: normalized.issues || [],
+    memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot())
+  };
+}
+async function prepareMemoryPack(charId, userInput, scene = 'chat', options = {}) {
+  return (await prepareConversationContext(charId, userInput, scene, options)).memoryPack;
+}
+async function prepareConversationContextSafe(charId, userInput, scene = 'chat', options = {}) {
   try {
-    return await prepareMemoryPack(charId, userInput, scene, options);
+    return await prepareConversationContext(charId, userInput, scene, options);
   } catch (err) {
     if (options.signal?.aborted || err?.name === 'AbortError') throw err;
     const char = characters.find(c => c.id === charId);
+    const chat = allChats[charId];
+    const normalizedScene = scene.includes('proactive') ? 'proactive-chat' : 'chat';
+    const now = options.now instanceof Date ? options.now : new Date();
+    const context = directorContextForChat(char, recentMessages(chat, NORMAL_RAW_CONTEXT_LIMIT), normalizedScene, now);
+    const card = ALLiveChatDirector.fallbackDirectorCard(context);
     const message = `记忆检索失败：${friendlyErrorMessage(err)}；已跳过记忆包继续生成。`;
     console.warn('[AL Memory] safe fallback:', err.message);
     setMemoryQueryStatus(message);
@@ -8402,11 +8521,24 @@ async function prepareMemoryPackSafe(charId, userInput, scene = 'chat', options 
       charId,
       ok: false,
       diagnostic: message,
-      system: '本地记忆包组装失败，已降级为空记忆包',
+      system: '本地记忆包组装失败，已降级为空记忆包和保守导演卡',
       messages: [{ role: 'user', content: `${charName(char)}｜${String(userInput || '').slice(0, 500)}` }]
     });
-    return '';
+    return {
+      memoryPack: '',
+      directorCard: card,
+      directorText: ALLiveChatDirector.formatDirectorCard(card, {
+        playerName: playerName(),
+        characterName: charName(char)
+      }),
+      directorSource: 'fallback',
+      directorIssues: ['MEMORY_CONTEXT_FAILED'],
+      memoryStatus: memoryQuerySnapshot()
+    };
   }
+}
+async function prepareMemoryPackSafe(charId, userInput, scene = 'chat', options = {}) {
+  return (await prepareConversationContextSafe(charId, userInput, scene, options)).memoryPack;
 }
 async function prepareProactiveMemoryPack(charId, query, kind = 'chat') {
   try {
@@ -9927,19 +10059,34 @@ async function triggerProactiveMessage(charId, manual = false, triggerMode = 'pl
     const proactiveTriggerMode = manual ? 'manual' : expectedProactiveChatMode(chat);
     const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow, proactiveTriggerMode);
     const query = buildProactiveMemoryQuery(chat, proactiveNow, proactiveTriggerMode);
-    const memoryPack = manual ? await prepareMemoryPackSafe(charId, query, 'manual-proactive-chat') : await prepareProactiveMemoryPack(charId, query);
-    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
+    const conversationContext = await prepareConversationContextSafe(
+      charId,
+      query,
+      manual ? 'manual-proactive-chat' : 'proactive-chat',
+      { now: proactiveNow }
+    );
+    if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `记忆完成 ${String(conversationContext.memoryPack || '').length} 字，正在请求聊天模型`);
     if (settings.cloudTimerEnabled && !manual) setCloudTimerStatus('前台私聊正在请求聊天模型。', true, 'chat');
-    const reply = manual
-      ? await callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode })
+    const request = buildChatRequest(chat, conversationContext, {
+      charId,
+      live: false,
+      proactive: true,
+      proactiveNow,
+      proactiveTimeContext,
+      proactiveTriggerMode
+    });
+    const rawReply = manual
+      ? await executeChatRequest(request)
       : await retryTransient(
-          () => callAPI(chat, memoryPack, { charId, live: false, proactive: true, proactiveNow, proactiveTimeContext, proactiveTriggerMode }),
+          () => executeChatRequest(request),
           {
             retries: 2,
             delayMs: 3500,
             onRetry: (err, attempt, total) => setCloudTimerStatus(`前台私聊请求失败，正在重试 ${attempt}/${total}：${statusErrorMessage(err)}`, true, 'chat')
           }
         );
+    const quality = await ensureForegroundReplyQuality(rawReply, request, conversationContext, { proactiveNow });
+    const reply = quality.reply;
     if (settings.cloudTimerEnabled && !manual) setCloudTimerTrace('chat', traceId, `模型返回 ${String(reply || '').trim().length} 字`);
     clearStreamingDraft(charId);
     const paymentDirective = extractPaymentStatusDirective(reply);
@@ -10208,20 +10355,129 @@ async function manualProactiveMoment() {
   await triggerProactiveMoment(charId, true);
 }
 
-async function callAPI(chat, memoryPack = '', options = {}) {
-  if (!settings.chatApiUrl || !settings.chatApiKey) throw new Error('请先在设置中配置聊天接口');
+function buildChatRequest(chat, conversationContext = {}, options = {}) {
   const charId = options.charId || currentCharId;
   const currentChar = characters.find(c => c.id === charId);
   if (!currentChar) throw new Error('找不到当前角色');
-  const prompt = buildChatSceneSystem(currentChar, chat, { ...options, memoryPack, returnPromptDetails: true });
-  const system = prompt.system;
+  const prompt = buildChatSceneSystem(currentChar, chat, {
+    ...options,
+    memoryPack: conversationContext.memoryPack || '',
+    directorText: conversationContext.directorText || '',
+    returnPromptDetails: true
+  });
   const proactiveNow = options.proactiveNow || new Date();
   const messages = sceneMessagesForAI(chat, 30, { withTime: !!options.proactive, now: proactiveNow });
   const selectedHistoryCount = messages.length;
   if (options.proactive) messages.push({ role: 'user', content: buildProactiveTriggerMessage(currentChar, chat, proactiveNow, options.proactiveTriggerMode) });
   const scene = chatSceneFromOptions(options);
-  const callOptions = { live: options.live !== false, charId, kind: 'chat', scene, signal: options.signal, historyOmitted: Math.max(0, recentMessageCandidateCount(chat, 30) - selectedHistoryCount), memoryChars: String(memoryPack || '').length, memoryStatus: memoryStatusWithBudget(memoryPack, options.memoryStatus || memoryQuerySnapshot()), promptBlocks: prompt.promptBlocks };
-  return (settings.chatApiType || 'openai') === 'claude' ? callClaude(system, messages, callOptions) : callOpenAI(system, messages, callOptions);
+  return {
+    system: prompt.system,
+    messages,
+    callOptions: {
+      live: options.live !== false,
+      charId,
+      kind: options.kind || 'chat',
+      scene,
+      signal: options.signal,
+      historyOmitted: Math.max(0, recentMessageCandidateCount(chat, 30) - selectedHistoryCount),
+      memoryChars: String(conversationContext.memoryPack || '').length,
+      memoryStatus: conversationContext.memoryStatus || memoryStatusWithBudget(conversationContext.memoryPack || '', memoryQuerySnapshot()),
+      promptBlocks: prompt.promptBlocks,
+      directorSource: conversationContext.directorSource || '',
+      directorScene: conversationContext.directorCard?.scene || '',
+      directorConfidence: Number(conversationContext.directorCard?.confidence) || 0,
+      directorPreview: compactLogText(conversationContext.directorText || '', 180)
+    },
+    promptBlocks: prompt.promptBlocks,
+    directorContext: directorContextForChat(currentChar, recentMessages(chat, NORMAL_RAW_CONTEXT_LIMIT), scene, proactiveNow)
+  };
+}
+function executeChatRequest(request) {
+  if (!settings.chatApiUrl || !settings.chatApiKey) throw new Error('请先在设置中配置聊天接口');
+  return (settings.chatApiType || 'openai') === 'claude'
+    ? callClaude(request.system, request.messages, request.callOptions)
+    : callOpenAI(request.system, request.messages, request.callOptions);
+}
+function liveReplyHiddenDirectives(rawReply) {
+  const tags = ['al_schedule', 'al_plan', 'al_payment', 'al_send_payment', 'al_relationship_stage', 'al_moment_action'];
+  const found = [];
+  tags.forEach(tag => {
+    const match = String(rawReply || '').match(new RegExp(`<${tag}>\\s*[\\s\\S]*?\\s*<\\/${tag}>`, 'i'));
+    if (match) found.push(match[0].trim());
+  });
+  return found;
+}
+function reattachLiveReplyDirectives(visibleReply, directives) {
+  const clean = ALLiveChatDirector.visibleReplyText(visibleReply);
+  return [clean, ...(Array.isArray(directives) ? directives : [])].filter(Boolean).join('\n');
+}
+async function ensureForegroundReplyQuality(rawReply, request, conversationContext = {}, options = {}) {
+  const chat = allChats[request.callOptions.charId] || { messages: [] };
+  const char = characters.find(item => item.id === request.callOptions.charId);
+  const context = {
+    ...(request.directorContext || directorContextForChat(
+      char,
+      recentMessages(chat, NORMAL_RAW_CONTEXT_LIMIT),
+      request.callOptions.scene,
+      options.proactiveNow || new Date()
+    )),
+    scene: request.callOptions.scene,
+    directorCard: conversationContext.directorCard || null
+  };
+  const report = ALLiveChatDirector.validateLiveChatReply(rawReply, context);
+  if (!ALLiveChatDirector.shouldRewriteReply(report)) {
+    return {
+      reply: rawReply,
+      report,
+      rewriteAttempted: false,
+      rewriteOutcome: request.callOptions.scene === 'payment' ? 'skipped-payment' : 'not-needed'
+    };
+  }
+  const directives = liveReplyHiddenDirectives(rawReply);
+  const rewriteInstruction = ALLiveChatDirector.buildRewriteInstruction(
+    rawReply,
+    report,
+    conversationContext.directorText || '',
+    context
+  );
+  const rewriteRequest = {
+    system: request.system,
+    messages: [{ role: 'user', content: rewriteInstruction }],
+    callOptions: {
+      ...request.callOptions,
+      live: false,
+      kind: 'chat-rewrite',
+      scene: `${request.callOptions.scene}-rewrite`,
+      qualityCodes: report.codes,
+      rewriteAttempted: true
+    }
+  };
+  try {
+    const dispatch = typeof options.executeRequest === 'function' ? options.executeRequest : executeChatRequest;
+    const rewritten = await dispatch(rewriteRequest);
+    const rewrittenReport = ALLiveChatDirector.validateLiveChatReply(rewritten, context);
+    if (ALLiveChatDirector.shouldRewriteReply(rewrittenReport)) {
+      return { reply: rawReply, report: rewrittenReport, rewriteAttempted: true, rewriteOutcome: 'rejected' };
+    }
+    return {
+      reply: reattachLiveReplyDirectives(rewritten, directives),
+      report: rewrittenReport,
+      rewriteAttempted: true,
+      rewriteOutcome: 'accepted'
+    };
+  } catch (error) {
+    return { reply: rawReply, report, rewriteAttempted: true, rewriteOutcome: 'failed' };
+  }
+}
+async function callAPI(chat, memoryPack = '', options = {}) {
+  const conversationContext = {
+    memoryPack,
+    directorText: options.directorText || '',
+    directorCard: options.directorCard || null,
+    directorSource: options.directorSource || '',
+    memoryStatus: options.memoryStatus
+  };
+  return executeChatRequest(buildChatRequest(chat, conversationContext, options));
 }
 
 async function fetchWithTimeout(url, options, timeoutMs = API_TIMEOUT_MS) {
@@ -10327,11 +10583,11 @@ async function callOpenAI(system, messages, options = {}) {
     if (live) {
       const text = await readOpenAIStream(resp, options.charId, options.signal);
       if (!text.trim()) lastChatResponseDiagnostic = lastChatResponseDiagnostic || '流式接口返回为空';
-      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
       return text;
     }
   } catch (err) {
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: false, error: err.message });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: false, error: err.message });
     throw err;
   }
   const raw = await resp.text();
@@ -10339,12 +10595,12 @@ async function callOpenAI(system, messages, options = {}) {
     const json = JSON.parse(raw);
     const text = extractResponseText(json) || parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = responseDiagnostic(json, raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   } catch {
     const text = parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'openai', model: settings.chatModel || 'gpt-4o', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   }
 }
@@ -10391,11 +10647,11 @@ async function callClaude(system, messages, options = {}) {
     if (live) {
       const text = await readClaudeStream(resp, options.charId, options.signal);
       if (!text.trim()) lastChatResponseDiagnostic = lastChatResponseDiagnostic || '流式接口返回为空';
-      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+      recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
       return text;
     }
   } catch (err) {
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: false, error: err.message });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: false, error: err.message });
     throw err;
   }
   const raw = await resp.text();
@@ -10403,12 +10659,12 @@ async function callClaude(system, messages, options = {}) {
     const json = JSON.parse(raw);
     const text = extractResponseText(json) || parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = responseDiagnostic(json, raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   } catch {
     const text = parseJsonFallbackText(raw);
     if (!text.trim()) lastChatResponseDiagnostic = '接口返回不是标准 JSON：' + compactRawResponse(raw);
-    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
+    recordModelCall({ kind: options.kind || 'chat', scene: options.scene || '', provider: 'claude', model: settings.chatModel || 'claude-sonnet-4-20250514', charId: options.charId || '', system, messages, memoryChars: options.memoryChars, memoryStatus: options.memoryStatus, promptBlocks: options.promptBlocks, directorSource: options.directorSource, directorScene: options.directorScene, directorConfidence: options.directorConfidence, directorPreview: options.directorPreview, qualityCodes: options.qualityCodes, rewriteAttempted: options.rewriteAttempted, rewriteOutcome: options.rewriteOutcome, startedAt, ok: true, empty: !text.trim(), diagnostic: lastChatResponseDiagnostic, output: text });
     return text;
   }
 }

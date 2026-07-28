@@ -8,8 +8,19 @@ const html = readFileSync('tavern-app/index.html', 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
 const apiEndpointHelper = readFileSync('tavern-app/lib/api-endpoint.js', 'utf8');
 const rolePlanDomain = readFileSync('tavern-app/lib/role-plan-domain.js', 'utf8');
+const liveDirectorHelper = readFileSync('tavern-app/lib/live-chat-director.js', 'utf8');
 assert.ok(script, 'index.html should contain an inline app script');
+assert.match(html, /<script src="\.\/lib\/live-chat-director\.js"><\/script>/);
 const swScript = readFileSync('tavern-app/sw-v11.js', 'utf8');
+assert.match(swScript, /importScripts\('\.\/lib\/live-chat-director\.js'\)/);
+assert.match(swScript, /'\.\/lib\/live-chat-director\.js'/);
+assert.match(swScript, /live-director-card/);
+assert.match(swScript, /ensureBackgroundReplyQuality/);
+assert.match(swScript, /if \(String\(scene \|\| ''\)\.includes\('moment'\)\)[\s\S]{0,600}includeDirector: false/);
+assert.doesNotMatch(
+  swScript.slice(swScript.indexOf('function buildBackgroundMomentPostSystem'), swScript.indexOf('async function callModel')),
+  /live-director-card/
+);
 const cloudTimerWorker = readFileSync('cloud-timer-worker.js', 'utf8');
 const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
 const cloudTimerDeployDoc = readFileSync('CLOUD_TIMER_DEPLOY.md', 'utf8');
@@ -153,7 +164,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v95';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v97';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -174,7 +185,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-27\.102';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-28\.103';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -249,7 +260,7 @@ assert.doesNotMatch(script, /return \{ summaries, events, profiles, vectors: \[\
 assert.match(script, /buildAndroidUserReplyTask\(charId, userMessageId, options\.userText \|\| chat\.pendingReply\?\.userText \|\| userMessage\.content/);
 assert.match(script, /queueAndroidUserReply\(requestCharId, message\.id, \{ userText: voicePrompt \}\)/);
 assert.match(script, /if \(isNativeApp\(\)\) return queueAndroidUserReply\(requestCharId, message\.id/);
-assert.match(script, /const reply = await callAPI\(chat, memoryPack, \{[\s\S]*live: false/);
+assert.match(script, /const rawReply = await executeChatRequest\(request\)[\s\S]*const quality = await ensureForegroundReplyQuality/);
 assert.doesNotMatch(script, /callAPI\(chat, memoryPack, \{ charId, live: true, proactive: true/);
 assert.doesNotMatch(script, /await mirrorAppStateNow\(\); \} catch \(err\) \{ console\.warn\('\[AL Timer\] user turn state mirror skipped/);
 assert.match(script, /const messages = sceneMessagesForAI\(chat, 30,/);
@@ -278,7 +289,7 @@ assert.match(html, /id="screen-stage-personas"/);
 assert.match(html, /onclick="openStagePersonas\(currentCharId, 'chat-info'\)"/);
 assert.match(swScript, /function backgroundStagePersonaBlock\(char, settings = \{\}\)/);
 assert.match(swScript, /composer\.add\('stage-persona', backgroundStagePersonaBlock\(char, settings\)/);
-assert.match(script, /const memoryPack = await prepareMemoryPackSafe\(requestCharId, userText, 'chat', \{ signal: controller\.signal \}\)/);
+assert.match(script, /continueAssistantTurn[\s\S]*prepareConversationContextSafe\([\s\S]*ensureForegroundReplyQuality/);
 assert.match(script, /chat\.pendingReply = \{[\s\S]*userMessageId/);
 assert.match(script, /function resumePendingAssistantTurns\(\)/);
 assert.match(script, /function mergeLocalPendingReplies\(remoteChats = \{\}, localChats = \{\}, options = \{\}\)/);
@@ -297,8 +308,10 @@ assert.match(html, /class="message-failure-reason"/);
 assert.match(script, /function showReplyFailureReason\(charId, messageId\)/);
 assert.match(html, /data-memory-action="edit"/);
 assert.match(script, /function bindMemoryListActions\(list\)/);
-assert.match(script, /const query = await generateMemoryQuery\(char, userInput, recent, scene, options\)/);
-assert.match(swScript, /const query = await generateBackgroundMemoryQuery\(charId, char, settings, queryText, recent, scene\)/);
+assert.match(script, /async function prepareConversationContext\(charId, userInput, scene = 'chat', options = \{\}\)/);
+assert.match(script, /const query = await generateMemoryQuery\(char, userInput, recent, scene, \{/);
+assert.match(script, /async function prepareMemoryPack\(charId, userInput, scene = 'chat', options = \{\}\)[\s\S]*prepareConversationContext/);
+assert.match(swScript, /const query = await generateBackgroundMemoryQuery\(charId, char, settings, queryText, recent, scene, \{/);
 assert.match(html, /\.primary\{width:calc\(100% - 28px\);/);
 assert.doesNotMatch(html, />发起聊天<\/button>/);
 assert.doesNotMatch(html, /class="wallet-tools"/);
@@ -496,9 +509,9 @@ assert.match(swScript, /diagnostic = responseDiagnostic\(json, raw\)/);
 assert.match(script, /记忆 API 有正文但不是可解析 JSON/);
 assert.match(swScript, /记忆 API 有正文但不是可解析 JSON/);
 assert.match(script, /async function prepareMemoryPackSafe\(charId, userInput, scene = 'chat', options = \{\}\)/);
-assert.match(script, /return await prepareMemoryPack\(charId, userInput, scene, options\)/);
+assert.match(script, /prepareConversationContextSafe\(charId, userInput, scene, options\)\)\.memoryPack/);
 assert.match(script, /prepareMemoryPack\(charId, query, `proactive-\$\{kind\}`\)/);
-assert.match(swScript, /buildMemoryPack\(charId, char, settings, memoryQuery, 'proactive-chat'\)/);
+assert.match(swScript, /buildBackgroundMemoryContext\([\s\S]{0,180}memoryQuery,[\s\S]{0,80}'proactive-chat'/);
 assert.match(swScript, /buildMemoryPack\(charId, char, settings, memoryQuery, 'moment-post'\)/);
 assert.match(html, /id="new-personality"/);
 assert.doesNotMatch(html, /id="new-first"/);
@@ -629,7 +642,8 @@ assert.match(html, /测试记忆筛选/);
 assert.match(script, /async function testMemoryQueryPreset\(\)/);
 assert.match(script, /scene: 'memory-query-test'/);
 assert.match(script, /记忆检索失败：\$\{friendlyErrorMessage\(err\)\}；已跳过记忆包继续生成。/);
-assert.match(script, /await prepareMemoryPackSafe\(requestCharId, userText, 'chat', \{ signal: controller\.signal \}\)/);
+assert.match(script, /await prepareConversationContextSafe\(\s*requestCharId,\s*userText,\s*'chat'/);
+assert.match(script, /triggerProactiveMessage[\s\S]*prepareConversationContextSafe\([\s\S]*ensureForegroundReplyQuality/);
 assert.match(script, /await prepareMemoryPackSafe\(char\.id, memoryQuery, 'moment-interaction'\)/);
 assert.match(script, /await prepareMemoryPackSafe\(char\.id, memoryQuery, 'moment-reply'\)/);
 assert.match(html, /onpointerdown="startVoiceRecording\(event\)"/);
@@ -860,7 +874,7 @@ const context = {
 const modelListFetch = context.fetch;
 
 vm.createContext(context);
-vm.runInContext(`${apiEndpointHelper}\n${script}
+vm.runInContext(`${apiEndpointHelper}\n${liveDirectorHelper}\n${script}
 globalThis.__appTest = {
   parseCharacterCard,
   buildCharPrompt,
@@ -925,6 +939,9 @@ globalThis.__appTest = {
   createPromptComposer,
   chatSceneFromOptions,
   buildChatSceneSystem,
+  buildChatRequest,
+  executeChatRequest,
+  ensureForegroundReplyQuality,
   buildMomentInteractionPayload,
   buildMomentPostPayload,
   buildMomentReplyPayload,
@@ -1883,7 +1900,14 @@ assert.match(chatSystem, /微信私聊/);
 assert.match(chatSystem, /记忆：林晚和玩家约好周末见。/);
 assert.match(chatSystem, /当前触发情况：玩家刚在私聊里发来消息/);
 const chatPromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。', returnPromptDetails: true });
-assert.equal(blockIds(chatPromptDetails).slice(0, 4).join(','), 'scene-base,memory-pack,rich-chat-actions,normal-chat-scene');
+const directorText = '【本轮隐藏导演卡】\n它不是台词提纲，不得复述。';
+const directorPromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。', directorText, returnPromptDetails: true });
+assert.equal(
+  blockIds(directorPromptDetails).filter(id => ['scene-base', 'memory-pack', 'live-director-card', 'rich-chat-actions', 'normal-chat-scene'].includes(id)).join(','),
+  'scene-base,memory-pack,live-director-card,rich-chat-actions,normal-chat-scene'
+);
+assert.match(directorPromptDetails.system, /不是台词提纲/);
+assert.match(directorPromptDetails.system, /不得复述/);
 const proactivePromptDetails = buildChatSceneSystem(v2, { messages: [] }, { memoryPack: '记忆：林晚和玩家约好周末见。', proactive: true, returnPromptDetails: true });
 assert.ok(proactivePromptDetails.system.startsWith(RP_PRESETS.combined.prompt), '主动私聊必须完整发送综合 RP 预设');
 assert.ok(blockIds(proactivePromptDetails).includes('proactive-time-context'));
@@ -1899,11 +1923,41 @@ assert.ok(blockIds(paymentPromptDetails).includes('payment-scene'));
 assert.ok(blockIds(paymentPromptDetails).includes('memory-pack'));
 assert.match(paymentPromptDetails.system, /<al_payment>\{"status":"received\|pending\|refused"\}<\/al_payment>/);
 assert.match(paymentPromptDetails.system, /不是不收，我只是想问清楚/);
+assert.equal(blockIds(paymentPromptDetails).includes('live-director-card'), false, '支付场景不得使用导演卡语义重写');
 const pendingPaymentChat = { messages: [{ id: 'pending_red', role: 'user', type: 'redpacket', payType: 'redpacket', amount: 66, note: '别熬夜', payStatus: 'pending', time: Date.now(), payExpiresAt: Date.now() + 86400000 }] };
 const pendingPaymentPrompt = buildChatSceneSystem(v2, pendingPaymentChat, { proactive: true, returnPromptDetails: true });
 assert.ok(blockIds(pendingPaymentPrompt).includes('pending-payment-context'));
 assert.match(pendingPaymentPrompt.system, /仍有一笔玩家发给林晚的红包等待处理/);
 assert.match(pendingPaymentPrompt.system, /status":"pending/);
+const fakeQualityRequest = {
+  system: '完整系统提示',
+  messages: [{ role: 'user', content: '测试' }],
+  callOptions: { charId: v2.id, scene: 'chat', live: false }
+};
+const fakeConversationContext = {
+  directorCard: { scene: 'chat', contactPressure: 'low', replyImpulse: 'answer' },
+  directorText
+};
+let foregroundRewriteCalls = 0;
+const validQuality = await context.__appTest.ensureForegroundReplyQuality(
+  '正常回复',
+  fakeQualityRequest,
+  fakeConversationContext,
+  { executeRequest: async () => { foregroundRewriteCalls++; return '不应调用'; } }
+);
+assert.equal(validQuality.rewriteAttempted, false);
+assert.equal(foregroundRewriteCalls, 0);
+const rewrittenQuality = await context.__appTest.ensureForegroundReplyQuality(
+  '晚点说\nend_turn\n<al_schedule>{"nextProactiveAt":"2026-07-28T19:00:00+08:00"}</al_schedule>',
+  fakeQualityRequest,
+  fakeConversationContext,
+  { executeRequest: async () => { foregroundRewriteCalls++; return '晚点再说。'; } }
+);
+assert.equal(rewrittenQuality.rewriteAttempted, true);
+assert.equal(rewrittenQuality.rewriteOutcome, 'accepted');
+assert.equal(foregroundRewriteCalls, 1);
+assert.match(rewrittenQuality.reply, /晚点再说。/);
+assert.equal((rewrittenQuality.reply.match(/<al_schedule>/g) || []).length, 1);
 const playerMoment = { text: '今天有点想喝热茶。', likes: [], comments: [], time: Date.now(), authorType: 'player' };
 const interactionPayload = buildMomentInteractionPayload(v2, playerMoment, '记忆：林晚刚收过玩家的红包。');
 assert.ok(interactionPayload.system.startsWith(RP_PRESETS.combined.prompt), '朋友圈互动必须完整发送综合 RP 预设');
@@ -2068,6 +2122,20 @@ assert.match(memoryQueryPayload.system, /只输出 JSON，不要输出解释/);
 assert.match(memoryQueryPayload.user, /当前输入或触发原因：\n你还记得红包吗？/);
 assert.match(memoryQueryPayload.system, /玩家当前输入或当前触发原因是最高优先级/);
 assert.match(memoryQueryPayload.system, /只说“今天天气不错”，却因为最近200条出现过红包就检索并继续催红包/);
+const directorMemoryPayload = buildMemoryQueryPayload(
+  v2,
+  '你说这个是什么意思',
+  [
+    { id: 'director-user', role: 'user', content: '你说这个是什么意思', time: Date.parse('2026-07-28T14:59:00+08:00') },
+    { id: 'director-assistant', role: 'assistant', content: '就是字面意思', time: Date.parse('2026-07-28T14:59:30+08:00') }
+  ],
+  { scene: 'chat', now: new Date('2026-07-28T15:00:00+08:00') }
+);
+assert.match(directorMemoryPayload.system, /任务三：生成本轮隐藏导演卡/);
+assert.match(directorMemoryPayload.system, /不是台词提纲/);
+assert.match(directorMemoryPayload.user, /固定最近200条聊天与场景事件/);
+assert.match(directorMemoryPayload.user, /当前设备时间/);
+assert.match(directorMemoryPayload.user, /"director"/);
 const memoryTwoHundredMessages = Array.from({ length: 205 }, (_, index) => ({ role: index % 2 ? 'assistant' : 'user', content: `记忆上下文${index}`, time: index + 1 }));
 const memoryTwoHundredPayload = buildMemoryQueryPayload(v2, '昨天那件事呢？', memoryTwoHundredMessages);
 assert.doesNotMatch(memoryTwoHundredPayload.user, /记忆上下文4(?:\D|$)/);

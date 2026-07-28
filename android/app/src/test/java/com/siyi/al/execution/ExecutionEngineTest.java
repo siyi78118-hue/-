@@ -29,9 +29,13 @@ public class ExecutionEngineTest {
         assertEquals(TurnState.COMPLETED.name(), store.turn.state);
         assertEquals(2, store.replyParts.size());
         assertTrue(gateway.chatSystem.contains("昨天约好周六语音"));
+        assertTrue(gateway.chatSystem.contains("【本轮隐藏导演卡】"));
+        assertTrue(gateway.chatSystem.contains("不是台词提纲"));
+        assertTrue(gateway.chatSystem.contains("【记忆 AI 本轮筛选结果】"));
         assertTrue(gateway.chatSystem.contains("原生执行时钟"));
-        assertEquals(200, gateway.chatMessageCount);
-        assertEquals("消息5", gateway.firstChatMessage);
+        assertEquals(30, gateway.chatMessageCount);
+        assertEquals("消息175", gateway.firstChatMessage);
+        assertEquals(1, gateway.chatCalls);
     }
 
     @Test
@@ -197,6 +201,49 @@ public class ExecutionEngineTest {
         assertEquals(0, gateway.calls.size());
     }
 
+    @Test
+    public void invalidReplyUsesAtMostOneRewriteAndCommitsOnlyRewrittenParts() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        RecordingGateway gateway = new RecordingGateway("晚点说\nend_turn", "晚点再说。");
+        ExecutionEngine engine = engine(store, gateway);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(2, gateway.chatCalls);
+        assertEquals(1, store.replyParts.size());
+        assertEquals("晚点再说。", store.replyParts.get(0).content);
+        assertTrue(store.replyParts.stream().noneMatch(part -> part.content.contains("end_turn")));
+    }
+
+    @Test
+    public void invalidRewriteDoesNotLoop() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        RecordingGateway gateway = new RecordingGateway("晚点说\nend_turn", "还是晚点\nend_turn");
+        ExecutionEngine engine = engine(store, gateway);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(2, gateway.chatCalls);
+        assertEquals(TurnState.COMPLETED.name(), store.turn.state);
+    }
+
+    @Test
+    public void rewritePreservesPrimaryHiddenDirectiveExactlyOnce() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        RecordingGateway gateway = new RecordingGateway(
+            "晚点说\nend_turn\n<al_schedule>{\"nextProactiveAt\":\"2026-07-29T12:00:00+08:00\"}</al_schedule>",
+            "晚点再说。"
+        );
+        ExecutionEngine engine = engine(store, gateway);
+
+        assertTrue(engine.runNext());
+
+        assertEquals(2, gateway.chatCalls);
+        assertEquals(2, store.replyParts.size());
+        assertEquals("TEXT", store.replyParts.get(0).type);
+        assertEquals("SCHEDULE", store.replyParts.get(1).type);
+    }
+
     private static ExecutionEngine engine(FakeStore store, RecordingGateway gateway) {
         return new ExecutionEngine(
             store,
@@ -238,6 +285,15 @@ public class ExecutionEngineTest {
         snapshot.put("chatConfigId", "chat-config");
         snapshot.put("memorySystem", "筛选相关记忆并保留时间");
         snapshot.put("chatSystem", "完整 RP 规则和当前阶段人设");
+        snapshot.put("playerName", "姜隽倚");
+        snapshot.put("characterName", "虞栖");
+        snapshot.put("directorContext", new JSONObject()
+            .put("scene", "chat")
+            .put("nowMs", 100L)
+            .put("lastMessageAt", 1L)
+            .put("relationshipStageId", "familiar")
+            .put("previousContactPressure", "none")
+            .put("latestMessageIds", new JSONArray()));
         snapshot.put("memoryMaxTokens", 1400);
         snapshot.put("chatMaxTokens", 1000);
         snapshot.put("memoryMessages", new JSONArray().put(message("user", "候选记忆")));
@@ -253,20 +309,30 @@ public class ExecutionEngineTest {
 
     private static final class RecordingGateway implements ModelGateway {
         final List<String> calls = new ArrayList<>();
+        final List<String> chatReplies = new ArrayList<>();
         String chatSystem = "";
         int chatMessageCount;
         String firstChatMessage = "";
+        int chatCalls;
+
+        RecordingGateway(String... replies) {
+            if (replies != null) Collections.addAll(chatReplies, replies);
+        }
 
         @Override
         public String call(String configId, String system, JSONArray messages, int maxTokens) {
             if ("memory-config".equals(configId)) {
                 calls.add("memory");
-                return "2026-07-12：昨天约好周六语音";
+                return "{\"memoryPack\":\"2026-07-12：昨天约好周六语音\","
+                    + "\"director\":{\"scene\":\"chat\",\"relationshipStageId\":\"familiar\","
+                    + "\"replyImpulse\":\"answer\",\"contactPressure\":\"low\",\"confidence\":0.7}}";
             }
             calls.add("chat");
+            chatCalls += 1;
             chatSystem = system;
             chatMessageCount = messages.length();
             firstChatMessage = messages.length() == 0 ? "" : messages.optJSONObject(0).optString("content");
+            if (chatCalls <= chatReplies.size()) return chatReplies.get(chatCalls - 1);
             return "第一句😊\n第二句";
         }
     }
