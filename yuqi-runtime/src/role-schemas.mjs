@@ -123,7 +123,7 @@ const conversationFrameSchema = objectSchema({
 }, [
   'surfaceAct', 'intentHypotheses', 'interactionMode', 'emotionalTone', 'relationshipMove',
   'initiative', 'priorTopic', 'interruption', 'activeHooks', 'ambiguities', 'responseRisks',
-  'needsNuanceReview'
+  'explicitBoundaries', 'recentCorrection', 'needsNuanceReview'
 ]);
 
 const rewriteResolutionSchema = objectSchema({

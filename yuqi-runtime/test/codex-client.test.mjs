@@ -40,6 +40,27 @@ function methods(logFile) {
     .map(item => item.method);
 }
 
+function assertEveryObjectRequiresEveryProperty(schema, path = 'root') {
+  if (!schema || typeof schema !== 'object') return;
+  if (schema.type === 'object') {
+    const propertyNames = Object.keys(schema.properties || {}).sort();
+    const requiredNames = [...(schema.required || [])].sort();
+    assert.deepEqual(
+      requiredNames,
+      propertyNames,
+      `${path} must require every declared property for strict structured output`
+    );
+  }
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'required') continue;
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => assertEveryObjectRequiresEveryProperty(item, `${path}.${key}[${index}]`));
+    } else if (value && typeof value === 'object') {
+      assertEveryObjectRequiresEveryProperty(value, `${path}.${key}`);
+    }
+  }
+}
+
 function protocolLines(logFile) {
   return readFileSync(logFile, 'utf8')
     .trim()
@@ -167,7 +188,7 @@ test('memory schema requires an evidence-linked ephemeral conversation frame', a
   assert.deepEqual(frame.required, [
     'surfaceAct', 'intentHypotheses', 'interactionMode', 'emotionalTone', 'relationshipMove',
     'initiative', 'priorTopic', 'interruption', 'activeHooks', 'ambiguities', 'responseRisks',
-    'needsNuanceReview'
+    'explicitBoundaries', 'recentCorrection', 'needsNuanceReview'
   ]);
   assert.deepEqual(frame.properties.priorTopic.required, [
     'status', 'summary', 'waitingOn', 'evidenceMessageIds', 'reason'
@@ -179,4 +200,11 @@ test('memory schema requires an evidence-linked ephemeral conversation frame', a
     'intent', 'confidence', 'evidenceMessageIds'
   ]);
   assert.equal(frame.additionalProperties, false);
+}));
+
+test('memory schema remains valid for strict structured output after nested fields are added', async () => fixture(async ({ client, logFile }) => {
+  await client.runTurn('memory', 'validate the complete memory schema');
+  const started = protocolLines(logFile).find(item => item.method === 'turn/start');
+
+  assertEveryObjectRequiresEveryProperty(started.params.outputSchema, 'memory');
 }));
