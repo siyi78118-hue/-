@@ -331,7 +331,7 @@ function conversationFrame(overrides = {}) {
   };
 }
 
-test('ephemeral conversation frame reaches the brain but never becomes a durable fact', async () => {
+test('ephemeral analysis becomes a compact brain contract and never becomes a durable fact', async () => {
   const frame = conversationFrame();
   await withFixture({
     memory: [JSON.stringify({
@@ -345,11 +345,145 @@ test('ephemeral conversation frame reaches the brain but never becomes a durable
     const brain = codex.calls.find(call => call.role === 'brain').input;
     const memoryPacket = JSON.parse(store.getTurn(result.turnId).memoryPacketJson);
 
-    assert.deepEqual(brain.conversationFrame, frame);
+    assert.equal(brain.conversationFrame, undefined);
+    assert.equal(brain.interactionContract.primaryIntent, frame.intentHypotheses[0].intent);
+    assert.equal(brain.interactionContract.activeIssue, frame.priorTopic.summary);
     assert.equal(brain.lifeContext.current, null);
     assert.equal(brain.lifeContext.needsPlan, true);
-    assert.deepEqual(memoryPacket.conversationFrame, frame);
+    assert.equal(memoryPacket.conversationFrame.surfaceAct, frame.surfaceAct);
+    assert.deepEqual(memoryPacket.conversationFrame.intentHypotheses, frame.intentHypotheses);
+    assert.deepEqual(memoryPacket.conversationFrame.explicitBoundaries, []);
+    assert.equal(memoryPacket.conversationFrame.recentCorrection.active, false);
+    assert.deepEqual(brain.interactionContract, memoryPacket.interactionContract);
     assert.equal(store.listFacts('yuqi').some(fact => fact.predicate === 'possibleIntent'), false);
+  });
+});
+
+test('dedicated runtime sends the same interaction contract to brain and supervisor', async () => {
+  const frame = conversationFrame({
+    intentHypotheses: [
+      {
+        intent: '询问虞栖此刻在做什么',
+        confidence: 0.70,
+        evidenceMessageIds: ['msg_phone_212']
+      },
+      {
+        intent: '质问虞栖为何无视仍未解决的争执',
+        confidence: 0.42,
+        evidenceMessageIds: ['msg_phone_212']
+      }
+    ],
+    priorTopic: {
+      status: 'open',
+      summary: '双方争执仍未解决',
+      waitingOn: 'user',
+      evidenceMessageIds: ['msg_phone_212'],
+      reason: '用户仍在质疑争执期间的互动'
+    },
+    needsNuanceReview: true
+  });
+  await withFixture({
+    memory: [JSON.stringify({
+      query: '当前互动', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: ['{"action":"send","reply":"我知道你问的不只是我在做什么。","usedFactIds":[]}'],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ codex, orchestrator }) => {
+    const request = envelope(212, '你干嘛？');
+    request.protocolVersion = 2;
+    request.kind = 'DIRECT_REPLY';
+    request.context = {
+      scene: {
+        relationshipStage: {
+          id: 'new',
+          phase: { id: 'conflict', label: '闹矛盾期' }
+        }
+      }
+    };
+
+    await orchestrator.process(request);
+    const brain = codex.calls.find(call => call.role === 'brain').input;
+    const supervisor = codex.calls.find(call => call.role === 'supervisor').input;
+
+    assert.equal(brain.conversationFrame, undefined);
+    assert.equal(brain.interactionContract.activeIssue, '双方争执仍未解决');
+    assert.equal(brain.interactionContract.preserveAmbiguity, true);
+    assert.deepEqual(supervisor.interactionContract, brain.interactionContract);
+  });
+});
+
+test('structural silence commits before brain and does not consume the ordinary proactive skip budget', async () => {
+  const frame = conversationFrame({
+    intentHypotheses: [{
+      intent: '在明确暂停后判断是否仍应主动联系',
+      confidence: 0.92,
+      evidenceMessageIds: ['msg_pause']
+    }],
+    interactionMode: 'unresolved_conflict_pause',
+    initiative: {
+      topicIntroducedBy: 'user',
+      suggestedNextCarrier: 'user',
+      reason: '用户明确要求条件变化后再谈'
+    },
+    priorTopic: {
+      status: 'open',
+      summary: '双方争执尚未解决',
+      waitingOn: 'user',
+      evidenceMessageIds: ['msg_pause'],
+      reason: '用户要求暂停，当前没有新的回应'
+    },
+    explicitBoundaries: [{
+      type: 'pause_requested',
+      active: true,
+      reason: '用户要求在虞栖愿意退让后再谈',
+      evidenceMessageIds: ['msg_pause']
+    }]
+  });
+  await withFixture({
+    memory: [JSON.stringify({
+      query: '主动联系', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: ['{"action":"skip","reply":"","usedFactIds":[]}'],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    store.putMessage({
+      messageId: 'msg_pause',
+      turnId: 'turn_pause',
+      characterId: 'yuqi',
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: '等你愿意稍作退让，我们再谈',
+      sentAt: 1784399000000,
+      origin: 'phone'
+    });
+    store.putMessage({
+      messageId: 'msg_unanswered_yuqi',
+      turnId: 'turn_unanswered_yuqi',
+      characterId: 'yuqi',
+      speakerId: 'yuqi',
+      speakerType: 'character',
+      recipientId: 'user',
+      content: '我去改稿了',
+      sentAt: 1784399500000,
+      origin: 'codex'
+    });
+    const before = store.getProactiveChatDeliveryPolicy('yuqi');
+    const result = await orchestrator.process(triggerEnvelope(213));
+    const after = store.getProactiveChatDeliveryPolicy('yuqi');
+    const diagnostic = store.db.prepare(
+      "SELECT detail_json FROM diagnostics WHERE turn_id = ? AND stage = 'structural_silence'"
+    ).get(result.turnId);
+
+    assert.equal(result.action, 'skip');
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory']);
+    assert.equal(before.usedSkips, 0);
+    assert.equal(after.usedSkips, 0);
+    assert.equal(JSON.parse(diagnostic.detail_json).action, 'structural_silence');
   });
 });
 
@@ -549,7 +683,11 @@ test('a nuanced fast turn upgrades to supervisor without repeating memory', asyn
     const result = await orchestrator.process(envelope(12, 'sure, go ahead'));
 
     assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
-    assert.deepEqual(codex.calls.find(call => call.role === 'supervisor').input.conversationFrame, frame);
+    const supervisorFrame = codex.calls.find(call => call.role === 'supervisor').input.conversationFrame;
+    assert.equal(supervisorFrame.interactionMode, frame.interactionMode);
+    assert.deepEqual(supervisorFrame.intentHypotheses, frame.intentHypotheses);
+    assert.deepEqual(supervisorFrame.explicitBoundaries, []);
+    assert.equal(supervisorFrame.recentCorrection.active, false);
     assert.equal(codex.calls.filter(call => call.role === 'memory').length, 1);
     assert.equal(store.getTurn(result.turnId).route, 'fast_to_deep');
     assert.ok(store.getTurn(result.turnId).routeReasons.includes('conversation_nuance'));

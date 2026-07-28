@@ -537,6 +537,7 @@ export class YuqiStore {
       WHERE character_id = ?
         AND state IN ('committed', 'delivered', 'completed')
         AND json_extract(envelope_json, '$.kind') = 'PROACTIVE_CHAT'
+        AND COALESCE(json_extract(reply_json, '$.skipReason'), '') <> 'structural_silence'
       ORDER BY created_at DESC
       LIMIT ?
     `).all(characterId, safeWindowSize);

@@ -217,6 +217,7 @@ git commit -m "feat: capture interaction boundaries and corrections"
 
 **Files:**
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/test/orchestrator.test.mjs`
 
 **Interfaces:**
@@ -284,7 +285,7 @@ const memoryPacket = {
 
 - [ ] **Step 5: Apply structural silence before brain**
 
-When state is `memory_done`, parse `memoryPacket.interactionContract`. For `PROACTIVE_CHAT` with `shouldRespond === false`, advance directly to `approved` using a normalized skip draft and a `structural_silence` diagnostic. Do not call `deliveryPolicyFor()` and do not write a normal skip-budget record.
+When state is `memory_done`, parse `memoryPacket.interactionContract`. For `PROACTIVE_CHAT` with `shouldRespond === false`, advance directly to `approved` using a normalized skip draft and a `structural_silence` diagnostic. Persist `skipReason: "structural_silence"` in the committed result, and exclude those rows before the ordinary four-turn delivery-policy window is calculated. Do not call `deliveryPolicyFor()` for the structural-silence turn.
 
 - [ ] **Step 6: Propagate the contract**
 
@@ -299,7 +300,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```powershell
-git add -- yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/orchestrator.test.mjs
+git add -- yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/store.mjs yuqi-runtime/test/orchestrator.test.mjs
 git commit -m "feat: enforce interaction contracts in yuqi runtime"
 ```
 

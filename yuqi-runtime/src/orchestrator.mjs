@@ -5,6 +5,7 @@ import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route-policy.mjs';
 import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stage.mjs';
 import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
+import { compileInteractionContract } from './interaction-contract.mjs';
 import { buildGenerationWindow } from './conversation-context.mjs';
 import { LifeSimulationCoordinator } from './life-simulation.mjs';
 import { materializeImageAttachments } from './image-attachments.mjs';
@@ -64,6 +65,7 @@ export function normalizeBrainDraft(draft) {
     ...(draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}),
     action: draft?.action === 'skip' ? 'skip' : 'send',
     reply: String(draft?.reply || '').trim(),
+    skipReason: String(draft?.skipReason || ''),
     paymentAction,
     momentAction: draft?.momentAction && typeof draft.momentAction === 'object' && !Array.isArray(draft.momentAction)
       ? {
@@ -194,6 +196,34 @@ function normalizeConversationFrame(frame) {
     activeHooks: Array.isArray(source.activeHooks) ? source.activeHooks.map(String) : [],
     ambiguities: Array.isArray(source.ambiguities) ? source.ambiguities.map(String) : [],
     responseRisks: Array.isArray(source.responseRisks) ? source.responseRisks.map(String) : [],
+    explicitBoundaries: Array.isArray(source.explicitBoundaries)
+      ? source.explicitBoundaries.map(item => ({
+          type: String(item?.type || ''),
+          active: item?.active === true,
+          reason: String(item?.reason || ''),
+          evidenceMessageIds: Array.isArray(item?.evidenceMessageIds)
+            ? item.evidenceMessageIds.map(String)
+            : []
+        })).filter(item => item.type && item.reason)
+      : [],
+    recentCorrection: source.recentCorrection && typeof source.recentCorrection === 'object'
+      ? {
+          active: source.recentCorrection.active === true,
+          rejectedInterpretation: String(source.recentCorrection.rejectedInterpretation || ''),
+          expiresAfterBatches: Math.max(
+            0,
+            Math.min(2, Math.trunc(Number(source.recentCorrection.expiresAfterBatches) || 0))
+          ),
+          evidenceMessageIds: Array.isArray(source.recentCorrection.evidenceMessageIds)
+            ? source.recentCorrection.evidenceMessageIds.map(String)
+            : []
+        }
+      : {
+          active: false,
+          rejectedInterpretation: '',
+          expiresAfterBatches: 0,
+          evidenceMessageIds: []
+        },
     needsNuanceReview: source.needsNuanceReview === true
   };
 }
@@ -495,6 +525,37 @@ export class YuqiOrchestrator {
           continue;
         }
         if (current.state === 'memory_done') {
+          const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
+          if (
+            envelope.kind === 'PROACTIVE_CHAT'
+            && memoryPacket.interactionContract?.shouldRespond === false
+          ) {
+            const reason = String(
+              memoryPacket.interactionContract.structuralSilenceReason
+              || 'structural_silence'
+            );
+            this.store.putDiagnostic({
+              turnId,
+              stage: 'structural_silence',
+              level: 'info',
+              detail: {
+                action: 'structural_silence',
+                reason,
+                initiativeOwner: memoryPacket.interactionContract.initiativeOwner,
+                activeIssue: memoryPacket.interactionContract.activeIssue
+              }
+            });
+            this.store.advanceTurn(turnId, 'memory_done', 'approved', {
+              brainDraftJson: JSON.stringify({
+                action: 'skip',
+                reply: '',
+                skipReason: 'structural_silence',
+                usedFactIds: [],
+                rolePlanOperationsJson: '[]'
+              })
+            });
+            continue;
+          }
           this.store.advanceTurn(turnId, 'memory_done', 'brain_running');
           continue;
         }
@@ -676,6 +737,13 @@ export class YuqiOrchestrator {
     const relationship = resolveRelationshipStage(
       scene, memoryResult.relationshipStageReview, recentMessages, this.clock()
     );
+    const interactionContract = compileInteractionContract({
+      envelope,
+      scene: { ...scene, relationshipStage: relationship.stage },
+      interactionState,
+      conversationFrame,
+      recentMessages
+    });
     const memoryPacket = {
       query: String(memoryResult.query || envelope.message?.content || envelope.trigger?.triggerType || ''),
       keywords: Array.isArray(memoryResult.keywords) ? memoryResult.keywords.map(String) : [],
@@ -690,6 +758,7 @@ export class YuqiOrchestrator {
       commitmentRisk: memoryResult.commitmentRisk === true,
       relationshipStageReview: memoryResult.relationshipStageReview || null,
       conversationFrame,
+      interactionContract,
       effectiveRelationshipStage: relationship.stage,
       relationshipStageAction: relationship.action,
       lifeContext
@@ -742,7 +811,7 @@ export class YuqiOrchestrator {
       interactionState,
       lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
       evidencePack,
-      conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
+      interactionContract: memoryPacket.interactionContract,
       ...(deliveryPolicy ? { deliveryPolicy } : {}),
       ...(previousSupervisor?.decision === 'rewrite' ? {
         rejectedDraft: previousDraft,
@@ -801,6 +870,7 @@ export class YuqiOrchestrator {
       lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
       evidencePack,
       conversationFrame: normalizeConversationFrame(memoryPacket.conversationFrame),
+      interactionContract: memoryPacket.interactionContract,
       ...(deliveryPolicy ? { deliveryPolicy } : {}),
       draft,
       previousReview: previous,
@@ -956,6 +1026,7 @@ export class YuqiOrchestrator {
           turnId: envelope.turnId,
           presetVersion: this.presets.current().version,
           action: draft.rolePlanOperations.length ? 'send' : 'skip',
+          skipReason: draft.skipReason || null,
           paymentAction: null,
           reply: null,
           usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : [],
