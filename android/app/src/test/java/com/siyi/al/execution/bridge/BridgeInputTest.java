@@ -84,4 +84,62 @@ public class BridgeInputTest {
         assertEquals("[图片]", message.getString("content"));
         assertEquals("att_msg_phone_2", message.getJSONArray("attachments").getJSONObject(0).getString("attachmentId"));
     }
+
+    @Test
+    public void directCurrentBatchCarriesEveryOrderedMessagePayload() throws Exception {
+        JSONArray batchMessages = new JSONArray()
+            .put(new JSONObject()
+                .put("messageId", "msg_batch_1")
+                .put("speakerId", "user")
+                .put("speakerType", "user")
+                .put("recipientId", "yuqi")
+                .put("content", "你明明答应过我，我真的很失望")
+                .put("sentAt", 1000))
+            .put(new JSONObject()
+                .put("messageId", "msg_batch_2")
+                .put("speakerId", "user")
+                .put("speakerType", "user")
+                .put("recipientId", "yuqi")
+                .put("content", "算了")
+                .put("sentAt", 2000));
+        TurnSubmission submission = new TurnSubmission(
+            "turn_batch_1",
+            "yuqi",
+            "msg_batch_2",
+            TurnKind.DIRECT_REPLY,
+            new JSONObject()
+                .put("deviceSeq", 3)
+                .put("message", batchMessages.getJSONObject(1))
+                .put("options", new JSONObject()
+                    .put("batchId", "batch_1")
+                    .put("batchMessageIds", new JSONArray()
+                        .put("msg_batch_1")
+                        .put("msg_batch_2"))
+                    .put("batchMessages", batchMessages)
+                    .put("batchStartedAt", 1000)
+                    .put("batchCommittedAt", 3000))
+                .toString(),
+            "{}",
+            null,
+            3000
+        );
+        BridgeConfig config = new BridgeConfig(
+            true, BridgeMode.AUTO, "http://127.0.0.1:17891", "",
+            "device1", "123456789012", "", "", 1200, 90000, 60, 1000
+        );
+
+        JSONObject currentBatch = BridgeInput.envelope(submission, config)
+            .getJSONObject("context")
+            .getJSONObject("currentBatch");
+
+        assertEquals(2, currentBatch.getJSONArray("messages").length());
+        assertEquals(
+            "你明明答应过我，我真的很失望",
+            currentBatch.getJSONArray("messages").getJSONObject(0).getString("content")
+        );
+        assertEquals(
+            "msg_batch_2",
+            currentBatch.getJSONArray("messages").getJSONObject(1).getString("messageId")
+        );
+    }
 }

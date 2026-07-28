@@ -2360,6 +2360,14 @@ function buildAndroidUserReplyTask(charId, userMessageId, userText, options = {}
       payment: options.payment || null,
       batchId: options.batchId || '',
       batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : [],
+      batchMessages: Array.isArray(options.batchMessages)
+        ? options.batchMessages.map(item => ({
+            ...item,
+            ...(Array.isArray(item.attachments)
+              ? { attachments: item.attachments.map(attachment => ({ ...attachment })) }
+              : {})
+          }))
+        : [],
       batchStartedAt: Math.max(1, Number(options.batchStartedAt) || Number(createdAt) || Date.now()),
       batchCommittedAt: Math.max(1, Number(options.batchCommittedAt) || Number(createdAt) || Date.now()),
       attachments: Array.isArray(options.attachments) ? options.attachments.map(item => ({ ...item })) : []
@@ -3651,10 +3659,17 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     const snapshot = await buildNativeExecutionSnapshot(charId, task);
     const wireOptions = { ...task.options };
     delete wireOptions.attachments;
-    const wireAttachments = (task.options.attachments?.length
-      ? task.options.attachments
-      : messageAttachmentsForAI(userMessage))
-      .map(item => ({ ...item, messageId: userMessageId }));
+    const wireBatchMessages = task.options.batchMessages?.length
+      ? task.options.batchMessages.map(message => ({
+          ...message,
+          ...(Array.isArray(message.attachments)
+            ? { attachments: message.attachments.map(attachment => ({ ...attachment })) }
+            : {})
+        }))
+      : [batchMessageForAI(charId, userMessage)];
+    const wireSourceMessage = wireBatchMessages.find(message => message.messageId === userMessageId)
+      || wireBatchMessages.at(-1)
+      || batchMessageForAI(charId, userMessage);
     const result = await plugin.submitTurn({
       turnId,
       characterId: charId,
@@ -3663,16 +3678,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
       inputJson: JSON.stringify({
         userText: task.userText,
         options: wireOptions,
-        message: {
-          messageId: userMessageId,
-          speakerId: 'user',
-          speakerType: 'user',
-          recipientId: charId,
-          content: messageContentForAI(userMessage),
-          ...(wireAttachments.length ? { attachments: wireAttachments } : {}),
-          quote: userMessage.quote || null,
-          sentAt: Number(userMessage.time) || task.createdAt
-        },
+        message: wireSourceMessage,
         deviceSeq: Math.max(1, task.createdAt)
       }),
       snapshotJson: JSON.stringify(snapshot),
@@ -4223,6 +4229,19 @@ function messageContentForAI(message) {
   if (message?.role !== 'user') return content;
   const quote = quoteContextText(message.quote);
   return quote ? `${quote}\n用户本次正文：${content}` : content;
+}
+function batchMessageForAI(charId, message) {
+  const attachments = messageAttachmentsForAI(message);
+  return {
+    messageId: String(message?.id || ''),
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: String(charId || ''),
+    content: messageContentForAI(message),
+    ...(attachments.length ? { attachments } : {}),
+    quote: message?.quote || null,
+    sentAt: Math.max(1, Number(message?.time) || Date.now())
+  };
 }
 function messageAttachmentsForAI(message) {
   if (!message || message.type !== 'image' || !String(message.imageData || '').startsWith('data:image/')) return [];
@@ -7612,6 +7631,14 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
     payment: options.payment || null,
     batchId: options.batchId || '',
     batchMessageIds: Array.isArray(options.batchMessageIds) ? [...options.batchMessageIds] : [],
+    batchMessages: Array.isArray(options.batchMessages)
+      ? options.batchMessages.map(message => ({
+          ...message,
+          ...(Array.isArray(message.attachments)
+            ? { attachments: message.attachments.map(attachment => ({ ...attachment })) }
+            : {})
+        }))
+      : [],
     batchStartedAt: Math.max(1, Number(options.batchStartedAt) || Number(chat.pendingReply?.createdAt) || Date.now()),
     batchCommittedAt: Math.max(1, Number(options.batchCommittedAt) || Number(chat.pendingReply?.updatedAt) || Date.now())
   };
@@ -8854,6 +8881,7 @@ async function finishStagedBatch(charId = currentCharId) {
   const committed = commitStagedBatch(chat);
   if (!committed?.sourceMessage) return false;
   const batchMessageIds = [...committed.messageIds];
+  const batchMessages = committed.messages.map(message => batchMessageForAI(charId, message));
   const userText = committed.messages.map(message => String(message.content || '').trim()).filter(Boolean).join('\n');
   const batchAttachments = committed.messages.flatMap(messageAttachmentsForAI);
   const sourceMessage = committed.sourceMessage;
@@ -8864,6 +8892,7 @@ async function finishStagedBatch(charId = currentCharId) {
   const options = {
     batchId: committed.batchId,
     batchMessageIds,
+    batchMessages,
     batchStartedAt: Number(committed.messages?.[0]?.time) || committed.committedAt,
     batchCommittedAt: committed.committedAt,
     attachments: batchAttachments,

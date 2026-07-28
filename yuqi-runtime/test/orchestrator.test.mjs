@@ -242,9 +242,111 @@ test('a direct image is shown to every role as a local image without leaking bas
       assert.equal(existsSync(call.options.localImagePaths[0]), false, 'image temp file must be cleaned after the turn');
       assert.doesNotMatch(JSON.stringify(call.input), /base64,/);
     }
-    const brainMessage = codex.calls.find(call => call.role === 'brain').input.currentUserMessage;
+    const brainBatch = codex.calls.find(call => call.role === 'brain').input.currentUserBatch;
+    const brainMessage = brainBatch.messages[0];
     assert.equal(brainMessage.attachments[0].attachmentId, 'att_msg_phone_199');
     assert.equal('dataUrl' in brainMessage.attachments[0], false);
+    assert.equal(codex.calls.find(call => call.role === 'brain').input.currentUserMessage, undefined);
+  });
+});
+
+test('every role receives one ordered current user batch without duplicating it in recent history', async () => {
+  await withFixture({
+    memory: ['{"query":"","keywords":[],"candidates":[]}'],
+    brain: ['{"reply":"我听见了。","usedFactIds":[]}'],
+    supervisor: ['{"approved":true,"issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    const request = envelope(299, '算了');
+    request.protocolVersion = 2;
+    request.kind = 'DIRECT_REPLY';
+    const first = {
+      ...request.message,
+      messageId: 'msg_phone_299_first',
+      content: '你明明答应过我，我真的很失望',
+      sentAt: request.message.sentAt - 1_000
+    };
+    request.context = {
+      currentBatch: {
+        batchId: 'batch_phone_299',
+        messageIds: [first.messageId, request.message.messageId],
+        startedAt: first.sentAt,
+        committedAt: request.createdAt,
+        messages: [first, request.message]
+      }
+    };
+    store.putMessage({
+      ...first,
+      turnId: 'turn_legacy_msg_phone_299_first',
+      characterId: request.characterId,
+      origin: 'phone'
+    });
+
+    const result = await orchestrator.process(request);
+    const roleCalls = codex.calls.filter(call => ['memory', 'brain', 'supervisor'].includes(call.role));
+    const expectedIds = [first.messageId, request.message.messageId];
+
+    assert.deepEqual(roleCalls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    for (const call of roleCalls) {
+      assert.deepEqual(
+        call.input.currentUserBatch.messages.map(message => message.messageId),
+        expectedIds
+      );
+      assert.equal(
+        call.input.recentMessages.some(message => expectedIds.includes(message.messageId)),
+        false
+      );
+      assert.equal(call.input.currentUserMessage, undefined);
+    }
+    assert.equal(
+      JSON.parse(store.getTurn(result.turnId).memoryPacketJson).query,
+      '你明明答应过我，我真的很失望\n算了'
+    );
+  });
+});
+
+test('an image in a non-final batch bubble is materialized for every role and removed from role JSON', async () => {
+  await withFixture(normalOutputs(), async ({ codex, orchestrator }) => {
+    const request = envelope(300, '然后呢');
+    request.protocolVersion = 2;
+    request.kind = 'DIRECT_REPLY';
+    const first = {
+      ...request.message,
+      messageId: 'msg_phone_300_image',
+      content: '[图片]',
+      sentAt: request.message.sentAt - 1_000,
+      attachments: [{
+        attachmentId: 'att_msg_phone_300_image',
+        messageId: 'msg_phone_300_image',
+        kind: 'image',
+        mime: 'image/jpeg',
+        name: 'one.jpg',
+        width: 1,
+        height: 1,
+        bytes: Buffer.from(JPEG_1X1, 'base64').length,
+        dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
+      }]
+    };
+    request.context = {
+      currentBatch: {
+        batchId: 'batch_phone_300',
+        messageIds: [first.messageId, request.message.messageId],
+        startedAt: first.sentAt,
+        committedAt: request.createdAt,
+        messages: [first, request.message]
+      }
+    };
+
+    await orchestrator.process(request);
+
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain']);
+    for (const call of codex.calls) {
+      assert.equal(call.options.localImagePaths.length, 1);
+      assert.doesNotMatch(JSON.stringify(call.input), /base64,/);
+      assert.equal(
+        call.input.currentUserBatch.messages[0].attachments[0].attachmentId,
+        'att_msg_phone_300_image'
+      );
+    }
   });
 });
 
@@ -837,7 +939,9 @@ test('keeps 200 evidence messages but gives brain and supervisor 20 complete his
     assert.equal(supervisorInput.recentMessages.length, 20);
     assert.equal(brainInput.recentMessages.some(message => message.messageId === input.message.messageId), false);
     assert.equal(supervisorInput.recentMessages.some(message => message.messageId === input.message.messageId), false);
-    assert.equal(brainInput.currentUserMessage.messageId, input.message.messageId);
+    assert.equal(brainInput.currentUserBatch.sourceMessageId, input.message.messageId);
+    assert.deepEqual(brainInput.currentUserBatch.messages.map(message => message.messageId), [input.message.messageId]);
+    assert.equal(brainInput.currentUserMessage, undefined);
   });
 });
 
@@ -1384,6 +1488,7 @@ test('automatic trigger reaches brain as currentTrigger and never becomes user e
     assert.equal(result.reply.speakerId, 'yuqi');
     assert.equal(memory.currentMessageId, undefined);
     assert.equal(memory.currentTrigger.triggerId, 'trigger_phone_20');
+    assert.equal(brain.currentUserBatch, undefined);
     assert.equal(brain.currentUserMessage, undefined);
     assert.equal(brain.currentTrigger.triggerType, 'proactive_chat');
     assert.match(brain.preset, /action.*skip.*不发送|不发送.*action.*skip/s);

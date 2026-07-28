@@ -1,3 +1,5 @@
+import { resolveCurrentUserBatch } from './current-user-batch.mjs';
+
 const DEFAULT_PROFILES = Object.freeze({
   fast: Object.freeze({
     memory: Object.freeze({ model: 'gpt-5.6-terra', effort: 'medium' }),
@@ -32,8 +34,10 @@ export function selectTurnRoute({ envelope, recentMessages = [] }) {
   if (envelope.kind && envelope.kind !== 'DIRECT_REPLY') {
     return { route: 'deep', reasons: ['automatic_task'] };
   }
-  const text = String(envelope.message?.content || '').trim();
+  const currentBatch = resolveCurrentUserBatch(envelope, recentMessages);
+  const text = String(currentBatch?.combinedText || envelope.message?.content || '').trim();
   const reasons = collectDeepReasons(text, recentMessages);
+  if (currentBatch && !currentBatch.complete) reasons.push('incomplete_current_batch');
   return { route: reasons.length ? 'deep' : 'fast', reasons };
 }
 
@@ -47,4 +51,3 @@ export function roleExecutionProfile(route, role, configuredProfiles = DEFAULT_P
 }
 
 export { DEFAULT_PROFILES };
-

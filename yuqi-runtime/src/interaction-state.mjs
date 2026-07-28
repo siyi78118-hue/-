@@ -1,3 +1,5 @@
+import { resolveCurrentUserBatch } from './current-user-batch.mjs';
+
 function elapsedText(milliseconds) {
   const minutes = Math.floor(Math.max(0, milliseconds) / 60_000);
   if (minutes < 1) return '不到1分钟';
@@ -31,13 +33,8 @@ export function buildAuthoritativeInteractionState({ envelope, messages = [], cu
   const currentTime = Number(now || Date.now());
   const sourceOccurredAt = Number(envelope.message?.sentAt || envelope.trigger?.executedAt || envelope.trigger?.scheduledFor || envelope.createdAt || currentTime);
   const processingDelayMs = Math.max(0, currentTime - sourceOccurredAt);
-  const suppliedBatchIds = Array.isArray(envelope.context?.currentBatch?.messageIds)
-    ? envelope.context.currentBatch.messageIds.map(String).filter(Boolean)
-    : [];
-  const currentBatchMessageIds = [...new Set([
-    ...suppliedBatchIds,
-    ...(envelope.message?.messageId ? [String(envelope.message.messageId)] : [])
-  ])];
+  const currentBatch = resolveCurrentUserBatch(envelope, sorted);
+  const currentBatchMessageIds = currentBatch?.messageIds || [];
   const currentBatchSet = new Set(currentBatchMessageIds);
   const historical = currentBatchSet.size
     ? sorted.filter(item => !currentBatchSet.has(String(item?.messageId || '')))
@@ -50,7 +47,7 @@ export function buildAuthoritativeInteractionState({ envelope, messages = [], cu
   const unansweredOutgoingCount = lastUserMessage
     ? historical.filter(item => item.speakerId === envelope.characterId && Number(item.sentAt || 0) > Number(lastUserMessage.sentAt || 0)).length
     : historical.filter(item => item.speakerId === envelope.characterId).length;
-  const batchStartedAt = Number(envelope.context?.currentBatch?.startedAt || sourceOccurredAt);
+  const batchStartedAt = Number(currentBatch?.startedAt || sourceOccurredAt);
   const conversationGapMs = lastMessage
     ? Math.max(0, batchStartedAt - Number(lastMessage.sentAt || batchStartedAt))
     : null;

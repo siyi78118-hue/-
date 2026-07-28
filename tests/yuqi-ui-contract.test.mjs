@@ -92,10 +92,12 @@ test('manual annotations retain evidence and preset version for the maintenance 
 });
 
 test('native direct replies submit a canonical attributed user message', () => {
-  assert.match(html, /inputJson:\s*JSON\.stringify\(\{[\s\S]*?message:\s*\{[\s\S]*?messageId:\s*userMessageId/);
+  assert.match(html, /function\s+batchMessageForAI\(charId,\s*message\)/);
+  assert.match(html, /messageId:\s*String\(message\?\.id\s*\|\|\s*''\)/);
   assert.match(html, /speakerId:\s*'user'[\s\S]*?speakerType:\s*'user'/);
-  assert.match(html, /content:\s*messageContentForAI\(userMessage\)/, '桥接原话库必须持久化引用归属和用户本次正文');
-  assert.match(html, /sentAt:\s*Number\(userMessage\.time\)\s*\|\|\s*task\.createdAt/);
+  assert.match(html, /content:\s*messageContentForAI\(message\)/, '桥接原话库必须持久化引用归属和用户本次正文');
+  assert.match(html, /sentAt:\s*Math\.max\(1,\s*Number\(message\?\.time\)\s*\|\|\s*Date\.now\(\)\)/);
+  assert.match(html, /message:\s*wireSourceMessage/);
 });
 
 test('chat composer stages compressed user images and forwards them as canonical attachments', () => {
@@ -107,8 +109,9 @@ test('chat composer stages compressed user images and forwards them as canonical
   assert.match(html, /type:\s*'image'/);
   assert.match(html, /imageData:/);
   assert.match(html, /class="chat-image-message"/);
-  assert.match(html, /const\s+wireAttachments\s*=\s*\(task\.options\.attachments/);
-  assert.match(html, /\.\.\.\(wireAttachments\.length\s*\?\s*\{\s*attachments:\s*wireAttachments\s*\}\s*:\s*\{\s*\}\)/);
+  assert.match(html, /const\s+attachments\s*=\s*messageAttachmentsForAI\(message\)/);
+  assert.match(html, /\.\.\.\(attachments\.length\s*\?\s*\{\s*attachments\s*\}\s*:\s*\{\s*\}\)/);
+  assert.match(html, /const\s+wireBatchMessages\s*=\s*task\.options\.batchMessages\?\.length/);
   assert.match(html, /const\s+batchAttachments\s*=\s*committed\.messages\.flatMap\(messageAttachmentsForAI\)/);
 });
 

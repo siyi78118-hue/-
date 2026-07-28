@@ -1,9 +1,17 @@
-export function buildGenerationWindow(messages, { currentMessageId = '', limit = 20 } = {}) {
+export function buildGenerationWindow(messages, {
+  currentMessageId = '',
+  currentMessageIds = [],
+  limit = 20
+} = {}) {
   const safeLimit = Math.max(1, Math.min(200, Number(limit) || 20));
+  const excludedIds = new Set([
+    String(currentMessageId || ''),
+    ...(Array.isArray(currentMessageIds) ? currentMessageIds.map(String) : [])
+  ].filter(Boolean));
   const byId = new Map();
   for (const message of Array.isArray(messages) ? messages : []) {
     const messageId = String(message?.messageId || '');
-    if (!messageId || messageId === String(currentMessageId || '')) continue;
+    if (!messageId || excludedIds.has(messageId)) continue;
     const previous = byId.get(messageId);
     if (!previous || Number(message?.sentAt || 0) >= Number(previous?.sentAt || 0)) {
       byId.set(messageId, message);
@@ -15,8 +23,13 @@ export function buildGenerationWindow(messages, { currentMessageId = '', limit =
   const byGroupKey = new Map();
   for (const message of ordered) {
     const turnId = String(message?.turnId || '');
+    const batchId = String(message?.batchId || '');
     const speaker = String(message?.speakerType || message?.speakerId || 'unknown');
-    const groupKey = turnId ? `${speaker}:${turnId}` : `message:${message.messageId}`;
+    const groupKey = batchId
+      ? `${speaker}:batch:${batchId}`
+      : turnId
+        ? `${speaker}:${turnId}`
+        : `message:${message.messageId}`;
     let group = byGroupKey.get(groupKey);
     if (!group) {
       group = [];

@@ -61,3 +61,39 @@ test('a single direct message forms its own current batch for legacy envelopes',
   assert.equal(state.previousMessageId, 'msg_previous');
   assert.deepEqual(state.currentBatchMessageIds, ['msg_current']);
 });
+
+test('an id-only batch resolves every current bubble before calculating the previous message', () => {
+  const previousAt = Date.parse('2026-07-23T14:00:00+08:00');
+  const batchAt = previousAt + 60 * 60_000;
+  const envelope = {
+    characterId: 'yuqi',
+    createdAt: batchAt + 2_000,
+    message: {
+      messageId: 'msg_batch_last',
+      speakerId: 'user',
+      content: '算了',
+      sentAt: batchAt + 1_000
+    },
+    context: {
+      currentBatch: {
+        batchId: 'batch_gap',
+        messageIds: ['msg_batch_first', 'msg_batch_last'],
+        startedAt: batchAt,
+        committedAt: batchAt + 2_000
+      }
+    }
+  };
+  const state = buildAuthoritativeInteractionState({
+    envelope,
+    messages: [
+      { messageId: 'msg_previous', speakerId: 'yuqi', sentAt: previousAt, content: '我在听' },
+      { messageId: 'msg_batch_first', speakerId: 'user', sentAt: batchAt, content: '我很失望' },
+      { messageId: 'msg_batch_last', speakerId: 'user', sentAt: batchAt + 1_000, content: '算了' }
+    ],
+    now: batchAt + 5_000
+  });
+
+  assert.equal(state.previousMessageId, 'msg_previous');
+  assert.equal(state.conversationGapMs, 60 * 60_000);
+  assert.deepEqual(state.currentBatchMessageIds, ['msg_batch_first', 'msg_batch_last']);
+});

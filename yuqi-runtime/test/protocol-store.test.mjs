@@ -55,6 +55,29 @@ function validV2Envelope(overrides = {}) {
   };
 }
 
+function validBatchedV2Envelope(overrides = {}) {
+  const source = validV2Envelope(overrides);
+  const first = {
+    messageId: 'msg_device2_batch_1',
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: source.characterId,
+    content: '第一条',
+    sentAt: source.message.sentAt - 1_000
+  };
+  source.context = {
+    ...(source.context || {}),
+    currentBatch: {
+      batchId: 'batch_device2_1',
+      messageIds: [first.messageId, source.message.messageId],
+      startedAt: first.sentAt,
+      committedAt: source.createdAt,
+      messages: [first, source.message]
+    }
+  };
+  return source;
+}
+
 const JPEG_1X1 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==';
 
 test('direct text messages normalize a legacy empty attachment array to no attachment field', () => {
@@ -215,6 +238,91 @@ test('protocol v2 direct turn preserves the exact user message and kind', () => 
   assert.equal(value.trigger, undefined);
 });
 
+test('protocol v2 preserves and normalizes a self-contained ordered current batch', () => {
+  const first = {
+    messageId: 'msg_device2_batch_1',
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: 'yuqi',
+    content: '你明明答应过我，我真的很失望',
+    sentAt: 1784399999000
+  };
+  const second = validV2Envelope().message;
+  const value = validateEnvelope(validV2Envelope({
+    context: {
+      currentBatch: {
+        batchId: 'batch_device2_1',
+        messageIds: [first.messageId, second.messageId],
+        startedAt: first.sentAt,
+        committedAt: 1784400000000,
+        messages: [first, second]
+      }
+    }
+  }));
+
+  assert.deepEqual(value.context.currentBatch.messageIds, [
+    'msg_device2_batch_1',
+    'msg_device2_1'
+  ]);
+  assert.deepEqual(
+    value.context.currentBatch.messages.map(message => message.content),
+    ['你明明答应过我，我真的很失望', '你好']
+  );
+  assert.equal(value.context.currentBatch.startedAt, first.sentAt);
+  assert.equal(value.context.currentBatch.committedAt, 1784400000000);
+});
+
+test('protocol v2 rejects malformed current batch identity, ordering, and timing', () => {
+  const source = validV2Envelope().message;
+  const earlier = {
+    ...source,
+    messageId: 'msg_device2_batch_earlier',
+    content: '第一条',
+    sentAt: source.sentAt - 1_000
+  };
+  const withBatch = currentBatch => validV2Envelope({ context: { currentBatch } });
+
+  assert.throws(() => validateEnvelope(withBatch({
+    batchId: 'batch_device2_duplicate',
+    messageIds: [earlier.messageId, earlier.messageId],
+    startedAt: earlier.sentAt,
+    committedAt: source.sentAt,
+    messages: [earlier, earlier]
+  })), /duplicate batch messageId/i);
+
+  assert.throws(() => validateEnvelope(withBatch({
+    batchId: 'batch_device2_wrong_source',
+    messageIds: [source.messageId, earlier.messageId],
+    startedAt: earlier.sentAt,
+    committedAt: source.sentAt,
+    messages: [source, earlier]
+  })), /source message/i);
+
+  assert.throws(() => validateEnvelope(withBatch({
+    batchId: 'batch_device2_bad_time',
+    messageIds: [earlier.messageId, source.messageId],
+    startedAt: source.sentAt + 1,
+    committedAt: source.sentAt,
+    messages: [earlier, source]
+  })), /batch timing/i);
+});
+
+test('protocol v2 keeps id-only current batches compatible with an existing client', () => {
+  const value = validateEnvelope(validV2Envelope({
+    context: {
+      currentBatch: {
+        batchId: 'batch_legacy_phone',
+        messageIds: ['msg_legacy_first', 'msg_device2_1'],
+        startedAt: 1784399999000,
+        committedAt: 1784400000000
+      }
+    }
+  }));
+
+  assert.deepEqual(value.context.currentBatch.messageIds, ['msg_legacy_first', 'msg_device2_1']);
+  assert.equal('messages' in value.context.currentBatch, false);
+});
+
 test('protocol v2 preserves validated retry lineage for a direct turn', () => {
   const value = validateEnvelope(validV2Envelope({
     context: {
@@ -252,6 +360,91 @@ test('a retry creates a new turn while reusing one canonical user message', () =
     assert.equal(saved.turnId, retry.turnId);
     assert.equal(saved.sourceMessageId, original.message.messageId);
     assert.equal(store.listMessages('yuqi', 20).filter(row => row.speakerType === 'user').length, 1);
+  });
+});
+
+test('a current user batch persists independently from legacy message turn ids across reopening', () => {
+  withStore(({ store, file }) => {
+    store.migrate();
+    const input = validBatchedV2Envelope();
+    store.putMessage({
+      ...input.context.currentBatch.messages[0],
+      turnId: 'turn_legacy_msg_device2_batch_1',
+      characterId: input.characterId,
+      origin: 'phone'
+    });
+    store.submitTurn(input);
+
+    assert.equal(store.getMessage('msg_device2_batch_1').turnId, 'turn_legacy_msg_device2_batch_1');
+    store.close();
+
+    const reopened = new YuqiStore(file);
+    try {
+      reopened.migrate();
+      const batch = reopened.getCurrentUserBatch(input.turnId);
+      assert.equal(batch.batchId, 'batch_device2_1');
+      assert.equal(batch.sourceMessageId, input.message.messageId);
+      assert.deepEqual(batch.messages.map(message => message.messageId), [
+        'msg_device2_batch_1',
+        input.message.messageId
+      ]);
+      const history = reopened.listMessages(input.characterId, 20);
+      assert.deepEqual(
+        history.filter(message => batch.messageIds.includes(message.messageId))
+          .map(message => [message.messageId, message.batchId, message.batchSequence]),
+        [
+          ['msg_device2_batch_1', 'batch_device2_1', 0],
+          [input.message.messageId, 'batch_device2_1', 1]
+        ]
+      );
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test('a retry persists a second turn reference to the same immutable current batch', () => {
+  withStore(({ store }) => {
+    store.migrate();
+    const original = validBatchedV2Envelope();
+    store.submitTurn(original);
+    const retry = validBatchedV2Envelope({
+      turnId: 'turn_device2_batch_retry',
+      deviceSeq: 2,
+      createdAt: original.createdAt + 1_000
+    });
+    retry.context.retry = {
+      retryOfTurnId: original.turnId,
+      canonicalMessageId: original.message.messageId
+    };
+    retry.context.currentBatch.committedAt = original.context.currentBatch.committedAt;
+
+    store.submitTurn(retry);
+
+    assert.equal(store.getCurrentUserBatch(original.turnId).batchId, 'batch_device2_1');
+    assert.equal(store.getCurrentUserBatch(retry.turnId).batchId, 'batch_device2_1');
+    assert.equal(store.listMessages('yuqi', 20).filter(row => row.speakerType === 'user').length, 1);
+  });
+});
+
+test('a retry cannot mutate an earlier message in its canonical current batch', () => {
+  withStore(({ store }) => {
+    store.migrate();
+    const original = validBatchedV2Envelope();
+    store.submitTurn(original);
+    const retry = validBatchedV2Envelope({
+      turnId: 'turn_device2_batch_retry_mutated',
+      deviceSeq: 3,
+      createdAt: original.createdAt + 2_000
+    });
+    retry.context.retry = {
+      retryOfTurnId: original.turnId,
+      canonicalMessageId: original.message.messageId
+    };
+    retry.context.currentBatch.messages[0].content = '被错误改写的第一条';
+    retry.context.currentBatch.committedAt = original.context.currentBatch.committedAt;
+
+    assert.throws(() => store.submitTurn(retry), /retry current batch conflict/i);
   });
 });
 

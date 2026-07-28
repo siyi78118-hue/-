@@ -7,6 +7,7 @@ import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stag
 import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
 import { compileInteractionContract } from './interaction-contract.mjs';
 import { buildGenerationWindow } from './conversation-context.mjs';
+import { currentUserBatchForRole, resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { LifeSimulationCoordinator } from './life-simulation.mjs';
 import { materializeImageAttachments } from './image-attachments.mjs';
 import {
@@ -25,6 +26,35 @@ function parseRoleJson(text, role) {
   }
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${role} returned invalid object`);
   return value;
+}
+
+function withoutCurrentBatch(messages, batch, limit = null) {
+  const currentIds = new Set(batch?.messageIds || []);
+  const historical = (Array.isArray(messages) ? messages : [])
+    .filter(message => !currentIds.has(String(message?.messageId || '')));
+  return limit === null ? historical : historical.slice(-Math.max(1, Number(limit) || 1));
+}
+
+function evidenceMessages(messages, batch) {
+  const byId = new Map();
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const messageId = String(message?.messageId || '');
+    if (messageId) byId.set(messageId, message);
+  }
+  for (const message of batch?.messages || []) {
+    const messageId = String(message?.messageId || '');
+    if (messageId) byId.set(messageId, message);
+  }
+  return [...byId.values()]
+    .sort((left, right) => Number(left?.sentAt || 0) - Number(right?.sentAt || 0));
+}
+
+function stripAttachmentData(message) {
+  if (!message || !Array.isArray(message.attachments)) return message;
+  return {
+    ...message,
+    attachments: message.attachments.map(({ dataUrl, ...metadata }) => metadata)
+  };
 }
 
 export function hardValidateReply(reply) {
@@ -505,11 +535,17 @@ export class YuqiOrchestrator {
     if (['delivered', 'completed'].includes(current.state) && current.replyJson) return JSON.parse(current.replyJson);
     if (['failed', 'fallback'].includes(current.state)) throw new Error(`turn is already ${current.state}`);
     const envelope = JSON.parse(current.envelopeJson);
-    const rawAttachments = Array.isArray(envelope.message?.attachments) ? envelope.message.attachments : [];
+    const initialBatch = resolveCurrentUserBatch(envelope);
+    const rawAttachments = initialBatch?.messages.flatMap(message =>
+      Array.isArray(message?.attachments) ? message.attachments : []
+    ) || [];
     const preparedImages = await materializeImageAttachments(rawAttachments, { turnId });
     if (preparedImages.paths.length) {
       this.turnImagePaths.set(turnId, preparedImages.paths);
-      envelope.message.attachments = rawAttachments.map(({ dataUrl, ...metadata }) => metadata);
+      envelope.message = stripAttachmentData(envelope.message);
+      if (Array.isArray(envelope.context?.currentBatch?.messages)) {
+        envelope.context.currentBatch.messages = envelope.context.currentBatch.messages.map(stripAttachmentData);
+      }
     }
 
     try {
@@ -692,17 +728,24 @@ export class YuqiOrchestrator {
       });
     }
     const lifeContext = this.lifeSimulation.advanceTo(envelope.characterId, this.clock());
-    const recentMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const declaredBatch = resolveCurrentUserBatch(envelope);
+    const stateMessages = this.store.listMessages(
+      envelope.characterId,
+      Math.min(5000, this.contextLimit + Number(declaredBatch?.messageIds.length || 0))
+    );
+    const currentBatch = resolveCurrentUserBatch(envelope, stateMessages);
+    const recentMessages = withoutCurrentBatch(stateMessages, currentBatch, this.contextLimit);
+    const evidenceSourceMessages = evidenceMessages(stateMessages, currentBatch);
     const scene = sceneFromEnvelope(envelope);
     const interactionState = buildAuthoritativeInteractionState({
-      envelope, messages: recentMessages, currentStage: scene.relationshipStage, now: this.clock()
+      envelope, messages: stateMessages, currentStage: scene.relationshipStage, now: this.clock()
     });
     const memoryRequest = {
       task: envelope.message ? 'retrieve_and_extract_evidence' : 'retrieve_context_for_trigger',
       preset: this.presets.compileFor('memory', { scene: { ...scene, kind: envelope.kind } }),
       scene,
-      ...(envelope.message
-        ? { currentMessageId: envelope.message.messageId }
+      ...(currentBatch
+        ? { currentUserBatch: currentUserBatchForRole(currentBatch) }
         : { currentTrigger: envelope.trigger, triggerIsNotUserEvidence: true }),
       recentMessages,
       interactionState,
@@ -735,16 +778,16 @@ export class YuqiOrchestrator {
       current = this.store.getTurn(envelope.turnId);
     }
     const candidates = Array.isArray(memoryResult.candidates) ? memoryResult.candidates : [];
-    const committedFacts = commitVerifiedFacts(this.store, candidates, recentMessages);
+    const committedFacts = commitVerifiedFacts(this.store, candidates, evidenceSourceMessages);
     const relationship = resolveRelationshipStage(
-      scene, memoryResult.relationshipStageReview, recentMessages, this.clock()
+      scene, memoryResult.relationshipStageReview, evidenceSourceMessages, this.clock()
     );
     const interactionContract = compileInteractionContract({
       envelope,
       scene: { ...scene, relationshipStage: relationship.stage },
       interactionState,
       conversationFrame,
-      recentMessages
+      recentMessages: evidenceSourceMessages
     });
     current = this.store.getTurn(envelope.turnId);
     if (
@@ -759,7 +802,7 @@ export class YuqiOrchestrator {
       current = this.store.getTurn(envelope.turnId);
     }
     const memoryPacket = {
-      query: String(memoryResult.query || envelope.message?.content || envelope.trigger?.triggerType || ''),
+      query: String(memoryResult.query || currentBatch?.combinedText || envelope.trigger?.triggerType || ''),
       keywords: Array.isArray(memoryResult.keywords) ? memoryResult.keywords.map(String) : [],
       committedFacts: {
         verified: committedFacts.verified.map(item => item.fact.factId),
@@ -783,9 +826,14 @@ export class YuqiOrchestrator {
   }
 
   async completeBrain(envelope, current) {
-    const stateMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const declaredBatch = resolveCurrentUserBatch(envelope);
+    const stateMessages = this.store.listMessages(
+      envelope.characterId,
+      Math.min(5000, this.contextLimit + Number(declaredBatch?.messageIds.length || 0))
+    );
+    const currentBatch = resolveCurrentUserBatch(envelope, stateMessages);
     const recentMessages = buildGenerationWindow(stateMessages, {
-      currentMessageId: envelope.message?.messageId,
+      currentMessageIds: currentBatch?.messageIds || [],
       limit: this.generationContextLimit
     });
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
@@ -818,7 +866,7 @@ export class YuqiOrchestrator {
         revealedFactIds: evidencePack.facts.map(fact => fact.factId)
       }),
       scene,
-      ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
+      ...(currentBatch ? { currentUserBatch: currentUserBatchForRole(currentBatch) } : { currentTrigger: envelope.trigger }),
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       ...(currentRolePlanExecution(envelope) ? { currentRolePlanExecution: currentRolePlanExecution(envelope) } : {}),
       recentMessages,
@@ -843,9 +891,14 @@ export class YuqiOrchestrator {
 
   async completeSupervisor(envelope, current) {
     const draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
-    const stateMessages = this.store.listMessages(envelope.characterId, this.contextLimit);
+    const declaredBatch = resolveCurrentUserBatch(envelope);
+    const stateMessages = this.store.listMessages(
+      envelope.characterId,
+      Math.min(5000, this.contextLimit + Number(declaredBatch?.messageIds.length || 0))
+    );
+    const currentBatch = resolveCurrentUserBatch(envelope, stateMessages);
     const recentMessages = buildGenerationWindow(stateMessages, {
-      currentMessageId: envelope.message?.messageId,
+      currentMessageIds: currentBatch?.messageIds || [],
       limit: this.generationContextLimit
     });
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
@@ -876,7 +929,7 @@ export class YuqiOrchestrator {
       task: 'review_yuqi_reply',
       preset: this.presets.compileFor('supervisor', { scene: { ...scene, kind: envelope.kind } }),
       scene,
-      ...(envelope.message ? { currentUserMessage: envelope.message } : { currentTrigger: envelope.trigger }),
+      ...(currentBatch ? { currentUserBatch: currentUserBatchForRole(currentBatch) } : { currentTrigger: envelope.trigger }),
       ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
       ...(currentRolePlanExecution(envelope) ? { currentRolePlanExecution: currentRolePlanExecution(envelope) } : {}),
       recentMessages,

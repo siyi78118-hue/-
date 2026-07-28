@@ -1028,7 +1028,9 @@ assert.match(html, /id="chat-quote-preview"/, '聊天输入区必须提供引用
 assert.match(script, /function selectMessageQuote\(charId, messageId\)/, '必须通过真实消息构造待发送引用');
 assert.match(script, /onclick="selectSelectedMessageQuote\(\)"/, '长按虞栖消息菜单必须提供引用入口');
 assert.match(script, /stagePlayerMessage\(chat, text, quote \? \{ quote \} : \{\}\)/, '发送消息时必须把引用快照存入用户消息');
-assert.match(script, /quote:\s*userMessage\.quote \|\| null/, '原生首次发送必须传递引用快照');
+assert.match(script, /function batchMessageForAI\(charId, message\)/, '原生首次发送必须从完整批次构造规范消息');
+assert.match(script, /quote:\s*message\?\.quote \|\| null/, '原生首次发送必须传递每个气泡自己的引用快照');
+assert.match(script, /message:\s*wireSourceMessage/, '原生首次发送必须以批次末条作为回复锚点');
 assert.match(script, /quote:\s*message\.quote \|\| null/, '原生重试必须传递同一引用快照');
 const quoteUiProbe = vm.runInContext(`(() => {
   const oldCharacters = characters;

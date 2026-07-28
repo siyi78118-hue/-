@@ -103,7 +103,6 @@ export function validateEnvelope(value) {
     envelope.kind = incomingKind;
     if (DIRECT_KINDS.has(envelope.kind)) {
       if (value.trigger !== undefined) throw new Error('direct turn cannot contain a trigger');
-      if (value.context !== undefined) envelope.context = validateDirectContext(value.context);
     } else if (AUTOMATIC_KINDS.has(envelope.kind)) {
       if (value.message !== undefined) throw new Error('automatic turn cannot contain a message');
       delete envelope.message;
@@ -115,15 +114,21 @@ export function validateEnvelope(value) {
   }
 
   validateUserMessage(envelope.message, envelope);
+  if (envelope.protocolVersion === 2 && value.context !== undefined) {
+    envelope.context = validateDirectContext(value.context, envelope);
+  }
   return envelope;
 }
 
-function validateDirectContext(context) {
+function validateDirectContext(context, envelope) {
   if (!context || typeof context !== 'object' || Array.isArray(context)) {
     throw new Error('invalid direct context');
   }
   const normalized = {};
   if (context.scene !== undefined) normalized.scene = validateScene(context.scene);
+  if (context.currentBatch !== undefined) {
+    normalized.currentBatch = validateCurrentBatch(context.currentBatch, envelope);
+  }
   if (context.retry !== undefined) {
     const retry = context.retry;
     if (!retry || typeof retry !== 'object' || Array.isArray(retry)) {
@@ -151,6 +156,93 @@ function validateDirectContext(context) {
     requireId(messageId, 'payment messageId');
     if (!['pending', 'received', 'refused'].includes(status)) throw new Error('invalid payment status');
     normalized.payment = { kind, amount, note, messageId, status };
+  }
+  return normalized;
+}
+
+function canonicalMessageId(value, label = 'batch messageId') {
+  const incoming = String(value || '');
+  const messageId = /^pay_[A-Za-z0-9_-]+$/.test(incoming) ? `msg_${incoming}` : incoming;
+  requireId(messageId, label, 'msg_');
+  return messageId;
+}
+
+function normalizedBatchMessage(value, envelope) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('invalid current batch message');
+  }
+  const message = structuredClone(value);
+  message.messageId = canonicalMessageId(message.messageId);
+  validateUserMessage(message, envelope);
+  if (message.speakerType !== 'user' || message.speakerId !== 'user') {
+    throw new Error('current batch messages must be user messages');
+  }
+  if (message.recipientId !== envelope.characterId) {
+    throw new Error('current batch recipient mismatch');
+  }
+  return {
+    messageId: message.messageId,
+    speakerId: message.speakerId,
+    speakerType: message.speakerType,
+    recipientId: message.recipientId,
+    content: message.content,
+    ...(message.attachments ? { attachments: message.attachments } : {}),
+    sentAt: message.sentAt
+  };
+}
+
+function validateCurrentBatch(value, envelope) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('invalid current batch');
+  }
+  const batchId = String(value.batchId || '');
+  requireId(batchId, 'current batchId', 'batch_');
+  if (!Array.isArray(value.messageIds) || value.messageIds.length < 1 || value.messageIds.length > 64) {
+    throw new Error('invalid current batch messageIds');
+  }
+  const messageIds = value.messageIds.map(messageId => canonicalMessageId(messageId));
+  if (new Set(messageIds).size !== messageIds.length) throw new Error('duplicate batch messageId');
+  if (messageIds.at(-1) !== envelope.message.messageId) throw new Error('current batch source message mismatch');
+
+  const startedAt = requireTimestamp(value.startedAt, 'current batch startedAt');
+  const committedAt = requireTimestamp(value.committedAt, 'current batch committedAt');
+  if (startedAt > committedAt) throw new Error('invalid current batch timing');
+  const normalized = { batchId, messageIds, startedAt, committedAt };
+
+  if (value.messages !== undefined) {
+    if (!Array.isArray(value.messages) || value.messages.length !== messageIds.length) {
+      throw new Error('current batch messages must match messageIds');
+    }
+    const messages = value.messages.map(message => normalizedBatchMessage(message, envelope));
+    const normalizedIds = messages.map(message => message.messageId);
+    if (canonicalJson(normalizedIds) !== canonicalJson(messageIds)) {
+      throw new Error('current batch message order mismatch');
+    }
+    const source = messages.at(-1);
+    if (
+      source.messageId !== envelope.message.messageId
+      || source.content !== envelope.message.content
+      || Number(source.sentAt) !== Number(envelope.message.sentAt)
+    ) {
+      throw new Error('current batch source message mismatch');
+    }
+    if (
+      startedAt !== Number(messages[0].sentAt)
+      || messages.some((message, index) =>
+        Number(message.sentAt) > committedAt
+        || (index > 0 && Number(message.sentAt) < Number(messages[index - 1].sentAt))
+      )
+    ) {
+      throw new Error('invalid current batch timing');
+    }
+    const totalText = messages.reduce((sum, message) => sum + message.content.length, 0);
+    if (totalText > 200_000) throw new Error('current batch content too large');
+    const totalAttachments = messages.reduce(
+      (sum, message) => sum + (Array.isArray(message.attachments) ? message.attachments.length : 0),
+      0
+    );
+    if (totalAttachments > 1) throw new Error('current batch supports at most one image attachment');
+    normalized.messages = messages;
   }
   return normalized;
 }

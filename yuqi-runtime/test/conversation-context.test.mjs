@@ -92,3 +92,52 @@ test('generation window counts user and character messages separately even when 
 
   assert.deepEqual(window.map(item => item.messageId), ['msg_shared_character']);
 });
+
+test('generation window excludes every message in the current user batch', () => {
+  const window = buildGenerationWindow([
+    { messageId: 'msg_history', speakerType: 'character', sentAt: 1, content: '之前' },
+    { messageId: 'msg_batch_1', speakerType: 'user', sentAt: 2, content: '第一条' },
+    { messageId: 'msg_batch_2', speakerType: 'user', sentAt: 3, content: '第二条' }
+  ], {
+    currentMessageIds: ['msg_batch_1', 'msg_batch_2'],
+    limit: 20
+  });
+
+  assert.deepEqual(window.map(item => item.messageId), ['msg_history']);
+});
+
+test('generation window keeps a historical multi-bubble user batch as one complete group', () => {
+  const messages = [
+    {
+      messageId: 'msg_user_batch_1',
+      batchId: 'batch_history',
+      batchSequence: 0,
+      turnId: 'turn_legacy_1',
+      speakerType: 'user',
+      sentAt: 1,
+      content: '第一条'
+    },
+    {
+      messageId: 'msg_user_batch_2',
+      batchId: 'batch_history',
+      batchSequence: 1,
+      turnId: 'turn_legacy_2',
+      speakerType: 'user',
+      sentAt: 2,
+      content: '第二条'
+    },
+    ...Array.from({ length: 20 }, (_, index) => ({
+      messageId: `msg_recent_group_${index}`,
+      turnId: `turn_recent_group_${index}`,
+      speakerType: 'character',
+      sentAt: 3 + index,
+      content: `最近消息 ${index}`
+    }))
+  ];
+
+  const window = buildGenerationWindow(messages, { limit: 21 });
+
+  assert.equal(window.some(item => item.messageId === 'msg_user_batch_1'), true);
+  assert.equal(window.some(item => item.messageId === 'msg_user_batch_2'), true);
+  assert.equal(window.length, 22);
+});

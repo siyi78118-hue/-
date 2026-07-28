@@ -55,6 +55,50 @@ test('strong emotion selects the deep route even when short', () => {
   assert.equal(selectTurnRoute({ envelope: direct('我真的很失望'), recentMessages: [] }).route, 'deep');
 });
 
+test('the whole current batch selects deep when a severe first bubble is followed by a mild last bubble', () => {
+  const envelope = direct('算了');
+  envelope.context = {
+    currentBatch: {
+      batchId: 'batch_route_1',
+      messageIds: ['msg_route_first', envelope.message.messageId],
+      startedAt: envelope.message.sentAt - 1_000,
+      committedAt: envelope.createdAt,
+      messages: [
+        {
+          ...envelope.message,
+          messageId: 'msg_route_first',
+          content: '你明明答应过我，我真的很失望',
+          sentAt: envelope.message.sentAt - 1_000
+        },
+        envelope.message
+      ]
+    }
+  };
+
+  const decision = selectTurnRoute({ envelope, recentMessages: [] });
+
+  assert.equal(decision.route, 'deep');
+  assert.ok(decision.reasons.includes('commitment_or_relationship'));
+  assert.ok(decision.reasons.includes('strong_emotion'));
+});
+
+test('an incomplete old current batch routes deep instead of silently using only its last bubble', () => {
+  const envelope = direct('算了');
+  envelope.context = {
+    currentBatch: {
+      batchId: 'batch_route_missing',
+      messageIds: ['msg_route_missing', envelope.message.messageId],
+      startedAt: envelope.message.sentAt - 1_000,
+      committedAt: envelope.createdAt
+    }
+  };
+
+  const decision = selectTurnRoute({ envelope, recentMessages: [] });
+
+  assert.equal(decision.route, 'deep');
+  assert.ok(decision.reasons.includes('incomplete_current_batch'));
+});
+
 test('long or multi-question content selects the deep route', () => {
   assert.equal(selectTurnRoute({ envelope: direct(`${'我想认真和你聊聊。'.repeat(30)}你怎么看？为什么？`), recentMessages: [] }).route, 'deep');
 });
@@ -71,4 +115,3 @@ test('role profiles implement the approved model matrix', () => {
   assert.deepEqual(roleExecutionProfile('deep', 'brain'), { model: 'gpt-5.6-sol', effort: 'medium' });
   assert.deepEqual(roleExecutionProfile('deep', 'supervisor'), { model: 'gpt-5.6-terra', effort: 'medium' });
 });
-

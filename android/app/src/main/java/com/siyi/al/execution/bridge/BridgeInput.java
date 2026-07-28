@@ -34,6 +34,22 @@ final class BridgeInput {
         return messageId;
     }
 
+    static JSONObject currentBatchMessage(JSONObject supplied, String characterId) throws Exception {
+        JSONObject message = new JSONObject(supplied.toString());
+        String messageId = wireMessageId(message.optString("messageId", ""));
+        message.put("messageId", messageId);
+        message.put("speakerId", "user");
+        message.put("speakerType", "user");
+        message.put("recipientId", characterId);
+        JSONArray attachments = message.optJSONArray("attachments");
+        if (attachments != null) {
+            for (int index = 0; index < attachments.length(); index += 1) {
+                attachments.getJSONObject(index).put("messageId", messageId);
+            }
+        }
+        return message;
+    }
+
     static long deviceSeq(TurnSubmission submission) throws Exception {
         return source(submission).optLong("deviceSeq", Math.max(1L, submission.createdAt));
     }
@@ -68,9 +84,12 @@ final class BridgeInput {
                 context.put("retry", new JSONObject(suppliedRetry.toString()));
             }
             JSONArray suppliedMessageIds = options == null ? null : options.optJSONArray("batchMessageIds");
-            JSONArray messageIds = suppliedMessageIds == null
-                ? new JSONArray()
-                : new JSONArray(suppliedMessageIds.toString());
+            JSONArray messageIds = new JSONArray();
+            if (suppliedMessageIds != null) {
+                for (int index = 0; index < suppliedMessageIds.length(); index += 1) {
+                    messageIds.put(wireMessageId(suppliedMessageIds.optString(index, "")));
+                }
+            }
             String currentMessageId = envelope.getJSONObject("message").getString("messageId");
             if (messageIds.length() == 0) messageIds.put(currentMessageId);
             long messageSentAt = envelope.getJSONObject("message").getLong("sentAt");
@@ -85,6 +104,17 @@ final class BridgeInput {
                 .put("committedAt", options == null
                     ? submission.createdAt
                     : options.optLong("batchCommittedAt", submission.createdAt));
+            JSONArray suppliedBatchMessages = options == null ? null : options.optJSONArray("batchMessages");
+            if (suppliedBatchMessages != null && suppliedBatchMessages.length() > 0) {
+                JSONArray batchMessages = new JSONArray();
+                for (int index = 0; index < suppliedBatchMessages.length(); index += 1) {
+                    batchMessages.put(currentBatchMessage(
+                        suppliedBatchMessages.getJSONObject(index),
+                        submission.characterId
+                    ));
+                }
+                currentBatch.put("messages", batchMessages);
+            }
             context.put("currentBatch", currentBatch);
             JSONObject scene = snapshot.optJSONObject("scene");
             if (scene != null) context.put("scene", new JSONObject(scene.toString()));

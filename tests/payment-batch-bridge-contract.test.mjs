@@ -25,6 +25,20 @@ test('finishing a batch preserves the latest payment metadata for reply settleme
   assert.match(finish, /payment:\s*\{\s*kind:/);
 });
 
+test('finishing a batch serializes every visible bubble as one ordered AI batch', () => {
+  const finish = bodyOf('finishStagedBatch', 'voiceButtonEl');
+  assert.match(finish, /batchMessages\s*=\s*committed\.messages\.map/);
+  assert.match(finish, /batchMessageForAI\(charId,\s*message\)/);
+  assert.match(finish, /batchMessages,/);
+
+  const taskBuilder = bodyOf('buildAndroidUserReplyTask', 'dumpCharacterMemoryForRunner');
+  assert.match(taskBuilder, /batchMessages:\s*Array\.isArray\(options\.batchMessages\)/);
+
+  const queue = bodyOf('queueAndroidUserReply', 'mirrorAppStateNow');
+  assert.match(queue, /wireBatchMessages/);
+  assert.match(queue, /message:\s*wireSourceMessage/);
+});
+
 test('discarding a staged outgoing payment refunds it exactly once', () => {
   const refund = bodyOf('refundStagedOutgoingPayment', 'retractMessage');
   assert.match(refund, /deliveryState\s*!==\s*'staged'/);

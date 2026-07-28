@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
+import { resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { TURN_STATES, canonicalJson, contentHash, validateEnvelope } from './protocol.mjs';
 
 const TURN_PATCH_COLUMNS = new Map([
@@ -60,6 +61,8 @@ function mapMessage(row) {
     origin: row.origin,
     deviceId: row.device_id || '',
     deviceSeq: row.device_seq ?? null,
+    batchId: row.batch_id || '',
+    batchSequence: row.batch_sequence ?? null,
     checksum: row.checksum
   };
 }
@@ -240,6 +243,34 @@ export class YuqiStore {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_messages_character_time ON messages(character_id, sent_at DESC);
+
+      CREATE TABLE IF NOT EXISTS current_user_batches (
+        turn_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        character_id TEXT NOT NULL,
+        source_message_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        committed_at INTEGER NOT NULL,
+        checksum TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(turn_id) REFERENCES turns(turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_current_user_batches_batch
+        ON current_user_batches(batch_id);
+
+      CREATE TABLE IF NOT EXISTS current_user_batch_items (
+        turn_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        message_json TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        PRIMARY KEY(turn_id, sequence),
+        UNIQUE(turn_id, message_id),
+        FOREIGN KEY(turn_id) REFERENCES current_user_batches(turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_current_user_batch_items_message
+        ON current_user_batch_items(message_id);
 
       CREATE TABLE IF NOT EXISTS facts (
         fact_id TEXT PRIMARY KEY,
@@ -458,6 +489,14 @@ export class YuqiStore {
       ) {
         throw new Error('retry turn lineage mismatch');
       }
+      const previousEnvelope = parseJson(previousTurn.envelopeJson, {});
+      const previousBatch = previousEnvelope.context?.currentBatch;
+      if (
+        previousBatch
+        && contentHash(previousBatch) !== contentHash(envelope.context?.currentBatch || null)
+      ) {
+        throw new Error('retry current batch conflict');
+      }
       canonicalRetryMessage = this.getMessage(retry.canonicalMessageId);
       if (
         !canonicalRetryMessage
@@ -514,6 +553,7 @@ export class YuqiStore {
         envelope.createdAt,
         now()
       );
+      if (envelope.message) this.putCurrentUserBatchInternal(envelope);
       const turn = this.getTurn(envelope.turnId);
       this.appendSync('turn', envelope.turnId, 'insert', turn);
       return turn;
@@ -522,6 +562,73 @@ export class YuqiStore {
 
   getTurn(turnId) {
     return mapTurn(this.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turnId));
+  }
+
+  putCurrentUserBatchInternal(envelope) {
+    const batch = resolveCurrentUserBatch(envelope);
+    if (!batch) return null;
+    const canonical = {
+      batchId: batch.batchId,
+      sourceMessageId: batch.sourceMessageId,
+      messageIds: batch.messageIds,
+      startedAt: batch.startedAt,
+      committedAt: batch.committedAt
+    };
+    this.db.prepare(`
+      INSERT INTO current_user_batches(
+        turn_id, batch_id, character_id, source_message_id,
+        started_at, committed_at, checksum, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      envelope.turnId,
+      batch.batchId,
+      envelope.characterId,
+      batch.sourceMessageId,
+      batch.startedAt,
+      batch.committedAt,
+      contentHash(canonical),
+      now()
+    );
+    const byId = new Map(batch.messages.map(message => [String(message.messageId || ''), message]));
+    const insert = this.db.prepare(`
+      INSERT INTO current_user_batch_items(
+        turn_id, batch_id, message_id, sequence, message_json, checksum
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    batch.messageIds.forEach((messageId, sequence) => {
+      const message = byId.get(messageId) || { messageId };
+      insert.run(
+        envelope.turnId,
+        batch.batchId,
+        messageId,
+        sequence,
+        canonicalJson(message),
+        contentHash(message)
+      );
+    });
+    return this.getCurrentUserBatch(envelope.turnId);
+  }
+
+  getCurrentUserBatch(turnId) {
+    const batch = this.db.prepare(
+      'SELECT * FROM current_user_batches WHERE turn_id = ?'
+    ).get(turnId);
+    if (!batch) return null;
+    const items = this.db.prepare(`
+      SELECT * FROM current_user_batch_items
+      WHERE turn_id = ? ORDER BY sequence ASC
+    `).all(turnId);
+    return {
+      turnId: batch.turn_id,
+      batchId: batch.batch_id,
+      characterId: batch.character_id,
+      sourceMessageId: batch.source_message_id,
+      messageIds: items.map(item => item.message_id),
+      startedAt: batch.started_at,
+      committedAt: batch.committed_at,
+      messages: items.map(item => parseJson(item.message_json, { messageId: item.message_id })),
+      checksum: batch.checksum
+    };
   }
 
   getProactiveChatDeliveryPolicy(characterId, { windowSize = 4, maxSkips = 1 } = {}) {
@@ -988,12 +1095,19 @@ export class YuqiStore {
   listMessages(characterId, limit = 200) {
     const safeLimit = Math.max(1, Math.min(5000, Number(limit) || 200));
     return this.db.prepare(`
-      SELECT * FROM (
+      SELECT recent.*, batch.batch_id, batch.batch_sequence
+      FROM (
         SELECT * FROM messages
         WHERE character_id = ?
           AND message_id NOT IN (SELECT message_id FROM suppressed_messages)
         ORDER BY sent_at DESC, message_id DESC LIMIT ?
-      ) ORDER BY sent_at ASC, message_id ASC
+      ) AS recent
+      LEFT JOIN (
+        SELECT message_id, MIN(batch_id) AS batch_id, MIN(sequence) AS batch_sequence
+        FROM current_user_batch_items
+        GROUP BY message_id
+      ) AS batch ON batch.message_id = recent.message_id
+      ORDER BY recent.sent_at ASC, recent.message_id ASC
     `).all(characterId, safeLimit).map(mapMessage);
   }
 
