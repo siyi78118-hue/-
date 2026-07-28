@@ -110,3 +110,10 @@ test('导演卡不替换完整 RP 预设和当前 200 条证据契约', () => {
   assert.match(source, /live-director-card/);
   assert.match(source, /prepareConversationContextSafe/);
 });
+
+test('导演卡不替换完整 RP 预设和当前 200 条证据契约', () => {
+  assert.match(source, /RP_PRESETS\.combined/);
+  assert.match(source, /const NORMAL_RAW_CONTEXT_LIMIT = 200/);
+  assert.match(source, /live-director-card/);
+  assert.match(source, /prepareConversationContextSafe/);
+});
