@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { PresetRegistry } from '../src/preset-registry.mjs';
+import { ROLE_OUTPUT_SCHEMAS } from '../src/role-schemas.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -25,7 +26,7 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.9.0');
+  assert.equal(current.version, '1.9.1');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
@@ -64,7 +65,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.9.0');
+    assert.equal(registry.current().version, '1.9.1');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -141,6 +142,30 @@ test('memory stays isolated while supervisor receives the authoritative generati
   assert.doesNotMatch(supervisor, /候选事实抽取格式/);
 }));
 
+test('memory schema exposes temporary interaction boundaries and correction evidence', () => {
+  const frame = ROLE_OUTPUT_SCHEMAS.memory.properties.conversationFrame;
+  const boundaries = frame.properties.explicitBoundaries;
+  const correction = frame.properties.recentCorrection;
+
+  assert.equal(boundaries.type, 'array');
+  assert.deepEqual(boundaries.items.required, ['type', 'active', 'reason', 'evidenceMessageIds']);
+  assert.deepEqual(
+    correction.required,
+    ['active', 'rejectedInterpretation', 'expiresAfterBatches', 'evidenceMessageIds']
+  );
+  assert.equal(correction.properties.expiresAfterBatches.type, 'integer');
+});
+
+test('memory preset prioritizes whole-interaction evidence without writing dialogue for Yuqi', () => withRegistry(registry => {
+  const memory = registry.compileFor('memory', { stage: 'familiar' });
+
+  assert.match(memory, /整段互动.*字面|字面.*整段互动/s);
+  assert.match(memory, /冲突|冷却|开放话题/);
+  assert.match(memory, /明确纠正.*临时|临时.*明确纠正/s);
+  assert.match(memory, /不得.*台词|不.*替.*写.*回复/s);
+  assert.doesNotMatch(memory, /“你干嘛”|“\\？”|厨房/);
+}));
+
 test('brain and supervisor presets define an executable closed rewrite handshake', () => withRegistry(registry => {
   const brain = registry.compileFor('brain', { stage: 'initial' });
   const supervisor = registry.compileFor('supervisor', { stage: 'initial' });
@@ -166,16 +191,16 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.9.1');
-  assert.equal(published.parentVersion, '1.9.0');
+  assert.equal(published.version, '1.9.2');
+  assert.equal(published.parentVersion, '1.9.1');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 2);
 
-  const rollback = registry.rollback('1.9.0');
-  assert.equal(rollback.version, '1.9.2');
-  assert.equal(rollback.parentVersion, '1.9.1');
-  assert.equal(rollback.rollbackOf, '1.9.0');
+  const rollback = registry.rollback('1.9.1');
+  assert.equal(rollback.version, '1.9.3');
+  assert.equal(rollback.parentVersion, '1.9.2');
+  assert.equal(rollback.rollbackOf, '1.9.1');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
   assert.equal(store.listPresetVersions().length, 3);
 }));

@@ -134,6 +134,7 @@ git commit -m "feat: compile authoritative interaction contracts"
 
 **Files:**
 - Modify: `yuqi-runtime/src/role-schemas.mjs`
+- Modify: `yuqi-runtime/presets/manifest.json`
 - Modify: `yuqi-runtime/presets/memory-manager.md`
 - Modify: `yuqi-runtime/test/preset-registry.test.mjs`
 - Modify: `yuqi-runtime/test/orchestrator.test.mjs`
@@ -197,6 +198,7 @@ recentCorrection: objectSchema({
 ```
 
 Update the memory preset with general evidence-priority rules rather than example phrases.
+Raise the packaged immutable preset version from `1.9.0` to `1.9.1` so an existing production database promotes the new memory, brain, and supervisor modules instead of reopening the old stored `1.9.0` snapshot.
 
 - [ ] **Step 4: Run focused tests**
 
@@ -207,7 +209,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add -- yuqi-runtime/src/role-schemas.mjs yuqi-runtime/presets/memory-manager.md yuqi-runtime/test/preset-registry.test.mjs yuqi-runtime/test/orchestrator.test.mjs
+git add -- yuqi-runtime/src/role-schemas.mjs yuqi-runtime/presets/manifest.json yuqi-runtime/presets/memory-manager.md yuqi-runtime/test/preset-registry.test.mjs yuqi-runtime/test/orchestrator.test.mjs
 git commit -m "feat: capture interaction boundaries and corrections"
 ```
 

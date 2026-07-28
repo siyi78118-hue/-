@@ -104,6 +104,21 @@ const conversationFrameSchema = objectSchema({
   activeHooks: stringArray(),
   ambiguities: stringArray(),
   responseRisks: stringArray(),
+  explicitBoundaries: {
+    type: 'array',
+    items: objectSchema({
+      type: { type: 'string' },
+      active: { type: 'boolean' },
+      reason: { type: 'string' },
+      evidenceMessageIds: stringArray()
+    }, ['type', 'active', 'reason', 'evidenceMessageIds'])
+  },
+  recentCorrection: objectSchema({
+    active: { type: 'boolean' },
+    rejectedInterpretation: { type: 'string' },
+    expiresAfterBatches: { type: 'integer' },
+    evidenceMessageIds: stringArray()
+  }, ['active', 'rejectedInterpretation', 'expiresAfterBatches', 'evidenceMessageIds']),
   needsNuanceReview: { type: 'boolean' }
 }, [
   'surfaceAct', 'intentHypotheses', 'interactionMode', 'emotionalTone', 'relationshipMove',
