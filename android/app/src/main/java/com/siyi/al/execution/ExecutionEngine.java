@@ -82,14 +82,41 @@ public final class ExecutionEngine {
             }
             if (state == TurnState.MEMORY_DONE) {
                 store.markStage(turn.turnId, attempt.attemptId, TurnState.CHAT_RUNNING, AttemptStage.CHAT, clock.now());
-                String rawReply = models.call(
+                String chatSystem = withExecutionTime(
+                    withMemory(snapshot, snapshot.getString("chatSystem"), attempt.memoryResult),
+                    clock.now()
+                );
+                String primaryReply = models.call(
                     snapshot.getString("chatConfigId"),
-                    withExecutionTime(withMemory(snapshot.getString("chatSystem"), attempt.memoryResult), clock.now()),
+                    chatSystem,
                     exactChatMessages(snapshot),
                     snapshot.optInt("chatMaxTokens", 1000)
                 );
-                store.saveRawReply(turn.turnId, attempt.attemptId, rawReply, clock.now());
-                attempt.rawReply = rawReply;
+                LiveReplyQualityGate qualityGate = new LiveReplyQualityGate();
+                LiveReplyQualityGate.Context qualityContext =
+                    LiveReplyQualityGate.Context.fromSnapshot(snapshot, attempt.memoryResult);
+                LiveReplyQualityGate.Report qualityReport = qualityGate.inspect(primaryReply, qualityContext);
+                String finalReply = primaryReply;
+                if (qualityGate.shouldRewrite(qualityReport) && !"payment".equals(qualityContext.scene)) {
+                    List<String> directives = LiveReplyQualityGate.hiddenDirectives(primaryReply);
+                    JSONArray rewriteMessages = new JSONArray().put(new JSONObject()
+                        .put("role", "user")
+                        .put("content", qualityGate.buildRewriteInstruction(
+                            primaryReply,
+                            qualityReport,
+                            DirectorCardCodec.directorText(attempt.memoryResult, snapshot),
+                            qualityContext
+                        )));
+                    String rewritten = models.call(
+                        snapshot.getString("chatConfigId"),
+                        chatSystem,
+                        rewriteMessages,
+                        snapshot.optInt("chatMaxTokens", 1000)
+                    );
+                    finalReply = LiveReplyQualityGate.reattachDirectives(rewritten, directives);
+                }
+                store.saveRawReply(turn.turnId, attempt.attemptId, finalReply, clock.now());
+                attempt.rawReply = finalReply;
                 state = TurnState.CHAT_DONE;
             }
             if (state == TurnState.CHAT_DONE) commitStoredReply(turn, attempt);
@@ -185,15 +212,19 @@ public final class ExecutionEngine {
     private static JSONArray exactChatMessages(JSONObject snapshot) {
         JSONArray source = snapshot.optJSONArray("chatMessages");
         if (source == null) return new JSONArray();
-        int start = Math.max(0, source.length() - 200);
+        int start = Math.max(0, source.length() - 30);
         JSONArray selected = new JSONArray();
         for (int index = start; index < source.length(); index++) selected.put(source.opt(index));
         return selected;
     }
 
-    private static String withMemory(String fullSystemPrompt, String memory) {
-        String selected = memory == null || memory.trim().isEmpty() ? "无相关记忆" : memory.trim();
-        return fullSystemPrompt + "\n\n【记忆 AI 本轮筛选结果】\n" + selected + "\n以上事件时间必须按记录理解，不得把昨天改写成今天。";
+    private static String withMemory(JSONObject snapshot, String fullSystemPrompt, String rawMemory) {
+        DirectorCardCodec.Context context = DirectorCardCodec.Context.fromSnapshot(snapshot);
+        DirectorCardCodec.Result result = new DirectorCardCodec().parse(rawMemory, context);
+        return fullSystemPrompt + "\n\n" + result.formatPrompt(
+            snapshot.optString("playerName", "我"),
+            snapshot.optString("characterName", "AL")
+        );
     }
 
     private static String withExecutionTime(String system, long now) {

@@ -1,5 +1,7 @@
-const CACHE_NAME = 'rpchat-v95';
-const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './warm-modern.css', './lib/api-endpoint.js', './lib/role-plan-domain.js', './lib/role-plan-repository.js', './sw-v11.js'];
+importScripts('./lib/live-chat-director.js');
+
+const CACHE_NAME = 'rpchat-v97';
+const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './warm-modern.css', './lib/api-endpoint.js', './lib/role-plan-domain.js', './lib/role-plan-repository.js', './lib/live-chat-director.js', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
@@ -1216,25 +1218,89 @@ async function updateBackgroundPaymentStatusFromReply(state, charId, reply, expl
   return true;
 }
 
-function buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings = {}) {
-  const system = `你是 AL 的后台本地记忆检索 AI。
+function backgroundPreviousContactPressure(messages = []) {
+  const visible = (Array.isArray(messages) ? messages : []).filter(row => row && !row.deleted && !row.retracted && row.role !== 'system');
+  const lastUserIndex = visible.map(row => row.role).lastIndexOf('user');
+  const assistantSinceUser = visible.slice(lastUserIndex + 1)
+    .filter(row => row.role === 'assistant' && row.proactive && row.proactiveMode !== 'manual');
+  if (!assistantSinceUser.length) return 'none';
+  const text = assistantSinceUser.map(row => String(row.content || '')).join('\n');
+  const directRequest = /(?:回我|理我|说话|在吗|怎么不回|为什么不回)/.test(text);
+  const complaint = /(?:又不回|一直不回|每次都|算了|随便你|当我没说|不想理我)/.test(text);
+  if (assistantSinceUser.length >= 2 && (directRequest || complaint)) return 'high';
+  if (directRequest || complaint) return 'medium';
+  return 'low';
+}
+
+function backgroundDirectorContext(char, messages, scene = 'proactive-chat', now = new Date()) {
+  const visible = (Array.isArray(messages) ? messages : []).filter(row => row && !row.deleted && !row.retracted && row.role !== 'system');
+  const last = visible.at(-1);
+  const lastUser = [...visible].reverse().find(row => row.role === 'user');
+  const lastAssistant = [...visible].reverse().find(row => row.role === 'assistant');
+  const stageId = char?.stagePersona?.currentStage || 'new';
+  return {
+    scene: scene === 'payment' ? 'payment' : scene === 'chat' ? 'chat' : 'proactive-chat',
+    nowMs: now.getTime(),
+    lastMessageAt: Number(last?.time) || 0,
+    lastUserAt: Number(lastUser?.time) || 0,
+    lastAssistantAt: Number(lastAssistant?.time) || 0,
+    lastAssistantText: String(lastAssistant?.content || ''),
+    latestMessageIds: visible.slice(-NORMAL_RAW_CONTEXT_LIMIT).map(row => row.id).filter(Boolean),
+    relationshipStageId: stageId,
+    previousContactPressure: backgroundPreviousContactPressure(visible)
+  };
+}
+
+function buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings = {}, options = {}) {
+  const now = options.now instanceof Date ? options.now : new Date();
+  const scene = options.scene === 'payment' ? 'payment' : options.scene === 'chat' ? 'chat' : 'proactive-chat';
+  const directorContext = options.directorContext || backgroundDirectorContext(char, messages, scene, now);
+  if (options.includeDirector === false) {
+    return {
+      system: `你是 AL 的后台本地记忆检索 AI。
 你不参与角色扮演，不回复${playerName(settings)}，不替${charName(char)}说话。
 任务：只根据当前触发原因、固定最近200条聊天和后台场景事件，生成向量数据库召回用的检索查询。
 当前触发原因或玩家最近一条发言优先级最高。最近200条只用于消除“昨天那件事”等指代歧义，不代表其中每个旧话题都要召回。
-正例：当前触发原因明确提到“昨天的红包”，检索红包金额、是否领取和备注。
-反例：当前是新话题，却仅因30条里出现过红包就继续召回并催问红包。
 有关联时可以召回昨天或更早的记忆；没有关联时不要强行带入旧内容。
 query 要围绕当前需要回忆的事实、关系、承诺、红包、朋友圈或雷点。
 keywords 要短而具体，方便本地记忆库召回。
-只输出 JSON，不要输出解释：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`;
-  const user = `双方昵称：${playerName(settings)} / ${charName(char)}
+只输出 JSON，不要输出解释：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`,
+      user: `双方昵称：${playerName(settings)} / ${charName(char)}
 固定最近200条聊天与场景事件（仅用于判断当前触发是否指向旧内容）：
 ${messages.slice(-NORMAL_RAW_CONTEXT_LIMIT).map(m => messageLine(m, char, settings)).join('\n') || '暂无'}
 
 当前触发原因：
 ${triggerText}
 
-输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`;
+输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current"}`
+    };
+  }
+  const system = `你是 AL 的后台本地记忆检索 AI。
+你不参与角色扮演，不回复${playerName(settings)}，不替${charName(char)}说话。
+任务一：只根据当前触发原因、固定最近200条聊天和后台场景事件，生成向量数据库召回用的检索查询。
+当前触发原因或玩家最近一条发言优先级最高。最近200条只用于消除“昨天那件事”等指代歧义，不代表其中每个旧话题都要召回。
+正例：当前触发原因明确提到“昨天的红包”，检索红包金额、是否领取和备注。
+反例：当前是新话题，却仅因30条里出现过红包就继续召回并催问红包。
+有关联时可以召回昨天或更早的记忆；没有关联时不要强行带入旧内容。
+query 要围绕当前需要回忆的事实、关系、承诺、红包、朋友圈或雷点。
+keywords 要短而具体，方便本地记忆库召回。
+任务二：生成本轮隐藏导演卡。它只描述角色当前理解、情绪、边界和回复方向，不写可直接发送的台词。
+主动私聊要判断未回复前因、上一轮联系压力和真实时间间隔；允许有证据的潜台词判断，但低置信度时必须按字面含义和保守边界处理。
+导演卡不是台词提纲，不得写可直接复制发送的句子；意图、情绪原因和沉默原因必须由最近原文、时间或记忆支持。
+director 必须包含：schemaVersion、scene、timeGap、silenceCause、previousContactPressure、relationshipStageId、playerIntent、playerIntentConfidence、currentMood、moodCause、stanceTowardPlayer、ownLifeFocus、noticedPoint、replyImpulse、contactPressure、openingNeeded、recommendedDirection、avoid、evidenceMessageIds、confidence。
+只输出 JSON，不要输出解释：{"query":"一句检索查询","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","director":{"schemaVersion":1,"scene":"chat|proactive-chat|payment","timeGap":"instant|short|hours|overnight|days","silenceCause":"not_applicable|natural_pause|temporary_absence|conflict|explicit_distance|repeated_unexplained|uncertain","previousContactPressure":"none|low|medium|high","relationshipStageId":"new|acquainted|familiar|close|committed","playerIntent":"简短判断","playerIntentConfidence":0,"currentMood":"","moodCause":"","stanceTowardPlayer":"","ownLifeFocus":"","noticedPoint":"","replyImpulse":"answer|share|tease|refuse|check_in|repair|pause|skip","contactPressure":"low|medium|high","openingNeeded":false,"recommendedDirection":"","avoid":[],"evidenceMessageIds":[],"confidence":0}}`;
+  const user = `双方昵称：${playerName(settings)} / ${charName(char)}
+本轮场景：${scene}
+当前设备时间：${formatFullTime(now)}
+距离最后一条消息：${directorContext.lastMessageAt ? formatElapsed(now.getTime() - directorContext.lastMessageAt) : '无可用记录'}
+上一轮联系压力：${directorContext.previousContactPressure}
+固定最近200条聊天与场景事件（仅用于判断当前触发是否指向旧内容）：
+${messages.slice(-NORMAL_RAW_CONTEXT_LIMIT).map(m => messageLine(m, char, settings)).join('\n') || '暂无'}
+
+当前触发原因：
+${triggerText}
+
+输出 JSON：{"query":"一句检索查询，包含最需要回忆的人物、事件、承诺、朋友圈/红包等关键词","keywords":["关键词"],"focus":"profile|event|relationship|payment|moment|current","director":{"schemaVersion":1,"scene":"${scene}","timeGap":"instant","silenceCause":"${scene === 'chat' ? 'not_applicable' : 'uncertain'}","previousContactPressure":"${directorContext.previousContactPressure}","relationshipStageId":"${directorContext.relationshipStageId}","playerIntent":"","playerIntentConfidence":0,"currentMood":"","moodCause":"","stanceTowardPlayer":"","ownLifeFocus":"","noticedPoint":"","replyImpulse":"${scene === 'chat' ? 'answer' : 'share'}","contactPressure":"low","openingNeeded":false,"recommendedDirection":"","avoid":[],"evidenceMessageIds":[],"confidence":0}}`;
   return { system, user };
 }
 
@@ -1320,14 +1386,14 @@ function memoryQuerySceneName(scene = 'background-memory-query') {
   return value.startsWith('background-memory-query-') ? value : `background-memory-query-${value}`;
 }
 
-async function generateBackgroundMemoryQuery(charId, char, settings = {}, triggerText = '', messages = [], scene = 'background-memory-query') {
+async function generateBackgroundMemoryQuery(charId, char, settings = {}, triggerText = '', messages = [], scene = 'background-memory-query', options = {}) {
   const fallback = { query: `${charName(char)} ${triggerText}`, keywords: memorySignalTerms(triggerText).slice(0, 8), focus: 'current', _memoryAiStatus: 'skipped' };
   const queryScene = memoryQuerySceneName(scene);
   if (!hasBackgroundMemoryApi(settings)) {
     setMemoryQueryStatus(settings, '后台记忆AI筛选跳过：记忆接口未完整配置，已改用本地关键词检索。');
     return fallback;
   }
-  const payload = buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings);
+  const payload = buildBackgroundMemoryQueryPayload(char, triggerText, messages, settings, options);
   try {
     const json = await callBackgroundMemoryJSON(settings, payload.system, payload.user, { scene: queryScene, charId });
     return { ...fallback, ...json, _memoryAiStatus: 'ok' };
@@ -1338,10 +1404,7 @@ async function generateBackgroundMemoryQuery(charId, char, settings = {}, trigge
   }
 }
 
-async function buildMemoryPack(charId, char, settings = {}, queryText = '', scene = 'background-memory-query') {
-  const state = await getMeta('app_state', null).catch(() => null);
-  const recent = Array.isArray(state?.allChats?.[charId]?.messages) ? state.allChats[charId].messages.slice(-NORMAL_RAW_CONTEXT_LIMIT) : [];
-  const query = await generateBackgroundMemoryQuery(charId, char, settings, queryText, recent, scene);
+async function recallBackgroundMemoryPack(charId, char, settings, query, queryText) {
   const recallText = [query.query, queryText, ...(query.keywords || [])].filter(Boolean).join(' ');
   return Promise.all([
     searchMemoryVectors(charId, recallText),
@@ -1366,13 +1429,57 @@ async function buildMemoryPack(charId, char, settings = {}, queryText = '', scen
   });
 }
 
-function buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext, triggerMode = 'planned') {
+async function buildBackgroundMemoryContext(charId, char, settings = {}, queryText = '', scene = 'background-memory-query', options = {}) {
+  const state = await getMeta('app_state', null).catch(() => null);
+  const recent = Array.isArray(state?.allChats?.[charId]?.messages) ? state.allChats[charId].messages.slice(-NORMAL_RAW_CONTEXT_LIMIT) : [];
+  const normalizedScene = scene.includes('proactive') ? 'proactive-chat' : scene === 'payment' ? 'payment' : 'chat';
+  const now = options.now instanceof Date ? options.now : new Date();
+  const directorContext = options.directorContext || backgroundDirectorContext(char, recent, normalizedScene, now);
+  const query = await generateBackgroundMemoryQuery(charId, char, settings, queryText, recent, scene, {
+    ...options,
+    now,
+    scene: normalizedScene,
+    directorContext
+  });
+  const normalized = self.ALLiveChatDirector.normalizeDirectorCard(query.director, directorContext);
+  const memoryPack = await recallBackgroundMemoryPack(charId, char, settings, query, queryText);
+  return {
+    memoryPack,
+    directorCard: normalized.card,
+    directorText: self.ALLiveChatDirector.formatDirectorCard(normalized.card, {
+      playerName: playerName(settings),
+      characterName: charName(char)
+    }),
+    directorSource: normalized.source === 'invalid' ? 'fallback' : normalized.source,
+    directorIssues: normalized.issues || [],
+    directorContext
+  };
+}
+
+async function buildMemoryPack(charId, char, settings = {}, queryText = '', scene = 'background-memory-query') {
+  if (String(scene || '').includes('moment')) {
+    const state = await getMeta('app_state', null).catch(() => null);
+    const recent = Array.isArray(state?.allChats?.[charId]?.messages)
+      ? state.allChats[charId].messages.slice(-NORMAL_RAW_CONTEXT_LIMIT)
+      : [];
+    const query = await generateBackgroundMemoryQuery(charId, char, settings, queryText, recent, scene, {
+      includeDirector: false,
+      scene: 'moment-post'
+    });
+    return recallBackgroundMemoryPack(charId, char, settings, query, queryText);
+  }
+  return (await buildBackgroundMemoryContext(charId, char, settings, queryText, scene)).memoryPack;
+}
+
+function buildBackgroundProactiveChatSystem(settings, char, chat, memoryContext, proactiveNow, proactiveTimeContext, triggerMode = 'planned') {
   const composer = createPromptComposer('proactive-chat');
+  const memoryPack = memoryContext?.memoryPack || '';
   const normalizedTriggerMode = normalizeProactiveTriggerMode(triggerMode);
   composer.add('char-prompt', stripStagePersonaBlock(chat.charPrompt || `当前你要扮演的角色：${charName(char)}`), { priority: 0 });
   composer.add('stage-persona', backgroundStagePersonaBlock(char, settings), { priority: 5 });
   composer.add('time-context', '当前设备时间（角色可以自然参考，但不要说自己看到了系统时间）：\n' + getTimeContext(proactiveNow), { priority: 10 });
   composer.add('memory-pack', memoryPack, { priority: 20 });
+  composer.add('live-director-card', memoryContext?.directorText || '', { priority: 25, scenes: ['proactive-chat'] });
   const pendingPayment = latestPendingPayment(chat);
   if (pendingPayment) {
     const label = (pendingPayment.payType || pendingPayment.type) === 'redpacket' ? '红包' : '转账';
@@ -1711,6 +1818,64 @@ async function recoverProactivePushFailure(payload = {}, reason = null) {
   }
 }
 
+function backgroundLiveReplyHiddenDirectives(rawReply) {
+  const tags = ['al_schedule', 'al_plan', 'al_payment', 'al_send_payment', 'al_relationship_stage', 'al_moment_action'];
+  const found = [];
+  tags.forEach(tag => {
+    const match = String(rawReply || '').match(new RegExp(`<${tag}>\\s*[\\s\\S]*?\\s*<\\/${tag}>`, 'i'));
+    if (match) found.push(match[0].trim());
+  });
+  return found;
+}
+
+function reattachBackgroundLiveReplyDirectives(visibleReply, directives) {
+  const clean = self.ALLiveChatDirector.visibleReplyText(visibleReply);
+  return [clean, ...(Array.isArray(directives) ? directives : [])].filter(Boolean).join('\n');
+}
+
+async function ensureBackgroundReplyQuality(rawReply, settings, prompt, memoryContext, options = {}) {
+  const context = {
+    ...(memoryContext?.directorContext || {}),
+    scene: options.scene || 'proactive-chat',
+    nowMs: Number(options.nowMs) || Date.now(),
+    directorCard: memoryContext?.directorCard || null
+  };
+  const report = self.ALLiveChatDirector.validateLiveChatReply(rawReply, context);
+  if (!self.ALLiveChatDirector.shouldRewriteReply(report)) {
+    return { reply: rawReply, report, rewriteAttempted: false, rewriteOutcome: 'not-needed' };
+  }
+  const directives = backgroundLiveReplyHiddenDirectives(rawReply);
+  const instruction = self.ALLiveChatDirector.buildRewriteInstruction(
+    rawReply,
+    report,
+    memoryContext?.directorText || '',
+    context
+  );
+  try {
+    const rewritten = await callModel(settings, prompt.system, [{ role: 'user', content: instruction }], {
+      stream: false,
+      kind: 'chat-rewrite',
+      scene: 'background-proactive-chat-rewrite',
+      charId: options.charId || '',
+      qualityCodes: report.codes,
+      rewriteAttempted: true,
+      promptBlocks: prompt.promptBlocks
+    });
+    const rewrittenReport = self.ALLiveChatDirector.validateLiveChatReply(rewritten, context);
+    if (self.ALLiveChatDirector.shouldRewriteReply(rewrittenReport)) {
+      return { reply: rawReply, report: rewrittenReport, rewriteAttempted: true, rewriteOutcome: 'rejected' };
+    }
+    return {
+      reply: reattachBackgroundLiveReplyDirectives(rewritten, directives),
+      report: rewrittenReport,
+      rewriteAttempted: true,
+      rewriteOutcome: 'accepted'
+    };
+  } catch (error) {
+    return { reply: rawReply, report, rewriteAttempted: true, rewriteOutcome: 'failed' };
+  }
+}
+
 function isAndroidNativeDelivery(payload = {}) {
   return payload.nativeExecution === true
     || payload.platform === 'android'
@@ -1844,15 +2009,23 @@ async function handleProactivePush(payload) {
   const proactiveNow = new Date();
   const proactiveTimeContext = buildProactiveTimeContext(chat, proactiveNow, triggerMode);
   const memoryQuery = buildProactiveMemoryQuery(chat, settings, proactiveNow, triggerMode);
-  const memoryPack = await buildMemoryPack(charId, char, settings, memoryQuery, 'proactive-chat');
+  const memoryContext = await buildBackgroundMemoryContext(
+    charId,
+    char,
+    settings,
+    memoryQuery,
+    'proactive-chat',
+    { now: proactiveNow }
+  );
+  const memoryPack = memoryContext.memoryPack;
   if (!(await automaticTasksStillEnabled())) return false;
   setStateCloudTimerTrace(state, 'chat', traceId, `记忆完成 ${String(memoryPack || '').length} 字，正在请求聊天模型`);
-  const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryPack, proactiveNow, proactiveTimeContext, triggerMode);
+  const prompt = buildBackgroundProactiveChatSystem(settings, char, chat, memoryContext, proactiveNow, proactiveTimeContext, triggerMode);
 
   const messages = proactiveRecentMessages(chat, 30, proactiveNow, settings);
   const historyOmitted = Math.max(0, recentMessageCandidateCount(chat, 30) - messages.length);
   messages.push({ role: 'user', content: buildProactiveTriggerMessage(settings, char, chat, proactiveNow, triggerMode) });
-  const reply = (await callModel(settings, prompt.system, messages, {
+  const primaryReply = (await callModel(settings, prompt.system, messages, {
     stream: true,
     kind: 'chat',
     scene: 'background-proactive-chat',
@@ -1862,6 +2035,12 @@ async function handleProactivePush(payload) {
     memoryStatus: memoryStatusWithBudget(memoryPack, memoryQuerySnapshot(settings)),
     promptBlocks: prompt.promptBlocks
   })).trim();
+  const quality = await ensureBackgroundReplyQuality(primaryReply, settings, prompt, memoryContext, {
+    charId,
+    scene: 'proactive-chat',
+    nowMs: proactiveNow.getTime()
+  });
+  const reply = String(quality.reply || '').trim();
   if (!(await automaticTasksStillEnabled())) return false;
   setStateCloudTimerTrace(state, 'chat', traceId, `模型返回 ${reply.length} 字`);
   const paymentDirective = extractPaymentStatusDirective(reply);
