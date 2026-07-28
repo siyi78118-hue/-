@@ -180,6 +180,27 @@ test('brain and supervisor presets define an executable closed rewrite handshake
   assert.match(supervisor, /直接私聊.*必须.*可发送|可发送.*直接私聊/s);
 }));
 
+test('brain treats the interaction contract as behavior constraints instead of dialogue material', () => withRegistry(registry => {
+  const brain = registry.compileFor('brain', { stage: 'familiar' });
+
+  assert.match(brain, /interactionContract|互动契约/);
+  assert.match(brain, /不能忽略|必须遵守|权威/s);
+  assert.match(brain, /preserveAmbiguity|保留歧义/);
+  assert.match(brain, /不得.*逐项.*解释|不得.*复述.*契约/s);
+  assert.doesNotMatch(brain, /conversationFrame.*最终仍以原始聊天为准/);
+}));
+
+test('supervisor checks contract action and report-like narration before style', () => withRegistry(registry => {
+  const supervisor = registry.compileFor('supervisor', { stage: 'familiar' });
+
+  assert.match(supervisor, /互动动作.*语气|先.*互动.*再.*语气/s);
+  assert.match(supervisor, /INTERACTION_CONTRACT_MISS/);
+  assert.match(supervisor, /REPEATED_REJECTED_INTERPRETATION/);
+  assert.match(supervisor, /DIALOGUE_META_NARRATION/);
+  assert.match(supervisor, /身处.*对话.*复盘|复盘.*对话.*身处/s);
+  assert.match(supervisor, /mustPreserve.*mustChange.*allowedStrategies.*acceptanceCriteria/s);
+}));
+
 test('publishes an annotation as a child version and can roll back immutably', () => withRegistry((registry, store) => {
   const proposal = registry.proposeAnnotation({
     annotationId: 'ann_1',

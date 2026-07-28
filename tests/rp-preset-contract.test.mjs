@@ -98,10 +98,10 @@ test('第四轮让主动消息先判断沉默前因并把 skip 作为后备', ()
   assert.match(prompt, /连续多次无理由不回/);
 });
 
-test('第四轮按整个发送回合判断完整性并登记 1.9.0', () => {
+test('第四轮按整个发送回合判断完整性并登记当前不可变预设版本', () => {
   assert.match(prompt, /完整性按整个发送回合判断/);
   assert.match(prompt, /同一回合内的多个气泡可以互相承接/);
-  assert.equal(presetManifest.currentVersion, '1.9.0');
+  assert.equal(presetManifest.currentVersion, '1.9.1');
 });
 
 test('导演卡不替换完整 RP 预设和当前 200 条证据契约', () => {

@@ -601,8 +601,9 @@ export class YuqiOrchestrator {
             continue;
           }
           if (draft.action === 'skip') {
-            if (current.route === 'fast' && (hasLifeDecision(draft) || draft.rolePlanOperations.length)) {
+            if (current.route !== 'deep' && (hasLifeDecision(draft) || draft.rolePlanOperations.length)) {
               this.store.setTurnRoute(turnId, 'fast_to_deep', [
+                ...(Array.isArray(current.routeReasons) ? current.routeReasons : []),
                 ...(hasLifeDecision(draft) ? ['life_decision'] : []),
                 ...(draft.rolePlanOperations.length ? ['role_plan_decision'] : [])
               ]);
@@ -632,8 +633,9 @@ export class YuqiOrchestrator {
               detail: { action: 'reply_repaired_for_delivery', issues: hard.issues.map(issue => issue.code) }
             });
           }
-          if (current.route === 'fast' && (hasLifeDecision(repairedDraft) || repairedDraft.rolePlanOperations.length)) {
+          if (current.route !== 'deep' && (hasLifeDecision(repairedDraft) || repairedDraft.rolePlanOperations.length)) {
             this.store.setTurnRoute(turnId, 'fast_to_deep', [
+              ...(Array.isArray(current.routeReasons) ? current.routeReasons : []),
               ...(hasLifeDecision(repairedDraft) ? ['life_decision'] : []),
               ...(repairedDraft.rolePlanOperations.length ? ['role_plan_decision'] : [])
             ]);
@@ -744,6 +746,18 @@ export class YuqiOrchestrator {
       conversationFrame,
       recentMessages
     });
+    current = this.store.getTurn(envelope.turnId);
+    if (
+      current.route === 'fast'
+      && (
+        interactionContract.preserveAmbiguity
+        || interactionContract.recentCorrection.active
+        || interactionContract.explicitBoundaries.length > 0
+      )
+    ) {
+      this.store.setTurnRoute(envelope.turnId, 'fast_to_deep', ['interaction_contract']);
+      current = this.store.getTurn(envelope.turnId);
+    }
     const memoryPacket = {
       query: String(memoryResult.query || envelope.message?.content || envelope.trigger?.triggerType || ''),
       keywords: Array.isArray(memoryResult.keywords) ? memoryResult.keywords.map(String) : [],

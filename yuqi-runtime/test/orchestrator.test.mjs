@@ -339,7 +339,8 @@ test('ephemeral analysis becomes a compact brain contract and never becomes a du
       escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
       relationshipStageReview: null, conversationFrame: frame
     })],
-    brain: ['{"action":"send","reply":"Then I will keep going.","paymentAction":null,"usedFactIds":[],"momentAction":null}']
+    brain: ['{"action":"send","reply":"Then I will keep going.","paymentAction":null,"usedFactIds":[],"momentAction":null}'],
+    supervisor: ['{"decision":"approve","issues":[]}']
   }, async ({ store, codex, orchestrator }) => {
     const result = await orchestrator.process(envelope(11, 'go on'));
     const brain = codex.calls.find(call => call.role === 'brain').input;
@@ -694,6 +695,40 @@ test('a nuanced fast turn upgrades to supervisor without repeating memory', asyn
   });
 });
 
+test('an interaction contract requiring ambiguity handling upgrades a fast turn to supervisor', async () => {
+  const frame = conversationFrame({
+    intentHypotheses: [
+      {
+        intent: '接受表面提议',
+        confidence: 0.58,
+        evidenceMessageIds: ['msg_phone_214']
+      },
+      {
+        intent: '带着未解决情绪暂时结束争论',
+        confidence: 0.46,
+        evidenceMessageIds: ['msg_phone_214']
+      }
+    ],
+    needsNuanceReview: false,
+    ambiguities: ['表面同意与带情绪收束同时可能']
+  });
+  await withFixture({
+    memory: [JSON.stringify({
+      query: '继续互动', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: ['{"action":"send","reply":"行。","usedFactIds":[]}'],
+    supervisor: ['{"decision":"approve","issues":[]}']
+  }, async ({ store, codex, orchestrator }) => {
+    await orchestrator.process(envelope(214, '行'));
+
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    assert.equal(store.getTurn('turn_phone_214').route, 'fast_to_deep');
+    assert.ok(store.getTurn('turn_phone_214').routeReasons.includes('interaction_contract'));
+  });
+});
+
 test('fast route runs Terra memory and Sol brain without supervisor', async () => {
   await withFixture(normalOutputs(), async ({ store, codex, orchestrator }) => {
     const result = await orchestrator.process(envelope());
@@ -938,6 +973,86 @@ test('supervisor gives the next brain an executable stable rewrite contract and 
         .some(fact => fact.predicate === 'currently_reading'),
       true
     );
+  });
+});
+
+test('report-like dialogue receives an executable contract-aware rewrite instead of approval', async () => {
+  const frame = conversationFrame({
+    intentHypotheses: [{
+      intent: '要求虞栖正视仍未解决的互动问题',
+      confidence: 0.94,
+      evidenceMessageIds: ['msg_phone_404']
+    }],
+    priorTopic: {
+      status: 'open',
+      summary: '双方仍在处理争执',
+      waitingOn: 'yuqi',
+      evidenceMessageIds: ['msg_phone_404'],
+      reason: '用户要求虞栖回应当前矛盾'
+    },
+    needsNuanceReview: true
+  });
+  await withFixture({
+    memory: [JSON.stringify({
+      query: '回应争执', keywords: [], candidates: [], requiresDeepMemory: false,
+      escalationReasons: [], speakerAmbiguity: false, commitmentRisk: false,
+      relationshipStageReview: null, conversationFrame: frame
+    })],
+    brain: [
+      '{"action":"send","reply":"我想继续说话，又不想面对争执，所以显得像在装没事。","usedFactIds":[]}',
+      JSON.stringify({
+        action: 'send',
+        reply: '……我知道。刚才是我在躲。',
+        usedFactIds: [],
+        rewriteResolution: {
+          resolvedIssueIds: ['DIALOGUE_META_NARRATION:1'],
+          resolutionNotes: [{
+            issueId: 'DIALOGUE_META_NARRATION:1',
+            strategy: '只留下当下承认，不再总结互动机制',
+            visibleResult: '正文直接承认回避'
+          }]
+        }
+      })
+    ],
+    supervisor: [
+      JSON.stringify({
+        decision: 'rewrite',
+        issues: [{
+          issueId: 'DIALOGUE_META_NARRATION:1',
+          code: 'DIALOGUE_META_NARRATION',
+          severity: 'soft',
+          message: '草稿在总结自己的互动行为',
+          mustPreserve: ['仍然在意并想继续联系'],
+          mustChange: ['删除对回复策略和外在观感的完整因果总结'],
+          allowedStrategies: ['只留下当下承认、停顿或回避'],
+          acceptanceCriteria: ['正文不再概括自己为什么这样说以及看起来像什么']
+        }]
+      }),
+      JSON.stringify({
+        decision: 'approve',
+        reviewedIssueIds: ['DIALOGUE_META_NARRATION:1'],
+        resolvedIssueIds: ['DIALOGUE_META_NARRATION:1'],
+        issues: []
+      })
+    ]
+  }, async ({ codex, orchestrator }) => {
+    const result = await orchestrator.process(envelope(404, '我们还在吵架吧，你到底在干嘛？'));
+    const brainCalls = codex.calls.filter(call => call.role === 'brain');
+    const supervisorCalls = codex.calls.filter(call => call.role === 'supervisor');
+
+    assert.equal(
+      brainCalls[1].input.rewriteContract.issues[0].code,
+      'DIALOGUE_META_NARRATION'
+    );
+    assert.deepEqual(
+      brainCalls[1].input.interactionContract,
+      brainCalls[0].input.interactionContract
+    );
+    assert.deepEqual(
+      supervisorCalls[1].input.interactionContract,
+      supervisorCalls[0].input.interactionContract
+    );
+    assert.equal(result.reply.content, '……我知道。刚才是我在躲。');
   });
 });
 
