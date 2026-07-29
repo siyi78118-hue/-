@@ -386,13 +386,14 @@ test('a capacity error switches the same role to its alternate model once', asyn
     memory: [capacityError, '{"query":"你好","keywords":["你好"],"candidates":[]}']
   }, async ({ codex, orchestrator }) => {
     orchestrator.accept(envelope(97));
-    const result = await orchestrator.runStructuredRole(
-      'memory',
-      { task: 'retrieve' },
-      'turn_phone_97_memory',
-      { model: 'gpt-5.6-sol', effort: 'medium' },
-      'memory_deep'
-    );
+    const result = await orchestrator.runStructuredRole({
+      turnId: 'turn_phone_97',
+      role: 'memory',
+      request: { task: 'retrieve' },
+      clientUserMessageId: 'turn_phone_97_memory',
+      profile: { model: 'gpt-5.6-sol', effort: 'medium' },
+      stage: 'memory_deep'
+    });
 
     assert.equal(result.query, '你好');
     assert.deepEqual(codex.calls.map(call => call.options.model), [
@@ -412,13 +413,14 @@ test('an account usage limit never rotates through alternate models', async () =
   }, async ({ codex, orchestrator }) => {
     orchestrator.accept(envelope(98));
     await assert.rejects(
-      orchestrator.runStructuredRole(
-        'memory',
-        { task: 'retrieve' },
-        'turn_phone_98_memory',
-        { model: 'gpt-5.6-sol', effort: 'medium' },
-        'memory_deep'
-      ),
+      orchestrator.runStructuredRole({
+        turnId: 'turn_phone_98',
+        role: 'memory',
+        request: { task: 'retrieve' },
+        clientUserMessageId: 'turn_phone_98_memory',
+        profile: { model: 'gpt-5.6-sol', effort: 'medium' },
+        stage: 'memory_deep'
+      }),
       /purchase more credits/i
     );
     assert.deepEqual(codex.calls.map(call => call.options.model), ['gpt-5.6-sol']);

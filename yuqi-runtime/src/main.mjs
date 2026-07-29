@@ -3,12 +3,15 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { CodexAppServerClient } from './codex-client.mjs';
+import { CognitivePipeline } from './cognitive-pipeline.mjs';
 import { CloudRelayPump } from './cloud-relay-pump.mjs';
 import { createYuqiServer } from './local-server.mjs';
 import { YuqiOrchestrator } from './orchestrator.mjs';
 import { PresetRegistry } from './preset-registry.mjs';
 import { YuqiReconciler } from './reconcile.mjs';
 import { ResultOutbox } from './result-outbox.mjs';
+import { selectTurnRoute } from './route-policy.mjs';
+import { ShadowDispatcher } from './shadow-dispatcher.mjs';
 import { YuqiStore } from './store.mjs';
 import { TurnDispatcher } from './turn-dispatcher.mjs';
 import { createSystemCloudFetch } from '../../scripts/cloud-http.mjs';
@@ -39,6 +42,17 @@ const orchestrator = new YuqiOrchestrator({
 });
 const reconciler = new YuqiReconciler({ store, codex });
 const dispatcher = new TurnDispatcher({ store, orchestrator });
+const cognitivePipeline = new CognitivePipeline({
+  store,
+  codexClient: codex,
+  presetRegistry: presets,
+  routePolicy: selectTurnRoute
+});
+const shadowDispatcher = new ShadowDispatcher({
+  store,
+  cognitivePipeline,
+  foregroundActivity: { isBusy: () => dispatcher.inflight.size > 0 }
+});
 const explicitProxy = config.cloudRelay?.proxy?.enabled === true;
 const cloudFetch = config.cloudRelay?.enabled
   ? (explicitProxy ? globalThis.fetch : createSystemCloudFetch())
@@ -83,6 +97,7 @@ const server = createYuqiServer({
 
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });
 dispatcher.recover();
+shadowDispatcher.start();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
 function checkLifePlanning() {
   orchestrator.ensureLifePlan('yuqi', Date.now()).catch(error => {
@@ -105,6 +120,7 @@ async function stop() {
   if (stopping) return;
   stopping = true;
   clearInterval(lifeBoundaryTimer);
+  try { shadowDispatcher.stop(); } catch {}
   try { cloudPump?.stop(); } catch {}
   try { await server.close(); } catch {}
   try { await codex.stop(); } catch {}

@@ -753,22 +753,27 @@ export class YuqiOrchestrator {
     };
     let current = this.store.getTurn(envelope.turnId);
     const initialRoute = current.route === 'fast' ? 'fast' : 'deep';
-    let memoryResult = await this.runStructuredRole(
-      'memory', memoryRequest, `${envelope.turnId}_memory`,
-      roleExecutionProfile(initialRoute, 'memory', this.roleProfiles),
-      initialRoute === 'fast' ? 'memory_fast' : 'memory_deep'
-    );
+    let memoryResult = await this.runStructuredRole({
+      turnId: envelope.turnId,
+      role: 'memory',
+      request: memoryRequest,
+      clientUserMessageId: `${envelope.turnId}_memory`,
+      profile: roleExecutionProfile(initialRoute, 'memory', this.roleProfiles),
+      stage: initialRoute === 'fast' ? 'memory_fast' : 'memory_deep'
+    });
     if (initialRoute === 'fast' && memoryResult.requiresDeepMemory === true) {
       const reasons = Array.isArray(memoryResult.escalationReasons)
         ? memoryResult.escalationReasons.map(String)
         : ['memory_role_requested'];
       this.store.setTurnRoute(envelope.turnId, 'fast_to_deep', reasons.length ? reasons : ['memory_role_requested']);
-      memoryResult = await this.runStructuredRole(
-        'memory', { ...memoryRequest, task: 'deep_retrieve_and_extract_evidence', fastMemoryReview: memoryResult },
-        `${envelope.turnId}_memory_deep`,
-        roleExecutionProfile('deep', 'memory', this.roleProfiles),
-        'memory_deep'
-      );
+      memoryResult = await this.runStructuredRole({
+        turnId: envelope.turnId,
+        role: 'memory',
+        request: { ...memoryRequest, task: 'deep_retrieve_and_extract_evidence', fastMemoryReview: memoryResult },
+        clientUserMessageId: `${envelope.turnId}_memory_deep`,
+        profile: roleExecutionProfile('deep', 'memory', this.roleProfiles),
+        stage: 'memory_deep'
+      });
       current = this.store.getTurn(envelope.turnId);
     }
     const conversationFrame = normalizeConversationFrame(memoryResult.conversationFrame);
@@ -943,11 +948,14 @@ export class YuqiOrchestrator {
       previousReview: previous,
       rewriteResolution: draft.rewriteResolution
     };
-    const reviewed = await this.runStructuredRole(
-      'supervisor', supervisorRequest, `${envelope.turnId}_supervisor_${attempt}`,
-      roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
-      `supervisor_${attempt}`
-    );
+    const reviewed = await this.runStructuredRole({
+      turnId: envelope.turnId,
+      role: 'supervisor',
+      request: supervisorRequest,
+      clientUserMessageId: `${envelope.turnId}_supervisor_${attempt}`,
+      profile: roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
+      stage: `supervisor_${attempt}`
+    });
     let supervisorResult = normalizeSupervisorResult(reviewed, {
       attempt,
       previous,
@@ -1254,18 +1262,28 @@ export class YuqiOrchestrator {
   }
 
   async runBrain(turnId, request, attempt = 1, route = 'deep') {
-    const result = await this.withBrainRoleLock(() => this.runStructuredRole(
-      'brain', request, `${turnId}_brain_${attempt}`,
-      roleExecutionProfile(route, 'brain', this.roleProfiles),
-      `brain_${attempt}`
-    ));
+    const result = await this.withBrainRoleLock(() => this.runStructuredRole({
+      turnId,
+      role: 'brain',
+      request,
+      clientUserMessageId: `${turnId}_brain_${attempt}`,
+      profile: roleExecutionProfile(route, 'brain', this.roleProfiles),
+      stage: `brain_${attempt}`
+    }));
     if (typeof result.reply !== 'string') throw new Error('brain reply is missing');
     return normalizeBrainDraft(result);
   }
 
-  async runStructuredRole(role, request, clientUserMessageId, profile, stage = role) {
+  async runStructuredRole({
+    turnId,
+    role,
+    request,
+    clientUserMessageId,
+    profile,
+    stage = role
+  }) {
     if (!profile?.model || !profile?.effort) throw new Error(`missing execution profile for ${role}`);
-    const turnId = clientUserMessageId.replace(/_(memory(?:_deep)?|brain_\d+|supervisor_\d+)$/, '');
+    if (!String(turnId || '')) throw new Error(`turnId is required for ${role}`);
     this.store.beginStage(turnId, stage, profile.model, profile.effort, this.clock());
     let invalidOutput = '';
     let activeProfile = profile;
