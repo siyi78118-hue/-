@@ -208,3 +208,96 @@ test('a direct cognition result can never materialize a skipped reply', async ()
     routeDecision: { route: 'fast' }
   }), /DIRECT_REPLY/);
 });
+
+test('moment cognition owns the exact action target while expression only supplies text', async () => {
+  const decided = cognition(false);
+  decided.actionIntent.channel = 'moment';
+  decided.actionIntent.momentIntent = {
+    momentId: 'moment_1',
+    like: true,
+    comment: '我也觉得',
+    replyToCommentId: 'comment_1'
+  };
+  const automaticEnvelope = {
+    kind: 'MOMENT_REPLY',
+    characterId: 'yuqi',
+    turnId: 'turn_1',
+    createdAt: 1,
+    trigger: {
+      context: { momentId: 'moment_1', commentId: 'comment_1' }
+    }
+  };
+  const { pipeline } = fixture([decided, expression('我也觉得')]);
+  const result = await pipeline.runForeground({
+    turn: { turnId: 'turn_1' },
+    envelope: automaticEnvelope,
+    scene: {},
+    currentBatch,
+    routeDecision: {
+      route: 'fast',
+      allowedActionTargets: {
+        momentIds: ['moment_1'],
+        commentIds: ['comment_1']
+      }
+    }
+  });
+  assert.deepEqual(result.draft.momentAction, decided.actionIntent.momentIntent);
+  assert.equal(result.draft.reply, '我也觉得');
+});
+
+test('proactive cognition may choose structural silence without producing an empty visible message', async () => {
+  const decided = cognition(false);
+  decided.decision.shouldRespond = false;
+  decided.decision.silenceReason = '仍在等待用户回应';
+  decided.actionIntent.channel = 'none';
+  const { pipeline } = fixture([decided, {
+    action: 'skip',
+    reply: '',
+    usedFactIds: [],
+    rewriteResolution: null
+  }]);
+  const result = await pipeline.runForeground({
+    turn: { turnId: 'turn_1' },
+    envelope: {
+      kind: 'PROACTIVE_CHAT',
+      characterId: 'yuqi',
+      turnId: 'turn_1',
+      createdAt: 1,
+      trigger: { context: { wakeSource: 'schedule' } }
+    },
+    scene: {},
+    currentBatch,
+    routeDecision: { route: 'fast' }
+  });
+  assert.equal(result.draft.action, 'skip');
+  assert.equal(result.draft.reply, '');
+});
+
+test('role-plan cognition can use the existing plan domain without expression rewriting operations', async () => {
+  const decided = cognition(false);
+  decided.actionIntent.channel = 'chat';
+  decided.actionIntent.rolePlanOperationsJson = JSON.stringify([{
+    op: 'complete',
+    planId: 'plan_1',
+    evidenceMessageIds: ['msg_1']
+  }]);
+  const { pipeline } = fixture([decided, expression('这件事处理好了。')]);
+  const result = await pipeline.runForeground({
+    turn: { turnId: 'turn_1' },
+    envelope: {
+      kind: 'ROLE_PLAN_CHAT',
+      characterId: 'yuqi',
+      turnId: 'turn_1',
+      createdAt: 1,
+      trigger: { context: { planId: 'plan_1', occurrenceId: 'occurrence_1' } }
+    },
+    scene: {},
+    currentBatch,
+    routeDecision: {
+      route: 'fast',
+      allowedActionTargets: { rolePlanIds: ['plan_1'] }
+    }
+  });
+  assert.equal(result.draft.rolePlanOperationsJson, decided.actionIntent.rolePlanOperationsJson);
+  assert.equal(result.draft.reply, '这件事处理好了。');
+});

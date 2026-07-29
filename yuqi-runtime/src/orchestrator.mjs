@@ -561,7 +561,13 @@ export class YuqiOrchestrator {
       current = this.store.getTurn(turnId);
       if (
         current.pipelineMode === 'active'
-        && envelope.kind === 'DIRECT_REPLY'
+        && [
+          'DIRECT_REPLY',
+          'ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT',
+          'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE',
+          'PROACTIVE_CHAT', 'PROACTIVE_MOMENT',
+          'MOMENT_INTERACTION', 'MOMENT_REPLY'
+        ].includes(envelope.kind)
         && this.cognitivePipeline
         && ['queued', 'memory_running', 'memory_done', 'brain_running'].includes(current.state)
       ) {
@@ -589,7 +595,18 @@ export class YuqiOrchestrator {
             cognitiveState: this.store.getCognitiveState?.(envelope.characterId) || {},
             allowedActionTargets: {
               lifeEpisodeIds: this.store.listLifeEpisodes?.(envelope.characterId)
-                ?.map(item => item.episodeId) || []
+                ?.map(item => item.episodeId) || [],
+              momentIds: [
+                envelope.trigger?.context?.momentId,
+                envelope.trigger?.context?.targetMomentId
+              ].filter(Boolean),
+              commentIds: [
+                envelope.trigger?.context?.commentId,
+                envelope.trigger?.context?.targetCommentId
+              ].filter(Boolean),
+              rolePlanIds: [
+                envelope.trigger?.context?.planId
+              ].filter(Boolean)
             }
           }
         });
@@ -605,7 +622,9 @@ export class YuqiOrchestrator {
           current = this.store.getTurn(turnId);
         }
         if (current.state === 'brain_done') {
-          const hard = hardValidateReply(cognition.draft.reply);
+          const hard = cognition.draft.action === 'send'
+            ? hardValidateReply(cognition.draft.reply)
+            : { ok: true, issues: [] };
           if (!hard.ok) throw new Error(`active cognition reply is not deliverable: ${hard.issues.map(item => item.code).join(',')}`);
           this.store.advanceTurn(turnId, 'brain_done', 'approved', {
             brainDraftJson: JSON.stringify(cognition.draft)
