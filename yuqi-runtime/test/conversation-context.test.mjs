@@ -141,3 +141,55 @@ test('generation window keeps a historical multi-bubble user batch as one comple
   assert.equal(window.some(item => item.messageId === 'msg_user_batch_2'), true);
   assert.equal(window.length, 22);
 });
+
+test('the twentieth complete group boundary never cuts a three-bubble batch', () => {
+  const messages = [
+    {
+      messageId: 'msg_boundary_1',
+      batchId: 'batch_boundary',
+      speakerType: 'user',
+      sentAt: 1,
+      content: '边界第一条'
+    },
+    {
+      messageId: 'msg_boundary_2',
+      batchId: 'batch_boundary',
+      speakerType: 'user',
+      sentAt: 2,
+      content: '边界第二条'
+    },
+    {
+      messageId: 'msg_boundary_3',
+      batchId: 'batch_boundary',
+      speakerType: 'user',
+      sentAt: 3,
+      content: '边界第三条'
+    },
+    ...Array.from({ length: 19 }, (_, index) => ({
+      messageId: `msg_after_boundary_${index}`,
+      turnId: `turn_after_boundary_${index}`,
+      speakerType: 'character',
+      sentAt: 4 + index,
+      content: `后续完整组 ${index}`
+    }))
+  ];
+
+  const included = buildGenerationWindow(messages, { limit: 20 });
+  assert.deepEqual(
+    included.slice(0, 3).map((item) => item.messageId),
+    ['msg_boundary_1', 'msg_boundary_2', 'msg_boundary_3']
+  );
+
+  const excluded = buildGenerationWindow([
+    {
+      messageId: 'msg_older',
+      turnId: 'turn_older',
+      speakerType: 'character',
+      sentAt: 0,
+      content: '更早一组'
+    },
+    ...messages
+  ], { limit: 20 });
+  assert.equal(excluded.some((item) => item.batchId === 'batch_boundary'), true);
+  assert.equal(excluded.some((item) => item.messageId === 'msg_older'), false);
+});

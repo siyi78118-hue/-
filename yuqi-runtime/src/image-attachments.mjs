@@ -1,4 +1,5 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
@@ -53,6 +54,55 @@ export async function materializeImageAttachments(attachments, options = {}) {
     return {
       directory,
       paths,
+      cleanup: () => rm(directory, { recursive: true, force: true })
+    };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+export async function materializeRoleImages({
+  messages,
+  role,
+  dedupeByChecksum = true,
+  rootDir = join(tmpdir(), 'yuqi-al-role-images')
+} = {}) {
+  const directory = join(
+    resolve(rootDir),
+    `${safeId(role, 'role')}_${Date.now()}_${randomUUID().slice(0, 8)}`
+  );
+  const paths = [];
+  const references = [];
+  const checksumPaths = new Map();
+  await mkdir(directory, { recursive: true });
+  try {
+    for (const message of Array.isArray(messages) ? messages : []) {
+      for (const attachment of Array.isArray(message?.attachments) ? message.attachments : []) {
+        if (attachment?.kind !== 'image') continue;
+        const decoded = decodeImageDataUrl(attachment);
+        const checksum = createHash('sha256').update(decoded.bytes).digest('hex');
+        let path = dedupeByChecksum ? checksumPaths.get(checksum) : '';
+        if (!path) {
+          const filename = `${String(paths.length + 1).padStart(2, '0')}_${checksum.slice(0, 16)}.${decoded.extension}`;
+          path = join(directory, filename);
+          await writeFile(path, decoded.bytes, { flag: 'wx' });
+          checksumPaths.set(checksum, path);
+          paths.push(path);
+        }
+        references.push({
+          messageId: String(message?.messageId || attachment?.messageId || ''),
+          attachmentId: String(attachment?.attachmentId || ''),
+          mime: String(attachment?.mime || ''),
+          checksum,
+          path
+        });
+      }
+    }
+    return {
+      directory,
+      paths,
+      references,
       cleanup: () => rm(directory, { recursive: true, force: true })
     };
   } catch (error) {
