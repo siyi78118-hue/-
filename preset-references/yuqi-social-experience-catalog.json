@@ -272,8 +272,8 @@
       "forbiddenInference": ["同一句字面文本不能恒定映射为同一种动机"],
       "sourceRefs": [
         {
-          "path": "preset-references/真人聊天训练批注-第四轮-交接.md",
-          "section": "## 三、对用户答案的证据态度"
+          "path": "preset-references/cognition-evidence-principles.md",
+          "section": "## Subjective reports and stable evidence"
         }
       ]
     }
