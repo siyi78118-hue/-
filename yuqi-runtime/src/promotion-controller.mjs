@@ -319,4 +319,123 @@ export class PromotionController {
       now
     });
   }
+
+  createLifePlanningAttempt({ roleId, planningContext, now = this.clock() }) {
+    return this.store.transaction(() => {
+      const open = this.store.getOpenLifePlanningAttempt(roleId);
+      if (open) return open;
+      const rollout = this.getStatus('LIFE_PLANNING');
+      if (!rollout) throw new Error('LIFE_PLANNING rollout is unavailable');
+      const startAt = Number(
+        planningContext?.planWindowStartAt
+        || Math.floor(Number(now) / 600_000) * 600_000
+      );
+      const endAt = Number(planningContext?.targetPlanEndAt || startAt + 12 * 60 * 60_000);
+      const lifeBasisChecksum = this.store.getLifeBasisChecksum(roleId, {
+        from: startAt,
+        to: endAt
+      });
+      const inputSnapshot = {
+        roleId: String(roleId),
+        planningAnchorAt: startAt,
+        planningWindow: { startAt, targetEndAt: endAt },
+        current: planningContext?.current || null,
+        recent: Array.isArray(planningContext?.recent) ? planningContext.recent : [],
+        upcoming: Array.isArray(planningContext?.upcoming) ? planningContext.upcoming : [],
+        cognitiveState: this.store.getCognitiveState(roleId)?.state || {},
+        allowedActions: ['create_life_episode']
+      };
+      const contextChecksum = contentHash({
+        cognitiveState: inputSnapshot.cognitiveState,
+        allowedActions: inputSnapshot.allowedActions
+      });
+      const requestBaseKey = contentHash({
+        roleId, startAt, endAt, lifeBasisChecksum, contextChecksum
+      });
+      const requestKey = contentHash({
+        requestBaseKey,
+        presetVersion: rollout.presetVersion,
+        pipelineMode: rollout.currentMode,
+        pipelineChecksum: rollout.pipelineChecksum,
+        evidenceEpoch: rollout.evidenceEpoch,
+        shadowEpoch: rollout.shadowEpoch,
+        canaryEpoch: rollout.canaryEpoch
+      });
+      const shadow = rollout.currentMode === 'shadow';
+      const canary = rollout.currentMode === 'active' && rollout.rolloutPhase === 'canary';
+      return this.store.createLifePlanningAttemptInternal({
+        roleId,
+        requestBaseKey,
+        requestKey,
+        planningWindowStartAt: startAt,
+        planningWindowEndAt: endAt,
+        lifeBasisChecksum,
+        contextChecksum,
+        pipelineMode: rollout.currentMode,
+        comparisonMode: shadow ? 'cognition_compare' : canary ? 'legacy_compare' : 'none',
+        authoritativePipeline: rollout.currentMode === 'active' ? 'cognition' : 'legacy',
+        comparisonDirection: shadow
+          ? 'legacy_authoritative_cognition_compare'
+          : canary ? 'cognition_authoritative_legacy_compare' : null,
+        rolloutRevision: rollout.revision,
+        rolloutEvidenceEpoch: rollout.evidenceEpoch,
+        pipelineChecksum: rollout.pipelineChecksum,
+        shadowEpoch: shadow ? rollout.shadowEpoch : null,
+        canaryEpoch: canary ? rollout.canaryEpoch : null,
+        canarySlot: canary ? rollout.canaryStartedCount + 1 : null,
+        presetVersion: rollout.presetVersion,
+        inputSnapshot,
+        dueAt: now,
+        now
+      });
+    });
+  }
+
+  commitLifePlanningAuthoritativeResult({
+    planningId, workerId, validatedResult, now = this.clock()
+  }) {
+    return this.store.transaction(() => this.store.commitLifePlanningResultInternal({
+      planningId, workerId, validatedResult, now
+    }));
+  }
+
+  failLifePlanningAttempt({
+    planningId, workerId, errorCode, failureClass, report = {}, now = this.clock()
+  }) {
+    return this.store.transaction(() => {
+      const attempt = this.store.failLifePlanningAttemptInternal({
+        planningId, workerId, errorCode, now
+      });
+      if (attempt.pipelineMode === 'active') {
+        const rollout = this.getStatus('LIFE_PLANNING');
+        if (rollout
+          && rollout.pipelineChecksum === attempt.pipelineChecksum
+          && rollout.evidenceEpoch === attempt.rolloutEvidenceEpoch) {
+          const stored = this.store.putEvaluationReportInternal({
+            reportId: `report_life_failure_${contentHash({ planningId, errorCode, now }).slice(0, 24)}`,
+            reportType: 'active_failure',
+            rolloutKey: 'LIFE_PLANNING',
+            sourceType: 'active_subject',
+            sourceRef: planningId,
+            artifactPath: report.artifactPath || '',
+            summary: { planningId, errorCode, failureClass, ...(report.summary || {}) },
+            createdAt: now
+          });
+          this.store.transitionCognitionRolloutInternal({
+            rolloutKey: 'LIFE_PLANNING',
+            expectedRevision: rollout.revision,
+            toMode: 'shadow',
+            toPhase: 'rolled_back',
+            actor: 'life_planning_dispatcher',
+            reasonCode: errorCode || 'LIFE_PLANNING_ACTIVE_FAILURE',
+            reportId: stored.reportId,
+            reportChecksum: stored.artifactChecksum,
+            metadata: { planningId, failureClass },
+            now
+          });
+        }
+      }
+      return attempt;
+    });
+  }
 }

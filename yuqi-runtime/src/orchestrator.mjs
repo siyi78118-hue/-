@@ -368,7 +368,8 @@ export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
     generationContextLimit = 20, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null,
-    lifePlanningEnabled = true, cognitivePipeline = null, promotionController = null
+    lifePlanningEnabled = true, cognitivePipeline = null, promotionController = null,
+    lifePlanningDispatcher = null
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
@@ -387,6 +388,7 @@ export class YuqiOrchestrator {
     this.turnImagePaths = new Map();
     this.cognitivePipeline = cognitivePipeline;
     this.promotionController = promotionController;
+    this.lifePlanningDispatcher = lifePlanningDispatcher;
   }
 
   accept(envelope) {
@@ -460,6 +462,21 @@ export class YuqiOrchestrator {
     const context = this.lifeSimulation.advanceTo(characterId, now);
     if (!this.lifePlanningEnabled) return { planned: false, reason: 'disabled', context };
     if (!context.needsPlan) return { planned: false, reason: 'horizon_sufficient', context };
+    if (this.lifePlanningDispatcher && this.promotionController) {
+      const attempt = this.promotionController.createLifePlanningAttempt({
+        roleId: characterId,
+        planningContext: context,
+        now
+      });
+      this.lifePlanningDispatcher.poke();
+      return {
+        planned: false,
+        reason: 'planning_queued',
+        planningId: attempt.planningId,
+        state: attempt.executionState,
+        context
+      };
+    }
     if (Number(this.lifePlanningRetryAfter.get(characterId) || 0) > now) {
       return { planned: false, reason: 'retry_cooldown', context };
     }
@@ -535,6 +552,65 @@ export class YuqiOrchestrator {
         this.lifePlanningPromises.delete(characterId);
       }
     }
+  }
+
+  setLifePlanningDispatcher(dispatcher) {
+    this.lifePlanningDispatcher = dispatcher;
+  }
+
+  async executeLifePlanningAttempt(attempt) {
+    const snapshot = attempt?.inputSnapshot || {};
+    const planningWindow = snapshot.planningWindow || {};
+    const planKey = attempt.planningId;
+    return this.withBrainRoleLock(async () => {
+      const profile = roleExecutionProfile('deep', 'brain', this.roleProfiles);
+      const request = {
+        task: attempt.authoritativePipeline === 'cognition'
+          ? 'plan_yuqi_life_with_cognition'
+          : 'plan_yuqi_life',
+        preset: this.presets.compileFor('brain', { scene: { kind: 'LIFE_PLANNING' } }),
+        characterId: attempt.roleId,
+        planKey,
+        lifeContext: snapshot,
+        planningWindow: {
+          startAt: Number(planningWindow.startAt),
+          targetEndAt: Number(planningWindow.targetEndAt),
+          minimumCoverageMs: 6 * 60 * 60_000,
+          maximumCoverageMs: 24 * 60 * 60_000
+        }
+      };
+      const response = await this.codex.runTurn('brain', JSON.stringify(request), {
+        clientUserMessageId: planKey,
+        outputSchema: ROLE_OUTPUT_SCHEMAS.brain,
+        model: profile.model,
+        effort: profile.effort
+      });
+      const draft = normalizeBrainDraft(parseRoleJson(response.text, 'brain'));
+      if (draft.action !== 'skip' || draft.reply || draft.momentAction || draft.lifeAdjustment) {
+        throw new Error('life planning task must stay silent');
+      }
+      const episodes = Array.isArray(draft.lifePlan?.episodes) ? draft.lifePlan.episodes : [];
+      const ordered = episodes
+        .map(item => ({
+          ...item,
+          startAt: Number(item.startAt),
+          endAt: Number(item.endAt)
+        }))
+        .sort((left, right) => left.startAt - right.startAt);
+      if (!ordered.length || ordered.length > 12) throw new Error('invalid life plan size');
+      if (ordered[0].startAt < Number(planningWindow.startAt)) throw new Error('life plan starts in the past');
+      if (ordered[0].startAt - Number(planningWindow.startAt) > 60 * 60_000) {
+        throw new Error('life plan leaves a large initial gap');
+      }
+      for (let index = 1; index < ordered.length; index += 1) {
+        if (ordered[index].startAt < ordered[index - 1].endAt) throw new Error('life plan overlaps');
+      }
+      const coverageMs = ordered.at(-1).endAt - ordered[0].startAt;
+      if (coverageMs < 6 * 60 * 60_000 || coverageMs > 24 * 60 * 60_000) {
+        throw new Error('life plan coverage is outside the allowed window');
+      }
+      return { episodes: ordered };
+    });
   }
 
   async run(turnId) {

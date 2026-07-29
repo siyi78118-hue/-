@@ -325,6 +325,56 @@ function mapCharacterLifeState(row) {
   };
 }
 
+function mapLifePlanningAttempt(row) {
+  if (!row) return null;
+  return {
+    planningId: row.planning_id,
+    requestBaseKey: row.request_base_key,
+    requestKey: row.request_key,
+    roleId: row.role_id,
+    planningRevision: Number(row.planning_revision),
+    planningWindowStartAt: Number(row.planning_window_start_at),
+    planningWindowEndAt: Number(row.planning_window_end_at),
+    lifeBasisChecksum: row.life_basis_checksum,
+    contextChecksum: row.context_checksum,
+    rolloutKey: row.rollout_key,
+    pipelineMode: row.pipeline_mode,
+    comparisonMode: row.comparison_mode,
+    authoritativePipeline: row.authoritative_pipeline,
+    comparisonDirection: row.comparison_direction || null,
+    rolloutRevision: Number(row.rollout_revision),
+    rolloutEvidenceEpoch: Number(row.rollout_evidence_epoch),
+    pipelineChecksum: row.pipeline_checksum,
+    shadowEpoch: row.shadow_epoch ?? null,
+    canaryEpoch: row.canary_epoch ?? null,
+    canarySlot: row.canary_slot ?? null,
+    presetVersion: row.preset_version,
+    inputSnapshot: parseJson(row.input_snapshot_json, {}),
+    inputChecksum: row.input_checksum,
+    executionState: row.execution_state,
+    comparisonState: row.comparison_state,
+    authoritativeResult: parseJson(row.authoritative_result_json, null),
+    authoritativeResultChecksum: row.authoritative_result_checksum || null,
+    compareJobId: row.compare_job_id || null,
+    attemptCount: Number(row.attempt_count),
+    dueAt: Number(row.due_at),
+    leaseOwner: row.lease_owner || null,
+    leaseExpiresAt: row.lease_expires_at ?? null,
+    lastErrorCode: row.last_error_code || null,
+    resultCommittedAt: row.result_committed_at ?? null,
+    completedAt: row.completed_at ?? null,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
+export class LifePlanningResultConflictError extends Error {
+  constructor(message = 'life planning authoritative result conflict') {
+    super(message);
+    this.name = 'LifePlanningResultConflictError';
+  }
+}
+
 export class YuqiStore {
   constructor(filename) {
     if (!filename) throw new Error('database filename is required');
@@ -759,6 +809,64 @@ export class YuqiStore {
         PRIMARY KEY(run_id, case_id),
         CHECK(source_type IN ('approved_fixture', 'annotation_derived', 'synthetic', 'local_history'))
       );
+
+      CREATE TABLE IF NOT EXISTS cognition_life_planning_attempts (
+        planning_id TEXT PRIMARY KEY,
+        request_base_key TEXT NOT NULL,
+        request_key TEXT NOT NULL UNIQUE,
+        role_id TEXT NOT NULL,
+        planning_revision INTEGER NOT NULL,
+        planning_window_start_at INTEGER NOT NULL,
+        planning_window_end_at INTEGER NOT NULL,
+        life_basis_checksum TEXT NOT NULL,
+        context_checksum TEXT NOT NULL,
+        rollout_key TEXT NOT NULL DEFAULT 'LIFE_PLANNING',
+        pipeline_mode TEXT NOT NULL,
+        comparison_mode TEXT NOT NULL,
+        authoritative_pipeline TEXT NOT NULL,
+        comparison_direction TEXT,
+        rollout_revision INTEGER NOT NULL,
+        rollout_evidence_epoch INTEGER NOT NULL,
+        pipeline_checksum TEXT NOT NULL,
+        shadow_epoch INTEGER,
+        canary_epoch INTEGER,
+        canary_slot INTEGER,
+        preset_version TEXT NOT NULL,
+        input_snapshot_json TEXT NOT NULL,
+        input_checksum TEXT NOT NULL,
+        execution_state TEXT NOT NULL,
+        comparison_state TEXT NOT NULL,
+        authoritative_result_json TEXT,
+        authoritative_result_checksum TEXT,
+        compare_job_id TEXT UNIQUE,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        due_at INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at INTEGER,
+        last_error_code TEXT,
+        result_committed_at INTEGER,
+        completed_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(role_id, planning_revision),
+        CHECK(pipeline_mode IN ('legacy', 'shadow', 'active')),
+        CHECK(comparison_mode IN ('none', 'cognition_compare', 'legacy_compare')),
+        CHECK(authoritative_pipeline IN ('legacy', 'cognition')),
+        CHECK(execution_state IN (
+          'created', 'running', 'retry_wait', 'result_committed', 'completed', 'failed', 'cancelled'
+        )),
+        CHECK(comparison_state IN (
+          'not_ready', 'not_applicable', 'queued', 'running', 'completed', 'failed', 'cancelled'
+        ))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_life_planning_canary_slot
+        ON cognition_life_planning_attempts(rollout_key, canary_epoch, canary_slot)
+        WHERE canary_slot IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_life_planning_request_base
+        ON cognition_life_planning_attempts(request_base_key);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_life_planning_one_open_per_role
+        ON cognition_life_planning_attempts(role_id)
+        WHERE execution_state IN ('created', 'running', 'retry_wait', 'result_committed');
     `);
 
     const factColumns = new Set(this.db.prepare('PRAGMA table_info(facts)').all().map(row => row.name));
@@ -819,7 +927,7 @@ export class YuqiStore {
           'PROACTIVE_CHAT', 'PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'
         );
     `);
-    this.db.exec('PRAGMA user_version = 8;');
+    this.db.exec('PRAGMA user_version = 9;');
   }
 
   transaction(run) {
@@ -2322,6 +2430,230 @@ export class YuqiStore {
 
   putLifePlan(characterId, episodes, options = {}) {
     return this.transaction(() => this.putLifePlanInternal(characterId, episodes, options));
+  }
+
+  getLifeBasisChecksum(roleId, { from = null, to = null } = {}) {
+    const episodes = this.listLifeEpisodes(roleId, { from, to })
+      .filter(item => item.status !== 'cancelled')
+      .map(item => ({ episodeId: item.episodeId, checksum: item.checksum, status: item.status }));
+    const state = this.getCharacterLifeState(roleId);
+    return contentHash({
+      roleId: String(roleId),
+      revision: Number(state?.revision || 0),
+      episodes
+    });
+  }
+
+  getLifePlanningAttempt(planningId) {
+    return mapLifePlanningAttempt(this.db.prepare(
+      'SELECT * FROM cognition_life_planning_attempts WHERE planning_id = ?'
+    ).get(String(planningId || '')));
+  }
+
+  getOpenLifePlanningAttempt(roleId) {
+    return mapLifePlanningAttempt(this.db.prepare(`
+      SELECT * FROM cognition_life_planning_attempts
+      WHERE role_id = ?
+        AND execution_state IN ('created', 'running', 'retry_wait', 'result_committed')
+      ORDER BY planning_revision DESC LIMIT 1
+    `).get(String(roleId || '')));
+  }
+
+  getLifePlanningAttemptByRequestKey(requestKey) {
+    return mapLifePlanningAttempt(this.db.prepare(
+      'SELECT * FROM cognition_life_planning_attempts WHERE request_key = ?'
+    ).get(String(requestKey || '')));
+  }
+
+  createLifePlanningAttemptInternal(attempt) {
+    const roleId = String(attempt?.roleId || '');
+    if (!roleId) throw new Error('life planning role is required');
+    const existingOpen = this.getOpenLifePlanningAttempt(roleId);
+    if (existingOpen) return existingOpen;
+    const exact = this.getLifePlanningAttemptByRequestKey(attempt.requestKey);
+    if (exact) return exact;
+    const revision = Number(this.db.prepare(`
+      SELECT COALESCE(MAX(planning_revision), 0) + 1 AS next_revision
+      FROM cognition_life_planning_attempts WHERE role_id = ?
+    `).get(roleId)?.next_revision || 1);
+    const planningId = `lifeplan:${roleId}:${revision}`;
+    const timestamp = Number(attempt.now || now());
+    const inputSnapshotJson = canonicalJson(attempt.inputSnapshot || {});
+    const inputChecksum = contentHash(attempt.inputSnapshot || {});
+    const comparisonMode = String(attempt.comparisonMode || 'none');
+    this.db.prepare(`
+      INSERT INTO cognition_life_planning_attempts(
+        planning_id, request_base_key, request_key, role_id, planning_revision,
+        planning_window_start_at, planning_window_end_at, life_basis_checksum,
+        context_checksum, rollout_key, pipeline_mode, comparison_mode,
+        authoritative_pipeline, comparison_direction, rollout_revision,
+        rollout_evidence_epoch, pipeline_checksum, shadow_epoch, canary_epoch,
+        canary_slot, preset_version, input_snapshot_json, input_checksum,
+        execution_state, comparison_state, attempt_count, due_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIFE_PLANNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        'created', ?, 0, ?, ?, ?)
+    `).run(
+      planningId, attempt.requestBaseKey, attempt.requestKey, roleId, revision,
+      Number(attempt.planningWindowStartAt), Number(attempt.planningWindowEndAt),
+      attempt.lifeBasisChecksum, attempt.contextChecksum, attempt.pipelineMode,
+      comparisonMode, attempt.authoritativePipeline, attempt.comparisonDirection || null,
+      Number(attempt.rolloutRevision), Number(attempt.rolloutEvidenceEpoch),
+      attempt.pipelineChecksum, attempt.shadowEpoch ?? null, attempt.canaryEpoch ?? null,
+      attempt.canarySlot ?? null, attempt.presetVersion, inputSnapshotJson, inputChecksum,
+      comparisonMode === 'none' ? 'not_applicable' : 'not_ready',
+      Number(attempt.dueAt || timestamp), timestamp, timestamp
+    );
+    return this.getLifePlanningAttempt(planningId);
+  }
+
+  claimDueLifePlanningAttempt({ workerId, now: claimAt = now(), leaseMs = 300_000 }) {
+    return this.transaction(() => {
+      const row = this.db.prepare(`
+        SELECT * FROM cognition_life_planning_attempts
+        WHERE due_at <= ? AND (
+          execution_state IN ('created', 'retry_wait')
+          OR (execution_state = 'running' AND COALESCE(lease_expires_at, 0) <= ?)
+        )
+        ORDER BY due_at, created_at, planning_id LIMIT 1
+      `).get(Number(claimAt), Number(claimAt));
+      if (!row) return null;
+      const result = this.db.prepare(`
+        UPDATE cognition_life_planning_attempts
+        SET execution_state = 'running', attempt_count = attempt_count + 1,
+            lease_owner = ?, lease_expires_at = ?, updated_at = ?
+        WHERE planning_id = ? AND (
+          execution_state IN ('created', 'retry_wait')
+          OR (execution_state = 'running' AND COALESCE(lease_expires_at, 0) <= ?)
+        )
+      `).run(
+        String(workerId), Number(claimAt) + Number(leaseMs), Number(claimAt),
+        row.planning_id, Number(claimAt)
+      );
+      return Number(result.changes) === 1 ? this.getLifePlanningAttempt(row.planning_id) : null;
+    });
+  }
+
+  retryLifePlanningAttempt({ planningId, workerId, errorCode, nextDueAt, now: retryAt = now() }) {
+    const result = this.db.prepare(`
+      UPDATE cognition_life_planning_attempts
+      SET execution_state = 'retry_wait', due_at = ?, lease_owner = NULL,
+          lease_expires_at = NULL, last_error_code = ?, updated_at = ?
+      WHERE planning_id = ? AND execution_state = 'running' AND lease_owner = ?
+    `).run(Number(nextDueAt), String(errorCode || 'RETRYABLE'), Number(retryAt), planningId, workerId);
+    if (Number(result.changes) !== 1) throw new Error('life planning attempt lease mismatch');
+    return this.getLifePlanningAttempt(planningId);
+  }
+
+  recoverExpiredLifePlanningAttempts({ now: recoveredAt = now() } = {}) {
+    const result = this.db.prepare(`
+      UPDATE cognition_life_planning_attempts
+      SET execution_state = 'retry_wait', due_at = ?, lease_owner = NULL,
+          lease_expires_at = NULL, last_error_code = 'LEASE_RECOVERED', updated_at = ?
+      WHERE execution_state = 'running' AND COALESCE(lease_expires_at, 0) <= ?
+    `).run(Number(recoveredAt), Number(recoveredAt), Number(recoveredAt));
+    return Number(result.changes || 0);
+  }
+
+  commitLifePlanningResultInternal({ planningId, workerId, validatedResult, now: committedAt = now() }) {
+    const attempt = this.getLifePlanningAttempt(planningId);
+    if (!attempt) throw new Error('life planning attempt not found');
+    const result = {
+      episodes: (validatedResult?.episodes || []).map((item, index) => ({
+        ...item,
+        episodeId: `life:${planningId}:${index + 1}`
+      }))
+    };
+    const checksum = contentHash(result);
+    if (attempt.authoritativeResultChecksum) {
+      if (attempt.authoritativeResultChecksum !== checksum) throw new LifePlanningResultConflictError();
+      return attempt;
+    }
+    if (attempt.executionState !== 'running' || attempt.leaseOwner !== workerId) {
+      throw new Error('life planning attempt lease mismatch');
+    }
+    const currentBasis = this.getLifeBasisChecksum(attempt.roleId, {
+      from: attempt.planningWindowStartAt,
+      to: attempt.planningWindowEndAt
+    });
+    if (currentBasis !== attempt.lifeBasisChecksum) {
+      this.db.prepare(`
+        UPDATE cognition_life_planning_attempts
+        SET execution_state = 'cancelled', comparison_state = ?,
+            lease_owner = NULL, lease_expires_at = NULL,
+            last_error_code = 'LIFE_BASIS_STALE', completed_at = ?, updated_at = ?
+        WHERE planning_id = ?
+      `).run(
+        attempt.comparisonMode === 'none' ? 'not_applicable' : 'cancelled',
+        Number(committedAt), Number(committedAt), planningId
+      );
+      return this.getLifePlanningAttempt(planningId);
+    }
+    this.putLifePlanInternal(attempt.roleId, result.episodes, { sourceTurnId: planningId });
+    let compareJob = null;
+    if (attempt.comparisonMode !== 'none') {
+      compareJob = this.createConsolidationJobInternal({
+        subjectType: 'life_planning',
+        subjectId: planningId,
+        roleId: attempt.roleId,
+        jobType: attempt.comparisonMode === 'cognition_compare'
+          ? 'shadow_cognition'
+          : 'active_canary_compare',
+        payload: {
+          subjectType: 'life_planning',
+          subjectId: planningId,
+          turnId: null,
+          rolloutKey: 'LIFE_PLANNING',
+          rolloutRevision: attempt.rolloutRevision,
+          rolloutEvidenceEpoch: attempt.rolloutEvidenceEpoch,
+          shadowEpoch: attempt.shadowEpoch,
+          canaryEpoch: attempt.canaryEpoch,
+          canarySlot: attempt.canarySlot,
+          comparisonDirection: attempt.comparisonDirection,
+          authoritativePipeline: attempt.authoritativePipeline,
+          comparisonPipeline: attempt.authoritativePipeline === 'legacy' ? 'cognition' : 'legacy',
+          authoritativeResultChecksum: checksum,
+          inputChecksum: attempt.inputChecksum,
+          pipelineChecksum: attempt.pipelineChecksum,
+          presetVersion: attempt.presetVersion
+        },
+        createdAt: committedAt
+      });
+    }
+    this.db.prepare(`
+      UPDATE cognition_life_planning_attempts
+      SET execution_state = ?, comparison_state = ?,
+          authoritative_result_json = ?, authoritative_result_checksum = ?,
+          compare_job_id = ?, result_committed_at = ?, completed_at = ?,
+          lease_owner = NULL, lease_expires_at = NULL, last_error_code = NULL, updated_at = ?
+      WHERE planning_id = ?
+    `).run(
+      compareJob ? 'result_committed' : 'completed',
+      compareJob ? 'queued' : 'not_applicable',
+      canonicalJson(result), checksum, compareJob?.jobId || null,
+      Number(committedAt), compareJob ? null : Number(committedAt),
+      Number(committedAt), planningId
+    );
+    return this.getLifePlanningAttempt(planningId);
+  }
+
+  failLifePlanningAttemptInternal({
+    planningId, workerId, errorCode, now: failedAt = now()
+  }) {
+    const attempt = this.getLifePlanningAttempt(planningId);
+    if (!attempt) throw new Error('life planning attempt not found');
+    const result = this.db.prepare(`
+      UPDATE cognition_life_planning_attempts
+      SET execution_state = 'failed', comparison_state = ?, lease_owner = NULL,
+          lease_expires_at = NULL, last_error_code = ?, completed_at = ?, updated_at = ?
+      WHERE planning_id = ? AND execution_state = 'running' AND lease_owner = ?
+        AND authoritative_result_checksum IS NULL AND compare_job_id IS NULL
+    `).run(
+      attempt.comparisonMode === 'none' ? 'not_applicable' : 'cancelled',
+      String(errorCode || 'LIFE_PLANNING_FAILED'), Number(failedAt), Number(failedAt),
+      planningId, workerId
+    );
+    if (Number(result.changes) !== 1) throw new Error('life planning attempt lease mismatch');
+    return this.getLifePlanningAttempt(planningId);
   }
 
   getCharacterLifeState(characterId) {

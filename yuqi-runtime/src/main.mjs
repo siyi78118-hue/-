@@ -8,6 +8,7 @@ import { ConsolidationWorker } from './consolidation-worker.mjs';
 import { CloudRelayPump } from './cloud-relay-pump.mjs';
 import { createYuqiServer } from './local-server.mjs';
 import { YuqiOrchestrator } from './orchestrator.mjs';
+import { LifePlanningDispatcher } from './life-planning-dispatcher.mjs';
 import { PresetRegistry } from './preset-registry.mjs';
 import { PromotionController } from './promotion-controller.mjs';
 import { YuqiReconciler } from './reconcile.mjs';
@@ -56,6 +57,12 @@ const orchestrator = new YuqiOrchestrator({
   generationContextLimit: 20,
   roleProfiles: config.roleProfiles
 });
+const lifePlanningDispatcher = new LifePlanningDispatcher({
+  store,
+  promotionController,
+  executeAttempt: attempt => orchestrator.executeLifePlanningAttempt(attempt)
+});
+orchestrator.setLifePlanningDispatcher(lifePlanningDispatcher);
 const reconciler = new YuqiReconciler({ store, codex });
 const dispatcher = new TurnDispatcher({ store, orchestrator });
 const consolidationWorker = new ConsolidationWorker({
@@ -114,6 +121,8 @@ const server = createYuqiServer({
 
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });
 dispatcher.recover();
+lifePlanningDispatcher.recover();
+lifePlanningDispatcher.start();
 consolidationWorker.start();
 shadowDispatcher.start();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
@@ -138,6 +147,7 @@ async function stop() {
   if (stopping) return;
   stopping = true;
   clearInterval(lifeBoundaryTimer);
+  try { await lifePlanningDispatcher.stop(); } catch {}
   try { await consolidationWorker.stop(); } catch {}
   try { shadowDispatcher.stop(); } catch {}
   try { cloudPump?.stop(); } catch {}
