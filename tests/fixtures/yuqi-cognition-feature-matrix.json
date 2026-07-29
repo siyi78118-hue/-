@@ -1,0 +1,223 @@
+{
+  "schemaVersion": 1,
+  "turnKinds": {
+    "DIRECT_REPLY": {
+      "requiredContext": ["currentBatch", "scene", "conversationHistory", "localMemoryHints"],
+      "allowedActions": ["reply", "payment", "rolePlan", "lifeAdjustment", "relationshipReview"],
+      "forbiddenActions": ["skip", "momentTargetOutsideTrigger"],
+      "legacyTests": [
+        {"path": "yuqi-runtime/test/orchestrator.test.mjs", "status": "implemented"},
+        {"path": "yuqi-runtime/test/current-user-batch.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "ROLE_PLAN_CHAT": {
+      "requiredContext": ["trigger", "planOccurrence", "roleSchedule", "scene"],
+      "allowedActions": ["reply", "skip", "rolePlan"],
+      "forbiddenActions": ["momentPost", "publicDisclosureOfPrivatePlan"],
+      "legacyTests": [
+        {"path": "tests/role-plan-domain.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "ROLE_PLAN_MOMENT": {
+      "requiredContext": ["trigger", "planOccurrence", "roleSchedule", "publicBoundary"],
+      "allowedActions": ["momentPost", "skip", "rolePlan"],
+      "forbiddenActions": ["privateReply", "privateFactDisclosure"],
+      "legacyTests": [
+        {"path": "tests/role-plan-domain.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "ROLE_PLAN_CHAT_PRIVATE": {
+      "requiredContext": ["trigger", "privateOccurrence", "roleSchedule", "scene"],
+      "allowedActions": ["reply", "skip", "rolePlan"],
+      "forbiddenActions": ["momentPost", "publicDisclosureOfPrivatePlan"],
+      "legacyTests": [
+        {"path": "tests/role-plan-repository.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "ROLE_PLAN_MOMENT_PRIVATE": {
+      "requiredContext": ["trigger", "privateOccurrence", "roleSchedule", "publicBoundary"],
+      "allowedActions": ["momentPost", "skip", "rolePlan"],
+      "forbiddenActions": ["privateReply", "privateFactDisclosure"],
+      "legacyTests": [
+        {"path": "tests/role-plan-repository.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "PROACTIVE_CHAT": {
+      "requiredContext": ["trigger", "interactionState", "skipBudget", "lifeState", "openThreads"],
+      "allowedActions": ["reply", "skip", "payment"],
+      "forbiddenActions": ["momentPost", "triggerAsUserEvidence"],
+      "legacyTests": [
+        {"path": "yuqi-runtime/test/interaction-state.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "PROACTIVE_MOMENT": {
+      "requiredContext": ["trigger", "lifeState", "publicBoundary", "momentContext"],
+      "allowedActions": ["momentPost", "skip"],
+      "forbiddenActions": ["privateReply", "privateFactDisclosure"],
+      "legacyTests": [
+        {"path": "yuqi-runtime/test/orchestrator.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "MOMENT_INTERACTION": {
+      "requiredContext": ["trigger", "momentTarget", "publicThread", "publicBoundary"],
+      "allowedActions": ["none", "like", "comment"],
+      "forbiddenActions": ["replyToDifferentComment", "privateFactDisclosure"],
+      "legacyTests": [
+        {"path": "yuqi-runtime/test/orchestrator.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    },
+    "MOMENT_REPLY": {
+      "requiredContext": ["trigger", "momentTarget", "commentTarget", "publicThread"],
+      "allowedActions": ["none", "reply"],
+      "forbiddenActions": ["replyToDifferentComment", "privateFactDisclosure"],
+      "legacyTests": [
+        {"path": "yuqi-runtime/test/orchestrator.test.mjs", "status": "implemented"}
+      ],
+      "activeTests": [
+        {"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}
+      ]
+    }
+  },
+  "crossCuttingCapabilities": {
+    "fullCurrentBatch": {
+      "legacyTests": [{"path": "yuqi-runtime/test/current-user-batch.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "quotes": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-contract.test.mjs", "status": "planned"}]
+    },
+    "images": {
+      "legacyTests": [{"path": "yuqi-runtime/test/image-attachments.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "voiceMessages": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "unicodeEmoji": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "payment": {
+      "legacyTests": [{"path": "tests/payment-batch-bridge-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-contract.test.mjs", "status": "planned"}]
+    },
+    "baseStage": {
+      "legacyTests": [{"path": "yuqi-runtime/test/relationship-stage.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-contract.test.mjs", "status": "planned"}]
+    },
+    "phaseStage": {
+      "legacyTests": [{"path": "yuqi-runtime/test/relationship-stage.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-contract.test.mjs", "status": "planned"}]
+    },
+    "stagePersona": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "rolePlans": {
+      "legacyTests": [{"path": "tests/role-plan-domain.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}]
+    },
+    "roleSchedule": {
+      "legacyTests": [{"path": "tests/role-plan-domain.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "lifeTimeline": {
+      "legacyTests": [{"path": "yuqi-runtime/test/life-simulation.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/life-planning-attempt.test.mjs", "status": "planned"}]
+    },
+    "deliveryReceipt": {
+      "legacyTests": [{"path": "yuqi-runtime/test/local-server.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/consolidation-worker.test.mjs", "status": "planned"}]
+    },
+    "fallback": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "android/app/src/test/java/com/siyi/al/execution/NativeModelGatewayTest.java", "status": "planned"}]
+    },
+    "phoneMemoryDb": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "roleAndPlayerProfile": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognition-context.test.mjs", "status": "planned"}]
+    },
+    "chatUiState": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/cognitive-pipeline.test.mjs", "status": "planned"}]
+    },
+    "settingsCompatibility": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "android/app/src/test/java/com/siyi/al/execution/NativeModelGatewayTest.java", "status": "planned"}]
+    },
+    "rolloutAuthority": {
+      "legacyTests": [{"path": "yuqi-runtime/test/protocol-store.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/promotion-controller.test.mjs", "status": "planned"}]
+    },
+    "replayIsolation": {
+      "legacyTests": [{"path": "tests/yuqi-deployment-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/replay-runner.test.mjs", "status": "planned"}]
+    },
+    "liveShadow": {
+      "legacyTests": [{"path": "yuqi-runtime/test/turn-dispatcher.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/shadow-dispatcher.test.mjs", "status": "planned"}]
+    },
+    "activeCanary": {
+      "legacyTests": [{"path": "yuqi-runtime/test/orchestrator.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/promotion-controller.test.mjs", "status": "planned"}]
+    },
+    "automaticRollback": {
+      "legacyTests": [{"path": "yuqi-runtime/test/turn-dispatcher.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/promotion-controller.test.mjs", "status": "planned"}]
+    },
+    "staleCompareIsolation": {
+      "legacyTests": [{"path": "yuqi-runtime/test/protocol-store.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/comparison-evaluator.test.mjs", "status": "planned"}]
+    },
+    "canaryBackpressure": {
+      "legacyTests": [{"path": "yuqi-runtime/test/turn-dispatcher.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/promotion-controller.test.mjs", "status": "planned"}]
+    },
+    "activeFailureRollback": {
+      "legacyTests": [{"path": "yuqi-runtime/test/orchestrator.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/promotion-controller.test.mjs", "status": "planned"}]
+    },
+    "serviceWorkerUpdate": {
+      "legacyTests": [{"path": "test-sw-automatic-task-guard.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "tests/yuqi-rollout-authority-contract.test.mjs", "status": "planned"}]
+    },
+    "backupRestore": {
+      "legacyTests": [{"path": "tests/yuqi-deployment-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "tests/yuqi-memory-backup.test.mjs", "status": "planned"}]
+    },
+    "clearDelete": {
+      "legacyTests": [{"path": "tests/yuqi-ui-contract.test.mjs", "status": "implemented"}],
+      "cognitionTests": [{"path": "yuqi-runtime/test/store-cognition-migration.test.mjs", "status": "planned"}]
+    }
+  }
+}
