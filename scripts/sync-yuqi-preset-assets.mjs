@@ -2,6 +2,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { compileCognitionAssets } from './compile-yuqi-cognition-assets.mjs';
+
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 export function extractCombinedRp(html) {
@@ -26,6 +28,7 @@ function syncFile(path, expected, checkOnly) {
 }
 
 export function syncYuqiPresetAssets({ checkOnly = false } = {}) {
+  const cognition = compileCognitionAssets({ rootDir: root, checkOnly });
   const htmlPath = resolve(root, 'tavern-app', 'index.html');
   const corePath = resolve(root, 'yuqi-runtime', 'presets', 'yuqi-core.md');
   const combinedPath = resolve(root, 'yuqi-runtime', 'presets', 'al-combined-rp.md');
@@ -34,7 +37,8 @@ export function syncYuqiPresetAssets({ checkOnly = false } = {}) {
   const browserCore = renderYuqiCoreAsset(readFileSync(corePath, 'utf8'));
   return {
     combinedChanged: syncFile(combinedPath, combined, checkOnly),
-    coreChanged: syncFile(browserCorePath, browserCore, checkOnly)
+    coreChanged: syncFile(browserCorePath, browserCore, checkOnly),
+    cognitionChanged: cognition.changed
   };
 }
 
