@@ -1,4 +1,5 @@
 node_modules/
+artifacts/qa/cognition/replay/
 .toolchains/
 yuqi-runtime/data/
 yuqi-runtime/config.json

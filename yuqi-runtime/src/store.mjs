@@ -722,6 +722,43 @@ export class YuqiStore {
         CHECK(source_type IN ('comparison_run', 'active_subject', 'replay_batch', 'aggregate_gate', 'promotion_snapshot')),
         CHECK(artifact_state IN ('pending', 'materialized'))
       );
+
+      CREATE TABLE IF NOT EXISTS cognition_replay_batches (
+        run_id TEXT PRIMARY KEY,
+        dataset_id TEXT NOT NULL,
+        dataset_checksum TEXT NOT NULL,
+        preset_version TEXT NOT NULL,
+        model_profile_checksum TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        requested_concurrency INTEGER NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        artifact_path TEXT,
+        artifact_checksum TEXT,
+        CHECK(source_type IN ('fixture', 'local_history'))
+      );
+
+      CREATE TABLE IF NOT EXISTS cognition_replay_runs (
+        run_id TEXT NOT NULL,
+        case_id TEXT NOT NULL,
+        rollout_key TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        input_checksum TEXT NOT NULL,
+        legacy_result_checksum TEXT,
+        cognition_result_checksum TEXT,
+        metrics_json TEXT NOT NULL DEFAULT '{}',
+        critical_findings_json TEXT NOT NULL DEFAULT '[]',
+        state TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        latency_ms INTEGER,
+        error_code TEXT,
+        source_deleted_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(run_id, case_id),
+        CHECK(source_type IN ('approved_fixture', 'annotation_derived', 'synthetic', 'local_history'))
+      );
     `);
 
     const factColumns = new Set(this.db.prepare('PRAGMA table_info(facts)').all().map(row => row.name));
@@ -782,7 +819,7 @@ export class YuqiStore {
           'PROACTIVE_CHAT', 'PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'
         );
     `);
-    this.db.exec('PRAGMA user_version = 7;');
+    this.db.exec('PRAGMA user_version = 8;');
   }
 
   transaction(run) {
@@ -1098,35 +1135,6 @@ export class YuqiStore {
       }
       return { changed, rollouts: this.listCognitionRollouts() };
     });
-  }
-
-  countOutstandingComparisonSubjects(rolloutKey, { canaryEpoch = null } = {}) {
-    const turnWhere = canaryEpoch === null
-      ? ''
-      : ' AND canary_epoch = ?';
-    const params = canaryEpoch === null
-      ? [String(rolloutKey)]
-      : [String(rolloutKey), Number(canaryEpoch)];
-    const turn = this.db.prepare(`
-      SELECT COUNT(*) AS count, MIN(created_at) AS oldest
-      FROM turns
-      WHERE rollout_key = ?
-        AND comparison_mode != 'none'
-        AND state NOT IN ('completed', 'fallback', 'failed')
-        ${turnWhere}
-    `).get(...params);
-    const jobs = this.db.prepare(`
-      SELECT COUNT(*) AS count, MIN(created_at) AS oldest
-      FROM cognition_shadow_runs
-      WHERE rollout_key = ?
-        AND state IN ('queued', 'running', 'retry_wait')
-        ${canaryEpoch === null ? '' : ' AND canary_epoch = ?'}
-    `).get(...params);
-    const oldest = [turn.oldest, jobs.oldest].filter(value => value !== null && value !== undefined);
-    return {
-      count: Number(turn.count || 0) + Number(jobs.count || 0),
-      oldestAt: oldest.length ? Math.min(...oldest.map(Number)) : null
-    };
   }
 
   submitTurn(input, pin = {}) {
@@ -2618,37 +2626,182 @@ export class YuqiStore {
     `).all(rolloutKey, direction, Number(since)).map(mapShadowRun);
   }
 
-  countOutstandingComparisonSubjects({
-    rolloutKey,
-    direction,
-    evidenceEpoch,
-    shadowEpoch = null,
-    canaryEpoch = null,
-    now: at = now()
-  }) {
+  countOutstandingComparisonSubjects(input, options = {}) {
+    const rolloutKey = typeof input === 'string' ? input : input.rolloutKey;
+    const direction = typeof input === 'string' ? null : input.direction;
+    const evidenceEpoch = typeof input === 'string' ? null : input.evidenceEpoch;
+    const shadowEpoch = typeof input === 'string' ? null : input.shadowEpoch ?? null;
+    const canaryEpoch = typeof input === 'string'
+      ? options.canaryEpoch ?? null
+      : input.canaryEpoch ?? null;
+    const at = typeof input === 'string' ? now() : input.now ?? now();
     const runs = this.db.prepare(`
-      SELECT subject_type, subject_id, state
+      SELECT subject_type, subject_id, state, created_at
       FROM cognition_shadow_runs
-      WHERE rollout_key = ? AND comparison_direction = ? AND evidence_epoch = ?
+      WHERE rollout_key = ?
+        AND (? IS NULL OR comparison_direction = ?)
+        AND (? IS NULL OR evidence_epoch = ?)
         AND (? IS NULL OR shadow_epoch = ?)
         AND (? IS NULL OR canary_epoch = ?)
         AND stale_for_rollout = 0
     `).all(
-      rolloutKey, direction, Number(evidenceEpoch),
+      rolloutKey, direction, direction,
+      evidenceEpoch, evidenceEpoch,
       shadowEpoch, shadowEpoch, canaryEpoch, canaryEpoch
     );
-    const outstanding = new Set(
-      runs.filter(run => !['completed', 'failed', 'cancelled'].includes(run.state))
-        .map(run => `${run.subject_type}:${run.subject_id}`)
-    );
+    const subjects = new Map();
+    for (const run of runs.filter(run => !['completed', 'failed', 'cancelled'].includes(run.state))) {
+      subjects.set(`${run.subject_type}:${run.subject_id}`, Number(run.created_at));
+    }
+    const turns = this.db.prepare(`
+      SELECT turn_id, created_at FROM turns
+      WHERE rollout_key = ? AND comparison_mode != 'none'
+        AND (? IS NULL OR canary_epoch = ?)
+        AND state NOT IN ('completed', 'fallback', 'failed')
+    `).all(rolloutKey, canaryEpoch, canaryEpoch);
+    for (const turn of turns) {
+      const key = `turn:${turn.turn_id}`;
+      if (!subjects.has(key)) subjects.set(key, Number(turn.created_at));
+    }
     const jobs = this.db.prepare(`
-      SELECT subject_type, subject_id FROM consolidation_jobs
+      SELECT subject_type, subject_id, created_at FROM consolidation_jobs
       WHERE state IN ('queued', 'running', 'retry_wait')
         AND job_type IN ('shadow_cognition', 'active_canary_compare')
         AND (state != 'running' OR COALESCE(lease_expires_at, ?) > ?)
     `).all(Number(at), Number(at));
-    for (const job of jobs) outstanding.add(`${job.subject_type}:${job.subject_id}`);
-    return outstanding.size;
+    for (const job of jobs) {
+      const key = `${job.subject_type}:${job.subject_id}`;
+      if (!subjects.has(key)) subjects.set(key, Number(job.created_at));
+    }
+    const values = [...subjects.values()];
+    const result = {
+      count: subjects.size,
+      oldestAt: values.length ? Math.min(...values) : null
+    };
+    return typeof input === 'string' ? result : result.count;
+  }
+
+  createReplayBatch(batch) {
+    this.db.prepare(`
+      INSERT INTO cognition_replay_batches(
+        run_id, dataset_id, dataset_checksum, preset_version,
+        model_profile_checksum, source_type, state, requested_concurrency, started_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id) DO NOTHING
+    `).run(
+      batch.runId, batch.datasetId, batch.datasetChecksum, batch.presetVersion,
+      batch.modelProfileChecksum, batch.sourceType, batch.state || 'running',
+      Number(batch.requestedConcurrency || 1), Number(batch.startedAt || now())
+    );
+    return this.getReplayBatch(batch.runId);
+  }
+
+  getReplayBatch(runId) {
+    const row = this.db.prepare(
+      'SELECT * FROM cognition_replay_batches WHERE run_id = ?'
+    ).get(String(runId));
+    if (!row) return null;
+    return {
+      runId: row.run_id,
+      datasetId: row.dataset_id,
+      datasetChecksum: row.dataset_checksum,
+      presetVersion: row.preset_version,
+      modelProfileChecksum: row.model_profile_checksum,
+      sourceType: row.source_type,
+      state: row.state,
+      requestedConcurrency: Number(row.requested_concurrency),
+      startedAt: row.started_at,
+      completedAt: row.completed_at ?? null,
+      artifactPath: row.artifact_path || null,
+      artifactChecksum: row.artifact_checksum || null
+    };
+  }
+
+  putReplayRun(run) {
+    const timestamp = Number(run.updatedAt || now());
+    this.db.prepare(`
+      INSERT INTO cognition_replay_runs(
+        run_id, case_id, rollout_key, source_type, input_checksum,
+        legacy_result_checksum, cognition_result_checksum, metrics_json,
+        critical_findings_json, state, attempt_count, latency_ms, error_code,
+        source_deleted_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id, case_id) DO UPDATE SET
+        legacy_result_checksum = excluded.legacy_result_checksum,
+        cognition_result_checksum = excluded.cognition_result_checksum,
+        metrics_json = excluded.metrics_json,
+        critical_findings_json = excluded.critical_findings_json,
+        state = excluded.state,
+        attempt_count = excluded.attempt_count,
+        latency_ms = excluded.latency_ms,
+        error_code = excluded.error_code,
+        source_deleted_at = excluded.source_deleted_at,
+        updated_at = excluded.updated_at
+    `).run(
+      run.runId, run.caseId, run.rolloutKey, run.sourceType, run.inputChecksum,
+      run.legacyResultChecksum || null, run.cognitionResultChecksum || null,
+      canonicalJson(run.metrics || {}), canonicalJson(run.criticalFindings || []),
+      run.state, Number(run.attemptCount || 0), run.latencyMs ?? null,
+      run.errorCode || null, run.sourceDeletedAt ?? null,
+      Number(run.createdAt || timestamp), timestamp
+    );
+    return this.getReplayRun(run.runId, run.caseId);
+  }
+
+  getReplayRun(runId, caseId) {
+    const row = this.db.prepare(`
+      SELECT * FROM cognition_replay_runs WHERE run_id = ? AND case_id = ?
+    `).get(String(runId), String(caseId));
+    if (!row) return null;
+    return {
+      runId: row.run_id,
+      caseId: row.case_id,
+      rolloutKey: row.rollout_key,
+      sourceType: row.source_type,
+      inputChecksum: row.input_checksum,
+      legacyResultChecksum: row.legacy_result_checksum || null,
+      cognitionResultChecksum: row.cognition_result_checksum || null,
+      metrics: parseJson(row.metrics_json, {}),
+      criticalFindings: parseJson(row.critical_findings_json, []),
+      state: row.state,
+      attemptCount: Number(row.attempt_count),
+      latencyMs: row.latency_ms ?? null,
+      errorCode: row.error_code || null,
+      sourceDeletedAt: row.source_deleted_at ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  listReplayRuns(runId) {
+    return this.db.prepare(`
+      SELECT case_id FROM cognition_replay_runs WHERE run_id = ? ORDER BY case_id
+    `).all(String(runId)).map(row => this.getReplayRun(runId, row.case_id));
+  }
+
+  listReplayEligibleTurns({ rolloutKey = 'DIRECT_REPLY', limit = 30, beforeTurnId = null } = {}) {
+    const before = beforeTurnId
+      ? this.db.prepare('SELECT created_at FROM turns WHERE turn_id = ?').get(String(beforeTurnId))?.created_at
+      : null;
+    return this.db.prepare(`
+      SELECT * FROM turns
+      WHERE COALESCE(rollout_key, json_extract(envelope_json, '$.kind')) = ?
+        AND state IN ('committed', 'delivered', 'completed')
+        AND (? IS NULL OR created_at < ?)
+      ORDER BY created_at DESC, turn_id DESC
+      LIMIT ?
+    `).all(String(rolloutKey), before ?? null, before ?? null, Math.max(1, Number(limit) || 30))
+      .map(mapTurn);
+  }
+
+  completeReplayBatch({ runId, state = 'completed', artifactPath = null, artifactChecksum = null, now: completedAt = now() }) {
+    const result = this.db.prepare(`
+      UPDATE cognition_replay_batches
+      SET state = ?, completed_at = ?, artifact_path = ?, artifact_checksum = ?
+      WHERE run_id = ?
+    `).run(state, Number(completedAt), artifactPath, artifactChecksum, String(runId));
+    if (Number(result.changes) !== 1) throw new Error('replay batch not found');
+    return this.getReplayBatch(runId);
   }
 
   advanceConsolidationBackfillCursor(cursor) {

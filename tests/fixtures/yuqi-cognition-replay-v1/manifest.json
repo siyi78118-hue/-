@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "datasetId": "yuqi-cognition-replay-v1",
+  "caseCount": 270,
+  "requiredPerTurnKind": 30,
+  "turnKinds": [
+    "DIRECT_REPLY",
+    "ROLE_PLAN_CHAT",
+    "ROLE_PLAN_MOMENT",
+    "ROLE_PLAN_CHAT_PRIVATE",
+    "ROLE_PLAN_MOMENT_PRIVATE",
+    "PROACTIVE_CHAT",
+    "PROACTIVE_MOMENT",
+    "MOMENT_INTERACTION",
+    "MOMENT_REPLY"
+  ],
+  "sourceQuotaPerTurnKind": {
+    "normal": 12,
+    "ambiguity": 6,
+    "recovery": 4,
+    "action_boundary": 4,
+    "stage": 2,
+    "attachment": 2
+  },
+  "casesChecksum": "fdf10a51b83fddd6da2b9041a3156caad98517276310bf3d15fad9f91ef4ebb1",
+  "generatedFrom": "approved synthetic protocol structures"
+}
