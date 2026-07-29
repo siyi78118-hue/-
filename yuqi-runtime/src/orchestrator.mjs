@@ -766,6 +766,28 @@ export class YuqiOrchestrator {
           });
         } catch {}
       }
+      if (current?.pipelineMode === 'active' && this.promotionController) {
+        try {
+          const transient = /timeout|rate.?limit|capacity|temporar/i.test(
+            `${error?.name || ''} ${error?.message || ''}`
+          );
+          this.promotionController.recordActivePipelineFailure({
+            subjectType: 'turn',
+            subjectId: turnId,
+            errorCode: String(error?.code || error?.name || 'ACTIVE_PRECOMMIT_CRITICAL'),
+            failureClass: transient ? 'transient' : 'deterministic',
+            report: { summary: { stage: current.state } },
+            now: this.clock()
+          });
+        } catch (rollbackError) {
+          this.store.putDiagnostic({
+            turnId,
+            stage: 'active_rollout_failure',
+            level: 'error',
+            detail: { name: rollbackError.name, message: rollbackError.message }
+          });
+        }
+      }
       this.store.putDiagnostic({
         turnId,
         stage: current?.state || 'unknown',
@@ -1204,6 +1226,59 @@ export class YuqiOrchestrator {
     return saved;
   }
 
+  queueComparisonJobInternal(envelope, current, result) {
+    if (!['cognition_compare', 'legacy_compare'].includes(current.comparisonMode)) return null;
+    const cognitionCompare = current.comparisonMode === 'cognition_compare';
+    const comparisonDirection = cognitionCompare
+      ? 'legacy_authoritative_cognition_compare'
+      : 'cognition_authoritative_legacy_compare';
+    const jobType = cognitionCompare ? 'shadow_cognition' : 'active_canary_compare';
+    const authoritativeResultChecksum = contentHash(result);
+    const payload = {
+      subjectType: 'turn',
+      subjectId: envelope.turnId,
+      turnId: envelope.turnId,
+      rolloutKey: current.rolloutKey || envelope.kind,
+      rolloutRevision: current.rolloutRevision,
+      rolloutEvidenceEpoch: current.rolloutEvidenceEpoch,
+      shadowEpoch: current.shadowEpoch,
+      canaryEpoch: current.canaryEpoch,
+      canarySlot: current.canarySlot,
+      comparisonDirection,
+      authoritativePipeline: cognitionCompare ? 'legacy' : 'cognition',
+      comparisonPipeline: cognitionCompare ? 'cognition' : 'legacy',
+      authoritativeResultChecksum,
+      pipelineMode: current.pipelineMode,
+      comparisonMode: current.comparisonMode,
+      presetVersion: current.presetVersion,
+      pipelineChecksum: current.pipelineChecksum,
+      annotationSnapshotChecksum: contentHash(current.annotationSnapshot || {}),
+      inputChecksum: contentHash({
+        envelope,
+        route: current.route,
+        routeReasons: current.routeReasons,
+        presetVersion: current.presetVersion,
+        annotationSnapshot: current.annotationSnapshot
+      })
+    };
+    return this.store.putConsolidationJobInternal({
+      jobId: `compare_${contentHash({
+        subjectId: envelope.turnId,
+        comparisonDirection,
+        authoritativeResultChecksum
+      }).slice(0, 24)}`,
+      subjectType: 'turn',
+      subjectId: envelope.turnId,
+      turnId: envelope.turnId,
+      roleId: envelope.characterId,
+      jobType,
+      state: 'queued',
+      dueAt: this.clock(),
+      createdAt: this.clock(),
+      payload
+    });
+  }
+
   commitApproved(envelope, current) {
     const draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
@@ -1232,6 +1307,7 @@ export class YuqiOrchestrator {
           rolePlanOperations: draft.rolePlanOperations
         };
         this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
+        this.queueComparisonJobInternal(envelope, current, result);
         this.store.advanceTurn(
           envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
         );
@@ -1267,6 +1343,7 @@ export class YuqiOrchestrator {
           usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
         };
         this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
+        this.queueComparisonJobInternal(envelope, current, result);
         this.store.advanceTurn(
           envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
         );
@@ -1312,6 +1389,7 @@ export class YuqiOrchestrator {
           rolePlanOperations: draft.rolePlanOperations
         };
         this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
+        this.queueComparisonJobInternal(envelope, current, result);
         this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
           replyJson: JSON.stringify(result)
         });
@@ -1361,6 +1439,7 @@ export class YuqiOrchestrator {
         rolePlanOperations: draft.rolePlanOperations
       };
       this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
+      this.queueComparisonJobInternal(envelope, current, result);
       this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
         replyJson: JSON.stringify(result)
       });

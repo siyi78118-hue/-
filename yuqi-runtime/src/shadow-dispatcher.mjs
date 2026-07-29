@@ -1,10 +1,16 @@
+import { evaluatePipelineComparison } from './comparison-evaluator.mjs';
+import { contentHash } from './protocol.mjs';
+
 export class ShadowDispatcher {
   constructor({
     store,
     cognitivePipeline,
     foregroundActivity,
     clock = Date.now,
-    workerId = 'yuqi-shadow'
+    workerId = 'yuqi-shadow',
+    promotionController = null,
+    comparisonEvaluator = evaluatePipelineComparison,
+    comparisonExecutor = null
   }) {
     if (!store || !cognitivePipeline) throw new Error('store and cognitivePipeline are required');
     this.store = store;
@@ -12,6 +18,9 @@ export class ShadowDispatcher {
     this.foregroundActivity = foregroundActivity || { isBusy: () => false };
     this.clock = clock;
     this.workerId = workerId;
+    this.promotionController = promotionController;
+    this.comparisonEvaluator = comparisonEvaluator;
+    this.comparisonExecutor = comparisonExecutor;
     this.timer = null;
   }
 
@@ -40,12 +49,99 @@ export class ShadowDispatcher {
     if (!claimed) return null;
     const startedAt = this.clock();
     try {
-      const result = await this.cognitivePipeline.runShadow(claimed.payload);
-      this.store.completeConsolidationJob({
-        jobId: claimed.jobId,
-        workerId: this.workerId,
-        now: this.clock()
+      const payload = claimed.payload;
+      if (!this.promotionController && !payload.subjectType) {
+        const result = await this.cognitivePipeline.runShadow(payload);
+        this.store.completeConsolidationJob({
+          jobId: claimed.jobId,
+          workerId: this.workerId,
+          now: this.clock()
+        });
+        this.store.putDiagnostic?.({
+          turnId: claimed.turnId,
+          stage: 'shadow_cognition',
+          detail: {
+            latencyMs: this.clock() - startedAt,
+            draftChecksum: result?.draft?.draftChecksum || '',
+            action: result?.draft?.action || ''
+          }
+        });
+        return result;
+      }
+      const turn = payload.subjectType === 'turn' ? this.store.getTurn(payload.turnId) : null;
+      if (!turn || contentHash({
+        envelope: JSON.parse(turn.envelopeJson),
+        route: turn.route,
+        routeReasons: turn.routeReasons,
+        presetVersion: turn.presetVersion,
+        annotationSnapshot: turn.annotationSnapshot
+      }) !== payload.inputChecksum) {
+        const error = new Error('pinned comparison input is unavailable');
+        error.code = 'PINNED_PIPELINE_UNAVAILABLE';
+        throw error;
+      }
+      const envelope = JSON.parse(turn.envelopeJson);
+      const authoritativeResult = JSON.parse(turn.replyJson || '{}');
+      if (contentHash(authoritativeResult) !== payload.authoritativeResultChecksum) {
+        throw new Error('authoritative result checksum mismatch');
+      }
+      const currentBatch = this.store.getCurrentUserBatch(turn.turnId);
+      const execution = {
+        turn,
+        envelope,
+        scene: {},
+        currentBatch,
+        routeDecision: {
+          route: turn.route,
+          allowedActionTargets: [envelope.characterId, 'user']
+        }
+      };
+      const result = this.comparisonExecutor
+        ? await this.comparisonExecutor({ claimed, payload, execution })
+        : payload.comparisonPipeline === 'cognition'
+          ? await this.cognitivePipeline.runShadow(execution)
+          : await this.cognitivePipeline.runLegacyShadow?.(execution);
+      if (!result) {
+        const error = new Error('pinned comparison pipeline is unavailable');
+        error.code = 'PINNED_PIPELINE_UNAVAILABLE';
+        throw error;
+      }
+      const comparisonResult = result.draft || result;
+      const evaluated = this.comparisonEvaluator({
+        subjectType: payload.subjectType,
+        subject: envelope,
+        authoritativeResult,
+        comparisonResult,
+        currentBatch,
+        scene: execution.scene,
+        allowedActionTargets: [envelope.characterId, 'user']
       });
+      if (this.promotionController) {
+        this.promotionController.recordComparisonOutcome({
+          jobId: claimed.jobId,
+          workerId: this.workerId,
+          run: {
+            runId: `run_${contentHash({ jobId: claimed.jobId, payload }).slice(0, 24)}`,
+            comparisonResultChecksum: contentHash(comparisonResult),
+            metrics: evaluated.metrics,
+            latencyMs: this.clock() - startedAt
+          },
+          report: {
+            summary: {
+              metrics: evaluated.metrics,
+              warnings: evaluated.warnings
+            }
+          },
+          criticalFindings: evaluated.criticalFindings,
+          now: this.clock()
+        });
+      } else {
+        this.store.completeConsolidationJob({
+          jobId: claimed.jobId,
+          workerId: this.workerId,
+          now: this.clock()
+        });
+      }
       this.store.putDiagnostic?.({
         turnId: claimed.turnId,
         stage: 'shadow_cognition',
@@ -58,7 +154,9 @@ export class ShadowDispatcher {
       return result;
     } catch (error) {
       const attempt = Number(claimed.attemptCount || 1);
-      const delays = [300_000, 1_800_000];
+      const delays = claimed.jobType === 'active_canary_compare'
+        ? [60_000, 300_000, 1_800_000]
+        : [300_000, 1_800_000];
       this.store.failConsolidationJob({
         jobId: claimed.jobId,
         workerId: this.workerId,
@@ -66,6 +164,20 @@ export class ShadowDispatcher {
         errorCode: String(error?.code || error?.name || 'SHADOW_FAILED'),
         nextDueAt: attempt <= delays.length ? this.clock() + delays[attempt - 1] : this.clock()
       });
+      if (claimed.jobType === 'active_canary_compare' && attempt > delays.length
+        && this.promotionController) {
+        const turn = claimed.turnId ? this.store.getTurn(claimed.turnId) : null;
+        if (turn?.pipelineMode === 'active') {
+          this.promotionController.recordActivePipelineFailure({
+            subjectType: 'turn',
+            subjectId: turn.turnId,
+            errorCode: String(error?.code || 'CANARY_COMPARE_UNAVAILABLE'),
+            failureClass: 'pipeline_unavailable',
+            report: { summary: { comparisonJobId: claimed.jobId } },
+            now: this.clock()
+          });
+        }
+      }
       return null;
     }
   }

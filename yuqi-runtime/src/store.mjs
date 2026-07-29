@@ -1137,6 +1137,133 @@ export class YuqiStore {
     });
   }
 
+  recordActiveTransientFailureInternal({
+    rolloutKey,
+    expectedRevision,
+    subjectId,
+    errorCode,
+    report = {},
+    now: failedAt = now()
+  }) {
+    return this.transaction(() => {
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(String(rolloutKey));
+      if (!current || Number(current.revision) !== Number(expectedRevision)) {
+        throw new RolloutRevisionConflictError();
+      }
+      const withinWindow = current.active_transient_window_started_at !== null
+        && Number(failedAt) - Number(current.active_transient_window_started_at) <= 15 * 60 * 1000;
+      const count = withinWindow ? Number(current.active_transient_failure_count) + 1 : 1;
+      const windowStartedAt = withinWindow
+        ? Number(current.active_transient_window_started_at)
+        : Number(failedAt);
+      const rollback = count >= 3;
+      const nextRevision = Number(current.revision) + 1;
+      let reportId = null;
+      let reportChecksum = null;
+      if (rollback) {
+        const summary = {
+          rolloutKey,
+          subjectId,
+          errorCode,
+          failureClass: 'transient',
+          consecutiveCount: count,
+          windowStartedAt,
+          ...report.summary
+        };
+        reportId = report.reportId || `report_active_failure_${contentHash({
+          rolloutKey, subjectId, count, failedAt
+        }).slice(0, 24)}`;
+        const stored = this.putEvaluationReportInternal({
+          reportId,
+          reportType: 'active_failure',
+          rolloutKey,
+          sourceType: 'active_subject',
+          sourceRef: subjectId,
+          artifactPath: report.artifactPath || '',
+          summary,
+          createdAt: failedAt
+        });
+        reportChecksum = stored.artifactChecksum;
+      }
+      const update = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET current_mode = CASE WHEN ? = 1 THEN 'shadow' ELSE current_mode END,
+            rollout_phase = CASE WHEN ? = 1 THEN 'rolled_back' ELSE rollout_phase END,
+            revision = ?,
+            shadow_epoch = shadow_epoch + ?,
+            active_transient_failure_count = CASE WHEN ? = 1 THEN 0 ELSE ? END,
+            active_transient_window_started_at = CASE WHEN ? = 1 THEN NULL ELSE ? END,
+            last_report_id = COALESCE(?, last_report_id),
+            last_report_checksum = COALESCE(?, last_report_checksum),
+            rolled_back_at = CASE WHEN ? = 1 THEN ? ELSE rolled_back_at END,
+            last_reason_code = ?, updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(
+        rollback ? 1 : 0,
+        rollback ? 1 : 0,
+        nextRevision,
+        rollback ? 1 : 0,
+        rollback ? 1 : 0, count,
+        rollback ? 1 : 0, windowStartedAt,
+        reportId, reportChecksum,
+        rollback ? 1 : 0, Number(failedAt),
+        rollback ? errorCode : 'active_transient_failure',
+        Number(failedAt), rolloutKey, Number(expectedRevision)
+      );
+      if (Number(update.changes) !== 1) throw new RolloutRevisionConflictError();
+      if (rollback) {
+        this.appendPromotionHistoryInternal({
+          eventId: `promotion_${contentHash({ rolloutKey, subjectId, failedAt }).slice(0, 24)}`,
+          rolloutKey,
+          fromMode: current.current_mode,
+          toMode: 'shadow',
+          fromPhase: current.rollout_phase,
+          toPhase: 'rolled_back',
+          fromRevision: Number(current.revision),
+          toRevision: nextRevision,
+          actor: 'orchestrator',
+          reasonCode: errorCode,
+          reportId,
+          reportChecksum,
+          metadata: { consecutiveCount: count },
+          createdAt: failedAt
+        });
+      }
+      return { rolledBack: rollback, rollout: this.getCognitionRollout(rolloutKey) };
+    });
+  }
+
+  resetActiveTransientFailuresInternal({
+    rolloutKey,
+    pipelineChecksum,
+    evidenceEpoch,
+    now: resetAt = now()
+  }) {
+    return this.transaction(() => {
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(String(rolloutKey));
+      if (!current
+        || current.current_mode !== 'active'
+        || current.pipeline_checksum !== pipelineChecksum
+        || Number(current.evidence_epoch) !== Number(evidenceEpoch)
+        || Number(current.active_transient_failure_count) === 0) {
+        return { reset: false, rollout: mapCognitionRollout(current) };
+      }
+      const result = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET revision = revision + 1, active_transient_failure_count = 0,
+            active_transient_window_started_at = NULL,
+            last_reason_code = 'active_pipeline_recovered', updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(Number(resetAt), rolloutKey, Number(current.revision));
+      if (Number(result.changes) !== 1) throw new RolloutRevisionConflictError();
+      return { reset: true, rollout: this.getCognitionRollout(rolloutKey) };
+    });
+  }
+
   submitTurn(input, pin = {}) {
     const envelope = validateEnvelope(input);
     const envelopeChecksum = contentHash(envelope);
@@ -2529,6 +2656,12 @@ export class YuqiStore {
     });
   }
 
+  getConsolidationJob(jobId) {
+    return mapConsolidationJob(this.db.prepare(
+      'SELECT * FROM consolidation_jobs WHERE job_id = ?'
+    ).get(String(jobId)));
+  }
+
   completeConsolidationJob({ jobId, workerId, now: completedAt = now() }) {
     return this.transaction(() => {
       const result = this.db.prepare(`
@@ -2616,6 +2749,155 @@ export class YuqiStore {
     return mapShadowRun(
       this.db.prepare('SELECT * FROM cognition_shadow_runs WHERE run_id = ?').get(runId)
     );
+  }
+
+  recordComparisonOutcomeInternal({
+    jobId,
+    workerId,
+    run,
+    report,
+    criticalFindings = [],
+    now: recordedAt = now()
+  }) {
+    return this.transaction(() => {
+      const job = this.db.prepare(
+        'SELECT * FROM consolidation_jobs WHERE job_id = ?'
+      ).get(String(jobId));
+      if (!job || job.state !== 'running' || job.lease_owner !== workerId) {
+        throw new Error('comparison job lease is not held');
+      }
+      if (contentHash(parseJson(job.payload_json, {})) !== job.payload_checksum) {
+        throw new Error('comparison job payload checksum mismatch');
+      }
+      const payload = parseJson(job.payload_json, {});
+      const rollout = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(payload.rolloutKey);
+      const shadowDirection = payload.comparisonDirection
+        === 'legacy_authoritative_cognition_compare';
+      const validEpoch = Boolean(rollout)
+        && Number(rollout.evidence_epoch) === Number(payload.rolloutEvidenceEpoch)
+        && rollout.pipeline_checksum === payload.pipelineChecksum
+        && (
+          shadowDirection
+            ? rollout.current_mode === 'shadow'
+              && Number(rollout.shadow_epoch) === Number(payload.shadowEpoch)
+            : rollout.current_mode === 'active'
+              && rollout.rollout_phase === 'canary'
+              && Number(rollout.canary_epoch) === Number(payload.canaryEpoch)
+        );
+      const stale = !validEpoch;
+      this.putCognitionShadowRunInternal({
+        ...run,
+        runId: run.runId || `run_${contentHash({ jobId, payload }).slice(0, 24)}`,
+        subjectType: payload.subjectType,
+        subjectId: payload.subjectId,
+        turnId: payload.turnId || null,
+        rolloutKey: payload.rolloutKey,
+        source: 'live',
+        comparisonDirection: payload.comparisonDirection,
+        evidenceEpoch: payload.rolloutEvidenceEpoch,
+        shadowEpoch: payload.shadowEpoch,
+        canaryEpoch: payload.canaryEpoch,
+        canarySlot: payload.canarySlot,
+        rolloutRevision: payload.rolloutRevision,
+        pipelineChecksum: payload.pipelineChecksum,
+        authoritativeResultChecksum: payload.authoritativeResultChecksum,
+        criticalFindings,
+        staleForRollout: stale,
+        state: 'completed',
+        createdAt: recordedAt,
+        updatedAt: recordedAt
+      });
+      const summary = {
+        ...(report.summary || {}),
+        rolloutKey: payload.rolloutKey,
+        jobId,
+        staleForRollout: stale,
+        criticalFindings
+      };
+      const reportId = report.reportId
+        || `report_compare_${contentHash({ jobId, summary }).slice(0, 24)}`;
+      const storedReport = this.putEvaluationReportInternal({
+        reportId,
+        reportType: shadowDirection ? 'live_shadow' : 'active_canary',
+        rolloutKey: payload.rolloutKey,
+        sourceType: 'comparison_run',
+        sourceRef: jobId,
+        artifactPath: report.artifactPath || '',
+        summary,
+        createdAt: recordedAt
+      });
+      if (!stale) {
+        const critical = criticalFindings.length > 0;
+        const rollback = !shadowDirection && critical;
+        const nextMode = rollback ? 'shadow' : rollout.current_mode;
+        const nextPhase = rollback ? 'rolled_back' : rollout.rollout_phase;
+        const nextRevision = Number(rollout.revision) + 1;
+        const update = this.db.prepare(`
+          UPDATE cognition_kind_rollouts
+          SET current_mode = ?, rollout_phase = ?, revision = ?,
+              shadow_epoch = shadow_epoch + ?,
+              live_shadow_first_at = CASE
+                WHEN ? = 1 AND live_shadow_first_at IS NULL THEN ?
+                ELSE live_shadow_first_at
+              END,
+              live_shadow_last_at = CASE WHEN ? = 1 THEN ? ELSE live_shadow_last_at END,
+              live_shadow_success_count = live_shadow_success_count + ?,
+              live_shadow_failure_count = live_shadow_failure_count + ?,
+              canary_completed_count = canary_completed_count + ?,
+              canary_failure_count = canary_failure_count + ?,
+              last_report_id = ?, last_report_checksum = ?,
+              rolled_back_at = CASE WHEN ? = 1 THEN ? ELSE rolled_back_at END,
+              last_reason_code = ?, updated_at = ?
+          WHERE rollout_key = ? AND revision = ?
+        `).run(
+          nextMode, nextPhase, nextRevision,
+          rollback ? 1 : 0,
+          shadowDirection ? 1 : 0, Number(recordedAt),
+          shadowDirection ? 1 : 0, Number(recordedAt),
+          shadowDirection && !critical ? 1 : 0,
+          shadowDirection && critical ? 1 : 0,
+          !shadowDirection && !critical ? 1 : 0,
+          !shadowDirection && critical ? 1 : 0,
+          reportId, storedReport.artifactChecksum,
+          rollback ? 1 : 0, Number(recordedAt),
+          rollback ? criticalFindings[0]?.code || 'ACTIVE_PRECOMMIT_CRITICAL' : 'comparison_recorded',
+          Number(recordedAt), payload.rolloutKey, Number(rollout.revision)
+        );
+        if (Number(update.changes) !== 1) throw new RolloutRevisionConflictError();
+        if (rollback) {
+          this.appendPromotionHistoryInternal({
+            eventId: `promotion_${contentHash({ jobId, reportId, recordedAt }).slice(0, 24)}`,
+            rolloutKey: payload.rolloutKey,
+            fromMode: rollout.current_mode,
+            toMode: 'shadow',
+            fromPhase: rollout.rollout_phase,
+            toPhase: 'rolled_back',
+            fromRevision: Number(rollout.revision),
+            toRevision: nextRevision,
+            actor: 'comparison_evaluator',
+            reasonCode: criticalFindings[0]?.code || 'ACTIVE_PRECOMMIT_CRITICAL',
+            reportId,
+            reportChecksum: storedReport.artifactChecksum,
+            metadata: { jobId },
+            createdAt: recordedAt
+          });
+        }
+      }
+      this.db.prepare(`
+        UPDATE consolidation_jobs
+        SET state = 'completed', lease_owner = NULL, lease_expires_at = NULL,
+            last_error_code = NULL, updated_at = ?
+        WHERE job_id = ? AND state = 'running' AND lease_owner = ?
+      `).run(Number(recordedAt), jobId, workerId);
+      return {
+        run: this.getCognitionShadowRun(run.runId || `run_${contentHash({ jobId, payload }).slice(0, 24)}`),
+        report: this.getEvaluationReport(reportId),
+        rollout: this.getCognitionRollout(payload.rolloutKey),
+        staleForRollout: stale
+      };
+    });
   }
 
   listLiveShadowRuns({ rolloutKey, direction, since = 0 }) {

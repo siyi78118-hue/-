@@ -67,6 +67,7 @@ const consolidationWorker = new ConsolidationWorker({
 const shadowDispatcher = new ShadowDispatcher({
   store,
   cognitivePipeline,
+  promotionController,
   foregroundActivity: { isBusy: () => dispatcher.inflight.size > 0 }
 });
 const explicitProxy = config.cloudRelay?.proxy?.enabled === true;

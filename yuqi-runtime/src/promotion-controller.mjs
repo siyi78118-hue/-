@@ -230,5 +230,93 @@ export class PromotionController {
       now: this.clock()
     });
   }
-}
 
+  recordComparisonOutcome({
+    jobId,
+    workerId,
+    run,
+    report = {},
+    criticalFindings = [],
+    now = this.clock()
+  }) {
+    return this.store.recordComparisonOutcomeInternal({
+      jobId,
+      workerId,
+      run,
+      report,
+      criticalFindings,
+      now
+    });
+  }
+
+  recordActivePipelineFailure({
+    subjectType,
+    subjectId,
+    errorCode,
+    failureClass,
+    report = {},
+    now = this.clock()
+  }) {
+    if (subjectType !== 'turn') throw new Error('unsupported active subject type');
+    const subject = this.store.getTurn(subjectId);
+    if (!subject || subject.pipelineMode !== 'active' || !subject.rolloutKey) {
+      return { staleForRollout: true, rolledBack: false };
+    }
+    const rollout = this.getStatus(subject.rolloutKey);
+    const matching = rollout
+      && rollout.pipelineChecksum === subject.pipelineChecksum
+      && rollout.evidenceEpoch === subject.rolloutEvidenceEpoch
+      && (rollout.rolloutPhase !== 'canary' || rollout.canaryEpoch === subject.canaryEpoch);
+    if (!matching) return { staleForRollout: true, rolledBack: false };
+    const deterministic = ['deterministic', 'preset_unavailable', 'pipeline_unavailable'].includes(failureClass);
+    const immediate = rollout.rolloutPhase === 'canary' || deterministic;
+    if (!immediate) {
+      return this.store.recordActiveTransientFailureInternal({
+        rolloutKey: rollout.rolloutKey,
+        expectedRevision: rollout.revision,
+        subjectId,
+        errorCode,
+        report,
+        now
+      });
+    }
+    const summary = { subjectType, subjectId, errorCode, failureClass, ...report.summary };
+    const reportId = report.reportId
+      || `report_active_failure_${contentHash({ ...summary, now }).slice(0, 24)}`;
+    const stored = this.store.putEvaluationReportInternal({
+      reportId,
+      reportType: 'active_failure',
+      rolloutKey: rollout.rolloutKey,
+      sourceType: 'active_subject',
+      sourceRef: subjectId,
+      artifactPath: report.artifactPath || '',
+      summary,
+      createdAt: now
+    });
+    const transitioned = this.store.transitionCognitionRolloutInternal({
+      rolloutKey: rollout.rolloutKey,
+      expectedRevision: rollout.revision,
+      toMode: 'shadow',
+      toPhase: 'rolled_back',
+      actor: 'orchestrator',
+      reasonCode: errorCode || 'ACTIVE_PRECOMMIT_CRITICAL',
+      reportId,
+      reportChecksum: stored.artifactChecksum,
+      metadata: summary,
+      now
+    });
+    return { staleForRollout: false, rolledBack: true, rollout: transitioned };
+  }
+
+  recordActivePipelineSuccess({ subjectType, subjectId, now = this.clock() }) {
+    if (subjectType !== 'turn') return { reset: false };
+    const subject = this.store.getTurn(subjectId);
+    if (!subject?.rolloutKey || subject.pipelineMode !== 'active') return { reset: false };
+    return this.store.resetActiveTransientFailuresInternal({
+      rolloutKey: subject.rolloutKey,
+      pipelineChecksum: subject.pipelineChecksum,
+      evidenceEpoch: subject.rolloutEvidenceEpoch,
+      now
+    });
+  }
+}

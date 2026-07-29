@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { ShadowDispatcher } from '../src/shadow-dispatcher.mjs';
+import { contentHash } from '../src/protocol.mjs';
 
 function fixture({ busy = false, failure = null, attemptCount = 1 } = {}) {
   const events = [];
@@ -67,3 +68,97 @@ test('shadow failures use two delays and fail permanently on the third attempt',
     assert.equal(events[0].input.nextDueAt, expectedDueAt);
   }
 });
+
+for (const scenario of [
+  {
+    name: 'shadow runs cognition behind a legacy authoritative result',
+    jobType: 'shadow_cognition',
+    comparisonMode: 'cognition_compare',
+    comparisonPipeline: 'cognition',
+    direction: 'legacy_authoritative_cognition_compare'
+  },
+  {
+    name: 'active canary runs legacy behind a cognition authoritative result',
+    jobType: 'active_canary_compare',
+    comparisonMode: 'legacy_compare',
+    comparisonPipeline: 'legacy',
+    direction: 'cognition_authoritative_legacy_compare'
+  }
+]) {
+  test(scenario.name, async () => {
+    const envelope = {
+      protocolVersion: 2,
+      turnId: 'turn_compare',
+      characterId: 'yuqi',
+      deviceId: 'phone',
+      deviceSeq: 1,
+      createdAt: 1,
+      kind: 'DIRECT_REPLY',
+      message: {
+        messageId: 'msg_compare',
+        speakerId: 'user',
+        speakerType: 'user',
+        recipientId: 'yuqi',
+        content: '测试',
+        sentAt: 1
+      }
+    };
+    const turn = {
+      turnId: envelope.turnId,
+      envelopeJson: JSON.stringify(envelope),
+      replyJson: JSON.stringify({ reply: { content: '权威结果' } }),
+      route: 'deep',
+      routeReasons: [],
+      presetVersion: '2.0.0',
+      annotationSnapshot: {}
+    };
+    const payload = {
+      subjectType: 'turn',
+      subjectId: turn.turnId,
+      turnId: turn.turnId,
+      rolloutKey: 'DIRECT_REPLY',
+      comparisonDirection: scenario.direction,
+      comparisonPipeline: scenario.comparisonPipeline,
+      comparisonMode: scenario.comparisonMode,
+      authoritativeResultChecksum: contentHash(JSON.parse(turn.replyJson)),
+      inputChecksum: contentHash({
+        envelope,
+        route: turn.route,
+        routeReasons: turn.routeReasons,
+        presetVersion: turn.presetVersion,
+        annotationSnapshot: turn.annotationSnapshot
+      })
+    };
+    let recorded = null;
+    const dispatcher = new ShadowDispatcher({
+      store: {
+        claimDueConsolidationJob() {
+          if (recorded) return null;
+          return {
+            jobId: 'job_compare',
+            jobType: scenario.jobType,
+            turnId: turn.turnId,
+            attemptCount: 1,
+            payload
+          };
+        },
+        getTurn: () => turn,
+        getCurrentUserBatch: () => ({ messageIds: ['msg_compare'] }),
+        putDiagnostic() {}
+      },
+      cognitivePipeline: {},
+      comparisonExecutor: async ({ payload: fixed }) => ({
+        reply: { content: `dry ${fixed.comparisonPipeline}` },
+        usedMessageIds: ['msg_compare'],
+        schemaValid: true
+      }),
+      promotionController: {
+        recordComparisonOutcome(input) { recorded = input; }
+      },
+      clock: () => 1_000
+    });
+    await dispatcher.runOnce();
+    assert.equal(recorded.criticalFindings.length, 0);
+    assert.equal(recorded.run.metrics.schemaValid, true);
+  });
+}
