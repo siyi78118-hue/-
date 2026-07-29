@@ -2615,6 +2615,9 @@ function withOptionalTemperature(payload, enabled, value) {
 function nativeTurnIdForMessage(messageId) {
   return `turn_${String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
+function nativeRetryRootTurnId(messageId) {
+  return nativeTurnIdForMessage(messageId);
+}
 function nativeRetryTurnIdForMessage(messageId) {
   const source = String(messageId || '').replace(/[^a-zA-Z0-9_-]/g, '_').slice(-48);
   return `turn_retry_${source}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 9)}`;
@@ -7757,7 +7760,7 @@ async function retryFailedReply(charId, userMessageId) {
   const savedOptions = oldPending?.options || {};
   const retryStartedAt = Date.now();
   const nativeRetry = isNativeApp();
-  const retryOfTurnId = nativeRetry ? (oldPending?.nativeTurnId || nativeTurnIdForMessage(userMessageId)) : '';
+  const retryOfTurnId = nativeRetry ? nativeRetryRootTurnId(userMessageId) : '';
   const retryLineageTurnIds = nativeRetry ? [...new Set([
     ...(Array.isArray(oldPending?.retryLineageTurnIds) ? oldPending.retryLineageTurnIds : []),
     retryOfTurnId

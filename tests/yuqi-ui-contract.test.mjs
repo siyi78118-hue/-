@@ -196,6 +196,21 @@ test('native retry creates a fresh execution turn for the canonical message', ()
   assert.doesNotMatch(retry, /plugin\.retryTurn/);
 });
 
+test('every manual retry anchors to the original deterministic message turn', () => {
+  const helpersStart = html.indexOf('function nativeTurnIdForMessage');
+  const helpersEnd = html.indexOf('async function saveNativeExecutionApiConfigs');
+  const retry = html.slice(html.indexOf('async function retryFailedReply'), html.indexOf('function showReplyFailureReason'));
+  assert.ok(helpersStart >= 0 && helpersEnd > helpersStart);
+  const helpers = new Function(
+    `${html.slice(helpersStart, helpersEnd)}
+     return { nativeTurnIdForMessage, nativeRetryRootTurnId };`
+  )();
+
+  assert.equal(helpers.nativeRetryRootTurnId('msg_phone_1'), helpers.nativeTurnIdForMessage('msg_phone_1'));
+  assert.match(retry, /const\s+retryOfTurnId\s*=\s*nativeRetry\s*\?\s*nativeRetryRootTurnId\(userMessageId\)\s*:\s*''/);
+  assert.doesNotMatch(retry, /retryOfTurnId\s*=\s*nativeRetry\s*\?\s*\(oldPending\?\.nativeTurnId/);
+});
+
 test('Room persists fresh retry turns and only deduplicates an exact turn id', () => {
   assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
   assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
