@@ -256,6 +256,31 @@ export class PresetRegistry {
     return clone(preset);
   }
 
+  evidenceManifest(rolloutKey) {
+    const preset = this.current();
+    const modules = preset.modules || {};
+    const shared = {
+      cognitionPresetChecksum: contentHash(modules.cognition || modules.brain || {}),
+      expressionPresetChecksum: contentHash(modules.expression || modules.brain || {}),
+      supervisorPresetChecksum: contentHash(modules.supervisor || {}),
+      schemaAdapterBundleChecksum: contentHash({
+        rolloutKey,
+        schema: modules.socialExperience || {},
+        life: rolloutKey === 'LIFE_PLANNING' ? modules.lifePlanning || modules.memory || {} : null
+      }),
+      modelProfileChecksum: contentHash(modules.modelProfiles || {}),
+      approvedAnnotationCatalogChecksum: contentHash(preset.annotationIds || []),
+      comparisonEvaluatorChecksum: contentHash({ evaluator: 'yuqi-cognition-v2', schemaVersion: 1 }),
+      legacyBaselineChecksum: contentHash({
+        foundation: modules.foundation || {},
+        brain: modules.brain || {},
+        memory: modules.memory || {},
+        supervisor: modules.supervisor || {}
+      })
+    };
+    return { manifest: shared, checksum: contentHash(shared), presetVersion: preset.version };
+  }
+
   resolvePresetBundle({ role, version, annotations = [] }) {
     const preset = this.store.getPresetVersion(version);
     if (!preset) throw new Error(`preset version is unavailable: ${version}`);

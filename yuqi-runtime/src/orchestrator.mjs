@@ -368,7 +368,7 @@ export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
     generationContextLimit = 20, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null,
-    lifePlanningEnabled = true, cognitivePipeline = null
+    lifePlanningEnabled = true, cognitivePipeline = null, promotionController = null
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
@@ -386,10 +386,17 @@ export class YuqiOrchestrator {
     this.brainRolePromise = null;
     this.turnImagePaths = new Map();
     this.cognitivePipeline = cognitivePipeline;
+    this.promotionController = promotionController;
   }
 
   accept(envelope) {
-    let submitted = this.store.submitTurn(envelope);
+    let submitted = this.promotionController
+      ? this.promotionController.createTurn({
+        envelope,
+        presetVersion: this.presets.current().version,
+        annotationSnapshot: {}
+      })
+      : this.store.submitTurn(envelope);
     if (submitted.state === 'failed') {
       const recovery = this.store.requeueTransientFailedTurn(submitted.turnId);
       if (recovery.requeued) submitted = recovery.turn;

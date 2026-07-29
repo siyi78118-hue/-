@@ -9,6 +9,7 @@ import { CloudRelayPump } from './cloud-relay-pump.mjs';
 import { createYuqiServer } from './local-server.mjs';
 import { YuqiOrchestrator } from './orchestrator.mjs';
 import { PresetRegistry } from './preset-registry.mjs';
+import { PromotionController } from './promotion-controller.mjs';
 import { YuqiReconciler } from './reconcile.mjs';
 import { ResultOutbox } from './result-outbox.mjs';
 import { selectTurnRoute } from './route-policy.mjs';
@@ -27,6 +28,12 @@ mkdirSync(dirname(databasePath), { recursive: true });
 
 const store = new YuqiStore(databasePath);
 const presets = new PresetRegistry({ presetDir: join(runtimeDir, 'presets'), store });
+const promotionController = new PromotionController({
+  store,
+  presetRegistry: presets,
+  bootstrap: config.cognitionRuntime?.rolloutBootstrap || {}
+});
+promotionController.initialize();
 const codex = new CodexAppServerClient({
   store,
   command: config.codexCommand || 'codex',
@@ -44,6 +51,7 @@ const orchestrator = new YuqiOrchestrator({
   presets,
   codex,
   cognitivePipeline,
+  promotionController,
   contextLimit: 200,
   generationContextLimit: 20,
   roleProfiles: config.roleProfiles

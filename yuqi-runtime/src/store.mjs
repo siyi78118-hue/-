@@ -41,6 +41,14 @@ function mapTurn(row) {
     route: row.route || 'deep',
     routeReasons: parseJson(row.route_reasons_json, []),
     pipelineMode: row.pipeline_mode || 'legacy',
+    rolloutKey: row.rollout_key || null,
+    comparisonMode: row.comparison_mode || 'none',
+    rolloutRevision: Number(row.rollout_revision || 0),
+    rolloutEvidenceEpoch: Number(row.rollout_evidence_epoch || 0),
+    pipelineChecksum: row.pipeline_checksum || '',
+    shadowEpoch: row.shadow_epoch ?? null,
+    canaryEpoch: row.canary_epoch ?? null,
+    canarySlot: row.canary_slot ?? null,
     presetVersion: row.preset_version || '1.9.1',
     annotationSnapshot: parseJson(row.annotation_snapshot_json, {}),
     workerId: row.worker_id || '',
@@ -55,6 +63,67 @@ function mapTurn(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function mapCognitionRollout(row) {
+  if (!row) return null;
+  return {
+    rolloutKey: row.rollout_key,
+    currentMode: row.current_mode,
+    rolloutPhase: row.rollout_phase,
+    revision: Number(row.revision),
+    presetVersion: row.preset_version,
+    pipelineChecksum: row.pipeline_checksum,
+    evidenceEpoch: Number(row.evidence_epoch),
+    shadowEpoch: Number(row.shadow_epoch),
+    liveShadowFirstAt: row.live_shadow_first_at ?? null,
+    liveShadowLastAt: row.live_shadow_last_at ?? null,
+    liveShadowSuccessCount: Number(row.live_shadow_success_count),
+    liveShadowFailureCount: Number(row.live_shadow_failure_count),
+    canaryEpoch: Number(row.canary_epoch),
+    canaryTargetCount: Number(row.canary_target_count),
+    canaryMaxOutstanding: Number(row.canary_max_outstanding),
+    canaryCompareDeadlineMs: Number(row.canary_compare_deadline_ms),
+    canaryStartedCount: Number(row.canary_started_count),
+    canaryCompletedCount: Number(row.canary_completed_count),
+    canaryFailureCount: Number(row.canary_failure_count),
+    canaryStartedAt: row.canary_started_at ?? null,
+    canaryObserveUntil: row.canary_observe_until ?? null,
+    activeTransientFailureCount: Number(row.active_transient_failure_count),
+    activeTransientWindowStartedAt: row.active_transient_window_started_at ?? null,
+    lastReportId: row.last_report_id || null,
+    lastReportChecksum: row.last_report_checksum || null,
+    activatedAt: row.activated_at ?? null,
+    rolledBackAt: row.rolled_back_at ?? null,
+    lastReasonCode: row.last_reason_code,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapEvaluationReport(row) {
+  if (!row) return null;
+  return {
+    reportId: row.report_id,
+    reportType: row.report_type,
+    rolloutKey: row.rollout_key || null,
+    sourceType: row.source_type,
+    sourceRef: row.source_ref,
+    artifactPath: row.artifact_path,
+    artifactChecksum: row.artifact_checksum,
+    artifactState: row.artifact_state,
+    summary: parseJson(row.summary_json, {}),
+    createdAt: row.created_at,
+    materializedAt: row.materialized_at ?? null,
+    lastArtifactErrorCode: row.last_artifact_error_code || null
+  };
+}
+
+export class RolloutRevisionConflictError extends Error {
+  constructor(message = 'rollout revision conflict') {
+    super(message);
+    this.name = 'RolloutRevisionConflictError';
+  }
 }
 
 function mapCognitiveState(row) {
@@ -573,6 +642,86 @@ export class YuqiStore {
         UNIQUE(subject_type, subject_id, comparison_direction),
         CHECK(subject_type IN ('turn', 'life_planning'))
       );
+
+      CREATE TABLE IF NOT EXISTS cognition_kind_rollouts (
+        rollout_key TEXT PRIMARY KEY,
+        current_mode TEXT NOT NULL,
+        rollout_phase TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        preset_version TEXT NOT NULL,
+        pipeline_checksum TEXT NOT NULL,
+        evidence_epoch INTEGER NOT NULL DEFAULT 1,
+        shadow_epoch INTEGER NOT NULL DEFAULT 0,
+        live_shadow_first_at INTEGER,
+        live_shadow_last_at INTEGER,
+        live_shadow_success_count INTEGER NOT NULL DEFAULT 0,
+        live_shadow_failure_count INTEGER NOT NULL DEFAULT 0,
+        canary_epoch INTEGER NOT NULL DEFAULT 0,
+        canary_target_count INTEGER NOT NULL DEFAULT 10,
+        canary_max_outstanding INTEGER NOT NULL DEFAULT 3,
+        canary_compare_deadline_ms INTEGER NOT NULL DEFAULT 900000,
+        canary_started_count INTEGER NOT NULL DEFAULT 0,
+        canary_completed_count INTEGER NOT NULL DEFAULT 0,
+        canary_failure_count INTEGER NOT NULL DEFAULT 0,
+        canary_started_at INTEGER,
+        canary_observe_until INTEGER,
+        active_transient_failure_count INTEGER NOT NULL DEFAULT 0,
+        active_transient_window_started_at INTEGER,
+        last_report_id TEXT,
+        last_report_checksum TEXT,
+        activated_at INTEGER,
+        rolled_back_at INTEGER,
+        last_reason_code TEXT NOT NULL DEFAULT 'bootstrap',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        CHECK(current_mode IN ('legacy', 'shadow', 'active')),
+        CHECK(rollout_phase IN ('stable', 'collecting', 'canary', 'rolled_back'))
+      );
+
+      CREATE TABLE IF NOT EXISTS cognition_promotion_history (
+        event_id TEXT PRIMARY KEY,
+        rollout_key TEXT NOT NULL,
+        from_mode TEXT NOT NULL,
+        to_mode TEXT NOT NULL,
+        from_phase TEXT NOT NULL,
+        to_phase TEXT NOT NULL,
+        from_revision INTEGER NOT NULL,
+        to_revision INTEGER NOT NULL,
+        actor TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        report_id TEXT,
+        report_checksum TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at INTEGER NOT NULL
+      );
+      CREATE TRIGGER IF NOT EXISTS cognition_promotion_history_no_update
+      BEFORE UPDATE ON cognition_promotion_history
+      BEGIN
+        SELECT RAISE(ABORT, 'promotion history is append-only');
+      END;
+      CREATE TRIGGER IF NOT EXISTS cognition_promotion_history_no_delete
+      BEFORE DELETE ON cognition_promotion_history
+      BEGIN
+        SELECT RAISE(ABORT, 'promotion history is append-only');
+      END;
+
+      CREATE TABLE IF NOT EXISTS cognition_evaluation_reports (
+        report_id TEXT PRIMARY KEY,
+        report_type TEXT NOT NULL,
+        rollout_key TEXT,
+        source_type TEXT NOT NULL,
+        source_ref TEXT NOT NULL,
+        artifact_path TEXT NOT NULL,
+        artifact_checksum TEXT NOT NULL,
+        artifact_state TEXT NOT NULL DEFAULT 'pending',
+        summary_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        materialized_at INTEGER,
+        last_artifact_error_code TEXT,
+        CHECK(report_type IN ('replay', 'live_shadow', 'active_canary', 'active_failure', 'promotion')),
+        CHECK(source_type IN ('comparison_run', 'active_subject', 'replay_batch', 'aggregate_gate', 'promotion_snapshot')),
+        CHECK(artifact_state IN ('pending', 'materialized'))
+      );
     `);
 
     const factColumns = new Set(this.db.prepare('PRAGMA table_info(facts)').all().map(row => row.name));
@@ -583,6 +732,14 @@ export class YuqiStore {
     if (!turnColumns.has('pipeline_mode')) this.db.exec("ALTER TABLE turns ADD COLUMN pipeline_mode TEXT NOT NULL DEFAULT 'legacy';");
     if (!turnColumns.has('preset_version')) this.db.exec("ALTER TABLE turns ADD COLUMN preset_version TEXT NOT NULL DEFAULT '1.9.1';");
     if (!turnColumns.has('annotation_snapshot_json')) this.db.exec("ALTER TABLE turns ADD COLUMN annotation_snapshot_json TEXT NOT NULL DEFAULT '{}';");
+    if (!turnColumns.has('rollout_key')) this.db.exec('ALTER TABLE turns ADD COLUMN rollout_key TEXT;');
+    if (!turnColumns.has('comparison_mode')) this.db.exec("ALTER TABLE turns ADD COLUMN comparison_mode TEXT NOT NULL DEFAULT 'none';");
+    if (!turnColumns.has('rollout_revision')) this.db.exec('ALTER TABLE turns ADD COLUMN rollout_revision INTEGER NOT NULL DEFAULT 0;');
+    if (!turnColumns.has('rollout_evidence_epoch')) this.db.exec('ALTER TABLE turns ADD COLUMN rollout_evidence_epoch INTEGER NOT NULL DEFAULT 0;');
+    if (!turnColumns.has('pipeline_checksum')) this.db.exec("ALTER TABLE turns ADD COLUMN pipeline_checksum TEXT NOT NULL DEFAULT '';");
+    if (!turnColumns.has('shadow_epoch')) this.db.exec('ALTER TABLE turns ADD COLUMN shadow_epoch INTEGER;');
+    if (!turnColumns.has('canary_epoch')) this.db.exec('ALTER TABLE turns ADD COLUMN canary_epoch INTEGER;');
+    if (!turnColumns.has('canary_slot')) this.db.exec('ALTER TABLE turns ADD COLUMN canary_slot INTEGER;');
     const deliveryColumns = new Set(this.db.prepare('PRAGMA table_info(cloud_deliveries)').all().map(row => row.name));
     if (!deliveryColumns.has('confirmed_at')) this.db.exec('ALTER TABLE cloud_deliveries ADD COLUMN confirmed_at INTEGER;');
     const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(sessions)').all().map(row => row.name));
@@ -611,8 +768,21 @@ export class YuqiStore {
         AND legacy.character_id = canonical.character_id
         AND legacy.content = canonical.content
         AND legacy.turn_id = canonical.turn_id;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_rollout_canary_slot
+      ON turns(rollout_key, canary_epoch, canary_slot)
+      WHERE canary_slot IS NOT NULL;
+
+      UPDATE turns
+      SET rollout_key = json_extract(envelope_json, '$.kind')
+      WHERE rollout_key IS NULL
+        AND json_extract(envelope_json, '$.kind') IN (
+          'DIRECT_REPLY', 'ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT',
+          'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE',
+          'PROACTIVE_CHAT', 'PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'
+        );
     `);
-    this.db.exec('PRAGMA user_version = 6;');
+    this.db.exec('PRAGMA user_version = 7;');
   }
 
   transaction(run) {
@@ -635,6 +805,328 @@ export class YuqiStore {
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(entityType, entityId, operation, payloadJson, checksum, now());
     return Number(result.lastInsertRowid);
+  }
+
+  getCognitionRollout(rolloutKey) {
+    return mapCognitionRollout(this.db.prepare(
+      'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+    ).get(String(rolloutKey || '')));
+  }
+
+  listCognitionRollouts() {
+    return this.db.prepare(
+      'SELECT * FROM cognition_kind_rollouts ORDER BY rollout_key'
+    ).all().map(mapCognitionRollout);
+  }
+
+  listPromotionHistory(rolloutKey = null) {
+    const rows = rolloutKey
+      ? this.db.prepare(
+        'SELECT * FROM cognition_promotion_history WHERE rollout_key = ? ORDER BY created_at, event_id'
+      ).all(String(rolloutKey))
+      : this.db.prepare(
+        'SELECT * FROM cognition_promotion_history ORDER BY created_at, event_id'
+      ).all();
+    return rows.map(row => ({
+      eventId: row.event_id,
+      rolloutKey: row.rollout_key,
+      fromMode: row.from_mode,
+      toMode: row.to_mode,
+      fromPhase: row.from_phase,
+      toPhase: row.to_phase,
+      fromRevision: Number(row.from_revision),
+      toRevision: Number(row.to_revision),
+      actor: row.actor,
+      reasonCode: row.reason_code,
+      reportId: row.report_id || null,
+      reportChecksum: row.report_checksum || null,
+      metadata: parseJson(row.metadata_json, {}),
+      createdAt: row.created_at
+    }));
+  }
+
+  initializeCognitionRolloutsInternal({ rows, now: initializedAt = now() }) {
+    if (!Array.isArray(rows) || !rows.length) throw new Error('rollout rows are required');
+    return this.transaction(() => {
+      if (Number(this.db.prepare('SELECT COUNT(*) AS value FROM cognition_kind_rollouts').get().value) > 0) {
+        return this.listCognitionRollouts();
+      }
+      const insert = this.db.prepare(`
+        INSERT INTO cognition_kind_rollouts(
+          rollout_key, current_mode, rollout_phase, revision, preset_version,
+          pipeline_checksum, evidence_epoch, shadow_epoch, canary_epoch,
+          last_reason_code, created_at, updated_at
+        ) VALUES (?, ?, ?, 1, ?, ?, 1, 0, 0, 'bootstrap', ?, ?)
+      `);
+      const history = this.db.prepare(`
+        INSERT INTO cognition_promotion_history(
+          event_id, rollout_key, from_mode, to_mode, from_phase, to_phase,
+          from_revision, to_revision, actor, reason_code, metadata_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, 1, 'bootstrap', 'bootstrap', '{}', ?)
+      `);
+      for (const row of rows) {
+        insert.run(
+          row.rolloutKey,
+          row.currentMode || 'legacy',
+          row.rolloutPhase || 'stable',
+          row.presetVersion || '1.9.1',
+          row.pipelineChecksum || '',
+          Number(initializedAt),
+          Number(initializedAt)
+        );
+        history.run(
+          `promotion_bootstrap_${contentHash(row.rolloutKey).slice(0, 24)}`,
+          row.rolloutKey,
+          row.currentMode || 'legacy',
+          row.currentMode || 'legacy',
+          row.rolloutPhase || 'stable',
+          row.rolloutPhase || 'stable',
+          Number(initializedAt)
+        );
+      }
+      return this.listCognitionRollouts();
+    });
+  }
+
+  appendPromotionHistoryInternal(event) {
+    this.db.prepare(`
+      INSERT INTO cognition_promotion_history(
+        event_id, rollout_key, from_mode, to_mode, from_phase, to_phase,
+        from_revision, to_revision, actor, reason_code, report_id,
+        report_checksum, metadata_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      event.eventId,
+      event.rolloutKey,
+      event.fromMode,
+      event.toMode,
+      event.fromPhase,
+      event.toPhase,
+      Number(event.fromRevision),
+      Number(event.toRevision),
+      event.actor,
+      event.reasonCode,
+      event.reportId || null,
+      event.reportChecksum || null,
+      canonicalJson(event.metadata || {}),
+      Number(event.createdAt || now())
+    );
+  }
+
+  transitionCognitionRolloutInternal({
+    rolloutKey,
+    expectedRevision,
+    toMode,
+    toPhase,
+    actor,
+    reasonCode,
+    reportId = null,
+    reportChecksum = null,
+    metadata = {},
+    now: transitionedAt = now()
+  }) {
+    return this.transaction(() => {
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(String(rolloutKey));
+      if (!current || Number(current.revision) !== Number(expectedRevision)) {
+        throw new RolloutRevisionConflictError();
+      }
+      const newShadowWindow = toMode === 'shadow'
+        && (current.current_mode !== 'shadow' || toPhase !== current.rollout_phase);
+      const newCanary = toMode === 'active' && toPhase === 'canary'
+        && !(current.current_mode === 'active' && current.rollout_phase === 'canary');
+      const nextRevision = Number(current.revision) + 1;
+      const updated = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET current_mode = ?, rollout_phase = ?, revision = ?,
+            shadow_epoch = shadow_epoch + ?,
+            live_shadow_first_at = CASE WHEN ? = 1 THEN NULL ELSE live_shadow_first_at END,
+            live_shadow_last_at = CASE WHEN ? = 1 THEN NULL ELSE live_shadow_last_at END,
+            live_shadow_success_count = CASE WHEN ? = 1 THEN 0 ELSE live_shadow_success_count END,
+            live_shadow_failure_count = CASE WHEN ? = 1 THEN 0 ELSE live_shadow_failure_count END,
+            canary_epoch = canary_epoch + ?,
+            canary_started_count = CASE WHEN ? = 1 THEN 0 ELSE canary_started_count END,
+            canary_completed_count = CASE WHEN ? = 1 THEN 0 ELSE canary_completed_count END,
+            canary_failure_count = CASE WHEN ? = 1 THEN 0 ELSE canary_failure_count END,
+            canary_started_at = CASE WHEN ? = 1 THEN ? ELSE canary_started_at END,
+            canary_observe_until = CASE WHEN ? = 1 THEN ? ELSE canary_observe_until END,
+            last_report_id = ?, last_report_checksum = ?,
+            activated_at = CASE WHEN ? = 'active' THEN ? ELSE activated_at END,
+            rolled_back_at = CASE WHEN ? = 'shadow' AND ? = 'active' THEN ? ELSE rolled_back_at END,
+            last_reason_code = ?, updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(
+        toMode, toPhase, nextRevision,
+        newShadowWindow ? 1 : 0,
+        newShadowWindow ? 1 : 0,
+        newShadowWindow ? 1 : 0,
+        newShadowWindow ? 1 : 0,
+        newShadowWindow ? 1 : 0,
+        newCanary ? 1 : 0,
+        newCanary ? 1 : 0,
+        newCanary ? 1 : 0,
+        newCanary ? 1 : 0,
+        newCanary ? 1 : 0, Number(transitionedAt),
+        newCanary ? 1 : 0, Number(transitionedAt) + 48 * 60 * 60 * 1000,
+        reportId, reportChecksum,
+        toMode, Number(transitionedAt),
+        toMode, current.current_mode, Number(transitionedAt),
+        reasonCode, Number(transitionedAt),
+        rolloutKey, Number(expectedRevision)
+      );
+      if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      this.appendPromotionHistoryInternal({
+        eventId: `promotion_${contentHash({
+          rolloutKey, expectedRevision, toMode, toPhase, reasonCode, transitionedAt
+        }).slice(0, 24)}`,
+        rolloutKey,
+        fromMode: current.current_mode,
+        toMode,
+        fromPhase: current.rollout_phase,
+        toPhase,
+        fromRevision: Number(current.revision),
+        toRevision: nextRevision,
+        actor,
+        reasonCode,
+        reportId,
+        reportChecksum,
+        metadata,
+        createdAt: transitionedAt
+      });
+      return this.getCognitionRollout(rolloutKey);
+    });
+  }
+
+  putEvaluationReportInternal(report) {
+    const summaryJson = canonicalJson(report.summary || {});
+    const checksum = contentHash(report.summary || {});
+    if (report.artifactChecksum && report.artifactChecksum !== checksum) {
+      throw new Error('evaluation report checksum mismatch');
+    }
+    this.db.prepare(`
+      INSERT INTO cognition_evaluation_reports(
+        report_id, report_type, rollout_key, source_type, source_ref,
+        artifact_path, artifact_checksum, artifact_state, summary_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(report_id) DO NOTHING
+    `).run(
+      report.reportId, report.reportType, report.rolloutKey || null,
+      report.sourceType, report.sourceRef, report.artifactPath || '',
+      checksum, report.artifactState || 'pending', summaryJson,
+      Number(report.createdAt || now())
+    );
+    return this.getEvaluationReport(report.reportId);
+  }
+
+  getEvaluationReport(reportId) {
+    return mapEvaluationReport(this.db.prepare(
+      'SELECT * FROM cognition_evaluation_reports WHERE report_id = ?'
+    ).get(String(reportId)));
+  }
+
+  markEvaluationReportMaterialized({ reportId, expectedChecksum, now: materializedAt = now() }) {
+    const result = this.db.prepare(`
+      UPDATE cognition_evaluation_reports
+      SET artifact_state = 'materialized', materialized_at = ?, last_artifact_error_code = NULL
+      WHERE report_id = ? AND artifact_checksum = ?
+    `).run(Number(materializedAt), String(reportId), String(expectedChecksum));
+    if (Number(result.changes) !== 1) throw new Error('evaluation report checksum conflict');
+    return this.getEvaluationReport(reportId);
+  }
+
+  createTurnWithRolloutInternal({ envelope, rolloutKey, presetVersion, annotationSnapshot }) {
+    return this.submitTurn(envelope, { rolloutKey, presetVersion, annotationSnapshot });
+  }
+
+  refreshCognitionEvidenceInternal({ entries, reasonCode, now: refreshedAt = now() }) {
+    return this.transaction(() => {
+      const currentRows = new Map(this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts ORDER BY rollout_key'
+      ).all().map(row => [row.rollout_key, row]));
+      if (entries.some(entry => !currentRows.has(entry.rolloutKey))) {
+        throw new Error('rollout evidence refresh is incomplete');
+      }
+      const changed = [];
+      for (const entry of entries) {
+        const current = currentRows.get(entry.rolloutKey);
+        if (current.pipeline_checksum === entry.pipelineChecksum
+          && current.preset_version === entry.presetVersion) continue;
+        const nextRevision = Number(current.revision) + 1;
+        const remainsLegacy = current.current_mode === 'legacy';
+        const toMode = remainsLegacy ? 'legacy' : 'shadow';
+        const toPhase = remainsLegacy ? 'stable' : 'collecting';
+        const update = this.db.prepare(`
+          UPDATE cognition_kind_rollouts
+          SET current_mode = ?, rollout_phase = ?, revision = ?,
+              preset_version = ?, pipeline_checksum = ?,
+              evidence_epoch = evidence_epoch + 1,
+              shadow_epoch = shadow_epoch + ?,
+              live_shadow_first_at = NULL, live_shadow_last_at = NULL,
+              live_shadow_success_count = 0, live_shadow_failure_count = 0,
+              canary_started_count = 0, canary_completed_count = 0,
+              canary_failure_count = 0, canary_started_at = NULL,
+              canary_observe_until = NULL, last_reason_code = ?, updated_at = ?
+          WHERE rollout_key = ? AND revision = ?
+        `).run(
+          toMode, toPhase, nextRevision,
+          entry.presetVersion, entry.pipelineChecksum,
+          remainsLegacy ? 0 : 1,
+          reasonCode, Number(refreshedAt), entry.rolloutKey, Number(current.revision)
+        );
+        if (Number(update.changes) !== 1) throw new RolloutRevisionConflictError();
+        this.appendPromotionHistoryInternal({
+          eventId: `promotion_${contentHash({
+            rolloutKey: entry.rolloutKey,
+            revision: nextRevision,
+            pipelineChecksum: entry.pipelineChecksum,
+            refreshedAt
+          }).slice(0, 24)}`,
+          rolloutKey: entry.rolloutKey,
+          fromMode: current.current_mode,
+          toMode,
+          fromPhase: current.rollout_phase,
+          toPhase,
+          fromRevision: Number(current.revision),
+          toRevision: nextRevision,
+          actor: 'preset_registry',
+          reasonCode,
+          metadata: { pipelineChecksum: entry.pipelineChecksum },
+          createdAt: refreshedAt
+        });
+        changed.push(entry.rolloutKey);
+      }
+      return { changed, rollouts: this.listCognitionRollouts() };
+    });
+  }
+
+  countOutstandingComparisonSubjects(rolloutKey, { canaryEpoch = null } = {}) {
+    const turnWhere = canaryEpoch === null
+      ? ''
+      : ' AND canary_epoch = ?';
+    const params = canaryEpoch === null
+      ? [String(rolloutKey)]
+      : [String(rolloutKey), Number(canaryEpoch)];
+    const turn = this.db.prepare(`
+      SELECT COUNT(*) AS count, MIN(created_at) AS oldest
+      FROM turns
+      WHERE rollout_key = ?
+        AND comparison_mode != 'none'
+        AND state NOT IN ('completed', 'fallback', 'failed')
+        ${turnWhere}
+    `).get(...params);
+    const jobs = this.db.prepare(`
+      SELECT COUNT(*) AS count, MIN(created_at) AS oldest
+      FROM cognition_shadow_runs
+      WHERE rollout_key = ?
+        AND state IN ('queued', 'running', 'retry_wait')
+        ${canaryEpoch === null ? '' : ' AND canary_epoch = ?'}
+    `).get(...params);
+    const oldest = [turn.oldest, jobs.oldest].filter(value => value !== null && value !== undefined);
+    return {
+      count: Number(turn.count || 0) + Number(jobs.count || 0),
+      oldestAt: oldest.length ? Math.min(...oldest.map(Number)) : null
+    };
   }
 
   submitTurn(input, pin = {}) {
@@ -691,6 +1183,35 @@ export class YuqiStore {
     }
 
     return this.transaction(() => {
+      let effectivePin = { ...pin };
+      let rollout = null;
+      if (pin.rolloutKey) {
+        rollout = this.db.prepare(
+          'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+        ).get(String(pin.rolloutKey));
+        if (!rollout) throw new Error(`cognition rollout is unavailable: ${pin.rolloutKey}`);
+        effectivePin = {
+          ...effectivePin,
+          pipelineMode: rollout.current_mode,
+          rolloutKey: rollout.rollout_key,
+          rolloutRevision: Number(rollout.revision),
+          rolloutEvidenceEpoch: Number(rollout.evidence_epoch),
+          pipelineChecksum: rollout.pipeline_checksum,
+          shadowEpoch: rollout.current_mode === 'shadow' ? Number(rollout.shadow_epoch) : null,
+          canaryEpoch: rollout.current_mode === 'active' && rollout.rollout_phase === 'canary'
+            ? Number(rollout.canary_epoch)
+            : null,
+          comparisonMode: rollout.current_mode === 'shadow'
+            ? 'cognition_compare'
+            : rollout.current_mode === 'active' && rollout.rollout_phase === 'canary'
+              ? 'legacy_compare'
+              : 'none',
+          canarySlot: rollout.current_mode === 'active' && rollout.rollout_phase === 'canary'
+            ? Number(rollout.canary_started_count) + 1
+            : null,
+          presetVersion: rollout.preset_version
+        };
+      }
       if (envelope.message && !canonicalRetryMessage) {
         const savedMessage = this.putMessageInternal({
           ...envelope.message,
@@ -721,8 +1242,10 @@ export class YuqiStore {
         INSERT INTO turns(
           turn_id, character_id, device_id, device_seq, source_message_id,
           state, origin, envelope_json, envelope_checksum, created_at, updated_at,
-          pipeline_mode, preset_version, annotation_snapshot_json
-        ) VALUES (?, ?, ?, ?, ?, 'queued', 'codex', ?, ?, ?, ?, ?, ?, ?)
+          pipeline_mode, preset_version, annotation_snapshot_json,
+          rollout_key, comparison_mode, rollout_revision, rollout_evidence_epoch,
+          pipeline_checksum, shadow_epoch, canary_epoch, canary_slot
+        ) VALUES (?, ?, ?, ?, ?, 'queued', 'codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         envelope.turnId,
         envelope.characterId,
@@ -733,10 +1256,33 @@ export class YuqiStore {
         envelopeChecksum,
         envelope.createdAt,
         now(),
-        ['legacy', 'shadow', 'active'].includes(pin.pipelineMode) ? pin.pipelineMode : 'legacy',
-        String(pin.presetVersion || '1.9.1'),
-        canonicalJson(pin.annotationSnapshot || {})
+        ['legacy', 'shadow', 'active'].includes(effectivePin.pipelineMode) ? effectivePin.pipelineMode : 'legacy',
+        String(effectivePin.presetVersion || '1.9.1'),
+        canonicalJson(effectivePin.annotationSnapshot || {}),
+        effectivePin.rolloutKey || null,
+        effectivePin.comparisonMode || 'none',
+        Number(effectivePin.rolloutRevision || 0),
+        Number(effectivePin.rolloutEvidenceEpoch || 0),
+        String(effectivePin.pipelineChecksum || ''),
+        effectivePin.shadowEpoch ?? null,
+        effectivePin.canaryEpoch ?? null,
+        effectivePin.canarySlot ?? null
       );
+      if (rollout && effectivePin.comparisonMode === 'cognition_compare') {
+        const updated = this.db.prepare(`
+          UPDATE cognition_kind_rollouts
+          SET revision = revision + 1, updated_at = ?
+          WHERE rollout_key = ? AND revision = ?
+        `).run(now(), rollout.rollout_key, rollout.revision);
+        if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      } else if (rollout && effectivePin.comparisonMode === 'legacy_compare') {
+        const updated = this.db.prepare(`
+          UPDATE cognition_kind_rollouts
+          SET revision = revision + 1, canary_started_count = canary_started_count + 1, updated_at = ?
+          WHERE rollout_key = ? AND revision = ?
+        `).run(now(), rollout.rollout_key, rollout.revision);
+        if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      }
       if (envelope.message) this.putCurrentUserBatchInternal(envelope);
       const turn = this.getTurn(envelope.turnId);
       this.appendSync('turn', envelope.turnId, 'insert', turn);
