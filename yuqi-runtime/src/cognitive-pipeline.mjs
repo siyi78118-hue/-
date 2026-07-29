@@ -9,6 +9,7 @@ import {
   COGNITION_SCHEMA_V2,
   EXPRESSION_SCHEMA_V2
 } from './role-schemas.mjs';
+import { resolveRelationshipStage } from './relationship-stage.mjs';
 
 function parseObject(response, role) {
   const text = String(response?.text ?? response ?? '').trim();
@@ -100,7 +101,7 @@ export class CognitivePipeline {
     throw new Error(`${role} failed`);
   }
 
-  persistCognitionCheckpoint(turnId, packet) {
+  persistCognitionCheckpoint(turnId, checkpoint) {
     const current = this.store.getTurn?.(turnId);
     if (!current || current.memoryPacketJson) return;
     if (typeof this.store.advanceTurn !== 'function') return;
@@ -113,7 +114,7 @@ export class CognitivePipeline {
       this.store.advanceTurn(turnId, 'memory_running', 'memory_done', {
         memoryPacketJson: JSON.stringify({
           packetType: 'cognition-v2',
-          packet
+          ...checkpoint
         })
       });
     }
@@ -193,7 +194,25 @@ export class CognitivePipeline {
         cognitiveState: routeDecision.cognitiveState || {},
         cognitionResult
       });
-      this.persistCognitionCheckpoint(turn.turnId, packet);
+      const evidenceMessages = [
+        ...(context.recentMessages || []),
+        ...(context.currentBatch?.messages || [])
+      ];
+      const relationship = resolveRelationshipStage(
+        scene,
+        cognitionResult.relationshipStageReview,
+        evidenceMessages,
+        this.clock()
+      );
+      this.persistCognitionCheckpoint(turn.turnId, {
+        packet,
+        query: cognitionResult.query,
+        keywords: cognitionResult.keywords,
+        conversationFrame: cognitionResult.conversationFrame,
+        effectiveRelationshipStage: relationship.stage,
+        relationshipStageAction: relationship.action,
+        interactionContract: cognitionResult.decision
+      });
     }
 
     const expressionSystem = this.presetRegistry.resolvePresetBundle({

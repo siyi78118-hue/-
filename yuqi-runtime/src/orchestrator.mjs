@@ -367,7 +367,7 @@ export class YuqiOrchestrator {
   constructor({
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
     generationContextLimit = 20, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null,
-    lifePlanningEnabled = true
+    lifePlanningEnabled = true, cognitivePipeline = null
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
@@ -384,6 +384,7 @@ export class YuqiOrchestrator {
     this.lifePlanningRetryAfter = new Map();
     this.brainRolePromise = null;
     this.turnImagePaths = new Map();
+    this.cognitivePipeline = cognitivePipeline;
   }
 
   accept(envelope) {
@@ -549,6 +550,60 @@ export class YuqiOrchestrator {
     }
 
     try {
+      current = this.store.getTurn(turnId);
+      if (
+        current.pipelineMode === 'active'
+        && envelope.kind === 'DIRECT_REPLY'
+        && this.cognitivePipeline
+        && ['queued', 'memory_running', 'memory_done', 'brain_running'].includes(current.state)
+      ) {
+        const stateMessages = this.store.listMessages(
+          envelope.characterId,
+          Math.min(5000, this.contextLimit + Number(initialBatch?.messageIds.length || 0))
+        );
+        const currentBatch = resolveCurrentUserBatch(envelope, stateMessages);
+        const scene = sceneFromEnvelope(envelope);
+        const interactionState = buildAuthoritativeInteractionState({
+          envelope,
+          messages: stateMessages,
+          currentStage: scene.relationshipStage,
+          now: this.clock()
+        });
+        const cognition = await this.cognitivePipeline.runForeground({
+          turn: current,
+          envelope,
+          scene,
+          currentBatch,
+          routeDecision: {
+            route: current.route,
+            interactionState,
+            lifeContext: this.lifeSimulation.advanceTo(envelope.characterId, this.clock()),
+            cognitiveState: this.store.getCognitiveState?.(envelope.characterId) || {},
+            allowedActionTargets: {
+              lifeEpisodeIds: this.store.listLifeEpisodes?.(envelope.characterId)
+                ?.map(item => item.episodeId) || []
+            }
+          }
+        });
+        current = this.store.getTurn(turnId);
+        if (current.state === 'memory_done') {
+          this.store.advanceTurn(turnId, 'memory_done', 'brain_running');
+          current = this.store.getTurn(turnId);
+        }
+        if (current.state === 'brain_running') {
+          this.store.advanceTurn(turnId, 'brain_running', 'brain_done', {
+            brainDraftJson: JSON.stringify(cognition.draft)
+          });
+          current = this.store.getTurn(turnId);
+        }
+        if (current.state === 'brain_done') {
+          const hard = hardValidateReply(cognition.draft.reply);
+          if (!hard.ok) throw new Error(`active cognition reply is not deliverable: ${hard.issues.map(item => item.code).join(',')}`);
+          this.store.advanceTurn(turnId, 'brain_done', 'approved', {
+            brainDraftJson: JSON.stringify(cognition.draft)
+          });
+        }
+      }
       for (let step = 0; step < 16; step += 1) {
         current = this.store.getTurn(turnId);
         if (current.state === 'queued') {
@@ -1099,7 +1154,7 @@ export class YuqiOrchestrator {
         }
         const result = {
           turnId: envelope.turnId,
-          presetVersion: this.presets.current().version,
+          presetVersion: current.presetVersion || this.presets.current().version,
           action: draft.rolePlanOperations.length ? 'send' : 'skip',
           skipReason: draft.skipReason || null,
           paymentAction: null,
@@ -1131,7 +1186,7 @@ export class YuqiOrchestrator {
           : null;
         const result = {
           turnId: envelope.turnId,
-          presetVersion: this.presets.current().version,
+          presetVersion: current.presetVersion || this.presets.current().version,
           action: 'send',
           paymentAction: null,
           relationshipStageAction: memoryPacket.relationshipStageAction || null,
@@ -1165,7 +1220,7 @@ export class YuqiOrchestrator {
           : null;
         const result = {
           turnId: envelope.turnId,
-          presetVersion: this.presets.current().version,
+          presetVersion: current.presetVersion || this.presets.current().version,
           action: 'send',
           paymentAction: null,
           reply: {
@@ -1223,7 +1278,7 @@ export class YuqiOrchestrator {
       }
       const result = {
         turnId: envelope.turnId,
-        presetVersion: this.presets.current().version,
+        presetVersion: current.presetVersion || this.presets.current().version,
         action: 'send',
         paymentAction: resolvedPaymentAction(envelope, draft),
         reply: savedReply,

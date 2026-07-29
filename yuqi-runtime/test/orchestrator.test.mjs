@@ -129,14 +129,15 @@ class FakeCodex {
 
 function withFixture(outputs, run, {
   clock = () => 1784400000000,
-  lifePlanningEnabled = false
+  lifePlanningEnabled = false,
+  cognitivePipeline = null
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-orchestrator-'));
   const store = new YuqiStore(join(dir, 'runtime.sqlite'));
   const presets = new PresetRegistry({ presetDir, store, clock: () => 1784400000000 });
   const codex = new FakeCodex(outputs);
   const orchestrator = new YuqiOrchestrator({
-    store, presets, codex, workerId: 'test-worker', clock, lifePlanningEnabled
+    store, presets, codex, workerId: 'test-worker', clock, lifePlanningEnabled, cognitivePipeline
   });
   return Promise.resolve(run({ store, presets, codex, orchestrator })).finally(() => {
     store.close();
@@ -1648,5 +1649,113 @@ test('accepting the same envelope again requeues a transient brain timeout', asy
 
     assert.equal(retried.state, 'memory_done');
     assert.equal(retried.errorJson, null);
+  });
+});
+
+test('only a turn pinned active uses cognition for a direct reply and preserves structured payment', async () => {
+  await withFixture({}, async ({ store, orchestrator, codex }) => {
+    const value = envelope(120, '请你喝一杯');
+    value.protocolVersion = 2;
+    value.kind = 'DIRECT_REPLY';
+    value.context = {
+      payment: {
+        kind: 'redpacket',
+        amount: 20,
+        note: '请你喝一杯',
+        messageId: value.message.messageId,
+        status: 'pending'
+      }
+    };
+    const saved = store.submitTurn(value, {
+      pipelineMode: 'active',
+      presetVersion: '2.0.0',
+      annotationSnapshot: { ids: ['annotation_live'] }
+    });
+    store.setTurnRoute(saved.turnId, 'fast', ['simple_direct']);
+    let calls = 0;
+    orchestrator.cognitivePipeline = {
+      async runForeground({ turn }) {
+        calls += 1;
+        let current = store.getTurn(turn.turnId);
+        if (current.state === 'queued') {
+          store.advanceTurn(turn.turnId, 'queued', 'memory_running');
+          current = store.getTurn(turn.turnId);
+        }
+        if (current.state === 'memory_running') {
+          store.advanceTurn(turn.turnId, 'memory_running', 'memory_done', {
+            memoryPacketJson: JSON.stringify({
+              packetType: 'cognition-v2',
+              query: '红包',
+              keywords: ['红包'],
+              relationshipStageAction: null,
+              packet: { packetChecksum: 'packet' }
+            })
+          });
+        }
+        return {
+          draft: {
+            action: 'send',
+            reply: '那我就收下了。',
+            paymentAction: 'received',
+            usedFactIds: [],
+            momentAction: null,
+            lifePlan: null,
+            lifeAdjustment: null,
+            rolePlanOperationsJson: '[]',
+            rewriteResolution: null
+          }
+        };
+      }
+    };
+
+    const result = await orchestrator.run(saved.turnId);
+    assert.equal(calls, 1);
+    assert.equal(result.reply.content, '那我就收下了。');
+    assert.equal(result.paymentAction, 'received');
+    assert.equal(codex.calls.length, 0);
+  });
+});
+
+test('a legacy direct turn ignores an available cognition pipeline', async () => {
+  await withFixture({
+    memory: [JSON.stringify({
+      query: '普通回复',
+      keywords: ['普通回复'],
+      candidates: [],
+      requiresDeepMemory: false,
+      escalationReasons: [],
+      speakerAmbiguity: false,
+      commitmentRisk: false,
+      relationshipStageReview: null,
+      conversationFrame: conversationFrame()
+    })],
+    brain: [JSON.stringify({
+      action: 'send',
+      reply: '走旧管线。',
+      paymentAction: null,
+      usedFactIds: [],
+      momentAction: null,
+      lifePlan: null,
+      lifeAdjustment: null,
+      rolePlanOperationsJson: '[]',
+      rewriteResolution: null
+    })],
+    supervisor: [JSON.stringify({
+      decision: 'approve',
+      reviewedIssueIds: [],
+      resolvedIssueIds: [],
+      issues: []
+    })]
+  }, async ({ orchestrator }) => {
+    let calls = 0;
+    orchestrator.cognitivePipeline = {
+      async runForeground() {
+        calls += 1;
+        throw new Error('must not run');
+      }
+    };
+    const result = await orchestrator.process(envelope(121, '普通回复'));
+    assert.equal(result.reply.content, '走旧管线。');
+    assert.equal(calls, 0);
   });
 });
