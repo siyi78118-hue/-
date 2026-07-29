@@ -5,12 +5,39 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { hardValidateReply, YuqiOrchestrator } from '../src/orchestrator.mjs';
+import { hardValidateReply, normalizeBrainDraft, YuqiOrchestrator } from '../src/orchestrator.mjs';
+import { materializeBrainDraft } from '../src/cognition-contract.mjs';
 import { PresetRegistry } from '../src/preset-registry.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const presetDir = join(here, '..', 'presets');
+
+test('legacy brain normalization accepts a cognition-v2 materialized draft', () => {
+  const cognitionPacket = {
+    packetChecksum: 'a'.repeat(64),
+    cognitionResult: {
+      relationshipStageReview: { base: null, phase: null },
+      actionIntent: {
+        paymentAction: null,
+        momentIntent: null,
+        rolePlanOperationsJson: '[]',
+        lifePlan: null,
+        lifeAdjustment: null
+      }
+    }
+  };
+  const materialized = materializeBrainDraft(cognitionPacket, {
+    action: 'send',
+    reply: '还真让你抢先了。',
+    usedFactIds: [],
+    rewriteResolution: null
+  });
+  const normalized = normalizeBrainDraft(materialized);
+  assert.equal(normalized.action, 'send');
+  assert.equal(normalized.reply, '还真让你抢先了。');
+  assert.deepEqual(normalized.rolePlanOperations, []);
+});
 
 function envelope(seq = 1, content = '你好') {
   return {

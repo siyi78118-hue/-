@@ -177,6 +177,171 @@ const supervisorIssueSchema = objectSchema({
   'acceptanceCriteria'
 ]);
 
+const cognitionRelationshipReviewSchema = objectSchema({
+  base: { anyOf: [baseRelationshipReviewSchema, { type: 'null' }] },
+  phase: { anyOf: [phaseRelationshipReviewSchema, { type: 'null' }] }
+}, ['base', 'phase']);
+
+const selfStateSchema = objectSchema({
+  mood: { type: 'string' },
+  moodCause: { type: 'string' },
+  bodyState: { type: 'string' },
+  attention: { type: 'string' },
+  stanceTowardUser: { type: 'string' },
+  ownNeed: { type: 'string' },
+  continuity: { type: 'string' },
+  intensity: { type: 'number' }
+}, [
+  'mood',
+  'moodCause',
+  'bodyState',
+  'attention',
+  'stanceTowardUser',
+  'ownNeed',
+  'continuity',
+  'intensity'
+]);
+
+const cognitionDecisionSchema = objectSchema({
+  shouldRespond: { type: 'boolean' },
+  silenceReason: { type: 'string' },
+  relationshipGoal: { type: 'string' },
+  primaryAction: { type: 'string' },
+  initiativeOwner: { type: 'string' },
+  mustAddress: stringArray(),
+  forbiddenMoves: stringArray(),
+  preserveAmbiguity: { type: 'boolean' },
+  evidenceMessageIds: stringArray()
+}, [
+  'shouldRespond',
+  'silenceReason',
+  'relationshipGoal',
+  'primaryAction',
+  'initiativeOwner',
+  'mustAddress',
+  'forbiddenMoves',
+  'preserveAmbiguity',
+  'evidenceMessageIds'
+]);
+
+const cognitionPaymentActionSchema = objectSchema({
+  action: { type: 'string', enum: ['received', 'refused', 'pending'] },
+  messageId: { type: 'string' },
+  kind: { type: 'string', enum: ['redpacket', 'transfer'] },
+  amount: { type: 'number' }
+}, ['action', 'messageId', 'kind', 'amount']);
+
+const cognitionMomentIntentSchema = objectSchema({
+  momentId: { type: 'string' },
+  like: { type: 'boolean' },
+  comment: { type: 'string' },
+  replyToCommentId: nullable('string')
+}, ['momentId', 'like', 'comment', 'replyToCommentId']);
+
+const lifeEpisodeSchema = objectSchema({
+  episodeId: { type: 'string' },
+  kind: { type: 'string' },
+  title: { type: 'string' },
+  startAt: { type: 'number' },
+  endAt: { type: 'number' }
+}, ['episodeId', 'kind', 'title', 'startAt', 'endAt']);
+
+const cognitionLifePlanSchema = objectSchema({
+  planKey: { type: 'string' },
+  episodes: { type: 'array', items: lifeEpisodeSchema }
+}, ['planKey', 'episodes']);
+
+const cognitionLifeAdjustmentSchema = objectSchema({
+  type: { type: 'string', enum: ['none', 'reschedule', 'shorten', 'extend', 'cancel'] },
+  targetEpisodeId: { type: 'string' },
+  startAt: { anyOf: [{ type: 'number' }, { type: 'null' }] },
+  endAt: { anyOf: [{ type: 'number' }, { type: 'null' }] },
+  reason: { type: 'string' }
+}, ['type', 'targetEpisodeId', 'startAt', 'endAt', 'reason']);
+
+const cognitionActionIntentSchema = objectSchema({
+  channel: { type: 'string', enum: ['chat', 'moment', 'private', 'none'] },
+  paymentAction: { anyOf: [cognitionPaymentActionSchema, { type: 'null' }] },
+  momentIntent: { anyOf: [cognitionMomentIntentSchema, { type: 'null' }] },
+  rolePlanOperationsJson: { type: 'string' },
+  lifePlan: { anyOf: [cognitionLifePlanSchema, { type: 'null' }] },
+  lifeAdjustment: { anyOf: [cognitionLifeAdjustmentSchema, { type: 'null' }] }
+}, [
+  'channel',
+  'paymentAction',
+  'momentIntent',
+  'rolePlanOperationsJson',
+  'lifePlan',
+  'lifeAdjustment'
+]);
+
+export const COGNITION_SCHEMA_V2 = objectSchema({
+  schemaVersion: { type: 'integer', enum: [2] },
+  query: { type: 'string' },
+  keywords: stringArray(),
+  requiresDeepCognition: { type: 'boolean' },
+  escalationReasons: stringArray(),
+  relationshipStageReview: cognitionRelationshipReviewSchema,
+  conversationFrame: conversationFrameSchema,
+  selfState: selfStateSchema,
+  decision: cognitionDecisionSchema,
+  actionIntent: cognitionActionIntentSchema
+}, [
+  'schemaVersion',
+  'query',
+  'keywords',
+  'requiresDeepCognition',
+  'escalationReasons',
+  'relationshipStageReview',
+  'conversationFrame',
+  'selfState',
+  'decision',
+  'actionIntent'
+]);
+
+export const EXPRESSION_SCHEMA_V2 = objectSchema({
+  action: { type: 'string', enum: ['send', 'skip'] },
+  reply: { type: 'string' },
+  usedFactIds: stringArray(),
+  rewriteResolution: { anyOf: [rewriteResolutionSchema, { type: 'null' }] }
+}, ['action', 'reply', 'usedFactIds', 'rewriteResolution']);
+
+export const CONSOLIDATION_SCHEMA_V2 = objectSchema({
+  schemaVersion: { type: 'integer', enum: [2] },
+  query: { type: 'string' },
+  keywords: stringArray(),
+  candidates: { type: 'array', items: factCandidateSchema },
+  conflicts: {
+    type: 'array',
+    items: objectSchema({
+      factId: { type: 'string' },
+      conflictsWithFactId: { type: 'string' },
+      evidenceMessageIds: stringArray(),
+      reason: { type: 'string' }
+    }, ['factId', 'conflictsWithFactId', 'evidenceMessageIds', 'reason'])
+  },
+  supersessions: {
+    type: 'array',
+    items: objectSchema({
+      oldFactId: { type: 'string' },
+      newFactId: { type: 'string' },
+      evidenceMessageIds: stringArray(),
+      reason: { type: 'string' }
+    }, ['oldFactId', 'newFactId', 'evidenceMessageIds', 'reason'])
+  }
+}, ['schemaVersion', 'query', 'keywords', 'candidates', 'conflicts', 'supersessions']);
+
+export const LIFE_PLANNING_SCHEMA_V2 = objectSchema({
+  schemaVersion: { type: 'integer', enum: [2] },
+  planKey: { type: 'string' },
+  episodes: { type: 'array', items: lifeEpisodeSchema },
+  cognitiveStatePatch: objectSchema({
+    bodyState: { type: 'string' },
+    attention: { type: 'string' },
+    ownNeed: { type: 'string' }
+  }, ['bodyState', 'attention', 'ownNeed'])
+}, ['schemaVersion', 'planKey', 'episodes', 'cognitiveStatePatch']);
+
 export const ROLE_OUTPUT_SCHEMAS = Object.freeze({
   memory: objectSchema({
     query: { type: 'string' },
