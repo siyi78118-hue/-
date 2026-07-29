@@ -157,3 +157,31 @@ test('an approved user-driven adjustment can reschedule Yuqi life without invent
     assert.equal(store.getLifeEpisode(personal.episodeId).startAt, personal.startAt + 60 * 60_000);
   });
 });
+
+test('life context exposes only episode, elapsed time, body, and attention signals to cognition', () => {
+  fixture(({ store }) => {
+    const now = at('2026-07-23T14:00:00+08:00');
+    store.putLifePlan('yuqi', [{
+      episodeId: 'life_editing',
+      kind: 'work',
+      title: '改稿',
+      startAt: now - 60_000,
+      endAt: now + 60_000,
+      payload: {
+        bodyState: '有点累',
+        attention: '手里的稿子',
+        intensityDelta: -0.1,
+        attitudeTowardUser: '这个字段不应成为认知信号'
+      }
+    }]);
+    const context = new LifeSimulationCoordinator({ store }).contextFor('yuqi', now);
+    assert.deepEqual(context.cognitiveSignals, {
+      currentEpisodeId: 'life_editing',
+      elapsedSinceRecentEpisodeMs: null,
+      bodyState: '有点累',
+      attention: '手里的稿子',
+      intensityDelta: -0.1
+    });
+    assert.equal(Object.hasOwn(context.cognitiveSignals, 'attitudeTowardUser'), false);
+  });
+});

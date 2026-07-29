@@ -39,7 +39,16 @@ export class LifeSimulationCoordinator {
       horizonEndAt,
       planWindowStartAt,
       targetPlanEndAt: planWindowStartAt + this.targetPlanMs,
-      needsPlan: !horizonEndAt || horizonEndAt - Number(now) < this.planningThresholdMs
+      needsPlan: !horizonEndAt || horizonEndAt - Number(now) < this.planningThresholdMs,
+      cognitiveSignals: {
+        currentEpisodeId: current?.episodeId || null,
+        elapsedSinceRecentEpisodeMs: recent.length
+          ? Math.max(0, Number(now) - Number(recent.at(-1).endAt))
+          : null,
+        bodyState: String(current?.payload?.bodyState || ''),
+        attention: String(current?.payload?.attention || current?.title || ''),
+        intensityDelta: Number(current?.payload?.intensityDelta || 0)
+      }
     };
   }
 

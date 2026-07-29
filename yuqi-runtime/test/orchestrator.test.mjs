@@ -1688,7 +1688,26 @@ test('only a turn pinned active uses cognition for a direct reply and preserves 
               query: '红包',
               keywords: ['红包'],
               relationshipStageAction: null,
-              packet: { packetChecksum: 'packet' }
+              packet: {
+                packetChecksum: 'packet',
+                cognitionResult: {
+                  conversationFrame: {
+                    activeHooks: [{ summary: '红包已经收下', waitingOn: 'none' }],
+                    explicitBoundaries: [],
+                    recentCorrection: { active: false }
+                  },
+                  selfState: {
+                    mood: '开心',
+                    moodCause: '收到姜隽倚的红包',
+                    intensity: 0.6,
+                    bodyState: '正常',
+                    attention: '聊天',
+                    ownNeed: '继续聊两句',
+                    stanceTowardUser: '亲近'
+                  },
+                  decision: { shouldRespond: true }
+                }
+              }
             })
           });
         }
@@ -1713,6 +1732,14 @@ test('only a turn pinned active uses cognition for a direct reply and preserves 
     assert.equal(result.reply.content, '那我就收下了。');
     assert.equal(result.paymentAction, 'received');
     assert.equal(codex.calls.length, 0);
+    const cognitiveState = store.getCognitiveState('yuqi');
+    assert.equal(cognitiveState.lastTurnId, saved.turnId);
+    assert.equal(cognitiveState.revision, 1);
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS count FROM consolidation_jobs WHERE turn_id = ?')
+        .get(saved.turnId).count,
+      1
+    );
   });
 });
 

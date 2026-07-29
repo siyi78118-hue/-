@@ -10,6 +10,7 @@ import { buildGenerationWindow } from './conversation-context.mjs';
 import { currentUserBatchForRole, resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { LifeSimulationCoordinator } from './life-simulation.mjs';
 import { materializeImageAttachments } from './image-attachments.mjs';
+import { reduceCognitiveState } from './cognitive-state.mjs';
 import {
   characterFactCandidatesForReply,
   hasHighPriorityIssues,
@@ -1139,6 +1140,63 @@ export class YuqiOrchestrator {
     });
   }
 
+  persistCommittedCognitionInternal(envelope, current, memoryPacket) {
+    if (memoryPacket?.packetType !== 'cognition-v2' || !memoryPacket?.packet?.cognitionResult) return null;
+    const previousRecord = this.store.getCognitiveState(envelope.characterId);
+    const previous = previousRecord ? {
+      ...previousRecord.state,
+      revision: previousRecord.revision,
+      lastTurnId: previousRecord.lastTurnId,
+      updatedAt: previousRecord.updatedAt
+    } : null;
+    const supervisorDecision = current.supervisorJson
+      ? String(parseRoleJson(current.supervisorJson, 'supervisor').decision || 'approve')
+      : 'approve';
+    const committedAt = this.clock();
+    const next = reduceCognitiveState({
+      previous,
+      cognitionPacket: memoryPacket.packet,
+      committedTurn: {
+        turnId: envelope.turnId,
+        kind: envelope.kind,
+        state: 'committed',
+        supervisorDecision,
+        hasUserBatch: Boolean(resolveCurrentUserBatch(envelope)?.messages?.length)
+      },
+      lifeState: this.lifeSimulation.contextFor(envelope.characterId, committedAt),
+      now: committedAt
+    });
+    if (next.lastTurnId !== envelope.turnId) return previousRecord;
+    const { checksum: _checksum, ...state } = next;
+    const saved = this.store.putCognitiveStateInternal({
+      roleId: envelope.characterId,
+      schemaVersion: state.schemaVersion,
+      revision: state.revision,
+      lastTurnId: state.lastTurnId,
+      state,
+      expectedChecksum: previousRecord?.checksum,
+      updatedAt: state.updatedAt
+    });
+    this.store.createConsolidationJobInternal({
+      subjectType: 'turn',
+      subjectId: envelope.turnId,
+      turnId: envelope.turnId,
+      roleId: envelope.characterId,
+      jobType: 'turn_consolidation',
+      dueAt: committedAt,
+      createdAt: committedAt,
+      payload: {
+        turnId: envelope.turnId,
+        roleId: envelope.characterId,
+        pipelineMode: current.pipelineMode,
+        presetVersion: current.presetVersion,
+        cognitionPacketChecksum: memoryPacket.packet.packetChecksum || null,
+        cognitiveStateChecksum: saved.checksum
+      }
+    });
+    return saved;
+  }
+
   commitApproved(envelope, current) {
     const draft = normalizeBrainDraft(parseRoleJson(current.brainDraftJson, 'brain'));
     const memoryPacket = parseRoleJson(current.memoryPacketJson, 'memory');
@@ -1166,6 +1224,7 @@ export class YuqiOrchestrator {
           momentAction: null,
           rolePlanOperations: draft.rolePlanOperations
         };
+        this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
         this.store.advanceTurn(
           envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
         );
@@ -1200,6 +1259,7 @@ export class YuqiOrchestrator {
           reply: null,
           usedFactIds: Array.isArray(draft.usedFactIds) ? draft.usedFactIds : []
         };
+        this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
         this.store.advanceTurn(
           envelope.turnId, 'approved', 'committed', { replyJson: JSON.stringify(result) }
         );
@@ -1244,6 +1304,7 @@ export class YuqiOrchestrator {
           momentAction: null,
           rolePlanOperations: draft.rolePlanOperations
         };
+        this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
         this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
           replyJson: JSON.stringify(result)
         });
@@ -1292,6 +1353,7 @@ export class YuqiOrchestrator {
         momentAction: null,
         rolePlanOperations: draft.rolePlanOperations
       };
+      this.persistCommittedCognitionInternal(envelope, current, memoryPacket);
       this.store.advanceTurn(envelope.turnId, 'approved', 'committed', {
         replyJson: JSON.stringify(result)
       });
