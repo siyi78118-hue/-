@@ -1597,6 +1597,7 @@ let voiceStartAt = 0;
 let voiceRecordingCharId = '';
 let nativeReplyPollTimer = null;
 let nativeExecutionReconcilePromise = null;
+let nativeExecutionCompletedListenerReady = false;
 let lastNativeCompletedRecoveryAt = 0;
 const nativeReplyQueuedIds = new Set();
 const nativeTurnApplyPromises = new Map();
@@ -2689,6 +2690,28 @@ function nativeDirectorMemorySystem(char, scene) {
 {"memoryPack":"本轮相关记忆或无相关记忆","director":{"schemaVersion":1,"scene":"${scene}","timeGap":"instant|short|hours|overnight|days","silenceCause":"not_applicable|natural_pause|temporary_absence|conflict|explicit_distance|repeated_unexplained|uncertain","previousContactPressure":"none|low|medium|high","relationshipStageId":"new|acquainted|familiar|close|committed","playerIntent":"简短判断","playerIntentConfidence":0,"currentMood":"","moodCause":"","stanceTowardPlayer":"","ownLifeFocus":"","noticedPoint":"","replyImpulse":"answer|share|tease|refuse|check_in|repair|pause|skip","contactPressure":"low|medium|high","openingNeeded":false,"recommendedDirection":"","avoid":[],"evidenceMessageIds":[],"confidence":0}}
 director 不是台词提纲，不得写${charName(char)}要直接发送的句子。`;
 }
+function withCognitionV2Snapshot(snapshot) {
+  return {
+    ...snapshot,
+    packetType: 'cognition-v2',
+    cognitionConfigId: snapshot.memoryConfigId,
+    cognitionSystem: snapshot.memorySystem,
+    cognitionMessages: Array.isArray(snapshot.memoryMessages) ? snapshot.memoryMessages : [],
+    expressionConfigId: snapshot.chatConfigId,
+    expressionSystem: snapshot.chatSystem,
+    expressionMessages: Array.isArray(snapshot.chatMessages) ? snapshot.chatMessages : [],
+    cognitiveState: snapshot.scene?.cognitiveState || {},
+    localMemoryHints: Array.isArray(snapshot.localMemoryHints) ? snapshot.localMemoryHints : [],
+    playerProfile: { displayName: snapshot.playerName || '' },
+    relationshipStage: snapshot.scene?.relationshipStage || {},
+    stageCatalog: snapshot.scene?.stageCatalog || [],
+    phaseCatalog: snapshot.scene?.phaseCatalog || [],
+    currentPhase: snapshot.scene?.currentPhase || {},
+    rolePlanCatalog: snapshot.scene?.rolePlanCatalog || [],
+    roleScheduleContext: snapshot.scene?.roleScheduleContext || {},
+    momentContext: snapshot.scene?.momentContext || {}
+  };
+}
 async function buildNativeExecutionSnapshot(charId, task) {
   const char = characters.find(item => item.id === charId);
   const chat = allChats[charId];
@@ -2704,7 +2727,7 @@ async function buildNativeExecutionSnapshot(charId, task) {
   });
   const now = new Date();
   const nativeScene = task.options?.payment ? 'payment' : 'chat';
-  return {
+  return withCognitionV2Snapshot({
     scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
     playerName: playerName(),
@@ -2718,7 +2741,7 @@ async function buildNativeExecutionSnapshot(charId, task) {
     directorContext: directorContextForChat(char, memoryRecent, nativeScene, now),
     chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
     createdAt: now.toISOString()
-  };
+  });
 }
 
 function nativeProactiveSnapshotIds(charId, kind = 'chat', job = null) {
@@ -2760,7 +2783,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     chatMessages = nativeProactiveChatMessages(char, chat, now, triggerMode);
     memoryQuery = buildProactiveMemoryQuery(chat, now, triggerMode);
   }
-  const snapshot = {
+  const snapshot = withCognitionV2Snapshot({
     scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
     playerName: playerName(),
@@ -2785,7 +2808,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     timerEndpoint: settings.timerEndpoint || '',
     deviceId: settings.deviceId || '',
     createdAt: now.toISOString()
-  };
+  });
   const record = {
     characterId: charId,
     characterName: charName(char),
@@ -2845,7 +2868,7 @@ async function saveNativeRolePlanSnapshot(charId, plan, job) {
     chatSystem = `${prompt.system}\n\n${planContext}`;
     chatMessages = nativeProactiveChatMessages(char, chat, now, 'planned');
   }
-  const snapshot = {
+  const snapshot = withCognitionV2Snapshot({
     scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
     playerName: playerName(),
@@ -2866,7 +2889,7 @@ async function saveNativeRolePlanSnapshot(charId, plan, job) {
     timerEndpoint: settings.timerEndpoint || '',
     deviceId: settings.deviceId || '',
     createdAt: now.toISOString()
-  };
+  });
   await plugin.saveProactiveSnapshot({
     snapshotId: rolePlanSnapshotId(charId, plan.planId),
     characterId: charId,
@@ -3102,13 +3125,27 @@ function nativeTurnHasUiLanding(result) {
   }
   return (chat.messages || []).some(message => message.sourceTurnId === sourceTurnId);
 }
+function nativeBridgeCall(promise, label, timeoutMs = 8000) {
+  let timer = null;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    })
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 async function drainNativeUiInbox(
   plugin,
   applyTurn = applyNativeExecutionTurn,
   hasLanded = nativeTurnHasUiLanding
 ) {
   if (!plugin?.unappliedCompletedTurns || !plugin?.acknowledgeUiApplied) return false;
-  const page = await plugin.unappliedCompletedTurns({ limit: 500 });
+  const page = await nativeBridgeCall(
+    plugin.unappliedCompletedTurns({ limit: 500 }),
+    'unappliedCompletedTurns'
+  );
   const turns = (Array.isArray(page?.turns) ? page.turns : [])
     .slice()
     .sort((a, b) => Number(a.completedAt || a.createdAt) - Number(b.completedAt || b.createdAt));
@@ -3117,7 +3154,10 @@ async function drainNativeUiInbox(
     try {
       changed = await applyTurn(result) || changed;
       if (!hasLanded(result)) continue;
-      await plugin.acknowledgeUiApplied({ turnId: result.turnId });
+      await nativeBridgeCall(
+        plugin.acknowledgeUiApplied({ turnId: result.turnId }),
+        'acknowledgeUiApplied'
+      );
     } catch (err) {
       console.warn('[AL Native Execution] inbox item deferred:', result?.turnId, err.message);
     }
@@ -3130,7 +3170,10 @@ async function replayRecentNativeCompletedTurns(
   hasLanded = nativeTurnHasUiLanding
 ) {
   if (!plugin?.recentCompletedTurns) return false;
-  const page = await plugin.recentCompletedTurns({ limit: 50 });
+  const page = await nativeBridgeCall(
+    plugin.recentCompletedTurns({ limit: 50 }),
+    'recentCompletedTurns'
+  );
   const turns = (Array.isArray(page?.turns) ? page.turns : [])
     .slice()
     .sort((a, b) => Number(a.completedAt || a.createdAt) - Number(b.completedAt || b.createdAt));
@@ -3484,10 +3527,16 @@ async function reconcileNativeExecutionTurnsUnlocked() {
     changed = await replayRecentNativeCompletedTurns(plugin) || changed;
   }
   if (plugin.changesSince) {
-    const page = await plugin.changesSince({ cursor, limit: 200 });
+    const page = await nativeBridgeCall(
+      plugin.changesSince({ cursor, limit: 200 }),
+      'changesSince'
+    );
     for (const event of Array.isArray(page?.changes) ? page.changes : []) {
       try {
-        changed = await applyNativeExecutionTurn(await plugin.getTurn({ turnId: event.turnId })) || changed;
+        changed = await applyNativeExecutionTurn(await nativeBridgeCall(
+          plugin.getTurn({ turnId: event.turnId }),
+          'getTurn'
+        )) || changed;
         cursor = Math.max(cursor, Number(event.cursor) || 0);
         localStorage.setItem(cursorKey, String(cursor));
       } catch (err) {
@@ -3498,7 +3547,10 @@ async function reconcileNativeExecutionTurnsUnlocked() {
   }
   const pending = Object.values(allChats || {}).flatMap(chat => chat?.pendingReply?.nativeTurnId ? [chat.pendingReply.nativeTurnId] : []);
   for (const turnId of [...new Set(pending)]) {
-    try { changed = await applyNativeExecutionTurn(await plugin.getTurn({ turnId })) || changed; }
+    try { changed = await applyNativeExecutionTurn(await nativeBridgeCall(
+      plugin.getTurn({ turnId }),
+      'getTurn'
+    )) || changed; }
     catch (err) { console.warn('[AL Native Execution] getTurn failed:', turnId, err.message); }
   }
   return changed;
@@ -3517,6 +3569,22 @@ function startNativeReplyPolling() {
   nativeReplyPollTimer = setInterval(() => {
     reconcileNativeReplyState().catch(err => console.warn('[AL Native Reply] poll skipped:', err.message));
   }, 3000);
+}
+async function ensureNativeExecutionCompletedListener() {
+  const plugin = nativeExecutionPlugin();
+  if (!isNativeApp() || !plugin?.addListener || nativeExecutionCompletedListenerReady) return;
+  nativeExecutionCompletedListenerReady = true;
+  await plugin.addListener('executionCompleted', () => {
+    // The event is only a wake-up. Room remains authoritative and the exact
+    // turn/checksum is drained through the same idempotent inbox path.
+    drainNativeUiInbox(plugin).then(changed => {
+      if (!changed) return;
+      resumePendingAssistantTurns();
+      if (activeScreen === 'chat') renderMessages();
+      renderChats();
+      stopNativeReplyPollingIfIdle();
+    }).catch(err => console.warn('[AL Native Execution] completed event deferred:', err.message));
+  });
 }
 
 function yuqiImmersiveProgressText(pending = {}) {
@@ -11416,6 +11484,7 @@ async function bootApp() {
   refreshAppVersionDisplay();
   if (isNativeApp()) await ensureNativePushListeners().catch(err => console.warn('[AL Native] push listeners skipped:', err.message));
   if (isNativeApp()) {
+    await ensureNativeExecutionCompletedListener().catch(err => console.warn('[AL Native] execution listener skipped:', err.message));
     const App = window.Capacitor?.Plugins?.App;
     App?.addListener?.('appStateChange', state => {
       if (state?.isActive) {

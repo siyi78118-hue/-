@@ -48,21 +48,43 @@ public final class NativeModelGateway implements TurnBridgeGateway {
 
     public BridgeResult executeFallback(TurnSubmission submission) throws Exception {
         JSONObject snapshot = new JSONObject(submission.snapshotJson);
+        String packetType = snapshot.optString("packetType", "");
+        boolean cognitionV2 = "cognition-v2".equals(packetType);
+        if (!packetType.isEmpty() && !cognitionV2) {
+            throw new IllegalArgumentException("UNSUPPORTED_FALLBACK_PACKET: " + packetType);
+        }
+        String cognitionConfigId = cognitionV2
+            ? snapshot.optString("cognitionConfigId", snapshot.optString("memoryConfigId", ""))
+            : snapshot.getString("memoryConfigId");
+        String cognitionSystem = cognitionV2
+            ? snapshot.optString("cognitionSystem", snapshot.optString("memorySystem", ""))
+            : snapshot.getString("memorySystem");
+        JSONArray cognitionMessages = cognitionV2
+            ? snapshot.optJSONArray("cognitionMessages")
+            : snapshot.optJSONArray("memoryMessages");
         String memory = call(
-            snapshot.getString("memoryConfigId"),
-            snapshot.getString("memorySystem"),
-            snapshot.optJSONArray("memoryMessages") == null ? new JSONArray() : snapshot.getJSONArray("memoryMessages"),
+            cognitionConfigId,
+            cognitionSystem,
+            cognitionMessages == null ? new JSONArray() : cognitionMessages,
             snapshot.optInt("memoryMaxTokens", 1400)
         );
-        JSONArray allMessages = snapshot.optJSONArray("chatMessages");
+        JSONArray allMessages = cognitionV2
+            ? snapshot.optJSONArray("expressionMessages")
+            : snapshot.optJSONArray("chatMessages");
         JSONArray selected = new JSONArray();
         if (allMessages != null) {
             int start = Math.max(0, allMessages.length() - 200);
             for (int index = start; index < allMessages.length(); index += 1) selected.put(allMessages.opt(index));
         }
+        String expressionConfigId = cognitionV2
+            ? snapshot.optString("expressionConfigId", snapshot.optString("chatConfigId", ""))
+            : snapshot.getString("chatConfigId");
+        String expressionSystem = cognitionV2
+            ? snapshot.optString("expressionSystem", snapshot.optString("chatSystem", ""))
+            : snapshot.getString("chatSystem");
         String rawReply = call(
-            snapshot.getString("chatConfigId"),
-            snapshot.getString("chatSystem") + "\n\n【临时记忆筛选结果】\n" + (memory == null ? "" : memory),
+            expressionConfigId,
+            expressionSystem + "\n\n【临时认知结果】\n" + (memory == null ? "" : memory),
             selected,
             snapshot.optInt("chatMaxTokens", 1000)
         );

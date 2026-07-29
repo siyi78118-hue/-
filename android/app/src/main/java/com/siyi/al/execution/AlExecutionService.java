@@ -5,6 +5,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import com.siyi.al.AlExecutionPlugin;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
@@ -153,6 +154,7 @@ public final class AlExecutionService extends Service {
         RolePlanCoordinator rolePlanCoordinator = new RolePlanCoordinator(this);
         rolePlanCoordinator.reconcileFailedTurns(System.currentTimeMillis());
         for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
+            AlExecutionPlugin.notifyCompletedTurn(turn.turnId, turn.updatedAt);
             confirmBridgeDelivery(turn, bridgeReceipts);
             acknowledgeCloudTurn(turn, acknowledged);
             continueAutomaticTask(turn, proactiveContinued);

@@ -38,11 +38,15 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.UUID;
+import java.lang.ref.WeakReference;
+import android.os.Handler;
+import android.os.Looper;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 @CapacitorPlugin(name = "AlExecution")
 public final class AlExecutionPlugin extends Plugin {
+    private static WeakReference<AlExecutionPlugin> activeInstance = new WeakReference<>(null);
     private ExecutorService io;
     private RoomExecutionStore store;
     private AlSecretStore secrets;
@@ -52,11 +56,25 @@ public final class AlExecutionPlugin extends Plugin {
         io = Executors.newSingleThreadExecutor();
         store = new RoomExecutionStore(AlExecutionDatabase.get(getContext()));
         secrets = new AlSecretStore(getContext());
+        activeInstance = new WeakReference<>(this);
     }
 
     @Override
     protected void handleOnDestroy() {
+        AlExecutionPlugin current = activeInstance.get();
+        if (current == this) activeInstance.clear();
         if (io != null) io.shutdownNow();
+    }
+
+    public static void notifyCompletedTurn(String turnId, long updatedAt) {
+        AlExecutionPlugin plugin = activeInstance.get();
+        if (plugin == null) return;
+        new Handler(Looper.getMainLooper()).post(() -> {
+            JSObject payload = new JSObject();
+            payload.put("turnId", turnId == null ? "" : turnId);
+            payload.put("updatedAt", updatedAt);
+            plugin.notifyListeners("executionCompleted", payload, true);
+        });
     }
 
     @PluginMethod
