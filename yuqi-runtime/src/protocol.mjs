@@ -58,6 +58,70 @@ export function contentHash(value) {
   return createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex');
 }
 
+export function deliveryItemsForResult(result = {}) {
+  const turnId = String(result?.turnId || '');
+  if (!turnId) return [];
+  const items = [];
+  if (result.reply?.messageId) {
+    items.push({
+      kind: 'message',
+      id: String(result.reply.messageId),
+      checksum: contentHash({
+        messageId: String(result.reply.messageId),
+        content: String(result.reply.content || ''),
+        recipientId: String(result.reply.recipientId || '')
+      })
+    });
+  }
+  const actionEntries = [
+    ['payment', result.paymentAction],
+    ['moment', result.momentAction],
+    ['life_adjustment', result.lifeAdjustment],
+    ['relationship_stage', result.relationshipStageAction]
+  ].filter(([, value]) => value != null);
+  (Array.isArray(result.rolePlanOperations) ? result.rolePlanOperations : [])
+    .forEach((value, index) => actionEntries.push([`role_plan_${index}`, value]));
+  for (const [name, payload] of actionEntries) {
+    items.push({
+      kind: 'action',
+      id: `${turnId}:${name}`,
+      checksum: contentHash({ name, payload })
+    });
+  }
+  return items;
+}
+
+export function validateDeliveryReceipt(value) {
+  if (!value || value.protocolVersion !== 1 || !ID_PATTERN.test(String(value.turnId || ''))) {
+    throw new Error('invalid delivery receipt identity');
+  }
+  if (!Number.isSafeInteger(Number(value.deliveredAt)) || Number(value.deliveredAt) < 0) {
+    throw new Error('invalid delivery receipt time');
+  }
+  if (!Array.isArray(value.items) || !value.items.length) {
+    throw new Error('delivery receipt items are required');
+  }
+  const seen = new Set();
+  const items = value.items.map(item => {
+    const kind = String(item?.kind || '');
+    const id = String(item?.id || '');
+    const checksum = String(item?.checksum || '');
+    if (!['message', 'action'].includes(kind) || !id || !/^[a-f0-9]{64}$/.test(checksum)) {
+      throw new Error('invalid delivery receipt item');
+    }
+    const key = `${kind}:${id}`;
+    if (seen.has(key)) throw new Error('duplicate delivery receipt item');
+    seen.add(key);
+    return { kind, id, checksum };
+  });
+  return {
+    protocolVersion: 1,
+    turnId: String(value.turnId),
+    deliveredAt: Number(value.deliveredAt),
+    items
+  };
+}
+
 function requireId(value, label, prefix = '') {
   const text = String(value || '');
   if (!ID_PATTERN.test(text) || (prefix && !text.startsWith(prefix))) {

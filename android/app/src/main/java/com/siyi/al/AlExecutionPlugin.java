@@ -408,6 +408,7 @@ public final class AlExecutionPlugin extends Plugin {
         execute(call, () -> {
             String turnId = required(call, "turnId");
             store.acknowledgeUiApplied(turnId, System.currentTimeMillis());
+            AlExecutionService.requestRun(getContext());
             return turnResult(store.turn(turnId));
         });
     }
@@ -572,6 +573,10 @@ public final class AlExecutionPlugin extends Plugin {
                         result.put("origin", checkpoint.optString("origin", ""));
                         result.put("fallback", checkpoint.optBoolean("fallback", false));
                         result.put("attemptedRoutes", checkpoint.optJSONArray("attemptedRoutes") == null ? new JSONArray() : checkpoint.optJSONArray("attemptedRoutes"));
+                    }
+                    JSONObject bridgeResponse = checkpoint.optJSONObject("bridgeResponse");
+                    if (bridgeResponse != null && bridgeResponse.optJSONArray("deliveryItems") != null) {
+                        result.put("deliveryItems", bridgeResponse.optJSONArray("deliveryItems"));
                     }
                 } catch (Exception ignored) {
                     // Ordinary memory-model output is not a bridge checkpoint.

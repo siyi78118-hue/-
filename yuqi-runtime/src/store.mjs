@@ -2,7 +2,14 @@ import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
-import { TURN_STATES, canonicalJson, contentHash, validateEnvelope } from './protocol.mjs';
+import {
+  TURN_STATES,
+  canonicalJson,
+  contentHash,
+  deliveryItemsForResult,
+  validateDeliveryReceipt,
+  validateEnvelope
+} from './protocol.mjs';
 
 const TURN_PATCH_COLUMNS = new Map([
   ['memoryPacketJson', 'memory_packet_json'],
@@ -453,6 +460,19 @@ export class YuqiStore {
         created_at INTEGER NOT NULL,
         FOREIGN KEY(message_id) REFERENCES messages(message_id)
       );
+
+      CREATE TABLE IF NOT EXISTS delivery_receipt_items (
+        turn_id TEXT NOT NULL,
+        item_kind TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        delivered_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY(turn_id, item_kind, item_id),
+        FOREIGN KEY(turn_id) REFERENCES turns(turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_delivery_receipt_items_turn
+        ON delivery_receipt_items(turn_id, delivered_at);
 
       CREATE TABLE IF NOT EXISTS life_episodes (
         episode_id TEXT PRIMARY KEY,
@@ -1117,6 +1137,135 @@ export class YuqiStore {
     return mapCloudDelivery(this.db.prepare(`
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, peerId));
+  }
+
+  getDeliveryState(turnId) {
+    const turn = this.getTurn(turnId);
+    if (!turn?.replyJson) return null;
+    const expectedItems = deliveryItemsForResult(parseJson(turn.replyJson, {}));
+    const delivered = this.db.prepare(`
+      SELECT item_kind, item_id, checksum, delivered_at
+      FROM delivery_receipt_items
+      WHERE turn_id = ?
+      ORDER BY delivered_at, item_kind, item_id
+    `).all(turnId).map(row => ({
+      kind: row.item_kind,
+      id: row.item_id,
+      checksum: row.checksum,
+      deliveredAt: row.delivered_at
+    }));
+    const deliveredKeys = new Set(delivered.map(item => `${item.kind}:${item.id}`));
+    return {
+      turnId,
+      expectedItems,
+      deliveredItems: delivered,
+      pendingItems: expectedItems.filter(item => !deliveredKeys.has(`${item.kind}:${item.id}`)),
+      complete: expectedItems.length > 0 && expectedItems.every(
+        item => deliveredKeys.has(`${item.kind}:${item.id}`)
+      )
+    };
+  }
+
+  promoteDeliveredMessageFactsInternal(messageId, deliveredAt = now()) {
+    const rows = this.db.prepare(`
+      SELECT * FROM facts
+      WHERE status = 'provisional'
+        AND source_message_ids_json LIKE ?
+    `).all(`%${String(messageId).replaceAll('%', '\\%').replaceAll('_', '\\_')}%`);
+    let promoted = 0;
+    for (const row of rows) {
+      const fact = mapFact(row);
+      if (
+        fact?.evidenceSource !== 'fallback_provisional'
+        || !(fact.sourceMessageIds || []).includes(String(messageId))
+      ) continue;
+      const next = {
+        ...fact,
+        evidenceSource: 'yuqi_delivered_message',
+        status: 'verified',
+        verifiedAt: Number(deliveredAt)
+      };
+      this.db.prepare(`
+        UPDATE facts
+        SET status = 'verified', origin = ?, checksum = ?, verified_at = ?, fact_json = ?
+        WHERE fact_id = ? AND status = 'provisional'
+      `).run(
+        String(next.origin || 'consolidation'),
+        contentHash(next),
+        Number(deliveredAt),
+        canonicalJson(next),
+        next.factId
+      );
+      promoted += 1;
+    }
+    return promoted;
+  }
+
+  recordDeliveryReceipt(receipt) {
+    const normalized = validateDeliveryReceipt(receipt);
+    const turn = this.getTurn(normalized.turnId);
+    if (!turn?.replyJson) throw new Error('delivery receipt turn has no approved result');
+    const expected = new Map(
+      deliveryItemsForResult(parseJson(turn.replyJson, {}))
+        .map(item => [`${item.kind}:${item.id}`, item])
+    );
+    for (const item of normalized.items) {
+      const authoritative = expected.get(`${item.kind}:${item.id}`);
+      if (!authoritative) throw new Error('delivery receipt item does not belong to turn result');
+      if (authoritative.checksum !== item.checksum) {
+        throw new Error('delivery receipt item checksum mismatch');
+      }
+    }
+    return this.transaction(() => {
+      for (const item of normalized.items) {
+        const existing = this.db.prepare(`
+          SELECT checksum FROM delivery_receipt_items
+          WHERE turn_id = ? AND item_kind = ? AND item_id = ?
+        `).get(normalized.turnId, item.kind, item.id);
+        if (existing && existing.checksum !== item.checksum) {
+          throw new Error('delivery receipt item conflict');
+        }
+        this.db.prepare(`
+          INSERT OR IGNORE INTO delivery_receipt_items(
+            turn_id, item_kind, item_id, checksum, delivered_at, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          normalized.turnId,
+          item.kind,
+          item.id,
+          item.checksum,
+          normalized.deliveredAt,
+          now()
+        );
+        if (item.kind === 'message') {
+          this.db.prepare(`
+            DELETE FROM suppressed_messages
+            WHERE message_id = ? AND reason = 'pending_phone_receipt'
+          `).run(item.id);
+          this.promoteDeliveredMessageFactsInternal(item.id, normalized.deliveredAt);
+        }
+      }
+      return this.getDeliveryState(normalized.turnId);
+    });
+  }
+
+  confirmCloudDeliveryItems(turnId, peerId, receipt) {
+    const deliveryState = this.recordDeliveryReceipt(receipt);
+    const delivery = this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+    `).get(turnId, String(peerId));
+    if (!delivery) throw new Error('cloud delivery not found');
+    if (delivery.state !== 'confirmed') {
+      if (!['mailboxed', 'delivered'].includes(delivery.state)) {
+        throw new Error('cloud delivery is not awaiting a phone receipt');
+      }
+      this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'confirmed', confirmed_at = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ?
+      `).run(Number(receipt.deliveredAt) || now(), now(), turnId, String(peerId));
+    }
+    return deliveryState;
   }
 
   confirmCloudDelivery(turnId, peerId, receipt) {

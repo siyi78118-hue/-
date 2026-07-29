@@ -296,3 +296,35 @@ test('a phone delivery receipt confirms memory without dispatching a chat turn',
   ]);
   assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
 });
+
+test('an encrypted itemized phone receipt uses the unified exact delivery store before relay ack', async () => {
+  const receipt = {
+    type: 'DELIVERY_RECEIPT',
+    protocolVersion: 1,
+    turnId: 'turn_phone_cloud_v2_2',
+    peerId: 'phone_cloud',
+    deliveredAt: 1784400010000,
+    items: [{ kind: 'message', id: 'msg_yuqi_2', checksum: 'b'.repeat(64) }]
+  };
+  const relay = relayFixture(receipt);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: { accept() { throw new Error('receipt must not dispatch'); } },
+    store: {
+      registerCloudDelivery() {},
+      confirmCloudDelivery() { throw new Error('legacy receipt path must not run'); },
+      confirmCloudDeliveryItems(turnId, peerId, value) {
+        events.push(`items:${turnId}:${peerId}:${value.items.length}`);
+        return { complete: true };
+      }
+    }
+  });
+
+  const result = await pump.pumpOnce();
+
+  assert.equal(result.processed, 1);
+  assert.deepEqual(events, ['items:turn_phone_cloud_v2_2:phone_cloud:1']);
+  assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+});

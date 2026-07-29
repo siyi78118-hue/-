@@ -160,7 +160,9 @@ public final class ExecutionEngine {
             .put("fallback", result.fallback)
             .put("attemptedRoutes", new JSONArray(result.attemptedRoutes));
         JSONObject bridgeResponse = new JSONObject(result.responseJson == null ? "{}" : result.responseJson);
-        if (bridgeResponse.has("_relayMessageId")) checkpoint.put("bridgeResponse", bridgeResponse);
+        if (bridgeResponse.has("_relayMessageId") || bridgeResponse.has("deliveryItems")) {
+            checkpoint.put("bridgeResponse", bridgeResponse);
+        }
         store.saveMemoryResult(turn.turnId, attempt.attemptId, checkpoint.toString(), clock.now());
         store.markStage(turn.turnId, attempt.attemptId, TurnState.CHAT_RUNNING, AttemptStage.CHAT, clock.now());
         if (result.skipped) {

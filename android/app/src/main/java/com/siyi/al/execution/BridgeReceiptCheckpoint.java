@@ -18,7 +18,12 @@ final class BridgeReceiptCheckpoint {
             } else {
                 return null;
             }
-            return response.optString("_relayMessageId", "").trim().isEmpty() ? null : response;
+            if (!response.has("deliveryItems")
+                    && response.optString("_relayMessageId", "").trim().isEmpty()) return null;
+            if (!response.has("_deliveryRoute")) {
+                response.put("_deliveryRoute", checkpoint.optString("origin", ""));
+            }
+            return response;
         } catch (Exception ignored) {
             return null;
         }

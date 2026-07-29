@@ -57,12 +57,11 @@ final class ExecutionRuntime {
         return client.drainCloudInbox();
     }
 
-    static boolean confirmCloudResult(Context context, String responseJson) throws Exception {
+    static boolean confirmAppliedResult(Context context, String responseJson) throws Exception {
         AlExecutionDatabase database = AlExecutionDatabase.get(context);
         AlSecretStore secrets = new AlSecretStore(context);
         BridgeConfig config = secrets.loadBridgeConfig();
-        if (!config.hasCloud()) return false;
         FallbackJournal journal = new FallbackJournal(database.executionDao(), config.deviceId);
-        return new BridgeClient(config, journal).confirmCloudResult(responseJson);
+        return new BridgeClient(config, journal).confirmAppliedResult(responseJson);
     }
 }

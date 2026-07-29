@@ -9,6 +9,7 @@ import {
   TURN_STATES,
   canonicalJson,
   contentHash,
+  deliveryItemsForResult,
   validateEnvelope
 } from '../src/protocol.mjs';
 import { YuqiStore } from '../src/store.mjs';
@@ -816,6 +817,60 @@ test('persists one cloud delivery target per turn and peer across reopening', ()
   } finally {
     reopened.close();
   }
+}));
+
+test('delivery receipts merge partial out-of-order items idempotently and reject foreign items', () => withStore(({ store }) => {
+  const turn = store.submitTurn(validV2Envelope());
+  const reply = store.putMessage({
+    messageId: 'msg_yuqi_delivery_1',
+    turnId: turn.turnId,
+    characterId: 'yuqi',
+    speakerId: 'yuqi',
+    speakerType: 'character',
+    recipientId: 'user',
+    content: '好呀，我记住了。',
+    sentAt: 1784400001000,
+    origin: 'codex'
+  });
+  store.quarantinePendingReply(reply.messageId);
+  const result = {
+    turnId: turn.turnId,
+    reply,
+    paymentAction: {
+      messageId: 'pay_1', kind: 'redpacket', amount: 20, status: 'received'
+    },
+    momentAction: null,
+    lifeAdjustment: null,
+    relationshipStageAction: null,
+    rolePlanOperations: []
+  };
+  store.db.prepare(
+    "UPDATE turns SET state = 'committed', reply_json = ? WHERE turn_id = ?"
+  ).run(JSON.stringify(result), turn.turnId);
+  const [messageItem, actionItem] = deliveryItemsForResult(result);
+  const receipt = items => ({
+    protocolVersion: 1,
+    turnId: turn.turnId,
+    deliveredAt: 1784400002000,
+    items
+  });
+
+  const actionOnly = store.recordDeliveryReceipt(receipt([actionItem]));
+  assert.equal(actionOnly.complete, false);
+  assert.deepEqual(actionOnly.pendingItems, [messageItem]);
+  assert.equal(store.isMessageSuppressed(reply.messageId), true);
+
+  store.recordDeliveryReceipt(receipt([actionItem]));
+  const complete = store.recordDeliveryReceipt(receipt([messageItem]));
+  assert.equal(complete.complete, true);
+  assert.equal(complete.deliveredItems.length, 2);
+  assert.equal(store.isMessageSuppressed(reply.messageId), false);
+
+  assert.throws(() => store.recordDeliveryReceipt(receipt([{
+    kind: 'action',
+    id: `${turn.turnId}:foreign`,
+    checksum: '0'.repeat(64)
+  }])), /does not belong/i);
 }));
 
 test('recovers a failed brain draft as one committed reply and resets cloud delivery', () => withStore(({ store }) => {

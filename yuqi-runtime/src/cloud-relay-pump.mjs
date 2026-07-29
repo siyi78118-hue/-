@@ -137,11 +137,19 @@ export class CloudRelayPump {
             if (!this.store || typeof this.store.confirmCloudDelivery !== 'function') {
               throw new Error('delivery receipt store is unavailable');
             }
-            this.store.confirmCloudDelivery(
-              String(envelope.turnId || ''),
-              String(envelope.peerId || this.deviceId),
-              envelope
-            );
+            if (Array.isArray(envelope.items)) {
+              this.store.confirmCloudDeliveryItems(
+                String(envelope.turnId || ''),
+                String(envelope.peerId || this.deviceId),
+                envelope
+              );
+            } else {
+              this.store.confirmCloudDelivery(
+                String(envelope.turnId || ''),
+                String(envelope.peerId || this.deviceId),
+                envelope
+              );
+            }
             const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {
               method: 'POST', headers: this.headers(true),
               body: JSON.stringify({ deviceId: this.deviceId, messageIds: [message.messageId] })

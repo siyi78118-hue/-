@@ -40,6 +40,7 @@ export function publicTurnStatus(turn, { stages = [], clock = Date.now } = {}) {
     rolePlanOperations: committed && Array.isArray(result?.rolePlanOperations)
       ? result.rolePlanOperations
       : [],
+    deliveryItems: committed ? deliveryItemsForResult(result) : [],
     reply: committed ? result?.reply || null : null,
     errorCode: failed ? String(error?.code || error?.name || 'YUQI_ROLE_FAILED') : '',
     origin: committed ? String(result?.reply?.origin || turn.origin || 'codex') : String(turn.origin || 'codex'),
@@ -55,3 +56,4 @@ export function publicTurnStatus(turn, { stages = [], clock = Date.now } = {}) {
     retryAfterMs: committed || failed ? 0 : 1500
   };
 }
+import { deliveryItemsForResult } from './protocol.mjs';

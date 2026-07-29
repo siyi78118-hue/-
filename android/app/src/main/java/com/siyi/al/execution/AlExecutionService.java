@@ -177,12 +177,13 @@ public final class AlExecutionService extends Service {
     private void confirmBridgeDelivery(ChatTurnEntity turn, SharedPreferences confirmed) {
         String key = "turn." + turn.turnId;
         if (confirmed.getBoolean(key, false)) return;
+        if (turn.uiAppliedAt == null) return;
         try {
             com.siyi.al.execution.db.ExecutionAttemptEntity attempt = executionStore.activeAttempt(turn.turnId);
             if (attempt == null || attempt.memoryResult == null || attempt.memoryResult.trim().isEmpty()) return;
             JSONObject response = BridgeReceiptCheckpoint.extract(attempt.memoryResult);
             if (response == null) return;
-            if (ExecutionRuntime.confirmCloudResult(this, response.toString())) {
+            if (ExecutionRuntime.confirmAppliedResult(this, response.toString())) {
                 confirmed.edit().putBoolean(key, true).apply();
                 executionStore.recordDiagnostic(
                     turn.turnId, turn.activeAttemptId, "INFO", "PHONE_RECEIPT_SENT",

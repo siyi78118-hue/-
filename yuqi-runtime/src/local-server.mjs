@@ -145,6 +145,19 @@ export function createYuqiServer({
         ? json(response, 200, { ok: true, ...status })
         : json(response, 404, { ok: false, error: 'turn not found' });
     }
+    const receiptMatch = /^\/v2\/turns\/([^/]+)\/delivery-receipt$/.exec(url.pathname);
+    if (request.method === 'POST' && receiptMatch) {
+      const turnId = decodeURIComponent(receiptMatch[1]);
+      if (String(body?.turnId || '') !== turnId) {
+        return json(response, 400, { ok: false, error: 'delivery receipt turn mismatch' });
+      }
+      try {
+        const delivery = store.recordDeliveryReceipt(body);
+        return json(response, 200, { ok: true, delivery });
+      } catch (error) {
+        return json(response, 409, { ok: false, error: error.message });
+      }
+    }
     const turnMatch = /^\/v1\/turns\/([^/]+)$/.exec(url.pathname);
     if (request.method === 'GET' && turnMatch) {
       const turn = store.getTurn(decodeURIComponent(turnMatch[1]));

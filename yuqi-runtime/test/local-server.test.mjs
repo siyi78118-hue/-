@@ -93,6 +93,44 @@ test('health exposes only the non-sensitive cloud relay connection summary', asy
   }
 });
 
+test('accepts a signed exact delivery receipt through the shared store path', async () => {
+  const received = [];
+  const store = {
+    getSyncDelta: () => [],
+    ackSync: () => 0,
+    recordDeliveryReceipt: value => {
+      received.push(value);
+      return { turnId: value.turnId, complete: true, pendingItems: [] };
+    }
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store,
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const body = {
+      protocolVersion: 1,
+      turnId: 'turn_phone_receipt_1',
+      deliveredAt: 1784400000000,
+      items: [{ kind: 'message', id: 'msg_1', checksum: 'a'.repeat(64) }]
+    };
+    const response = await call(server.address().port, {
+      method: 'POST',
+      path: '/v2/turns/turn_phone_receipt_1/delivery-receipt',
+      body,
+      secret: 'test-pairing-secret',
+      nonce: 'receipt-nonce'
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.delivery.complete, true);
+    assert.deepEqual(received, [body]);
+  } finally {
+    await server.close();
+  }
+});
+
 test('rejects stale, tampered, and oversized requests', async () => {
   const server = createYuqiServer({
     secret: 'test-pairing-secret',

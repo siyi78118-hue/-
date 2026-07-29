@@ -245,6 +245,21 @@ public final class BridgeClient {
         return true;
     }
 
+    public boolean confirmAppliedResult(String responseJson) throws Exception {
+        JSONObject decoded = new JSONObject(responseJson == null ? "{}" : responseJson);
+        String route = decoded.optString("_deliveryRoute", "").trim();
+        if ("cloud".equals(route) || !decoded.optString("_relayMessageId", "").trim().isEmpty()) {
+            return confirmCloudResult(decoded.toString());
+        }
+        if (!"lan".equals(route) || !config.hasLan()) return false;
+        JSONObject receipt = itemizedDeliveryReceipt(decoded);
+        String turnId = receipt.getString("turnId");
+        String path = "/v2/turns/" + URLEncoder.encode(turnId, "UTF-8") + "/delivery-receipt";
+        HttpResult response = signedLan("POST", path, receipt.toString());
+        requireSuccess(response, "LAN delivery receipt");
+        return true;
+    }
+
     private boolean processBacklogCommitted(JSONObject decoded, String raw) throws Exception {
         if (inboxConsumer == null || !inboxConsumer.persist(raw)) return false;
         publishDeliveryReceipt(decoded);
@@ -253,23 +268,34 @@ public final class BridgeClient {
     }
 
     private void publishDeliveryReceipt(JSONObject decoded) throws Exception {
-        JSONObject reply = decoded.optJSONObject("reply");
-        if (reply == null) throw new IllegalStateException("cloud reply is missing");
-        String turnId = decoded.optString("turnId", "").trim();
-        String messageId = reply.optString("messageId", "").trim();
-        String content = reply.optString("content", "");
-        if (turnId.isEmpty() || messageId.isEmpty() || content.trim().isEmpty()) {
-            throw new IllegalStateException("cloud reply identity is incomplete");
+        JSONObject receipt;
+        if (decoded.optJSONArray("deliveryItems") == null) {
+            JSONObject reply = decoded.optJSONObject("reply");
+            if (reply == null) throw new IllegalStateException("cloud reply is missing");
+            String turnId = decoded.optString("turnId", "").trim();
+            String messageId = reply.optString("messageId", "").trim();
+            String content = reply.optString("content", "");
+            if (turnId.isEmpty() || messageId.isEmpty() || content.trim().isEmpty()) {
+                throw new IllegalStateException("cloud reply identity is incomplete");
+            }
+            receipt = new JSONObject()
+                .put("type", "DELIVERY_RECEIPT")
+                .put("peerId", config.deviceId)
+                .put("turnId", turnId)
+                .put("messageId", messageId)
+                .put("contentSha256", sha256(content))
+                .put("receivedAt", clock.now());
+        } else {
+            receipt = itemizedDeliveryReceipt(decoded);
+            receipt.put("type", "DELIVERY_RECEIPT").put("peerId", config.deviceId);
         }
-        JSONObject receipt = new JSONObject()
-            .put("type", "DELIVERY_RECEIPT")
-            .put("peerId", config.deviceId)
-            .put("turnId", turnId)
-            .put("messageId", messageId)
-            .put("contentSha256", sha256(content))
-            .put("receivedAt", clock.now());
+        String turnId = receipt.getString("turnId");
         Encrypted encrypted = encrypt(receipt.toString());
-        String identity = turnId + ":" + messageId;
+        String identity = turnId + ":" + (
+            receipt.optJSONArray("items") == null
+                ? receipt.optString("messageId", "")
+                : sha256(receipt.getJSONArray("items").toString())
+        );
         JSONObject output = new JSONObject()
             .put("deviceId", config.deviceId)
             .put("messageId", "receipt_" + sha256(identity).substring(0, 24))
@@ -282,6 +308,19 @@ public final class BridgeClient {
             "POST", config.cloudUrl + "/bridge/enqueue", output.toString(), bearerHeaders()
         );
         requireSuccess(response, "delivery receipt enqueue");
+    }
+
+    private JSONObject itemizedDeliveryReceipt(JSONObject decoded) throws Exception {
+        String turnId = decoded.optString("turnId", "").trim();
+        JSONArray items = decoded.optJSONArray("deliveryItems");
+        if (turnId.isEmpty() || items == null || items.length() == 0) {
+            throw new IllegalStateException("delivery receipt identity is incomplete");
+        }
+        return new JSONObject()
+            .put("protocolVersion", 1)
+            .put("turnId", turnId)
+            .put("deliveredAt", clock.now())
+            .put("items", items);
     }
 
     public static String signLanRequest(
