@@ -41,6 +41,10 @@ export function validateFactCandidate(candidate, rawMessages) {
   if (reasons.length) return { status: 'rejected', reasons, fact: normalizeCandidate(candidate, 'rejected') };
 
   let status = 'verified';
+  if (candidate.evidenceSource === 'fallback_provisional') {
+    status = 'provisional';
+    reasons.push('fallback or undelivered character text is provisional until delivery is confirmed');
+  }
   if (candidate.type === 'commitment') {
     for (const sourceId of sourceIds) {
       const raw = byId.get(sourceId);

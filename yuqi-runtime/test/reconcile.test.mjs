@@ -45,7 +45,7 @@ function fallbackBatch() {
   ];
 }
 
-test('replays exact fallback messages through memory and never creates a second reply', async () => withStore(async store => {
+test('queues exact fallback messages for background consolidation and never creates a second reply', async () => withStore(async store => {
   const roleCalls = [];
   const codex = {
       async runTurn(role, input, options) {
@@ -59,11 +59,12 @@ test('replays exact fallback messages through memory and never creates a second 
   assert.equal(result.ackSeq, 12);
   assert.deepEqual(result.deliverReplies, []);
   assert.deepEqual(result.reconciledFallbackTurns, ['turn_phone_11']);
-  assert.deepEqual(roleCalls.map(call => call.role), ['memory']);
-  assert.equal(roleCalls[0].options.model, 'gpt-5.6-sol');
-  assert.equal(roleCalls[0].options.effort, 'medium');
-  assert.equal(roleCalls[0].input.exactRawMessages[0].speakerId, 'user');
-  assert.equal(roleCalls[0].input.exactRawMessages[1].speakerId, 'yuqi');
+  assert.deepEqual(roleCalls, []);
+  const queued = store.db.prepare(
+    'SELECT state, payload_json FROM consolidation_jobs WHERE turn_id = ?'
+  ).get('turn_phone_11');
+  assert.equal(queued.state, 'queued');
+  assert.deepEqual(JSON.parse(queued.payload_json).messageIds, ['msg_phone_11', 'msg_fallback_11']);
   assert.equal(store.getSyncCursor('phone_a'), 12);
 }));
 
@@ -89,8 +90,12 @@ test('reconciles legacy frontend fallback messages as character memory without d
 
   assert.equal(result.importedMessages, 1);
   assert.deepEqual(result.deliverReplies, []);
-  assert.deepEqual(calls.map(call => call.role), ['memory']);
-  assert.equal(calls[0].input.exactRawMessages[0].speakerId, 'yuqi');
+  assert.deepEqual(calls, []);
+  assert.equal(
+    store.db.prepare('SELECT state FROM consolidation_jobs WHERE turn_id = ?')
+      .get('turn_legacy_0241').state,
+    'queued'
+  );
   assert.equal(store.getMessage('msg_legacy_0241').origin, 'legacy_fallback');
 }));
 
@@ -102,22 +107,24 @@ test('duplicate recovery batches are idempotent and do not rerun memory', async 
   });
   await reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 10, entries: fallbackBatch() });
   const duplicate = await reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 10, entries: fallbackBatch() });
-  assert.equal(calls, 1);
+  assert.equal(calls, 0);
   assert.equal(duplicate.importedMessages, 0);
   assert.equal(duplicate.ackSeq, 12);
 }));
 
-test('a memory-role failure leaves the cursor unacknowledged for a later retry', async () => withStore(async store => {
+test('a memory provider outage does not block durable reconciliation or its cursor', async () => withStore(async store => {
   const reconciler = new YuqiReconciler({
     store,
     codex: { async runTurn() { throw new Error('memory thread unavailable'); } }
   });
-  await assert.rejects(
-    reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 10, entries: fallbackBatch() }),
-    /memory thread unavailable/
+  await reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 10, entries: fallbackBatch() });
+  assert.equal(store.getSyncCursor('phone_a'), 12);
+  assert.equal(store.listMessages('yuqi', 20).length, 2);
+  assert.equal(
+    store.db.prepare('SELECT state FROM consolidation_jobs WHERE turn_id = ?')
+      .get('turn_phone_11').state,
+    'queued'
   );
-  assert.equal(store.getSyncCursor('phone_a'), 10);
-  assert.equal(store.listMessages('yuqi', 20).length, 2, 'raw chat remains durable even when memory analysis fails');
 }));
 
 test('an already-generated Codex reply is preserved raw but hidden behind the reply actually shown to the user', async () => withStore(async store => {

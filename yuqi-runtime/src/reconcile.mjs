@@ -1,14 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import { commitVerifiedFacts } from './evidence-memory.mjs';
 import { canonicalJson, contentHash } from './protocol.mjs';
-
-function parseRoleJson(text) {
-  const source = String(text || '').trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-  const value = JSON.parse(source);
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('memory recovery returned invalid JSON');
-  return value;
-}
 
 function legacyAndroidContentHash(value) {
   return createHash('sha256')
@@ -85,32 +77,24 @@ export class YuqiReconciler {
       suppressedReplies += this.store.suppressCompetingReplies(reply.turnId, reply.messageId);
     }
 
-    try {
-      if (fallbackTurns.length) {
-        const exactRawMessages = pending
-          .filter(entry => entry.entityType === 'message' && fallbackTurns.includes(entry.payload?.turnId))
-          .map(entry => this.store.getMessage(entry.entityId))
-          .filter(Boolean);
-        const response = await this.codex.runTurn('memory', JSON.stringify({
-          task: 'reconcile_fallback_memory_only',
-          rule: 'Read exact raw messages, preserve speaker attribution, and propose evidence-backed facts. Do not draft or resend a chat reply.',
-          fallbackTurnIds: fallbackTurns,
-          exactRawMessages
-        }), {
-          clientUserMessageId: `reconcile_${peerId}_${pending.at(-1).seq}`,
-          model: 'gpt-5.6-sol',
-          effort: 'medium'
-        });
-        const parsed = parseRoleJson(response.text);
-        commitVerifiedFacts(this.store, Array.isArray(parsed.candidates) ? parsed.candidates : [], exactRawMessages);
-      }
-    } catch (error) {
-      this.store.putDiagnostic({
-        stage: 'fallback_reconciliation',
-        level: 'error',
-        detail: { peerId, fromSeq: acknowledged + 1, toSeq: pending.at(-1).seq, message: error.message }
+    for (const fallbackTurnId of fallbackTurns) {
+      const messageIds = pending
+        .filter(entry => entry.entityType === 'message' && entry.payload?.turnId === fallbackTurnId)
+        .map(entry => String(entry.entityId));
+      this.store.createConsolidationJobInternal({
+        subjectType: 'turn',
+        subjectId: fallbackTurnId,
+        turnId: fallbackTurnId,
+        roleId: 'yuqi',
+        jobType: 'turn_consolidation',
+        dueAt: Date.now(),
+        payload: {
+          turnId: fallbackTurnId,
+          messageIds,
+          evidenceSource: 'fallback_provisional',
+          reconcilePeerId: peerId
+        }
       });
-      throw error;
     }
 
     const ackSeq = Number(pending.at(-1).seq);

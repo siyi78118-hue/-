@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { CodexAppServerClient } from './codex-client.mjs';
 import { CognitivePipeline } from './cognitive-pipeline.mjs';
+import { ConsolidationWorker } from './consolidation-worker.mjs';
 import { CloudRelayPump } from './cloud-relay-pump.mjs';
 import { createYuqiServer } from './local-server.mjs';
 import { YuqiOrchestrator } from './orchestrator.mjs';
@@ -49,6 +50,12 @@ const orchestrator = new YuqiOrchestrator({
 });
 const reconciler = new YuqiReconciler({ store, codex });
 const dispatcher = new TurnDispatcher({ store, orchestrator });
+const consolidationWorker = new ConsolidationWorker({
+  store,
+  codexClient: codex,
+  presetRegistry: presets,
+  workerId: 'yuqi-memory-consolidation'
+});
 const shadowDispatcher = new ShadowDispatcher({
   store,
   cognitivePipeline,
@@ -98,6 +105,7 @@ const server = createYuqiServer({
 
 await server.listen({ host: config.host || '0.0.0.0', port: Number(config.port) || 17891 });
 dispatcher.recover();
+consolidationWorker.start();
 shadowDispatcher.start();
 cloudPump?.start(config.cloudRelay.pollIntervalMs || 1500);
 function checkLifePlanning() {
@@ -121,6 +129,7 @@ async function stop() {
   if (stopping) return;
   stopping = true;
   clearInterval(lifeBoundaryTimer);
+  try { await consolidationWorker.stop(); } catch {}
   try { shadowDispatcher.stop(); } catch {}
   try { cloudPump?.stop(); } catch {}
   try { await server.close(); } catch {}
