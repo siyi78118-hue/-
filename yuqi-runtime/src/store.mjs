@@ -33,6 +33,9 @@ function mapTurn(row) {
     state: row.state,
     route: row.route || 'deep',
     routeReasons: parseJson(row.route_reasons_json, []),
+    pipelineMode: row.pipeline_mode || 'legacy',
+    presetVersion: row.preset_version || '1.9.1',
+    annotationSnapshot: parseJson(row.annotation_snapshot_json, {}),
     workerId: row.worker_id || '',
     origin: row.origin,
     memoryPacketJson: row.memory_packet_json,
@@ -45,6 +48,85 @@ function mapTurn(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
+}
+
+function mapCognitiveState(row) {
+  if (!row) return null;
+  return {
+    roleId: row.role_id,
+    schemaVersion: row.schema_version,
+    revision: row.revision,
+    lastTurnId: row.last_turn_id,
+    state: parseJson(row.state_json, {}),
+    checksum: row.checksum,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapConsolidationJob(row) {
+  if (!row) return null;
+  return {
+    jobId: row.job_id,
+    subjectType: row.subject_type,
+    subjectId: row.subject_id,
+    turnId: row.turn_id || null,
+    roleId: row.role_id,
+    jobType: row.job_type,
+    state: row.state,
+    attemptCount: row.attempt_count,
+    dueAt: row.due_at,
+    leaseOwner: row.lease_owner || null,
+    leaseExpiresAt: row.lease_expires_at ?? null,
+    payload: parseJson(row.payload_json, {}),
+    payloadChecksum: row.payload_checksum,
+    lastErrorCode: row.last_error_code || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapShadowRun(row) {
+  if (!row) return null;
+  return {
+    runId: row.run_id,
+    subjectType: row.subject_type,
+    subjectId: row.subject_id,
+    turnId: row.turn_id || null,
+    rolloutKey: row.rollout_key,
+    source: row.source,
+    comparisonDirection: row.comparison_direction,
+    evidenceEpoch: row.evidence_epoch,
+    shadowEpoch: row.shadow_epoch ?? null,
+    canaryEpoch: row.canary_epoch ?? null,
+    canarySlot: row.canary_slot ?? null,
+    rolloutRevision: row.rollout_revision,
+    pipelineChecksum: row.pipeline_checksum,
+    state: row.state,
+    authoritativeResultChecksum: row.authoritative_result_checksum || null,
+    comparisonResultChecksum: row.comparison_result_checksum || null,
+    metrics: parseJson(row.metrics_json, null),
+    criticalFindings: parseJson(row.critical_findings_json, null),
+    latencyMs: row.latency_ms ?? null,
+    errorCode: row.error_code || null,
+    staleForRollout: Boolean(row.stale_for_rollout),
+    sourceDeletedAt: row.source_deleted_at ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+export class CognitiveStateConflictError extends Error {
+  constructor(message = 'cognitive state revision/checksum conflict') {
+    super(message);
+    this.name = 'CognitiveStateConflictError';
+  }
+}
+
+export class ConsolidationJobConflictError extends Error {
+  constructor(message = 'consolidation job payload conflict') {
+    super(message);
+    this.name = 'ConsolidationJobConflictError';
+  }
 }
 
 function mapMessage(row) {
@@ -398,6 +480,79 @@ export class YuqiStore {
         state_json TEXT NOT NULL DEFAULT '{}',
         updated_at INTEGER NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS cognitive_states (
+        role_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        last_turn_id TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS consolidation_jobs (
+        job_id TEXT PRIMARY KEY,
+        subject_type TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        turn_id TEXT,
+        role_id TEXT NOT NULL,
+        job_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        due_at INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at INTEGER,
+        payload_json TEXT NOT NULL,
+        payload_checksum TEXT NOT NULL,
+        last_error_code TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(subject_type, subject_id, job_type),
+        CHECK(subject_type IN ('turn', 'role_history', 'life_planning')),
+        CHECK(
+          (subject_type = 'turn' AND turn_id IS NOT NULL)
+          OR (subject_type <> 'turn' AND turn_id IS NULL)
+        )
+      );
+      CREATE INDEX IF NOT EXISTS idx_consolidation_jobs_due
+        ON consolidation_jobs(state, due_at, job_type);
+
+      CREATE TABLE IF NOT EXISTS consolidation_backfill_cursors (
+        role_id TEXT PRIMARY KEY,
+        last_completed_group_key TEXT,
+        last_checksum TEXT,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cognition_shadow_runs (
+        run_id TEXT PRIMARY KEY,
+        subject_type TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        turn_id TEXT,
+        rollout_key TEXT NOT NULL,
+        source TEXT NOT NULL CHECK(source = 'live'),
+        comparison_direction TEXT NOT NULL,
+        evidence_epoch INTEGER NOT NULL,
+        shadow_epoch INTEGER,
+        canary_epoch INTEGER,
+        canary_slot INTEGER,
+        rollout_revision INTEGER NOT NULL,
+        pipeline_checksum TEXT NOT NULL,
+        state TEXT NOT NULL,
+        authoritative_result_checksum TEXT,
+        comparison_result_checksum TEXT,
+        metrics_json TEXT,
+        critical_findings_json TEXT,
+        latency_ms INTEGER,
+        error_code TEXT,
+        stale_for_rollout INTEGER NOT NULL DEFAULT 0,
+        source_deleted_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(subject_type, subject_id, comparison_direction),
+        CHECK(subject_type IN ('turn', 'life_planning'))
+      );
     `);
 
     const factColumns = new Set(this.db.prepare('PRAGMA table_info(facts)').all().map(row => row.name));
@@ -405,6 +560,9 @@ export class YuqiStore {
     const turnColumns = new Set(this.db.prepare('PRAGMA table_info(turns)').all().map(row => row.name));
     if (!turnColumns.has('route')) this.db.exec("ALTER TABLE turns ADD COLUMN route TEXT NOT NULL DEFAULT 'deep';");
     if (!turnColumns.has('route_reasons_json')) this.db.exec("ALTER TABLE turns ADD COLUMN route_reasons_json TEXT NOT NULL DEFAULT '[]';");
+    if (!turnColumns.has('pipeline_mode')) this.db.exec("ALTER TABLE turns ADD COLUMN pipeline_mode TEXT NOT NULL DEFAULT 'legacy';");
+    if (!turnColumns.has('preset_version')) this.db.exec("ALTER TABLE turns ADD COLUMN preset_version TEXT NOT NULL DEFAULT '1.9.1';");
+    if (!turnColumns.has('annotation_snapshot_json')) this.db.exec("ALTER TABLE turns ADD COLUMN annotation_snapshot_json TEXT NOT NULL DEFAULT '{}';");
     const deliveryColumns = new Set(this.db.prepare('PRAGMA table_info(cloud_deliveries)').all().map(row => row.name));
     if (!deliveryColumns.has('confirmed_at')) this.db.exec('ALTER TABLE cloud_deliveries ADD COLUMN confirmed_at INTEGER;');
     const sessionColumns = new Set(this.db.prepare('PRAGMA table_info(sessions)').all().map(row => row.name));
@@ -434,6 +592,7 @@ export class YuqiStore {
         AND legacy.content = canonical.content
         AND legacy.turn_id = canonical.turn_id;
     `);
+    this.db.exec('PRAGMA user_version = 6;');
   }
 
   transaction(run) {
@@ -458,7 +617,7 @@ export class YuqiStore {
     return Number(result.lastInsertRowid);
   }
 
-  submitTurn(input) {
+  submitTurn(input, pin = {}) {
     const envelope = validateEnvelope(input);
     const envelopeChecksum = contentHash(envelope);
     const sourceMessageId = envelope.message?.messageId || envelope.trigger?.triggerId || '';
@@ -541,8 +700,9 @@ export class YuqiStore {
       this.db.prepare(`
         INSERT INTO turns(
           turn_id, character_id, device_id, device_seq, source_message_id,
-          state, origin, envelope_json, envelope_checksum, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, 'queued', 'codex', ?, ?, ?, ?)
+          state, origin, envelope_json, envelope_checksum, created_at, updated_at,
+          pipeline_mode, preset_version, annotation_snapshot_json
+        ) VALUES (?, ?, ?, ?, ?, 'queued', 'codex', ?, ?, ?, ?, ?, ?, ?)
       `).run(
         envelope.turnId,
         envelope.characterId,
@@ -552,7 +712,10 @@ export class YuqiStore {
         canonicalJson(envelope),
         envelopeChecksum,
         envelope.createdAt,
-        now()
+        now(),
+        ['legacy', 'shadow', 'active'].includes(pin.pipelineMode) ? pin.pipelineMode : 'legacy',
+        String(pin.presetVersion || '1.9.1'),
+        canonicalJson(pin.annotationSnapshot || {})
       );
       if (envelope.message) this.putCurrentUserBatchInternal(envelope);
       const turn = this.getTurn(envelope.turnId);
@@ -1531,5 +1694,290 @@ export class YuqiStore {
       VALUES (?, ?, ?, ?, ?)
     `).run(turnId, stage, level, canonicalJson(detail), now());
     return Number(result.lastInsertRowid);
+  }
+
+  getCognitiveState(roleId) {
+    return mapCognitiveState(
+      this.db.prepare('SELECT * FROM cognitive_states WHERE role_id = ?').get(roleId)
+    );
+  }
+
+  putCognitiveStateInternal(state) {
+    const roleId = String(state?.roleId || '');
+    const revision = Number(state?.revision);
+    const schemaVersion = Number(state?.schemaVersion || 1);
+    const lastTurnId = String(state?.lastTurnId || '');
+    if (!roleId || !lastTurnId || !Number.isInteger(revision) || revision < 1) {
+      throw new CognitiveStateConflictError('invalid cognitive state identity');
+    }
+    const stateJson = canonicalJson(state?.state || {});
+    const checksum = contentHash(state?.state || {});
+    if (state?.checksum && state.checksum !== checksum) {
+      throw new CognitiveStateConflictError('cognitive state checksum mismatch');
+    }
+    const current = this.getCognitiveState(roleId);
+    if (current) {
+      if (current.lastTurnId === lastTurnId && current.revision === revision) {
+        if (current.checksum !== checksum) throw new CognitiveStateConflictError();
+        return current;
+      }
+      if (revision !== current.revision + 1) throw new CognitiveStateConflictError();
+      if (state.expectedChecksum && state.expectedChecksum !== current.checksum) {
+        throw new CognitiveStateConflictError();
+      }
+    } else if (revision !== 1) {
+      throw new CognitiveStateConflictError();
+    }
+    const updatedAt = Number(state?.updatedAt || now());
+    this.db.prepare(`
+      INSERT INTO cognitive_states(
+        role_id, schema_version, revision, last_turn_id, state_json, checksum, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(role_id) DO UPDATE SET
+        schema_version = excluded.schema_version,
+        revision = excluded.revision,
+        last_turn_id = excluded.last_turn_id,
+        state_json = excluded.state_json,
+        checksum = excluded.checksum,
+        updated_at = excluded.updated_at
+    `).run(roleId, schemaVersion, revision, lastTurnId, stateJson, checksum, updatedAt);
+    return this.getCognitiveState(roleId);
+  }
+
+  deleteCognitiveStateInternal(roleId) {
+    return Number(this.db.prepare('DELETE FROM cognitive_states WHERE role_id = ?').run(roleId).changes);
+  }
+
+  createConsolidationJobInternal(job) {
+    const subjectType = String(job?.subjectType || '');
+    const subjectId = String(job?.subjectId || '');
+    const jobType = String(job?.jobType || '');
+    const roleId = String(job?.roleId || '');
+    const turnId = job?.turnId ? String(job.turnId) : null;
+    if (!['turn', 'role_history', 'life_planning'].includes(subjectType)
+      || !subjectId || !roleId
+      || !['turn_consolidation', 'history_backfill', 'shadow_cognition', 'active_canary_compare'].includes(jobType)
+      || (subjectType === 'turn') !== Boolean(turnId)) {
+      throw new Error('invalid consolidation job');
+    }
+    const payloadJson = canonicalJson(job?.payload || {});
+    const payloadChecksum = contentHash(job?.payload || {});
+    const existing = this.db.prepare(`
+      SELECT * FROM consolidation_jobs
+      WHERE subject_type = ? AND subject_id = ? AND job_type = ?
+    `).get(subjectType, subjectId, jobType);
+    if (existing) {
+      if (existing.payload_checksum !== payloadChecksum) throw new ConsolidationJobConflictError();
+      return mapConsolidationJob(existing);
+    }
+    const timestamp = Number(job?.createdAt || now());
+    this.db.prepare(`
+      INSERT INTO consolidation_jobs(
+        job_id, subject_type, subject_id, turn_id, role_id, job_type, state,
+        attempt_count, due_at, payload_json, payload_checksum, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)
+    `).run(
+      String(job?.jobId || `job_${contentHash({ subjectType, subjectId, jobType }).slice(0, 24)}`),
+      subjectType, subjectId, turnId, roleId, jobType, Number(job?.dueAt || timestamp),
+      payloadJson, payloadChecksum, timestamp, timestamp
+    );
+    return mapConsolidationJob(this.db.prepare(`
+      SELECT * FROM consolidation_jobs
+      WHERE subject_type = ? AND subject_id = ? AND job_type = ?
+    `).get(subjectType, subjectId, jobType));
+  }
+
+  claimDueConsolidationJob({ workerId, jobTypes, now: claimAt = now(), leaseMs = 60_000 }) {
+    if (!String(workerId || '') || !Array.isArray(jobTypes) || !jobTypes.length) {
+      throw new Error('workerId and jobTypes are required');
+    }
+    return this.transaction(() => {
+      const placeholders = jobTypes.map(() => '?').join(',');
+      const row = this.db.prepare(`
+        SELECT * FROM consolidation_jobs
+        WHERE job_type IN (${placeholders})
+          AND due_at <= ?
+          AND (
+            state IN ('queued', 'retry_wait')
+            OR (state = 'running' AND COALESCE(lease_expires_at, 0) <= ?)
+          )
+        ORDER BY due_at, created_at, job_id
+        LIMIT 1
+      `).get(...jobTypes, Number(claimAt), Number(claimAt));
+      if (!row) return null;
+      if (contentHash(parseJson(row.payload_json, {})) !== row.payload_checksum) {
+        this.db.prepare(`
+          UPDATE consolidation_jobs
+          SET state = 'failed', last_error_code = 'JOB_PAYLOAD_CHECKSUM_MISMATCH',
+              lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+          WHERE job_id = ?
+        `).run(Number(claimAt), row.job_id);
+        return null;
+      }
+      this.db.prepare(`
+        UPDATE consolidation_jobs
+        SET state = 'running', attempt_count = attempt_count + 1,
+            lease_owner = ?, lease_expires_at = ?, updated_at = ?
+        WHERE job_id = ?
+      `).run(String(workerId), Number(claimAt) + Number(leaseMs), Number(claimAt), row.job_id);
+      return mapConsolidationJob(
+        this.db.prepare('SELECT * FROM consolidation_jobs WHERE job_id = ?').get(row.job_id)
+      );
+    });
+  }
+
+  completeConsolidationJob({ jobId, workerId, now: completedAt = now() }) {
+    return this.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE consolidation_jobs
+        SET state = 'completed', lease_owner = NULL, lease_expires_at = NULL,
+            last_error_code = NULL, updated_at = ?
+        WHERE job_id = ? AND state = 'running' AND lease_owner = ?
+      `).run(Number(completedAt), jobId, workerId);
+      if (Number(result.changes) !== 1) throw new Error('consolidation job lease mismatch');
+      return mapConsolidationJob(
+        this.db.prepare('SELECT * FROM consolidation_jobs WHERE job_id = ?').get(jobId)
+      );
+    });
+  }
+
+  failConsolidationJob({ jobId, workerId, now: failedAt = now(), errorCode, nextDueAt }) {
+    return this.transaction(() => {
+      const retry = Number(nextDueAt) > Number(failedAt);
+      const result = this.db.prepare(`
+        UPDATE consolidation_jobs
+        SET state = ?, due_at = ?, lease_owner = NULL, lease_expires_at = NULL,
+            last_error_code = ?, updated_at = ?
+        WHERE job_id = ? AND state = 'running' AND lease_owner = ?
+      `).run(
+        retry ? 'retry_wait' : 'failed',
+        retry ? Number(nextDueAt) : Number(failedAt),
+        String(errorCode || 'UNKNOWN'),
+        Number(failedAt),
+        jobId,
+        workerId
+      );
+      if (Number(result.changes) !== 1) throw new Error('consolidation job lease mismatch');
+      return mapConsolidationJob(
+        this.db.prepare('SELECT * FROM consolidation_jobs WHERE job_id = ?').get(jobId)
+      );
+    });
+  }
+
+  listRecoverableConsolidationJobs({ now: at = now() } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM consolidation_jobs
+      WHERE state IN ('queued', 'retry_wait')
+         OR (state = 'running' AND COALESCE(lease_expires_at, 0) <= ?)
+      ORDER BY due_at, created_at, job_id
+    `).all(Number(at)).map(mapConsolidationJob);
+  }
+
+  putCognitionShadowRunInternal(run) {
+    if (run?.source !== 'live') throw new Error('cognition shadow run source must be live');
+    const timestamp = Number(run?.createdAt || now());
+    this.db.prepare(`
+      INSERT INTO cognition_shadow_runs(
+        run_id, subject_type, subject_id, turn_id, rollout_key, source,
+        comparison_direction, evidence_epoch, shadow_epoch, canary_epoch, canary_slot,
+        rollout_revision, pipeline_checksum, state, authoritative_result_checksum,
+        comparison_result_checksum, metrics_json, critical_findings_json, latency_ms,
+        error_code, stale_for_rollout, source_deleted_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 'live', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(run_id) DO UPDATE SET
+        state = excluded.state,
+        authoritative_result_checksum = excluded.authoritative_result_checksum,
+        comparison_result_checksum = excluded.comparison_result_checksum,
+        metrics_json = excluded.metrics_json,
+        critical_findings_json = excluded.critical_findings_json,
+        latency_ms = excluded.latency_ms,
+        error_code = excluded.error_code,
+        stale_for_rollout = excluded.stale_for_rollout,
+        source_deleted_at = excluded.source_deleted_at,
+        updated_at = excluded.updated_at
+    `).run(
+      run.runId, run.subjectType, run.subjectId, run.turnId || null, run.rolloutKey,
+      run.comparisonDirection, Number(run.evidenceEpoch), run.shadowEpoch ?? null,
+      run.canaryEpoch ?? null, run.canarySlot ?? null, Number(run.rolloutRevision),
+      run.pipelineChecksum, run.state, run.authoritativeResultChecksum || null,
+      run.comparisonResultChecksum || null,
+      run.metrics == null ? null : canonicalJson(run.metrics),
+      run.criticalFindings == null ? null : canonicalJson(run.criticalFindings),
+      run.latencyMs ?? null, run.errorCode || null, run.staleForRollout ? 1 : 0,
+      run.sourceDeletedAt ?? null, timestamp, Number(run.updatedAt || timestamp)
+    );
+    return this.getCognitionShadowRun(run.runId);
+  }
+
+  getCognitionShadowRun(runId) {
+    return mapShadowRun(
+      this.db.prepare('SELECT * FROM cognition_shadow_runs WHERE run_id = ?').get(runId)
+    );
+  }
+
+  listLiveShadowRuns({ rolloutKey, direction, since = 0 }) {
+    return this.db.prepare(`
+      SELECT * FROM cognition_shadow_runs
+      WHERE rollout_key = ? AND comparison_direction = ? AND created_at >= ?
+      ORDER BY created_at, run_id
+    `).all(rolloutKey, direction, Number(since)).map(mapShadowRun);
+  }
+
+  countOutstandingComparisonSubjects({
+    rolloutKey,
+    direction,
+    evidenceEpoch,
+    shadowEpoch = null,
+    canaryEpoch = null,
+    now: at = now()
+  }) {
+    const runs = this.db.prepare(`
+      SELECT subject_type, subject_id, state
+      FROM cognition_shadow_runs
+      WHERE rollout_key = ? AND comparison_direction = ? AND evidence_epoch = ?
+        AND (? IS NULL OR shadow_epoch = ?)
+        AND (? IS NULL OR canary_epoch = ?)
+        AND stale_for_rollout = 0
+    `).all(
+      rolloutKey, direction, Number(evidenceEpoch),
+      shadowEpoch, shadowEpoch, canaryEpoch, canaryEpoch
+    );
+    const outstanding = new Set(
+      runs.filter(run => !['completed', 'failed', 'cancelled'].includes(run.state))
+        .map(run => `${run.subject_type}:${run.subject_id}`)
+    );
+    const jobs = this.db.prepare(`
+      SELECT subject_type, subject_id FROM consolidation_jobs
+      WHERE state IN ('queued', 'running', 'retry_wait')
+        AND job_type IN ('shadow_cognition', 'active_canary_compare')
+        AND (state != 'running' OR COALESCE(lease_expires_at, ?) > ?)
+    `).all(Number(at), Number(at));
+    for (const job of jobs) outstanding.add(`${job.subject_type}:${job.subject_id}`);
+    return outstanding.size;
+  }
+
+  advanceConsolidationBackfillCursor(cursor) {
+    const roleId = String(cursor?.roleId || '');
+    if (!roleId) throw new Error('roleId is required');
+    this.db.prepare(`
+      INSERT INTO consolidation_backfill_cursors(
+        role_id, last_completed_group_key, last_checksum, updated_at
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(role_id) DO UPDATE SET
+        last_completed_group_key = excluded.last_completed_group_key,
+        last_checksum = excluded.last_checksum,
+        updated_at = excluded.updated_at
+    `).run(
+      roleId,
+      cursor.lastCompletedGroupKey || null,
+      cursor.lastChecksum || null,
+      Number(cursor.updatedAt || now())
+    );
+    return {
+      roleId,
+      lastCompletedGroupKey: cursor.lastCompletedGroupKey || null,
+      lastChecksum: cursor.lastChecksum || null,
+      updatedAt: Number(cursor.updatedAt || now())
+    };
   }
 }

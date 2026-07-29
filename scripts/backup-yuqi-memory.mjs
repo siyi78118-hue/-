@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
@@ -34,6 +35,28 @@ export function createMemorySnapshot(options = {}) {
     .reverse();
   for (const name of snapshots.slice(retain)) rmSync(join(snapshotsDir, name));
   return snapshotPath;
+}
+
+export function inspectMemorySnapshot(snapshotPath) {
+  const resolved = resolve(snapshotPath || '');
+  if (!resolved || !existsSync(resolved)) throw new Error('Yuqi memory snapshot does not exist');
+  const sha256 = createHash('sha256').update(readFileSync(resolved)).digest('hex');
+  const database = new DatabaseSync(resolved, { readOnly: true });
+  try {
+    const schemaVersion = Number(database.prepare('PRAGMA user_version').get()?.user_version || 0);
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all();
+    const tableCounts = Object.fromEntries(tables.map(({ name }) => [
+      name,
+      Number(database.prepare(`SELECT COUNT(*) AS count FROM "${name.replaceAll('"', '""')}"`).get().count)
+    ]));
+    return { snapshotPath: resolved, sha256, schemaVersion, tableCounts };
+  } finally {
+    database.close();
+  }
 }
 
 const invokedPath = process.argv[1] ? resolve(process.argv[1]) : '';
