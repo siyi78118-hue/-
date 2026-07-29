@@ -480,23 +480,6 @@ export class YuqiStore {
       if (!envelope.message || retry.canonicalMessageId !== sourceMessageId) {
         throw new Error('retry canonical message mismatch');
       }
-      const previousTurn = this.getTurn(retry.retryOfTurnId);
-      if (
-        !previousTurn
-        || previousTurn.characterId !== envelope.characterId
-        || previousTurn.deviceId !== envelope.deviceId
-        || previousTurn.sourceMessageId !== sourceMessageId
-      ) {
-        throw new Error('retry turn lineage mismatch');
-      }
-      const previousEnvelope = parseJson(previousTurn.envelopeJson, {});
-      const previousBatch = previousEnvelope.context?.currentBatch;
-      if (
-        previousBatch
-        && contentHash(previousBatch) !== contentHash(envelope.context?.currentBatch || null)
-      ) {
-        throw new Error('retry current batch conflict');
-      }
       canonicalRetryMessage = this.getMessage(retry.canonicalMessageId);
       if (
         !canonicalRetryMessage
@@ -507,6 +490,24 @@ export class YuqiStore {
         || Number(canonicalRetryMessage.sentAt) !== Number(envelope.message.sentAt)
       ) {
         throw new Error('retry canonical message conflict');
+      }
+      const previousTurn = this.getTurn(retry.retryOfTurnId);
+      const validExistingTurn = previousTurn
+        && previousTurn.characterId === envelope.characterId
+        && previousTurn.deviceId === envelope.deviceId
+        && previousTurn.sourceMessageId === sourceMessageId;
+      const validRecoveredLineage = !previousTurn
+        && canonicalRetryMessage.turnId === retry.retryOfTurnId;
+      if (!validExistingTurn && !validRecoveredLineage) {
+        throw new Error('retry turn lineage mismatch');
+      }
+      const previousEnvelope = previousTurn ? parseJson(previousTurn.envelopeJson, {}) : {};
+      const previousBatch = previousEnvelope.context?.currentBatch;
+      if (
+        previousBatch
+        && contentHash(previousBatch) !== contentHash(envelope.context?.currentBatch || null)
+      ) {
+        throw new Error('retry current batch conflict');
       }
     }
 

@@ -363,6 +363,67 @@ test('a retry creates a new turn while reusing one canonical user message', () =
   });
 });
 
+test('a retry can reuse a reconciled canonical message when its original turn is missing', () => {
+  withStore(({ store }) => {
+    store.migrate();
+    const original = validV2Envelope();
+    store.putMessage({
+      ...original.message,
+      turnId: original.turnId,
+      characterId: original.characterId,
+      origin: 'phone',
+      deviceId: original.deviceId,
+      deviceSeq: original.deviceSeq
+    });
+    const retry = validV2Envelope({
+      turnId: 'turn_device2_recovered_retry',
+      deviceSeq: 2,
+      createdAt: original.createdAt + 1_000,
+      context: {
+        retry: {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: original.message.messageId
+        }
+      }
+    });
+
+    const saved = store.submitTurn(retry);
+
+    assert.equal(saved.turnId, retry.turnId);
+    assert.equal(saved.state, 'queued');
+    assert.equal(saved.sourceMessageId, original.message.messageId);
+    assert.equal(store.listMessages('yuqi', 20).filter(row => row.speakerType === 'user').length, 1);
+  });
+});
+
+test('a retry cannot claim an unrelated missing turn through a reconciled message', () => {
+  withStore(({ store }) => {
+    store.migrate();
+    const original = validV2Envelope();
+    store.putMessage({
+      ...original.message,
+      turnId: original.turnId,
+      characterId: original.characterId,
+      origin: 'phone',
+      deviceId: original.deviceId,
+      deviceSeq: original.deviceSeq
+    });
+    const retry = validV2Envelope({
+      turnId: 'turn_device2_unrelated_retry',
+      deviceSeq: 2,
+      createdAt: original.createdAt + 1_000,
+      context: {
+        retry: {
+          retryOfTurnId: 'turn_device2_different_missing_parent',
+          canonicalMessageId: original.message.messageId
+        }
+      }
+    });
+
+    assert.throws(() => store.submitTurn(retry), /retry turn lineage mismatch/i);
+  });
+});
+
 test('a current user batch persists independently from legacy message turn ids across reopening', () => {
   withStore(({ store, file }) => {
     store.migrate();
