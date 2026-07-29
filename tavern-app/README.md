@@ -3,14 +3,14 @@
 ## 文件说明
 - `index.html` — 主应用
 - `manifest.json` — PWA 配置（让浏览器知道这是可安装的应用）
-- `sw.js` — 离线缓存支持
+- `sw-v11.js` — 当前离线缓存与后台任务支持
 
 ## 部署方法（任选其一）
 
 ### 方法一：GitHub Pages（推荐，免费）
 1. 注册/登录 GitHub (github.com)
 2. 新建一个仓库（Repository），名字随意，比如 `tavern`
-3. 把这三个文件上传到仓库
+3. 把整个 `tavern-app` 文件夹内容上传到仓库
 4. 进入仓库 → Settings → Pages → Source 选 `main` 分支 → Save
 5. 等几分钟后，访问 `https://你的用户名.github.io/tavern/`
 
