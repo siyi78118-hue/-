@@ -2677,7 +2677,9 @@ function buildYuqiDynamicScene(char, chat) {
     momentContext: buildMomentChatContext(char.id),
     stageCatalog: config.stages.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') })),
     phaseCatalog: config.phases.map(item => ({ id: item.id, label: item.label, content: String(item.content || '') })),
-    currentPhase: config.currentPhase
+    currentPhase: config.currentPhase,
+    effectiveStagePersona: currentStagePersonaBlock(char),
+    stagePersonaRevision: config.revision
   };
 }
 function nativeDirectorMemorySystem(char, scene) {
@@ -3189,6 +3191,10 @@ function applyNativeRelationshipStagePart(charId, part, turnId) {
   const config = normalizeStagePersonaConfig(char);
   const sourceTurnId = String(turnId || '');
   if (config.history.some(item => item.sourceTurnId === sourceTurnId)) return false;
+  if (
+    Number.isInteger(action.expectedSceneRevision)
+    && config.revision !== action.expectedSceneRevision
+  ) return false;
   const baseAction = action.baseAction || (action.to ? action : null);
   const phaseAction = action.phaseAction || null;
   const baseTarget = baseAction ? config.stages.find(stage => stage.id === baseAction.to) : null;
@@ -3223,6 +3229,7 @@ function applyNativeRelationshipStagePart(charId, part, turnId) {
     baseAction, phaseAction, source: 'yuqi-runtime', sourceTurnId
   });
   config.history = config.history.slice(-NORMAL_RAW_CONTEXT_LIMIT);
+  config.revision += 1;
   char.stagePersona = config;
   refreshStoredCharacterPrompt(char, oldPrompt);
   DB.set('characters', characters);
@@ -3881,6 +3888,7 @@ function createDefaultStagePersonaConfig(char = {}) {
   const now = Number(char.createdAt) || Date.now();
   return {
     version: 2,
+    revision: 0,
     enabled: true,
     currentStage: 'new',
     currentPhase: 'normal',
@@ -3923,6 +3931,7 @@ function normalizeStagePersonaConfig(char = {}) {
   const currentPhase = validPhaseIds.has(source.currentPhase) ? source.currentPhase : 'normal';
   char.stagePersona = {
     version: 2,
+    revision: Math.max(0, Number(source.revision || 0)),
     enabled: source.enabled !== false,
     currentStage,
     currentPhase,

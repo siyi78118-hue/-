@@ -183,6 +183,9 @@ test('native relationship writeback applies base and phase actions atomically', 
   assert.match(source, /action\.baseAction/);
   assert.match(source, /action\.phaseAction/);
   assert.match(source, /config\.currentPhase/);
+  assert.match(source, /action\.expectedSceneRevision/);
+  assert.match(source, /config\.revision\s*!==\s*action\.expectedSceneRevision/);
+  assert.match(source, /config\.revision\s*\+=\s*1/);
   assert.match(html, /熟悉 · 闹矛盾期/);
 });
 

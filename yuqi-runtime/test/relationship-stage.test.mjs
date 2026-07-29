@@ -235,3 +235,65 @@ test('phase changes follow the approved directed state graph', () => {
   assert.equal(resolve('normal', 'conflict', 0.79), 'normal');
   assert.equal(resolve('normal', 'conflict', 0.78, true, ['msg_1']), 'conflict');
 });
+
+test('base and phase reviews are atomic and carry the expected phone scene revision', () => {
+  const currentScene = {
+    ...scene,
+    stagePersonaRevision: 7,
+    relationshipStage: {
+      base: { id: 'new', label: '初识', content: '' },
+      phase: { id: 'normal', label: '正常相处', content: '' }
+    }
+  };
+  const result = resolveRelationshipStage(currentScene, {
+    base: {
+      recommended: 'acquainted',
+      confidence: 0.82,
+      reason: '双方持续愿意联系',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitMutualChange: false
+    },
+    phase: {
+      recommended: 'repair',
+      confidence: 0.95,
+      reason: '这个状态图转换非法',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitAcknowledgedChange: false
+    }
+  }, messages, 3000);
+
+  assert.equal(result.stage.base.id, 'new');
+  assert.equal(result.stage.phase.id, 'normal');
+  assert.equal(result.action, null);
+});
+
+test('a valid combined base and phase review records one shared expected revision', () => {
+  const currentScene = {
+    ...scene,
+    stagePersonaRevision: 9,
+    relationshipStage: {
+      base: { id: 'new', label: '初识', content: '' },
+      phase: { id: 'normal', label: '正常相处', content: '' }
+    }
+  };
+  const result = resolveRelationshipStage(currentScene, {
+    base: {
+      recommended: 'acquainted',
+      confidence: 0.82,
+      reason: '双方持续愿意联系',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitMutualChange: false
+    },
+    phase: {
+      recommended: 'conflict',
+      confidence: 0.9,
+      reason: '双方持续围绕同一问题争执',
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitAcknowledgedChange: false
+    }
+  }, messages, 3000);
+
+  assert.equal(result.stage.base.id, 'acquainted');
+  assert.equal(result.stage.phase.id, 'conflict');
+  assert.equal(result.action.expectedSceneRevision, 9);
+});

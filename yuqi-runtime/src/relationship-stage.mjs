@@ -169,6 +169,15 @@ function resolvePhase(current, catalog, review, available, now) {
   };
 }
 
+function requestedChange(review, currentId) {
+  return Boolean(
+    review
+    && typeof review === 'object'
+    && !Array.isArray(review)
+    && String(review.recommended || review.stage || currentId) !== currentId
+  );
+}
+
 export function sceneFromEnvelope(envelope = {}) {
   return normalizedScene(envelope.context?.scene || envelope.trigger?.context?.scene || {});
 }
@@ -193,6 +202,14 @@ export function resolveRelationshipStage(scene, review, recentMessages = [], now
     available,
     now
   );
+  const requestedBase = requestedChange(legacyReview || review?.base, normalized.relationshipStage.base.id);
+  const requestedPhase = requestedChange(review?.phase, normalized.relationshipStage.phase.id);
+  if (
+    (requestedBase && requestedPhase)
+    && (!baseResult.action || !phaseResult.action)
+  ) {
+    return { stage: normalized.relationshipStage, action: null };
+  }
   const stage = combinedStage(baseResult.value, phaseResult.value);
   if (!baseResult.action && !phaseResult.action) return { stage, action: null };
   return {
@@ -200,6 +217,7 @@ export function resolveRelationshipStage(scene, review, recentMessages = [], now
     action: {
       baseAction: baseResult.action,
       phaseAction: phaseResult.action,
+      expectedSceneRevision: Math.max(0, Number(normalized.stagePersonaRevision || 0)),
       label: stage.label,
       changedAt: Number(now),
       ...(baseResult.action ? {
