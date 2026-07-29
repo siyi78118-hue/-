@@ -123,7 +123,11 @@ assert.match(executionPlugin, /unappliedCompletedTurns[\s\S]{0,1800}turnResult/,
 assert.match(executionPlugin, /result\.put\("inputJson",\s*turn\.inputJson\)/, 'native role-plan results must expose their minimal occurrence identifiers');
 assert.match(html, /plugin\.unappliedCompletedTurns\(/, 'foreground reconciliation must scan the durable native UI inbox');
 assert.match(html, /plugin\.recentCompletedTurns\(\{\s*limit:\s*50\s*\}\)/, 'foreground reconciliation must self-heal acknowledged native replies whose bubbles are absent');
-assert.match(html, /await\s+plugin\.acknowledgeUiApplied\(/, 'the web UI must acknowledge a native result only after applying it');
+assert.match(
+  html,
+  /await\s+(?:nativeBridgeCall\(\s*)?plugin\.acknowledgeUiApplied\(/,
+  'the web UI must acknowledge a native result only after applying it'
+);
 assert.match(html, /function\s+nativeExecutionPlugin\(\)/, 'web UI should use the native Room execution bridge');
 assert.match(html, /nativeExecutionPlugin\(\)[\s\S]{0,12000}\.submitTurn\(/, 'native sends should submit a durable Room turn');
 assert.match(script, /const MAX_CHAT_OUTPUT_TOKENS = 8192;/, 'all chat paths should share a high output-token ceiling');
