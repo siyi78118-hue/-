@@ -1,11 +1,26 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "currentVersion": "1.9.1",
+  "candidateVersion": "2.0.0",
   "characterId": "yuqi",
-  "modules": {
-    "foundation": "al-combined-rp.md",
-    "brain": "yuqi-core.md",
-    "memory": "memory-manager.md",
-    "supervisor": "supervisor.md"
+  "versions": {
+    "1.9.1": {
+      "modules": {
+        "foundation": "al-combined-rp.md",
+        "brain": "yuqi-core.md",
+        "memory": "memory-manager.md",
+        "supervisor": "supervisor.md"
+      }
+    },
+    "2.0.0": {
+      "modules": {
+        "foundation": "al-combined-rp.md",
+        "cognition": "cognition-core.md",
+        "socialExperience": "social-experience.json",
+        "expression": "expression.md",
+        "consolidation": "consolidation.md",
+        "supervisor": "supervisor.md"
+      }
+    }
   }
 }

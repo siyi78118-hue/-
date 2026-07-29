@@ -1,11 +1,17 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { PresetRegistry } from '../src/preset-registry.mjs';
+import {
+  PRESET_ROLES,
+  PRESET_ROLE_ALIASES,
+  PresetRegistry,
+  normalizePresetRole,
+  resolvePresetBundle
+} from '../src/preset-registry.mjs';
 import { ROLE_OUTPUT_SCHEMAS } from '../src/role-schemas.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
@@ -30,6 +36,113 @@ test('loads a checksummed immutable seed version', () => withRegistry(registry =
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
+
+test('exposes cognition roles while preserving legacy turn role aliases', () => {
+  assert.deepEqual(PRESET_ROLES, ['cognition', 'expression', 'consolidation', 'supervisor']);
+  assert.deepEqual(PRESET_ROLE_ALIASES, {
+    brain: 'expression',
+    memory: 'consolidation'
+  });
+  assert.equal(normalizePresetRole('brain'), 'expression');
+  assert.equal(normalizePresetRole('memory'), 'consolidation');
+  assert.equal(normalizePresetRole('cognition'), 'cognition');
+  assert.throws(() => normalizePresetRole('unknown'), /unknown preset role/);
+});
+
+test('schema 2 stores legacy and candidate versions without moving the current pointer', () => withRegistry((registry, store) => {
+  assert.equal(registry.current().version, '1.9.1');
+  assert.deepEqual(
+    store.listPresetVersions().map((preset) => preset.version).sort(),
+    ['1.9.1', '2.0.0']
+  );
+  assert.ok(store.getPresetVersion('2.0.0'));
+  assert.equal(store.getCurrentPresetVersion(), '1.9.1');
+}));
+
+test('resolves the exact cognition candidate in deterministic module order', () => {
+  const prompt = resolvePresetBundle({
+    role: 'cognition',
+    version: '2.0.0',
+    annotations: [
+      {
+        lessonId: 'lesson_emotion_before_function'
+      },
+      {
+        annotationId: 'ann_cognition_1',
+        targetModule: 'cognition',
+        instruction: '本轮保留两个有证据的解释，不把次解释写成事实。'
+      }
+    ]
+  });
+  const foundationIndex = prompt.indexOf('你正在进行中文手机私聊式角色扮演');
+  const cognitionIndex = prompt.indexOf('# 虞栖认知核心');
+  const lessonsIndex = prompt.indexOf('## 已批准社会经验');
+  const annotationsIndex = prompt.indexOf('## cognition 人工标注');
+  assert.ok(foundationIndex >= 0);
+  assert.ok(foundationIndex < cognitionIndex);
+  assert.ok(cognitionIndex < lessonsIndex);
+  assert.ok(lessonsIndex < annotationsIndex);
+  assert.match(prompt, /lesson_emotion_before_function/);
+  assert.doesNotMatch(prompt, /lesson_gift_as_relationship_action/);
+  assert.match(prompt, /本轮保留两个有证据的解释/);
+});
+
+test('candidate expression and consolidation stay isolated', () => {
+  const expression = resolvePresetBundle({
+    role: 'expression',
+    version: '2.0.0',
+    annotations: []
+  });
+  const consolidation = resolvePresetBundle({
+    role: 'consolidation',
+    version: '2.0.0',
+    annotations: []
+  });
+  assert.match(expression, /微信|气泡/);
+  assert.doesNotMatch(expression, /事实候选|写入记忆库|取代关系/);
+  assert.match(consolidation, /事实候选|证据/);
+  assert.match(consolidation, /不得替虞栖写回复|不得生成可发送台词/);
+  assert.doesNotMatch(consolidation, /请(?:直接)?输出(?:可发送台词|聊天正文)/);
+  assert.throws(
+    () => resolvePresetBundle({ role: 'unknown', version: '2.0.0', annotations: [] }),
+    /unknown preset role/
+  );
+});
+
+test('reads a schema 1 manifest and restores legacy brain and memory turns', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yuqi-presets-schema1-'));
+  const fixturePresetDir = join(dir, 'presets');
+  const store = new YuqiStore(join(dir, 'runtime.sqlite'));
+  try {
+    mkdirSync(fixturePresetDir, { recursive: true });
+    writeFileSync(join(fixturePresetDir, 'manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      currentVersion: '1.9.1',
+      characterId: 'yuqi',
+      modules: {
+        foundation: 'foundation.md',
+        brain: 'brain.md',
+        memory: 'memory.md',
+        supervisor: 'supervisor.md'
+      }
+    }), 'utf8');
+    writeFileSync(join(fixturePresetDir, 'foundation.md'), 'legacy foundation', 'utf8');
+    writeFileSync(join(fixturePresetDir, 'brain.md'), 'legacy brain', 'utf8');
+    writeFileSync(join(fixturePresetDir, 'memory.md'), 'legacy memory evidence', 'utf8');
+    writeFileSync(join(fixturePresetDir, 'supervisor.md'), 'legacy supervisor', 'utf8');
+
+    const registry = new PresetRegistry({
+      presetDir: fixturePresetDir,
+      store,
+      clock: () => 1000
+    });
+    assert.match(registry.compileFor('brain', { stage: 'initial' }), /legacy foundation[\s\S]*legacy brain/);
+    assert.match(registry.compileFor('memory', { stage: 'initial' }), /legacy memory evidence/);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('reopens a durable seed without changing its publication manifest', () => {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-presets-reopen-'));
@@ -216,14 +329,14 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(published.parentVersion, '1.9.1');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 2);
+  assert.equal(store.listPresetVersions().length, 3);
 
   const rollback = registry.rollback('1.9.1');
   assert.equal(rollback.version, '1.9.3');
   assert.equal(rollback.parentVersion, '1.9.2');
   assert.equal(rollback.rollbackOf, '1.9.1');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 3);
+  assert.equal(store.listPresetVersions().length, 4);
 }));
 
 test('rejects annotations that try to inject hidden biography as known fact', () => withRegistry(registry => {

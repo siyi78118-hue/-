@@ -102,6 +102,21 @@ test('第四轮按整个发送回合判断完整性并登记当前不可变预�
   assert.match(prompt, /完整性按整个发送回合判断/);
   assert.match(prompt, /同一回合内的多个气泡可以互相承接/);
   assert.equal(presetManifest.currentVersion, '1.9.1');
+  assert.equal(presetManifest.candidateVersion, '2.0.0');
+  assert.ok(presetManifest.versions['1.9.1']);
+  assert.ok(presetManifest.versions['2.0.0']);
+});
+
+test('cognition candidate separates expression, consolidation and action authorization', () => {
+  const expression = readFileSync(new URL('../yuqi-runtime/presets/expression.md', import.meta.url), 'utf8');
+  const consolidation = readFileSync(new URL('../yuqi-runtime/presets/consolidation.md', import.meta.url), 'utf8');
+  const supervisor = readFileSync(new URL('../yuqi-runtime/presets/supervisor.md', import.meta.url), 'utf8');
+  assert.match(expression, /口语|微信/);
+  assert.doesNotMatch(expression, /事实候选|写入记忆库|取代关系/);
+  assert.match(consolidation, /事实候选|原始消息 ID/);
+  assert.match(consolidation, /不得替虞栖写回复|不得生成可发送台词/);
+  assert.doesNotMatch(consolidation, /请(?:直接)?输出(?:可发送台词|聊天正文)/);
+  assert.match(supervisor, /cognition.*授权.*动作|动作.*cognition.*授权/is);
 });
 
 test('导演卡不替换完整 RP 预设和当前 200 条证据契约', () => {
