@@ -55,7 +55,7 @@
 
 ### Existing PC runtime modules to evolve
 
-- `yuqi-runtime/src/store.mjs`: v9→v10 base migration, v10→v11 canonical-result migration, release pins, retry lineages, authority records, lanes, quality evidence, atomic commit primitives, backup/export lifecycle.
+- `yuqi-runtime/src/store.mjs`: v9→v10 base migration, v10→v11 canonical-result migration, v11→v12 semantic-manifest migration, release pins, retry lineages, authority records, lanes, quality evidence, atomic commit primitives, backup/export lifecycle.
 - `yuqi-runtime/src/role-schemas.mjs`: v3 JSON schemas alongside v2.
 - `yuqi-runtime/src/cognition-context.mjs`: bounded history/fact/state retrieval.
 - `yuqi-runtime/src/cognitive-pipeline.mjs`: v3 route/checkpoint/reconsideration flow while retaining v2 resume.
@@ -3010,6 +3010,519 @@ After the commit, stop. Report the commit, exact test total, five manual
 counterexample outputs, and any deviation from these interfaces. Do not start
 Task 11 until the plan owner explicitly reviews and releases this gate.
 
+### Task 10E: Seal Post-Commit Semantics and Restore Fresh-Agency Retry
+
+**Why this repair gate exists:** Commit `b79cd37` passes the declared 199-test
+Task 10D suite, but an independent review reproduced four additional violations:
+
+1. `setCanonicalTurnRouteInternal()` accepts `expectedState='committed'`, and
+   `advanceCanonicalTurnInternal()` can then move the committed turn back to
+   `queued`;
+2. changing `visible_result_actions.action_json` survives reopen and the changed
+   payload is delivered;
+3. deleting the authorized action row survives reopen and the delivery silently
+   loses the action;
+4. after agency heads change, a retry with the new checksum is rejected for not
+   matching the parent, while a retry with the parent checksum is rejected for
+   not matching the current snapshot. The explicit recovery required for
+   `AGENCY_AUTHORITY_STALE` is therefore impossible.
+
+The same review found two uncovered preservation risks: v11 only checks that an
+input batch row exists rather than verifying its ordered contents/checksums, and
+`ResultOutbox` always concatenates canonical rows before legacy rows, so a
+canonical backlog at the limit can starve legacy delivery indefinitely. Task 11
+remains forbidden until Task 10E is implemented, committed, and independently
+reviewed.
+
+**Files:**
+- Modify: `docs/superpowers/specs/2026-07-30-yuqi-lived-agency-v3-design.md`
+- Modify: `docs/superpowers/plans/2026-07-30-yuqi-lived-agency-v3.md`
+- Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/src/visible-result-commit.mjs`
+- Modify: `yuqi-runtime/src/result-outbox.mjs`
+- Modify: `scripts/migrate-yuqi-agency-state.mjs`
+- Modify: `yuqi-runtime/test/store-cognition-migration.test.mjs`
+- Modify: `yuqi-runtime/test/store-agency-v10.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
+- Modify: `yuqi-runtime/test/canonical-turn-state.test.mjs`
+- Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
+- Modify: `yuqi-runtime/test/result-outbox.test.mjs`
+- Modify: `tests/yuqi-agency-state-migration.test.mjs`
+
+**Interfaces:**
+- Consumes: PC schema v11 from Task 10D, canonical turn/lineage CAS, the
+  `pc-visible-commit-v1` semantic payload, and separate canonical/legacy pending
+  delivery queries.
+- Produces: PC schema v12; one manifest row per canonical result; a closed
+  canonical transition graph; fresh-agency retry semantics; complete restart
+  joins; fair mixed outbox enumeration.
+- Android Room remains on the independently versioned schema declared by
+  Tasks 12–13. PC `user_version=12` must never be copied into Room versioning.
+
+```text
+visible_result_manifests(
+  group_id TEXT PRIMARY KEY,
+  authority_origin TEXT NOT NULL,
+  payload_version TEXT NOT NULL,
+  semantic_json TEXT,
+  semantic_checksum TEXT NOT NULL UNIQUE,
+  redacted_at INTEGER,
+  created_at INTEGER NOT NULL,
+  CHECK (
+    (semantic_json IS NOT NULL AND redacted_at IS NULL)
+    OR (semantic_json IS NULL AND redacted_at IS NOT NULL)
+  ),
+  FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+)
+
+getVisibleResultManifest(groupId)
+  -> { visibleGroupId, authorityOrigin, payloadVersion, semantic,
+       semanticChecksum, redactedAt, createdAt } | null
+
+assertCanonicalAttemptMutableInternal({
+  turnId, expectedState, expectedTurnRevision, operation
+}) -> { turn, lineage }
+```
+
+The manifest is the persisted canonical semantic payload itself, not a second
+caller-authored summary. For PC results,
+`contentHash(parseJson(semantic_json)) === semantic_checksum ===
+visible_commit_receipts.commit_checksum`, and `payload_version` is
+`pc-visible-commit-v1`.
+
+- [ ] **Step 1: Add red terminal-mutation and fresh-agency retry tests**
+
+Extend `canonical-turn-state.test.mjs` with a committed fixture and exercise
+every canonical attempt writer:
+
+```js
+test('a committed canonical lineage is immutable through every attempt writer', () => {
+  const { store, turn, receipt } = committedCanonicalTurn();
+  const writes = [
+    () => store.setCanonicalTurnRouteInternal({
+      turnId: turn.turnId,
+      expectedState: 'committed',
+      expectedTurnRevision: receipt.turnRevisionAfter,
+      route: 'fast',
+      reasons: ['forged']
+    }),
+    () => store.beginCanonicalStageInternal({
+      turnId: turn.turnId,
+      expectedState: 'committed',
+      expectedTurnRevision: receipt.turnRevisionAfter,
+      stage: 'memory'
+    }),
+    () => store.advanceCanonicalTurnInternal({
+      turnId: turn.turnId,
+      expectedState: 'committed',
+      nextState: 'queued',
+      expectedTurnRevision: receipt.turnRevisionAfter
+    }),
+    () => store.recordCanonicalTurnFailureInternal({
+      turnId: turn.turnId,
+      expectedState: 'committed',
+      expectedTurnRevision: receipt.turnRevisionAfter,
+      failure: { failureClass: 'terminal', code: 'FORGED' }
+    })
+  ];
+  for (const write of writes) {
+    assert.throws(write, /canonical committed authority is immutable/i);
+    assert.deepEqual(store.getVisibleCommitReceipt(turn.authorityLineageKey), receipt);
+    assert.equal(store.getTurn(turn.turnId).turnRevision, receipt.turnRevisionAfter);
+    assert.equal(store.getTurn(turn.turnId).state, 'committed');
+  }
+});
+```
+
+Add a table-driven transition test. `claimCanonicalTurnInternal()` owns only
+`queued→memory_running`; `advanceCanonicalTurnInternal()` allows only:
+
+```js
+const canonicalForwardEdges = new Map([
+  ['memory_running', 'memory_done'],
+  ['memory_done', 'brain_running'],
+  ['brain_running', 'brain_done'],
+  ['brain_done', 'supervisor_running'],
+  ['supervisor_running', 'approved']
+]);
+```
+
+Every reverse, skip, same-state, `approved→committed`, and
+`failed→queued` call through the generic advance method must fail without
+revision change. Commit and requeue retain their dedicated APIs.
+
+Extend `store-visible-authority-v11.test.mjs`:
+
+```js
+test('open retry fixes a fresh agency snapshot while inheriting model pins', () => {
+  const { store, original, originalEnvelope } = openCanonicalTurn();
+  mutateCurrentAgencyHead(store);
+  const fresh = store.readAgencyAuthoritySnapshotInternal({
+    roleId: 'yuqi',
+    at: originalEnvelope.message.sentAt
+  });
+  assert.notEqual(fresh.checksum, original.agencySnapshotChecksum);
+  const retry = store.createCanonicalVisibleTurnInternal(
+    retryInput(original, originalEnvelope, {
+      agencySnapshotChecksum: fresh.checksum
+    })
+  ).turn;
+  assert.equal(retry.agencySnapshotChecksum, fresh.checksum);
+  assert.equal(retry.authoritativeReleaseId, original.authoritativeReleaseId);
+  assert.equal(retry.authoritativePipelineChecksum, original.authoritativePipelineChecksum);
+  assert.equal(retry.rolloutRevision, original.rolloutRevision);
+  assert.equal(retry.inputUserBatchId, original.inputUserBatchId);
+  assert.equal(retry.inputVisibilitySequence, original.inputVisibilitySequence);
+});
+```
+
+The same test must prove a forged checksum has zero side effects, an exact replay
+of the retry validates the retry's own checksum, and an already-committed lineage
+still returns its receipt before reading current agency heads.
+
+- [ ] **Step 2: Run the mutation/retry tests red**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/canonical-turn-state.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs
+```
+
+Expected: FAIL because committed writers currently accept caller-supplied
+terminal states, generic advance has no transition graph, and retry requires the
+parent agency checksum.
+
+- [ ] **Step 3: Add red v12 manifest, batch, child-authority, and migration tests**
+
+In `store-visible-authority-v11.test.mjs`, keep the filename for historical
+coverage but add a v12 corruption matrix. Seed a committed result containing at
+least two items, one action, one state patch/stance transition, one memory job,
+one canonical delivery, and a manifest. Close the store, corrupt through raw
+SQLite, and require the next `new YuqiStore(path)` to reject each case:
+
+```js
+const corruptions = [
+  db => db.prepare(`
+    UPDATE visible_result_actions
+    SET action_json = '{"text":"tampered"}'
+  `).run(),
+  db => db.prepare('DELETE FROM visible_result_actions').run(),
+  db => db.prepare(`
+    UPDATE visible_result_actions
+    SET action_checksum = ?
+  `).run('f'.repeat(64)),
+  db => db.prepare(`
+    UPDATE current_user_batch_items
+    SET message_json = '{"messageId":"msg_source","content":"tampered"}'
+  `).run(),
+  db => db.prepare(`
+    UPDATE current_user_batch_items SET sequence = sequence + 10
+  `).run(),
+  db => db.prepare(`
+    UPDATE consolidation_jobs SET role_id = 'other_role'
+    WHERE authority_group_id IS NOT NULL
+  `).run(),
+  db => db.prepare(`
+    UPDATE consolidation_jobs SET payload_json = '{"tampered":true}'
+    WHERE authority_group_id IS NOT NULL
+  `).run(),
+  db => db.prepare(`
+    DELETE FROM consolidation_jobs WHERE authority_group_id IS NOT NULL
+  `).run(),
+  db => db.prepare(`
+    UPDATE cognitive_states SET checksum = ?
+    WHERE last_authority_group_id IS NOT NULL
+  `).run('e'.repeat(64)),
+  db => db.prepare('DELETE FROM visible_result_manifests').run(),
+  db => db.prepare(`
+    UPDATE visible_result_manifests
+    SET semantic_json = '{"payloadVersion":"pc-visible-commit-v1"}'
+  `).run(),
+  db => db.prepare(`
+    UPDATE visible_commit_receipts SET commit_checksum = ?
+  `).run('d'.repeat(64))
+];
+for (const corrupt of corruptions) {
+  assertV12CorruptionRejected(corrupt);
+}
+```
+
+Add retry-row corruptions that must fail reopen: changed preset/release/checksum,
+comparison mode/release, rollout/evidence epoch, batch identity/visibility,
+annotation snapshot, parent lineage, or a child
+`lineage_revision_at_creation != parent + 1`. Do not require child
+`agency_snapshot_checksum` to equal parent.
+
+Add migration tests:
+
+1. raw populated v10 with only legacy rows migrates v10→v11→v12 with unchanged
+   structural counts;
+2. v11 with no canonical group/receipt creates the manifest table and becomes
+   v12;
+3. v11 containing a canonical group/receipt but no manifest throws
+   `v12 migration cannot reconstruct canonical manifest` before changing
+   `user_version`, schema, logical row counts, or logical data checksum;
+4. fresh/open v12 is restart-idempotent;
+5. `user_version > 12` stops without rewriting;
+6. dry-run clone reports `workingUserVersion:12`, includes manifest table counts
+   and v12 invariant checksum, while the source remains byte-identical.
+
+- [ ] **Step 4: Run the v12 corruption and migration tests red**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs tests/yuqi-agency-state-migration.test.mjs
+```
+
+Expected: FAIL because schema v12/manifest does not exist and current reopen
+checks neither semantic action/job projections nor complete batch contents.
+
+- [ ] **Step 5: Implement v12, manifest commit, mutation closure, and full reopen invariants**
+
+In `store.mjs`, add `migrateVisibleAuthorityV12Internal()` in the same outer
+migration transaction:
+
+```js
+if (this.userVersion() === 11) {
+  const canonicalRows = Number(this.db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM visible_result_groups) +
+      (SELECT COUNT(*) FROM visible_commit_receipts) AS value
+  `).get().value);
+  if (canonicalRows !== 0) {
+    throw new Error('v12 migration cannot reconstruct canonical manifest');
+  }
+  this.db.exec(`
+    CREATE TABLE visible_result_manifests (
+      group_id TEXT PRIMARY KEY,
+      authority_origin TEXT NOT NULL,
+      payload_version TEXT NOT NULL,
+      semantic_json TEXT,
+      semantic_checksum TEXT NOT NULL UNIQUE,
+      redacted_at INTEGER,
+      created_at INTEGER NOT NULL,
+      CHECK (
+        (semantic_json IS NOT NULL AND redacted_at IS NULL)
+        OR (semantic_json IS NULL AND redacted_at IS NOT NULL)
+      ),
+      FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+    );
+    PRAGMA user_version = 12;
+  `);
+}
+```
+
+Do not use `CREATE TABLE IF NOT EXISTS` to bless a partially modified v11
+database. The preflight must distinguish a clean v11 migration from a forged
+v12-like table and the invariant must require exactly the declared columns,
+indexes, and foreign key.
+
+In `visible-result-commit.mjs`, compute the strict allowlisted
+`canonicalCommitPayload(input)` once at entry. This lets an existing exact
+receipt compare semantic checksum before reading mutable lane/agency/target
+state. On a new commit, resolve targets and validate state/jobs, require those
+normalized semantic descriptors to equal the already-built manifest, then pass
+the same manifest to the internal transaction:
+
+```js
+const authorityManifest = canonicalCommitPayload(input);
+const commitChecksum = contentHash(authorityManifest);
+const existing = input.store.getVisibleCommitReceipt(input.authorityLineageKey);
+if (existing) {
+  assert.equal(existing.authorityOrigin, 'pc');
+  assert.equal(existing.commitPayloadVersion, authorityManifest.payloadVersion);
+  assert.equal(existing.commitChecksum, commitChecksum);
+  return { ...existing, committed: false };
+}
+```
+
+After the existing target/state/comparison validation has produced
+`resolvedActions`, `validatedStatePatch`, and `normalizedMemoryJobs`, add these
+exact equivalence checks before `commitVisibleResultInternal()`:
+
+```js
+assert.deepEqual(authorityManifest.actions, resolvedActions.map(normalizeAction));
+assert.deepEqual(authorityManifest.statePatch, validatedStatePatch?.semanticPatch ?? null);
+assert.deepEqual(authorityManifest.memoryJobs,
+  normalizedMemoryJobs.map(job => normalizeMemoryJob(job)));
+
+return input.store.commitVisibleResultInternal({
+  ...input,
+  visibleGroup: { items: authorityManifest.visibleItems },
+  actionSet: resolvedActions,
+  statePatch: validatedStatePatch,
+  memoryJobs: normalizedMemoryJobs,
+  authorityOrigin: 'pc',
+  commitPayloadVersion: authorityManifest.payloadVersion,
+  authorityManifest,
+  commitChecksum
+});
+```
+
+In `commitVisibleResultInternal()`:
+
+- recompute `contentHash(input.authorityManifest)` and require it equals
+  `input.commitChecksum`;
+- insert `visible_result_manifests` inside the same transaction;
+- make `visible_result_groups.reply_checksum` hash the ordered normalized
+  `{items, actions}` projection rather than items alone;
+- insert the manifest before the receipt and add a separate fault-injection
+  boundary, making the transaction gate 14 write steps;
+- join manifest/group/receipt before returning an existing receipt;
+- never reconstruct a manifest from `reply_json`, action rows, jobs, or current
+  state.
+
+Add one internal guard used by route/stage/claim/advance/failure writers. Its SQL
+must enforce the authority conditions, not merely pre-read them:
+
+```sql
+WHERE t.turn_id = ?
+  AND t.result_authority_version = 1
+  AND t.state = ?
+  AND t.turn_revision = ?
+  AND EXISTS (
+    SELECT 1 FROM turn_authority_lineages l
+    WHERE l.lineage_key = t.authority_lineage_key
+      AND l.state = 'open'
+      AND l.latest_turn_id = t.turn_id
+      AND l.committed_group_id IS NULL
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM visible_commit_receipts r
+    WHERE r.lineage_key = t.authority_lineage_key
+  )
+```
+
+Apply the explicit transition map from Step 1 before executing
+`advanceCanonicalTurnInternal()`. Keep claim, commit, failure, cancellation, and
+requeue as dedicated transitions; no generic caller may name a terminal
+destination.
+
+For retry creation, compare parent and child immutable pins explicitly:
+
+```js
+const inheritedRetryPins = [
+  'pipelineMode', 'presetVersion', 'rolloutRevision', 'rolloutEvidenceEpoch',
+  'pipelineChecksum', 'shadowEpoch', 'canaryEpoch', 'canarySlot',
+  'comparisonMode', 'authoritativeReleaseId', 'comparisonReleaseId',
+  'authoritativePipelineChecksum', 'comparisonPipelineChecksum',
+  'inputUserBatchId', 'inputVisibilitySequence'
+];
+```
+
+Also require the complete normalized batch and annotation snapshot to match.
+Do not include `agencySnapshotChecksum` in this inherited list. Recompute and
+persist the current agency snapshot for a new open retry. Exact same-turn replay
+continues to compare its own stored agency checksum.
+
+Replace the shallow v11 reopen checks with v12 closure:
+
+- recompute every envelope, batch header, ordered batch item, item/action/job
+  payload checksum;
+- compare the persisted batch exactly with `resolveCurrentUserBatch(envelope)`;
+- require retry child pins from the list above and annotation hash to equal its
+  parent, creation revision to be parent+1, and lineage/root/batch identity to
+  match;
+- require one manifest per group and one group per manifest;
+- for a non-redacted group, require manifest origin/version/checksum to equal
+  group/receipt and recompute its canonical JSON hash;
+- for a redacted group, require group/manifest matching non-null redaction time,
+  null semantic JSON, no pending delivery, no retrievable item/message content,
+  no executable action payload, and no path through `visibleDeliveryPayload()`;
+- require ordered item/action rows to equal `manifest.visibleItems/actions`
+  exactly, including counts and contiguous ordinals;
+- reconstruct action checksum from
+  `{kind, targetKey, targetRevision, payload}` and require the deterministic
+  action ID;
+- compare manifest memory/compare descriptor counts and semantics with
+  authority-group jobs, while allowing only documented attempt metadata outside
+  the semantic descriptor;
+- require job `subject_type='turn'`, `subject_id=turn_id=authoritativeTurnId`,
+  `role_id=group.roleId`, contiguous authority ordinals, and valid payload hash;
+- require stance rows to use the same group role/turn and contiguous authority
+  ordinals;
+- require a cognitive state carrying `last_authority_group_id` to use the same
+  role/turn and a checksum matching `state_json`;
+- keep all existing receipt, delivery, message, release, fingerprint, lineage,
+  and authority-version checks.
+
+`visibleDeliveryPayload()` must call the same manifest/projection validator
+before returning payload, so a corrupt database opened through a test-only raw
+handle cannot emit altered actions even before the next process restart.
+
+- [ ] **Step 6: Add and implement fair mixed outbox scheduling**
+
+Add this test to `result-outbox.test.mjs`:
+
+```js
+test('mixed canonical and legacy backlog honors global age without starvation', async () => {
+  const { outbox, store, fetchOrder } = mixedBacklog({
+    canonical: 60,
+    legacy: 2,
+    legacyUpdatedAt: 1,
+    canonicalUpdatedAt: 2
+  });
+  await outbox.flushOnce(50);
+  assert.deepEqual(fetchOrder.slice(0, 2), ['legacy_old_1', 'legacy_old_2']);
+
+  resetMixedBacklog({
+    canonical: 2,
+    legacy: 60,
+    canonicalUpdatedAt: 1,
+    legacyUpdatedAt: 2
+  });
+  await outbox.flushOnce(50);
+  assert.deepEqual(fetchOrder.slice(0, 2), ['canonical_old_1', 'canonical_old_2']);
+  assert.equal(store.listPendingCloudDeliveries().every(x => x.authorityGroupId == null), true);
+  assert.equal(store.listPendingAuthorityCloudDeliveries().every(x => x.authorityGroupId != null), true);
+});
+```
+
+Keep the two store queries isolated, request up to `limit` from each, merge and
+sort by numeric `updatedAt`, then a stable key
+`authorityGroupId || turnId`, then `peerId`, and only then slice to `limit`.
+Do not concatenate one class ahead of the other.
+
+- [ ] **Step 7: Run the complete Task 10E gate and manual counterexamples**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/agency-state.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/canonical-turn-state.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs tests/yuqi-agency-state-migration.test.mjs
+```
+
+Expected: all 199 Task 10D tests plus every Task 10E test PASS. Record the exact
+new total; do not hardcode or waive a lower count.
+
+Then run and report exact output for these counterexamples:
+
+1. committed route/stage/advance/failure each rejects with unchanged receipt,
+   state, and revision;
+2. action payload mutation is rejected on reopen and on direct delivery load;
+3. action deletion is rejected on reopen and on direct delivery load;
+4. fresh-agency open retry succeeds, while forged checksum has zero side
+   effects;
+5. current-user-batch content/order/checksum corruption is rejected;
+6. job role/turn/payload/deletion corruption is rejected;
+7. with more than `limit` canonical rows, older legacy rows are still selected,
+   and the inverse case also passes;
+8. raw v11 with a canonical receipt but no manifest refuses v12 migration
+   without changing `user_version`, schema, row counts, or logical data
+   checksum.
+
+- [ ] **Step 8: Commit and stop for independent review**
+
+```powershell
+git add docs/superpowers/specs/2026-07-30-yuqi-lived-agency-v3-design.md docs/superpowers/plans/2026-07-30-yuqi-lived-agency-v3.md yuqi-runtime/src/store.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/result-outbox.mjs scripts/migrate-yuqi-agency-state.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/canonical-turn-state.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs tests/yuqi-agency-state-migration.test.mjs
+git commit -m "fix: seal canonical result authority"
+```
+
+After the commit, stop. Report the commit, exact full-gate total, all eight
+manual outputs, migration before/after evidence, and every interface deviation.
+Do not start Task 11 until the plan owner independently reviews and explicitly
+releases Task 10E.
+
 ### Task 11: Integrate v3, Lanes, Shadow, and Recovery in the Runtime
 
 **Files:**
@@ -3026,7 +3539,7 @@ Task 11 until the plan owner explicitly reviews and releases this gate.
 - Create: `yuqi-runtime/test/v3-runtime-recovery.test.mjs`
 
 **Interfaces:**
-- Consumes: Tasks 2, 7, 9, 10, 10A, 10B, and 10C.
+- Consumes: Tasks 2, 7, 9, 10, 10A, 10B, 10C, 10D, and 10E.
 - Produces: one release-pinned execution path for all ten rollout keys; the first production call to `createCanonicalVisibleTurnInternal()` under the explicit eligibility rule below; receipt-derived bridge results; background comparisons created inside the authoritative result transaction only after the checksum is deterministic.
 
 - [ ] **Step 1: Write red orchestration tests for release direction and recovery**
@@ -3276,7 +3789,7 @@ git commit -m "feat: integrate v3 release execution and recovery"
 
 **Interfaces:**
 - Consumes: Task 10 receipt fields, native completion, and existing successful DOM `uiAppliedAt` acknowledgement.
-- Produces: Android Room v11 (independent from PC schema v11); durable local lineage/receipt mirror; plugin methods `getConversationCursor` and existing acknowledgement methods updating the cursor.
+- Produces: Android Room v11 (independent from PC schema v12); durable local lineage/receipt mirror; plugin methods `getConversationCursor` and existing acknowledgement methods updating the cursor.
 
 - [ ] **Step 1: Write red Room migration and monotonic cursor tests**
 
@@ -3396,7 +3909,7 @@ static final Migration MIGRATION_10_11 = new Migration(10, 11) {
 };
 ```
 
-Add nullable matching fields to `ChatTurnEntity`. New v3 submission creates/claims `ConversationAuthorityEntity` and pins its lineage key/revision on the turn before any route is attempted. Task 13 fills completion fields from a validated PC receipt; Task 14 may fill them from a locally committed fallback receipt. Old Android Room v10 turns retain null and continue using turn ID for legacy deduplication. The PC `user_version=11` database and Android Room version 11 are unrelated stores even though their numbers match.
+Add nullable matching fields to `ChatTurnEntity`. New v3 submission creates/claims `ConversationAuthorityEntity` and pins its lineage key/revision on the turn before any route is attempted. Task 13 fills completion fields from a validated PC receipt; Task 14 may fill them from a locally committed fallback receipt. Old Android Room v10 turns retain null and continue using turn ID for legacy deduplication. The PC `user_version=12` database and Android Room version 11 are unrelated stores; their version numbers have no shared lifecycle.
 
 DAO updates must use one transaction and enforce two independent rules:
 
@@ -3664,6 +4177,14 @@ test('Android fallback receipt imports as external visibility without PC side ef
   const receipt = reconcile.importAndroidFallbackReceipt(validFallbackReceipt());
   assert.equal(receipt.authorityOrigin, 'android_fallback');
   assert.equal(store.visibleGroupsForLineage(receipt.authorityLineageKey).length, 1);
+  assert.equal(
+    store.getVisibleResultManifest(receipt.visibleGroupId).payloadVersion,
+    'android-fallback-commit-v1'
+  );
+  assert.equal(
+    store.getVisibleResultManifest(receipt.visibleGroupId).semanticChecksum,
+    receipt.commitChecksum
+  );
   assert.equal(store.outboxForGroup(receipt.visibleGroupId).length, 0);
   assert.deepEqual(store.getCognitiveState('yuqi'), beforeState);
   assert.equal(store.comparisonJobsForGroup(receipt.visibleGroupId).length, 0);
@@ -3727,7 +4248,7 @@ explicit final without fallback                         -> REMOTE_FINAL_FAILURE
 
 When local fallback is allowed, `RoomExecutionStore` uses one transaction to re-read the open `ConversationAuthorityEntity`, validate expected revision/latest turn, derive group/message/action IDs, insert reply parts and applied structured-action records, CAS the lineage to committed, write the exact local commit checksum with `commitPayloadVersion=android-fallback-commit-v1` and `authorityOrigin=android_fallback`, complete the turn, and advance `nativeCompleted`. Its normalized checksum payload contains lineage/group, ordered reply/action payloads, the complete input batch/cursor identity, fallback contract checksum, and a deterministic `android_fallback:<contractChecksum>` release ID; it contains no unavailable PC state revisions and no timestamps/random IDs. Exact replay returns the stored receipt; different content conflicts.
 
-`FallbackJournal` syncs an `authority_receipt` entity before/with its deterministic group items, not just raw fallback messages. `reconcile.mjs` validates all Task 10/13 IDs and the semantic checksum, then calls `store.importExternalVisibleReceiptInternal()`. That PC transaction either returns an exact existing receipt or creates a mirror turn/lineage, group/items/actions and receipt with origin `android_fallback`. It creates no PC cognition state/stance/memory/comparison/outbox/notification writes, never increments live shadow/canary evidence, and marks action rows `already_applied_on_android`. Its receipt has null PC lane/state revisions; reconciliation may only advance lane visibility cursors monotonically by the imported local sequence and must not replace a newer PC `latest_authoritative_group_id`. A different existing receipt inserts a sanitized authority-conflict diagnostic and aborts import.
+`FallbackJournal` syncs an `authority_receipt` entity before/with its deterministic group items, not just raw fallback messages. `reconcile.mjs` validates all Task 10/13 IDs and the semantic checksum, then calls `store.importExternalVisibleReceiptInternal()`. That PC transaction either returns an exact existing receipt or creates a mirror turn/lineage, group/items/actions, `visible_result_manifests` row and receipt with origin `android_fallback`. The manifest stores the exact normalized `android-fallback-commit-v1` payload received from Room and must hash to the imported receipt checksum; it is never reconstructed from projection rows. The transaction creates no PC cognition state/stance/memory/comparison/outbox/notification writes, never increments live shadow/canary evidence, and marks action rows `already_applied_on_android`. Its receipt has null PC lane/state revisions; reconciliation may only advance lane visibility cursors monotonically by the imported local sequence and must not replace a newer PC `latest_authoritative_group_id`. A different existing receipt inserts a sanitized authority-conflict diagnostic and aborts import.
 
 - [ ] **Step 4: Run Android fallback tests green**
 
@@ -4246,7 +4767,7 @@ test('committed facts commitments events and repeated preferences are allowed wi
   }
 });
 
-test('clear operations preserve or redact canonical v11 authority explicitly', () => {
+test('clear operations preserve or redact canonical v12 authority explicitly', () => {
   const matrix = lifecycleMatrix();
   assert.deepEqual(matrix.clearAutomaticTasks.deletedTables.sort(),
     ['automatic_tasks', 'comparison_jobs'].sort());
@@ -4256,6 +4777,10 @@ test('clear operations preserve or redact canonical v11 authority explicitly', (
     'archive_when_sole_message_evidence_is_deleted');
   assert.equal(matrix.clearChat.actions.visible_result_items, 'delete_content');
   assert.equal(matrix.clearChat.actions.visible_result_groups, 'retain_redacted_header');
+  assert.equal(matrix.clearChat.actions.visible_result_manifests,
+    'clear_semantic_json_retain_checksum_and_redaction_time');
+  assert.equal(matrix.clearChat.actions.visible_result_actions,
+    'clear_payload_retain_identity_and_checksum');
   assert.equal(matrix.clearChat.actions.visible_commit_receipts, 'retain_checksum_only');
   assert.equal(matrix.clearChat.actions.cloud_deliveries,
     'cancel_undelivered_and_clear_payload');
@@ -4272,7 +4797,7 @@ Run:
 node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs
 ```
 
-Expected: FAIL because v10/v11 records are not yet classified by lifecycle.
+Expected: FAIL because v10/v11/v12 records are not yet classified by lifecycle.
 
 - [ ] **Step 3: Implement memory allowlist and explicit lifecycle matrix**
 
@@ -4296,12 +4821,12 @@ Implement and test this table:
 
 | operation | constraints | stances/state | canonical result authority | lanes | releases/rollout | quality/audit |
 |---|---|---|---|---|---|---|
-| backup/export | include | include | include lineage/group/items/actions/receipt/group-delivery | include | include | include |
+| backup/export | include | include | include lineage/group/manifest/items/actions/receipt/group-delivery | include | include | include |
 | import | merge by immutable ID/revision | replace only if newer valid revision | exact lineage/group/checksum merge only; any mismatch stops import | rebuild safe cursor state | preserve local authority unless explicit full restore | append |
 | clear automatic tasks | preserve | preserve | preserve committed authority; delete only unstarted comparison work | preserve | preserve | preserve |
-| clear chat | preserve system/author; archive user constraints whose sole evidence is deleted | expire evidence-dependent stance and remove chat-derived fast state | delete group items/message projections; mark group redacted; cancel undelivered delivery and null payload; retain lineage/action IDs/receipt checksums | delete/reinitialize | preserve | preserve |
+| clear chat | preserve system/author; archive user constraints whose sole evidence is deleted | expire evidence-dependent stance and remove chat-derived fast state | atomically cancel undelivered delivery; clear item/message content, action payload and manifest semantic JSON; mark group/manifest with one redaction time; retain lineage/action IDs/manifest+receipt checksums; redacted group cannot deliver/replay/execute | delete/reinitialize | preserve | preserve |
 | clear memory | preserve system/author and explicit user boundaries | expire memory-dependent stance and rebuild snapshot from persona/stage | preserve | preserve cursor | preserve | preserve |
-| delete Yuqi role | delete role rows | delete | delete role lineages/groups/items/actions/receipts/deliveries in FK-safe order after backup | delete | keep global release definitions; delete role rollout state | retain redacted audit |
+| delete Yuqi role | delete role rows | delete | delete role lineages/groups/manifests/items/actions/receipts/deliveries in FK-safe order after backup | delete | keep global release definitions; delete role rollout state | retain redacted audit |
 
 Withdrawn/deleted messages are removed from future retrieval; dependent stance/constraint records become released/archived through a new revision rather than being physically rewritten. Non-Yuqi lifecycle remains unchanged.
 
@@ -4314,7 +4839,7 @@ node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/ev
 node scripts/audit-yuqi-memory.mjs yuqi-runtime/config.json
 ```
 
-Expected: PASS; audit reports all v10/v11 tables, no dangling group/receipt/delivery/message authority, and no deleted message evidence remains retrievable.
+Expected: PASS; audit reports all v10/v11/v12 tables, no dangling group/manifest/receipt/delivery/message authority, no redacted manifest/action payload remains retrievable or executable, and no deleted message evidence remains retrievable.
 
 - [ ] **Step 5: Commit**
 
@@ -4984,7 +5509,7 @@ const raceCases = [
   'runtime_restart_before_visible_commit',
   'runtime_restart_after_visible_commit',
   'original_retry_and_sibling_retry_compete',
-  'populated_v10_migrates_then_restarts_v11',
+  'populated_v10_migrates_then_restarts_v12',
   'canary_rollback_while_turn_in_flight',
   'same_fingerprint_adjacent_revisions',
   'cloud_waiting_does_not_block_next_local_turn',
@@ -5273,7 +5798,7 @@ Do not commit APK binaries to the source branch. Keep the formal APK under `arti
 
 **Interfaces:**
 - Consumes: ready source, formal APK, validated migration decisions, eligible quality report, release manifest.
-- Produces: production PC v11 state, stable-visible candidate shadow per kind, honest completion/handoff report.
+- Produces: production PC v12 state, stable-visible candidate shadow per kind, honest completion/handoff report.
 
 - [ ] **Step 1: Stop runtime cleanly, back up, and prove the source database matches the validated dry run**
 
@@ -5285,7 +5810,7 @@ node scripts/backup-yuqi-memory.mjs yuqi-runtime/config.json
 node scripts/migrate-yuqi-agency-state.mjs --config yuqi-runtime/config.json --dry-run --clone-out artifacts/yuqi-lived-agency-v3/production-migration-clone.sqlite --out artifacts/yuqi-lived-agency-v3/production-migration-report.json
 ```
 
-Expected: the raw backup is created before any new `YuqiStore` opens production; only the clone migrates to v11 during dry-run. Current database SHA/source decision checksum matches the validated basis or produces a new complete report with no structural count loss. The clone passes v11 invariant checks and restart-open checks. If messages or state legitimately changed since Task 3, rerun clone validation against this new report before applying. Do not apply an old report to changed data.
+Expected: the raw backup is created before any new `YuqiStore` opens production; only the clone migrates through v11 to v12 during dry-run. Current database SHA/source decision checksum matches the validated basis or produces a new complete report with no structural count loss. The clone passes v12 manifest/invariant checks and restart-open checks. If messages or state legitimately changed since Task 3, rerun clone validation against this new report before applying. Do not apply an old report to changed data.
 
 - [ ] **Step 2: Apply migration atomically, audit, and restart on stable**
 
@@ -5298,7 +5823,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-yuqi-backg
 node scripts/verify-yuqi-runtime.mjs
 ```
 
-Expected: runtime healthy, PC database v11, current production stable release still visible, no candidate active, old authority-version-0 unfinished turns resumable on the legacy branch, and before/after structural counts preserved. Every eligible new cognition-release turn created through the canonical internal boundary has lineage authority. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
+Expected: runtime healthy, PC database v12, current production stable release still visible, no candidate active, old authority-version-0 unfinished turns resumable on the legacy branch, and before/after structural counts preserved. Every eligible new cognition-release turn created through the canonical internal boundary has lineage authority and a semantic manifest. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
 
 - [ ] **Step 3: Register the same eligible v3 candidate for each rollout key in shadow**
 
@@ -5436,7 +5961,7 @@ After this design window amends the authoritative plan, the central window rerea
 ## Evidence Checklist Before Any “Finished” Claim
 
 - [ ] Baseline report identifies immutable current stable evidence.
-- [ ] PC v10→v11 populated clone migration and production migration reports match their source database; old turns remain authority version 0 and no historical receipt was invented.
+- [ ] PC v10→v11→v12 populated clone migration and production migration reports match their source database; old turns remain authority version 0, no historical receipt was invented, and every new canonical receipt has one manifest.
 - [ ] All 270 protocol cases pass and are labeled non-quality evidence.
 - [ ] 24×3 sentinel runs, 72×2 coverage runs, and 30 local-history runs are present.
 - [ ] Six-dimensional gate and pairwise stable/candidate comparison are eligible.

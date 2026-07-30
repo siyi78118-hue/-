@@ -586,9 +586,13 @@ wire protocol 版本与 PC 内部结果权威版本是两个独立维度：
 
 上述 rollout CAS 适用于 fresh original。version-1 retry 必须继承 parent turn 已固定的 rollout/release/checksum/comparison/preset，不得因期间发生晋级或回退而换模型；version-0 parent 的 retry 仍走旧兼容路径，缺失或损坏 parent 时停止而不是伪造 canonical lineage。相同未提交 turn 的 exact replay 不重复增加任何 revision；lineage 已提交时返回原 receipt，不受当前 rollout 变化影响。
 
+retry 继承的是模型与输入的不可变 pins，不是已经过期的 agency head。若 open parent 因 `AGENCY_AUTHORITY_STALE` 失败，显式 retry 必须在同一个创建事务内重新读取当前 agency snapshot，核对调用方的乐观 checksum，并把新 checksum 固定到 retry attempt；它允许与 parent 不同。否则“新 checksum 因不等于 parent 被拒绝、旧 checksum 又因不等于当前 snapshot 被拒绝”会使 open lineage 永久不可恢复。exact same-turn replay 仍逐项核对该 attempt 自己持久化的 agency checksum；committed lineage 仍在完整 immutable input/parent/lineage 校验后直接返回原 receipt，不读取当前 agency heads。
+
 store 必须独立重算并核对 `roleId=yuqi`、`rolloutKey`、`laneKey`、`rootSourceId` 和 `inputUserBatchId`，不能把调用方传值当作路由权威。wire v2 没有 visibility cursor 时只允许等于持久 lane snapshot，不能借一个更大的数字推进游标；wire v3 到 Task 13 验证 cursor 后才允许单调前进。retry 必须逐项复用完整 normalized current batch，包括此前气泡、attachment、顺序和时间，不能只比较最后一条正文。
 
 canonical authority 不是一个只约束最终 commit 的新 API，而是对所有旧 mutation entrypoint 的封闭权限域。`claimTurn*`、turn stage/checkpoint、failure/requeue、lane supersession、user cancellation、failed-draft recovery 和 legacy delivery helper 遇到 version-1 turn/group 时，必须调用带 `turnRevision/lineageRevision` CAS 的 canonical API，或在写入前明确拒绝；任何旧方法都不能绕过 lineage/group authority。failure 保持 lineage open 供显式 retry，cancellation/supersession 把 open lineage CAS 为 cancelled，committed lineage 永远不可变。
+
+“调用方传入 `expectedState=committed`”不是修改已提交 turn 的授权。所有 canonical route/stage/checkpoint/failure/state writer 必须在同一个 `BEGIN IMMEDIATE` 中同时证明 lineage 为 `open`、该 turn 是 `latestTurnId`、receipt/group 尚不存在、当前 state/revision 匹配，并且 transition 位于显式白名单。通用 advance 只允许工作流前进边：`memory_running→memory_done→brain_running→brain_done→supervisor_running→approved`；`queued→memory_running` 只由 claim，`approved→committed` 只由唯一 commit transaction，`*→failed` 只由 failure API，`failed→checkpoint` 只由专用 requeue。任何 writer 都不能把 `committed/delivered/completed/cancelled-lineage` 改回可执行状态。
 
 `agencySnapshotChecksum` 也不是调用方自报的摘要。store 在 canonical turn 创建事务内读取该角色所有 active constraint heads、当前 cognitive state 指向且仍为 verified/retrievable 的 `stable_preference` facts、当前 active stance heads，以及 cognitive-state revision/checksum，按稳定 ID/revision 排序后形成 `agency-authority-v1` snapshot。缺失、被压制或类型不符的 preference fact 使 snapshot 构造失败，不能静默丢掉。调用方只可提交预读 checksum 作为乐观期望；store 必须重算、核对、持久化其 checksum，并把同一 snapshot 返回给本轮 agency view。open turn 恢复时若当前 snapshot 已变化，不得拿新状态冒充旧输入继续生成，而是记录 `AGENCY_AUTHORITY_STALE` 并通过显式 retry 固定新 snapshot；已 committed 的 exact replay 仍直接返回原 receipt。
 
@@ -596,16 +600,21 @@ current stance 使用一个稳定 `stanceId` 的 append-only revision 链。main
 
 #### 13.3.2 唯一可见结果与 receipt
 
-PC 数据库新增四组 canonical 记录：
+PC 数据库新增 canonical 记录：
 
 - `visible_result_groups`：一条 lineage 最多一个 group，一条 authoritative turn 最多一个 group，并标明 `pc` 或 `android_fallback` authority origin；
 - `visible_result_items`：按 `groupId + ordinal` 唯一保存可见气泡；
 - `visible_result_actions`：按 `groupId + ordinal` 唯一保存已授权结构化动作；
-- `visible_commit_receipts`：以 `lineageKey` 为主键，唯一关联 group、authoritative turn、authority origin、`commitPayloadVersion` 和 `commitChecksum`。
+- `visible_commit_receipts`：以 `lineageKey` 为主键，唯一关联 group、authoritative turn、authority origin、`commitPayloadVersion` 和 `commitChecksum`；
+- `visible_result_manifests`：以 `groupId` 为主键保存该 origin/payload version 的完整规范化语义 payload 及 checksum，作为 receipt 与所有可变查询投影之间的重启校验锚点。正常状态下 `semanticJson` 非空且 `redactedAt` 为空；执行既有“清除聊天”隐私操作后，两者必须原子变为 `semanticJson=null + redactedAt=<time>`，只保留 checksum/identity 审计壳。
 
 group ID 和气泡/action ID 由当前合法 authority owner 按双方共享的版本化算法根据 lineage 与 ordinal 确定性生成，不接受模型输出、当前时间或临时随机 ID。PC `commitChecksum` 对规范化语义 payload 计算，包含 lineage、可见气泡、动作、状态 patch、记忆任务的 allowlisted 语义 descriptor、可选 compare release/direction/epoch descriptor、release、输入可见游标和生成时权威 checksum；Android fallback 使用另一个明确版本的规范 payload。两者都排除 attempt `turnId`，以及 job payload 内嵌的 turn/worker/job ID、due/created 时间、随机数和非语义日志。不同 retry attempt 产生完全相同的语义结果时 checksum 必须相同；真正的语义变化才改变 checksum。重复提交只有 origin、payload version 和 checksum 全部相同时才返回同一 receipt；同 lineage 的不同 payload 一律是 authority conflict。
 
-`messages` 只是 group items 的聊天查询投影；`turn.replyJson` 只是兼容投影。它们都不能反推出新的 group ID 或 receipt，也不能成为第二事实源。
+`messages` 只是 group items 的聊天查询投影；`turn.replyJson` 只是兼容投影。action rows、memory/compare jobs、state/stance rows也都是 manifest 授权语义的执行或查询投影。它们都不能反推出新的 group ID、manifest 或 receipt，也不能成为第二事实源。
+
+PC schema v12 引入 `visible_result_manifests`。v11→v12 只允许在不存在 canonical group/receipt 的数据库上自动前进，因为旧 v11 没有保存足以无损重建 state patch 与 job descriptor 的完整规范 payload；发现已有 v11 canonical 结果却缺 manifest 时必须在任何写入前隔离并报告，不能猜测、回算或悄悄给旧 receipt 盖新 checksum。Android Room 的 schema 版本独立，仍按其任务规定演进，不能因 PC user_version 变为 12 而同步改号。
+
+manifest 不能破坏已有数据生命周期。“清除聊天”必须在取消未投递 delivery 后，同时清除 manifest semantic JSON、item/message 内容和 action payload，把 group/manifest 标成同一 redaction 时间；receipt/checksum、确定性 ID、origin 和最小审计壳保留。redacted group 不再可投递、执行 action、重放正文或参与生成上下文；reopen invariant 验证完整 redaction shape，而不是要求已清除内容仍能重算原 checksum。backup/export、角色删除和导入必须把 manifest 纳入与 group/receipt 相同的 FK 顺序与冲突规则。
 
 #### 13.3.3 提交前重新校验
 
@@ -640,7 +649,7 @@ canonical generation fingerprint 的 action 部分使用已经过 resolver 的�
 `speakerId=turn.characterId`、`speakerType=character`、`recipientId=user`，
 且正文非空；caller identity 字段不能借“之后会覆盖 ID”绕过这些角色约束。
 
-通过后依次写入 canonical group/items/actions、聊天消息投影、认知状态/stance revisions、证据记忆任务、可选 compare job、group-based outbox、lane CAS、lineage CAS、turn CAS 和 commit receipt。任一步失败全部回滚。
+通过后依次写入 canonical group/items/actions、聊天消息投影、认知状态/stance revisions、证据记忆任务、可选 compare job、group-based outbox、lane CAS、lineage CAS、turn CAS、完整 semantic manifest 和 commit receipt。manifest 的 canonical JSON 必须重新 hash 为 receipt 的 `commitChecksum`；任一步失败全部回滚。
 
 #### 13.3.4 状态与任务的 authority key
 
@@ -671,7 +680,9 @@ fallback 只在以下情况取得本地提交权：
 
 #### 13.3.6 group-based outbox
 
-旧 v1/v2 delivery 继续保留 `turnId + peerId` 兼容路径，但每个 legacy helper 必须以 `authorityGroupId IS NULL` 为前置条件并拒绝 canonical row。所有 `resultAuthorityVersion=1` 的新结果只按 `authorityGroupId + peerId` 读取、租约、重试、确认和恢复；`turnId` 只是指向获胜 turn 的诊断字段。投递幂等键为 `groupId + peerId + commitChecksum`。由 group/item/action join 生成桥接 payload 时，必须最后覆盖确定性 `messageId/actionId/ordinal/target`，禁止 item/action JSON 中的同名字段反向覆盖权威 identity。因此 original/retry 即使有不同 turn ID，也不可能分别投递。
+旧 v1/v2 delivery 继续保留 `turnId + peerId` 兼容路径，但每个 legacy helper 必须以 `authorityGroupId IS NULL` 为前置条件并拒绝 canonical row。所有 `resultAuthorityVersion=1` 的新结果只按 `authorityGroupId + peerId` 读取、租约、重试、确认和恢复；`turnId` 只是指向获胜 turn 的诊断字段。投递幂等键为 `groupId + peerId + commitChecksum`。由 manifest 与 group/item/action join 生成桥接 payload 时，必须先证明投影与 manifest 完全一致，再最后覆盖确定性 `messageId/actionId/ordinal/target`，禁止 item/action JSON 中的同名字段反向覆盖权威 identity。因此 original/retry 即使有不同 turn ID，也不可能分别投递。
+
+canonical 与 legacy 可以使用隔离的查询 API，但同一个 outbox pump 必须把两组候选按持久化 `updatedAt` 与稳定 identity 做全局排序后再应用本轮 limit；不能固定把 canonical 拼在 legacy 前面或反过来。否则持续大于 limit 的一侧会让另一侧永久饥饿，等价于更新后破坏旧消息或新消息投递。
 
 “每个 legacy helper”包括列表入口与间接入口，而不只包括最终 `UPDATE`：
 `listPendingCloudDeliveries()` 只返回 `authorityGroupId IS NULL`，canonical pump 使用独立
@@ -686,14 +697,18 @@ envelope、完整 current batch、parent、derived lineage 和存储的 immutabl
 rollout revision 或 agency heads 仍等于原生成时的值，因为这些 mutable authority
 在成功 commit 后按设计已经推进。
 
-v11 reopen invariant 是运行时恢复闸门，不只是表存在性检查。它拒绝
+v12 reopen invariant 是运行时恢复闸门，不只是表存在性检查。它拒绝
 `resultAuthorityVersion NOT IN (0,1)`，并验证 canonical envelope/checksum、input batch、
 release pin、lineage/retry chain、latest owner、committed turn/lineage 的实际 revision
-等于 receipt after-revision、group/item/action/message 的双向且确定性 identity join，
-以及 stance/job/cognitive-state/delivery 的 group authority 不悬空。数据库中保留一条
-unknown authority version、缺 item projection、错误 deterministic ID 或 committed
-turn revision 与 receipt 脱节，都必须在 worker 恢复前隔离，不能被 Task 11 的
-“非 0 即 canonical”分支接管。
+等于 receipt after-revision、manifest JSON/checksum/receipt 的闭合、group/item/action/message
+与 manifest 的双向且确定性 identity/semantic join，以及 stance/job/cognitive-state/delivery
+的 role/turn/group/ordinal/checksum authority join。input batch 必须逐项重算 batch checksum、
+item checksum、顺序和完整 message JSON，并与 normalized envelope 相等；retry 还必须证明
+parent/child 的 release、rollout、comparison、preset、batch、visibility 与 annotation pins
+相同，`lineageRevisionAtCreation=parent+1`，但允许 child 固定新的有效 agency checksum。
+数据库中保留一条 unknown authority version、缺 item/action/job projection、错误
+deterministic ID、manifest/receipt checksum 不一致或 committed turn revision 与 receipt
+脱节，都必须在 worker 恢复前隔离，不能被 Task 11 的“非 0 即 canonical”分支接管。
 
 ### 13.4 可见游标
 
