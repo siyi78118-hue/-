@@ -455,3 +455,77 @@ test('lane admission atomically supersedes an uncommitted proactive turn and sur
       store.close();
     }
   }));
+
+test('lane admission cancels canonical proactive authority before admitting a direct user turn', () =>
+  withTemporaryDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      store.initializeCognitionRolloutsInternal({
+        rows: [
+          directRollout(),
+          {
+            rolloutKey: 'PROACTIVE_CHAT',
+            currentMode: 'legacy',
+            rolloutPhase: 'stable',
+            presetVersion: '1.9.2',
+            pipelineChecksum: 'b'.repeat(64)
+          }
+        ],
+        now: 1
+      });
+      const proactiveEnvelope = envelope('turn_canonical_proactive', 21);
+      proactiveEnvelope.kind = 'PROACTIVE_CHAT';
+      delete proactiveEnvelope.message;
+      proactiveEnvelope.trigger = {
+        triggerId: 'trigger_canonical_proactive',
+        triggerType: 'proactive_chat',
+        scheduledFor: 1_020,
+        executedAt: 1_021
+      };
+      const rollout = store.getCognitionRollout('PROACTIVE_CHAT');
+      const proactive = store.createCanonicalVisibleTurnInternal({
+        envelope: proactiveEnvelope,
+        rolloutKey: 'PROACTIVE_CHAT',
+        expectedRolloutRevision: rollout.revision,
+        authoritativeReleaseId: rollout.stableReleaseId,
+        comparisonReleaseId: null,
+        comparisonDirection: null,
+        laneKey: 'private_chat',
+        expectedLaneRevision: 0,
+        inputUserBatchId: proactiveEnvelope.trigger.triggerId,
+        inputVisibilitySequence: 0,
+        agencySnapshotChecksum: 'c'.repeat(64),
+        annotationSnapshot: {}
+      }).turn;
+      const openLineage = store.getTurnAuthorityLineage(proactive.authorityLineageKey);
+
+      const direct = envelope('turn_after_canonical_proactive', 22);
+      store.submitTurn(direct, { laneKey: 'private_chat', laneRevision: 1 });
+      const admitted = store.admitInteractionTurnInternal({
+        roleId: 'yuqi',
+        laneKey: 'private_chat',
+        expectedRevision: 1,
+        incomingTurnId: direct.turnId,
+        latestUserBatchId: `batch_msg_${direct.turnId}`,
+        now: 1_200
+      });
+
+      const cancelled = store.getTurn(proactive.turnId);
+      const cancelledLineage = store.getTurnAuthorityLineage(proactive.authorityLineageKey);
+      assert.equal(admitted.decision.supersededTurnId, proactive.turnId);
+      assert.equal(cancelled.state, 'failed');
+      assert.equal(cancelled.turnRevision, proactive.turnRevision + 1);
+      assert.equal(cancelledLineage.state, 'cancelled');
+      assert.equal(cancelledLineage.revision, openLineage.revision + 1);
+      assert.equal(admitted.lane.generatingTurnId, direct.turnId);
+      assert.throws(() => store.cancelCanonicalTurnInternal({
+        turnId: proactive.turnId,
+        authorityLineageKey: proactive.authorityLineageKey,
+        expectedTurnRevision: proactive.turnRevision,
+        expectedLineageRevision: openLineage.revision,
+        reasonCode: 'STALE_RETRY'
+      }), /canonical turn authority conflict/i);
+    } finally {
+      store.close();
+    }
+  }));

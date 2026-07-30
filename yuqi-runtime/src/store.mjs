@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
-import { decideLaneAdmission } from './interaction-lanes.mjs';
+import { decideLaneAdmission, laneKeyForEnvelope } from './interaction-lanes.mjs';
 import {
   TURN_STATES,
   canonicalJson,
@@ -2192,16 +2192,34 @@ export class YuqiStore {
       if (!decision.admitted) return { decision, lane };
 
       if (decision.supersededTurnId) {
-        this.db.prepare(`
-          UPDATE turns
-          SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?
-          WHERE turn_id = ? AND reply_json IS NULL
-        `).run(canonicalJson({
-          code: decision.reasonCode,
-          supersededByTurnId: incomingTurnId
-        }), Number(input.now || now()), decision.supersededTurnId);
+        const superseded = this.getTurn(decision.supersededTurnId);
+        if (superseded?.resultAuthorityVersion === 1) {
+          const lineage = this.getTurnAuthorityLineage(superseded.authorityLineageKey);
+          this.cancelCanonicalTurnRowsInternal({
+            turnId: superseded.turnId,
+            authorityLineageKey: superseded.authorityLineageKey,
+            expectedTurnRevision: superseded.turnRevision,
+            expectedLineageRevision: lineage?.revision,
+            reasonCode: decision.reasonCode,
+            supersededByTurnId: incomingTurnId,
+            timestamp: Number(input.now || now())
+          });
+        } else {
+          this.db.prepare(`
+            UPDATE turns
+            SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?
+            WHERE turn_id = ? AND reply_json IS NULL
+          `).run(canonicalJson({
+            code: decision.reasonCode,
+            supersededByTurnId: incomingTurnId
+          }), Number(input.now || now()), decision.supersededTurnId);
+        }
       }
       if (decision.requeueTurnId) {
+        const requeued = this.getTurn(decision.requeueTurnId);
+        if (requeued?.resultAuthorityVersion === 1) {
+          throw new Error('canonical turn API required for lane requeue');
+        }
         this.db.prepare(`
           UPDATE turns
           SET state = 'queued', worker_id = NULL, error_json = NULL, updated_at = ?
@@ -2662,6 +2680,26 @@ export class YuqiStore {
       || envelope.message?.messageId
       || envelope.trigger?.triggerId
       || '';
+    const derivedRolloutKey = String(envelope.kind || '');
+    const derivedLaneKey = laneKeyForEnvelope(envelope);
+    const derivedInputUserBatchId = String(
+      envelope.context?.currentBatch?.batchId
+      ?? envelope.message?.messageId
+      ?? envelope.trigger?.triggerId
+      ?? ''
+    );
+    if (envelope.characterId !== 'yuqi') {
+      throw new Error('canonical authority requires role yuqi');
+    }
+    if (rolloutKey !== derivedRolloutKey) {
+      throw new Error('canonical rollout authority conflict');
+    }
+    if (laneKey !== derivedLaneKey) {
+      throw new Error('canonical lane authority conflict');
+    }
+    if (inputUserBatchId !== derivedInputUserBatchId) {
+      throw new Error('canonical user batch authority conflict');
+    }
     if (!rolloutKey || !laneKey || !rootSourceId || !inputUserBatchId
       || !Number.isInteger(expectedRolloutRevision) || expectedRolloutRevision < 0
       || !Number.isInteger(expectedLaneRevision) || expectedLaneRevision < 0
@@ -2694,6 +2732,10 @@ export class YuqiStore {
       if (actualLaneRevision !== expectedLaneRevision) {
         throw new Error('interaction lane revision conflict');
       }
+      if (envelope.protocolVersion === 2
+        && inputVisibilitySequence !== Number(lane?.localSequence || 0)) {
+        throw new Error('protocol v2 input visibility sequence authority conflict');
+      }
       if (inputVisibilitySequence < Number(lane?.localSequence || 0)) {
         throw new Error('input visibility sequence is behind lane authority');
       }
@@ -2709,12 +2751,24 @@ export class YuqiStore {
         }
         const parentEnvelope = parseJson(parent.envelopeJson, {});
         const parentMessage = parentEnvelope.message;
+        const canonicalBatch = value => value?.context?.currentBatch
+          ? value.context.currentBatch
+          : value?.message
+            ? {
+                batchId: value.message.messageId,
+                messageIds: [value.message.messageId],
+                startedAt: value.message.sentAt,
+                committedAt: value.message.sentAt,
+                messages: [value.message]
+              }
+            : null;
         if (!parentMessage
           || parent.sourceMessageId !== retry.canonicalMessageId
           || envelope.message?.messageId !== retry.canonicalMessageId
           || envelope.message?.content !== parentMessage.content
-          || Number(envelope.message?.sentAt) !== Number(parentMessage.sentAt)) {
-          throw new Error('retry canonical message conflict');
+          || Number(envelope.message?.sentAt) !== Number(parentMessage.sentAt)
+          || contentHash(canonicalBatch(envelope)) !== contentHash(canonicalBatch(parentEnvelope))) {
+          throw new Error('retry canonical batch conflict');
         }
         const lineage = this.getTurnAuthorityLineage(parent.authorityLineageKey);
         if (!lineage) throw new Error('canonical retry lineage invariant conflict');
@@ -2809,6 +2863,28 @@ export class YuqiStore {
           authoritativePipelineChecksum: authoritativeRelease.releaseChecksum,
           comparisonPipelineChecksum: comparisonRelease?.releaseChecksum || null
         };
+        if (phase === 'canary') {
+          const outstanding = Number(rolloutRow.canary_started_count)
+            - Number(rolloutRow.canary_completed_count)
+            - Number(rolloutRow.canary_failure_count);
+          if (outstanding >= Number(rolloutRow.canary_max_outstanding)) {
+            throw new Error('canary outstanding authority limit reached');
+          }
+          const reservation = this.db.prepare(`
+            UPDATE cognition_kind_rollouts
+            SET revision = revision + 1,
+                canary_started_count = canary_started_count + 1,
+                canary_started_at = COALESCE(canary_started_at, ?),
+                updated_at = ?
+            WHERE rollout_key = ? AND revision = ?
+              AND (
+                canary_started_count - canary_completed_count - canary_failure_count
+              ) < canary_max_outstanding
+          `).run(now(), now(), rolloutKey, expectedRolloutRevision);
+          if (Number(reservation.changes) !== 1) {
+            throw new RolloutRevisionConflictError('canary reservation conflict');
+          }
+        }
       }
 
       const timestamp = now();
@@ -3969,6 +4045,9 @@ export class YuqiStore {
   recoverFailedDraft(turnId, { peerId, sentAt = null } = {}) {
     const current = this.getTurn(turnId);
     if (!current) throw new Error('turn not found');
+    if (current.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn API required for failed draft recovery');
+    }
     if (current.state === 'committed' && current.replyJson) {
       return { recovered: false, result: parseJson(current.replyJson, null) };
     }
@@ -4034,6 +4113,9 @@ export class YuqiStore {
   requeueTransientFailedTurn(turnId) {
     const current = this.getTurn(turnId);
     if (!current) throw new Error('turn not found');
+    if (current.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn API required for transient requeue');
+    }
     if (current.state !== 'failed') return { requeued: false, turn: current };
     const failure = parseJson(current.errorJson, {});
     const isTransientCodexFailure = String(failure?.name || '') === 'CodexTurnError'
@@ -4079,6 +4161,9 @@ export class YuqiStore {
   requeueUsageLimitFailedTurn(turnId) {
     const current = this.getTurn(turnId);
     if (!current) throw new Error('turn not found');
+    if (current.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn API required for usage-limit requeue');
+    }
     if (current.state !== 'failed') return { requeued: false, turn: current };
     const failure = parseJson(current.errorJson, {});
     const isUsageLimit = String(failure?.name || '') === 'CodexTurnError'
@@ -4328,11 +4413,207 @@ export class YuqiStore {
     });
   }
 
+  claimCanonicalTurnInternal({ turnId, workerId, expectedTurnRevision }) {
+    if (!workerId) throw new Error('workerId is required');
+    return this.withImmediateTransaction(() => {
+      const result = this.db.prepare(`
+        UPDATE turns
+        SET state = 'memory_running', worker_id = ?, updated_at = ?,
+            turn_revision = turn_revision + 1
+        WHERE turn_id = ? AND result_authority_version = 1
+          AND state = 'queued' AND turn_revision = ?
+      `).run(String(workerId), now(), String(turnId), Number(expectedTurnRevision));
+      if (Number(result.changes) !== 1) {
+        throw new Error('canonical turn authority conflict');
+      }
+      const turn = this.getTurn(turnId);
+      this.appendSync('turn', turnId, 'state', turn);
+      return turn;
+    });
+  }
+
+  advanceCanonicalTurnInternal({
+    turnId,
+    expectedState,
+    nextState,
+    expectedTurnRevision,
+    patch = {}
+  }) {
+    if (!TURN_STATES.includes(expectedState) || !TURN_STATES.includes(nextState)) {
+      throw new Error('unknown turn state');
+    }
+    const assignments = [
+      'state = ?',
+      'updated_at = ?',
+      'turn_revision = turn_revision + 1'
+    ];
+    const values = [nextState, now()];
+    for (const [key, value] of Object.entries(patch || {})) {
+      const column = TURN_PATCH_COLUMNS.get(key);
+      if (!column) throw new Error(`unsupported turn patch: ${key}`);
+      assignments.push(`${column} = ?`);
+      values.push(value);
+    }
+    values.push(String(turnId), expectedState, Number(expectedTurnRevision));
+    return this.withImmediateTransaction(() => {
+      const result = this.db.prepare(`
+        UPDATE turns SET ${assignments.join(', ')}
+        WHERE turn_id = ? AND result_authority_version = 1
+          AND state = ? AND turn_revision = ?
+      `).run(...values);
+      if (Number(result.changes) !== 1) {
+        throw new Error('canonical turn authority conflict');
+      }
+      const turn = this.getTurn(turnId);
+      this.appendSync('turn', turnId, 'state', turn);
+      return turn;
+    });
+  }
+
+  recordCanonicalTurnFailureInternal({
+    turnId,
+    expectedState,
+    expectedTurnRevision,
+    failure
+  }) {
+    if (!TURN_STATES.includes(expectedState)) throw new Error('unknown turn state');
+    const normalizedFailure = {
+      ...structuredClone(failure || {}),
+      failureClass: String(failure?.failureClass || 'terminal')
+    };
+    return this.withImmediateTransaction(() => {
+      const result = this.db.prepare(`
+        UPDATE turns
+        SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?,
+            turn_revision = turn_revision + 1
+        WHERE turn_id = ? AND result_authority_version = 1
+          AND state = ? AND turn_revision = ?
+      `).run(
+        canonicalJson(normalizedFailure),
+        now(),
+        String(turnId),
+        expectedState,
+        Number(expectedTurnRevision)
+      );
+      if (Number(result.changes) !== 1) {
+        throw new Error('canonical turn authority conflict');
+      }
+      const turn = this.getTurn(turnId);
+      this.appendSync('turn', turnId, 'state', turn);
+      return turn;
+    });
+  }
+
+  requeueCanonicalFailedTurnInternal({
+    turnId,
+    expectedTurnRevision,
+    allowedFailureClass
+  }) {
+    const current = this.getTurn(turnId);
+    const failure = parseJson(current?.errorJson, {});
+    if (!current || current.resultAuthorityVersion !== 1
+      || current.state !== 'failed'
+      || String(failure.failureClass || '') !== String(allowedFailureClass || '')) {
+      throw new Error('canonical turn authority conflict');
+    }
+    const checkpoint = current.brainDraftJson
+      ? 'brain_done'
+      : current.memoryPacketJson
+        ? 'memory_done'
+        : 'queued';
+    return this.withImmediateTransaction(() => {
+      const result = this.db.prepare(`
+        UPDATE turns
+        SET state = ?, worker_id = NULL, error_json = NULL,
+            brain_draft_json = CASE
+              WHEN ? = 'memory_done' OR ? = 'queued' THEN NULL
+              ELSE brain_draft_json
+            END,
+            supervisor_json = NULL, reply_json = NULL, updated_at = ?,
+            turn_revision = turn_revision + 1
+        WHERE turn_id = ? AND result_authority_version = 1
+          AND state = 'failed' AND turn_revision = ?
+      `).run(
+        checkpoint,
+        checkpoint,
+        checkpoint,
+        now(),
+        String(turnId),
+        Number(expectedTurnRevision)
+      );
+      if (Number(result.changes) !== 1) {
+        throw new Error('canonical turn authority conflict');
+      }
+      const turn = this.getTurn(turnId);
+      this.appendSync('turn', turnId, 'state', turn);
+      return turn;
+    });
+  }
+
+  cancelCanonicalTurnRowsInternal({
+    turnId,
+    authorityLineageKey,
+    expectedTurnRevision,
+    expectedLineageRevision,
+    reasonCode,
+    supersededByTurnId = null,
+    timestamp = now()
+  }) {
+    const turnResult = this.db.prepare(`
+      UPDATE turns
+      SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?,
+          turn_revision = turn_revision + 1
+      WHERE turn_id = ? AND result_authority_version = 1
+        AND authority_lineage_key = ? AND reply_json IS NULL
+        AND turn_revision = ?
+    `).run(
+      canonicalJson({
+        code: String(reasonCode || 'CANONICAL_CANCELLED'),
+        ...(supersededByTurnId ? { supersededByTurnId: String(supersededByTurnId) } : {})
+      }),
+      Number(timestamp),
+      String(turnId),
+      String(authorityLineageKey),
+      Number(expectedTurnRevision)
+    );
+    if (Number(turnResult.changes) !== 1) {
+      throw new Error('canonical turn authority conflict');
+    }
+    const lineageResult = this.db.prepare(`
+      UPDATE turn_authority_lineages
+      SET state = 'cancelled', revision = revision + 1, updated_at = ?
+      WHERE lineage_key = ? AND latest_turn_id = ? AND state = 'open'
+        AND revision = ?
+    `).run(
+      Number(timestamp),
+      String(authorityLineageKey),
+      String(turnId),
+      Number(expectedLineageRevision)
+    );
+    if (Number(lineageResult.changes) !== 1) {
+      throw new Error('canonical turn authority conflict');
+    }
+    return {
+      turn: this.getTurn(turnId),
+      lineage: this.getTurnAuthorityLineage(authorityLineageKey)
+    };
+  }
+
+  cancelCanonicalTurnInternal(input) {
+    return this.withImmediateTransaction(() => {
+      const result = this.cancelCanonicalTurnRowsInternal(input);
+      this.appendSync('turn', result.turn.turnId, 'state', result.turn);
+      return result;
+    });
+  }
+
   claimTurn(workerId) {
     if (!workerId) throw new Error('workerId is required');
     return this.transaction(() => {
       const row = this.db.prepare(
-        "SELECT turn_id FROM turns WHERE state = 'queued' ORDER BY created_at, turn_id LIMIT 1"
+        `SELECT turn_id FROM turns
+         WHERE state = 'queued' AND result_authority_version = 0
+         ORDER BY created_at, turn_id LIMIT 1`
       ).get();
       if (!row) return null;
       const result = this.db.prepare(`
@@ -4348,6 +4629,10 @@ export class YuqiStore {
 
   claimTurnById(turnId, workerId) {
     if (!workerId) throw new Error('workerId is required');
+    const current = this.getTurn(turnId);
+    if (current?.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn API required for claim');
+    }
     const result = this.db.prepare(`
       UPDATE turns SET state = 'memory_running', worker_id = ?, updated_at = ?
       WHERE turn_id = ? AND state = 'queued'
@@ -4364,6 +4649,9 @@ export class YuqiStore {
     }
     const current = this.getTurn(turnId);
     if (!current) throw new Error('turn not found');
+    if (current.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn API required for state advance');
+    }
     if (current.state !== expectedState) throw new Error('stale turn state');
 
     const assignments = ['state = ?', 'updated_at = ?'];

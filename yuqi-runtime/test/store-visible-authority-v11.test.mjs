@@ -346,12 +346,18 @@ function canonicalCreateInput(store, envelope, overrides = {}) {
     envelope,
     rolloutKey: 'DIRECT_REPLY',
     expectedRolloutRevision: rollout.revision,
-    authoritativeReleaseId: rollout.stableReleaseId,
+    authoritativeReleaseId: rollout.candidatePhase === 'canary'
+      ? rollout.candidateReleaseId
+      : rollout.stableReleaseId,
     comparisonReleaseId: rollout.candidatePhase === 'shadow'
       ? rollout.candidateReleaseId
+      : rollout.candidatePhase === 'canary'
+        ? rollout.stableReleaseId
       : null,
     comparisonDirection: rollout.candidatePhase === 'shadow'
       ? 'stable_authoritative_candidate_compare'
+      : rollout.candidatePhase === 'canary'
+        ? 'candidate_authoritative_stable_compare'
       : null,
     laneKey: 'private_chat',
     expectedLaneRevision: Number(lane?.revision || 0),
@@ -361,6 +367,55 @@ function canonicalCreateInput(store, envelope, overrides = {}) {
     annotationSnapshot: {},
     ...overrides
   };
+}
+
+function canonicalAuthorityCounts(store) {
+  return {
+    turns: Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value),
+    lineages: Number(store.db.prepare(
+      'SELECT COUNT(*) AS value FROM turn_authority_lineages'
+    ).get().value),
+    lanes: Number(store.db.prepare('SELECT COUNT(*) AS value FROM interaction_lanes').get().value),
+    rollout: store.getCognitionRollout('DIRECT_REPLY')
+  };
+}
+
+function batchedEnvelope(turnId, deviceSeq) {
+  const result = v2Envelope(turnId, deviceSeq, {
+    messageId: 'msg_batch_last',
+    content: '最后一条',
+    sentAt: 10_000
+  });
+  const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl2ZQAAAABJRU5ErkJggg==';
+  const first = {
+    messageId: 'msg_batch_first',
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: 'yuqi',
+    content: '第一条',
+    sentAt: 9_999,
+    attachments: [{
+      attachmentId: 'att_batch_first',
+      messageId: 'msg_batch_first',
+      kind: 'image',
+      mime: 'image/png',
+      name: 'first.png',
+      width: 1,
+      height: 1,
+      bytes: Buffer.from(png, 'base64').length,
+      dataUrl: `data:image/png;base64,${png}`
+    }]
+  };
+  result.context = {
+    currentBatch: {
+      batchId: 'batch_complete',
+      messageIds: [first.messageId, result.message.messageId],
+      startedAt: first.sentAt,
+      committedAt: result.createdAt,
+      messages: [first, result.message]
+    }
+  };
+  return result;
 }
 
 function ensureDirectRollout(store) {
@@ -376,6 +431,155 @@ function ensureDirectRollout(store) {
     now: 1
   });
 }
+
+for (const [index, [name, mutate]] of [
+  ['role', input => { input.envelope.characterId = 'other_role'; }],
+  ['rollout kind', input => { input.rolloutKey = 'PROACTIVE_CHAT'; }],
+  ['lane', input => { input.laneKey = 'public_moment'; }],
+  ['user batch', input => { input.inputUserBatchId = 'batch_forged'; }],
+  ['v2 visibility sequence', input => { input.inputVisibilitySequence += 1; }]
+].entries()) {
+  test(`canonical creation rejects caller-spoofed ${name} with zero side effects`, () =>
+    withDatabase(path => {
+      const store = new YuqiStore(path);
+      try {
+        ensureDirectRollout(store);
+        const input = canonicalCreateInput(store, v2Envelope(`turn_spoof_${index}`, 1));
+        const before = canonicalAuthorityCounts(store);
+        mutate(input);
+        assert.throws(
+          () => store.createCanonicalVisibleTurnInternal(input),
+          /canonical|authority|rollout|lane|batch|visibility/i
+        );
+        assert.deepEqual(canonicalAuthorityCounts(store), before);
+      } finally {
+        store.close();
+      }
+    }));
+}
+
+for (const [index, [name, mutate]] of [
+  ['earlier bubble content', envelope => {
+    envelope.context.currentBatch.messages[0].content = '被篡改的第一条';
+  }],
+  ['earlier attachment', envelope => {
+    envelope.context.currentBatch.messages[0].attachments[0].name = 'changed.png';
+  }],
+  ['message ordering', envelope => {
+    envelope.context.currentBatch.messages.reverse();
+    envelope.context.currentBatch.messageIds.reverse();
+  }],
+  ['batch id', envelope => {
+    envelope.context.currentBatch.batchId = 'batch_forged';
+  }]
+].entries()) {
+  test(`canonical retry rejects changed ${name} before authority mutation`, () =>
+    withDatabase(path => {
+      const store = new YuqiStore(path);
+      try {
+        ensureDirectRollout(store);
+        const originalEnvelope = batchedEnvelope('turn_batch_original', 1);
+        const original = store.createCanonicalVisibleTurnInternal(canonicalCreateInput(
+          store,
+          originalEnvelope,
+          { inputUserBatchId: originalEnvelope.context.currentBatch.batchId }
+        )).turn;
+        const retryEnvelope = structuredClone(originalEnvelope);
+        retryEnvelope.turnId = `turn_batch_retry_${index}`;
+        retryEnvelope.deviceSeq = 2;
+        retryEnvelope.createdAt += 1;
+        retryEnvelope.context.retry = {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: originalEnvelope.message.messageId
+        };
+        mutate(retryEnvelope);
+        const laneBefore = structuredClone(store.getInteractionLane('yuqi', 'private_chat'));
+        const lineageBefore = structuredClone(
+          store.getTurnAuthorityLineage(original.authorityLineageKey)
+        );
+        const turnCountBefore = canonicalAuthorityCounts(store).turns;
+        assert.throws(() => store.createCanonicalVisibleTurnInternal({
+          ...canonicalCreateInput(store, retryEnvelope, {
+            expectedRolloutRevision: original.rolloutRevision,
+            expectedLaneRevision: laneBefore.revision,
+            inputUserBatchId: retryEnvelope.context.currentBatch.batchId,
+            inputVisibilitySequence: laneBefore.localSequence,
+            authoritativeReleaseId: original.authoritativeReleaseId,
+            comparisonReleaseId: original.comparisonReleaseId,
+            comparisonDirection: original.comparisonMode === 'none'
+              ? null
+              : original.comparisonMode
+          })
+        }), /retry.*batch|canonical.*batch|message.*conflict|current batch/i);
+        assert.equal(canonicalAuthorityCounts(store).turns, turnCountBefore);
+        assert.deepEqual(store.getInteractionLane('yuqi', 'private_chat'), laneBefore);
+        assert.deepEqual(
+          store.getTurnAuthorityLineage(original.authorityLineageKey),
+          lineageBefore
+        );
+      } finally {
+        store.close();
+      }
+    }));
+}
+
+test('canary creation reserves distinct slots atomically and exact replay reserves none', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      store.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET candidate_phase = 'canary', current_mode = 'active',
+            rollout_phase = 'canary', canary_max_outstanding = 2,
+            canary_started_count = 0, canary_completed_count = 0,
+            canary_failure_count = 0
+        WHERE rollout_key = 'DIRECT_REPLY'
+      `).run();
+      const firstInput = canonicalCreateInput(store, v2Envelope('turn_canary_1', 1));
+      const first = store.createCanonicalVisibleTurnInternal(firstInput);
+      assert.equal(first.turn.canarySlot, 1);
+      assert.equal(store.getCognitionRollout('DIRECT_REPLY').canaryStartedCount, 1);
+      const replay = store.createCanonicalVisibleTurnInternal(structuredClone(firstInput));
+      assert.equal(replay.turn.turnId, first.turn.turnId);
+      assert.equal(store.getCognitionRollout('DIRECT_REPLY').canaryStartedCount, 1);
+
+      const lane = store.getInteractionLane('yuqi', 'private_chat');
+      const rollout = store.getCognitionRollout('DIRECT_REPLY');
+      const secondInput = canonicalCreateInput(store, v2Envelope('turn_canary_2', 2, {
+        messageId: 'msg_canary_2',
+        content: '第二个 canary',
+        sentAt: 10_002
+      }), {
+        expectedRolloutRevision: rollout.revision,
+        expectedLaneRevision: lane.revision,
+        inputVisibilitySequence: lane.localSequence
+      });
+      const second = store.createCanonicalVisibleTurnInternal(secondInput);
+      assert.equal(second.turn.canarySlot, 2);
+      assert.equal(store.getCognitionRollout('DIRECT_REPLY').canaryStartedCount, 2);
+
+      const before = canonicalAuthorityCounts(store);
+      const latestLane = store.getInteractionLane('yuqi', 'private_chat');
+      const latestRollout = store.getCognitionRollout('DIRECT_REPLY');
+      assert.throws(() => store.createCanonicalVisibleTurnInternal(canonicalCreateInput(
+        store,
+        v2Envelope('turn_canary_overflow', 3, {
+          messageId: 'msg_canary_overflow',
+          content: '超过配额',
+          sentAt: 10_003
+        }),
+        {
+          expectedRolloutRevision: latestRollout.revision,
+          expectedLaneRevision: latestLane.revision,
+          inputVisibilitySequence: latestLane.localSequence
+        }
+      )), /canary.*outstanding/i);
+      assert.deepEqual(canonicalAuthorityCounts(store), before);
+    } finally {
+      store.close();
+    }
+  }));
 
 function commitCanonicalTurn(store, turn) {
   const visibleGroup = {
