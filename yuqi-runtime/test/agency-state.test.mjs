@@ -131,6 +131,14 @@ test('a relevant user batch decrements a stance and expires it at zero', () => {
   assert.equal(result.activeStances.length, 0);
   assert.equal(result.changedRecords[0].status, 'expired');
   assert.equal(result.changedRecords[0].revision, 2);
+  assert.deepEqual(result.auditRecords, [{
+    stanceId: 's1',
+    revision: 2,
+    status: 'expired',
+    supersedes: 's1',
+    sourceMessageIds: ['u2'],
+    lastConfirmedAt: 2000
+  }]);
 });
 
 test('an irrelevant user batch neither requires coverage nor decrements a stance', () => {

@@ -1260,7 +1260,7 @@ export class YuqiStore {
       UPDATE cognition_kind_rollouts
       SET stable_release_id = COALESCE(stable_release_id, ?),
           candidate_release_id = COALESCE(candidate_release_id, ?),
-          candidate_phase = COALESCE(candidate_phase, 'baseline')
+          candidate_phase = COALESCE(candidate_phase, 'none')
     `).run(
       BASELINE_STABLE_RELEASE.releaseId,
       BASELINE_V2_CANDIDATE_RELEASE.releaseId
@@ -1777,7 +1777,7 @@ export class YuqiStore {
           pipeline_checksum, evidence_epoch, shadow_epoch, canary_epoch,
           last_reason_code, created_at, updated_at, stable_release_id,
           candidate_release_id, candidate_phase
-        ) VALUES (?, ?, ?, 1, ?, ?, 1, 0, 0, 'bootstrap', ?, ?, ?, ?, 'baseline')
+        ) VALUES (?, ?, ?, 1, ?, ?, 1, 0, 0, 'bootstrap', ?, ?, ?, ?, 'none')
       `);
       const history = this.db.prepare(`
         INSERT INTO cognition_promotion_history(

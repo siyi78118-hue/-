@@ -194,6 +194,7 @@ test('clean v9 migrates once to the exact v10 authority schema', () => withTempo
       );
     }
     assert.equal(store.listPipelineReleases().length, 2);
+    assert.ok(store.listCognitionRollouts().every(row => row.candidatePhase === 'none'));
     store.migrate();
     assert.equal(store.userVersion(), 10);
     assert.equal(store.listPipelineReleases().length, 2);
@@ -209,6 +210,7 @@ test('populated v9 to v10 is non-destructive and idempotent', () => withTemporar
   try {
     assert.equal(store.userVersion(), 10);
     assert.deepEqual(countStructuralRows(path), before);
+    assert.equal(store.listCognitionRollouts()[0].candidatePhase, 'none');
     store.migrate();
     assert.equal(store.userVersion(), 10);
     assert.equal(store.listPipelineReleases().length, 2);

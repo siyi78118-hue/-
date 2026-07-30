@@ -347,9 +347,18 @@ export function applyStanceTransitions({
     activeStances.push(created);
   }
 
+  const auditRecords = changedRecords.map(record => ({
+    stanceId: record.stanceId,
+    revision: record.revision,
+    status: record.status,
+    supersedes: record.supersedes ?? null,
+    sourceMessageIds: [...record.sourceMessageIds],
+    lastConfirmedAt: record.lastConfirmedAt
+  }));
   return deepFreeze({
     activeStances: activeStances.sort((left, right) => left.stanceId.localeCompare(right.stanceId)),
-    changedRecords
+    changedRecords,
+    auditRecords
   });
 }
 
