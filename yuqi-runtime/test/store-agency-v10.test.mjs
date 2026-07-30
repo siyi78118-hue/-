@@ -406,3 +406,52 @@ test('release, lane, quality, and migration audit methods round-trip canonical r
       store.close();
     }
   }));
+
+test('lane admission atomically supersedes an uncommitted proactive turn and survives restart', () =>
+  withTemporaryDatabase(path => {
+    let store = new YuqiStore(path);
+    try {
+      const proactive = envelope('turn_proactive', 11);
+      proactive.kind = 'PROACTIVE_CHAT';
+      delete proactive.message;
+      proactive.trigger = {
+        triggerId: 'trigger_1',
+        triggerType: 'proactive_chat',
+        scheduledFor: 1010,
+        executedAt: 1011
+      };
+      store.submitTurn(proactive, { laneKey: 'private_chat', laneRevision: 0 });
+      store.claimInteractionLaneInternal({
+        roleId: 'yuqi',
+        laneKey: 'private_chat',
+        expectedRevision: 0,
+        generatingTurnId: proactive.turnId,
+        now: 1100
+      });
+      const direct = envelope('turn_direct', 12);
+      store.submitTurn(direct, { laneKey: 'private_chat', laneRevision: 1 });
+
+      const admitted = store.admitInteractionTurnInternal({
+        roleId: 'yuqi',
+        laneKey: 'private_chat',
+        expectedRevision: 1,
+        incomingTurnId: direct.turnId,
+        latestUserBatchId: `batch_msg_${direct.turnId}`,
+        now: 1200
+      });
+      assert.equal(admitted.decision.supersededTurnId, proactive.turnId);
+      assert.equal(store.getTurn(proactive.turnId).state, 'failed');
+      assert.equal(JSON.parse(store.getTurn(proactive.turnId).errorJson).code,
+        'superseded_by_user_batch');
+      assert.equal(admitted.lane.generatingTurnId, direct.turnId);
+      assert.equal(admitted.lane.revision, 2);
+      store.close();
+
+      store = new YuqiStore(path);
+      assert.equal(store.getInteractionLane('yuqi', 'private_chat').generatingTurnId,
+        direct.turnId);
+      assert.equal(store.getInteractionLane('yuqi', 'private_chat').revision, 2);
+    } finally {
+      store.close();
+    }
+  }));

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
+import { decideLaneAdmission } from './interaction-lanes.mjs';
 import {
   TURN_STATES,
   canonicalJson,
@@ -1591,6 +1592,85 @@ export class YuqiStore {
     );
     if (Number(result.changes) !== 1) throw new Error('interaction lane revision conflict');
     return this.getInteractionLane(roleId, laneKey);
+  }
+
+  admitInteractionTurnInternal(input) {
+    const roleId = String(input?.roleId || '');
+    const laneKey = String(input?.laneKey || '');
+    const expectedRevision = Number(input?.expectedRevision ?? 0);
+    const incomingTurnId = String(input?.incomingTurnId || '');
+    if (!roleId || !laneKey || !incomingTurnId || !Number.isInteger(expectedRevision)) {
+      throw new Error('invalid interaction lane admission');
+    }
+    return this.transaction(() => {
+      const lane = this.getInteractionLane(roleId, laneKey);
+      const actualRevision = Number(lane?.revision || 0);
+      if (actualRevision !== expectedRevision) {
+        throw new Error('interaction lane revision conflict');
+      }
+      const incomingTurn = this.getTurn(incomingTurnId);
+      if (!incomingTurn || incomingTurn.characterId !== roleId) {
+        throw new Error('incoming interaction turn is unavailable');
+      }
+      const incomingEnvelope = parseJson(incomingTurn.envelopeJson, {});
+      const currentTurn = lane?.generatingTurnId
+        ? this.getTurn(lane.generatingTurnId)
+        : null;
+      const currentEnvelope = currentTurn ? parseJson(currentTurn.envelopeJson, {}) : {};
+      const decision = decideLaneAdmission({
+        lane: {
+          ...lane,
+          generatingTurn: currentTurn
+            ? {
+                turnId: currentTurn.turnId,
+                kind: currentEnvelope.kind,
+                state: currentTurn.state,
+                committed: Boolean(currentTurn.replyJson)
+                  || ['committed', 'completed', 'delivered'].includes(currentTurn.state)
+              }
+            : null
+        },
+        incoming: {
+          turnId: incomingTurn.turnId,
+          kind: incomingEnvelope.kind,
+          state: incomingTurn.state,
+          committed: Boolean(incomingTurn.replyJson)
+        },
+        now: input.now || now()
+      });
+      if (!decision.admitted) return { decision, lane };
+
+      if (decision.supersededTurnId) {
+        this.db.prepare(`
+          UPDATE turns
+          SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?
+          WHERE turn_id = ? AND reply_json IS NULL
+        `).run(canonicalJson({
+          code: decision.reasonCode,
+          supersededByTurnId: incomingTurnId
+        }), Number(input.now || now()), decision.supersededTurnId);
+      }
+      if (decision.requeueTurnId) {
+        this.db.prepare(`
+          UPDATE turns
+          SET state = 'queued', worker_id = NULL, error_json = NULL, updated_at = ?
+          WHERE turn_id = ? AND reply_json IS NULL
+        `).run(Number(input.now || now()), decision.requeueTurnId);
+      }
+      const updatedLane = this.claimInteractionLaneInternal({
+        roleId,
+        laneKey,
+        expectedRevision,
+        generatingTurnId: incomingTurnId,
+        latestUserBatchId: input.latestUserBatchId ?? lane?.latestUserBatchId ?? null,
+        now: input.now || now()
+      });
+      this.appendSync('interaction_lane', `${roleId}:${laneKey}`, 'admit', {
+        decision,
+        lane: updatedLane
+      });
+      return { decision, lane: updatedLane };
+    });
   }
 
   putQualityEvalRunInternal(run) {
