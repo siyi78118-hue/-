@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { generationFingerprint } from '../src/interaction-lanes.mjs';
-import { commitVisibleResult } from '../src/visible-result-commit.mjs';
+import { contentHash } from '../src/protocol.mjs';
+import { canonicalCommitPayload, commitVisibleResult } from '../src/visible-result-commit.mjs';
 import {
   YuqiStore,
   deriveAuthorityLineageKey,
@@ -15,6 +16,17 @@ import {
 } from '../src/store.mjs';
 
 const SHA = 'a'.repeat(64);
+
+function withStore(run) {
+  const directory = mkdtempSync(join(tmpdir(), 'yuqi-authority-snapshot-'));
+  const store = new YuqiStore(join(directory, 'memory.sqlite'));
+  try {
+    return run(store);
+  } finally {
+    store.close();
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+}
 
 test('al-authority-v1 identity vectors are stable across UTF-8 and ordinal boundaries', () => {
   const fixture = JSON.parse(readFileSync(
@@ -30,6 +42,230 @@ test('al-authority-v1 identity vectors are stable across UTF-8 and ordinal bound
     assert.equal(deriveVisibleMessageId(groupId, vector.ordinal), vector.messageId, vector.name);
     assert.equal(deriveVisibleActionId(groupId, vector.ordinal), vector.actionId, vector.name);
   }
+});
+
+test('agency authority snapshot includes verified referenced preferences and is order stable', () =>
+  withStore(store => {
+    for (const fact of [
+      {
+        factId: 'pref_b',
+        characterId: 'yuqi',
+        subjectId: 'user',
+        predicate: 'drink',
+        object: 'oolong',
+        type: 'stable_preference',
+        status: 'verified',
+        confidence: 0.8,
+        sourceMessageIds: ['u2']
+      },
+      {
+        factId: 'pref_a',
+        characterId: 'yuqi',
+        subjectId: 'user',
+        predicate: 'food',
+        object: 'rice_noodles',
+        type: 'stable_preference',
+        status: 'verified',
+        confidence: 0.9,
+        sourceMessageIds: ['u1']
+      }
+    ]) store.putFact(fact);
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi',
+      schemaVersion: 2,
+      revision: 1,
+      lastTurnId: 'seed',
+      state: {
+        slowState: { preferenceFactIds: ['pref_b', 'pref_a'] },
+        mediumState: {},
+        fastState: {}
+      },
+      updatedAt: 1
+    });
+    const first = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 10 });
+    const second = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 10 });
+    assert.deepEqual(first.preferenceFacts.map(item => item.factId), ['pref_a', 'pref_b']);
+    assert.equal(first.checksum, second.checksum);
+    assert.equal(first.cognitiveState.revision, 1);
+  }));
+
+test('agency authority snapshot rejects an invalid referenced preference fact', () =>
+  withStore(store => {
+    store.putFact({
+      factId: 'pref_bad',
+      characterId: 'yuqi',
+      subjectId: 'user',
+      predicate: 'food',
+      object: 'rice_noodles',
+      type: 'temporary_observation',
+      status: 'verified',
+      confidence: 0.9,
+      sourceMessageIds: ['u1']
+    });
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi',
+      schemaVersion: 2,
+      revision: 1,
+      lastTurnId: 'seed',
+      state: {
+        slowState: { preferenceFactIds: ['pref_bad'] },
+        mediumState: {},
+        fastState: {}
+      },
+      updatedAt: 1
+    });
+    assert.throws(
+      () => store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 10 }),
+      /preference fact is invalid/i
+    );
+  }));
+
+test('canonical creation recomputes agency authority and rejects a forged checksum without writes', () =>
+  withStore(store => {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'DIRECT_REPLY',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: SHA
+      }],
+      now: 1
+    });
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const before = Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value);
+    assert.throws(() => store.createCanonicalVisibleTurnInternal({
+      envelope: envelope('turn_forged_agency'),
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 0,
+      inputUserBatchId: 'msg_user_authority',
+      inputVisibilitySequence: 0,
+      agencySnapshotChecksum: 'f'.repeat(64),
+      annotationSnapshot: {}
+    }), /agency snapshot authority conflict/i);
+    assert.equal(
+      Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value),
+      before
+    );
+  }));
+
+test('canonical commit checksum excludes top-level and nested attempt metadata', () => {
+  const base = {
+    authorityLineageKey: 'lin_semantic',
+    turnId: 'turn_attempt_1',
+    laneKey: 'private_chat',
+    expectedLatestUserBatchId: 'batch_1',
+    inputVisibilitySequence: 4,
+    agencySnapshotChecksum: SHA,
+    expectedCognitiveStateRevision: 2,
+    authoritativeReleaseId: 'release_a',
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    generationFingerprint: SHA,
+    visibleGroup: {
+      items: [{
+        content: '一样的回复',
+        speakerId: 'yuqi',
+        speakerType: 'character',
+        recipientId: 'user'
+      }]
+    },
+    actionSet: [],
+    statePatch: { mood: 'warm', currentStances: [], openThreads: [] },
+    memoryJobs: [{
+      jobId: 'job_attempt_1',
+      jobType: 'turn_consolidation',
+      dueAt: 100,
+      workerId: 'worker_a',
+      payload: {
+        turnId: 'turn_attempt_1',
+        createdAt: 100,
+        cognitionPacketChecksum: 'b'.repeat(64),
+        resultingCognitiveStateChecksum: 'c'.repeat(64)
+      }
+    }],
+    comparisonJob: null
+  };
+  const retry = structuredClone(base);
+  retry.turnId = 'turn_attempt_2';
+  retry.memoryJobs[0].jobId = 'job_attempt_2';
+  retry.memoryJobs[0].dueAt = 999;
+  retry.memoryJobs[0].workerId = 'worker_b';
+  retry.memoryJobs[0].payload.turnId = 'turn_attempt_2';
+  retry.memoryJobs[0].payload.createdAt = 999;
+  assert.equal(
+    contentHash(canonicalCommitPayload(base)),
+    contentHash(canonicalCommitPayload(retry))
+  );
+  retry.memoryJobs[0].payload.cognitionPacketChecksum = 'd'.repeat(64);
+  assert.notEqual(
+    contentHash(canonicalCommitPayload(base)),
+    contentHash(canonicalCommitPayload(retry))
+  );
+});
+
+test('canonical memory and compare descriptors default-deny unknown semantic fields', () => {
+  const base = {
+    authorityLineageKey: 'lin_job_allowlist',
+    turnId: 'turn_job_allowlist',
+    laneKey: 'private_chat',
+    expectedLatestUserBatchId: 'batch_1',
+    inputVisibilitySequence: 4,
+    agencySnapshotChecksum: SHA,
+    expectedCognitiveStateRevision: 2,
+    authoritativeReleaseId: 'release_a',
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    generationFingerprint: SHA,
+    visibleGroup: { items: [] },
+    actionSet: [],
+    statePatch: null,
+    memoryJobs: [{
+      jobType: 'turn_consolidation',
+      payload: {
+        cognitionPacketChecksum: 'b'.repeat(64),
+        resultingCognitiveStateChecksum: 'c'.repeat(64),
+        unregisteredSemanticInput: 'must-not-be-silently-ignored'
+      }
+    }],
+    comparisonJob: null
+  };
+  assert.throws(
+    () => canonicalCommitPayload(base),
+    /memory job payload contains unsupported fields/i
+  );
+  const invalidChecksum = structuredClone(base);
+  delete invalidChecksum.memoryJobs[0].payload.unregisteredSemanticInput;
+  invalidChecksum.memoryJobs[0].payload.cognitionPacketChecksum = '';
+  assert.throws(
+    () => canonicalCommitPayload(invalidChecksum),
+    /memory job cognitionPacketChecksum must be a sha-256 checksum/i
+  );
+  const comparison = structuredClone(base);
+  comparison.memoryJobs = [];
+  comparison.comparisonJob = {
+    jobType: 'shadow_cognition',
+    payload: {
+      comparisonReleaseId: 'release_b',
+      comparisonDirection: 'stable_visible_candidate_compare',
+      rolloutEvidenceEpoch: 1,
+      shadowEpoch: 1,
+      canaryEpoch: null,
+      canarySlot: null,
+      annotationSnapshotChecksum: 'd'.repeat(64),
+      inputChecksum: 'e'.repeat(64),
+      unregisteredSemanticInput: 'must-not-be-silently-ignored'
+    }
+  };
+  assert.throws(
+    () => canonicalCommitPayload(comparison),
+    /comparison job payload contains unsupported fields/i
+  );
 });
 
 function envelope(turnId = 'turn_authority') {
@@ -68,6 +304,27 @@ function withAuthority(run) {
       now: 1
     });
     const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi',
+      schemaVersion: 2,
+      revision: 1,
+      lastTurnId: 'turn_state_seed',
+      state: {
+        slowState: { identity: 'yuqi' },
+        mediumState: { activeScene: 'chat' },
+        fastState: {
+          mood: 'neutral',
+          body: 'resting',
+          attention: 'user',
+          openThreadIds: []
+        }
+      },
+      updatedAt: 999
+    });
+    const agencySnapshot = store.readAgencyAuthoritySnapshotInternal({
+      roleId: 'yuqi',
+      at: 1_000
+    });
     const creationInput = {
       envelope: envelope(),
       rolloutKey: 'DIRECT_REPLY',
@@ -79,22 +336,10 @@ function withAuthority(run) {
       expectedLaneRevision: 0,
       inputUserBatchId: 'msg_user_authority',
       inputVisibilitySequence: 0,
-      agencySnapshotChecksum: SHA,
+      agencySnapshotChecksum: agencySnapshot.checksum,
       annotationSnapshot: {}
     };
     const creation = store.createCanonicalVisibleTurnInternal(creationInput);
-    store.putCognitiveStateInternal({
-      roleId: 'yuqi',
-      schemaVersion: 2,
-      revision: 1,
-      lastTurnId: creation.turn.turnId,
-      state: {
-        slowState: {},
-        mediumState: {},
-        fastState: { mood: 'neutral' }
-      },
-      updatedAt: 1001
-    });
     return run(store, creation.turn, creationInput);
   } finally {
     store.close();
@@ -110,15 +355,15 @@ function commitInput(store, turn) {
     ]
   };
   const actionSet = [{
-    kind: 'chat_marker',
-    targetKey: 'conversation:yuqi:user',
+    kind: 'moment_create',
+    targetKey: `lineage_create:${turn.authorityLineageKey}:moment_create`,
     targetRevision: '1',
-    payload: { marker: 'replied' }
+    payload: { privacy: 'private', content: '雨后的灯。' }
   }];
   const fingerprint = generationFingerprint({
     roleId: turn.characterId,
     laneKey: turn.laneKey,
-    laneRevision: turn.laneRevision,
+    inputVisibilitySequence: turn.inputVisibilitySequence,
     visibleGroup,
     actionSet,
     contextRevision: turn.agencySnapshotChecksum
@@ -139,41 +384,31 @@ function commitInput(store, turn) {
     visibleGroup,
     actionSet,
     statePatch: {
-      roleId: 'yuqi',
-      schemaVersion: 2,
-      revision: 2,
-      state: {
-        slowState: {},
-        mediumState: {},
-        fastState: { mood: 'engaged' }
-      },
-      stanceRevisions: [{
+      mood: 'engaged',
+      openThreads: [],
+      currentStances: [{
+        operation: 'create',
         stanceId: 'stance_authority',
-        revision: 1,
         topic: 'conversation',
         position: '想继续聊',
         reason: '当前互动',
         strength: 0.7,
         flexibility: 0.8,
-        sourceMessageIds: ['msg_user_authority'],
-        createdAt: 2000,
-        lastConfirmedAt: 2000,
+        evidenceMessageIds: ['msg_user_authority'],
         expiresAt: 3000,
-        remainingRelevantUserBatches: 3,
-        status: 'active',
-        supersedes: null
+        remainingRelevantUserBatches: 3
       }]
     },
     memoryJobs: [{
       jobId: 'job_authority',
       jobType: 'turn_consolidation',
-      payload: { turnId: turn.turnId }
+      payload: {
+        turnId: turn.turnId,
+        cognitionPacketChecksum: 'b'.repeat(64),
+        resultingCognitiveStateChecksum: 'c'.repeat(64)
+      }
     }],
-    comparisonJob: {
-      jobId: 'job_authority_compare',
-      jobType: 'shadow_cognition',
-      payload: { comparisonReleaseId: 'release_candidate' }
-    },
+    comparisonJob: null,
     generationFingerprint: fingerprint,
     now: 2000
   };
@@ -204,7 +439,7 @@ test('canonical group projections action state memory outbox and receipt commit 
     assert.equal(store.actionsForGroup(result.visibleGroupId).length, 1);
     assert.equal(store.getCognitiveState('yuqi').lastAuthorityGroupId, result.visibleGroupId);
     assert.equal(store.memoryJobsForGroup(result.visibleGroupId).length, 1);
-    assert.equal(store.comparisonJobsForGroup(result.visibleGroupId).length, 1);
+    assert.equal(store.comparisonJobsForGroup(result.visibleGroupId).length, 0);
     assert.equal(
       store.db.prepare(
         'SELECT authority_group_id FROM stance_records WHERE stance_id = ?'
@@ -215,6 +450,347 @@ test('canonical group projections action state memory outbox and receipt commit 
     assert.equal(store.getVisibleCommitReceipt(turn.authorityLineageKey).commitChecksum,
       result.commitChecksum);
     assert.equal(store.getInteractionLane('yuqi', 'private_chat').revision, 2);
+    const state = store.getCognitiveState('yuqi').state;
+    assert.deepEqual(state.slowState, { identity: 'yuqi' });
+    assert.deepEqual(state.mediumState, { activeScene: 'chat' });
+    assert.equal(state.fastState.body, 'resting');
+    assert.equal(state.fastState.attention, 'user');
+    assert.equal(state.fastState.mood, 'engaged');
+  }));
+
+test('an agency head change invalidates an open result but not an exact committed receipt replay', () =>
+  withAuthority((store, turn) => {
+    const input = commitInput(store, turn);
+    store.putConstraintRevisionInternal({
+      constraintId: 'constraint_new',
+      revision: 1,
+      roleId: 'yuqi',
+      authority: 'system',
+      kind: 'privacy',
+      subject: 'both',
+      scope: { channel: 'private_chat', target: 'all' },
+      rule: 'keep_private',
+      sourceMessageIds: [],
+      status: 'active',
+      createdAt: 1_000,
+      updatedAt: 1_000
+    });
+    assert.throws(() => commitVisibleResult(input), /AGENCY_AUTHORITY_STALE/);
+    store.db.prepare('DELETE FROM constraint_records WHERE constraint_id = ?').run('constraint_new');
+    const first = commitVisibleResult(input);
+    store.putConstraintRevisionInternal({
+      constraintId: 'constraint_after_commit',
+      revision: 1,
+      roleId: 'yuqi',
+      authority: 'system',
+      kind: 'privacy',
+      subject: 'both',
+      scope: { channel: 'private_chat', target: 'all' },
+      rule: 'keep_private',
+      sourceMessageIds: [],
+      status: 'active',
+      createdAt: 1_000,
+      updatedAt: 1_000
+    });
+    assert.equal(commitVisibleResult(input).commitChecksum, first.commitChecksum);
+  }));
+
+for (const [name, mutate] of [
+  ['hard constraints', patch => { patch.hardConstraints = []; }],
+  ['preference evidence', patch => { patch.preferenceEvidence = []; }],
+  ['foreign role', patch => { patch.roleId = 'other'; }],
+  ['slow state', patch => { patch.slowState = {}; }],
+  ['medium state', patch => { patch.mediumState = {}; }],
+  ['extra top-level key', patch => { patch.extra = true; }],
+  ['stale stance evidence', patch => {
+    patch.currentStances[0].evidenceMessageIds = ['missing_message'];
+  }],
+  ['unsupported stance transition', patch => {
+    patch.currentStances[0].operation = 'delete';
+  }]
+]) {
+  test(`state patch rejects ${name} without side effects`, () =>
+    withAuthority((store, turn) => {
+      const input = commitInput(store, turn);
+      const before = sideEffectCounts(store);
+      mutate(input.statePatch);
+      assert.throws(() => commitVisibleResult(input));
+      assert.deepEqual(sideEffectCounts(store), before);
+    }));
+}
+
+test('unknown action kinds and injected stable comparison jobs are rejected', () =>
+  withAuthority((store, turn) => {
+    const unknown = commitInput(store, turn);
+    unknown.actionSet[0].kind = 'arbitrary_action';
+    unknown.generationFingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup: unknown.visibleGroup,
+      actionSet: unknown.actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    });
+    assert.throws(() => commitVisibleResult(unknown), /unknown canonical action/i);
+    const injected = commitInput(store, turn);
+    injected.comparisonJob = {
+      jobId: 'compare_injected',
+      jobType: 'shadow_cognition',
+      payload: {}
+    };
+    assert.throws(() => commitVisibleResult(injected), /comparison authority conflict/i);
+  }));
+
+test('caller projection identity cannot override deterministic group identities', () =>
+  withAuthority((store, turn) => {
+    const input = commitInput(store, turn);
+    input.visibleGroup.items[0].messageId = 'forged_message';
+    input.visibleGroup.items[0].ordinal = 99;
+    input.actionSet[0].actionId = 'forged_action';
+    input.actionSet[0].ordinal = 99;
+    const receipt = commitVisibleResult(input);
+    const item = store.visibleItemsForGroup(receipt.visibleGroupId)[0];
+    const action = store.actionsForGroup(receipt.visibleGroupId)[0];
+    assert.equal(item.messageId, deriveVisibleMessageId(receipt.visibleGroupId, 0));
+    assert.equal(item.ordinal, 0);
+    assert.equal(action.actionId, deriveVisibleActionId(receipt.visibleGroupId, 0));
+    assert.equal(action.ordinal, 0);
+  }));
+
+test('state commit inserts revision one when cognitive state is absent', () =>
+  withStore(store => {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'DIRECT_REPLY',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: SHA
+      }],
+      now: 1
+    });
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const source = envelope('turn_state_insert');
+    const snapshot = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1_000 });
+    const turn = store.createCanonicalVisibleTurnInternal({
+      envelope: source,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 0,
+      inputUserBatchId: source.message.messageId,
+      inputVisibilitySequence: 0,
+      agencySnapshotChecksum: snapshot.checksum,
+      annotationSnapshot: {}
+    }).turn;
+    const visibleGroup = {
+      items: [{
+        content: '在呢。',
+        speakerId: 'yuqi',
+        speakerType: 'character',
+        recipientId: 'user'
+      }]
+    };
+    const generation = generationFingerprint({
+      roleId: 'yuqi',
+      laneKey: 'private_chat',
+      inputVisibilitySequence: 0,
+      visibleGroup,
+      actionSet: [],
+      contextRevision: snapshot.checksum
+    });
+    commitVisibleResult({
+      store,
+      turnId: turn.turnId,
+      authorityLineageKey: turn.authorityLineageKey,
+      laneKey: turn.laneKey,
+      expectedTurnRevision: turn.turnRevision,
+      expectedLineageRevision: store.getTurnAuthorityLineage(turn.authorityLineageKey).revision,
+      expectedLaneRevision: store.getInteractionLane('yuqi', 'private_chat').revision,
+      expectedCognitiveStateRevision: 0,
+      expectedLatestUserBatchId: turn.inputUserBatchId,
+      inputVisibilitySequence: 0,
+      agencySnapshotChecksum: snapshot.checksum,
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      visibleGroup,
+      actionSet: [],
+      statePatch: { mood: 'awake', currentStances: [], openThreads: ['chat'] },
+      memoryJobs: [],
+      comparisonJob: null,
+      generationFingerprint: generation,
+      now: 2_000
+    });
+    const state = store.getCognitiveState('yuqi');
+    assert.equal(state.revision, 1);
+    assert.equal(state.state.fastState.mood, 'awake');
+    assert.deepEqual(state.state.fastState.openThreadIds, ['chat']);
+  }));
+
+test('canonical action target registry resolves every supported authority namespace', () =>
+  withStore(store => {
+    store.putLifePlanInternal('yuqi', [{
+      episodeId: 'life_1',
+      kind: 'work',
+      title: '整理画稿',
+      startAt: 2_000,
+      endAt: 3_000,
+      payload: {}
+    }]);
+    const turn = {
+      turnId: 'turn_registry',
+      characterId: 'yuqi',
+      authorityLineageKey: 'lin_registry',
+      envelopeJson: JSON.stringify({
+        context: {
+          pendingPayment: { messageId: 'pay_1', amountMinor: 2000, currency: 'CNY' },
+          targetMoment: { momentId: 'moment_1', revision: 3 },
+          commentId: 'comment_1',
+          rolePlan: { rolePlanId: 'plan_1', revision: 2 },
+          relationship: { phase: 'familiar', revision: 4 }
+        }
+      })
+    };
+    const cases = [
+      ['payment_accept', { messageId: 'pay_1' }, 'payment:pay_1'],
+      ['moment_create', {}, 'lineage_create:lin_registry:moment_create'],
+      ['moment_like', { momentId: 'moment_1' }, 'moment:moment_1'],
+      ['moment_comment', { momentId: 'moment_1' }, 'moment:moment_1'],
+      ['moment_reply', { commentId: 'comment_1' }, 'comment:comment_1'],
+      ['role_plan_create', {}, 'lineage_create:lin_registry:role_plan_create'],
+      ['role_plan_update', { rolePlanId: 'plan_1' }, 'role_plan:plan_1'],
+      ['life_episode_create', {}, 'lineage_create:lin_registry:life_episode_create'],
+      ['life_episode_update', { episodeId: 'life_1' }, 'life_episode:life_1'],
+      ['relationship_transition', {}, 'relationship:yuqi']
+    ];
+    for (const [kind, payload, targetKey] of cases) {
+      const resolved = store.resolveCanonicalActionTargetInternal({
+        turn,
+        action: { kind, payload }
+      });
+      assert.equal(resolved.targetKey, targetKey, kind);
+      assert.ok(resolved.targetRevision, kind);
+    }
+  }));
+
+test('shadow commit requires the exact pinned comparison descriptor', () =>
+  withStore(store => {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'DIRECT_REPLY',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: SHA
+      }],
+      now: 1
+    });
+    const initial = store.getCognitionRollout('DIRECT_REPLY');
+    const candidate = store.listPipelineReleases().find(
+      release => release.releaseId !== initial.stableReleaseId
+    );
+    store.db.prepare(`
+      UPDATE cognition_kind_rollouts
+      SET current_mode = 'shadow', rollout_phase = 'collecting',
+          candidate_release_id = ?, candidate_phase = 'shadow', shadow_epoch = 1
+      WHERE rollout_key = 'DIRECT_REPLY'
+    `).run(candidate.releaseId);
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const source = envelope('turn_shadow_compare');
+    const snapshot = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1_000 });
+    const turn = store.createCanonicalVisibleTurnInternal({
+      envelope: source,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: rollout.candidateReleaseId,
+      comparisonDirection: 'stable_authoritative_candidate_compare',
+      laneKey: 'private_chat',
+      expectedLaneRevision: 0,
+      inputUserBatchId: source.message.messageId,
+      inputVisibilitySequence: 0,
+      agencySnapshotChecksum: snapshot.checksum,
+      annotationSnapshot: { training: 'v4' }
+    }).turn;
+    const visibleGroup = {
+      items: [{
+        content: '在。',
+        speakerId: 'yuqi',
+        speakerType: 'character',
+        recipientId: 'user'
+      }]
+    };
+    const generation = generationFingerprint({
+      roleId: 'yuqi',
+      laneKey: 'private_chat',
+      inputVisibilitySequence: 0,
+      visibleGroup,
+      actionSet: [],
+      contextRevision: snapshot.checksum
+    });
+    const base = {
+      store,
+      turnId: turn.turnId,
+      authorityLineageKey: turn.authorityLineageKey,
+      laneKey: turn.laneKey,
+      expectedTurnRevision: turn.turnRevision,
+      expectedLineageRevision: store.getTurnAuthorityLineage(turn.authorityLineageKey).revision,
+      expectedLaneRevision: store.getInteractionLane('yuqi', 'private_chat').revision,
+      expectedCognitiveStateRevision: 0,
+      expectedLatestUserBatchId: turn.inputUserBatchId,
+      inputVisibilitySequence: 0,
+      agencySnapshotChecksum: snapshot.checksum,
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      comparisonReleaseId: turn.comparisonReleaseId,
+      comparisonDirection: turn.comparisonMode,
+      visibleGroup,
+      actionSet: [],
+      statePatch: null,
+      memoryJobs: [],
+      comparisonJob: null,
+      generationFingerprint: generation,
+      now: 2_000
+    };
+    assert.throws(() => commitVisibleResult(base), /comparison authority conflict/i);
+    const valid = {
+      ...base,
+      comparisonJob: {
+      jobId: 'compare_shadow',
+      jobType: 'shadow_cognition',
+      payload: {
+        comparisonReleaseId: turn.comparisonReleaseId,
+        comparisonDirection: turn.comparisonMode,
+        rolloutEvidenceEpoch: turn.rolloutEvidenceEpoch,
+        shadowEpoch: turn.shadowEpoch,
+        canaryEpoch: null,
+        canarySlot: null,
+        annotationSnapshotChecksum: contentHash(turn.annotationSnapshot),
+        inputChecksum: contentHash({
+          envelope: source,
+          authoritativeReleaseId: turn.authoritativeReleaseId,
+          authoritativePipelineChecksum: turn.authoritativePipelineChecksum,
+          comparisonReleaseId: turn.comparisonReleaseId,
+          comparisonPipelineChecksum: turn.comparisonPipelineChecksum,
+          rolloutRevision: turn.rolloutRevision,
+          rolloutEvidenceEpoch: turn.rolloutEvidenceEpoch,
+          shadowEpoch: turn.shadowEpoch,
+          canaryEpoch: turn.canaryEpoch,
+          canarySlot: turn.canarySlot
+        })
+      }
+    }};
+    const wrong = {
+      ...valid,
+      comparisonJob: structuredClone(valid.comparisonJob)
+    };
+    wrong.comparisonJob.payload.inputChecksum = 'f'.repeat(64);
+    assert.throws(() => commitVisibleResult(wrong), /comparison authority conflict/i);
+    const receipt = commitVisibleResult(valid);
+    assert.equal(store.comparisonJobsForGroup(receipt.visibleGroupId).length, 1);
   }));
 
 test('exact repeated commit returns one receipt and changed payload conflicts', () =>
@@ -271,7 +847,7 @@ for (const [name, mutate] of [
     input.generationFingerprint = generationFingerprint({
       roleId: 'yuqi',
       laneKey: input.laneKey,
-      laneRevision: 1,
+      inputVisibilitySequence: input.inputVisibilitySequence,
       visibleGroup: input.visibleGroup,
       actionSet: input.actionSet,
       contextRevision: input.agencySnapshotChecksum

@@ -483,6 +483,10 @@ test('lane admission cancels canonical proactive authority before admitting a di
         executedAt: 1_021
       };
       const rollout = store.getCognitionRollout('PROACTIVE_CHAT');
+      const agencySnapshot = store.readAgencyAuthoritySnapshotInternal({
+        roleId: 'yuqi',
+        at: proactiveEnvelope.trigger.executedAt
+      });
       const proactive = store.createCanonicalVisibleTurnInternal({
         envelope: proactiveEnvelope,
         rolloutKey: 'PROACTIVE_CHAT',
@@ -494,7 +498,7 @@ test('lane admission cancels canonical proactive authority before admitting a di
         expectedLaneRevision: 0,
         inputUserBatchId: proactiveEnvelope.trigger.triggerId,
         inputVisibilitySequence: 0,
-        agencySnapshotChecksum: 'c'.repeat(64),
+        agencySnapshotChecksum: agencySnapshot.checksum,
         annotationSnapshot: {}
       }).turn;
       const openLineage = store.getTurnAuthorityLineage(proactive.authorityLineageKey);

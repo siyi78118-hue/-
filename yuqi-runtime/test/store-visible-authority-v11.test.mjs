@@ -342,6 +342,10 @@ function v2Envelope(turnId, deviceSeq, {
 function canonicalCreateInput(store, envelope, overrides = {}) {
   const rollout = store.getCognitionRollout('DIRECT_REPLY');
   const lane = store.getInteractionLane('yuqi', 'private_chat');
+  const agencySnapshot = store.readAgencyAuthoritySnapshotInternal({
+    roleId: 'yuqi',
+    at: envelope.message.sentAt
+  });
   return {
     envelope,
     rolloutKey: 'DIRECT_REPLY',
@@ -363,7 +367,7 @@ function canonicalCreateInput(store, envelope, overrides = {}) {
     expectedLaneRevision: Number(lane?.revision || 0),
     inputUserBatchId: envelope.message.messageId,
     inputVisibilitySequence: 0,
-    agencySnapshotChecksum: SHA_A,
+    agencySnapshotChecksum: agencySnapshot.checksum,
     annotationSnapshot: {},
     ...overrides
   };
@@ -612,7 +616,7 @@ function commitCanonicalTurn(store, turn) {
     generationFingerprint: generationFingerprint({
       roleId: turn.characterId,
       laneKey: turn.laneKey,
-      laneRevision: turn.laneRevision,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
       visibleGroup,
       actionSet,
       contextRevision: turn.agencySnapshotChecksum

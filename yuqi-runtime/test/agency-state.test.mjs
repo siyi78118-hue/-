@@ -135,7 +135,7 @@ test('a relevant user batch decrements a stance and expires it at zero', () => {
     stanceId: 's1',
     revision: 2,
     status: 'expired',
-    supersedes: 's1',
+    supersedes: 's1@1',
     sourceMessageIds: ['u2'],
     lastConfirmedAt: 2000
   }]);
@@ -195,8 +195,12 @@ test('soften and reverse create revisions rather than mutating history', () => {
     evidenceIndex: new Map([['u2', { messageId: 'u2', speakerType: 'user' }]]),
     now: 2000
   });
-  assert.equal(result.changedRecords[0].status, 'superseded');
-  assert.equal(result.activeStances[0].supersedes, 's1');
+  assert.equal(result.changedRecords.length, 1);
+  assert.equal(result.changedRecords[0].stanceId, 's1');
+  assert.equal(result.changedRecords[0].status, 'active');
+  assert.equal(result.changedRecords[0].supersedes, 's1@1');
+  assert.equal(result.activeStances[0].stanceId, 's1');
+  assert.equal(result.activeStances[0].supersedes, 's1@1');
   assert.equal(result.activeStances[0].revision, 2);
   assert.equal(original.status, 'active');
   assert.equal(original.position, 'not accepting another gift today');
@@ -267,6 +271,20 @@ test('create and explicit expire preserve auditable records', () => {
   });
   assert.equal(expired.activeStances.length, 0);
   assert.equal(expired.changedRecords.at(-1).status, 'expired');
+});
+
+test('time expiry appends a terminal revision under the stable stance id', () => {
+  const result = applyStanceTransitions({
+    stances: [stance({ expiresAt: 1_500 })],
+    transitions: [],
+    relevantBatch: { messageIds: [], topics: [] },
+    now: 2_000
+  });
+  assert.equal(result.activeStances.length, 0);
+  assert.equal(result.changedRecords[0].stanceId, 's1');
+  assert.equal(result.changedRecords[0].revision, 2);
+  assert.equal(result.changedRecords[0].status, 'expired');
+  assert.equal(result.changedRecords[0].supersedes, 's1@1');
 });
 
 test('agency view expires by time, filters by feature relevance, ranks deterministically, and is bounded', () => {

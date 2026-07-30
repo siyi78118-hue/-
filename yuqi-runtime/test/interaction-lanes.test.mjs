@@ -75,7 +75,7 @@ test('fingerprint only deduplicates adjacent matching authority contexts', () =>
   const value = {
     roleId: 'yuqi',
     laneKey: 'private_chat',
-    laneRevision: 8,
+    inputVisibilitySequence: 8,
     visibleGroup: [{ text: ' 你好  ' }, { text: '今天怎么样' }],
     actionSet: [{ type: 'payment', messageId: 'pay_1', action: 'received' }],
     contextRevision: 'ctx_1'
@@ -83,10 +83,36 @@ test('fingerprint only deduplicates adjacent matching authority contexts', () =>
   assert.equal(generationFingerprint(value), generationFingerprint(structuredClone(value)));
   assert.notEqual(
     generationFingerprint(value),
-    generationFingerprint({ ...value, laneRevision: 9 })
+    generationFingerprint({ ...value, inputVisibilitySequence: 9 })
   );
   assert.notEqual(
     generationFingerprint(value),
     generationFingerprint({ ...value, contextRevision: 'ctx_2' })
+  );
+});
+
+test('generation fingerprint follows input visibility, not retry lane revision', () => {
+  const base = {
+    roleId: 'yuqi',
+    laneKey: 'private_chat',
+    inputVisibilitySequence: 7,
+    visibleGroup: { items: [{ content: '收到。' }] },
+    actionSet: [],
+    contextRevision: 'agency-1'
+  };
+  assert.equal(
+    generationFingerprint({ ...base, laneRevision: 2 }),
+    generationFingerprint({ ...base, laneRevision: 99 })
+  );
+  assert.notEqual(
+    generationFingerprint(base),
+    generationFingerprint({ ...base, inputVisibilitySequence: 8 })
+  );
+  assert.notEqual(
+    generationFingerprint(base),
+    generationFingerprint({
+      ...base,
+      visibleGroup: { items: [{ content: '不同回复' }] }
+    })
   );
 });

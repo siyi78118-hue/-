@@ -191,6 +191,18 @@ test('canonical original and retry restart emit one group-keyed delivery', async
       now: 1
     });
     const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi',
+      schemaVersion: 2,
+      revision: 1,
+      lastTurnId: 'seed',
+      state: { slowState: {}, mediumState: {}, fastState: {} },
+      updatedAt: 1
+    });
+    const agencySnapshot = store.readAgencyAuthoritySnapshotInternal({
+      roleId: 'yuqi',
+      at: 1_000
+    });
     const baseEnvelope = envelope();
     const original = store.createCanonicalVisibleTurnInternal({
       envelope: baseEnvelope,
@@ -203,7 +215,7 @@ test('canonical original and retry restart emit one group-keyed delivery', async
       expectedLaneRevision: 0,
       inputUserBatchId: baseEnvelope.message.messageId,
       inputVisibilitySequence: 0,
-      agencySnapshotChecksum: 'a'.repeat(64),
+      agencySnapshotChecksum: agencySnapshot.checksum,
       annotationSnapshot: {}
     }).turn;
     const retryEnvelope = structuredClone(baseEnvelope);
@@ -229,14 +241,6 @@ test('canonical original and retry restart emit one group-keyed delivery', async
       agencySnapshotChecksum: original.agencySnapshotChecksum,
       annotationSnapshot: original.annotationSnapshot
     }).turn;
-    store.putCognitiveStateInternal({
-      roleId: 'yuqi',
-      schemaVersion: 2,
-      revision: 1,
-      lastTurnId: retry.turnId,
-      state: { slowState: {}, mediumState: {}, fastState: {} },
-      updatedAt: 1
-    });
     const visibleGroup = {
       items: [{
         content: '在。',
@@ -249,7 +253,7 @@ test('canonical original and retry restart emit one group-keyed delivery', async
     const generation = generationFingerprint({
       roleId: retry.characterId,
       laneKey: retry.laneKey,
-      laneRevision: retry.laneRevision,
+      inputVisibilitySequence: retry.inputVisibilitySequence,
       visibleGroup,
       actionSet,
       contextRevision: retry.agencySnapshotChecksum
@@ -270,10 +274,9 @@ test('canonical original and retry restart emit one group-keyed delivery', async
       visibleGroup,
       actionSet,
       statePatch: {
-        roleId: 'yuqi',
-        schemaVersion: 2,
-        revision: 2,
-        state: { slowState: {}, mediumState: {}, fastState: {} }
+        mood: 'present',
+        currentStances: [],
+        openThreads: []
       },
       memoryJobs: [],
       comparisonJob: null,
@@ -281,6 +284,14 @@ test('canonical original and retry restart emit one group-keyed delivery', async
       now: 2
     });
     assert.equal(store.outboxForTurn(original.turnId).length, 0);
+    const canonicalDeliveryBefore = store.outboxForGroup(receipt.visibleGroupId)[0];
+    for (const legacyCall of [
+      () => store.registerCloudDelivery(retry.turnId, retry.deviceId),
+      () => store.prepareCloudDelivery(retry.turnId, retry.deviceId, { replyParts: [] }),
+      () => store.markCloudDeliveryAttempt(retry.turnId, retry.deviceId),
+      () => store.markCloudDeliveryMailboxed(retry.turnId, retry.deviceId, 'x')
+    ]) assert.throws(legacyCall, /canonical delivery API required/i);
+    assert.deepEqual(store.outboxForGroup(receipt.visibleGroupId)[0], canonicalDeliveryBefore);
     store.close();
     store = new YuqiStore(file);
 

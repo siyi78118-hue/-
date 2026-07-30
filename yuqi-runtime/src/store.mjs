@@ -2065,6 +2065,91 @@ export class YuqiStore {
     `).all(String(roleId), String(roleId), Number(at)).map(mapStanceRecord);
   }
 
+  readAgencyAuthoritySnapshotInternal({ roleId, at = now() }) {
+    const normalizedRoleId = String(roleId || '').trim();
+    if (!normalizedRoleId) throw new Error('agency authority role is required');
+    const cognitiveState = this.getCognitiveState(normalizedRoleId);
+    const descriptor = {
+      version: 'agency-authority-v1',
+      roleId: normalizedRoleId,
+      constraints: this.listActiveConstraints(normalizedRoleId)
+        .map(record => ({
+          constraintId: record.constraintId,
+          revision: record.revision,
+          authority: record.authority,
+          kind: record.kind,
+          subject: record.subject,
+          scope: record.scope,
+          rule: record.rule,
+          sourceMessageIds: record.sourceMessageIds,
+          sourceConfigRef: record.sourceConfigRef ?? null,
+          releaseCondition: record.releaseCondition ?? null,
+          status: record.status,
+          supersedes: record.supersedes ?? null
+        }))
+        .sort((left, right) => String(left.constraintId).localeCompare(String(right.constraintId))
+          || Number(left.revision) - Number(right.revision)),
+      preferenceFacts: [],
+      stances: this.listActiveStances(normalizedRoleId, Number(at))
+        .map(record => ({
+          stanceId: record.stanceId,
+          revision: record.revision,
+          topic: record.topic,
+          position: record.position,
+          reason: record.reason,
+          strength: record.strength,
+          flexibility: record.flexibility,
+          sourceMessageIds: record.sourceMessageIds,
+          lastConfirmedAt: record.lastConfirmedAt,
+          expiresAt: record.expiresAt ?? null,
+          remainingRelevantUserBatches: record.remainingRelevantUserBatches,
+          status: record.status,
+          supersedes: record.supersedes ?? null
+        }))
+        .sort((left, right) => String(left.stanceId).localeCompare(String(right.stanceId))
+          || Number(left.revision) - Number(right.revision)),
+      cognitiveState: {
+        revision: Number(cognitiveState?.revision || 0),
+        checksum: cognitiveState?.checksum || null
+      }
+    };
+    const preferenceFactIds = [...new Set(
+      cognitiveState?.state?.slowState?.preferenceFactIds || []
+    )].map(String).sort();
+    const suppressed = new Set(this.db.prepare(
+      'SELECT message_id FROM suppressed_messages'
+    ).all().map(row => String(row.message_id)));
+    descriptor.preferenceFacts = preferenceFactIds.map(factId => {
+      const row = this.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get(factId);
+      const fact = mapFact(row);
+      if (!row || !fact
+        || fact.characterId !== normalizedRoleId
+        || fact.type !== 'stable_preference'
+        || fact.status !== 'verified'
+        || !Array.isArray(fact.sourceMessageIds)
+        || fact.sourceMessageIds.length === 0
+        || fact.sourceMessageIds.some(messageId => suppressed.has(String(messageId)))) {
+        throw new Error(`agency authority preference fact is invalid: ${factId}`);
+      }
+      return {
+        factId: fact.factId,
+        type: fact.type,
+        subjectId: fact.subjectId,
+        predicate: fact.predicate,
+        object: fact.object,
+        sourceMessageIds: [...fact.sourceMessageIds].map(String).sort(),
+        status: fact.status,
+        confidence: fact.confidence,
+        supersedes: fact.supersedes ?? null,
+        checksum: row.checksum
+      };
+    });
+    return {
+      ...descriptor,
+      checksum: contentHash(descriptor)
+    };
+  }
+
   getInteractionLane(roleId, laneKey) {
     return mapInteractionLane(this.db.prepare(`
       SELECT * FROM interaction_lanes WHERE role_id = ? AND lane_key = ?
@@ -2887,6 +2972,19 @@ export class YuqiStore {
         }
       }
 
+      const agencyEffectiveAt = Number(
+        envelope.message?.sentAt
+        ?? envelope.trigger?.executedAt
+        ?? envelope.trigger?.scheduledFor
+        ?? envelope.createdAt
+      );
+      const agencySnapshot = this.readAgencyAuthoritySnapshotInternal({
+        roleId: envelope.characterId,
+        at: agencyEffectiveAt
+      });
+      if (agencySnapshot.checksum !== agencySnapshotChecksum) {
+        throw new Error('agency snapshot authority conflict');
+      }
       const timestamp = now();
       this.db.prepare(`
         INSERT INTO turns(
@@ -2993,7 +3091,7 @@ export class YuqiStore {
       });
       const turn = this.getTurn(envelope.turnId);
       this.appendSync('turn', envelope.turnId, 'insert', turn);
-      return { status: 'created', turn };
+      return { status: 'created', turn, agencySnapshot };
     });
   }
 
@@ -3004,6 +3102,116 @@ export class YuqiStore {
       lineage: this.getTurnAuthorityLineage(authorityLineageKey),
       lane: turn ? this.getInteractionLane(turn.characterId, laneKey) : null,
       cognitiveState: turn ? this.getCognitiveState(turn.characterId) : null
+    };
+  }
+
+  resolveCanonicalActionTargetInternal({ turn, action }) {
+    const kind = String(action?.kind || '');
+    const namespaceByKind = {
+      payment_accept: 'payment',
+      payment_decline: 'payment',
+      moment_create: 'lineage_create',
+      moment_like: 'moment',
+      moment_comment: 'moment',
+      moment_reply: 'comment',
+      role_plan_create: 'lineage_create',
+      role_plan_update: 'role_plan',
+      role_plan_cancel: 'role_plan',
+      role_plan_pause: 'role_plan',
+      role_plan_resume: 'role_plan',
+      role_plan_complete: 'role_plan',
+      life_episode_create: 'lineage_create',
+      life_episode_update: 'life_episode',
+      life_episode_cancel: 'life_episode',
+      relationship_transition: 'relationship'
+    };
+    const namespace = namespaceByKind[kind];
+    if (!namespace) throw new Error('unknown canonical action target kind');
+    const envelope = parseJson(turn.envelopeJson, {});
+    const payload = action.payload || {};
+    if (namespace === 'lineage_create') {
+      return {
+        targetKey: `lineage_create:${turn.authorityLineageKey}:${kind}`,
+        targetRevision: String(this.getTurnAuthorityLineage(turn.authorityLineageKey)?.revision || 0),
+        authoritySource: 'lineage'
+      };
+    }
+    if (namespace === 'payment') {
+      const messageId = String(payload.messageId
+        || envelope.context?.pendingPayment?.messageId
+        || envelope.context?.payment?.messageId
+        || envelope.message?.messageId
+        || '');
+      const payment = envelope.context?.pendingPayment
+        || envelope.context?.payment
+        || envelope.context?.currentBatch?.messages?.find(message => message.messageId === messageId)?.payment;
+      if (!messageId || !payment) throw new Error('canonical payment target not found');
+      return {
+        targetKey: `payment:${messageId}`,
+        targetRevision: `sha256:${contentHash(payment)}`,
+        authoritySource: 'input_snapshot'
+      };
+    }
+    if (namespace === 'moment' || namespace === 'comment') {
+      const context = envelope.context || envelope.featureContext || {};
+      const id = String(
+        payload[namespace === 'moment' ? 'momentId' : 'commentId']
+        || context[`${namespace}Id`]
+        || context[`target${namespace[0].toUpperCase()}${namespace.slice(1)}`]?.[`${namespace}Id`]
+        || ''
+      );
+      if (!id) throw new Error(`canonical ${namespace} target not found`);
+      return {
+        targetKey: `${namespace}:${id}`,
+        targetRevision: `sha256:${contentHash(context)}`,
+        authoritySource: 'input_snapshot'
+      };
+    }
+    if (namespace === 'life_episode') {
+      const episodeId = String(payload.episodeId || '');
+      const episode = this.getLifeEpisode(episodeId);
+      if (!episode || episode.characterId !== turn.characterId) {
+        throw new Error('canonical life episode target not found');
+      }
+      return {
+        targetKey: `life_episode:${episodeId}`,
+        targetRevision: `sha256:${episode.checksum}`,
+        authoritySource: 'pc_store'
+      };
+    }
+    if (namespace === 'relationship') {
+      const relationship = envelope.context?.relationship
+        || envelope.context?.relationshipState
+        || envelope.context?.scene?.relationshipStage
+        || envelope.featureContext?.relationship
+        || null;
+      if (!relationship) throw new Error('canonical relationship target not found');
+      return {
+        targetKey: `relationship:${turn.characterId}`,
+        targetRevision: `sha256:${contentHash(relationship)}`,
+        authoritySource: 'input_snapshot'
+      };
+    }
+    const table = namespace === 'role_plan' ? 'role_plans' : 'role_occurrences';
+    const idName = namespace === 'role_plan' ? 'plan_id' : 'occurrence_id';
+    const id = String(payload[namespace === 'role_plan' ? 'rolePlanId' : 'occurrenceId'] || '');
+    const contextTarget = namespace === 'role_plan'
+      ? envelope.context?.rolePlan
+      : envelope.context?.roleOccurrence;
+    const tableExists = this.db.prepare(
+      'SELECT 1 AS value FROM sqlite_master WHERE type = ? AND name = ?'
+    ).get('table', table);
+    const row = id && tableExists
+      ? this.db.prepare(`SELECT * FROM ${table} WHERE ${idName} = ?`).get(id)
+      : null;
+    const target = row || contextTarget;
+    if (!target || !id) throw new Error(`canonical ${namespace} target not found`);
+    return {
+      targetKey: `${namespace}:${id}`,
+      targetRevision: row
+        ? String(row.revision ?? row.updated_at ?? 0)
+        : `sha256:${contentHash(target)}`,
+      authoritySource: row ? 'pc_store' : 'input_snapshot'
     };
   }
 
@@ -3096,17 +3304,17 @@ export class YuqiStore {
     `).get(String(groupId || ''), String(peerId || ''));
     if (!authority) throw new Error('canonical cloud delivery authority conflict');
     const items = this.visibleItemsForGroup(authority.authority_group_id).map(item => ({
+      ...item.item,
       messageId: item.messageId,
-      ordinal: item.ordinal,
-      ...item.item
+      ordinal: item.ordinal
     }));
     const actions = this.actionsForGroup(authority.authority_group_id).map(action => ({
+      ...action.action,
       actionId: action.actionId,
       ordinal: action.ordinal,
-      kind: action.actionKind,
+      kind: action.kind,
       targetKey: action.targetKey,
-      targetRevision: action.targetRevision,
-      ...action.action
+      targetRevision: action.targetRevision
     }));
     return {
       ok: true,
@@ -3293,22 +3501,42 @@ export class YuqiStore {
     if (input.statePatch) {
       const stateJson = canonicalJson(input.statePatch.state || {});
       const stateChecksum = contentHash(input.statePatch.state || {});
-      const update = this.db.prepare(`
-        UPDATE cognitive_states
-        SET schema_version = ?, revision = revision + 1, last_turn_id = ?,
-            state_json = ?, checksum = ?, updated_at = ?, last_authority_group_id = ?
-        WHERE role_id = ? AND revision = ?
-      `).run(
-        Number(input.statePatch.schemaVersion || cognitiveState.schemaVersion),
-        input.turnId,
-        stateJson,
-        stateChecksum,
-        timestamp,
-        input.groupId,
-        turn.characterId,
-        Number(input.expectedCognitiveStateRevision)
-      );
-      if (Number(update.changes) !== 1) throw new Error('cognitive state authority conflict');
+      if (!cognitiveState) {
+        if (Number(input.expectedCognitiveStateRevision) !== 0) {
+          throw new Error('cognitive state authority conflict');
+        }
+        this.db.prepare(`
+          INSERT INTO cognitive_states(
+            role_id, schema_version, revision, last_turn_id, state_json,
+            checksum, updated_at, last_authority_group_id
+          ) VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+        `).run(
+          turn.characterId,
+          Number(input.statePatch.schemaVersion || 2),
+          input.turnId,
+          stateJson,
+          stateChecksum,
+          timestamp,
+          input.groupId
+        );
+      } else {
+        const update = this.db.prepare(`
+          UPDATE cognitive_states
+          SET schema_version = ?, revision = revision + 1, last_turn_id = ?,
+              state_json = ?, checksum = ?, updated_at = ?, last_authority_group_id = ?
+          WHERE role_id = ? AND revision = ?
+        `).run(
+          Number(input.statePatch.schemaVersion || cognitiveState.schemaVersion),
+          input.turnId,
+          stateJson,
+          stateChecksum,
+          timestamp,
+          input.groupId,
+          turn.characterId,
+          Number(input.expectedCognitiveStateRevision)
+        );
+        if (Number(update.changes) !== 1) throw new Error('cognitive state authority conflict');
+      }
       stateRevisionAfter += 1;
     }
     failAfter(5);
@@ -4010,7 +4238,11 @@ export class YuqiStore {
   }
 
   registerCloudDelivery(turnId, peerId, recoveryAckSeq = 0) {
-    if (!this.getTurn(turnId)) throw new Error('turn not found');
+    const turn = this.getTurn(turnId);
+    if (!turn) throw new Error('turn not found');
+    if (turn.resultAuthorityVersion === 1) {
+      throw new Error('canonical delivery API required');
+    }
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(peerId || ''))) throw new Error('invalid cloud peer');
     const ackSeq = Math.max(0, Number(recoveryAckSeq) || 0);
     const timestamp = now();
@@ -4212,6 +4444,7 @@ export class YuqiStore {
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, peerId);
     if (!existing) throw new Error('cloud delivery not found');
+    if (existing.authority_group_id != null) throw new Error('canonical delivery API required');
     if (existing.checksum && existing.checksum !== checksum) throw new Error('cloud delivery checksum conflict');
     if (existing.state !== 'delivered') {
       this.db.prepare(`
@@ -4225,10 +4458,21 @@ export class YuqiStore {
     `).get(turnId, peerId));
   }
 
+  assertLegacyCloudDeliveryInternal(turnId, peerId) {
+    const row = this.db.prepare(`
+      SELECT authority_group_id FROM cloud_deliveries
+      WHERE turn_id = ? AND peer_id = ?
+    `).get(String(turnId), String(peerId));
+    if (!row) throw new Error('cloud delivery not found');
+    if (row.authority_group_id != null) throw new Error('canonical delivery API required');
+  }
+
   markCloudDeliveryAttempt(turnId, peerId) {
+    this.assertLegacyCloudDeliveryInternal(turnId, peerId);
     const result = this.db.prepare(`
       UPDATE cloud_deliveries SET attempts = attempts + 1, updated_at = ?
       WHERE turn_id = ? AND peer_id = ? AND state = 'pending'
+        AND authority_group_id IS NULL
     `).run(now(), turnId, peerId);
     if (Number(result.changes) !== 1) throw new Error('pending cloud delivery not found');
   }
@@ -4238,10 +4482,12 @@ export class YuqiStore {
   }
 
   markCloudDeliveryMailboxed(turnId, peerId, checksum) {
+    this.assertLegacyCloudDeliveryInternal(turnId, peerId);
     const timestamp = now();
     const result = this.db.prepare(`
       UPDATE cloud_deliveries SET state = 'mailboxed', delivered_at = ?, updated_at = ?
       WHERE turn_id = ? AND peer_id = ? AND state = 'pending' AND checksum = ?
+        AND authority_group_id IS NULL
     `).run(timestamp, timestamp, turnId, peerId, checksum);
     if (Number(result.changes) !== 1) throw new Error('cloud delivery acknowledgement conflict');
     return mapCloudDelivery(this.db.prepare(`
@@ -4360,11 +4606,12 @@ export class YuqiStore {
   }
 
   confirmCloudDeliveryItems(turnId, peerId, receipt) {
-    const deliveryState = this.recordDeliveryReceipt(receipt);
     const delivery = this.db.prepare(`
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, String(peerId));
     if (!delivery) throw new Error('cloud delivery not found');
+    if (delivery.authority_group_id != null) throw new Error('canonical delivery API required');
+    const deliveryState = this.recordDeliveryReceipt(receipt);
     if (delivery.state !== 'confirmed') {
       if (!['mailboxed', 'delivered'].includes(delivery.state)) {
         throw new Error('cloud delivery is not awaiting a phone receipt');
@@ -4391,6 +4638,7 @@ export class YuqiStore {
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, String(peerId));
     if (!delivery) throw new Error('cloud delivery not found');
+    if (delivery.authority_group_id != null) throw new Error('canonical delivery API required');
     if (delivery.state === 'confirmed') return mapCloudDelivery(delivery);
     if (!['mailboxed', 'delivered'].includes(delivery.state)) {
       throw new Error('cloud delivery is not awaiting a phone receipt');
@@ -4401,6 +4649,7 @@ export class YuqiStore {
         UPDATE cloud_deliveries
         SET state = 'confirmed', confirmed_at = ?, updated_at = ?
         WHERE turn_id = ? AND peer_id = ? AND state IN ('mailboxed', 'delivered')
+          AND authority_group_id IS NULL
       `).run(confirmedAt, now(), turnId, String(peerId));
       if (Number(result.changes) !== 1) throw new Error('cloud delivery confirmation conflict');
       this.db.prepare(`

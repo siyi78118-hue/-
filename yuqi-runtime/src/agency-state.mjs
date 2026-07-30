@@ -226,16 +226,12 @@ function validateTransitionCoverage(stances, transitions, relevantBatch) {
   }
 }
 
-function nextStanceId(current, revision) {
-  return `${current.stanceId}:r${revision}`;
-}
-
 function terminalStance(current, status, transition, now, remaining) {
   return deepFreeze({
     ...clone(current),
     revision: current.revision + 1,
     status,
-    supersedes: current.stanceId,
+    supersedes: `${current.stanceId}@${current.revision}`,
     sourceMessageIds: normalizedMessageIds(transition.evidenceMessageIds),
     lastConfirmedAt: finiteNumber(now),
     remainingRelevantUserBatches: Math.max(0, remaining)
@@ -255,7 +251,7 @@ function revisedActiveStance(current, transition, now, remaining) {
     : boundedInteger(transition.extendRelevantUserBatches, remaining, 0, 3);
   return normalizeCurrentStance({
     ...clone(current),
-    stanceId: nextStanceId(current, revision),
+    stanceId: current.stanceId,
     position: operation === 'reverse'
       ? requiredText(transition.position, 'reversed stance position')
       : transition.position ?? current.position,
@@ -269,7 +265,7 @@ function revisedActiveStance(current, transition, now, remaining) {
     remainingRelevantUserBatches: extended,
     status: 'active',
     revision,
-    supersedes: current.stanceId
+    supersedes: `${current.stanceId}@${current.revision}`
   }, now);
 }
 
@@ -301,8 +297,19 @@ export function applyStanceTransitions({
   now = Date.now()
 }) {
   const normalized = stances.map(item => normalizeCurrentStance(item, now));
-  const timeExpired = normalized.filter((item, index) =>
-    item.status === 'expired' && stances[index]?.status === 'active');
+  const timeExpired = normalized.flatMap((item, index) =>
+    item.status === 'expired' && stances[index]?.status === 'active'
+      ? [terminalStance(
+          normalizeCurrentStance(
+            stances[index],
+            Math.min(finiteNumber(now), finiteNumber(stances[index].expiresAt) - 1)
+          ),
+          'expired',
+          { evidenceMessageIds: stances[index].sourceMessageIds || [] },
+          now,
+          0
+        )]
+      : []);
   const current = normalized.filter(item => item.status === 'active');
   validateTransitionCoverage(current, transitions, relevantBatch);
 
@@ -333,7 +340,7 @@ export function applyStanceTransitions({
     }
 
     const replacement = revisedActiveStance(stance, transitionWithEvidence, now, remaining);
-    changedRecords.push(deepFreeze({ ...clone(stance), status: 'superseded' }));
+    changedRecords.push(replacement);
     activeStances.push(replacement);
   }
 
@@ -345,6 +352,7 @@ export function applyStanceTransitions({
       throw new Error(`created stance id already exists: ${created.stanceId}`);
     }
     activeStances.push(created);
+    changedRecords.push(created);
   }
 
   const auditRecords = changedRecords.map(record => ({

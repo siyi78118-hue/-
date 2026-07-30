@@ -46,7 +46,11 @@ export function priorityForEnvelope(envelope) {
 }
 
 function normalizeVisibleText(value) {
-  const bubbles = Array.isArray(value) ? value : [value];
+  const bubbles = Array.isArray(value)
+    ? value
+    : Array.isArray(value?.items)
+      ? value.items
+      : [value];
   return bubbles.map((bubble) =>
     String(bubble?.text ?? bubble?.content ?? bubble ?? '')
       .replace(/\s+/gu, ' ')
@@ -72,7 +76,7 @@ export function generationFingerprint(input) {
   return contentHash({
     roleId: String(input?.roleId || ''),
     laneKey: String(input?.laneKey || ''),
-    laneRevision: Number(input?.laneRevision || 0),
+    inputVisibilitySequence: Number(input?.inputVisibilitySequence || 0),
     normalizedReply: normalizeVisibleText(input?.visibleGroup),
     actionTargets: canonicalActionTargets(input?.actionSet),
     contextRevision: String(input?.contextRevision || '')

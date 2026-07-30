@@ -44,6 +44,10 @@ function withCanonical(run) {
       now: 1
     });
     const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const agencySnapshot = store.readAgencyAuthoritySnapshotInternal({
+      roleId: 'yuqi',
+      at: 1_000
+    });
     const created = store.createCanonicalVisibleTurnInternal({
       envelope: envelope(),
       rolloutKey: 'DIRECT_REPLY',
@@ -55,7 +59,7 @@ function withCanonical(run) {
       expectedLaneRevision: 0,
       inputUserBatchId: 'msg_turn_canonical_state',
       inputVisibilitySequence: 0,
-      agencySnapshotChecksum: SHA,
+      agencySnapshotChecksum: agencySnapshot.checksum,
       annotationSnapshot: {}
     }).turn;
     return run(store, created);
