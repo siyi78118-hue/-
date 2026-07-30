@@ -1,7 +1,6 @@
 package com.siyi.al.execution;
 
 import android.app.ForegroundServiceStartNotAllowedException;
-import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
@@ -10,7 +9,6 @@ import com.siyi.al.AlExecutionPlugin;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
-import android.service.notification.StatusBarNotification;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.core.content.ContextCompat;
@@ -164,38 +162,35 @@ public final class AlExecutionService extends Service {
             rolePlanCoordinator.completeForTurn(turn.turnId, System.currentTimeMillis());
             String key = "turn." + turn.turnId;
             int notificationId = AlNotificationFactory.messageNotificationId(turn.turnId);
-            if (notified.getBoolean(key, false)) {
-                if (turn.notificationShownAt == null && notificationWasPosted(notificationId)) {
+            if (notified.getBoolean(key, false) || turn.notificationShownAt != null) {
+                if (!notified.getBoolean(key, false)) {
+                    notified.edit().putBoolean(key, true).commit();
+                }
+                if (turn.notificationShownAt == null) {
                     executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
                 }
                 continue;
             }
             String title = characterName(turn);
             String text = notificationText(turn);
+            AlNotificationStatus.Snapshot notificationStatus = AlNotificationStatus.inspect(this);
+            if (!notificationStatus.permissionGranted
+                || !notificationStatus.appEnabled
+                || !notificationStatus.channelExists
+                || notificationStatus.importance <= 0) {
+                continue;
+            }
             try {
                 NotificationManagerCompat.from(this).notify(
                     notificationId,
                     notifications.messageNotification(title, text, turn.turnId.hashCode())
                 );
-                if (notificationWasPosted(notificationId)) {
-                    executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
-                    notified.edit().putBoolean(key, true).apply();
-                }
+                notified.edit().putBoolean(key, true).commit();
+                executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
             } catch (SecurityException ignored) {
                 // Android 13+ will deliver after the user grants notification permission.
             }
         }
-    }
-
-    private boolean notificationWasPosted(int notificationId) {
-        if (!AlNotificationStatus.inspect(this).healthy) return false;
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true;
-        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (manager == null) return false;
-        for (StatusBarNotification notification : manager.getActiveNotifications()) {
-            if (notification.getId() == notificationId) return true;
-        }
-        return false;
     }
 
     private void confirmBridgeDelivery(ChatTurnEntity turn, SharedPreferences confirmed) {

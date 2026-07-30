@@ -197,6 +197,15 @@ public class BridgeClientTest {
         assertEquals("turn_phone_1:committed", statuses.get(2));
     }
 
+    @Test public void cloudAcceptedTurnReleasesTheWorkerWithoutLongPolling() throws Exception {
+        try {
+            BridgeClient.completeCloudHandoff();
+            throw new AssertionError("expected durable cloud handoff");
+        } catch (BridgeAcceptedException accepted) {
+            assertEquals("cloud", accepted.route());
+        }
+    }
+
     @Test public void bridgeStatusParsesRouteStageModelAndDurations() throws Exception {
         BridgeTurnStatus status = BridgeTurnStatus.parse(
             "{\"turnId\":\"turn_phone_1\",\"state\":\"memory_running\",\"terminal\":false,"

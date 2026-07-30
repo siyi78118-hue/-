@@ -8,6 +8,7 @@ import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.bridge.BridgeResult;
+import com.siyi.al.execution.bridge.BridgeAcceptedException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
@@ -120,6 +121,12 @@ public final class ExecutionEngine {
                 state = TurnState.CHAT_DONE;
             }
             if (state == TurnState.CHAT_DONE) commitStoredReply(turn, attempt);
+        } catch (BridgeAcceptedException accepted) {
+            try {
+                store.markBridgeWaiting(turn.turnId, attempt.attemptId, accepted.route(), clock.now());
+            } catch (StaleAttemptException ignored) {
+                // A terminal inbox result may win the race with this accepted checkpoint.
+            }
         } catch (StaleAttemptException ignored) {
             // A newer retry owns this turn. The late attempt must not overwrite it.
         } catch (Exception error) {

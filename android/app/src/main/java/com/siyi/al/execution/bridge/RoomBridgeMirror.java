@@ -134,6 +134,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
             String state = turn.state == null ? "" : turn.state;
             if (!("FAILED_RETRYABLE".equals(state) || "FAILED_FINAL".equals(state)
                 || "INTERRUPTED".equals(state) || "CANCELLED".equals(state)
+                || "BRIDGE_WAITING".equals(state)
                 || "COMPLETED".equals(state))) {
                 return false;
             }

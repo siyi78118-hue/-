@@ -100,6 +100,7 @@ public final class AlNotificationFactory {
             .setStyle(new NotificationCompat.BigTextStyle().bigText(safeText))
             .setContentIntent(pending)
             .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_MESSAGE)
             .setDefaults(Notification.DEFAULT_SOUND | Notification.DEFAULT_VIBRATE)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)

@@ -334,6 +334,34 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     @Override
+    public void markBridgeWaiting(String turnId, String attemptId, String route, long now) {
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            if (!attemptId.equals(turn.activeAttemptId)
+                || !TurnState.MEMORY_RUNNING.name().equals(turn.state)) {
+                throw new StaleAttemptException(turnId, attemptId);
+            }
+            dao.markStage(
+                turnId,
+                attemptId,
+                TurnState.BRIDGE_WAITING.name(),
+                AttemptStage.BRIDGE.name(),
+                now
+            );
+            String safeRoute = "cloud".equals(route) ? "cloud" : "bridge";
+            insertDiagnostic(
+                turnId,
+                attemptId,
+                "INFO",
+                "BRIDGE_STATUS",
+                "{\"route\":\"" + safeRoute + "\",\"displayStage\":\"消息已到云端，正在等待电脑接收…\","
+                    + "\"technicalStage\":\"cloud_accepted\"}",
+                now
+            );
+        });
+    }
+
+    @Override
     public void saveMemoryResult(String turnId, String attemptId, String memory, long now) {
         dao.saveMemoryCheckpoint(turnId, attemptId, memory, now);
         insertDiagnostic(turnId, attemptId, "INFO", "MEMORY_DONE", "memory checkpoint saved", now);
