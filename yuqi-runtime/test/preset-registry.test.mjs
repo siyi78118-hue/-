@@ -53,11 +53,65 @@ test('schema 2 stores immutable legacy, current, and candidate versions', () => 
   assert.equal(registry.current().version, '1.9.2');
   assert.deepEqual(
     store.listPresetVersions().map((preset) => preset.version).sort(),
-    ['1.9.1', '1.9.2', '2.0.0']
+    ['1.9.1', '1.9.2', '2.0.0', '2.1.0']
   );
   assert.ok(store.getPresetVersion('2.0.0'));
   assert.equal(store.getCurrentPresetVersion(), '1.9.2');
 }));
+
+test('2.1.0 is an immutable complete v3 seed without replacing older versions', () =>
+  withRegistry((registry, store) => {
+    const preset = store.getPresetVersion('2.1.0');
+    assert.ok(store.getPresetVersion('1.9.2'));
+    assert.ok(store.getPresetVersion('2.0.0'));
+    assert.deepEqual(Object.keys(preset.modules).sort(), [
+      'cognition',
+      'consolidation',
+      'expression',
+      'foundation',
+      'socialExperience',
+      'supervisor'
+    ]);
+    assert.equal(store.getCurrentPresetVersion(), '1.9.2');
+  }));
+
+test('v3 release checksum covers baseline evaluator adapter model and schemas', () =>
+  withRegistry((registry) => {
+    const original = registry.pipelineReleaseManifest('2.1.0', 'release_stable_a');
+    const changedInputs = [
+      ['baseline', registry.pipelineReleaseManifest('2.1.0', 'release_stable_b')],
+      ['evaluator', registry.pipelineReleaseManifest(
+        '2.1.0',
+        'release_stable_a',
+        { evaluatorVersion: 'yuqi-lived-quality-v1.1' }
+      )],
+      ['adapter', registry.pipelineReleaseManifest(
+        '2.1.0',
+        'release_stable_a',
+        { adapterRegistryVersion: 'cognition-v3-adapters-test' }
+      )],
+      ['model', registry.pipelineReleaseManifest(
+        '2.1.0',
+        'release_stable_a',
+        { modelProfile: { cognitionFast: 'test-model' } }
+      )],
+      ['schema', registry.pipelineReleaseManifest(
+        '2.1.0',
+        'release_stable_a',
+        { cognitionSchemaVersion: 4 }
+      )]
+    ];
+    assert.equal(original.pipelineVersion, 'yuqi-lived-agency-v3');
+    assert.equal(original.presetVersion, '2.1.0');
+    assert.match(original.checksum, /^[a-f0-9]{64}$/);
+    for (const [label, changed] of changedInputs) {
+      assert.notEqual(changed.checksum, original.checksum, `${label} must affect release checksum`);
+    }
+    assert.deepEqual(
+      registry.pipelineReleaseManifest('2.1.0', 'release_stable_a'),
+      original
+    );
+  }));
 
 test('resolves the exact cognition candidate in deterministic module order', () => {
   const prompt = resolvePresetBundle({
@@ -329,14 +383,14 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(published.parentVersion, '1.9.2');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 4);
+  assert.equal(store.listPresetVersions().length, 5);
 
   const rollback = registry.rollback('1.9.1');
   assert.equal(rollback.version, '1.9.4');
   assert.equal(rollback.parentVersion, '1.9.3');
   assert.equal(rollback.rollbackOf, '1.9.1');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 5);
+  assert.equal(store.listPresetVersions().length, 6);
 }));
 
 test('rejects annotations that try to inject hidden biography as known fact', () => withRegistry(registry => {

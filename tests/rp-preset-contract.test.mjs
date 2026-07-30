@@ -32,6 +32,34 @@ test('关系复核明确按跨时段累计互动推进各长期阶段', () => {
   assert.match(memoryManager, /关系确立[^]*双方明确确认/);
 });
 
+test('2.1.0 adds all lived-agency modules without replacing immutable older presets', () => {
+  assert.ok(presetManifest.versions['1.9.2']);
+  assert.ok(presetManifest.versions['2.0.0']);
+  assert.deepEqual(
+    Object.keys(presetManifest.versions['2.1.0'].modules).sort(),
+    ['cognition', 'consolidation', 'expression', 'foundation',
+      'socialExperience', 'supervisor']
+  );
+  assert.equal(presetManifest.currentVersion, '1.9.2');
+  assert.equal(presetManifest.candidateVersion, '2.0.0');
+});
+
+test('2.1.0 assets are general decision instructions rather than gift-specific reply rules', () => {
+  const modules = presetManifest.versions['2.1.0'].modules;
+  const text = Object.values(modules)
+    .map((filename) => readFileSync(
+      new URL(`../yuqi-runtime/presets/${filename}`, import.meta.url),
+      'utf8'
+    ))
+    .join('\n');
+  assert.match(text, /完整(?:提交|消息)组/);
+  assert.match(text, /字面行为/);
+  assert.match(text, /社会含义/);
+  assert.match(text, /维持|强化|软化|反转|过期/);
+  assert.doesNotMatch(text, /红包.*必须|充值.*必须|亲亲.*必须/);
+  assert.doesNotMatch(text, /直接回复[：:]/);
+});
+
 test('保留第一轮确认的聊天底座', () => {
   assert.match(prompt, /独立生活/);
   assert.match(prompt, /省略主语、宾语、因果和结论/);

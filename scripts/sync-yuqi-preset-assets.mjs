@@ -38,7 +38,9 @@ export function syncYuqiPresetAssets({ checkOnly = false } = {}) {
   return {
     combinedChanged: syncFile(combinedPath, combined, checkOnly),
     coreChanged: syncFile(browserCorePath, browserCore, checkOnly),
-    cognitionChanged: cognition.changed
+    cognitionChanged: cognition.changed,
+    livedAgencyV3Changed: false,
+    livedAgencyV3Experiences: cognition.livedAgencyV3.experienceCount
   };
 }
 

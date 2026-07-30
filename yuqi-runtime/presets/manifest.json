@@ -29,6 +29,16 @@
         "consolidation": "consolidation.md",
         "supervisor": "supervisor.md"
       }
+    },
+    "2.1.0": {
+      "modules": {
+        "foundation": "2.1.0/foundation.md",
+        "cognition": "2.1.0/cognition-core-v3.md",
+        "socialExperience": "2.1.0/social-experience-v3.json",
+        "expression": "2.1.0/expression-v3.md",
+        "consolidation": "2.1.0/consolidation-v3.md",
+        "supervisor": "2.1.0/supervisor-v3.md"
+      }
     }
   }
 }

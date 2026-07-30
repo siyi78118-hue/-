@@ -90,6 +90,21 @@ function renderApprovedLessons(moduleText, selections) {
       .map((selection) => selection?.lessonId)
       .filter(Boolean)
   );
+  if (asset.schemaVersion === 3 && Array.isArray(asset.experiences)) {
+    const experiences = selectedIds.size
+      ? asset.experiences.filter((experience) => selectedIds.has(experience.experienceId))
+      : asset.experiences;
+    return [
+      '## 已批准社会经验',
+      ...experiences.map((experience) => [
+        `### ${experience.experienceId}`,
+        `适用场景：${experience.applicability.join(', ')}`,
+        `通用模式：${experience.pattern}`,
+        `反模式：${experience.counterPattern}`,
+        `来源：${experience.sourceRefs.join('；')}`
+      ].join('\n'))
+    ].join('\n\n');
+  }
   const lessons = Array.isArray(asset.lessons)
     ? asset.lessons.filter(
         (lesson) => lesson?.status === 'approved' && selectedIds.has(lesson.lessonId)
@@ -279,6 +294,52 @@ export class PresetRegistry {
       })
     };
     return { manifest: shared, checksum: contentHash(shared), presetVersion: preset.version };
+  }
+
+  pipelineReleaseManifest(version, stableBaselineReleaseId, options = {}) {
+    const preset = this.store.getPresetVersion(version);
+    if (!preset) throw new Error(`preset version is unavailable: ${version}`);
+    if (!String(stableBaselineReleaseId || '').trim()) {
+      throw new Error('stable baseline release id is required');
+    }
+    const modelProfile = clone(options.modelProfile || {
+      cognitionFast: 'gpt-5.6-sol/medium',
+      cognitionDeep: 'gpt-5.6-sol/medium',
+      expression: 'gpt-5.6-terra/medium',
+      supervisor: 'gpt-5.6-terra/medium'
+    });
+    const cognitionSchemaVersion = Number(options.cognitionSchemaVersion || 3);
+    const expressionSchemaVersion = Number(options.expressionSchemaVersion || 3);
+    const evaluatorVersion = String(options.evaluatorVersion || 'yuqi-lived-quality-v1');
+    const components = {
+      presets: Object.fromEntries(
+        Object.entries(preset.modules || {})
+          .sort(([left], [right]) => left.localeCompare(right))
+          .map(([name, content]) => [name, contentHash(content)])
+      ),
+      schemas: {
+        cognition: cognitionSchemaVersion,
+        expression: expressionSchemaVersion,
+        bundle: String(options.schemaBundleVersion || 'role-schemas-v3')
+      },
+      stateCompiler: String(options.stateCompilerVersion || 'agency-state-v3'),
+      adapterRegistry: String(options.adapterRegistryVersion || 'cognition-v3-adapters-v1'),
+      supervisor: contentHash(preset.modules?.supervisor || ''),
+      socialExperience: contentHash(preset.modules?.socialExperience || ''),
+      evaluator: evaluatorVersion,
+      modelProfile,
+      stableBaselineReleaseId: String(stableBaselineReleaseId)
+    };
+    return {
+      pipelineVersion: 'yuqi-lived-agency-v3',
+      presetVersion: version,
+      cognitionSchemaVersion,
+      expressionSchemaVersion,
+      evaluatorVersion,
+      modelProfile,
+      components,
+      checksum: contentHash(components)
+    };
   }
 
   resolvePresetBundle({ role, version, annotations = [] }) {

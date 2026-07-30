@@ -7,6 +7,14 @@ const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sourceRelativePath = 'preset-references/yuqi-social-experience-catalog.json';
 const coreRelativePath = 'yuqi-runtime/presets/cognition-core.md';
 const outputRelativePath = 'yuqi-runtime/presets/social-experience.json';
+const v3PresetRelativeDir = 'yuqi-runtime/presets/2.1.0';
+const v3ModuleFiles = [
+  'foundation.md',
+  'cognition-core-v3.md',
+  'expression-v3.md',
+  'supervisor-v3.md',
+  'consolidation-v3.md'
+];
 const allowedStatuses = new Set(['approved', 'provisional', 'retired']);
 const requiredArrayFields = [
   'scenes',
@@ -101,6 +109,62 @@ function toRuntimeLesson(lesson) {
   };
 }
 
+function validateV3SocialExperience(asset, { rootDir }) {
+  if (asset?.schemaVersion !== 3 || !Array.isArray(asset.experiences)
+      || asset.experiences.length === 0) {
+    throw new Error('v3 social experience must use schemaVersion 3 and contain experiences');
+  }
+  const ids = new Set();
+  for (const [index, experience] of asset.experiences.entries()) {
+    const label = `experiences[${index}]`;
+    if (!/^social_|^whole_|^emotion_|^return_|^stance_|^natural_|^independent_|^implicit_/.test(
+      String(experience?.experienceId || '')
+    )) {
+      throw new Error(`${label}.experienceId is invalid`);
+    }
+    if (ids.has(experience.experienceId)) {
+      throw new Error(`duplicate experienceId: ${experience.experienceId}`);
+    }
+    ids.add(experience.experienceId);
+    assertNonEmptyString(experience.pattern, `${label}.pattern`);
+    assertNonEmptyString(experience.counterPattern, `${label}.counterPattern`);
+    assertNonEmptyStringArray(experience.applicability, `${label}.applicability`);
+    assertNonEmptyStringArray(experience.sourceRefs, `${label}.sourceRefs`);
+    if (containsCopyableDialogue(experience.pattern)
+        || containsCopyableDialogue(experience.counterPattern)) {
+      throw new Error(`${experience.experienceId} contains copyable dialogue`);
+    }
+    for (const reference of experience.sourceRefs) {
+      const [filename, section] = String(reference).split('#');
+      const sourcePath = resolve(rootDir, 'preset-references', filename);
+      if (!existsSync(sourcePath)) throw new Error(`v3 source does not exist: ${filename}`);
+      if (!section || !readFileSync(sourcePath, 'utf8').includes(section)) {
+        throw new Error(`v3 source section was not found: ${reference}`);
+      }
+    }
+  }
+  return asset;
+}
+
+export function validateLivedAgencyV3Assets({ rootDir = defaultRoot } = {}) {
+  const presetDir = resolve(rootDir, v3PresetRelativeDir);
+  const moduleChecksums = {};
+  for (const filename of v3ModuleFiles) {
+    const text = readFileSync(resolve(presetDir, filename), 'utf8').trim();
+    if (!text) throw new Error(`v3 preset module is empty: ${filename}`);
+    if (text.length > 16_000) throw new Error(`v3 preset module is too large: ${filename}`);
+    moduleChecksums[filename] = createHash('sha256').update(text).digest('hex');
+  }
+  const socialText = readFileSync(resolve(presetDir, 'social-experience-v3.json'), 'utf8');
+  if (socialText.length > 24_000) throw new Error('v3 social experience exceeds 24000 characters');
+  const socialExperience = validateV3SocialExperience(JSON.parse(socialText), { rootDir });
+  return {
+    moduleChecksums,
+    experienceCount: socialExperience.experiences.length,
+    socialExperienceChecksum: createHash('sha256').update(socialText).digest('hex')
+  };
+}
+
 export function compileCognitionAssets({ rootDir = defaultRoot, checkOnly = false } = {}) {
   const sourcePath = resolve(rootDir, sourceRelativePath);
   const corePath = resolve(rootDir, coreRelativePath);
@@ -138,7 +202,8 @@ export function compileCognitionAssets({ rootDir = defaultRoot, checkOnly = fals
     mkdirSync(dirname(outputPath), { recursive: true });
     writeFileSync(outputPath, expected, 'utf8');
   }
-  return { changed, asset, outputPath };
+  const livedAgencyV3 = validateLivedAgencyV3Assets({ rootDir });
+  return { changed, asset, outputPath, livedAgencyV3 };
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
@@ -151,6 +216,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     changed: result.changed,
     output: outputRelativePath,
     lessons: result.asset.lessons.length,
+    livedAgencyV3Experiences: result.livedAgencyV3.experienceCount,
     sourceChecksum: result.asset.sourceChecksum
   })}\n`);
 }
