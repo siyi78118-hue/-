@@ -521,13 +521,14 @@ acceptanceCriteria
 
 ### 12.8 Android fallback
 
-新 APK 支持 cognition-v3 精简快照，同时读取 cognition-v2 和 memory-v1/chat-v1。fallback 读取相关硬约束、当前立场、关系阶段和最近完整对话。PC 恢复后不重写已显示结果，fallback 事实只进入待复核记录。
+新 APK 支持 cognition-v3 精简快照，同时读取 cognition-v2 和 memory-v1/chat-v1。fallback 读取相关硬约束、当前立场、关系阶段和最近完整对话。PC 恢复后不重写已显示结果，fallback 事实只进入待复核记录。v3 只有在请求明确没有被 PC 接受时才可 fallback；超时、丢响应和未知异常保持 receipt/replay 恢复，五分钟后转为可重试错误，不能用第二份本机生成结果掩盖权威不明。
 
 ### 12.9 数据生命周期
 
 - 导出、导入和备份包含新状态表；
 - 清空自动任务不删除人格、事实、关系和认知状态；
 - 清空聊天、清空记忆、删除角色分别定义新表处理；
+- 清空聊天删除消息投影和可见正文，取消尚未交付的 outbox payload，但保留不含正文的 lineage、commit receipt 和 checksum，防止清空后重试造成重复发送或重复动作；
 - 被撤回或删除消息不能继续作为新状态证据；
 - 非虞栖角色保持旧链路。
 
@@ -553,16 +554,82 @@ acceptanceCriteria
 
 ### 13.3 原子提交
 
-`commitVisibleResult()` 在同一事务检查：
+#### 13.3.1 跨重试的唯一权威
 
-- turn 仍有提交权；
-- 没有更新用户批次；
-- revision 仍有效；
-- 没有其他权威结果；
+最终可见结果的权威单位不是 `turnId`，而是跨 original/retry 分支稳定不变的 `lineageKey`。
+
+PC 数据库新增 `turn_authority_lineages`。每条 lineage 由 `roleId + laneKey + rootSourceId` 唯一确定，保存 `latestTurnId`、显式整数 `revision`、`open/committed/cancelled` 状态和唯一 `committedGroupId`。首个 v3 turn 创建 lineage；重试必须复用前一 turn 的 lineage，并用 compare-and-swap 把 `latestTurnId` 从被重试 turn 改为新 turn。两个 sibling retry 不能同时取得提交权；lineage 已提交时不得再生成新 retry，只返回已有 receipt。
+
+`turns` 增加：
+
+- `resultAuthorityVersion`：旧 turn 为 0，Task 10 之后创建的 v3 turn 为 1；
+- `authorityLineageKey`；
+- `lineageRevisionAtCreation`；
+- `turnRevision`；
+- `retryOfTurnId`；
+- `agencySnapshotChecksum`。
+
+`updatedAt` 只用于诊断和排序，绝不用于并发判定。v3 turn 的 claim、checkpoint、supersede、failure 和 commit 都必须使用显式 `turnRevision` compare-and-swap。
+
+#### 13.3.2 唯一可见结果与 receipt
+
+PC 数据库新增四组 canonical 记录：
+
+- `visible_result_groups`：一条 lineage 最多一个 group，一条 authoritative turn 最多一个 group，并标明 `pc` 或 `android_fallback` authority origin；
+- `visible_result_items`：按 `groupId + ordinal` 唯一保存可见气泡；
+- `visible_result_actions`：按 `groupId + ordinal` 唯一保存已授权结构化动作；
+- `visible_commit_receipts`：以 `lineageKey` 为主键，唯一关联 group、authoritative turn、authority origin、`commitPayloadVersion` 和 `commitChecksum`。
+
+group ID 和气泡/action ID 由当前合法 authority owner 按双方共享的版本化算法根据 lineage 与 ordinal 确定性生成，不接受模型输出、当前时间或临时随机 ID。PC `commitChecksum` 对规范化语义 payload 计算，包含 lineage、可见气泡、动作、状态 patch、记忆任务、可选 compare descriptor、release、输入可见游标和生成时权威 checksum；Android fallback 使用另一个明确版本的规范 payload。两者都排除时间戳、随机数和非语义日志。重复提交只有 origin、payload version 和 checksum 全部相同时才返回同一 receipt；同 lineage 的不同 payload 一律是 authority conflict。
+
+`messages` 只是 group items 的聊天查询投影；`turn.replyJson` 只是兼容投影。它们都不能反推出新的 group ID 或 receipt，也不能成为第二事实源。
+
+#### 13.3.3 提交前重新校验
+
+`commitVisibleResult()` 在一个 `BEGIN IMMEDIATE` 事务中检查：
+
+- receipt 尚不存在；若存在，只允许 exact duplicate 返回；
+- turn 的 `resultAuthorityVersion=1`，且 `turnRevision` 仍有效；
+- lineage 仍为 open、revision 未变且 `latestTurnId` 正是当前 turn；
+- lane revision、最新用户批次 ID 和本地 visibility sequence 未变；
+- 当前 cognitive state revision 未变；
+- 当前 hard constraints、preference evidence、active stance heads 和 cognitive state 组成的 `agencySnapshotChecksum` 未变；
+- authoritative release pin 未变；
 - 动作对象仍有效；
-- 未被重试或恢复分支取代。
+- generation fingerprint 仍有权成为该 lane 的结果。
 
-通过后原子提交消息组、动作、认知状态、记忆任务、outbox 和 lane revision。
+通过后依次写入 canonical group/items/actions、聊天消息投影、认知状态/stance revisions、证据记忆任务、可选 compare job、group-based outbox、lane CAS、lineage CAS、turn CAS 和 commit receipt。任一步失败全部回滚。
+
+#### 13.3.4 状态与任务的 authority key
+
+由结果产生的所有附属写入都必须带 group authority：
+
+- `cognitive_states.lastAuthorityGroupId` 并按 state revision CAS；
+- `stance_records.authorityGroupId + authorityOrdinal` 唯一；
+- `consolidation_jobs.authorityGroupId + authorityOrdinal` 唯一；
+- `messages.authorityGroupId + groupOrdinal` 唯一；
+- `cloud_deliveries.authorityGroupId + peerId` 唯一。
+
+domain action 的外部执行不假装与 SQLite 物理事务同步；事务原子提交的是唯一授权 action row 和 outbox。消费者只按 `actionId` 幂等执行。shadow/compare worker无权调用本提交边界或任何动作消费者。
+
+#### 13.3.5 Android fallback 的分布式权威边界
+
+PC SQLite 与 Android Room 在断网时不能对同一 lineage 实现同步互斥；系统不得假装可以用两个独立数据库达成分布式 exactly-once。
+
+双方共享版本化的确定性 lineage/group/message/action ID 算法和测试向量。Android 在提交 turn 时先持久化本地 lineage。PC 对协议传来的 lineage key 重新计算并要求一致，绝不直接信任客户端字段。
+
+fallback 只在以下情况取得本地提交权：
+
+- bridge 明确关闭，PC 请求从未发送；
+- 所有远端路径都返回“明确未接受且允许 fallback”的终态。
+
+连接超时、响应丢失和未知异常都属于“可能已被 PC 接受”，不得转成本地 fallback；它们保持 `BRIDGE_WAITING`，由 receipt/replay 恢复。这样牺牲模糊网络状态下的立即离线回复，换取不会出现 PC 与手机各生成一条的正确性。
+
+本机 fallback 在一个 Room 事务中 CAS 本地 lineage，写入确定性 group、reply parts、结构化动作和 local receipt，authority origin 为 `android_fallback`，checksum 使用独立且版本化的 `android-fallback-commit-v1` 规范；PC 提交使用 `pc-visible-commit-v1`。同步恢复后，PC 只能把这个已可见 receipt 作为 external canonical result 导入：按其 payload version 验证相同 lineage/group/checksum，记录消息和 receipt，不运行 PC cognition、不写 PC state、不创建 outbox/通知。若 PC 已有不同 receipt，属于必须隔离的跨设备 authority conflict，不能选择其一继续显示。
+
+#### 13.3.6 group-based outbox
+
+旧 v1/v2 delivery 继续保留 `turnId + peerId` 兼容路径。所有 `resultAuthorityVersion=1` 的新结果只按 `authorityGroupId + peerId` 读取、租约、重试、确认和恢复；`turnId` 只是指向获胜 turn 的诊断字段。投递幂等键为 `groupId + peerId + commitChecksum`。因此 original/retry 即使有不同 turn ID，也不可能分别投递。
 
 ### 13.4 可见游标
 
@@ -706,6 +773,13 @@ pipeline checksum 包含：
 
 ## 16. 数据迁移
 
+PC schema 分两步：
+
+- 已完成的基础迁移为 `user_version 9 → 10`，提供 release、constraint、stance、lane 和 quality authority；
+- 最终结果权威迁移为 `user_version 10 → 11`，提供跨 retry lineage、canonical visible group、commit receipt、显式 turn CAS 和 group outbox。
+
+PC schema 11 与 Android Room 11 是两个彼此独立的数据库版本域，数字相同不表示共用迁移。
+
 新增或升级：
 
 - `constraint_records`
@@ -716,19 +790,29 @@ pipeline checksum 包含：
 - `quality_eval_runs`
 - `quality_findings`
 - `state_migration_audit`
+- `turn_authority_lineages`
+- `visible_result_groups`
+- `visible_result_items`
+- `visible_result_actions`
+- `visible_commit_receipts`
+- `turns.turn_revision` 与 lineage 字段
+- `messages`、`cognitive_states`、`stance_records`、`consolidation_jobs` 和 `cloud_deliveries` 的 group authority 字段与唯一索引
 
 步骤：
 
 1. 快照数据库和配置并计算 SHA-256；
-2. 创建新表，不删除旧表；
-3. 重新验证旧 `activeBoundaries`；
-4. 用户明确边界迁移为硬约束；
-5. 仍有效的虞栖态度迁移为短期立场；
-6. 过期或证据不足内容进入审计；
-7. 验证消息、事实、base/phase、安排和生活数量；
-8. 生成前后对照报告。
+2. 事务内顺序运行历史迁移、v10 基础迁移和 v11 结果权威迁移；
+3. 创建新表、nullable authority 列和 partial unique indexes，不删除旧表；
+4. 所有迁移前已有 turn 标记 `resultAuthorityVersion=0`，不猜测或伪造历史 lineage/group/receipt；
+5. 重新验证旧 `activeBoundaries`；
+6. 用户明确边界迁移为硬约束；
+7. 仍有效的虞栖态度迁移为短期立场；
+8. 过期或证据不足内容进入审计；
+9. 验证消息、事实、base/phase、安排、生活、turn 和 outbox 数量；
+10. 验证所有 `resultAuthorityVersion=1` turn 都有唯一 lineage，所有 committed lineage 都能联结唯一 group/receipt/outbox；
+11. 生成前后对照报告。
 
-迁移必须事务化、幂等。旧 turn 继续按固定旧 schema 恢复；新 turn 才使用 v3。
+迁移必须事务化、幂等。现有 v10 数据库必须真实执行 10→11，不能只修改 9→10 分支。旧 turn 继续按 `resultAuthorityVersion=0` 的固定旧 schema 和旧 outbox 恢复；新 turn 才使用 v3 canonical authority。任何无法证明来源的历史结果不得反向合成 v3 receipt。
 
 ## 17. Android 与正式发布
 
@@ -740,6 +824,8 @@ pipeline checksum 包含：
 - lane revision 和权威消息组；
 - 事件、轮询和 replay exactly-once；
 - v3诊断和自动回退状态。
+
+PC 完成的结果中，Android 的 `visibleGroupId`、`commitChecksum`、`authorityLineageKey` 和 authority revisions 必须逐字来自 PC `visible_commit_receipts` 及其联结记录。本机 fallback 的同类字段必须来自 Room local receipt，并按共享版本化算法生成。Room/Web 不得从正文、当前时间或临时随机数重新生成这些字段；同一 lineage 收到不同 receipt 时必须隔离为协议冲突，而不是覆盖。
 
 实施时读取源码、发布清单和现有产物中的最大版本，使用下一个未占用版本；按当前产物应高于 1.0.108，但不得仅凭本设计硬编码。
 

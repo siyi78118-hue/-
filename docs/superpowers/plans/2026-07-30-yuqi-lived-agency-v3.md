@@ -4,7 +4,7 @@
 
 **Goal:** Replace Yuqi's rule-accumulating cognition path with a versioned cognition-v3 agency model that understands whole interactions, can revise temporary attitudes, preserves every existing feature, arbitrates concurrent outputs, and ships through a truthful stable/candidate rollout with a formally signed OTA-capable APK.
 
-**Architecture:** Keep one cognition core and provide small TurnKind adapters around it. Separate durable authority into hard constraints, non-binding preferences, and expiring current stances; generate a compact expression brief; validate hard actions deterministically; and commit the visible message group, structured actions, state patch, memory work, outbox, and interaction-lane revision atomically. Treat the current production pipeline as an immutable stable release and v3 as an immutable candidate release, with stable-visible shadow, candidate-visible canary, per-kind rollback, and evidence-bound quality gates.
+**Architecture:** Keep one cognition core and provide small TurnKind adapters around it. Separate durable authority into hard constraints, non-binding preferences, and expiring current stances; generate a compact expression brief; validate hard actions deterministically; and commit one cross-retry canonical visible group, structured actions, state patch, memory work, group outbox, receipt, and interaction-lane revision atomically. Treat the current production pipeline as an immutable stable release and v3 as an immutable candidate release, with stable-visible shadow, candidate-visible canary, per-kind rollback, and evidence-bound quality gates.
 
 **Tech Stack:** Node.js 22 ESM, `node:test`, SQLite via the existing runtime store, Markdown/JSON preset assets, Java 21, Android Room, Capacitor 8, WebView JavaScript, GitHub Actions/REST, Android `aapt`/`apksigner`.
 
@@ -16,6 +16,7 @@
 - Do not add production special cases for red packets, kisses, recharge jokes, or any individual sentence. Fix the general social-state mechanism.
 - Preserve direct chat, payments, images, voice, emoji, quotes, multi-bubble batches, proactive chat, proactive moments, moment interaction/reply, role plans, life planning, relationship stages, memory, notifications, recovery, diagnostics, export/import/backup/delete, and Android fallback.
 - Preserve the existing Android cloud-queue convergence state machine: `LOCAL_QUEUED → CLOUD_ACCEPTED/BRIDGE_WAITING → PC_ACCEPTED → COMPLETED → UI_APPLIED`. A cloud-accepted turn releases the single drain thread, is completed by inbox recovery, and is never re-enqueued merely because the app restarts.
+- For v3, a deadline/lost response/unknown remote outcome never authorizes local fallback because PC may already own the lineage. Only bridge-disabled-before-send or an explicit not-accepted terminal response may grant Android fallback authority. Ambiguity resolves through receipt/replay or ends as retryable at five minutes, never as a second generated reply.
 - A user stages multiple bubbles and explicitly submits one complete batch. Never add a timer that waits for more user bubbles after submission.
 - Keep ordinary visible replies near one minute; five minutes is the hard user-facing limit. Shadow comparison and consolidation never block the visible path.
 - `responseRisks` are current-turn evidence only. They never become `forbiddenMoves`, hard constraints, preferences, or persistent stances.
@@ -30,7 +31,7 @@
 - One SQLite row per TurnKind in `cognition_kind_rollouts` remains the current rollout authority. History tables are append-only audit, never current-state authority.
 - Stable/candidate release IDs and checksums, not the old words `legacy/cognition`, decide which implementation is visible.
 - Low-frequency TurnKinds without genuine live evidence remain shadow and must be reported as such. Do not claim that all kinds are active.
-- PC runtime database migration is `user_version 9 → 10`; Android Room migration is `10 → 11`. Both must be transactional, idempotent, and covered by migration tests.
+- PC runtime migrations are the already-completed base `user_version 9 → 10` in Task 2 and the mandatory final-result-authority `10 → 11` in Task 10. Android Room independently migrates `10 → 11`; the equal final number is coincidental and the two version domains must never be conflated. Every path must be transactional, idempotent, and covered by populated-database migration tests.
 - Determine the APK version from the maximum version in source, update channel, releases, and local formal artifacts at execution time. It must be greater than `1.0.108`; do not assume a fixed number before Task 26.
 - Formal delivery follows `docs/AL-android-signing-runbook.md`. Package `com.siyi.al`, signer SHA-256 `5761277e3bdf4a64236c3bad569de6a07666581f643167d01e37f13e9e832b2b`, version, OTA URL, and final APK SHA-256 must all be independently verified.
 - Preserve unrelated dirty-worktree changes. Stage and commit only the files named by the current task.
@@ -53,7 +54,7 @@
 
 ### Existing PC runtime modules to evolve
 
-- `yuqi-runtime/src/store.mjs`: v9→v10 migration, release pins, authority records, lanes, quality evidence, atomic commit primitives, backup/export lifecycle.
+- `yuqi-runtime/src/store.mjs`: v9→v10 base migration, v10→v11 canonical-result migration, release pins, retry lineages, authority records, lanes, quality evidence, atomic commit primitives, backup/export lifecycle.
 - `yuqi-runtime/src/role-schemas.mjs`: v3 JSON schemas alongside v2.
 - `yuqi-runtime/src/cognition-context.mjs`: bounded history/fact/state retrieval.
 - `yuqi-runtime/src/cognitive-pipeline.mjs`: v3 route/checkpoint/reconsideration flow while retaining v2 resume.
@@ -133,9 +134,12 @@ generationFingerprint(input) -> string
 decideLaneAdmission({ lane, incoming, now }) -> LaneAdmission
 
 // visible-result-commit.mjs
-commitVisibleResult({ store, turnId, laneKey, expectedTurnRevision, expectedLaneRevision,
-  inputVisibilitySequence, authoritativeReleaseId, visibleGroup, actionSet,
-  statePatch, memoryJobs, generationFingerprint, now }) -> CommitVisibleResult
+commitVisibleResult({ store, turnId, authorityLineageKey, laneKey,
+  expectedTurnRevision, expectedLineageRevision, expectedLaneRevision,
+  expectedCognitiveStateRevision, expectedLatestUserBatchId, inputVisibilitySequence,
+  agencySnapshotChecksum, authoritativeReleaseId, visibleGroup, actionSet,
+  statePatch, memoryJobs, comparisonJob, generationFingerprint, now
+}) -> CommitVisibleResult
 
 // promotion-controller.mjs
 resolvePipelinePair(rollout) -> {
@@ -415,7 +419,7 @@ git commit -m "feat: separate Yuqi constraints preferences and stances"
 
 **Interfaces:**
 - Consumes: Task 1 records and the stable/candidate semantics table.
-- Produces: PC schema v10; store methods named in the implementation block below.
+- Produces: PC schema v10 base authority; store methods named in the implementation block below. It intentionally does not yet provide canonical visible-result authority; Task 10 upgrades this exact schema to v11 before any v3 visible result can commit.
 
 - [ ] **Step 1: Add migration tests from clean v9 and populated v9**
 
@@ -622,6 +626,8 @@ createTurnWithReleasePinInternal(input)
 ```
 
 Read `PRAGMA user_version` before migration: versions below 9 first follow the existing historical migrations, version 9 runs the new transaction, version 10 performs invariant checks without rewriting data, and versions above 10 stop as unsupported. Remove the current unconditional assignment back to 9. Set `PRAGMA user_version = 10` only after all DDL, backfill, and invariant queries succeed in one transaction. `cognitive_states` remains the one snapshot table; new snapshots use `schema_version = 2`, satisfying the design's `cognitive_state_v2` without creating a competing snapshot authority.
+
+Task 2's version-10 assertion is the historical completion boundary for this task, not the final application schema. After Task 10, the same migration entrypoint must accept populated v10, apply v11 once, and assert v11 on later opens. Do not retroactively pretend Task 2 created the visible group tables, and do not use `reply_json`, `turn_id`, or `updated_at` as a temporary replacement for them.
 
 - [ ] **Step 4: Run migration and store tests green**
 
@@ -1356,95 +1362,478 @@ git add yuqi-runtime/src/interaction-lanes.mjs yuqi-runtime/src/store.mjs yuqi-r
 git commit -m "feat: arbitrate Yuqi output through persistent lanes"
 ```
 
-### Task 10: Commit Visible Results and State Atomically
+### Task 10: Add PC v11 Canonical Result Authority and Commit Atomically
 
 **Files:**
 - Create: `yuqi-runtime/src/visible-result-commit.mjs`
 - Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/result-outbox.mjs`
+- Modify: `yuqi-runtime/test/store-cognition-migration.test.mjs`
+- Modify: `yuqi-runtime/test/store-agency-v10.test.mjs`
+- Create: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
 - Create: `yuqi-runtime/test/visible-result-commit.test.mjs`
 - Modify: `yuqi-runtime/test/result-outbox.test.mjs`
+- Create: `tests/fixtures/authority-identity-v1.json`
+- Modify: `scripts/migrate-yuqi-agency-state.mjs`
+- Modify: `tests/yuqi-agency-state-migration.test.mjs`
 
 **Interfaces:**
-- Consumes: an authorized draft, Task 9 lane claim, action target revisions, Task 1 stance patch.
-- Produces: `commitVisibleResult()` and `store.commitVisibleResultInternal(input)`.
+- Consumes: the actual Task 2 v10 schema, an authorized draft, Task 9 lane claim, current action target revisions, Task 1 agency/state patch, and an optional already-materialized comparison job.
+- Produces: PC schema v11; one cross-retry lineage authority; `commitVisibleResult()`; `store.commitVisibleResultInternal(input)`; receipt-derived `visibleGroupId` and `commitChecksum`; group-keyed v3 outbox.
+- Authority rule: `turnId` identifies one execution attempt. `authorityLineageKey` identifies the one user/trigger interaction that may become visible. Only the lineage may own a receipt.
 
-- [ ] **Step 1: Write red all-or-nothing and exactly-once tests**
+- [ ] **Step 1: Write red populated-v10 migration and lineage tests**
+
+The migration test must construct/open an actual populated `user_version=10` database before the new `YuqiStore` migrates it. It must not obtain “v10” by opening it once with the new migration code.
 
 ```js
-test('visible result, action, state, memory job, outbox, and lane revision commit together', () => {
+test('populated PC v10 migrates once to v11 without inventing authority for old turns', () => {
+  const db = createPopulatedV10DatabaseWithOldTurnMessagesAndOutbox();
+  const before = countLegacyStructuralRows(db);
+  const store = new YuqiStore(db.filename);
+  assert.equal(store.userVersion(), 11);
+  assert.deepEqual(countLegacyStructuralRows(store.rawDb()), before);
+  assert.equal(store.getTurn('turn_v2').resultAuthorityVersion, 0);
+  assert.equal(store.getTurn('turn_v2').authorityLineageKey, null);
+  assert.equal(store.listTurnAuthorityLineages().length, 0);
+  store.migrate();
+  assert.equal(store.userVersion(), 11);
+  assert.deepEqual(countLegacyStructuralRows(store.rawDb()), before);
+});
+
+test('fresh v3 turn creates one lineage rooted in the canonical source identity', () => {
+  const outcome = store.createTurnWithReleasePinInternal(v3CreateInput('turn_original'));
+  assert.equal(outcome.status, 'created');
+  const turn = outcome.turn;
+  assert.equal(turn.resultAuthorityVersion, 1);
+  assert.equal(turn.turnRevision, 1);
+  const lineage = store.getTurnAuthorityLineage(turn.authorityLineageKey);
+  assert.equal(lineage.rootSourceId, turn.sourceMessageId);
+  assert.equal(lineage.latestTurnId, turn.turnId);
+  assert.equal(lineage.revision, 1);
+  assert.equal(lineage.state, 'open');
+});
+
+test('retry reuses lineage and sibling retries cannot both replace latest turn', () => {
+  const original = createV3Turn('turn_original');
+  const retry1 = createV3Retry(original, 'turn_retry_1', {
+    expectedLineageRevision: 1
+  });
+  assert.equal(retry1.authorityLineageKey, original.authorityLineageKey);
+  assert.equal(store.getTurnAuthorityLineage(original.authorityLineageKey).latestTurnId,
+    'turn_retry_1');
+  assert.throws(
+    () => createV3Retry(original, 'turn_retry_2', { expectedLineageRevision: 1 }),
+    /retry lineage authority conflict/
+  );
+});
+```
+
+Also prove all three entry paths:
+
+1. fresh/legacy database runs historical migrations, v10, then v11 in one outer transaction;
+2. populated v10 runs only v11;
+3. v11 performs invariant checks without rewriting rows, and `user_version > 11` stops unsupported.
+
+The migration CLI test must prove a populated raw v10 source file remains byte-identical in dry-run, its clone becomes v11, and the report records `sourceUserVersion:10`, `workingUserVersion:11`, before/after table counts, source/clone SHA-256, and a checksummed v11 invariant summary. Opening the clone with `YuqiStore` a second time must preserve its logical schema/data checksum and row counts; do not require the physical SQLite file hash to remain fixed across WAL/checkpoint metadata changes.
+
+- [ ] **Step 2: Write red all-or-nothing, state-CAS, retry, and outbox tests**
+
+```js
+test('canonical group, projections, action, state, memory, compare, outbox and receipt commit together', () => {
   const result = commitVisibleResult(validCommitInput());
   assert.equal(result.committed, true);
-  assert.equal(store.visibleGroupsFor('turn_1').length, 1);
-  assert.equal(store.actionsFor('turn_1').length, 1);
-  assert.equal(store.getCognitiveState('yuqi').schemaVersion, 2);
-  assert.equal(store.memoryJobsFor('turn_1').length, 1);
-  assert.equal(store.outboxFor('turn_1').length, 1);
+  assert.equal(store.visibleGroupsForLineage(result.authorityLineageKey).length, 1);
+  assert.equal(store.visibleItemsForGroup(result.visibleGroupId).length, 2);
+  assert.equal(store.actionsForGroup(result.visibleGroupId).length, 1);
+  assert.equal(store.getCognitiveState('yuqi').lastAuthorityGroupId, result.visibleGroupId);
+  assert.equal(store.memoryJobsForGroup(result.visibleGroupId).length, 1);
+  assert.equal(store.comparisonJobsForGroup(result.visibleGroupId).length, 1);
+  assert.equal(store.outboxForGroup(result.visibleGroupId).length, 1);
+  assert.equal(store.getVisibleCommitReceipt(result.authorityLineageKey).commitChecksum,
+    result.commitChecksum);
   assert.equal(store.getInteractionLane('yuqi', 'private_chat').revision, 2);
 });
 
-for (const mutation of ['new_user_batch', 'lane_revision', 'action_target', 'retry_branch']) {
+for (const mutation of [
+  'new_user_batch_id',
+  'visibility_sequence',
+  'turn_revision',
+  'lineage_revision',
+  'lane_revision',
+  'cognitive_state_revision',
+  'agency_snapshot_checksum',
+  'action_target_revision',
+  'retry_branch',
+  'release_pin',
+  'generation_fingerprint'
+]) {
   test(`${mutation} conflict rolls back every visible side effect`, () => {
     const input = validCommitInput();
     mutateAuthority(input, mutation);
     assert.throws(() => commitVisibleResult(input), /authority conflict/);
-    assert.deepEqual(countCommitSideEffects(store, 'turn_1'), allZeroCounts());
+    assert.deepEqual(countCommitSideEffects(store, input.authorityLineageKey),
+      allZeroCounts());
   });
 }
 
-test('repeated commit returns the same authority receipt without duplication', () => {
-  const first = commitVisibleResult(validCommitInput());
-  const second = commitVisibleResult(validCommitInput());
+test('exact repeated commit returns one receipt but changed payload on same lineage conflicts', () => {
+  const input = validCommitInput();
+  const first = commitVisibleResult(input);
+  const second = commitVisibleResult(structuredClone(input));
   assert.equal(second.commitChecksum, first.commitChecksum);
-  assert.equal(store.visibleGroupsFor('turn_1').length, 1);
+  assert.equal(second.visibleGroupId, first.visibleGroupId);
+  assert.equal(store.visibleGroupsForLineage(input.authorityLineageKey).length, 1);
+  assert.throws(
+    () => commitVisibleResult({ ...input, visibleGroup: changedReply(input.visibleGroup) }),
+    /lineage already committed with different checksum/
+  );
+});
+
+test('original and retry turn IDs cannot create two canonical groups or two deliveries', () => {
+  const original = createV3Turn('turn_original');
+  const retry = createV3Retry(original, 'turn_retry');
+  assert.throws(() => commitVisibleResult(commitInputFor(original)), /retry branch/);
+  const receipt = commitVisibleResult(commitInputFor(retry));
+  assert.equal(store.visibleGroupsForLineage(original.authorityLineageKey).length, 1);
+  assert.equal(store.outboxForGroup(receipt.visibleGroupId).length, 1);
+  assert.equal(store.outboxForTurn(original.turnId).length, 0);
 });
 ```
 
-- [ ] **Step 2: Run commit tests red**
+Inject a forced exception after every individual write/CAS listed in Step 6 and assert that group, messages, actions, state, stance, memory jobs, comparison job, outbox, lane, lineage, turn, and receipt all remain at their pre-transaction values.
 
-Run: `node --test yuqi-runtime/test/visible-result-commit.test.mjs`
+- [ ] **Step 3: Run the v11/commit tests red**
 
-Expected: FAIL on missing commit module.
+Run:
 
-- [ ] **Step 3: Implement one transaction boundary**
+```powershell
+node --test yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs
+```
+
+Expected: FAIL because v10 currently returns early, canonical authority tables/columns do not exist, and outbox is keyed only by turn.
+
+- [ ] **Step 4: Implement the exact PC v11 schema**
+
+Create these tables:
+
+```sql
+CREATE TABLE IF NOT EXISTS turn_authority_lineages (
+  lineage_key TEXT PRIMARY KEY,
+  role_id TEXT NOT NULL,
+  lane_key TEXT NOT NULL,
+  root_source_id TEXT NOT NULL,
+  latest_turn_id TEXT NOT NULL,
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  state TEXT NOT NULL CHECK(state IN ('open','committed','cancelled')),
+  committed_group_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE(role_id, lane_key, root_source_id),
+  CHECK(
+    (state = 'committed' AND committed_group_id IS NOT NULL)
+    OR (state IN ('open','cancelled') AND committed_group_id IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS visible_result_groups (
+  group_id TEXT PRIMARY KEY,
+  lineage_key TEXT NOT NULL UNIQUE,
+  authoritative_turn_id TEXT NOT NULL UNIQUE,
+  role_id TEXT NOT NULL,
+  lane_key TEXT NOT NULL,
+  authority_origin TEXT NOT NULL CHECK(authority_origin IN ('pc','android_fallback')),
+  authoritative_release_id TEXT NOT NULL,
+  generation_fingerprint TEXT NOT NULL,
+  reply_checksum TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  redacted_at INTEGER,
+  FOREIGN KEY(lineage_key) REFERENCES turn_authority_lineages(lineage_key),
+  FOREIGN KEY(authoritative_turn_id) REFERENCES turns(turn_id)
+);
+
+CREATE TABLE IF NOT EXISTS visible_result_items (
+  group_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  message_id TEXT NOT NULL UNIQUE,
+  item_json TEXT NOT NULL,
+  item_checksum TEXT NOT NULL,
+  PRIMARY KEY(group_id, ordinal),
+  FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+);
+
+CREATE TABLE IF NOT EXISTS visible_result_actions (
+  group_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  action_id TEXT NOT NULL UNIQUE,
+  action_kind TEXT NOT NULL,
+  target_key TEXT NOT NULL,
+  target_revision TEXT,
+  action_json TEXT NOT NULL,
+  action_checksum TEXT NOT NULL,
+  PRIMARY KEY(group_id, ordinal),
+  FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+);
+
+CREATE TABLE IF NOT EXISTS visible_commit_receipts (
+  lineage_key TEXT PRIMARY KEY,
+  group_id TEXT NOT NULL UNIQUE,
+  authoritative_turn_id TEXT NOT NULL UNIQUE,
+  authority_origin TEXT NOT NULL CHECK(authority_origin IN ('pc','android_fallback')),
+  commit_payload_version TEXT NOT NULL,
+  turn_revision_before INTEGER NOT NULL,
+  turn_revision_after INTEGER NOT NULL,
+  lineage_revision_before INTEGER NOT NULL,
+  lineage_revision_after INTEGER NOT NULL,
+  lane_revision_before INTEGER,
+  lane_revision_after INTEGER,
+  cognitive_state_revision_before INTEGER,
+  cognitive_state_revision_after INTEGER,
+  commit_checksum TEXT NOT NULL UNIQUE,
+  committed_at INTEGER NOT NULL,
+  FOREIGN KEY(lineage_key) REFERENCES turn_authority_lineages(lineage_key),
+  FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id),
+  FOREIGN KEY(authoritative_turn_id) REFERENCES turns(turn_id)
+);
+```
+
+Add columns idempotently with `addColumnIfMissing`:
+
+```text
+turns.result_authority_version INTEGER NOT NULL DEFAULT 0
+turns.authority_lineage_key TEXT
+turns.lineage_revision_at_creation INTEGER
+turns.turn_revision INTEGER NOT NULL DEFAULT 0
+turns.retry_of_turn_id TEXT
+turns.input_user_batch_id TEXT
+turns.agency_snapshot_checksum TEXT
+
+messages.authority_group_id TEXT
+messages.group_ordinal INTEGER
+
+cognitive_states.last_authority_group_id TEXT
+
+stance_records.authority_group_id TEXT
+stance_records.authority_ordinal INTEGER
+
+consolidation_jobs.authority_group_id TEXT
+consolidation_jobs.authority_ordinal INTEGER
+
+cloud_deliveries.authority_group_id TEXT
+cloud_deliveries.authority_commit_checksum TEXT
+```
+
+Create these partial unique indexes:
+
+```sql
+CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_authority_group_ordinal
+  ON messages(authority_group_id, group_ordinal)
+  WHERE authority_group_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_stances_authority_group_ordinal
+  ON stance_records(authority_group_id, authority_ordinal)
+  WHERE authority_group_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_consolidation_authority_group_ordinal
+  ON consolidation_jobs(authority_group_id, authority_ordinal)
+  WHERE authority_group_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_delivery_authority_group_peer
+  ON cloud_deliveries(authority_group_id, peer_id)
+  WHERE authority_group_id IS NOT NULL;
+```
+
+Do not add `visible_group_id` or `commit_checksum` as competing authority columns on `turns`. `getTurn()` may expose receipt-derived projection fields by joining `visible_commit_receipts`, but persisted truth remains the receipt. `reply_json` remains a legacy/read-optimization projection only.
+
+- [ ] **Step 5: Implement v10→v11 migration, invariant checks, and lineage creation**
+
+Refactor `migrate()` to one ordered version ladder:
+
+```js
+const initialVersion = this.userVersion();
+if (initialVersion > 11) throw unsupportedVersion(initialVersion);
+if (initialVersion === 11) {
+  this.assertAgencyV10Invariants();
+  this.assertVisibleAuthorityV11Invariants();
+  return;
+}
+this.withImmediateTransaction(() => {
+  if (initialVersion < 9) migrateHistoricalToV9Internal();
+  if (initialVersion < 10) migrateAgencyV10Internal();
+  if (initialVersion < 11) migrateVisibleAuthorityV11Internal();
+  assertAgencyV10Invariants({ allowPreFinalVersion: true });
+  assertVisibleAuthorityV11Invariants({ allowVersionTen: true });
+  this.db.exec('PRAGMA user_version = 11');
+});
+```
+
+`migrateVisibleAuthorityV11Internal()` leaves every pre-existing turn at `result_authority_version=0` with null lineage fields. It does not infer a canonical group from `reply_json`, messages, delivery rows, timestamps, or the most recent retry. Those old turns remain on their pinned legacy recovery/outbox branch. Only a turn created after the v11 schema is available may set `result_authority_version=1`.
+
+`assertVisibleAuthorityV11Invariants()` must prove:
+
+- every authority-version-1 turn has non-null lineage key, positive turn revision, input batch identity, release pin, lane, and agency checksum;
+- every lineage latest turn exists, belongs to the same role/lane/root source, and points back to that lineage;
+- every committed lineage joins exactly one group and one receipt;
+- every group joins the same lineage, authoritative turn, role, lane, release, and authority origin as its receipt;
+- every receipt uses the payload version allowed for its origin;
+- every receipt's turn/lineage revisions increment exactly once; `pc` receipts also require lane before/after to increment once, while imported fallback receipts keep both lane fields null;
+- every v3 delivery joins the receipt group and carries the same authority commit checksum;
+- every `pc` receipt has its required peer deliveries, while every imported `android_fallback` receipt has none;
+- no authority-version-0 turn is silently attached to a v3 lineage or receipt.
+
+Update `migrate-yuqi-agency-state.mjs` so it reads source `PRAGMA user_version` before constructing `YuqiStore`, migrates only `--clone-out` during dry-run, and materializes the v11 invariant summary in the report. `--apply --expect-report` must compare the raw source SHA/version and structural counts from the approved report before opening/migrating production; a changed source stops before mutation. The verified raw backup remains the rollback artifact.
+
+Change `createTurnWithReleasePinInternal()` so its v3 return type is explicit:
+
+```text
+{ status: 'created', turn }
+{ status: 'already_committed', receipt }
+```
+
+New v3 turn creation, first lineage insert, and lane claim occur in one immediate transaction. Derive:
+
+```js
+rootSourceId = envelope.context?.retry?.canonicalMessageId
+  ?? envelope.message?.messageId
+  ?? envelope.triggerId;
+lineageKey = deriveAuthorityLineageKey({
+  roleId: envelope.characterId, laneKey, rootSourceId
+});
+```
+
+For a retry, ignore any caller-supplied lineage key. Load `retryOfTurnId`, require that turn to be the open lineage's current `latestTurnId`, require `expectedLineageRevision`, insert the retry turn pointing to the same lineage, and CAS `latest_turn_id/revision`. A committed lineage returns `{status:'already_committed', receipt}` without creating or claiming a new turn. A stale/sibling retry reports a retry-lineage authority conflict. Persist `input_user_batch_id`, the current visibility sequence, release pins, lane revision, and the normalized agency snapshot checksum on the new turn.
+
+All authority-changing writes for result-authority-version-1 turns use:
+
+```sql
+UPDATE turns
+SET ..., turn_revision = turn_revision + 1
+WHERE turn_id = ? AND turn_revision = ?;
+```
+
+Zero affected rows is an authority conflict. `updated_at` is never a CAS token.
+
+A retryable/final model failure CAS-updates the turn but leaves its lineage `open` and latest so an explicit retry can replace it. User deletion/cancellation and lane supersession CAS the still-open lineage to `cancelled`; cancelled lineages can never commit or be retried implicitly. A committed lineage is immutable. Recovery tests cover all three states.
+
+- [ ] **Step 6: Implement the one canonical commit transaction**
+
+The canonical commit payload must be stable-key ordered and include lineage, origin/payload version, ordered visible items/actions, state patch, memory jobs, optional comparison release/direction, release pin, input batch/cursor identity, generation fingerprint, and agency/state authority checksums. It excludes attempt-only/non-semantic values such as timestamps, random IDs, worker IDs, diagnostics, and raw model traces.
+
+Identity algorithm `al-authority-v1` is cross-platform and must not depend on JSON object iteration order. Define `lp(value)` as the decimal UTF-8 byte length, one colon, then the exact UTF-8 string. Lower-case hexadecimal SHA-256 is used:
+
+```js
+lineageKey = 'lin_' + sha256(
+  'al-turn-lineage-v1\0' + lp(roleId) + lp(laneKey) + lp(rootSourceId)
+);
+groupId = 'grp_' + sha256(
+  'al-visible-group-v1\0' + lp(lineageKey)
+);
+messageId = ordinal => 'msg_' + sha256(
+  'al-visible-message-v1\0' + lp(groupId) + lp(String(ordinal))
+);
+actionId = ordinal => 'act_' + sha256(
+  'al-visible-action-v1\0' + lp(groupId) + lp(String(ordinal))
+);
+```
+
+`tests/fixtures/authority-identity-v1.json` contains ASCII, Chinese, emoji, colon, empty-string, and large-ordinal vectors with exact expected IDs. Node must pass these vectors now; Task 13 reuses the same file from Java. Changing the algorithm requires a new named version, never silent replacement.
+
+Implement:
 
 ```js
 export function commitVisibleResult(input) {
-  return input.store.transaction(() => {
-    const authority = input.store.readCommitAuthority(input.turnId, input.laneKey);
+  const canonicalPayload = canonicalCommitPayload({
+    ...input,
+    authorityOrigin: 'pc',
+    commitPayloadVersion: 'pc-visible-commit-v1'
+  });
+  const commitChecksum = contentHash(canonicalPayload);
+  return input.store.withImmediateTransaction(() => {
+    const existing = input.store.getVisibleCommitReceipt(input.authorityLineageKey);
+    if (existing) {
+      assert.equal(existing.authorityOrigin, 'pc',
+        'lineage already committed by a different authority origin');
+      assert.equal(existing.commitPayloadVersion, 'pc-visible-commit-v1',
+        'lineage receipt payload version conflict');
+      assert.equal(existing.commitChecksum, commitChecksum,
+        'lineage already committed with different checksum');
+      return existing;
+    }
+
+    const authority = input.store.readCommitAuthority({
+      turnId: input.turnId,
+      authorityLineageKey: input.authorityLineageKey,
+      laneKey: input.laneKey
+    });
+    assertResultAuthorityVersion(authority, 1);
     assertTurnRevision(authority, input.expectedTurnRevision);
+    assertLineageLatestOpen(authority, input.expectedLineageRevision, input.turnId);
     assertLaneRevision(authority, input.expectedLaneRevision);
+    assertNoNewerUserBatch(authority, {
+      expectedLatestUserBatchId: input.expectedLatestUserBatchId,
+      inputVisibilitySequence: input.inputVisibilitySequence
+    });
+    assertCognitiveStateRevision(authority, input.expectedCognitiveStateRevision);
+    assertAgencySnapshotChecksum(authority, input.agencySnapshotChecksum);
     assertReleasePin(authority, input.authoritativeReleaseId);
-    assertNoNewerUserBatch(authority, input.inputVisibilitySequence);
     assertActionTargets(authority, input.actionSet);
-    assertRetryLineage(authority, input.turnId);
     assertFingerprintAuthority(authority, input.generationFingerprint);
+
     return input.store.commitVisibleResultInternal({
       ...input,
+      authorityOrigin: 'pc',
+      commitPayloadVersion: 'pc-visible-commit-v1',
+      groupId: deriveVisibleGroupId(input.authorityLineageKey),
       statePatch: validateStatePatchAgainstAgency(input.statePatch, authority),
-      commitChecksum: contentHash(canonicalCommitPayload(input))
+      commitChecksum
     });
   });
 }
 ```
 
-`commitVisibleResultInternal()` inserts the visible reply group, authorized action rows, new cognitive snapshot/stance revisions, evidence-memory jobs, one outbox group, and the lane revision before marking the turn committed. All tables use unique authority keys so exact retry returns the existing receipt. Shadow results call no part of this function.
+`commitVisibleResultInternal()` performs this exact write order inside the already-open transaction:
 
-- [ ] **Step 4: Run commit/outbox/store tests green**
+1. insert `visible_result_groups`;
+2. insert deterministic `visible_result_items`;
+3. insert deterministic `visible_result_actions`;
+4. insert `messages` projections with `authority_group_id + group_ordinal`;
+5. update `cognitive_states` using the expected state revision and `last_authority_group_id`;
+6. insert stance revisions with `authority_group_id + authority_ordinal`;
+7. insert consolidation/evidence-memory jobs with `authority_group_id + authority_ordinal`;
+8. insert the optional dry-run comparison job using the group/commit authority; comparison creation is part of this transaction, not a later call;
+9. insert one delivery per peer with `authority_group_id + peer_id` and `authority_commit_checksum`;
+10. CAS the lane from expected revision to `revision + 1`, setting latest authoritative group/checksum;
+11. CAS the lineage from open/latest/current revision to committed/group/`revision + 1`;
+12. CAS the turn from expected revision to committed/`turnRevision + 1`;
+13. insert `visible_commit_receipts` with every before/after revision and return it.
+
+Although the receipt row is inserted last, the whole SQLite transaction is the authority boundary. Any exception rolls back all thirteen steps. `commitVisibleResult()` always records authority origin `pc`; the later Android fallback task may import an already-visible external receipt through a separate validation-only path, never by pretending it was a PC cognition commit. Shadow/comparison execution may write only comparison/quality rows; it never calls this function, an action store, outbox, notification, state, facts, or memory consolidation.
+
+- [ ] **Step 7: Convert only v3 outbox operations to group authority**
+
+Keep legacy rows and public compatibility methods for result-authority-version-0 turns. For rows with `authority_group_id`:
+
+- list/lease/retry/confirm/recover by `authority_group_id + peer_id`;
+- load payload by joining `visible_commit_receipts → visible_result_groups/items/actions`;
+- use `${authorityGroupId}:${peerId}:${authorityCommitChecksum}` as the idempotency key;
+- reject a delivery whose turn, group, lineage, or checksum does not join the same receipt;
+- never reconstruct a group from `turn.reply_json`;
+- return delivery receipt fields verbatim to the bridge.
+
+Add a restart test where original and retry turn IDs both exist, only the retry owns the committed lineage, and `ResultOutbox` emits exactly one group after multiple process restarts.
+
+- [ ] **Step 8: Run commit/outbox/store tests green**
 
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/protocol-store.test.mjs
+node --test yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/protocol-store.test.mjs tests/yuqi-agency-state-migration.test.mjs
 ```
 
-Expected: PASS; forced failure at each insert point leaves no partial rows.
+Expected: PASS; populated v10 is preserved and becomes v11; exact retry returns one receipt; stale/sibling retry fails; every forced failure leaves no partial authority; old v2 delivery remains readable; v3 emits one canonical group.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 9: Commit**
 
 ```powershell
-git add yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/result-outbox.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs
-git commit -m "feat: commit Yuqi visible results and state atomically"
+git add yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/result-outbox.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs tests/fixtures/authority-identity-v1.json scripts/migrate-yuqi-agency-state.mjs tests/yuqi-agency-state-migration.test.mjs
+git commit -m "feat: add canonical Yuqi result authority"
 ```
 
 ### Task 11: Integrate v3, Lanes, Shadow, and Recovery in the Runtime
@@ -1464,7 +1853,7 @@ git commit -m "feat: commit Yuqi visible results and state atomically"
 
 **Interfaces:**
 - Consumes: Tasks 2, 7, 9, and 10.
-- Produces: one release-pinned execution path for all ten rollout keys; background comparisons created only after authoritative result checksums exist.
+- Produces: one release-pinned execution path for all ten rollout keys; receipt-derived bridge results; background comparisons created inside the authoritative result transaction only after the checksum is deterministic.
 
 - [ ] **Step 1: Write red orchestration tests for release direction and recovery**
 
@@ -1518,7 +1907,7 @@ Expected: FAIL because release IDs/lanes are not wired into execution.
 ```js
 const rollout = promotionController.getStatus(envelope.kind);
 const pair = promotionController.resolvePipelinePair(rollout);
-const turn = store.createTurnWithReleasePinInternal({
+const creation = store.createTurnWithReleasePinInternal({
   envelope,
   rolloutKey: envelope.kind,
   authoritativeReleaseId: pair.visibleReleaseId,
@@ -1526,22 +1915,37 @@ const turn = store.createTurnWithReleasePinInternal({
   comparisonDirection: pair.comparisonDirection,
   laneKey: laneKeyForEnvelope(envelope),
   expectedLaneRevision: lane.revision,
-  inputVisibilitySequence: envelope.context.visibilityCursor.localSequence
+  inputUserBatchId: envelope.context.currentBatch?.batchId ?? envelope.triggerId,
+  inputVisibilitySequence: envelope.context.visibilityCursor.localSequence,
+  agencySnapshotChecksum: agencyView.checksum
 });
+if (creation.status === 'already_committed') {
+  return bridgeResultFromCommitReceipt(creation.receipt);
+}
+const turn = creation.turn;
 const execution = await executePinnedRelease(turn);
-const receipt = commitVisibleResult(toCommitInput(execution));
-if (turn.comparisonReleaseId) {
-  store.createComparisonJobAfterAuthorityInternal({
+const comparisonJob = turn.comparisonReleaseId
+  ? buildComparisonJobDraft({
     subjectType: 'turn',
     subjectId: turn.turnId,
-    authoritativeResultChecksum: receipt.commitChecksum,
+    authorityLineageKey: turn.authorityLineageKey,
     authoritativeReleaseId: turn.authoritativeReleaseId,
     comparisonReleaseId: turn.comparisonReleaseId
-  });
-}
+  })
+  : null;
+const receipt = commitVisibleResult(toCommitInput(execution, {
+  expectedTurnRevision: store.getTurn(turn.turnId).turnRevision,
+  expectedLineageRevision: store.getTurnAuthorityLineage(
+    turn.authorityLineageKey).revision,
+  expectedCognitiveStateRevision: execution.inputCognitiveStateRevision,
+  comparisonJob
+}));
+return bridgeResultFromCommitReceipt(receipt);
 ```
 
-The compare worker is dry-run: it can write only comparison/quality rows. It cannot call action stores, visible commit, outbox, notification, state, fact, or consolidation APIs. Life planning retains two phases: attempt creation fixes release/epoch/checksum/canary slot/input; result commit creates comparison work in the same transaction. Outstanding canary count includes attempts allocated before the comparison job exists.
+`buildComparisonJobDraft()` has no database side effect. Task 10 inserts it as step 8 of the same result transaction and fills the authoritative group/checksum from that transaction; there is no post-commit window where a visible result lacks required comparison work. The compare worker is dry-run: it can write only comparison/quality rows. It cannot call action stores, visible commit, outbox, notification, state, fact, or consolidation APIs. Life planning retains two phases: attempt creation fixes release/epoch/checksum/canary slot/input; result commit creates comparison work in the same transaction. Outstanding canary count includes attempts allocated before the comparison job exists.
+
+Recovery branches explicitly on `resultAuthorityVersion`: version 0 resumes the pre-v11 pinned legacy turn/outbox path; version 1 must load lineage, current turn revision, canonical receipt/group and group delivery. A version-1 turn with a missing or inconsistent lineage is quarantined as an invariant failure and never regenerated or silently downgraded.
 
 - [ ] **Step 4: Run all runtime integration tests green**
 
@@ -1564,6 +1968,7 @@ git commit -m "feat: integrate v3 release execution and recovery"
 
 **Files:**
 - Create: `android/app/src/main/java/com/siyi/al/execution/db/ConversationCursorEntity.java`
+- Create: `android/app/src/main/java/com/siyi/al/execution/db/ConversationAuthorityEntity.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/db/ChatTurnEntity.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
@@ -1574,8 +1979,8 @@ git commit -m "feat: integrate v3 release execution and recovery"
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
 
 **Interfaces:**
-- Consumes: native completion and existing successful DOM `uiAppliedAt` acknowledgement.
-- Produces: Room v11; plugin methods `getConversationCursor` and existing acknowledgement methods updating the cursor.
+- Consumes: Task 10 receipt fields, native completion, and existing successful DOM `uiAppliedAt` acknowledgement.
+- Produces: Android Room v11 (independent from PC schema v11); durable local lineage/receipt mirror; plugin methods `getConversationCursor` and existing acknowledgement methods updating the cursor.
 
 - [ ] **Step 1: Write red Room migration and monotonic cursor tests**
 
@@ -1588,7 +1993,11 @@ public void migration10To11PreservesTurnsAndCreatesCursor() {
     db = helper.runMigrationsAndValidate(TEST_DB, 11, true, MIGRATION_10_11);
     assertEquals(1L, DatabaseUtils.queryNumEntries((SQLiteDatabase) db, "chat_turns"));
     assertTrue(hasTable(db, "conversation_cursors"));
+    assertTrue(hasTable(db, "conversation_authorities"));
     assertTrue(hasColumn(db, "chat_turns", "visibleGroupId"));
+    assertTrue(hasColumn(db, "chat_turns", "authorityLineageKey"));
+    assertTrue(hasColumn(db, "chat_turns", "lineageRevision"));
+    assertTrue(hasColumn(db, "chat_turns", "turnRevision"));
     assertTrue(hasColumn(db, "chat_turns", "pipelineReleaseId"));
 }
 
@@ -1634,6 +2043,28 @@ public final class ConversationCursorEntity {
     public long updatedAt;
 }
 
+@Entity(
+    tableName = "conversation_authorities",
+    indices = @Index(
+        value = {"characterId", "laneKey", "rootSourceId"},
+        unique = true
+    )
+)
+public final class ConversationAuthorityEntity {
+    @PrimaryKey @NonNull public String authorityLineageKey;
+    @NonNull public String characterId;
+    @NonNull public String laneKey;
+    @NonNull public String rootSourceId;
+    @NonNull public String latestTurnId;
+    public long revision;
+    @NonNull public String state; // OPEN | COMMITTED | CANCELLED
+    public String visibleGroupId;
+    public String commitChecksum;
+    public String commitPayloadVersion;
+    public String authorityOrigin; // pc | android_fallback
+    public long updatedAt;
+}
+
 static final Migration MIGRATION_10_11 = new Migration(10, 11) {
     @Override public void migrate(@NonNull SupportSQLiteDatabase db) {
         db.execSQL("CREATE TABLE IF NOT EXISTS `conversation_cursors` (" +
@@ -1643,7 +2074,23 @@ static final Migration MIGRATION_10_11 = new Migration(10, 11) {
             "`uiAppliedSequence` INTEGER NOT NULL, `localSequence` INTEGER NOT NULL, " +
             "`chatOpen` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, " +
             "PRIMARY KEY(`characterId`))");
+        db.execSQL("CREATE TABLE IF NOT EXISTS `conversation_authorities` (" +
+            "`authorityLineageKey` TEXT NOT NULL, `characterId` TEXT NOT NULL, " +
+            "`laneKey` TEXT NOT NULL, `rootSourceId` TEXT NOT NULL, " +
+            "`latestTurnId` TEXT NOT NULL, `revision` INTEGER NOT NULL, " +
+            "`state` TEXT NOT NULL, `visibleGroupId` TEXT, `commitChecksum` TEXT, " +
+            "`commitPayloadVersion` TEXT, " +
+            "`authorityOrigin` TEXT, `updatedAt` INTEGER NOT NULL, " +
+            "PRIMARY KEY(`authorityLineageKey`))");
+        db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS " +
+            "`index_conversation_authorities_characterId_laneKey_rootSourceId` " +
+            "ON `conversation_authorities` (`characterId`,`laneKey`,`rootSourceId`)");
         db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `visibleGroupId` TEXT");
+        db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `authorityLineageKey` TEXT");
+        db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `authorityOrigin` TEXT");
+        db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `commitPayloadVersion` TEXT");
+        db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `lineageRevision` INTEGER");
+        db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `turnRevision` INTEGER");
         db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `laneKey` TEXT");
         db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `laneRevision` INTEGER");
         db.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `generationFingerprint` TEXT");
@@ -1653,7 +2100,16 @@ static final Migration MIGRATION_10_11 = new Migration(10, 11) {
 };
 ```
 
-Add nullable matching fields to `ChatTurnEntity`. Task 13 fills them from the validated BridgeResult; old v10 turns retain null and continue using turn ID for legacy deduplication. DAO updates must use one transaction and update only when incoming `localSequence >= stored.localSequence`. `nativeCompleted` is written after the native reply group is durably complete; `uiApplied` only after Web confirms exact DOM landing. `getConversationCursor({characterId})` returns all fields even when null.
+Add nullable matching fields to `ChatTurnEntity`. New v3 submission creates/claims `ConversationAuthorityEntity` and pins its lineage key/revision on the turn before any route is attempted. Task 13 fills completion fields from a validated PC receipt; Task 14 may fill them from a locally committed fallback receipt. Old Android Room v10 turns retain null and continue using turn ID for legacy deduplication. The PC `user_version=11` database and Android Room version 11 are unrelated stores even though their numbers match.
+
+DAO updates must use one transaction and enforce two independent rules:
+
+1. cursor stages advance only when incoming `localSequence >= stored.localSequence`;
+2. once a turn has non-null `authorityLineageKey + visibleGroupId + commitPayloadVersion + bridgeCommitChecksum`, an exact replay is idempotent but any changed member is a `BRIDGE_AUTHORITY_CONFLICT` and cannot overwrite the row or advance `nativeCompleted`.
+
+Lineage claim/replace/commit is also compare-and-swap on `ConversationAuthorityEntity.revision`. A new retry must prove its `retryOfTurnId` is the current `latestTurnId`; a committed lineage returns the stored receipt and never launches another model. The shared lineage/group hash implementation and cross-language vectors are added in Task 13.
+
+`nativeCompleted` is written after the exact native reply group is durably complete; `uiApplied` only after Web confirms every bubble of that same group landed in the DOM. `getConversationCursor({characterId})` returns all fields even when null.
 
 - [ ] **Step 4: Run Android Room tests green**
 
@@ -1664,12 +2120,12 @@ cd android
 .\gradlew.bat testDebugUnitTest assembleDebugAndroidTest connectedDebugAndroidTest --no-daemon --no-problems-report
 ```
 
-Expected: PASS on an attached device/emulator; migration retains all v10 rows and repeated acknowledgements create one cursor. Merely compiling the instrumentation APK is not migration evidence. If no device/emulator can execute the migration test, stop and report the missing validation environment before formal release.
+Expected: PASS on an attached device/emulator; migration retains all Android Room v10 rows, exact receipt replay is idempotent, conflicting receipt replay is rejected, and repeated acknowledgements create one cursor. Merely compiling the instrumentation APK is not migration evidence. If no device/emulator can execute the migration test, stop and report the missing validation environment before formal release.
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add android/app/src/main/java/com/siyi/al/execution/db/ConversationCursorEntity.java android/app/src/main/java/com/siyi/al/execution/db/ChatTurnEntity.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java
+git add android/app/src/main/java/com/siyi/al/execution/db/ConversationCursorEntity.java android/app/src/main/java/com/siyi/al/execution/db/ConversationAuthorityEntity.java android/app/src/main/java/com/siyi/al/execution/db/ChatTurnEntity.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java
 git commit -m "feat: persist Android conversation visibility cursor"
 ```
 
@@ -1677,10 +2133,12 @@ git commit -m "feat: persist Android conversation visibility cursor"
 
 **Files:**
 - Modify: `android/app/src/main/java/com/siyi/al/execution/TurnSubmission.java`
+- Create: `android/app/src/main/java/com/siyi/al/execution/AuthorityIdentity.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeResult.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java`
+- Create: `android/app/src/test/java/com/siyi/al/execution/AuthorityIdentityTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
 - Modify: `tests/payment-batch-bridge-contract.test.mjs`
 - Modify: `yuqi-runtime/src/protocol.mjs`
@@ -1688,7 +2146,7 @@ git commit -m "feat: persist Android conversation visibility cursor"
 
 **Interfaces:**
 - Consumes: Task 12 cursor and the existing complete user batch.
-- Produces: protocol v3 `context.visibilityCursor`; result `visibleGroupId`, `laneKey`, `laneRevision`, `generationFingerprint`.
+- Produces: shared `al-authority-v1` IDs; protocol v3 `authority` plus `context.visibilityCursor`; a receipt-derived result containing `authorityLineageKey`, `visibleGroupId`, lineage/turn/lane revisions, `generationFingerprint`, `releaseId`, `commitPayloadVersion`, and `commitChecksum`.
 
 - [ ] **Step 1: Write red Java and Node bridge contract tests**
 
@@ -1704,6 +2162,17 @@ public void userReplyIncludesCompleteBatchAndVisibilityCursor() throws Exception
     assertEquals(12L, cursor.getLong("localSequence"));
     assertTrue(cursor.getBoolean("chatOpen"));
 }
+
+@Test
+public void javaAuthorityIdentityMatchesEveryNodeVector() throws Exception {
+    for (JSONObject vector : readAuthorityIdentityVectors()) {
+        assertEquals(vector.getString("lineageKey"),
+            AuthorityIdentity.lineageKey(vector.getString("roleId"),
+                vector.getString("laneKey"), vector.getString("rootSourceId")));
+        assertEquals(vector.getString("groupId"),
+            AuthorityIdentity.groupId(vector.getString("lineageKey")));
+    }
+}
 ```
 
 ```js
@@ -1712,6 +2181,18 @@ test('protocol v3 rejects an impossible visibility cursor', () => {
   envelope.context.visibilityCursor.uiAppliedSequence = 9;
   envelope.context.visibilityCursor.nativeCompletedSequence = 8;
   assert.throws(() => normalizeEnvelope(envelope), /uiApplied.*nativeCompleted/);
+});
+
+test('protocol v3 result uses the persisted commit receipt and never derives group identity', () => {
+  const receipt = store.getVisibleCommitReceipt('lineage-1');
+  const result = bridgeResultFromCommitReceipt(receipt);
+  assert.equal(result.authorityLineageKey, receipt.authorityLineageKey);
+  assert.equal(result.visibleGroupId, receipt.visibleGroupId);
+  assert.equal(result.commitChecksum, receipt.commitChecksum);
+  assert.throws(
+    () => bridgeResultFromTurnReplyJson(store.getTurn(receipt.authoritativeTurnId)),
+    /receipt required/
+  );
 });
 ```
 
@@ -1732,6 +2213,15 @@ Expected: FAIL on missing cursor/group fields.
 ```json
 {
   "protocolVersion": 3,
+  "authority": {
+    "algorithm": "al-authority-v1",
+    "roleId": "yuqi",
+    "laneKey": "private_chat",
+    "rootSourceId": "canonical-message-or-trigger-id",
+    "lineageKey": "lin_sha256",
+    "claimedLineageRevision": 1,
+    "retryOfTurnId": "turn-id-or-null"
+  },
   "context": {
     "visibilityCursor": {
       "nativeCompletedTurnId": "turn-id-or-null",
@@ -1748,31 +2238,37 @@ Expected: FAIL on missing cursor/group fields.
 }
 ```
 
-Protocol normalization accepts v2 without a cursor for old installed clients and synthesizes an `unknown` visibility state. V3 requires the cursor, verifies UI sequence is not ahead of native completion, and retains every current-batch message. Bridge results return:
+Protocol normalization accepts v2 without a cursor/authority object for old installed clients and synthesizes an `unknown` visibility state. V3 requires both. Android obtains `rootSourceId` from the canonical source message/trigger, derives and persists the lineage before route execution, and sends it. `claimedLineageRevision` is 1 for a first local claim and increments exactly once when a retry replaces `latestTurnId`; it is not a caller-selected PC CAS token. PC independently derives role, lane and root source from the normalized envelope, recomputes `al-authority-v1`, loads the prior turn/lineage when present, and accepts the claimed revision only when it equals the deterministic next revision. V3 also verifies UI sequence is not ahead of native completion and retains every current-batch message. Bridge results return:
 
 ```json
 {
+  "authorityLineageKey": "turn-lineage-key",
   "visibleGroupId": "reply-group-id",
+  "lineageRevision": 2,
+  "turnRevision": 4,
   "laneKey": "private_chat",
   "laneRevision": 8,
   "generationFingerprint": "sha256",
   "releaseId": "release-id",
+  "commitPayloadVersion": "pc-visible-commit-v1",
   "commitChecksum": "sha256"
 }
 ```
 
-`RoomBridgeMirror` writes those five authority fields plus the bridge commit checksum to the same `ChatTurnEntity` completion transaction before advancing `nativeCompleted`. A restart reconstructs the exact group/release/fingerprint from Room; it must not generate a new group ID from current content.
+`AuthorityIdentity.java` implements the exact byte-length-prefixed SHA-256 algorithm from Task 10 and passes the same `tests/fixtures/authority-identity-v1.json`; do not create an Android-only canonicalization. The PC response builder must join `visible_commit_receipts`, `visible_result_groups`, the lineage, lane and authoritative turn, then copy all fields verbatim. It rejects any non-joining turn/group/lineage/checksum rather than falling back to `reply_json`. Legacy v2 responses keep the old turn-ID identity and omit v3 receipt fields.
+
+`RoomBridgeMirror` validates and writes all v3 authority fields to the same `ChatTurnEntity` completion transaction before advancing `nativeCompleted`. Exact event/poll/replay duplicates return the stored row; a different lineage/group/checksum for the same turn is quarantined as `BRIDGE_AUTHORITY_CONFLICT`. A restart reconstructs the exact lineage/group/release/revisions/fingerprint from Room; Android and Web must not generate a new group ID or checksum from current content.
 
 - [ ] **Step 4: Run bridge tests green**
 
 Run the Step 2 commands again.
 
-Expected: PASS for v2 compatibility, v3 validation, complete batches, payment order, and mirror replay.
+Expected: PASS for v2 compatibility, v3 receipt authority, complete batches, payment order, exact mirror replay, and conflicting-receipt rejection.
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add android/app/src/main/java/com/siyi/al/execution/TurnSubmission.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeResult.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/src/protocol.mjs yuqi-runtime/test/protocol-store.test.mjs
+git add android/app/src/main/java/com/siyi/al/execution/TurnSubmission.java android/app/src/main/java/com/siyi/al/execution/AuthorityIdentity.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeResult.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/test/java/com/siyi/al/execution/AuthorityIdentityTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/src/protocol.mjs yuqi-runtime/test/protocol-store.test.mjs
 git commit -m "feat: carry visible conversation authority through bridge"
 ```
 
@@ -1784,12 +2280,19 @@ git commit -m "feat: carry visible conversation authority through bridge"
 - Modify: `android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/LiveReplyQualityGate.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/FallbackJournal.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/LiveReplyQualityGateTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
+- Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/src/reconcile.mjs`
+- Create: `yuqi-runtime/test/android-fallback-authority.test.mjs`
 
 **Interfaces:**
-- Consumes: `cognition-v3`, `cognition-v2`, `memory-v1`, and `chat-v1` snapshots.
-- Produces: `FallbackCognitionPacketCodec.decode(JSONObject) -> FallbackContext`; v3 fallback request/response parsing.
+- Consumes: Task 12 local lineage, Task 13 shared IDs, `cognition-v3`, `cognition-v2`, `memory-v1`, and `chat-v1` snapshots.
+- Produces: `FallbackCognitionPacketCodec.decode(JSONObject) -> FallbackContext`; ambiguity-safe fallback routing; one Room local receipt; idempotent PC import of an already-visible Android result.
 
 - [ ] **Step 1: Write red codec compatibility and authority tests**
 
@@ -1815,6 +2318,50 @@ public void fallbackCannotPersistInferredHardConstraint() {
     assertFalse(gateway.execute(v3SubmissionWithInferredBoundary())
         .statePatch().has("hardConstraints"));
 }
+
+@Test
+public void ambiguousTimeoutNeverAuthorizesV3Fallback() {
+    lan.failWith(lanDeadlineAfterPossibleAccept());
+    cloud.failWith(cloudDeadlineAfterPossibleAccept());
+    assertThrows(BridgePendingException.class,
+        () -> router.execute(v3Submission()));
+    assertEquals(0, fallback.callCount());
+}
+
+@Test
+public void explicitNotAcceptedOrDisabledBridgeCanCommitOneLocalReceipt() {
+    lan.failWith(explicitNotAccepted());
+    cloud.failWith(explicitNotAccepted());
+    BridgeResult result = router.execute(v3Submission());
+    assertEquals("android_fallback", result.authorityOrigin);
+    assertEquals(AuthorityIdentity.groupId(result.authorityLineageKey),
+        result.visibleGroupId);
+    assertEquals(1, dao.authorityCount(result.authorityLineageKey));
+    assertEquals(1, dao.replyGroupCount(result.visibleGroupId));
+}
+```
+
+```js
+test('Android fallback receipt imports as external visibility without PC side effects', () => {
+  const beforeState = store.getCognitiveState('yuqi');
+  const receipt = reconcile.importAndroidFallbackReceipt(validFallbackReceipt());
+  assert.equal(receipt.authorityOrigin, 'android_fallback');
+  assert.equal(store.visibleGroupsForLineage(receipt.authorityLineageKey).length, 1);
+  assert.equal(store.outboxForGroup(receipt.visibleGroupId).length, 0);
+  assert.deepEqual(store.getCognitiveState('yuqi'), beforeState);
+  assert.equal(store.comparisonJobsForGroup(receipt.visibleGroupId).length, 0);
+  assert.deepEqual(reconcile.importAndroidFallbackReceipt(validFallbackReceipt()), receipt);
+});
+
+test('different PC and Android receipts for one lineage are quarantined, never merged', () => {
+  commitVisibleResult(pcCommitFor('lineage-1'));
+  assert.throws(
+    () => reconcile.importAndroidFallbackReceipt(changedFallbackReceipt('lineage-1')),
+    /cross-device authority conflict/
+  );
+  assert.equal(store.visibleGroupsForLineage('lineage-1').length, 1);
+  assert.equal(store.authorityConflictsFor('lineage-1').length, 1);
+});
 ```
 
 - [ ] **Step 2: Run Android unit tests red**
@@ -1823,10 +2370,12 @@ Run:
 
 ```powershell
 cd android
-.\gradlew.bat testDebugUnitTest --tests "*FallbackCognitionPacketCodecTest" --tests "*ExecutionEngineTest" --tests "*LiveReplyQualityGateTest" --no-daemon --no-problems-report
+.\gradlew.bat testDebugUnitTest --tests "*FallbackCognitionPacketCodecTest" --tests "*ExecutionEngineTest" --tests "*LiveReplyQualityGateTest" --tests "*BridgeRouterTest" --no-daemon --no-problems-report
+cd ..
+node --test yuqi-runtime/test/android-fallback-authority.test.mjs
 ```
 
-Expected: FAIL because v3 is currently rejected.
+Expected: FAIL because v3 is currently rejected, deadline still broadly authorizes fallback, and no local/external receipt authority exists.
 
 - [ ] **Step 3: Implement a focused compatibility codec and v3 fallback**
 
@@ -1847,16 +2396,32 @@ public final class FallbackCognitionPacketCodec {
 
 `NativeModelGateway` delegates parsing to the codec, sends a compact cognition request before expression for v3, and enforces the same structured-action targets as PC. Fallback receives relevant hard constraints, at most two current stances, base/phase, recent complete groups, and allowed actions. Fallback-created facts are marked `pending_review`; it never overwrites a PC state record or rewrites a result already visible.
 
+For v3, replace the old broad `fallbackAuthorized` boolean with these explicit route outcomes:
+
+```text
+bridge disabled before any remote call                  -> LOCAL_FALLBACK_ALLOWED
+all routes explicitly reply NOT_ACCEPTED_ALLOW_FALLBACK -> LOCAL_FALLBACK_ALLOWED
+CLOUD_ACCEPTED / BRIDGE_WAITING                         -> REMOTE_OWNS_AUTHORITY
+deadline, lost response, unknown exception              -> AUTHORITY_AMBIGUOUS
+explicit final without fallback                         -> REMOTE_FINAL_FAILURE
+```
+
+`AUTHORITY_AMBIGUOUS` persists `BRIDGE_WAITING` and uses receipt/poll/replay; it never invokes the local model. If no receipt or definitive not-accepted result is available by the global five-minute limit, stop the thinking UI and expose `FAILED_RETRYABLE/AUTHORITY_UNRESOLVED`; keep the lineage open for later reconciliation and do not fabricate a local reply. Preserve legacy routing behavior for old v1/v2 turns only.
+
+When local fallback is allowed, `RoomExecutionStore` uses one transaction to re-read the open `ConversationAuthorityEntity`, validate expected revision/latest turn, derive group/message/action IDs, insert reply parts and applied structured-action records, CAS the lineage to committed, write the exact local commit checksum with `commitPayloadVersion=android-fallback-commit-v1` and `authorityOrigin=android_fallback`, complete the turn, and advance `nativeCompleted`. Its normalized checksum payload contains lineage/group, ordered reply/action payloads, the complete input batch/cursor identity, fallback contract checksum, and a deterministic `android_fallback:<contractChecksum>` release ID; it contains no unavailable PC state revisions and no timestamps/random IDs. Exact replay returns the stored receipt; different content conflicts.
+
+`FallbackJournal` syncs an `authority_receipt` entity before/with its deterministic group items, not just raw fallback messages. `reconcile.mjs` validates all Task 10/13 IDs and the semantic checksum, then calls `store.importExternalVisibleReceiptInternal()`. That PC transaction either returns an exact existing receipt or creates a mirror turn/lineage, group/items/actions and receipt with origin `android_fallback`. It creates no PC cognition state/stance/memory/comparison/outbox/notification writes, never increments live shadow/canary evidence, and marks action rows `already_applied_on_android`. Its receipt has null PC lane/state revisions; reconciliation may only advance lane visibility cursors monotonically by the imported local sequence and must not replace a newer PC `latest_authoritative_group_id`. A different existing receipt inserts a sanitized authority-conflict diagnostic and aborts import.
+
 - [ ] **Step 4: Run Android fallback tests green**
 
 Run the Step 2 command.
 
-Expected: PASS for all four contracts; v3 invalid action targets fail before any local commit.
+Expected: PASS for all four contracts; v3 invalid action targets fail before any local commit; ambiguous remote outcomes never start fallback; explicit local authority produces/imports one receipt with no PC duplicate side effects.
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add android/app/src/main/java/com/siyi/al/execution/FallbackCognitionPacketCodec.java android/app/src/test/java/com/siyi/al/execution/FallbackCognitionPacketCodecTest.java android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java android/app/src/main/java/com/siyi/al/execution/LiveReplyQualityGate.java android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java android/app/src/test/java/com/siyi/al/execution/LiveReplyQualityGateTest.java
+git add android/app/src/main/java/com/siyi/al/execution/FallbackCognitionPacketCodec.java android/app/src/test/java/com/siyi/al/execution/FallbackCognitionPacketCodecTest.java android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java android/app/src/main/java/com/siyi/al/execution/LiveReplyQualityGate.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java android/app/src/main/java/com/siyi/al/execution/bridge/FallbackJournal.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java android/app/src/test/java/com/siyi/al/execution/LiveReplyQualityGateTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java yuqi-runtime/src/store.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/test/android-fallback-authority.test.mjs
 git commit -m "feat: support cognition v3 Android fallback"
 ```
 
@@ -2364,7 +2929,7 @@ test('committed facts commitments events and repeated preferences are allowed wi
   }
 });
 
-test('clear operations affect exactly their declared v10 tables', () => {
+test('clear operations preserve or redact canonical v11 authority explicitly', () => {
   const matrix = lifecycleMatrix();
   assert.deepEqual(matrix.clearAutomaticTasks.deletedTables.sort(),
     ['automatic_tasks', 'comparison_jobs'].sort());
@@ -2372,6 +2937,11 @@ test('clear operations affect exactly their declared v10 tables', () => {
   assert.equal(matrix.clearChat.deletedTables.includes('interaction_lanes'), true);
   assert.equal(matrix.clearChat.revisionActions.constraint_records,
     'archive_when_sole_message_evidence_is_deleted');
+  assert.equal(matrix.clearChat.actions.visible_result_items, 'delete_content');
+  assert.equal(matrix.clearChat.actions.visible_result_groups, 'retain_redacted_header');
+  assert.equal(matrix.clearChat.actions.visible_commit_receipts, 'retain_checksum_only');
+  assert.equal(matrix.clearChat.actions.cloud_deliveries,
+    'cancel_undelivered_and_clear_payload');
   assert.equal(matrix.clearMemory.deletedTables.includes('constraint_records'), false);
   assert.equal(matrix.deleteRole.deletedTables.includes('constraint_records'), true);
 });
@@ -2385,7 +2955,7 @@ Run:
 node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs
 ```
 
-Expected: FAIL because v10 records are not yet classified by lifecycle.
+Expected: FAIL because v10/v11 records are not yet classified by lifecycle.
 
 - [ ] **Step 3: Implement memory allowlist and explicit lifecycle matrix**
 
@@ -2407,14 +2977,14 @@ export function validateConsolidationCandidate(candidate) {
 
 Implement and test this table:
 
-| operation | constraints | stances | cognitive snapshot | lanes | releases/rollout | quality/audit |
+| operation | constraints | stances/state | canonical result authority | lanes | releases/rollout | quality/audit |
 |---|---|---|---|---|---|---|
-| backup/export | include | include | include | include | include | include |
-| import | merge by immutable ID/revision | merge | replace only if newer valid revision | rebuild safe cursor state | preserve local authority unless explicit full restore | append |
-| clear automatic tasks | preserve | preserve | preserve | preserve | preserve | preserve |
-| clear chat | preserve system/author; archive user constraints whose sole evidence is deleted | expire evidence-dependent stances | remove chat-derived fast state | delete/reinitialize | preserve | preserve |
-| clear memory | preserve system/author and explicit user boundaries | expire memory-dependent stances | rebuild from persona/stage | preserve cursor | preserve | preserve |
-| delete Yuqi role | delete role rows | delete | delete | delete | keep global release definitions; delete role rollout state | retain redacted audit |
+| backup/export | include | include | include lineage/group/items/actions/receipt/group-delivery | include | include | include |
+| import | merge by immutable ID/revision | replace only if newer valid revision | exact lineage/group/checksum merge only; any mismatch stops import | rebuild safe cursor state | preserve local authority unless explicit full restore | append |
+| clear automatic tasks | preserve | preserve | preserve committed authority; delete only unstarted comparison work | preserve | preserve | preserve |
+| clear chat | preserve system/author; archive user constraints whose sole evidence is deleted | expire evidence-dependent stance and remove chat-derived fast state | delete group items/message projections; mark group redacted; cancel undelivered delivery and null payload; retain lineage/action IDs/receipt checksums | delete/reinitialize | preserve | preserve |
+| clear memory | preserve system/author and explicit user boundaries | expire memory-dependent stance and rebuild snapshot from persona/stage | preserve | preserve cursor | preserve | preserve |
+| delete Yuqi role | delete role rows | delete | delete role lineages/groups/items/actions/receipts/deliveries in FK-safe order after backup | delete | keep global release definitions; delete role rollout state | retain redacted audit |
 
 Withdrawn/deleted messages are removed from future retrieval; dependent stance/constraint records become released/archived through a new revision rather than being physically rewritten. Non-Yuqi lifecycle remains unchanged.
 
@@ -2427,7 +2997,7 @@ node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/ev
 node scripts/audit-yuqi-memory.mjs yuqi-runtime/config.json
 ```
 
-Expected: PASS; audit reports all v10 tables and no dangling message evidence.
+Expected: PASS; audit reports all v10/v11 tables, no dangling group/receipt/delivery/message authority, and no deleted message evidence remains retrievable.
 
 - [ ] **Step 5: Commit**
 
@@ -2954,8 +3524,8 @@ git commit -m "feat: control Yuqi stable candidate rollout by release"
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/race-report.json`
 
 **Interfaces:**
-- Consumes: delivery timestamps, cursor, lane, release/rollout, comparison, quality findings.
-- Produces: separate observable stages and a checksummed race report.
+- Consumes: turn, lineage, canonical group, commit receipt, group delivery, cursor, lane, release/rollout, comparison, and quality findings.
+- Produces: one joined authority chain, separate observable stages, and a checksummed race report.
 
 - [ ] **Step 1: Write red diagnostics tests**
 
@@ -2978,6 +3548,19 @@ test('diagnostics name release pair and lane authority', async () => {
   assert.equal(value.lane.key, 'private_chat');
   assert.equal(value.lane.revision, 8);
   assert.equal(value.visibleGroup.id, 'group-1');
+  assert.equal(value.authority.lineageKey, 'lineage-1');
+  assert.equal(value.authority.origin, 'pc');
+  assert.equal(value.authority.chainValid, true);
+  assert.equal(value.authority.commitChecksum, 'commit-sha256');
+  assert.equal(value.outbox.authorityGroupId, 'group-1');
+});
+
+test('diagnostics never fabricate authority from turn reply JSON', async () => {
+  corruptReceiptJoinWithoutChangingTurnProjection('turn-1');
+  const value = await diagnosticsFor('turn-1');
+  assert.equal(value.authority.chainValid, false);
+  assert.equal(value.visibleGroup, null);
+  assert.equal(value.authority.errorCode, 'VISIBLE_AUTHORITY_INVARIANT');
 });
 
 test('raw internal cognition text and private quality scenes are not exposed', async () => {
@@ -3000,7 +3583,12 @@ Expected: FAIL on missing release/lane/quality diagnostics.
 - [ ] **Step 3: Implement a sanitized diagnostic projection**
 
 ```js
-function projectTurnDiagnostics({ turn, delivery, lane, rollout, comparison, findings }) {
+function projectTurnDiagnostics({
+  turn, lineage, group, receipt, delivery, lane, rollout, comparison, findings
+}) {
+  const authority = validateVisibleAuthorityJoin({
+    turn, lineage, group, receipt, delivery, lane
+  });
   return {
     turnId: turn.turnId,
     kind: turn.rolloutKey,
@@ -3012,12 +3600,36 @@ function projectTurnDiagnostics({ turn, delivery, lane, rollout, comparison, fin
       pcAcceptedAt: turn.pcAcceptedAt
     },
     delivery: {
-      cloudConfirmed: Boolean(delivery.cloudConfirmedAt),
-      nativeCompleted: Boolean(delivery.nativeCompletedAt),
-      notificationShown: Boolean(delivery.notificationShownAt),
-      uiApplied: Boolean(delivery.uiAppliedAt)
+      cloudConfirmed: Boolean(delivery?.cloudConfirmedAt),
+      nativeCompleted: Boolean(delivery?.nativeCompletedAt),
+      notificationShown: Boolean(delivery?.notificationShownAt),
+      uiApplied: Boolean(delivery?.uiAppliedAt)
     },
-    visibleGroup: { id: turn.visibleGroupId, commitChecksum: turn.commitChecksum },
+    authority: authority.valid ? {
+      lineageKey: lineage.lineageKey,
+      lineageRevision: lineage.revision,
+      turnRevision: turn.turnRevision,
+      origin: receipt.authorityOrigin,
+      commitPayloadVersion: receipt.commitPayloadVersion,
+      commitChecksum: receipt.commitChecksum,
+      chainValid: true
+    } : {
+      lineageKey: turn.authorityLineageKey,
+      chainValid: false,
+      errorCode: 'VISIBLE_AUTHORITY_INVARIANT'
+    },
+    visibleGroup: authority.valid ? {
+      id: group.groupId,
+      authoritativeTurnId: group.authoritativeTurnId,
+      redacted: Boolean(group.redactedAt)
+    } : null,
+    outbox: authority.valid && delivery ? {
+      authorityGroupId: delivery.authorityGroupId,
+      peerId: delivery.peerId,
+      state: delivery.state
+    } : authority.valid && receipt.authorityOrigin === 'android_fallback'
+      ? { authorityGroupId: group.groupId, state: 'not_applicable_external_visibility' }
+      : null,
     lane: { key: lane.laneKey, revision: lane.revision, localSequence: lane.localSequence },
     pipeline: {
       authoritativeReleaseId: turn.authoritativeReleaseId,
@@ -3032,7 +3644,9 @@ function projectTurnDiagnostics({ turn, delivery, lane, rollout, comparison, fin
 }
 ```
 
-Android native diagnostics expose four stage timestamps, group/cursor IDs, local sequence, fallback contract, and last native error. Web displays each stage independently and never marks success merely because a notification has body text. PC exposes no prompt bodies, private scene text, secrets, or full cognitive chain.
+`diagnosticsFor()` performs the join from `turn.authority_lineage_key → turn_authority_lineages → visible_commit_receipts → visible_result_groups`, and for origin `pc` additionally requires matching `cloud_deliveries`. Origin `android_fallback` must have no PC delivery and reports `not_applicable_external_visibility`. It never reads `turn.reply_json` to obtain group/checksum and never reports a synthetic success when any key, revision, origin, release, lane or checksum disagrees. Legacy authority-version-0 turns are labeled `legacy_turn_identity`, not failed v3 joins.
+
+Android native diagnostics expose four stage timestamps, local authority lineage/group/checksum/origin/revisions, cursor IDs, local sequence, fallback contract, and last native error. Web displays each stage independently and never marks success merely because a notification has body text. PC exposes no prompt bodies, private scene text, secrets, or full cognitive chain.
 
 The transport projection is separate from delivery: `LOCAL_QUEUED`, `CLOUD_ACCEPTED`, `PC_ACCEPTED`, `COMPLETED`, and `UI_APPLIED` remain distinguishable. `BRIDGE_WAITING` is a persisted execution state corresponding to `CLOUD_ACCEPTED`; it is neither runnable nor fallback-eligible.
 
@@ -3052,9 +3666,14 @@ const raceCases = [
   'page_reload_before_ui_ack',
   'runtime_restart_before_visible_commit',
   'runtime_restart_after_visible_commit',
+  'original_retry_and_sibling_retry_compete',
+  'populated_v10_migrates_then_restarts_v11',
   'canary_rollback_while_turn_in_flight',
   'same_fingerprint_adjacent_revisions',
-  'cloud_waiting_does_not_block_next_local_turn'
+  'cloud_waiting_does_not_block_next_local_turn',
+  'ambiguous_remote_timeout_never_falls_back',
+  'android_fallback_receipt_syncs_without_pc_redelivery',
+  'pc_android_receipt_conflict_is_quarantined'
 ];
 ```
 
@@ -3069,7 +3688,7 @@ node --test yuqi-runtime/test/v3-diagnostics.test.mjs tests/yuqi-ui-contract.tes
 node scripts/verify-yuqi-v3-races.mjs --out artifacts/yuqi-lived-agency-v3/race-report.json
 ```
 
-Expected: tests PASS; all 13 race cases pass and report checksum is materialized.
+Expected: tests PASS; all 18 race cases pass and report checksum is materialized.
 
 - [ ] **Step 6: Commit**
 
@@ -3330,13 +3949,14 @@ Do not commit APK binaries to the source branch. Keep the formal APK under `arti
 **Files:**
 - Modify only through commands: production runtime database and rollout rows.
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/production-migration-report.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/production-migration-clone.sqlite`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/rollout-initialization.json`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/final-handoff.json`
 - Read only: all evidence from Tasks 0–26.
 
 **Interfaces:**
 - Consumes: ready source, formal APK, validated migration decisions, eligible quality report, release manifest.
-- Produces: production v10 state, stable-visible candidate shadow per kind, honest completion/handoff report.
+- Produces: production PC v11 state, stable-visible candidate shadow per kind, honest completion/handoff report.
 
 - [ ] **Step 1: Stop runtime cleanly, back up, and prove the source database matches the validated dry run**
 
@@ -3345,10 +3965,10 @@ Run:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/stop-yuqi-background.ps1
 node scripts/backup-yuqi-memory.mjs yuqi-runtime/config.json
-node scripts/migrate-yuqi-agency-state.mjs --config yuqi-runtime/config.json --dry-run --out artifacts/yuqi-lived-agency-v3/production-migration-report.json
+node scripts/migrate-yuqi-agency-state.mjs --config yuqi-runtime/config.json --dry-run --clone-out artifacts/yuqi-lived-agency-v3/production-migration-clone.sqlite --out artifacts/yuqi-lived-agency-v3/production-migration-report.json
 ```
 
-Expected: current database SHA/source decision checksum matches the validated basis or produces a new complete report with no structural count loss. If messages or state legitimately changed since Task 3, rerun clone validation against this new report before applying. Do not apply an old report to changed data.
+Expected: the raw backup is created before any new `YuqiStore` opens production; only the clone migrates to v11 during dry-run. Current database SHA/source decision checksum matches the validated basis or produces a new complete report with no structural count loss. The clone passes v11 invariant checks and restart-open checks. If messages or state legitimately changed since Task 3, rerun clone validation against this new report before applying. Do not apply an old report to changed data.
 
 - [ ] **Step 2: Apply migration atomically, audit, and restart on stable**
 
@@ -3361,7 +3981,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-yuqi-backg
 node scripts/verify-yuqi-runtime.mjs
 ```
 
-Expected: runtime healthy, database v10, current production stable release still visible, no candidate active, old unfinished turns resumable, and before/after structural counts preserved. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
+Expected: runtime healthy, PC database v11, current production stable release still visible, no candidate active, old authority-version-0 unfinished turns resumable on the legacy branch, and before/after structural counts preserved. Every new v3 turn has lineage authority. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
 
 - [ ] **Step 3: Register the same eligible v3 candidate for each rollout key in shadow**
 
@@ -3413,11 +4033,11 @@ During DIRECT_REPLY canary, the first ten new turns show v3 and run stable dry-r
 {
   "design": {"path": "", "commit": ""},
   "plan": {"path": "", "commit": ""},
-  "database": {"userVersion": 10, "backupPath": "", "backupSha256": "", "migrationReport": ""},
+  "database": {"userVersion": 11, "backupPath": "", "backupSha256": "", "migrationReport": ""},
   "protocol": {"cases": 270, "passed": 270, "reportPath": "", "sha256": ""},
   "quality": {"sentinelRuns": 72, "coverageRuns": 144, "historyRuns": 30,
     "eligible": true, "reportPath": "", "sha256": ""},
-  "races": {"cases": 13, "passed": 13, "reportPath": "", "sha256": ""},
+  "races": {"cases": 18, "passed": 18, "reportPath": "", "sha256": ""},
   "rollouts": [],
   "android": {"apkPath": "", "versionCode": 0, "versionName": "",
     "packageName": "com.siyi.al", "signerSha256": "", "apkSha256": "",
@@ -3443,7 +4063,7 @@ No source commit is expected in this task. Database changes and generated eviden
 Execute Tasks 0–27 in order. The central window may continue automatically after an ordinary red test becomes green. It must stop immediately when any of these is true:
 
 1. The baseline cannot identify the actual visible stable implementation and checksum.
-2. A v9/v10 or Room 10/11 migration loses or reclassifies data without exact evidence.
+2. A PC v9→10→11 or Android Room 10→11 migration loses or reclassifies data without exact evidence.
 3. A required TurnKind lacks an adapter, structural-action domain, or quality coverage.
 4. Android v3 fallback and PC v3 assign different authority or state meaning.
 5. A comparison path can commit a visible action, message, state, fact, outbox item, or notification.
@@ -3499,12 +4119,12 @@ After this design window amends the authoritative plan, the central window rerea
 ## Evidence Checklist Before Any “Finished” Claim
 
 - [ ] Baseline report identifies immutable current stable evidence.
-- [ ] PC v10 clone migration and production migration reports match their source database.
+- [ ] PC v10→v11 populated clone migration and production migration reports match their source database; old turns remain authority version 0 and no historical receipt was invented.
 - [ ] All 270 protocol cases pass and are labeled non-quality evidence.
 - [ ] 24×3 sentinel runs, 72×2 coverage runs, and 30 local-history runs are present.
 - [ ] Six-dimensional gate and pairwise stable/candidate comparison are eligible.
 - [ ] Every TurnKind and life planning has adapter, structured-domain, recovery, and rollout evidence.
-- [ ] All 13 lane/delivery/restart/head-of-line races pass.
+- [ ] All 18 lane/delivery/retry/fallback/restart/head-of-line races pass.
 - [ ] Android Room v11 migration, v1/v2/v3 fallback, event/poll/replay, and four delivery stages pass.
 - [ ] Full Node and Android test suites pass.
 - [ ] Production stable/candidate state is explicit; non-active kinds are listed.
