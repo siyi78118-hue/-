@@ -109,13 +109,17 @@ Use these exact public names throughout the plan. Later tasks must not silently 
 normalizeHardConstraint(value, evidenceIndex) -> HardConstraint
 transitionHardConstraint({ constraint, operation, authorityEvidence, now }) -> HardConstraint
 normalizePreference(value) -> Preference
+preferenceFromStableFact(fact) -> Preference
 normalizeCurrentStance(value, now) -> CurrentStance
-applyStanceTransitions({ stances, transitions, relevantBatch, now }) -> {
+applyStanceTransitions({ stances, transitions, relevantBatch, evidenceIndex, now }) -> {
   activeStances, changedRecords, auditRecords
 }
 compileAgencyView({ constraints, preferences, stances, featureContext, limits }) -> {
   hardConstraints, preferences, currentStances
 }
+validateStatePatchAgainstAgency({
+  patch, turn, cognitiveState, activeStances, currentBatch, evidenceIndex, effectiveAt
+}) -> { semanticPatch, nextState, stanceRevisionRows }
 
 // cognition-v3-contract.mjs
 normalizeCognitionV3Result(value, validationContext) -> CognitionV3Result
@@ -143,12 +147,17 @@ commitVisibleResult({ store, turnId, authorityLineageKey, laneKey,
 }) -> CommitVisibleResult
 
 // store.mjs result-authority creation boundary
+readAgencyAuthoritySnapshotInternal({ roleId, at }) -> {
+  version, roleId, constraints, preferenceFacts, stances,
+  cognitiveState: { revision, checksum }, checksum
+}
 createCanonicalVisibleTurnInternal({
   envelope, rolloutKey, expectedRolloutRevision, authoritativeReleaseId,
   comparisonReleaseId, comparisonDirection, laneKey, expectedLaneRevision,
   inputUserBatchId, inputVisibilitySequence, agencySnapshotChecksum,
   annotationSnapshot
-}) -> { status: 'created', turn } | { status: 'already_committed', receipt }
+}) -> { status: 'created', turn, agencySnapshot }
+   | { status: 'already_committed', receipt }
 
 // promotion-controller.mjs
 resolvePipelinePair(rollout) -> {
@@ -328,8 +337,9 @@ test('soften and reverse create revisions rather than mutating history', () => {
     relevantBatch: { messageIds: ['u2'], topics: ['gift_play'] },
     now: 2000
   });
-  assert.equal(result.changedRecords[0].status, 'superseded');
-  assert.equal(result.activeStances[0].supersedes, 's1');
+  assert.equal(result.changedRecords[0].status, 'active');
+  assert.equal(result.changedRecords[0].stanceId, 's1');
+  assert.equal(result.activeStances[0].supersedes, 's1@1');
   assert.equal(result.activeStances[0].revision, 2);
 });
 
@@ -394,9 +404,13 @@ export function normalizeCurrentStance(value, now = Date.now()) {
   };
 }
 
-export function applyStanceTransitions({ stances, transitions, relevantBatch, now }) {
+export function applyStanceTransitions({
+  stances, transitions, relevantBatch, evidenceIndex, now
+}) {
   validateTransitionCoverage(stances, transitions, relevantBatch);
-  return reduceTransitionsAppendOnly({ stances, transitions, relevantBatch, now });
+  return reduceTransitionsAppendOnly({
+    stances, transitions, relevantBatch, evidenceIndex, now
+  });
 }
 
 export function compileAgencyView({ constraints, preferences, stances, featureContext, limits }) {
@@ -404,7 +418,14 @@ export function compileAgencyView({ constraints, preferences, stances, featureCo
 }
 ```
 
-The implementation must reject missing transition coverage for every relevant active stance, reject `maintain` without fresh evidence, expire by time before ranking, decrement only when the submitted batch is relevant, cap extensions at three new relevant batches, and preserve superseded/expired records for audit.
+The implementation must reject missing transition coverage for every relevant
+active stance, reject `maintain` without fresh evidence, expire by time before
+ranking, decrement only when the submitted batch is relevant, cap extensions at
+three new relevant batches, and preserve every prior revision for audit.
+Non-create transitions retain the stable `stanceId`; their append-only head uses
+`supersedes: '<stanceId>@<previousRevision>'`. `changedRecords` contains the
+actual rows that can be inserted, never a rewritten copy of an already-persisted
+primary key.
 
 - [ ] **Step 4: Run state tests green**
 
@@ -1317,6 +1338,15 @@ test('a due commitment is postponed, not deleted', () => {
 test('fingerprint only deduplicates adjacent matching authority contexts', () => {
   assert.equal(generationFingerprint(fpInput()), generationFingerprint(fpInput()));
   assert.notEqual(generationFingerprint(fpInput()), generationFingerprint(fpInput({ laneRevision: 9 })));
+  const canonical = fpInput({ inputVisibilitySequence: 7 });
+  assert.equal(
+    generationFingerprint(canonical),
+    generationFingerprint({ ...canonical, laneRevision: 9 })
+  );
+  assert.notEqual(
+    generationFingerprint(canonical),
+    generationFingerprint({ ...canonical, inputVisibilitySequence: 8 })
+  );
 });
 ```
 
@@ -1347,8 +1377,12 @@ export function priorityForEnvelope(envelope) {
 }
 
 export function generationFingerprint(input) {
+  const authorityContextRevision =
+    Number.isSafeInteger(input.inputVisibilitySequence)
+      ? `visibility:${input.inputVisibilitySequence}`
+      : `lane:${input.laneRevision}`;
   return contentHash({
-    roleId: input.roleId, laneKey: input.laneKey, laneRevision: input.laneRevision,
+    roleId: input.roleId, laneKey: input.laneKey, authorityContextRevision,
     normalizedReply: normalizeVisibleText(input.visibleGroup),
     actionTargets: canonicalActionTargets(input.actionSet),
     contextRevision: input.contextRevision
@@ -1724,7 +1758,7 @@ createCanonicalVisibleTurnInternal({
   agencySnapshotChecksum,
   annotationSnapshot
 }) ->
-{ status: 'created', turn }
+{ status: 'created', turn, agencySnapshot }
 { status: 'already_committed', receipt }
 ```
 
@@ -1899,6 +1933,7 @@ export function commitVisibleResult(input) {
       roleId: authority.turn.characterId,
       laneKey: authority.turn.laneKey,
       laneRevision: authority.turn.laneRevision,
+      inputVisibilitySequence: authority.turn.inputVisibilitySequence,
       visibleGroup: input.visibleGroup,
       actionSet: input.actionSet,
       contextRevision: input.agencySnapshotChecksum
@@ -1964,6 +1999,627 @@ git add yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yu
 git commit -m "feat: add canonical Yuqi result authority"
 ```
 
+### Task 10A: Close v11 Restart Invariants and Migration CLI Safety
+
+**Why this repair gate exists:** Commit `b4715fb` passed its 105-test focused
+suite, but two independent counterexamples still succeed: a dry-run without a
+clone changes a source database from `user_version=0` to 11, and a version-1
+turn pointing at a nonexistent lineage survives close/reopen. Task 11 is
+forbidden until Tasks 10A–10C are green and committed.
+
+**Files:**
+- Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `scripts/migrate-yuqi-agency-state.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
+- Modify: `tests/yuqi-agency-state-migration.test.mjs`
+
+**Interfaces:**
+- Consumes: Task 10 schema v11 and its existing raw-v10 clone report.
+- Produces: exhaustive `assertVisibleAuthorityV11Invariants()`; a migration CLI
+  that cannot open a source in write mode during dry-run and cannot apply
+  without an approved report; `YuqiStore.openForMigration(path, {
+  expectedSourceVersion, expectedPostMigrationInvariantChecksum })` as the only
+  apply-mode entry that can compare the post-migration summary before commit.
+
+- [ ] **Step 1: Add red corruption-matrix and CLI no-mutation tests**
+
+Add direct database corruptions that are legal at the SQLite column level but
+must make the next `new YuqiStore(path)` throw:
+
+```js
+for (const [name, corrupt] of [
+  ['version-1 turn has no lineage row', db =>
+    db.prepare('DELETE FROM turn_authority_lineages').run()],
+  ['lineage latest turn root/role/lane does not join', mutateLineageIdentity],
+  ['committed group does not join receipt turn/release/origin', mutateGroupReceiptJoin],
+  ['receipt payload version does not match origin', mutateReceiptPayloadVersion],
+  ['committed turn/group fingerprints differ', mutateGroupFingerprint],
+  ['uncommitted version-1 turn already has fingerprint', seedOpenTurnFingerprint],
+  ['turn lineage and lane revision deltas are not exactly one', mutateReceiptDeltas],
+  ['PC receipt has no canonical delivery', deletePcDelivery],
+  ['delivery checksum differs from receipt', mutateDeliveryChecksum],
+  ['version-0 turn is attached to canonical lineage/group', attachLegacyTurn]
+]) {
+  test(`v11 reopen rejects ${name}`, () => withCommittedV11(path => {
+    corrupt(openRaw(path));
+    assert.throws(() => new YuqiStore(path), /v11 invariant/i);
+  }));
+}
+```
+
+Add CLI process tests:
+
+```js
+test('dry-run without a different clone refuses before opening source', () => {
+  const before = rawSnapshot(source);
+  const result = runMigration(['--database', source, '--dry-run']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /dry-run requires --clone-out/i);
+  assert.deepEqual(rawSnapshot(source), before);
+});
+
+test('apply without an approved report refuses before opening source', () => {
+  const before = rawSnapshot(source);
+  const result = runMigration(['--database', source, '--apply']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /apply requires --expect-report/i);
+  assert.deepEqual(rawSnapshot(source), before);
+});
+```
+
+The dry-run test must cover both `--database` and `--config`. Also prove
+`resolve(cloneOut) === resolve(source)` is rejected.
+
+- [ ] **Step 2: Run the new tests red**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/store-visible-authority-v11.test.mjs tests/yuqi-agency-state-migration.test.mjs
+```
+
+Expected: FAIL because the current invariant accepts orphan/cross-joined rows and
+the current CLI mutates an explicit `--database` dry-run source.
+
+- [ ] **Step 3: Implement exhaustive restart queries and pre-open CLI gates**
+
+`assertVisibleAuthorityV11Invariants()` must fail on every condition listed in
+Task 10 Step 5, not merely missing tables. Use one helper per invariant:
+
+```js
+function assertNoInvariantRow(db, code, sql) {
+  const row = db.prepare(sql).get();
+  if (row) throw new Error(`v11 invariant ${code}: ${JSON.stringify(row)}`);
+}
+```
+
+The query set must prove both directions of every join:
+
+- each version-1 turn joins exactly one lineage with the same role/lane/root
+  identity; the lineage's `latestTurnId` exists, points back to that lineage,
+  and is the sole current owner (older attempts may remain joined but are not
+  latest);
+- each committed lineage joins exactly one group and receipt; open/cancelled
+  lineages join none;
+- group, receipt, turn and lineage agree on IDs, role, lane, release and origin;
+- `pc → pc-visible-commit-v1` and
+  `android_fallback → android-fallback-commit-v1`;
+- every uncommitted/cancelled PC turn has null fingerprint; committed PC turn
+  and group fingerprints are equal and non-null;
+- receipt before/after turn and lineage revisions differ by exactly one; PC lane
+  revisions differ by one; cognitive-state before/after revisions are either
+  equal (no patch) or differ by one (validated patch); imported fallback lane
+  and cognitive-state revisions are null;
+- canonical delivery joins the same group/turn/peer/checksum; every PC receipt
+  has its required peer delivery; fallback receipt has no PC delivery;
+- no version-0 turn has lineage/group/receipt authority fields.
+
+Place these CLI gates before `rawDatabaseSnapshot()` is followed by any
+`YuqiStore` construction:
+
+```js
+if (dryRun && (!cloneOut || resolve(cloneOut) === sourceDatabase)) {
+  throw new Error('dry-run requires --clone-out different from source');
+}
+if (apply && !expectedPath) {
+  throw new Error('apply requires --expect-report');
+}
+```
+
+On apply, compare the raw source SHA, `user_version`, and structural counts from
+the approved report before constructing `YuqiStore`. A mismatch stops before
+mutation. The v11 invariant summary is computed inside the migration transaction
+and must equal the clone report before that transaction commits; it cannot be
+pretended to exist on the still-v10 source. Implement this through
+`YuqiStore.openForMigration(...)`; do not construct the ordinary auto-migrating
+store and compare only after it has already committed.
+
+- [ ] **Step 4: Run migration/invariant suites green**
+
+Run the Step 2 command plus:
+
+```powershell
+node --test yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs
+```
+
+Expected: PASS, including byte-identical source evidence for every refused
+command and every corruption rejected on reopen.
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add yuqi-runtime/src/store.mjs scripts/migrate-yuqi-agency-state.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs tests/yuqi-agency-state-migration.test.mjs
+git commit -m "fix: enforce v11 authority and migration invariants"
+```
+
+### Task 10B: Seal Canonical Creation and Every Version-1 Turn Mutation
+
+**Files:**
+- Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
+- Modify: `yuqi-runtime/test/store-agency-v10.test.mjs`
+- Create: `yuqi-runtime/test/canonical-turn-state.test.mjs`
+
+**Interfaces:**
+- Consumes: normalized protocol-v2 envelope, Task 9 lane derivation and Task 10
+  lineage/release pins.
+- Produces:
+
+```text
+claimCanonicalTurnInternal({ turnId, workerId, expectedTurnRevision }) -> turn
+advanceCanonicalTurnInternal({
+  turnId, expectedState, nextState, expectedTurnRevision, patch
+}) -> turn
+recordCanonicalTurnFailureInternal({
+  turnId, expectedState, expectedTurnRevision, failure
+}) -> turn
+requeueCanonicalFailedTurnInternal({
+  turnId, expectedTurnRevision, allowedFailureClass
+}) -> turn
+cancelCanonicalTurnInternal({
+  turnId, authorityLineageKey, expectedTurnRevision,
+  expectedLineageRevision, reasonCode
+}) -> { turn, lineage }
+```
+
+- [ ] **Step 1: Add red creation-authority and mutation-closure tests**
+
+Creation tests must prove zero side effects for:
+
+```js
+[
+  input => { input.envelope.characterId = 'other_role'; },
+  input => { input.rolloutKey = 'PROACTIVE_CHAT'; },       // envelope is DIRECT_REPLY
+  input => { input.laneKey = 'public_moment'; },
+  input => { input.inputUserBatchId = 'batch_forged'; },
+  input => { input.inputVisibilitySequence += 1; }         // v2 has no cursor
+]
+```
+
+Add retry tests that change an earlier current-batch bubble, attachment,
+message ordering or batch ID while preserving the final message; every case
+must fail before turn/lineage/lane mutation. A committed retry first validates
+the normalized envelope checksum, complete batch and derived lineage against
+the stored interaction, then returns the receipt before evaluating mutable
+lane/rollout/agency claims. It must not disclose an unrelated lineage receipt
+merely because a caller supplied its root ID.
+
+Add canary reservation tests: two fresh accepted turns receive distinct slots,
+`canary_started_count` increments transactionally, rollout CAS losers write
+nothing, and `canary_max_outstanding` cannot be exceeded. An exact replay and a
+version-1 retry consume no new slot. Outstanding is the rollout-owned value
+`canary_started_count - canary_completed_count - canary_failure_count`, not a
+count of comparison rows that do not exist until after an authoritative result
+commits.
+
+Add mutation closure:
+
+```js
+test('legacy mutation APIs cannot write a canonical turn', () => {
+  const turn = canonicalOpenTurn();
+  for (const call of [
+    () => store.claimTurnById(turn.turnId, 'worker'),
+    () => store.advanceTurn(turn.turnId, 'queued', 'memory_running'),
+    () => store.recoverFailedDraft(turn.turnId),
+    () => store.requeueTransientFailedTurn(turn.turnId)
+  ]) assert.throws(call, /canonical turn API required/i);
+});
+
+test('stale canonical revision cannot claim checkpoint fail requeue or cancel', () => {
+  const claimed = store.claimCanonicalTurnInternal({
+    turnId, workerId: 'worker', expectedTurnRevision: 1
+  });
+  assert.equal(claimed.turnRevision, 2);
+  assertEveryCanonicalMutationRejectsRevision(1);
+});
+```
+
+Superseding a version-1 proactive turn must atomically increment its turn
+revision, mark its open lineage `cancelled`, and make a later commit/retry fail.
+A model failure increments turn revision but leaves lineage `open/latest`, so
+one explicit retry may replace it.
+
+- [ ] **Step 2: Run state-boundary tests red**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/canonical-turn-state.test.mjs
+```
+
+Expected: FAIL because `b4715fb` trusts caller route/batch fields, does not
+reserve canary counters, and legacy state/supersession APIs mutate version-1
+turns without turn/lineage CAS.
+
+- [ ] **Step 3: Make store derive identity and close old mutation paths**
+
+Inside `createCanonicalVisibleTurnInternal()` independently require:
+
+```js
+assert.equal(envelope.characterId, 'yuqi');
+assert.equal(input.rolloutKey, envelope.kind);
+assert.equal(input.laneKey, laneKeyForEnvelope(envelope));
+assert.equal(input.inputUserBatchId,
+  envelope.context?.currentBatch?.batchId
+    ?? envelope.message?.messageId
+    ?? envelope.trigger?.triggerId);
+```
+
+For protocol v2, require `inputVisibilitySequence === lane.localSequence`.
+Protocol v3 monotonic advancement remains unreachable until Task 13 validates
+its cursor. Retry compares the complete normalized parent/current batch and
+message attachment structure by canonical hash.
+
+Fresh shadow/canary creation reserves rollout state in the same immediate
+transaction. Canary checks current outstanding work, increments
+`canary_started_count`, assigns one unique slot, and increments rollout
+revision. Retry inherits the parent slot and release pair without another
+reservation. A shadow creation verifies the pinned rollout revision/release pair
+under the same immediate transaction but does not increment canary counters.
+
+Every produced method above performs:
+
+```sql
+UPDATE turns
+SET ..., turn_revision = turn_revision + 1
+WHERE turn_id = ?
+  AND result_authority_version = 1
+  AND state = ?
+  AND turn_revision = ?;
+```
+
+Zero rows is an authority conflict. `claimTurn()` skips version-1 rows;
+`claimTurnById()`, `advanceTurn()`, failed-draft recovery and legacy requeue
+throw before writing when `resultAuthorityVersion=1`. Version-0 behavior and
+tests remain unchanged. `admitInteractionTurnInternal()` uses
+`cancelCanonicalTurnInternal()` for a version-1 superseded owner in the same
+outer transaction.
+
+- [ ] **Step 4: Run state and legacy compatibility suites green**
+
+Run Step 2 plus:
+
+```powershell
+node --test yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs
+```
+
+Expected: PASS; all canonical revisions are explicit and legacy turns retain
+their existing state machine.
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add yuqi-runtime/src/store.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/canonical-turn-state.test.mjs
+git commit -m "fix: close canonical turn mutation authority"
+```
+
+### Task 10C: Make Commit Checksums Semantic and Isolate the Group Outbox
+
+**Files:**
+- Modify: `yuqi-runtime/src/agency-state.mjs`
+- Modify: `yuqi-runtime/src/interaction-lanes.mjs`
+- Modify: `yuqi-runtime/src/visible-result-commit.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/src/result-outbox.mjs`
+- Modify: `yuqi-runtime/test/agency-state.test.mjs`
+- Modify: `yuqi-runtime/test/interaction-lanes.test.mjs`
+- Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
+- Modify: `yuqi-runtime/test/result-outbox.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
+
+**Interfaces:**
+- Consumes: current agency authority heads, authorized state patch, pinned
+  comparison release/direction and store-owned action-target revisions.
+- Produces:
+
+```text
+store.readAgencyAuthoritySnapshotInternal({ roleId, at }) -> {
+  version, roleId, constraints, preferenceFacts, stances,
+  cognitiveState: { revision, checksum }, checksum
+}
+validateStatePatchAgainstAgency({
+  patch, turn, cognitiveState, activeStances, currentBatch, evidenceIndex,
+  effectiveAt
+}) -> { semanticPatch, nextState, stanceRevisionRows }
+store.resolveCanonicalActionTargetInternal({ turn, action }) ->
+  { targetKey, targetRevision, authoritySource }
+```
+
+It also produces a semantic `pc-visible-commit-v1` checksum, default-deny
+action/state validation, and canonical-only group delivery methods with legacy
+isolation.
+
+- [ ] **Step 1: Add red semantic-authority tests**
+
+Add tests proving:
+
+1. `readAgencyAuthoritySnapshotInternal()` is stable under row/order changes,
+   contains every active constraint/stance head plus every cognitive-state
+   referenced verified `stable_preference` fact, and rejects a referenced fact
+   that is missing, suppressed, unverified or the wrong type;
+2. canonical creation recomputes that snapshot inside its transaction, rejects
+   a forged caller checksum with zero side effects, persists the computed
+   checksum, and returns the exact snapshot used by the model;
+3. changing an active constraint/stance/preference-evidence head or cognitive
+   state after creation invalidates an uncommitted result even when the caller
+   repeats the stored checksum; an open-turn recovery reports
+   `AGENCY_AUTHORITY_STALE`, while a committed exact replay still returns its
+   receipt;
+4. a state patch containing `hardConstraints`, new preference evidence,
+   foreign-role state, `slowState`, `mediumState`, an extra top-level key, stale
+   evidence, or an unsupported stance transition produces zero side effects;
+5. maintain/strengthen/soften/reverse append `revision+1` under the same
+   `stanceId`, expire appends a terminal head, create alone introduces a new
+   `stanceId`, and a reopened store returns only the latest active head;
+6. state commit supports both absent cognitive state (`0 → 1` insert) and an
+   existing state (`N → N+1` CAS), preserves slow/medium/body/attention, and can
+   change only fast mood/open-thread IDs plus validated stance heads;
+7. unknown action target kinds and stale revisions are rejected. Supported
+   resolvers cover conversation lane, current-batch message/payment, persisted
+   moment/comment/role-plan/occurrence input snapshots, PC life episode, current
+   relationship snapshot, and lineage-scoped create actions;
+8. a required shadow/canary compare job cannot be missing and must match the
+   turn's comparison release/direction; a stable turn rejects an injected job;
+9. canonical generation fingerprints use stable input visibility sequence rather
+   than retry-varying lane claim revision; changing only `turnId` or lane claim
+   revision keeps the fingerprint, while changing visibility sequence changes it;
+10. two retry attempts with the same semantic visible result, action/state/memory
+   descriptors and release pins produce the same canonical checksum even when
+   top-level or nested job `turnId`, job IDs, due times, worker IDs and
+   timestamps differ;
+11. changing any semantic field changes the checksum;
+12. item/action JSON containing forged `messageId`, `actionId`, `ordinal`,
+   `targetKey` or `targetRevision` cannot override deterministic projection
+   fields;
+13. every legacy `prepare/mark/confirm/recover` helper rejects a row whose
+   `authority_group_id` is non-null without mutation.
+
+- [ ] **Step 2: Run commit/outbox tests red**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/agency-state.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs
+```
+
+Expected: FAIL because the current checksum includes attempt `turnId` and raw
+job objects, current agency heads are neither constructed nor recomputed,
+stance revisions do not form a persistable stable-ID head chain, state patches
+are not validated, and legacy delivery methods can still address canonical rows
+by turn ID.
+
+- [ ] **Step 3: Canonicalize only semantic fields and revalidate store authority**
+
+`canonicalCommitPayload()` must use this shape:
+
+```js
+{
+  payloadVersion: 'pc-visible-commit-v1',
+  authorityOrigin: 'pc',
+  authorityLineageKey,
+  laneKey,
+  input: { userBatchId, visibilitySequence },
+  agency: { snapshotChecksum, cognitiveStateRevision },
+  releases: {
+    authoritativeReleaseId,
+    comparisonReleaseId,
+    comparisonDirection
+  },
+  generationFingerprint,
+  visibleItems: normalizedItemsWithoutCallerIdentity,
+  actions: canonicalActionDescriptors,
+  statePatch: normalizedCognitionV3StateIntent,
+  memoryJobs: canonicalMemoryJobDescriptors,
+  comparison: comparisonJob
+    ? {
+        jobType, comparisonReleaseId, comparisonDirection,
+        rolloutEvidenceEpoch, shadowEpoch, canaryEpoch, canarySlot,
+        annotationSnapshotChecksum, inputChecksum
+      }
+    : null
+}
+```
+
+It excludes attempt `turnId`, job IDs, due/created times, worker, diagnostics and
+raw traces, including those fields when nested in a job payload. The receipt
+separately retains `authoritativeTurnId`. `canonicalMemoryJobDescriptors` is a
+job-type allowlist, not `{...rawPayload}`: for `turn_consolidation` it contains
+only `jobType`, `cognitionPacketChecksum`, `resultingCognitiveStateChecksum` and
+the already-canonical lineage identity. Unknown memory/compare job types fail.
+
+Commit ordering is exact:
+
+1. default-deny normalize visible items, actions, cognition-v3 state intent,
+   memory descriptors and comparison descriptor without reading mutable current
+   state;
+2. compute the semantic checksum;
+3. if a receipt already exists, require exact origin/payload-version/checksum
+   and return it without revalidating mutable agency/rollout/lane state;
+4. otherwise load current authority, recompute the store-owned agency snapshot,
+   resolve action targets, derive the authorized state rows, validate comparison
+   pins, then execute the thirteen-write transaction.
+
+This ordering preserves idempotent receipt replay after the first commit has
+legitimately changed cognitive state, while still denying stale authority for a
+new commit.
+
+Before a new commit writes:
+
+- construct `agency-authority-v1` by canonicalizing all active constraint heads,
+  active stable-ID stance heads, the cognitive state's referenced
+  `stable_preference` fact rows, and cognitive-state revision/checksum. Sort by
+  stable ID/revision and exclude only non-semantic DB bookkeeping;
+- `preferenceFromStableFact(fact)` requires `fact.type ===
+  'stable_preference'`, `status === 'verified'`, and nonempty evidence; it maps
+  `preferenceId=factId`, `topic=fact.topic ?? fact.predicate`,
+  `value=fact.value ?? fact.object`, `weight=fact.weight ?? fact.confidence`,
+  and source message IDs, then forces `binding:false`;
+- recompute that snapshot during canonical creation and commit. The caller
+  checksum is only an optimistic expectation; the store-computed value is the
+  persisted authority. `createCanonicalVisibleTurnInternal()` returns the
+  computed snapshot with its turn;
+- run `validateStatePatchAgainstAgency()` against the exact raw cognition-v3
+  shape `{mood,currentStances,openThreads}`. Derive `effectiveAt` from the
+  canonical root input batch/trigger timestamp, not retry time or caller
+  `now`; clone the current schema-v2 state, preserve slow/medium and
+  fast body/attention, replace only fast mood/open-thread IDs, and use
+  `applyStanceTransitions()` to produce append-only stable-ID next revisions;
+- if cognitive state is absent and a patch exists, insert revision 1 with
+  `lastAuthorityGroupId`; otherwise CAS `N → N+1`. If no patch exists, leave
+  the revision unchanged;
+- resolve every action target through this closed registry:
+  `conversation`, `message/payment`, `moment/comment`,
+  `role_plan/role_occurrence`, `life_episode`, `relationship`, and
+  `lineage_create`. Database-owned targets use their current row revision or
+  checksum. Android-owned targets use the exact persisted validated envelope
+  snapshot revision/checksum, and the Android consumer must perform the final
+  local CAS. Unknown namespaces or missing targets fail;
+- validate compare presence/release/direction against the pinned turn;
+- strip/reject caller identity fields from visible items/actions.
+
+Comparison validation maps
+`legacy_authoritative_cognition_compare → shadow_cognition` and
+`cognition_authoritative_legacy_compare → active_canary_compare`; the job's
+comparison release, rollout evidence epoch, shadow/canary epoch and canary slot
+must equal the turn's pins. `annotationSnapshotChecksum` is recomputed from the
+turn's stored annotation snapshot, and `inputChecksum` from its normalized
+envelope plus pinned release/checksum fields. The caller cannot provide
+alternative epoch/input evidence.
+
+The agency snapshot descriptor is exact:
+
+```js
+{
+  version: 'agency-authority-v1',
+  roleId,
+  constraints: activeConstraints.map(x => ({
+    constraintId: x.constraintId, revision: x.revision,
+    authority: x.authority, kind: x.kind, subject: x.subject,
+    scope: x.scope, rule: x.rule, sourceMessageIds: x.sourceMessageIds,
+    sourceConfigRef: x.sourceConfigRef, releaseCondition: x.releaseCondition,
+    status: x.status, supersedes: x.supersedes
+  })).sort(byIdRevision),
+  preferenceFacts: resolvedPreferenceFacts.map(x => ({
+    factId: x.factId, type: x.type, subjectId: x.subjectId,
+    predicate: x.predicate, object: x.object,
+    sourceMessageIds: x.sourceMessageIds, status: x.status,
+    confidence: x.confidence, supersedes: x.supersedes,
+    checksum: x.checksum
+  })).sort(byFactId),
+  stances: activeStances.map(x => ({
+    stanceId: x.stanceId, revision: x.revision, topic: x.topic,
+    position: x.position, reason: x.reason, strength: x.strength,
+    flexibility: x.flexibility, sourceMessageIds: x.sourceMessageIds,
+    lastConfirmedAt: x.lastConfirmedAt, expiresAt: x.expiresAt,
+    remainingRelevantUserBatches: x.remainingRelevantUserBatches,
+    status: x.status, supersedes: x.supersedes
+  })).sort(byIdRevision),
+  cognitiveState: {
+    revision: cognitiveState?.revision ?? 0,
+    checksum: cognitiveState?.checksum ?? null
+  }
+}
+```
+
+`createdAt`, `updatedAt`, DB row order and prior `sourceTurnId` are excluded;
+evidence IDs, expiry and remaining-batch budget are semantic and included. Its
+`checksum` is `contentHash(descriptor)` and is returned alongside, not embedded
+inside itself.
+
+`normalizedItemsWithoutCallerIdentity` is a default-deny map of
+`content`, `speakerId`, `speakerType`, `recipientId`, `contentType`,
+normalized attachment references, and optional `replyToMessageId`. It rejects
+unknown fields and excludes `messageId`, group/turn IDs, ordinal, delivery/UI
+state, and all timestamps. `canonicalActionDescriptors` contains only
+`kind`, store-resolved `targetKey/targetRevision`, and a kind-validated semantic
+payload; it excludes action/group/turn IDs, ordinal and execution metadata.
+
+The action-kind registry is also closed:
+
+```js
+{
+  payment_accept: 'payment',
+  payment_decline: 'payment',
+  moment_create: 'lineage_create',
+  moment_like: 'moment',
+  moment_comment: 'moment',
+  moment_reply: 'comment',
+  role_plan_create: 'lineage_create',
+  role_plan_update: 'role_plan',
+  role_plan_cancel: 'role_plan',
+  role_plan_pause: 'role_plan',
+  role_plan_resume: 'role_plan',
+  role_plan_complete: 'role_plan',
+  life_episode_create: 'lineage_create',
+  life_episode_update: 'life_episode',
+  life_episode_cancel: 'life_episode',
+  relationship_transition: 'relationship'
+}
+```
+
+The existing cognition validators remain responsible for each payload's domain
+schema (amount/currency/payment parties, moment privacy/thread, role-plan
+operation, life timing/overlap, relationship evidence). Commit independently
+requires the action kind's target namespace to match this registry.
+
+Canonical target keys are respectively
+`conversation:<roleId>:<peerId>`, `message:<messageId>`,
+`payment:<messageId>`, `moment:<momentId>`, `comment:<commentId>`,
+`role_plan:<planId>`, `role_occurrence:<occurrenceId>`,
+`life_episode:<episodeId>`, `relationship:<roleId>`, and
+`lineage_create:<lineageKey>:<actionKind>`. A numeric authority revision is
+serialized as its base-10 string; an immutable input snapshot uses
+`sha256:<contentHash(canonicalTarget)>`. The trusted orchestrator constructs
+these descriptors from a normalized cognition action; model output cannot
+supply an arbitrary target key.
+
+When rebuilding bridge payload, spread stored semantic JSON first and assign
+deterministic `messageId/actionId/ordinal/kind/target` last.
+
+All legacy delivery/recovery SQL adds
+`AND authority_group_id IS NULL` or performs an explicit preflight rejection.
+Canonical rows are addressed only by `authority_group_id + peer_id +
+authority_commit_checksum`.
+
+- [ ] **Step 4: Run the complete Task 10 gate**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/agency-state.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/canonical-turn-state.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs tests/yuqi-agency-state-migration.test.mjs
+```
+
+Expected: PASS. Then rerun the two manual counterexamples: dry-run source
+`user_version` remains unchanged because the command refuses, and an orphan
+version-1 turn makes reopen fail.
+
+- [ ] **Step 5: Commit**
+
+```powershell
+git add yuqi-runtime/src/agency-state.mjs yuqi-runtime/src/interaction-lanes.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/result-outbox.mjs yuqi-runtime/test/agency-state.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs
+git commit -m "fix: enforce semantic visible result authority"
+```
+
 ### Task 11: Integrate v3, Lanes, Shadow, and Recovery in the Runtime
 
 **Files:**
@@ -1980,7 +2636,7 @@ git commit -m "feat: add canonical Yuqi result authority"
 - Create: `yuqi-runtime/test/v3-runtime-recovery.test.mjs`
 
 **Interfaces:**
-- Consumes: Tasks 2, 7, 9, and 10.
+- Consumes: Tasks 2, 7, 9, 10, 10A, 10B, and 10C.
 - Produces: one release-pinned execution path for all ten rollout keys; the first production call to `createCanonicalVisibleTurnInternal()` under the explicit eligibility rule below; receipt-derived bridge results; background comparisons created inside the authoritative result transaction only after the checksum is deterministic.
 
 - [ ] **Step 1: Write red orchestration tests for release direction and recovery**
@@ -2094,6 +2750,10 @@ const inputVisibilitySequence =
   Number.isSafeInteger(envelope.context?.visibilityCursor?.localSequence)
     ? envelope.context.visibilityCursor.localSequence
     : lane.localSequence;
+const agencyPreview = store.readAgencyAuthoritySnapshotInternal({
+  roleId: envelope.characterId,
+  at: canonicalInteractionAt(envelope)
+});
 const creation = store.createCanonicalVisibleTurnInternal({
   envelope,
   rolloutKey: envelope.kind,
@@ -2107,18 +2767,26 @@ const creation = store.createCanonicalVisibleTurnInternal({
     ?? envelope.message?.messageId
     ?? envelope.trigger?.triggerId,
   inputVisibilitySequence,
-  agencySnapshotChecksum: agencyView.checksum,
+  agencySnapshotChecksum: agencyPreview.checksum,
   annotationSnapshot
 });
 if (creation.status === 'already_committed') {
   return bridgeResultFromCommitReceipt(creation.receipt);
 }
 const turn = creation.turn;
-const execution = await executePinnedRelease(turn);
+const agencyView = compileAgencyView({
+  constraints: creation.agencySnapshot.constraints,
+  preferences: creation.agencySnapshot.preferenceFacts.map(preferenceFromStableFact),
+  stances: creation.agencySnapshot.stances,
+  featureContext: featureContextForEnvelope(envelope),
+  limits: { hardConstraints: 5, currentStances: 2, preferences: 4 }
+});
+const execution = await executePinnedRelease(turn, { agencyView });
 const outputFingerprint = generationFingerprint({
   roleId: turn.characterId,
   laneKey: turn.laneKey,
   laneRevision: turn.laneRevision,
+  inputVisibilitySequence: turn.inputVisibilitySequence,
   visibleGroup: execution.visibleGroup,
   actionSet: execution.actionSet,
   contextRevision: turn.agencySnapshotChecksum
@@ -2157,8 +2825,17 @@ an old creator and later mutate that turn to version 1.
 retry uses `releasePairPinnedByTurn(retryParent)` even if the rollout controller
 now reports a different phase or release. Add a recovery/race test that changes
 the rollout between original failure and retry and proves the retry retains the
-parent's release IDs/checksums/preset while still taking a fresh lane and agency
+parent’s release IDs/checksums/preset while still taking a fresh lane and agency
 snapshot.
+
+`agencyPreview.checksum` is only an optimistic CAS expectation. The model must
+receive `creation.agencySnapshot`, which the store recomputed inside the same
+turn-creation transaction; it must not receive the pre-read object after a race.
+`canonicalInteractionAt(envelope)` is the stable root batch/trigger time shared
+by retries. Recovery of an open canonical turn recomputes this snapshot and
+continues only when it equals `turn.agencySnapshotChecksum`; otherwise it records
+`AGENCY_AUTHORITY_STALE` and requires an explicit retry. There is no
+`agencyView.checksum` field.
 
 For protocol v2, `inputVisibilitySequence` is deliberately the lane snapshot,
 not a fabricated client cursor; add a test with a non-zero persisted lane

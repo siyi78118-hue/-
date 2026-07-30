@@ -586,6 +586,14 @@ wire protocol 版本与 PC 内部结果权威版本是两个独立维度：
 
 上述 rollout CAS 适用于 fresh original。version-1 retry 必须继承 parent turn 已固定的 rollout/release/checksum/comparison/preset，不得因期间发生晋级或回退而换模型；version-0 parent 的 retry 仍走旧兼容路径，缺失或损坏 parent 时停止而不是伪造 canonical lineage。相同未提交 turn 的 exact replay 不重复增加任何 revision；lineage 已提交时返回原 receipt，不受当前 rollout 变化影响。
 
+store 必须独立重算并核对 `roleId=yuqi`、`rolloutKey`、`laneKey`、`rootSourceId` 和 `inputUserBatchId`，不能把调用方传值当作路由权威。wire v2 没有 visibility cursor 时只允许等于持久 lane snapshot，不能借一个更大的数字推进游标；wire v3 到 Task 13 验证 cursor 后才允许单调前进。retry 必须逐项复用完整 normalized current batch，包括此前气泡、attachment、顺序和时间，不能只比较最后一条正文。
+
+canonical authority 不是一个只约束最终 commit 的新 API，而是对所有旧 mutation entrypoint 的封闭权限域。`claimTurn*`、turn stage/checkpoint、failure/requeue、lane supersession、user cancellation、failed-draft recovery 和 legacy delivery helper 遇到 version-1 turn/group 时，必须调用带 `turnRevision/lineageRevision` CAS 的 canonical API，或在写入前明确拒绝；任何旧方法都不能绕过 lineage/group authority。failure 保持 lineage open 供显式 retry，cancellation/supersession 把 open lineage CAS 为 cancelled，committed lineage 永远不可变。
+
+`agencySnapshotChecksum` 也不是调用方自报的摘要。store 在 canonical turn 创建事务内读取该角色所有 active constraint heads、当前 cognitive state 指向且仍为 verified/retrievable 的 `stable_preference` facts、当前 active stance heads，以及 cognitive-state revision/checksum，按稳定 ID/revision 排序后形成 `agency-authority-v1` snapshot。缺失、被压制或类型不符的 preference fact 使 snapshot 构造失败，不能静默丢掉。调用方只可提交预读 checksum 作为乐观期望；store 必须重算、核对、持久化其 checksum，并把同一 snapshot 返回给本轮 agency view。open turn 恢复时若当前 snapshot 已变化，不得拿新状态冒充旧输入继续生成，而是记录 `AGENCY_AUTHORITY_STALE` 并通过显式 retry 固定新 snapshot；已 committed 的 exact replay 仍直接返回原 receipt。
+
+current stance 使用一个稳定 `stanceId` 的 append-only revision 链。maintain/strengthen/soften/reverse 写入同一 `stanceId` 的 `revision+1` head；expire 写入同一链的 terminal head；create 才产生新 `stanceId`。下一 head 的 `supersedes` 固定写成 `<stanceId>@<previousRevision>`。旧 row 永不原地改写。`listActiveStances()` 只读取每个稳定 ID 的最大 revision，因此不能用一个新 stance ID 加“supersedes”却把旧 active head 留在查询结果中。
+
 #### 13.3.2 唯一可见结果与 receipt
 
 PC 数据库新增四组 canonical 记录：
@@ -595,7 +603,7 @@ PC 数据库新增四组 canonical 记录：
 - `visible_result_actions`：按 `groupId + ordinal` 唯一保存已授权结构化动作；
 - `visible_commit_receipts`：以 `lineageKey` 为主键，唯一关联 group、authoritative turn、authority origin、`commitPayloadVersion` 和 `commitChecksum`。
 
-group ID 和气泡/action ID 由当前合法 authority owner 按双方共享的版本化算法根据 lineage 与 ordinal 确定性生成，不接受模型输出、当前时间或临时随机 ID。PC `commitChecksum` 对规范化语义 payload 计算，包含 lineage、可见气泡、动作、状态 patch、记忆任务、可选 compare descriptor、release、输入可见游标和生成时权威 checksum；Android fallback 使用另一个明确版本的规范 payload。两者都排除时间戳、随机数和非语义日志。重复提交只有 origin、payload version 和 checksum 全部相同时才返回同一 receipt；同 lineage 的不同 payload 一律是 authority conflict。
+group ID 和气泡/action ID 由当前合法 authority owner 按双方共享的版本化算法根据 lineage 与 ordinal 确定性生成，不接受模型输出、当前时间或临时随机 ID。PC `commitChecksum` 对规范化语义 payload 计算，包含 lineage、可见气泡、动作、状态 patch、记忆任务的 allowlisted 语义 descriptor、可选 compare release/direction/epoch descriptor、release、输入可见游标和生成时权威 checksum；Android fallback 使用另一个明确版本的规范 payload。两者都排除 attempt `turnId`，以及 job payload 内嵌的 turn/worker/job ID、due/created 时间、随机数和非语义日志。不同 retry attempt 产生完全相同的语义结果时 checksum 必须相同；真正的语义变化才改变 checksum。重复提交只有 origin、payload version 和 checksum 全部相同时才返回同一 receipt；同 lineage 的不同 payload 一律是 authority conflict。
 
 `messages` 只是 group items 的聊天查询投影；`turn.replyJson` 只是兼容投影。它们都不能反推出新的 group ID 或 receipt，也不能成为第二事实源。
 
@@ -610,8 +618,12 @@ group ID 和气泡/action ID 由当前合法 authority owner 按双方共享的�
 - 当前 cognitive state revision 未变；
 - 当前 hard constraints、preference evidence、active stance heads 和 cognitive state 组成的 `agencySnapshotChecksum` 未变；
 - authoritative release pin 未变；
-- 动作对象仍有效；
+- 动作对象由 store-owned target resolver 重新读取数据库 row 或 turn 中持久化的、已验证 input snapshot 后仍有效且 revision 完全相等；未知 target kind 默认拒绝；Android-owned 对象还必须由手机端 action consumer 做最终本地 CAS；
+- state patch 经过 agency validator。validator 只接受 cognition-v3 的 `mood/currentStances/openThreads` 三个顶层字段，以当前 schema-v2 cognitive state 为基底，只能替换 `fastState.mood/openThreadIds`，并通过 `applyStanceTransitions()` 产生同一稳定 stance ID 的下一 revision；`slowState`、`mediumState`、硬约束、preference evidence、外部角色状态和任意额外字段都不能由模型 patch；
+- rollout 要求 compare 时，compare job 必须存在并精确匹配 pinned comparison release/direction；无需 compare 时不得塞入 job；
 - generation fingerprint 仍有权成为该 lane 的结果。
+
+action target registry 是封闭集合：`conversation:<roleId>:<peerId>`、`message:<messageId>`、`payment:<messageId>`、`moment:<momentId>`、`comment:<commentId>`、`role_plan:<planId>`、`role_occurrence:<occurrenceId>`、`life_episode:<episodeId>`、`relationship:<roleId>` 和 `lineage_create:<lineageKey>:<actionKind>`。PC-owned 对象从当前数据库 row 读取 revision/checksum；Android-owned 对象只能从 turn 中持久化的 validated input snapshot 读取，并以 `sha256:<canonical target hash>` 固定提交时的期望，手机 action consumer 再对 Room 当前 row 做最终 CAS。trusted orchestrator 从已验证 cognition action 构造 target descriptor，模型不能直接指定任意 key/revision。
 
 通过后依次写入 canonical group/items/actions、聊天消息投影、认知状态/stance revisions、证据记忆任务、可选 compare job、group-based outbox、lane CAS、lineage CAS、turn CAS 和 commit receipt。任一步失败全部回滚。
 
@@ -644,7 +656,7 @@ fallback 只在以下情况取得本地提交权：
 
 #### 13.3.6 group-based outbox
 
-旧 v1/v2 delivery 继续保留 `turnId + peerId` 兼容路径。所有 `resultAuthorityVersion=1` 的新结果只按 `authorityGroupId + peerId` 读取、租约、重试、确认和恢复；`turnId` 只是指向获胜 turn 的诊断字段。投递幂等键为 `groupId + peerId + commitChecksum`。因此 original/retry 即使有不同 turn ID，也不可能分别投递。
+旧 v1/v2 delivery 继续保留 `turnId + peerId` 兼容路径，但每个 legacy helper 必须以 `authorityGroupId IS NULL` 为前置条件并拒绝 canonical row。所有 `resultAuthorityVersion=1` 的新结果只按 `authorityGroupId + peerId` 读取、租约、重试、确认和恢复；`turnId` 只是指向获胜 turn 的诊断字段。投递幂等键为 `groupId + peerId + commitChecksum`。由 group/item/action join 生成桥接 payload 时，必须最后覆盖确定性 `messageId/actionId/ordinal/target`，禁止 item/action JSON 中的同名字段反向覆盖权威 identity。因此 original/retry 即使有不同 turn ID，也不可能分别投递。
 
 ### 13.4 可见游标
 
@@ -668,7 +680,7 @@ PC 不再以“已生成或已入云信箱”推测用户已经看见。
 
 ### 13.6 重复兜底
 
-同一角色、私聊通道、相邻 revision 和短时间内，使用正文、动作目标和上下文 revision 形成 `generationFingerprint`。自动与直接结果指纹完全相同且前一条尚未稳定落地时只允许一个成为权威。不得跨普通时间窗口模糊删除合理重复短句。
+同一角色、私聊通道、相邻 authority context 和短时间内，使用正文、动作目标和上下文 revision 形成 `generationFingerprint`。legacy turn 的 authority context 沿用 lane revision；canonical version-1 turn 使用稳定的 `inputVisibilitySequence`，不能使用每次 retry 都会变化的 lane claim revision。这样同一语义 retry 保持同一 fingerprint/checksum，而真正看过新内容后的回复会变化。自动与直接结果指纹完全相同且前一条尚未稳定落地时只允许一个成为权威。不得跨普通时间窗口模糊删除合理重复短句。
 
 被仲裁取消的回合不显示、不更新状态、不形成事实、不消耗普通 skip、不触发通知，也不计为模型质量失败。
 
@@ -828,6 +840,8 @@ PC schema 11 与 Android Room 11 是两个彼此独立的数据库版本域，�
 11. 生成前后对照报告。
 
 迁移必须事务化、幂等。现有 v10 数据库必须真实执行 10→11，不能只修改 9→10 分支。旧 turn 继续按 `resultAuthorityVersion=0` 的固定旧 schema 和旧 outbox 恢复；只有经新版内部编排显式创建的 canonical-authority turn 才使用 version 1。任何无法证明来源的历史结果不得反向合成 canonical receipt。
+
+CLI 安全边界是强制的：任何 `--dry-run` 都必须带不同于 source 的 `--clone-out`，无论 source 来自 `--config` 还是显式 `--database`；任何 `--apply` 都必须带已批准的 `--expect-report`。这两个条件在构造 `YuqiStore` 之前检查，失败时 source SHA、`user_version` 和表计数必须完全不变。apply 先以 raw read-only 方式核对 source SHA/version/count，再通过 migration-only store 入口在同一迁移事务提交前核对 clone 报告中的 post-migration invariant checksum；不能先让普通 auto-migrating constructor 提交后才比较。重启 invariant 不是“表存在且有几行”的健康检查，而是逐条证明 turn↔lineage↔group↔receipt↔delivery、origin/payload version、revision delta、fingerprint 和 legacy isolation 的完整联结；任一损坏都必须在 runtime 开始处理 turn 之前拒绝打开。
 
 ## 17. Android 与正式发布
 
