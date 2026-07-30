@@ -1407,7 +1407,7 @@ const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
 const NATIVE_BRIDGE_TIMEOUT_MS = 8000;
 const NATIVE_RECONCILE_TIMEOUT_MS = 12000;
 const NATIVE_TURN_APPLY_TIMEOUT_MS = 10000;
-const APP_BUILD_VERSION = '2026-07-30.107';
+const APP_BUILD_VERSION = '2026-07-30.108';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -3602,6 +3602,9 @@ function yuqiImmersiveProgressText(pending = {}) {
   const display = String(pending?.bridgeDisplayStage || pending?.displayStage || '').trim();
   if (display) return display;
   const stage = String(pending?.bridgeTechnicalStage || pending?.technicalStage || pending?.nativeState || '').toLowerCase();
+  if (!pending?.nativeAcceptedAt && !stage) return '正在把消息交给后台…';
+  if (stage === 'queued' || stage === 'pending') return '正在把消息送过去…';
+  if (stage.includes('bridge_waiting') || stage.includes('cloud_accepted')) return '消息已到云端，正在等待电脑接收…';
   if (stage.includes('memory')) return '正在翻一下我们以前说过的话…';
   if (stage.includes('supervisor') || stage.includes('approved') || stage.includes('committing')) return '快好了…';
   return '正在认真想…';

@@ -32,7 +32,7 @@ function withRegistry(run) {
 
 test('loads a checksummed immutable seed version', () => withRegistry(registry => {
   const current = registry.current();
-  assert.equal(current.version, '1.9.1');
+  assert.equal(current.version, '1.9.2');
   assert.match(current.checksum, /^[a-f0-9]{64}$/);
   assert.deepEqual(current.changedModules.sort(), ['brain', 'foundation', 'memory', 'supervisor']);
 }));
@@ -49,14 +49,14 @@ test('exposes cognition roles while preserving legacy turn role aliases', () => 
   assert.throws(() => normalizePresetRole('unknown'), /unknown preset role/);
 });
 
-test('schema 2 stores legacy and candidate versions without moving the current pointer', () => withRegistry((registry, store) => {
-  assert.equal(registry.current().version, '1.9.1');
+test('schema 2 stores immutable legacy, current, and candidate versions', () => withRegistry((registry, store) => {
+  assert.equal(registry.current().version, '1.9.2');
   assert.deepEqual(
     store.listPresetVersions().map((preset) => preset.version).sort(),
-    ['1.9.1', '2.0.0']
+    ['1.9.1', '1.9.2', '2.0.0']
   );
   assert.ok(store.getPresetVersion('2.0.0'));
-  assert.equal(store.getCurrentPresetVersion(), '1.9.1');
+  assert.equal(store.getCurrentPresetVersion(), '1.9.2');
 }));
 
 test('resolves the exact cognition candidate in deterministic module order', () => {
@@ -178,7 +178,7 @@ test('promotes an older current seed to the newer packaged preset version', () =
 
     const registry = new PresetRegistry({ presetDir, store, clock: () => 2000 });
 
-    assert.equal(registry.current().version, '1.9.1');
+    assert.equal(registry.current().version, '1.9.2');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
@@ -325,18 +325,18 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(proposal.status, 'proposed');
 
   const published = registry.publishVersion(proposal.proposalId);
-  assert.equal(published.version, '1.9.2');
-  assert.equal(published.parentVersion, '1.9.1');
+  assert.equal(published.version, '1.9.3');
+  assert.equal(published.parentVersion, '1.9.2');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 3);
+  assert.equal(store.listPresetVersions().length, 4);
 
   const rollback = registry.rollback('1.9.1');
-  assert.equal(rollback.version, '1.9.3');
-  assert.equal(rollback.parentVersion, '1.9.2');
+  assert.equal(rollback.version, '1.9.4');
+  assert.equal(rollback.parentVersion, '1.9.3');
   assert.equal(rollback.rollbackOf, '1.9.1');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 4);
+  assert.equal(store.listPresetVersions().length, 5);
 }));
 
 test('rejects annotations that try to inject hidden biography as known fact', () => withRegistry(registry => {

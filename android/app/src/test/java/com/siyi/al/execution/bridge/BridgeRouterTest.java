@@ -96,6 +96,24 @@ public class BridgeRouterTest {
         }
     }
 
+    @Test public void acceptedCloudHandoffNeverFallsBack() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeRouter router = router(
+            BridgeMode.CLOUD,
+            events,
+            value -> { throw new AssertionError("LAN must not run"); },
+            value -> { events.add("cloud"); throw new BridgeAcceptedException("cloud"); },
+            fallback("fallback", events)
+        );
+
+        try {
+            router.execute(submission());
+            throw new AssertionError("expected BridgeAcceptedException");
+        } catch (BridgeAcceptedException expected) {
+            assertEquals(Arrays.asList("mirror-user", "cloud"), events);
+        }
+    }
+
     @Test public void explicitFinalFailureMayAuthorizeTheLegacyFallback() throws Exception {
         List<String> events = new ArrayList<>();
         BridgeRouter router = router(

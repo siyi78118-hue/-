@@ -15,7 +15,17 @@ public final class TurnStateMachine {
         LEGAL.put(
             TurnState.MEMORY_RUNNING,
             EnumSet.of(
+                TurnState.BRIDGE_WAITING,
                 TurnState.MEMORY_DONE,
+                TurnState.FAILED_RETRYABLE,
+                TurnState.FAILED_FINAL,
+                TurnState.CANCELLED
+            )
+        );
+        LEGAL.put(
+            TurnState.BRIDGE_WAITING,
+            EnumSet.of(
+                TurnState.COMPLETED,
                 TurnState.FAILED_RETRYABLE,
                 TurnState.FAILED_FINAL,
                 TurnState.CANCELLED

@@ -1,10 +1,18 @@
 {
   "schemaVersion": 2,
-  "currentVersion": "1.9.1",
+  "currentVersion": "1.9.2",
   "candidateVersion": "2.0.0",
   "characterId": "yuqi",
   "versions": {
     "1.9.1": {
+      "modules": {
+        "foundation": "al-combined-rp.md",
+        "brain": "yuqi-core.md",
+        "memory": "memory-manager.md",
+        "supervisor": "supervisor-1.9.1.md"
+      }
+    },
+    "1.9.2": {
       "modules": {
         "foundation": "al-combined-rp.md",
         "brain": "yuqi-core.md",

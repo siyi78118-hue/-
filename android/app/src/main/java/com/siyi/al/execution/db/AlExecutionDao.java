@@ -362,6 +362,7 @@ public interface AlExecutionDao {
         String state = turn.state == null ? "" : turn.state;
         if (!("FAILED_RETRYABLE".equals(state) || "FAILED_FINAL".equals(state)
             || "INTERRUPTED".equals(state) || "CANCELLED".equals(state)
+            || "BRIDGE_WAITING".equals(state)
             || "COMPLETED".equals(state))) return false;
         if (!replyAlreadyStored) insertReplyParts(java.util.Collections.singletonList(part));
         if ("COMPLETED".equals(state) && replyAlreadyStored) return true;

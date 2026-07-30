@@ -11,6 +11,7 @@ public interface ExecutionEngineStore {
     ChatTurnEntity turn(String turnId);
     ExecutionAttemptEntity activeAttempt(String turnId);
     void markStage(String turnId, String attemptId, TurnState state, AttemptStage stage, long now);
+    void markBridgeWaiting(String turnId, String attemptId, String route, long now);
     void saveMemoryResult(String turnId, String attemptId, String memory, long now);
     void saveRawReply(String turnId, String attemptId, String rawReply, long now);
     void commitReply(String turnId, String attemptId, List<ReplyPartEntity> parts, long now);

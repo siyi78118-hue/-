@@ -137,9 +137,7 @@ public final class BridgeClient {
 
     public BridgeResult sendCloud(TurnSubmission submission) throws Exception {
         if (!config.hasCloud()) throw new BridgeFinalException("CLOUD_BRIDGE_NOT_CONFIGURED", true);
-        long deadline = deadline(submission);
         JSONObject wire = wireEnvelope(submission);
-        String wireTurnId = wire.getString("turnId");
         Encrypted encrypted = encrypt(wire.toString());
         String relayMessageId = "relay_" + sha256(submission.turnId).substring(0, 24);
         JSONObject enqueue = new JSONObject()
@@ -154,47 +152,12 @@ public final class BridgeClient {
             "POST", config.cloudUrl + "/bridge/enqueue", enqueue.toString(), bearerHeaders()
         );
         requireSuccess(enqueued, "cloud enqueue");
+        completeCloudHandoff();
+        throw new IllegalStateException("unreachable");
+    }
 
-        String encodedDevice = URLEncoder.encode(config.deviceId, "UTF-8");
-        String pollTarget = config.cloudUrl + "/bridge/poll?deviceId=" + encodedDevice
-            + "&direction=pc_to_phone&limit=50";
-        while (clock.now() < deadline) {
-            HttpResult polled = request("GET", pollTarget, "", bearerHeaders());
-            requireSuccess(polled, "cloud poll");
-            JSONArray messages = new JSONObject(polled.body).optJSONArray("messages");
-            if (messages != null) {
-                for (int index = 0; index < messages.length(); index += 1) {
-                    JSONObject item = messages.optJSONObject(index);
-                    if (item == null) continue;
-                    String plaintext;
-                    try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
-                    catch (Exception ignored) { continue; }
-                    JSONObject decoded = new JSONObject(plaintext);
-                    decoded.put("_relayMessageId", item.optString("messageId"));
-                    decoded.put("_deliveryRoute", "cloud");
-                    String decorated = decoded.toString();
-                    String disposition = classifyCloudResult(submission, decoded);
-                    if ("BACKLOG_COMMITTED".equals(disposition)) {
-                        processBacklogCommitted(decoded, decorated);
-                        continue;
-                    }
-                    if ("BACKLOG_FAILED".equals(disposition)) {
-                        acknowledgeCloud(item.optString("messageId"));
-                        continue;
-                    }
-                    BridgeTurnStatus status = BridgeTurnStatus.parse(decorated, wireTurnId);
-                    reportStatus(submission.turnId, status);
-                    acknowledgeRecovery(status);
-                    if (status.committed()) return status.toResult("cloud");
-                    if (status.failedFinal()) {
-                        acknowledgeCloud(item.optString("messageId"));
-                        throw new BridgeFinalException(status.errorCode, status.allowFallback);
-                    }
-                }
-            }
-            sleepForPoll(submission.turnId, deadline, config.cloudPollIntervalMs);
-        }
-        throw new BridgeDeadlineException(submission.turnId);
+    static void completeCloudHandoff() throws BridgeAcceptedException {
+        throw new BridgeAcceptedException("cloud");
     }
 
     public int drainCloudInbox() throws Exception {

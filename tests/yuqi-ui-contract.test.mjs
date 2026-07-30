@@ -10,6 +10,8 @@ const executionDao = readFileSync('android/app/src/main/java/com/siyi/al/executi
 const executionDatabase = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java', 'utf8');
 const chatTurnEntity = readFileSync('android/app/src/main/java/com/siyi/al/execution/db/ChatTurnEntity.java', 'utf8');
 const executionService = readFileSync('android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java', 'utf8');
+const notificationFactory = readFileSync('android/app/src/main/java/com/siyi/al/execution/AlNotificationFactory.java', 'utf8');
+const bridgeClient = readFileSync('android/app/src/main/java/com/siyi/al/execution/bridge/BridgeClient.java', 'utf8');
 const worker = readFileSync('tavern-app/sw-v11.js', 'utf8');
 const corePreset = readFileSync('tavern-app/lib/yuqi-core-preset.js', 'utf8');
 
@@ -319,14 +321,20 @@ test('native delivery diagnostics persist and expose four independent convergenc
   }
 });
 
-test('notification stage is recorded only after Android reports the notification as active', () => {
-  assert.match(executionService, /notificationWasPosted\(notificationId\)/);
+test('notification idempotency is persisted immediately after notify succeeds', () => {
   const delivery = executionService.slice(
     executionService.indexOf('NotificationManagerCompat.from(this).notify('),
     executionService.indexOf('private void confirmBridgeDelivery')
   );
-  assert.ok(delivery.indexOf('.notify(') < delivery.indexOf('notificationWasPosted(notificationId)'));
-  assert.ok(delivery.indexOf('notificationWasPosted(notificationId)') < delivery.indexOf('markNotificationShown'));
+  assert.ok(delivery.indexOf('.notify(') < delivery.indexOf('putBoolean(key, true)'));
+  assert.ok(delivery.indexOf('putBoolean(key, true)') < delivery.indexOf('markNotificationShown'));
+  assert.doesNotMatch(delivery, /if\s*\(notificationWasPosted\(notificationId\)\)/);
+  assert.doesNotMatch(executionService, /AlNotificationStatus\.inspect\(this\)\.healthy/);
+  const messageNotification = notificationFactory.slice(
+    notificationFactory.indexOf('Notification messageNotification('),
+    notificationFactory.indexOf('Notification progressNotification(')
+  );
+  assert.match(messageNotification, /setOnlyAlertOnce\(true\)/);
 });
 
 test('native completion event and polling share a bounded self-clearing reconciliation path', () => {
@@ -573,4 +581,23 @@ test('immersive bridge progress uses natural copy while diagnostics retain techn
   assert.match(plugin, /stageEffort/);
   assert.match(plugin, /stageElapsedMs/);
   assert.match(plugin, /totalElapsedMs/);
+});
+
+test('local queue and cloud handoff are not presented as remote model thinking', () => {
+  const progress = html.slice(
+    html.indexOf('function yuqiImmersiveProgressText'),
+    html.indexOf('function stableLegacyVisibleMessageId')
+  );
+  assert.match(progress, /正在把消息交给后台/);
+  assert.match(progress, /正在把消息送过去/);
+  assert.match(progress, /bridge_waiting|cloud_accepted/);
+});
+
+test('cloud enqueue hands off to the independent inbox drain without long polling', () => {
+  const sendCloud = bridgeClient.slice(
+    bridgeClient.indexOf('public BridgeResult sendCloud'),
+    bridgeClient.indexOf('public int drainCloudInbox')
+  );
+  assert.match(sendCloud, /requireSuccess\(enqueued,\s*"cloud enqueue"\)[\s\S]*completeCloudHandoff\(\)/);
+  assert.doesNotMatch(sendCloud, /bridge\/poll|while\s*\(clock\.now\(\)\s*<\s*deadline\)/);
 });

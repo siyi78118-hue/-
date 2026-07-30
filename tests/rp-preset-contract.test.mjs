@@ -101,9 +101,10 @@ test('第四轮让主动消息先判断沉默前因并把 skip 作为后备', ()
 test('第四轮按整个发送回合判断完整性并登记当前不可变预设版本', () => {
   assert.match(prompt, /完整性按整个发送回合判断/);
   assert.match(prompt, /同一回合内的多个气泡可以互相承接/);
-  assert.equal(presetManifest.currentVersion, '1.9.1');
+  assert.equal(presetManifest.currentVersion, '1.9.2');
   assert.equal(presetManifest.candidateVersion, '2.0.0');
   assert.ok(presetManifest.versions['1.9.1']);
+  assert.ok(presetManifest.versions['1.9.2']);
   assert.ok(presetManifest.versions['2.0.0']);
 });
 

@@ -6,6 +6,7 @@ import static org.junit.Assert.assertTrue;
 import com.siyi.al.execution.api.ParsedReply;
 import com.siyi.al.execution.api.ReplyParser;
 import com.siyi.al.execution.bridge.BridgeResult;
+import com.siyi.al.execution.bridge.BridgeAcceptedException;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
@@ -132,6 +133,26 @@ public class ExecutionEngineTest {
         assertEquals(1, gateway.bridgeCalls);
         assertEquals(0, gateway.legacyCalls);
         assertEquals(TurnState.COMPLETED.name(), store.turn.state);
+    }
+
+    @Test
+    public void acceptedCloudHandoffBecomesWaitingAndReleasesTheDrain() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) throws Exception {
+                throw new BridgeAcceptedException("cloud");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("legacy must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L).runNext());
+
+        assertEquals(TurnState.BRIDGE_WAITING.name(), store.turn.state);
+        assertEquals("cloud-accepted", String.join(",", store.events));
+        assertEquals(null, store.claimNext(101L));
     }
 
     @Test
@@ -397,6 +418,12 @@ public class ExecutionEngineTest {
             attempt.memoryResult = memory;
             turn.state = TurnState.MEMORY_DONE.name();
             attempt.state = TurnState.MEMORY_DONE.name();
+        }
+
+        @Override public void markBridgeWaiting(String turnId, String attemptId, String route, long now) {
+            events.add(route + "-accepted");
+            turn.state = TurnState.BRIDGE_WAITING.name();
+            attempt.state = TurnState.BRIDGE_WAITING.name();
         }
 
         @Override public void saveRawReply(String turnId, String attemptId, String rawReply, long now) {

@@ -55,9 +55,12 @@ public final class BridgeRouter {
 
         boolean fallbackAuthorized = !config.enabled;
         BridgePendingException pending = null;
+        BridgeAcceptedException accepted = null;
         BridgeFinalException blockedFinal = null;
         for (Exception failure : failures) {
-            if (failure instanceof BridgePendingException) {
+            if (failure instanceof BridgeAcceptedException) {
+                accepted = (BridgeAcceptedException) failure;
+            } else if (failure instanceof BridgePendingException) {
                 pending = (BridgePendingException) failure;
             } else if (failure instanceof BridgeDeadlineException) {
                 fallbackAuthorized = true;
@@ -69,6 +72,10 @@ public final class BridgeRouter {
                 // Legacy route clients predate explicit failure categories.
                 fallbackAuthorized = true;
             }
+        }
+        if (accepted != null) {
+            for (Exception failure : failures) if (failure != accepted) accepted.addSuppressed(failure);
+            throw accepted;
         }
         if (blockedFinal != null && !fallbackAuthorized) throw blockedFinal;
         if (pending != null && !fallbackAuthorized) {
