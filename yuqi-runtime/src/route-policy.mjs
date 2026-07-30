@@ -29,6 +29,26 @@ function collectDeepReasons(text, recentMessages) {
   return [...new Set(reasons)];
 }
 
+function collectStructuralDeepReasons(envelope) {
+  const context = envelope?.context || {};
+  const signals = context.routeSignals || {};
+  const reasons = [];
+  if (context.payment) reasons.push('payment_as_social_action');
+  if (context.moment || context.targetMoment || context.rolePlan || context.occurrence) {
+    reasons.push('structured_action');
+  }
+  if ((signals.relevantStanceIds || []).length || signals.stanceTransition) {
+    reasons.push('stance_reconsideration');
+  }
+  if (signals.relationshipTest) reasons.push('relationship_test');
+  if (signals.conflictOrRepair) reasons.push('conflict_or_repair');
+  if (signals.jealousyOrAffection) reasons.push('jealousy_or_affection');
+  if (signals.userCorrection) reasons.push('user_correction');
+  if (signals.multiplePlausibleMeanings) reasons.push('multiple_plausible_meanings');
+  if (signals.relationshipChange) reasons.push('relationship_change');
+  return reasons;
+}
+
 export function selectTurnRoute({ envelope, recentMessages = [] }) {
   if (!envelope || typeof envelope !== 'object') throw new Error('envelope is required');
   if (envelope.kind && envelope.kind !== 'DIRECT_REPLY') {
@@ -36,9 +56,12 @@ export function selectTurnRoute({ envelope, recentMessages = [] }) {
   }
   const currentBatch = resolveCurrentUserBatch(envelope, recentMessages);
   const text = String(currentBatch?.combinedText || envelope.message?.content || '').trim();
-  const reasons = collectDeepReasons(text, recentMessages);
+  const reasons = [
+    ...collectDeepReasons(text, recentMessages),
+    ...collectStructuralDeepReasons(envelope)
+  ];
   if (currentBatch && !currentBatch.complete) reasons.push('incomplete_current_batch');
-  return { route: reasons.length ? 'deep' : 'fast', reasons };
+  return { route: reasons.length ? 'deep' : 'fast', reasons: [...new Set(reasons)] };
 }
 
 export function roleExecutionProfile(route, role, configuredProfiles = DEFAULT_PROFILES) {

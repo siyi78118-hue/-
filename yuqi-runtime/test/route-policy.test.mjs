@@ -107,6 +107,40 @@ test('proactive task selects the deep route', () => {
   assert.equal(selectTurnRoute({ envelope: proactive(), recentMessages: [] }).route, 'deep');
 });
 
+test('structured payment and explicit social ambiguity route deep without keyword matching', () => {
+  const paymentEnvelope = direct('给你');
+  paymentEnvelope.context = {
+    payment: { messageId: 'pay_1', kind: 'redpacket', amount: 20 }
+  };
+  assert.ok(selectTurnRoute({
+    envelope: paymentEnvelope,
+    recentMessages: []
+  }).reasons.includes('payment_as_social_action'));
+
+  const ambiguousEnvelope = direct('行啊');
+  ambiguousEnvelope.context = {
+    routeSignals: { multiplePlausibleMeanings: true }
+  };
+  assert.ok(selectTurnRoute({
+    envelope: ambiguousEnvelope,
+    recentMessages: []
+  }).reasons.includes('multiple_plausible_meanings'));
+});
+
+test('a relevant temporary stance or relationship transition routes deep structurally', () => {
+  const stanceEnvelope = direct('那继续吧');
+  stanceEnvelope.context = {
+    routeSignals: {
+      relevantStanceIds: ['stance_1'],
+      relationshipChange: true
+    }
+  };
+  const decision = selectTurnRoute({ envelope: stanceEnvelope, recentMessages: [] });
+  assert.equal(decision.route, 'deep');
+  assert.ok(decision.reasons.includes('stance_reconsideration'));
+  assert.ok(decision.reasons.includes('relationship_change'));
+});
+
 test('role profiles implement the approved model matrix', () => {
   assert.deepEqual(roleExecutionProfile('fast', 'memory'), { model: 'gpt-5.6-terra', effort: 'medium' });
   assert.deepEqual(roleExecutionProfile('fast', 'brain'), { model: 'gpt-5.6-sol', effort: 'medium' });

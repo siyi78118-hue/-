@@ -247,3 +247,25 @@ export async function buildCognitionContext({
   };
   return trimToLimit(context, Math.max(1, Number(maxCharacters) || 80_000));
 }
+
+export async function buildCognitionV3Input(input) {
+  const context = await buildCognitionContext(input);
+  const roleId = String(input.envelope?.characterId || '');
+  return {
+    ...input,
+    currentBatch: context.currentBatch,
+    relevantHistory: context.recentMessages,
+    verifiedFacts: context.memoryItems.filter((item) => item.kind === 'pc_verified_fact'),
+    constraints: typeof input.store?.listActiveConstraints === 'function'
+      ? input.store.listActiveConstraints(roleId)
+      : (input.constraints || []),
+    preferences: input.preferences || [],
+    stances: typeof input.store?.listActiveStances === 'function'
+      ? input.store.listActiveStances(roleId, input.now || Date.now())
+      : (input.stances || []),
+    relationship: input.scene?.relationshipStage || input.relationship || null,
+    lifeSignals: input.lifeSignals || (context.lifeContext ? [context.lifeContext] : []),
+    socialExperience: context.socialLessons,
+    openThreads: context.openThreads
+  };
+}

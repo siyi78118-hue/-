@@ -4,12 +4,32 @@ import {
   normalizeCognitionResult,
   normalizeExpressionResult
 } from './cognition-contract.mjs';
-import { buildCognitionContext } from './cognition-context.mjs';
+import {
+  compileCognitionPacketV3,
+  compileExpressionBriefV3,
+  materializeV3Draft,
+  normalizeCognitionV3Result,
+  normalizeExpressionV3Result
+} from './cognition-v3-contract.mjs';
+import { buildCognitionEnvelopeV3 } from './cognition-v3-adapters.mjs';
+import { buildCognitionContext, buildCognitionV3Input } from './cognition-context.mjs';
 import {
   COGNITION_SCHEMA_V2,
-  EXPRESSION_SCHEMA_V2
+  COGNITION_SCHEMA_V3,
+  EXPRESSION_SCHEMA_V2,
+  EXPRESSION_SCHEMA_V3
 } from './role-schemas.mjs';
 import { resolveRelationshipStage } from './relationship-stage.mjs';
+
+const COGNITION_FAST_ROUTE_SCHEMA_V3 = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  required: ['routeDecision', 'cognitionResult'],
+  properties: {
+    routeDecision: { type: 'string', enum: ['fast', 'deep'] },
+    cognitionResult: COGNITION_SCHEMA_V3
+  }
+});
 
 function parseObject(response, role) {
   const text = String(response?.text ?? response ?? '').trim();
@@ -46,6 +66,206 @@ function executionProfile(route, role) {
       : { model: 'gpt-5.6-sol', effort: 'medium' };
   }
   return { model: 'gpt-5.6-sol', effort: 'medium' };
+}
+
+function objectResult(value, role) {
+  if (value && typeof value === 'object' && !Array.isArray(value) && value.text === undefined) {
+    return value;
+  }
+  return parseObject(value, role);
+}
+
+function v3MessageIds(envelope) {
+  return [
+    ...(envelope?.currentInteraction?.messages || []),
+    ...(envelope?.relevantHistory || [])
+  ].map((message) => String(message?.messageId || '')).filter(Boolean);
+}
+
+function v3AllowedTargets(envelope) {
+  const feature = envelope?.featureContext || {};
+  return {
+    paymentMessageId: feature.payment?.messageId || null,
+    momentId: feature.targetMoment?.momentId || null,
+    commentId: feature.targetComment?.commentId || null,
+    rolePlanId: feature.rolePlan?.rolePlanId || null,
+    occurrenceId: feature.occurrence?.occurrenceId || null
+  };
+}
+
+function checkpointFromStore(store, turnId) {
+  return store?.getTurnCheckpoint?.(turnId) || {};
+}
+
+function persistV3Checkpoint(store, turn, packet) {
+  if (typeof store?.saveCognitionCheckpointInternal === 'function') {
+    store.saveCognitionCheckpointInternal(turn.turnId, packet);
+    return;
+  }
+  const current = store?.getTurn?.(turn.turnId);
+  if (!current || current.memoryPacketJson || typeof store?.advanceTurn !== 'function') return;
+  let state = current.state;
+  if (state === 'queued') {
+    store.advanceTurn(turn.turnId, 'queued', 'memory_running');
+    state = 'memory_running';
+  }
+  if (state === 'memory_running') {
+    store.advanceTurn(turn.turnId, 'memory_running', 'memory_done', {
+      memoryPacketJson: JSON.stringify({
+        packetType: 'cognition-v3',
+        cognitionEnvelope: packet.envelope,
+        cognitionPacket: packet
+      })
+    });
+  }
+}
+
+function storedV3Checkpoint(store, turn) {
+  const direct = checkpointFromStore(store, turn.turnId);
+  if (direct?.cognitionPacket?.schemaVersion === 3) return direct;
+  const current = store?.getTurn?.(turn.turnId);
+  if (!current?.memoryPacketJson) return direct;
+  try {
+    const parsed = JSON.parse(current.memoryPacketJson);
+    return parsed?.packetType === 'cognition-v3' ? parsed : direct;
+  } catch {
+    return direct;
+  }
+}
+
+function rolePayload({ turn, system, task, content }) {
+  return {
+    turnId: turn.turnId,
+    authoritativeReleaseId: turn.authoritativeReleaseId || null,
+    system,
+    task,
+    ...content
+  };
+}
+
+export async function runCognitionV3Turn(input) {
+  const startedAt = input.now?.() ?? Date.now();
+  const outerDeadlineMs = Math.max(1, Number(input.outerDeadlineMs) || 300_000);
+  const checkpoint = storedV3Checkpoint(input.store, input.turn);
+  let cognitionEnvelope = checkpoint.cognitionEnvelope
+    || checkpoint.cognitionPacket?.envelope
+    || input.cognitionEnvelope
+    || null;
+  if (!cognitionEnvelope) {
+    const loaded = input.contextLoader?.load
+      ? await input.contextLoader.load(input)
+      : await buildCognitionV3Input(input.contextInput || input);
+    cognitionEnvelope = buildCognitionEnvelopeV3(loaded);
+  }
+
+  let cognitionPacket = checkpoint.cognitionPacket || null;
+  if (!cognitionPacket) {
+    const fastResponse = objectResult(await input.client.runRole(
+      'cognition_fast',
+      rolePayload({
+        turn: input.turn,
+        system: input.presetBundles?.cognition || '',
+        task: 'understand_and_decide_v3',
+        content: { cognitionEnvelope }
+      }),
+      {
+        deadlineMs: 45_000,
+        outerDeadlineMs,
+        outputSchema: COGNITION_FAST_ROUTE_SCHEMA_V3,
+        model: 'gpt-5.6-terra',
+        effort: 'medium'
+      }
+    ), 'cognition_fast');
+    let cognitionCandidate = fastResponse.cognitionResult || fastResponse;
+    if (fastResponse.routeDecision === 'deep' || fastResponse.requiresDeepCognition === true) {
+      const deepResponse = objectResult(await input.client.runRole(
+        'cognition_deep',
+        rolePayload({
+          turn: input.turn,
+          system: input.presetBundles?.cognition || '',
+          task: 'reconsider_and_decide_v3',
+          content: {
+            cognitionEnvelope,
+            priorFastResult: cognitionCandidate
+          }
+        }),
+        {
+          deadlineMs: 120_000,
+          outerDeadlineMs,
+          outputSchema: COGNITION_SCHEMA_V3,
+          model: 'gpt-5.6-sol',
+          effort: 'medium'
+        }
+      ), 'cognition_deep');
+      cognitionCandidate = deepResponse.cognitionResult || deepResponse;
+    }
+    const cognitionResult = normalizeCognitionV3Result(cognitionCandidate, {
+      validMessageIds: v3MessageIds(cognitionEnvelope),
+      envelope: {
+        ...cognitionEnvelope,
+        kind: cognitionEnvelope.turnKind
+      },
+      relevantStances: cognitionEnvelope.currentStances || [],
+      allowedActions: cognitionEnvelope.allowedActions || [],
+      allowedActionTargets: v3AllowedTargets(cognitionEnvelope),
+      scene: input.scene || {}
+    });
+    cognitionPacket = compileCognitionPacketV3({
+      envelope: cognitionEnvelope,
+      cognitionResult
+    });
+    persistV3Checkpoint(input.store, input.turn, cognitionPacket);
+  }
+
+  const agencyView = {
+    hardConstraints: cognitionEnvelope.hardConstraints || [],
+    preferences: cognitionEnvelope.preferences || [],
+    currentStances: cognitionEnvelope.currentStances || []
+  };
+  const expressionBrief = compileExpressionBriefV3({
+    envelope: cognitionEnvelope,
+    agencyView,
+    relationship: cognitionEnvelope.relationshipBasePhase || {},
+    cognitionResult: cognitionPacket.cognitionResult
+  });
+  const expressionRaw = objectResult(await input.client.runRole(
+    'expression_v3',
+    rolePayload({
+      turn: input.turn,
+      system: input.presetBundles?.expression || '',
+      task: 'express_authorized_decision_v3',
+      content: { expressionBrief }
+    }),
+    {
+      deadlineMs: 60_000,
+      outerDeadlineMs,
+      outputSchema: EXPRESSION_SCHEMA_V3,
+      model: 'gpt-5.6-sol',
+      effort: 'medium'
+    }
+  ), 'expression_v3');
+  const expressionResult = normalizeExpressionV3Result(expressionRaw);
+  const draft = materializeV3Draft({ cognitionPacket, expressionResult });
+  const visibleCompletedAt = input.now?.() ?? Date.now();
+  if (typeof input.queueShadow === 'function') {
+    Promise.resolve(input.queueShadow({
+      turn: input.turn,
+      cognitionEnvelope,
+      cognitionPacket,
+      draft
+    })).catch((error) => input.onBackgroundError?.(error));
+  }
+  return {
+    cognitionPacket,
+    expressionResult,
+    draft,
+    checkpoints: {
+      cognition: cognitionPacket.packetChecksum,
+      expression: draft.draftChecksum
+    },
+    timings: { startedAt, visibleCompletedAt },
+    shadowState: typeof input.queueShadow === 'function' ? 'queued' : 'none'
+  };
 }
 
 export class CognitivePipeline {

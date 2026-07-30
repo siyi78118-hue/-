@@ -5,6 +5,13 @@ import { createInterface } from 'node:readline';
 import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 
 const ROLES = new Set(['memory', 'brain', 'supervisor']);
+const PIPELINE_ROLE_THREADS = Object.freeze({
+  cognition_fast: 'memory',
+  cognition_deep: 'memory',
+  expression_v3: 'brain',
+  supervisor_v3: 'supervisor',
+  consolidation_v3: 'memory'
+});
 
 export class CodexProtocolError extends Error {
   constructor(message, details = null) {
@@ -283,6 +290,24 @@ export class CodexAppServerClient {
     });
     this.roleQueues.set(role, tail);
     return current;
+  }
+
+  runRole(role, payload, options = {}) {
+    const sessionRole = PIPELINE_ROLE_THREADS[String(role || '')];
+    if (!sessionRole) return Promise.reject(new Error(`unknown pipeline role: ${role}`));
+    const { deadlineMs, outerDeadlineMs, ...turnOptions } = options;
+    return this.runTurn(sessionRole, payload, {
+      ...turnOptions,
+      clientUserMessageId: turnOptions.clientUserMessageId
+        || `${String(payload?.turnId || 'yuqi')}_${role}_${randomUUID()}`,
+      turnTimeoutMs: Math.max(
+        1,
+        Math.min(
+          Number(deadlineMs) || this.turnTimeoutMs,
+          Number(outerDeadlineMs) || Number.MAX_SAFE_INTEGER
+        )
+      )
+    });
   }
 
   async runTurnInternal(role, input, options) {
