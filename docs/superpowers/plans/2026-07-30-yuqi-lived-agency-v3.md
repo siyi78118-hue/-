@@ -15,6 +15,7 @@
 - The authoritative design above wins over older cognition-v2 plans wherever they conflict.
 - Do not add production special cases for red packets, kisses, recharge jokes, or any individual sentence. Fix the general social-state mechanism.
 - Preserve direct chat, payments, images, voice, emoji, quotes, multi-bubble batches, proactive chat, proactive moments, moment interaction/reply, role plans, life planning, relationship stages, memory, notifications, recovery, diagnostics, export/import/backup/delete, and Android fallback.
+- Preserve the existing Android cloud-queue convergence state machine: `LOCAL_QUEUED → CLOUD_ACCEPTED/BRIDGE_WAITING → PC_ACCEPTED → COMPLETED → UI_APPLIED`. A cloud-accepted turn releases the single drain thread, is completed by inbox recovery, and is never re-enqueued merely because the app restarts.
 - A user stages multiple bubbles and explicitly submits one complete batch. Never add a timer that waits for more user bubbles after submission.
 - Keep ordinary visible replies near one minute; five minutes is the hard user-facing limit. Shadow comparison and consolidation never block the visible path.
 - `responseRisks` are current-turn evidence only. They never become `forbiddenMoves`, hard constraints, preferences, or persistent stances.
@@ -1933,6 +1934,8 @@ async function getYuqiVisibilityCursor(characterId) {
 
 `queueAndroidUserReply()` reads the cursor, then builds one task from the already-complete submitted batch. Event, poll, reload replay, and notification-open all enter the existing bounded single-flight reconciler. DOM insertion is keyed by `visibleGroupId`; only after every bubble in that group exists does Web call `markUiApplied`. A timed-out plugin Promise releases its lock in `finally` and leaves Room unacknowledged for later replay.
 
+Keep the existing transport copy: `LOCAL_QUEUED` shows “正在把消息送过去…”, `CLOUD_ACCEPTED` remains a delivery/waiting state, and only `PC_ACCEPTED` may switch the UI to model-thinking wording. V3 metadata must not collapse local queue acceptance into PC acceptance.
+
 - [ ] **Step 4: Run all six recovery races and Web contracts green**
 
 Run: `node --test test-basic.mjs tests/yuqi-ui-contract.test.mjs`
@@ -2962,6 +2965,7 @@ test('diagnostics do not collapse four delivery stages', async () => {
   assert.deepEqual(Object.keys(value.delivery).sort(), [
     'cloudConfirmed', 'nativeCompleted', 'notificationShown', 'uiApplied'
   ]);
+  assert.equal(value.transport.stage, 'PC_ACCEPTED');
   assert.equal(value.delivery.nativeCompleted, true);
   assert.equal(value.delivery.uiApplied, false);
 });
@@ -3001,6 +3005,12 @@ function projectTurnDiagnostics({ turn, delivery, lane, rollout, comparison, fin
     turnId: turn.turnId,
     kind: turn.rolloutKey,
     state: turn.state,
+    transport: {
+      stage: normalizeTransportStage(turn),
+      localQueuedAt: turn.localQueuedAt,
+      cloudAcceptedAt: turn.cloudAcceptedAt,
+      pcAcceptedAt: turn.pcAcceptedAt
+    },
     delivery: {
       cloudConfirmed: Boolean(delivery.cloudConfirmedAt),
       nativeCompleted: Boolean(delivery.nativeCompletedAt),
@@ -3024,6 +3034,8 @@ function projectTurnDiagnostics({ turn, delivery, lane, rollout, comparison, fin
 
 Android native diagnostics expose four stage timestamps, group/cursor IDs, local sequence, fallback contract, and last native error. Web displays each stage independently and never marks success merely because a notification has body text. PC exposes no prompt bodies, private scene text, secrets, or full cognitive chain.
 
+The transport projection is separate from delivery: `LOCAL_QUEUED`, `CLOUD_ACCEPTED`, `PC_ACCEPTED`, `COMPLETED`, and `UI_APPLIED` remain distinguishable. `BRIDGE_WAITING` is a persisted execution state corresponding to `CLOUD_ACCEPTED`; it is neither runnable nor fallback-eligible.
+
 - [ ] **Step 4: Execute the fixed race matrix**
 
 `verify-yuqi-v3-races.mjs` must run and record:
@@ -3041,7 +3053,8 @@ const raceCases = [
   'runtime_restart_before_visible_commit',
   'runtime_restart_after_visible_commit',
   'canary_rollback_while_turn_in_flight',
-  'same_fingerprint_adjacent_revisions'
+  'same_fingerprint_adjacent_revisions',
+  'cloud_waiting_does_not_block_next_local_turn'
 ];
 ```
 
@@ -3056,7 +3069,7 @@ node --test yuqi-runtime/test/v3-diagnostics.test.mjs tests/yuqi-ui-contract.tes
 node scripts/verify-yuqi-v3-races.mjs --out artifacts/yuqi-lived-agency-v3/race-report.json
 ```
 
-Expected: tests PASS; all 12 race cases pass and report checksum is materialized.
+Expected: tests PASS; all 13 race cases pass and report checksum is materialized.
 
 - [ ] **Step 6: Commit**
 
@@ -3404,7 +3417,7 @@ During DIRECT_REPLY canary, the first ten new turns show v3 and run stable dry-r
   "protocol": {"cases": 270, "passed": 270, "reportPath": "", "sha256": ""},
   "quality": {"sentinelRuns": 72, "coverageRuns": 144, "historyRuns": 30,
     "eligible": true, "reportPath": "", "sha256": ""},
-  "races": {"cases": 12, "passed": 12, "reportPath": "", "sha256": ""},
+  "races": {"cases": 13, "passed": 13, "reportPath": "", "sha256": ""},
   "rollouts": [],
   "android": {"apkPath": "", "versionCode": 0, "versionName": "",
     "packageName": "com.siyi.al", "signerSha256": "", "apkSha256": "",
@@ -3473,7 +3486,7 @@ After this design window amends the authoritative plan, the central window rerea
 | §10 stage persona and memory | Tasks 6, 19–20 |
 | §11 life system | Tasks 5, 11, 19, 21–23 |
 | §12 all feature adapters | Tasks 5, 14–20, 21 |
-| §13 lanes, cursor, races, deduplication | Tasks 9–15, 17, 24 |
+| §13 lanes, cursor, transport stages, races, deduplication | Tasks 9–15, 17, 24 |
 | §14 human quality evaluation | Tasks 21–22, 25 |
 | §15 stable/candidate rollout | Tasks 2, 6, 11, 23, 27 |
 | §16 migration | Tasks 0, 2–3, 20, 27 |
@@ -3491,7 +3504,7 @@ After this design window amends the authoritative plan, the central window rerea
 - [ ] 24×3 sentinel runs, 72×2 coverage runs, and 30 local-history runs are present.
 - [ ] Six-dimensional gate and pairwise stable/candidate comparison are eligible.
 - [ ] Every TurnKind and life planning has adapter, structured-domain, recovery, and rollout evidence.
-- [ ] All 12 lane/delivery/restart races pass.
+- [ ] All 13 lane/delivery/restart/head-of-line races pass.
 - [ ] Android Room v11 migration, v1/v2/v3 fallback, event/poll/replay, and four delivery stages pass.
 - [ ] Full Node and Android test suites pass.
 - [ ] Production stable/candidate state is explicit; non-active kinds are listed.
