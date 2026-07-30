@@ -233,7 +233,7 @@ assert.match(androidWorkflow, /TAG="android-v\$\{\{ env\.AL_RELEASE_VERSION_CODE
 assert.match(androidWorkflow, /gh release create "\$TAG"/);
 assert.match(androidWorkflow, /Publish automatic update manifest/);
 assert.match(androidWorkflow, /refs\/heads\/update-channel/);
-assert.match(androidWorkflow, /releases\/download\/android-v%s\/AL-%s-release\.apk/);
+assert.match(androidWorkflow, /releases\/download\/android-v%s\/app-release\.apk/);
 assert.match(androidWorkflow, /Publish branch-signed APK handoff/);
 assert.match(androidWorkflow, /BRANCH='signed-builds'/);
 assert.match(androidWorkflow, /AL-\$\{\{ env\.AL_RELEASE_VERSION_NAME \}\}-release\.apk/);

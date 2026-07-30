@@ -26,11 +26,11 @@ test('the signed branch build publishes an OTA manifest that names the real rele
   assert.equal(updateManifest.version, '1.0.107');
   assert.equal(
     updateManifest.releaseUrl,
-    'https://github.com/siyi78118-hue/-/releases/download/android-v107/AL-1.0.107-release.apk'
+    'https://github.com/siyi78118-hue/-/releases/download/android-v107/app-release.apk'
   );
   assert.match(
     androidWorkflow,
     /if:\s*github\.ref == 'refs\/heads\/main' \|\| github\.ref == 'refs\/heads\/codex\/al-tdd'/
   );
-  assert.match(androidWorkflow, /releases\/download\/android-v%s\/AL-%s-release\.apk/);
+  assert.match(androidWorkflow, /releases\/download\/android-v%s\/app-release\.apk/);
 });
