@@ -313,22 +313,7 @@ function rawDatabaseSnapshot(path) {
 
 function v11InvariantSummary(store) {
   store.assertAgencyV10Invariants();
-  store.assertVisibleAuthorityV11Invariants();
-  const tableCountsAfter = tableCounts(store.db);
-  const summary = {
-    userVersion: store.userVersion(),
-    tableCounts: tableCountsAfter,
-    canonicalTurnCount: Number(store.db.prepare(
-      'SELECT COUNT(*) AS value FROM turns WHERE result_authority_version = 1'
-    ).get().value),
-    lineageCount: Number(store.db.prepare(
-      'SELECT COUNT(*) AS value FROM turn_authority_lineages'
-    ).get().value),
-    receiptCount: Number(store.db.prepare(
-      'SELECT COUNT(*) AS value FROM visible_commit_receipts'
-    ).get().value)
-  };
-  return { ...summary, checksum: contentHash(summary) };
+  return store.visibleAuthorityV11InvariantSummary();
 }
 
 function sqliteString(value) {
@@ -372,13 +357,17 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
   const apply = process.argv.includes('--apply');
   const dryRun = process.argv.includes('--dry-run') || !apply;
   const cloneOut = option('--clone-out');
-  if (dryRun && !cloneOut && !explicitDatabase) {
-    throw new Error('production dry-run requires --clone-out');
+  const expectedPath = option('--expect-report');
+  if (dryRun && (!cloneOut || resolve(cloneOut) === sourceDatabase)) {
+    throw new Error('dry-run requires --clone-out different from source');
+  }
+  if (apply && !expectedPath) {
+    throw new Error('apply requires --expect-report');
   }
   const sourceBefore = rawDatabaseSnapshot(sourceDatabase);
-  const expectedPath = option('--expect-report');
-  if (apply && expectedPath) {
-    const expected = JSON.parse(readFileSync(resolve(expectedPath), 'utf8'));
+  let expected = null;
+  if (apply) {
+    expected = JSON.parse(readFileSync(resolve(expectedPath), 'utf8'));
     if (expected.sourceDatabaseSha256 !== sourceBefore.sha256
       || Number(expected.sourceUserVersion) !== sourceBefore.userVersion
       || canonicalJson(expected.sourceTableCounts) !== canonicalJson(sourceBefore.tableCounts)) {
@@ -387,7 +376,12 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
   }
   if (cloneOut && resolve(cloneOut) !== sourceDatabase) cloneDatabase(sourceDatabase, resolve(cloneOut));
   const workingDatabase = cloneOut ? resolve(cloneOut) : sourceDatabase;
-  const store = new YuqiStore(workingDatabase);
+  const store = apply
+    ? YuqiStore.openForMigration(workingDatabase, {
+        expectedSourceVersion: sourceBefore.userVersion,
+        expectedPostMigrationInvariantChecksum: expected.v11InvariantSummary.checksum
+      })
+    : new YuqiStore(workingDatabase);
   let report;
   try {
     report = migrateAgencyState({ store, apply, now: Date.now() });
@@ -405,7 +399,7 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
   report.applied = apply;
 
   if (expectedPath) {
-    const expected = JSON.parse(readFileSync(resolve(expectedPath), 'utf8'));
+    expected ??= JSON.parse(readFileSync(resolve(expectedPath), 'utf8'));
     if (expected.decisionChecksum !== report.decisionChecksum
       || canonicalJson(expected.beforeCounts) !== canonicalJson(report.beforeCounts)
       || canonicalJson(expected.v11InvariantSummary) !== canonicalJson(report.v11InvariantSummary)) {

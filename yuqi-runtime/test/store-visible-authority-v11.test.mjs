@@ -7,7 +7,9 @@ import { spawnSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
+import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import { YuqiStore } from '../src/store.mjs';
+import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
 const SHA_A = 'a'.repeat(64);
 const SHA_B = 'b'.repeat(64);
@@ -375,6 +377,169 @@ function ensureDirectRollout(store) {
   });
 }
 
+function commitCanonicalTurn(store, turn) {
+  const visibleGroup = {
+    items: [{
+      content: '收到。',
+      speakerId: 'yuqi',
+      speakerType: 'character',
+      recipientId: 'user'
+    }]
+  };
+  const actionSet = [];
+  return commitVisibleResult({
+    store,
+    turnId: turn.turnId,
+    authorityLineageKey: turn.authorityLineageKey,
+    laneKey: turn.laneKey,
+    expectedTurnRevision: turn.turnRevision,
+    expectedLineageRevision: store.getTurnAuthorityLineage(turn.authorityLineageKey).revision,
+    expectedLaneRevision: store.getInteractionLane('yuqi', turn.laneKey).revision,
+    expectedCognitiveStateRevision: 0,
+    expectedLatestUserBatchId: turn.inputUserBatchId,
+    inputVisibilitySequence: turn.inputVisibilitySequence,
+    agencySnapshotChecksum: turn.agencySnapshotChecksum,
+    authoritativeReleaseId: turn.authoritativeReleaseId,
+    visibleGroup,
+    actionSet,
+    statePatch: null,
+    memoryJobs: [],
+    comparisonJob: null,
+    generationFingerprint: generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      laneRevision: turn.laneRevision,
+      visibleGroup,
+      actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    }),
+    now: 20_000
+  });
+}
+
+function seedCommittedV11(path) {
+  const store = new YuqiStore(path);
+  try {
+    ensureDirectRollout(store);
+    const committed = store.createCanonicalVisibleTurnInternal(
+      canonicalCreateInput(store, v2Envelope('turn_committed', 1))
+    ).turn;
+    commitCanonicalTurn(store, committed);
+
+    const lane = store.getInteractionLane('yuqi', 'private_chat');
+    const openEnvelope = v2Envelope('turn_open', 2, {
+      messageId: 'msg_source_open',
+      content: '第二条测试消息',
+      sentAt: 10_002
+    });
+    store.createCanonicalVisibleTurnInternal(canonicalCreateInput(store, openEnvelope, {
+      expectedLaneRevision: lane.revision,
+      inputVisibilitySequence: lane.localSequence
+    }));
+
+    const legacyLane = store.getInteractionLane('yuqi', 'private_chat');
+    store.createTurnWithReleasePinInternal({
+      envelope: v2Envelope('turn_legacy_v11', 3, {
+        messageId: 'msg_source_legacy',
+        content: '旧路径消息',
+        sentAt: 10_003
+      }),
+      rolloutKey: 'DIRECT_REPLY',
+      laneKey: 'private_chat',
+      expectedLaneRevision: legacyLane.revision,
+      inputVisibilitySequence: legacyLane.localSequence
+    });
+  } finally {
+    store.close();
+  }
+}
+
+function mutateRaw(path, mutate) {
+  const database = new DatabaseSync(path);
+  try {
+    database.exec('PRAGMA foreign_keys = OFF;');
+    mutate(database);
+  } finally {
+    database.close();
+  }
+}
+
+function assertV11ReopenRejected(path) {
+  let reopened;
+  try {
+    reopened = new YuqiStore(path);
+  } catch (error) {
+    assert.match(String(error?.message || error), /v11 invariant/i);
+    return;
+  } finally {
+    reopened?.close();
+  }
+  assert.fail('expected v11 invariant rejection');
+}
+
+for (const [name, corrupt] of [
+  ['version-1 turn has no lineage row', database =>
+    database.prepare('DELETE FROM turn_authority_lineages').run()],
+  ['lineage latest turn root/role/lane does not join', database =>
+    database.prepare(`
+      UPDATE turn_authority_lineages
+      SET root_source_id = 'forged_root'
+      WHERE state = 'committed'
+    `).run()],
+  ['committed group does not join receipt turn/release/origin', database =>
+    database.prepare(`
+      UPDATE visible_result_groups
+      SET authoritative_release_id = 'forged_release'
+    `).run()],
+  ['receipt payload version does not match origin', database =>
+    database.prepare(`
+      UPDATE visible_commit_receipts
+      SET commit_payload_version = 'android-fallback-commit-v1'
+      WHERE authority_origin = 'pc'
+    `).run()],
+  ['committed turn/group fingerprints differ', database =>
+    database.prepare(`
+      UPDATE visible_result_groups
+      SET generation_fingerprint = ?
+    `).run('f'.repeat(64))],
+  ['uncommitted version-1 turn already has fingerprint', database =>
+    database.prepare(`
+      UPDATE turns
+      SET generation_fingerprint = ?
+      WHERE turn_id = 'turn_open'
+    `).run('f'.repeat(64))],
+  ['turn lineage and lane revision deltas are not exactly one', database =>
+    database.prepare(`
+      UPDATE visible_commit_receipts
+      SET turn_revision_after = turn_revision_before
+      WHERE authority_origin = 'pc'
+    `).run()],
+  ['PC receipt has no canonical delivery', database =>
+    database.prepare('DELETE FROM cloud_deliveries WHERE authority_group_id IS NOT NULL').run()],
+  ['delivery checksum differs from receipt', database =>
+    database.prepare(`
+      UPDATE cloud_deliveries
+      SET authority_commit_checksum = ?
+      WHERE authority_group_id IS NOT NULL
+    `).run('f'.repeat(64))],
+  ['version-0 turn is attached to canonical lineage/group', database =>
+    database.prepare(`
+      UPDATE turns
+      SET authority_lineage_key = (
+        SELECT lineage_key FROM turn_authority_lineages WHERE state = 'committed' LIMIT 1
+      )
+      WHERE turn_id = 'turn_legacy_v11'
+    `).run()]
+]) {
+  test(`v11 reopen rejects ${name}`, () => withDatabase(path => {
+    seedCommittedV11(path);
+    const healthy = new YuqiStore(path);
+    healthy.close();
+    mutateRaw(path, corrupt);
+    assertV11ReopenRejected(path);
+  }));
+}
+
 test('populated PC v10 migrates once to v11 without inventing historical authority', () =>
   withDatabase(path => {
     const before = createPopulatedV10(path);
@@ -428,6 +593,26 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     assert.match(report.v11InvariantSummary.checksum, /^[a-f0-9]{64}$/);
     assert.ok(Object.hasOwn(report.sourceTableCounts, 'turns'));
     assert.ok(Object.hasOwn(report.v11InvariantSummary.tableCounts, 'visible_commit_receipts'));
+
+    const applyReportPath = join(directory, 'migration-apply-report.json');
+    const applyCommand = spawnSync(process.execPath, [
+      join(process.cwd(), 'scripts', 'migrate-yuqi-agency-state.mjs'),
+      '--database', path,
+      '--apply',
+      '--expect-report', reportPath,
+      '--out', applyReportPath
+    ], {
+      cwd: process.cwd(),
+      encoding: 'utf8'
+    });
+    assert.equal(applyCommand.status, 0, applyCommand.stderr || applyCommand.stdout);
+    const applied = JSON.parse(readFileSync(applyReportPath, 'utf8'));
+    assert.equal(applied.applied, true);
+    assert.equal(applied.workingUserVersion, 11);
+    assert.equal(
+      applied.v11InvariantSummary.checksum,
+      report.v11InvariantSummary.checksum
+    );
 
     const first = new YuqiStore(clone);
     const logicalBefore = {

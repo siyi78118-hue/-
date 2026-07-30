@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import {
@@ -10,6 +13,85 @@ import {
 } from '../scripts/migrate-yuqi-agency-state.mjs';
 import { inspectMemorySnapshot } from '../scripts/backup-yuqi-memory.mjs';
 import { YuqiStore } from '../yuqi-runtime/src/store.mjs';
+
+function rawSnapshot(path) {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const tables = database.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+    ).all().map(row => row.name);
+    return {
+      sha256: createHash('sha256').update(readFileSync(path)).digest('hex'),
+      userVersion: Number(database.prepare('PRAGMA user_version').get().user_version),
+      tables
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function runMigration(args) {
+  return spawnSync(process.execPath, [
+    join(process.cwd(), 'scripts', 'migrate-yuqi-agency-state.mjs'),
+    ...args
+  ], {
+    cwd: process.cwd(),
+    encoding: 'utf8'
+  });
+}
+
+function withRawSource(run) {
+  const directory = mkdtempSync(join(tmpdir(), 'yuqi-agency-cli-'));
+  const source = join(directory, 'source.sqlite');
+  const database = new DatabaseSync(source);
+  database.exec('CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES (\'keep\');');
+  database.close();
+  try {
+    return run({ directory, source });
+  } finally {
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+}
+
+for (const [name, buildArgs] of [
+  ['explicit database', ({ source }) => ['--database', source, '--dry-run']],
+  ['config database', ({ source, directory }) => {
+    const config = join(directory, 'config.json');
+    writeFileSync(config, JSON.stringify({ databasePath: source }), 'utf8');
+    return ['--config', config, '--dry-run'];
+  }]
+]) {
+  test(`dry-run without a different clone refuses before opening ${name} source`, () =>
+    withRawSource(context => {
+      const before = rawSnapshot(context.source);
+      const result = runMigration(buildArgs(context));
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /dry-run requires --clone-out/i);
+      assert.deepEqual(rawSnapshot(context.source), before);
+    }));
+}
+
+test('dry-run refuses a clone path resolving to the source before opening it', () =>
+  withRawSource(({ source }) => {
+    const before = rawSnapshot(source);
+    const result = runMigration([
+      '--database', source,
+      '--dry-run',
+      '--clone-out', resolve(source)
+    ]);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /dry-run requires --clone-out.*different/i);
+    assert.deepEqual(rawSnapshot(source), before);
+  }));
+
+test('apply without an approved report refuses before opening source', () =>
+  withRawSource(({ source }) => {
+    const before = rawSnapshot(source);
+    const result = runMigration(['--database', source, '--apply']);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /apply requires --expect-report/i);
+    assert.deepEqual(rawSnapshot(source), before);
+  }));
 
 test('only explicit matching user evidence can migrate to a user hard constraint', () => {
   const result = classifyLegacyBoundary({

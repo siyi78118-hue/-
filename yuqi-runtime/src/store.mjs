@@ -601,11 +601,12 @@ export class LifePlanningResultConflictError extends Error {
 }
 
 export class YuqiStore {
-  constructor(filename) {
+  constructor(filename, migrationOptions = null) {
     if (!filename) throw new Error('database filename is required');
     this.filename = filename;
     this.db = new DatabaseSync(filename);
     this.closed = false;
+    this.migrationOptions = migrationOptions;
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     try {
       this.migrate();
@@ -614,6 +615,22 @@ export class YuqiStore {
       try { this.db.close(); } catch {}
       throw error;
     }
+  }
+
+  static openForMigration(filename, {
+    expectedSourceVersion,
+    expectedPostMigrationInvariantChecksum
+  } = {}) {
+    if (!Number.isInteger(Number(expectedSourceVersion))) {
+      throw new Error('migration expected source version is required');
+    }
+    if (!/^[a-f0-9]{64}$/i.test(String(expectedPostMigrationInvariantChecksum || ''))) {
+      throw new Error('migration expected post-migration invariant checksum is required');
+    }
+    return new YuqiStore(filename, {
+      expectedSourceVersion: Number(expectedSourceVersion),
+      expectedPostMigrationInvariantChecksum: String(expectedPostMigrationInvariantChecksum)
+    });
   }
 
   open() {
@@ -629,12 +646,19 @@ export class YuqiStore {
 
   migrate() {
     const initialVersion = this.userVersion();
+    if (this.migrationOptions
+      && initialVersion !== this.migrationOptions.expectedSourceVersion) {
+      throw new Error(
+        `migration source version mismatch: expected ${this.migrationOptions.expectedSourceVersion}, got ${initialVersion}`
+      );
+    }
     if (initialVersion > 11) {
       throw new Error(`unsupported database user_version ${initialVersion}`);
     }
     if (initialVersion === 11) {
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV11Invariants();
+      this.assertExpectedPostMigrationInvariantChecksum();
       return;
     }
     this.db.exec('BEGIN IMMEDIATE');
@@ -1183,10 +1207,24 @@ export class YuqiStore {
         this.assertVisibleAuthorityV11Invariants({ allowVersionTen: true });
         this.db.exec('PRAGMA user_version = 11;');
       }
+      this.assertAgencyV10Invariants();
+      this.assertVisibleAuthorityV11Invariants();
+      this.assertExpectedPostMigrationInvariantChecksum();
       this.db.exec('COMMIT');
     } catch (error) {
       try { this.db.exec('ROLLBACK'); } catch {}
       throw error;
+    }
+  }
+
+  assertExpectedPostMigrationInvariantChecksum() {
+    const expected = this.migrationOptions?.expectedPostMigrationInvariantChecksum;
+    if (!expected) return;
+    const actual = this.visibleAuthorityV11InvariantSummary().checksum;
+    if (actual !== expected) {
+      throw new Error(
+        `migration post-migration invariant checksum mismatch: expected ${expected}, got ${actual}`
+      );
     }
   }
 
@@ -1505,52 +1543,271 @@ export class YuqiStore {
     ).all().map(row => row.name));
     const missing = requiredTables.filter(name => !existing.has(name));
     if (missing.length) throw new Error(`v11 invariant missing tables: ${missing.join(',')}`);
+    const assertNoInvariantRow = (code, sql) => {
+      const row = this.db.prepare(sql).get();
+      if (row) throw new Error(`v11 invariant ${code}: ${JSON.stringify(row)}`);
+    };
 
-    const invalidLegacy = this.db.prepare(`
-      SELECT turn_id FROM turns
-      WHERE result_authority_version = 0
-        AND (authority_lineage_key IS NOT NULL OR lineage_revision_at_creation IS NOT NULL)
-      LIMIT 1
-    `).get();
-    if (invalidLegacy) throw new Error(`v11 invariant legacy authority leak: ${invalidLegacy.turn_id}`);
-
-    const invalidTurn = this.db.prepare(`
-      SELECT turn_id FROM turns
-      WHERE result_authority_version = 1
+    assertNoInvariantRow('legacy_authority_leak', `
+      SELECT t.turn_id
+      FROM turns t
+      WHERE t.result_authority_version = 0
         AND (
-          authority_lineage_key IS NULL OR turn_revision < 1
-          OR input_user_batch_id IS NULL OR authoritative_release_id IS NULL
-          OR lane_key IS NULL OR agency_snapshot_checksum IS NULL
+          t.authority_lineage_key IS NOT NULL
+          OR t.lineage_revision_at_creation IS NOT NULL
+          OR t.retry_of_turn_id IS NOT NULL
+          OR t.input_user_batch_id IS NOT NULL
+          OR t.agency_snapshot_checksum IS NOT NULL
+          OR EXISTS (
+            SELECT 1 FROM visible_result_groups g
+            WHERE g.authoritative_turn_id = t.turn_id
+          )
+          OR EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.authoritative_turn_id = t.turn_id
+          )
         )
       LIMIT 1
-    `).get();
-    if (invalidTurn) throw new Error(`v11 invariant invalid canonical turn: ${invalidTurn.turn_id}`);
+    `);
 
-    const invalidLineage = this.db.prepare(`
-      SELECT l.lineage_key
+    assertNoInvariantRow('canonical_turn_shape', `
+      SELECT t.turn_id
+      FROM turns t
+      WHERE t.result_authority_version = 1
+        AND (
+          t.authority_lineage_key IS NULL
+          OR t.turn_revision < 1
+          OR t.lineage_revision_at_creation < 1
+          OR t.input_user_batch_id IS NULL
+          OR t.authoritative_release_id IS NULL
+          OR t.lane_key IS NULL
+          OR t.agency_snapshot_checksum IS NULL
+        )
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('canonical_turn_lineage_join', `
+      SELECT t.turn_id, t.authority_lineage_key
+      FROM turns t
+      LEFT JOIN turn_authority_lineages l
+        ON l.lineage_key = t.authority_lineage_key
+      WHERE t.result_authority_version = 1
+        AND (
+          l.lineage_key IS NULL
+          OR l.role_id IS NOT t.character_id
+          OR l.lane_key IS NOT t.lane_key
+          OR l.root_source_id IS NOT t.source_message_id
+        )
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('lineage_latest_owner', `
+      SELECT l.lineage_key, l.latest_turn_id
       FROM turn_authority_lineages l
       LEFT JOIN turns t ON t.turn_id = l.latest_turn_id
-      WHERE t.turn_id IS NULL OR t.authority_lineage_key != l.lineage_key
-        OR t.character_id != l.role_id OR t.lane_key != l.lane_key
+      WHERE t.turn_id IS NULL
+        OR t.result_authority_version != 1
+        OR t.authority_lineage_key IS NOT l.lineage_key
+        OR t.character_id IS NOT l.role_id
+        OR t.lane_key IS NOT l.lane_key
+        OR t.source_message_id IS NOT l.root_source_id
       LIMIT 1
-    `).get();
-    if (invalidLineage) {
-      throw new Error(`v11 invariant invalid lineage: ${invalidLineage.lineage_key}`);
-    }
+    `);
 
-    const invalidCommitted = this.db.prepare(`
-      SELECT l.lineage_key
+    assertNoInvariantRow('noncommitted_has_result', `
+      SELECT l.lineage_key, l.state
+      FROM turn_authority_lineages l
+      WHERE l.state IN ('open', 'cancelled')
+        AND (
+          l.committed_group_id IS NOT NULL
+          OR EXISTS (SELECT 1 FROM visible_result_groups g WHERE g.lineage_key = l.lineage_key)
+          OR EXISTS (SELECT 1 FROM visible_commit_receipts r WHERE r.lineage_key = l.lineage_key)
+        )
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('committed_join', `
+      SELECT l.lineage_key, l.committed_group_id
       FROM turn_authority_lineages l
       LEFT JOIN visible_result_groups g
-        ON g.lineage_key = l.lineage_key AND g.group_id = l.committed_group_id
+        ON g.lineage_key = l.lineage_key
+       AND g.group_id = l.committed_group_id
       LEFT JOIN visible_commit_receipts r
-        ON r.lineage_key = l.lineage_key AND r.group_id = l.committed_group_id
-      WHERE l.state = 'committed' AND (g.group_id IS NULL OR r.group_id IS NULL)
+        ON r.lineage_key = l.lineage_key
+       AND r.group_id = l.committed_group_id
+      LEFT JOIN turns t
+        ON t.turn_id = r.authoritative_turn_id
+      WHERE l.state = 'committed'
+        AND (
+          g.group_id IS NULL
+          OR r.group_id IS NULL
+          OR t.turn_id IS NULL
+          OR g.authoritative_turn_id IS NOT r.authoritative_turn_id
+          OR g.authoritative_turn_id IS NOT l.latest_turn_id
+          OR t.authority_lineage_key IS NOT l.lineage_key
+          OR g.role_id IS NOT l.role_id
+          OR g.lane_key IS NOT l.lane_key
+          OR g.authoritative_release_id IS NOT t.authoritative_release_id
+          OR g.authority_origin IS NOT r.authority_origin
+        )
       LIMIT 1
-    `).get();
-    if (invalidCommitted) {
-      throw new Error(`v11 invariant committed authority missing: ${invalidCommitted.lineage_key}`);
-    }
+    `);
+
+    assertNoInvariantRow('orphan_group_or_receipt', `
+      SELECT COALESCE(g.group_id, r.group_id) AS group_id
+      FROM visible_result_groups g
+      LEFT JOIN visible_commit_receipts r
+        ON r.group_id = g.group_id
+       AND r.lineage_key = g.lineage_key
+       AND r.authoritative_turn_id = g.authoritative_turn_id
+      LEFT JOIN turn_authority_lineages l
+        ON l.lineage_key = g.lineage_key
+      WHERE r.group_id IS NULL OR l.lineage_key IS NULL OR l.state != 'committed'
+      UNION ALL
+      SELECT r.group_id
+      FROM visible_commit_receipts r
+      LEFT JOIN visible_result_groups g ON g.group_id = r.group_id
+      LEFT JOIN turn_authority_lineages l ON l.lineage_key = r.lineage_key
+      WHERE g.group_id IS NULL OR l.lineage_key IS NULL OR l.state != 'committed'
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('receipt_payload_origin', `
+      SELECT lineage_key, authority_origin, commit_payload_version
+      FROM visible_commit_receipts
+      WHERE (authority_origin = 'pc' AND commit_payload_version != 'pc-visible-commit-v1')
+         OR (authority_origin = 'android_fallback'
+             AND commit_payload_version != 'android-fallback-commit-v1')
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('fingerprint_authority', `
+      SELECT t.turn_id, l.state, t.generation_fingerprint, g.generation_fingerprint AS group_fingerprint
+      FROM turns t
+      JOIN turn_authority_lineages l ON l.lineage_key = t.authority_lineage_key
+      LEFT JOIN visible_result_groups g ON g.authoritative_turn_id = t.turn_id
+      WHERE t.result_authority_version = 1
+        AND (
+          (l.state IN ('open', 'cancelled') AND t.generation_fingerprint IS NOT NULL)
+          OR (
+            l.state = 'committed'
+            AND t.turn_id = l.latest_turn_id
+            AND (
+              t.generation_fingerprint IS NULL
+              OR g.generation_fingerprint IS NULL
+              OR t.generation_fingerprint IS NOT g.generation_fingerprint
+            )
+          )
+        )
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('receipt_revision_delta', `
+      SELECT lineage_key
+      FROM visible_commit_receipts
+      WHERE turn_revision_after != turn_revision_before + 1
+         OR lineage_revision_after != lineage_revision_before + 1
+         OR (
+           authority_origin = 'pc'
+           AND (
+             lane_revision_before IS NULL
+             OR lane_revision_after != lane_revision_before + 1
+             OR cognitive_state_revision_before IS NULL
+             OR cognitive_state_revision_after IS NULL
+             OR cognitive_state_revision_after NOT IN (
+               cognitive_state_revision_before,
+               cognitive_state_revision_before + 1
+             )
+           )
+         )
+         OR (
+           authority_origin = 'android_fallback'
+           AND (
+             lane_revision_before IS NOT NULL
+             OR lane_revision_after IS NOT NULL
+             OR cognitive_state_revision_before IS NOT NULL
+             OR cognitive_state_revision_after IS NOT NULL
+           )
+         )
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('canonical_delivery_join', `
+      SELECT r.lineage_key, r.group_id
+      FROM visible_commit_receipts r
+      JOIN turns t ON t.turn_id = r.authoritative_turn_id
+      LEFT JOIN cloud_deliveries d
+        ON d.authority_group_id = r.group_id
+       AND d.turn_id = r.authoritative_turn_id
+       AND d.peer_id = t.device_id
+       AND d.authority_commit_checksum = r.commit_checksum
+      WHERE (r.authority_origin = 'pc' AND d.turn_id IS NULL)
+         OR (
+           r.authority_origin = 'android_fallback'
+           AND EXISTS (
+             SELECT 1 FROM cloud_deliveries fallback_delivery
+             WHERE fallback_delivery.authority_group_id = r.group_id
+           )
+         )
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('orphan_canonical_delivery', `
+      SELECT d.turn_id, d.peer_id, d.authority_group_id
+      FROM cloud_deliveries d
+      LEFT JOIN visible_commit_receipts r
+        ON r.group_id = d.authority_group_id
+       AND r.commit_checksum = d.authority_commit_checksum
+      LEFT JOIN visible_result_groups g
+        ON g.group_id = d.authority_group_id
+       AND g.authoritative_turn_id = d.turn_id
+      WHERE d.authority_group_id IS NOT NULL
+        AND (r.group_id IS NULL OR g.group_id IS NULL OR r.authority_origin != 'pc')
+      LIMIT 1
+    `);
+  }
+
+  visibleAuthorityV11InvariantSummary() {
+    this.assertVisibleAuthorityV11Invariants();
+    const tableNames = [
+      'messages',
+      'facts',
+      'relationship_states',
+      'relationship_history',
+      'role_plans',
+      'life_episodes',
+      'turns',
+      'result_outbox',
+      'turn_authority_lineages',
+      'visible_result_groups',
+      'visible_result_items',
+      'visible_result_actions',
+      'visible_commit_receipts',
+      'cloud_deliveries'
+    ];
+    const existing = new Set(this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).all().map(row => row.name));
+    const tableCounts = Object.fromEntries(tableNames.map(table => [
+      table,
+      existing.has(table)
+        ? Number(this.db.prepare(`SELECT COUNT(*) AS value FROM "${table}"`).get().value)
+        : null
+    ]));
+    const summary = {
+      userVersion: this.userVersion(),
+      tableCounts,
+      canonicalTurnCount: Number(this.db.prepare(
+        'SELECT COUNT(*) AS value FROM turns WHERE result_authority_version = 1'
+      ).get().value),
+      lineageCount: Number(this.db.prepare(
+        'SELECT COUNT(*) AS value FROM turn_authority_lineages'
+      ).get().value),
+      receiptCount: Number(this.db.prepare(
+        'SELECT COUNT(*) AS value FROM visible_commit_receipts'
+      ).get().value)
+    };
+    return { ...summary, checksum: contentHash(summary) };
   }
 
   assertAgencyV10Invariants({ allowVersionNine = false, allowPreFinalVersion = false } = {}) {
