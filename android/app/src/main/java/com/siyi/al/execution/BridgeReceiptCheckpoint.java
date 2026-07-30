@@ -2,10 +2,10 @@ package com.siyi.al.execution;
 
 import org.json.JSONObject;
 
-final class BridgeReceiptCheckpoint {
+public final class BridgeReceiptCheckpoint {
     private BridgeReceiptCheckpoint() {}
 
-    static JSONObject extract(String memoryResult) {
+    public static JSONObject extract(String memoryResult) {
         if (memoryResult == null || !memoryResult.trim().startsWith("{")) return null;
         try {
             JSONObject checkpoint = new JSONObject(memoryResult);

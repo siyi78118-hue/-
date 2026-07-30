@@ -217,7 +217,7 @@ test('every manual retry anchors to the original deterministic message turn', ()
 test('Room persists fresh retry turns and only deduplicates an exact turn id', () => {
   assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
   assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
-  assert.match(executionDatabase, /version\s*=\s*9/);
+  assert.match(executionDatabase, /version\s*=\s*10/);
   assert.match(executionDatabase, /new Migration\(8,\s*9\)/);
   assert.match(executionDatabase, /DROP INDEX IF EXISTS `index_chat_turns_sourceMessageId`/);
   assert.match(executionDatabase, /CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId`/);
@@ -301,6 +301,49 @@ test('native completed turns are serialized across submit, poll, inbox, and fore
   assert.match(html, /async function\s+applyNativeExecutionTurnUnlocked\(result\)/);
   assert.match(html, /function\s+applyNativeExecutionTurn\(result\)\s*\{\s*return\s+withNativeTurnApplyLock\(result\?\.turnId,\s*\(\)\s*=>\s*applyNativeExecutionTurnUnlocked\(result\)\)/);
   assert.match(html, /if\s*\(nativeExecutionReconcilePromise\)\s*return\s+nativeExecutionReconcilePromise/);
+});
+
+test('native delivery diagnostics persist and expose four independent convergence stages', () => {
+  assert.match(executionDatabase, /version\s*=\s*10/);
+  assert.match(executionDatabase, /MIGRATION_9_10/);
+  assert.match(chatTurnEntity, /Long\s+notificationShownAt/);
+  assert.match(chatTurnEntity, /Long\s+cloudConfirmedAt/);
+  assert.match(executionDao, /markNotificationShown/);
+  assert.match(executionDao, /markCloudConfirmed/);
+  assert.match(plugin, /result\.put\("notificationShownAt",\s*turn\.notificationShownAt\)/);
+  assert.match(plugin, /result\.put\("cloudConfirmedAt",\s*turn\.cloudConfirmedAt\)/);
+  assert.match(plugin, /result\.put\("cloudConfirmationRequired"/);
+  assert.match(plugin, /result\.put\("deliveryStages",\s*deliveryStages\)/);
+  for (const label of ['cloudConfirmed', 'nativeCompleted', 'notificationShown', 'uiApplied']) {
+    assert.match(html, new RegExp(label));
+  }
+});
+
+test('notification stage is recorded only after Android reports the notification as active', () => {
+  assert.match(executionService, /notificationWasPosted\(notificationId\)/);
+  const delivery = executionService.slice(
+    executionService.indexOf('NotificationManagerCompat.from(this).notify('),
+    executionService.indexOf('private void confirmBridgeDelivery')
+  );
+  assert.ok(delivery.indexOf('.notify(') < delivery.indexOf('notificationWasPosted(notificationId)'));
+  assert.ok(delivery.indexOf('notificationWasPosted(notificationId)') < delivery.indexOf('markNotificationShown'));
+});
+
+test('native completion event and polling share a bounded self-clearing reconciliation path', () => {
+  assert.match(html, /const\s+NATIVE_RECONCILE_TIMEOUT_MS\s*=/);
+  assert.match(html, /function\s+withNativePromiseTimeout\(/);
+  const reconcile = html.slice(
+    html.indexOf('function reconcileNativeExecutionTurns()'),
+    html.indexOf('function startNativeReplyPolling()')
+  );
+  assert.match(reconcile, /withNativePromiseTimeout\(/);
+  assert.match(reconcile, /\.finally\(\(\)\s*=>/);
+  const listener = html.slice(
+    html.indexOf('async function ensureNativeExecutionCompletedListener()'),
+    html.indexOf('function yuqiImmersiveProgressText')
+  );
+  assert.match(listener, /reconcileNativeReplyState\(\)/);
+  assert.doesNotMatch(listener, /drainNativeUiInbox\(plugin\)/);
 });
 
 test('long chats mount only the latest 120 visible messages and expand in bounded pages', () => {

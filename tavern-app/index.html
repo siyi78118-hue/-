@@ -1404,7 +1404,10 @@ const DEFAULT_SETTINGS = {
 };
 const API_TIMEOUT_MS = 120000;
 const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
-const APP_BUILD_VERSION = '2026-07-28.103';
+const NATIVE_BRIDGE_TIMEOUT_MS = 8000;
+const NATIVE_RECONCILE_TIMEOUT_MS = 12000;
+const NATIVE_TURN_APPLY_TIMEOUT_MS = 10000;
+const APP_BUILD_VERSION = '2026-07-30.107';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -3081,8 +3084,14 @@ function appendNativeReplyTextParts(chat, result, extra = {}) {
 }
 function withNativeTurnApplyLock(turnId, operation) {
   const key = String(turnId || '');
+  const requestedTimeoutMs = Number(arguments[2]);
+  const timeoutMs = requestedTimeoutMs > 0 ? requestedTimeoutMs : NATIVE_TURN_APPLY_TIMEOUT_MS;
   const previous = nativeTurnApplyPromises.get(key) || Promise.resolve();
-  const current = previous.catch(() => {}).then(operation);
+  const current = withNativePromiseTimeout(
+    previous.catch(() => {}).then(operation),
+    `apply native turn ${key}`,
+    timeoutMs
+  );
   nativeTurnApplyPromises.set(key, current);
   return current.finally(() => {
     if (nativeTurnApplyPromises.get(key) === current) nativeTurnApplyPromises.delete(key);
@@ -3125,7 +3134,7 @@ function nativeTurnHasUiLanding(result) {
   }
   return (chat.messages || []).some(message => message.sourceTurnId === sourceTurnId);
 }
-function nativeBridgeCall(promise, label, timeoutMs = 8000) {
+function withNativePromiseTimeout(promise, label, timeoutMs) {
   let timer = null;
   return Promise.race([
     Promise.resolve(promise),
@@ -3135,6 +3144,9 @@ function nativeBridgeCall(promise, label, timeoutMs = 8000) {
   ]).finally(() => {
     if (timer) clearTimeout(timer);
   });
+}
+function nativeBridgeCall(promise, label, timeoutMs = NATIVE_BRIDGE_TIMEOUT_MS) {
+  return withNativePromiseTimeout(promise, label, timeoutMs);
 }
 async function drainNativeUiInbox(
   plugin,
@@ -3557,7 +3569,11 @@ async function reconcileNativeExecutionTurnsUnlocked() {
 }
 function reconcileNativeExecutionTurns() {
   if (nativeExecutionReconcilePromise) return nativeExecutionReconcilePromise;
-  const current = reconcileNativeExecutionTurnsUnlocked();
+  const current = withNativePromiseTimeout(
+    reconcileNativeExecutionTurnsUnlocked(),
+    'reconcileNativeExecutionTurns',
+    NATIVE_RECONCILE_TIMEOUT_MS
+  );
   nativeExecutionReconcilePromise = current;
   return current.finally(() => {
     if (nativeExecutionReconcilePromise === current) nativeExecutionReconcilePromise = null;
@@ -3577,13 +3593,8 @@ async function ensureNativeExecutionCompletedListener() {
   await plugin.addListener('executionCompleted', () => {
     // The event is only a wake-up. Room remains authoritative and the exact
     // turn/checksum is drained through the same idempotent inbox path.
-    drainNativeUiInbox(plugin).then(changed => {
-      if (!changed) return;
-      resumePendingAssistantTurns();
-      if (activeScreen === 'chat') renderMessages();
-      renderChats();
-      stopNativeReplyPollingIfIdle();
-    }).catch(err => console.warn('[AL Native Execution] completed event deferred:', err.message));
+    reconcileNativeReplyState()
+      .catch(err => console.warn('[AL Native Execution] completed event deferred:', err.message));
   });
 }
 
@@ -5037,10 +5048,30 @@ async function renderDiagnosticsScreen() {
       })
     : { diagnostics: [] };
   const nativeRows = Array.isArray(nativePage?.diagnostics) ? nativePage.diagnostics : [];
-  if (!logs.length && !nativeRows.length) {
+  const deliveryStages = Array.isArray(nativePage?.deliveryStages) ? nativePage.deliveryStages : [];
+  if (!logs.length && !nativeRows.length && !deliveryStages.length) {
     list.innerHTML = '<div class="empty">还没有模型调用记录</div>';
     return;
   }
+  const deliveryHtml = deliveryStages.length ? `<div class="diagnostic-item">
+    <div class="diagnostic-head">
+      <div>
+        <div class="diagnostic-title">原生消息送达四阶段</div>
+        <div class="diagnostic-meta">最近 ${deliveryStages.length} 个已完成任务；四项分别记录，互不代替</div>
+      </div>
+      <span class="diagnostic-state ${deliveryStages.some(stage => !stage.nativeCompleted || !stage.uiApplied || (stage.cloudConfirmationRequired && !stage.cloudConfirmed)) ? 'state-fail' : ''}">${deliveryStages.some(stage => !stage.nativeCompleted || !stage.uiApplied || (stage.cloudConfirmationRequired && !stage.cloudConfirmed)) ? '未完全收敛' : '已收敛'}</span>
+    </div>
+    <div class="diagnostic-pre">${deliveryStages.map(stage => {
+      const value = (done, at, optional = false) => optional ? '无需' : `${done ? '是' : '否'}${at ? ` @ ${new Date(Number(at)).toLocaleString()}` : ''}`;
+      return [
+        `${stage.turnId || '-'}｜${stage.kind || '-'}`,
+        `cloudConfirmed=${value(stage.cloudConfirmed, stage.cloudConfirmedAt, !stage.cloudConfirmationRequired)}`,
+        `nativeCompleted=${value(stage.nativeCompleted, stage.nativeCompletedAt)}`,
+        `notificationShown=${value(stage.notificationShown, stage.notificationShownAt)}`,
+        `uiApplied=${value(stage.uiApplied, stage.uiAppliedAt)}`
+      ].join('｜');
+    }).map(esc).join('\n')}</div>
+  </div>` : '';
   const nativeHtml = nativeRows.length ? `<div class="diagnostic-item">
     <div class="diagnostic-head">
       <div>
@@ -5053,7 +5084,7 @@ async function renderDiagnosticsScreen() {
       return formatNativeDiagnosticRow(row);
     }).map(esc).join('\n')}</div>
   </div>` : '';
-  list.innerHTML = nativeHtml + logs.map((log, index) => {
+  list.innerHTML = deliveryHtml + nativeHtml + logs.map((log, index) => {
     const state = diagnosticState(log);
     const note = log.error || log.diagnostic || '';
     const metaParts = [

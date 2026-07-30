@@ -11,6 +11,7 @@ import com.siyi.al.execution.AlExecutionService;
 import com.siyi.al.execution.AlExecutionWakeWorker;
 import com.siyi.al.execution.AlNotificationStatus;
 import com.siyi.al.execution.AutomaticTaskCleanupResult;
+import com.siyi.al.execution.BridgeReceiptCheckpoint;
 import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -449,6 +450,26 @@ public final class AlExecutionPlugin extends Plugin {
             }
             JSObject result = new JSObject();
             result.put("diagnostics", diagnostics);
+            JSArray deliveryStages = new JSArray();
+            int deliveryLimit = Math.max(1, Math.min(limit == null ? 30 : limit, 50));
+            for (ChatTurnEntity turn : store.recentCompletedTurns(deliveryLimit)) {
+                ExecutionAttemptEntity attempt = store.activeAttempt(turn.turnId);
+                JSObject stage = new JSObject();
+                stage.put("turnId", turn.turnId);
+                stage.put("characterId", turn.characterId);
+                stage.put("kind", turn.kind);
+                stage.put("cloudConfirmationRequired", cloudConfirmationRequired(attempt));
+                stage.put("nativeCompleted", turn.completedAt != null);
+                stage.put("nativeCompletedAt", turn.completedAt);
+                stage.put("notificationShown", turn.notificationShownAt != null);
+                stage.put("notificationShownAt", turn.notificationShownAt);
+                stage.put("uiApplied", turn.uiAppliedAt != null);
+                stage.put("uiAppliedAt", turn.uiAppliedAt);
+                stage.put("cloudConfirmed", turn.cloudConfirmedAt != null);
+                stage.put("cloudConfirmedAt", turn.cloudConfirmedAt);
+                deliveryStages.put(stage);
+            }
+            result.put("deliveryStages", deliveryStages);
             return result;
         });
     }
@@ -577,8 +598,11 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("createdAt", turn.createdAt);
         result.put("updatedAt", turn.updatedAt);
         result.put("completedAt", turn.completedAt);
+        result.put("notificationShownAt", turn.notificationShownAt);
         result.put("uiAppliedAt", turn.uiAppliedAt);
+        result.put("cloudConfirmedAt", turn.cloudConfirmedAt);
         ExecutionAttemptEntity attempt = store.activeAttempt(turn.turnId);
+        result.put("cloudConfirmationRequired", cloudConfirmationRequired(attempt));
         if (attempt != null) {
             result.put("attemptId", attempt.attemptId);
             result.put("errorCode", attempt.errorCode);
@@ -630,6 +654,10 @@ public final class AlExecutionPlugin extends Plugin {
         }
         result.put("replyParts", parts);
         return result;
+    }
+
+    private boolean cloudConfirmationRequired(ExecutionAttemptEntity attempt) {
+        return attempt != null && BridgeReceiptCheckpoint.extract(attempt.memoryResult) != null;
     }
 
     private void execute(PluginCall call, Operation operation) {

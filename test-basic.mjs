@@ -112,7 +112,7 @@ assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopServic
 for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*9[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9/, 'Room must migrate existing installs through the native fresh-retry schema without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*10[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9[\s\S]*MIGRATION_9_10/, 'Room must migrate existing installs through the native delivery-stage schema without destructive reset');
 assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors[\s\S]*yuqi_annotations/, 'Room v7 must retain raw messages, evidence facts, sync cursors, and annotations on the phone');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
@@ -168,7 +168,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v97';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v98';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -189,7 +189,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-07-28\.103';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-07-30\.107';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -229,10 +229,11 @@ assert.match(androidWorkflow, /- codex\/al-tdd/);
 assert.match(androidWorkflow, /if: github\.ref == 'refs\/heads\/main'/);
 assert.match(androidWorkflow, /assembleRelease assembleDebug/);
 assert.match(androidWorkflow, /apksigner" verify --verbose --print-certs/);
-assert.match(androidWorkflow, /gh release create "android-v\$\{\{ env\.AL_RELEASE_VERSION_CODE \}\}"/);
+assert.match(androidWorkflow, /TAG="android-v\$\{\{ env\.AL_RELEASE_VERSION_CODE \}\}"/);
+assert.match(androidWorkflow, /gh release create "\$TAG"/);
 assert.match(androidWorkflow, /Publish automatic update manifest/);
 assert.match(androidWorkflow, /refs\/heads\/update-channel/);
-assert.match(androidWorkflow, /releases\/download\/android-v%s\/app-release\.apk/);
+assert.match(androidWorkflow, /releases\/download\/android-v%s\/AL-%s-release\.apk/);
 assert.match(androidWorkflow, /Publish branch-signed APK handoff/);
 assert.match(androidWorkflow, /BRANCH='signed-builds'/);
 assert.match(androidWorkflow, /AL-\$\{\{ env\.AL_RELEASE_VERSION_NAME \}\}-release\.apk/);
@@ -936,6 +937,8 @@ globalThis.__appTest = {
   nativeReplyTextParts,
   appendAssistantMessages,
   drainNativeUiInbox,
+  replayRecentNativeCompletedTurns,
+  withNativeTurnApplyLock,
   nativePendingStateIsCurrent,
   nativePendingReplyNeedsSubmission,
   nativePendingReplyText,
@@ -1860,6 +1863,66 @@ const inboxChanged = await drainNativeUiInbox(
 );
 assert.equal(inboxChanged, true);
 assert.deepEqual(inboxCalls, ['apply:older', 'ack:older', 'apply:newer', 'ack:newer'], '一次同步必须按完成时间排空全部积压结果');
+const notLandedCalls = [];
+await drainNativeUiInbox(
+  {
+    unappliedCompletedTurns: async () => ({ turns: [{ turnId: 'not-landed', completedAt: 30000 }] }),
+    acknowledgeUiApplied: async ({ turnId }) => notLandedCalls.push(`ack:${turnId}`)
+  },
+  async result => { notLandedCalls.push(`apply:${result.turnId}`); return true; },
+  () => false
+);
+assert.deepEqual(notLandedCalls, ['apply:not-landed'], 'DOM 未实际落地时不得提前记录 uiAppliedAt');
+const reloadCalls = [];
+const reloadChanged = await context.__appTest.replayRecentNativeCompletedTurns(
+  {
+    recentCompletedTurns: async () => ({ turns: [{ turnId: 'reload-turn', completedAt: 31000, uiAppliedAt: 30000 }] })
+  },
+  async result => { reloadCalls.push(`apply:${result.turnId}`); return true; },
+  () => false
+);
+assert.equal(reloadChanged, true);
+assert.deepEqual(reloadCalls, ['apply:reload-turn'], 'WebView 重载后必须从原生完成记录恢复未渲染消息');
+const concurrentLandings = new Set();
+let concurrentApplyCount = 0;
+const concurrentPlugin = {
+  unappliedCompletedTurns: async () => ({ turns: [{ turnId: 'concurrent-turn', completedAt: 32000 }] }),
+  acknowledgeUiApplied: async () => {}
+};
+const concurrentApply = result => context.__appTest.withNativeTurnApplyLock(result.turnId, async () => {
+  if (concurrentLandings.has(result.turnId)) return false;
+  await new Promise(resolve => setTimeout(resolve, 5));
+  concurrentLandings.add(result.turnId);
+  concurrentApplyCount += 1;
+  return true;
+}, 50);
+await Promise.all([
+  drainNativeUiInbox(concurrentPlugin, concurrentApply, result => concurrentLandings.has(result.turnId)),
+  drainNativeUiInbox(concurrentPlugin, concurrentApply, result => concurrentLandings.has(result.turnId))
+]);
+await drainNativeUiInbox(concurrentPlugin, concurrentApply, result => concurrentLandings.has(result.turnId));
+assert.equal(concurrentApplyCount, 1, '事件、轮询和重复投递同时到达也只能渲染一次');
+const hangingApply = context.__appTest.withNativeTurnApplyLock(
+  'hung-turn',
+  () => new Promise(() => {}),
+  20
+);
+await assert.rejects(
+  Promise.race([
+    hangingApply,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('test guard expired')), 80))
+  ]),
+  /apply native turn hung-turn timed out/,
+  '悬挂的插件或渲染调用必须被单次超时切断'
+);
+assert.equal(
+  await Promise.race([
+    context.__appTest.withNativeTurnApplyLock('hung-turn', async () => 'recovered', 20),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('replay stayed blocked')), 80))
+  ]),
+  'recovered',
+  '悬挂 Promise 超时并清锁后，同一 turn 的恢复重放不得继续被阻塞'
+);
 const currentNativeChat = {
   pendingReply: { nativeTurnId: 'turn-message-a', nativeAcceptedAt: 98, state: 'running', nativeState: 'CHAT_RUNNING', nativeUpdatedAt: 99 }
 };

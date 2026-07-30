@@ -47,5 +47,9 @@ public interface ExecutionStore {
 
     List<ChatTurnEntity> recentCompletedTurns(int limit);
 
+    void markNotificationShown(String turnId, long now);
+
     void acknowledgeUiApplied(String turnId, long now);
+
+    void markCloudConfirmed(String turnId, long now);
 }

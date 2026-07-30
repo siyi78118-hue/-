@@ -197,6 +197,33 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void notificationUiAndCloudStagesRemainIndependent() {
+        store.submitTurn(submission("turn-delivery-stages", "msg-delivery-stages"));
+        String attemptId = store.activeAttempt("turn-delivery-stages").attemptId;
+        prepareChatDone("turn-delivery-stages", attemptId);
+        store.commitReply(
+            "turn-delivery-stages",
+            attemptId,
+            Collections.singletonList(textPart("turn-delivery-stages", attemptId, "通知先显示")),
+            10L
+        );
+
+        store.markNotificationShown("turn-delivery-stages", 11L);
+        assertEquals(Long.valueOf(10L), store.turn("turn-delivery-stages").completedAt);
+        assertEquals(Long.valueOf(11L), store.turn("turn-delivery-stages").notificationShownAt);
+        assertEquals(null, store.turn("turn-delivery-stages").uiAppliedAt);
+        assertEquals(null, store.turn("turn-delivery-stages").cloudConfirmedAt);
+        assertEquals(1, store.unappliedCompletedTurns(10).size());
+
+        store.acknowledgeUiApplied("turn-delivery-stages", 12L);
+        store.markCloudConfirmed("turn-delivery-stages", 13L);
+
+        assertEquals(Long.valueOf(12L), store.turn("turn-delivery-stages").uiAppliedAt);
+        assertEquals(Long.valueOf(13L), store.turn("turn-delivery-stages").cloudConfirmedAt);
+        assertEquals(0, store.unappliedCompletedTurns(10).size());
+    }
+
+    @Test
     public void clearAutomaticTasksCancelsOnlyProactiveWork() {
         store.submitTurn(submission("direct", "direct-msg", TurnKind.DIRECT_REPLY));
         store.submitTurn(submission("chat-auto", "chat-auto-msg", TurnKind.PROACTIVE_CHAT));

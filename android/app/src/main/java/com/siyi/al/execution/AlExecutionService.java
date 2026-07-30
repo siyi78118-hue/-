@@ -1,6 +1,7 @@
 package com.siyi.al.execution;
 
 import android.app.ForegroundServiceStartNotAllowedException;
+import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
@@ -9,6 +10,7 @@ import com.siyi.al.AlExecutionPlugin;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.service.notification.StatusBarNotification;
 import androidx.annotation.Nullable;
 import androidx.annotation.RequiresApi;
 import androidx.core.content.ContextCompat;
@@ -161,24 +163,49 @@ public final class AlExecutionService extends Service {
             continueRolePlan(turn, continued);
             rolePlanCoordinator.completeForTurn(turn.turnId, System.currentTimeMillis());
             String key = "turn." + turn.turnId;
-            if (notified.getBoolean(key, false)) continue;
+            int notificationId = AlNotificationFactory.messageNotificationId(turn.turnId);
+            if (notified.getBoolean(key, false)) {
+                if (turn.notificationShownAt == null && notificationWasPosted(notificationId)) {
+                    executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
+                }
+                continue;
+            }
             String title = characterName(turn);
             String text = notificationText(turn);
             try {
                 NotificationManagerCompat.from(this).notify(
-                    AlNotificationFactory.messageNotificationId(turn.turnId),
+                    notificationId,
                     notifications.messageNotification(title, text, turn.turnId.hashCode())
                 );
-                notified.edit().putBoolean(key, true).apply();
+                if (notificationWasPosted(notificationId)) {
+                    executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
+                    notified.edit().putBoolean(key, true).apply();
+                }
             } catch (SecurityException ignored) {
                 // Android 13+ will deliver after the user grants notification permission.
             }
         }
     }
 
+    private boolean notificationWasPosted(int notificationId) {
+        if (!AlNotificationStatus.inspect(this).healthy) return false;
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true;
+        NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) return false;
+        for (StatusBarNotification notification : manager.getActiveNotifications()) {
+            if (notification.getId() == notificationId) return true;
+        }
+        return false;
+    }
+
     private void confirmBridgeDelivery(ChatTurnEntity turn, SharedPreferences confirmed) {
         String key = "turn." + turn.turnId;
-        if (confirmed.getBoolean(key, false)) return;
+        if (confirmed.getBoolean(key, false)) {
+            if (turn.uiAppliedAt != null && turn.cloudConfirmedAt == null) {
+                executionStore.markCloudConfirmed(turn.turnId, turn.uiAppliedAt);
+            }
+            return;
+        }
         if (turn.uiAppliedAt == null) return;
         try {
             com.siyi.al.execution.db.ExecutionAttemptEntity attempt = executionStore.activeAttempt(turn.turnId);
@@ -186,10 +213,12 @@ public final class AlExecutionService extends Service {
             JSONObject response = BridgeReceiptCheckpoint.extract(attempt.memoryResult);
             if (response == null) return;
             if (ExecutionRuntime.confirmAppliedResult(this, response.toString())) {
+                long confirmedAt = System.currentTimeMillis();
+                executionStore.markCloudConfirmed(turn.turnId, confirmedAt);
                 confirmed.edit().putBoolean(key, true).apply();
                 executionStore.recordDiagnostic(
                     turn.turnId, turn.activeAttemptId, "INFO", "PHONE_RECEIPT_SENT",
-                    response.optString("_relayMessageId", ""), System.currentTimeMillis()
+                    response.optString("_relayMessageId", ""), confirmedAt
                 );
             }
         } catch (Exception error) {

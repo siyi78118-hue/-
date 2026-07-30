@@ -24,7 +24,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         SyncCursorEntity.class,
         YuqiAnnotationEntity.class
     },
-    version = 9,
+    version = 10,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
@@ -101,6 +101,12 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             );
         }
     };
+    private static final Migration MIGRATION_9_10 = new Migration(9, 10) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("ALTER TABLE chat_turns ADD COLUMN notificationShownAt INTEGER");
+            database.execSQL("ALTER TABLE chat_turns ADD COLUMN cloudConfirmedAt INTEGER");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -114,7 +120,8 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         "al-execution.db"
                     ).addMigrations(
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
-                        MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9
+                        MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
+                        MIGRATION_9_10
                     ).build();
                 }
             }

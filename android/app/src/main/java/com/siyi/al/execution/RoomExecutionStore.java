@@ -279,11 +279,32 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     @Override
+    public void markNotificationShown(String turnId, long now) {
+        ChatTurnEntity turn = requireTurn(turnId);
+        if (turn.notificationShownAt != null) return;
+        if (dao.markNotificationShown(turnId, now) != 1) {
+            throw new IllegalStateException("Unable to record notification for " + turnId);
+        }
+    }
+
+    @Override
     public void acknowledgeUiApplied(String turnId, long now) {
         ChatTurnEntity turn = requireTurn(turnId);
         if (turn.uiAppliedAt != null) return;
         if (dao.acknowledgeUiApplied(turnId, now) != 1) {
             throw new IllegalStateException("Unable to acknowledge UI result for " + turnId);
+        }
+    }
+
+    @Override
+    public void markCloudConfirmed(String turnId, long now) {
+        ChatTurnEntity turn = requireTurn(turnId);
+        if (turn.cloudConfirmedAt != null) return;
+        if (turn.uiAppliedAt == null) {
+            throw new IllegalStateException("Cannot confirm cloud delivery before UI landing for " + turnId);
+        }
+        if (dao.markCloudConfirmed(turnId, now) != 1) {
+            throw new IllegalStateException("Unable to record cloud confirmation for " + turnId);
         }
     }
 
