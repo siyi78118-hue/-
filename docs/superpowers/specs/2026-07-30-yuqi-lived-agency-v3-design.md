@@ -616,6 +616,259 @@ PC schema v12 引入 `visible_result_manifests`。v11→v12 只允许在不存�
 
 manifest 不能破坏已有数据生命周期。“清除聊天”必须在取消未投递 delivery 后，同时清除 manifest semantic JSON、item/message 内容和 action payload，把 group/manifest 标成同一 redaction 时间；receipt/checksum、确定性 ID、origin 和最小审计壳保留。redacted group 不再可投递、执行 action、重放正文或参与生成上下文；reopen invariant 验证完整 redaction shape，而不是要求已清除内容仍能重算原 checksum。backup/export、角色删除和导入必须把 manifest 纳入与 group/receipt 相同的 FK 顺序与冲突规则。
 
+Task 10E 的独立复核证明 v12 只能作为过渡格式，不能作为最终隐私生命周期格式：v12 的 item/action 语义列为 `NOT NULL`，v11 兼容 invariant 又要求每个 group 永远至少有一个 live item，因此“保留确定性 ID、清除正文与动作 payload”的 audit shell 无法合法表示。PC schema 必须继续升到 v13；Android Room 版本仍然独立，不能跟随改号。
+
+v13 重建三个含语义副本的 projection 表，并为 turn 增加统一 redaction 标记；
+保留原表名、主键、唯一键和外键：
+
+```sql
+CREATE TABLE visible_result_items (
+  group_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  message_id TEXT NOT NULL UNIQUE,
+  item_json TEXT,
+  item_checksum TEXT NOT NULL,
+  redacted_at INTEGER,
+  PRIMARY KEY(group_id, ordinal),
+  CHECK (
+    (item_json IS NOT NULL AND redacted_at IS NULL)
+    OR (item_json IS NULL AND redacted_at IS NOT NULL)
+  ),
+  FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+);
+
+CREATE TABLE visible_result_actions (
+  group_id TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  action_id TEXT NOT NULL UNIQUE,
+  action_kind TEXT,
+  target_key TEXT,
+  target_revision TEXT,
+  action_json TEXT,
+  action_checksum TEXT NOT NULL,
+  redacted_at INTEGER,
+  PRIMARY KEY(group_id, ordinal),
+  CHECK (
+    (
+      action_kind IS NOT NULL
+      AND target_key IS NOT NULL
+      AND action_json IS NOT NULL
+      AND redacted_at IS NULL
+    )
+    OR (
+      action_kind IS NULL
+      AND target_key IS NULL
+      AND target_revision IS NULL
+      AND action_json IS NULL
+      AND redacted_at IS NOT NULL
+    )
+  ),
+  FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+);
+
+CREATE TABLE current_user_batch_items (
+  turn_id TEXT NOT NULL,
+  batch_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  message_json TEXT,
+  checksum TEXT NOT NULL,
+  redacted_at INTEGER,
+  PRIMARY KEY(turn_id, sequence),
+  UNIQUE(turn_id, message_id),
+  CHECK (
+    (message_json IS NOT NULL AND redacted_at IS NULL)
+    OR (message_json IS NULL AND redacted_at IS NOT NULL)
+  ),
+  FOREIGN KEY(turn_id) REFERENCES current_user_batches(turn_id)
+);
+
+ALTER TABLE turns ADD COLUMN authority_redacted_at INTEGER;
+ALTER TABLE turns ADD COLUMN input_clear_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turn_authority_lineages ADD COLUMN redacted_at INTEGER;
+ALTER TABLE cloud_deliveries ADD COLUMN relay_message_id TEXT;
+ALTER TABLE cloud_deliveries ADD COLUMN redaction_requested_at INTEGER;
+ALTER TABLE cloud_deliveries ADD COLUMN redaction_acknowledged_at INTEGER;
+ALTER TABLE interaction_lanes ADD COLUMN clear_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE interaction_lanes
+  ADD COLUMN cleared_through_sequence INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE conversation_clear_controls (
+  control_id TEXT PRIMARY KEY,
+  role_id TEXT NOT NULL,
+  clear_epoch INTEGER NOT NULL CHECK(clear_epoch > 0),
+  cleared_through_sequence INTEGER NOT NULL CHECK(cleared_through_sequence >= 0),
+  requested_at INTEGER NOT NULL,
+  applied_at INTEGER NOT NULL,
+  checksum TEXT NOT NULL,
+  UNIQUE(role_id, clear_epoch)
+);
+```
+
+redacted item 保留 `groupId + ordinal + messageId + itemChecksum`；redacted action 保留 `groupId + ordinal + actionId + actionChecksum`。这些 checksum 只作不可逆审计锚点，redacted 后不得再用于回算正文、target 或 payload。live row 继续逐字段重算；redacted row 只校验确定性 ID、连续 ordinal、原 checksum 格式和统一 redaction 时间。
+redacted input batch item 同样只保留 turn/batch/message identity、顺序和原 checksum。
+同一 authority lineage 的所有 attempt 都写相同 `authority_redacted_at`，
+lineage 自身写相同 `redacted_at`；
+`envelope_json` 变为固定 `{"redacted":true}`，但保留原 `envelope_checksum`，
+使 same-turn replay 仍可核对调用方原 envelope hash。retry/original replay 对完整
+incoming batch 逐项重算 checksum，并与 batch tombstone 比较；不得因为存储正文已清除
+就跳过 immutable input 验证。
+
+v12→v13 是原子、非猜测迁移。源库必须先通过专用
+`assertV12ToV13SourceInvariantsInternal()`：它使用修正后的 current-state
+规则验证所有 non-redacted group，不调用已知会误判历史 statePatch 的旧 v12
+全库入口；v12 若已有任何 `group.redacted_at`、`manifest.redacted_at` 或
+`semantic_json IS NULL` 必须在写入前拒绝，因为 v12 没有合法 audit-shell
+表示。通过后，在一个 `BEGIN IMMEDIATE` 中重建 current-batch-items/items/actions，
+原样复制 live
+rows 并令新增 `redacted_at=NULL`、`authority_redacted_at=NULL`、
+`input_clear_epoch=0`，核对 row count、每行 checksum、schema、
+index、foreign key 和 logical checksum 后才写 `user_version=13`。迁移中任何
+断点都回滚到字节语义等价的 v12；`>13` 一律拒绝。fresh、populated v9/v10/v11/v12
+都必须最终到 v13；已包含多个历史 statePatch 的合法 v12 也必须能够迁移。
+迁移 CLI 只对 clone 操作，报告字段固定为 `v13InvariantSummary`，源库 raw hash、
+schema、row count、logical checksum 和 `user_version` 均不得变化。
+
+所有 canonical group 校验统一收口到：
+
+```js
+assertVisibleGroupAuthorityInternal(groupId, {
+  purpose, // 'reopen' | 'receipt_replay' | 'delivery'
+  expectedLineageKey = null,
+  expectedTurnId = null,
+  expectedOrigin = null,
+  expectedPayloadVersion = null,
+  expectedCommitChecksum = null
+})
+// -> { status: 'live' | 'redacted', group, receipt, manifest }
+```
+
+它只读取目标 group 及其 lineage 的所有 attempt、receipt/manifest/items/actions/
+messages/current-batch tombstones/jobs/
+stances/current-state/delivery 投影，不扫描其他 group。v13 全库 reopen invariant
+负责验证全局 schema/cardinality/孤儿关系，再按稳定 group ID 枚举并各调用一次；
+`visibleDeliveryPayload()` 只调用目标 group validator，不能在一次 outbox flush
+中对同一数据库重复执行最多 50 次全库扫描。`purpose='delivery'` 遇到 redacted
+必须在读取 items/actions 前抛出 `canonical visible result is redacted`。
+
+cognitive state 是每角色一个 current row，不是每 group 一条历史 projection。
+全局规则是：每个非空 `cognitive_states.last_authority_group_id` 必须指向同 role、
+同 `last_turn_id` 的 live group，该 current row 的 checksum/mood/open threads 必须
+与该 group manifest 的 `statePatch` 一致。历史 manifest 即使包含 statePatch，只要
+其 group 已被后续合法 group 取代，就不得要求它仍拥有 current row。若未来需要逐
+次历史 state projection，必须新增 append-only revision 表，不能把 current 表误当
+历史表。
+
+已有 receipt 的所有快路径共用：
+
+```js
+readCanonicalCommitOutcomeInternal({
+  lineageKey,
+  expectedTurnId = null,
+  expectedOrigin = null,
+  expectedPayloadVersion = null,
+  expectedCommitChecksum = null
+})
+// -> { status: 'already_committed', receipt }
+//  | { status: 'redacted', receipt: receipt | null, lineage }
+```
+
+对 committed lineage，该入口必须先 join lineage/turn/group/receipt/manifest，再调用 group validator，
+最后核对调用方已知的 immutable identity；任一缺行、origin/version/checksum/turn
+不一致都抛 authority conflict。`commitVisibleResult()` 的 exact duplicate、
+same-turn create replay、committed original create 和 committed retry 都只能调用
+这个入口，不能直接 `getVisibleCommitReceipt()`。live 返回
+`status='already_committed'`；redacted 只返回不含正文/action 的 receipt metadata
+与 `status='redacted'`，调用方不得重新排队、投递、执行或把它当作普通可见成功。
+对 `state='cancelled' + redacted_at!=NULL` 且从未提交 group/receipt 的 lineage，
+它必须调用 redacted-lineage validator，证明所有 attempt/batch/message/working-copy
+都已 tombstone 后返回 `{status:'redacted', receipt:null, lineage}`。普通 cancelled
+lineage 没有这个返回资格。create original/retry 在完整 incoming envelope/batch hash
+验证后可返回该结果；一个已在运行的旧 worker 则仍必须在 commit CAS 处失败。
+
+“清除聊天”的 canonical authority 子事务顺序固定如下，Task 20 必须在同一个
+`BEGIN IMMEDIATE` 内与 stance/constraint/state/lane 生命周期变更一起调用：
+
+1. 锁定该角色所有待清聊天 turn。对 committed lineage，锁定 live group 及同
+   lineage 的全部 original/retry attempts并使用 group validator 核对 receipt/
+   manifest checksum；对 open lineage，先 CAS 为 cancelled；所有 canonical lineage
+   写统一 `redacted_at`。没有 lineage 的 Yuqi authority-version-0 turn 也必须进入
+   turn/batch/message scrub，不能因旧架构而保留正文；
+2. 清空目标 group 所有 delivery（包括 waiting/pending/retry/mailboxed/confirmed）
+   的 `payload_json/checksum`，保留 `authority_commit_checksum`。从未 enqueue、没有
+   `relay_message_id` 的 row 可直接置为 `redacted`；已经 enqueue 的 row 置为
+   `redaction_pending` 并写 `redaction_requested_at`，之后普通 pending 枚举不得再
+   返回它。持久 retraction worker 用原 deterministic `relay_message_id` 调 relay
+   `/bridge/ack`，成功或确认消息已不存在后写 `redaction_acknowledged_at` 并置
+   `redacted`；
+3. 删除该 group 尚可能执行的 memory/compare consolidation jobs；已产出的
+   evidence 由同一 clear-chat 生命周期追加 archive/expire revision，不能继续参与检索；
+4. 对关联 stance 追加 terminal revision，重建 chat-derived fast state，并保证
+   current cognitive state 不再以该 redacted group 为 `last_authority_group_id`；
+5. 清空同 lineage 所有 turn 的 `memory_packet_json`、`brain_draft_json`、
+   `supervisor_json`、`reply_json`、`error_json`、`route_reasons_json`，把
+   `annotation_snapshot_json` 改成 `{}`，把 `envelope_json` 改成固定 tombstone 并写
+   `authority_redacted_at`；清空这些 turn 的 current-batch `message_json` 并写同一
+   redaction 时间；清空对应 user/character message content；删除这些 turn/message
+   的 annotation、diagnostic 和旧 `sync_log.payload_json` 副本，只追加
+   `entity_type='authority_redaction'`、payload 仅含
+   `{groupId,redactedAt,reasonCode}` 的审计行；清除该角色 `sessions` row，保证后续模型不会续接仍含
+   已删除聊天的旧 Codex thread；
+   item 行改为
+   `item_json=NULL + redacted_at=<same time>`；action 行清空 kind/target/revision/
+   payload 并写同一 redaction 时间，保留确定性 ID 与原 checksum；
+6. 写 `manifest.semantic_json=NULL`，并把 group/manifest 标成同一 redaction 时间；
+7. 删除或重建仍指向该 group 的 lane cursor，在提交事务前用
+   `purpose='reopen'` 的 scoped validator 验证完整 redacted shell。
+
+redacted validator 必须同时证明：同 lineage 的所有 turn 工作字段为空、
+annotation snapshot 为 `{}`、route reasons 为空、
+`envelope_json={"redacted":true}` 且 `authority_redacted_at` 一致；batch item
+`message_json` 为空且 tombstone checksum/identity/顺序完整；user/character message
+content 为空；旧 sync payload 不可检索；item/action
+semantic 列为空且 tombstone ID/ordinal/redaction time 合法；manifest semantic 为空；
+所有 delivery payload 为空，且 state 只能是带 request time 的
+`redaction_pending` 或带 acknowledgement time 的 `redacted`；无 authority-group
+job；无 active
+stance head或 current cognitive-state/lane 指向该 group；无关联 annotation/
+diagnostic 或仍连接旧对话的 session。仅检查“没有 pending
+delivery”不够，因为 mailboxed/confirmed payload 同样可能保留完整回复与动作。
+没有 committed group 的 redacted-cancelled lineage 使用相同 turn/batch/message/
+annotation/diagnostic/sync/session 检查，并额外要求 `state='cancelled'`、无
+group/receipt/delivery/job、所有 attempt 不在 recoverable state。redacted 的 Yuqi
+version-0 turn 也必须满足 turn/batch/message scrub，且不得再被 legacy recovery
+或 legacy outbox 枚举。
+
+本地数据库 tombstone 不能假装撤回已经进入 relay 的密文。clear-chat 返回后，
+retraction job 必须离线可恢复并优先于普通发送；relay ACK 是幂等删除，直到成功或
+原消息自然过期才完成。与此同时 Android clear 操作必须先持久化
+`clearedThroughSequence + clearEpoch`；PC 可见结果 payload 必须携带
+`inputVisibilitySequence`，任何不高于 cleared-through cursor 的迟到 group 都只做
+receipt acknowledgement，不写 Room reply、不触发通知、不渲染 DOM。这样即使旧
+relay ciphertext 与撤回请求竞态，已清聊天也不会重新出现。
+
+`inputClearEpoch` 是 canonical input authority 的一部分。v13 migration 对历史 turn
+写 0；Task 11 创建新 turn 时从已验证 visibility cursor 固定它，wire v2 缺失时只能
+固定 0。PC 新提交使用 `pc-visible-commit-v2`，其 canonical payload 的 `input`
+固定包含 `{userBatchId, visibilitySequence, clearEpoch}`；Android 新 fallback 使用
+`android-fallback-commit-v2` 并包含同一字段。v1 receipt/manifest 继续只按原 v1
+payload 重算，且必须满足 `input_clear_epoch=0`。不能在仍名为 v1 的 checksum
+payload 中悄悄增加 clear epoch。existing-receipt replay 先闭合验证存储的
+origin/payload version，再选择相应 v1/v2 canonicalizer 重算调用方 input；新 open
+turn 一律只产生 v2。
+
+private-chat lane 持久化当前 `clear_epoch + cleared_through_sequence`。fresh turn 的
+input clear epoch 必须等于 lane current epoch；retry 继承 parent 的
+`input_clear_epoch`，并把它加入 immutable pins。一个 clear control 使用稳定
+`controlId` 和 `(roleId, clearEpoch)` 唯一键，只有 `clearEpoch > lane.clear_epoch`
+且 through-sequence 不倒退时才可应用；exact duplicate 返回同一 applied record，
+同 epoch 不同 checksum 一律冲突。事务只 redacts 满足
+`turn.input_clear_epoch < clearEpoch` 或“epoch 相等且
+`input_visibility_sequence <= clearedThroughSequence`”的 turn，绝不能因为控制消息
+迟到而清除 clear 之后的新输入。事务最后推进 lane clear cursor，再写
+`conversation_clear_controls`。PC 主动 turn 从 lane 固定最新 epoch；旧 wire v2
+在 lane epoch 已非 0 时必须升级/失败，不能用 0 绕过 clear boundary。
+
 #### 13.3.3 提交前重新校验
 
 `commitVisibleResult()` 在一个 `BEGIN IMMEDIATE` 事务中检查：
@@ -697,7 +950,7 @@ envelope、完整 current batch、parent、derived lineage 和存储的 immutabl
 rollout revision 或 agency heads 仍等于原生成时的值，因为这些 mutable authority
 在成功 commit 后按设计已经推进。
 
-v12 reopen invariant 是运行时恢复闸门，不只是表存在性检查。它拒绝
+v13 reopen invariant 是运行时恢复闸门，不只是表存在性检查。它拒绝
 `resultAuthorityVersion NOT IN (0,1)`，并验证 canonical envelope/checksum、input batch、
 release pin、lineage/retry chain、latest owner、committed turn/lineage 的实际 revision
 等于 receipt after-revision、manifest JSON/checksum/receipt 的闭合、group/item/action/message
