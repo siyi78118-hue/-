@@ -64,6 +64,34 @@ function now() {
   return Date.now();
 }
 
+function authorityLengthPrefix(value) {
+  const text = String(value ?? '');
+  return `${Buffer.byteLength(text, 'utf8')}:${text}`;
+}
+
+function authorityHash(namespace, values) {
+  const hash = createHash('sha256');
+  hash.update(`${namespace}\0`, 'utf8');
+  for (const value of values) hash.update(authorityLengthPrefix(value), 'utf8');
+  return hash.digest('hex');
+}
+
+export function deriveAuthorityLineageKey({ roleId, laneKey, rootSourceId }) {
+  return `lin_${authorityHash('al-turn-lineage-v1', [roleId, laneKey, rootSourceId])}`;
+}
+
+export function deriveVisibleGroupId(lineageKey) {
+  return `grp_${authorityHash('al-visible-group-v1', [lineageKey])}`;
+}
+
+export function deriveVisibleMessageId(groupId, ordinal) {
+  return `msg_${authorityHash('al-visible-message-v1', [groupId, String(ordinal)])}`;
+}
+
+export function deriveVisibleActionId(groupId, ordinal) {
+  return `act_${authorityHash('al-visible-action-v1', [groupId, String(ordinal)])}`;
+}
+
 function parseJson(value, fallback = null) {
   if (value === null || value === undefined || value === '') return fallback;
   try { return JSON.parse(value); } catch { return fallback; }
@@ -97,6 +125,13 @@ function mapTurn(row) {
     laneRevision: row.lane_revision ?? null,
     inputVisibilitySequence: row.input_visibility_sequence ?? null,
     generationFingerprint: row.generation_fingerprint || null,
+    resultAuthorityVersion: Number(row.result_authority_version || 0),
+    authorityLineageKey: row.authority_lineage_key || null,
+    lineageRevisionAtCreation: row.lineage_revision_at_creation ?? null,
+    turnRevision: Number(row.turn_revision || 0),
+    retryOfTurnId: row.retry_of_turn_id || null,
+    inputUserBatchId: row.input_user_batch_id || null,
+    agencySnapshotChecksum: row.agency_snapshot_checksum || null,
     presetVersion: row.preset_version || '1.9.1',
     annotationSnapshot: parseJson(row.annotation_snapshot_json, {}),
     workerId: row.worker_id || '',
@@ -152,6 +187,43 @@ function mapCognitionRollout(row) {
   };
 }
 
+function mapAuthorityLineage(row) {
+  if (!row) return null;
+  return {
+    lineageKey: row.lineage_key,
+    roleId: row.role_id,
+    laneKey: row.lane_key,
+    rootSourceId: row.root_source_id,
+    latestTurnId: row.latest_turn_id,
+    revision: Number(row.revision),
+    state: row.state,
+    committedGroupId: row.committed_group_id || null,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
+function mapVisibleCommitReceipt(row) {
+  if (!row) return null;
+  return {
+    authorityLineageKey: row.lineage_key,
+    visibleGroupId: row.group_id,
+    authoritativeTurnId: row.authoritative_turn_id,
+    authorityOrigin: row.authority_origin,
+    commitPayloadVersion: row.commit_payload_version,
+    turnRevisionBefore: Number(row.turn_revision_before),
+    turnRevisionAfter: Number(row.turn_revision_after),
+    lineageRevisionBefore: Number(row.lineage_revision_before),
+    lineageRevisionAfter: Number(row.lineage_revision_after),
+    laneRevisionBefore: row.lane_revision_before ?? null,
+    laneRevisionAfter: row.lane_revision_after ?? null,
+    cognitiveStateRevisionBefore: row.cognitive_state_revision_before ?? null,
+    cognitiveStateRevisionAfter: row.cognitive_state_revision_after ?? null,
+    commitChecksum: row.commit_checksum,
+    committedAt: Number(row.committed_at)
+  };
+}
+
 function mapEvaluationReport(row) {
   if (!row) return null;
   return {
@@ -186,6 +258,7 @@ function mapCognitiveState(row) {
     lastTurnId: row.last_turn_id,
     state: parseJson(row.state_json, {}),
     checksum: row.checksum,
+    lastAuthorityGroupId: row.last_authority_group_id || null,
     updatedAt: row.updated_at
   };
 }
@@ -207,6 +280,8 @@ function mapConsolidationJob(row) {
     payload: parseJson(row.payload_json, {}),
     payloadChecksum: row.payload_checksum,
     lastErrorCode: row.last_error_code || null,
+    authorityGroupId: row.authority_group_id || null,
+    authorityOrdinal: row.authority_ordinal ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -350,7 +425,9 @@ function mapCloudDelivery(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     deliveredAt: row.delivered_at,
-    confirmedAt: row.confirmed_at ?? null
+    confirmedAt: row.confirmed_at ?? null,
+    authorityGroupId: row.authority_group_id || null,
+    authorityCommitChecksum: row.authority_commit_checksum || null
   };
 }
 
@@ -491,7 +568,9 @@ function mapStanceRecord(row) {
     expiresAt: row.expires_at ?? null,
     remainingRelevantUserBatches: Number(row.remaining_relevant_user_batches),
     status: row.status,
-    supersedes: row.supersedes || null
+    supersedes: row.supersedes || null,
+    authorityGroupId: row.authority_group_id || null,
+    authorityOrdinal: row.authority_ordinal ?? null
   };
 }
 
@@ -550,11 +629,12 @@ export class YuqiStore {
 
   migrate() {
     const initialVersion = this.userVersion();
-    if (initialVersion > 10) {
+    if (initialVersion > 11) {
       throw new Error(`unsupported database user_version ${initialVersion}`);
     }
-    if (initialVersion === 10) {
+    if (initialVersion === 11) {
       this.assertAgencyV10Invariants();
+      this.assertVisibleAuthorityV11Invariants();
       return;
     }
     this.db.exec('BEGIN IMMEDIATE');
@@ -1092,9 +1172,17 @@ export class YuqiStore {
     `);
         this.db.exec('PRAGMA user_version = 9;');
       }
-      this.migrateAgencyV10Internal();
-      this.assertAgencyV10Invariants({ allowVersionNine: true });
-      this.db.exec('PRAGMA user_version = 10;');
+      if (initialVersion < 10) {
+        this.migrateAgencyV10Internal();
+        this.assertAgencyV10Invariants({ allowVersionNine: true });
+        this.db.exec('PRAGMA user_version = 10;');
+      }
+      if (initialVersion < 11) {
+        this.migrateVisibleAuthorityV11Internal();
+        this.assertAgencyV10Invariants({ allowPreFinalVersion: true });
+        this.assertVisibleAuthorityV11Invariants({ allowVersionTen: true });
+        this.db.exec('PRAGMA user_version = 11;');
+      }
       this.db.exec('COMMIT');
     } catch (error) {
       try { this.db.exec('ROLLBACK'); } catch {}
@@ -1268,9 +1356,211 @@ export class YuqiStore {
     );
   }
 
-  assertAgencyV10Invariants({ allowVersionNine = false } = {}) {
+  migrateVisibleAuthorityV11Internal() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS turn_authority_lineages (
+        lineage_key TEXT PRIMARY KEY,
+        role_id TEXT NOT NULL,
+        lane_key TEXT NOT NULL,
+        root_source_id TEXT NOT NULL,
+        latest_turn_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision >= 1),
+        state TEXT NOT NULL CHECK(state IN ('open','committed','cancelled')),
+        committed_group_id TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(role_id, lane_key, root_source_id),
+        CHECK(
+          (state = 'committed' AND committed_group_id IS NOT NULL)
+          OR (state IN ('open','cancelled') AND committed_group_id IS NULL)
+        )
+      );
+
+      CREATE TABLE IF NOT EXISTS visible_result_groups (
+        group_id TEXT PRIMARY KEY,
+        lineage_key TEXT NOT NULL UNIQUE,
+        authoritative_turn_id TEXT NOT NULL UNIQUE,
+        role_id TEXT NOT NULL,
+        lane_key TEXT NOT NULL,
+        authority_origin TEXT NOT NULL CHECK(authority_origin IN ('pc','android_fallback')),
+        authoritative_release_id TEXT NOT NULL,
+        generation_fingerprint TEXT NOT NULL,
+        reply_checksum TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        redacted_at INTEGER,
+        FOREIGN KEY(lineage_key) REFERENCES turn_authority_lineages(lineage_key),
+        FOREIGN KEY(authoritative_turn_id) REFERENCES turns(turn_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS visible_result_items (
+        group_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        message_id TEXT NOT NULL UNIQUE,
+        item_json TEXT NOT NULL,
+        item_checksum TEXT NOT NULL,
+        PRIMARY KEY(group_id, ordinal),
+        FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS visible_result_actions (
+        group_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        action_id TEXT NOT NULL UNIQUE,
+        action_kind TEXT NOT NULL,
+        target_key TEXT NOT NULL,
+        target_revision TEXT,
+        action_json TEXT NOT NULL,
+        action_checksum TEXT NOT NULL,
+        PRIMARY KEY(group_id, ordinal),
+        FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS visible_commit_receipts (
+        lineage_key TEXT PRIMARY KEY,
+        group_id TEXT NOT NULL UNIQUE,
+        authoritative_turn_id TEXT NOT NULL UNIQUE,
+        authority_origin TEXT NOT NULL CHECK(authority_origin IN ('pc','android_fallback')),
+        commit_payload_version TEXT NOT NULL,
+        turn_revision_before INTEGER NOT NULL,
+        turn_revision_after INTEGER NOT NULL,
+        lineage_revision_before INTEGER NOT NULL,
+        lineage_revision_after INTEGER NOT NULL,
+        lane_revision_before INTEGER,
+        lane_revision_after INTEGER,
+        cognitive_state_revision_before INTEGER,
+        cognitive_state_revision_after INTEGER,
+        commit_checksum TEXT NOT NULL UNIQUE,
+        committed_at INTEGER NOT NULL,
+        FOREIGN KEY(lineage_key) REFERENCES turn_authority_lineages(lineage_key),
+        FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id),
+        FOREIGN KEY(authoritative_turn_id) REFERENCES turns(turn_id)
+      );
+    `);
+
+    const additions = {
+      turns: {
+        result_authority_version: 'INTEGER NOT NULL DEFAULT 0',
+        authority_lineage_key: 'TEXT',
+        lineage_revision_at_creation: 'INTEGER',
+        turn_revision: 'INTEGER NOT NULL DEFAULT 0',
+        retry_of_turn_id: 'TEXT',
+        input_user_batch_id: 'TEXT',
+        agency_snapshot_checksum: 'TEXT'
+      },
+      messages: {
+        authority_group_id: 'TEXT',
+        group_ordinal: 'INTEGER'
+      },
+      cognitive_states: {
+        last_authority_group_id: 'TEXT'
+      },
+      stance_records: {
+        authority_group_id: 'TEXT',
+        authority_ordinal: 'INTEGER'
+      },
+      consolidation_jobs: {
+        authority_group_id: 'TEXT',
+        authority_ordinal: 'INTEGER'
+      },
+      cloud_deliveries: {
+        authority_group_id: 'TEXT',
+        authority_commit_checksum: 'TEXT'
+      }
+    };
+    for (const [table, columns] of Object.entries(additions)) {
+      for (const [column, definition] of Object.entries(columns)) {
+        this.addColumnIfMissing(table, column, definition);
+      }
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_authority_group_ordinal
+        ON messages(authority_group_id, group_ordinal)
+        WHERE authority_group_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_stances_authority_group_ordinal
+        ON stance_records(authority_group_id, authority_ordinal)
+        WHERE authority_group_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_consolidation_authority_group_ordinal
+        ON consolidation_jobs(authority_group_id, authority_ordinal)
+        WHERE authority_group_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_delivery_authority_group_peer
+        ON cloud_deliveries(authority_group_id, peer_id)
+        WHERE authority_group_id IS NOT NULL;
+    `);
+  }
+
+  assertVisibleAuthorityV11Invariants({ allowVersionTen = false } = {}) {
     const version = this.userVersion();
-    if ((!allowVersionNine && version !== 10) || (allowVersionNine && version !== 9)) {
+    if ((!allowVersionTen && version !== 11) || (allowVersionTen && version !== 10)) {
+      throw new Error(`v11 invariant user_version mismatch: ${version}`);
+    }
+    const requiredTables = [
+      'turn_authority_lineages',
+      'visible_result_groups',
+      'visible_result_items',
+      'visible_result_actions',
+      'visible_commit_receipts'
+    ];
+    const existing = new Set(this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).all().map(row => row.name));
+    const missing = requiredTables.filter(name => !existing.has(name));
+    if (missing.length) throw new Error(`v11 invariant missing tables: ${missing.join(',')}`);
+
+    const invalidLegacy = this.db.prepare(`
+      SELECT turn_id FROM turns
+      WHERE result_authority_version = 0
+        AND (authority_lineage_key IS NOT NULL OR lineage_revision_at_creation IS NOT NULL)
+      LIMIT 1
+    `).get();
+    if (invalidLegacy) throw new Error(`v11 invariant legacy authority leak: ${invalidLegacy.turn_id}`);
+
+    const invalidTurn = this.db.prepare(`
+      SELECT turn_id FROM turns
+      WHERE result_authority_version = 1
+        AND (
+          authority_lineage_key IS NULL OR turn_revision < 1
+          OR input_user_batch_id IS NULL OR authoritative_release_id IS NULL
+          OR lane_key IS NULL OR agency_snapshot_checksum IS NULL
+        )
+      LIMIT 1
+    `).get();
+    if (invalidTurn) throw new Error(`v11 invariant invalid canonical turn: ${invalidTurn.turn_id}`);
+
+    const invalidLineage = this.db.prepare(`
+      SELECT l.lineage_key
+      FROM turn_authority_lineages l
+      LEFT JOIN turns t ON t.turn_id = l.latest_turn_id
+      WHERE t.turn_id IS NULL OR t.authority_lineage_key != l.lineage_key
+        OR t.character_id != l.role_id OR t.lane_key != l.lane_key
+      LIMIT 1
+    `).get();
+    if (invalidLineage) {
+      throw new Error(`v11 invariant invalid lineage: ${invalidLineage.lineage_key}`);
+    }
+
+    const invalidCommitted = this.db.prepare(`
+      SELECT l.lineage_key
+      FROM turn_authority_lineages l
+      LEFT JOIN visible_result_groups g
+        ON g.lineage_key = l.lineage_key AND g.group_id = l.committed_group_id
+      LEFT JOIN visible_commit_receipts r
+        ON r.lineage_key = l.lineage_key AND r.group_id = l.committed_group_id
+      WHERE l.state = 'committed' AND (g.group_id IS NULL OR r.group_id IS NULL)
+      LIMIT 1
+    `).get();
+    if (invalidCommitted) {
+      throw new Error(`v11 invariant committed authority missing: ${invalidCommitted.lineage_key}`);
+    }
+  }
+
+  assertAgencyV10Invariants({ allowVersionNine = false, allowPreFinalVersion = false } = {}) {
+    const version = this.userVersion();
+    const versionAllowed = allowVersionNine
+      ? version === 9
+      : allowPreFinalVersion
+        ? version === 10
+        : version === 10 || version === 11;
+    if (!versionAllowed) {
       throw new Error(`v10 invariant user_version mismatch: ${version}`);
     }
     const requiredTables = [
@@ -1455,7 +1745,9 @@ export class YuqiStore {
       expiresAt: record?.expiresAt ?? null,
       remainingRelevantUserBatches: Number(record?.remainingRelevantUserBatches),
       status: String(record?.status || ''),
-      supersedes: record?.supersedes ?? null
+      supersedes: record?.supersedes ?? null,
+      authorityGroupId: record?.authorityGroupId ?? null,
+      authorityOrdinal: record?.authorityOrdinal ?? null
     };
     if (!normalized.stanceId || !normalized.roleId || !Number.isInteger(normalized.revision)) {
       throw new Error('invalid stance revision');
@@ -1474,8 +1766,8 @@ export class YuqiStore {
         stance_id, revision, role_id, topic, position_text, reason_text,
         strength, flexibility, source_turn_id, source_message_ids_json,
         created_at, last_confirmed_at, expires_at, remaining_relevant_user_batches,
-        status, supersedes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        status, supersedes, authority_group_id, authority_ordinal
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       normalized.stanceId,
       normalized.revision,
@@ -1492,7 +1784,9 @@ export class YuqiStore {
       normalized.expiresAt,
       normalized.remainingRelevantUserBatches,
       normalized.status,
-      normalized.supersedes
+      normalized.supersedes,
+      normalized.authorityGroupId,
+      normalized.authorityOrdinal
     );
     return mapStanceRecord(this.db.prepare(`
       SELECT * FROM stance_records WHERE stance_id = ? AND revision = ?
@@ -1797,6 +2091,10 @@ export class YuqiStore {
     }
   }
 
+  withImmediateTransaction(run) {
+    return this.transaction(run);
+  }
+
   appendSync(entityType, entityId, operation, payload) {
     const payloadJson = canonicalJson(payload);
     const checksum = contentHash(payload);
@@ -2061,6 +2359,782 @@ export class YuqiStore {
       presetVersion,
       annotationSnapshot
     });
+  }
+
+  getTurnAuthorityLineage(lineageKey) {
+    return mapAuthorityLineage(this.db.prepare(
+      'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
+    ).get(String(lineageKey || '')));
+  }
+
+  listTurnAuthorityLineages() {
+    return this.db.prepare(
+      'SELECT * FROM turn_authority_lineages ORDER BY created_at, lineage_key'
+    ).all().map(mapAuthorityLineage);
+  }
+
+  getVisibleCommitReceipt(lineageKey) {
+    return mapVisibleCommitReceipt(this.db.prepare(
+      'SELECT * FROM visible_commit_receipts WHERE lineage_key = ?'
+    ).get(String(lineageKey || '')));
+  }
+
+  createCanonicalVisibleTurnInternal(input = {}) {
+    for (const forbidden of [
+      'resultAuthorityVersion',
+      'authorityContractVersion',
+      'authorityLineageKey',
+      'lineageRevisionAtCreation',
+      'turnRevision'
+    ]) {
+      if (Object.hasOwn(input, forbidden)) {
+        throw new Error(`invalid authority selector input: ${forbidden}`);
+      }
+    }
+    const envelope = validateEnvelope(input.envelope);
+    const envelopeChecksum = contentHash(envelope);
+    const rolloutKey = String(input.rolloutKey || '');
+    const laneKey = String(input.laneKey || '');
+    const expectedRolloutRevision = Number(input.expectedRolloutRevision);
+    const expectedLaneRevision = Number(input.expectedLaneRevision);
+    const inputVisibilitySequence = Number(input.inputVisibilitySequence);
+    const inputUserBatchId = String(input.inputUserBatchId || '');
+    const agencySnapshotChecksum = String(input.agencySnapshotChecksum || '');
+    const retry = envelope.context?.retry || null;
+    const rootSourceId = retry?.canonicalMessageId
+      || envelope.message?.messageId
+      || envelope.trigger?.triggerId
+      || '';
+    if (!rolloutKey || !laneKey || !rootSourceId || !inputUserBatchId
+      || !Number.isInteger(expectedRolloutRevision) || expectedRolloutRevision < 0
+      || !Number.isInteger(expectedLaneRevision) || expectedLaneRevision < 0
+      || !Number.isSafeInteger(inputVisibilitySequence) || inputVisibilitySequence < 0
+      || !/^[a-f0-9]{64}$/i.test(agencySnapshotChecksum)) {
+      throw new Error('invalid canonical authority input');
+    }
+    const lineageKey = deriveAuthorityLineageKey({
+      roleId: envelope.characterId,
+      laneKey,
+      rootSourceId
+    });
+
+    return this.withImmediateTransaction(() => {
+      const exactTurn = this.getTurn(envelope.turnId);
+      if (exactTurn) {
+        if (exactTurn.envelopeChecksum !== envelopeChecksum
+          || exactTurn.resultAuthorityVersion !== 1
+          || exactTurn.authorityLineageKey !== lineageKey) {
+          throw new Error('canonical turn authority conflict');
+        }
+        const receipt = this.getVisibleCommitReceipt(lineageKey);
+        return receipt
+          ? { status: 'already_committed', receipt }
+          : { status: 'created', turn: exactTurn };
+      }
+
+      const lane = this.getInteractionLane(envelope.characterId, laneKey);
+      const actualLaneRevision = Number(lane?.revision || 0);
+      if (actualLaneRevision !== expectedLaneRevision) {
+        throw new Error('interaction lane revision conflict');
+      }
+      if (inputVisibilitySequence < Number(lane?.localSequence || 0)) {
+        throw new Error('input visibility sequence is behind lane authority');
+      }
+
+      let pinned;
+      let lineageRevision = 1;
+      let retryOfTurnId = null;
+      if (retry) {
+        const parent = this.getTurn(retry.retryOfTurnId);
+        if (!parent || parent.resultAuthorityVersion !== 1
+          || !parent.authorityLineageKey || parent.authorityLineageKey !== lineageKey) {
+          throw new Error('canonical retry parent invariant conflict');
+        }
+        const parentEnvelope = parseJson(parent.envelopeJson, {});
+        const parentMessage = parentEnvelope.message;
+        if (!parentMessage
+          || parent.sourceMessageId !== retry.canonicalMessageId
+          || envelope.message?.messageId !== retry.canonicalMessageId
+          || envelope.message?.content !== parentMessage.content
+          || Number(envelope.message?.sentAt) !== Number(parentMessage.sentAt)) {
+          throw new Error('retry canonical message conflict');
+        }
+        const lineage = this.getTurnAuthorityLineage(parent.authorityLineageKey);
+        if (!lineage) throw new Error('canonical retry lineage invariant conflict');
+        if (lineage.state === 'committed') {
+          const receipt = this.getVisibleCommitReceipt(lineage.lineageKey);
+          if (!receipt) throw new Error('committed lineage receipt invariant conflict');
+          return { status: 'already_committed', receipt };
+        }
+        if (lineage.state !== 'open' || lineage.latestTurnId !== parent.turnId) {
+          throw new Error('retry lineage authority conflict');
+        }
+        const inheritedComparisonDirection = parent.comparisonMode === 'none'
+          ? null
+          : parent.comparisonMode;
+        if (Number(input.expectedRolloutRevision) !== parent.rolloutRevision
+          || String(input.authoritativeReleaseId || '') !== String(parent.authoritativeReleaseId || '')
+          || String(input.comparisonReleaseId || '') !== String(parent.comparisonReleaseId || '')
+          || String(input.comparisonDirection || '') !== String(inheritedComparisonDirection || '')) {
+          throw new Error('canonical retry release pin conflict');
+        }
+        pinned = {
+          pipelineMode: parent.pipelineMode,
+          presetVersion: parent.presetVersion,
+          rolloutRevision: parent.rolloutRevision,
+          rolloutEvidenceEpoch: parent.rolloutEvidenceEpoch,
+          pipelineChecksum: parent.pipelineChecksum,
+          shadowEpoch: parent.shadowEpoch,
+          canaryEpoch: parent.canaryEpoch,
+          canarySlot: parent.canarySlot,
+          comparisonMode: parent.comparisonMode,
+          authoritativeReleaseId: parent.authoritativeReleaseId,
+          comparisonReleaseId: parent.comparisonReleaseId,
+          authoritativePipelineChecksum: parent.authoritativePipelineChecksum,
+          comparisonPipelineChecksum: parent.comparisonPipelineChecksum
+        };
+        lineageRevision = lineage.revision + 1;
+        retryOfTurnId = parent.turnId;
+      } else {
+        const rolloutRow = this.db.prepare(
+          'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+        ).get(rolloutKey);
+        if (!rolloutRow || Number(rolloutRow.revision) !== expectedRolloutRevision) {
+          throw new RolloutRevisionConflictError();
+        }
+        const phase = String(rolloutRow.candidate_phase || 'none');
+        const visibleReleaseId = phase === 'canary'
+          ? rolloutRow.candidate_release_id
+          : rolloutRow.stable_release_id;
+        const comparisonReleaseId = phase === 'shadow'
+          ? rolloutRow.candidate_release_id
+          : phase === 'canary'
+            ? rolloutRow.stable_release_id
+            : null;
+        const comparisonDirection = phase === 'shadow'
+          ? 'stable_authoritative_candidate_compare'
+          : phase === 'canary'
+            ? 'candidate_authoritative_stable_compare'
+            : null;
+        if (String(input.authoritativeReleaseId || '') !== String(visibleReleaseId || '')
+          || String(input.comparisonReleaseId || '') !== String(comparisonReleaseId || '')
+          || String(input.comparisonDirection || '') !== String(comparisonDirection || '')) {
+          throw new RolloutRevisionConflictError('rollout release pair conflict');
+        }
+        const authoritativeRelease = this.getPipelineRelease(visibleReleaseId);
+        const comparisonRelease = comparisonReleaseId
+          ? this.getPipelineRelease(comparisonReleaseId)
+          : null;
+        if (!authoritativeRelease || (comparisonReleaseId && !comparisonRelease)) {
+          throw new Error('canonical release authority is unavailable');
+        }
+        const existingLineage = this.getTurnAuthorityLineage(lineageKey);
+        if (existingLineage) {
+          if (existingLineage.state === 'committed') {
+            const receipt = this.getVisibleCommitReceipt(lineageKey);
+            if (!receipt) throw new Error('committed lineage receipt invariant conflict');
+            return { status: 'already_committed', receipt };
+          }
+          throw new Error('canonical lineage already has an open turn');
+        }
+        pinned = {
+          pipelineMode: phase === 'canary' ? 'active' : phase === 'shadow' ? 'shadow' : 'legacy',
+          presetVersion: authoritativeRelease.presetVersion,
+          rolloutRevision: Number(rolloutRow.revision),
+          rolloutEvidenceEpoch: Number(rolloutRow.evidence_epoch),
+          pipelineChecksum: authoritativeRelease.releaseChecksum,
+          shadowEpoch: phase === 'shadow' ? Number(rolloutRow.shadow_epoch) : null,
+          canaryEpoch: phase === 'canary' ? Number(rolloutRow.canary_epoch) : null,
+          canarySlot: phase === 'canary' ? Number(rolloutRow.canary_started_count) + 1 : null,
+          comparisonMode: comparisonDirection || 'none',
+          authoritativeReleaseId: authoritativeRelease.releaseId,
+          comparisonReleaseId: comparisonRelease?.releaseId || null,
+          authoritativePipelineChecksum: authoritativeRelease.releaseChecksum,
+          comparisonPipelineChecksum: comparisonRelease?.releaseChecksum || null
+        };
+      }
+
+      const timestamp = now();
+      this.db.prepare(`
+        INSERT INTO turns(
+          turn_id, character_id, device_id, device_seq, source_message_id,
+          state, origin, envelope_json, envelope_checksum, created_at, updated_at,
+          pipeline_mode, preset_version, annotation_snapshot_json,
+          rollout_key, comparison_mode, rollout_revision, rollout_evidence_epoch,
+          pipeline_checksum, shadow_epoch, canary_epoch, canary_slot,
+          authoritative_release_id, comparison_release_id,
+          authoritative_pipeline_checksum, comparison_pipeline_checksum,
+          lane_key, lane_revision, input_visibility_sequence, generation_fingerprint,
+          result_authority_version, authority_lineage_key,
+          lineage_revision_at_creation, turn_revision, retry_of_turn_id,
+          input_user_batch_id, agency_snapshot_checksum
+        ) VALUES (
+          ?, ?, ?, ?, ?, 'queued', 'codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?, 1, ?, ?, ?
+        )
+      `).run(
+        envelope.turnId,
+        envelope.characterId,
+        envelope.deviceId,
+        envelope.deviceSeq,
+        rootSourceId,
+        canonicalJson(envelope),
+        envelopeChecksum,
+        envelope.createdAt,
+        timestamp,
+        pinned.pipelineMode,
+        pinned.presetVersion,
+        canonicalJson(input.annotationSnapshot || {}),
+        rolloutKey,
+        pinned.comparisonMode,
+        pinned.rolloutRevision,
+        pinned.rolloutEvidenceEpoch,
+        pinned.pipelineChecksum,
+        pinned.shadowEpoch,
+        pinned.canaryEpoch,
+        pinned.canarySlot,
+        pinned.authoritativeReleaseId,
+        pinned.comparisonReleaseId,
+        pinned.authoritativePipelineChecksum,
+        pinned.comparisonPipelineChecksum,
+        laneKey,
+        expectedLaneRevision + 1,
+        inputVisibilitySequence,
+        lineageKey,
+        lineageRevision,
+        retryOfTurnId,
+        inputUserBatchId,
+        agencySnapshotChecksum
+      );
+
+      if (!retry && envelope.message) {
+        this.putMessageInternal({
+          ...envelope.message,
+          turnId: envelope.turnId,
+          characterId: envelope.characterId,
+          origin: 'phone',
+          deviceId: envelope.deviceId,
+          deviceSeq: envelope.deviceSeq
+        });
+      }
+      if (envelope.message) this.putCurrentUserBatchInternal(envelope);
+
+      if (retry) {
+        const updated = this.db.prepare(`
+          UPDATE turn_authority_lineages
+          SET latest_turn_id = ?, revision = revision + 1, updated_at = ?
+          WHERE lineage_key = ? AND latest_turn_id = ? AND revision = ?
+            AND state = 'open'
+        `).run(
+          envelope.turnId,
+          timestamp,
+          lineageKey,
+          retryOfTurnId,
+          lineageRevision - 1
+        );
+        if (Number(updated.changes) !== 1) throw new Error('retry lineage authority conflict');
+      } else {
+        this.db.prepare(`
+          INSERT INTO turn_authority_lineages(
+            lineage_key, role_id, lane_key, root_source_id, latest_turn_id,
+            revision, state, committed_group_id, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, 1, 'open', NULL, ?, ?)
+        `).run(
+          lineageKey,
+          envelope.characterId,
+          laneKey,
+          rootSourceId,
+          envelope.turnId,
+          timestamp,
+          timestamp
+        );
+      }
+      this.claimInteractionLaneInternal({
+        roleId: envelope.characterId,
+        laneKey,
+        expectedRevision: expectedLaneRevision,
+        generatingTurnId: envelope.turnId,
+        latestUserBatchId: inputUserBatchId,
+        localSequence: inputVisibilitySequence,
+        now: timestamp
+      });
+      const turn = this.getTurn(envelope.turnId);
+      this.appendSync('turn', envelope.turnId, 'insert', turn);
+      return { status: 'created', turn };
+    });
+  }
+
+  readCommitAuthority({ turnId, authorityLineageKey, laneKey }) {
+    const turn = this.getTurn(turnId);
+    return {
+      turn,
+      lineage: this.getTurnAuthorityLineage(authorityLineageKey),
+      lane: turn ? this.getInteractionLane(turn.characterId, laneKey) : null,
+      cognitiveState: turn ? this.getCognitiveState(turn.characterId) : null
+    };
+  }
+
+  visibleGroupsForLineage(lineageKey) {
+    return this.db.prepare(
+      'SELECT * FROM visible_result_groups WHERE lineage_key = ? ORDER BY created_at'
+    ).all(String(lineageKey || '')).map(row => ({
+      visibleGroupId: row.group_id,
+      authorityLineageKey: row.lineage_key,
+      authoritativeTurnId: row.authoritative_turn_id,
+      roleId: row.role_id,
+      laneKey: row.lane_key,
+      authorityOrigin: row.authority_origin,
+      authoritativeReleaseId: row.authoritative_release_id,
+      generationFingerprint: row.generation_fingerprint,
+      replyChecksum: row.reply_checksum,
+      createdAt: Number(row.created_at),
+      redactedAt: row.redacted_at ?? null
+    }));
+  }
+
+  visibleItemsForGroup(groupId) {
+    return this.db.prepare(
+      'SELECT * FROM visible_result_items WHERE group_id = ? ORDER BY ordinal'
+    ).all(String(groupId || '')).map(row => ({
+      visibleGroupId: row.group_id,
+      ordinal: Number(row.ordinal),
+      messageId: row.message_id,
+      item: parseJson(row.item_json, {}),
+      itemChecksum: row.item_checksum
+    }));
+  }
+
+  actionsForGroup(groupId) {
+    return this.db.prepare(
+      'SELECT * FROM visible_result_actions WHERE group_id = ? ORDER BY ordinal'
+    ).all(String(groupId || '')).map(row => ({
+      visibleGroupId: row.group_id,
+      ordinal: Number(row.ordinal),
+      actionId: row.action_id,
+      kind: row.action_kind,
+      targetKey: row.target_key,
+      targetRevision: row.target_revision,
+      action: parseJson(row.action_json, {}),
+      actionChecksum: row.action_checksum
+    }));
+  }
+
+  memoryJobsForGroup(groupId) {
+    return this.db.prepare(
+      'SELECT * FROM consolidation_jobs WHERE authority_group_id = ? ORDER BY authority_ordinal'
+    ).all(String(groupId || '')).map(mapConsolidationJob).filter(job =>
+      !['shadow_cognition', 'active_canary_compare'].includes(job.jobType));
+  }
+
+  comparisonJobsForGroup(groupId) {
+    return this.db.prepare(
+      'SELECT * FROM consolidation_jobs WHERE authority_group_id = ? ORDER BY authority_ordinal'
+    ).all(String(groupId || '')).map(mapConsolidationJob).filter(job =>
+      ['shadow_cognition', 'active_canary_compare'].includes(job.jobType));
+  }
+
+  outboxForGroup(groupId) {
+    return this.db.prepare(
+      'SELECT * FROM cloud_deliveries WHERE authority_group_id = ? ORDER BY peer_id'
+    ).all(String(groupId || '')).map(mapCloudDelivery);
+  }
+
+  outboxForTurn(turnId) {
+    return this.listCloudDeliveries(turnId);
+  }
+
+  visibleDeliveryPayload(groupId, peerId) {
+    const authority = this.db.prepare(`
+      SELECT
+        d.authority_group_id, d.peer_id, d.recovery_ack_seq,
+        d.authority_commit_checksum, r.lineage_key, r.authoritative_turn_id,
+        r.authority_origin, r.commit_payload_version, r.commit_checksum,
+        g.role_id, g.lane_key, g.authoritative_release_id,
+        g.generation_fingerprint
+      FROM cloud_deliveries d
+      JOIN visible_commit_receipts r
+        ON r.group_id = d.authority_group_id
+       AND r.commit_checksum = d.authority_commit_checksum
+      JOIN visible_result_groups g
+        ON g.group_id = r.group_id
+       AND g.lineage_key = r.lineage_key
+       AND g.authoritative_turn_id = r.authoritative_turn_id
+      WHERE d.authority_group_id = ? AND d.peer_id = ?
+    `).get(String(groupId || ''), String(peerId || ''));
+    if (!authority) throw new Error('canonical cloud delivery authority conflict');
+    const items = this.visibleItemsForGroup(authority.authority_group_id).map(item => ({
+      messageId: item.messageId,
+      ordinal: item.ordinal,
+      ...item.item
+    }));
+    const actions = this.actionsForGroup(authority.authority_group_id).map(action => ({
+      actionId: action.actionId,
+      ordinal: action.ordinal,
+      kind: action.actionKind,
+      targetKey: action.targetKey,
+      targetRevision: action.targetRevision,
+      ...action.action
+    }));
+    return {
+      ok: true,
+      terminal: true,
+      state: 'committed',
+      turnId: authority.authoritative_turn_id,
+      authorityLineageKey: authority.lineage_key,
+      visibleGroupId: authority.authority_group_id,
+      authorityOrigin: authority.authority_origin,
+      commitPayloadVersion: authority.commit_payload_version,
+      commitChecksum: authority.commit_checksum,
+      generationFingerprint: authority.generation_fingerprint,
+      authoritativeReleaseId: authority.authoritative_release_id,
+      roleId: authority.role_id,
+      laneKey: authority.lane_key,
+      replyParts: items,
+      actions,
+      recoveryAckSeq: Number(authority.recovery_ack_seq || 0)
+    };
+  }
+
+  prepareAuthorityCloudDelivery(groupId, peerId, payload) {
+    const payloadJson = canonicalJson(payload);
+    const checksum = contentHash(payload);
+    const existing = this.db.prepare(`
+      SELECT d.*, r.commit_checksum AS receipt_checksum
+      FROM cloud_deliveries d
+      JOIN visible_commit_receipts r ON r.group_id = d.authority_group_id
+      WHERE d.authority_group_id = ? AND d.peer_id = ?
+    `).get(String(groupId || ''), String(peerId || ''));
+    if (!existing || existing.authority_commit_checksum !== existing.receipt_checksum) {
+      throw new Error('canonical cloud delivery authority conflict');
+    }
+    if (existing.checksum && existing.checksum !== checksum) {
+      throw new Error('canonical cloud delivery payload checksum conflict');
+    }
+    if (!['mailboxed', 'confirmed'].includes(existing.state)) {
+      this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'pending', payload_json = ?, checksum = ?, updated_at = ?
+        WHERE authority_group_id = ? AND peer_id = ?
+          AND authority_commit_checksum = ?
+      `).run(
+        payloadJson,
+        checksum,
+        now(),
+        String(groupId),
+        String(peerId),
+        existing.receipt_checksum
+      );
+    }
+    return mapCloudDelivery(this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE authority_group_id = ? AND peer_id = ?
+    `).get(String(groupId), String(peerId)));
+  }
+
+  markAuthorityCloudDeliveryAttempt(groupId, peerId) {
+    const result = this.db.prepare(`
+      UPDATE cloud_deliveries SET attempts = attempts + 1, updated_at = ?
+      WHERE authority_group_id = ? AND peer_id = ? AND state = 'pending'
+    `).run(now(), String(groupId || ''), String(peerId || ''));
+    if (Number(result.changes) !== 1) throw new Error('pending canonical cloud delivery not found');
+  }
+
+  markAuthorityCloudDeliveryMailboxed(groupId, peerId, checksum) {
+    const timestamp = now();
+    const result = this.db.prepare(`
+      UPDATE cloud_deliveries
+      SET state = 'mailboxed', delivered_at = ?, updated_at = ?
+      WHERE authority_group_id = ? AND peer_id = ?
+        AND state = 'pending' AND checksum = ?
+    `).run(timestamp, timestamp, String(groupId || ''), String(peerId || ''), String(checksum || ''));
+    if (Number(result.changes) !== 1) {
+      throw new Error('canonical cloud delivery acknowledgement conflict');
+    }
+    return mapCloudDelivery(this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE authority_group_id = ? AND peer_id = ?
+    `).get(String(groupId), String(peerId)));
+  }
+
+  commitVisibleResultInternal(input) {
+    const timestamp = Number(input.now || now());
+    const turn = this.getTurn(input.turnId);
+    const lineage = this.getTurnAuthorityLineage(input.authorityLineageKey);
+    const lane = this.getInteractionLane(turn.characterId, input.laneKey);
+    const cognitiveState = this.getCognitiveState(turn.characterId);
+    const items = Array.isArray(input.visibleGroup?.items) ? input.visibleGroup.items : [];
+    const actions = Array.isArray(input.actionSet) ? input.actionSet : [];
+    if (!items.length) throw new Error('visible group items are required');
+    const failAfter = step => {
+      if (Number(this.commitFaultAfterStep) === step) {
+        throw new Error(`forced commit fault after step ${step}`);
+      }
+    };
+
+    this.db.prepare(`
+      INSERT INTO visible_result_groups(
+        group_id, lineage_key, authoritative_turn_id, role_id, lane_key,
+        authority_origin, authoritative_release_id, generation_fingerprint,
+        reply_checksum, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.groupId,
+      input.authorityLineageKey,
+      input.turnId,
+      turn.characterId,
+      input.laneKey,
+      input.authorityOrigin,
+      input.authoritativeReleaseId,
+      input.generationFingerprint,
+      contentHash(items),
+      timestamp
+    );
+    failAfter(1);
+
+    const itemInsert = this.db.prepare(`
+      INSERT INTO visible_result_items(
+        group_id, ordinal, message_id, item_json, item_checksum
+      ) VALUES (?, ?, ?, ?, ?)
+    `);
+    items.forEach((item, ordinal) => {
+      itemInsert.run(
+        input.groupId,
+        ordinal,
+        deriveVisibleMessageId(input.groupId, ordinal),
+        canonicalJson(item),
+        contentHash(item)
+      );
+    });
+    failAfter(2);
+
+    const actionInsert = this.db.prepare(`
+      INSERT INTO visible_result_actions(
+        group_id, ordinal, action_id, action_kind, target_key,
+        target_revision, action_json, action_checksum
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    actions.forEach((action, ordinal) => {
+      actionInsert.run(
+        input.groupId,
+        ordinal,
+        deriveVisibleActionId(input.groupId, ordinal),
+        String(action.kind || ''),
+        String(action.targetKey || ''),
+        action.targetRevision == null ? null : String(action.targetRevision),
+        canonicalJson(action.payload || action),
+        contentHash(action)
+      );
+    });
+    failAfter(3);
+
+    const messageInsert = this.db.prepare(`
+      INSERT INTO messages(
+        message_id, turn_id, character_id, speaker_id, speaker_type,
+        recipient_id, content, sent_at, origin, checksum, created_at,
+        authority_group_id, group_ordinal
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?, ?, ?, ?)
+    `);
+    items.forEach((item, ordinal) => {
+      const messageId = deriveVisibleMessageId(input.groupId, ordinal);
+      const projection = {
+        messageId,
+        content: String(item.content || ''),
+        recipientId: String(item.recipientId || 'user')
+      };
+      messageInsert.run(
+        messageId,
+        input.turnId,
+        turn.characterId,
+        String(item.speakerId || turn.characterId),
+        String(item.speakerType || 'character'),
+        projection.recipientId,
+        projection.content,
+        timestamp + ordinal,
+        contentHash(projection),
+        timestamp,
+        input.groupId,
+        ordinal
+      );
+    });
+    failAfter(4);
+
+    let stateRevisionAfter = Number(cognitiveState?.revision || 0);
+    if (input.statePatch) {
+      const stateJson = canonicalJson(input.statePatch.state || {});
+      const stateChecksum = contentHash(input.statePatch.state || {});
+      const update = this.db.prepare(`
+        UPDATE cognitive_states
+        SET schema_version = ?, revision = revision + 1, last_turn_id = ?,
+            state_json = ?, checksum = ?, updated_at = ?, last_authority_group_id = ?
+        WHERE role_id = ? AND revision = ?
+      `).run(
+        Number(input.statePatch.schemaVersion || cognitiveState.schemaVersion),
+        input.turnId,
+        stateJson,
+        stateChecksum,
+        timestamp,
+        input.groupId,
+        turn.characterId,
+        Number(input.expectedCognitiveStateRevision)
+      );
+      if (Number(update.changes) !== 1) throw new Error('cognitive state authority conflict');
+      stateRevisionAfter += 1;
+    }
+    failAfter(5);
+
+    (input.statePatch?.stanceRevisions || []).forEach((stance, ordinal) => {
+      this.putStanceRevisionInternal({
+        ...stance,
+        roleId: turn.characterId,
+        sourceTurnId: input.turnId,
+        authorityGroupId: input.groupId,
+        authorityOrdinal: ordinal
+      });
+    });
+    failAfter(6);
+
+    const memoryInsert = this.db.prepare(`
+      INSERT INTO consolidation_jobs(
+        job_id, subject_type, subject_id, turn_id, role_id, job_type, state,
+        attempt_count, due_at, payload_json, payload_checksum, created_at, updated_at,
+        authority_group_id, authority_ordinal
+      ) VALUES (?, 'turn', ?, ?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    (input.memoryJobs || []).forEach((job, ordinal) => {
+      const payload = job.payload || {};
+      memoryInsert.run(
+        String(job.jobId || `job_${contentHash({ group: input.groupId, ordinal }).slice(0, 24)}`),
+        input.turnId,
+        input.turnId,
+        turn.characterId,
+        String(job.jobType || 'turn_consolidation'),
+        timestamp,
+        canonicalJson(payload),
+        contentHash(payload),
+        timestamp,
+        timestamp,
+        input.groupId,
+        ordinal
+      );
+    });
+    failAfter(7);
+
+    if (input.comparisonJob) {
+      const job = input.comparisonJob;
+      const payload = {
+        ...(job.payload || {}),
+        authorityGroupId: input.groupId,
+        authoritativeResultChecksum: input.commitChecksum
+      };
+      memoryInsert.run(
+        String(job.jobId),
+        input.turnId,
+        input.turnId,
+        turn.characterId,
+        String(job.jobType),
+        timestamp,
+        canonicalJson(payload),
+        contentHash(payload),
+        timestamp,
+        timestamp,
+        input.groupId,
+        Number((input.memoryJobs || []).length)
+      );
+    }
+    failAfter(8);
+
+    this.db.prepare(`
+      INSERT INTO cloud_deliveries(
+        turn_id, peer_id, recovery_ack_seq, state, attempts,
+        created_at, updated_at, authority_group_id, authority_commit_checksum
+      ) VALUES (?, ?, 0, 'waiting', 0, ?, ?, ?, ?)
+    `).run(
+      input.turnId,
+      turn.deviceId,
+      timestamp,
+      timestamp,
+      input.groupId,
+      input.commitChecksum
+    );
+    failAfter(9);
+
+    const laneUpdate = this.db.prepare(`
+      UPDATE interaction_lanes
+      SET revision = revision + 1, generating_turn_id = NULL,
+          latest_authoritative_group_id = ?, last_commit_checksum = ?, updated_at = ?
+      WHERE role_id = ? AND lane_key = ? AND revision = ?
+        AND latest_user_batch_id = ? AND local_sequence = ?
+    `).run(
+      input.groupId,
+      input.commitChecksum,
+      timestamp,
+      turn.characterId,
+      input.laneKey,
+      Number(input.expectedLaneRevision),
+      input.expectedLatestUserBatchId,
+      Number(input.inputVisibilitySequence)
+    );
+    if (Number(laneUpdate.changes) !== 1) throw new Error('lane authority conflict');
+    failAfter(10);
+
+    const lineageUpdate = this.db.prepare(`
+      UPDATE turn_authority_lineages
+      SET state = 'committed', committed_group_id = ?, revision = revision + 1, updated_at = ?
+      WHERE lineage_key = ? AND latest_turn_id = ? AND revision = ? AND state = 'open'
+    `).run(
+      input.groupId,
+      timestamp,
+      input.authorityLineageKey,
+      input.turnId,
+      Number(input.expectedLineageRevision)
+    );
+    if (Number(lineageUpdate.changes) !== 1) throw new Error('lineage authority conflict');
+    failAfter(11);
+
+    const turnUpdate = this.db.prepare(`
+      UPDATE turns
+      SET state = 'committed', reply_json = ?, generation_fingerprint = ?,
+          turn_revision = turn_revision + 1, updated_at = ?
+      WHERE turn_id = ? AND turn_revision = ? AND result_authority_version = 1
+    `).run(
+      canonicalJson({ messages: items }),
+      input.generationFingerprint,
+      timestamp,
+      input.turnId,
+      Number(input.expectedTurnRevision)
+    );
+    if (Number(turnUpdate.changes) !== 1) throw new Error('turn authority conflict');
+    failAfter(12);
+
+    this.db.prepare(`
+      INSERT INTO visible_commit_receipts(
+        lineage_key, group_id, authoritative_turn_id, authority_origin,
+        commit_payload_version, turn_revision_before, turn_revision_after,
+        lineage_revision_before, lineage_revision_after,
+        lane_revision_before, lane_revision_after,
+        cognitive_state_revision_before, cognitive_state_revision_after,
+        commit_checksum, committed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      input.authorityLineageKey,
+      input.groupId,
+      input.turnId,
+      input.authorityOrigin,
+      input.commitPayloadVersion,
+      Number(input.expectedTurnRevision),
+      Number(input.expectedTurnRevision) + 1,
+      Number(input.expectedLineageRevision),
+      Number(input.expectedLineageRevision) + 1,
+      Number(input.expectedLaneRevision),
+      Number(input.expectedLaneRevision) + 1,
+      Number(input.expectedCognitiveStateRevision),
+      stateRevisionAfter,
+      input.commitChecksum,
+      timestamp
+    );
+    failAfter(13);
+    return {
+      ...this.getVisibleCommitReceipt(input.authorityLineageKey),
+      committed: true
+    };
   }
 
   refreshCognitionEvidenceInternal({ entries, reasonCode, now: refreshedAt = now() }) {

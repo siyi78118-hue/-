@@ -1,0 +1,60 @@
+{
+  "algorithm": "al-authority-v1",
+  "vectors": [
+    {
+      "name": "ascii",
+      "roleId": "yuqi",
+      "laneKey": "private_chat",
+      "rootSourceId": "msg_1",
+      "ordinal": 0,
+      "lineageKey": "lin_f1703edc7a68137d62b23ee718cdbcc79af5c529367d4a922b7e82810d92b550",
+      "groupId": "grp_1c9583b23acbbf43c38bfd2a292059d1fed07d34deead53e9dde97d09e5c5be7",
+      "messageId": "msg_268c38ed7355c96014813a76dc3e5a04c7b750f58f82ab107260e25facd81c77",
+      "actionId": "act_b32c8df720eda6fece60d0684f323f671199e222415956f4fb243cef3673ed8b"
+    },
+    {
+      "name": "chinese-colon",
+      "roleId": "虞栖",
+      "laneKey": "私聊",
+      "rootSourceId": "消息：你好",
+      "ordinal": 1,
+      "lineageKey": "lin_6db0f333d469bc8f7fbc558a6b19d3fe14f0d8cb7d539d14efebb465a447e72c",
+      "groupId": "grp_d1a3bd35efabf8a3505157ded6d64c1ceb9192a630cb12297821ec94206895cb",
+      "messageId": "msg_de4f61e87ba8c75b851ff0862d5d5e3d76f98802fe0dea7bc39cb2b2912f82b8",
+      "actionId": "act_8f3fd952052e24e6db846fc3f29c4a7585ccad581b3129490089ba532a69c5ba"
+    },
+    {
+      "name": "emoji",
+      "roleId": "yuqi🌧️",
+      "laneKey": "lane:💬",
+      "rootSourceId": "🙂",
+      "ordinal": 12,
+      "lineageKey": "lin_c6310d399fca2659932d595788509db483522e4ff93f2aefa03d65a059ddab94",
+      "groupId": "grp_22a469ac8457c4f774ce07929ea30d2903e099798ce4970b7b679ee0ebcce93f",
+      "messageId": "msg_8cca93a092092e6acac2138e1e5d1bcd482ec4618317e9eb9d6cbddd6f335509",
+      "actionId": "act_b6ec26168315feab4a20348a17208c3be344b8af2cf17a5040ff093663a51e37"
+    },
+    {
+      "name": "empty-strings",
+      "roleId": "",
+      "laneKey": "",
+      "rootSourceId": "",
+      "ordinal": 0,
+      "lineageKey": "lin_5f4f29002f190668cc5d66def341d15440b124d56e8f0c719ea9a92e8148098d",
+      "groupId": "grp_35bd9b44fcb1106f1eaf491653dc14de1265817c85f7a655934958d6fd3b6035",
+      "messageId": "msg_66bc7e8ea4c98413dd8270b251484ff62cf00a3b9c3dc040f0cc9d37841b46c6",
+      "actionId": "act_7cf8ae55cb1ab893cbd7aa01eb356b1eb5f9fbf87d197f3a323e99f8e651abaa"
+    },
+    {
+      "name": "large-ordinal",
+      "roleId": "yuqi",
+      "laneKey": "private_chat",
+      "rootSourceId": "root:colon",
+      "ordinal": 9007199254740991,
+      "lineageKey": "lin_6d95e906de322093e30f3ddadff3bfe9ce418c1b92acbd18c79939922f19e70f",
+      "groupId": "grp_30bc4916eabdd0cde9eed2acbb6c20a3a0e1e20b5d0b3024d40c42123b5e3eee",
+      "messageId": "msg_5074e5f4db3022b6fa0f61e23f86b68e909ccabbddd02c515a5bd91130a2f7f6",
+      "actionId": "act_78f15aa377692b4c50c59fd976752c08062ad2513e4907aaf1093895e10f812d"
+    }
+  ]
+}

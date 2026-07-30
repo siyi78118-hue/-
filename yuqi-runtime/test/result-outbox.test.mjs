@@ -5,8 +5,10 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { decryptRelayPayload } from '../src/cloud-relay-pump.mjs';
+import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import { ResultOutbox } from '../src/result-outbox.mjs';
 import { YuqiStore } from '../src/store.mjs';
+import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
 const keyBase64 = Buffer.alloc(32, 9).toString('base64');
 
@@ -170,5 +172,140 @@ test('delivers an automatic skip as a successful terminal action without inventi
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('canonical original and retry restart emit one group-keyed delivery', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yuqi-authority-outbox-'));
+  const file = join(dir, 'runtime.sqlite');
+  let store = new YuqiStore(file);
+  try {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'DIRECT_REPLY',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: 'a'.repeat(64)
+      }],
+      now: 1
+    });
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const baseEnvelope = envelope();
+    const original = store.createCanonicalVisibleTurnInternal({
+      envelope: baseEnvelope,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 0,
+      inputUserBatchId: baseEnvelope.message.messageId,
+      inputVisibilitySequence: 0,
+      agencySnapshotChecksum: 'a'.repeat(64),
+      annotationSnapshot: {}
+    }).turn;
+    const retryEnvelope = structuredClone(baseEnvelope);
+    retryEnvelope.turnId = 'turn_cloud_outbox_retry';
+    retryEnvelope.deviceSeq += 1;
+    retryEnvelope.context = {
+      retry: {
+        retryOfTurnId: original.turnId,
+        canonicalMessageId: baseEnvelope.message.messageId
+      }
+    };
+    const retry = store.createCanonicalVisibleTurnInternal({
+      envelope: retryEnvelope,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: original.rolloutRevision,
+      authoritativeReleaseId: original.authoritativeReleaseId,
+      comparisonReleaseId: original.comparisonReleaseId,
+      comparisonDirection: original.comparisonDirection,
+      laneKey: 'private_chat',
+      expectedLaneRevision: store.getInteractionLane('yuqi', 'private_chat').revision,
+      inputUserBatchId: original.inputUserBatchId,
+      inputVisibilitySequence: original.inputVisibilitySequence,
+      agencySnapshotChecksum: original.agencySnapshotChecksum,
+      annotationSnapshot: original.annotationSnapshot
+    }).turn;
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi',
+      schemaVersion: 2,
+      revision: 1,
+      lastTurnId: retry.turnId,
+      state: { slowState: {}, mediumState: {}, fastState: {} },
+      updatedAt: 1
+    });
+    const visibleGroup = {
+      items: [{
+        content: '在。',
+        speakerId: 'yuqi',
+        speakerType: 'character',
+        recipientId: 'user'
+      }]
+    };
+    const actionSet = [];
+    const generation = generationFingerprint({
+      roleId: retry.characterId,
+      laneKey: retry.laneKey,
+      laneRevision: retry.laneRevision,
+      visibleGroup,
+      actionSet,
+      contextRevision: retry.agencySnapshotChecksum
+    });
+    const receipt = commitVisibleResult({
+      store,
+      turnId: retry.turnId,
+      authorityLineageKey: retry.authorityLineageKey,
+      laneKey: retry.laneKey,
+      expectedTurnRevision: retry.turnRevision,
+      expectedLineageRevision: store.getTurnAuthorityLineage(retry.authorityLineageKey).revision,
+      expectedLaneRevision: store.getInteractionLane('yuqi', 'private_chat').revision,
+      expectedCognitiveStateRevision: 1,
+      expectedLatestUserBatchId: retry.inputUserBatchId,
+      inputVisibilitySequence: retry.inputVisibilitySequence,
+      agencySnapshotChecksum: retry.agencySnapshotChecksum,
+      authoritativeReleaseId: retry.authoritativeReleaseId,
+      visibleGroup,
+      actionSet,
+      statePatch: {
+        roleId: 'yuqi',
+        schemaVersion: 2,
+        revision: 2,
+        state: { slowState: {}, mediumState: {}, fastState: {} }
+      },
+      memoryJobs: [],
+      comparisonJob: null,
+      generationFingerprint: generation,
+      now: 2
+    });
+    assert.equal(store.outboxForTurn(original.turnId).length, 0);
+    store.close();
+    store = new YuqiStore(file);
+
+    const attempts = [];
+    const outbox = new ResultOutbox({
+      relayUrl: 'https://relay.example',
+      deviceId: 'phone_cloud',
+      deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64,
+      store,
+      fetchImpl: async (_url, options) => {
+        attempts.push(JSON.parse(options.body));
+        return Response.json({ ok: true }, { status: 201 });
+      }
+    });
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 1, failed: 0, waiting: 0 });
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 0, waiting: 0 });
+    assert.equal(attempts.length, 1);
+    const decoded = decryptRelayPayload(attempts[0], keyBase64);
+    assert.equal(decoded.visibleGroupId, receipt.visibleGroupId);
+    assert.equal(decoded.authorityLineageKey, retry.authorityLineageKey);
+    assert.equal(decoded.commitChecksum, receipt.commitChecksum);
+    assert.equal(decoded.replyParts[0].content, '在。');
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

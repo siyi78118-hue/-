@@ -22,7 +22,13 @@ const STRUCTURAL_TABLES = Object.freeze([
   'role_plans',
   'life_episodes',
   'turns',
-  'result_outbox'
+  'result_outbox',
+  'turn_authority_lineages',
+  'visible_result_groups',
+  'visible_result_items',
+  'visible_result_actions',
+  'visible_commit_receipts',
+  'cloud_deliveries'
 ]);
 
 function normalizedText(value) {
@@ -292,6 +298,39 @@ function fileSha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
+function rawDatabaseSnapshot(path) {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    return {
+      sha256: fileSha256(path),
+      userVersion: Number(database.prepare('PRAGMA user_version').get().user_version),
+      tableCounts: tableCounts(database)
+    };
+  } finally {
+    database.close();
+  }
+}
+
+function v11InvariantSummary(store) {
+  store.assertAgencyV10Invariants();
+  store.assertVisibleAuthorityV11Invariants();
+  const tableCountsAfter = tableCounts(store.db);
+  const summary = {
+    userVersion: store.userVersion(),
+    tableCounts: tableCountsAfter,
+    canonicalTurnCount: Number(store.db.prepare(
+      'SELECT COUNT(*) AS value FROM turns WHERE result_authority_version = 1'
+    ).get().value),
+    lineageCount: Number(store.db.prepare(
+      'SELECT COUNT(*) AS value FROM turn_authority_lineages'
+    ).get().value),
+    receiptCount: Number(store.db.prepare(
+      'SELECT COUNT(*) AS value FROM visible_commit_receipts'
+    ).get().value)
+  };
+  return { ...summary, checksum: contentHash(summary) };
+}
+
 function sqliteString(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
@@ -336,25 +375,40 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
   if (dryRun && !cloneOut && !explicitDatabase) {
     throw new Error('production dry-run requires --clone-out');
   }
+  const sourceBefore = rawDatabaseSnapshot(sourceDatabase);
+  const expectedPath = option('--expect-report');
+  if (apply && expectedPath) {
+    const expected = JSON.parse(readFileSync(resolve(expectedPath), 'utf8'));
+    if (expected.sourceDatabaseSha256 !== sourceBefore.sha256
+      || Number(expected.sourceUserVersion) !== sourceBefore.userVersion
+      || canonicalJson(expected.sourceTableCounts) !== canonicalJson(sourceBefore.tableCounts)) {
+      throw new Error('migration source changed since approved dry-run');
+    }
+  }
   if (cloneOut && resolve(cloneOut) !== sourceDatabase) cloneDatabase(sourceDatabase, resolve(cloneOut));
   const workingDatabase = cloneOut ? resolve(cloneOut) : sourceDatabase;
-  const sourceDatabaseSha256 = fileSha256(sourceDatabase);
   const store = new YuqiStore(workingDatabase);
   let report;
   try {
     report = migrateAgencyState({ store, apply, now: Date.now() });
+    report.workingUserVersion = store.userVersion();
+    report.v11InvariantSummary = v11InvariantSummary(store);
   } finally {
     store.close();
   }
-  report.sourceDatabaseSha256 = sourceDatabaseSha256;
+  const sourceAfter = rawDatabaseSnapshot(sourceDatabase);
+  report.sourceDatabaseSha256 = sourceBefore.sha256;
+  report.sourceDatabaseSha256After = sourceAfter.sha256;
+  report.sourceUserVersion = sourceBefore.userVersion;
+  report.sourceTableCounts = sourceBefore.tableCounts;
   report.workingDatabaseSha256 = fileSha256(workingDatabase);
   report.applied = apply;
 
-  const expectedPath = option('--expect-report');
   if (expectedPath) {
     const expected = JSON.parse(readFileSync(resolve(expectedPath), 'utf8'));
     if (expected.decisionChecksum !== report.decisionChecksum
-      || canonicalJson(expected.beforeCounts) !== canonicalJson(report.beforeCounts)) {
+      || canonicalJson(expected.beforeCounts) !== canonicalJson(report.beforeCounts)
+      || canonicalJson(expected.v11InvariantSummary) !== canonicalJson(report.v11InvariantSummary)) {
       throw new Error('migration dry-run/apply report checksum mismatch');
     }
   }

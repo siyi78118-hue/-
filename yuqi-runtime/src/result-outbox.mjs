@@ -34,6 +34,52 @@ export class ResultOutbox {
     const summary = { delivered: 0, failed: 0, waiting: 0 };
     try {
       for (const target of this.store.listPendingCloudDeliveries(limit)) {
+        if (target.authorityGroupId) {
+          try {
+            const publicPayload = this.store.visibleDeliveryPayload(
+              target.authorityGroupId,
+              target.peerId
+            );
+            const delivery = this.store.prepareAuthorityCloudDelivery(
+              target.authorityGroupId,
+              target.peerId,
+              publicPayload
+            );
+            this.store.markAuthorityCloudDeliveryAttempt(
+              target.authorityGroupId,
+              target.peerId
+            );
+            const encrypted = encryptRelayPayload(publicPayload, this.encryptionKeyBase64);
+            const identity = `${target.authorityGroupId}:${target.peerId}:${target.authorityCommitChecksum}`;
+            const output = {
+              deviceId: this.deviceId,
+              messageId: stableId('relay_pc', identity),
+              idempotencyKey: stableId('reply', identity),
+              direction: 'pc_to_phone',
+              ...encrypted,
+              expiresAt: this.clock() + 24 * 60 * 60 * 1000
+            };
+            const response = await this.fetch(`${this.relayUrl}/bridge/enqueue`, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${this.deviceToken}`,
+                accept: 'application/json',
+                'content-type': 'application/json'
+              },
+              body: JSON.stringify(output)
+            });
+            if (!response.ok) throw new Error(`cloud relay enqueue HTTP ${response.status}`);
+            this.store.markAuthorityCloudDeliveryMailboxed(
+              target.authorityGroupId,
+              target.peerId,
+              delivery.checksum
+            );
+            summary.delivered += 1;
+          } catch {
+            summary.failed += 1;
+          }
+          continue;
+        }
         const turn = this.store.getTurn(target.turnId);
         const status = publicTurnStatus(turn);
         if (!status?.terminal) {

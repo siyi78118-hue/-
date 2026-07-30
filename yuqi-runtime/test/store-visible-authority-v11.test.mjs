@@ -1,0 +1,711 @@
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
+import test from 'node:test';
+
+import { YuqiStore } from '../src/store.mjs';
+
+const SHA_A = 'a'.repeat(64);
+const SHA_B = 'b'.repeat(64);
+
+function withDatabase(run) {
+  const directory = mkdtempSync(join(tmpdir(), 'yuqi-visible-v11-'));
+  const path = join(directory, 'memory.sqlite');
+  try {
+    return run(path);
+  } finally {
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+}
+
+function tableCounts(database) {
+  return Object.fromEntries([
+    'turns',
+    'messages',
+    'cloud_deliveries',
+    'cognitive_states',
+    'consolidation_jobs',
+    'cognition_kind_rollouts',
+    'pipeline_releases',
+    'interaction_lanes'
+  ].map(table => [
+    table,
+    Number(database.prepare(`SELECT COUNT(*) AS value FROM "${table}"`).get().value)
+  ]));
+}
+
+function fileSha256(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function createPopulatedV10(path) {
+  const database = new DatabaseSync(path);
+  try {
+    database.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE turns (
+        turn_id TEXT PRIMARY KEY,
+        character_id TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        device_seq INTEGER NOT NULL,
+        source_message_id TEXT NOT NULL,
+        state TEXT NOT NULL,
+        worker_id TEXT,
+        origin TEXT NOT NULL DEFAULT 'codex',
+        memory_packet_json TEXT,
+        brain_draft_json TEXT,
+        supervisor_json TEXT,
+        reply_json TEXT,
+        error_json TEXT,
+        envelope_json TEXT NOT NULL,
+        envelope_checksum TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        route TEXT NOT NULL DEFAULT 'deep',
+        route_reasons_json TEXT NOT NULL DEFAULT '[]',
+        pipeline_mode TEXT NOT NULL DEFAULT 'legacy',
+        preset_version TEXT NOT NULL DEFAULT '1.9.1',
+        annotation_snapshot_json TEXT NOT NULL DEFAULT '{}',
+        rollout_key TEXT,
+        comparison_mode TEXT NOT NULL DEFAULT 'none',
+        rollout_revision INTEGER NOT NULL DEFAULT 0,
+        rollout_evidence_epoch INTEGER NOT NULL DEFAULT 0,
+        pipeline_checksum TEXT NOT NULL DEFAULT '',
+        shadow_epoch INTEGER,
+        canary_epoch INTEGER,
+        canary_slot INTEGER,
+        authoritative_release_id TEXT,
+        comparison_release_id TEXT,
+        authoritative_pipeline_checksum TEXT,
+        comparison_pipeline_checksum TEXT,
+        lane_key TEXT,
+        lane_revision INTEGER,
+        input_visibility_sequence INTEGER,
+        generation_fingerprint TEXT,
+        UNIQUE(device_id, device_seq)
+      );
+      CREATE TABLE messages (
+        message_id TEXT PRIMARY KEY,
+        turn_id TEXT NOT NULL,
+        character_id TEXT NOT NULL,
+        speaker_id TEXT NOT NULL,
+        speaker_type TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        sent_at INTEGER NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'codex',
+        device_id TEXT,
+        device_seq INTEGER,
+        checksum TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE cloud_deliveries (
+        turn_id TEXT NOT NULL,
+        peer_id TEXT NOT NULL,
+        recovery_ack_seq INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'waiting',
+        payload_json TEXT,
+        checksum TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        delivered_at INTEGER,
+        confirmed_at INTEGER,
+        PRIMARY KEY(turn_id, peer_id)
+      );
+      CREATE TABLE cognitive_states (
+        role_id TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL,
+        revision INTEGER NOT NULL,
+        last_turn_id TEXT NOT NULL,
+        state_json TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE consolidation_jobs (
+        job_id TEXT PRIMARY KEY,
+        subject_type TEXT NOT NULL,
+        subject_id TEXT NOT NULL,
+        turn_id TEXT,
+        role_id TEXT NOT NULL,
+        job_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        due_at INTEGER NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at INTEGER,
+        payload_json TEXT NOT NULL,
+        payload_checksum TEXT NOT NULL,
+        last_error_code TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(subject_type, subject_id, job_type)
+      );
+      CREATE TABLE cognition_kind_rollouts (
+        rollout_key TEXT PRIMARY KEY,
+        current_mode TEXT NOT NULL,
+        rollout_phase TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        preset_version TEXT NOT NULL,
+        pipeline_checksum TEXT NOT NULL,
+        evidence_epoch INTEGER NOT NULL DEFAULT 1,
+        shadow_epoch INTEGER NOT NULL DEFAULT 0,
+        canary_epoch INTEGER NOT NULL DEFAULT 0,
+        stable_release_id TEXT,
+        candidate_release_id TEXT,
+        candidate_phase TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE cognition_life_planning_attempts (
+        planning_id TEXT PRIMARY KEY,
+        authoritative_release_id TEXT,
+        comparison_release_id TEXT,
+        authoritative_pipeline_checksum TEXT,
+        comparison_pipeline_checksum TEXT,
+        lane_key TEXT,
+        lane_revision INTEGER,
+        input_visibility_sequence INTEGER,
+        generation_fingerprint TEXT
+      );
+      CREATE TABLE pipeline_releases (
+        release_id TEXT PRIMARY KEY,
+        pipeline_version TEXT NOT NULL,
+        preset_version TEXT NOT NULL,
+        cognition_schema_version INTEGER NOT NULL,
+        expression_schema_version INTEGER NOT NULL,
+        evaluator_version TEXT NOT NULL,
+        model_profile_json TEXT NOT NULL,
+        component_manifest_json TEXT NOT NULL,
+        release_checksum TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        retired_at INTEGER
+      );
+      CREATE TABLE constraint_records (
+        constraint_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        role_id TEXT NOT NULL,
+        authority TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        scope_json TEXT NOT NULL,
+        rule_text TEXT NOT NULL,
+        source_message_ids_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(constraint_id, revision)
+      );
+      CREATE TABLE stance_records (
+        stance_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        role_id TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        position_text TEXT NOT NULL,
+        reason_text TEXT NOT NULL,
+        strength REAL NOT NULL,
+        flexibility REAL NOT NULL,
+        source_turn_id TEXT NOT NULL,
+        source_message_ids_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_confirmed_at INTEGER NOT NULL,
+        remaining_relevant_user_batches INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        PRIMARY KEY(stance_id, revision)
+      );
+      CREATE TABLE interaction_lanes (
+        role_id TEXT NOT NULL,
+        lane_key TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        generating_turn_id TEXT,
+        latest_user_batch_id TEXT,
+        latest_authoritative_group_id TEXT,
+        native_completed_group_id TEXT,
+        native_completed_sequence INTEGER NOT NULL DEFAULT 0,
+        ui_applied_group_id TEXT,
+        ui_applied_sequence INTEGER NOT NULL DEFAULT 0,
+        local_sequence INTEGER NOT NULL DEFAULT 0,
+        last_commit_checksum TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(role_id, lane_key)
+      );
+      CREATE TABLE quality_eval_runs (
+        eval_run_id TEXT PRIMARY KEY,
+        release_id TEXT NOT NULL,
+        baseline_release_id TEXT NOT NULL,
+        suite_version TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        manifest_checksum TEXT NOT NULL,
+        summary_json TEXT NOT NULL,
+        artifact_path TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE quality_findings (
+        finding_id TEXT PRIMARY KEY,
+        eval_run_id TEXT NOT NULL,
+        rollout_key TEXT NOT NULL,
+        scene_id TEXT NOT NULL,
+        repeat_index INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        scores_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE state_migration_audit (
+        audit_id TEXT PRIMARY KEY,
+        role_id TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      INSERT INTO pipeline_releases VALUES
+        ('stable', 'legacy', '1.9.2', 2, 2, 'eval', '{}', '{}', '${SHA_A}', 1, NULL),
+        ('candidate', 'v3', '1.9.2', 3, 3, 'eval', '{}', '{}', '${SHA_B}', 1, NULL);
+      INSERT INTO cognition_kind_rollouts(
+        rollout_key, current_mode, rollout_phase, revision, preset_version,
+        pipeline_checksum, stable_release_id, candidate_release_id, candidate_phase,
+        created_at, updated_at
+      ) VALUES (
+        'DIRECT_REPLY', 'legacy', 'stable', 1, '1.9.2', '${SHA_A}',
+        'stable', 'candidate', 'none', 1, 1
+      );
+      INSERT INTO turns(
+        turn_id, character_id, device_id, device_seq, source_message_id, state,
+        reply_json, envelope_json, envelope_checksum, created_at, updated_at,
+        rollout_key, authoritative_release_id, authoritative_pipeline_checksum,
+        lane_key, lane_revision, input_visibility_sequence, generation_fingerprint
+      ) VALUES (
+        'turn_v2', 'yuqi', 'phone', 1, 'source_v2', 'completed',
+        '{"messages":["旧回复"]}', '{"protocolVersion":2,"kind":"DIRECT_REPLY"}',
+        '${SHA_A}', 1, 2, 'DIRECT_REPLY', 'stable', '${SHA_A}',
+        'private_chat', 0, 1, '${SHA_B}'
+      );
+      INSERT INTO messages VALUES (
+        'message_v2', 'turn_v2', 'yuqi', 'yuqi', 'character', 'user',
+        '旧回复', 2, 'codex', NULL, NULL, '${SHA_A}', 2
+      );
+      INSERT INTO cloud_deliveries(
+        turn_id, peer_id, state, payload_json, checksum, created_at, updated_at
+      ) VALUES ('turn_v2', 'phone', 'confirmed', '{}', '${SHA_A}', 2, 2);
+      INSERT INTO cognitive_states VALUES (
+        'yuqi', 2, 1, 'turn_v2', '{}', '${SHA_A}', 2
+      );
+      INSERT INTO interaction_lanes(
+        role_id, lane_key, revision, latest_authoritative_group_id, updated_at
+      ) VALUES ('yuqi', 'private_chat', 1, 'legacy_group', 2);
+      PRAGMA user_version = 10;
+    `);
+    return tableCounts(database);
+  } finally {
+    database.close();
+  }
+}
+
+function v2Envelope(turnId, deviceSeq, {
+  messageId = 'msg_source_original',
+  content = '测试消息',
+  sentAt = 10_001,
+  retry = null
+} = {}) {
+  return {
+    protocolVersion: 2,
+    turnId,
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq,
+    createdAt: 10_000 + deviceSeq,
+    kind: 'DIRECT_REPLY',
+    message: {
+      messageId,
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content,
+      sentAt
+    },
+    ...(retry ? { context: { retry } } : {})
+  };
+}
+
+function canonicalCreateInput(store, envelope, overrides = {}) {
+  const rollout = store.getCognitionRollout('DIRECT_REPLY');
+  const lane = store.getInteractionLane('yuqi', 'private_chat');
+  return {
+    envelope,
+    rolloutKey: 'DIRECT_REPLY',
+    expectedRolloutRevision: rollout.revision,
+    authoritativeReleaseId: rollout.stableReleaseId,
+    comparisonReleaseId: rollout.candidatePhase === 'shadow'
+      ? rollout.candidateReleaseId
+      : null,
+    comparisonDirection: rollout.candidatePhase === 'shadow'
+      ? 'stable_authoritative_candidate_compare'
+      : null,
+    laneKey: 'private_chat',
+    expectedLaneRevision: Number(lane?.revision || 0),
+    inputUserBatchId: envelope.message.messageId,
+    inputVisibilitySequence: 0,
+    agencySnapshotChecksum: SHA_A,
+    annotationSnapshot: {},
+    ...overrides
+  };
+}
+
+function ensureDirectRollout(store) {
+  if (store.getCognitionRollout('DIRECT_REPLY')) return;
+  store.initializeCognitionRolloutsInternal({
+    rows: [{
+      rolloutKey: 'DIRECT_REPLY',
+      currentMode: 'legacy',
+      rolloutPhase: 'stable',
+      presetVersion: '1.9.2',
+      pipelineChecksum: SHA_A
+    }],
+    now: 1
+  });
+}
+
+test('populated PC v10 migrates once to v11 without inventing historical authority', () =>
+  withDatabase(path => {
+    const before = createPopulatedV10(path);
+    let store = new YuqiStore(path);
+    try {
+      assert.equal(store.userVersion(), 11);
+      assert.deepEqual(tableCounts(store.db), before);
+      const oldTurn = store.getTurn('turn_v2');
+      assert.equal(oldTurn.resultAuthorityVersion, 0);
+      assert.equal(oldTurn.authorityLineageKey, null);
+      assert.equal(store.listTurnAuthorityLineages().length, 0);
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM visible_result_groups').get().value, 0);
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM visible_commit_receipts').get().value, 0);
+      store.close();
+
+      store = new YuqiStore(path);
+      assert.equal(store.userVersion(), 11);
+      assert.deepEqual(tableCounts(store.db), before);
+      assert.equal(store.listTurnAuthorityLineages().length, 0);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('migration CLI preserves a raw populated v10 source and produces a restart-stable v11 clone report', () =>
+  withDatabase(path => {
+    createPopulatedV10(path);
+    const directory = join(path, '..');
+    const clone = join(directory, 'clone.sqlite');
+    const reportPath = join(directory, 'migration-report.json');
+    const sourceHash = fileSha256(path);
+    const command = spawnSync(process.execPath, [
+      join(process.cwd(), 'scripts', 'migrate-yuqi-agency-state.mjs'),
+      '--database', path,
+      '--dry-run',
+      '--clone-out', clone,
+      '--out', reportPath
+    ], {
+      cwd: process.cwd(),
+      encoding: 'utf8'
+    });
+    assert.equal(command.status, 0, command.stderr || command.stdout);
+    assert.equal(fileSha256(path), sourceHash);
+    const report = JSON.parse(readFileSync(reportPath, 'utf8'));
+    assert.equal(report.sourceUserVersion, 10);
+    assert.equal(report.workingUserVersion, 11);
+    assert.equal(report.sourceDatabaseSha256, sourceHash);
+    assert.equal(report.sourceDatabaseSha256After, sourceHash);
+    assert.match(report.workingDatabaseSha256, /^[a-f0-9]{64}$/);
+    assert.equal(report.v11InvariantSummary.userVersion, 11);
+    assert.match(report.v11InvariantSummary.checksum, /^[a-f0-9]{64}$/);
+    assert.ok(Object.hasOwn(report.sourceTableCounts, 'turns'));
+    assert.ok(Object.hasOwn(report.v11InvariantSummary.tableCounts, 'visible_commit_receipts'));
+
+    const first = new YuqiStore(clone);
+    const logicalBefore = {
+      counts: tableCounts(first.db),
+      summary: report.v11InvariantSummary
+    };
+    first.close();
+    const second = new YuqiStore(clone);
+    assert.deepEqual(tableCounts(second.db), logicalBefore.counts);
+    assert.equal(second.userVersion(), 11);
+    second.close();
+  }));
+
+test('ordinary protocol-v2 release-pinned creation remains legacy authority on v11', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const turn = store.createTurnWithReleasePinInternal({
+        envelope: v2Envelope('turn_legacy', 1),
+        rolloutKey: 'DIRECT_REPLY',
+        laneKey: 'private_chat',
+        expectedLaneRevision: 0,
+        inputVisibilitySequence: 0
+      });
+      assert.equal(turn.resultAuthorityVersion, 0);
+      assert.equal(turn.authorityLineageKey, null);
+      assert.equal(store.listTurnAuthorityLineages().length, 0);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('explicit canonical internal creation accepts protocol v2 and creates one lineage', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const envelope = v2Envelope('turn_original', 1);
+      const outcome = store.createCanonicalVisibleTurnInternal(
+        canonicalCreateInput(store, envelope)
+      );
+      assert.equal(outcome.status, 'created');
+      assert.equal(outcome.turn.resultAuthorityVersion, 1);
+      assert.equal(outcome.turn.turnRevision, 1);
+      const lineage = store.getTurnAuthorityLineage(outcome.turn.authorityLineageKey);
+      assert.equal(lineage.rootSourceId, envelope.message.messageId);
+      assert.equal(lineage.latestTurnId, 'turn_original');
+      assert.equal(lineage.revision, 1);
+      assert.equal(lineage.state, 'open');
+    } finally {
+      store.close();
+    }
+  }));
+
+test('retry reuses the original lineage and stale sibling retry loses lineage CAS', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const originalEnvelope = v2Envelope('turn_original', 1);
+      const original = store.createCanonicalVisibleTurnInternal(
+        canonicalCreateInput(store, originalEnvelope)
+      ).turn;
+      const retryEnvelope = v2Envelope('turn_retry_1', 2, {
+        messageId: originalEnvelope.message.messageId,
+        content: originalEnvelope.message.content,
+        sentAt: originalEnvelope.message.sentAt,
+        retry: {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: originalEnvelope.message.messageId
+        }
+      });
+      const retry1 = store.createCanonicalVisibleTurnInternal({
+        ...canonicalCreateInput(store, retryEnvelope),
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode,
+        expectedRolloutRevision: original.rolloutRevision
+      }).turn;
+      assert.equal(retry1.authorityLineageKey, original.authorityLineageKey);
+      assert.equal(
+        store.getTurnAuthorityLineage(original.authorityLineageKey).latestTurnId,
+        retry1.turnId
+      );
+      const siblingEnvelope = v2Envelope('turn_retry_2', 3, {
+        messageId: originalEnvelope.message.messageId,
+        content: originalEnvelope.message.content,
+        sentAt: originalEnvelope.message.sentAt,
+        retry: {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: originalEnvelope.message.messageId
+        }
+      });
+      assert.throws(() => store.createCanonicalVisibleTurnInternal({
+        ...canonicalCreateInput(store, siblingEnvelope),
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode,
+        expectedRolloutRevision: original.rolloutRevision
+      }), /retry lineage authority conflict/i);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('canonical creation rejects caller-selected authority version and revision selectors', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const envelope = v2Envelope('turn_injected', 1);
+      for (const injected of [
+        { resultAuthorityVersion: 1 },
+        { authorityContractVersion: 1 },
+        { authorityLineageKey: 'lin_forged' },
+        { lineageRevisionAtCreation: 99 },
+        { turnRevision: 99 }
+      ]) {
+        assert.throws(() => store.createCanonicalVisibleTurnInternal({
+          ...canonicalCreateInput(store, envelope),
+          ...injected
+        }), /authority selector|authority input/i);
+      }
+    } finally {
+      store.close();
+    }
+  }));
+
+test('exact open-turn replay is mutation-free and a rollout race has zero side effects', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const input = canonicalCreateInput(store, v2Envelope('turn_replay', 1));
+      const first = store.createCanonicalVisibleTurnInternal(input);
+      const laneBefore = store.getInteractionLane('yuqi', 'private_chat');
+      const lineageBefore = store.getTurnAuthorityLineage(first.turn.authorityLineageKey);
+      const replay = store.createCanonicalVisibleTurnInternal(structuredClone(input));
+      assert.equal(replay.turn.turnId, first.turn.turnId);
+      assert.equal(
+        store.getInteractionLane('yuqi', 'private_chat').revision,
+        laneBefore.revision
+      );
+      assert.equal(
+        store.getTurnAuthorityLineage(first.turn.authorityLineageKey).revision,
+        lineageBefore.revision
+      );
+
+      const turnsBefore = Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value);
+      const lineagesBefore = store.listTurnAuthorityLineages().length;
+      const laneSnapshot = structuredClone(store.getInteractionLane('yuqi', 'private_chat'));
+      const raced = canonicalCreateInput(store, v2Envelope('turn_raced', 2), {
+        expectedRolloutRevision: 999,
+        expectedLaneRevision: laneSnapshot.revision,
+        inputVisibilitySequence: laneSnapshot.localSequence
+      });
+      assert.throws(
+        () => store.createCanonicalVisibleTurnInternal(raced),
+        /rollout.*conflict/i
+      );
+      assert.equal(
+        Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value),
+        turnsBefore
+      );
+      assert.equal(store.listTurnAuthorityLineages().length, lineagesBefore);
+      assert.deepEqual(store.getInteractionLane('yuqi', 'private_chat'), laneSnapshot);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('protocol v2 canonical creation uses the persisted non-zero lane sequence exactly', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      store.claimInteractionLaneInternal({
+        roleId: 'yuqi',
+        laneKey: 'private_chat',
+        expectedRevision: 0,
+        generatingTurnId: 'turn_prior',
+        latestUserBatchId: 'msg_prior',
+        localSequence: 7,
+        now: 1
+      });
+      const envelope = v2Envelope('turn_sequence', 1);
+      const outcome = store.createCanonicalVisibleTurnInternal(
+        canonicalCreateInput(store, envelope, {
+          expectedLaneRevision: 1,
+          inputVisibilitySequence: 7
+        })
+      );
+      assert.equal(outcome.turn.inputVisibilitySequence, 7);
+      assert.equal(store.getInteractionLane('yuqi', 'private_chat').localSequence, 7);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('canonical retry inherits the parent release pair after rollout changes', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const originalEnvelope = v2Envelope('turn_pin_original', 1);
+      const original = store.createCanonicalVisibleTurnInternal(
+        canonicalCreateInput(store, originalEnvelope)
+      ).turn;
+      store.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET revision = revision + 1, candidate_phase = 'shadow',
+            rollout_phase = 'collecting', current_mode = 'shadow'
+        WHERE rollout_key = 'DIRECT_REPLY'
+      `).run();
+      const retryEnvelope = v2Envelope('turn_pin_retry', 2, {
+        messageId: originalEnvelope.message.messageId,
+        content: originalEnvelope.message.content,
+        sentAt: originalEnvelope.message.sentAt,
+        retry: {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: originalEnvelope.message.messageId
+        }
+      });
+      const retry = store.createCanonicalVisibleTurnInternal({
+        ...canonicalCreateInput(store, retryEnvelope),
+        expectedRolloutRevision: original.rolloutRevision,
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode
+      }).turn;
+      assert.equal(retry.rolloutRevision, original.rolloutRevision);
+      assert.equal(retry.authoritativeReleaseId, original.authoritativeReleaseId);
+      assert.equal(retry.comparisonReleaseId, original.comparisonReleaseId);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('a retry of a legacy or missing parent cannot enter canonical creation', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const legacyEnvelope = v2Envelope('turn_legacy_parent', 1);
+      store.createTurnWithReleasePinInternal({
+        envelope: legacyEnvelope,
+        rolloutKey: 'DIRECT_REPLY',
+        laneKey: 'private_chat',
+        expectedLaneRevision: 0,
+        inputVisibilitySequence: 0
+      });
+      for (const [turnId, parentId, sequence] of [
+        ['turn_retry_legacy', legacyEnvelope.turnId, 2],
+        ['turn_retry_missing', 'turn_missing', 3]
+      ]) {
+        const retryEnvelope = v2Envelope(turnId, sequence, {
+          messageId: legacyEnvelope.message.messageId,
+          content: legacyEnvelope.message.content,
+          sentAt: legacyEnvelope.message.sentAt,
+          retry: {
+            retryOfTurnId: parentId,
+            canonicalMessageId: legacyEnvelope.message.messageId
+          }
+        });
+        assert.throws(
+          () => store.createCanonicalVisibleTurnInternal(canonicalCreateInput(store, retryEnvelope)),
+          /retry parent invariant/i
+        );
+      }
+    } finally {
+      store.close();
+    }
+  }));
+
+test('user versions above v11 stop without rewriting', () => withDatabase(path => {
+  const database = new DatabaseSync(path);
+  database.exec('PRAGMA user_version = 12;');
+  database.close();
+  assert.throws(() => new YuqiStore(path), /unsupported.*12/i);
+}));

@@ -179,11 +179,11 @@ function cognitiveSnapshotV2() {
   };
 }
 
-test('clean v9 migrates once to the exact v10 authority schema', () => withTemporaryDatabase(path => {
+test('clean v9 passes through the historical v10 schema and finishes at v11', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: false });
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 10);
+    assert.equal(store.userVersion(), 11);
     for (const table of V10_TABLES) {
       assert.equal(
         Boolean(store.db.prepare(
@@ -196,23 +196,23 @@ test('clean v9 migrates once to the exact v10 authority schema', () => withTempo
     assert.equal(store.listPipelineReleases().length, 2);
     assert.ok(store.listCognitionRollouts().every(row => row.candidatePhase === 'none'));
     store.migrate();
-    assert.equal(store.userVersion(), 10);
+    assert.equal(store.userVersion(), 11);
     assert.equal(store.listPipelineReleases().length, 2);
   } finally {
     store.close();
   }
 }));
 
-test('populated v9 to v10 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
+test('populated v9 through v10 to v11 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: true });
   const before = countStructuralRows(path);
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 10);
+    assert.equal(store.userVersion(), 11);
     assert.deepEqual(countStructuralRows(path), before);
     assert.equal(store.listCognitionRollouts()[0].candidatePhase, 'none');
     store.migrate();
-    assert.equal(store.userVersion(), 10);
+    assert.equal(store.userVersion(), 11);
     assert.equal(store.listPipelineReleases().length, 2);
     assert.deepEqual(countStructuralRows(path), before);
   } finally {
@@ -220,11 +220,11 @@ test('populated v9 to v10 is non-destructive and idempotent', () => withTemporar
   }
 }));
 
-test('versions above v10 stop instead of being rewritten', () => withTemporaryDatabase(path => {
+test('versions above v11 stop instead of being rewritten', () => withTemporaryDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 11;');
+  database.exec('PRAGMA user_version = 12;');
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*11/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*12/i);
 }));
 
 test('new turns pin release pair and lane revision while old turns remain readable', () =>
