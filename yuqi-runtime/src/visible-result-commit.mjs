@@ -274,16 +274,15 @@ export function commitVisibleResult(input) {
       || authority.turn.generationFingerprint !== null) {
       throw new Error('visible result authority conflict');
     }
-    const expectedFingerprint = computeGenerationFingerprint({
-      roleId: authority.turn.characterId,
-      laneKey: authority.turn.laneKey,
-      inputVisibilitySequence: authority.turn.inputVisibilitySequence,
-      visibleGroup: input.visibleGroup,
-      actionSet: input.actionSet || [],
-      contextRevision: input.agencySnapshotChecksum
-    });
-    if (input.generationFingerprint !== expectedFingerprint) {
-      throw new Error('generation fingerprint authority conflict');
+    for (const item of input.visibleGroup?.items || []) {
+      if (String(item?.content || '').trim() === '') {
+        throw new Error('visible item content must not be blank');
+      }
+      if (String(item?.speakerId || '') !== authority.turn.characterId
+        || String(item?.speakerType || '') !== 'character'
+        || String(item?.recipientId || '') !== 'user') {
+        throw new Error('visible item identity authority conflict');
+      }
     }
     const resolvedActions = (input.actionSet || []).map(action => {
       const resolved = input.store.resolveCanonicalActionTargetInternal({
@@ -301,6 +300,17 @@ export function commitVisibleResult(input) {
         payload: structuredClone(action.payload || {})
       };
     });
+    const expectedFingerprint = computeGenerationFingerprint({
+      roleId: authority.turn.characterId,
+      laneKey: authority.turn.laneKey,
+      inputVisibilitySequence: authority.turn.inputVisibilitySequence,
+      visibleGroup: input.visibleGroup,
+      actionSet: resolvedActions,
+      contextRevision: input.agencySnapshotChecksum
+    });
+    if (input.generationFingerprint !== expectedFingerprint) {
+      throw new Error('generation fingerprint authority conflict');
+    }
     const comparisonMode = String(authority.turn.comparisonMode || 'none');
     const expectedComparisonType = new Map([
       ['stable_authoritative_candidate_compare', 'shadow_cognition'],

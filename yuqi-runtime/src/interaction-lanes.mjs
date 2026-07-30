@@ -61,13 +61,10 @@ function normalizeVisibleText(value) {
 function canonicalActionTargets(actionSet) {
   return (Array.isArray(actionSet) ? actionSet : [])
     .map((action) => ({
-      type: String(action?.type || action?.kind || ''),
-      action: String(action?.action || ''),
-      messageId: action?.messageId ?? null,
-      momentId: action?.momentId ?? null,
-      commentId: action?.commentId ?? action?.replyToCommentId ?? null,
-      rolePlanId: action?.rolePlanId ?? null,
-      occurrenceId: action?.occurrenceId ?? null
+      kind: String(action?.kind || action?.type || ''),
+      targetKey: String(action?.targetKey || ''),
+      targetRevision: String(action?.targetRevision || ''),
+      semanticPayloadChecksum: contentHash(action?.payload || {})
     }))
     .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
 }

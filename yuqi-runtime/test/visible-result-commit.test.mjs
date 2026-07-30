@@ -28,6 +28,20 @@ function withStore(run) {
   }
 }
 
+function putEvidenceMessage(store, messageId) {
+  return store.putMessage({
+    messageId,
+    turnId: `turn_${messageId}`,
+    characterId: 'yuqi',
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: 'yuqi',
+    content: `evidence ${messageId}`,
+    sentAt: 1,
+    origin: 'phone'
+  });
+}
+
 test('al-authority-v1 identity vectors are stable across UTF-8 and ordinal boundaries', () => {
   const fixture = JSON.parse(readFileSync(
     join(process.cwd(), 'tests', 'fixtures', 'authority-identity-v1.json'),
@@ -46,6 +60,8 @@ test('al-authority-v1 identity vectors are stable across UTF-8 and ordinal bound
 
 test('agency authority snapshot includes verified referenced preferences and is order stable', () =>
   withStore(store => {
+    putEvidenceMessage(store, 'u1');
+    putEvidenceMessage(store, 'u2');
     for (const fact of [
       {
         factId: 'pref_b',
@@ -91,6 +107,7 @@ test('agency authority snapshot includes verified referenced preferences and is 
 
 test('agency authority snapshot rejects an invalid referenced preference fact', () =>
   withStore(store => {
+    putEvidenceMessage(store, 'u1');
     store.putFact({
       factId: 'pref_bad',
       characterId: 'yuqi',
@@ -120,6 +137,53 @@ test('agency authority snapshot rejects an invalid referenced preference fact', 
     );
   }));
 
+test('agency authority snapshot rejects missing or suppressed preference evidence', () =>
+  withStore(store => {
+    for (const [factId, sourceMessageIds] of [
+      ['pref_missing_evidence', ['missing_message']],
+      ['pref_suppressed_evidence', ['suppressed_message']]
+    ]) {
+      if (sourceMessageIds[0] === 'suppressed_message') {
+        putEvidenceMessage(store, 'suppressed_message');
+        store.db.prepare(`
+          INSERT INTO suppressed_messages(
+            message_id,
+            authoritative_message_id,
+            reason,
+            created_at
+          ) VALUES (?, ?, 'test', 1)
+        `).run('suppressed_message', 'suppressed_message');
+      }
+      store.putFact({
+        factId,
+        characterId: 'yuqi',
+        subjectId: 'user',
+        predicate: 'food',
+        object: 'rice_noodles',
+        type: 'stable_preference',
+        status: 'verified',
+        confidence: 0.9,
+        sourceMessageIds
+      });
+      store.putCognitiveStateInternal({
+        roleId: 'yuqi',
+        schemaVersion: 2,
+        revision: factId === 'pref_missing_evidence' ? 1 : 2,
+        lastTurnId: factId,
+        state: {
+          slowState: { preferenceFactIds: [factId] },
+          mediumState: {},
+          fastState: {}
+        },
+        updatedAt: 1
+      });
+      assert.throws(
+        () => store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 10 }),
+        /preference fact is invalid/i
+      );
+    }
+  }));
+
 test('canonical creation recomputes agency authority and rejects a forged checksum without writes', () =>
   withStore(store => {
     store.initializeCognitionRolloutsInternal({
@@ -143,7 +207,7 @@ test('canonical creation recomputes agency authority and rejects a forged checks
       comparisonDirection: null,
       laneKey: 'private_chat',
       expectedLaneRevision: 0,
-      inputUserBatchId: 'msg_user_authority',
+      inputUserBatchId: 'batch_msg_user_authority',
       inputVisibilitySequence: 0,
       agencySnapshotChecksum: 'f'.repeat(64),
       annotationSnapshot: {}
@@ -334,7 +398,7 @@ function withAuthority(run) {
       comparisonDirection: null,
       laneKey: 'private_chat',
       expectedLaneRevision: 0,
-      inputUserBatchId: 'msg_user_authority',
+      inputUserBatchId: 'batch_msg_user_authority',
       inputVisibilitySequence: 0,
       agencySnapshotChecksum: agencySnapshot.checksum,
       annotationSnapshot: {}
@@ -541,6 +605,117 @@ test('unknown action kinds and injected stable comparison jobs are rejected', ()
     assert.throws(() => commitVisibleResult(injected), /comparison authority conflict/i);
   }));
 
+test('input snapshot target id and revision must come from the same object', () =>
+  withAuthority((store, turn) => {
+    const paymentEnvelope = JSON.parse(turn.envelopeJson);
+    paymentEnvelope.context = {
+      payment: { messageId: 'pay_real', amount: 20, currency: 'CNY' }
+    };
+    const paymentTurn = { ...turn, envelopeJson: JSON.stringify(paymentEnvelope) };
+    assert.throws(() => store.resolveCanonicalActionTargetInternal({
+      turn: paymentTurn,
+      action: {
+        kind: 'payment_accept',
+        payload: { messageId: 'pay_forged' }
+      }
+    }), /target identity conflict/i);
+
+    const momentEnvelope = JSON.parse(turn.envelopeJson);
+    momentEnvelope.context = {
+      targetMoment: { momentId: 'moment_real', revision: 3 }
+    };
+    const momentTurn = { ...turn, envelopeJson: JSON.stringify(momentEnvelope) };
+    assert.throws(() => store.resolveCanonicalActionTargetInternal({
+      turn: momentTurn,
+      action: {
+        kind: 'moment_like',
+        payload: { momentId: 'moment_forged' }
+      }
+    }), /target identity conflict/i);
+  }));
+
+test('one target-ref resolver covers message conversation comment and role occurrence', () =>
+  withAuthority((store, turn) => {
+    const sourceEnvelope = JSON.parse(turn.envelopeJson);
+    const message = store.resolveCanonicalTargetRefInternal({
+      turn,
+      namespace: 'message',
+      targetId: sourceEnvelope.message.messageId
+    });
+    assert.equal(message.targetKey, `message:${sourceEnvelope.message.messageId}`);
+    const conversation = store.resolveCanonicalTargetRefInternal({
+      turn,
+      namespace: 'conversation',
+      targetId: `${turn.characterId}:${turn.deviceId}`
+    });
+    assert.equal(conversation.targetKey, `conversation:${turn.characterId}:${turn.deviceId}`);
+
+    const contextualEnvelope = structuredClone(sourceEnvelope);
+    contextualEnvelope.context = {
+      targetComment: { commentId: 'comment_real', content: 'hi' },
+      roleOccurrence: {
+        occurrenceId: 'occurrence_real',
+        characterId: 'yuqi',
+        revision: 2
+      }
+    };
+    const contextualTurn = { ...turn, envelopeJson: JSON.stringify(contextualEnvelope) };
+    assert.equal(store.resolveCanonicalTargetRefInternal({
+      turn: contextualTurn,
+      namespace: 'comment',
+      targetId: 'comment_real'
+    }).targetKey, 'comment:comment_real');
+    assert.equal(store.resolveCanonicalTargetRefInternal({
+      turn: contextualTurn,
+      namespace: 'role_occurrence',
+      targetId: 'occurrence_real'
+    }).targetKey, 'role_occurrence:occurrence_real');
+    assert.throws(() => store.resolveCanonicalTargetRefInternal({
+      turn: contextualTurn,
+      namespace: 'role_occurrence',
+      targetId: 'occurrence_forged'
+    }), /target identity conflict|target not found/i);
+
+    store.db.exec(`
+      CREATE TABLE role_plans(
+        plan_id TEXT PRIMARY KEY,
+        character_id TEXT NOT NULL,
+        revision INTEGER NOT NULL
+      );
+      INSERT INTO role_plans(plan_id, character_id, revision)
+      VALUES ('plan_foreign', 'other_role', 1);
+    `);
+    assert.throws(() => store.resolveCanonicalTargetRefInternal({
+      turn: contextualTurn,
+      namespace: 'role_plan',
+      targetId: 'plan_foreign'
+    }), /role authority conflict/i);
+  }));
+
+test('canonical visible items cannot spoof speaker recipient or blank content', () =>
+  withAuthority((store, turn) => {
+    for (const mutate of [
+      item => { item.speakerId = 'user'; },
+      item => { item.speakerType = 'user'; },
+      item => { item.recipientId = 'other_peer'; },
+      item => { item.content = '   '; }
+    ]) {
+      const input = commitInput(store, turn);
+      mutate(input.visibleGroup.items[0]);
+      input.generationFingerprint = generationFingerprint({
+        roleId: turn.characterId,
+        laneKey: turn.laneKey,
+        inputVisibilitySequence: turn.inputVisibilitySequence,
+        visibleGroup: input.visibleGroup,
+        actionSet: input.actionSet,
+        contextRevision: turn.agencySnapshotChecksum
+      });
+      const before = sideEffectCounts(store);
+      assert.throws(() => commitVisibleResult(input), /visible item (identity|content)/i);
+      assert.deepEqual(sideEffectCounts(store), before);
+    }
+  }));
+
 test('caller projection identity cannot override deterministic group identities', () =>
   withAuthority((store, turn) => {
     const input = commitInput(store, turn);
@@ -581,7 +756,7 @@ test('state commit inserts revision one when cognitive state is absent', () =>
       comparisonDirection: null,
       laneKey: 'private_chat',
       expectedLaneRevision: 0,
-      inputUserBatchId: source.message.messageId,
+      inputUserBatchId: `batch_${source.message.messageId}`,
       inputVisibilitySequence: 0,
       agencySnapshotChecksum: snapshot.checksum,
       annotationSnapshot: {}
@@ -655,6 +830,26 @@ test('canonical action target registry resolves every supported authority namesp
         }
       })
     };
+    store.db.prepare(`
+      INSERT INTO turn_authority_lineages(
+        lineage_key,
+        role_id,
+        lane_key,
+        root_source_id,
+        latest_turn_id,
+        revision,
+        state,
+        committed_group_id,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, 1, 'open', NULL, 1, 1)
+    `).run(
+      turn.authorityLineageKey,
+      turn.characterId,
+      'direct:device_1',
+      'registry_source',
+      turn.turnId
+    );
     const cases = [
       ['payment_accept', { messageId: 'pay_1' }, 'payment:pay_1'],
       ['moment_create', {}, 'lineage_create:lin_registry:moment_create'],
@@ -711,7 +906,7 @@ test('shadow commit requires the exact pinned comparison descriptor', () =>
       comparisonDirection: 'stable_authoritative_candidate_compare',
       laneKey: 'private_chat',
       expectedLaneRevision: 0,
-      inputUserBatchId: source.message.messageId,
+      inputUserBatchId: `batch_${source.message.messageId}`,
       inputVisibilitySequence: 0,
       agencySnapshotChecksum: snapshot.checksum,
       annotationSnapshot: { training: 'v4' }

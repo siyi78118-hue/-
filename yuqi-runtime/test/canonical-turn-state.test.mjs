@@ -57,7 +57,7 @@ function withCanonical(run) {
       comparisonDirection: null,
       laneKey: 'private_chat',
       expectedLaneRevision: 0,
-      inputUserBatchId: 'msg_turn_canonical_state',
+      inputUserBatchId: 'batch_msg_turn_canonical_state',
       inputVisibilitySequence: 0,
       agencySnapshotChecksum: agencySnapshot.checksum,
       annotationSnapshot: {}
@@ -202,4 +202,71 @@ test('canonical cancellation atomically closes the lineage and rejects stale can
       expectedLineageRevision: lineage.revision,
       reasonCode: 'STALE'
     }), /canonical turn authority conflict/i);
+  }));
+
+test('all legacy turn execution writers reject a canonical turn', () =>
+  withCanonical((store, turn) => {
+    const characterMessage = {
+      messageId: 'msg_canonical_output_bypass',
+      turnId: turn.turnId,
+      characterId: 'yuqi',
+      speakerId: 'yuqi',
+      speakerType: 'character',
+      recipientId: 'user',
+      content: '不得旁路写入',
+      sentAt: 2_000
+    };
+    for (const write of [
+      () => store.setTurnRoute(turn.turnId, 'fast', ['test']),
+      () => store.beginStage(turn.turnId, 'memory'),
+      () => store.finishStage(turn.turnId, 'memory'),
+      () => store.putMessageInternal(characterMessage)
+    ]) {
+      const before = store.getTurn(turn.turnId);
+      assert.throws(write, /canonical .* API required/i);
+      assert.equal(store.getTurn(turn.turnId).turnRevision, before.turnRevision);
+    }
+    assert.equal(store.getMessage(characterMessage.messageId), null);
+  }));
+
+test('canonical route and stage writers CAS the turn revision', () =>
+  withCanonical((store, turn) => {
+    const routed = store.setCanonicalTurnRouteInternal({
+      turnId: turn.turnId,
+      expectedState: 'queued',
+      expectedTurnRevision: 1,
+      route: 'fast',
+      reasons: ['direct_reply']
+    });
+    assert.equal(routed.turnRevision, 2);
+    assert.equal(routed.route, 'fast');
+    assert.throws(() => store.beginCanonicalStageInternal({
+      turnId: turn.turnId,
+      expectedState: 'queued',
+      expectedTurnRevision: 1,
+      stage: 'memory',
+      model: 'codex',
+      effort: 'medium',
+      startedAt: 10
+    }), /canonical turn authority conflict/i);
+    const begun = store.beginCanonicalStageInternal({
+      turnId: turn.turnId,
+      expectedState: 'queued',
+      expectedTurnRevision: 2,
+      stage: 'memory',
+      model: 'codex',
+      effort: 'medium',
+      startedAt: 10
+    });
+    assert.equal(begun.turn.turnRevision, 3);
+    assert.equal(begun.stage.finishedAt, null);
+    const finished = store.finishCanonicalStageInternal({
+      turnId: turn.turnId,
+      expectedState: 'queued',
+      expectedTurnRevision: 3,
+      stage: 'memory',
+      finishedAt: 20
+    });
+    assert.equal(finished.turn.turnRevision, 4);
+    assert.equal(finished.stage.finishedAt, 20);
   }));

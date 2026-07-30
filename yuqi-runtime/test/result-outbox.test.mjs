@@ -213,7 +213,7 @@ test('canonical original and retry restart emit one group-keyed delivery', async
       comparisonDirection: null,
       laneKey: 'private_chat',
       expectedLaneRevision: 0,
-      inputUserBatchId: baseEnvelope.message.messageId,
+      inputUserBatchId: `batch_${baseEnvelope.message.messageId}`,
       inputVisibilitySequence: 0,
       agencySnapshotChecksum: agencySnapshot.checksum,
       annotationSnapshot: {}
@@ -285,6 +285,25 @@ test('canonical original and retry restart emit one group-keyed delivery', async
     });
     assert.equal(store.outboxForTurn(original.turnId).length, 0);
     const canonicalDeliveryBefore = store.outboxForGroup(receipt.visibleGroupId)[0];
+    assert.equal(
+      store.listPendingCloudDeliveries().some(delivery => delivery.authorityGroupId != null),
+      false
+    );
+    assert.deepEqual(
+      store.listPendingAuthorityCloudDeliveries().map(delivery => delivery.authorityGroupId),
+      [receipt.visibleGroupId]
+    );
+    const canonicalItem = store.visibleItemsForGroup(receipt.visibleGroupId)[0];
+    assert.throws(() => store.recordDeliveryReceipt({
+      protocolVersion: 1,
+      turnId: retry.turnId,
+      deliveredAt: 3,
+      items: [{
+        kind: 'message',
+        id: canonicalItem.messageId,
+        checksum: canonicalItem.itemChecksum
+      }]
+    }), /canonical delivery API required/i);
     for (const legacyCall of [
       () => store.registerCloudDelivery(retry.turnId, retry.deviceId),
       () => store.prepareCloudDelivery(retry.turnId, retry.deviceId, { replyParts: [] }),

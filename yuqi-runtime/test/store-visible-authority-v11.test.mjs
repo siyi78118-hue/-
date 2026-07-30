@@ -365,7 +365,8 @@ function canonicalCreateInput(store, envelope, overrides = {}) {
       : null,
     laneKey: 'private_chat',
     expectedLaneRevision: Number(lane?.revision || 0),
-    inputUserBatchId: envelope.message.messageId,
+    inputUserBatchId: envelope.context?.currentBatch?.batchId
+      || `batch_${envelope.message.messageId}`,
     inputVisibilitySequence: 0,
     agencySnapshotChecksum: agencySnapshot.checksum,
     annotationSnapshot: {},
@@ -594,7 +595,19 @@ function commitCanonicalTurn(store, turn) {
       recipientId: 'user'
     }]
   };
-  const actionSet = [];
+  const actionDraft = {
+    kind: 'moment_create',
+    payload: { text: '测试动态' }
+  };
+  const resolvedAction = store.resolveCanonicalActionTargetInternal({
+    turn,
+    action: actionDraft
+  });
+  const actionSet = [{
+    ...actionDraft,
+    targetKey: resolvedAction.targetKey,
+    targetRevision: resolvedAction.targetRevision
+  }];
   return commitVisibleResult({
     store,
     turnId: turn.turnId,
@@ -611,7 +624,14 @@ function commitCanonicalTurn(store, turn) {
     visibleGroup,
     actionSet,
     statePatch: null,
-    memoryJobs: [],
+    memoryJobs: [{
+      jobId: `job_${turn.turnId}`,
+      jobType: 'turn_consolidation',
+      payload: {
+        cognitionPacketChecksum: 'c'.repeat(64),
+        resultingCognitiveStateChecksum: 'd'.repeat(64)
+      }
+    }],
     comparisonJob: null,
     generationFingerprint: generationFingerprint({
       roleId: turn.characterId,
@@ -686,6 +706,11 @@ function assertV11ReopenRejected(path) {
 }
 
 for (const [name, corrupt] of [
+  ['authority version outside zero and one', database =>
+    database.prepare(`
+      UPDATE turns SET result_authority_version = 2
+      WHERE turn_id = 'turn_legacy_v11'
+    `).run()],
   ['version-1 turn has no lineage row', database =>
     database.prepare('DELETE FROM turn_authority_lineages').run()],
   ['lineage latest turn root/role/lane does not join', database =>
@@ -722,6 +747,39 @@ for (const [name, corrupt] of [
       SET turn_revision_after = turn_revision_before
       WHERE authority_origin = 'pc'
     `).run()],
+  ['committed turn revision differs from receipt', database =>
+    database.prepare(`
+      UPDATE turns SET turn_revision = turn_revision + 1
+      WHERE turn_id = 'turn_committed'
+    `).run()],
+  ['committed lineage revision differs from receipt', database =>
+    database.prepare(`
+      UPDATE turn_authority_lineages SET revision = revision + 1
+      WHERE state = 'committed'
+    `).run()],
+  ['committed group has no visible item', database =>
+    database.prepare('DELETE FROM visible_result_items').run()],
+  ['visible item has no matching message projection', database =>
+    database.prepare(`
+      UPDATE messages SET authority_group_id = NULL
+      WHERE authority_group_id IS NOT NULL
+    `).run()],
+  ['visible item JSON spoofs the canonical speaker', database =>
+    database.prepare(`
+      UPDATE visible_result_items
+      SET item_json = json_set(item_json, '$.speakerId', 'user')
+    `).run()],
+  ['visible action id is not deterministic', database =>
+    database.prepare(`
+      UPDATE visible_result_actions SET action_id = 'action_forged'
+    `).run()],
+  ['canonical memory job points at a missing group', database => {
+    database.exec('PRAGMA foreign_keys = OFF;');
+    database.prepare(`
+      UPDATE consolidation_jobs SET authority_group_id = 'group_missing'
+      WHERE authority_group_id IS NOT NULL
+    `).run();
+  }],
   ['PC receipt has no canonical delivery', database =>
     database.prepare('DELETE FROM cloud_deliveries WHERE authority_group_id IS NOT NULL').run()],
   ['delivery checksum differs from receipt', database =>
@@ -922,6 +980,48 @@ test('retry reuses the original lineage and stale sibling retry loses lineage CA
         comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode,
         expectedRolloutRevision: original.rolloutRevision
       }), /retry lineage authority conflict/i);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('committed retry returns its receipt before mutable lane checks', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const originalEnvelope = v2Envelope('turn_committed_retry_original', 1);
+      const original = store.createCanonicalVisibleTurnInternal(
+        canonicalCreateInput(store, originalEnvelope)
+      ).turn;
+      commitCanonicalTurn(store, original);
+      const receipt = store.getVisibleCommitReceipt(original.authorityLineageKey);
+      assert.equal(store.getInteractionLane('yuqi', 'private_chat').revision, 2);
+      const retryEnvelope = v2Envelope('turn_committed_retry_late', 2, {
+        messageId: originalEnvelope.message.messageId,
+        content: originalEnvelope.message.content,
+        sentAt: originalEnvelope.message.sentAt,
+        retry: {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: originalEnvelope.message.messageId
+        }
+      });
+      const retryInput = {
+        ...canonicalCreateInput(store, retryEnvelope, {
+          expectedLaneRevision: 1,
+          inputVisibilitySequence: original.inputVisibilitySequence
+        }),
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode,
+        expectedRolloutRevision: original.rolloutRevision,
+        agencySnapshotChecksum: original.agencySnapshotChecksum
+      };
+      assert.deepEqual(
+        store.createCanonicalVisibleTurnInternal(retryInput),
+        { status: 'already_committed', receipt }
+      );
+      assert.equal(store.getTurn(retryEnvelope.turnId), null);
     } finally {
       store.close();
     }

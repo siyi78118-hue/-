@@ -33,7 +33,11 @@ export class ResultOutbox {
     this.running = true;
     const summary = { delivered: 0, failed: 0, waiting: 0 };
     try {
-      for (const target of this.store.listPendingCloudDeliveries(limit)) {
+      const authorityTargets = typeof this.store.listPendingAuthorityCloudDeliveries === 'function'
+        ? this.store.listPendingAuthorityCloudDeliveries(limit)
+        : [];
+      const legacyTargets = this.store.listPendingCloudDeliveries(limit);
+      for (const target of [...authorityTargets, ...legacyTargets].slice(0, limit)) {
         if (target.authorityGroupId) {
           try {
             const publicPayload = this.store.visibleDeliveryPayload(

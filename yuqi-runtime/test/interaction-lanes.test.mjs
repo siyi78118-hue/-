@@ -116,3 +116,41 @@ test('generation fingerprint follows input visibility, not retry lane revision',
     })
   );
 });
+
+test('fingerprint changes with resolved action target and semantic payload', () => {
+  const base = {
+    roleId: 'yuqi',
+    laneKey: 'private_chat',
+    inputVisibilitySequence: 7,
+    visibleGroup: { items: [{ content: '收到了。' }] },
+    contextRevision: 'agency-1'
+  };
+  const first = {
+    kind: 'payment_accept',
+    targetKey: 'payment:pay_1',
+    targetRevision: `sha256:${'a'.repeat(64)}`,
+    payload: { messageId: 'pay_1', decision: 'accept' }
+  };
+  assert.notEqual(
+    generationFingerprint({ ...base, actionSet: [first] }),
+    generationFingerprint({
+      ...base,
+      actionSet: [{
+        ...first,
+        targetKey: 'payment:pay_2',
+        targetRevision: `sha256:${'b'.repeat(64)}`,
+        payload: { messageId: 'pay_2', decision: 'accept' }
+      }]
+    })
+  );
+  assert.notEqual(
+    generationFingerprint({ ...base, actionSet: [first] }),
+    generationFingerprint({
+      ...base,
+      actionSet: [{
+        ...first,
+        payload: { messageId: 'pay_1', decision: 'decline' }
+      }]
+    })
+  );
+});

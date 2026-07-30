@@ -1548,6 +1548,13 @@ export class YuqiStore {
       if (row) throw new Error(`v11 invariant ${code}: ${JSON.stringify(row)}`);
     };
 
+    assertNoInvariantRow('authority_version_domain', `
+      SELECT turn_id, result_authority_version
+      FROM turns
+      WHERE result_authority_version NOT IN (0, 1)
+      LIMIT 1
+    `);
+
     assertNoInvariantRow('legacy_authority_leak', `
       SELECT t.turn_id
       FROM turns t
@@ -1597,6 +1604,54 @@ export class YuqiStore {
           OR l.role_id IS NOT t.character_id
           OR l.lane_key IS NOT t.lane_key
           OR l.root_source_id IS NOT t.source_message_id
+        )
+      LIMIT 1
+    `);
+
+    if (existing.has('current_user_batches')) {
+      assertNoInvariantRow('canonical_input_batch_join', `
+        SELECT t.turn_id, t.input_user_batch_id, b.batch_id
+        FROM turns t
+        LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+        WHERE t.result_authority_version = 1
+          AND json_type(t.envelope_json, '$.message') IS NOT NULL
+          AND (b.turn_id IS NULL OR b.batch_id IS NOT t.input_user_batch_id)
+        LIMIT 1
+      `);
+    } else {
+      assertNoInvariantRow('canonical_input_batch_table', `
+        SELECT turn_id FROM turns WHERE result_authority_version = 1 LIMIT 1
+      `);
+    }
+
+    assertNoInvariantRow('canonical_release_join', `
+      SELECT t.turn_id, t.authoritative_release_id, t.comparison_release_id
+      FROM turns t
+      LEFT JOIN pipeline_releases a ON a.release_id = t.authoritative_release_id
+      LEFT JOIN pipeline_releases c ON c.release_id = t.comparison_release_id
+      WHERE t.result_authority_version = 1
+        AND (
+          a.release_id IS NULL
+          OR a.release_checksum IS NOT t.authoritative_pipeline_checksum
+          OR (t.comparison_release_id IS NULL AND t.comparison_pipeline_checksum IS NOT NULL)
+          OR (t.comparison_release_id IS NOT NULL AND (
+            c.release_id IS NULL
+            OR c.release_checksum IS NOT t.comparison_pipeline_checksum
+          ))
+        )
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('canonical_retry_parent_join', `
+      SELECT t.turn_id, t.retry_of_turn_id
+      FROM turns t
+      LEFT JOIN turns p ON p.turn_id = t.retry_of_turn_id
+      WHERE t.result_authority_version = 1
+        AND t.retry_of_turn_id IS NOT NULL
+        AND (
+          p.turn_id IS NULL
+          OR p.result_authority_version != 1
+          OR p.authority_lineage_key IS NOT t.authority_lineage_key
         )
       LIMIT 1
     `);
@@ -1732,6 +1787,74 @@ export class YuqiStore {
       LIMIT 1
     `);
 
+    assertNoInvariantRow('committed_actual_revision_join', `
+      SELECT r.lineage_key, r.authoritative_turn_id,
+             t.turn_revision, r.turn_revision_after,
+             l.revision AS lineage_revision, r.lineage_revision_after
+      FROM visible_commit_receipts r
+      JOIN turns t ON t.turn_id = r.authoritative_turn_id
+      JOIN turn_authority_lineages l ON l.lineage_key = r.lineage_key
+      WHERE t.turn_revision != r.turn_revision_after
+         OR l.revision != r.lineage_revision_after
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('canonical_group_item_shape', `
+      SELECT g.group_id, COUNT(i.ordinal) AS item_count,
+             MIN(i.ordinal) AS min_ordinal, MAX(i.ordinal) AS max_ordinal
+      FROM visible_result_groups g
+      LEFT JOIN visible_result_items i ON i.group_id = g.group_id
+      GROUP BY g.group_id
+      HAVING item_count < 1 OR min_ordinal != 0 OR max_ordinal != item_count - 1
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('canonical_item_message_projection', `
+      SELECT i.group_id, i.ordinal, i.message_id
+      FROM visible_result_items i
+      JOIN visible_result_groups g ON g.group_id = i.group_id
+      LEFT JOIN messages m
+        ON m.message_id = i.message_id
+       AND m.authority_group_id = i.group_id
+       AND m.group_ordinal = i.ordinal
+       AND m.turn_id = g.authoritative_turn_id
+      WHERE m.message_id IS NULL
+         OR m.character_id IS NOT g.role_id
+         OR m.speaker_id IS NOT g.role_id
+         OR m.speaker_type != 'character'
+         OR m.recipient_id != 'user'
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('orphan_canonical_message_projection', `
+      SELECT m.message_id, m.authority_group_id, m.group_ordinal
+      FROM messages m
+      LEFT JOIN visible_result_items i
+        ON i.group_id = m.authority_group_id
+       AND i.ordinal = m.group_ordinal
+       AND i.message_id = m.message_id
+      WHERE m.authority_group_id IS NOT NULL AND i.message_id IS NULL
+      LIMIT 1
+    `);
+
+    assertNoInvariantRow('orphan_group_authority_reference', `
+      SELECT 'stance' AS source, authority_group_id AS group_id
+      FROM stance_records s
+      LEFT JOIN visible_result_groups g ON g.group_id = s.authority_group_id
+      WHERE s.authority_group_id IS NOT NULL AND g.group_id IS NULL
+      UNION ALL
+      SELECT 'job', authority_group_id
+      FROM consolidation_jobs j
+      LEFT JOIN visible_result_groups g ON g.group_id = j.authority_group_id
+      WHERE j.authority_group_id IS NOT NULL AND g.group_id IS NULL
+      UNION ALL
+      SELECT 'state', last_authority_group_id
+      FROM cognitive_states c
+      LEFT JOIN visible_result_groups g ON g.group_id = c.last_authority_group_id
+      WHERE c.last_authority_group_id IS NOT NULL AND g.group_id IS NULL
+      LIMIT 1
+    `);
+
     assertNoInvariantRow('canonical_delivery_join', `
       SELECT r.lineage_key, r.group_id
       FROM visible_commit_receipts r
@@ -1765,6 +1888,46 @@ export class YuqiStore {
         AND (r.group_id IS NULL OR g.group_id IS NULL OR r.authority_origin != 'pc')
       LIMIT 1
     `);
+
+    for (const turn of this.db.prepare(`
+      SELECT turn_id, envelope_json, envelope_checksum
+      FROM turns WHERE result_authority_version = 1
+    `).all()) {
+      if (contentHash(parseJson(turn.envelope_json, {})) !== turn.envelope_checksum) {
+        throw new Error(`v11 invariant canonical_envelope_checksum: ${turn.turn_id}`);
+      }
+    }
+    for (const item of this.db.prepare(`
+      SELECT i.group_id, i.ordinal, i.message_id, i.item_json, i.item_checksum,
+             g.role_id, m.content, m.speaker_id, m.speaker_type, m.recipient_id
+      FROM visible_result_items i
+      JOIN visible_result_groups g ON g.group_id = i.group_id
+      JOIN messages m ON m.message_id = i.message_id
+    `).all()) {
+      if (item.message_id !== deriveVisibleMessageId(item.group_id, Number(item.ordinal))) {
+        throw new Error(`v11 invariant deterministic_message_id: ${item.message_id}`);
+      }
+      const descriptor = parseJson(item.item_json, null);
+      if (!descriptor
+        || contentHash(descriptor) !== item.item_checksum
+        || String(descriptor.content || '').trim() === ''
+        || String(descriptor.content) !== String(item.content)
+        || String(descriptor.speakerId || '') !== item.role_id
+        || String(descriptor.speakerId || '') !== item.speaker_id
+        || String(descriptor.speakerType || '') !== 'character'
+        || String(descriptor.speakerType || '') !== item.speaker_type
+        || String(descriptor.recipientId || '') !== 'user'
+        || String(descriptor.recipientId || '') !== item.recipient_id) {
+        throw new Error(`v11 invariant canonical_item_identity: ${item.message_id}`);
+      }
+    }
+    for (const action of this.db.prepare(`
+      SELECT group_id, ordinal, action_id FROM visible_result_actions
+    `).all()) {
+      if (action.action_id !== deriveVisibleActionId(action.group_id, Number(action.ordinal))) {
+        throw new Error(`v11 invariant deterministic_action_id: ${action.action_id}`);
+      }
+    }
   }
 
   visibleAuthorityV11InvariantSummary() {
@@ -2122,12 +2285,15 @@ export class YuqiStore {
     descriptor.preferenceFacts = preferenceFactIds.map(factId => {
       const row = this.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get(factId);
       const fact = mapFact(row);
+      const evidenceExists = Array.isArray(fact?.sourceMessageIds)
+        && fact.sourceMessageIds.every(messageId => Boolean(this.getMessage(messageId)));
       if (!row || !fact
         || fact.characterId !== normalizedRoleId
         || fact.type !== 'stable_preference'
         || fact.status !== 'verified'
         || !Array.isArray(fact.sourceMessageIds)
         || fact.sourceMessageIds.length === 0
+        || !evidenceExists
         || fact.sourceMessageIds.some(messageId => suppressed.has(String(messageId)))) {
         throw new Error(`agency authority preference fact is invalid: ${factId}`);
       }
@@ -2768,8 +2934,7 @@ export class YuqiStore {
     const derivedRolloutKey = String(envelope.kind || '');
     const derivedLaneKey = laneKeyForEnvelope(envelope);
     const derivedInputUserBatchId = String(
-      envelope.context?.currentBatch?.batchId
-      ?? envelope.message?.messageId
+      resolveCurrentUserBatch(envelope)?.batchId
       ?? envelope.trigger?.triggerId
       ?? ''
     );
@@ -2803,7 +2968,20 @@ export class YuqiStore {
       if (exactTurn) {
         if (exactTurn.envelopeChecksum !== envelopeChecksum
           || exactTurn.resultAuthorityVersion !== 1
-          || exactTurn.authorityLineageKey !== lineageKey) {
+          || exactTurn.authorityLineageKey !== lineageKey
+          || exactTurn.rolloutKey !== rolloutKey
+          || exactTurn.laneKey !== laneKey
+          || exactTurn.inputUserBatchId !== inputUserBatchId
+          || Number(exactTurn.inputVisibilitySequence) !== inputVisibilitySequence
+          || Number(exactTurn.laneRevision) !== expectedLaneRevision + 1
+          || Number(exactTurn.rolloutRevision) !== expectedRolloutRevision
+          || exactTurn.authoritativeReleaseId !== String(input.authoritativeReleaseId || '')
+          || String(exactTurn.comparisonReleaseId || '') !== String(input.comparisonReleaseId || '')
+          || String(exactTurn.comparisonMode === 'none' ? '' : exactTurn.comparisonMode)
+            !== String(input.comparisonDirection || '')
+          || exactTurn.agencySnapshotChecksum !== agencySnapshotChecksum
+          || contentHash(exactTurn.annotationSnapshot || {})
+            !== contentHash(input.annotationSnapshot || {})) {
           throw new Error('canonical turn authority conflict');
         }
         const receipt = this.getVisibleCommitReceipt(lineageKey);
@@ -2812,22 +2990,7 @@ export class YuqiStore {
           : { status: 'created', turn: exactTurn };
       }
 
-      const lane = this.getInteractionLane(envelope.characterId, laneKey);
-      const actualLaneRevision = Number(lane?.revision || 0);
-      if (actualLaneRevision !== expectedLaneRevision) {
-        throw new Error('interaction lane revision conflict');
-      }
-      if (envelope.protocolVersion === 2
-        && inputVisibilitySequence !== Number(lane?.localSequence || 0)) {
-        throw new Error('protocol v2 input visibility sequence authority conflict');
-      }
-      if (inputVisibilitySequence < Number(lane?.localSequence || 0)) {
-        throw new Error('input visibility sequence is behind lane authority');
-      }
-
-      let pinned;
-      let lineageRevision = 1;
-      let retryOfTurnId = null;
+      let validatedRetry = null;
       if (retry) {
         const parent = this.getTurn(retry.retryOfTurnId);
         if (!parent || parent.resultAuthorityVersion !== 1
@@ -2855,6 +3018,20 @@ export class YuqiStore {
           || contentHash(canonicalBatch(envelope)) !== contentHash(canonicalBatch(parentEnvelope))) {
           throw new Error('retry canonical batch conflict');
         }
+        const inheritedComparisonDirection = parent.comparisonMode === 'none'
+          ? null
+          : parent.comparisonMode;
+        if (Number(input.expectedRolloutRevision) !== parent.rolloutRevision
+          || String(input.authoritativeReleaseId || '') !== String(parent.authoritativeReleaseId || '')
+          || String(input.comparisonReleaseId || '') !== String(parent.comparisonReleaseId || '')
+          || String(input.comparisonDirection || '') !== String(inheritedComparisonDirection || '')
+          || inputVisibilitySequence !== Number(parent.inputVisibilitySequence)
+          || inputUserBatchId !== parent.inputUserBatchId
+          || agencySnapshotChecksum !== parent.agencySnapshotChecksum
+          || contentHash(input.annotationSnapshot || {})
+            !== contentHash(parent.annotationSnapshot || {})) {
+          throw new Error('canonical retry immutable authority conflict');
+        }
         const lineage = this.getTurnAuthorityLineage(parent.authorityLineageKey);
         if (!lineage) throw new Error('canonical retry lineage invariant conflict');
         if (lineage.state === 'committed') {
@@ -2862,17 +3039,29 @@ export class YuqiStore {
           if (!receipt) throw new Error('committed lineage receipt invariant conflict');
           return { status: 'already_committed', receipt };
         }
+        validatedRetry = { parent, lineage };
+      }
+
+      const lane = this.getInteractionLane(envelope.characterId, laneKey);
+      const actualLaneRevision = Number(lane?.revision || 0);
+      if (actualLaneRevision !== expectedLaneRevision) {
+        throw new Error('interaction lane revision conflict');
+      }
+      if (envelope.protocolVersion === 2
+        && inputVisibilitySequence !== Number(lane?.localSequence || 0)) {
+        throw new Error('protocol v2 input visibility sequence authority conflict');
+      }
+      if (inputVisibilitySequence < Number(lane?.localSequence || 0)) {
+        throw new Error('input visibility sequence is behind lane authority');
+      }
+
+      let pinned;
+      let lineageRevision = 1;
+      let retryOfTurnId = null;
+      if (retry) {
+        const { parent, lineage } = validatedRetry;
         if (lineage.state !== 'open' || lineage.latestTurnId !== parent.turnId) {
           throw new Error('retry lineage authority conflict');
-        }
-        const inheritedComparisonDirection = parent.comparisonMode === 'none'
-          ? null
-          : parent.comparisonMode;
-        if (Number(input.expectedRolloutRevision) !== parent.rolloutRevision
-          || String(input.authoritativeReleaseId || '') !== String(parent.authoritativeReleaseId || '')
-          || String(input.comparisonReleaseId || '') !== String(parent.comparisonReleaseId || '')
-          || String(input.comparisonDirection || '') !== String(inheritedComparisonDirection || '')) {
-          throw new Error('canonical retry release pin conflict');
         }
         pinned = {
           pipelineMode: parent.pipelineMode,
@@ -3105,6 +3294,161 @@ export class YuqiStore {
     };
   }
 
+  resolveCanonicalTargetRefInternal({ turn, namespace, targetId }) {
+    const safeNamespace = String(namespace || '');
+    const safeTargetId = String(targetId || '');
+    const allowed = new Set([
+      'conversation', 'message', 'payment', 'moment', 'comment', 'role_plan',
+      'role_occurrence', 'life_episode', 'relationship', 'lineage_create'
+    ]);
+    if (!allowed.has(safeNamespace)) throw new Error('unknown canonical target namespace');
+    if (!safeTargetId) throw new Error('canonical action target not found');
+    const envelope = parseJson(turn.envelopeJson, {});
+    const context = envelope.context || envelope.featureContext || {};
+    const inputSnapshot = (candidate, idKeys) => {
+      if (!candidate || typeof candidate !== 'object') return null;
+      const candidateId = idKeys.map(key => candidate[key]).find(value => value != null);
+      if (String(candidateId || '') !== safeTargetId) return null;
+      return structuredClone(candidate);
+    };
+    const inputResult = snapshot => ({
+      targetKey: `${safeNamespace}:${safeTargetId}`,
+      targetRevision: `sha256:${contentHash(snapshot)}`,
+      authoritySource: 'input_snapshot',
+      canonicalTarget: snapshot
+    });
+
+    if (safeNamespace === 'lineage_create') {
+      const prefix = `${turn.authorityLineageKey}:`;
+      if (!safeTargetId.startsWith(prefix) || safeTargetId.length === prefix.length) {
+        throw new Error('canonical action target identity conflict');
+      }
+      const lineage = this.getTurnAuthorityLineage(turn.authorityLineageKey);
+      if (!lineage) throw new Error('canonical lineage target not found');
+      return {
+        targetKey: `lineage_create:${safeTargetId}`,
+        targetRevision: String(lineage.revision),
+        authoritySource: 'pc_store',
+        canonicalTarget: {
+          lineageKey: turn.authorityLineageKey,
+          actionKind: safeTargetId.slice(prefix.length),
+          revision: lineage.revision
+        }
+      };
+    }
+    if (safeNamespace === 'conversation') {
+      const expectedId = `${turn.characterId}:${turn.deviceId}`;
+      if (safeTargetId !== expectedId) throw new Error('canonical action target identity conflict');
+      const lane = this.getInteractionLane(turn.characterId, turn.laneKey);
+      if (!lane) throw new Error('canonical conversation target not found');
+      return {
+        targetKey: `conversation:${expectedId}`,
+        targetRevision: String(lane.revision),
+        authoritySource: 'pc_store',
+        canonicalTarget: {
+          roleId: turn.characterId,
+          peerId: turn.deviceId,
+          laneKey: turn.laneKey,
+          laneRevision: lane.revision
+        }
+      };
+    }
+    if (safeNamespace === 'message') {
+      const candidates = [
+        envelope.message,
+        ...(context.currentBatch?.messages || [])
+      ];
+      const snapshot = candidates.map(candidate =>
+        inputSnapshot(candidate, ['messageId'])).find(Boolean);
+      if (!snapshot) throw new Error('canonical action target identity conflict');
+      return inputResult(snapshot);
+    }
+    if (safeNamespace === 'payment') {
+      const direct = [context.pendingPayment, context.payment]
+        .map(candidate => inputSnapshot(candidate, ['messageId']))
+        .find(Boolean);
+      const batchPayment = (context.currentBatch?.messages || [])
+        .map(message => {
+          if (String(message?.messageId || '') !== safeTargetId || !message?.payment) return null;
+          return { messageId: message.messageId, payment: message.payment };
+        }).find(Boolean);
+      const snapshot = direct || batchPayment;
+      if (!snapshot) throw new Error('canonical action target identity conflict');
+      return inputResult(snapshot);
+    }
+    if (safeNamespace === 'moment' || safeNamespace === 'comment') {
+      const title = safeNamespace[0].toUpperCase() + safeNamespace.slice(1);
+      const idKey = `${safeNamespace}Id`;
+      const candidates = [
+        context[`target${title}`],
+        context[safeNamespace],
+        context[idKey] == null ? null : { [idKey]: context[idKey] }
+      ];
+      const snapshot = candidates.map(candidate =>
+        inputSnapshot(candidate, [idKey])).find(Boolean);
+      if (!snapshot) throw new Error('canonical action target identity conflict');
+      return inputResult(snapshot);
+    }
+    if (safeNamespace === 'life_episode') {
+      const episode = this.getLifeEpisode(safeTargetId);
+      if (!episode || episode.characterId !== turn.characterId) {
+        throw new Error('canonical life episode target not found');
+      }
+      return {
+        targetKey: `life_episode:${safeTargetId}`,
+        targetRevision: `sha256:${episode.checksum}`,
+        authoritySource: 'pc_store',
+        canonicalTarget: episode
+      };
+    }
+    if (safeNamespace === 'relationship') {
+      if (safeTargetId !== turn.characterId) {
+        throw new Error('canonical action target identity conflict');
+      }
+      const relationship = context.relationship
+        || context.relationshipState
+        || context.scene?.relationshipStage
+        || envelope.featureContext?.relationship
+        || null;
+      if (!relationship) throw new Error('canonical relationship target not found');
+      return {
+        targetKey: `relationship:${turn.characterId}`,
+        targetRevision: `sha256:${contentHash(relationship)}`,
+        authoritySource: 'input_snapshot',
+        canonicalTarget: structuredClone(relationship)
+      };
+    }
+    const table = safeNamespace === 'role_plan' ? 'role_plans' : 'role_occurrences';
+    const idName = safeNamespace === 'role_plan' ? 'plan_id' : 'occurrence_id';
+    const contextTarget = safeNamespace === 'role_plan'
+      ? context.rolePlan
+      : context.roleOccurrence;
+    const tableExists = this.db.prepare(
+      'SELECT 1 AS value FROM sqlite_master WHERE type = ? AND name = ?'
+    ).get('table', table);
+    const row = tableExists
+      ? this.db.prepare(`SELECT * FROM ${table} WHERE ${idName} = ?`).get(safeTargetId)
+      : null;
+    if (row) {
+      const owner = String(row.character_id ?? row.role_id ?? '');
+      if (owner && owner !== turn.characterId) throw new Error('canonical target role authority conflict');
+      return {
+        targetKey: `${safeNamespace}:${safeTargetId}`,
+        targetRevision: String(row.revision ?? row.updated_at ?? row.checksum ?? 0),
+        authoritySource: 'pc_store',
+        canonicalTarget: structuredClone(row)
+      };
+    }
+    const idKeys = safeNamespace === 'role_plan'
+      ? ['rolePlanId', 'planId', 'plan_id']
+      : ['occurrenceId', 'occurrence_id'];
+    const target = inputSnapshot(contextTarget, idKeys);
+    if (!target) throw new Error('canonical action target identity conflict');
+    const owner = String(target.characterId ?? target.roleId ?? target.character_id ?? target.role_id ?? '');
+    if (owner && owner !== turn.characterId) throw new Error('canonical target role authority conflict');
+    return inputResult(target);
+  }
+
   resolveCanonicalActionTargetInternal({ turn, action }) {
     const kind = String(action?.kind || '');
     const namespaceByKind = {
@@ -3127,92 +3471,28 @@ export class YuqiStore {
     };
     const namespace = namespaceByKind[kind];
     if (!namespace) throw new Error('unknown canonical action target kind');
-    const envelope = parseJson(turn.envelopeJson, {});
     const payload = action.payload || {};
-    if (namespace === 'lineage_create') {
-      return {
-        targetKey: `lineage_create:${turn.authorityLineageKey}:${kind}`,
-        targetRevision: String(this.getTurnAuthorityLineage(turn.authorityLineageKey)?.revision || 0),
-        authoritySource: 'lineage'
-      };
-    }
-    if (namespace === 'payment') {
-      const messageId = String(payload.messageId
-        || envelope.context?.pendingPayment?.messageId
-        || envelope.context?.payment?.messageId
-        || envelope.message?.messageId
-        || '');
-      const payment = envelope.context?.pendingPayment
-        || envelope.context?.payment
-        || envelope.context?.currentBatch?.messages?.find(message => message.messageId === messageId)?.payment;
-      if (!messageId || !payment) throw new Error('canonical payment target not found');
-      return {
-        targetKey: `payment:${messageId}`,
-        targetRevision: `sha256:${contentHash(payment)}`,
-        authoritySource: 'input_snapshot'
-      };
-    }
-    if (namespace === 'moment' || namespace === 'comment') {
-      const context = envelope.context || envelope.featureContext || {};
-      const id = String(
-        payload[namespace === 'moment' ? 'momentId' : 'commentId']
-        || context[`${namespace}Id`]
-        || context[`target${namespace[0].toUpperCase()}${namespace.slice(1)}`]?.[`${namespace}Id`]
-        || ''
-      );
-      if (!id) throw new Error(`canonical ${namespace} target not found`);
-      return {
-        targetKey: `${namespace}:${id}`,
-        targetRevision: `sha256:${contentHash(context)}`,
-        authoritySource: 'input_snapshot'
-      };
-    }
-    if (namespace === 'life_episode') {
-      const episodeId = String(payload.episodeId || '');
-      const episode = this.getLifeEpisode(episodeId);
-      if (!episode || episode.characterId !== turn.characterId) {
-        throw new Error('canonical life episode target not found');
-      }
-      return {
-        targetKey: `life_episode:${episodeId}`,
-        targetRevision: `sha256:${episode.checksum}`,
-        authoritySource: 'pc_store'
-      };
-    }
-    if (namespace === 'relationship') {
-      const relationship = envelope.context?.relationship
-        || envelope.context?.relationshipState
-        || envelope.context?.scene?.relationshipStage
-        || envelope.featureContext?.relationship
-        || null;
-      if (!relationship) throw new Error('canonical relationship target not found');
-      return {
-        targetKey: `relationship:${turn.characterId}`,
-        targetRevision: `sha256:${contentHash(relationship)}`,
-        authoritySource: 'input_snapshot'
-      };
-    }
-    const table = namespace === 'role_plan' ? 'role_plans' : 'role_occurrences';
-    const idName = namespace === 'role_plan' ? 'plan_id' : 'occurrence_id';
-    const id = String(payload[namespace === 'role_plan' ? 'rolePlanId' : 'occurrenceId'] || '');
-    const contextTarget = namespace === 'role_plan'
-      ? envelope.context?.rolePlan
-      : envelope.context?.roleOccurrence;
-    const tableExists = this.db.prepare(
-      'SELECT 1 AS value FROM sqlite_master WHERE type = ? AND name = ?'
-    ).get('table', table);
-    const row = id && tableExists
-      ? this.db.prepare(`SELECT * FROM ${table} WHERE ${idName} = ?`).get(id)
-      : null;
-    const target = row || contextTarget;
-    if (!target || !id) throw new Error(`canonical ${namespace} target not found`);
-    return {
-      targetKey: `${namespace}:${id}`,
-      targetRevision: row
-        ? String(row.revision ?? row.updated_at ?? 0)
-        : `sha256:${contentHash(target)}`,
-      authoritySource: row ? 'pc_store' : 'input_snapshot'
-    };
+    const targetId = namespace === 'lineage_create'
+      ? `${turn.authorityLineageKey}:${kind}`
+      : namespace === 'payment'
+        ? payload.messageId
+        : namespace === 'moment'
+          ? payload.momentId
+          : namespace === 'comment'
+            ? payload.commentId
+            : namespace === 'role_plan'
+              ? payload.rolePlanId
+              : namespace === 'life_episode'
+                ? payload.episodeId
+                : namespace === 'relationship'
+                  ? turn.characterId
+                  : null;
+    if (!targetId) throw new Error(`canonical ${namespace} target not found`);
+    return this.resolveCanonicalTargetRefInternal({
+      turn,
+      namespace,
+      targetId
+    });
   }
 
   visibleGroupsForLineage(lineageKey) {
@@ -4175,6 +4455,10 @@ export class YuqiStore {
 
   setTurnRoute(turnId, route, reasons = []) {
     if (!['fast', 'deep', 'fast_to_deep'].includes(route)) throw new Error('invalid turn route');
+    const turn = this.getTurn(turnId);
+    if (turn?.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn route API required');
+    }
     const result = this.db.prepare(`
       UPDATE turns SET route = ?, route_reasons_json = ?, updated_at = ? WHERE turn_id = ?
     `).run(route, canonicalJson([...new Set(reasons.map(String))]), now(), turnId);
@@ -4182,9 +4466,44 @@ export class YuqiStore {
     return this.getTurn(turnId);
   }
 
+  setCanonicalTurnRouteInternal({
+    turnId,
+    expectedState,
+    expectedTurnRevision,
+    route,
+    reasons = []
+  }) {
+    if (!['fast', 'deep', 'fast_to_deep'].includes(route)) throw new Error('invalid turn route');
+    return this.withImmediateTransaction(() => {
+      const timestamp = now();
+      const result = this.db.prepare(`
+        UPDATE turns
+        SET route = ?, route_reasons_json = ?, turn_revision = turn_revision + 1,
+            updated_at = ?
+        WHERE turn_id = ? AND result_authority_version = 1
+          AND state = ? AND turn_revision = ?
+      `).run(
+        route,
+        canonicalJson([...new Set(reasons.map(String))]),
+        timestamp,
+        String(turnId),
+        String(expectedState),
+        Number(expectedTurnRevision)
+      );
+      if (Number(result.changes) !== 1) throw new Error('canonical turn authority conflict');
+      const turn = this.getTurn(turnId);
+      this.appendSync('turn', turn.turnId, 'update', turn);
+      return turn;
+    });
+  }
+
   beginStage(turnId, stage, model = null, effort = null, startedAt = now()) {
     if (!String(stage || '').trim()) throw new Error('stage is required');
-    if (!this.getTurn(turnId)) throw new Error('turn not found');
+    const turn = this.getTurn(turnId);
+    if (!turn) throw new Error('turn not found');
+    if (turn.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn stage API required');
+    }
     const active = this.db.prepare(`
       SELECT * FROM turn_stages
       WHERE turn_id = ? AND stage = ? AND finished_at IS NULL
@@ -4203,7 +4522,52 @@ export class YuqiStore {
     ).get(turnId, stage, ordinal));
   }
 
+  beginCanonicalStageInternal({
+    turnId,
+    expectedState,
+    expectedTurnRevision,
+    stage,
+    model = null,
+    effort = null,
+    startedAt = now()
+  }) {
+    if (!String(stage || '').trim()) throw new Error('stage is required');
+    return this.withImmediateTransaction(() => {
+      const result = this.db.prepare(`
+        UPDATE turns
+        SET turn_revision = turn_revision + 1, updated_at = ?
+        WHERE turn_id = ? AND result_authority_version = 1
+          AND state = ? AND turn_revision = ?
+      `).run(now(), String(turnId), String(expectedState), Number(expectedTurnRevision));
+      if (Number(result.changes) !== 1) throw new Error('canonical turn authority conflict');
+      const active = this.db.prepare(`
+        SELECT * FROM turn_stages
+        WHERE turn_id = ? AND stage = ? AND finished_at IS NULL
+        ORDER BY ordinal DESC LIMIT 1
+      `).get(turnId, stage);
+      if (active) throw new Error('canonical stage is already active');
+      const ordinal = Number(this.db.prepare(
+        'SELECT COALESCE(MAX(ordinal), 0) AS value FROM turn_stages WHERE turn_id = ?'
+      ).get(turnId)?.value || 0) + 1;
+      this.db.prepare(`
+        INSERT INTO turn_stages(turn_id, stage, ordinal, model, effort, started_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(turnId, stage, ordinal, model, effort, Number(startedAt));
+      const turn = this.getTurn(turnId);
+      const stageRow = mapTurnStage(this.db.prepare(
+        'SELECT * FROM turn_stages WHERE turn_id = ? AND stage = ? AND ordinal = ?'
+      ).get(turnId, stage, ordinal));
+      this.appendSync('turn', turn.turnId, 'update', turn);
+      return { turn, stage: stageRow };
+    });
+  }
+
   finishStage(turnId, stage, finishedAt = now()) {
+    const turn = this.getTurn(turnId);
+    if (!turn) throw new Error('turn not found');
+    if (turn.resultAuthorityVersion === 1) {
+      throw new Error('canonical turn stage API required');
+    }
     const active = this.db.prepare(`
       SELECT * FROM turn_stages
       WHERE turn_id = ? AND stage = ? AND finished_at IS NULL
@@ -4218,6 +4582,41 @@ export class YuqiStore {
     return mapTurnStage(this.db.prepare(
       'SELECT * FROM turn_stages WHERE turn_id = ? AND stage = ? AND ordinal = ?'
     ).get(turnId, stage, active.ordinal));
+  }
+
+  finishCanonicalStageInternal({
+    turnId,
+    expectedState,
+    expectedTurnRevision,
+    stage,
+    finishedAt = now()
+  }) {
+    return this.withImmediateTransaction(() => {
+      const active = this.db.prepare(`
+        SELECT * FROM turn_stages
+        WHERE turn_id = ? AND stage = ? AND finished_at IS NULL
+        ORDER BY ordinal DESC LIMIT 1
+      `).get(turnId, stage);
+      if (!active) throw new Error('canonical active stage not found');
+      const result = this.db.prepare(`
+        UPDATE turns
+        SET turn_revision = turn_revision + 1, updated_at = ?
+        WHERE turn_id = ? AND result_authority_version = 1
+          AND state = ? AND turn_revision = ?
+      `).run(now(), String(turnId), String(expectedState), Number(expectedTurnRevision));
+      if (Number(result.changes) !== 1) throw new Error('canonical turn authority conflict');
+      const durationMs = Math.max(0, Number(finishedAt) - Number(active.started_at));
+      this.db.prepare(`
+        UPDATE turn_stages SET finished_at = ?, duration_ms = ?
+        WHERE turn_id = ? AND stage = ? AND ordinal = ?
+      `).run(Number(finishedAt), durationMs, turnId, stage, active.ordinal);
+      const turn = this.getTurn(turnId);
+      const stageRow = mapTurnStage(this.db.prepare(
+        'SELECT * FROM turn_stages WHERE turn_id = ? AND stage = ? AND ordinal = ?'
+      ).get(turnId, stage, active.ordinal));
+      this.appendSync('turn', turn.turnId, 'update', turn);
+      return { turn, stage: stageRow };
+    });
   }
 
   getTurnStages(turnId) {
@@ -4270,7 +4669,29 @@ export class YuqiStore {
     return this.db.prepare(`
       SELECT * FROM cloud_deliveries
       WHERE state IN ('waiting', 'pending')
+        AND authority_group_id IS NULL
       ORDER BY updated_at ASC, turn_id ASC, peer_id ASC LIMIT ?
+    `).all(safeLimit).map(mapCloudDelivery);
+  }
+
+  listPendingAuthorityCloudDeliveries(limit = 50) {
+    const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
+    return this.db.prepare(`
+      SELECT d.*
+      FROM cloud_deliveries d
+      JOIN visible_commit_receipts r
+        ON r.group_id = d.authority_group_id
+       AND r.commit_checksum = d.authority_commit_checksum
+       AND r.authoritative_turn_id = d.turn_id
+      JOIN visible_result_groups g
+        ON g.group_id = r.group_id
+       AND g.lineage_key = r.lineage_key
+       AND g.authoritative_turn_id = r.authoritative_turn_id
+      WHERE d.state IN ('waiting', 'pending')
+        AND d.authority_group_id IS NOT NULL
+        AND r.authority_origin = 'pc'
+      ORDER BY d.updated_at ASC, d.authority_group_id ASC, d.peer_id ASC
+      LIMIT ?
     `).all(safeLimit).map(mapCloudDelivery);
   }
 
@@ -4560,6 +4981,9 @@ export class YuqiStore {
   recordDeliveryReceipt(receipt) {
     const normalized = validateDeliveryReceipt(receipt);
     const turn = this.getTurn(normalized.turnId);
+    if (turn?.resultAuthorityVersion === 1) {
+      throw new Error('canonical delivery API required');
+    }
     if (!turn?.replyJson) throw new Error('delivery receipt turn has no approved result');
     const expected = new Map(
       deliveryItemsForResult(parseJson(turn.replyJson, {}))
@@ -4923,6 +5347,11 @@ export class YuqiStore {
   }
 
   putMessageInternal(message) {
+    const ownerTurn = message?.turnId ? this.getTurn(message.turnId) : null;
+    if (ownerTurn?.resultAuthorityVersion === 1
+      && String(message?.speakerType || '') === 'character') {
+      throw new Error('canonical visible result API required');
+    }
     const normalized = {
       messageId: String(message.messageId || ''),
       turnId: String(message.turnId || ''),
