@@ -27,7 +27,7 @@ function sanitizeAttachment(attachment) {
   return metadata;
 }
 
-function sanitizeMessage(message) {
+export function sanitizeCognitionMessage(message) {
   if (!message || typeof message !== 'object') return message;
   return {
     ...message,
@@ -35,6 +35,25 @@ function sanitizeMessage(message) {
       ? message.attachments.map(sanitizeAttachment)
       : []
   };
+}
+
+export function rankCognitionItems(items, limit, scoreKeys = ['relevanceScore', 'score']) {
+  const boundedLimit = Math.max(0, Number(limit) || 0);
+  return [...(Array.isArray(items) ? items : [])]
+    .map((item, index) => ({ item, index }))
+    .sort((left, right) => {
+      const leftScore = scoreKeys.reduce(
+        (score, key) => score || Number(left.item?.[key] || 0),
+        0
+      );
+      const rightScore = scoreKeys.reduce(
+        (score, key) => score || Number(right.item?.[key] || 0),
+        0
+      );
+      return rightScore - leftScore || left.index - right.index;
+    })
+    .slice(0, boundedLimit)
+    .map(({ item }) => item);
 }
 
 function localMemoryItem(hint) {
@@ -164,7 +183,7 @@ export async function buildCognitionContext({
   catalog,
   maxCharacters = 80_000
 }) {
-  const batchMessages = (currentBatch?.messages || []).map(sanitizeMessage);
+  const batchMessages = (currentBatch?.messages || []).map(sanitizeCognitionMessage);
   const currentMessageIds = batchMessages.map(item => item.messageId).filter(Boolean);
   const allMessages = typeof store?.listMessages === 'function'
     ? store.listMessages(envelope?.characterId)
@@ -172,7 +191,7 @@ export async function buildCognitionContext({
   const recentMessages = buildGenerationWindow(allMessages, {
     currentMessageIds,
     limit: COGNITION_CONTEXT_LIMITS.recentMessages
-  }).map(sanitizeMessage);
+  }).map(sanitizeCognitionMessage);
   const query = batchMessages.map(item => item.content).filter(Boolean).join(' ');
   const evidencePack = buildEvidencePack(store, {
     characterId: envelope?.characterId,

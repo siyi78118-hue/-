@@ -1,3 +1,31 @@
+export function completeMessageGroupKey(message) {
+  const turnId = String(message?.turnId || '');
+  const batchId = String(message?.batchId || '');
+  const speaker = String(message?.speakerType || message?.speakerId || 'unknown');
+  return batchId
+    ? `${speaker}:batch:${batchId}`
+    : turnId
+      ? `${speaker}:turn:${turnId}`
+      : `message:${String(message?.messageId || '')}`;
+}
+
+export function takeCompleteMessageGroups(messages, limit = 20) {
+  const safeLimit = Math.max(1, Math.min(200, Number(limit) || 20));
+  const groups = [];
+  const byGroupKey = new Map();
+  for (const message of Array.isArray(messages) ? messages : []) {
+    const groupKey = completeMessageGroupKey(message);
+    let group = byGroupKey.get(groupKey);
+    if (!group) {
+      group = [];
+      byGroupKey.set(groupKey, group);
+      groups.push(group);
+    }
+    group.push(message);
+  }
+  return groups.slice(-safeLimit).flat();
+}
+
 export function buildGenerationWindow(messages, {
   currentMessageId = '',
   currentMessageIds = [],
@@ -19,24 +47,5 @@ export function buildGenerationWindow(messages, {
   }
   const ordered = [...byId.values()]
     .sort((left, right) => Number(left?.sentAt || 0) - Number(right?.sentAt || 0));
-  const groups = [];
-  const byGroupKey = new Map();
-  for (const message of ordered) {
-    const turnId = String(message?.turnId || '');
-    const batchId = String(message?.batchId || '');
-    const speaker = String(message?.speakerType || message?.speakerId || 'unknown');
-    const groupKey = batchId
-      ? `${speaker}:batch:${batchId}`
-      : turnId
-        ? `${speaker}:${turnId}`
-        : `message:${message.messageId}`;
-    let group = byGroupKey.get(groupKey);
-    if (!group) {
-      group = [];
-      byGroupKey.set(groupKey, group);
-      groups.push(group);
-    }
-    group.push(message);
-  }
-  return groups.slice(-safeLimit).flat();
+  return takeCompleteMessageGroups(ordered, safeLimit);
 }
