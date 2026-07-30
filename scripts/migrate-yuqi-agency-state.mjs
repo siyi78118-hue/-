@@ -27,6 +27,7 @@ const STRUCTURAL_TABLES = Object.freeze([
   'visible_result_groups',
   'visible_result_items',
   'visible_result_actions',
+  'visible_result_manifests',
   'visible_commit_receipts',
   'cloud_deliveries'
 ]);
@@ -311,7 +312,7 @@ function rawDatabaseSnapshot(path) {
   }
 }
 
-function v11InvariantSummary(store) {
+function v12InvariantSummary(store) {
   store.assertAgencyV10Invariants();
   return store.visibleAuthorityV11InvariantSummary();
 }
@@ -379,14 +380,14 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
   const store = apply
     ? YuqiStore.openForMigration(workingDatabase, {
         expectedSourceVersion: sourceBefore.userVersion,
-        expectedPostMigrationInvariantChecksum: expected.v11InvariantSummary.checksum
+        expectedPostMigrationInvariantChecksum: expected.v12InvariantSummary.checksum
       })
     : new YuqiStore(workingDatabase);
   let report;
   try {
     report = migrateAgencyState({ store, apply, now: Date.now() });
     report.workingUserVersion = store.userVersion();
-    report.v11InvariantSummary = v11InvariantSummary(store);
+    report.v12InvariantSummary = v12InvariantSummary(store);
   } finally {
     store.close();
   }
@@ -402,7 +403,7 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
     expected ??= JSON.parse(readFileSync(resolve(expectedPath), 'utf8'));
     if (expected.decisionChecksum !== report.decisionChecksum
       || canonicalJson(expected.beforeCounts) !== canonicalJson(report.beforeCounts)
-      || canonicalJson(expected.v11InvariantSummary) !== canonicalJson(report.v11InvariantSummary)) {
+      || canonicalJson(expected.v12InvariantSummary) !== canonicalJson(report.v12InvariantSummary)) {
       throw new Error('migration dry-run/apply report checksum mismatch');
     }
   }

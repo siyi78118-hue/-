@@ -483,6 +483,7 @@ function sideEffectCounts(store) {
     'visible_result_groups',
     'visible_result_items',
     'visible_result_actions',
+    'visible_result_manifests',
     'visible_commit_receipts',
     'messages',
     'stance_records',
@@ -986,6 +987,7 @@ test('shadow commit requires the exact pinned comparison descriptor', () =>
     assert.throws(() => commitVisibleResult(wrong), /comparison authority conflict/i);
     const receipt = commitVisibleResult(valid);
     assert.equal(store.comparisonJobsForGroup(receipt.visibleGroupId).length, 1);
+    assert.doesNotThrow(() => store.assertVisibleAuthorityV12Invariants());
   }));
 
 test('exact repeated commit returns one receipt and changed payload conflicts', () =>
@@ -1015,7 +1017,7 @@ test('committed canonical creation replay returns its original receipt after rol
     assert.equal(replay.receipt.commitChecksum, receipt.commitChecksum);
   }));
 
-for (const step of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]) {
+for (const step of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]) {
   test(`forced failure after commit step ${step} rolls back canonical authority`, () =>
     withAuthority((store, turn) => {
       const before = sideEffectCounts(store);

@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import { YuqiStore } from '../src/store.mjs';
+import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
 const SHA = 'a'.repeat(64);
 
@@ -67,6 +69,45 @@ function withCanonical(run) {
     store.close();
     rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
+}
+
+function commitCanonical(store, turn) {
+  const visibleGroup = {
+    items: [{
+      content: '已提交。',
+      speakerId: 'yuqi',
+      speakerType: 'character',
+      recipientId: 'user'
+    }]
+  };
+  return commitVisibleResult({
+    store,
+    turnId: turn.turnId,
+    authorityLineageKey: turn.authorityLineageKey,
+    laneKey: turn.laneKey,
+    expectedTurnRevision: turn.turnRevision,
+    expectedLineageRevision: store.getTurnAuthorityLineage(turn.authorityLineageKey).revision,
+    expectedLaneRevision: store.getInteractionLane('yuqi', 'private_chat').revision,
+    expectedCognitiveStateRevision: 0,
+    expectedLatestUserBatchId: turn.inputUserBatchId,
+    inputVisibilitySequence: turn.inputVisibilitySequence,
+    agencySnapshotChecksum: turn.agencySnapshotChecksum,
+    authoritativeReleaseId: turn.authoritativeReleaseId,
+    visibleGroup,
+    actionSet: [],
+    statePatch: null,
+    memoryJobs: [],
+    comparisonJob: null,
+    generationFingerprint: generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup,
+      actionSet: [],
+      contextRevision: turn.agencySnapshotChecksum
+    }),
+    now: 2_000
+  });
 }
 
 for (const [name, prepare, call] of [
@@ -169,7 +210,7 @@ test('canonical lifecycle uses explicit turn revisions for claim checkpoint fail
         allowedFailureClass: 'transient'
       })
     ]) {
-      assert.throws(stale, /canonical turn authority conflict/i);
+      assert.throws(stale, /canonical (turn|transition) authority conflict/i);
     }
 
     const requeued = store.requeueCanonicalFailedTurnInternal({
@@ -202,6 +243,11 @@ test('canonical cancellation atomically closes the lineage and rejects stale can
       expectedLineageRevision: lineage.revision,
       reasonCode: 'STALE'
     }), /canonical turn authority conflict/i);
+    assert.throws(() => store.requeueCanonicalFailedTurnInternal({
+      turnId: turn.turnId,
+      expectedTurnRevision: cancelled.turn.turnRevision,
+      allowedFailureClass: ''
+    }), /canonical (committed authority is immutable|turn authority conflict)/i);
   }));
 
 test('all legacy turn execution writers reject a canonical turn', () =>
@@ -269,4 +315,74 @@ test('canonical route and stage writers CAS the turn revision', () =>
     });
     assert.equal(finished.turn.turnRevision, 4);
     assert.equal(finished.stage.finishedAt, 20);
+  }));
+
+test('a committed canonical lineage is immutable through every attempt writer', () =>
+  withCanonical((store, turn) => {
+    commitCanonical(store, turn);
+    const receipt = store.getVisibleCommitReceipt(turn.authorityLineageKey);
+    const writes = [
+      () => store.setCanonicalTurnRouteInternal({
+        turnId: turn.turnId,
+        expectedState: 'committed',
+        expectedTurnRevision: receipt.turnRevisionAfter,
+        route: 'fast',
+        reasons: ['forged']
+      }),
+      () => store.beginCanonicalStageInternal({
+        turnId: turn.turnId,
+        expectedState: 'committed',
+        expectedTurnRevision: receipt.turnRevisionAfter,
+        stage: 'memory',
+        model: 'codex',
+        effort: 'medium',
+        startedAt: 3_000
+      }),
+      () => store.advanceCanonicalTurnInternal({
+        turnId: turn.turnId,
+        expectedState: 'committed',
+        nextState: 'queued',
+        expectedTurnRevision: receipt.turnRevisionAfter
+      }),
+      () => store.recordCanonicalTurnFailureInternal({
+        turnId: turn.turnId,
+        expectedState: 'committed',
+        expectedTurnRevision: receipt.turnRevisionAfter,
+        failure: { failureClass: 'terminal', code: 'FORGED' }
+      })
+    ];
+    for (const write of writes) {
+      assert.throws(write, /canonical committed authority is immutable/i);
+      assert.deepEqual(store.getVisibleCommitReceipt(turn.authorityLineageKey), receipt);
+      assert.equal(store.getTurn(turn.turnId).turnRevision, receipt.turnRevisionAfter);
+      assert.equal(store.getTurn(turn.turnId).state, 'committed');
+    }
+  }));
+
+test('generic canonical advance accepts only the explicit forward graph', () =>
+  withCanonical((store, turn) => {
+    const claimed = store.claimCanonicalTurnInternal({
+      turnId: turn.turnId,
+      workerId: 'worker',
+      expectedTurnRevision: turn.turnRevision
+    });
+    const before = store.getTurn(turn.turnId);
+    for (const nextState of [
+      'memory_running', 'brain_running', 'approved', 'committed', 'queued', 'failed'
+    ]) {
+      assert.throws(() => store.advanceCanonicalTurnInternal({
+        turnId: turn.turnId,
+        expectedState: claimed.state,
+        nextState,
+        expectedTurnRevision: before.turnRevision
+      }), /canonical transition authority conflict/i);
+      assert.deepEqual(store.getTurn(turn.turnId), before);
+    }
+    const advanced = store.advanceCanonicalTurnInternal({
+      turnId: turn.turnId,
+      expectedState: 'memory_running',
+      nextState: 'memory_done',
+      expectedTurnRevision: before.turnRevision
+    });
+    assert.equal(advanced.state, 'memory_done');
   }));

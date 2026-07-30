@@ -17,6 +17,15 @@ const V10_TABLES = [
   'state_migration_audit'
 ];
 
+const V11_V12_TABLES = [
+  'visible_result_manifests',
+  'visible_commit_receipts',
+  'visible_result_actions',
+  'visible_result_items',
+  'visible_result_groups',
+  'turn_authority_lineages'
+];
+
 const V10_COLUMNS = {
   cognition_kind_rollouts: [
     'stable_release_id',
@@ -42,7 +51,29 @@ const V10_COLUMNS = {
     'lane_revision',
     'input_visibility_sequence',
     'generation_fingerprint'
-  ]
+  ],
+  turns: [
+    'result_authority_version',
+    'authority_lineage_key',
+    'lineage_revision_at_creation',
+    'turn_revision',
+    'retry_of_turn_id',
+    'input_user_batch_id',
+    'agency_snapshot_checksum',
+    'authoritative_release_id',
+    'comparison_release_id',
+    'authoritative_pipeline_checksum',
+    'comparison_pipeline_checksum',
+    'lane_key',
+    'lane_revision',
+    'input_visibility_sequence',
+    'generation_fingerprint'
+  ],
+  messages: ['authority_group_id', 'group_ordinal'],
+  cognitive_states: ['last_authority_group_id'],
+  stance_records: ['authority_group_id', 'authority_ordinal'],
+  consolidation_jobs: ['authority_group_id', 'authority_ordinal'],
+  cloud_deliveries: ['authority_group_id', 'authority_commit_checksum']
 };
 
 function envelope(id, sequence = 1) {
@@ -83,6 +114,13 @@ function stripV10Schema(path) {
   const database = new DatabaseSync(path);
   try {
     database.exec('PRAGMA foreign_keys = OFF;');
+    for (const index of [
+      'ux_messages_authority_group_ordinal',
+      'ux_stances_authority_group_ordinal',
+      'ux_consolidation_authority_group_ordinal',
+      'ux_delivery_authority_group_peer'
+    ]) database.exec(`DROP INDEX IF EXISTS "${index}";`);
+    for (const table of V11_V12_TABLES) database.exec(`DROP TABLE IF EXISTS "${table}";`);
     for (const table of V10_TABLES) database.exec(`DROP TABLE IF EXISTS "${table}";`);
     for (const [table, names] of Object.entries(V10_COLUMNS)) {
       const existing = columns(database, table);
@@ -179,11 +217,11 @@ function cognitiveSnapshotV2() {
   };
 }
 
-test('clean v9 passes through the historical v10 schema and finishes at v11', () => withTemporaryDatabase(path => {
+test('clean v9 passes through the historical schemas and finishes at v12', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: false });
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 11);
+    assert.equal(store.userVersion(), 12);
     for (const table of V10_TABLES) {
       assert.equal(
         Boolean(store.db.prepare(
@@ -196,23 +234,23 @@ test('clean v9 passes through the historical v10 schema and finishes at v11', ()
     assert.equal(store.listPipelineReleases().length, 2);
     assert.ok(store.listCognitionRollouts().every(row => row.candidatePhase === 'none'));
     store.migrate();
-    assert.equal(store.userVersion(), 11);
+    assert.equal(store.userVersion(), 12);
     assert.equal(store.listPipelineReleases().length, 2);
   } finally {
     store.close();
   }
 }));
 
-test('populated v9 through v10 to v11 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
+test('populated v9 through v10, v11, and v12 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: true });
   const before = countStructuralRows(path);
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 11);
+    assert.equal(store.userVersion(), 12);
     assert.deepEqual(countStructuralRows(path), before);
     assert.equal(store.listCognitionRollouts()[0].candidatePhase, 'none');
     store.migrate();
-    assert.equal(store.userVersion(), 11);
+    assert.equal(store.userVersion(), 12);
     assert.equal(store.listPipelineReleases().length, 2);
     assert.deepEqual(countStructuralRows(path), before);
   } finally {
@@ -220,11 +258,11 @@ test('populated v9 through v10 to v11 is non-destructive and idempotent', () => 
   }
 }));
 
-test('versions above v11 stop instead of being rewritten', () => withTemporaryDatabase(path => {
+test('versions above v12 stop instead of being rewritten', () => withTemporaryDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 12;');
+  database.exec('PRAGMA user_version = 13;');
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*12/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*13/i);
 }));
 
 test('new turns pin release pair and lane revision while old turns remain readable', () =>

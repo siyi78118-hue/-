@@ -37,7 +37,14 @@ export class ResultOutbox {
         ? this.store.listPendingAuthorityCloudDeliveries(limit)
         : [];
       const legacyTargets = this.store.listPendingCloudDeliveries(limit);
-      for (const target of [...authorityTargets, ...legacyTargets].slice(0, limit)) {
+      const targets = [...authorityTargets, ...legacyTargets].sort((left, right) =>
+        Number(left.updatedAt || 0) - Number(right.updatedAt || 0)
+        || String(left.authorityGroupId || left.turnId).localeCompare(
+          String(right.authorityGroupId || right.turnId)
+        )
+        || String(left.peerId).localeCompare(String(right.peerId))
+      ).slice(0, limit);
+      for (const target of targets) {
         if (target.authorityGroupId) {
           try {
             const publicPayload = this.store.visibleDeliveryPayload(

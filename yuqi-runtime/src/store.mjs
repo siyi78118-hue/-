@@ -652,12 +652,12 @@ export class YuqiStore {
         `migration source version mismatch: expected ${this.migrationOptions.expectedSourceVersion}, got ${initialVersion}`
       );
     }
-    if (initialVersion > 11) {
+    if (initialVersion > 12) {
       throw new Error(`unsupported database user_version ${initialVersion}`);
     }
-    if (initialVersion === 11) {
+    if (initialVersion === 12) {
       this.assertAgencyV10Invariants();
-      this.assertVisibleAuthorityV11Invariants();
+      this.assertVisibleAuthorityV12Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
       return;
     }
@@ -1207,8 +1207,11 @@ export class YuqiStore {
         this.assertVisibleAuthorityV11Invariants({ allowVersionTen: true });
         this.db.exec('PRAGMA user_version = 11;');
       }
+      if (initialVersion < 12) {
+        this.migrateVisibleAuthorityV12Internal();
+      }
       this.assertAgencyV10Invariants();
-      this.assertVisibleAuthorityV11Invariants();
+      this.assertVisibleAuthorityV12Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
       this.db.exec('COMMIT');
     } catch (error) {
@@ -1526,9 +1529,46 @@ export class YuqiStore {
     `);
   }
 
-  assertVisibleAuthorityV11Invariants({ allowVersionTen = false } = {}) {
+  migrateVisibleAuthorityV12Internal() {
+    const canonicalRows = Number(this.db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM visible_result_groups) +
+        (SELECT COUNT(*) FROM visible_commit_receipts) AS value
+    `).get().value);
+    if (canonicalRows !== 0) {
+      throw new Error('v12 migration cannot reconstruct canonical manifest');
+    }
+    const tableExists = this.db.prepare(`
+      SELECT 1 AS value FROM sqlite_master
+      WHERE type = 'table' AND name = 'visible_result_manifests'
+    `).get();
+    if (tableExists) throw new Error('v12 migration found unexpected manifest table');
+    this.db.exec(`
+      CREATE TABLE visible_result_manifests (
+        group_id TEXT PRIMARY KEY,
+        authority_origin TEXT NOT NULL,
+        payload_version TEXT NOT NULL,
+        semantic_json TEXT,
+        semantic_checksum TEXT NOT NULL UNIQUE,
+        redacted_at INTEGER,
+        created_at INTEGER NOT NULL,
+        CHECK (
+          (semantic_json IS NOT NULL AND redacted_at IS NULL)
+          OR (semantic_json IS NULL AND redacted_at IS NOT NULL)
+        ),
+        FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+      );
+      PRAGMA user_version = 12;
+    `);
+  }
+
+  assertVisibleAuthorityV11Invariants({
+    allowVersionTen = false,
+    allowVersionTwelve = false
+  } = {}) {
     const version = this.userVersion();
-    if ((!allowVersionTen && version !== 11) || (allowVersionTen && version !== 10)) {
+    const expectedVersion = allowVersionTen ? 10 : allowVersionTwelve ? 12 : 11;
+    if (version !== expectedVersion) {
       throw new Error(`v11 invariant user_version mismatch: ${version}`);
     }
     const requiredTables = [
@@ -1930,8 +1970,265 @@ export class YuqiStore {
     }
   }
 
+  getVisibleResultManifest(groupId) {
+    const row = this.db.prepare(`
+      SELECT * FROM visible_result_manifests WHERE group_id = ?
+    `).get(String(groupId || ''));
+    if (!row) return null;
+    return {
+      visibleGroupId: row.group_id,
+      authorityOrigin: row.authority_origin,
+      payloadVersion: row.payload_version,
+      semantic: row.semantic_json == null ? null : parseJson(row.semantic_json, null),
+      semanticChecksum: row.semantic_checksum,
+      redactedAt: row.redacted_at == null ? null : Number(row.redacted_at),
+      createdAt: Number(row.created_at)
+    };
+  }
+
+  assertVisibleAuthorityV12Invariants() {
+    this.assertVisibleAuthorityV11Invariants({ allowVersionTwelve: true });
+    const columns = this.db.prepare('PRAGMA table_info(visible_result_manifests)').all();
+    const expectedColumns = [
+      'group_id', 'authority_origin', 'payload_version', 'semantic_json',
+      'semantic_checksum', 'redacted_at', 'created_at'
+    ];
+    if (canonicalJson(columns.map(row => row.name)) !== canonicalJson(expectedColumns)) {
+      throw new Error('v12 invariant manifest schema mismatch');
+    }
+    const manifestIndexes = this.db.prepare(
+      'PRAGMA index_list(visible_result_manifests)'
+    ).all();
+    const uniqueIndexColumns = manifestIndexes
+      .filter(index => Number(index.unique) === 1)
+      .map(index => this.db.prepare(`PRAGMA index_info("${index.name}")`).all()
+        .map(column => column.name).join(','))
+      .sort();
+    if (canonicalJson(uniqueIndexColumns) !== canonicalJson(['group_id', 'semantic_checksum'])) {
+      throw new Error('v12 invariant manifest index mismatch');
+    }
+    const manifestForeignKeys = this.db.prepare(
+      'PRAGMA foreign_key_list(visible_result_manifests)'
+    ).all();
+    if (manifestForeignKeys.length !== 1
+      || manifestForeignKeys[0].table !== 'visible_result_groups'
+      || manifestForeignKeys[0].from !== 'group_id'
+      || manifestForeignKeys[0].to !== 'group_id') {
+      throw new Error('v12 invariant manifest foreign key mismatch');
+    }
+    const groups = this.db.prepare(`
+      SELECT g.*, r.commit_checksum, r.commit_payload_version,
+             r.authority_origin AS receipt_origin, m.semantic_json,
+             m.semantic_checksum, m.payload_version, m.authority_origin AS manifest_origin,
+             g.redacted_at AS group_redacted_at,
+             m.redacted_at AS manifest_redacted_at
+      FROM visible_result_groups g
+      LEFT JOIN visible_commit_receipts r ON r.group_id = g.group_id
+      LEFT JOIN visible_result_manifests m ON m.group_id = g.group_id
+    `).all();
+    const manifestCount = Number(this.db.prepare(
+      'SELECT COUNT(*) AS value FROM visible_result_manifests'
+    ).get().value);
+    if (manifestCount !== groups.length) {
+      throw new Error('v12 invariant manifest group cardinality mismatch');
+    }
+    for (const turn of this.db.prepare(`
+      SELECT * FROM turns WHERE result_authority_version = 1
+    `).all()) {
+      const envelope = parseJson(turn.envelope_json, {});
+      const normalized = resolveCurrentUserBatch(envelope);
+      if (envelope.message) {
+        const batch = this.db.prepare(
+          'SELECT * FROM current_user_batches WHERE turn_id = ?'
+        ).get(turn.turn_id);
+        const items = this.db.prepare(`
+          SELECT * FROM current_user_batch_items
+          WHERE turn_id = ? ORDER BY sequence
+        `).all(turn.turn_id);
+        const header = normalized && {
+          batchId: normalized.batchId,
+          sourceMessageId: normalized.sourceMessageId,
+          messageIds: normalized.messageIds,
+          startedAt: normalized.startedAt,
+          committedAt: normalized.committedAt
+        };
+        if (!batch || !normalized
+          || batch.batch_id !== normalized.batchId
+          || batch.character_id !== turn.character_id
+          || batch.source_message_id !== normalized.sourceMessageId
+          || Number(batch.started_at) !== Number(normalized.startedAt)
+          || Number(batch.committed_at) !== Number(normalized.committedAt)
+          || batch.checksum !== contentHash(header)
+          || items.length !== normalized.messageIds.length) {
+          throw new Error(`v12 invariant canonical input batch: ${turn.turn_id}`);
+        }
+        items.forEach((item, sequence) => {
+          const message = normalized.messages.find(candidate =>
+            candidate.messageId === normalized.messageIds[sequence]);
+          if (Number(item.sequence) !== sequence
+            || item.batch_id !== normalized.batchId
+            || item.message_id !== normalized.messageIds[sequence]
+            || item.checksum !== contentHash(message)
+            || canonicalJson(parseJson(item.message_json, null)) !== canonicalJson(message)) {
+            throw new Error(`v12 invariant canonical input item: ${turn.turn_id}`);
+          }
+        });
+      }
+      if (turn.retry_of_turn_id) {
+        const parent = this.db.prepare('SELECT * FROM turns WHERE turn_id = ?')
+          .get(turn.retry_of_turn_id);
+        const inherited = [
+          'pipeline_mode', 'preset_version', 'rollout_revision', 'rollout_evidence_epoch',
+          'pipeline_checksum', 'shadow_epoch', 'canary_epoch', 'canary_slot',
+          'comparison_mode', 'authoritative_release_id', 'comparison_release_id',
+          'authoritative_pipeline_checksum', 'comparison_pipeline_checksum',
+          'input_user_batch_id', 'input_visibility_sequence'
+        ];
+        if (!parent
+          || inherited.some(column => turn[column] !== parent[column])
+          || contentHash(parseJson(turn.annotation_snapshot_json, {}))
+            !== contentHash(parseJson(parent.annotation_snapshot_json, {}))
+          || Number(turn.lineage_revision_at_creation)
+            !== Number(parent.lineage_revision_at_creation) + 1) {
+          throw new Error(`v12 invariant canonical retry pins: ${turn.turn_id}`);
+        }
+      }
+    }
+    for (const group of groups) {
+      if (!group.semantic_checksum
+        || group.semantic_checksum !== group.commit_checksum
+        || group.payload_version !== group.commit_payload_version
+        || group.manifest_origin !== group.receipt_origin
+        || group.manifest_origin !== group.authority_origin) {
+        throw new Error(`v12 invariant manifest receipt join: ${group.group_id}`);
+      }
+      if (group.group_redacted_at != null || group.manifest_redacted_at != null) {
+        const redactedDeliveries = Number(this.db.prepare(`
+          SELECT COUNT(*) AS value FROM cloud_deliveries
+          WHERE authority_group_id = ? AND state IN ('waiting','pending','retry')
+        `).get(group.group_id).value);
+        const retainedItems = Number(this.db.prepare(`
+          SELECT COUNT(*) AS value FROM visible_result_items WHERE group_id = ?
+        `).get(group.group_id).value);
+        const retainedActions = Number(this.db.prepare(`
+          SELECT COUNT(*) AS value FROM visible_result_actions WHERE group_id = ?
+        `).get(group.group_id).value);
+        const retainedMessages = Number(this.db.prepare(`
+          SELECT COUNT(*) AS value FROM messages
+          WHERE authority_group_id = ? AND length(trim(content)) > 0
+        `).get(group.group_id).value);
+        if (group.group_redacted_at == null
+          || group.manifest_redacted_at == null
+          || Number(group.group_redacted_at) !== Number(group.manifest_redacted_at)
+          || group.semantic_json != null
+          || redactedDeliveries !== 0
+          || retainedItems !== 0
+          || retainedActions !== 0
+          || retainedMessages !== 0) {
+          throw new Error(`v12 invariant redacted manifest shape: ${group.group_id}`);
+        }
+        continue;
+      }
+      const semantic = parseJson(group.semantic_json, null);
+      if (!semantic || contentHash(semantic) !== group.semantic_checksum) {
+        throw new Error(`v12 invariant manifest checksum: ${group.group_id}`);
+      }
+      const items = this.visibleItemsForGroup(group.group_id).map(item => item.item);
+      const actionRows = this.actionsForGroup(group.group_id);
+      const actions = actionRows.map(action => ({
+        kind: action.kind,
+        targetKey: action.targetKey,
+        targetRevision: action.targetRevision,
+        payload: action.action
+      }));
+      if (canonicalJson(items) !== canonicalJson(semantic.visibleItems || [])
+        || canonicalJson(actions) !== canonicalJson(semantic.actions || [])) {
+        throw new Error(`v12 invariant manifest projection mismatch: ${group.group_id}`);
+      }
+      actionRows.forEach((action, ordinal) => {
+        const descriptor = actions[ordinal];
+        if (action.ordinal !== ordinal
+          || action.actionChecksum !== contentHash(descriptor)
+          || action.actionId !== deriveVisibleActionId(group.group_id, ordinal)) {
+          throw new Error(`v12 invariant manifest action authority: ${group.group_id}`);
+        }
+      });
+      const jobs = this.db.prepare(`
+        SELECT * FROM consolidation_jobs
+        WHERE authority_group_id = ? ORDER BY authority_ordinal
+      `).all(group.group_id);
+      const expectedJobs = [
+        ...(semantic.memoryJobs || []),
+        ...(semantic.comparison ? [semantic.comparison] : [])
+      ];
+      if (jobs.length !== expectedJobs.length) {
+        throw new Error(`v12 invariant manifest job cardinality: ${group.group_id}`);
+      }
+      jobs.forEach((job, ordinal) => {
+        const payload = parseJson(job.payload_json, {});
+        const expected = expectedJobs[ordinal];
+        const semanticJob = ['shadow_cognition', 'active_canary_compare'].includes(job.job_type)
+          ? {
+              jobType: job.job_type,
+              ...Object.fromEntries(Object.entries(payload).filter(([key]) =>
+                !['authorityGroupId', 'authoritativeResultChecksum'].includes(key)))
+            }
+          : payload;
+        if (job.role_id !== group.role_id
+          || job.turn_id !== group.authoritative_turn_id
+          || job.subject_type !== 'turn'
+          || job.subject_id !== group.authoritative_turn_id
+          || Number(job.authority_ordinal) !== ordinal
+          || contentHash(payload) !== job.payload_checksum
+          || canonicalJson(semanticJob) !== canonicalJson(expected)) {
+          throw new Error(`v12 invariant manifest job authority: ${group.group_id}`);
+        }
+      });
+      const stances = this.db.prepare(`
+        SELECT * FROM stance_records
+        WHERE authority_group_id = ? ORDER BY authority_ordinal
+      `).all(group.group_id);
+      const expectedStances = semantic.statePatch?.currentStances || [];
+      if (stances.length !== expectedStances.length) {
+        throw new Error(`v12 invariant manifest stance cardinality: ${group.group_id}`);
+      }
+      stances.forEach((stance, ordinal) => {
+        const expected = expectedStances[ordinal];
+        if (stance.role_id !== group.role_id
+          || stance.source_turn_id !== group.authoritative_turn_id
+          || Number(stance.authority_ordinal) !== ordinal
+          || stance.stance_id !== String(expected.stanceId || '')
+          || stance.topic !== String(expected.topic || '')
+          || stance.position_text !== String(expected.position || '')
+          || stance.reason_text !== String(expected.reason || '')) {
+          throw new Error(`v12 invariant manifest stance authority: ${group.group_id}`);
+        }
+      });
+      const cognitiveState = this.db.prepare(`
+        SELECT * FROM cognitive_states WHERE last_authority_group_id = ?
+      `).get(group.group_id);
+      if (semantic.statePatch && !cognitiveState) {
+        throw new Error(`v12 invariant manifest cognitive state missing: ${group.group_id}`);
+      }
+      if (cognitiveState) {
+        const state = parseJson(cognitiveState.state_json, {});
+        const expectedOpenThreads = (semantic.statePatch?.openThreads || []).map(item =>
+          typeof item === 'string' ? item : String(item?.threadId || '')
+        ).filter(Boolean);
+        if (cognitiveState.role_id !== group.role_id
+          || cognitiveState.last_turn_id !== group.authoritative_turn_id
+          || cognitiveState.checksum !== contentHash(state)
+          || String(state.fastState?.mood || '') !== String(semantic.statePatch?.mood || '')
+          || canonicalJson(state.fastState?.openThreadIds || []) !== canonicalJson(expectedOpenThreads)) {
+          throw new Error(`v12 invariant manifest cognitive state authority: ${group.group_id}`);
+        }
+      }
+    }
+  }
+
   visibleAuthorityV11InvariantSummary() {
-    this.assertVisibleAuthorityV11Invariants();
+    if (this.userVersion() === 12) this.assertVisibleAuthorityV12Invariants();
+    else this.assertVisibleAuthorityV11Invariants();
     const tableNames = [
       'messages',
       'facts',
@@ -1945,6 +2242,7 @@ export class YuqiStore {
       'visible_result_groups',
       'visible_result_items',
       'visible_result_actions',
+      'visible_result_manifests',
       'visible_commit_receipts',
       'cloud_deliveries'
     ];
@@ -1979,7 +2277,7 @@ export class YuqiStore {
       ? version === 9
       : allowPreFinalVersion
         ? version === 10
-        : version === 10 || version === 11;
+        : version === 10 || version === 11 || version === 12;
     if (!versionAllowed) {
       throw new Error(`v10 invariant user_version mismatch: ${version}`);
     }
@@ -3027,7 +3325,6 @@ export class YuqiStore {
           || String(input.comparisonDirection || '') !== String(inheritedComparisonDirection || '')
           || inputVisibilitySequence !== Number(parent.inputVisibilitySequence)
           || inputUserBatchId !== parent.inputUserBatchId
-          || agencySnapshotChecksum !== parent.agencySnapshotChecksum
           || contentHash(input.annotationSnapshot || {})
             !== contentHash(parent.annotationSnapshot || {})) {
           throw new Error('canonical retry immutable authority conflict');
@@ -3565,6 +3862,7 @@ export class YuqiStore {
   }
 
   visibleDeliveryPayload(groupId, peerId) {
+    this.assertVisibleAuthorityV12Invariants();
     const authority = this.db.prepare(`
       SELECT
         d.authority_group_id, d.peer_id, d.recovery_ack_seq,
@@ -3684,6 +3982,10 @@ export class YuqiStore {
     const items = Array.isArray(input.visibleGroup?.items) ? input.visibleGroup.items : [];
     const actions = Array.isArray(input.actionSet) ? input.actionSet : [];
     if (!items.length) throw new Error('visible group items are required');
+    if (!input.authorityManifest
+      || contentHash(input.authorityManifest) !== input.commitChecksum) {
+      throw new Error('canonical manifest checksum authority conflict');
+    }
     const failAfter = step => {
       if (Number(this.commitFaultAfterStep) === step) {
         throw new Error(`forced commit fault after step ${step}`);
@@ -3705,7 +4007,7 @@ export class YuqiStore {
       input.authorityOrigin,
       input.authoritativeReleaseId,
       input.generationFingerprint,
-      contentHash(items),
+      contentHash({ items, actions }),
       timestamp
     );
     failAfter(1);
@@ -3946,6 +4248,21 @@ export class YuqiStore {
     failAfter(12);
 
     this.db.prepare(`
+      INSERT INTO visible_result_manifests(
+        group_id, authority_origin, payload_version, semantic_json,
+        semantic_checksum, redacted_at, created_at
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?)
+    `).run(
+      input.groupId,
+      input.authorityOrigin,
+      input.commitPayloadVersion,
+      canonicalJson(input.authorityManifest),
+      input.commitChecksum,
+      timestamp
+    );
+    failAfter(13);
+
+    this.db.prepare(`
       INSERT INTO visible_commit_receipts(
         lineage_key, group_id, authoritative_turn_id, authority_origin,
         commit_payload_version, turn_revision_before, turn_revision_after,
@@ -3971,7 +4288,7 @@ export class YuqiStore {
       input.commitChecksum,
       timestamp
     );
-    failAfter(13);
+    failAfter(14);
     return {
       ...this.getVisibleCommitReceipt(input.authorityLineageKey),
       committed: true
@@ -4466,6 +4783,45 @@ export class YuqiStore {
     return this.getTurn(turnId);
   }
 
+  assertCanonicalAttemptMutableInternal({
+    turnId,
+    expectedState,
+    expectedTurnRevision,
+    operation = 'mutation'
+  }) {
+    const row = this.db.prepare(`
+      SELECT t.state, t.turn_revision, t.result_authority_version,
+             l.state AS lineage_state, l.latest_turn_id, l.committed_group_id,
+             r.group_id AS receipt_group_id
+      FROM turns t
+      LEFT JOIN turn_authority_lineages l
+        ON l.lineage_key = t.authority_lineage_key
+      LEFT JOIN visible_commit_receipts r
+        ON r.lineage_key = t.authority_lineage_key
+      WHERE t.turn_id = ?
+    `).get(String(turnId));
+    if (row && (row.state === 'committed'
+      || row.lineage_state === 'committed'
+      || row.committed_group_id != null
+      || row.receipt_group_id != null)) {
+      throw new Error('canonical committed authority is immutable');
+    }
+    if (!row
+      || Number(row.result_authority_version) !== 1
+      || row.state !== String(expectedState)
+      || Number(row.turn_revision) !== Number(expectedTurnRevision)
+      || row.lineage_state !== 'open'
+      || row.latest_turn_id !== String(turnId)
+      || row.committed_group_id != null
+      || row.receipt_group_id != null) {
+      throw new Error(`canonical turn authority conflict: ${operation}`);
+    }
+    return {
+      turn: this.getTurn(turnId),
+      lineage: this.getTurnAuthorityLineage(this.getTurn(turnId).authorityLineageKey)
+    };
+  }
+
   setCanonicalTurnRouteInternal({
     turnId,
     expectedState,
@@ -4475,6 +4831,12 @@ export class YuqiStore {
   }) {
     if (!['fast', 'deep', 'fast_to_deep'].includes(route)) throw new Error('invalid turn route');
     return this.withImmediateTransaction(() => {
+      this.assertCanonicalAttemptMutableInternal({
+        turnId,
+        expectedState,
+        expectedTurnRevision,
+        operation: 'route'
+      });
       const timestamp = now();
       const result = this.db.prepare(`
         UPDATE turns
@@ -4482,6 +4844,16 @@ export class YuqiStore {
             updated_at = ?
         WHERE turn_id = ? AND result_authority_version = 1
           AND state = ? AND turn_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turn_authority_lineages l
+            WHERE l.lineage_key = turns.authority_lineage_key
+              AND l.state = 'open' AND l.latest_turn_id = turns.turn_id
+              AND l.committed_group_id IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.lineage_key = turns.authority_lineage_key
+          )
       `).run(
         route,
         canonicalJson([...new Set(reasons.map(String))]),
@@ -4533,11 +4905,27 @@ export class YuqiStore {
   }) {
     if (!String(stage || '').trim()) throw new Error('stage is required');
     return this.withImmediateTransaction(() => {
+      this.assertCanonicalAttemptMutableInternal({
+        turnId,
+        expectedState,
+        expectedTurnRevision,
+        operation: 'begin_stage'
+      });
       const result = this.db.prepare(`
         UPDATE turns
         SET turn_revision = turn_revision + 1, updated_at = ?
         WHERE turn_id = ? AND result_authority_version = 1
           AND state = ? AND turn_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turn_authority_lineages l
+            WHERE l.lineage_key = turns.authority_lineage_key
+              AND l.state = 'open' AND l.latest_turn_id = turns.turn_id
+              AND l.committed_group_id IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.lineage_key = turns.authority_lineage_key
+          )
       `).run(now(), String(turnId), String(expectedState), Number(expectedTurnRevision));
       if (Number(result.changes) !== 1) throw new Error('canonical turn authority conflict');
       const active = this.db.prepare(`
@@ -4592,6 +4980,12 @@ export class YuqiStore {
     finishedAt = now()
   }) {
     return this.withImmediateTransaction(() => {
+      this.assertCanonicalAttemptMutableInternal({
+        turnId,
+        expectedState,
+        expectedTurnRevision,
+        operation: 'finish_stage'
+      });
       const active = this.db.prepare(`
         SELECT * FROM turn_stages
         WHERE turn_id = ? AND stage = ? AND finished_at IS NULL
@@ -4603,6 +4997,16 @@ export class YuqiStore {
         SET turn_revision = turn_revision + 1, updated_at = ?
         WHERE turn_id = ? AND result_authority_version = 1
           AND state = ? AND turn_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turn_authority_lineages l
+            WHERE l.lineage_key = turns.authority_lineage_key
+              AND l.state = 'open' AND l.latest_turn_id = turns.turn_id
+              AND l.committed_group_id IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.lineage_key = turns.authority_lineage_key
+          )
       `).run(now(), String(turnId), String(expectedState), Number(expectedTurnRevision));
       if (Number(result.changes) !== 1) throw new Error('canonical turn authority conflict');
       const durationMs = Math.max(0, Number(finishedAt) - Number(active.started_at));
@@ -5089,12 +5493,28 @@ export class YuqiStore {
   claimCanonicalTurnInternal({ turnId, workerId, expectedTurnRevision }) {
     if (!workerId) throw new Error('workerId is required');
     return this.withImmediateTransaction(() => {
+      this.assertCanonicalAttemptMutableInternal({
+        turnId,
+        expectedState: 'queued',
+        expectedTurnRevision,
+        operation: 'claim'
+      });
       const result = this.db.prepare(`
         UPDATE turns
         SET state = 'memory_running', worker_id = ?, updated_at = ?,
             turn_revision = turn_revision + 1
         WHERE turn_id = ? AND result_authority_version = 1
           AND state = 'queued' AND turn_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turn_authority_lineages l
+            WHERE l.lineage_key = turns.authority_lineage_key
+              AND l.state = 'open' AND l.latest_turn_id = turns.turn_id
+              AND l.committed_group_id IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.lineage_key = turns.authority_lineage_key
+          )
       `).run(String(workerId), now(), String(turnId), Number(expectedTurnRevision));
       if (Number(result.changes) !== 1) {
         throw new Error('canonical turn authority conflict');
@@ -5115,6 +5535,13 @@ export class YuqiStore {
     if (!TURN_STATES.includes(expectedState) || !TURN_STATES.includes(nextState)) {
       throw new Error('unknown turn state');
     }
+    const canonicalForwardEdges = new Map([
+      ['memory_running', 'memory_done'],
+      ['memory_done', 'brain_running'],
+      ['brain_running', 'brain_done'],
+      ['brain_done', 'supervisor_running'],
+      ['supervisor_running', 'approved']
+    ]);
     const assignments = [
       'state = ?',
       'updated_at = ?',
@@ -5129,10 +5556,29 @@ export class YuqiStore {
     }
     values.push(String(turnId), expectedState, Number(expectedTurnRevision));
     return this.withImmediateTransaction(() => {
+      this.assertCanonicalAttemptMutableInternal({
+        turnId,
+        expectedState,
+        expectedTurnRevision,
+        operation: 'advance'
+      });
+      if (canonicalForwardEdges.get(expectedState) !== nextState) {
+        throw new Error('canonical transition authority conflict');
+      }
       const result = this.db.prepare(`
         UPDATE turns SET ${assignments.join(', ')}
         WHERE turn_id = ? AND result_authority_version = 1
           AND state = ? AND turn_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turn_authority_lineages l
+            WHERE l.lineage_key = turns.authority_lineage_key
+              AND l.state = 'open' AND l.latest_turn_id = turns.turn_id
+              AND l.committed_group_id IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.lineage_key = turns.authority_lineage_key
+          )
       `).run(...values);
       if (Number(result.changes) !== 1) {
         throw new Error('canonical turn authority conflict');
@@ -5155,12 +5601,28 @@ export class YuqiStore {
       failureClass: String(failure?.failureClass || 'terminal')
     };
     return this.withImmediateTransaction(() => {
+      this.assertCanonicalAttemptMutableInternal({
+        turnId,
+        expectedState,
+        expectedTurnRevision,
+        operation: 'failure'
+      });
       const result = this.db.prepare(`
         UPDATE turns
         SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?,
             turn_revision = turn_revision + 1
         WHERE turn_id = ? AND result_authority_version = 1
           AND state = ? AND turn_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turn_authority_lineages l
+            WHERE l.lineage_key = turns.authority_lineage_key
+              AND l.state = 'open' AND l.latest_turn_id = turns.turn_id
+              AND l.committed_group_id IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.lineage_key = turns.authority_lineage_key
+          )
       `).run(
         canonicalJson(normalizedFailure),
         now(),
@@ -5182,19 +5644,22 @@ export class YuqiStore {
     expectedTurnRevision,
     allowedFailureClass
   }) {
-    const current = this.getTurn(turnId);
-    const failure = parseJson(current?.errorJson, {});
-    if (!current || current.resultAuthorityVersion !== 1
-      || current.state !== 'failed'
-      || String(failure.failureClass || '') !== String(allowedFailureClass || '')) {
-      throw new Error('canonical turn authority conflict');
-    }
-    const checkpoint = current.brainDraftJson
-      ? 'brain_done'
-      : current.memoryPacketJson
-        ? 'memory_done'
-        : 'queued';
     return this.withImmediateTransaction(() => {
+      const { turn: current } = this.assertCanonicalAttemptMutableInternal({
+        turnId,
+        expectedState: 'failed',
+        expectedTurnRevision,
+        operation: 'requeue'
+      });
+      const failure = parseJson(current.errorJson, {});
+      if (String(failure.failureClass || '') !== String(allowedFailureClass || '')) {
+        throw new Error('canonical turn authority conflict');
+      }
+      const checkpoint = current.brainDraftJson
+        ? 'brain_done'
+        : current.memoryPacketJson
+          ? 'memory_done'
+          : 'queued';
       const result = this.db.prepare(`
         UPDATE turns
         SET state = ?, worker_id = NULL, error_json = NULL,
@@ -5206,6 +5671,16 @@ export class YuqiStore {
             turn_revision = turn_revision + 1
         WHERE turn_id = ? AND result_authority_version = 1
           AND state = 'failed' AND turn_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turn_authority_lineages l
+            WHERE l.lineage_key = turns.authority_lineage_key
+              AND l.state = 'open' AND l.latest_turn_id = turns.turn_id
+              AND l.committed_group_id IS NULL
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM visible_commit_receipts r
+            WHERE r.lineage_key = turns.authority_lineage_key
+          )
       `).run(
         checkpoint,
         checkpoint,

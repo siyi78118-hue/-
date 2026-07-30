@@ -371,13 +371,19 @@ export function commitVisibleResult(input) {
       evidenceIndex,
       effectiveAt
     });
-    const semantic = canonicalCommitPayload(input);
+    const semantic = canonicalPayload;
     const normalizedItems = semantic.visibleItems;
     const normalizedMemoryJobs = semantic.memoryJobs.map((descriptor, ordinal) => ({
       jobId: input.memoryJobs?.[ordinal]?.jobId,
       jobType: descriptor.jobType,
       payload: descriptor
     }));
+    assert.deepEqual(semantic.actions, resolvedActions.map(normalizeAction));
+    assert.deepEqual(semantic.statePatch, validatedStatePatch?.semanticPatch ?? null);
+    assert.deepEqual(
+      semantic.memoryJobs,
+      normalizedMemoryJobs.map(job => job.payload)
+    );
     return input.store.commitVisibleResultInternal({
       ...input,
       visibleGroup: { items: normalizedItems },
@@ -386,6 +392,7 @@ export function commitVisibleResult(input) {
       memoryJobs: normalizedMemoryJobs,
       authorityOrigin: 'pc',
       commitPayloadVersion: 'pc-visible-commit-v1',
+      authorityManifest: semantic,
       groupId: deriveVisibleGroupId(input.authorityLineageKey),
       commitChecksum
     });

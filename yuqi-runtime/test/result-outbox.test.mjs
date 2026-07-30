@@ -339,3 +339,96 @@ test('canonical original and retry restart emit one group-keyed delivery', async
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
+
+test('mixed canonical and legacy backlog honors global age without starvation', async () => {
+  const fetchOrder = [];
+  const makeStore = ({ canonical, legacy, canonicalUpdatedAt, legacyUpdatedAt }) => ({
+    listPendingAuthorityCloudDeliveries(limit) {
+      return Array.from({ length: canonical }, (_, index) => ({
+        authorityGroupId: `canonical_${String(index + 1).padStart(3, '0')}`,
+        peerId: 'phone_cloud',
+        authorityCommitChecksum: 'a'.repeat(64),
+        updatedAt: canonicalUpdatedAt + index
+      })).slice(0, limit);
+    },
+    listPendingCloudDeliveries(limit) {
+      return Array.from({ length: legacy }, (_, index) => ({
+        turnId: `legacy_${String(index + 1).padStart(3, '0')}`,
+        peerId: 'phone_cloud',
+        recoveryAckSeq: 0,
+        updatedAt: legacyUpdatedAt + index
+      })).slice(0, limit);
+    },
+    visibleDeliveryPayload(groupId) {
+      return {
+        visibleGroupId: groupId,
+        authorityLineageKey: `lineage_${groupId}`,
+        commitChecksum: 'a'.repeat(64),
+        replyParts: []
+      };
+    },
+    prepareAuthorityCloudDelivery(groupId) {
+      return { checksum: `checksum_${groupId}` };
+    },
+    markAuthorityCloudDeliveryAttempt() {},
+    markAuthorityCloudDeliveryMailboxed() {},
+    getTurn(turnId) {
+      return {
+        turnId,
+        state: 'committed',
+        replyJson: JSON.stringify({ reply: { content: turnId } }),
+        createdAt: 1,
+        updatedAt: 1
+      };
+    },
+    prepareCloudDelivery(turnId) {
+      return { checksum: `checksum_${turnId}` };
+    },
+    markCloudDeliveryAttempt() {},
+    markCloudDeliveryMailboxed() {}
+  });
+  const run = async options => {
+    fetchOrder.length = 0;
+    const store = makeStore(options);
+    const outbox = new ResultOutbox({
+      relayUrl: 'https://relay.example',
+      deviceId: 'phone_cloud',
+      deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64,
+      store,
+      fetchImpl: async (_url, request) => {
+        const encrypted = JSON.parse(request.body);
+        const payload = decryptRelayPayload(encrypted, keyBase64);
+        fetchOrder.push(payload.visibleGroupId || payload.turnId);
+        return Response.json({ ok: true }, { status: 201 });
+      }
+    });
+    assert.equal(store.listPendingCloudDeliveries(100).every(
+      target => target.authorityGroupId == null
+    ), true);
+    assert.equal(store.listPendingAuthorityCloudDeliveries(100).every(
+      target => target.authorityGroupId != null
+    ), true);
+    assert.deepEqual(await outbox.flushOnce(50), {
+      delivered: 50,
+      failed: 0,
+      waiting: 0
+    });
+  };
+
+  await run({
+    canonical: 60,
+    legacy: 2,
+    legacyUpdatedAt: 1,
+    canonicalUpdatedAt: 100
+  });
+  assert.deepEqual(fetchOrder.slice(0, 2), ['legacy_001', 'legacy_002']);
+
+  await run({
+    canonical: 2,
+    legacy: 60,
+    canonicalUpdatedAt: 1,
+    legacyUpdatedAt: 100
+  });
+  assert.deepEqual(fetchOrder.slice(0, 2), ['canonical_001', 'canonical_002']);
+});

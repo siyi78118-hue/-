@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { generationFingerprint } from '../src/interaction-lanes.mjs';
+import { contentHash } from '../src/protocol.mjs';
 import { YuqiStore } from '../src/store.mjs';
 import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
@@ -42,6 +43,30 @@ function tableCounts(database) {
 
 function fileSha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function rawLogicalSnapshot(path) {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    const schema = database.prepare(`
+      SELECT type, name, sql FROM sqlite_master
+      WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'index', 'trigger')
+      ORDER BY type, name
+    `).all();
+    const tables = schema.filter(entry => entry.type === 'table').map(entry => entry.name);
+    const rows = Object.fromEntries(tables.map(name => {
+      const values = database.prepare(`SELECT * FROM "${name}"`).all();
+      return [name, values.map(value => JSON.stringify(value)).sort()];
+    }));
+    return {
+      userVersion: Number(database.prepare('PRAGMA user_version').get().user_version),
+      schema,
+      rowCounts: Object.fromEntries(tables.map(name => [name, rows[name].length])),
+      logicalChecksum: createHash('sha256').update(JSON.stringify(rows)).digest('hex')
+    };
+  } finally {
+    database.close();
+  }
 }
 
 function createPopulatedV10(path) {
@@ -623,7 +648,22 @@ function commitCanonicalTurn(store, turn) {
     authoritativeReleaseId: turn.authoritativeReleaseId,
     visibleGroup,
     actionSet,
-    statePatch: null,
+    statePatch: {
+      mood: 'engaged',
+      openThreads: ['thread_authority'],
+      currentStances: [{
+        operation: 'create',
+        stanceId: `stance_${turn.turnId}`,
+        topic: 'conversation',
+        position: '想继续聊',
+        reason: '当前互动',
+        strength: 0.7,
+        flexibility: 0.8,
+        evidenceMessageIds: [JSON.parse(turn.envelopeJson).message.messageId],
+        expiresAt: 30_000,
+        remainingRelevantUserBatches: 3
+      }]
+    },
     memoryJobs: [{
       jobId: `job_${turn.turnId}`,
       jobType: 'turn_consolidation',
@@ -660,17 +700,32 @@ function seedCommittedV11(path) {
       content: '第二条测试消息',
       sentAt: 10_002
     });
-    store.createCanonicalVisibleTurnInternal(canonicalCreateInput(store, openEnvelope, {
+    const open = store.createCanonicalVisibleTurnInternal(canonicalCreateInput(store, openEnvelope, {
       expectedLaneRevision: lane.revision,
       inputVisibilitySequence: lane.localSequence
+    })).turn;
+    const retryEnvelope = v2Envelope('turn_open_retry', 3, {
+      messageId: openEnvelope.message.messageId,
+      content: openEnvelope.message.content,
+      sentAt: openEnvelope.message.sentAt,
+      retry: {
+        retryOfTurnId: open.turnId,
+        canonicalMessageId: openEnvelope.message.messageId
+      }
+    });
+    const retryLane = store.getInteractionLane('yuqi', 'private_chat');
+    store.createCanonicalVisibleTurnInternal(canonicalCreateInput(store, retryEnvelope, {
+      expectedLaneRevision: retryLane.revision,
+      inputUserBatchId: open.inputUserBatchId,
+      inputVisibilitySequence: open.inputVisibilitySequence
     }));
 
     const legacyLane = store.getInteractionLane('yuqi', 'private_chat');
     store.createTurnWithReleasePinInternal({
-      envelope: v2Envelope('turn_legacy_v11', 3, {
+      envelope: v2Envelope('turn_legacy_v11', 4, {
         messageId: 'msg_source_legacy',
         content: '旧路径消息',
-        sentAt: 10_003
+        sentAt: 10_004
       }),
       rolloutKey: 'DIRECT_REPLY',
       laneKey: 'private_chat',
@@ -697,7 +752,7 @@ function assertV11ReopenRejected(path) {
   try {
     reopened = new YuqiStore(path);
   } catch (error) {
-    assert.match(String(error?.message || error), /v11 invariant/i);
+    assert.match(String(error?.message || error), /v1[12] invariant/i);
     return;
   } finally {
     reopened?.close();
@@ -773,6 +828,43 @@ for (const [name, corrupt] of [
     database.prepare(`
       UPDATE visible_result_actions SET action_id = 'action_forged'
     `).run()],
+  ['visible action semantic payload differs from manifest', database => {
+    const row = database.prepare('SELECT * FROM visible_result_actions LIMIT 1').get();
+    const payload = { content: 'tampered' };
+    database.prepare(`
+      UPDATE visible_result_actions SET action_json = ?, action_checksum = ?
+    `).run(JSON.stringify(payload), contentHash({
+      kind: row.action_kind,
+      targetKey: row.target_key,
+      targetRevision: row.target_revision,
+      payload
+    }));
+  }],
+  ['visible action checksum differs from semantic action', database =>
+    database.prepare(`
+      UPDATE visible_result_actions SET action_checksum = ?
+    `).run('f'.repeat(64))],
+  ['visible action projection is missing', database =>
+    database.prepare('DELETE FROM visible_result_actions').run()],
+  ['canonical input batch item content is tampered', database => {
+    const row = database.prepare(`
+      SELECT * FROM current_user_batch_items
+      WHERE turn_id = 'turn_committed' LIMIT 1
+    `).get();
+    const message = JSON.parse(row.message_json);
+    message.content = 'tampered';
+    database.prepare(`
+      UPDATE current_user_batch_items
+      SET message_json = ?, checksum = ?
+      WHERE turn_id = 'turn_committed' AND message_id = ?
+    `).run(JSON.stringify(message), contentHash(message), row.message_id);
+  }],
+  ['canonical input batch item order is tampered', database =>
+    database.prepare(`
+      UPDATE current_user_batch_items
+      SET sequence = sequence + 10
+      WHERE turn_id = 'turn_committed'
+    `).run()],
   ['canonical memory job points at a missing group', database => {
     database.exec('PRAGMA foreign_keys = OFF;');
     database.prepare(`
@@ -780,6 +872,79 @@ for (const [name, corrupt] of [
       WHERE authority_group_id IS NOT NULL
     `).run();
   }],
+  ['canonical memory job has a foreign role', database =>
+    database.prepare(`
+      UPDATE consolidation_jobs SET role_id = 'other_role'
+      WHERE authority_group_id IS NOT NULL
+    `).run()],
+  ['canonical memory job has a foreign turn', database =>
+    database.prepare(`
+      UPDATE consolidation_jobs SET turn_id = 'turn_open'
+      WHERE authority_group_id IS NOT NULL
+    `).run()],
+  ['canonical memory job payload is tampered', database => {
+    const payload = { tampered: true };
+    database.prepare(`
+      UPDATE consolidation_jobs SET payload_json = ?, payload_checksum = ?
+      WHERE authority_group_id IS NOT NULL
+    `).run(JSON.stringify(payload), contentHash(payload));
+  }],
+  ['canonical memory job projection is missing', database =>
+    database.prepare(`
+      DELETE FROM consolidation_jobs WHERE authority_group_id IS NOT NULL
+    `).run()],
+  ['canonical cognitive state checksum is tampered', database =>
+    database.prepare(`
+      UPDATE cognitive_states SET checksum = ?
+      WHERE last_authority_group_id IS NOT NULL
+    `).run('e'.repeat(64))],
+  ['canonical stance role is tampered', database =>
+    database.prepare(`
+      UPDATE stance_records SET role_id = 'other_role'
+      WHERE authority_group_id IS NOT NULL
+    `).run()],
+  ['canonical retry release pin is tampered', database =>
+    database.prepare(`
+      UPDATE turns SET authoritative_release_id = 'forged_release'
+      WHERE turn_id = 'turn_open_retry'
+    `).run()],
+  ['canonical retry comparison pin is tampered', database =>
+    database.prepare(`
+      UPDATE turns SET comparison_mode = 'candidate_authoritative_stable_compare'
+      WHERE turn_id = 'turn_open_retry'
+    `).run()],
+  ['canonical retry rollout pin is tampered', database =>
+    database.prepare(`
+      UPDATE turns SET rollout_evidence_epoch = rollout_evidence_epoch + 1
+      WHERE turn_id = 'turn_open_retry'
+    `).run()],
+  ['canonical retry batch pin is tampered', database =>
+    database.prepare(`
+      UPDATE turns SET input_user_batch_id = 'batch_forged'
+      WHERE turn_id = 'turn_open_retry'
+    `).run()],
+  ['canonical retry annotation snapshot is tampered', database =>
+    database.prepare(`
+      UPDATE turns SET annotation_snapshot_json = '{"forged":true}'
+      WHERE turn_id = 'turn_open_retry'
+    `).run()],
+  ['canonical retry parent is tampered', database =>
+    database.prepare(`
+      UPDATE turns SET retry_of_turn_id = 'turn_committed'
+      WHERE turn_id = 'turn_open_retry'
+    `).run()],
+  ['canonical retry creation revision is tampered', database =>
+    database.prepare(`
+      UPDATE turns SET lineage_revision_at_creation = lineage_revision_at_creation + 1
+      WHERE turn_id = 'turn_open_retry'
+    `).run()],
+  ['canonical semantic manifest is missing', database =>
+    database.prepare('DELETE FROM visible_result_manifests').run()],
+  ['canonical semantic manifest JSON is tampered', database =>
+    database.prepare(`
+      UPDATE visible_result_manifests
+      SET semantic_json = '{"payloadVersion":"pc-visible-commit-v1"}'
+    `).run()],
   ['PC receipt has no canonical delivery', database =>
     database.prepare('DELETE FROM cloud_deliveries WHERE authority_group_id IS NOT NULL').run()],
   ['delivery checksum differs from receipt', database =>
@@ -806,12 +971,48 @@ for (const [name, corrupt] of [
   }));
 }
 
-test('populated PC v10 migrates once to v11 without inventing historical authority', () =>
+for (const [name, corrupt] of [
+  ['mutated action payload', store => {
+    const forged = { content: 'tampered' };
+    store.db.prepare(`
+      UPDATE visible_result_actions
+      SET action_json = ?, action_checksum = ?
+    `).run(JSON.stringify(forged), contentHash({
+      kind: 'moment_create',
+      targetKey: store.db.prepare(
+        'SELECT target_key FROM visible_result_actions LIMIT 1'
+      ).get().target_key,
+      targetRevision: store.db.prepare(
+        'SELECT target_revision FROM visible_result_actions LIMIT 1'
+      ).get().target_revision,
+      payload: forged
+    }));
+  }],
+  ['deleted action projection', store =>
+    store.db.prepare('DELETE FROM visible_result_actions').run()]
+]) {
+  test(`direct canonical delivery rejects ${name} before restart`, () => withDatabase(path => {
+    seedCommittedV11(path);
+    const store = new YuqiStore(path);
+    try {
+      const delivery = store.listPendingAuthorityCloudDeliveries(1)[0];
+      corrupt(store);
+      assert.throws(
+        () => store.visibleDeliveryPayload(delivery.authorityGroupId, delivery.peerId),
+        /v12 invariant/i
+      );
+    } finally {
+      store.close();
+    }
+  }));
+}
+
+test('populated PC v10 migrates through v11 to v12 without inventing historical authority', () =>
   withDatabase(path => {
     const before = createPopulatedV10(path);
     let store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 11);
+      assert.equal(store.userVersion(), 12);
       assert.deepEqual(tableCounts(store.db), before);
       const oldTurn = store.getTurn('turn_v2');
       assert.equal(oldTurn.resultAuthorityVersion, 0);
@@ -822,7 +1023,7 @@ test('populated PC v10 migrates once to v11 without inventing historical authori
       store.close();
 
       store = new YuqiStore(path);
-      assert.equal(store.userVersion(), 11);
+      assert.equal(store.userVersion(), 12);
       assert.deepEqual(tableCounts(store.db), before);
       assert.equal(store.listTurnAuthorityLineages().length, 0);
     } finally {
@@ -830,7 +1031,56 @@ test('populated PC v10 migrates once to v11 without inventing historical authori
     }
   }));
 
-test('migration CLI preserves a raw populated v10 source and produces a restart-stable v11 clone report', () =>
+test('clean v11 creates its v12 manifest table and remains restart-idempotent', () =>
+  withDatabase(path => {
+    createPopulatedV10(path);
+    const migrated = new YuqiStore(path);
+    migrated.close();
+    mutateRaw(path, database => {
+      database.exec(`
+        DROP TABLE visible_result_manifests;
+        PRAGMA user_version = 11;
+      `);
+    });
+    let store = new YuqiStore(path);
+    try {
+      assert.equal(store.userVersion(), 12);
+      assert.equal(
+        Number(store.db.prepare(
+          'SELECT COUNT(*) AS value FROM visible_result_manifests'
+        ).get().value),
+        0
+      );
+    } finally {
+      store.close();
+    }
+    store = new YuqiStore(path);
+    try {
+      assert.equal(store.userVersion(), 12);
+    } finally {
+      store.close();
+    }
+  }));
+
+test('v11 canonical authority without a manifest refuses v12 migration without mutation', () =>
+  withDatabase(path => {
+    seedCommittedV11(path);
+    mutateRaw(path, database => {
+      database.exec(`
+        DROP TABLE visible_result_manifests;
+        PRAGMA user_version = 11;
+      `);
+    });
+    const before = rawLogicalSnapshot(path);
+    assert.throws(
+      () => new YuqiStore(path),
+      /v12 migration cannot reconstruct canonical manifest/i
+    );
+    const after = rawLogicalSnapshot(path);
+    assert.deepEqual(after, before);
+  }));
+
+test('migration CLI preserves a raw populated v10 source and produces a restart-stable v12 clone report', () =>
   withDatabase(path => {
     createPopulatedV10(path);
     const directory = join(path, '..');
@@ -851,14 +1101,15 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     assert.equal(fileSha256(path), sourceHash);
     const report = JSON.parse(readFileSync(reportPath, 'utf8'));
     assert.equal(report.sourceUserVersion, 10);
-    assert.equal(report.workingUserVersion, 11);
+    assert.equal(report.workingUserVersion, 12);
     assert.equal(report.sourceDatabaseSha256, sourceHash);
     assert.equal(report.sourceDatabaseSha256After, sourceHash);
     assert.match(report.workingDatabaseSha256, /^[a-f0-9]{64}$/);
-    assert.equal(report.v11InvariantSummary.userVersion, 11);
-    assert.match(report.v11InvariantSummary.checksum, /^[a-f0-9]{64}$/);
+    assert.equal(report.v12InvariantSummary.userVersion, 12);
+    assert.match(report.v12InvariantSummary.checksum, /^[a-f0-9]{64}$/);
     assert.ok(Object.hasOwn(report.sourceTableCounts, 'turns'));
-    assert.ok(Object.hasOwn(report.v11InvariantSummary.tableCounts, 'visible_commit_receipts'));
+    assert.ok(Object.hasOwn(report.v12InvariantSummary.tableCounts, 'visible_commit_receipts'));
+    assert.ok(Object.hasOwn(report.v12InvariantSummary.tableCounts, 'visible_result_manifests'));
 
     const applyReportPath = join(directory, 'migration-apply-report.json');
     const applyCommand = spawnSync(process.execPath, [
@@ -874,21 +1125,21 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     assert.equal(applyCommand.status, 0, applyCommand.stderr || applyCommand.stdout);
     const applied = JSON.parse(readFileSync(applyReportPath, 'utf8'));
     assert.equal(applied.applied, true);
-    assert.equal(applied.workingUserVersion, 11);
+    assert.equal(applied.workingUserVersion, 12);
     assert.equal(
-      applied.v11InvariantSummary.checksum,
-      report.v11InvariantSummary.checksum
+      applied.v12InvariantSummary.checksum,
+      report.v12InvariantSummary.checksum
     );
 
     const first = new YuqiStore(clone);
     const logicalBefore = {
       counts: tableCounts(first.db),
-      summary: report.v11InvariantSummary
+      summary: report.v12InvariantSummary
     };
     first.close();
     const second = new YuqiStore(clone);
     assert.deepEqual(tableCounts(second.db), logicalBefore.counts);
-    assert.equal(second.userVersion(), 11);
+    assert.equal(second.userVersion(), 12);
     second.close();
   }));
 
@@ -1160,6 +1411,68 @@ test('canonical retry inherits the parent release pair after rollout changes', (
     }
   }));
 
+test('open retry fixes a fresh agency snapshot while inheriting model pins', () =>
+  withDatabase(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const originalEnvelope = v2Envelope('turn_fresh_agency_original', 1);
+      const original = store.createCanonicalVisibleTurnInternal(
+        canonicalCreateInput(store, originalEnvelope)
+      ).turn;
+      store.putCognitiveStateInternal({
+        roleId: 'yuqi',
+        schemaVersion: 1,
+        revision: 1,
+        lastTurnId: 'agency_update',
+        state: { mood: 'changed' },
+        updatedAt: 10_001
+      });
+      const fresh = store.readAgencyAuthoritySnapshotInternal({
+        roleId: 'yuqi',
+        at: originalEnvelope.message.sentAt
+      });
+      assert.notEqual(fresh.checksum, original.agencySnapshotChecksum);
+      const retryEnvelope = v2Envelope('turn_fresh_agency_retry', 2, {
+        messageId: originalEnvelope.message.messageId,
+        content: originalEnvelope.message.content,
+        sentAt: originalEnvelope.message.sentAt,
+        retry: {
+          retryOfTurnId: original.turnId,
+          canonicalMessageId: originalEnvelope.message.messageId
+        }
+      });
+      const lane = store.getInteractionLane('yuqi', 'private_chat');
+      const retryInput = {
+        ...canonicalCreateInput(store, retryEnvelope, {
+          expectedLaneRevision: lane.revision,
+          inputVisibilitySequence: original.inputVisibilitySequence,
+          agencySnapshotChecksum: fresh.checksum
+        }),
+        expectedRolloutRevision: original.rolloutRevision,
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode
+      };
+      const countBeforeForgery = canonicalAuthorityCounts(store).turns;
+      assert.throws(() => store.createCanonicalVisibleTurnInternal({
+        ...retryInput,
+        envelope: { ...retryEnvelope, turnId: 'turn_fresh_agency_forged' },
+        agencySnapshotChecksum: 'f'.repeat(64)
+      }), /agency snapshot authority conflict/i);
+      assert.equal(canonicalAuthorityCounts(store).turns, countBeforeForgery);
+      const retry = store.createCanonicalVisibleTurnInternal(retryInput).turn;
+      assert.equal(retry.agencySnapshotChecksum, fresh.checksum);
+      assert.equal(retry.authoritativeReleaseId, original.authoritativeReleaseId);
+      assert.equal(retry.authoritativePipelineChecksum, original.authoritativePipelineChecksum);
+      assert.equal(retry.rolloutRevision, original.rolloutRevision);
+      assert.equal(retry.inputUserBatchId, original.inputUserBatchId);
+      assert.equal(retry.inputVisibilitySequence, original.inputVisibilitySequence);
+    } finally {
+      store.close();
+    }
+  }));
+
 test('a retry of a legacy or missing parent cannot enter canonical creation', () =>
   withDatabase(path => {
     const store = new YuqiStore(path);
@@ -1196,9 +1509,9 @@ test('a retry of a legacy or missing parent cannot enter canonical creation', ()
     }
   }));
 
-test('user versions above v11 stop without rewriting', () => withDatabase(path => {
+test('user versions above v12 stop without rewriting', () => withDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 12;');
+  database.exec('PRAGMA user_version = 13;');
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*12/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*13/i);
 }));
