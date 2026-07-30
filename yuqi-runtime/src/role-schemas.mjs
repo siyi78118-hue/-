@@ -306,6 +306,105 @@ export const EXPRESSION_SCHEMA_V2 = objectSchema({
   rewriteResolution: { anyOf: [rewriteResolutionSchema, { type: 'null' }] }
 }, ['action', 'reply', 'usedFactIds', 'rewriteResolution']);
 
+export const STANCE_TRANSITION_SCHEMA_V3 = objectSchema({
+  stanceId: { type: 'string' },
+  operation: {
+    type: 'string',
+    enum: ['maintain', 'strengthen', 'soften', 'reverse', 'expire', 'create']
+  },
+  topic: nullable('string'),
+  position: nullable('string'),
+  reason: { type: 'string' },
+  strength: nullable('number'),
+  flexibility: nullable('number'),
+  evidenceMessageIds: stringArray(),
+  expiresAt: nullable('number'),
+  remainingRelevantUserBatches: nullable('integer')
+}, [
+  'stanceId',
+  'operation',
+  'topic',
+  'position',
+  'reason',
+  'strength',
+  'flexibility',
+  'evidenceMessageIds',
+  'expiresAt',
+  'remainingRelevantUserBatches'
+]);
+
+const rolePlanIntentSchemaV3 = objectSchema({
+  operationsJson: { type: 'string' }
+}, ['operationsJson']);
+
+export const ACTION_INTENT_SCHEMA_V3 = objectSchema({
+  payment: { anyOf: [cognitionPaymentActionSchema, { type: 'null' }] },
+  moment: { anyOf: [cognitionMomentIntentSchema, { type: 'null' }] },
+  rolePlan: { anyOf: [rolePlanIntentSchemaV3, { type: 'null' }] },
+  lifeAdjustment: { anyOf: [cognitionLifeAdjustmentSchema, { type: 'null' }] },
+  relationshipReview: relationshipStageReviewSchema
+}, ['payment', 'moment', 'rolePlan', 'lifeAdjustment', 'relationshipReview']);
+
+export const STATE_PATCH_SCHEMA_V3 = objectSchema({
+  mood: { type: 'string' },
+  currentStances: { type: 'array', items: STANCE_TRANSITION_SCHEMA_V3 },
+  openThreads: stringArray()
+}, ['mood', 'currentStances', 'openThreads']);
+
+export const COGNITION_SCHEMA_V3 = objectSchema({
+  interactionRead: objectSchema({
+    surfaceAct: { type: 'string' },
+    primarySocialMeaning: { type: 'string' },
+    alternativeMeaning: nullable('string'),
+    confidence: { type: 'number' },
+    evidenceMessageIds: stringArray()
+  }, [
+    'surfaceAct',
+    'primarySocialMeaning',
+    'alternativeMeaning',
+    'confidence',
+    'evidenceMessageIds'
+  ]),
+  selfResponse: objectSchema({
+    immediateFeeling: { type: 'string' },
+    desire: { type: 'string' },
+    resistance: { type: 'string' },
+    attention: { type: 'string' },
+    stanceTransitions: { type: 'array', items: STANCE_TRANSITION_SCHEMA_V3 }
+  }, ['immediateFeeling', 'desire', 'resistance', 'attention', 'stanceTransitions']),
+  interactionDecision: objectSchema({
+    intendedResponse: { type: 'string', enum: ['send', 'skip'] },
+    relationshipEffect: { type: 'string' },
+    shouldAcknowledgeBid: { type: 'boolean' },
+    intentionalNonResponseReason: nullable('string'),
+    mustConvey: stringArray(),
+    mustNotClaim: stringArray()
+  }, [
+    'intendedResponse',
+    'relationshipEffect',
+    'shouldAcknowledgeBid',
+    'intentionalNonResponseReason',
+    'mustConvey',
+    'mustNotClaim'
+  ]),
+  actionIntent: ACTION_INTENT_SCHEMA_V3,
+  statePatch: STATE_PATCH_SCHEMA_V3
+}, ['interactionRead', 'selfResponse', 'interactionDecision', 'actionIntent', 'statePatch']);
+
+export const EXPRESSION_SCHEMA_V3 = objectSchema({
+  action: { type: 'string', enum: ['send', 'skip'] },
+  reply: { type: 'string' },
+  usedFactIds: stringArray(),
+  bubblePlan: {
+    type: 'array',
+    items: objectSchema({
+      text: { type: 'string' },
+      purpose: { type: 'string' }
+    }, ['text', 'purpose'])
+  },
+  incompatibility: nullable('string')
+}, ['action', 'reply', 'usedFactIds', 'bubblePlan', 'incompatibility']);
+
 export const CONSOLIDATION_SCHEMA_V2 = objectSchema({
   schemaVersion: { type: 'integer', enum: [2] },
   query: { type: 'string' },

@@ -1,0 +1,256 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  compileCognitionPacketV3,
+  compileExpressionBriefV3,
+  materializeV3Draft,
+  normalizeCognitionV3Result,
+  normalizeExpressionV3Result
+} from '../src/cognition-v3-contract.mjs';
+import { contentHash } from '../src/protocol.mjs';
+
+function transition(overrides = {}) {
+  return {
+    stanceId: 's1',
+    operation: 'maintain',
+    topic: null,
+    position: null,
+    reason: 'the current bid supports it',
+    strength: null,
+    flexibility: null,
+    evidenceMessageIds: ['u1'],
+    expiresAt: null,
+    remainingRelevantUserBatches: null,
+    ...overrides
+  };
+}
+
+function validCognitionV3(overrides = {}) {
+  const stanceTransitions = [transition()];
+  return {
+    interactionRead: {
+      surfaceAct: 'playful statement',
+      primarySocialMeaning: 'playful reassurance bid',
+      alternativeMeaning: null,
+      confidence: 0.86,
+      evidenceMessageIds: ['u1']
+    },
+    selfResponse: {
+      immediateFeeling: 'amused',
+      desire: 'stay in the exchange',
+      resistance: '',
+      attention: 'the playful bid',
+      stanceTransitions
+    },
+    interactionDecision: {
+      intendedResponse: 'send',
+      relationshipEffect: 'meet the bid without overexplaining it',
+      shouldAcknowledgeBid: true,
+      intentionalNonResponseReason: null,
+      mustConvey: ['she caught the playful bid'],
+      mustNotClaim: ['a payment was accepted']
+    },
+    actionIntent: {
+      payment: null,
+      moment: null,
+      rolePlan: null,
+      lifeAdjustment: null,
+      relationshipReview: null
+    },
+    statePatch: {
+      mood: 'amused',
+      currentStances: stanceTransitions,
+      openThreads: ['playful_exchange']
+    },
+    ...overrides
+  };
+}
+
+function validationContext(overrides = {}) {
+  return {
+    validMessageIds: ['u1', 'a0'],
+    envelope: {
+      kind: 'DIRECT_REPLY',
+      createdAt: 1000,
+      currentInteraction: {
+        messages: [{ messageId: 'u1', speakerType: 'user', content: '废话废话' }]
+      },
+      featureContext: {}
+    },
+    relevantStances: [{ stanceId: 's1', topic: 'gift_play', status: 'active' }],
+    allowedActions: [],
+    allowedActionTargets: {},
+    ...overrides
+  };
+}
+
+function validExpressionV3(overrides = {}) {
+  return {
+    action: 'send',
+    reply: '行，这次算你多说了两个字。',
+    usedFactIds: [],
+    bubblePlan: [{
+      text: '行，这次算你多说了两个字。',
+      purpose: 'continue the playful exchange'
+    }],
+    incompatibility: null,
+    ...overrides
+  };
+}
+
+test('v3 requires an intentional decision about an identified social bid', () => {
+  const value = validCognitionV3();
+  delete value.interactionDecision.shouldAcknowledgeBid;
+  assert.throws(
+    () => normalizeCognitionV3Result(value, validationContext()),
+    /shouldAcknowledgeBid/
+  );
+});
+
+test('every evidence id and every relevant stance transition is validated', () => {
+  const unknown = validCognitionV3();
+  unknown.interactionRead.evidenceMessageIds = ['invented'];
+  assert.throws(
+    () => normalizeCognitionV3Result(unknown, validationContext()),
+    /unknown evidence messageId/
+  );
+
+  const missing = validCognitionV3();
+  missing.selfResponse.stanceTransitions = [];
+  missing.statePatch.currentStances = [];
+  assert.throws(
+    () => normalizeCognitionV3Result(missing, validationContext()),
+    /transition coverage/
+  );
+});
+
+test('DIRECT_REPLY cannot intentionally skip', () => {
+  const value = validCognitionV3();
+  value.interactionDecision.intendedResponse = 'skip';
+  value.interactionDecision.intentionalNonResponseReason = 'does not feel like answering';
+  assert.throws(
+    () => normalizeCognitionV3Result(value, validationContext()),
+    /DIRECT_REPLY/
+  );
+});
+
+test('structured actions require both an allowed action and the authoritative target', () => {
+  const value = validCognitionV3();
+  value.actionIntent.payment = {
+    action: 'received',
+    messageId: 'pay_wrong',
+    kind: 'redpacket',
+    amount: 20
+  };
+  assert.throws(
+    () => normalizeCognitionV3Result(value, validationContext()),
+    /payment.*not allowed/
+  );
+  assert.throws(
+    () => normalizeCognitionV3Result(value, validationContext({
+      allowedActions: ['payment'],
+      envelope: {
+        ...validationContext().envelope,
+        featureContext: {
+          payment: { messageId: 'pay_1', kind: 'redpacket', amount: 20 }
+        }
+      }
+    })),
+    /payment target/
+  );
+});
+
+test('state patch must carry the same stance decisions as self response', () => {
+  const value = validCognitionV3();
+  value.statePatch.currentStances = structuredClone(value.statePatch.currentStances);
+  value.statePatch.currentStances[0] = transition({ operation: 'reverse', position: 'accept' });
+  assert.throws(
+    () => normalizeCognitionV3Result(value, validationContext()),
+    /statePatch.*stance/
+  );
+});
+
+test('response risks and evaluator language cannot appear in the expression brief', () => {
+  const cognitionResult = validCognitionV3();
+  const brief = compileExpressionBriefV3({
+    envelope: {
+      ...validationContext().envelope,
+      relevantHistory: [{ groupId: 'g1', messages: [{ messageId: 'a0', content: '前文' }] }],
+      personaTone: ['自然', '有自己的判断'],
+      continuityDetails: ['detail 1', 'detail 2', 'detail 3']
+    },
+    agencyView: {
+      hardConstraints: [],
+      preferences: [{ topic: 'food', value: 'sweet', binding: false }],
+      currentStances: [{ stanceId: 's1', position: 'playful' }]
+    },
+    relationship: { formalFacts: [], toneTendencies: ['熟悉'] },
+    cognitionResult,
+    responseRisks: ['may look transactional'],
+    evaluatorTaxonomy: ['SOCIAL_BID_DROPPED']
+  });
+  const serialized = JSON.stringify(brief);
+  assert.equal(serialized.includes('may look transactional'), false);
+  assert.equal(serialized.includes('SOCIAL_BID_DROPPED'), false);
+  assert.equal(serialized.includes('confidence'), false);
+  assert.equal(brief.continuityDetails.length, 2);
+  assert.deepEqual(
+    brief.currentInteraction.messages.map(message => message.messageId),
+    ['u1']
+  );
+});
+
+test('expression cannot add payment, moment, plan, stage, stance, or factual actions', () => {
+  const input = validExpressionV3();
+  input.paymentAction = { action: 'accept' };
+  assert.throws(() => normalizeExpressionV3Result(input), /additional properties/);
+});
+
+test('expression bubble plan is bounded and must agree with its visible reply', () => {
+  assert.throws(() => normalizeExpressionV3Result(validExpressionV3({
+    bubblePlan: Array.from({ length: 6 }, (_, index) => ({
+      text: `bubble ${index}`,
+      purpose: 'overflow'
+    }))
+  })), /bubblePlan/);
+  assert.throws(() => normalizeExpressionV3Result(validExpressionV3({
+    bubblePlan: [{ text: 'different', purpose: 'contradiction' }]
+  })), /reply/);
+});
+
+test('cognition packet checksum covers exactly the v3 envelope and decision', () => {
+  const cognitionResult = normalizeCognitionV3Result(
+    validCognitionV3(),
+    validationContext()
+  );
+  const packet = compileCognitionPacketV3({
+    envelope: validationContext().envelope,
+    cognitionResult
+  });
+  assert.equal(packet.schemaVersion, 3);
+  assert.equal(packet.packetChecksum, contentHash({
+    schemaVersion: 3,
+    envelope: packet.envelope,
+    cognitionResult: packet.cognitionResult
+  }));
+});
+
+test('materialization preserves cognition authority and expression only controls wording', () => {
+  const cognitionResult = normalizeCognitionV3Result(
+    validCognitionV3(),
+    validationContext()
+  );
+  const packet = compileCognitionPacketV3({
+    envelope: validationContext().envelope,
+    cognitionResult
+  });
+  const draft = materializeV3Draft({
+    cognitionPacket: packet,
+    expressionResult: validExpressionV3()
+  });
+  assert.equal(draft.action, 'send');
+  assert.deepEqual(draft.actionIntent, cognitionResult.actionIntent);
+  assert.deepEqual(draft.statePatch, cognitionResult.statePatch);
+  assert.match(draft.draftChecksum, /^[a-f0-9]{64}$/);
+});
