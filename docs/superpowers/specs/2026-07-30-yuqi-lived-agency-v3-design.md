@@ -625,6 +625,21 @@ group ID 和气泡/action ID 由当前合法 authority owner 按双方共享的�
 
 action target registry 是封闭集合：`conversation:<roleId>:<peerId>`、`message:<messageId>`、`payment:<messageId>`、`moment:<momentId>`、`comment:<commentId>`、`role_plan:<planId>`、`role_occurrence:<occurrenceId>`、`life_episode:<episodeId>`、`relationship:<roleId>` 和 `lineage_create:<lineageKey>:<actionKind>`。PC-owned 对象从当前数据库 row 读取 revision/checksum；Android-owned 对象只能从 turn 中持久化的 validated input snapshot 读取，并以 `sha256:<canonical target hash>` 固定提交时的期望，手机 action consumer 再对 Room 当前 row 做最终 CAS。trusted orchestrator 从已验证 cognition action 构造 target descriptor，模型不能直接指定任意 key/revision。
 
+target resolver 不得把两个不同对象拼成一条“看似有 revision”的 authority。它先从
+store row 或持久化 envelope 中解析唯一权威对象及其 ID，再要求 action payload 中的
+ID（若存在）与该 ID 完全相同，最后才从同一个对象计算 target key 与 revision。禁止
+`payload.id || snapshot.id` 这种独立选择 ID、却对另一条 snapshot 计算 checksum 的
+写法。`conversation`、`message` 和 `role_occurrence` 即使暂时没有模型可直接产生的
+action kind，也必须由同一个 store-owned target-ref resolver 覆盖；action-kind registry
+只能调用这些 target ref，不能另写一套较弱的查找逻辑。
+
+canonical generation fingerprint 的 action 部分使用已经过 resolver 的稳定描述符：
+`kind + targetKey + targetRevision + contentHash(semanticPayload)`。不得继续读取旧草稿
+结构的顶层 `messageId/momentId/...`，否则两个 target/payload 不同的新 action 会得到
+相同 fingerprint。可见 item 也必须重新校验输出身份：PC 可见回复只能是
+`speakerId=turn.characterId`、`speakerType=character`、`recipientId=user`，
+且正文非空；caller identity 字段不能借“之后会覆盖 ID”绕过这些角色约束。
+
 通过后依次写入 canonical group/items/actions、聊天消息投影、认知状态/stance revisions、证据记忆任务、可选 compare job、group-based outbox、lane CAS、lineage CAS、turn CAS 和 commit receipt。任一步失败全部回滚。
 
 #### 13.3.4 状态与任务的 authority key
@@ -657,6 +672,28 @@ fallback 只在以下情况取得本地提交权：
 #### 13.3.6 group-based outbox
 
 旧 v1/v2 delivery 继续保留 `turnId + peerId` 兼容路径，但每个 legacy helper 必须以 `authorityGroupId IS NULL` 为前置条件并拒绝 canonical row。所有 `resultAuthorityVersion=1` 的新结果只按 `authorityGroupId + peerId` 读取、租约、重试、确认和恢复；`turnId` 只是指向获胜 turn 的诊断字段。投递幂等键为 `groupId + peerId + commitChecksum`。由 group/item/action join 生成桥接 payload 时，必须最后覆盖确定性 `messageId/actionId/ordinal/target`，禁止 item/action JSON 中的同名字段反向覆盖权威 identity。因此 original/retry 即使有不同 turn ID，也不可能分别投递。
+
+“每个 legacy helper”包括列表入口与间接入口，而不只包括最终 `UPDATE`：
+`listPendingCloudDeliveries()` 只返回 `authorityGroupId IS NULL`，canonical pump 使用独立
+的 group 列表；`recordDeliveryReceipt()`、route/stage/checkpoint、failed recovery、
+requeue、prepare/mark/confirm 都必须在任何写入前拒绝 version-1 turn/group。canonical
+route 与 stage 需要显式 `expectedTurnRevision` CAS；输出 character message 只能由
+canonical visible-result transaction 写入，不能经 `putMessageInternal()` 旁路生成。
+
+committed retry 的恢复顺序同样属于 exactly-once 语义。系统先验证 normalized
+envelope、完整 current batch、parent、derived lineage 和存储的 immutable pins；一旦
+确认 lineage 已 committed，立即返回原 receipt。它不能先要求当前 lane revision、
+rollout revision 或 agency heads 仍等于原生成时的值，因为这些 mutable authority
+在成功 commit 后按设计已经推进。
+
+v11 reopen invariant 是运行时恢复闸门，不只是表存在性检查。它拒绝
+`resultAuthorityVersion NOT IN (0,1)`，并验证 canonical envelope/checksum、input batch、
+release pin、lineage/retry chain、latest owner、committed turn/lineage 的实际 revision
+等于 receipt after-revision、group/item/action/message 的双向且确定性 identity join，
+以及 stance/job/cognitive-state/delivery 的 group authority 不悬空。数据库中保留一条
+unknown authority version、缺 item projection、错误 deterministic ID 或 committed
+turn revision 与 receipt 脱节，都必须在 worker 恢复前隔离，不能被 Task 11 的
+“非 0 即 canonical”分支接管。
 
 ### 13.4 可见游标
 

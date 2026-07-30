@@ -2620,6 +2620,396 @@ git add yuqi-runtime/src/agency-state.mjs yuqi-runtime/src/interaction-lanes.mjs
 git commit -m "fix: enforce semantic visible result authority"
 ```
 
+### Task 10D: Close Independent-Review Authority Bypasses
+
+**Why this repair gate exists:** Commits `0f76069`, `b7d3e25`, and `21efad9`
+pass the declared 183-test Task 10 suite, but independent counterexamples still
+prove five authority violations:
+
+1. a stored `result_authority_version=2` survives reopen, even though Task 11
+   branches `0 = legacy`, `1 = canonical`;
+2. `setTurnRoute()` mutates a version-1 turn without a revision CAS;
+3. a committed retry checks the now-advanced lane before returning its receipt
+   and fails with `interaction lane revision conflict`;
+4. the payment/moment/comment/role-plan snapshot resolver accepts an ID from one
+   object and computes the revision from a different persisted object;
+5. two actions with different `targetKey`, `targetRevision`, and nested payload
+   currently produce the same generation fingerprint.
+
+The 183 passing tests remain regression evidence, but do not authorize Task 11.
+Task 11 is forbidden until this task is independently reviewed and committed.
+
+**Files:**
+- Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/src/interaction-lanes.mjs`
+- Modify: `yuqi-runtime/src/visible-result-commit.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
+- Modify: `yuqi-runtime/test/canonical-turn-state.test.mjs`
+- Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
+- Modify: `yuqi-runtime/test/result-outbox.test.mjs`
+- Modify: `yuqi-runtime/test/interaction-lanes.test.mjs`
+
+**Interfaces:**
+- Consumes: schema v11, `createCanonicalVisibleTurnInternal()`, canonical turn
+  CAS APIs, `commitVisibleResult()`, and group-keyed deliveries from Tasks
+  10–10C.
+- Produces:
+
+```text
+setCanonicalTurnRouteInternal({
+  turnId, expectedState, expectedTurnRevision, route, reasons
+}) -> turn
+beginCanonicalStageInternal({
+  turnId, expectedState, expectedTurnRevision, stage, model, effort, startedAt
+}) -> { turn, stage }
+finishCanonicalStageInternal({
+  turnId, expectedState, expectedTurnRevision, stage, finishedAt
+}) -> { turn, stage }
+resolveCanonicalTargetRefInternal({
+  turn, namespace, targetId
+}) -> { targetKey, targetRevision, authoritySource, canonicalTarget }
+listPendingAuthorityCloudDeliveries(limit) -> CloudDelivery[]
+```
+
+- Preserves: version-0 route/stage/delivery behavior and the wire protocol-v2
+  boundary. This task does not begin runtime integration or accept protocol v3.
+
+- [ ] **Step 1: Add red reopen and committed-retry ordering tests**
+
+Add a corruption matrix to
+`yuqi-runtime/test/store-visible-authority-v11.test.mjs`:
+
+```js
+test('v11 reopen rejects every authority version outside zero and one', () =>
+  corruptReopen(database => {
+    database.prepare(`
+      UPDATE turns SET result_authority_version = 2
+      WHERE turn_id = 'turn_legacy'
+    `).run();
+  }, /v11 invariant authority_version_domain/i));
+
+test('v11 reopen joins committed revisions and every group projection', () => {
+  for (const corruption of [
+    db => db.prepare(`
+      UPDATE turns SET turn_revision = turn_revision + 1
+      WHERE turn_id = 'turn_committed'
+    `).run(),
+    db => db.prepare(`
+      UPDATE turn_authority_lineages SET revision = revision + 1
+      WHERE state = 'committed'
+    `).run(),
+    db => db.prepare('DELETE FROM visible_result_items').run(),
+    db => db.prepare(`
+      UPDATE messages SET authority_group_id = NULL
+      WHERE authority_group_id IS NOT NULL
+    `).run(),
+    db => db.prepare(`
+      UPDATE visible_result_actions SET action_id = 'action_forged'
+    `).run(),
+    db => db.prepare(`
+      UPDATE consolidation_jobs SET authority_group_id = 'group_missing'
+      WHERE authority_group_id IS NOT NULL
+    `).run()
+  ]) assertCorruptionRejected(corruption);
+});
+```
+
+The restart invariant must cover both directions:
+
+- authority version is exactly 0 or 1;
+- canonical `envelope_json` hashes to `envelope_checksum`;
+- stored input batch identity joins the persisted current batch;
+- release IDs/checksums join `pipeline_releases`;
+- every retry parent exists in the same lineage and the latest open/committed
+  turn's creation revision agrees with lineage/receipt authority;
+- committed turn revision equals `receipt.turnRevisionAfter`;
+- committed lineage revision equals `receipt.lineageRevisionAfter`;
+- every group has at least one contiguous item, and each item has exactly one
+  deterministic message projection with the same group/ordinal/turn and valid
+  Yuqi speaker identity;
+- every stored item/action ID equals the shared deterministic derivation;
+- no message, stance, consolidation/comparison job, cognitive-state
+  `last_authority_group_id`, or canonical delivery points at a missing group.
+
+Add the exact committed-retry counterexample:
+
+```js
+test('committed retry returns its receipt before mutable lane checks', () => {
+  const { store, original, originalEnvelope, receipt } = committedOriginal();
+  assert.equal(store.getInteractionLane('yuqi', 'private_chat').revision, 2);
+  const retry = canonicalRetryInput(original, originalEnvelope, {
+    expectedLaneRevision: 1 // the creation-time value is now stale by design
+  });
+  assert.deepEqual(
+    store.createCanonicalVisibleTurnInternal(retry),
+    { status: 'already_committed', receipt }
+  );
+  assert.equal(store.getTurn(retry.envelope.turnId), null);
+});
+```
+
+Also make exact same-`turnId` replay validate the stored immutable identity:
+envelope checksum, derived lineage, rollout/lane/batch/visibility, release pair,
+agency checksum, and annotation snapshot. It may ignore only mutable current
+lane/rollout/agency state. A mismatch returns an authority conflict and never
+returns a receipt.
+
+- [ ] **Step 2: Run the new reopen/retry tests red**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/store-visible-authority-v11.test.mjs
+```
+
+Expected: FAIL on the unknown authority version, actual receipt revision joins,
+child projection joins, and stale-lane committed retry.
+
+- [ ] **Step 3: Add red mutation-closure and outbox-list tests**
+
+Extend `canonical-turn-state.test.mjs`:
+
+```js
+test('all legacy turn execution writers reject a canonical turn', () => {
+  const turn = canonicalOpenTurn();
+  for (const write of [
+    () => store.setTurnRoute(turn.turnId, 'fast', ['test']),
+    () => store.beginStage(turn.turnId, 'memory'),
+    () => store.finishStage(turn.turnId, 'memory'),
+    () => store.putMessageInternal(canonicalCharacterMessage(turn.turnId))
+  ]) {
+    assert.throws(write, /canonical .* API required/i);
+    assert.equal(store.getTurn(turn.turnId).turnRevision, turn.turnRevision);
+  }
+});
+
+test('canonical route and stage writers CAS the turn revision', () => {
+  const routed = store.setCanonicalTurnRouteInternal({
+    turnId, expectedState: 'queued', expectedTurnRevision: 1,
+    route: 'fast', reasons: ['direct_reply']
+  });
+  assert.equal(routed.turnRevision, 2);
+  assert.throws(() => store.beginCanonicalStageInternal({
+    turnId, expectedState: 'queued', expectedTurnRevision: 1,
+    stage: 'memory', model: 'codex', effort: 'medium', startedAt: 10
+  }), /authority conflict/i);
+});
+```
+
+Extend `result-outbox.test.mjs`:
+
+```js
+test('legacy pending and receipt entrypoints cannot see or mutate canonical delivery', () => {
+  const canonical = committedCanonicalDelivery();
+  assert.equal(
+    store.listPendingCloudDeliveries().some(x => x.authorityGroupId !== null),
+    false
+  );
+  assert.equal(
+    store.listPendingAuthorityCloudDeliveries().map(x => x.authorityGroupId),
+    [canonical.authorityGroupId]
+  );
+  assert.throws(
+    () => store.recordDeliveryReceipt(legacyReceiptFor(canonical.turnId)),
+    /canonical delivery API required/i
+  );
+});
+```
+
+`listPendingCloudDeliveries()` remains the legacy compatibility method and adds
+`authority_group_id IS NULL`. The new canonical list requires a valid
+group/receipt/checksum join. No caller may decide which API to use merely from a
+turn ID supplied over the wire.
+
+- [ ] **Step 4: Implement the mutation boundary**
+
+In `store.mjs`:
+
+- add `authority_version_domain` and the full reopen joins from Step 1;
+- move retry parent/full-batch/lineage validation before lane/rollout/agency
+  reads, returning the receipt immediately for a committed lineage;
+- validate exact-turn immutable replay before returning `created` or
+  `already_committed`;
+- make `setTurnRoute()`, `beginStage()`, `finishStage()`, and character-output
+  `putMessageInternal()` reject version-1 turns before mutation;
+- add the three canonical route/stage methods. Each performs one
+  `BEGIN IMMEDIATE` transaction, checks `result_authority_version=1`,
+  `expectedState`, and `expectedTurnRevision`, applies its row/stage write,
+  increments `turn_revision` exactly once, and appends sync only after the CAS;
+- keep canonical input user-message persistence private to canonical creation
+  and verify it equals the normalized envelope input;
+- make `recordDeliveryReceipt()` reject a version-1 turn before inserting
+  receipt items or promoting facts;
+- split pending-delivery enumeration as specified above.
+
+Do not “fix” stale committed retry by accepting arbitrary root IDs. The method
+still validates the normalized complete batch, retry parent, derived lineage,
+and immutable stored pins before receipt return.
+
+- [ ] **Step 5: Add red target-identity, speaker-identity, and fingerprint tests**
+
+Add to `visible-result-commit.test.mjs`:
+
+```js
+test('input snapshot target id and revision must come from the same object', () => {
+  const turn = paymentTurn({ messageId: 'pay_real' });
+  assert.throws(() => store.resolveCanonicalActionTargetInternal({
+    turn,
+    action: {
+      kind: 'payment_accept',
+      payload: { messageId: 'pay_forged' }
+    }
+  }), /target identity conflict/i);
+});
+
+for (const fixture of [
+  forgedMomentId(), forgedCommentId(), forgedRolePlanId(),
+  forgedRoleOccurrenceId(), foreignRolePlanRow()
+]) {
+  test(fixture.name, () => assert.throws(
+    () => store.resolveCanonicalActionTargetInternal(fixture.input),
+    /target identity|target not found|role authority/i
+  ));
+}
+
+test('canonical visible items cannot spoof speaker or recipient identity', () => {
+  for (const mutation of [
+    item => { item.speakerId = 'user'; },
+    item => { item.speakerType = 'user'; },
+    item => { item.recipientId = 'other_peer'; },
+    item => { item.content = '   '; }
+  ]) assertVisibleCommitRollsBack(mutation);
+});
+```
+
+Add to `interaction-lanes.test.mjs`:
+
+```js
+test('fingerprint changes with resolved action target and semantic payload', () => {
+  const first = resolvedAction({
+    targetKey: 'payment:pay_1',
+    targetRevision: `sha256:${'a'.repeat(64)}`,
+    payload: { messageId: 'pay_1', decision: 'accept' }
+  });
+  assert.notEqual(
+    generationFingerprint(fpInput({ actionSet: [first] })),
+    generationFingerprint(fpInput({ actionSet: [{
+      ...first,
+      targetKey: 'payment:pay_2',
+      payload: { messageId: 'pay_2', decision: 'accept' }
+    }] }))
+  );
+  assert.notEqual(
+    generationFingerprint(fpInput({ actionSet: [first] })),
+    generationFingerprint(fpInput({ actionSet: [{
+      ...first,
+      payload: { messageId: 'pay_1', decision: 'decline' }
+    }] }))
+  );
+});
+```
+
+Update preference authority tests so every valid `stable_preference` evidence
+ID resolves to a real, unsuppressed message. Add separate missing-evidence,
+suppressed-evidence, unverified, wrong-type, and missing-fact cases; all must
+fail snapshot creation. Existing fixtures that use nonexistent `u1/u2` as
+“valid evidence” are incorrect under the design and must not be retained.
+
+- [ ] **Step 6: Implement one target resolver and resolved-action fingerprint**
+
+Add `resolveCanonicalTargetRefInternal()` as the only namespace resolver:
+
+```js
+resolveCanonicalTargetRefInternal({ turn, namespace, targetId }) {
+  const canonicalTarget = findExactPersistedTarget({
+    db: this.db,
+    envelope: parseJson(turn.envelopeJson, {}),
+    roleId: turn.characterId,
+    namespace,
+    targetId
+  });
+  if (!canonicalTarget || canonicalTarget.id !== String(targetId)) {
+    throw new Error('canonical action target identity conflict');
+  }
+  return {
+    targetKey: `${namespace}:${canonicalTarget.id}`,
+    targetRevision: canonicalTarget.pcOwned
+      ? canonicalTarget.revisionOrChecksum
+      : `sha256:${contentHash(canonicalTarget.snapshot)}`,
+    authoritySource: canonicalTarget.pcOwned ? 'pc_store' : 'input_snapshot',
+    canonicalTarget: canonicalTarget.snapshot
+  };
+}
+```
+
+The concrete implementation must:
+
+- derive payment/message/moment/comment IDs from the persisted validated
+  envelope first, then compare the action ID;
+- hash the exact matched snapshot, not the whole context and not an adjacent
+  object;
+- verify PC role-plan/occurrence/life rows belong to `turn.characterId`;
+- derive conversation from `turn.characterId + turn.deviceId` and the current
+  lane revision;
+- derive lineage-create only from `turn.authorityLineageKey + action.kind`;
+- default-deny unknown namespaces and action kinds.
+
+`resolveCanonicalActionTargetInternal()` maps the already enumerated action
+kinds to this resolver. It does not invent a model-facing kind for
+`conversation`, `message`, or `role_occurrence`; those namespaces are tested
+through the target-ref interface and become reachable only when a trusted
+materializer maps a validated domain operation in Task 11.
+
+Change fingerprint action canonicalization to:
+
+```js
+function canonicalActionTargets(actionSet) {
+  return actionSet.map(action => ({
+    kind: String(action.kind),
+    targetKey: String(action.targetKey),
+    targetRevision: String(action.targetRevision),
+    semanticPayloadChecksum: contentHash(action.payload || {})
+  }));
+}
+```
+
+Sort by canonical JSON. On a new commit, resolve actions and validate visible
+speaker/recipient identity before comparing the caller fingerprint. Existing
+receipt replay continues to normalize and checksum the submitted semantic
+descriptor without reading mutable state.
+
+- [ ] **Step 7: Run the complete repair gate**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/agency-state.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/canonical-turn-state.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs tests/yuqi-agency-state-migration.test.mjs
+```
+
+Expected: all prior 183 tests plus the new Task 10D tests PASS.
+
+Then rerun these manual counterexamples and record their exact output in the
+handoff:
+
+1. unknown authority version reopen is rejected;
+2. `setTurnRoute()` rejects a canonical turn with no revision change;
+3. committed retry with stale creation-time lane revision returns the original
+   receipt and creates no retry turn;
+4. `payment.messageId=pay_forged` against snapshot `pay_real` is rejected;
+5. two resolved actions with different target/payload produce different
+   fingerprints.
+
+- [ ] **Step 8: Commit and stop for independent review**
+
+```powershell
+git add docs/superpowers/specs/2026-07-30-yuqi-lived-agency-v3-design.md docs/superpowers/plans/2026-07-30-yuqi-lived-agency-v3.md yuqi-runtime/src/store.mjs yuqi-runtime/src/interaction-lanes.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/canonical-turn-state.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs
+git commit -m "fix: close canonical authority review bypasses"
+```
+
+After the commit, stop. Report the commit, exact test total, five manual
+counterexample outputs, and any deviation from these interfaces. Do not start
+Task 11 until the plan owner explicitly reviews and releases this gate.
+
 ### Task 11: Integrate v3, Lanes, Shadow, and Recovery in the Runtime
 
 **Files:**
