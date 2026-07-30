@@ -20,6 +20,7 @@ import {
   EXPRESSION_SCHEMA_V3
 } from './role-schemas.mjs';
 import { resolveRelationshipStage } from './relationship-stage.mjs';
+import { repairPlanForFinding, superviseLivedTurn } from './lived-quality-supervisor.mjs';
 
 const COGNITION_FAST_ROUTE_SCHEMA_V3 = Object.freeze({
   type: 'object',
@@ -143,6 +144,80 @@ function rolePayload({ turn, system, task, content }) {
   };
 }
 
+function sameJson(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function v3ValidationContext(cognitionEnvelope, input) {
+  return {
+    validMessageIds: v3MessageIds(cognitionEnvelope),
+    envelope: {
+      ...cognitionEnvelope,
+      kind: cognitionEnvelope.turnKind
+    },
+    relevantStances: cognitionEnvelope.currentStances || [],
+    allowedActions: cognitionEnvelope.allowedActions || [],
+    allowedActionTargets: v3AllowedTargets(cognitionEnvelope),
+    scene: input.scene || {}
+  };
+}
+
+async function runV3Expression(input, cognitionEnvelope, cognitionPacket, repairPlans = []) {
+  const agencyView = {
+    hardConstraints: cognitionEnvelope.hardConstraints || [],
+    preferences: cognitionEnvelope.preferences || [],
+    currentStances: cognitionEnvelope.currentStances || []
+  };
+  const expressionBrief = compileExpressionBriefV3({
+    envelope: cognitionEnvelope,
+    agencyView,
+    relationship: cognitionEnvelope.relationshipBasePhase || {},
+    cognitionResult: cognitionPacket.cognitionResult
+  });
+  const expressionRaw = objectResult(await input.client.runRole(
+    'expression_v3',
+    rolePayload({
+      turn: input.turn,
+      system: input.presetBundles?.expression || '',
+      task: repairPlans.length
+        ? 'rewrite_expression_for_lived_quality_v3'
+        : 'express_authorized_decision_v3',
+      content: {
+        expressionBrief,
+        ...(repairPlans.length ? { repairPlans } : {})
+      }
+    }),
+    {
+      deadlineMs: 60_000,
+      outerDeadlineMs: Math.max(1, Number(input.outerDeadlineMs) || 300_000),
+      outputSchema: EXPRESSION_SCHEMA_V3,
+      model: 'gpt-5.6-sol',
+      effort: 'medium'
+    }
+  ), 'expression_v3');
+  const expressionResult = normalizeExpressionV3Result(expressionRaw);
+  return {
+    expressionResult,
+    draft: materializeV3Draft({ cognitionPacket, expressionResult })
+  };
+}
+
+async function reviewV3Draft(input, cognitionPacket, draft, final = false) {
+  const custom = final ? input.finalSupervise || input.supervise : input.supervise;
+  const reviewInput = {
+    highRisk: Boolean(input.highRisk),
+    cognitionPacket,
+    draft,
+    currentInteraction: cognitionPacket.envelope.currentInteraction,
+    continuity: input.continuity || null,
+    applicableChecks: input.applicableChecks || [],
+    reviewer: input.reviewer,
+    turnSuperseded: input.turnSuperseded,
+    actionAuthorized: input.actionAuthorized
+  };
+  return custom ? custom(reviewInput) : superviseLivedTurn(reviewInput);
+}
+
 export async function runCognitionV3Turn(input) {
   const startedAt = input.now?.() ?? Date.now();
   const outerDeadlineMs = Math.max(1, Number(input.outerDeadlineMs) || 300_000);
@@ -199,17 +274,10 @@ export async function runCognitionV3Turn(input) {
       ), 'cognition_deep');
       cognitionCandidate = deepResponse.cognitionResult || deepResponse;
     }
-    const cognitionResult = normalizeCognitionV3Result(cognitionCandidate, {
-      validMessageIds: v3MessageIds(cognitionEnvelope),
-      envelope: {
-        ...cognitionEnvelope,
-        kind: cognitionEnvelope.turnKind
-      },
-      relevantStances: cognitionEnvelope.currentStances || [],
-      allowedActions: cognitionEnvelope.allowedActions || [],
-      allowedActionTargets: v3AllowedTargets(cognitionEnvelope),
-      scene: input.scene || {}
-    });
+    const cognitionResult = normalizeCognitionV3Result(
+      cognitionCandidate,
+      v3ValidationContext(cognitionEnvelope, input)
+    );
     cognitionPacket = compileCognitionPacketV3({
       envelope: cognitionEnvelope,
       cognitionResult
@@ -217,36 +285,96 @@ export async function runCognitionV3Turn(input) {
     persistV3Checkpoint(input.store, input.turn, cognitionPacket);
   }
 
-  const agencyView = {
-    hardConstraints: cognitionEnvelope.hardConstraints || [],
-    preferences: cognitionEnvelope.preferences || [],
-    currentStances: cognitionEnvelope.currentStances || []
+  let { expressionResult, draft } = await runV3Expression(
+    input,
+    cognitionEnvelope,
+    cognitionPacket
+  );
+  const attempts = {
+    cognitionReconsideration: 0,
+    expressionRewrite: 0,
+    finalReview: 0
   };
-  const expressionBrief = compileExpressionBriefV3({
-    envelope: cognitionEnvelope,
-    agencyView,
-    relationship: cognitionEnvelope.relationshipBasePhase || {},
-    cognitionResult: cognitionPacket.cognitionResult
-  });
-  const expressionRaw = objectResult(await input.client.runRole(
-    'expression_v3',
-    rolePayload({
-      turn: input.turn,
-      system: input.presetBundles?.expression || '',
-      task: 'express_authorized_decision_v3',
-      content: { expressionBrief }
-    }),
-    {
-      deadlineMs: 60_000,
-      outerDeadlineMs,
-      outputSchema: EXPRESSION_SCHEMA_V3,
-      model: 'gpt-5.6-sol',
-      effort: 'medium'
+  let supervision = await reviewV3Draft(input, cognitionPacket, draft);
+  if (!supervision.approved) {
+    const actionFindings = supervision.findings.filter((item) => item.owner === 'action');
+    if (actionFindings.length) {
+      return {
+        cognitionPacket,
+        expressionResult,
+        draft,
+        supervision,
+        attempts,
+        state: 'supervision_failed',
+        timings: { startedAt, visibleCompletedAt: input.now?.() ?? Date.now() },
+        shadowState: 'none'
+      };
     }
-  ), 'expression_v3');
-  const expressionResult = normalizeExpressionV3Result(expressionRaw);
-  const draft = materializeV3Draft({ cognitionPacket, expressionResult });
+    const cognitionFindings = supervision.findings.filter((item) => item.owner === 'cognition');
+    const expressionFindings = supervision.findings.filter((item) => item.owner === 'expression');
+    if (cognitionFindings.length) {
+      attempts.cognitionReconsideration = 1;
+      const reconsideredRaw = objectResult(await input.client.runRole(
+        'cognition_deep',
+        rolePayload({
+          turn: input.turn,
+          system: input.presetBundles?.cognition || '',
+          task: 'reconsider_lived_quality_v3',
+          content: {
+            cognitionEnvelope,
+            cognitionPacket,
+            repairPlans: cognitionFindings.map(repairPlanForFinding)
+          }
+        }),
+        {
+          deadlineMs: 120_000,
+          outerDeadlineMs,
+          outputSchema: COGNITION_SCHEMA_V3,
+          model: 'gpt-5.6-sol',
+          effort: 'medium'
+        }
+      ), 'cognition_deep');
+      const reconsidered = normalizeCognitionV3Result(
+        reconsideredRaw.cognitionResult || reconsideredRaw,
+        v3ValidationContext(cognitionEnvelope, input)
+      );
+      if (!sameJson(reconsidered.actionIntent, cognitionPacket.cognitionResult.actionIntent)) {
+        throw new Error('cognition reconsideration changed an authorized action');
+      }
+      cognitionPacket = compileCognitionPacketV3({
+        envelope: cognitionEnvelope,
+        cognitionResult: reconsidered
+      });
+      if (typeof input.store?.saveCognitionCheckpointInternal === 'function') {
+        input.store.saveCognitionCheckpointInternal(input.turn.turnId, cognitionPacket);
+      }
+    }
+    if (cognitionFindings.length || expressionFindings.length) {
+      attempts.expressionRewrite = 1;
+      ({ expressionResult, draft } = await runV3Expression(
+        input,
+        cognitionEnvelope,
+        cognitionPacket,
+        [...cognitionFindings, ...expressionFindings].map(repairPlanForFinding)
+      ));
+    }
+    attempts.finalReview = 1;
+    supervision = await reviewV3Draft(input, cognitionPacket, draft, true);
+  }
   const visibleCompletedAt = input.now?.() ?? Date.now();
+  const state = supervision.approved ? 'completed' : 'supervision_failed';
+  if (state === 'supervision_failed') {
+    return {
+      cognitionPacket,
+      expressionResult,
+      draft,
+      supervision,
+      attempts,
+      state,
+      timings: { startedAt, visibleCompletedAt },
+      shadowState: 'none'
+    };
+  }
   if (typeof input.queueShadow === 'function') {
     Promise.resolve(input.queueShadow({
       turn: input.turn,
@@ -259,6 +387,9 @@ export async function runCognitionV3Turn(input) {
     cognitionPacket,
     expressionResult,
     draft,
+    supervision,
+    attempts,
+    state,
     checkpoints: {
       cognition: cognitionPacket.packetChecksum,
       expression: draft.draftChecksum

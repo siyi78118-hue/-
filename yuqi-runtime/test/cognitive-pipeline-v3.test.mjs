@@ -223,3 +223,105 @@ test('a five-minute outer deadline leaves a recoverable checkpoint', async () =>
   );
   assert.equal(timeout, 300_000);
 });
+
+test('cognition and expression each repair at most once before one final review', async () => {
+  const repairedCognition = cognitionResult({
+    interactionRead: {
+      ...cognitionResult().interactionRead,
+      primarySocialMeaning: 'reconsidered social bid'
+    }
+  });
+  const client = new FakeClient(
+    cognitionResult(),
+    expressionResult(),
+    repairedCognition,
+    expressionResult()
+  );
+  let reviews = 0;
+  const result = await runCognitionV3Turn(input({
+    client,
+    highRisk: true,
+    async supervise() {
+      reviews += 1;
+      return {
+        approved: false,
+        findings: [
+          {
+            code: 'SOCIAL_BID_DROPPED',
+            owner: 'cognition',
+            evidenceMessageIds: ['u1'],
+            violatedRequirement: 'bid not carried into the decision',
+            mustPreserve: ['authorized action targets'],
+            mustChange: ['the participation decision'],
+            acceptanceCriteria: ['decision knowingly answers the bid']
+          },
+          {
+            code: 'DIALOGUE_META_NARRATION',
+            owner: 'expression',
+            evidenceMessageIds: ['u1'],
+            violatedRequirement: 'reply narrates the interaction',
+            mustPreserve: ['reconsidered decision'],
+            mustChange: ['visible wording'],
+            acceptanceCriteria: ['reply participates without analysis']
+          }
+        ]
+      };
+    },
+    async finalSupervise() {
+      reviews += 1;
+      return {
+        approved: false,
+        findings: [{
+          code: 'CHARACTER_STATE_BREAK',
+          owner: 'expression',
+          evidenceMessageIds: ['u1'],
+          violatedRequirement: 'still inconsistent',
+          mustPreserve: ['authorized actions'],
+          mustChange: ['state continuity'],
+          acceptanceCriteria: ['continuity restored']
+        }]
+      };
+    }
+  }));
+
+  assert.deepEqual(result.attempts, {
+    cognitionReconsideration: 1,
+    expressionRewrite: 1,
+    finalReview: 1
+  });
+  assert.equal(result.state, 'supervision_failed');
+  assert.equal(reviews, 2);
+  assert.deepEqual(client.calls.map((call) => call.role), [
+    'cognition_fast',
+    'expression_v3',
+    'cognition_deep',
+    'expression_v3'
+  ]);
+});
+
+test('action-owned supervision failure never asks a model to repair authority', async () => {
+  const client = new FakeClient(cognitionResult(), expressionResult());
+  const result = await runCognitionV3Turn(input({
+    client,
+    highRisk: true,
+    async supervise() {
+      return {
+        approved: false,
+        findings: [{
+          code: 'CHARACTER_STATE_BREAK',
+          owner: 'action',
+          evidenceMessageIds: ['u1'],
+          violatedRequirement: 'target changed',
+          mustPreserve: ['visible intent'],
+          mustChange: ['action target'],
+          acceptanceCriteria: ['authoritative target restored']
+        }]
+      };
+    }
+  }));
+
+  assert.equal(result.state, 'supervision_failed');
+  assert.equal(result.attempts.cognitionReconsideration, 0);
+  assert.equal(result.attempts.expressionRewrite, 0);
+  assert.equal(client.calls.length, 2);
+});

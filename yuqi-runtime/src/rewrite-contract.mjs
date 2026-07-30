@@ -45,6 +45,11 @@ function normalizeIssue(issue, { previous, occurrence }) {
     issueId: String(issue?.issueId || prior?.issueId || `${code}:${occurrence}`),
     code,
     severity,
+    owner: ['cognition', 'expression', 'action'].includes(issue?.owner)
+      ? issue.owner
+      : 'expression',
+    evidenceMessageIds: strings(issue?.evidenceMessageIds),
+    violatedRequirement: String(issue?.violatedRequirement || message).trim(),
     message,
     mustPreserve: strings(issue?.mustPreserve).length
       ? strings(issue.mustPreserve)
@@ -111,6 +116,9 @@ export function rewriteContractForBrain(supervisorResult) {
       issueId: issue.issueId,
       code: issue.code,
       severity: issue.severity,
+      owner: issue.owner,
+      evidenceMessageIds: strings(issue.evidenceMessageIds),
+      violatedRequirement: issue.violatedRequirement,
       mustPreserve: strings(issue.mustPreserve),
       mustChange: strings(issue.mustChange),
       allowedStrategies: strings(issue.allowedStrategies),
