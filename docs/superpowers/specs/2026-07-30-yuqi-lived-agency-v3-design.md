@@ -558,18 +558,33 @@ acceptanceCriteria
 
 最终可见结果的权威单位不是 `turnId`，而是跨 original/retry 分支稳定不变的 `lineageKey`。
 
-PC 数据库新增 `turn_authority_lineages`。每条 lineage 由 `roleId + laneKey + rootSourceId` 唯一确定，保存 `latestTurnId`、显式整数 `revision`、`open/committed/cancelled` 状态和唯一 `committedGroupId`。首个 v3 turn 创建 lineage；重试必须复用前一 turn 的 lineage，并用 compare-and-swap 把 `latestTurnId` 从被重试 turn 改为新 turn。两个 sibling retry 不能同时取得提交权；lineage 已提交时不得再生成新 retry，只返回已有 receipt。
+PC 数据库新增 `turn_authority_lineages`。每条 lineage 由 `roleId + laneKey + rootSourceId` 唯一确定，保存 `latestTurnId`、显式整数 `revision`、`open/committed/cancelled` 状态和唯一 `committedGroupId`。首个 canonical-authority turn 创建 lineage；重试必须复用前一 turn 的 lineage，并用 compare-and-swap 把 `latestTurnId` 从被重试 turn 改为新 turn。两个 sibling retry 不能同时取得提交权；lineage 已提交时不得再生成新 retry，只返回已有 receipt。
 
 `turns` 增加：
 
-- `resultAuthorityVersion`：旧 turn 为 0，Task 10 之后创建的 v3 turn 为 1；
+- `resultAuthorityVersion`：所有旧创建入口和历史 turn 为 0；只有 `createCanonicalVisibleTurnInternal()` 创建的 turn 为 1；
 - `authorityLineageKey`；
 - `lineageRevisionAtCreation`；
 - `turnRevision`；
 - `retryOfTurnId`；
 - `agencySnapshotChecksum`。
 
-`updatedAt` 只用于诊断和排序，绝不用于并发判定。v3 turn 的 claim、checkpoint、supersede、failure 和 commit 都必须使用显式 `turnRevision` compare-and-swap。
+`updatedAt` 只用于诊断和排序，绝不用于并发判定。result-authority-version-1 turn 的 claim、checkpoint、supersede、failure 和 commit 都必须使用显式 `turnRevision` compare-and-swap。
+
+wire protocol 版本与 PC 内部结果权威版本是两个独立维度：
+
+- `protocolVersion` 只描述 Android/PC 传输 payload；Task 10 实施时现有 wire 仍为 v2，Task 13 才增加 v3；
+- `resultAuthorityVersion` 只描述 PC 如何提交最终可见结果，不能由 envelope 字段、客户端版本或模型输出自行选择；
+- 现有 `submitTurn()`、`createTurnWithRolloutInternal()` 和 `createTurnWithReleasePinInternal()` 保持兼容语义，始终创建 `resultAuthorityVersion=0` turn；
+- Task 10 新增唯一内部入口 `createCanonicalVisibleTurnInternal()`，它的调用本身才选择 `resultAuthorityVersion=1`；
+- Task 11 是该入口的第一个生产调用方，只为新建、非恢复、虞栖、wire v2/v3、进入新版 release-pinned lane/atomic-commit 编排的 turn 调用；旧 turn、wire v1、非虞栖和所有旧调用方继续走 version 0；
+- Task 13 的 wire v3 `authority` 只是需要被 PC 重新计算验证的客户端 claim，不是开启 canonical authority 的开关。wire v2 没有 claim 时，Task 11 仍可由 PC 内部推导同一 lineage。
+
+`createCanonicalVisibleTurnInternal()` 必须在一个事务内完成 turn、lineage 和 lane claim；不得先调用旧创建 API 再把 turn patch 成 version 1。它只接受 store-owned release/lane/agency 参数和已标准化 envelope，拒绝任何调用方直接传入 `resultAuthorityVersion`。
+
+创建事务还必须用 rollout revision 做 CAS，重新读取并核对 stable/candidate release pair，再从不可变 release 记录固定 checksum 与 preset；调用方不能借参数自行选择 release。`generationFingerprint` 依赖尚未生成的可见 draft/action，因此创建时必须为 null，只能在 canonical result 提交事务中根据已授权输出和 agency/context revision 重新计算，并同时写入 turn 与 visible group。
+
+上述 rollout CAS 适用于 fresh original。version-1 retry 必须继承 parent turn 已固定的 rollout/release/checksum/comparison/preset，不得因期间发生晋级或回退而换模型；version-0 parent 的 retry 仍走旧兼容路径，缺失或损坏 parent 时停止而不是伪造 canonical lineage。相同未提交 turn 的 exact replay 不重复增加任何 revision；lineage 已提交时返回原 receipt，不受当前 rollout 变化影响。
 
 #### 13.3.2 唯一可见结果与 receipt
 
@@ -812,7 +827,7 @@ PC schema 11 与 Android Room 11 是两个彼此独立的数据库版本域，�
 10. 验证所有 `resultAuthorityVersion=1` turn 都有唯一 lineage，所有 committed lineage 都能联结唯一 group/receipt/outbox；
 11. 生成前后对照报告。
 
-迁移必须事务化、幂等。现有 v10 数据库必须真实执行 10→11，不能只修改 9→10 分支。旧 turn 继续按 `resultAuthorityVersion=0` 的固定旧 schema 和旧 outbox 恢复；新 turn 才使用 v3 canonical authority。任何无法证明来源的历史结果不得反向合成 v3 receipt。
+迁移必须事务化、幂等。现有 v10 数据库必须真实执行 10→11，不能只修改 9→10 分支。旧 turn 继续按 `resultAuthorityVersion=0` 的固定旧 schema 和旧 outbox 恢复；只有经新版内部编排显式创建的 canonical-authority turn 才使用 version 1。任何无法证明来源的历史结果不得反向合成 canonical receipt。
 
 ## 17. Android 与正式发布
 

@@ -26,6 +26,7 @@
 - Non-Yuqi characters remain on the existing path.
 - Existing preset versions remain immutable. Add v3 as a new version; never overwrite `1.9.2` or `2.0.0`.
 - Existing old turns resume with their pinned schema and pipeline fields. Only new turns use v3 release IDs and v3 state.
+- Wire `protocolVersion` never selects PC `resultAuthorityVersion`. Existing turn-creation APIs remain authority version 0; only the internal `createCanonicalVisibleTurnInternal()` added in Task 10 creates version 1, and Task 11 is its first production caller under the exact eligibility rule defined there.
 - The existing 270 fixtures are protocol regression evidence only. They do not count as human-chat quality evidence or live shadow evidence.
 - Offline replay rows use replay/quality tables. Only real production comparisons may increment live shadow/canary counters.
 - One SQLite row per TurnKind in `cognition_kind_rollouts` remains the current rollout authority. History tables are append-only audit, never current-state authority.
@@ -140,6 +141,14 @@ commitVisibleResult({ store, turnId, authorityLineageKey, laneKey,
   agencySnapshotChecksum, authoritativeReleaseId, visibleGroup, actionSet,
   statePatch, memoryJobs, comparisonJob, generationFingerprint, now
 }) -> CommitVisibleResult
+
+// store.mjs result-authority creation boundary
+createCanonicalVisibleTurnInternal({
+  envelope, rolloutKey, expectedRolloutRevision, authoritativeReleaseId,
+  comparisonReleaseId, comparisonDirection, laneKey, expectedLaneRevision,
+  inputUserBatchId, inputVisibilitySequence, agencySnapshotChecksum,
+  annotationSnapshot
+}) -> { status: 'created', turn } | { status: 'already_committed', receipt }
 
 // promotion-controller.mjs
 resolvePipelinePair(rollout) -> {
@@ -627,7 +636,7 @@ createTurnWithReleasePinInternal(input)
 
 Read `PRAGMA user_version` before migration: versions below 9 first follow the existing historical migrations, version 9 runs the new transaction, version 10 performs invariant checks without rewriting data, and versions above 10 stop as unsupported. Remove the current unconditional assignment back to 9. Set `PRAGMA user_version = 10` only after all DDL, backfill, and invariant queries succeed in one transaction. `cognitive_states` remains the one snapshot table; new snapshots use `schema_version = 2`, satisfying the design's `cognitive_state_v2` without creating a competing snapshot authority.
 
-Task 2's version-10 assertion is the historical completion boundary for this task, not the final application schema. After Task 10, the same migration entrypoint must accept populated v10, apply v11 once, and assert v11 on later opens. Do not retroactively pretend Task 2 created the visible group tables, and do not use `reply_json`, `turn_id`, or `updated_at` as a temporary replacement for them.
+Task 2's version-10 assertion is the historical completion boundary for this task, not the final application schema. After Task 10, the same migration entrypoint must accept populated v10, apply v11 once, and assert v11 on later opens. Do not retroactively pretend Task 2 created the visible group tables, and do not use `reply_json`, `turn_id`, or `updated_at` as a temporary replacement for them. `createTurnWithReleasePinInternal()` remains a version-0 compatibility API even after v11; Task 10 adds a separate internal canonical-authority creator rather than silently changing this method's meaning.
 
 - [ ] **Step 4: Run migration and store tests green**
 
@@ -1379,8 +1388,9 @@ git commit -m "feat: arbitrate Yuqi output through persistent lanes"
 
 **Interfaces:**
 - Consumes: the actual Task 2 v10 schema, an authorized draft, Task 9 lane claim, current action target revisions, Task 1 agency/state patch, and an optional already-materialized comparison job.
-- Produces: PC schema v11; one cross-retry lineage authority; `commitVisibleResult()`; `store.commitVisibleResultInternal(input)`; receipt-derived `visibleGroupId` and `commitChecksum`; group-keyed v3 outbox.
+- Produces: PC schema v11; `store.createCanonicalVisibleTurnInternal(input)` as the only version-1 creation boundary; one cross-retry lineage authority; `commitVisibleResult()`; `store.commitVisibleResultInternal(input)`; receipt-derived `visibleGroupId` and `commitChecksum`; group-keyed result-authority-version-1 outbox.
 - Authority rule: `turnId` identifies one execution attempt. `authorityLineageKey` identifies the one user/trigger interaction that may become visible. Only the lineage may own a receipt.
+- Compatibility rule: wire protocol and result authority are independent. Task 10 tests use a currently valid protocol-v2 envelope. Ordinary `submitTurn`/`createTurnWithReleasePinInternal` calls remain result authority version 0 on schema v11.
 
 - [ ] **Step 1: Write red populated-v10 migration and lineage tests**
 
@@ -1401,8 +1411,19 @@ test('populated PC v10 migrates once to v11 without inventing authority for old 
   assert.deepEqual(countLegacyStructuralRows(store.rawDb()), before);
 });
 
-test('fresh v3 turn creates one lineage rooted in the canonical source identity', () => {
-  const outcome = store.createTurnWithReleasePinInternal(v3CreateInput('turn_original'));
+test('ordinary protocol-v2 release-pinned creation remains legacy authority on v11', () => {
+  const turn = store.createTurnWithReleasePinInternal(
+    legacyReleasePinnedV2Input('turn_legacy')
+  );
+  assert.equal(turn.resultAuthorityVersion, 0);
+  assert.equal(turn.authorityLineageKey, null);
+  assert.equal(store.listTurnAuthorityLineages().length, 0);
+});
+
+test('explicit canonical internal creation accepts protocol v2 and creates one lineage', () => {
+  const outcome = store.createCanonicalVisibleTurnInternal(
+    canonicalV2CreateInput('turn_original')
+  );
   assert.equal(outcome.status, 'created');
   const turn = outcome.turn;
   assert.equal(turn.resultAuthorityVersion, 1);
@@ -1415,19 +1436,19 @@ test('fresh v3 turn creates one lineage rooted in the canonical source identity'
 });
 
 test('retry reuses lineage and sibling retries cannot both replace latest turn', () => {
-  const original = createV3Turn('turn_original');
-  const retry1 = createV3Retry(original, 'turn_retry_1', {
-    expectedLineageRevision: 1
-  });
+  const original = createCanonicalV2Turn('turn_original');
+  const retry1 = createCanonicalV2Retry(original, 'turn_retry_1');
   assert.equal(retry1.authorityLineageKey, original.authorityLineageKey);
   assert.equal(store.getTurnAuthorityLineage(original.authorityLineageKey).latestTurnId,
     'turn_retry_1');
   assert.throws(
-    () => createV3Retry(original, 'turn_retry_2', { expectedLineageRevision: 1 }),
+    () => createCanonicalV2Retry(original, 'turn_retry_2'),
     /retry lineage authority conflict/
   );
 });
 ```
+
+`canonicalV2CreateInput()` uses `protocolVersion:2`, `kind:'DIRECT_REPLY'`, and a valid current protocol-v2 user message/context. `createCanonicalV2Retry()` must keep the original canonical message ID/content/sentAt, set `context.retry = {retryOfTurnId, canonicalMessageId}`, and use only a new turn ID/device sequence. The store derives retry lineage and its expected current revision from the validated previous turn; the test must not pass a second `retryOfTurnId` or caller-selected lineage revision outside the envelope.
 
 Also prove all three entry paths:
 
@@ -1491,8 +1512,8 @@ test('exact repeated commit returns one receipt but changed payload on same line
 });
 
 test('original and retry turn IDs cannot create two canonical groups or two deliveries', () => {
-  const original = createV3Turn('turn_original');
-  const retry = createV3Retry(original, 'turn_retry');
+  const original = createCanonicalV2Turn('turn_original');
+  const retry = createCanonicalV2Retry(original, 'turn_retry');
   assert.throws(() => commitVisibleResult(commitInputFor(original)), /retry branch/);
   const receipt = commitVisibleResult(commitInputFor(retry));
   assert.equal(store.visibleGroupsForLineage(original.authorityLineageKey).length, 1);
@@ -1673,32 +1694,130 @@ this.withImmediateTransaction(() => {
 - every committed lineage joins exactly one group and one receipt;
 - every group joins the same lineage, authoritative turn, role, lane, release, and authority origin as its receipt;
 - every receipt uses the payload version allowed for its origin;
+- every committed version-1 PC turn has a non-null generation fingerprint equal to its visible group; every uncommitted version-1 turn keeps that field null;
 - every receipt's turn/lineage revisions increment exactly once; `pc` receipts also require lane before/after to increment once, while imported fallback receipts keep both lane fields null;
-- every v3 delivery joins the receipt group and carries the same authority commit checksum;
+- every result-authority-version-1 delivery joins the receipt group and carries the same authority commit checksum;
 - every `pc` receipt has its required peer deliveries, while every imported `android_fallback` receipt has none;
-- no authority-version-0 turn is silently attached to a v3 lineage or receipt.
+- no authority-version-0 turn is silently attached to a canonical lineage or receipt.
 
 Update `migrate-yuqi-agency-state.mjs` so it reads source `PRAGMA user_version` before constructing `YuqiStore`, migrates only `--clone-out` during dry-run, and materializes the v11 invariant summary in the report. `--apply --expect-report` must compare the raw source SHA/version and structural counts from the approved report before opening/migrating production; a changed source stops before mutation. The verified raw backup remains the rollback artifact.
 
-Change `createTurnWithReleasePinInternal()` so its v3 return type is explicit:
+Keep `submitTurn()`, `createTurnWithRolloutInternal()`, and
+`createTurnWithReleasePinInternal()` unchanged as compatibility entry points. Even on
+schema v11 they return their existing plain turn shape and create only
+`result_authority_version=0` rows with null lineage fields.
+
+Add this separate store-owned boundary:
 
 ```text
+createCanonicalVisibleTurnInternal({
+  envelope,
+  rolloutKey,
+  expectedRolloutRevision,
+  authoritativeReleaseId,
+  comparisonReleaseId,
+  comparisonDirection,
+  laneKey,
+  expectedLaneRevision,
+  inputUserBatchId,
+  inputVisibilitySequence,
+  agencySnapshotChecksum,
+  annotationSnapshot
+}) ->
 { status: 'created', turn }
 { status: 'already_committed', receipt }
 ```
 
-New v3 turn creation, first lineage insert, and lane claim occur in one immediate transaction. Derive:
+The method call itself—not `envelope.protocolVersion`, an `authority` object, or a
+caller-supplied numeric flag—is the sole selector for
+`result_authority_version=1`. Reject an input that attempts to supply
+`resultAuthorityVersion`, `authorityContractVersion`, `authorityLineageKey`,
+`lineageRevisionAtCreation`, or `turnRevision`. Task 10 must not widen
+`validateEnvelope()` to accept protocol v3; its fixtures use a currently valid,
+normalized protocol-v2 envelope. Task 13 later makes a validated protocol-v3
+envelope another input format to this same method.
+
+Do not implement this by calling a compatibility creator and patching its row.
+Refactor a private turn-insert primitive if needed, but canonical turn creation,
+first lineage insert/replacement, and lane claim must occur in one immediate
+transaction. Derive:
 
 ```js
 rootSourceId = envelope.context?.retry?.canonicalMessageId
   ?? envelope.message?.messageId
-  ?? envelope.triggerId;
+  ?? envelope.trigger?.triggerId;
 lineageKey = deriveAuthorityLineageKey({
   roleId: envelope.characterId, laneKey, rootSourceId
 });
 ```
 
-For a retry, ignore any caller-supplied lineage key. Load `retryOfTurnId`, require that turn to be the open lineage's current `latestTurnId`, require `expectedLineageRevision`, insert the retry turn pointing to the same lineage, and CAS `latest_turn_id/revision`. A committed lineage returns `{status:'already_committed', receipt}` without creating or claiming a new turn. A stale/sibling retry reports a retry-lineage authority conflict. Persist `input_user_batch_id`, the current visibility sequence, release pins, lane revision, and the normalized agency snapshot checksum on the new turn.
+For a fresh non-retry creation, inside that same transaction reload the rollout
+row, require `revision === expectedRolloutRevision`, independently resolve its
+visible and comparison release pair, and require exact equality with the three
+supplied release fields. Then load the immutable release rows and pin their
+checksums and the authoritative release's preset version. These caller fields
+are optimistic CAS expectations from `PromotionController`, not permission to
+choose a release. A concurrent promotion or rollback fails before inserting a
+turn, lineage, message, or lane mutation.
+
+For a retry, the only retry identity is the already-validated
+`envelope.context.retry.retryOfTurnId` plus its `canonicalMessageId`; no duplicate
+`retryOfTurnId`, lineage key, or expected lineage revision is accepted outside
+the envelope. Load that prior turn, verify the canonical message
+ID/content/`sentAt` against the original source batch, derive the same lineage,
+and require the prior turn to be the open lineage's current `latestTurnId`. Read
+the lineage's current revision inside the same immediate transaction, insert the
+retry turn pointing to the same lineage, and CAS `latest_turn_id/revision` from
+that observed row. A committed lineage returns
+`{status:'already_committed', receipt}` without creating or claiming a new turn.
+A stale or sibling retry loses the CAS and reports a retry-lineage authority
+conflict. Persist `input_user_batch_id`, current visibility sequence, release
+pins, lane revision, derived preset/annotation pins, and the normalized agency
+snapshot checksum on the new turn. `generation_fingerprint` remains null until
+the canonical visible result transaction because it depends on the authorized
+visible draft and action set, which do not exist at turn creation.
+
+A version-1 retry inherits `rolloutRevision`, authoritative/comparison release
+IDs and checksums, comparison direction, and preset version from the prior turn;
+it does not adopt the rollout table's current pair after a promotion, graduation,
+or rollback. Its caller supplies those inherited values as expectations and the
+store compares them with the prior turn and immutable release rows. A retry whose
+prior turn is version 0 stays on the compatibility creator/recovery path. A
+retry whose prior turn is missing or whose authority version/lineage fields are
+inconsistent is rejected as an invariant conflict; Task 10 must not synthesize a
+new canonical lineage from a partial legacy record.
+
+After validating the normalized envelope against stored source identity, handle
+idempotency before fresh authority claims: an exact replay of the same
+uncommitted canonical `turnId + envelopeChecksum` returns
+`{status:'created', turn}` without incrementing rollout, lane, lineage, or turn
+revision; a committed lineage returns its joined receipt even if the rollout has
+since changed. Any changed envelope under the same turn/lineage conflicts.
+
+`inputVisibilitySequence` is required to be a non-negative safe integer. For the
+current protocol-v2 input, which has no visibility cursor, Task 11 supplies the
+persisted lane's `localSequence` snapshot. Once Task 13 accepts protocol v3, it
+supplies the validated `context.visibilityCursor.localSequence`; canonical
+creation rejects it if it is behind the persisted lane and atomically advances
+the lane to it if it is ahead. The turn always stores the resulting exact lane
+sequence. Do not synthesize a v3 cursor inside Task 10 or trust an unvalidated
+wire value.
+
+Add explicit negative tests proving that a protocol-v2 envelope passed through
+an old creation API remains version 0; a protocol-v2 envelope passed through
+`createCanonicalVisibleTurnInternal()` becomes version 1; injecting a wire
+`resultAuthorityVersion` or external retry/revision selector cannot upgrade or
+replace authority; a rollout revision/release-pair race leaves no turn, message,
+lineage, or lane mutation; and protocol v2 without a cursor uses a non-zero
+persisted lane sequence exactly. Task 10 does not alter protocol-v3 acceptance:
+the existing protocol baseline remains red for v3 at this checkpoint and Task 13
+intentionally replaces that protocol expectation. Do not put a permanent
+“protocol v3 must fail” assertion in the v11 store test.
+
+Also test that an exact open-turn replay is mutation-free, an exact committed
+replay returns the original receipt after rollout change, a version-1 retry
+inherits its parent's release pair after rollout change, and a retry of a
+version-0 or missing parent cannot enter canonical creation.
 
 All authority-changing writes for result-authority-version-1 turns use:
 
@@ -1774,7 +1893,16 @@ export function commitVisibleResult(input) {
     assertAgencySnapshotChecksum(authority, input.agencySnapshotChecksum);
     assertReleasePin(authority, input.authoritativeReleaseId);
     assertActionTargets(authority, input.actionSet);
-    assertFingerprintAuthority(authority, input.generationFingerprint);
+    assert.equal(authority.turn.generationFingerprint, null,
+      'an uncommitted turn cannot pre-own an output fingerprint');
+    assert.equal(input.generationFingerprint, generationFingerprint({
+      roleId: authority.turn.characterId,
+      laneKey: authority.turn.laneKey,
+      laneRevision: authority.turn.laneRevision,
+      visibleGroup: input.visibleGroup,
+      actionSet: input.actionSet,
+      contextRevision: input.agencySnapshotChecksum
+    }), 'generation fingerprint mismatch');
 
     return input.store.commitVisibleResultInternal({
       ...input,
@@ -1801,12 +1929,12 @@ export function commitVisibleResult(input) {
 9. insert one delivery per peer with `authority_group_id + peer_id` and `authority_commit_checksum`;
 10. CAS the lane from expected revision to `revision + 1`, setting latest authoritative group/checksum;
 11. CAS the lineage from open/latest/current revision to committed/group/`revision + 1`;
-12. CAS the turn from expected revision to committed/`turnRevision + 1`;
+12. CAS the turn from expected revision to committed/`turnRevision + 1`, setting its generation fingerprint to the exact fingerprint stored on the group;
 13. insert `visible_commit_receipts` with every before/after revision and return it.
 
 Although the receipt row is inserted last, the whole SQLite transaction is the authority boundary. Any exception rolls back all thirteen steps. `commitVisibleResult()` always records authority origin `pc`; the later Android fallback task may import an already-visible external receipt through a separate validation-only path, never by pretending it was a PC cognition commit. Shadow/comparison execution may write only comparison/quality rows; it never calls this function, an action store, outbox, notification, state, facts, or memory consolidation.
 
-- [ ] **Step 7: Convert only v3 outbox operations to group authority**
+- [ ] **Step 7: Convert only result-authority-version-1 outbox operations to group authority**
 
 Keep legacy rows and public compatibility methods for result-authority-version-0 turns. For rows with `authority_group_id`:
 
@@ -1827,7 +1955,7 @@ Run:
 node --test yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/protocol-store.test.mjs tests/yuqi-agency-state-migration.test.mjs
 ```
 
-Expected: PASS; populated v10 is preserved and becomes v11; exact retry returns one receipt; stale/sibling retry fails; every forced failure leaves no partial authority; old v2 delivery remains readable; v3 emits one canonical group.
+Expected: PASS; populated v10 is preserved and becomes v11; exact retry returns one receipt; stale/sibling retry fails; every forced failure leaves no partial authority; old version-0 delivery remains readable; version-1 authority emits one canonical group even though Task 10 fixtures still use wire protocol v2.
 
 - [ ] **Step 9: Commit**
 
@@ -1853,7 +1981,7 @@ git commit -m "feat: add canonical Yuqi result authority"
 
 **Interfaces:**
 - Consumes: Tasks 2, 7, 9, and 10.
-- Produces: one release-pinned execution path for all ten rollout keys; receipt-derived bridge results; background comparisons created inside the authoritative result transaction only after the checksum is deterministic.
+- Produces: one release-pinned execution path for all ten rollout keys; the first production call to `createCanonicalVisibleTurnInternal()` under the explicit eligibility rule below; receipt-derived bridge results; background comparisons created inside the authoritative result transaction only after the checksum is deterministic.
 
 - [ ] **Step 1: Write red orchestration tests for release direction and recovery**
 
@@ -1890,6 +2018,29 @@ test('life compare is queued only in the authoritative result transaction', asyn
   controller.commitLifePlanningAuthoritativeResult(validLifeResult(attempt));
   assert.ok(store.getComparisonJobForLife(attempt.planningId));
 });
+
+test('new Yuqi protocol-v2 execution uses canonical authority independent of wire v3', async () => {
+  const result = await orchestrator.execute(directEnvelope({ protocolVersion: 2 }));
+  assert.equal(store.getTurn(result.turnId).resultAuthorityVersion, 1);
+  assert.equal(store.spy.createCanonicalVisibleTurnInternal.calls.length, 1);
+  assert.equal(store.spy.createTurnWithReleasePinInternal.calls.length, 0);
+});
+
+test('wire v1, non-Yuqi, and recovered version-0 turns never enter canonical creation', async () => {
+  await orchestrator.execute(protocolV1Envelope());
+  await orchestrator.execute(nonYuqiEnvelope());
+  await orchestrator.recover(existingVersionZeroTurn().turnId);
+  assert.equal(store.spy.createCanonicalVisibleTurnInternal.calls.length, 0);
+  assertLegacyCompatibilityResults();
+});
+
+test('recovery dispatches by persisted resultAuthorityVersion and never recreates a turn', async () => {
+  const oldResult = await newRuntime().recover(existingVersionZeroTurn().turnId);
+  const canonicalResult = await newRuntime().recover(existingVersionOneTurn().turnId);
+  assert.equal(oldResult.recoveryPath, 'legacy');
+  assert.equal(canonicalResult.recoveryPath, 'canonical');
+  assert.equal(store.spy.createCanonicalVisibleTurnInternal.calls.length, 0);
+});
 ```
 
 - [ ] **Step 2: Run runtime integration tests red**
@@ -1905,25 +2056,73 @@ Expected: FAIL because release IDs/lanes are not wired into execution.
 - [ ] **Step 3: Route every new turn through the authoritative release pair**
 
 ```js
+const existingTurn = findPersistedTurnForRecovery(envelope);
+if (existingTurn) {
+  return existingTurn.resultAuthorityVersion === 0
+    ? recoverLegacyTurn(existingTurn)
+    : recoverCanonicalTurnOrQuarantine(existingTurn);
+}
+
+const retryParent = envelope.context?.retry
+  ? store.getTurn(envelope.context.retry.retryOfTurnId)
+  : null;
+if (envelope.context?.retry && !retryParent) {
+  return quarantineInvariantFailure('missing_retry_parent');
+}
+
+const eligibleForCanonicalResultAuthority =
+  envelope.characterId === 'yuqi'
+  && (envelope.protocolVersion === 2 || envelope.protocolVersion === 3)
+  && SUPPORTED_ROLLOUT_KEYS.has(envelope.kind)
+  && (!retryParent || retryParent.resultAuthorityVersion === 1)
+  && executionEntry === 'cognition-release-pinned';
+
+if (!eligibleForCanonicalResultAuthority) {
+  return executeCompatibilityPath(envelope);
+}
+
 const rollout = promotionController.getStatus(envelope.kind);
-const pair = promotionController.resolvePipelinePair(rollout);
-const creation = store.createTurnWithReleasePinInternal({
+const pair = retryParent
+  ? releasePairPinnedByTurn(retryParent)
+  : promotionController.resolvePipelinePair(rollout);
+if (retryParent) assertValidCanonicalRetryParent(retryParent, pair);
+else assertValidReleasePair(pair, rollout);
+const laneKey = laneKeyForEnvelope(envelope);
+const lane = store.getInteractionLane(envelope.characterId, laneKey)
+  ?? { revision: 0, localSequence: 0 };
+const inputVisibilitySequence =
+  Number.isSafeInteger(envelope.context?.visibilityCursor?.localSequence)
+    ? envelope.context.visibilityCursor.localSequence
+    : lane.localSequence;
+const creation = store.createCanonicalVisibleTurnInternal({
   envelope,
   rolloutKey: envelope.kind,
+  expectedRolloutRevision: retryParent?.rolloutRevision ?? rollout.revision,
   authoritativeReleaseId: pair.visibleReleaseId,
   comparisonReleaseId: pair.comparisonReleaseId,
   comparisonDirection: pair.comparisonDirection,
-  laneKey: laneKeyForEnvelope(envelope),
+  laneKey,
   expectedLaneRevision: lane.revision,
-  inputUserBatchId: envelope.context.currentBatch?.batchId ?? envelope.triggerId,
-  inputVisibilitySequence: envelope.context.visibilityCursor.localSequence,
-  agencySnapshotChecksum: agencyView.checksum
+  inputUserBatchId: envelope.context?.currentBatch?.batchId
+    ?? envelope.message?.messageId
+    ?? envelope.trigger?.triggerId,
+  inputVisibilitySequence,
+  agencySnapshotChecksum: agencyView.checksum,
+  annotationSnapshot
 });
 if (creation.status === 'already_committed') {
   return bridgeResultFromCommitReceipt(creation.receipt);
 }
 const turn = creation.turn;
 const execution = await executePinnedRelease(turn);
+const outputFingerprint = generationFingerprint({
+  roleId: turn.characterId,
+  laneKey: turn.laneKey,
+  laneRevision: turn.laneRevision,
+  visibleGroup: execution.visibleGroup,
+  actionSet: execution.actionSet,
+  contextRevision: turn.agencySnapshotChecksum
+});
 const comparisonJob = turn.comparisonReleaseId
   ? buildComparisonJobDraft({
     subjectType: 'turn',
@@ -1938,14 +2137,44 @@ const receipt = commitVisibleResult(toCommitInput(execution, {
   expectedLineageRevision: store.getTurnAuthorityLineage(
     turn.authorityLineageKey).revision,
   expectedCognitiveStateRevision: execution.inputCognitiveStateRevision,
+  generationFingerprint: outputFingerprint,
   comparisonJob
 }));
 return bridgeResultFromCommitReceipt(receipt);
 ```
 
+`executionEntry` is an internal orchestrator constant set only after the request
+has entered this Task 11 release-pinned cognition handler; it is not read from
+the envelope. During Task 11 the reachable accepted wire version is 2. The
+`protocolVersion === 3` arm is deliberately dormant until Task 13 extends and
+validates the wire protocol; it does not authorize version 1 by itself. A valid
+release pair is required in both stable-visible shadow and candidate-visible
+canary phases, so both use the same canonical commit authority. No code may call
+an old creator and later mutate that turn to version 1.
+
+`executeCompatibilityPath()` handles a retry parent with
+`resultAuthorityVersion=0`; the boolean above must never upgrade it. A canonical
+retry uses `releasePairPinnedByTurn(retryParent)` even if the rollout controller
+now reports a different phase or release. Add a recovery/race test that changes
+the rollout between original failure and retry and proves the retry retains the
+parent's release IDs/checksums/preset while still taking a fresh lane and agency
+snapshot.
+
+For protocol v2, `inputVisibilitySequence` is deliberately the lane snapshot,
+not a fabricated client cursor; add a test with a non-zero persisted lane
+sequence and no `context.visibilityCursor`. For protocol v3, Task 13 owns cursor
+validation before this handler runs. An automatic turn derives
+`inputUserBatchId` and `rootSourceId` from `envelope.trigger.triggerId`, never
+from a nonexistent top-level `triggerId`.
+
 `buildComparisonJobDraft()` has no database side effect. Task 10 inserts it as step 8 of the same result transaction and fills the authoritative group/checksum from that transaction; there is no post-commit window where a visible result lacks required comparison work. The compare worker is dry-run: it can write only comparison/quality rows. It cannot call action stores, visible commit, outbox, notification, state, fact, or consolidation APIs. Life planning retains two phases: attempt creation fixes release/epoch/checksum/canary slot/input; result commit creates comparison work in the same transaction. Outstanding canary count includes attempts allocated before the comparison job exists.
 
-Recovery branches explicitly on `resultAuthorityVersion`: version 0 resumes the pre-v11 pinned legacy turn/outbox path; version 1 must load lineage, current turn revision, canonical receipt/group and group delivery. A version-1 turn with a missing or inconsistent lineage is quarantined as an invariant failure and never regenerated or silently downgraded.
+Recovery branches explicitly on persisted `resultAuthorityVersion` before any
+new-turn creation: version 0 resumes the pre-v11 pinned legacy turn/outbox path;
+version 1 must load lineage, current turn revision, canonical receipt/group and
+group delivery. Recovery never invokes `createCanonicalVisibleTurnInternal()`.
+A version-1 turn with a missing or inconsistent lineage is quarantined as an
+invariant failure and never regenerated or silently downgraded.
 
 - [ ] **Step 4: Run all runtime integration tests green**
 
@@ -1955,7 +2184,7 @@ Run:
 node --test yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs
 ```
 
-Expected: PASS; recovered old v2 turns still use the old branch; recovered new turns never adopt a later rollout change.
+Expected: PASS; recovered result-authority-version-0 turns still use the old branch; recovered version-1 turns never adopt a later rollout change.
 
 - [ ] **Step 5: Commit**
 
@@ -2146,7 +2375,7 @@ git commit -m "feat: persist Android conversation visibility cursor"
 
 **Interfaces:**
 - Consumes: Task 12 cursor and the existing complete user batch.
-- Produces: shared `al-authority-v1` IDs; protocol v3 `authority` plus `context.visibilityCursor`; a receipt-derived result containing `authorityLineageKey`, `visibleGroupId`, lineage/turn/lane revisions, `generationFingerprint`, `releaseId`, `commitPayloadVersion`, and `commitChecksum`.
+- Produces: shared `al-authority-v1` IDs; protocol v3 `authority` plus `context.visibilityCursor`; validation that maps v3 claims into the same Task 10 internal creation contract without selecting its authority version; a receipt-derived result containing `authorityLineageKey`, `visibleGroupId`, lineage/turn/lane revisions, `generationFingerprint`, `releaseId`, `commitPayloadVersion`, and `commitChecksum`.
 
 - [ ] **Step 1: Write red Java and Node bridge contract tests**
 
@@ -2181,6 +2410,16 @@ test('protocol v3 rejects an impossible visibility cursor', () => {
   envelope.context.visibilityCursor.uiAppliedSequence = 9;
   envelope.context.visibilityCursor.nativeCompletedSequence = 8;
   assert.throws(() => normalizeEnvelope(envelope), /uiApplied.*nativeCompleted/);
+});
+
+test('protocol v3 authority is a verified claim, not a result-authority selector', () => {
+  const envelope = validProtocolV3Envelope();
+  envelope.authority.lineageKey = 'lin_forged';
+  assert.throws(() => normalizeEnvelope(envelope), /authority lineage mismatch/);
+  assert.equal(
+    Object.hasOwn(normalizeEnvelope(validProtocolV3Envelope()), 'resultAuthorityVersion'),
+    false
+  );
 });
 
 test('protocol v3 result uses the persisted commit receipt and never derives group identity', () => {
@@ -2238,7 +2477,18 @@ Expected: FAIL on missing cursor/group fields.
 }
 ```
 
-Protocol normalization accepts v2 without a cursor/authority object for old installed clients and synthesizes an `unknown` visibility state. V3 requires both. Android obtains `rootSourceId` from the canonical source message/trigger, derives and persists the lineage before route execution, and sends it. `claimedLineageRevision` is 1 for a first local claim and increments exactly once when a retry replaces `latestTurnId`; it is not a caller-selected PC CAS token. PC independently derives role, lane and root source from the normalized envelope, recomputes `al-authority-v1`, loads the prior turn/lineage when present, and accepts the claimed revision only when it equals the deterministic next revision. V3 also verifies UI sequence is not ahead of native completion and retains every current-batch message. Bridge results return:
+Protocol normalization accepts v2 without a cursor/authority object for old installed clients and synthesizes an `unknown` visibility state. V3 requires both. Android obtains `rootSourceId` from the canonical source message/trigger, derives and persists the lineage before route execution, and sends it. `claimedLineageRevision` is 1 for a first local claim and increments exactly once when a retry replaces `latestTurnId`; it is not a caller-selected PC CAS token. PC independently derives role, lane and root source from the normalized envelope, recomputes `al-authority-v1`, loads the prior turn/lineage when present, and accepts the claimed revision only when it equals the deterministic next revision. V3 also verifies UI sequence is not ahead of native completion and retains every current-batch message.
+
+The normalized `authority` object is verification evidence only. It never
+produces, accepts, or overwrites `resultAuthorityVersion`; a v3 envelope sent
+through an old compatibility creator still creates version 0, while Task 11's
+eligible internal path creates version 1 for a valid v2 or v3 envelope. Task 13
+must not add a second authority-version option to any store API. After v3
+normalization succeeds, Task 11 passes the normalized envelope to the already
+implemented `createCanonicalVisibleTurnInternal()` and the store independently
+re-derives the lineage. A claim mismatch fails before turn creation.
+
+Bridge results return:
 
 ```json
 {
@@ -2255,7 +2505,7 @@ Protocol normalization accepts v2 without a cursor/authority object for old inst
 }
 ```
 
-`AuthorityIdentity.java` implements the exact byte-length-prefixed SHA-256 algorithm from Task 10 and passes the same `tests/fixtures/authority-identity-v1.json`; do not create an Android-only canonicalization. The PC response builder must join `visible_commit_receipts`, `visible_result_groups`, the lineage, lane and authoritative turn, then copy all fields verbatim. It rejects any non-joining turn/group/lineage/checksum rather than falling back to `reply_json`. Legacy v2 responses keep the old turn-ID identity and omit v3 receipt fields.
+`AuthorityIdentity.java` implements the exact byte-length-prefixed SHA-256 algorithm from Task 10 and passes the same `tests/fixtures/authority-identity-v1.json`; do not create an Android-only canonicalization. The PC response builder must join `visible_commit_receipts`, `visible_result_groups`, the lineage, lane and authoritative turn, then copy all fields verbatim. It rejects any non-joining turn/group/lineage/checksum rather than falling back to `reply_json`. For an old installed v2 client, the wire response keeps its legacy turn-ID-shaped payload and omits v3 receipt fields, but this is only a response projection: an eligible new Task 11 execution may still be version 1 internally and use one canonical group/outbox. Persisted pre-v11/version-0 turns continue to use the truly legacy authority and outbox path.
 
 `RoomBridgeMirror` validates and writes all v3 authority fields to the same `ChatTurnEntity` completion transaction before advancing `nativeCompleted`. Exact event/poll/replay duplicates return the stored row; a different lineage/group/checksum for the same turn is quarantined as `BRIDGE_AUTHORITY_CONFLICT`. A restart reconstructs the exact lineage/group/release/revisions/fingerprint from Room; Android and Web must not generate a new group ID or checksum from current content.
 
@@ -2594,7 +2844,7 @@ export function compileCurrentTurnAdvisories({ responseRisks = [], ambiguities =
 }
 ```
 
-Delete the merge from `responseRisks` into `forbiddenMoves`. New v3 turns do not write `activeBoundaries`; old v2 resume continues to read its frozen checkpoint. Payment validation locks message ID, kind, amount, currency, payer/payee, current status, refund, and wallet effects, while cognition independently decides the social response. Image materialization remains exactly once. Voice without transcript remains unknown. Emoji gets no fixed emotion mapping. Quotes retain original speaker/message ID. Visible multi-bubbles share one authority group and commit checksum.
+Delete the merge from `responseRisks` into `forbiddenMoves`. New cognition-release turns do not write `activeBoundaries`; persisted result-authority-version-0 turns continue to read their frozen checkpoint during recovery. Payment validation locks message ID, kind, amount, currency, payer/payee, current status, refund, and wallet effects, while cognition independently decides the social response. Image materialization remains exactly once. Voice without transcript remains unknown. Emoji gets no fixed emotion mapping. Quotes retain original speaker/message ID. Visible multi-bubbles share one authority group and commit checksum.
 
 - [ ] **Step 4: Run direct feature tests green**
 
@@ -3981,7 +4231,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-yuqi-backg
 node scripts/verify-yuqi-runtime.mjs
 ```
 
-Expected: runtime healthy, PC database v11, current production stable release still visible, no candidate active, old authority-version-0 unfinished turns resumable on the legacy branch, and before/after structural counts preserved. Every new v3 turn has lineage authority. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
+Expected: runtime healthy, PC database v11, current production stable release still visible, no candidate active, old authority-version-0 unfinished turns resumable on the legacy branch, and before/after structural counts preserved. Every eligible new cognition-release turn created through the canonical internal boundary has lineage authority. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
 
 - [ ] **Step 3: Register the same eligible v3 candidate for each rollout key in shadow**
 
