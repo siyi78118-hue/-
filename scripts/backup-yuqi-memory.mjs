@@ -66,5 +66,10 @@ if (invokedPath === fileURLToPath(import.meta.url)) {
   const config = JSON.parse(readFileSync(configPath, 'utf8'));
   const databasePath = resolve(config.databasePath);
   const result = createMemorySnapshot({ databasePath, retain: Number(process.argv[3]) || 30 });
-  process.stdout.write(`${JSON.stringify({ ok: true, snapshotPath: result })}\n`);
+  const inspection = inspectMemorySnapshot(result);
+  process.stdout.write(`${JSON.stringify({
+    ok: true,
+    ...inspection,
+    preMigrationDatabaseSha256: inspection.sha256
+  })}\n`);
 }
