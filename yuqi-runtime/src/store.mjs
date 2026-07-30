@@ -20,6 +20,45 @@ const TURN_PATCH_COLUMNS = new Map([
   ['origin', 'origin']
 ]);
 
+const BASELINE_STABLE_RELEASE = Object.freeze({
+  releaseId: 'release_baseline_78a4b362be0dd02d42ba8ad7',
+  pipelineVersion: 'stable-visible-baseline-2026-07-30',
+  presetVersion: '1.9.2',
+  cognitionSchemaVersion: 1,
+  expressionSchemaVersion: 1,
+  evaluatorVersion: 'legacy-supervisor-v1',
+  modelProfile: { source: 'baseline-audit', checksum: '040a2584c1c96c99fae21a791cc303436367f149bf432e7a91450bdb49a047d2' },
+  componentManifest: {
+    kind: 'synthetic_immutable_visible_baseline',
+    auditGitHead: '317302d220fc67984ee8769206d8480a976865d9'
+  },
+  releaseChecksum: '78a4b362be0dd02d42ba8ad776b040c179d6ebcebdafc6193bf2449ab774e0a0',
+  createdAt: 1785406322867,
+  retiredAt: null
+});
+
+const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
+  kind: 'synthetic_existing_cognition_v2_candidate',
+  presetVersion: '2.0.0',
+  baseReleaseId: BASELINE_STABLE_RELEASE.releaseId,
+  schemaVersion: 2
+});
+
+const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
+const BASELINE_V2_CANDIDATE_RELEASE = Object.freeze({
+  releaseId: `release_cognition_v2_${BASELINE_V2_CANDIDATE_CHECKSUM.slice(0, 24)}`,
+  pipelineVersion: 'cognition-v2-candidate-2026-07-30',
+  presetVersion: '2.0.0',
+  cognitionSchemaVersion: 2,
+  expressionSchemaVersion: 2,
+  evaluatorVersion: 'supervisor-v2',
+  modelProfile: { source: 'existing-v2-candidate' },
+  componentManifest: BASELINE_V2_CANDIDATE_MANIFEST,
+  releaseChecksum: BASELINE_V2_CANDIDATE_CHECKSUM,
+  createdAt: 1785406322867,
+  retiredAt: null
+});
+
 function now() {
   return Date.now();
 }
@@ -49,6 +88,14 @@ function mapTurn(row) {
     shadowEpoch: row.shadow_epoch ?? null,
     canaryEpoch: row.canary_epoch ?? null,
     canarySlot: row.canary_slot ?? null,
+    authoritativeReleaseId: row.authoritative_release_id || null,
+    comparisonReleaseId: row.comparison_release_id || null,
+    authoritativePipelineChecksum: row.authoritative_pipeline_checksum || null,
+    comparisonPipelineChecksum: row.comparison_pipeline_checksum || null,
+    laneKey: row.lane_key || null,
+    laneRevision: row.lane_revision ?? null,
+    inputVisibilitySequence: row.input_visibility_sequence ?? null,
+    generationFingerprint: row.generation_fingerprint || null,
     presetVersion: row.preset_version || '1.9.1',
     annotationSnapshot: parseJson(row.annotation_snapshot_json, {}),
     workerId: row.worker_id || '',
@@ -74,6 +121,9 @@ function mapCognitionRollout(row) {
     revision: Number(row.revision),
     presetVersion: row.preset_version,
     pipelineChecksum: row.pipeline_checksum,
+    stableReleaseId: row.stable_release_id || null,
+    candidateReleaseId: row.candidate_release_id || null,
+    candidatePhase: row.candidate_phase || null,
     evidenceEpoch: Number(row.evidence_epoch),
     shadowEpoch: Number(row.shadow_epoch),
     liveShadowFirstAt: row.live_shadow_first_at ?? null,
@@ -175,6 +225,14 @@ function mapShadowRun(row) {
     shadowEpoch: row.shadow_epoch ?? null,
     canaryEpoch: row.canary_epoch ?? null,
     canarySlot: row.canary_slot ?? null,
+    authoritativeReleaseId: row.authoritative_release_id || null,
+    comparisonReleaseId: row.comparison_release_id || null,
+    authoritativePipelineChecksum: row.authoritative_pipeline_checksum || null,
+    comparisonPipelineChecksum: row.comparison_pipeline_checksum || null,
+    laneKey: row.lane_key || null,
+    laneRevision: row.lane_revision ?? null,
+    inputVisibilitySequence: row.input_visibility_sequence ?? null,
+    generationFingerprint: row.generation_fingerprint || null,
     rolloutRevision: row.rollout_revision,
     pipelineChecksum: row.pipeline_checksum,
     state: row.state,
@@ -348,6 +406,14 @@ function mapLifePlanningAttempt(row) {
     shadowEpoch: row.shadow_epoch ?? null,
     canaryEpoch: row.canary_epoch ?? null,
     canarySlot: row.canary_slot ?? null,
+    authoritativeReleaseId: row.authoritative_release_id || null,
+    comparisonReleaseId: row.comparison_release_id || null,
+    authoritativePipelineChecksum: row.authoritative_pipeline_checksum || null,
+    comparisonPipelineChecksum: row.comparison_pipeline_checksum || null,
+    laneKey: row.lane_key || null,
+    laneRevision: row.lane_revision ?? null,
+    inputVisibilitySequence: row.input_visibility_sequence ?? null,
+    generationFingerprint: row.generation_fingerprint || null,
     presetVersion: row.preset_version,
     inputSnapshot: parseJson(row.input_snapshot_json, {}),
     inputChecksum: row.input_checksum,
@@ -368,6 +434,85 @@ function mapLifePlanningAttempt(row) {
   };
 }
 
+function mapPipelineRelease(row) {
+  if (!row) return null;
+  return {
+    releaseId: row.release_id,
+    pipelineVersion: row.pipeline_version,
+    presetVersion: row.preset_version,
+    cognitionSchemaVersion: Number(row.cognition_schema_version),
+    expressionSchemaVersion: Number(row.expression_schema_version),
+    evaluatorVersion: row.evaluator_version,
+    modelProfile: parseJson(row.model_profile_json, {}),
+    componentManifest: parseJson(row.component_manifest_json, {}),
+    releaseChecksum: row.release_checksum,
+    createdAt: Number(row.created_at),
+    retiredAt: row.retired_at ?? null
+  };
+}
+
+function mapConstraintRecord(row) {
+  if (!row) return null;
+  return {
+    constraintId: row.constraint_id,
+    revision: Number(row.revision),
+    roleId: row.role_id,
+    authority: row.authority,
+    kind: row.kind,
+    subject: row.subject,
+    scope: parseJson(row.scope_json, {}),
+    rule: row.rule_text,
+    sourceMessageIds: parseJson(row.source_message_ids_json, []),
+    sourceConfigRef: row.source_config_ref || null,
+    releaseCondition: row.release_condition || null,
+    status: row.status,
+    supersedes: row.supersedes || null,
+    createdAt: Number(row.created_at),
+    updatedAt: Number(row.updated_at)
+  };
+}
+
+function mapStanceRecord(row) {
+  if (!row) return null;
+  return {
+    stanceId: row.stance_id,
+    revision: Number(row.revision),
+    roleId: row.role_id,
+    topic: row.topic,
+    position: row.position_text,
+    reason: row.reason_text,
+    strength: Number(row.strength),
+    flexibility: Number(row.flexibility),
+    sourceTurnId: row.source_turn_id,
+    sourceMessageIds: parseJson(row.source_message_ids_json, []),
+    createdAt: Number(row.created_at),
+    lastConfirmedAt: Number(row.last_confirmed_at),
+    expiresAt: row.expires_at ?? null,
+    remainingRelevantUserBatches: Number(row.remaining_relevant_user_batches),
+    status: row.status,
+    supersedes: row.supersedes || null
+  };
+}
+
+function mapInteractionLane(row) {
+  if (!row) return null;
+  return {
+    roleId: row.role_id,
+    laneKey: row.lane_key,
+    revision: Number(row.revision),
+    generatingTurnId: row.generating_turn_id || null,
+    latestUserBatchId: row.latest_user_batch_id || null,
+    latestAuthoritativeGroupId: row.latest_authoritative_group_id || null,
+    nativeCompletedGroupId: row.native_completed_group_id || null,
+    nativeCompletedSequence: Number(row.native_completed_sequence),
+    uiAppliedGroupId: row.ui_applied_group_id || null,
+    uiAppliedSequence: Number(row.ui_applied_sequence),
+    localSequence: Number(row.local_sequence),
+    lastCommitChecksum: row.last_commit_checksum || null,
+    updatedAt: Number(row.updated_at)
+  };
+}
+
 export class LifePlanningResultConflictError extends Error {
   constructor(message = 'life planning authoritative result conflict') {
     super(message);
@@ -382,7 +527,13 @@ export class YuqiStore {
     this.db = new DatabaseSync(filename);
     this.closed = false;
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (error) {
+      this.closed = true;
+      try { this.db.close(); } catch {}
+      throw error;
+    }
   }
 
   open() {
@@ -397,7 +548,18 @@ export class YuqiStore {
   }
 
   migrate() {
-    this.db.exec(`
+    const initialVersion = this.userVersion();
+    if (initialVersion > 10) {
+      throw new Error(`unsupported database user_version ${initialVersion}`);
+    }
+    if (initialVersion === 10) {
+      this.assertAgencyV10Invariants();
+      return;
+    }
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      if (initialVersion < 9) {
+        this.db.exec(`
       CREATE TABLE IF NOT EXISTS turns (
         turn_id TEXT PRIMARY KEY,
         character_id TEXT NOT NULL,
@@ -927,7 +1089,620 @@ export class YuqiStore {
           'PROACTIVE_CHAT', 'PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'
         );
     `);
-    this.db.exec('PRAGMA user_version = 9;');
+        this.db.exec('PRAGMA user_version = 9;');
+      }
+      this.migrateAgencyV10Internal();
+      this.assertAgencyV10Invariants({ allowVersionNine: true });
+      this.db.exec('PRAGMA user_version = 10;');
+      this.db.exec('COMMIT');
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
+  }
+
+  userVersion() {
+    return Number(this.db.prepare('PRAGMA user_version').get()?.user_version || 0);
+  }
+
+  addColumnIfMissing(table, column, definition) {
+    const columns = new Set(this.db.prepare(`PRAGMA table_info("${table}")`).all().map(row => row.name));
+    if (!columns.has(column)) {
+      this.db.exec(`ALTER TABLE "${table}" ADD COLUMN "${column}" ${definition};`);
+    }
+  }
+
+  migrateAgencyV10Internal() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS pipeline_releases (
+        release_id TEXT PRIMARY KEY,
+        pipeline_version TEXT NOT NULL,
+        preset_version TEXT NOT NULL,
+        cognition_schema_version INTEGER NOT NULL,
+        expression_schema_version INTEGER NOT NULL,
+        evaluator_version TEXT NOT NULL,
+        model_profile_json TEXT NOT NULL,
+        component_manifest_json TEXT NOT NULL,
+        release_checksum TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        retired_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS constraint_records (
+        constraint_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        role_id TEXT NOT NULL,
+        authority TEXT NOT NULL CHECK(authority IN ('system','author','user')),
+        kind TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        scope_json TEXT NOT NULL,
+        rule_text TEXT NOT NULL,
+        source_message_ids_json TEXT NOT NULL,
+        source_config_ref TEXT,
+        release_condition TEXT,
+        status TEXT NOT NULL CHECK(status IN ('active','released','archived')),
+        supersedes TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(constraint_id, revision)
+      );
+      CREATE INDEX IF NOT EXISTS idx_constraint_records_role_status
+        ON constraint_records(role_id, status, constraint_id, revision);
+
+      CREATE TABLE IF NOT EXISTS stance_records (
+        stance_id TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        role_id TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        position_text TEXT NOT NULL,
+        reason_text TEXT NOT NULL,
+        strength REAL NOT NULL,
+        flexibility REAL NOT NULL,
+        source_turn_id TEXT NOT NULL,
+        source_message_ids_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_confirmed_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        remaining_relevant_user_batches INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active','expired','superseded')),
+        supersedes TEXT,
+        PRIMARY KEY(stance_id, revision)
+      );
+      CREATE INDEX IF NOT EXISTS idx_stance_records_role_status
+        ON stance_records(role_id, status, stance_id, revision);
+
+      CREATE TABLE IF NOT EXISTS interaction_lanes (
+        role_id TEXT NOT NULL,
+        lane_key TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        generating_turn_id TEXT,
+        latest_user_batch_id TEXT,
+        latest_authoritative_group_id TEXT,
+        native_completed_group_id TEXT,
+        native_completed_sequence INTEGER NOT NULL DEFAULT 0,
+        ui_applied_group_id TEXT,
+        ui_applied_sequence INTEGER NOT NULL DEFAULT 0,
+        local_sequence INTEGER NOT NULL DEFAULT 0,
+        last_commit_checksum TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(role_id, lane_key)
+      );
+
+      CREATE TABLE IF NOT EXISTS quality_eval_runs (
+        eval_run_id TEXT PRIMARY KEY,
+        release_id TEXT NOT NULL,
+        baseline_release_id TEXT NOT NULL,
+        suite_version TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        manifest_checksum TEXT NOT NULL,
+        summary_json TEXT NOT NULL,
+        artifact_path TEXT NOT NULL,
+        artifact_checksum TEXT,
+        created_at INTEGER NOT NULL,
+        completed_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS quality_findings (
+        finding_id TEXT PRIMARY KEY,
+        eval_run_id TEXT NOT NULL,
+        rollout_key TEXT NOT NULL,
+        scene_id TEXT NOT NULL,
+        repeat_index INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        scores_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS state_migration_audit (
+        audit_id TEXT PRIMARY KEY,
+        role_id TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        classification TEXT NOT NULL,
+        target_id TEXT,
+        reason_code TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(role_id, source_type, source_id)
+      );
+    `);
+
+    for (const [column, definition] of Object.entries({
+      stable_release_id: 'TEXT',
+      candidate_release_id: 'TEXT',
+      candidate_phase: 'TEXT'
+    })) {
+      this.addColumnIfMissing('cognition_kind_rollouts', column, definition);
+    }
+    const pinColumns = {
+      authoritative_release_id: 'TEXT',
+      comparison_release_id: 'TEXT',
+      authoritative_pipeline_checksum: 'TEXT',
+      comparison_pipeline_checksum: 'TEXT',
+      lane_key: 'TEXT',
+      lane_revision: 'INTEGER',
+      input_visibility_sequence: 'INTEGER',
+      generation_fingerprint: 'TEXT'
+    };
+    for (const table of ['turns', 'cognition_life_planning_attempts']) {
+      for (const [column, definition] of Object.entries(pinColumns)) {
+        this.addColumnIfMissing(table, column, definition);
+      }
+    }
+
+    this.putPipelineReleaseInternal(BASELINE_STABLE_RELEASE);
+    this.putPipelineReleaseInternal(BASELINE_V2_CANDIDATE_RELEASE);
+    this.db.prepare(`
+      UPDATE cognition_kind_rollouts
+      SET stable_release_id = COALESCE(stable_release_id, ?),
+          candidate_release_id = COALESCE(candidate_release_id, ?),
+          candidate_phase = COALESCE(candidate_phase, 'baseline')
+    `).run(
+      BASELINE_STABLE_RELEASE.releaseId,
+      BASELINE_V2_CANDIDATE_RELEASE.releaseId
+    );
+  }
+
+  assertAgencyV10Invariants({ allowVersionNine = false } = {}) {
+    const version = this.userVersion();
+    if ((!allowVersionNine && version !== 10) || (allowVersionNine && version !== 9)) {
+      throw new Error(`v10 invariant user_version mismatch: ${version}`);
+    }
+    const requiredTables = [
+      'pipeline_releases',
+      'constraint_records',
+      'stance_records',
+      'interaction_lanes',
+      'quality_eval_runs',
+      'quality_findings',
+      'state_migration_audit'
+    ];
+    const existing = new Set(this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).all().map(row => row.name));
+    const missing = requiredTables.filter(name => !existing.has(name));
+    if (missing.length) throw new Error(`v10 invariant missing tables: ${missing.join(',')}`);
+    const releaseCount = Number(this.db.prepare(
+      'SELECT COUNT(*) AS value FROM pipeline_releases'
+    ).get().value);
+    if (releaseCount < 2) throw new Error('v10 invariant requires stable and candidate releases');
+    const invalidRollout = this.db.prepare(`
+      SELECT rollout_key FROM cognition_kind_rollouts
+      WHERE stable_release_id IS NULL OR candidate_release_id IS NULL OR candidate_phase IS NULL
+         OR stable_release_id NOT IN (SELECT release_id FROM pipeline_releases)
+         OR candidate_release_id NOT IN (SELECT release_id FROM pipeline_releases)
+      LIMIT 1
+    `).get();
+    if (invalidRollout) {
+      throw new Error(`v10 invariant rollout release authority is invalid: ${invalidRollout.rollout_key}`);
+    }
+  }
+
+  putPipelineReleaseInternal(release) {
+    const normalized = {
+      releaseId: String(release?.releaseId || ''),
+      pipelineVersion: String(release?.pipelineVersion || ''),
+      presetVersion: String(release?.presetVersion || ''),
+      cognitionSchemaVersion: Number(release?.cognitionSchemaVersion),
+      expressionSchemaVersion: Number(release?.expressionSchemaVersion),
+      evaluatorVersion: String(release?.evaluatorVersion || ''),
+      modelProfile: release?.modelProfile || {},
+      componentManifest: release?.componentManifest || {},
+      releaseChecksum: String(release?.releaseChecksum || ''),
+      createdAt: Number(release?.createdAt || now()),
+      retiredAt: release?.retiredAt ?? null
+    };
+    if (!normalized.releaseId
+      || !normalized.pipelineVersion
+      || !normalized.presetVersion
+      || !normalized.evaluatorVersion
+      || !/^[a-f0-9]{64}$/i.test(normalized.releaseChecksum)
+      || !Number.isInteger(normalized.cognitionSchemaVersion)
+      || !Number.isInteger(normalized.expressionSchemaVersion)) {
+      throw new Error('invalid pipeline release');
+    }
+    const existing = this.getPipelineRelease(normalized.releaseId);
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(normalized)) {
+        throw new Error('pipeline release identity conflict');
+      }
+      return existing;
+    }
+    this.db.prepare(`
+      INSERT INTO pipeline_releases(
+        release_id, pipeline_version, preset_version, cognition_schema_version,
+        expression_schema_version, evaluator_version, model_profile_json,
+        component_manifest_json, release_checksum, created_at, retired_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.releaseId,
+      normalized.pipelineVersion,
+      normalized.presetVersion,
+      normalized.cognitionSchemaVersion,
+      normalized.expressionSchemaVersion,
+      normalized.evaluatorVersion,
+      canonicalJson(normalized.modelProfile),
+      canonicalJson(normalized.componentManifest),
+      normalized.releaseChecksum,
+      normalized.createdAt,
+      normalized.retiredAt
+    );
+    return this.getPipelineRelease(normalized.releaseId);
+  }
+
+  getPipelineRelease(releaseId) {
+    return mapPipelineRelease(this.db.prepare(
+      'SELECT * FROM pipeline_releases WHERE release_id = ?'
+    ).get(String(releaseId || '')));
+  }
+
+  listPipelineReleases() {
+    return this.db.prepare(
+      'SELECT * FROM pipeline_releases ORDER BY created_at, release_id'
+    ).all().map(mapPipelineRelease);
+  }
+
+  putConstraintRevisionInternal(record) {
+    const normalized = {
+      constraintId: String(record?.constraintId || ''),
+      revision: Number(record?.revision),
+      roleId: String(record?.roleId || ''),
+      authority: String(record?.authority || ''),
+      kind: String(record?.kind || ''),
+      subject: String(record?.subject || ''),
+      scope: record?.scope || {},
+      rule: String(record?.rule || ''),
+      sourceMessageIds: Array.isArray(record?.sourceMessageIds) ? record.sourceMessageIds : [],
+      sourceConfigRef: record?.sourceConfigRef ?? null,
+      releaseCondition: record?.releaseCondition ?? null,
+      status: String(record?.status || ''),
+      supersedes: record?.supersedes ?? null,
+      createdAt: Number(record?.createdAt || now()),
+      updatedAt: Number(record?.updatedAt || record?.createdAt || now())
+    };
+    if (!normalized.constraintId || !normalized.roleId || !Number.isInteger(normalized.revision)) {
+      throw new Error('invalid constraint revision');
+    }
+    const existing = mapConstraintRecord(this.db.prepare(`
+      SELECT * FROM constraint_records WHERE constraint_id = ? AND revision = ?
+    `).get(normalized.constraintId, normalized.revision));
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(normalized)) {
+        throw new Error('constraint revision conflict');
+      }
+      return existing;
+    }
+    this.db.prepare(`
+      INSERT INTO constraint_records(
+        constraint_id, revision, role_id, authority, kind, subject, scope_json,
+        rule_text, source_message_ids_json, source_config_ref, release_condition,
+        status, supersedes, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.constraintId,
+      normalized.revision,
+      normalized.roleId,
+      normalized.authority,
+      normalized.kind,
+      normalized.subject,
+      canonicalJson(normalized.scope),
+      normalized.rule,
+      canonicalJson(normalized.sourceMessageIds),
+      normalized.sourceConfigRef,
+      normalized.releaseCondition,
+      normalized.status,
+      normalized.supersedes,
+      normalized.createdAt,
+      normalized.updatedAt
+    );
+    return mapConstraintRecord(this.db.prepare(`
+      SELECT * FROM constraint_records WHERE constraint_id = ? AND revision = ?
+    `).get(normalized.constraintId, normalized.revision));
+  }
+
+  listActiveConstraints(roleId) {
+    return this.db.prepare(`
+      SELECT records.* FROM constraint_records records
+      JOIN (
+        SELECT constraint_id, MAX(revision) AS revision
+        FROM constraint_records WHERE role_id = ? GROUP BY constraint_id
+      ) latest
+      ON latest.constraint_id = records.constraint_id AND latest.revision = records.revision
+      WHERE records.role_id = ? AND records.status = 'active'
+      ORDER BY records.updated_at DESC, records.constraint_id
+    `).all(String(roleId), String(roleId)).map(mapConstraintRecord);
+  }
+
+  putStanceRevisionInternal(record) {
+    const normalized = {
+      stanceId: String(record?.stanceId || ''),
+      revision: Number(record?.revision),
+      roleId: String(record?.roleId || ''),
+      topic: String(record?.topic || ''),
+      position: String(record?.position || ''),
+      reason: String(record?.reason || ''),
+      strength: Number(record?.strength),
+      flexibility: Number(record?.flexibility),
+      sourceTurnId: String(record?.sourceTurnId || ''),
+      sourceMessageIds: Array.isArray(record?.sourceMessageIds) ? record.sourceMessageIds : [],
+      createdAt: Number(record?.createdAt || now()),
+      lastConfirmedAt: Number(record?.lastConfirmedAt || record?.createdAt || now()),
+      expiresAt: record?.expiresAt ?? null,
+      remainingRelevantUserBatches: Number(record?.remainingRelevantUserBatches),
+      status: String(record?.status || ''),
+      supersedes: record?.supersedes ?? null
+    };
+    if (!normalized.stanceId || !normalized.roleId || !Number.isInteger(normalized.revision)) {
+      throw new Error('invalid stance revision');
+    }
+    const existing = mapStanceRecord(this.db.prepare(`
+      SELECT * FROM stance_records WHERE stance_id = ? AND revision = ?
+    `).get(normalized.stanceId, normalized.revision));
+    if (existing) {
+      if (canonicalJson(existing) !== canonicalJson(normalized)) {
+        throw new Error('stance revision conflict');
+      }
+      return existing;
+    }
+    this.db.prepare(`
+      INSERT INTO stance_records(
+        stance_id, revision, role_id, topic, position_text, reason_text,
+        strength, flexibility, source_turn_id, source_message_ids_json,
+        created_at, last_confirmed_at, expires_at, remaining_relevant_user_batches,
+        status, supersedes
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.stanceId,
+      normalized.revision,
+      normalized.roleId,
+      normalized.topic,
+      normalized.position,
+      normalized.reason,
+      normalized.strength,
+      normalized.flexibility,
+      normalized.sourceTurnId,
+      canonicalJson(normalized.sourceMessageIds),
+      normalized.createdAt,
+      normalized.lastConfirmedAt,
+      normalized.expiresAt,
+      normalized.remainingRelevantUserBatches,
+      normalized.status,
+      normalized.supersedes
+    );
+    return mapStanceRecord(this.db.prepare(`
+      SELECT * FROM stance_records WHERE stance_id = ? AND revision = ?
+    `).get(normalized.stanceId, normalized.revision));
+  }
+
+  listActiveStances(roleId, at = now()) {
+    return this.db.prepare(`
+      SELECT records.* FROM stance_records records
+      JOIN (
+        SELECT stance_id, MAX(revision) AS revision
+        FROM stance_records WHERE role_id = ? GROUP BY stance_id
+      ) latest
+      ON latest.stance_id = records.stance_id AND latest.revision = records.revision
+      WHERE records.role_id = ? AND records.status = 'active'
+        AND (records.expires_at IS NULL OR records.expires_at > ?)
+        AND records.remaining_relevant_user_batches > 0
+      ORDER BY records.last_confirmed_at DESC, records.stance_id
+    `).all(String(roleId), String(roleId), Number(at)).map(mapStanceRecord);
+  }
+
+  getInteractionLane(roleId, laneKey) {
+    return mapInteractionLane(this.db.prepare(`
+      SELECT * FROM interaction_lanes WHERE role_id = ? AND lane_key = ?
+    `).get(String(roleId), String(laneKey)));
+  }
+
+  claimInteractionLaneInternal(input) {
+    const roleId = String(input?.roleId || '');
+    const laneKey = String(input?.laneKey || '');
+    const expectedRevision = Number(input?.expectedRevision ?? 0);
+    if (!roleId || !laneKey || !Number.isInteger(expectedRevision) || expectedRevision < 0) {
+      throw new Error('invalid interaction lane claim');
+    }
+    const current = this.getInteractionLane(roleId, laneKey);
+    if (!current) {
+      if (expectedRevision !== 0) throw new Error('interaction lane revision conflict');
+      this.db.prepare(`
+        INSERT INTO interaction_lanes(
+          role_id, lane_key, revision, generating_turn_id, latest_user_batch_id,
+          latest_authoritative_group_id, native_completed_group_id,
+          native_completed_sequence, ui_applied_group_id, ui_applied_sequence,
+          local_sequence, last_commit_checksum, updated_at
+        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        roleId,
+        laneKey,
+        input.generatingTurnId ?? null,
+        input.latestUserBatchId ?? null,
+        input.latestAuthoritativeGroupId ?? null,
+        input.nativeCompletedGroupId ?? null,
+        Number(input.nativeCompletedSequence || 0),
+        input.uiAppliedGroupId ?? null,
+        Number(input.uiAppliedSequence || 0),
+        Number(input.localSequence || 0),
+        input.lastCommitChecksum ?? null,
+        Number(input.now || now())
+      );
+      return this.getInteractionLane(roleId, laneKey);
+    }
+    if (current.revision !== expectedRevision) throw new Error('interaction lane revision conflict');
+    const next = {
+      generatingTurnId: input.generatingTurnId ?? current.generatingTurnId,
+      latestUserBatchId: input.latestUserBatchId ?? current.latestUserBatchId,
+      latestAuthoritativeGroupId:
+        input.latestAuthoritativeGroupId ?? current.latestAuthoritativeGroupId,
+      nativeCompletedGroupId: input.nativeCompletedGroupId ?? current.nativeCompletedGroupId,
+      nativeCompletedSequence:
+        input.nativeCompletedSequence ?? current.nativeCompletedSequence,
+      uiAppliedGroupId: input.uiAppliedGroupId ?? current.uiAppliedGroupId,
+      uiAppliedSequence: input.uiAppliedSequence ?? current.uiAppliedSequence,
+      localSequence: input.localSequence ?? current.localSequence,
+      lastCommitChecksum: input.lastCommitChecksum ?? current.lastCommitChecksum,
+      updatedAt: Number(input.now || now())
+    };
+    const result = this.db.prepare(`
+      UPDATE interaction_lanes
+      SET revision = revision + 1, generating_turn_id = ?, latest_user_batch_id = ?,
+          latest_authoritative_group_id = ?, native_completed_group_id = ?,
+          native_completed_sequence = ?, ui_applied_group_id = ?, ui_applied_sequence = ?,
+          local_sequence = ?, last_commit_checksum = ?, updated_at = ?
+      WHERE role_id = ? AND lane_key = ? AND revision = ?
+    `).run(
+      next.generatingTurnId,
+      next.latestUserBatchId,
+      next.latestAuthoritativeGroupId,
+      next.nativeCompletedGroupId,
+      Number(next.nativeCompletedSequence),
+      next.uiAppliedGroupId,
+      Number(next.uiAppliedSequence),
+      Number(next.localSequence),
+      next.lastCommitChecksum,
+      next.updatedAt,
+      roleId,
+      laneKey,
+      expectedRevision
+    );
+    if (Number(result.changes) !== 1) throw new Error('interaction lane revision conflict');
+    return this.getInteractionLane(roleId, laneKey);
+  }
+
+  putQualityEvalRunInternal(run) {
+    const normalized = {
+      evalRunId: String(run?.evalRunId || ''),
+      releaseId: String(run?.releaseId || ''),
+      baselineReleaseId: String(run?.baselineReleaseId || ''),
+      suiteVersion: String(run?.suiteVersion || ''),
+      sourceType: String(run?.sourceType || ''),
+      state: String(run?.state || ''),
+      manifestChecksum: String(run?.manifestChecksum || ''),
+      summary: run?.summary || {},
+      artifactPath: String(run?.artifactPath || ''),
+      artifactChecksum: run?.artifactChecksum ?? null,
+      createdAt: Number(run?.createdAt || now()),
+      completedAt: run?.completedAt ?? null
+    };
+    if (!normalized.evalRunId || !normalized.releaseId || !normalized.baselineReleaseId) {
+      throw new Error('invalid quality evaluation run');
+    }
+    this.db.prepare(`
+      INSERT INTO quality_eval_runs(
+        eval_run_id, release_id, baseline_release_id, suite_version, source_type,
+        state, manifest_checksum, summary_json, artifact_path, artifact_checksum,
+        created_at, completed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.evalRunId,
+      normalized.releaseId,
+      normalized.baselineReleaseId,
+      normalized.suiteVersion,
+      normalized.sourceType,
+      normalized.state,
+      normalized.manifestChecksum,
+      canonicalJson(normalized.summary),
+      normalized.artifactPath,
+      normalized.artifactChecksum,
+      normalized.createdAt,
+      normalized.completedAt
+    );
+    return normalized;
+  }
+
+  putQualityFindingInternal(finding) {
+    const normalized = {
+      findingId: String(finding?.findingId || ''),
+      evalRunId: String(finding?.evalRunId || ''),
+      rolloutKey: String(finding?.rolloutKey || ''),
+      sceneId: String(finding?.sceneId || ''),
+      repeatIndex: Number(finding?.repeatIndex || 0),
+      code: String(finding?.code || ''),
+      owner: String(finding?.owner || ''),
+      severity: String(finding?.severity || ''),
+      evidence: finding?.evidence || {},
+      scores: finding?.scores || {},
+      createdAt: Number(finding?.createdAt || now())
+    };
+    if (!normalized.findingId || !normalized.evalRunId) throw new Error('invalid quality finding');
+    this.db.prepare(`
+      INSERT INTO quality_findings(
+        finding_id, eval_run_id, rollout_key, scene_id, repeat_index, code,
+        owner, severity, evidence_json, scores_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.findingId,
+      normalized.evalRunId,
+      normalized.rolloutKey,
+      normalized.sceneId,
+      normalized.repeatIndex,
+      normalized.code,
+      normalized.owner,
+      normalized.severity,
+      canonicalJson(normalized.evidence),
+      canonicalJson(normalized.scores),
+      normalized.createdAt
+    );
+    return normalized;
+  }
+
+  putStateMigrationAuditInternal(audit) {
+    const normalized = {
+      auditId: String(audit?.auditId || ''),
+      roleId: String(audit?.roleId || ''),
+      sourceType: String(audit?.sourceType || ''),
+      sourceId: String(audit?.sourceId || ''),
+      classification: String(audit?.classification || ''),
+      targetId: audit?.targetId ?? null,
+      reasonCode: String(audit?.reasonCode || ''),
+      evidence: audit?.evidence || {},
+      createdAt: Number(audit?.createdAt || now())
+    };
+    if (!normalized.auditId || !normalized.roleId || !normalized.sourceType
+      || !normalized.sourceId || !normalized.classification || !normalized.reasonCode) {
+      throw new Error('invalid state migration audit');
+    }
+    this.db.prepare(`
+      INSERT INTO state_migration_audit(
+        audit_id, role_id, source_type, source_id, classification, target_id,
+        reason_code, evidence_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.auditId,
+      normalized.roleId,
+      normalized.sourceType,
+      normalized.sourceId,
+      normalized.classification,
+      normalized.targetId,
+      normalized.reasonCode,
+      canonicalJson(normalized.evidence),
+      normalized.createdAt
+    );
+    return normalized;
   }
 
   transaction(run) {
@@ -1000,8 +1775,9 @@ export class YuqiStore {
         INSERT INTO cognition_kind_rollouts(
           rollout_key, current_mode, rollout_phase, revision, preset_version,
           pipeline_checksum, evidence_epoch, shadow_epoch, canary_epoch,
-          last_reason_code, created_at, updated_at
-        ) VALUES (?, ?, ?, 1, ?, ?, 1, 0, 0, 'bootstrap', ?, ?)
+          last_reason_code, created_at, updated_at, stable_release_id,
+          candidate_release_id, candidate_phase
+        ) VALUES (?, ?, ?, 1, ?, ?, 1, 0, 0, 'bootstrap', ?, ?, ?, ?, 'baseline')
       `);
       const history = this.db.prepare(`
         INSERT INTO cognition_promotion_history(
@@ -1017,7 +1793,9 @@ export class YuqiStore {
           row.presetVersion || '1.9.1',
           row.pipelineChecksum || '',
           Number(initializedAt),
-          Number(initializedAt)
+          Number(initializedAt),
+          BASELINE_STABLE_RELEASE.releaseId,
+          BASELINE_V2_CANDIDATE_RELEASE.releaseId
         );
         history.run(
           `promotion_bootstrap_${contentHash(row.rolloutKey).slice(0, 24)}`,
@@ -1182,6 +1960,27 @@ export class YuqiStore {
 
   createTurnWithRolloutInternal({ envelope, rolloutKey, presetVersion, annotationSnapshot }) {
     return this.submitTurn(envelope, { rolloutKey, presetVersion, annotationSnapshot });
+  }
+
+  createTurnWithReleasePinInternal({
+    envelope,
+    rolloutKey,
+    laneKey,
+    expectedLaneRevision,
+    inputVisibilitySequence = null,
+    generationFingerprint = null,
+    presetVersion,
+    annotationSnapshot
+  }) {
+    return this.submitTurn(envelope, {
+      rolloutKey,
+      laneKey,
+      laneRevision: Number(expectedLaneRevision ?? 0),
+      inputVisibilitySequence,
+      generationFingerprint,
+      presetVersion,
+      annotationSnapshot
+    });
   }
 
   refreshCognitionEvidenceInternal({ entries, reasonCode, now: refreshedAt = now() }) {
@@ -1433,6 +2232,14 @@ export class YuqiStore {
           'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
         ).get(String(pin.rolloutKey));
         if (!rollout) throw new Error(`cognition rollout is unavailable: ${pin.rolloutKey}`);
+        const stableRelease = this.getPipelineRelease(rollout.stable_release_id);
+        const candidateRelease = this.getPipelineRelease(rollout.candidate_release_id);
+        if (!stableRelease || !candidateRelease) {
+          throw new Error(`cognition rollout release authority is unavailable: ${pin.rolloutKey}`);
+        }
+        const candidateIsAuthoritative = rollout.current_mode === 'active';
+        const authoritativeRelease = candidateIsAuthoritative ? candidateRelease : stableRelease;
+        const comparisonRelease = candidateIsAuthoritative ? stableRelease : candidateRelease;
         effectivePin = {
           ...effectivePin,
           pipelineMode: rollout.current_mode,
@@ -1452,7 +2259,11 @@ export class YuqiStore {
           canarySlot: rollout.current_mode === 'active' && rollout.rollout_phase === 'canary'
             ? Number(rollout.canary_started_count) + 1
             : null,
-          presetVersion: rollout.preset_version
+          presetVersion: rollout.preset_version,
+          authoritativeReleaseId: authoritativeRelease.releaseId,
+          comparisonReleaseId: comparisonRelease.releaseId,
+          authoritativePipelineChecksum: authoritativeRelease.releaseChecksum,
+          comparisonPipelineChecksum: comparisonRelease.releaseChecksum
         };
       }
       if (envelope.message && !canonicalRetryMessage) {
@@ -1487,8 +2298,14 @@ export class YuqiStore {
           state, origin, envelope_json, envelope_checksum, created_at, updated_at,
           pipeline_mode, preset_version, annotation_snapshot_json,
           rollout_key, comparison_mode, rollout_revision, rollout_evidence_epoch,
-          pipeline_checksum, shadow_epoch, canary_epoch, canary_slot
-        ) VALUES (?, ?, ?, ?, ?, 'queued', 'codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          pipeline_checksum, shadow_epoch, canary_epoch, canary_slot,
+          authoritative_release_id, comparison_release_id,
+          authoritative_pipeline_checksum, comparison_pipeline_checksum,
+          lane_key, lane_revision, input_visibility_sequence, generation_fingerprint
+        ) VALUES (
+          ?, ?, ?, ?, ?, 'queued', 'codex', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?
+        )
       `).run(
         envelope.turnId,
         envelope.characterId,
@@ -1509,7 +2326,15 @@ export class YuqiStore {
         String(effectivePin.pipelineChecksum || ''),
         effectivePin.shadowEpoch ?? null,
         effectivePin.canaryEpoch ?? null,
-        effectivePin.canarySlot ?? null
+        effectivePin.canarySlot ?? null,
+        effectivePin.authoritativeReleaseId ?? null,
+        effectivePin.comparisonReleaseId ?? null,
+        effectivePin.authoritativePipelineChecksum ?? null,
+        effectivePin.comparisonPipelineChecksum ?? null,
+        effectivePin.laneKey ?? null,
+        effectivePin.laneRevision ?? null,
+        effectivePin.inputVisibilitySequence ?? null,
+        effectivePin.generationFingerprint ?? null
       );
       if (rollout && effectivePin.comparisonMode === 'cognition_compare') {
         const updated = this.db.prepare(`
@@ -2864,13 +3689,23 @@ export class YuqiStore {
     );
   }
 
-  putCognitiveStateInternal(state) {
+  putCognitiveStateInternal(roleIdOrState, maybeState = null) {
+    const state = typeof roleIdOrState === 'string'
+      ? { ...(maybeState || {}), roleId: roleIdOrState }
+      : roleIdOrState;
     const roleId = String(state?.roleId || '');
     const revision = Number(state?.revision);
     const schemaVersion = Number(state?.schemaVersion || 1);
     const lastTurnId = String(state?.lastTurnId || '');
     if (!roleId || !lastTurnId || !Number.isInteger(revision) || revision < 1) {
       throw new CognitiveStateConflictError('invalid cognitive state identity');
+    }
+    if (schemaVersion === 2) {
+      const expected = ['fastState', 'mediumState', 'slowState'];
+      const keys = Object.keys(state?.state || {}).sort();
+      if (canonicalJson(keys) !== canonicalJson(expected)) {
+        throw new CognitiveStateConflictError('cognitive state v2 time-scale shape is invalid');
+      }
     }
     const stateJson = canonicalJson(state?.state || {});
     const checksum = contentHash(state?.state || {});

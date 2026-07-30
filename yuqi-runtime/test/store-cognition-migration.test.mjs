@@ -88,7 +88,7 @@ test('opening a pre-cognition database twice pins old pending turns to legacy de
 
     const second = new YuqiStore(path);
     assert.equal(second.getTurn('turn_old').state, 'memory_done');
-    assert.equal(second.db.prepare('PRAGMA user_version').get().user_version, 9);
+    assert.equal(second.db.prepare('PRAGMA user_version').get().user_version, 10);
     second.close();
   } finally {
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
