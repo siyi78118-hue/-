@@ -780,9 +780,12 @@ test('a complete v13 redacted audit shell is restart-valid and non-deliverable',
       assert.equal(turn.rollout_key, fixture.expectedRolloutKey);
       assert.equal(JSON.parse(turn.envelope_json).kind, undefined);
       assert.equal(lineage.attempt_commitment, fixture.expectedAttemptCommitment);
-      assert.equal(store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+      const outcome = store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
         purpose: 'reopen'
-      }).status, 'redacted');
+      });
+      assert.equal(outcome.status, 'redacted');
+      assert.equal(outcome.terminalDisposition, 'visible');
+      assert.equal(outcome.group.itemCount, 1);
       assert.throws(
         () => store.visibleDeliveryPayload(fixture.groupId, 'phone'),
         /redacted/
@@ -827,6 +830,14 @@ test('a redacted cancelled lineage returns a terminal redacted outcome without r
         store.db.exec('ROLLBACK');
         throw error;
       }
+      store.db.prepare(`
+        UPDATE turns SET route_reasons_json = '["retained-secret"]'
+        WHERE authority_lineage_key = ?
+      `).run(fixture.lineageKey);
+      assert.throws(() => new YuqiStore(path), /redacted cancelled lineage conflict/);
+      store.db.prepare(`
+        UPDATE turns SET route_reasons_json = '[]' WHERE authority_lineage_key = ?
+      `).run(fixture.lineageKey);
       const outcome = store.readCanonicalCommitOutcomeInternal({
         lineageKey: fixture.lineageKey
       });
@@ -849,6 +860,22 @@ test('a redacted cancelled lineage returns a terminal redacted outcome without r
       });
       assert.equal(replay.status, 'redacted');
       assert.equal(replay.receipt, null);
+      const forgedOriginal = envelope(1);
+      forgedOriginal.message.content = 'forged changed content';
+      assert.throws(() => store.createCanonicalVisibleTurnInternal({
+        envelope: forgedOriginal,
+        rolloutKey: original.rolloutKey,
+        expectedRolloutRevision: original.rolloutRevision,
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode,
+        laneKey: original.laneKey,
+        expectedLaneRevision: Number(original.laneRevision) - 1,
+        inputUserBatchId: original.inputUserBatchId,
+        inputVisibilitySequence: original.inputVisibilitySequence,
+        agencySnapshotChecksum: original.agencySnapshotChecksum,
+        annotationSnapshot: original.annotationSnapshot
+      }), /canonical turn authority conflict|redacted replay authority conflict/);
       const retryEnvelope = envelope(1);
       retryEnvelope.turnId = 'turn_v13_redacted_retry';
       retryEnvelope.deviceSeq = 101;
@@ -874,6 +901,8 @@ test('a redacted cancelled lineage returns a terminal redacted outcome without r
       });
       assert.equal(retry.status, 'redacted');
       assert.equal(retry.receipt, null);
+      assert.throws(() => commitCanonical(store, original, 1),
+        /redacted.*cancelled|cancelled.*redacted|redacted lineage/i);
     } finally {
       store.close();
     }
@@ -910,9 +939,13 @@ test('redacted automatic skip preserves explicit empty item and action commitmen
       assert.equal(Number(group.item_count), 0);
       assert.equal(Number(group.action_count), 0);
       assert.match(group.tombstone_commitment, /^[a-f0-9]{64}$/);
-      assert.equal(store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+      const outcome = store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
         purpose: 'reopen'
-      }).status, 'redacted');
+      });
+      assert.equal(outcome.status, 'redacted');
+      assert.equal(outcome.terminalDisposition, 'skip');
+      assert.equal(outcome.group.itemCount, 0);
+      assert.equal(outcome.group.actionCount, 0);
     } finally {
       store.close();
     }
@@ -990,6 +1023,42 @@ test('redacted batch parent commitment rejects deleting its final retained item'
   assert.throws(() => new YuqiStore(path), /redacted authority input batch shell conflict/);
 }));
 
+test('redacted audit shell rejects deleting a retained character message projection', () =>
+  withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      const item = store.db.prepare(`
+        SELECT message_id FROM visible_result_items WHERE group_id = ? ORDER BY ordinal LIMIT 1
+      `).get(fixture.groupId);
+      store.db.prepare('DELETE FROM messages WHERE message_id = ?').run(item.message_id);
+      assert.throws(() => store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }), /redacted authority message shell conflict/);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /redacted authority message shell conflict/);
+  }));
+
+test('redacted audit shell rejects deleting a retained user batch message projection', () =>
+  withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      const item = store.db.prepare(`
+        SELECT message_id FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence LIMIT 1
+      `).get(fixture.turnId);
+      store.db.prepare('DELETE FROM messages WHERE message_id = ?').run(item.message_id);
+      assert.throws(() => store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }), /redacted authority message shell conflict/);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /redacted authority message shell conflict/);
+  }));
+
 test('redacted lineage permits clearing a nonempty annotation snapshot without changing its commitment',
   () => withTempPath(path => {
     const fixture = buildRedactedV13Fixture(path, {
@@ -1019,6 +1088,44 @@ test('live batch parent count is authority-checked at reopen', () => withTempPat
     store.close();
   }
 }));
+
+test('live canonical envelope tampering is rejected by scoped validation and reopen', () =>
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    let receipt;
+    try {
+      ensureDirectRollout(store);
+      receipt = commitCanonical(store, createCanonical(store, 94), 94);
+      const turn = store.getTurn(receipt.authoritativeTurnId);
+      const changed = JSON.parse(turn.envelopeJson);
+      changed.deviceSeq += 7;
+      store.db.prepare('UPDATE turns SET envelope_json = ? WHERE turn_id = ?')
+        .run(JSON.stringify(changed), turn.turnId);
+      assert.throws(() => store.assertVisibleGroupAuthorityInternal(receipt.visibleGroupId, {
+        purpose: 'reopen'
+      }), /turn input authority|envelope.*authority|envelope.*checksum/i);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /turn input authority|envelope.*authority|envelope.*checksum/i);
+  }));
+
+test('open canonical envelope tampering is rejected before any visible group exists', () =>
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const created = createCanonical(store, 95);
+      const turn = store.getTurn(created.turnId);
+      const changed = JSON.parse(turn.envelopeJson);
+      changed.deviceSeq += 3;
+      store.db.prepare('UPDATE turns SET envelope_json = ? WHERE turn_id = ?')
+        .run(JSON.stringify(changed), turn.turnId);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /turn input authority|envelope.*authority|envelope.*checksum/i);
+  }));
 
 test('live automatic skip survives a close and reopen', () => withTempPath(path => {
   const store = new YuqiStore(path);

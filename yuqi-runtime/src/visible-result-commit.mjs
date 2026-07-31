@@ -228,6 +228,9 @@ export function commitVisibleResult(input) {
     });
     if (existing) {
       const receipt = existing.receipt;
+      if (existing.status === 'redacted' && !receipt) {
+        throw new Error('canonical result lineage is redacted and cancelled');
+      }
       const canonicalPayload = receipt.commitPayloadVersion === 'pc-visible-commit-v1'
         ? canonicalCommitPayloadV1(input)
         : canonicalCommitPayload(input);
