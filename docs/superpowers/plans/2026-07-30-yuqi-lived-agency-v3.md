@@ -51,6 +51,8 @@
 - `yuqi-runtime/src/cognition-v3-adapters.mjs`: build one bounded `CognitionEnvelopeV3` per TurnKind.
 - `yuqi-runtime/src/interaction-lanes.mjs`: lane keys, priorities, generation fingerprints, and supersession decisions.
 - `yuqi-runtime/src/visible-result-commit.mjs`: one transaction boundary for authority revalidation and visible-result commit.
+- `yuqi-runtime/src/production-release-adapters.mjs`: the only production binding from the three immutable pipeline versions to their turn/life draft providers.
+- `yuqi-runtime/src/runtime-composition.mjs`: side-effect-free production object-graph factory; creates one complete `ReleaseExecutor` and injects that same instance before any listener/timer starts.
 - `yuqi-runtime/src/quality-evaluator.mjs`: deterministic findings, six-dimensional evaluation normalization, blind comparison, and gate aggregation.
 
 ### Existing PC runtime modules to evolve
@@ -177,8 +179,28 @@ comparisonContractForMode(comparisonMode) -> {
 
 // release-executor.mjs
 supportsPipelineVersion(pipelineVersion) -> boolean
-ReleaseExecutor.executeTurn({ releaseId, releaseChecksum, execution, dryRun }) -> TurnDraft
-ReleaseExecutor.executeLife({ releaseId, releaseChecksum, execution, dryRun }) -> LifeDraft
+ReleaseExecutor.adapterIds() -> { turn: AdapterId[], life: AdapterId[] }
+ReleaseExecutor.executeTurn({ releaseId, releaseChecksum, execution, dryRun }) -> {
+  adapterId, releaseId, releaseChecksum, draft: TurnDraft, dryRun, capabilities
+}
+ReleaseExecutor.executeLife({ releaseId, releaseChecksum, execution, dryRun }) -> {
+  adapterId, releaseId, releaseChecksum, draft: LifeDraft, dryRun, capabilities
+}
+
+// production-release-adapters.mjs
+createProductionReleaseAdapters({ orchestrator, cognitivePipeline }) -> {
+  turnAdapters: Map<AdapterId, TurnAdapter>,
+  lifeAdapters: Map<AdapterId, LifeAdapter>
+}
+
+// runtime-composition.mjs
+composeYuqiExecutionRuntime({
+  store, presets, codex, cognitivePipeline, promotionController,
+  contextLimit, generationContextLimit, roleProfiles
+}) -> {
+  releaseExecutor, orchestrator, turnDispatcher,
+  lifePlanningDispatcher, shadowDispatcher
+}
 
 // promotion-controller.mjs
 PromotionController.resolvePipelinePair(rollout) -> ReleasePair
@@ -4526,19 +4548,25 @@ plan owner independently reviews Task 10F and explicitly releases it.
 - Create: `yuqi-runtime/src/release-pair.mjs`
 - Create: `yuqi-runtime/src/comparison-contract.mjs`
 - Create: `yuqi-runtime/src/release-executor.mjs`
+- Create: `yuqi-runtime/src/production-release-adapters.mjs`
+- Create: `yuqi-runtime/src/runtime-composition.mjs`
 - Modify: `yuqi-runtime/src/promotion-controller.mjs`
 - Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/visible-result-commit.mjs`
+- Modify: `yuqi-runtime/src/cognitive-pipeline.mjs`
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Modify: `yuqi-runtime/src/turn-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/shadow-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/life-planning-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/reconcile.mjs`
 - Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
+- Modify: `yuqi-runtime/src/main.mjs`
 - Modify: `scripts/migrate-yuqi-agency-state.mjs`
 - Create: `yuqi-runtime/test/release-pair.test.mjs`
 - Create: `yuqi-runtime/test/comparison-contract.test.mjs`
 - Create: `yuqi-runtime/test/release-executor.test.mjs`
+- Create: `yuqi-runtime/test/production-release-adapters.test.mjs`
+- Create: `yuqi-runtime/test/runtime-composition.test.mjs`
 - Modify: `yuqi-runtime/test/promotion-controller.test.mjs`
 - Create: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Modify: `yuqi-runtime/test/store-cognition-migration.test.mjs`
@@ -4546,12 +4574,15 @@ plan owner independently reviews Task 10F and explicitly releases it.
 - Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
 - Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
 - Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
+- Modify: `yuqi-runtime/test/cognitive-pipeline.test.mjs`
+- Modify: `yuqi-runtime/test/cognitive-pipeline-v3.test.mjs`
 - Modify: `yuqi-runtime/test/orchestrator.test.mjs`
 - Modify: `yuqi-runtime/test/turn-dispatcher.test.mjs`
 - Modify: `yuqi-runtime/test/shadow-dispatcher.test.mjs`
 - Modify: `yuqi-runtime/test/life-planning-attempt.test.mjs`
 - Create: `yuqi-runtime/test/v3-runtime-recovery.test.mjs`
 - Modify: `tests/yuqi-agency-state-migration.test.mjs`
+- Modify: `tests/yuqi-deployment-contract.test.mjs`
 
 **Interfaces:**
 - Consumes: Tasks 2, 7, 9, 10, 10A, 10B, 10C, 10D, 10E, and 10F.
@@ -4567,7 +4598,11 @@ plan owner independently reviews Task 10F and explicitly releases it.
   v13 is retry-safe canary-slot ownership indexes; v13 visible/redaction
   semantics remain unchanged. Produces one pure fresh-comparison contract that
   distinguishes the persisted compatibility mode, release-aware direction, and
-  job type without allowing any caller to equate the three namespaces.
+  job type without allowing any caller to equate the three namespaces. Produces
+  one side-effect-free production composition factory that constructs exactly
+  one complete release executor per PC process and injects the same object into
+  authoritative turn execution, life execution, and background comparison
+  before the runtime becomes reachable.
 
 Task 11, not Task 23, owns the read-only release-pair contract needed to create
 work. Task 23 owns candidate registration, phase mutation, promotion commands,
@@ -4722,6 +4757,101 @@ test('one release executor owns authoritative and dry-run adapter selection', as
     releaseId: 'unknown-pipeline-release', releaseChecksum: SHA_UNKNOWN,
     execution: directExecution(), dryRun: false
   }), /release executor unavailable/);
+});
+
+test('production adapters bind each release flavor to one explicit draft provider', async () => {
+  const calls = [];
+  const EXECUTION_ARGS = Object.freeze({
+    release: { releaseId: 'release-fixture', presetVersion: '2.1.0' },
+    execution: { subjectId: 'subject-fixture' },
+    dryRun: true,
+    capabilities: Object.freeze({ visibleCommit: false, action: false, state: false })
+  });
+  const orchestrator = {
+    executeLegacyReleaseTurnDraft: input => calls.push(['legacy-turn', input]),
+    executeLegacyLifeReleaseDraft: input => calls.push(['legacy-life', input]),
+    executeCognitionV2LifeReleaseDraft: input => calls.push(['v2-life', input]),
+    executeCognitionV3LifeReleaseDraft: input => calls.push(['v3-life', input])
+  };
+  const cognitivePipeline = {
+    runV2ReleaseDraft: input => calls.push(['v2-turn', input]),
+    runV3ReleaseDraft: input => calls.push(['v3-turn', input])
+  };
+  const adapters = createProductionReleaseAdapters({ orchestrator, cognitivePipeline });
+  assert.deepEqual([...adapters.turnAdapters.keys()], [
+    'legacy-v1', 'cognition-v2', 'cognition-v3'
+  ]);
+  assert.deepEqual([...adapters.lifeAdapters.keys()], [
+    'legacy-v1', 'cognition-v2', 'cognition-v3'
+  ]);
+  await adapters.turnAdapters.get('legacy-v1').executeTurn(EXECUTION_ARGS);
+  await adapters.turnAdapters.get('cognition-v2').executeTurn(EXECUTION_ARGS);
+  await adapters.turnAdapters.get('cognition-v3').executeTurn(EXECUTION_ARGS);
+  await adapters.lifeAdapters.get('legacy-v1').executeLife(EXECUTION_ARGS);
+  await adapters.lifeAdapters.get('cognition-v2').executeLife(EXECUTION_ARGS);
+  await adapters.lifeAdapters.get('cognition-v3').executeLife(EXECUTION_ARGS);
+  assert.deepEqual(calls.map(([provider]) => provider), [
+    'legacy-turn', 'v2-turn', 'v3-turn',
+    'legacy-life', 'v2-life', 'v3-life'
+  ]);
+});
+
+test('production composition injects one complete release executor before exposure', () => {
+  const runtime = composeYuqiExecutionRuntime(runtimeFixture());
+  assert.strictEqual(runtime.orchestrator.releaseExecutor, runtime.releaseExecutor);
+  assert.strictEqual(runtime.lifePlanningDispatcher.releaseExecutor,
+    runtime.releaseExecutor);
+  assert.strictEqual(runtime.shadowDispatcher.releaseExecutor,
+    runtime.releaseExecutor);
+  assert.deepEqual(runtime.releaseExecutor.adapterIds(), {
+    turn: ['legacy-v1', 'cognition-v2', 'cognition-v3'],
+    life: ['legacy-v1', 'cognition-v2', 'cognition-v3']
+  });
+  assert.equal(runtime.orchestrator.releaseExecutorAttached, true);
+  assert.throws(
+    () => runtime.orchestrator.attachReleaseExecutor(new FakeReleaseExecutor()),
+    /release executor already attached/
+  );
+});
+
+test('release executor refuses an incomplete production adapter set at construction', () => {
+  const complete = completeAdapterFixture();
+  complete.turnAdapters.delete('legacy-v1');
+  assert.throws(() => new ReleaseExecutor({
+    store: complete.store,
+    turnAdapters: complete.turnAdapters,
+    lifeAdapters: complete.lifeAdapters
+  }), /complete production release adapter set/);
+});
+
+test('all six release adapters return drafts and dry-run performs zero domain writes', async () => {
+  for (const adapterId of ['legacy-v1', 'cognition-v2', 'cognition-v3']) {
+    const fixture = productionAdapterFixture({ adapterId });
+    const turn = await fixture.releaseExecutor.executeTurn({
+      releaseId: fixture.releaseId,
+      releaseChecksum: fixture.releaseChecksum,
+      execution: fixture.turnExecution,
+      dryRun: true
+    });
+    const life = await fixture.releaseExecutor.executeLife({
+      releaseId: fixture.releaseId,
+      releaseChecksum: fixture.releaseChecksum,
+      execution: fixture.lifeExecution,
+      dryRun: true
+    });
+    assert.ok(turn.draft);
+    assert.ok(life.draft);
+    assert.deepEqual(fixture.domainWrites(), []);
+  }
+});
+
+test('main delegates the reachable runtime graph to the tested composition factory', () => {
+  const source = readFileSync('yuqi-runtime/src/main.mjs', 'utf8');
+  assert.match(source, /composeYuqiExecutionRuntime/);
+  assert.equal((source.match(/composeYuqiExecutionRuntime\s*\(/g) || []).length, 1);
+  assert.doesNotMatch(source, /new ReleaseExecutor\s*\(/);
+  assert.doesNotMatch(source, /new ShadowDispatcher\s*\(/);
+  assert.doesNotMatch(source, /new LifePlanningDispatcher\s*\(/);
 });
 
 test('canonical canary reserves comparison slots only for the first ten subjects', () => {
@@ -5044,7 +5174,7 @@ v13 invariant assertions.
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
+node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/production-release-adapters.test.mjs yuqi-runtime/test/runtime-composition.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/cognitive-pipeline.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs tests/yuqi-deployment-contract.test.mjs
 npm.cmd test
 ```
 
@@ -5052,7 +5182,10 @@ Expected: FAIL because the shared release resolver does not exist, the store sti
 duplicates phase selection and allocates a comparison to every canary turn, life
 attempt creation does not persist release IDs/checksums, v14 retry-safe slot
 ownership does not exist, outstanding accounting omits life/retry lineage
-semantics, and release IDs/lanes are not wired into runtime execution.
+semantics, release IDs/lanes are not wired into runtime execution, the
+production `main.mjs` graph has no release executor, the six production adapter
+sources are not bound, and v2/v3 shadow execution still reuses a checkpoint-
+writing foreground path.
 
 - [ ] **Step 3: Route every fresh subject through the authoritative release pair**
 
@@ -5217,6 +5350,118 @@ visible/action/state/fact/memory/outbox/notification write disabled. The
 authoritative orchestrator and `ShadowDispatcher` call this same registry; no
 dispatcher branches directly on `current_mode`, release ID prefixes, or
 `comparisonPipeline`.
+
+Each provider returns only its normalized draft body. `ReleaseExecutor` wraps
+it as `{ adapterId, releaseId, releaseChecksum, draft, dryRun, capabilities }`;
+the provider cannot self-report a different adapter/release identity.
+`LifePlanningDispatcher` passes only `result.draft` to the authoritative life
+result validator/commit transaction.
+
+The constructor is production-strict: before it can be returned, it verifies
+that both maps contain exactly `legacy-v1`, `cognition-v2`, and `cognition-v3`,
+that every turn entry exposes `executeTurn`, and every life entry exposes
+`executeLife`. Missing, extra, or duplicate adapters fail with
+`complete production release adapter set is required`; a runtime must not start
+with a lazy "fail when first selected" hole. `adapterIds()` returns the two
+sorted exact lists for composition diagnostics/tests, not mutable adapter
+objects.
+
+Create `production-release-adapters.mjs`. It owns construction of the six
+production adapters, while `release-executor.mjs` remains the sole
+`pipelineVersion → adapterId` registry. The sources are fixed:
+
+| Adapter | Turn draft provider | Life draft provider |
+|---|---|---|
+| `legacy-v1` | `orchestrator.executeLegacyReleaseTurnDraft()` factored from the existing memory→brain→supervisor behavior | `orchestrator.executeLegacyLifeReleaseDraft()` factored from the existing `plan_yuqi_life` behavior |
+| `cognition-v2` | `cognitivePipeline.runV2ReleaseDraft()` using the pinned v2 preset/schema | `orchestrator.executeCognitionV2LifeReleaseDraft()` using the pinned v2 release |
+| `cognition-v3` | `cognitivePipeline.runV3ReleaseDraft()` using the Task 3–8 v3 envelope/contract/supervisor | `orchestrator.executeCognitionV3LifeReleaseDraft()` using the v3 life adapter and pinned release |
+
+Every provider receives exactly `{ release, execution, dryRun, capabilities }`
+and returns a normalized draft; it may not commit a visible group, message,
+action, state patch, fact, memory job, outbox row or notification. The legacy
+turn provider may reuse/refactor existing request builders and validation, but
+must stop before `commitApproved()` and must not call the version-0
+`advanceTurn()`/delivery path for a canonical turn. Version-0 recovery continues
+to call the old compatibility path directly and is not smuggled through a fake
+release row.
+
+`CognitivePipeline.runForeground()` remains the version-0 compatibility wrapper.
+Task 11 adds `runV2ReleaseDraft()` and `runV3ReleaseDraft()` with an explicit
+`dryRun/capabilities` input. Authoritative execution may persist only the
+canonical attempt checkpoints allowed by the canonical turn writer; dry-run
+must not call `persistCognitionCheckpoint`, `saveCognitionCheckpointInternal`,
+legacy `advanceTurn`, cognitive-state/fact/memory writers, or any output writer.
+Do not implement dry-run as `runShadow() → runForeground()` against the live
+store. The focused cognitive-pipeline tests use throwing write spies for both v2
+and v3 and prove that model calls still occur while domain writes remain zero.
+
+Create side-effect-free `runtime-composition.mjs` and keep `main.mjs` as config,
+I/O and lifecycle only. One PC process owns exactly one `ReleaseExecutor`
+instance. Because the legacy providers are methods on the orchestrator, use a
+closed, one-time attachment sequence rather than constructing incomplete
+consumer-local executors:
+
+```js
+export function composeYuqiExecutionRuntime(input) {
+  const orchestrator = new YuqiOrchestrator({
+    ...input,
+    releaseExecutor: null
+  });
+  const { turnAdapters, lifeAdapters } = createProductionReleaseAdapters({
+    orchestrator,
+    cognitivePipeline: input.cognitivePipeline
+  });
+  const releaseExecutor = new ReleaseExecutor({
+    store: input.store,
+    turnAdapters,
+    lifeAdapters
+  });
+  orchestrator.attachReleaseExecutor(releaseExecutor);
+  const turnDispatcher = new TurnDispatcher({
+    store: input.store,
+    orchestrator
+  });
+  const lifePlanningDispatcher = new LifePlanningDispatcher({
+    store: input.store,
+    promotionController: input.promotionController,
+    releaseExecutor,
+    buildExecution: attempt => orchestrator.buildLifePlanningReleaseExecution(attempt)
+  });
+  orchestrator.setLifePlanningDispatcher(lifePlanningDispatcher);
+  const shadowDispatcher = new ShadowDispatcher({
+    store: input.store,
+    releaseExecutor,
+    promotionController: input.promotionController,
+    legacyVersionZeroComparisonExecutor:
+      execution => input.cognitivePipeline.runShadow(execution),
+    foregroundActivity: { isBusy: () => turnDispatcher.inflight.size > 0 }
+  });
+  return Object.freeze({
+    releaseExecutor,
+    orchestrator,
+    turnDispatcher,
+    lifePlanningDispatcher,
+    shadowDispatcher
+  });
+}
+```
+
+`attachReleaseExecutor()` accepts one complete executor exactly once and exposes
+`releaseExecutorAttached=true`; a second attachment fails. Canonical
+`accept/process/run`, life release execution, and v1 comparison fail closed if
+attachment is absent. The factory performs the attachment before it returns,
+and `main.mjs` must call the factory exactly once before constructing the local
+server, cloud pump, timers, or invoking any `recover/start`. Main must not call
+`new ReleaseExecutor`, `new ShadowDispatcher`, or `new LifePlanningDispatcher`
+itself.
+
+`LifePlanningDispatcher` receives that same instance and calls
+`executeLife()` with the attempt's persisted authoritative release/checksum;
+`ShadowDispatcher` receives the same instance and calls it with `dryRun=true`
+for every version-1 job. Its separately named
+`legacyVersionZeroComparisonExecutor` exists only for an already-persisted
+version-0 job after explicit authority-version classification. It cannot be
+selected for fresh work. No consumer constructs or owns another executor.
 
 `PromotionController.resolvePipelinePair(rollout)` delegates directly to this
 function. It must not copy the switch. Add
@@ -5648,13 +5893,17 @@ invariant failure and never regenerated or silently downgraded.
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
+node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/production-release-adapters.test.mjs yuqi-runtime/test/runtime-composition.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/cognitive-pipeline.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs tests/yuqi-deployment-contract.test.mjs
 ```
 
 Expected: PASS; the resolver/store/controller direction tests agree at canary
 slots 9/10/11; life attempts persist release IDs/checksums across restart;
 fresh canonical commits keep compatibility mode, release-aware direction and
 job type distinct and reject every cross-pair with zero writes;
+the production composition exposes one complete executor instance shared by
+orchestrator/life/shadow, all six adapter providers are present, v2/v3/legacy
+dry-run write-spy totals remain zero, and `main.mjs` cannot bypass the tested
+factory;
 graduated `active/stable/none` remains active on its new stable release;
 v13→v14 changes only slot indexes/user version and is fault-atomic; canonical
 retry and life subjects reconcile exactly with canary counters;
@@ -5667,7 +5916,7 @@ stable-visible behavior remain unchanged.
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add yuqi-runtime/src/release-pair.mjs yuqi-runtime/src/comparison-contract.mjs yuqi-runtime/src/release-executor.mjs yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/shadow-dispatcher.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/src/cloud-relay-pump.mjs scripts/migrate-yuqi-agency-state.mjs yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
+git add yuqi-runtime/src/release-pair.mjs yuqi-runtime/src/comparison-contract.mjs yuqi-runtime/src/release-executor.mjs yuqi-runtime/src/production-release-adapters.mjs yuqi-runtime/src/runtime-composition.mjs yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/cognitive-pipeline.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/shadow-dispatcher.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/src/main.mjs scripts/migrate-yuqi-agency-state.mjs yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/production-release-adapters.test.mjs yuqi-runtime/test/runtime-composition.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/cognitive-pipeline.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs tests/yuqi-deployment-contract.test.mjs
 git commit -m "feat: integrate v3 release execution and recovery"
 ```
 
