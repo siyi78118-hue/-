@@ -719,17 +719,28 @@ function buildRedactedV13Fixture(path, {
         redactedAt - 20, groupId, delivery.authority_commit_checksum
       );
     }
-    store.db.prepare(`
-      UPDATE cloud_deliveries
-      SET state = 'redacted', payload_json = NULL, checksum = NULL,
-          relay_message_id = NULL, redaction_requested_at = NULL,
-          redaction_acknowledged_at = ?
-      WHERE authority_group_id = ?
-    `).run(redactedAt, groupId);
     const frozenDeliveries = store.db.prepare(`
       SELECT peer_id, recovery_ack_seq, relay_message_id, authority_commit_checksum
       FROM cloud_deliveries WHERE authority_group_id = ? ORDER BY peer_id
     `).all(groupId);
+    store.db.prepare(`
+      UPDATE cloud_deliveries
+      SET state = CASE
+            WHEN relay_message_id IS NULL THEN 'redacted'
+            ELSE 'redaction_pending'
+          END,
+          payload_json = NULL,
+          checksum = NULL,
+          redaction_requested_at = CASE
+            WHEN relay_message_id IS NULL THEN NULL
+            ELSE ?
+          END,
+          redaction_acknowledged_at = CASE
+            WHEN relay_message_id IS NULL THEN ?
+            ELSE NULL
+          END
+      WHERE authority_group_id = ?
+    `).run(redactedAt, redactedAt, groupId);
     const deliveryCommitment = contentHash({
       version: 'authority-redaction-deliveries-v1',
       groupId,
@@ -858,6 +869,8 @@ function convertRedactedFixtureToCancelled(store, fixture) {
       .run(fixture.groupId);
     store.db.prepare('DELETE FROM visible_result_items WHERE group_id = ?')
       .run(fixture.groupId);
+    store.db.prepare('DELETE FROM messages WHERE authority_group_id = ?')
+      .run(fixture.groupId);
     store.db.prepare('DELETE FROM visible_commit_receipts WHERE lineage_key = ?')
       .run(fixture.lineageKey);
     store.db.prepare('DELETE FROM visible_result_groups WHERE group_id = ?')
@@ -922,6 +935,27 @@ test('redacted matrix fixture retains three bubbles, three attempts, two actions
       assert.equal(store.db.prepare(
         'SELECT COUNT(*) AS value FROM cloud_deliveries WHERE authority_group_id = ?'
       ).get(fixture.groupId).value, 2);
+      const deliveries = store.db.prepare(`
+        SELECT peer_id, state, relay_message_id, redaction_requested_at,
+               redaction_acknowledged_at
+        FROM cloud_deliveries WHERE authority_group_id = ? ORDER BY peer_id
+      `).all(fixture.groupId).map(row => ({ ...row }));
+      assert.deepEqual(deliveries, [
+        {
+          peer_id: 'phone',
+          state: 'redaction_pending',
+          relay_message_id: 'relay_phone_confirmed',
+          redaction_requested_at: fixture.redactedAt,
+          redaction_acknowledged_at: null
+        },
+        {
+          peer_id: 'tablet',
+          state: 'redaction_pending',
+          relay_message_id: 'relay_tablet_mailboxed',
+          redaction_requested_at: fixture.redactedAt,
+          redaction_acknowledged_at: null
+        }
+      ]);
       assert.equal(store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
         purpose: 'reopen'
       }).status, 'redacted');
@@ -1001,6 +1035,15 @@ for (const [name, mutate] of [
   ).run(fixture.groupId)],
   ['mailboxed delivery deletion', (store, fixture) => store.db.prepare(
     "DELETE FROM cloud_deliveries WHERE authority_group_id = ? AND peer_id = 'tablet'"
+  ).run(fixture.groupId)],
+  ['confirmed delivery relay identity change', (store, fixture) => store.db.prepare(
+    "UPDATE cloud_deliveries SET relay_message_id = 'relay_phone_changed' WHERE authority_group_id = ? AND peer_id = 'phone'"
+  ).run(fixture.groupId)],
+  ['mailboxed delivery relay identity change', (store, fixture) => store.db.prepare(
+    "UPDATE cloud_deliveries SET relay_message_id = 'relay_tablet_changed' WHERE authority_group_id = ? AND peer_id = 'tablet'"
+  ).run(fixture.groupId)],
+  ['pending delivery relay identity removal', (store, fixture) => store.db.prepare(
+    "UPDATE cloud_deliveries SET relay_message_id = NULL WHERE authority_group_id = ? AND peer_id = 'phone'"
   ).run(fixture.groupId)]
 ]) {
   test(`redacted matrix rejects ${name} in scoped validation and restart`, () =>
@@ -1021,6 +1064,8 @@ test('a redacted cancelled lineage returns a terminal redacted outcome without r
         store.db.prepare('DELETE FROM visible_result_actions WHERE group_id = ?')
           .run(fixture.groupId);
         store.db.prepare('DELETE FROM visible_result_items WHERE group_id = ?')
+          .run(fixture.groupId);
+        store.db.prepare('DELETE FROM messages WHERE authority_group_id = ?')
           .run(fixture.groupId);
         store.db.prepare('DELETE FROM visible_commit_receipts WHERE lineage_key = ?')
           .run(fixture.lineageKey);
@@ -1155,6 +1200,7 @@ test('cancelled redacted lineage rejects a restored session and a non-cancelled 
         store.db.prepare('DELETE FROM visible_result_manifests WHERE group_id = ?').run(fixture.groupId);
         store.db.prepare('DELETE FROM visible_result_actions WHERE group_id = ?').run(fixture.groupId);
         store.db.prepare('DELETE FROM visible_result_items WHERE group_id = ?').run(fixture.groupId);
+        store.db.prepare('DELETE FROM messages WHERE authority_group_id = ?').run(fixture.groupId);
         store.db.prepare('DELETE FROM visible_commit_receipts WHERE lineage_key = ?').run(fixture.lineageKey);
         store.db.prepare('DELETE FROM visible_result_groups WHERE group_id = ?').run(fixture.groupId);
         store.db.prepare(`UPDATE turns SET state = 'cancelled', generation_fingerprint = NULL
@@ -1196,6 +1242,38 @@ function assertCancelledRedactedReject(mutate) {
   });
 }
 
+function insertTurnLinkedMessage(store, fixture, {
+  messageId, content = '', authorityGroupId = null
+}) {
+  const turn = store.getTurn(fixture.turnId);
+  const normalized = {
+    messageId,
+    turnId: fixture.turnId,
+    characterId: turn.characterId,
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: turn.characterId,
+    content,
+    sentAt: 49_000,
+    origin: 'codex',
+    deviceId: null,
+    deviceSeq: null
+  };
+  store.db.prepare(`
+    INSERT INTO messages(
+      message_id, turn_id, character_id, speaker_id, speaker_type,
+      recipient_id, content, sent_at, origin, device_id, device_seq,
+      checksum, created_at, authority_group_id, group_ordinal
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    normalized.messageId, normalized.turnId, normalized.characterId,
+    normalized.speakerId, normalized.speakerType, normalized.recipientId,
+    normalized.content, normalized.sentAt, normalized.origin,
+    normalized.deviceId, normalized.deviceSeq, contentHash(normalized),
+    49_000, authorityGroupId
+  );
+}
+
 for (const [name, mutate] of [
   ['mismatched attempt redaction time', (store, fixture) => store.db.prepare(`
     UPDATE turns SET authority_redacted_at = authority_redacted_at + 1
@@ -1222,7 +1300,23 @@ for (const [name, mutate] of [
   ['forged user character identity', (store) => store.db.prepare(`
     UPDATE messages SET character_id = 'other_role'
     WHERE message_id = 'msg_v13_batch_1_1'
-  `).run()]
+  `).run()],
+  ['extra plaintext turn-linked message', (store, fixture) =>
+    insertTurnLinkedMessage(store, fixture, {
+      messageId: 'msg_cancelled_extra_plaintext',
+      content: 'retained secret'
+    })],
+  ['extra empty turn-linked message', (store, fixture) =>
+    insertTurnLinkedMessage(store, fixture, {
+      messageId: 'msg_cancelled_extra_empty'
+    })],
+  ['foreign authority-group message', (store, fixture) => {
+    store.db.exec('PRAGMA foreign_keys = OFF');
+    insertTurnLinkedMessage(store, fixture, {
+      messageId: 'msg_cancelled_foreign_group',
+      authorityGroupId: 'group_foreign_authority'
+    });
+  }]
 ]) {
   test(`cancelled redacted lineage rejects ${name} in scoped outcome and restart`, () =>
     assertCancelledRedactedReject(mutate));
@@ -1304,6 +1398,77 @@ test('open canonical batch header tampering is rejected at restart', () => withT
     reopened.close();
   }, /turn input authority|batch.*authority/i);
 }));
+
+test('live canonical input rejects a tombstoned batch item in scoped and restart validation',
+  () => withTempPath(path => {
+    const store = new YuqiStore(path);
+    let turn;
+    try {
+      turn = createCanonicalFromEnvelope(store, threeBubbleEnvelope(96));
+      store.db.prepare(`
+        UPDATE current_user_batch_items
+        SET message_json = NULL, redacted_at = 60000
+        WHERE turn_id = ? AND sequence = 1
+      `).run(turn.turnId);
+      assert.throws(() => store.assertCanonicalTurnInputAuthorityInternal({
+        storedTurn: store.getTurn(turn.turnId),
+        incomingEnvelope: JSON.parse(turn.envelopeJson),
+        mode: 'live_reopen'
+      }), /canonical turn input authority conflict/);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /canonical turn input authority conflict/);
+  }));
+
+test('canonical input validation rejects an unknown authority mode', () => withTempPath(path => {
+  const store = new YuqiStore(path);
+  try {
+    const turn = createCanonicalFromEnvelope(store, threeBubbleEnvelope(97));
+    assert.throws(() => store.assertCanonicalTurnInputAuthorityInternal({
+      storedTurn: store.getTurn(turn.turnId),
+      incomingEnvelope: JSON.parse(turn.envelopeJson),
+      mode: 'unspecified'
+    }), /canonical turn input authority mode conflict/);
+  } finally {
+    store.close();
+  }
+}));
+
+test('canonical creation rolls back every authority write on a conflicting preexisting batch message',
+  () => withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureDirectRollout(store);
+      const input = threeBubbleEnvelope(98);
+      const conflicting = envelope(998);
+      conflicting.message.messageId = input.context.currentBatch.messages[1].messageId;
+      conflicting.message.content = '冲突的预写入正文';
+      store.submitTurn(conflicting);
+      const snapshot = () => ({
+        turns: Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value),
+        lineages: Number(store.db.prepare(
+          'SELECT COUNT(*) AS value FROM turn_authority_lineages'
+        ).get().value),
+        batches: Number(store.db.prepare(
+          'SELECT COUNT(*) AS value FROM current_user_batches'
+        ).get().value),
+        batchItems: Number(store.db.prepare(
+          'SELECT COUNT(*) AS value FROM current_user_batch_items'
+        ).get().value),
+        lanes: store.db.prepare(`
+          SELECT role_id, lane_key, revision, local_sequence, generating_turn_id
+          FROM interaction_lanes ORDER BY role_id, lane_key
+        `).all()
+      });
+      const before = snapshot();
+      assert.throws(() => createCanonicalFromEnvelope(store, input), /message checksum conflict/);
+      assert.deepEqual(snapshot(), before);
+      assert.equal(store.getTurn(input.turnId), null);
+    } finally {
+      store.close();
+    }
+  }));
 
 for (const [field, mutation] of [
   ['batch_id', "batch_id = batch_id || '_forged'"],

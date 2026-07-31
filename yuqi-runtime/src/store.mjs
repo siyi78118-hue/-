@@ -3008,6 +3008,9 @@ export class YuqiStore {
   assertCanonicalTurnInputAuthorityInternal({
     storedTurn: turn, incomingEnvelope: envelope, mode = 'live_reopen'
   }) {
+    if (!['live_reopen', 'redacted_replay'].includes(mode)) {
+      throw new Error('v13 invariant canonical turn input authority mode conflict');
+    }
     const requireEnvelopeChecksum = mode === 'live_reopen';
     if (requireEnvelopeChecksum
       && (contentHash(envelope) !== turn.envelopeChecksum
@@ -3054,12 +3057,18 @@ export class YuqiStore {
     for (let sequence = 0; sequence < items.length; sequence += 1) {
       const item = items[sequence];
       const message = normalized.messages[sequence];
+      const liveItemConflict = mode === 'live_reopen'
+        && (item.message_json === null || item.redacted_at !== null
+          || canonicalJson(parseJson(item.message_json, null)) !== canonicalJson(message));
+      const redactedItemConflict = mode === 'redacted_replay'
+        && (item.message_json !== null
+          || !Number.isSafeInteger(Number(turn.authorityRedactedAt))
+          || Number(item.redacted_at) !== Number(turn.authorityRedactedAt));
       if (!message || Number(item.sequence) !== sequence
         || item.batch_id !== batch.batch_id
         || item.message_id !== message.messageId
         || item.checksum !== contentHash(message)
-        || (item.message_json !== null
-          && canonicalJson(parseJson(item.message_json, null)) !== canonicalJson(message))) {
+        || liveItemConflict || redactedItemConflict) {
         throw new Error('v13 invariant canonical turn input authority conflict');
       }
     }
@@ -3122,6 +3131,7 @@ export class YuqiStore {
          ${groupId == null ? '' : 'OR authority_group_id = ?'}
     `).all(...turnIds, ...(groupId == null ? [] : [groupId]));
     const messageById = new Map(messages.map(message => [message.message_id, message]));
+    const expectedUserMessageIds = new Set(batchItems.map(item => item.message_id));
     for (const turn of attempts) {
       const batch = this.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?')
         .get(turn.turn_id);
@@ -3167,6 +3177,20 @@ export class YuqiStore {
           })}`);
         }
       });
+    }
+    const actualUserMessages = messages.filter(message =>
+      turnIds.includes(message.turn_id) && message.speaker_type === 'user');
+    const extraMessages = messages.filter(message =>
+      !expectedUserMessageIds.has(message.message_id));
+    if (messages.some(message => message.content !== '')
+      || actualUserMessages.length !== expectedUserMessageIds.size
+      || actualUserMessages.some(message => !expectedUserMessageIds.has(message.message_id))
+      || (cancelled && extraMessages.length !== 0)
+      || (!cancelled && extraMessages.some(message =>
+        message.speaker_type !== 'character'
+        || message.authority_group_id !== groupId
+        || !turnIds.includes(message.turn_id)))) {
+      throw new Error('redacted authority lineage message set conflict');
     }
     const messageIds = messages.map(message => message.message_id);
     const messageMarks = messageIds.map(() => '?').join(',') || "''";
