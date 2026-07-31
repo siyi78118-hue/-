@@ -610,8 +610,14 @@ PC 数据库新增 canonical 记录：
 
 group ID 和气泡/action ID 由当前合法 authority owner 按双方共享的版本化算法根据 lineage 与 ordinal 确定性生成，不接受模型输出、当前时间或临时随机 ID。PC `commitChecksum` 对规范化语义 payload 计算，包含 lineage、可见气泡、动作、状态 patch、记忆任务的 allowlisted 语义 descriptor、可选 compare release/direction/epoch descriptor、release、输入可见游标和生成时权威 checksum；Android fallback 使用另一个明确版本的规范 payload。两者都排除 attempt `turnId`，以及 job payload 内嵌的 turn/worker/job ID、due/created 时间、随机数和非语义日志。不同 retry attempt 产生完全相同的语义结果时 checksum 必须相同；真正的语义变化才改变 checksum。重复提交只有 origin、payload version 和 checksum 全部相同时才返回同一 receipt；同 lineage 的不同 payload 一律是 authority conflict。
 
-“没有气泡”不等于失败或没有 authority。store 必须从持久 turn kind 与规范 payload
-共同判定 terminal disposition：
+“没有气泡”不等于失败或没有 authority。canonical version-1 turn 的唯一持久
+kind anchor 固定复用现有 `turns.rollout_key`，逻辑名为 `turnKind`；不得新增一个
+会与它漂移的 `turn_kind` 列，也不得在 redaction 后从
+`envelope_json`、item/action remainder 或 reply projection 推断。创建事务必须由
+已验证 `envelope.kind` 推导 `rollout_key`；retry 必须继承相同值；v12→v13 source
+validation 必须在任何 commitment 回填前证明两者相等且属于下面九种
+canonical turn kind。清除聊天保留这个非敏感 anchor。store 使用该持久 anchor 与
+规范 payload 共同判定 terminal disposition：
 
 - `DIRECT_REPLY` 只能是 `visible`，必须至少有一个非空 item；
 - 任一 automatic kind 有 item 时是 `visible`，无 item但有 action 时是
@@ -813,9 +819,15 @@ plan/life attempt 不创建伪造空 batch，其 attempt commitment 把
 `turn_authority_lineages.attempt_count/attempt_commitment` 在 original 创建时从 1
 开始，每次合法 retry 与 `latest_turn_id/revision` 在同一 CAS 中追加更新，commit、
 cancel 和 redaction 不改变它。commitment 覆盖 original/retry 的有序 turn identity、
-持久 `turnKind`、原 envelope checksum 与各自 batch commitment，因此删除较早
-attempt、篡改决定 terminal disposition 的 kind、删除 batch parent 或整条 retry
-链的一部分都可检测。v12 source 在计算该 commitment 以前必须证明
+从 `turns.rollout_key` 读取并规范化的持久 `turnKind`、原 envelope checksum 与
+各自 batch commitment，因此删除较早 attempt、篡改决定 terminal disposition 的
+rollout/kind anchor、删除 batch parent 或整条 retry 链的一部分都可检测。v12
+source 在计算该 commitment 以前必须证明每条 canonical turn 的
+`rollout_key === normalized envelope.kind`，且 kind 属于
+`DIRECT_REPLY/PROACTIVE_CHAT/PROACTIVE_MOMENT/MOMENT_INTERACTION/MOMENT_REPLY/`
+`ROLE_PLAN_CHAT/ROLE_PLAN_MOMENT/ROLE_PLAN_CHAT_PRIVATE/`
+`ROLE_PLAN_MOMENT_PRIVATE`；`LIFE_PLANNING` 只存在于独立 life attempt authority。
+随后还必须证明
 `lineage_revision_at_creation` 从 1 连续到 N、`latest_turn_id` 等于第 N 条；
 open lineage revision 必须为 N，committed/cancelled 必须由 receipt/CAS 证明合法
 终态 revision，不能用当前剩余 row 数猜测历史。
@@ -935,7 +947,9 @@ lineage 没有这个返回资格。create original/retry 在完整 incoming enve
 5. 清空同 lineage 所有 turn 的 `memory_packet_json`、`brain_draft_json`、
    `supervisor_json`、`reply_json`、`error_json`、`route_reasons_json`，把
    `annotation_snapshot_json` 改成 `{}`，把 `envelope_json` 改成固定 tombstone 并写
-   `authority_redacted_at`；清空这些 turn 的 current-batch `message_json` 并写同一
+   `authority_redacted_at`；保留且禁止修改每个 canonical turn 的
+   `rollout_key`，因为它是重算 attempt commitment 与 terminal disposition 的唯一
+   非敏感 kind anchor；清空这些 turn 的 current-batch `message_json` 并写同一
    redaction 时间；清空对应 user/character message content；删除这些 turn/message
    的 annotation、diagnostic 和旧 `sync_log.payload_json` 副本，只追加
    `entity_type='authority_redaction'`、payload 仅含
@@ -950,7 +964,10 @@ lineage 没有这个返回资格。create original/retry 在完整 incoming enve
 
 redacted validator 必须同时证明：同 lineage 的所有 turn 工作字段为空、
 annotation snapshot 为 `{}`、route reasons 为空、
-`envelope_json={"redacted":true}` 且 `authority_redacted_at` 一致；batch item
+`envelope_json={"redacted":true}` 且 `authority_redacted_at` 一致；每个
+version-1 attempt 的 `rollout_key` 非空、属于 canonical turn-kind 闭集，并以它作为
+attempt commitment 中 `turnKind` 的唯一来源；redacted 路径不得调用
+`json_extract(envelope_json,'$.kind')`；batch item
 `message_json` 为空且 parent batch count/commitment、tombstone
 checksum/identity/顺序完整；lineage attempt count/commitment 与全部 original/retry
 turn/batch parent 完整；user/character message

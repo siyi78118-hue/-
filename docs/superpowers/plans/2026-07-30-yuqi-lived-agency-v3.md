@@ -3577,6 +3577,8 @@ repeats a whole-database invariant scan. Task 11 remains forbidden until Task
 - Produces: PC schema v13; nullable input-batch/item/action semantic tombstones
   with immutable IDs/checksums; parent-owned result/batch/lineage
   cardinality-and-identity commitments; redaction-time delivery-set commitment;
+  existing `turns.rollout_key` promoted to the sole persistent, non-sensitive
+  canonical turn-kind anchor;
   per-turn `authority_redacted_at`;
   per-turn `input_clear_epoch`; new PC commits use
   `pc-visible-commit-v2` while v1 receipts remain replayable;
@@ -3656,6 +3658,8 @@ test('fresh and populated v12 migrate atomically to exact v13 tombstone schema',
   }
   assert.equal(columns(store, 'turns').includes('authority_redacted_at'), true);
   assert.equal(columns(store, 'turns').includes('input_clear_epoch'), true);
+  assert.equal(columns(store, 'turns').includes('rollout_key'), true);
+  assert.equal(columns(store, 'turns').includes('turn_kind'), false);
   assert.equal(columns(store, 'turn_authority_lineages').includes('redacted_at'), true);
   assert.equal(columns(store, 'cloud_deliveries').includes('relay_message_id'), true);
   assert.equal(columns(store, 'cloud_deliveries').includes('redaction_requested_at'), true);
@@ -3700,7 +3704,10 @@ historical state patches is a required accepted source. Add multi-message
 original+two-retry fixtures and prove v12 source validation rejects a missing
 attempt, non-contiguous `lineage_revision_at_creation`, wrong latest turn,
 missing current-batch tail item, missing result tail item, and deleted action
-before any v13 commitment is calculated.
+before any v13 commitment is calculated. Also reject a canonical v12 turn whose
+`rollout_key` is null, outside the nine-kind closed set, or differs from its
+live normalized `envelope.kind`; all three failures must preserve the exact v12
+snapshot.
 
 - [ ] **Step 2: Run migration tests red**
 
@@ -3735,8 +3742,10 @@ visibleAuthorityV13InvariantSummary()
   current cognitive-state rule from Step 6;
 - reject any missing/corrupt group, receipt, manifest, item, action, message,
   job, stance, delivery, envelope, batch, retry pin, release, or lineage join.
-- require each persisted turn kind to equal its normalized live envelope kind
-  before that kind is admitted into the v13 attempt commitment;
+- require every version-1 turn's existing `rollout_key` to be non-null, belong
+  to the nine canonical turn-kind closed set, and equal its normalized live
+  `envelope.kind` before that value is admitted as `turnKind` into the v13
+  attempt commitment. `LIFE_PLANNING` is not a turn-group kind;
 - before deriving any v13 audit commitment, require each v12 lineage's attempts
   to have revisions `1..N` with no duplicate/gap, retry `i` to name attempt
   `i-1`, and `latest_turn_id` to name attempt N; require open revision `N`,
@@ -3762,6 +3771,54 @@ instead of normalizing it away. A delivery row must contain the
 `relayMessageId` member; explicit null is valid only for a waiting row that was
 never mailboxed and remains part of the committed delivery set.
 
+`authorityLineageAttemptsCommitment()` keeps the logical tuple member
+`turnKind`, but every store query must project it only as
+`t.rollout_key AS turn_kind`; the helper receives `row.turn_kind`. The v12 live
+source validator may read `envelope.kind` only to prove equality before
+backfill. No v13 redacted/reopen/receipt/delivery path may select
+`json_extract(t.envelope_json,'$.kind')`.
+
+Use one closed constant for this authority domain:
+
+```js
+const CANONICAL_RESULT_TURN_KINDS = new Set([
+  'DIRECT_REPLY',
+  'PROACTIVE_CHAT',
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY',
+  'ROLE_PLAN_CHAT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_CHAT_PRIVATE',
+  'ROLE_PLAN_MOMENT_PRIVATE'
+]);
+```
+
+The lineage-attempt row loader has one field-source contract, shared by
+migration, original/retry writes, scoped validation, redacted validation, and
+receipt replay:
+
+```sql
+SELECT
+  t.lineage_revision_at_creation,
+  t.turn_id,
+  t.rollout_key AS turn_kind,
+  t.retry_of_turn_id,
+  t.input_user_batch_id,
+  t.envelope_checksum,
+  b.tombstone_commitment AS batch_tombstone_commitment
+FROM turns t
+LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+WHERE t.authority_lineage_key = ?
+ORDER BY t.lineage_revision_at_creation, t.turn_id
+```
+
+If the physical store uses an equivalent parent join for the batch ID, the
+projection and aliases above remain mandatory. A missing batch parent projects
+explicit null; duplicate batch parents are an invariant failure, never a row
+deduplication. `LIFE_PLANNING` is intentionally absent from this constant and
+query path.
+
 `migrateVisibleAuthorityV13Internal()` must run in the existing outer
 `BEGIN IMMEDIATE`, create replacement current-batch-item/item/action tables with
 the exact v13 columns and CHECK constraints from the design, add
@@ -3779,6 +3836,9 @@ create the exact empty `conversation_clear_controls` authority table,
 compare source/destination counts, per-row logical checksums, and every derived
 parent commitment, replace the old
 tables, recreate indexes/foreign keys, and write `PRAGMA user_version=13` last.
+Do not add `turn_kind`: `turns.rollout_key` already exists before v13 and is
+copied unchanged. Backfill the lineage commitment from that validated column,
+not from JSON extraction after redaction.
 Add deterministic fault boundaries after create/alter, each table copy,
 each parent commitment backfill, count/checksum/commitment verification,
 old-table rename/drop, new-table rename, index
@@ -3882,7 +3942,8 @@ for (const corruption of [
   'change_batch_tombstone_commitment',
   'delete_original_attempt_from_retry_lineage',
   'delete_middle_retry_attempt',
-  'change_attempt_turn_kind',
+  'null_attempt_rollout_key',
+  'change_attempt_rollout_key',
   'change_lineage_attempt_count',
   'change_lineage_attempt_commitment'
 ]) {
@@ -3963,8 +4024,10 @@ historical `manifest.statePatch` to retain a current row.
 Before branching on live/redacted semantics, the scoped validator must:
 
 1. load all lineage attempts and require their count/ordered tuple hash to equal
-   `attempt_count/attempt_commitment`; the tuple includes persisted `turnKind`,
-   and the live branch also requires it to equal the normalized envelope kind;
+   `attempt_count/attempt_commitment`; the tuple's logical `turnKind` comes only
+   from persisted `turns.rollout_key`. The live branch additionally requires
+   `rollout_key === normalized envelope.kind`; the redacted branch never reads
+   kind from the tombstoned envelope;
 2. for every attempt with a batch, load its parent/items and require batch
    count/ordered tuple hash to equal `item_count/tombstone_commitment`; for an
    attempt without a batch, use explicit null in the lineage tuple. In the live
@@ -3972,8 +4035,8 @@ Before branching on live/redacted semantics, the scoped validator must:
    requires none;
 3. load group items/actions and require both counts plus their combined ordered
    tuple hash to equal the group parent fields;
-4. derive terminal disposition from the persisted turn kind and validated row
-   sets: `DIRECT_REPLY` requires at least one item; automatic kinds map
+4. derive terminal disposition from the persisted `turns.rollout_key` and
+   validated row sets: `DIRECT_REPLY` requires at least one item; automatic kinds map
    item>0 to `visible`, item=0/action>0 to `action_only`, and both zero to
    `skip`; `LIFE_PLANNING` is rejected because it has a separate result
    authority. A derived `skip` must have no evidence-memory/consolidation job
@@ -4107,12 +4170,14 @@ of the new parent commitments:
 - insert `current_user_batches.item_count/tombstone_commitment` in the same
   transaction as its items; trigger-driven turns create no synthetic empty
   batch and contribute explicit null to their lineage attempt tuple;
-- original creation inserts lineage `attempt_count=1` and the commitment over
-  attempt 1;
+- original creation first derives `turns.rollout_key` from the validated
+  envelope, rejects any caller mismatch, inserts it with the turn, then inserts
+  lineage `attempt_count=1` and the commitment over attempt 1 using that
+  persisted key as `turnKind`;
 - retry creation computes the complete previous+new ordered attempt set, then
   updates `latest_turn_id`, lineage `revision`, `attempt_count`, and
-  `attempt_commitment` in the existing one-row CAS; a stale CAS leaves no new
-  turn/batch;
+  `attempt_commitment` in the existing one-row CAS; retry must inherit the
+  parent `rollout_key`, and a stale CAS leaves no new turn/batch;
 - canonical terminal-result commit computes
   `item_count/action_count/tombstone_commitment` from the
   already normalized semantic result and inserts them with the group before any
@@ -4143,8 +4208,17 @@ Add:
 
 ```js
 test('a complete v13 redacted audit shell is restart-valid and non-deliverable', () => {
-  const { path, groupId } = buildRedactedV13Fixture();
+  const {
+    path, groupId, turnId, lineageKey,
+    expectedRolloutKey, expectedAttemptCommitment
+  } = buildRedactedV13Fixture();
   const store = new YuqiStore(path);
+  const turn = rows(store, 'turns').find(row => row.turn_id === turnId);
+  const lineage = rows(store, 'turn_authority_lineages')
+    .find(row => row.lineage_key === lineageKey);
+  assert.equal(turn.rollout_key, expectedRolloutKey);
+  assert.equal(JSON.parse(turn.envelope_json).kind, undefined);
+  assert.equal(lineage.attempt_commitment, expectedAttemptCommitment);
   assert.equal(store.assertVisibleGroupAuthorityInternal(groupId, {
     purpose: 'reopen'
   }).status, 'redacted');
@@ -4161,7 +4235,8 @@ for (const corruption of [
   'delete_redacted_batch_middle',
   'delete_redacted_original_attempt',
   'delete_redacted_retry_attempt',
-  'change_redacted_turn_kind',
+  'null_redacted_rollout_key',
+  'change_redacted_rollout_key',
   'delete_redaction_mailboxed_delivery',
   'delete_redaction_confirmed_delivery',
   'change_redaction_relay_message_id'
@@ -4281,6 +4356,11 @@ The redacted branch requires:
   `envelope_json={"redacted":true}`, null memory/draft/supervisor/reply/error
   working fields, empty route reasons, `{}` annotation snapshot, and retains
   only the original envelope checksum;
+- every version-1 attempt retains a non-null `turns.rollout_key` in
+  `CANONICAL_RESULT_TURN_KINDS`; the validator projects that column as
+  `turn_kind`, recomputes the lineage commitment from it, and derives terminal
+  disposition from it. Clearing must never null or rewrite `rollout_key`, and
+  this branch must not read kind from the tombstoned envelope;
 - lineage `attempt_count/attempt_commitment` exactly covers every original/retry
   turn in revision order and each attempt's retained batch commitment;
 - every current-batch item for those turns retains identity/order/checksum but
@@ -4383,7 +4463,9 @@ Then run and preserve exact output for these manual counterexamples:
    stance, current state, and lane leak is rejected;
 5. for both live and redacted fixtures, deleting a tail/middle/all child from
    item/action/batch, deleting original/retry attempts, or deleting
-   mailboxed/confirmed delivery rows is rejected; a legitimate automatic
+   mailboxed/confirmed delivery rows is rejected; nulling or changing any
+   canonical attempt's persisted `rollout_key` is rejected even though its
+   redacted envelope contains no kind; a legitimate automatic
    zero-item/zero-action skip and zero-delivery set reopens with explicit
    empty-set commitments, while the same empty result for `DIRECT_REPLY` is
    rejected without writes;
@@ -4633,7 +4715,7 @@ const agencyView = compileAgencyView({
 });
 const execution = await executePinnedRelease(turn, { agencyView });
 if (execution.draft.action === 'skip') {
-  if (!isAutomaticKind(turn.kind)) {
+  if (!isAutomaticKind(turn.rolloutKey)) {
     throw new Error('DIRECT_REPLY cannot commit an empty canonical result');
   }
   execution.visibleGroup = { items: [] };
@@ -5144,10 +5226,11 @@ response projection: an eligible new Task 11 execution may still be version 1
 internally and use one canonical group/outbox. Persisted pre-v11/version-0 turns
 continue to use the truly legacy authority and outbox path.
 
-`terminalDisposition` is computed on PC from the already validated persisted kind and
-group rows, then verified again on Android: item count > 0 is `visible`; zero
-items plus actions is `action_only`; zero/zero is `skip` only for an automatic
-kind. It is never copied from model output. `RoomBridgeMirror` validates and
+`terminalDisposition` is computed on PC from the already validated
+`turns.rollout_key` and group rows, never from `envelope_json`, then verified
+again on Android against the persisted Room turn kind: item count > 0 is
+`visible`; zero items plus actions is `action_only`; zero/zero is `skip` only
+for an automatic kind. It is never copied from model output. `RoomBridgeMirror` validates and
 writes all v3 authority fields to the same `ChatTurnEntity` completion
 transaction before advancing `nativeCompleted`. Before writing reply/action rows
 it reads the cursor: if `result.inputClearEpoch < cursor.clearEpoch`, the result
@@ -5993,7 +6076,7 @@ Implement and test this table:
 | backup/export | include | include | include lineage/group/manifest/items/actions/receipt/group-delivery plus all v13 parent counts/commitments | include | include | include |
 | import | merge by immutable ID/revision | replace only if newer valid revision | exact lineage/group/checksum and v13 parent-commitment merge only; recompute imported child sets before acceptance and stop on any mismatch | rebuild safe cursor state | preserve local authority unless explicit full restore | append |
 | clear automatic tasks | preserve | preserve | preserve committed authority; delete only unstarted comparison work | preserve | preserve | preserve |
-| clear chat | preserve system/author; archive user constraints whose sole evidence is deleted | expire evidence-dependent stance and remove chat-derived fast state | atomically freeze delivery count/commitment before redacting every local delivery state and clearing payload; tombstone every lineage attempt envelope/current-batch item; clear turn working fields, user/character messages, annotations, diagnostics, sync payloads, old Codex session, item/action payload and manifest semantic JSON; mark turn/batch/item/action/group/manifest with one redaction time; retain lineage attempt count/commitment, batch item count/commitment, group item/action counts/commitment, delivery set commitment, deterministic IDs and original audit checksums; redacted group cannot deliver/replay/execute | delete/reinitialize | preserve | preserve |
+| clear chat | preserve system/author; archive user constraints whose sole evidence is deleted | expire evidence-dependent stance and remove chat-derived fast state | atomically freeze delivery count/commitment before redacting every local delivery state and clearing payload; tombstone every lineage attempt envelope/current-batch item; clear turn working fields, user/character messages, annotations, diagnostics, sync payloads, old Codex session, item/action payload and manifest semantic JSON; mark turn/batch/item/action/group/manifest with one redaction time; retain each version-1 turn's non-sensitive `rollout_key`, lineage attempt count/commitment, batch item count/commitment, group item/action counts/commitment, delivery set commitment, deterministic IDs and original audit checksums; redacted group cannot deliver/replay/execute | delete/reinitialize | preserve | preserve |
 | clear memory | preserve system/author and explicit user boundaries | expire memory-dependent stance and rebuild snapshot from persona/stage | preserve | preserve cursor | preserve | preserve |
 | delete Yuqi role | delete role rows | delete | delete role lineages/groups/manifests/items/actions/receipts/deliveries in FK-safe order after backup | delete | keep global release definitions; delete role rollout state | retain redacted audit |
 
@@ -6023,7 +6106,9 @@ The distributed clear flow is fixed:
    clearing any delivery payload, it freezes the exact pre-clear delivery set in
    `redaction_delivery_count/commitment`; it preserves and revalidates group,
    batch, and lineage parent commitments rather than recomputing them from
-   surviving children.
+   surviving children. It leaves every canonical attempt's `turns.rollout_key`
+   unchanged and revalidates the lineage commitment by projecting that column as
+   `turn_kind`; it never tries to recover kind from the redacted envelope.
 5. `ResultOutbox.flushRetractionsOnce()` runs before normal sends, calls relay
    `/bridge/ack` with each persisted deterministic message ID, and marks the row
    `redacted` only after idempotent success. Offline failures remain durable and
