@@ -858,6 +858,36 @@ function buildRedactedV13Fixture(path, {
   };
 }
 
+function buildLiveV13MatrixFixture(path) {
+  const store = new YuqiStore(path);
+  let turn = createCanonicalFromEnvelope(store, threeBubbleEnvelope(41));
+  const attemptTurnIds = [turn.turnId];
+  turn = createCanonicalRetry(store, turn, 411);
+  attemptTurnIds.push(turn.turnId);
+  turn = createCanonicalRetry(store, turn, 412);
+  attemptTurnIds.push(turn.turnId);
+  const items = [0, 1, 2].map(index => ({
+    content: `活跃矩阵回复${index + 1}`,
+    speakerId: 'yuqi',
+    speakerType: 'character',
+    recipientId: 'user'
+  }));
+  const actionSet = [0, 1].map(index => {
+    const draft = { kind: 'moment_create', payload: { text: `活跃矩阵动态${index + 1}` } };
+    const target = store.resolveCanonicalActionTargetInternal({ turn, action: draft });
+    return { ...draft, targetKey: target.targetKey, targetRevision: target.targetRevision };
+  });
+  const receipt = commitCanonical(store, turn, 41, { items, actionSet });
+  store.close();
+  return {
+    path,
+    groupId: receipt.visibleGroupId,
+    turnId: receipt.authoritativeTurnId,
+    lineageKey: receipt.authorityLineageKey,
+    attemptTurnIds
+  };
+}
+
 function convertRedactedFixtureToCancelled(store, fixture) {
   store.db.exec('BEGIN IMMEDIATE');
   try {
@@ -985,6 +1015,26 @@ function assertRedactedMatrixReject(
   });
 }
 
+function assertLiveMatrixReject(
+  mutate,
+  expected = /message|projection|canonical visible|v1[13] invariant/i
+) {
+  return withTempPath(path => {
+    const fixture = buildLiveV13MatrixFixture(path);
+    const store = new YuqiStore(path);
+    try {
+      store.db.exec('PRAGMA foreign_keys = OFF');
+      mutate(store, fixture);
+      assert.throws(() => store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }), expected);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), expected);
+  });
+}
+
 for (const [name, mutate] of [
   ['visible item tail deletion', (store, fixture) => store.db.prepare(
     'DELETE FROM visible_result_items WHERE group_id = ? AND ordinal = 2'
@@ -1044,11 +1094,160 @@ for (const [name, mutate] of [
   ).run(fixture.groupId)],
   ['pending delivery relay identity removal', (store, fixture) => store.db.prepare(
     "UPDATE cloud_deliveries SET relay_message_id = NULL WHERE authority_group_id = ? AND peer_id = 'phone'"
-  ).run(fixture.groupId)]
+  ).run(fixture.groupId)],
+  ['user projection attached to result group', (store, fixture) => store.db.prepare(`
+    UPDATE messages SET authority_group_id = ?, group_ordinal = 99
+    WHERE message_id = 'msg_v13_batch_1_1'
+  `).run(fixture.groupId)],
+  ['extra valid-shape character projection', (store, fixture) => {
+    const projection = {
+      messageId: 'msg_redacted_extra_character',
+      content: '',
+      recipientId: 'user'
+    };
+    store.db.prepare(`
+      INSERT INTO messages(
+        message_id, turn_id, character_id, speaker_id, speaker_type,
+        recipient_id, content, sent_at, origin, checksum, created_at,
+        authority_group_id, group_ordinal
+      ) VALUES (?, ?, 'yuqi', 'yuqi', 'character', 'user', '', 49999,
+        'codex', ?, 49999, ?, 99)
+    `).run(projection.messageId, fixture.turnId, contentHash(projection), fixture.groupId);
+  }],
+  ['user projection owner moved to retry', (store, fixture) => store.db.prepare(`
+    UPDATE messages SET turn_id = ? WHERE message_id = 'msg_v13_batch_1_1'
+  `).run(fixture.attemptTurnIds[1])],
+  ['pending delivery with premature acknowledgement', (store, fixture) => store.db.prepare(`
+    UPDATE cloud_deliveries SET redaction_acknowledged_at = redaction_requested_at
+    WHERE authority_group_id = ? AND peer_id = 'phone'
+  `).run(fixture.groupId)],
+  ['remote redacted delivery with missing request', (store, fixture) => store.db.prepare(`
+    UPDATE cloud_deliveries
+    SET state = 'redacted', redaction_requested_at = NULL,
+        redaction_acknowledged_at = ?
+    WHERE authority_group_id = ? AND peer_id = 'phone'
+  `).run(fixture.redactedAt + 1, fixture.groupId)],
+  ['authority redaction secret on authoritative turn', (store, fixture) => {
+    const payload = {
+      groupId: fixture.groupId,
+      redactedAt: fixture.redactedAt,
+      reasonCode: 'user_clear',
+      secret: 'leak'
+    };
+    store.db.prepare(`
+      INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+      VALUES ('authority_redaction', ?, 'redact', ?, ?, ?)
+    `).run(
+      fixture.turnId, JSON.stringify(payload), contentHash(payload), fixture.redactedAt
+    );
+  }]
 ]) {
   test(`redacted matrix rejects ${name} in scoped validation and restart`, () =>
     assertRedactedMatrixReject(mutate));
 }
+
+test('live v13 group rejects an extra valid-shape character projection in scoped validation and restart',
+  () => assertLiveMatrixReject((store, fixture) => {
+    const projection = {
+      messageId: 'msg_live_extra_character',
+      content: '额外投影',
+      recipientId: 'user'
+    };
+    store.db.prepare(`
+      INSERT INTO messages(
+        message_id, turn_id, character_id, speaker_id, speaker_type,
+        recipient_id, content, sent_at, origin, checksum, created_at,
+        authority_group_id, group_ordinal
+      ) VALUES (?, ?, 'yuqi', 'yuqi', 'character', 'user', ?, 49999,
+        'codex', ?, 49999, ?, 99)
+    `).run(
+      projection.messageId, fixture.turnId, projection.content,
+      contentHash(projection), fixture.groupId
+    );
+  }));
+
+test('live v13 group rejects forged middle user history in scoped validation and restart',
+  () => assertLiveMatrixReject((store) => store.db.prepare(`
+    UPDATE messages SET content = 'forged history'
+    WHERE message_id = 'msg_v13_batch_41_1'
+  `).run()));
+
+test('never-enqueued redacted delivery requires its exact local acknowledgement time',
+  () => withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      store.db.prepare(`
+        UPDATE cloud_deliveries
+        SET redaction_acknowledged_at = redaction_acknowledged_at + 1
+        WHERE authority_group_id = ? AND relay_message_id IS NULL
+      `).run(fixture.groupId);
+      assert.throws(() => store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }), /redacted authority delivery.*conflict/i);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /redacted authority delivery.*conflict/i);
+  }));
+
+test('live multi-bubble retry message projections pass scoped validation and restart',
+  () => withTempPath(path => {
+    const fixture = buildLiveV13MatrixFixture(path);
+    const store = new YuqiStore(path);
+    try {
+      assert.equal(store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }).status, 'live');
+    } finally {
+      store.close();
+    }
+    assert.doesNotThrow(() => new YuqiStore(path).close());
+  }));
+
+test('remote redaction acknowledgement preserves relay and request authority',
+  () => withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path, { matrix: true });
+    const store = new YuqiStore(path);
+    try {
+      store.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'redacted', redaction_acknowledged_at = ?
+        WHERE authority_group_id = ? AND peer_id = 'phone'
+      `).run(fixture.redactedAt + 1, fixture.groupId);
+      assert.equal(store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }).status, 'redacted');
+    } finally {
+      store.close();
+    }
+    assert.doesNotThrow(() => new YuqiStore(path).close());
+  }));
+
+test('canonical authority redaction audit metadata is accepted without semantic leakage',
+  () => withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      const payload = {
+        groupId: fixture.groupId,
+        reasonCode: 'user_clear',
+        redactedAt: fixture.redactedAt
+      };
+      store.db.prepare(`
+        INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+        VALUES ('authority_redaction', ?, 'redact', ?, ?, ?)
+      `).run(
+        fixture.groupId, JSON.stringify(payload), contentHash(payload), fixture.redactedAt
+      );
+      assert.equal(store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }).status, 'redacted');
+    } finally {
+      store.close();
+    }
+    assert.doesNotThrow(() => new YuqiStore(path).close());
+  }));
 
 test('a redacted cancelled lineage returns a terminal redacted outcome without recovery', () =>
   withTempPath(path => {
@@ -1627,7 +1826,10 @@ test('redacted audit shell rejects deleting a retained character message project
     } finally {
       store.close();
     }
-    assert.throws(() => new YuqiStore(path), /redacted authority.*message.*conflict/);
+    assert.throws(
+      () => new YuqiStore(path),
+      /redacted authority.*message.*conflict|canonical_item_message_projection/
+    );
   }));
 
 test('redacted audit shell rejects deleting a retained user batch message projection', () =>
@@ -1672,7 +1874,7 @@ test('live batch parent count is authority-checked at reopen', () => withTempPat
       .run(receipt.authoritativeTurnId);
     assert.throws(() => store.assertVisibleGroupAuthorityInternal(receipt.visibleGroupId, {
       purpose: 'reopen'
-    }), /input batch authority conflict/);
+    }), /input batch authority conflict|canonical turn input authority conflict/);
   } finally {
     store.close();
   }

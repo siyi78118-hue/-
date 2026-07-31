@@ -2544,7 +2544,9 @@ export class YuqiStore {
       LIMIT 1
       `);
 
-      assertNoInvariantRow('canonical_item_message_projection', `
+    }
+
+    assertNoInvariantRow('canonical_item_message_projection', `
       SELECT i.group_id, i.ordinal, i.message_id
       FROM visible_result_items i
       JOIN visible_result_groups g ON g.group_id = i.group_id
@@ -2561,7 +2563,7 @@ export class YuqiStore {
       LIMIT 1
       `);
 
-      assertNoInvariantRow('orphan_canonical_message_projection', `
+    assertNoInvariantRow('orphan_canonical_message_projection', `
       SELECT m.message_id, m.authority_group_id, m.group_ordinal
       FROM messages m
       LEFT JOIN visible_result_items i
@@ -2571,7 +2573,6 @@ export class YuqiStore {
       WHERE m.authority_group_id IS NOT NULL AND i.message_id IS NULL
       LIMIT 1
       `);
-    }
 
     assertNoInvariantRow('orphan_group_authority_reference', `
       SELECT 'stance' AS source, authority_group_id AS group_id
@@ -3074,6 +3075,188 @@ export class YuqiStore {
     }
   }
 
+  assertCanonicalLineageMessageAuthorityInternal({
+    lineageKey, mode, groupId = null
+  }) {
+    if (!['live', 'redacted'].includes(mode)) {
+      throw new Error('canonical lineage message authority mode conflict');
+    }
+    const conflictPrefix = mode === 'redacted'
+      ? 'redacted authority canonical lineage'
+      : 'canonical lineage';
+    const attempts = this.db.prepare(`
+      SELECT * FROM turns WHERE authority_lineage_key = ?
+      ORDER BY lineage_revision_at_creation, turn_id
+    `).all(String(lineageKey || ''));
+    const roots = attempts.filter(turn => turn.retry_of_turn_id == null);
+    if (!attempts.length || roots.length !== 1) {
+      throw new Error(`${conflictPrefix} message root authority conflict`);
+    }
+    const root = roots[0];
+    const turnIds = attempts.map(turn => turn.turn_id);
+    const turnMarks = turnIds.map(() => '?').join(',');
+    const batchItems = this.db.prepare(`
+      SELECT * FROM current_user_batch_items
+      WHERE turn_id IN (${turnMarks})
+      ORDER BY turn_id, sequence
+    `).all(...turnIds);
+    const expectedUserIds = [...new Set(batchItems.map(item => item.message_id))];
+    const messages = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE turn_id IN (${turnMarks})
+        ${groupId == null ? '' : 'OR authority_group_id = ?'}
+    `).all(...turnIds, ...(groupId == null ? [] : [String(groupId)]));
+    const messageById = new Map(messages.map(message => [message.message_id, message]));
+    const expectedUserById = new Map();
+    if (expectedUserIds.length && mode === 'live') {
+      const rootEnvelope = parseJson(root.envelope_json, {});
+      const rootBatch = resolveCurrentUserBatch(rootEnvelope);
+      if (!rootBatch || !rootBatch.complete || rootBatch.missingMessageIds.length) {
+        throw new Error(`${conflictPrefix} user message authority conflict`);
+      }
+      for (const message of rootBatch.messages) {
+        expectedUserById.set(message.messageId, {
+          messageId: message.messageId,
+          turnId: root.turn_id,
+          characterId: root.character_id,
+          speakerId: message.speakerId,
+          speakerType: message.speakerType,
+          recipientId: message.recipientId,
+          content: message.content,
+          sentAt: message.sentAt,
+          origin: 'phone',
+          deviceId: root.device_id,
+          deviceSeq: message.messageId === rootEnvelope.message?.messageId
+            ? root.device_seq : null
+        });
+      }
+    } else {
+      expectedUserIds.forEach(messageId => expectedUserById.set(messageId, { messageId }));
+    }
+    if (expectedUserById.size !== expectedUserIds.length
+      || expectedUserIds.some(messageId => !expectedUserById.has(messageId))) {
+      throw new Error(`${conflictPrefix} user message authority conflict`);
+    }
+    for (const messageId of expectedUserIds) {
+      const row = messageById.get(messageId);
+      const expected = expectedUserById.get(messageId);
+      if (!row || row.turn_id !== root.turn_id
+        || row.character_id !== root.character_id
+        || row.speaker_id !== 'user' || row.speaker_type !== 'user'
+        || row.recipient_id !== root.character_id
+        || row.authority_group_id !== null || row.group_ordinal !== null
+        || (mode === 'live' && (
+          row.content !== expected.content
+          || Number(row.sent_at) !== Number(expected.sentAt)
+          || row.origin !== expected.origin
+          || row.device_id !== expected.deviceId
+          || Number(row.device_seq ?? -1) !== Number(expected.deviceSeq ?? -1)
+          || row.checksum !== contentHash(expected)
+        ))
+        || (mode === 'redacted' && row.content !== '')) {
+        throw new Error(`${conflictPrefix} user message authority conflict`);
+      }
+    }
+
+    const itemRows = groupId == null ? [] : this.db.prepare(`
+      SELECT * FROM visible_result_items WHERE group_id = ? ORDER BY ordinal
+    `).all(String(groupId));
+    const group = groupId == null ? null : this.db.prepare(`
+      SELECT * FROM visible_result_groups WHERE group_id = ?
+    `).get(String(groupId));
+    const expectedCharacterIds = new Set(itemRows.map(item => item.message_id));
+    if ((groupId == null && itemRows.length)
+      || (groupId != null && (!group
+        || itemRows.length !== Number(group.item_count)))) {
+      throw new Error(`${conflictPrefix} character message authority conflict`);
+    }
+    for (const item of itemRows) {
+      const row = messageById.get(item.message_id);
+      const semantic = mode === 'live' ? parseJson(item.item_json, null) : null;
+      const projection = semantic && {
+        messageId: item.message_id,
+        content: String(semantic.content || ''),
+        recipientId: String(semantic.recipientId || 'user')
+      };
+      if (!row || Number(item.ordinal) !== Number(row.group_ordinal)
+        || row.turn_id !== group.authoritative_turn_id
+        || row.character_id !== group.role_id
+        || row.speaker_id !== group.role_id || row.speaker_type !== 'character'
+        || row.recipient_id !== 'user' || row.authority_group_id !== group.group_id
+        || (mode === 'live' && (!semantic
+          || row.content !== projection.content
+          || row.checksum !== contentHash(projection)))
+        || (mode === 'redacted' && row.content !== '')) {
+        throw new Error(`${conflictPrefix} character message authority conflict`);
+      }
+    }
+    const allowedIds = new Set([...expectedUserIds, ...expectedCharacterIds]);
+    if (messages.length !== allowedIds.size
+      || messages.some(message => !allowedIds.has(message.message_id))) {
+      throw new Error(`${conflictPrefix} message set authority conflict`);
+    }
+    return { attempts, root, messages, batchItems, itemRows };
+  }
+
+  assertRedactedDeliveryLifecycleInternal(delivery, redactedAt, commitChecksum) {
+    const at = Number(redactedAt);
+    if (!Number.isSafeInteger(at) || at <= 0
+      || delivery.payload_json !== null || delivery.checksum !== null
+      || delivery.authority_commit_checksum !== commitChecksum) {
+      throw new Error('redacted authority delivery lifecycle conflict');
+    }
+    const request = delivery.redaction_requested_at == null
+      ? null : Number(delivery.redaction_requested_at);
+    const acknowledged = delivery.redaction_acknowledged_at == null
+      ? null : Number(delivery.redaction_acknowledged_at);
+    if (delivery.state === 'redaction_pending') {
+      if (!delivery.relay_message_id || request !== at || acknowledged !== null) {
+        throw new Error('redacted authority delivery lifecycle conflict');
+      }
+      return;
+    }
+    if (delivery.state !== 'redacted') {
+      throw new Error('redacted authority delivery lifecycle conflict');
+    }
+    if (delivery.relay_message_id) {
+      if (request !== at || !Number.isSafeInteger(acknowledged)
+        || acknowledged < request) {
+        throw new Error('redacted authority delivery lifecycle conflict');
+      }
+      return;
+    }
+    if (request !== null || acknowledged !== at) {
+      throw new Error('redacted authority delivery lifecycle conflict');
+    }
+  }
+
+  assertAuthorityRedactionAuditInternal({
+    lineageKey, groupId = null, redactedAt, turnIds, messageIds
+  }) {
+    const targetId = groupId == null ? String(lineageKey) : String(groupId);
+    const linkedIds = [...turnIds, ...messageIds];
+    const placeholders = [...linkedIds, targetId].map(() => '?').join(',');
+    const rows = this.db.prepare(`
+      SELECT * FROM sync_log WHERE entity_id IN (${placeholders})
+    `).all(...linkedIds, targetId);
+    for (const row of rows) {
+      if (row.entity_type !== 'authority_redaction' || row.entity_id !== targetId) {
+        throw new Error('redacted authority sync audit conflict');
+      }
+      const payload = parseJson(row.payload_json, null);
+      const keys = payload && Object.keys(payload).sort();
+      if (row.operation !== 'redact'
+        || canonicalJson(keys) !== canonicalJson(['groupId', 'reasonCode', 'redactedAt'])
+        || payload.groupId !== (groupId == null ? null : String(groupId))
+        || Number(payload.redactedAt) !== Number(redactedAt)
+        || !/^[a-z0-9][a-z0-9_:-]*$/.test(String(payload.reasonCode || ''))
+        || canonicalJson(payload) !== row.payload_json
+        || contentHash(payload) !== row.checksum) {
+        throw new Error('redacted authority sync audit conflict');
+      }
+    }
+  }
+
   assertRedactedLineageAuthorityInternal(lineageKey, {
     groupId = null, purpose = 'reopen'
   } = {}) {
@@ -3126,12 +3309,6 @@ export class YuqiStore {
       SELECT * FROM current_user_batch_items WHERE turn_id IN (${turnMarks})
       ORDER BY turn_id, sequence
     `).all(...turnIds);
-    const messages = this.db.prepare(`
-      SELECT * FROM messages WHERE turn_id IN (${turnMarks})
-         ${groupId == null ? '' : 'OR authority_group_id = ?'}
-    `).all(...turnIds, ...(groupId == null ? [] : [groupId]));
-    const messageById = new Map(messages.map(message => [message.message_id, message]));
-    const expectedUserMessageIds = new Set(batchItems.map(item => item.message_id));
     for (const turn of attempts) {
       const batch = this.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?')
         .get(turn.turn_id);
@@ -3150,48 +3327,18 @@ export class YuqiStore {
         throw new Error('redacted authority lineage batch conflict');
       }
       items.forEach((item, sequence) => {
-        const message = messageById.get(item.message_id);
         if (Number(item.sequence) !== sequence || item.batch_id !== batch.batch_id
-          || item.message_json !== null || Number(item.redacted_at) !== redactedAt
-          || !message || !turnIds.includes(message.turn_id)
-          || message.character_id !== turn.character_id
-          || message.speaker_id !== 'user' || message.speaker_type !== 'user'
-          || message.recipient_id !== turn.character_id || message.content !== '') {
-          throw new Error(`redacted authority lineage message conflict: ${canonicalJson({
-            turnId: turn.turn_id,
-            item: {
-              sequence: item.sequence,
-              batchId: item.batch_id,
-              messageId: item.message_id,
-              redactedAt: item.redacted_at,
-              messageJson: item.message_json
-            },
-            message: message && {
-              turnId: message.turn_id,
-              characterId: message.character_id,
-              speakerId: message.speaker_id,
-              speakerType: message.speaker_type,
-              recipientId: message.recipient_id,
-              content: message.content
-            }
-          })}`);
+          || item.message_json !== null || Number(item.redacted_at) !== redactedAt) {
+          throw new Error('redacted authority lineage batch item conflict');
         }
       });
     }
-    const actualUserMessages = messages.filter(message =>
-      turnIds.includes(message.turn_id) && message.speaker_type === 'user');
-    const extraMessages = messages.filter(message =>
-      !expectedUserMessageIds.has(message.message_id));
-    if (messages.some(message => message.content !== '')
-      || actualUserMessages.length !== expectedUserMessageIds.size
-      || actualUserMessages.some(message => !expectedUserMessageIds.has(message.message_id))
-      || (cancelled && extraMessages.length !== 0)
-      || (!cancelled && extraMessages.some(message =>
-        message.speaker_type !== 'character'
-        || message.authority_group_id !== groupId
-        || !turnIds.includes(message.turn_id)))) {
-      throw new Error('redacted authority lineage message set conflict');
-    }
+    const messageClosure = this.assertCanonicalLineageMessageAuthorityInternal({
+      lineageKey: lineage.lineage_key,
+      mode: 'redacted',
+      groupId
+    });
+    const messages = messageClosure.messages;
     const messageIds = messages.map(message => message.message_id);
     const messageMarks = messageIds.map(() => '?').join(',') || "''";
     const retainedContext = [
@@ -3200,10 +3347,6 @@ export class YuqiStore {
         .get(...turnIds, ...messageIds).value),
       Number(this.db.prepare(`SELECT COUNT(*) AS value FROM diagnostics
         WHERE turn_id IN (${turnMarks})`).get(...turnIds).value),
-      Number(this.db.prepare(`SELECT COUNT(*) AS value FROM sync_log
-        WHERE entity_type != 'authority_redaction'
-          AND entity_id IN (${[...turnIds, ...messageIds].map(() => '?').join(',') || "''"})`)
-        .get(...turnIds, ...messageIds).value),
       Number(this.db.prepare(`SELECT COUNT(*) AS value FROM sessions
         WHERE role IN (${[...new Set(attempts.map(turn => turn.character_id))]
           .map(() => '?').join(',') || "''"})`)
@@ -3219,6 +3362,13 @@ export class YuqiStore {
     if (retainedContext || executable) {
       throw new Error('redacted authority lineage retained context conflict');
     }
+    this.assertAuthorityRedactionAuditInternal({
+      lineageKey: lineage.lineage_key,
+      groupId,
+      redactedAt,
+      turnIds,
+      messageIds
+    });
     if (cancelled) {
       const retainedResult = this.db.prepare(`
         SELECT 1 FROM visible_result_groups WHERE lineage_key = ?
@@ -3344,29 +3494,6 @@ export class YuqiStore {
         throw new Error('redacted authority group shell conflict');
       }
       const sha256Pattern = /^[a-f0-9]{64}$/i;
-      const attempts = closure.attempts;
-      const turnIds = attempts.map(turn => turn.turn_id);
-      const placeholders = turnIds.map(() => '?').join(',');
-      const linkedMessages = this.db.prepare(`
-        SELECT * FROM messages
-        WHERE turn_id IN (${placeholders}) OR authority_group_id = ?
-      `).all(...turnIds, groupKey);
-      const linkedById = new Map(linkedMessages.map(message => [message.message_id, message]));
-      const missingRedactedCharacterProjection = this.db.prepare(`
-        SELECT ordinal, message_id FROM visible_result_items WHERE group_id = ? ORDER BY ordinal
-      `).all(groupKey).some(item => {
-        const message = linkedById.get(item.message_id);
-        return !message || message.turn_id !== authority.authoritative_turn_id
-          || message.character_id !== authority.role_id
-          || message.authority_group_id !== groupKey
-          || Number(message.group_ordinal) !== Number(item.ordinal)
-          || message.speaker_id !== authority.role_id || message.speaker_type !== 'character'
-          || message.recipient_id !== 'user' || message.content !== '';
-      });
-      if (missingRedactedCharacterProjection
-        || linkedMessages.some(message => message.content !== '')) {
-        throw new Error('redacted authority message shell conflict');
-      }
       const itemRows = this.db.prepare(`
         SELECT * FROM visible_result_items WHERE group_id = ? ORDER BY ordinal
       `).all(groupKey);
@@ -3411,18 +3538,10 @@ export class YuqiStore {
         }).commitment !== authority.redaction_delivery_commitment) {
         throw new Error('redacted authority delivery commitment conflict');
       }
-      if (deliveries.some(delivery => {
-        if (delivery.payload_json !== null || delivery.checksum !== null
-          || delivery.authority_commit_checksum !== authority.commit_checksum) return true;
-        if (delivery.state === 'redaction_pending') {
-          return delivery.redaction_requested_at == null || !delivery.relay_message_id;
-        }
-        if (delivery.state === 'redacted') {
-          return delivery.redaction_acknowledged_at == null;
-        }
-        return true;
-      })) {
-        throw new Error('redacted authority delivery shell conflict');
+      for (const delivery of deliveries) {
+        this.assertRedactedDeliveryLifecycleInternal(
+          delivery, redactedAt, authority.commit_checksum
+        );
       }
       const retainedJobs = Number(this.db.prepare(`
         SELECT COUNT(*) AS value FROM consolidation_jobs WHERE authority_group_id = ?
@@ -3612,66 +3731,18 @@ export class YuqiStore {
       ORDER BY lineage_revision_at_creation, turn_id
     `).all(authority.lineage_key);
     for (const turn of attempts) {
-      const envelope = parseJson(turn.envelope_json, {});
-      if (contentHash(envelope) !== turn.envelope_checksum
-        || String(envelope.kind || '') !== String(turn.rollout_key || '')) {
-        throw new Error('canonical visible group turn input authority conflict');
-      }
-      const normalized = resolveCurrentUserBatch(envelope);
-      if (envelope.message) {
-        const batch = this.db.prepare(
-          'SELECT * FROM current_user_batches WHERE turn_id = ?'
-        ).get(turn.turn_id);
-        const batchItems = this.db.prepare(`
-          SELECT * FROM current_user_batch_items
-          WHERE turn_id = ? ORDER BY sequence
-        `).all(turn.turn_id);
-        const header = normalized && {
-          batchId: normalized.batchId,
-          sourceMessageId: normalized.sourceMessageId,
-          messageIds: normalized.messageIds,
-          startedAt: normalized.startedAt,
-          committedAt: normalized.committedAt
-        };
-        if (!batch || !normalized
-          || batch.batch_id !== normalized.batchId
-          || batch.character_id !== turn.character_id
-          || batch.source_message_id !== normalized.sourceMessageId
-          || Number(batch.started_at) !== Number(normalized.startedAt)
-          || Number(batch.committed_at) !== Number(normalized.committedAt)
-          || batch.checksum !== contentHash(header)
-          || batchItems.length !== normalized.messageIds.length
-          || Number(batch.item_count) !== batchItems.length
-          || currentUserBatchTombstoneCommitment({
-            turnId: turn.turn_id,
-            batchId: batch.batch_id,
-            itemRows: batchItems
-          }).commitment !== batch.tombstone_commitment) {
-          throw new Error('canonical visible group input batch authority conflict');
-        }
-        batchItems.forEach((item, sequence) => {
-          const message = normalized.messages.find(candidate =>
-            candidate.messageId === normalized.messageIds[sequence]);
-          if (Number(item.sequence) !== sequence
-            || item.batch_id !== normalized.batchId
-            || item.message_id !== normalized.messageIds[sequence]
-            || item.checksum !== contentHash(message)
-            || canonicalJson(parseJson(item.message_json, null)) !== canonicalJson(message)) {
-            throw new Error('canonical visible group input batch authority conflict');
-          }
-        });
-      } else {
-        const batch = this.db.prepare(
-          'SELECT * FROM current_user_batches WHERE turn_id = ?'
-        ).get(turn.turn_id);
-        const batchItems = this.db.prepare(
-          'SELECT * FROM current_user_batch_items WHERE turn_id = ?'
-        ).all(turn.turn_id);
-        if (batch || batchItems.length) {
-          throw new Error('canonical visible group trigger batch authority conflict');
-        }
-      }
+      const storedTurn = mapTurn(turn);
+      this.assertCanonicalTurnInputAuthorityInternal({
+        storedTurn,
+        incomingEnvelope: parseJson(storedTurn.envelopeJson, {}),
+        mode: 'live_reopen'
+      });
     }
+    this.assertCanonicalLineageMessageAuthorityInternal({
+      lineageKey: authority.lineage_key,
+      mode: 'live',
+      groupId: groupKey
+    });
 
     const deliveries = this.db.prepare(`
       SELECT * FROM cloud_deliveries WHERE authority_group_id = ?
@@ -3769,6 +3840,13 @@ export class YuqiStore {
               : 'v13 invariant canonical batch parent conflict');
           }
         }
+      }
+      if (lineage.redacted_at == null) {
+        this.assertCanonicalLineageMessageAuthorityInternal({
+          lineageKey: lineage.lineage_key,
+          mode: 'live',
+          groupId: lineage.state === 'committed' ? lineage.committed_group_id : null
+        });
       }
       if (lineage.state === 'cancelled' && lineage.redacted_at != null) {
         this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, {
