@@ -3233,27 +3233,156 @@ export class YuqiStore {
   assertAuthorityRedactionAuditInternal({
     lineageKey, groupId = null, redactedAt, turnIds, messageIds
   }) {
-    const targetId = groupId == null ? String(lineageKey) : String(groupId);
+    if (!this.db.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_log'
+    `).get()) return;
+    const targetId = groupId == null ? lineageKey : groupId;
     const linkedIds = [...turnIds, ...messageIds];
     const placeholders = [...linkedIds, targetId].map(() => '?').join(',');
     const rows = this.db.prepare(`
       SELECT * FROM sync_log WHERE entity_id IN (${placeholders})
     `).all(...linkedIds, targetId);
+    const targetAudits = rows.filter(row =>
+      row.entity_type === 'authority_redaction' && row.entity_id === targetId
+    );
+    if (targetAudits.length > 1) {
+      throw new Error('redacted authority sync audit conflict');
+    }
     for (const row of rows) {
       if (row.entity_type !== 'authority_redaction' || row.entity_id !== targetId) {
         throw new Error('redacted authority sync audit conflict');
       }
-      const payload = parseJson(row.payload_json, null);
-      const keys = payload && Object.keys(payload).sort();
-      if (row.operation !== 'redact'
-        || canonicalJson(keys) !== canonicalJson(['groupId', 'reasonCode', 'redactedAt'])
-        || payload.groupId !== (groupId == null ? null : String(groupId))
-        || Number(payload.redactedAt) !== Number(redactedAt)
-        || !/^[a-z0-9][a-z0-9_:-]*$/.test(String(payload.reasonCode || ''))
-        || canonicalJson(payload) !== row.payload_json
-        || contentHash(payload) !== row.checksum) {
+      this.assertAuthorityRedactionAuditRowInternal(row, {
+        targetId, groupId, redactedAt
+      });
+    }
+  }
+
+  assertAuthorityRedactionAuditRowInternal(row, {
+    targetId, groupId = null, redactedAt
+  }) {
+    const payload = parseJson(row?.payload_json, null);
+    const expectedGroupId = groupId == null ? null : groupId;
+    if (!Number.isSafeInteger(redactedAt) || redactedAt <= 0
+      || row?.entity_type !== 'authority_redaction'
+      || row.entity_id !== targetId
+      || row.operation !== 'redact'
+      || !payload || typeof payload !== 'object' || Array.isArray(payload)
+      || canonicalJson(Object.keys(payload).sort())
+        !== canonicalJson(['groupId', 'reasonCode', 'redactedAt'])
+      || payload.groupId !== expectedGroupId
+      || !Number.isSafeInteger(payload.redactedAt)
+      || payload.redactedAt <= 0
+      || payload.redactedAt !== redactedAt
+      || typeof payload.reasonCode !== 'string'
+      || !/^[a-z0-9][a-z0-9_:-]{0,63}$/.test(payload.reasonCode)
+      || !Number.isSafeInteger(row.created_at)
+      || row.created_at !== redactedAt
+      || canonicalJson(payload) !== row.payload_json
+      || contentHash(payload) !== row.checksum) {
+      throw new Error('redacted authority sync audit conflict');
+    }
+  }
+
+  assertNoAuthorityRedactionAuditForLiveTargetInternal({
+    lineageKey, groupId = null, turnIds, messageIds
+  }) {
+    if (!this.db.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_log'
+    `).get()) return;
+    const linkedIds = [
+      lineageKey,
+      ...(groupId == null ? [] : [groupId]),
+      ...turnIds,
+      ...messageIds
+    ];
+    const placeholders = linkedIds.map(() => '?').join(',') || "''";
+    const retainedAudit = this.db.prepare(`
+      SELECT 1 FROM sync_log
+      WHERE entity_type = 'authority_redaction'
+        AND entity_id IN (${placeholders})
+      LIMIT 1
+    `).get(...linkedIds);
+    if (retainedAudit) {
+      throw new Error('live authority redaction sync audit conflict');
+    }
+  }
+
+  assertAuthorityRedactionAuditClosureInternal() {
+    if (!this.db.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_log'
+    `).get()) return;
+    const rows = this.db.prepare(`
+      SELECT * FROM sync_log
+      WHERE entity_type = 'authority_redaction'
+      ORDER BY entity_id, created_at
+    `).all();
+    const counts = new Map();
+    for (const row of rows) {
+      counts.set(row.entity_id, (counts.get(row.entity_id) || 0) + 1);
+      if (counts.get(row.entity_id) > 1) {
         throw new Error('redacted authority sync audit conflict');
       }
+      const group = this.db.prepare(`
+        SELECT g.group_id, g.lineage_key, g.redacted_at AS group_redacted_at,
+               m.redacted_at AS manifest_redacted_at,
+               l.state AS lineage_state, l.committed_group_id,
+               l.redacted_at AS lineage_redacted_at
+        FROM visible_result_groups g
+        JOIN visible_result_manifests m ON m.group_id = g.group_id
+        JOIN turn_authority_lineages l ON l.lineage_key = g.lineage_key
+        WHERE g.group_id = ?
+      `).get(row.entity_id);
+      if (group) {
+        const redactedAt = Number(group.group_redacted_at);
+        const attempts = this.db.prepare(`
+          SELECT state, authority_redacted_at FROM turns
+          WHERE authority_lineage_key = ?
+        `).all(group.lineage_key);
+        if (!Number.isSafeInteger(redactedAt) || redactedAt <= 0
+          || Number(group.manifest_redacted_at) !== redactedAt
+          || group.lineage_state !== 'committed'
+          || group.committed_group_id !== group.group_id
+          || Number(group.lineage_redacted_at) !== redactedAt
+          || !attempts.length
+          || attempts.some(attempt =>
+            Number(attempt.authority_redacted_at) !== redactedAt)) {
+          throw new Error('redacted authority sync audit target conflict');
+        }
+        this.assertAuthorityRedactionAuditRowInternal(row, {
+          targetId: group.group_id,
+          groupId: group.group_id,
+          redactedAt
+        });
+        continue;
+      }
+      const lineage = this.db.prepare(`
+        SELECT lineage_key, state, committed_group_id, redacted_at
+        FROM turn_authority_lineages WHERE lineage_key = ?
+      `).get(row.entity_id);
+      const attempts = lineage ? this.db.prepare(`
+        SELECT state, authority_redacted_at FROM turns
+        WHERE authority_lineage_key = ?
+      `).all(lineage.lineage_key) : [];
+      const redactedAt = Number(lineage?.redacted_at);
+      if (!lineage
+        || lineage.state !== 'cancelled'
+        || lineage.committed_group_id !== null
+        || !Number.isSafeInteger(redactedAt) || redactedAt <= 0
+        || !attempts.length
+        || attempts.some(attempt =>
+          attempt.state !== 'cancelled'
+          || Number(attempt.authority_redacted_at) !== redactedAt)
+        || this.db.prepare(`
+          SELECT 1 FROM visible_result_groups WHERE lineage_key = ? LIMIT 1
+        `).get(lineage.lineage_key)) {
+        throw new Error('redacted authority sync audit target conflict');
+      }
+      this.assertAuthorityRedactionAuditRowInternal(row, {
+        targetId: lineage.lineage_key,
+        groupId: null,
+        redactedAt
+      });
     }
   }
 
@@ -3738,10 +3867,16 @@ export class YuqiStore {
         mode: 'live_reopen'
       });
     }
-    this.assertCanonicalLineageMessageAuthorityInternal({
+    const liveMessageClosure = this.assertCanonicalLineageMessageAuthorityInternal({
       lineageKey: authority.lineage_key,
       mode: 'live',
       groupId: groupKey
+    });
+    this.assertNoAuthorityRedactionAuditForLiveTargetInternal({
+      lineageKey: authority.lineage_key,
+      groupId: groupKey,
+      turnIds: attempts.map(turn => turn.turn_id),
+      messageIds: liveMessageClosure.messages.map(message => message.message_id)
     });
 
     const deliveries = this.db.prepare(`
@@ -3871,6 +4006,7 @@ export class YuqiStore {
         throw new Error(`v13 invariant current cognitive state authority: ${state.role_id}`);
       }
     }
+    this.assertAuthorityRedactionAuditClosureInternal();
   }
 
   visibleAuthorityV13InvariantSummary() {

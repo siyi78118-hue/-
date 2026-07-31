@@ -917,6 +917,26 @@ function convertRedactedFixtureToCancelled(store, fixture) {
   }
 }
 
+function insertAuthorityRedactionAudit(store, {
+  entityId, groupId, redactedAt, reasonCode = 'user_clear',
+  createdAt = redactedAt, payloadOverrides = {}
+}) {
+  const payload = {
+    groupId,
+    reasonCode,
+    redactedAt,
+    ...payloadOverrides
+  };
+  store.db.prepare(`
+    INSERT INTO sync_log(
+      entity_type, entity_id, operation, payload_json, checksum, created_at
+    ) VALUES ('authority_redaction', ?, 'redact', ?, ?, ?)
+  `).run(
+    entityId, JSON.stringify(payload), contentHash(payload), createdAt
+  );
+  return payload;
+}
+
 test('a complete v13 redacted audit shell is restart-valid and non-deliverable',
   () => withTempPath(path => {
     const fixture = buildRedactedV13Fixture(path);
@@ -1248,6 +1268,156 @@ test('canonical authority redaction audit metadata is accepted without semantic 
     }
     assert.doesNotThrow(() => new YuqiStore(path).close());
   }));
+
+test('live committed authority rejects a premature redaction audit in scoped and restart validation',
+  () => withTempPath(path => {
+    const fixture = buildLiveV13MatrixFixture(path);
+    const store = new YuqiStore(path);
+    try {
+      insertAuthorityRedactionAudit(store, {
+        entityId: fixture.groupId,
+        groupId: fixture.groupId,
+        redactedAt: 50_000
+      });
+      assert.throws(
+        () => store.assertVisibleGroupAuthorityInternal(fixture.groupId),
+        /authority redaction|sync audit/i
+      );
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /authority redaction|sync audit/i);
+  }));
+
+test('v13 full authority rejects an orphan redaction audit before and after restart',
+  () => withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      insertAuthorityRedactionAudit(store, {
+        entityId: 'group_missing',
+        groupId: 'group_missing',
+        redactedAt: 50_000
+      });
+      assert.throws(
+        () => store.assertVisibleAuthorityV13Invariants(),
+        /authority redaction|sync audit/i
+      );
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /authority redaction|sync audit/i);
+  }));
+
+for (const [name, insert] of [
+  ['numeric reason code', (store, fixture) => insertAuthorityRedactionAudit(store, {
+    entityId: fixture.groupId,
+    groupId: fixture.groupId,
+    redactedAt: fixture.redactedAt,
+    reasonCode: 123
+  })],
+  ['string redaction time', (store, fixture) => insertAuthorityRedactionAudit(store, {
+    entityId: fixture.groupId,
+    groupId: fixture.groupId,
+    redactedAt: String(fixture.redactedAt)
+  })],
+  ['mismatched created time', (store, fixture) => insertAuthorityRedactionAudit(store, {
+    entityId: fixture.groupId,
+    groupId: fixture.groupId,
+    redactedAt: fixture.redactedAt,
+    createdAt: fixture.redactedAt + 1
+  })],
+  ['overlong reason code', (store, fixture) => insertAuthorityRedactionAudit(store, {
+    entityId: fixture.groupId,
+    groupId: fixture.groupId,
+    redactedAt: fixture.redactedAt,
+    reasonCode: `a${'b'.repeat(64)}`
+  })],
+  ['duplicate audit rows', (store, fixture) => {
+    insertAuthorityRedactionAudit(store, {
+      entityId: fixture.groupId,
+      groupId: fixture.groupId,
+      redactedAt: fixture.redactedAt
+    });
+    insertAuthorityRedactionAudit(store, {
+      entityId: fixture.groupId,
+      groupId: fixture.groupId,
+      redactedAt: fixture.redactedAt
+    });
+  }],
+  ['entity and payload target mismatch', (store, fixture) =>
+    insertAuthorityRedactionAudit(store, {
+      entityId: fixture.groupId,
+      groupId: 'group_other',
+      redactedAt: fixture.redactedAt
+    })]
+]) {
+  test(`redacted committed authority rejects ${name} in scoped and restart validation`,
+    () => withTempPath(path => {
+      const fixture = buildRedactedV13Fixture(path);
+      const store = new YuqiStore(path);
+      try {
+        insert(store, fixture);
+        assert.throws(
+          () => store.assertVisibleGroupAuthorityInternal(fixture.groupId),
+          /authority redaction|sync audit/i
+        );
+      } finally {
+        store.close();
+      }
+      assert.throws(() => new YuqiStore(path), /authority redaction|sync audit/i);
+    }));
+}
+
+test('cancelled redacted lineage accepts one strict canonical redaction audit',
+  () => withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      convertRedactedFixtureToCancelled(store, fixture);
+      insertAuthorityRedactionAudit(store, {
+        entityId: fixture.lineageKey,
+        groupId: null,
+        redactedAt: fixture.redactedAt
+      });
+      assert.equal(store.readCanonicalCommitOutcomeInternal({
+        lineageKey: fixture.lineageKey
+      }).status, 'redacted');
+    } finally {
+      store.close();
+    }
+    assert.doesNotThrow(() => new YuqiStore(path).close());
+  }));
+
+for (const [name, insert] of [
+  ['non-null payload group', (store, fixture) =>
+    insertAuthorityRedactionAudit(store, {
+      entityId: fixture.lineageKey,
+      groupId: fixture.groupId,
+      redactedAt: fixture.redactedAt
+    })],
+  ['wrong audit target', (store, fixture) =>
+    insertAuthorityRedactionAudit(store, {
+      entityId: fixture.turnId,
+      groupId: null,
+      redactedAt: fixture.redactedAt
+    })]
+]) {
+  test(`cancelled redacted lineage rejects ${name} in scoped outcome and restart`,
+    () => withTempPath(path => {
+      const fixture = buildRedactedV13Fixture(path);
+      const store = new YuqiStore(path);
+      try {
+        convertRedactedFixtureToCancelled(store, fixture);
+        insert(store, fixture);
+        assert.throws(() => store.readCanonicalCommitOutcomeInternal({
+          lineageKey: fixture.lineageKey
+        }), /authority redaction|sync audit/i);
+      } finally {
+        store.close();
+      }
+      assert.throws(() => new YuqiStore(path), /authority redaction|sync audit/i);
+    }));
+}
 
 test('a redacted cancelled lineage returns a terminal redacted outcome without recovery', () =>
   withTempPath(path => {
