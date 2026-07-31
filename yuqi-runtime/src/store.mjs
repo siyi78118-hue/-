@@ -3237,11 +3237,16 @@ export class YuqiStore {
       SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_log'
     `).get()) return;
     const targetId = groupId == null ? lineageKey : groupId;
-    const linkedIds = [...turnIds, ...messageIds];
-    const placeholders = [...linkedIds, targetId].map(() => '?').join(',');
+    const linkedIds = [...new Set([
+      lineageKey,
+      ...(groupId == null ? [] : [groupId]),
+      ...turnIds,
+      ...messageIds
+    ])];
+    const placeholders = linkedIds.map(() => '?').join(',');
     const rows = this.db.prepare(`
       SELECT * FROM sync_log WHERE entity_id IN (${placeholders})
-    `).all(...linkedIds, targetId);
+    `).all(...linkedIds);
     const targetAudits = rows.filter(row =>
       row.entity_type === 'authority_redaction' && row.entity_id === targetId
     );

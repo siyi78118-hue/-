@@ -1269,6 +1269,50 @@ test('canonical authority redaction audit metadata is accepted without semantic 
     assert.doesNotThrow(() => new YuqiStore(path).close());
   }));
 
+test('redacted committed group rejects an audit attached to its lineage in scoped and restart validation',
+  () => withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      insertAuthorityRedactionAudit(store, {
+        entityId: fixture.lineageKey,
+        groupId: null,
+        redactedAt: fixture.redactedAt
+      });
+      assert.throws(
+        () => store.assertVisibleGroupAuthorityInternal(fixture.groupId),
+        /authority redaction|sync audit/i
+      );
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /authority redaction|sync audit/i);
+  }));
+
+test('redacted committed group rejects a retained lineage sync payload in scoped and restart validation',
+  () => withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      const payload = { secret: 'retained lineage payload' };
+      store.db.prepare(`
+        INSERT INTO sync_log(
+          entity_type, entity_id, operation, payload_json, checksum, created_at
+        ) VALUES ('authority_lineage', ?, 'update', ?, ?, ?)
+      `).run(
+        fixture.lineageKey, JSON.stringify(payload), contentHash(payload),
+        fixture.redactedAt
+      );
+      assert.throws(
+        () => store.assertVisibleGroupAuthorityInternal(fixture.groupId),
+        /authority redaction|sync audit/i
+      );
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /authority redaction|sync audit/i);
+  }));
+
 test('live committed authority rejects a premature redaction audit in scoped and restart validation',
   () => withTempPath(path => {
     const fixture = buildLiveV13MatrixFixture(path);
