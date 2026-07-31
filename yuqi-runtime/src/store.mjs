@@ -118,14 +118,21 @@ function assertOrdinalCommitmentRows(rows, field, label, start = 0) {
   return ordered;
 }
 
+function requireCommitmentField(row, field, label) {
+  if (!row || !Object.hasOwn(row, field)) {
+    throw new Error(`${label} commitment conflict: missing ${field}`);
+  }
+  return row[field];
+}
+
 function requireCommitmentText(value, label) {
-  const text = String(value || '');
+  const text = typeof value === 'string' ? value : '';
   if (!text) throw new Error(`${label} commitment conflict: identity`);
   return text;
 }
 
 function requireCommitmentChecksum(value, label) {
-  const checksum = String(value || '');
+  const checksum = typeof value === 'string' ? value : '';
   if (!/^[a-f0-9]{64}$/.test(checksum)) {
     throw new Error(`${label} commitment conflict: checksum`);
   }
@@ -134,37 +141,59 @@ function requireCommitmentChecksum(value, label) {
 
 function visibleResultTombstoneCommitment({ groupId, itemRows, actionRows }) {
   const items = assertOrdinalCommitmentRows(itemRows, 'ordinal', 'visible item').map(row => ({
-    ordinal: Number(row.ordinal), messageId: requireCommitmentText(row.message_id, 'visible item'),
-    itemChecksum: requireCommitmentChecksum(row.item_checksum, 'visible item')
+    ordinal: Number(requireCommitmentField(row, 'ordinal', 'visible item')),
+    messageId: requireCommitmentText(
+      requireCommitmentField(row, 'message_id', 'visible item'), 'visible item'
+    ),
+    itemChecksum: requireCommitmentChecksum(
+      requireCommitmentField(row, 'item_checksum', 'visible item'), 'visible item'
+    )
   }));
   const actions = assertOrdinalCommitmentRows(actionRows, 'ordinal', 'visible action').map(row => ({
-    ordinal: Number(row.ordinal), actionId: requireCommitmentText(row.action_id, 'visible action'),
-    actionChecksum: requireCommitmentChecksum(row.action_checksum, 'visible action')
+    ordinal: Number(requireCommitmentField(row, 'ordinal', 'visible action')),
+    actionId: requireCommitmentText(
+      requireCommitmentField(row, 'action_id', 'visible action'), 'visible action'
+    ),
+    actionChecksum: requireCommitmentChecksum(
+      requireCommitmentField(row, 'action_checksum', 'visible action'), 'visible action'
+    )
   }));
   if (new Set(items.map(item => item.messageId)).size !== items.length
     || new Set(actions.map(action => action.actionId)).size !== actions.length) {
     throw new Error('visible result commitment conflict: duplicate identity');
   }
-  return contentHash({
+  return {
+    itemCount: items.length,
+    actionCount: actions.length,
+    commitment: contentHash({
     version: 'visible-result-tombstone-v1', groupId: requireCommitmentText(groupId, 'visible result'),
     itemCount: items.length, actionCount: actions.length, items, actions
-  });
+    })
+  };
 }
 
 function currentUserBatchTombstoneCommitment({ turnId, batchId, itemRows }) {
   const items = assertOrdinalCommitmentRows(itemRows, 'sequence', 'current user batch').map(row => ({
-    sequence: Number(row.sequence), messageId: requireCommitmentText(row.message_id, 'current user batch'),
-    checksum: requireCommitmentChecksum(row.checksum, 'current user batch')
+    sequence: Number(requireCommitmentField(row, 'sequence', 'current user batch')),
+    messageId: requireCommitmentText(
+      requireCommitmentField(row, 'message_id', 'current user batch'), 'current user batch'
+    ),
+    checksum: requireCommitmentChecksum(
+      requireCommitmentField(row, 'checksum', 'current user batch'), 'current user batch'
+    )
   }));
   if (new Set(items.map(item => item.messageId)).size !== items.length) {
     throw new Error('current user batch commitment conflict: duplicate identity');
   }
-  return contentHash({
+  return {
+    itemCount: items.length,
+    commitment: contentHash({
     version: 'current-user-batch-tombstone-v1',
     turnId: requireCommitmentText(turnId, 'current user batch'),
     batchId: requireCommitmentText(batchId, 'current user batch'),
     itemCount: items.length, items
-  });
+    })
+  };
 }
 
 function authorityRedactionDeliveriesCommitment({ groupId, deliveryRows }) {
@@ -172,7 +201,8 @@ function authorityRedactionDeliveriesCommitment({ groupId, deliveryRows }) {
     .map(row => {
       if (!Object.hasOwn(row, 'relay_message_id')
         || !Object.hasOwn(row, 'recovery_ack_seq')
-        || !Object.hasOwn(row, 'authority_commit_checksum')) {
+        || !Object.hasOwn(row, 'authority_commit_checksum')
+        || !Object.hasOwn(row, 'peer_id')) {
         throw new Error('redaction delivery commitment relay message id is required');
       }
       const relayMessageId = row.relay_message_id == null ? null : String(row.relay_message_id);
@@ -183,7 +213,7 @@ function authorityRedactionDeliveriesCommitment({ groupId, deliveryRows }) {
         throw new Error('redaction delivery commitment checksum conflict');
       }
       return {
-        peerId: String(row.peer_id),
+        peerId: requireCommitmentText(row.peer_id, 'redaction delivery'),
         relayMessageId,
         recoveryAckSeq,
         authorityCommitChecksum
@@ -193,10 +223,14 @@ function authorityRedactionDeliveriesCommitment({ groupId, deliveryRows }) {
   if (new Set(rows.map(row => row.peerId)).size !== rows.length) {
     throw new Error('redaction delivery commitment duplicate peer conflict');
   }
-  return contentHash({
+  return {
+    deliveryCount: rows.length,
+    commitment: contentHash({
     version: 'authority-redaction-deliveries-v1',
-    groupId: String(groupId), deliveryCount: rows.length, deliveries: rows
-  });
+    groupId: requireCommitmentText(groupId, 'redaction delivery'),
+    deliveryCount: rows.length, deliveries: rows
+    })
+  };
 }
 
 function authorityLineageAttemptsCommitment({ lineageKey, attemptRows }) {
@@ -204,20 +238,36 @@ function authorityLineageAttemptsCommitment({ lineageKey, attemptRows }) {
     attemptRows, 'lineage_revision_at_creation', 'lineage attempt', 1
   )
     .map(row => ({
-      lineageRevisionAtCreation: Number(row.lineage_revision_at_creation),
-      turnId: requireCommitmentText(row.turn_id, 'lineage attempt'),
-      turnKind: requireCommitmentText(row.turn_kind, 'lineage attempt'),
-      retryOfTurnId: row.retry_of_turn_id == null ? null : String(row.retry_of_turn_id),
-      inputUserBatchId: row.input_user_batch_id == null ? null : String(row.input_user_batch_id),
-      envelopeChecksum: requireCommitmentChecksum(row.envelope_checksum, 'lineage attempt'),
-      batchTombstoneCommitment: row.tombstone_commitment == null
-        ? null : requireCommitmentChecksum(row.tombstone_commitment, 'lineage attempt')
+      lineageRevisionAtCreation: Number(
+        requireCommitmentField(row, 'lineage_revision_at_creation', 'lineage attempt')
+      ),
+      turnId: requireCommitmentText(
+        requireCommitmentField(row, 'turn_id', 'lineage attempt'), 'lineage attempt'
+      ),
+      turnKind: requireCommitmentText(
+        requireCommitmentField(row, 'turn_kind', 'lineage attempt'), 'lineage attempt'
+      ),
+      retryOfTurnId: requireCommitmentField(row, 'retry_of_turn_id', 'lineage attempt') == null
+        ? null : String(row.retry_of_turn_id),
+      inputUserBatchId: requireCommitmentField(row, 'input_user_batch_id', 'lineage attempt') == null
+        ? null : String(row.input_user_batch_id),
+      envelopeChecksum: requireCommitmentChecksum(
+        requireCommitmentField(row, 'envelope_checksum', 'lineage attempt'), 'lineage attempt'
+      ),
+      batchTombstoneCommitment:
+        requireCommitmentField(row, 'batch_tombstone_commitment', 'lineage attempt') == null
+          ? null : requireCommitmentChecksum(
+            row.batch_tombstone_commitment, 'lineage attempt'
+          )
     }));
-  return contentHash({
+  return {
+    attemptCount: attempts.length,
+    commitment: contentHash({
     version: 'authority-lineage-attempts-v1',
     lineageKey: requireCommitmentText(lineageKey, 'lineage attempt'),
     attemptCount: attempts.length, attempts
-  });
+    })
+  };
 }
 
 function deriveTerminalDisposition(turnKind, itemCount, actionCount) {
@@ -2046,7 +2096,7 @@ export class YuqiStore {
       });
       this.db.prepare(
         'UPDATE current_user_batches SET item_count = ?, tombstone_commitment = ? WHERE turn_id = ?'
-      ).run(items.length, commitment, batch.turn_id);
+      ).run(commitment.itemCount, commitment.commitment, batch.turn_id);
     }
     this.maybeFailV13Migration('after_batch_parent_backfill');
     for (const group of this.db.prepare(
@@ -2063,7 +2113,9 @@ export class YuqiStore {
       });
       this.db.prepare(
         'UPDATE visible_result_groups SET item_count = ?, action_count = ?, tombstone_commitment = ? WHERE group_id = ?'
-      ).run(itemRows.length, actionRows.length, commitment, group.group_id);
+      ).run(
+        commitment.itemCount, commitment.actionCount, commitment.commitment, group.group_id
+      );
     }
     this.maybeFailV13Migration('after_group_parent_backfill');
     for (const lineage of this.db.prepare(
@@ -2073,7 +2125,7 @@ export class YuqiStore {
         `SELECT t.lineage_revision_at_creation, t.turn_id,
                 t.rollout_key AS turn_kind,
                 t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
-                b.tombstone_commitment
+                b.tombstone_commitment AS batch_tombstone_commitment
          FROM turns t LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
          WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
          ORDER BY t.lineage_revision_at_creation`
@@ -2083,7 +2135,7 @@ export class YuqiStore {
       });
       this.db.prepare(
         'UPDATE turn_authority_lineages SET attempt_count = ?, attempt_commitment = ? WHERE lineage_key = ?'
-      ).run(attempts.length, commitment, lineage.lineage_key);
+      ).run(commitment.attemptCount, commitment.commitment, lineage.lineage_key);
     }
     this.maybeFailV13Migration('after_lineage_parent_backfill');
 
@@ -2099,7 +2151,7 @@ export class YuqiStore {
       if (Number(batch.item_count) !== items.length
         || currentUserBatchTombstoneCommitment({
           turnId: batch.turn_id, batchId: batch.batch_id, itemRows: items
-        }) !== batch.tombstone_commitment) {
+        }).commitment !== batch.tombstone_commitment) {
         throw new Error(`v13 migration batch parent verification conflict: ${batch.turn_id}`);
       }
     }
@@ -2116,7 +2168,7 @@ export class YuqiStore {
         || Number(group.action_count) !== actionRows.length
         || visibleResultTombstoneCommitment({
           groupId: group.group_id, itemRows, actionRows
-        }) !== group.tombstone_commitment) {
+        }).commitment !== group.tombstone_commitment) {
         throw new Error(`v13 migration group parent verification conflict: ${group.group_id}`);
       }
     }
@@ -2126,7 +2178,8 @@ export class YuqiStore {
       const attempts = this.db.prepare(`
         SELECT t.lineage_revision_at_creation, t.turn_id,
                t.rollout_key AS turn_kind, t.retry_of_turn_id,
-               t.input_user_batch_id, t.envelope_checksum, b.tombstone_commitment
+               t.input_user_batch_id, t.envelope_checksum,
+               b.tombstone_commitment AS batch_tombstone_commitment
         FROM turns t LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
         WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
         ORDER BY t.lineage_revision_at_creation
@@ -2134,7 +2187,7 @@ export class YuqiStore {
       if (Number(lineage.attempt_count) !== attempts.length
         || authorityLineageAttemptsCommitment({
           lineageKey: lineage.lineage_key, attemptRows: attempts
-        }) !== lineage.attempt_commitment) {
+        }).commitment !== lineage.attempt_commitment) {
         throw new Error(`v13 migration lineage parent verification conflict: ${lineage.lineage_key}`);
       }
     }
@@ -2952,9 +3005,10 @@ export class YuqiStore {
     }
   }
 
-  assertIncomingCanonicalBatchForStoredTurnInternal({
-    turn, envelope, requireEnvelopeChecksum = true
+  assertCanonicalTurnInputAuthorityInternal({
+    storedTurn: turn, incomingEnvelope: envelope, mode = 'live_reopen'
   }) {
+    const requireEnvelopeChecksum = mode === 'live_reopen';
     if (requireEnvelopeChecksum
       && (contentHash(envelope) !== turn.envelopeChecksum
         || String(envelope.kind || '') !== String(turn.rolloutKey || ''))) {
@@ -2971,8 +3025,28 @@ export class YuqiStore {
       if (batch || items.length) throw new Error('retry canonical batch conflict');
       return;
     }
+    if (!normalized.complete
+      || normalized.missingMessageIds.length !== 0
+      || normalized.messageIds.length !== normalized.messages.length
+      || normalized.messageIds.some((messageId, sequence) =>
+        String(normalized.messages[sequence]?.messageId || '') !== String(messageId))) {
+      throw new Error('v13 invariant canonical turn input authority conflict');
+    }
+    const canonicalHeader = {
+      batchId: normalized.batchId,
+      sourceMessageId: normalized.sourceMessageId,
+      messageIds: normalized.messageIds,
+      startedAt: normalized.startedAt,
+      committedAt: normalized.committedAt
+    };
     if (!batch
       || batch.batch_id !== turn.inputUserBatchId
+      || batch.batch_id !== normalized.batchId
+      || batch.character_id !== turn.characterId
+      || batch.source_message_id !== normalized.sourceMessageId
+      || Number(batch.started_at) !== Number(normalized.startedAt)
+      || Number(batch.committed_at) !== Number(normalized.committedAt)
+      || batch.checksum !== contentHash(canonicalHeader)
       || Number(batch.item_count) !== items.length
       || items.length !== normalized.messages.length) {
       throw new Error('v13 invariant canonical turn input authority conflict');
@@ -2989,6 +3063,150 @@ export class YuqiStore {
         throw new Error('v13 invariant canonical turn input authority conflict');
       }
     }
+  }
+
+  assertRedactedLineageAuthorityInternal(lineageKey, {
+    groupId = null, purpose = 'reopen'
+  } = {}) {
+    const lineage = this.db.prepare(`
+      SELECT * FROM turn_authority_lineages WHERE lineage_key = ?
+    `).get(String(lineageKey));
+    if (!lineage || lineage.redacted_at == null) {
+      throw new Error('redacted authority lineage conflict');
+    }
+    const redactedAt = Number(lineage.redacted_at);
+    const attempts = this.db.prepare(`
+      SELECT * FROM turns WHERE authority_lineage_key = ?
+      ORDER BY lineage_revision_at_creation, turn_id
+    `).all(lineage.lineage_key);
+    const commitmentRows = this.db.prepare(`
+      SELECT t.lineage_revision_at_creation, t.turn_id,
+             t.rollout_key AS turn_kind, t.retry_of_turn_id,
+             t.input_user_batch_id, t.envelope_checksum,
+             b.tombstone_commitment AS batch_tombstone_commitment
+      FROM turns t LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+      WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
+      ORDER BY t.lineage_revision_at_creation, t.turn_id
+    `).all(lineage.lineage_key);
+    if (!attempts.length || attempts.length !== Number(lineage.attempt_count)
+      || authorityLineageAttemptsCommitment({
+        lineageKey: lineage.lineage_key, attemptRows: commitmentRows
+      }).commitment !== lineage.attempt_commitment) {
+      throw new Error('redacted authority lineage attempt commitment conflict');
+    }
+    const cancelled = groupId == null;
+    if ((cancelled && (lineage.state !== 'cancelled' || lineage.committed_group_id !== null))
+      || (!cancelled && (lineage.state !== 'committed' || lineage.committed_group_id !== groupId))) {
+      throw new Error('redacted authority lineage terminal state conflict');
+    }
+    if (attempts.some(turn =>
+      Number(turn.authority_redacted_at) !== redactedAt
+      || (cancelled && turn.state !== 'cancelled')
+      || !CANONICAL_RESULT_TURN_KINDS.has(String(turn.rollout_key || ''))
+      || !/^[a-f0-9]{64}$/.test(String(turn.envelope_checksum || ''))
+      || canonicalJson(parseJson(turn.envelope_json, null)) !== '{"redacted":true}'
+      || turn.memory_packet_json !== null || turn.brain_draft_json !== null
+      || turn.supervisor_json !== null || turn.reply_json !== null || turn.error_json !== null
+      || canonicalJson(parseJson(turn.route_reasons_json, null)) !== '[]'
+      || canonicalJson(parseJson(turn.annotation_snapshot_json, null)) !== '{}')) {
+      throw new Error('redacted authority lineage turn shell conflict');
+    }
+    const turnIds = attempts.map(turn => turn.turn_id);
+    const turnMarks = turnIds.map(() => '?').join(',');
+    const batchItems = this.db.prepare(`
+      SELECT * FROM current_user_batch_items WHERE turn_id IN (${turnMarks})
+      ORDER BY turn_id, sequence
+    `).all(...turnIds);
+    const messages = this.db.prepare(`
+      SELECT * FROM messages WHERE turn_id IN (${turnMarks})
+         ${groupId == null ? '' : 'OR authority_group_id = ?'}
+    `).all(...turnIds, ...(groupId == null ? [] : [groupId]));
+    const messageById = new Map(messages.map(message => [message.message_id, message]));
+    for (const turn of attempts) {
+      const batch = this.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?')
+        .get(turn.turn_id);
+      const items = batchItems.filter(item => item.turn_id === turn.turn_id);
+      if (!batch) {
+        if (items.length) {
+          throw new Error('redacted authority lineage batch conflict');
+        }
+        continue;
+      }
+      if (batch.batch_id !== turn.input_user_batch_id
+        || Number(batch.item_count) !== items.length
+        || currentUserBatchTombstoneCommitment({
+          turnId: turn.turn_id, batchId: batch.batch_id, itemRows: items
+        }).commitment !== batch.tombstone_commitment) {
+        throw new Error('redacted authority lineage batch conflict');
+      }
+      items.forEach((item, sequence) => {
+        const message = messageById.get(item.message_id);
+        if (Number(item.sequence) !== sequence || item.batch_id !== batch.batch_id
+          || item.message_json !== null || Number(item.redacted_at) !== redactedAt
+          || !message || !turnIds.includes(message.turn_id)
+          || message.character_id !== turn.character_id
+          || message.speaker_id !== 'user' || message.speaker_type !== 'user'
+          || message.recipient_id !== turn.character_id || message.content !== '') {
+          throw new Error(`redacted authority lineage message conflict: ${canonicalJson({
+            turnId: turn.turn_id,
+            item: {
+              sequence: item.sequence,
+              batchId: item.batch_id,
+              messageId: item.message_id,
+              redactedAt: item.redacted_at,
+              messageJson: item.message_json
+            },
+            message: message && {
+              turnId: message.turn_id,
+              characterId: message.character_id,
+              speakerId: message.speaker_id,
+              speakerType: message.speaker_type,
+              recipientId: message.recipient_id,
+              content: message.content
+            }
+          })}`);
+        }
+      });
+    }
+    const messageIds = messages.map(message => message.message_id);
+    const messageMarks = messageIds.map(() => '?').join(',') || "''";
+    const retainedContext = [
+      Number(this.db.prepare(`SELECT COUNT(*) AS value FROM annotations
+        WHERE turn_id IN (${turnMarks}) OR source_message_id IN (${messageMarks})`)
+        .get(...turnIds, ...messageIds).value),
+      Number(this.db.prepare(`SELECT COUNT(*) AS value FROM diagnostics
+        WHERE turn_id IN (${turnMarks})`).get(...turnIds).value),
+      Number(this.db.prepare(`SELECT COUNT(*) AS value FROM sync_log
+        WHERE entity_type != 'authority_redaction'
+          AND entity_id IN (${[...turnIds, ...messageIds].map(() => '?').join(',') || "''"})`)
+        .get(...turnIds, ...messageIds).value),
+      Number(this.db.prepare(`SELECT COUNT(*) AS value FROM sessions
+        WHERE role IN (${[...new Set(attempts.map(turn => turn.character_id))]
+          .map(() => '?').join(',') || "''"})`)
+        .get(...new Set(attempts.map(turn => turn.character_id))).value)
+    ].some(Boolean);
+    const executable = Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM consolidation_jobs WHERE turn_id IN (${turnMarks})
+      UNION ALL SELECT COUNT(*) AS value FROM stance_records WHERE source_turn_id IN (${turnMarks})
+      UNION ALL SELECT COUNT(*) AS value FROM cognitive_states WHERE last_turn_id IN (${turnMarks})
+      UNION ALL SELECT COUNT(*) AS value FROM interaction_lanes WHERE generating_turn_id IN (${turnMarks})
+    `).all(...turnIds, ...turnIds, ...turnIds, ...turnIds)
+      .reduce((sum, row) => sum + Number(row.value), 0)) > 0;
+    if (retainedContext || executable) {
+      throw new Error('redacted authority lineage retained context conflict');
+    }
+    if (cancelled) {
+      const retainedResult = this.db.prepare(`
+        SELECT 1 FROM visible_result_groups WHERE lineage_key = ?
+        UNION ALL SELECT 1 FROM visible_commit_receipts WHERE lineage_key = ?
+        UNION ALL SELECT 1 FROM cloud_deliveries
+          WHERE turn_id IN (${turnMarks}) OR authority_group_id IS NOT NULL
+            AND turn_id IN (${turnMarks})
+        LIMIT 1
+      `).get(lineage.lineage_key, lineage.lineage_key, ...turnIds, ...turnIds);
+      if (retainedResult) throw new Error('redacted cancelled lineage authority conflict');
+    }
+    return { lineage, attempts, messages, redactedAt, purpose };
   }
 
   assertVisibleGroupAuthorityInternal(groupId, {
@@ -3068,7 +3286,7 @@ export class YuqiStore {
       SELECT t.lineage_revision_at_creation, t.turn_id,
              t.rollout_key AS turn_kind,
              t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum, t.envelope_json,
-             b.tombstone_commitment
+             b.tombstone_commitment AS batch_tombstone_commitment
       FROM turns t
       LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
       WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
@@ -3078,7 +3296,7 @@ export class YuqiStore {
       || authorityLineageAttemptsCommitment({
         lineageKey: authority.lineage_key,
         attemptRows: lineageAttempts
-      }) !== authority.attempt_commitment) {
+      }).commitment !== authority.attempt_commitment) {
       throw new Error('canonical visible group lineage attempt commitment conflict');
     }
     const redactedAuthority = authority.redacted_at != null
@@ -3091,7 +3309,10 @@ export class YuqiStore {
       if (purpose === 'delivery') {
         throw new Error('canonical visible result is redacted');
       }
-      const redactedAt = Number(authority.redacted_at);
+      const closure = this.assertRedactedLineageAuthorityInternal(authority.lineage_key, {
+        groupId: groupKey, purpose
+      });
+      const redactedAt = closure.redactedAt;
       if (!Number.isSafeInteger(redactedAt) || redactedAt <= 0
         || Number(authority.manifest_redacted_at) !== redactedAt
         || Number(authority.lineage_redacted_at) !== redactedAt
@@ -3099,84 +3320,14 @@ export class YuqiStore {
         throw new Error('redacted authority group shell conflict');
       }
       const sha256Pattern = /^[a-f0-9]{64}$/i;
-      const attempts = this.db.prepare(`
-        SELECT * FROM turns
-        WHERE authority_lineage_key = ?
-        ORDER BY lineage_revision_at_creation, turn_id
-      `).all(authority.lineage_key);
-      if (!attempts.length || attempts.some(turn =>
-        Number(turn.authority_redacted_at) !== redactedAt
-        || canonicalJson(parseJson(turn.envelope_json, null)) !== '{"redacted":true}'
-        || turn.memory_packet_json !== null
-        || turn.brain_draft_json !== null
-        || turn.supervisor_json !== null
-        || turn.reply_json !== null
-        || turn.error_json !== null
-        || canonicalJson(parseJson(turn.route_reasons_json, null)) !== '[]'
-        || canonicalJson(parseJson(turn.annotation_snapshot_json, null)) !== '{}'
-        || !sha256Pattern.test(String(turn.envelope_checksum || '')))) {
-        throw new Error('redacted authority turn shell conflict');
-      }
+      const attempts = closure.attempts;
       const turnIds = attempts.map(turn => turn.turn_id);
       const placeholders = turnIds.map(() => '?').join(',');
-      const batchItems = this.db.prepare(`
-        SELECT * FROM current_user_batch_items
-        WHERE turn_id IN (${placeholders})
-        ORDER BY turn_id, sequence
-      `).all(...turnIds);
-      const batchesByTurn = new Map();
-      for (const item of batchItems) {
-        const list = batchesByTurn.get(item.turn_id) || [];
-        list.push(item);
-        batchesByTurn.set(item.turn_id, list);
-        if (item.message_json !== null || Number(item.redacted_at) !== redactedAt
-          || !sha256Pattern.test(String(item.checksum || ''))) {
-          throw new Error('redacted authority input batch shell conflict');
-        }
-      }
-      for (const items of batchesByTurn.values()) {
-        items.forEach((item, sequence) => {
-          if (Number(item.sequence) !== sequence) {
-            throw new Error('redacted authority input batch shell conflict');
-          }
-        });
-      }
-      for (const attempt of attempts) {
-        const batch = this.db.prepare(
-          'SELECT * FROM current_user_batches WHERE turn_id = ?'
-        ).get(attempt.turn_id);
-        const items = batchesByTurn.get(attempt.turn_id) || [];
-        const commitmentAttempt = lineageAttempts.find(candidate =>
-          candidate.turn_id === attempt.turn_id);
-        if (!batch) {
-          if (items.length || commitmentAttempt?.tombstone_commitment != null) {
-            throw new Error('redacted authority input batch shell conflict');
-          }
-          continue;
-        }
-        if (batch.batch_id !== attempt.input_user_batch_id
-          || Number(batch.item_count) !== items.length
-          || currentUserBatchTombstoneCommitment({
-            turnId: attempt.turn_id,
-            batchId: batch.batch_id,
-            itemRows: items
-          }) !== batch.tombstone_commitment
-          || commitmentAttempt?.tombstone_commitment !== batch.tombstone_commitment) {
-          throw new Error('redacted authority input batch shell conflict');
-        }
-      }
       const linkedMessages = this.db.prepare(`
         SELECT * FROM messages
         WHERE turn_id IN (${placeholders}) OR authority_group_id = ?
       `).all(...turnIds, groupKey);
       const linkedById = new Map(linkedMessages.map(message => [message.message_id, message]));
-      const missingRedactedUserProjection = batchItems.some(item => {
-        const message = linkedById.get(item.message_id);
-        return !message || message.turn_id !== item.turn_id
-          || message.character_id !== authority.role_id
-          || message.speaker_id !== 'user' || message.speaker_type !== 'user'
-          || message.recipient_id !== authority.role_id || message.content !== '';
-      });
       const missingRedactedCharacterProjection = this.db.prepare(`
         SELECT ordinal, message_id FROM visible_result_items WHERE group_id = ? ORDER BY ordinal
       `).all(groupKey).some(item => {
@@ -3188,35 +3339,9 @@ export class YuqiStore {
           || message.speaker_id !== authority.role_id || message.speaker_type !== 'character'
           || message.recipient_id !== 'user' || message.content !== '';
       });
-      if (missingRedactedUserProjection || missingRedactedCharacterProjection
+      if (missingRedactedCharacterProjection
         || linkedMessages.some(message => message.content !== '')) {
         throw new Error('redacted authority message shell conflict');
-      }
-      const linkedMessageIds = linkedMessages.map(message => message.message_id);
-      const messagePlaceholders = linkedMessageIds.length
-        ? linkedMessageIds.map(() => '?').join(',')
-        : "''";
-      const annotationCount = Number(this.db.prepare(`
-        SELECT COUNT(*) AS value FROM annotations
-        WHERE turn_id IN (${placeholders})
-           OR source_message_id IN (${messagePlaceholders})
-      `).get(...turnIds, ...linkedMessageIds).value);
-      const diagnosticCount = Number(this.db.prepare(`
-        SELECT COUNT(*) AS value FROM diagnostics
-        WHERE turn_id IN (${placeholders})
-      `).get(...turnIds).value);
-      const syncCount = Number(this.db.prepare(`
-        SELECT COUNT(*) AS value FROM sync_log
-        WHERE entity_type != 'authority_redaction'
-          AND entity_id IN (${[...turnIds, ...linkedMessageIds].map(() => '?').join(',')})
-      `).get(...turnIds, ...linkedMessageIds).value);
-      const sessionCount = Number(this.db.prepare(
-        'SELECT COUNT(*) AS value FROM sessions WHERE role = ?'
-      ).get(authority.role_id).value);
-      if (annotationCount || diagnosticCount || syncCount || sessionCount) {
-        throw new Error(`redacted authority retained context conflict: ${canonicalJson({
-          annotationCount, diagnosticCount, syncCount, sessionCount
-        })}`);
       }
       const itemRows = this.db.prepare(`
         SELECT * FROM visible_result_items WHERE group_id = ? ORDER BY ordinal
@@ -3249,7 +3374,7 @@ export class YuqiStore {
         groupId: groupKey,
         itemRows,
         actionRows
-      }) !== authority.tombstone_commitment) {
+      }).commitment !== authority.tombstone_commitment) {
         throw new Error('redacted authority result tombstone commitment conflict');
       }
       const deliveries = this.db.prepare(`
@@ -3259,7 +3384,7 @@ export class YuqiStore {
         || authorityRedactionDeliveriesCommitment({
           groupId: groupKey,
           deliveryRows: deliveries
-        }) !== authority.redaction_delivery_commitment) {
+        }).commitment !== authority.redaction_delivery_commitment) {
         throw new Error('redacted authority delivery commitment conflict');
       }
       if (deliveries.some(delivery => {
@@ -3358,7 +3483,7 @@ export class YuqiStore {
       groupId: groupKey,
       itemRows,
       actionRows
-    }) !== authority.tombstone_commitment) {
+    }).commitment !== authority.tombstone_commitment) {
       throw new Error('canonical visible group tombstone commitment conflict');
     }
     const terminalDisposition = deriveTerminalDisposition(
@@ -3497,7 +3622,7 @@ export class YuqiStore {
             turnId: turn.turn_id,
             batchId: batch.batch_id,
             itemRows: batchItems
-          }) !== batch.tombstone_commitment) {
+          }).commitment !== batch.tombstone_commitment) {
           throw new Error('canonical visible group input batch authority conflict');
         }
         batchItems.forEach((item, sequence) => {
@@ -3567,7 +3692,7 @@ export class YuqiStore {
         SELECT t.lineage_revision_at_creation, t.turn_id,
                t.rollout_key AS turn_kind,
                t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
-               b.tombstone_commitment
+               b.tombstone_commitment AS batch_tombstone_commitment
         FROM turns t
         LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
         WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
@@ -3577,15 +3702,16 @@ export class YuqiStore {
         || authorityLineageAttemptsCommitment({
           lineageKey: lineage.lineage_key,
           attemptRows: attempts
-        }) !== lineage.attempt_commitment) {
+        }).commitment !== lineage.attempt_commitment) {
         throw new Error('v13 invariant lineage attempt commitment conflict');
       }
       for (const attempt of attempts) {
         if (lineage.redacted_at == null) {
           const storedTurn = this.getTurn(attempt.turn_id);
-          this.assertIncomingCanonicalBatchForStoredTurnInternal({
-            turn: storedTurn,
-            envelope: parseJson(storedTurn.envelopeJson, {})
+          this.assertCanonicalTurnInputAuthorityInternal({
+            storedTurn,
+            incomingEnvelope: parseJson(storedTurn.envelopeJson, {}),
+            mode: 'live_reopen'
           });
         }
         const batch = this.db.prepare(
@@ -3595,7 +3721,7 @@ export class YuqiStore {
           SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence
         `).all(attempt.turn_id);
         if (!batch) {
-          if (batchItems.length || attempt.tombstone_commitment != null) {
+          if (batchItems.length || attempt.batch_tombstone_commitment != null) {
             throw new Error('v13 invariant canonical batch parent conflict');
           }
         } else {
@@ -3611,8 +3737,9 @@ export class YuqiStore {
           }
           if (batch.batch_id !== attempt.input_user_batch_id
             || Number(batch.item_count) !== batchItems.length
-            || commitment !== batch.tombstone_commitment
-            || attempt.tombstone_commitment !== batch.tombstone_commitment) {
+            || commitment.itemCount !== batchItems.length
+            || commitment.commitment !== batch.tombstone_commitment
+            || attempt.batch_tombstone_commitment !== batch.tombstone_commitment) {
             throw new Error(lineage.redacted_at != null
               ? 'redacted authority input batch shell conflict'
               : 'v13 invariant canonical batch parent conflict');
@@ -3620,62 +3747,9 @@ export class YuqiStore {
         }
       }
       if (lineage.state === 'cancelled' && lineage.redacted_at != null) {
-        const cancelledAttempts = this.db.prepare(`
-          SELECT * FROM turns WHERE authority_lineage_key = ?
-          ORDER BY lineage_revision_at_creation
-        `).all(lineage.lineage_key);
-        const leaking = cancelledAttempts.some(turn =>
-          turn.authority_redacted_at == null
-          || canonicalJson(parseJson(turn.envelope_json, null)) !== '{"redacted":true}'
-          || turn.memory_packet_json !== null || turn.brain_draft_json !== null
-          || turn.supervisor_json !== null || turn.reply_json !== null || turn.error_json !== null
-          || canonicalJson(parseJson(turn.route_reasons_json, null)) !== '[]'
-          || canonicalJson(parseJson(turn.annotation_snapshot_json, null)) !== '{}');
-        const retainedResult = this.db.prepare(`
-          SELECT 1 FROM visible_result_groups WHERE lineage_key = ?
-          UNION ALL SELECT 1 FROM visible_commit_receipts WHERE lineage_key = ?
-          UNION ALL SELECT 1 FROM cloud_deliveries WHERE authority_group_id IS NOT NULL
-            AND turn_id IN (SELECT turn_id FROM turns WHERE authority_lineage_key = ?)
-          LIMIT 1
-        `).get(lineage.lineage_key, lineage.lineage_key, lineage.lineage_key);
-        const cancelledTurnIds = cancelledAttempts.map(turn => turn.turn_id);
-        const cancelledPlaceholders = cancelledTurnIds.map(() => '?').join(',');
-        const cancelledBatchItems = this.db.prepare(`
-          SELECT * FROM current_user_batch_items WHERE turn_id IN (${cancelledPlaceholders})
-        `).all(...cancelledTurnIds);
-        const cancelledMessages = this.db.prepare(`
-          SELECT * FROM messages WHERE turn_id IN (${cancelledPlaceholders})
-        `).all(...cancelledTurnIds);
-        const cancelledMessageById = new Map(cancelledMessages.map(message => [message.message_id, message]));
-        const cancelledBatchLeak = cancelledBatchItems.some(item => {
-          const message = cancelledMessageById.get(item.message_id);
-          return item.message_json !== null || Number(item.redacted_at) !== Number(lineage.redacted_at)
-            || !message || message.turn_id !== item.turn_id
-            || message.speaker_id !== 'user' || message.speaker_type !== 'user'
-            || message.content !== '';
+        this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, {
+          groupId: null, purpose: 'reopen'
         });
-        const cancelledContextLeak = Number(this.db.prepare(`
-          SELECT COUNT(*) AS value FROM annotations WHERE turn_id IN (${cancelledPlaceholders})
-          UNION ALL SELECT COUNT(*) AS value FROM diagnostics WHERE turn_id IN (${cancelledPlaceholders})
-          UNION ALL SELECT COUNT(*) AS value FROM consolidation_jobs WHERE turn_id IN (${cancelledPlaceholders})
-          UNION ALL SELECT COUNT(*) AS value FROM stance_records WHERE source_turn_id IN (${cancelledPlaceholders})
-          UNION ALL SELECT COUNT(*) AS value FROM cognitive_states WHERE last_turn_id IN (${cancelledPlaceholders})
-          UNION ALL SELECT COUNT(*) AS value FROM interaction_lanes
-            WHERE generating_turn_id IN (${cancelledPlaceholders})
-          UNION ALL SELECT COUNT(*) AS value FROM sync_log
-            WHERE entity_type != 'authority_redaction'
-              AND entity_id IN (${[...cancelledTurnIds, ...cancelledMessages.map(message => message.message_id)]
-                .map(() => '?').join(',')})
-        `).all(
-          ...cancelledTurnIds, ...cancelledTurnIds, ...cancelledTurnIds,
-          ...cancelledTurnIds, ...cancelledTurnIds,
-          ...cancelledTurnIds, ...cancelledMessages.map(message => message.message_id)
-        )
-          .reduce((total, row) => total + Number(row.value), 0)) > 0;
-        if (lineage.committed_group_id !== null || leaking || retainedResult
-          || cancelledBatchLeak || cancelledContextLeak) {
-          throw new Error('v13 invariant redacted cancelled lineage conflict');
-        }
       }
     }
     for (const row of this.db.prepare(`
@@ -4730,7 +4804,9 @@ export class YuqiStore {
     const lineage = this.getTurnAuthorityLineage(lineageKey);
     if (!lineage) return null;
     if (lineage.state === 'cancelled' && lineage.redactedAt != null) {
-      this.assertVisibleAuthorityV13Invariants();
+      this.assertRedactedLineageAuthorityInternal(lineage.lineageKey, {
+        groupId: null, purpose: 'receipt_replay'
+      });
       return { status: 'redacted', receipt: null, lineage };
     }
     if (lineage.state !== 'committed') return null;
@@ -4866,8 +4942,8 @@ export class YuqiStore {
             : null;
         const parentRedacted = parent.authorityRedactedAt != null;
         if (parentRedacted) {
-          this.assertIncomingCanonicalBatchForStoredTurnInternal({
-            turn: parent, envelope, requireEnvelopeChecksum: false
+          this.assertCanonicalTurnInputAuthorityInternal({
+            storedTurn: parent, incomingEnvelope: envelope, mode: 'redacted_replay'
           });
         } else if (!parentMessage
           || parent.sourceMessageId !== retry.canonicalMessageId
@@ -5101,14 +5177,18 @@ export class YuqiStore {
       }
 
       if (!retry && envelope.message) {
-        this.putMessageInternal({
-          ...envelope.message,
-          turnId: envelope.turnId,
-          characterId: envelope.characterId,
-          origin: 'phone',
-          deviceId: envelope.deviceId,
-          deviceSeq: envelope.deviceSeq
-        });
+        const initialBatch = resolveCurrentUserBatch(envelope);
+        for (const message of initialBatch?.messages || [envelope.message]) {
+          this.putMessageInternal({
+            ...message,
+            turnId: envelope.turnId,
+            characterId: envelope.characterId,
+            origin: 'phone',
+            deviceId: envelope.deviceId,
+            deviceSeq: message.messageId === envelope.message.messageId
+              ? envelope.deviceSeq : null
+          });
+        }
       }
       if (envelope.message) this.putCurrentUserBatchInternal(envelope);
 
@@ -5171,7 +5251,7 @@ export class YuqiStore {
       SELECT t.lineage_revision_at_creation, t.turn_id,
              t.rollout_key AS turn_kind,
              t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
-             b.tombstone_commitment
+             b.tombstone_commitment AS batch_tombstone_commitment
       FROM turns t
       LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
       WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
@@ -5184,7 +5264,7 @@ export class YuqiStore {
       UPDATE turn_authority_lineages
       SET attempt_count = ?, attempt_commitment = ?
       WHERE lineage_key = ?
-    `).run(attempts.length, commitment, String(lineageKey));
+    `).run(commitment.attemptCount, commitment.commitment, String(lineageKey));
     if (Number(updated.changes) !== 1) throw new Error('lineage attempt commitment conflict');
   }
 
@@ -5640,7 +5720,11 @@ export class YuqiStore {
       input.generationFingerprint, contentHash({ items, actions }), timestamp
     ];
     if (this.userVersion() >= 13) {
-      groupValues.push(itemTombstoneRows.length, actionTombstoneRows.length, tombstoneCommitment);
+      groupValues.push(
+        tombstoneCommitment.itemCount,
+        tombstoneCommitment.actionCount,
+        tombstoneCommitment.commitment
+      );
     }
     this.db.prepare(`INSERT INTO visible_result_groups(${groupColumns})
                      VALUES (${groupValues.map(() => '?').join(', ')})`).run(...groupValues);
@@ -6342,7 +6426,7 @@ export class YuqiStore {
       `).run(
         envelope.turnId, batch.batchId, envelope.characterId, batch.sourceMessageId,
         batch.startedAt, batch.committedAt, contentHash(canonical), now(),
-        batchItemRows.length, tombstoneCommitment
+        tombstoneCommitment.itemCount, tombstoneCommitment.commitment
       );
     } else {
       this.db.prepare(`
