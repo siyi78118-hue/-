@@ -143,7 +143,8 @@ commitVisibleResult({ store, turnId, authorityLineageKey, laneKey,
   expectedTurnRevision, expectedLineageRevision, expectedLaneRevision,
   expectedCognitiveStateRevision, expectedLatestUserBatchId, inputVisibilitySequence,
   inputClearEpoch,
-  agencySnapshotChecksum, authoritativeReleaseId, visibleGroup, actionSet,
+  agencySnapshotChecksum, authoritativeReleaseId, comparisonReleaseId,
+  comparisonDirection, visibleGroup, actionSet,
   statePatch, memoryJobs, comparisonJob, generationFingerprint, now
 }) -> CommitVisibleResult
 
@@ -164,6 +165,14 @@ createCanonicalVisibleTurnInternal({
 // release-pair.mjs
 resolvePipelinePair(rollout) -> {
   visibleReleaseId, comparisonReleaseId, comparisonDirection, candidatePhase
+}
+
+// comparison-contract.mjs
+comparisonContractForDirection(comparisonDirection) -> {
+  comparisonMode, comparisonDirection, jobType
+}
+comparisonContractForMode(comparisonMode) -> {
+  comparisonMode, comparisonDirection, jobType
 }
 
 // release-executor.mjs
@@ -2517,14 +2526,18 @@ Before a new commit writes:
 - validate compare presence/release/direction against the pinned turn;
 - strip/reject caller identity fields from visible items/actions.
 
-Comparison validation maps
-`legacy_authoritative_cognition_compare → shadow_cognition` and
-`cognition_authoritative_legacy_compare → active_canary_compare`; the job's
-comparison release, rollout evidence epoch, shadow/canary epoch and canary slot
-must equal the turn's pins. `annotationSnapshotChecksum` is recomputed from the
-turn's stored annotation snapshot, and `inputChecksum` from its normalized
-envelope plus pinned release/checksum fields. The caller cannot provide
-alternative epoch/input evidence.
+At the Task 10 checkpoint, comparison validation uses the then-persisted turn
+descriptor to pair shadow work with `shadow_cognition` and canary work with
+`active_canary_compare`; the job's comparison release, rollout evidence epoch,
+shadow/canary epoch and canary slot must equal the turn's pins.
+`annotationSnapshotChecksum` is recomputed from the turn's stored annotation
+snapshot, and `inputChecksum` from its normalized envelope plus pinned
+release/checksum fields. The caller cannot provide alternative epoch/input
+evidence. Task 11 deliberately replaces this transitional descriptor mapping
+with the shared three-domain `comparison-contract.mjs`: final fresh version-1
+turn rows persist compatibility mode, while canonical commit/job descriptors
+persist the release-aware direction. Historical version-0 aliases remain only
+in the legacy worker branch.
 
 The agency snapshot descriptor is exact:
 
@@ -4511,9 +4524,11 @@ plan owner independently reviews Task 10F and explicitly releases it.
 
 **Files:**
 - Create: `yuqi-runtime/src/release-pair.mjs`
+- Create: `yuqi-runtime/src/comparison-contract.mjs`
 - Create: `yuqi-runtime/src/release-executor.mjs`
 - Modify: `yuqi-runtime/src/promotion-controller.mjs`
 - Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/src/visible-result-commit.mjs`
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Modify: `yuqi-runtime/src/turn-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/shadow-dispatcher.mjs`
@@ -4522,6 +4537,7 @@ plan owner independently reviews Task 10F and explicitly releases it.
 - Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
 - Modify: `scripts/migrate-yuqi-agency-state.mjs`
 - Create: `yuqi-runtime/test/release-pair.test.mjs`
+- Create: `yuqi-runtime/test/comparison-contract.test.mjs`
 - Create: `yuqi-runtime/test/release-executor.test.mjs`
 - Modify: `yuqi-runtime/test/promotion-controller.test.mjs`
 - Create: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
@@ -4529,6 +4545,7 @@ plan owner independently reviews Task 10F and explicitly releases it.
 - Modify: `yuqi-runtime/test/store-agency-v10.test.mjs`
 - Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
 - Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
+- Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
 - Modify: `yuqi-runtime/test/orchestrator.test.mjs`
 - Modify: `yuqi-runtime/test/turn-dispatcher.test.mjs`
 - Modify: `yuqi-runtime/test/shadow-dispatcher.test.mjs`
@@ -4548,7 +4565,9 @@ plan owner independently reviews Task 10F and explicitly releases it.
   both store-owned creation transactions; and persisted release IDs/checksums for
   life-planning attempts. Produces PC schema v14, whose only schema delta from
   v13 is retry-safe canary-slot ownership indexes; v13 visible/redaction
-  semantics remain unchanged.
+  semantics remain unchanged. Produces one pure fresh-comparison contract that
+  distinguishes the persisted compatibility mode, release-aware direction, and
+  job type without allowing any caller to equate the three namespaces.
 
 Task 11, not Task 23, owns the read-only release-pair contract needed to create
 work. Task 23 owns candidate registration, phase mutation, promotion commands,
@@ -4837,6 +4856,91 @@ test('release-aware directions classify shadow and canary while legacy jobs stil
   }), /comparison direction authority conflict/);
 });
 
+test('fresh comparison contract keeps database mode direction and job type distinct', () => {
+  assert.deepEqual(
+    comparisonContractForDirection('stable_authoritative_candidate_compare'),
+    {
+      comparisonMode: 'cognition_compare',
+      comparisonDirection: 'stable_authoritative_candidate_compare',
+      jobType: 'shadow_cognition'
+    }
+  );
+  assert.deepEqual(comparisonContractForMode('legacy_compare'), {
+    comparisonMode: 'legacy_compare',
+    comparisonDirection: 'candidate_authoritative_stable_compare',
+    jobType: 'active_canary_compare'
+  });
+  assert.deepEqual(comparisonContractForMode('none'), {
+    comparisonMode: 'none',
+    comparisonDirection: null,
+    jobType: null
+  });
+  for (const legacyAlias of [
+    'legacy_authoritative_cognition_compare',
+    'cognition_authoritative_legacy_compare'
+  ]) {
+    assert.throws(
+      () => comparisonContractForDirection(legacyAlias),
+      /fresh comparison contract/
+    );
+  }
+});
+
+test('canonical commit validates compatibility mode against release direction and job type', () => {
+  const shadow = createCommittedDraftWithPinnedComparison({
+    comparisonMode: 'cognition_compare',
+    comparisonReleaseId: 'candidate-r3'
+  });
+  assert.doesNotThrow(() => commitVisibleResult({
+    ...shadow.commit,
+    comparisonReleaseId: 'candidate-r3',
+    comparisonDirection: 'stable_authoritative_candidate_compare',
+    comparisonJob: {
+      ...shadow.commit.comparisonJob,
+      jobType: 'shadow_cognition',
+      payload: {
+        ...shadow.commit.comparisonJob.payload,
+        comparisonDirection: 'stable_authoritative_candidate_compare'
+      }
+    }
+  }));
+  for (const mutation of [
+    { comparisonDirection: 'cognition_compare' },
+    { comparisonDirection: 'legacy_authoritative_cognition_compare' },
+    { comparisonDirection: 'candidate_authoritative_stable_compare' },
+    { comparisonReleaseId: 'stable-r2' },
+    { jobType: 'active_canary_compare' }
+  ]) {
+    const input = mutateComparisonCommit(shadow.commit, mutation);
+    assert.throws(() => commitVisibleResult(input), /comparison authority conflict/);
+  }
+
+  const canary = createCommittedDraftWithPinnedComparison({
+    comparisonMode: 'legacy_compare',
+    comparisonReleaseId: 'stable-r2'
+  });
+  assert.doesNotThrow(() => commitVisibleResult(withComparisonContract(canary.commit, {
+    comparisonDirection: 'candidate_authoritative_stable_compare',
+    jobType: 'active_canary_compare'
+  })));
+
+  const stable = createCommittedDraftWithPinnedComparison({
+    comparisonMode: 'none',
+    comparisonReleaseId: null
+  });
+  assert.doesNotThrow(() => commitVisibleResult({
+    ...stable.commit,
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    comparisonJob: null
+  }));
+  assert.throws(() => commitVisibleResult({
+    ...stable.commit,
+    comparisonReleaseId: 'candidate-r3',
+    comparisonDirection: 'stable_authoritative_candidate_compare'
+  }), /comparison authority conflict/);
+});
+
 test('stale or caller-invented release pairs have zero creation side effects', () => {
   const before = snapshotCanonicalCreationRows();
   assert.throws(() => createCanonicalTurnWithPair({
@@ -4940,7 +5044,7 @@ v13 invariant assertions.
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
+node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
 npm.cmd test
 ```
 
@@ -5041,6 +5145,54 @@ export function resolvePipelinePair(rollout) {
 }
 ```
 
+Create `comparison-contract.mjs` as the only fresh-version-1 conversion between
+the three deliberately different namespaces. Neither store, orchestrator,
+visible commit, life planning nor comparison worker may carry a second map:
+
+```js
+const FRESH_COMPARISON_CONTRACTS = Object.freeze([
+  Object.freeze({
+    comparisonMode: 'none',
+    comparisonDirection: null,
+    jobType: null
+  }),
+  Object.freeze({
+    comparisonMode: 'cognition_compare',
+    comparisonDirection: 'stable_authoritative_candidate_compare',
+    jobType: 'shadow_cognition'
+  }),
+  Object.freeze({
+    comparisonMode: 'legacy_compare',
+    comparisonDirection: 'candidate_authoritative_stable_compare',
+    jobType: 'active_canary_compare'
+  })
+]);
+
+function copy(contract) {
+  return { ...contract };
+}
+
+export function comparisonContractForDirection(comparisonDirection) {
+  const contract = FRESH_COMPARISON_CONTRACTS.find(
+    item => item.comparisonDirection === comparisonDirection
+  );
+  if (!contract) throw new Error('fresh comparison contract direction conflict');
+  return copy(contract);
+}
+
+export function comparisonContractForMode(comparisonMode) {
+  const contract = FRESH_COMPARISON_CONTRACTS.find(
+    item => item.comparisonMode === comparisonMode
+  );
+  if (!contract) throw new Error('fresh comparison contract mode conflict');
+  return copy(contract);
+}
+```
+
+The module intentionally does not accept either historical comparison-direction
+alias. Those aliases belong only to the explicitly version-0 worker branch and
+must never be converted into a fresh contract.
+
 Create `release-executor.mjs` as the only release-ID-to-runtime adapter
 registry. It loads the immutable `pipeline_releases` row itself, verifies the
 caller/subject checksum, and selects from a closed exact `pipelineVersion`
@@ -5081,7 +5233,17 @@ blocked canary selection fails closed with stable code
 pair. Task 23 extends this same method to perform the transactional per-kind
 rollback, so the orchestrator call site does not change.
 
-New version-1 turns and fresh Task 11 life attempts persist only the
+There are three distinct fields, and they are never equal by design:
+
+| Authority field | Fresh version-1 value | Purpose |
+|---|---|---|
+| `turns.comparison_mode` / life `comparison_mode` | `none`, `cognition_compare`, `legacy_compare` | existing database compatibility/scheduling projection |
+| canonical commit + job payload `comparisonDirection`, life `comparison_direction` | release-aware direction below or null | immutable release direction |
+| comparison job `job_type` | `shadow_cognition`, `active_canary_compare` or absent | worker operation |
+
+`turns` has no `comparison_direction` column, and v14 must not add one: its only
+schema delta remains the retry-safe canary indexes. Fresh version-1 canonical
+commit descriptors/jobs and fresh Task 11 life attempts use only the
 release-aware direction strings emitted above:
 `stable_authoritative_candidate_compare` and
 `candidate_authoritative_stable_compare`. The older
@@ -5093,6 +5255,24 @@ already-persisted result-authority-version-0 turns, jobs and life attempts.
 IDs/checksums/epochs/slot, accepts the appropriate legacy alias only for a
 legacy subject, and rejects a cross-direction pair. New code never emits a
 legacy alias.
+
+On the uncommitted path, `commitVisibleResult()` must import
+`comparisonContractForMode()` and validate the complete persisted-turn tuple
+before any canonical result write:
+
+1. `input.comparisonReleaseId` exactly equals the pinned turn release ID;
+2. `input.comparisonDirection` exactly equals the contract's release-aware
+   direction, never the compatibility mode string;
+3. a comparison exists iff the contract has a non-null `jobType`;
+4. the job type and payload direction exactly equal that same contract;
+5. `none` requires null comparison release/direction and no comparison job.
+
+The normalized canonical commit payload retains the release-aware top-level
+direction and the normalized comparison descriptor. A version-1 canonical
+turn presenting a legacy alias, `cognition_compare`/`legacy_compare` as a
+direction, a cross-paired job type, or a different top-level release ID fails
+with zero commit writes. Existing exact-replay checksum behavior remains
+unchanged.
 
 Do not expand or reinterpret Task 10F's canonical comparison descriptor to
 repair the old worker. For a version-1 turn job, the worker joins
@@ -5167,7 +5347,8 @@ The pair resolver deliberately does not invent compatibility mode. The store
 also validates the rollout's `current_mode/rollout_phase/candidate_phase`
 projection (including graduated `active/stable/none`) and pins
 `pipeline_mode=current_mode`. Derive the remaining compatibility fields from
-that validated row and pair: stable-visible comparison maps to
+that validated row and pair only through
+`comparisonContractForDirection(pair.comparisonDirection)`: stable-visible comparison maps to
 `comparison_mode=cognition_compare`; candidate-visible comparison maps to
 `comparison_mode=legacy_compare`; no comparison maps to
 `comparison_mode=none`; `authoritative_pipeline` is `cognition` only for an
@@ -5394,7 +5575,8 @@ from a nonexistent top-level `triggerId`.
 `buildComparisonJobDraftFromTurn({ turn, envelope })` has no database side
 effect and accepts the persisted turn object rather than caller-selected
 release fields. It deterministically derives job type, comparison release and
-direction, rollout evidence/shadow/canary epochs/slot, annotation checksum and
+direction through `comparisonContractForMode(turn.comparisonMode)`, rollout
+evidence/shadow/canary epochs/slot, annotation checksum and
 Task 10F's exact input checksum. Task 10 inserts it as
 step 8 of the same result transaction and fills the authoritative group/checksum
 from that transaction; there is no post-commit window where a visible result
@@ -5466,11 +5648,13 @@ invariant failure and never regenerated or silently downgraded.
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
+node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
 ```
 
 Expected: PASS; the resolver/store/controller direction tests agree at canary
 slots 9/10/11; life attempts persist release IDs/checksums across restart;
+fresh canonical commits keep compatibility mode, release-aware direction and
+job type distinct and reject every cross-pair with zero writes;
 graduated `active/stable/none` remains active on its new stable release;
 v13→v14 changes only slot indexes/user version and is fault-atomic; canonical
 retry and life subjects reconcile exactly with canary counters;
@@ -5483,7 +5667,7 @@ stable-visible behavior remain unchanged.
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add yuqi-runtime/src/release-pair.mjs yuqi-runtime/src/release-executor.mjs yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/shadow-dispatcher.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/src/cloud-relay-pump.mjs scripts/migrate-yuqi-agency-state.mjs yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
+git add yuqi-runtime/src/release-pair.mjs yuqi-runtime/src/comparison-contract.mjs yuqi-runtime/src/release-executor.mjs yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/shadow-dispatcher.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/src/cloud-relay-pump.mjs scripts/migrate-yuqi-agency-state.mjs yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/comparison-contract.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
 git commit -m "feat: integrate v3 release execution and recovery"
 ```
 

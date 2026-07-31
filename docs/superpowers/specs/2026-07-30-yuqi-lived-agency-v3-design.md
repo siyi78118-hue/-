@@ -586,6 +586,18 @@ wire protocol 版本与 PC 内部结果权威版本是两个独立维度：
 
 release pair 的阶段投影只有一个实现：Task 11 建立不依赖 store/controller/orchestrator 的纯 `release-pair.mjs`，`PromotionController` 只委托它，fresh turn 创建事务和 fresh life-planning attempt 创建事务也调用同一个函数重新解析。orchestrator 的预读只用于选择将要请求的 release；store 在 `BEGIN IMMEDIATE` 内用 rollout revision CAS、当前计数和不可变 release row 再次证明该 pair。resolver 只决定 visible/comparison release identity 与方向，不擅自推导兼容 `pipeline_mode`；store 还必须验证 `current_mode/rollout_phase/candidate_phase` 投影，并允许毕业后的 `active/stable/none`。retry/open attempt 恢复只认自身持久 pins，不重新解析当前 rollout。Task 23 只增加 candidate 注册、阶段迁移、晋级、熔断和回退，不能再实现第二份 phase switch。
 
+comparison 在持久层有三个名字不同、用途不同的域，不能互相直接比较：
+
+| 域 | fresh version-1 合法值 | 权威用途 |
+|---|---|---|
+| compatibility mode | `none` / `cognition_compare` / `legacy_compare` | 既有 `turns.comparison_mode` 与 life `comparison_mode` 的数据库调度投影 |
+| release direction | null / `stable_authoritative_candidate_compare` / `candidate_authoritative_stable_compare` | canonical commit、comparison job payload 与 life `comparison_direction` 的 release 语义 |
+| job type | null / `shadow_cognition` / `active_canary_compare` | 后台 worker 操作 |
+
+Task 11 必须建立独立、无 store 依赖的 `comparison-contract.mjs`，以一个冻结闭集提供 `comparisonContractForDirection()` 与 `comparisonContractForMode()`。stable-visible candidate compare 的三元组固定为 `cognition_compare + stable_authoritative_candidate_compare + shadow_cognition`；candidate-visible stable compare 固定为 `legacy_compare + candidate_authoritative_stable_compare + active_canary_compare`；无对照固定为 `none + null + null`。store 创建、canonical commit、orchestrator job draft、life attempt/result 与 compare worker 全部调用这一份契约，不得各自复制 Map 或用字符串包含关系推断。
+
+`turns` 没有也不新增 `comparison_direction` 列；v14 的唯一 schema 变化仍是 retry-safe canary slot indexes。fresh canonical turn 只在 `turns.comparison_mode` 保存 compatibility mode；release-aware direction 保存在 canonical commit semantic payload 与 comparison job descriptor。life attempt 因已有两列而同时保存 compatibility mode 与 release direction，并必须通过同一三元组自洽。`commitVisibleResult()` 的未提交路径先用持久 turn mode 解析三元组，再精确核对顶层 `comparisonReleaseId/comparisonDirection`、job type、job payload direction 与 pinned turn release；`none` 必须同时没有 comparison release、direction 和 job。任一把 `cognition_compare` 当方向、把 release direction 写进 `turns.comparison_mode`、交叉配对 job type、使用不同顶层 release，或在 version-1 路径使用历史 alias 的输入，都必须在任何结果写入前失败。已提交 exact replay 仍按既有 canonical payload checksum 验证并返回原 receipt，不建立第二套 replay 语义。
+
 fresh version-1 authority 的 comparison direction 固定使用 release 语义：
 `stable_authoritative_candidate_compare` 或
 `candidate_authoritative_stable_compare`。旧
