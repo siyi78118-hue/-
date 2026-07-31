@@ -183,7 +183,7 @@ export function validateStatePatchAgainstAgency({
   };
 }
 
-export function canonicalCommitPayload(input) {
+function canonicalCommitPayloadV1(input) {
   return {
     payloadVersion: 'pc-visible-commit-v1',
     authorityOrigin: 'pc',
@@ -211,30 +211,49 @@ export function canonicalCommitPayload(input) {
   };
 }
 
+export function canonicalCommitPayload(input) {
+  const payload = canonicalCommitPayloadV1(input);
+  payload.payloadVersion = 'pc-visible-commit-v2';
+  payload.input.clearEpoch = Number(input.inputClearEpoch ?? 0);
+  return payload;
+}
+
 export function commitVisibleResult(input) {
   if (!input?.store) throw new Error('visible commit store is required');
-  const canonicalPayload = canonicalCommitPayload(input);
-  const commitChecksum = contentHash(canonicalPayload);
   return input.store.withImmediateTransaction(() => {
-    const existing = input.store.getVisibleCommitReceipt(input.authorityLineageKey);
+    const existing = input.store.readCanonicalCommitOutcomeInternal({
+      lineageKey: input.authorityLineageKey,
+      expectedTurnId: input.turnId,
+      expectedOrigin: 'pc'
+    });
     if (existing) {
+      const receipt = existing.receipt;
+      const canonicalPayload = receipt.commitPayloadVersion === 'pc-visible-commit-v1'
+        ? canonicalCommitPayloadV1(input)
+        : canonicalCommitPayload(input);
+      const commitChecksum = contentHash(canonicalPayload);
       assert.equal(
-        existing.authorityOrigin,
+        receipt.authorityOrigin,
         'pc',
         'lineage already committed by a different authority origin'
       );
       assert.equal(
-        existing.commitPayloadVersion,
-        'pc-visible-commit-v1',
+        receipt.commitPayloadVersion,
+        canonicalPayload.payloadVersion,
         'lineage receipt payload version conflict'
       );
       assert.equal(
-        existing.commitChecksum,
+        receipt.commitChecksum,
         commitChecksum,
         'lineage already committed with different checksum'
       );
-      return { ...existing, committed: false };
+      return { ...receipt, status: existing.status, committed: false };
     }
+
+    const canonicalPayload = input.store.userVersion() >= 13
+      ? canonicalCommitPayload(input)
+      : canonicalCommitPayloadV1(input);
+    const commitChecksum = contentHash(canonicalPayload);
 
     const authority = input.store.readCommitAuthority({
       turnId: input.turnId,
@@ -243,6 +262,9 @@ export function commitVisibleResult(input) {
     });
     if (!authority.turn || authority.turn.resultAuthorityVersion !== 1) {
       throw new Error('result authority conflict');
+    }
+    if (Number(input.inputClearEpoch ?? 0) !== Number(authority.turn.inputClearEpoch || 0)) {
+      throw new Error('clear epoch authority conflict');
     }
     const envelope = JSON.parse(authority.turn.envelopeJson);
     const effectiveAt = Number(
@@ -391,7 +413,7 @@ export function commitVisibleResult(input) {
       statePatch: validatedStatePatch,
       memoryJobs: normalizedMemoryJobs,
       authorityOrigin: 'pc',
-      commitPayloadVersion: 'pc-visible-commit-v1',
+      commitPayloadVersion: canonicalPayload.payloadVersion,
       authorityManifest: semantic,
       groupId: deriveVisibleGroupId(input.authorityLineageKey),
       commitChecksum

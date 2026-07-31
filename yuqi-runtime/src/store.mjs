@@ -46,6 +46,17 @@ const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
 });
 
 const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
+const CANONICAL_RESULT_TURN_KINDS = new Set([
+  'DIRECT_REPLY',
+  'PROACTIVE_CHAT',
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY',
+  'ROLE_PLAN_CHAT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_CHAT_PRIVATE',
+  'ROLE_PLAN_MOMENT_PRIVATE'
+]);
 const BASELINE_V2_CANDIDATE_RELEASE = Object.freeze({
   releaseId: `release_cognition_v2_${BASELINE_V2_CANDIDATE_CHECKSUM.slice(0, 24)}`,
   pipelineVersion: 'cognition-v2-candidate-2026-07-30',
@@ -97,6 +108,109 @@ function parseJson(value, fallback = null) {
   try { return JSON.parse(value); } catch { return fallback; }
 }
 
+function assertOrdinalCommitmentRows(rows, field, label, start = 0) {
+  const ordered = [...rows].sort((left, right) => Number(left[field]) - Number(right[field]));
+  ordered.forEach((row, index) => {
+    if (Number(row[field]) !== index + start) {
+      throw new Error(`${label} commitment sequence conflict`);
+    }
+  });
+  return ordered;
+}
+
+function visibleResultTombstoneCommitment({ groupId, itemRows, actionRows }) {
+  const items = assertOrdinalCommitmentRows(itemRows, 'ordinal', 'visible item').map(row => ({
+    ordinal: Number(row.ordinal), messageId: String(row.message_id), itemChecksum: String(row.item_checksum)
+  }));
+  const actions = assertOrdinalCommitmentRows(actionRows, 'ordinal', 'visible action').map(row => ({
+    ordinal: Number(row.ordinal), actionId: String(row.action_id), actionChecksum: String(row.action_checksum)
+  }));
+  return contentHash({
+    version: 'visible-result-tombstone-v1', groupId: String(groupId),
+    itemCount: items.length, actionCount: actions.length, items, actions
+  });
+}
+
+function currentUserBatchTombstoneCommitment({ turnId, batchId, itemRows }) {
+  const items = assertOrdinalCommitmentRows(itemRows, 'sequence', 'current user batch').map(row => ({
+    sequence: Number(row.sequence), messageId: String(row.message_id), checksum: String(row.checksum)
+  }));
+  return contentHash({
+    version: 'current-user-batch-tombstone-v1', turnId: String(turnId), batchId: String(batchId),
+    itemCount: items.length, items
+  });
+}
+
+function authorityRedactionDeliveriesCommitment({ groupId, deliveryRows }) {
+  const rows = [...deliveryRows]
+    .map(row => {
+      if (!Object.hasOwn(row, 'relay_message_id')
+        || !Object.hasOwn(row, 'recovery_ack_seq')
+        || !Object.hasOwn(row, 'authority_commit_checksum')) {
+        throw new Error('redaction delivery commitment relay message id is required');
+      }
+      const relayMessageId = row.relay_message_id == null ? null : String(row.relay_message_id);
+      const authorityCommitChecksum = String(row.authority_commit_checksum || '');
+      const recoveryAckSeq = Number(row.recovery_ack_seq);
+      if (!/^[a-f0-9]{64}$/.test(authorityCommitChecksum)
+        || !Number.isSafeInteger(recoveryAckSeq) || recoveryAckSeq < 0) {
+        throw new Error('redaction delivery commitment checksum conflict');
+      }
+      return {
+        peerId: String(row.peer_id),
+        relayMessageId,
+        recoveryAckSeq,
+        authorityCommitChecksum
+      };
+    })
+    .sort((left, right) => left.peerId.localeCompare(right.peerId));
+  if (new Set(rows.map(row => row.peerId)).size !== rows.length) {
+    throw new Error('redaction delivery commitment duplicate peer conflict');
+  }
+  return contentHash({
+    version: 'authority-redaction-deliveries-v1',
+    groupId: String(groupId), deliveryCount: rows.length, deliveries: rows
+  });
+}
+
+function authorityLineageAttemptsCommitment({ lineageKey, attemptRows }) {
+  const attempts = assertOrdinalCommitmentRows(
+    attemptRows, 'lineage_revision_at_creation', 'lineage attempt', 1
+  )
+    .map(row => ({
+      lineageRevisionAtCreation: Number(row.lineage_revision_at_creation),
+      turnId: String(row.turn_id), turnKind: String(row.turn_kind),
+      retryOfTurnId: row.retry_of_turn_id == null ? null : String(row.retry_of_turn_id),
+      inputUserBatchId: row.input_user_batch_id == null ? null : String(row.input_user_batch_id),
+      envelopeChecksum: String(row.envelope_checksum),
+      batchTombstoneCommitment: row.tombstone_commitment == null ? null : String(row.tombstone_commitment),
+      rolloutRevision: Number(row.rollout_revision),
+      rolloutEvidenceEpoch: Number(row.rollout_evidence_epoch),
+      authoritativeReleaseId: row.authoritative_release_id == null ? null : String(row.authoritative_release_id),
+      comparisonReleaseId: row.comparison_release_id == null ? null : String(row.comparison_release_id),
+      comparisonMode: String(row.comparison_mode || 'none'),
+      annotationSnapshotChecksum: contentHash(parseJson(row.annotation_snapshot_json, {}))
+    }));
+  return contentHash({
+    version: 'authority-lineage-attempts-v1', lineageKey: String(lineageKey),
+    attemptCount: attempts.length, attempts
+  });
+}
+
+function deriveTerminalDisposition(turnKind, itemCount, actionCount) {
+  const kind = String(turnKind || '');
+  if (kind === 'DIRECT_REPLY') {
+    if (itemCount < 1) throw new Error('DIRECT_REPLY requires visible result items');
+    return 'visible';
+  }
+  if (!CANONICAL_RESULT_TURN_KINDS.has(kind)) {
+    throw new Error('canonical terminal turn kind conflict');
+  }
+  if (itemCount > 0) return 'visible';
+  if (actionCount > 0) return 'action_only';
+  return 'skip';
+}
+
 function mapTurn(row) {
   if (!row) return null;
   return {
@@ -124,6 +238,7 @@ function mapTurn(row) {
     laneKey: row.lane_key || null,
     laneRevision: row.lane_revision ?? null,
     inputVisibilitySequence: row.input_visibility_sequence ?? null,
+    inputClearEpoch: Number(row.input_clear_epoch || 0),
     generationFingerprint: row.generation_fingerprint || null,
     resultAuthorityVersion: Number(row.result_authority_version || 0),
     authorityLineageKey: row.authority_lineage_key || null,
@@ -427,7 +542,8 @@ function mapCloudDelivery(row) {
     deliveredAt: row.delivered_at,
     confirmedAt: row.confirmed_at ?? null,
     authorityGroupId: row.authority_group_id || null,
-    authorityCommitChecksum: row.authority_commit_checksum || null
+    authorityCommitChecksum: row.authority_commit_checksum || null,
+    relayMessageId: row.relay_message_id || null
   };
 }
 
@@ -588,6 +704,8 @@ function mapInteractionLane(row) {
     uiAppliedGroupId: row.ui_applied_group_id || null,
     uiAppliedSequence: Number(row.ui_applied_sequence),
     localSequence: Number(row.local_sequence),
+    clearEpoch: Number(row.clear_epoch || 0),
+    clearedThroughSequence: Number(row.cleared_through_sequence || 0),
     lastCommitChecksum: row.last_commit_checksum || null,
     updatedAt: Number(row.updated_at)
   };
@@ -646,16 +764,26 @@ export class YuqiStore {
 
   migrate() {
     const initialVersion = this.userVersion();
-    if (this.migrationOptions
+    if (this.migrationOptions?.expectedSourceVersion != null
       && initialVersion !== this.migrationOptions.expectedSourceVersion) {
       throw new Error(
         `migration source version mismatch: expected ${this.migrationOptions.expectedSourceVersion}, got ${initialVersion}`
       );
     }
-    if (initialVersion > 12) {
+    const targetVersion = Number(this.migrationOptions?.targetVersion || 13);
+    if (![12, 13].includes(targetVersion)) {
+      throw new Error(`unsupported migration target version ${targetVersion}`);
+    }
+    if (initialVersion > 13) {
       throw new Error(`unsupported database user_version ${initialVersion}`);
     }
-    if (initialVersion === 12) {
+    if (initialVersion === 13) {
+      this.assertAgencyV10Invariants();
+      this.assertVisibleAuthorityV13Invariants();
+      this.assertExpectedPostMigrationInvariantChecksum();
+      return;
+    }
+    if (initialVersion === 12 && targetVersion === 12) {
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV12Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
@@ -1210,8 +1338,18 @@ export class YuqiStore {
       if (initialVersion < 12) {
         this.migrateVisibleAuthorityV12Internal();
       }
+      if (targetVersion === 12) {
+        this.assertAgencyV10Invariants();
+        this.assertVisibleAuthorityV12Invariants();
+        this.assertExpectedPostMigrationInvariantChecksum();
+        this.db.exec('COMMIT');
+        return;
+      }
+      if (initialVersion < 13) {
+        this.migrateVisibleAuthorityV13Internal();
+      }
       this.assertAgencyV10Invariants();
-      this.assertVisibleAuthorityV12Invariants();
+      this.assertVisibleAuthorityV13Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
       this.db.exec('COMMIT');
     } catch (error) {
@@ -1223,7 +1361,9 @@ export class YuqiStore {
   assertExpectedPostMigrationInvariantChecksum() {
     const expected = this.migrationOptions?.expectedPostMigrationInvariantChecksum;
     if (!expected) return;
-    const actual = this.visibleAuthorityV11InvariantSummary().checksum;
+    const actual = this.userVersion() === 13
+      ? this.visibleAuthorityV13InvariantSummary().checksum
+      : this.visibleAuthorityV11InvariantSummary().checksum;
     if (actual !== expected) {
       throw new Error(
         `migration post-migration invariant checksum mismatch: expected ${expected}, got ${actual}`
@@ -1544,6 +1684,34 @@ export class YuqiStore {
     `).get();
     if (tableExists) throw new Error('v12 migration found unexpected manifest table');
     this.db.exec(`
+      -- Some populated v10 databases predate user-batch persistence entirely.
+      -- These are empty compatibility projections, not reconstructed authority.
+      CREATE TABLE IF NOT EXISTS current_user_batches (
+        turn_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        character_id TEXT NOT NULL,
+        source_message_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        committed_at INTEGER NOT NULL,
+        checksum TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY(turn_id) REFERENCES turns(turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_current_user_batches_batch
+        ON current_user_batches(batch_id);
+      CREATE TABLE IF NOT EXISTS current_user_batch_items (
+        turn_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        message_json TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        PRIMARY KEY(turn_id, sequence),
+        UNIQUE(turn_id, message_id),
+        FOREIGN KEY(turn_id) REFERENCES current_user_batches(turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_current_user_batch_items_message
+        ON current_user_batch_items(message_id);
       CREATE TABLE visible_result_manifests (
         group_id TEXT PRIMARY KEY,
         authority_origin TEXT NOT NULL,
@@ -1562,12 +1730,309 @@ export class YuqiStore {
     `);
   }
 
+  maybeFailV13Migration(step) {
+    if (this.migrationOptions?.v13MigrationFaultStep === step) {
+      throw new Error(`forced v13 migration fault: ${step}`);
+    }
+  }
+
+  assertV12ToV13SourceInvariantsInternal() {
+    if (this.userVersion() !== 12) {
+      throw new Error(`v13 migration source version mismatch: ${this.userVersion()}`);
+    }
+    const redacted = this.db.prepare(`
+      SELECT g.group_id
+      FROM visible_result_groups g
+      LEFT JOIN visible_result_manifests m ON m.group_id = g.group_id
+      WHERE g.redacted_at IS NOT NULL
+         OR m.redacted_at IS NOT NULL
+         OR m.semantic_json IS NULL
+      LIMIT 1
+    `).get();
+    if (redacted) {
+      throw new Error(`v13 migration rejects v12 redacted source: ${redacted.group_id}`);
+    }
+    const exactColumns = (table, expected) => {
+      const actual = this.db.prepare(`PRAGMA table_info("${table}")`).all()
+        .map(row => row.name);
+      if (canonicalJson(actual) !== canonicalJson(expected)) {
+        throw new Error(`v13 migration v12 schema mismatch: ${table}`);
+      }
+    };
+    exactColumns('current_user_batch_items', [
+      'turn_id', 'batch_id', 'message_id', 'sequence', 'message_json', 'checksum'
+    ]);
+    exactColumns('visible_result_items', [
+      'group_id', 'ordinal', 'message_id', 'item_json', 'item_checksum'
+    ]);
+    exactColumns('visible_result_actions', [
+      'group_id', 'ordinal', 'action_id', 'action_kind', 'target_key',
+      'target_revision', 'action_json', 'action_checksum'
+    ]);
+    for (const turn of this.db.prepare(`
+      SELECT turn_id, rollout_key, envelope_json
+      FROM turns WHERE result_authority_version = 1 ORDER BY turn_id
+    `).all()) {
+      const kind = String(parseJson(turn.envelope_json, {})?.kind || '');
+      if (!CANONICAL_RESULT_TURN_KINDS.has(String(turn.rollout_key || ''))
+        || String(turn.rollout_key || '') !== kind) {
+        throw new Error(`v13 migration canonical turn kind anchor conflict: ${turn.turn_id}`);
+      }
+    }
+    this.assertVisibleAuthorityV12Invariants({ allowHistoricalStatePatch: true });
+  }
+
+  migrateVisibleAuthorityV13Internal() {
+    this.assertV12ToV13SourceInvariantsInternal();
+    const sourceRows = Object.fromEntries([
+      'current_user_batch_items',
+      'visible_result_items',
+      'visible_result_actions'
+    ].map(table => [
+      table,
+      this.db.prepare(`SELECT * FROM "${table}" ORDER BY rowid`).all()
+    ]));
+    this.db.exec(`
+      CREATE TABLE current_user_batch_items_v13 (
+        turn_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        message_json TEXT,
+        checksum TEXT NOT NULL,
+        redacted_at INTEGER,
+        PRIMARY KEY(turn_id, sequence),
+        UNIQUE(turn_id, message_id),
+        CHECK (
+          (message_json IS NOT NULL AND redacted_at IS NULL)
+          OR (message_json IS NULL AND redacted_at IS NOT NULL)
+        ),
+        FOREIGN KEY(turn_id) REFERENCES current_user_batches(turn_id)
+      );
+      CREATE TABLE visible_result_items_v13 (
+        group_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        message_id TEXT NOT NULL UNIQUE,
+        item_json TEXT,
+        item_checksum TEXT NOT NULL,
+        redacted_at INTEGER,
+        PRIMARY KEY(group_id, ordinal),
+        CHECK (
+          (item_json IS NOT NULL AND redacted_at IS NULL)
+          OR (item_json IS NULL AND redacted_at IS NOT NULL)
+        ),
+        FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+      );
+      CREATE TABLE visible_result_actions_v13 (
+        group_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        action_id TEXT NOT NULL UNIQUE,
+        action_kind TEXT,
+        target_key TEXT,
+        target_revision TEXT,
+        action_json TEXT,
+        action_checksum TEXT NOT NULL,
+        redacted_at INTEGER,
+        PRIMARY KEY(group_id, ordinal),
+        CHECK (
+          (
+            action_kind IS NOT NULL
+            AND target_key IS NOT NULL
+            AND action_json IS NOT NULL
+            AND redacted_at IS NULL
+          )
+          OR (
+            action_kind IS NULL
+            AND target_key IS NULL
+            AND target_revision IS NULL
+            AND action_json IS NULL
+            AND redacted_at IS NOT NULL
+          )
+        ),
+        FOREIGN KEY(group_id) REFERENCES visible_result_groups(group_id)
+      );
+    `);
+    this.addColumnIfMissing('turns', 'authority_redacted_at', 'INTEGER');
+    this.addColumnIfMissing('turns', 'input_clear_epoch', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing('turn_authority_lineages', 'redacted_at', 'INTEGER');
+    this.addColumnIfMissing(
+      'turn_authority_lineages', 'attempt_count', 'INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0)'
+    );
+    this.addColumnIfMissing('turn_authority_lineages', 'attempt_commitment', "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing(
+      'current_user_batches', 'item_count', 'INTEGER NOT NULL DEFAULT 0 CHECK(item_count >= 0)'
+    );
+    this.addColumnIfMissing('current_user_batches', 'tombstone_commitment', "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing(
+      'visible_result_groups', 'item_count', 'INTEGER NOT NULL DEFAULT 0 CHECK(item_count >= 0)'
+    );
+    this.addColumnIfMissing(
+      'visible_result_groups', 'action_count', 'INTEGER NOT NULL DEFAULT 0 CHECK(action_count >= 0)'
+    );
+    this.addColumnIfMissing('visible_result_groups', 'tombstone_commitment', "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing(
+      'visible_result_groups', 'redaction_delivery_count', 'INTEGER CHECK(redaction_delivery_count >= 0)'
+    );
+    this.addColumnIfMissing('visible_result_groups', 'redaction_delivery_commitment', 'TEXT');
+    this.addColumnIfMissing('cloud_deliveries', 'relay_message_id', 'TEXT');
+    this.addColumnIfMissing('cloud_deliveries', 'redaction_requested_at', 'INTEGER');
+    this.addColumnIfMissing('cloud_deliveries', 'redaction_acknowledged_at', 'INTEGER');
+    this.addColumnIfMissing('interaction_lanes', 'clear_epoch', 'INTEGER NOT NULL DEFAULT 0');
+    this.addColumnIfMissing(
+      'interaction_lanes',
+      'cleared_through_sequence',
+      'INTEGER NOT NULL DEFAULT 0'
+    );
+    this.db.exec(`
+      CREATE TABLE conversation_clear_controls (
+        control_id TEXT PRIMARY KEY,
+        role_id TEXT NOT NULL,
+        clear_epoch INTEGER NOT NULL CHECK(clear_epoch > 0),
+        cleared_through_sequence INTEGER NOT NULL CHECK(cleared_through_sequence >= 0),
+        requested_at INTEGER NOT NULL,
+        applied_at INTEGER NOT NULL,
+        checksum TEXT NOT NULL,
+        UNIQUE(role_id, clear_epoch)
+      );
+    `);
+    this.maybeFailV13Migration('after_schema_create');
+
+    this.db.exec(`
+      INSERT INTO current_user_batch_items_v13(
+        turn_id, batch_id, message_id, sequence, message_json, checksum, redacted_at
+      )
+      SELECT turn_id, batch_id, message_id, sequence, message_json, checksum, NULL
+      FROM current_user_batch_items;
+    `);
+    this.maybeFailV13Migration('after_current_batch_copy');
+    this.db.exec(`
+      INSERT INTO visible_result_items_v13(
+        group_id, ordinal, message_id, item_json, item_checksum, redacted_at
+      )
+      SELECT group_id, ordinal, message_id, item_json, item_checksum, NULL
+      FROM visible_result_items;
+    `);
+    this.maybeFailV13Migration('after_visible_item_copy');
+    this.db.exec(`
+      INSERT INTO visible_result_actions_v13(
+        group_id, ordinal, action_id, action_kind, target_key, target_revision,
+        action_json, action_checksum, redacted_at
+      )
+      SELECT group_id, ordinal, action_id, action_kind, target_key, target_revision,
+             action_json, action_checksum, NULL
+      FROM visible_result_actions;
+    `);
+    this.maybeFailV13Migration('after_visible_action_copy');
+
+    const copiedRows = {
+      current_user_batch_items: this.db.prepare(`
+        SELECT turn_id, batch_id, message_id, sequence, message_json, checksum
+        FROM current_user_batch_items_v13 ORDER BY rowid
+      `).all(),
+      visible_result_items: this.db.prepare(`
+        SELECT group_id, ordinal, message_id, item_json, item_checksum
+        FROM visible_result_items_v13 ORDER BY rowid
+      `).all(),
+      visible_result_actions: this.db.prepare(`
+        SELECT group_id, ordinal, action_id, action_kind, target_key, target_revision,
+               action_json, action_checksum
+        FROM visible_result_actions_v13 ORDER BY rowid
+      `).all()
+    };
+    for (const table of Object.keys(sourceRows)) {
+      if (canonicalJson(sourceRows[table]) !== canonicalJson(copiedRows[table])) {
+        throw new Error(`v13 migration copy checksum mismatch: ${table}`);
+      }
+    }
+    this.maybeFailV13Migration('after_copy_verification');
+
+    this.db.exec(`
+      ALTER TABLE current_user_batch_items RENAME TO current_user_batch_items_v12;
+      ALTER TABLE visible_result_items RENAME TO visible_result_items_v12;
+      ALTER TABLE visible_result_actions RENAME TO visible_result_actions_v12;
+    `);
+    this.maybeFailV13Migration('after_old_table_rename');
+    this.db.exec(`
+      ALTER TABLE current_user_batch_items_v13 RENAME TO current_user_batch_items;
+      ALTER TABLE visible_result_items_v13 RENAME TO visible_result_items;
+      ALTER TABLE visible_result_actions_v13 RENAME TO visible_result_actions;
+    `);
+    this.maybeFailV13Migration('after_new_table_rename');
+    this.db.exec(`
+      DROP TABLE current_user_batch_items_v12;
+      DROP TABLE visible_result_items_v12;
+      DROP TABLE visible_result_actions_v12;
+      CREATE INDEX idx_current_user_batch_items_message
+        ON current_user_batch_items(message_id);
+    `);
+    for (const batch of this.db.prepare(
+      'SELECT turn_id, batch_id FROM current_user_batches ORDER BY turn_id'
+    ).all()) {
+      const items = this.db.prepare(
+        'SELECT sequence, message_id, checksum FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence'
+      ).all(batch.turn_id);
+      const commitment = currentUserBatchTombstoneCommitment({
+        turnId: batch.turn_id, batchId: batch.batch_id, itemRows: items
+      });
+      this.db.prepare(
+        'UPDATE current_user_batches SET item_count = ?, tombstone_commitment = ? WHERE turn_id = ?'
+      ).run(items.length, commitment, batch.turn_id);
+    }
+    for (const group of this.db.prepare(
+      'SELECT group_id FROM visible_result_groups ORDER BY group_id'
+    ).all()) {
+      const itemRows = this.db.prepare(
+        'SELECT ordinal, message_id, item_checksum FROM visible_result_items WHERE group_id = ? ORDER BY ordinal'
+      ).all(group.group_id);
+      const actionRows = this.db.prepare(
+        'SELECT ordinal, action_id, action_checksum FROM visible_result_actions WHERE group_id = ? ORDER BY ordinal'
+      ).all(group.group_id);
+      const commitment = visibleResultTombstoneCommitment({
+        groupId: group.group_id, itemRows, actionRows
+      });
+      this.db.prepare(
+        'UPDATE visible_result_groups SET item_count = ?, action_count = ?, tombstone_commitment = ? WHERE group_id = ?'
+      ).run(itemRows.length, actionRows.length, commitment, group.group_id);
+    }
+    for (const lineage of this.db.prepare(
+      'SELECT lineage_key FROM turn_authority_lineages ORDER BY lineage_key'
+    ).all()) {
+      const attempts = this.db.prepare(
+        `SELECT t.lineage_revision_at_creation, t.turn_id,
+                t.rollout_key AS turn_kind,
+                t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
+                t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
+             t.comparison_mode, t.annotation_snapshot_json,
+                b.tombstone_commitment
+         FROM turns t LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+         WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
+         ORDER BY t.lineage_revision_at_creation`
+      ).all(lineage.lineage_key);
+      const commitment = authorityLineageAttemptsCommitment({
+        lineageKey: lineage.lineage_key, attemptRows: attempts
+      });
+      this.db.prepare(
+        'UPDATE turn_authority_lineages SET attempt_count = ?, attempt_commitment = ? WHERE lineage_key = ?'
+      ).run(attempts.length, commitment, lineage.lineage_key);
+    }
+    this.maybeFailV13Migration('after_index_create');
+    this.db.exec('PRAGMA user_version = 13;');
+    this.maybeFailV13Migration('after_version_write');
+  }
+
   assertVisibleAuthorityV11Invariants({
     allowVersionTen = false,
-    allowVersionTwelve = false
+    allowVersionTwelve = false,
+    allowVersionThirteen = false
   } = {}) {
     const version = this.userVersion();
-    const expectedVersion = allowVersionTen ? 10 : allowVersionTwelve ? 12 : 11;
+    const expectedVersion = allowVersionTen
+      ? 10
+      : allowVersionTwelve
+        ? 12
+        : allowVersionThirteen
+          ? 13
+          : 11;
     if (version !== expectedVersion) {
       throw new Error(`v11 invariant user_version mismatch: ${version}`);
     }
@@ -1767,7 +2232,18 @@ export class YuqiStore {
       LIMIT 1
     `);
 
-    assertNoInvariantRow('receipt_payload_origin', `
+    assertNoInvariantRow('receipt_payload_origin', allowVersionThirteen ? `
+      SELECT lineage_key, authority_origin, commit_payload_version
+      FROM visible_commit_receipts
+      WHERE (authority_origin = 'pc'
+             AND commit_payload_version NOT IN ('pc-visible-commit-v1', 'pc-visible-commit-v2'))
+         OR (authority_origin = 'android_fallback'
+             AND commit_payload_version NOT IN (
+               'android-fallback-commit-v1', 'android-fallback-commit-v2'
+             ))
+         OR authority_origin NOT IN ('pc', 'android_fallback')
+      LIMIT 1
+    ` : `
       SELECT lineage_key, authority_origin, commit_payload_version
       FROM visible_commit_receipts
       WHERE (authority_origin = 'pc' AND commit_payload_version != 'pc-visible-commit-v1')
@@ -1845,7 +2321,9 @@ export class YuqiStore {
       FROM visible_result_groups g
       LEFT JOIN visible_result_items i ON i.group_id = g.group_id
       GROUP BY g.group_id
-      HAVING item_count < 1 OR min_ordinal != 0 OR max_ordinal != item_count - 1
+      HAVING COUNT(i.ordinal) < 1
+         OR min_ordinal != 0
+         OR max_ordinal != COUNT(i.ordinal) - 1
       LIMIT 1
     `);
 
@@ -1986,8 +2464,14 @@ export class YuqiStore {
     };
   }
 
-  assertVisibleAuthorityV12Invariants() {
-    this.assertVisibleAuthorityV11Invariants({ allowVersionTwelve: true });
+  assertVisibleAuthorityV12Invariants({
+    allowVersionThirteen = false,
+    allowHistoricalStatePatch = false
+  } = {}) {
+    this.assertVisibleAuthorityV11Invariants({
+      allowVersionTwelve: !allowVersionThirteen,
+      allowVersionThirteen
+    });
     const columns = this.db.prepare('PRAGMA table_info(visible_result_manifests)').all();
     const expectedColumns = [
       'group_id', 'authority_origin', 'payload_version', 'semantic_json',
@@ -2207,7 +2691,7 @@ export class YuqiStore {
       const cognitiveState = this.db.prepare(`
         SELECT * FROM cognitive_states WHERE last_authority_group_id = ?
       `).get(group.group_id);
-      if (semantic.statePatch && !cognitiveState) {
+      if (semantic.statePatch && !cognitiveState && !allowHistoricalStatePatch) {
         throw new Error(`v12 invariant manifest cognitive state missing: ${group.group_id}`);
       }
       if (cognitiveState) {
@@ -2224,10 +2708,690 @@ export class YuqiStore {
         }
       }
     }
+    if (allowHistoricalStatePatch) {
+      for (const cognitiveState of this.db.prepare(`
+        SELECT c.*, g.role_id AS group_role_id,
+               g.authoritative_turn_id, m.semantic_json
+        FROM cognitive_states c
+        LEFT JOIN visible_result_groups g
+          ON g.group_id = c.last_authority_group_id
+        LEFT JOIN visible_result_manifests m
+          ON m.group_id = c.last_authority_group_id
+        WHERE c.last_authority_group_id IS NOT NULL
+      `).all()) {
+        const semantic = parseJson(cognitiveState.semantic_json, null);
+        const state = parseJson(cognitiveState.state_json, {});
+        const expectedOpenThreads = (semantic?.statePatch?.openThreads || []).map(item =>
+          typeof item === 'string' ? item : String(item?.threadId || '')
+        ).filter(Boolean);
+        if (!semantic?.statePatch
+          || cognitiveState.group_role_id !== cognitiveState.role_id
+          || cognitiveState.authoritative_turn_id !== cognitiveState.last_turn_id
+          || cognitiveState.checksum !== contentHash(state)
+          || String(state.fastState?.mood || '') !== String(semantic.statePatch.mood || '')
+          || canonicalJson(state.fastState?.openThreadIds || [])
+            !== canonicalJson(expectedOpenThreads)) {
+          throw new Error(
+            `v12 invariant current cognitive state authority: ${cognitiveState.role_id}`
+          );
+        }
+      }
+    }
+  }
+
+  assertVisibleAuthorityV13SchemaInternal() {
+    if (this.userVersion() !== 13) {
+      throw new Error(`v13 invariant user_version mismatch: ${this.userVersion()}`);
+    }
+    const exactColumns = (table, expected) => {
+      const actual = this.db.prepare(`PRAGMA table_info("${table}")`).all()
+        .map(row => row.name);
+      if (canonicalJson(actual) !== canonicalJson(expected)) {
+        throw new Error(`v13 invariant schema mismatch: ${table}`);
+      }
+    };
+    exactColumns('current_user_batch_items', [
+      'turn_id', 'batch_id', 'message_id', 'sequence',
+      'message_json', 'checksum', 'redacted_at'
+    ]);
+    exactColumns('visible_result_items', [
+      'group_id', 'ordinal', 'message_id', 'item_json', 'item_checksum', 'redacted_at'
+    ]);
+    exactColumns('visible_result_actions', [
+      'group_id', 'ordinal', 'action_id', 'action_kind', 'target_key',
+      'target_revision', 'action_json', 'action_checksum', 'redacted_at'
+    ]);
+    exactColumns('conversation_clear_controls', [
+      'control_id', 'role_id', 'clear_epoch', 'cleared_through_sequence',
+      'requested_at', 'applied_at', 'checksum'
+    ]);
+    for (const [table, columns] of Object.entries({
+      turns: ['authority_redacted_at', 'input_clear_epoch'],
+      turn_authority_lineages: ['redacted_at', 'attempt_count', 'attempt_commitment'],
+      current_user_batches: ['item_count', 'tombstone_commitment'],
+      visible_result_groups: [
+        'item_count', 'action_count', 'tombstone_commitment',
+        'redaction_delivery_count', 'redaction_delivery_commitment'
+      ],
+      cloud_deliveries: [
+        'relay_message_id', 'redaction_requested_at', 'redaction_acknowledged_at'
+      ],
+      interaction_lanes: ['clear_epoch', 'cleared_through_sequence']
+    })) {
+      const actual = new Set(this.db.prepare(`PRAGMA table_info("${table}")`).all()
+        .map(row => row.name));
+      const missing = columns.filter(column => !actual.has(column));
+      if (missing.length) {
+        throw new Error(`v13 invariant schema missing ${table}: ${missing.join(',')}`);
+      }
+    }
+  }
+
+  assertVisibleGroupAuthorityInternal(groupId, {
+    purpose = 'reopen',
+    expectedLineageKey = null,
+    expectedTurnId = null,
+    expectedOrigin = null,
+    expectedPayloadVersion = null,
+    expectedCommitChecksum = null
+  } = {}) {
+    const groupKey = String(groupId || '');
+    const authority = this.db.prepare(`
+      SELECT
+        g.*, l.state AS lineage_state, l.latest_turn_id, l.committed_group_id,
+        l.revision AS lineage_revision, l.redacted_at AS lineage_redacted_at,
+        l.attempt_count, l.attempt_commitment,
+        t.character_id, t.device_id, t.result_authority_version, t.rollout_key AS turn_kind,
+        t.turn_revision, t.input_user_batch_id, t.input_visibility_sequence,
+        t.input_clear_epoch, t.authoritative_release_id AS turn_release_id,
+        t.authority_redacted_at AS turn_redacted_at,
+        r.authority_origin AS receipt_origin,
+        r.commit_payload_version, r.commit_checksum,
+        r.turn_revision_after, r.lineage_revision_after,
+        m.authority_origin AS manifest_origin, m.payload_version,
+        m.semantic_json, m.semantic_checksum,
+        m.redacted_at AS manifest_redacted_at
+      FROM visible_result_groups g
+      JOIN turn_authority_lineages l ON l.lineage_key = g.lineage_key
+      JOIN turns t ON t.turn_id = g.authoritative_turn_id
+      JOIN visible_commit_receipts r
+        ON r.lineage_key = g.lineage_key
+       AND r.group_id = g.group_id
+       AND r.authoritative_turn_id = g.authoritative_turn_id
+      JOIN visible_result_manifests m ON m.group_id = g.group_id
+      WHERE g.group_id = ?
+    `).get(groupKey);
+    if (!authority) throw new Error('canonical visible group authority conflict');
+    const expectedFields = [
+      [expectedLineageKey, authority.lineage_key],
+      [expectedTurnId, authority.authoritative_turn_id],
+      [expectedOrigin, authority.receipt_origin],
+      [expectedPayloadVersion, authority.commit_payload_version],
+      [expectedCommitChecksum, authority.commit_checksum]
+    ];
+    if (expectedFields.some(([expected, actual]) =>
+      expected != null && String(expected) !== String(actual))) {
+      throw new Error('canonical visible group authority conflict');
+    }
+    if (authority.lineage_state !== 'committed'
+      || authority.committed_group_id !== groupKey
+      || authority.latest_turn_id !== authority.authoritative_turn_id
+      || Number(authority.result_authority_version) !== 1
+      || Number(authority.turn_revision) !== Number(authority.turn_revision_after)
+      || Number(authority.lineage_revision) !== Number(authority.lineage_revision_after)
+      || authority.role_id !== authority.character_id
+      || authority.authoritative_release_id !== authority.turn_release_id
+      || authority.authority_origin !== authority.receipt_origin
+      || authority.manifest_origin !== authority.receipt_origin
+      || authority.payload_version !== authority.commit_payload_version
+      || authority.semantic_checksum !== authority.commit_checksum) {
+      throw new Error('canonical visible group authority conflict');
+    }
+    const receiptMatrixKey = `${authority.receipt_origin}:${authority.commit_payload_version}`;
+    const historicalPayload = new Set([
+      'pc:pc-visible-commit-v1',
+      'android_fallback:android-fallback-commit-v1'
+    ]).has(receiptMatrixKey);
+    const currentPayload = new Set([
+      'pc:pc-visible-commit-v2',
+      'android_fallback:android-fallback-commit-v2'
+    ]).has(receiptMatrixKey);
+    if ((!historicalPayload && !currentPayload)
+      || (historicalPayload && Number(authority.input_clear_epoch) !== 0)) {
+      throw new Error('canonical visible group receipt authority conflict');
+    }
+    const lineageAttempts = this.db.prepare(`
+      SELECT t.lineage_revision_at_creation, t.turn_id,
+             t.rollout_key AS turn_kind,
+             t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum, t.envelope_json,
+             t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
+             t.comparison_mode, t.annotation_snapshot_json,
+             b.tombstone_commitment
+      FROM turns t
+      LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+      WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
+      ORDER BY t.lineage_revision_at_creation
+    `).all(authority.lineage_key);
+    if (lineageAttempts.length !== Number(authority.attempt_count)
+      || authorityLineageAttemptsCommitment({
+        lineageKey: authority.lineage_key,
+        attemptRows: lineageAttempts
+      }) !== authority.attempt_commitment) {
+      throw new Error('canonical visible group lineage attempt commitment conflict');
+    }
+    const redactedAuthority = authority.redacted_at != null
+      || authority.manifest_redacted_at != null || authority.lineage_redacted_at != null;
+    if (lineageAttempts.some(attempt => !CANONICAL_RESULT_TURN_KINDS.has(attempt.turn_kind)
+      || (!redactedAuthority && String(parseJson(attempt.envelope_json, {})?.kind || '') !== attempt.turn_kind))) {
+      throw new Error('canonical visible group turn kind anchor conflict');
+    }
+    if (redactedAuthority) {
+      if (purpose === 'delivery') {
+        throw new Error('canonical visible result is redacted');
+      }
+      const redactedAt = Number(authority.redacted_at);
+      if (!Number.isSafeInteger(redactedAt) || redactedAt <= 0
+        || Number(authority.manifest_redacted_at) !== redactedAt
+        || Number(authority.lineage_redacted_at) !== redactedAt
+        || authority.semantic_json !== null) {
+        throw new Error('redacted authority group shell conflict');
+      }
+      const sha256Pattern = /^[a-f0-9]{64}$/i;
+      const attempts = this.db.prepare(`
+        SELECT * FROM turns
+        WHERE authority_lineage_key = ?
+        ORDER BY lineage_revision_at_creation, turn_id
+      `).all(authority.lineage_key);
+      if (!attempts.length || attempts.some(turn =>
+        Number(turn.authority_redacted_at) !== redactedAt
+        || canonicalJson(parseJson(turn.envelope_json, null)) !== '{"redacted":true}'
+        || turn.memory_packet_json !== null
+        || turn.brain_draft_json !== null
+        || turn.supervisor_json !== null
+        || turn.reply_json !== null
+        || turn.error_json !== null
+        || canonicalJson(parseJson(turn.route_reasons_json, null)) !== '[]'
+        || canonicalJson(parseJson(turn.annotation_snapshot_json, null)) !== '{}'
+        || !sha256Pattern.test(String(turn.envelope_checksum || '')))) {
+        throw new Error('redacted authority turn shell conflict');
+      }
+      const turnIds = attempts.map(turn => turn.turn_id);
+      const placeholders = turnIds.map(() => '?').join(',');
+      const batchItems = this.db.prepare(`
+        SELECT * FROM current_user_batch_items
+        WHERE turn_id IN (${placeholders})
+        ORDER BY turn_id, sequence
+      `).all(...turnIds);
+      const batchesByTurn = new Map();
+      for (const item of batchItems) {
+        const list = batchesByTurn.get(item.turn_id) || [];
+        list.push(item);
+        batchesByTurn.set(item.turn_id, list);
+        if (item.message_json !== null || Number(item.redacted_at) !== redactedAt
+          || !sha256Pattern.test(String(item.checksum || ''))) {
+          throw new Error('redacted authority input batch shell conflict');
+        }
+      }
+      for (const items of batchesByTurn.values()) {
+        items.forEach((item, sequence) => {
+          if (Number(item.sequence) !== sequence) {
+            throw new Error('redacted authority input batch shell conflict');
+          }
+        });
+      }
+      const linkedMessages = this.db.prepare(`
+        SELECT * FROM messages
+        WHERE turn_id IN (${placeholders}) OR authority_group_id = ?
+      `).all(...turnIds, groupKey);
+      if (linkedMessages.some(message => message.content !== '')) {
+        throw new Error('redacted authority message shell conflict');
+      }
+      const linkedMessageIds = linkedMessages.map(message => message.message_id);
+      const messagePlaceholders = linkedMessageIds.length
+        ? linkedMessageIds.map(() => '?').join(',')
+        : "''";
+      const annotationCount = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value FROM annotations
+        WHERE turn_id IN (${placeholders})
+           OR source_message_id IN (${messagePlaceholders})
+      `).get(...turnIds, ...linkedMessageIds).value);
+      const diagnosticCount = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value FROM diagnostics
+        WHERE turn_id IN (${placeholders})
+      `).get(...turnIds).value);
+      const syncCount = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value FROM sync_log
+        WHERE entity_type != 'authority_redaction'
+          AND entity_id IN (${[...turnIds, ...linkedMessageIds].map(() => '?').join(',')})
+      `).get(...turnIds, ...linkedMessageIds).value);
+      const sessionCount = Number(this.db.prepare(
+        'SELECT COUNT(*) AS value FROM sessions WHERE role = ?'
+      ).get(authority.role_id).value);
+      if (annotationCount || diagnosticCount || syncCount || sessionCount) {
+        throw new Error(`redacted authority retained context conflict: ${canonicalJson({
+          annotationCount, diagnosticCount, syncCount, sessionCount
+        })}`);
+      }
+      const itemRows = this.db.prepare(`
+        SELECT * FROM visible_result_items WHERE group_id = ? ORDER BY ordinal
+      `).all(groupKey);
+      if (itemRows.length !== Number(authority.item_count)
+        || itemRows.some((item, ordinal) =>
+          Number(item.ordinal) !== ordinal
+          || item.message_id !== deriveVisibleMessageId(groupKey, ordinal)
+          || item.item_json !== null
+          || Number(item.redacted_at) !== redactedAt
+          || !sha256Pattern.test(String(item.item_checksum || '')))) {
+        throw new Error('redacted authority item shell conflict');
+      }
+      const actionRows = this.db.prepare(`
+        SELECT * FROM visible_result_actions WHERE group_id = ? ORDER BY ordinal
+      `).all(groupKey);
+      if (actionRows.length !== Number(authority.action_count)
+        || actionRows.some((action, ordinal) =>
+          Number(action.ordinal) !== ordinal
+          || action.action_id !== deriveVisibleActionId(groupKey, ordinal)
+          || action.action_kind !== null
+          || action.target_key !== null
+          || action.target_revision !== null
+          || action.action_json !== null
+          || Number(action.redacted_at) !== redactedAt
+          || !sha256Pattern.test(String(action.action_checksum || '')))) {
+        throw new Error('redacted authority action shell conflict');
+      }
+      if (visibleResultTombstoneCommitment({
+        groupId: groupKey,
+        itemRows,
+        actionRows
+      }) !== authority.tombstone_commitment) {
+        throw new Error('redacted authority result tombstone commitment conflict');
+      }
+      const deliveries = this.db.prepare(`
+        SELECT * FROM cloud_deliveries WHERE authority_group_id = ?
+      `).all(groupKey);
+      if (Number(authority.redaction_delivery_count) !== deliveries.length
+        || authorityRedactionDeliveriesCommitment({
+          groupId: groupKey,
+          deliveryRows: deliveries
+        }) !== authority.redaction_delivery_commitment) {
+        throw new Error('redacted authority delivery commitment conflict');
+      }
+      if (deliveries.some(delivery => {
+        if (delivery.payload_json !== null || delivery.checksum !== null
+          || delivery.authority_commit_checksum !== authority.commit_checksum) return true;
+        if (delivery.state === 'redaction_pending') {
+          return delivery.redaction_requested_at == null || !delivery.relay_message_id;
+        }
+        if (delivery.state === 'redacted') {
+          return delivery.redaction_acknowledged_at == null;
+        }
+        return true;
+      })) {
+        throw new Error('redacted authority delivery shell conflict');
+      }
+      const retainedJobs = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value FROM consolidation_jobs WHERE authority_group_id = ?
+      `).get(groupKey).value);
+      const retainedStances = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value FROM stance_records WHERE authority_group_id = ?
+      `).get(groupKey).value);
+      const retainedState = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value FROM cognitive_states WHERE last_authority_group_id = ?
+      `).get(groupKey).value);
+      const retainedLane = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value FROM interaction_lanes
+        WHERE latest_authoritative_group_id = ?
+           OR native_completed_group_id = ?
+           OR ui_applied_group_id = ?
+      `).get(groupKey, groupKey, groupKey).value);
+      if (retainedJobs || retainedStances || retainedState || retainedLane) {
+        throw new Error('redacted authority executable projection conflict');
+      }
+      return {
+        status: 'redacted',
+        group: {
+          visibleGroupId: groupKey,
+          authorityLineageKey: authority.lineage_key,
+          authoritativeTurnId: authority.authoritative_turn_id
+        },
+        receipt: this.getVisibleCommitReceipt(authority.lineage_key),
+        manifest: this.getVisibleResultManifest(groupKey)
+      };
+    }
+    const semantic = parseJson(authority.semantic_json, null);
+    if (!semantic || contentHash(semantic) !== authority.semantic_checksum) {
+      throw new Error('canonical visible group manifest authority conflict');
+    }
+
+    const itemRows = this.db.prepare(`
+      SELECT i.*, m.content, m.turn_id AS message_turn_id,
+             m.character_id AS message_character_id, m.speaker_id,
+             m.speaker_type, m.recipient_id,
+             m.authority_group_id, m.group_ordinal
+      FROM visible_result_items i
+      LEFT JOIN messages m ON m.message_id = i.message_id
+      WHERE i.group_id = ?
+      ORDER BY i.ordinal
+    `).all(groupKey);
+    if (itemRows.length !== Number(authority.item_count)
+      || itemRows.length !== (semantic.visibleItems || []).length) {
+      throw new Error('canonical visible group item authority conflict');
+    }
+    itemRows.forEach((item, ordinal) => {
+      const expected = semantic.visibleItems[ordinal];
+      if (Number(item.ordinal) !== ordinal
+        || item.message_id !== deriveVisibleMessageId(groupKey, ordinal)
+        || item.item_checksum !== contentHash(expected)
+        || canonicalJson(parseJson(item.item_json, null)) !== canonicalJson(expected)
+        || item.message_turn_id !== authority.authoritative_turn_id
+        || item.authority_group_id !== groupKey
+        || Number(item.group_ordinal) !== ordinal
+        || item.message_character_id !== authority.role_id
+        || item.speaker_id !== authority.role_id
+        || item.speaker_type !== 'character'
+        || item.recipient_id !== 'user'
+        || String(item.content) !== String(expected.content)) {
+        throw new Error('canonical visible group item authority conflict');
+      }
+    });
+
+    const actionRows = this.db.prepare(`
+      SELECT * FROM visible_result_actions WHERE group_id = ? ORDER BY ordinal
+    `).all(groupKey);
+    if (actionRows.length !== Number(authority.action_count)
+      || actionRows.length !== (semantic.actions || []).length) {
+      throw new Error('canonical visible group action authority conflict');
+    }
+    if (visibleResultTombstoneCommitment({
+      groupId: groupKey,
+      itemRows,
+      actionRows
+    }) !== authority.tombstone_commitment) {
+      throw new Error('canonical visible group tombstone commitment conflict');
+    }
+    const terminalDisposition = deriveTerminalDisposition(
+      authority.turn_kind,
+      itemRows.length,
+      actionRows.length
+    );
+    actionRows.forEach((action, ordinal) => {
+      const expected = semantic.actions[ordinal];
+      const descriptor = {
+        kind: action.action_kind,
+        targetKey: action.target_key,
+        targetRevision: action.target_revision,
+        payload: parseJson(action.action_json, null)
+      };
+      if (Number(action.ordinal) !== ordinal
+        || action.action_id !== deriveVisibleActionId(groupKey, ordinal)
+        || action.action_checksum !== contentHash(descriptor)
+        || canonicalJson(descriptor) !== canonicalJson(expected)) {
+        throw new Error('canonical visible group action authority conflict');
+      }
+    });
+
+    const jobs = this.db.prepare(`
+      SELECT * FROM consolidation_jobs
+      WHERE authority_group_id = ? ORDER BY authority_ordinal
+    `).all(groupKey);
+    const expectedJobs = [
+      ...(semantic.memoryJobs || []),
+      ...(semantic.comparison ? [semantic.comparison] : [])
+    ];
+    if (jobs.length !== expectedJobs.length) {
+      throw new Error('canonical visible group job authority conflict');
+    }
+    if (terminalDisposition === 'skip' && jobs.some(job =>
+      job.job_type === 'turn_consolidation')) {
+      throw new Error('canonical skip result retained evidence memory');
+    }
+    jobs.forEach((job, ordinal) => {
+      const payload = parseJson(job.payload_json, {});
+      const semanticJob = ['shadow_cognition', 'active_canary_compare'].includes(job.job_type)
+        ? {
+            jobType: job.job_type,
+            ...Object.fromEntries(Object.entries(payload).filter(([key]) =>
+              !['authorityGroupId', 'authoritativeResultChecksum'].includes(key)))
+          }
+        : payload;
+      if (job.role_id !== authority.role_id
+        || job.turn_id !== authority.authoritative_turn_id
+        || job.subject_type !== 'turn'
+        || job.subject_id !== authority.authoritative_turn_id
+        || Number(job.authority_ordinal) !== ordinal
+        || contentHash(payload) !== job.payload_checksum
+        || canonicalJson(semanticJob) !== canonicalJson(expectedJobs[ordinal])) {
+        throw new Error('canonical visible group job authority conflict');
+      }
+    });
+
+    const stances = this.db.prepare(`
+      SELECT * FROM stance_records
+      WHERE authority_group_id = ? ORDER BY authority_ordinal
+    `).all(groupKey);
+    const expectedStances = semantic.statePatch?.currentStances || [];
+    if (stances.length !== expectedStances.length) {
+      throw new Error('canonical visible group stance authority conflict');
+    }
+    stances.forEach((stance, ordinal) => {
+      const expected = expectedStances[ordinal];
+      if (stance.role_id !== authority.role_id
+        || stance.source_turn_id !== authority.authoritative_turn_id
+        || Number(stance.authority_ordinal) !== ordinal
+        || stance.stance_id !== String(expected.stanceId || '')
+        || stance.topic !== String(expected.topic || '')
+        || stance.position_text !== String(expected.position || '')
+        || stance.reason_text !== String(expected.reason || '')) {
+        throw new Error('canonical visible group stance authority conflict');
+      }
+    });
+
+    const currentState = this.db.prepare(`
+      SELECT * FROM cognitive_states WHERE last_authority_group_id = ?
+    `).get(groupKey);
+    if (currentState) {
+      const state = parseJson(currentState.state_json, {});
+      const expectedOpenThreads = (semantic.statePatch?.openThreads || []).map(item =>
+        typeof item === 'string' ? item : String(item?.threadId || '')
+      ).filter(Boolean);
+      if (!semantic.statePatch
+        || currentState.role_id !== authority.role_id
+        || currentState.last_turn_id !== authority.authoritative_turn_id
+        || currentState.checksum !== contentHash(state)
+        || String(state.fastState?.mood || '') !== String(semantic.statePatch.mood || '')
+        || canonicalJson(state.fastState?.openThreadIds || [])
+          !== canonicalJson(expectedOpenThreads)) {
+        throw new Error('canonical visible group cognitive state authority conflict');
+      }
+    }
+
+    const attempts = this.db.prepare(`
+      SELECT * FROM turns
+      WHERE authority_lineage_key = ?
+      ORDER BY lineage_revision_at_creation, turn_id
+    `).all(authority.lineage_key);
+    for (const turn of attempts) {
+      const envelope = parseJson(turn.envelope_json, {});
+      const normalized = resolveCurrentUserBatch(envelope);
+      if (envelope.message) {
+        const batch = this.db.prepare(
+          'SELECT * FROM current_user_batches WHERE turn_id = ?'
+        ).get(turn.turn_id);
+        const batchItems = this.db.prepare(`
+          SELECT * FROM current_user_batch_items
+          WHERE turn_id = ? ORDER BY sequence
+        `).all(turn.turn_id);
+        const header = normalized && {
+          batchId: normalized.batchId,
+          sourceMessageId: normalized.sourceMessageId,
+          messageIds: normalized.messageIds,
+          startedAt: normalized.startedAt,
+          committedAt: normalized.committedAt
+        };
+        if (!batch || !normalized
+          || batch.batch_id !== normalized.batchId
+          || batch.character_id !== turn.character_id
+          || batch.source_message_id !== normalized.sourceMessageId
+          || Number(batch.started_at) !== Number(normalized.startedAt)
+          || Number(batch.committed_at) !== Number(normalized.committedAt)
+          || batch.checksum !== contentHash(header)
+          || batchItems.length !== normalized.messageIds.length) {
+          throw new Error('canonical visible group input batch authority conflict');
+        }
+        batchItems.forEach((item, sequence) => {
+          const message = normalized.messages.find(candidate =>
+            candidate.messageId === normalized.messageIds[sequence]);
+          if (Number(item.sequence) !== sequence
+            || item.batch_id !== normalized.batchId
+            || item.message_id !== normalized.messageIds[sequence]
+            || item.checksum !== contentHash(message)
+            || canonicalJson(parseJson(item.message_json, null)) !== canonicalJson(message)) {
+            throw new Error('canonical visible group input batch authority conflict');
+          }
+        });
+      }
+    }
+
+    const deliveries = this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE authority_group_id = ?
+    `).all(groupKey);
+    if (authority.receipt_origin === 'pc') {
+      if (!deliveries.some(delivery =>
+        delivery.turn_id === authority.authoritative_turn_id
+        && delivery.peer_id === authority.device_id
+        && delivery.authority_commit_checksum === authority.commit_checksum)) {
+        throw new Error('canonical visible group delivery authority conflict');
+      }
+    } else if (deliveries.length) {
+      throw new Error('canonical visible group delivery authority conflict');
+    }
+    if (deliveries.some(delivery =>
+      delivery.turn_id !== authority.authoritative_turn_id
+      || delivery.authority_commit_checksum !== authority.commit_checksum)) {
+      throw new Error('canonical visible group delivery authority conflict');
+    }
+    return {
+      status: 'live',
+      terminalDisposition,
+      group: {
+        visibleGroupId: groupKey,
+        authorityLineageKey: authority.lineage_key,
+        authoritativeTurnId: authority.authoritative_turn_id
+      },
+      receipt: this.getVisibleCommitReceipt(authority.lineage_key),
+      manifest: this.getVisibleResultManifest(groupKey)
+    };
+  }
+
+  assertVisibleAuthorityV13Invariants() {
+    this.assertVisibleAuthorityV13SchemaInternal();
+    const redactedGroupCount = Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM visible_result_groups WHERE redacted_at IS NOT NULL
+    `).get().value);
+    if (redactedGroupCount === 0) {
+      this.assertVisibleAuthorityV11Invariants({ allowVersionThirteen: true });
+    } else {
+      const unknownAuthority = this.db.prepare(`
+        SELECT turn_id, result_authority_version
+        FROM turns
+        WHERE result_authority_version NOT IN (0, 1)
+        LIMIT 1
+      `).get();
+      if (unknownAuthority) {
+        throw new Error(`v13 invariant unknown result authority: ${JSON.stringify(unknownAuthority)}`);
+      }
+    }
+    for (const lineage of this.db.prepare(`
+      SELECT lineage_key, attempt_count, attempt_commitment
+      FROM turn_authority_lineages ORDER BY lineage_key
+    `).all()) {
+      const attempts = this.db.prepare(`
+        SELECT t.lineage_revision_at_creation, t.turn_id,
+               t.rollout_key AS turn_kind,
+               t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
+               t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
+             t.comparison_mode, t.annotation_snapshot_json,
+               b.tombstone_commitment
+        FROM turns t
+        LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+        WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
+        ORDER BY t.lineage_revision_at_creation
+      `).all(lineage.lineage_key);
+      if (attempts.length !== Number(lineage.attempt_count)
+        || authorityLineageAttemptsCommitment({
+          lineageKey: lineage.lineage_key,
+          attemptRows: attempts
+        }) !== lineage.attempt_commitment) {
+        throw new Error('v13 invariant lineage attempt commitment conflict');
+      }
+    }
+    for (const row of this.db.prepare(`
+      SELECT group_id FROM visible_result_groups ORDER BY group_id
+    `).all()) {
+      this.assertVisibleGroupAuthorityInternal(row.group_id, { purpose: 'reopen' });
+    }
+    for (const state of this.db.prepare(`
+      SELECT c.role_id, c.last_turn_id, c.last_authority_group_id,
+             g.role_id AS group_role_id, g.authoritative_turn_id
+      FROM cognitive_states c
+      LEFT JOIN visible_result_groups g ON g.group_id = c.last_authority_group_id
+      WHERE c.last_authority_group_id IS NOT NULL
+    `).all()) {
+      if (state.group_role_id !== state.role_id
+        || state.authoritative_turn_id !== state.last_turn_id) {
+        throw new Error(`v13 invariant current cognitive state authority: ${state.role_id}`);
+      }
+    }
+  }
+
+  visibleAuthorityV13InvariantSummary() {
+    this.assertVisibleAuthorityV13Invariants();
+    const tableNames = [
+      'messages',
+      'facts',
+      'relationship_states',
+      'relationship_history',
+      'role_plans',
+      'life_episodes',
+      'turns',
+      'result_outbox',
+      'turn_authority_lineages',
+      'visible_result_groups',
+      'visible_result_items',
+      'visible_result_actions',
+      'visible_result_manifests',
+      'visible_commit_receipts',
+      'cloud_deliveries',
+      'conversation_clear_controls'
+    ];
+    const existing = new Set(this.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).all().map(row => row.name));
+    const tableCounts = Object.fromEntries(tableNames.map(table => [
+      table,
+      existing.has(table)
+        ? Number(this.db.prepare(`SELECT COUNT(*) AS value FROM "${table}"`).get().value)
+        : null
+    ]));
+    const summary = {
+      userVersion: this.userVersion(),
+      tableCounts,
+      canonicalTurnCount: Number(this.db.prepare(
+        'SELECT COUNT(*) AS value FROM turns WHERE result_authority_version = 1'
+      ).get().value),
+      lineageCount: Number(this.db.prepare(
+        'SELECT COUNT(*) AS value FROM turn_authority_lineages'
+      ).get().value),
+      receiptCount: Number(this.db.prepare(
+        'SELECT COUNT(*) AS value FROM visible_commit_receipts'
+      ).get().value)
+    };
+    return { ...summary, checksum: contentHash(summary) };
   }
 
   visibleAuthorityV11InvariantSummary() {
-    if (this.userVersion() === 12) this.assertVisibleAuthorityV12Invariants();
+    if (this.userVersion() === 13) this.assertVisibleAuthorityV13Invariants();
+    else if (this.userVersion() === 12) this.assertVisibleAuthorityV12Invariants();
     else this.assertVisibleAuthorityV11Invariants();
     const tableNames = [
       'messages',
@@ -2277,7 +3441,7 @@ export class YuqiStore {
       ? version === 9
       : allowPreFinalVersion
         ? version === 10
-        : version === 10 || version === 11 || version === 12;
+        : version === 10 || version === 11 || version === 12 || version === 13;
     if (!versionAllowed) {
       throw new Error(`v10 invariant user_version mismatch: ${version}`);
     }
@@ -3203,6 +4367,35 @@ export class YuqiStore {
     ).get(String(lineageKey || '')));
   }
 
+  readCanonicalCommitOutcomeInternal({
+    lineageKey,
+    expectedTurnId = null,
+    expectedOrigin = null,
+    expectedPayloadVersion = null,
+    expectedCommitChecksum = null
+  } = {}) {
+    const lineage = this.getTurnAuthorityLineage(lineageKey);
+    if (!lineage || lineage.state !== 'committed') return null;
+    if (!lineage.committedGroupId) {
+      throw new Error('canonical commit authority conflict');
+    }
+    try {
+      const closure = this.assertVisibleGroupAuthorityInternal(lineage.committedGroupId, {
+        purpose: 'receipt_replay',
+        expectedLineageKey: lineage.lineageKey,
+        expectedTurnId,
+        expectedOrigin,
+        expectedPayloadVersion,
+        expectedCommitChecksum
+      });
+      return closure.status === 'redacted'
+        ? { status: 'redacted', receipt: closure.receipt }
+        : { status: 'already_committed', receipt: closure.receipt };
+    } catch (error) {
+      throw new Error('canonical commit authority conflict', { cause: error });
+    }
+  }
+
   createCanonicalVisibleTurnInternal(input = {}) {
     for (const forbidden of [
       'resultAuthorityVersion',
@@ -3222,6 +4415,7 @@ export class YuqiStore {
     const expectedRolloutRevision = Number(input.expectedRolloutRevision);
     const expectedLaneRevision = Number(input.expectedLaneRevision);
     const inputVisibilitySequence = Number(input.inputVisibilitySequence);
+    const inputClearEpoch = Number(input.inputClearEpoch ?? 0);
     const inputUserBatchId = String(input.inputUserBatchId || '');
     const agencySnapshotChecksum = String(input.agencySnapshotChecksum || '');
     const retry = envelope.context?.retry || null;
@@ -3248,10 +4442,12 @@ export class YuqiStore {
     if (inputUserBatchId !== derivedInputUserBatchId) {
       throw new Error('canonical user batch authority conflict');
     }
-    if (!rolloutKey || !laneKey || !rootSourceId || !inputUserBatchId
+    if (!CANONICAL_RESULT_TURN_KINDS.has(rolloutKey)
+      || !laneKey || !rootSourceId || !inputUserBatchId
       || !Number.isInteger(expectedRolloutRevision) || expectedRolloutRevision < 0
       || !Number.isInteger(expectedLaneRevision) || expectedLaneRevision < 0
       || !Number.isSafeInteger(inputVisibilitySequence) || inputVisibilitySequence < 0
+      || !Number.isSafeInteger(inputClearEpoch) || inputClearEpoch < 0
       || !/^[a-f0-9]{64}$/i.test(agencySnapshotChecksum)) {
       throw new Error('invalid canonical authority input');
     }
@@ -3271,6 +4467,7 @@ export class YuqiStore {
           || exactTurn.laneKey !== laneKey
           || exactTurn.inputUserBatchId !== inputUserBatchId
           || Number(exactTurn.inputVisibilitySequence) !== inputVisibilitySequence
+          || Number(exactTurn.inputClearEpoch) !== inputClearEpoch
           || Number(exactTurn.laneRevision) !== expectedLaneRevision + 1
           || Number(exactTurn.rolloutRevision) !== expectedRolloutRevision
           || exactTurn.authoritativeReleaseId !== String(input.authoritativeReleaseId || '')
@@ -3282,10 +4479,11 @@ export class YuqiStore {
             !== contentHash(input.annotationSnapshot || {})) {
           throw new Error('canonical turn authority conflict');
         }
-        const receipt = this.getVisibleCommitReceipt(lineageKey);
-        return receipt
-          ? { status: 'already_committed', receipt }
-          : { status: 'created', turn: exactTurn };
+        const outcome = this.readCanonicalCommitOutcomeInternal({
+          lineageKey,
+          expectedTurnId: exactTurn.turnId
+        });
+        return outcome || { status: 'created', turn: exactTurn };
       }
 
       let validatedRetry = null;
@@ -3320,10 +4518,12 @@ export class YuqiStore {
           ? null
           : parent.comparisonMode;
         if (Number(input.expectedRolloutRevision) !== parent.rolloutRevision
+          || parent.rolloutKey !== rolloutKey
           || String(input.authoritativeReleaseId || '') !== String(parent.authoritativeReleaseId || '')
           || String(input.comparisonReleaseId || '') !== String(parent.comparisonReleaseId || '')
           || String(input.comparisonDirection || '') !== String(inheritedComparisonDirection || '')
           || inputVisibilitySequence !== Number(parent.inputVisibilitySequence)
+          || inputClearEpoch !== Number(parent.inputClearEpoch)
           || inputUserBatchId !== parent.inputUserBatchId
           || contentHash(input.annotationSnapshot || {})
             !== contentHash(parent.annotationSnapshot || {})) {
@@ -3332,9 +4532,10 @@ export class YuqiStore {
         const lineage = this.getTurnAuthorityLineage(parent.authorityLineageKey);
         if (!lineage) throw new Error('canonical retry lineage invariant conflict');
         if (lineage.state === 'committed') {
-          const receipt = this.getVisibleCommitReceipt(lineage.lineageKey);
-          if (!receipt) throw new Error('committed lineage receipt invariant conflict');
-          return { status: 'already_committed', receipt };
+          return this.readCanonicalCommitOutcomeInternal({
+            lineageKey: lineage.lineageKey,
+            expectedTurnId: lineage.latestTurnId
+          });
         }
         validatedRetry = { parent, lineage };
       }
@@ -3350,6 +4551,9 @@ export class YuqiStore {
       }
       if (inputVisibilitySequence < Number(lane?.localSequence || 0)) {
         throw new Error('input visibility sequence is behind lane authority');
+      }
+      if (inputClearEpoch !== Number(lane?.clearEpoch || 0)) {
+        throw new Error('clear epoch authority conflict');
       }
 
       let pinned;
@@ -3413,9 +4617,10 @@ export class YuqiStore {
         const existingLineage = this.getTurnAuthorityLineage(lineageKey);
         if (existingLineage) {
           if (existingLineage.state === 'committed') {
-            const receipt = this.getVisibleCommitReceipt(lineageKey);
-            if (!receipt) throw new Error('committed lineage receipt invariant conflict');
-            return { status: 'already_committed', receipt };
+            return this.readCanonicalCommitOutcomeInternal({
+              lineageKey,
+              expectedTurnId: existingLineage.latestTurnId
+            });
           }
           throw new Error('canonical lineage already has an open turn');
         }
@@ -3523,6 +4728,11 @@ export class YuqiStore {
         inputUserBatchId,
         agencySnapshotChecksum
       );
+      if (this.userVersion() >= 13) {
+        this.db.prepare(
+          'UPDATE turns SET input_clear_epoch = ? WHERE turn_id = ?'
+        ).run(inputClearEpoch, envelope.turnId);
+      }
 
       if (!retry && envelope.message) {
         this.putMessageInternal({
@@ -3551,21 +4761,30 @@ export class YuqiStore {
         );
         if (Number(updated.changes) !== 1) throw new Error('retry lineage authority conflict');
       } else {
-        this.db.prepare(`
-          INSERT INTO turn_authority_lineages(
-            lineage_key, role_id, lane_key, root_source_id, latest_turn_id,
-            revision, state, committed_group_id, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, 1, 'open', NULL, ?, ?)
-        `).run(
-          lineageKey,
-          envelope.characterId,
-          laneKey,
-          rootSourceId,
-          envelope.turnId,
-          timestamp,
-          timestamp
-        );
+        if (this.userVersion() >= 13) {
+          this.db.prepare(`
+            INSERT INTO turn_authority_lineages(
+              lineage_key, role_id, lane_key, root_source_id, latest_turn_id,
+              revision, state, committed_group_id, created_at, updated_at,
+              attempt_count, attempt_commitment
+            ) VALUES (?, ?, ?, ?, ?, 1, 'open', NULL, ?, ?, 0, '')
+          `).run(
+            lineageKey, envelope.characterId, laneKey, rootSourceId,
+            envelope.turnId, timestamp, timestamp
+          );
+        } else {
+          this.db.prepare(`
+            INSERT INTO turn_authority_lineages(
+              lineage_key, role_id, lane_key, root_source_id, latest_turn_id,
+              revision, state, committed_group_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, 'open', NULL, ?, ?)
+          `).run(
+            lineageKey, envelope.characterId, laneKey, rootSourceId,
+            envelope.turnId, timestamp, timestamp
+          );
+        }
       }
+      if (this.userVersion() >= 13) this.refreshLineageAttemptCommitmentInternal(lineageKey);
       this.claimInteractionLaneInternal({
         roleId: envelope.characterId,
         laneKey,
@@ -3579,6 +4798,30 @@ export class YuqiStore {
       this.appendSync('turn', envelope.turnId, 'insert', turn);
       return { status: 'created', turn, agencySnapshot };
     });
+  }
+
+  refreshLineageAttemptCommitmentInternal(lineageKey) {
+    const attempts = this.db.prepare(`
+      SELECT t.lineage_revision_at_creation, t.turn_id,
+             t.rollout_key AS turn_kind,
+             t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
+             t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
+             t.comparison_mode, t.annotation_snapshot_json,
+             b.tombstone_commitment
+      FROM turns t
+      LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+      WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
+      ORDER BY t.lineage_revision_at_creation
+    `).all(String(lineageKey));
+    const commitment = authorityLineageAttemptsCommitment({
+      lineageKey, attemptRows: attempts
+    });
+    const updated = this.db.prepare(`
+      UPDATE turn_authority_lineages
+      SET attempt_count = ?, attempt_commitment = ?
+      WHERE lineage_key = ?
+    `).run(attempts.length, commitment, String(lineageKey));
+    if (Number(updated.changes) !== 1) throw new Error('lineage attempt commitment conflict');
   }
 
   readCommitAuthority({ turnId, authorityLineageKey, laneKey }) {
@@ -3862,14 +5105,15 @@ export class YuqiStore {
   }
 
   visibleDeliveryPayload(groupId, peerId) {
-    this.assertVisibleAuthorityV12Invariants();
+    const validated = this.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'delivery' });
     const authority = this.db.prepare(`
       SELECT
         d.authority_group_id, d.peer_id, d.recovery_ack_seq,
         d.authority_commit_checksum, r.lineage_key, r.authoritative_turn_id,
         r.authority_origin, r.commit_payload_version, r.commit_checksum,
         g.role_id, g.lane_key, g.authoritative_release_id,
-        g.generation_fingerprint
+        g.generation_fingerprint, t.input_visibility_sequence,
+        t.input_clear_epoch
       FROM cloud_deliveries d
       JOIN visible_commit_receipts r
         ON r.group_id = d.authority_group_id
@@ -3878,6 +5122,7 @@ export class YuqiStore {
         ON g.group_id = r.group_id
        AND g.lineage_key = r.lineage_key
        AND g.authoritative_turn_id = r.authoritative_turn_id
+      JOIN turns t ON t.turn_id = r.authoritative_turn_id
       WHERE d.authority_group_id = ? AND d.peer_id = ?
     `).get(String(groupId || ''), String(peerId || ''));
     if (!authority) throw new Error('canonical cloud delivery authority conflict');
@@ -3908,6 +5153,11 @@ export class YuqiStore {
       authoritativeReleaseId: authority.authoritative_release_id,
       roleId: authority.role_id,
       laneKey: authority.lane_key,
+      terminalDisposition: validated.terminalDisposition,
+      inputVisibilitySequence: authority.input_visibility_sequence == null
+        ? null
+        : Number(authority.input_visibility_sequence),
+      inputClearEpoch: Number(authority.input_clear_epoch || 0),
       replyParts: items,
       actions,
       recoveryAckSeq: Number(authority.recovery_ack_seq || 0)
@@ -3957,14 +5207,16 @@ export class YuqiStore {
     if (Number(result.changes) !== 1) throw new Error('pending canonical cloud delivery not found');
   }
 
-  markAuthorityCloudDeliveryMailboxed(groupId, peerId, checksum) {
+  markAuthorityCloudDeliveryMailboxed(groupId, peerId, checksum, relayMessageId) {
     const timestamp = now();
+    const relayId = String(relayMessageId || '');
+    if (!relayId) throw new Error('canonical cloud delivery relay message id is required');
     const result = this.db.prepare(`
       UPDATE cloud_deliveries
-      SET state = 'mailboxed', delivered_at = ?, updated_at = ?
+      SET state = 'mailboxed', relay_message_id = ?, delivered_at = ?, updated_at = ?
       WHERE authority_group_id = ? AND peer_id = ?
         AND state = 'pending' AND checksum = ?
-    `).run(timestamp, timestamp, String(groupId || ''), String(peerId || ''), String(checksum || ''));
+    `).run(relayId, timestamp, timestamp, String(groupId || ''), String(peerId || ''), String(checksum || ''));
     if (Number(result.changes) !== 1) {
       throw new Error('canonical cloud delivery acknowledgement conflict');
     }
@@ -3981,7 +5233,26 @@ export class YuqiStore {
     const cognitiveState = this.getCognitiveState(turn.characterId);
     const items = Array.isArray(input.visibleGroup?.items) ? input.visibleGroup.items : [];
     const actions = Array.isArray(input.actionSet) ? input.actionSet : [];
-    if (!items.length) throw new Error('visible group items are required');
+    const terminalDisposition = deriveTerminalDisposition(turn.rolloutKey, items.length, actions.length);
+    if (terminalDisposition === 'skip'
+      && ((input.memoryJobs || []).length || input.comparisonJob?.jobType === 'turn_consolidation')) {
+      throw new Error('skip result cannot enqueue evidence memory');
+    }
+    const itemTombstoneRows = items.map((item, ordinal) => ({
+      ordinal,
+      message_id: deriveVisibleMessageId(input.groupId, ordinal),
+      item_checksum: contentHash(item)
+    }));
+    const actionTombstoneRows = actions.map((action, ordinal) => ({
+      ordinal,
+      action_id: deriveVisibleActionId(input.groupId, ordinal),
+      action_checksum: contentHash(action)
+    }));
+    const tombstoneCommitment = visibleResultTombstoneCommitment({
+      groupId: input.groupId,
+      itemRows: itemTombstoneRows,
+      actionRows: actionTombstoneRows
+    });
     if (!input.authorityManifest
       || contentHash(input.authorityManifest) !== input.commitChecksum) {
       throw new Error('canonical manifest checksum authority conflict');
@@ -3992,24 +5263,23 @@ export class YuqiStore {
       }
     };
 
-    this.db.prepare(`
-      INSERT INTO visible_result_groups(
-        group_id, lineage_key, authoritative_turn_id, role_id, lane_key,
-        authority_origin, authoritative_release_id, generation_fingerprint,
-        reply_checksum, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      input.groupId,
-      input.authorityLineageKey,
-      input.turnId,
-      turn.characterId,
-      input.laneKey,
-      input.authorityOrigin,
-      input.authoritativeReleaseId,
-      input.generationFingerprint,
-      contentHash({ items, actions }),
-      timestamp
-    );
+    const groupColumns = this.userVersion() >= 13
+      ? `group_id, lineage_key, authoritative_turn_id, role_id, lane_key,
+         authority_origin, authoritative_release_id, generation_fingerprint,
+         reply_checksum, created_at, item_count, action_count, tombstone_commitment`
+      : `group_id, lineage_key, authoritative_turn_id, role_id, lane_key,
+         authority_origin, authoritative_release_id, generation_fingerprint,
+         reply_checksum, created_at`;
+    const groupValues = [
+      input.groupId, input.authorityLineageKey, input.turnId, turn.characterId,
+      input.laneKey, input.authorityOrigin, input.authoritativeReleaseId,
+      input.generationFingerprint, contentHash({ items, actions }), timestamp
+    ];
+    if (this.userVersion() >= 13) {
+      groupValues.push(itemTombstoneRows.length, actionTombstoneRows.length, tombstoneCommitment);
+    }
+    this.db.prepare(`INSERT INTO visible_result_groups(${groupColumns})
+                     VALUES (${groupValues.map(() => '?').join(', ')})`).run(...groupValues);
     failAfter(1);
 
     const itemInsert = this.db.prepare(`
@@ -4684,36 +5954,56 @@ export class YuqiStore {
       startedAt: batch.startedAt,
       committedAt: batch.committedAt
     };
-    this.db.prepare(`
-      INSERT INTO current_user_batches(
-        turn_id, batch_id, character_id, source_message_id,
-        started_at, committed_at, checksum, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      envelope.turnId,
-      batch.batchId,
-      envelope.characterId,
-      batch.sourceMessageId,
-      batch.startedAt,
-      batch.committedAt,
-      contentHash(canonical),
-      now()
-    );
     const byId = new Map(batch.messages.map(message => [String(message.messageId || ''), message]));
+    const batchItemRows = batch.messageIds.map((messageId, sequence) => {
+      const message = byId.get(messageId) || { messageId };
+      return {
+        sequence,
+        message_id: String(messageId),
+        message_json: canonicalJson(message),
+        checksum: contentHash(message)
+      };
+    });
+    const tombstoneCommitment = currentUserBatchTombstoneCommitment({
+      turnId: envelope.turnId,
+      batchId: batch.batchId,
+      itemRows: batchItemRows
+    });
+    if (this.userVersion() >= 13) {
+      this.db.prepare(`
+        INSERT INTO current_user_batches(
+          turn_id, batch_id, character_id, source_message_id,
+          started_at, committed_at, checksum, created_at, item_count, tombstone_commitment
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        envelope.turnId, batch.batchId, envelope.characterId, batch.sourceMessageId,
+        batch.startedAt, batch.committedAt, contentHash(canonical), now(),
+        batchItemRows.length, tombstoneCommitment
+      );
+    } else {
+      this.db.prepare(`
+        INSERT INTO current_user_batches(
+          turn_id, batch_id, character_id, source_message_id,
+          started_at, committed_at, checksum, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        envelope.turnId, batch.batchId, envelope.characterId, batch.sourceMessageId,
+        batch.startedAt, batch.committedAt, contentHash(canonical), now()
+      );
+    }
     const insert = this.db.prepare(`
       INSERT INTO current_user_batch_items(
         turn_id, batch_id, message_id, sequence, message_json, checksum
       ) VALUES (?, ?, ?, ?, ?, ?)
     `);
-    batch.messageIds.forEach((messageId, sequence) => {
-      const message = byId.get(messageId) || { messageId };
+    batchItemRows.forEach(item => {
       insert.run(
         envelope.turnId,
         batch.batchId,
-        messageId,
-        sequence,
-        canonicalJson(message),
-        contentHash(message)
+        item.message_id,
+        item.sequence,
+        item.message_json,
+        item.checksum
       );
     });
     return this.getCurrentUserBatch(envelope.turnId);

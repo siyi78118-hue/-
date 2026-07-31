@@ -18,6 +18,7 @@ const V10_TABLES = [
 ];
 
 const V11_V12_TABLES = [
+  'conversation_clear_controls',
   'visible_result_manifests',
   'visible_commit_receipts',
   'visible_result_actions',
@@ -60,6 +61,8 @@ const V10_COLUMNS = {
     'retry_of_turn_id',
     'input_user_batch_id',
     'agency_snapshot_checksum',
+    'authority_redacted_at',
+    'input_clear_epoch',
     'authoritative_release_id',
     'comparison_release_id',
     'authoritative_pipeline_checksum',
@@ -73,7 +76,13 @@ const V10_COLUMNS = {
   cognitive_states: ['last_authority_group_id'],
   stance_records: ['authority_group_id', 'authority_ordinal'],
   consolidation_jobs: ['authority_group_id', 'authority_ordinal'],
-  cloud_deliveries: ['authority_group_id', 'authority_commit_checksum']
+  cloud_deliveries: [
+    'authority_group_id',
+    'authority_commit_checksum',
+    'relay_message_id',
+    'redaction_requested_at',
+    'redaction_acknowledged_at'
+  ]
 };
 
 function envelope(id, sequence = 1) {
@@ -118,7 +127,8 @@ function stripV10Schema(path) {
       'ux_messages_authority_group_ordinal',
       'ux_stances_authority_group_ordinal',
       'ux_consolidation_authority_group_ordinal',
-      'ux_delivery_authority_group_peer'
+      'ux_delivery_authority_group_peer',
+      'idx_current_user_batch_items_message'
     ]) database.exec(`DROP INDEX IF EXISTS "${index}";`);
     for (const table of V11_V12_TABLES) database.exec(`DROP TABLE IF EXISTS "${table}";`);
     for (const table of V10_TABLES) database.exec(`DROP TABLE IF EXISTS "${table}";`);
@@ -127,6 +137,30 @@ function stripV10Schema(path) {
       for (const name of names) {
         if (existing.has(name)) database.exec(`ALTER TABLE "${table}" DROP COLUMN "${name}";`);
       }
+    }
+    if (columns(database, 'current_user_batch_items').has('redacted_at')) {
+      database.exec(`
+        ALTER TABLE current_user_batch_items RENAME TO current_user_batch_items_v13;
+        CREATE TABLE current_user_batch_items (
+          turn_id TEXT NOT NULL,
+          batch_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          sequence INTEGER NOT NULL,
+          message_json TEXT NOT NULL,
+          checksum TEXT NOT NULL,
+          PRIMARY KEY(turn_id, sequence),
+          UNIQUE(turn_id, message_id),
+          FOREIGN KEY(turn_id) REFERENCES current_user_batches(turn_id)
+        );
+        INSERT INTO current_user_batch_items(
+          turn_id, batch_id, message_id, sequence, message_json, checksum
+        )
+        SELECT turn_id, batch_id, message_id, sequence, message_json, checksum
+        FROM current_user_batch_items_v13;
+        DROP TABLE current_user_batch_items_v13;
+        CREATE INDEX idx_current_user_batch_items_message
+          ON current_user_batch_items(message_id);
+      `);
     }
     database.exec('PRAGMA user_version = 9;');
   } finally {
@@ -217,11 +251,11 @@ function cognitiveSnapshotV2() {
   };
 }
 
-test('clean v9 passes through the historical schemas and finishes at v12', () => withTemporaryDatabase(path => {
+test('clean v9 passes through the historical schemas and finishes at v13', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: false });
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 12);
+    assert.equal(store.userVersion(), 13);
     for (const table of V10_TABLES) {
       assert.equal(
         Boolean(store.db.prepare(
@@ -234,23 +268,23 @@ test('clean v9 passes through the historical schemas and finishes at v12', () =>
     assert.equal(store.listPipelineReleases().length, 2);
     assert.ok(store.listCognitionRollouts().every(row => row.candidatePhase === 'none'));
     store.migrate();
-    assert.equal(store.userVersion(), 12);
+    assert.equal(store.userVersion(), 13);
     assert.equal(store.listPipelineReleases().length, 2);
   } finally {
     store.close();
   }
 }));
 
-test('populated v9 through v10, v11, and v12 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
+test('populated v9 through v10, v11, v12, and v13 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: true });
   const before = countStructuralRows(path);
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 12);
+    assert.equal(store.userVersion(), 13);
     assert.deepEqual(countStructuralRows(path), before);
     assert.equal(store.listCognitionRollouts()[0].candidatePhase, 'none');
     store.migrate();
-    assert.equal(store.userVersion(), 12);
+    assert.equal(store.userVersion(), 13);
     assert.equal(store.listPipelineReleases().length, 2);
     assert.deepEqual(countStructuralRows(path), before);
   } finally {
@@ -258,11 +292,11 @@ test('populated v9 through v10, v11, and v12 is non-destructive and idempotent',
   }
 }));
 
-test('versions above v12 stop instead of being rewritten', () => withTemporaryDatabase(path => {
+test('versions above v13 stop instead of being rewritten', () => withTemporaryDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 13;');
+  database.exec('PRAGMA user_version = 14;');
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*13/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*14/i);
 }));
 
 test('new turns pin release pair and lane revision while old turns remain readable', () =>

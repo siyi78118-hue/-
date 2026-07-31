@@ -334,6 +334,10 @@ test('canonical original and retry restart emit one group-keyed delivery', async
     assert.equal(decoded.authorityLineageKey, retry.authorityLineageKey);
     assert.equal(decoded.commitChecksum, receipt.commitChecksum);
     assert.equal(decoded.replyParts[0].content, '在。');
+    assert.equal(
+      store.outboxForGroup(receipt.visibleGroupId)[0].relayMessageId,
+      attempts[0].messageId
+    );
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -431,4 +435,43 @@ test('mixed canonical and legacy backlog honors global age without starvation', 
     legacyUpdatedAt: 100
   });
   assert.deepEqual(fetchOrder.slice(0, 2), ['canonical_001', 'canonical_002']);
+});
+
+test('fifty canonical sends perform fifty scoped validations and zero full scans', async () => {
+  const validationCounts = { fullDatabase: 0, groupScoped: 0 };
+  const fetchBodies = [];
+  const targets = Array.from({ length: 50 }, (_, index) => ({
+    authorityGroupId: `group_${String(index).padStart(3, '0')}`,
+    peerId: 'phone_cloud',
+    authorityCommitChecksum: 'a'.repeat(64),
+    updatedAt: index + 1
+  }));
+  const store = {
+    listPendingAuthorityCloudDeliveries: limit => targets.slice(0, limit),
+    listPendingCloudDeliveries: () => [],
+    visibleDeliveryPayload(groupId) {
+      validationCounts.groupScoped += 1;
+      return {
+        ok: true, terminal: true, visibleGroupId: groupId,
+        authorityLineageKey: `lineage_${groupId}`,
+        commitChecksum: 'a'.repeat(64), replyParts: [], actions: [],
+        inputVisibilitySequence: 0, inputClearEpoch: 0
+      };
+    },
+    prepareAuthorityCloudDelivery() { return { checksum: 'b'.repeat(64) }; },
+    markAuthorityCloudDeliveryAttempt() {},
+    markAuthorityCloudDeliveryMailboxed() {}
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async (_url, options) => {
+      fetchBodies.push(JSON.parse(options.body));
+      return Response.json({ ok: true }, { status: 201 });
+    }
+  });
+  assert.deepEqual(await outbox.flushOnce(50), { delivered: 50, failed: 0, waiting: 0 });
+  assert.equal(validationCounts.fullDatabase, 0);
+  assert.equal(validationCounts.groupScoped, 50);
+  assert.equal(fetchBodies.length, 50);
 });

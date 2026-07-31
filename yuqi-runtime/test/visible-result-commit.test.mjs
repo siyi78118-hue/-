@@ -987,7 +987,7 @@ test('shadow commit requires the exact pinned comparison descriptor', () =>
     assert.throws(() => commitVisibleResult(wrong), /comparison authority conflict/i);
     const receipt = commitVisibleResult(valid);
     assert.equal(store.comparisonJobsForGroup(receipt.visibleGroupId).length, 1);
-    assert.doesNotThrow(() => store.assertVisibleAuthorityV12Invariants());
+    assert.doesNotThrow(() => store.assertVisibleAuthorityV13Invariants());
   }));
 
 test('exact repeated commit returns one receipt and changed payload conflicts', () =>
@@ -1014,6 +1014,127 @@ test('committed canonical creation replay returns its original receipt after rol
     const replay = store.createCanonicalVisibleTurnInternal(structuredClone(creationInput));
     assert.equal(replay.status, 'already_committed');
     assert.equal(replay.receipt.visibleGroupId, receipt.visibleGroupId);
+    assert.equal(replay.receipt.commitChecksum, receipt.commitChecksum);
+  }));
+
+test('exact commit replay rejects an in-process corrupted manifest', () =>
+  withAuthority((store, turn) => {
+    const input = commitInput(store, turn);
+    commitVisibleResult(input);
+    store.db.prepare(`
+      UPDATE visible_result_manifests
+      SET semantic_json = '{"tampered":true}'
+    `).run();
+    assert.throws(
+      () => commitVisibleResult(input),
+      /canonical commit authority conflict/
+    );
+  }));
+
+test('same-turn create and committed retry replay share manifest closure', () =>
+  withAuthority((store, turn, creationInput) => {
+    commitVisibleResult(commitInput(store, turn));
+    const retryInput = structuredClone(creationInput);
+    retryInput.envelope = structuredClone(creationInput.envelope);
+    retryInput.envelope.turnId = `${turn.turnId}_retry`;
+    retryInput.envelope.deviceSeq += 1;
+    retryInput.envelope.context = {
+      retry: {
+        retryOfTurnId: turn.turnId,
+        canonicalMessageId: creationInput.envelope.message.messageId
+      }
+    };
+    retryInput.expectedLaneRevision = store.getInteractionLane('yuqi', 'private_chat').revision;
+    retryInput.inputUserBatchId = turn.inputUserBatchId;
+    retryInput.inputVisibilitySequence = turn.inputVisibilitySequence;
+    store.db.prepare('DELETE FROM visible_result_manifests').run();
+    assert.throws(
+      () => store.createCanonicalVisibleTurnInternal(structuredClone(creationInput)),
+      /canonical commit authority conflict/
+    );
+    assert.throws(
+      () => store.createCanonicalVisibleTurnInternal(retryInput),
+      /canonical commit authority conflict/
+    );
+  }));
+
+test('fresh v13 commits use v2 and pin the lane clear epoch across retries', () =>
+  withStore(store => {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'DIRECT_REPLY',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: SHA
+      }],
+      now: 1
+    });
+    store.claimInteractionLaneInternal({
+      roleId: 'yuqi',
+      laneKey: 'private_chat',
+      expectedRevision: 0,
+      now: 1
+    });
+    store.db.prepare(`
+      UPDATE interaction_lanes SET clear_epoch = 3
+      WHERE role_id = 'yuqi' AND lane_key = 'private_chat'
+    `).run();
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const lane = store.getInteractionLane('yuqi', 'private_chat');
+    const originalEnvelope = envelope('turn_clear_epoch');
+    const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1_000 });
+    const originalInput = {
+      envelope: originalEnvelope,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: lane.revision,
+      inputUserBatchId: `batch_${originalEnvelope.message.messageId}`,
+      inputVisibilitySequence: lane.localSequence,
+      inputClearEpoch: 3,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: {}
+    };
+    assert.throws(
+      () => store.createCanonicalVisibleTurnInternal({
+        ...structuredClone(originalInput),
+        inputClearEpoch: 2
+      }),
+      /clear epoch authority/
+    );
+    const original = store.createCanonicalVisibleTurnInternal(originalInput).turn;
+    assert.equal(original.inputClearEpoch, 3);
+    const commit = commitInput(store, original);
+    commit.inputClearEpoch = 3;
+    commit.expectedCognitiveStateRevision = 0;
+    const receipt = commitVisibleResult(commit);
+    assert.equal(receipt.commitPayloadVersion, 'pc-visible-commit-v2');
+
+    const retryInput = structuredClone(originalInput);
+    retryInput.envelope.turnId = 'turn_clear_epoch_retry';
+    retryInput.envelope.deviceSeq += 1;
+    retryInput.envelope.context = {
+      retry: {
+        retryOfTurnId: original.turnId,
+        canonicalMessageId: originalEnvelope.message.messageId
+      }
+    };
+    retryInput.expectedLaneRevision = store.getInteractionLane('yuqi', 'private_chat').revision;
+    retryInput.inputUserBatchId = original.inputUserBatchId;
+    retryInput.inputVisibilitySequence = original.inputVisibilitySequence;
+    assert.throws(
+      () => store.createCanonicalVisibleTurnInternal({
+        ...structuredClone(retryInput),
+        inputClearEpoch: 4
+      }),
+      /retry immutable authority/
+    );
+    const replay = store.createCanonicalVisibleTurnInternal(retryInput);
+    assert.equal(replay.status, 'already_committed');
     assert.equal(replay.receipt.commitChecksum, receipt.commitChecksum);
   }));
 

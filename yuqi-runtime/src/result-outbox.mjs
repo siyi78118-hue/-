@@ -83,7 +83,8 @@ export class ResultOutbox {
             this.store.markAuthorityCloudDeliveryMailboxed(
               target.authorityGroupId,
               target.peerId,
-              delivery.checksum
+              delivery.checksum,
+              output.messageId
             );
             summary.delivered += 1;
           } catch {
