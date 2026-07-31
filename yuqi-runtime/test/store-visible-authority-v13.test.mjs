@@ -14,11 +14,17 @@ import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 const SHA_A = 'a'.repeat(64);
 const V13_MIGRATION_FAULT_STEPS = [
   'after_schema_create',
+  'after_schema_alter',
   'after_current_batch_copy',
   'after_visible_item_copy',
   'after_visible_action_copy',
   'after_copy_verification',
+  'after_batch_parent_backfill',
+  'after_group_parent_backfill',
+  'after_lineage_parent_backfill',
+  'after_parent_backfill_verification',
   'after_old_table_rename',
+  'after_old_table_drop',
   'after_new_table_rename',
   'after_index_create',
   'after_version_write'
@@ -529,12 +535,12 @@ function assertScopedAndRestartReject(path, groupId, mutate) {
     mutate(store.db);
     assert.throws(
       () => store.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }),
-      /authority conflict/
+      /authority conflict|commitment sequence conflict/
     );
   } finally {
     store.close();
   }
-  assert.throws(() => new YuqiStore(path), /invariant|authority conflict/);
+  assert.throws(() => new YuqiStore(path), /invariant|authority conflict|commitment sequence conflict/);
 }
 
 for (const [name, mutate] of [
@@ -610,7 +616,8 @@ function buildRedactedV13Fixture(path, {
   rich = true,
   kind = 'DIRECT_REPLY',
   items = undefined,
-  actionSet = undefined
+  actionSet = undefined,
+  annotationSnapshot = null
 } = {}) {
   const store = new YuqiStore(path);
   ensureRollout(store, kind);
@@ -625,6 +632,10 @@ function buildRedactedV13Fixture(path, {
     SELECT attempt_commitment FROM turn_authority_lineages WHERE lineage_key = ?
   `).get(lineageKey).attempt_commitment;
   const redactedAt = 50_000;
+  if (annotationSnapshot) {
+    store.db.prepare('UPDATE turns SET annotation_snapshot_json = ? WHERE turn_id = ?')
+      .run(JSON.stringify(annotationSnapshot), turnId);
+  }
   store.db.exec('BEGIN IMMEDIATE');
   try {
     const lineage = store.db.prepare(`
@@ -782,6 +793,93 @@ test('a complete v13 redacted audit shell is restart-valid and non-deliverable',
     assert.doesNotThrow(() => new YuqiStore(path).close());
   }));
 
+test('a redacted cancelled lineage returns a terminal redacted outcome without recovery', () =>
+  withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      store.db.exec('BEGIN IMMEDIATE');
+      try {
+        store.db.prepare('DELETE FROM cloud_deliveries WHERE authority_group_id = ?')
+          .run(fixture.groupId);
+        store.db.prepare('DELETE FROM visible_result_manifests WHERE group_id = ?')
+          .run(fixture.groupId);
+        store.db.prepare('DELETE FROM visible_result_actions WHERE group_id = ?')
+          .run(fixture.groupId);
+        store.db.prepare('DELETE FROM visible_result_items WHERE group_id = ?')
+          .run(fixture.groupId);
+        store.db.prepare('DELETE FROM visible_commit_receipts WHERE lineage_key = ?')
+          .run(fixture.lineageKey);
+        store.db.prepare('DELETE FROM visible_result_groups WHERE group_id = ?')
+          .run(fixture.groupId);
+        store.db.prepare(`
+          UPDATE turns
+          SET state = 'cancelled', generation_fingerprint = NULL
+          WHERE authority_lineage_key = ?
+        `).run(fixture.lineageKey);
+        store.db.prepare(`
+          UPDATE turn_authority_lineages
+          SET state = 'cancelled', committed_group_id = NULL
+          WHERE lineage_key = ?
+        `).run(fixture.lineageKey);
+        store.db.exec('COMMIT');
+      } catch (error) {
+        store.db.exec('ROLLBACK');
+        throw error;
+      }
+      const outcome = store.readCanonicalCommitOutcomeInternal({
+        lineageKey: fixture.lineageKey
+      });
+      assert.equal(outcome.status, 'redacted');
+      assert.equal(outcome.receipt, null);
+      const original = store.getTurn(fixture.turnId);
+      const replay = store.createCanonicalVisibleTurnInternal({
+        envelope: envelope(1),
+        rolloutKey: original.rolloutKey,
+        expectedRolloutRevision: original.rolloutRevision,
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode,
+        laneKey: original.laneKey,
+        expectedLaneRevision: Number(original.laneRevision) - 1,
+        inputUserBatchId: original.inputUserBatchId,
+        inputVisibilitySequence: original.inputVisibilitySequence,
+        agencySnapshotChecksum: original.agencySnapshotChecksum,
+        annotationSnapshot: original.annotationSnapshot
+      });
+      assert.equal(replay.status, 'redacted');
+      assert.equal(replay.receipt, null);
+      const retryEnvelope = envelope(1);
+      retryEnvelope.turnId = 'turn_v13_redacted_retry';
+      retryEnvelope.deviceSeq = 101;
+      retryEnvelope.context = {
+        retry: {
+          retryOfTurnId: fixture.turnId,
+          canonicalMessageId: retryEnvelope.message.messageId
+        }
+      };
+      const retry = store.createCanonicalVisibleTurnInternal({
+        envelope: retryEnvelope,
+        rolloutKey: original.rolloutKey,
+        expectedRolloutRevision: original.rolloutRevision,
+        authoritativeReleaseId: original.authoritativeReleaseId,
+        comparisonReleaseId: original.comparisonReleaseId,
+        comparisonDirection: original.comparisonMode === 'none' ? null : original.comparisonMode,
+        laneKey: original.laneKey,
+        expectedLaneRevision: Number(original.laneRevision) - 1,
+        inputUserBatchId: original.inputUserBatchId,
+        inputVisibilitySequence: original.inputVisibilitySequence,
+        agencySnapshotChecksum: original.agencySnapshotChecksum,
+        annotationSnapshot: original.annotationSnapshot
+      });
+      assert.equal(retry.status, 'redacted');
+      assert.equal(retry.receipt, null);
+    } finally {
+      store.close();
+    }
+    assert.doesNotThrow(() => new YuqiStore(path).close());
+  }));
+
 test('redacted group preserves an explicit empty action tombstone set', () => withTempPath(path => {
   const fixture = buildRedactedV13Fixture(path, { rich: false });
   const store = new YuqiStore(path);
@@ -855,7 +953,7 @@ test('redacted delivery commitment rejects a deleted retained delivery', () => w
   } finally {
     store.close();
   }
-  assert.throws(() => new YuqiStore(path), /redacted authority delivery commitment conflict/);
+  assert.throws(() => new YuqiStore(path), /redacted authority delivery commitment conflict|v11 invariant canonical_delivery_join/);
 }));
 
 test('redacted delivery commitment rejects a changed retained relay identity', () => withTempPath(path => {
@@ -875,6 +973,83 @@ test('redacted delivery commitment rejects a changed retained relay identity', (
   }
   assert.throws(() => new YuqiStore(path), /redacted authority delivery commitment conflict/);
 }));
+
+test('redacted batch parent commitment rejects deleting its final retained item', () => withTempPath(path => {
+  const fixture = buildRedactedV13Fixture(path);
+  const store = new YuqiStore(path);
+  try {
+    store.db.prepare('DELETE FROM current_user_batch_items WHERE turn_id = ?')
+      .run(fixture.turnId);
+    assert.throws(
+      () => store.assertVisibleGroupAuthorityInternal(fixture.groupId, { purpose: 'reopen' }),
+      /redacted authority input batch shell conflict/
+    );
+  } finally {
+    store.close();
+  }
+  assert.throws(() => new YuqiStore(path), /redacted authority input batch shell conflict/);
+}));
+
+test('redacted lineage permits clearing a nonempty annotation snapshot without changing its commitment',
+  () => withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path, {
+      annotationSnapshot: { lesson: '对方更喜欢自然的接话' }
+    });
+    const store = new YuqiStore(path);
+    try {
+      assert.equal(store.assertVisibleGroupAuthorityInternal(fixture.groupId, {
+        purpose: 'reopen'
+      }).status, 'redacted');
+    } finally {
+      store.close();
+    }
+  }));
+
+test('live batch parent count is authority-checked at reopen', () => withTempPath(path => {
+  const store = new YuqiStore(path);
+  try {
+    ensureDirectRollout(store);
+    const receipt = commitCanonical(store, createCanonical(store, 91), 91);
+    store.db.prepare('UPDATE current_user_batches SET item_count = 8 WHERE turn_id = ?')
+      .run(receipt.authoritativeTurnId);
+    assert.throws(() => store.assertVisibleGroupAuthorityInternal(receipt.visibleGroupId, {
+      purpose: 'reopen'
+    }), /input batch authority conflict/);
+  } finally {
+    store.close();
+  }
+}));
+
+test('live automatic skip survives a close and reopen', () => withTempPath(path => {
+  const store = new YuqiStore(path);
+  ensureRollout(store, 'PROACTIVE_CHAT');
+  const skipped = createCanonical(store, 92, 'PROACTIVE_CHAT');
+  const receipt = commitCanonical(store, skipped, 92, { items: [], actionSet: [] });
+  store.close();
+  const reopened = new YuqiStore(path);
+  try {
+    assert.equal(reopened.assertVisibleGroupAuthorityInternal(receipt.visibleGroupId, {
+      purpose: 'reopen'
+    }).terminalDisposition, 'skip');
+  } finally {
+    reopened.close();
+  }
+}));
+
+test('a redacted group does not suppress unrelated legacy authority-leak checks', () =>
+  withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path);
+    const store = new YuqiStore(path);
+    try {
+      const legacy = store.submitTurn(envelope(93));
+      store.db.prepare(`
+        UPDATE turns SET authority_lineage_key = 'forged_legacy_lineage' WHERE turn_id = ?
+      `).run(legacy.turnId);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => new YuqiStore(path), /v11 invariant legacy_authority_leak/);
+  }));
 
 for (const [name, inject] of [
   ['turn reply JSON', (database, fixture) => database.prepare(`

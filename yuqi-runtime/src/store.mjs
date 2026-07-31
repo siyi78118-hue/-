@@ -183,13 +183,7 @@ function authorityLineageAttemptsCommitment({ lineageKey, attemptRows }) {
       retryOfTurnId: row.retry_of_turn_id == null ? null : String(row.retry_of_turn_id),
       inputUserBatchId: row.input_user_batch_id == null ? null : String(row.input_user_batch_id),
       envelopeChecksum: String(row.envelope_checksum),
-      batchTombstoneCommitment: row.tombstone_commitment == null ? null : String(row.tombstone_commitment),
-      rolloutRevision: Number(row.rollout_revision),
-      rolloutEvidenceEpoch: Number(row.rollout_evidence_epoch),
-      authoritativeReleaseId: row.authoritative_release_id == null ? null : String(row.authoritative_release_id),
-      comparisonReleaseId: row.comparison_release_id == null ? null : String(row.comparison_release_id),
-      comparisonMode: String(row.comparison_mode || 'none'),
-      annotationSnapshotChecksum: contentHash(parseJson(row.annotation_snapshot_json, {}))
+      batchTombstoneCommitment: row.tombstone_commitment == null ? null : String(row.tombstone_commitment)
     }));
   return contentHash({
     version: 'authority-lineage-attempts-v1', lineageKey: String(lineageKey),
@@ -313,6 +307,7 @@ function mapAuthorityLineage(row) {
     revision: Number(row.revision),
     state: row.state,
     committedGroupId: row.committed_group_id || null,
+    redactedAt: row.redacted_at == null ? null : Number(row.redacted_at),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at)
   };
@@ -1896,6 +1891,7 @@ export class YuqiStore {
       );
     `);
     this.maybeFailV13Migration('after_schema_create');
+    this.maybeFailV13Migration('after_schema_alter');
 
     this.db.exec(`
       INSERT INTO current_user_batch_items_v13(
@@ -1965,6 +1961,7 @@ export class YuqiStore {
       CREATE INDEX idx_current_user_batch_items_message
         ON current_user_batch_items(message_id);
     `);
+    this.maybeFailV13Migration('after_old_table_drop');
     for (const batch of this.db.prepare(
       'SELECT turn_id, batch_id FROM current_user_batches ORDER BY turn_id'
     ).all()) {
@@ -1978,6 +1975,7 @@ export class YuqiStore {
         'UPDATE current_user_batches SET item_count = ?, tombstone_commitment = ? WHERE turn_id = ?'
       ).run(items.length, commitment, batch.turn_id);
     }
+    this.maybeFailV13Migration('after_batch_parent_backfill');
     for (const group of this.db.prepare(
       'SELECT group_id FROM visible_result_groups ORDER BY group_id'
     ).all()) {
@@ -1994,6 +1992,7 @@ export class YuqiStore {
         'UPDATE visible_result_groups SET item_count = ?, action_count = ?, tombstone_commitment = ? WHERE group_id = ?'
       ).run(itemRows.length, actionRows.length, commitment, group.group_id);
     }
+    this.maybeFailV13Migration('after_group_parent_backfill');
     for (const lineage of this.db.prepare(
       'SELECT lineage_key FROM turn_authority_lineages ORDER BY lineage_key'
     ).all()) {
@@ -2001,8 +2000,6 @@ export class YuqiStore {
         `SELECT t.lineage_revision_at_creation, t.turn_id,
                 t.rollout_key AS turn_kind,
                 t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
-                t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
-             t.comparison_mode, t.annotation_snapshot_json,
                 b.tombstone_commitment
          FROM turns t LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
          WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
@@ -2015,6 +2012,60 @@ export class YuqiStore {
         'UPDATE turn_authority_lineages SET attempt_count = ?, attempt_commitment = ? WHERE lineage_key = ?'
       ).run(attempts.length, commitment, lineage.lineage_key);
     }
+    this.maybeFailV13Migration('after_lineage_parent_backfill');
+
+    // Verify the v13 parent commitments before any legacy tables are renamed
+    // away.  This is deliberately independent of the write loops above so a
+    // future change cannot silently persist a mismatched count/checksum pair.
+    for (const batch of this.db.prepare(
+      'SELECT turn_id, batch_id, item_count, tombstone_commitment FROM current_user_batches'
+    ).all()) {
+      const items = this.db.prepare(
+        'SELECT sequence, message_id, checksum FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence'
+      ).all(batch.turn_id);
+      if (Number(batch.item_count) !== items.length
+        || currentUserBatchTombstoneCommitment({
+          turnId: batch.turn_id, batchId: batch.batch_id, itemRows: items
+        }) !== batch.tombstone_commitment) {
+        throw new Error(`v13 migration batch parent verification conflict: ${batch.turn_id}`);
+      }
+    }
+    for (const group of this.db.prepare(
+      'SELECT group_id, item_count, action_count, tombstone_commitment FROM visible_result_groups'
+    ).all()) {
+      const itemRows = this.db.prepare(
+        'SELECT ordinal, message_id, item_checksum FROM visible_result_items WHERE group_id = ? ORDER BY ordinal'
+      ).all(group.group_id);
+      const actionRows = this.db.prepare(
+        'SELECT ordinal, action_id, action_checksum FROM visible_result_actions WHERE group_id = ? ORDER BY ordinal'
+      ).all(group.group_id);
+      if (Number(group.item_count) !== itemRows.length
+        || Number(group.action_count) !== actionRows.length
+        || visibleResultTombstoneCommitment({
+          groupId: group.group_id, itemRows, actionRows
+        }) !== group.tombstone_commitment) {
+        throw new Error(`v13 migration group parent verification conflict: ${group.group_id}`);
+      }
+    }
+    for (const lineage of this.db.prepare(
+      'SELECT lineage_key, attempt_count, attempt_commitment FROM turn_authority_lineages'
+    ).all()) {
+      const attempts = this.db.prepare(`
+        SELECT t.lineage_revision_at_creation, t.turn_id,
+               t.rollout_key AS turn_kind, t.retry_of_turn_id,
+               t.input_user_batch_id, t.envelope_checksum, b.tombstone_commitment
+        FROM turns t LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+        WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
+        ORDER BY t.lineage_revision_at_creation
+      `).all(lineage.lineage_key);
+      if (Number(lineage.attempt_count) !== attempts.length
+        || authorityLineageAttemptsCommitment({
+          lineageKey: lineage.lineage_key, attemptRows: attempts
+        }) !== lineage.attempt_commitment) {
+        throw new Error(`v13 migration lineage parent verification conflict: ${lineage.lineage_key}`);
+      }
+    }
+    this.maybeFailV13Migration('after_parent_backfill_verification');
     this.maybeFailV13Migration('after_index_create');
     this.db.exec('PRAGMA user_version = 13;');
     this.maybeFailV13Migration('after_version_write');
@@ -2160,6 +2211,46 @@ export class YuqiStore {
         )
       LIMIT 1
     `);
+
+    // The lineage commitment deliberately has a small, stable seven-field
+    // shape.  Model/release/comparison pins are still immutable live retry
+    // inputs, but are validated here rather than being smuggled into that
+    // commitment namespace.  Redaction intentionally clears annotations, so
+    // its audit shell is exempt from this live-input comparison.
+    if (allowVersionThirteen) {
+      const retryPins = this.db.prepare(`
+        SELECT t.*, p.rollout_key AS parent_rollout_key,
+               p.rollout_revision AS parent_rollout_revision,
+               p.rollout_evidence_epoch AS parent_rollout_evidence_epoch,
+               p.authoritative_release_id AS parent_authoritative_release_id,
+               p.authoritative_pipeline_checksum AS parent_authoritative_pipeline_checksum,
+               p.comparison_release_id AS parent_comparison_release_id,
+               p.comparison_pipeline_checksum AS parent_comparison_pipeline_checksum,
+               p.comparison_mode AS parent_comparison_mode,
+               p.annotation_snapshot_json AS parent_annotation_snapshot_json
+        FROM turns t
+        JOIN turns p ON p.turn_id = t.retry_of_turn_id
+        JOIN turn_authority_lineages l ON l.lineage_key = t.authority_lineage_key
+        WHERE t.result_authority_version = 1
+          AND t.retry_of_turn_id IS NOT NULL
+          AND l.redacted_at IS NULL
+      `).all();
+      for (const retry of retryPins) {
+        const mismatch = retry.rollout_key !== retry.parent_rollout_key
+          || Number(retry.rollout_revision) !== Number(retry.parent_rollout_revision)
+          || Number(retry.rollout_evidence_epoch) !== Number(retry.parent_rollout_evidence_epoch)
+          || retry.authoritative_release_id !== retry.parent_authoritative_release_id
+          || retry.authoritative_pipeline_checksum !== retry.parent_authoritative_pipeline_checksum
+          || retry.comparison_release_id !== retry.parent_comparison_release_id
+          || retry.comparison_pipeline_checksum !== retry.parent_comparison_pipeline_checksum
+          || retry.comparison_mode !== retry.parent_comparison_mode
+          || canonicalJson(parseJson(retry.annotation_snapshot_json, null))
+            !== canonicalJson(parseJson(retry.parent_annotation_snapshot_json, null));
+        if (mismatch) {
+          throw new Error(`v13 invariant canonical retry pin conflict: ${retry.turn_id}`);
+        }
+      }
+    }
 
     assertNoInvariantRow('lineage_latest_owner', `
       SELECT l.lineage_key, l.latest_turn_id
@@ -2315,7 +2406,8 @@ export class YuqiStore {
       LIMIT 1
     `);
 
-    assertNoInvariantRow('canonical_group_item_shape', `
+    if (!allowVersionThirteen) {
+      assertNoInvariantRow('canonical_group_item_shape', `
       SELECT g.group_id, COUNT(i.ordinal) AS item_count,
              MIN(i.ordinal) AS min_ordinal, MAX(i.ordinal) AS max_ordinal
       FROM visible_result_groups g
@@ -2325,9 +2417,9 @@ export class YuqiStore {
          OR min_ordinal != 0
          OR max_ordinal != COUNT(i.ordinal) - 1
       LIMIT 1
-    `);
+      `);
 
-    assertNoInvariantRow('canonical_item_message_projection', `
+      assertNoInvariantRow('canonical_item_message_projection', `
       SELECT i.group_id, i.ordinal, i.message_id
       FROM visible_result_items i
       JOIN visible_result_groups g ON g.group_id = i.group_id
@@ -2342,9 +2434,9 @@ export class YuqiStore {
          OR m.speaker_type != 'character'
          OR m.recipient_id != 'user'
       LIMIT 1
-    `);
+      `);
 
-    assertNoInvariantRow('orphan_canonical_message_projection', `
+      assertNoInvariantRow('orphan_canonical_message_projection', `
       SELECT m.message_id, m.authority_group_id, m.group_ordinal
       FROM messages m
       LEFT JOIN visible_result_items i
@@ -2353,7 +2445,8 @@ export class YuqiStore {
        AND i.message_id = m.message_id
       WHERE m.authority_group_id IS NOT NULL AND i.message_id IS NULL
       LIMIT 1
-    `);
+      `);
+    }
 
     assertNoInvariantRow('orphan_group_authority_reference', `
       SELECT 'stance' AS source, authority_group_id AS group_id
@@ -2407,7 +2500,7 @@ export class YuqiStore {
       LIMIT 1
     `);
 
-    for (const turn of this.db.prepare(`
+    if (!allowVersionThirteen) for (const turn of this.db.prepare(`
       SELECT turn_id, envelope_json, envelope_checksum
       FROM turns WHERE result_authority_version = 1
     `).all()) {
@@ -2415,7 +2508,7 @@ export class YuqiStore {
         throw new Error(`v11 invariant canonical_envelope_checksum: ${turn.turn_id}`);
       }
     }
-    for (const item of this.db.prepare(`
+    if (!allowVersionThirteen) for (const item of this.db.prepare(`
       SELECT i.group_id, i.ordinal, i.message_id, i.item_json, i.item_checksum,
              g.role_id, m.content, m.speaker_id, m.speaker_type, m.recipient_id
       FROM visible_result_items i
@@ -2864,8 +2957,6 @@ export class YuqiStore {
       SELECT t.lineage_revision_at_creation, t.turn_id,
              t.rollout_key AS turn_kind,
              t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum, t.envelope_json,
-             t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
-             t.comparison_mode, t.annotation_snapshot_json,
              b.tombstone_commitment
       FROM turns t
       LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
@@ -2938,6 +3029,30 @@ export class YuqiStore {
             throw new Error('redacted authority input batch shell conflict');
           }
         });
+      }
+      for (const attempt of attempts) {
+        const batch = this.db.prepare(
+          'SELECT * FROM current_user_batches WHERE turn_id = ?'
+        ).get(attempt.turn_id);
+        const items = batchesByTurn.get(attempt.turn_id) || [];
+        const commitmentAttempt = lineageAttempts.find(candidate =>
+          candidate.turn_id === attempt.turn_id);
+        if (!batch) {
+          if (items.length || commitmentAttempt?.tombstone_commitment != null) {
+            throw new Error('redacted authority input batch shell conflict');
+          }
+          continue;
+        }
+        if (batch.batch_id !== attempt.input_user_batch_id
+          || Number(batch.item_count) !== items.length
+          || currentUserBatchTombstoneCommitment({
+            turnId: attempt.turn_id,
+            batchId: batch.batch_id,
+            itemRows: items
+          }) !== batch.tombstone_commitment
+          || commitmentAttempt?.tombstone_commitment !== batch.tombstone_commitment) {
+          throw new Error('redacted authority input batch shell conflict');
+        }
       }
       const linkedMessages = this.db.prepare(`
         SELECT * FROM messages
@@ -3235,7 +3350,13 @@ export class YuqiStore {
           || Number(batch.started_at) !== Number(normalized.startedAt)
           || Number(batch.committed_at) !== Number(normalized.committedAt)
           || batch.checksum !== contentHash(header)
-          || batchItems.length !== normalized.messageIds.length) {
+          || batchItems.length !== normalized.messageIds.length
+          || Number(batch.item_count) !== batchItems.length
+          || currentUserBatchTombstoneCommitment({
+            turnId: turn.turn_id,
+            batchId: batch.batch_id,
+            itemRows: batchItems
+          }) !== batch.tombstone_commitment) {
           throw new Error('canonical visible group input batch authority conflict');
         }
         batchItems.forEach((item, sequence) => {
@@ -3249,6 +3370,16 @@ export class YuqiStore {
             throw new Error('canonical visible group input batch authority conflict');
           }
         });
+      } else {
+        const batch = this.db.prepare(
+          'SELECT * FROM current_user_batches WHERE turn_id = ?'
+        ).get(turn.turn_id);
+        const batchItems = this.db.prepare(
+          'SELECT * FROM current_user_batch_items WHERE turn_id = ?'
+        ).all(turn.turn_id);
+        if (batch || batchItems.length) {
+          throw new Error('canonical visible group trigger batch authority conflict');
+        }
       }
     }
 
@@ -3285,32 +3416,16 @@ export class YuqiStore {
 
   assertVisibleAuthorityV13Invariants() {
     this.assertVisibleAuthorityV13SchemaInternal();
-    const redactedGroupCount = Number(this.db.prepare(`
-      SELECT COUNT(*) AS value FROM visible_result_groups WHERE redacted_at IS NOT NULL
-    `).get().value);
-    if (redactedGroupCount === 0) {
-      this.assertVisibleAuthorityV11Invariants({ allowVersionThirteen: true });
-    } else {
-      const unknownAuthority = this.db.prepare(`
-        SELECT turn_id, result_authority_version
-        FROM turns
-        WHERE result_authority_version NOT IN (0, 1)
-        LIMIT 1
-      `).get();
-      if (unknownAuthority) {
-        throw new Error(`v13 invariant unknown result authority: ${JSON.stringify(unknownAuthority)}`);
-      }
-    }
+    this.assertVisibleAuthorityV11Invariants({ allowVersionThirteen: true });
     for (const lineage of this.db.prepare(`
-      SELECT lineage_key, attempt_count, attempt_commitment
+      SELECT lineage_key, state, committed_group_id, redacted_at,
+             attempt_count, attempt_commitment
       FROM turn_authority_lineages ORDER BY lineage_key
     `).all()) {
       const attempts = this.db.prepare(`
         SELECT t.lineage_revision_at_creation, t.turn_id,
                t.rollout_key AS turn_kind,
                t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
-               t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
-             t.comparison_mode, t.annotation_snapshot_json,
                b.tombstone_commitment
         FROM turns t
         LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
@@ -3323,6 +3438,59 @@ export class YuqiStore {
           attemptRows: attempts
         }) !== lineage.attempt_commitment) {
         throw new Error('v13 invariant lineage attempt commitment conflict');
+      }
+      for (const attempt of attempts) {
+        const batch = this.db.prepare(
+          'SELECT * FROM current_user_batches WHERE turn_id = ?'
+        ).get(attempt.turn_id);
+        const batchItems = this.db.prepare(`
+          SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence
+        `).all(attempt.turn_id);
+        if (!batch) {
+          if (batchItems.length || attempt.tombstone_commitment != null) {
+            throw new Error('v13 invariant canonical batch parent conflict');
+          }
+        } else {
+          let commitment;
+          try {
+            commitment = currentUserBatchTombstoneCommitment({
+              turnId: attempt.turn_id,
+              batchId: batch.batch_id,
+              itemRows: batchItems
+            });
+          } catch {
+            throw new Error('v13 invariant canonical batch parent conflict');
+          }
+          if (batch.batch_id !== attempt.input_user_batch_id
+            || Number(batch.item_count) !== batchItems.length
+            || commitment !== batch.tombstone_commitment
+            || attempt.tombstone_commitment !== batch.tombstone_commitment) {
+            throw new Error(lineage.redacted_at != null
+              ? 'redacted authority input batch shell conflict'
+              : 'v13 invariant canonical batch parent conflict');
+          }
+        }
+      }
+      if (lineage.state === 'cancelled' && lineage.redacted_at != null) {
+        const cancelledAttempts = this.db.prepare(`
+          SELECT * FROM turns WHERE authority_lineage_key = ?
+          ORDER BY lineage_revision_at_creation
+        `).all(lineage.lineage_key);
+        const leaking = cancelledAttempts.some(turn =>
+          turn.authority_redacted_at == null
+          || canonicalJson(parseJson(turn.envelope_json, null)) !== '{"redacted":true}'
+          || turn.memory_packet_json !== null || turn.brain_draft_json !== null
+          || turn.supervisor_json !== null || turn.reply_json !== null || turn.error_json !== null);
+        const retainedResult = this.db.prepare(`
+          SELECT 1 FROM visible_result_groups WHERE lineage_key = ?
+          UNION ALL SELECT 1 FROM visible_commit_receipts WHERE lineage_key = ?
+          UNION ALL SELECT 1 FROM cloud_deliveries WHERE authority_group_id IS NOT NULL
+            AND turn_id IN (SELECT turn_id FROM turns WHERE authority_lineage_key = ?)
+          LIMIT 1
+        `).get(lineage.lineage_key, lineage.lineage_key, lineage.lineage_key);
+        if (lineage.committed_group_id !== null || leaking || retainedResult) {
+          throw new Error('v13 invariant redacted cancelled lineage conflict');
+        }
       }
     }
     for (const row of this.db.prepare(`
@@ -4375,7 +4543,12 @@ export class YuqiStore {
     expectedCommitChecksum = null
   } = {}) {
     const lineage = this.getTurnAuthorityLineage(lineageKey);
-    if (!lineage || lineage.state !== 'committed') return null;
+    if (!lineage) return null;
+    if (lineage.state === 'cancelled' && lineage.redactedAt != null) {
+      this.assertVisibleAuthorityV13Invariants();
+      return { status: 'redacted', receipt: null, lineage };
+    }
+    if (lineage.state !== 'committed') return null;
     if (!lineage.committedGroupId) {
       throw new Error('canonical commit authority conflict');
     }
@@ -4458,6 +4631,11 @@ export class YuqiStore {
     });
 
     return this.withImmediateTransaction(() => {
+      // A clear is terminal for the whole lineage.  Resolve it before reading
+      // an attempt's now-tombstoned envelope, so both an original replay and a
+      // fresh retry cannot revive, requeue, or produce a second result.
+      const terminalOutcome = this.readCanonicalCommitOutcomeInternal({ lineageKey });
+      if (terminalOutcome?.status === 'redacted') return terminalOutcome;
       const exactTurn = this.getTurn(envelope.turnId);
       if (exactTurn) {
         if (exactTurn.envelopeChecksum !== envelopeChecksum
@@ -4805,8 +4983,6 @@ export class YuqiStore {
       SELECT t.lineage_revision_at_creation, t.turn_id,
              t.rollout_key AS turn_kind,
              t.retry_of_turn_id, t.input_user_batch_id, t.envelope_checksum,
-             t.rollout_revision, t.rollout_evidence_epoch, t.authoritative_release_id, t.comparison_release_id,
-             t.comparison_mode, t.annotation_snapshot_json,
              b.tombstone_commitment
       FROM turns t
       LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
