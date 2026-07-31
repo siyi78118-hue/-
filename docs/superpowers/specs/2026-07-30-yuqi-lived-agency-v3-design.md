@@ -584,6 +584,50 @@ wire protocol 版本与 PC 内部结果权威版本是两个独立维度：
 
 创建事务还必须用 rollout revision 做 CAS，重新读取并核对 stable/candidate release pair，再从不可变 release 记录固定 checksum 与 preset；调用方不能借参数自行选择 release。`generationFingerprint` 依赖尚未生成的可见 draft/action，因此创建时必须为 null，只能在 canonical result 提交事务中根据已授权输出和 agency/context revision 重新计算，并同时写入 turn 与 visible group。
 
+release pair 的阶段投影只有一个实现：Task 11 建立不依赖 store/controller/orchestrator 的纯 `release-pair.mjs`，`PromotionController` 只委托它，fresh turn 创建事务和 fresh life-planning attempt 创建事务也调用同一个函数重新解析。orchestrator 的预读只用于选择将要请求的 release；store 在 `BEGIN IMMEDIATE` 内用 rollout revision CAS、当前计数和不可变 release row 再次证明该 pair。resolver 只决定 visible/comparison release identity 与方向，不擅自推导兼容 `pipeline_mode`；store 还必须验证 `current_mode/rollout_phase/candidate_phase` 投影，并允许毕业后的 `active/stable/none`。retry/open attempt 恢复只认自身持久 pins，不重新解析当前 rollout。Task 23 只增加 candidate 注册、阶段迁移、晋级、熔断和回退，不能再实现第二份 phase switch。
+
+fresh version-1 authority 的 comparison direction 固定使用 release 语义：
+`stable_authoritative_candidate_compare` 或
+`candidate_authoritative_stable_compare`。旧
+`legacy_authoritative_cognition_compare` /
+`cognition_authoritative_legacy_compare` 只作为已持久化 version-0
+job/attempt 的只读兼容别名。compare worker 必须联合校验
+`jobType + direction + subject authority version + release IDs/checksums`；
+不能仅凭字符串包含 legacy/cognition 判断 shadow/canary，也不能让新任务继续写旧别名。
+canonical compare job 不因此扩大 Task 10F 已封闭的 semantic descriptor：worker
+必须沿 `authority_group_id` 连接 receipt/group/turn 取得 rollout 与 release pins；
+life job 则连接 `planning_id` attempt。不得要求 descriptor 中不存在的 rolloutKey/
+pipelineChecksum，也不得拿兼容 rollout.pipeline_checksum 代替 stable/candidate
+release checksum。旧 version-0 job 才允许继续读取历史自包含 payload。
+
+release ID 到实际执行器也只有一个 Task 11 `ReleaseExecutor`：它以不可变 release
+row 的精确 pipelineVersion 选择 legacy-v1、cognition-v2 或 cognition-v3 adapter，
+authoritative turn、authoritative life planning 和后台 compare 都通过它。未知版本或
+checksum 不符在 model call 前失败；compare 使用 dry-run capability，不能借旧
+`comparisonPipeline` 字符串或 mode 分支绕开写权限。redaction 在 claim 前后都能使
+worker 只做 metadata-only cancellation，绝不重新装载已清除正文。
+
+canary 的 `canary_started_count` 专指已经原子分配的后台对照 subject，而不是所有 candidate-visible subject。每个 rollout key 各自把前十个 subject 固定为 candidate 可见、stable 后台、slot 1–10；第十一个及以后在观察期内仍可使用 candidate 可见，但 `comparisonReleaseId/canarySlot` 为 null，不能继续增加 started count。turn 与 life planning 共用同一套 per-key 持久计数规则、最多三个 outstanding 和十五分钟 deadline，但绝不跨 TurnKind 共用一个计数器；retry 继承 parent slot/pair，不能再次占位。超时/积压使用控制器运行时钟和持久 subject/attempt 占位时间，不使用可被历史回放、延迟投递或 compare-job 延迟创建影响的消息/触发时间。deadline 过期始终阻止新的 canary subject；outstanding 上限只在本次还会占新对照 slot 时阻止，十个 slot 已满后允许无新对照的 candidate-visible subject 等待未超时旧任务收尾。
+
+`LIFE_PLANNING` 虽不创建 chat turn/group，也必须在 attempt 创建事务中固定与其他 TurnKind 相同的 `authoritative_release_id`、`comparison_release_id` 及双方 checksum。恢复时先返回已有 open/exact attempt 及其原 pins，只有 fresh attempt 才读取当前 rollout 并占新 slot。compare job 只能在 authoritative life result checksum 已形成的提交事务内创建，并复制 attempt 已固定的 release identity；attempt 创建阶段不得先建 job。每个已占 slot 的 turn/life subject 必须最终且仅一次计入 completed 或 failure；权威管线在 compare job 建立前发生可重试失败时继续保持 outstanding，只有明确终止/取消才计 failure，不能因漏记而永久挂住。
+
+这里的 turn canary subject 是整条 canonical lineage，不是每个 retry attempt。v13
+遗留的 `UNIQUE(rollout_key, canary_epoch, canary_slot)` 索引会阻止 retry 持久化相同
+slot，因此 Task 11 将 PC schema 升到 v14：不重写任何语义行，只把唯一约束限定到
+`retry_of_turn_id IS NULL` 的 root turn，并增加 lineage-slot 查询索引。store 与 reopen
+invariant 继续要求同 lineage 的所有 retry 精确继承 root 的 epoch/slot/release pins，
+同时禁止两个 root owner 共享 slot。v13→v14 必须先验证 v13 全部语义 invariant 和
+当前 canary 计数，再在单事务内换索引、验证、最后写 user version；任何故障或
+不一致源都保持 v13 原样。
+
+canary outstanding 的权威读按 rollout key/epoch 从 root lineage 与 life attempt
+枚举 allocation，不能把 retry 当成第二个 subject，也不能扫描未按 rollout 过滤的
+全局 compare job。`started = completed + failure + outstanding` 是 reopen/selection
+共同 invariant；oldestAt 取原始 slot 占位时间。retryable failure/retry_wait 不终结
+subject；lineage 取消、life terminal failure、comparison 成功/critical/permanent
+failure 才在同一事务中且仅一次关闭计数。Task 11 以后 PC 最新 schema 为 v14；
+Android Room 的版本号仍独立。
+
 上述 rollout CAS 适用于 fresh original。version-1 retry 必须继承 parent turn 已固定的 rollout/release/checksum/comparison/preset，不得因期间发生晋级或回退而换模型；version-0 parent 的 retry 仍走旧兼容路径，缺失或损坏 parent 时停止而不是伪造 canonical lineage。相同未提交 turn 的 exact replay 不重复增加任何 revision；lineage 已提交时返回原 receipt，不受当前 rollout 变化影响。
 
 retry 继承的是模型与输入的不可变 pins，不是已经过期的 agency head。若 open parent 因 `AGENCY_AUTHORITY_STALE` 失败，显式 retry 必须在同一个创建事务内重新读取当前 agency snapshot，核对调用方的乐观 checksum，并把新 checksum 固定到 retry attempt；它允许与 parent 不同。否则“新 checksum 因不等于 parent 被拒绝、旧 checksum 又因不等于当前 snapshot 被拒绝”会使 open lineage 永久不可恢复。exact same-turn replay 仍逐项核对该 attempt 自己持久化的 agency checksum；committed lineage 仍在完整 immutable input/parent/lineage 校验后直接返回原 receipt，不读取当前 agency heads。
@@ -1241,8 +1285,12 @@ pipeline checksum 包含：
 
 1. 离线候选：迁移、协议、质量、历史、竞态和 Android 兼容全部通过；
 2. 真实 shadow：稳定版可见、v3后台；
-3. DIRECT_REPLY canary：v3可见，前十个回合全部运行稳定版后台对照；
+3. DIRECT_REPLY canary：v3可见，前十个 subject 全部运行稳定版后台对照；
 4. 逐 TurnKind 晋级：主动、朋友圈、安排和生活分别晋级。
+
+每个后续 TurnKind 的 canary 也独立分配自己的前十个后台对照；`LIFE_PLANNING`
+以 attempt/result subject 计数，不以聊天回合计数。十个 slot 完成后进入观察期，
+candidate 可继续可见但不再创建对照，也不再递增 `canary_started_count`。
 
 低频功能没有真实样本时不能谎称稳定 active。实现完成与生产晋级分别报告。后续 PC rollout 不要求重新安装 APK。
 

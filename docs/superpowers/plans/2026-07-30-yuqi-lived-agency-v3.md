@@ -161,9 +161,22 @@ createCanonicalVisibleTurnInternal({
    | { status: 'already_committed', receipt }
    | { status: 'redacted', receipt: receipt | null, lineage }
 
-// promotion-controller.mjs
+// release-pair.mjs
 resolvePipelinePair(rollout) -> {
   visibleReleaseId, comparisonReleaseId, comparisonDirection, candidatePhase
+}
+
+// release-executor.mjs
+supportsPipelineVersion(pipelineVersion) -> boolean
+ReleaseExecutor.executeTurn({ releaseId, releaseChecksum, execution, dryRun }) -> TurnDraft
+ReleaseExecutor.executeLife({ releaseId, releaseChecksum, execution, dryRun }) -> LifeDraft
+
+// promotion-controller.mjs
+PromotionController.resolvePipelinePair(rollout) -> ReleasePair
+selectPipelinePairForFreshSubject(rolloutKey, { now }) -> {
+  rollout, pair: {
+    visibleReleaseId, comparisonReleaseId, comparisonDirection, candidatePhase
+  }
 }
 registerCandidate({ rolloutKey, expectedRevision, releaseId, reportId, reportChecksum })
 promoteToCanary({ rolloutKey, expectedRevision, reportId, reportChecksum })
@@ -177,7 +190,7 @@ The persisted release semantics are:
 |---|---|---|
 | `none` | stable release | none |
 | `shadow` | stable release | candidate release |
-| `canary` | candidate release | stable release |
+| `canary` | candidate release | stable release for comparison slots 1–10; none after target |
 | `rolled_back` | stable release | none |
 
 Graduation is one transaction: the candidate becomes `stable_release_id`, `candidate_release_id` becomes null, and `candidate_phase` becomes `none`. The old `current_mode`, `rollout_phase`, `preset_version`, and `pipeline_checksum` columns are a compatibility projection only; new code reads release IDs.
@@ -2207,13 +2220,14 @@ the stored interaction, then returns the receipt before evaluating mutable
 lane/rollout/agency claims. It must not disclose an unrelated lineage receipt
 merely because a caller supplied its root ID.
 
-Add canary reservation tests: two fresh accepted turns receive distinct slots,
-`canary_started_count` increments transactionally, rollout CAS losers write
-nothing, and `canary_max_outstanding` cannot be exceeded. An exact replay and a
-version-1 retry consume no new slot. Outstanding is the rollout-owned value
+Add canary reservation tests: two fresh accepted canary turns receive distinct
+slots, `canary_started_count` increments transactionally, rollout CAS losers
+write nothing, and `canary_max_outstanding` cannot be exceeded. An exact replay
+and version-1 retry consume no new slot. Outstanding is the rollout-owned value
 `canary_started_count - canary_completed_count - canary_failure_count`, not a
 count of comparison rows that do not exist until after an authoritative result
-commits.
+commits. This Task 10 primitive predates release-pair selection; Task 11 later
+gates it to the first ten comparison-bearing subjects and adds the target cap.
 
 Add mutation closure:
 
@@ -2273,12 +2287,15 @@ Protocol v3 monotonic advancement remains unreachable until Task 13 validates
 its cursor. Retry compares the complete normalized parent/current batch and
 message attachment structure by canonical hash.
 
-Fresh shadow/canary creation reserves rollout state in the same immediate
-transaction. Canary checks current outstanding work, increments
-`canary_started_count`, assigns one unique slot, and increments rollout
-revision. Retry inherits the parent slot and release pair without another
-reservation. A shadow creation verifies the pinned rollout revision/release pair
-under the same immediate transaction but does not increment canary counters.
+At this Task 10 boundary, fresh shadow/canary creation validates rollout state
+in the same immediate transaction. Canary checks current outstanding work,
+increments `canary_started_count`, assigns one unique slot, and increments
+rollout revision. Retry inherits the parent slot and release pair without
+another reservation. A shadow creation verifies the pinned rollout
+revision/release pair under the same immediate transaction but does not
+increment canary counters. Task 11 replaces Task 10's temporary all-canary phase
+switch with the shared resolver and makes the reservation conditional on a
+non-null comparison release, so the final behavior stops at ten.
 
 Every produced method above performs:
 
@@ -4493,17 +4510,31 @@ plan owner independently reviews Task 10F and explicitly releases it.
 ### Task 11: Integrate v3, Lanes, Shadow, and Recovery in the Runtime
 
 **Files:**
+- Create: `yuqi-runtime/src/release-pair.mjs`
+- Create: `yuqi-runtime/src/release-executor.mjs`
+- Modify: `yuqi-runtime/src/promotion-controller.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Modify: `yuqi-runtime/src/turn-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/shadow-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/life-planning-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/reconcile.mjs`
 - Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
+- Modify: `scripts/migrate-yuqi-agency-state.mjs`
+- Create: `yuqi-runtime/test/release-pair.test.mjs`
+- Create: `yuqi-runtime/test/release-executor.test.mjs`
+- Modify: `yuqi-runtime/test/promotion-controller.test.mjs`
+- Create: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
+- Modify: `yuqi-runtime/test/store-cognition-migration.test.mjs`
+- Modify: `yuqi-runtime/test/store-agency-v10.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v11.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
 - Modify: `yuqi-runtime/test/orchestrator.test.mjs`
 - Modify: `yuqi-runtime/test/turn-dispatcher.test.mjs`
 - Modify: `yuqi-runtime/test/shadow-dispatcher.test.mjs`
 - Modify: `yuqi-runtime/test/life-planning-attempt.test.mjs`
 - Create: `yuqi-runtime/test/v3-runtime-recovery.test.mjs`
+- Modify: `tests/yuqi-agency-state-migration.test.mjs`
 
 **Interfaces:**
 - Consumes: Tasks 2, 7, 9, 10, 10A, 10B, 10C, 10D, 10E, and 10F.
@@ -4513,7 +4544,24 @@ plan owner independently reviews Task 10F and explicitly releases it.
   below, while `LIFE_PLANNING` uses its pre-existing two-phase attempt/result
   authority; receipt-derived bridge results; background comparisons created
   inside the applicable authoritative result transaction only after the checksum
-  is deterministic.
+  is deterministic; one pure release-pair resolver shared by the controller and
+  both store-owned creation transactions; and persisted release IDs/checksums for
+  life-planning attempts. Produces PC schema v14, whose only schema delta from
+  v13 is retry-safe canary-slot ownership indexes; v13 visible/redaction
+  semantics remain unchanged.
+
+Task 11, not Task 23, owns the read-only release-pair contract needed to create
+work. Task 23 owns candidate registration, phase mutation, promotion commands,
+quality fuses, graduation, and rollback. No orchestrator or dispatcher may
+reimplement the phase switch.
+
+The pre-existing `PromotionController.createTurn()` and
+`store.createTurnWithRolloutInternal()` remain a sealed result-authority-version-0
+compatibility adapter for ineligible/old callers only. Task 11 must not route a
+canonical Yuqi subject through them, mutate their row to version 1 afterward, or
+copy their `current_mode` switch into new code. Their historical recovery and
+wire-v1 behavior remain covered by compatibility tests; Task 23 tests exercise
+the Task 11 orchestrator, not this legacy creator.
 
 - [ ] **Step 1: Write red orchestration tests for release direction and recovery**
 
@@ -4603,19 +4651,574 @@ test('redacted committed replay is terminal and never re-enters model or outbox'
   assert.equal(model.calls.length, 0);
   assert.equal(store.listPendingAuthorityCloudDeliveries().length, 0);
 });
+
+test('one pure resolver owns stable shadow canary and rollback release direction', () => {
+  assert.deepEqual(resolvePipelinePair(rollout({ candidatePhase: 'none' })), {
+    visibleReleaseId: 'stable-r2', comparisonReleaseId: null,
+    comparisonDirection: null, candidatePhase: 'none'
+  });
+  assert.deepEqual(resolvePipelinePair(rollout({
+    candidatePhase: 'none', candidateReleaseId: null
+  })), {
+    visibleReleaseId: 'stable-r2', comparisonReleaseId: null,
+    comparisonDirection: null, candidatePhase: 'none'
+  });
+  assert.deepEqual(resolvePipelinePair(rollout({ candidatePhase: 'shadow' })), {
+    visibleReleaseId: 'stable-r2', comparisonReleaseId: 'candidate-r3',
+    comparisonDirection: 'stable_authoritative_candidate_compare',
+    candidatePhase: 'shadow'
+  });
+  assert.equal(resolvePipelinePair(rollout({
+    candidatePhase: 'canary', canaryStartedCount: 9
+  })).comparisonReleaseId, 'stable-r2');
+  assert.equal(resolvePipelinePair(rollout({
+    candidatePhase: 'canary', canaryStartedCount: 10
+  })).comparisonReleaseId, null);
+  assert.deepEqual(resolvePipelinePair(rollout({ candidatePhase: 'rolled_back' })), {
+    visibleReleaseId: 'stable-r2', comparisonReleaseId: null,
+    comparisonDirection: null, candidatePhase: 'rolled_back'
+  });
+  assert.throws(() => resolvePipelinePair(rollout({
+    candidatePhase: 'canary', canaryStartedCount: 11
+  })), /invalid rollout release authority/);
+});
+
+test('one release executor owns authoritative and dry-run adapter selection', async () => {
+  const visible = await releaseExecutor.executeTurn({
+    releaseId: 'candidate-r3', releaseChecksum: SHA_R3,
+    execution: directExecution(), dryRun: false
+  });
+  const compare = await releaseExecutor.executeTurn({
+    releaseId: 'candidate-r3', releaseChecksum: SHA_R3,
+    execution: directExecution(), dryRun: true
+  });
+  assert.equal(visible.adapterId, 'cognition-v3');
+  assert.equal(compare.adapterId, 'cognition-v3');
+  assert.equal(compare.capabilities.visibleCommit, false);
+  await assert.rejects(() => releaseExecutor.executeTurn({
+    releaseId: 'candidate-r3', releaseChecksum: SHA_FORGED,
+    execution: directExecution(), dryRun: false
+  }), /release checksum authority conflict/);
+  await assert.rejects(() => releaseExecutor.executeTurn({
+    releaseId: 'unknown-pipeline-release', releaseChecksum: SHA_UNKNOWN,
+    execution: directExecution(), dryRun: false
+  }), /release executor unavailable/);
+});
+
+test('canonical canary reserves comparison slots only for the first ten subjects', () => {
+  seedCanaryRollout({ started: 9, completed: 9, target: 10 });
+  const tenth = createCanonicalTurn(10);
+  completeComparison(tenth);
+  const eleventh = createCanonicalTurn(11);
+  assert.equal(tenth.canarySlot, 10);
+  assert.equal(tenth.comparisonReleaseId, 'stable-r2');
+  assert.equal(eleventh.canarySlot, null);
+  assert.equal(eleventh.comparisonReleaseId, null);
+  assert.equal(store.getCognitionRollout('DIRECT_REPLY').canaryStartedCount, 10);
+});
+
+test('graduated active stable projection remains candidate-v3 visible without comparison', () => {
+  seedRollout('DIRECT_REPLY', {
+    currentMode: 'active', rolloutPhase: 'stable', candidatePhase: 'none',
+    stableReleaseId: 'candidate-r3', candidateReleaseId: null
+  });
+  const turn = createCanonicalTurn(1);
+  assert.equal(turn.pipelineMode, 'active');
+  assert.equal(turn.authoritativeReleaseId, 'candidate-r3');
+  assert.equal(turn.comparisonReleaseId, null);
+  assert.equal(turn.canarySlot, null);
+});
+
+test('invalid compatibility and candidate phase projection has zero side effects', () => {
+  seedRollout('DIRECT_REPLY', {
+    currentMode: 'legacy', rolloutPhase: 'stable', candidatePhase: 'canary'
+  });
+  const before = snapshotCanonicalCreationRows();
+  assert.throws(() => createCanonicalTurn(1), /rollout phase projection conflict/);
+  assert.deepEqual(snapshotCanonicalCreationRows(), before);
+});
+
+test('life planning pins the same release pair and creates no compare before result commit', () => {
+  seedShadowRollout('LIFE_PLANNING');
+  const attempt = controller.createLifePlanningAttempt(lifeInput());
+  assert.equal(attempt.authoritativeReleaseId, 'stable-r2');
+  assert.equal(attempt.comparisonReleaseId, 'candidate-r3');
+  assert.match(attempt.authoritativePipelineChecksum, /^[a-f0-9]{64}$/);
+  assert.match(attempt.comparisonPipelineChecksum, /^[a-f0-9]{64}$/);
+  assert.equal(store.getComparisonJobForLife(attempt.planningId), null);
+  controller.commitLifePlanningAuthoritativeResult(validLifeResult(attempt));
+  const job = store.getComparisonJobForLife(attempt.planningId);
+  assert.equal(job.payload.authoritativeReleaseId, 'stable-r2');
+  assert.equal(job.payload.comparisonReleaseId, 'candidate-r3');
+});
+
+test('comparison worker loads canonical receipt authority and executes the pinned release dry-run', async () => {
+  const result = await orchestrator.execute(directEnvelope());
+  overwriteNonAuthorityReplyProjection(result.turnId, { forged: true });
+  const comparison = await shadowDispatcher.runOnce();
+  assert.equal(comparison.input.authoritativeResultChecksum, result.commitChecksum);
+  assert.equal(comparison.executedReleaseId, 'candidate-r3');
+  assert.equal(store.actionsByRelease('candidate-r3').length, 0);
+  assert.equal(notifications.count(), 1); // authoritative result only
+});
+
+test('life comparison worker uses attempt input/result authority without a chat turn', async () => {
+  const attempt = createAndCommitShadowLifeAttempt();
+  const comparison = await shadowDispatcher.runOnce();
+  assert.equal(comparison.subjectType, 'life_planning');
+  assert.equal(comparison.subjectId, attempt.planningId);
+  assert.equal(comparison.inputChecksum, attempt.inputChecksum);
+  assert.equal(comparison.authoritativeResultChecksum,
+    attempt.authoritativeResultChecksum);
+  assert.equal(store.getTurn(attempt.planningId), null);
+  assert.equal(store.visibleGroupsForLife(attempt.planningId).length, 0);
+});
+
+test('redaction before comparison cancels without loading content or calling a model', async () => {
+  const subject = createCommittedCanarySubject();
+  redactCanonicalLineage(subject.authorityLineageKey);
+  const result = await shadowDispatcher.runOnce();
+  assert.equal(result.status, 'cancelled_redacted');
+  assert.equal(model.calls.length, 0);
+  assert.equal(findPlaintextForLineage(subject.authorityLineageKey), null);
+  assert.deepEqual(canaryCounts(subject.rolloutKey), {
+    started: 1, completed: 0, failed: 1
+  });
+  await shadowDispatcher.runOnce();
+  assert.equal(canaryCounts(subject.rolloutKey).failed, 1);
+});
+
+test('life planning uses only ten canary comparison slots and recovers its pinned pair', () => {
+  seedCanaryRollout('LIFE_PLANNING', { started: 9, completed: 9, target: 10 });
+  const tenth = controller.createLifePlanningAttempt(lifeInput({ windowIndex: 10 }));
+  assert.equal(tenth.canarySlot, 10);
+  assert.equal(tenth.comparisonReleaseId, 'stable-r2');
+  const restored = reopenRuntime();
+  const recovered = restored.controller.createLifePlanningAttempt(
+    lifeInput({ windowIndex: 10 })
+  );
+  assert.equal(recovered.planningId, tenth.planningId);
+  restored.completeLifeAttemptAndComparison(recovered);
+  const eleventh = restored.controller.createLifePlanningAttempt(
+    lifeInput({ windowIndex: 11 })
+  );
+  assert.equal(eleventh.canarySlot, null);
+  assert.equal(eleventh.comparisonReleaseId, null);
+  assert.equal(restored.store.getCognitionRollout(
+    'LIFE_PLANNING').canaryStartedCount, 10);
+  assert.equal(restored.store.getComparisonJobForLife(eleventh.planningId), null);
+});
+
+test('fresh selection uses the runtime clock rather than historical interaction time', async () => {
+  clock.set(2_000_000);
+  const envelope = directEnvelope({ sentAt: 1_000 });
+  await orchestrator.execute(envelope);
+  assert.equal(promotionController.spy.lastFreshSelection.now, 2_000_000);
+});
+
+test('release-aware directions classify shadow and canary while legacy jobs still resume', () => {
+  assertComparisonOutcomeDirection({
+    jobType: 'shadow_cognition',
+    direction: 'stable_authoritative_candidate_compare',
+    expectedCounter: 'liveShadowSuccessCount',
+    canonicalDescriptorOmits: ['rolloutKey', 'pipelineChecksum']
+  });
+  assertComparisonOutcomeDirection({
+    jobType: 'active_canary_compare',
+    direction: 'candidate_authoritative_stable_compare',
+    expectedCounter: 'canaryCompletedCount'
+  });
+  assertLegacyVersionZeroComparisonJobStillCompletes(
+    'legacy_authoritative_cognition_compare'
+  );
+  assert.throws(() => recordComparisonWithDirection({
+    jobType: 'shadow_cognition',
+    direction: 'candidate_authoritative_stable_compare'
+  }), /comparison direction authority conflict/);
+});
+
+test('stale or caller-invented release pairs have zero creation side effects', () => {
+  const before = snapshotCanonicalCreationRows();
+  assert.throws(() => createCanonicalTurnWithPair({
+    visibleReleaseId: 'candidate-r3',
+    comparisonReleaseId: 'stable-r2',
+    comparisonDirection: 'candidate_authoritative_stable_compare'
+  }), /rollout release pair conflict|rollout revision conflict/);
+  assert.deepEqual(snapshotCanonicalCreationRows(), before);
+  const lifeBefore = snapshotLifeAttemptAndRolloutRows();
+  assert.throws(() => createLifeAttemptAfterSelectionRace(), /rollout.*conflict/);
+  assert.deepEqual(snapshotLifeAttemptAndRolloutRows(), lifeBefore);
+});
+
+test('retryable canonical failure keeps one lineage slot until retry comparison completes', () => {
+  seedCanaryRollout('DIRECT_REPLY', { started: 0, completed: 0, failed: 0 });
+  const original = createCanonicalTurn(1);
+  failCanonicalTurnRetryable(original);
+  const retry = createCanonicalRetry(original);
+  assert.equal(retry.canarySlot, original.canarySlot);
+  assert.equal(retry.authorityLineageKey, original.authorityLineageKey);
+  assert.deepEqual(canaryCounts('DIRECT_REPLY'), {
+    started: 1, completed: 0, failed: 0
+  });
+  commitAndCompleteComparison(retry);
+  replayComparisonCompletion(retry);
+  assert.deepEqual(canaryCounts('DIRECT_REPLY'), {
+    started: 1, completed: 1, failed: 0
+  });
+});
+
+test('terminal lineage and life failures close canary accounting exactly once', () => {
+  seedCanaryRollout('DIRECT_REPLY', { started: 0, completed: 0, failed: 0 });
+  const turn = createCanonicalTurn(1);
+  cancelCanonicalLineage(turn);
+  replayCanonicalCancellation(turn);
+  assert.deepEqual(canaryCounts('DIRECT_REPLY'), {
+    started: 1, completed: 0, failed: 1
+  });
+  seedCanaryRollout('LIFE_PLANNING', { started: 0, completed: 0, failed: 0 });
+  const attempt = controller.createLifePlanningAttempt(lifeInput());
+  failLifeAttemptTerminally(attempt);
+  replayLifeAttemptFailure(attempt);
+  assert.deepEqual(canaryCounts('LIFE_PLANNING'), {
+    started: 1, completed: 0, failed: 1
+  });
+});
+
+test('outstanding canary authority counts one lineage, includes life, and excludes other kinds', () => {
+  const original = createCanaryOriginalThenRetry('DIRECT_REPLY');
+  const life = createCanaryLifeAttempt();
+  createUnfinishedCanaryTurn('MOMENT_REPLY');
+  const direct = store.readCanaryOutstandingAuthorityInternal({
+    rolloutKey: 'DIRECT_REPLY', canaryEpoch: original.canaryEpoch
+  });
+  const planning = store.readCanaryOutstandingAuthorityInternal({
+    rolloutKey: 'LIFE_PLANNING', canaryEpoch: life.canaryEpoch
+  });
+  assert.deepEqual(direct, { count: 1, oldestAt: original.createdAt });
+  assert.deepEqual(planning, { count: 1, oldestAt: life.createdAt });
+});
+
+test('populated v13 migrates to v14 without changing semantic rows', () => {
+  const source = buildPopulatedV13WithCanaryOriginalAndLifeAttempt();
+  const before = logicalRowSnapshot(source);
+  const store = new YuqiStore(source.path);
+  assert.equal(store.userVersion(), 14);
+  assert.deepEqual(logicalRowSnapshot(store), before);
+  assertExactCanarySlotIndexes(store);
+  assert.doesNotThrow(() => store.assertReleaseAuthorityV14Invariants());
+});
+
+test('every v14 index migration fault leaves the exact v13 source intact', () => {
+  for (const step of V14_MIGRATION_FAULT_STEPS) {
+    const source = buildPopulatedV13WithCanaryOriginalAndLifeAttempt();
+    const before = rawAndLogicalSnapshot(source);
+    assert.throws(() => openWithV14MigrationFault(source.path, step),
+      /forced v14 migration fault/);
+    assert.deepEqual(rawAndLogicalSnapshot(source.path), before);
+  }
+});
+
+test('inconsistent v13 canary counters refuse v14 migration before the first write', () => {
+  const source = buildPopulatedV13WithCanaryOriginalAndLifeAttempt();
+  corruptCurrentCanaryStartedCount(source, 9);
+  const before = rawAndLogicalSnapshot(source);
+  assert.throws(() => new YuqiStore(source.path),
+    /v14 migration canary accounting conflict/);
+  assert.deepEqual(rawAndLogicalSnapshot(source.path), before);
+});
 ```
+
+The migration suite also covers fresh v14, populated
+v9→v10→v11→v12→v13→v14, populated v10/v12/v13 sources, v14 restart
+idempotence, raw `>14` rejection, clone CLI report/restart, and a v13 source with
+no canary rows. Existing Task 10F v13 semantic/redaction fixtures remain green;
+update only their final opened-store version expectation, never weaken their
+v13 invariant assertions.
 
 - [ ] **Step 2: Run runtime integration tests red**
 
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs
+node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
+npm.cmd test
 ```
 
-Expected: FAIL because release IDs/lanes are not wired into execution.
+Expected: FAIL because the shared release resolver does not exist, the store still
+duplicates phase selection and allocates a comparison to every canary turn, life
+attempt creation does not persist release IDs/checksums, v14 retry-safe slot
+ownership does not exist, outstanding accounting omits life/retry lineage
+semantics, and release IDs/lanes are not wired into runtime execution.
 
-- [ ] **Step 3: Route every new turn through the authoritative release pair**
+- [ ] **Step 3: Route every fresh subject through the authoritative release pair**
+
+First migrate PC schema v13→v14 in one immediate transaction. V14 does not
+rewrite any semantic row and does not change Task 10F's visible/redaction
+contract. It changes only canary-slot ownership indexes so a canonical retry may
+inherit its lineage's slot without allowing a second root owner:
+
+```sql
+DROP INDEX idx_turns_rollout_canary_slot;
+
+CREATE UNIQUE INDEX idx_turns_rollout_canary_root_slot
+ON turns(rollout_key, canary_epoch, canary_slot)
+WHERE canary_slot IS NOT NULL AND retry_of_turn_id IS NULL;
+
+CREATE INDEX idx_turns_rollout_canary_lineage_slot
+ON turns(rollout_key, canary_epoch, canary_slot, authority_lineage_key)
+WHERE canary_slot IS NOT NULL;
+```
+
+Before the first DDL write, run all v13 invariants and a v14 preflight. For every
+current canary epoch it must prove: slot values are integers in `1..10`; root
+turn/life owners are unique and contiguous through `canary_started_count`;
+every canonical retry with a slot joins the same lineage/root and has the exact
+same epoch, slot, release pair and checksums; terminal comparison/cancellation
+evidence agrees with completed/failure counters; and
+`started = completed + failure + outstanding`. Refuse an inconsistent source
+with zero writes—never repair or fabricate historical counts.
+
+Migration fault hooks cover before drop, after drop, after root-index creation,
+after lineage-index creation, after invariant verification, and before
+`PRAGMA user_version=14`; every fault rolls the whole transaction back to the
+exact v13 schema/data/user-version snapshot. Write user version last. Reopen
+runs all v13 semantic invariants plus `assertReleaseAuthorityV14Invariants()`.
+The migration CLI remains clone-only/dry-run-safe, reports
+`v14InvariantSummary` containing the nested v13 semantic summary and canary-slot
+summary, leaves the source raw hash/logical snapshot unchanged, and rejects
+`>14`.
+
+Create `release-pair.mjs` as a dependency-free projection module. It must not
+import the store, controller, orchestrator, model, or preset registry:
+
+```js
+export const CANARY_COMPARISON_TARGET = 10;
+
+export function resolvePipelinePair(rollout) {
+  if (!rollout || typeof rollout !== 'object' || Array.isArray(rollout)) {
+    throw new Error('rollout release authority is required');
+  }
+  const candidatePhase = String(rollout.candidatePhase || '');
+  const stableReleaseId = String(rollout.stableReleaseId || '');
+  const candidateReleaseId = rollout.candidateReleaseId == null
+    ? null
+    : String(rollout.candidateReleaseId);
+  const canaryStartedCount = Number(rollout.canaryStartedCount);
+  if (!stableReleaseId
+    || !['none', 'shadow', 'canary', 'rolled_back'].includes(candidatePhase)
+    || !Number.isSafeInteger(canaryStartedCount) || canaryStartedCount < 0
+    || canaryStartedCount > CANARY_COMPARISON_TARGET
+    || Number(rollout.canaryTargetCount) !== CANARY_COMPARISON_TARGET
+    || (['shadow', 'canary'].includes(candidatePhase)
+      && (!candidateReleaseId || candidateReleaseId === stableReleaseId))) {
+    throw new Error('invalid rollout release authority');
+  }
+  if (candidatePhase === 'shadow') {
+    return {
+      visibleReleaseId: stableReleaseId,
+      comparisonReleaseId: candidateReleaseId,
+      comparisonDirection: 'stable_authoritative_candidate_compare',
+      candidatePhase
+    };
+  }
+  if (candidatePhase === 'canary') {
+    const compare = canaryStartedCount < CANARY_COMPARISON_TARGET;
+    return {
+      visibleReleaseId: candidateReleaseId,
+      comparisonReleaseId: compare ? stableReleaseId : null,
+      comparisonDirection: compare
+        ? 'candidate_authoritative_stable_compare'
+        : null,
+      candidatePhase
+    };
+  }
+  return {
+    visibleReleaseId: stableReleaseId,
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    candidatePhase
+  };
+}
+```
+
+Create `release-executor.mjs` as the only release-ID-to-runtime adapter
+registry. It loads the immutable `pipeline_releases` row itself, verifies the
+caller/subject checksum, and selects from a closed exact `pipelineVersion`
+mapping:
+
+```js
+const RELEASE_ADAPTERS = new Map([
+  ['stable-visible-baseline-2026-07-30', 'legacy-v1'],
+  ['cognition-v2-candidate-2026-07-30', 'cognition-v2'],
+  ['yuqi-lived-agency-v3', 'cognition-v3']
+]);
+```
+
+Export `supportsPipelineVersion()` over this same closed map for Tasks 22/23;
+they may not duplicate the list.
+The constructor receives the three turn adapters and their life-planning
+counterparts. `executeTurn()` / `executeLife()` return drafts only; visible
+state/action/message commits remain outside the adapter. An unknown
+`pipelineVersion`, unavailable adapter, or release checksum mismatch fails
+before a model call. `dryRun=true` supplies a capability object with every
+visible/action/state/fact/memory/outbox/notification write disabled. The
+authoritative orchestrator and `ShadowDispatcher` call this same registry; no
+dispatcher branches directly on `current_mode`, release ID prefixes, or
+`comparisonPipeline`.
+
+`PromotionController.resolvePipelinePair(rollout)` delegates directly to this
+function. It must not copy the switch. Add
+`selectPipelinePairForFreshSubject(rolloutKey, { now })`, which reads the current
+rollout, resolves the pair, validates canary outstanding count/deadline, and
+returns `{ rollout, pair }`. Deadline age is measured from the durable
+subject/attempt reservation time, not from a delayed compare-job creation time.
+A deadline breach always blocks canary selection. The max-outstanding check
+blocks only when the resolved pair would allocate another comparison; a
+post-target pair with no comparison may proceed while non-expired earlier
+comparisons finish. Until Task 23 supplies candidate rollback mutations, a
+blocked canary selection fails closed with stable code
+`CANARY_COMPARE_BACKLOG` and no writes; it never silently returns a stale canary
+pair. Task 23 extends this same method to perform the transactional per-kind
+rollback, so the orchestrator call site does not change.
+
+New version-1 turns and fresh Task 11 life attempts persist only the
+release-aware direction strings emitted above:
+`stable_authoritative_candidate_compare` and
+`candidate_authoritative_stable_compare`. The older
+`legacy_authoritative_cognition_compare` /
+`cognition_authoritative_legacy_compare` strings remain read-only aliases for
+already-persisted result-authority-version-0 turns, jobs and life attempts.
+`recordComparisonOutcomeInternal()` classifies direction from the closed
+`jobType + comparisonDirection` pair, validates the subject's stored release
+IDs/checksums/epochs/slot, accepts the appropriate legacy alias only for a
+legacy subject, and rejects a cross-direction pair. New code never emits a
+legacy alias.
+
+Do not expand or reinterpret Task 10F's canonical comparison descriptor to
+repair the old worker. For a version-1 turn job, the worker joins
+`consolidation_jobs.authority_group_id → visible result group/receipt →
+authoritative turn` and derives rollout key/revision, authoritative release and
+both checksums from those persisted authorities; the small job payload supplies
+only the already-validated comparison descriptor plus group/result checksum.
+For life work it joins `subject_id → cognition_life_planning_attempts` and uses
+that attempt's pins. It must not require canonical payload fields such as
+`rolloutKey` or `pipelineChecksum` that Task 10F intentionally excluded, and it
+must not compare a stable-visible subject checksum to the compatibility
+`cognition_kind_rollouts.pipeline_checksum`. Existing version-0 jobs may use
+their historical self-contained payload. Shadow/canary freshness is proven
+from current stable/candidate release IDs, immutable release checksums,
+evidence/shadow/canary epochs and the subject slot; ordinary rollout revision
+increments caused by other slot allocations do not make an earlier subject
+stale.
+
+`createCanonicalVisibleTurnInternal()` imports the same pure resolver. For a
+fresh original, inside its existing `BEGIN IMMEDIATE` transaction it reloads the
+rollout, checks `expectedRolloutRevision`, resolves the pair again, verifies
+caller pair fields, then loads immutable release rows and pins their
+checksums/preset. It must remove the current in-method phase switch. A
+version-1 retry does not reload or resolve the current rollout: after immutable
+parent/lineage validation it inherits the parent's complete release pair,
+checksums, preset, epochs and slot exactly as Task 10 requires. A canary
+comparison reservation is allocated only for a fresh subject when the resolved
+pair has a non-null comparison release:
+
+```js
+const pair = resolvePipelinePair(mapCognitionRollout(rolloutRow));
+assertExactCallerPair(input, pair);
+const reservesCanaryComparison =
+  pair.candidatePhase === 'canary' && pair.comparisonReleaseId !== null;
+const canarySlot = reservesCanaryComparison
+  ? rollout.canaryStartedCount + 1
+  : null;
+if (reservesCanaryComparison) {
+  assertCanaryOutstandingBelowLimit(rollout);
+  reserveCanaryComparisonSlotCAS(rollout.rolloutKey, rollout.revision);
+}
+```
+
+`canary_started_count` counts allocated comparison subjects, not every
+candidate-visible result. It stops at exactly ten. The eleventh and later canary
+subject remains candidate-visible but has `canary_slot=NULL`, no comparison
+release/job, and does not change the started counter. Retry creation inherits the
+parent pair and slot and never resolves or allocates again.
+
+Apply the same rule to `createLifePlanningAttempt()`. Its existing store
+transaction must first return an existing open/exact attempt with its original
+pins. Only for a fresh attempt does it read the current rollout, re-resolve and
+validate the supplied pair, reserve a canary comparison slot for that
+`LIFE_PLANNING` rollout key only among its first ten subjects, and persist the
+already-existing columns:
+
+```text
+authoritative_release_id
+comparison_release_id
+authoritative_pipeline_checksum
+comparison_pipeline_checksum
+```
+
+The life request key includes both release IDs/checksums, comparison direction,
+candidate phase, evidence epoch, and canary epoch so a changed release cannot
+reuse an old attempt. `commitLifePlanningResultInternal()` copies those stored
+release IDs/checksums into the compare-job payload; it still creates that job
+only in the authoritative result transaction after the result checksum exists.
+No additional life-attempt columns are required because Task 2 already added
+these four; the v14 slot-index migration above is still required.
+The pair resolver deliberately does not invent compatibility mode. The store
+also validates the rollout's `current_mode/rollout_phase/candidate_phase`
+projection (including graduated `active/stable/none`) and pins
+`pipeline_mode=current_mode`. Derive the remaining compatibility fields from
+that validated row and pair: stable-visible comparison maps to
+`comparison_mode=cognition_compare`; candidate-visible comparison maps to
+`comparison_mode=legacy_compare`; no comparison maps to
+`comparison_mode=none`; `authoritative_pipeline` is `cognition` only for an
+active visible release and `legacy` otherwise. The authoritative checksum is
+always the selected visible release checksum, never an independently supplied
+rollout checksum. `comparison_direction` itself is always the release-aware
+pair direction for a fresh attempt; compatibility mode names do not replace it.
+
+For every allocated canary slot, exactly one durable terminal accounting event
+must eventually increment `canary_completed_count` or `canary_failure_count`.
+The subject identity is the canonical lineage for turn work and `planning_id`
+for life work, never an individual retry attempt. A retryable turn failure or
+life `retry_wait` leaves the one slot outstanding; a retry inherits it. Only a
+terminal lineage cancellation, terminal life failure/cancellation, successful
+comparison, critical comparison, or permanently failed comparison closes the
+slot. Compare retry/replay and repeated terminal calls are idempotent and cannot
+increment a counter twice. These counters belong to the subject's own rollout
+key; turn kinds and `LIFE_PLANNING` share the accounting rules and controller,
+not a cross-kind counter.
+
+Add one store read,
+`readCanaryOutstandingAuthorityInternal({ rolloutKey, canaryEpoch })`. It
+enumerates allocation owners from root turns
+(`retry_of_turn_id IS NULL`) and life attempts with non-null slots, groups all
+canonical attempts by lineage, subtracts only durable terminal evidence, and
+returns `{ count, oldestAt }` using the original reservation timestamp. It must
+not enumerate unfiltered consolidation jobs. It verifies allocation,
+terminal, and unresolved cardinalities against the rollout counters and throws
+`CANARY_ACCOUNTING_INVARIANT` on any mismatch. The existing
+`countOutstandingComparisonSubjects(..., { canaryEpoch })` delegates to this
+authority path; its shadow/replay query behavior remains separate.
+
+Close counters in the same transaction as their terminal evidence:
+
+- `recordComparisonOutcomeInternal()` changes completed/failure once while
+  moving the leased job to completed;
+- final (non-`retry_wait`) `failConsolidationJob()` changes failure once for a
+  live canary comparison and updates a life attempt's comparison state when
+  applicable;
+- `cancelCanonicalTurnInternal()` changes failure once only when it terminally
+  closes an allocated lineage with no prior terminal comparison;
+- `failLifePlanningAttemptInternal()` and stale-basis cancellation do the same
+  for an allocated life attempt;
+- retryable turn failure, life retry scheduling, lease recovery, exact replay,
+  and canonical retry creation change no terminal counter.
+
+Each update matches rollout key, canary epoch, slot, release pins and current
+counter revision. A stale epoch records its own terminal job/run state but
+cannot mutate the current rollout counters.
+
+Then wire the runtime:
 
 ```js
 const existingTurn = findPersistedTurnForRecovery(envelope);
@@ -4643,20 +5246,26 @@ if (!eligibleForCanonicalResultAuthority) {
   return executeCompatibilityPath(envelope);
 }
 
-const rollout = promotionController.getStatus(envelope.kind);
-const pair = retryParent
-  ? releasePairPinnedByTurn(retryParent)
-  : promotionController.resolvePipelinePair(rollout);
-if (retryParent) assertValidCanonicalRetryParent(retryParent, pair);
-else assertValidReleasePair(pair, rollout);
 if (envelope.kind === 'LIFE_PLANNING') {
+  const openAttempt = store.getOpenLifePlanningAttempt(envelope.characterId);
+  if (openAttempt) return recoverPinnedLifePlanningAttempt(openAttempt);
   return executeTwoPhaseLifePlanningAuthority({
     envelope,
-    rollout,
-    pair,
-    annotationSnapshot
+    annotationSnapshot,
+    now: runtimeClock.now()
   });
 }
+
+const selection = retryParent
+  ? null
+  : promotionController.selectPipelinePairForFreshSubject(
+      envelope.kind, { now: runtimeClock.now() }
+    );
+const rollout = selection?.rollout ?? null;
+const pair = retryParent
+  ? releasePairPinnedByTurn(retryParent)
+  : selection.pair;
+if (retryParent) assertValidCanonicalRetryParent(retryParent, pair);
 const laneKey = laneKeyForEnvelope(envelope);
 const lane = store.getInteractionLane(envelope.characterId, laneKey)
   ?? { revision: 0, localSequence: 0, clearEpoch: 0, clearedThroughSequence: 0 };
@@ -4713,7 +5322,12 @@ const agencyView = compileAgencyView({
   featureContext: featureContextForEnvelope(envelope),
   limits: { hardConstraints: 5, currentStances: 2, preferences: 4 }
 });
-const execution = await executePinnedRelease(turn, { agencyView });
+const execution = await releaseExecutor.executeTurn({
+  releaseId: turn.authoritativeReleaseId,
+  releaseChecksum: turn.authoritativePipelineChecksum,
+  execution: { turn, envelope, agencyView },
+  dryRun: false
+});
 if (execution.draft.action === 'skip') {
   if (!isAutomaticKind(turn.rolloutKey)) {
     throw new Error('DIRECT_REPLY cannot commit an empty canonical result');
@@ -4731,13 +5345,7 @@ const outputFingerprint = generationFingerprint({
   contextRevision: turn.agencySnapshotChecksum
 });
 const comparisonJob = turn.comparisonReleaseId
-  ? buildComparisonJobDraft({
-    subjectType: 'turn',
-    subjectId: turn.turnId,
-    authorityLineageKey: turn.authorityLineageKey,
-    authoritativeReleaseId: turn.authoritativeReleaseId,
-    comparisonReleaseId: turn.comparisonReleaseId
-  })
+  ? buildComparisonJobDraftFromTurn({ turn, envelope })
   : null;
 const receipt = commitVisibleResult(toCommitInput(execution, {
   expectedTurnRevision: store.getTurn(turn.turnId).turnRevision,
@@ -4783,13 +5391,61 @@ validation before this handler runs. An automatic turn derives
 `inputUserBatchId` and `rootSourceId` from `envelope.trigger.triggerId`, never
 from a nonexistent top-level `triggerId`.
 
-`buildComparisonJobDraft()` has no database side effect. Task 10 inserts it as step 8 of the same result transaction and fills the authoritative group/checksum from that transaction; there is no post-commit window where a visible result lacks required comparison work. The compare worker is dry-run: it can write only comparison/quality rows. It cannot call action stores, visible commit, outbox, notification, state, fact, or consolidation APIs. Life planning retains two phases: attempt creation fixes release/epoch/checksum/canary slot/input; result commit creates comparison work in the same transaction. Outstanding canary count includes attempts allocated before the comparison job exists.
+`buildComparisonJobDraftFromTurn({ turn, envelope })` has no database side
+effect and accepts the persisted turn object rather than caller-selected
+release fields. It deterministically derives job type, comparison release and
+direction, rollout evidence/shadow/canary epochs/slot, annotation checksum and
+Task 10F's exact input checksum. Task 10 inserts it as
+step 8 of the same result transaction and fills the authoritative group/checksum
+from that transaction; there is no post-commit window where a visible result
+lacks required comparison work.
+
+Add
+`store.loadComparisonExecutionAuthorityInternal({ jobId, workerId })` as the
+only comparison input loader. While the job lease is held it:
+
+1. verifies job payload checksum/type/direction;
+2. for a canonical turn, scoped-validates `authority_group_id`, joins the
+   receipt/group/manifest/authoritative turn, reconstructs the authoritative
+   result from canonical items/actions/terminal disposition, and uses the
+   stored commit checksum rather than `turn.reply_json`;
+3. for life planning, joins the attempt, verifies stored input/result
+   checksums and returns its input snapshot/episodes without creating a turn;
+4. resolves both immutable release rows and returns the exact comparison
+   release executor plus a dry-run capability object;
+5. for a legacy job only, uses the frozen legacy payload path.
+
+If the lineage/group or life source was redacted/cancelled before claim, the
+loader returns a metadata-only terminal cancellation, never reconstructs
+content and never calls a model. The same transaction marks the job cancelled
+and closes an allocated canary subject as failure exactly once. A redaction
+racing after claim must win at the final outcome transaction: the worker
+discards its draft and applies the same metadata-only cancellation.
+
+`ShadowDispatcher` consumes only that loader and invokes the same
+release-ID-based execution registry as the authoritative path with
+`dryRun=true`. Turn comparison and life comparison have separate context
+adapters but the same release authority. The dry-run capability can write only
+the leased job, `cognition_shadow_runs`, quality reports/findings and canary
+terminal accounting; it cannot call action stores, visible commit, outbox,
+notification, cognitive/life state, fact, memory or consolidation APIs. Add
+negative capability spies for all of them.
+
+Life planning retains two phases: attempt creation fixes
+release/epoch/checksum/canary slot/input; result commit creates comparison work
+in the same transaction. Outstanding canary count includes attempts allocated
+before the comparison job exists.
 
 `executeTwoPhaseLifePlanningAuthority()` is selected before canonical turn/group
-creation. It pins the same rollout release pair, but creates/reuses a
-`cognition_life_planning_attempt`; authoritative life-result commit owns its
-checksum and compare job. It never fabricates an empty chat batch, visible group,
-receipt, delivery, or Android notification.
+creation. Its controller transaction checks for an existing open/exact attempt
+before reading current rollout state. A fresh attempt calls the same
+`selectPipelinePairForFreshSubject('LIFE_PLANNING', { now })`, then the store
+re-resolves that pair and reserves any canary slot before inserting the attempt.
+It pins the release pair on `cognition_life_planning_attempt`; authoritative
+life execution calls `releaseExecutor.executeLife()` with the attempt's
+authoritative ID/checksum, and result commit owns its checksum and compare job.
+It never fabricates an empty chat batch, visible group, receipt, delivery, or
+Android notification.
 
 For the other nine keys, zero visible items are not globally rejected.
 `commitVisibleResult()` derives the Task 10F terminal disposition from persisted
@@ -4810,15 +5466,24 @@ invariant failure and never regenerated or silently downgraded.
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs
+node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
 ```
 
-Expected: PASS; recovered result-authority-version-0 turns still use the old branch; recovered version-1 turns never adopt a later rollout change.
+Expected: PASS; the resolver/store/controller direction tests agree at canary
+slots 9/10/11; life attempts persist release IDs/checksums across restart;
+graduated `active/stable/none` remains active on its new stable release;
+v13→v14 changes only slot indexes/user version and is fault-atomic; canonical
+retry and life subjects reconcile exactly with canary counters;
+recovered result-authority-version-0 turns still use the old branch; recovered
+version-1 turns never adopt a later rollout change. The full repository gate
+passes with zero failures/skips; existing non-Yuqi, wire-v1/version-0,
+moments/plans/proactive, Android contracts, UI, service-worker and legacy
+stable-visible behavior remain unchanged.
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/shadow-dispatcher.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs
+git add yuqi-runtime/src/release-pair.mjs yuqi-runtime/src/release-executor.mjs yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/shadow-dispatcher.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/src/cloud-relay-pump.mjs scripts/migrate-yuqi-agency-state.mjs yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs yuqi-runtime/test/store-agency-v10.test.mjs yuqi-runtime/test/store-visible-authority-v11.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/shadow-dispatcher.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-agency-state-migration.test.mjs
 git commit -m "feat: integrate v3 release execution and recovery"
 ```
 
@@ -4838,7 +5503,7 @@ git commit -m "feat: integrate v3 release execution and recovery"
 
 **Interfaces:**
 - Consumes: Task 10 receipt fields, native completion, and existing successful DOM `uiAppliedAt` acknowledgement.
-- Produces: Android Room v11 (independent from PC schema v13); durable local lineage/receipt mirror; plugin methods `getConversationCursor` and `markConversationCleared`; existing acknowledgement methods updating the cursor; monotonic `clearedThroughSequence + clearEpoch`.
+- Produces: Android Room v11 (independent from PC schema v14); durable local lineage/receipt mirror; plugin methods `getConversationCursor` and `markConversationCleared`; existing acknowledgement methods updating the cursor; monotonic `clearedThroughSequence + clearEpoch`.
 
 - [ ] **Step 1: Write red Room migration and monotonic cursor tests**
 
@@ -4988,7 +5653,7 @@ Add nullable matching fields, including `terminalDisposition`, to
 before any route is attempted. Task 13 fills completion fields from a validated
 PC receipt; Task 14 may fill them from a locally committed fallback receipt. Old
 Android Room v10 turns retain null and continue using turn ID for legacy
-deduplication. The PC `user_version=13` database and Android Room version 11 are
+deduplication. The PC `user_version=14` database and Android Room version 11 are
 unrelated stores; their version numbers have no shared lifecycle.
 
 DAO updates must use one transaction and enforce two independent rules:
@@ -6373,7 +7038,10 @@ git commit -m "test: separate protocol and lived quality evidence"
 
 **Interfaces:**
 - Consumes: Task 21 suites; immutable stable/candidate release IDs.
-- Produces: deterministic findings, blinded model scores, pairwise preference, disagreement queue, materialized gate report.
+- Produces: deterministic findings, blinded model scores, pairwise preference,
+  disagreement queue, materialized gate report, and the full checksummed
+  immutable candidate-release definition compiled from Task 6 assets. It does
+  not mutate the production release table.
 
 - [ ] **Step 1: Write red scoring, blinding, and gate tests**
 
@@ -6458,6 +7126,15 @@ for (const scene of localHistoryScenes) runPair(scene, { repeats: 1 });
 
 Each repeat gets a fixed input/checkpoint checksum, independent model calls, randomized blind labels, full latency, deterministic findings, six scores, pairwise result, and evaluator version. A retry appends an attempt under the same run/scene/repeat key; it cannot replace a completed record.
 
+The materialized report embeds `candidateRelease` with every
+`pipeline_releases` field (`releaseId`, `pipelineVersion`, `presetVersion`,
+cognition/expression schema versions, evaluator version, model profile,
+component manifest, release checksum and createdAt). Its ID/checksum are
+recomputed from the immutable Task 6 manifest and exact model profile; the
+reporter rejects a caller-supplied ID or a pipeline version unsupported by Task
+11's `ReleaseExecutor`. This closes the handoff: Task 22 produces the immutable
+definition, while Task 23 alone may register it in production.
+
 Before report materialization, the central window resolves every Layer 3 queue item in `artifacts/yuqi-lived-agency-v3/manual-quality-review.jsonl` using:
 
 ```json
@@ -6497,7 +7174,7 @@ npm run cognition:quality:replay -- --stable-from artifacts/yuqi-lived-agency-v3
 npm run cognition:quality:report -- --out artifacts/yuqi-lived-agency-v3/quality-report.json
 ```
 
-Expected: tests PASS. The report records all 72 sentinel runs, 144 coverage runs, 30 history runs, all six dimension aggregates, pairwise rates, severe findings, structural results, release/checksum IDs, and `eligible`. If `eligible=false`, stop before registering a production candidate; do not weaken gates.
+Expected: tests PASS. The report records all 72 sentinel runs, 144 coverage runs, 30 history runs, all six dimension aggregates, pairwise rates, severe findings, structural results, the complete checksummed stable/candidate release definitions, and `eligible`. If `eligible=false`, stop before registering a production candidate; do not weaken gates.
 
 - [ ] **Step 6: Commit**
 
@@ -6518,8 +7195,13 @@ git commit -m "feat: gate Yuqi v3 with blind lived quality evidence"
 - Modify: `package.json`
 
 **Interfaces:**
-- Consumes: Task 2 release rows; Task 22 materialized report; live shadow/canary rows only.
-- Produces: exact Cross-Task Interface rollout methods and CLI commands.
+- Consumes: Task 2 release rows; Task 11 `release-pair.mjs`,
+  `release-executor.mjs`,
+  `selectPipelinePairForFreshSubject()` and comparison-slot accounting; Task 22
+  materialized report; live shadow/canary rows only.
+- Produces: candidate registration/phase mutation, exact Cross-Task Interface
+  promotion methods, transactional quality-fuse rollback, and CLI commands. It
+  does not introduce a second release resolver or a second turn creator.
 
 - [ ] **Step 1: Write red release-pair, evidence, canary, and rollback tests**
 
@@ -6531,37 +7213,51 @@ test('registering candidate requires immutable release and eligible materialized
   }), /eligible materialized quality report/);
 });
 
+test('candidate definition is inserted once from the report and cannot be substituted', () => {
+  const report = eligibleReportWithCandidateRelease('candidate-r3');
+  controller.registerCandidate(registerInput(report));
+  assert.deepEqual(store.getPipelineRelease('candidate-r3'),
+    report.candidateRelease);
+  const forged = structuredClone(report);
+  forged.candidateRelease.componentManifest.executor = 'unknown';
+  assert.throws(() => controller.registerCandidate(registerInput(forged)),
+    /candidate release checksum|release executor unavailable/);
+});
+
 test('replay rows never satisfy live shadow gate', () => {
   insertReplaySuccesses('DIRECT_REPLY', 300);
   assert.equal(controller.promotionCheck('DIRECT_REPLY').liveShadowSuccessCount, 0);
 });
 
-test('canary pins candidate visible and stable compare for exactly the first ten', () => {
+test('canary pins candidate visible and stable compare for exactly the first ten', async () => {
   makeDirectEligibleForCanary();
   controller.promoteToCanary(canaryInput());
-  const turns = createAndCompleteCanaryTurns(11);
+  const turns = await executeAndCompleteCanaryTurnsThroughTask11Runtime(11);
   assert.equal(turns.filter(x => x.comparisonReleaseId === 'stable-r2').length, 10);
   assert.equal(turns[10].comparisonReleaseId, null);
 });
 
-test('canary allows at most three outstanding comparisons and survives restart', () => {
+test('canary allows at most three outstanding comparisons and survives restart', async () => {
   makeDirectEligibleForCanary();
   controller.promoteToCanary(canaryInput());
   createUnfinishedCanaryTurns(3);
-  const restored = new PromotionController({ store: reopenStore(), presetRegistry });
-  const next = restored.createTurn(directTurnInput());
-  assert.equal(restored.getStatus('DIRECT_REPLY').candidatePhase, 'rolled_back');
+  const restored = reopenTask11Runtime();
+  const next = await restored.orchestrator.execute(directTurnInput());
+  assert.equal(restored.promotionController.getStatus(
+    'DIRECT_REPLY').candidatePhase, 'rolled_back');
   assert.equal(next.authoritativeReleaseId, 'stable-r2');
-  assert.equal(restored.getStatus('DIRECT_REPLY').lastReasonCode,
+  assert.equal(restored.promotionController.getStatus(
+    'DIRECT_REPLY').lastReasonCode,
     'CANARY_COMPARE_BACKLOG');
 });
 
-test('hard action error rolls back only that TurnKind for new turns', () => {
+test('hard action error rolls back only that TurnKind for new turns', async () => {
   const oldTurn = createCanaryTurn('MOMENT_REPLY');
   controller.recordCriticalFinding(criticalFinding('PUBLIC_PRIVACY_VIOLATION', oldTurn));
   assert.equal(controller.getStatus('MOMENT_REPLY').candidatePhase, 'rolled_back');
   assert.equal(store.getTurn(oldTurn.turnId).authoritativeReleaseId, 'candidate-r3');
-  assert.equal(controller.createTurn(momentReplyInput()).authoritativeReleaseId, 'stable-r2');
+  assert.equal((await runtime.execute(
+    momentReplyInput())).authoritativeReleaseId, 'stable-r2');
   assert.equal(controller.getStatus('DIRECT_REPLY').candidatePhase, 'canary');
 });
 
@@ -6574,33 +7270,51 @@ test('two confirmed severe lived failures in fifteen minutes trip quality fuse',
 
 - [ ] **Step 2: Run promotion tests red**
 
-Run: `node --test yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs`
+Run: `node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs`
 
-Expected: FAIL because current controller treats `legacy/cognition` as identity and lacks release methods.
+Expected: FAIL because candidate registration, phase mutation, promotion gates,
+quality-fuse rollback, and CLI methods do not exist. Task 11 release-pair tests
+must already be green; a failure in `release-pair.test.mjs` is not an acceptable
+Task 23 red state.
 
-- [ ] **Step 3: Implement transactional release resolution and gates**
+- [ ] **Step 3: Implement transactional candidate mutations and gates**
+
+Do not implement or copy `resolvePipelinePair()` here. Import the Task 11
+function through `PromotionController.resolvePipelinePair()` and leave
+`release-pair.mjs` unchanged. This task adds only the transactional mutations
+around that projection:
 
 ```js
-export function resolvePipelinePair(rollout) {
-  switch (rollout.candidatePhase) {
-    case 'none':
-    case 'rolled_back':
-      return pair(rollout.stableReleaseId, null, null, rollout.candidatePhase);
-    case 'shadow':
-      return pair(rollout.stableReleaseId, rollout.candidateReleaseId,
-        'stable_authoritative_candidate_compare', 'shadow');
-    case 'canary':
-      return pair(rollout.candidateReleaseId,
-        rollout.canaryStartedCount < 10 ? rollout.stableReleaseId : null,
-        rollout.canaryStartedCount < 10 ? 'candidate_authoritative_stable_compare' : null,
-        'canary');
-    default:
-      throw new Error('invalid candidate phase');
-  }
-}
+registerCandidate({ rolloutKey, expectedRevision, releaseId, reportId, reportChecksum })
+promoteToCanary({ rolloutKey, expectedRevision, reportId, reportChecksum })
+graduateCandidate({ rolloutKey, expectedRevision, reportId, reportChecksum })
+rollbackCandidate({ rolloutKey, expectedRevision, reasonCode, findingIds })
 ```
 
-Registration verifies report checksum, release checksum, baseline release ID, evaluator version, suite checksum, and `eligible=true`, then increments a new evidence epoch and enters shadow. Initial live gates are:
+Each mutation updates `candidate_phase`, the compatibility
+`current_mode/rollout_phase` projection, evidence/canary epochs and counters in
+one store transaction. `selectPipelinePairForFreshSubject()` preserves Task 11's
+conditional max-outstanding rule and is extended so an applicable backlog or
+any deadline breach transactionally calls `rollbackCandidate()`, reloads the
+row, then returns the stable pair. The Task 11 orchestrator remains unchanged
+and the store still re-resolves under its creation CAS. Existing open
+turns/attempts retain their stored pair.
+
+Task 11 already owns “first ten only” allocation for both turn and life-planning
+subjects. Task 23 must not increment `canary_started_count` itself during
+selection; only the store-owned creation transactions reserve a comparison
+slot. Task 23 reads those durable counters to decide promotion, graduation,
+backlog and rollback.
+
+Registration obtains the full candidate definition from the exact materialized
+Task 22 report, recomputes its release ID/checksum, verifies the stable baseline
+ID, evaluator version, suite checksum, `eligible=true`, and Task 11 executor
+support, then calls `putPipelineReleaseInternal()` in the same transaction as
+the rollout mutation. An absent row is inserted once; an existing exact row is
+reused; any same-ID/checksum/content mismatch rolls the transaction back. The
+CLI's `--candidate-release-id` is only an equality assertion against the report,
+not enough data to invent a release. Registration then increments a new
+evidence epoch and enters shadow. Initial live gates are:
 
 | kind | minimum real shadow success | observation span | canary comparisons | post-canary observation |
 |---|---:|---:|---:|---:|
@@ -6608,7 +7322,7 @@ Registration verifies report checksum, release checksum, baseline release ID, ev
 | each other turn kind | 30 | 72 hours | first 10 | 48 hours |
 | `LIFE_PLANNING` | 30 completed real attempts | 72 hours | first 10 | 48 hours |
 
-All require zero critical error, no stale evidence, and no outstanding comparison backlog. Canary preserves `canary_target_count=10`, `canary_max_outstanding=3`, and `canary_compare_deadline_ms=900000`; allocation and completion counters live in SQLite and survive restart. A fourth outstanding subject or one older than 15 minutes rolls the affected kind back before a new turn is pinned. These thresholds control production promotion, not APK build completion. Graduation requires all canary comparisons complete, no critical error, no confirmed severe quality fuse, no outstanding work, and observation deadline elapsed. It atomically swaps candidate into stable.
+All require zero critical error, no stale evidence, and no outstanding comparison backlog. Canary preserves `canary_target_count=10`, `canary_max_outstanding=3`, and `canary_compare_deadline_ms=900000`; allocation and completion counters live in SQLite and survive restart. When a fresh subject would allocate a fourth outstanding comparison, or any outstanding subject is older than 15 minutes, the affected kind rolls back before that fresh subject is pinned. These thresholds control production promotion, not APK build completion. Graduation requires all canary comparisons complete, no critical error, no confirmed severe quality fuse, no outstanding work, and observation deadline elapsed. It atomically swaps candidate into stable.
 
 Immediate per-kind rollback codes include payment target/amount mismatch, public privacy leak, illegal stage transition, duplicate structured action, unauthorized target, and deterministic pipeline/preset absence. A lived-quality failure becomes confirmed only after two independent blinded evaluator judgments agree on severity/code. Two confirmed severity-critical turns within 15 minutes roll back the same kind. Ordinary style disagreement records a finding only. Existing turns keep fixed release IDs.
 
@@ -6639,7 +7353,7 @@ npm run cognition:rollback -- --config yuqi-runtime/config.json --kind DIRECT_RE
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs
+node --test yuqi-runtime/test/release-pair.test.mjs yuqi-runtime/test/release-executor.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/store-cognition-migration.test.mjs
 npm run cognition:rollout-status -- --config yuqi-runtime/config.json
 npm run cognition:promotion-check -- --config yuqi-runtime/config.json --kind DIRECT_REPLY
 ```
@@ -7100,7 +7814,7 @@ Do not commit APK binaries to the source branch. Keep the formal APK under `arti
 
 **Interfaces:**
 - Consumes: ready source, formal APK, validated migration decisions, eligible quality report, release manifest.
-- Produces: production PC v13 state, stable-visible candidate shadow per kind, honest completion/handoff report.
+- Produces: production PC v14 state, stable-visible candidate shadow per kind, honest completion/handoff report.
 
 - [ ] **Step 1: Stop runtime cleanly, back up, and prove the source database matches the validated dry run**
 
@@ -7112,7 +7826,7 @@ node scripts/backup-yuqi-memory.mjs yuqi-runtime/config.json
 node scripts/migrate-yuqi-agency-state.mjs --config yuqi-runtime/config.json --dry-run --clone-out artifacts/yuqi-lived-agency-v3/production-migration-clone.sqlite --out artifacts/yuqi-lived-agency-v3/production-migration-report.json
 ```
 
-Expected: the raw backup is created before any new `YuqiStore` opens production; only the clone migrates through v11, v12, and v13 during dry-run. Current database SHA/source decision checksum matches the validated basis or produces a new complete report with no structural count loss. The clone passes v13 manifest/tombstone/invariant checks and restart-open checks. If messages or state legitimately changed since Task 3, rerun clone validation against this new report before applying. Do not apply an old report to changed data.
+Expected: the raw backup is created before any new `YuqiStore` opens production; only the clone migrates through v11, v12, v13, and v14 during dry-run. Current database SHA/source decision checksum matches the validated basis or produces a new complete report with no structural count loss. The clone passes v13 manifest/tombstone invariants, v14 release/slot/accounting invariants, and restart-open checks. If messages or state legitimately changed since Task 3, rerun clone validation against this new report before applying. Do not apply an old report to changed data.
 
 - [ ] **Step 2: Apply migration atomically, audit, and restart on stable**
 
@@ -7125,7 +7839,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/start-yuqi-backg
 node scripts/verify-yuqi-runtime.mjs
 ```
 
-Expected: runtime healthy, PC database v13, current production stable release still visible, no candidate active, old authority-version-0 unfinished turns resumable on the legacy branch, and before/after structural counts preserved. Every eligible new cognition-release turn created through the canonical internal boundary has lineage authority and a semantic manifest. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
+Expected: runtime healthy, PC database v14, current production stable release still visible, no candidate active, old authority-version-0 unfinished turns resumable on the legacy branch, and before/after structural counts preserved. Every eligible new cognition-release turn created through the canonical internal boundary has lineage authority and a semantic manifest. On failure, stop runtime, restore the verified database backup, start the prior runtime, and report rollback evidence.
 
 - [ ] **Step 3: Register the same eligible v3 candidate for each rollout key in shadow**
 
@@ -7177,7 +7891,7 @@ During DIRECT_REPLY canary, the first ten new turns show v3 and run stable dry-r
 {
   "design": {"path": "", "commit": ""},
   "plan": {"path": "", "commit": ""},
-  "database": {"userVersion": 11, "backupPath": "", "backupSha256": "", "migrationReport": ""},
+  "database": {"userVersion": 14, "backupPath": "", "backupSha256": "", "migrationReport": ""},
   "protocol": {"cases": 270, "passed": 270, "reportPath": "", "sha256": ""},
   "quality": {"sentinelRuns": 72, "coverageRuns": 144, "historyRuns": 30,
     "eligible": true, "reportPath": "", "sha256": ""},
@@ -7207,7 +7921,7 @@ No source commit is expected in this task. Database changes and generated eviden
 Execute Tasks 0–27 in order. The central window may continue automatically after an ordinary red test becomes green. It must stop immediately when any of these is true:
 
 1. The baseline cannot identify the actual visible stable implementation and checksum.
-2. A PC v9→10→11 or Android Room 10→11 migration loses or reclassifies data without exact evidence.
+2. A PC v9→10→11→12→13→14 or Android Room 10→11 migration loses or reclassifies data without exact evidence.
 3. A required TurnKind lacks an adapter, structural-action domain, or quality coverage.
 4. Android v3 fallback and PC v3 assign different authority or state meaning.
 5. A comparison path can commit a visible action, message, state, fact, outbox item, or notification.
@@ -7263,7 +7977,7 @@ After this design window amends the authoritative plan, the central window rerea
 ## Evidence Checklist Before Any “Finished” Claim
 
 - [ ] Baseline report identifies immutable current stable evidence.
-- [ ] PC v10→v11→v12→v13 populated clone migration and production migration reports match their source database; old turns remain authority version 0, no historical receipt was invented, and every new canonical receipt has one manifest.
+- [ ] PC v10→v11→v12→v13→v14 populated clone migration and production migration reports match their source database; v14 changes only canary-slot indexes/user version, old turns remain authority version 0, no historical receipt was invented, and every new canonical receipt has one manifest.
 - [ ] All 270 protocol cases pass and are labeled non-quality evidence.
 - [ ] 24×3 sentinel runs, 72×2 coverage runs, and 30 local-history runs are present.
 - [ ] Six-dimensional gate and pairwise stable/candidate comparison are eligible.
