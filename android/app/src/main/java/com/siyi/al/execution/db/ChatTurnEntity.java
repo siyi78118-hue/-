@@ -32,4 +32,18 @@ public class ChatTurnEntity {
     @Nullable public Long cloudConfirmedAt;
     @Nullable public Long cancelledAt;
     @Nullable public Long deletedAt;
+    @Nullable public String visibleGroupId;
+    @Nullable public String authorityLineageKey;
+    @Nullable public String authorityOrigin;
+    @Nullable public String commitPayloadVersion;
+    @Nullable public Long lineageRevision;
+    @Nullable public Long turnRevision;
+    @Nullable public String laneKey;
+    @Nullable public Long laneRevision;
+    @Nullable public String generationFingerprint;
+    @Nullable public String pipelineReleaseId;
+    @Nullable public Long inputVisibilitySequence;
+    @Nullable public Long inputClearEpoch;
+    @Nullable public String bridgeCommitChecksum;
+    @Nullable public String terminalDisposition;
 }

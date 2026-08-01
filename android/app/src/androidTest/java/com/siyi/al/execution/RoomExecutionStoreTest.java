@@ -3,6 +3,7 @@ package com.siyi.al.execution;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 import android.content.Context;
 import androidx.room.Room;
@@ -221,6 +222,27 @@ public class RoomExecutionStoreTest {
         assertEquals(Long.valueOf(12L), store.turn("turn-delivery-stages").uiAppliedAt);
         assertEquals(Long.valueOf(13L), store.turn("turn-delivery-stages").cloudConfirmedAt);
         assertEquals(0, store.unappliedCompletedTurns(10).size());
+    }
+
+    @Test
+    public void exactTerminalReceiptReplayIsIdempotentButChangedReceiptIsRejected() {
+        store.submitTurn(submission("turn-receipt", "message-receipt"));
+
+        store.recordTerminalReceipt(
+            "turn-receipt", "lineage-1", "lane-1", "message-receipt", "group-1",
+            2L, "pc", "v3", "checksum-1", "visible", 7L, 1L, 10L
+        );
+        store.recordTerminalReceipt(
+            "turn-receipt", "lineage-1", "lane-1", "message-receipt", "group-1",
+            2L, "pc", "v3", "checksum-1", "visible", 7L, 1L, 11L
+        );
+
+        assertEquals("group-1", store.turn("turn-receipt").visibleGroupId);
+        IllegalStateException conflict = assertThrows(IllegalStateException.class, () -> store.recordTerminalReceipt(
+            "turn-receipt", "lineage-1", "lane-1", "message-receipt", "group-2",
+            2L, "pc", "v3", "checksum-1", "visible", 7L, 1L, 12L
+        ));
+        assertTrue(conflict.getMessage().contains("BRIDGE_AUTHORITY_CONFLICT"));
     }
 
     @Test

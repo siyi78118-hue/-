@@ -22,9 +22,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         RawMessageEntity.class,
         EvidenceFactEntity.class,
         SyncCursorEntity.class,
-        YuqiAnnotationEntity.class
+        YuqiAnnotationEntity.class,
+        ConversationCursorEntity.class,
+        ConversationAuthorityEntity.class
     },
-    version = 10,
+    version = 11,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
@@ -107,6 +109,43 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
             database.execSQL("ALTER TABLE chat_turns ADD COLUMN cloudConfirmedAt INTEGER");
         }
     };
+    public static final Migration MIGRATION_10_11 = new Migration(10, 11) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `conversation_cursors` ("
+                + "`characterId` TEXT NOT NULL, `nativeCompletedTurnId` TEXT, "
+                + "`nativeCompletedGroupId` TEXT, `nativeCompletedSequence` INTEGER NOT NULL, "
+                + "`uiAppliedTurnId` TEXT, `uiAppliedGroupId` TEXT, "
+                + "`uiAppliedSequence` INTEGER NOT NULL, `localSequence` INTEGER NOT NULL, "
+                + "`clearedThroughSequence` INTEGER NOT NULL, `clearEpoch` INTEGER NOT NULL, "
+                + "`clearedAt` INTEGER NOT NULL, `chatOpen` INTEGER NOT NULL, "
+                + "`updatedAt` INTEGER NOT NULL, PRIMARY KEY(`characterId`))");
+            database.execSQL("CREATE TABLE IF NOT EXISTS `conversation_authorities` ("
+                + "`authorityLineageKey` TEXT NOT NULL, `characterId` TEXT NOT NULL, "
+                + "`laneKey` TEXT NOT NULL, `rootSourceId` TEXT NOT NULL, "
+                + "`latestTurnId` TEXT NOT NULL, `revision` INTEGER NOT NULL, "
+                + "`state` TEXT NOT NULL, `visibleGroupId` TEXT, `commitChecksum` TEXT, "
+                + "`commitPayloadVersion` TEXT, `authorityOrigin` TEXT, "
+                + "`terminalDisposition` TEXT, `updatedAt` INTEGER NOT NULL, "
+                + "PRIMARY KEY(`authorityLineageKey`))");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS "
+                + "`index_conversation_authorities_characterId_laneKey_rootSourceId` "
+                + "ON `conversation_authorities` (`characterId`, `laneKey`, `rootSourceId`)");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `visibleGroupId` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `authorityLineageKey` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `authorityOrigin` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `commitPayloadVersion` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `lineageRevision` INTEGER");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `turnRevision` INTEGER");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `laneKey` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `laneRevision` INTEGER");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `generationFingerprint` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `pipelineReleaseId` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `inputVisibilitySequence` INTEGER");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `inputClearEpoch` INTEGER");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `bridgeCommitChecksum` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `terminalDisposition` TEXT");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -121,7 +160,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                     ).addMigrations(
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
-                        MIGRATION_9_10
+                        MIGRATION_9_10, MIGRATION_10_11
                     ).build();
                 }
             }

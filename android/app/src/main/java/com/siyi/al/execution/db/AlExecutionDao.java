@@ -13,6 +13,12 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertTurn(ChatTurnEntity turn);
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertConversationCursor(ConversationCursorEntity cursor);
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertConversationAuthority(ConversationAuthorityEntity authority);
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     void insertAttempt(ExecutionAttemptEntity attempt);
 
@@ -87,6 +93,65 @@ public interface AlExecutionDao {
 
     @Query("SELECT * FROM chat_turns WHERE turnId = :turnId LIMIT 1")
     ChatTurnEntity turn(String turnId);
+
+    @Query("SELECT * FROM conversation_cursors WHERE characterId = :characterId LIMIT 1")
+    ConversationCursorEntity conversationCursor(String characterId);
+
+    @Query("SELECT * FROM conversation_authorities WHERE authorityLineageKey = :authorityLineageKey LIMIT 1")
+    ConversationAuthorityEntity conversationAuthority(String authorityLineageKey);
+
+    @Query("UPDATE conversation_cursors SET nativeCompletedTurnId = :nativeCompletedTurnId, nativeCompletedGroupId = :nativeCompletedGroupId, nativeCompletedSequence = :nativeCompletedSequence, uiAppliedTurnId = :uiAppliedTurnId, uiAppliedGroupId = :uiAppliedGroupId, uiAppliedSequence = :uiAppliedSequence, localSequence = :localSequence, clearedThroughSequence = :clearedThroughSequence, clearEpoch = :clearEpoch, clearedAt = :clearedAt, chatOpen = :chatOpen, updatedAt = :updatedAt WHERE characterId = :characterId")
+    int updateConversationCursor(
+        String characterId,
+        String nativeCompletedTurnId,
+        String nativeCompletedGroupId,
+        long nativeCompletedSequence,
+        String uiAppliedTurnId,
+        String uiAppliedGroupId,
+        long uiAppliedSequence,
+        long localSequence,
+        long clearedThroughSequence,
+        long clearEpoch,
+        long clearedAt,
+        boolean chatOpen,
+        long updatedAt
+    );
+
+    @Query("UPDATE conversation_authorities SET latestTurnId = :latestTurnId, revision = :nextRevision, state = :state, visibleGroupId = :visibleGroupId, commitChecksum = :commitChecksum, commitPayloadVersion = :commitPayloadVersion, authorityOrigin = :authorityOrigin, terminalDisposition = :terminalDisposition, updatedAt = :updatedAt WHERE authorityLineageKey = :authorityLineageKey AND revision = :expectedRevision")
+    int compareAndSetConversationAuthority(
+        String authorityLineageKey,
+        long expectedRevision,
+        String latestTurnId,
+        long nextRevision,
+        String state,
+        String visibleGroupId,
+        String commitChecksum,
+        String commitPayloadVersion,
+        String authorityOrigin,
+        String terminalDisposition,
+        long updatedAt
+    );
+
+    @Query("UPDATE chat_turns SET visibleGroupId = :visibleGroupId, authorityLineageKey = :authorityLineageKey, authorityOrigin = :authorityOrigin, commitPayloadVersion = :commitPayloadVersion, lineageRevision = :lineageRevision, turnRevision = :turnRevision, laneKey = :laneKey, laneRevision = :laneRevision, inputVisibilitySequence = :inputVisibilitySequence, inputClearEpoch = :inputClearEpoch, bridgeCommitChecksum = :bridgeCommitChecksum, terminalDisposition = :terminalDisposition, updatedAt = :updatedAt WHERE turnId = :turnId AND authorityLineageKey IS NULL AND visibleGroupId IS NULL AND commitPayloadVersion IS NULL AND bridgeCommitChecksum IS NULL AND terminalDisposition IS NULL")
+    int writeTerminalReceipt(
+        String turnId,
+        String visibleGroupId,
+        String authorityLineageKey,
+        String authorityOrigin,
+        String commitPayloadVersion,
+        long lineageRevision,
+        long turnRevision,
+        String laneKey,
+        long laneRevision,
+        long inputVisibilitySequence,
+        long inputClearEpoch,
+        String bridgeCommitChecksum,
+        String terminalDisposition,
+        long updatedAt
+    );
+
+    @Query("DELETE FROM reply_parts WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)")
+    int clearReplyPartsThroughSequence(String characterId, long clearedThroughSequence);
 
     @Query("SELECT * FROM chat_turns WHERE sourceMessageId = :sourceMessageId LIMIT 1")
     ChatTurnEntity turnBySourceMessage(String sourceMessageId);

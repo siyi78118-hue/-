@@ -1,7 +1,8 @@
 package com.siyi.al.execution;
 
 import com.siyi.al.execution.db.ChangeEventEntity;
-import com.siyi.al.execution.db.ChatTurnEntity;
+ import com.siyi.al.execution.db.ChatTurnEntity;
+import com.siyi.al.execution.db.ConversationCursorEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import java.util.List;
@@ -50,6 +51,10 @@ public interface ExecutionStore {
     void markNotificationShown(String turnId, long now);
 
     void acknowledgeUiApplied(String turnId, long now);
+
+    ConversationCursorEntity getConversationCursor(String characterId);
+
+    void markConversationCleared(String characterId, long clearedThroughSequence, long clearEpoch, long now);
 
     void markCloudConfirmed(String turnId, long now);
 }

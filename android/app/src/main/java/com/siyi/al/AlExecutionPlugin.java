@@ -23,6 +23,7 @@ import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
+import com.siyi.al.execution.db.ConversationCursorEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
@@ -433,6 +434,33 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void getConversationCursor(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            return conversationCursorResult(characterId, store.getConversationCursor(characterId));
+        });
+    }
+
+    @PluginMethod
+    public void markConversationCleared(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            Long clearedThroughSequence = call.getLong("clearedThroughSequence");
+            Long clearEpoch = call.getLong("clearEpoch");
+            if (clearedThroughSequence == null || clearEpoch == null) {
+                throw new IllegalArgumentException("clearedThroughSequence and clearEpoch are required");
+            }
+            store.markConversationCleared(
+                characterId,
+                clearedThroughSequence,
+                clearEpoch,
+                System.currentTimeMillis()
+            );
+            return conversationCursorResult(characterId, store.getConversationCursor(characterId));
+        });
+    }
+
+    @PluginMethod
     public void nativeDiagnostics(PluginCall call) {
         execute(call, () -> {
             Integer limit = call.getInt("limit", 100);
@@ -653,6 +681,39 @@ public final class AlExecutionPlugin extends Plugin {
             parts.put(item);
         }
         result.put("replyParts", parts);
+        return result;
+    }
+
+    private static JSObject conversationCursorResult(String characterId, ConversationCursorEntity cursor) {
+        JSObject result = new JSObject();
+        result.put("characterId", characterId);
+        if (cursor == null) {
+            result.put("nativeCompletedTurnId", (Object) null);
+            result.put("nativeCompletedGroupId", (Object) null);
+            result.put("nativeCompletedSequence", 0L);
+            result.put("uiAppliedTurnId", (Object) null);
+            result.put("uiAppliedGroupId", (Object) null);
+            result.put("uiAppliedSequence", 0L);
+            result.put("localSequence", 0L);
+            result.put("clearedThroughSequence", 0L);
+            result.put("clearEpoch", 0L);
+            result.put("clearedAt", 0L);
+            result.put("chatOpen", false);
+            result.put("updatedAt", 0L);
+            return result;
+        }
+        result.put("nativeCompletedTurnId", cursor.nativeCompletedTurnId);
+        result.put("nativeCompletedGroupId", cursor.nativeCompletedGroupId);
+        result.put("nativeCompletedSequence", cursor.nativeCompletedSequence);
+        result.put("uiAppliedTurnId", cursor.uiAppliedTurnId);
+        result.put("uiAppliedGroupId", cursor.uiAppliedGroupId);
+        result.put("uiAppliedSequence", cursor.uiAppliedSequence);
+        result.put("localSequence", cursor.localSequence);
+        result.put("clearedThroughSequence", cursor.clearedThroughSequence);
+        result.put("clearEpoch", cursor.clearEpoch);
+        result.put("clearedAt", cursor.clearedAt);
+        result.put("chatOpen", cursor.chatOpen);
+        result.put("updatedAt", cursor.updatedAt);
         return result;
     }
 
