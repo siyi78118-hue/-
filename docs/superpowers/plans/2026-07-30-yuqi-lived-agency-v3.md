@@ -7345,7 +7345,7 @@ Use `git mv` for the fixture directory. Change its manifest to:
 }
 ```
 
-The replay runner writes `cognition_replay_runs.source_type='fixture'`; local history writes `source_type='local_history'`. Neither code path may call `putCognitionShadowRunInternal()` or increment rollout live counters.
+The replay runner writes the existing closed-enum value `cognition_replay_runs.source_type='approved_fixture'` (the database authority name for an approved protocol fixture); local history writes `source_type='local_history'`. Batch summaries and provenance may use the shorter semantic label `fixture`, but no second synonymous database enum is introduced. Neither code path may call `putCognitionShadowRunInternal()` or increment rollout live counters.
 
 - [ ] **Step 4: Author the exact 24 sentinel IDs and 72 independent variants**
 
