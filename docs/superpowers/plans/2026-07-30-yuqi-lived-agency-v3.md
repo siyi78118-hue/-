@@ -6132,6 +6132,14 @@ git commit -m "feat: persist Android conversation visibility cursor"
 
 ### Task 13: Carry Visibility and Visible-Group Authority Through the Bridge
 
+> **Execution authority amendment (2026-08-01):** The original Task 13 file
+> list, examples, and steps below are retained only as design history. They are
+> superseded in full by
+> `docs/superpowers/plans/2026-08-01-yuqi-task13-bridge-authority.md`. Implement
+> Task 13A, 13B, and 13C from that document, in order. Do not use the narrower
+> legacy file whitelist or its fictional `normalizeEnvelope()` /
+> `orchestrator.execute()` examples as an implementation contract.
+
 **Files:**
 - Modify: `android/app/src/main/java/com/siyi/al/execution/TurnSubmission.java`
 - Create: `android/app/src/main/java/com/siyi/al/execution/AuthorityIdentity.java`
