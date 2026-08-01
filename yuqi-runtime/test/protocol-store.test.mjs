@@ -12,7 +12,7 @@ import {
   deliveryItemsForResult,
   validateEnvelope
 } from '../src/protocol.mjs';
-import { YuqiStore } from '../src/store.mjs';
+import { deriveAuthorityLineageKey, YuqiStore } from '../src/store.mjs';
 import { publicTurnStatus } from '../src/turn-status.mjs';
 
 function validEnvelope(overrides = {}) {
@@ -77,6 +77,112 @@ function validBatchedV2Envelope(overrides = {}) {
     }
   };
   return source;
+}
+
+function validV3Envelope(overrides = {}) {
+  const source = validBatchedV2Envelope();
+  source.protocolVersion = 3;
+  source.context.visibilityCursor = {
+    nativeCompletedTurnId: null,
+    nativeCompletedGroupId: null,
+    nativeCompletedSequence: 0,
+    uiAppliedTurnId: null,
+    uiAppliedGroupId: null,
+    uiAppliedSequence: 0,
+    localSequence: 1,
+    clearedThroughSequence: 0,
+    clearEpoch: 0,
+    clearedAt: 0,
+    chatOpen: true,
+    quotedMessageId: null
+  };
+  source.authority = {
+    algorithm: 'al-authority-v1',
+    roleId: source.characterId,
+    laneKey: 'private_chat',
+    rootSourceId: source.message.messageId,
+    lineageKey: deriveAuthorityLineageKey({
+      roleId: source.characterId,
+      laneKey: 'private_chat',
+      rootSourceId: source.message.messageId
+    }),
+    claimedLineageRevision: 1,
+    retryOfTurnId: null
+  };
+  return { ...source, ...overrides };
+}
+
+const V3_AUTOMATIC_KINDS = Object.freeze([
+  'ROLE_PLAN_CHAT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_CHAT_PRIVATE',
+  'ROLE_PLAN_MOMENT_PRIVATE',
+  'PROACTIVE_CHAT',
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY'
+]);
+
+function v3LaneForKind(kind) {
+  if (['ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE', 'PROACTIVE_CHAT'].includes(kind)) {
+    return 'private_chat';
+  }
+  if (['ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE', 'PROACTIVE_MOMENT'].includes(kind)) {
+    return 'public_moment';
+  }
+  return 'moment_interaction:moment_protocol_v3';
+}
+
+function validV3AutomaticEnvelope(kind, overrides = {}) {
+  const source = validTriggerEnvelope({
+    protocolVersion: 3,
+    turnId: `turn_v3_${kind.toLowerCase()}`,
+    kind,
+    trigger: {
+      triggerId: `trigger_v3_${kind.toLowerCase()}`,
+      triggerType: kind.toLowerCase(),
+      scheduledFor: 1784400000000,
+      executedAt: 1784400001000,
+      context: ['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(kind)
+        ? { momentId: 'moment_protocol_v3' }
+        : {}
+    }
+  });
+  const laneKey = v3LaneForKind(kind);
+  source.context = {
+    visibilityCursor: {
+      nativeCompletedTurnId: null,
+      nativeCompletedGroupId: null,
+      nativeCompletedSequence: 0,
+      uiAppliedTurnId: null,
+      uiAppliedGroupId: null,
+      uiAppliedSequence: 0,
+      localSequence: 1,
+      clearedThroughSequence: 0,
+      clearEpoch: 0,
+      clearedAt: 0,
+      chatOpen: false,
+      quotedMessageId: null
+    }
+  };
+  source.authority = {
+    algorithm: 'al-authority-v1',
+    roleId: source.characterId,
+    laneKey,
+    rootSourceId: source.trigger.triggerId,
+    lineageKey: deriveAuthorityLineageKey({
+      roleId: source.characterId,
+      laneKey,
+      rootSourceId: source.trigger.triggerId
+    }),
+    claimedLineageRevision: 1,
+    retryOfTurnId: null
+  };
+  return { ...source, ...overrides };
+}
+
+function cloned(value) {
+  return structuredClone(value);
 }
 
 const JPEG_1X1 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==';
@@ -271,6 +377,291 @@ test('protocol v2 preserves and normalizes a self-contained ordered current batc
   );
   assert.equal(value.context.currentBatch.startedAt, first.sentAt);
   assert.equal(value.context.currentBatch.committedAt, 1784400000000);
+});
+
+test('protocol v3 preserves a complete verified authority and visibility cursor', () => {
+  const source = validV3Envelope();
+  const normalized = validateEnvelope(source);
+
+  assert.equal(normalized.protocolVersion, 3);
+  assert.deepEqual(normalized.authority, source.authority);
+  assert.deepEqual(normalized.context.visibilityCursor, source.context.visibilityCursor);
+  assert.equal(normalized.context.currentBatch.messages.length, 2);
+  assert.equal(Object.hasOwn(normalized, 'resultAuthorityVersion'), false);
+  assert.deepEqual(validateEnvelope(cloned(normalized)), normalized);
+});
+
+test('protocol v3 support leaves complete protocol v1 and v2 normalization unchanged', () => {
+  const v1 = validEnvelope();
+  const v2 = validBatchedV2Envelope();
+  assert.deepEqual(validateEnvelope(cloned(v1)), validateEnvelope(v1));
+  assert.deepEqual(validateEnvelope(cloned(v2)), validateEnvelope(v2));
+  assert.equal(Object.hasOwn(validateEnvelope(v2), 'authority'), false);
+  assert.equal(Object.hasOwn(validateEnvelope(v2).context, 'visibilityCursor'), false);
+  assert.throws(() => validateEnvelope({ ...v2, protocolVersion: 4 }), /protocolVersion/i);
+});
+
+test('protocol v3 closes direct and automatic context keys without changing v2 normalization', () => {
+  const directUnknown = validV3Envelope();
+  directUnknown.context.unexpectedContextField = true;
+  assert.throws(() => validateEnvelope(directUnknown), /context.*keys/i);
+
+  const automaticUnknown = validV3AutomaticEnvelope('PROACTIVE_CHAT');
+  automaticUnknown.context.unexpectedContextField = true;
+  assert.throws(() => validateEnvelope(automaticUnknown), /context.*keys/i);
+
+  const v2 = validBatchedV2Envelope();
+  v2.context.unexpectedContextField = true;
+  assert.doesNotThrow(() => validateEnvelope(v2));
+});
+
+test('protocol v3 rejects forged authority, impossible cursor, and authority selectors', () => {
+  const forged = validV3Envelope();
+  forged.authority.lineageKey = 'lin_forged';
+  assert.throws(() => validateEnvelope(forged), /authority lineage mismatch/i);
+
+  const impossible = validV3Envelope();
+  impossible.context.visibilityCursor.uiAppliedSequence = 1;
+  impossible.context.visibilityCursor.nativeCompletedSequence = 0;
+  assert.throws(() => validateEnvelope(impossible), /uiApplied.*nativeCompleted/i);
+
+  const selector = validV3Envelope({ resultAuthorityVersion: 1 });
+  assert.throws(() => validateEnvelope(selector), /resultAuthorityVersion/i);
+});
+
+test('protocol v3 validates every automatic kind and never skips its top-level cursor', () => {
+  for (const kind of V3_AUTOMATIC_KINDS) {
+    const source = validV3AutomaticEnvelope(kind);
+    const normalized = validateEnvelope(source);
+    assert.equal(normalized.kind, kind);
+    assert.equal(normalized.authority.laneKey, v3LaneForKind(kind));
+    assert.equal(normalized.context.visibilityCursor.localSequence, 1);
+
+    const missing = cloned(source);
+    delete missing.context.visibilityCursor;
+    assert.throws(() => validateEnvelope(missing), /visibility cursor/i, kind);
+
+    const impossible = cloned(source);
+    impossible.context.visibilityCursor.uiAppliedSequence = 1;
+    assert.throws(() => validateEnvelope(impossible), /uiApplied.*nativeCompleted/i, kind);
+  }
+
+  for (const [kind, anchorId] of [
+    ['PROACTIVE_CHAT', 'cloud_alarm_protocol_v3'],
+    ['ROLE_PLAN_CHAT', 'plan_alarm_protocol_v3']
+  ]) {
+    const source = validV3AutomaticEnvelope(kind);
+    source.context.visibilityCursor.nativeCompletedTurnId = anchorId;
+    source.context.visibilityCursor.nativeCompletedGroupId = anchorId;
+    source.context.visibilityCursor.uiAppliedTurnId = anchorId;
+    source.context.visibilityCursor.uiAppliedGroupId = anchorId;
+    const normalized = validateEnvelope(source);
+    assert.equal(
+      normalized.context.visibilityCursor.nativeCompletedTurnId,
+      `turn_${anchorId}`
+    );
+    assert.equal(
+      normalized.context.visibilityCursor.nativeCompletedGroupId,
+      `turn_${anchorId}`
+    );
+  }
+});
+
+test('protocol v3 direct requires the complete current batch by count identity and order', () => {
+  const missingMessages = validV3Envelope();
+  delete missingMessages.context.currentBatch.messages;
+  assert.throws(() => validateEnvelope(missingMessages), /current batch messages/i);
+
+  const missingItem = validV3Envelope();
+  missingItem.context.currentBatch.messages.pop();
+  assert.throws(() => validateEnvelope(missingItem), /current batch messages/i);
+
+  const wrongOrder = validV3Envelope();
+  wrongOrder.context.currentBatch.messages.reverse();
+  assert.throws(() => validateEnvelope(wrongOrder), /current batch message order/i);
+
+  const wrongIds = validV3Envelope();
+  wrongIds.context.currentBatch.messageIds[0] = 'msg_forged_batch_member';
+  assert.throws(() => validateEnvelope(wrongIds), /current batch message order/i);
+
+  const wrongSource = validV3Envelope();
+  wrongSource.context.currentBatch.messages[wrongSource.context.currentBatch.messages.length - 1] = {
+    ...wrongSource.context.currentBatch.messages.at(-1),
+    content: '篡改后的最后一条'
+  };
+  assert.throws(() => validateEnvelope(wrongSource), /current batch source message/i);
+
+  const payment = validV3Envelope();
+  payment.message.messageId = 'pay_protocol_v3';
+  payment.context.currentBatch.messageIds[1] = 'pay_protocol_v3';
+  payment.context.currentBatch.messages[1].messageId = 'pay_protocol_v3';
+  payment.authority.rootSourceId = 'msg_pay_protocol_v3';
+  payment.authority.lineageKey = deriveAuthorityLineageKey({
+    roleId: payment.characterId,
+    laneKey: payment.authority.laneKey,
+    rootSourceId: 'msg_pay_protocol_v3'
+  });
+  const normalizedPayment = validateEnvelope(payment);
+  assert.equal(normalizedPayment.message.messageId, 'msg_pay_protocol_v3');
+  assert.equal(normalizedPayment.context.currentBatch.messageIds.at(-1), 'msg_pay_protocol_v3');
+  assert.equal(normalizedPayment.authority.rootSourceId, 'msg_pay_protocol_v3');
+});
+
+test('protocol v3 rejects a final envelope message whose attachment differs from its complete batch', () => {
+  const forged = validV3Envelope();
+  forged.message = {
+    ...forged.message,
+    attachments: [{
+      attachmentId: 'att_protocol_v3_final',
+      messageId: forged.message.messageId,
+      kind: 'image',
+      mime: 'image/jpeg',
+      name: 'final.jpg',
+      width: 1,
+      height: 1,
+      bytes: Buffer.from(JPEG_1X1, 'base64').length,
+      dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
+    }]
+  };
+  assert.throws(() => validateEnvelope(forged), /current batch source message mismatch/i);
+});
+
+test('protocol v3 cursor enforces closed keys, integer domains, boolean type, and ordering', () => {
+  const unknown = validV3Envelope();
+  unknown.context.visibilityCursor.unknown = true;
+  assert.throws(() => validateEnvelope(unknown), /visibility cursor.*keys/i);
+
+  for (const field of [
+    'nativeCompletedSequence', 'uiAppliedSequence', 'localSequence',
+    'clearedThroughSequence', 'clearEpoch', 'clearedAt'
+  ]) {
+    const negative = validV3Envelope();
+    negative.context.visibilityCursor[field] = -1;
+    assert.throws(() => validateEnvelope(negative), new RegExp(field, 'i'));
+    const stringValue = validV3Envelope();
+    stringValue.context.visibilityCursor[field] = '0';
+    assert.throws(() => validateEnvelope(stringValue), new RegExp(field, 'i'));
+    const fraction = validV3Envelope();
+    fraction.context.visibilityCursor[field] = 0.5;
+    assert.throws(() => validateEnvelope(fraction), new RegExp(field, 'i'));
+    const unsafe = validV3Envelope();
+    unsafe.context.visibilityCursor[field] = Number.MAX_SAFE_INTEGER + 1;
+    assert.throws(() => validateEnvelope(unsafe), new RegExp(field, 'i'));
+  }
+
+  const nonBoolean = validV3Envelope();
+  nonBoolean.context.visibilityCursor.chatOpen = 1;
+  assert.throws(() => validateEnvelope(nonBoolean), /chatOpen/i);
+
+  const nativeAhead = validV3Envelope();
+  nativeAhead.context.visibilityCursor.nativeCompletedSequence = 1;
+  nativeAhead.context.visibilityCursor.nativeCompletedTurnId = 'turn_native_1';
+  nativeAhead.context.visibilityCursor.nativeCompletedGroupId = 'grp_native_1';
+  assert.throws(() => validateEnvelope(nativeAhead), /nativeCompleted.*localSequence/i);
+
+  const clearedAhead = validV3Envelope();
+  clearedAhead.context.visibilityCursor.clearedThroughSequence = 2;
+  assert.throws(() => validateEnvelope(clearedAhead), /clearedThrough.*localSequence/i);
+});
+
+test('protocol v3 cursor closes canonical identities while permitting one legacy sequence-zero anchor shape', () => {
+  const missingNativeIdentity = validV3Envelope();
+  missingNativeIdentity.context.visibilityCursor.nativeCompletedSequence = 1;
+  missingNativeIdentity.context.visibilityCursor.localSequence = 2;
+  assert.throws(() => validateEnvelope(missingNativeIdentity), /nativeCompleted.*identity/i);
+
+  const partialNativeIdentity = validV3Envelope();
+  partialNativeIdentity.context.visibilityCursor.nativeCompletedTurnId = 'turn_legacy_1';
+  assert.throws(() => validateEnvelope(partialNativeIdentity), /nativeCompleted.*identity/i);
+
+  const partialUiIdentity = validV3Envelope();
+  partialUiIdentity.context.visibilityCursor.uiAppliedTurnId = 'turn_legacy_1';
+  assert.throws(() => validateEnvelope(partialUiIdentity), /uiApplied.*identity/i);
+
+  const legacy = validV3Envelope();
+  legacy.context.visibilityCursor.nativeCompletedTurnId = 'turn_legacy_1';
+  legacy.context.visibilityCursor.nativeCompletedGroupId = 'turn_legacy_1';
+  legacy.context.visibilityCursor.uiAppliedTurnId = 'turn_legacy_1';
+  legacy.context.visibilityCursor.uiAppliedGroupId = 'turn_legacy_1';
+  const normalized = validateEnvelope(legacy);
+  assert.equal(normalized.context.visibilityCursor.nativeCompletedSequence, 0);
+  assert.equal(normalized.context.visibilityCursor.nativeCompletedGroupId, 'turn_legacy_1');
+
+  const mismatchedLegacy = cloned(legacy);
+  mismatchedLegacy.context.visibilityCursor.nativeCompletedGroupId = 'turn_other_legacy';
+  assert.throws(() => validateEnvelope(mismatchedLegacy), /legacy.*anchor/i);
+
+  const samePositiveSequenceDifferentIdentity = validV3Envelope();
+  samePositiveSequenceDifferentIdentity.context.visibilityCursor = {
+    ...samePositiveSequenceDifferentIdentity.context.visibilityCursor,
+    nativeCompletedTurnId: 'turn_native_cursor_1',
+    nativeCompletedGroupId: `grp_${'a'.repeat(64)}`,
+    nativeCompletedSequence: 1,
+    uiAppliedTurnId: 'turn_ui_cursor_1',
+    uiAppliedGroupId: `grp_${'b'.repeat(64)}`,
+    uiAppliedSequence: 1,
+    localSequence: 2
+  };
+  assert.throws(
+    () => validateEnvelope(samePositiveSequenceDifferentIdentity),
+    /positive.*cursor.*identity|cursor.*identity/i
+  );
+
+  const samePositiveGroupDifferentSequence = validV3Envelope();
+  samePositiveGroupDifferentSequence.context.visibilityCursor = {
+    ...samePositiveGroupDifferentSequence.context.visibilityCursor,
+    nativeCompletedTurnId: 'turn_cursor_group_1',
+    nativeCompletedGroupId: `grp_${'c'.repeat(64)}`,
+    nativeCompletedSequence: 2,
+    uiAppliedTurnId: 'turn_cursor_group_1',
+    uiAppliedGroupId: `grp_${'c'.repeat(64)}`,
+    uiAppliedSequence: 1,
+    localSequence: 3
+  };
+  assert.throws(
+    () => validateEnvelope(samePositiveGroupDifferentSequence),
+    /positive.*cursor.*identity|cursor.*identity/i
+  );
+});
+
+test('protocol v3 authority and cursor reject unknown keys, mismatched retry, and nested selectors', () => {
+  const authorityUnknown = validV3Envelope();
+  authorityUnknown.authority.extra = true;
+  assert.throws(() => validateEnvelope(authorityUnknown), /authority.*keys/i);
+
+  for (const [field, value] of [
+    ['algorithm', 'al-authority-v2'],
+    ['roleId', 'other'],
+    ['laneKey', 'public_moment'],
+    ['rootSourceId', 'msg_other'],
+    ['claimedLineageRevision', 0]
+  ]) {
+    const invalid = validV3Envelope();
+    invalid.authority[field] = value;
+    assert.throws(() => validateEnvelope(invalid), /authority/i, field);
+  }
+
+  for (const revision of [-1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1, '1']) {
+    const invalid = validV3Envelope();
+    invalid.authority.claimedLineageRevision = revision;
+    assert.throws(() => validateEnvelope(invalid), /authority.*revision/i);
+  }
+
+  const retry = validV3Envelope();
+  retry.context.retry = {
+    retryOfTurnId: 'turn_parent_v3',
+    canonicalMessageId: retry.message.messageId
+  };
+  retry.authority.retryOfTurnId = 'turn_different_parent';
+  assert.throws(() => validateEnvelope(retry), /authority retry mismatch/i);
+
+  const nestedSelector = validV3Envelope();
+  nestedSelector.authority.resultAuthorityVersion = 1;
+  assert.throws(() => validateEnvelope(nestedSelector), /resultAuthorityVersion/i);
+
+  const cursorSelector = validV3Envelope();
+  cursorSelector.context.visibilityCursor.resultAuthorityVersion = 1;
+  assert.throws(() => validateEnvelope(cursorSelector), /resultAuthorityVersion/i);
 });
 
 test('protocol v2 rejects malformed current batch identity, ordering, and timing', () => {

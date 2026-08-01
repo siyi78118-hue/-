@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
 
+import { deriveAuthorityLineageKey } from './authority-identity.mjs';
+import { laneKeyForEnvelope } from './interaction-lanes.mjs';
+
 export const TURN_STATES = Object.freeze([
   'queued',
   'memory_running',
@@ -136,13 +139,199 @@ function requireTimestamp(value, label) {
   return number;
 }
 
+const V3_AUTHORITY_KEYS = Object.freeze([
+  'algorithm',
+  'roleId',
+  'laneKey',
+  'rootSourceId',
+  'lineageKey',
+  'claimedLineageRevision',
+  'retryOfTurnId'
+]);
+const V3_CURSOR_KEYS = Object.freeze([
+  'nativeCompletedTurnId',
+  'nativeCompletedGroupId',
+  'nativeCompletedSequence',
+  'uiAppliedTurnId',
+  'uiAppliedGroupId',
+  'uiAppliedSequence',
+  'localSequence',
+  'clearedThroughSequence',
+  'clearEpoch',
+  'clearedAt',
+  'chatOpen',
+  'quotedMessageId'
+]);
+const V3_DIRECT_CONTEXT_KEYS = Object.freeze([
+  'scene', 'currentBatch', 'retry', 'payment', 'visibilityCursor'
+]);
+const V3_AUTOMATIC_CONTEXT_KEYS = Object.freeze(['visibilityCursor']);
+
+function assertClosedKeys(value, expected, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`invalid ${label}`);
+  }
+  const actual = Object.keys(value).sort();
+  const required = [...expected].sort();
+  if (canonicalJson(actual) !== canonicalJson(required)) {
+    throw new Error(`${label} keys conflict`);
+  }
+}
+
+function assertNoUnknownKeys(value, allowed, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`invalid ${label}`);
+  }
+  const allowedKeys = new Set(allowed);
+  if (Object.keys(value).some(key => !allowedKeys.has(key))) {
+    throw new Error(`${label} keys conflict`);
+  }
+}
+
+function rejectAuthorityVersionSelector(value, seen = new WeakSet()) {
+  if (!value || typeof value !== 'object') return;
+  if (seen.has(value)) return;
+  seen.add(value);
+  if (Object.hasOwn(value, 'resultAuthorityVersion')) {
+    throw new Error('resultAuthorityVersion is store-owned');
+  }
+  for (const nested of Object.values(value)) rejectAuthorityVersionSelector(nested, seen);
+}
+
+function requireNonNegativeSafeInteger(value, label) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`invalid ${label}`);
+  }
+  return value;
+}
+
+function validateCursorIdentity(cursor, prefix) {
+  const sequence = cursor[`${prefix}Sequence`];
+  const turnField = `${prefix}TurnId`;
+  const groupField = `${prefix}GroupId`;
+  const turnId = cursor[turnField];
+  const groupId = cursor[groupField];
+  const bothNull = turnId === null && groupId === null;
+  const bothText = typeof turnId === 'string' && typeof groupId === 'string';
+  if (!bothNull && !bothText) throw new Error(`${prefix} identity conflict`);
+  if (sequence === 0) {
+    if (bothNull) return;
+    if (!/^turn_[A-Za-z0-9_-]+$/.test(turnId) || turnId !== groupId) {
+      throw new Error(`${prefix} legacy anchor conflict`);
+    }
+    return;
+  }
+  if (!bothText || !/^turn_[A-Za-z0-9_-]+$/.test(turnId) || !/^grp_[a-f0-9]{64}$/.test(groupId)) {
+    throw new Error(`${prefix} identity conflict`);
+  }
+}
+
+function validateVisibilityCursor(value) {
+  assertClosedKeys(value, V3_CURSOR_KEYS, 'visibility cursor');
+  const normalizeLegacyAnchor = candidate => (
+    typeof candidate === 'string' && /^(?:cloud|plan)_/.test(candidate)
+      ? `turn_${candidate}`
+      : candidate
+  );
+  const cursor = {
+    nativeCompletedTurnId: normalizeLegacyAnchor(value.nativeCompletedTurnId),
+    nativeCompletedGroupId: normalizeLegacyAnchor(value.nativeCompletedGroupId),
+    nativeCompletedSequence: requireNonNegativeSafeInteger(value.nativeCompletedSequence, 'nativeCompletedSequence'),
+    uiAppliedTurnId: normalizeLegacyAnchor(value.uiAppliedTurnId),
+    uiAppliedGroupId: normalizeLegacyAnchor(value.uiAppliedGroupId),
+    uiAppliedSequence: requireNonNegativeSafeInteger(value.uiAppliedSequence, 'uiAppliedSequence'),
+    localSequence: requireNonNegativeSafeInteger(value.localSequence, 'localSequence'),
+    clearedThroughSequence: requireNonNegativeSafeInteger(value.clearedThroughSequence, 'clearedThroughSequence'),
+    clearEpoch: requireNonNegativeSafeInteger(value.clearEpoch, 'clearEpoch'),
+    clearedAt: requireNonNegativeSafeInteger(value.clearedAt, 'clearedAt'),
+    chatOpen: value.chatOpen,
+    quotedMessageId: value.quotedMessageId
+  };
+  if (typeof cursor.chatOpen !== 'boolean') throw new Error('invalid chatOpen');
+  if (cursor.quotedMessageId !== null) requireId(cursor.quotedMessageId, 'quotedMessageId', 'msg_');
+  if (cursor.uiAppliedSequence > cursor.nativeCompletedSequence) {
+    throw new Error('uiAppliedSequence exceeds nativeCompletedSequence');
+  }
+  if (cursor.nativeCompletedSequence >= cursor.localSequence) {
+    throw new Error('nativeCompletedSequence must precede localSequence');
+  }
+  if (cursor.clearedThroughSequence > cursor.localSequence) {
+    throw new Error('clearedThroughSequence exceeds localSequence');
+  }
+  validateCursorIdentity(cursor, 'nativeCompleted');
+  validateCursorIdentity(cursor, 'uiApplied');
+  if (
+    cursor.nativeCompletedSequence > 0
+    && cursor.nativeCompletedSequence === cursor.uiAppliedSequence
+    && (
+      cursor.nativeCompletedTurnId !== cursor.uiAppliedTurnId
+      || cursor.nativeCompletedGroupId !== cursor.uiAppliedGroupId
+    )
+  ) {
+    throw new Error('positive cursor identity conflict');
+  }
+  if (
+    cursor.nativeCompletedSequence > 0
+    && cursor.uiAppliedSequence > 0
+    && cursor.nativeCompletedGroupId === cursor.uiAppliedGroupId
+    && cursor.nativeCompletedSequence !== cursor.uiAppliedSequence
+  ) {
+    throw new Error('positive cursor identity conflict');
+  }
+  return cursor;
+}
+
+export function authorityLaneKeyForEnvelope(envelope) {
+  if (!['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(envelope.kind)) {
+    return laneKeyForEnvelope(envelope);
+  }
+  return laneKeyForEnvelope({ ...envelope, context: envelope.trigger?.context || {} });
+}
+
+function validateV3Authority(value, envelope) {
+  assertClosedKeys(value, V3_AUTHORITY_KEYS, 'authority');
+  if (value.algorithm !== 'al-authority-v1') throw new Error('invalid authority algorithm');
+  if (value.roleId !== envelope.characterId) throw new Error('authority role mismatch');
+  const laneKey = authorityLaneKeyForEnvelope(envelope);
+  if (value.laneKey !== laneKey) throw new Error('authority lane mismatch');
+  const retryOfTurnId = envelope.context?.retry?.retryOfTurnId || null;
+  if (value.retryOfTurnId !== retryOfTurnId) throw new Error('authority retry mismatch');
+  const rootSourceId = envelope.kind === 'DIRECT_REPLY'
+    ? (envelope.context?.retry?.canonicalMessageId || envelope.message.messageId)
+    : envelope.trigger.triggerId;
+  if (value.rootSourceId !== rootSourceId) throw new Error('authority root mismatch');
+  if (
+    typeof value.claimedLineageRevision !== 'number'
+    || !Number.isSafeInteger(value.claimedLineageRevision)
+    || value.claimedLineageRevision < 1
+  ) {
+    throw new Error('invalid authority revision');
+  }
+  const lineageKey = deriveAuthorityLineageKey({
+    roleId: envelope.characterId,
+    laneKey,
+    rootSourceId
+  });
+  if (value.lineageKey !== lineageKey) throw new Error('authority lineage mismatch');
+  return {
+    algorithm: 'al-authority-v1',
+    roleId: envelope.characterId,
+    laneKey,
+    rootSourceId,
+    lineageKey,
+    claimedLineageRevision: value.claimedLineageRevision,
+    retryOfTurnId
+  };
+}
+
 export function validateEnvelope(value) {
   if (!value || typeof value !== 'object') throw new Error('invalid envelope');
-  if (![1, 2].includes(value.protocolVersion)) throw new Error('invalid protocolVersion');
+  if (![1, 2, 3].includes(value.protocolVersion)) throw new Error('invalid protocolVersion');
+  if (value.protocolVersion === 3) rejectAuthorityVersionSelector(value);
 
-  const incomingKind = value.protocolVersion === 2 ? String(value.kind || '') : '';
+  const incomingKind = value.protocolVersion >= 2 ? String(value.kind || '') : '';
   const incomingTurnId = String(value.turnId || '');
-  const legacyAutomaticTurnId = value.protocolVersion === 2
+  const legacyAutomaticTurnId = value.protocolVersion >= 2
     && AUTOMATIC_KINDS.has(incomingKind)
     && /^(?:cloud|plan)_/.test(incomingTurnId);
 
@@ -163,7 +352,7 @@ export function validateEnvelope(value) {
   }
   requireTimestamp(envelope.createdAt, 'createdAt');
 
-  if (envelope.protocolVersion === 2) {
+  if (envelope.protocolVersion >= 2) {
     envelope.kind = incomingKind;
     if (DIRECT_KINDS.has(envelope.kind)) {
       if (value.trigger !== undefined) throw new Error('direct turn cannot contain a trigger');
@@ -171,20 +360,37 @@ export function validateEnvelope(value) {
       if (value.message !== undefined) throw new Error('automatic turn cannot contain a message');
       delete envelope.message;
       envelope.trigger = validateTrigger(value.trigger);
-      return envelope;
+      if (envelope.protocolVersion === 2) return envelope;
     } else {
       throw new Error('invalid turn kind');
     }
   }
 
-  validateUserMessage(envelope.message, envelope);
-  if (envelope.protocolVersion === 2 && value.context !== undefined) {
-    envelope.context = validateDirectContext(value.context, envelope);
+  if (DIRECT_KINDS.has(envelope.kind) || envelope.protocolVersion === 1) {
+    validateUserMessage(envelope.message, envelope);
+  }
+  if (DIRECT_KINDS.has(envelope.kind) && value.context !== undefined) {
+    envelope.context = validateDirectContext(value.context, envelope, {
+      requireCompleteBatch: envelope.protocolVersion === 3
+    });
+  }
+  if (envelope.protocolVersion === 3) {
+    if (!value.context || typeof value.context !== 'object' || Array.isArray(value.context)) {
+      throw new Error('visibility cursor is required');
+    }
+    assertNoUnknownKeys(
+      value.context,
+      DIRECT_KINDS.has(envelope.kind) ? V3_DIRECT_CONTEXT_KEYS : V3_AUTOMATIC_CONTEXT_KEYS,
+      'context'
+    );
+    if (!DIRECT_KINDS.has(envelope.kind)) envelope.context = {};
+    envelope.context.visibilityCursor = validateVisibilityCursor(value.context.visibilityCursor);
+    envelope.authority = validateV3Authority(value.authority, envelope);
   }
   return envelope;
 }
 
-function validateDirectContext(context, envelope) {
+function validateDirectContext(context, envelope, { requireCompleteBatch = false } = {}) {
   if (!context || typeof context !== 'object' || Array.isArray(context)) {
     throw new Error('invalid direct context');
   }
@@ -192,6 +398,9 @@ function validateDirectContext(context, envelope) {
   if (context.scene !== undefined) normalized.scene = validateScene(context.scene);
   if (context.currentBatch !== undefined) {
     normalized.currentBatch = validateCurrentBatch(context.currentBatch, envelope);
+  }
+  if (requireCompleteBatch && !Array.isArray(normalized.currentBatch?.messages)) {
+    throw new Error('current batch messages are required');
   }
   if (context.retry !== undefined) {
     const retry = context.retry;
@@ -283,11 +492,14 @@ function validateCurrentBatch(value, envelope) {
       throw new Error('current batch message order mismatch');
     }
     const source = messages.at(-1);
-    if (
-      source.messageId !== envelope.message.messageId
-      || source.content !== envelope.message.content
-      || Number(source.sentAt) !== Number(envelope.message.sentAt)
-    ) {
+    const sourceMatchesEnvelope = envelope.protocolVersion === 3
+      ? canonicalJson(source) === canonicalJson(normalizedBatchMessage(envelope.message, envelope))
+      : (
+        source.messageId === envelope.message.messageId
+        && source.content === envelope.message.content
+        && Number(source.sentAt) === Number(envelope.message.sentAt)
+      );
+    if (!sourceMatchesEnvelope) {
       throw new Error('current batch source message mismatch');
     }
     if (

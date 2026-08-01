@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 
+import {
+  deriveAuthorityLineageKey,
+  deriveVisibleActionId,
+  deriveVisibleGroupId,
+  deriveVisibleMessageId
+} from './authority-identity.mjs';
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { decideLaneAdmission, laneKeyForEnvelope } from './interaction-lanes.mjs';
 import { resolvePipelinePair } from './release-pair.mjs';
@@ -13,6 +19,7 @@ import {
   canonicalJson,
   contentHash,
   deliveryItemsForResult,
+  authorityLaneKeyForEnvelope,
   validateDeliveryReceipt,
   validateEnvelope
 } from './protocol.mjs';
@@ -80,33 +87,12 @@ function now() {
   return Date.now();
 }
 
-function authorityLengthPrefix(value) {
-  const text = String(value ?? '');
-  return `${Buffer.byteLength(text, 'utf8')}:${text}`;
-}
-
-function authorityHash(namespace, values) {
-  const hash = createHash('sha256');
-  hash.update(`${namespace}\0`, 'utf8');
-  for (const value of values) hash.update(authorityLengthPrefix(value), 'utf8');
-  return hash.digest('hex');
-}
-
-export function deriveAuthorityLineageKey({ roleId, laneKey, rootSourceId }) {
-  return `lin_${authorityHash('al-turn-lineage-v1', [roleId, laneKey, rootSourceId])}`;
-}
-
-export function deriveVisibleGroupId(lineageKey) {
-  return `grp_${authorityHash('al-visible-group-v1', [lineageKey])}`;
-}
-
-export function deriveVisibleMessageId(groupId, ordinal) {
-  return `msg_${authorityHash('al-visible-message-v1', [groupId, String(ordinal)])}`;
-}
-
-export function deriveVisibleActionId(groupId, ordinal) {
-  return `act_${authorityHash('al-visible-action-v1', [groupId, String(ordinal)])}`;
-}
+export {
+  deriveAuthorityLineageKey,
+  deriveVisibleActionId,
+  deriveVisibleGroupId,
+  deriveVisibleMessageId
+} from './authority-identity.mjs';
 
 function parseJson(value, fallback = null) {
   if (value === null || value === undefined || value === '') return fallback;
@@ -4725,14 +4711,7 @@ export class YuqiStore {
     const current = this.getInteractionLane(roleId, laneKey);
     if (!current) {
       if (expectedRevision !== 0) throw new Error('interaction lane revision conflict');
-      this.db.prepare(`
-        INSERT INTO interaction_lanes(
-          role_id, lane_key, revision, generating_turn_id, latest_user_batch_id,
-          latest_authoritative_group_id, native_completed_group_id,
-          native_completed_sequence, ui_applied_group_id, ui_applied_sequence,
-          local_sequence, last_commit_checksum, updated_at
-        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+      const commonValues = [
         roleId,
         laneKey,
         input.generatingTurnId ?? null,
@@ -4742,10 +4721,38 @@ export class YuqiStore {
         Number(input.nativeCompletedSequence || 0),
         input.uiAppliedGroupId ?? null,
         Number(input.uiAppliedSequence || 0),
-        Number(input.localSequence || 0),
-        input.lastCommitChecksum ?? null,
-        Number(input.now || now())
-      );
+        Number(input.localSequence || 0)
+      ];
+      if (this.userVersion() >= 13) {
+        this.db.prepare(`
+          INSERT INTO interaction_lanes(
+            role_id, lane_key, revision, generating_turn_id, latest_user_batch_id,
+            latest_authoritative_group_id, native_completed_group_id,
+            native_completed_sequence, ui_applied_group_id, ui_applied_sequence,
+            local_sequence, clear_epoch, cleared_through_sequence,
+            last_commit_checksum, updated_at
+          ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...commonValues,
+          Number(input.clearEpoch || 0),
+          Number(input.clearedThroughSequence || 0),
+          input.lastCommitChecksum ?? null,
+          Number(input.now || now())
+        );
+      } else {
+        this.db.prepare(`
+          INSERT INTO interaction_lanes(
+            role_id, lane_key, revision, generating_turn_id, latest_user_batch_id,
+            latest_authoritative_group_id, native_completed_group_id,
+            native_completed_sequence, ui_applied_group_id, ui_applied_sequence,
+            local_sequence, last_commit_checksum, updated_at
+          ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ...commonValues,
+          input.lastCommitChecksum ?? null,
+          Number(input.now || now())
+        );
+      }
       return this.getInteractionLane(roleId, laneKey);
     }
     if (current.revision !== expectedRevision) throw new Error('interaction lane revision conflict');
@@ -4760,17 +4767,13 @@ export class YuqiStore {
       uiAppliedGroupId: input.uiAppliedGroupId ?? current.uiAppliedGroupId,
       uiAppliedSequence: input.uiAppliedSequence ?? current.uiAppliedSequence,
       localSequence: input.localSequence ?? current.localSequence,
+      clearEpoch: input.clearEpoch ?? current.clearEpoch,
+      clearedThroughSequence:
+        input.clearedThroughSequence ?? current.clearedThroughSequence,
       lastCommitChecksum: input.lastCommitChecksum ?? current.lastCommitChecksum,
       updatedAt: Number(input.now || now())
     };
-    const result = this.db.prepare(`
-      UPDATE interaction_lanes
-      SET revision = revision + 1, generating_turn_id = ?, latest_user_batch_id = ?,
-          latest_authoritative_group_id = ?, native_completed_group_id = ?,
-          native_completed_sequence = ?, ui_applied_group_id = ?, ui_applied_sequence = ?,
-          local_sequence = ?, last_commit_checksum = ?, updated_at = ?
-      WHERE role_id = ? AND lane_key = ? AND revision = ?
-    `).run(
+    const commonValues = [
       next.generatingTurnId,
       next.latestUserBatchId,
       next.latestAuthoritativeGroupId,
@@ -4778,13 +4781,42 @@ export class YuqiStore {
       Number(next.nativeCompletedSequence),
       next.uiAppliedGroupId,
       Number(next.uiAppliedSequence),
-      Number(next.localSequence),
-      next.lastCommitChecksum,
-      next.updatedAt,
-      roleId,
-      laneKey,
-      expectedRevision
-    );
+      Number(next.localSequence)
+    ];
+    const result = this.userVersion() >= 13
+      ? this.db.prepare(`
+        UPDATE interaction_lanes
+        SET revision = revision + 1, generating_turn_id = ?, latest_user_batch_id = ?,
+            latest_authoritative_group_id = ?, native_completed_group_id = ?,
+            native_completed_sequence = ?, ui_applied_group_id = ?, ui_applied_sequence = ?,
+            local_sequence = ?, clear_epoch = ?, cleared_through_sequence = ?,
+            last_commit_checksum = ?, updated_at = ?
+        WHERE role_id = ? AND lane_key = ? AND revision = ?
+      `).run(
+        ...commonValues,
+        Number(next.clearEpoch),
+        Number(next.clearedThroughSequence),
+        next.lastCommitChecksum,
+        next.updatedAt,
+        roleId,
+        laneKey,
+        expectedRevision
+      )
+      : this.db.prepare(`
+        UPDATE interaction_lanes
+        SET revision = revision + 1, generating_turn_id = ?, latest_user_batch_id = ?,
+            latest_authoritative_group_id = ?, native_completed_group_id = ?,
+            native_completed_sequence = ?, ui_applied_group_id = ?, ui_applied_sequence = ?,
+            local_sequence = ?, last_commit_checksum = ?, updated_at = ?
+        WHERE role_id = ? AND lane_key = ? AND revision = ?
+      `).run(
+        ...commonValues,
+        next.lastCommitChecksum,
+        next.updatedAt,
+        roleId,
+        laneKey,
+        expectedRevision
+      );
     if (Number(result.changes) !== 1) throw new Error('interaction lane revision conflict');
     return this.getInteractionLane(roleId, laneKey);
   }
@@ -5310,6 +5342,124 @@ export class YuqiStore {
     ).get(String(lineageKey || '')));
   }
 
+  hasCanonicalV3LanePinInternal(roleId, laneKey) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 AS value
+      FROM turns
+      WHERE character_id = ? AND lane_key = ? AND result_authority_version = 1
+        AND (
+          json_extract(envelope_json, '$.protocolVersion') = 3
+          OR authority_redacted_at IS NOT NULL
+        )
+      LIMIT 1
+    `).get(String(roleId), String(laneKey)));
+  }
+
+  assertLegacyV3CursorAnchorInternal({ envelope, laneKey, turnId }) {
+    const anchor = this.getTurn(turnId);
+    const terminalStates = new Set(['committed', 'delivered', 'completed', 'fallback']);
+    if (!anchor
+      || Number(anchor.resultAuthorityVersion || 0) !== 0
+      || anchor.characterId !== envelope.characterId
+      || anchor.deviceId !== envelope.deviceId
+      || !terminalStates.has(anchor.state)) {
+      throw new Error('legacy bootstrap authority conflict');
+    }
+    const anchorEnvelope = validateEnvelope(parseJson(anchor.envelopeJson, null));
+    const anchorLaneKey = authorityLaneKeyForEnvelope(anchorEnvelope);
+    if (anchorLaneKey !== laneKey) throw new Error('legacy bootstrap authority conflict');
+    if (anchorEnvelope.message) {
+      const message = this.getMessage(anchorEnvelope.message.messageId);
+      if (!message
+        || message.turnId !== anchor.turnId
+        || message.characterId !== envelope.characterId
+        || message.speakerType !== 'user') {
+        throw new Error('legacy bootstrap authority conflict');
+      }
+    }
+    return anchor;
+  }
+
+  assertCanonicalV3CursorGroupInternal({
+    envelope, laneKey, prefix, turnId, groupId, sequence, requireSequencePin
+  }) {
+    let closure;
+    try {
+      closure = this.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'v3_cursor' });
+    } catch (error) {
+      throw new Error('canonical cursor authority conflict', { cause: error });
+    }
+    const receipt = closure.receipt;
+    const authoritativeTurn = receipt
+      ? this.getTurn(receipt.authoritativeTurnId)
+      : null;
+    if (!receipt || !authoritativeTurn
+      || turnId !== receipt.authoritativeTurnId
+      || authoritativeTurn.characterId !== envelope.characterId
+      || authoritativeTurn.deviceId !== envelope.deviceId
+      || authoritativeTurn.laneKey !== laneKey
+      || (requireSequencePin
+        && Number(authoritativeTurn.inputVisibilitySequence) !== Number(sequence))) {
+      throw new Error(`${prefix} canonical cursor authority conflict`);
+    }
+    return { closure, authoritativeTurn };
+  }
+
+  assertCanonicalV3CursorAuthorityInternal({ envelope, lane }) {
+    const cursor = envelope.context.visibilityCursor;
+    const laneKey = envelope.authority.laneKey;
+    const established = this.hasCanonicalV3LanePinInternal(envelope.characterId, laneKey);
+    const verify = prefix => {
+      const turnId = cursor[`${prefix}TurnId`];
+      const groupId = cursor[`${prefix}GroupId`];
+      const sequence = Number(cursor[`${prefix}Sequence`]);
+      if (sequence === 0) {
+        if (turnId === null && groupId === null) return;
+        if (established) throw new Error('canonical cursor legacy bootstrap disabled');
+        this.assertLegacyV3CursorAnchorInternal({ envelope, laneKey, turnId });
+        return;
+      }
+      this.assertCanonicalV3CursorGroupInternal({
+        envelope, laneKey, prefix, turnId, groupId, sequence,
+        requireSequencePin: established
+      });
+    };
+    verify('nativeCompleted');
+    verify('uiApplied');
+
+    const laneNativeSequence = Number(lane?.nativeCompletedSequence || 0);
+    const laneUiSequence = Number(lane?.uiAppliedSequence || 0);
+    if (cursor.nativeCompletedSequence < laneNativeSequence
+      || cursor.uiAppliedSequence < laneUiSequence
+      || cursor.clearedThroughSequence < Number(lane?.clearedThroughSequence || 0)
+      || (cursor.nativeCompletedSequence === laneNativeSequence
+        && laneNativeSequence > 0
+        && cursor.nativeCompletedGroupId !== lane.nativeCompletedGroupId)
+      || (cursor.uiAppliedSequence === laneUiSequence
+        && laneUiSequence > 0
+        && cursor.uiAppliedGroupId !== lane.uiAppliedGroupId)) {
+      throw new Error('canonical cursor authority conflict');
+    }
+    const priorWatermark = Math.max(
+      Number(lane?.localSequence || 0),
+      Number(cursor.nativeCompletedSequence),
+      Number(cursor.uiAppliedSequence),
+      Number(cursor.clearedThroughSequence)
+    );
+    if (Number(cursor.localSequence) !== priorWatermark + 1) {
+      throw new Error('input visibility sequence authority conflict');
+    }
+    if (
+      Number(cursor.clearEpoch) !== Number(lane?.clearEpoch || 0)
+      || Number(cursor.clearedThroughSequence) !== Number(lane?.clearedThroughSequence || 0)
+    ) {
+      const error = new Error('CLEAR_EPOCH_SYNC_REQUIRED');
+      error.code = 'CLEAR_EPOCH_SYNC_REQUIRED';
+      throw error;
+    }
+    return { cursor, established };
+  }
+
   readCanonicalCommitOutcomeInternal({
     lineageKey,
     expectedTurnId = null,
@@ -5374,7 +5524,9 @@ export class YuqiStore {
       || envelope.trigger?.triggerId
       || '';
     const derivedRolloutKey = String(envelope.kind || '');
-    const derivedLaneKey = laneKeyForEnvelope(envelope);
+    const derivedLaneKey = envelope.protocolVersion === 3
+      ? authorityLaneKeyForEnvelope(envelope)
+      : laneKeyForEnvelope(envelope);
     const derivedInputUserBatchId = String(
       resolveCurrentUserBatch(envelope)?.batchId
       ?? envelope.trigger?.triggerId
@@ -5391,6 +5543,11 @@ export class YuqiStore {
     }
     if (inputUserBatchId !== derivedInputUserBatchId) {
       throw new Error('canonical user batch authority conflict');
+    }
+    if (envelope.protocolVersion === 3
+      && (inputVisibilitySequence !== envelope.context.visibilityCursor.localSequence
+        || inputClearEpoch !== envelope.context.visibilityCursor.clearEpoch)) {
+      throw new Error('canonical cursor input authority conflict');
     }
     if (!CANONICAL_RESULT_TURN_KINDS.has(rolloutKey)
       || !laneKey || !rootSourceId || !inputUserBatchId
@@ -5418,7 +5575,8 @@ export class YuqiStore {
           || exactTurn.inputUserBatchId !== inputUserBatchId
           || Number(exactTurn.inputVisibilitySequence) !== inputVisibilitySequence
           || Number(exactTurn.inputClearEpoch) !== inputClearEpoch
-          || Number(exactTurn.laneRevision) !== expectedLaneRevision + 1
+          || (envelope.protocolVersion !== 3
+            && Number(exactTurn.laneRevision) !== expectedLaneRevision + 1)
           || Number(exactTurn.rolloutRevision) !== expectedRolloutRevision
           || exactTurn.authoritativeReleaseId !== String(input.authoritativeReleaseId || '')
           || String(exactTurn.comparisonReleaseId || '') !== String(input.comparisonReleaseId || '')
@@ -5430,8 +5588,7 @@ export class YuqiStore {
           throw new Error('canonical turn authority conflict');
         }
         const outcome = this.readCanonicalCommitOutcomeInternal({
-          lineageKey,
-          expectedTurnId: exactTurn.turnId
+          lineageKey
         });
         return outcome || { status: 'created', turn: exactTurn };
       }
@@ -5484,16 +5641,30 @@ export class YuqiStore {
         }
         const lineage = this.getTurnAuthorityLineage(parent.authorityLineageKey);
         if (!lineage) throw new Error('canonical retry lineage invariant conflict');
-        if (lineage.state === 'cancelled' && lineage.redactedAt != null) {
+        const expectedHistoricalRetryClaim = Number(parent.lineageRevisionAtCreation) + 1;
+        const terminalOutcome = lineage.state === 'committed'
+          || (lineage.state === 'cancelled' && lineage.redactedAt != null);
+        if (terminalOutcome) {
+          if (envelope.protocolVersion === 3
+            && Number(envelope.authority.claimedLineageRevision) !== expectedHistoricalRetryClaim) {
+            throw new Error('authority claim revision conflict');
+          }
           return this.readCanonicalCommitOutcomeInternal({ lineageKey: lineage.lineageKey });
         }
-        if (lineage.state === 'committed') {
-          return this.readCanonicalCommitOutcomeInternal({
-            lineageKey: lineage.lineageKey,
-            expectedTurnId: lineage.latestTurnId
-          });
+        if (envelope.protocolVersion === 3
+          && Number(envelope.authority.claimedLineageRevision) !== Number(lineage.revision) + 1) {
+          throw new Error('authority claim revision conflict');
+        }
+        if (envelope.protocolVersion === 3) {
+          const failure = parseJson(parent.errorJson, {});
+          if (parent.state !== 'failed' || failure.retryAllowed !== true) {
+            throw new Error('canonical retry permission conflict');
+          }
         }
         validatedRetry = { parent, lineage };
+      } else if (envelope.protocolVersion === 3
+        && Number(envelope.authority.claimedLineageRevision) !== 1) {
+        throw new Error('authority claim revision conflict');
       }
 
       const lane = this.getInteractionLane(envelope.characterId, laneKey);
@@ -5508,7 +5679,11 @@ export class YuqiStore {
       if (inputVisibilitySequence < Number(lane?.localSequence || 0)) {
         throw new Error('input visibility sequence is behind lane authority');
       }
-      if (inputClearEpoch !== Number(lane?.clearEpoch || 0)) {
+      const v3CursorAuthority = envelope.protocolVersion === 3
+        ? this.assertCanonicalV3CursorAuthorityInternal({ envelope, lane })
+        : null;
+      if (envelope.protocolVersion !== 3
+        && inputClearEpoch !== Number(lane?.clearEpoch || 0)) {
         throw new Error('clear epoch authority conflict');
       }
 
@@ -5571,6 +5746,9 @@ export class YuqiStore {
         }
         const existingLineage = this.getTurnAuthorityLineage(lineageKey);
         if (existingLineage) {
+          if (envelope.protocolVersion === 3) {
+            throw new Error('authority claim revision conflict');
+          }
           if (existingLineage.state === 'committed') {
             return this.readCanonicalCommitOutcomeInternal({
               lineageKey,
@@ -5757,7 +5935,13 @@ export class YuqiStore {
         expectedRevision: expectedLaneRevision,
         generatingTurnId: envelope.turnId,
         latestUserBatchId: inputUserBatchId,
+        nativeCompletedGroupId: v3CursorAuthority?.cursor.nativeCompletedGroupId ?? undefined,
+        nativeCompletedSequence: v3CursorAuthority?.cursor.nativeCompletedSequence ?? undefined,
+        uiAppliedGroupId: v3CursorAuthority?.cursor.uiAppliedGroupId ?? undefined,
+        uiAppliedSequence: v3CursorAuthority?.cursor.uiAppliedSequence ?? undefined,
         localSequence: inputVisibilitySequence,
+        clearEpoch: v3CursorAuthority?.cursor.clearEpoch ?? undefined,
+        clearedThroughSequence: v3CursorAuthority?.cursor.clearedThroughSequence ?? undefined,
         now: timestamp
       });
       const turn = this.getTurn(envelope.turnId);
@@ -6042,6 +6226,129 @@ export class YuqiStore {
       action: parseJson(row.action_json, {}),
       actionChecksum: row.action_checksum
     }));
+  }
+
+  loadCanonicalBridgeResultInternal(turnId) {
+    try {
+      const lookupTurn = this.getTurn(String(turnId || ''));
+      if (!lookupTurn
+        || Number(lookupTurn.resultAuthorityVersion || 0) !== 1
+        || !lookupTurn.authorityLineageKey) {
+        throw new Error('canonical bridge lookup turn conflict');
+      }
+      const lineage = this.getTurnAuthorityLineage(lookupTurn.authorityLineageKey);
+      if (!lineage || lineage.state !== 'committed' || !lineage.committedGroupId) {
+        throw new Error('canonical bridge lineage conflict');
+      }
+      const closure = this.assertVisibleGroupAuthorityInternal(lineage.committedGroupId, {
+        purpose: 'bridge_result',
+        expectedLineageKey: lineage.lineageKey
+      });
+      const receipt = closure.receipt;
+      if (!receipt) throw new Error('canonical bridge receipt conflict');
+      if (closure.status === 'redacted') {
+        return {
+          status: 'redacted',
+          deliverable: false,
+          turnId: receipt.authoritativeTurnId,
+          authorityLineageKey: receipt.authorityLineageKey,
+          visibleGroupId: receipt.visibleGroupId,
+          commitChecksum: receipt.commitChecksum
+        };
+      }
+      const authority = this.db.prepare(`
+        SELECT
+          r.lineage_key, r.group_id, r.authoritative_turn_id,
+          r.authority_origin, r.commit_payload_version, r.commit_checksum,
+          r.turn_revision_after, r.lineage_revision_after, r.lane_revision_after,
+          g.role_id, g.lane_key, g.authoritative_release_id,
+          g.generation_fingerprint, g.reply_checksum,
+          t.input_visibility_sequence, t.input_clear_epoch,
+          t.authority_lineage_key AS turn_lineage_key,
+          t.authoritative_release_id AS turn_release_id,
+          l.committed_group_id, l.latest_turn_id,
+          p.release_id,
+          il.role_id AS lane_role_id, il.lane_key AS joined_lane_key,
+          m.semantic_checksum
+        FROM visible_commit_receipts r
+        JOIN visible_result_groups g
+          ON g.group_id = r.group_id
+         AND g.lineage_key = r.lineage_key
+         AND g.authoritative_turn_id = r.authoritative_turn_id
+        JOIN visible_result_manifests m ON m.group_id = g.group_id
+        JOIN turn_authority_lineages l ON l.lineage_key = r.lineage_key
+        JOIN turns t ON t.turn_id = r.authoritative_turn_id
+        JOIN pipeline_releases p ON p.release_id = g.authoritative_release_id
+        JOIN interaction_lanes il ON il.role_id = g.role_id AND il.lane_key = g.lane_key
+        WHERE r.lineage_key = ? AND r.group_id = ?
+      `).get(lineage.lineageKey, lineage.committedGroupId);
+      if (!authority
+        || authority.turn_lineage_key !== authority.lineage_key
+        || authority.turn_release_id !== authority.authoritative_release_id
+        || authority.release_id !== authority.authoritative_release_id
+        || authority.committed_group_id !== authority.group_id
+        || authority.latest_turn_id !== authority.authoritative_turn_id
+        || authority.lane_role_id !== authority.role_id
+        || authority.joined_lane_key !== authority.lane_key
+        || authority.semantic_checksum !== authority.commit_checksum
+        || Number(authority.turn_revision_after) !== Number(receipt.turnRevisionAfter)
+        || Number(authority.lineage_revision_after) !== Number(receipt.lineageRevisionAfter)
+        || Number(authority.lane_revision_after) !== Number(receipt.laneRevisionAfter)) {
+        throw new Error('canonical bridge join conflict');
+      }
+      const storedItems = this.visibleItemsForGroup(authority.group_id);
+      const storedActions = this.actionsForGroup(authority.group_id);
+      if (contentHash({
+        items: storedItems.map(item => item.item),
+        actions: storedActions.map(action => ({
+          kind: action.kind,
+          targetKey: action.targetKey,
+          targetRevision: action.targetRevision,
+          payload: action.action
+        }))
+      }) !== authority.reply_checksum) {
+        throw new Error('canonical bridge reply checksum conflict');
+      }
+      const replyParts = storedItems.map(item => ({
+        ...item.item,
+        messageId: item.messageId,
+        ordinal: item.ordinal,
+        itemChecksum: item.itemChecksum
+      }));
+      const actions = storedActions.map(action => ({
+        actionId: action.actionId,
+        ordinal: action.ordinal,
+        actionChecksum: action.actionChecksum,
+        kind: action.kind,
+        targetKey: action.targetKey,
+        targetRevision: action.targetRevision,
+        payload: action.action
+      }));
+      return {
+        protocolVersion: 3,
+        turnId: authority.authoritative_turn_id,
+        roleId: authority.role_id,
+        authorityOrigin: authority.authority_origin,
+        authorityLineageKey: authority.lineage_key,
+        visibleGroupId: authority.group_id,
+        lineageRevision: Number(receipt.lineageRevisionAfter),
+        turnRevision: Number(receipt.turnRevisionAfter),
+        laneKey: authority.lane_key,
+        laneRevision: Number(receipt.laneRevisionAfter),
+        inputVisibilitySequence: Number(authority.input_visibility_sequence),
+        inputClearEpoch: Number(authority.input_clear_epoch),
+        generationFingerprint: authority.generation_fingerprint,
+        releaseId: authority.authoritative_release_id,
+        commitPayloadVersion: authority.commit_payload_version,
+        commitChecksum: authority.commit_checksum,
+        terminalDisposition: closure.terminalDisposition,
+        replyParts,
+        actions
+      };
+    } catch (error) {
+      if (error?.message === 'canonical bridge result authority conflict') throw error;
+      throw new Error('canonical bridge result authority conflict', { cause: error });
+    }
   }
 
   memoryJobsForGroup(groupId) {

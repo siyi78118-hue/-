@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import test from 'node:test';
 
+import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
 import { YuqiOrchestrator } from '../src/orchestrator.mjs';
 
 const SHA_STABLE = '1'.repeat(64);
@@ -38,6 +39,51 @@ function directEnvelope({
     },
     ...(retry ? { context: { retry } } : {})
   };
+}
+
+function v3DirectEnvelope(overrides = {}) {
+  const source = directEnvelope({
+    protocolVersion: 3,
+    turnId: 'turn_wire_v3',
+    messageId: 'msg_wire_v3'
+  });
+  source.context = {
+    currentBatch: {
+      batchId: 'batch_wire_v3',
+      messageIds: [source.message.messageId],
+      startedAt: source.message.sentAt,
+      committedAt: source.createdAt,
+      messages: [source.message]
+    },
+    visibilityCursor: {
+      nativeCompletedTurnId: null,
+      nativeCompletedGroupId: null,
+      nativeCompletedSequence: 0,
+      uiAppliedTurnId: null,
+      uiAppliedGroupId: null,
+      uiAppliedSequence: 0,
+      localSequence: 1,
+      clearedThroughSequence: 0,
+      clearEpoch: 0,
+      clearedAt: 0,
+      chatOpen: true,
+      quotedMessageId: null
+    }
+  };
+  source.authority = {
+    algorithm: 'al-authority-v1',
+    roleId: source.characterId,
+    laneKey: 'private_chat',
+    rootSourceId: source.message.messageId,
+    lineageKey: deriveAuthorityLineageKey({
+      roleId: source.characterId,
+      laneKey: 'private_chat',
+      rootSourceId: source.message.messageId
+    }),
+    claimedLineageRevision: 1,
+    retryOfTurnId: null
+  };
+  return { ...source, ...overrides };
 }
 
 function pinnedCanonicalTurn(envelope, overrides = {}) {
@@ -91,6 +137,8 @@ function orchestrationFixture({ turns = [], canonicalRouteReasons = ['release-pi
     canonicalRoutes: [],
     legacyCreates: [],
     legacyRoutes: [],
+    legacyRequeues: [],
+    canonicalRequeues: [],
     freshSelections: [],
     diagnostics: [],
     releaseExecutions: []
@@ -132,8 +180,9 @@ function orchestrationFixture({ turns = [], canonicalRouteReasons = ['release-pi
     },
     createCanonicalVisibleTurnInternal(input) {
       calls.canonicalCreates.push(input);
-      if (input.envelope.protocolVersion === 3) {
-        throw new Error('unsupported protocolVersion: 3');
+      const exact = turnMap.get(input.envelope.turnId);
+      if (exact && Number(exact.resultAuthorityVersion || 0) === 1) {
+        return { status: 'created', turn: exact };
       }
       const turn = pinnedCanonicalTurn(input.envelope, {
         rolloutRevision: input.expectedRolloutRevision,
@@ -148,6 +197,25 @@ function orchestrationFixture({ turns = [], canonicalRouteReasons = ['release-pi
       });
       turnMap.set(turn.turnId, turn);
       return { status: 'created', turn, agencySnapshot: this.readAgencyAuthoritySnapshotInternal() };
+    },
+    requeueCanonicalFailedTurnInternal(input) {
+      calls.canonicalRequeues.push(input);
+      const current = turnMap.get(input.turnId);
+      const turn = {
+        ...current,
+        state: 'queued',
+        errorJson: null,
+        turnRevision: Number(current.turnRevision || 0) + 1
+      };
+      turnMap.set(turn.turnId, turn);
+      return turn;
+    },
+    requeueTransientFailedTurn(turnId) {
+      calls.legacyRequeues.push(turnId);
+      const current = turnMap.get(turnId);
+      const turn = { ...current, state: 'queued' };
+      turnMap.set(turn.turnId, turn);
+      return { requeued: true, turn };
     },
     listMessages: () => [],
     setTurnRoute(turnId, route, reasons) {
@@ -174,6 +242,8 @@ function orchestrationFixture({ turns = [], canonicalRouteReasons = ['release-pi
   const promotionController = {
     createTurn({ envelope }) {
       calls.legacyCreates.push(envelope);
+      const exact = turnMap.get(envelope.turnId);
+      if (exact) return exact;
       const turn = {
         turnId: envelope.turnId,
         characterId: envelope.characterId,
@@ -255,17 +325,126 @@ test('fresh canonical routing uses the revisioned canonical writer', () => {
   assert.deepEqual(accepted.routeReasons, fixture.calls.canonicalRoutes[0].reasons);
 });
 
-test('wire v3 stays dormant while wire v1 and non-Yuqi turns remain version zero', () => {
+test('validated wire v3 enters canonical creation with its normalized cursor unchanged', () => {
   const fixture = orchestrationFixture();
+  const raw = v3DirectEnvelope();
+  const accepted = fixture.orchestrator.accept(raw);
 
-  assert.throws(
-    () => fixture.orchestrator.accept(directEnvelope({
-      protocolVersion: 3,
-      turnId: 'turn_wire_v3',
-      messageId: 'msg_wire_v3'
-    })),
-    /unsupported protocolVersion|protocol version/i
+  assert.equal(accepted.resultAuthorityVersion, 1);
+  assert.equal(fixture.calls.canonicalCreates.length, 1);
+  assert.equal(fixture.calls.canonicalCreates[0].envelope.protocolVersion, 3);
+  assert.deepEqual(
+    fixture.calls.canonicalCreates[0].envelope.context.visibilityCursor,
+    raw.context.visibilityCursor
   );
+  assert.equal(fixture.calls.canonicalCreates[0].inputVisibilitySequence, 1);
+  assert.equal(fixture.calls.canonicalCreates[0].inputClearEpoch, 0);
+  assert.equal(fixture.calls.legacyCreates.length, 0);
+});
+
+test('malformed raw v3 is rejected before rollout, lane, agency, route, or store work', () => {
+  const fixture = orchestrationFixture();
+  const forged = v3DirectEnvelope();
+  forged.authority.lineageKey = `lin_${'f'.repeat(64)}`;
+  assert.throws(
+    () => fixture.orchestrator.accept(forged),
+    /authority lineage mismatch/i
+  );
+  assert.equal(fixture.calls.freshSelections.length, 0);
+  assert.equal(fixture.calls.agencyReads.length, 0);
+  assert.equal(fixture.calls.canonicalCreates.length, 0);
+  assert.equal(fixture.calls.canonicalRoutes.length, 0);
+  assert.equal(fixture.calls.legacyCreates.length, 0);
+  assert.equal(fixture.calls.legacyRoutes.length, 0);
+});
+
+test('exact v3 replay reuses persisted release and agency pins without fresh authority reads', () => {
+  const envelope = v3DirectEnvelope();
+  const persisted = pinnedCanonicalTurn(envelope, {
+    authorityLineageKey: envelope.authority.lineageKey,
+    laneKey: envelope.authority.laneKey,
+    rolloutRevision: 19,
+    inputVisibilitySequence: envelope.context.visibilityCursor.localSequence,
+    inputClearEpoch: envelope.context.visibilityCursor.clearEpoch,
+    agencySnapshotChecksum: SHA_AGENCY_REFRESHED
+  });
+  const fixture = orchestrationFixture({ turns: [persisted] });
+
+  const accepted = fixture.orchestrator.accept(envelope);
+
+  assert.equal(accepted.turnId, persisted.turnId);
+  assert.equal(fixture.calls.canonicalCreates.length, 1);
+  assert.equal(fixture.calls.canonicalCreates[0].expectedRolloutRevision, 19);
+  assert.equal(
+    fixture.calls.canonicalCreates[0].agencySnapshotChecksum,
+    SHA_AGENCY_REFRESHED
+  );
+  assert.equal(fixture.calls.freshSelections.length, 0);
+  assert.equal(fixture.calls.agencyReads.length, 0);
+});
+
+test('canonical transient failed v3 replay uses the revisioned canonical requeue only', () => {
+  const envelope = v3DirectEnvelope();
+  const persisted = pinnedCanonicalTurn(envelope, {
+    authorityLineageKey: envelope.authority.lineageKey,
+    state: 'failed',
+    turnRevision: 7,
+    errorJson: JSON.stringify({ failureClass: 'transient' })
+  });
+  const fixture = orchestrationFixture({ turns: [persisted] });
+
+  const replay = fixture.orchestrator.accept(envelope);
+
+  assert.equal(fixture.calls.legacyCreates.length, 0);
+  assert.equal(replay.state, 'queued');
+  assert.equal(fixture.calls.canonicalRequeues.length, 1);
+  assert.deepEqual(fixture.calls.canonicalRequeues[0], {
+    turnId: persisted.turnId,
+    expectedTurnRevision: 7,
+    allowedFailureClass: 'transient'
+  });
+  assert.equal(fixture.calls.legacyRequeues.length, 0);
+});
+
+test('canonical non-transient failed v3 replay remains terminal without either requeue writer', () => {
+  const envelope = v3DirectEnvelope();
+  const persisted = pinnedCanonicalTurn(envelope, {
+    authorityLineageKey: envelope.authority.lineageKey,
+    state: 'failed',
+    turnRevision: 8,
+    errorJson: JSON.stringify({ failureClass: 'terminal' })
+  });
+  const fixture = orchestrationFixture({ turns: [persisted] });
+
+  const replay = fixture.orchestrator.accept(envelope);
+
+  assert.equal(replay.state, 'failed');
+  assert.equal(fixture.calls.canonicalRequeues.length, 0);
+  assert.equal(fixture.calls.legacyRequeues.length, 0);
+});
+
+test('version-zero failed replay keeps the legacy transient requeue path', () => {
+  const envelope = directEnvelope({ protocolVersion: 1, turnId: 'turn_legacy_failed_replay' });
+  const persisted = {
+    turnId: envelope.turnId,
+    characterId: 'yuqi',
+    state: 'failed',
+    resultAuthorityVersion: 0,
+    envelopeJson: JSON.stringify(envelope)
+  };
+  const fixture = orchestrationFixture({ turns: [persisted] });
+
+  const replay = fixture.orchestrator.accept(envelope);
+
+  assert.equal(fixture.calls.legacyCreates.length, 1);
+  assert.deepEqual(fixture.calls.legacyRequeues, [persisted.turnId]);
+  assert.equal(replay.state, 'queued');
+  assert.equal(fixture.calls.canonicalRequeues.length, 0);
+  assert.deepEqual(fixture.calls.legacyRequeues, [persisted.turnId]);
+});
+
+test('wire v1 and non-Yuqi turns remain version zero', () => {
+  const fixture = orchestrationFixture();
   const wireV1 = fixture.orchestrator.accept(directEnvelope({
     protocolVersion: 1,
     turnId: 'turn_wire_v1',

@@ -1,5 +1,5 @@
 import { commitVerifiedFacts } from './evidence-memory.mjs';
-import { contentHash } from './protocol.mjs';
+import { contentHash, validateEnvelope } from './protocol.mjs';
 import { buildEvidencePack } from './retrieval.mjs';
 import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route-policy.mjs';
@@ -52,6 +52,16 @@ function evidenceMessages(messages, batch) {
   }
   return [...byId.values()]
     .sort((left, right) => Number(left?.sentAt || 0) - Number(right?.sentAt || 0));
+}
+
+function failureClassForTurn(turn) {
+  if (!turn?.errorJson) return null;
+  try {
+    const failure = JSON.parse(turn.errorJson);
+    return typeof failure?.failureClass === 'string' ? failure.failureClass : null;
+  } catch {
+    return null;
+  }
 }
 
 const CANONICAL_TURN_KINDS = new Set([
@@ -430,19 +440,15 @@ export class YuqiOrchestrator {
     return this;
   }
 
-  accept(envelope) {
+  accept(rawEnvelope) {
+    const envelope = validateEnvelope(rawEnvelope);
     if (this.promotionController && !this.releaseExecutorAttached) {
       throw new Error('canonical release executor is not attached');
-    }
-    if (envelope?.characterId === 'yuqi'
-      && Number(envelope?.protocolVersion) === 3
-      && CANONICAL_TURN_KINDS.has(String(envelope?.kind || ''))) {
-      throw new Error('unsupported protocolVersion: 3');
     }
     const canonical = Boolean(
       this.promotionController
       && envelope?.characterId === 'yuqi'
-      && Number(envelope?.protocolVersion) === 2
+      && [2, 3].includes(Number(envelope?.protocolVersion))
       && CANONICAL_TURN_KINDS.has(String(envelope?.kind || ''))
     );
     let submitted = canonical
@@ -455,8 +461,18 @@ export class YuqiOrchestrator {
           })
         : this.store.submitTurn(envelope);
     if (submitted.state === 'failed') {
-      const recovery = this.store.requeueTransientFailedTurn(submitted.turnId);
-      if (recovery.requeued) submitted = recovery.turn;
+      if (Number(submitted.resultAuthorityVersion || 0) === 1) {
+        if (failureClassForTurn(submitted) === 'transient') {
+          submitted = this.store.requeueCanonicalFailedTurnInternal({
+            turnId: submitted.turnId,
+            expectedTurnRevision: submitted.turnRevision,
+            allowedFailureClass: 'transient'
+          });
+        }
+      } else {
+        const recovery = this.store.requeueTransientFailedTurn(submitted.turnId);
+        if (recovery.requeued) submitted = recovery.turn;
+      }
     }
     if (submitted.state === 'queued' && (!submitted.routeReasons || submitted.routeReasons.length === 0)) {
       const decision = selectTurnRoute({
@@ -478,35 +494,44 @@ export class YuqiOrchestrator {
   }
 
   createCanonicalTurnForEnvelope(envelope) {
+    const exactTurn = this.store.getTurn(envelope.turnId);
+    const exactCanonicalTurn = Number(exactTurn?.resultAuthorityVersion || 0) === 1
+      ? exactTurn
+      : null;
     const retryParentId = envelope?.context?.retry?.retryOfTurnId || null;
     const retryParent = retryParentId ? this.store.getTurn(retryParentId) : null;
     if (retryParentId && !retryParent) {
       throw new Error('missing canonical retry parent');
     }
-    if (retryParent && Number(retryParent.resultAuthorityVersion || 0) !== 1) {
+    if (retryParent
+      && Number(retryParent.resultAuthorityVersion || 0) !== 1
+      && envelope.protocolVersion !== 3) {
       return this.promotionController.createTurn({
         envelope,
         presetVersion: this.presets.current().version,
         annotationSnapshot: {}
       });
     }
-    const selection = retryParent
+    const pinnedTurn = exactCanonicalTurn || retryParent;
+    const selection = pinnedTurn
       ? null
       : this.promotionController.selectPipelinePairForFreshSubject(
           envelope.kind,
           { now: this.clock() }
         );
-    const pair = retryParent
+    const pair = pinnedTurn
       ? {
-          visibleReleaseId: retryParent.authoritativeReleaseId,
-          comparisonReleaseId: retryParent.comparisonReleaseId,
+          visibleReleaseId: pinnedTurn.authoritativeReleaseId,
+          comparisonReleaseId: pinnedTurn.comparisonReleaseId,
           comparisonDirection: comparisonContractForMode(
-            retryParent.comparisonMode
+            pinnedTurn.comparisonMode
           ).comparisonDirection
         }
       : selection.pair;
     const rollout = selection?.rollout || null;
-    const laneKey = laneKeyForEnvelope(envelope);
+    const laneKey = envelope.protocolVersion === 3
+      ? envelope.authority.laneKey
+      : laneKeyForEnvelope(envelope);
     const lane = this.store.getInteractionLane(envelope.characterId, laneKey) || {
       revision: 0,
       localSequence: 0,
@@ -514,14 +539,16 @@ export class YuqiOrchestrator {
       clearedThroughSequence: 0
     };
     const currentBatch = resolveCurrentUserBatch(envelope);
-    const agencySnapshot = this.store.readAgencyAuthoritySnapshotInternal({
-      roleId: envelope.characterId,
-      at: canonicalInteractionAt(envelope, this.clock())
-    });
+    const agencySnapshot = exactCanonicalTurn
+      ? { checksum: exactCanonicalTurn.agencySnapshotChecksum }
+      : this.store.readAgencyAuthoritySnapshotInternal({
+          roleId: envelope.characterId,
+          at: canonicalInteractionAt(envelope, this.clock())
+        });
     const creation = this.store.createCanonicalVisibleTurnInternal({
       envelope,
       rolloutKey: envelope.kind,
-      expectedRolloutRevision: retryParent?.rolloutRevision ?? rollout.revision,
+      expectedRolloutRevision: pinnedTurn?.rolloutRevision ?? rollout.revision,
       authoritativeReleaseId: pair.visibleReleaseId,
       comparisonReleaseId: pair.comparisonReleaseId,
       comparisonDirection: pair.comparisonDirection,
@@ -530,10 +557,14 @@ export class YuqiOrchestrator {
       inputUserBatchId: currentBatch?.batchId
         || envelope.message?.messageId
         || envelope.trigger?.triggerId,
-      inputVisibilitySequence: Number(lane.localSequence || 0),
-      inputClearEpoch: Number(lane.clearEpoch || 0),
+      inputVisibilitySequence: envelope.protocolVersion === 3
+        ? envelope.context.visibilityCursor.localSequence
+        : Number(lane.localSequence || 0),
+      inputClearEpoch: envelope.protocolVersion === 3
+        ? envelope.context.visibilityCursor.clearEpoch
+        : Number(lane.clearEpoch || 0),
       agencySnapshotChecksum: agencySnapshot.checksum,
-      annotationSnapshot: {}
+      annotationSnapshot: exactCanonicalTurn?.annotationSnapshot || {}
     });
     if (creation.status === 'already_committed') {
       return {

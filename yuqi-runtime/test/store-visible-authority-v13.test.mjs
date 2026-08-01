@@ -954,6 +954,15 @@ test('a complete v13 redacted audit shell is restart-valid and non-deliverable',
       assert.equal(outcome.status, 'redacted');
       assert.equal(outcome.terminalDisposition, 'visible');
       assert.equal(outcome.group.itemCount, 1);
+      const bridgeResult = store.loadCanonicalBridgeResultInternal(fixture.turnId);
+      assert.deepEqual(Object.keys(bridgeResult).sort(), [
+        'authorityLineageKey', 'commitChecksum', 'deliverable',
+        'status', 'turnId', 'visibleGroupId'
+      ].sort());
+      assert.equal(bridgeResult.status, 'redacted');
+      assert.equal(bridgeResult.deliverable, false);
+      assert.equal(bridgeResult.turnId, fixture.turnId);
+      assert.equal(bridgeResult.visibleGroupId, fixture.groupId);
       assert.throws(
         () => store.visibleDeliveryPayload(fixture.groupId, 'phone'),
         /redacted/
