@@ -6143,11 +6143,13 @@ git commit -m "feat: persist Android conversation visibility cursor"
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
 - Modify: `tests/payment-batch-bridge-contract.test.mjs`
 - Modify: `yuqi-runtime/src/protocol.mjs`
+- Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Modify: `yuqi-runtime/test/protocol-store.test.mjs`
+- Modify: `yuqi-runtime/test/v3-runtime-recovery.test.mjs`
 
 **Interfaces:**
 - Consumes: Task 12 cursor and the existing complete user batch.
-- Produces: shared `al-authority-v1` IDs; protocol v3 `authority` plus `context.visibilityCursor`; validation that maps v3 claims into the same Task 10 internal creation contract without selecting its authority version; a receipt-derived result containing `authorityLineageKey`, `visibleGroupId`, lineage/turn/lane revisions, `inputVisibilitySequence`, `inputClearEpoch`, `generationFingerprint`, `releaseId`, `commitPayloadVersion`, `commitChecksum`, and the independently derived `terminalDisposition`.
+- Produces: shared `al-authority-v1` IDs; protocol v3 `authority` plus `context.visibilityCursor`; validation that maps v3 claims into the same Task 10 internal creation contract without selecting its authority version; activation of Task 11's previously dormant protocol-v3 canonical execution arm only after normalization succeeds; a receipt-derived result containing `authorityLineageKey`, `visibleGroupId`, lineage/turn/lane revisions, `inputVisibilitySequence`, `inputClearEpoch`, `generationFingerprint`, `releaseId`, `commitPayloadVersion`, `commitChecksum`, and the independently derived `terminalDisposition`.
 
 - [ ] **Step 1: Write red Java and Node bridge contract tests**
 
@@ -6232,6 +6234,14 @@ test('protocol v3 result uses the persisted commit receipt and never derives gro
     /receipt required/
   );
 });
+
+test('a normalized protocol v3 Yuqi turn enters the existing canonical v1 path', async () => {
+  const envelope = normalizeEnvelope(validProtocolV3Envelope());
+  const result = await orchestrator.execute(envelope);
+  assert.equal(store.getTurn(result.turnId).resultAuthorityVersion, 1);
+  assert.equal(store.spy.createCanonicalVisibleTurnInternal.calls.length, 1);
+  assert.equal(store.spy.createTurnWithReleasePinInternal.calls.length, 0);
+});
 ```
 
 - [ ] **Step 2: Run focused bridge tests red**
@@ -6239,7 +6249,7 @@ test('protocol v3 result uses the persisted commit receipt and never derives gro
 Run:
 
 ```powershell
-node --test tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/test/protocol-store.test.mjs
+node --test tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs
 cd android
 .\gradlew.bat testDebugUnitTest --tests "*BridgeInputTest" --tests "*RoomBridgeMirrorTest" --no-daemon --no-problems-report
 ```
@@ -6289,6 +6299,14 @@ must not add a second authority-version option to any store API. After v3
 normalization succeeds, Task 11 passes the normalized envelope to the already
 implemented `createCanonicalVisibleTurnInternal()` and the store independently
 re-derives the lineage. A claim mismatch fails before turn creation.
+
+Task 13 changes the Task 11 orchestrator eligibility guard from the single
+accepted wire version `2` to the closed set `{2, 3}` and removes the temporary
+explicit v3 rejection. It does not change release-pair, authority-version,
+retry, or version-0 compatibility rules. The runtime recovery test must prove
+that valid normalized v3 enters the existing canonical v1 creator, while wire
+v1, non-Yuqi, invalid v3, and persisted version-0 recovery stay on their prior
+paths.
 
 Bridge results return:
 
@@ -6351,7 +6369,7 @@ Expected: PASS for v2 compatibility, v3 receipt authority, complete batches, pay
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add android/app/src/main/java/com/siyi/al/execution/TurnSubmission.java android/app/src/main/java/com/siyi/al/execution/AuthorityIdentity.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeResult.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/test/java/com/siyi/al/execution/AuthorityIdentityTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/src/protocol.mjs yuqi-runtime/test/protocol-store.test.mjs
+git add android/app/src/main/java/com/siyi/al/execution/TurnSubmission.java android/app/src/main/java/com/siyi/al/execution/AuthorityIdentity.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeResult.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/test/java/com/siyi/al/execution/AuthorityIdentityTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/src/protocol.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs
 git commit -m "feat: carry visible conversation authority through bridge"
 ```
 
