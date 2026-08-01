@@ -37,12 +37,18 @@ compilation.
   selector.
 - A fresh v3 turn must present `localSequence == persistedLane.localSequence +
   1`; an exact replay must equal its stored pin. Task 13 never accepts arbitrary
-  jumps. The sole exception is the first v3 turn on a lane: it may adopt a
-  completely verified v2 visibility watermark and advance once in the same lane
-  CAS; after that bootstrap the strict `+1` rule is permanent.
-- A v3 clear epoch must equal the PC lane clear epoch. A mismatch fails before
-  writes with `CLEAR_EPOCH_SYNC_REQUIRED`. Authenticated clear synchronization
-  remains Task 20; services must not be released before Task 20 closes it.
+  jumps after a v3 pin exists. The sole migration exception is the first v3 turn
+  on a lane: Android supplies its persisted v2 native/UI watermark, while PC
+  verifies the referenced terminal turn/group identities, cursor-internal
+  ordering, and the one-time lane CAS. PC v2 rows do not contain an independent
+  Android native/UI sequence fact, so Task 13 must not pretend to compare that
+  migration number with `turns.input_visibility_sequence`.
+- A v3 clear epoch and `clearedThroughSequence` must exactly equal the PC lane
+  clear authority. Any mismatch fails before writes with
+  `CLEAR_EPOCH_SYNC_REQUIRED`; an ordinary turn may never create or advance a
+  clear boundary, including during first-v3 bootstrap. Authenticated clear
+  synchronization remains Task 20; services must not be released before Task 20
+  closes it.
 - `lineageRevision`, `turnRevision`, and `laneRevision` are independent values.
   Android must never copy one into another.
 - A protocol-v3 result is built only from a validated receipt/group/lineage/
@@ -121,10 +127,16 @@ assert.equal(Object.hasOwn(v3, 'resultAuthorityVersion'), false);
 Cover direct and every automatic kind. Automatic validation must not return
 before checking the top-level cursor. V3 direct requires full
 `currentBatch.messages`; `messageIds` must equal those messages by count, order,
-and canonical ID. Validate:
+and canonical ID, and the last normalized batch message must equal the complete
+normalized top-level message projection, including speaker, recipient, and
+attachments. V3 direct context accepts only `scene`, `currentBatch`, `retry`,
+`payment`, and `visibilityCursor`; automatic top-level context accepts only
+`visibilityCursor`. V1/v2 keep their existing normalization. Validate:
 
 - `uiAppliedSequence <= nativeCompletedSequence < localSequence` for a fresh
   submission;
+- for positive watermarks, equal native/UI sequence means equal turn/group
+  identity, and the same canonical group identity cannot carry two sequences;
 - `clearedThroughSequence <= localSequence`;
 - canonical turn/group ID nullability is paired with sequence zero/nonzero. The
   first-v3 bootstrap alone may carry a verified legacy v2 turn anchor at
@@ -201,7 +213,8 @@ assert.equal(retry.turn.authorityLineageKey, first.turn.authorityLineageKey);
 ```
 
 Also cover exact same-turn replay, wrong latest parent, foreign lineage, changed
-batch, cursor sequence jump, prior group ID mismatch, and
+batch, cursor sequence jump, prior group ID mismatch, a clear watermark change
+without authenticated Task 20 synchronization, and
 `CLEAR_EPOCH_SYNC_REQUIRED`, each with a before/after database snapshot.
 Add a retry whose remote turn ID changes while its current message,
 `retry.canonicalMessageId`, batch source, and parent root remain identical. A
@@ -211,12 +224,27 @@ replace its cursor from the new lane state.
 
 Cover a real bootstrap chain: completed authority-version-0 v2 history with a
 legacy turn cursor, then the first v3 turn, restart, then a second v3 turn. The
-first v3 claim may adopt prior native/UI/clear watermarks only when every legacy
-turn/message belongs to the same role, device, and lane and is terminal. A
+first v3 claim may adopt prior native/UI watermarks only when every referenced
+legacy turn/message belongs to the same role, device, and lane and is terminal;
+its clear watermark must still equal PC clear authority. A
 sequence-zero legacy fallback ID is allowed only in this branch. A prior
 canonical group is validated through the ordinary group authority. Missing,
 foreign, pending, or mixed anchors fail before writes. Once a v3 pin exists on
 the lane, legacy bootstrap is permanently disabled.
+
+For an open v3 lineage, a new retry member additionally requires the current
+latest parent to be persistently `failed` with native boolean
+`error_json.retryAllowed === true`. Queued/running parents, missing permission,
+and forged non-boolean permission fail before writes. A committed or redacted
+lineage still returns its existing outcome after immutable member validation and
+does not require retry permission. A delayed child prepared before that terminal
+transition keeps its historical claim: require
+`claimedLineageRevision === parent.lineageRevisionAtCreation + 1`, not the now
+advanced terminal lineage revision plus one. Changed parent, batch, pins, or
+historical claim still fail before returning the terminal outcome. After a retry
+commits, replaying the exact original member resolves the same receipt and
+authoritative retry turn; it may not strand an at-least-once relay message by
+insisting that the lookup member is the committed member.
 
 Legacy automatic anchors use the same historical wire normalization as the turn
 itself: local `cloud_*`/`plan_*` IDs map to `turn_cloud_*`/`turn_plan_*`. Native
@@ -249,18 +277,32 @@ Inside the existing immediate canonical creation transaction:
 3. For a first root, require claim revision 1 and no prior lineage.
 4. For a retry, require `retryOfTurnId == current latestTurnId`, the same root and
    lineage, and claim revision exactly `current.revision + 1`.
-5. Require matching clear epoch. For an established v3 lane, require fresh
+5. Require matching clear epoch and cleared-through watermark for every v3
+   creation. For an established v3 lane, require fresh
    `localSequence == lane.localSequence + 1` and prior native/UI identities that
    join retained canonical groups. For the first v3 turn only, verify the full
    authority-version-0/canonical-v2 bootstrap described in Step 3, require the
-   fresh sequence to be exactly one above the verified prior watermark, and
-   adopt it without a separate migration write.
+   fresh sequence to be exactly one above the internally consistent Android v2
+   native/UI watermark, and adopt it without a separate migration write. Do not
+   compare a canonical-v2 group to its PC input sequence as if that were an
+   Android-applied watermark.
 6. In the same lane CAS used by canonical creation, copy only the verified
    monotonic prior native/UI group watermarks from the cursor and advance
    `lane.localSequence` to the fresh pinned input sequence. This must not be a
    second lane write or a second revision increment.
 7. Let the store calculate and write revisions; never use a claim as a caller CAS
    token and never accept an authority-version option.
+
+For exact member replay, validate that member's complete immutable envelope and
+pins first, then resolve a committed outcome by lineage. The receipt's
+authoritative turn may be a later retry member. For a new member on an open v3
+lineage, validate the persisted parent failure and `retryAllowed:true` before
+the lineage/lane CAS, and require the claim to equal the current lineage revision
+plus one. For a delayed child whose lineage is already committed or redacted,
+validate the historical claim against the declared parent's
+`lineageRevisionAtCreation + 1`, then return the existing outcome before open-
+lineage retry permission and mutable lane checks. V2 retry behavior remains
+unchanged.
 
 `loadCanonicalBridgeResultInternal(turnId)` must join receipt, group, manifest,
 lineage, lane, authoritative turn, ordered items, ordered actions, and release.
@@ -663,6 +705,10 @@ Use distinct result values `lineage=2`, `turn=4`, `lane=8`. Cover:
 - LAN and cloud verified PC terminal failure, then restart and retry, creates one
   child/revision; local configuration/HTTP/timeout/process errors retain the
   parent remote ID and revision. Forged or changed remote-failure proof conflicts.
+- `retryAllowed:true` survives PC status, LAN/cloud parsing, Room checkpoint, and
+  restart without coercion; missing, false, null, numeric, and string variants
+  do not authorize a child. Changing only this field changes the raw-status
+  checksum and conflicts with an already persisted proof.
 
 Run red:
 
@@ -691,6 +737,20 @@ proof contains the known remote member ID, pinned lineage, terminal failed
 state/error, retry permission, canonical raw-status checksum, and authenticated
 route. LAN creates it only after parsing a valid PC terminal status for a known
 member; encrypted cloud `BACKLOG_FAILED` uses the identical validator.
+
+The retry permission has one authority source: the native JSON boolean
+`turns.error_json.retryAllowed` written by the PC canonical failure transaction.
+The v3 terminal-status projection must always expose a closed boolean
+`retryAllowed`; it is `true` only when the persisted field exists and is exactly
+the JSON boolean `true`. Missing, `null`, numeric, string, or otherwise malformed
+values are fail-closed as `false` and can never be coerced. A production writer
+may grant retry only by passing `retryAllowed: true` in the same
+`recordCanonicalTurnFailureInternal` transaction that persists the canonical
+failure class. The status endpoint, LAN client, cloud client, Android router,
+and Room checkpoint must copy this boolean verbatim; none may derive or upgrade
+it from an exception class, HTTP code, timeout, transport retryability, or local
+policy. The canonical raw-status checksum covers the field.
+
 `commitVerifiedRemoteFailure` atomically stores that metadata-only proof in the
 attempt bridge checkpoint and terminates the attempt/turn as retryable without
 writing a commit receipt, group, part/action, authority revision, or cursor.
