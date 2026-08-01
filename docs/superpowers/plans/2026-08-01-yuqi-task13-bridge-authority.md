@@ -378,15 +378,73 @@ git commit -m "feat: verify v3 bridge authority claims"
 - Modify: `yuqi-runtime/src/local-server.mjs`
 - Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
 - Modify: `yuqi-runtime/src/result-outbox.mjs`
+- Modify: `yuqi-runtime/src/orchestrator.mjs`
+- Modify: `yuqi-runtime/src/turn-dispatcher.mjs`
+- Create: `tests/fixtures/canonical-failure-status-v1.json`
 - Modify: `yuqi-runtime/test/bridge-authority-v3.test.mjs`
 - Modify: `yuqi-runtime/test/local-server.test.mjs`
 - Modify: `yuqi-runtime/test/cloud-relay-pump.test.mjs`
 - Modify: `yuqi-runtime/test/result-outbox.test.mjs`
+- Modify: `yuqi-runtime/test/turn-dispatcher.test.mjs`
+- Modify: `yuqi-runtime/test/v3-runtime-recovery.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
+- Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 
 **Interfaces:**
 
-- `publicTurnStatus(turn, { canonicalResult, stages, clock })` uses a closed
-  canonical result when version 1 is terminal; version 0 retains its old parser.
+- `publicTurnStatus(turn, { canonicalResult, canonicalFailure, stages, clock })`
+  uses a closed canonical result for committed version 1 and the closed failure
+  below for wire-v3 failed version 1. Version 0 and wire-v2 failure retain their
+  old parser byte-for-byte.
+- `projectCanonicalFailureForWire(authority)` returns the one closed v3 failure
+  value used by LAN and cloud. `rawStatusChecksum` is the lowercase SHA-256 of
+  the canonical JSON of every field below except `rawStatusChecksum` itself:
+
+  ```js
+  {
+    protocolVersion: 3,
+    type: 'BACKLOG_FAILED',
+    turnId,
+    roleId,
+    authorityLineageKey,
+    lineageRevision,
+    turnRevision,
+    laneKey,
+    laneRevision,
+    retryOfTurnId,       // string | null
+    inputVisibilitySequence,
+    inputClearEpoch,
+    generationFingerprint,
+    releaseId,
+    state: 'failed',
+    errorCode,
+    failureClass,       // transient | deterministic
+    retryAllowed,       // native JSON boolean
+    failedAt,
+    rawStatusChecksum   // excluded from its own hash basis
+  }
+  ```
+
+  The value is a closed-key object with exactly the listed keys. Hash bytes are
+  UTF-8 `canonicalJson` as defined by `protocol.mjs`: object keys are recursively
+  sorted lexicographically and array order is preserved. Transport wrappers,
+  including `ok`, `recoveryAckSeq`, encryption metadata, and relay IDs, are not
+  in the hash basis. `tests/fixtures/canonical-failure-status-v1.json` contains
+  native-true, native-false, non-ASCII identity, retry-parent, and both error-code
+  vectors with exact expected `rawStatusChecksum`. Node and Android tests load
+  every vector. Unknown/missing keys, non-native booleans, and a mismatched
+  checksum reject before any Room write.
+
+  `lineageRevision` is the latest member's persisted
+  `lineageRevisionAtCreation`; `turnRevision` is its post-failure revision and
+  `laneRevision` is the member's persisted lane pin. `errorCode` is exactly
+  `YUQI_TRANSIENT_EXECUTION_FAILURE` for `transient` and
+  `YUQI_DETERMINISTIC_EXECUTION_FAILURE` for `deterministic`; raw provider
+  messages and stacks remain PC-local and are not part of the wire value. The loader requires
+  the turn to be the latest failed member of an open lineage, requires the
+  current lineage revision to equal that member's creation revision, and reads
+  all pins from persisted authority rows. It never trusts a caller-supplied
+  failure object.
 - `validateAuthorityDeliveryReceipt(value)` validates one group receipt and
   permits zero items for `skip` because group checksum is the authority.
 - `store.confirmAuthorityCloudDeliveryInternal(receipt, peerId)` confirms only
@@ -394,8 +452,183 @@ git commit -m "feat: verify v3 bridge authority claims"
 - `store.confirmCanonicalV2DeliveryInternal(receipt, peerId)` maps a legacy
   receipt back to one canonical group and confirms only a complete exact
   projection; it never calls the authority-version-0 receipt writer.
+- `store.loadCanonicalFailureForBridgeInternal(turnId)` is the only PC loader for
+  the failure authority above. `store.recordCanonicalTurnFailureInternal()` is
+  its only production writer and, for a wire-v3 turn, requires an explicit
+  native boolean `retryAllowed` in the same transaction as the failed state.
+- `store.list/claim/completeCanonicalFailureCloudDeliveryInternal(...)` own the
+  metadata-only canonical-failure outbox. Claim returns a persisted lease and
+  complete requires that exact lease. All legacy delivery APIs hard-require
+  `turns.result_authority_version = 0`; `authority_group_id IS NULL` alone is not
+  a legacy discriminator.
+- `store.supersedeCanonicalFailureDeliveryInternal(...)` is called inside v3
+  child creation. It makes an unsent/pending parent failure target ineligible for
+  any new send without deleting its proof. If an already-started enqueue later
+  succeeds, the same relay ID may be recorded as `superseded_mailboxed`; it is
+  never enqueued again. An already `mailboxed` row remains immutable evidence.
+- `store.quarantineCanonicalCloudDeliveryInternal(...)` changes only the exact
+  corrupt group/failure delivery target to `quarantined` and appends a redacted
+  diagnostic. It never changes a committed/failed turn into a legacy state.
 
-- [ ] **Step 1: Write LAN/cloud red tests against real canonical commits**
+- [ ] **Step 1: Write red tests for the reachable PC failure authority**
+
+Use `TurnDispatcher` with a real canonical wire-v3 turn and a production-shaped
+throwing release adapter; do not call a test-only store failure helper. Prove:
+
+- the PC classifier is the only policy source: a known transient model/provider
+  execution failure is persisted terminal `failed` with native boolean
+  `retryAllowed:true`, while a deterministic execution failure is persisted with
+  native boolean `retryAllowed:false`;
+- wire-v3 failures are not immediately requeued under the same turn ID. Wire-v2
+  and authority-version-0 retain their existing same-ID transient recovery;
+- `orchestrator.accept()` does not requeue a wire-v3 failed member whose persisted
+  error has `retryAllowed:true`; a canonical requeue writer rejects that state so
+  a visible permission cannot later be revoked by clearing `error_json`;
+- the v3 failure transaction writes exactly one metadata-only
+  `{turnId, peerId}` cloud target with the current persisted `sync_cursors`
+  acknowledgement. Exact replay is idempotent; a changed failure or peer is a
+  zero-write conflict;
+- the pure failure projection survives store close/reopen and LAN/cloud use the
+  exact same `rawStatusChecksum`. Changing only `retryAllowed`, using a missing,
+  null, numeric, or string value, or changing any identity/pin changes the
+  checksum or is rejected; none can authorize a child;
+- creating an authorized v3 child transactionally supersedes a parent
+  `waiting`/`pending` failure target. A pending enqueue that has already crossed
+  the network boundary may record only `superseded_mailboxed`; an already
+  `mailboxed` target remains evidence. Neither is sent again. Child commit creates
+  only the child's group target and never recreates the parent target;
+- capture before/after row snapshots for `waiting -> pending -> mailboxed`,
+  `waiting -> superseded`, and
+  `pending -> superseded -> superseded_mailboxed`. Run two outbox instances
+  concurrently against the same unexpired lease and prove one claim CAS, one
+  enqueue call, one relay identity, and stable restart state. Also cover crash
+  before enqueue, expired-lease reclaim with the same relay identity, old-lease
+  late success after reclaim (completion rejected), and old-lease late success
+  after child supersession (only `superseded_mailboxed`);
+- cancelled/redacted/quarantined lineages and a successful canonical group never
+  enter the failure or legacy null-group outbox.
+- close/reopen v13 and v14 fixtures cover every legal failure-target state,
+  every illegal `(resultAuthorityVersion, authorityGroupId, state)` tuple,
+  corrupt payload/checksum/peer/latest-member joins, and child supersession.
+  Scoped operations perform one target/lineage validation and zero full scans.
+
+Failure policy is intentionally PC-owned and closed. For wire v3, `transient`
+means the existing PC classifier recognized a model/provider execution failure
+as timeout, capacity/rate-limit, temporary unavailable, network, or reset. That
+known remote execution failure is terminal for that remote member and grants one
+persisted child permission. `deterministic` is terminal without permission.
+Android HTTP errors, relay timeouts, missing configuration, process death, and
+unknown remote outcomes never call this writer and continue to reuse the same
+remote ID. Do not add an Android- or transport-owned retry classifier.
+
+Reuse `cloud_deliveries`; Task13B has no schema-version change. Its authority is
+the joined turn plus the group discriminator:
+
+- version 0 + null group = legacy target;
+- version 1 + non-null group = canonical committed-result target;
+- version 1 + null group + wire-v3 latest terminal failed member = canonical
+  failure target.
+
+Extend v13/v14 reopen/scoped invariants to reject every other combination and to
+validate peer, lineage/latest member, failed state, retry boolean, payload/checksum
+and state lifecycle. Permitted failure-target states are `waiting`, `pending`,
+`mailboxed`, `superseded`, `superseded_mailboxed`, and
+`quarantined`; state-specific payload, relay ID, attempt and timestamp rules are
+closed. No authority row is inferred merely from a null group.
+
+The relay `messageId` and idempotency key are the same deterministic value:
+`stableId('relay_failure', turnId + ':' + peerId + ':' + rawStatusChecksum)`.
+The local send right uses a separate persisted lease inside `payload_json`:
+`{failure, lease:{leaseId,leaseAttempt,leasedAt}}`. The lease is transport
+metadata and is excluded from `rawStatusChecksum`. `leaseAttempt` is the
+monotonic delivery `attempts` value and `leaseId` is
+`stableId('failure_lease', turnId + ':' + peerId + ':' + rawStatusChecksum + ':' + leaseAttempt)`.
+
+`claimCanonicalFailureCloudDeliveryInternal` uses an immediate transaction and
+one compare-and-swap to claim either `waiting` or a `pending` lease whose
+`updated_at` is at least `FAILURE_DELIVERY_LEASE_MS = 60000` ms old. It increments
+the attempt, writes the closed lease, and returns it. A non-expired `pending` row
+is not claimable or selectable by another flusher. Only the holder of the exact
+current `leaseId + leaseAttempt + rawStatusChecksum` may make the enqueue call
+and complete it. Completion CASes `pending -> mailboxed`; if child creation
+CASed the same leased row to `superseded` while the enqueue was in flight, that
+same lease may CAS only `superseded -> superseded_mailboxed`. No other state can
+enter either mailboxed state, and no `superseded*` target is selected again.
+
+Two live flushers therefore produce one HTTP call while the lease is valid. A
+process crash before or during enqueue is recovered only after lease expiry;
+that may produce another HTTP call, so cross-crash exactly-once is not claimed.
+Every lease attempt nevertheless uses the same relay message ID/idempotency key,
+and the relay's at-least-once idempotency is the external duplicate boundary. An
+old lease that returns after a newer lease was claimed fails the completion CAS
+and cannot overwrite it. An old lease retained by child supersession may record
+only `superseded_mailboxed` with the same stable relay ID.
+
+The failure-target state contract is exact:
+
+| State | Required retained fields | May the outbox select it? |
+| --- | --- | --- |
+| `waiting` | no payload/checksum/relay ID; zero attempts | yes |
+| `pending` | exact failure/checksum plus one closed active or expired lease; no relay ID | no; only the transactional claim API may reclaim an expired lease |
+| `mailboxed` | exact payload/checksum/relay ID and delivered time | no |
+| `superseded` | no relay ID; payload and checksum are either both absent (from waiting) or the exact pair (from pending) | no |
+| `superseded_mailboxed` | exact payload/checksum/relay ID and delivered time from an enqueue already in flight | no |
+| `quarantined` | pre-quarantine delivery fields plus one linked redacted diagnostic | no |
+
+Canonical failure has no PC-side `confirmed` state in Task13: Android ACKs the
+relay item only after its Room proof transaction, while PC preserves `mailboxed`
+as immutable enqueue evidence. A future acknowledgement protocol must be a new
+closed contract, not reuse a group receipt.
+
+Run the first red gate:
+
+```powershell
+node --test yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs yuqi-runtime/test/bridge-authority-v3.test.mjs yuqi-runtime/test/result-outbox.test.mjs
+```
+
+Expected red: the dispatcher requeues transient v3 failures, no production
+writer stores `retryAllowed`, and a failed canonical turn has no cloud target.
+
+- [ ] **Step 2: Implement the failure writer, outbox lifecycle, and checksum**
+
+Keep classification in `turn-dispatcher.mjs`; pass the explicit boolean into the
+store transaction. Normalize the persisted v3 error to a closed PC record with
+`name`, `code`, bounded `message`, `failureClass`, and native boolean
+`retryAllowed`. Only the wire projection omits message/stack. The transaction
+must CAS turn state/revision, validate lineage/latest member and release pins,
+write the failure, read the same-device sync cursor, and insert the failure
+delivery target atomically. A fault after every write boundary rolls everything
+back.
+
+`TurnDispatcher` terminalizes wire-v3 failures once. It retains the existing
+same-turn retry for wire-v2/version-0. `orchestrator.accept()` returns an exact
+stored v3 failure unchanged so repeated input can poll it; only wire-v2
+canonical rows may use the existing canonical same-turn recovery. The store
+rejects same-turn requeue for every wire-v3 turn, and also rejects any row whose
+persisted `retryAllowed === true`.
+
+For a result-authority-version-1 turn whose persisted normalized envelope is
+protocol v2, retain the pre-Task13 failure/status/requeue behavior byte-for-byte.
+It never creates a canonical-failure target and never calls
+`loadCanonicalFailureForBridgeInternal` or
+`projectCanonicalFailureForWire`. The prohibition on parsing `reply_json` or
+`error_json` applies only to protocol-v3 authority terminal paths. Add
+canonical-internal wire-v2 transient and deterministic failure, restart, exact
+status, duplicate, and no-failure-outbox regression tests in addition to v0.
+
+Build and validate the closed failure object in
+`bridge-result-projector.mjs`. LAN status and cloud failure outbox load it through
+`loadCanonicalFailureForBridgeInternal`; they do not parse arbitrary
+`turn.errorJson`. The raw checksum covers the full closed object, including the
+native boolean, and excludes only itself and transport-only `recoveryAckSeq`.
+
+All legacy null-group register/prepare/attempt/mailbox/confirm/list methods must
+join the turn and require authority version 0. Add separate canonical-failure
+methods rather than a boolean option on legacy methods. ResultOutbox globally
+age-sorts committed-group, canonical-failure, and legacy targets, but each target
+uses only its authority-specific loader and writers.
+
+- [ ] **Step 3: Write LAN/cloud red tests against real canonical commits**
 
 Cover all of the following with real store rows, not mocked reply JSON:
 
@@ -416,6 +649,16 @@ Cover all of the following with real store rows, not mocked reply JSON:
 - malformed raw v3 is not ACKed and creates no turn; a terminal canonical join
   failure after durable acceptance keeps the input ACK, quarantines that group
   delivery with a diagnostic, emits no output, and never falls back to legacy;
+- malformed raw v3 with an otherwise valid recovery peer performs zero envelope
+  reconciliation, zero store lookup/write, zero stale suppression, and zero ACK;
+- an exact normalized v3 duplicate is ACKed only when its persisted
+  `envelopeChecksum` matches; a same-turn-ID envelope with changed authority,
+  batch, cursor, release pin, or checksum is `BRIDGE_AUTHORITY_CONFLICT`, is not
+  ACKed, and produces zero duplicate/audit writes. V0/v2 duplicate behavior is
+  byte-compatible;
+- a real dispatcher failure is exposed as the same closed `BACKLOG_FAILED` value
+  through LAN and encrypted cloud, including exact `rawStatusChecksum` and
+  `retryAllowed`; store restart does not change either;
 - canonical-v2 three-message visible, every closed action kind, action-only, and
   skip follow the projection table below; old item/simple receipts are replay-
   safe and any partial or changed receipt conflicts.
@@ -427,9 +670,10 @@ node --test yuqi-runtime/test/bridge-authority-v3.test.mjs yuqi-runtime/test/loc
 ```
 
 Expected red: canonical v2 cloud registration throws, LAN reads `reply_json`,
-and the v3 receipt fields are incomplete.
+the v3 receipt fields are incomplete, validation happens after reconciliation,
+and checksum-conflict ACK is too broad.
 
-- [ ] **Step 2: Implement one pure v2/v3 projector**
+- [ ] **Step 4: Implement one pure v2/v3 projector**
 
 For wire v3, return the closed canonical result verbatim plus transport-only
 relay metadata. For wire v2, use this deterministic compatibility table:
@@ -453,9 +697,12 @@ no-op applied path defined in 13C.
 
 Both `local-server.mjs` and `result-outbox.mjs` must call the same projector.
 In-progress turns continue to use ordinary nonterminal status without inventing
-a committed result.
+a committed result. A canonical failed turn calls the failure projector from
+Step 2. No protocol-v3 authority-version-1 terminal path may parse `reply_json`
+or directly parse `error_json` in `turn-status.mjs`; the explicit protocol-v2
+compatibility branch above remains byte-identical.
 
-- [ ] **Step 3: Close canonical cloud registration and receipt routing**
+- [ ] **Step 5: Close preflight, cloud registration, quarantine, and receipts**
 
 After `dispatcher.accept()`:
 
@@ -484,6 +731,13 @@ maximum acknowledged sync watermark, so accept/restart/additional valid
 reconciliation/later commit remain correct without a new schema field. Tests
 must cover slow reconciliation, accept/restart/commit, a foreign peer, and an
 invalid v3 with valid peer and zero total database changes.
+
+Stale proactive suppression occurs only after Step 1 validation and Step 2
+identity agreement. It may never ACK malformed raw input. If `dispatcher.accept`
+reports a checksum conflict, cloud treats it as an exact duplicate only after a
+read proves the persisted `envelopeChecksum` equals the checksum of the same
+normalized envelope. Any changed v3 authority/batch/pin remains unacknowledged
+and has no diagnostic/duplicate side effect.
 
 Define the v3 applied receipt:
 
@@ -516,13 +770,51 @@ no semantic result. Cloud projection failure marks only that delivery
 legacy result or delivery API. Invalid input/claim is not ACKed; a previously
 durably accepted input remains ACKed even if its later output is quarantined.
 
-- [ ] **Step 4: Run Task 13B gate green and commit**
+Apply the same rule to a canonical failure target: corrupt lineage/member/error
+or checksum joins quarantine only that failure delivery and emit no payload.
+`ResultOutbox` must not swallow the exception and retry forever. Redacted or
+cancelled lineages return 410/no semantics on LAN and cancel or quarantine any
+unsent failure target. Group redaction never falls through to failure or legacy.
+
+When a v3 retry child is created, supersede the parent's unsent failure target in
+the same creation transaction after immutable proof validation but before the
+lineage/lane CAS commits. A child creation rollback also rolls this state back.
+An exact child replay does not rewrite the target. The failure payload may have
+already reached Android; its stable checksum and Android's one-use checkpoint
+make that harmless, while the PC outbox never originates a second delivery.
+
+- [ ] **Step 6: Run Task 13B gate green and commit**
 
 Run the Step 1 command, then:
 
 ```powershell
 node --test yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs
 ```
+
+Then run the complete focused gate in one process:
+
+```powershell
+node --test yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/bridge-authority-v3.test.mjs yuqi-runtime/test/local-server.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs
+```
+
+Required counterexample evidence before commit:
+
+1. real dispatcher transient failure -> restart -> identical LAN/cloud failure
+   checksum -> one authorized child;
+2. deterministic/false and malformed boolean variants never create a child;
+3. invalid raw v3 + valid recovery produces zero reconciliation/store/ACK;
+4. changed valid-shape v3 checksum conflict produces zero ACK/write;
+5. waiting, pending, mailboxed, and enqueue-race parent failure targets each
+   follow the closed CAS/lease supersession lifecycle; two concurrent flushers
+   under one unexpired lease produce one enqueue, while crash/reclaim may repeat
+   HTTP only with the same deterministic relay identity;
+6. corrupt committed and corrupt failure joins quarantine once, do not retry,
+   and never use `reply_json`/legacy delivery;
+7. version-0 LAN/cloud output and duplicate handling remain byte-identical;
+8. canonical-internal wire-v2 transient/deterministic/restart status and
+   duplicates remain byte-identical and never enter the failure outbox;
+9. 50 mixed group/failure/legacy deliveries preserve global age fairness and
+   use scoped validation with zero full-database scans.
 
 Stage only Task 13B files and commit:
 
@@ -560,6 +852,7 @@ git commit -m "feat: project canonical bridge results across transports"
 - Modify: `android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
+- Create: `android/app/src/test/java/com/siyi/al/execution/bridge/CanonicalFailureStatusTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/AlNotificationPolicyTest.java`
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
@@ -574,8 +867,9 @@ git commit -m "feat: project canonical bridge results across transports"
 - `ExecutionEngineStore.commitBridgedTerminal(turnId, attemptId, result, now) ->
   DeliveryDisposition` is the only v3 result writer.
 - `ExecutionEngineStore.commitVerifiedRemoteFailure(turnId, attemptId, proof,
-  now)` is the only authority that can make a later attempt create a remote
-  child; it writes no receipt/group/cursor.
+  now)` is the only writer for a closed PC terminal-failure proof; it writes no
+  receipt/group/cursor. Only a proof whose native `retryAllowed` is exactly true
+  can make one later attempt create a remote child.
 - `BridgeResult` carries immutable receipt fields plus ordered visible items and
   actions; it does not derive them from reply text. Its wire `turnId` is exposed
   as `authoritativeTurnId`; Room writes still use the separate local turn ID.
@@ -595,6 +889,12 @@ parent.
 `tests/fixtures/authority-identity-v1.json` and verify lineage, group, message,
 and action IDs, including Chinese, emoji, empty text components, and large
 ordinals. Java uses UTF-8 byte length, not `String.length()`.
+
+`CanonicalFailureStatusTest` must load every vector in
+`tests/fixtures/canonical-failure-status-v1.json`, reproduce the recursive
+lexicographic UTF-8 canonical JSON bytes and exact SHA-256, and reject every
+unknown/missing key, boolean coercion, changed tuple field, and checksum before
+calling an `ExecutionEngineStore` writer.
 
 `BridgeInputTest` and the real Room test must prove:
 
@@ -625,7 +925,7 @@ Run red:
 
 ```powershell
 cd android
-.\gradlew.bat testDebugUnitTest --tests "*AuthorityIdentityTest" --tests "*BridgeInputTest" --tests "*ExecutionEngineTest" --no-daemon --no-problems-report
+.\gradlew.bat testDebugUnitTest --tests "*AuthorityIdentityTest" --tests "*CanonicalFailureStatusTest" --tests "*BridgeInputTest" --tests "*ExecutionEngineTest" --no-daemon --no-problems-report
 ```
 
 - [ ] **Step 2: Implement idempotent pre-route authority preparation**
@@ -734,29 +1034,35 @@ A parsed v3 PC terminal failure is a separate closed
 `verified_remote_failure` result, never inferred from `BridgeFinalException`, an
 HTTP code, `retryable`, timeout, missing configuration, or process death. Its
 proof contains the known remote member ID, pinned lineage, terminal failed
-state/error, retry permission, canonical raw-status checksum, and authenticated
-route. LAN creates it only after parsing a valid PC terminal status for a known
-member; encrypted cloud `BACKLOG_FAILED` uses the identical validator.
+state/error, retry permission, every field in the closed Task13B
+failure-authority tuple, canonical raw-status checksum, and authenticated route.
+LAN creates it only after parsing a valid PC terminal status for a known member; encrypted cloud
+`BACKLOG_FAILED` uses the identical validator and exact Task13B checksum basis.
 
 The retry permission has one authority source: the native JSON boolean
 `turns.error_json.retryAllowed` written by the PC canonical failure transaction.
 The v3 terminal-status projection must always expose a closed boolean
 `retryAllowed`; it is `true` only when the persisted field exists and is exactly
-the JSON boolean `true`. Missing, `null`, numeric, string, or otherwise malformed
-values are fail-closed as `false` and can never be coerced. A production writer
-may grant retry only by passing `retryAllowed: true` in the same
+the JSON boolean `true`; explicit false is preserved as false. A missing, null,
+numeric, string, or otherwise malformed wire value is rejected as a malformed
+failure proof and can never be coerced. A malformed persisted v3 value is a PC
+authority conflict and is quarantined rather than projected. The production PC
+writer always passes a native boolean in the same
 `recordCanonicalTurnFailureInternal` transaction that persists the canonical
 failure class. The status endpoint, LAN client, cloud client, Android router,
-and Room checkpoint must copy this boolean verbatim; none may derive or upgrade
-it from an exception class, HTTP code, timeout, transport retryability, or local
-policy. The canonical raw-status checksum covers the field.
+and Room checkpoint copy this boolean verbatim; none may derive or upgrade it
+from an exception class, HTTP code, timeout, transport retryability, or local
+policy. The Task13B canonical raw-status checksum covers the field.
 
 `commitVerifiedRemoteFailure` atomically stores that metadata-only proof in the
-attempt bridge checkpoint and terminates the attempt/turn as retryable without
-writing a commit receipt, group, part/action, authority revision, or cursor.
-Exact proof replay is idempotent; changed proof conflicts. Cloud ACK occurs only
-after this transaction; unknown/foreign failure stays pending. Preparation may
-create a child only from this persisted proof and consumes that authority once.
+attempt bridge checkpoint and terminates the attempt/turn as failed without
+writing a commit receipt, group, part/action, authority revision, or cursor. It
+marks the local failure retryable only when the stored proof contains native
+`retryAllowed:true`; explicit false remains a verified terminal failure but
+cannot create a child. Exact proof replay is idempotent; changed proof conflicts.
+Cloud ACK occurs only after this transaction; unknown/foreign failure stays
+pending. Preparation may create a child only from a persisted true proof and
+consumes that authority once.
 
 `commitBridgedTerminal` runs one outer Room transaction:
 
