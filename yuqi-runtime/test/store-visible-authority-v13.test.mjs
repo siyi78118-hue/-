@@ -378,7 +378,7 @@ test('fresh and populated v12 migrate atomically to exact v13 tombstone schema',
     const before = snapshotDatabase(path);
     const store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 13);
+      assert.equal(store.userVersion(), 14);
       assert.deepEqual(columns(store, 'visible_result_items'), [
         'group_id', 'ordinal', 'message_id', 'item_json', 'item_checksum', 'redacted_at'
       ]);

@@ -244,6 +244,46 @@ const normalOutputs = () => ({
   supervisor: ['{"approved":true,"issues":[]}']
 });
 
+test('legacy release provider runs memory brain supervisor as a side-effect-free draft', async () => {
+  await withFixture(normalOutputs(), async ({ store, presets, codex, orchestrator }) => {
+    const request = stagedEnvelope(198);
+    const beforeChanges = Number(store.db.prepare('SELECT total_changes() AS value').get().value);
+
+    const draft = await orchestrator.executeLegacyReleaseTurnDraft({
+      release: {
+        releaseId: 'stable-r2',
+        presetVersion: presets.current().version
+      },
+      execution: {
+        turn: {
+          turnId: request.turnId,
+          characterId: request.characterId,
+          route: 'deep'
+        },
+        envelope: request,
+        routeDecision: { route: 'deep' }
+      },
+      dryRun: false,
+      capabilities: {
+        visibleCommit: true,
+        action: true,
+        state: true,
+        fact: true,
+        memory: true,
+        outbox: true,
+        notification: true
+      }
+    });
+    const afterChanges = Number(store.db.prepare('SELECT total_changes() AS value').get().value);
+
+    assert.equal(draft.action, 'send');
+    assert.equal(draft.reply, '你好。我是虞栖，你呢？');
+    assert.deepEqual(codex.calls.map(call => call.role), ['memory', 'brain', 'supervisor']);
+    assert.equal(afterChanges, beforeChanges);
+    assert.equal(store.getTurn(request.turnId), null);
+  });
+});
+
 const JPEG_1X1 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==';
 
 test('a direct image is shown to every role as a local image without leaking base64 into role text', async () => {

@@ -140,6 +140,17 @@ const currentBatch = {
   messages: [{ messageId: 'msg_1', content: '继续吧' }]
 };
 
+function v2Release(overrides = {}) {
+  return {
+    releaseId: 'candidate-v2',
+    pipelineVersion: 'cognition-v2-candidate-2026-07-30',
+    presetVersion: '2.1.0',
+    cognitionSchemaVersion: 2,
+    expressionSchemaVersion: 2,
+    ...overrides
+  };
+}
+
 test('fast cognition escalates once without rebuilding or truncating the current batch', async () => {
   const { pipeline, calls } = fixture([
     cognition(true),
@@ -193,6 +204,67 @@ test('expression retry resumes from the persisted cognition checkpoint', async (
   });
   assert.equal(result.draft.reply, '从断点继续。');
   assert.deepEqual(secondCalls.map(call => call.role), ['brain']);
+});
+
+test('v2 release draft calls the model but never writes a legacy turn checkpoint', async () => {
+  const { pipeline, store, calls } = fixture([cognition(false), expression()]);
+  store.advanceTurn = () => {
+    throw new Error('release draft attempted a legacy domain write');
+  };
+  const draft = await pipeline.runV2ReleaseDraft({
+    release: v2Release(),
+    execution: {
+      turn: { turnId: 'turn_1' },
+      envelope,
+      scene: {},
+      currentBatch,
+      routeDecision: { route: 'fast' }
+    },
+    dryRun: true,
+    capabilities: { visibleCommit: false }
+  });
+  assert.equal(draft.reply, '那就继续聊。');
+  assert.deepEqual(calls.map(call => call.role), ['memory', 'brain']);
+  assert.deepEqual(calls.map(call => call.input.system), [
+    'cognition:2.1.0',
+    'expression:2.1.0'
+  ]);
+});
+
+test('v2 release draft rejects an empty pinned preset before calling a model', async () => {
+  const { pipeline, calls } = fixture([cognition(false), expression()], {
+    presetRegistry: { resolvePresetBundle: () => '   ' }
+  });
+  await assert.rejects(() => pipeline.runV2ReleaseDraft({
+    release: v2Release(),
+    execution: {
+      turn: { turnId: 'turn_1' },
+      envelope,
+      scene: {},
+      currentBatch,
+      routeDecision: { route: 'fast' }
+    },
+    dryRun: true,
+    capabilities: { visibleCommit: false }
+  }), /pinned preset bundle is empty/);
+  assert.equal(calls.length, 0);
+});
+
+test('v2 release draft rejects a mismatched immutable pipeline schema before calling a model', async () => {
+  const { pipeline, calls } = fixture([cognition(false), expression()]);
+  await assert.rejects(() => pipeline.runV2ReleaseDraft({
+    release: v2Release({ cognitionSchemaVersion: 3 }),
+    execution: {
+      turn: { turnId: 'turn_1' },
+      envelope,
+      scene: {},
+      currentBatch,
+      routeDecision: { route: 'fast' }
+    },
+    dryRun: true,
+    capabilities: { visibleCommit: false }
+  }), /release draft contract conflict/);
+  assert.equal(calls.length, 0);
 });
 
 test('a direct cognition result can never materialize a skipped reply', async () => {

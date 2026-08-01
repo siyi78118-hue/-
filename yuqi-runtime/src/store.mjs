@@ -3,6 +3,11 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { decideLaneAdmission, laneKeyForEnvelope } from './interaction-lanes.mjs';
+import { resolvePipelinePair } from './release-pair.mjs';
+import {
+  comparisonContractForDirection,
+  comparisonContractForMode
+} from './comparison-contract.mjs';
 import {
   TURN_STATES,
   canonicalJson,
@@ -845,14 +850,21 @@ export class YuqiStore {
         `migration source version mismatch: expected ${this.migrationOptions.expectedSourceVersion}, got ${initialVersion}`
       );
     }
-    const targetVersion = Number(this.migrationOptions?.targetVersion || 13);
-    if (![12, 13].includes(targetVersion)) {
+    const targetVersion = Number(this.migrationOptions?.targetVersion || 14);
+    if (![12, 13, 14].includes(targetVersion)) {
       throw new Error(`unsupported migration target version ${targetVersion}`);
     }
-    if (initialVersion > 13) {
+    if (initialVersion > 14) {
       throw new Error(`unsupported database user_version ${initialVersion}`);
     }
-    if (initialVersion === 13) {
+    if (initialVersion === 14) {
+      this.assertAgencyV10Invariants();
+      this.assertVisibleAuthorityV13Invariants();
+      this.assertReleaseAuthorityV14Invariants();
+      this.assertExpectedPostMigrationInvariantChecksum();
+      return;
+    }
+    if (initialVersion === 13 && targetVersion === 13) {
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV13Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
@@ -1423,8 +1435,19 @@ export class YuqiStore {
       if (initialVersion < 13) {
         this.migrateVisibleAuthorityV13Internal();
       }
+      if (targetVersion === 13) {
+        this.assertAgencyV10Invariants();
+        this.assertVisibleAuthorityV13Invariants();
+        this.assertExpectedPostMigrationInvariantChecksum();
+        this.db.exec('COMMIT');
+        return;
+      }
+      if (initialVersion < 14) {
+        this.migrateReleaseAuthorityV14Internal();
+      }
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV13Invariants();
+      this.assertReleaseAuthorityV14Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
       this.db.exec('COMMIT');
     } catch (error) {
@@ -1436,9 +1459,11 @@ export class YuqiStore {
   assertExpectedPostMigrationInvariantChecksum() {
     const expected = this.migrationOptions?.expectedPostMigrationInvariantChecksum;
     if (!expected) return;
-    const actual = this.userVersion() === 13
-      ? this.visibleAuthorityV13InvariantSummary().checksum
-      : this.visibleAuthorityV11InvariantSummary().checksum;
+    const actual = this.userVersion() >= 14
+      ? this.releaseAuthorityV14InvariantSummary().checksum
+      : this.userVersion() >= 13
+        ? this.visibleAuthorityV13InvariantSummary().checksum
+        : this.visibleAuthorityV11InvariantSummary().checksum;
     if (actual !== expected) {
       throw new Error(
         `migration post-migration invariant checksum mismatch: expected ${expected}, got ${actual}`
@@ -1579,7 +1604,26 @@ export class YuqiStore {
     for (const [column, definition] of Object.entries({
       stable_release_id: 'TEXT',
       candidate_release_id: 'TEXT',
-      candidate_phase: 'TEXT'
+      candidate_phase: 'TEXT',
+      live_shadow_first_at: 'INTEGER',
+      live_shadow_last_at: 'INTEGER',
+      live_shadow_success_count: 'INTEGER NOT NULL DEFAULT 0',
+      live_shadow_failure_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_target_count: 'INTEGER NOT NULL DEFAULT 10',
+      canary_max_outstanding: 'INTEGER NOT NULL DEFAULT 3',
+      canary_compare_deadline_ms: 'INTEGER NOT NULL DEFAULT 900000',
+      canary_started_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_completed_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_failure_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_started_at: 'INTEGER',
+      canary_observe_until: 'INTEGER',
+      active_transient_failure_count: 'INTEGER NOT NULL DEFAULT 0',
+      active_transient_window_started_at: 'INTEGER',
+      last_report_id: 'TEXT',
+      last_report_checksum: 'TEXT',
+      activated_at: 'INTEGER',
+      rolled_back_at: 'INTEGER',
+      last_reason_code: "TEXT NOT NULL DEFAULT 'bootstrap'"
     })) {
       this.addColumnIfMissing('cognition_kind_rollouts', column, definition);
     }
@@ -1613,6 +1657,29 @@ export class YuqiStore {
   }
 
   migrateVisibleAuthorityV11Internal() {
+    for (const [column, definition] of Object.entries({
+      live_shadow_first_at: 'INTEGER',
+      live_shadow_last_at: 'INTEGER',
+      live_shadow_success_count: 'INTEGER NOT NULL DEFAULT 0',
+      live_shadow_failure_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_target_count: 'INTEGER NOT NULL DEFAULT 10',
+      canary_max_outstanding: 'INTEGER NOT NULL DEFAULT 3',
+      canary_compare_deadline_ms: 'INTEGER NOT NULL DEFAULT 900000',
+      canary_started_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_completed_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_failure_count: 'INTEGER NOT NULL DEFAULT 0',
+      canary_started_at: 'INTEGER',
+      canary_observe_until: 'INTEGER',
+      active_transient_failure_count: 'INTEGER NOT NULL DEFAULT 0',
+      active_transient_window_started_at: 'INTEGER',
+      last_report_id: 'TEXT',
+      last_report_checksum: 'TEXT',
+      activated_at: 'INTEGER',
+      rolled_back_at: 'INTEGER',
+      last_reason_code: "TEXT NOT NULL DEFAULT 'bootstrap'"
+    })) {
+      this.addColumnIfMissing('cognition_kind_rollouts', column, definition);
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS turn_authority_lineages (
         lineage_key TEXT PRIMARY KEY,
@@ -1808,6 +1875,12 @@ export class YuqiStore {
   maybeFailV13Migration(step) {
     if (this.migrationOptions?.v13MigrationFaultStep === step) {
       throw new Error(`forced v13 migration fault: ${step}`);
+    }
+  }
+
+  maybeFailV14Migration(step) {
+    if (this.migrationOptions?.v14MigrationFaultStep === step) {
+      throw new Error(`forced v14 migration fault: ${step}`);
     }
   }
 
@@ -2196,19 +2269,164 @@ export class YuqiStore {
     this.maybeFailV13Migration('after_version_write');
   }
 
+  migrateReleaseAuthorityV14Internal() {
+    if (this.userVersion() !== 13) {
+      throw new Error(`v14 migration source version mismatch: ${this.userVersion()}`);
+    }
+    this.assertAgencyV10Invariants();
+    this.assertVisibleAuthorityV13Invariants();
+    this.assertReleaseAuthorityV14PreflightInternal();
+    this.maybeFailV14Migration('before_drop');
+    this.db.exec('DROP INDEX IF EXISTS idx_turns_rollout_canary_slot;');
+    this.maybeFailV14Migration('after_drop');
+    this.db.exec(`
+      CREATE UNIQUE INDEX idx_turns_rollout_canary_root_slot
+      ON turns(rollout_key, canary_epoch, canary_slot)
+      WHERE canary_slot IS NOT NULL AND retry_of_turn_id IS NULL;
+    `);
+    this.maybeFailV14Migration('after_root_index_create');
+    this.db.exec(`
+      CREATE INDEX idx_turns_rollout_canary_lineage_slot
+      ON turns(rollout_key, canary_epoch, canary_slot, authority_lineage_key)
+      WHERE canary_slot IS NOT NULL;
+    `);
+    this.maybeFailV14Migration('after_lineage_index_create');
+    this.assertReleaseAuthorityV14IndexShapeInternal({ allowVersionThirteen: true });
+    this.maybeFailV14Migration('after_invariant_verification');
+    this.maybeFailV14Migration('before_version_write');
+    this.db.exec('PRAGMA user_version = 14;');
+  }
+
+  assertReleaseAuthorityV14PreflightInternal() {
+    const invalidSlot = this.db.prepare(`
+      SELECT turn_id, canary_slot
+      FROM turns
+      WHERE canary_slot IS NOT NULL
+        AND (typeof(canary_slot) != 'integer' OR canary_slot < 1 OR canary_slot > 10)
+      LIMIT 1
+    `).get();
+    if (invalidSlot) {
+      throw new Error(`v14 migration canary slot conflict: ${invalidSlot.turn_id}`);
+    }
+    const lifePlanningColumns = new Set(this.db.prepare(
+      'PRAGMA table_info(cognition_life_planning_attempts)'
+    ).all().map(row => row.name));
+    const invalidLifeSlot = lifePlanningColumns.has('canary_slot')
+      ? this.db.prepare(`
+          SELECT planning_id, canary_slot
+          FROM cognition_life_planning_attempts
+          WHERE canary_slot IS NOT NULL
+            AND (typeof(canary_slot) != 'integer' OR canary_slot < 1 OR canary_slot > 10)
+          LIMIT 1
+        `).get()
+      : null;
+    if (invalidLifeSlot) {
+      throw new Error(`v14 migration life canary slot conflict: ${invalidLifeSlot.planning_id}`);
+    }
+    const duplicateRoot = this.db.prepare(`
+      SELECT rollout_key, canary_epoch, canary_slot, COUNT(*) AS count
+      FROM turns
+      WHERE canary_slot IS NOT NULL AND retry_of_turn_id IS NULL
+      GROUP BY rollout_key, canary_epoch, canary_slot
+      HAVING COUNT(*) != 1
+      LIMIT 1
+    `).get();
+    if (duplicateRoot) throw new Error('v14 migration root canary slot conflict');
+    const retryMismatch = this.db.prepare(`
+      SELECT retry.turn_id
+      FROM turns retry
+      JOIN turns root
+        ON root.authority_lineage_key = retry.authority_lineage_key
+       AND root.retry_of_turn_id IS NULL
+      WHERE retry.retry_of_turn_id IS NOT NULL
+        AND (
+          retry.rollout_key IS NOT root.rollout_key
+          OR retry.canary_epoch IS NOT root.canary_epoch
+          OR retry.canary_slot IS NOT root.canary_slot
+          OR retry.authoritative_release_id IS NOT root.authoritative_release_id
+          OR retry.comparison_release_id IS NOT root.comparison_release_id
+          OR retry.authoritative_pipeline_checksum IS NOT root.authoritative_pipeline_checksum
+          OR retry.comparison_pipeline_checksum IS NOT root.comparison_pipeline_checksum
+        )
+      LIMIT 1
+    `).get();
+    if (retryMismatch) {
+      throw new Error(`v14 migration retry canary authority conflict: ${retryMismatch.turn_id}`);
+    }
+    for (const rollout of this.listCognitionRollouts()) {
+      try {
+        this.readCanaryOutstandingAuthorityInternal({
+          rolloutKey: rollout.rolloutKey,
+          canaryEpoch: rollout.canaryEpoch
+        });
+      } catch (error) {
+        if (/CANARY_ACCOUNTING_INVARIANT/.test(String(error?.message || ''))) {
+          throw new Error(`v14 migration canary accounting conflict: ${rollout.rolloutKey}`);
+        }
+        throw error;
+      }
+    }
+  }
+
+  assertReleaseAuthorityV14IndexShapeInternal({ allowVersionThirteen = false } = {}) {
+    const version = this.userVersion();
+    if (version !== 14 && !(allowVersionThirteen && version === 13)) {
+      throw new Error(`v14 invariant user_version mismatch: ${version}`);
+    }
+    const indexes = new Map(this.db.prepare(`
+      SELECT name, sql FROM sqlite_master
+      WHERE type = 'index' AND tbl_name = 'turns'
+    `).all().map(row => [row.name, String(row.sql || '')]));
+    if (indexes.has('idx_turns_rollout_canary_slot')
+      || !/UNIQUE INDEX idx_turns_rollout_canary_root_slot/i.test(
+        indexes.get('idx_turns_rollout_canary_root_slot') || ''
+      )
+      || !/retry_of_turn_id IS NULL/i.test(
+        indexes.get('idx_turns_rollout_canary_root_slot') || ''
+      )
+      || !/authority_lineage_key/i.test(
+        indexes.get('idx_turns_rollout_canary_lineage_slot') || ''
+      )) {
+      throw new Error('v14 invariant canary slot index mismatch');
+    }
+  }
+
+  assertReleaseAuthorityV14Invariants() {
+    this.assertReleaseAuthorityV14IndexShapeInternal();
+    this.assertReleaseAuthorityV14PreflightInternal();
+    for (const rollout of this.listCognitionRollouts()) {
+      const authority = this.readCanaryOutstandingAuthorityInternal({
+        rolloutKey: rollout.rolloutKey,
+        canaryEpoch: rollout.canaryEpoch
+      });
+      const expected = rollout.canaryStartedCount
+        - rollout.canaryCompletedCount
+        - rollout.canaryFailureCount;
+      if (expected < 0 || authority.count !== expected) {
+        throw new Error(
+          `CANARY_ACCOUNTING_INVARIANT: ${rollout.rolloutKey} expected=${expected} actual=${authority.count}`
+        );
+      }
+    }
+  }
+
   assertVisibleAuthorityV11Invariants({
     allowVersionTen = false,
     allowVersionTwelve = false,
-    allowVersionThirteen = false
+    allowVersionThirteen = false,
+    allowVersionFourteen = false
   } = {}) {
     const version = this.userVersion();
-    const expectedVersion = allowVersionTen
-      ? 10
-      : allowVersionTwelve
-        ? 12
-        : allowVersionThirteen
-          ? 13
-          : 11;
+    const allowV13Semantics = allowVersionThirteen || allowVersionFourteen;
+    const expectedVersion = allowVersionFourteen
+      ? 14
+      : allowVersionThirteen
+        ? 13
+        : allowVersionTwelve
+          ? 12
+          : allowVersionTen
+            ? 10
+            : 11;
     if (version !== expectedVersion) {
       throw new Error(`v11 invariant user_version mismatch: ${version}`);
     }
@@ -2342,7 +2560,7 @@ export class YuqiStore {
     // inputs, but are validated here rather than being smuggled into that
     // commitment namespace.  Redaction intentionally clears annotations, so
     // its audit shell is exempt from this live-input comparison.
-    if (allowVersionThirteen) {
+    if (allowV13Semantics) {
       const retryPins = this.db.prepare(`
         SELECT t.*, p.rollout_key AS parent_rollout_key,
                p.rollout_revision AS parent_rollout_revision,
@@ -2448,7 +2666,9 @@ export class YuqiStore {
       LIMIT 1
     `);
 
-    assertNoInvariantRow('receipt_payload_origin', allowVersionThirteen ? `
+    assertNoInvariantRow(
+      'receipt_payload_origin',
+      allowV13Semantics ? `
       SELECT lineage_key, authority_origin, commit_payload_version
       FROM visible_commit_receipts
       WHERE (authority_origin = 'pc'
@@ -2531,7 +2751,7 @@ export class YuqiStore {
       LIMIT 1
     `);
 
-    if (!allowVersionThirteen) {
+    if (!allowV13Semantics) {
       assertNoInvariantRow('canonical_group_item_shape', `
       SELECT g.group_id, COUNT(i.ordinal) AS item_count,
              MIN(i.ordinal) AS min_ordinal, MAX(i.ordinal) AS max_ordinal
@@ -2626,7 +2846,7 @@ export class YuqiStore {
       LIMIT 1
     `);
 
-    if (!allowVersionThirteen) for (const turn of this.db.prepare(`
+    if (!allowV13Semantics) for (const turn of this.db.prepare(`
       SELECT turn_id, envelope_json, envelope_checksum
       FROM turns WHERE result_authority_version = 1
     `).all()) {
@@ -2634,7 +2854,7 @@ export class YuqiStore {
         throw new Error(`v11 invariant canonical_envelope_checksum: ${turn.turn_id}`);
       }
     }
-    if (!allowVersionThirteen) for (const item of this.db.prepare(`
+    if (!allowV13Semantics) for (const item of this.db.prepare(`
       SELECT i.group_id, i.ordinal, i.message_id, i.item_json, i.item_checksum,
              g.role_id, m.content, m.speaker_id, m.speaker_type, m.recipient_id
       FROM visible_result_items i
@@ -2959,7 +3179,7 @@ export class YuqiStore {
   }
 
   assertVisibleAuthorityV13SchemaInternal() {
-    if (this.userVersion() !== 13) {
+    if (![13, 14].includes(this.userVersion())) {
       throw new Error(`v13 invariant user_version mismatch: ${this.userVersion()}`);
     }
     const exactColumns = (table, expected) => {
@@ -3801,7 +4021,8 @@ export class YuqiStore {
     }
     jobs.forEach((job, ordinal) => {
       const payload = parseJson(job.payload_json, {});
-      const semanticJob = ['shadow_cognition', 'active_canary_compare'].includes(job.job_type)
+      const comparisonJob = ['shadow_cognition', 'active_canary_compare'].includes(job.job_type);
+      const semanticJob = comparisonJob
         ? {
             jobType: job.job_type,
             ...Object.fromEntries(Object.entries(payload).filter(([key]) =>
@@ -3811,7 +4032,9 @@ export class YuqiStore {
       if (job.role_id !== authority.role_id
         || job.turn_id !== authority.authoritative_turn_id
         || job.subject_type !== 'turn'
-        || job.subject_id !== authority.authoritative_turn_id
+        || job.subject_id !== (comparisonJob
+          ? authority.lineage_key
+          : authority.authoritative_turn_id)
         || Number(job.authority_ordinal) !== ordinal
         || contentHash(payload) !== job.payload_checksum
         || canonicalJson(semanticJob) !== canonicalJson(expectedJobs[ordinal])) {
@@ -3917,7 +4140,11 @@ export class YuqiStore {
 
   assertVisibleAuthorityV13Invariants() {
     this.assertVisibleAuthorityV13SchemaInternal();
-    this.assertVisibleAuthorityV11Invariants({ allowVersionThirteen: true });
+    this.assertVisibleAuthorityV11Invariants(
+      this.userVersion() === 14
+        ? { allowVersionFourteen: true }
+        : { allowVersionThirteen: true }
+    );
     for (const lineage of this.db.prepare(`
       SELECT lineage_key, state, committed_group_id, redacted_at,
              attempt_count, attempt_commitment
@@ -4059,8 +4286,41 @@ export class YuqiStore {
     return { ...summary, checksum: contentHash(summary) };
   }
 
+  releaseAuthorityV14InvariantSummary() {
+    this.assertReleaseAuthorityV14Invariants();
+    const semantic = this.visibleAuthorityV13InvariantSummary();
+    const rolloutCanary = this.listCognitionRollouts().map(rollout => ({
+      rolloutKey: rollout.rolloutKey,
+      canaryEpoch: rollout.canaryEpoch,
+      started: rollout.canaryStartedCount,
+      completed: rollout.canaryCompletedCount,
+      failure: rollout.canaryFailureCount,
+      outstanding: this.readCanaryOutstandingAuthorityInternal({
+        rolloutKey: rollout.rolloutKey,
+        canaryEpoch: rollout.canaryEpoch
+      })
+    }));
+    const indexes = this.db.prepare(`
+      SELECT name, sql
+      FROM sqlite_master
+      WHERE type = 'index'
+        AND name IN (
+          'idx_turns_rollout_canary_root_slot',
+          'idx_turns_rollout_canary_lineage_slot'
+        )
+      ORDER BY name
+    `).all().map(row => ({ name: row.name, sql: row.sql }));
+    const summary = {
+      userVersion: this.userVersion(),
+      semantic,
+      indexes,
+      rolloutCanary
+    };
+    return { ...summary, checksum: contentHash(summary) };
+  }
+
   visibleAuthorityV11InvariantSummary() {
-    if (this.userVersion() === 13) this.assertVisibleAuthorityV13Invariants();
+    if (this.userVersion() >= 13) this.assertVisibleAuthorityV13Invariants();
     else if (this.userVersion() === 12) this.assertVisibleAuthorityV12Invariants();
     else this.assertVisibleAuthorityV11Invariants();
     const tableNames = [
@@ -4111,7 +4371,8 @@ export class YuqiStore {
       ? version === 9
       : allowPreFinalVersion
         ? version === 10
-        : version === 10 || version === 11 || version === 12 || version === 13;
+        : version === 10 || version === 11 || version === 12
+          || version === 13 || version === 14;
     if (!versionAllowed) {
       throw new Error(`v10 invariant user_version mismatch: ${version}`);
     }
@@ -4935,6 +5196,18 @@ export class YuqiStore {
         rolloutKey, Number(expectedRevision)
       );
       if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      const candidatePhase = toMode === 'shadow'
+        ? 'shadow'
+        : toMode === 'active' && toPhase === 'canary'
+          ? 'canary'
+          : current.current_mode !== 'legacy' && toMode === 'legacy'
+            ? 'rolled_back'
+            : current.candidate_phase;
+      this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET candidate_phase = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(candidatePhase, rolloutKey, nextRevision);
       this.appendPromotionHistoryInternal({
         eventId: `promotion_${contentHash({
           rolloutKey, expectedRevision, toMode, toPhase, reasonCode, transitionedAt
@@ -5149,8 +5422,8 @@ export class YuqiStore {
           || Number(exactTurn.rolloutRevision) !== expectedRolloutRevision
           || exactTurn.authoritativeReleaseId !== String(input.authoritativeReleaseId || '')
           || String(exactTurn.comparisonReleaseId || '') !== String(input.comparisonReleaseId || '')
-          || String(exactTurn.comparisonMode === 'none' ? '' : exactTurn.comparisonMode)
-            !== String(input.comparisonDirection || '')
+          || exactTurn.comparisonMode
+            !== comparisonContractForDirection(input.comparisonDirection).comparisonMode
           || exactTurn.agencySnapshotChecksum !== agencySnapshotChecksum
           || contentHash(exactTurn.annotationSnapshot || {})
             !== contentHash(input.annotationSnapshot || {})) {
@@ -5196,16 +5469,14 @@ export class YuqiStore {
           || contentHash(canonicalBatch(envelope)) !== contentHash(canonicalBatch(parentEnvelope))) {
           throw new Error('retry canonical batch conflict');
         }
-        const inheritedComparisonDirection = parent.comparisonMode === 'none'
-          ? null
-          : parent.comparisonMode;
+        const inheritedComparisonDirection = comparisonContractForMode(
+          parent.comparisonMode
+        ).comparisonDirection;
         if (Number(input.expectedRolloutRevision) !== parent.rolloutRevision
           || parent.rolloutKey !== rolloutKey
           || String(input.authoritativeReleaseId || '') !== String(parent.authoritativeReleaseId || '')
           || String(input.comparisonReleaseId || '') !== String(parent.comparisonReleaseId || '')
           || String(input.comparisonDirection || '') !== String(inheritedComparisonDirection || '')
-          || inputVisibilitySequence !== Number(parent.inputVisibilitySequence)
-          || inputClearEpoch !== Number(parent.inputClearEpoch)
           || inputUserBatchId !== parent.inputUserBatchId
           || contentHash(input.annotationSnapshot || {})
             !== contentHash(parent.annotationSnapshot || {})) {
@@ -5273,30 +5544,29 @@ export class YuqiStore {
         if (!rolloutRow || Number(rolloutRow.revision) !== expectedRolloutRevision) {
           throw new RolloutRevisionConflictError();
         }
-        const phase = String(rolloutRow.candidate_phase || 'none');
-        const visibleReleaseId = phase === 'canary'
-          ? rolloutRow.candidate_release_id
-          : rolloutRow.stable_release_id;
-        const comparisonReleaseId = phase === 'shadow'
-          ? rolloutRow.candidate_release_id
-          : phase === 'canary'
-            ? rolloutRow.stable_release_id
-            : null;
-        const comparisonDirection = phase === 'shadow'
-          ? 'stable_authoritative_candidate_compare'
-          : phase === 'canary'
-            ? 'candidate_authoritative_stable_compare'
-            : null;
-        if (String(input.authoritativeReleaseId || '') !== String(visibleReleaseId || '')
-          || String(input.comparisonReleaseId || '') !== String(comparisonReleaseId || '')
-          || String(input.comparisonDirection || '') !== String(comparisonDirection || '')) {
+        const rollout = mapCognitionRollout(rolloutRow);
+        const pair = resolvePipelinePair(rollout);
+        const projectionIsValid = pair.candidatePhase === 'shadow'
+          ? rollout.currentMode === 'shadow'
+          : pair.candidatePhase === 'canary'
+            ? rollout.currentMode === 'active' && rollout.rolloutPhase === 'canary'
+            : pair.candidatePhase === 'rolled_back'
+              ? rollout.currentMode !== 'active'
+              : rollout.currentMode !== 'shadow'
+                && !(rollout.currentMode === 'active' && rollout.rolloutPhase === 'canary');
+        if (!projectionIsValid) {
+          throw new RolloutRevisionConflictError('rollout phase projection conflict');
+        }
+        if (String(input.authoritativeReleaseId || '') !== pair.visibleReleaseId
+          || String(input.comparisonReleaseId || '') !== String(pair.comparisonReleaseId || '')
+          || String(input.comparisonDirection || '') !== String(pair.comparisonDirection || '')) {
           throw new RolloutRevisionConflictError('rollout release pair conflict');
         }
-        const authoritativeRelease = this.getPipelineRelease(visibleReleaseId);
-        const comparisonRelease = comparisonReleaseId
-          ? this.getPipelineRelease(comparisonReleaseId)
+        const authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
+        const comparisonRelease = pair.comparisonReleaseId
+          ? this.getPipelineRelease(pair.comparisonReleaseId)
           : null;
-        if (!authoritativeRelease || (comparisonReleaseId && !comparisonRelease)) {
+        if (!authoritativeRelease || (pair.comparisonReleaseId && !comparisonRelease)) {
           throw new Error('canonical release authority is unavailable');
         }
         const existingLineage = this.getTurnAuthorityLineage(lineageKey);
@@ -5309,22 +5579,29 @@ export class YuqiStore {
           }
           throw new Error('canonical lineage already has an open turn');
         }
+        const reservesCanaryComparison = pair.candidatePhase === 'canary'
+          && pair.comparisonReleaseId !== null;
+        const comparisonMode = comparisonContractForDirection(
+          pair.comparisonDirection
+        ).comparisonMode;
         pinned = {
-          pipelineMode: phase === 'canary' ? 'active' : phase === 'shadow' ? 'shadow' : 'legacy',
+          pipelineMode: rollout.currentMode,
           presetVersion: authoritativeRelease.presetVersion,
           rolloutRevision: Number(rolloutRow.revision),
           rolloutEvidenceEpoch: Number(rolloutRow.evidence_epoch),
           pipelineChecksum: authoritativeRelease.releaseChecksum,
-          shadowEpoch: phase === 'shadow' ? Number(rolloutRow.shadow_epoch) : null,
-          canaryEpoch: phase === 'canary' ? Number(rolloutRow.canary_epoch) : null,
-          canarySlot: phase === 'canary' ? Number(rolloutRow.canary_started_count) + 1 : null,
-          comparisonMode: comparisonDirection || 'none',
+          shadowEpoch: pair.candidatePhase === 'shadow' ? Number(rolloutRow.shadow_epoch) : null,
+          canaryEpoch: pair.candidatePhase === 'canary' ? Number(rolloutRow.canary_epoch) : null,
+          canarySlot: reservesCanaryComparison
+            ? Number(rolloutRow.canary_started_count) + 1
+            : null,
+          comparisonMode,
           authoritativeReleaseId: authoritativeRelease.releaseId,
           comparisonReleaseId: comparisonRelease?.releaseId || null,
           authoritativePipelineChecksum: authoritativeRelease.releaseChecksum,
           comparisonPipelineChecksum: comparisonRelease?.releaseChecksum || null
         };
-        if (phase === 'canary') {
+        if (reservesCanaryComparison) {
           const outstanding = Number(rolloutRow.canary_started_count)
             - Number(rolloutRow.canary_completed_count)
             - Number(rolloutRow.canary_failure_count);
@@ -6130,7 +6407,7 @@ export class YuqiStore {
       };
       memoryInsert.run(
         String(job.jobId),
-        input.turnId,
+        input.authorityLineageKey,
         input.turnId,
         turn.characterId,
         String(job.jobType),
@@ -7731,6 +8008,13 @@ export class YuqiStore {
   cancelCanonicalTurnInternal(input) {
     return this.withImmediateTransaction(() => {
       const result = this.cancelCanonicalTurnRowsInternal(input);
+      this.settleCanaryFailureInternal({
+        rolloutKey: result.turn.rolloutKey,
+        canaryEpoch: result.turn.canaryEpoch,
+        canarySlot: result.turn.canarySlot,
+        reasonCode: String(input.reasonCode || 'CANONICAL_CANCELLED'),
+        now: input.timestamp || now()
+      });
       this.appendSync('turn', result.turn.turnId, 'state', result.turn);
       return result;
     });
@@ -8130,6 +8414,69 @@ export class YuqiStore {
     if (existingOpen) return existingOpen;
     const exact = this.getLifePlanningAttemptByRequestKey(attempt.requestKey);
     if (exact) return exact;
+    const rolloutRow = this.db.prepare(
+      'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+    ).get('LIFE_PLANNING');
+    if (!rolloutRow || Number(rolloutRow.revision) !== Number(attempt.rolloutRevision)) {
+      throw new RolloutRevisionConflictError();
+    }
+    const rollout = mapCognitionRollout(rolloutRow);
+    const pair = resolvePipelinePair(rollout);
+    const comparison = comparisonContractForDirection(pair.comparisonDirection);
+    if (String(attempt.authoritativeReleaseId || '') !== pair.visibleReleaseId
+      || String(attempt.comparisonReleaseId || '') !== String(pair.comparisonReleaseId || '')
+      || String(attempt.comparisonDirection || '') !== String(comparison.comparisonDirection || '')
+      || String(attempt.comparisonMode || '') !== comparison.comparisonMode
+      || String(attempt.pipelineMode || '') !== rollout.currentMode) {
+      throw new RolloutRevisionConflictError('life planning rollout release pair conflict');
+    }
+    const authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
+    const comparisonRelease = pair.comparisonReleaseId
+      ? this.getPipelineRelease(pair.comparisonReleaseId)
+      : null;
+    if (!authoritativeRelease
+      || authoritativeRelease.releaseChecksum !== attempt.authoritativePipelineChecksum
+      || attempt.pipelineChecksum !== authoritativeRelease.releaseChecksum
+      || attempt.presetVersion !== authoritativeRelease.presetVersion
+      || (comparisonRelease
+        ? comparisonRelease.releaseChecksum !== attempt.comparisonPipelineChecksum
+        : attempt.comparisonPipelineChecksum != null)) {
+      throw new Error('life planning release checksum authority conflict');
+    }
+    const reservesCanaryComparison = pair.candidatePhase === 'canary'
+      && pair.comparisonReleaseId !== null;
+    const canarySlot = reservesCanaryComparison
+      ? Number(rollout.canaryStartedCount) + 1
+      : null;
+    if (reservesCanaryComparison) {
+      const outstanding = this.readCanaryOutstandingAuthorityInternal({
+        rolloutKey: 'LIFE_PLANNING',
+        canaryEpoch: rollout.canaryEpoch
+      });
+      if (outstanding.count >= rollout.canaryMaxOutstanding) {
+        throw new Error('canary outstanding authority limit reached');
+      }
+      const reservation = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET revision = revision + 1,
+            canary_started_count = canary_started_count + 1,
+            canary_started_at = COALESCE(canary_started_at, ?),
+            updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+          AND canary_started_count < canary_target_count
+          AND (
+            canary_started_count - canary_completed_count - canary_failure_count
+          ) < canary_max_outstanding
+      `).run(
+        Number(attempt.now || now()),
+        Number(attempt.now || now()),
+        'LIFE_PLANNING',
+        Number(attempt.rolloutRevision)
+      );
+      if (Number(reservation.changes) !== 1) {
+        throw new RolloutRevisionConflictError('life canary reservation conflict');
+      }
+    }
     const revision = Number(this.db.prepare(`
       SELECT COALESCE(MAX(planning_revision), 0) + 1 AS next_revision
       FROM cognition_life_planning_attempts WHERE role_id = ?
@@ -8146,9 +8493,11 @@ export class YuqiStore {
         context_checksum, rollout_key, pipeline_mode, comparison_mode,
         authoritative_pipeline, comparison_direction, rollout_revision,
         rollout_evidence_epoch, pipeline_checksum, shadow_epoch, canary_epoch,
-        canary_slot, preset_version, input_snapshot_json, input_checksum,
+        canary_slot, authoritative_release_id, comparison_release_id,
+        authoritative_pipeline_checksum, comparison_pipeline_checksum,
+        preset_version, input_snapshot_json, input_checksum,
         execution_state, comparison_state, attempt_count, due_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIFE_PLANNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIFE_PLANNING', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
         'created', ?, 0, ?, ?, ?)
     `).run(
       planningId, attempt.requestBaseKey, attempt.requestKey, roleId, revision,
@@ -8157,7 +8506,9 @@ export class YuqiStore {
       comparisonMode, attempt.authoritativePipeline, attempt.comparisonDirection || null,
       Number(attempt.rolloutRevision), Number(attempt.rolloutEvidenceEpoch),
       attempt.pipelineChecksum, attempt.shadowEpoch ?? null, attempt.canaryEpoch ?? null,
-      attempt.canarySlot ?? null, attempt.presetVersion, inputSnapshotJson, inputChecksum,
+      canarySlot, authoritativeRelease.releaseId, comparisonRelease?.releaseId || null,
+      authoritativeRelease.releaseChecksum, comparisonRelease?.releaseChecksum || null,
+      attempt.presetVersion, inputSnapshotJson, inputChecksum,
       comparisonMode === 'none' ? 'not_applicable' : 'not_ready',
       Number(attempt.dueAt || timestamp), timestamp, timestamp
     );
@@ -8244,18 +8595,28 @@ export class YuqiStore {
         attempt.comparisonMode === 'none' ? 'not_applicable' : 'cancelled',
         Number(committedAt), Number(committedAt), planningId
       );
+      this.settleCanaryFailureInternal({
+        rolloutKey: attempt.rolloutKey,
+        canaryEpoch: attempt.canaryEpoch,
+        canarySlot: attempt.canarySlot,
+        reasonCode: 'LIFE_BASIS_STALE',
+        now: committedAt
+      });
       return this.getLifePlanningAttempt(planningId);
     }
     this.putLifePlanInternal(attempt.roleId, result.episodes, { sourceTurnId: planningId });
     let compareJob = null;
     if (attempt.comparisonMode !== 'none') {
+      const comparison = comparisonContractForMode(attempt.comparisonMode);
+      if (comparison.comparisonDirection !== attempt.comparisonDirection
+        || !attempt.comparisonReleaseId || !attempt.comparisonPipelineChecksum) {
+        throw new Error('life planning comparison authority conflict');
+      }
       compareJob = this.createConsolidationJobInternal({
         subjectType: 'life_planning',
         subjectId: planningId,
         roleId: attempt.roleId,
-        jobType: attempt.comparisonMode === 'cognition_compare'
-          ? 'shadow_cognition'
-          : 'active_canary_compare',
+        jobType: comparison.jobType,
         payload: {
           subjectType: 'life_planning',
           subjectId: planningId,
@@ -8266,7 +8627,11 @@ export class YuqiStore {
           shadowEpoch: attempt.shadowEpoch,
           canaryEpoch: attempt.canaryEpoch,
           canarySlot: attempt.canarySlot,
-          comparisonDirection: attempt.comparisonDirection,
+          authoritativeReleaseId: attempt.authoritativeReleaseId,
+          comparisonReleaseId: attempt.comparisonReleaseId,
+          authoritativePipelineChecksum: attempt.authoritativePipelineChecksum,
+          comparisonPipelineChecksum: attempt.comparisonPipelineChecksum,
+          comparisonDirection: comparison.comparisonDirection,
           authoritativePipeline: attempt.authoritativePipeline,
           comparisonPipeline: attempt.authoritativePipeline === 'legacy' ? 'cognition' : 'legacy',
           authoritativeResultChecksum: checksum,
@@ -8311,6 +8676,13 @@ export class YuqiStore {
       planningId, workerId
     );
     if (Number(result.changes) !== 1) throw new Error('life planning attempt lease mismatch');
+    this.settleCanaryFailureInternal({
+      rolloutKey: attempt.rolloutKey,
+      canaryEpoch: attempt.canaryEpoch,
+      canarySlot: attempt.canarySlot,
+      reasonCode: String(errorCode || 'LIFE_PLANNING_FAILED'),
+      now: failedAt
+    });
     return this.getLifePlanningAttempt(planningId);
   }
 
@@ -8662,6 +9034,215 @@ export class YuqiStore {
     ).get(String(jobId)));
   }
 
+  loadComparisonExecutionAuthorityInternal({ jobId, workerId }) {
+    const job = this.getConsolidationJob(jobId);
+    if (!job || job.state !== 'running' || job.leaseOwner !== String(workerId || '')) {
+      throw new Error('comparison job lease authority conflict');
+    }
+    if (!['shadow_cognition', 'active_canary_compare'].includes(job.jobType)
+      || contentHash(job.payload) !== job.payloadChecksum) {
+      throw new Error('comparison job payload authority conflict');
+    }
+    let contract = null;
+    try {
+      contract = comparisonContractForDirection(job.payload.comparisonDirection);
+    } catch {
+      const legacyJobType = job.payload.comparisonDirection === 'legacy_authoritative_cognition_compare'
+        ? 'shadow_cognition'
+        : job.payload.comparisonDirection === 'cognition_authoritative_legacy_compare'
+          ? 'active_canary_compare'
+          : null;
+      if (legacyJobType !== job.jobType || job.authorityGroupId) {
+        throw new Error('comparison direction authority conflict');
+      }
+      if (job.subjectType === 'life_planning') {
+        const attempt = this.getLifePlanningAttempt(job.subjectId);
+        if (!attempt
+          || contentHash(attempt.inputSnapshot) !== attempt.inputChecksum
+          || contentHash(attempt.authoritativeResult) !== attempt.authoritativeResultChecksum) {
+          throw new Error('legacy life comparison execution authority conflict');
+        }
+        if (['cancelled', 'failed'].includes(attempt.executionState)) {
+          return {
+            status: 'cancelled_redacted',
+            authorityVersion: 0,
+            subjectType: 'life_planning',
+            subjectId: attempt.planningId
+          };
+        }
+        return {
+          status: 'ready',
+          authorityVersion: 0,
+          subjectType: 'life_planning',
+          subjectId: attempt.planningId,
+          comparisonDirection: job.payload.comparisonDirection,
+          authoritativeResult: attempt.authoritativeResult,
+          execution: { attempt, inputSnapshot: attempt.inputSnapshot }
+        };
+      }
+      if (job.subjectType !== 'turn') {
+        throw new Error('legacy comparison subject authority conflict');
+      }
+      const turn = this.getTurn(job.turnId);
+      if (!turn || Number(turn.resultAuthorityVersion || 0) !== 0) {
+        throw new Error('legacy comparison turn authority conflict');
+      }
+      const envelope = parseJson(turn.envelopeJson, {});
+      const pinnedInput = {
+        envelope,
+        route: turn.route,
+        routeReasons: turn.routeReasons,
+        presetVersion: turn.presetVersion,
+        annotationSnapshot: turn.annotationSnapshot
+      };
+      const authoritativeResult = parseJson(turn.replyJson, {});
+      if (contentHash(pinnedInput) !== job.payload.inputChecksum
+        || contentHash(authoritativeResult) !== job.payload.authoritativeResultChecksum) {
+        throw new Error('legacy comparison input authority conflict');
+      }
+      const currentBatch = this.getCurrentUserBatch(turn.turnId);
+      return {
+        status: 'ready',
+        authorityVersion: 0,
+        subjectType: 'turn',
+        subjectId: job.payload.subjectId || turn.turnId,
+        comparisonDirection: job.payload.comparisonDirection,
+        authoritativeResult,
+        execution: {
+          turn,
+          envelope,
+          currentBatch,
+          scene: {},
+          routeDecision: {
+            route: turn.route,
+            allowedActionTargets: [envelope.characterId, 'user']
+          }
+        }
+      };
+    }
+    if (contract.jobType !== job.jobType) {
+      throw new Error('comparison direction authority conflict');
+    }
+    if (job.subjectType === 'life_planning') {
+      const attempt = this.getLifePlanningAttempt(job.subjectId);
+      if (!attempt || attempt.compareJobId !== job.jobId
+        || attempt.comparisonReleaseId !== job.payload.comparisonReleaseId
+        || attempt.comparisonPipelineChecksum !== job.payload.comparisonPipelineChecksum
+        || attempt.comparisonDirection !== job.payload.comparisonDirection
+        || attempt.authoritativeResultChecksum !== job.payload.authoritativeResultChecksum
+        || attempt.inputChecksum !== job.payload.inputChecksum
+        || contentHash(attempt.inputSnapshot) !== attempt.inputChecksum
+        || contentHash(attempt.authoritativeResult) !== attempt.authoritativeResultChecksum) {
+        throw new Error('life comparison execution authority conflict');
+      }
+      if (['cancelled', 'failed'].includes(attempt.executionState)) {
+        return {
+          status: 'cancelled_redacted',
+          authorityVersion: 1,
+          subjectType: 'life_planning',
+          subjectId: attempt.planningId
+        };
+      }
+      return {
+        status: 'ready',
+        authorityVersion: 1,
+        subjectType: 'life_planning',
+        subjectId: attempt.planningId,
+        comparisonReleaseId: attempt.comparisonReleaseId,
+        comparisonReleaseChecksum: attempt.comparisonPipelineChecksum,
+        comparisonDirection: attempt.comparisonDirection,
+        authoritativeResult: attempt.authoritativeResult,
+        execution: {
+          attempt,
+          inputSnapshot: attempt.inputSnapshot
+        }
+      };
+    }
+    if (job.subjectType !== 'turn' || !job.authorityGroupId) {
+      throw new Error('comparison subject authority conflict');
+    }
+    const closure = this.assertVisibleGroupAuthorityInternal(job.authorityGroupId, {
+      purpose: 'comparison'
+    });
+    if (closure.status === 'redacted') {
+      return {
+        status: 'cancelled_redacted',
+        authorityVersion: 1,
+        subjectType: 'turn',
+        subjectId: closure.group.authorityLineageKey
+      };
+    }
+    const receipt = closure.receipt;
+    const turn = this.getTurn(receipt.authoritativeTurnId);
+    const envelope = turn ? parseJson(turn.envelopeJson, {}) : {};
+    const expectedInputChecksum = turn ? contentHash({
+      envelope,
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      authoritativePipelineChecksum: turn.authoritativePipelineChecksum,
+      comparisonReleaseId: turn.comparisonReleaseId,
+      comparisonPipelineChecksum: turn.comparisonPipelineChecksum,
+      rolloutRevision: turn.rolloutRevision,
+      rolloutEvidenceEpoch: turn.rolloutEvidenceEpoch,
+      shadowEpoch: turn.shadowEpoch,
+      canaryEpoch: turn.canaryEpoch,
+      canarySlot: turn.canarySlot
+    }) : null;
+    const comparisonRelease = turn?.comparisonReleaseId
+      ? this.getPipelineRelease(turn.comparisonReleaseId)
+      : null;
+    if (!turn || Number(turn.resultAuthorityVersion) !== 1
+      || job.turnId !== turn.turnId
+      || job.subjectId !== turn.authorityLineageKey
+      || job.payload.comparisonReleaseId !== turn.comparisonReleaseId
+      || job.payload.comparisonDirection !== contract.comparisonDirection
+      || Number(job.payload.rolloutEvidenceEpoch) !== Number(turn.rolloutEvidenceEpoch)
+      || (job.payload.shadowEpoch ?? null) !== (turn.shadowEpoch ?? null)
+      || (job.payload.canaryEpoch ?? null) !== (turn.canaryEpoch ?? null)
+      || (job.payload.canarySlot ?? null) !== (turn.canarySlot ?? null)
+      || job.payload.annotationSnapshotChecksum !== contentHash(turn.annotationSnapshot || {})
+      || job.payload.inputChecksum !== expectedInputChecksum
+      || !comparisonRelease
+      || comparisonRelease.releaseChecksum !== turn.comparisonPipelineChecksum
+      || job.payload.authoritativeResultChecksum !== receipt.commitChecksum) {
+      throw new Error('canonical comparison execution authority conflict');
+    }
+    const items = this.visibleItemsForGroup(job.authorityGroupId).map(item => ({
+      ...item.item,
+      messageId: item.messageId,
+      ordinal: item.ordinal
+    }));
+    const actions = this.actionsForGroup(job.authorityGroupId).map(action => ({
+      ...action.action,
+      actionId: action.actionId,
+      ordinal: action.ordinal,
+      kind: action.kind,
+      targetKey: action.targetKey,
+      targetRevision: action.targetRevision
+    }));
+    return {
+      status: 'ready',
+      authorityVersion: 1,
+      subjectType: 'turn',
+      subjectId: turn.authorityLineageKey,
+      comparisonReleaseId: turn.comparisonReleaseId,
+      comparisonReleaseChecksum: turn.comparisonPipelineChecksum,
+      comparisonDirection: job.payload.comparisonDirection,
+      authoritativeResult: {
+        terminalDisposition: closure.terminalDisposition,
+        replyParts: items,
+        actions,
+        commitChecksum: receipt.commitChecksum
+      },
+      execution: {
+        turn,
+        envelope,
+        currentBatch: this.getCurrentUserBatch(turn.turnId),
+        scene: envelope.context?.scene || {},
+        allowedActionTargets: [turn.characterId, 'user']
+      }
+    };
+  }
+
   completeConsolidationJob({ jobId, workerId, now: completedAt = now() }) {
     return this.transaction(() => {
       const result = this.db.prepare(`
@@ -8680,6 +9261,7 @@ export class YuqiStore {
   failConsolidationJob({ jobId, workerId, now: failedAt = now(), errorCode, nextDueAt }) {
     return this.transaction(() => {
       const retry = Number(nextDueAt) > Number(failedAt);
+      const before = this.getConsolidationJob(jobId);
       const result = this.db.prepare(`
         UPDATE consolidation_jobs
         SET state = ?, due_at = ?, lease_owner = NULL, lease_expires_at = NULL,
@@ -8694,6 +9276,47 @@ export class YuqiStore {
         workerId
       );
       if (Number(result.changes) !== 1) throw new Error('consolidation job lease mismatch');
+      if (!retry && before
+        && ['shadow_cognition', 'active_canary_compare'].includes(before.jobType)) {
+        let contract = null;
+        try {
+          contract = comparisonContractForDirection(before.payload?.comparisonDirection);
+        } catch {}
+        if (contract?.jobType === before.jobType) {
+          let subject = null;
+          if (before.subjectType === 'life_planning') {
+            subject = this.getLifePlanningAttempt(before.subjectId);
+            if (subject) {
+              this.db.prepare(`
+                UPDATE cognition_life_planning_attempts
+                SET execution_state = 'completed', comparison_state = 'failed',
+                    completed_at = ?, last_error_code = ?, updated_at = ?
+                WHERE planning_id = ? AND compare_job_id = ?
+                  AND execution_state = 'result_committed'
+                  AND comparison_state IN ('queued','running')
+              `).run(
+                Number(failedAt),
+                String(errorCode || 'COMPARISON_FAILED'),
+                Number(failedAt),
+                before.subjectId,
+                before.jobId
+              );
+            }
+          } else if (before.subjectType === 'turn' && before.authorityGroupId) {
+            const receipt = this.getVisibleCommitReceipt(before.subjectId);
+            subject = receipt ? this.getTurn(receipt.authoritativeTurnId) : null;
+          }
+          if (contract.jobType === 'active_canary_compare' && subject) {
+            this.settleCanaryFailureInternal({
+              rolloutKey: subject.rolloutKey,
+              canaryEpoch: subject.canaryEpoch,
+              canarySlot: subject.canarySlot,
+              reasonCode: String(errorCode || 'CANARY_COMPARISON_FAILED'),
+              now: failedAt
+            });
+          }
+        }
+      }
       return mapConsolidationJob(
         this.db.prepare('SELECT * FROM consolidation_jobs WHERE job_id = ?').get(jobId)
       );
@@ -8751,12 +9374,54 @@ export class YuqiStore {
     );
   }
 
+  settleCanaryFailureInternal({
+    rolloutKey,
+    canaryEpoch,
+    canarySlot,
+    reasonCode,
+    now: settledAt = now()
+  }) {
+    if (canarySlot == null) return false;
+    const key = String(rolloutKey || '');
+    const epoch = Number(canaryEpoch);
+    const slot = Number(canarySlot);
+    if (!key || !Number.isSafeInteger(epoch) || epoch < 0
+      || !Number.isSafeInteger(slot) || slot < 1 || slot > 10) {
+      throw new Error('CANARY_ACCOUNTING_INVARIANT');
+    }
+    const rollout = this.db.prepare(
+      'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+    ).get(key);
+    if (!rollout) {
+      if (allocationRows.length === 0) return { count: 0, oldestAt: null };
+      throw new Error('CANARY_ACCOUNTING_INVARIANT');
+    }
+    if (Number(rollout.canary_epoch) !== epoch) return false;
+    const update = this.db.prepare(`
+      UPDATE cognition_kind_rollouts
+      SET canary_failure_count = canary_failure_count + 1,
+          revision = revision + 1, last_reason_code = ?, updated_at = ?
+      WHERE rollout_key = ? AND canary_epoch = ?
+        AND canary_started_count >= ?
+        AND canary_completed_count + canary_failure_count < canary_started_count
+    `).run(
+      String(reasonCode || 'CANARY_TERMINAL_FAILURE'),
+      Number(settledAt),
+      key,
+      epoch,
+      slot
+    );
+    if (Number(update.changes) !== 1) throw new Error('CANARY_ACCOUNTING_INVARIANT');
+    return true;
+  }
+
   recordComparisonOutcomeInternal({
     jobId,
     workerId,
     run,
     report,
     criticalFindings = [],
+    terminalCancellation = null,
     now: recordedAt = now()
   }) {
     return this.transaction(() => {
@@ -8770,38 +9435,148 @@ export class YuqiStore {
         throw new Error('comparison job payload checksum mismatch');
       }
       const payload = parseJson(job.payload_json, {});
+      let freshContract = null;
+      try {
+        freshContract = comparisonContractForDirection(payload.comparisonDirection);
+      } catch {}
+      const freshAuthority = Boolean(freshContract);
+      let authority = null;
+      let subject = null;
+      let rolloutKey = payload.rolloutKey;
+      let rolloutEvidenceEpoch = payload.rolloutEvidenceEpoch;
+      let shadowEpoch = payload.shadowEpoch;
+      let canaryEpoch = payload.canaryEpoch;
+      let canarySlot = payload.canarySlot;
+      let pipelineChecksum = payload.pipelineChecksum;
+      let shadowDirection = payload.comparisonDirection
+        === 'legacy_authoritative_cognition_compare';
+
+      if (freshAuthority) {
+        if (freshContract.jobType !== job.job_type) {
+          throw new Error('comparison direction authority conflict');
+        }
+        authority = this.loadComparisonExecutionAuthorityInternal({ jobId, workerId });
+        if (authority.status === 'cancelled_redacted') {
+          if (terminalCancellation !== 'cancelled_redacted') {
+            throw new Error('comparison source was redacted before outcome commit');
+          }
+          if (job.subject_type === 'life_planning') {
+            subject = this.getLifePlanningAttempt(job.subject_id);
+            this.db.prepare(`
+              UPDATE cognition_life_planning_attempts
+              SET comparison_state = 'cancelled', completed_at = COALESCE(completed_at, ?),
+                  updated_at = ?
+              WHERE planning_id = ? AND comparison_state NOT IN ('completed','failed','cancelled')
+            `).run(Number(recordedAt), Number(recordedAt), job.subject_id);
+          } else {
+            const cancelledTurn = this.db.prepare(`
+              SELECT * FROM turns
+              WHERE authority_lineage_key = ? AND result_authority_version = 1
+              ORDER BY created_at, turn_id LIMIT 1
+            `).get(job.subject_id);
+            subject = cancelledTurn ? mapTurn(cancelledTurn) : null;
+          }
+          if (subject) {
+            this.settleCanaryFailureInternal({
+              rolloutKey: subject.rolloutKey,
+              canaryEpoch: subject.canaryEpoch,
+              canarySlot: subject.canarySlot,
+              reasonCode: 'CANARY_SOURCE_REDACTED',
+              now: recordedAt
+            });
+          }
+          const cancelled = this.db.prepare(`
+            UPDATE consolidation_jobs
+            SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+                last_error_code = 'SOURCE_REDACTED', updated_at = ?
+            WHERE job_id = ? AND state = 'running' AND lease_owner = ?
+          `).run(Number(recordedAt), jobId, workerId);
+          if (Number(cancelled.changes) !== 1) throw new Error('comparison job lease is not held');
+          return {
+            status: 'cancelled_redacted',
+            run: null,
+            report: null,
+            rollout: subject ? this.getCognitionRollout(subject.rolloutKey) : null,
+            staleForRollout: false
+          };
+        }
+        if (terminalCancellation) {
+          throw new Error('comparison terminal cancellation authority conflict');
+        }
+        if (authority.status !== 'ready') {
+          throw new Error('comparison execution authority is unavailable');
+        }
+        subject = authority.subjectType === 'life_planning'
+          ? authority.execution.attempt
+          : authority.execution.turn;
+        rolloutKey = subject.rolloutKey;
+        rolloutEvidenceEpoch = subject.rolloutEvidenceEpoch;
+        shadowEpoch = subject.shadowEpoch;
+        canaryEpoch = subject.canaryEpoch;
+        canarySlot = subject.canarySlot;
+        pipelineChecksum = authority.comparisonReleaseChecksum;
+        shadowDirection = freshContract.jobType === 'shadow_cognition';
+      } else {
+        const legacyPair = payload.comparisonDirection === 'legacy_authoritative_cognition_compare'
+          ? 'shadow_cognition'
+          : payload.comparisonDirection === 'cognition_authoritative_legacy_compare'
+            ? 'active_canary_compare'
+            : null;
+        if (legacyPair !== job.job_type) {
+          throw new Error('comparison direction authority conflict');
+        }
+        if (terminalCancellation) {
+          throw new Error('legacy comparison cannot use canonical cancellation');
+        }
+      }
+
       const rollout = this.db.prepare(
         'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
-      ).get(payload.rolloutKey);
-      const shadowDirection = payload.comparisonDirection
-        === 'legacy_authoritative_cognition_compare';
+      ).get(rolloutKey);
       const validEpoch = Boolean(rollout)
-        && Number(rollout.evidence_epoch) === Number(payload.rolloutEvidenceEpoch)
-        && rollout.pipeline_checksum === payload.pipelineChecksum
+        && Number(rollout.evidence_epoch) === Number(rolloutEvidenceEpoch)
         && (
-          shadowDirection
-            ? rollout.current_mode === 'shadow'
-              && Number(rollout.shadow_epoch) === Number(payload.shadowEpoch)
-            : rollout.current_mode === 'active'
-              && rollout.rollout_phase === 'canary'
-              && Number(rollout.canary_epoch) === Number(payload.canaryEpoch)
+          freshAuthority
+            ? shadowDirection
+              ? rollout.current_mode === 'shadow'
+                && rollout.candidate_phase === 'shadow'
+                && rollout.stable_release_id === subject.authoritativeReleaseId
+                && rollout.candidate_release_id === subject.comparisonReleaseId
+                && Number(rollout.shadow_epoch) === Number(shadowEpoch)
+              : rollout.current_mode === 'active'
+                && rollout.candidate_phase === 'canary'
+                && rollout.candidate_release_id === subject.authoritativeReleaseId
+                && rollout.stable_release_id === subject.comparisonReleaseId
+                && Number(rollout.canary_epoch) === Number(canaryEpoch)
+                && Number(subject.canarySlot) === Number(canarySlot)
+            : rollout.pipeline_checksum === pipelineChecksum
+              && (shadowDirection
+                ? rollout.current_mode === 'shadow'
+                  && Number(rollout.shadow_epoch) === Number(shadowEpoch)
+                : rollout.current_mode === 'active'
+                  && rollout.rollout_phase === 'canary'
+                  && Number(rollout.canary_epoch) === Number(canaryEpoch))
         );
       const stale = !validEpoch;
+      if (!run || typeof run !== 'object') throw new Error('comparison run is required');
+      const reportInput = report && typeof report === 'object' ? report : {};
       this.putCognitionShadowRunInternal({
         ...run,
         runId: run.runId || `run_${contentHash({ jobId, payload }).slice(0, 24)}`,
-        subjectType: payload.subjectType,
-        subjectId: payload.subjectId,
-        turnId: payload.turnId || null,
-        rolloutKey: payload.rolloutKey,
+        subjectType: freshAuthority ? authority.subjectType : payload.subjectType,
+        subjectId: freshAuthority ? authority.subjectId : payload.subjectId,
+        turnId: freshAuthority && authority.subjectType === 'turn'
+          ? subject.turnId
+          : payload.turnId || null,
+        rolloutKey,
         source: 'live',
         comparisonDirection: payload.comparisonDirection,
-        evidenceEpoch: payload.rolloutEvidenceEpoch,
-        shadowEpoch: payload.shadowEpoch,
-        canaryEpoch: payload.canaryEpoch,
-        canarySlot: payload.canarySlot,
-        rolloutRevision: payload.rolloutRevision,
-        pipelineChecksum: payload.pipelineChecksum,
+        evidenceEpoch: rolloutEvidenceEpoch,
+        shadowEpoch,
+        canaryEpoch,
+        canarySlot,
+        rolloutRevision: freshAuthority ? subject.rolloutRevision : payload.rolloutRevision,
+        pipelineChecksum,
         authoritativeResultChecksum: payload.authoritativeResultChecksum,
         criticalFindings,
         staleForRollout: stale,
@@ -8810,21 +9585,21 @@ export class YuqiStore {
         updatedAt: recordedAt
       });
       const summary = {
-        ...(report.summary || {}),
-        rolloutKey: payload.rolloutKey,
+        ...(reportInput.summary || {}),
+        rolloutKey,
         jobId,
         staleForRollout: stale,
         criticalFindings
       };
-      const reportId = report.reportId
+      const reportId = reportInput.reportId
         || `report_compare_${contentHash({ jobId, summary }).slice(0, 24)}`;
       const storedReport = this.putEvaluationReportInternal({
         reportId,
         reportType: shadowDirection ? 'live_shadow' : 'active_canary',
-        rolloutKey: payload.rolloutKey,
+        rolloutKey,
         sourceType: 'comparison_run',
         sourceRef: jobId,
-        artifactPath: report.artifactPath || '',
+        artifactPath: reportInput.artifactPath || '',
         summary,
         createdAt: recordedAt
       });
@@ -8863,7 +9638,7 @@ export class YuqiStore {
           reportId, storedReport.artifactChecksum,
           rollback ? 1 : 0, Number(recordedAt),
           rollback ? criticalFindings[0]?.code || 'ACTIVE_PRECOMMIT_CRITICAL' : 'comparison_recorded',
-          Number(recordedAt), payload.rolloutKey, Number(rollout.revision)
+          Number(recordedAt), rolloutKey, Number(rollout.revision)
         );
         if (Number(update.changes) !== 1) throw new RolloutRevisionConflictError();
         if (rollback) {
@@ -8891,10 +9666,19 @@ export class YuqiStore {
             last_error_code = NULL, updated_at = ?
         WHERE job_id = ? AND state = 'running' AND lease_owner = ?
       `).run(Number(recordedAt), jobId, workerId);
+      if (freshAuthority && authority.subjectType === 'life_planning') {
+        this.db.prepare(`
+          UPDATE cognition_life_planning_attempts
+          SET execution_state = 'completed', comparison_state = 'completed',
+              completed_at = ?, updated_at = ?
+          WHERE planning_id = ? AND compare_job_id = ?
+            AND execution_state = 'result_committed' AND comparison_state = 'queued'
+        `).run(Number(recordedAt), Number(recordedAt), subject.planningId, jobId);
+      }
       return {
         run: this.getCognitionShadowRun(run.runId || `run_${contentHash({ jobId, payload }).slice(0, 24)}`),
         report: this.getEvaluationReport(reportId),
-        rollout: this.getCognitionRollout(payload.rolloutKey),
+        rollout: this.getCognitionRollout(rolloutKey),
         staleForRollout: stale
       };
     });
@@ -8908,6 +9692,132 @@ export class YuqiStore {
     `).all(rolloutKey, direction, Number(since)).map(mapShadowRun);
   }
 
+  readCanaryOutstandingAuthorityInternal({ rolloutKey, canaryEpoch }) {
+    const key = String(rolloutKey || '');
+    const epoch = Number(canaryEpoch);
+    if (!key || !Number.isSafeInteger(epoch) || epoch < 0) {
+      throw new Error('invalid canary outstanding authority query');
+    }
+    const allocationRows = [];
+    const owners = [];
+    let completed = 0;
+    let failure = 0;
+    const classifyCompletedRun = ({ subjectType, subjectId, slot }) => {
+      const runs = this.db.prepare(`
+        SELECT critical_findings_json
+        FROM cognition_shadow_runs
+        WHERE source = 'live' AND stale_for_rollout = 0
+          AND subject_type = ? AND subject_id = ?
+          AND rollout_key = ? AND canary_epoch = ? AND canary_slot = ?
+          AND state = 'completed'
+        ORDER BY created_at, run_id
+      `).all(subjectType, subjectId, key, epoch, slot);
+      if (runs.length !== 1) throw new Error('CANARY_ACCOUNTING_INVARIANT');
+      return Array.isArray(parseJson(runs[0].critical_findings_json, []))
+        && parseJson(runs[0].critical_findings_json, []).length > 0
+        ? 'failure'
+        : 'completed';
+    };
+    if (key !== 'LIFE_PLANNING') {
+      for (const row of this.db.prepare(`
+        SELECT root.authority_lineage_key AS subject_id, root.created_at,
+               root.canary_slot, lineage.state AS lineage_state
+        FROM turns root
+        JOIN turn_authority_lineages lineage
+          ON lineage.lineage_key = root.authority_lineage_key
+        WHERE root.result_authority_version = 1
+          AND root.retry_of_turn_id IS NULL
+          AND root.rollout_key = ?
+          AND root.canary_epoch = ?
+          AND root.canary_slot IS NOT NULL
+        ORDER BY root.canary_slot, root.created_at, root.turn_id
+      `).all(key, epoch)) {
+        allocationRows.push(row);
+        if (row.lineage_state === 'cancelled') {
+          failure += 1;
+          continue;
+        }
+        const terminalJobs = this.db.prepare(`
+          SELECT job_id, state
+          FROM consolidation_jobs
+          WHERE subject_type = 'turn' AND subject_id = ?
+            AND job_type = 'active_canary_compare'
+            AND state IN ('completed','failed','cancelled')
+          ORDER BY created_at, job_id
+        `).all(row.subject_id);
+        if (terminalJobs.length > 1) throw new Error('CANARY_ACCOUNTING_INVARIANT');
+        if (terminalJobs.length === 0) {
+          owners.push(Number(row.created_at));
+          continue;
+        }
+        if (terminalJobs[0].state !== 'completed') {
+          failure += 1;
+          continue;
+        }
+        const outcome = classifyCompletedRun({
+          subjectType: 'turn', subjectId: row.subject_id, slot: Number(row.canary_slot)
+        });
+        if (outcome === 'completed') completed += 1;
+        else failure += 1;
+      }
+    }
+    if (key === 'LIFE_PLANNING') {
+      for (const row of this.db.prepare(`
+        SELECT planning_id, created_at, canary_slot, execution_state, comparison_state
+        FROM cognition_life_planning_attempts
+        WHERE rollout_key = 'LIFE_PLANNING'
+          AND canary_epoch = ?
+          AND canary_slot IS NOT NULL
+        ORDER BY created_at, planning_id
+      `).all(epoch)) {
+        allocationRows.push({
+          subject_id: row.planning_id,
+          created_at: row.created_at,
+          canary_slot: row.canary_slot
+        });
+        const terminalExecution = ['failed', 'cancelled'].includes(row.execution_state);
+        if (terminalExecution || ['failed', 'cancelled'].includes(row.comparison_state)) {
+          failure += 1;
+          continue;
+        }
+        if (row.comparison_state === 'completed') {
+          const outcome = classifyCompletedRun({
+            subjectType: 'life_planning',
+            subjectId: row.planning_id,
+            slot: Number(row.canary_slot)
+          });
+          if (outcome === 'completed') completed += 1;
+          else failure += 1;
+          continue;
+        }
+        owners.push(Number(row.created_at));
+      }
+    }
+    const rollout = this.db.prepare(
+      'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+    ).get(key);
+    if (!rollout) {
+      if (allocationRows.length === 0) return { count: 0, oldestAt: null };
+      throw new Error('CANARY_ACCOUNTING_INVARIANT');
+    }
+    if (Number(rollout.canary_epoch) === epoch) {
+      const started = Number(rollout.canary_started_count);
+      const slots = allocationRows.map(row => Number(row.canary_slot)).sort((a, b) => a - b);
+      const contiguous = slots.length === started
+        && slots.every((slot, index) => slot === index + 1);
+      if (!contiguous
+        || completed !== Number(rollout.canary_completed_count)
+        || failure !== Number(rollout.canary_failure_count)
+        || started !== completed + failure + owners.length) {
+        throw new Error('CANARY_ACCOUNTING_INVARIANT');
+      }
+    }
+    return {
+      count: owners.length,
+      oldestAt: owners.length ? Math.min(...owners) : null
+    };
+  }
+
   countOutstandingComparisonSubjects(input, options = {}) {
     const rolloutKey = typeof input === 'string' ? input : input.rolloutKey;
     const direction = typeof input === 'string' ? null : input.direction;
@@ -8916,6 +9826,13 @@ export class YuqiStore {
     const canaryEpoch = typeof input === 'string'
       ? options.canaryEpoch ?? null
       : input.canaryEpoch ?? null;
+    if (canaryEpoch != null) {
+      const authority = this.readCanaryOutstandingAuthorityInternal({
+        rolloutKey,
+        canaryEpoch
+      });
+      return typeof input === 'string' ? authority : authority.count;
+    }
     const at = typeof input === 'string' ? now() : input.now ?? now();
     const runs = this.db.prepare(`
       SELECT subject_type, subject_id, state, created_at

@@ -11,6 +11,10 @@ import { currentUserBatchForRole, resolveCurrentUserBatch } from './current-user
 import { LifeSimulationCoordinator } from './life-simulation.mjs';
 import { materializeImageAttachments } from './image-attachments.mjs';
 import { reduceCognitiveState } from './cognitive-state.mjs';
+import { compileAgencyView } from './agency-state.mjs';
+import { comparisonContractForMode } from './comparison-contract.mjs';
+import { generationFingerprint, laneKeyForEnvelope } from './interaction-lanes.mjs';
+import { commitVisibleResult } from './visible-result-commit.mjs';
 import {
   characterFactCandidatesForReply,
   hasHighPriorityIssues,
@@ -48,6 +52,28 @@ function evidenceMessages(messages, batch) {
   }
   return [...byId.values()]
     .sort((left, right) => Number(left?.sentAt || 0) - Number(right?.sentAt || 0));
+}
+
+const CANONICAL_TURN_KINDS = new Set([
+  'DIRECT_REPLY',
+  'ROLE_PLAN_CHAT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_CHAT_PRIVATE',
+  'ROLE_PLAN_MOMENT_PRIVATE',
+  'PROACTIVE_CHAT',
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY'
+]);
+
+export function canonicalInteractionAt(envelope, fallback = Date.now()) {
+  const value = envelope?.message?.sentAt
+    ?? envelope?.trigger?.executedAt
+    ?? envelope?.trigger?.scheduledFor
+    ?? envelope?.createdAt
+    ?? fallback;
+  const normalized = Number(value);
+  return Number.isFinite(normalized) ? normalized : Number(fallback);
 }
 
 function stripAttachmentData(message) {
@@ -369,7 +395,7 @@ export class YuqiOrchestrator {
     store, presets, codex, workerId = 'yuqi-worker', clock = Date.now, contextLimit = 200,
     generationContextLimit = 20, roleProfiles = DEFAULT_PROFILES, lifeSimulation = null,
     lifePlanningEnabled = true, cognitivePipeline = null, promotionController = null,
-    lifePlanningDispatcher = null
+    lifePlanningDispatcher = null, releaseExecutor = null
   }) {
     if (!store || !presets || !codex) throw new Error('store, presets, and codex are required');
     this.store = store;
@@ -389,16 +415,45 @@ export class YuqiOrchestrator {
     this.cognitivePipeline = cognitivePipeline;
     this.promotionController = promotionController;
     this.lifePlanningDispatcher = lifePlanningDispatcher;
+    this.releaseExecutor = releaseExecutor;
+    this.releaseExecutorAttached = Boolean(releaseExecutor);
+  }
+
+  attachReleaseExecutor(releaseExecutor) {
+    if (this.releaseExecutorAttached) throw new Error('release executor already attached');
+    if (!releaseExecutor || typeof releaseExecutor.executeTurn !== 'function'
+      || typeof releaseExecutor.executeLife !== 'function') {
+      throw new Error('complete release executor is required');
+    }
+    this.releaseExecutor = releaseExecutor;
+    this.releaseExecutorAttached = true;
+    return this;
   }
 
   accept(envelope) {
-    let submitted = this.promotionController
-      ? this.promotionController.createTurn({
-        envelope,
-        presetVersion: this.presets.current().version,
-        annotationSnapshot: {}
-      })
-      : this.store.submitTurn(envelope);
+    if (this.promotionController && !this.releaseExecutorAttached) {
+      throw new Error('canonical release executor is not attached');
+    }
+    if (envelope?.characterId === 'yuqi'
+      && Number(envelope?.protocolVersion) === 3
+      && CANONICAL_TURN_KINDS.has(String(envelope?.kind || ''))) {
+      throw new Error('unsupported protocolVersion: 3');
+    }
+    const canonical = Boolean(
+      this.promotionController
+      && envelope?.characterId === 'yuqi'
+      && Number(envelope?.protocolVersion) === 2
+      && CANONICAL_TURN_KINDS.has(String(envelope?.kind || ''))
+    );
+    let submitted = canonical
+      ? this.createCanonicalTurnForEnvelope(envelope)
+      : this.promotionController
+        ? this.promotionController.createTurn({
+            envelope,
+            presetVersion: this.presets.current().version,
+            annotationSnapshot: {}
+          })
+        : this.store.submitTurn(envelope);
     if (submitted.state === 'failed') {
       const recovery = this.store.requeueTransientFailedTurn(submitted.turnId);
       if (recovery.requeued) submitted = recovery.turn;
@@ -408,9 +463,142 @@ export class YuqiOrchestrator {
         envelope,
         recentMessages: this.store.listMessages(envelope.characterId, this.contextLimit)
       });
+      if (Number(submitted.resultAuthorityVersion || 0) === 1) {
+        return this.store.setCanonicalTurnRouteInternal({
+          turnId: submitted.turnId,
+          expectedState: submitted.state,
+          expectedTurnRevision: submitted.turnRevision,
+          route: decision.route,
+          reasons: decision.reasons
+        });
+      }
       return this.store.setTurnRoute(submitted.turnId, decision.route, decision.reasons);
     }
     return submitted;
+  }
+
+  createCanonicalTurnForEnvelope(envelope) {
+    const retryParentId = envelope?.context?.retry?.retryOfTurnId || null;
+    const retryParent = retryParentId ? this.store.getTurn(retryParentId) : null;
+    if (retryParentId && !retryParent) {
+      throw new Error('missing canonical retry parent');
+    }
+    if (retryParent && Number(retryParent.resultAuthorityVersion || 0) !== 1) {
+      return this.promotionController.createTurn({
+        envelope,
+        presetVersion: this.presets.current().version,
+        annotationSnapshot: {}
+      });
+    }
+    const selection = retryParent
+      ? null
+      : this.promotionController.selectPipelinePairForFreshSubject(
+          envelope.kind,
+          { now: this.clock() }
+        );
+    const pair = retryParent
+      ? {
+          visibleReleaseId: retryParent.authoritativeReleaseId,
+          comparisonReleaseId: retryParent.comparisonReleaseId,
+          comparisonDirection: comparisonContractForMode(
+            retryParent.comparisonMode
+          ).comparisonDirection
+        }
+      : selection.pair;
+    const rollout = selection?.rollout || null;
+    const laneKey = laneKeyForEnvelope(envelope);
+    const lane = this.store.getInteractionLane(envelope.characterId, laneKey) || {
+      revision: 0,
+      localSequence: 0,
+      clearEpoch: 0,
+      clearedThroughSequence: 0
+    };
+    const currentBatch = resolveCurrentUserBatch(envelope);
+    const agencySnapshot = this.store.readAgencyAuthoritySnapshotInternal({
+      roleId: envelope.characterId,
+      at: canonicalInteractionAt(envelope, this.clock())
+    });
+    const creation = this.store.createCanonicalVisibleTurnInternal({
+      envelope,
+      rolloutKey: envelope.kind,
+      expectedRolloutRevision: retryParent?.rolloutRevision ?? rollout.revision,
+      authoritativeReleaseId: pair.visibleReleaseId,
+      comparisonReleaseId: pair.comparisonReleaseId,
+      comparisonDirection: pair.comparisonDirection,
+      laneKey,
+      expectedLaneRevision: lane.revision,
+      inputUserBatchId: currentBatch?.batchId
+        || envelope.message?.messageId
+        || envelope.trigger?.triggerId,
+      inputVisibilitySequence: Number(lane.localSequence || 0),
+      inputClearEpoch: Number(lane.clearEpoch || 0),
+      agencySnapshotChecksum: agencySnapshot.checksum,
+      annotationSnapshot: {}
+    });
+    if (creation.status === 'already_committed') {
+      return {
+        ...creation.receipt,
+        status: 'already_committed',
+        state: 'committed',
+        terminal: true,
+        turnId: creation.receipt.authoritativeTurnId
+      };
+    }
+    if (creation.status === 'redacted') {
+      return {
+        status: 'redacted',
+        state: 'redacted',
+        terminal: true,
+        visible: false,
+        turnId: creation.receipt?.authoritativeTurnId ?? creation.lineage?.latestTurnId ?? null,
+        authorityLineageKey:
+          creation.receipt?.authorityLineageKey ?? creation.lineage?.lineageKey ?? null,
+        visibleGroupId: creation.receipt?.visibleGroupId ?? null,
+        commitChecksum: creation.receipt?.commitChecksum ?? null,
+        replyParts: [],
+        actions: []
+      };
+    }
+    return creation.turn;
+  }
+
+  async recover(turnId) {
+    const turn = this.store.getTurn(turnId);
+    if (!turn) throw new Error('turn not found');
+    if (Number(turn.resultAuthorityVersion || 0) === 0) {
+      return { ...(await this.run(turnId)), recoveryPath: 'legacy' };
+    }
+    const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
+    const validLineage = lineage
+      && ['open', 'committed'].includes(lineage.state)
+      && lineage.latestTurnId === turn.turnId
+      && Number(lineage.revision) >= Number(turn.lineageRevisionAtCreation || 0);
+    if (!validLineage) {
+      const reasonCode = !lineage
+        ? 'missing canonical lineage'
+        : 'canonical lineage latest turn invariant';
+      this.store.putDiagnostic?.({
+        turnId,
+        stage: 'canonical_recovery_quarantine',
+        level: 'error',
+        detail: { reasonCode }
+      });
+      return { status: 'quarantined', reasonCode, recoveryPath: 'canonical' };
+    }
+    const outcome = this.store.readCanonicalCommitOutcomeInternal?.({
+      lineageKey: turn.authorityLineageKey,
+      expectedTurnId: turn.turnId
+    });
+    if (outcome) {
+      return { ...outcome, recoveryPath: 'canonical' };
+    }
+    return {
+      ...turn,
+      recoveryPath: 'canonical',
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      comparisonReleaseId: turn.comparisonReleaseId,
+      laneRevision: turn.laneRevision
+    };
   }
 
   deliveryPolicyFor(envelope) {
@@ -443,6 +631,7 @@ export class YuqiOrchestrator {
 
   async process(envelope) {
     const submitted = this.accept(envelope);
+    if (submitted?.terminal === true) return submitted;
     return this.run(submitted.turnId);
   }
 
@@ -558,6 +747,384 @@ export class YuqiOrchestrator {
     this.lifePlanningDispatcher = dispatcher;
   }
 
+  buildLifePlanningReleaseExecution(attempt) {
+    return { attempt };
+  }
+
+  async executeLegacyReleaseTurnDraft({ release, execution }) {
+    const turn = execution?.turn;
+    const envelope = execution?.envelope;
+    if (!turn?.turnId || !envelope?.characterId) {
+      throw new Error('legacy release turn draft execution is unavailable');
+    }
+    const declaredBatch = execution.currentBatch || resolveCurrentUserBatch(envelope);
+    const storedMessages = this.store.listMessages(
+      envelope.characterId,
+      Math.min(5000, this.contextLimit + Number(declaredBatch?.messageIds?.length || 0))
+    );
+    const currentBatch = execution.currentBatch
+      || resolveCurrentUserBatch(envelope, storedMessages);
+    const stateMessages = evidenceMessages(storedMessages, currentBatch);
+    const recentMessages = withoutCurrentBatch(stateMessages, currentBatch, this.contextLimit);
+    let route = execution.routeDecision?.route || turn.route || 'deep';
+    const baseScene = execution.scene || sceneFromEnvelope(envelope);
+    const interactionState = buildAuthoritativeInteractionState({
+      envelope,
+      messages: stateMessages,
+      currentStage: baseScene.relationshipStage,
+      now: this.clock()
+    });
+    const lifeContext = this.lifeSimulation.contextFor(envelope.characterId, this.clock());
+    const memoryRequest = {
+      task: envelope.message ? 'retrieve_and_extract_evidence' : 'retrieve_context_for_trigger',
+      preset: this.legacyReleasePreset('memory', release, {
+        ...baseScene,
+        kind: envelope.kind
+      }),
+      scene: baseScene,
+      ...(currentBatch
+        ? { currentUserBatch: currentUserBatchForRole(currentBatch) }
+        : { currentTrigger: envelope.trigger, triggerIsNotUserEvidence: true }),
+      recentMessages,
+      interactionState,
+      lifeContext
+    };
+    const memoryProfile = roleExecutionProfile(route === 'fast' ? 'fast' : 'deep', 'memory', this.roleProfiles);
+    let memoryResult = await this.runStructuredRoleDraftOnly({
+      turnId: turn.turnId,
+      role: 'memory',
+      request: memoryRequest,
+      clientUserMessageId: `${turn.turnId}_release_memory`,
+      profile: memoryProfile,
+      localImagePaths: execution.localImagePaths
+    });
+    if (route === 'fast' && memoryResult.requiresDeepMemory === true) {
+      route = 'deep';
+      memoryResult = await this.runStructuredRoleDraftOnly({
+        turnId: turn.turnId,
+        role: 'memory',
+        request: {
+          ...memoryRequest,
+          task: 'deep_retrieve_and_extract_evidence',
+          fastMemoryReview: memoryResult
+        },
+        clientUserMessageId: `${turn.turnId}_release_memory_deep`,
+        profile: roleExecutionProfile('deep', 'memory', this.roleProfiles),
+        localImagePaths: execution.localImagePaths
+      });
+    }
+    const conversationFrame = normalizeConversationFrame(memoryResult.conversationFrame);
+    const relationship = resolveRelationshipStage(
+      baseScene,
+      memoryResult.relationshipStageReview,
+      stateMessages,
+      this.clock()
+    );
+    const scene = {
+      ...baseScene,
+      relationshipStage: relationship.stage
+    };
+    const interactionContract = compileInteractionContract({
+      envelope,
+      scene,
+      interactionState,
+      conversationFrame,
+      recentMessages: stateMessages
+    });
+    if (route === 'fast' && (
+      interactionContract.preserveAmbiguity
+      || interactionContract.recentCorrection.active
+      || interactionContract.explicitBoundaries.length > 0
+      || conversationFrame.needsNuanceReview
+    )) {
+      route = 'deep';
+    }
+    if (envelope.kind === 'PROACTIVE_CHAT' && interactionContract.shouldRespond === false) {
+      return normalizeBrainDraft({
+        action: 'skip',
+        reply: '',
+        skipReason: 'structural_silence',
+        usedFactIds: [],
+        rolePlanOperationsJson: '[]'
+      });
+    }
+    const memoryPacket = {
+      query: String(memoryResult.query || currentBatch?.combinedText || envelope.trigger?.triggerType || ''),
+      keywords: Array.isArray(memoryResult.keywords) ? memoryResult.keywords.map(String) : [],
+      conversationFrame,
+      interactionContract,
+      effectiveRelationshipStage: relationship.stage,
+      relationshipStageAction: relationship.action,
+      lifeContext
+    };
+    const generationMessages = buildGenerationWindow(stateMessages, {
+      currentMessageIds: currentBatch?.messageIds || [],
+      limit: this.generationContextLimit
+    });
+    const evidencePack = buildEvidencePack(this.store, {
+      characterId: envelope.characterId,
+      query: memoryPacket.query,
+      keywords: memoryPacket.keywords,
+      limit: 12
+    });
+    const deliveryPolicy = this.readDraftDeliveryPolicy(envelope);
+    let previous = null;
+    let previousDraft = null;
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const brainRequest = {
+        task: previous?.decision === 'rewrite' ? 'rewrite_as_yuqi' : 'reply_as_yuqi',
+        preset: this.legacyReleasePreset('brain', release, {
+          ...scene,
+          kind: envelope.kind,
+          revealedFactIds: evidencePack.facts.map(fact => fact.factId)
+        }),
+        scene,
+        ...(currentBatch
+          ? { currentUserBatch: currentUserBatchForRole(currentBatch) }
+          : { currentTrigger: envelope.trigger }),
+        ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
+        ...(currentRolePlanExecution(envelope)
+          ? { currentRolePlanExecution: currentRolePlanExecution(envelope) }
+          : {}),
+        recentMessages: generationMessages,
+        interactionState,
+        lifeContext,
+        evidencePack,
+        interactionContract,
+        ...(execution.agencyView ? { agencyView: execution.agencyView } : {}),
+        ...(deliveryPolicy ? { deliveryPolicy } : {}),
+        ...(previous?.decision === 'rewrite' ? {
+          rejectedDraft: previousDraft,
+          supervisorIssues: previous.issues || [],
+          rewriteContract: rewriteContractForBrain(previous)
+        } : {})
+      };
+      let draft = normalizeBrainDraft(await this.withBrainRoleLock(() =>
+        this.runStructuredRoleDraftOnly({
+          turnId: turn.turnId,
+          role: 'brain',
+          request: brainRequest,
+          clientUserMessageId: `${turn.turnId}_release_brain_${attempt}`,
+          profile: roleExecutionProfile(route === 'fast' ? 'fast' : 'deep', 'brain', this.roleProfiles),
+          localImagePaths: execution.localImagePaths
+        })
+      ));
+      if (draft.action === 'skip' && !isAutomaticKind(envelope.kind)) {
+        draft = { ...draft, action: 'send', reply: repairReplyForDelivery('', envelope.kind) };
+      }
+      const validMomentAction = isMomentKind(envelope.kind)
+        && draft.momentAction?.momentId
+        && (draft.momentAction.like || draft.momentAction.comment);
+      if (isMomentKind(envelope.kind) && !validMomentAction) {
+        draft = { ...draft, action: 'skip', reply: '' };
+      }
+      const hard = draft.action === 'skip' || validMomentAction
+        ? { ok: true, issues: [] }
+        : hardValidateReply(draft.reply);
+      if (!hard.ok) {
+        draft = isAutomaticKind(envelope.kind) && !String(draft.reply || '').trim()
+          ? { ...draft, action: 'skip', reply: '' }
+          : { ...draft, action: 'send', reply: repairReplyForDelivery(draft.reply, envelope.kind) };
+      }
+      if (draft.action === 'skip' && deliveryPolicy?.skipAllowed === false) {
+        previous = proactiveDeliveryRewrite(previous, attempt, 'brain_skip');
+        previousDraft = draft;
+        route = 'deep';
+        continue;
+      }
+      if (draft.action === 'skip' || (
+        route === 'fast'
+        && !hasLifeDecision(draft)
+        && draft.rolePlanOperations.length === 0
+      )) {
+        return draft;
+      }
+      route = 'deep';
+      const supervisorRequest = {
+        task: 'review_yuqi_reply',
+        preset: this.legacyReleasePreset('supervisor', release, {
+          ...scene,
+          kind: envelope.kind
+        }),
+        scene,
+        ...(currentBatch
+          ? { currentUserBatch: currentUserBatchForRole(currentBatch) }
+          : { currentTrigger: envelope.trigger }),
+        ...(envelope.context?.payment ? { currentPayment: envelope.context.payment } : {}),
+        ...(currentRolePlanExecution(envelope)
+          ? { currentRolePlanExecution: currentRolePlanExecution(envelope) }
+          : {}),
+        recentMessages: generationMessages,
+        interactionState,
+        lifeContext,
+        evidencePack,
+        conversationFrame,
+        interactionContract,
+        ...(execution.agencyView ? { agencyView: execution.agencyView } : {}),
+        ...(deliveryPolicy ? { deliveryPolicy } : {}),
+        draft,
+        previousReview: previous,
+        rewriteResolution: draft.rewriteResolution
+      };
+      let reviewed = normalizeSupervisorResult(await this.runStructuredRoleDraftOnly({
+        turnId: turn.turnId,
+        role: 'supervisor',
+        request: supervisorRequest,
+        clientUserMessageId: `${turn.turnId}_release_supervisor_${attempt}`,
+        profile: roleExecutionProfile('deep', 'supervisor', this.roleProfiles),
+        localImagePaths: execution.localImagePaths
+      }), {
+        attempt,
+        previous,
+        direct: !isAutomaticKind(envelope.kind)
+      });
+      if (deliveryPolicy?.skipAllowed === false
+        && ['skip', 'reject'].includes(reviewed.decision)) {
+        reviewed = proactiveDeliveryRewrite(previous, attempt, reviewed.decision);
+      }
+      if (reviewed.decision === 'approve') return draft;
+      if (reviewed.decision === 'skip') {
+        if (!isAutomaticKind(envelope.kind)) {
+          throw new Error('supervisor cannot skip a direct reply');
+        }
+        return { ...draft, action: 'skip', reply: '' };
+      }
+      if (reviewed.decision === 'reject') {
+        if (!isAutomaticKind(envelope.kind)) throw new Error('supervisor rejected the reply');
+        return { ...draft, action: 'skip', reply: '' };
+      }
+      if (attempt >= 3) {
+        if (deliveryPolicy?.skipAllowed === false) {
+          if (hasHighPriorityIssues(reviewed) || !String(draft.reply || '').trim()) {
+            throw new Error('PROACTIVE_DELIVERY_BLOCKED: no safe visible reply after rewrites');
+          }
+          return draft;
+        }
+        if (isAutomaticKind(envelope.kind)) return { ...draft, action: 'skip', reply: '' };
+        if (!(hasHighPriorityIssues(reviewed) && attempt === 3)) return draft;
+      }
+      previous = reviewed;
+      previousDraft = draft;
+    }
+    throw new Error('legacy release draft exceeded supervisor rewrite limit');
+  }
+
+  legacyReleasePreset(role, release, scene) {
+    const pinnedVersion = String(release?.presetVersion || '');
+    if (!pinnedVersion || typeof this.presets.resolvePresetBundle !== 'function') {
+      return this.presets.compileFor(role, { scene });
+    }
+    const current = this.presets.current();
+    if (current.version === pinnedVersion) return this.presets.compileFor(role, { scene });
+    const bundle = this.presets.resolvePresetBundle({ role, version: pinnedVersion, annotations: [] });
+    return [
+      bundle,
+      '',
+      '## 本轮运行边界',
+      `当前关系阶段：${scene?.relationshipStage?.label || scene?.relationshipStage?.id || '初识'}`,
+      scene?.kind ? `当前场景：${scene.kind}` : '',
+      `当前预设版本：${pinnedVersion}`
+    ].filter(Boolean).join('\n');
+  }
+
+  readDraftDeliveryPolicy(envelope) {
+    if (envelope.kind !== 'PROACTIVE_CHAT') return null;
+    try {
+      return this.store.getProactiveChatDeliveryPolicy(envelope.characterId);
+    } catch {
+      return {
+        kind: 'proactive_chat',
+        windowSize: 4,
+        maxSkips: 1,
+        usedSkips: 0,
+        skipAllowed: true,
+        inspectedTurnIds: [],
+        resetAfterTurnId: null
+      };
+    }
+  }
+
+  async runStructuredRoleDraftOnly({
+    turnId,
+    role,
+    request,
+    clientUserMessageId,
+    profile,
+    localImagePaths = []
+  }) {
+    if (!profile?.model || !profile?.effort) throw new Error(`missing execution profile for ${role}`);
+    if (!String(turnId || '')) throw new Error(`turnId is required for ${role}`);
+    let invalidOutput = '';
+    let activeProfile = profile;
+    let capacityFallbackUsed = false;
+    const roleImagePaths = Array.isArray(localImagePaths) && localImagePaths.length
+      ? localImagePaths
+      : this.turnImagePaths.get(turnId) || [];
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const payload = attempt === 1 ? request : {
+        ...request,
+        protocolRepair: {
+          attempt,
+          rule: 'Return exactly one JSON object that matches the supplied output schema.',
+          invalidOutput: invalidOutput.slice(0, 2_000)
+        }
+      };
+      const baseMessageId = attempt === 1
+        ? clientUserMessageId
+        : `${clientUserMessageId}_protocol_${attempt}`;
+      let response;
+      try {
+        response = await this.codex.runTurn(role, JSON.stringify(payload), {
+          clientUserMessageId: baseMessageId,
+          outputSchema: ROLE_OUTPUT_SCHEMAS[role],
+          model: activeProfile.model,
+          effort: activeProfile.effort,
+          localImagePaths: roleImagePaths
+        });
+      } catch (error) {
+        const alternate = capacityFallbackUsed ? null : fallbackRoleProfile(activeProfile);
+        if (!isModelCapacityError(error) || !alternate) throw error;
+        capacityFallbackUsed = true;
+        activeProfile = alternate;
+        response = await this.codex.runTurn(role, JSON.stringify(payload), {
+          clientUserMessageId: `${baseMessageId}_capacity_fallback`,
+          outputSchema: ROLE_OUTPUT_SCHEMAS[role],
+          model: activeProfile.model,
+          effort: activeProfile.effort,
+          localImagePaths: roleImagePaths
+        });
+      }
+      invalidOutput = String(response.text || '');
+      try {
+        return parseRoleJson(invalidOutput, role);
+      } catch (error) {
+        if (attempt === 2 || !String(error.message).startsWith(`${role} returned invalid`)) throw error;
+      }
+    }
+    throw new Error(`${role} returned invalid structured output twice`);
+  }
+
+  async executeLegacyLifeReleaseDraft({ execution }) {
+    return this.executeLifePlanningAttempt({
+      ...execution?.attempt,
+      authoritativePipeline: 'legacy'
+    });
+  }
+
+  async executeCognitionV2LifeReleaseDraft({ execution }) {
+    return this.executeLifePlanningAttempt({
+      ...execution?.attempt,
+      authoritativePipeline: 'cognition'
+    });
+  }
+
+  async executeCognitionV3LifeReleaseDraft({ execution }) {
+    return this.executeLifePlanningAttempt({
+      ...execution?.attempt,
+      authoritativePipeline: 'cognition-v3'
+    });
+  }
+
   async executeLifePlanningAttempt(attempt) {
     const snapshot = attempt?.inputSnapshot || {};
     const planningWindow = snapshot.planningWindow || {};
@@ -565,7 +1132,7 @@ export class YuqiOrchestrator {
     return this.withBrainRoleLock(async () => {
       const profile = roleExecutionProfile('deep', 'brain', this.roleProfiles);
       const request = {
-        task: attempt.authoritativePipeline === 'cognition'
+        task: ['cognition', 'cognition-v3'].includes(attempt.authoritativePipeline)
           ? 'plan_yuqi_life_with_cognition'
           : 'plan_yuqi_life',
         preset: this.presets.compileFor('brain', { scene: { kind: 'LIFE_PLANNING' } }),
@@ -616,6 +1183,12 @@ export class YuqiOrchestrator {
   async run(turnId) {
     let current = this.store.getTurn(turnId);
     if (!current) throw new Error('turn not found');
+    if (Number(current.resultAuthorityVersion || 0) === 1) {
+      if (!this.releaseExecutorAttached) {
+        throw new Error('canonical release executor is not attached');
+      }
+      return this.runCanonicalReleaseTurn(current);
+    }
     if (current.state === 'committed' && current.replyJson) return JSON.parse(current.replyJson);
     if (['delivered', 'completed'].includes(current.state) && current.replyJson) return JSON.parse(current.replyJson);
     if (['failed', 'fallback'].includes(current.state)) throw new Error(`turn is already ${current.state}`);
@@ -892,6 +1465,194 @@ export class YuqiOrchestrator {
       throw error;
     } finally {
       this.turnImagePaths.delete(turnId);
+      await preparedImages.cleanup();
+    }
+  }
+
+  canonicalVisibleGroup(turn, envelope, draft) {
+    const texts = Array.isArray(draft?.bubblePlan) && draft.bubblePlan.length
+      ? draft.bubblePlan.map(item => String(item?.text || '').trim()).filter(Boolean)
+      : String(draft?.reply || '').trim()
+        ? [String(draft.reply).trim()]
+        : [];
+    if (draft?.action === 'skip') return { items: [] };
+    const recipientId = ['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE']
+      .includes(turn.rolloutKey)
+      ? 'public_moments'
+      : 'user';
+    return {
+      items: texts.map(content => ({
+        content,
+        speakerId: envelope.characterId,
+        speakerType: 'character',
+        recipientId
+      }))
+    };
+  }
+
+  canonicalActionSet(turn, draft) {
+    if (!draft?.momentAction) return [];
+    const payload = structuredClone(draft.momentAction);
+    const kind = payload.comment ? 'moment_comment' : payload.like ? 'moment_like' : '';
+    if (!kind) return [];
+    const target = this.store.resolveCanonicalActionTargetInternal({
+      turn,
+      action: { kind, payload }
+    });
+    return [{
+      kind,
+      targetKey: target.targetKey,
+      targetRevision: target.targetRevision,
+      payload
+    }];
+  }
+
+  comparisonJobDraftFromCanonicalTurn(turn, envelope) {
+    const contract = comparisonContractForMode(turn.comparisonMode);
+    if (!contract.comparisonDirection) return null;
+    return {
+      jobId: `compare_${contentHash({
+        lineageKey: turn.authorityLineageKey,
+        releaseId: turn.comparisonReleaseId,
+        direction: contract.comparisonDirection
+      }).slice(0, 24)}`,
+      jobType: contract.jobType,
+      payload: {
+        subjectType: 'turn',
+        subjectId: turn.authorityLineageKey,
+        turnId: turn.turnId,
+        authoritativeReleaseId: turn.authoritativeReleaseId,
+        comparisonReleaseId: turn.comparisonReleaseId,
+        comparisonDirection: contract.comparisonDirection,
+        rolloutEvidenceEpoch: turn.rolloutEvidenceEpoch,
+        shadowEpoch: turn.shadowEpoch,
+        canaryEpoch: turn.canaryEpoch,
+        canarySlot: turn.canarySlot,
+        annotationSnapshotChecksum: contentHash(turn.annotationSnapshot || {}),
+        inputChecksum: contentHash({
+          envelope,
+          authoritativeReleaseId: turn.authoritativeReleaseId,
+          authoritativePipelineChecksum: turn.authoritativePipelineChecksum,
+          comparisonReleaseId: turn.comparisonReleaseId,
+          comparisonPipelineChecksum: turn.comparisonPipelineChecksum,
+          rolloutRevision: turn.rolloutRevision,
+          rolloutEvidenceEpoch: turn.rolloutEvidenceEpoch,
+          shadowEpoch: turn.shadowEpoch,
+          canaryEpoch: turn.canaryEpoch,
+          canarySlot: turn.canarySlot
+        })
+      }
+    };
+  }
+
+  async runCanonicalReleaseTurn(turn) {
+    const existing = this.store.readCanonicalCommitOutcomeInternal({
+      lineageKey: turn.authorityLineageKey,
+      expectedTurnId: turn.turnId
+    });
+    if (existing?.receipt) return existing.receipt;
+    if (existing?.status === 'redacted') return existing;
+    const storedEnvelope = JSON.parse(turn.envelopeJson);
+    const declaredBatch = resolveCurrentUserBatch(storedEnvelope);
+    const persistedBatch = this.store.getCurrentUserBatch(turn.turnId) || declaredBatch;
+    const rawAttachments = (declaredBatch?.messages || []).flatMap(message =>
+      Array.isArray(message?.attachments) ? message.attachments : []
+    );
+    const preparedImages = await materializeImageAttachments(rawAttachments, {
+      turnId: turn.turnId
+    });
+    let envelope = structuredClone(storedEnvelope);
+    let currentBatch = persistedBatch ? structuredClone(persistedBatch) : null;
+    if (preparedImages.paths.length) {
+      this.turnImagePaths.set(turn.turnId, preparedImages.paths);
+      envelope.message = stripAttachmentData(envelope.message);
+      if (Array.isArray(envelope.context?.currentBatch?.messages)) {
+        envelope.context.currentBatch.messages =
+          envelope.context.currentBatch.messages.map(stripAttachmentData);
+      }
+      if (Array.isArray(currentBatch?.messages)) {
+        currentBatch.messages = currentBatch.messages.map(stripAttachmentData);
+      }
+    }
+    try {
+      const agencySnapshot = this.store.readAgencyAuthoritySnapshotInternal({
+        roleId: turn.characterId,
+        at: canonicalInteractionAt(envelope, this.clock())
+      });
+      if (agencySnapshot.checksum !== turn.agencySnapshotChecksum) {
+        const error = new Error('canonical agency authority is stale');
+        error.code = 'AGENCY_AUTHORITY_STALE';
+        throw error;
+      }
+      const agencyView = compileAgencyView({
+        constraints: agencySnapshot.constraints,
+        preferences: agencySnapshot.preferenceFacts || [],
+        stances: agencySnapshot.stances,
+        featureContext: envelope.context || {},
+        limits: { hardConstraints: 5, currentStances: 2, preferences: 4 }
+      });
+      const executionResult = await this.releaseExecutor.executeTurn({
+        releaseId: turn.authoritativeReleaseId,
+        releaseChecksum: turn.authoritativePipelineChecksum,
+        execution: {
+          turn,
+          envelope,
+          scene: sceneFromEnvelope(envelope),
+          currentBatch,
+          localImagePaths: [...preparedImages.paths],
+          agencyView,
+          routeDecision: {
+            route: turn.route,
+            cognitiveState: this.store.getCognitiveState?.(turn.characterId) || {},
+            allowedActionTargets: {}
+          }
+        },
+        dryRun: false
+      });
+      const draft = normalizeBrainDraft(executionResult.draft);
+      if (draft.action === 'skip' && !isAutomaticKind(turn.rolloutKey)) {
+        throw new Error('DIRECT_REPLY cannot commit an empty canonical result');
+      }
+      const visibleGroup = this.canonicalVisibleGroup(turn, envelope, draft);
+      const actionSet = this.canonicalActionSet(turn, draft);
+      const fingerprint = generationFingerprint({
+        roleId: turn.characterId,
+        laneKey: turn.laneKey,
+        inputVisibilitySequence: turn.inputVisibilitySequence,
+        visibleGroup,
+        actionSet,
+        contextRevision: turn.agencySnapshotChecksum
+      });
+      const current = this.store.getTurn(turn.turnId);
+      const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
+      const lane = this.store.getInteractionLane(turn.characterId, turn.laneKey);
+      return commitVisibleResult({
+        store: this.store,
+        turnId: turn.turnId,
+        authorityLineageKey: turn.authorityLineageKey,
+        laneKey: turn.laneKey,
+        expectedTurnRevision: current.turnRevision,
+        expectedLineageRevision: lineage.revision,
+        expectedLaneRevision: lane.revision,
+        expectedCognitiveStateRevision:
+          Number(this.store.getCognitiveState?.(turn.characterId)?.revision || 0),
+        expectedLatestUserBatchId: turn.inputUserBatchId,
+        inputVisibilitySequence: turn.inputVisibilitySequence,
+        inputClearEpoch: turn.inputClearEpoch,
+        agencySnapshotChecksum: turn.agencySnapshotChecksum,
+        authoritativeReleaseId: turn.authoritativeReleaseId,
+        comparisonReleaseId: turn.comparisonReleaseId,
+        comparisonDirection: comparisonContractForMode(turn.comparisonMode).comparisonDirection,
+        visibleGroup,
+        actionSet,
+        statePatch: null,
+        memoryJobs: [],
+        comparisonJob: this.comparisonJobDraftFromCanonicalTurn(turn, envelope),
+        generationFingerprint: fingerprint,
+        now: this.clock()
+      });
+    } finally {
+      this.turnImagePaths.delete(turn.turnId);
       await preparedImages.cleanup();
     }
   }

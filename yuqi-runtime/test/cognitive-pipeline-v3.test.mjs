@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { runCognitionV3Turn } from '../src/cognitive-pipeline.mjs';
+import { CognitivePipeline, runCognitionV3Turn } from '../src/cognitive-pipeline.mjs';
 
 function cognitionResult(overrides = {}) {
   return {
@@ -143,6 +143,17 @@ function input(overrides = {}) {
   };
 }
 
+function v3Release(overrides = {}) {
+  return {
+    releaseId: 'release_v3',
+    pipelineVersion: 'yuqi-lived-agency-v3',
+    presetVersion: '2.1.0',
+    cognitionSchemaVersion: 3,
+    expressionSchemaVersion: 3,
+    ...overrides
+  };
+}
+
 test('fast cognition can escalate before expression with fixed role budgets', async () => {
   const client = new FakeClient(
     { routeDecision: 'deep', cognitionResult: cognitionResult() },
@@ -190,6 +201,94 @@ test('retry reuses the committed cognition checkpoint after expression failure',
   assert.equal(client.calls.filter((call) => call.role === 'expression_v3').length, 2);
   assert.equal(result.cognitionPacket.packetChecksum,
     store.getTurnCheckpoint('turn_v3').cognitionPacket.packetChecksum);
+});
+
+test('v3 dry-run calls cognition and expression without checkpoints or nested shadow work', async () => {
+  const store = new FakeStore();
+  store.saveCognitionCheckpointInternal = () => {
+    throw new Error('dry-run attempted a checkpoint write');
+  };
+  let shadowQueued = 0;
+  const client = new FakeClient(cognitionResult(), expressionResult());
+  const result = await runCognitionV3Turn(input({
+    store,
+    client,
+    dryRun: true,
+    queueShadow: () => { shadowQueued += 1; }
+  }));
+  assert.equal(result.draft.reply, '行，这次算你多说了两个字。');
+  assert.equal(shadowQueued, 0);
+  assert.equal(client.calls.length, 2);
+});
+
+test('v3 release draft compiles both non-empty bundles from the immutable release preset', async () => {
+  const store = new FakeStore();
+  store.getTurn = () => ({
+    turnId: 'turn_v3',
+    characterId: 'yuqi',
+    pipelineMode: 'active',
+    presetVersion: 'current-not-authoritative',
+    annotationSnapshot: { annotations: [] }
+  });
+  store.saveCognitionCheckpointInternal = () => {
+    throw new Error('release draft attempted a checkpoint write');
+  };
+  const presetCalls = [];
+  const presetRegistry = {
+    resolvePresetBundle({ role, version }) {
+      presetCalls.push({ role, version });
+      return `${role}:${version}`;
+    }
+  };
+  const client = new FakeClient(cognitionResult(), expressionResult());
+  const pipeline = new CognitivePipeline({ store, codexClient: client, presetRegistry });
+  const draft = await pipeline.runV3ReleaseDraft({
+    release: v3Release(),
+    execution: {
+      turn: { turnId: 'turn_v3', characterId: 'yuqi' },
+      cognitionEnvelope: envelope(),
+      presetBundles: { cognition: 'forged-current', expression: 'forged-current' }
+    },
+    dryRun: true,
+    capabilities: {
+      visibleCommit: false,
+      action: false,
+      state: false,
+      fact: false,
+      memory: false,
+      outbox: false,
+      notification: false
+    }
+  });
+
+  assert.equal(draft.reply, '行，这次算你多说了两个字。');
+  assert.deepEqual(presetCalls, [
+    { role: 'cognition', version: '2.1.0' },
+    { role: 'expression', version: '2.1.0' }
+  ]);
+  assert.deepEqual(client.calls.map(call => call.payload.system), [
+    'cognition:2.1.0',
+    'expression:2.1.0'
+  ]);
+});
+
+test('release draft rejects write capabilities during dry-run before calling a model', async () => {
+  const client = new FakeClient(cognitionResult(), expressionResult());
+  const pipeline = new CognitivePipeline({
+    store: new FakeStore(),
+    codexClient: client,
+    presetRegistry: { resolvePresetBundle: ({ role }) => `${role}:pinned` }
+  });
+  await assert.rejects(() => pipeline.runV3ReleaseDraft({
+    release: v3Release(),
+    execution: {
+      turn: { turnId: 'turn_v3', characterId: 'yuqi' },
+      cognitionEnvelope: envelope()
+    },
+    dryRun: true,
+    capabilities: { visibleCommit: true }
+  }), /dry-run release capabilities conflict/);
+  assert.equal(client.calls.length, 0);
 });
 
 test('shadow comparison is queued and never awaited by visible completion', async () => {

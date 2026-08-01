@@ -4,6 +4,7 @@ import { applyStanceTransitions } from './agency-state.mjs';
 import { generationFingerprint as computeGenerationFingerprint } from './interaction-lanes.mjs';
 import { contentHash } from './protocol.mjs';
 import { deriveVisibleGroupId } from './store.mjs';
+import { comparisonContractForMode } from './comparison-contract.mjs';
 
 function exactObject(value, allowed, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -337,14 +338,12 @@ export function commitVisibleResult(input) {
       throw new Error('generation fingerprint authority conflict');
     }
     const comparisonMode = String(authority.turn.comparisonMode || 'none');
-    const expectedComparisonType = new Map([
-      ['stable_authoritative_candidate_compare', 'shadow_cognition'],
-      ['legacy_authoritative_cognition_compare', 'shadow_cognition'],
-      ['candidate_authoritative_stable_compare', 'active_canary_compare'],
-      ['cognition_authoritative_legacy_compare', 'active_canary_compare']
-    ]).get(comparisonMode) || null;
-    if (!expectedComparisonType) {
+    const expectedComparison = comparisonContractForMode(comparisonMode);
+    if (!expectedComparison.jobType) {
       if (input.comparisonJob != null || authority.turn.comparisonReleaseId) {
+        throw new Error('comparison authority conflict');
+      }
+      if (input.comparisonReleaseId != null || input.comparisonDirection != null) {
         throw new Error('comparison authority conflict');
       }
     } else {
@@ -362,9 +361,13 @@ export function commitVisibleResult(input) {
         canaryEpoch: authority.turn.canaryEpoch,
         canarySlot: authority.turn.canarySlot
       });
-      if (input.comparisonJob?.jobType !== expectedComparisonType
+      if (String(input.comparisonReleaseId || '')
+          !== String(authority.turn.comparisonReleaseId || '')
+        || String(input.comparisonDirection || '') !== expectedComparison.comparisonDirection
+        || input.comparisonJob?.jobType !== expectedComparison.jobType
         || String(payload.comparisonReleaseId || '') !== String(authority.turn.comparisonReleaseId || '')
-        || String(payload.comparisonDirection || '') !== comparisonMode
+        || String(payload.comparisonDirection || '')
+          !== expectedComparison.comparisonDirection
         || Number(payload.rolloutEvidenceEpoch) !== Number(authority.turn.rolloutEvidenceEpoch)
         || (authority.turn.shadowEpoch == null
           ? payload.shadowEpoch != null

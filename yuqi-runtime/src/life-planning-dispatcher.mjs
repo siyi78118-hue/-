@@ -11,17 +11,23 @@ export class LifePlanningDispatcher {
     store,
     promotionController,
     executeAttempt,
+    releaseExecutor = null,
+    buildExecution = null,
     workerId = 'yuqi-life-planning',
     clock = Date.now,
     pollIntervalMs = 5_000,
     leaseMs = 300_000
   }) {
-    if (!store || !promotionController || typeof executeAttempt !== 'function') {
-      throw new Error('store, promotionController, and executeAttempt are required');
+    if (!store || !promotionController
+      || (!releaseExecutor && typeof executeAttempt !== 'function')
+      || (releaseExecutor && typeof buildExecution !== 'function')) {
+      throw new Error('store, promotionController, and life release execution are required');
     }
     this.store = store;
     this.promotionController = promotionController;
     this.executeAttempt = executeAttempt;
+    this.releaseExecutor = releaseExecutor;
+    this.buildExecution = buildExecution;
     this.workerId = workerId;
     this.clock = clock;
     this.pollIntervalMs = pollIntervalMs;
@@ -60,7 +66,14 @@ export class LifePlanningDispatcher {
     });
     if (!attempt) return null;
     try {
-      const validatedResult = await this.executeAttempt(attempt);
+      const validatedResult = this.releaseExecutor
+        ? (await this.releaseExecutor.executeLife({
+            releaseId: attempt.authoritativeReleaseId,
+            releaseChecksum: attempt.authoritativePipelineChecksum,
+            execution: this.buildExecution(attempt),
+            dryRun: false
+          })).draft
+        : await this.executeAttempt(attempt);
       return this.promotionController.commitLifePlanningAuthoritativeResult({
         planningId: attempt.planningId,
         workerId: this.workerId,

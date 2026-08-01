@@ -10,9 +10,13 @@ export class ShadowDispatcher {
     workerId = 'yuqi-shadow',
     promotionController = null,
     comparisonEvaluator = evaluatePipelineComparison,
-    comparisonExecutor = null
+    comparisonExecutor = null,
+    releaseExecutor = null,
+    legacyVersionZeroComparisonExecutor = null
   }) {
-    if (!store || !cognitivePipeline) throw new Error('store and cognitivePipeline are required');
+    if (!store || (!cognitivePipeline && !releaseExecutor)) {
+      throw new Error('store and comparison release execution are required');
+    }
     this.store = store;
     this.cognitivePipeline = cognitivePipeline;
     this.foregroundActivity = foregroundActivity || { isBusy: () => false };
@@ -21,6 +25,8 @@ export class ShadowDispatcher {
     this.promotionController = promotionController;
     this.comparisonEvaluator = comparisonEvaluator;
     this.comparisonExecutor = comparisonExecutor;
+    this.releaseExecutor = releaseExecutor;
+    this.legacyVersionZeroComparisonExecutor = legacyVersionZeroComparisonExecutor;
     this.timer = null;
   }
 
@@ -50,6 +56,129 @@ export class ShadowDispatcher {
     const startedAt = this.clock();
     try {
       const payload = claimed.payload;
+      if (this.releaseExecutor
+        && typeof this.store.loadComparisonExecutionAuthorityInternal === 'function') {
+        const recordTerminalCancellation = authority => {
+          if (this.promotionController) {
+            this.promotionController.recordComparisonOutcome({
+              jobId: claimed.jobId,
+              workerId: this.workerId,
+              terminalCancellation: 'cancelled_redacted',
+              now: this.clock()
+            });
+          } else {
+            this.store.completeConsolidationJob?.({
+              jobId: claimed.jobId,
+              workerId: this.workerId,
+              now: this.clock()
+            });
+          }
+          return authority;
+        };
+        const loadAuthority = () => this.store.loadComparisonExecutionAuthorityInternal({
+          jobId: claimed.jobId,
+          workerId: this.workerId
+        });
+        let authority = loadAuthority();
+        const authorityVersion = Number(authority?.authorityVersion);
+        if (![0, 1].includes(authorityVersion)) {
+          throw new Error('comparison authority version conflict');
+        }
+        if (authority.status === 'cancelled_redacted') {
+          return recordTerminalCancellation(authority);
+        }
+        if (authority.status !== 'ready') {
+          throw new Error('comparison execution authority is unavailable');
+        }
+        let executionResult;
+        if (authorityVersion === 0) {
+          if (typeof this.legacyVersionZeroComparisonExecutor !== 'function') {
+            const error = new Error('version-zero comparison executor is unavailable');
+            error.code = 'PINNED_PIPELINE_UNAVAILABLE';
+            throw error;
+          }
+          executionResult = await this.legacyVersionZeroComparisonExecutor(authority.execution);
+        } else {
+          executionResult = authority.subjectType === 'life_planning'
+            ? await this.releaseExecutor.executeLife({
+                releaseId: authority.comparisonReleaseId,
+                releaseChecksum: authority.comparisonReleaseChecksum,
+                execution: authority.execution,
+                dryRun: true
+              })
+            : await this.releaseExecutor.executeTurn({
+                releaseId: authority.comparisonReleaseId,
+                releaseChecksum: authority.comparisonReleaseChecksum,
+                execution: authority.execution,
+                dryRun: true
+              });
+        }
+        const finalAuthority = loadAuthority();
+        if (Number(finalAuthority?.authorityVersion) !== authorityVersion) {
+          throw new Error('comparison authority version conflict');
+        }
+        if (finalAuthority.status === 'cancelled_redacted') {
+          return recordTerminalCancellation(finalAuthority);
+        }
+        if (finalAuthority.status !== 'ready') {
+          throw new Error('comparison execution authority is unavailable');
+        }
+        authority = finalAuthority;
+        const comparisonResult = executionResult?.draft || executionResult;
+        const evaluated = this.comparisonEvaluator({
+          subjectType: authority.subjectType,
+          subject: authority.execution?.envelope
+            || authority.execution?.inputSnapshot
+            || authority.execution?.attempt
+            || {},
+          authoritativeResult: authority.authoritativeResult,
+          comparisonResult,
+          currentBatch: authority.execution?.currentBatch || null,
+          scene: authority.execution?.scene || {},
+          allowedActionTargets: authority.execution?.allowedActionTargets || []
+        });
+        if (this.promotionController) {
+          this.promotionController.recordComparisonOutcome({
+            jobId: claimed.jobId,
+            workerId: this.workerId,
+            run: {
+              runId: `run_${contentHash({
+                jobId: claimed.jobId,
+                subjectId: authority.subjectId,
+                comparisonResult
+              }).slice(0, 24)}`,
+              comparisonResultChecksum: contentHash(comparisonResult),
+              metrics: evaluated.metrics,
+              latencyMs: this.clock() - startedAt
+            },
+            report: {
+              summary: {
+                metrics: evaluated.metrics,
+                warnings: evaluated.warnings
+              }
+            },
+            criticalFindings: evaluated.criticalFindings,
+            now: this.clock()
+          });
+        } else {
+          this.store.completeConsolidationJob?.({
+            jobId: claimed.jobId,
+            workerId: this.workerId,
+            now: this.clock()
+          });
+        }
+        this.store.putDiagnostic?.({
+          turnId: claimed.turnId || null,
+          stage: 'release_comparison',
+          detail: {
+            subjectType: authority.subjectType,
+            subjectId: authority.subjectId,
+            releaseId: authority.comparisonReleaseId,
+            latencyMs: this.clock() - startedAt
+          }
+        });
+        return executionResult;
+      }
       if (!this.promotionController && !payload.subjectType) {
         const result = await this.cognitivePipeline.runShadow(payload);
         this.store.completeConsolidationJob({

@@ -1015,7 +1015,7 @@ test('populated PC v10 migrates through v11 and v12 to v13 without inventing his
     const before = createPopulatedV10(path);
     let store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 13);
+      assert.equal(store.userVersion(), 14);
       assert.deepEqual(tableCounts(store.db), before);
       const oldTurn = store.getTurn('turn_v2');
       assert.equal(oldTurn.resultAuthorityVersion, 0);
@@ -1026,7 +1026,7 @@ test('populated PC v10 migrates through v11 and v12 to v13 without inventing his
       store.close();
 
       store = new YuqiStore(path);
-      assert.equal(store.userVersion(), 13);
+      assert.equal(store.userVersion(), 14);
       assert.deepEqual(tableCounts(store.db), before);
       assert.equal(store.listTurnAuthorityLineages().length, 0);
     } finally {
@@ -1047,7 +1047,7 @@ test('clean v11 creates its v12 manifest then v13 tombstone schema and remains r
     });
     let store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 13);
+      assert.equal(store.userVersion(), 14);
       assert.equal(
         Number(store.db.prepare(
           'SELECT COUNT(*) AS value FROM visible_result_manifests'
@@ -1059,7 +1059,7 @@ test('clean v11 creates its v12 manifest then v13 tombstone schema and remains r
     }
     store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 13);
+      assert.equal(store.userVersion(), 14);
     } finally {
       store.close();
     }
@@ -1083,7 +1083,7 @@ test('v11 canonical authority without a manifest refuses v12 migration without m
     assert.deepEqual(after, before);
   }));
 
-test('migration CLI preserves a raw populated v10 source and produces a restart-stable v13 clone report', () =>
+test('migration CLI preserves a raw populated v10 source and produces a restart-stable v14 clone report', () =>
   withDatabase(path => {
     createPopulatedV10(path);
     const directory = join(path, '..');
@@ -1104,15 +1104,21 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     assert.equal(fileSha256(path), sourceHash);
     const report = JSON.parse(readFileSync(reportPath, 'utf8'));
     assert.equal(report.sourceUserVersion, 10);
-    assert.equal(report.workingUserVersion, 13);
+    assert.equal(report.workingUserVersion, 14);
     assert.equal(report.sourceDatabaseSha256, sourceHash);
     assert.equal(report.sourceDatabaseSha256After, sourceHash);
     assert.match(report.workingDatabaseSha256, /^[a-f0-9]{64}$/);
-    assert.equal(report.v13InvariantSummary.userVersion, 13);
-    assert.match(report.v13InvariantSummary.checksum, /^[a-f0-9]{64}$/);
+    assert.equal(report.v14InvariantSummary.userVersion, 14);
+    assert.match(report.v14InvariantSummary.checksum, /^[a-f0-9]{64}$/);
     assert.ok(Object.hasOwn(report.sourceTableCounts, 'turns'));
-    assert.ok(Object.hasOwn(report.v13InvariantSummary.tableCounts, 'visible_commit_receipts'));
-    assert.ok(Object.hasOwn(report.v13InvariantSummary.tableCounts, 'visible_result_manifests'));
+    assert.ok(Object.hasOwn(
+      report.v14InvariantSummary.semantic.tableCounts,
+      'visible_commit_receipts'
+    ));
+    assert.ok(Object.hasOwn(
+      report.v14InvariantSummary.semantic.tableCounts,
+      'visible_result_manifests'
+    ));
 
     const applyReportPath = join(directory, 'migration-apply-report.json');
     const applyCommand = spawnSync(process.execPath, [
@@ -1128,21 +1134,21 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     assert.equal(applyCommand.status, 0, applyCommand.stderr || applyCommand.stdout);
     const applied = JSON.parse(readFileSync(applyReportPath, 'utf8'));
     assert.equal(applied.applied, true);
-    assert.equal(applied.workingUserVersion, 13);
+    assert.equal(applied.workingUserVersion, 14);
     assert.equal(
-      applied.v13InvariantSummary.checksum,
-      report.v13InvariantSummary.checksum
+      applied.v14InvariantSummary.checksum,
+      report.v14InvariantSummary.checksum
     );
 
     const first = new YuqiStore(clone);
     const logicalBefore = {
       counts: tableCounts(first.db),
-      summary: report.v13InvariantSummary
+      summary: report.v14InvariantSummary
     };
     first.close();
     const second = new YuqiStore(clone);
     assert.deepEqual(tableCounts(second.db), logicalBefore.counts);
-    assert.equal(second.userVersion(), 13);
+    assert.equal(second.userVersion(), 14);
     second.close();
   }));
 
@@ -1512,9 +1518,9 @@ test('a retry of a legacy or missing parent cannot enter canonical creation', ()
     }
   }));
 
-test('user versions above v13 stop without rewriting', () => withDatabase(path => {
+test('user versions above v14 stop without rewriting', () => withDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 14;');
+  database.exec('PRAGMA user_version = 15;');
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*14/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*15/i);
 }));

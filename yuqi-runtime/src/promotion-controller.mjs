@@ -1,4 +1,11 @@
 import { contentHash } from './protocol.mjs';
+import { resolvePipelinePair } from './release-pair.mjs';
+import {
+  comparisonContractForDirection,
+  comparisonContractForMode
+} from './comparison-contract.mjs';
+import { laneKeyForEnvelope } from './interaction-lanes.mjs';
+import { resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { RolloutRevisionConflictError } from './store.mjs';
 
 export const COGNITION_ROLLOUT_KEYS = Object.freeze([
@@ -90,53 +97,38 @@ export class PromotionController {
     return this.store.listCognitionRollouts();
   }
 
-  createTurn({ envelope, presetVersion, annotationSnapshot, now = this.clock() }) {
-    const rolloutKey = rolloutKeyForEnvelope(envelope);
-    let rollout = this.store.getCognitionRollout(rolloutKey);
+  resolvePipelinePair(rollout) {
+    return resolvePipelinePair(rollout);
+  }
+
+  selectPipelinePairForFreshSubject(rolloutKey, { now = this.clock() } = {}) {
+    const rollout = this.getStatus(rolloutKey);
     if (!rollout) throw new Error(`cognition rollout is unavailable: ${rolloutKey}`);
-    if (rollout.currentMode === 'active' && rollout.rolloutPhase === 'canary') {
-      const outstanding = this.store.countOutstandingComparisonSubjects(rolloutKey, {
+    const pair = this.resolvePipelinePair(rollout);
+    if (pair.candidatePhase === 'canary') {
+      const outstanding = this.store.readCanaryOutstandingAuthorityInternal({
+        rolloutKey,
         canaryEpoch: rollout.canaryEpoch
       });
-      const tooOld = outstanding.oldestAt !== null
+      const deadlineBreached = outstanding.oldestAt !== null
         && Number(now) - Number(outstanding.oldestAt) > rollout.canaryCompareDeadlineMs;
-      if (outstanding.count >= rollout.canaryMaxOutstanding || tooOld) {
-        const summary = {
-          rolloutKey,
-          canaryEpoch: rollout.canaryEpoch,
-          outstandingCount: outstanding.count,
-          oldestAt: outstanding.oldestAt,
-          reasonCode: 'CANARY_COMPARE_BACKLOG'
-        };
-        const reportId = `report_backlog_${contentHash({ ...summary, now }).slice(0, 24)}`;
-        const report = this.store.putEvaluationReportInternal({
-          reportId,
-          reportType: 'active_failure',
-          rolloutKey,
-          sourceType: 'aggregate_gate',
-          sourceRef: `canary:${rollout.canaryEpoch}`,
-          artifactPath: '',
-          summary,
-          createdAt: now
-        });
-        rollout = this.store.transitionCognitionRolloutInternal({
-          rolloutKey,
-          expectedRevision: rollout.revision,
-          toMode: 'shadow',
-          toPhase: 'rolled_back',
-          actor: 'promotion_controller',
-          reasonCode: 'CANARY_COMPARE_BACKLOG',
-          reportId,
-          reportChecksum: report.artifactChecksum,
-          metadata: summary,
-          now
-        });
+      const allocatesComparison = pair.comparisonReleaseId !== null;
+      if (deadlineBreached
+        || (allocatesComparison && outstanding.count >= rollout.canaryMaxOutstanding)) {
+        const error = new Error('canary comparison backlog');
+        error.code = 'CANARY_COMPARE_BACKLOG';
+        throw error;
       }
     }
+    return { rollout, pair };
+  }
+
+  createTurn({ envelope, presetVersion, annotationSnapshot, now = this.clock() }) {
+    const rolloutKey = rolloutKeyForEnvelope(envelope);
     return this.store.createTurnWithRolloutInternal({
       envelope,
       rolloutKey,
-      presetVersion: presetVersion || rollout.presetVersion,
+      presetVersion,
       annotationSnapshot: annotationSnapshot || {}
     });
   }
@@ -237,6 +229,7 @@ export class PromotionController {
     run,
     report = {},
     criticalFindings = [],
+    terminalCancellation = null,
     now = this.clock()
   }) {
     return this.store.recordComparisonOutcomeInternal({
@@ -245,6 +238,7 @@ export class PromotionController {
       run,
       report,
       criticalFindings,
+      terminalCancellation,
       now
     });
   }
@@ -324,8 +318,18 @@ export class PromotionController {
     return this.store.transaction(() => {
       const open = this.store.getOpenLifePlanningAttempt(roleId);
       if (open) return open;
-      const rollout = this.getStatus('LIFE_PLANNING');
-      if (!rollout) throw new Error('LIFE_PLANNING rollout is unavailable');
+      const { rollout, pair } = this.selectPipelinePairForFreshSubject(
+        'LIFE_PLANNING',
+        { now }
+      );
+      const authoritativeRelease = this.store.getPipelineRelease(pair.visibleReleaseId);
+      const comparisonRelease = pair.comparisonReleaseId
+        ? this.store.getPipelineRelease(pair.comparisonReleaseId)
+        : null;
+      if (!authoritativeRelease || (pair.comparisonReleaseId && !comparisonRelease)) {
+        throw new Error('LIFE_PLANNING release authority is unavailable');
+      }
+      const comparison = comparisonContractForDirection(pair.comparisonDirection);
       const startAt = Number(
         planningContext?.planWindowStartAt
         || Math.floor(Number(now) / 600_000) * 600_000
@@ -354,15 +358,19 @@ export class PromotionController {
       });
       const requestKey = contentHash({
         requestBaseKey,
-        presetVersion: rollout.presetVersion,
+        presetVersion: authoritativeRelease.presetVersion,
         pipelineMode: rollout.currentMode,
-        pipelineChecksum: rollout.pipelineChecksum,
+        pipelineChecksum: authoritativeRelease.releaseChecksum,
+        authoritativeReleaseId: authoritativeRelease.releaseId,
+        comparisonReleaseId: comparisonRelease?.releaseId || null,
+        authoritativePipelineChecksum: authoritativeRelease.releaseChecksum,
+        comparisonPipelineChecksum: comparisonRelease?.releaseChecksum || null,
+        comparisonDirection: comparison.comparisonDirection,
+        candidatePhase: pair.candidatePhase,
         evidenceEpoch: rollout.evidenceEpoch,
         shadowEpoch: rollout.shadowEpoch,
         canaryEpoch: rollout.canaryEpoch
       });
-      const shadow = rollout.currentMode === 'shadow';
-      const canary = rollout.currentMode === 'active' && rollout.rolloutPhase === 'canary';
       return this.store.createLifePlanningAttemptInternal({
         roleId,
         requestBaseKey,
@@ -372,18 +380,19 @@ export class PromotionController {
         lifeBasisChecksum,
         contextChecksum,
         pipelineMode: rollout.currentMode,
-        comparisonMode: shadow ? 'cognition_compare' : canary ? 'legacy_compare' : 'none',
+        comparisonMode: comparison.comparisonMode,
         authoritativePipeline: rollout.currentMode === 'active' ? 'cognition' : 'legacy',
-        comparisonDirection: shadow
-          ? 'legacy_authoritative_cognition_compare'
-          : canary ? 'cognition_authoritative_legacy_compare' : null,
+        comparisonDirection: comparison.comparisonDirection,
         rolloutRevision: rollout.revision,
         rolloutEvidenceEpoch: rollout.evidenceEpoch,
-        pipelineChecksum: rollout.pipelineChecksum,
-        shadowEpoch: shadow ? rollout.shadowEpoch : null,
-        canaryEpoch: canary ? rollout.canaryEpoch : null,
-        canarySlot: canary ? rollout.canaryStartedCount + 1 : null,
-        presetVersion: rollout.presetVersion,
+        pipelineChecksum: authoritativeRelease.releaseChecksum,
+        shadowEpoch: pair.candidatePhase === 'shadow' ? rollout.shadowEpoch : null,
+        canaryEpoch: pair.candidatePhase === 'canary' ? rollout.canaryEpoch : null,
+        authoritativeReleaseId: authoritativeRelease.releaseId,
+        comparisonReleaseId: comparisonRelease?.releaseId || null,
+        authoritativePipelineChecksum: authoritativeRelease.releaseChecksum,
+        comparisonPipelineChecksum: comparisonRelease?.releaseChecksum || null,
+        presetVersion: authoritativeRelease.presetVersion,
         inputSnapshot,
         dueAt: now,
         now

@@ -32,6 +32,37 @@ const COGNITION_FAST_ROUTE_SCHEMA_V3 = Object.freeze({
   }
 });
 
+const RELEASE_DRAFT_CONTRACTS = Object.freeze({
+  v2: Object.freeze({
+    pipelineVersion: 'cognition-v2-candidate-2026-07-30',
+    cognitionSchemaVersion: 2,
+    expressionSchemaVersion: 2
+  }),
+  v3: Object.freeze({
+    pipelineVersion: 'yuqi-lived-agency-v3',
+    cognitionSchemaVersion: 3,
+    expressionSchemaVersion: 3
+  })
+});
+
+function assertReleaseDraftContract(release, contract) {
+  if (!String(release?.releaseId || '').trim()
+    || !String(release?.presetVersion || '').trim()
+    || String(release?.pipelineVersion || '') !== contract.pipelineVersion
+    || Number(release?.cognitionSchemaVersion) !== contract.cognitionSchemaVersion
+    || Number(release?.expressionSchemaVersion) !== contract.expressionSchemaVersion) {
+    throw new Error('release draft contract conflict');
+  }
+}
+
+function assertDryRunCapabilities(dryRun, capabilities) {
+  if (dryRun === true
+    && capabilities
+    && Object.values(capabilities).some(Boolean)) {
+    throw new Error('dry-run release capabilities conflict');
+  }
+}
+
 function parseObject(response, role) {
   const text = String(response?.text ?? response ?? '').trim();
   if (!text) throw new Error(`${role} returned an empty result`);
@@ -98,7 +129,8 @@ function checkpointFromStore(store, turnId) {
   return store?.getTurnCheckpoint?.(turnId) || {};
 }
 
-function persistV3Checkpoint(store, turn, packet) {
+function persistV3Checkpoint(store, turn, packet, dryRun = false) {
+  if (dryRun) return;
   if (typeof store?.saveCognitionCheckpointInternal === 'function') {
     store.saveCognitionCheckpointInternal(turn.turnId, packet);
     return;
@@ -282,7 +314,12 @@ export async function runCognitionV3Turn(input) {
       envelope: cognitionEnvelope,
       cognitionResult
     });
-    persistV3Checkpoint(input.store, input.turn, cognitionPacket);
+    persistV3Checkpoint(
+      input.store,
+      input.turn,
+      cognitionPacket,
+      input.dryRun === true || input.draftOnly === true
+    );
   }
 
   let { expressionResult, draft } = await runV3Expression(
@@ -345,7 +382,9 @@ export async function runCognitionV3Turn(input) {
         envelope: cognitionEnvelope,
         cognitionResult: reconsidered
       });
-      if (typeof input.store?.saveCognitionCheckpointInternal === 'function') {
+      if (input.dryRun !== true
+        && input.draftOnly !== true
+        && typeof input.store?.saveCognitionCheckpointInternal === 'function') {
         input.store.saveCognitionCheckpointInternal(input.turn.turnId, cognitionPacket);
       }
     }
@@ -375,7 +414,9 @@ export async function runCognitionV3Turn(input) {
       shadowState: 'none'
     };
   }
-  if (typeof input.queueShadow === 'function') {
+  if (input.dryRun !== true
+    && input.draftOnly !== true
+    && typeof input.queueShadow === 'function') {
     Promise.resolve(input.queueShadow({
       turn: input.turn,
       cognitionEnvelope,
@@ -395,7 +436,11 @@ export async function runCognitionV3Turn(input) {
       expression: draft.draftChecksum
     },
     timings: { startedAt, visibleCompletedAt },
-    shadowState: typeof input.queueShadow === 'function' ? 'queued' : 'none'
+    shadowState: input.dryRun !== true
+      && input.draftOnly !== true
+      && typeof input.queueShadow === 'function'
+      ? 'queued'
+      : 'none'
   };
 }
 
@@ -476,9 +521,13 @@ export class CognitivePipeline {
     envelope,
     scene,
     currentBatch,
-    routeDecision = {}
+    routeDecision = {},
+    persistCheckpoint = true,
+    pinnedTurn = null,
+    presetBundles = null,
+    reuseCheckpoint = true
   }) {
-    const pinned = this.store.getTurn?.(turn.turnId) || turn;
+    const pinned = pinnedTurn || this.store.getTurn?.(turn.turnId) || turn;
     if (!['active', 'shadow'].includes(pinned.pipelineMode)) {
       throw new Error('cognition pipeline requires a pinned active or shadow turn');
     }
@@ -494,18 +543,21 @@ export class CognitivePipeline {
       lifeContext: routeDecision.lifeContext || null,
       catalog: routeDecision.catalog || { schemaVersion: 1, lessons: [] }
     });
-    const existing = this.store.getTurn?.(turn.turnId) || turn;
+    const existing = reuseCheckpoint
+      ? this.store.getTurn?.(turn.turnId) || turn
+      : turn;
     let packet = null;
     if (existing.memoryPacketJson) {
       const stored = JSON.parse(existing.memoryPacketJson);
       if (stored.packetType === 'cognition-v2') packet = stored.packet;
     }
     if (!packet) {
-      const system = this.presetRegistry.resolvePresetBundle({
-        role: 'cognition',
-        version: pinned.presetVersion,
-        annotations
-      });
+      const system = presetBundles?.cognition
+        || this.presetRegistry.resolvePresetBundle({
+          role: 'cognition',
+          version: pinned.presetVersion,
+          annotations
+        });
       const initialRoute = routeDecision.route === 'fast' || pinned.route === 'fast' ? 'fast' : 'deep';
       let raw = await this.runRole({
         turn: pinned,
@@ -555,22 +607,25 @@ export class CognitivePipeline {
         evidenceMessages,
         this.clock()
       );
-      this.persistCognitionCheckpoint(turn.turnId, {
-        packet,
-        query: cognitionResult.query,
-        keywords: cognitionResult.keywords,
-        conversationFrame: cognitionResult.conversationFrame,
-        effectiveRelationshipStage: relationship.stage,
-        relationshipStageAction: relationship.action,
-        interactionContract: cognitionResult.decision
-      });
+      if (persistCheckpoint) {
+        this.persistCognitionCheckpoint(turn.turnId, {
+          packet,
+          query: cognitionResult.query,
+          keywords: cognitionResult.keywords,
+          conversationFrame: cognitionResult.conversationFrame,
+          effectiveRelationshipStage: relationship.stage,
+          relationshipStageAction: relationship.action,
+          interactionContract: cognitionResult.decision
+        });
+      }
     }
 
-    const expressionSystem = this.presetRegistry.resolvePresetBundle({
-      role: 'expression',
-      version: pinned.presetVersion,
-      annotations
-    });
+    const expressionSystem = presetBundles?.expression
+      || this.presetRegistry.resolvePresetBundle({
+        role: 'expression',
+        version: pinned.presetVersion,
+        annotations
+      });
     const expression = normalizeExpressionResult(await this.runRole({
       turn: pinned,
       role: 'expression',
@@ -593,5 +648,64 @@ export class CognitivePipeline {
 
   async runShadow(input) {
     return this.runForeground(input);
+  }
+
+  compilePinnedReleaseBundles(release, execution) {
+    const storedTurn = this.store.getTurn?.(execution?.turn?.turnId) || execution?.turn || {};
+    const annotations = storedTurn.annotationSnapshot?.annotations || [];
+    const bundles = Object.fromEntries(['cognition', 'expression'].map((role) => {
+      const bundle = this.presetRegistry.resolvePresetBundle({
+        role,
+        version: release.presetVersion,
+        annotations
+      });
+      if (!String(bundle || '').trim()) throw new Error('pinned preset bundle is empty');
+      return [role, bundle];
+    }));
+    return bundles;
+  }
+
+  async runV2ReleaseDraft({ release, execution, dryRun = false, capabilities = null }) {
+    assertReleaseDraftContract(release, RELEASE_DRAFT_CONTRACTS.v2);
+    assertDryRunCapabilities(dryRun, capabilities);
+    const presetBundles = this.compilePinnedReleaseBundles(release, execution);
+    const storedTurn = this.store.getTurn?.(execution?.turn?.turnId) || {};
+    const pinnedTurn = {
+      ...storedTurn,
+      ...(execution?.turn || {}),
+      presetVersion: release.presetVersion,
+      authoritativeReleaseId: release.releaseId
+    };
+    const result = await this.runForeground({
+      ...execution,
+      turn: pinnedTurn,
+      pinnedTurn,
+      presetBundles,
+      persistCheckpoint: false,
+      reuseCheckpoint: false
+    });
+    return result.draft;
+  }
+
+  async runV3ReleaseDraft({ release, execution, dryRun = false, capabilities = null }) {
+    assertReleaseDraftContract(release, RELEASE_DRAFT_CONTRACTS.v3);
+    assertDryRunCapabilities(dryRun, capabilities);
+    const presetBundles = this.compilePinnedReleaseBundles(release, execution);
+    const pinnedTurn = {
+      ...(execution?.turn || {}),
+      presetVersion: release.presetVersion,
+      authoritativeReleaseId: release.releaseId
+    };
+    const result = await runCognitionV3Turn({
+      ...execution,
+      turn: pinnedTurn,
+      store: this.store,
+      client: execution?.client || this.codexClient,
+      presetBundles,
+      dryRun: Boolean(dryRun),
+      draftOnly: true,
+      queueShadow: null
+    });
+    return result.draft;
   }
 }

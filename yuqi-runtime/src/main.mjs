@@ -7,16 +7,13 @@ import { CognitivePipeline } from './cognitive-pipeline.mjs';
 import { ConsolidationWorker } from './consolidation-worker.mjs';
 import { CloudRelayPump } from './cloud-relay-pump.mjs';
 import { createYuqiServer } from './local-server.mjs';
-import { YuqiOrchestrator } from './orchestrator.mjs';
-import { LifePlanningDispatcher } from './life-planning-dispatcher.mjs';
 import { PresetRegistry } from './preset-registry.mjs';
 import { PromotionController } from './promotion-controller.mjs';
 import { YuqiReconciler } from './reconcile.mjs';
 import { ResultOutbox } from './result-outbox.mjs';
 import { selectTurnRoute } from './route-policy.mjs';
-import { ShadowDispatcher } from './shadow-dispatcher.mjs';
 import { YuqiStore } from './store.mjs';
-import { TurnDispatcher } from './turn-dispatcher.mjs';
+import { composeYuqiExecutionRuntime } from './runtime-composition.mjs';
 import { createSystemCloudFetch } from '../../scripts/cloud-http.mjs';
 
 const runtimeDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -47,7 +44,7 @@ const cognitivePipeline = new CognitivePipeline({
   presetRegistry: presets,
   routePolicy: selectTurnRoute
 });
-const orchestrator = new YuqiOrchestrator({
+const executionRuntime = composeYuqiExecutionRuntime({
   store,
   presets,
   codex,
@@ -57,25 +54,18 @@ const orchestrator = new YuqiOrchestrator({
   generationContextLimit: 20,
   roleProfiles: config.roleProfiles
 });
-const lifePlanningDispatcher = new LifePlanningDispatcher({
-  store,
-  promotionController,
-  executeAttempt: attempt => orchestrator.executeLifePlanningAttempt(attempt)
-});
-orchestrator.setLifePlanningDispatcher(lifePlanningDispatcher);
+const {
+  orchestrator,
+  turnDispatcher: dispatcher,
+  lifePlanningDispatcher,
+  shadowDispatcher
+} = executionRuntime;
 const reconciler = new YuqiReconciler({ store, codex });
-const dispatcher = new TurnDispatcher({ store, orchestrator });
 const consolidationWorker = new ConsolidationWorker({
   store,
   codexClient: codex,
   presetRegistry: presets,
   workerId: 'yuqi-memory-consolidation'
-});
-const shadowDispatcher = new ShadowDispatcher({
-  store,
-  cognitivePipeline,
-  promotionController,
-  foregroundActivity: { isBusy: () => dispatcher.inflight.size > 0 }
 });
 const explicitProxy = config.cloudRelay?.proxy?.enabled === true;
 const cloudFetch = config.cloudRelay?.enabled

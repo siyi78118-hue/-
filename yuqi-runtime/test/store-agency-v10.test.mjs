@@ -128,7 +128,9 @@ function stripV10Schema(path) {
       'ux_stances_authority_group_ordinal',
       'ux_consolidation_authority_group_ordinal',
       'ux_delivery_authority_group_peer',
-      'idx_current_user_batch_items_message'
+      'idx_current_user_batch_items_message',
+      'idx_turns_rollout_canary_root_slot',
+      'idx_turns_rollout_canary_lineage_slot'
     ]) database.exec(`DROP INDEX IF EXISTS "${index}";`);
     for (const table of V11_V12_TABLES) database.exec(`DROP TABLE IF EXISTS "${table}";`);
     for (const table of V10_TABLES) database.exec(`DROP TABLE IF EXISTS "${table}";`);
@@ -251,11 +253,11 @@ function cognitiveSnapshotV2() {
   };
 }
 
-test('clean v9 passes through the historical schemas and finishes at v13', () => withTemporaryDatabase(path => {
+test('clean v9 passes through the historical schemas and finishes at v14', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: false });
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 13);
+    assert.equal(store.userVersion(), 14);
     for (const table of V10_TABLES) {
       assert.equal(
         Boolean(store.db.prepare(
@@ -268,23 +270,23 @@ test('clean v9 passes through the historical schemas and finishes at v13', () =>
     assert.equal(store.listPipelineReleases().length, 2);
     assert.ok(store.listCognitionRollouts().every(row => row.candidatePhase === 'none'));
     store.migrate();
-    assert.equal(store.userVersion(), 13);
+    assert.equal(store.userVersion(), 14);
     assert.equal(store.listPipelineReleases().length, 2);
   } finally {
     store.close();
   }
 }));
 
-test('populated v9 through v10, v11, v12, and v13 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
+test('populated v9 through v10, v11, v12, v13, and v14 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: true });
   const before = countStructuralRows(path);
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 13);
+    assert.equal(store.userVersion(), 14);
     assert.deepEqual(countStructuralRows(path), before);
     assert.equal(store.listCognitionRollouts()[0].candidatePhase, 'none');
     store.migrate();
-    assert.equal(store.userVersion(), 13);
+    assert.equal(store.userVersion(), 14);
     assert.equal(store.listPipelineReleases().length, 2);
     assert.deepEqual(countStructuralRows(path), before);
   } finally {
@@ -292,11 +294,11 @@ test('populated v9 through v10, v11, v12, and v13 is non-destructive and idempot
   }
 }));
 
-test('versions above v13 stop instead of being rewritten', () => withTemporaryDatabase(path => {
+test('versions above v14 stop instead of being rewritten', () => withTemporaryDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 14;');
+  database.exec('PRAGMA user_version = 15;');
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*14/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*15/i);
 }));
 
 test('new turns pin release pair and lane revision while old turns remain readable', () =>

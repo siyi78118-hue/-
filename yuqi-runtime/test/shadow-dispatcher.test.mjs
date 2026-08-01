@@ -162,3 +162,346 @@ for (const scenario of [
     assert.equal(recorded.run.metrics.schemaValid, true);
   });
 }
+
+test('version-one turn comparison loads canonical authority and uses the shared release executor dry-run', async () => {
+  const calls = [];
+  let available = true;
+  let recorded = null;
+  const authority = {
+    status: 'ready',
+    authorityVersion: 1,
+    subjectType: 'turn',
+    subjectId: 'lineage_1',
+    comparisonReleaseId: 'candidate-r3',
+    comparisonReleaseChecksum: 'c'.repeat(64),
+    comparisonDirection: 'stable_authoritative_candidate_compare',
+    authoritativeResult: { terminalDisposition: 'visible', replyParts: ['权威结果'], actions: [] },
+    execution: {
+      turn: { turnId: 'turn_1', rolloutKey: 'DIRECT_REPLY' },
+      envelope: { kind: 'DIRECT_REPLY', characterId: 'yuqi' },
+      currentBatch: { messageIds: ['msg_1'] },
+      scene: {},
+      allowedActionTargets: ['yuqi', 'user']
+    }
+  };
+  const dispatcher = new ShadowDispatcher({
+    store: {
+      claimDueConsolidationJob() {
+        if (!available) return null;
+        available = false;
+        return { jobId: 'job_1', jobType: 'shadow_cognition', attemptCount: 1 };
+      },
+      loadComparisonExecutionAuthorityInternal(input) {
+        calls.push(['load', input]);
+        return authority;
+      },
+      getTurn() {
+        throw new Error('turn.replyJson is not canonical comparison authority');
+      },
+      putDiagnostic() {}
+    },
+    releaseExecutor: {
+      async executeTurn(input) {
+        calls.push(['executeTurn', input]);
+        return { draft: { action: 'send', reply: '对照草稿', usedMessageIds: ['msg_1'] } };
+      },
+      async executeLife() {
+        throw new Error('wrong release execution kind');
+      }
+    },
+    cognitivePipeline: {
+      async runShadow() { throw new Error('version-one comparison used legacy shadow'); },
+      async runLegacyShadow() { throw new Error('version-one comparison used legacy shadow'); }
+    },
+    promotionController: {
+      recordComparisonOutcome(input) {
+        recorded = input;
+        return { status: 'completed' };
+      }
+    },
+    clock: () => 1_000
+  });
+
+  const result = await dispatcher.runOnce();
+
+  assert.equal(result.draft.reply, '对照草稿');
+  assert.deepEqual(calls[0], ['load', { jobId: 'job_1', workerId: 'yuqi-shadow' }]);
+  assert.equal(calls[1][0], 'executeTurn');
+  assert.equal(calls[1][1].releaseId, 'candidate-r3');
+  assert.equal(calls[1][1].releaseChecksum, 'c'.repeat(64));
+  assert.equal(calls[1][1].dryRun, true);
+  assert.equal(recorded.jobId, 'job_1');
+});
+
+test('version-one life comparison uses planning authority and executeLife without a chat turn', async () => {
+  let executed = null;
+  let recorded = null;
+  const dispatcher = new ShadowDispatcher({
+    store: {
+      claimDueConsolidationJob: (() => {
+        let available = true;
+        return () => {
+          if (!available) return null;
+          available = false;
+          return { jobId: 'job_life', jobType: 'active_canary_compare', attemptCount: 1 };
+        };
+      })(),
+      loadComparisonExecutionAuthorityInternal() {
+        return {
+          status: 'ready',
+          authorityVersion: 1,
+          subjectType: 'life_planning',
+          subjectId: 'planning_1',
+          comparisonReleaseId: 'stable-r2',
+          comparisonReleaseChecksum: 'b'.repeat(64),
+          comparisonDirection: 'candidate_authoritative_stable_compare',
+          authoritativeResult: { episodes: [{ episodeId: 'episode_1' }] },
+          execution: { attempt: { planningId: 'planning_1' }, inputSnapshot: { horizon: 'today' } }
+        };
+      },
+      getTurn() {
+        throw new Error('life comparison must not load a chat turn');
+      },
+      putDiagnostic() {}
+    },
+    releaseExecutor: {
+      async executeTurn() { throw new Error('wrong release execution kind'); },
+      async executeLife(input) {
+        executed = input;
+        return { draft: { episodes: [{ episodeId: 'candidate_episode' }] } };
+      }
+    },
+    promotionController: {
+      recordComparisonOutcome(input) {
+        recorded = input;
+        return { status: 'completed' };
+      }
+    },
+    comparisonEvaluator: () => ({
+      metrics: { schemaValid: true },
+      warnings: [],
+      criticalFindings: []
+    }),
+    clock: () => 2_000
+  });
+
+  await dispatcher.runOnce();
+
+  assert.equal(executed.releaseId, 'stable-r2');
+  assert.equal(executed.dryRun, true);
+  assert.equal(recorded.jobId, 'job_life');
+});
+
+test('redacted version-one comparison cancels without loading content or invoking a model', async () => {
+  let recorded = null;
+  const dispatcher = new ShadowDispatcher({
+    store: {
+      claimDueConsolidationJob: (() => {
+        let available = true;
+        return () => {
+          if (!available) return null;
+          available = false;
+          return { jobId: 'job_redacted', jobType: 'active_canary_compare', attemptCount: 1 };
+        };
+      })(),
+      loadComparisonExecutionAuthorityInternal() {
+        return {
+          status: 'cancelled_redacted',
+          authorityVersion: 1,
+          subjectType: 'turn',
+          subjectId: 'lineage_redacted'
+        };
+      },
+      putDiagnostic() {}
+    },
+    releaseExecutor: {
+      async executeTurn() { throw new Error('redacted comparison invoked a model'); },
+      async executeLife() { throw new Error('redacted comparison invoked a model'); }
+    },
+    promotionController: {
+      recordComparisonOutcome(input) {
+        recorded = input;
+        return { status: 'cancelled_redacted' };
+      }
+    },
+    comparisonEvaluator() {
+      throw new Error('redacted comparison invoked evaluator');
+    },
+    clock: () => 3_000
+  });
+
+  const result = await dispatcher.runOnce();
+
+  assert.equal(result.status, 'cancelled_redacted');
+  assert.equal(recorded.terminalCancellation, 'cancelled_redacted');
+});
+
+test('persisted version-zero comparison uses only the explicit legacy executor', async () => {
+  let available = true;
+  let legacyExecution = null;
+  let recorded = null;
+  const authority = {
+    status: 'ready',
+    authorityVersion: 0,
+    subjectType: 'turn',
+    subjectId: 'turn_v0',
+    authoritativeResult: { reply: { content: '旧权威结果' } },
+    execution: {
+      envelope: { kind: 'DIRECT_REPLY', characterId: 'yuqi' },
+      currentBatch: { messageIds: ['msg_v0'] },
+      scene: {},
+      allowedActionTargets: ['yuqi', 'user']
+    }
+  };
+  const dispatcher = new ShadowDispatcher({
+    store: {
+      claimDueConsolidationJob() {
+        if (!available) return null;
+        available = false;
+        return { jobId: 'job_v0', jobType: 'shadow_cognition', attemptCount: 1 };
+      },
+      loadComparisonExecutionAuthorityInternal() {
+        return authority;
+      },
+      failConsolidationJob() {
+        throw new Error('version-zero comparison was rejected');
+      },
+      putDiagnostic() {}
+    },
+    releaseExecutor: {
+      async executeTurn() { throw new Error('version-zero comparison used release executor'); },
+      async executeLife() { throw new Error('version-zero comparison used release executor'); }
+    },
+    legacyVersionZeroComparisonExecutor: async execution => {
+      legacyExecution = execution;
+      return { draft: { action: 'send', reply: '旧版对照草稿', usedMessageIds: ['msg_v0'] } };
+    },
+    promotionController: {
+      recordComparisonOutcome(input) {
+        recorded = input;
+        return { status: 'completed' };
+      }
+    },
+    comparisonEvaluator: () => ({
+      metrics: { schemaValid: true },
+      warnings: [],
+      criticalFindings: []
+    }),
+    clock: () => 4_000
+  });
+
+  const result = await dispatcher.runOnce();
+
+  assert.equal(result.draft.reply, '旧版对照草稿');
+  assert.equal(legacyExecution, authority.execution);
+  assert.equal(recorded.jobId, 'job_v0');
+  assert.equal(recorded.run.metrics.schemaValid, true);
+});
+
+test('redaction after comparison load discards the draft before evaluation and records cancellation', async () => {
+  let available = true;
+  let loadCount = 0;
+  let recorded = null;
+  const dispatcher = new ShadowDispatcher({
+    store: {
+      claimDueConsolidationJob() {
+        if (!available) return null;
+        available = false;
+        return { jobId: 'job_race', jobType: 'active_canary_compare', attemptCount: 1 };
+      },
+      loadComparisonExecutionAuthorityInternal() {
+        loadCount += 1;
+        if (loadCount === 1) {
+          return {
+            status: 'ready',
+            authorityVersion: 1,
+            subjectType: 'turn',
+            subjectId: 'lineage_race',
+            comparisonReleaseId: 'stable-r2',
+            comparisonReleaseChecksum: 'b'.repeat(64),
+            authoritativeResult: { terminalDisposition: 'visible', replyParts: ['权威结果'] },
+            execution: {
+              envelope: { kind: 'DIRECT_REPLY', characterId: 'yuqi' },
+              currentBatch: { messageIds: ['msg_race'] }
+            }
+          };
+        }
+        return {
+          status: 'cancelled_redacted',
+          authorityVersion: 1,
+          subjectType: 'turn',
+          subjectId: 'lineage_race'
+        };
+      },
+      putDiagnostic() {}
+    },
+    releaseExecutor: {
+      async executeTurn() {
+        return { draft: { action: 'send', reply: '必须丢弃的草稿' } };
+      },
+      async executeLife() { throw new Error('wrong release execution kind'); }
+    },
+    promotionController: {
+      recordComparisonOutcome(input) {
+        recorded = input;
+        return { status: 'cancelled_redacted' };
+      }
+    },
+    comparisonEvaluator() {
+      throw new Error('redacted draft reached evaluator');
+    },
+    clock: () => 5_000
+  });
+
+  const result = await dispatcher.runOnce();
+
+  assert.equal(loadCount, 2);
+  assert.equal(result.status, 'cancelled_redacted');
+  assert.equal(recorded.terminalCancellation, 'cancelled_redacted');
+  assert.equal(recorded.run, undefined);
+});
+
+test('permanent release comparison failures remain delegated to the consolidation store', async () => {
+  let failure = null;
+  const dispatcher = new ShadowDispatcher({
+    store: {
+      claimDueConsolidationJob: (() => {
+        let available = true;
+        return () => {
+          if (!available) return null;
+          available = false;
+          return { jobId: 'job_failed', jobType: 'shadow_cognition', attemptCount: 3 };
+        };
+      })(),
+      loadComparisonExecutionAuthorityInternal() {
+        return {
+          status: 'ready',
+          authorityVersion: 1,
+          subjectType: 'turn',
+          subjectId: 'lineage_failed',
+          comparisonReleaseId: 'candidate-r3',
+          comparisonReleaseChecksum: 'c'.repeat(64),
+          authoritativeResult: {},
+          execution: { envelope: {}, currentBatch: null }
+        };
+      },
+      failConsolidationJob(input) {
+        failure = input;
+      }
+    },
+    releaseExecutor: {
+      async executeTurn() {
+        const error = new Error('candidate unavailable');
+        error.code = 'PINNED_PIPELINE_UNAVAILABLE';
+        throw error;
+      },
+      async executeLife() { throw new Error('wrong release execution kind'); }
+    },
+    clock: () => 6_000
+  });
+
+  assert.equal(await dispatcher.runOnce(), null);
+  assert.equal(failure.jobId, 'job_failed');
+  assert.equal(failure.errorCode, 'PINNED_PIPELINE_UNAVAILABLE');
+  assert.equal(failure.nextDueAt, 6_000);
+});

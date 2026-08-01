@@ -942,7 +942,7 @@ test('shadow commit requires the exact pinned comparison descriptor', () =>
       agencySnapshotChecksum: snapshot.checksum,
       authoritativeReleaseId: turn.authoritativeReleaseId,
       comparisonReleaseId: turn.comparisonReleaseId,
-      comparisonDirection: turn.comparisonMode,
+      comparisonDirection: 'stable_authoritative_candidate_compare',
       visibleGroup,
       actionSet: [],
       statePatch: null,
@@ -959,7 +959,7 @@ test('shadow commit requires the exact pinned comparison descriptor', () =>
       jobType: 'shadow_cognition',
       payload: {
         comparisonReleaseId: turn.comparisonReleaseId,
-        comparisonDirection: turn.comparisonMode,
+        comparisonDirection: 'stable_authoritative_candidate_compare',
         rolloutEvidenceEpoch: turn.rolloutEvidenceEpoch,
         shadowEpoch: turn.shadowEpoch,
         canaryEpoch: null,
@@ -987,6 +987,32 @@ test('shadow commit requires the exact pinned comparison descriptor', () =>
     assert.throws(() => commitVisibleResult(wrong), /comparison authority conflict/i);
     const receipt = commitVisibleResult(valid);
     assert.equal(store.comparisonJobsForGroup(receipt.visibleGroupId).length, 1);
+    const claimed = store.claimDueConsolidationJob({
+      workerId: 'comparison-worker',
+      jobTypes: ['shadow_cognition'],
+      now: 2_001,
+      leaseMs: 60_000
+    });
+    const authority = store.loadComparisonExecutionAuthorityInternal({
+      jobId: claimed.jobId,
+      workerId: 'comparison-worker'
+    });
+    assert.equal(authority.status, 'ready');
+    assert.equal(authority.subjectId, turn.authorityLineageKey);
+    store.recordComparisonOutcomeInternal({
+      jobId: claimed.jobId,
+      workerId: 'comparison-worker',
+      run: {
+        runId: 'run_real_shadow_compare',
+        comparisonResultChecksum: 'a'.repeat(64),
+        metrics: { schemaValid: true },
+        latencyMs: 12
+      },
+      report: { reportId: 'report_real_shadow_compare', summary: {} },
+      criticalFindings: [],
+      now: 2_010
+    });
+    assert.equal(store.getCognitionRollout('DIRECT_REPLY').liveShadowSuccessCount, 1);
     assert.doesNotThrow(() => store.assertVisibleAuthorityV13Invariants());
   }));
 
@@ -1058,7 +1084,7 @@ test('same-turn create and committed retry replay share manifest closure', () =>
     );
   }));
 
-test('fresh v13 commits use v2 and pin the lane clear epoch across retries', () =>
+test('fresh v13 commits pin clear epoch while committed retry replay ignores mutable cursor state', () =>
   withStore(store => {
     store.initializeCognitionRolloutsInternal({
       rows: [{
@@ -1126,16 +1152,88 @@ test('fresh v13 commits use v2 and pin the lane clear epoch across retries', () 
     retryInput.expectedLaneRevision = store.getInteractionLane('yuqi', 'private_chat').revision;
     retryInput.inputUserBatchId = original.inputUserBatchId;
     retryInput.inputVisibilitySequence = original.inputVisibilitySequence;
-    assert.throws(
-      () => store.createCanonicalVisibleTurnInternal({
-        ...structuredClone(retryInput),
-        inputClearEpoch: 4
-      }),
-      /retry immutable authority/
-    );
+    const changedCursorReplay = store.createCanonicalVisibleTurnInternal({
+      ...structuredClone(retryInput),
+      inputClearEpoch: 4
+    });
+    assert.equal(changedCursorReplay.status, 'already_committed');
+    assert.equal(changedCursorReplay.receipt.commitChecksum, receipt.commitChecksum);
     const replay = store.createCanonicalVisibleTurnInternal(retryInput);
     assert.equal(replay.status, 'already_committed');
     assert.equal(replay.receipt.commitChecksum, receipt.commitChecksum);
+  }));
+
+test('open canonical retry inherits release pins but refreshes lane visibility authority', () =>
+  withStore(store => {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'DIRECT_REPLY',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: SHA
+      }],
+      now: 1
+    });
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const originalEnvelope = envelope('turn_lane_retry_original');
+    const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1_000 });
+    const original = store.createCanonicalVisibleTurnInternal({
+      envelope: originalEnvelope,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 0,
+      inputUserBatchId: `batch_${originalEnvelope.message.messageId}`,
+      inputVisibilitySequence: 0,
+      inputClearEpoch: 0,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: {}
+    }).turn;
+    store.recordCanonicalTurnFailureInternal({
+      turnId: original.turnId,
+      expectedState: original.state,
+      expectedTurnRevision: original.turnRevision,
+      failure: { failureClass: 'transient', code: 'TIMEOUT' }
+    });
+    store.db.prepare(`
+      UPDATE interaction_lanes
+      SET revision = revision + 1, local_sequence = local_sequence + 3,
+          clear_epoch = clear_epoch + 1
+      WHERE role_id = 'yuqi' AND lane_key = 'private_chat'
+    `).run();
+    const lane = store.getInteractionLane('yuqi', 'private_chat');
+    const retryEnvelope = structuredClone(originalEnvelope);
+    retryEnvelope.turnId = 'turn_lane_retry_child';
+    retryEnvelope.deviceSeq += 1;
+    retryEnvelope.context = {
+      retry: {
+        retryOfTurnId: original.turnId,
+        canonicalMessageId: originalEnvelope.message.messageId
+      }
+    };
+    const retry = store.createCanonicalVisibleTurnInternal({
+      envelope: retryEnvelope,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: original.rolloutRevision,
+      authoritativeReleaseId: original.authoritativeReleaseId,
+      comparisonReleaseId: original.comparisonReleaseId,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: lane.revision,
+      inputUserBatchId: original.inputUserBatchId,
+      inputVisibilitySequence: lane.localSequence,
+      inputClearEpoch: lane.clearEpoch,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: original.annotationSnapshot
+    }).turn;
+    assert.equal(retry.authoritativeReleaseId, original.authoritativeReleaseId);
+    assert.equal(retry.authoritativePipelineChecksum, original.authoritativePipelineChecksum);
+    assert.equal(retry.inputVisibilitySequence, lane.localSequence);
+    assert.equal(retry.inputClearEpoch, lane.clearEpoch);
   }));
 
 for (const step of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]) {

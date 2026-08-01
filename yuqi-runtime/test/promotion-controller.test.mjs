@@ -99,6 +99,7 @@ test('turns pin rollout state and later transitions never rewrite old turns', ()
     reasonCode: 'collect_live_shadow'
   });
   const turnA = controller.createTurn({ envelope: envelope(1) });
+  assert.equal(turnA.resultAuthorityVersion, 0);
   assert.equal(turnA.pipelineMode, 'shadow');
   assert.equal(turnA.comparisonMode, 'cognition_compare');
   assert.equal(turnA.rolloutRevision, shadow.revision);
@@ -161,3 +162,23 @@ test('evidence changes atomically begin a new epoch without reacting to unrelate
   assert.ok(second.listStatus().every(row => row.evidenceEpoch === 2));
 }));
 
+test('controller delegates fresh selection to the shared release resolver and runtime clock', () =>
+  withStore(store => {
+    let clock = 20_000;
+    const controller = new PromotionController({
+      store,
+      presetRegistry: registry(),
+      clock: () => clock
+    });
+    controller.initialize();
+    const selected = controller.selectPipelinePairForFreshSubject('DIRECT_REPLY', {
+      now: clock
+    });
+    assert.equal(selected.rollout.rolloutKey, 'DIRECT_REPLY');
+    assert.equal(selected.pair.visibleReleaseId, selected.rollout.stableReleaseId);
+    assert.equal(selected.pair.comparisonReleaseId, null);
+    assert.deepEqual(
+      controller.resolvePipelinePair(selected.rollout),
+      selected.pair
+    );
+  }));
