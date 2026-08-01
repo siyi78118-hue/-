@@ -1,5 +1,6 @@
 node_modules/
 artifacts/qa/cognition/replay/
+artifacts/yuqi-lived-agency-v3/private/
 .toolchains/
 yuqi-runtime/data/
 yuqi-runtime/config.json

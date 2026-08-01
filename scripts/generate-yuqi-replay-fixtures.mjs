@@ -74,7 +74,7 @@ for (const kind of kinds) {
     cases.push({
       caseId,
       turnKind: kind,
-      sourceType: category === 'normal' ? 'approved_fixture' : 'synthetic',
+      sourceType: 'fixture',
       sourceRef: `fixture:${kind}:${category}:${index + 1}`,
       category,
       clock: createdAt,
@@ -98,12 +98,15 @@ for (const kind of kinds) {
   });
 }
 
-const outputDir = resolve(process.argv[2] || 'tests/fixtures/yuqi-cognition-replay-v1');
+const outputDir = resolve(process.argv[2] || 'tests/fixtures/yuqi-cognition-protocol-v1');
 mkdirSync(outputDir, { recursive: true });
 const casesText = `${cases.map(item => canonicalJson(item)).join('\n')}\n`;
 const manifest = {
-  schemaVersion: 1,
-  datasetId: 'yuqi-cognition-replay-v1',
+  schemaVersion: 2,
+  suiteId: 'yuqi-cognition-protocol-v1',
+  suitePurpose: 'protocol_regression',
+  qualityEvidenceEligible: false,
+  datasetId: 'yuqi-cognition-protocol-v1',
   caseCount: cases.length,
   requiredPerTurnKind: 30,
   turnKinds: kinds,

@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "yuqi-lived-quality-v1",
+  "suitePurpose": "source_grounded_human_quality",
+  "qualityEvidenceEligible": true,
+  "sentinelCount": 24,
+  "coverageSceneCount": 72,
+  "localHistoryTargetCount": 30,
+  "annotationFiles": [
+    "真人聊天训练批注-第一轮.md",
+    "真人聊天训练批注-第二轮.md",
+    "真人聊天训练批注-第四轮-交接.md"
+  ]
+}

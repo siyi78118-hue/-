@@ -13,6 +13,9 @@ function readDataset(datasetPath) {
   if (cases.length !== manifest.caseCount || contentHash(cases) !== manifest.casesChecksum) {
     throw new Error('replay dataset checksum/count mismatch');
   }
+  if (manifest.suitePurpose !== 'protocol_regression' || manifest.qualityEvidenceEligible !== false) {
+    throw new Error('replay dataset must be an ineligible protocol regression suite');
+  }
   return { root, manifest, cases, checksum: contentHash({ manifest, cases }) };
 }
 
@@ -168,6 +171,7 @@ export class ReplayRunner {
 
   async runFixtureBatch({ runId, datasetPath, presetVersion, modelProfileChecksum = 'default' }) {
     const dataset = readDataset(datasetPath);
+    const liveShadowCountBefore = this.liveShadowCount();
     const existing = this.store.getReplayBatch(runId);
     if (existing && (
       existing.datasetChecksum !== dataset.checksum
@@ -184,11 +188,16 @@ export class ReplayRunner {
       requestedConcurrency: this.concurrency,
       startedAt: this.clock()
     });
-    await mapLimit(dataset.cases, this.concurrency, item => this.executeCase(runId, item));
-    return this.finalize(runId, dataset.manifest);
+    await mapLimit(
+      dataset.cases.map(item => ({ ...item, sourceType: 'approved_fixture' })),
+      this.concurrency,
+      item => this.executeCase(runId, item)
+    );
+    return this.finalize(runId, dataset.manifest, { sourceType: 'fixture', liveShadowCountBefore });
   }
 
   async runLocalHistoryBatch({ runId, rolloutKey = 'DIRECT_REPLY', limit = 30, beforeTurnId = null }) {
+    const liveShadowCountBefore = this.liveShadowCount();
     const turns = this.store.listReplayEligibleTurns?.({ rolloutKey, limit, beforeTurnId }) || [];
     const cases = turns.map((turn, index) => ({
       caseId: `local_${turn.turnId}`,
@@ -227,7 +236,7 @@ export class ReplayRunner {
       caseCount: Number(limit),
       requiredPerTurnKind: Number(limit),
       turnKinds: [rolloutKey]
-    });
+    }, { sourceType: 'local_history', liveShadowCountBefore });
   }
 
   async resume(runId) {
@@ -236,7 +245,15 @@ export class ReplayRunner {
     return { batch, runs: this.store.listReplayRuns(runId) };
   }
 
-  finalize(runId, manifest) {
+  liveShadowCount() {
+    try {
+      return Number(this.store.db?.prepare('SELECT COUNT(*) AS value FROM cognition_shadow_runs').get()?.value || 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  finalize(runId, manifest, { sourceType, liveShadowCountBefore = this.liveShadowCount() } = {}) {
     const runs = this.store.listReplayRuns(runId);
     const batch = this.store.getReplayBatch(runId);
     const completed = runs.filter(run => run.state === 'completed').length;
@@ -268,8 +285,14 @@ export class ReplayRunner {
       byKind,
       eligible,
       realModelExecution,
-      productionDataChecksumChanges: 0
+      productionDataChecksumChanges: 0,
+      sourceType: sourceType || batch?.sourceType || 'unknown',
+      liveShadowCountBefore,
+      liveShadowCountAfter: this.liveShadowCount()
     };
+    if (summary.liveShadowCountAfter !== liveShadowCountBefore) {
+      throw new Error('replay run must not mutate live shadow storage');
+    }
     const directory = join(this.artifactRoot, runId);
     const summaryJson = `${canonicalJson(summary)}\n`;
     atomicWrite(join(directory, 'summary.json'), summaryJson);

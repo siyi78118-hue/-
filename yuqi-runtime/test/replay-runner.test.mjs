@@ -40,25 +40,28 @@ test('fixture replay is resumable, dry-run only, and never enters live shadow st
   try {
     const result = await runner.runFixtureBatch({
       runId: 'fixture-test',
-      datasetPath: 'tests/fixtures/yuqi-cognition-replay-v1',
+      datasetPath: 'tests/fixtures/yuqi-cognition-protocol-v1',
       presetVersion: '2.0.0'
     });
     assert.equal(result.summary.completed, 270);
     assert.equal(result.summary.failed, 0);
     assert.equal(result.summary.eligible, true);
+    assert.equal(result.summary.sourceType, 'fixture');
+    assert.equal(result.summary.liveShadowCountBefore, 0);
+    assert.equal(result.summary.liveShadowCountAfter, 0);
     assert.equal(sideEffects, 0);
     assert.equal(store.listReplayRuns('fixture-test').length, 270);
     assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM cognition_shadow_runs').get().value, 0);
     const resumed = await runner.runFixtureBatch({
       runId: 'fixture-test',
-      datasetPath: 'tests/fixtures/yuqi-cognition-replay-v1',
+      datasetPath: 'tests/fixtures/yuqi-cognition-protocol-v1',
       presetVersion: '2.0.0'
     });
     assert.equal(resumed.summary.completed, 270);
+    assert.ok(store.listReplayRuns('fixture-test').every(run => run.sourceType === 'approved_fixture'));
     assert.ok(store.listReplayRuns('fixture-test').every(run => run.attemptCount === 1));
   } finally {
     store.close();
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
   }
 });
-

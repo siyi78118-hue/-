@@ -19,6 +19,9 @@ const store = new YuqiStore(databasePath);
 const runId = option('run-id');
 if (!runId) throw new Error('--run-id is required');
 const source = option('source', 'fixture');
+if (!['fixture', 'local-history'].includes(source)) {
+  throw new Error('--source must be fixture or local-history');
+}
 const structuralPipeline = label => ({
   async run({ envelope }) {
     return {
@@ -54,7 +57,7 @@ try {
     })
     : await runner.runFixtureBatch({
       runId,
-      datasetPath: option('dataset', 'tests/fixtures/yuqi-cognition-replay-v1'),
+      datasetPath: option('dataset', 'tests/fixtures/yuqi-cognition-protocol-v1'),
       presetVersion: config.cognitionRuntime?.presetVersion || '2.0.0',
       modelProfileChecksum: 'structural-only-not-promotion-evidence'
     });
@@ -66,4 +69,3 @@ try {
 } finally {
   store.close();
 }
-

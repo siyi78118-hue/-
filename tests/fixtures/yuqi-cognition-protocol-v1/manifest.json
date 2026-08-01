@@ -1,6 +1,9 @@
 {
-  "schemaVersion": 1,
-  "datasetId": "yuqi-cognition-replay-v1",
+  "schemaVersion": 2,
+  "suiteId": "yuqi-cognition-protocol-v1",
+  "suitePurpose": "protocol_regression",
+  "qualityEvidenceEligible": false,
+  "datasetId": "yuqi-cognition-protocol-v1",
   "caseCount": 270,
   "requiredPerTurnKind": 30,
   "turnKinds": [
@@ -22,6 +25,6 @@
     "stage": 2,
     "attachment": 2
   },
-  "casesChecksum": "fdf10a51b83fddd6da2b9041a3156caad98517276310bf3d15fad9f91ef4ebb1",
+  "casesChecksum": "8011ded4c91ecb8a9ea0a24abf8351edc2f63ae81e69c73f004466dafa33951e",
   "generatedFrom": "approved synthetic protocol structures"
 }
