@@ -5,12 +5,38 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { decryptRelayPayload } from '../src/cloud-relay-pump.mjs';
+import { projectBridgeResultForWire } from '../src/bridge-result-projector.mjs';
 import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import { ResultOutbox } from '../src/result-outbox.mjs';
 import { YuqiStore } from '../src/store.mjs';
 import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
 const keyBase64 = Buffer.alloc(32, 9).toString('base64');
+const SHA_A = 'a'.repeat(64);
+
+function canonicalOutboxResult(turnId, groupId) {
+  return {
+    protocolVersion: 3,
+    turnId,
+    roleId: 'yuqi',
+    authorityOrigin: 'pc',
+    authorityLineageKey: `lineage_${groupId}`,
+    visibleGroupId: groupId,
+    lineageRevision: 1,
+    turnRevision: 1,
+    laneKey: 'private_chat',
+    laneRevision: 1,
+    inputVisibilitySequence: 0,
+    inputClearEpoch: 0,
+    generationFingerprint: null,
+    releaseId: 'release_test',
+    commitPayloadVersion: 'pc-visible-commit-v2',
+    commitChecksum: SHA_A,
+    terminalDisposition: 'skip',
+    replyParts: [],
+    actions: []
+  };
+}
 
 function envelope() {
   return {
@@ -100,6 +126,121 @@ test('persists a terminal cloud reply until relay delivery succeeds without leak
     store.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('two result outboxes claim one canonical failure lease and enqueue it once', async () => {
+  const failure = {
+    protocolVersion: 3,
+    type: 'BACKLOG_FAILED',
+    turnId: 'turn_failure_lease_1',
+    roleId: 'yuqi',
+    authorityLineageKey: 'lin_failure_lease_1',
+    lineageRevision: 1,
+    turnRevision: 2,
+    laneKey: 'private_chat',
+    laneRevision: 1,
+    retryOfTurnId: null,
+    inputVisibilitySequence: 1,
+    inputClearEpoch: 0,
+    generationFingerprint: null,
+    releaseId: 'release_test',
+    state: 'failed',
+    errorCode: 'YUQI_TRANSIENT_EXECUTION_FAILURE',
+    failureClass: 'transient',
+    retryAllowed: true,
+    failedAt: 100
+  };
+  let claimed = false;
+  let marked = 0;
+  let calls = 0;
+  const store = {
+    listPendingAuthorityCloudDeliveries: () => [],
+    listPendingCanonicalFailureCloudDeliveries: () => [{
+      deliveryType: 'canonical_failure', turnId: failure.turnId, peerId: 'phone_cloud', updatedAt: 1
+    }],
+    listPendingCloudDeliveries: () => [],
+    claimCanonicalFailureCloudDeliveryInternal() {
+      if (claimed) return null;
+      claimed = true;
+      return {
+        payload: { ok: true, ...failure, rawStatusChecksum: 'a'.repeat(64), recoveryAckSeq: 0 },
+        rawStatusChecksum: 'a'.repeat(64),
+        leaseId: 'failure_lease_1', leaseAttempt: 1,
+        relayMessageId: 'relay_failure_1'
+      };
+    },
+    markCanonicalFailureCloudDeliveryMailboxedInternal(input) {
+      marked += 1;
+      assert.equal(input.relayMessageId, 'relay_failure_1');
+    }
+  };
+  const fetchImpl = async () => {
+    calls += 1;
+    return Response.json({ ok: true }, { status: 201 });
+  };
+  const shared = {
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store, fetchImpl,
+    clock: () => 1_000
+  };
+  const [first, second] = await Promise.all([
+    new ResultOutbox(shared).flushOnce(),
+    new ResultOutbox(shared).flushOnce()
+  ]);
+  assert.equal(first.delivered + second.delivered, 1);
+  assert.equal(calls, 1);
+  assert.equal(marked, 1);
+});
+
+test('canonical authority quarantine failures surface instead of being swallowed by the outbox', async () => {
+  let quarantineCalls = 0;
+  const store = {
+    listPendingAuthorityCloudDeliveries: () => [],
+    listPendingCanonicalFailureCloudDeliveries: () => [{
+      deliveryType: 'canonical_failure', turnId: 'turn_failure_quarantine_surface', peerId: 'phone_cloud',
+      state: 'waiting', payloadJson: null, checksum: '', attempts: 0, relayMessageId: null,
+      deliveredAt: null, updatedAt: 1
+    }],
+    listPendingCloudDeliveries: () => [],
+    claimCanonicalFailureCloudDeliveryInternal() {
+      throw new Error('canonical failure target set conflict');
+    },
+    quarantineCanonicalCloudDeliveryInternal() {
+      quarantineCalls += 1;
+      throw new Error('SQLITE_BUSY: diagnostic write failed');
+    }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async () => { throw new Error('fetch must not run'); }, clock: () => 1_000
+  });
+  await assert.rejects(() => outbox.flushOnce(), /SQLITE_BUSY: diagnostic write failed/);
+  assert.equal(quarantineCalls, 1);
+});
+
+test('prefix-shaped unknown errors never quarantine a canonical delivery', async () => {
+  let quarantineCalls = 0;
+  const store = {
+    listPendingAuthorityCloudDeliveries: () => [],
+    listPendingCanonicalFailureCloudDeliveries: () => [{
+      deliveryType: 'canonical_failure', turnId: 'turn_failure_unknown_prefix', peerId: 'phone_cloud',
+      state: 'waiting', payloadJson: null, checksum: '', attempts: 0, relayMessageId: null,
+      deliveredAt: null, updatedAt: 1
+    }],
+    listPendingCloudDeliveries: () => [],
+    claimCanonicalFailureCloudDeliveryInternal() {
+      throw new Error('canonical failure made_up conflict');
+    },
+    quarantineCanonicalCloudDeliveryInternal() { quarantineCalls += 1; }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async () => { throw new Error('fetch must not run'); }, clock: () => 1_000
+  });
+  await assert.rejects(() => outbox.flushOnce(), /canonical failure made_up conflict/);
+  assert.equal(quarantineCalls, 0);
 });
 
 test('delivers a LAN-accepted terminal turn through Cloud later without changing the turn or duplicating the reply', async () => {
@@ -323,21 +464,129 @@ test('canonical original and retry restart emit one group-keyed delivery', async
       store,
       fetchImpl: async (_url, options) => {
         attempts.push(JSON.parse(options.body));
-        return Response.json({ ok: true }, { status: 201 });
+        return attempts.length === 1
+          ? Response.json({ ok: false }, { status: 503 })
+          : Response.json({ ok: true }, { status: 201 });
       }
     });
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 1, waiting: 0 });
+    assert.equal(store.outboxForGroup(receipt.visibleGroupId)[0].state, 'pending');
+    assert.equal(store.db.prepare(`
+      SELECT COUNT(*) AS count FROM diagnostics
+      WHERE turn_id = ? AND stage = 'canonical_visible_delivery_quarantined'
+    `).get(retry.turnId).count, 0);
     assert.deepEqual(await outbox.flushOnce(), { delivered: 1, failed: 0, waiting: 0 });
     assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 0, waiting: 0 });
-    assert.equal(attempts.length, 1);
-    const decoded = decryptRelayPayload(attempts[0], keyBase64);
-    assert.equal(decoded.visibleGroupId, receipt.visibleGroupId);
-    assert.equal(decoded.authorityLineageKey, retry.authorityLineageKey);
-    assert.equal(decoded.commitChecksum, receipt.commitChecksum);
+    assert.equal(attempts.length, 2);
+    const decoded = decryptRelayPayload(attempts[1], keyBase64);
+    const expectedCanonical = store.loadCanonicalBridgeResultInternal(retry.turnId);
+    assert.deepEqual(decoded, {
+      ok: true,
+      ...projectBridgeResultForWire(expectedCanonical, 2),
+      recoveryAckSeq: 0
+    });
     assert.equal(decoded.replyParts[0].content, '在。');
     assert.equal(
       store.outboxForGroup(receipt.visibleGroupId)[0].relayMessageId,
-      attempts[0].messageId
+      attempts[1].messageId
     );
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('a corrupt canonical group target is quarantined before relay fetch and never selected again', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yuqi-authority-outbox-quarantine-'));
+  const file = join(dir, 'runtime.sqlite');
+  const store = new YuqiStore(file);
+  try {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'DIRECT_REPLY', currentMode: 'legacy', rolloutPhase: 'stable',
+        presetVersion: '1.9.2', pipelineChecksum: 'a'.repeat(64)
+      }], now: 1
+    });
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi', schemaVersion: 2, revision: 1, lastTurnId: 'seed',
+      state: { slowState: {}, mediumState: {}, fastState: {} }, updatedAt: 1
+    });
+    const agencySnapshot = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1_000 });
+    const input = { ...envelope(), turnId: 'turn_cloud_outbox_quarantine_1' };
+    const turn = store.createCanonicalVisibleTurnInternal({
+      envelope: input,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 0,
+      inputUserBatchId: `batch_${input.message.messageId}`,
+      inputVisibilitySequence: 0,
+      agencySnapshotChecksum: agencySnapshot.checksum,
+      annotationSnapshot: {}
+    }).turn;
+    const visibleGroup = {
+      items: [{ content: '我在。', speakerId: 'yuqi', speakerType: 'character', recipientId: 'user' }]
+    };
+    const receipt = commitVisibleResult({
+      store,
+      turnId: turn.turnId,
+      authorityLineageKey: turn.authorityLineageKey,
+      laneKey: turn.laneKey,
+      expectedTurnRevision: turn.turnRevision,
+      expectedLineageRevision: store.getTurnAuthorityLineage(turn.authorityLineageKey).revision,
+      expectedLaneRevision: store.getInteractionLane('yuqi', 'private_chat').revision,
+      expectedCognitiveStateRevision: 1,
+      expectedLatestUserBatchId: turn.inputUserBatchId,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      agencySnapshotChecksum: turn.agencySnapshotChecksum,
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      visibleGroup,
+      actionSet: [],
+      statePatch: { mood: 'present', currentStances: [], openThreads: [] },
+      memoryJobs: [],
+      comparisonJob: null,
+      generationFingerprint: generationFingerprint({
+        roleId: turn.characterId, laneKey: turn.laneKey,
+        inputVisibilitySequence: turn.inputVisibilitySequence,
+        visibleGroup, actionSet: [], contextRevision: turn.agencySnapshotChecksum
+      }),
+      now: 2
+    });
+    const target = store.listCloudDeliveries(turn.turnId)[0];
+    store.db.prepare(`UPDATE visible_commit_receipts SET commit_checksum = ? WHERE group_id = ?`).run(
+      'b'.repeat(64), receipt.visibleGroupId
+    );
+    let fetchCalls = 0;
+    const outbox = new ResultOutbox({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+      deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+      fetchImpl: async () => { fetchCalls += 1; return Response.json({ ok: true }, { status: 201 }); }
+    });
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 1, waiting: 0 });
+    assert.equal(fetchCalls, 0);
+    const quarantined = store.listCloudDeliveries(turn.turnId)[0];
+    assert.deepEqual({
+      state: quarantined.state,
+      payloadJson: quarantined.payloadJson,
+      checksum: quarantined.checksum,
+      attempts: quarantined.attempts,
+      relayMessageId: quarantined.relayMessageId,
+      deliveredAt: quarantined.deliveredAt
+    }, {
+      state: 'quarantined', payloadJson: null, checksum: '', attempts: 0,
+      relayMessageId: null, deliveredAt: null
+    });
+    assert.equal(store.db.prepare(`
+      SELECT COUNT(*) AS count FROM diagnostics
+      WHERE turn_id = ? AND stage = 'canonical_visible_delivery_quarantined'
+    `).get(turn.turnId).count, 1);
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 0, waiting: 0 });
+    assert.equal(fetchCalls, 0);
+    assert.equal(target.state, 'waiting');
   } finally {
     store.close();
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
@@ -350,6 +599,7 @@ test('mixed canonical and legacy backlog honors global age without starvation', 
     listPendingAuthorityCloudDeliveries(limit) {
       return Array.from({ length: canonical }, (_, index) => ({
         authorityGroupId: `canonical_${String(index + 1).padStart(3, '0')}`,
+        turnId: `turn_canonical_${String(index + 1).padStart(3, '0')}`,
         peerId: 'phone_cloud',
         authorityCommitChecksum: 'a'.repeat(64),
         updatedAt: canonicalUpdatedAt + index
@@ -363,13 +613,8 @@ test('mixed canonical and legacy backlog honors global age without starvation', 
         updatedAt: legacyUpdatedAt + index
       })).slice(0, limit);
     },
-    visibleDeliveryPayload(groupId) {
-      return {
-        visibleGroupId: groupId,
-        authorityLineageKey: `lineage_${groupId}`,
-        commitChecksum: 'a'.repeat(64),
-        replyParts: []
-      };
+    loadCanonicalBridgeResultInternal(turnId) {
+      return canonicalOutboxResult(turnId, turnId.replace('turn_', ''));
     },
     prepareAuthorityCloudDelivery(groupId) {
       return { checksum: `checksum_${groupId}` };
@@ -380,6 +625,7 @@ test('mixed canonical and legacy backlog honors global age without starvation', 
       return {
         turnId,
         state: 'committed',
+        protocolVersion: turnId.startsWith('turn_canonical_') ? 3 : 1,
         replyJson: JSON.stringify({ reply: { content: turnId } }),
         createdAt: 1,
         updatedAt: 1
@@ -437,11 +683,86 @@ test('mixed canonical and legacy backlog honors global age without starvation', 
   assert.deepEqual(fetchOrder.slice(0, 2), ['canonical_001', 'canonical_002']);
 });
 
+test('fifty mixed group, failure, and legacy deliveries preserve global age fairness', async () => {
+  const fetchOrder = [];
+  const checksum = 'c'.repeat(64);
+  const store = {
+    listPendingAuthorityCloudDeliveries(limit) {
+      return Array.from({ length: 20 }, (_, index) => ({
+        authorityGroupId: `group_${String(index).padStart(2, '0')}`,
+        turnId: `turn_group_${String(index).padStart(2, '0')}`,
+        peerId: 'phone_cloud', authorityCommitChecksum: checksum, updatedAt: 300 + index
+      })).slice(0, limit);
+    },
+    listPendingCanonicalFailureCloudDeliveries(limit) {
+      return Array.from({ length: 20 }, (_, index) => ({
+        deliveryType: 'canonical_failure', turnId: `failure_${String(index).padStart(2, '0')}`,
+        peerId: 'phone_cloud', updatedAt: 100 + index
+      })).slice(0, limit);
+    },
+    listPendingCloudDeliveries(limit) {
+      return Array.from({ length: 20 }, (_, index) => ({
+        turnId: `legacy_${String(index).padStart(2, '0')}`,
+        peerId: 'phone_cloud', recoveryAckSeq: 0, updatedAt: 200 + index
+      })).slice(0, limit);
+    },
+    claimCanonicalFailureCloudDeliveryInternal({ turnId }) {
+      return {
+        payload: {
+          ok: true, terminal: true, type: 'BACKLOG_FAILED', turnId,
+          rawStatusChecksum: checksum, recoveryAckSeq: 0
+        },
+        rawStatusChecksum: checksum,
+        leaseId: `lease_${turnId}`,
+        leaseAttempt: 1,
+        relayMessageId: `relay_${turnId}`
+      };
+    },
+    markCanonicalFailureCloudDeliveryMailboxedInternal() {},
+    loadCanonicalBridgeResultInternal(turnId) {
+      return canonicalOutboxResult(turnId, turnId.replace('turn_', ''));
+    },
+    prepareAuthorityCloudDelivery() { return { checksum }; },
+    markAuthorityCloudDeliveryAttempt() {},
+    markAuthorityCloudDeliveryMailboxed() {},
+    getTurn(turnId) {
+      return {
+        turnId, state: 'committed', protocolVersion: turnId.startsWith('turn_group_') ? 3 : 1,
+        replyJson: JSON.stringify({ reply: { content: turnId } }), createdAt: 1, updatedAt: 1
+      };
+    },
+    prepareCloudDelivery() { return { checksum }; },
+    markCloudDeliveryAttempt() {},
+    markCloudDeliveryMailboxed() {}
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async (_url, request) => {
+      const payload = decryptRelayPayload(JSON.parse(request.body), keyBase64);
+      fetchOrder.push(payload.visibleGroupId || payload.turnId);
+      return Response.json({ ok: true }, { status: 201 });
+    },
+    clock: () => 1_000
+  });
+  assert.deepEqual(await outbox.flushOnce(50), { delivered: 50, failed: 0, waiting: 0 });
+  assert.deepEqual(fetchOrder.slice(0, 20), Array.from({ length: 20 }, (_, index) =>
+    `failure_${String(index).padStart(2, '0')}`
+  ));
+  assert.deepEqual(fetchOrder.slice(20, 40), Array.from({ length: 20 }, (_, index) =>
+    `legacy_${String(index).padStart(2, '0')}`
+  ));
+  assert.deepEqual(fetchOrder.slice(40), Array.from({ length: 10 }, (_, index) =>
+    `group_${String(index).padStart(2, '0')}`
+  ));
+});
+
 test('fifty canonical sends perform fifty scoped validations and zero full scans', async () => {
   const validationCounts = { fullDatabase: 0, groupScoped: 0 };
   const fetchBodies = [];
   const targets = Array.from({ length: 50 }, (_, index) => ({
     authorityGroupId: `group_${String(index).padStart(3, '0')}`,
+    turnId: `turn_group_${String(index).padStart(3, '0')}`,
     peerId: 'phone_cloud',
     authorityCommitChecksum: 'a'.repeat(64),
     updatedAt: index + 1
@@ -449,14 +770,12 @@ test('fifty canonical sends perform fifty scoped validations and zero full scans
   const store = {
     listPendingAuthorityCloudDeliveries: limit => targets.slice(0, limit),
     listPendingCloudDeliveries: () => [],
-    visibleDeliveryPayload(groupId) {
+    getTurn(turnId) {
+      return { turnId, protocolVersion: 3, state: 'committed' };
+    },
+    loadCanonicalBridgeResultInternal(turnId) {
       validationCounts.groupScoped += 1;
-      return {
-        ok: true, terminal: true, visibleGroupId: groupId,
-        authorityLineageKey: `lineage_${groupId}`,
-        commitChecksum: 'a'.repeat(64), replyParts: [], actions: [],
-        inputVisibilitySequence: 0, inputClearEpoch: 0
-      };
+      return canonicalOutboxResult(turnId, turnId.replace('turn_', ''));
     },
     prepareAuthorityCloudDelivery() { return { checksum: 'b'.repeat(64) }; },
     markAuthorityCloudDeliveryAttempt() {},

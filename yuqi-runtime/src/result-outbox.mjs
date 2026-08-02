@@ -1,5 +1,15 @@
 import { encryptRelayPayload, stableId } from './cloud-relay-pump.mjs';
+import { isCanonicalAuthorityConflictError, projectBridgeResultForWire } from './bridge-result-projector.mjs';
 import { publicTurnStatus } from './turn-status.mjs';
+
+function consumeCanonicalQuarantineOutcome(result) {
+  if (!result || ![
+    'quarantined', 'already_quarantined', 'stale_redacted', 'stale_terminal'
+  ].includes(result.quarantineOutcome)) {
+    throw new Error('canonical delivery quarantine outcome conflict');
+  }
+  return result;
+}
 
 export class ResultOutbox {
   constructor({
@@ -36,8 +46,11 @@ export class ResultOutbox {
       const authorityTargets = typeof this.store.listPendingAuthorityCloudDeliveries === 'function'
         ? this.store.listPendingAuthorityCloudDeliveries(limit)
         : [];
+      const failureTargets = typeof this.store.listPendingCanonicalFailureCloudDeliveries === 'function'
+        ? this.store.listPendingCanonicalFailureCloudDeliveries(limit, this.clock())
+        : [];
       const legacyTargets = this.store.listPendingCloudDeliveries(limit);
-      const targets = [...authorityTargets, ...legacyTargets].sort((left, right) =>
+      const targets = [...authorityTargets, ...failureTargets, ...legacyTargets].sort((left, right) =>
         Number(left.updatedAt || 0) - Number(right.updatedAt || 0)
         || String(left.authorityGroupId || left.turnId).localeCompare(
           String(right.authorityGroupId || right.turnId)
@@ -45,32 +58,50 @@ export class ResultOutbox {
         || String(left.peerId).localeCompare(String(right.peerId))
       ).slice(0, limit);
       for (const target of targets) {
-        if (target.authorityGroupId) {
+        if (target.deliveryType === 'canonical_failure') {
+          const expected = {
+            state: target.state,
+            payloadJson: target.payloadJson ?? null,
+            checksum: target.checksum || null,
+            attempts: Number(target.attempts || 0),
+            relayMessageId: target.relayMessageId ?? null,
+            deliveredAt: target.deliveredAt ?? null,
+            updatedAt: Number(target.updatedAt || 0)
+          };
+          let claim;
           try {
-            const publicPayload = this.store.visibleDeliveryPayload(
-              target.authorityGroupId,
-              target.peerId
-            );
-            const delivery = this.store.prepareAuthorityCloudDelivery(
-              target.authorityGroupId,
-              target.peerId,
-              publicPayload
-            );
-            this.store.markAuthorityCloudDeliveryAttempt(
-              target.authorityGroupId,
-              target.peerId
-            );
-            const encrypted = encryptRelayPayload(publicPayload, this.encryptionKeyBase64);
-            const identity = `${target.authorityGroupId}:${target.peerId}:${target.authorityCommitChecksum}`;
-            const output = {
-              deviceId: this.deviceId,
-              messageId: stableId('relay_pc', identity),
-              idempotencyKey: stableId('reply', identity),
-              direction: 'pc_to_phone',
-              ...encrypted,
-              expiresAt: this.clock() + 24 * 60 * 60 * 1000
-            };
-            const response = await this.fetch(`${this.relayUrl}/bridge/enqueue`, {
+            claim = this.store.claimCanonicalFailureCloudDeliveryInternal({
+              turnId: target.turnId,
+              peerId: target.peerId,
+              timestamp: this.clock()
+            });
+            if (!claim) continue;
+          } catch (error) {
+            if (isCanonicalAuthorityConflictError(error)
+              && typeof this.store.quarantineCanonicalCloudDeliveryInternal === 'function') {
+              consumeCanonicalQuarantineOutcome(this.store.quarantineCanonicalCloudDeliveryInternal({
+                turnId: target.turnId,
+                peerId: target.peerId,
+                expected,
+                reason: 'authority_validation_failed'
+              }));
+              summary.failed += 1;
+              continue;
+            }
+            throw error;
+          }
+          const encrypted = encryptRelayPayload(claim.payload, this.encryptionKeyBase64);
+          const output = {
+            deviceId: this.deviceId,
+            messageId: claim.relayMessageId,
+            idempotencyKey: claim.relayMessageId,
+            direction: 'pc_to_phone',
+            ...encrypted,
+            expiresAt: this.clock() + 24 * 60 * 60 * 1000
+          };
+          let response;
+          try {
+            response = await this.fetch(`${this.relayUrl}/bridge/enqueue`, {
               method: 'POST',
               headers: {
                 authorization: `Bearer ${this.deviceToken}`,
@@ -79,7 +110,114 @@ export class ResultOutbox {
               },
               body: JSON.stringify(output)
             });
-            if (!response.ok) throw new Error(`cloud relay enqueue HTTP ${response.status}`);
+          } catch {
+            summary.failed += 1;
+            continue;
+          }
+          if (!response.ok) {
+            summary.failed += 1;
+            continue;
+          }
+          try {
+            this.store.markCanonicalFailureCloudDeliveryMailboxedInternal({
+              turnId: target.turnId,
+              peerId: target.peerId,
+              rawStatusChecksum: claim.rawStatusChecksum,
+              leaseId: claim.leaseId,
+              leaseAttempt: claim.leaseAttempt,
+              relayMessageId: output.messageId,
+              timestamp: this.clock()
+            });
+            summary.delivered += 1;
+          } catch (error) {
+            throw error;
+          }
+          continue;
+        }
+        if (target.authorityGroupId) {
+          const expected = {
+            state: target.state,
+            payloadJson: target.payloadJson ?? null,
+            checksum: target.checksum || null,
+            attempts: Number(target.attempts || 0),
+            relayMessageId: target.relayMessageId ?? null,
+            deliveredAt: target.deliveredAt ?? null,
+            updatedAt: Number(target.updatedAt || 0)
+          };
+          let publicPayload;
+          let delivery;
+          try {
+            const persistedTurn = this.store.getTurn(target.turnId);
+            const canonicalResult = this.store.loadCanonicalBridgeResultInternal(target.turnId);
+            if (canonicalResult?.status === 'redacted') {
+              summary.failed += 1;
+              continue;
+            }
+            publicPayload = {
+              ok: true,
+              ...projectBridgeResultForWire(canonicalResult,
+                Number(persistedTurn?.protocolVersion) === 3 ? 3 : 2),
+              recoveryAckSeq: Number(target.recoveryAckSeq || 0)
+            };
+            if (publicPayload.deliverable === false) {
+              summary.failed += 1;
+              continue;
+            }
+            delivery = this.store.prepareAuthorityCloudDelivery(
+              target.authorityGroupId,
+              target.peerId,
+              publicPayload
+            );
+            this.store.markAuthorityCloudDeliveryAttempt(
+              target.authorityGroupId,
+              target.peerId
+            );
+          } catch (error) {
+            if (isCanonicalAuthorityConflictError(error)
+              && typeof this.store.quarantineCanonicalVisibleDeliveryInternal === 'function') {
+              consumeCanonicalQuarantineOutcome(this.store.quarantineCanonicalVisibleDeliveryInternal({
+                turnId: target.turnId,
+                peerId: target.peerId,
+                authorityGroupId: target.authorityGroupId,
+                authorityCommitChecksum: target.authorityCommitChecksum,
+                expected,
+                reason: 'authority_validation_failed'
+              }));
+              summary.failed += 1;
+              continue;
+            }
+            throw error;
+          }
+          const encrypted = encryptRelayPayload(publicPayload, this.encryptionKeyBase64);
+          const identity = `${target.authorityGroupId}:${target.peerId}:${target.authorityCommitChecksum}`;
+          const output = {
+            deviceId: this.deviceId,
+            messageId: stableId('relay_pc', identity),
+            idempotencyKey: stableId('reply', identity),
+            direction: 'pc_to_phone',
+            ...encrypted,
+            expiresAt: this.clock() + 24 * 60 * 60 * 1000
+          };
+          let response;
+          try {
+            response = await this.fetch(`${this.relayUrl}/bridge/enqueue`, {
+              method: 'POST',
+              headers: {
+                authorization: `Bearer ${this.deviceToken}`,
+                accept: 'application/json',
+                'content-type': 'application/json'
+              },
+              body: JSON.stringify(output)
+            });
+          } catch {
+            summary.failed += 1;
+            continue;
+          }
+          if (!response.ok) {
+            summary.failed += 1;
+            continue;
+          }
+          try {
             this.store.markAuthorityCloudDeliveryMailboxed(
               target.authorityGroupId,
               target.peerId,
@@ -87,8 +225,8 @@ export class ResultOutbox {
               output.messageId
             );
             summary.delivered += 1;
-          } catch {
-            summary.failed += 1;
+          } catch (error) {
+            throw error;
           }
           continue;
         }

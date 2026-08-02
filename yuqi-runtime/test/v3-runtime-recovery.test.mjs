@@ -91,6 +91,7 @@ function pinnedCanonicalTurn(envelope, overrides = {}) {
     turnId: envelope.turnId,
     characterId: envelope.characterId,
     state: 'queued',
+    protocolVersion: envelope.protocolVersion,
     route: 'deep',
     routeReasons: ['release-pinned'],
     resultAuthorityVersion: 1,
@@ -383,10 +384,51 @@ test('exact v3 replay reuses persisted release and agency pins without fresh aut
   assert.equal(fixture.calls.agencyReads.length, 0);
 });
 
-test('canonical transient failed v3 replay uses the revisioned canonical requeue only', () => {
+test('canonical transient failed v3 replay stays terminal and only authorizes a child retry', () => {
+  for (const retryAllowed of [true, false]) {
+    const envelope = v3DirectEnvelope();
+    const persisted = pinnedCanonicalTurn(envelope, {
+      authorityLineageKey: envelope.authority.lineageKey,
+      state: 'failed',
+      turnRevision: 7,
+      errorJson: JSON.stringify({ failureClass: 'transient', retryAllowed })
+    });
+    const fixture = orchestrationFixture({ turns: [persisted] });
+
+    const replay = fixture.orchestrator.accept(envelope);
+
+    assert.equal(fixture.calls.legacyCreates.length, 0);
+    assert.equal(replay.state, 'failed');
+    assert.equal(replay.turnRevision, 7);
+    assert.equal(replay.errorJson, persisted.errorJson);
+    assert.equal(fixture.calls.canonicalRequeues.length, 0);
+    assert.equal(fixture.calls.legacyRequeues.length, 0);
+  }
+});
+
+test('canonical deterministic failed v3 replay remains terminal without either requeue writer', () => {
   const envelope = v3DirectEnvelope();
   const persisted = pinnedCanonicalTurn(envelope, {
     authorityLineageKey: envelope.authority.lineageKey,
+    state: 'failed',
+    turnRevision: 8,
+    errorJson: JSON.stringify({ failureClass: 'deterministic', retryAllowed: false })
+  });
+  const fixture = orchestrationFixture({ turns: [persisted] });
+
+  const replay = fixture.orchestrator.accept(envelope);
+
+  assert.equal(replay.state, 'failed');
+  assert.equal(fixture.calls.canonicalRequeues.length, 0);
+  assert.equal(fixture.calls.legacyRequeues.length, 0);
+});
+
+test('canonical wire-v2 transient failed replay retains the revisioned same-turn requeue', () => {
+  const envelope = directEnvelope({
+    protocolVersion: 2,
+    turnId: 'turn_wire_v2_transient_replay'
+  });
+  const persisted = pinnedCanonicalTurn(envelope, {
     state: 'failed',
     turnRevision: 7,
     errorJson: JSON.stringify({ failureClass: 'transient' })
@@ -395,7 +437,6 @@ test('canonical transient failed v3 replay uses the revisioned canonical requeue
 
   const replay = fixture.orchestrator.accept(envelope);
 
-  assert.equal(fixture.calls.legacyCreates.length, 0);
   assert.equal(replay.state, 'queued');
   assert.equal(fixture.calls.canonicalRequeues.length, 1);
   assert.deepEqual(fixture.calls.canonicalRequeues[0], {
@@ -403,23 +444,6 @@ test('canonical transient failed v3 replay uses the revisioned canonical requeue
     expectedTurnRevision: 7,
     allowedFailureClass: 'transient'
   });
-  assert.equal(fixture.calls.legacyRequeues.length, 0);
-});
-
-test('canonical non-transient failed v3 replay remains terminal without either requeue writer', () => {
-  const envelope = v3DirectEnvelope();
-  const persisted = pinnedCanonicalTurn(envelope, {
-    authorityLineageKey: envelope.authority.lineageKey,
-    state: 'failed',
-    turnRevision: 8,
-    errorJson: JSON.stringify({ failureClass: 'terminal' })
-  });
-  const fixture = orchestrationFixture({ turns: [persisted] });
-
-  const replay = fixture.orchestrator.accept(envelope);
-
-  assert.equal(replay.state, 'failed');
-  assert.equal(fixture.calls.canonicalRequeues.length, 0);
   assert.equal(fixture.calls.legacyRequeues.length, 0);
 });
 

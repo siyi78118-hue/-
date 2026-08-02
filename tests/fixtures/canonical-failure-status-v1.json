@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "canonicalization": "utf8-canonical-json-v1",
+  "vectors": [
+    {
+      "name": "transient-native-retry-allowed",
+      "failureInput": {
+        "name": "ProviderTimeout",
+        "message": "provider temporarily unavailable"
+      },
+      "wire": {
+        "protocolVersion": 3,
+        "type": "BACKLOG_FAILED",
+        "turnId": "turn_failure_transient_native",
+        "roleId": "yuqi",
+        "authorityLineageKey": "lin_failure_transient_native",
+        "lineageRevision": 4,
+        "turnRevision": 7,
+        "laneKey": "private_chat",
+        "laneRevision": 12,
+        "retryOfTurnId": null,
+        "inputVisibilitySequence": 300,
+        "inputClearEpoch": 2,
+        "generationFingerprint": "fp_failure_transient_native",
+        "releaseId": "cognition-v3",
+        "state": "failed",
+        "errorCode": "YUQI_TRANSIENT_EXECUTION_FAILURE",
+        "failureClass": "transient",
+        "retryAllowed": true,
+        "failedAt": 1720000000123,
+        "rawStatusChecksum": "bca317be2e2ba4f5b54737cdda5da7e680ce0b08780045645b8f0f489ff2e3ae"
+      }
+    },
+    {
+      "name": "deterministic-native-retry-disallowed",
+      "failureInput": {
+        "name": "PolicyRejected",
+        "message": "request cannot be retried"
+      },
+      "wire": {
+        "protocolVersion": 3,
+        "type": "BACKLOG_FAILED",
+        "turnId": "turn_failure_deterministic",
+        "roleId": "yuqi",
+        "authorityLineageKey": "lin_failure_deterministic",
+        "lineageRevision": 9,
+        "turnRevision": 11,
+        "laneKey": "private_chat",
+        "laneRevision": 18,
+        "retryOfTurnId": null,
+        "inputVisibilitySequence": 412,
+        "inputClearEpoch": 2,
+        "generationFingerprint": "fp_failure_deterministic",
+        "releaseId": "legacy-v1",
+        "state": "failed",
+        "errorCode": "YUQI_DETERMINISTIC_EXECUTION_FAILURE",
+        "failureClass": "deterministic",
+        "retryAllowed": false,
+        "failedAt": 1720000001123,
+        "rawStatusChecksum": "9cb77b83e5e93be7a436d646273276da2a9cb4de5e893bad211ef85079bc7dc4"
+      }
+    },
+    {
+      "name": "unicode-retry-child",
+      "failureInput": {
+        "name": "\u4e34\u65f6\u5f02\u5e38",
+        "message": "\u8de8\u5e73\u884c\u65f6\u7a7a\u7684\u91cd\u8bd5\u7b49\u5f85"
+      },
+      "wire": {
+        "protocolVersion": 3,
+        "type": "BACKLOG_FAILED",
+        "turnId": "turn_\u91cd\u8bd5_\u4e8c",
+        "roleId": "\u865e\u6816\ud83c\udf27\ufe0f",
+        "authorityLineageKey": "lin_\u5e73\u884c\u65f6\u7a7a_\u91cd\u8bd5",
+        "lineageRevision": 13,
+        "turnRevision": 5,
+        "laneKey": "\u79c1\u804a:\u591c\u96e8",
+        "laneRevision": 21,
+        "retryOfTurnId": "turn_\u521d\u59cb_\u4e00",
+        "inputVisibilitySequence": 9007199254740000,
+        "inputClearEpoch": 3,
+        "generationFingerprint": "fp_\u8de8\u65f6\u7a7a_\u91cd\u8bd5",
+        "releaseId": "cognition-v2",
+        "state": "failed",
+        "errorCode": "YUQI_TRANSIENT_EXECUTION_FAILURE",
+        "failureClass": "transient",
+        "retryAllowed": false,
+        "failedAt": 1720000002123,
+        "rawStatusChecksum": "ade697a22e4e533e7fbcede4154a094ee6fd794e0fab8b7a3ad086b8ee59caa0"
+      }
+    }
+  ]
+}

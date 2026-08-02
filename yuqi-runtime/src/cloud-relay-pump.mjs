@@ -1,5 +1,8 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 
+import { contentHash, validateAuthorityDeliveryReceipt, validateEnvelope } from './protocol.mjs';
+import { normalizeRecoverySnapshot } from './reconcile.mjs';
+
 function keyBytes(value) {
   const key = Buffer.from(String(value || ''), 'base64');
   if (key.length !== 32) throw new Error('cloud encryption key must be 256-bit');
@@ -132,23 +135,65 @@ export class CloudRelayPump {
       for (const message of messages) {
         let envelope = null;
         try {
-          envelope = decryptRelayPayload(message, this.encryptionKeyBase64);
-          if (envelope.type === 'DELIVERY_RECEIPT') {
-            if (!this.store || typeof this.store.confirmCloudDelivery !== 'function') {
-              throw new Error('delivery receipt store is unavailable');
+          const rawEnvelope = decryptRelayPayload(message, this.encryptionKeyBase64);
+          if (rawEnvelope.type === 'AUTHORITY_DELIVERY_RECEIPT') {
+            if (!this.store || typeof this.store.confirmAuthorityCloudDeliveryInternal !== 'function') {
+              throw new Error('authority delivery receipt store is unavailable');
             }
-            if (Array.isArray(envelope.items)) {
-              this.store.confirmCloudDeliveryItems(
-                String(envelope.turnId || ''),
-                String(envelope.peerId || this.deviceId),
-                envelope
-              );
+            this.store.confirmAuthorityCloudDeliveryInternal(validateAuthorityDeliveryReceipt(rawEnvelope));
+            const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {
+              method: 'POST', headers: this.headers(true),
+              body: JSON.stringify({ deviceId: this.deviceId, messageIds: [message.messageId] })
+            });
+            if (!acked.ok) throw new Error(`cloud relay ack HTTP ${acked.status}`);
+            summary.processed += 1;
+            continue;
+          }
+          if (rawEnvelope.type === 'DELIVERY_RECEIPT') {
+            if (!this.store) throw new Error('delivery receipt store is unavailable');
+            const deliveryTurn = this.store.getTurn?.(String(rawEnvelope.turnId || ''));
+            const canonicalV2 = Number(deliveryTurn?.resultAuthorityVersion || 0) === 1
+              && Number(deliveryTurn?.protocolVersion || 0) === 2;
+            if (Array.isArray(rawEnvelope.items)) {
+              if (canonicalV2) {
+                if (typeof this.store.confirmCanonicalV2DeliveryInternal !== 'function') {
+                  throw new Error('canonical v2 delivery receipt store is unavailable');
+                }
+                this.store.confirmCanonicalV2DeliveryInternal(
+                  String(rawEnvelope.turnId || ''),
+                  String(rawEnvelope.peerId || this.deviceId),
+                  rawEnvelope
+                );
+              } else {
+                if (typeof this.store.confirmCloudDeliveryItems !== 'function') {
+                  throw new Error('delivery receipt store is unavailable');
+                }
+                this.store.confirmCloudDeliveryItems(
+                  String(rawEnvelope.turnId || ''),
+                  String(rawEnvelope.peerId || this.deviceId),
+                  rawEnvelope
+                );
+              }
             } else {
-              this.store.confirmCloudDelivery(
-                String(envelope.turnId || ''),
-                String(envelope.peerId || this.deviceId),
-                envelope
-              );
+              if (canonicalV2) {
+                if (typeof this.store.confirmCanonicalV2SimpleDeliveryInternal !== 'function') {
+                  throw new Error('canonical v2 delivery receipt store is unavailable');
+                }
+                this.store.confirmCanonicalV2SimpleDeliveryInternal(
+                  String(rawEnvelope.turnId || ''),
+                  String(rawEnvelope.peerId || this.deviceId),
+                  rawEnvelope
+                );
+              } else {
+                if (typeof this.store.confirmCloudDelivery !== 'function') {
+                  throw new Error('delivery receipt store is unavailable');
+                }
+                this.store.confirmCloudDelivery(
+                  String(rawEnvelope.turnId || ''),
+                  String(rawEnvelope.peerId || this.deviceId),
+                  rawEnvelope
+                );
+              }
             }
             const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {
               method: 'POST', headers: this.headers(true),
@@ -158,9 +203,19 @@ export class CloudRelayPump {
             summary.processed += 1;
             continue;
           }
+          let recoveryInput;
+          try {
+            envelope = validateEnvelope(rawEnvelope);
+            recoveryInput = rawEnvelope.recovery === undefined
+              ? null
+              : normalizeRecoverySnapshot(rawEnvelope.recovery, { expectedDeviceId: envelope.deviceId });
+          } catch (error) {
+            error.suppressStoreDiagnostic = true;
+            throw error;
+          }
           let recoveryAckSeq = 0;
-          if (this.reconciler && envelope.recovery && Array.isArray(envelope.recovery.entries)) {
-            const recovery = await this.reconciler.reconcileFrom(envelope.recovery);
+          if (this.reconciler && recoveryInput) {
+            const recovery = await this.reconciler.reconcileFrom(recoveryInput);
             recoveryAckSeq = recovery.ackSeq;
           }
           const ageMs = this.clock() - Number(envelope.createdAt || 0);
@@ -192,6 +247,13 @@ export class CloudRelayPump {
                 ? this.store.getTurn(String(envelope.turnId || ''))
                 : null;
               if (!authoritative) throw error;
+              if (Number(envelope.protocolVersion) === 3
+                && (String(authoritative.turnId || '') !== String(envelope.turnId)
+                  || String(authoritative.envelopeChecksum || '') !== contentHash(envelope))) {
+                const conflict = new Error('canonical duplicate envelope conflict');
+                conflict.suppressStoreDiagnostic = true;
+                throw conflict;
+              }
               turn = authoritative;
               this.store.putDiagnostic?.({
                 turnId: turn.turnId,
@@ -201,7 +263,9 @@ export class CloudRelayPump {
               });
             }
             const peerId = String(envelope.recovery?.peerId || envelope.deviceId || this.deviceId);
-            this.store.registerCloudDelivery(turn.turnId, peerId, recoveryAckSeq);
+            if (Number(turn?.resultAuthorityVersion || 0) === 0) {
+              this.store.registerCloudDelivery(turn.turnId, peerId, recoveryAckSeq);
+            }
             const acked = await this.fetch(`${this.relayUrl}/bridge/ack`, {
               method: 'POST', headers: this.headers(true),
               body: JSON.stringify({ deviceId: this.deviceId, messageIds: [message.messageId] })
@@ -237,7 +301,8 @@ export class CloudRelayPump {
           const now = this.clock();
           const relayMessageId = String(message?.messageId || '').slice(0, 128);
           const previous = Number(this.messageDiagnosticTimes.get(relayMessageId) || 0);
-          if (this.store?.putDiagnostic && (previous === 0 || now - previous >= 60_000)) {
+          if (error?.suppressStoreDiagnostic !== true
+            && this.store?.putDiagnostic && (previous === 0 || now - previous >= 60_000)) {
             const raw = String(error?.message || error || 'cloud relay message failed');
             const safeMessage = raw.replaceAll(this.deviceToken, '[redacted]').slice(0, 160);
             this.store.putDiagnostic({

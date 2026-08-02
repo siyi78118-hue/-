@@ -125,6 +125,65 @@ export function validateDeliveryReceipt(value) {
   };
 }
 
+const AUTHORITY_DELIVERY_RECEIPT_KEYS = Object.freeze([
+  'protocolVersion',
+  'type',
+  'peerId',
+  'turnId',
+  'authorityLineageKey',
+  'visibleGroupId',
+  'commitChecksum',
+  'terminalDisposition',
+  'deliveredAt'
+]);
+
+export function validateAuthorityDeliveryReceipt(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('invalid authority delivery receipt');
+  }
+  const keys = Object.keys(value).sort();
+  const expectedKeys = [...AUTHORITY_DELIVERY_RECEIPT_KEYS].sort();
+  if (keys.length !== expectedKeys.length || keys.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error('invalid authority delivery receipt shape');
+  }
+  if (value.protocolVersion !== 3 || value.type !== 'AUTHORITY_DELIVERY_RECEIPT') {
+    throw new Error('invalid authority delivery receipt identity');
+  }
+  if (typeof value.terminalDisposition !== 'string'
+    || !['visible', 'action_only', 'skip'].includes(value.terminalDisposition)) {
+    throw new Error('invalid authority delivery receipt disposition');
+  }
+  const terminalDisposition = value.terminalDisposition;
+  if (typeof value.commitChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(value.commitChecksum)) {
+    throw new Error('invalid authority delivery receipt checksum');
+  }
+  const commitChecksum = value.commitChecksum;
+  for (const [key, label] of [
+    ['peerId', 'peer'],
+    ['turnId', 'turn'],
+    ['authorityLineageKey', 'lineage'],
+    ['visibleGroupId', 'group']
+  ]) {
+    if (typeof value[key] !== 'string') {
+      throw new Error(`invalid authority delivery receipt ${label}`);
+    }
+  }
+  if (typeof value.deliveredAt !== 'number') {
+    throw new Error('invalid authority delivery receipt time');
+  }
+  return {
+    protocolVersion: 3,
+    type: 'AUTHORITY_DELIVERY_RECEIPT',
+    peerId: requireId(value.peerId, 'authority delivery receipt peer'),
+    turnId: requireId(value.turnId, 'authority delivery receipt turn'),
+    authorityLineageKey: requireId(value.authorityLineageKey, 'authority delivery receipt lineage'),
+    visibleGroupId: requireId(value.visibleGroupId, 'authority delivery receipt group'),
+    commitChecksum,
+    terminalDisposition,
+    deliveredAt: requireTimestamp(value.deliveredAt, 'authority delivery receipt time')
+  };
+}
+
 function requireId(value, label, prefix = '') {
   const text = String(value || '');
   if (!ID_PATTERN.test(text) || (prefix && !text.startsWith(prefix))) {

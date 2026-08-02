@@ -9,6 +9,15 @@ function failureClassFor(error) {
   ) ? 'transient' : 'deterministic';
 }
 
+function isWireV3(turn) {
+  if (Number(turn?.protocolVersion) === 3) return true;
+  try {
+    return Number(JSON.parse(String(turn?.envelopeJson || '{}')).protocolVersion) === 3;
+  } catch {
+    return false;
+  }
+}
+
 export class TurnDispatcher {
   constructor({ orchestrator, store }) {
     if (!orchestrator || !store) throw new Error('orchestrator and store are required');
@@ -41,18 +50,27 @@ export class TurnDispatcher {
           let current = this.store.getTurn(turnId);
           if (Number(current?.resultAuthorityVersion || 0) === 1) {
             const failureClass = failureClassFor(error);
+            const wireV3 = isWireV3(current);
             if (current.state !== 'failed' && this.store.recordCanonicalTurnFailureInternal) {
+              const failure = {
+                name: String(error?.name || 'Error'),
+                message: String(error?.message || error),
+                failureClass
+              };
+              if (wireV3) {
+                failure.retryAllowed = failureClass === 'transient';
+                failure.code = failureClass === 'transient'
+                  ? 'YUQI_TRANSIENT_EXECUTION_FAILURE'
+                  : 'YUQI_DETERMINISTIC_EXECUTION_FAILURE';
+              }
               current = this.store.recordCanonicalTurnFailureInternal({
                 turnId,
                 expectedState: current.state,
                 expectedTurnRevision: current.turnRevision,
-                failure: {
-                  name: String(error?.name || 'Error'),
-                  message: String(error?.message || error),
-                  failureClass
-                }
+                failure
               });
             }
+            if (wireV3 && current?.state === 'failed') return current;
             if (failureClass !== 'transient' || current?.state !== 'failed') throw error;
             this.store.requeueCanonicalFailedTurnInternal({
               turnId,

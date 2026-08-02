@@ -25,6 +25,37 @@ function validateEntries(entries) {
   }
 }
 
+export function normalizeRecoverySnapshot(value, { expectedDeviceId = null } = {}) {
+  const keys = value && typeof value === 'object' && !Array.isArray(value)
+    ? Object.keys(value).sort().join(',')
+    : '';
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !['entries,lastCommonSeq,peerId', 'entries,lastCommonSeq,lastSeq,peerId'].includes(keys)
+    || typeof value.peerId !== 'string'
+    || !/^[A-Za-z0-9:_-]{3,128}$/.test(value.peerId)
+    || !Number.isSafeInteger(value.lastCommonSeq) || value.lastCommonSeq < 0
+    || !Array.isArray(value.entries)) {
+    throw new Error('invalid recovery snapshot');
+  }
+  if (expectedDeviceId !== null && value.peerId !== expectedDeviceId) {
+    throw new Error('recovery peer must match envelope device');
+  }
+  const entries = structuredClone(value.entries)
+    .sort((left, right) => Number(left.seq) - Number(right.seq));
+  validateEntries(entries);
+  if (Object.hasOwn(value, 'lastSeq')) {
+    const expectedLastSeq = Math.max(value.lastCommonSeq, ...entries.map(entry => Number(entry.seq)));
+    if (!Number.isSafeInteger(value.lastSeq) || value.lastSeq < 0 || value.lastSeq !== expectedLastSeq) {
+      throw new Error('invalid recovery snapshot');
+    }
+  }
+  return {
+    peerId: value.peerId,
+    lastCommonSeq: value.lastCommonSeq,
+    entries
+  };
+}
+
 export class YuqiReconciler {
   constructor({ store, codex }) {
     if (!store || !codex) throw new Error('store and codex are required');
@@ -32,12 +63,9 @@ export class YuqiReconciler {
     this.codex = codex;
   }
 
-  async reconcileFrom({ peerId, lastCommonSeq = 0, entries = [] }) {
-    if (!/^[A-Za-z0-9:_-]{3,128}$/.test(String(peerId || ''))) throw new Error('invalid peerId');
-    const declaredCommon = Math.max(0, Number(lastCommonSeq) || 0);
+  async reconcileFrom(rawRecovery) {
+    const { peerId, lastCommonSeq: declaredCommon, entries: ordered } = normalizeRecoverySnapshot(rawRecovery);
     if (declaredCommon > this.store.getSyncCursor(peerId)) this.store.ackSync(peerId, declaredCommon);
-    const ordered = [...entries].sort((left, right) => Number(left.seq) - Number(right.seq));
-    validateEntries(ordered);
     const acknowledged = this.store.getSyncCursor(peerId);
     const pending = ordered.filter(entry => Number(entry.seq) > acknowledged);
     if (!pending.length) {

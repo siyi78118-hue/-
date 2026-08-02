@@ -1,3 +1,6 @@
+import { projectBridgeResultForWire } from './bridge-result-projector.mjs';
+import { deliveryItemsForResult } from './protocol.mjs';
+
 function parseStoredJson(value) {
   try { return value ? JSON.parse(value) : null; } catch { return null; }
 }
@@ -10,10 +13,22 @@ function immersiveStage(stage, terminal) {
   return '正在认真想…';
 }
 
-export function publicTurnStatus(turn, { stages = [], clock = Date.now } = {}) {
+export function publicTurnStatus(turn, {
+  stages = [], canonicalResult = null, canonicalFailure = null, wireVersion = null, clock = Date.now
+} = {}) {
   if (!turn) return null;
   const committed = ['committed', 'delivered', 'completed'].includes(turn.state);
   const failed = ['failed', 'fallback'].includes(turn.state);
+  const authoritativeVersion = Number(turn.resultAuthorityVersion) === 1;
+  const persistedWireVersion = Number(wireVersion ?? turn.protocolVersion ?? 0);
+  if (authoritativeVersion && committed) {
+    if (!canonicalResult) throw new Error('canonical bridge result authority conflict');
+    return projectBridgeResultForWire(canonicalResult, persistedWireVersion === 3 ? 3 : 2);
+  }
+  if (authoritativeVersion && persistedWireVersion === 3 && failed) {
+    if (!canonicalFailure) throw new Error('canonical failure authority conflict');
+    return { ...canonicalFailure, terminal: true, allowFallback: false, action: 'failed', retryAfterMs: 0 };
+  }
   const result = parseStoredJson(turn.replyJson);
   const error = parseStoredJson(turn.errorJson);
   const latestStage = [...stages].sort((a, b) => Number(a.ordinal || 0) - Number(b.ordinal || 0)).at(-1) || null;
@@ -56,4 +71,3 @@ export function publicTurnStatus(turn, { stages = [], clock = Date.now } = {}) {
     retryAfterMs: committed || failed ? 0 : 1500
   };
 }
-import { deliveryItemsForResult } from './protocol.mjs';

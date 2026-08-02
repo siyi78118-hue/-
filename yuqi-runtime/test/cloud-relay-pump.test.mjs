@@ -6,6 +6,8 @@ import {
   decryptRelayPayload,
   encryptRelayPayload
 } from '../src/cloud-relay-pump.mjs';
+import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
+import { contentHash } from '../src/protocol.mjs';
 
 const keyBase64 = Buffer.alloc(32, 7).toString('base64');
 const envelope = {
@@ -19,7 +21,7 @@ const envelope = {
     messageId: 'msg_phone_cloud_1', speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
     content: '在吗', sentAt: 1784400000001
   },
-  recovery: { peerId: 'phone_cloud', lastCommonSeq: 0, entries: [] }
+  recovery: { peerId: 'phone_cloud', lastCommonSeq: 0, lastSeq: 0, entries: [] }
 };
 
 const v2Envelope = {
@@ -49,10 +51,44 @@ const staleProactiveEnvelope = {
     triggerId: 'trigger_phone_cloud_stale_proactive',
     triggerType: 'proactive_chat',
     scheduledFor: 1784500000000,
+    executedAt: 1784500000000,
     reason: 'planned'
   },
   recovery: { peerId: 'phone_cloud', lastCommonSeq: 0, entries: [] }
 };
+
+function v3Envelope(content = 'v3 云端消息') {
+  const message = {
+    messageId: 'msg_phone_cloud_v3_1', speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+    content, sentAt: 1784400000003
+  };
+  return {
+    protocolVersion: 3,
+    turnId: 'turn_phone_cloud_v3_1', characterId: 'yuqi', deviceId: 'phone_cloud', deviceSeq: 3,
+    createdAt: 1784400000003, kind: 'DIRECT_REPLY', message,
+    context: {
+      currentBatch: {
+        batchId: 'batch_phone_cloud_v3_1', messageIds: [message.messageId],
+        startedAt: message.sentAt, committedAt: 1784400000003, messages: [message]
+      },
+      visibilityCursor: {
+        nativeCompletedTurnId: null, nativeCompletedGroupId: null, nativeCompletedSequence: 0,
+        uiAppliedTurnId: null, uiAppliedGroupId: null, uiAppliedSequence: 0,
+        localSequence: 1, clearedThroughSequence: 0, clearEpoch: 0, clearedAt: 0,
+        chatOpen: true, quotedMessageId: null
+      }
+    },
+    authority: {
+      algorithm: 'al-authority-v1', roleId: 'yuqi', laneKey: 'private_chat',
+      rootSourceId: message.messageId,
+      lineageKey: deriveAuthorityLineageKey({
+        roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: message.messageId
+      }),
+      claimedLineageRevision: 1, retryOfTurnId: null
+    },
+    recovery: { peerId: 'phone_cloud', lastCommonSeq: 0, entries: [] }
+  };
+}
 
 function relayFixture(payload = envelope) {
   const encrypted = encryptRelayPayload(payload, keyBase64, Buffer.alloc(12, 3));
@@ -228,6 +264,33 @@ test('v2 cloud ingress acknowledges after durable dispatch without waiting for t
   ]);
 });
 
+test('canonical v2 and v3 cloud turns acknowledge once without creating a legacy delivery', async () => {
+  for (const incoming of [v2Envelope, v3Envelope('canonical cloud turn')]) {
+    const relay = relayFixture(incoming);
+    const registrations = [];
+    const pump = new CloudRelayPump({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+      dispatcher: {
+        accept(value) {
+          return { turnId: value.turnId, state: 'queued', resultAuthorityVersion: 1 };
+        }
+      },
+      store: {
+        registerCloudDelivery(...args) { registrations.push(args); }
+      },
+      reconciler: { async reconcileFrom() { return { ackSeq: 55 }; } },
+      outbox: { async flushOnce() { return { delivered: 0 }; } }
+    });
+
+    const result = await pump.pumpOnce();
+
+    assert.equal(result.processed, 1);
+    assert.deepEqual(registrations, []);
+    assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+  }
+});
+
 test('v2 duplicate checksum conflict keeps the authoritative turn and acknowledges the relay envelope', async () => {
   const relay = relayFixture(v2Envelope);
   const events = [];
@@ -263,6 +326,134 @@ test('v2 duplicate checksum conflict keeps the authoritative turn and acknowledg
     'delivery:turn_phone_cloud_v2_1:phone_cloud:61',
     'outbox'
   ]);
+});
+
+test('malformed v3 cloud ingress does not reconcile, write, or acknowledge', async () => {
+  const malformed = { ...v2Envelope, protocolVersion: 3, turnId: 'turn_phone_cloud_bad_v3' };
+  const relay = relayFixture(malformed);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: { accept() { events.push('accept'); return { turnId: malformed.turnId, state: 'queued' }; } },
+    store: {
+      registerCloudDelivery() { events.push('delivery'); },
+      putDiagnostic() { events.push('diagnostic'); }
+    },
+    reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, []);
+  assert.deepEqual(relay.state.acked, []);
+});
+
+test('invalid cloud recovery checksum is rejected before reconciliation, store work, or acknowledgement', async () => {
+  const invalidRecovery = {
+    ...v2Envelope,
+    turnId: 'turn_phone_cloud_bad_recovery',
+    recovery: {
+      peerId: 'phone_cloud', lastCommonSeq: 100,
+      entries: [{ seq: 1, entityType: 'message', entityId: 'msg_bad_recovery', operation: 'insert', payload: {}, checksum: '0'.repeat(64) }]
+    }
+  };
+  const relay = relayFixture(invalidRecovery);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: { accept() { events.push('accept'); return { turnId: invalidRecovery.turnId, state: 'queued' }; } },
+    store: {
+      registerCloudDelivery() { events.push('delivery'); },
+      putDiagnostic() { events.push('diagnostic'); }
+    },
+    reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, []);
+  assert.deepEqual(relay.state.acked, []);
+});
+
+test('invalid cloud recovery cursor is rejected before reconciliation, store work, or acknowledgement', async () => {
+  const invalidRecovery = {
+    ...v2Envelope,
+    turnId: 'turn_phone_cloud_bad_recovery_cursor',
+    recovery: { peerId: 'phone_cloud', lastCommonSeq: '100', entries: [] }
+  };
+  const relay = relayFixture(invalidRecovery);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: { accept() { events.push('accept'); return { turnId: invalidRecovery.turnId, state: 'queued' }; } },
+    store: {
+      registerCloudDelivery() { events.push('delivery'); },
+      putDiagnostic() { events.push('diagnostic'); }
+    },
+    reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, []);
+  assert.deepEqual(relay.state.acked, []);
+});
+
+test('forged Android lastSeq recovery variants are rejected before cloud side effects', async () => {
+  const variants = [
+    { peerId: 'phone_cloud', lastCommonSeq: 10, lastSeq: 9, entries: [] },
+    { peerId: 'phone_cloud', lastCommonSeq: 10, lastSeq: 11, entries: [] },
+    { peerId: 'phone_cloud', lastCommonSeq: 10, lastSeq: '10', entries: [] },
+    { peerId: 'phone_cloud', lastCommonSeq: 10, lastSeq: 10, entries: [], extra: true }
+  ];
+  for (const [index, recovery] of variants.entries()) {
+    const invalidRecovery = {
+      ...v2Envelope,
+      turnId: `turn_phone_cloud_bad_last_seq_${index}`,
+      recovery
+    };
+    const relay = relayFixture(invalidRecovery);
+    const events = [];
+    const pump = new CloudRelayPump({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+      dispatcher: { accept() { events.push('accept'); return { turnId: invalidRecovery.turnId, state: 'queued' }; } },
+      store: {
+        registerCloudDelivery() { events.push('delivery'); },
+        putDiagnostic() { events.push('diagnostic'); }
+      },
+      reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } }
+    });
+    const result = await pump.pumpOnce();
+    assert.equal(result.failed, 1);
+    assert.deepEqual(events, []);
+    assert.deepEqual(relay.state.acked, []);
+  }
+});
+
+test('changed v3 checksum conflict is not treated as an acknowledged duplicate', async () => {
+  const original = v3Envelope();
+  const changed = v3Envelope('已被改写的同一 turn');
+  const relay = relayFixture(changed);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: { accept() { events.push('accept'); throw new Error('turn checksum conflict'); } },
+    store: {
+      getTurn(turnId) {
+        events.push(`lookup:${turnId}`);
+        return { turnId: original.turnId, envelopeChecksum: contentHash(original) };
+      },
+      registerCloudDelivery() { events.push('delivery'); },
+      putDiagnostic() { events.push('diagnostic'); }
+    },
+    reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, ['reconcile', 'accept', `lookup:${original.turnId}`]);
+  assert.deepEqual(relay.state.acked, []);
 });
 
 test('a phone delivery receipt confirms memory without dispatching a chat turn', async () => {
@@ -311,7 +502,7 @@ test('an encrypted itemized phone receipt uses the unified exact delivery store 
   const pump = new CloudRelayPump({
     relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
     encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
-    dispatcher: { accept() { throw new Error('receipt must not dispatch'); } },
+    orchestrator: { process() { throw new Error('receipt must not dispatch'); } },
     store: {
       registerCloudDelivery() {},
       confirmCloudDelivery() { throw new Error('legacy receipt path must not run'); },
@@ -327,4 +518,162 @@ test('an encrypted itemized phone receipt uses the unified exact delivery store 
   assert.equal(result.processed, 1);
   assert.deepEqual(events, ['items:turn_phone_cloud_v2_2:phone_cloud:1']);
   assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+});
+
+test('an encrypted canonical v2 simple receipt uses its authority adapter before relay ack', async () => {
+  const receipt = {
+    type: 'DELIVERY_RECEIPT',
+    turnId: 'turn_phone_cloud_canonical_v2_simple',
+    messageId: 'msg_yuqi_canonical_v2_simple',
+    contentSha256: 'c'.repeat(64),
+    receivedAt: 1784400010500
+  };
+  const relay = relayFixture(receipt);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    orchestrator: { process() { throw new Error('receipt must not dispatch'); } },
+    store: {
+      getTurn: turnId => ({ turnId, resultAuthorityVersion: 1, protocolVersion: 2 }),
+      confirmCanonicalV2SimpleDeliveryInternal(turnId, peerId, value) {
+        events.push(`canonical-simple:${turnId}:${peerId}:${value.messageId}`);
+        return { state: 'confirmed' };
+      },
+      confirmCloudDelivery() { throw new Error('legacy receipt writer must not run'); }
+    }
+  });
+
+  const result = await pump.pumpOnce();
+
+  assert.equal(result.processed, 1);
+  assert.deepEqual(events, [
+    'canonical-simple:turn_phone_cloud_canonical_v2_simple:phone_cloud:msg_yuqi_canonical_v2_simple'
+  ]);
+  assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+});
+
+test('an encrypted v3 authority delivery receipt uses the canonical writer before relay acknowledgement', async () => {
+  const receipt = {
+    protocolVersion: 3,
+    type: 'AUTHORITY_DELIVERY_RECEIPT',
+    peerId: 'phone_cloud',
+    turnId: 'turn_phone_cloud_v3_1',
+    authorityLineageKey: 'lin_phone_cloud_v3_1',
+    visibleGroupId: 'group_phone_cloud_v3_1',
+    commitChecksum: 'a'.repeat(64),
+    terminalDisposition: 'skip',
+    deliveredAt: 1784400011000
+  };
+  const relay = relayFixture(receipt);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    orchestrator: { process() { throw new Error('receipt must not dispatch'); } },
+    store: {
+      confirmAuthorityCloudDeliveryInternal(value) {
+        events.push(`authority:${value.visibleGroupId}:${value.terminalDisposition}`);
+        return { state: 'confirmed' };
+      },
+      confirmCloudDelivery() { throw new Error('legacy receipt writer must not run'); }
+    }
+  });
+
+  const result = await pump.pumpOnce();
+
+  assert.equal(result.processed, 1);
+  assert.deepEqual(events, ['authority:group_phone_cloud_v3_1:skip']);
+  assert.deepEqual(relay.state.acked, ['relay_phone_cloud_1']);
+});
+
+test('encrypted v3 authority target-set conflicts leave both persisted and foreign peers unacknowledged', async () => {
+  for (const peerId of ['phone_cloud', 'foreign_phone']) {
+    const receipt = {
+      protocolVersion: 3,
+      type: 'AUTHORITY_DELIVERY_RECEIPT',
+      peerId,
+      turnId: 'turn_phone_cloud_v3_target_conflict',
+      authorityLineageKey: 'lin_phone_cloud_v3_target_conflict',
+      visibleGroupId: 'group_phone_cloud_v3_target_conflict',
+      commitChecksum: 'a'.repeat(64),
+      terminalDisposition: 'visible',
+      deliveredAt: 1784400011000
+    };
+    const relay = relayFixture(receipt);
+    const attemptedPeers = [];
+    const pump = new CloudRelayPump({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+      orchestrator: { process() { throw new Error('receipt must not dispatch'); } },
+      store: {
+        confirmAuthorityCloudDeliveryInternal(value) {
+          attemptedPeers.push(value.peerId);
+          throw new Error('canonical visible delivery target conflict');
+        },
+        confirmCloudDelivery() { throw new Error('legacy receipt writer must not run'); }
+      }
+    });
+    const result = await pump.pumpOnce();
+    assert.equal(result.failed, 1);
+    assert.deepEqual(attemptedPeers, [peerId]);
+    assert.deepEqual(relay.state.acked, []);
+  }
+});
+
+test('an invalid encrypted v3 authority receipt does not call the store or acknowledge the relay', async () => {
+  const receipt = {
+    protocolVersion: 3,
+    type: 'AUTHORITY_DELIVERY_RECEIPT',
+    peerId: 'phone_cloud',
+    turnId: 'turn_phone_cloud_v3_1',
+    authorityLineageKey: 'lin_phone_cloud_v3_1',
+    visibleGroupId: 'group_phone_cloud_v3_1',
+    commitChecksum: 'a'.repeat(64),
+    terminalDisposition: 'skip',
+    deliveredAt: 1784400011000,
+    unexpected: true
+  };
+  const relay = relayFixture(receipt);
+  let calls = 0;
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    orchestrator: { process() { throw new Error('receipt must not dispatch'); } },
+    store: { confirmAuthorityCloudDeliveryInternal() { calls += 1; } }
+  });
+
+  const result = await pump.pumpOnce();
+
+  assert.equal(result.failed, 1);
+  assert.equal(calls, 0);
+  assert.deepEqual(relay.state.acked, []);
+});
+
+test('encrypted non-native v3 receipt dispositions never call the store or acknowledge', async () => {
+  for (const terminalDisposition of [['skip'], { value: 'skip' }, 1, true, null]) {
+    const receipt = {
+      protocolVersion: 3,
+      type: 'AUTHORITY_DELIVERY_RECEIPT',
+      peerId: 'phone_cloud',
+      turnId: 'turn_phone_cloud_v3_invalid_disposition',
+      authorityLineageKey: 'lin_phone_cloud_v3_invalid_disposition',
+      visibleGroupId: 'group_phone_cloud_v3_invalid_disposition',
+      commitChecksum: 'a'.repeat(64),
+      terminalDisposition,
+      deliveredAt: 1784400011000
+    };
+    const relay = relayFixture(receipt);
+    let calls = 0;
+    const pump = new CloudRelayPump({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+      orchestrator: { process() { throw new Error('receipt must not dispatch'); } },
+      store: { confirmAuthorityCloudDeliveryInternal() { calls += 1; } }
+    });
+    const result = await pump.pumpOnce();
+    assert.equal(result.failed, 1);
+    assert.equal(calls, 0);
+    assert.deepEqual(relay.state.acked, []);
+  }
 });

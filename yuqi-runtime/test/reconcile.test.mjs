@@ -145,7 +145,7 @@ test('an already-generated Codex reply is preserved raw but hidden behind the re
   assert.equal(visible.some(message => message.messageId === 'msg_fallback_11'), true);
 }));
 
-test('invalid sync checksums stop reconciliation before facts can be promoted', async () => withStore(async store => {
+test('invalid recovery checksums stop reconciliation before cursor acknowledgement or facts can be promoted', async () => withStore(async store => {
   const corrupted = fallbackBatch();
   corrupted[1] = { ...corrupted[1], checksum: '0'.repeat(64) };
   const reconciler = new YuqiReconciler({
@@ -153,10 +153,38 @@ test('invalid sync checksums stop reconciliation before facts can be promoted', 
     codex: { async runTurn() { throw new AssertionError('must not run'); } }
   });
   await assert.rejects(
-    reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 10, entries: corrupted }),
+    reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: 100, entries: corrupted }),
     /checksum/
   );
-  assert.equal(store.getSyncCursor('phone_a'), 10);
+  assert.equal(store.getSyncCursor('phone_a'), 0);
+}));
+
+test('invalid recovery cursors stop reconciliation before cursor acknowledgement', async () => withStore(async store => {
+  const reconciler = new YuqiReconciler({
+    store,
+    codex: { async runTurn() { throw new AssertionError('must not run'); } }
+  });
+  await assert.rejects(
+    reconciler.reconcileFrom({ peerId: 'phone_a', lastCommonSeq: '100', entries: [] }),
+    /invalid recovery snapshot/
+  );
+  assert.equal(store.getSyncCursor('phone_a'), 0);
+}));
+
+test('forged Android lastSeq variants cannot advance a reconciler cursor', async () => withStore(async store => {
+  const reconciler = new YuqiReconciler({
+    store,
+    codex: { async runTurn() { throw new AssertionError('must not run'); } }
+  });
+  for (const recovery of [
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: 11, entries: fallbackBatch() },
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: 13, entries: fallbackBatch() },
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: '10', entries: [] },
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: 10, entries: [], extra: true }
+  ]) {
+    await assert.rejects(reconciler.reconcileFrom(recovery), /invalid recovery snapshot/);
+    assert.equal(store.getSyncCursor('phone_a'), 0);
+  }
 }));
 
 test('accepts the exact legacy Android checksum that escaped forward slashes', async () => withStore(async store => {

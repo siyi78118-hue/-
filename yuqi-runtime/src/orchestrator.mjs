@@ -462,7 +462,7 @@ export class YuqiOrchestrator {
         : this.store.submitTurn(envelope);
     if (submitted.state === 'failed') {
       if (Number(submitted.resultAuthorityVersion || 0) === 1) {
-        if (failureClassForTurn(submitted) === 'transient') {
+        if (Number(submitted.protocolVersion) === 2 && failureClassForTurn(submitted) === 'transient') {
           submitted = this.store.requeueCanonicalFailedTurnInternal({
             turnId: submitted.turnId,
             expectedTurnRevision: submitted.turnRevision,

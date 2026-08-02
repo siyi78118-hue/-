@@ -2,6 +2,9 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 
 import { publicTurnStatus } from './turn-status.mjs';
+import { validateAuthorityDeliveryReceipt, validateEnvelope } from './protocol.mjs';
+import { normalizeRecoverySnapshot } from './reconcile.mjs';
+import { isCanonicalAuthorityConflictError } from './bridge-result-projector.mjs';
 
 function bodyHash(body) {
   return createHash('sha256').update(String(body || ''), 'utf8').digest('hex');
@@ -26,6 +29,16 @@ function safeEqual(left, right) {
   const a = Buffer.from(String(left || ''), 'utf8');
   const b = Buffer.from(String(right || ''), 'utf8');
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function preflightEnvelope(raw) {
+  const envelope = validateEnvelope(raw);
+  return {
+    envelope,
+    recovery: raw?.recovery === undefined
+      ? null
+      : normalizeRecoverySnapshot(raw.recovery, { expectedDeviceId: envelope.deviceId })
+  };
 }
 
 export function createYuqiServer({
@@ -71,6 +84,64 @@ export function createYuqiServer({
     return { ok: true };
   }
 
+  function bridgeStatus(turn) {
+    const authoritativeVersion = Number(turn?.resultAuthorityVersion) === 1;
+    const committed = ['committed', 'delivered', 'completed'].includes(turn?.state);
+    const canonicalResult = authoritativeVersion && committed
+      ? store.loadCanonicalBridgeResultInternal(turn.turnId)
+      : null;
+    const canonicalFailure = authoritativeVersion
+      && Number(turn?.protocolVersion) === 3 && turn.state === 'failed'
+      ? store.loadCanonicalFailureForBridgeInternal(turn.turnId)
+      : null;
+    return publicTurnStatus(turn, {
+      stages: turn && typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : [],
+      canonicalResult,
+      canonicalFailure,
+      wireVersion: turn.protocolVersion
+    });
+  }
+
+  function resolveCanonicalTerminalStatus(turn) {
+    const authoritativeVersion = Number(turn?.resultAuthorityVersion) === 1;
+    const committed = ['committed', 'delivered', 'completed'].includes(turn?.state);
+    const canonicalFailure = authoritativeVersion
+      && Number(turn?.protocolVersion) === 3 && turn.state === 'failed';
+    const canonicalCommitted = authoritativeVersion && committed;
+    if (!canonicalCommitted && !canonicalFailure) return { status: bridgeStatus(turn) };
+    try {
+      if (canonicalCommitted) {
+        const canonicalResult = store.loadCanonicalBridgeResultInternal(turn.turnId);
+        if (canonicalResult?.status === 'redacted') {
+          return { error: 'CANONICAL_RESULT_REDACTED' };
+        }
+        return {
+          status: publicTurnStatus(turn, {
+            stages: typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : [],
+            canonicalResult,
+            wireVersion: turn.protocolVersion
+          })
+        };
+      }
+      const failure = store.loadCanonicalFailureForBridgeInternal(turn.turnId);
+      if (failure?.status === 'redacted') {
+        return { error: 'CANONICAL_RESULT_REDACTED' };
+      }
+      return {
+        status: publicTurnStatus(turn, {
+          stages: typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : [],
+          canonicalFailure: failure,
+          wireVersion: turn.protocolVersion
+        })
+      };
+    } catch (error) {
+      if (isCanonicalAuthorityConflictError(error)) {
+        return { error: 'CANONICAL_AUTHORITY_CONFLICT' };
+      }
+      throw error;
+    }
+  }
+
   async function handle(request, response, rawBody) {
     if (request.method === 'GET' && request.url === '/v1/health') {
       const roleThreads = Object.fromEntries(['memory', 'brain', 'supervisor'].map(role => [
@@ -107,42 +178,65 @@ export function createYuqiServer({
     }
 
     if (request.method === 'POST' && url.pathname === '/v1/turns') {
+      let preflight;
+      try { preflight = preflightEnvelope(body); } catch (error) {
+        return json(response, 400, { ok: false, error: error.message });
+      }
+      const { envelope, recovery: recoveryInput } = preflight;
       let recoveryAckSeq = 0;
-      if (reconciler && body?.recovery && Array.isArray(body.recovery.entries)) {
-        const recovery = await reconciler.reconcileFrom(body.recovery);
+      if (reconciler && recoveryInput) {
+        const recovery = await reconciler.reconcileFrom(recoveryInput);
         recoveryAckSeq = recovery.ackSeq;
       }
-      const result = await orchestrator.process(body);
+      const result = await orchestrator.process(envelope);
       return json(response, 201, { ok: true, ...result, recoveryAckSeq });
     }
     if (request.method === 'POST' && url.pathname === '/v2/turns') {
       if (!dispatcher || typeof dispatcher.accept !== 'function') {
         return json(response, 503, { ok: false, error: 'turn dispatcher is unavailable' });
       }
+      let preflight;
+      try { preflight = preflightEnvelope(body); } catch (error) {
+        return json(response, 400, { ok: false, error: error.message });
+      }
+      const { envelope, recovery: recoveryInput } = preflight;
       let recoveryAckSeq = 0;
-      if (reconciler && body?.recovery && Array.isArray(body.recovery.entries)) {
-        const recovery = await reconciler.reconcileFrom(body.recovery);
+      if (reconciler && recoveryInput) {
+        const recovery = await reconciler.reconcileFrom(recoveryInput);
         recoveryAckSeq = Number(recovery.ackSeq || 0);
       }
-      const turn = dispatcher.accept(body);
-      const status = publicTurnStatus(turn, {
-        stages: typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : []
+      const turn = dispatcher.accept(envelope);
+      const resolved = resolveCanonicalTerminalStatus(turn);
+      if (resolved.error) return json(response, resolved.error === 'CANONICAL_RESULT_REDACTED' ? 410 : 409, {
+        ok: false,
+        error: resolved.error
       });
-      return json(response, status.terminal ? 200 : 202, {
+      const status = resolved.status;
+      const terminal = ['committed', 'delivered', 'completed', 'failed', 'fallback'].includes(turn?.state);
+      return json(response, terminal ? 200 : 202, {
         ok: true,
         accepted: true,
         ...status,
+        terminal,
         recoveryAckSeq
       });
     }
     const v2TurnMatch = /^\/v2\/turns\/([^/]+)$/.exec(url.pathname);
     if (request.method === 'GET' && v2TurnMatch) {
       const turn = store.getTurn(decodeURIComponent(v2TurnMatch[1]));
-      const status = publicTurnStatus(turn, {
-        stages: turn && typeof store.getTurnStages === 'function' ? store.getTurnStages(turn.turnId) : []
+      if (!turn) return json(response, 404, { ok: false, error: 'turn not found' });
+      const resolved = resolveCanonicalTerminalStatus(turn);
+      if (resolved.error) return json(response, resolved.error === 'CANONICAL_RESULT_REDACTED' ? 410 : 409, {
+        ok: false,
+        error: resolved.error
       });
+      const status = resolved.status;
       return status
-        ? json(response, 200, { ok: true, ...status })
+        ? json(response, 200, {
+          ok: true,
+          ...status,
+          terminal: ['committed', 'delivered', 'completed', 'failed', 'fallback'].includes(turn?.state)
+        })
         : json(response, 404, { ok: false, error: 'turn not found' });
     }
     const receiptMatch = /^\/v2\/turns\/([^/]+)\/delivery-receipt$/.exec(url.pathname);
@@ -152,7 +246,28 @@ export function createYuqiServer({
         return json(response, 400, { ok: false, error: 'delivery receipt turn mismatch' });
       }
       try {
-        const delivery = store.recordDeliveryReceipt(body);
+        const targetTurn = store.getTurn?.(turnId);
+        const canonicalV2 = Number(targetTurn?.resultAuthorityVersion || 0) === 1
+          && Number(targetTurn?.protocolVersion || 0) === 2;
+        const delivery = canonicalV2
+          ? (Array.isArray(body?.items)
+            ? store.confirmCanonicalV2DeliveryInternal(turnId, String(body?.peerId || targetTurn.deviceId), body)
+            : store.confirmCanonicalV2SimpleDeliveryInternal(turnId, String(body?.peerId || targetTurn.deviceId), body))
+          : store.recordDeliveryReceipt(body);
+        return json(response, 200, { ok: true, delivery });
+      } catch (error) {
+        return json(response, 409, { ok: false, error: error.message });
+      }
+    }
+    const authorityReceiptMatch = /^\/v3\/groups\/([^/]+)\/delivery-receipt$/.exec(url.pathname);
+    if (request.method === 'POST' && authorityReceiptMatch) {
+      const groupId = decodeURIComponent(authorityReceiptMatch[1]);
+      try {
+        if (String(body?.visibleGroupId || '') !== groupId) {
+          return json(response, 400, { ok: false, error: 'authority delivery receipt group mismatch' });
+        }
+        const receipt = validateAuthorityDeliveryReceipt(body);
+        const delivery = store.confirmAuthorityCloudDeliveryInternal(receipt);
         return json(response, 200, { ok: true, delivery });
       } catch (error) {
         return json(response, 409, { ok: false, error: error.message });

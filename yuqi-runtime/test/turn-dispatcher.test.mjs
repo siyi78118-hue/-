@@ -156,16 +156,18 @@ test('a transient Codex timeout is automatically retried once from its checkpoin
   assert.equal(turn.state, 'committed');
 });
 
-test('a canonical transient failure requeues through revision CAS instead of legacy recovery', async () => {
+test('a wire-v3 canonical transient failure is terminalized once with a native retry permission', async () => {
   let runs = 0;
   let canonicalRequeues = 0;
   let legacyRequeues = 0;
+  let failureWrite = null;
   const turn = {
     turnId: 'turn_canonical_timeout',
     state: 'queued',
     resultAuthorityVersion: 1,
     turnRevision: 7,
-    errorJson: JSON.stringify({ failureClass: 'transient' })
+    protocolVersion: 3,
+    errorJson: null
   };
   const store = {
     getTurn: () => turn,
@@ -184,6 +186,16 @@ test('a canonical transient failure requeues through revision CAS instead of leg
       turn.state = 'queued';
       turn.turnRevision += 1;
       return { ...turn };
+    },
+    recordCanonicalTurnFailureInternal(input) {
+      failureWrite = input;
+      turn.state = 'failed';
+      turn.turnRevision += 1;
+      turn.errorJson = JSON.stringify({
+        failureClass: input.failure.failureClass,
+        retryAllowed: input.failure.retryAllowed
+      });
+      return { ...turn };
     }
   };
   const dispatcher = new TurnDispatcher({
@@ -193,7 +205,6 @@ test('a canonical transient failure requeues through revision CAS instead of leg
       async run() {
         runs += 1;
         if (runs === 1) {
-          turn.state = 'failed';
           throw new Error('provider temporarily unavailable');
         }
         turn.state = 'committed';
@@ -204,7 +215,10 @@ test('a canonical transient failure requeues through revision CAS instead of leg
 
   dispatcher.schedule(turn.turnId);
   await dispatcher.idle();
-  assert.equal(runs, 2);
-  assert.equal(canonicalRequeues, 1);
+  assert.equal(runs, 1);
+  assert.equal(failureWrite.failure.retryAllowed, true);
+  assert.equal(failureWrite.failure.failureClass, 'transient');
+  assert.equal(canonicalRequeues, 0);
   assert.equal(legacyRequeues, 0);
+  assert.equal(turn.state, 'failed');
 });

@@ -6,8 +6,9 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
+import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
 import { generationFingerprint, laneKeyForEnvelope } from '../src/interaction-lanes.mjs';
-import { contentHash } from '../src/protocol.mjs';
+import { contentHash, validateEnvelope } from '../src/protocol.mjs';
 import { YuqiStore } from '../src/store.mjs';
 import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
@@ -371,6 +372,54 @@ function openWithV13MigrationFault(path, step) {
   });
   store.close();
 }
+
+test('canonical visible commit snapshots only its persisted device recovery acknowledgement', () =>
+  withAuthorityV13(store => {
+    const turn = createCanonical(store, 9_901);
+    store.ackSync('phone', 12);
+    store.ackSync('foreign_device', 99);
+    store.ackSync('phone', 42);
+
+    const receipt = commitCanonical(store, turn, 9_901);
+    const delivery = store.db.prepare(`
+      SELECT peer_id, recovery_ack_seq
+      FROM cloud_deliveries
+      WHERE authority_group_id = ?
+    `).get(receipt.visibleGroupId);
+    assert.equal(delivery.peer_id, 'phone');
+    assert.equal(delivery.recovery_ack_seq, 42);
+
+    store.ackSync('phone', 88);
+    const frozen = store.db.prepare(`
+      SELECT recovery_ack_seq
+      FROM cloud_deliveries
+      WHERE authority_group_id = ?
+    `).get(receipt.visibleGroupId);
+    assert.equal(frozen.recovery_ack_seq, 42);
+  }));
+
+test('canonical visible commit rolls back its recovery acknowledgement delivery at fault step 9', () =>
+  withAuthorityV13(store => {
+    const turn = createCanonical(store, 9_902);
+    store.ackSync('phone', 42);
+    store.commitFaultAfterStep = 9;
+    try {
+      assert.throws(() => commitCanonical(store, turn, 9_902), /commit fault after step 9/);
+    } finally {
+      store.commitFaultAfterStep = undefined;
+    }
+
+    assert.equal(store.db.prepare(`
+      SELECT COUNT(*) AS value
+      FROM visible_result_groups
+      WHERE lineage_key = ?
+    `).get(turn.authorityLineageKey).value, 0);
+    assert.equal(store.db.prepare(`
+      SELECT COUNT(*) AS value
+      FROM cloud_deliveries
+      WHERE turn_id = ? AND authority_group_id IS NOT NULL
+    `).get(turn.turnId).value, 0);
+  }));
 
 test('fresh and populated v12 migrate atomically to exact v13 tombstone schema', () =>
   withTempPath(path => {
@@ -2282,3 +2331,434 @@ test('v13 terminal dispositions permit automatic visible/action-only/skip but re
     assert.deepEqual(payload.replyParts, []);
     assert.deepEqual(payload.actions, []);
   }));
+
+function v3FailureEnvelope({ suffix, parent = null }) {
+  const parentWire = parent ? JSON.parse(parent.envelopeJson) : null;
+  const rootMessageId = parentWire?.authority?.rootSourceId || `msg_v13_failure_${suffix}`;
+  const retryOfTurnId = parent?.turnId || null;
+  const claimedLineageRevision = parent
+    ? Number(parent.lineageRevisionAtCreation) + 1
+    : 1;
+  const message = parentWire?.message || {
+    messageId: rootMessageId,
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: 'yuqi',
+    content: `failure fixture ${suffix}`,
+    sentAt: 90_000
+  };
+  const currentBatch = parentWire?.context?.currentBatch || {
+    batchId: `batch_v13_failure_${rootMessageId}`,
+    messageIds: [rootMessageId],
+    startedAt: message.sentAt,
+    committedAt: 90_001,
+    messages: [message]
+  };
+  const localSequence = parentWire
+    ? Number(parentWire.context.visibilityCursor.localSequence) + 1
+    : 1;
+  const laneKey = 'private_chat';
+  return {
+    protocolVersion: 3,
+    turnId: `turn_v13_failure_${suffix}`,
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq: 10_000 + claimedLineageRevision,
+    createdAt: 90_001 + claimedLineageRevision,
+    kind: 'DIRECT_REPLY',
+    message,
+    context: {
+      currentBatch,
+      ...(retryOfTurnId ? {
+        retry: { retryOfTurnId, canonicalMessageId: rootMessageId }
+      } : {}),
+      visibilityCursor: {
+        nativeCompletedTurnId: null,
+        nativeCompletedGroupId: null,
+        nativeCompletedSequence: 0,
+        uiAppliedTurnId: null,
+        uiAppliedGroupId: null,
+        uiAppliedSequence: 0,
+        localSequence,
+        clearedThroughSequence: 0,
+        clearEpoch: 0,
+        clearedAt: 0,
+        chatOpen: true,
+        quotedMessageId: null
+      }
+    },
+    authority: {
+      algorithm: 'al-authority-v1',
+      roleId: 'yuqi',
+      laneKey,
+      rootSourceId: rootMessageId,
+      lineageKey: deriveAuthorityLineageKey({ roleId: 'yuqi', laneKey, rootSourceId: rootMessageId }),
+      claimedLineageRevision,
+      retryOfTurnId
+    }
+  };
+}
+
+function createV3FailureTurn(store, suffix, parent = null) {
+  ensureDirectRollout(store);
+  const input = validateEnvelope(v3FailureEnvelope({ suffix, parent }));
+  const rollout = store.getCognitionRollout('DIRECT_REPLY');
+  const lane = store.getInteractionLane('yuqi', 'private_chat');
+  const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: input.message.sentAt });
+  return store.createCanonicalVisibleTurnInternal({
+    envelope: input,
+    rolloutKey: 'DIRECT_REPLY',
+    expectedRolloutRevision: rollout.revision,
+    authoritativeReleaseId: rollout.stableReleaseId,
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    laneKey: 'private_chat',
+    expectedLaneRevision: Number(lane?.revision || 0),
+    inputUserBatchId: input.context.currentBatch.batchId,
+    inputVisibilitySequence: input.context.visibilityCursor.localSequence,
+    inputClearEpoch: input.context.visibilityCursor.clearEpoch,
+    agencySnapshotChecksum: agency.checksum,
+    annotationSnapshot: {}
+  }).turn;
+}
+
+function failV3FailureTurn(store, turn) {
+  return store.recordCanonicalTurnFailureInternal({
+    turnId: turn.turnId,
+    expectedState: turn.state,
+    expectedTurnRevision: turn.turnRevision,
+    failure: {
+      name: 'TimeoutError',
+      code: 'YUQI_TRANSIENT_EXECUTION_FAILURE',
+      message: 'canonical failure delivery fixture',
+      failureClass: 'transient',
+      retryAllowed: true
+    }
+  });
+}
+
+function prepareV3FailureDeliveryState(store, variant) {
+  const parent = failV3FailureTurn(store, createV3FailureTurn(store, variant.name));
+  const peerId = parent.deviceId;
+  let claim = null;
+  const claimFailure = () => {
+    claim = store.claimCanonicalFailureCloudDeliveryInternal({
+      turnId: parent.turnId, peerId, timestamp: 100_000
+    });
+    assert.ok(claim, `${variant.name} must claim the canonical failure delivery`);
+  };
+  const mailbox = () => store.markCanonicalFailureCloudDeliveryMailboxedInternal({
+    turnId: parent.turnId,
+    peerId,
+    rawStatusChecksum: claim.rawStatusChecksum,
+    leaseId: claim.leaseId,
+    leaseAttempt: claim.leaseAttempt,
+    relayMessageId: claim.relayMessageId,
+    timestamp: 100_100
+  });
+  const quarantine = () => {
+    const target = store.listCloudDeliveries(parent.turnId)[0];
+    return store.quarantineCanonicalCloudDeliveryInternal({
+      turnId: parent.turnId,
+      peerId,
+      expected: {
+        state: target.state, payloadJson: target.payloadJson, checksum: target.checksum,
+        attempts: target.attempts, relayMessageId: target.relayMessageId,
+        deliveredAt: target.deliveredAt, updatedAt: target.updatedAt
+      },
+      reason: 'authority_validation_failed'
+    });
+  };
+  switch (variant.prepare) {
+    case 'waiting':
+      break;
+    case 'pending':
+      claimFailure();
+      break;
+    case 'mailboxed':
+      claimFailure();
+      mailbox();
+      break;
+    case 'superseded_empty':
+      createV3FailureTurn(store, `${variant.name}_child`, parent);
+      break;
+    case 'superseded_payload':
+      claimFailure();
+      createV3FailureTurn(store, `${variant.name}_child`, parent);
+      break;
+    case 'superseded_mailboxed':
+      claimFailure();
+      createV3FailureTurn(store, `${variant.name}_child`, parent);
+      mailbox();
+      break;
+    case 'quarantined_waiting':
+      quarantine();
+      break;
+    case 'quarantined_pending':
+      claimFailure();
+      quarantine();
+      break;
+    default:
+      throw new Error(`unknown canonical failure fixture state: ${variant.prepare}`);
+  }
+  return { parent, peerId };
+}
+
+const CANONICAL_FAILURE_REOPEN_VARIANTS = [
+  { name: 'waiting', prepare: 'waiting', state: 'waiting', payload: false, relay: false },
+  { name: 'pending', prepare: 'pending', state: 'pending', payload: true, relay: false },
+  { name: 'mailboxed', prepare: 'mailboxed', state: 'mailboxed', payload: true, relay: true },
+  { name: 'superseded-empty', prepare: 'superseded_empty', state: 'superseded', payload: false, relay: false },
+  { name: 'superseded-payload', prepare: 'superseded_payload', state: 'superseded', payload: true, relay: false },
+  { name: 'superseded-mailboxed', prepare: 'superseded_mailboxed', state: 'superseded_mailboxed', payload: true, relay: true },
+  { name: 'quarantined-from-waiting', prepare: 'quarantined_waiting', state: 'quarantined', payload: false, relay: false },
+  { name: 'quarantined-from-pending', prepare: 'quarantined_pending', state: 'quarantined', payload: false, relay: false }
+];
+
+for (const variant of CANONICAL_FAILURE_REOPEN_VARIANTS) {
+  test(`v13 canonical failure delivery ${variant.name} survives SQLite close and reopen`, () =>
+    withTempPath(path => {
+      const store = new YuqiStore(path, { targetVersion: 13 });
+      let fixture;
+      try {
+        fixture = prepareV3FailureDeliveryState(store, variant);
+        const delivery = store.db.prepare(`
+          SELECT state, authority_group_id, payload_json, checksum, relay_message_id, delivered_at
+          FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+        `).get(fixture.parent.turnId, fixture.peerId);
+        assert.equal(delivery.state, variant.state);
+      } finally {
+        store.close();
+      }
+      const reopened = new YuqiStore(path, { targetVersion: 13 });
+      try {
+        const delivery = reopened.db.prepare(`
+          SELECT state, authority_group_id, payload_json, checksum, relay_message_id, delivered_at
+          FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+        `).get(fixture.parent.turnId, fixture.peerId);
+        assert.equal(delivery.state, variant.state);
+        assert.equal(delivery.authority_group_id, null);
+        assert.equal(delivery.payload_json != null, variant.payload);
+        assert.equal(delivery.checksum != null, variant.payload);
+        assert.equal(delivery.relay_message_id != null, variant.relay);
+        assert.equal(delivery.delivered_at != null, variant.relay);
+        assert.doesNotThrow(() => reopened.assertVisibleAuthorityV13Invariants());
+      } finally {
+        reopened.close();
+      }
+    }));
+}
+
+function rawFailureDelivery(store, fixture) {
+  return store.db.prepare(`
+    SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+  `).get(fixture.parent.turnId, fixture.peerId);
+}
+
+function rawFailurePayload(store, fixture, change) {
+  const delivery = rawFailureDelivery(store, fixture);
+  const payload = JSON.parse(delivery.payload_json);
+  change(payload, delivery);
+  store.db.prepare(`UPDATE cloud_deliveries SET payload_json = ? WHERE turn_id = ? AND peer_id = ?`)
+    .run(JSON.stringify(payload), fixture.parent.turnId, fixture.peerId);
+}
+
+function appendV3FailureGrandchild(store, fixture) {
+  const child = store.getTurn(store.getTurnAuthorityLineage(fixture.parent.authorityLineageKey).latestTurnId);
+  const failedChild = failV3FailureTurn(store, child);
+  return createV3FailureTurn(store, 'corrupt_multilevel_grandchild', failedChild);
+}
+
+function assertV13FailureCorruptionRejected(scenario) {
+  withTempPath(path => {
+    const store = new YuqiStore(path, { targetVersion: 13 });
+    try {
+      const fixture = prepareV3FailureDeliveryState(store, {
+        name: `corrupt_${scenario.name}`,
+        prepare: scenario.prepare || 'pending'
+      });
+      scenario.mutate(store, fixture);
+    } finally {
+      store.close();
+    }
+    assert.throws(() => {
+      const reopened = new YuqiStore(path, { targetVersion: 13 });
+      reopened.close();
+    }, /canonical failure|v13 invariant|v11 invariant|authority|retry permission/i, scenario.name);
+  });
+}
+
+const V13_CANONICAL_FAILURE_CORRUPTIONS = [
+  {
+    name: 'result-authority-version',
+    mutate: (store, fixture) => store.db.prepare(`
+      UPDATE turns SET result_authority_version = 0 WHERE turn_id = ?
+    `).run(fixture.parent.turnId)
+  },
+  {
+    name: 'authority-group-id',
+    mutate: (store, fixture) => store.db.prepare(`
+      UPDATE cloud_deliveries SET authority_group_id = 'forged_failure_group'
+      WHERE turn_id = ? AND peer_id = ?
+    `).run(fixture.parent.turnId, fixture.peerId)
+  },
+  {
+    name: 'invalid-state',
+    mutate: (store, fixture) => {
+      store.db.exec('PRAGMA ignore_check_constraints = ON');
+      try {
+        store.db.prepare(`UPDATE cloud_deliveries SET state = 'delivered'
+          WHERE turn_id = ? AND peer_id = ?`).run(fixture.parent.turnId, fixture.peerId);
+      } finally {
+        store.db.exec('PRAGMA ignore_check_constraints = OFF');
+      }
+    }
+  },
+  {
+    name: 'foreign-peer',
+    mutate: (store, fixture) => store.db.prepare(`
+      UPDATE cloud_deliveries SET peer_id = 'foreign_phone' WHERE turn_id = ? AND peer_id = ?
+    `).run(fixture.parent.turnId, fixture.peerId)
+  },
+  {
+    name: 'parent-lineage',
+    mutate: (store, fixture) => store.db.prepare(`
+      UPDATE turns SET authority_lineage_key = 'forged_failure_lineage' WHERE turn_id = ?
+    `).run(fixture.parent.turnId)
+  },
+  {
+    name: 'direct-retry-parent',
+    prepare: 'superseded_empty',
+    mutate: (store, fixture) => store.db.prepare(`
+      UPDATE turns SET retry_of_turn_id = 'forged_parent'
+      WHERE authority_lineage_key = ? AND retry_of_turn_id = ?
+    `).run(fixture.parent.authorityLineageKey, fixture.parent.turnId)
+  },
+  {
+    name: 'lineage-latest',
+    prepare: 'superseded_empty',
+    mutate: (store, fixture) => store.db.prepare(`
+      UPDATE turn_authority_lineages SET latest_turn_id = ? WHERE lineage_key = ?
+    `).run(fixture.parent.turnId, fixture.parent.authorityLineageKey)
+  },
+  {
+    name: 'multilevel-retry',
+    prepare: 'superseded_empty',
+    mutate: (store, fixture) => {
+      const grandchild = appendV3FailureGrandchild(store, fixture);
+      store.db.prepare(`UPDATE turns SET retry_of_turn_id = ? WHERE turn_id = ?`)
+        .run(fixture.parent.turnId, grandchild.turnId);
+    }
+  },
+  {
+    name: 'error-extra-field',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE turns SET error_json = ? WHERE turn_id = ?`)
+      .run(JSON.stringify({ ...JSON.parse(fixture.parent.errorJson), extra: 'leak' }), fixture.parent.turnId)
+  },
+  {
+    name: 'error-missing-code',
+    mutate: (store, fixture) => {
+      const error = JSON.parse(fixture.parent.errorJson);
+      delete error.code;
+      store.db.prepare(`UPDATE turns SET error_json = ? WHERE turn_id = ?`)
+        .run(JSON.stringify(error), fixture.parent.turnId);
+    }
+  },
+  {
+    name: 'error-nonboolean-retry',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE turns SET error_json = ? WHERE turn_id = ?`)
+      .run(JSON.stringify({ ...JSON.parse(fixture.parent.errorJson), retryAllowed: 'true' }), fixture.parent.turnId)
+  },
+  {
+    name: 'payload-extra-field',
+    mutate: (store, fixture) => rawFailurePayload(store, fixture, payload => { payload.extra = 'leak'; })
+  },
+  {
+    name: 'payload-missing-failure',
+    mutate: (store, fixture) => rawFailurePayload(store, fixture, payload => { delete payload.failure; })
+  },
+  {
+    name: 'payload-value-change',
+    mutate: (store, fixture) => rawFailurePayload(store, fixture, payload => {
+      payload.failure.message = 'forged failure detail';
+    })
+  },
+  {
+    name: 'checksum',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE cloud_deliveries SET checksum = ?
+      WHERE turn_id = ? AND peer_id = ?`).run('f'.repeat(64), fixture.parent.turnId, fixture.peerId)
+  },
+  ...['leaseId', 'leaseAttempt', 'leasedAt'].map(key => ({
+    name: `lease-missing-${key}`,
+    mutate: (store, fixture) => rawFailurePayload(store, fixture, payload => { delete payload.lease[key]; })
+  })),
+  {
+    name: 'lease-attempt',
+    mutate: (store, fixture) => rawFailurePayload(store, fixture, payload => { payload.lease.leaseAttempt += 1; })
+  },
+  {
+    name: 'lease-id',
+    mutate: (store, fixture) => rawFailurePayload(store, fixture, payload => { payload.lease.leaseId = 'lease_forged'; })
+  },
+  {
+    name: 'lease-time',
+    mutate: (store, fixture) => rawFailurePayload(store, fixture, (payload, delivery) => {
+      payload.lease.leasedAt = Number(delivery.updated_at) + 1;
+    })
+  },
+  {
+    name: 'relay-id',
+    prepare: 'mailboxed',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE cloud_deliveries SET relay_message_id = 'relay_forged'
+      WHERE turn_id = ? AND peer_id = ?`).run(fixture.parent.turnId, fixture.peerId)
+  },
+  {
+    name: 'delivered-at',
+    prepare: 'mailboxed',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE cloud_deliveries SET delivered_at = NULL
+      WHERE turn_id = ? AND peer_id = ?`).run(fixture.parent.turnId, fixture.peerId)
+  },
+  {
+    name: 'quarantine-duplicate-diagnostic',
+    prepare: 'quarantined_waiting',
+    mutate: (store, fixture) => {
+      const diagnostic = store.db.prepare(`SELECT detail_json FROM diagnostics
+        WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'`).get(fixture.parent.turnId);
+      store.db.prepare(`INSERT INTO diagnostics(turn_id, stage, level, detail_json, created_at)
+        VALUES (?, 'canonical_failure_delivery_quarantined', 'error', ?, 1)`)
+        .run(fixture.parent.turnId, diagnostic.detail_json);
+    }
+  },
+  {
+    name: 'quarantine-extra-diagnostic',
+    prepare: 'quarantined_waiting',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE diagnostics SET detail_json = ?
+      WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'`)
+      .run(JSON.stringify({ redacted: true, peerId: fixture.peerId, reason: 'bad', extra: true }), fixture.parent.turnId)
+  },
+  {
+    name: 'quarantine-secret-diagnostic',
+    prepare: 'quarantined_waiting',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE diagnostics SET detail_json = ?
+      WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'`)
+      .run(JSON.stringify({ redacted: true, peerId: fixture.peerId, reason: 'bad', secret: 'leak' }), fixture.parent.turnId)
+  },
+  {
+    name: 'quarantine-wrong-peer-diagnostic',
+    prepare: 'quarantined_waiting',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE diagnostics SET detail_json = ?
+      WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'`)
+      .run(JSON.stringify({ redacted: true, peerId: 'foreign_phone', reason: 'bad' }), fixture.parent.turnId)
+  },
+  {
+    name: 'pending-after-child',
+    prepare: 'superseded_payload',
+    mutate: (store, fixture) => store.db.prepare(`UPDATE cloud_deliveries SET state = 'pending'
+      WHERE turn_id = ? AND peer_id = ?`).run(fixture.parent.turnId, fixture.peerId)
+  }
+];
+
+for (const scenario of V13_CANONICAL_FAILURE_CORRUPTIONS) {
+  test(`v13 reopen rejects canonical failure corruption: ${scenario.name}`, () =>
+    assertV13FailureCorruptionRejected(scenario));
+}

@@ -2,7 +2,62 @@ import assert from 'node:assert/strict';
 import { request } from 'node:http';
 import test from 'node:test';
 
+import { decryptRelayPayload } from '../src/cloud-relay-pump.mjs';
 import { createYuqiServer, signBridgeRequest } from '../src/local-server.mjs';
+import { contentHash, validateEnvelope } from '../src/protocol.mjs';
+import { ResultOutbox } from '../src/result-outbox.mjs';
+
+const keyBase64 = Buffer.alloc(32, 9).toString('base64');
+
+function frozenCanonicalBridgeResult() {
+  return Object.freeze({
+    protocolVersion: 3,
+    turnId: 'turn_canonical_transport_1',
+    roleId: 'yuqi',
+    authorityOrigin: 'pc',
+    authorityLineageKey: 'lin_canonical_transport_1',
+    visibleGroupId: 'group_canonical_transport_1',
+    lineageRevision: 2,
+    turnRevision: 4,
+    laneKey: 'private_chat',
+    laneRevision: 3,
+    inputVisibilitySequence: 7,
+    inputClearEpoch: 0,
+    generationFingerprint: null,
+    releaseId: 'release_test',
+    commitPayloadVersion: 'pc-visible-commit-v2',
+    commitChecksum: 'a'.repeat(64),
+    terminalDisposition: 'visible',
+    replyParts: [
+      { ordinal: 0, messageId: 'msg_canonical_transport_1', content: '第一段', itemChecksum: 'b'.repeat(64) },
+      { ordinal: 1, messageId: 'msg_canonical_transport_2', content: '第二段', itemChecksum: 'c'.repeat(64) }
+    ],
+    actions: [{
+      ordinal: 0,
+      actionId: 'action_canonical_transport_1',
+      kind: 'moment_create',
+      targetKey: 'moment:m_1',
+      targetRevision: 'd'.repeat(64),
+      payload: { momentId: 'm_1', text: '桥接动态' },
+      actionChecksum: 'e'.repeat(64)
+    }]
+  });
+}
+
+function authorityDeliveryReceipt(overrides = {}) {
+  return {
+    protocolVersion: 3,
+    type: 'AUTHORITY_DELIVERY_RECEIPT',
+    peerId: 'phone_canonical',
+    turnId: 'turn_canonical_transport_1',
+    authorityLineageKey: 'lin_canonical_transport_1',
+    visibleGroupId: 'group_canonical_transport_1',
+    commitChecksum: 'a'.repeat(64),
+    terminalDisposition: 'visible',
+    deliveredAt: 1784400000000,
+    ...overrides
+  };
+}
 
 function call(port, { method = 'GET', path = '/', body = '', secret = '', nonce = 'nonce-1', timestamp = Date.now() }) {
   const payload = typeof body === 'string' ? body : JSON.stringify(body);
@@ -47,7 +102,14 @@ test('serves health and accepts one signed turn without exposing unsigned APIs',
     const unsigned = await call(port, { method: 'GET', path: '/v1/turns/turn_1' });
     assert.equal(unsigned.status, 401);
 
-    const payload = { protocolVersion: 1, turnId: 'turn_phone_1' };
+    const payload = {
+      protocolVersion: 1, turnId: 'turn_phone_1', characterId: 'yuqi', deviceId: 'phone_a',
+      deviceSeq: 1, createdAt: 1784400000000,
+      message: {
+        messageId: 'msg_phone_1', speakerId: 'user', speakerType: 'user',
+        recipientId: 'yuqi', content: '你好', sentAt: 1784400000000
+      }
+    };
     const signed = await call(port, {
       method: 'POST', path: '/v1/turns', body: payload,
       secret: 'test-pairing-secret', nonce: 'unique-nonce'
@@ -131,6 +193,162 @@ test('accepts a signed exact delivery receipt through the shared store path', as
   }
 });
 
+test('routes a canonical v2 simple receipt to its authority adapter without touching the legacy writer', async () => {
+  const received = [];
+  const store = {
+    getSyncDelta: () => [],
+    ackSync: () => 0,
+    getTurn: turnId => ({ turnId, resultAuthorityVersion: 1, protocolVersion: 2, deviceId: 'phone_v2' }),
+    confirmCanonicalV2SimpleDeliveryInternal(turnId, peerId, value) {
+      received.push({ turnId, peerId, value });
+      return { turnId, state: 'confirmed' };
+    },
+    recordDeliveryReceipt() { throw new Error('legacy receipt writer must not run'); }
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret', store, orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const body = {
+      turnId: 'turn_phone_receipt_canonical_v2',
+      messageId: 'msg_phone_receipt_canonical_v2',
+      contentSha256: 'a'.repeat(64),
+      receivedAt: 1784400000100
+    };
+    const response = await call(server.address().port, {
+      method: 'POST',
+      path: `/v2/turns/${body.turnId}/delivery-receipt`,
+      body,
+      secret: 'test-pairing-secret',
+      nonce: 'canonical-v2-simple-receipt-nonce'
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(received, [{ turnId: body.turnId, peerId: 'phone_v2', value: body }]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('accepts a signed v3 authority delivery receipt only through the canonical store writer', async () => {
+  const received = [];
+  const store = {
+    getSyncDelta: () => [],
+    ackSync: () => 0,
+    confirmAuthorityCloudDeliveryInternal: value => {
+      received.push(value);
+      return { state: 'confirmed', visibleGroupId: value.visibleGroupId };
+    },
+    recordDeliveryReceipt() { throw new Error('legacy receipt writer must not run'); }
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret', store, orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const body = authorityDeliveryReceipt();
+    const response = await call(server.address().port, {
+      method: 'POST',
+      path: `/v3/groups/${body.visibleGroupId}/delivery-receipt`,
+      body,
+      secret: 'test-pairing-secret',
+      nonce: 'canonical-receipt-nonce'
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(received, [body]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('v3 authority receipt target-set conflicts never report either foreign or persisted peer as delivered', async () => {
+  const attemptedPeers = [];
+  const store = {
+    getSyncDelta: () => [],
+    ackSync: () => 0,
+    confirmAuthorityCloudDeliveryInternal(value) {
+      attemptedPeers.push(value.peerId);
+      throw new Error('canonical visible delivery target conflict');
+    },
+    recordDeliveryReceipt() { throw new Error('legacy receipt writer must not run'); }
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret', store, orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    for (const [index, peerId] of ['phone_canonical', 'foreign_phone'].entries()) {
+      const body = authorityDeliveryReceipt({ peerId });
+      const response = await call(server.address().port, {
+        method: 'POST',
+        path: `/v3/groups/${body.visibleGroupId}/delivery-receipt`,
+        body,
+        secret: 'test-pairing-secret',
+        nonce: `canonical-target-conflict-${index}`
+      });
+      assert.equal(response.status, 409);
+    }
+    assert.deepEqual(attemptedPeers, ['phone_canonical', 'foreign_phone']);
+  } finally {
+    await server.close();
+  }
+});
+
+test('rejects every non-native v3 receipt disposition before the canonical store writer', async () => {
+  let calls = 0;
+  const store = {
+    getSyncDelta: () => [],
+    ackSync: () => 0,
+    confirmAuthorityCloudDeliveryInternal() { calls += 1; throw new Error('must not write'); }
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret', store, orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    for (const [index, terminalDisposition] of [
+      ['skip'], { value: 'skip' }, 1, true, null
+    ].entries()) {
+      const body = { ...authorityDeliveryReceipt(), terminalDisposition };
+      const response = await call(server.address().port, {
+        method: 'POST',
+        path: `/v3/groups/${body.visibleGroupId}/delivery-receipt`,
+        body,
+        secret: 'test-pairing-secret',
+        nonce: `canonical-invalid-disposition-${index}`
+      });
+      assert.equal(response.status, 409);
+    }
+    assert.equal(calls, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('v3 authority receipt path mismatch rejects before the canonical store writer', async () => {
+  let calls = 0;
+  const store = {
+    getSyncDelta: () => [],
+    ackSync: () => 0,
+    confirmAuthorityCloudDeliveryInternal() { calls += 1; }
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret', store, orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const body = authorityDeliveryReceipt();
+    const response = await call(server.address().port, {
+      method: 'POST', path: '/v3/groups/group_other/delivery-receipt', body,
+      secret: 'test-pairing-secret', nonce: 'canonical-receipt-mismatch-nonce'
+    });
+    assert.equal(response.status, 400);
+    assert.equal(calls, 0);
+  } finally {
+    await server.close();
+  }
+});
+
 test('rejects stale, tampered, and oversized requests', async () => {
   const server = createYuqiServer({
     secret: 'test-pairing-secret',
@@ -181,8 +399,13 @@ test('reconciles the phone journal before processing the new turn and returns it
     const result = await call(server.address().port, {
       method: 'POST', path: '/v1/turns', secret: 'test-pairing-secret', nonce: 'recovery-nonce',
       body: {
-        protocolVersion: 1, turnId: 'turn_phone_88',
-        recovery: { peerId: 'phone_a', lastCommonSeq: 80, entries: [] }
+        protocolVersion: 1, turnId: 'turn_phone_88', characterId: 'yuqi', deviceId: 'phone_a',
+        deviceSeq: 1, createdAt: 1784400000000,
+        message: {
+          messageId: 'msg_phone_88', speakerId: 'user', speakerType: 'user',
+          recipientId: 'yuqi', content: '继续说', sentAt: 1784400000000
+        },
+        recovery: { peerId: 'phone_a', lastCommonSeq: 80, lastSeq: 80, entries: [] }
       }
     });
     assert.equal(result.status, 201);
@@ -265,6 +488,306 @@ test('v2 accepts a background turn immediately and exposes signed polling status
   }
 });
 
+test('canonical v3 POST, GET, and cloud delivery use the same closed result instead of reply_json', async () => {
+  const canonical = frozenCanonicalBridgeResult();
+  const stored = {
+    turnId: canonical.turnId,
+    state: 'committed',
+    protocolVersion: 3,
+    resultAuthorityVersion: 1,
+    replyJson: '{ definitely-not-authoritative-json',
+    errorJson: '{ likewise-not-authoritative',
+    createdAt: 1784400000000,
+    updatedAt: 1784400001000
+  };
+  const store = {
+    getTurn: () => stored,
+    getTurnStages: () => [],
+    getSyncDelta: () => [],
+    ackSync: () => 0,
+    loadCanonicalBridgeResultInternal(turnId) {
+      assert.equal(turnId, canonical.turnId);
+      return canonical;
+    },
+    listPendingAuthorityCloudDeliveries: () => [{
+      authorityGroupId: canonical.visibleGroupId,
+      turnId: canonical.turnId,
+      peerId: 'phone_a',
+      authorityCommitChecksum: canonical.commitChecksum,
+      recoveryAckSeq: 31,
+      updatedAt: 1
+    }],
+    listPendingCanonicalFailureCloudDeliveries: () => [],
+    listPendingCloudDeliveries: () => [],
+    prepareAuthorityCloudDelivery() { return { checksum: 'f'.repeat(64) }; },
+    markAuthorityCloudDeliveryAttempt() {},
+    markAuthorityCloudDeliveryMailboxed() {}
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store,
+    dispatcher: { accept: () => stored },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const payload = {
+      protocolVersion: 2,
+      turnId: canonical.turnId,
+      characterId: 'yuqi', deviceId: 'phone_a', deviceSeq: 1, createdAt: 1784400000000,
+      kind: 'DIRECT_REPLY',
+      message: {
+        messageId: 'msg_transport_user', speakerId: 'user', speakerType: 'user',
+        recipientId: 'yuqi', content: '你好', sentAt: 1784400000000
+      }
+    };
+    const posted = await call(server.address().port, {
+      method: 'POST', path: '/v2/turns', body: payload,
+      secret: 'test-pairing-secret', nonce: 'canonical-transport-post'
+    });
+    const polled = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${canonical.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'canonical-transport-get'
+    });
+    assert.equal(posted.status, 200);
+    assert.equal(polled.status, 200);
+    assert.deepEqual(
+      (({ ok, accepted, recoveryAckSeq, ...status }) => status)(posted.body),
+      (({ ok, ...status }) => status)(polled.body)
+    );
+    assert.deepEqual(posted.body.replyParts, canonical.replyParts);
+    assert.equal('replyJson' in posted.body, false);
+    assert.equal('errorJson' in posted.body, false);
+
+    const deliveries = [];
+    const outbox = new ResultOutbox({
+      relayUrl: 'https://relay.example', deviceId: 'phone_a',
+      deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+      fetchImpl: async (_url, request) => {
+        deliveries.push(JSON.parse(request.body));
+        return Response.json({ ok: true }, { status: 201 });
+      }
+    });
+    assert.deepEqual(await outbox.flushOnce(), { delivered: 1, failed: 0, waiting: 0 });
+    assert.equal(deliveries.length, 1);
+    const cloud = decryptRelayPayload(deliveries[0], keyBase64);
+    assert.deepEqual(cloud, { ok: true, ...canonical, recoveryAckSeq: 31 });
+  } finally {
+    await server.close();
+  }
+});
+
+test('canonical terminal LAN responses distinguish redacted authority from a corrupt live authority without leaking semantics', async () => {
+  const redactedTurn = {
+    turnId: 'turn_canonical_redacted_terminal', state: 'committed', protocolVersion: 3,
+    resultAuthorityVersion: 1, replyJson: JSON.stringify({ reply: 'must not leak' }), errorJson: null
+  };
+  const corruptTurn = {
+    turnId: 'turn_canonical_corrupt_terminal', state: 'committed', protocolVersion: 3,
+    resultAuthorityVersion: 1, replyJson: JSON.stringify({ reply: 'must not fall back' }), errorJson: null
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: {
+      getTurn(turnId) {
+        return turnId === redactedTurn.turnId ? redactedTurn : corruptTurn;
+      },
+      getTurnStages: () => [], getSyncDelta: () => [], ackSync: () => 0,
+      loadCanonicalBridgeResultInternal(turnId) {
+        if (turnId === redactedTurn.turnId) return { status: 'redacted' };
+        throw new Error('canonical visible group item authority conflict');
+      }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const redacted = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${redactedTurn.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'canonical-redacted-terminal'
+    });
+    assert.deepEqual(redacted, {
+      status: 410,
+      body: { ok: false, error: 'CANONICAL_RESULT_REDACTED' }
+    });
+    const corrupt = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${corruptTurn.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'canonical-corrupt-terminal'
+    });
+    assert.deepEqual(corrupt, {
+      status: 409,
+      body: { ok: false, error: 'CANONICAL_AUTHORITY_CONFLICT' }
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test('canonical terminal LAN maps only closed authority errors to 409 and leaves runtime failures as 5xx', async () => {
+  const turns = {
+    authority: { turnId: 'turn_terminal_authority_error', state: 'committed', protocolVersion: 3, resultAuthorityVersion: 1 },
+    type: { turnId: 'turn_terminal_type_error', state: 'committed', protocolVersion: 3, resultAuthorityVersion: 1 },
+    sqlite: { turnId: 'turn_terminal_sqlite_error', state: 'committed', protocolVersion: 3, resultAuthorityVersion: 1 },
+    arbitrary: { turnId: 'turn_terminal_arbitrary_error', state: 'committed', protocolVersion: 3, resultAuthorityVersion: 1 },
+    prefix: { turnId: 'turn_terminal_prefix_error', state: 'committed', protocolVersion: 3, resultAuthorityVersion: 1 }
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: {
+      getTurn(turnId) { return Object.values(turns).find(turn => turn.turnId === turnId) || null; },
+      getTurnStages: () => [], getSyncDelta: () => [], ackSync: () => 0,
+      loadCanonicalBridgeResultInternal(turnId) {
+        if (turnId === turns.authority.turnId) throw new Error('canonical visible group item authority conflict');
+        if (turnId === turns.type.turnId) throw new TypeError('bridge adapter was undefined');
+        if (turnId === turns.sqlite.turnId) throw new Error('SQLITE_BUSY: database is locked');
+        if (turnId === turns.prefix.turnId) throw new Error('canonical visible group arbitrary fault conflict');
+        throw new Error('ordinary unexpected failure');
+      }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const responses = await Promise.all(Object.values(turns).map((turn, index) => call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${turn.turnId}`,
+      secret: 'test-pairing-secret', nonce: `canonical-terminal-classify-${index}`
+    })));
+    assert.deepEqual(responses[0], { status: 409, body: { ok: false, error: 'CANONICAL_AUTHORITY_CONFLICT' } });
+    for (const response of responses.slice(1)) assert.equal(response.status, 500);
+  } finally {
+    await server.close();
+  }
+});
+
+test('canonical v3 failed LAN responses classify cancelled or corrupt authority without parsing legacy error JSON', async () => {
+  const redactedTurn = {
+    turnId: 'turn_canonical_failed_redacted', state: 'failed', protocolVersion: 3,
+    resultAuthorityVersion: 1, errorJson: JSON.stringify({ message: 'must not leak' })
+  };
+  const corruptTurn = {
+    turnId: 'turn_canonical_failed_corrupt', state: 'failed', protocolVersion: 3,
+    resultAuthorityVersion: 1, errorJson: JSON.stringify({ message: 'must not fall back' })
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: {
+      getTurn(turnId) { return turnId === redactedTurn.turnId ? redactedTurn : corruptTurn; },
+      getTurnStages: () => [], getSyncDelta: () => [], ackSync: () => 0,
+      loadCanonicalFailureForBridgeInternal(turnId) {
+        if (turnId === redactedTurn.turnId) return { status: 'redacted' };
+        throw new Error('canonical failure delivery authority conflict');
+      }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const redacted = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${redactedTurn.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'canonical-failed-redacted'
+    });
+    assert.deepEqual(redacted, {
+      status: 410,
+      body: { ok: false, error: 'CANONICAL_RESULT_REDACTED' }
+    });
+    const corrupt = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${corruptTurn.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'canonical-failed-corrupt'
+    });
+    assert.deepEqual(corrupt, {
+      status: 409,
+      body: { ok: false, error: 'CANONICAL_AUTHORITY_CONFLICT' }
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+test('wire-v3 canonical failure is projected from its closed authority before error_json parsing', async () => {
+  const closedFailure = Object.freeze({
+    protocolVersion: 3,
+    type: 'BACKLOG_FAILED',
+    turnId: 'turn_canonical_failure_transport',
+    roleId: 'yuqi',
+    authorityLineageKey: 'lin_canonical_failure_transport',
+    lineageRevision: 1,
+    turnRevision: 2,
+    laneKey: 'private_chat',
+    laneRevision: 1,
+    retryOfTurnId: null,
+    inputVisibilitySequence: 4,
+    inputClearEpoch: 0,
+    generationFingerprint: null,
+    releaseId: 'release_test',
+    state: 'failed',
+    errorCode: 'YUQI_TRANSIENT_EXECUTION_FAILURE',
+    failureClass: 'transient',
+    retryAllowed: true,
+    failedAt: 1784400001000,
+    rawStatusChecksum: 'a'.repeat(64)
+  });
+  const stored = {
+    turnId: closedFailure.turnId,
+    state: 'failed', protocolVersion: 3, resultAuthorityVersion: 1,
+    replyJson: '{ invalid old reply json', errorJson: '{ invalid old error json'
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: {
+      getTurn: () => stored,
+      getTurnStages: () => [], getSyncDelta: () => [], ackSync: () => 0,
+      loadCanonicalFailureForBridgeInternal: () => closedFailure
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const response = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${stored.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'canonical-failure-transport'
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.type, 'BACKLOG_FAILED');
+    assert.equal(response.body.errorCode, 'YUQI_TRANSIENT_EXECUTION_FAILURE');
+    assert.equal(response.body.allowFallback, false);
+    assert.equal('reply' in response.body, false);
+    assert.equal('errorJson' in response.body, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test('wire-v2 authority failure retains the legacy error status compatibility branch', async () => {
+  const stored = {
+    turnId: 'turn_canonical_v2_failure', state: 'failed', protocolVersion: 2, resultAuthorityVersion: 1,
+    origin: 'codex', createdAt: 1, updatedAt: 2,
+    replyJson: null,
+    errorJson: JSON.stringify({ name: 'LegacyProviderTimeout', code: 'LEGACY_TIMEOUT' })
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: {
+      getTurn: () => stored,
+      getTurnStages: () => [], getSyncDelta: () => [], ackSync: () => 0,
+      loadCanonicalFailureForBridgeInternal: () => { throw new Error('wire-v2 must retain legacy status'); }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const response = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${stored.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'canonical-v2-failure-compat'
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.errorCode, 'LEGACY_TIMEOUT');
+    assert.equal(response.body.allowFallback, true);
+    assert.equal(response.body.terminal, true);
+  } finally {
+    await server.close();
+  }
+});
+
 test('v2 reconciles phone-only messages before accepting the new turn', async () => {
   const events = [];
   const stored = {
@@ -301,12 +824,197 @@ test('v2 reconciles phone-only messages before accepting the new turn', async ()
           messageId: 'msg_phone_async_recovery', speakerId: 'user', speakerType: 'user',
           recipientId: 'yuqi', content: '继续说', sentAt: 1784400000000
         },
-        recovery: { peerId: 'phone_a', lastCommonSeq: 20, entries: [] }
+        recovery: { peerId: 'phone_a', lastCommonSeq: 20, lastSeq: 20, entries: [] }
       }
     });
     assert.equal(result.status, 202);
     assert.equal(result.body.recoveryAckSeq, 23);
     assert.deepEqual(events, ['reconcile:phone_a', `turn:${stored.turnId}`]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('v2 rejects a malformed v3 envelope before reconciliation or durable dispatch', async () => {
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: {
+      getTurnStages() { events.push('store'); return []; },
+      getSyncDelta: () => [], ackSync: () => 0
+    },
+    reconciler: {
+      async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; }
+    },
+    dispatcher: {
+      accept() { events.push('accept'); return { turnId: 'turn_bad_v3', state: 'queued' }; }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const result = await call(server.address().port, {
+      method: 'POST', path: '/v2/turns', secret: 'test-pairing-secret', nonce: 'malformed-v3-preflight',
+      body: {
+        protocolVersion: 3,
+        turnId: 'turn_bad_v3', characterId: 'yuqi', deviceId: 'phone_a', deviceSeq: 1,
+        createdAt: 1784400000000, kind: 'DIRECT_REPLY',
+        message: {
+          messageId: 'msg_bad_v3', speakerId: 'user', speakerType: 'user',
+          recipientId: 'yuqi', content: '不能先写入', sentAt: 1784400000000
+        },
+        recovery: { peerId: 'phone_a', lastCommonSeq: 0, entries: [] }
+      }
+    });
+    assert.equal(result.status, 400);
+    assert.deepEqual(events, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test('v1 rejects a malformed v3 envelope before reconciliation or legacy processing', async () => {
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { getSyncDelta: () => [], ackSync: () => 0 },
+    reconciler: {
+      async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; }
+    },
+    orchestrator: {
+      async process() { events.push('process'); return { turnId: 'turn_bad_v3' }; }
+    }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const result = await call(server.address().port, {
+      method: 'POST', path: '/v1/turns', secret: 'test-pairing-secret', nonce: 'malformed-v3-v1-preflight',
+      body: {
+        protocolVersion: 3,
+        turnId: 'turn_bad_v3', characterId: 'yuqi', deviceId: 'phone_a', deviceSeq: 1,
+        createdAt: 1784400000000, kind: 'DIRECT_REPLY',
+        message: {
+          messageId: 'msg_bad_v3', speakerId: 'user', speakerType: 'user',
+          recipientId: 'yuqi', content: '不能进入旧入口', sentAt: 1784400000000
+        },
+        recovery: { peerId: 'phone_a', lastCommonSeq: 0, entries: [] }
+      }
+    });
+    assert.equal(result.status, 400);
+    assert.deepEqual(events, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test('recovery metadata is validated separately and never changes normalized turn identity', async () => {
+  const base = {
+    protocolVersion: 2, turnId: 'turn_recovery_identity', characterId: 'yuqi', deviceId: 'phone_a',
+    deviceSeq: 1, createdAt: 1784400000000, kind: 'DIRECT_REPLY',
+    message: {
+      messageId: 'msg_recovery_identity', speakerId: 'user', speakerType: 'user',
+      recipientId: 'yuqi', content: '同一条消息', sentAt: 1784400000000
+    }
+  };
+  const earlier = { ...base, recovery: { peerId: 'phone_a', lastCommonSeq: 1, entries: [] } };
+  const later = { ...base, recovery: { peerId: 'phone_a', lastCommonSeq: 99, entries: [] } };
+  assert.deepEqual(validateEnvelope(earlier), validateEnvelope(later));
+  assert.equal(contentHash(validateEnvelope(earlier)), contentHash(validateEnvelope(later)));
+});
+
+test('v2 rejects a foreign recovery peer before reconciliation or durable dispatch', async () => {
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { getSyncDelta: () => [], ackSync: () => 0 },
+    reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } },
+    dispatcher: { accept() { events.push('accept'); return { turnId: 'turn_foreign_recovery', state: 'queued' }; } },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const result = await call(server.address().port, {
+      method: 'POST', path: '/v2/turns', secret: 'test-pairing-secret', nonce: 'foreign-recovery-peer',
+      body: {
+        protocolVersion: 2, turnId: 'turn_foreign_recovery', characterId: 'yuqi', deviceId: 'phone_a',
+        deviceSeq: 1, createdAt: 1784400000000, kind: 'DIRECT_REPLY',
+        message: {
+          messageId: 'msg_foreign_recovery', speakerId: 'user', speakerType: 'user',
+          recipientId: 'yuqi', content: '不应进入恢复', sentAt: 1784400000000
+        },
+        recovery: { peerId: 'other_phone', lastCommonSeq: 10, entries: [] }
+      }
+    });
+    assert.equal(result.status, 400);
+    assert.deepEqual(events, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test('v2 rejects an invalid recovery cursor before reconciliation or durable dispatch', async () => {
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { getSyncDelta: () => [], ackSync: () => 0 },
+    reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } },
+    dispatcher: { accept() { events.push('accept'); return { turnId: 'turn_invalid_recovery_cursor', state: 'queued' }; } },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const result = await call(server.address().port, {
+      method: 'POST', path: '/v2/turns', secret: 'test-pairing-secret', nonce: 'invalid-recovery-cursor',
+      body: {
+        protocolVersion: 2, turnId: 'turn_invalid_recovery_cursor', characterId: 'yuqi', deviceId: 'phone_a',
+        deviceSeq: 1, createdAt: 1784400000000, kind: 'DIRECT_REPLY',
+        message: {
+          messageId: 'msg_invalid_recovery_cursor', speakerId: 'user', speakerType: 'user',
+          recipientId: 'yuqi', content: '不能确认游标', sentAt: 1784400000000
+        },
+        recovery: { peerId: 'phone_a', lastCommonSeq: '100', entries: [] }
+      }
+    });
+    assert.equal(result.status, 400);
+    assert.deepEqual(events, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test('v2 rejects forged Android lastSeq recovery variants before any side effect', async () => {
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { getSyncDelta: () => [], ackSync: () => 0 },
+    reconciler: { async reconcileFrom() { events.push('reconcile'); return { ackSeq: 1 }; } },
+    dispatcher: { accept() { events.push('accept'); return { turnId: 'turn_invalid_last_seq', state: 'queued' }; } },
+    orchestrator: { process: async () => ({}) }
+  });
+  const variants = [
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: 9, entries: [] },
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: 11, entries: [] },
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: '10', entries: [] },
+    { peerId: 'phone_a', lastCommonSeq: 10, lastSeq: 10, entries: [], extra: true }
+  ];
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    for (const [index, recovery] of variants.entries()) {
+      const result = await call(server.address().port, {
+        method: 'POST', path: '/v2/turns', secret: 'test-pairing-secret', nonce: `invalid-last-seq-${index}`,
+        body: {
+          protocolVersion: 2, turnId: `turn_invalid_last_seq_${index}`, characterId: 'yuqi', deviceId: 'phone_a',
+          deviceSeq: index + 1, createdAt: 1784400000000, kind: 'DIRECT_REPLY',
+          message: {
+            messageId: `msg_invalid_last_seq_${index}`, speakerId: 'user', speakerType: 'user',
+            recipientId: 'yuqi', content: '不应进入恢复', sentAt: 1784400000000
+          },
+          recovery
+        }
+      });
+      assert.equal(result.status, 400);
+    }
+    assert.deepEqual(events, []);
   } finally {
     await server.close();
   }

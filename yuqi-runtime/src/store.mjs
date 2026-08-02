@@ -15,11 +15,17 @@ import {
   comparisonContractForMode
 } from './comparison-contract.mjs';
 import {
+  projectCanonicalFailureForWire,
+  projectCanonicalFailureSnapshotForWire,
+  projectBridgeResultForWire
+} from './bridge-result-projector.mjs';
+import {
   TURN_STATES,
   canonicalJson,
   contentHash,
   deliveryItemsForResult,
   authorityLaneKeyForEnvelope,
+  validateAuthorityDeliveryReceipt,
   validateDeliveryReceipt,
   validateEnvelope
 } from './protocol.mjs';
@@ -58,6 +64,11 @@ const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
 });
 
 const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
+const FAILURE_DELIVERY_LEASE_MS = 60_000;
+
+function stableFailureId(prefix, value) {
+  return `${prefix}_${createHash('sha256').update(String(value), 'utf8').digest('hex').slice(0, 24)}`;
+}
 const CANONICAL_RESULT_TURN_KINDS = new Set([
   'DIRECT_REPLY',
   'PROACTIVE_CHAT',
@@ -322,6 +333,7 @@ function mapTurn(row) {
     replyJson: row.reply_json,
     errorJson: row.error_json,
     envelopeJson: row.envelope_json,
+    protocolVersion: Number(parseJson(row.envelope_json, {}).protocolVersion || 0),
     envelopeChecksum: row.envelope_checksum,
     createdAt: row.created_at,
     updatedAt: row.updated_at
@@ -4097,10 +4109,10 @@ export class YuqiStore {
       SELECT * FROM cloud_deliveries WHERE authority_group_id = ?
     `).all(groupKey);
     if (authority.receipt_origin === 'pc') {
-      if (!deliveries.some(delivery =>
-        delivery.turn_id === authority.authoritative_turn_id
-        && delivery.peer_id === authority.device_id
-        && delivery.authority_commit_checksum === authority.commit_checksum)) {
+      if (deliveries.length !== 1
+        || deliveries[0].turn_id !== authority.authoritative_turn_id
+        || deliveries[0].peer_id !== authority.device_id
+        || deliveries[0].authority_commit_checksum !== authority.commit_checksum) {
         throw new Error('canonical visible group delivery authority conflict');
       }
     } else if (deliveries.length) {
@@ -4110,6 +4122,36 @@ export class YuqiStore {
       delivery.turn_id !== authority.authoritative_turn_id
       || delivery.authority_commit_checksum !== authority.commit_checksum)) {
       throw new Error('canonical visible group delivery authority conflict');
+    }
+    const quarantinedDelivery = deliveries.find(delivery => delivery.state === 'quarantined');
+    if (quarantinedDelivery) {
+      if (quarantinedDelivery.payload_json != null || quarantinedDelivery.checksum != null
+        || Number(quarantinedDelivery.attempts) !== 0
+        || quarantinedDelivery.relay_message_id != null || quarantinedDelivery.delivered_at != null
+        || quarantinedDelivery.confirmed_at != null) {
+        throw new Error('canonical visible delivery quarantine state conflict');
+      }
+      const diagnostics = this.db.prepare(`
+        SELECT detail_json FROM diagnostics
+        WHERE turn_id = ? AND stage = 'canonical_visible_delivery_quarantined'
+      `).all(authority.authoritative_turn_id).map(entry => parseJson(entry.detail_json, null));
+      const validReasons = new Set([
+        'authority_validation_failed', 'source_cancelled', 'source_redacted'
+      ]);
+      if (diagnostics.length !== 1 || !diagnostics.every(detail => detail
+        && Object.keys(detail).sort().join(',') === 'groupId,peerId,reason,redacted'
+        && detail.redacted === true
+        && detail.groupId === groupKey
+        && detail.peerId === authority.device_id
+        && validReasons.has(detail.reason))) {
+        throw new Error('canonical visible delivery quarantine diagnostic conflict');
+      }
+    } else if (this.db.prepare(`
+      SELECT 1 AS value FROM diagnostics
+      WHERE turn_id = ? AND stage = 'canonical_visible_delivery_quarantined'
+      LIMIT 1
+    `).get(authority.authoritative_turn_id)) {
+      throw new Error('canonical visible delivery quarantine diagnostic conflict');
     }
     return {
       status: 'live',
@@ -4124,6 +4166,43 @@ export class YuqiStore {
     };
   }
 
+  assertCanonicalVisibleDeliveryTargetSetInternal({
+    groupId,
+    expectedLineageKey = null
+  }) {
+    const closure = this.assertVisibleGroupAuthorityInternal(groupId, {
+      purpose: 'canonical_delivery_target',
+      expectedLineageKey
+    });
+    if (closure.status === 'redacted' || !closure.receipt) {
+      throw new Error('canonical visible delivery target conflict');
+    }
+    const target = this.db.prepare(`
+      SELECT g.lineage_key, g.authoritative_turn_id, r.commit_checksum,
+             t.device_id, d.*
+      FROM visible_result_groups g
+      JOIN visible_commit_receipts r ON r.group_id = g.group_id
+      JOIN turns t ON t.turn_id = g.authoritative_turn_id
+      JOIN cloud_deliveries d ON d.authority_group_id = g.group_id
+      WHERE g.group_id = ?
+    `).all(String(groupId || ''));
+    if (target.length !== 1) throw new Error('canonical visible delivery target conflict');
+    const row = target[0];
+    if (row.turn_id !== row.authoritative_turn_id
+      || row.peer_id !== row.device_id
+      || row.authority_commit_checksum !== row.commit_checksum) {
+      throw new Error('canonical visible delivery target conflict');
+    }
+    return {
+      closure,
+      authorityLineageKey: row.lineage_key,
+      turnId: row.authoritative_turn_id,
+      peerId: row.device_id,
+      commitChecksum: row.commit_checksum,
+      delivery: row
+    };
+  }
+
   assertVisibleAuthorityV13Invariants() {
     this.assertVisibleAuthorityV13SchemaInternal();
     this.assertVisibleAuthorityV11Invariants(
@@ -4133,7 +4212,7 @@ export class YuqiStore {
     );
     for (const lineage of this.db.prepare(`
       SELECT lineage_key, state, committed_group_id, redacted_at,
-             attempt_count, attempt_commitment
+             latest_turn_id, revision, attempt_count, attempt_commitment
       FROM turn_authority_lineages ORDER BY lineage_key
     `).all()) {
       const attempts = this.db.prepare(`
@@ -4152,6 +4231,15 @@ export class YuqiStore {
           attemptRows: attempts
         }).commitment !== lineage.attempt_commitment) {
         throw new Error('v13 invariant lineage attempt commitment conflict');
+      }
+      const latestAttempt = attempts.at(-1);
+      const expectedLineageRevision = lineage.state === 'open'
+        ? Number(latestAttempt?.lineage_revision_at_creation)
+        : Number(latestAttempt?.lineage_revision_at_creation) + 1;
+      if (!latestAttempt
+        || lineage.latest_turn_id !== latestAttempt.turn_id
+        || Number(lineage.revision) !== expectedLineageRevision) {
+        throw new Error('v13 invariant lineage latest attempt conflict');
       }
       for (const attempt of attempts) {
         if (lineage.redacted_at == null) {
@@ -4211,6 +4299,14 @@ export class YuqiStore {
       SELECT group_id FROM visible_result_groups ORDER BY group_id
     `).all()) {
       this.assertVisibleGroupAuthorityInternal(row.group_id, { purpose: 'reopen' });
+    }
+    for (const delivery of this.db.prepare(`
+      SELECT d.* FROM cloud_deliveries d
+      JOIN turns t ON t.turn_id = d.turn_id
+      WHERE t.result_authority_version = 1 AND d.authority_group_id IS NULL
+      ORDER BY d.turn_id, d.peer_id
+    `).all()) {
+      this.assertCanonicalFailureDeliveryInternal(mapCloudDelivery(delivery));
     }
     for (const state of this.db.prepare(`
       SELECT c.role_id, c.last_turn_id, c.last_authority_group_id,
@@ -5904,6 +6000,22 @@ export class YuqiStore {
           lineageRevision - 1
         );
         if (Number(updated.changes) !== 1) throw new Error('retry lineage authority conflict');
+        if (envelope.protocolVersion === 3) {
+          this.db.prepare(`
+            UPDATE cloud_deliveries
+            SET state = 'superseded',
+                updated_at = ?
+            WHERE turn_id = ? AND authority_group_id IS NULL
+              AND state IN ('waiting', 'pending')
+              AND EXISTS (
+                SELECT 1 FROM turns parent
+                WHERE parent.turn_id = cloud_deliveries.turn_id
+                  AND parent.result_authority_version = 1
+                  AND parent.state = 'failed'
+                  AND json_extract(parent.envelope_json, '$.protocolVersion') = 3
+              )
+          `).run(timestamp, retryOfTurnId);
+        }
       } else {
         if (this.userVersion() >= 13) {
           this.db.prepare(`
@@ -6447,6 +6559,9 @@ export class YuqiStore {
     if (!existing || existing.authority_commit_checksum !== existing.receipt_checksum) {
       throw new Error('canonical cloud delivery authority conflict');
     }
+    if (!['waiting', 'pending', 'mailboxed', 'confirmed'].includes(existing.state)) {
+      throw new Error('canonical cloud delivery authority conflict');
+    }
     if (existing.checksum && existing.checksum !== checksum) {
       throw new Error('canonical cloud delivery payload checksum conflict');
     }
@@ -6729,14 +6844,21 @@ export class YuqiStore {
     }
     failAfter(8);
 
+    const recoveryAckSeq = Number(this.db.prepare(`
+      SELECT ack_seq
+      FROM sync_cursors
+      WHERE peer_id = ?
+    `).get(turn.deviceId)?.ack_seq || 0);
+
     this.db.prepare(`
       INSERT INTO cloud_deliveries(
         turn_id, peer_id, recovery_ack_seq, state, attempts,
         created_at, updated_at, authority_group_id, authority_commit_checksum
-      ) VALUES (?, ?, 0, 'waiting', 0, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, 'waiting', 0, ?, ?, ?, ?)
     `).run(
       input.turnId,
       turn.deviceId,
+      recoveryAckSeq,
       timestamp,
       timestamp,
       input.groupId,
@@ -7636,10 +7758,12 @@ export class YuqiStore {
   listPendingCloudDeliveries(limit = 50) {
     const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
     return this.db.prepare(`
-      SELECT * FROM cloud_deliveries
-      WHERE state IN ('waiting', 'pending')
-        AND authority_group_id IS NULL
-      ORDER BY updated_at ASC, turn_id ASC, peer_id ASC LIMIT ?
+      SELECT d.* FROM cloud_deliveries d
+      JOIN turns t ON t.turn_id = d.turn_id
+      WHERE d.state IN ('waiting', 'pending')
+        AND d.authority_group_id IS NULL
+        AND t.result_authority_version = 0
+      ORDER BY d.updated_at ASC, d.turn_id ASC, d.peer_id ASC LIMIT ?
     `).all(safeLimit).map(mapCloudDelivery);
   }
 
@@ -7648,20 +7772,486 @@ export class YuqiStore {
     return this.db.prepare(`
       SELECT d.*
       FROM cloud_deliveries d
-      JOIN visible_commit_receipts r
-        ON r.group_id = d.authority_group_id
-       AND r.commit_checksum = d.authority_commit_checksum
-       AND r.authoritative_turn_id = d.turn_id
-      JOIN visible_result_groups g
-        ON g.group_id = r.group_id
-       AND g.lineage_key = r.lineage_key
-       AND g.authoritative_turn_id = r.authoritative_turn_id
+      JOIN turns t ON t.turn_id = d.turn_id
       WHERE d.state IN ('waiting', 'pending')
         AND d.authority_group_id IS NOT NULL
-        AND r.authority_origin = 'pc'
+        AND t.result_authority_version = 1
       ORDER BY d.updated_at ASC, d.authority_group_id ASC, d.peer_id ASC
       LIMIT ?
     `).all(safeLimit).map(mapCloudDelivery);
+  }
+
+  assertCanonicalFailureDeliveryInternal(delivery) {
+    const row = delivery?.turnId ? delivery : mapCloudDelivery(delivery);
+    const turn = this.getTurn(row?.turnId);
+    const lineage = this.getTurnAuthorityLineage(turn?.authorityLineageKey);
+    const failure = parseJson(turn?.errorJson, null);
+    const wire = parseJson(turn?.envelopeJson, null);
+    if (!row || !turn || !lineage
+      || row.authorityGroupId != null
+      || Number(turn.resultAuthorityVersion) !== 1
+      || Number(wire?.protocolVersion) !== 3
+      || row.peerId !== turn.deviceId
+      || !['waiting', 'pending', 'mailboxed', 'superseded', 'superseded_mailboxed', 'quarantined'].includes(row.state)) {
+      throw new Error('canonical failure delivery authority conflict');
+    }
+    const isCurrentFailure = turn.state === 'failed'
+      && lineage.state === 'open'
+      && lineage.latestTurnId === turn.turnId
+      && lineage.committedGroupId == null
+      && lineage.redactedAt == null;
+    if (isCurrentFailure) {
+      projectCanonicalFailureSnapshotForWire({
+        turn,
+        failure,
+        lineageRevision: Number(turn.lineageRevisionAtCreation)
+      });
+    }
+    const payload = parseJson(row.payloadJson, null);
+    const needsPayload = ['pending', 'mailboxed', 'superseded_mailboxed'].includes(row.state)
+      || ((row.state === 'superseded' || row.state === 'quarantined') && row.payloadJson != null);
+    if (needsPayload) {
+      if (!payload?.failure || !payload?.lease || !row.checksum
+        || Object.keys(payload).sort().join(',') !== 'failure,lease'
+        || Object.keys(payload.lease).sort().join(',') !== 'leaseAttempt,leaseId,leasedAt'
+        || !Number.isSafeInteger(Number(payload.lease.leaseAttempt))
+        || Number(payload.lease.leaseAttempt) !== Number(row.attempts)
+        || !Number.isSafeInteger(Number(payload.lease.leasedAt))
+        || Number(payload.lease.leasedAt) <= 0
+        || payload.lease.leaseId !== stableFailureId('failure_lease',
+          `${row.turnId}:${row.peerId}:${row.checksum}:${row.attempts}`)) {
+        throw new Error('canonical failure delivery lease conflict');
+      }
+      if ((row.state === 'pending' && Number(payload.lease.leasedAt) !== Number(row.updatedAt))
+        || (row.state !== 'pending' && Number(payload.lease.leasedAt) > Number(row.updatedAt))) {
+        throw new Error('canonical failure delivery lease time conflict');
+      }
+      {
+        const expected = projectCanonicalFailureSnapshotForWire({
+          turn,
+          failure,
+          lineageRevision: Number(turn.lineageRevisionAtCreation)
+        });
+        if (row.checksum !== expected.rawStatusChecksum
+          || canonicalJson(payload.failure) !== canonicalJson({
+            ok: true, ...expected, recoveryAckSeq: Number(row.recoveryAckSeq || 0)
+          })) throw new Error('canonical failure delivery checksum conflict');
+      }
+    } else if (row.payloadJson != null || row.checksum || Number(row.attempts) !== 0) {
+      throw new Error('canonical failure delivery state conflict');
+    }
+    if (['mailboxed', 'superseded_mailboxed'].includes(row.state)
+      || (row.state === 'quarantined' && row.relayMessageId != null)) {
+      const expectedRelay = stableFailureId('relay_failure', `${row.turnId}:${row.peerId}:${row.checksum}`);
+      if (row.relayMessageId !== expectedRelay || !Number.isSafeInteger(Number(row.deliveredAt))) {
+        throw new Error('canonical failure relay identity conflict');
+      }
+      if (payload?.lease && Number(row.deliveredAt) < Number(payload.lease.leasedAt)) {
+        throw new Error('canonical failure delivery time conflict');
+      }
+    } else if (row.relayMessageId != null || row.deliveredAt != null) {
+      throw new Error('canonical failure delivery state conflict');
+    }
+    if (row.state === 'waiting' && !isCurrentFailure) {
+      throw new Error('canonical failure delivery authority conflict');
+    }
+    if (row.state === 'pending' && !isCurrentFailure) {
+      throw new Error('canonical failure delivery authority conflict');
+    }
+    if (['superseded', 'superseded_mailboxed'].includes(row.state)) {
+      const directChild = this.db.prepare(`
+        SELECT * FROM turns
+        WHERE retry_of_turn_id = ? AND authority_lineage_key = ?
+          AND lineage_revision_at_creation = ?
+      `).get(turn.turnId, turn.authorityLineageKey, Number(turn.lineageRevisionAtCreation) + 1);
+      const latest = this.getTurn(lineage.latestTurnId);
+      const childWire = parseJson(directChild?.envelope_json, null);
+      if (!directChild || !latest
+        || directChild.authority_lineage_key !== turn.authorityLineageKey
+        || Number(directChild.result_authority_version) !== 1
+        || Number(childWire?.protocolVersion) !== 3
+        || latest.authorityLineageKey !== turn.authorityLineageKey
+        || Number(latest.resultAuthorityVersion) !== 1
+        || !['open', 'committed', 'cancelled'].includes(lineage.state)) {
+        throw new Error('canonical failure delivery authority conflict');
+      }
+    }
+    if (row.state === 'quarantined') {
+      const diagnostics = this.db.prepare(`
+        SELECT detail_json FROM diagnostics
+        WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'
+      `).all(row.turnId).map(entry => parseJson(entry.detail_json, null));
+      const hasRedactedDiagnostic = diagnostics.length === 1 && diagnostics.every(detail => detail
+        && Object.keys(detail).sort().join(',') === 'peerId,reason,redacted'
+        && detail.redacted === true
+        && detail.peerId === row.peerId
+        && typeof detail.reason === 'string'
+        && ['authority_validation_failed', 'source_cancelled', 'source_redacted'].includes(detail.reason));
+      if (!hasRedactedDiagnostic) throw new Error('canonical failure delivery quarantine diagnostic conflict');
+    } else if (this.db.prepare(`
+      SELECT 1 AS value FROM diagnostics
+      WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'
+      LIMIT 1
+    `).get(row.turnId)) {
+      throw new Error('canonical failure delivery quarantine diagnostic conflict');
+    }
+    return row;
+  }
+
+  listPendingCanonicalFailureCloudDeliveries(limit = 50, timestamp = now()) {
+    const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
+    return this.db.prepare(`
+      SELECT d.*
+      FROM cloud_deliveries d
+      JOIN turns t ON t.turn_id = d.turn_id
+      JOIN turn_authority_lineages l
+        ON l.lineage_key = t.authority_lineage_key
+       AND l.latest_turn_id = t.turn_id
+      WHERE d.authority_group_id IS NULL
+        AND d.peer_id = t.device_id
+        AND t.result_authority_version = 1
+        AND t.state = 'failed'
+        AND json_extract(t.envelope_json, '$.protocolVersion') = 3
+        AND l.state = 'open' AND l.committed_group_id IS NULL AND l.redacted_at IS NULL
+        AND (d.state = 'waiting' OR (d.state = 'pending' AND d.updated_at <= ?))
+      ORDER BY d.updated_at ASC, d.turn_id ASC, d.peer_id ASC
+      LIMIT ?
+    `).all(Number(timestamp) - FAILURE_DELIVERY_LEASE_MS, safeLimit)
+      .map(row => ({ ...mapCloudDelivery(row), deliveryType: 'canonical_failure' }));
+  }
+
+  claimCanonicalFailureCloudDeliveryInternal({ turnId, peerId, timestamp = now() }) {
+    return this.withImmediateTransaction(() => {
+      const existing = this.db.prepare(`
+        SELECT d.*
+        FROM cloud_deliveries d
+        JOIN turns t ON t.turn_id = d.turn_id
+        JOIN turn_authority_lineages l
+          ON l.lineage_key = t.authority_lineage_key
+         AND l.latest_turn_id = t.turn_id
+         AND l.state = 'open' AND l.committed_group_id IS NULL AND l.redacted_at IS NULL
+        WHERE d.turn_id = ? AND d.peer_id = ? AND d.authority_group_id IS NULL
+          AND d.peer_id = t.device_id
+          AND t.result_authority_version = 1 AND t.state = 'failed'
+          AND json_extract(t.envelope_json, '$.protocolVersion') = 3
+          AND NOT EXISTS (
+            SELECT 1 FROM cloud_deliveries other
+            WHERE other.turn_id = d.turn_id
+              AND other.authority_group_id IS NULL
+              AND other.peer_id <> t.device_id
+          )
+      `).get(String(turnId), String(peerId));
+      if (!existing) throw new Error('canonical failure delivery authority conflict');
+      const reclaimable = existing.state === 'waiting'
+        || (existing.state === 'pending'
+          && Number(existing.updated_at) <= Number(timestamp) - FAILURE_DELIVERY_LEASE_MS);
+      if (!reclaimable) return null;
+      const failure = this.loadCanonicalFailureForBridgeInternal(turnId);
+      const leaseAttempt = Number(existing.attempts || 0) + 1;
+      const rawStatusChecksum = failure.rawStatusChecksum;
+      const leaseId = stableFailureId('failure_lease',
+        `${turnId}:${peerId}:${rawStatusChecksum}:${leaseAttempt}`);
+      const payload = {
+        failure: { ok: true, ...failure, recoveryAckSeq: Number(existing.recovery_ack_seq || 0) },
+        lease: { leaseId, leaseAttempt, leasedAt: Number(timestamp) }
+      };
+      const result = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'pending', payload_json = ?, checksum = ?, attempts = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND authority_group_id IS NULL
+          AND ((state = 'waiting' AND attempts = ?)
+            OR (state = 'pending' AND attempts = ? AND updated_at <= ?))
+      `).run(
+        canonicalJson(payload), rawStatusChecksum, leaseAttempt, Number(timestamp),
+        String(turnId), String(peerId), Number(existing.attempts || 0),
+        Number(existing.attempts || 0), Number(timestamp) - FAILURE_DELIVERY_LEASE_MS
+      );
+      if (Number(result.changes) !== 1) return null;
+      return {
+        delivery: mapCloudDelivery(this.db.prepare(
+          'SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?'
+        ).get(String(turnId), String(peerId))),
+        payload: payload.failure,
+        rawStatusChecksum,
+        leaseId,
+        leaseAttempt,
+        relayMessageId: stableFailureId('relay_failure', `${turnId}:${peerId}:${rawStatusChecksum}`)
+      };
+    });
+  }
+
+  markCanonicalFailureCloudDeliveryMailboxedInternal({
+    turnId, peerId, rawStatusChecksum, leaseId, leaseAttempt, relayMessageId, timestamp = now()
+  }) {
+    return this.withImmediateTransaction(() => {
+      const row = this.db.prepare(
+        `SELECT d.* FROM cloud_deliveries d
+         JOIN turns t ON t.turn_id = d.turn_id
+         JOIN turn_authority_lineages l
+           ON l.lineage_key = t.authority_lineage_key
+         WHERE d.turn_id = ? AND d.peer_id = ?
+           AND d.peer_id = t.device_id
+           AND t.result_authority_version = 1 AND t.state = 'failed'
+           AND json_extract(t.envelope_json, '$.protocolVersion') = 3`
+      ).get(String(turnId), String(peerId));
+      if (!row) {
+        throw new Error('canonical failure target set conflict');
+      }
+      this.assertCanonicalFailureDeliveryInternal(row);
+      const payload = parseJson(row?.payload_json, null);
+      const lease = payload?.lease;
+      const expectedRelayMessageId = stableFailureId('relay_failure',
+        `${turnId}:${peerId}:${rawStatusChecksum}`);
+      if (!row || row.authority_group_id != null || row.checksum !== String(rawStatusChecksum)
+        || lease?.leaseId !== leaseId || Number(lease?.leaseAttempt) !== Number(leaseAttempt)) {
+        throw new Error('canonical failure delivery lease conflict');
+      }
+      if (String(relayMessageId) !== expectedRelayMessageId) {
+        throw new Error('canonical failure relay identity conflict');
+      }
+      const nextState = row.state === 'pending'
+        ? 'mailboxed'
+        : row.state === 'superseded'
+          ? 'superseded_mailboxed'
+          : null;
+      if (!nextState) throw new Error('canonical failure delivery lease conflict');
+      const failedTurn = this.getTurn(turnId);
+      const lineage = this.getTurnAuthorityLineage(failedTurn?.authorityLineageKey);
+      if (!lineage) throw new Error('canonical failure delivery authority conflict');
+      if (row.state === 'pending'
+        && (lineage.state !== 'open' || lineage.latestTurnId !== String(turnId)
+          || lineage.committedGroupId != null || lineage.redactedAt != null)) {
+        throw new Error('canonical failure delivery lease conflict');
+      }
+      if (row.state === 'superseded') {
+        const child = this.getTurn(lineage.latestTurnId);
+        if (!child || child.authorityLineageKey !== failedTurn.authorityLineageKey
+          || child.turnId === failedTurn.turnId
+          || child.retryOfTurnId !== failedTurn.turnId
+          || Number(child.lineageRevisionAtCreation) !== Number(failedTurn.lineageRevisionAtCreation) + 1
+          || !['open', 'committed', 'cancelled'].includes(lineage.state)) {
+          throw new Error('canonical failure delivery authority conflict');
+        }
+      }
+      const result = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = ?, relay_message_id = ?, delivered_at = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND state = ? AND checksum = ?
+          AND payload_json = ? AND attempts = ?
+      `).run(nextState, String(relayMessageId), Number(timestamp), Number(timestamp),
+        String(turnId), String(peerId), row.state, String(rawStatusChecksum),
+        String(row.payload_json), Number(leaseAttempt));
+      if (Number(result.changes) !== 1) throw new Error('canonical failure delivery lease conflict');
+      return mapCloudDelivery(this.db.prepare(
+        'SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?'
+      ).get(String(turnId), String(peerId)));
+    });
+  }
+
+  quarantineCanonicalCloudDeliveryInternal({
+    turnId,
+    peerId,
+    expected,
+    reason = 'authority_validation_failed'
+  }) {
+    const allowedReasons = new Set([
+      'authority_validation_failed', 'source_cancelled', 'source_redacted'
+    ]);
+    const requiredSnapshotKeys = [
+      'state', 'payloadJson', 'checksum', 'attempts',
+      'relayMessageId', 'deliveredAt', 'updatedAt'
+    ];
+    if (!allowedReasons.has(String(reason))) {
+      throw new Error('canonical failure delivery quarantine reason conflict');
+    }
+    if (!expected || requiredSnapshotKeys.some(key => !Object.hasOwn(expected, key))) {
+      throw new Error('canonical failure delivery quarantine snapshot conflict');
+    }
+    return this.withImmediateTransaction(() => {
+      const row = this.db.prepare(`
+        SELECT d.*, t.result_authority_version, t.device_id
+        FROM cloud_deliveries d JOIN turns t ON t.turn_id = d.turn_id
+        WHERE d.turn_id = ? AND d.peer_id = ?
+          AND d.authority_group_id IS NULL
+          AND t.result_authority_version = 1 AND t.device_id = d.peer_id
+          AND json_extract(t.envelope_json, '$.protocolVersion') = 3
+      `).get(String(turnId), String(peerId));
+      if (!row) {
+        const turn = this.getTurn(String(turnId));
+        const lineage = this.getTurnAuthorityLineage(turn?.authorityLineageKey);
+        if (turn?.state === 'cancelled' || lineage?.redactedAt != null || lineage?.state === 'cancelled') {
+          return { quarantineOutcome: 'stale_redacted', state: null };
+        }
+        throw new Error('canonical failure delivery quarantine target conflict');
+      }
+      const detail = canonicalJson({ redacted: true, peerId: String(peerId), reason: String(reason) });
+      const diagnosticRows = this.db.prepare(`
+        SELECT diagnostic_id, detail_json
+        FROM diagnostics
+        WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'
+      `).all(String(turnId));
+      if (row.state === 'quarantined') {
+        if (row.payload_json != null || row.checksum != null || Number(row.attempts) !== 0
+          || row.relay_message_id != null || row.delivered_at != null || row.confirmed_at != null
+          || diagnosticRows.length !== 1 || diagnosticRows[0].detail_json !== detail) {
+          throw new Error('canonical failure delivery quarantine conflict');
+        }
+        return { ...mapCloudDelivery(row), quarantineOutcome: 'already_quarantined' };
+      }
+      if (['mailboxed', 'confirmed', 'superseded', 'superseded_mailboxed', 'redaction_pending', 'redacted'].includes(row.state)) {
+        return { ...mapCloudDelivery(row), quarantineOutcome: 'stale_terminal' };
+      }
+      if (!['waiting', 'pending'].includes(row.state)
+        || row.state !== expected.state
+        || (row.payload_json ?? null) !== (expected.payloadJson ?? null)
+        || (row.checksum ?? null) !== (expected.checksum || null)
+        || Number(row.attempts) !== Number(expected.attempts)
+        || (row.relay_message_id ?? null) !== (expected.relayMessageId ?? null)
+        || (row.delivered_at ?? null) !== (expected.deliveredAt ?? null)
+        || Number(row.updated_at) !== Number(expected.updatedAt)) {
+        throw new Error('canonical failure delivery quarantine snapshot conflict');
+      }
+      if (diagnosticRows.length !== 0) {
+        throw new Error('canonical failure delivery quarantine diagnostic conflict');
+      }
+      const timestamp = now();
+      const updated = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'quarantined', payload_json = NULL, checksum = NULL,
+            attempts = 0, relay_message_id = NULL, delivered_at = NULL,
+            confirmed_at = NULL, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND authority_group_id IS NULL
+          AND state = ? AND payload_json IS ? AND checksum IS ? AND attempts = ?
+          AND relay_message_id IS ? AND delivered_at IS ? AND updated_at = ?
+      `).run(
+        timestamp,
+        String(turnId), String(peerId), expected.state,
+        expected.payloadJson ?? null, expected.checksum || null, Number(expected.attempts),
+        expected.relayMessageId ?? null, expected.deliveredAt ?? null, Number(expected.updatedAt)
+      );
+      if (Number(updated.changes) !== 1) {
+        throw new Error('canonical failure delivery quarantine snapshot conflict');
+      }
+      this.putDiagnostic({
+        turnId: String(turnId),
+        stage: 'canonical_failure_delivery_quarantined',
+        level: 'error',
+        detail: JSON.parse(detail)
+      });
+      return { ...mapCloudDelivery(this.db.prepare(
+        'SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?'
+      ).get(String(turnId), String(peerId))), quarantineOutcome: 'quarantined' };
+    });
+  }
+
+  quarantineCanonicalVisibleDeliveryInternal({
+    turnId,
+    peerId,
+    authorityGroupId,
+    authorityCommitChecksum,
+    expected,
+    reason = 'authority_validation_failed'
+  }) {
+    const allowedReasons = new Set([
+      'authority_validation_failed',
+      'source_cancelled',
+      'source_redacted'
+    ]);
+    if (!allowedReasons.has(String(reason))) {
+      throw new Error('canonical visible delivery quarantine reason conflict');
+    }
+    const requiredSnapshotKeys = [
+      'state', 'payloadJson', 'checksum', 'attempts',
+      'relayMessageId', 'deliveredAt', 'updatedAt'
+    ];
+    if (!expected || requiredSnapshotKeys.some(key => !Object.hasOwn(expected, key))) {
+      throw new Error('canonical visible delivery quarantine snapshot conflict');
+    }
+    return this.withImmediateTransaction(() => {
+      const row = this.db.prepare(`
+        SELECT d.*, t.result_authority_version, t.device_id
+        FROM cloud_deliveries d
+        JOIN turns t ON t.turn_id = d.turn_id
+        WHERE d.turn_id = ? AND d.peer_id = ?
+          AND d.authority_group_id = ? AND d.authority_commit_checksum = ?
+          AND t.result_authority_version = 1 AND t.device_id = d.peer_id
+      `).get(
+        String(turnId), String(peerId), String(authorityGroupId), String(authorityCommitChecksum)
+      );
+      if (!row) {
+        const turn = this.getTurn(String(turnId));
+        const lineage = this.getTurnAuthorityLineage(turn?.authorityLineageKey);
+        if (turn?.state === 'cancelled' || lineage?.redactedAt != null || lineage?.state === 'cancelled') {
+          return { quarantineOutcome: 'stale_redacted', state: null };
+        }
+        throw new Error('canonical visible delivery quarantine target conflict');
+      }
+      const detail = canonicalJson({
+        redacted: true,
+        groupId: String(authorityGroupId),
+        peerId: String(peerId),
+        reason: String(reason)
+      });
+      const diagnosticRows = this.db.prepare(`
+        SELECT diagnostic_id, detail_json
+        FROM diagnostics
+        WHERE turn_id = ? AND stage = 'canonical_visible_delivery_quarantined'
+      `).all(String(turnId));
+      if (row.state === 'quarantined') {
+        if (row.payload_json != null || row.checksum != null || Number(row.attempts) !== 0
+          || row.relay_message_id != null || row.delivered_at != null || row.confirmed_at != null
+          || diagnosticRows.length !== 1 || diagnosticRows[0].detail_json !== detail) {
+          throw new Error('canonical visible delivery quarantine conflict');
+        }
+        return { ...mapCloudDelivery(row), quarantineOutcome: 'already_quarantined' };
+      }
+      if (['mailboxed', 'confirmed', 'superseded', 'superseded_mailboxed', 'redaction_pending', 'redacted'].includes(row.state)) {
+        return { ...mapCloudDelivery(row), quarantineOutcome: 'stale_terminal' };
+      }
+      if (!['waiting', 'pending'].includes(row.state)
+        || row.state !== expected.state
+        || (row.payload_json ?? null) !== (expected.payloadJson ?? null)
+        || (row.checksum ?? null) !== (expected.checksum || null)
+        || Number(row.attempts) !== Number(expected.attempts)
+        || (row.relay_message_id ?? null) !== (expected.relayMessageId ?? null)
+        || (row.delivered_at ?? null) !== (expected.deliveredAt ?? null)
+        || Number(row.updated_at) !== Number(expected.updatedAt)) {
+        throw new Error('canonical visible delivery quarantine snapshot conflict');
+      }
+      if (diagnosticRows.length !== 0) {
+        throw new Error('canonical visible delivery quarantine diagnostic conflict');
+      }
+      const timestamp = now();
+      const updated = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'quarantined', payload_json = NULL, checksum = NULL,
+            attempts = 0, relay_message_id = NULL, delivered_at = NULL,
+            confirmed_at = NULL, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND authority_group_id = ?
+          AND authority_commit_checksum = ? AND state = ?
+          AND payload_json IS ? AND checksum IS ? AND attempts = ?
+          AND relay_message_id IS ? AND delivered_at IS ? AND updated_at = ?
+      `).run(
+        timestamp,
+        String(turnId), String(peerId), String(authorityGroupId), String(authorityCommitChecksum),
+        expected.state,
+        expected.payloadJson ?? null, expected.checksum || null, Number(expected.attempts),
+        expected.relayMessageId ?? null, expected.deliveredAt ?? null, Number(expected.updatedAt)
+      );
+      if (Number(updated.changes) !== 1) {
+        throw new Error('canonical visible delivery quarantine snapshot conflict');
+      }
+      this.putDiagnostic({
+        turnId: String(turnId),
+        stage: 'canonical_visible_delivery_quarantined',
+        level: 'error',
+        detail: JSON.parse(detail)
+      });
+      return { ...mapCloudDelivery(this.db.prepare(`
+        SELECT * FROM cloud_deliveries
+        WHERE turn_id = ? AND peer_id = ? AND authority_group_id = ?
+      `).get(String(turnId), String(peerId), String(authorityGroupId))), quarantineOutcome: 'quarantined' };
+    });
   }
 
   recoverFailedDraft(turnId, { peerId, sentAt = null } = {}) {
@@ -7828,13 +8418,13 @@ export class YuqiStore {
   }
 
   prepareCloudDelivery(turnId, peerId, payload) {
+    this.assertLegacyCloudDeliveryInternal(turnId, peerId);
     const payloadJson = canonicalJson(payload);
     const checksum = contentHash(payload);
     const existing = this.db.prepare(`
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, peerId);
     if (!existing) throw new Error('cloud delivery not found');
-    if (existing.authority_group_id != null) throw new Error('canonical delivery API required');
     if (existing.checksum && existing.checksum !== checksum) throw new Error('cloud delivery checksum conflict');
     if (existing.state !== 'delivered') {
       this.db.prepare(`
@@ -7850,11 +8440,15 @@ export class YuqiStore {
 
   assertLegacyCloudDeliveryInternal(turnId, peerId) {
     const row = this.db.prepare(`
-      SELECT authority_group_id FROM cloud_deliveries
-      WHERE turn_id = ? AND peer_id = ?
+      SELECT d.authority_group_id, t.result_authority_version
+      FROM cloud_deliveries d
+      JOIN turns t ON t.turn_id = d.turn_id
+      WHERE d.turn_id = ? AND d.peer_id = ?
     `).get(String(turnId), String(peerId));
     if (!row) throw new Error('cloud delivery not found');
-    if (row.authority_group_id != null) throw new Error('canonical delivery API required');
+    if (row.authority_group_id != null || Number(row.result_authority_version) !== 0) {
+      throw new Error('canonical delivery API required');
+    }
   }
 
   markCloudDeliveryAttempt(turnId, peerId) {
@@ -7999,11 +8593,11 @@ export class YuqiStore {
   }
 
   confirmCloudDeliveryItems(turnId, peerId, receipt) {
+    this.assertLegacyCloudDeliveryInternal(turnId, peerId);
     const delivery = this.db.prepare(`
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, String(peerId));
     if (!delivery) throw new Error('cloud delivery not found');
-    if (delivery.authority_group_id != null) throw new Error('canonical delivery API required');
     const deliveryState = this.recordDeliveryReceipt(receipt);
     if (delivery.state !== 'confirmed') {
       if (!['mailboxed', 'delivered'].includes(delivery.state)) {
@@ -8019,6 +8613,7 @@ export class YuqiStore {
   }
 
   confirmCloudDelivery(turnId, peerId, receipt) {
+    this.assertLegacyCloudDeliveryInternal(turnId, peerId);
     const message = this.getMessage(String(receipt?.messageId || ''));
     if (!message || message.turnId !== turnId || message.speakerType !== 'character') {
       throw new Error('delivery receipt message mismatch');
@@ -8031,7 +8626,6 @@ export class YuqiStore {
       SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
     `).get(turnId, String(peerId));
     if (!delivery) throw new Error('cloud delivery not found');
-    if (delivery.authority_group_id != null) throw new Error('canonical delivery API required');
     if (delivery.state === 'confirmed') return mapCloudDelivery(delivery);
     if (!['mailboxed', 'delivered'].includes(delivery.state)) {
       throw new Error('cloud delivery is not awaiting a phone receipt');
@@ -8052,6 +8646,150 @@ export class YuqiStore {
       return mapCloudDelivery(this.db.prepare(`
         SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
       `).get(turnId, String(peerId)));
+    });
+  }
+
+  confirmAuthorityCloudDeliveryInternal(receipt) {
+    const normalized = validateAuthorityDeliveryReceipt(receipt);
+    return this.withImmediateTransaction(() => {
+      const target = this.assertCanonicalVisibleDeliveryTargetSetInternal({
+        groupId: normalized.visibleGroupId,
+        expectedLineageKey: normalized.authorityLineageKey
+      });
+      if (target.authorityLineageKey !== normalized.authorityLineageKey
+        || target.turnId !== normalized.turnId
+        || target.peerId !== normalized.peerId
+        || target.commitChecksum !== normalized.commitChecksum
+        || target.closure.terminalDisposition !== normalized.terminalDisposition) {
+        throw new Error('canonical authority delivery receipt conflict');
+      }
+      const delivery = target.delivery;
+      if (delivery.state === 'confirmed') {
+        if (Number(delivery.confirmed_at) !== normalized.deliveredAt) {
+          throw new Error('canonical authority delivery receipt conflict');
+        }
+        return mapCloudDelivery(delivery);
+      }
+      if (delivery.state !== 'mailboxed') {
+        throw new Error('canonical authority delivery is not mailboxed');
+      }
+      const updatedAt = now();
+      const updated = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'confirmed', confirmed_at = ?, updated_at = ?
+        WHERE authority_group_id = ? AND peer_id = ? AND turn_id = ?
+          AND authority_commit_checksum = ? AND state = 'mailboxed'
+      `).run(
+        normalized.deliveredAt,
+        updatedAt,
+        normalized.visibleGroupId,
+        normalized.peerId,
+        normalized.turnId,
+        normalized.commitChecksum
+      );
+      if (Number(updated.changes) !== 1) throw new Error('canonical authority delivery receipt conflict');
+      return mapCloudDelivery(this.db.prepare(`
+        SELECT * FROM cloud_deliveries
+        WHERE authority_group_id = ? AND peer_id = ?
+      `).get(normalized.visibleGroupId, normalized.peerId));
+    });
+  }
+
+  confirmCanonicalV2DeliveryInternal(turnId, peerId, receipt) {
+    const normalized = validateDeliveryReceipt(receipt);
+    if (normalized.turnId !== String(turnId || '')) {
+      throw new Error('canonical v2 delivery receipt turn conflict');
+    }
+    return this.withImmediateTransaction(() => {
+      const lookupTurn = this.getTurn(normalized.turnId);
+      if (!lookupTurn
+        || Number(lookupTurn.resultAuthorityVersion || 0) !== 1
+        || Number(lookupTurn.protocolVersion || 0) !== 2) {
+        throw new Error('canonical v2 delivery receipt conflict');
+      }
+      const canonical = this.loadCanonicalBridgeResultInternal(lookupTurn.turnId);
+      if (canonical.status === 'redacted') throw new Error('canonical v2 delivery receipt conflict');
+      const target = this.assertCanonicalVisibleDeliveryTargetSetInternal({
+        groupId: canonical.visibleGroupId,
+        expectedLineageKey: canonical.authorityLineageKey
+      });
+      if (target.turnId !== canonical.turnId
+        || target.peerId !== String(peerId)
+        || target.commitChecksum !== canonical.commitChecksum) {
+        throw new Error('canonical v2 delivery target conflict');
+      }
+      const projection = projectBridgeResultForWire(canonical, 2);
+      const expectedItems = projection.deliveryItems;
+      if (expectedItems.length === 0 || normalized.items.length !== expectedItems.length) {
+        throw new Error('canonical v2 delivery receipt item conflict');
+      }
+      const expected = new Map(expectedItems.map(item => [`${item.kind}:${item.id}`, item.checksum]));
+      for (const item of normalized.items) {
+        if (expected.get(`${item.kind}:${item.id}`) !== item.checksum) {
+          throw new Error('canonical v2 delivery receipt item conflict');
+        }
+      }
+      const delivery = target.delivery;
+      if (delivery.state === 'confirmed') {
+        if (Number(delivery.confirmed_at) !== normalized.deliveredAt) {
+          throw new Error('canonical v2 delivery receipt conflict');
+        }
+        return mapCloudDelivery(delivery);
+      }
+      if (delivery.state !== 'mailboxed') {
+        throw new Error('canonical v2 delivery is not mailboxed');
+      }
+      const updated = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'confirmed', confirmed_at = ?, updated_at = ?
+        WHERE authority_group_id = ? AND peer_id = ? AND turn_id = ?
+          AND authority_commit_checksum = ? AND state = 'mailboxed'
+      `).run(
+        normalized.deliveredAt,
+        now(),
+        canonical.visibleGroupId,
+        String(peerId),
+        canonical.turnId,
+        canonical.commitChecksum
+      );
+      if (Number(updated.changes) !== 1) throw new Error('canonical v2 delivery receipt conflict');
+      return mapCloudDelivery(this.db.prepare(`
+        SELECT * FROM cloud_deliveries
+        WHERE authority_group_id = ? AND peer_id = ?
+      `).get(canonical.visibleGroupId, String(peerId)));
+    });
+  }
+
+  confirmCanonicalV2SimpleDeliveryInternal(turnId, peerId, receipt) {
+    const lookupTurn = this.getTurn(String(turnId || ''));
+    if (!lookupTurn
+      || Number(lookupTurn.resultAuthorityVersion || 0) !== 1
+      || Number(lookupTurn.protocolVersion || 0) !== 2) {
+      throw new Error('canonical v2 delivery receipt conflict');
+    }
+    const canonical = this.loadCanonicalBridgeResultInternal(lookupTurn.turnId);
+    if (canonical.status === 'redacted') throw new Error('canonical v2 delivery receipt conflict');
+    const projection = projectBridgeResultForWire(canonical, 2);
+    if (projection.replyParts.length !== 1 || projection.actions.length !== 0) {
+      throw new Error('canonical v2 simple delivery receipt conflict');
+    }
+    const messageId = String(receipt?.messageId || '');
+    const contentSha256 = String(receipt?.contentSha256 || '');
+    const expectedContentHash = createHash('sha256')
+      .update(String(projection.replyParts[0].content || ''), 'utf8')
+      .digest('hex');
+    if (messageId !== projection.replyParts[0].messageId || contentSha256 !== expectedContentHash) {
+      throw new Error('canonical v2 simple delivery receipt conflict');
+    }
+    return this.confirmCanonicalV2DeliveryInternal(lookupTurn.turnId, peerId, {
+      protocolVersion: 1,
+      turnId: lookupTurn.turnId,
+      deliveredAt: Math.max(1, Number(receipt?.receivedAt) || now()),
+      items: [{
+        kind: 'message',
+        id: projection.replyParts[0].messageId,
+        checksum: projection.replyParts[0].itemChecksum
+      }]
     });
   }
 
@@ -8161,17 +8899,46 @@ export class YuqiStore {
     failure
   }) {
     if (!TURN_STATES.includes(expectedState)) throw new Error('unknown turn state');
-    const normalizedFailure = {
-      ...structuredClone(failure || {}),
-      failureClass: String(failure?.failureClass || 'terminal')
-    };
     return this.withImmediateTransaction(() => {
+      const timestamp = now();
+      const current = this.getTurn(turnId);
       this.assertCanonicalAttemptMutableInternal({
         turnId,
         expectedState,
         expectedTurnRevision,
         operation: 'failure'
       });
+      const failureClass = String(failure?.failureClass || 'terminal');
+      if (!['transient', 'deterministic'].includes(failureClass)) {
+        throw new Error('canonical failure class conflict');
+      }
+      if (failure?.retryAllowed === true && failureClass !== 'transient') {
+        throw new Error('canonical deterministic retry permission conflict');
+      }
+      const wireProtocolVersion = Number(parseJson(current?.envelopeJson, {}).protocolVersion || 0);
+      if (wireProtocolVersion === 3 && typeof failure?.retryAllowed !== 'boolean') {
+        throw new Error('canonical v3 retry permission must be a native boolean');
+      }
+      const normalizedFailure = wireProtocolVersion === 3
+        ? {
+            name: String(failure?.name || 'Error').slice(0, 128),
+            code: String(failure?.code || '').slice(0, 128),
+            message: String(failure?.message || '').slice(0, 2048),
+            failureClass,
+            retryAllowed: failure?.retryAllowed,
+            failedAt: timestamp
+          }
+        : {
+            name: String(failure?.name || 'Error'),
+            message: String(failure?.message || ''),
+            failureClass
+          };
+      if (wireProtocolVersion === 3
+        && normalizedFailure.code !== (failureClass === 'transient'
+          ? 'YUQI_TRANSIENT_EXECUTION_FAILURE'
+          : 'YUQI_DETERMINISTIC_EXECUTION_FAILURE')) {
+        throw new Error('canonical v3 failure code conflict');
+      }
       const result = this.db.prepare(`
         UPDATE turns
         SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?,
@@ -8190,7 +8957,7 @@ export class YuqiStore {
           )
       `).run(
         canonicalJson(normalizedFailure),
-        now(),
+        timestamp,
         String(turnId),
         expectedState,
         Number(expectedTurnRevision)
@@ -8199,9 +8966,60 @@ export class YuqiStore {
         throw new Error('canonical turn authority conflict');
       }
       const turn = this.getTurn(turnId);
+      if (wireProtocolVersion === 3) {
+        const lineage = this.getTurnAuthorityLineage(turn.authorityLineageKey);
+        const authority = projectCanonicalFailureForWire({ turn, lineage, failure: normalizedFailure });
+        const recoveryAckSeq = Number(this.db.prepare(
+          'SELECT ack_seq FROM sync_cursors WHERE peer_id = ?'
+        ).get(turn.deviceId)?.ack_seq || 0);
+        this.db.prepare(`
+          INSERT INTO cloud_deliveries(
+            turn_id, peer_id, recovery_ack_seq, state, payload_json, checksum,
+            attempts, created_at, updated_at, delivered_at,
+            authority_group_id, authority_commit_checksum
+          ) VALUES (?, ?, ?, 'waiting', NULL, NULL, 0, ?, ?, NULL, NULL, NULL)
+          ON CONFLICT(turn_id, peer_id) DO NOTHING
+        `).run(turn.turnId, turn.deviceId, recoveryAckSeq, timestamp, timestamp);
+        if (!this.db.prepare(`
+          SELECT 1 AS value FROM cloud_deliveries
+          WHERE turn_id = ? AND peer_id = ? AND authority_group_id IS NULL
+            AND state = 'waiting' AND payload_json IS NULL AND checksum IS NULL
+        `).get(turn.turnId, turn.deviceId)) {
+          throw new Error('canonical failure delivery authority conflict');
+        }
+        // The projection is intentionally built in the writer transaction: malformed
+        // persisted failure records cannot become a bridge-visible terminal state.
+        void authority;
+      }
       this.appendSync('turn', turnId, 'state', turn);
       return turn;
     });
+  }
+
+  loadCanonicalFailureForBridgeInternal(turnId) {
+    const turn = this.getTurn(turnId);
+    if (!turn || Number(turn.resultAuthorityVersion) !== 1 || turn.protocolVersion !== 3) {
+      throw new Error('canonical failure authority conflict');
+    }
+    const delivery = this.db.prepare(`
+      SELECT d.*
+      FROM cloud_deliveries d
+      JOIN turns t ON t.turn_id = d.turn_id
+      WHERE d.turn_id = ?
+        AND d.authority_group_id IS NULL
+        AND d.peer_id = t.device_id
+        AND NOT EXISTS (
+          SELECT 1 FROM cloud_deliveries other
+          WHERE other.turn_id = d.turn_id
+            AND other.authority_group_id IS NULL
+            AND other.peer_id <> t.device_id
+        )
+    `).get(String(turnId));
+    if (!delivery) throw new Error('canonical failure target set conflict');
+    this.assertCanonicalFailureDeliveryInternal(delivery);
+    const lineage = this.getTurnAuthorityLineage(turn.authorityLineageKey);
+    const failure = parseJson(turn.errorJson, null);
+    return projectCanonicalFailureForWire({ turn, lineage, failure });
   }
 
   requeueCanonicalFailedTurnInternal({
@@ -8217,6 +9035,10 @@ export class YuqiStore {
         operation: 'requeue'
       });
       const failure = parseJson(current.errorJson, {});
+      const wireProtocolVersion = Number(parseJson(current.envelopeJson, {}).protocolVersion || 0);
+      if (wireProtocolVersion === 3 || failure.retryAllowed === true) {
+        throw new Error('canonical v3 failures require an authorized child retry');
+      }
       if (String(failure.failureClass || '') !== String(allowedFailureClass || '')) {
         throw new Error('canonical turn authority conflict');
       }
@@ -8272,14 +9094,62 @@ export class YuqiStore {
     supersededByTurnId = null,
     timestamp = now()
   }) {
+    const currentTurn = this.getTurn(turnId);
+    const wireProtocolVersion = Number(parseJson(currentTurn?.envelopeJson, {}).protocolVersion || 0);
+    const existingFailureDelivery = wireProtocolVersion === 3
+      ? this.db.prepare(`
+        SELECT d.* FROM cloud_deliveries d
+        JOIN turns t ON t.turn_id = d.turn_id
+        WHERE d.turn_id = ? AND d.peer_id = t.device_id
+          AND d.authority_group_id IS NULL
+          AND t.result_authority_version = 1
+          AND json_extract(t.envelope_json, '$.protocolVersion') = 3
+      `).get(String(turnId))
+      : null;
+    const preserveClosedFailure = Boolean(existingFailureDelivery);
+    if (existingFailureDelivery && ['waiting', 'pending'].includes(existingFailureDelivery.state)) {
+      const diagnosticRows = this.db.prepare(`
+        SELECT diagnostic_id FROM diagnostics
+        WHERE turn_id = ? AND stage = 'canonical_failure_delivery_quarantined'
+      `).all(String(turnId));
+      if (diagnosticRows.length !== 0) {
+        throw new Error('canonical failure delivery quarantine diagnostic conflict');
+      }
+      const quarantined = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'quarantined', payload_json = NULL, checksum = NULL,
+            attempts = 0, relay_message_id = NULL, delivered_at = NULL,
+            confirmed_at = NULL, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND authority_group_id IS NULL
+          AND state = ? AND payload_json IS ? AND checksum IS ? AND attempts = ?
+          AND relay_message_id IS ? AND delivered_at IS ? AND updated_at = ?
+      `).run(
+        Number(timestamp), String(turnId), existingFailureDelivery.peer_id,
+        existingFailureDelivery.state,
+        existingFailureDelivery.payload_json ?? null, existingFailureDelivery.checksum ?? null,
+        Number(existingFailureDelivery.attempts), existingFailureDelivery.relay_message_id ?? null,
+        existingFailureDelivery.delivered_at ?? null, Number(existingFailureDelivery.updated_at)
+      );
+      if (Number(quarantined.changes) !== 1) {
+        throw new Error('canonical failure delivery quarantine snapshot conflict');
+      }
+      this.putDiagnostic({
+        turnId: String(turnId),
+        stage: 'canonical_failure_delivery_quarantined',
+        level: 'error',
+        detail: { redacted: true, peerId: existingFailureDelivery.peer_id, reason: 'source_cancelled' }
+      });
+    }
     const turnResult = this.db.prepare(`
       UPDATE turns
-      SET state = 'failed', worker_id = NULL, error_json = ?, updated_at = ?,
+      SET state = 'failed', worker_id = NULL,
+          error_json = CASE WHEN ? = 1 THEN error_json ELSE ? END, updated_at = ?,
           turn_revision = turn_revision + 1
       WHERE turn_id = ? AND result_authority_version = 1
         AND authority_lineage_key = ? AND reply_json IS NULL
         AND turn_revision = ?
     `).run(
+      preserveClosedFailure ? 1 : 0,
       canonicalJson({
         code: String(reasonCode || 'CANONICAL_CANCELLED'),
         ...(supersededByTurnId ? { supersededByTurnId: String(supersededByTurnId) } : {})
