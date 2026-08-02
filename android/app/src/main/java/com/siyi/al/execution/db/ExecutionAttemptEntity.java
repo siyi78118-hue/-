@@ -34,6 +34,8 @@ public class ExecutionAttemptEntity {
     @Nullable public String rawReply;
     @Nullable public String errorCode;
     @Nullable public String errorDetail;
+    @Nullable public String bridgeAuthorityCheckpointJson;
+    @Nullable public String bridgeAuthorityCheckpointChecksum;
     public boolean retryable;
     public int crashCount;
 }

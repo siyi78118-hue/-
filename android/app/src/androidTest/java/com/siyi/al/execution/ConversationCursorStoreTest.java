@@ -1,8 +1,11 @@
 package com.siyi.al.execution;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import android.content.Context;
 import androidx.room.Room;
@@ -85,6 +88,194 @@ public class ConversationCursorStoreTest {
     }
 
     @Test
+    public void migration11To12PreservesPopulatedHistoryAndLeavesAuthorityCheckpointNull() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v11-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV11Helper(context, databaseName);
+        SupportSQLiteDatabase db = helper.getWritableDatabase();
+        insertPopulatedV11History(db);
+
+        AlExecutionDatabase.MIGRATION_11_12.migrate(db);
+
+        assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
+        assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
+        assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        android.database.Cursor attempt = db.query(
+            "SELECT turnId, sequence, stage, state, startedAt, heartbeatAt, finishedAt, "
+                + "memoryResult, rawReply, errorCode, errorDetail, retryable, crashCount, "
+                + "bridgeAuthorityCheckpointJson, bridgeAuthorityCheckpointChecksum "
+                + "FROM execution_attempts WHERE attemptId = 'attempt-11'"
+        );
+        try {
+            assertTrue(attempt.moveToFirst());
+            assertEquals("turn-11", attempt.getString(0));
+            assertEquals(7, attempt.getInt(1));
+            assertEquals("FINISHED", attempt.getString(2));
+            assertEquals("FAILED_FINAL", attempt.getString(3));
+            assertEquals(101L, attempt.getLong(4));
+            assertEquals(102L, attempt.getLong(5));
+            assertEquals(103L, attempt.getLong(6));
+            assertEquals("{\"legacyMemory\":\"保留\"}", attempt.getString(7));
+            assertEquals("raw-bytes-\uD83C\uDF27\uFE0F", attempt.getString(8));
+            assertEquals("OLD_ERROR", attempt.getString(9));
+            assertEquals("旧失败", attempt.getString(10));
+            assertEquals(0, attempt.getInt(11));
+            assertEquals(4, attempt.getInt(12));
+            assertTrue(attempt.isNull(13));
+            assertTrue(attempt.isNull(14));
+        } finally {
+            attempt.close();
+        }
+        android.database.Cursor turn = db.query(
+            "SELECT turnId, characterId, sourceMessageId, cloudJobId, kind, state, activeAttemptId, "
+                + "inputJson, snapshotJson, createdAt, updatedAt, completedAt, notificationShownAt, "
+                + "uiAppliedAt, cloudConfirmedAt, cancelledAt, deletedAt, visibleGroupId, "
+                + "authorityLineageKey, authorityOrigin, commitPayloadVersion, lineageRevision, "
+                + "turnRevision, laneKey, laneRevision, generationFingerprint, pipelineReleaseId, "
+                + "inputVisibilitySequence, inputClearEpoch, bridgeCommitChecksum, terminalDisposition "
+                + "FROM chat_turns WHERE turnId = 'turn-11'"
+        );
+        try {
+            assertTrue(turn.moveToFirst());
+            assertEquals("turn-11", turn.getString(0));
+            assertEquals("yuqi", turn.getString(1));
+            assertEquals("message-11", turn.getString(2));
+            assertEquals("cloud-11", turn.getString(3));
+            assertEquals("DIRECT_REPLY", turn.getString(4));
+            assertEquals("FAILED_FINAL", turn.getString(5));
+            assertEquals("attempt-11", turn.getString(6));
+            assertEquals("{\"message\":\"历史\"}", turn.getString(7));
+            assertEquals("{\"scene\":\"旧快照\"}", turn.getString(8));
+            assertFalse(turn.getString(8).contains("_alBridgeProtocol"));
+            for (int index = 9; index <= 15; index += 1) assertEquals(index - 8L, turn.getLong(index));
+            assertTrue(turn.isNull(16));
+            assertEquals("group-11", turn.getString(17));
+            assertEquals("lineage-11", turn.getString(18));
+            assertEquals("pc", turn.getString(19));
+            assertEquals("canonical-v2", turn.getString(20));
+            assertEquals(2L, turn.getLong(21));
+            assertEquals(4L, turn.getLong(22));
+            assertEquals("lane-11", turn.getString(23));
+            assertEquals(8L, turn.getLong(24));
+            assertEquals("fingerprint-11", turn.getString(25));
+            assertEquals("release-11", turn.getString(26));
+            assertEquals(9L, turn.getLong(27));
+            assertEquals(3L, turn.getLong(28));
+            assertEquals("checksum-11", turn.getString(29));
+            assertEquals("visible", turn.getString(30));
+        } finally {
+            turn.close();
+        }
+        assertEquals(1L, count(db, "conversation_authorities"));
+        android.database.Cursor authority = db.query(
+            "SELECT authorityLineageKey, characterId, laneKey, rootSourceId, latestTurnId, revision, "
+                + "state, visibleGroupId, commitChecksum, commitPayloadVersion, authorityOrigin, "
+                + "terminalDisposition, updatedAt FROM conversation_authorities "
+                + "WHERE authorityLineageKey = 'lineage-11'"
+        );
+        try {
+            assertTrue(authority.moveToFirst());
+            assertEquals("lineage-11", authority.getString(0));
+            assertEquals("yuqi", authority.getString(1));
+            assertEquals("lane-11", authority.getString(2));
+            assertEquals("message-11", authority.getString(3));
+            assertEquals("remote-turn-11", authority.getString(4));
+            assertEquals(2L, authority.getLong(5));
+            assertEquals("COMMITTED", authority.getString(6));
+            assertEquals("group-11", authority.getString(7));
+            assertEquals("checksum-11", authority.getString(8));
+            assertEquals("canonical-v2", authority.getString(9));
+            assertEquals("pc", authority.getString(10));
+            assertEquals("visible", authority.getString(11));
+            assertEquals(104L, authority.getLong(12));
+        } finally {
+            authority.close();
+        }
+        assertEquals("{\"_alBridgeProtocol\":{\"version\":99,\"owner\":\"caller\",\"extra\":true},\"note\":\"原样\"}",
+            stringValue(db, "SELECT snapshotJson FROM chat_turns WHERE turnId = 'turn-11-malformed'"));
+        helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void migration11To12IsRestartStableAndContinuousAfter10To11() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v10-v12-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper10 = createV10Helper(context, databaseName);
+        SupportSQLiteDatabase db10 = helper10.getWritableDatabase();
+        db10.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('turn-10', 'yuqi', 'message-10', 'DIRECT_REPLY', 'QUEUED', '{\"v\":10}', '{\"legacy\":true}', 10, 10)");
+        db10.execSQL("INSERT INTO execution_attempts (attemptId, turnId, sequence, stage, state, startedAt, heartbeatAt, finishedAt, memoryResult, rawReply, errorCode, errorDetail, retryable, crashCount) VALUES ('attempt-10', 'turn-10', 1, 'QUEUED', 'QUEUED', 10, 10, NULL, NULL, NULL, NULL, NULL, 0, 0)");
+        helper10.close();
+
+        SupportSQLiteOpenHelper helper12 = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase db12 = helper12.getWritableDatabase();
+        assertTrue(hasColumn(db12, "execution_attempts", "bridgeAuthorityCheckpointJson"));
+        assertTrue(hasColumn(db12, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertEquals("{\"legacy\":true}", stringValue(db12,
+            "SELECT snapshotJson FROM chat_turns WHERE turnId = 'turn-10'"));
+        assertNull(stringValue(db12,
+            "SELECT bridgeAuthorityCheckpointJson FROM execution_attempts WHERE attemptId = 'attempt-10'"));
+        helper12.close();
+
+        SupportSQLiteOpenHelper reopened = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase reopenedDb = reopened.getWritableDatabase();
+        assertEquals(1L, count(reopenedDb, "chat_turns"));
+        assertEquals(1L, count(reopenedDb, "execution_attempts"));
+        assertTrue(hasColumn(reopenedDb, "execution_attempts", "bridgeAuthorityCheckpointJson"));
+        reopened.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void freshV12SchemaContainsNullableAuthorityCheckpointColumns() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-fresh-v12-" + System.nanoTime();
+        AlExecutionDatabase fresh = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries()
+            .build();
+        SupportSQLiteDatabase db = fresh.getOpenHelper().getWritableDatabase();
+        assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
+        assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
+        assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        fresh.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void newerVersionIsNotSilentlyRepairedOrDowngraded() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-newer-v13-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper12 = createV12UpgradeHelper(context, databaseName);
+        helper12.getWritableDatabase();
+        helper12.close();
+        SupportSQLiteOpenHelper helper13 = new FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(databaseName)
+                .callback(new SupportSQLiteOpenHelper.Callback(13) {
+                    @Override public void onCreate(SupportSQLiteDatabase db) { }
+                    @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
+                })
+                .build()
+        );
+        helper13.getWritableDatabase();
+        helper13.close();
+        AlExecutionDatabase incompatible = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries()
+            .build();
+        try {
+            incompatible.getOpenHelper().getWritableDatabase();
+            fail("v12 must not silently downgrade or repair a newer database");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("downgrade"));
+        } finally {
+            incompatible.close();
+            context.deleteDatabase(databaseName);
+        }
+    }
+
+    @Test
     public void cursorStagesAdvanceMonotonicallyAndIdempotently() {
         store.markNativeCompleted("yuqi", "turn-1", "group-1", 7L, 1000L);
         store.markUiApplied("yuqi", "turn-1", "group-1", 7L, 1100L);
@@ -131,6 +322,87 @@ public class ConversationCursorStoreTest {
         }
     }
 
+    private static String stringValue(SupportSQLiteDatabase db, String sql) {
+        android.database.Cursor cursor = db.query(sql);
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.isNull(0) ? null : cursor.getString(0);
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static SupportSQLiteOpenHelper createV10Helper(Context context, String name) {
+        return new FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(name)
+                .callback(new SupportSQLiteOpenHelper.Callback(10) {
+                    @Override public void onCreate(SupportSQLiteDatabase db) {
+                        createV10Tables(db);
+                    }
+                    @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
+                })
+                .build()
+        );
+    }
+
+    private static SupportSQLiteOpenHelper createV11Helper(Context context, String name) {
+        return new FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(name)
+                .callback(new SupportSQLiteOpenHelper.Callback(11) {
+                    @Override public void onCreate(SupportSQLiteDatabase db) {
+                        createV10Tables(db);
+                        AlExecutionDatabase.MIGRATION_10_11.migrate(db);
+                    }
+                    @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
+                })
+                .build()
+        );
+    }
+
+    private static SupportSQLiteOpenHelper createV12UpgradeHelper(Context context, String name) {
+        return new FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(name)
+                .callback(new SupportSQLiteOpenHelper.Callback(12) {
+                    @Override public void onCreate(SupportSQLiteDatabase db) {
+                        createV10Tables(db);
+                        AlExecutionDatabase.MIGRATION_10_11.migrate(db);
+                        AlExecutionDatabase.MIGRATION_11_12.migrate(db);
+                    }
+                    @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) {
+                        if (oldVersion == 10) AlExecutionDatabase.MIGRATION_10_11.migrate(db);
+                        if (oldVersion <= 11) AlExecutionDatabase.MIGRATION_11_12.migrate(db);
+                    }
+                })
+                .build()
+        );
+    }
+
+    private static void createV10Tables(SupportSQLiteDatabase db) {
+        db.execSQL("CREATE TABLE `chat_turns` ("
+            + "`turnId` TEXT NOT NULL, `characterId` TEXT NOT NULL, `sourceMessageId` TEXT NOT NULL, "
+            + "`cloudJobId` TEXT, `kind` TEXT NOT NULL, `state` TEXT NOT NULL, `activeAttemptId` TEXT, "
+            + "`inputJson` TEXT NOT NULL, `snapshotJson` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, "
+            + "`updatedAt` INTEGER NOT NULL, `completedAt` INTEGER, `notificationShownAt` INTEGER, "
+            + "`uiAppliedAt` INTEGER, `cloudConfirmedAt` INTEGER, `cancelledAt` INTEGER, `deletedAt` INTEGER, "
+            + "PRIMARY KEY(`turnId`))");
+        db.execSQL("CREATE TABLE `execution_attempts` ("
+            + "`attemptId` TEXT NOT NULL, `turnId` TEXT NOT NULL, `sequence` INTEGER NOT NULL, "
+            + "`stage` TEXT NOT NULL, `state` TEXT NOT NULL, `startedAt` INTEGER NOT NULL, "
+            + "`heartbeatAt` INTEGER NOT NULL, `finishedAt` INTEGER, `memoryResult` TEXT, `rawReply` TEXT, "
+            + "`errorCode` TEXT, `errorDetail` TEXT, `retryable` INTEGER NOT NULL, `crashCount` INTEGER NOT NULL, "
+            + "PRIMARY KEY(`attemptId`))");
+    }
+
+    private static void insertPopulatedV11History(SupportSQLiteDatabase db) {
+        db.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, cloudJobId, kind, state, activeAttemptId, inputJson, snapshotJson, createdAt, updatedAt, completedAt, notificationShownAt, uiAppliedAt, cloudConfirmedAt, cancelledAt, deletedAt, visibleGroupId, authorityLineageKey, authorityOrigin, commitPayloadVersion, lineageRevision, turnRevision, laneKey, laneRevision, generationFingerprint, pipelineReleaseId, inputVisibilitySequence, inputClearEpoch, bridgeCommitChecksum, terminalDisposition) VALUES ('turn-11', 'yuqi', 'message-11', 'cloud-11', 'DIRECT_REPLY', 'FAILED_FINAL', 'attempt-11', '{\"message\":\"历史\"}', '{\"scene\":\"旧快照\"}', 1, 2, 3, 4, 5, 6, 7, NULL, 'group-11', 'lineage-11', 'pc', 'canonical-v2', 2, 4, 'lane-11', 8, 'fingerprint-11', 'release-11', 9, 3, 'checksum-11', 'visible')");
+        db.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('turn-11-malformed', 'yuqi', 'message-11-malformed', 'DIRECT_REPLY', 'QUEUED', '{\"message\":\"保留\"}', '{\"_alBridgeProtocol\":{\"version\":99,\"owner\":\"caller\",\"extra\":true},\"note\":\"原样\"}', 11, 11)");
+        db.execSQL("INSERT INTO execution_attempts (attemptId, turnId, sequence, stage, state, startedAt, heartbeatAt, finishedAt, memoryResult, rawReply, errorCode, errorDetail, retryable, crashCount) VALUES ('attempt-11', 'turn-11', 7, 'FINISHED', 'FAILED_FINAL', 101, 102, 103, '{\"legacyMemory\":\"保留\"}', 'raw-bytes-\uD83C\uDF27\uFE0F', 'OLD_ERROR', '旧失败', 0, 4)");
+        db.execSQL("INSERT INTO conversation_authorities (authorityLineageKey, characterId, laneKey, rootSourceId, latestTurnId, revision, state, visibleGroupId, commitChecksum, commitPayloadVersion, authorityOrigin, terminalDisposition, updatedAt) VALUES ('lineage-11', 'yuqi', 'lane-11', 'message-11', 'remote-turn-11', 2, 'COMMITTED', 'group-11', 'checksum-11', 'canonical-v2', 'pc', 'visible', 104)");
+    }
+
     private static boolean hasTable(SupportSQLiteDatabase db, String table) {
         android.database.Cursor cursor = db.query(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '" + table + "'"
@@ -149,6 +421,20 @@ public class ConversationCursorStoreTest {
                 if (column.equals(cursor.getString(cursor.getColumnIndexOrThrow("name")))) return true;
             }
             return false;
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static boolean columnIsNotNull(SupportSQLiteDatabase db, String table, String column) {
+        android.database.Cursor cursor = db.query("PRAGMA table_info(`" + table + "`)");
+        try {
+            while (cursor.moveToNext()) {
+                if (column.equals(cursor.getString(cursor.getColumnIndexOrThrow("name")))) {
+                    return cursor.getInt(cursor.getColumnIndexOrThrow("notnull")) != 0;
+                }
+            }
+            throw new AssertionError("missing column " + table + "." + column);
         } finally {
             cursor.close();
         }
