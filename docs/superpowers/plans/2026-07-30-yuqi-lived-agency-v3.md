@@ -32,7 +32,7 @@
 - One SQLite row per TurnKind in `cognition_kind_rollouts` remains the current rollout authority. History tables are append-only audit, never current-state authority.
 - Stable/candidate release IDs and checksums, not the old words `legacy/cognition`, decide which implementation is visible.
 - Low-frequency TurnKinds without genuine live evidence remain shadow and must be reported as such. Do not claim that all kinds are active.
-- PC runtime migrations are the already-completed base `user_version 9 → 10` in Task 2 and the mandatory final-result-authority `10 → 11` in Task 10. Android Room independently migrates `10 → 11`; the equal final number is coincidental and the two version domains must never be conflated. Every path must be transactional, idempotent, and covered by populated-database migration tests.
+- PC runtime migrations are the already-completed base `user_version 9 → 10` in Task 2 and the mandatory final-result-authority `10 → 11` in Task 10. Android Room independently migrates `10 → 11` in Task 12 and `11 → 12` in Task 13C; equal version numbers in either domain are coincidental and the two version domains must never be conflated. Every path must be transactional, idempotent, and covered by populated-database migration tests.
 - Determine the APK version from the maximum version in source, update channel, releases, and local formal artifacts at execution time. It must be greater than `1.0.108`; do not assume a fixed number before Task 26.
 - Formal delivery follows `docs/AL-android-signing-runbook.md`. Package `com.siyi.al`, signer SHA-256 `5761277e3bdf4a64236c3bad569de6a07666581f643167d01e37f13e9e832b2b`, version, OTA URL, and final APK SHA-256 must all be independently verified.
 - Preserve unrelated dirty-worktree changes. Stage and commit only the files named by the current task.
@@ -7057,6 +7057,7 @@ git commit -m "feat: integrate plans life and formal relationship stages"
 - Modify: `tavern-app/index.html`
 - Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java`
 - Modify: `yuqi-runtime/test/consolidation-worker.test.mjs`
 - Modify: `yuqi-runtime/test/evidence-memory.test.mjs`
@@ -7064,13 +7065,15 @@ git commit -m "feat: integrate plans life and formal relationship stages"
 - Modify: `yuqi-runtime/test/cloud-relay-pump.test.mjs`
 - Modify: `yuqi-runtime/test/result-outbox.test.mjs`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
+- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
+- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java`
 - Modify: `scripts/backup-yuqi-memory.mjs`
 - Modify: `scripts/audit-yuqi-memory.mjs`
 
 **Interfaces:**
 - Consumes: committed canonical terminal results and source evidence only; an
   automatic skip is completion evidence but never message/fact evidence.
-- Produces: evidence-only facts/preferences/events; explicit new-table behavior for backup/export/import/clear/delete; monotonic encrypted `conversation_clear_v1` control; durable PC relay retraction; Android late-result suppression.
+- Produces: evidence-only facts/preferences/events; explicit new-table behavior for backup/export/import/clear/delete; monotonic encrypted `conversation_clear_v1` control; durable PC relay retraction; Android late-result suppression; transactional tombstoning of Task 13C Room-v12 bridge-authority checkpoints.
 
 - [ ] **Step 1: Write red memory allowlist and lifecycle tests**
 
@@ -7127,6 +7130,8 @@ test('clear operations preserve or redact canonical v13 authority explicitly', (
     'scrub_and_exclude_from_recovery_and_outbox');
   assert.equal(matrix.clearChat.actions.redaction_delivery_commitments,
     'freeze_pre_clear_delivery_set_before_payload_clear');
+  assert.equal(matrix.clearChat.actions.android_bridge_authority_checkpoints,
+    'tombstone_semantic_envelope_failure_result_route_and_relay_retain_identity_commitment');
   assert.deepEqual(matrix.clearChat.rowDeletes.sort(),
     ['annotations_by_turn', 'diagnostics_by_turn', 'sessions_by_role',
      'sync_log_by_turn_or_message'].sort());
@@ -7208,14 +7213,23 @@ Withdrawn/deleted messages are removed from future retrieval; dependent stance/c
 The clear-chat implementation must use the Task 10F transaction order and scoped
 redacted validator before commit. It may not implement a second, weaker
 redaction path in the UI or backup layer.
+For Android Room v12, the same native clear transaction rewrites every affected
+attempt's `bridgeAuthorityCheckpointJson` to the closed Task 13C redacted
+tombstone and CASes its checksum. The tombstone retains only local turn/attempt
+identity, attempt sequence, remote-member identity, lineage/lane/clear-epoch
+commitments, and redaction time. It clears `normalizedEnvelope`, failure text,
+canonical result items/actions, authenticated route, and relay message ID. A
+one-sided or changed checkpoint/checksum aborts the clear before reply/action or
+cursor deletion; no legacy `memoryResult` parser may perform this lifecycle.
 
 The distributed clear flow is fixed:
 
 1. `clearCurrentChat()` first calls native
    `markConversationCleared(characterId, localSequence, clearEpoch+1)`. Room
-   atomically advances the cursor, clears local reply/action rows through the
-   sequence, and persists one outbound `conversation_clear_v1` control before
-   JavaScript deletes its local chat objects.
+   atomically validates and tombstones affected v12 bridge checkpoints, advances
+   the cursor, clears local reply/action rows through the sequence, and persists
+   one outbound `conversation_clear_v1` control before JavaScript deletes its
+   local chat objects.
 2. `BridgeRouter` sends the same encrypted control through LAN
    `POST /v3/controls/conversation-clear` or cloud `phone_to_pc`. The control ID
    and checksum remain stable across retries; each relay enqueue has a fresh
@@ -7257,6 +7271,7 @@ Run:
 node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs
 cd android
 .\gradlew.bat testDebugUnitTest --tests "*BridgeRouterTest" --no-daemon --no-problems-report
+.\gradlew.bat assembleDebugAndroidTest --no-daemon --no-problems-report
 cd ..
 node scripts/audit-yuqi-memory.mjs yuqi-runtime/config.json
 ```
@@ -7270,7 +7285,7 @@ any retained item/action/batch/attempt/delivery tombstone is detected.
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add yuqi-runtime/src/consolidation-worker.mjs yuqi-runtime/src/evidence-memory.mjs yuqi-runtime/src/retrieval.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/src/result-outbox.mjs tavern-app/index.html android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java scripts/backup-yuqi-memory.mjs scripts/audit-yuqi-memory.mjs
+git add yuqi-runtime/src/consolidation-worker.mjs yuqi-runtime/src/evidence-memory.mjs yuqi-runtime/src/retrieval.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/src/result-outbox.mjs tavern-app/index.html android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java scripts/backup-yuqi-memory.mjs scripts/audit-yuqi-memory.mjs
 git commit -m "feat: constrain Yuqi memory and agency lifecycle"
 ```
 
@@ -8380,7 +8395,7 @@ No source commit is expected in this task. Database changes and generated eviden
 Execute Tasks 0–27 in order. The central window may continue automatically after an ordinary red test becomes green. It must stop immediately when any of these is true:
 
 1. The baseline cannot identify the actual visible stable implementation and checksum.
-2. A PC v9→10→11→12→13→14 or Android Room 10→11 migration loses or reclassifies data without exact evidence.
+2. A PC v9→10→11→12→13→14 or Android Room 10→11→12 migration loses or reclassifies data without exact evidence.
 3. A required TurnKind lacks an adapter, structural-action domain, or quality coverage.
 4. Android v3 fallback and PC v3 assign different authority or state meaning.
 5. A comparison path can commit a visible action, message, state, fact, outbox item, or notification.
@@ -8442,7 +8457,7 @@ After this design window amends the authoritative plan, the central window rerea
 - [ ] Six-dimensional gate and pairwise stable/candidate comparison are eligible.
 - [ ] Every TurnKind and life planning has adapter, structured-domain, recovery, and rollout evidence.
 - [ ] All 18 lane/delivery/retry/fallback/restart/head-of-line races pass.
-- [ ] Android Room v11 migration, v1/v2/v3 fallback, event/poll/replay, and four delivery stages pass.
+- [ ] Android Room populated 10→11→12 migration, v1/v2/v3 fallback, event/poll/replay, v12 checkpoint redaction, and four delivery stages pass.
 - [ ] Full Node and Android test suites pass.
 - [ ] Production stable/candidate state is explicit; non-active kinds are listed.
 - [ ] Formal APK package/version/signature/certificate/SHA-256 pass.

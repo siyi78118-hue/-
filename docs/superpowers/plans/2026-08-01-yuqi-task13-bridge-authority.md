@@ -834,6 +834,8 @@ git commit -m "feat: project canonical bridge results across transports"
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngineStore.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/ExecutionAttemptEntity.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeResult.java`
@@ -851,6 +853,7 @@ git commit -m "feat: project canonical bridge results across transports"
 - Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java`
+- Create: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeTurnStatusTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
 - Create: `android/app/src/test/java/com/siyi/al/execution/bridge/CanonicalFailureStatusTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
@@ -883,6 +886,88 @@ Room turn/attempt writes, diagnostics, and raw user projection use only local
 authorized remote child has a different key and cannot be deduplicated as its
 parent.
 
+Task 13C deliberately advances Android Room from v11 to v12. It does not reuse
+`ExecutionAttemptEntity.memoryResult`, `rawReply`, `ChatTurnEntity.inputJson`, or
+`snapshotJson` as the authority store. `memoryResult` remains the legacy/model or
+legacy-bridge checkpoint field; bridge-v3 authority is held in two new nullable
+attempt columns:
+
+- `bridgeAuthorityCheckpointJson`: canonical closed JSON for the attempt's
+  prepared remote member and its later verified outcome;
+- `bridgeAuthorityCheckpointChecksum`: lowercase SHA-256 of the recursive
+  lexicographic UTF-8 canonical JSON bytes.
+
+Both columns are null for every migrated v11 row and for every v0/v2 attempt.
+They are written and changed together by exact-checksum CAS inside the same Room
+transaction as the cursor/authority/turn transition. A one-sided value, a bad
+checksum, an unknown key, or a checkpoint whose local turn, attempt, sequence,
+lineage, remote member, pinned envelope, or outcome does not match the joined
+Room rows is `BRIDGE_AUTHORITY_CONFLICT` before any network or visible write.
+`MIGRATION_11_12` only adds these columns and does not add a bridge marker,
+fabricate an authority member, or reinterpret historical turns.
+Task 20 lifecycle/redaction must treat the v12 checkpoint as an authority-bearing
+copy of turn input: clear/delete/retraction rewrites it to a closed metadata
+tombstone in the same transaction as the turn and cursor clear. It may not leave
+`normalizedEnvelope`, failure text, receipt items/actions, route, or relay data
+retrievable after the corresponding authority is redacted.
+
+The checkpoint is version 1 and always has the exact top-level keys
+`version`, `localTurnId`, `attemptId`, `attemptSequence`,
+`authoritativeTurnId`, `authorityLineageKey`, `claimedLineageRevision`,
+`retryOfTurnId`, `laneKey`, `inputVisibilitySequence`, `inputClearEpoch`,
+`normalizedEnvelope`, `envelopeChecksum`, and `outcome`. Optional values are
+explicit JSON null rather than omitted. `outcome` is a closed tagged union:
+`open`, `verified_remote_failure`, `committed`, or `redacted`.
+`retryOfTurnId` is always the remote authoritative parent ID from the parent
+checkpoint, never the local Room turn ID; the local attempt relationship is the
+shared `localTurnId` plus attempt sequence.
+
+Every outcome object has exactly the keys `type`, `route`, `relayMessageId`,
+`failure`, `result`, and `redactedAt`, with unused members present as JSON null:
+
+- `open`: every member except `type` is null;
+- `verified_remote_failure`: `route` is `lan` or `cloud`, `relayMessageId` is
+  null for LAN and the authenticated relay ID for cloud, `failure` is the exact
+  closed Task 13B `BACKLOG_FAILED` object including `rawStatusChecksum`, and
+  `result`/`redactedAt` are null;
+- `committed`: `route`/`relayMessageId` follow the same transport rule,
+  `result` is exactly the Task 13B canonical v3 result object with the 19 keys
+  from `CANONICAL_RESULT_KEYS`, including ordered `replyParts` and `actions`,
+  and `failure`/`redactedAt` are null;
+- `redacted`: `route`/`relayMessageId` follow the same transport rule,
+  `result` is a metadata-only receipt identity with exactly
+  `protocolVersion`, `turnId`, `roleId`, `authorityOrigin`,
+  `authorityLineageKey`, `visibleGroupId`, `lineageRevision`, `turnRevision`,
+  `laneKey`, `laneRevision`, `inputVisibilitySequence`, `inputClearEpoch`,
+  `generationFingerprint`, `releaseId`, `commitPayloadVersion`,
+  `commitChecksum`, and `terminalDisposition`; `failure` is null and
+  `redactedAt` is the native safe-integer local redaction time. It retains no
+  reply text, item/action payload, or semantic checksum.
+
+Transport metadata never enters the Task 13B raw-status or commit checksum.
+Every update validates and re-hashes the whole checkpoint before its CAS. A
+committed outcome may contain a result `turnId` different from that attempt's
+top-level `authoritativeTurnId` only through the earlier-member convergence rule
+defined below; no other outcome may cross members.
+
+The store-owned v3 marker is also frozen. `RoomExecutionStore.submitTurn()`
+removes any caller-supplied top-level `_alBridgeProtocol` value before lookup or
+insert. Only a newly inserted `characterId == "yuqi"` turn receives exactly
+`"_alBridgeProtocol":{"version":3,"owner":"room-v12"}` in its persisted
+snapshot. Existing rows are returned without backfill, and non-Yuqi rows remain
+unmarked. Preparation trusts only that exact persisted object; malformed,
+extended, caller-owned, or historical snapshots remain v2.
+
+Task 13C uses three implementation slices with explicit stop gates. Slice C1
+owns the pure identity/checksum/closed-wire DTOs and tests. Slice C2 owns the
+Room v12 migration, store marker, pre-route preparation, checkpoint CAS, cursor,
+and authority state. Slice C3 owns parsing, the one terminal applier, router,
+cloud/LAN integration, plugin/service lifecycle, and notification policy. C2
+must consume the frozen C1 API; C3 starts only after C1 and C2 interfaces pass
+their focused gates. No two slices may concurrently modify
+`TurnSubmission`, `ExecutionEngineStore`, `RoomExecutionStore`,
+`AlExecutionDao`, `BridgeClient`, `ExecutionEngine`, or `RoomBridgeMirror`.
+
 - [ ] **Step 1: Write Android red tests for identities and outbound preparation**
 
 `AuthorityIdentityTest` must load every vector in
@@ -913,6 +998,13 @@ calling an `ExecutionEngineStore` writer.
   normalized and accepted only for the first-v3 bootstrap;
 - every automatic kind maps its completed local `cloud_*`/`plan_*` native and UI
   anchors to the historical PC wire IDs, including different anchors and restart.
+- v11→v12 migration preserves populated turns/attempts byte-for-byte, adds both
+  nullable checkpoint columns, leaves them null, is reopen-stable, and never
+  adds the store-owned v3 marker to a historical snapshot;
+- a fresh v12 database rejects a one-sided checkpoint/checksum, a bad checksum,
+  an unknown checkpoint/outcome key, and a checkpoint joined to the wrong local
+  turn, attempt sequence, lineage, or remote member before cursor/authority
+  writes.
 
 There is no caller-controlled “cognition-v3 snapshot” flag. On insert,
 `RoomExecutionStore.submitTurn()` removes any caller-supplied internal bridge
@@ -954,9 +1046,11 @@ Immediately before `gateway.executeBridgeTurn`, `ExecutionEngine` calls
    Unknown-outcome replay performs no CAS.
 6. Pin lineage, lane, input sequence, and clear epoch on `ChatTurnEntity`.
 7. Persist the exact per-attempt remote ID/claim and immutable normalized
-   envelope checksum/fields in a metadata-only bridge checkpoint on
-   `ExecutionAttemptEntity`; this is the replay/member mapping and is not model
-   memory.
+   envelope checksum/fields in the dedicated v12
+   `bridgeAuthorityCheckpointJson` plus
+   `bridgeAuthorityCheckpointChecksum` columns on `ExecutionAttemptEntity`;
+   this is the replay/member mapping and is never read through or written by
+   model-memory or legacy bridge checkpoint APIs.
 8. Return a `TurnSubmission` whose `BridgeAuthority` and envelope use the remote
    authoritative ID while retaining the local ID for Room execution.
 
@@ -1009,11 +1103,17 @@ Use distinct result values `lineage=2`, `turn=4`, `lane=8`. Cover:
   restart without coercion; missing, false, null, numeric, and string variants
   do not authorize a child. Changing only this field changes the raw-status
   checksum and conflicts with an already persisted proof.
+- `BridgeTurnStatus.parseV3` and the cloud parser accept only the same closed
+  immutable DTO: native protocol/type/booleans/integers, exact identity and
+  receipt/failure key sets, ordered items/actions, and exact Task 13B checksum.
+  Unknown keys, `opt*` coercions, mixed result/failure shapes, or transport
+  fields inside authority tuples are rejected before any store writer. V2 keeps
+  its exact requested-turn check and byte-compatible parser.
 
 Run red:
 
 ```powershell
-.\gradlew.bat testDebugUnitTest --tests "*ExecutionEngineTest" --tests "*BridgeClientTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*BridgeReceiptCheckpointTest" --tests "*AlNotificationPolicyTest" --no-daemon --no-problems-report
+.\gradlew.bat testDebugUnitTest --tests "*ExecutionEngineTest" --tests "*BridgeClientTest" --tests "*BridgeTurnStatusTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*BridgeReceiptCheckpointTest" --tests "*AlNotificationPolicyTest" --no-daemon --no-problems-report
 .\gradlew.bat assembleDebugAndroidTest --no-daemon --no-problems-report
 ```
 
@@ -1029,6 +1129,15 @@ v2 behavior remains unchanged. `BridgeRouter` does not pre-write a v3 reply
 through `RoomBridgeMirror`; legacy mirror behavior remains for authority-version
 0/v2 only. Once a v3 claim is pinned, LAN/cloud failure may not route to or
 commit legacy fallback.
+
+`BridgeResult` is a closed discriminated result rather than a bag of legacy
+reply fields. A v3 value is exactly one of `canonical_terminal` or
+`verified_remote_failure`; it carries the parsed immutable tuple, ordered
+items/actions, raw authenticated response, route, and nullable relay message ID.
+Legacy v2 values retain their existing fields and behavior. LAN and encrypted
+cloud call the same parser and produce the same DTO; neither path may infer a
+terminal kind from reply text, HTTP status, `allowFallback`, or local retry
+policy.
 
 A parsed v3 PC terminal failure is a separate closed
 `verified_remote_failure` result, never inferred from `BridgeFinalException`, an
@@ -1082,6 +1191,36 @@ consumes that authority once.
    advance `nativeCompleted`.
 4. For exact replay, compare every field and return the stored disposition.
 5. For changed replay, throw `BRIDGE_AUTHORITY_CONFLICT` before writes.
+
+That transaction first validates the v12 attempt checkpoints and uses their
+accepted remote-member set. It never searches by a guessed `turn_*`,
+`cloud_*`, or `plan_*` string. Cloud backlog first resolves exactly one local
+turn by `ChatTurnEntity.authorityLineageKey`, then groups that turn's attempt
+checkpoints by `authoritativeTurnId`. Duplicate checkpoints for an
+unknown-outcome replay are legal only when every immutable remote-member field
+and envelope checksum is byte-identical; the earliest attempt sequence is the
+canonical member checkpoint. Zero local matches, multiple local matches, no
+member match, or divergent duplicates remains unacknowledged and writes one
+bounded redacted diagnostic.
+
+`commitBridgedTerminal(localTurnId, activeAttemptId, result, now)` validates the
+receipt against the canonical checkpoint for `result.turnId`, not blindly
+against the currently active attempt's remote ID. It separately verifies that
+`activeAttemptId` is the active attempt of the same local turn and that its
+checkpoint is a valid open member of the same lineage. It then finalizes that
+active attempt, stores the committed outcome there, and converges
+`ConversationAuthority` to the result's real committed member and revisions.
+Thus a PC committed-retry fast path may return a previously requested member;
+zero/multiple member matches, any receipt/member-field difference, a foreign
+active attempt, or a changed lineage is `BRIDGE_AUTHORITY_CONFLICT` before
+writes. If the result member and active member are the same, both validations
+resolve to the same checkpoint.
+
+The `redacted` outcome in Task 13C is only the immediate old-clear-epoch result
+path described above. It writes the closed metadata receipt identity and no
+semantics. It does not invoke or partially implement Task 20 lifecycle clearing;
+Task 20 later rewrites every remaining live checkpoint copy during explicit
+clear/delete/retraction.
 
 Branch to this v3 transaction immediately after the gateway returns and before
 `saveMemoryResult`, `markStage(CHAT_RUNNING)`, `saveRawReply`, `commitReply`, or
