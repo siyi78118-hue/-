@@ -849,6 +849,7 @@ git commit -m "feat: project canonical bridge results across transports"
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java`
 - Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
+- Create: `android/app/src/main/java/com/siyi/al/execution/BridgeReceiptDeliveryCoordinator.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/AlNotificationPolicy.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java`
 - Create: `android/app/src/test/java/com/siyi/al/execution/AuthorityIdentityTest.java`
@@ -860,13 +861,26 @@ git commit -m "feat: project canonical bridge results across transports"
 - Create: `android/app/src/test/java/com/siyi/al/execution/bridge/CanonicalFailureStatusTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/AlNotificationPolicyTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionServicePolicyTest.java`
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java`
+- Modify: `tavern-app/index.html`
+- Create: `tavern-app/lib/canonical-action-application.js`
+- Modify: `tavern-app/lib/role-plan-domain.js`
+- Modify: `tavern-app/lib/role-plan-repository.js`
+- Create: `tests/canonical-action-application.test.mjs`
+- Modify: `tests/yuqi-ui-contract.test.mjs`
+- Modify: `tests/role-plan-domain.test.mjs`
+- Modify: `tests/role-plan-repository.test.mjs`
 - Modify: `tests/fixtures/authority-identity-v1.json`
 - Modify: `tests/fixtures/canonical-failure-status-v1.json`
+- Create: `tests/fixtures/canonical-raw-message-v1.json`
 - Modify: `tests/payment-batch-bridge-contract.test.mjs`
+- Modify: `package.json`
 - Modify: `yuqi-runtime/src/authority-identity.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/test/bridge-authority-v3.test.mjs`
+- Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
 
 **Interfaces:**
 
@@ -1142,6 +1156,28 @@ Use distinct result values `lineage=2`, `turn=4`, `lane=8`. Cover:
 
 - visible with three items;
 - action-only with two actions and zero text;
+- a sixteen-kind table that freezes the exact action type and
+  `{version,canonicalAction,legacyPayload}` wrapper; prefix lookalikes,
+  duplicate single-value compatibility actions, wrapper drift, and
+  message/action identity collision all fail before writes;
+- direct, proactive, and moment UI application paths route every canonical
+  action through one closed applier before any chat/moment/pending-state
+  mutation. Supported actions write exact persistent application proofs;
+  reserved/unknown/conflicting actions return not-applied, perform no Web UI
+  acknowledgement, and therefore cannot trigger the Android receipt sender;
+- PC target resolution uses only `planId`, `targetEpisodeId`, and
+  `replyToCommentId` for the three non-create namespaces. The former
+  `rolePlanId`, `episodeId`, and `commentId` names fail rather than becoming
+  alternate wire aliases;
+- three visible items create three exact raw character messages under one
+  `pc-group:<groupId>` device namespace with sequence 1/2/3, stable derived
+  `sentAt`, full eleven-field checksum, and `syncSeq=0`; a second group with the
+  same source time does not collide, while any occupied ID/device tuple or
+  missing/extra/changed row conflicts across restart;
+- Node and Android load `canonical-raw-message-v1.json`, whose hard-coded
+  canonical text and SHA-256 include Chinese, emoji, slash, newline, and control
+  characters. They prove the eleven-field raw checksum is cross-language stable
+  and intentionally differs from the canonical visible-item checksum;
 - automatic skip with zero items/actions;
 - direct skip rejection;
 - every receipt field changed one at a time;
@@ -1153,12 +1189,44 @@ Use distinct result values `lineage=2`, `turn=4`, `lane=8`. Cover:
 - old `inputClearEpoch` with a larger sequence is REDACTED, creates no reply/
   action row, does not advance native completion, and is not returned in the UI
   completion inbox;
+- an earlier-member result may advance a lagging native watermark while
+  preserving a newer local sequence; equal sequence with a different identity
+  conflicts and a newer native/UI watermark never moves backwards;
 - a fault after each write boundary rolls back receipt, attempt, parts/actions,
   raw message projection, conversation authority, and cursor;
 - skip never reaches `AlNotificationFactory`; visible retains notification;
 - the cross-stack contract proves the notification guard occurs after completion
   event/receipt/continuations but before notification ID/text/factory calls;
 - plugin `turnResult` exposes all receipt fields and stored relay metadata.
+- Web action-only applies supported payment, moment, relationship, and role-plan
+  actions exactly once across reload and only then calls the idempotent native
+  `acknowledgeUiApplied`. Missing target, rejected operation, changed proof, unknown kind,
+  `MOMENT_CREATE`, and every `life_episode_*` kind perform no success-state
+  mutation and publish no receipt; a fault after one supported action resumes the
+  remaining exact actions without replaying the proven one;
+- two canonical role-plan actions against the same plan, including identical
+  consecutive updates and pause/resume, persist distinct actionId/checksum
+  proofs with the plan state in one `role_plans_v1` write. A crash before the
+  history projection or global UI proof is repaired with `historyId=actionId`
+  without repeating either operation; create-dedup writes the proof on the
+  reused plan. Legacy create/update attempts to inject or overwrite the reserved
+  ledger are rejected and never authorize canonical replay;
+- payment decline fault injection after the settings wallet/journal write but
+  before the chat target write, and after the chat write but before the global
+  UI proof, preserves one exact integer-cent refund. Exact replay repairs the
+  missing projection and emits payment chat/memory effects once, while changed
+  action/target/revision/amount conflicts. Replaying the old action after a later
+  recharge or unrelated payment remains a no-op and preserves both balances;
+- the executable canonical-action harness throws after every injected store
+  boundary, constructs a new applier over the same state, and proves whole-set
+  preflight, partial resume, exact per-domain proof recovery, and one persisted
+  native UI transition under ambiguous repeated acknowledgement. It has no Web
+  receipt sender. Static source-contract tests cannot satisfy this gate;
+- Android service tests prove UI-not-applied sends zero group receipts; the first
+  applied state sends one; repeated Web acknowledgement, service restart, and
+  event/poll duplication do not create a second authoritative receipt. A network
+  retry keeps the same group/idempotency identity, and successful confirmation
+  persists `cloudConfirmedAt` before further service retries stop;
 - v3 LAN/cloud failure never commits a legacy fallback result; the pinned turn
   remains recoverable until Task 14 supplies an authority-preserving fallback.
 - LAN and cloud verified PC terminal failure, then restart and retry, creates one
@@ -1178,7 +1246,9 @@ Use distinct result values `lineage=2`, `turn=4`, `lane=8`. Cover:
 Run red:
 
 ```powershell
-.\gradlew.bat testDebugUnitTest --tests "*ExecutionEngineTest" --tests "*BridgeClientTest" --tests "*BridgeTurnStatusTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*BridgeReceiptCheckpointTest" --tests "*AlNotificationPolicyTest" --no-daemon --no-problems-report
+node --test yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/bridge-authority-v3.test.mjs tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs tests/canonical-action-application.test.mjs tests/payment-batch-bridge-contract.test.mjs tests/yuqi-ui-contract.test.mjs
+cd android
+.\gradlew.bat testDebugUnitTest --tests "*ExecutionEngineTest" --tests "*BridgeClientTest" --tests "*BridgeTurnStatusTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*BridgeReceiptCheckpointTest" --tests "*AlNotificationPolicyTest" --tests "*ExecutionServicePolicyTest" --no-daemon --no-problems-report
 .\gradlew.bat assembleDebugAndroidTest --no-daemon --no-problems-report
 ```
 
@@ -1263,13 +1333,18 @@ accepted remote-member set. It never searches by a guessed `turn_*`,
 turn by `ChatTurnEntity.authorityLineageKey`, then groups that turn's attempt
 checkpoints by `authoritativeTurnId`. Duplicate checkpoints for an
 unknown-outcome replay are legal only when every immutable remote-member field
-and envelope checksum is byte-identical; the earliest attempt sequence is the
-canonical member checkpoint. Zero local matches, multiple local matches, no
-member match, or divergent duplicates remains unacknowledged and writes one
-bounded redacted diagnostic.
+and envelope checksum is byte-identical. The earliest attempt sequence owns the
+deterministic remote-member identity. Repeated `open` outcomes may coexist; if a
+terminal outcome exists for that remote member, it must be unique or
+canonical-JSON byte-identical across duplicates and that terminal checkpoint is
+the member's authority proof when walking the distinct-member chain. A later
+terminal proof must never be discarded merely because an earlier local attempt
+for the same remote member remained `open`. Zero local matches, multiple local
+matches, no member match, or divergent duplicates remains unacknowledged and
+writes one bounded redacted diagnostic.
 
 `commitBridgedTerminal(localTurnId, activeAttemptId, result, now)` validates the
-receipt against the canonical checkpoint for `result.turnId`, not blindly
+receipt against the canonical checkpoint for `result.authoritativeTurnId`, not blindly
 against the currently active attempt's remote ID. It separately verifies that
 `activeAttemptId` is the active attempt of the same local turn and that its
 checkpoint is a valid open member of the same lineage. It then finalizes that
@@ -1293,15 +1368,221 @@ Branch to this v3 transaction immediately after the gateway returns and before
 owns its receipt/checkpoint, attempt state, change/diagnostic rows, parts/actions,
 raw-message projections, authority and cursor together.
 
-Projection is exact and collision-free: visible items become `ReplyPartEntity`
+Projection is exact and collision-free. Visible items become `ReplyPartEntity`
 rows with `replyPartId=canonical messageId`, sequence `0..itemCount-1`, type
-`TEXT`, exact content, and canonical metadata payload; they alone create
-`RawMessageEntity` rows using the canonical message ID and remote authoritative
-turn ID. Actions become reply parts with `replyPartId=canonical actionId`,
-sequence `itemCount..itemCount+actionCount-1`, empty content, a closed
-kind-to-type map, and canonical semantic payload. Actions never create raw chat
-messages. Validate item and action counts, ordinals, IDs, semantic checksums, and
-sets separately across restart; a total-count-only check is forbidden.
+`TEXT`, exact content, and a closed canonical metadata payload. They alone create
+`RawMessageEntity` rows. For item ordinal `i`, derive the row only from the
+validated result and the unique receipt-member checkpoint:
+
+- `messageId=replyPart.messageId`, `turnId=result.authoritativeTurnId`,
+  `characterId=result.roleId`, and speaker/recipient/content are copied exactly;
+- `origin=result.authorityOrigin`, which is exactly `pc` for this contract;
+- `deviceId="pc-group:" + result.visibleGroupId`, `deviceSeq=i+1`, and
+  `syncSeq=0`; every group therefore owns a separate collision-free device
+  namespace and PC-authored character replies are not echoed through the
+  fallback journal;
+- let `baseSentAt=min(checkpoint.normalizedEnvelope.createdAt,
+  Number.MAX_SAFE_INTEGER-(itemCount-1))`; require a positive safe integer and
+  persist `sentAt=baseSentAt+i`;
+- `checksum` is SHA-256 over canonical JSON for exactly the eleven persisted
+  fields `messageId,turnId,characterId,speakerId,speakerType,recipientId,
+  content,sentAt,origin,deviceId,deviceSeq`. It is deliberately distinct from the
+  canonical item's richer `itemChecksum`.
+
+Do not treat `INSERT IGNORE` as idempotency. Before any write, reject an existing
+foreign row occupying either `messageId` or `(deviceId,deviceSeq)`. Exact replay
+and restart reopen the complete character-message set for the remote turn and
+recompute count, IDs, ordinals, fields, and checksums. Missing, extra, or changed
+rows conflict. Actions never create raw chat messages.
+
+Every canonical action becomes one `ReplyPartEntity` with
+`replyPartId=actionId`, sequence `itemCount+ordinal`, empty content, and
+`payloadJson=canonicalJson({version:1,canonicalAction,legacyPayload})`. The
+`canonicalAction` object contains exactly
+`actionId,ordinal,kind,targetKey,targetRevision,payload,actionChecksum` and is the
+only authority source. `legacyPayload` is a deterministic compatibility
+projection, never a second source. `AlExecutionPlugin` later exposes
+`legacyPayload` as the old `payloadJson` while separately exposing the canonical
+action for v3 revalidation. The exact kind map is:
+
+| Canonical kind | `ReplyPartEntity.type` | deterministic `legacyPayload` |
+| --- | --- | --- |
+| `payment_accept` | `PAYMENT_STATUS` | `{status:"received"}` |
+| `payment_decline` | `PAYMENT_STATUS` | `{status:"refused"}` |
+| `moment_create` | `MOMENT_CREATE` | exact canonical payload |
+| `moment_like`, `moment_comment`, `moment_reply` | `MOMENT_ACTION` | exact canonical payload |
+| `role_plan_create`, `role_plan_update`, `role_plan_cancel`, `role_plan_pause`, `role_plan_resume`, `role_plan_complete` | `PLAN` | `{operations:[canonical payload]}` |
+| `life_episode_create` | `LIFE_EPISODE` | exact canonical payload |
+| `life_episode_update`, `life_episode_cancel` | `LIFE_ADJUSTMENT` | exact canonical payload |
+| `relationship_transition` | `RELATIONSHIP_STAGE` | exact canonical payload |
+
+The action map is an exact switch over the sixteen registered kinds; prefix
+matching is forbidden. Incoming order is authoritative and is never sorted.
+Payment, moment, life, and relationship compatibility projections
+allow at most one action each; role-plan actions may repeat in ordinal order.
+Unknown kind, duplicate single-value projection, wrapper key/type drift,
+message/action ID collision, ordinal drift, or semantic checksum drift conflicts
+before writes and again across restart.
+
+Canonical payload names follow the existing cognition and feature-domain
+contracts: role-plan update/cancel/pause/resume/complete targets use `planId`,
+life update/cancel uses `targetEpisodeId`, and moment reply uses
+`replyToCommentId`. `resolveCanonicalActionTargetInternal` must extract a target
+ID only from those exact `action.payload` fields; `rolePlanId`, `episodeId`, and
+`commentId` are not alternate wire payload aliases. After extraction,
+`resolveCanonicalTargetRefInternal` continues to validate the target against the
+existing PC store row or domain-native normalized input snapshot, where
+`rolePlanId`/`episodeId`/`commentId` remain legitimate facts. Preserve the
+current resolver sources: role-plan store row or `context.rolePlan`, life-episode
+store row, and moment/comment target object or normalized top-level `momentId`/
+`commentId` scalar. Do not independently scan raw nested trigger scalars such as
+`trigger.context.targetCommentId` or `trigger.context.planId`. A correct new wire
+field plus the matching old-domain source succeeds; an old wire payload name
+fails even if that source exists. The compatibility wrapper may reshape a
+canonical payload for an old consumer, but must never add a second canonical
+identity field.
+
+`moment_create` and all three `life_episode_*` kinds remain reserved until their
+dedicated Web consumers are implemented. Room persists them under the distinct
+`MOMENT_CREATE`, `LIFE_EPISODE`, or `LIFE_ADJUSTMENT` types, advances native
+completion, leaves UI application pending, and never misroutes them through
+`MOMENT_ACTION`, `SCHEDULE`, or a synthetic text reply.
+
+Web uses one exact action-part applier with outcomes `applied`,
+`already_applied`, `unsupported`, or `conflict`. It preflights the entire action
+set before any domain/chat/pending mutation. The supported set in Task 13C is
+payment accept/decline, moment like/comment/reply, relationship transition, and
+the six role-plan operations. After a domain mutation succeeds, persist a
+bounded application proof with exactly `turnId,actionId,actionChecksum,type,
+appliedAt`; here `turnId` is the canonical `result.authoritativeTurnId`, never
+the local Room turn ID. The caller supplies only the four immutable fields;
+`appliedAt` is generated on the first successful application as a positive safe
+integer and is thereafter retained verbatim. An existing proof is
+`already_applied` only when all four immutable fields match and the stored
+`appliedAt` is valid, otherwise it is `conflict`. Store proofs in the
+existing Web database under `yuqiNativeActionApplications`, keyed by canonical
+`actionId`; each value has exactly the five proof fields above. Retain the newest
+1000 by `appliedAt`. A trimmed proof does not authorize blind replay: exact
+domain-native evidence must reconstruct the same immutable tuple first.
+
+Implement that behavior in `tavern-app/lib/canonical-action-application.js`, a
+browser/Node-loadable module whose `createCanonicalActionApplier(...)` receives
+injected settings, chat/payment, moment, relationship, role-plan, and global-
+proof stores, `now`, a named fault hook, and one idempotent
+`acknowledgeUiApplied` hook.
+Its `applyGroup({localTurnId,result,actions})` performs the closed whole-set
+preflight, applies actions in authoritative ordinal order, repairs exact proofs,
+and returns `ready_for_ui_ack` or the already-proven equivalent only after every
+action has an exact proof. It may then invoke `acknowledgeUiApplied`, but it never
+constructs, publishes, or retries a group receipt. The shared native mock makes
+the UI transition monotonic and idempotent, so an ambiguous Web retry may call
+the API again while the persisted transition still occurs once. The module owns
+no hidden globals and accepts no fallback consumer. Reload tests create a new
+applier over the same injected stores after each forced fault; they must inspect
+actual persisted values and call counts rather than source text.
+`tavern-app/index.html` only adapts the existing DB/domain consumers to this
+module. `tests/yuqi-ui-contract.test.mjs` remains a static wiring/order guard,
+including the absence of a Web receipt publisher, while
+`tests/canonical-action-application.test.mjs` is the mandatory executable
+behavior gate.
+
+Role-plan idempotency is not inferred from the existing summary history. Extend
+the role-plan domain and repository with a canonical-application entrypoint that
+accepts ordered `{operation,request}` pairs. The immutable request has exactly
+`version,authoritativeTurnId,actionId,actionChecksum,kind,planId,operationJson`;
+`operationJson` is the closed canonical operation to apply and `planId` is the
+resolved persisted target, including the plan reused by the create-duplicate
+branch. The repository adds a positive-safe-integer `appliedAt` only on first
+application. Each plan owns an untrimmed `canonicalActionApplications` ledger
+for its lifetime, keyed by `actionId`. The domain preflights the complete ordered
+batch: an existing action ID is a no-op only when all seven immutable request
+fields match and stored `appliedAt` is valid, while a changed request or duplicate
+ID in the incoming batch is a conflict. A replay never regenerates or compares
+`appliedAt`. It then applies only unproven operations and writes the resulting
+plan state plus every new stored proof in the same single `role_plans_v1`
+meta-store write.
+This also applies to create deduplication and to repeated operations against the
+same plan in one canonical result. `role_plan_history_v1` remains a repairable
+projection and may be written after the authoritative plan/proof record; it is
+never used alone to authorize replay. Existing noncanonical role-plan APIs and
+rows without this ledger remain compatible and cannot fabricate a canonical
+proof. When the native repository is available, the proof remains inside the
+persisted plan JSON and the existing transactional `replaceRolePlans` call must
+write plans/proofs and history together; the Web fallback uses the authoritative
+plan/proof meta write first and may repair its history projection afterward.
+Every canonical history row uses `historyId=actionId` and is derived only from
+the stored ledger's `operationJson`. Missing history is inserted, an exact row
+is a no-op, and a changed/duplicate row conflicts. Legacy create input containing
+`canonicalActionApplications`, and legacy update patches that add/replace/delete
+that reserved field, are rejected before mutation; only the canonical repository
+entrypoint can create a ledger proof.
+
+Payment idempotency is anchored to the same persisted `settings` value as the
+wallet balance, not to a later chat save. Before mutation, resolve one exact
+payment target and compute the immutable request with exactly `version,
+authoritativeTurnId,actionId,actionChecksum,kind,targetKey,targetRevision,
+characterId,targetMessageId,payType,amountCents,decision,balanceDeltaCents`.
+`balanceDeltaCents` is recomputed from the existing payment rules and target;
+it is not caller-controlled. On the first application only, compute
+`balanceAfterCents` from the current integer-cent balance and generate positive
+safe-integer `appliedAt`; append both to the stored journal entry. Store it under
+`settings.nativePaymentActionApplications[actionId]` in the same single
+`DB.set('settings', settings)` that applies the integer-cent balance delta.
+`payment_accept` preserves the existing received behavior;
+`payment_decline` preserves the existing distinction that a transfer refunds
+once while a red-packet decline remains pending until expiry. On replay, look up
+the action ID before reading the current balance: compare only the twelve
+immutable request fields, validate the stored generated fields, retain the
+historical `balanceAfterCents`/`appliedAt`, and perform no balance change. A later
+recharge or unrelated payment therefore cannot turn an exact old replay into a
+conflict. An exact existing journal authorizes repair of the chat target plus the
+five-field UI proof; a changed request conflicts. The later
+chat write stores the same action ID/checksum on the target message, so either
+the wallet journal or the exact target marker can reconstruct a missing global
+proof. Retain the newest 1000 journal entries; the newly written entry cannot be
+trimmed by its own insertion. A crash after the wallet/journal write but before
+the chat write, or after the chat write but before the global proof write, must
+resume without a second refund or a second action.
+
+Moment and relationship mutations receive the same immutable four-field action
+request used by the global UI proof. In the same persistence write as their
+domain mutation, moment targets store an exact per-action proof rather than only
+`nativeActionTurnIds`, and relationship history stores the proof rather than only
+`sourceTurnId`. Exact replay validates all four fields and retains the original
+`appliedAt`; changed proof conflicts. A legacy matching turn ID or generic domain
+state is never sufficient to reconstruct a canonical UI proof.
+
+`nativeTurnHasUiLanding` must not infer action success from a chat message,
+pending-reply ownership, or a generic completed state. For `action_only`, every
+canonical action requires an exact `applied`/`already_applied` proof. For
+`visible` with actions, both the visible message landing and every action proof
+are required. Only then may Web clear pending state, record successful completion,
+or call `acknowledgeUiApplied`. A preflight rejection performs
+zero domain mutation; a runtime interruption after a subset applied publishes no
+UI acknowledgement and resumes from the persisted per-action proofs. Reserved or unknown
+types remain unapplied. Validate item and action counts, ordinals, IDs, semantic
+checksums, and sets separately across restart; a total-count-only check is
+forbidden.
+
+Cursor updates are part of the same outer transaction and are independent of
+arrival order. A result epoch newer than the persisted cursor conflicts. An
+older epoch, or a sequence already inside the persisted clear boundary, returns
+`REDACTED` with no semantic rows or cursor movement. For a live result,
+`localSequence=max(existing,result.inputVisibilitySequence)`. Advance the native
+watermark only when the result sequence is greater; for an equal sequence its
+stored turn/group identity must match; for a smaller sequence preserve the
+newer identity. Thus an earlier-member receipt may advance native from 4 to 5
+while local remains 6, but it can never lower native 7. `visible` and
+`action_only` advance native only. `skip` applies the same monotonic rule to both
+native and UI and sets `uiAppliedAt=now` in the transaction.
+
+The fresh terminal transaction has nine fault boundaries: checkpoint terminal
+CAS, reply-part batch, raw-message batch, authority CAS, turn finalizer, active
+attempt finalizer, native cursor update, skip-only UI cursor update, and change
+event insert. The verified-failure transaction has five: checkpoint failure CAS,
+turn failure CAS, attempt failure CAS, change event, and metadata-only
+diagnostic. A forced failure after every boundary must roll back checkpoint,
+turn, attempt, authority, cursor, parts, raw messages, changes, and diagnostics.
 
 For canonical `skip`, the terminal transaction performs a safe no-op UI apply:
 it sets `uiAppliedAt`, advances native and UI cursors to the group, writes no
@@ -1335,12 +1616,26 @@ late result ACKs only that relay envelope and never publishes an applied group
 receipt. Otherwise `confirmAppliedResult()` publishes the Task 13B group receipt
 only after UI application; the skip no-op is already UI-applied atomically.
 
+`BridgeReceiptDeliveryCoordinator` is the single testable sender used by
+`AlExecutionService.confirmBridgeDelivery`. It receives injected Room receipt
+state/CAS access, transport, and clock. A missing `uiAppliedAt`, redacted result,
+or existing exact `cloudConfirmedAt` returns without transport. A ready result
+always derives the same authority receipt and transport idempotency identity from
+the persisted group/checksum; network failure retains the same retryable proof.
+After authenticated PC success, the coordinator CASes the exact group/checksum
+to `cloudConfirmedAt` before treating the work as finished. A crash after remote
+acceptance but before that CAS may repeat HTTP with the same identity; it must
+not construct a second authority receipt. Unit tests create a new coordinator
+over the same fake persisted store to model service restart and repeated Web UI
+acknowledgement. `ExecutionServicePolicyTest` owns these executable cases;
+notification or static source-contract tests cannot substitute for them.
+
 - [ ] **Step 5: Run cross-stack Task 13 gate**
 
 From repository root:
 
 ```powershell
-node --test tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/test/bridge-authority-v3.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs yuqi-runtime/test/local-server.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs
+node --test tests/canonical-action-application.test.mjs tests/payment-batch-bridge-contract.test.mjs yuqi-runtime/test/bridge-authority-v3.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs yuqi-runtime/test/local-server.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs
 cd android
 .\gradlew.bat testDebugUnitTest assembleDebugAndroidTest --no-daemon --no-problems-report
 ```
@@ -1365,3 +1660,6 @@ npm.cmd test
 
 Do not begin Task 14 until the three Task 13 commits, focused cross-stack gate,
 full repository gate, and a file-boundary audit all pass.
+
+Add `tests/canonical-action-application.test.mjs` to the permanent `npm test`
+command in `package.json`; the Step 5 focused invocation is not its only gate.
