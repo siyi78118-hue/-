@@ -976,7 +976,11 @@ never reads it from caller input, snapshot, a constant, or a cursor row.
 rebuilding it, and immediately before network I/O requires the current route
 configuration's device ID to equal the pinned value. A configuration change
 therefore fails before send and cannot silently fork the checkpoint. The legacy
-v2 builder continues to use its existing configuration path.
+v2 builder continues to use its existing configuration path. When a v3
+automatic envelope embeds the semantic snapshot in `trigger.context`, the local
+`_alBridgeProtocol` marker is removed from that embedded copy before hashing and
+persistence; the Room `snapshotJson` and provenance column remain unchanged.
+Local ownership metadata is never sent to PC cognition as character context.
 
 `BridgeAuthority.canonicalJson` is byte-compatible with the PC
 `protocol.mjs` canonical JSON for every supported JSON value, including
@@ -1033,6 +1037,8 @@ non-empty string, while `failedAt` is a positive safe integer.
   parent remote ID and identical cloud key;
 - automatic root uses `triggerId`; direct/payment root uses canonical message ID;
 - all current-batch messages and the full cursor are emitted;
+- every automatic v3 envelope and checkpoint excludes `_alBridgeProtocol` from
+  the embedded semantic snapshot while the Room source row retains it;
 - preparation obtains the device ID from the gateway before the transaction,
   persists it in the exact normalized envelope, and a changed route device ID
   fails before either LAN or cloud sends;
