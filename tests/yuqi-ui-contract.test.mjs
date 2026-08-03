@@ -606,3 +606,18 @@ test('cloud enqueue hands off to the independent inbox drain without long pollin
   assert.match(sendCloud, /requireSuccess\(enqueued,\s*"cloud enqueue"\)[\s\S]*completeCloudHandoff\(\)/);
   assert.doesNotMatch(sendCloud, /bridge\/poll|while\s*\(clock\.now\(\)\s*<\s*deadline\)/);
 });
+
+test('canonical role-plan bundles use one browser-side compare-and-swap boundary', () => {
+  const memoryDb = html.slice(
+    html.indexOf('const MemoryDB = {'),
+    html.indexOf('async function saveMemory')
+  );
+  assert.match(memoryDb, /async compareAndSwapRolePlanBundle\(bundle\)/);
+  assert.match(memoryDb, /db\.transaction\('meta', 'readwrite'\)/);
+  assert.match(memoryDb, /globalThis\.navigator\?\.locks/);
+  assert.match(memoryDb, /canonical role plan CAS unavailable/);
+  assert.match(memoryDb, /expectedScopeChecksum/);
+  assert.match(memoryDb, /incomingActionIds/);
+  assert.match(memoryDb, /canonicalActionApplications/);
+  assert.match(memoryDb, /status: 'stale'/);
+});

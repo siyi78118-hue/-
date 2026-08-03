@@ -34,6 +34,22 @@ function canonicalPair(actionId, kind, planId, operation, overrides = {}) {
   };
 }
 
+function canonicalDescriptor(actionId, kind, operation, overrides = {}) {
+  const targetKey = operation.op === 'create'
+    ? 'lineage_create:lineage_1:role_plan_create'
+    : `role_plan:${operation.planId}`;
+  return {
+    authoritativeTurnId: 'turn_authority_1',
+    actionId,
+    actionChecksum: 'a'.repeat(64),
+    kind,
+    targetKey,
+    targetRevision: `sha256:${'b'.repeat(64)}`,
+    operation: structuredClone(operation),
+    ...overrides
+  };
+}
+
 test('exports the role plan domain', () => {
   assert.ok(domain, 'ALRolePlans should be exported');
 });
@@ -339,4 +355,86 @@ test('legacy operations cannot inject, overwrite, or delete the canonical role-p
     assert.equal(result.rejected[0].code, 'PLAN_LEDGER_RESERVED');
     assert.deepEqual(result.plans, [plan]);
   }
+});
+
+test('canonical preparation resolves a six-operation create chain before any caller mutation', () => {
+  assert.equal(typeof domain.prepareCanonicalApplications, 'function');
+  const now = Date.parse('2026-07-16T20:00:00+08:00');
+  const create = {
+    op: 'create', planId: 'plan-new', type: 'private_message', source: 'spoken',
+    title: '早安', intent: '明天发早安',
+    schedule: { kind: 'once', at: '2026-07-17T09:00:00+08:00' },
+    timeConfidence: 'explicit'
+  };
+  const descriptors = [
+    canonicalDescriptor('action_create', 'role_plan_create', create),
+    canonicalDescriptor('action_update', 'role_plan_update', { op: 'update', planId: 'plan-new', patch: { title: '新早安' } }),
+    canonicalDescriptor('action_pause', 'role_plan_pause', { op: 'pause', planId: 'plan-new', reason: '先等等' }),
+    canonicalDescriptor('action_resume', 'role_plan_resume', { op: 'resume', planId: 'plan-new' }),
+    canonicalDescriptor('action_complete', 'role_plan_complete', { op: 'complete', planId: 'plan-new' }),
+    canonicalDescriptor('action_cancel', 'role_plan_cancel', { op: 'cancel', planId: 'plan-new', reason: '最终取消' })
+  ];
+  const sourcePlans = [];
+  const sourceHistory = [];
+
+  const prepared = domain.prepareCanonicalApplications(sourcePlans, sourceHistory, descriptors, {
+    charId: 'char-a', now, appliedAt: now, uid: () => 'unused'
+  });
+
+  assert.deepEqual(sourcePlans, []);
+  assert.deepEqual(sourceHistory, []);
+  assert.deepEqual(prepared.pairs.map(pair => pair.request.planId), Array(6).fill('plan-new'));
+  assert.equal(prepared.preview.plans[0].title, '新早安');
+  assert.equal(prepared.preview.plans[0].status, 'cancelled');
+  assert.deepEqual(Object.keys(prepared.preview.plans[0].canonicalActionApplications), descriptors.map(row => row.actionId));
+  assert.deepEqual(prepared.preview.history.map(row => row.historyId), descriptors.map(row => row.actionId));
+});
+
+test('canonical preparation owns semantic create dedup and keeps the original operation JSON', () => {
+  const now = Date.parse('2026-07-16T20:00:00+08:00');
+  const plans = [{
+    planId: 'existing', characterId: 'char-a', status: 'active', type: 'private_message',
+    source: 'spoken', title: '早安', intent: '明天发早安',
+    nextRunAt: Date.parse('2026-07-17T09:00:00+08:00')
+  }];
+  const operation = {
+    op: 'create', planId: 'proposed', type: 'private_message', source: 'spoken', title: '发早安',
+    intent: '明天发早安', schedule: { kind: 'once', at: '2026-07-17T09:02:00+08:00' },
+    timeConfidence: 'explicit'
+  };
+  const prepared = domain.prepareCanonicalApplications(plans, [], [
+    canonicalDescriptor('action_dedup', 'role_plan_create', operation)
+  ], { charId: 'char-a', now, appliedAt: now });
+
+  assert.equal(prepared.pairs[0].request.planId, 'existing');
+  assert.equal(prepared.pairs[0].request.operationJson, canonicalJson(operation));
+  assert.equal(prepared.preview.plans.length, 1);
+  assert.equal(prepared.preview.plans[0].canonicalActionApplications.action_dedup.planId, 'existing');
+});
+
+test('canonical preparation rejects late invalid operations, foreign targets, and history-only authority without mutation', () => {
+  const plans = [{
+    planId: 'plan-a', characterId: 'char-a', status: 'active', type: 'private_message',
+    source: 'spoken', title: 'A', intent: 'A', nextRunAt: 9000
+  }];
+  const before = structuredClone(plans);
+  const valid = canonicalDescriptor('action_pause', 'role_plan_pause', {
+    op: 'pause', planId: 'plan-a'
+  });
+  const invalid = canonicalDescriptor('action_resume', 'role_plan_resume', {
+    op: 'resume', planId: 'foreign'
+  });
+  assert.throws(() => domain.prepareCanonicalApplications(plans, [], [valid, invalid], {
+    charId: 'char-a', now: 5000, appliedAt: 5000
+  }), /canonical role plan operation conflict/);
+  assert.deepEqual(plans, before);
+
+  const history = [{
+    historyId: 'action_pause', planId: 'plan-a', operation: 'pause',
+    detailJson: canonicalJson({ op: 'pause', planId: 'plan-a' }), createdAt: 1
+  }];
+  assert.throws(() => domain.prepareCanonicalApplications(plans, history, [valid], {
+    charId: 'char-a', now: 5000, appliedAt: 5000
+  }), /canonical role plan history conflict/);
+  assert.deepEqual(plans, before);
 });

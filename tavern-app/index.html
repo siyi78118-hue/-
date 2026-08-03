@@ -1614,6 +1614,22 @@ const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
 const MEMORY_STORES = ['summaries', 'events', 'profiles', 'vectors', 'meta'];
 const VECTOR_DIM = 384;
+function canonicalRolePlanBundleJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalRolePlanBundleJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalRolePlanBundleJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+function canonicalRolePlanScopeChecksum(plans, history) {
+  const order = rows => structuredClone(Array.isArray(rows) ? rows : [])
+    .sort((left, right) => {
+      const leftJson = canonicalRolePlanBundleJson(left);
+      const rightJson = canonicalRolePlanBundleJson(right);
+      return leftJson < rightJson ? -1 : (leftJson > rightJson ? 1 : 0);
+    });
+  return canonicalRolePlanBundleJson({ plans: order(plans), history: order(history) });
+}
 const MemoryDB = {
   dbPromise: null,
   fallbackKey: 'al_memory_db_fallback_v1',
@@ -1717,6 +1733,115 @@ const MemoryDB = {
   },
   async setMeta(key, value) {
     return this.put('meta', { key, value, updatedAt: Date.now() });
+  },
+  async compareAndSwapRolePlanBundle(bundle) {
+    const characterId = String(bundle?.characterId || '');
+    const expectedScopeChecksum = bundle?.expectedScopeChecksum;
+    const requestedPlanIds = new Set(Array.isArray(bundle?.requestedPlanIds) ? bundle.requestedPlanIds : []);
+    const incomingActionIds = new Set((Array.isArray(bundle?.incomingActionIds) ? bundle.incomingActionIds : [])
+      .filter(actionId => typeof actionId === 'string' && actionId));
+    const nextPlans = structuredClone(Array.isArray(bundle?.plans) ? bundle.plans : []);
+    const nextHistory = structuredClone(Array.isArray(bundle?.history) ? bundle.history : []);
+    if (!characterId || typeof expectedScopeChecksum !== 'string') {
+      throw new Error('canonical role plan CAS unavailable');
+    }
+    const apply = (allPlans, allHistory) => {
+      const currentPlans = Array.isArray(allPlans) ? allPlans : [];
+      const currentHistory = Array.isArray(allHistory) ? allHistory : [];
+      const currentCharacterPlans = currentPlans.filter(plan => plan?.characterId === characterId);
+      const scopePlanIds = new Set([
+        ...currentCharacterPlans.map(plan => plan.planId),
+        ...requestedPlanIds
+      ]);
+      const currentScopeHistory = currentHistory.filter(row => scopePlanIds.has(row?.planId));
+      if (canonicalRolePlanScopeChecksum(currentCharacterPlans, currentScopeHistory) !== expectedScopeChecksum) {
+        return null;
+      }
+      for (const plan of currentPlans) {
+        const ledger = plan?.canonicalActionApplications;
+        if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger)) continue;
+        if (plan.characterId !== characterId && Object.keys(ledger).some(actionId => incomingActionIds.has(actionId))) {
+          throw new Error('canonical role plan authority conflict');
+        }
+      }
+      for (const row of currentHistory) {
+        if (incomingActionIds.has(row?.historyId) && !scopePlanIds.has(row?.planId)) {
+          throw new Error('canonical role plan authority conflict');
+        }
+      }
+      const replacedPlanIds = new Set([
+        ...currentCharacterPlans.map(plan => plan.planId),
+        ...nextPlans.map(plan => plan?.planId)
+      ]);
+      return {
+        plans: [
+          ...currentPlans.filter(plan => plan?.characterId !== characterId),
+          ...nextPlans
+        ],
+        history: [
+          ...currentHistory.filter(row => !replacedPlanIds.has(row?.planId)),
+          ...nextHistory
+        ]
+      };
+    };
+    const db = await this.open();
+    if (!db) {
+      const locks = globalThis.navigator?.locks;
+      if (!locks?.request) throw new Error('canonical role plan CAS unavailable');
+      return locks.request('al-role-plan-ledger', { mode: 'exclusive' }, async () => {
+        const data = this.readFallback();
+        const next = apply(data.meta?.find?.(row => row?.key === 'role_plans_v1')?.value || [],
+          data.meta?.find?.(row => row?.key === 'role_plan_history_v1')?.value || []);
+        if (!next) return { status: 'stale' };
+        const meta = Array.isArray(data.meta) ? data.meta.filter(row => (
+          row?.key !== 'role_plans_v1' && row?.key !== 'role_plan_history_v1'
+        )) : [];
+        const updatedAt = Date.now();
+        meta.push({ key: 'role_plans_v1', value: next.plans, updatedAt });
+        meta.push({ key: 'role_plan_history_v1', value: next.history, updatedAt });
+        data.meta = meta;
+        this.writeFallback(data);
+        return { status: 'applied' };
+      });
+    }
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('meta', 'readwrite');
+      const store = tx.objectStore('meta');
+      const plansRequest = store.get('role_plans_v1');
+      const historyRequest = store.get('role_plan_history_v1');
+      let remaining = 2;
+      let outcome = null;
+      const settleRead = () => {
+        remaining -= 1;
+        if (remaining) return;
+        let next;
+        try {
+          next = apply(plansRequest.result?.value || [], historyRequest.result?.value || []);
+        } catch (error) {
+          outcome = { error };
+          tx.abort();
+          return;
+        }
+        if (!next) {
+          outcome = { status: 'stale' };
+          tx.abort();
+          return;
+        }
+        const updatedAt = Date.now();
+        store.put({ key: 'role_plans_v1', value: next.plans, updatedAt });
+        store.put({ key: 'role_plan_history_v1', value: next.history, updatedAt });
+        outcome = { status: 'applied' };
+      };
+      plansRequest.onsuccess = settleRead;
+      historyRequest.onsuccess = settleRead;
+      plansRequest.onerror = () => reject(plansRequest.error);
+      historyRequest.onerror = () => reject(historyRequest.error);
+      tx.oncomplete = () => resolve(outcome || { status: 'stale' });
+      tx.onabort = () => outcome?.status === 'stale' ? resolve(outcome) : reject(outcome?.error || tx.error || new Error('canonical role plan CAS unavailable'));
+      tx.onerror = () => {
+        if (!outcome?.error) reject(tx.error);
+      };
+    });
   },
   async byChar(storeName, charId) {
     return (await this.all(storeName)).filter(r => r.charId === charId);

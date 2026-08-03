@@ -4,6 +4,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const modulePath = new URL('../tavern-app/lib/canonical-action-application.js', import.meta.url);
+const roleDomainPath = new URL('../tavern-app/lib/role-plan-domain.js', import.meta.url);
+const roleRepositoryPath = new URL('../tavern-app/lib/role-plan-repository.js', import.meta.url);
 
 function loadModule() {
   const context = vm.createContext({
@@ -19,6 +21,20 @@ function loadModule() {
   });
   if (existsSync(modulePath)) vm.runInContext(readFileSync(modulePath, 'utf8'), context);
   return context.ALCanonicalActionApplication;
+}
+
+function loadIntegratedModules() {
+  const context = vm.createContext({
+    structuredClone, Date, JSON, Math, Number, Object, Promise, Set, String
+  });
+  for (const path of [roleDomainPath, roleRepositoryPath, modulePath]) {
+    vm.runInContext(readFileSync(path, 'utf8'), context);
+  }
+  return {
+    actions: context.ALCanonicalActionApplication,
+    domain: context.ALRolePlans,
+    repository: context.ALRolePlanRepository
+  };
 }
 
 test('exports the canonical action application boundary', () => {
@@ -50,12 +66,51 @@ function groupResult(overrides = {}) {
   };
 }
 
+function roleAction(kind, ordinal, operation, overrides = {}) {
+  return canonicalAction(kind, ordinal, {
+    actionId: overrides.actionId || `role_${operation.op}_${ordinal}`,
+    targetKey: operation.op === 'create'
+      ? 'lineage_create:lineage_1:role_plan_create'
+      : `role_plan:${operation.planId}`,
+    targetRevision: `sha256:${'c'.repeat(64)}`,
+    payload: structuredClone(operation),
+    ...overrides
+  });
+}
+
+function applicationProof(action, appliedAt = 5000) {
+  return {
+    turnId: 'turn_remote_1',
+    actionId: action.actionId,
+    actionChecksum: action.actionChecksum,
+    type: action.kind,
+    appliedAt
+  };
+}
+
 function proofStore(initial = {}) {
   let value = structuredClone(initial);
   let writes = 0;
   return {
     async load() { return structuredClone(value); },
     async save(next) { value = structuredClone(next); writes += 1; },
+    async mergeCanonicalProofs(incoming) {
+      const next = structuredClone(value);
+      for (const [actionId, proof] of Object.entries(incoming || {})) {
+        const existing = next[actionId];
+        if (existing && JSON.stringify(existing) !== JSON.stringify(proof)) {
+          throw new Error('canonical action proof store conflict');
+        }
+        next[actionId] = structuredClone(proof);
+      }
+      const retained = new Set(Object.entries(next).sort((left, right) => (
+        Number(right[1]?.appliedAt || 0) - Number(left[1]?.appliedAt || 0)
+        || left[0].localeCompare(right[0])
+      )).slice(0, 1000).map(([actionId]) => actionId));
+      value = Object.fromEntries(Object.entries(next).filter(([actionId]) => retained.has(actionId)));
+      writes += 1;
+      return structuredClone(value);
+    },
     snapshot() { return structuredClone(value); },
     writes() { return writes; }
   };
@@ -333,11 +388,11 @@ test('a trimmed historical domain proof is valid session evidence without changi
     globalProofStore,
     adapters: {
       role_plan: {
-        async preflight() {},
-        async verifyApplied() { throw new Error('unexpected global verification'); },
-        async apply() {
+        async preflightBatch() { return {}; },
+        async verifyAppliedBatch() { throw new Error('unexpected global verification'); },
+        async applyBatch() {
           applies += 1;
-          return { outcome: 'already_applied', proof: structuredClone(historicalProof) };
+          return { [action.actionId]: { outcome: 'already_applied', proof: structuredClone(historicalProof) } };
         }
       }
     },
@@ -466,9 +521,10 @@ test('a concurrently corrupted persisted proof cannot pass on session fields alo
   let stored = {};
   const globalProofStore = {
     async load() { return structuredClone(stored); },
-    async save(next) {
-      stored = structuredClone(next);
+    async mergeCanonicalProofs(next) {
+      stored = { ...stored, ...structuredClone(next) };
       stored[action.actionId].extra = 'leak';
+      return structuredClone(stored);
     }
   };
   let uiAcks = 0;
@@ -476,9 +532,11 @@ test('a concurrently corrupted persisted proof cannot pass on session fields alo
     globalProofStore,
     adapters: {
       role_plan: {
-        async preflight() {},
-        async verifyApplied() { throw new Error('unexpected verify'); },
-        async apply() { return { outcome: 'applied', proof: structuredClone(proof) }; }
+        async preflightBatch() { return {}; },
+        async verifyAppliedBatch() { throw new Error('unexpected verify'); },
+        async applyBatch() {
+          return { [action.actionId]: { outcome: 'applied', proof: structuredClone(proof) } };
+        }
       }
     },
     acknowledgeUiApplied: async () => { uiAcks += 1; }
@@ -490,6 +548,448 @@ test('a concurrently corrupted persisted proof cannot pass on session fields alo
     actions: [action]
   }), /canonical action application proof conflict/);
   assert.equal(uiAcks, 0);
+});
+
+test('a contiguous six-action role-plan block uses one batch mutation and saves proofs in ordinal order', async () => {
+  const api = loadModule();
+  const actions = [
+    roleAction('role_plan_create', 0, { op: 'create', planId: 'plan-a' }),
+    roleAction('role_plan_update', 1, { op: 'update', planId: 'plan-a' }),
+    roleAction('role_plan_pause', 2, { op: 'pause', planId: 'plan-a' }),
+    roleAction('role_plan_resume', 3, { op: 'resume', planId: 'plan-a' }),
+    roleAction('role_plan_complete', 4, { op: 'complete', planId: 'plan-a' }),
+    roleAction('role_plan_cancel', 5, { op: 'cancel', planId: 'plan-a' })
+  ];
+  const events = [];
+  const globalProofStore = proofStore();
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore,
+    adapters: {
+      role_plan: {
+        async preflightBatch({ items }) { events.push(`preflight:${items.length}`); return { token: 1 }; },
+        async verifyAppliedBatch() { return {}; },
+        async applyBatch({ items }) {
+          events.push(`apply:${items.map(item => item.action.actionId).join(',')}`);
+          return Object.fromEntries(items.map((item, index) => [
+            item.action.actionId,
+            { outcome: 'applied', proof: applicationProof(item.action, 5000 + index) }
+          ]));
+        }
+      }
+    },
+    acknowledgeUiApplied: async () => events.push('ack'),
+    fault: async name => events.push(name)
+  });
+
+  const outcome = await applier.applyGroup({ localTurnId: 'local_role_batch', result: groupResult(), actions });
+  assert.equal(outcome.status, 'ready_for_ui_ack');
+  assert.equal(events.filter(row => row.startsWith('apply:')).length, 1);
+  assert.ok(events.includes('after_domain_batch:role_plan:0:5'));
+  assert.deepEqual(Object.keys(globalProofStore.snapshot()), actions.map(action => action.actionId));
+  assert.equal(globalProofStore.writes(), 6);
+  assert.equal(events.at(-1), 'after_ui_ack');
+});
+
+test('role batch fault labels use the enclosing action ordinals rather than action ids', async () => {
+  const api = loadModule();
+  const payment = canonicalAction('payment_accept', 0, { actionId: 'before-pay' });
+  const moment = canonicalAction('moment_like', 1, { actionId: 'before-moment' });
+  const first = roleAction('role_plan_pause', 2, { op: 'pause', planId: 'plan-a' }, { actionId: 'nonordinal-first' });
+  const last = roleAction('role_plan_resume', 3, { op: 'resume', planId: 'plan-a' }, { actionId: 'nonordinal-last' });
+  const events = [];
+  const simple = action => ({ outcome: 'applied', proof: applicationProof(action, 5000 + action.ordinal) });
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: proofStore(),
+    adapters: {
+      payment: { async preflight() {}, async verifyApplied() {}, async apply({ action }) { return simple(action); } },
+      moment: { async preflight() {}, async verifyApplied() {}, async apply({ action }) { return simple(action); } },
+      role_plan: {
+        async preflightBatch() { return {}; }, async verifyAppliedBatch() { return {}; },
+        async applyBatch({ items }) {
+          return Object.fromEntries(items.map(item => [item.action.actionId, simple(item.action)]));
+        }
+      }
+    },
+    acknowledgeUiApplied: async () => {},
+    fault: async name => events.push(name)
+  });
+  await applier.applyGroup({ localTurnId: 'local_ordinal_fault', result: groupResult(), actions: [payment, moment, first, last] });
+  assert.ok(events.includes('after_domain_batch:role_plan:2:3'));
+  assert.equal(events.filter(name => name.startsWith('after_domain_batch:role_plan:')).length, 1);
+});
+
+test('numeric action ids use an ordered batch result array instead of object-key enumeration', async () => {
+  const api = loadModule();
+  const first = roleAction('role_plan_pause', 0, { op: 'pause', planId: 'plan-a' }, { actionId: '2' });
+  const second = roleAction('role_plan_resume', 1, { op: 'resume', planId: 'plan-a' }, { actionId: '1' });
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: proofStore(),
+    adapters: { role_plan: {
+      async preflightBatch() { return {}; }, async verifyAppliedBatch() { return []; },
+      async applyBatch({ items }) {
+        return items.map(item => ({ outcome: 'applied', proof: applicationProof(item.action, 5000 + item.action.ordinal) }));
+      }
+    } },
+    acknowledgeUiApplied: async () => {}
+  });
+  const result = await applier.applyGroup({ localTurnId: 'local_numeric_actions', result: groupResult(), actions: [first, second] });
+  assert.equal(result.status, 'ready_for_ui_ack');
+});
+
+test('concurrent groups require the atomic global proof merge and retain both proofs', async () => {
+  const api = loadModule();
+  let proofs = {};
+  const store = {
+    async load() { return structuredClone(proofs); },
+    async mergeCanonicalProofs(incoming) {
+      for (const [actionId, proof] of Object.entries(incoming)) {
+        if (proofs[actionId] && JSON.stringify(proofs[actionId]) !== JSON.stringify(proof)) {
+          throw new Error('canonical action proof store conflict');
+        }
+        proofs[actionId] = structuredClone(proof);
+      }
+      return structuredClone(proofs);
+    }
+  };
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: store,
+    adapters: { moment: {
+      async preflight() {}, async verifyApplied() {},
+      async apply({ action }) { return { outcome: 'applied', proof: applicationProof(action, 7000 + action.ordinal) }; }
+    } },
+    acknowledgeUiApplied: async () => {}
+  });
+  const input = (localTurnId, actionId) => ({
+    localTurnId, result: groupResult({ visibleGroupId: `group-${actionId}` }),
+    actions: [canonicalAction('moment_like', 0, { actionId })]
+  });
+  await Promise.all([applier.applyGroup(input('local-1', 'proof-a')), applier.applyGroup(input('local-2', 'proof-b'))]);
+  assert.deepEqual(Object.keys(proofs).sort(), ['proof-a', 'proof-b']);
+});
+
+test('mixed contiguous blocks finish every preflight and verification before ordered mutations', async () => {
+  const api = loadModule();
+  const payment = canonicalAction('payment_accept', 0, { actionId: 'pay_existing' });
+  const role1 = roleAction('role_plan_update', 1, { op: 'update', planId: 'plan-a' });
+  const role2 = roleAction('role_plan_pause', 2, { op: 'pause', planId: 'plan-a' });
+  const moment = canonicalAction('moment_like', 3, { actionId: 'moment_pending' });
+  const events = [];
+  const globalProofStore = proofStore({ pay_existing: applicationProof(payment, 4000) });
+  const simple = family => ({
+    async preflight({ action }) { events.push(`preflight:${family}:${action.actionId}`); },
+    async verifyApplied({ action }) { events.push(`verify:${family}:${action.actionId}`); return { outcome: 'already_applied', proof: applicationProof(action, 4000) }; },
+    async apply({ action }) { events.push(`apply:${family}:${action.actionId}`); return { outcome: 'applied', proof: applicationProof(action, 7000) }; }
+  });
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore,
+    adapters: {
+      payment: simple('payment'),
+      moment: simple('moment'),
+      role_plan: {
+        async preflightBatch() { events.push('preflight:role'); return {}; },
+        async verifyAppliedBatch() { events.push('verify:role'); return {}; },
+        async applyBatch({ items }) {
+          events.push('apply:role');
+          return Object.fromEntries(items.map(item => [item.action.actionId,
+            { outcome: 'applied', proof: applicationProof(item.action, 6000) }]));
+        }
+      }
+    },
+    acknowledgeUiApplied: async () => events.push('ack')
+  });
+  await applier.applyGroup({
+    localTurnId: 'local_mixed', result: groupResult(), actions: [payment, role1, role2, moment]
+  });
+  assert.deepEqual(events.slice(0, 3), [
+    'preflight:payment:pay_existing', 'preflight:role', 'preflight:moment:moment_pending'
+  ]);
+  assert.equal(events[3], 'verify:payment:pay_existing');
+  assert.ok(events.indexOf('apply:role') < events.indexOf('apply:moment:moment_pending'));
+  assert.equal(events.at(-1), 'ack');
+});
+
+test('interleaved role-plan families conflict before proof reads or domain writes', async () => {
+  const api = loadModule();
+  let proofReads = 0;
+  let batchCalls = 0;
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: {
+      async load() { proofReads += 1; return {}; },
+      async save() { throw new Error('unexpected save'); }
+    },
+    adapters: {
+      role_plan: { async preflightBatch() { batchCalls += 1; } },
+      payment: { async preflight() { batchCalls += 1; } }
+    },
+    acknowledgeUiApplied: async () => { throw new Error('unexpected ack'); }
+  });
+  await assert.rejects(applier.applyGroup({
+    localTurnId: 'local_interleaved', result: groupResult(), actions: [
+      roleAction('role_plan_update', 0, { op: 'update', planId: 'plan-a' }),
+      canonicalAction('payment_accept', 1),
+      roleAction('role_plan_pause', 2, { op: 'pause', planId: 'plan-a' })
+    ]
+  }), /canonical action set conflict/);
+  assert.equal(proofReads, 0);
+  assert.equal(batchCalls, 0);
+});
+
+test('a later simple-family preflight failure prevents an earlier role batch mutation', async () => {
+  const api = loadModule();
+  let roleWrites = 0;
+  const store = proofStore();
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: store,
+    adapters: {
+      role_plan: {
+        async preflightBatch() { return {}; },
+        async verifyAppliedBatch() { return {}; },
+        async applyBatch() { roleWrites += 1; return {}; }
+      },
+      moment: {
+        async preflight() { throw new Error('moment preflight failed'); },
+        async verifyApplied() {}, async apply() {}
+      }
+    },
+    acknowledgeUiApplied: async () => {}
+  });
+  await assert.rejects(applier.applyGroup({
+    localTurnId: 'local_later_fail', result: groupResult(), actions: [
+      roleAction('role_plan_pause', 0, { op: 'pause', planId: 'plan-a' }),
+      canonicalAction('moment_like', 1)
+    ]
+  }), /moment preflight failed/);
+  assert.equal(roleWrites, 0);
+  assert.equal(store.writes(), 0);
+});
+
+test('a later role batch preflight failure prevents an earlier pending payment mutation', async () => {
+  const api = loadModule();
+  let paymentWrites = 0;
+  const store = proofStore();
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: store,
+    adapters: {
+      payment: {
+        async preflight() {}, async verifyApplied() {},
+        async apply() { paymentWrites += 1; return {}; }
+      },
+      role_plan: {
+        async preflightBatch() { throw new Error('role preflight failed'); },
+        async verifyAppliedBatch() {}, async applyBatch() {}
+      }
+    },
+    acknowledgeUiApplied: async () => {}
+  });
+  await assert.rejects(applier.applyGroup({
+    localTurnId: 'local_role_fail', result: groupResult(), actions: [
+      canonicalAction('payment_accept', 0),
+      roleAction('role_plan_pause', 1, { op: 'pause', planId: 'plan-a' })
+    ]
+  }), /role preflight failed/);
+  assert.equal(paymentWrites, 0);
+  assert.equal(store.writes(), 0);
+});
+
+test('a forged global role proof without a matching plan ledger blocks every pending mutation', async () => {
+  const api = loadModule();
+  const role = roleAction('role_plan_update', 0, { op: 'update', planId: 'plan-a' });
+  const moment = canonicalAction('moment_like', 1);
+  let mutations = 0;
+  const store = proofStore({ [role.actionId]: applicationProof(role, 5000) });
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: store,
+    adapters: {
+      role_plan: {
+        async preflightBatch() { return {}; },
+        async verifyAppliedBatch() { throw new Error('role ledger proof conflict'); },
+        async applyBatch() { mutations += 1; return {}; }
+      },
+      moment: {
+        async preflight() {}, async verifyApplied() {},
+        async apply() { mutations += 1; return {}; }
+      }
+    },
+    acknowledgeUiApplied: async () => {}
+  });
+  await assert.rejects(applier.applyGroup({
+    localTurnId: 'local_forged_role', result: groupResult(), actions: [role, moment]
+  }), /role ledger proof conflict/);
+  assert.equal(mutations, 0);
+  assert.equal(store.writes(), 0);
+});
+
+test('a crash after a role domain batch rebuilds global proofs without a second role write', async () => {
+  const api = loadModule();
+  const actions = [
+    roleAction('role_plan_update', 0, { op: 'update', planId: 'plan-a' }),
+    roleAction('role_plan_pause', 1, { op: 'pause', planId: 'plan-a' })
+  ];
+  const ledger = {};
+  let roleWrites = 0;
+  let crash = true;
+  const store = proofStore();
+  const adapter = {
+    async preflightBatch() { return {}; },
+    async verifyAppliedBatch({ items }) {
+      return Object.fromEntries(items.map(item => [item.action.actionId,
+        { outcome: 'already_applied', proof: ledger[item.action.actionId] }]));
+    },
+    async applyBatch({ items }) {
+      const missing = items.filter(item => !ledger[item.action.actionId]);
+      if (missing.length) roleWrites += 1;
+      items.forEach((item, index) => { ledger[item.action.actionId] ||= applicationProof(item.action, 5000 + index); });
+      return Object.fromEntries(items.map(item => [item.action.actionId,
+        { outcome: missing.some(row => row.action.actionId === item.action.actionId) ? 'applied' : 'already_applied', proof: ledger[item.action.actionId] }]));
+    }
+  };
+  const make = () => api.createCanonicalActionApplier({
+    globalProofStore: store, adapters: { role_plan: adapter },
+    acknowledgeUiApplied: async () => {},
+    fault: async name => {
+      if (name.startsWith('after_domain_batch:role_plan:') && crash) {
+        crash = false;
+        throw new Error('forced:role_batch');
+      }
+    }
+  });
+  const input = { localTurnId: 'local_role_crash', result: groupResult(), actions };
+  await assert.rejects(make().applyGroup(input), /forced:role_batch/);
+  assert.equal(roleWrites, 1);
+  assert.equal(store.writes(), 0);
+  await make().applyGroup(input);
+  assert.equal(roleWrites, 1);
+  assert.deepEqual(Object.keys(store.snapshot()), actions.map(row => row.actionId));
+});
+
+test('partial global proof persistence and mixed existing actions reuse one role ledger application', async () => {
+  const api = loadModule();
+  const actions = [
+    roleAction('role_plan_update', 0, { op: 'update', planId: 'plan-a' }),
+    roleAction('role_plan_pause', 1, { op: 'pause', planId: 'plan-a' })
+  ];
+  const ledger = Object.fromEntries(actions.map((action, index) => [action.actionId, applicationProof(action, 5100 + index)]));
+  const store = proofStore({ [actions[0].actionId]: ledger[actions[0].actionId] });
+  let domainWrites = 0;
+  const adapter = {
+    async preflightBatch() { return {}; },
+    async verifyAppliedBatch({ items }) {
+      return Object.fromEntries(items.map(item => [item.action.actionId,
+        { outcome: 'already_applied', proof: ledger[item.action.actionId] }]));
+    },
+    async applyBatch({ items }) {
+      domainWrites += 0;
+      return Object.fromEntries(items.map(item => [item.action.actionId,
+        { outcome: 'already_applied', proof: ledger[item.action.actionId] }]));
+    }
+  };
+  const applier = api.createCanonicalActionApplier({
+    globalProofStore: store, adapters: { role_plan: adapter }, acknowledgeUiApplied: async () => {}
+  });
+  const outcome = await applier.applyGroup({ localTurnId: 'local_partial', result: groupResult(), actions });
+  assert.equal(outcome.status, 'ready_for_ui_ack');
+  assert.equal(domainWrites, 0);
+  assert.deepEqual(store.snapshot(), ledger);
+});
+
+test('batch adapters reject missing, extra, changed, or out-of-order returned role proofs before UI acknowledgement', async () => {
+  const api = loadModule();
+  const action = roleAction('role_plan_pause', 0, { op: 'pause', planId: 'plan-a' });
+  for (const returned of [
+    {},
+    { extra: { outcome: 'applied', proof: applicationProof(action) } },
+    { [action.actionId]: { outcome: 'applied', proof: { ...applicationProof(action), actionChecksum: 'f'.repeat(64) } } }
+  ]) {
+    let uiAcks = 0;
+    const store = proofStore();
+    const applier = api.createCanonicalActionApplier({
+      globalProofStore: store,
+      adapters: { role_plan: {
+        async preflightBatch() { return {}; },
+        async verifyAppliedBatch() { return {}; },
+        async applyBatch() { return structuredClone(returned); }
+      } },
+      acknowledgeUiApplied: async () => { uiAcks += 1; }
+    });
+    await assert.rejects(applier.applyGroup({
+      localTurnId: 'local_bad_batch', result: groupResult(), actions: [action]
+    }), /canonical action application proof conflict/);
+    assert.equal(store.writes(), 0);
+    assert.equal(uiAcks, 0);
+  }
+
+  const second = roleAction('role_plan_resume', 1, { op: 'resume', planId: 'plan-a' });
+  const reversed = {
+    [second.actionId]: { outcome: 'applied', proof: applicationProof(second, 5001) },
+    [action.actionId]: { outcome: 'applied', proof: applicationProof(action, 5000) }
+  };
+  const reversedStore = proofStore();
+  const reversedApplier = api.createCanonicalActionApplier({
+    globalProofStore: reversedStore,
+    adapters: { role_plan: {
+      async preflightBatch() { return {}; },
+      async verifyAppliedBatch() { return {}; },
+      async applyBatch() { return reversed; }
+    } },
+    acknowledgeUiApplied: async () => { throw new Error('unexpected UI acknowledgement'); }
+  });
+  await assert.rejects(reversedApplier.applyGroup({
+    localTurnId: 'local_reversed_batch', result: groupResult(), actions: [action, second]
+  }), /canonical action application proof conflict/);
+  assert.equal(reversedStore.writes(), 0);
+});
+
+test('the real role-plan adapter recovers after its batch write without writing role plans twice', async () => {
+  const modules = loadIntegratedModules();
+  assert.equal(typeof modules.actions.createRolePlanActionAdapter, 'function');
+  const rows = new Map([['role_plans_v1', [{
+    planId: 'plan-a', characterId: 'yuqi', status: 'active', type: 'private_message',
+    source: 'spoken', title: 'A', intent: '联系用户', nextRunAt: 9000
+  }]]]);
+  const writes = [];
+  const metaStore = {
+    async getMeta(key, fallback) { return rows.has(key) ? structuredClone(rows.get(key)) : fallback; },
+    async setMeta(key, value) { writes.push(key); rows.set(key, structuredClone(value)); },
+    async compareAndSwapRolePlanBundle(bundle) {
+      writes.push('canonical_role_plan_bundle');
+      rows.set('role_plans_v1', structuredClone(bundle.plans));
+      rows.set('role_plan_history_v1', structuredClone(bundle.history));
+      return { status: 'applied' };
+    }
+  };
+  const repository = modules.repository.create({
+    domain: modules.domain, metaStore, now: () => 5000, uid: () => 'unused'
+  });
+  const adapter = modules.actions.createRolePlanActionAdapter({ repository });
+  const actions = [
+    roleAction('role_plan_update', 0, { op: 'update', planId: 'plan-a', patch: { title: 'B' } }),
+    roleAction('role_plan_pause', 1, { op: 'pause', planId: 'plan-a' })
+  ];
+  const globals = proofStore();
+  let crash = true;
+  const make = () => modules.actions.createCanonicalActionApplier({
+    globalProofStore: globals,
+    adapters: { role_plan: adapter },
+    acknowledgeUiApplied: async () => {},
+    fault: async name => {
+      if (name.startsWith('after_domain_batch:role_plan:') && crash) {
+        crash = false;
+        throw new Error('forced:real_role_batch');
+      }
+    }
+  });
+  const input = { localTurnId: 'local_real_role', result: groupResult(), actions };
+
+  await assert.rejects(make().applyGroup(input), /forced:real_role_batch/);
+  assert.equal(writes.filter(key => key === 'canonical_role_plan_bundle').length, 1);
+  assert.equal(globals.writes(), 0);
+  const stablePlanBytes = JSON.stringify(rows.get('role_plans_v1'));
+
+  const replay = await make().applyGroup(input);
+  assert.equal(replay.status, 'ready_for_ui_ack');
+  assert.equal(writes.filter(key => key === 'canonical_role_plan_bundle').length, 1);
+  assert.equal(JSON.stringify(rows.get('role_plans_v1')), stablePlanBytes);
+  assert.deepEqual(Object.keys(globals.snapshot()), actions.map(action => action.actionId));
 });
 
 function paymentState() {

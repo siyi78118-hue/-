@@ -67,7 +67,7 @@
     if (!Array.isArray(actions)) throw new Error('canonical action set conflict');
     const ids = new Set();
     const singleCounts = new Map();
-    return actions.map((action, index) => {
+    const normalized = actions.map((action, index) => {
       if (!exactKeys(action, ACTION_KEYS)
         || !validId(action.actionId)
         || !Number.isSafeInteger(action.ordinal)
@@ -91,14 +91,22 @@
       }
       return action;
     });
+    const roleOrdinals = normalized
+      .map((action, index) => FAMILY_BY_KIND[action.kind] === 'role_plan' ? index : -1)
+      .filter(index => index >= 0);
+    if (roleOrdinals.length
+      && roleOrdinals.at(-1) - roleOrdinals[0] + 1 !== roleOrdinals.length) {
+      throw new Error('canonical action set conflict');
+    }
+    return normalized;
   }
 
   function trimProofs(proofs) {
-    const entries = Object.entries(proofs).sort((left, right) => (
+    const retained = new Set(Object.entries(proofs).sort((left, right) => (
       Number(right[1]?.appliedAt || 0) - Number(left[1]?.appliedAt || 0)
       || left[0].localeCompare(right[0])
-    )).slice(0, PROOF_LIMIT);
-    return Object.fromEntries(entries);
+    )).slice(0, PROOF_LIMIT).map(([actionId]) => actionId));
+    return Object.fromEntries(Object.entries(proofs).filter(([actionId]) => retained.has(actionId)));
   }
 
   const PAYMENT_PAYLOAD_KEYS = Object.freeze(['messageId']);
@@ -348,6 +356,58 @@
     return { preflight, verifyApplied, apply };
   }
 
+  function createRolePlanActionAdapter(options = {}) {
+    const repository = options.repository;
+    if (!repository?.prepareCanonicalBatch
+      || !repository?.inspectPreparedCanonicalBatch
+      || !repository?.applyPreparedCanonicalBatch) {
+      throw new Error('role plan action repository conflict');
+    }
+
+    function descriptors(items, result) {
+      return items.map(item => ({
+        authoritativeTurnId: result.authoritativeTurnId,
+        actionId: item.action.actionId,
+        actionChecksum: item.action.actionChecksum,
+        kind: item.action.kind,
+        targetKey: item.action.targetKey,
+        targetRevision: item.action.targetRevision,
+        operation: clone(item.action.payload)
+      }));
+    }
+
+    async function preflightBatch({ items, result }) {
+      return repository.prepareCanonicalBatch(result.roleId, descriptors(items, result));
+    }
+
+    function projectedResults(items, proofs, outcomes) {
+      return items.map(item => {
+        const proof = proofs?.[item.action.actionId];
+        if (!proof) throw new Error('canonical action application proof conflict');
+        return {
+          outcome: outcomes?.[item.action.actionId] || 'already_applied',
+          proof: clone(proof)
+        };
+      });
+    }
+
+    async function verifyAppliedBatch({ prepared, items }) {
+      const inspected = await repository.inspectPreparedCanonicalBatch(prepared);
+      return projectedResults(items, inspected.proofs, null);
+    }
+
+    async function applyBatch({ prepared, items }) {
+      const applied = await repository.applyPreparedCanonicalBatch(prepared);
+      const outcomes = Object.fromEntries(items.map(item => [
+        item.action.actionId,
+        applied.plansChanged || applied.historyChanged ? 'applied' : 'already_applied'
+      ]));
+      return projectedResults(items, applied.proofs, outcomes);
+    }
+
+    return { preflightBatch, verifyAppliedBatch, applyBatch };
+  }
+
   function createCanonicalActionApplier(options = {}) {
     const adapters = options.adapters || {};
     const globalProofStore = options.globalProofStore;
@@ -377,7 +437,7 @@
           return { status: 'unsupported', actionId: action.actionId, kind };
         }
       }
-      if (!globalProofStore?.load || !globalProofStore?.save || typeof acknowledgeUiApplied !== 'function') {
+      if (!globalProofStore?.load || !globalProofStore?.mergeCanonicalProofs || typeof acknowledgeUiApplied !== 'function') {
         throw new Error('canonical action application dependency conflict');
       }
 
@@ -386,11 +446,6 @@
       const work = actions.map(action => {
         const family = FAMILY_BY_KIND[action.kind];
         const adapter = adapters[family];
-        if (typeof adapter.preflight !== 'function'
-          || typeof adapter.verifyApplied !== 'function'
-          || typeof adapter.apply !== 'function') {
-          throw new Error('canonical action adapter conflict');
-        }
         return {
           action,
           family,
@@ -399,19 +454,101 @@
           stored: proofs[action.actionId]
         };
       });
-
+      const blocks = [];
       for (const item of work) {
-        await item.adapter.preflight({
-          action: item.action,
-          request: item.expected,
-          result: input.result,
-          localTurnId: input.localTurnId
-        });
+        if (item.family === 'role_plan') {
+          const last = blocks.at(-1);
+          if (last?.family === 'role_plan') last.items.push(item);
+          else blocks.push({ family: item.family, adapter: item.adapter, items: [item], batch: true });
+        } else {
+          blocks.push({ family: item.family, adapter: item.adapter, items: [item], batch: false });
+        }
+      }
+      for (const block of blocks) {
+        if (block.batch) {
+          if (typeof block.adapter.preflightBatch !== 'function'
+            || typeof block.adapter.verifyAppliedBatch !== 'function'
+            || typeof block.adapter.applyBatch !== 'function') {
+            throw new Error('canonical action adapter conflict');
+          }
+          block.prepared = await block.adapter.preflightBatch({
+            items: block.items,
+            result: input.result,
+            localTurnId: input.localTurnId
+          });
+        } else {
+          const item = block.items[0];
+          if (typeof item.adapter.preflight !== 'function'
+            || typeof item.adapter.verifyApplied !== 'function'
+            || typeof item.adapter.apply !== 'function') {
+            throw new Error('canonical action adapter conflict');
+          }
+          await item.adapter.preflight({
+            action: item.action,
+            request: item.expected,
+            result: input.result,
+            localTurnId: input.localTurnId
+          });
+        }
       }
 
-      const pending = [];
+      function orderedBatchResults(items, outcomes) {
+        if (Array.isArray(outcomes)) {
+          if (outcomes.length !== items.length) throw new Error('canonical action application proof conflict');
+          return outcomes;
+        }
+        const expectedIds = items.map(item => item.action.actionId);
+        if (!plainObject(outcomes)
+          || Object.keys(outcomes).join('\u0000') !== expectedIds.join('\u0000')) {
+          throw new Error('canonical action application proof conflict');
+        }
+        return items.map(item => outcomes[item.action.actionId]);
+      }
+
+      async function mergeGlobalProof(actionId, proof) {
+        const merged = await globalProofStore.mergeCanonicalProofs({ [actionId]: proof });
+        if (!plainObject(merged)) throw new Error('canonical action proof store conflict');
+        proofs = merged;
+      }
+
+      const pendingIds = new Set();
       const sessionProofs = {};
-      for (const item of work) {
+      for (const block of blocks) {
+        if (block.batch) {
+          const existing = [];
+          for (const item of block.items) {
+            if (item.stored == null) {
+              pendingIds.add(item.action.actionId);
+              continue;
+            }
+            if (!proofMatches(item.stored, item.expected)) {
+              return { status: 'conflict', actionId: item.action.actionId, kind: item.action.kind };
+            }
+            existing.push(item);
+          }
+          if (existing.length) {
+            const verified = await block.adapter.verifyAppliedBatch({
+              prepared: block.prepared,
+              items: existing,
+              result: input.result,
+              localTurnId: input.localTurnId
+            });
+            const outcomes = orderedBatchResults(existing, verified);
+            for (let index = 0; index < existing.length; index += 1) {
+              const item = existing[index];
+              const outcome = outcomes[index];
+              if (outcome?.outcome !== 'already_applied'
+                || !proofMatches(outcome?.proof, item.expected)
+                || !sameFields(outcome.proof, item.stored,
+                  ['turnId', 'actionId', 'actionChecksum', 'type', 'appliedAt'])) {
+                throw new Error('canonical action application proof conflict');
+              }
+              sessionProofs[item.action.actionId] = outcome.proof;
+            }
+          }
+          continue;
+        }
+        const item = block.items[0];
         if (item.stored != null) {
           if (!proofMatches(item.stored, item.expected)) {
             return { status: 'conflict', actionId: item.action.actionId, kind: item.action.kind };
@@ -429,12 +566,43 @@
             throw new Error('canonical action application proof conflict');
           }
           sessionProofs[item.action.actionId] = verified.proof;
-          continue;
+        } else {
+          pendingIds.add(item.action.actionId);
         }
-        pending.push(item);
       }
 
-      for (const item of pending) {
+      for (const block of blocks) {
+        const pendingItems = block.items.filter(item => pendingIds.has(item.action.actionId));
+        if (!pendingItems.length) continue;
+        if (block.batch) {
+          const applied = await block.adapter.applyBatch({
+            prepared: block.prepared,
+            items: block.items,
+            pendingActionIds: pendingItems.map(item => item.action.actionId),
+            result: input.result,
+            localTurnId: input.localTurnId
+          });
+          const outcomes = orderedBatchResults(block.items, applied);
+          for (let index = 0; index < block.items.length; index += 1) {
+            const item = block.items[index];
+            const outcome = outcomes[index];
+            if (!['applied', 'already_applied'].includes(outcome?.outcome)
+              || !proofMatches(outcome?.proof, item.expected)
+              || (item.stored != null && !sameFields(outcome.proof, item.stored,
+                ['turnId', 'actionId', 'actionChecksum', 'type', 'appliedAt']))) {
+              throw new Error('canonical action application proof conflict');
+            }
+            sessionProofs[item.action.actionId] = outcome.proof;
+          }
+          await fault(`after_domain_batch:${block.family}:${block.items[0].action.ordinal}:${block.items.at(-1).action.ordinal}`);
+          for (const item of pendingItems) {
+            const proof = outcomes[block.items.indexOf(item)].proof;
+            await mergeGlobalProof(item.action.actionId, proof);
+            await fault(`after_global_proof:${item.action.actionId}`);
+          }
+          continue;
+        }
+        const item = pendingItems[0];
         const applied = await item.adapter.apply({
           action: item.action,
           request: item.expected,
@@ -447,9 +615,7 @@
         }
         sessionProofs[item.action.actionId] = applied.proof;
         await fault(`after_domain:${item.action.actionId}`);
-        proofs = { ...proofs, [item.action.actionId]: applied.proof };
-        proofs = trimProofs(proofs);
-        await globalProofStore.save(proofs);
+        await mergeGlobalProof(item.action.actionId, applied.proof);
         await fault(`after_global_proof:${item.action.actionId}`);
       }
 
@@ -472,7 +638,7 @@
         visibleGroupId
       });
       await fault('after_ui_ack');
-      return { status: pending.length ? 'ready_for_ui_ack' : 'already_proven' };
+      return { status: pendingIds.size ? 'ready_for_ui_ack' : 'already_proven' };
     }
 
     return { applyGroup };
@@ -480,6 +646,7 @@
 
   root.ALCanonicalActionApplication = {
     createCanonicalActionApplier,
-    createPaymentActionAdapter
+    createPaymentActionAdapter,
+    createRolePlanActionAdapter
   };
 })(typeof globalThis !== 'undefined' ? globalThis : self);

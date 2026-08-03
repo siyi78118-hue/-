@@ -11,6 +11,10 @@
   ]);
   const CANONICAL_PROOF_KEYS = Object.freeze([...CANONICAL_REQUEST_KEYS, 'appliedAt']);
   const CANONICAL_HISTORY_KEYS = Object.freeze(['historyId', 'planId', 'operation', 'detailJson', 'createdAt']);
+  const CANONICAL_DESCRIPTOR_KEYS = Object.freeze([
+    'authoritativeTurnId', 'actionId', 'actionChecksum', 'kind',
+    'targetKey', 'targetRevision', 'operation'
+  ]);
   const ACTIVE_LIMIT = 50;
   const MIN_SEND_GAP_MS = 5 * 60 * 1000;
 
@@ -193,6 +197,16 @@
     return compact(left, 600).replace(/\s+/g, '') === compact(right, 600).replace(/\s+/g, '');
   }
 
+  function semanticDuplicatePlan(plans, operation, characterId) {
+    return (Array.isArray(plans) ? plans : []).find(plan => (
+      plan.characterId === characterId
+      && plan.type === operation.type
+      && plan.status === 'active'
+      && sameIntent(plan.intent, operation.intent)
+      && Math.abs(Number(plan.nextRunAt) - Number(operation.nextRunAt)) < MIN_SEND_GAP_MS
+    )) || null;
+  }
+
   function applyOperations(plans, history, operations, context = {}) {
     const nextPlans = copy(Array.isArray(plans) ? plans : []);
     let nextHistory = copy(Array.isArray(history) ? history : []);
@@ -209,13 +223,7 @@
       }
       const operation = checked.value;
       if (operation.op === 'create') {
-        const duplicate = nextPlans.find(plan => (
-          plan.characterId === context.charId
-          && plan.type === operation.type
-          && plan.status === 'active'
-          && sameIntent(plan.intent, operation.intent)
-          && Math.abs(Number(plan.nextRunAt) - Number(operation.nextRunAt)) < MIN_SEND_GAP_MS
-        ));
+        const duplicate = semanticDuplicatePlan(nextPlans, operation, context.charId);
         if (duplicate) {
           duplicate.nextRunAt = operation.nextRunAt;
           duplicate.schedule = copy(operation.schedule);
@@ -360,6 +368,57 @@
       && CANONICAL_HISTORY_KEYS.every(key => canonicalJson(left[key]) === canonicalJson(right[key]));
   }
 
+  function findCanonicalProofOwner(plans, actionId) {
+    const owners = (Array.isArray(plans) ? plans : []).filter(plan => (
+      plainObject(plan?.canonicalActionApplications)
+      && Object.hasOwn(plan.canonicalActionApplications, actionId)
+    ));
+    if (owners.length > 1) throw new Error('canonical role plan authority conflict');
+    return owners[0] || null;
+  }
+
+  function globalApplicationProof(request, proof) {
+    return {
+      turnId: request.authoritativeTurnId,
+      actionId: request.actionId,
+      actionChecksum: request.actionChecksum,
+      type: request.kind,
+      appliedAt: proof.appliedAt
+    };
+  }
+
+  function inspectCanonicalApplications(plans, history, pairs) {
+    const nextPlans = copy(Array.isArray(plans) ? plans : []);
+    const nextHistory = copy(Array.isArray(history) ? history : []);
+    const checkedPairs = (Array.isArray(pairs) ? pairs : []).map(validateCanonicalPair);
+    const incomingIds = new Set();
+    const proofs = {};
+    const missingActionIds = [];
+    for (const pair of checkedPairs) {
+      const request = pair.request;
+      if (incomingIds.has(request.actionId)) throw new Error('canonical role plan authority conflict');
+      incomingIds.add(request.actionId);
+      const owner = findCanonicalProofOwner(nextPlans, request.actionId);
+      const proof = owner?.canonicalActionApplications?.[request.actionId] || null;
+      const historyMatches = nextHistory.filter(row => row?.historyId === request.actionId);
+      if (!proof) {
+        if (historyMatches.length) throw new Error('canonical role plan history conflict');
+        missingActionIds.push(request.actionId);
+        continue;
+      }
+      if (owner.planId !== request.planId || !requestMatchesProof(request, proof)) {
+        throw new Error('canonical role plan authority conflict');
+      }
+      const expectedHistory = canonicalHistoryRow(proof);
+      if (historyMatches.length > 1
+        || (historyMatches.length === 1 && !sameCanonicalHistory(historyMatches[0], expectedHistory))) {
+        throw new Error('canonical role plan history conflict');
+      }
+      proofs[request.actionId] = globalApplicationProof(request, proof);
+    }
+    return { proofs, missingActionIds };
+  }
+
   function applyCanonicalApplications(plans, history, pairs, context = {}) {
     const nextPlans = copy(Array.isArray(plans) ? plans : []);
     const nextHistory = copy(Array.isArray(history) ? history : []);
@@ -377,12 +436,7 @@
 
     for (const pair of checkedPairs) {
       const { operation, request } = pair;
-      const owners = nextPlans.filter(plan => (
-        plainObject(plan?.canonicalActionApplications)
-        && Object.hasOwn(plan.canonicalActionApplications, request.actionId)
-      ));
-      if (owners.length > 1) throw new Error('canonical role plan authority conflict');
-      let target = owners[0] || null;
+      let target = findCanonicalProofOwner(nextPlans, request.actionId);
       let proof = target?.canonicalActionApplications?.[request.actionId] || null;
       if (proof) {
         if (target.planId !== request.planId || !requestMatchesProof(request, proof)) {
@@ -426,12 +480,97 @@
       }
     }
 
+    const inspected = inspectCanonicalApplications(nextPlans, nextHistory, checkedPairs);
+    if (inspected.missingActionIds.length) throw new Error('canonical role plan authority conflict');
     return {
       plans: nextPlans,
       history: nextHistory,
       changed: plansChanged || historyChanged,
       plansChanged,
-      historyChanged
+      historyChanged,
+      proofs: inspected.proofs
+    };
+  }
+
+  function validateCanonicalDescriptor(descriptor) {
+    if (!exactKeys(descriptor, CANONICAL_DESCRIPTOR_KEYS)
+      || !plainObject(descriptor.operation)
+      || !nativeNonemptyString(descriptor.authoritativeTurnId, 128)
+      || !nativeNonemptyString(descriptor.actionId, 128)
+      || typeof descriptor.actionChecksum !== 'string'
+      || !/^[a-f0-9]{64}$/.test(descriptor.actionChecksum)
+      || typeof descriptor.targetKey !== 'string'
+      || !descriptor.targetKey
+      || typeof descriptor.targetRevision !== 'string'
+      || !descriptor.targetRevision) {
+      throw new Error('canonical role plan authority conflict');
+    }
+    const operation = copy(descriptor.operation);
+    if (!CANONICAL_PLAN_OPERATIONS.has(operation.op)
+      || descriptor.kind !== `role_plan_${operation.op}`) {
+      throw new Error('canonical role plan authority conflict');
+    }
+    if (operation.op === 'create') {
+      if (!nativeNonemptyString(operation.planId, 96)
+        || !/^lineage_create:[a-zA-Z0-9._:-]+:role_plan_create$/.test(descriptor.targetKey)) {
+        throw new Error('canonical role plan authority conflict');
+      }
+    } else if (!nativeNonemptyString(operation.planId, 96)
+      || descriptor.targetKey !== `role_plan:${operation.planId}`) {
+      throw new Error('canonical role plan authority conflict');
+    }
+    return { ...copy(descriptor), operation };
+  }
+
+  function canonicalPairForDescriptor(descriptor, planId) {
+    return {
+      operation: copy(descriptor.operation),
+      request: {
+        version: 1,
+        authoritativeTurnId: descriptor.authoritativeTurnId,
+        actionId: descriptor.actionId,
+        actionChecksum: descriptor.actionChecksum,
+        kind: descriptor.kind,
+        planId,
+        operationJson: canonicalJson(descriptor.operation)
+      }
+    };
+  }
+
+  function prepareCanonicalApplications(plans, history, descriptors, context = {}) {
+    const checked = (Array.isArray(descriptors) ? descriptors : []).map(validateCanonicalDescriptor);
+    const incomingIds = new Set();
+    let runningPlans = copy(Array.isArray(plans) ? plans : []);
+    let runningHistory = copy(Array.isArray(history) ? history : []);
+    const pairs = [];
+    for (const descriptor of checked) {
+      if (incomingIds.has(descriptor.actionId)) throw new Error('canonical role plan authority conflict');
+      incomingIds.add(descriptor.actionId);
+      const owner = findCanonicalProofOwner(runningPlans, descriptor.actionId);
+      let planId = owner?.planId || descriptor.operation.planId;
+      if (!owner && descriptor.operation.op === 'create') {
+        const normalized = normalizeOperation(descriptor.operation, {
+          ...context,
+          now: Number(context.now),
+          uid: () => descriptor.operation.planId
+        });
+        if (!normalized.ok) throw new Error('canonical role plan operation conflict');
+        planId = semanticDuplicatePlan(runningPlans, normalized.value, context.charId)?.planId
+          || normalized.value.planId;
+      }
+      const pair = canonicalPairForDescriptor(descriptor, planId);
+      const preview = applyCanonicalApplications(runningPlans, runningHistory, [pair], context);
+      runningPlans = preview.plans;
+      runningHistory = preview.history;
+      pairs.push(pair);
+    }
+    return {
+      pairs: copy(pairs),
+      preview: {
+        plans: runningPlans,
+        history: runningHistory,
+        proofs: inspectCanonicalApplications(runningPlans, runningHistory, pairs).proofs
+      }
     };
   }
 
@@ -522,6 +661,8 @@
     normalizeOperation,
     applyOperations,
     applyCanonicalApplications,
+    prepareCanonicalApplications,
+    inspectCanonicalApplications,
     nextOccurrence,
     occurrenceId,
     effectivePlans,

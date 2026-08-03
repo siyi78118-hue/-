@@ -8,6 +8,31 @@
     return value == null ? value : JSON.parse(JSON.stringify(value));
   }
 
+  function snapshot(value) {
+    return JSON.stringify(value);
+  }
+
+  function canonicalJson(value) {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (value && typeof value === 'object') {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  function canonicalRows(rows) {
+    return clone(Array.isArray(rows) ? rows : [])
+      .sort((left, right) => {
+        const leftJson = canonicalJson(left);
+        const rightJson = canonicalJson(right);
+        return leftJson < rightJson ? -1 : (leftJson > rightJson ? 1 : 0);
+      });
+  }
+
+  function scopeChecksum(plans, history) {
+    return canonicalJson({ plans: canonicalRows(plans), history: canonicalRows(history) });
+  }
+
   function create(options = {}) {
     const domain = options.domain;
     const nativePlugin = options.nativePlugin || null;
@@ -40,7 +65,10 @@
     }
 
     async function replace(characterId, plans, history) {
-      if (nativePlugin?.replaceRolePlans) {
+      if (nativePlugin && typeof nativePlugin.readCanonicalRolePlanBundle !== 'function') {
+        if (typeof nativePlugin.replaceRolePlans !== 'function') {
+          throw new Error('role plan native repository conflict');
+        }
         await nativePlugin.replaceRolePlans({
           characterId,
           plansJson: JSON.stringify(plans),
@@ -48,17 +76,10 @@
         });
         return;
       }
-      const existingPlans = await allPlans();
-      const existingHistory = await allHistory();
-      await metaStore.setMeta(PLANS_KEY, [
-        ...existingPlans.filter(plan => plan.characterId !== characterId),
-        ...plans
-      ]);
-      const changedPlanIds = new Set(plans.map(plan => plan.planId));
-      await metaStore.setMeta(HISTORY_KEY, [
-        ...existingHistory.filter(row => !changedPlanIds.has(row.planId)),
-        ...history
-      ]);
+      const requestedIds = new Set((Array.isArray(plans) ? plans : [])
+        .map(plan => plan?.planId).filter(Boolean));
+      const scope = await readCanonicalScope(characterId, requestedIds);
+      await compareAndSwapCanonicalScope(scope, plans, history, []);
     }
 
     async function history(planId, limit = 100) {
@@ -73,70 +94,218 @@
     }
 
     async function apply(characterId, operations) {
-      const plans = await list(characterId, { includeTerminal: true });
-      const planIds = new Set(plans.map(plan => plan.planId));
-      const historyRows = nativePlugin?.rolePlanHistory
-        ? (await Promise.all([...planIds].map(planId => history(planId, 200)))).flat()
-        : (await allHistory()).filter(row => planIds.has(row.planId));
-      const result = domain.applyOperations(plans, historyRows, operations, {
+      if (nativePlugin && typeof nativePlugin.readCanonicalRolePlanBundle !== 'function') {
+        const plans = await list(characterId, { includeTerminal: true });
+        const planIds = new Set(plans.map(plan => plan.planId));
+        const historyRows = (await Promise.all([...planIds].map(planId => history(planId, 200)))).flat();
+        const result = domain.applyOperations(plans, historyRows, operations, {
+          charId: characterId,
+          now: now(),
+          uid
+        });
+        if (result.changed) await replace(characterId, result.plans, result.history);
+        return result;
+      }
+      const scope = await readCanonicalScope(characterId);
+      const result = domain.applyOperations(scope.plans, scope.historyRows, operations, {
         charId: characterId,
         now: now(),
         uid
       });
-      if (result.changed) await replace(characterId, result.plans, result.history);
+      if (result.changed) await compareAndSwapCanonicalScope(scope, result.plans, result.history, []);
       return result;
     }
 
     async function applyCanonical(characterId, orderedPairs) {
-      const allPlanRows = nativePlugin?.listRolePlans ? null : await allPlans();
-      const plans = nativePlugin?.listRolePlans
-        ? await list(characterId, { includeTerminal: true })
-        : allPlanRows.filter(plan => plan.characterId === characterId);
-      const requestedPlanIds = (Array.isArray(orderedPairs) ? orderedPairs : [])
-        .map(pair => pair?.request?.planId)
-        .filter(planId => typeof planId === 'string' && planId.length > 0);
-      const planIds = new Set([
-        ...plans.map(plan => plan.planId),
-        ...requestedPlanIds
-      ]);
-      const allHistoryRows = nativePlugin?.rolePlanHistory ? null : await allHistory();
-      const historyRows = nativePlugin?.rolePlanHistory
-        ? (await Promise.all([...planIds].map(planId => history(planId, 200)))).flat()
-        : allHistoryRows.filter(row => planIds.has(row.planId));
+      const scope = await readCanonicalScope(characterId, pairPlanIds(orderedPairs));
+      assertNoForeignCanonicalActionOwners(scope, (Array.isArray(orderedPairs) ? orderedPairs : [])
+        .map(pair => pair?.request?.actionId));
       const appliedAt = Number(now());
-      const result = domain.applyCanonicalApplications(plans, historyRows, orderedPairs, {
+      const result = domain.applyCanonicalApplications(scope.plans, scope.historyRows, orderedPairs, {
         charId: characterId,
         now: appliedAt,
         appliedAt,
         uid
       });
       if (!result.plansChanged && !result.historyChanged) return result;
+      await compareAndSwapCanonicalScope(scope, result.plans, result.history, (Array.isArray(orderedPairs) ? orderedPairs : [])
+        .map(pair => pair?.request?.actionId));
+      return result;
+    }
 
-      if (nativePlugin?.replaceRolePlans) {
-        await nativePlugin.replaceRolePlans({
-          characterId,
-          plansJson: JSON.stringify(result.plans),
-          historyJson: JSON.stringify(result.history)
-        });
-        return result;
+    function pairPlanIds(pairs) {
+      const ids = new Set();
+      for (const pair of Array.isArray(pairs) ? pairs : []) {
+        if (typeof pair?.request?.planId === 'string' && pair.request.planId) ids.add(pair.request.planId);
+        try {
+          const operation = JSON.parse(pair?.request?.operationJson || 'null');
+          if (typeof operation?.planId === 'string' && operation.planId) ids.add(operation.planId);
+        } catch {}
       }
+      return ids;
+    }
 
-      const scopePlanIds = new Set([
-        ...plans.map(plan => plan.planId),
-        ...result.plans.map(plan => plan.planId)
+    function descriptorPlanIds(descriptors) {
+      return new Set((Array.isArray(descriptors) ? descriptors : [])
+        .map(row => row?.operation?.planId)
+        .filter(planId => typeof planId === 'string' && planId));
+    }
+
+    function assertNoForeignCanonicalActionOwners(scope, actionIds) {
+      const incoming = new Set(actionIds || []);
+      const localPlanIds = new Set([
+        ...scope.plans.map(plan => plan.planId),
+        ...(scope.requestedPlanIds || [])
       ]);
-      if (result.plansChanged) {
-        await metaStore.setMeta(PLANS_KEY, [
-          ...allPlanRows.filter(plan => plan.characterId !== characterId),
-          ...result.plans
-        ]);
+      for (const plan of scope.allPlanRows) {
+        const ledger = plan?.canonicalActionApplications;
+        if (!ledger || typeof ledger !== 'object' || Array.isArray(ledger)) continue;
+        for (const actionId of Object.keys(ledger)) {
+          if (incoming.has(actionId) && plan.characterId !== scope.characterId) {
+            throw new Error('canonical role plan authority conflict');
+          }
+        }
       }
-      if (result.historyChanged) {
-        await metaStore.setMeta(HISTORY_KEY, [
-          ...allHistoryRows.filter(row => !scopePlanIds.has(row.planId)),
-          ...result.history
-        ]);
+      for (const row of scope.allHistoryRows) {
+        if (incoming.has(row?.historyId) && !localPlanIds.has(row.planId)) {
+          throw new Error('canonical role plan authority conflict');
+        }
       }
+    }
+
+    async function readCanonicalScope(characterId, requestedIds = new Set()) {
+      if (nativePlugin) {
+        if (typeof nativePlugin.readCanonicalRolePlanBundle !== 'function') {
+          throw new Error('canonical role plan CAS unavailable');
+        }
+        const bundle = await nativePlugin.readCanonicalRolePlanBundle({
+          characterId,
+          requestedPlanIds: [...requestedIds]
+        });
+        if (!Array.isArray(bundle?.plans) || !Array.isArray(bundle?.history)
+          || !Array.isArray(bundle?.allPlans) || !Array.isArray(bundle?.allHistory)) {
+          throw new Error('canonical role plan CAS unavailable');
+        }
+        const scope = {
+          characterId,
+          requestedPlanIds: [...requestedIds],
+          plans: clone(bundle.plans),
+          historyRows: clone(bundle.history),
+          allPlanRows: clone(bundle.allPlans),
+          allHistoryRows: clone(bundle.allHistory)
+        };
+        scope.scopeChecksum = scopeChecksum(scope.plans, scope.historyRows);
+        return scope;
+      }
+      const allPlanRows = await allPlans();
+      const plans = allPlanRows.filter(plan => plan.characterId === characterId);
+      const planIds = new Set([...plans.map(plan => plan.planId), ...requestedIds]);
+      const allHistoryRows = await allHistory();
+      const historyRows = allHistoryRows.filter(row => planIds.has(row.planId));
+      return {
+        characterId,
+        requestedPlanIds: [...requestedIds],
+        allPlanRows,
+        plans,
+        allHistoryRows,
+        historyRows,
+        scopeChecksum: scopeChecksum(plans, historyRows)
+      };
+    }
+
+    async function compareAndSwapCanonicalScope(scope, plans, historyRows, incomingActionIds = []) {
+      if (nativePlugin) {
+        if (typeof nativePlugin.replaceRolePlansIfUnchanged !== 'function') {
+          throw new Error('canonical role plan CAS unavailable');
+        }
+        const result = await nativePlugin.replaceRolePlansIfUnchanged({
+          characterId: scope.characterId,
+          requestedPlanIds: clone(scope.requestedPlanIds || []),
+          expectedScopeChecksum: scope.scopeChecksum,
+          incomingActionIds: clone(incomingActionIds),
+          plansJson: JSON.stringify(plans),
+          historyJson: JSON.stringify(historyRows)
+        });
+        if (result?.status === 'stale') throw new Error('canonical role plan prepared state conflict');
+        if (result?.status !== 'applied') throw new Error('canonical role plan CAS unavailable');
+        return;
+      }
+      if (typeof metaStore.compareAndSwapRolePlanBundle !== 'function') {
+        throw new Error('canonical role plan CAS unavailable');
+      }
+      const result = await metaStore.compareAndSwapRolePlanBundle({
+        characterId: scope.characterId,
+        requestedPlanIds: clone(scope.requestedPlanIds || []),
+        expectedScopeChecksum: scope.scopeChecksum,
+        incomingActionIds: clone(incomingActionIds),
+        plans: clone(plans),
+        history: clone(historyRows)
+      });
+      if (result?.status === 'stale') throw new Error('canonical role plan prepared state conflict');
+      if (result?.status !== 'applied') throw new Error('canonical role plan CAS unavailable');
+    }
+
+    async function prepareCanonicalBatch(characterId, descriptors) {
+      const appliedAt = Number(now());
+      if (!Number.isSafeInteger(appliedAt) || appliedAt <= 0) {
+        throw new Error('canonical role plan prepared state conflict');
+      }
+      const scope = await readCanonicalScope(characterId, descriptorPlanIds(descriptors));
+      assertNoForeignCanonicalActionOwners(scope, (Array.isArray(descriptors) ? descriptors : []).map(row => row?.actionId));
+      const prepared = domain.prepareCanonicalApplications(scope.plans, scope.historyRows, descriptors, {
+        charId: characterId,
+        now: appliedAt,
+        appliedAt,
+        uid
+      });
+      return {
+        characterId,
+        appliedAt,
+        pairs: clone(prepared.pairs),
+        scopeChecksum: scope.scopeChecksum
+      };
+    }
+
+    function validatePrepared(prepared) {
+      if (!prepared || typeof prepared !== 'object'
+        || Array.isArray(prepared)
+        || typeof prepared.characterId !== 'string'
+        || !prepared.characterId
+        || !Number.isSafeInteger(prepared.appliedAt)
+        || prepared.appliedAt <= 0
+        || !Array.isArray(prepared.pairs)
+        || typeof prepared.scopeChecksum !== 'string'
+        || !prepared.scopeChecksum) {
+        throw new Error('canonical role plan prepared state conflict');
+      }
+    }
+
+    async function currentPreparedScope(prepared) {
+      validatePrepared(prepared);
+      const scope = await readCanonicalScope(prepared.characterId, pairPlanIds(prepared.pairs));
+      assertNoForeignCanonicalActionOwners(scope, prepared.pairs.map(pair => pair?.request?.actionId));
+      if (scope.scopeChecksum !== prepared.scopeChecksum) {
+        throw new Error('canonical role plan prepared state conflict');
+      }
+      return scope;
+    }
+
+    async function inspectPreparedCanonicalBatch(prepared) {
+      const scope = await currentPreparedScope(prepared);
+      return domain.inspectCanonicalApplications(scope.plans, scope.historyRows, prepared.pairs);
+    }
+
+    async function applyPreparedCanonicalBatch(prepared) {
+      const scope = await currentPreparedScope(prepared);
+      const result = domain.applyCanonicalApplications(scope.plans, scope.historyRows, prepared.pairs, {
+        charId: prepared.characterId,
+        now: prepared.appliedAt,
+        appliedAt: prepared.appliedAt,
+        uid
+      });
+      if (!result.plansChanged && !result.historyChanged) return result;
+      await compareAndSwapCanonicalScope(scope, result.plans, result.history,
+        prepared.pairs.map(pair => pair?.request?.actionId));
       return result;
     }
 
@@ -154,7 +323,19 @@
       return list(characterId, { includeTerminal: true });
     }
 
-    return { list, apply, applyCanonical, mutate, replace, history, scheduleContext, reconcile };
+    return {
+      list,
+      apply,
+      applyCanonical,
+      prepareCanonicalBatch,
+      inspectPreparedCanonicalBatch,
+      applyPreparedCanonicalBatch,
+      mutate,
+      replace,
+      history,
+      scheduleContext,
+      reconcile
+    };
   }
 
   root.ALRolePlanRepository = { create, PLANS_KEY, HISTORY_KEY };
