@@ -6272,6 +6272,16 @@ export class YuqiStore {
     const namespace = namespaceByKind[kind];
     if (!namespace) throw new Error('unknown canonical action target kind');
     const payload = action.payload || {};
+    const exactPayloadTarget = (key, legacyKey) => {
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || Object.hasOwn(payload, legacyKey)
+        || !Object.hasOwn(payload, key)
+        || typeof payload[key] !== 'string'
+        || payload[key].length === 0) {
+        throw new Error('canonical action target identity conflict');
+      }
+      return payload[key];
+    };
     const targetId = namespace === 'lineage_create'
       ? `${turn.authorityLineageKey}:${kind}`
       : namespace === 'payment'
@@ -6279,11 +6289,11 @@ export class YuqiStore {
         : namespace === 'moment'
           ? payload.momentId
           : namespace === 'comment'
-            ? payload.commentId
+            ? exactPayloadTarget('replyToCommentId', 'commentId')
             : namespace === 'role_plan'
-              ? payload.rolePlanId
+              ? exactPayloadTarget('planId', 'rolePlanId')
               : namespace === 'life_episode'
-                ? payload.episodeId
+                ? exactPayloadTarget('targetEpisodeId', 'episodeId')
                 : namespace === 'relationship'
                   ? turn.characterId
                   : null;

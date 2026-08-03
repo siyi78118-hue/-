@@ -853,14 +853,20 @@ test('canonical action target registry resolves every supported authority namesp
     );
     const cases = [
       ['payment_accept', { messageId: 'pay_1' }, 'payment:pay_1'],
+      ['payment_decline', { messageId: 'pay_1' }, 'payment:pay_1'],
       ['moment_create', {}, 'lineage_create:lin_registry:moment_create'],
       ['moment_like', { momentId: 'moment_1' }, 'moment:moment_1'],
       ['moment_comment', { momentId: 'moment_1' }, 'moment:moment_1'],
-      ['moment_reply', { commentId: 'comment_1' }, 'comment:comment_1'],
+      ['moment_reply', { replyToCommentId: 'comment_1' }, 'comment:comment_1'],
       ['role_plan_create', {}, 'lineage_create:lin_registry:role_plan_create'],
-      ['role_plan_update', { rolePlanId: 'plan_1' }, 'role_plan:plan_1'],
+      ['role_plan_update', { op: 'update', planId: 'plan_1' }, 'role_plan:plan_1'],
+      ['role_plan_cancel', { op: 'cancel', planId: 'plan_1' }, 'role_plan:plan_1'],
+      ['role_plan_pause', { op: 'pause', planId: 'plan_1' }, 'role_plan:plan_1'],
+      ['role_plan_resume', { op: 'resume', planId: 'plan_1' }, 'role_plan:plan_1'],
+      ['role_plan_complete', { op: 'complete', planId: 'plan_1' }, 'role_plan:plan_1'],
       ['life_episode_create', {}, 'lineage_create:lin_registry:life_episode_create'],
-      ['life_episode_update', { episodeId: 'life_1' }, 'life_episode:life_1'],
+      ['life_episode_update', { type: 'reschedule', targetEpisodeId: 'life_1' }, 'life_episode:life_1'],
+      ['life_episode_cancel', { type: 'cancel', targetEpisodeId: 'life_1' }, 'life_episode:life_1'],
       ['relationship_transition', {}, 'relationship:yuqi']
     ];
     for (const [kind, payload, targetKey] of cases) {
@@ -871,6 +877,191 @@ test('canonical action target registry resolves every supported authority namesp
       assert.equal(resolved.targetKey, targetKey, kind);
       assert.ok(resolved.targetRevision, kind);
     }
+  }));
+
+test('canonical wire target names are exact while domain target sources stay native', () =>
+  withStore(store => {
+    store.putLifePlanInternal('yuqi', [{
+      episodeId: 'life_1',
+      kind: 'work',
+      title: '整理画稿',
+      startAt: 2_000,
+      endAt: 3_000,
+      payload: {}
+    }]);
+    const turn = {
+      turnId: 'turn_exact_wire_target',
+      characterId: 'yuqi',
+      authorityLineageKey: 'lin_exact_wire_target',
+      envelopeJson: JSON.stringify({
+        context: {
+          commentId: 'comment_1',
+          rolePlan: { rolePlanId: 'plan_1', revision: 2 }
+        },
+        trigger: {
+          context: {
+            targetCommentId: 'comment_nested_only',
+            planId: 'plan_nested_only'
+          }
+        }
+      })
+    };
+    store.db.prepare(`
+      INSERT INTO turn_authority_lineages(
+        lineage_key,
+        role_id,
+        lane_key,
+        root_source_id,
+        latest_turn_id,
+        revision,
+        state,
+        committed_group_id,
+        created_at,
+        updated_at
+      ) VALUES (?, ?, ?, ?, ?, 1, 'open', NULL, 1, 1)
+    `).run(
+      turn.authorityLineageKey,
+      turn.characterId,
+      'private_chat',
+      'exact_wire_source',
+      turn.turnId
+    );
+
+    const cases = [
+      {
+        kind: 'moment_reply',
+        canonicalKey: 'replyToCommentId',
+        legacyKey: 'commentId',
+        targetId: 'comment_1',
+        targetKey: 'comment:comment_1',
+        domainId: resolved => resolved.canonicalTarget.commentId
+      },
+      {
+        kind: 'role_plan_update',
+        canonicalKey: 'planId',
+        legacyKey: 'rolePlanId',
+        targetId: 'plan_1',
+        targetKey: 'role_plan:plan_1',
+        domainId: resolved => resolved.canonicalTarget.rolePlanId
+      },
+      {
+        kind: 'life_episode_update',
+        canonicalKey: 'targetEpisodeId',
+        legacyKey: 'episodeId',
+        targetId: 'life_1',
+        targetKey: 'life_episode:life_1',
+        domainId: resolved => resolved.canonicalTarget.episodeId
+      }
+    ];
+    for (const entry of cases) {
+      const resolved = store.resolveCanonicalActionTargetInternal({
+        turn,
+        action: {
+          kind: entry.kind,
+          payload: { [entry.canonicalKey]: entry.targetId }
+        }
+      });
+      assert.equal(resolved.targetKey, entry.targetKey, entry.kind);
+      assert.equal(entry.domainId(resolved), entry.targetId, `${entry.kind} domain source`);
+
+      assert.throws(() => store.resolveCanonicalActionTargetInternal({
+        turn,
+        action: {
+          kind: entry.kind,
+          payload: { [entry.legacyKey]: entry.targetId }
+        }
+      }), /canonical .* target|target identity conflict/i, `${entry.kind} legacy wire key`);
+      assert.throws(() => store.resolveCanonicalActionTargetInternal({
+        turn,
+        action: {
+          kind: entry.kind,
+          payload: {
+            [entry.canonicalKey]: entry.targetId,
+            [entry.legacyKey]: entry.targetId
+          }
+        }
+      }), /canonical .* target|target identity conflict/i, `${entry.kind} dual wire keys`);
+      const inheritedPayload = Object.create({ [entry.canonicalKey]: entry.targetId });
+      assert.throws(() => store.resolveCanonicalActionTargetInternal({
+        turn,
+        action: { kind: entry.kind, payload: inheritedPayload }
+      }), /canonical .* target|target identity conflict/i, `${entry.kind} inherited wire key`);
+      for (const invalid of ['', null, 1, [entry.targetId], { id: entry.targetId }]) {
+        assert.throws(() => store.resolveCanonicalActionTargetInternal({
+          turn,
+          action: {
+            kind: entry.kind,
+            payload: { [entry.canonicalKey]: invalid }
+          }
+        }), /canonical .* target|target identity conflict/i, `${entry.kind} invalid wire type`);
+      }
+      assert.throws(() => store.resolveCanonicalActionTargetInternal({
+        turn,
+        action: {
+          kind: entry.kind,
+          payload: { [entry.canonicalKey]: `${entry.targetId}_foreign` }
+        }
+      }), /canonical .* target|target identity conflict/i, `${entry.kind} foreign target`);
+    }
+
+    const nestedOnly = {
+      ...turn,
+      envelopeJson: JSON.stringify({ trigger: JSON.parse(turn.envelopeJson).trigger })
+    };
+    assert.throws(() => store.resolveCanonicalActionTargetInternal({
+      turn: nestedOnly,
+      action: { kind: 'moment_reply', payload: { replyToCommentId: 'comment_nested_only' } }
+    }), /target identity conflict/i);
+    assert.throws(() => store.resolveCanonicalActionTargetInternal({
+      turn: nestedOnly,
+      action: { kind: 'role_plan_update', payload: { planId: 'plan_nested_only' } }
+    }), /target identity conflict/i);
+  }));
+
+test('legacy wire target aliases fail a visible commit without side effects', () =>
+  withAuthority((store, turn) => {
+    store.putLifePlanInternal('yuqi', [{
+      episodeId: 'life_commit_alias',
+      kind: 'work',
+      title: '整理画稿',
+      startAt: 2_000,
+      endAt: 3_000,
+      payload: {}
+    }]);
+    const target = store.resolveCanonicalTargetRefInternal({
+      turn,
+      namespace: 'life_episode',
+      targetId: 'life_commit_alias'
+    });
+    const input = commitInput(store, turn);
+    input.actionSet = [{
+      kind: 'life_episode_update',
+      targetKey: target.targetKey,
+      targetRevision: target.targetRevision,
+      payload: {
+        type: 'reschedule',
+        episodeId: 'life_commit_alias',
+        startAt: 2_500,
+        endAt: 3_500,
+        reason: '旧wire别名不得成为权威目标'
+      }
+    }];
+    input.generationFingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup: input.visibleGroup,
+      actionSet: input.actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    });
+    const before = sideEffectCounts(store);
+    assert.throws(
+      () => commitVisibleResult(input),
+      /canonical life_episode target|target identity conflict/i
+    );
+    assert.deepEqual(sideEffectCounts(store), before);
+    assert.equal(store.getTurn(turn.turnId).state, 'queued');
+    assert.equal(store.getTurnAuthorityLineage(turn.authorityLineageKey).state, 'open');
   }));
 
 test('shadow commit requires the exact pinned comparison descriptor', () =>
