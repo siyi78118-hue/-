@@ -1568,6 +1568,52 @@ entrypoint can create a ledger proof.
 > plan/proof write. Existing ledger proofs remain session evidence even when the
 > bounded global proof store trims their repaired copies, so replay retains the
 > historical `appliedAt` and never repeats a role operation.
+>
+> **Role-plan repository CAS amendment (2026-08-03):** The prepared baseline is
+> not an advisory read. It includes one deterministic `scopeChecksum` over the
+> complete, canonically ordered plans and history rows owned by the character.
+> `applyPreparedCanonicalBatch` must compare that checksum and replace the plans,
+> canonical ledgers, and repairable history inside one persistence transaction.
+> A mismatch is `canonical role plan prepared state conflict` with zero writes;
+> the caller may rebuild the same actionId/checksum batch from fresh state. A
+> read-compare followed by a separate whole-array write is forbidden because two
+> distinct local turns can both pass preflight and silently overwrite one another.
+>
+> The Web fallback exposes one `compareAndSwapRolePlanBundle` operation on the
+> meta store. IndexedDB reads both `role_plans_v1` and `role_plan_history_v1`,
+> verifies the expected checksum, and writes both values in one `readwrite`
+> transaction. A localStorage fallback uses one cross-context `navigator.locks`
+> role-plan-ledger lock plus a synchronous read/check/write of its single stored
+> database object; when that lock is unavailable, canonical role-plan application
+> fails closed instead of claiming atomicity. The native
+> plugin exposes an expected-snapshot replace operation whose Room `@Transaction`
+> re-reads every plan and history row for the character, verifies the same
+> checksum, then replaces the exact bundle. It must conflict with concurrent
+> `RolePlanCoordinator` or service updates instead of overwriting them. Ordinary
+> `apply`, `mutate`, `applyCanonical`, and canonical batch writers all use this
+> shared mutation primitive; an applier promise lock may reduce retries but is
+> never the authority or the only concurrency protection.
+>
+> Executable gates must overlap two different local turns before the first write
+> and prove that both cannot report success while one ledger/history disappears;
+> cover same-plan updates, different-character whole-array fallback writes, and
+> a native scheduler update racing the expected-snapshot replace. A successful
+> retry preserves both immutable action proofs. The batch fault label contains
+> the authoritative action ordinals, exactly
+> `after_domain_batch:role_plan:<firstOrdinal>:<lastOrdinal>`; action IDs in that
+> position are a contract violation.
+>
+> Native snapshot reads are complete, not the existing `rolePlanHistory(...,200)`
+> UI window. A character with 201 or more history rows retains every row after a
+> canonical operation. The same persistence transaction also checks the complete
+> repository for a foreign plan ledger or history row that already owns any
+> incoming actionId; action IDs and global UI proofs are repository-global, so a
+> second character cannot reuse one. The bounded global proof store uses a CAS or
+> atomic merge-by-actionId operation: two concurrent successful groups retain
+> both immutable proofs, while a changed tuple conflicts. Plain load/modify/save
+> is forbidden. Batch adapter results are validated as an ordered array or by an
+> explicit ordinal walk, not by JavaScript object-key enumeration, so numeric
+> action IDs cannot be spuriously reordered.
 
 Payment idempotency is anchored to the same persisted `settings` value as the
 wallet balance, not to a later chat save. Before mutation, resolve one exact
