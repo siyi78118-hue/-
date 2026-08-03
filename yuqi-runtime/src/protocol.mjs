@@ -225,6 +225,22 @@ const V3_DIRECT_CONTEXT_KEYS = Object.freeze([
   'scene', 'currentBatch', 'retry', 'payment', 'visibilityCursor'
 ]);
 const V3_AUTOMATIC_CONTEXT_KEYS = Object.freeze(['visibilityCursor']);
+const V3_SCENE_KEYS = Object.freeze([
+  'playerName',
+  'characterName',
+  'relationshipStage',
+  'relationshipPhase',
+  'conversationExtraPrompt',
+  'globalExtraPrompt',
+  'rolePlanCatalog',
+  'roleScheduleContext',
+  'momentContext',
+  'stageCatalog',
+  'phaseCatalog',
+  'currentPhase',
+  'effectiveStagePersona',
+  'stagePersonaRevision'
+]);
 
 function assertClosedKeys(value, expected, label) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -418,7 +434,9 @@ export function validateEnvelope(value) {
     } else if (AUTOMATIC_KINDS.has(envelope.kind)) {
       if (value.message !== undefined) throw new Error('automatic turn cannot contain a message');
       delete envelope.message;
-      envelope.trigger = validateTrigger(value.trigger);
+      envelope.trigger = validateTrigger(value.trigger, {
+        protocolVersion: envelope.protocolVersion
+      });
       if (envelope.protocolVersion === 2) return envelope;
     } else {
       throw new Error('invalid turn kind');
@@ -430,7 +448,8 @@ export function validateEnvelope(value) {
   }
   if (DIRECT_KINDS.has(envelope.kind) && value.context !== undefined) {
     envelope.context = validateDirectContext(value.context, envelope, {
-      requireCompleteBatch: envelope.protocolVersion === 3
+      requireCompleteBatch: envelope.protocolVersion === 3,
+      protocolVersion: envelope.protocolVersion
     });
   }
   if (envelope.protocolVersion === 3) {
@@ -449,12 +468,18 @@ export function validateEnvelope(value) {
   return envelope;
 }
 
-function validateDirectContext(context, envelope, { requireCompleteBatch = false } = {}) {
+function validateDirectContext(
+  context,
+  envelope,
+  { requireCompleteBatch = false, protocolVersion = envelope.protocolVersion } = {}
+) {
   if (!context || typeof context !== 'object' || Array.isArray(context)) {
     throw new Error('invalid direct context');
   }
   const normalized = {};
-  if (context.scene !== undefined) normalized.scene = validateScene(context.scene);
+  if (context.scene !== undefined) {
+    normalized.scene = validateScene(context.scene, { protocolVersion });
+  }
   if (context.currentBatch !== undefined) {
     normalized.currentBatch = validateCurrentBatch(context.currentBatch, envelope);
   }
@@ -588,8 +613,18 @@ function limitedText(value, maximum) {
   return text;
 }
 
-function validateScene(scene) {
+function validateScene(scene, { protocolVersion = 2 } = {}) {
   if (!scene || typeof scene !== 'object' || Array.isArray(scene)) throw new Error('invalid scene');
+  const authorityScene = protocolVersion === 3;
+  if (authorityScene) {
+    assertNoUnknownKeys(scene, V3_SCENE_KEYS, 'scene');
+    if (!Object.hasOwn(scene, 'stagePersonaRevision')) {
+      throw new Error('invalid stagePersonaRevision');
+    }
+  }
+  const stagePersonaRevision = authorityScene
+    ? requireNonNegativeSafeInteger(scene.stagePersonaRevision, 'stagePersonaRevision')
+    : null;
   const sourceStage = scene.relationshipStage;
   if (!sourceStage || typeof sourceStage !== 'object' || Array.isArray(sourceStage)) {
     throw new Error('invalid relationship stage');
@@ -676,7 +711,11 @@ function validateScene(scene) {
     momentContext: limitedText(scene.momentContext, 20_000),
     stageCatalog: catalog,
     phaseCatalog,
-    currentPhase: phaseId
+    currentPhase: phaseId,
+    ...(authorityScene ? {
+      effectiveStagePersona: limitedText(scene.effectiveStagePersona, 20_000),
+      stagePersonaRevision
+    } : {})
   };
 }
 
@@ -751,7 +790,7 @@ function validateImageAttachments(attachments, messageId) {
   }];
 }
 
-function validateTrigger(trigger) {
+function validateTrigger(trigger, { protocolVersion = 2 } = {}) {
   if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) throw new Error('invalid trigger');
   const normalized = {
     triggerId: String(trigger.triggerId || ''),
@@ -769,7 +808,9 @@ function validateTrigger(trigger) {
     }
     normalized.context = structuredClone(trigger.context);
     const suppliedScene = trigger.context.scene || trigger.context.snapshot?.scene;
-    if (suppliedScene !== undefined) normalized.context.scene = validateScene(suppliedScene);
+    if (suppliedScene !== undefined) {
+      normalized.context.scene = validateScene(suppliedScene, { protocolVersion });
+    }
   }
   return normalized;
 }

@@ -125,6 +125,7 @@ function normalizeRolePlanOperations(value) {
 }
 
 export function normalizeBrainDraft(draft) {
+  const momentSource = draft?.momentAction ?? draft?.actionIntent?.moment;
   const paymentAction = ['received', 'refused', 'pending'].includes(draft?.paymentAction)
     ? draft.paymentAction
     : null;
@@ -134,14 +135,17 @@ export function normalizeBrainDraft(draft) {
     reply: String(draft?.reply || '').trim(),
     skipReason: String(draft?.skipReason || ''),
     paymentAction,
-    momentAction: draft?.momentAction && typeof draft.momentAction === 'object' && !Array.isArray(draft.momentAction)
+    momentAction: momentSource && typeof momentSource === 'object' && !Array.isArray(momentSource)
       ? {
-          momentId: String(draft.momentAction.momentId || ''),
-          like: draft.momentAction.like === true,
-          comment: String(draft.momentAction.comment || '').trim().slice(0, 1000),
-          replyToCommentId: draft.momentAction.replyToCommentId ? String(draft.momentAction.replyToCommentId) : null
+          momentId: String(momentSource.momentId || ''),
+          like: momentSource.like === true,
+          comment: String(momentSource.comment || '').trim().slice(0, 1000),
+          replyToCommentId: momentSource.replyToCommentId ? String(momentSource.replyToCommentId) : null
         }
       : null,
+    relationshipStageReview: draft?.relationshipStageReview
+      ?? draft?.actionIntent?.relationshipReview
+      ?? null,
     lifePlan: draft?.lifePlan && typeof draft.lifePlan === 'object' && !Array.isArray(draft.lifePlan)
       ? {
           planKey: String(draft.lifePlan.planKey || ''),
@@ -177,6 +181,109 @@ export function normalizeBrainDraft(draft) {
     }
   }
   return normalized;
+}
+
+const CANONICAL_MOMENT_SOURCE_KEYS = Object.freeze([
+  'momentId', 'like', 'comment', 'replyToCommentId'
+]);
+const CANONICAL_RELATIONSHIP_SOURCE_KEYS = Object.freeze([
+  'baseAction', 'phaseAction', 'expectedSceneRevision', 'label', 'changedAt'
+]);
+const INTERNAL_RELATIONSHIP_FLATTENED_KEYS = Object.freeze([
+  'from', 'to', 'reason', 'confidence', 'evidenceMessageIds', 'explicitMutualChange'
+]);
+
+function assertCanonicalSourcePrototype(value, label) {
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error(`${label} inherited fields conflict`);
+  }
+}
+
+function assertExactCanonicalSourceKeys(value, expected, label) {
+  assertCanonicalSourcePrototype(value, label);
+  const keys = Object.keys(value).sort();
+  const required = [...expected].sort();
+  if (keys.length !== required.length || keys.some((key, index) => key !== required[index])) {
+    throw new Error(`${label} fields conflict`);
+  }
+}
+
+function canonicalMomentPayload(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('canonical moment action must be an object');
+  }
+  assertExactCanonicalSourceKeys(value, CANONICAL_MOMENT_SOURCE_KEYS, 'canonical moment action');
+  if (typeof value.momentId !== 'string' || !value.momentId
+    || typeof value.like !== 'boolean'
+    || typeof value.comment !== 'string'
+    || value.comment.length > 1000
+    || !(value.replyToCommentId === null
+      || (typeof value.replyToCommentId === 'string' && value.replyToCommentId.length > 0))) {
+    throw new Error('canonical moment action type conflict');
+  }
+  const payload = {
+    momentId: value.momentId,
+    like: value.like,
+    comment: value.comment.trim(),
+    replyToCommentId: value.replyToCommentId
+  };
+  if (payload.replyToCommentId && !payload.comment) {
+    throw new Error('canonical moment reply requires comment content');
+  }
+  if (payload.replyToCommentId && payload.like) {
+    throw new Error('canonical moment reply cannot also like');
+  }
+  return payload;
+}
+
+function canonicalRelationshipPayload(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('canonical relationship transition must be an object');
+  }
+  assertCanonicalSourcePrototype(value, 'canonical relationship transition');
+  const allowedKeys = new Set([
+    ...CANONICAL_RELATIONSHIP_SOURCE_KEYS,
+    ...INTERNAL_RELATIONSHIP_FLATTENED_KEYS
+  ]);
+  if (Object.keys(value).some(key => !allowedKeys.has(key))
+    || CANONICAL_RELATIONSHIP_SOURCE_KEYS.some(key => !Object.hasOwn(value, key))) {
+    throw new Error('canonical relationship transition fields conflict');
+  }
+  const baseAction = value.baseAction == null ? null : structuredClone(value.baseAction);
+  const phaseAction = value.phaseAction == null ? null : structuredClone(value.phaseAction);
+  if (!baseAction && !phaseAction) throw new Error('canonical relationship transition is empty');
+  if (typeof value.expectedSceneRevision !== 'number'
+    || !Number.isSafeInteger(value.expectedSceneRevision)
+    || value.expectedSceneRevision < 0
+    || typeof value.changedAt !== 'number'
+    || !Number.isSafeInteger(value.changedAt)
+    || value.changedAt < 0
+    || typeof value.label !== 'string' || !value.label.trim()) {
+    throw new Error('canonical relationship transition is invalid');
+  }
+  return {
+    baseAction,
+    phaseAction,
+    expectedSceneRevision: value.expectedSceneRevision,
+    label: value.label.trim(),
+    changedAt: value.changedAt
+  };
+}
+
+export function normalizeCanonicalBrainDraft(draft) {
+  const momentSource = draft?.momentAction ?? draft?.actionIntent?.moment;
+  const momentAction = momentSource == null ? null : canonicalMomentPayload(momentSource);
+  const relationshipSource = draft?.relationshipStageAction;
+  const relationshipStageAction = relationshipSource == null
+    ? null
+    : canonicalRelationshipPayload(relationshipSource);
+  const normalized = normalizeBrainDraft(draft);
+  return {
+    ...normalized,
+    momentAction,
+    ...(relationshipSource == null ? {} : { relationshipStageAction })
+  };
 }
 
 function isMomentKind(kind) {
@@ -851,6 +958,12 @@ export class YuqiOrchestrator {
       stateMessages,
       this.clock()
     );
+    const withRelationshipStageAction = draft => ({
+      ...draft,
+      relationshipStageAction: relationship.action
+        ? structuredClone(relationship.action)
+        : null
+    });
     const scene = {
       ...baseScene,
       relationshipStage: relationship.stage
@@ -871,13 +984,13 @@ export class YuqiOrchestrator {
       route = 'deep';
     }
     if (envelope.kind === 'PROACTIVE_CHAT' && interactionContract.shouldRespond === false) {
-      return normalizeBrainDraft({
+      return withRelationshipStageAction(normalizeBrainDraft({
         action: 'skip',
         reply: '',
         skipReason: 'structural_silence',
         usedFactIds: [],
         rolePlanOperationsJson: '[]'
-      });
+      }));
     }
     const memoryPacket = {
       query: String(memoryResult.query || currentBatch?.combinedText || envelope.trigger?.triggerType || ''),
@@ -968,7 +1081,7 @@ export class YuqiOrchestrator {
         && !hasLifeDecision(draft)
         && draft.rolePlanOperations.length === 0
       )) {
-        return draft;
+        return withRelationshipStageAction(draft);
       }
       route = 'deep';
       const supervisorRequest = {
@@ -1013,26 +1126,30 @@ export class YuqiOrchestrator {
         && ['skip', 'reject'].includes(reviewed.decision)) {
         reviewed = proactiveDeliveryRewrite(previous, attempt, reviewed.decision);
       }
-      if (reviewed.decision === 'approve') return draft;
+      if (reviewed.decision === 'approve') return withRelationshipStageAction(draft);
       if (reviewed.decision === 'skip') {
         if (!isAutomaticKind(envelope.kind)) {
           throw new Error('supervisor cannot skip a direct reply');
         }
-        return { ...draft, action: 'skip', reply: '' };
+        return withRelationshipStageAction({ ...draft, action: 'skip', reply: '' });
       }
       if (reviewed.decision === 'reject') {
         if (!isAutomaticKind(envelope.kind)) throw new Error('supervisor rejected the reply');
-        return { ...draft, action: 'skip', reply: '' };
+        return withRelationshipStageAction({ ...draft, action: 'skip', reply: '' });
       }
       if (attempt >= 3) {
         if (deliveryPolicy?.skipAllowed === false) {
           if (hasHighPriorityIssues(reviewed) || !String(draft.reply || '').trim()) {
             throw new Error('PROACTIVE_DELIVERY_BLOCKED: no safe visible reply after rewrites');
           }
-          return draft;
+          return withRelationshipStageAction(draft);
         }
-        if (isAutomaticKind(envelope.kind)) return { ...draft, action: 'skip', reply: '' };
-        if (!(hasHighPriorityIssues(reviewed) && attempt === 3)) return draft;
+        if (isAutomaticKind(envelope.kind)) {
+          return withRelationshipStageAction({ ...draft, action: 'skip', reply: '' });
+        }
+        if (!(hasHighPriorityIssues(reviewed) && attempt === 3)) {
+          return withRelationshipStageAction(draft);
+        }
       }
       previous = reviewed;
       previousDraft = draft;
@@ -1522,20 +1639,33 @@ export class YuqiOrchestrator {
   }
 
   canonicalActionSet(turn, draft) {
-    if (!draft?.momentAction) return [];
-    const payload = structuredClone(draft.momentAction);
-    const kind = payload.comment ? 'moment_comment' : payload.like ? 'moment_like' : '';
-    if (!kind) return [];
-    const target = this.store.resolveCanonicalActionTargetInternal({
-      turn,
-      action: { kind, payload }
+    const actionInputs = [];
+    if (draft?.momentAction) {
+      const payload = canonicalMomentPayload(draft.momentAction);
+      const kind = payload.replyToCommentId
+        ? 'moment_reply'
+        : payload.comment
+          ? 'moment_comment'
+          : payload.like
+            ? 'moment_like'
+            : '';
+      if (kind) actionInputs.push({ kind, payload });
+    }
+    if (draft?.relationshipStageAction) {
+      actionInputs.push({
+        kind: 'relationship_transition',
+        payload: canonicalRelationshipPayload(draft.relationshipStageAction)
+      });
+    }
+    return actionInputs.map(action => {
+      const target = this.store.resolveCanonicalActionTargetInternal({ turn, action });
+      return {
+        kind: action.kind,
+        targetKey: target.targetKey,
+        targetRevision: target.targetRevision,
+        payload: action.payload
+      };
     });
-    return [{
-      kind,
-      targetKey: target.targetKey,
-      targetRevision: target.targetRevision,
-      payload
-    }];
   }
 
   comparisonJobDraftFromCanonicalTurn(turn, envelope) {
@@ -1640,7 +1770,29 @@ export class YuqiOrchestrator {
         },
         dryRun: false
       });
-      const draft = normalizeBrainDraft(executionResult.draft);
+      const normalizedDraft = normalizeCanonicalBrainDraft(executionResult.draft);
+      let relationshipStageAction = normalizedDraft.relationshipStageAction || null;
+      if (!relationshipStageAction && normalizedDraft.relationshipStageReview) {
+        const relationshipMessages = evidenceMessages(
+          this.store.listMessages(
+            envelope.characterId,
+            Math.min(5000, this.contextLimit + Number(currentBatch?.messageIds?.length || 0))
+          ),
+          currentBatch
+        );
+        relationshipStageAction = resolveRelationshipStage(
+          sceneFromEnvelope(envelope),
+          normalizedDraft.relationshipStageReview,
+          relationshipMessages,
+          this.clock()
+        ).action;
+      }
+      const draft = {
+        ...normalizedDraft,
+        relationshipStageAction: relationshipStageAction
+          ? structuredClone(relationshipStageAction)
+          : null
+      };
       if (draft.action === 'skip' && !isAutomaticKind(turn.rolloutKey)) {
         throw new Error('DIRECT_REPLY cannot commit an empty canonical result');
       }

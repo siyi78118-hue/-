@@ -69,6 +69,16 @@ function normalizeAction(action) {
   };
 }
 
+function assertContiguousRolePlanActionBlock(actions) {
+  const ordinals = (Array.isArray(actions) ? actions : [])
+    .map((action, ordinal) => String(action?.kind || '').startsWith('role_plan_') ? ordinal : -1)
+    .filter(ordinal => ordinal >= 0);
+  if (ordinals.length > 1
+    && ordinals.at(-1) - ordinals[0] + 1 !== ordinals.length) {
+    throw new Error('canonical role plan actions must form one contiguous ordinal block');
+  }
+}
+
 function normalizeStateIntent(patch) {
   if (patch == null) return null;
   exactObject(patch, new Set(['mood', 'currentStances', 'openThreads']), 'state patch');
@@ -221,6 +231,7 @@ export function canonicalCommitPayload(input) {
 
 export function commitVisibleResult(input) {
   if (!input?.store) throw new Error('visible commit store is required');
+  assertContiguousRolePlanActionBlock(input.actionSet || []);
   return input.store.withImmediateTransaction(() => {
     const existing = input.store.readCanonicalCommitOutcomeInternal({
       lineageKey: input.authorityLineageKey,

@@ -789,6 +789,85 @@ function mapInteractionLane(row) {
   };
 }
 
+function assertExactCanonicalKeys(value, expectedKeys, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const keys = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new Error(`${label} fields conflict`);
+  }
+}
+
+function assertCanonicalMomentActionPayload(kind, payload) {
+  assertExactCanonicalKeys(
+    payload,
+    ['momentId', 'like', 'comment', 'replyToCommentId'],
+    'canonical moment action payload'
+  );
+  if (typeof payload.momentId !== 'string' || !payload.momentId
+    || typeof payload.like !== 'boolean'
+    || typeof payload.comment !== 'string'
+    || !(payload.replyToCommentId === null
+      || (typeof payload.replyToCommentId === 'string' && payload.replyToCommentId.length > 0))) {
+    throw new Error('canonical moment action payload type conflict');
+  }
+  if (kind === 'moment_like'
+    && !(payload.like === true && payload.comment === '' && payload.replyToCommentId === null)) {
+    throw new Error('canonical moment like payload conflict');
+  }
+  if (kind === 'moment_comment'
+    && !(payload.comment.trim().length > 0 && payload.replyToCommentId === null)) {
+    throw new Error('canonical moment comment payload conflict');
+  }
+  if (kind === 'moment_reply'
+    && !(payload.like === false
+      && payload.comment.trim().length > 0
+      && typeof payload.replyToCommentId === 'string')) {
+    throw new Error('canonical moment reply payload conflict');
+  }
+}
+
+function assertCanonicalRelationshipActionPart(value, part) {
+  if (value === null) return;
+  const booleanKey = part === 'base' ? 'explicitMutualChange' : 'explicitAcknowledgedChange';
+  assertExactCanonicalKeys(value, [
+    'from', 'to', 'label', 'reason', 'confidence', 'evidenceMessageIds', booleanKey, 'changedAt'
+  ], `canonical relationship ${part} action`);
+  if (!['from', 'to', 'label', 'reason'].every(key =>
+    typeof value[key] === 'string' && value[key].trim().length > 0)
+    || typeof value.confidence !== 'number'
+    || !Number.isFinite(value.confidence)
+    || value.confidence < 0
+    || value.confidence > 1
+    || !Array.isArray(value.evidenceMessageIds)
+    || value.evidenceMessageIds.some(id => typeof id !== 'string' || !id)
+    || typeof value[booleanKey] !== 'boolean'
+    || !Number.isSafeInteger(value.changedAt)
+    || value.changedAt < 0) {
+    throw new Error(`canonical relationship ${part} action type conflict`);
+  }
+}
+
+function assertCanonicalRelationshipActionPayload(payload) {
+  assertExactCanonicalKeys(payload, [
+    'baseAction', 'phaseAction', 'expectedSceneRevision', 'label', 'changedAt'
+  ], 'canonical relationship action payload');
+  assertCanonicalRelationshipActionPart(payload.baseAction, 'base');
+  assertCanonicalRelationshipActionPart(payload.phaseAction, 'phase');
+  if (payload.baseAction === null && payload.phaseAction === null) {
+    throw new Error('canonical relationship action payload is empty');
+  }
+  if (!Number.isSafeInteger(payload.expectedSceneRevision) || payload.expectedSceneRevision < 0
+    || typeof payload.label !== 'string' || !payload.label.trim()
+    || !Number.isSafeInteger(payload.changedAt) || payload.changedAt < 0
+    || [payload.baseAction, payload.phaseAction]
+      .some(part => part !== null && part.changedAt !== payload.changedAt)) {
+    throw new Error('canonical relationship action payload type conflict');
+  }
+}
+
 export class LifePlanningResultConflictError extends Error {
   constructor(message = 'life planning authoritative result conflict') {
     super(message);
@@ -6105,8 +6184,9 @@ export class YuqiStore {
     if (!safeTargetId) throw new Error('canonical action target not found');
     const envelope = parseJson(turn.envelopeJson, {});
     const context = envelope.context || envelope.featureContext || {};
+    const triggerInput = envelope.trigger?.context?.input;
     const inputSnapshot = (candidate, idKeys) => {
-      if (!candidate || typeof candidate !== 'object') return null;
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
       const candidateId = idKeys.map(key => candidate[key]).find(value => value != null);
       if (String(candidateId || '') !== safeTargetId) return null;
       return structuredClone(candidate);
@@ -6177,15 +6257,9 @@ export class YuqiStore {
       return inputResult(snapshot);
     }
     if (safeNamespace === 'moment' || safeNamespace === 'comment') {
-      const title = safeNamespace[0].toUpperCase() + safeNamespace.slice(1);
       const idKey = `${safeNamespace}Id`;
-      const candidates = [
-        context[`target${title}`],
-        context[safeNamespace],
-        context[idKey] == null ? null : { [idKey]: context[idKey] }
-      ];
-      const snapshot = candidates.map(candidate =>
-        inputSnapshot(candidate, [idKey])).find(Boolean);
+      const targetKey = safeNamespace === 'moment' ? 'targetMoment' : 'targetComment';
+      const snapshot = inputSnapshot(triggerInput?.[targetKey], [idKey]);
       if (!snapshot) throw new Error('canonical action target identity conflict');
       return inputResult(snapshot);
     }
@@ -6205,17 +6279,30 @@ export class YuqiStore {
       if (safeTargetId !== turn.characterId) {
         throw new Error('canonical action target identity conflict');
       }
+      const scene = context.scene || envelope.trigger?.context?.scene || null;
       const relationship = context.relationship
         || context.relationshipState
-        || context.scene?.relationshipStage
+        || scene?.relationshipStage
         || envelope.featureContext?.relationship
         || null;
       if (!relationship) throw new Error('canonical relationship target not found');
+      if (!scene
+        || !Object.hasOwn(scene, 'stagePersonaRevision')
+        || typeof scene.stagePersonaRevision !== 'number'
+        || !Number.isSafeInteger(scene.stagePersonaRevision)
+        || scene.stagePersonaRevision < 0) {
+        throw new Error('canonical relationship target revision conflict');
+      }
+      const stagePersonaRevision = scene.stagePersonaRevision;
+      const snapshot = {
+        relationshipStage: structuredClone(relationship),
+        stagePersonaRevision
+      };
       return {
         targetKey: `relationship:${turn.characterId}`,
-        targetRevision: `sha256:${contentHash(relationship)}`,
+        targetRevision: `sha256:${contentHash(snapshot)}`,
         authoritySource: 'input_snapshot',
-        canonicalTarget: structuredClone(relationship)
+        canonicalTarget: snapshot
       };
     }
     const table = safeNamespace === 'role_plan' ? 'role_plans' : 'role_occurrences';
@@ -6272,6 +6359,12 @@ export class YuqiStore {
     const namespace = namespaceByKind[kind];
     if (!namespace) throw new Error('unknown canonical action target kind');
     const payload = action.payload || {};
+    if (['moment_like', 'moment_comment', 'moment_reply'].includes(kind)) {
+      assertCanonicalMomentActionPayload(kind, payload);
+    }
+    if (kind === 'relationship_transition') {
+      assertCanonicalRelationshipActionPayload(payload);
+    }
     const exactPayloadTarget = (key, legacyKey) => {
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)
         || Object.hasOwn(payload, legacyKey)
@@ -6298,11 +6391,16 @@ export class YuqiStore {
                   ? turn.characterId
                   : null;
     if (!targetId) throw new Error(`canonical ${namespace} target not found`);
-    return this.resolveCanonicalTargetRefInternal({
+    const resolved = this.resolveCanonicalTargetRefInternal({
       turn,
       namespace,
       targetId
     });
+    if (kind === 'relationship_transition'
+      && resolved.canonicalTarget.stagePersonaRevision !== payload.expectedSceneRevision) {
+      throw new Error('canonical relationship target revision conflict');
+    }
+    return resolved;
   }
 
   visibleGroupsForLineage(lineageKey) {

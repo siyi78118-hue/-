@@ -185,6 +185,32 @@ function cloned(value) {
   return structuredClone(value);
 }
 
+function validDynamicScene(overrides = {}) {
+  return {
+    playerName: '姜隽倚',
+    characterName: '虞栖',
+    relationshipStage: {
+      id: 'new',
+      label: '初识',
+      content: '还在慢慢了解彼此。',
+      since: 1784300000000,
+      reason: '初次见面',
+      confidence: 0.7
+    },
+    conversationExtraPrompt: '',
+    globalExtraPrompt: '',
+    rolePlanCatalog: '',
+    roleScheduleContext: '',
+    momentContext: '',
+    stageCatalog: [{ id: 'new', label: '初识', content: '慢慢熟悉。' }],
+    phaseCatalog: [{ id: 'normal', label: '正常相处', content: '' }],
+    currentPhase: 'normal',
+    effectiveStagePersona: '当前有效的阶段人设。',
+    stagePersonaRevision: 7,
+    ...overrides
+  };
+}
+
 const JPEG_1X1 = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIQAxAAAAF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABBQJ//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAwEBPwF//8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAgBAgEBPwF//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQAGPwJ//8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPyF//9oADAMBAAIAAwAAABD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAEDAQE/EH//xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oACAECAQE/EH//xAAUEAEAAAAAAAAAAAAAAAAAAAAA/9oACAEBAAE/EH//2Q==';
 
 test('direct text messages normalize a legacy empty attachment array to no attachment field', () => {
@@ -389,6 +415,51 @@ test('protocol v3 preserves a complete verified authority and visibility cursor'
   assert.equal(normalized.context.currentBatch.messages.length, 2);
   assert.equal(Object.hasOwn(normalized, 'resultAuthorityVersion'), false);
   assert.deepEqual(validateEnvelope(cloned(normalized)), normalized);
+});
+
+test('protocol v3 preserves one closed native stage persona revision in direct and automatic scenes', () => {
+  const direct = validV3Envelope();
+  direct.context.scene = validDynamicScene();
+  const normalizedDirect = validateEnvelope(direct);
+  assert.equal(normalizedDirect.context.scene.stagePersonaRevision, 7);
+  assert.equal(normalizedDirect.context.scene.effectiveStagePersona, '当前有效的阶段人设。');
+
+  const automatic = validV3AutomaticEnvelope('MOMENT_INTERACTION');
+  automatic.trigger.context.scene = validDynamicScene({ stagePersonaRevision: 8 });
+  const normalizedAutomatic = validateEnvelope(automatic);
+  assert.equal(normalizedAutomatic.trigger.context.scene.stagePersonaRevision, 8);
+});
+
+test('protocol v3 rejects a missing coercible or unknown scene revision without widening v2', () => {
+  for (const [label, mutate] of [
+    ['missing', scene => { delete scene.stagePersonaRevision; }],
+    ['inherited', scene => {
+      delete scene.stagePersonaRevision;
+      Object.setPrototypeOf(scene, { stagePersonaRevision: 7 });
+    }],
+    ['string', scene => { scene.stagePersonaRevision = '7'; }],
+    ['negative', scene => { scene.stagePersonaRevision = -1; }],
+    ['unsafe', scene => { scene.stagePersonaRevision = Number.MAX_SAFE_INTEGER + 1; }],
+    ['unknown', scene => { scene.unexpectedSceneField = true; }]
+  ]) {
+    const source = validV3Envelope();
+    source.context.scene = validDynamicScene();
+    mutate(source.context.scene);
+    assert.throws(
+      () => validateEnvelope(source),
+      /stagePersonaRevision|scene.*keys/i,
+      label
+    );
+  }
+
+  const v2A = validV2Envelope({
+    context: { scene: validDynamicScene({ stagePersonaRevision: 7, unexpectedSceneField: 'old' }) }
+  });
+  const v2B = cloned(v2A);
+  v2B.context.scene.stagePersonaRevision = 'legacy-coerced-or-ignored';
+  v2B.context.scene.unexpectedSceneField = 'different-old-value';
+  assert.deepEqual(validateEnvelope(v2A), validateEnvelope(v2B));
+  assert.equal(Object.hasOwn(validateEnvelope(v2A).context.scene, 'stagePersonaRevision'), false);
 });
 
 test('protocol v3 support leaves complete protocol v1 and v2 normalization unchanged', () => {

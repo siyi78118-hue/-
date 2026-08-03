@@ -5,7 +5,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { hardValidateReply, normalizeBrainDraft, YuqiOrchestrator } from '../src/orchestrator.mjs';
+import {
+  hardValidateReply,
+  normalizeBrainDraft,
+  normalizeCanonicalBrainDraft,
+  YuqiOrchestrator
+} from '../src/orchestrator.mjs';
 import { materializeBrainDraft } from '../src/cognition-contract.mjs';
 import { PresetRegistry } from '../src/preset-registry.mjs';
 import { YuqiStore } from '../src/store.mjs';
@@ -37,6 +42,199 @@ test('legacy brain normalization accepts a cognition-v2 materialized draft', () 
   assert.equal(normalized.action, 'send');
   assert.equal(normalized.reply, '还真让你抢先了。');
   assert.deepEqual(normalized.rolePlanOperations, []);
+  assert.deepEqual(normalized.relationshipStageReview, { base: null, phase: null });
+});
+
+test('v3 authorized action intent is normalized into canonical moment and relationship sources', () => {
+  const normalized = normalizeBrainDraft({
+    action: 'send',
+    reply: '是呀。',
+    actionIntent: {
+      moment: {
+        momentId: 'moment_1',
+        like: false,
+        comment: '是呀。',
+        replyToCommentId: 'comment_1'
+      },
+      relationshipReview: {
+        base: {
+          recommended: 'acquainted',
+          confidence: 0.91,
+          reason: '共同经历充分',
+          evidenceMessageIds: ['msg_1', 'msg_2'],
+          explicitMutualChange: false
+        },
+        phase: null
+      }
+    }
+  });
+  assert.deepEqual(normalized.momentAction, {
+    momentId: 'moment_1',
+    like: false,
+    comment: '是呀。',
+    replyToCommentId: 'comment_1'
+  });
+  assert.equal(normalized.relationshipStageReview.base.recommended, 'acquainted');
+});
+
+test('canonical social actions preserve combined intent and project relationship transitions', () => {
+  const calls = [];
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.store = {
+    resolveCanonicalActionTargetInternal({ action }) {
+      calls.push(structuredClone(action));
+      return {
+        targetKey: action.kind === 'moment_reply'
+          ? `comment:${action.payload.replyToCommentId}`
+          : action.kind === 'relationship_transition'
+            ? 'relationship:yuqi'
+            : `moment:${action.payload.momentId}`,
+        targetRevision: `revision:${action.kind}`
+      };
+    }
+  };
+  const relationshipStageAction = {
+    baseAction: {
+      from: 'new',
+      to: 'acquainted',
+      label: '熟悉',
+      reason: '已经积累了真实共同经历',
+      confidence: 0.91,
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitMutualChange: false,
+      changedAt: 1000
+    },
+    phaseAction: null,
+    expectedSceneRevision: 4,
+    label: '熟悉',
+    changedAt: 1000,
+    from: 'new',
+    to: 'acquainted',
+    reason: 'legacy flattened fields must not enter canonical payload',
+    confidence: 0.91,
+    evidenceMessageIds: ['msg_1', 'msg_2'],
+    explicitMutualChange: false
+  };
+  const actions = orchestrator.canonicalActionSet({ characterId: 'yuqi' }, {
+    momentAction: {
+      momentId: 'moment_1',
+      like: true,
+      comment: '我也喜欢这一张。',
+      replyToCommentId: null
+    },
+    relationshipStageAction
+  });
+  assert.deepEqual(actions.map(action => action.kind), [
+    'moment_comment',
+    'relationship_transition'
+  ]);
+  assert.equal(actions[0].payload.like, true, 'comment classification must retain the like intent');
+  assert.deepEqual(Object.keys(actions[0].payload), [
+    'momentId', 'like', 'comment', 'replyToCommentId'
+  ]);
+  assert.deepEqual(actions[1].payload, {
+    baseAction: relationshipStageAction.baseAction,
+    phaseAction: null,
+    expectedSceneRevision: 4,
+    label: '熟悉',
+    changedAt: 1000
+  });
+  assert.equal(calls.length, 2);
+
+  const reply = orchestrator.canonicalActionSet({ characterId: 'yuqi' }, {
+    momentAction: {
+      momentId: 'moment_1',
+      like: false,
+      comment: '是呀。',
+      replyToCommentId: 'comment_1'
+    }
+  });
+  assert.equal(reply[0].kind, 'moment_reply');
+  assert.equal(reply[0].targetKey, 'comment:comment_1');
+
+  const like = orchestrator.canonicalActionSet({ characterId: 'yuqi' }, {
+    momentAction: {
+      momentId: 'moment_1',
+      like: true,
+      comment: '',
+      replyToCommentId: null
+    }
+  });
+  assert.equal(like[0].kind, 'moment_like');
+
+  assert.throws(() => orchestrator.canonicalActionSet({ characterId: 'yuqi' }, {
+    momentAction: {
+      momentId: 'moment_1',
+      like: true,
+      comment: '这条回复同时要求点赞，不能静默丢失。',
+      replyToCommentId: 'comment_1'
+    }
+  }), /moment reply cannot also like/i);
+});
+
+test('canonical action sources reject fields and native-type bypasses before target resolution', () => {
+  let targetCalls = 0;
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.store = {
+    resolveCanonicalActionTargetInternal({ action }) {
+      targetCalls += 1;
+      return {
+        targetKey: action.kind === 'relationship_transition'
+          ? 'relationship:yuqi'
+          : 'moment:moment_1',
+        targetRevision: `revision:${action.kind}`
+      };
+    }
+  };
+  const moment = {
+    momentId: 'moment_1', like: true, comment: '', replyToCommentId: null
+  };
+  const inheritedMoment = Object.assign(Object.create({ secret: 'prototype' }), moment);
+  const relationship = {
+    baseAction: {
+      from: 'new', to: 'acquainted', label: '熟悉', reason: '共同经历充分',
+      confidence: 0.9, evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitMutualChange: false, changedAt: 2000
+    },
+    phaseAction: null,
+    expectedSceneRevision: 4,
+    label: '熟悉',
+    changedAt: 2000,
+    from: 'new',
+    to: 'acquainted',
+    reason: '共同经历充分',
+    confidence: 0.9,
+    evidenceMessageIds: ['msg_1', 'msg_2'],
+    explicitMutualChange: false
+  };
+  const inheritedRelationship = Object.assign(
+    Object.create({ secret: 'prototype' }),
+    relationship
+  );
+  const invalidDrafts = [
+    { actionIntent: { moment: { ...moment, secret: 'leak' } } },
+    { momentAction: { ...moment, secret: 'leak' } },
+    { momentAction: inheritedMoment },
+    { momentAction: { ...moment, comment: 1 } },
+    { momentAction: { ...moment, comment: ['array'] } },
+    { relationshipStageAction: { ...relationship, expectedSceneRevision: '4' } },
+    { relationshipStageAction: { ...relationship, secret: 'leak' } },
+    { relationshipStageAction: inheritedRelationship }
+  ];
+  for (const draft of invalidDrafts) {
+    assert.throws(
+      () => normalizeCanonicalBrainDraft(draft),
+      /canonical (moment|relationship)/i
+    );
+    if (draft.momentAction || draft.relationshipStageAction) {
+      assert.throws(
+        () => orchestrator.canonicalActionSet({ characterId: 'yuqi' }, draft),
+        /canonical (moment|relationship)/i
+      );
+    }
+  }
+  assert.equal(targetCalls, 0);
+  assert.equal(normalizeBrainDraft({ momentAction: { ...moment, comment: 1 } }).momentAction.comment, '1');
 });
 
 function envelope(seq = 1, content = '你好') {

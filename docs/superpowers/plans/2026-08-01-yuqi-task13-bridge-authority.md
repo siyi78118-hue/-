@@ -1666,6 +1666,16 @@ for that trigger snapshot, and opaque caller revisions or legacy `id` aliases
 are never trusted. Cross-stack fixtures must freeze the exact Web/Android/PC
 target projection and SHA-256 vectors before an adapter may mutate state.
 
+For protocol v3, any supplied scene has a closed native
+`stagePersonaRevision`: it is an own, nonnegative safe integer and is preserved
+in the normalized envelope/checksum beside `effectiveStagePersona`. A v3 scene
+with a missing, inherited, coerced, negative, unsafe, or unknown revision field
+is rejected before turn creation. Protocol v1/v2 keep the pre-v3 scene
+projection byte-for-byte and do not gain this authority field. The
+`relationship_transition.expectedSceneRevision` and its target checksum bind
+only to this persisted normalized v3 scene value; `relationship.revision`, a
+caller string, and a default zero are forbidden fallback facts.
+
 In the same persistence write as the domain mutation, moment targets store
 `canonicalActionApplications[actionId]` with the exact five-field proof rather
 than only `nativeActionTurnIds`; relationship stores the same permanent proof at

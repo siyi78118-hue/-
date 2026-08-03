@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { generationFingerprint } from '../src/interaction-lanes.mjs';
-import { contentHash } from '../src/protocol.mjs';
+import { normalizeCanonicalBrainDraft, YuqiOrchestrator } from '../src/orchestrator.mjs';
+import { contentHash, validateEnvelope } from '../src/protocol.mjs';
 import { canonicalCommitPayload, commitVisibleResult } from '../src/visible-result-commit.mjs';
 import {
   YuqiStore,
@@ -411,6 +412,101 @@ function withAuthority(run) {
   }
 }
 
+function momentEnvelope(turnId = 'turn_moment_authority') {
+  const triggerId = `trigger_${turnId.slice('turn_'.length)}`;
+  const laneKey = 'moment_interaction:moment_real';
+  return {
+    protocolVersion: 3,
+    turnId,
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq: 1,
+    createdAt: 1000,
+    kind: 'MOMENT_INTERACTION',
+    trigger: {
+      triggerId,
+      triggerType: 'moment_interaction',
+      scheduledFor: 999,
+      executedAt: 1000,
+      context: {
+        momentId: 'moment_real',
+        input: {
+          targetMoment: { momentId: 'moment_real', revision: 3, ownerId: 'user' },
+          targetComment: {
+            commentId: 'comment_real',
+            momentId: 'moment_real',
+            revision: 2,
+            ownerId: 'user'
+          }
+        },
+        scene: {
+          relationshipStage: { id: 'new', label: '初识' },
+          stagePersonaRevision: 4
+        }
+      }
+    },
+    context: {
+      visibilityCursor: {
+        nativeCompletedTurnId: null,
+        nativeCompletedGroupId: null,
+        nativeCompletedSequence: 0,
+        uiAppliedTurnId: null,
+        uiAppliedGroupId: null,
+        uiAppliedSequence: 0,
+        localSequence: 1,
+        clearedThroughSequence: 0,
+        clearEpoch: 0,
+        clearedAt: 0,
+        chatOpen: false,
+        quotedMessageId: null
+      }
+    },
+    authority: {
+      algorithm: 'al-authority-v1',
+      roleId: 'yuqi',
+      laneKey,
+      rootSourceId: triggerId,
+      lineageKey: deriveAuthorityLineageKey({ roleId: 'yuqi', laneKey, rootSourceId: triggerId }),
+      claimedLineageRevision: 1,
+      retryOfTurnId: null
+    }
+  };
+}
+
+function withMomentAuthority(run) {
+  return withStore(store => {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'MOMENT_INTERACTION',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: SHA
+      }],
+      now: 1
+    });
+    const envelope = validateEnvelope(momentEnvelope());
+    const rollout = store.getCognitionRollout('MOMENT_INTERACTION');
+    const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1000 });
+    const created = store.createCanonicalVisibleTurnInternal({
+      envelope,
+      rolloutKey: 'MOMENT_INTERACTION',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: envelope.authority.laneKey,
+      expectedLaneRevision: 0,
+      inputUserBatchId: envelope.trigger.triggerId,
+      inputVisibilitySequence: 1,
+      inputClearEpoch: 0,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: {}
+    });
+    return run(store, created.turn);
+  });
+}
+
 function commitInput(store, turn) {
   const visibleGroup = {
     items: [
@@ -439,8 +535,8 @@ function commitInput(store, turn) {
     laneKey: turn.laneKey,
     expectedTurnRevision: turn.turnRevision,
     expectedLineageRevision: store.getTurnAuthorityLineage(turn.authorityLineageKey).revision,
-    expectedLaneRevision: store.getInteractionLane('yuqi', 'private_chat').revision,
-    expectedCognitiveStateRevision: 1,
+    expectedLaneRevision: store.getInteractionLane('yuqi', turn.laneKey).revision,
+    expectedCognitiveStateRevision: Number(store.getCognitiveState('yuqi')?.revision || 0),
     expectedLatestUserBatchId: turn.inputUserBatchId,
     inputVisibilitySequence: turn.inputVisibilitySequence,
     agencySnapshotChecksum: turn.agencySnapshotChecksum,
@@ -489,6 +585,20 @@ function sideEffectCounts(store) {
     'stance_records',
     'consolidation_jobs',
     'cloud_deliveries'
+  ].map(table => [
+    table,
+    Number(store.db.prepare(`SELECT COUNT(*) AS value FROM ${table}`).get().value)
+  ]));
+}
+
+function canonicalCreationCounts(store) {
+  return Object.fromEntries([
+    'turns',
+    'turn_authority_lineages',
+    'current_user_batches',
+    'current_user_batch_items',
+    'messages',
+    'interaction_lanes'
   ].map(table => [
     table,
     Number(store.db.prepare(`SELECT COUNT(*) AS value FROM ${table}`).get().value)
@@ -606,6 +716,87 @@ test('unknown action kinds and injected stable comparison jobs are rejected', ()
     assert.throws(() => commitVisibleResult(injected), /comparison authority conflict/i);
   }));
 
+test('interleaved role-plan action ordinals are rejected before any visible write', () =>
+  withAuthority((store, turn) => {
+    const input = commitInput(store, turn);
+    input.actionSet = [
+      {
+        kind: 'role_plan_create',
+        targetKey: `lineage_create:${turn.authorityLineageKey}:role_plan_create`,
+        targetRevision: '1',
+        payload: { op: 'create', planId: 'plan_new' }
+      },
+      {
+        kind: 'moment_create',
+        targetKey: `lineage_create:${turn.authorityLineageKey}:moment_create`,
+        targetRevision: '1',
+        payload: { privacy: 'private', content: '中间动作' }
+      },
+      {
+        kind: 'role_plan_update',
+        targetKey: 'role_plan:plan_existing',
+        targetRevision: '1',
+        payload: { op: 'update', planId: 'plan_existing' }
+      }
+    ];
+    input.generationFingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup: input.visibleGroup,
+      actionSet: input.actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    });
+    const before = sideEffectCounts(store);
+    assert.throws(
+      () => commitVisibleResult(input),
+      /role plan actions must form one contiguous ordinal block/i
+    );
+    assert.deepEqual(sideEffectCounts(store), before);
+  }));
+
+test('one contiguous role-plan action block commits with consecutive ordinals', () =>
+  withAuthority((store, turn) => {
+    store.db.exec(`
+      CREATE TABLE role_plans(
+        plan_id TEXT PRIMARY KEY,
+        character_id TEXT NOT NULL,
+        revision INTEGER NOT NULL
+      );
+      INSERT INTO role_plans(plan_id, character_id, revision)
+      VALUES ('plan_existing', 'yuqi', 3);
+    `);
+    const actionInputs = [
+      { kind: 'role_plan_create', payload: { op: 'create', planId: 'plan_new' } },
+      { kind: 'role_plan_update', payload: { op: 'update', planId: 'plan_existing' } },
+      { kind: 'moment_create', payload: { privacy: 'private', content: '动作块之后' } }
+    ];
+    const input = commitInput(store, turn);
+    input.actionSet = actionInputs.map(action => {
+      const target = store.resolveCanonicalActionTargetInternal({ turn, action });
+      return {
+        ...action,
+        targetKey: target.targetKey,
+        targetRevision: target.targetRevision
+      };
+    });
+    input.generationFingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup: input.visibleGroup,
+      actionSet: input.actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    });
+    const receipt = commitVisibleResult(input);
+    assert.deepEqual(
+      store.actionsForGroup(receipt.visibleGroupId)
+        .filter(action => action.kind.startsWith('role_plan_'))
+        .map(action => action.ordinal),
+      [0, 1]
+    );
+  }));
+
 test('input snapshot target id and revision must come from the same object', () =>
   withAuthority((store, turn) => {
     const paymentEnvelope = JSON.parse(turn.envelopeJson);
@@ -622,15 +813,19 @@ test('input snapshot target id and revision must come from the same object', () 
     }), /target identity conflict/i);
 
     const momentEnvelope = JSON.parse(turn.envelopeJson);
-    momentEnvelope.context = {
-      targetMoment: { momentId: 'moment_real', revision: 3 }
+    momentEnvelope.trigger = {
+      context: {
+        input: { targetMoment: { momentId: 'moment_real', revision: 3 } }
+      }
     };
     const momentTurn = { ...turn, envelopeJson: JSON.stringify(momentEnvelope) };
     assert.throws(() => store.resolveCanonicalActionTargetInternal({
       turn: momentTurn,
       action: {
         kind: 'moment_like',
-        payload: { momentId: 'moment_forged' }
+        payload: {
+          momentId: 'moment_forged', like: true, comment: '', replyToCommentId: null
+        }
       }
     }), /target identity conflict/i);
   }));
@@ -653,11 +848,15 @@ test('one target-ref resolver covers message conversation comment and role occur
 
     const contextualEnvelope = structuredClone(sourceEnvelope);
     contextualEnvelope.context = {
-      targetComment: { commentId: 'comment_real', content: 'hi' },
       roleOccurrence: {
         occurrenceId: 'occurrence_real',
         characterId: 'yuqi',
         revision: 2
+      }
+    };
+    contextualEnvelope.trigger = {
+      context: {
+        input: { targetComment: { commentId: 'comment_real', content: 'hi' } }
       }
     };
     const contextualTurn = { ...turn, envelopeJson: JSON.stringify(contextualEnvelope) };
@@ -824,10 +1023,19 @@ test('canonical action target registry resolves every supported authority namesp
       envelopeJson: JSON.stringify({
         context: {
           pendingPayment: { messageId: 'pay_1', amountMinor: 2000, currency: 'CNY' },
-          targetMoment: { momentId: 'moment_1', revision: 3 },
-          commentId: 'comment_1',
           rolePlan: { rolePlanId: 'plan_1', revision: 2 },
-          relationship: { phase: 'familiar', revision: 4 }
+          scene: {
+            relationshipStage: { phase: 'familiar' },
+            stagePersonaRevision: 4
+          }
+        },
+        trigger: {
+          context: {
+            input: {
+              targetMoment: { momentId: 'moment_1', revision: 3 },
+              targetComment: { commentId: 'comment_1', revision: 2 }
+            }
+          }
         }
       })
     };
@@ -855,9 +1063,15 @@ test('canonical action target registry resolves every supported authority namesp
       ['payment_accept', { messageId: 'pay_1' }, 'payment:pay_1'],
       ['payment_decline', { messageId: 'pay_1' }, 'payment:pay_1'],
       ['moment_create', {}, 'lineage_create:lin_registry:moment_create'],
-      ['moment_like', { momentId: 'moment_1' }, 'moment:moment_1'],
-      ['moment_comment', { momentId: 'moment_1' }, 'moment:moment_1'],
-      ['moment_reply', { replyToCommentId: 'comment_1' }, 'comment:comment_1'],
+      ['moment_like', {
+        momentId: 'moment_1', like: true, comment: '', replyToCommentId: null
+      }, 'moment:moment_1'],
+      ['moment_comment', {
+        momentId: 'moment_1', like: true, comment: '同感。', replyToCommentId: null
+      }, 'moment:moment_1'],
+      ['moment_reply', {
+        momentId: 'moment_1', like: false, comment: '是呀。', replyToCommentId: 'comment_1'
+      }, 'comment:comment_1'],
       ['role_plan_create', {}, 'lineage_create:lin_registry:role_plan_create'],
       ['role_plan_update', { op: 'update', planId: 'plan_1' }, 'role_plan:plan_1'],
       ['role_plan_cancel', { op: 'cancel', planId: 'plan_1' }, 'role_plan:plan_1'],
@@ -867,7 +1081,17 @@ test('canonical action target registry resolves every supported authority namesp
       ['life_episode_create', {}, 'lineage_create:lin_registry:life_episode_create'],
       ['life_episode_update', { type: 'reschedule', targetEpisodeId: 'life_1' }, 'life_episode:life_1'],
       ['life_episode_cancel', { type: 'cancel', targetEpisodeId: 'life_1' }, 'life_episode:life_1'],
-      ['relationship_transition', {}, 'relationship:yuqi']
+      ['relationship_transition', {
+        baseAction: {
+          from: 'new', to: 'acquainted', label: '熟悉', reason: '共同经历充分',
+          confidence: 0.9, evidenceMessageIds: ['msg_1', 'msg_2'],
+          explicitMutualChange: false, changedAt: 2000
+        },
+        phaseAction: null,
+        expectedSceneRevision: 4,
+        label: '熟悉',
+        changedAt: 2000
+      }, 'relationship:yuqi']
     ];
     for (const [kind, payload, targetKey] of cases) {
       const resolved = store.resolveCanonicalActionTargetInternal({
@@ -894,13 +1118,13 @@ test('canonical wire target names are exact while domain target sources stay nat
       characterId: 'yuqi',
       authorityLineageKey: 'lin_exact_wire_target',
       envelopeJson: JSON.stringify({
-        context: {
-          commentId: 'comment_1',
-          rolePlan: { rolePlanId: 'plan_1', revision: 2 }
-        },
+        context: { rolePlan: { rolePlanId: 'plan_1', revision: 2 } },
         trigger: {
           context: {
-            targetCommentId: 'comment_nested_only',
+            input: {
+              targetComment: { commentId: 'comment_1', revision: 2 },
+              commentId: 'comment_legacy_scalar'
+            },
             planId: 'plan_nested_only'
           }
         }
@@ -934,6 +1158,7 @@ test('canonical wire target names are exact while domain target sources stay nat
         legacyKey: 'commentId',
         targetId: 'comment_1',
         targetKey: 'comment:comment_1',
+        payloadBase: { momentId: 'moment_1', like: false, comment: '是呀。' },
         domainId: resolved => resolved.canonicalTarget.commentId
       },
       {
@@ -958,7 +1183,7 @@ test('canonical wire target names are exact while domain target sources stay nat
         turn,
         action: {
           kind: entry.kind,
-          payload: { [entry.canonicalKey]: entry.targetId }
+          payload: { ...(entry.payloadBase || {}), [entry.canonicalKey]: entry.targetId }
         }
       });
       assert.equal(resolved.targetKey, entry.targetKey, entry.kind);
@@ -968,54 +1193,339 @@ test('canonical wire target names are exact while domain target sources stay nat
         turn,
         action: {
           kind: entry.kind,
-          payload: { [entry.legacyKey]: entry.targetId }
+          payload: { ...(entry.payloadBase || {}), [entry.legacyKey]: entry.targetId }
         }
-      }), /canonical .* target|target identity conflict/i, `${entry.kind} legacy wire key`);
+      }), /canonical .* target|target identity conflict|moment action payload/i,
+      `${entry.kind} legacy wire key`);
       assert.throws(() => store.resolveCanonicalActionTargetInternal({
         turn,
         action: {
           kind: entry.kind,
           payload: {
+            ...(entry.payloadBase || {}),
             [entry.canonicalKey]: entry.targetId,
             [entry.legacyKey]: entry.targetId
           }
         }
-      }), /canonical .* target|target identity conflict/i, `${entry.kind} dual wire keys`);
-      const inheritedPayload = Object.create({ [entry.canonicalKey]: entry.targetId });
+      }), /canonical .* target|target identity conflict|moment action payload/i,
+      `${entry.kind} dual wire keys`);
+      const inheritedPayload = Object.assign(
+        Object.create({ [entry.canonicalKey]: entry.targetId }),
+        entry.payloadBase || {}
+      );
       assert.throws(() => store.resolveCanonicalActionTargetInternal({
         turn,
         action: { kind: entry.kind, payload: inheritedPayload }
-      }), /canonical .* target|target identity conflict/i, `${entry.kind} inherited wire key`);
+      }), /canonical .* target|target identity conflict|moment action payload/i,
+      `${entry.kind} inherited wire key`);
       for (const invalid of ['', null, 1, [entry.targetId], { id: entry.targetId }]) {
         assert.throws(() => store.resolveCanonicalActionTargetInternal({
           turn,
           action: {
             kind: entry.kind,
-            payload: { [entry.canonicalKey]: invalid }
+            payload: { ...(entry.payloadBase || {}), [entry.canonicalKey]: invalid }
           }
-        }), /canonical .* target|target identity conflict/i, `${entry.kind} invalid wire type`);
+        }), /canonical .* target|target identity conflict|moment .* payload/i,
+        `${entry.kind} invalid wire type`);
       }
       assert.throws(() => store.resolveCanonicalActionTargetInternal({
         turn,
         action: {
           kind: entry.kind,
-          payload: { [entry.canonicalKey]: `${entry.targetId}_foreign` }
+          payload: {
+            ...(entry.payloadBase || {}),
+            [entry.canonicalKey]: `${entry.targetId}_foreign`
+          }
         }
-      }), /canonical .* target|target identity conflict/i, `${entry.kind} foreign target`);
+      }), /canonical .* target|target identity conflict|moment action payload/i,
+      `${entry.kind} foreign target`);
     }
 
     const nestedOnly = {
       ...turn,
-      envelopeJson: JSON.stringify({ trigger: JSON.parse(turn.envelopeJson).trigger })
+      envelopeJson: JSON.stringify({
+        trigger: { context: { input: { commentId: 'comment_nested_only' } } }
+      })
     };
     assert.throws(() => store.resolveCanonicalActionTargetInternal({
       turn: nestedOnly,
-      action: { kind: 'moment_reply', payload: { replyToCommentId: 'comment_nested_only' } }
+      action: {
+        kind: 'moment_reply',
+        payload: {
+          momentId: 'moment_1', like: false, comment: '回复。',
+          replyToCommentId: 'comment_nested_only'
+        }
+      }
     }), /target identity conflict/i);
     assert.throws(() => store.resolveCanonicalActionTargetInternal({
       turn: nestedOnly,
       action: { kind: 'role_plan_update', payload: { planId: 'plan_nested_only' } }
     }), /target identity conflict/i);
+  }));
+
+test('moment and relationship actions commit from fixed authoritative targets', () =>
+  withMomentAuthority((store, turn) => {
+    const relationshipPayload = {
+      baseAction: {
+        from: 'new',
+        to: 'acquainted',
+        label: '熟悉',
+        reason: '共同经历充分',
+        confidence: 0.91,
+        evidenceMessageIds: ['msg_evidence_1', 'msg_evidence_2'],
+        explicitMutualChange: false,
+        changedAt: 2000
+      },
+      phaseAction: null,
+      expectedSceneRevision: 4,
+      label: '熟悉',
+      changedAt: 2000
+    };
+    const actions = [
+      ['moment_like', {
+        momentId: 'moment_real', like: true, comment: '', replyToCommentId: null
+      }],
+      ['moment_comment', {
+        momentId: 'moment_real', like: true, comment: '我也喜欢这一张。', replyToCommentId: null
+      }],
+      ['moment_reply', {
+        momentId: 'moment_real', like: false, comment: '是呀。', replyToCommentId: 'comment_real'
+      }],
+      ['relationship_transition', relationshipPayload]
+    ].map(([kind, payload]) => {
+      const target = store.resolveCanonicalActionTargetInternal({ turn, action: { kind, payload } });
+      return { kind, payload, targetKey: target.targetKey, targetRevision: target.targetRevision };
+    });
+    const input = commitInput(store, turn);
+    input.actionSet = actions;
+    input.statePatch = null;
+    input.memoryJobs = [];
+    input.generationFingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup: input.visibleGroup,
+      actionSet: input.actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    });
+    const receipt = commitVisibleResult(input);
+    assert.deepEqual(
+      store.actionsForGroup(receipt.visibleGroupId).map(action => action.kind),
+      ['moment_like', 'moment_comment', 'moment_reply', 'relationship_transition']
+    );
+  }));
+
+test('invalid v3 stage persona revisions are rejected before a canonical turn can write', () =>
+  withStore(store => {
+    store.initializeCognitionRolloutsInternal({
+      rows: [{
+        rolloutKey: 'MOMENT_INTERACTION',
+        currentMode: 'legacy',
+        rolloutPhase: 'stable',
+        presetVersion: '1.9.2',
+        pipelineChecksum: SHA
+      }],
+      now: 1
+    });
+    const before = canonicalCreationCounts(store);
+    for (const [label, mutate] of [
+      ['missing', scene => { delete scene.stagePersonaRevision; }],
+      ['string', scene => { scene.stagePersonaRevision = '4'; }],
+      ['negative', scene => { scene.stagePersonaRevision = -1; }]
+    ]) {
+      const raw = momentEnvelope(`turn_invalid_scene_revision_${label}`);
+      mutate(raw.trigger.context.scene);
+      assert.throws(() => {
+        const envelope = validateEnvelope(raw);
+        const rollout = store.getCognitionRollout('MOMENT_INTERACTION');
+        const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1000 });
+        store.createCanonicalVisibleTurnInternal({
+          envelope,
+          rolloutKey: 'MOMENT_INTERACTION',
+          expectedRolloutRevision: rollout.revision,
+          authoritativeReleaseId: rollout.stableReleaseId,
+          comparisonReleaseId: null,
+          comparisonDirection: null,
+          laneKey: envelope.authority.laneKey,
+          expectedLaneRevision: 0,
+          inputUserBatchId: envelope.trigger.triggerId,
+          inputVisibilitySequence: 1,
+          inputClearEpoch: 0,
+          agencySnapshotChecksum: agency.checksum,
+          annotationSnapshot: {}
+        });
+      }, /stagePersonaRevision/i, label);
+      assert.deepEqual(canonicalCreationCounts(store), before, label);
+    }
+  }));
+
+test('invalid raw canonical action sources cannot be cleaned into visible SQLite writes', () =>
+  withMomentAuthority((store, turn) => {
+    const orchestrator = Object.create(YuqiOrchestrator.prototype);
+    orchestrator.store = store;
+    const moment = {
+      momentId: 'moment_real', like: true, comment: '', replyToCommentId: null
+    };
+    const relationship = {
+      baseAction: {
+        from: 'new', to: 'acquainted', label: '熟悉', reason: '共同经历充分',
+        confidence: 0.91, evidenceMessageIds: ['msg_1', 'msg_2'],
+        explicitMutualChange: false, changedAt: 2000
+      },
+      phaseAction: null,
+      expectedSceneRevision: 4,
+      label: '熟悉',
+      changedAt: 2000,
+      from: 'new',
+      to: 'acquainted',
+      reason: '共同经历充分',
+      confidence: 0.91,
+      evidenceMessageIds: ['msg_1', 'msg_2'],
+      explicitMutualChange: false
+    };
+    const invalid = [
+      { actionIntent: { moment: { ...moment, secret: 'leak' } } },
+      { momentAction: Object.assign(Object.create({ secret: 'prototype' }), moment) },
+      { momentAction: { ...moment, comment: 1 } },
+      { momentAction: { ...moment, comment: ['array'] } },
+      { relationshipStageAction: { ...relationship, expectedSceneRevision: '4' } },
+      { relationshipStageAction: { ...relationship, secret: 'leak' } },
+      {
+        relationshipStageAction: Object.assign(
+          Object.create({ secret: 'prototype' }),
+          relationship
+        )
+      }
+    ];
+    const before = sideEffectCounts(store);
+    for (const rawDraft of invalid) {
+      assert.throws(() => {
+        const draft = normalizeCanonicalBrainDraft(rawDraft);
+        orchestrator.canonicalActionSet(turn, draft);
+      }, /canonical (moment|relationship)/i);
+      assert.deepEqual(sideEffectCounts(store), before);
+    }
+  }));
+
+test('moment and relationship payload shapes are closed before canonical writes', () =>
+  withMomentAuthority((store, turn) => {
+    const relationship = {
+      baseAction: {
+        from: 'new', to: 'acquainted', label: '熟悉', reason: '共同经历充分',
+        confidence: 0.91, evidenceMessageIds: ['msg_1', 'msg_2'],
+        explicitMutualChange: false, changedAt: 2000
+      },
+      phaseAction: null,
+      expectedSceneRevision: 4,
+      label: '熟悉',
+      changedAt: 2000
+    };
+    const invalid = [
+      ['moment_like', {
+        momentId: 'moment_real', like: true, comment: '不能伪装成纯点赞', replyToCommentId: null
+      }],
+      ['moment_comment', {
+        momentId: 'moment_real', like: false, comment: '', replyToCommentId: null
+      }],
+      ['moment_reply', {
+        momentId: 'moment_real', like: true, comment: '不能静默丢点赞', replyToCommentId: 'comment_real'
+      }],
+      ['moment_like', {
+        momentId: 'moment_real', like: true, comment: '', replyToCommentId: null, secret: 'leak'
+      }],
+      ['relationship_transition', { ...relationship, from: 'legacy_flattened' }],
+      ['relationship_transition', {
+        ...relationship,
+        baseAction: { ...relationship.baseAction, secret: 'leak' }
+      }],
+      ['relationship_transition', { ...relationship, expectedSceneRevision: 5 }]
+    ];
+    const before = sideEffectCounts(store);
+    for (const [kind, payload] of invalid) {
+      const input = commitInput(store, turn);
+      input.statePatch = null;
+      input.memoryJobs = [];
+      input.actionSet = [{
+        kind,
+        payload,
+        targetKey: kind === 'moment_reply'
+          ? 'comment:comment_real'
+          : kind === 'relationship_transition'
+            ? 'relationship:yuqi'
+            : 'moment:moment_real',
+        targetRevision: 'forged'
+      }];
+      input.generationFingerprint = generationFingerprint({
+        roleId: turn.characterId,
+        laneKey: turn.laneKey,
+        inputVisibilitySequence: turn.inputVisibilitySequence,
+        visibleGroup: input.visibleGroup,
+        actionSet: input.actionSet,
+        contextRevision: turn.agencySnapshotChecksum
+      });
+      assert.throws(() => commitVisibleResult(input), /canonical .* payload|canonical relationship/i);
+      assert.deepEqual(sideEffectCounts(store), before, kind);
+    }
+  }));
+
+test('moment aliases foreign identities and changed target proofs fail without visible writes', () =>
+  withMomentAuthority((store, turn) => {
+    const before = sideEffectCounts(store);
+    const persistedEnvelope = JSON.parse(turn.envelopeJson);
+    const aliasTurn = {
+      ...turn,
+      envelopeJson: JSON.stringify({
+        ...persistedEnvelope,
+        context: {
+          ...persistedEnvelope.context,
+          targetMoment: { momentId: 'moment_real', revision: 3 },
+          momentId: 'moment_real'
+        },
+        trigger: {
+          ...persistedEnvelope.trigger,
+          context: { input: { id: 'moment_real', momentId: 'moment_real' } }
+        }
+      })
+    };
+    const likePayload = {
+      momentId: 'moment_real', like: true, comment: '', replyToCommentId: null
+    };
+    assert.throws(() => store.resolveCanonicalActionTargetInternal({
+      turn: aliasTurn,
+      action: { kind: 'moment_like', payload: likePayload }
+    }), /target identity conflict/i);
+    assert.throws(() => store.resolveCanonicalActionTargetInternal({
+      turn,
+      action: {
+        kind: 'moment_like',
+        payload: { ...likePayload, momentId: 'moment_foreign' }
+      }
+    }), /target identity conflict/i);
+    assert.deepEqual(sideEffectCounts(store), before);
+
+    const target = store.resolveCanonicalActionTargetInternal({
+      turn,
+      action: { kind: 'moment_like', payload: likePayload }
+    });
+    const changed = commitInput(store, turn);
+    changed.actionSet = [{
+      kind: 'moment_like',
+      payload: likePayload,
+      targetKey: target.targetKey,
+      targetRevision: `${target.targetRevision}_changed`
+    }];
+    changed.statePatch = null;
+    changed.memoryJobs = [];
+    changed.generationFingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup: changed.visibleGroup,
+      actionSet: changed.actionSet,
+      contextRevision: turn.agencySnapshotChecksum
+    });
+    assert.throws(() => commitVisibleResult(changed), /target revision authority conflict/i);
+    assert.deepEqual(sideEffectCounts(store), before);
   }));
 
 test('legacy wire target aliases fail a visible commit without side effects', () =>
