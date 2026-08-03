@@ -10,6 +10,30 @@ const context = vm.createContext({ structuredClone, Date, Math, JSON, Set, Strin
 if (existsSync(domainPath)) vm.runInContext(readFileSync(domainPath, 'utf8'), context);
 const domain = context.ALRolePlans;
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function canonicalPair(actionId, kind, planId, operation, overrides = {}) {
+  return {
+    operation: structuredClone(operation),
+    request: {
+      version: 1,
+      authoritativeTurnId: 'turn_authority_1',
+      actionId,
+      actionChecksum: 'a'.repeat(64),
+      kind,
+      planId,
+      operationJson: canonicalJson(operation),
+      ...overrides
+    }
+  };
+}
+
 test('exports the role plan domain', () => {
   assert.ok(domain, 'ALRolePlans should be exported');
 });
@@ -212,4 +236,107 @@ test('deletes only a terminal plan together with its history', () => {
   });
   assert.deepEqual(result.plans.map(plan => plan.planId), ['active']);
   assert.deepEqual(result.history.map(row => row.historyId), ['h-active']);
+});
+
+test('canonical role-plan batches preflight every request and persist ordered untrimmed proofs', () => {
+  assert.equal(typeof domain.applyCanonicalApplications, 'function');
+  const original = [{
+    planId: 'plan-a', characterId: 'char-a', type: 'private_message', source: 'spoken',
+    status: 'active', title: '旧标题', intent: '晚点联系', nextRunAt: 9000, updatedAt: 1000
+  }];
+  const update = { op: 'update', planId: 'plan-a', patch: { title: '新标题' } };
+  const pause = { op: 'pause', planId: 'plan-a', reason: '临时有事' };
+  const pairs = [
+    canonicalPair('action_update', 'role_plan_update', 'plan-a', update),
+    canonicalPair('action_pause', 'role_plan_pause', 'plan-a', pause)
+  ];
+  const applied = domain.applyCanonicalApplications(original, [], pairs, {
+    charId: 'char-a', now: 5000, appliedAt: 5000, uid: () => 'unused'
+  });
+
+  assert.equal(applied.plansChanged, true);
+  assert.equal(applied.historyChanged, true);
+  assert.equal(applied.plans[0].title, '新标题');
+  assert.equal(applied.plans[0].status, 'paused');
+  assert.deepEqual(Object.keys(applied.plans[0].canonicalActionApplications), ['action_update', 'action_pause']);
+  assert.equal(applied.plans[0].canonicalActionApplications.action_update.appliedAt, 5000);
+  assert.deepEqual(applied.history.map(row => row.historyId), ['action_update', 'action_pause']);
+
+  const replay = domain.applyCanonicalApplications(applied.plans, applied.history, pairs, {
+    charId: 'char-a', now: 9000, appliedAt: 9000, uid: () => 'unused'
+  });
+  assert.equal(replay.plansChanged, false);
+  assert.equal(replay.historyChanged, false);
+  assert.equal(replay.plans[0].canonicalActionApplications.action_update.appliedAt, 5000);
+
+  const changed = canonicalPair('action_update', 'role_plan_update', 'plan-a', update, {
+    actionChecksum: 'b'.repeat(64)
+  });
+  assert.throws(() => domain.applyCanonicalApplications(applied.plans, applied.history, [changed], {
+    charId: 'char-a', now: 10000, appliedAt: 10000
+  }), /canonical role plan authority conflict/);
+  assert.throws(() => domain.applyCanonicalApplications(original, [], [pairs[0], pairs[0]], {
+    charId: 'char-a', now: 5000, appliedAt: 5000
+  }), /canonical role plan authority conflict/);
+  assert.equal('canonicalActionApplications' in original[0], false, 'failed preflight must not mutate input plans');
+});
+
+test('canonical history is repairable but never authorizes replay without a plan ledger', () => {
+  const operation = { op: 'pause', planId: 'plan-a', reason: '稍后继续' };
+  const pair = canonicalPair('action_pause', 'role_plan_pause', 'plan-a', operation);
+  const proof = { ...pair.request, appliedAt: 7000 };
+  const provenPlan = {
+    planId: 'plan-a', characterId: 'char-a', type: 'private_message', status: 'paused',
+    canonicalActionApplications: { action_pause: proof }
+  };
+  const repaired = domain.applyCanonicalApplications([provenPlan], [], [pair], {
+    charId: 'char-a', now: 9000, appliedAt: 9000
+  });
+  assert.equal(repaired.plansChanged, false);
+  assert.equal(repaired.historyChanged, true);
+  assert.equal(repaired.history[0].historyId, 'action_pause');
+  assert.equal(repaired.history[0].createdAt, 7000);
+
+  const historyOnly = structuredClone(repaired.history);
+  const unprovenPlan = {
+    planId: 'plan-a', characterId: 'char-a', type: 'private_message', status: 'active'
+  };
+  assert.throws(() => domain.applyCanonicalApplications([unprovenPlan], historyOnly, [pair], {
+    charId: 'char-a', now: 10000, appliedAt: 10000
+  }), /canonical role plan history conflict/, 'history alone must neither authorize nor be overwritten');
+  assert.equal(unprovenPlan.status, 'active');
+  assert.equal('canonicalActionApplications' in unprovenPlan, false);
+
+  const changedHistory = [{ ...repaired.history[0], operation: 'resume' }];
+  assert.throws(() => domain.applyCanonicalApplications([provenPlan], changedHistory, [pair], {
+    charId: 'char-a', now: 10000, appliedAt: 10000
+  }), /canonical role plan history conflict/);
+});
+
+test('legacy operations cannot inject, overwrite, or delete the canonical role-plan ledger', () => {
+  const plan = {
+    planId: 'plan-a', characterId: 'char-a', type: 'private_message', source: 'spoken',
+    status: 'active', intent: '联系用户', nextRunAt: 9000,
+    canonicalActionApplications: { action_existing: { appliedAt: 1000 } }
+  };
+  const create = domain.applyOperations([], [], [{
+    op: 'create', planId: 'bad-create', type: 'private_message', source: 'spoken',
+    intent: '不能注入', schedule: { kind: 'once', at: '2026-07-17T09:00:00+08:00' },
+    canonicalActionApplications: {}
+  }], { charId: 'char-a', now: 1000, uid: () => 'bad-create' });
+  assert.equal(create.changed, false);
+  assert.equal(create.rejected[0].code, 'PLAN_LEDGER_RESERVED');
+
+  for (const patch of [
+    { canonicalActionApplications: {} },
+    { canonicalActionApplications: null },
+    { canonicalActionApplications: undefined }
+  ]) {
+    const result = domain.applyOperations([plan], [], [{ op: 'update', planId: 'plan-a', patch }], {
+      charId: 'char-a', now: 2000, uid: () => 'legacy-history'
+    });
+    assert.equal(result.changed, false);
+    assert.equal(result.rejected[0].code, 'PLAN_LEDGER_RESERVED');
+    assert.deepEqual(result.plans, [plan]);
+  }
 });

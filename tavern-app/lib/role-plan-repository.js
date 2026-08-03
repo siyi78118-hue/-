@@ -87,6 +87,59 @@
       return result;
     }
 
+    async function applyCanonical(characterId, orderedPairs) {
+      const allPlanRows = nativePlugin?.listRolePlans ? null : await allPlans();
+      const plans = nativePlugin?.listRolePlans
+        ? await list(characterId, { includeTerminal: true })
+        : allPlanRows.filter(plan => plan.characterId === characterId);
+      const requestedPlanIds = (Array.isArray(orderedPairs) ? orderedPairs : [])
+        .map(pair => pair?.request?.planId)
+        .filter(planId => typeof planId === 'string' && planId.length > 0);
+      const planIds = new Set([
+        ...plans.map(plan => plan.planId),
+        ...requestedPlanIds
+      ]);
+      const allHistoryRows = nativePlugin?.rolePlanHistory ? null : await allHistory();
+      const historyRows = nativePlugin?.rolePlanHistory
+        ? (await Promise.all([...planIds].map(planId => history(planId, 200)))).flat()
+        : allHistoryRows.filter(row => planIds.has(row.planId));
+      const appliedAt = Number(now());
+      const result = domain.applyCanonicalApplications(plans, historyRows, orderedPairs, {
+        charId: characterId,
+        now: appliedAt,
+        appliedAt,
+        uid
+      });
+      if (!result.plansChanged && !result.historyChanged) return result;
+
+      if (nativePlugin?.replaceRolePlans) {
+        await nativePlugin.replaceRolePlans({
+          characterId,
+          plansJson: JSON.stringify(result.plans),
+          historyJson: JSON.stringify(result.history)
+        });
+        return result;
+      }
+
+      const scopePlanIds = new Set([
+        ...plans.map(plan => plan.planId),
+        ...result.plans.map(plan => plan.planId)
+      ]);
+      if (result.plansChanged) {
+        await metaStore.setMeta(PLANS_KEY, [
+          ...allPlanRows.filter(plan => plan.characterId !== characterId),
+          ...result.plans
+        ]);
+      }
+      if (result.historyChanged) {
+        await metaStore.setMeta(HISTORY_KEY, [
+          ...allHistoryRows.filter(row => !scopePlanIds.has(row.planId)),
+          ...result.history
+        ]);
+      }
+      return result;
+    }
+
     async function mutate(characterId, planId, action, patch = {}) {
       return apply(characterId, [{ op: action, planId, ...clone(patch) }]);
     }
@@ -101,7 +154,7 @@
       return list(characterId, { includeTerminal: true });
     }
 
-    return { list, apply, mutate, replace, history, scheduleContext, reconcile };
+    return { list, apply, applyCanonical, mutate, replace, history, scheduleContext, reconcile };
   }
 
   root.ALRolePlanRepository = { create, PLANS_KEY, HISTORY_KEY };

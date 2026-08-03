@@ -5,6 +5,12 @@
   const PLAN_TYPES = new Set(['private_message', 'moment_post', 'role_schedule']);
   const PLAN_SOURCES = new Set(['spoken', 'accepted_request', 'private_decision', 'user_created']);
   const PLAN_OPERATIONS = new Set(['create', 'update', 'cancel', 'pause', 'resume', 'complete', 'delete']);
+  const CANONICAL_PLAN_OPERATIONS = new Set(['create', 'update', 'cancel', 'pause', 'resume', 'complete']);
+  const CANONICAL_REQUEST_KEYS = Object.freeze([
+    'version', 'authoritativeTurnId', 'actionId', 'actionChecksum', 'kind', 'planId', 'operationJson'
+  ]);
+  const CANONICAL_PROOF_KEYS = Object.freeze([...CANONICAL_REQUEST_KEYS, 'appliedAt']);
+  const CANONICAL_HISTORY_KEYS = Object.freeze(['historyId', 'planId', 'operation', 'detailJson', 'createdAt']);
   const ACTIVE_LIMIT = 50;
   const MIN_SEND_GAP_MS = 5 * 60 * 1000;
 
@@ -15,6 +21,31 @@
   function compact(value, maxLength) {
     const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
     return text.length <= maxLength ? text : text.slice(0, maxLength);
+  }
+
+  function plainObject(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+  }
+
+  function exactKeys(value, keys) {
+    return plainObject(value)
+      && Object.keys(value).sort().join('\n') === [...keys].sort().join('\n');
+  }
+
+  function canonicalJson(value) {
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (plainObject(value)) {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+    }
+    return JSON.stringify(value);
+  }
+
+  function positiveSafeInteger(value) {
+    return Number.isSafeInteger(value) && value > 0;
+  }
+
+  function nativeNonemptyString(value, maxLength = 256) {
+    return typeof value === 'string' && value.length > 0 && value.length <= maxLength;
   }
 
   function safeId(value) {
@@ -107,6 +138,14 @@
   }
 
   function normalizeOperation(operation, context = {}) {
+    const source = operation && typeof operation === 'object' ? operation : {};
+    if ((source.op === 'create' && Object.hasOwn(source, 'canonicalActionApplications'))
+      || (source.op === 'update'
+        && source.patch
+        && typeof source.patch === 'object'
+        && Object.hasOwn(source.patch, 'canonicalActionApplications'))) {
+      return { ok: false, code: 'PLAN_LEDGER_RESERVED', detail: 'canonicalActionApplications is reserved' };
+    }
     const value = copy(operation || {});
     if (!PLAN_OPERATIONS.has(value.op)) {
       return { ok: false, code: 'PLAN_OP_INVALID', detail: 'unknown operation' };
@@ -264,6 +303,138 @@
     return { plans: nextPlans, history: nextHistory, changed, rejected };
   }
 
+  function validateCanonicalPair(pair) {
+    if (!exactKeys(pair, ['operation', 'request'])
+      || !plainObject(pair.operation)
+      || !exactKeys(pair.request, CANONICAL_REQUEST_KEYS)) {
+      throw new Error('canonical role plan authority conflict');
+    }
+    const request = pair.request;
+    if (request.version !== 1
+      || !nativeNonemptyString(request.authoritativeTurnId, 128)
+      || !nativeNonemptyString(request.actionId, 128)
+      || typeof request.actionChecksum !== 'string'
+      || !/^[a-f0-9]{64}$/.test(request.actionChecksum)
+      || !nativeNonemptyString(request.planId, 96)
+      || typeof request.operationJson !== 'string') {
+      throw new Error('canonical role plan authority conflict');
+    }
+    let operation;
+    try {
+      operation = JSON.parse(request.operationJson);
+    } catch {
+      throw new Error('canonical role plan authority conflict');
+    }
+    if (!plainObject(operation)
+      || canonicalJson(operation) !== request.operationJson
+      || canonicalJson(pair.operation) !== request.operationJson
+      || !CANONICAL_PLAN_OPERATIONS.has(operation.op)
+      || request.kind !== `role_plan_${operation.op}`) {
+      throw new Error('canonical role plan authority conflict');
+    }
+    if (operation.op !== 'create' && operation.planId !== request.planId) {
+      throw new Error('canonical role plan authority conflict');
+    }
+    return { operation: copy(operation), request: copy(request) };
+  }
+
+  function requestMatchesProof(request, proof) {
+    return exactKeys(proof, CANONICAL_PROOF_KEYS)
+      && positiveSafeInteger(proof.appliedAt)
+      && CANONICAL_REQUEST_KEYS.every(key => canonicalJson(proof[key]) === canonicalJson(request[key]));
+  }
+
+  function canonicalHistoryRow(proof) {
+    const operation = JSON.parse(proof.operationJson);
+    return {
+      historyId: proof.actionId,
+      planId: proof.planId,
+      operation: operation.op,
+      detailJson: proof.operationJson,
+      createdAt: proof.appliedAt
+    };
+  }
+
+  function sameCanonicalHistory(left, right) {
+    return exactKeys(left, CANONICAL_HISTORY_KEYS)
+      && CANONICAL_HISTORY_KEYS.every(key => canonicalJson(left[key]) === canonicalJson(right[key]));
+  }
+
+  function applyCanonicalApplications(plans, history, pairs, context = {}) {
+    const nextPlans = copy(Array.isArray(plans) ? plans : []);
+    const nextHistory = copy(Array.isArray(history) ? history : []);
+    const checkedPairs = (Array.isArray(pairs) ? pairs : []).map(validateCanonicalPair);
+    const incomingIds = new Set();
+    for (const pair of checkedPairs) {
+      if (incomingIds.has(pair.request.actionId)) {
+        throw new Error('canonical role plan authority conflict');
+      }
+      incomingIds.add(pair.request.actionId);
+    }
+    const appliedAt = Number(context.appliedAt);
+    let plansChanged = false;
+    let historyChanged = false;
+
+    for (const pair of checkedPairs) {
+      const { operation, request } = pair;
+      const owners = nextPlans.filter(plan => (
+        plainObject(plan?.canonicalActionApplications)
+        && Object.hasOwn(plan.canonicalActionApplications, request.actionId)
+      ));
+      if (owners.length > 1) throw new Error('canonical role plan authority conflict');
+      let target = owners[0] || null;
+      let proof = target?.canonicalActionApplications?.[request.actionId] || null;
+      if (proof) {
+        if (target.planId !== request.planId || !requestMatchesProof(request, proof)) {
+          throw new Error('canonical role plan authority conflict');
+        }
+      } else {
+        if (!positiveSafeInteger(appliedAt)) {
+          throw new Error('canonical role plan authority conflict');
+        }
+        const result = applyOperations(nextPlans, [], [operation], {
+          ...context,
+          now: Number(context.now),
+          uid: () => request.planId
+        });
+        if (!result.changed || result.rejected.length) {
+          throw new Error('canonical role plan operation conflict');
+        }
+        nextPlans.splice(0, nextPlans.length, ...result.plans);
+        target = nextPlans.find(plan => plan.planId === request.planId && plan.characterId === context.charId);
+        if (!target) throw new Error('canonical role plan authority conflict');
+        if (target.canonicalActionApplications != null
+          && !plainObject(target.canonicalActionApplications)) {
+          throw new Error('canonical role plan authority conflict');
+        }
+        proof = { ...copy(request), appliedAt };
+        target.canonicalActionApplications = {
+          ...(target.canonicalActionApplications || {}),
+          [request.actionId]: proof
+        };
+        plansChanged = true;
+      }
+
+      const expectedHistory = canonicalHistoryRow(proof);
+      const matches = nextHistory.filter(row => row?.historyId === request.actionId);
+      if (matches.length > 1 || (matches.length === 1 && !sameCanonicalHistory(matches[0], expectedHistory))) {
+        throw new Error('canonical role plan history conflict');
+      }
+      if (matches.length === 0) {
+        nextHistory.push(expectedHistory);
+        historyChanged = true;
+      }
+    }
+
+    return {
+      plans: nextPlans,
+      history: nextHistory,
+      changed: plansChanged || historyChanged,
+      plansChanged,
+      historyChanged
+    };
+  }
+
   function scheduleContext(plans, characterId, nowMs) {
     const now = Number(nowMs);
     return (Array.isArray(plans) ? plans : []).filter(plan => {
@@ -350,6 +521,7 @@
     MIN_SEND_GAP_MS,
     normalizeOperation,
     applyOperations,
+    applyCanonicalApplications,
     nextOccurrence,
     occurrenceId,
     effectivePlans,
