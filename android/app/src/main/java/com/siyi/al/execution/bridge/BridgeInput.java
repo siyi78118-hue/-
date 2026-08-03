@@ -1,10 +1,25 @@
 package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.TurnSubmission;
+import com.siyi.al.execution.BridgeAuthority;
+import com.siyi.al.execution.TurnKind;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-final class BridgeInput {
+public final class BridgeInput {
+    private static final Set<String> CHECKPOINT_KEYS = new HashSet<>(Arrays.asList(
+        "version", "localTurnId", "attemptId", "attemptSequence",
+        "authoritativeTurnId", "authorityLineageKey", "claimedLineageRevision",
+        "retryOfTurnId", "laneKey", "inputVisibilitySequence", "inputClearEpoch",
+        "normalizedEnvelope", "envelopeChecksum", "outcome"
+    ));
+    private static final Set<String> OUTCOME_KEYS = new HashSet<>(Arrays.asList(
+        "type", "route", "relayMessageId", "failure", "result", "redactedAt"
+    ));
     private BridgeInput() {}
 
     static JSONObject source(TurnSubmission submission) throws Exception {
@@ -55,20 +70,83 @@ final class BridgeInput {
     }
 
     static String wireTurnId(TurnSubmission submission) {
-        return submission.turnId.startsWith("turn_")
-            ? submission.turnId
-            : (submission.kind == com.siyi.al.execution.TurnKind.DIRECT_REPLY
-                ? submission.turnId
-                : "turn_" + submission.turnId);
+        return wireTurnId(submission.turnId, submission.kind);
+    }
+
+    public static String wireTurnId(String localTurnId, TurnKind kind) {
+        return localTurnId.startsWith("turn_")
+            ? localTurnId
+            : (kind == TurnKind.DIRECT_REPLY ? localTurnId : "turn_" + localTurnId);
+    }
+
+    public static String rootSourceId(TurnSubmission submission) throws Exception {
+        if (submission.kind == TurnKind.DIRECT_REPLY) {
+            return userMessage(submission).getString("messageId");
+        }
+        return submission.sourceMessageId.startsWith("trigger_")
+            ? submission.sourceMessageId
+            : "trigger_" + submission.sourceMessageId;
+    }
+
+    public static String laneKey(TurnSubmission submission) throws Exception {
+        switch (submission.kind) {
+            case DIRECT_REPLY:
+            case PROACTIVE_CHAT:
+            case ROLE_PLAN_CHAT:
+            case ROLE_PLAN_CHAT_PRIVATE:
+                return "private_chat";
+            case PROACTIVE_MOMENT:
+            case ROLE_PLAN_MOMENT:
+            case ROLE_PLAN_MOMENT_PRIVATE:
+                return "public_moment";
+            case MOMENT_INTERACTION:
+            case MOMENT_REPLY:
+                String momentId = authoritativeMomentId(submission);
+                if (momentId == null) {
+                    throw new IllegalArgumentException("moment interaction requires an authoritative moment id");
+                }
+                return "moment_interaction:" + momentId;
+            default:
+                throw new IllegalArgumentException("no interaction lane for " + submission.kind);
+        }
+    }
+
+    public static String authoritativeMomentId(TurnSubmission submission) throws Exception {
+        JSONObject input = source(submission);
+        JSONObject snapshot = new JSONObject(submission.snapshotJson);
+        String momentId = momentId(input);
+        return momentId == null ? momentId(snapshot) : momentId;
+    }
+
+    private static String momentId(JSONObject value) {
+        String direct = value.optString("momentId", "").trim();
+        if (!direct.isEmpty()) return direct;
+        JSONObject target = value.optJSONObject("targetMoment");
+        if (target != null && !target.optString("momentId", "").trim().isEmpty()) {
+            return target.optString("momentId").trim();
+        }
+        JSONObject moment = value.optJSONObject("moment");
+        if (moment != null && !moment.optString("momentId", "").trim().isEmpty()) {
+            return moment.optString("momentId").trim();
+        }
+        JSONObject context = value.optJSONObject("context");
+        return context == null ? null : momentId(context);
     }
 
     static JSONObject envelope(TurnSubmission submission, BridgeConfig config) throws Exception {
+        if (submission.bridgeAuthorityCheckpointJson != null) {
+            return preparedV3Envelope(submission, config);
+        }
+        return legacyV2Envelope(submission, config.deviceId);
+    }
+
+    private static JSONObject legacyV2Envelope(TurnSubmission submission, String deviceId) throws Exception {
         String wireTurnId = wireTurnId(submission);
         JSONObject envelope = new JSONObject()
             .put("protocolVersion", 2)
             .put("turnId", wireTurnId)
             .put("characterId", submission.characterId)
-            .put("deviceId", config.deviceId)
+            .put("deviceId", deviceId)
             .put("deviceSeq", deviceSeq(submission))
             .put("createdAt", Math.max(1L, submission.createdAt))
             .put("kind", submission.kind.name());
@@ -154,5 +232,145 @@ final class BridgeInput {
             .put("executedAt", Math.max(1L, submission.createdAt))
             .put("context", context));
         return envelope;
+    }
+
+    public static JSONObject prepareV3Envelope(
+        TurnSubmission submission,
+        String deviceId,
+        String authoritativeTurnId,
+        String laneKey,
+        String rootSourceId,
+        String lineageKey,
+        long claimedLineageRevision,
+        String retryOfTurnId,
+        JSONObject visibilityCursor
+    ) throws Exception {
+        JSONObject envelope = legacyV2Envelope(submission, deviceId);
+        envelope.put("protocolVersion", 3);
+        envelope.put("turnId", authoritativeTurnId);
+        envelope.put("deviceSeq", visibilityCursor.getLong("localSequence"));
+        envelope.put("authority", new JSONObject()
+            .put("algorithm", "al-authority-v1")
+            .put("roleId", submission.characterId)
+            .put("laneKey", laneKey)
+            .put("rootSourceId", rootSourceId)
+            .put("lineageKey", lineageKey)
+            .put("claimedLineageRevision", claimedLineageRevision)
+            .put("retryOfTurnId", retryOfTurnId == null ? JSONObject.NULL : retryOfTurnId));
+        if (submission.kind == TurnKind.DIRECT_REPLY) {
+            JSONObject context = envelope.getJSONObject("context");
+            JSONObject batch = context.getJSONObject("currentBatch");
+            JSONArray messages = batch.optJSONArray("messages");
+            if (messages == null || messages.length() == 0) {
+                messages = new JSONArray().put(new JSONObject(envelope.getJSONObject("message").toString()));
+                batch.put("messages", messages);
+            }
+            JSONArray ids = batch.getJSONArray("messageIds");
+            if (ids.length() != messages.length()) {
+                throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: current batch cardinality");
+            }
+            for (int index = 0; index < messages.length(); index += 1) {
+                JSONObject message = currentBatchMessage(messages.getJSONObject(index), submission.characterId);
+                messages.put(index, message);
+                if (!message.getString("messageId").equals(ids.getString(index))) {
+                    throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: current batch identity");
+                }
+            }
+            envelope.put("message", new JSONObject(messages.getJSONObject(messages.length() - 1).toString()));
+            context.remove("retry");
+            if (retryOfTurnId != null) {
+                context.put("retry", new JSONObject()
+                    .put("retryOfTurnId", retryOfTurnId)
+                    .put("canonicalMessageId", rootSourceId));
+            }
+            context.put("visibilityCursor", new JSONObject(visibilityCursor.toString()));
+        } else {
+            JSONObject triggerContext = envelope.getJSONObject("trigger").optJSONObject("context");
+            if (triggerContext != null) {
+                JSONObject embeddedSnapshot = triggerContext.optJSONObject("snapshot");
+                if (embeddedSnapshot != null) embeddedSnapshot.remove("_alBridgeProtocol");
+            }
+            if (submission.kind == TurnKind.MOMENT_INTERACTION
+                || submission.kind == TurnKind.MOMENT_REPLY) {
+                String momentId = authoritativeMomentId(submission);
+                if (momentId == null) {
+                    throw new IllegalArgumentException("moment interaction requires an authoritative moment id");
+                }
+                if (triggerContext == null) {
+                    triggerContext = new JSONObject();
+                    envelope.getJSONObject("trigger").put("context", triggerContext);
+                }
+                triggerContext.put("momentId", momentId);
+            }
+            envelope.put("context", new JSONObject()
+                .put("visibilityCursor", new JSONObject(visibilityCursor.toString())));
+        }
+        return envelope;
+    }
+
+    private static JSONObject preparedV3Envelope(TurnSubmission submission, BridgeConfig config) throws Exception {
+        JSONObject checkpoint = new JSONObject(submission.bridgeAuthorityCheckpointJson);
+        Set<String> keys = new HashSet<>();
+        Iterator<String> iterator = checkpoint.keys();
+        while (iterator.hasNext()) keys.add(iterator.next());
+        if (!CHECKPOINT_KEYS.equals(keys)
+            || exactSafeInteger(checkpoint, "version", false) != 1L
+            || exactSafeInteger(checkpoint, "attemptSequence", true) <= 0L
+            || exactSafeInteger(checkpoint, "claimedLineageRevision", true) <= 0L
+            || exactSafeInteger(checkpoint, "inputVisibilitySequence", true) <= 0L
+            || exactSafeInteger(checkpoint, "inputClearEpoch", false) < 0L
+            || !submission.turnId.equals(checkpoint.getString("localTurnId"))
+            || !submission.authoritativeTurnId.equals(checkpoint.getString("authoritativeTurnId"))) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: checkpoint identity");
+        }
+        JSONObject outcome = checkpoint.getJSONObject("outcome");
+        if (!OUTCOME_KEYS.equals(keysOf(outcome))
+            || !(outcome.opt("type") instanceof String)
+            || !"open".equals(outcome.getString("type"))
+            || outcome.opt("route") != JSONObject.NULL
+            || outcome.opt("relayMessageId") != JSONObject.NULL
+            || outcome.opt("failure") != JSONObject.NULL
+            || outcome.opt("result") != JSONObject.NULL
+            || outcome.opt("redactedAt") != JSONObject.NULL) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: checkpoint outcome");
+        }
+        JSONObject envelope = checkpoint.getJSONObject("normalizedEnvelope");
+        JSONObject authority = envelope.getJSONObject("authority");
+        JSONObject cursor = envelope.getJSONObject("context").getJSONObject("visibilityCursor");
+        if (exactSafeInteger(envelope, "protocolVersion", false) != 3L
+            || exactSafeInteger(envelope, "deviceSeq", true)
+                != exactSafeInteger(checkpoint, "inputVisibilitySequence", true)
+            || exactSafeInteger(envelope, "createdAt", true) <= 0L
+            || exactSafeInteger(authority, "claimedLineageRevision", true)
+                != exactSafeInteger(checkpoint, "claimedLineageRevision", true)
+            || exactSafeInteger(cursor, "localSequence", true)
+                != exactSafeInteger(checkpoint, "inputVisibilitySequence", true)
+            || exactSafeInteger(cursor, "clearEpoch", false)
+                != exactSafeInteger(checkpoint, "inputClearEpoch", false)
+            || !submission.authoritativeTurnId.equals(envelope.getString("turnId"))
+            || !config.deviceId.equals(envelope.getString("deviceId"))
+            || !checkpoint.getString("envelopeChecksum").equals(BridgeAuthority.sha256CanonicalJson(envelope))) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: pinned envelope");
+        }
+        return new JSONObject(envelope.toString());
+    }
+
+    private static long exactSafeInteger(JSONObject value, String key, boolean positive) {
+        Object raw = value.opt(key);
+        if (!(raw instanceof Number) || raw instanceof Float || raw instanceof Double) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: integer field");
+        }
+        long number = ((Number) raw).longValue();
+        if ((positive ? number <= 0L : number < 0L) || number > 9007199254740991L) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: integer range");
+        }
+        return number;
+    }
+
+    private static Set<String> keysOf(JSONObject value) {
+        Set<String> keys = new HashSet<>();
+        Iterator<String> iterator = value.keys();
+        while (iterator.hasNext()) keys.add(iterator.next());
+        return keys;
     }
 }

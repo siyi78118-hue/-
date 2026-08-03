@@ -150,6 +150,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
         @Override public void migrate(SupportSQLiteDatabase database) {
             database.execSQL("ALTER TABLE `execution_attempts` ADD COLUMN `bridgeAuthorityCheckpointJson` TEXT");
             database.execSQL("ALTER TABLE `execution_attempts` ADD COLUMN `bridgeAuthorityCheckpointChecksum` TEXT");
+            database.execSQL("ALTER TABLE `chat_turns` ADD COLUMN `bridgeProtocolVersion` INTEGER");
         }
     };
 

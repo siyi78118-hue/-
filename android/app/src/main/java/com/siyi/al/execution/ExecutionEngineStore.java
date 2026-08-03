@@ -10,6 +10,7 @@ public interface ExecutionEngineStore {
     List<ExecutionAttemptEntity> recoverableAttempts();
     ChatTurnEntity turn(String turnId);
     ExecutionAttemptEntity activeAttempt(String turnId);
+    TurnSubmission prepareBridgeSubmission(TurnSubmission base, String bridgeDeviceId, long now);
     void markStage(String turnId, String attemptId, TurnState state, AttemptStage stage, long now);
     void markBridgeWaiting(String turnId, String attemptId, String route, long now);
     void saveMemoryResult(String turnId, String attemptId, String memory, long now);

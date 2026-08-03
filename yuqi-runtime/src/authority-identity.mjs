@@ -27,3 +27,7 @@ export function deriveVisibleMessageId(groupId, ordinal) {
 export function deriveVisibleActionId(groupId, ordinal) {
   return `act_${authorityHash('al-visible-action-v1', [groupId, String(ordinal)])}`;
 }
+
+export function deriveRemoteRetryTurnId(attemptId) {
+  return `turn_retry_${authorityHash('al-remote-retry-turn-v1', [attemptId])}`;
+}

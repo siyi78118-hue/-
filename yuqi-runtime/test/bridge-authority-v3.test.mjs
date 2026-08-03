@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import {
   deriveAuthorityLineageKey,
+  deriveRemoteRetryTurnId,
   deriveVisibleActionId,
   deriveVisibleGroupId,
   deriveVisibleMessageId
@@ -38,6 +39,7 @@ test('shared authority identity matches every frozen Task 10 vector', () => {
     assert.equal(deriveVisibleGroupId(lineageKey), vector.groupId, vector.name);
     assert.equal(deriveVisibleMessageId(vector.groupId, vector.ordinal), vector.messageId, vector.name);
     assert.equal(deriveVisibleActionId(vector.groupId, vector.ordinal), vector.actionId, vector.name);
+    assert.equal(deriveRemoteRetryTurnId(vector.attemptId), vector.remoteRetryTurnId, vector.name);
   }
 });
 

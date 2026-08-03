@@ -34,8 +34,16 @@ public final class BridgeRouter {
     }
 
     public boolean isEnabled() { return config.enabled; }
+    public String deviceId() { return config.deviceId; }
 
     public BridgeResult execute(TurnSubmission submission) throws Exception {
+        if (submission.bridgeAuthorityCheckpointJson != null) {
+            String pinnedDeviceId = new org.json.JSONObject(submission.bridgeAuthorityCheckpointJson)
+                .getJSONObject("normalizedEnvelope").getString("deviceId");
+            if (!config.deviceId.equals(pinnedDeviceId)) {
+                throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT: bridge device changed");
+            }
+        }
         if (submission.kind == TurnKind.DIRECT_REPLY) {
             mirror.persistSubmission(submission);
         }

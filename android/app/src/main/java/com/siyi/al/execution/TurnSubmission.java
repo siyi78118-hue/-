@@ -9,6 +9,8 @@ public final class TurnSubmission {
     public final String snapshotJson;
     public final String cloudJobId;
     public final long createdAt;
+    public final String authoritativeTurnId;
+    public final String bridgeAuthorityCheckpointJson;
 
     public TurnSubmission(
         String turnId,
@@ -20,6 +22,24 @@ public final class TurnSubmission {
         String cloudJobId,
         long createdAt
     ) {
+        this(
+            turnId, characterId, sourceMessageId, kind, inputJson, snapshotJson,
+            cloudJobId, createdAt, turnId, null
+        );
+    }
+
+    public TurnSubmission(
+        String turnId,
+        String characterId,
+        String sourceMessageId,
+        TurnKind kind,
+        String inputJson,
+        String snapshotJson,
+        String cloudJobId,
+        long createdAt,
+        String authoritativeTurnId,
+        String bridgeAuthorityCheckpointJson
+    ) {
         this.turnId = requireText(turnId, "turnId");
         this.characterId = requireText(characterId, "characterId");
         this.sourceMessageId = requireText(sourceMessageId, "sourceMessageId");
@@ -28,6 +48,11 @@ public final class TurnSubmission {
         this.snapshotJson = snapshotJson == null ? "{}" : snapshotJson;
         this.cloudJobId = emptyToNull(cloudJobId);
         this.createdAt = createdAt;
+        this.authoritativeTurnId = requireText(authoritativeTurnId, "authoritativeTurnId");
+        this.bridgeAuthorityCheckpointJson = emptyToNull(bridgeAuthorityCheckpointJson);
+        if (this.bridgeAuthorityCheckpointJson == null && !this.turnId.equals(this.authoritativeTurnId)) {
+            throw new IllegalArgumentException("remote authority requires a bridge checkpoint");
+        }
     }
 
     private static String requireText(String value, String label) {

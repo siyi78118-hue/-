@@ -29,6 +29,10 @@ public class AuthorityIdentityTest {
             assertEquals(vector.getString("groupId"), groupId);
             assertEquals(vector.getString("messageId"), AuthorityIdentity.messageId(groupId, ordinal));
             assertEquals(vector.getString("actionId"), AuthorityIdentity.actionId(groupId, ordinal));
+            assertEquals(
+                vector.getString("remoteRetryTurnId"),
+                AuthorityIdentity.remoteRetryTurnId(vector.getString("attemptId"))
+            );
         }
     }
 

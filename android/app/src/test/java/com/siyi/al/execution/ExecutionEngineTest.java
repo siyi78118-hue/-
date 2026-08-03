@@ -56,12 +56,56 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void bridgeSubmissionIsPreparedImmediatelyBeforeNetworkExecution() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device-from-gateway"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                store.bridgePreparationEvents.add("network");
+                return BridgeResult.skipped("codex", "{}");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("legacy must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L).runNext());
+
+        assertEquals("prepare,network", String.join(",", store.bridgePreparationEvents));
+        assertEquals("device-from-gateway", store.preparedBridgeDeviceId);
+    }
+
+    @Test
+    public void storeOwnedV3MarkerReplacesCallerValueOnlyForFreshYuqiTurns() throws Exception {
+        String supplied = new JSONObject()
+            .put("scene", "chat")
+            .put("_alBridgeProtocol", new JSONObject()
+                .put("version", 99)
+                .put("owner", "caller")
+                .put("extra", "forged"))
+            .toString();
+
+        JSONObject yuqi = new JSONObject(RoomExecutionStore.snapshotForNewTurn(supplied, "yuqi"));
+        JSONObject marker = yuqi.getJSONObject("_alBridgeProtocol");
+        assertEquals(2, marker.length());
+        assertEquals(3, marker.getInt("version"));
+        assertEquals("room-v12", marker.getString("owner"));
+        assertEquals("chat", yuqi.getString("scene"));
+
+        JSONObject ordinary = new JSONObject(RoomExecutionStore.snapshotForNewTurn(supplied, "other"));
+        assertEquals(false, ordinary.has("_alBridgeProtocol"));
+        assertEquals("chat", ordinary.getString("scene"));
+    }
+
+    @Test
     public void bridgedAutomaticSkipCompletesWithoutCreatingReplyParts() throws Exception {
         ChatTurnEntity value = turn("QUEUED", null);
         value.kind = TurnKind.PROACTIVE_CHAT.name();
         FakeStore store = new FakeStore(value, attempt("QUEUED", null));
         TurnBridgeGateway gateway = new TurnBridgeGateway() {
             @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
             @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) { return BridgeResult.skipped("codex", "{}"); }
             @Override public String call(String configId, String system, JSONArray messages, int maxTokens) { throw new AssertionError(); }
         };
@@ -79,6 +123,7 @@ public class ExecutionEngineTest {
         FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
         TurnBridgeGateway gateway = new TurnBridgeGateway() {
             @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
             @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
                 return BridgeResult.success("codex", "那我就收了", "{}", "received");
             }
@@ -101,6 +146,7 @@ public class ExecutionEngineTest {
         FakeStore store = new FakeStore(value, attempt("QUEUED", null));
         TurnBridgeGateway gateway = new TurnBridgeGateway() {
             @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
             @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
                 return BridgeResult.success(
                     "codex", "", "{}", "", "", "",
@@ -140,6 +186,7 @@ public class ExecutionEngineTest {
         FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
         TurnBridgeGateway gateway = new TurnBridgeGateway() {
             @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
             @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) throws Exception {
                 throw new BridgeAcceptedException("cloud");
             }
@@ -365,6 +412,8 @@ public class ExecutionEngineTest {
 
         @Override public boolean hasBridge() { return true; }
 
+        @Override public String bridgeDeviceId() { return "device1"; }
+
         @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
             bridgeCalls += 1;
             submissionCreatedAt = submission.createdAt;
@@ -387,6 +436,8 @@ public class ExecutionEngineTest {
         final ExecutionAttemptEntity attempt;
         final List<String> events = new ArrayList<>();
         final List<ReplyPartEntity> replyParts = new ArrayList<>();
+        final List<String> bridgePreparationEvents = new ArrayList<>();
+        String preparedBridgeDeviceId;
 
         FakeStore(ChatTurnEntity turn, ExecutionAttemptEntity attempt) {
             this.turn = turn;
@@ -406,6 +457,12 @@ public class ExecutionEngineTest {
 
         @Override public ChatTurnEntity turn(String turnId) { return turn; }
         @Override public ExecutionAttemptEntity activeAttempt(String turnId) { return attempt; }
+
+        @Override public TurnSubmission prepareBridgeSubmission(TurnSubmission submission, String bridgeDeviceId, long now) {
+            bridgePreparationEvents.add("prepare");
+            preparedBridgeDeviceId = bridgeDeviceId;
+            return submission;
+        }
 
         @Override public void markStage(String turnId, String attemptId, TurnState state, AttemptStage stage, long now) {
             turn.state = state.name();

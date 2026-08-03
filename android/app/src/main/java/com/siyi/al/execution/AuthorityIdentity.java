@@ -29,6 +29,10 @@ public final class AuthorityIdentity {
         return "act_" + authorityHash("al-visible-action-v1", groupId, decimalOrdinal(ordinal));
     }
 
+    public static String remoteRetryTurnId(String attemptId) {
+        return "turn_retry_" + authorityHash("al-remote-retry-turn-v1", attemptId);
+    }
+
     private static String decimalOrdinal(long ordinal) {
         if (ordinal < 0 || ordinal > MAX_SAFE_ORDINAL) {
             throw new IllegalArgumentException("authority ordinal is outside the safe protocol range");

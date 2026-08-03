@@ -15,6 +15,7 @@ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import com.siyi.al.execution.db.AlExecutionDatabase;
+import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
 import org.junit.After;
 import org.junit.Before;
@@ -89,6 +90,8 @@ public class ConversationCursorStoreTest {
 
     @Test
     public void migration11To12PreservesPopulatedHistoryAndLeavesAuthorityCheckpointNull() {
+        ChatTurnEntity entityContract = new ChatTurnEntity();
+        assertNull(entityContract.bridgeProtocolVersion);
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         String databaseName = "cursor-v11-" + System.nanoTime();
         SupportSQLiteOpenHelper helper = createV11Helper(context, databaseName);
@@ -99,8 +102,10 @@ public class ConversationCursorStoreTest {
 
         assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
         assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertTrue(hasColumn(db, "chat_turns", "bridgeProtocolVersion"));
         assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
         assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertFalse(columnIsNotNull(db, "chat_turns", "bridgeProtocolVersion"));
         android.database.Cursor attempt = db.query(
             "SELECT turnId, sequence, stage, state, startedAt, heartbeatAt, finishedAt, "
                 + "memoryResult, rawReply, errorCode, errorDetail, retryable, crashCount, "
@@ -133,7 +138,8 @@ public class ConversationCursorStoreTest {
                 + "uiAppliedAt, cloudConfirmedAt, cancelledAt, deletedAt, visibleGroupId, "
                 + "authorityLineageKey, authorityOrigin, commitPayloadVersion, lineageRevision, "
                 + "turnRevision, laneKey, laneRevision, generationFingerprint, pipelineReleaseId, "
-                + "inputVisibilitySequence, inputClearEpoch, bridgeCommitChecksum, terminalDisposition "
+                + "inputVisibilitySequence, inputClearEpoch, bridgeCommitChecksum, terminalDisposition, "
+                + "bridgeProtocolVersion "
                 + "FROM chat_turns WHERE turnId = 'turn-11'"
         );
         try {
@@ -164,6 +170,7 @@ public class ConversationCursorStoreTest {
             assertEquals(3L, turn.getLong(28));
             assertEquals("checksum-11", turn.getString(29));
             assertEquals("visible", turn.getString(30));
+            assertTrue(turn.isNull(31));
         } finally {
             turn.close();
         }
@@ -194,6 +201,10 @@ public class ConversationCursorStoreTest {
         }
         assertEquals("{\"_alBridgeProtocol\":{\"version\":99,\"owner\":\"caller\",\"extra\":true},\"note\":\"原样\"}",
             stringValue(db, "SELECT snapshotJson FROM chat_turns WHERE turnId = 'turn-11-malformed'"));
+        assertEquals("{\"_alBridgeProtocol\":{\"version\":3,\"owner\":\"room-v12\"},\"note\":\"历史碰巧同值\"}",
+            stringValue(db, "SELECT snapshotJson FROM chat_turns WHERE turnId = 'turn-11-exact-marker'"));
+        assertNull(stringValue(db,
+            "SELECT bridgeProtocolVersion FROM chat_turns WHERE turnId = 'turn-11-exact-marker'"));
         helper.close();
         context.deleteDatabase(databaseName);
     }
@@ -212,6 +223,7 @@ public class ConversationCursorStoreTest {
         SupportSQLiteDatabase db12 = helper12.getWritableDatabase();
         assertTrue(hasColumn(db12, "execution_attempts", "bridgeAuthorityCheckpointJson"));
         assertTrue(hasColumn(db12, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertTrue(hasColumn(db12, "chat_turns", "bridgeProtocolVersion"));
         assertEquals("{\"legacy\":true}", stringValue(db12,
             "SELECT snapshotJson FROM chat_turns WHERE turnId = 'turn-10'"));
         assertNull(stringValue(db12,
@@ -223,6 +235,7 @@ public class ConversationCursorStoreTest {
         assertEquals(1L, count(reopenedDb, "chat_turns"));
         assertEquals(1L, count(reopenedDb, "execution_attempts"));
         assertTrue(hasColumn(reopenedDb, "execution_attempts", "bridgeAuthorityCheckpointJson"));
+        assertTrue(hasColumn(reopenedDb, "chat_turns", "bridgeProtocolVersion"));
         reopened.close();
         context.deleteDatabase(databaseName);
     }
@@ -237,8 +250,10 @@ public class ConversationCursorStoreTest {
         SupportSQLiteDatabase db = fresh.getOpenHelper().getWritableDatabase();
         assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
         assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertTrue(hasColumn(db, "chat_turns", "bridgeProtocolVersion"));
         assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
         assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
+        assertFalse(columnIsNotNull(db, "chat_turns", "bridgeProtocolVersion"));
         fresh.close();
         context.deleteDatabase(databaseName);
     }
@@ -399,6 +414,7 @@ public class ConversationCursorStoreTest {
     private static void insertPopulatedV11History(SupportSQLiteDatabase db) {
         db.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, cloudJobId, kind, state, activeAttemptId, inputJson, snapshotJson, createdAt, updatedAt, completedAt, notificationShownAt, uiAppliedAt, cloudConfirmedAt, cancelledAt, deletedAt, visibleGroupId, authorityLineageKey, authorityOrigin, commitPayloadVersion, lineageRevision, turnRevision, laneKey, laneRevision, generationFingerprint, pipelineReleaseId, inputVisibilitySequence, inputClearEpoch, bridgeCommitChecksum, terminalDisposition) VALUES ('turn-11', 'yuqi', 'message-11', 'cloud-11', 'DIRECT_REPLY', 'FAILED_FINAL', 'attempt-11', '{\"message\":\"历史\"}', '{\"scene\":\"旧快照\"}', 1, 2, 3, 4, 5, 6, 7, NULL, 'group-11', 'lineage-11', 'pc', 'canonical-v2', 2, 4, 'lane-11', 8, 'fingerprint-11', 'release-11', 9, 3, 'checksum-11', 'visible')");
         db.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('turn-11-malformed', 'yuqi', 'message-11-malformed', 'DIRECT_REPLY', 'QUEUED', '{\"message\":\"保留\"}', '{\"_alBridgeProtocol\":{\"version\":99,\"owner\":\"caller\",\"extra\":true},\"note\":\"原样\"}', 11, 11)");
+        db.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('turn-11-exact-marker', 'yuqi', 'message-11-exact-marker', 'DIRECT_REPLY', 'QUEUED', '{\"message\":\"保留\"}', '{\"_alBridgeProtocol\":{\"version\":3,\"owner\":\"room-v12\"},\"note\":\"历史碰巧同值\"}', 12, 12)");
         db.execSQL("INSERT INTO execution_attempts (attemptId, turnId, sequence, stage, state, startedAt, heartbeatAt, finishedAt, memoryResult, rawReply, errorCode, errorDetail, retryable, crashCount) VALUES ('attempt-11', 'turn-11', 7, 'FINISHED', 'FAILED_FINAL', 101, 102, 103, '{\"legacyMemory\":\"保留\"}', 'raw-bytes-\uD83C\uDF27\uFE0F', 'OLD_ERROR', '旧失败', 0, 4)");
         db.execSQL("INSERT INTO conversation_authorities (authorityLineageKey, characterId, laneKey, rootSourceId, latestTurnId, revision, state, visibleGroupId, commitChecksum, commitPayloadVersion, authorityOrigin, terminalDisposition, updatedAt) VALUES ('lineage-11', 'yuqi', 'lane-11', 'message-11', 'remote-turn-11', 2, 'COMMITTED', 'group-11', 'checksum-11', 'canonical-v2', 'pc', 'visible', 104)");
     }

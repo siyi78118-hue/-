@@ -46,4 +46,5 @@ public class ChatTurnEntity {
     @Nullable public Long inputClearEpoch;
     @Nullable public String bridgeCommitChecksum;
     @Nullable public String terminalDisposition;
+    @Nullable public Integer bridgeProtocolVersion;
 }

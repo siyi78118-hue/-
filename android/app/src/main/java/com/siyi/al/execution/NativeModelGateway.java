@@ -40,6 +40,15 @@ public final class NativeModelGateway implements TurnBridgeGateway {
     }
 
     @Override
+    public String bridgeDeviceId() {
+        BridgeRouter current = currentBridgeRouter();
+        if (current == null || !current.isEnabled()) {
+            throw new IllegalStateException("Bridge router is not configured");
+        }
+        return current.deviceId();
+    }
+
+    @Override
     public BridgeResult executeBridgeTurn(TurnSubmission submission) throws Exception {
         BridgeRouter current = currentBridgeRouter();
         if (current == null) throw new IllegalStateException("Bridge router is not configured");

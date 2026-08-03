@@ -3,6 +3,7 @@ package com.siyi.al.execution.bridge;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertThrows;
 
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -10,8 +11,34 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import org.junit.Test;
+import org.json.JSONObject;
 
 public class BridgeRouterTest {
+    @Test public void changedRouteDeviceRejectsPinnedV3BeforeMirrorOrNetwork() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeConfig changed = new BridgeConfig(
+            true, BridgeMode.AUTO, "http://192.168.1.8:17891", "https://relay.example",
+            "device_changed", "pairing-secret-123", "device-token-123456",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 500, 2000, 2, 1
+        );
+        JSONObject checkpoint = new JSONObject().put("normalizedEnvelope", new JSONObject()
+            .put("deviceId", "device_pinned"));
+        TurnSubmission prepared = new TurnSubmission(
+            "turn_local", "yuqi", "msg_1", TurnKind.DIRECT_REPLY, "{}", "{}", null, 1L,
+            "turn_remote", checkpoint.toString()
+        );
+        BridgeRouter router = new BridgeRouter(
+            changed, succeeding("lan", events), succeeding("cloud", events), fallback("fallback", events),
+            new BridgeRouter.MessageMirror() {
+                @Override public void persistSubmission(TurnSubmission value) { events.add("mirror-user"); }
+                @Override public void persistReply(TurnSubmission value, BridgeResult result) { events.add("mirror-reply"); }
+            }
+        );
+
+        assertThrows(IllegalStateException.class, () -> router.execute(prepared));
+        assertTrue(events.isEmpty());
+    }
+
     @Test public void autoPrefersLanAndFallsBackToCloud() throws Exception {
         List<String> events = new ArrayList<>();
         BridgeRouter router = router(BridgeMode.AUTO, events, failing("lan", events), succeeding("cloud", events), fallback("fallback", events));

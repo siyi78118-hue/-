@@ -150,6 +150,41 @@ public interface AlExecutionDao {
         long updatedAt
     );
 
+    @Query("UPDATE chat_turns SET authorityLineageKey = :authorityLineageKey, lineageRevision = :claimedLineageRevision, laneKey = :laneKey, inputVisibilitySequence = :inputVisibilitySequence, inputClearEpoch = :inputClearEpoch, updatedAt = :updatedAt WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 AND ((authorityLineageKey IS NULL AND lineageRevision IS NULL AND laneKey IS NULL AND inputVisibilitySequence IS NULL AND inputClearEpoch IS NULL) OR (authorityLineageKey = :authorityLineageKey AND lineageRevision = :claimedLineageRevision AND laneKey = :laneKey AND inputVisibilitySequence = :inputVisibilitySequence AND inputClearEpoch = :inputClearEpoch))")
+    int pinPreparedBridgeTurn(
+        String turnId,
+        String attemptId,
+        String authorityLineageKey,
+        long claimedLineageRevision,
+        String laneKey,
+        long inputVisibilitySequence,
+        long inputClearEpoch,
+        long updatedAt
+    );
+
+    @Query("UPDATE chat_turns SET lineageRevision = :nextClaimedLineageRevision, inputVisibilitySequence = :nextInputVisibilitySequence, inputClearEpoch = :nextInputClearEpoch, updatedAt = :updatedAt WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 AND authorityLineageKey = :authorityLineageKey AND laneKey = :laneKey AND lineageRevision = :expectedClaimedLineageRevision AND inputVisibilitySequence = :expectedInputVisibilitySequence AND inputClearEpoch = :expectedInputClearEpoch")
+    int advancePreparedBridgeTurn(
+        String turnId,
+        String attemptId,
+        String authorityLineageKey,
+        String laneKey,
+        long expectedClaimedLineageRevision,
+        long expectedInputVisibilitySequence,
+        long expectedInputClearEpoch,
+        long nextClaimedLineageRevision,
+        long nextInputVisibilitySequence,
+        long nextInputClearEpoch,
+        long updatedAt
+    );
+
+    @Query("UPDATE execution_attempts SET bridgeAuthorityCheckpointJson = :checkpointJson, bridgeAuthorityCheckpointChecksum = :checkpointChecksum WHERE attemptId = :attemptId AND turnId = :turnId AND bridgeAuthorityCheckpointJson IS NULL AND bridgeAuthorityCheckpointChecksum IS NULL")
+    int writeBridgeAuthorityCheckpoint(
+        String attemptId,
+        String turnId,
+        String checkpointJson,
+        String checkpointChecksum
+    );
+
     @Query("DELETE FROM reply_parts WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)")
     int clearReplyPartsThroughSequence(String characterId, long clearedThroughSequence);
 

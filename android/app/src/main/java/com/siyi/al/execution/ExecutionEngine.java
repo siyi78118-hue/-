@@ -161,7 +161,9 @@ public final class ExecutionEngine {
             turn.cloudJobId,
             deadlineAnchor
         );
-        BridgeResult result = gateway.executeBridgeTurn(submission);
+        String bridgeDeviceId = gateway.bridgeDeviceId();
+        TurnSubmission prepared = store.prepareBridgeSubmission(submission, bridgeDeviceId, clock.now());
+        BridgeResult result = gateway.executeBridgeTurn(prepared);
         JSONObject checkpoint = new JSONObject()
             .put("origin", result.origin)
             .put("fallback", result.fallback)
