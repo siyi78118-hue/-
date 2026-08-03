@@ -1,5 +1,8 @@
 package com.siyi.al.execution;
 
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Arrays;
@@ -68,7 +71,7 @@ public final class BridgeAuthority {
         requireNullableNonEmptyString(value, "retryOfTurnId");
         requireSafeNonNegativeInteger(value, "inputVisibilitySequence");
         requireSafeNonNegativeInteger(value, "inputClearEpoch");
-        requireNonEmptyString(value, "generationFingerprint");
+        requireNullableNonEmptyString(value, "generationFingerprint");
         requireNonEmptyString(value, "releaseId");
         requireExactString(value, "state", "failed");
 
@@ -142,8 +145,48 @@ public final class BridgeAuthority {
             return output.append(']').toString();
         }
         if (value instanceof String) return jsonQuote((String) value);
-        if (value instanceof Boolean || value instanceof Number) return String.valueOf(value);
+        if (value instanceof Boolean) return String.valueOf(value);
+        if (value instanceof Number) return canonicalNumber((Number) value);
         throw new IllegalArgumentException("canonical JSON value type is invalid");
+    }
+
+    private static String canonicalNumber(Number value) {
+        double number = value.doubleValue();
+        if (!Double.isFinite(number)) {
+            throw new IllegalArgumentException("canonical JSON number must be finite");
+        }
+        if (number == 0.0d) return "0";
+
+        BigDecimal exact = new BigDecimal(number);
+        BigDecimal shortest = null;
+        long expectedBits = Double.doubleToRawLongBits(number);
+        for (int precision = 1; precision <= 17; precision += 1) {
+            BigDecimal candidate = exact.round(new MathContext(precision, RoundingMode.HALF_EVEN)).stripTrailingZeros();
+            if (Double.doubleToRawLongBits(Double.parseDouble(candidate.toString())) == expectedBits) {
+                shortest = candidate;
+                break;
+            }
+        }
+        if (shortest == null) {
+            throw new IllegalArgumentException("canonical JSON number cannot be represented");
+        }
+
+        BigDecimal absolute = shortest.abs();
+        if (absolute.compareTo(new BigDecimal("0.000001")) >= 0
+                && absolute.compareTo(new BigDecimal("1e21")) < 0) {
+            return shortest.toPlainString();
+        }
+
+        String digits = absolute.unscaledValue().toString();
+        int exponent = digits.length() - absolute.scale() - 1;
+        String mantissa = digits.length() == 1
+            ? digits
+            : digits.substring(0, 1) + "." + digits.substring(1);
+        return (shortest.signum() < 0 ? "-" : "")
+            + mantissa
+            + "e"
+            + (exponent >= 0 ? "+" : "")
+            + exponent;
     }
 
     private static void requireExactKeys(JSONObject value, Set<String> expected, String label) {

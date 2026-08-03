@@ -6,6 +6,8 @@ import static org.junit.Assert.assertThrows;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import com.siyi.al.execution.BridgeAuthority;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -31,20 +33,57 @@ public class CanonicalFailureStatusTest {
     @Test
     public void failureValidatorRejectsUnknownMissingCoercedAndChangedFields() throws Exception {
         JSONObject wire = readFixture("canonical-failure-status-v1.json")
-            .getJSONArray("vectors").getJSONObject(0).getJSONObject("wire");
+            .getJSONArray("vectors").getJSONObject(2).getJSONObject("wire");
 
         JSONObject unknown = new JSONObject(wire.toString()).put("secret", "must-not-pass");
         assertInvalid(unknown);
 
-        JSONObject missing = new JSONObject(wire.toString());
-        missing.remove("retryAllowed");
-        assertInvalid(missing);
-
         JSONObject coerced = new JSONObject(wire.toString()).put("retryAllowed", "true");
         assertInvalid(coerced);
 
-        JSONObject changed = new JSONObject(wire.toString()).put("laneRevision", wire.getLong("laneRevision") + 1L);
-        assertInvalid(changed);
+        for (Object invalidFingerprint : new Object[] { "", 1L, true, new JSONObject() }) {
+            assertInvalid(new JSONObject(wire.toString()).put("generationFingerprint", invalidFingerprint));
+        }
+
+        String[] closedFields = new String[] {
+            "protocolVersion", "type", "turnId", "roleId", "authorityLineageKey", "lineageRevision",
+            "turnRevision", "laneKey", "laneRevision", "retryOfTurnId", "inputVisibilitySequence",
+            "inputClearEpoch", "generationFingerprint", "releaseId", "state", "errorCode",
+            "failureClass", "retryAllowed", "failedAt", "rawStatusChecksum"
+        };
+        for (String requiredField : closedFields) {
+            JSONObject missingField = new JSONObject(wire.toString());
+            missingField.remove(requiredField);
+            assertInvalid(missingField);
+        }
+
+        Map<String, Object> changedBasisFields = new LinkedHashMap<>();
+        changedBasisFields.put("protocolVersion", 4L);
+        changedBasisFields.put("type", "BACKLOG_FAILED_CHANGED");
+        changedBasisFields.put("turnId", wire.getString("turnId") + "_changed");
+        changedBasisFields.put("roleId", wire.getString("roleId") + "_changed");
+        changedBasisFields.put("authorityLineageKey", wire.getString("authorityLineageKey") + "_changed");
+        changedBasisFields.put("lineageRevision", wire.getLong("lineageRevision") + 1L);
+        changedBasisFields.put("turnRevision", wire.getLong("turnRevision") + 1L);
+        changedBasisFields.put("laneKey", wire.getString("laneKey") + "_changed");
+        changedBasisFields.put("laneRevision", wire.getLong("laneRevision") + 1L);
+        changedBasisFields.put("retryOfTurnId", wire.getString("retryOfTurnId") + "_changed");
+        changedBasisFields.put("inputVisibilitySequence", wire.getLong("inputVisibilitySequence") + 1L);
+        changedBasisFields.put("inputClearEpoch", wire.getLong("inputClearEpoch") + 1L);
+        changedBasisFields.put("generationFingerprint", wire.getString("generationFingerprint") + "_changed");
+        changedBasisFields.put("releaseId", wire.getString("releaseId") + "_changed");
+        changedBasisFields.put("state", "queued");
+        changedBasisFields.put("errorCode", "YUQI_DETERMINISTIC_EXECUTION_FAILURE");
+        changedBasisFields.put("failureClass", "deterministic");
+        changedBasisFields.put("retryAllowed", !wire.getBoolean("retryAllowed"));
+        changedBasisFields.put("failedAt", wire.getLong("failedAt") + 1L);
+        for (Map.Entry<String, Object> changedField : changedBasisFields.entrySet()) {
+            assertInvalid(new JSONObject(wire.toString()).put(changedField.getKey(), changedField.getValue()));
+        }
+
+        assertInvalid(new JSONObject(wire.toString()).put("rawStatusChecksum", "invalid"));
+        assertInvalid(new JSONObject(wire.toString()).put(
+            "rawStatusChecksum", "0000000000000000000000000000000000000000000000000000000000000000"));
     }
 
     @Test
@@ -71,6 +110,31 @@ public class CanonicalFailureStatusTest {
             "27a60309369c09579fa307178dbd9f2bf7eaed8f60672276b9edfe336d4efd71",
             BridgeAuthority.sha256CanonicalJson(value)
         );
+    }
+
+    @Test
+    public void canonicalJsonMatchesEcmaScriptNumberFormattingAndRejectsNonFiniteNumbers() throws Exception {
+        JSONObject value = new JSONObject()
+            .put("one", 1.0d)
+            .put("quarter", 1.25d)
+            .put("negativeZero", -0.0d)
+            .put("small", 1e-7d)
+            .put("huge", 1e21d)
+            .put("nested", new JSONArray().put(new JSONObject()
+                .put("integerLike", 10000000.0d)
+                .put("threshold", 0.000001d)));
+
+        assertEquals(
+            "{\"huge\":1e+21,\"negativeZero\":0,\"nested\":[{\"integerLike\":10000000,\"threshold\":0.000001}],\"one\":1,\"quarter\":1.25,\"small\":1e-7}",
+            BridgeAuthority.canonicalJson(value)
+        );
+        assertEquals(
+            "3849e83a6745e20bc91a86af3f007eaa60b6e0528f3000d4d80e2aff34338404",
+            BridgeAuthority.sha256CanonicalJson(value)
+        );
+        assertThrows(IllegalArgumentException.class, () -> BridgeAuthority.canonicalJson(Double.NaN));
+        assertThrows(IllegalArgumentException.class, () -> BridgeAuthority.canonicalJson(Double.POSITIVE_INFINITY));
+        assertThrows(IllegalArgumentException.class, () -> BridgeAuthority.canonicalJson(Double.NEGATIVE_INFINITY));
     }
 
     private static void assertInvalid(JSONObject candidate) {
