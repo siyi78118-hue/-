@@ -3,13 +3,17 @@ package com.siyi.al.execution.bridge;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.assertThrows;
 
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
+import com.siyi.al.execution.AuthorityIdentity;
+import com.siyi.al.execution.BridgeAuthority;
 import java.lang.reflect.Method;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
 
@@ -167,6 +171,68 @@ public class BridgeClientTest {
         assertEquals("turn_phone_old", new JSONObject(persisted.get(0)).getString("turnId"));
     }
 
+    @Test public void canonicalCloudRelayIsAcknowledgedOnlyAfterRoomApplyAndNeverPublishesEarlyReceipt()
+        throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeClient.Transport transport = (method, target, body, headers) -> {
+            events.add(target.endsWith("/bridge/ack") ? "ack" : "unexpected:" + target);
+            return new BridgeClient.HttpResult(200, "{}");
+        };
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport, () -> 500L, millis -> {}, null,
+            raw -> {
+                events.add("room");
+                return true;
+            }
+        );
+        JSONObject item = new JSONObject().put("messageId", "relay_v3_skip");
+
+        assertTrue(client.processDecodedCloudInboxItem(item, canonicalSkipWire()));
+        assertEquals(java.util.Arrays.asList("room", "ack"), events);
+    }
+
+    @Test public void canonicalCloudProofFailureLeavesRelayUnacknowledged() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null,
+            (method, target, body, headers) -> {
+                events.add("ack");
+                return new BridgeClient.HttpResult(200, "{}");
+            },
+            () -> 500L,
+            millis -> {},
+            null,
+            raw -> { throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT"); }
+        );
+
+        assertThrows(IllegalStateException.class, () -> client.processDecodedCloudInboxItem(
+            new JSONObject().put("messageId", "relay_v3_invalid"), canonicalSkipWire()));
+        assertTrue(events.isEmpty());
+    }
+
+    @Test public void malformedCanonicalProtocolVersionCannotFallBackToLegacyAck() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null,
+            (method, target, body, headers) -> {
+                events.add("ack");
+                return new BridgeClient.HttpResult(200, "{}");
+            },
+            () -> 500L,
+            millis -> {},
+            null,
+            raw -> {
+                events.add("legacy-consumer");
+                return true;
+            }
+        );
+        JSONObject malformed = canonicalSkipWire().put("protocolVersion", "3");
+
+        assertThrows(IllegalArgumentException.class, () -> client.processDecodedCloudInboxItem(
+            new JSONObject().put("messageId", "relay_v3_malformed"), malformed));
+        assertTrue(events.isEmpty());
+    }
+
     @Test public void lanAcceptedTurnPollsWithFreshSignedGetsUntilCommitted() throws Exception {
         FakeTransport transport = new FakeTransport();
         transport.responses.add(new BridgeClient.HttpResult(202,
@@ -195,6 +261,262 @@ public class BridgeClientTest {
         assertEquals(3, statuses.size());
         assertEquals("turn_phone_1:queued", statuses.get(0));
         assertEquals("turn_phone_1:committed", statuses.get(2));
+    }
+
+    @Test public void lanPreparedV3ImmediateTerminalUsesTheClosedAuthorityParser() throws Exception {
+        String lineage = "lineage_lan_v3_immediate";
+        String remoteTurnId = "turn_remote_lan_v3_immediate";
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            canonicalSkipWire(lineage, remoteTurnId)
+                .put("terminal", true).put("recoveryAckSeq", 7L).toString()));
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport,
+            new MutableTime(1784400000000L), millis -> {}, null);
+
+        BridgeResult result = client.sendLan(canonicalV3Submission(
+            "local_lan_v3_immediate", remoteTurnId, lineage, 1L));
+
+        assertEquals(BridgeResult.Kind.CANONICAL_TERMINAL, result.kind);
+        assertEquals(remoteTurnId, result.authoritativeTurnId);
+        assertEquals("skip", result.terminalDisposition);
+        assertEquals(1, transport.targets.size());
+    }
+
+    @Test public void lanPreparedV3PollAcceptsAnEarlierCommittedMember() throws Exception {
+        String lineage = "lineage_lan_v3_retry";
+        String childTurnId = "turn_remote_lan_v3_child";
+        String parentTurnId = "turn_remote_lan_v3_parent";
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(202,
+            "{\"ok\":true,\"turnId\":\"" + childTurnId
+                + "\",\"state\":\"queued\",\"terminal\":false,\"retryAfterMs\":1}"));
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            canonicalSkipWire(lineage, parentTurnId)
+                .put("terminal", true).put("recoveryAckSeq", 8L).toString()));
+        MutableTime time = new MutableTime(1784400000000L);
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport, time, time, null);
+
+        BridgeResult result = client.sendLan(canonicalV3Submission(
+            "local_lan_v3_retry", childTurnId, lineage, 2L));
+
+        assertEquals(BridgeResult.Kind.CANONICAL_TERMINAL, result.kind);
+        assertEquals(parentTurnId, result.authoritativeTurnId);
+        assertEquals(2, transport.targets.size());
+    }
+
+    @Test public void lanPreparedV3ReturnsVerifiedRemoteFailureInsteadOfLegacyFallback() throws Exception {
+        String lineage = "lineage_lan_v3_failure";
+        String remoteTurnId = "turn_remote_lan_v3_failure";
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            canonicalFailureWire(lineage, remoteTurnId, true).toString()));
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport,
+            new MutableTime(1784400000000L), millis -> {}, null);
+
+        BridgeResult result = client.sendLan(canonicalV3Submission(
+            "local_lan_v3_failure", remoteTurnId, lineage, 1L));
+
+        assertEquals(BridgeResult.Kind.VERIFIED_REMOTE_FAILURE, result.kind);
+        assertEquals(remoteTurnId, result.authoritativeTurnId);
+        assertTrue(result.retryAllowed);
+    }
+
+    @Test public void cloudCanonicalMarkersCannotDowngradeWhenProtocolVersionIsMissing() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null,
+            (method, target, body, headers) -> {
+                events.add("ack");
+                return new BridgeClient.HttpResult(200, "{}");
+            },
+            () -> 500L,
+            millis -> {},
+            null,
+            raw -> {
+                events.add("consumer");
+                return true;
+            }
+        );
+        JSONObject downgraded = canonicalSkipWire();
+        downgraded.remove("protocolVersion");
+        downgraded.put("terminal", true).put("reply", new JSONObject()
+            .put("messageId", "msg_downgrade")
+            .put("content", "不应进入旧链路"));
+
+        assertThrows(IllegalArgumentException.class, () -> client.processDecodedCloudInboxItem(
+            new JSONObject().put("messageId", "relay_v3_downgrade"), downgraded));
+        assertTrue(events.isEmpty());
+    }
+
+    @Test public void cloudPayloadCannotPredeclareReservedTransportMetadata() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null,
+            (method, target, body, headers) -> {
+                events.add("ack");
+                return new BridgeClient.HttpResult(200, "{}");
+            },
+            () -> 500L,
+            millis -> {},
+            null,
+            raw -> {
+                events.add("consumer");
+                return true;
+            }
+        );
+
+        for (String reserved : new String[]{"_relayMessageId", "_deliveryRoute"}) {
+            JSONObject payload = canonicalSkipWire().put(reserved, "attacker");
+            assertThrows(IllegalArgumentException.class, () -> client.processDecodedCloudInboxItem(
+                new JSONObject().put("messageId", "relay_v3_reserved_" + reserved), payload));
+        }
+        assertTrue(events.isEmpty());
+    }
+
+    @Test public void rejectedCanonicalCloudItemDoesNotAckOrStarveTheNextValidItem()
+        throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeClient.CloudInboxConsumer consumer = new BridgeClient.CloudInboxConsumer() {
+            @Override public boolean persist(String raw) throws Exception {
+                events.add("persist:" + new JSONObject(raw).optString("_relayMessageId"));
+                return true;
+            }
+
+            @Override public void recordRejected(String relayMessageId, String reason, long now) {
+                events.add("reject:" + relayMessageId + ":" + reason);
+            }
+        };
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null,
+            (method, target, body, headers) -> {
+                if (target.endsWith("/bridge/ack")) {
+                    events.add("ack:" + new JSONObject(body)
+                        .getJSONArray("messageIds").getString(0));
+                }
+                return new BridgeClient.HttpResult(200, "{}");
+            },
+            () -> 500L, millis -> {}, null, consumer);
+        JSONObject bad = canonicalSkipWire();
+        bad.remove("protocolVersion");
+        JSONArray batch = new JSONArray()
+            .put(new JSONObject().put("messageId", "relay_bad")
+                .put("decoded", bad))
+            .put(new JSONObject().put("messageId", "relay_good")
+                .put("decoded", canonicalSkipWire()));
+
+        int processed = client.processCloudInboxBatch(
+            batch, item -> item.getJSONObject("decoded"));
+
+        assertEquals(1, processed);
+        assertEquals(java.util.Arrays.asList(
+            "reject:relay_bad:protocol_conflict",
+            "persist:relay_good",
+            "ack:relay_good"
+        ), events);
+    }
+
+    @Test public void unknownCloudInboxProgramOrDatabaseErrorStillEscapesTheBatch()
+        throws Exception {
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null,
+            (method, target, body, headers) -> new BridgeClient.HttpResult(200, "{}"),
+            () -> 500L, millis -> {}, null,
+            raw -> { throw new IllegalStateException("SQLITE_BUSY"); });
+        JSONArray batch = new JSONArray()
+            .put(new JSONObject().put("messageId", "relay_unknown")
+                .put("decoded", canonicalSkipWire()))
+            .put(new JSONObject().put("messageId", "relay_never_reached")
+                .put("decoded", canonicalSkipWire()));
+
+        IllegalStateException error = assertThrows(IllegalStateException.class, () ->
+            client.processCloudInboxBatch(batch, item -> item.getJSONObject("decoded")));
+        assertEquals("SQLITE_BUSY", error.getMessage());
+        assertFalse(BridgeClient.isCanonicalInboxRejection(error));
+    }
+
+    @Test public void canonicalLookingProgramErrorsAreNotClassifiedByTheirMessagePrefix()
+        throws Exception {
+        String[] messages = new String[] {
+            "v3 bridge arbitrary programming fault",
+            "canonical result arbitrary programming fault",
+            "canonical failure arbitrary programming fault"
+        };
+        for (String message : messages) {
+            List<String> events = new ArrayList<>();
+            BridgeClient.CloudInboxConsumer consumer = new BridgeClient.CloudInboxConsumer() {
+                @Override public boolean persist(String raw) {
+                    throw new IllegalArgumentException(message);
+                }
+
+                @Override public void recordRejected(String relayMessageId, String reason, long now) {
+                    events.add("reject");
+                }
+            };
+            BridgeClient client = new BridgeClient(
+                config("http://lan.example"), null,
+                (method, target, body, headers) -> new BridgeClient.HttpResult(200, "{}"),
+                () -> 500L, millis -> {}, null, consumer);
+            JSONArray batch = new JSONArray().put(new JSONObject()
+                .put("messageId", "relay_unknown_prefix")
+                .put("decoded", canonicalSkipWire()));
+
+            IllegalArgumentException error = assertThrows(IllegalArgumentException.class, () ->
+                client.processCloudInboxBatch(batch, item -> item.getJSONObject("decoded")));
+
+            assertEquals(message, error.getMessage());
+            assertFalse(BridgeClient.isCanonicalInboxRejection(error));
+            assertTrue(events.isEmpty());
+        }
+    }
+
+    @Test public void aRealMalformedV3PayloadIsIsolatedAndTheNextItemStillCommits()
+        throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeClient.CloudInboxConsumer consumer = new BridgeClient.CloudInboxConsumer() {
+            @Override public boolean persist(String raw) throws Exception {
+                JSONObject value = new JSONObject(raw);
+                String relayMessageId = value.getString("_relayMessageId");
+                value.remove("_relayMessageId");
+                value.remove("_deliveryRoute");
+                BridgeTurnStatus.parseV3(
+                    value.toString(), "cloud", relayMessageId);
+                events.add("persist:" + relayMessageId);
+                return true;
+            }
+
+            @Override public void recordRejected(String relayMessageId, String reason, long now) {
+                events.add("reject:" + relayMessageId + ":" + reason);
+            }
+        };
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null,
+            (method, target, body, headers) -> {
+                if (target.endsWith("/bridge/ack")) {
+                    events.add("ack:" + new JSONObject(body)
+                        .getJSONArray("messageIds").getString(0));
+                }
+                return new BridgeClient.HttpResult(200, "{}");
+            },
+            () -> 500L, millis -> {}, null, consumer);
+        JSONObject bad = canonicalSkipWire().put("terminalDisposition", "not_a_disposition");
+        JSONArray batch = new JSONArray()
+            .put(new JSONObject().put("messageId", "relay_malformed")
+                .put("decoded", bad))
+            .put(new JSONObject().put("messageId", "relay_valid")
+                .put("decoded", canonicalSkipWire()));
+
+        int processed = client.processCloudInboxBatch(
+            batch, item -> item.getJSONObject("decoded"));
+
+        assertEquals(1, processed);
+        assertEquals(java.util.Arrays.asList(
+            "reject:relay_malformed:parse_conflict",
+            "persist:relay_valid",
+            "ack:relay_valid"
+        ), events);
     }
 
     @Test public void cloudAcceptedTurnReleasesTheWorkerWithoutLongPolling() throws Exception {
@@ -252,6 +574,131 @@ public class BridgeClientTest {
             "turn_phone_1", "yuqi", "msg_phone_1", TurnKind.DIRECT_REPLY,
             "{\"userText\":\"你好\",\"deviceSeq\":1}", "{}", null, createdAt
         );
+    }
+
+    private static JSONObject canonicalSkipWire() throws Exception {
+        return canonicalSkipWire("lineage_cloud_client", "turn_remote_cloud_client");
+    }
+
+    private static JSONObject canonicalSkipWire(String lineage, String remoteTurnId) throws Exception {
+        return new JSONObject()
+            .put("protocolVersion", 3)
+            .put("turnId", remoteTurnId)
+            .put("roleId", "yuqi")
+            .put("authorityOrigin", "pc")
+            .put("authorityLineageKey", lineage)
+            .put("visibleGroupId", AuthorityIdentity.groupId(lineage))
+            .put("lineageRevision", 2L)
+            .put("turnRevision", 1L)
+            .put("laneKey", "private_chat")
+            .put("laneRevision", 1L)
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("generationFingerprint", JSONObject.NULL)
+            .put("releaseId", "release-cognition-v3")
+            .put("commitPayloadVersion", "v3")
+            .put("commitChecksum", repeat('a', 64))
+            .put("terminalDisposition", "skip")
+            .put("replyParts", new org.json.JSONArray())
+            .put("actions", new org.json.JSONArray());
+    }
+
+    private static JSONObject canonicalFailureWire(
+        String lineage, String remoteTurnId, boolean retryAllowed
+    ) throws Exception {
+        JSONObject wire = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "BACKLOG_FAILED")
+            .put("turnId", remoteTurnId)
+            .put("roleId", "yuqi")
+            .put("authorityLineageKey", lineage)
+            .put("lineageRevision", 1L)
+            .put("turnRevision", 2L)
+            .put("laneKey", "private_chat")
+            .put("laneRevision", 1L)
+            .put("retryOfTurnId", JSONObject.NULL)
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("generationFingerprint", JSONObject.NULL)
+            .put("releaseId", "release-cognition-v3")
+            .put("state", "failed")
+            .put("errorCode", retryAllowed
+                ? "YUQI_TRANSIENT_EXECUTION_FAILURE"
+                : "YUQI_DETERMINISTIC_EXECUTION_FAILURE")
+            .put("failureClass", retryAllowed ? "transient" : "deterministic")
+            .put("retryAllowed", retryAllowed)
+            .put("failedAt", 1784400000100L);
+        wire.put("rawStatusChecksum", BridgeAuthority.sha256CanonicalJson(wire));
+        return wire.put("terminal", true).put("recoveryAckSeq", 9L);
+    }
+
+    private static TurnSubmission canonicalV3Submission(
+        String localTurnId, String remoteTurnId, String lineage, long claim
+    ) throws Exception {
+        long createdAt = 1784400000000L;
+        String messageId = "msg_" + localTurnId;
+        JSONObject message = new JSONObject()
+            .put("messageId", messageId)
+            .put("speakerId", "user")
+            .put("speakerType", "user")
+            .put("recipientId", "yuqi")
+            .put("content", "你好")
+            .put("sentAt", createdAt);
+        JSONObject input = new JSONObject()
+            .put("message", message)
+            .put("options", new JSONObject()
+                .put("batchId", "batch_" + localTurnId)
+                .put("batchMessageIds", new JSONArray().put(messageId))
+                .put("batchMessages", new JSONArray().put(message))
+                .put("batchStartedAt", createdAt)
+                .put("batchCommittedAt", createdAt));
+        TurnSubmission base = new TurnSubmission(
+            localTurnId, "yuqi", messageId, TurnKind.DIRECT_REPLY,
+            input.toString(), "{}", null, createdAt);
+        JSONObject cursor = new JSONObject()
+            .put("nativeCompletedTurnId", JSONObject.NULL)
+            .put("nativeCompletedGroupId", JSONObject.NULL)
+            .put("nativeCompletedSequence", 0L)
+            .put("uiAppliedTurnId", JSONObject.NULL)
+            .put("uiAppliedGroupId", JSONObject.NULL)
+            .put("uiAppliedSequence", 0L)
+            .put("localSequence", 1L)
+            .put("clearedThroughSequence", 0L)
+            .put("clearEpoch", 0L);
+        JSONObject envelope = BridgeInput.prepareV3Envelope(
+            base, "device_123456", remoteTurnId, "private_chat", messageId,
+            lineage, claim, null, cursor);
+        JSONObject checkpoint = new JSONObject()
+            .put("version", 1L)
+            .put("localTurnId", localTurnId)
+            .put("attemptId", "attempt_" + localTurnId + "_1")
+            .put("attemptSequence", 1L)
+            .put("authoritativeTurnId", remoteTurnId)
+            .put("authorityLineageKey", lineage)
+            .put("claimedLineageRevision", claim)
+            .put("retryOfTurnId", JSONObject.NULL)
+            .put("laneKey", "private_chat")
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("normalizedEnvelope", envelope)
+            .put("envelopeChecksum", BridgeAuthority.sha256CanonicalJson(envelope))
+            .put("outcome", new JSONObject()
+                .put("type", "open")
+                .put("route", JSONObject.NULL)
+                .put("relayMessageId", JSONObject.NULL)
+                .put("failure", JSONObject.NULL)
+                .put("result", JSONObject.NULL)
+                .put("redactedAt", JSONObject.NULL));
+        return new TurnSubmission(
+            base.turnId, base.characterId, base.sourceMessageId, base.kind,
+            base.inputJson, base.snapshotJson, base.cloudJobId, base.createdAt,
+            remoteTurnId, checkpoint.toString());
+    }
+
+    private static String repeat(char value, int count) {
+        StringBuilder result = new StringBuilder(count);
+        for (int index = 0; index < count; index += 1) result.append(value);
+        return result.toString();
     }
 
     private static String statusState(String raw) {

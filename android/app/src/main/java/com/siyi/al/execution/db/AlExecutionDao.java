@@ -245,6 +245,16 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM execution_attempts WHERE turnId = :turnId ORDER BY sequence DESC")
     List<ExecutionAttemptEntity> attempts(String turnId);
 
+    @Query("SELECT * FROM chat_turns WHERE authorityLineageKey = :authorityLineageKey ORDER BY turnId ASC")
+    List<ChatTurnEntity> canonicalBridgeLineageOwners(String authorityLineageKey);
+
+    @Query("SELECT a.* FROM execution_attempts a INNER JOIN chat_turns t ON t.turnId = a.turnId "
+        + "WHERE t.authorityLineageKey = :authorityLineageKey "
+        + "AND a.bridgeAuthorityCheckpointJson IS NOT NULL "
+        + "AND a.bridgeAuthorityCheckpointChecksum IS NOT NULL "
+        + "ORDER BY a.turnId ASC, a.sequence ASC")
+    List<ExecutionAttemptEntity> canonicalBridgeCandidateAttempts(String authorityLineageKey);
+
     @Query("SELECT * FROM chat_turns WHERE state IN ('QUEUED','MEMORY_DONE','CHAT_DONE') AND deletedAt IS NULL ORDER BY CASE kind WHEN 'DIRECT_REPLY' THEN 0 WHEN 'ROLE_PLAN_CHAT' THEN 1 WHEN 'ROLE_PLAN_MOMENT' THEN 1 WHEN 'ROLE_PLAN_CHAT_PRIVATE' THEN 2 WHEN 'ROLE_PLAN_MOMENT_PRIVATE' THEN 2 WHEN 'PROACTIVE_CHAT' THEN 3 WHEN 'PROACTIVE_MOMENT' THEN 4 ELSE 5 END, createdAt ASC LIMIT 1")
     ChatTurnEntity nextRunnableTurn();
 
@@ -324,7 +334,7 @@ public interface AlExecutionDao {
         String nextChecksum
     );
 
-    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now, deletedAt = :deletedAt, notificationShownAt = NULL, uiAppliedAt = :uiAppliedAt, cloudConfirmedAt = NULL, visibleGroupId = :visibleGroupId, authorityLineageKey = :authorityLineageKey, authorityOrigin = :authorityOrigin, commitPayloadVersion = :commitPayloadVersion, lineageRevision = :lineageRevision, turnRevision = :turnRevision, laneKey = :laneKey, laneRevision = :laneRevision, generationFingerprint = :generationFingerprint, pipelineReleaseId = :pipelineReleaseId, inputVisibilitySequence = :inputVisibilitySequence, inputClearEpoch = :inputClearEpoch, bridgeCommitChecksum = :bridgeCommitChecksum, terminalDisposition = :terminalDisposition WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 AND authorityLineageKey = :authorityLineageKey AND laneKey = :laneKey AND lineageRevision = :expectedClaimedLineageRevision AND inputVisibilitySequence = :expectedInputVisibilitySequence AND inputClearEpoch = :expectedInputClearEpoch AND state NOT IN ('COMPLETED','CANCELLED')")
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now, deletedAt = :deletedAt, notificationShownAt = NULL, uiAppliedAt = :uiAppliedAt, cloudConfirmedAt = NULL, visibleGroupId = :visibleGroupId, authorityLineageKey = :authorityLineageKey, authorityOrigin = :authorityOrigin, commitPayloadVersion = :commitPayloadVersion, lineageRevision = :lineageRevision, turnRevision = :turnRevision, laneKey = :laneKey, laneRevision = :laneRevision, generationFingerprint = :generationFingerprint, pipelineReleaseId = :pipelineReleaseId, inputVisibilitySequence = :inputVisibilitySequence, inputClearEpoch = :inputClearEpoch, bridgeCommitChecksum = :bridgeCommitChecksum, terminalDisposition = :terminalDisposition WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 AND authorityLineageKey = :authorityLineageKey AND laneKey = :laneKey AND lineageRevision = :expectedClaimedLineageRevision AND inputVisibilitySequence = :expectedInputVisibilitySequence AND inputClearEpoch = :expectedInputClearEpoch AND state IN ('MEMORY_RUNNING','BRIDGE_WAITING','FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED')")
     int finalizeCanonicalBridgeTurn(
         String turnId,
         String attemptId,
@@ -350,14 +360,14 @@ public interface AlExecutionDao {
         long now
     );
 
-    @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId AND turnId = :turnId AND state NOT IN ('COMPLETED','CANCELLED')")
+    @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId AND turnId = :turnId AND state IN ('MEMORY_RUNNING','BRIDGE_WAITING','FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED')")
     int finalizeCanonicalBridgeAttempt(String attemptId, String turnId, long now);
 
-    @Query("UPDATE chat_turns SET state = :state, updatedAt = :now, completedAt = NULL, notificationShownAt = NULL, uiAppliedAt = NULL, cloudConfirmedAt = NULL WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 AND state NOT IN ('COMPLETED','CANCELLED')")
+    @Query("UPDATE chat_turns SET state = :state, updatedAt = :now, completedAt = NULL, notificationShownAt = NULL, uiAppliedAt = NULL, cloudConfirmedAt = NULL WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 AND state IN ('MEMORY_RUNNING','BRIDGE_WAITING','FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED')")
     int finalizeCanonicalBridgeFailureTurn(
         String turnId, String attemptId, String state, long now);
 
-    @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = :state, heartbeatAt = :now, finishedAt = :now, errorCode = :errorCode, errorDetail = NULL, retryable = :retryable WHERE attemptId = :attemptId AND turnId = :turnId AND state NOT IN ('COMPLETED','CANCELLED')")
+    @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = :state, heartbeatAt = :now, finishedAt = :now, errorCode = :errorCode, errorDetail = NULL, retryable = :retryable WHERE attemptId = :attemptId AND turnId = :turnId AND state IN ('MEMORY_RUNNING','BRIDGE_WAITING','FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED')")
     int finalizeCanonicalBridgeFailureAttempt(
         String attemptId,
         String turnId,
@@ -461,6 +471,9 @@ public interface AlExecutionDao {
 
     @Query("SELECT * FROM diagnostics WHERE turnId = :turnId AND code = 'BRIDGE_STATUS' ORDER BY createdAt DESC, diagnosticId DESC LIMIT 1")
     DiagnosticEntity latestBridgeStatus(String turnId);
+
+    @Query("SELECT COUNT(*) FROM diagnostics WHERE code = :code AND detail = :detail")
+    int diagnosticCountByCodeAndDetail(String code, String detail);
 
     @Transaction
     default void commitReply(

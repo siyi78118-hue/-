@@ -1,9 +1,12 @@
 package com.siyi.al.execution.bridge;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
+import com.siyi.al.execution.AuthorityIdentity;
+import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
@@ -15,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.LinkedHashMap;
 import org.junit.Test;
+import org.json.JSONObject;
 
 public class RoomBridgeMirrorTest {
     @Test public void automaticTurnNeverCreatesAFabricatedUserRow() throws Exception {
@@ -243,6 +247,154 @@ public class RoomBridgeMirrorTest {
 
         assertEquals(true, saved);
         assertEquals(Arrays.asList("cloud_proactive_skip_1"), skips);
+    }
+
+    @Test public void canonicalCloudResultUsesOnlyTheRoomAuthorityApplierAndNeverBackfills()
+        throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<String> events = new ArrayList<>();
+        RoomBridgeMirror.CanonicalApplier applier = new RoomBridgeMirror.CanonicalApplier() {
+            @Override public RoomExecutionStore.CanonicalCloudTarget resolve(
+                String lineageKey, String remoteTurnId
+            ) {
+                events.add("resolve:" + lineageKey + ":" + remoteTurnId);
+                return new RoomExecutionStore.CanonicalCloudTarget(
+                    "local-cloud-v3", "attempt-cloud-v3");
+            }
+
+            @Override public RoomExecutionStore.DeliveryDisposition commitTerminal(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) {
+                events.add("commit:" + target.localTurnId + ":" + result.authoritativeTurnId);
+                return RoomExecutionStore.DeliveryDisposition.REDACTED;
+            }
+
+            @Override public void commitFailure(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) {
+                throw new AssertionError("failure writer must not run");
+            }
+
+            @Override public void recordRejected(
+                RoomExecutionStore.CanonicalCloudTarget target,
+                String relayMessageId,
+                String reason,
+                long now
+            ) {
+                events.add("rejected");
+            }
+        };
+        RoomBridgeMirror mirror = new RoomBridgeMirror(dao(inserted), applier, "phone_a");
+        JSONObject wire = canonicalSkipWire()
+            .put("_relayMessageId", "relay_v3_skip")
+            .put("_deliveryRoute", "cloud");
+
+        assertTrue(mirror.persistCloudInboxReply(wire.toString()));
+
+        assertEquals(Arrays.asList(
+            "resolve:lineage_cloud_mirror:turn_remote_cloud_mirror",
+            "commit:local-cloud-v3:turn_remote_cloud_mirror"
+        ), events);
+        assertEquals(0, inserted.size());
+    }
+
+    @Test public void canonicalCloudApplyConflictRecordsOnlyARedactedPendingDiagnostic()
+        throws Exception {
+        List<String> events = new ArrayList<>();
+        RoomBridgeMirror.CanonicalApplier applier = new RoomBridgeMirror.CanonicalApplier() {
+            @Override public RoomExecutionStore.CanonicalCloudTarget resolve(
+                String lineageKey, String remoteTurnId
+            ) {
+                return new RoomExecutionStore.CanonicalCloudTarget(
+                    "local-cloud-v3", "attempt-cloud-v3");
+            }
+
+            @Override public RoomExecutionStore.DeliveryDisposition commitTerminal(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) {
+                throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
+            }
+
+            @Override public void commitFailure(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) {}
+
+            @Override public void recordRejected(
+                RoomExecutionStore.CanonicalCloudTarget target,
+                String relayMessageId,
+                String reason,
+                long now
+            ) {
+                events.add("redacted:" + target.localTurnId + ":" + target.activeAttemptId
+                    + ":" + relayMessageId + ":" + reason);
+            }
+        };
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            dao(new ArrayList<RawMessageEntity>()), applier, "phone_a");
+        JSONObject wire = canonicalSkipWire()
+            .put("_relayMessageId", "relay_v3_conflict")
+            .put("_deliveryRoute", "cloud");
+
+        org.junit.Assert.assertThrows(
+            IllegalStateException.class,
+            () -> mirror.persistCloudInboxReply(wire.toString())
+        );
+        assertEquals(Arrays.asList(
+            "redacted:local-cloud-v3:attempt-cloud-v3:relay_v3_conflict:apply_conflict"
+        ), events);
+    }
+
+    @Test public void malformedCanonicalProtocolVersionNeverUsesLegacyBackfill() throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<ChatTurnEntity> insertedTurns = new ArrayList<>();
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            dao(inserted, new ArrayList<ReplyPartEntity>(), insertedTurns, null, null),
+            "phone_a"
+        );
+        JSONObject malformed = canonicalSkipWire()
+            .put("protocolVersion", "3")
+            .put("reply", new JSONObject()
+                .put("messageId", "msg_should_not_backfill")
+                .put("characterId", "yuqi")
+                .put("content", "不能写入")
+                .put("sentAt", 500L));
+
+        org.junit.Assert.assertThrows(
+            IllegalArgumentException.class,
+            () -> mirror.persistCloudInboxReply(malformed.toString())
+        );
+        assertEquals(0, inserted.size());
+        assertEquals(0, insertedTurns.size());
+    }
+
+    private static JSONObject canonicalSkipWire() throws Exception {
+        String lineage = "lineage_cloud_mirror";
+        return new JSONObject()
+            .put("protocolVersion", 3)
+            .put("turnId", "turn_remote_cloud_mirror")
+            .put("roleId", "yuqi")
+            .put("authorityOrigin", "pc")
+            .put("authorityLineageKey", lineage)
+            .put("visibleGroupId", AuthorityIdentity.groupId(lineage))
+            .put("lineageRevision", 2L)
+            .put("turnRevision", 1L)
+            .put("laneKey", "private_chat")
+            .put("laneRevision", 1L)
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("generationFingerprint", JSONObject.NULL)
+            .put("releaseId", "release-cognition-v3")
+            .put("commitPayloadVersion", "v3")
+            .put("commitChecksum", repeat('b', 64))
+            .put("terminalDisposition", "skip")
+            .put("replyParts", new org.json.JSONArray())
+            .put("actions", new org.json.JSONArray());
+    }
+
+    private static String repeat(char value, int count) {
+        StringBuilder result = new StringBuilder(count);
+        for (int index = 0; index < count; index += 1) result.append(value);
+        return result.toString();
     }
 
     private static AlExecutionDao dao(List<RawMessageEntity> inserted) {

@@ -30,10 +30,15 @@ public final class BridgeClient {
 
     public interface CloudInboxConsumer {
         boolean persist(String raw) throws Exception;
+        default void recordRejected(String relayMessageId, String reason, long now) throws Exception {}
     }
 
     interface Transport {
         HttpResult request(String method, String target, String body, String[][] headers) throws Exception;
+    }
+
+    interface CloudInboxDecoder {
+        JSONObject decode(JSONObject item) throws Exception;
     }
 
     interface Clock { long now(); }
@@ -115,24 +120,30 @@ public final class BridgeClient {
         long deadline = deadline(submission);
         String path = "/v2/turns";
         JSONObject wire = wireEnvelope(submission);
+        boolean canonicalV3 = submission.bridgeAuthorityCheckpointJson != null;
         String wireTurnId = wire.getString("turnId");
         String body = wire.toString();
         HttpResult response = signedLan("POST", path, body);
         requireSuccess(response, "LAN submit");
-        BridgeTurnStatus status = BridgeTurnStatus.parse(response.body, wireTurnId);
-        reportStatus(submission.turnId, status);
-        acknowledgeRecovery(status);
-        while (!status.terminal) {
+        while (true) {
+            if (canonicalV3 && isTerminalResponse(response.body)) {
+                BridgeResult result = BridgeTurnStatus.parseV3(response.body, "lan", null);
+                reportRawStatus(submission.turnId, response.body);
+                acknowledgeRecovery(response.body);
+                return result;
+            }
+            BridgeTurnStatus status = BridgeTurnStatus.parse(response.body, wireTurnId);
+            reportStatus(submission.turnId, status);
+            acknowledgeRecovery(status);
+            if (status.terminal) {
+                if (status.committed()) return status.toResult("lan");
+                throw new BridgeFinalException(status.errorCode, status.allowFallback);
+            }
             sleepForPoll(submission.turnId, deadline, status.retryAfterMs);
             path = "/v2/turns/" + URLEncoder.encode(wireTurnId, "UTF-8");
             response = signedLan("GET", path, "");
             requireSuccess(response, "LAN poll");
-            status = BridgeTurnStatus.parse(response.body, wireTurnId);
-            reportStatus(submission.turnId, status);
-            acknowledgeRecovery(status);
         }
-        if (status.committed()) return status.toResult("lan");
-        throw new BridgeFinalException(status.errorCode, status.allowFallback);
     }
 
     public BridgeResult sendCloud(TurnSubmission submission) throws Exception {
@@ -168,31 +179,114 @@ public final class BridgeClient {
         HttpResult polled = request("GET", pollTarget, "", bearerHeaders());
         requireSuccess(polled, "cloud poll");
         JSONArray messages = new JSONObject(polled.body).optJSONArray("messages");
+        if (messages == null) return 0;
+        return processCloudInboxBatch(messages, item -> {
+            String plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce"));
+            return new JSONObject(plaintext);
+        });
+    }
+
+    int processCloudInboxBatch(JSONArray messages, CloudInboxDecoder decoder) throws Exception {
         int processed = 0;
-        if (messages == null) return processed;
+        if (messages == null || decoder == null) return processed;
         for (int index = 0; index < messages.length(); index += 1) {
             JSONObject item = messages.optJSONObject(index);
             if (item == null) continue;
-            String plaintext;
-            try { plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce")); }
+            JSONObject decoded;
+            try { decoded = decoder.decode(item); }
             catch (Exception ignored) { continue; }
-            JSONObject decoded = new JSONObject(plaintext);
-            decoded.put("_relayMessageId", item.optString("messageId"));
-            decoded.put("_deliveryRoute", "cloud");
-            String disposition = classifyCloudResult(null, decoded);
-            if ("BACKLOG_COMMITTED".equals(disposition)) {
-                if (processBacklogCommitted(decoded, decoded.toString())) processed += 1;
-            } else if ("BACKLOG_FAILED".equals(disposition)) {
-                if (persistBacklogFailure(inboxConsumer, decoded.toString())) {
-                    acknowledgeCloud(item.optString("messageId"));
-                    processed += 1;
-                }
-            } else {
-                acknowledgeCloud(item.optString("messageId"));
-                processed += 1;
+            try {
+                if (processDecodedCloudInboxItem(item, decoded)) processed += 1;
+            } catch (RuntimeException error) {
+                if (!isCanonicalInboxRejection(error)) throw error;
+                inboxConsumer.recordRejected(
+                    item.optString("messageId", ""), canonicalRejectionReason(error), clock.now());
+                // A bad authority item remains unacknowledged, but must not starve later valid relays.
             }
         }
         return processed;
+    }
+
+    boolean processDecodedCloudInboxItem(JSONObject item, JSONObject decoded) throws Exception {
+        String relayMessageId = item == null ? "" : item.optString("messageId", "").trim();
+        if (relayMessageId.isEmpty() || decoded == null) return false;
+        rejectPredeclaredTransportMetadata(decoded);
+        int protocolVersion = declaredProtocolVersion(decoded);
+        if (protocolVersion == 0 && hasCanonicalAuthorityMarker(decoded)) {
+            throw new IllegalArgumentException("canonical bridge protocol marker conflict");
+        }
+        decoded.put("_relayMessageId", relayMessageId);
+        decoded.put("_deliveryRoute", "cloud");
+        if (protocolVersion == 3) {
+            if (inboxConsumer == null || !inboxConsumer.persist(decoded.toString())) return false;
+            acknowledgeCloud(relayMessageId);
+            return true;
+        }
+        String disposition = classifyCloudResult(null, decoded);
+        if ("BACKLOG_COMMITTED".equals(disposition)) {
+            return processBacklogCommitted(decoded, decoded.toString());
+        }
+        if ("BACKLOG_FAILED".equals(disposition)) {
+            if (!persistBacklogFailure(inboxConsumer, decoded.toString())) return false;
+            acknowledgeCloud(relayMessageId);
+            return true;
+        }
+        acknowledgeCloud(relayMessageId);
+        return true;
+    }
+
+    private static int declaredProtocolVersion(JSONObject value) {
+        if (!value.has("protocolVersion")) return 0;
+        Object raw = value.opt("protocolVersion");
+        if (!(raw instanceof Number) || raw instanceof Float || raw instanceof Double) {
+            throw new IllegalArgumentException("bridge protocol version conflict");
+        }
+        long version = ((Number) raw).longValue();
+        if (version < 1L || version > 3L) {
+            throw new IllegalArgumentException("bridge protocol version conflict");
+        }
+        return (int) version;
+    }
+
+    private static void rejectPredeclaredTransportMetadata(JSONObject value) {
+        if (value.has("_relayMessageId") || value.has("_deliveryRoute")) {
+            throw new IllegalArgumentException("canonical bridge transport metadata conflict");
+        }
+    }
+
+    private static boolean hasCanonicalAuthorityMarker(JSONObject value) {
+        String[] markers = new String[] {
+            "authorityOrigin", "authorityLineageKey", "visibleGroupId", "lineageRevision",
+            "turnRevision", "laneRevision", "inputVisibilitySequence", "inputClearEpoch",
+            "commitPayloadVersion", "commitChecksum", "rawStatusChecksum", "retryAllowed"
+        };
+        for (String marker : markers) if (value.has(marker)) return true;
+        return false;
+    }
+
+    static boolean isCanonicalInboxRejection(Throwable error) {
+        if (error == null) return false;
+        if (error instanceof BridgeTurnStatus.CanonicalPayloadRejectedException) return true;
+        String message = error.getMessage() == null ? "" : error.getMessage();
+        if ("BRIDGE_AUTHORITY_CONFLICT".equals(message)
+            && (error instanceof IllegalStateException || error instanceof IllegalArgumentException)) return true;
+        if (!(error instanceof IllegalArgumentException)) return false;
+        return "bridge protocol version conflict".equals(message)
+            || "canonical bridge protocol marker conflict".equals(message)
+            || "canonical bridge transport metadata conflict".equals(message);
+    }
+
+    static String canonicalRejectionReason(Throwable error) {
+        String message = error == null || error.getMessage() == null ? "" : error.getMessage();
+        if ("bridge protocol version conflict".equals(message)
+            || "canonical bridge protocol marker conflict".equals(message)
+            || "canonical bridge transport metadata conflict".equals(message)) {
+            return "protocol_conflict";
+        }
+        if (error instanceof BridgeTurnStatus.CanonicalPayloadRejectedException) {
+            return "parse_conflict";
+        }
+        return "apply_conflict";
     }
 
     static boolean persistBacklogFailure(CloudInboxConsumer consumer, String raw) throws Exception {
@@ -327,12 +421,51 @@ public final class BridgeClient {
         if (journal != null) journal.acknowledge(status.recoveryAckSeq);
     }
 
+    private void acknowledgeRecovery(String raw) {
+        if (journal == null) return;
+        try {
+            JSONObject value = new JSONObject(raw);
+            Object field = value.opt("recoveryAckSeq");
+            if (!(field instanceof Number) || field instanceof Float || field instanceof Double) {
+                if (field == null) return;
+                throw new IllegalArgumentException("v3 bridge recovery cursor conflict");
+            }
+            long sequence = ((Number) field).longValue();
+            if (sequence < 0L || sequence > 9007199254740991L) {
+                throw new IllegalArgumentException("v3 bridge recovery cursor conflict");
+            }
+            journal.acknowledge(sequence);
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalArgumentException("v3 bridge recovery cursor conflict", error);
+        }
+    }
+
     private void reportStatus(String localTurnId, BridgeTurnStatus status) {
         if (statusListener == null || status == null) return;
         try {
             statusListener.onStatus(localTurnId, status.raw);
         } catch (Exception ignored) {
             // Progress reporting is observational and must never break reply delivery.
+        }
+    }
+
+    private void reportRawStatus(String localTurnId, String raw) {
+        if (statusListener == null) return;
+        try {
+            statusListener.onStatus(localTurnId, raw);
+        } catch (Exception ignored) {
+            // Progress reporting is observational and must never break reply delivery.
+        }
+    }
+
+    private static boolean isTerminalResponse(String raw) {
+        try {
+            JSONObject value = new JSONObject(raw == null ? "{}" : raw);
+            return value.opt("terminal") instanceof Boolean && value.getBoolean("terminal");
+        } catch (Exception error) {
+            throw new IllegalArgumentException("v3 bridge result JSON conflict", error);
         }
     }
 

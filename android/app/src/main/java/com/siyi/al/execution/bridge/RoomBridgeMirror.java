@@ -2,6 +2,8 @@ package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.TurnKind;
+import com.siyi.al.execution.BridgeAuthority;
+import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.api.ParsedReply;
 import com.siyi.al.execution.api.ParsedReplyPart;
 import com.siyi.al.execution.api.ReplyParser;
@@ -16,11 +18,39 @@ import java.util.List;
 import org.json.JSONObject;
 
 public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
+    interface CanonicalApplier {
+        RoomExecutionStore.CanonicalCloudTarget resolve(
+            String lineageKey, String authoritativeTurnId);
+        RoomExecutionStore.DeliveryDisposition commitTerminal(
+            RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now);
+        void commitFailure(
+            RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now);
+        void recordRejected(
+            RoomExecutionStore.CanonicalCloudTarget target,
+            String relayMessageId,
+            String reason,
+            long now);
+    }
+
     private final AlExecutionDao dao;
+    private final CanonicalApplier canonicalApplier;
     private final String deviceId;
 
     public RoomBridgeMirror(AlExecutionDao dao, String deviceId) {
+        this(dao, (CanonicalApplier) null, deviceId);
+    }
+
+    public RoomBridgeMirror(
+        AlExecutionDao dao,
+        RoomExecutionStore store,
+        String deviceId
+    ) {
+        this(dao, canonicalApplier(store), deviceId);
+    }
+
+    RoomBridgeMirror(AlExecutionDao dao, CanonicalApplier canonicalApplier, String deviceId) {
         this.dao = dao;
+        this.canonicalApplier = canonicalApplier;
         this.deviceId = deviceId == null || deviceId.trim().isEmpty() ? "phone" : deviceId.trim();
     }
 
@@ -72,6 +102,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
 
     public boolean persistCloudInboxReply(String raw) throws Exception {
         JSONObject response = new JSONObject(raw == null ? "{}" : raw);
+        if (declaredProtocolVersion(response) == 3) return persistCanonicalCloudResult(response);
         JSONObject reply = response.optJSONObject("reply");
         String remoteTurnId = response.optString("turnId", "").trim();
         if (remoteTurnId.isEmpty()) return false;
@@ -169,6 +200,109 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         }
         ReplyPartEntity independentPart = backlogPart(messageId, backfillTurnId, null, content, sentAt);
         return dao.importCloudBacklogReply(backfillTurnId, independentPart, sentAt);
+    }
+
+    public void recordCanonicalCloudRejection(
+        String relayMessageId, String reason, long now
+    ) {
+        if (canonicalApplier == null) {
+            throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        canonicalApplier.recordRejected(null, relayMessageId, reason, now);
+    }
+
+    private boolean persistCanonicalCloudResult(JSONObject response) throws Exception {
+        if (canonicalApplier == null) {
+            throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        String relayMessageId = nativeNonEmptyString(response, "_relayMessageId");
+        String route = nativeNonEmptyString(response, "_deliveryRoute");
+        if (!"cloud".equals(route)) {
+            throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        JSONObject wire = new JSONObject(response.toString());
+        wire.remove("_relayMessageId");
+        wire.remove("_deliveryRoute");
+        BridgeResult result = null;
+        RoomExecutionStore.CanonicalCloudTarget target = null;
+        long now = System.currentTimeMillis();
+        try {
+            result = BridgeTurnStatus.parseV3(wire.toString(), "cloud", relayMessageId);
+            target = canonicalApplier.resolve(
+                result.authorityLineageKey, result.authoritativeTurnId);
+            if (result.kind == BridgeResult.Kind.CANONICAL_TERMINAL) {
+                canonicalApplier.commitTerminal(target, result, now);
+            } else if (result.kind == BridgeResult.Kind.VERIFIED_REMOTE_FAILURE) {
+                canonicalApplier.commitFailure(target, result, now);
+            } else {
+                throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
+            }
+            return true;
+        } catch (RuntimeException error) {
+            if (BridgeClient.isCanonicalInboxRejection(error)) {
+                String reason = result == null
+                    ? BridgeClient.canonicalRejectionReason(error)
+                    : target == null ? "target_conflict" : "apply_conflict";
+                canonicalApplier.recordRejected(target, relayMessageId, reason, now);
+            }
+            throw error;
+        }
+    }
+
+    private static CanonicalApplier canonicalApplier(RoomExecutionStore store) {
+        if (store == null) throw new IllegalArgumentException("canonical store is required");
+        return new CanonicalApplier() {
+            @Override public RoomExecutionStore.CanonicalCloudTarget resolve(
+                String lineageKey, String authoritativeTurnId
+            ) {
+                return store.resolveCanonicalCloudTarget(lineageKey, authoritativeTurnId);
+            }
+
+            @Override public RoomExecutionStore.DeliveryDisposition commitTerminal(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) {
+                return store.commitBridgedTerminal(
+                    target.localTurnId, target.activeAttemptId, result, now);
+            }
+
+            @Override public void commitFailure(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) {
+                store.commitVerifiedRemoteFailure(
+                    target.localTurnId, target.activeAttemptId, result, now);
+            }
+
+            @Override public void recordRejected(
+                RoomExecutionStore.CanonicalCloudTarget target,
+                String relayMessageId,
+                String reason,
+                long now
+            ) {
+                store.recordCanonicalCloudRejectionOnce(
+                    target, relayMessageId, reason, now);
+            }
+        };
+    }
+
+    private static int declaredProtocolVersion(JSONObject value) {
+        if (!value.has("protocolVersion")) return 0;
+        Object raw = value.opt("protocolVersion");
+        if (!(raw instanceof Number) || raw instanceof Float || raw instanceof Double) {
+            throw new IllegalArgumentException("bridge protocol version conflict");
+        }
+        long version = ((Number) raw).longValue();
+        if (version < 1L || version > 3L) {
+            throw new IllegalArgumentException("bridge protocol version conflict");
+        }
+        return (int) version;
+    }
+
+    private static String nativeNonEmptyString(JSONObject value, String key) {
+        Object raw = value.opt(key);
+        if (!(raw instanceof String) || ((String) raw).trim().isEmpty()) {
+            throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        return (String) raw;
     }
 
     private boolean completedTurnAlreadyContainsReply(ChatTurnEntity turn, String content) {

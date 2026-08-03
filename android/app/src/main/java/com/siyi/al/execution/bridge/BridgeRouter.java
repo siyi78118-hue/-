@@ -37,14 +37,15 @@ public final class BridgeRouter {
     public String deviceId() { return config.deviceId; }
 
     public BridgeResult execute(TurnSubmission submission) throws Exception {
-        if (submission.bridgeAuthorityCheckpointJson != null) {
+        boolean canonicalV3 = submission.bridgeAuthorityCheckpointJson != null;
+        if (canonicalV3) {
             String pinnedDeviceId = new org.json.JSONObject(submission.bridgeAuthorityCheckpointJson)
                 .getJSONObject("normalizedEnvelope").getString("deviceId");
             if (!config.deviceId.equals(pinnedDeviceId)) {
                 throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT: bridge device changed");
             }
         }
-        if (submission.kind == TurnKind.DIRECT_REPLY) {
+        if (!canonicalV3 && submission.kind == TurnKind.DIRECT_REPLY) {
             mirror.persistSubmission(submission);
         }
         List<String> routes = new ArrayList<>();
@@ -53,11 +54,11 @@ public final class BridgeRouter {
         if (config.enabled) {
             if (config.mode == BridgeMode.AUTO || config.mode == BridgeMode.LAN) {
                 BridgeResult result = attempt("lan", lan, submission, routes, failures);
-                if (result != null) return finish(submission, result.routed(routes, false));
+                if (result != null) return finish(submission, result.routed(routes, false), canonicalV3);
             }
             if (config.mode == BridgeMode.AUTO || config.mode == BridgeMode.CLOUD) {
                 BridgeResult result = attempt("cloud", cloud, submission, routes, failures);
-                if (result != null) return finish(submission, result.routed(routes, false));
+                if (result != null) return finish(submission, result.routed(routes, false), canonicalV3);
             }
         }
 
@@ -85,6 +86,16 @@ public final class BridgeRouter {
             for (Exception failure : failures) if (failure != accepted) accepted.addSuppressed(failure);
             throw accepted;
         }
+        if (canonicalV3) {
+            Exception terminal = blockedFinal != null
+                ? blockedFinal
+                : pending != null ? pending : failures.isEmpty() ? null : failures.get(failures.size() - 1);
+            if (terminal == null) {
+                throw new BridgeFinalException("BRIDGE_V3_ROUTE_UNAVAILABLE", false);
+            }
+            for (Exception failure : failures) if (failure != terminal) terminal.addSuppressed(failure);
+            throw terminal;
+        }
         if (blockedFinal != null && !fallbackAuthorized) throw blockedFinal;
         if (pending != null && !fallbackAuthorized) {
             for (Exception failure : failures) if (failure != pending) pending.addSuppressed(failure);
@@ -94,7 +105,7 @@ public final class BridgeRouter {
         routes.add("fallback");
         try {
             BridgeResult result = fallback.execute(submission).routed(routes, true);
-            return finish(submission, result);
+            return finish(submission, result, false);
         } catch (Exception error) {
             for (Exception failure : failures) error.addSuppressed(failure);
             throw error;
@@ -111,7 +122,17 @@ public final class BridgeRouter {
         }
     }
 
-    private BridgeResult finish(TurnSubmission submission, BridgeResult result) throws Exception {
+    private BridgeResult finish(
+        TurnSubmission submission,
+        BridgeResult result,
+        boolean canonicalV3
+    ) throws Exception {
+        if (canonicalV3) {
+            if (result.kind == BridgeResult.Kind.LEGACY_V2 || result.fallback) {
+                throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT: v3 route returned legacy result");
+            }
+            return result;
+        }
         if (result.skipped) return result;
         if (result.replyText.trim().isEmpty()) throw new IllegalStateException("bridge returned an empty reply");
         mirror.persistReply(submission, result);

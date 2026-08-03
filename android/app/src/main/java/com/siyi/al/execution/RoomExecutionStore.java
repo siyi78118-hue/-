@@ -28,6 +28,15 @@ import org.json.JSONArray;
 
 public final class RoomExecutionStore implements ExecutionStore, ExecutionEngineStore {
     public enum DeliveryDisposition { APPLY, REDACTED }
+    public static final class CanonicalCloudTarget {
+        public final String localTurnId;
+        public final String activeAttemptId;
+
+        public CanonicalCloudTarget(String localTurnId, String activeAttemptId) {
+            this.localTurnId = localTurnId;
+            this.activeAttemptId = activeAttemptId;
+        }
+    }
     interface TerminalFaultHook {
         void after(String boundary);
     }
@@ -189,6 +198,48 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return turn.activeAttemptId == null ? null : dao.attempt(turn.activeAttemptId);
     }
 
+    public CanonicalCloudTarget resolveCanonicalCloudTarget(
+        String authorityLineageKey,
+        String authoritativeTurnId
+    ) {
+        AtomicReference<CanonicalCloudTarget> resolved = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            String safeLineage = requireBridgeIdentity(
+                authorityLineageKey, "cloud authority lineage");
+            String safeRemoteTurn = requireBridgeIdentity(
+                authoritativeTurnId, "cloud authoritative turn");
+            List<ChatTurnEntity> owners = dao.canonicalBridgeLineageOwners(safeLineage);
+            if (owners == null || owners.size() != 1) {
+                throw bridgeAuthorityConflict("bridge-cloud-inbox");
+            }
+            ChatTurnEntity turn = owners.get(0);
+            String localTurnId = turn == null ? "bridge-cloud-inbox" : turn.turnId;
+            if (turn == null || !isStoreOwnedV3(turn)
+                || !safeLineage.equals(turn.authorityLineageKey)
+                || turn.activeAttemptId == null) {
+                throw bridgeAuthorityConflict(localTurnId);
+            }
+            List<ExecutionAttemptEntity> attempts = dao.attempts(localTurnId);
+            List<MemberCheckpoint> members = validateCheckpointSet(turn, attempts, true);
+            int matchingMembers = 0;
+            for (MemberCheckpoint member : members) {
+                if (safeRemoteTurn.equals(member.checkpoint.optString(
+                    "authoritativeTurnId", ""))) matchingMembers += 1;
+            }
+            ExecutionAttemptEntity active = dao.attempt(turn.activeAttemptId);
+            if (matchingMembers != 1 || active == null
+                || !localTurnId.equals(active.turnId)
+                || active.sequence != dao.maxAttemptSequence(localTurnId)) {
+                throw bridgeAuthorityConflict(localTurnId);
+            }
+            JSONObject activeCheckpoint = validateCheckpoint(turn, active, false);
+            assertCanonicalBridgeLifecycle(turn, active, false, activeCheckpoint);
+            resolved.set(new CanonicalCloudTarget(localTurnId, active.attemptId));
+        });
+        if (resolved.get() == null) throw bridgeAuthorityConflict("bridge-cloud-inbox");
+        return resolved.get();
+    }
+
     @Override
     public TurnSubmission prepareBridgeSubmission(TurnSubmission base, String bridgeDeviceId, long now) {
         AtomicReference<TurnSubmission> result = new AtomicReference<>();
@@ -223,6 +274,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         boolean storeOwnedV3 = isStoreOwnedV3(turn);
         List<MemberCheckpoint> members = validateCheckpointSet(turn, allAttempts, storeOwnedV3);
         if (!storeOwnedV3) return base;
+        assertCanonicalBridgeLifecycle(turn, attempt, true, null);
         String safeDeviceId = requireBridgeIdentity(bridgeDeviceId, "bridge device id");
         if (attempt.bridgeAuthorityCheckpointJson != null || attempt.bridgeAuthorityCheckpointChecksum != null) {
             JSONObject checkpoint = validateCheckpoint(turn, attempt, true);
@@ -495,6 +547,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             List<ExecutionAttemptEntity> attempts = dao.attempts(turnId);
             validateCheckpointSet(turn, attempts, true);
             JSONObject activeCheckpoint = validateCheckpoint(turn, activeAttempt, false);
+            assertCanonicalBridgeLifecycle(turn, activeAttempt, false, activeCheckpoint);
             MemberCheckpoint receiptMember = uniqueReceiptMember(
                 turn, attempts, result.authoritativeTurnId);
             validateCanonicalTerminalResult(turn, activeCheckpoint, receiptMember.checkpoint, result);
@@ -639,6 +692,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             List<ExecutionAttemptEntity> attempts = dao.attempts(turnId);
             validateCheckpointSet(turn, attempts, true);
             JSONObject checkpoint = validateCheckpoint(turn, attempt, false);
+            assertCanonicalBridgeLifecycle(turn, attempt, false, checkpoint);
             validateCanonicalFailureResult(turn, checkpoint, result);
             JSONObject currentOutcome = checkpoint.getJSONObject("outcome");
             if ("verified_remote_failure".equals(currentOutcome.getString("type"))) {
@@ -766,6 +820,40 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         long now
     ) {
         insertDiagnostic(turnId, attemptId, level, code, detail, now);
+    }
+
+    public void recordCanonicalCloudRejectionOnce(
+        CanonicalCloudTarget target,
+        String relayMessageId,
+        String reason,
+        long now
+    ) {
+        String safeRelay = requireBridgeIdentity(relayMessageId, "cloud relay message");
+        if (!Arrays.asList(
+            "protocol_conflict", "parse_conflict", "target_conflict", "apply_conflict"
+        ).contains(reason)) {
+            throw bridgeAuthorityConflict(target == null ? "bridge-cloud-inbox" : target.localTurnId);
+        }
+        database.runInTransaction(() -> {
+            try {
+                String detail = BridgeAuthority.canonicalJson(new JSONObject()
+                    .put("reason", reason)
+                    .put("redacted", true)
+                    .put("relayMessageId", safeRelay));
+                if (dao.diagnosticCountByCodeAndDetail(
+                    "BRIDGE_CLOUD_RESULT_PENDING", detail) == 0) {
+                    insertDiagnostic(
+                        target == null ? "bridge-cloud-inbox" : target.localTurnId,
+                        target == null ? null : target.activeAttemptId,
+                        "WARN", "BRIDGE_CLOUD_RESULT_PENDING", detail, now);
+                }
+            } catch (RuntimeException error) {
+                throw error;
+            } catch (Exception error) {
+                throw bridgeAuthorityConflict(
+                    target == null ? "bridge-cloud-inbox" : target.localTurnId);
+            }
+        });
     }
 
     @Override
@@ -1779,6 +1867,87 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         }
     }
 
+    private static void assertCanonicalBridgeLifecycle(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        boolean preparing,
+        JSONObject checkpoint
+    ) {
+        if (turn == null || attempt == null
+            || turn.activeAttemptId == null
+            || !turn.activeAttemptId.equals(attempt.attemptId)
+            || !turn.turnId.equals(attempt.turnId)) {
+            throw bridgeAuthorityConflict(turn == null ? "bridge-cloud-inbox" : turn.turnId);
+        }
+        String turnState = turn.state;
+        String attemptState = attempt.state;
+        String stage = attempt.stage;
+        boolean unfinished = attempt.finishedAt == null;
+        String outcomeType = null;
+        if (checkpoint != null) {
+            JSONObject outcome = checkpoint.optJSONObject("outcome");
+            outcomeType = outcome == null ? null : outcome.optString("type", null);
+        }
+        boolean valid;
+        if (preparing) {
+            valid = TurnState.MEMORY_RUNNING.name().equals(turnState)
+                && TurnState.MEMORY_RUNNING.name().equals(attemptState)
+                && AttemptStage.MEMORY.name().equals(stage)
+                && unfinished
+                && !attempt.retryable;
+        } else if (TurnState.MEMORY_RUNNING.name().equals(turnState)) {
+            valid = turnState.equals(attemptState)
+                && AttemptStage.MEMORY.name().equals(stage)
+                && unfinished
+                && !attempt.retryable;
+        } else if (TurnState.BRIDGE_WAITING.name().equals(turnState)) {
+            valid = turnState.equals(attemptState)
+                && AttemptStage.BRIDGE.name().equals(stage)
+                && unfinished
+                && !attempt.retryable;
+        } else if (TurnState.FAILED_RETRYABLE.name().equals(turnState)
+            || TurnState.INTERRUPTED.name().equals(turnState)) {
+            valid = turnState.equals(attemptState)
+                && (AttemptStage.MEMORY.name().equals(stage)
+                    || AttemptStage.BRIDGE.name().equals(stage)
+                    || AttemptStage.FINISHED.name().equals(stage))
+                && !unfinished
+                && attempt.retryable;
+        } else if (TurnState.FAILED_FINAL.name().equals(turnState)) {
+            valid = turnState.equals(attemptState)
+                && (AttemptStage.MEMORY.name().equals(stage)
+                    || AttemptStage.BRIDGE.name().equals(stage)
+                    || AttemptStage.FINISHED.name().equals(stage))
+                && !unfinished
+                && !attempt.retryable;
+        } else if (TurnState.COMPLETED.name().equals(turnState)) {
+            valid = TurnState.COMPLETED.name().equals(attemptState)
+                && AttemptStage.FINISHED.name().equals(stage)
+                && !unfinished
+                && !attempt.retryable
+                && turn.completedAt != null;
+        } else {
+            valid = false;
+        }
+        if (valid && !preparing) {
+            boolean localOpenState = TurnState.MEMORY_RUNNING.name().equals(turnState)
+                || TurnState.BRIDGE_WAITING.name().equals(turnState);
+            boolean failedState = TurnState.FAILED_RETRYABLE.name().equals(turnState)
+                || TurnState.INTERRUPTED.name().equals(turnState)
+                || TurnState.FAILED_FINAL.name().equals(turnState);
+            if (localOpenState) {
+                valid = "open".equals(outcomeType);
+            } else if (failedState) {
+                valid = AttemptStage.FINISHED.name().equals(stage)
+                    ? "verified_remote_failure".equals(outcomeType)
+                    : "open".equals(outcomeType);
+            } else if (TurnState.COMPLETED.name().equals(turnState)) {
+                valid = "committed".equals(outcomeType) || "redacted".equals(outcomeType);
+            }
+        }
+        if (!valid) throw bridgeAuthorityConflict(turn.turnId);
+    }
+
     private static void assertAuthorizedChild(
         ChatTurnEntity turn,
         MemberCheckpoint parent,
@@ -2517,7 +2686,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     private static String requireBridgeIdentity(String value, String label) {
         if (value == null || !value.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,127}")) {
-            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: invalid " + label);
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT");
         }
         return value;
     }
@@ -2620,7 +2789,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     private static IllegalStateException bridgeAuthorityConflict(String turnId) {
-        return new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT: " + turnId);
+        return new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
     }
 
     private ChatTurnEntity requireTurn(String turnId) {

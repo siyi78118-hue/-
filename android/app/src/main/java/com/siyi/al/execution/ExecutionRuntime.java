@@ -26,14 +26,15 @@ final class ExecutionRuntime {
         gateway.setBridgeRouterProvider(() -> {
             BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
             FallbackJournal fallbackJournal = new FallbackJournal(database.executionDao(), bridgeConfig.deviceId);
-            RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), bridgeConfig.deviceId);
+            RoomBridgeMirror mirror = new RoomBridgeMirror(
+                database.executionDao(), store, bridgeConfig.deviceId);
             BridgeClient bridgeClient = new BridgeClient(
                 bridgeConfig,
                 fallbackJournal,
                 (turnId, raw) -> store.recordDiagnostic(
                     turnId, null, "INFO", "BRIDGE_STATUS", raw, System.currentTimeMillis()
                 ),
-                mirror::persistCloudInboxReply
+                cloudInboxConsumer(mirror)
             );
             return new BridgeRouter(
                 bridgeConfig,
@@ -52,9 +53,24 @@ final class ExecutionRuntime {
         BridgeConfig config = secrets.loadBridgeConfig();
         if (!config.hasCloud()) return 0;
         FallbackJournal journal = new FallbackJournal(database.executionDao(), config.deviceId);
-        RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), config.deviceId);
-        BridgeClient client = new BridgeClient(config, journal, null, mirror::persistCloudInboxReply);
+        RoomExecutionStore store = new RoomExecutionStore(database);
+        RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), store, config.deviceId);
+        BridgeClient client = new BridgeClient(config, journal, null, cloudInboxConsumer(mirror));
         return client.drainCloudInbox();
+    }
+
+    private static BridgeClient.CloudInboxConsumer cloudInboxConsumer(RoomBridgeMirror mirror) {
+        return new BridgeClient.CloudInboxConsumer() {
+            @Override public boolean persist(String raw) throws Exception {
+                return mirror.persistCloudInboxReply(raw);
+            }
+
+            @Override public void recordRejected(
+                String relayMessageId, String reason, long now
+            ) {
+                mirror.recordCanonicalCloudRejection(relayMessageId, reason, now);
+            }
+        };
     }
 
     static boolean confirmAppliedResult(Context context, String responseJson) throws Exception {

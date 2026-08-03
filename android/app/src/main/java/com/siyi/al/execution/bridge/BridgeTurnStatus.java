@@ -13,6 +13,12 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 public final class BridgeTurnStatus {
+    public static final class CanonicalPayloadRejectedException extends IllegalArgumentException {
+        CanonicalPayloadRejectedException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
     private static final long MAX_SAFE_INTEGER = 9007199254740991L;
     private static final Set<String> CANONICAL_RESULT_KEYS = immutableSet(
         "protocolVersion", "turnId", "roleId", "authorityOrigin", "authorityLineageKey",
@@ -399,6 +405,18 @@ public final class BridgeTurnStatus {
     }
 
     public static BridgeResult parseV3(
+        String raw, String deliveryRoute, String relayMessageId
+    ) {
+        try {
+            return parseV3Unchecked(raw, deliveryRoute, relayMessageId);
+        } catch (CanonicalPayloadRejectedException error) {
+            throw error;
+        } catch (IllegalArgumentException error) {
+            throw new CanonicalPayloadRejectedException(error.getMessage(), error);
+        }
+    }
+
+    private static BridgeResult parseV3Unchecked(
         String raw, String deliveryRoute, String relayMessageId
     ) {
         if (!("lan".equals(deliveryRoute) || "cloud".equals(deliveryRoute))) {

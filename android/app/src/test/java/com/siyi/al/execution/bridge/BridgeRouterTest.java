@@ -39,6 +39,51 @@ public class BridgeRouterTest {
         assertTrue(events.isEmpty());
     }
 
+    @Test public void pinnedV3TerminalNeverUsesLegacyMessageMirrors() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeRouter router = new BridgeRouter(
+            config(BridgeMode.LAN),
+            value -> {
+                events.add("lan");
+                return BridgeResult.canonicalTerminal(
+                    new JSONObject()
+                        .put("terminalDisposition", "action_only")
+                        .put("replyParts", new org.json.JSONArray())
+                        .put("actions", new org.json.JSONArray()),
+                    "{}", "lan", null
+                );
+            },
+            failing("cloud", events),
+            fallback("fallback", events),
+            recordingMirror(events)
+        );
+
+        BridgeResult result = router.execute(preparedV3Submission());
+
+        assertEquals(BridgeResult.Kind.CANONICAL_TERMINAL, result.kind);
+        assertEquals(Arrays.asList("lan"), events);
+    }
+
+    @Test public void pinnedV3FailureNeverAuthorizesLegacyFallback() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeRouter router = new BridgeRouter(
+            config(BridgeMode.AUTO),
+            value -> {
+                events.add("lan");
+                throw new BridgeDeadlineException("turn_local");
+            },
+            value -> {
+                events.add("cloud");
+                throw new BridgeFinalException("REMOTE_FINAL", true);
+            },
+            fallback("fallback", events),
+            recordingMirror(events)
+        );
+
+        assertThrows(BridgeFinalException.class, () -> router.execute(preparedV3Submission()));
+        assertEquals(Arrays.asList("lan", "cloud"), events);
+    }
+
     @Test public void autoPrefersLanAndFallsBackToCloud() throws Exception {
         List<String> events = new ArrayList<>();
         BridgeRouter router = router(BridgeMode.AUTO, events, failing("lan", events), succeeding("cloud", events), fallback("fallback", events));
@@ -164,12 +209,18 @@ public class BridgeRouterTest {
         BridgeRouter.RouteClient cloud,
         BridgeRouter.FallbackExecutor fallback
     ) {
-        BridgeConfig config = new BridgeConfig(true, mode, "http://192.168.1.8:17891", "https://relay.example", "device_123456", "pairing-secret-123", "device-token-123456", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 500, 2000, 2, 1);
-        BridgeRouter.MessageMirror mirror = new BridgeRouter.MessageMirror() {
+        return new BridgeRouter(config(mode), lan, cloud, fallback, recordingMirror(events));
+    }
+
+    private static BridgeConfig config(BridgeMode mode) {
+        return new BridgeConfig(true, mode, "http://192.168.1.8:17891", "https://relay.example", "device_123456", "pairing-secret-123", "device-token-123456", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", 500, 2000, 2, 1);
+    }
+
+    private static BridgeRouter.MessageMirror recordingMirror(List<String> events) {
+        return new BridgeRouter.MessageMirror() {
             @Override public void persistSubmission(TurnSubmission value) { events.add("mirror-user"); }
             @Override public void persistReply(TurnSubmission value, BridgeResult result) { events.add("mirror-reply"); }
         };
-        return new BridgeRouter(config, lan, cloud, fallback, mirror);
     }
 
     private static BridgeRouter.RouteClient failing(String route, List<String> events) {
@@ -186,5 +237,14 @@ public class BridgeRouterTest {
 
     private static TurnSubmission submission() {
         return new TurnSubmission("turn_phone_1", "yuqi", "msg_phone_1", TurnKind.DIRECT_REPLY, "{\"text\":\"你好\"}", "{}", null, 1784400000000L);
+    }
+
+    private static TurnSubmission preparedV3Submission() throws Exception {
+        JSONObject checkpoint = new JSONObject().put("normalizedEnvelope", new JSONObject()
+            .put("deviceId", "device_123456"));
+        return new TurnSubmission(
+            "turn_local", "yuqi", "msg_1", TurnKind.DIRECT_REPLY,
+            "{}", "{}", null, 1L, "turn_remote", checkpoint.toString()
+        );
     }
 }
