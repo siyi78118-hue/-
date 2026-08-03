@@ -3,6 +3,7 @@ package com.siyi.al.execution;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
+import com.siyi.al.execution.bridge.BridgeResult;
 import java.util.List;
 
 public interface ExecutionEngineStore {
@@ -11,6 +12,10 @@ public interface ExecutionEngineStore {
     ChatTurnEntity turn(String turnId);
     ExecutionAttemptEntity activeAttempt(String turnId);
     TurnSubmission prepareBridgeSubmission(TurnSubmission base, String bridgeDeviceId, long now);
+    RoomExecutionStore.DeliveryDisposition commitBridgedTerminal(
+        String turnId, String attemptId, BridgeResult result, long now);
+    void commitVerifiedRemoteFailure(
+        String turnId, String attemptId, BridgeResult result, long now);
     void markStage(String turnId, String attemptId, TurnState state, AttemptStage stage, long now);
     void markBridgeWaiting(String turnId, String attemptId, String route, long now);
     void saveMemoryResult(String turnId, String attemptId, String memory, long now);

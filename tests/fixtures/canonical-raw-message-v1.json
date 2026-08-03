@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "canonicalization": "utf8-canonical-json-v1",
+  "vectors": [
+    {
+      "name": "unicode-character-message",
+      "rawMessage": {
+        "messageId": "msg_虞栖_🌧️",
+        "turnId": "turn/跨时空",
+        "characterId": "虞栖",
+        "speakerId": "虞栖🌧️",
+        "speakerType": "character",
+        "recipientId": "user",
+        "content": "中文/emoji😀\nline\u0001",
+        "sentAt": 1720000000123,
+        "origin": "pc",
+        "deviceId": "pc-group:grp_测试",
+        "deviceSeq": 1
+      },
+      "canonicalJson": "{\"characterId\":\"虞栖\",\"content\":\"中文/emoji😀\\nline\\u0001\",\"deviceId\":\"pc-group:grp_测试\",\"deviceSeq\":1,\"messageId\":\"msg_虞栖_🌧️\",\"origin\":\"pc\",\"recipientId\":\"user\",\"sentAt\":1720000000123,\"speakerId\":\"虞栖🌧️\",\"speakerType\":\"character\",\"turnId\":\"turn/跨时空\"}",
+      "rawMessageChecksum": "d922c0e0801a0120c1799268b2dd553df9c2fbfec97de20cbb0a533b7dc795d3",
+      "canonicalItemChecksum": "dbfd66b9c0bf211c9659494175f802f75f2641a09891a2bef29dcd79777c47a6"
+    }
+  ]
+}

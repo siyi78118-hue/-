@@ -31,6 +31,10 @@ const canonicalFailureFixture = JSON.parse(readFileSync(
   new URL('../../tests/fixtures/canonical-failure-status-v1.json', import.meta.url),
   'utf8'
 ));
+const canonicalRawMessageFixture = JSON.parse(readFileSync(
+  new URL('../../tests/fixtures/canonical-raw-message-v1.json', import.meta.url),
+  'utf8'
+));
 
 test('shared authority identity matches every frozen Task 10 vector', () => {
   for (const vector of fixture.vectors) {
@@ -40,6 +44,19 @@ test('shared authority identity matches every frozen Task 10 vector', () => {
     assert.equal(deriveVisibleMessageId(vector.groupId, vector.ordinal), vector.messageId, vector.name);
     assert.equal(deriveVisibleActionId(vector.groupId, vector.ordinal), vector.actionId, vector.name);
     assert.equal(deriveRemoteRetryTurnId(vector.attemptId), vector.remoteRetryTurnId, vector.name);
+  }
+});
+
+test('canonical raw character messages hash exactly eleven persisted fields across runtimes', () => {
+  for (const vector of canonicalRawMessageFixture.vectors) {
+    const canonical = canonicalJson(vector.rawMessage);
+    assert.equal(canonical, vector.canonicalJson, vector.name);
+    assert.equal(
+      createHash('sha256').update(Buffer.from(canonical, 'utf8')).digest('hex'),
+      vector.rawMessageChecksum,
+      vector.name
+    );
+    assert.notEqual(vector.rawMessageChecksum, vector.canonicalItemChecksum, vector.name);
   }
 });
 

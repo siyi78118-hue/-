@@ -18,6 +18,8 @@ import com.siyi.al.execution.db.ConversationAuthorityEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
+import com.siyi.al.execution.bridge.BridgeResult;
+import com.siyi.al.execution.bridge.BridgeTurnStatus;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
 import java.util.Collections;
 import org.json.JSONObject;
@@ -44,6 +46,709 @@ public class RoomExecutionStoreTest {
     @After
     public void tearDown() {
         database.close();
+    }
+
+    @Test
+    public void canonicalVisibleTerminalCommitsReceiptPartsRawMessagesAuthorityAndCursorAtomically()
+        throws Exception {
+        String localTurnId = "local-v3-terminal";
+        store.submitTurn(yuqiThreeBubbleSubmission(localTurnId, "msg-v3-terminal-3", 100L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 101L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalTerminal(checkpoint, "visible", 3, new JSONArray()).toString(),
+            "lan",
+            null
+        );
+
+        RoomExecutionStore.DeliveryDisposition disposition = store.commitBridgedTerminal(
+            localTurnId, attempt.attemptId, result, 200L);
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY, disposition);
+        ChatTurnEntity committed = store.turn(localTurnId);
+        assertEquals(TurnState.COMPLETED.name(), committed.state);
+        assertEquals(Long.valueOf(200L), committed.completedAt);
+        assertEquals(result.visibleGroupId, committed.visibleGroupId);
+        assertEquals(result.authorityLineageKey, committed.authorityLineageKey);
+        assertEquals(Long.valueOf(2L), committed.lineageRevision);
+        assertEquals(Long.valueOf(4L), committed.turnRevision);
+        assertEquals(Long.valueOf(8L), committed.laneRevision);
+        assertEquals("pc", committed.authorityOrigin);
+        assertEquals(result.commitPayloadVersion, committed.commitPayloadVersion);
+        assertEquals(result.generationFingerprint, committed.generationFingerprint);
+        assertEquals(result.releaseId, committed.pipelineReleaseId);
+        assertEquals(Long.valueOf(result.inputVisibilitySequence),
+            committed.inputVisibilitySequence);
+        assertEquals(Long.valueOf(result.inputClearEpoch), committed.inputClearEpoch);
+        assertEquals(result.commitChecksum, committed.bridgeCommitChecksum);
+        assertEquals("visible", committed.terminalDisposition);
+
+        java.util.List<ReplyPartEntity> storedParts = store.replyParts(localTurnId);
+        assertEquals(3, storedParts.size());
+        for (int ordinal = 0; ordinal < 3; ordinal += 1) {
+            JSONObject canonicalItem = new JSONObject(result.replyPartsJson.get(ordinal));
+            ReplyPartEntity part = storedParts.get(ordinal);
+            assertEquals(canonicalItem.getString("messageId"), part.replyPartId);
+            assertEquals(attempt.attemptId, part.attemptId);
+            assertEquals(ordinal, part.sequence);
+            assertEquals("TEXT", part.type);
+            assertEquals(canonicalItem.getString("content"), part.content);
+            assertEquals(BridgeAuthority.canonicalJson(new JSONObject()
+                .put("version", 1)
+                .put("canonicalItem", canonicalItem)), part.payloadJson);
+            assertEquals(200L, part.createdAt);
+
+            RawMessageEntity raw = database.executionDao().rawMessage(part.replyPartId);
+            assertEquals(canonicalItem.getString("messageId"), raw.messageId);
+            assertEquals(result.authoritativeTurnId, raw.turnId);
+            assertEquals(result.roleId, raw.characterId);
+            assertEquals(canonicalItem.getString("speakerId"), raw.speakerId);
+            assertEquals(canonicalItem.getString("speakerType"), raw.speakerType);
+            assertEquals(canonicalItem.getString("recipientId"), raw.recipientId);
+            assertEquals(canonicalItem.getString("content"), raw.content);
+            assertEquals(checkpoint.getJSONObject("normalizedEnvelope").getLong("createdAt") + ordinal,
+                raw.sentAt);
+            assertEquals("pc", raw.origin);
+            assertEquals("pc-group:" + result.visibleGroupId, raw.deviceId);
+            assertEquals(ordinal + 1L, raw.deviceSeq);
+            assertEquals(0L, raw.syncSeq);
+            assertEquals(RoomExecutionStore.canonicalRawMessageChecksum(raw), raw.checksum);
+        }
+
+        ConversationAuthorityEntity authority = database.executionDao().conversationAuthority(
+            result.authorityLineageKey);
+        assertEquals("COMMITTED", authority.state);
+        assertEquals(result.authoritativeTurnId, authority.latestTurnId);
+        assertEquals(2L, authority.revision);
+        ConversationCursorEntity cursor = store.getConversationCursor("yuqi");
+        assertEquals(localTurnId, cursor.nativeCompletedTurnId);
+        assertEquals(result.visibleGroupId, cursor.nativeCompletedGroupId);
+        assertEquals(result.inputVisibilitySequence, cursor.nativeCompletedSequence);
+        assertEquals(0L, cursor.uiAppliedSequence);
+
+        JSONObject storedCheckpoint = new JSONObject(
+            database.executionDao().attempt(attempt.attemptId).bridgeAuthorityCheckpointJson);
+        assertEquals(prepared.authoritativeTurnId,
+            storedCheckpoint.getString("authoritativeTurnId"));
+        assertEquals("committed", storedCheckpoint.getJSONObject("outcome").getString("type"));
+        assertEquals(result.authoritativeTurnId,
+            storedCheckpoint.getJSONObject("outcome").getJSONObject("result").getString("turnId"));
+
+        long changes = rowCount("change_events");
+        RoomExecutionStore restarted = new RoomExecutionStore(database);
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            restarted.commitBridgedTerminal(localTurnId, attempt.attemptId, result, 999L));
+        assertEquals(3, restarted.replyParts(localTurnId).size());
+        assertEquals(changes, rowCount("change_events"));
+        assertEquals(Long.valueOf(200L), store.turn(localTurnId).completedAt);
+        BridgeResult changedRoute = BridgeTurnStatus.parseV3(
+            canonicalTerminal(checkpoint, "visible", 3, new JSONArray()).toString(),
+            "cloud", "relay-changed-route");
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            localTurnId, attempt.attemptId, changedRoute, 1000L));
+        JSONObject changedReceiptWire = canonicalTerminal(
+            checkpoint, "visible", 3, new JSONArray());
+        changedReceiptWire.put("commitChecksum",
+            "0000000000000000000000000000000000000000000000000000000000000000");
+        BridgeResult changedReceipt = BridgeTurnStatus.parseV3(
+            changedReceiptWire.toString(), "lan", null);
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            localTurnId, attempt.attemptId, changedReceipt, 1001L));
+        assertEquals(3, store.replyParts(localTurnId).size());
+        assertEquals(changes, rowCount("change_events"));
+    }
+
+    @Test
+    public void canonicalActionOnlyAndAutomaticSkipUseDistinctClosedProjectionsAndCursors()
+        throws Exception {
+        String actionTurnId = "local-v3-action-only";
+        store.submitTurn(yuqiThreeBubbleSubmission(actionTurnId, "msg-action-only-3", 220L));
+        TurnSubmission actionPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(actionTurnId), "device_gateway", 221L);
+        JSONObject actionCheckpoint = new JSONObject(actionPrepared.bridgeAuthorityCheckpointJson);
+        JSONArray actions = new JSONArray()
+            .put(canonicalAction(actionCheckpoint, 0, "payment_accept",
+                "payment:msg-payment", "rev-payment", new JSONObject().put("messageId", "msg-payment")))
+            .put(canonicalAction(actionCheckpoint, 1, "role_plan_create",
+                "role-plan:plan-1", "rev-plan", new JSONObject().put("planId", "plan-1")));
+        BridgeResult actionResult = BridgeTurnStatus.parseV3(
+            canonicalTerminal(actionCheckpoint, "action_only", 0, actions).toString(), "lan", null);
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitBridgedTerminal(
+                actionTurnId, store.activeAttempt(actionTurnId).attemptId, actionResult, 230L));
+        java.util.List<ReplyPartEntity> actionParts = store.replyParts(actionTurnId);
+        assertEquals(2, actionParts.size());
+        assertEquals("PAYMENT_STATUS", actionParts.get(0).type);
+        assertEquals("PLAN", actionParts.get(1).type);
+        assertEquals("", actionParts.get(0).content);
+        assertEquals(0, database.executionDao().canonicalCharacterMessages(
+            actionResult.authoritativeTurnId).size());
+        ConversationCursorEntity afterAction = store.getConversationCursor("yuqi");
+        assertEquals(actionTurnId, afterAction.nativeCompletedTurnId);
+        assertEquals(actionResult.visibleGroupId, afterAction.nativeCompletedGroupId);
+        assertEquals(0L, afterAction.uiAppliedSequence);
+
+        String rejectedSkipTurnId = "local-v3-direct-skip";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            rejectedSkipTurnId, "msg-direct-skip-3", 235L));
+        TurnSubmission rejectedSkipPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(rejectedSkipTurnId), "device_gateway", 236L);
+        JSONObject rejectedSkipCheckpoint = new JSONObject(
+            rejectedSkipPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult rejectedSkip = BridgeTurnStatus.parseV3(
+            canonicalTerminal(
+                rejectedSkipCheckpoint, "skip", 0, new JSONArray()).toString(),
+            "lan", null);
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            rejectedSkipTurnId, store.activeAttempt(rejectedSkipTurnId).attemptId,
+            rejectedSkip, 237L));
+        assertEquals(TurnState.QUEUED.name(), store.turn(rejectedSkipTurnId).state);
+        assertEquals(0, store.replyParts(rejectedSkipTurnId).size());
+
+        String skipTurnId = "local-v3-skip";
+        store.submitTurn(yuqiAutomaticSubmission(skipTurnId, 240L));
+        TurnSubmission skipPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(skipTurnId), "device_gateway", 241L);
+        JSONObject skipCheckpoint = new JSONObject(skipPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult skipResult = BridgeTurnStatus.parseV3(
+            canonicalTerminal(skipCheckpoint, "skip", 0, new JSONArray()).toString(), "lan", null);
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitBridgedTerminal(
+                skipTurnId, store.activeAttempt(skipTurnId).attemptId, skipResult, 250L));
+        ChatTurnEntity skipped = store.turn(skipTurnId);
+        assertEquals(TurnState.COMPLETED.name(), skipped.state);
+        assertEquals(Long.valueOf(250L), skipped.uiAppliedAt);
+        assertEquals(0, store.replyParts(skipTurnId).size());
+        ConversationCursorEntity afterSkip = store.getConversationCursor("yuqi");
+        assertEquals(skipTurnId, afterSkip.nativeCompletedTurnId);
+        assertEquals(skipTurnId, afterSkip.uiAppliedTurnId);
+        assertEquals(skipResult.visibleGroupId, afterSkip.nativeCompletedGroupId);
+        assertEquals(skipResult.visibleGroupId, afterSkip.uiAppliedGroupId);
+        assertEquals(skipResult.inputVisibilitySequence, afterSkip.nativeCompletedSequence);
+        assertEquals(skipResult.inputVisibilitySequence, afterSkip.uiAppliedSequence);
+    }
+
+    @Test
+    public void oldEpochCanonicalTerminalStoresOnlyMetadataAndNeverMovesCursors()
+        throws Exception {
+        String localTurnId = "local-v3-redacted";
+        store.submitTurn(yuqiThreeBubbleSubmission(localTurnId, "msg-redacted-3", 260L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 261L);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalTerminal(checkpoint, "visible", 2, new JSONArray()).toString(), "lan", null);
+        store.markConversationCleared("yuqi", 0L, 1L, 270L);
+        ConversationCursorEntity before = store.getConversationCursor("yuqi");
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.REDACTED,
+            store.commitBridgedTerminal(
+                localTurnId, store.activeAttempt(localTurnId).attemptId, result, 280L));
+        ChatTurnEntity redacted = store.turn(localTurnId);
+        assertEquals(TurnState.COMPLETED.name(), redacted.state);
+        assertEquals(Long.valueOf(280L), redacted.deletedAt);
+        assertEquals(null, redacted.uiAppliedAt);
+        assertEquals("visible", redacted.terminalDisposition);
+        assertEquals(0, store.replyParts(localTurnId).size());
+        assertEquals(0, database.executionDao().canonicalCharacterMessages(
+            result.authoritativeTurnId).size());
+        ConversationCursorEntity after = store.getConversationCursor("yuqi");
+        assertEquals(before.localSequence, after.localSequence);
+        assertEquals(before.nativeCompletedSequence, after.nativeCompletedSequence);
+        assertEquals(before.uiAppliedSequence, after.uiAppliedSequence);
+        JSONObject storedCheckpoint = new JSONObject(
+            database.executionDao().attempt(store.turn(localTurnId).activeAttemptId)
+                .bridgeAuthorityCheckpointJson);
+        JSONObject outcome = storedCheckpoint.getJSONObject("outcome");
+        assertEquals("redacted", outcome.getString("type"));
+        assertEquals(17, outcome.getJSONObject("result").length());
+        assertEquals(false, outcome.getJSONObject("result").has("replyParts"));
+        assertEquals(false, outcome.getJSONObject("result").has("actions"));
+        assertEquals(RoomExecutionStore.DeliveryDisposition.REDACTED,
+            store.commitBridgedTerminal(
+                localTurnId, store.activeAttempt(localTurnId).attemptId, result, 999L));
+        JSONObject changedReceiptWire = canonicalTerminal(
+            checkpoint, "visible", 2, new JSONArray());
+        changedReceiptWire.put("commitChecksum",
+            "0000000000000000000000000000000000000000000000000000000000000000");
+        BridgeResult changedReceipt = BridgeTurnStatus.parseV3(
+            changedReceiptWire.toString(), "lan", null);
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            localTurnId, store.activeAttempt(localTurnId).attemptId, changedReceipt, 1000L));
+        assertEquals(0, store.replyParts(localTurnId).size());
+    }
+
+    @Test
+    public void verifiedRemoteFailureIsMetadataOnlyIdempotentAndNeverAdvancesAuthorityOrCursor()
+        throws Exception {
+        String localTurnId = "local-v3-verified-failure";
+        store.submitTurn(yuqiThreeBubbleSubmission(localTurnId, "msg-failure-3", 300L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 301L);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        JSONObject failureWire = canonicalFailure(checkpoint, true, 302L);
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            failureWire.toString(), "cloud", "relay-failure-1");
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        ConversationAuthorityEntity beforeAuthority = database.executionDao().conversationAuthority(
+            checkpoint.getString("authorityLineageKey"));
+        ConversationCursorEntity beforeCursor = store.getConversationCursor("yuqi");
+
+        store.commitVerifiedRemoteFailure(localTurnId, attempt.attemptId, result, 303L);
+
+        ChatTurnEntity failed = store.turn(localTurnId);
+        assertEquals(TurnState.FAILED_RETRYABLE.name(), failed.state);
+        assertEquals(null, failed.visibleGroupId);
+        assertEquals(0, store.replyParts(localTurnId).size());
+        ConversationAuthorityEntity afterAuthority = database.executionDao().conversationAuthority(
+            checkpoint.getString("authorityLineageKey"));
+        assertEquals("OPEN", afterAuthority.state);
+        assertEquals(beforeAuthority.revision, afterAuthority.revision);
+        ConversationCursorEntity afterCursor = store.getConversationCursor("yuqi");
+        assertEquals(beforeCursor.localSequence, afterCursor.localSequence);
+        assertEquals(beforeCursor.nativeCompletedSequence, afterCursor.nativeCompletedSequence);
+        assertEquals(1L, rowCount("diagnostics") - 1L);
+        long changes = rowCount("change_events");
+        long diagnostics = rowCount("diagnostics");
+        store.commitVerifiedRemoteFailure(localTurnId, attempt.attemptId, result, 999L);
+        assertEquals(changes, rowCount("change_events"));
+        assertEquals(diagnostics, rowCount("diagnostics"));
+
+        BridgeResult changedRoute = BridgeTurnStatus.parseV3(
+            failureWire.toString(), "cloud", "relay-failure-changed");
+        assertThrows(IllegalStateException.class, () -> store.commitVerifiedRemoteFailure(
+            localTurnId, attempt.attemptId, changedRoute, 1000L));
+
+        JSONObject changedFailure = canonicalFailure(checkpoint, false, 302L);
+        BridgeResult changed = BridgeTurnStatus.parseV3(
+            changedFailure.toString(), "cloud", "relay-failure-1");
+        assertThrows(IllegalStateException.class, () -> store.commitVerifiedRemoteFailure(
+            localTurnId, attempt.attemptId, changed, 304L));
+    }
+
+    @Test
+    public void everyCanonicalTerminalFaultBoundaryRollsBackTheWholeOuterTransaction()
+        throws Exception {
+        String localTurnId = "local-v3-terminal-faults";
+        store.submitTurn(yuqiThreeBubbleSubmission(localTurnId, "msg-faults-3", 330L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 331L);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        JSONArray actions = new JSONArray().put(canonicalAction(
+            checkpoint, 0, "role_plan_create", "role-plan:fault-plan", "rev-fault-plan",
+            new JSONObject().put("planId", "fault-plan")));
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalTerminal(checkpoint, "visible", 2, actions).toString(), "lan", null);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        long changes = rowCount("change_events");
+        long diagnostics = rowCount("diagnostics");
+        String[] boundaries = new String[]{
+            RoomExecutionStore.FAULT_CHECKPOINT,
+            RoomExecutionStore.FAULT_REPLY_PARTS,
+            RoomExecutionStore.FAULT_RAW_MESSAGES,
+            RoomExecutionStore.FAULT_AUTHORITY,
+            RoomExecutionStore.FAULT_TURN,
+            RoomExecutionStore.FAULT_ATTEMPT,
+            RoomExecutionStore.FAULT_NATIVE_CURSOR,
+            RoomExecutionStore.FAULT_CHANGE
+        };
+        for (String boundary : boundaries) {
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> faulted.commitBridgedTerminal(
+                localTurnId, attempt.attemptId, result, 340L));
+            assertOpenCanonicalAttemptAfterRollback(
+                localTurnId, attempt.attemptId, checkpoint, changes, diagnostics);
+        }
+
+        String actionTurnId = "local-v3-action-fault";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            actionTurnId, "msg-action-fault-3", 345L));
+        TurnSubmission actionPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(actionTurnId), "device_gateway", 346L);
+        JSONObject actionCheckpoint = new JSONObject(actionPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult actionOnly = BridgeTurnStatus.parseV3(
+            canonicalTerminal(
+                actionCheckpoint,
+                "action_only",
+                0,
+                new JSONArray().put(canonicalAction(
+                    actionCheckpoint,
+                    0,
+                    "role_plan_create",
+                    "role-plan:action-fault",
+                    "rev-action-fault",
+                    new JSONObject().put("planId", "action-fault")
+                ))
+            ).toString(),
+            "lan",
+            null
+        );
+        String actionAttemptId = store.activeAttempt(actionTurnId).attemptId;
+        long actionChanges = rowCount("change_events");
+        long actionDiagnostics = rowCount("diagnostics");
+        String[] actionBoundaries = new String[]{
+            RoomExecutionStore.FAULT_CHECKPOINT,
+            RoomExecutionStore.FAULT_REPLY_PARTS,
+            RoomExecutionStore.FAULT_AUTHORITY,
+            RoomExecutionStore.FAULT_TURN,
+            RoomExecutionStore.FAULT_ATTEMPT,
+            RoomExecutionStore.FAULT_NATIVE_CURSOR,
+            RoomExecutionStore.FAULT_CHANGE
+        };
+        for (String boundary : actionBoundaries) {
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> faulted.commitBridgedTerminal(
+                actionTurnId, actionAttemptId, actionOnly, 349L));
+            assertOpenCanonicalAttemptAfterRollback(
+                actionTurnId, actionAttemptId, actionCheckpoint,
+                actionChanges, actionDiagnostics);
+        }
+
+        String skipTurnId = "local-v3-skip-fault";
+        store.submitTurn(yuqiAutomaticSubmission(skipTurnId, 350L));
+        TurnSubmission skipPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(skipTurnId), "device_gateway", 351L);
+        JSONObject skipCheckpoint = new JSONObject(skipPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult skip = BridgeTurnStatus.parseV3(
+            canonicalTerminal(skipCheckpoint, "skip", 0, new JSONArray()).toString(), "lan", null);
+        String skipAttemptId = store.activeAttempt(skipTurnId).attemptId;
+        long skipChanges = rowCount("change_events");
+        long skipDiagnostics = rowCount("diagnostics");
+        String[] skipBoundaries = new String[]{
+            RoomExecutionStore.FAULT_CHECKPOINT,
+            RoomExecutionStore.FAULT_AUTHORITY,
+            RoomExecutionStore.FAULT_TURN,
+            RoomExecutionStore.FAULT_ATTEMPT,
+            RoomExecutionStore.FAULT_NATIVE_CURSOR,
+            RoomExecutionStore.FAULT_UI_CURSOR,
+            RoomExecutionStore.FAULT_CHANGE
+        };
+        for (String boundary : skipBoundaries) {
+            RoomExecutionStore skipFaulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> skipFaulted.commitBridgedTerminal(
+                skipTurnId, skipAttemptId, skip, 360L));
+            assertOpenCanonicalAttemptAfterRollback(
+                skipTurnId, skipAttemptId, skipCheckpoint, skipChanges, skipDiagnostics);
+        }
+
+        String redactedTurnId = "local-v3-redacted-fault";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            redactedTurnId, "msg-redacted-fault-3", 370L));
+        TurnSubmission redactedPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(redactedTurnId), "device_gateway", 371L);
+        JSONObject redactedCheckpoint = new JSONObject(
+            redactedPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult redacted = BridgeTurnStatus.parseV3(
+            canonicalTerminal(redactedCheckpoint, "visible", 1, new JSONArray()).toString(),
+            "lan", null);
+        store.markConversationCleared("yuqi", 0L,
+            redactedCheckpoint.getLong("inputClearEpoch") + 1L, 372L);
+        String redactedAttemptId = store.activeAttempt(redactedTurnId).attemptId;
+        long redactedChanges = rowCount("change_events");
+        long redactedDiagnostics = rowCount("diagnostics");
+        String[] redactedBoundaries = new String[]{
+            RoomExecutionStore.FAULT_CHECKPOINT,
+            RoomExecutionStore.FAULT_AUTHORITY,
+            RoomExecutionStore.FAULT_TURN,
+            RoomExecutionStore.FAULT_ATTEMPT,
+            RoomExecutionStore.FAULT_CHANGE
+        };
+        for (String boundary : redactedBoundaries) {
+            RoomExecutionStore redactedFaulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> redactedFaulted.commitBridgedTerminal(
+                redactedTurnId, redactedAttemptId, redacted, 380L));
+            assertOpenCanonicalAttemptAfterRollback(
+                redactedTurnId, redactedAttemptId, redactedCheckpoint,
+                redactedChanges, redactedDiagnostics);
+        }
+    }
+
+    @Test
+    public void everyVerifiedFailureFaultBoundaryRollsBackCheckpointTurnAttemptAndAudits()
+        throws Exception {
+        String localTurnId = "local-v3-failure-faults";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            localTurnId, "msg-failure-faults-3", 400L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 401L);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalFailure(checkpoint, true, 402L).toString(),
+            "cloud", "relay-failure-faults");
+        String attemptId = store.activeAttempt(localTurnId).attemptId;
+        long changes = rowCount("change_events");
+        long diagnostics = rowCount("diagnostics");
+        String[] boundaries = new String[]{
+            RoomExecutionStore.FAULT_FAILURE_CHECKPOINT,
+            RoomExecutionStore.FAULT_FAILURE_TURN,
+            RoomExecutionStore.FAULT_FAILURE_ATTEMPT,
+            RoomExecutionStore.FAULT_FAILURE_CHANGE,
+            RoomExecutionStore.FAULT_FAILURE_DIAGNOSTIC
+        };
+        for (String boundary : boundaries) {
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> faulted.commitVerifiedRemoteFailure(
+                localTurnId, attemptId, result, 410L));
+            assertOpenCanonicalAttemptAfterRollback(
+                localTurnId, attemptId, checkpoint, changes, diagnostics);
+        }
+    }
+
+    @Test
+    public void activeRemoteChildCanFinishFromAnEarlierReceiptMemberWithoutRewritingItsIdentity()
+        throws Exception {
+        String localTurnId = "local-v3-earlier-receipt";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            localTurnId, "msg-earlier-receipt-3", 430L));
+        TurnSubmission parent = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 431L);
+        JSONObject parentCheckpoint = new JSONObject(parent.bridgeAuthorityCheckpointJson);
+        ExecutionAttemptEntity parentAttempt = store.activeAttempt(localTurnId);
+        BridgeResult verifiedFailure = BridgeTurnStatus.parseV3(
+            canonicalFailure(parentCheckpoint, true, 432L).toString(),
+            "cloud", "relay-earlier-parent-failure");
+        store.commitVerifiedRemoteFailure(
+            localTurnId, parentAttempt.attemptId, verifiedFailure, 433L);
+
+        ExecutionAttemptEntity childAttempt = store.startRetry(localTurnId, 434L);
+        TurnSubmission child = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 435L);
+        JSONObject childCheckpoint = new JSONObject(child.bridgeAuthorityCheckpointJson);
+        assertNotEquals(parent.authoritativeTurnId, child.authoritativeTurnId);
+        assertEquals(parent.authoritativeTurnId, childCheckpoint.getString("retryOfTurnId"));
+        assertEquals(2L, childCheckpoint.getLong("claimedLineageRevision"));
+
+        BridgeResult parentReceipt = BridgeTurnStatus.parseV3(
+            canonicalTerminal(parentCheckpoint, "visible", 1, new JSONArray()).toString(),
+            "lan", null);
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitBridgedTerminal(
+                localTurnId, childAttempt.attemptId, parentReceipt, 440L));
+
+        JSONObject storedChildCheckpoint = new JSONObject(
+            database.executionDao().attempt(childAttempt.attemptId)
+                .bridgeAuthorityCheckpointJson);
+        assertEquals(child.authoritativeTurnId,
+            storedChildCheckpoint.getString("authoritativeTurnId"));
+        assertEquals(parent.authoritativeTurnId,
+            storedChildCheckpoint.getJSONObject("outcome")
+                .getJSONObject("result").getString("turnId"));
+        ConversationAuthorityEntity authority = database.executionDao().conversationAuthority(
+            parentReceipt.authorityLineageKey);
+        assertEquals(parent.authoritativeTurnId, authority.latestTurnId);
+        assertEquals(parentReceipt.lineageRevision, authority.revision);
+        ConversationCursorEntity cursor = store.getConversationCursor("yuqi");
+        assertEquals(2L, cursor.localSequence);
+        assertEquals(1L, cursor.nativeCompletedSequence);
+        assertEquals(localTurnId, cursor.nativeCompletedTurnId);
+        assertEquals(parentReceipt.visibleGroupId, cursor.nativeCompletedGroupId);
+        assertEquals(parent.authoritativeTurnId,
+            database.executionDao().canonicalCharacterMessages(
+                parent.authoritativeTurnId).get(0).turnId);
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitBridgedTerminal(
+                localTurnId, childAttempt.attemptId, parentReceipt, 999L));
+    }
+
+    @Test
+    public void canonicalCursorIsArrivalOrderIndependentAndEqualSequenceIdentityConflicts()
+        throws Exception {
+        String olderTurnId = "local-v3-arrival-old";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            olderTurnId, "msg-arrival-old-3", 460L));
+        TurnSubmission olderPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(olderTurnId), "device_gateway", 461L);
+        JSONObject olderCheckpoint = new JSONObject(olderPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult older = BridgeTurnStatus.parseV3(
+            canonicalTerminal(olderCheckpoint, "visible", 1, new JSONArray()).toString(),
+            "lan", null);
+
+        String newerTurnId = "local-v3-arrival-new";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            newerTurnId, "msg-arrival-new-3", 470L));
+        TurnSubmission newerPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(newerTurnId), "device_gateway", 471L);
+        JSONObject newerCheckpoint = new JSONObject(newerPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult newer = BridgeTurnStatus.parseV3(
+            canonicalTerminal(newerCheckpoint, "visible", 1, new JSONArray()).toString(),
+            "lan", null);
+        assertTrue(newer.inputVisibilitySequence > older.inputVisibilitySequence);
+
+        store.commitBridgedTerminal(
+            newerTurnId, store.activeAttempt(newerTurnId).attemptId, newer, 480L);
+        store.commitBridgedTerminal(
+            olderTurnId, store.activeAttempt(olderTurnId).attemptId, older, 481L);
+        ConversationCursorEntity afterOutOfOrder = store.getConversationCursor("yuqi");
+        assertEquals(newer.inputVisibilitySequence, afterOutOfOrder.nativeCompletedSequence);
+        assertEquals(newerTurnId, afterOutOfOrder.nativeCompletedTurnId);
+        assertEquals(newer.visibleGroupId, afterOutOfOrder.nativeCompletedGroupId);
+
+        String conflictTurnId = "local-v3-equal-cursor-conflict";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            conflictTurnId, "msg-equal-conflict-3", 490L));
+        TurnSubmission conflictPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(conflictTurnId), "device_gateway", 491L);
+        JSONObject conflictCheckpoint = new JSONObject(
+            conflictPrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult conflict = BridgeTurnStatus.parseV3(
+            canonicalTerminal(conflictCheckpoint, "visible", 1, new JSONArray()).toString(),
+            "lan", null);
+        store.markNativeCompleted(
+            "yuqi", "foreign-local-turn", "grp_foreign",
+            conflict.inputVisibilitySequence, 492L);
+        long changes = rowCount("change_events");
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            conflictTurnId, store.activeAttempt(conflictTurnId).attemptId, conflict, 493L));
+        assertEquals(TurnState.QUEUED.name(), store.turn(conflictTurnId).state);
+        assertEquals(0, store.replyParts(conflictTurnId).size());
+        assertEquals(changes, rowCount("change_events"));
+        ConversationCursorEntity afterConflict = store.getConversationCursor("yuqi");
+        assertEquals("foreign-local-turn", afterConflict.nativeCompletedTurnId);
+        assertEquals("grp_foreign", afterConflict.nativeCompletedGroupId);
+    }
+
+    @Test
+    public void canonicalCharacterProjectionRejectsMessageAndDeviceSequenceCollisionsBeforeWrites()
+        throws Exception {
+        String messageCollisionTurnId = "local-v3-message-collision";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            messageCollisionTurnId, "msg-message-collision-3", 510L));
+        TurnSubmission messagePrepared = store.prepareBridgeSubmission(
+            persistedSubmission(messageCollisionTurnId), "device_gateway", 511L);
+        JSONObject messageCheckpoint = new JSONObject(messagePrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult messageResult = BridgeTurnStatus.parseV3(
+            canonicalTerminal(messageCheckpoint, "visible", 1, new JSONArray()).toString(),
+            "lan", null);
+        JSONObject canonicalItem = new JSONObject(messageResult.replyPartsJson.get(0));
+        RawMessageEntity occupiedMessage = foreignRawMessage(
+            canonicalItem.getString("messageId"), "foreign-message-turn",
+            "foreign-device", 1L, 500L);
+        database.executionDao().insertRawMessage(occupiedMessage);
+        long messageChanges = rowCount("change_events");
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            messageCollisionTurnId, store.activeAttempt(messageCollisionTurnId).attemptId,
+            messageResult, 512L));
+        assertEquals(TurnState.QUEUED.name(), store.turn(messageCollisionTurnId).state);
+        assertEquals(0, store.replyParts(messageCollisionTurnId).size());
+        assertEquals(messageChanges, rowCount("change_events"));
+
+        String sequenceCollisionTurnId = "local-v3-sequence-collision";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            sequenceCollisionTurnId, "msg-sequence-collision-3", 520L));
+        TurnSubmission sequencePrepared = store.prepareBridgeSubmission(
+            persistedSubmission(sequenceCollisionTurnId), "device_gateway", 521L);
+        JSONObject sequenceCheckpoint = new JSONObject(sequencePrepared.bridgeAuthorityCheckpointJson);
+        BridgeResult sequenceResult = BridgeTurnStatus.parseV3(
+            canonicalTerminal(sequenceCheckpoint, "visible", 1, new JSONArray()).toString(),
+            "lan", null);
+        RawMessageEntity occupiedSequence = foreignRawMessage(
+            "foreign-message-id", "foreign-sequence-turn",
+            "pc-group:" + sequenceResult.visibleGroupId, 1L, 501L);
+        database.executionDao().insertRawMessage(occupiedSequence);
+        long sequenceChanges = rowCount("change_events");
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            sequenceCollisionTurnId, store.activeAttempt(sequenceCollisionTurnId).attemptId,
+            sequenceResult, 522L));
+        assertEquals(TurnState.QUEUED.name(), store.turn(sequenceCollisionTurnId).state);
+        assertEquals(0, store.replyParts(sequenceCollisionTurnId).size());
+        assertEquals(sequenceChanges, rowCount("change_events"));
+    }
+
+    @Test
+    public void everyRegisteredCanonicalActionUsesItsExactCompatibilityProjection()
+        throws Exception {
+        String[] kinds = new String[]{
+            "payment_accept", "payment_decline", "moment_create", "moment_like",
+            "moment_comment", "moment_reply", "role_plan_create", "role_plan_update",
+            "role_plan_cancel", "role_plan_pause", "role_plan_resume", "role_plan_complete",
+            "life_episode_create", "life_episode_update", "life_episode_cancel",
+            "relationship_transition"
+        };
+        String[] types = new String[]{
+            "PAYMENT_STATUS", "PAYMENT_STATUS", "MOMENT_CREATE", "MOMENT_ACTION",
+            "MOMENT_ACTION", "MOMENT_ACTION", "PLAN", "PLAN", "PLAN", "PLAN", "PLAN",
+            "PLAN", "LIFE_EPISODE", "LIFE_ADJUSTMENT", "LIFE_ADJUSTMENT",
+            "RELATIONSHIP_STAGE"
+        };
+        for (int index = 0; index < kinds.length; index += 1) {
+            String turnId = "local-v3-action-map-" + index;
+            store.submitTurn(yuqiThreeBubbleSubmission(
+                turnId, "msg-action-map-" + index + "-3", 600L + index * 10L));
+            TurnSubmission prepared = store.prepareBridgeSubmission(
+                persistedSubmission(turnId), "device_gateway", 601L + index * 10L);
+            JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+            JSONObject payload = actionPayload(kinds[index], index);
+            JSONObject canonicalAction = canonicalAction(
+                checkpoint, 0, kinds[index], "target:" + index, "revision:" + index, payload);
+            BridgeResult result = BridgeTurnStatus.parseV3(
+                canonicalTerminal(checkpoint, "action_only", 0,
+                    new JSONArray().put(canonicalAction)).toString(), "lan", null);
+
+            store.commitBridgedTerminal(
+                turnId, store.activeAttempt(turnId).attemptId, result, 605L + index * 10L);
+            ReplyPartEntity row = store.replyParts(turnId).get(0);
+            assertEquals(types[index], row.type);
+            assertEquals("", row.content);
+            JSONObject wrapper = new JSONObject(row.payloadJson);
+            assertEquals(3, wrapper.length());
+            assertEquals(1, wrapper.getInt("version"));
+            assertEquals(
+                BridgeAuthority.canonicalJson(canonicalAction),
+                BridgeAuthority.canonicalJson(wrapper.getJSONObject("canonicalAction")));
+            JSONObject legacy = wrapper.getJSONObject("legacyPayload");
+            if (kinds[index].startsWith("payment_")) {
+                assertEquals(kinds[index].equals("payment_accept") ? "received" : "refused",
+                    legacy.getString("status"));
+                assertEquals(1, legacy.length());
+            } else if (kinds[index].startsWith("role_plan_")) {
+                assertEquals(1, legacy.length());
+                assertEquals(BridgeAuthority.canonicalJson(payload),
+                    BridgeAuthority.canonicalJson(legacy.getJSONArray("operations").getJSONObject(0)));
+            } else {
+                assertEquals(BridgeAuthority.canonicalJson(payload),
+                    BridgeAuthority.canonicalJson(legacy));
+            }
+            assertEquals(0, database.executionDao().canonicalCharacterMessages(
+                result.authoritativeTurnId).size());
+        }
+
+        String duplicateTurnId = "local-v3-action-map-duplicate";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            duplicateTurnId, "msg-action-map-duplicate-3", 800L));
+        TurnSubmission duplicatePrepared = store.prepareBridgeSubmission(
+            persistedSubmission(duplicateTurnId), "device_gateway", 801L);
+        JSONObject duplicateCheckpoint = new JSONObject(
+            duplicatePrepared.bridgeAuthorityCheckpointJson);
+        JSONArray duplicateActions = new JSONArray()
+            .put(canonicalAction(duplicateCheckpoint, 0, "payment_accept",
+                "payment:first", "revision:first", new JSONObject().put("messageId", "first")))
+            .put(canonicalAction(duplicateCheckpoint, 1, "payment_decline",
+                "payment:second", "revision:second", new JSONObject().put("messageId", "second")));
+        BridgeResult duplicate = BridgeTurnStatus.parseV3(
+            canonicalTerminal(
+                duplicateCheckpoint, "action_only", 0, duplicateActions).toString(),
+            "lan", null);
+        long duplicateChanges = rowCount("change_events");
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminal(
+            duplicateTurnId, store.activeAttempt(duplicateTurnId).attemptId,
+            duplicate, 802L));
+        assertEquals(TurnState.QUEUED.name(), store.turn(duplicateTurnId).state);
+        assertEquals(0, store.replyParts(duplicateTurnId).size());
+        assertEquals(duplicateChanges, rowCount("change_events"));
     }
 
     @Test
@@ -1024,6 +1729,91 @@ public class RoomExecutionStoreTest {
             .put("sentAt", sentAt);
     }
 
+    private static JSONObject canonicalTerminal(
+        JSONObject checkpoint,
+        String disposition,
+        int itemCount,
+        JSONArray actions
+    ) throws Exception {
+        String lineageKey = checkpoint.getString("authorityLineageKey");
+        String groupId = AuthorityIdentity.groupId(lineageKey);
+        JSONArray parts = new JSONArray();
+        for (int ordinal = 0; ordinal < itemCount; ordinal += 1) {
+            JSONObject semantic = new JSONObject()
+                .put("content", "虞栖回复第" + (ordinal + 1) + "泡")
+                .put("speakerId", "yuqi")
+                .put("speakerType", "character")
+                .put("recipientId", "user");
+            parts.put(new JSONObject(semantic.toString())
+                .put("messageId", AuthorityIdentity.messageId(groupId, ordinal))
+                .put("ordinal", ordinal)
+                .put("itemChecksum", BridgeAuthority.sha256CanonicalJson(semantic)));
+        }
+        return new JSONObject()
+            .put("protocolVersion", 3)
+            .put("turnId", checkpoint.getString("authoritativeTurnId"))
+            .put("roleId", "yuqi")
+            .put("authorityOrigin", "pc")
+            .put("authorityLineageKey", lineageKey)
+            .put("visibleGroupId", groupId)
+            .put("lineageRevision", checkpoint.getLong("claimedLineageRevision") + 1L)
+            .put("turnRevision", 4L)
+            .put("laneKey", checkpoint.getString("laneKey"))
+            .put("laneRevision", 8L)
+            .put("inputVisibilitySequence", checkpoint.getLong("inputVisibilitySequence"))
+            .put("inputClearEpoch", checkpoint.getLong("inputClearEpoch"))
+            .put("generationFingerprint", "fp_v3_terminal")
+            .put("releaseId", "cognition-v3")
+            .put("commitPayloadVersion", "pc-visible-commit-v2")
+            .put("commitChecksum", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .put("terminalDisposition", disposition)
+            .put("replyParts", parts)
+            .put("actions", actions);
+    }
+
+    private static JSONObject canonicalAction(
+        JSONObject checkpoint,
+        int ordinal,
+        String kind,
+        String targetKey,
+        String targetRevision,
+        JSONObject payload
+    ) throws Exception {
+        String groupId = AuthorityIdentity.groupId(
+            checkpoint.getString("authorityLineageKey"));
+        JSONObject semantic = new JSONObject()
+            .put("kind", kind)
+            .put("targetKey", targetKey)
+            .put("targetRevision", targetRevision)
+            .put("payload", payload);
+        return new JSONObject(semantic.toString())
+            .put("actionId", AuthorityIdentity.actionId(groupId, ordinal))
+            .put("ordinal", ordinal)
+            .put("actionChecksum", BridgeAuthority.sha256CanonicalJson(semantic));
+    }
+
+    private static JSONObject actionPayload(String kind, int index) throws Exception {
+        if (kind.startsWith("payment_")) {
+            return new JSONObject().put("messageId", "payment-message-" + index);
+        }
+        if (kind.startsWith("moment_")) {
+            JSONObject payload = new JSONObject().put("momentId", "moment-" + index);
+            if ("moment_reply".equals(kind)) {
+                payload.put("replyToCommentId", "comment-" + index);
+            }
+            return payload;
+        }
+        if (kind.startsWith("role_plan_")) {
+            return new JSONObject().put("planId", "plan-" + index);
+        }
+        if (kind.startsWith("life_episode_")) {
+            return "life_episode_create".equals(kind)
+                ? new JSONObject().put("title", "episode-" + index)
+                : new JSONObject().put("targetEpisodeId", "episode-" + index);
+        }
+        return new JSONObject().put("stageId", "stage-" + index);
+    }
+
     private static JSONObject canonicalFailure(
         JSONObject checkpoint,
         boolean retryAllowed,
@@ -1152,6 +1942,42 @@ public class RoomExecutionStoreTest {
             database.executionDao().conversationAuthority(lineage).revision);
     }
 
+    private void assertOpenCanonicalAttemptAfterRollback(
+        String turnId,
+        String attemptId,
+        JSONObject checkpoint,
+        long changeCount,
+        long diagnosticCount
+    ) throws Exception {
+        ChatTurnEntity turn = store.turn(turnId);
+        ExecutionAttemptEntity attempt = database.executionDao().attempt(attemptId);
+        assertEquals(TurnState.QUEUED.name(), turn.state);
+        assertEquals(null, turn.completedAt);
+        assertEquals(null, turn.visibleGroupId);
+        assertEquals(null, turn.bridgeCommitChecksum);
+        assertEquals(null, turn.deletedAt);
+        assertEquals(TurnState.QUEUED.name(), attempt.state);
+        assertEquals(
+            BridgeAuthority.canonicalJson(checkpoint),
+            attempt.bridgeAuthorityCheckpointJson);
+        assertEquals("open", new JSONObject(attempt.bridgeAuthorityCheckpointJson)
+            .getJSONObject("outcome").getString("type"));
+        ConversationAuthorityEntity authority = database.executionDao().conversationAuthority(
+            checkpoint.getString("authorityLineageKey"));
+        assertEquals("OPEN", authority.state);
+        assertEquals(checkpoint.getString("authoritativeTurnId"), authority.latestTurnId);
+        assertEquals(checkpoint.getLong("claimedLineageRevision"), authority.revision);
+        assertEquals(0, store.replyParts(turnId).size());
+        assertEquals(0, database.executionDao().canonicalCharacterMessages(
+            checkpoint.getString("authoritativeTurnId")).size());
+        ConversationCursorEntity cursor = store.getConversationCursor(turn.characterId);
+        assertEquals(checkpoint.getLong("inputVisibilitySequence"), cursor.localSequence);
+        assertEquals(0L, cursor.nativeCompletedSequence);
+        assertEquals(0L, cursor.uiAppliedSequence);
+        assertEquals(changeCount, rowCount("change_events"));
+        assertEquals(diagnosticCount, rowCount("diagnostics"));
+    }
+
     private void assertCurrentRetryPointerConflictIsReadOnly(
         String turnId,
         String lineage,
@@ -1238,5 +2064,29 @@ public class RoomExecutionStoreTest {
         part.payloadJson = "{}";
         part.createdAt = 4L;
         return part;
+    }
+
+    private static RawMessageEntity foreignRawMessage(
+        String messageId,
+        String turnId,
+        String deviceId,
+        long deviceSeq,
+        long sentAt
+    ) {
+        RawMessageEntity row = new RawMessageEntity();
+        row.messageId = messageId;
+        row.turnId = turnId;
+        row.characterId = "yuqi";
+        row.speakerId = "yuqi";
+        row.speakerType = "character";
+        row.recipientId = "user";
+        row.content = "foreign";
+        row.sentAt = sentAt;
+        row.origin = "pc";
+        row.deviceId = deviceId;
+        row.deviceSeq = deviceSeq;
+        row.syncSeq = 0L;
+        row.checksum = RoomExecutionStore.canonicalRawMessageChecksum(row);
+        return row;
     }
 }

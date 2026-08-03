@@ -61,10 +61,15 @@ public final class ExecutionEngine {
         try {
             JSONObject snapshot = new JSONObject(turn.snapshotJson);
             TurnState state = TurnState.valueOf(turn.state);
-            if ((state == TurnState.QUEUED || state == TurnState.MEMORY_RUNNING) && models instanceof TurnBridgeGateway
-                && ((TurnBridgeGateway) models).hasBridge()) {
-                processBridgedTurn(turn, attempt, (TurnBridgeGateway) models);
-                return;
+            if (state == TurnState.QUEUED || state == TurnState.MEMORY_RUNNING) {
+                if (models instanceof TurnBridgeGateway
+                    && ((TurnBridgeGateway) models).hasBridge()) {
+                    processBridgedTurn(turn, attempt, (TurnBridgeGateway) models);
+                    return;
+                }
+                if (turn.bridgeProtocolVersion != null && turn.bridgeProtocolVersion == 3) {
+                    throw new IllegalStateException("STORE_OWNED_V3_BRIDGE_UNAVAILABLE");
+                }
             }
             if (state == TurnState.QUEUED) {
                 store.markStage(turn.turnId, attempt.attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, clock.now());
@@ -127,6 +132,8 @@ public final class ExecutionEngine {
             } catch (StaleAttemptException ignored) {
                 // A terminal inbox result may win the race with this accepted checkpoint.
             }
+        } catch (CanonicalBridgeApplyException authorityFailure) {
+            throw authorityFailure.original;
         } catch (StaleAttemptException ignored) {
             // A newer retry owns this turn. The late attempt must not overwrite it.
         } catch (Exception error) {
@@ -164,6 +171,22 @@ public final class ExecutionEngine {
         String bridgeDeviceId = gateway.bridgeDeviceId();
         TurnSubmission prepared = store.prepareBridgeSubmission(submission, bridgeDeviceId, clock.now());
         BridgeResult result = gateway.executeBridgeTurn(prepared);
+        if (result.kind == BridgeResult.Kind.CANONICAL_TERMINAL) {
+            try {
+                store.commitBridgedTerminal(turn.turnId, attempt.attemptId, result, clock.now());
+            } catch (RuntimeException error) {
+                throw new CanonicalBridgeApplyException(error);
+            }
+            return;
+        }
+        if (result.kind == BridgeResult.Kind.VERIFIED_REMOTE_FAILURE) {
+            try {
+                store.commitVerifiedRemoteFailure(turn.turnId, attempt.attemptId, result, clock.now());
+            } catch (RuntimeException error) {
+                throw new CanonicalBridgeApplyException(error);
+            }
+            return;
+        }
         JSONObject checkpoint = new JSONObject()
             .put("origin", result.origin)
             .put("fallback", result.fallback)
@@ -256,6 +279,15 @@ public final class ExecutionEngine {
             throw new StaleAttemptException(turn.turnId, turn.activeAttemptId);
         }
         return attempt;
+    }
+
+    private static final class CanonicalBridgeApplyException extends RuntimeException {
+        final RuntimeException original;
+
+        CanonicalBridgeApplyException(RuntimeException original) {
+            super(original);
+            this.original = original;
+        }
     }
 
     private static String safeDetail(Throwable error) {

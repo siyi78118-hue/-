@@ -1,11 +1,13 @@
 package com.siyi.al.execution;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import com.siyi.al.execution.api.ParsedReply;
 import com.siyi.al.execution.api.ReplyParser;
 import com.siyi.al.execution.bridge.BridgeResult;
+import com.siyi.al.execution.bridge.BridgeTurnStatus;
 import com.siyi.al.execution.bridge.BridgeAcceptedException;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
@@ -74,6 +76,102 @@ public class ExecutionEngineTest {
 
         assertEquals("prepare,network", String.join(",", store.bridgePreparationEvents));
         assertEquals("device-from-gateway", store.preparedBridgeDeviceId);
+    }
+
+    @Test
+    public void parsedV3TerminalUsesOnlyTheCanonicalWriter() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        turn.kind = TurnKind.PROACTIVE_CHAT.name();
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        BridgeResult terminal = canonicalSkipResult("turn-1");
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) { return terminal; }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("legacy must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L).runNext());
+
+        assertEquals(Collections.singletonList("canonical-terminal"), store.events);
+    }
+
+    @Test
+    public void canonicalWriterConflictEscapesWithoutLegacyFailureOrCheckpointWrites() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        turn.kind = TurnKind.PROACTIVE_CHAT.name();
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        store.canonicalApplyFailure = new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT");
+        BridgeResult terminal = canonicalSkipResult("turn-1");
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) { return terminal; }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("legacy must not run");
+            }
+        };
+
+        assertThrows(IllegalStateException.class,
+            () -> new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L).runNext());
+        assertEquals(Collections.singletonList("canonical-terminal"), store.events);
+    }
+
+    @Test
+    public void parsedV3VerifiedFailureUsesOnlyTheCanonicalFailureWriter() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        BridgeResult failure = canonicalFailureResult("turn-1");
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) { return failure; }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("legacy must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(
+            store, gateway, new ReplyParser(), () -> 100L).runNext());
+
+        assertEquals(Collections.singletonList("canonical-failure"), store.events);
+    }
+
+    @Test
+    public void storeOwnedV3WithoutAnAvailableBridgeFailsWithoutEnteringLegacyModelsOrWriters()
+        throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        int[] legacyCalls = new int[]{0};
+        TurnBridgeGateway unavailable = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return false; }
+            @Override public String bridgeDeviceId() { throw new AssertionError("bridge identity must not be read"); }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                throw new AssertionError("bridge execution must not start");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                legacyCalls[0] += 1;
+                return "legacy must not run";
+            }
+        };
+
+        assertTrue(new ExecutionEngine(store, unavailable, new ReplyParser(), () -> 1500L).runNext());
+
+        assertEquals(0, legacyCalls[0]);
+        assertEquals(Collections.emptyList(), store.events);
+        assertTrue(TurnState.FAILED_RETRYABLE.name().equals(store.turn.state)
+            || TurnState.FAILED_FINAL.name().equals(store.turn.state));
+        assertEquals(0, store.replyParts.size());
     }
 
     @Test
@@ -375,6 +473,57 @@ public class ExecutionEngineTest {
         return new JSONObject().put("role", role).put("content", content);
     }
 
+    private static BridgeResult canonicalSkipResult(String turnId) throws Exception {
+        String lineageKey = "lin_engine";
+        JSONObject result = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("turnId", turnId)
+            .put("roleId", "yuqi")
+            .put("authorityOrigin", "pc")
+            .put("authorityLineageKey", lineageKey)
+            .put("visibleGroupId", AuthorityIdentity.groupId(lineageKey))
+            .put("lineageRevision", 2L)
+            .put("turnRevision", 4L)
+            .put("laneKey", "private_chat")
+            .put("laneRevision", 8L)
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("generationFingerprint", JSONObject.NULL)
+            .put("releaseId", "cognition-v3")
+            .put("commitPayloadVersion", "pc-visible-commit-v2")
+            .put("commitChecksum", String.join("", Collections.nCopies(64, "a")))
+            .put("terminalDisposition", "skip")
+            .put("replyParts", new JSONArray())
+            .put("actions", new JSONArray());
+        return BridgeTurnStatus.parseV3(result.toString(), "lan", null);
+    }
+
+    private static BridgeResult canonicalFailureResult(String turnId) throws Exception {
+        JSONObject failure = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "BACKLOG_FAILED")
+            .put("turnId", turnId)
+            .put("roleId", "yuqi")
+            .put("authorityLineageKey", "lin_engine")
+            .put("lineageRevision", 1L)
+            .put("turnRevision", 2L)
+            .put("laneKey", "private_chat")
+            .put("laneRevision", 3L)
+            .put("retryOfTurnId", JSONObject.NULL)
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("generationFingerprint", JSONObject.NULL)
+            .put("releaseId", "cognition-v3")
+            .put("state", "failed")
+            .put("errorCode", "YUQI_TRANSIENT_EXECUTION_FAILURE")
+            .put("failureClass", "transient")
+            .put("retryAllowed", true)
+            .put("failedAt", 99L);
+        failure.put("rawStatusChecksum", BridgeAuthority.sha256CanonicalJson(failure));
+        return BridgeTurnStatus.parseV3(
+            failure.toString(), "cloud", "relay-engine-failure");
+    }
+
     private static final class RecordingGateway implements ModelGateway {
         final List<String> calls = new ArrayList<>();
         final List<String> chatReplies = new ArrayList<>();
@@ -438,6 +587,7 @@ public class ExecutionEngineTest {
         final List<ReplyPartEntity> replyParts = new ArrayList<>();
         final List<String> bridgePreparationEvents = new ArrayList<>();
         String preparedBridgeDeviceId;
+        RuntimeException canonicalApplyFailure;
 
         FakeStore(ChatTurnEntity turn, ExecutionAttemptEntity attempt) {
             this.turn = turn;
@@ -462,6 +612,19 @@ public class ExecutionEngineTest {
             bridgePreparationEvents.add("prepare");
             preparedBridgeDeviceId = bridgeDeviceId;
             return submission;
+        }
+
+        @Override public RoomExecutionStore.DeliveryDisposition commitBridgedTerminal(
+            String turnId, String attemptId, BridgeResult result, long now) {
+            events.add("canonical-terminal");
+            if (canonicalApplyFailure != null) throw canonicalApplyFailure;
+            return RoomExecutionStore.DeliveryDisposition.APPLY;
+        }
+
+        @Override public void commitVerifiedRemoteFailure(
+            String turnId, String attemptId, BridgeResult result, long now) {
+            events.add("canonical-failure");
+            if (canonicalApplyFailure != null) throw canonicalApplyFailure;
         }
 
         @Override public void markStage(String turnId, String attemptId, TurnState state, AttemptStage stage, long now) {
