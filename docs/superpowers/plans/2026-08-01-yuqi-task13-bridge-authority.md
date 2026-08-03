@@ -829,6 +829,8 @@ git commit -m "feat: project canonical bridge results across transports"
 **Files:**
 
 - Modify: `android/app/src/main/java/com/siyi/al/execution/TurnSubmission.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/TurnBridgeGateway.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java`
 - Create: `android/app/src/main/java/com/siyi/al/execution/AuthorityIdentity.java`
 - Create: `android/app/src/main/java/com/siyi/al/execution/BridgeAuthority.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java`
@@ -860,11 +862,18 @@ git commit -m "feat: project canonical bridge results across transports"
 - Modify: `android/app/src/test/java/com/siyi/al/execution/AlNotificationPolicyTest.java`
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java`
+- Modify: `tests/fixtures/authority-identity-v1.json`
+- Modify: `tests/fixtures/canonical-failure-status-v1.json`
 - Modify: `tests/payment-batch-bridge-contract.test.mjs`
+- Modify: `yuqi-runtime/src/authority-identity.mjs`
+- Modify: `yuqi-runtime/test/bridge-authority-v3.test.mjs`
 
 **Interfaces:**
 
-- `ExecutionEngineStore.prepareBridgeSubmission(base, now) -> TurnSubmission`
+- `TurnBridgeGateway.bridgeDeviceId() -> String` returns the device identity from
+  the current bridge configuration used by the route. It is read before the
+  Room preparation transaction and never taken from input/snapshot JSON.
+- `ExecutionEngineStore.prepareBridgeSubmission(base, bridgeDeviceId, now) -> TurnSubmission`
   is a no-op for legacy input and an idempotent Room authority/cursor pin for a
   store-marked v3 turn.
 - `ExecutionEngineStore.commitBridgedTerminal(turnId, attemptId, result, now) ->
@@ -878,8 +887,12 @@ git commit -m "feat: project canonical bridge results across transports"
   as `authoritativeTurnId`; Room writes still use the separate local turn ID.
 
 `TurnSubmission.turnId` remains the local Room identity for compatibility and a
-new `authoritativeTurnId` is the v3 remote identity (equal to `turnId` for legacy
-and the first attempt). BridgeInput wire turn ID, LAN expected result ID, cloud
+new `authoritativeTurnId` is the v3 remote identity. For legacy it equals
+`turnId`. For a first v3 attempt it equals the single canonical
+`BridgeInput.wireTurnId(localTurnId, kind)`: direct IDs retain the established
+direct rule, while automatic `cloud_*`/`plan_*` IDs receive the historical
+`turn_` wire prefix. It is not the raw local automatic ID. BridgeInput wire turn
+ID, LAN expected result ID, cloud
 relay message ID, and cloud idempotency key use only `authoritativeTurnId`.
 Room turn/attempt writes, diagnostics, and raw user projection use only local
 `turnId`. Therefore unknown-outcome replay has the same cloud key, while an
@@ -888,23 +901,29 @@ parent.
 
 Task 13C deliberately advances Android Room from v11 to v12. It does not reuse
 `ExecutionAttemptEntity.memoryResult`, `rawReply`, `ChatTurnEntity.inputJson`, or
-`snapshotJson` as the authority store. `memoryResult` remains the legacy/model or
-legacy-bridge checkpoint field; bridge-v3 authority is held in two new nullable
-attempt columns:
+`snapshotJson` alone as the authority store. `memoryResult` remains the
+legacy/model or legacy-bridge checkpoint field. Room v12 adds one nullable
+store-owned provenance column, `ChatTurnEntity.bridgeProtocolVersion`, and
+bridge-v3 attempt authority is held in two new nullable attempt columns:
 
 - `bridgeAuthorityCheckpointJson`: canonical closed JSON for the attempt's
   prepared remote member and its later verified outcome;
 - `bridgeAuthorityCheckpointChecksum`: lowercase SHA-256 of the recursive
   lexicographic UTF-8 canonical JSON bytes.
 
-Both columns are null for every migrated v11 row and for every v0/v2 attempt.
+The provenance column and both checkpoint columns are null for every migrated
+v11 row and for every v0/v2 turn/attempt. A fresh Room-created v3 Yuqi turn has
+`bridgeProtocolVersion=3`; no caller field can populate this column.
 They are written and changed together by exact-checksum CAS inside the same Room
 transaction as the cursor/authority/turn transition. A one-sided value, a bad
 checksum, an unknown key, or a checkpoint whose local turn, attempt, sequence,
 lineage, remote member, pinned envelope, or outcome does not match the joined
 Room rows is `BRIDGE_AUTHORITY_CONFLICT` before any network or visible write.
-`MIGRATION_11_12` only adds these columns and does not add a bridge marker,
-fabricate an authority member, or reinterpret historical turns.
+`MIGRATION_11_12` only adds the nullable provenance/checkpoint columns and does
+not populate a bridge version, fabricate an authority member, or reinterpret
+historical turns. Therefore even a historical snapshot whose bytes already
+contain the exact `_alBridgeProtocol` object remains v2 because its independent
+provenance column is null.
 Task 20 lifecycle/redaction must treat the v12 checkpoint as an authority-bearing
 copy of turn input: clear/delete/retraction rewrites it to a closed metadata
 tombstone in the same transaction as the turn and cursor clear. It may not leave
@@ -950,13 +969,31 @@ committed outcome may contain a result `turnId` different from that attempt's
 top-level `authoritativeTurnId` only through the earlier-member convergence rule
 defined below; no other outcome may cross members.
 
+The prepared v3 submission also pins the bridge device ID from
+`TurnBridgeGateway.bridgeDeviceId()` inside `normalizedEnvelope`. The Room store
+never reads it from caller input, snapshot, a constant, or a cursor row.
+`BridgeInput` sends the already-persisted normalized envelope rather than
+rebuilding it, and immediately before network I/O requires the current route
+configuration's device ID to equal the pinned value. A configuration change
+therefore fails before send and cannot silently fork the checkpoint. The legacy
+v2 builder continues to use its existing configuration path.
+
+`BridgeAuthority.canonicalJson` is byte-compatible with the PC
+`protocol.mjs` canonical JSON for every supported JSON value, including
+ECMAScript `JSON.stringify` number formatting (`1.0 -> 1`, negative zero ->
+`0`, lowercase exponent form and matching decimal/exponent thresholds). It
+rejects NaN and infinities. Fixed Java/Node vectors cover integral doubles,
+fractions, negative zero, and exponent boundaries before this function is used
+for an envelope or checkpoint checksum.
+
 The store-owned v3 marker is also frozen. `RoomExecutionStore.submitTurn()`
 removes any caller-supplied top-level `_alBridgeProtocol` value before lookup or
 insert. Only a newly inserted `characterId == "yuqi"` turn receives exactly
 `"_alBridgeProtocol":{"version":3,"owner":"room-v12"}` in its persisted
-snapshot. Existing rows are returned without backfill, and non-Yuqi rows remain
-unmarked. Preparation trusts only that exact persisted object; malformed,
-extended, caller-owned, or historical snapshots remain v2.
+snapshot and `bridgeProtocolVersion=3` in its independent Room column. Existing
+rows are returned without backfill, and non-Yuqi rows remain unmarked.
+Preparation requires both the exact persisted object and the independent column;
+malformed, extended, caller-owned, or historical snapshots remain v2.
 
 Task 13C uses three implementation slices with explicit stop gates. Slice C1
 owns the pure identity/checksum/closed-wire DTOs and tests. Slice C2 owns the
@@ -972,14 +1009,17 @@ their focused gates. No two slices may concurrently modify
 
 `AuthorityIdentityTest` must load every vector in
 `tests/fixtures/authority-identity-v1.json` and verify lineage, group, message,
-and action IDs, including Chinese, emoji, empty text components, and large
-ordinals. Java uses UTF-8 byte length, not `String.length()`.
+action, and remote-retry turn IDs, including Chinese, emoji, empty text
+components, and large ordinals. Java uses UTF-8 byte length, not
+`String.length()`.
 
 `CanonicalFailureStatusTest` must load every vector in
 `tests/fixtures/canonical-failure-status-v1.json`, reproduce the recursive
 lexicographic UTF-8 canonical JSON bytes and exact SHA-256, and reject every
 unknown/missing key, boolean coercion, changed tuple field, and checksum before
-calling an `ExecutionEngineStore` writer.
+calling an `ExecutionEngineStore` writer. The failure tuple preserves the PC
+domain exactly: `generationFingerprint` is either an explicit JSON null or a
+non-empty string, while `failedAt` is a positive safe integer.
 
 `BridgeInputTest` and the real Room test must prove:
 
@@ -993,14 +1033,19 @@ calling an `ExecutionEngineStore` writer.
   parent remote ID and identical cloud key;
 - automatic root uses `triggerId`; direct/payment root uses canonical message ID;
 - all current-batch messages and the full cursor are emitted;
+- preparation obtains the device ID from the gateway before the transaction,
+  persists it in the exact normalized envelope, and a changed route device ID
+  fails before either LAN or cloud sends;
 - an old snapshot remains protocol v2 and receives no synthetic authority;
 - a real Task12 cursor with sequence zero and non-null legacy fallback ID is
   normalized and accepted only for the first-v3 bootstrap;
 - every automatic kind maps its completed local `cloud_*`/`plan_*` native and UI
   anchors to the historical PC wire IDs, including different anchors and restart.
 - v11→v12 migration preserves populated turns/attempts byte-for-byte, adds both
-  nullable checkpoint columns, leaves them null, is reopen-stable, and never
-  adds the store-owned v3 marker to a historical snapshot;
+  nullable checkpoint columns plus nullable `bridgeProtocolVersion`, leaves all
+  three null, is reopen-stable, and never adds the store-owned v3 marker or
+  provenance to a historical snapshot, including one whose old snapshot already
+  contains the exact marker bytes;
 - a fresh v12 database rejects a one-sided checkpoint/checksum, a bad checksum,
   an unknown checkpoint/outcome key, and a checkpoint joined to the wrong local
   turn, attempt sequence, lineage, or remote member before cursor/authority
@@ -1009,9 +1054,10 @@ calling an `ExecutionEngineStore` writer.
 There is no caller-controlled “cognition-v3 snapshot” flag. On insert,
 `RoomExecutionStore.submitTurn()` removes any caller-supplied internal bridge
 marker, then marks only newly inserted `characterId == 'yuqi'` turns with a
-closed internal `bridgeProtocol=3` object in the persisted snapshot. Historical
-rows without that store-owned marker remain v2 forever. Tests must prove a
-forged marker cannot upgrade a non-Yuqi or existing turn.
+closed internal `bridgeProtocol=3` object in the persisted snapshot and the
+independent Room provenance value 3. Historical rows without that provenance
+remain v2 forever even if their snapshot contains identical marker bytes. Tests
+must prove a forged marker cannot upgrade a non-Yuqi or existing turn.
 
 Run red:
 
@@ -1022,8 +1068,10 @@ cd android
 
 - [ ] **Step 2: Implement idempotent pre-route authority preparation**
 
-Immediately before `gateway.executeBridgeTurn`, `ExecutionEngine` calls
-`prepareBridgeSubmission`. In one Room transaction for a v3 snapshot:
+Immediately before `gateway.executeBridgeTurn`, `ExecutionEngine` reads the
+gateway's current bridge device ID and calls
+`prepareBridgeSubmission(base, bridgeDeviceId, now)`. In one Room transaction
+for a v3 snapshot:
 
 1. Load/create the conversation cursor. Increment `localSequence` only when
    creating a fresh remote authority member; an unknown-outcome replay reuses
@@ -1034,13 +1082,17 @@ Immediately before `gateway.executeBridgeTurn`, `ExecutionEngine` calls
    when they resolve to a terminal same-role turn. Missing/foreign anchors fail
    before the cursor increment.
 3. Derive lane/root/lineage with `AuthorityIdentity`.
-4. Derive the wire `authoritativeTurnId`: the first attempt uses the local turn
-   ID. A new local attempt caused by timeout, process death, network error, or
+4. Derive the wire `authoritativeTurnId`: the first attempt uses the canonical
+   `BridgeInput.wireTurnId(localTurnId, kind)` described above. A new local
+   attempt caused by timeout, process death, network error, or
    any unknown remote outcome reuses the prior remote ID, revision, sequence,
    claim, created/device sequence, full batch, cursor, and normalized wire
    envelope exactly. Only a persisted, validated PC terminal failure with no
-   commit receipt authorizes a remote child; that child uses `turn_retry_` plus
-   the shared hash of its immutable `attemptId` and advances once.
+   commit receipt authorizes a remote child. Its ID is exactly `turn_retry_`
+   plus the lowercase SHA-256 produced by the shared byte-length-prefixed
+   authority hash with namespace `al-remote-retry-turn-v1` and immutable
+   `attemptId` as its sole value. The shared identity fixture freezes this
+   vector. It advances once.
 5. Insert or CAS the OPEN `ConversationAuthorityEntity` by exactly one revision;
    its `latestTurnId` is the remote authoritative ID, not the Room primary key.
    Unknown-outcome replay performs no CAS.
@@ -1058,7 +1110,14 @@ Existing pins make process retry read-only. Any parent, revision, batch, or
 identity conflict rolls back the cursor increment and authority row together.
 `startRetry()` continues to create a new local attempt on the same local turn,
 but does not itself authorize a new PC child. Preparation inspects the persisted
-prior outcome using the closed rule above. Exercise commit-response-lost → new
+prior outcome using the closed rule above. For a store-marked v3 turn,
+`startRetry(turnId, now, inputJson, snapshotJson)` accepts only byte-identical
+input/snapshot values and performs no payload replacement; any changed value is
+rejected before attempt, turn, cursor, authority, or checkpoint writes. Legacy
+turn replacement behavior remains byte-compatible when no internal marker is
+present. If a legacy replacement snapshot contains `_alBridgeProtocol`, Room
+removes only that caller field before writing, so retry replacement cannot
+upgrade a historical turn. Exercise commit-response-lost → new
 local retry → exact original receipt through the real plugin/store entry, not
 only a helper; it must converge without a revision increment.
 
