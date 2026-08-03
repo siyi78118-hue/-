@@ -1532,6 +1532,43 @@ is a no-op, and a changed/duplicate row conflicts. Legacy create input containin
 that reserved field, are rejected before mutation; only the canonical repository
 entrypoint can create a ledger proof.
 
+> **Role-plan execution-unit amendment (2026-08-03):** A canonical result may
+> contain several role-plan actions, but every role-plan ordinal in that result
+> must belong to one contiguous interval. Both PC visible-result validation and
+> the Web applier reject an interleaved set such as
+> `role_plan_update, payment_accept, role_plan_pause` before any write. This is
+> the minimum contract that preserves authoritative ordinal order, one
+> `role_plans_v1` write for the complete role block, and crash-prefix semantics;
+> a closure that silently collects per-action calls is forbidden.
+>
+> Ordinary adapters keep `preflight`, `verifyApplied`, and `apply`. The role-plan
+> batch adapter implements exactly:
+>
+> ```js
+> preflightBatch({ items, result, localTurnId }) -> prepared
+> verifyAppliedBatch({ prepared, itemsWithGlobalProof }) -> { proofsByActionId }
+> applyBatch({ prepared, items, pendingActionIds }) -> { resultsByActionId }
+> ```
+>
+> The applier first builds contiguous execution units, then preflights **all**
+> units, then verifies **all** existing global proofs, and only then mutates units
+> in ordinal order. One role unit calls `applyBatch` once and has one named fault
+> boundary `after_domain_batch:role_plan:<firstOrdinal>:<lastOrdinal>`. Global
+> proofs are repaired in action ordinal order. Missing, extra, duplicate, or
+> reordered proof results conflict before UI acknowledgement.
+>
+> The repository exposes the closed methods
+> `prepareCanonicalBatch(characterId, orderedActions, authority, appliedAt)`,
+> `inspectCanonicalBatch(prepared)`, and
+> `applyPreparedCanonicalBatch(prepared)`. Preparation resolves create semantic
+> deduplication through the role-plan domain's existing intent comparator and
+> pins the resolved plan ID and one positive safe-integer `appliedAt`; adapters
+> must not copy that comparison rule. Application re-reads fresh plans/history,
+> rejects any prepare-time state drift, and performs at most one authoritative
+> plan/proof write. Existing ledger proofs remain session evidence even when the
+> bounded global proof store trims their repaired copies, so replay retains the
+> historical `appliedAt` and never repeats a role operation.
+
 Payment idempotency is anchored to the same persisted `settings` value as the
 wallet balance, not to a later chat save. Before mutation, resolve one exact
 payment target and compute the immutable request with exactly `version,
@@ -1560,12 +1597,39 @@ the chat write, or after the chat write but before the global proof write, must
 resume without a second refund or a second action.
 
 Moment and relationship mutations receive the same immutable four-field action
-request used by the global UI proof. In the same persistence write as their
-domain mutation, moment targets store an exact per-action proof rather than only
-`nativeActionTurnIds`, and relationship history stores the proof rather than only
-`sourceTurnId`. Exact replay validates all four fields and retains the original
-`appliedAt`; changed proof conflicts. A legacy matching turn ID or generic domain
-state is never sufficient to reconstruct a canonical UI proof.
+request used by the global UI proof. Before Web adapters are implemented, the PC
+producer and target resolver must obey this closed contract:
+
+```text
+moment_like    = like is true, comment is empty, replyToCommentId is null
+moment_comment = comment is nonempty, replyToCommentId is null; like may be a
+                 native boolean and, when true, like+comment is one atomic action
+moment_reply   = comment is nonempty, replyToCommentId is nonempty, like is false
+relationship_transition payload keys exactly:
+  baseAction, phaseAction, expectedSceneRevision, label, changedAt
+```
+
+The producer selects reply before comment before like. It never relabels a reply
+as a comment, silently drops a simultaneous like, or omits a validated
+relationship-stage action from `canonicalActionSet`. Moment/comment target keys
+are respectively `moment:<momentId>` and `comment:<replyToCommentId>`;
+relationship uses `relationship:<roleId>`. Their target revisions are computed
+from the same persisted normalized trigger-input snapshot that Android sends and
+Web can reconstruct. Protocol-v3 `context.visibilityCursor` is not a substitute
+for that trigger snapshot, and opaque caller revisions or legacy `id` aliases
+are never trusted. Cross-stack fixtures must freeze the exact Web/Android/PC
+target projection and SHA-256 vectors before an adapter may mutate state.
+
+In the same persistence write as the domain mutation, moment targets store
+`canonicalActionApplications[actionId]` with the exact five-field proof rather
+than only `nativeActionTurnIds`; relationship stores the same permanent proof at
+the character authority level rather than inside trimmed stage history. Exact
+replay validates all four immutable fields and retains the original `appliedAt`;
+changed proof conflicts. A legacy matching turn ID, comment `sourceTurnId`, stage
+history `sourceTurnId`, or generic domain state is never sufficient to
+reconstruct a canonical UI proof. On first application target revision is
+verified before mutation; after an exact permanent domain proof exists, later
+unrelated target evolution does not invalidate historical replay.
 
 `nativeTurnHasUiLanding` must not infer action success from a chat message,
 pending-reply ownership, or a generic completed state. For `action_only`, every
