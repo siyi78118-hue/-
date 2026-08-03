@@ -853,6 +853,7 @@ git commit -m "feat: project canonical bridge results across transports"
 - Modify: `android/app/src/main/java/com/siyi/al/execution/AlNotificationPolicy.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java`
 - Create: `android/app/src/test/java/com/siyi/al/execution/AuthorityIdentityTest.java`
+- Create: `android/app/src/test/java/com/siyi/al/execution/CanonicalRawMessageTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java`
@@ -1184,7 +1185,8 @@ Use distinct result values `lineage=2`, `turn=4`, `lane=8`. Cover:
 - exact event/poll/cloud replay;
 - original commits on PC, Android starts a retry, then LAN poll and delayed cloud
   delivery for that retry return the original receipt; both resolve through the
-  same lineage member set and commit once across restart;
+  same lineage member set and commit once across restart. The storing child
+  attempt and the receipt-owning original member remain separate identities;
 - process restart reading the same Room row;
 - old `inputClearEpoch` with a larger sequence is REDACTED, creates no reply/
   action row, does not advance native completion, and is not returned in the UI
@@ -1194,6 +1196,9 @@ Use distinct result values `lineage=2`, `turn=4`, `lane=8`. Cover:
   conflicts and a newer native/UI watermark never moves backwards;
 - a fault after each write boundary rolls back receipt, attempt, parts/actions,
   raw message projection, conversation authority, and cursor;
+- an authority conflict thrown by either v3 Room terminal writer escapes the v3
+  apply branch and calls zero legacy checkpoint, result, skip, fallback, or
+  `markFailed` writers;
 - skip never reaches `AlNotificationFactory`; visible retains notification;
 - the cross-stack contract proves the notification guard occurs after completion
   event/receipt/continuations but before notification ID/text/factory calls;
@@ -1334,21 +1339,28 @@ turn by `ChatTurnEntity.authorityLineageKey`, then groups that turn's attempt
 checkpoints by `authoritativeTurnId`. Duplicate checkpoints for an
 unknown-outcome replay are legal only when every immutable remote-member field
 and envelope checksum is byte-identical. The earliest attempt sequence owns the
-deterministic remote-member identity. Repeated `open` outcomes may coexist; if a
-terminal outcome exists for that remote member, it must be unique or
-canonical-JSON byte-identical across duplicates and that terminal checkpoint is
-the member's authority proof when walking the distinct-member chain. A later
-terminal proof must never be discarded merely because an earlier local attempt
-for the same remote member remained `open`. Zero local matches, multiple local
-matches, no member match, or divergent duplicates remains unacknowledged and
-writes one bounded redacted diagnostic.
+deterministic remote-member identity. Repeated `open` outcomes may coexist. Do
+not assign a committed outcome to the attempt checkpoint's top-level remote ID:
+the top-level `authoritativeTurnId` identifies the member that attempt executed,
+while `outcome.result.turnId` identifies the member that actually owns the PC
+receipt. A child attempt may therefore store a committed outcome whose result
+belongs to an earlier original member. Build the distinct-member identity chain
+only from top-level checkpoint pins and verified failure proofs; build a separate
+receipt-owner index from committed/redacted outcome result IDs. A terminal result
+must have exactly one receipt-member identity aggregate, while repeated stored
+terminal outcomes must be canonical-JSON byte-identical. Zero local matches,
+multiple receipt-member matches, no member match, or divergent duplicates remains
+unacknowledged and writes one bounded redacted diagnostic.
 
 `commitBridgedTerminal(localTurnId, activeAttemptId, result, now)` validates the
 receipt against the canonical checkpoint for `result.authoritativeTurnId`, not blindly
 against the currently active attempt's remote ID. It separately verifies that
 `activeAttemptId` is the active attempt of the same local turn and that its
-checkpoint is a valid open member of the same lineage. It then finalizes that
-active attempt, stores the committed outcome there, and converges
+checkpoint is a valid member of the same lineage. On the first application that
+active checkpoint must be `open`; on exact replay it may already contain the
+byte-identical `committed` or `redacted` outcome and its attempt/turn may already
+be terminal. It then finalizes that active attempt, stores the committed outcome
+there without changing the attempt's top-level remote identity, and converges
 `ConversationAuthority` to the result's real committed member and revisions.
 Thus a PC committed-retry fast path may return a previously requested member;
 zero/multiple member matches, any receipt/member-field difference, a foreign
@@ -1370,7 +1382,10 @@ raw-message projections, authority and cursor together.
 
 Projection is exact and collision-free. Visible items become `ReplyPartEntity`
 rows with `replyPartId=canonical messageId`, sequence `0..itemCount-1`, type
-`TEXT`, exact content, and a closed canonical metadata payload. They alone create
+`TEXT`, exact content, `createdAt=the first successful transaction's now`, and
+`payloadJson=canonicalJson({version:1,canonicalItem:<the exact validated
+replyPart object>})`. Exact replay/reopen requires every text part's `createdAt`
+to equal the persisted turn `completedAt`; it never regenerates time. They alone create
 `RawMessageEntity` rows. For item ordinal `i`, derive the row only from the
 validated result and the unique receipt-member checkpoint:
 
@@ -1574,15 +1589,35 @@ stored turn/group identity must match; for a smaller sequence preserve the
 newer identity. Thus an earlier-member receipt may advance native from 4 to 5
 while local remains 6, but it can never lower native 7. `visible` and
 `action_only` advance native only. `skip` applies the same monotonic rule to both
-native and UI and sets `uiAppliedAt=now` in the transaction.
+native and UI and sets `uiAppliedAt=now` in the transaction. Both cursor identity
+columns always store `nativeCompletedTurnId`/`uiAppliedTurnId=localTurnId` and
+the remote `visibleGroupId`; they never store `result.authoritativeTurnId` as a
+Room turn ID. Remote member IDs remain only in the checkpoint, conversation
+authority, receipt fields, and raw character-message projection.
 
-The fresh terminal transaction has nine fault boundaries: checkpoint terminal
-CAS, reply-part batch, raw-message batch, authority CAS, turn finalizer, active
-attempt finalizer, native cursor update, skip-only UI cursor update, and change
-event insert. The verified-failure transaction has five: checkpoint failure CAS,
+The fresh terminal transaction has nine named logical fault boundaries across
+its branch matrix: checkpoint terminal CAS, reply-part batch, raw-message batch,
+authority CAS, turn finalizer, active attempt finalizer, native cursor update,
+skip-only UI cursor update, and change-event insert. A visible fixture does not
+fake a UI-cursor write; action-only does not fake raw rows; skip does not fake
+reply/raw batches; redacted executes only checkpoint, authority, turn, attempt,
+and change boundaries. Tests cover every applicable boundary across those real
+branches rather than claiming all nine writes occur in one call. The verified-
+failure transaction has five boundaries: checkpoint failure CAS,
 turn failure CAS, attempt failure CAS, change event, and metadata-only
 diagnostic. A forced failure after every boundary must roll back checkpoint,
 turn, attempt, authority, cursor, parts, raw messages, changes, and diagnostics.
+
+V3 change/diagnostic projections are fixed. Live `visible`/`action_only` inserts
+`REPLY_COMMITTED`, live `skip` inserts `TURN_SKIPPED`, and the old-epoch branch
+inserts `TURN_REDACTED`; each change payload is canonical JSON with exactly
+`turnId` (the local Room ID), `authorityLineageKey`, `visibleGroupId`, and the
+real `terminalDisposition`. Verified remote failure inserts `TURN_FAILED` with
+exact payload `turnId,authorityLineageKey,authoritativeTurnId,retryAllowed` and
+one `ERROR/BRIDGE_REMOTE_FAILURE` diagnostic whose detail is canonical JSON with
+exactly `redacted:true,errorCode,retryAllowed,rawStatusChecksum`. It stores no
+failure message. Exact replay inserts no second change/diagnostic; changed rows
+conflict.
 
 For canonical `skip`, the terminal transaction performs a safe no-op UI apply:
 it sets `uiAppliedAt`, advances native and UI cursors to the group, writes no
@@ -1598,6 +1633,13 @@ writes `generationFingerprint` plus `pipelineReleaseId`. Do not use
 `AlNotificationPolicy` and call it only at the actual notification branch, after
 completion event, receipt/ack, and continuations. Visible text may notify;
 `action_only` and `skip` never create a chat notification or placeholder text.
+
+After a gateway has returned a parsed v3 `BridgeResult`, `ExecutionEngine`
+enters a dedicated apply branch outside the legacy catch-and-`markFailed` path.
+An exception from `commitBridgedTerminal` or `commitVerifiedRemoteFailure`
+propagates as an authority/application failure with zero legacy writes. Only
+configuration, transport, timeout, or other unknown-result failures that occur
+before a valid v3 result exists retain the existing local retry/failure behavior.
 
 `BridgeReceiptCheckpoint.extract()` accepts a complete v3 canonical receipt even
 with zero items and no relay ID, preserves the original response and route, and
