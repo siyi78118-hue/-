@@ -219,9 +219,11 @@ test('every manual retry anchors to the original deterministic message turn', ()
 test('Room persists fresh retry turns and only deduplicates an exact turn id', () => {
   assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
   assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
-  assert.match(executionDatabase, /version\s*=\s*11/);
+  assert.match(executionDatabase, /version\s*=\s*12/);
   assert.match(executionDatabase, /new Migration\(8,\s*9\)/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
+  assert.match(executionDatabase, /MIGRATION_11_12/);
+  assert.match(executionDatabase, /MIGRATION_9_10,\s*MIGRATION_10_11,\s*MIGRATION_11_12/);
   assert.match(executionDatabase, /DROP INDEX IF EXISTS `index_chat_turns_sourceMessageId`/);
   assert.match(executionDatabase, /CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId`/);
   const submit = executionStore.slice(
@@ -307,9 +309,10 @@ test('native completed turns are serialized across submit, poll, inbox, and fore
 });
 
 test('native delivery diagnostics persist and expose four independent convergence stages', () => {
-  assert.match(executionDatabase, /version\s*=\s*11/);
+  assert.match(executionDatabase, /version\s*=\s*12/);
   assert.match(executionDatabase, /MIGRATION_9_10/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
+  assert.match(executionDatabase, /MIGRATION_11_12/);
   assert.match(chatTurnEntity, /Long\s+notificationShownAt/);
   assert.match(chatTurnEntity, /Long\s+cloudConfirmedAt/);
   assert.match(executionDao, /markNotificationShown/);
