@@ -1,6 +1,8 @@
 package com.siyi.al.execution.bridge;
 
 import android.util.Base64;
+import com.siyi.al.execution.AuthorityIdentity;
+import com.siyi.al.execution.BridgeAuthority;
 import com.siyi.al.execution.TurnSubmission;
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -15,7 +17,12 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.crypto.Cipher;
 import javax.crypto.Mac;
 import javax.crypto.spec.GCMParameterSpec;
@@ -41,6 +48,11 @@ public final class BridgeClient {
         JSONObject decode(JSONObject item) throws Exception;
     }
 
+    interface Base64Codec {
+        byte[] decode(String value);
+        String encode(byte[] value);
+    }
+
     interface Clock { long now(); }
     interface Sleeper { void sleep(long millis) throws Exception; }
 
@@ -51,6 +63,14 @@ public final class BridgeClient {
     }
 
     private static final SecureRandom RANDOM = new SecureRandom();
+    private static final Set<String> AUTHORITY_RECEIPT_KEYS = new HashSet<>(Arrays.asList(
+        "protocolVersion", "type", "peerId", "turnId", "authorityLineageKey",
+        "visibleGroupId", "commitChecksum", "terminalDisposition", "deliveredAt",
+        "_checkpointChecksum", "_deliveryRoute"));
+    private static final Set<String> CLOUD_AUTHORITY_RECEIPT_KEYS = new HashSet<>(Arrays.asList(
+        "protocolVersion", "type", "peerId", "turnId", "authorityLineageKey",
+        "visibleGroupId", "commitChecksum", "terminalDisposition", "deliveredAt",
+        "_checkpointChecksum", "_deliveryRoute", "_relayMessageId"));
     private final BridgeConfig config;
     private final FallbackJournal journal;
     private final Transport transport;
@@ -58,6 +78,8 @@ public final class BridgeClient {
     private final Sleeper sleeper;
     private final StatusListener statusListener;
     private final CloudInboxConsumer inboxConsumer;
+    private final Base64Codec base64Codec;
+    private final ConcurrentHashMap<String, String> authorityReceiptPins = new ConcurrentHashMap<>();
 
     public BridgeClient(BridgeConfig config) {
         this(config, null);
@@ -89,6 +111,13 @@ public final class BridgeClient {
         BridgeConfig config, FallbackJournal journal, Transport transport, Clock clock, Sleeper sleeper,
         StatusListener statusListener, CloudInboxConsumer inboxConsumer
     ) {
+        this(config, journal, transport, clock, sleeper, statusListener, inboxConsumer, null);
+    }
+
+    BridgeClient(
+        BridgeConfig config, FallbackJournal journal, Transport transport, Clock clock, Sleeper sleeper,
+        StatusListener statusListener, CloudInboxConsumer inboxConsumer, Base64Codec base64Codec
+    ) {
         this.config = config == null ? BridgeConfig.disabled() : config;
         this.journal = journal;
         this.transport = transport == null ? this::http : transport;
@@ -96,6 +125,15 @@ public final class BridgeClient {
         this.sleeper = sleeper == null ? Thread::sleep : sleeper;
         this.statusListener = statusListener;
         this.inboxConsumer = inboxConsumer;
+        this.base64Codec = base64Codec == null ? new Base64Codec() {
+            @Override public byte[] decode(String value) {
+                return Base64.decode(value, Base64.DEFAULT);
+            }
+
+            @Override public String encode(byte[] value) {
+                return Base64.encodeToString(value, Base64.NO_WRAP);
+            }
+        } : base64Codec;
     }
 
     public BridgeRouter.RouteClient lanRoute() { return this::sendLan; }
@@ -304,6 +342,10 @@ public final class BridgeClient {
 
     public boolean confirmAppliedResult(String responseJson) throws Exception {
         JSONObject decoded = new JSONObject(responseJson == null ? "{}" : responseJson);
+        if (decoded.has("_checkpointChecksum")
+            || "AUTHORITY_DELIVERY_RECEIPT".equals(decoded.opt("type"))) {
+            return confirmAuthorityAppliedResult(decoded);
+        }
         String route = decoded.optString("_deliveryRoute", "").trim();
         if ("cloud".equals(route) || !decoded.optString("_relayMessageId", "").trim().isEmpty()) {
             return confirmCloudResult(decoded.toString());
@@ -315,6 +357,98 @@ public final class BridgeClient {
         HttpResult response = signedLan("POST", path, receipt.toString());
         requireSuccess(response, "LAN delivery receipt");
         return true;
+    }
+
+    private boolean confirmAuthorityAppliedResult(JSONObject decoded) throws Exception {
+        AuthorityReceiptProjection projection = validateAuthorityReceiptProjection(decoded);
+        String prior = authorityReceiptPins.putIfAbsent(
+            projection.checkpointChecksum, projection.pin);
+        if (prior != null && !prior.equals(projection.pin)) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        if ("lan".equals(projection.route)) {
+            if (!config.hasLan()) return false;
+            String path = "/v3/groups/"
+                + URLEncoder.encode(projection.visibleGroupId, "UTF-8")
+                + "/delivery-receipt";
+            HttpResult response = signedLan("POST", path, projection.wireJson);
+            requireSuccess(response, "LAN authority delivery receipt");
+            return true;
+        }
+
+        Encrypted encrypted = encrypt(projection.wireJson);
+        String stableId = "authority_receipt_" + projection.idempotencyKey.substring(0, 24);
+        JSONObject output = new JSONObject()
+            .put("deviceId", config.deviceId)
+            .put("messageId", stableId)
+            .put("idempotencyKey", stableId)
+            .put("direction", "phone_to_pc")
+            .put("ciphertext", encrypted.ciphertext)
+            .put("nonce", encrypted.nonce)
+            .put("expiresAt", clock.now() + 24L * 60L * 60L * 1000L);
+        HttpResult response = request(
+            "POST", config.cloudUrl + "/bridge/enqueue", output.toString(), bearerHeaders());
+        requireSuccess(response, "authority delivery receipt enqueue");
+        acknowledgeCloud(projection.relayMessageId);
+        return true;
+    }
+
+    private AuthorityReceiptProjection validateAuthorityReceiptProjection(JSONObject decoded)
+        throws Exception {
+        String route = requireNativeNonEmptyString(decoded, "_deliveryRoute");
+        boolean cloud = "cloud".equals(route);
+        if (!(cloud || "lan".equals(route))
+            || !(cloud ? CLOUD_AUTHORITY_RECEIPT_KEYS : AUTHORITY_RECEIPT_KEYS)
+                .equals(keysOf(decoded))) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        Object version = decoded.opt("protocolVersion");
+        Object type = decoded.opt("type");
+        Object delivered = decoded.opt("deliveredAt");
+        if (!(version instanceof Number) || version instanceof Float || version instanceof Double
+            || ((Number) version).longValue() != 3L
+            || !(type instanceof String)
+            || !"AUTHORITY_DELIVERY_RECEIPT".equals(type)
+            || !(delivered instanceof Number) || delivered instanceof Float || delivered instanceof Double) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        long deliveredAt = ((Number) delivered).longValue();
+        if (deliveredAt <= 0L || deliveredAt > 9007199254740991L) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        String peerId = requireNativeNonEmptyString(decoded, "peerId");
+        String turnId = requireNativeNonEmptyString(decoded, "turnId");
+        String lineageKey = requireNativeNonEmptyString(decoded, "authorityLineageKey");
+        String groupId = requireNativeNonEmptyString(decoded, "visibleGroupId");
+        String commitChecksum = requireNativeNonEmptyString(decoded, "commitChecksum");
+        String disposition = requireNativeNonEmptyString(decoded, "terminalDisposition");
+        String checkpointChecksum = requireNativeNonEmptyString(decoded, "_checkpointChecksum");
+        String relayMessageId = cloud
+            ? requireNativeNonEmptyString(decoded, "_relayMessageId") : null;
+        if (!config.deviceId.equals(peerId)
+            || !AuthorityIdentity.groupId(lineageKey).equals(groupId)
+            || !commitChecksum.matches("[a-f0-9]{64}")
+            || !checkpointChecksum.matches("[a-f0-9]{64}")
+            || !("visible".equals(disposition)
+                || "action_only".equals(disposition) || "skip".equals(disposition))) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        JSONObject wire = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "AUTHORITY_DELIVERY_RECEIPT")
+            .put("peerId", peerId)
+            .put("turnId", turnId)
+            .put("authorityLineageKey", lineageKey)
+            .put("visibleGroupId", groupId)
+            .put("commitChecksum", commitChecksum)
+            .put("terminalDisposition", disposition)
+            .put("deliveredAt", deliveredAt);
+        String wireJson = BridgeAuthority.canonicalJson(wire);
+        String idempotencyKey = sha256(wireJson);
+        String pin = route + "\n" + (relayMessageId == null ? "" : relayMessageId)
+            + "\n" + idempotencyKey;
+        return new AuthorityReceiptProjection(
+            groupId, checkpointChecksum, route, relayMessageId, wireJson, idempotencyKey, pin);
     }
 
     private boolean processBacklogCommitted(JSONObject decoded, String raw) throws Exception {
@@ -378,6 +512,49 @@ public final class BridgeClient {
             .put("turnId", turnId)
             .put("deliveredAt", clock.now())
             .put("items", items);
+    }
+
+    private static String requireNativeNonEmptyString(JSONObject value, String key) {
+        Object raw = value.opt(key);
+        if (!(raw instanceof String) || ((String) raw).isEmpty()) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT");
+        }
+        return (String) raw;
+    }
+
+    private static Set<String> keysOf(JSONObject value) {
+        Set<String> keys = new HashSet<>();
+        Iterator<String> iterator = value.keys();
+        while (iterator.hasNext()) keys.add(iterator.next());
+        return keys;
+    }
+
+    private static final class AuthorityReceiptProjection {
+        final String visibleGroupId;
+        final String checkpointChecksum;
+        final String route;
+        final String relayMessageId;
+        final String wireJson;
+        final String idempotencyKey;
+        final String pin;
+
+        AuthorityReceiptProjection(
+            String visibleGroupId,
+            String checkpointChecksum,
+            String route,
+            String relayMessageId,
+            String wireJson,
+            String idempotencyKey,
+            String pin
+        ) {
+            this.visibleGroupId = visibleGroupId;
+            this.checkpointChecksum = checkpointChecksum;
+            this.route = route;
+            this.relayMessageId = relayMessageId;
+            this.wireJson = wireJson;
+            this.idempotencyKey = idempotencyKey;
+            this.pin = pin;
+        }
     }
 
     public static String signLanRequest(
@@ -505,7 +682,7 @@ public final class BridgeClient {
     }
 
     private Encrypted encrypt(String plaintext) throws Exception {
-        byte[] key = Base64.decode(config.encryptionKeyBase64, Base64.DEFAULT);
+        byte[] key = base64Codec.decode(config.encryptionKeyBase64);
         if (key.length != 32) throw new IllegalArgumentException("cloud encryption key must be 256-bit");
         byte[] nonce = new byte[12];
         RANDOM.nextBytes(nonce);
@@ -513,15 +690,15 @@ public final class BridgeClient {
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
         byte[] ciphertext = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
         return new Encrypted(
-            Base64.encodeToString(ciphertext, Base64.NO_WRAP),
-            Base64.encodeToString(nonce, Base64.NO_WRAP)
+            base64Codec.encode(ciphertext),
+            base64Codec.encode(nonce)
         );
     }
 
     private String decrypt(String ciphertextBase64, String nonceBase64) throws Exception {
-        byte[] key = Base64.decode(config.encryptionKeyBase64, Base64.DEFAULT);
-        byte[] ciphertext = Base64.decode(ciphertextBase64, Base64.DEFAULT);
-        byte[] nonce = Base64.decode(nonceBase64, Base64.DEFAULT);
+        byte[] key = base64Codec.decode(config.encryptionKeyBase64);
+        byte[] ciphertext = base64Codec.decode(ciphertextBase64);
+        byte[] nonce = base64Codec.decode(nonceBase64);
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
         return new String(cipher.doFinal(ciphertext), StandardCharsets.UTF_8);

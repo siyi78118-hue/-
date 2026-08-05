@@ -2,6 +2,8 @@ package com.siyi.al.execution;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -21,7 +23,12 @@ import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.json.JSONObject;
 import org.json.JSONArray;
 import org.junit.After;
@@ -1790,6 +1797,214 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void readAuthorityUsesActiveCurrentCheckpointAndSeparatesLocalAndRemoteTurnIds()
+        throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture(
+            "c3b-r1-current", "visible", 240L);
+        ExecutionAttemptEntity active = store.activeAttempt(fixture.localTurnId);
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot snapshot =
+            store.readAuthority(fixture.localTurnId);
+
+        assertNotNull(snapshot);
+        assertEquals(fixture.localTurnId, snapshot.localTurnId);
+        assertEquals(active.bridgeAuthorityCheckpointJson, snapshot.checkpointJson);
+        assertEquals(active.bridgeAuthorityCheckpointChecksum, snapshot.checkpointChecksum);
+        JSONObject checkpoint = new JSONObject(snapshot.checkpointJson);
+        assertEquals(
+            fixture.result.authoritativeTurnId,
+            checkpoint.getString("authoritativeTurnId"));
+        assertNotEquals(fixture.localTurnId, fixture.result.authoritativeTurnId);
+        assertEquals(null, snapshot.uiAppliedAt);
+        assertTrue(!snapshot.redacted);
+    }
+
+    @Test
+    public void readAuthorityRejectsForeignAttemptAndOneSidedOrDamagedCheckpoint() throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture(
+            "c3b-r1-corrupt", "visible", 250L);
+        String originalAttemptId = store.turn(fixture.localTurnId).activeAttemptId;
+        store.submitTurn(yuqiThreeBubbleSubmission("c3b-r1-foreign", "msg-c3b-r1-foreign", 251L));
+        String foreignAttemptId = store.activeAttempt("c3b-r1-foreign").attemptId;
+
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE chat_turns SET activeAttemptId=? WHERE turnId=?",
+            new Object[]{foreignAttemptId, fixture.localTurnId});
+        assertThrows(IllegalStateException.class,
+            () -> store.readAuthority(fixture.localTurnId));
+
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE chat_turns SET activeAttemptId=? WHERE turnId=?",
+            new Object[]{originalAttemptId, fixture.localTurnId});
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE execution_attempts SET bridgeAuthorityCheckpointChecksum=NULL WHERE attemptId=?",
+            new Object[]{originalAttemptId});
+        assertThrows(IllegalStateException.class,
+            () -> store.readAuthority(fixture.localTurnId));
+
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE execution_attempts SET bridgeAuthorityCheckpointChecksum=? WHERE attemptId=?",
+            new Object[]{fixture.checkpointChecksum, originalAttemptId});
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE execution_attempts SET bridgeAuthorityCheckpointChecksum=? WHERE attemptId=?",
+            new Object[]{"corrupt-checksum", originalAttemptId});
+        assertThrows(IllegalStateException.class,
+            () -> store.readAuthority(fixture.localTurnId));
+    }
+
+    @Test
+    public void readAuthorityIgnoresForgedMemoryResultWhenCheckpointIsValid() throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture(
+            "c3b-r1-memory", "visible", 260L);
+        String checkpointJson = store.activeAttempt(fixture.localTurnId).bridgeAuthorityCheckpointJson;
+        JSONObject forgedMemory = new JSONObject(checkpointJson);
+        forgedMemory.getJSONObject("outcome").getJSONObject("result")
+            .put("turnId", "forged");
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE execution_attempts SET memoryResult=? WHERE attemptId=?",
+            new Object[]{forgedMemory.toString(), store.turn(fixture.localTurnId).activeAttemptId});
+
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot snapshot =
+            store.readAuthority(fixture.localTurnId);
+
+        assertEquals(checkpointJson, snapshot.checkpointJson);
+        assertEquals(
+            fixture.checkpointChecksum,
+            snapshot.checkpointChecksum);
+    }
+
+    @Test
+    public void readAuthorityRejectsPersistedTurnPinsThatDisagreeWithTheActiveCheckpoint()
+        throws Exception {
+        String[] columns = {
+            "authorityLineageKey", "visibleGroupId", "bridgeCommitChecksum", "terminalDisposition"
+        };
+        String[] values = {
+            "lineage_forged", AuthorityIdentity.groupId("lineage_forged"), repeat('b', 64), "skip"
+        };
+        for (int index = 0; index < columns.length; index += 1) {
+            CanonicalFixture fixture = commitCanonicalFixture(
+                "c3b-r1-turn-pin-" + index, "visible", 265L + index);
+            database.getOpenHelper().getWritableDatabase().execSQL(
+                "UPDATE chat_turns SET " + columns[index] + "=? WHERE turnId=?",
+                new Object[]{values[index], fixture.localTurnId});
+
+            assertThrows(IllegalStateException.class,
+                () -> store.readAuthority(fixture.localTurnId));
+        }
+    }
+
+    @Test
+    public void confirmCloudReceiptExactCommitsAndReplaysAfterRoomStoreRestart() throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture(
+            "c3b-r2-exact", "skip", 270L);
+        BridgeReceiptDeliveryCoordinator.AuthorityReceipt receipt =
+            captureReceiptWithoutPersisting(store, fixture.localTurnId);
+
+        assertEquals(
+            BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFIRMED,
+            store.confirmCloudReceiptExact(receipt, 999L));
+        Long confirmedAt = store.turn(fixture.localTurnId).cloudConfirmedAt;
+        assertEquals(Long.valueOf(999L), confirmedAt);
+
+        RoomExecutionStore restarted = new RoomExecutionStore(database);
+        assertEquals(
+            BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFIRMED,
+            restarted.confirmCloudReceiptExact(receipt, 1200L));
+        assertEquals(confirmedAt, restarted.turn(fixture.localTurnId).cloudConfirmedAt);
+    }
+
+    @Test
+    public void changedAuthorityProofsReturnConflictWithoutStoreWrites() throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture(
+            "c3b-r2-conflicts", "skip", 280L);
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot canonical =
+            store.readAuthority(fixture.localTurnId);
+        long beforeChanges = rowCount("change_events");
+        long beforeDiagnostics = rowCount("diagnostics");
+
+        List<AuthoritySnapshotMutation> mutations = new ArrayList<>();
+        mutations.add(base -> mutateCheckpoint(base, payload ->
+            payload.put("turnId", "remote-changed")));
+        mutations.add(base -> mutateCheckpoint(base, payload -> {
+            payload.put("authorityLineageKey", "lineage-changed");
+            payload.put("visibleGroupId", AuthorityIdentity.groupId("lineage-changed"));
+        }));
+        mutations.add(base -> mutateCheckpoint(base, payload ->
+            payload.put("visibleGroupId", AuthorityIdentity.groupId("forged-group"))));
+        mutations.add(base -> mutateCheckpoint(base, payload ->
+            payload.put("commitChecksum", repeat('b', 64))));
+        mutations.add(base -> mutateCheckpoint(base, payload ->
+            payload.put("terminalDisposition", "action_only")));
+        mutations.add(base -> {
+            JSONObject checkpoint = new JSONObject(base.checkpointJson);
+            checkpoint.getJSONObject("outcome").put("route", "cloud")
+                .put("relayMessageId", "relay-changed");
+            return snapshotWithCheckpoint(base, checkpoint, "cloud", "relay-changed");
+        });
+        mutations.add(base -> new BridgeReceiptDeliveryCoordinator.AuthoritySnapshot(
+            base.localTurnId, base.checkpointJson, base.checkpointChecksum,
+            base.uiAppliedAt + 1L, base.redacted, false,
+            base.peerId, base.route, base.relayMessageId));
+        mutations.add(base -> new BridgeReceiptDeliveryCoordinator.AuthoritySnapshot(
+            base.localTurnId, base.checkpointJson, base.checkpointChecksum,
+            base.uiAppliedAt, base.redacted, false,
+            "foreign-peer", base.route, base.relayMessageId));
+        mutations.add(base -> new BridgeReceiptDeliveryCoordinator.AuthoritySnapshot(
+            base.localTurnId, base.checkpointJson, "corrupt-checksum",
+            base.uiAppliedAt, base.redacted, false,
+            base.peerId, base.route, base.relayMessageId));
+
+        int index = 0;
+        for (AuthoritySnapshotMutation mutation : mutations) {
+            BridgeReceiptDeliveryCoordinator.Store adversarial =
+                new PresentedSnapshotStore(store, mutation.apply(canonical));
+            try {
+                new BridgeReceiptDeliveryCoordinator(adversarial, receipt -> {})
+                    .deliver(fixture.localTurnId);
+                throw new AssertionError("changed authority proof must conflict at case " + index);
+            } catch (IllegalArgumentException expected) {
+                assertTrue(expected.getMessage().contains("authority")
+                    || expected.getMessage().contains("receipt")
+                    || expected.getMessage().contains("checksum"));
+            }
+            assertEquals(beforeChanges, rowCount("change_events"));
+            assertEquals(beforeDiagnostics, rowCount("diagnostics"));
+            assertEquals(null, store.turn(fixture.localTurnId).cloudConfirmedAt);
+            index += 1;
+        }
+    }
+
+    @Test
+    public void twoRoomStoreHandlesConcurrentExactConfirmationAndOnlyOneLocalPushRemains()
+        throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture(
+            "c3b-r2-concurrent", "skip", 290L);
+        RoomExecutionStore first = new RoomExecutionStore(database);
+        RoomExecutionStore second = new RoomExecutionStore(database);
+        BridgeReceiptDeliveryCoordinator.AuthorityReceipt receipt =
+            captureReceiptWithoutPersisting(first, fixture.localTurnId);
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            Future<BridgeReceiptDeliveryCoordinator.ConfirmationResult> one = pool.submit(
+                () -> first.confirmCloudReceiptExact(receipt, 1300L));
+            Future<BridgeReceiptDeliveryCoordinator.ConfirmationResult> two = pool.submit(
+                () -> second.confirmCloudReceiptExact(receipt, 1400L));
+            assertEquals(
+                BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFIRMED,
+                one.get());
+            assertEquals(
+                BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFIRMED,
+                two.get());
+        } finally {
+            pool.shutdownNow();
+        }
+        Long confirmedAt = store.turn(fixture.localTurnId).cloudConfirmedAt;
+        assertNotNull(confirmedAt);
+        assertEquals(confirmedAt, first.turn(fixture.localTurnId).cloudConfirmedAt);
+        assertEquals(confirmedAt, second.turn(fixture.localTurnId).cloudConfirmedAt);
+    }
+
+    @Test
     public void exactTerminalReceiptReplayIsIdempotentButChangedReceiptIsRejected() {
         store.submitTurn(submission("turn-receipt", "message-receipt"));
 
@@ -2222,6 +2437,155 @@ public class RoomExecutionStoreTest {
         assertEquals(cursorSequence, store.getConversationCursor("yuqi").localSequence);
         assertEquals(authorityRevision,
             database.executionDao().conversationAuthority(lineage).revision);
+    }
+
+    private CanonicalFixture commitCanonicalFixture(
+        String localTurnId,
+        String disposition,
+        long base
+    ) throws Exception {
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            localTurnId, "msg-" + localTurnId, base));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", base + 1L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        int partCount = "visible".equals(disposition) ? 3 : 0;
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalTerminal(checkpoint, disposition, partCount, new JSONArray()).toString(),
+            "lan",
+            null);
+        store.commitBridgedTerminal(localTurnId, attempt.attemptId, result, base + 2L);
+        ExecutionAttemptEntity committed = store.activeAttempt(localTurnId);
+        return new CanonicalFixture(
+            localTurnId,
+            result,
+            committed.bridgeAuthorityCheckpointJson,
+            committed.bridgeAuthorityCheckpointChecksum);
+    }
+
+    private static BridgeReceiptDeliveryCoordinator.AuthorityReceipt captureReceiptWithoutPersisting(
+        RoomExecutionStore target,
+        String localTurnId
+    ) {
+        final BridgeReceiptDeliveryCoordinator.AuthorityReceipt[] captured =
+            new BridgeReceiptDeliveryCoordinator.AuthorityReceipt[1];
+        BridgeReceiptDeliveryCoordinator.Store adapter =
+            new BridgeReceiptDeliveryCoordinator.Store() {
+                @Override public BridgeReceiptDeliveryCoordinator.AuthoritySnapshot readAuthority(
+                    String requestedLocalTurnId
+                ) {
+                    return target.readAuthority(requestedLocalTurnId);
+                }
+
+                @Override public BridgeReceiptDeliveryCoordinator.ConfirmationResult
+                    confirmCloudReceiptExact(
+                        BridgeReceiptDeliveryCoordinator.AuthorityReceipt expected,
+                        long confirmedAt
+                    ) {
+                    captured[0] = expected;
+                    return BridgeReceiptDeliveryCoordinator.ConfirmationResult.RETRYABLE;
+                }
+            };
+        BridgeReceiptDeliveryCoordinator.Outcome outcome =
+            new BridgeReceiptDeliveryCoordinator(adapter, receipt -> {})
+                .deliver(localTurnId);
+        assertEquals(
+            BridgeReceiptDeliveryCoordinator.OutcomeStatus.RETRYABLE,
+            outcome.status);
+        assertNotNull(captured[0]);
+        return captured[0];
+    }
+
+    private static BridgeReceiptDeliveryCoordinator.AuthoritySnapshot mutateCheckpoint(
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot base,
+        PayloadMutation mutation
+    ) throws Exception {
+        JSONObject checkpoint = new JSONObject(base.checkpointJson);
+        mutation.apply(checkpoint.getJSONObject("outcome").getJSONObject("result"));
+        return snapshotWithCheckpoint(base, checkpoint, base.route, base.relayMessageId);
+    }
+
+    private static BridgeReceiptDeliveryCoordinator.AuthoritySnapshot snapshotWithCheckpoint(
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot base,
+        JSONObject checkpoint,
+        String route,
+        String relayMessageId
+    ) throws Exception {
+        String json = BridgeAuthority.canonicalJson(checkpoint);
+        return new BridgeReceiptDeliveryCoordinator.AuthoritySnapshot(
+            base.localTurnId,
+            json,
+            BridgeAuthority.sha256CanonicalJson(checkpoint),
+            base.uiAppliedAt,
+            base.redacted,
+            false,
+            base.peerId,
+            route,
+            relayMessageId);
+    }
+
+    private static String repeat(char value, int length) {
+        char[] output = new char[length];
+        java.util.Arrays.fill(output, value);
+        return new String(output);
+    }
+
+    private interface PayloadMutation {
+        void apply(JSONObject payload) throws Exception;
+    }
+
+    private interface AuthoritySnapshotMutation {
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot apply(
+            BridgeReceiptDeliveryCoordinator.AuthoritySnapshot base
+        ) throws Exception;
+    }
+
+    private static final class PresentedSnapshotStore
+        implements BridgeReceiptDeliveryCoordinator.Store {
+        private final RoomExecutionStore delegate;
+        private final BridgeReceiptDeliveryCoordinator.AuthoritySnapshot presented;
+
+        PresentedSnapshotStore(
+            RoomExecutionStore delegate,
+            BridgeReceiptDeliveryCoordinator.AuthoritySnapshot presented
+        ) {
+            this.delegate = delegate;
+            this.presented = presented;
+        }
+
+        @Override public BridgeReceiptDeliveryCoordinator.AuthoritySnapshot readAuthority(
+            String localTurnId
+        ) {
+            return presented.localTurnId.equals(localTurnId) ? presented : null;
+        }
+
+        @Override public BridgeReceiptDeliveryCoordinator.ConfirmationResult
+            confirmCloudReceiptExact(
+                BridgeReceiptDeliveryCoordinator.AuthorityReceipt expected,
+                long confirmedAt
+            ) {
+            return delegate.confirmCloudReceiptExact(expected, confirmedAt);
+        }
+    }
+
+    private static final class CanonicalFixture {
+        private final String localTurnId;
+        private final BridgeResult result;
+        private final String checkpointJson;
+        private final String checkpointChecksum;
+
+        CanonicalFixture(
+            String localTurnId,
+            BridgeResult result,
+            String checkpointJson,
+            String checkpointChecksum
+        ) {
+            this.localTurnId = localTurnId;
+            this.result = result;
+            this.checkpointJson = checkpointJson;
+            this.checkpointChecksum = checkpointChecksum;
+        }
     }
 
     private long rowCount(String table) {

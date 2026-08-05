@@ -486,7 +486,7 @@ public final class AlExecutionPlugin extends Plugin {
                 stage.put("turnId", turn.turnId);
                 stage.put("characterId", turn.characterId);
                 stage.put("kind", turn.kind);
-                stage.put("cloudConfirmationRequired", cloudConfirmationRequired(attempt));
+                stage.put("cloudConfirmationRequired", cloudConfirmationRequired(turn, attempt));
                 stage.put("nativeCompleted", turn.completedAt != null);
                 stage.put("nativeCompletedAt", turn.completedAt);
                 stage.put("notificationShown", turn.notificationShownAt != null);
@@ -629,14 +629,44 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("notificationShownAt", turn.notificationShownAt);
         result.put("uiAppliedAt", turn.uiAppliedAt);
         result.put("cloudConfirmedAt", turn.cloudConfirmedAt);
+        result.put("bridgeProtocolVersion", turn.bridgeProtocolVersion);
+        result.put("authorityLineageKey", turn.authorityLineageKey);
+        result.put("visibleGroupId", turn.visibleGroupId);
+        result.put("commitChecksum", turn.bridgeCommitChecksum);
+        result.put("terminalDisposition", turn.terminalDisposition);
+        result.put("lineageRevision", turn.lineageRevision);
+        result.put("turnRevision", turn.turnRevision);
+        result.put("laneKey", turn.laneKey);
+        result.put("laneRevision", turn.laneRevision);
+        result.put("generationFingerprint", turn.generationFingerprint);
+        result.put("pipelineReleaseId", turn.pipelineReleaseId);
+        result.put("inputVisibilitySequence", turn.inputVisibilitySequence);
+        result.put("inputClearEpoch", turn.inputClearEpoch);
         ExecutionAttemptEntity attempt = store.activeAttempt(turn.turnId);
-        result.put("cloudConfirmationRequired", cloudConfirmationRequired(attempt));
+        result.put("cloudConfirmationRequired", cloudConfirmationRequired(turn, attempt));
         if (attempt != null) {
             result.put("attemptId", attempt.attemptId);
             result.put("errorCode", attempt.errorCode);
             result.put("errorDetail", attempt.errorDetail);
             result.put("retryable", attempt.retryable);
-            if (attempt.memoryResult != null && !attempt.memoryResult.trim().isEmpty()) {
+            if (attempt.bridgeAuthorityCheckpointJson != null
+                && attempt.bridgeAuthorityCheckpointChecksum != null) {
+                JSONObject authorityReceipt = BridgeReceiptCheckpoint
+                    .extractAuthorityReceiptFromV12Checkpoint(
+                        attempt.bridgeAuthorityCheckpointJson,
+                        attempt.bridgeAuthorityCheckpointChecksum);
+                if (authorityReceipt != null) {
+                    result.put("bridgeAuthorityCheckpointChecksum",
+                        attempt.bridgeAuthorityCheckpointChecksum);
+                    result.put("bridgeDeliveryRoute",
+                        authorityReceipt.optString("_deliveryRoute", ""));
+                    result.put("bridgeRelayMessageId",
+                        authorityReceipt.has("_relayMessageId")
+                            ? authorityReceipt.optString("_relayMessageId", "") : null);
+                }
+            }
+            if (BridgeReceiptCheckpoint.mayReadLegacyMemoryResult(turn.bridgeProtocolVersion)
+                && attempt.memoryResult != null && !attempt.memoryResult.trim().isEmpty()) {
                 try {
                     JSONObject checkpoint = new JSONObject(attempt.memoryResult);
                     if (checkpoint.has("origin")) {
@@ -717,8 +747,19 @@ public final class AlExecutionPlugin extends Plugin {
         return result;
     }
 
-    private boolean cloudConfirmationRequired(ExecutionAttemptEntity attempt) {
-        return attempt != null && BridgeReceiptCheckpoint.extract(attempt.memoryResult) != null;
+    private boolean cloudConfirmationRequired(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt
+    ) {
+        if (attempt == null) return false;
+        if (turn.bridgeProtocolVersion != null && turn.bridgeProtocolVersion == 3) {
+            return turn.deletedAt == null
+                && turn.cloudConfirmedAt == null
+                && BridgeReceiptCheckpoint.extractAuthorityReceiptFromV12Checkpoint(
+                    attempt.bridgeAuthorityCheckpointJson,
+                    attempt.bridgeAuthorityCheckpointChecksum) != null;
+        }
+        return BridgeReceiptCheckpoint.extract(attempt.memoryResult) != null;
     }
 
     private void execute(PluginCall call, Operation operation) {

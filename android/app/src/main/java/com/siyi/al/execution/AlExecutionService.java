@@ -35,6 +35,7 @@ public final class AlExecutionService extends Service {
     private ExecutionEngine engine;
     private AlExecutionDatabase database;
     private RoomExecutionStore executionStore;
+    private BridgeReceiptDeliveryCoordinator bridgeReceiptCoordinator;
     private AlNotificationFactory notifications;
     private PowerManager.WakeLock wakeLock;
 
@@ -61,6 +62,20 @@ public final class AlExecutionService extends Service {
         engine = ExecutionRuntime.create(this);
         database = AlExecutionDatabase.get(this);
         executionStore = new RoomExecutionStore(database);
+        bridgeReceiptCoordinator = new BridgeReceiptDeliveryCoordinator(
+            executionStore,
+            receipt -> {
+                JSONObject transportPayload = new JSONObject(receipt.wireJson)
+                    .put("_checkpointChecksum", receipt.checkpointChecksum)
+                    .put("_deliveryRoute", receipt.route);
+                if (receipt.relayMessageId != null) {
+                    transportPayload.put("_relayMessageId", receipt.relayMessageId);
+                }
+                if (!ExecutionRuntime.confirmAppliedResult(this, transportPayload.toString())) {
+                    throw new IllegalStateException("authority receipt transport is unavailable");
+                }
+            },
+            System::currentTimeMillis);
         PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AL:Execution");
         wakeLock.setReferenceCounted(false);
@@ -160,6 +175,12 @@ public final class AlExecutionService extends Service {
             continueAutomaticTask(turn, proactiveContinued);
             continueRolePlan(turn, continued);
             rolePlanCoordinator.completeForTurn(turn.turnId, System.currentTimeMillis());
+            java.util.List<ReplyPartEntity> notificationParts =
+                database.executionDao().replyParts(turn.turnId);
+            if (!AlNotificationPolicy.shouldNotifyCompletedTurn(
+                    turn.terminalDisposition, notificationParts.size(), turn.deletedAt != null)) {
+                continue;
+            }
             String key = "turn." + turn.turnId;
             int notificationId = AlNotificationFactory.messageNotificationId(turn.turnId);
             if (notified.getBoolean(key, false) || turn.notificationShownAt != null) {
@@ -194,6 +215,11 @@ public final class AlExecutionService extends Service {
     }
 
     private void confirmBridgeDelivery(ChatTurnEntity turn, SharedPreferences confirmed) {
+        if (ExecutionServicePolicy.shouldUseCanonicalReceipt(
+                turn.bridgeProtocolVersion, turn.state, turn.deletedAt)) {
+            confirmCanonicalBridgeDelivery(turn);
+            return;
+        }
         String key = "turn." + turn.turnId;
         if (confirmed.getBoolean(key, false)) {
             if (turn.uiAppliedAt != null && turn.cloudConfirmedAt == null) {
@@ -221,6 +247,28 @@ public final class AlExecutionService extends Service {
                 turn.turnId, turn.activeAttemptId, "WARN", "PHONE_RECEIPT_PENDING",
                 error.getMessage(), System.currentTimeMillis()
             );
+        }
+    }
+
+    private void confirmCanonicalBridgeDelivery(ChatTurnEntity turn) {
+        if (turn.cloudConfirmedAt != null) return;
+        try {
+            BridgeReceiptDeliveryCoordinator.Outcome outcome =
+                bridgeReceiptCoordinator.deliver(turn.turnId);
+            if (outcome.status == BridgeReceiptDeliveryCoordinator.OutcomeStatus.CONFIRMED) {
+                executionStore.recordDiagnostic(
+                    turn.turnId, turn.activeAttemptId, "INFO", "AUTHORITY_RECEIPT_CONFIRMED",
+                    outcome.receipt == null ? "" : outcome.receipt.idempotencyKey,
+                    System.currentTimeMillis());
+            } else if (outcome.status == BridgeReceiptDeliveryCoordinator.OutcomeStatus.RETRYABLE) {
+                executionStore.recordDiagnostic(
+                    turn.turnId, turn.activeAttemptId, "WARN", "AUTHORITY_RECEIPT_PENDING",
+                    outcome.reason, System.currentTimeMillis());
+            }
+        } catch (Exception error) {
+            executionStore.recordDiagnostic(
+                turn.turnId, turn.activeAttemptId, "WARN", "AUTHORITY_RECEIPT_PENDING",
+                error.getMessage(), System.currentTimeMillis());
         }
     }
 

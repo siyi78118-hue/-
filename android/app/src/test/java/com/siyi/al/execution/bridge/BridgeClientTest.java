@@ -10,9 +10,14 @@ import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.AuthorityIdentity;
 import com.siyi.al.execution.BridgeAuthority;
 import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -270,9 +275,7 @@ public class BridgeClientTest {
         transport.responses.add(new BridgeClient.HttpResult(200,
             canonicalSkipWire(lineage, remoteTurnId)
                 .put("terminal", true).put("recoveryAckSeq", 7L).toString()));
-        BridgeClient client = new BridgeClient(
-            config("http://lan.example"), null, transport,
-            new MutableTime(1784400000000L), millis -> {}, null);
+        BridgeClient client = receiptClient(transport, new MutableTime(1784400000000L));
 
         BridgeResult result = client.sendLan(canonicalV3Submission(
             "local_lan_v3_immediate", remoteTurnId, lineage, 1L));
@@ -312,9 +315,8 @@ public class BridgeClientTest {
         FakeTransport transport = new FakeTransport();
         transport.responses.add(new BridgeClient.HttpResult(200,
             canonicalFailureWire(lineage, remoteTurnId, true).toString()));
-        BridgeClient client = new BridgeClient(
-            config("http://lan.example"), null, transport,
-            new MutableTime(1784400000000L), millis -> {}, null);
+        BridgeClient client = receiptClient(
+            transport, new MutableTime(1784400000000L));
 
         BridgeResult result = client.sendLan(canonicalV3Submission(
             "local_lan_v3_failure", remoteTurnId, lineage, 1L));
@@ -569,6 +571,222 @@ public class BridgeClientTest {
         assertEquals("received", result.paymentStatus);
     }
 
+    @Test public void canonicalAuthorityReceiptUsesTheV3GroupPathAndExactWireBytes() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport,
+            new MutableTime(1784400000000L), millis -> {}, null);
+        JSONObject decoded = authorityReceiptWire(
+            "turn_receipt_lan", "lineage_receipt_lan", "lan", null);
+        JSONObject wire = receiptWireOnly(decoded);
+
+        assertTrue(client.confirmAppliedResult(decoded.toString()));
+        assertEquals(1, transport.targets.size());
+        assertTrue(transport.targets.get(0).endsWith(
+            "/v3/groups/" + AuthorityIdentity.groupId("lineage_receipt_lan") + "/delivery-receipt"));
+        assertEquals(BridgeAuthority.canonicalJson(wire), transport.bodies.get(0));
+    }
+
+    @Test public void cloudReceiptEncryptsTheExistingAuthorityWireWithoutRebuildingIdentity() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        BridgeClient client = receiptClient(
+            transport, new MutableTime(1784400000000L));
+        JSONObject decoded = authorityReceiptWire("turn_receipt_cloud", "lineage_receipt_cloud");
+        JSONObject wire = receiptWireOnly(decoded);
+
+        assertTrue(client.confirmAppliedResult(decoded.toString()));
+        assertEquals(2, transport.targets.size());
+        JSONObject enqueue = new JSONObject(transport.bodies.get(0));
+        assertEquals(
+            BridgeAuthority.canonicalJson(wire),
+            decrypt(enqueue.getString("ciphertext"), enqueue.getString("nonce")));
+        assertEquals("relay_turn_receipt_cloud", new JSONObject(transport.bodies.get(1))
+            .getJSONArray("messageIds").getString(0));
+    }
+
+    @Test public void skipReceiptSupportsZeroItemsAndRetryKeepsWireIdempotencyAndDeliveredAtStable() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(500, "{}"));
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        MutableTime time = new MutableTime(1784400000000L);
+        BridgeClient client = receiptClient(transport, time);
+        JSONObject decoded = authorityReceiptWire("turn_receipt_retry", "lineage_receipt_retry");
+
+        try {
+            client.confirmAppliedResult(decoded.toString());
+        } catch (BridgePendingException expected) {
+            // The remote may accept the retry later; the receipt identity must not change.
+        }
+        time.now += 90_000L;
+        assertTrue(client.confirmAppliedResult(decoded.toString()));
+
+        assertEquals(3, transport.targets.size());
+        JSONObject first = new JSONObject(transport.bodies.get(0));
+        JSONObject second = new JSONObject(transport.bodies.get(1));
+        assertEquals(first.getString("idempotencyKey"), second.getString("idempotencyKey"));
+        assertEquals(
+            decrypt(first.getString("ciphertext"), first.getString("nonce")),
+            decrypt(second.getString("ciphertext"), second.getString("nonce")));
+        assertEquals(
+            new JSONObject(decrypt(first.getString("ciphertext"), first.getString("nonce")))
+                .getLong("deliveredAt"),
+            new JSONObject(decrypt(second.getString("ciphertext"), second.getString("nonce")))
+                .getLong("deliveredAt"));
+    }
+
+    @Test public void changedAuthorityIdentityIsRejectedBeforeAnySendOrAck() throws Exception {
+        String[] changedWireFields = new String[] {
+            "visibleGroupId", "commitChecksum", "peerId", "turnId"
+        };
+        for (String field : changedWireFields) {
+            FakeTransport transport = new FakeTransport();
+            transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+            transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+            BridgeClient client = receiptClient(
+                transport, new MutableTime(1784400000000L));
+            JSONObject valid = authorityReceiptWire("turn_changed_" + field, "lineage_changed_" + field);
+            assertTrue(client.confirmAppliedResult(valid.toString()));
+            int sendsBeforeMutation = transport.targets.size();
+
+            JSONObject changed = new JSONObject(valid.toString());
+            if ("visibleGroupId".equals(field)) changed.put(field, AuthorityIdentity.groupId("forged"));
+            else if ("commitChecksum".equals(field)) changed.put(field, repeat('e', 64));
+            else changed.put(field, "changed_" + field);
+            try {
+                client.confirmAppliedResult(changed.toString());
+                throw new AssertionError(field + " must be rejected");
+            } catch (IllegalArgumentException expected) {
+                // Closed authority identity changes must never reach transport or ACK.
+            }
+            assertEquals(sendsBeforeMutation, transport.targets.size());
+        }
+
+        FakeTransport routeTransport = new FakeTransport();
+        routeTransport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        routeTransport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        BridgeClient routeClient = receiptClient(
+            routeTransport, new MutableTime(1784400000000L));
+        JSONObject validRoute = authorityReceiptWire("turn_changed_route", "lineage_changed_route");
+        assertTrue(routeClient.confirmAppliedResult(validRoute.toString()));
+        int sendsBeforeRoute = routeTransport.targets.size();
+        JSONObject changedRoute = new JSONObject(validRoute.toString()).put("_deliveryRoute", "lan");
+        try {
+            routeClient.confirmAppliedResult(changedRoute.toString());
+            throw new AssertionError("route must be rejected");
+        } catch (IllegalArgumentException expected) {
+            // expected
+        }
+        assertEquals(sendsBeforeRoute, routeTransport.targets.size());
+    }
+
+    private static JSONObject authorityReceiptWire(String turnId, String lineage) throws Exception {
+        return authorityReceiptWire(turnId, lineage, "cloud", "relay_" + turnId);
+    }
+
+    private static JSONObject authorityReceiptWire(
+        String turnId, String lineage, String route, String relayMessageId
+    ) throws Exception {
+        JSONObject checkpoint = authorityV12Checkpoint(turnId, lineage, route, relayMessageId);
+        JSONObject result = checkpoint.getJSONObject("outcome").getJSONObject("result");
+        JSONObject outcome = checkpoint.getJSONObject("outcome");
+        JSONObject receipt = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "AUTHORITY_DELIVERY_RECEIPT")
+            .put("peerId", "device_123456")
+            .put("turnId", result.getString("turnId"))
+            .put("authorityLineageKey", result.getString("authorityLineageKey"))
+            .put("visibleGroupId", result.getString("visibleGroupId"))
+            .put("commitChecksum", result.getString("commitChecksum"))
+            .put("terminalDisposition", result.getString("terminalDisposition"))
+            .put("deliveredAt", 1784400000130L)
+            .put("_checkpointChecksum", BridgeAuthority.sha256CanonicalJson(checkpoint));
+        receipt.put("_deliveryRoute", outcome.getString("route"));
+        if (outcome.isNull("relayMessageId")) {
+            receipt.remove("_relayMessageId");
+        } else {
+            receipt.put("_relayMessageId", outcome.getString("relayMessageId"));
+        }
+        return receipt;
+    }
+
+    private static JSONObject receiptWireOnly(JSONObject decoded) throws Exception {
+        JSONObject wire = new JSONObject(decoded.toString());
+        wire.remove("_deliveryRoute");
+        wire.remove("_relayMessageId");
+        wire.remove("_checkpointChecksum");
+        return wire;
+    }
+
+    private static JSONObject authorityV12Checkpoint(
+        String turnId, String lineage, String route, String relayMessageId
+    ) throws Exception {
+        JSONObject result = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("turnId", turnId)
+            .put("roleId", "yuqi")
+            .put("authorityOrigin", "pc")
+            .put("authorityLineageKey", lineage)
+            .put("visibleGroupId", AuthorityIdentity.groupId(lineage))
+            .put("lineageRevision", 1L)
+            .put("turnRevision", 1L)
+            .put("laneKey", "private_chat")
+            .put("laneRevision", 1L)
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("generationFingerprint", JSONObject.NULL)
+            .put("releaseId", "release_v3")
+            .put("commitPayloadVersion", "pc-visible-commit-v2")
+            .put("commitChecksum", repeat('a', 64))
+            .put("terminalDisposition", "skip")
+            .put("replyParts", new JSONArray())
+            .put("actions", new JSONArray());
+        JSONObject envelope = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("turnId", turnId)
+            .put("characterId", "yuqi")
+            .put("deviceId", "device_123456")
+            .put("deviceSeq", 1L)
+            .put("createdAt", 1784400000000L)
+            .put("authority", new JSONObject()
+                .put("lineageKey", lineage)
+                .put("claimedLineageRevision", 1L)
+                .put("laneKey", "private_chat")
+                .put("retryOfTurnId", JSONObject.NULL));
+        return new JSONObject()
+            .put("version", 1L)
+            .put("localTurnId", "local_" + turnId)
+            .put("attemptId", "attempt_" + turnId)
+            .put("attemptSequence", 1L)
+            .put("authoritativeTurnId", turnId)
+            .put("authorityLineageKey", lineage)
+            .put("claimedLineageRevision", 1L)
+            .put("retryOfTurnId", JSONObject.NULL)
+            .put("laneKey", "private_chat")
+            .put("inputVisibilitySequence", 1L)
+            .put("inputClearEpoch", 0L)
+            .put("normalizedEnvelope", envelope)
+            .put("envelopeChecksum", BridgeAuthority.sha256CanonicalJson(envelope))
+            .put("outcome", new JSONObject()
+                .put("type", "committed")
+                .put("route", route)
+                .put("relayMessageId", relayMessageId == null ? JSONObject.NULL : relayMessageId)
+                .put("failure", JSONObject.NULL)
+                .put("result", result)
+                .put("redactedAt", JSONObject.NULL));
+    }
+
+    private static String decrypt(String ciphertext, String nonce) throws Exception {
+        byte[] key = Base64.getDecoder().decode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(key, "AES"),
+            new GCMParameterSpec(128, Base64.getDecoder().decode(nonce)));
+        return new String(cipher.doFinal(Base64.getDecoder().decode(ciphertext)), StandardCharsets.UTF_8);
+    }
+
     private static TurnSubmission directSubmission(long createdAt) {
         return new TurnSubmission(
             "turn_phone_1", "yuqi", "msg_phone_1", TurnKind.DIRECT_REPLY,
@@ -717,13 +935,29 @@ public class BridgeClientTest {
         );
     }
 
+    private static BridgeClient receiptClient(FakeTransport transport, MutableTime time) {
+        return new BridgeClient(
+            config("http://lan.example"), null, transport, time, millis -> {}, null, null,
+            new BridgeClient.Base64Codec() {
+                @Override public byte[] decode(String value) {
+                    return Base64.getDecoder().decode(value);
+                }
+
+                @Override public String encode(byte[] value) {
+                    return Base64.getEncoder().encodeToString(value);
+                }
+            });
+    }
+
     private static final class FakeTransport implements BridgeClient.Transport {
         final ArrayDeque<BridgeClient.HttpResult> responses = new ArrayDeque<>();
         final List<String> targets = new ArrayList<>();
         final List<String> nonces = new ArrayList<>();
+        final List<String> bodies = new ArrayList<>();
 
         @Override public BridgeClient.HttpResult request(String method, String target, String body, String[][] headers) {
             targets.add(target);
+            bodies.add(body);
             String nonce = "";
             for (String[] header : headers) if ("X-Yuqi-Nonce".equals(header[0])) nonce = header[1];
             nonces.add(nonce);

@@ -2,10 +2,26 @@ package com.siyi.al.execution;
 
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.Set;
 import org.json.JSONObject;
 
 public final class BridgeReceiptCheckpoint {
+    private static final Set<String> AUTHORITY_CHECKPOINT_KEYS = new HashSet<>(Arrays.asList(
+        "version", "localTurnId", "attemptId", "attemptSequence",
+        "authoritativeTurnId", "authorityLineageKey", "claimedLineageRevision",
+        "retryOfTurnId", "laneKey", "inputVisibilitySequence", "inputClearEpoch",
+        "normalizedEnvelope", "envelopeChecksum", "outcome"));
+    private static final Set<String> AUTHORITY_OUTCOME_KEYS = new HashSet<>(Arrays.asList(
+        "type", "route", "relayMessageId", "failure", "result", "redactedAt"));
+
     private BridgeReceiptCheckpoint() {}
+
+    public static boolean mayReadLegacyMemoryResult(Integer bridgeProtocolVersion) {
+        return bridgeProtocolVersion == null || bridgeProtocolVersion != 3;
+    }
 
     public static JSONObject extract(String memoryResult) {
         if (memoryResult == null || !memoryResult.trim().startsWith("{")) return null;
@@ -56,11 +72,67 @@ public final class BridgeReceiptCheckpoint {
         }
     }
 
+    public static JSONObject extractAuthorityReceiptFromV12Checkpoint(
+        String checkpointJson,
+        String checkpointChecksum
+    ) {
+        if (checkpointJson == null || checkpointChecksum == null) return null;
+        try {
+            JSONObject checkpoint = new JSONObject(checkpointJson);
+            Object version = checkpoint.opt("version");
+            if (!AUTHORITY_CHECKPOINT_KEYS.equals(keysOf(checkpoint))
+                || !(version instanceof Number)
+                || version instanceof Float
+                || version instanceof Double
+                || ((Number) version).longValue() != 1L
+                || !checkpointChecksum.equals(BridgeAuthority.sha256CanonicalJson(checkpoint))) {
+                return null;
+            }
+            JSONObject outcome = checkpoint.optJSONObject("outcome");
+            if (outcome == null
+                || !AUTHORITY_OUTCOME_KEYS.equals(keysOf(outcome))
+                || !"committed".equals(outcome.opt("type"))
+                || outcome.opt("failure") != JSONObject.NULL
+                || outcome.opt("redactedAt") != JSONObject.NULL) {
+                return null;
+            }
+            Object routeValue = outcome.opt("route");
+            if (!(routeValue instanceof String)) return null;
+            String route = (String) routeValue;
+            Object relayValue = outcome.opt("relayMessageId");
+            String relay = relayValue == JSONObject.NULL
+                ? null : requireNonEmptyString(outcome, "relayMessageId");
+            if (!("lan".equals(route) || "cloud".equals(route))
+                || ("lan".equals(route) && relay != null)
+                || ("cloud".equals(route) && relay == null)) {
+                return null;
+            }
+            JSONObject resultJson = outcome.optJSONObject("result");
+            if (resultJson == null) return null;
+            BridgeResult result = BridgeTurnStatus.parseV3(
+                BridgeAuthority.canonicalJson(resultJson), route, relay);
+            if (result.kind != BridgeResult.Kind.CANONICAL_TERMINAL) return null;
+            JSONObject extracted = result.authorityPayload();
+            extracted.put("_deliveryRoute", route);
+            if (relay != null) extracted.put("_relayMessageId", relay);
+            return extracted;
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private static String requireNonEmptyString(JSONObject value, String key) {
         Object raw = value.opt(key);
         if (!(raw instanceof String) || ((String) raw).isEmpty()) {
             throw new IllegalArgumentException("bridge checkpoint " + key + " conflict");
         }
         return (String) raw;
+    }
+
+    private static Set<String> keysOf(JSONObject value) {
+        Set<String> keys = new HashSet<>();
+        Iterator<String> iterator = value.keys();
+        while (iterator.hasNext()) keys.add(iterator.next());
+        return keys;
     }
 }

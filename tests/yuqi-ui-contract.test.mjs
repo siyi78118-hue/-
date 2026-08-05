@@ -462,6 +462,58 @@ test('acknowledged native completions remain recoverable until their exact bubbl
   assert.doesNotMatch(landing, /message\.replyToMessageId\s*===\s*userMessage\.id/);
 });
 
+test('an applied action-only native result is a UI landing without a chat bubble', () => {
+  const landingSource = html.slice(
+    html.indexOf('function nativeTurnHasUiLanding'),
+    html.indexOf('async function drainNativeUiInbox')
+  );
+  const makeLanding = new Function(
+    'allChats',
+    'allMoments',
+    `${landingSource}; return nativeTurnHasUiLanding;`
+  );
+  const nativeTurnHasUiLanding = makeLanding({
+    yuqi: { messages: [] }
+  }, []);
+
+  assert.equal(nativeTurnHasUiLanding({
+    turnId: 'turn_action_only',
+    characterId: 'yuqi',
+    kind: 'DIRECT_REPLY',
+    terminalDisposition: 'action_only',
+    replyParts: [{ replyPartId: 'act_1', type: 'PLAN', payloadJson: '{}' }]
+  }), true);
+  assert.equal(nativeTurnHasUiLanding({
+    turnId: 'turn_visible_missing',
+    characterId: 'yuqi',
+    kind: 'DIRECT_REPLY',
+    terminalDisposition: 'visible',
+    replyParts: [{ replyPartId: 'msg_1', type: 'TEXT', content: '还没落地' }]
+  }), false);
+});
+
+test('v3 completion uses Room authority before legacy receipts and exposes its UI contract', () => {
+  const receiptFlow = executionService.slice(
+    executionService.indexOf('private void confirmBridgeDelivery'),
+    executionService.indexOf('private void acknowledgeCloudTurn')
+  );
+  assert.match(executionService, /new\s+BridgeReceiptDeliveryCoordinator\(/);
+  assert.ok(
+    receiptFlow.indexOf('shouldUseCanonicalReceipt') < receiptFlow.indexOf('attempt.memoryResult'),
+    'v3 must branch to the Room authority coordinator before the legacy memoryResult receipt'
+  );
+  assert.match(receiptFlow, /bridgeReceiptCoordinator\.deliver\(turn\.turnId\)/);
+  assert.match(executionService, /AlNotificationPolicy\.shouldNotifyCompletedTurn\(/);
+  for (const field of [
+    'bridgeProtocolVersion', 'authorityLineageKey', 'visibleGroupId', 'commitChecksum',
+    'terminalDisposition', 'lineageRevision', 'turnRevision', 'laneRevision',
+    'inputVisibilitySequence', 'inputClearEpoch', 'bridgeAuthorityCheckpointChecksum',
+    'bridgeDeliveryRoute', 'bridgeRelayMessageId'
+  ]) {
+    assert.match(plugin, new RegExp(`result\\.put\\("${field}"`), `plugin must expose ${field}`);
+  }
+});
+
 test('native text bubbles use deterministic per-turn part and chunk identities', () => {
   assert.match(html, /function\s+nativeReplyBubbleId\(turnId,\s*replyPartId,\s*chunkIndex\)/);
   assert.match(html, /nativeReplyBubbleId\(result\.turnId,\s*part\.replyPartId,\s*index\)/);

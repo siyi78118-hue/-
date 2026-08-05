@@ -24,4 +24,13 @@ public final class AlNotificationPolicy {
     public static int progressVisibility() {
         return Notification.VISIBILITY_SECRET;
     }
+
+    public static boolean shouldNotifyCompletedTurn(
+        String terminalDisposition,
+        int replyPartCount,
+        boolean deleted
+    ) {
+        if (deleted || replyPartCount <= 0) return false;
+        return terminalDisposition == null || "visible".equals(terminalDisposition);
+    }
 }

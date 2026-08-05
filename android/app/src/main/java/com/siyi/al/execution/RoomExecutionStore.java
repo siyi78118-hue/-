@@ -26,7 +26,8 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONObject;
 import org.json.JSONArray;
 
-public final class RoomExecutionStore implements ExecutionStore, ExecutionEngineStore {
+public final class RoomExecutionStore implements ExecutionStore, ExecutionEngineStore,
+    BridgeReceiptDeliveryCoordinator.Store {
     public enum DeliveryDisposition { APPLY, REDACTED }
     public static final class CanonicalCloudTarget {
         public final String localTurnId;
@@ -1023,6 +1024,177 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 inputClearEpoch, bridgeCommitChecksum, terminalDisposition, now
             ) != 1) throw bridgeAuthorityConflict(turnId);
         });
+    }
+
+    @Override
+    public BridgeReceiptDeliveryCoordinator.AuthoritySnapshot readAuthority(String localTurnId) {
+        AtomicReference<BridgeReceiptDeliveryCoordinator.AuthoritySnapshot> result =
+            new AtomicReference<>();
+        database.runInTransaction(() -> result.set(readAuthorityInternal(localTurnId)));
+        return result.get();
+    }
+
+    private BridgeReceiptDeliveryCoordinator.AuthoritySnapshot readAuthorityInternal(
+        String localTurnId
+    ) {
+        try {
+            ChatTurnEntity turn = requireTurn(localTurnId);
+            if (!isStoreOwnedV3(turn)
+                || !TurnState.COMPLETED.name().equals(turn.state)
+                || turn.activeAttemptId == null) {
+                throw bridgeAuthorityConflict(localTurnId);
+            }
+            ExecutionAttemptEntity attempt = dao.attempt(turn.activeAttemptId);
+            if (attempt == null
+                || !localTurnId.equals(attempt.turnId)
+                || attempt.sequence != dao.maxAttemptSequence(localTurnId)) {
+                throw bridgeAuthorityConflict(localTurnId);
+            }
+            JSONObject checkpoint = validateCheckpoint(turn, attempt, false);
+            assertCanonicalBridgeLifecycle(turn, attempt, false, checkpoint);
+            JSONObject outcome = checkpoint.getJSONObject("outcome");
+            String outcomeType = outcome.getString("type");
+            boolean redacted = "redacted".equals(outcomeType);
+            if (!(redacted || "committed".equals(outcomeType))
+                || redacted != (turn.deletedAt != null)) {
+                throw bridgeAuthorityConflict(localTurnId);
+            }
+            String route = requireNativeNonEmptyString(outcome, "route", localTurnId);
+            String relayMessageId = nullableString(outcome, "relayMessageId");
+            if (!("lan".equals(route) || "cloud".equals(route))
+                || ("lan".equals(route) && relayMessageId != null)
+                || ("cloud".equals(route) && relayMessageId == null)) {
+                throw bridgeAuthorityConflict(localTurnId);
+            }
+            if (!redacted && BridgeReceiptCheckpoint.extractAuthorityReceiptFromV12Checkpoint(
+                    attempt.bridgeAuthorityCheckpointJson,
+                    attempt.bridgeAuthorityCheckpointChecksum) == null) {
+                throw bridgeAuthorityConflict(localTurnId);
+            }
+            String peerId = requireNativeNonEmptyString(
+                checkpointEnvelope(checkpoint), "deviceId", localTurnId);
+            return new BridgeReceiptDeliveryCoordinator.AuthoritySnapshot(
+                localTurnId,
+                attempt.bridgeAuthorityCheckpointJson,
+                attempt.bridgeAuthorityCheckpointChecksum,
+                turn.uiAppliedAt,
+                redacted,
+                turn.cloudConfirmedAt != null,
+                peerId,
+                route,
+                relayMessageId);
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw bridgeAuthorityConflict(localTurnId);
+        }
+    }
+
+    @Override
+    public BridgeReceiptDeliveryCoordinator.ConfirmationResult confirmCloudReceiptExact(
+        BridgeReceiptDeliveryCoordinator.AuthorityReceipt receipt,
+        long confirmedAt
+    ) {
+        AtomicReference<BridgeReceiptDeliveryCoordinator.ConfirmationResult> result =
+            new AtomicReference<>();
+        database.runInTransaction(() -> result.set(
+            confirmCloudReceiptExactInternal(receipt, confirmedAt)));
+        return result.get();
+    }
+
+    private BridgeReceiptDeliveryCoordinator.ConfirmationResult confirmCloudReceiptExactInternal(
+        BridgeReceiptDeliveryCoordinator.AuthorityReceipt receipt,
+        long confirmedAt
+    ) {
+        if (receipt == null || receipt.localTurnId == null
+            || confirmedAt <= 0L || confirmedAt > 9007199254740991L) {
+            return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFLICT;
+        }
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot snapshot;
+        try {
+            snapshot = readAuthorityInternal(receipt.localTurnId);
+        } catch (RuntimeException error) {
+            return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFLICT;
+        }
+        if (!matchesAuthorityReceipt(snapshot, receipt)) {
+            return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFLICT;
+        }
+        ChatTurnEntity turn = dao.turn(receipt.localTurnId);
+        if (turn == null) return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFLICT;
+        if (turn.cloudConfirmedAt != null) {
+            return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFIRMED;
+        }
+        if (dao.compareAndSetCloudConfirmedExact(
+                receipt.localTurnId,
+                turn.activeAttemptId,
+                confirmedAt,
+                receipt.deliveredAt,
+                receipt.authorityLineageKey,
+                receipt.visibleGroupId,
+                receipt.commitChecksum,
+                receipt.terminalDisposition,
+                receipt.checkpointChecksum) == 1) {
+            return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFIRMED;
+        }
+        try {
+            BridgeReceiptDeliveryCoordinator.AuthoritySnapshot refreshed =
+                readAuthorityInternal(receipt.localTurnId);
+            ChatTurnEntity refreshedTurn = dao.turn(receipt.localTurnId);
+            if (!matchesAuthorityReceipt(refreshed, receipt) || refreshedTurn == null) {
+                return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFLICT;
+            }
+            if (refreshedTurn.cloudConfirmedAt == null) {
+                return BridgeReceiptDeliveryCoordinator.ConfirmationResult.RETRYABLE;
+            }
+            return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFIRMED;
+        } catch (RuntimeException error) {
+            return BridgeReceiptDeliveryCoordinator.ConfirmationResult.CONFLICT;
+        }
+    }
+
+    private static boolean matchesAuthorityReceipt(
+        BridgeReceiptDeliveryCoordinator.AuthoritySnapshot snapshot,
+        BridgeReceiptDeliveryCoordinator.AuthorityReceipt receipt
+    ) {
+        try {
+            if (snapshot == null || snapshot.redacted || snapshot.uiAppliedAt == null
+                || receipt.protocolVersion != 3
+                || !"AUTHORITY_DELIVERY_RECEIPT".equals(receipt.type)
+                || !snapshot.localTurnId.equals(receipt.localTurnId)
+                || !snapshot.checkpointChecksum.equals(receipt.checkpointChecksum)
+                || snapshot.uiAppliedAt.longValue() != receipt.deliveredAt
+                || !snapshot.peerId.equals(receipt.peerId)
+                || !snapshot.route.equals(receipt.route)
+                || !sameNullable(snapshot.relayMessageId, receipt.relayMessageId)
+                || !receipt.turnId.equals(receipt.authoritativeTurnId)) {
+                return false;
+            }
+            JSONObject payload = BridgeReceiptCheckpoint.extractAuthorityReceiptFromV12Checkpoint(
+                snapshot.checkpointJson, snapshot.checkpointChecksum);
+            if (payload == null
+                || !receipt.turnId.equals(payload.getString("turnId"))
+                || !receipt.authorityLineageKey.equals(payload.getString("authorityLineageKey"))
+                || !receipt.visibleGroupId.equals(payload.getString("visibleGroupId"))
+                || !receipt.commitChecksum.equals(payload.getString("commitChecksum"))
+                || !receipt.terminalDisposition.equals(payload.getString("terminalDisposition"))) {
+                return false;
+            }
+            JSONObject wire = new JSONObject()
+                .put("protocolVersion", 3)
+                .put("type", "AUTHORITY_DELIVERY_RECEIPT")
+                .put("peerId", receipt.peerId)
+                .put("turnId", receipt.turnId)
+                .put("authorityLineageKey", receipt.authorityLineageKey)
+                .put("visibleGroupId", receipt.visibleGroupId)
+                .put("commitChecksum", receipt.commitChecksum)
+                .put("terminalDisposition", receipt.terminalDisposition)
+                .put("deliveredAt", receipt.deliveredAt);
+            String wireJson = BridgeAuthority.canonicalJson(wire);
+            return wireJson.equals(receipt.wireJson)
+                && BridgeAuthority.sha256CanonicalJson(wire).equals(receipt.idempotencyKey);
+        } catch (Exception error) {
+            return false;
+        }
     }
 
     @Override

@@ -3251,6 +3251,10 @@ function nativeTurnHasUiLanding(result) {
   if (!chat) return false;
   const kind = String(result?.kind || 'DIRECT_REPLY');
   const sourceTurnId = `native:${result?.turnId || ''}`;
+  if (String(result?.terminalDisposition || '') === 'action_only') {
+    return (Array.isArray(result?.replyParts) ? result.replyParts : [])
+      .some(part => part && part.type !== 'TEXT' && String(part.replyPartId || '').trim());
+  }
   if (['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind)) {
     return (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
   }

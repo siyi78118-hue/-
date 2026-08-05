@@ -282,6 +282,31 @@ public interface AlExecutionDao {
     @Query("UPDATE chat_turns SET cloudConfirmedAt = :now WHERE turnId = :turnId AND state = 'COMPLETED' AND uiAppliedAt IS NOT NULL AND cloudConfirmedAt IS NULL")
     int markCloudConfirmed(String turnId, long now);
 
+    @Query("UPDATE chat_turns SET cloudConfirmedAt = :confirmedAt "
+        + "WHERE turnId = :turnId AND activeAttemptId = :attemptId "
+        + "AND state = 'COMPLETED' AND bridgeProtocolVersion = 3 "
+        + "AND uiAppliedAt = :deliveredAt AND cloudConfirmedAt IS NULL "
+        + "AND deletedAt IS NULL AND cancelledAt IS NULL "
+        + "AND authorityLineageKey = :lineageKey "
+        + "AND visibleGroupId = :visibleGroupId "
+        + "AND bridgeCommitChecksum = :commitChecksum "
+        + "AND terminalDisposition = :terminalDisposition "
+        + "AND EXISTS (SELECT 1 FROM execution_attempts a "
+        + "WHERE a.attemptId = :attemptId AND a.turnId = :turnId "
+        + "AND a.state = 'COMPLETED' "
+        + "AND a.bridgeAuthorityCheckpointChecksum = :checkpointChecksum)")
+    int compareAndSetCloudConfirmedExact(
+        String turnId,
+        String attemptId,
+        long confirmedAt,
+        long deliveredAt,
+        String lineageKey,
+        String visibleGroupId,
+        String commitChecksum,
+        String terminalDisposition,
+        String checkpointChecksum
+    );
+
     @Query("SELECT * FROM execution_attempts WHERE state IN ('MEMORY_RUNNING', 'MEMORY_DONE', 'CHAT_RUNNING', 'CHAT_DONE') ORDER BY startedAt ASC")
     List<ExecutionAttemptEntity> recoverableAttempts();
 
