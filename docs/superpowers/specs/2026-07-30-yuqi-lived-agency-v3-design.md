@@ -521,7 +521,9 @@ acceptanceCriteria
 
 ### 12.8 Android fallback
 
-新 APK 支持 cognition-v3 精简快照，同时读取 cognition-v2 和 memory-v1/chat-v1。fallback 读取相关硬约束、当前立场、关系阶段和最近完整对话。PC 恢复后不重写已显示结果，fallback 事实只进入待复核记录。v3 只有在请求明确没有被 PC 接受时才可 fallback；超时、丢响应和未知异常保持 receipt/replay 恢复，五分钟后转为可重试错误，不能用第二份本机生成结果掩盖权威不明。automatic fallback 的合法 skip 也必须形成本地 terminal receipt，但不得创建 reply group、通知或占位正文；direct fallback 不能 skip。
+新 APK 支持 cognition-v3 精简快照，同时读取 cognition-v2 和 memory-v1/chat-v1。fallback 读取相关硬约束、当前立场、关系阶段和最近完整对话。PC 恢复后不重写已显示结果，fallback 事实只进入待复核记录。v3 只有在请求明确没有被 PC 接受时才可 fallback；超时、丢响应和未知异常保持 receipt/replay 恢复，五分钟后转为可重试错误，不能用第二份本机生成结果掩盖权威不明。automatic fallback 的合法 skip 也必须形成本地 group identity 和 terminal receipt，但不得创建 reply part、action、通知或占位正文；direct fallback 不能 skip。
+
+`cognition-v3` 精简快照只描述角色当轮可用的认知语义，不承载 API 配置、system prompt 或模型 messages。本机执行所需内容使用独立闭集 `cognition-v3-fallback-v1` 载荷，并随同一 turn 在 Room 中持久化；该载荷还固定包含 Web 已生成并持久化的稳定 `deviceId`，不能在 fallback 或重启时临时随机生成。若本机桥接配置中已有非空 deviceId，它必须与载荷一致，即使配置处于 disabled。本地载荷不进入 cognition snapshot 的语义 checksum，也不得进入发往 PC 的 v3 envelope、外部 receipt 或诊断。为避免新增一个会漂移的数据库列，持久化的 `snapshotJson` 是本机 submission container：它由 compact cognition 的闭集语义字段和唯一保留键 `fallbackExecution` 组成。Android 必须先拆分并分别闭集校验，不能把整个 container 当成网络快照。直聊 envelope 只保留现有闭集 currentBatch/payment/retry/cursor 与另行提供的协议合法 scene，不能把 cognition-v3 对象硬塞进 `context.scene`；自动任务可在 `trigger.context.snapshot` 携带移除 fallbackExecution 后的 compact semantic view。两条路径都在 hash/上行前移除本地 device/config/system/messages。v1/v2 的旧 `packetType` 只保留为兼容读取，所有 v3 分流以闭集 `contract` 为准。
 
 ### 12.9 数据生命周期
 
@@ -1141,7 +1143,13 @@ fallback 只在以下情况取得本地提交权：
 
 连接超时、响应丢失和未知异常都属于“可能已被 PC 接受”，不得转成本地 fallback；它们保持 `BRIDGE_WAITING`，由 receipt/replay 恢复。这样牺牲模糊网络状态下的立即离线回复，换取不会出现 PC 与手机各生成一条的正确性。
 
-本机 fallback 在一个 Room 事务中 CAS 本地 lineage，写入确定性 group identity、任何 reply parts、结构化动作和 local receipt，authority origin 为 `android_fallback`；automatic skip 允许 reply/action 都为空但仍有 group identity/receipt，direct reply 为空则拒绝。checksum 使用独立且版本化的 `android-fallback-commit-v1/v2` 规范；历史 v1 原样重放，含 clear epoch 的新提交只写 v2。PC 历史 v1 同样原样重放，含 clear epoch 的新提交只写 `pc-visible-commit-v2`。同步恢复后，PC 只能把这个 terminal receipt 作为 external canonical result 导入：按其 payload version 验证相同 lineage/group/checksum，记录消息和 receipt，不运行 PC cognition、不写 PC state、不创建 outbox/通知。若 PC 已有不同 receipt，属于必须隔离的跨设备 authority conflict，不能选择其一继续显示。
+即使已经取得本地提交权，模型返回值也只是一份未授权 draft。`BridgeRouter` 只能在明确的本地授权结果下返回这份 draft；`ExecutionEngine` 必须完成解析、质量门和结构化动作校验，最后由 `RoomExecutionStore` 的单一事务生成 canonical local receipt。任何事务前的文本、隐藏标签、解析结果或临时 `BridgeResult` 都不构成可见权威，不得通知、同步或被 Web 读取。
+
+本机 fallback 在一个 Room 事务中 CAS 本地 lineage，写入确定性 group identity、已有 `ReplyPartEntity` 投影（其中包括 payment/moment/relationship/plan 等结构化部件）和 local receipt；规范化 action authority 列表保存在闭集 checkpoint/receipt 中，不为 Android 另造第二张 action 真相表。authority origin 为 `android_fallback`；automatic skip 允许 reply/action 都为空但仍有 group identity/receipt，direct reply 为空则拒绝。checksum 使用独立且版本化的 `android-fallback-commit-v1/v2` 规范；历史 v1 原样重放，含 clear epoch 的新提交只写 v2。PC 历史 v1 同样原样重放，含 clear epoch 的新提交只写 `pc-visible-commit-v2`。同步恢复后，PC 只能把这个 terminal receipt 作为 external canonical result 导入：按其 payload version 验证相同 lineage/group/checksum，记录消息和 receipt，不运行 PC cognition、不写 PC state、不创建 outbox/通知。导入 action 的执行所有权由 group/receipt 的 `android_fallback` origin 关闭，PC 不得二次执行，也不得修改已签名 action JSON 来伪造单行状态。若 PC 已有不同 receipt，属于必须隔离的跨设备 authority conflict，不能选择其一继续显示。
+
+本地 receipt 不是依附于某条可见消息的附加字段。Room v12 已有的 attempt checkpoint 两列保存闭集 local-fallback checkpoint；Task 14 不再加表或迁移，`authority_receipt` 是 `FallbackJournal` 从该持久 checkpoint 生成的确定性 journal 投影。Room 在同一提交事务中通过现有 `yuqi_sync_cursors` 的独立本机 allocator row 分配全局单调且可重启恢复的 journal sequence；raw message、annotation 与 authority receipt 三类生产者全部共用该事务分配器，旧的各自 `max+1` 路径必须移除，不能用时间或 turn 内 ordinal 代替。因此零气泡的 `skip` 也能同步。`FallbackJournal` 先同步 `authority_receipt`，再同步可选的消息投影。receipt entry 本身必须包含完成 PC 单事务导入所需的 normalized envelope、input batch/cursor identity、compact semantic cognition snapshot 及其 canonical checksum、完整有序 items/actions、manifest 与 checksum；随后到达的 message entry 只能作为同一权威的 exact-idempotent 投影，不能创建第二个结果。
+
+PC 导入 Android fallback 时必须创建一个可通过当前 v13/v14 重启不变量的完整 mirror authority：release registry row、turn、lineage、input batch、attempt commitment、group、items/actions、manifest 与 receipt 必须一起成立。Android fallback release 使用确定性 `android_fallback:<contractChecksum>` 标识和静态闭集元数据；其 `releaseChecksum` 是 `{origin:'android_fallback', contract:'cognition-v3-fallback-v1', contractChecksum, codecVersion:1}` 的 canonical hash，PC mirror turn 的 authoritative pipeline checksum 必须逐字取该值。它只证明本机 fallback contract，不伪装成 PC 模型 release，也不进入 rollout/canary 证据。相同 receipt 重放零写返回原 receipt；不同 receipt、已有 PC authority、跨设备合并或试图恢复已 redacted authority 都以独立、去重的脱敏冲突诊断拒绝，不能在失败的导入事务中把诊断一并回滚掉。只有完整导入成功后才能推进 recovery ACK。
 
 #### 13.3.6 group-based outbox
 

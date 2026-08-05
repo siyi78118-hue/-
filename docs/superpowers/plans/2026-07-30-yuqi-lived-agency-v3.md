@@ -6387,21 +6387,83 @@ git commit -m "feat: carry visible conversation authority through bridge"
 - Create: `android/app/src/main/java/com/siyi/al/execution/FallbackCognitionPacketCodec.java`
 - Create: `android/app/src/test/java/com/siyi/al/execution/FallbackCognitionPacketCodecTest.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngineStore.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/LiveReplyQualityGate.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/FallbackJournal.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/BridgeReceiptCheckpoint.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/LiveReplyQualityGateTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/FallbackJournalTest.java`
+- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
 - Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/reconcile.mjs`
 - Create: `yuqi-runtime/test/android-fallback-authority.test.mjs`
+- Modify: `yuqi-runtime/test/reconcile.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
+- Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
+- Create: `android/app/src/test/resources/fixtures/cognition-v3.json`
+- Create: `android/app/src/test/resources/fixtures/cognition-v2.json`
+- Create: `android/app/src/test/resources/fixtures/memory-v1.json`
+- Create: `android/app/src/test/resources/fixtures/chat-v1.json`
+- Create: `tests/fixtures/android-fallback-authority-v2.json`
 
 **Interfaces:**
 - Consumes: Task 12 local lineage, Task 13 shared IDs, `cognition-v3`, `cognition-v2`, `memory-v1`, and `chat-v1` snapshots.
-- Produces: `FallbackCognitionPacketCodec.decode(JSONObject) -> FallbackContext`; ambiguity-safe fallback routing; one Room local receipt; idempotent PC import of an already-visible Android result.
+- Produces: `FallbackCognitionPacketCodec.decode(JSONObject) -> FallbackContext`; a separate closed `FallbackExecution` carrier; ambiguity-safe fallback routing; one Room local receipt; idempotent PC import of an already-visible Android result.
+
+#### Task 14 authority and payload contract
+
+`cognition-v3` remains a compact semantic view. Its semantic-view key set is exactly the object returned by `withCognitionV3Snapshot()` in Task 15: `contract`, `schemaVersion`, `roleId`, `hardConstraints`, `preferences`, `currentStances`, `relationship`, `recentGroups`, `verifiedFacts`, `lifeSignals`, and `authorSettings`. The local `snapshotJson` is a submission container: `buildNativeExecutionSnapshot()` stores that semantic view plus the reserved local-only `fallbackExecution` key so a restart before first prepare cannot lose model inputs. The semantic checksum is computed after splitting the container and removing `fallbackExecution`; LAN/cloud `BridgeInput` projection always removes the reserved key.
+
+The reserved local `fallbackExecution` object is a separate closed member of that submission container when local execution is possible:
+
+```json
+{
+  "contract": "cognition-v3-fallback-v1",
+  "deviceId": "<stable native device id>",
+  "cognition": { "configId": "<1..128 chars>", "system": "<0..65536 UTF-8 bytes>", "messages": "<0..200 ordered messages, 512 KiB total>" },
+  "expression": { "configId": "<1..128 chars>", "system": "<0..65536 UTF-8 bytes>", "messages": "<0..200 ordered messages, 512 KiB total>" }
+}
+```
+
+The local object's exact keys are `contract`, `deviceId`, `cognition`, and `expression`; the two nested model objects have no keys other than `configId`, `system`, and `messages`. `deviceId` is the stable native installation/bridge identity already supplied by the Web settings and persisted with the turn; it is not generated during fallback or after restart. When a non-empty `BridgeConfig.deviceId` exists it must equal this value, even if the bridge is disabled. A disabled bridge therefore authorizes the route without making `bridgeDeviceId()` throw or creating a random replacement identity. Messages use the existing supported content shape (including the current ordered `{role,content}` memory/chat form), are checked for native types and bounded UTF-8/array size, and are never required to invent IDs or sequence fields. `FallbackCognitionPacketCodec` first splits the submission container into the exact semantic view and this reserved local object. `fallbackExecution` is restored from the container/checkpoint, is never folded into the semantic checksum, and is never serialized into a LAN/cloud envelope. `BridgeInput.prepareV3Envelope()` never serializes the submission container. Direct turns keep the existing closed v3 `context` facts (`currentBatch`, payment, retry, visibility cursor, and only a separately supplied protocol-valid scene); they do not put the cognition-v3 semantic object into `context.scene`. Automatic turns may place a copy of the compact semantic view at `trigger.context.snapshot`. Both paths explicitly drop `fallbackExecution`, device/config IDs, system prompts, and model messages before envelope hashing. The only fallback discriminator is `contract`. `packetType` is accepted solely by the explicitly named v1/v2 compatibility decoder and is never used to select a v3 path; v1/v2 envelope bytes remain unchanged.
+
+The four v3 route outcomes are one closed enum shared by Android and PC:
+
+```text
+LOCAL_FALLBACK_ALLOWED  = bridge disabled before any remote call
+                         | every attempted route explicitly returns NOT_ACCEPTED_ALLOW_FALLBACK
+REMOTE_OWNS_AUTHORITY   = CLOUD_ACCEPTED | BRIDGE_WAITING
+AUTHORITY_AMBIGUOUS     = deadline | lost response | timeout | unknown exception
+REMOTE_FINAL_FAILURE    = explicit final failure without fallback permission
+```
+
+Only `LOCAL_FALLBACK_ALLOWED` may invoke `NativeModelGateway` locally. `AUTHORITY_AMBIGUOUS` persists `BRIDGE_WAITING`, does not call the local model, and later reconciles/polls/replays. At the five-minute global limit it exposes `FAILED_RETRYABLE/AUTHORITY_UNRESOLVED` while retaining the open lineage. No HTTP status, timeout, retryable exception, or caller-supplied boolean may be converted into `NOT_ACCEPTED_ALLOW_FALLBACK`. v1/v2 retain their existing routing and fallback behavior byte-for-byte.
+
+Even after local execution is authorized, the local model output is only a draft. `BridgeRouter` may return that draft only for `LOCAL_FALLBACK_ALLOWED`; `ExecutionEngine` then runs the existing parser, `LiveReplyQualityGate`, terminal-disposition rules, and structured-action target validation before calling the store. No temporary `BridgeResult`, raw reply, hidden directive, or parsed action becomes visible, notifiable, or journaled before the Room authority transaction commits.
+
+`RoomExecutionStore.commitAndroidFallbackInternal(...)` is one Android Room transaction that re-reads the open `ConversationAuthorityEntity`, active terminal `ChatTurnEntity`/`ExecutionAttempt` checkpoint, checkpoint checksum, cursor/clear epoch, and lane revision; derives the complete input batch and authority IDs; inserts the existing Android `ReplyPartEntity` rows, including the already-supported typed structured parts such as payment/moment/relationship/plan (or an automatic zero-part/zero-action `skip` with a deterministic group identity and receipt); stores the corresponding closed action-authority projections in checkpoint v2/receipt instead of inventing a second Android action table; CASes the local authority to committed; writes `commitPayloadVersion='android-fallback-commit-v2'`, `authorityOrigin='android_fallback'`, `journalSyncSeq`, and `nativeCompleted`. A direct fallback cannot produce `skip`. It never writes PC cognition/state/stance/memory/comparison/outbox/notification rows; PC `turns/...` mirror rows are created only by the later import transaction.
+
+`reconcile.importExternalVisibleReceiptInternal(receipt)` is the only PC import entry point. It validates all Task 10/13 IDs and commitments, then in one transaction creates or exact-replays the complete mirror graph: `turn_authority_lineages`, root/attempt `turns`, `current_user_batches`/items and their message identity projections, the required existing lane/cursor joins, visible group/items/actions, manifest, and commit receipt. The external receipt and manifest are the import proof; PC never creates `cloud_deliveries` or an outbox row for this mirror. It reuses verified immutable parent projections and never invents missing parents. Android remains the execution owner for every imported action because the enclosing group/receipt origin is `android_fallback`; the PC action executor and outbox must reject that origin instead of adding a fictitious per-action status field or executing it again. It writes no PC cognition/state/stance/memory/comparison/outbox/notification/evidence rows and only advances visibility cursors monotonically. ACK is sent only after commit. Same lineage/group/checksum replay is idempotent; a different receipt records at most one redacted `authority_conflict` diagnostic in a separate transaction and is not ACKed. Redacted/cancelled sources cannot be resurrected.
+
+The non-PC execution release is a real immutable row in the existing `pipeline_releases` table, not a fabricated model release. For contract checksum `C`, use `release_id='android_fallback:' + C`; `release_checksum` is the deterministic canonical hash of the closed metadata `{origin:'android_fallback', contract:'cognition-v3-fallback-v1', contractChecksum:C, codecVersion:1}` (never a hash of `now` or a generated model release). Required existing columns use closed values (`pipeline_version='android-fallback-v2'`, `preset_version=C`, `evaluator_version='android-fallback-authority-v1'`, `created_at=0`, and model/component JSON containing only the same origin/contract/checksum metadata). Creation is insert-or-exact-replay; a same-ID/different-checksum row is a hard conflict. The imported PC turn/group stores `authoritativeReleaseId='android_fallback:' + C` and `authoritativePipelineChecksum=release_checksum`, and every manifest/receipt checksum join uses that metadata hash. Reopen validates every Android fallback turn/group/receipt against this registry row. No schema version increase is permitted; if the existing required columns cannot store this closed metadata, stop before implementation with the exact missing-column evidence.
+
+The Android local checkpoint and journal are versioned independently from the PC remote checkpoint: local fallback uses `bridgeAuthorityCheckpoint.version=2` with the closed local-only fields `fallbackExecution`, `journalSyncSeq`, and the v2 receipt payload; the Task 13 remote checkpoint remains version 1 with its existing closed key set. Version 2 is stored in the two existing nullable `ExecutionAttemptEntity` checkpoint columns added by Room v12; Task 14 adds no entity, table, or migration. The `authority_receipt` journal entry is a deterministic `FallbackJournal` projection of that persisted v2 checkpoint, not a second mutable copy or placeholder message. `BridgeReceiptCheckpoint` and Room reopen validation must branch explicitly on version 1 versus version 2, never widen the v1 allow-list. `journalSyncSeq` is allocated through one `AlExecutionDao` transaction using a reserved allocator row in the existing `yuqi_sync_cursors` table (separate from the `yuqi_pc` ACK cursor), is a positive safe integer globally monotonic per device across raw-message, annotation, and authority-receipt journal sources, and is persisted in checkpoint v2. `RoomBridgeMirror`, `AlExecutionPlugin` annotation/import writers, and local fallback commit must all use this allocator; no remaining producer may use its own `maxRawSyncSeq/maxAnnotationSyncSeq + 1`. It never derives from a turn-local reply ordinal or wall-clock time. `FallbackJournal` enumerates `authority_receipt` by this sequence, so automatic `skip` cannot depend on a message sequence.
+
+Every `authority_receipt` entry contains the complete normalized payload needed for one PC import: lineage/turn/group identity, terminal disposition, ordered input batch, ordered reply items/actions, cursor/clear epoch, the compact semantic cognition snapshot plus its `agencySnapshotChecksum`, release contract/checksum, `journalSyncSeq`, and the canonical commit checksum. `agencySnapshotChecksum` is the canonical SHA-256 of the compact semantic snapshot after `fallbackExecution` is removed, and becomes the imported turn's immutable `agency_snapshot_checksum`; PC can therefore recompute it without receiving local model configuration. The entry explicitly excludes `fallbackExecution`, device/config IDs, system prompts, and model messages; those remain local checkpoint material. The receipt entry is durable before any subsequent ordinary message projection. A later message entry may only exact-idempotently reference the same authority group/item identity; it cannot create a second authority or supply missing semantic fields. Automatic `skip` still has a deterministic group identity and receipt, but exactly zero reply parts and zero actions; it is never represented as “no group.”
+
+The imported mirror must satisfy the existing v13/v14 reopen invariants before ACK: `resultAuthorityVersion=1`, `lineageRevisionAtCreation>=1`, one complete input batch and attempt commitment, non-null agency snapshot checksum, `turns.rollout_key` in the closed kind set, immutable release join to the `android_fallback:<contractChecksum>` row, exact lineage/group/manifest/receipt/action commitments, and the required lane/cursor joins. Close/reopen must validate this graph and the release row; no import is accepted merely because a group row exists.
 
 - [ ] **Step 1: Write red codec compatibility and authority tests**
 
@@ -6441,20 +6503,24 @@ public void ambiguousTimeoutNeverAuthorizesV3Fallback() {
 public void explicitNotAcceptedOrDisabledBridgeCanCommitOneLocalReceipt() {
     lan.failWith(explicitNotAccepted());
     cloud.failWith(explicitNotAccepted());
-    BridgeResult result = router.execute(v3Submission());
-    assertEquals("android_fallback", result.authorityOrigin);
-    assertEquals(AuthorityIdentity.groupId(result.authorityLineageKey),
-        result.visibleGroupId);
-    assertEquals(1, dao.authorityCount(result.authorityLineageKey));
-    assertEquals(1, dao.replyGroupCount(result.visibleGroupId));
+    engine.runPrepared(v3Submission());
+    ChatTurnEntity turn = dao.turn(v3Submission().turnId);
+    ConversationAuthorityEntity authority = dao.conversationAuthority(turn.authorityLineageKey);
+    assertEquals("android_fallback", turn.authorityOrigin);
+    assertEquals(AuthorityIdentity.groupId(turn.authorityLineageKey), turn.visibleGroupId);
+    assertEquals("COMMITTED", authority.state);
+    assertNotNull(turn.bridgeCommitChecksum);
 }
 
 @Test
-public void automaticFallbackSkipCommitsReceiptWithoutReplyGroup() {
-    BridgeResult result = router.execute(v3AutomaticSubmissionWithNoMotive());
-    assertEquals("skip", result.terminalDisposition);
-    assertEquals(1, dao.authorityCount(result.authorityLineageKey));
-    assertEquals(0, dao.replyGroupCount(result.visibleGroupId));
+public void automaticFallbackSkipCommitsGroupReceiptWithoutReplyParts() {
+    TurnSubmission submission = v3AutomaticSubmissionWithNoMotive();
+    engine.runPrepared(submission);
+    ChatTurnEntity turn = dao.turn(submission.turnId);
+    assertEquals("skip", turn.terminalDisposition);
+    assertNotNull(turn.visibleGroupId);
+    assertEquals(0, dao.replyPartCount(turn.turnId));
+    assertEquals(0, BridgeReceiptCheckpoint.localActions(dao.activeAttempt(turn.turnId)).size());
     assertEquals(0, notifications.count());
 }
 ```
@@ -6490,18 +6556,22 @@ test('different PC and Android receipts for one lineage are quarantined, never m
 });
 ```
 
+The fixture boundary is explicit: the four Android JSON files are loaded from `android/app/src/test/resources/fixtures/` by `readFixture(...)`; `tests/fixtures/android-fallback-authority-v2.json` is the deterministic PC/reconcile matrix. The matrix has independent normal-visible, automatic-skip, action-only, exact-replay-after-restart, cross-device conflict, changed group/lineage/commit/checksum, out-of-order or missing IDs, malformed checksum, redacted/cancelled, v1 `inputClearEpoch=0`, v1 non-zero clear epoch rejection, and write-fault cases. Every invalid case asserts zero Room semantic writes, zero PC mirror writes, zero ACK, and no legacy fallback.
+
+Add a red contract test that builds a v3 direct and automatic envelope from a submission container containing `fallbackExecution`. The direct envelope must contain only its existing closed current-batch/payment/retry/cursor facts and must not substitute the cognition object for `context.scene`; the automatic `trigger.context.snapshot` may contain only the compact semantic view. Neither envelope may contain `fallbackExecution`, `deviceId` from the local carrier, config IDs, system prompts, or model messages; v1/v2 serialized bytes must equal their existing snapshots. Add a checkpoint test that accepts the local v2 closed keys, rejects a v2 key added to the remote v1 checkpoint, and rejects a local checkpoint missing `journalSyncSeq`. Add a real Room concurrency test in which message, annotation, and fallback receipt producers interleave and still receive unique increasing journal sequences; ACK at any returned sequence must not skip a same-sequence entry from another source.
+
 - [ ] **Step 2: Run Android unit tests red**
 
 Run:
 
 ```powershell
 cd android
-.\gradlew.bat testDebugUnitTest --tests "*FallbackCognitionPacketCodecTest" --tests "*ExecutionEngineTest" --tests "*LiveReplyQualityGateTest" --tests "*BridgeRouterTest" --no-daemon --no-problems-report
+.\gradlew.bat testDebugUnitTest --tests "*FallbackCognitionPacketCodecTest" --tests "*ExecutionEngineTest" --tests "*LiveReplyQualityGateTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*BridgeInputTest" --tests "*BridgeReceiptCheckpointTest" --tests "*FallbackJournalTest" --no-daemon --no-problems-report
 cd ..
-node --test yuqi-runtime/test/android-fallback-authority.test.mjs
+node --test yuqi-runtime/test/android-fallback-authority.test.mjs yuqi-runtime/test/reconcile.test.mjs
 ```
 
-Expected: FAIL because v3 is currently rejected, deadline still broadly authorizes fallback, and no local/external receipt authority exists.
+Expected: FAIL because v3 is currently rejected, deadline still broadly authorizes fallback, local checkpoint v2/journal sequencing is absent, and no external receipt import authority exists. Record the exact red failures before implementation.
 
 - [ ] **Step 3: Implement a focused compatibility codec and v3 fallback**
 
@@ -6520,7 +6590,7 @@ public final class FallbackCognitionPacketCodec {
 }
 ```
 
-`NativeModelGateway` delegates parsing to the codec, sends a compact cognition request before expression for v3, and enforces the same structured-action targets as PC. Fallback receives relevant hard constraints, at most two current stances, base/phase, recent complete groups, and allowed actions. Fallback-created facts are marked `pending_review`; it never overwrites a PC state record or rewrites a result already visible.
+`FallbackCognitionPacketCodec` splits the local submission container into the exact semantic view and the reserved `fallbackExecution` object. `NativeModelGateway` consumes that typed carrier, uses its persisted `deviceId` for local authority preparation (and verifies equality with a configured non-empty bridge device ID), sends a compact cognition request before expression for v3, and enforces the same structured-action targets as PC. Fallback receives relevant hard constraints, at most two current stances, base/phase, recent complete groups, and allowed actions. Fallback-created facts are marked `pending_review`; it never overwrites a PC state record or rewrites a result already visible.
 
 For v3, replace the old broad `fallbackAuthorized` boolean with these explicit route outcomes:
 
@@ -6534,20 +6604,42 @@ explicit final without fallback                         -> REMOTE_FINAL_FAILURE
 
 `AUTHORITY_AMBIGUOUS` persists `BRIDGE_WAITING` and uses receipt/poll/replay; it never invokes the local model. If no receipt or definitive not-accepted result is available by the global five-minute limit, stop the thinking UI and expose `FAILED_RETRYABLE/AUTHORITY_UNRESOLVED`; keep the lineage open for later reconciliation and do not fabricate a local reply. Preserve legacy routing behavior for old v1/v2 turns only.
 
-When local fallback is allowed, `RoomExecutionStore` uses one transaction to re-read the open `ConversationAuthorityEntity`, validate expected revision/latest turn, derive group/message/action IDs, validate the same per-kind terminal disposition, insert any reply parts and applied structured-action records, CAS the lineage to committed, write the exact local commit checksum with `commitPayloadVersion=android-fallback-commit-v2` and `authorityOrigin=android_fallback`, complete the turn, and advance `nativeCompleted`. An automatic `skip` commits the authority/group identity and receipt with zero reply/action rows and no notification; a direct fallback can never skip. Its normalized checksum payload contains lineage/group, ordered reply/action payloads, the complete input batch/cursor identity including `inputClearEpoch`, fallback contract checksum, and a deterministic `android_fallback:<contractChecksum>` release ID; it contains no unavailable PC state revisions and no timestamps/random IDs. Exact replay returns the stored receipt; different content conflicts.
+When local fallback is allowed, `RoomExecutionStore` uses the one Android transaction described above, including allocation of `journalSyncSeq` in the same commit. An automatic `skip` commits the authority/group identity and receipt with zero reply/action rows and no notification; a direct fallback can never skip. Its normalized checksum payload contains lineage/group, ordered reply/action payloads, the complete input batch/cursor identity including `inputClearEpoch`, fallback contract checksum, and the deterministic `android_fallback:<contractChecksum>` release ID; it contains no unavailable PC state revisions and no timestamps/random IDs. Exact replay returns the stored receipt; different content conflicts.
 
-`FallbackJournal` syncs an `authority_receipt` entity before/with its deterministic group items, not just raw fallback messages. `reconcile.mjs` validates all Task 10/13 IDs and the semantic checksum, then calls `store.importExternalVisibleReceiptInternal()`. That PC transaction either returns an exact existing receipt or creates a mirror turn/lineage, group/items/actions, `visible_result_manifests` row and receipt with origin `android_fallback`. The manifest stores the exact normalized `android-fallback-commit-v2` payload received from Room and must hash to the imported receipt checksum; it is never reconstructed from projection rows. The transaction creates no PC cognition state/stance/memory/comparison/outbox/notification writes, never increments live shadow/canary evidence, and marks action rows `already_applied_on_android`. Its receipt has null PC lane/state revisions; reconciliation may only advance lane visibility cursors monotonically by the imported local sequence and clear epoch and must not replace a newer PC `latest_authoritative_group_id`. A different existing receipt inserts a sanitized authority-conflict diagnostic and aborts import. Import may accept historical v1 only when `inputClearEpoch=0`; every new fallback writes v2.
+`FallbackJournal` enumerates the durable `authority_receipt` entries by `journalSyncSeq`, whose payload contains the normalized semantic receipt, input batch, manifest, and result items/actions but never `fallbackExecution`, system prompts, or model messages. `reconcile.mjs` validates all Task 10/13 IDs, release metadata, complete commitments, and the semantic checksum, then calls `store.importExternalVisibleReceiptInternal()`. The manifest stores the exact normalized `android-fallback-commit-v2` payload received from Room and must hash to the imported receipt checksum; it is never reconstructed from projection rows. The transaction creates no PC cognition state/stance/memory/comparison/outbox/cloud-delivery/notification writes and never increments live shadow/canary evidence. Imported actions retain their original semantic payload; non-execution is enforced by the `android_fallback` group/receipt origin at every PC action/outbox entry point, not by mutating the signed action JSON. Its receipt has null PC lane/state revisions; reconciliation may only advance lane visibility cursors monotonically by the imported local sequence and clear epoch and must not replace a newer PC `latest_authoritative_group_id`. A different existing receipt inserts a sanitized authority-conflict diagnostic and aborts import. Import may accept historical v1 only when `inputClearEpoch=0`; every new fallback writes v2.
 
 - [ ] **Step 4: Run Android fallback tests green**
 
-Run the Step 2 command.
+Run:
+
+```powershell
+cd android
+.\gradlew.bat testDebugUnitTest --tests "*FallbackCognitionPacketCodecTest" --tests "*ExecutionEngineTest" --tests "*LiveReplyQualityGateTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*BridgeInputTest" --tests "*BridgeReceiptCheckpointTest" --tests "*FallbackJournalTest" --no-daemon --no-problems-report
+.\gradlew.bat assembleDebugAndroidTest --no-daemon --no-problems-report
+cd ..
+node --test yuqi-runtime/test/android-fallback-authority.test.mjs yuqi-runtime/test/reconcile.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs
+npm.cmd test
+git diff --check
+```
 
 Expected: PASS for all four contracts; v3 invalid action targets fail before any local commit; ambiguous remote outcomes never start fallback; explicit local authority produces/imports one receipt with no PC duplicate side effects.
+
+The final gate must additionally prove:
+
+- direct visible, automatic visible, action-only, and automatic skip each commit exactly one Room authority receipt; skip has one group identity and zero part/action rows;
+- fault injection at every Room write boundary leaves authority, parts/actions, cursor, checkpoint, and journal sequence unchanged;
+- close/reopen preserves local checkpoint v2 and enumerates `authority_receipt` before optional message projections; exact replay does not allocate a second sequence, and interleaved message/annotation/receipt producers cannot duplicate or skip a journal sequence;
+- v3 direct and automatic bridge envelopes contain no `fallbackExecution`, local carrier device/config ID, system prompt, or local model message; direct keeps the pre-existing v3 scene contract rather than embedding cognition-v3 there, automatic carries only the compact semantic snapshot, and v1/v2 byte snapshots remain unchanged;
+- PC import passes v13/v14 close/reopen, creates the deterministic external release row, and has zero cognition/state/stance/memory/comparison/outbox/cloud-delivery/notification/live-shadow/canary side effects;
+- malformed/changed/duplicate-order/cross-device/redacted receipts are zero-write and zero-ACK; an exact retry after a crash before ACK returns the original receipt and then advances the cursor once;
+- no attached device means `connectedDebugAndroidTest` remains an explicit release hard gate, not a claimed pass or a skipped success.
+
+Stop at this gate for independent review. Any missing persistent fact, schema mismatch, or v1/v2 snapshot change is structural and must amend this task before committing.
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add android/app/src/main/java/com/siyi/al/execution/FallbackCognitionPacketCodec.java android/app/src/test/java/com/siyi/al/execution/FallbackCognitionPacketCodecTest.java android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java android/app/src/main/java/com/siyi/al/execution/LiveReplyQualityGate.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java android/app/src/main/java/com/siyi/al/execution/bridge/FallbackJournal.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java android/app/src/test/java/com/siyi/al/execution/LiveReplyQualityGateTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java yuqi-runtime/src/store.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/test/android-fallback-authority.test.mjs
+git add android/app/src/main/java/com/siyi/al/execution/FallbackCognitionPacketCodec.java android/app/src/test/java/com/siyi/al/execution/FallbackCognitionPacketCodecTest.java android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java android/app/src/main/java/com/siyi/al/execution/ExecutionEngineStore.java android/app/src/main/java/com/siyi/al/execution/LiveReplyQualityGate.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/main/java/com/siyi/al/execution/bridge/FallbackJournal.java android/app/src/main/java/com/siyi/al/execution/BridgeReceiptCheckpoint.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/test/java/com/siyi/al/execution/LiveReplyQualityGateTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java android/app/src/test/java/com/siyi/al/execution/bridge/FallbackJournalTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java android/app/src/test/resources/fixtures/cognition-v3.json android/app/src/test/resources/fixtures/cognition-v2.json android/app/src/test/resources/fixtures/memory-v1.json android/app/src/test/resources/fixtures/chat-v1.json tests/fixtures/android-fallback-authority-v2.json yuqi-runtime/src/store.mjs yuqi-runtime/src/reconcile.mjs yuqi-runtime/test/android-fallback-authority.test.mjs yuqi-runtime/test/reconcile.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs
 git commit -m "feat: support cognition v3 Android fallback"
 ```
 
@@ -6573,6 +6665,16 @@ test('v3 snapshot is compact and preserves complete visible groups', () => {
   assert.ok(snapshot.recentGroups.length <= 20);
   assert.deepEqual(snapshot.recentGroups.at(-1).messageIds, ['u1', 'u2', 'u3']);
   assert.equal(JSON.stringify(snapshot).includes('responseRisks'), false);
+});
+
+test('native v3 submission keeps one local fallback carrier outside semantic snapshot', async () => {
+  const container = await buildNativeExecutionSnapshot('yuqi', directTask());
+  assert.equal(container.contract, 'cognition-v3');
+  assert.equal(container.fallbackExecution.contract, 'cognition-v3-fallback-v1');
+  assert.equal(container.fallbackExecution.deviceId, settings.deviceId);
+  assert.deepEqual(Object.keys(container.fallbackExecution).sort(),
+    ['cognition', 'contract', 'deviceId', 'expression']);
+  assert.equal(JSON.stringify(withCognitionV3Snapshot(container)).includes('fallbackExecution'), false);
 });
 
 test('submit reads native cursor before building one complete task', async () => {
@@ -6621,6 +6723,18 @@ function withCognitionV3Snapshot(snapshot) {
   };
 }
 
+function withLocalFallbackExecution(semanticSnapshot, localModelInputs, deviceId) {
+  return {
+    ...semanticSnapshot,
+    fallbackExecution: closedFallbackExecution({
+      contract: 'cognition-v3-fallback-v1',
+      deviceId,
+      cognition: localModelInputs.cognition,
+      expression: localModelInputs.expression
+    })
+  };
+}
+
 async function getYuqiVisibilityCursor(characterId) {
   return withTimeout(
     AlExecution.getConversationCursor({ characterId }),
@@ -6630,7 +6744,7 @@ async function getYuqiVisibilityCursor(characterId) {
 }
 ```
 
-`queueAndroidUserReply()` reads the cursor, then builds one task from the already-complete submitted batch. Event, poll, reload replay, and notification-open all enter the existing bounded single-flight reconciler. DOM insertion is keyed by `visibleGroupId`; only after every bubble in a `visible` group exists does Web call `markUiApplied`. For a verified `skip`, the same reconciler confirms there are zero reply/action rows, renders nothing, and sends one no-DOM `markUiApplied` acknowledgement for that authority group so reload cannot loop forever. `action_only` waits for the structured action application rather than a chat bubble. A timed-out plugin Promise releases its lock in `finally` and leaves Room unacknowledged for later replay.
+`buildNativeExecutionSnapshot()` writes the local submission container by combining the exact compact semantic snapshot with one closed `fallbackExecution` carrier. It calls `ensureDeviceId()` before building that carrier, so the persisted ID is stable even when bridge transport is disabled; it never copies secrets, tokens, endpoints, or entire settings. `withCognitionV3Snapshot()` and every wire projection ignore/remove the reserved carrier. `queueAndroidUserReply()` reads the cursor, then builds one task from the already-complete submitted batch. Event, poll, reload replay, and notification-open all enter the existing bounded single-flight reconciler. DOM insertion is keyed by `visibleGroupId`; only after every bubble in a `visible` group exists does Web call `markUiApplied`. For a verified `skip`, the same reconciler confirms there are zero reply/action rows, renders nothing, and sends one no-DOM `markUiApplied` acknowledgement for that authority group so reload cannot loop forever. `action_only` waits for the structured action application rather than a chat bubble. A timed-out plugin Promise releases its lock in `finally` and leaves Room unacknowledged for later replay.
 
 Keep the existing transport copy: `LOCAL_QUEUED` shows “正在把消息送过去…”, `CLOUD_ACCEPTED` remains a delivery/waiting state, and only `PC_ACCEPTED` may switch the UI to model-thinking wording. V3 metadata must not collapse local queue acceptance into PC acceptance.
 
