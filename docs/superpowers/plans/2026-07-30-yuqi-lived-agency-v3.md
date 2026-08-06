@@ -6898,100 +6898,261 @@ git commit -m "feat: integrate direct social and structured interactions"
 ### Task 17: Integrate Proactive Chat With Motive and Collision Semantics
 
 **Files:**
-- Modify: `yuqi-runtime/src/route-policy.mjs`
 - Modify: `yuqi-runtime/src/life-simulation.mjs`
+- Modify: `yuqi-runtime/src/role-schemas.mjs`
+- Modify: `yuqi-runtime/src/cognition-v3-contract.mjs`
+- Modify: `yuqi-runtime/src/cognition-v3-adapters.mjs`
+- Modify: `yuqi-runtime/src/visible-result-commit.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/turn-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
+- Modify: `yuqi-runtime/test/life-simulation.test.mjs`
+- Modify: `yuqi-runtime/test/cognition-v3-contract.test.mjs`
+- Modify: `yuqi-runtime/test/cognition-v3-adapters.test.mjs`
+- Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
+- Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Modify: `yuqi-runtime/test/turn-dispatcher.test.mjs`
 - Create: `yuqi-runtime/test/proactive-chat-v3.test.mjs`
 - Modify: `tests/yuqi-cognition-feature-matrix.test.mjs`
 
 **Interfaces:**
-- Consumes: life changes, open threads, mood/attention, commitments, real user hard boundaries, Task 9 lane.
-- Produces: proactive candidate motive and either intentional skip or committed message; no forced send.
+- Consumes: the existing phone/cloud `PROACTIVE_CHAT` timer as a consideration signal; persisted `life_episodes`, the current checksum/revision-pinned `cognitive_states` row, immutable agency constraints, Task 9 private-chat lane authority, and the Task 10F canonical terminal transaction.
+- Produces: `proactiveMotiveAuthority` in the existing immutable `turns.annotation_snapshot_json`, a closed cognition `motiveEvidenceIds` decision, and exactly one of a visible canonical result, a canonical `skip`, or a canonical cancelled/superseded outcome.
+- Does not create another scheduler, does not add a database schema version, and does not let the phone, timer, trigger text, model, delivery policy, or legacy skip budget invent a motive.
 
-- [ ] **Step 1: Write red motive, silence, and direct-collision tests**
+**Authority and compatibility contract:**
+
+1. The Android/cloud timer means only “Yuqi may consider speaking now.” It is not motive evidence and never forces output. PC reconstructs candidates from persisted facts before creating the canonical turn.
+2. A fresh `PROACTIVE_CHAT` turn stores this exact closed object beside any existing annotations:
+
+   ```js
+   {
+     version: 'proactive-motive-v1',
+     consideredAt,
+     candidates: [{
+       motiveId,
+       sourceType,       // current_life_episode | recent_life_episode | open_thread
+       sourceId,
+       sourceRevision,   // non-negative safe integer or null
+       sourceChecksum,   // lowercase SHA-256
+       occurredAt,
+       expiresAt,
+       summary
+     }],
+     structuralSilence: null | {
+       reasonCode: 'ACTIVE_PRIVATE_CHAT_CONSTRAINT',
+       constraintRefs: [{ constraintId, revision }]
+     },
+     checksum
+   }
+   ```
+
+   `checksum` is `contentHash()` of the other four fields. `motiveId` is exactly `motive_${contentHash({sourceType,sourceId,sourceRevision,sourceChecksum}).slice(0,24)}`. Candidates are unique by `motiveId`, capped at six, and ordered by `occurredAt DESC, motiveId ASC`, so an unchanged source revision/checksum cannot authorize two visible proactive messages.
+3. Eligible life sources are non-cancelled current episodes and non-cancelled episodes that ended no more than six hours before fixed `consideredAt`. Eligible open threads come only from the current `cognitive_states` checksum/revision, have non-empty `threadId`, `summary`, `sourceTurnId`, and a `lastTouchedAt` no more than seven days old. A mood string, vague attention text, timer label, model inference, future episode, cancelled episode, expired thread, or missing checksum is never a candidate. Task 19 owns role-plan commitments; Task 17 emits no `due_commitment` candidate until an exact persisted commitment authority exists.
+4. A candidate already cited by a committed `PROACTIVE_CHAT` result is consumed for that exact source version and is filtered from later fresh turns. Task 17 adds `pc-visible-commit-v3`, whose only delta from v2 is the required closed `proactiveMotiveEvidenceIds`, and uses it only for canonical wire-v3 `PROACTIVE_CHAT`; that immutable manifest field—not visible prose—is the consumption fact source. Skips store `[]`. Failed/cancelled turns, shadow drafts, and uncommitted work consume nothing. Exact replay/restart reads the already-pinned annotation snapshot and committed manifest instead of rebuilding either. Retries inherit the parent snapshot through the existing canonical retry authority. Every other PC result remains `pc-visible-commit-v1/v2` byte-compatible.
+5. Structural silence recognizes only active hard constraints whose channel is `private_chat` or `all`, whose kind is `action` or `consent`, and whose exact machine rule is `deny_proactive_chat` or `deny_all_contact`. It never parses free-form refusal, mood, distance, or a prior one-off skip into a permanent ban.
+6. `motiveEvidenceIds` is an optional property in the shared v3 schema so other kinds remain byte-compatible. The v3 contract makes it mandatory for `PROACTIVE_CHAT`: `send` requires one to three unique IDs, all in the pinned candidate set; `skip` requires `[]`. With zero candidates or structural silence, the orchestrator commits a structural skip before calling `ReleaseExecutor`. With candidates, cognition may still choose an intentional skip.
+7. No-motive and structural-silence skips bypass `getProactiveChatDeliveryPolicy()` and its legacy skip budget. They use the normal Task 10F terminal commit with `items:[]`, `actions:[]`, no evidence-memory job, no message projection, no placeholder, and no notification payload. A model-produced intentional skip uses the same transaction.
+8. Task 17 changes canonical v3 `PROACTIVE_CHAT` and its collision with canonical v3 `DIRECT_REPLY` only. RA0, wire v1/v2, role-plan kinds, moment kinds, cloud stale-trigger handling, and their serialized outputs remain exact compatibility paths.
+
+- [ ] **Step 1: Write red tests for the immutable motive authority**
 
 ```js
-test('scheduler permits consideration but cannot force a message', async () => {
-  const result = await runProactive({ lifeSignals: [], openThreads: [], commitments: [] });
-  assert.equal(result.action, 'skip');
+test('the timer permits consideration but zero persisted motives never calls a model', async () => {
+  const result = await runCanonicalProactive({ episodes: [], cognitiveState: null });
+  assert.equal(result.terminalDisposition, 'skip');
   assert.equal(result.reasonCode, 'NO_LIVED_MOTIVE');
+  assert.equal(result.releaseExecutions, 0);
+  assert.deepEqual(result.replyParts, []);
+  assert.deepEqual(result.actions, []);
 });
 
-test('proactive message requires a source motive and independent visible content', async () => {
-  const result = await runProactive({
-    lifeSignals: [{ id: 'life-7', type: 'finished_photo_roll', delivered: true }],
-    openThreads: [{ id: 'thread-2', topic: 'user presentation' }]
+test('a visible proactive result cites only the pinned persisted source version', async () => {
+  const source = completedLifeEpisode('life-7');
+  const motiveId = motiveIdForSource(source);
+  const result = await runCanonicalProactive({
+    episodes: [source],
+    cognition: sendWithMotiveIds([motiveId])
   });
-  assert.equal(result.action, 'send');
-  assert.ok(result.cognition.motiveEvidenceIds.includes('life-7')
-    || result.cognition.motiveEvidenceIds.includes('thread-2'));
+  assert.equal(result.terminalDisposition, 'visible');
+  assert.deepEqual(result.cognition.motiveEvidenceIds, [motiveId]);
+  assert.deepEqual(result.commitManifest.proactiveMotiveEvidenceIds, [motiveId]);
+  assert.equal(result.pinnedAuthority.checksum, result.reopenedAuthority.checksum);
 });
 
-test('a user batch supersedes an uncommitted proactive result without quality penalty', async () => {
-  const proactive = beginSlowProactive();
-  const direct = await submitDirectBatch([{ id: 'u9', text: '在吗' }]);
-  await proactive;
-  assert.equal(store.getTurn(proactive.turnId).state, 'superseded_by_user_batch');
-  assert.equal(store.visibleGroupsFor(proactive.turnId).length, 0);
-  assert.equal(store.qualityFindingsFor(proactive.turnId).length, 0);
-  assert.equal(direct.visible, true);
+test('forged stale and already-consumed motives cannot authorize a send', async () => {
+  await assert.rejects(
+    runCanonicalProactive({ cognition: sendWithMotiveIds(['motive_forged']) }),
+    /proactive motive authority conflict/
+  );
+  const first = await commitOneProactiveFor('life-7');
+  const second = await runCanonicalProactive({ episodes: [first.source] });
+  assert.equal(second.reasonCode, 'NO_LIVED_MOTIVE');
+  assert.equal(second.releaseExecutions, 0);
 });
 ```
 
-- [ ] **Step 2: Run proactive tests red**
+`life-simulation.test.mjs` must freeze source normalization and ordering: current and recent episodes are accepted; future/cancelled/older-than-six-hours episodes are rejected; complete open-thread authority is accepted; missing IDs/checksums, over-age threads, and vague mood/attention alone are rejected. `cognition-v3-contract.test.mjs` must reject missing, duplicate, unknown, more-than-three, non-string, and skip-with-nonempty `motiveEvidenceIds`, while existing non-proactive v3 fixtures remain valid. `cognition-v3-adapters.test.mjs` must prove that the real adapter receives the exact pinned candidates and does not add timer or free-text candidates.
 
-Run: `node --test yuqi-runtime/test/proactive-chat-v3.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs`
+- [ ] **Step 2: Run the motive/contract tests and preserve the red result**
 
-Expected: FAIL until motives and lane supersession are connected.
-
-- [ ] **Step 3: Implement motive candidates and authority recheck**
-
-```js
-function proactiveMotiveCandidates(context) {
-  return [
-    ...deliveredLifeChanges(context),
-    ...dueCommitments(context),
-    ...openThreads(context),
-    ...currentEmotionOrAttention(context),
-    ...specificCuriosity(context)
-  ].filter(hasSourceEvidence);
-}
-
-async function executeProactiveChat(turn) {
-  const motives = proactiveMotiveCandidates(await loadProactiveContext(turn));
-  const execution = await executePinnedRelease({ ...turn, motives });
-  if (execution.draft.action === 'skip') {
-    return commitLegalAutomaticSkip(turn, {
-      ...execution,
-      visibleGroup: { items: [] },
-      actionSet: []
-    });
-  }
-  return commitVisibleResult(revalidateProactiveLane(execution));
-}
-```
-
-Structural silence reads active user/system hard constraints only. It cannot interpret Yuqi's temporary refusal as a ban on future initiative. A skip is valid without a message when no lived motive exists. A direct collision supersedes before commit and consumes neither normal skip budget nor notification.
-
-`commitLegalAutomaticSkip()` is not a legacy side channel: it revalidates the
-lane and delegates to the same Task 10F canonical terminal-result transaction
-with zero items/actions, the pinned state patch and comparison descriptor. It
-therefore creates one exactly-once receipt/delivery with
-`terminalDisposition:'skip'`, but no message, action, memory fact derived from an
-unsent draft, notification, or skip placeholder text.
-
-- [ ] **Step 4: Run proactive and matrix tests green**
-
-Run the Step 2 command.
-
-Expected: PASS; no proactive/direct duplicate fingerprint becomes visible.
-
-- [ ] **Step 5: Commit**
+Run:
 
 ```powershell
-git add yuqi-runtime/src/route-policy.mjs yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/proactive-chat-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
+node --test yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/proactive-chat-v3.test.mjs
+```
+
+Expected red assertions: no closed motive builder exists, `motiveEvidenceIds` is outside the v3 schema, the timer still reaches the release executor with zero motives, and source consumption is not persisted through the canonical turn input checksum. Do not create a fake life event or relax an existing fixture to make the tests green.
+
+- [ ] **Step 3: Implement and pin the motive snapshot before model execution**
+
+Add a pure builder in `life-simulation.mjs` with this public shape:
+
+```js
+export function buildProactiveMotiveAuthority({
+  consideredAt,
+  lifeContext,
+  cognitiveState,
+  consumedMotiveIds = [],
+  hardConstraints = []
+}) {
+  const considered = requireSafeTimestamp(consideredAt, 'proactive consideredAt');
+  const structuralSilence = proactiveStructuralSilence(hardConstraints);
+  const candidates = stableMotiveCandidates([
+    ...lifeEpisodeMotiveCandidates(lifeContext, considered),
+    ...openThreadMotiveCandidates(cognitiveState, considered)
+  ], consumedMotiveIds);
+  const semantic = {
+    version: 'proactive-motive-v1',
+    consideredAt: considered,
+    candidates,
+    structuralSilence
+  };
+  return Object.freeze({ ...semantic, checksum: contentHash(semantic) });
+}
+```
+
+`YuqiOrchestrator.createCanonicalTurnForEnvelope()` must use fixed `canonicalInteractionAt(envelope, clock)` as `consideredAt`, read the source rows and consumed IDs, build the snapshot, and pass:
+
+```js
+annotationSnapshot: {
+  ...(existingAnnotations || {}),
+  proactiveMotiveAuthority
+}
+```
+
+Only the orchestrator constructs this reserved key. `createCanonicalVisibleTurnInternal()` must validate the snapshot checksum, source IDs/checksums/revisions, expiration at `consideredAt`, deterministic sort/limit, structural constraint identity, and consumed-set status inside its existing immediate transaction before inserting a fresh proactive turn. Exact-turn replay and retry use the already persisted snapshot and existing immutable-annotation checksum checks. Add a scoped store reader for committed proactive motive IDs; it may read canonical `PROACTIVE_CHAT` roots/receipts and their annotation snapshot, but must ignore cancelled, failed, shadow-only, or uncommitted turns and must not introduce a schema migration.
+
+`lifeEpisodeMotiveCandidates`, `openThreadMotiveCandidates`, `stableMotiveCandidates`, and `proactiveStructuralSilence` are private helpers in the same file and implement the exact eligibility, closed shapes, deterministic ID, sort, limit, consumption, and machine-rule constraints above; they reject rather than coerce invalid native types. `requireSafeTimestamp` accepts only a native non-negative safe integer.
+
+Extend `COGNITION_SCHEMA_V3.interactionDecision` with optional `motiveEvidenceIds`. In `normalizeCognitionV3Result()`, require and validate it only when `envelope.kind === 'PROACTIVE_CHAT'`. Pass the pinned candidates through `buildCognitionV3Envelope()`/the existing `proactiveChatFeatureContext`; do not rebuild candidates inside the cognitive pipeline.
+
+Add `canonicalCommitPayloadV3()` and select it only when the authoritative turn is canonical wire-v3 `PROACTIVE_CHAT`. It includes all v2 fields plus `proactiveMotiveEvidenceIds`. `runCanonicalReleaseTurn()` supplies the normalized cognition IDs for `send` and `[]` for either kind of skip. `commitVisibleResult()` verifies the IDs against the pinned annotation snapshot before calculating `commitChecksum`; the receipt records `commit_payload_version:'pc-visible-commit-v3'`. The v13/v14 scoped and reopen validators accept v3 only for that turn kind, require the field, and reject missing, duplicate, unknown, or non-string IDs. Non-proactive and historical manifests remain byte-compatible on v1/v2.
+
+In `runCanonicalReleaseTurn()`, before image materialization or `releaseExecutor.executeTurn()`:
+
+```js
+if (turn.rolloutKey === 'PROACTIVE_CHAT'
+    && (authority.structuralSilence || authority.candidates.length === 0)) {
+  return commitCanonicalProactiveSkip({
+    turn,
+    reasonCode: authority.structuralSilence
+      ? 'STRUCTURAL_SILENCE'
+      : 'NO_LIVED_MOTIVE'
+  });
+}
+```
+
+`commitCanonicalProactiveSkip()` must call the same `commitVisibleResult()` path used by other canonical results with empty visible/action sets, the pinned comparison descriptor, and a generation fingerprint whose proactive context revision is `contentHash({agencySnapshotChecksum,proactiveMotiveAuthorityChecksum})`. Visible proactive sends use that same context revision. `commitVisibleResult()` must recompute this exact proactive context revision while every other kind keeps its existing agency-only fingerprint formula. The skip helper must not call the legacy delivery-policy budget and must not create evidence-memory work.
+
+- [ ] **Step 4: Write red atomic collision and recovery tests**
+
+```js
+test('a direct user batch atomically supersedes an uncommitted proactive turn', async () => {
+  const proactive = await beginSlowCanonicalProactive();
+  const direct = await submitCanonicalDirectBatch([{ messageId: 'u9', content: '在吗' }]);
+  releaseSlowProactive();
+  const late = await proactive.finished;
+
+  assert.equal(late.status, 'superseded');
+  assert.equal(store.getTurn(proactive.turnId).state, 'failed');
+  assert.equal(store.getTurnAuthorityLineage(proactive.lineageKey).state, 'cancelled');
+  assert.equal(store.visibleGroupsFor(proactive.turnId).length, 0);
+  assert.equal(store.deliveriesFor(proactive.turnId).length, 0);
+  assert.equal(store.qualityFindingsFor(proactive.turnId).length, 0);
+  assert.equal(direct.terminalDisposition, 'visible');
+});
+
+test('a proactive trigger arriving behind a direct turn fails retryably with zero writes', async () => {
+  const direct = await beginSlowCanonicalDirect();
+  await assert.rejects(
+    submitCanonicalProactiveTrigger(),
+    /INTERACTION_LANE_BUSY/
+  );
+  assert.equal(store.getInteractionLane('yuqi', 'private_chat').generatingTurnId, direct.turnId);
+  assert.equal(store.getTurn('turn_proactive_waiting'), null);
+});
+
+test('restart does not revive a superseded proactive result', async () => {
+  const ids = await createDirectProactiveCollision();
+  await reopenStore();
+  const recovered = await dispatcher.recover(ids.proactiveTurnId);
+  assert.equal(recovered.status, 'superseded');
+  assert.equal(modelCallsAfterRestart, 0);
+});
+```
+
+Also add a race in which the direct transaction wins while proactive generation is in flight, a race in which proactive commits first and direct follows normally, exact proactive replay with one receipt/group, same-source second trigger filtering, and a canary proactive cancellation. The cancellation must create no `quality_findings`; existing conservative canary cancellation accounting may record the cancelled subject as a rollout failure so the reserved slot is not leaked, but it must use reason `CANARY_SOURCE_SUPERSEDED` and must never masquerade as a model-quality finding.
+
+- [ ] **Step 5: Implement canonical private-chat admission in the creation transaction**
+
+Do not call the existing public `admitInteractionTurnInternal()` from inside `createCanonicalVisibleTurnInternal()` because that would nest an independent transaction after the caller has already pinned the lane. Extract a row-level helper used by both paths:
+
+```js
+admitCanonicalPrivateChatRowsInternal({
+  incomingTurnId,
+  expectedLaneRevision,
+  now
+})
+```
+
+Before rollout/canary reservation or any turn write, a fresh incoming canonical v3 `PROACTIVE_CHAT` must inspect the pinned lane revision. If a different uncommitted `DIRECT_REPLY` or `PROACTIVE_CHAT` owns it, throw a stable `InteractionLaneBusyError` with code `INTERACTION_LANE_BUSY` and zero database writes. `TurnDispatcher` treats that as retryable scheduling contention, not model/pipeline failure; cloud input is not ACKed until durable acceptance, and the existing stale-trigger gate may later retire it. This avoids creating a cancelled turn with a lane/canary reservation it never owned.
+
+For an admitted fresh turn, the row-level helper handles only these canonical v3 pairs on `private_chat`:
+
+- incoming `DIRECT_REPLY`, current uncommitted `PROACTIVE_CHAT`: call `cancelCanonicalTurnRowsInternal()` with `superseded_by_user_batch`, then claim the lane for direct in the same immediate transaction;
+- same turn replay: keep the existing owner and immutable replay path;
+- already committed current work: rely on the committed lane state and normal next-sequence admission; do not cancel a committed group.
+
+All other kinds continue through their existing Task 9/Task 19 paths. Do not invent a SQL turn state named `superseded_by_user_batch`; the persisted turn remains `state:'failed'`, the lineage becomes `state:'cancelled'`, and `error_json.code` carries the reason. `createCanonicalTurnForEnvelope()`, `runCanonicalReleaseTurn()`, `TurnDispatcher.accept/recover`, and their callers must recognize this terminal outcome and return `{status:'superseded', visible:false}` without invoking the model, recording a quality failure, requeueing, or producing a delivery.
+
+After release execution and immediately before drafting actions/quality/commit, `runCanonicalReleaseTurn()` must re-read the turn and lineage. If the direct transaction cancelled it while the model was running, return the same terminal superseded outcome. Any other lane or authority mismatch remains a real error; do not turn arbitrary CAS failures into supersession.
+
+- [ ] **Step 6: Run the complete Task 17 focused gate**
+
+Run:
+
+```powershell
+node --test yuqi-runtime/test/proactive-chat-v3.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
+```
+
+Expected: PASS with no `only`/`skip`. The gate must prove zero-motive and structural-silence execution call no model; a visible send cites pinned evidence; consumed/expired/forged evidence cannot send; canonical skip has zero items/actions/messages/delivery text/memory jobs; direct/proactive races have one lane owner and at most one visible group; close/reopen preserves cancelled and committed authority; and RA0, wire v1/v2, role-plan, moment, and cloud stale-trigger fixtures are unchanged.
+
+- [ ] **Step 7: Run the project regression gate**
+
+Run:
+
+```powershell
+npm.cmd test
+```
+
+Expected: PASS with zero failures and zero skipped tests. Run `git diff --check` and search the modified tests for `.only` and `.skip`. Do not start the PC service, cloud timers, or Android runtime during this task.
+
+- [ ] **Step 8: Commit**
+
+```powershell
+git add yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/role-schemas.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/proactive-chat-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
 git commit -m "feat: ground proactive chat in lived motives"
 ```
 
