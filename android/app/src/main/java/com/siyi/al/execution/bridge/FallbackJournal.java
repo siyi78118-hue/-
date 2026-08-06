@@ -1,6 +1,9 @@
 package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.db.AlExecutionDao;
+import com.siyi.al.execution.BridgeAuthority;
+import com.siyi.al.execution.BridgeReceiptCheckpoint;
+import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.db.SyncCursorEntity;
 import com.siyi.al.execution.db.YuqiAnnotationEntity;
@@ -31,6 +34,7 @@ public final class FallbackJournal {
             afterSeq,
             dao.rawMessagesAfterSync("yuqi", afterSeq, safeLimit),
             dao.annotationsAfterSync(afterSeq, safeLimit),
+            dao.authorityReceiptAttempts(),
             safeLimit
         );
     }
@@ -38,23 +42,45 @@ public final class FallbackJournal {
     public void acknowledge(long seq) {
         if (seq <= 0L) return;
         SyncCursorEntity existing = dao.syncCursor(PC_PEER);
-        if (existing != null && existing.ackSeq >= seq) return;
+        long current = existing == null ? 0L : existing.ackSeq;
+        if (current >= seq) return;
+        try {
+            JSONObject packet = pendingPacket(1000);
+            boolean proven = false;
+            JSONArray entries = packet.getJSONArray("entries");
+            for (int index = 0; index < entries.length(); index += 1) {
+                if (entries.getJSONObject(index).optLong("seq", -1L) == seq) {
+                    proven = true;
+                    break;
+                }
+            }
+            if (!proven) throw new IllegalArgumentException("fallback journal ack sequence conflict");
+        } catch (Exception error) {
+            SyncCursorEntity latest = dao.syncCursor(PC_PEER);
+            if (latest != null && latest.ackSeq >= seq) return;
+            if (error instanceof IllegalArgumentException) throw (IllegalArgumentException) error;
+            throw new IllegalArgumentException("fallback journal ack sequence conflict", error);
+        }
         SyncCursorEntity cursor = new SyncCursorEntity();
         cursor.peerId = PC_PEER;
-        cursor.ackSeq = seq;
-        cursor.updatedAt = System.currentTimeMillis();
-        dao.upsertSyncCursor(cursor);
+        cursor.ackSeq = 0L;
+        cursor.updatedAt = 0L;
+        dao.insertSyncCursorIfAbsent(cursor);
+        dao.advanceSyncCursorMonotonic(PC_PEER, seq, System.currentTimeMillis());
     }
 
     static JSONObject buildPacket(String deviceId, long afterSeq, List<RawMessageEntity> messages) throws Exception {
-        return buildPacket(deviceId, afterSeq, messages, java.util.Collections.emptyList(), 1000);
+        return buildPacket(
+            deviceId, afterSeq, messages, java.util.Collections.emptyList(),
+            java.util.Collections.emptyList(), 1000);
     }
 
-    private static JSONObject buildPacket(
+    static JSONObject buildPacket(
         String deviceId,
         long afterSeq,
         List<RawMessageEntity> messages,
         List<YuqiAnnotationEntity> annotations,
+        List<ExecutionAttemptEntity> attempts,
         int limit
     ) throws Exception {
         ArrayList<JSONObject> ordered = new ArrayList<>();
@@ -82,7 +108,34 @@ public final class FallbackJournal {
                 .put("checksum", sha256(canonical(payload)))
                 .put("createdAt", annotation.createdAt));
         }
+        for (ExecutionAttemptEntity attempt : attempts) {
+            JSONObject receipt = BridgeReceiptCheckpoint.extractLocalAuthorityReceipt(
+                attempt.bridgeAuthorityCheckpointJson,
+                attempt.bridgeAuthorityCheckpointChecksum);
+            if (receipt == null) continue;
+            JSONObject semantic = receipt.optJSONObject("semantic");
+            if (semantic == null) continue;
+            long sequence = semantic.optLong("journalSyncSeq", 0L);
+            String groupId = semantic.optString("visibleGroupId", "").trim();
+            if (sequence <= afterSeq || groupId.isEmpty()) continue;
+            ordered.add(new JSONObject()
+                .put("seq", sequence)
+                .put("entityType", "authority_receipt")
+                .put("entityId", groupId)
+                .put("operation", "insert")
+                .put("payload", receipt)
+                .put("checksum", BridgeAuthority.sha256CanonicalJson(receipt))
+                .put("createdAt", attempt.finishedAt == null ? 0L : attempt.finishedAt));
+        }
         ordered.sort(Comparator.comparingLong(value -> value.optLong("seq")));
+        long previousSequence = afterSeq;
+        for (JSONObject entry : ordered) {
+            long sequence = entry.optLong("seq", -1L);
+            if (sequence <= previousSequence || sequence > 9007199254740991L) {
+                throw new IllegalArgumentException("fallback journal sequence conflict");
+            }
+            previousSequence = sequence;
+        }
         JSONArray entries = new JSONArray();
         for (int index = 0; index < Math.min(limit, ordered.size()); index += 1) {
             JSONObject entry = ordered.get(index);

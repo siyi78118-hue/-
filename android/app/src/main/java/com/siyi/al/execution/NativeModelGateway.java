@@ -57,6 +57,25 @@ public final class NativeModelGateway implements TurnBridgeGateway {
 
     public BridgeResult executeFallback(TurnSubmission submission) throws Exception {
         JSONObject snapshot = new JSONObject(submission.snapshotJson);
+        FallbackCognitionPacketCodec.FallbackContext packet =
+            new FallbackCognitionPacketCodec().decode(snapshot);
+        if ("cognition-v3".equals(packet.contract)) {
+            FallbackCognitionPacketCodec.FallbackExecution execution = packet.fallbackExecution;
+            if (execution == null) throw new IllegalArgumentException("missing cognition-v3 fallbackExecution");
+            String memory = call(
+                execution.cognition.configId,
+                execution.cognition.system,
+                execution.cognition.messages,
+                1400
+            );
+            String rawReply = call(
+                execution.expression.configId,
+                execution.expression.system + "\n\n【临时认知结果】\n" + (memory == null ? "" : memory),
+                execution.expression.messages,
+                1000
+            );
+            return BridgeResult.success("fallback", rawReply);
+        }
         String packetType = snapshot.optString("packetType", "");
         boolean cognitionV2 = "cognition-v2".equals(packetType);
         if (!packetType.isEmpty() && !cognitionV2) {

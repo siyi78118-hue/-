@@ -3,6 +3,8 @@ package com.siyi.al.execution;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
 import org.junit.Test;
 
 public class LiveReplyQualityGateTest {
@@ -54,5 +56,15 @@ public class LiveReplyQualityGateTest {
         assertTrue(report.visibleText.contains("好，晚点说。"));
         assertFalse(report.visibleText.contains("al_schedule"));
         assertFalse(report.rewriteNeeded);
+    }
+
+    @Test
+    public void fallbackStatePatchCannotPersistInferredHardConstraint() throws Exception {
+        JSONObject safe = LiveReplyQualityGate.sanitizeFallbackStatePatch(
+            new JSONObject().put("hardConstraints", new JSONArray().put("inferred"))
+                .put("pendingReview", true)
+        );
+        assertFalse(safe.has("hardConstraints"));
+        assertTrue(safe.getBoolean("pendingReview"));
     }
 }

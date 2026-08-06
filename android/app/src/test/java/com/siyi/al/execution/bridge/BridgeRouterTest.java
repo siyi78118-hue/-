@@ -84,6 +84,55 @@ public class BridgeRouterTest {
         assertEquals(Arrays.asList("lan", "cloud"), events);
     }
 
+    @Test public void v3DisabledBeforeRemoteCallMayUseLocalFallbackDraft() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeConfig disabled = new BridgeConfig(
+            false, BridgeMode.AUTO, "", "", "device_123456", "", "", "", 500, 2000, 2, 1
+        );
+        BridgeRouter router = new BridgeRouter(
+            disabled,
+            value -> { throw new AssertionError("LAN must not run"); },
+            value -> { throw new AssertionError("cloud must not run"); },
+            fallback("fallback", events),
+            recordingMirror(events)
+        );
+
+        BridgeResult result = router.execute(preparedV3Submission());
+
+        assertTrue(result.fallback);
+        assertEquals(Arrays.asList("fallback"), events);
+    }
+
+    @Test public void v3OnlyExplicitNotAcceptedFailureMayUseFallback() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeRouter router = new BridgeRouter(
+            config(BridgeMode.AUTO),
+            value -> { events.add("lan"); throw new BridgeFinalException("NOT_ACCEPTED_ALLOW_FALLBACK", true); },
+            value -> { events.add("cloud"); throw new BridgeFinalException("NOT_ACCEPTED_ALLOW_FALLBACK", true); },
+            fallback("fallback", events),
+            recordingMirror(events)
+        );
+
+        BridgeResult result = router.execute(preparedV3Submission());
+
+        assertTrue(result.fallback);
+        assertEquals(Arrays.asList("lan", "cloud", "fallback"), events);
+    }
+
+    @Test public void v3UnknownRouteFailureNeverUsesFallback() throws Exception {
+        List<String> events = new ArrayList<>();
+        BridgeRouter router = new BridgeRouter(
+            config(BridgeMode.AUTO),
+            value -> { events.add("lan"); throw new IllegalStateException("unknown route failure"); },
+            value -> { events.add("cloud"); throw new IllegalStateException("unknown route failure"); },
+            fallback("fallback", events),
+            recordingMirror(events)
+        );
+
+        assertThrows(IllegalStateException.class, () -> router.execute(preparedV3Submission()));
+        assertEquals(Arrays.asList("lan", "cloud"), events);
+    }
+
     @Test public void autoPrefersLanAndFallsBackToCloud() throws Exception {
         List<String> events = new ArrayList<>();
         BridgeRouter router = router(BridgeMode.AUTO, events, failing("lan", events), succeeding("cloud", events), fallback("fallback", events));

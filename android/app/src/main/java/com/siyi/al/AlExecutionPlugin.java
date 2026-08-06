@@ -12,6 +12,7 @@ import com.siyi.al.execution.AlExecutionWakeWorker;
 import com.siyi.al.execution.AlNotificationStatus;
 import com.siyi.al.execution.AutomaticTaskCleanupResult;
 import com.siyi.al.execution.BridgeReceiptCheckpoint;
+import com.siyi.al.execution.ExecutionServicePolicy;
 import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -183,10 +184,8 @@ public final class AlExecutionPlugin extends Plugin {
             annotation.desiredBehavior = desiredBehavior;
             annotation.status = "proposed";
             annotation.createdAt = System.currentTimeMillis();
-            annotation.syncSeq = Math.max(
-                AlExecutionDatabase.get(getContext()).executionDao().maxRawSyncSeq(),
-                AlExecutionDatabase.get(getContext()).executionDao().maxAnnotationSyncSeq()
-            ) + 1L;
+            annotation.syncSeq = AlExecutionDatabase.get(getContext()).executionDao()
+                .allocateJournalSyncSeq(annotation.createdAt);
             annotation.checksum = annotation.annotationId;
             long inserted = AlExecutionDatabase.get(getContext()).executionDao().insertYuqiAnnotation(annotation);
             JSObject result = new JSObject();
@@ -236,10 +235,6 @@ public final class AlExecutionPlugin extends Plugin {
             String characterId = required(call, "characterId");
             JSONArray values = new JSONArray(call.getString("messagesJson", "[]"));
             int inserted = 0;
-            long nextSeq = Math.max(
-                AlExecutionDatabase.get(getContext()).executionDao().maxRawSyncSeq(),
-                AlExecutionDatabase.get(getContext()).executionDao().maxAnnotationSyncSeq()
-            ) + 1L;
             for (int index = 0; index < values.length(); index += 1) {
                 JSONObject value = values.getJSONObject(index);
                 String messageId = requiredJson(value, "messageId");
@@ -267,12 +262,13 @@ public final class AlExecutionPlugin extends Plugin {
                 row.sentAt = Math.max(1L, value.optLong("sentAt", System.currentTimeMillis()));
                 row.origin = value.optString("origin", "user".equals(speakerType) ? "phone" : "legacy_fallback");
                 row.deviceId = secrets.loadBridgeConfig().deviceId + ":visible";
-                row.deviceSeq = nextSeq;
-                row.syncSeq = nextSeq;
+                long syncSeq = AlExecutionDatabase.get(getContext()).executionDao()
+                    .allocateJournalSyncSeq(System.currentTimeMillis());
+                row.deviceSeq = syncSeq;
+                row.syncSeq = syncSeq;
                 row.checksum = messageId;
                 if (AlExecutionDatabase.get(getContext()).executionDao().insertRawMessage(row) != -1L) {
                     inserted += 1;
-                    nextSeq += 1L;
                 }
             }
             JSObject result = new JSObject();
@@ -621,11 +617,14 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("inputJson", turn.inputJson);
         result.put("cloudJobId", turn.cloudJobId);
         result.put("storedState", turn.state);
-        result.put("state", store.displayState(turn.turnId).name());
+        result.put("state", ExecutionServicePolicy.publicDisplayState(
+            store.displayState(turn.turnId).name(), turn.deletedAt));
         result.put("activeAttemptId", turn.activeAttemptId);
         result.put("createdAt", turn.createdAt);
         result.put("updatedAt", turn.updatedAt);
         result.put("completedAt", turn.completedAt);
+        result.put("deletedAt", turn.deletedAt);
+        result.put("redacted", ExecutionServicePolicy.isRedacted(turn.deletedAt));
         result.put("notificationShownAt", turn.notificationShownAt);
         result.put("uiAppliedAt", turn.uiAppliedAt);
         result.put("cloudConfirmedAt", turn.cloudConfirmedAt);

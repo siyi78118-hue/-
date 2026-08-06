@@ -64,7 +64,7 @@ public class RoomBridgeMirrorTest {
         mirror.persistReply(turn, fallback);
 
         assertEquals("fallback", inserted.get(0).origin);
-        assertEquals(1L, inserted.get(0).syncSeq);
+        assertEquals(41L, inserted.get(0).syncSeq);
     }
 
     @Test public void cloudReplyPreservesThePcMessageIdentityAndOriginalTime() throws Exception {
@@ -424,6 +424,7 @@ public class RoomBridgeMirrorTest {
                     inserted.add((RawMessageEntity) args[0]);
                     return 1L;
                 }
+                if ("allocateJournalSyncSeq".equals(method.getName())) return 41L;
                 if ("turn".equals(method.getName())) {
                     return turns.get((String) args[0]);
                 }

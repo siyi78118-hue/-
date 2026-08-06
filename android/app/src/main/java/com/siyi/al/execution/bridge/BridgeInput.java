@@ -2,6 +2,7 @@ package com.siyi.al.execution.bridge;
 
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.BridgeAuthority;
+import com.siyi.al.execution.FallbackCognitionPacketCodec;
 import com.siyi.al.execution.TurnKind;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -24,6 +25,13 @@ public final class BridgeInput {
 
     static JSONObject source(TurnSubmission submission) throws Exception {
         return new JSONObject(submission.inputJson);
+    }
+
+    private static JSONObject semanticSnapshot(TurnSubmission submission, JSONObject raw) throws Exception {
+        if (!"cognition-v3".equals(raw.optString("contract", ""))) {
+            return new JSONObject(raw.toString());
+        }
+        return new FallbackCognitionPacketCodec().decode(raw).semanticView;
     }
 
     static JSONObject userMessage(TurnSubmission submission) throws Exception {
@@ -221,7 +229,7 @@ public final class BridgeInput {
             : "trigger_" + submission.sourceMessageId;
         JSONObject context = new JSONObject()
             .put("input", input)
-            .put("snapshot", snapshot);
+            .put("snapshot", semanticSnapshot(submission, snapshot));
         JSONObject scene = snapshot.optJSONObject("scene");
         if (scene != null) context.put("scene", new JSONObject(scene.toString()));
         if (submission.cloudJobId != null) context.put("cloudJobId", submission.cloudJobId);

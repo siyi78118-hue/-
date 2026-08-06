@@ -12,6 +12,7 @@ import com.siyi.al.execution.bridge.BridgeAcceptedException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import org.json.JSONArray;
@@ -187,6 +188,11 @@ public final class ExecutionEngine {
             }
             return;
         }
+        if (turn.bridgeProtocolVersion != null && turn.bridgeProtocolVersion == 3
+            && "fallback".equals(result.origin)) {
+            commitAndroidFallbackDraft(turn, attempt, result);
+            return;
+        }
         JSONObject checkpoint = new JSONObject()
             .put("origin", result.origin)
             .put("fallback", result.fallback)
@@ -201,23 +207,131 @@ public final class ExecutionEngine {
             store.commitSkip(turn.turnId, attempt.attemptId, clock.now());
             return;
         }
-        String bridgedReply = result.replyText;
-        if ("received".equals(result.paymentStatus) || "refused".equals(result.paymentStatus) || "pending".equals(result.paymentStatus)) {
-            bridgedReply += "\n<al_payment>" + new JSONObject().put("status", result.paymentStatus).toString() + "</al_payment>";
-        }
-        if (!result.relationshipStageActionJson.isEmpty()) {
-            bridgedReply += "\n<al_relationship_stage>" + result.relationshipStageActionJson + "</al_relationship_stage>";
-        }
-        if (!result.momentActionJson.isEmpty()) {
-            bridgedReply += "\n<al_moment_action>" + result.momentActionJson + "</al_moment_action>";
-        }
-        if (!result.rolePlanOperationsJson.isEmpty()) {
-            bridgedReply += "\n<al_plan>" + new JSONObject()
-                .put("operations", new JSONArray(result.rolePlanOperationsJson)).toString() + "</al_plan>";
-        }
+        String bridgedReply = bridgedDraft(result);
         store.saveRawReply(turn.turnId, attempt.attemptId, bridgedReply, clock.now());
         attempt.rawReply = bridgedReply;
         commitStoredReply(turn, attempt);
+    }
+
+    private void commitAndroidFallbackDraft(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        BridgeResult result
+    ) throws Exception {
+        if (result.skipped) {
+            if (TurnKind.DIRECT_REPLY.name().equals(turn.kind)) {
+                throw new ApiProtocolException(
+                    "DIRECT_FALLBACK_SKIP_FORBIDDEN",
+                    "A direct fallback must contain a visible reply"
+                );
+            }
+            store.commitAndroidFallback(
+                turn.turnId,
+                attempt.attemptId,
+                Collections.emptyList(),
+                "skip",
+                clock.now()
+            );
+            return;
+        }
+
+        String draft = bridgedDraft(result);
+        LiveReplyQualityGate qualityGate = new LiveReplyQualityGate();
+        LiveReplyQualityGate.Report quality = qualityGate.inspect(
+            draft,
+            LiveReplyQualityGate.Context.fromSnapshot(new JSONObject(turn.snapshotJson), null)
+        );
+        if (qualityGate.shouldRewrite(quality)) {
+            throw new ApiProtocolException(
+                "FALLBACK_QUALITY_REJECTED",
+                "The local fallback draft failed the live quality gate"
+            );
+        }
+
+        ParsedReply parsed = parser.parse(draft, turn.turnId, attempt.attemptId);
+        List<ParsedReplyPart> authorizedParts = new ArrayList<>();
+        for (ParsedReplyPart part : parsed.parts) {
+            if ("PAYMENT_STATUS".equals(part.type)
+                && "pending".equals(new JSONObject(part.payloadJson).optString("status", "")
+                    .trim().toLowerCase(Locale.ROOT))) {
+                continue;
+            }
+            if ("RELATIONSHIP_STAGE".equals(part.type)
+                && !hasCompleteRelationshipAuthority(new JSONObject(part.payloadJson))) {
+                continue;
+            }
+            authorizedParts.add(part);
+        }
+        if (authorizedParts.isEmpty()) {
+            throw new ApiProtocolException(
+                "EMPTY_CONTENT",
+                "Local fallback contained neither visible content nor an authorized action"
+            );
+        }
+        List<ReplyPartEntity> entities = replyEntities(authorizedParts, clock.now());
+        boolean visible = entities.stream().anyMatch(part -> "TEXT".equals(part.type));
+        if (TurnKind.DIRECT_REPLY.name().equals(turn.kind) && !visible) {
+            throw new ApiProtocolException(
+                "DIRECT_FALLBACK_VISIBLE_REPLY_REQUIRED",
+                "A direct fallback must contain visible text"
+            );
+        }
+        store.commitAndroidFallback(
+            turn.turnId,
+            attempt.attemptId,
+            entities,
+            visible ? "visible" : "action_only",
+            clock.now()
+        );
+    }
+
+    private static boolean hasCompleteRelationshipAuthority(JSONObject payload) {
+        if (!(payload.opt("expectedSceneRevision") instanceof Number)
+            || !(payload.opt("label") instanceof String)
+            || !(payload.opt("changedAt") instanceof Number)) return false;
+        JSONObject base = payload.optJSONObject("baseAction");
+        JSONObject phase = payload.optJSONObject("phaseAction");
+        return hasCompleteRelationshipPart(base, "explicitMutualChange")
+            || hasCompleteRelationshipPart(phase, "explicitAcknowledgedChange");
+    }
+
+    private static boolean hasCompleteRelationshipPart(JSONObject value, String booleanKey) {
+        return value != null
+            && value.opt("from") instanceof String
+            && value.opt("to") instanceof String
+            && value.opt("label") instanceof String
+            && value.opt("reason") instanceof String
+            && value.opt("confidence") instanceof Number
+            && value.opt("evidenceMessageIds") instanceof JSONArray
+            && value.opt(booleanKey) instanceof Boolean
+            && value.opt("changedAt") instanceof Number;
+    }
+
+    private static String bridgedDraft(BridgeResult result) throws Exception {
+        String bridgedReply = result.replyText;
+        if ("received".equals(result.paymentStatus)
+            || "refused".equals(result.paymentStatus)
+            || "pending".equals(result.paymentStatus)) {
+            bridgedReply += "\n<al_payment>"
+                + new JSONObject().put("status", result.paymentStatus).toString()
+                + "</al_payment>";
+        }
+        if (!result.relationshipStageActionJson.isEmpty()) {
+            bridgedReply += "\n<al_relationship_stage>"
+                + result.relationshipStageActionJson
+                + "</al_relationship_stage>";
+        }
+        if (!result.momentActionJson.isEmpty()) {
+            bridgedReply += "\n<al_moment_action>"
+                + result.momentActionJson
+                + "</al_moment_action>";
+        }
+        if (!result.rolePlanOperationsJson.isEmpty()) {
+            bridgedReply += "\n<al_plan>" + new JSONObject()
+                .put("operations", new JSONArray(result.rolePlanOperationsJson)).toString()
+                + "</al_plan>";
+        }
+        return bridgedReply;
     }
 
     private void commitStoredReply(ChatTurnEntity turn, ExecutionAttemptEntity attempt) throws Exception {
@@ -226,9 +340,17 @@ public final class ExecutionEngine {
         }
         ParsedReply parsed = parser.parse(attempt.rawReply, turn.turnId, attempt.attemptId);
         if (parsed.parts.isEmpty()) throw new ApiProtocolException("EMPTY_CONTENT", "Model reply contained no visible message");
-        List<ReplyPartEntity> entities = new ArrayList<>();
         long now = clock.now();
-        for (ParsedReplyPart source : parsed.parts) {
+        List<ReplyPartEntity> entities = replyEntities(parsed.parts, now);
+        store.commitReply(turn.turnId, attempt.attemptId, entities, now);
+    }
+
+    private static List<ReplyPartEntity> replyEntities(
+        List<ParsedReplyPart> sources,
+        long now
+    ) {
+        List<ReplyPartEntity> entities = new ArrayList<>();
+        for (ParsedReplyPart source : sources) {
             ReplyPartEntity part = new ReplyPartEntity();
             part.replyPartId = source.partId;
             part.turnId = source.turnId;
@@ -240,7 +362,7 @@ public final class ExecutionEngine {
             part.createdAt = now;
             entities.add(part);
         }
-        store.commitReply(turn.turnId, attempt.attemptId, entities, now);
+        return entities;
     }
 
     private static JSONArray exactChatMessages(JSONObject snapshot) {

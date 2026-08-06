@@ -14,6 +14,13 @@ public interface ExecutionEngineStore {
     TurnSubmission prepareBridgeSubmission(TurnSubmission base, String bridgeDeviceId, long now);
     RoomExecutionStore.DeliveryDisposition commitBridgedTerminal(
         String turnId, String attemptId, BridgeResult result, long now);
+    RoomExecutionStore.DeliveryDisposition commitAndroidFallback(
+        String turnId,
+        String attemptId,
+        List<ReplyPartEntity> parts,
+        String terminalDisposition,
+        long now
+    );
     void commitVerifiedRemoteFailure(
         String turnId, String attemptId, BridgeResult result, long now);
     void markStage(String turnId, String attemptId, TurnState state, AttemptStage stage, long now);

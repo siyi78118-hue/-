@@ -1,6 +1,7 @@
 package com.siyi.al.execution.bridge;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -312,6 +313,87 @@ public class BridgeInputTest {
             assertEquals("kept_" + suffix, embedded.getString("semantic"));
             assertEquals(false, embedded.has("_alBridgeProtocol"));
         }
+    }
+
+    @Test
+    public void v3DirectEnvelopeNeverCarriesLocalFallbackExecutionOrModelInputs() throws Exception {
+        JSONObject container = new JSONObject()
+            .put("contract", "cognition-v3")
+            .put("schemaVersion", 3)
+            .put("roleId", "yuqi")
+            .put("hardConstraints", new JSONArray())
+            .put("preferences", new JSONArray())
+            .put("currentStances", new JSONArray())
+            .put("relationship", new JSONObject())
+            .put("recentGroups", new JSONArray())
+            .put("verifiedFacts", new JSONArray())
+            .put("lifeSignals", new JSONArray())
+            .put("authorSettings", new JSONObject())
+            .put("fallbackExecution", new JSONObject()
+                .put("contract", "cognition-v3-fallback-v1")
+                .put("deviceId", "device1")
+                .put("cognition", new JSONObject()
+                    .put("configId", "memory-v3")
+                    .put("system", "secret cognition")
+                    .put("messages", new JSONArray().put(new JSONObject().put("role", "user").put("content", "secret"))))
+                .put("expression", new JSONObject()
+                    .put("configId", "chat-v3")
+                    .put("system", "secret expression")
+                    .put("messages", new JSONArray())));
+        TurnSubmission submission = new TurnSubmission(
+            "turn_local_v3", "yuqi", "msg_v3", TurnKind.DIRECT_REPLY,
+            new JSONObject().put("userText", "你好").toString(), container.toString(), null, 1000L
+        );
+        JSONObject cursor = emptyCursor(1L);
+        JSONObject envelope = BridgeInput.prepareV3Envelope(
+            submission, "device1", "turn_remote_v3", "private_chat", "msg_v3", "lineage_v3", 1L, null, cursor
+        );
+
+        String serialized = envelope.toString();
+        assertEquals(-1, serialized.indexOf("fallbackExecution"));
+        assertEquals(-1, serialized.indexOf("memory-v3"));
+        assertEquals(-1, serialized.indexOf("secret cognition"));
+        assertEquals(-1, serialized.indexOf("secret expression"));
+        assertEquals(-1, serialized.indexOf("cognition-v3"));
+        assertFalse(envelope.getJSONObject("context").has("snapshot"));
+    }
+
+    @Test
+    public void v3AutomaticTriggerSnapshotKeepsOnlySemanticView() throws Exception {
+        JSONObject container = new JSONObject()
+            .put("contract", "cognition-v3")
+            .put("schemaVersion", 3)
+            .put("roleId", "yuqi")
+            .put("hardConstraints", new JSONArray())
+            .put("preferences", new JSONArray())
+            .put("currentStances", new JSONArray())
+            .put("relationship", new JSONObject())
+            .put("recentGroups", new JSONArray())
+            .put("verifiedFacts", new JSONArray())
+            .put("lifeSignals", new JSONArray())
+            .put("authorSettings", new JSONObject())
+            .put("fallbackExecution", new JSONObject()
+                .put("contract", "cognition-v3-fallback-v1")
+                .put("deviceId", "device1")
+                .put("cognition", new JSONObject()
+                    .put("configId", "memory-v3")
+                    .put("system", "secret cognition")
+                    .put("messages", new JSONArray()))
+                .put("expression", new JSONObject()
+                    .put("configId", "chat-v3")
+                    .put("system", "secret expression")
+                    .put("messages", new JSONArray())));
+        TurnSubmission submission = new TurnSubmission(
+            "automatic_v3", "yuqi", "trigger_v3", TurnKind.PROACTIVE_CHAT,
+            new JSONObject().put("scheduledFor", 1000L).toString(), container.toString(), "job_v3", 1000L
+        );
+        JSONObject envelope = BridgeInput.prepareV3Envelope(
+            submission, "device1", "turn_automatic_v3", "private_chat", "trigger_v3", "lineage_v3", 1L, null, emptyCursor(1L)
+        );
+        JSONObject snapshot = envelope.getJSONObject("trigger").getJSONObject("context").getJSONObject("snapshot");
+        assertEquals("cognition-v3", snapshot.getString("contract"));
+        assertEquals(false, snapshot.has("fallbackExecution"));
+        assertEquals(false, snapshot.has("deviceId"));
     }
 
     private static JSONObject batchMessage(String messageId, String content, long sentAt) throws Exception {

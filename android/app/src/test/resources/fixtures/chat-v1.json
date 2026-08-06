@@ -1,0 +1,9 @@
+{
+  "packetType": "chat-v1",
+  "memoryConfigId": "memory-v1",
+  "memorySystem": "memory system",
+  "memoryMessages": [],
+  "chatConfigId": "chat-v1",
+  "chatSystem": "chat system",
+  "chatMessages": [{"role":"user","content":"聊天"}]
+}

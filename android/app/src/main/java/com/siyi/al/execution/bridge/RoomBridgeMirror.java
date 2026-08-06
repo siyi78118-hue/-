@@ -343,7 +343,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
     }
 
     private long nextSyncSeq() {
-        return Math.max(1L, Math.max(dao.maxRawSyncSeq(), dao.maxAnnotationSyncSeq()) + 1L);
+        return dao.allocateJournalSyncSeq(System.currentTimeMillis());
     }
 
     private static String canonical(RawMessageEntity value) {

@@ -1,0 +1,9 @@
+{
+  "packetType": "cognition-v2",
+  "cognitionConfigId": "memory-v2",
+  "cognitionSystem": "memory system",
+  "cognitionMessages": [{"role":"user","content":"你好"}],
+  "expressionConfigId": "chat-v2",
+  "expressionSystem": "chat system",
+  "expressionMessages": [{"role":"user","content":"你好"}]
+}

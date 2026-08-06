@@ -63,6 +63,18 @@ export class YuqiReconciler {
     this.codex = codex;
   }
 
+  async importExternalVisibleReceiptInternal(receipt) {
+    const result = this.store.importExternalVisibleReceiptInternal(receipt);
+    const semantic = receipt?.semantic;
+    const peerId = String(semantic?.deviceId || '');
+    const ackSeq = Number(semantic?.journalSyncSeq);
+    if (!peerId || !Number.isSafeInteger(ackSeq) || ackSeq < 1) {
+      throw new Error('external authority receipt sync identity conflict');
+    }
+    this.store.ackSync(peerId, ackSeq);
+    return { ...result, peerId, ackSeq: this.store.getSyncCursor(peerId) };
+  }
+
   async reconcileFrom(rawRecovery) {
     const { peerId, lastCommonSeq: declaredCommon, entries: ordered } = normalizeRecoverySnapshot(rawRecovery);
     if (declaredCommon > this.store.getSyncCursor(peerId)) this.store.ackSync(peerId, declaredCommon);

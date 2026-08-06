@@ -215,9 +215,20 @@ public final class AlExecutionService extends Service {
     }
 
     private void confirmBridgeDelivery(ChatTurnEntity turn, SharedPreferences confirmed) {
-        if (ExecutionServicePolicy.shouldUseCanonicalReceipt(
-                turn.bridgeProtocolVersion, turn.state, turn.deletedAt)) {
+        ExecutionServicePolicy.CompletedDeliveryPath deliveryPath = completedDeliveryPath(turn);
+        if (deliveryPath == ExecutionServicePolicy.CompletedDeliveryPath.JOURNAL_ONLY) {
+            // Local fallback v2 is owned by FallbackJournal.  It has no cloud
+            // delivery target and must never fall through to either receipt
+            // writer (canonical or legacy).
+            return;
+        }
+        if (deliveryPath == ExecutionServicePolicy.CompletedDeliveryPath.CANONICAL_RECEIPT) {
             confirmCanonicalBridgeDelivery(turn);
+            return;
+        }
+        if (deliveryPath == ExecutionServicePolicy.CompletedDeliveryPath.NONE) {
+            // A v3 row without a closed, persisted authority checkpoint is
+            // ambiguous.  Fail closed instead of guessing from memoryResult.
             return;
         }
         String key = "turn." + turn.turnId;
@@ -248,6 +259,56 @@ public final class AlExecutionService extends Service {
                 error.getMessage(), System.currentTimeMillis()
             );
         }
+    }
+
+    private ExecutionServicePolicy.CompletedDeliveryPath completedDeliveryPath(ChatTurnEntity turn) {
+        if (turn == null) return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+        Integer checkpointVersion = null;
+        String outcomeType = null;
+        String outcomeRoute = null;
+        if (turn.bridgeProtocolVersion != null && turn.bridgeProtocolVersion == 3) {
+            if (turn.activeAttemptId == null || turn.activeAttemptId.trim().isEmpty()) {
+                return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+            }
+            try {
+                com.siyi.al.execution.db.ExecutionAttemptEntity attempt =
+                    executionStore.activeAttempt(turn.turnId);
+                if (attempt == null || !turn.activeAttemptId.equals(attempt.attemptId)
+                    || attempt.bridgeAuthorityCheckpointJson == null
+                    || attempt.bridgeAuthorityCheckpointChecksum == null) {
+                    return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+                }
+                JSONObject checkpoint = new JSONObject(attempt.bridgeAuthorityCheckpointJson);
+                Object version = checkpoint.opt("version");
+                if (!(version instanceof Number)) return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+                long versionValue = ((Number) version).longValue();
+                if (((Number) version).doubleValue() != (double) versionValue
+                    || versionValue < 1L || versionValue > Integer.MAX_VALUE) {
+                    return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+                }
+                checkpointVersion = (int) versionValue;
+                JSONObject outcome = checkpoint.optJSONObject("outcome");
+                if (outcome == null) return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+                Object type = outcome.opt("type");
+                Object route = outcome.opt("route");
+                if (!(type instanceof String) || !(route instanceof String)) {
+                    return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+                }
+                outcomeType = (String) type;
+                outcomeRoute = (String) route;
+            } catch (Exception malformedCheckpoint) {
+                return ExecutionServicePolicy.CompletedDeliveryPath.NONE;
+            }
+        }
+        return ExecutionServicePolicy.classifyCompletedDelivery(
+            turn.bridgeProtocolVersion,
+            turn.state,
+            turn.deletedAt,
+            checkpointVersion,
+            turn.authorityOrigin,
+            outcomeType,
+            outcomeRoute
+        );
     }
 
     private void confirmCanonicalBridgeDelivery(ChatTurnEntity turn) {

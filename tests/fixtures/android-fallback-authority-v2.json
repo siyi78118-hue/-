@@ -1,0 +1,169 @@
+{
+  "receiptVersion": 2,
+  "semantic": {
+    "protocolVersion": 2,
+    "contract": "android-fallback-authority-v2",
+    "authorityOrigin": "android_fallback",
+    "roleId": "yuqi",
+    "laneKey": "private_chat",
+    "rootSourceId": "msg_android_root_001",
+    "authorityLineageKey": "lin_bf1eb7e0ed9d585743ce01189dee754c062e4467aa3f5c4f9054c97bbcde55be",
+    "authoritativeTurnId": "turn_android_001",
+    "retryOfTurnId": null,
+    "lineageRevisionAtCreation": 1,
+    "turnRevision": 1,
+    "deviceId": "phone",
+    "turnKind": "PROACTIVE_CHAT",
+    "terminalDisposition": "visible",
+    "input": {
+      "kind": "automatic",
+      "trigger": {
+        "triggerId": "msg_android_root_001",
+        "triggerType": "proactive_chat",
+        "scheduledFor": 1000,
+        "executedAt": 1001,
+        "context": { "reason": "proactive" }
+      },
+      "visibilitySequence": 7,
+      "clearEpoch": 0,
+      "checksum": "bbb06d200d503439a91c760aa18ef15b0c7e3dcd3cf0e554b37c6ff3e7093a59"
+    },
+    "compactSemanticSnapshot": {
+      "contract": "cognition-v3",
+      "schemaVersion": 3,
+      "roleId": "yuqi",
+      "hardConstraints": [],
+      "preferences": [],
+      "currentStances": [],
+      "relationship": { "base": "close" },
+      "recentGroups": [],
+      "verifiedFacts": [],
+      "lifeSignals": [],
+      "authorSettings": {}
+    },
+    "agencySnapshotChecksum": "42a3e522fad9f8b355fb01c4edd56dde04d4a56034091155a3cb21e300c239c4",
+    "visibleGroupId": "grp_a4eb81d37e24e07ed64c45f77955865ea9953775d190ca9aaff674d1e9003608",
+    "replyItems": [
+      {
+        "ordinal": 0,
+        "messageId": "msg_61f64e3b2b496862dadf816f327baadd1c158bd29aaaf583b482b9913c5b68bb",
+        "message": {
+          "messageId": "msg_61f64e3b2b496862dadf816f327baadd1c158bd29aaaf583b482b9913c5b68bb",
+          "speakerId": "yuqi",
+          "speakerType": "character",
+          "recipientId": "user",
+          "content": "hello.",
+          "sentAt": 1001,
+          "attachments": []
+        },
+        "checksum": "269721e94eb46be9bf5b439ec9b185fb8dfbeaf4671f58b81ee1a55ccd037cdd"
+      }
+    ],
+    "visibleItems": [
+      {
+        "messageId": "msg_61f64e3b2b496862dadf816f327baadd1c158bd29aaaf583b482b9913c5b68bb",
+        "speakerId": "yuqi",
+        "speakerType": "character",
+        "recipientId": "user",
+        "content": "hello.",
+        "sentAt": 1001,
+        "attachments": []
+      }
+    ],
+    "actions": [],
+    "release": {
+      "releaseId": "android_fallback:7f2e640508eb316b947208f4752392bb379b8c8a57108cf16ec08044f557b105",
+      "contract": "cognition-v3-fallback-v1",
+      "codecVersion": 1,
+      "contractChecksum": "7f2e640508eb316b947208f4752392bb379b8c8a57108cf16ec08044f557b105",
+      "releaseChecksum": "86b5533a9ec430bfbb26586b681f8a69179179b19ed382827d8230baf7531381"
+    },
+    "journalSyncSeq": 8
+  },
+  "manifest": {
+    "payloadVersion": "android-fallback-commit-v2",
+    "authorityOrigin": "android_fallback",
+    "semantic": {
+      "protocolVersion": 2,
+      "contract": "android-fallback-authority-v2",
+      "authorityOrigin": "android_fallback",
+      "roleId": "yuqi",
+      "laneKey": "private_chat",
+      "rootSourceId": "msg_android_root_001",
+      "authorityLineageKey": "lin_bf1eb7e0ed9d585743ce01189dee754c062e4467aa3f5c4f9054c97bbcde55be",
+      "authoritativeTurnId": "turn_android_001",
+      "retryOfTurnId": null,
+      "lineageRevisionAtCreation": 1,
+      "turnRevision": 1,
+      "deviceId": "phone",
+      "turnKind": "PROACTIVE_CHAT",
+      "terminalDisposition": "visible",
+      "input": {
+        "kind": "automatic",
+        "trigger": {
+          "triggerId": "msg_android_root_001",
+          "triggerType": "proactive_chat",
+          "scheduledFor": 1000,
+          "executedAt": 1001,
+          "context": { "reason": "proactive" }
+        },
+        "visibilitySequence": 7,
+        "clearEpoch": 0,
+        "checksum": "bbb06d200d503439a91c760aa18ef15b0c7e3dcd3cf0e554b37c6ff3e7093a59"
+      },
+      "compactSemanticSnapshot": {
+        "contract": "cognition-v3",
+        "schemaVersion": 3,
+        "roleId": "yuqi",
+        "hardConstraints": [],
+        "preferences": [],
+        "currentStances": [],
+        "relationship": { "base": "close" },
+        "recentGroups": [],
+        "verifiedFacts": [],
+        "lifeSignals": [],
+        "authorSettings": {}
+      },
+      "agencySnapshotChecksum": "42a3e522fad9f8b355fb01c4edd56dde04d4a56034091155a3cb21e300c239c4",
+      "visibleGroupId": "grp_a4eb81d37e24e07ed64c45f77955865ea9953775d190ca9aaff674d1e9003608",
+      "replyItems": [
+        {
+          "ordinal": 0,
+          "messageId": "msg_61f64e3b2b496862dadf816f327baadd1c158bd29aaaf583b482b9913c5b68bb",
+          "message": {
+            "messageId": "msg_61f64e3b2b496862dadf816f327baadd1c158bd29aaaf583b482b9913c5b68bb",
+            "speakerId": "yuqi",
+            "speakerType": "character",
+            "recipientId": "user",
+            "content": "hello.",
+            "sentAt": 1001,
+            "attachments": []
+          },
+          "checksum": "269721e94eb46be9bf5b439ec9b185fb8dfbeaf4671f58b81ee1a55ccd037cdd"
+        }
+      ],
+      "visibleItems": [
+        {
+          "messageId": "msg_61f64e3b2b496862dadf816f327baadd1c158bd29aaaf583b482b9913c5b68bb",
+          "speakerId": "yuqi",
+          "speakerType": "character",
+          "recipientId": "user",
+          "content": "hello.",
+          "sentAt": 1001,
+          "attachments": []
+        }
+      ],
+      "actions": [],
+      "release": {
+        "releaseId": "android_fallback:7f2e640508eb316b947208f4752392bb379b8c8a57108cf16ec08044f557b105",
+        "contract": "cognition-v3-fallback-v1",
+        "codecVersion": 1,
+        "contractChecksum": "7f2e640508eb316b947208f4752392bb379b8c8a57108cf16ec08044f557b105",
+        "releaseChecksum": "86b5533a9ec430bfbb26586b681f8a69179179b19ed382827d8230baf7531381"
+      },
+      "journalSyncSeq": 8
+    },
+    "commitChecksum": "5d907947778113f483e37172e99e4b3fd4ba2ecff65a01ce4097b1dc8fe261a4"
+  },
+  "commitChecksum": "5d907947778113f483e37172e99e4b3fd4ba2ecff65a01ce4097b1dc8fe261a4"
+}

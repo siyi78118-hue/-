@@ -175,6 +175,140 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void storeOwnedV3LocalFallbackCommitsThroughTheAuthorityWriterOnly() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                return BridgeResult.success("fallback", "我在。刚刚去倒了杯水");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("the legacy memory/chat pipeline must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(
+            store, gateway, new ReplyParser(), () -> 1500L).runNext());
+
+        assertEquals(Collections.singletonList("android-fallback"), store.events);
+        assertEquals(1, store.replyParts.size());
+        assertEquals("我在。刚刚去倒了杯水", store.replyParts.get(0).content);
+    }
+
+    @Test
+    public void v3LocalFallbackTreatsPendingPaymentAsNonTerminalInformation() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                return BridgeResult.success("fallback", "我在。刚刚去倒了杯水", "{}", "pending");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("the legacy model path must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(
+            store, gateway, new ReplyParser(), () -> 1500L).runNext());
+
+        assertEquals(Collections.singletonList("android-fallback"), store.events);
+        assertEquals(1, store.replyParts.size());
+        assertEquals("TEXT", store.replyParts.get(0).type);
+        assertEquals("我在。刚刚去倒了杯水", store.replyParts.get(0).content);
+    }
+
+    @Test
+    public void v3PendingPaymentWithoutVisibleTextDoesNotCommitATerminalReceipt() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                return BridgeResult.success("fallback", "", "{}", "pending");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("the legacy model path must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(
+            store, gateway, new ReplyParser(), () -> 1500L).runNext());
+
+        assertEquals(Collections.emptyList(), store.events);
+        assertEquals(0, store.replyParts.size());
+        assertTrue(TurnState.FAILED_RETRYABLE.name().equals(store.turn.state)
+            || TurnState.FAILED_FINAL.name().equals(store.turn.state));
+    }
+
+    @Test
+    public void v3LocalFallbackKeepsVisibleTextButDoesNotInventMissingRelationshipEvidence() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        String legacyRelationship = new JSONObject()
+            .put("baseAction", JSONObject.NULL)
+            .put("phaseAction", new JSONObject().put("from", "normal").put("to", "conflict"))
+            .toString();
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                return BridgeResult.success(
+                    "fallback", "我还在生气。", "{}", "", legacyRelationship, "");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("the legacy model path must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(
+            store, gateway, new ReplyParser(), () -> 1500L).runNext());
+
+        assertEquals(Collections.singletonList("android-fallback"), store.events);
+        assertEquals(1, store.replyParts.size());
+        assertEquals("TEXT", store.replyParts.get(0).type);
+        assertEquals("我还在生气。", store.replyParts.get(0).content);
+    }
+
+    @Test
+    public void storeOwnedV3FallbackDraftMustPassTheLiveQualityGateBeforeCommit() throws Exception {
+        ChatTurnEntity turn = turn("QUEUED", null);
+        turn.bridgeProtocolVersion = 3;
+        turn.characterId = "yuqi";
+        FakeStore store = new FakeStore(turn, attempt("QUEUED", null));
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device1"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                return BridgeResult.success("fallback", "{\"reply\":\"不该直接显示\"}");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new IllegalStateException("rewrite rejected");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(
+            store, gateway, new ReplyParser(), () -> 1500L).runNext());
+
+        assertEquals(Collections.emptyList(), store.events);
+        assertEquals(0, store.replyParts.size());
+        assertTrue(TurnState.FAILED_RETRYABLE.name().equals(store.turn.state)
+            || TurnState.FAILED_FINAL.name().equals(store.turn.state));
+    }
+
+    @Test
     public void storeOwnedV3MarkerReplacesCallerValueOnlyForFreshYuqiTurns() throws Exception {
         String supplied = new JSONObject()
             .put("scene", "chat")
@@ -618,6 +752,20 @@ public class ExecutionEngineTest {
             String turnId, String attemptId, BridgeResult result, long now) {
             events.add("canonical-terminal");
             if (canonicalApplyFailure != null) throw canonicalApplyFailure;
+            return RoomExecutionStore.DeliveryDisposition.APPLY;
+        }
+
+        @Override public RoomExecutionStore.DeliveryDisposition commitAndroidFallback(
+            String turnId,
+            String attemptId,
+            List<ReplyPartEntity> parts,
+            String terminalDisposition,
+            long now
+        ) {
+            events.add("android-fallback");
+            replyParts.addAll(parts);
+            turn.state = TurnState.COMPLETED.name();
+            attempt.state = TurnState.COMPLETED.name();
             return RoomExecutionStore.DeliveryDisposition.APPLY;
         }
 

@@ -56,6 +56,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     static final String FAULT_FAILURE_ATTEMPT = "attempt_failure_cas";
     static final String FAULT_FAILURE_CHANGE = "failure_change_event";
     static final String FAULT_FAILURE_DIAGNOSTIC = "failure_diagnostic";
+    static final String FAULT_LOCAL_JOURNAL = "local_journal_sequence";
 
     private final AlExecutionDatabase database;
     private final AlExecutionDao dao;
@@ -65,6 +66,17 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         "authoritativeTurnId", "authorityLineageKey", "claimedLineageRevision",
         "retryOfTurnId", "laneKey", "inputVisibilitySequence", "inputClearEpoch",
         "normalizedEnvelope", "envelopeChecksum", "outcome"
+    ));
+    private static final Set<String> LOCAL_CHECKPOINT_KEYS = new HashSet<>(Arrays.asList(
+        "version", "localTurnId", "attemptId", "attemptSequence",
+        "authoritativeTurnId", "authorityLineageKey", "claimedLineageRevision",
+        "retryOfTurnId", "laneKey", "inputVisibilitySequence", "inputClearEpoch",
+        "normalizedEnvelope", "envelopeChecksum", "outcome", "fallbackExecution",
+        "journalSyncSeq"
+    ));
+    private static final Set<String> LOCAL_REDACTED_RESULT_KEYS = new HashSet<>(Arrays.asList(
+        "contract", "authorityLineageKey", "authoritativeTurnId",
+        "inputVisibilitySequence", "inputClearEpoch", "draftDisposition"
     ));
     private static final Set<String> OUTCOME_KEYS = new HashSet<>(Arrays.asList(
         "type", "route", "relayMessageId", "failure", "result", "redactedAt"
@@ -510,6 +522,269 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         if (!attemptId.equals(turn.activeAttemptId)) throw new StaleAttemptException(turnId, attemptId);
         dao.commitSkip(turnId, attemptId, now);
         markNativeCompleted(turn.characterId, turnId, groupId(turn), visibilitySequence(turn), now);
+    }
+
+    @Override
+    public DeliveryDisposition commitAndroidFallback(
+        String turnId,
+        String attemptId,
+        List<ReplyPartEntity> parts,
+        String terminalDisposition,
+        long now
+    ) {
+        AtomicReference<DeliveryDisposition> disposition = new AtomicReference<>();
+        database.runInTransaction(() -> disposition.set(commitAndroidFallbackInternal(
+            turnId, attemptId, parts, terminalDisposition, now)));
+        return disposition.get();
+    }
+
+    private DeliveryDisposition commitAndroidFallbackInternal(
+        String turnId,
+        String attemptId,
+        List<ReplyPartEntity> parts,
+        String terminalDisposition,
+        long now
+    ) {
+        try {
+            if (now <= 0L || now > 9007199254740991L
+                || !("visible".equals(terminalDisposition)
+                    || "action_only".equals(terminalDisposition)
+                    || "skip".equals(terminalDisposition))) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            List<ReplyPartEntity> suppliedParts = parts == null
+                ? java.util.Collections.emptyList() : parts;
+            ChatTurnEntity turn = requireTurn(turnId);
+            if (!isStoreOwnedV3(turn) || !attemptId.equals(turn.activeAttemptId)) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            ExecutionAttemptEntity attempt = dao.attempt(attemptId);
+            if (attempt == null || !turnId.equals(attempt.turnId)
+                || attempt.sequence != dao.maxAttemptSequence(turnId)) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+
+            JSONObject storedCheckpoint = new JSONObject(attempt.bridgeAuthorityCheckpointJson);
+            Object rawVersion = storedCheckpoint.opt("version");
+            if (rawVersion instanceof Number && !(rawVersion instanceof Float)
+                && !(rawVersion instanceof Double) && ((Number) rawVersion).longValue() == 2L) {
+                return validateExactLocalFallbackReplay(
+                    turn, attempt, storedCheckpoint, suppliedParts, terminalDisposition);
+            }
+
+            validateCheckpointSet(turn, dao.attempts(turnId), true);
+            JSONObject checkpoint = validateCheckpoint(turn, attempt, false);
+            assertCanonicalBridgeLifecycle(turn, attempt, false, checkpoint);
+            if (!"open".equals(checkpoint.getJSONObject("outcome").getString("type"))) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            assertLatestPreparedState(turn, checkpoint);
+
+            boolean direct = TurnKind.DIRECT_REPLY.name().equals(turn.kind);
+            if (direct && "skip".equals(terminalDisposition)) throw bridgeAuthorityConflict(turnId);
+            if ("skip".equals(terminalDisposition) && !suppliedParts.isEmpty()) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            if (!"skip".equals(terminalDisposition) && suppliedParts.isEmpty()) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+
+            JSONObject envelope = checkpointEnvelope(checkpoint);
+            FallbackCognitionPacketCodec.FallbackContext fallback =
+                new FallbackCognitionPacketCodec().decode(new JSONObject(turn.snapshotJson));
+            if (!"cognition-v3".equals(fallback.contract) || fallback.fallbackExecution == null
+                || !fallback.deviceId.equals(envelope.getString("deviceId"))) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            ConversationCursorEntity cursor = dao.conversationCursor(turn.characterId);
+            if (cursor == null || checkpoint.getLong("inputClearEpoch") > cursor.clearEpoch) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            boolean redacted = checkpoint.getLong("inputClearEpoch") < cursor.clearEpoch
+                || checkpoint.getLong("inputVisibilitySequence") <= cursor.clearedThroughSequence;
+            if (redacted) {
+                return commitRedactedAndroidFallback(
+                    turn, attempt, checkpoint, terminalDisposition, now);
+            }
+
+            String lineageKey = checkpoint.getString("authorityLineageKey");
+            String visibleGroupId = AuthorityIdentity.groupId(lineageKey);
+            List<ReplyPartEntity> committedParts = buildLocalFallbackParts(
+                turn, attempt, suppliedParts, visibleGroupId, terminalDisposition, now);
+            long journalSyncSeq = dao.allocateJournalSyncSeq(now);
+            if (journalSyncSeq <= 0L || journalSyncSeq > 9007199254740991L) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            terminalFaultHook.after(FAULT_LOCAL_JOURNAL);
+            JSONObject receipt = localFallbackReceipt(
+                turn, attempt, checkpoint, fallback, committedParts,
+                terminalDisposition, visibleGroupId, journalSyncSeq, now);
+            JSONObject nextCheckpoint = new JSONObject(checkpoint.toString())
+                .put("version", 2)
+                .put("fallbackExecution", new JSONObject(
+                    new JSONObject(turn.snapshotJson).getJSONObject("fallbackExecution").toString()))
+                .put("journalSyncSeq", journalSyncSeq)
+                .put("outcome", new JSONObject()
+                    .put("type", "committed")
+                    .put("route", "local")
+                    .put("relayMessageId", JSONObject.NULL)
+                    .put("failure", JSONObject.NULL)
+                    .put("result", receipt)
+                    .put("redactedAt", JSONObject.NULL));
+            String nextJson = BridgeAuthority.canonicalJson(nextCheckpoint);
+            String nextChecksum = BridgeAuthority.sha256CanonicalJson(nextCheckpoint);
+            if (dao.compareAndSetBridgeAuthorityCheckpoint(
+                attemptId, turnId,
+                attempt.bridgeAuthorityCheckpointJson,
+                attempt.bridgeAuthorityCheckpointChecksum,
+                nextJson,
+                nextChecksum
+            ) != 1) throw bridgeAuthorityConflict(turnId);
+            terminalFaultHook.after(FAULT_CHECKPOINT);
+
+            if (!committedParts.isEmpty()) {
+                dao.insertReplyParts(committedParts);
+                terminalFaultHook.after(FAULT_REPLY_PARTS);
+            }
+
+            JSONObject semantic = receipt.getJSONObject("semantic");
+            JSONObject release = semantic.getJSONObject("release");
+            long committedLineageRevision = checkpoint.getLong("claimedLineageRevision") + 1L;
+            if (committedLineageRevision > 9007199254740991L) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            ConversationAuthorityEntity authority = dao.conversationAuthority(lineageKey);
+            if (authority == null || !"OPEN".equals(authority.state)
+                || !checkpoint.getString("authoritativeTurnId").equals(authority.latestTurnId)
+                || checkpoint.getLong("claimedLineageRevision") != authority.revision
+                || dao.compareAndSetConversationAuthority(
+                    lineageKey,
+                    authority.revision,
+                    authority.latestTurnId,
+                    committedLineageRevision,
+                    "COMMITTED",
+                    visibleGroupId,
+                    receipt.getString("commitChecksum"),
+                    "android-fallback-commit-v2",
+                    "android_fallback",
+                    terminalDisposition,
+                    now
+                ) != 1) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            terminalFaultHook.after(FAULT_AUTHORITY);
+
+            Long uiAppliedAt = "skip".equals(terminalDisposition) ? now : null;
+            if (dao.finalizeCanonicalBridgeTurn(
+                turnId, attemptId, visibleGroupId, lineageKey,
+                "android_fallback", "android-fallback-commit-v2",
+                checkpoint.getLong("claimedLineageRevision"), attempt.sequence,
+                checkpoint.getString("laneKey"), attempt.sequence,
+                semantic.getString("agencySnapshotChecksum"),
+                release.getString("releaseId"),
+                checkpoint.getLong("inputVisibilitySequence"),
+                checkpoint.getLong("inputClearEpoch"),
+                receipt.getString("commitChecksum"),
+                terminalDisposition,
+                checkpoint.getLong("claimedLineageRevision"),
+                checkpoint.getLong("inputVisibilitySequence"),
+                checkpoint.getLong("inputClearEpoch"),
+                null, uiAppliedAt, now
+            ) != 1) throw bridgeAuthorityConflict(turnId);
+            terminalFaultHook.after(FAULT_TURN);
+            if (dao.finalizeCanonicalBridgeAttempt(attemptId, turnId, now) != 1) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+            terminalFaultHook.after(FAULT_ATTEMPT);
+
+            applyLocalFallbackCursor(
+                cursor, turnId, visibleGroupId,
+                checkpoint.getLong("inputVisibilitySequence"),
+                "skip".equals(terminalDisposition), now);
+            insertLocalFallbackChange(turnId, lineageKey, visibleGroupId, terminalDisposition, now);
+            terminalFaultHook.after(FAULT_CHANGE);
+            return DeliveryDisposition.APPLY;
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw bridgeAuthorityConflict(turnId);
+        }
+    }
+
+    private DeliveryDisposition commitRedactedAndroidFallback(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        JSONObject checkpoint,
+        String draftDisposition,
+        long now
+    ) throws Exception {
+        JSONObject metadata = new JSONObject()
+            .put("contract", "android-fallback-redacted-v1")
+            .put("authorityLineageKey", checkpoint.getString("authorityLineageKey"))
+            .put("authoritativeTurnId", checkpoint.getString("authoritativeTurnId"))
+            .put("inputVisibilitySequence", checkpoint.getLong("inputVisibilitySequence"))
+            .put("inputClearEpoch", checkpoint.getLong("inputClearEpoch"))
+            .put("draftDisposition", draftDisposition);
+        JSONObject nextCheckpoint = new JSONObject(checkpoint.toString())
+            .put("version", 2)
+            .put("fallbackExecution", new JSONObject(
+                new JSONObject(turn.snapshotJson).getJSONObject("fallbackExecution").toString()))
+            .put("journalSyncSeq", 0L)
+            .put("outcome", new JSONObject()
+                .put("type", "redacted")
+                .put("route", "local")
+                .put("relayMessageId", JSONObject.NULL)
+                .put("failure", JSONObject.NULL)
+                .put("result", metadata)
+                .put("redactedAt", now));
+        String nextJson = BridgeAuthority.canonicalJson(nextCheckpoint);
+        String nextChecksum = BridgeAuthority.sha256CanonicalJson(nextCheckpoint);
+        if (dao.compareAndSetBridgeAuthorityCheckpoint(
+            attempt.attemptId, turn.turnId,
+            attempt.bridgeAuthorityCheckpointJson,
+            attempt.bridgeAuthorityCheckpointChecksum,
+            nextJson,
+            nextChecksum
+        ) != 1) throw bridgeAuthorityConflict(turn.turnId);
+        terminalFaultHook.after(FAULT_CHECKPOINT);
+
+        ConversationAuthorityEntity authority = dao.conversationAuthority(
+            checkpoint.getString("authorityLineageKey"));
+        long nextRevision = checkpoint.getLong("claimedLineageRevision") + 1L;
+        if (authority == null || nextRevision > 9007199254740991L
+            || !"OPEN".equals(authority.state)
+            || !checkpoint.getString("authoritativeTurnId").equals(authority.latestTurnId)
+            || authority.revision != checkpoint.getLong("claimedLineageRevision")
+            || dao.compareAndSetConversationAuthority(
+                checkpoint.getString("authorityLineageKey"),
+                authority.revision,
+                authority.latestTurnId,
+                nextRevision,
+                "CANCELLED",
+                null,
+                null,
+                null,
+                null,
+                null,
+                now
+            ) != 1) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        terminalFaultHook.after(FAULT_AUTHORITY);
+        if (dao.finalizeLocalFallbackRedactedTurn(
+            turn.turnId, attempt.attemptId, now) != 1) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        terminalFaultHook.after(FAULT_TURN);
+        if (dao.finalizeCanonicalBridgeAttempt(
+            attempt.attemptId, turn.turnId, now) != 1) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        terminalFaultHook.after(FAULT_ATTEMPT);
+        insertLocalFallbackRedactedChange(
+            turn.turnId, checkpoint.getString("authorityLineageKey"), now);
+        terminalFaultHook.after(FAULT_CHANGE);
+        return DeliveryDisposition.REDACTED;
     }
 
     @Override
@@ -1397,6 +1672,559 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             .put("failure", JSONObject.NULL)
             .put("result", redacted ? canonicalResultMetadata(result) : result.authorityPayload())
             .put("redactedAt", redacted ? now : JSONObject.NULL);
+    }
+
+    private List<ReplyPartEntity> buildLocalFallbackParts(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        List<ReplyPartEntity> supplied,
+        String visibleGroupId,
+        String terminalDisposition,
+        long now
+    ) throws Exception {
+        List<ReplyPartEntity> committed = new java.util.ArrayList<>();
+        int textOrdinal = 0;
+        int actionOrdinal = 0;
+        Set<String> singleCompatibility = new HashSet<>();
+        JSONObject checkpoint = new JSONObject(attempt.bridgeAuthorityCheckpointJson);
+        for (int index = 0; index < supplied.size(); index += 1) {
+            ReplyPartEntity source = supplied.get(index);
+            if (source == null || !turn.turnId.equals(source.turnId)
+                || !attempt.attemptId.equals(source.attemptId)
+                || source.sequence != index || source.type == null
+                || source.content == null || source.payloadJson == null) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            if (!"TEXT".equals(source.type)) {
+                List<JSONObject> actions = localFallbackActions(
+                    turn, checkpoint, source, visibleGroupId, actionOrdinal, singleCompatibility);
+                for (JSONObject action : actions) {
+                    validateGeneratedLocalAction(turn, checkpoint, action);
+                    ActionProjection projection = projectCanonicalAction(action, singleCompatibility);
+                    ReplyPartEntity row = new ReplyPartEntity();
+                    row.replyPartId = action.getString("actionId");
+                    row.turnId = turn.turnId;
+                    row.attemptId = attempt.attemptId;
+                    row.sequence = textOrdinal + actionOrdinal;
+                    row.type = projection.type;
+                    row.content = "";
+                    row.payloadJson = BridgeAuthority.canonicalJson(new JSONObject()
+                        .put("version", 2)
+                        .put("canonicalAction", action)
+                        .put("legacyPayload", projection.legacyPayload));
+                    row.createdAt = now;
+                    committed.add(row);
+                    actionOrdinal += 1;
+                }
+                continue;
+            }
+            if (actionOrdinal != 0) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            if (source.content.trim().isEmpty()
+                || !BridgeAuthority.canonicalJson(new JSONObject(source.payloadJson)).equals("{}")) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            ReplyPartEntity row = new ReplyPartEntity();
+            row.replyPartId = AuthorityIdentity.messageId(visibleGroupId, textOrdinal);
+            row.turnId = turn.turnId;
+            row.attemptId = attempt.attemptId;
+            row.sequence = textOrdinal;
+            row.type = "TEXT";
+            row.content = source.content;
+            row.payloadJson = "{}";
+            row.createdAt = now;
+            committed.add(row);
+            textOrdinal += 1;
+        }
+        if ("visible".equals(terminalDisposition) && textOrdinal == 0) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        if ("action_only".equals(terminalDisposition)
+            && (textOrdinal != 0 || actionOrdinal == 0)) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        if ("skip".equals(terminalDisposition) && !committed.isEmpty()) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        return committed;
+    }
+
+    static void validateGeneratedLocalAction(
+        ChatTurnEntity turn,
+        JSONObject checkpoint,
+        JSONObject action
+    ) throws Exception {
+        LocalFallbackActionAuthority.validateAgainstPinnedInput(
+            action.getString("kind"),
+            action.getString("targetKey"),
+            action.getString("targetRevision"),
+            action.getJSONObject("payload"),
+            turn.characterId,
+            checkpoint.getString("authorityLineageKey"),
+            checkpoint.getLong("claimedLineageRevision"),
+            checkpointEnvelope(checkpoint));
+    }
+
+    private List<JSONObject> localFallbackActions(
+        ChatTurnEntity turn,
+        JSONObject checkpoint,
+        ReplyPartEntity source,
+        String visibleGroupId,
+        int firstOrdinal,
+        Set<String> singleCompatibility
+    ) throws Exception {
+        JSONObject legacy = new JSONObject(source.payloadJson);
+        List<JSONObject> actions = new java.util.ArrayList<>();
+        if ("PAYMENT_STATUS".equals(source.type)) {
+            if (!new HashSet<>(Arrays.asList("status")).equals(keysOf(legacy))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            String status = legacy.getString("status");
+            if (!("received".equals(status) || "refused".equals(status))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONObject payment = checkpointEnvelope(checkpoint)
+                .getJSONObject("context").getJSONObject("payment");
+            String messageId = payment.getString("messageId");
+            JSONObject payload = new JSONObject().put("messageId", messageId);
+            actions.add(localCanonicalAction(
+                visibleGroupId, firstOrdinal,
+                "received".equals(status) ? "payment_accept" : "payment_decline",
+                "payment:" + messageId,
+                "sha256:" + BridgeAuthority.sha256CanonicalJson(payment),
+                payload));
+            return actions;
+        }
+        if ("MOMENT_ACTION".equals(source.type)) {
+            String momentId = legacy.getString("momentId");
+            boolean like = legacy.opt("like") instanceof Boolean && legacy.getBoolean("like");
+            String comment = legacy.opt("comment") instanceof String
+                ? legacy.getString("comment") : "";
+            Object rawReply = legacy.opt("replyToCommentId");
+            String replyToCommentId = rawReply instanceof String && !((String) rawReply).isEmpty()
+                ? (String) rawReply : null;
+            String kind;
+            String namespace;
+            String targetId;
+            if (replyToCommentId != null && !comment.trim().isEmpty() && !like) {
+                kind = "moment_reply";
+                namespace = "comment";
+                targetId = replyToCommentId;
+            } else if (!comment.trim().isEmpty() && replyToCommentId == null) {
+                kind = "moment_comment";
+                namespace = "moment";
+                targetId = momentId;
+            } else if (like && comment.isEmpty() && replyToCommentId == null) {
+                kind = "moment_like";
+                namespace = "moment";
+                targetId = momentId;
+            } else {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONObject triggerInput = checkpointEnvelope(checkpoint)
+                .getJSONObject("trigger").getJSONObject("context").getJSONObject("input");
+            JSONObject target = "comment".equals(namespace)
+                ? triggerInput.getJSONObject("targetComment")
+                : triggerInput.getJSONObject("targetMoment");
+            String targetField = "comment".equals(namespace) ? "commentId" : "momentId";
+            if (!targetId.equals(target.getString(targetField))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONObject payload = new JSONObject()
+                .put("momentId", momentId)
+                .put("like", like)
+                .put("comment", comment)
+                .put("replyToCommentId", replyToCommentId == null ? JSONObject.NULL : replyToCommentId);
+            actions.add(localCanonicalAction(
+                visibleGroupId, firstOrdinal, kind, namespace + ":" + targetId,
+                "sha256:" + BridgeAuthority.sha256CanonicalJson(target), payload));
+            return actions;
+        }
+        if ("RELATIONSHIP_STAGE".equals(source.type)) {
+            JSONObject envelope = checkpointEnvelope(checkpoint);
+            JSONObject scene = envelope.optJSONObject("context") == null
+                ? null : envelope.getJSONObject("context").optJSONObject("scene");
+            if (scene == null && envelope.optJSONObject("trigger") != null) {
+                scene = envelope.getJSONObject("trigger").getJSONObject("context")
+                    .optJSONObject("scene");
+            }
+            if (scene == null || !(scene.opt("stagePersonaRevision") instanceof Number)) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            long revision = exactSafeInteger(scene, "stagePersonaRevision", false);
+            if (legacy.optLong("expectedSceneRevision", -1L) != revision
+                || !(legacy.opt("baseAction") instanceof JSONObject || legacy.isNull("baseAction"))
+                || !(legacy.opt("phaseAction") instanceof JSONObject || legacy.isNull("phaseAction"))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONObject relationship = scene.getJSONObject("relationshipStage");
+            JSONObject target = new JSONObject()
+                .put("relationshipStage", relationship)
+                .put("stagePersonaRevision", revision);
+            actions.add(localCanonicalAction(
+                visibleGroupId, firstOrdinal, "relationship_transition",
+                "relationship:" + turn.characterId,
+                "sha256:" + BridgeAuthority.sha256CanonicalJson(target),
+                new JSONObject(legacy.toString())));
+            return actions;
+        }
+        if ("PLAN".equals(source.type)) {
+            JSONArray operations = legacy.getJSONArray("operations");
+            if (operations.length() == 0) throw bridgeAuthorityConflict(turn.turnId);
+            JSONObject envelope = checkpointEnvelope(checkpoint);
+            JSONObject context = envelope.optJSONObject("context");
+            if (context == null && envelope.optJSONObject("trigger") != null) {
+                context = envelope.getJSONObject("trigger").getJSONObject("context");
+            }
+            JSONObject triggerInput = context == null ? null : context.optJSONObject("input");
+            for (int index = 0; index < operations.length(); index += 1) {
+                JSONObject operation = new JSONObject(operations.getJSONObject(index).toString());
+                String op = operation.getString("op");
+                if (!Arrays.asList("create", "update", "cancel", "pause", "resume", "complete")
+                    .contains(op)) {
+                    throw bridgeAuthorityConflict(turn.turnId);
+                }
+                String kind = "role_plan_" + op;
+                String targetKey;
+                String targetRevision;
+                if ("create".equals(op)) {
+                    targetKey = "lineage_create:" + checkpoint.getString("authorityLineageKey")
+                        + ":" + kind;
+                    targetRevision = String.valueOf(checkpoint.getLong("claimedLineageRevision"));
+                } else {
+                    String planId = operation.getString("planId");
+                    JSONObject rolePlan = triggerInput == null ? null : triggerInput.optJSONObject("rolePlan");
+                    if (rolePlan == null || !planId.equals(rolePlan.optString("planId", ""))) {
+                        throw bridgeAuthorityConflict(turn.turnId);
+                    }
+                    targetKey = "role_plan:" + planId;
+                    targetRevision = "sha256:" + BridgeAuthority.sha256CanonicalJson(rolePlan);
+                }
+                actions.add(localCanonicalAction(
+                    visibleGroupId, firstOrdinal + actions.size(), kind,
+                    targetKey, targetRevision, operation));
+            }
+            return actions;
+        }
+        throw bridgeAuthorityConflict(turn.turnId);
+    }
+
+    private static JSONObject localCanonicalAction(
+        String visibleGroupId,
+        int ordinal,
+        String kind,
+        String targetKey,
+        String targetRevision,
+        JSONObject payload
+    ) throws Exception {
+        LocalFallbackActionAuthority.validate(kind, targetKey, targetRevision, payload);
+        JSONObject semantic = new JSONObject()
+            .put("kind", kind)
+            .put("targetKey", targetKey)
+            .put("targetRevision", targetRevision)
+            .put("payload", new JSONObject(payload.toString()));
+        return new JSONObject()
+            .put("actionId", AuthorityIdentity.actionId(visibleGroupId, ordinal))
+            .put("ordinal", ordinal)
+            .put("kind", kind)
+            .put("targetKey", targetKey)
+            .put("targetRevision", targetRevision)
+            .put("payload", new JSONObject(payload.toString()))
+            .put("actionChecksum", BridgeAuthority.sha256CanonicalJson(semantic));
+    }
+
+    private static JSONObject localFallbackReceipt(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        JSONObject checkpoint,
+        FallbackCognitionPacketCodec.FallbackContext fallback,
+        List<ReplyPartEntity> parts,
+        String terminalDisposition,
+        String visibleGroupId,
+        long journalSyncSeq,
+        long now
+    ) throws Exception {
+        JSONObject envelope = checkpointEnvelope(checkpoint);
+        JSONObject authority = envelope.getJSONObject("authority");
+        JSONObject compactSemantic = new JSONObject(fallback.semanticView.toString());
+        String contractChecksum = BridgeAuthority.sha256CanonicalJson(new JSONObject()
+            .put("contract", "cognition-v3-fallback-v1")
+            .put("codecVersion", 1));
+        JSONObject release = new JSONObject()
+            .put("releaseId", "android_fallback:" + contractChecksum)
+            .put("contract", "cognition-v3-fallback-v1")
+            .put("codecVersion", 1)
+            .put("contractChecksum", contractChecksum);
+        release.put("releaseChecksum", BridgeAuthority.sha256CanonicalJson(new JSONObject()
+            .put("origin", "android_fallback")
+            .put("contract", "cognition-v3-fallback-v1")
+            .put("contractChecksum", contractChecksum)
+            .put("codecVersion", 1)));
+
+        JSONArray replyItems = new JSONArray();
+        JSONArray visibleItems = new JSONArray();
+        JSONArray actions = new JSONArray();
+        long visibleSentAt = localFallbackVisibleSentAt(envelope);
+        for (ReplyPartEntity part : parts) {
+            if (!"TEXT".equals(part.type)) {
+                JSONObject canonical = new JSONObject(part.payloadJson)
+                    .getJSONObject("canonicalAction");
+                actions.put(new JSONObject()
+                    .put("actionId", canonical.getString("actionId"))
+                    .put("ordinal", canonical.getLong("ordinal"))
+                    .put("kind", canonical.getString("kind"))
+                    .put("targetKey", canonical.getString("targetKey"))
+                    .put("targetRevision", canonical.getString("targetRevision"))
+                    .put("payload", new JSONObject(canonical.getJSONObject("payload").toString()))
+                    .put("checksum", canonical.getString("actionChecksum")));
+                continue;
+            }
+            JSONObject message = new JSONObject()
+                .put("messageId", part.replyPartId)
+                .put("speakerId", turn.characterId)
+                .put("speakerType", "character")
+                .put("recipientId", "user")
+                .put("content", part.content)
+                .put("sentAt", visibleSentAt)
+                .put("attachments", new JSONArray());
+            replyItems.put(new JSONObject()
+                .put("ordinal", replyItems.length())
+                .put("messageId", part.replyPartId)
+                .put("message", message)
+                .put("checksum", BridgeAuthority.sha256CanonicalJson(message)));
+            visibleItems.put(new JSONObject(message.toString()));
+        }
+        JSONObject input = localFallbackInput(turn, checkpoint, actions);
+        JSONObject semantic = new JSONObject()
+            .put("protocolVersion", 2)
+            .put("contract", "android-fallback-authority-v2")
+            .put("authorityOrigin", "android_fallback")
+            .put("roleId", turn.characterId)
+            .put("laneKey", checkpoint.getString("laneKey"))
+            .put("rootSourceId", authority.getString("rootSourceId"))
+            .put("authorityLineageKey", checkpoint.getString("authorityLineageKey"))
+            .put("authoritativeTurnId", checkpoint.getString("authoritativeTurnId"))
+            .put("lineageRevisionAtCreation", checkpoint.getLong("claimedLineageRevision"))
+            .put("retryOfTurnId", checkpoint.get("retryOfTurnId"))
+            .put("turnRevision", attempt.sequence)
+            .put("deviceId", envelope.getString("deviceId"))
+            .put("turnKind", turn.kind)
+            .put("terminalDisposition", terminalDisposition)
+            .put("input", input)
+            .put("compactSemanticSnapshot", compactSemantic)
+            .put("agencySnapshotChecksum", BridgeAuthority.sha256CanonicalJson(compactSemantic))
+            .put("visibleGroupId", visibleGroupId)
+            .put("replyItems", replyItems)
+            .put("visibleItems", visibleItems)
+            .put("actions", actions)
+            .put("release", release)
+            .put("journalSyncSeq", journalSyncSeq);
+        String commitChecksum = BridgeAuthority.sha256CanonicalJson(semantic);
+        JSONObject manifest = new JSONObject()
+            .put("payloadVersion", "android-fallback-commit-v2")
+            .put("authorityOrigin", "android_fallback")
+            .put("semantic", new JSONObject(semantic.toString()))
+            .put("commitChecksum", commitChecksum);
+        return new JSONObject()
+            .put("receiptVersion", 2)
+            .put("semantic", semantic)
+            .put("manifest", manifest)
+            .put("commitChecksum", commitChecksum);
+    }
+
+    static JSONObject localFallbackInput(
+        ChatTurnEntity turn,
+        JSONObject checkpoint,
+        JSONArray actions
+    ) throws Exception {
+        JSONObject envelope = checkpointEnvelope(checkpoint);
+        JSONObject input;
+        if (TurnKind.DIRECT_REPLY.name().equals(turn.kind)) {
+            JSONObject batch = envelope.getJSONObject("context").getJSONObject("currentBatch");
+            JSONArray messages = batch.getJSONArray("messages");
+            JSONArray ids = batch.getJSONArray("messageIds");
+            if (messages.length() == 0 || messages.length() != ids.length()) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONArray items = new JSONArray();
+            for (int index = 0; index < messages.length(); index += 1) {
+                JSONObject message = new JSONObject(messages.getJSONObject(index).toString());
+                if (!ids.getString(index).equals(message.getString("messageId"))) {
+                    throw bridgeAuthorityConflict(turn.turnId);
+                }
+                items.put(new JSONObject()
+                    .put("sequence", index)
+                    .put("messageId", message.getString("messageId"))
+                    .put("message", message)
+                    .put("checksum", BridgeAuthority.sha256CanonicalJson(message)));
+            }
+            JSONObject batchHeader = new JSONObject()
+                .put("batchId", batch.getString("batchId"))
+                .put("sourceMessageId", turn.sourceMessageId)
+                .put("messageIds", new JSONArray(ids.toString()))
+                .put("startedAt", batch.getLong("startedAt"))
+                .put("committedAt", batch.getLong("committedAt"));
+            JSONObject normalizedBatch = new JSONObject()
+                .put("batchId", batch.getString("batchId"))
+                .put("characterId", turn.characterId)
+                .put("sourceMessageId", turn.sourceMessageId)
+                .put("startedAt", batch.getLong("startedAt"))
+                .put("committedAt", batch.getLong("committedAt"))
+                .put("checksum", BridgeAuthority.sha256CanonicalJson(batchHeader))
+                .put("items", items);
+            input = new JSONObject()
+                .put("kind", "direct")
+                .put("batch", normalizedBatch)
+                .put("visibilitySequence", checkpoint.getLong("inputVisibilitySequence"))
+                .put("clearEpoch", checkpoint.getLong("inputClearEpoch"));
+            if (actions != null && actions.length() > 0) {
+                input.put("pinnedActionContext",
+                    LocalFallbackActionAuthority.receiptActionContext(envelope, actions));
+            }
+        } else {
+            JSONObject trigger = new JSONObject(envelope.getJSONObject("trigger").toString());
+            input = new JSONObject()
+                .put("kind", "automatic")
+                .put("trigger", trigger)
+                .put("visibilitySequence", checkpoint.getLong("inputVisibilitySequence"))
+                .put("clearEpoch", checkpoint.getLong("inputClearEpoch"));
+        }
+        if ("automatic".equals(input.getString("kind"))) {
+            input.put("checksum", BridgeAuthority.sha256CanonicalJson(
+                new JSONObject(input.toString())));
+        } else {
+            input.put("checksum", input.getJSONObject("batch").getString("checksum"));
+        }
+        return input;
+    }
+
+    private static long localFallbackVisibleSentAt(JSONObject envelope) throws Exception {
+        if (envelope.optJSONObject("trigger") != null) {
+            return exactSafeInteger(envelope.getJSONObject("trigger"), "executedAt", true);
+        }
+        return exactSafeInteger(envelope, "createdAt", true);
+    }
+
+    private DeliveryDisposition validateExactLocalFallbackReplay(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        JSONObject checkpoint,
+        List<ReplyPartEntity> supplied,
+        String terminalDisposition
+    ) throws Exception {
+        JSONObject validated = validateLocalCheckpoint(turn, attempt, checkpoint, true);
+        JSONObject outcome = validated.getJSONObject("outcome");
+        if ("redacted".equals(outcome.getString("type"))) {
+            JSONObject metadata = outcome.getJSONObject("result");
+            if (!terminalDisposition.equals(metadata.getString("draftDisposition"))
+                || dao.replyPartCount(turn.turnId) != 0) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            return DeliveryDisposition.REDACTED;
+        }
+        JSONObject receipt = outcome.getJSONObject("result");
+        JSONObject semantic = receipt.getJSONObject("semantic");
+        if (!terminalDisposition.equals(semantic.getString("terminalDisposition"))) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        List<ReplyPartEntity> expected = buildLocalFallbackParts(
+            turn, attempt, supplied, semantic.getString("visibleGroupId"),
+            terminalDisposition, turn.completedAt == null ? turn.updatedAt : turn.completedAt);
+        assertReplyPartsEqual(expected, dao.replyParts(turn.turnId), turn.turnId);
+        ConversationAuthorityEntity authority = dao.conversationAuthority(
+            semantic.getString("authorityLineageKey"));
+        if (authority == null || !"COMMITTED".equals(authority.state)
+            || !semantic.getString("visibleGroupId").equals(authority.visibleGroupId)
+            || !receipt.getString("commitChecksum").equals(authority.commitChecksum)) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        assertLocalFallbackCursorAfterReplay(turn, semantic);
+        return DeliveryDisposition.APPLY;
+    }
+
+    private void applyLocalFallbackCursor(
+        ConversationCursorEntity cursor,
+        String localTurnId,
+        String visibleGroupId,
+        long sequence,
+        boolean applyUi,
+        long now
+    ) {
+        cursor.localSequence = Math.max(cursor.localSequence, sequence);
+        if (sequence > cursor.nativeCompletedSequence) {
+            cursor.nativeCompletedTurnId = localTurnId;
+            cursor.nativeCompletedGroupId = visibleGroupId;
+            cursor.nativeCompletedSequence = sequence;
+        } else if (sequence == cursor.nativeCompletedSequence
+            && (!localTurnId.equals(cursor.nativeCompletedTurnId)
+                || !visibleGroupId.equals(cursor.nativeCompletedGroupId))) {
+            throw bridgeAuthorityConflict(localTurnId);
+        }
+        if (applyUi) {
+            cursor.uiAppliedTurnId = localTurnId;
+            cursor.uiAppliedGroupId = visibleGroupId;
+            cursor.uiAppliedSequence = Math.max(cursor.uiAppliedSequence, sequence);
+        }
+        cursor.updatedAt = now;
+        saveCursor(cursor);
+        terminalFaultHook.after(FAULT_NATIVE_CURSOR);
+        if (applyUi) terminalFaultHook.after(FAULT_UI_CURSOR);
+    }
+
+    private void assertLocalFallbackCursorAfterReplay(
+        ChatTurnEntity turn,
+        JSONObject semantic
+    ) throws Exception {
+        ConversationCursorEntity cursor = dao.conversationCursor(turn.characterId);
+        JSONObject input = semantic.getJSONObject("input");
+        long sequence = TurnKind.DIRECT_REPLY.name().equals(turn.kind)
+            ? turn.inputVisibilitySequence : input.getLong("visibilitySequence");
+        if (cursor == null || cursor.nativeCompletedSequence < sequence) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        if (cursor.nativeCompletedSequence == sequence
+            && (!turn.turnId.equals(cursor.nativeCompletedTurnId)
+                || !semantic.getString("visibleGroupId").equals(cursor.nativeCompletedGroupId))) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+    }
+
+    private void insertLocalFallbackChange(
+        String turnId,
+        String lineageKey,
+        String visibleGroupId,
+        String terminalDisposition,
+        long now
+    ) throws Exception {
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "skip".equals(terminalDisposition) ? "TURN_SKIPPED" : "REPLY_COMMITTED";
+        change.payloadJson = BridgeAuthority.canonicalJson(new JSONObject()
+            .put("turnId", turnId)
+            .put("authorityLineageKey", lineageKey)
+            .put("visibleGroupId", visibleGroupId)
+            .put("authorityOrigin", "android_fallback")
+            .put("terminalDisposition", terminalDisposition));
+        change.createdAt = now;
+        dao.insertChange(change);
+    }
+
+    private void insertLocalFallbackRedactedChange(
+        String turnId,
+        String lineageKey,
+        long now
+    ) throws Exception {
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "TURN_REDACTED";
+        change.payloadJson = BridgeAuthority.canonicalJson(new JSONObject()
+            .put("turnId", turnId)
+            .put("authorityLineageKey", lineageKey)
+            .put("authorityOrigin", "android_fallback")
+            .put("redacted", true));
+        change.createdAt = now;
+        dao.insertChange(change);
     }
 
     private static JSONObject canonicalResultMetadata(BridgeResult result) throws Exception {
@@ -2430,6 +3258,13 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 throw bridgeAuthorityConflict(turn.turnId);
             }
             JSONObject checkpoint = new JSONObject(attempt.bridgeAuthorityCheckpointJson);
+            Object checkpointVersion = checkpoint.opt("version");
+            if (checkpointVersion instanceof Number
+                && !(checkpointVersion instanceof Float)
+                && !(checkpointVersion instanceof Double)
+                && ((Number) checkpointVersion).longValue() == 2L) {
+                return validateLocalCheckpoint(turn, attempt, checkpoint, requireCurrentPins);
+            }
             String checkpointLocalTurnId = requireNativeNonEmptyString(
                 checkpoint, "localTurnId", turn.turnId);
             String checkpointAttemptId = requireNativeNonEmptyString(
@@ -2528,6 +3363,157 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         } catch (RuntimeException error) {
             throw error;
         } catch (Exception error) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+    }
+
+    private JSONObject validateLocalCheckpoint(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        JSONObject checkpoint,
+        boolean requireCurrentPins
+    ) {
+        try {
+            if (!LOCAL_CHECKPOINT_KEYS.equals(keysOf(checkpoint))
+                || exactSafeInteger(checkpoint, "version", false) != 2L
+                || !turn.turnId.equals(requireNativeNonEmptyString(
+                    checkpoint, "localTurnId", turn.turnId))
+                || !attempt.attemptId.equals(requireNativeNonEmptyString(
+                    checkpoint, "attemptId", turn.turnId))
+                || attempt.sequence != exactSafeInteger(checkpoint, "attemptSequence", true)
+                || exactSafeInteger(checkpoint, "journalSyncSeq", false) < 0L
+                || !attempt.bridgeAuthorityCheckpointChecksum.equals(
+                    BridgeAuthority.sha256CanonicalJson(checkpoint))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONObject fallbackExecution = checkpoint.optJSONObject("fallbackExecution");
+            JSONObject snapshot = new JSONObject(turn.snapshotJson);
+            JSONObject persistedExecution = snapshot.optJSONObject("fallbackExecution");
+            if (fallbackExecution == null || persistedExecution == null
+                || !BridgeAuthority.canonicalJson(fallbackExecution).equals(
+                    BridgeAuthority.canonicalJson(persistedExecution))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            new FallbackCognitionPacketCodec().decode(snapshot);
+            JSONObject outcome = checkpoint.optJSONObject("outcome");
+            if (outcome != null && "redacted".equals(outcome.opt("type"))) {
+                validateLocalRedactedCheckpoint(
+                    turn, attempt, checkpoint, outcome, requireCurrentPins);
+                return checkpoint;
+            }
+            if (outcome == null || !OUTCOME_KEYS.equals(keysOf(outcome))
+                || !"committed".equals(outcome.opt("type"))
+                || !"local".equals(outcome.opt("route"))
+                || outcome.opt("relayMessageId") != JSONObject.NULL
+                || outcome.opt("failure") != JSONObject.NULL
+                || outcome.opt("redactedAt") != JSONObject.NULL) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONObject receipt = BridgeReceiptCheckpoint.extractLocalAuthorityReceipt(
+                attempt.bridgeAuthorityCheckpointJson,
+                attempt.bridgeAuthorityCheckpointChecksum);
+            if (receipt == null
+                || exactSafeInteger(receipt, "receiptVersion", true) != 2L
+                || outcome.optJSONObject("result") == null
+                || !BridgeAuthority.canonicalJson(receipt).equals(
+                    BridgeAuthority.canonicalJson(outcome.getJSONObject("result")))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            JSONObject semantic = receipt.getJSONObject("semantic");
+            JSONObject envelope = checkpointEnvelope(checkpoint);
+            if (!turn.characterId.equals(semantic.getString("roleId"))
+                || !turn.kind.equals(semantic.getString("turnKind"))
+                || !"android_fallback".equals(semantic.getString("authorityOrigin"))
+                || !checkpoint.getString("authorityLineageKey").equals(
+                    semantic.getString("authorityLineageKey"))
+                || !checkpoint.getString("authoritativeTurnId").equals(
+                    semantic.getString("authoritativeTurnId"))
+                || !checkpoint.getString("laneKey").equals(semantic.getString("laneKey"))
+                || checkpoint.getLong("claimedLineageRevision")
+                    != semantic.getLong("lineageRevisionAtCreation")
+                || checkpoint.getLong("journalSyncSeq") != semantic.getLong("journalSyncSeq")
+                || !envelope.getString("deviceId").equals(semantic.getString("deviceId"))
+                || !AuthorityIdentity.groupId(checkpoint.getString("authorityLineageKey"))
+                    .equals(semantic.getString("visibleGroupId"))
+                || !TurnState.COMPLETED.name().equals(turn.state)
+                || !"android_fallback".equals(turn.authorityOrigin)
+                || !receipt.getString("commitChecksum").equals(turn.bridgeCommitChecksum)
+                || !semantic.getString("visibleGroupId").equals(turn.visibleGroupId)) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            if (requireCurrentPins && (!checkpoint.getString("authorityLineageKey").equals(
+                    turn.authorityLineageKey)
+                || !checkpoint.getString("laneKey").equals(turn.laneKey)
+                || turn.inputVisibilitySequence == null
+                || turn.inputVisibilitySequence != checkpoint.getLong("inputVisibilitySequence")
+                || turn.inputClearEpoch == null
+                || turn.inputClearEpoch != checkpoint.getLong("inputClearEpoch"))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            return checkpoint;
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+    }
+
+    private void validateLocalRedactedCheckpoint(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        JSONObject checkpoint,
+        JSONObject outcome,
+        boolean requireCurrentPins
+    ) throws Exception {
+        Object redactedAt = outcome.opt("redactedAt");
+        JSONObject result = outcome.optJSONObject("result");
+        if (!OUTCOME_KEYS.equals(keysOf(outcome))
+            || !"local".equals(outcome.opt("route"))
+            || outcome.opt("relayMessageId") != JSONObject.NULL
+            || outcome.opt("failure") != JSONObject.NULL
+            || !(redactedAt instanceof Number)
+            || redactedAt instanceof Float || redactedAt instanceof Double
+            || ((Number) redactedAt).longValue() <= 0L
+            || result == null || !LOCAL_REDACTED_RESULT_KEYS.equals(keysOf(result))
+            || exactSafeInteger(checkpoint, "journalSyncSeq", false) != 0L
+            || !"android-fallback-redacted-v1".equals(result.opt("contract"))
+            || !checkpoint.getString("authorityLineageKey").equals(
+                requireNativeNonEmptyString(result, "authorityLineageKey", turn.turnId))
+            || !checkpoint.getString("authoritativeTurnId").equals(
+                requireNativeNonEmptyString(result, "authoritativeTurnId", turn.turnId))
+            || checkpoint.getLong("inputVisibilitySequence")
+                != exactSafeInteger(result, "inputVisibilitySequence", true)
+            || checkpoint.getLong("inputClearEpoch")
+                != exactSafeInteger(result, "inputClearEpoch", false)
+            || !Arrays.asList("visible", "action_only", "skip").contains(
+                requireNativeNonEmptyString(result, "draftDisposition", turn.turnId))
+            || !TurnState.COMPLETED.name().equals(turn.state)
+            || turn.deletedAt == null
+            || turn.deletedAt != ((Number) redactedAt).longValue()
+            || turn.visibleGroupId != null || turn.bridgeCommitChecksum != null
+            || turn.commitPayloadVersion != null || turn.terminalDisposition != null
+            || dao.replyPartCount(turn.turnId) != 0
+            || !AttemptStage.FINISHED.name().equals(attempt.stage)
+            || !TurnState.COMPLETED.name().equals(attempt.state)) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        ConversationAuthorityEntity authority = dao.conversationAuthority(
+            checkpoint.getString("authorityLineageKey"));
+        if (authority == null || !"CANCELLED".equals(authority.state)
+            || authority.revision != checkpoint.getLong("claimedLineageRevision") + 1L
+            || !checkpoint.getString("authoritativeTurnId").equals(authority.latestTurnId)
+            || authority.visibleGroupId != null || authority.commitChecksum != null
+            || authority.commitPayloadVersion != null || authority.authorityOrigin != null
+            || authority.terminalDisposition != null) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        if (requireCurrentPins && (!checkpoint.getString("authorityLineageKey").equals(
+                turn.authorityLineageKey)
+            || !checkpoint.getString("laneKey").equals(turn.laneKey)
+            || turn.inputVisibilitySequence == null
+            || turn.inputVisibilitySequence != checkpoint.getLong("inputVisibilitySequence")
+            || turn.inputClearEpoch == null
+            || turn.inputClearEpoch != checkpoint.getLong("inputClearEpoch"))) {
             throw bridgeAuthorityConflict(turn.turnId);
         }
     }

@@ -72,14 +72,18 @@ public final class BridgeRouter {
             } else if (failure instanceof BridgePendingException) {
                 pending = (BridgePendingException) failure;
             } else if (failure instanceof BridgeDeadlineException) {
-                fallbackAuthorized = true;
+                if (!canonicalV3) fallbackAuthorized = true;
             } else if (failure instanceof BridgeFinalException) {
                 BridgeFinalException finalFailure = (BridgeFinalException) failure;
-                if (finalFailure.allowFallback()) fallbackAuthorized = true;
+                boolean explicitV3Fallback = "NOT_ACCEPTED_ALLOW_FALLBACK".equals(finalFailure.code())
+                    && finalFailure.allowFallback();
+                if ((!canonicalV3 && finalFailure.allowFallback()) || explicitV3Fallback) {
+                    fallbackAuthorized = true;
+                }
                 else blockedFinal = finalFailure;
             } else {
                 // Legacy route clients predate explicit failure categories.
-                fallbackAuthorized = true;
+                if (!canonicalV3) fallbackAuthorized = true;
             }
         }
         if (accepted != null) {
@@ -87,14 +91,18 @@ public final class BridgeRouter {
             throw accepted;
         }
         if (canonicalV3) {
-            Exception terminal = blockedFinal != null
-                ? blockedFinal
-                : pending != null ? pending : failures.isEmpty() ? null : failures.get(failures.size() - 1);
-            if (terminal == null) {
-                throw new BridgeFinalException("BRIDGE_V3_ROUTE_UNAVAILABLE", false);
+            if (blockedFinal != null || pending != null || !fallbackAuthorized) {
+                Exception terminal = blockedFinal != null
+                    ? blockedFinal
+                    : pending != null ? pending : failures.isEmpty()
+                        ? new BridgeFinalException("BRIDGE_V3_ROUTE_UNAVAILABLE", false)
+                        : failures.get(failures.size() - 1);
+                for (Exception failure : failures) if (failure != terminal) terminal.addSuppressed(failure);
+                throw terminal;
             }
-            for (Exception failure : failures) if (failure != terminal) terminal.addSuppressed(failure);
-            throw terminal;
+            routes.add("fallback");
+            BridgeResult result = fallback.execute(submission).routed(routes, true);
+            return finish(submission, result, true);
         }
         if (blockedFinal != null && !fallbackAuthorized) throw blockedFinal;
         if (pending != null && !fallbackAuthorized) {
@@ -128,7 +136,7 @@ public final class BridgeRouter {
         boolean canonicalV3
     ) throws Exception {
         if (canonicalV3) {
-            if (result.kind == BridgeResult.Kind.LEGACY_V2 || result.fallback) {
+            if (result.kind == BridgeResult.Kind.LEGACY_V2 && !result.fallback) {
                 throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT: v3 route returned legacy result");
             }
             return result;

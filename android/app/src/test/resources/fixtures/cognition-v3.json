@@ -1,0 +1,27 @@
+{
+  "contract": "cognition-v3",
+  "schemaVersion": 3,
+  "roleId": "yuqi",
+  "hardConstraints": [],
+  "preferences": [],
+  "currentStances": [{"id":"stance-1","value":"close"}],
+  "relationship": {"base":"close"},
+  "recentGroups": [{"messageIds":["msg-1"],"messages":[{"role":"user","content":"你好"}]}],
+  "verifiedFacts": [],
+  "lifeSignals": [],
+  "authorSettings": {},
+  "fallbackExecution": {
+    "contract": "cognition-v3-fallback-v1",
+    "deviceId": "device_v3",
+    "cognition": {
+      "configId": "memory-v3",
+      "system": "你负责整理临时认知。",
+      "messages": [{"role":"user","content":"你好"}]
+    },
+    "expression": {
+      "configId": "chat-v3",
+      "system": "你负责生成可见聊天正文。",
+      "messages": [{"role":"user","content":"你好"}]
+    }
+  }
+}

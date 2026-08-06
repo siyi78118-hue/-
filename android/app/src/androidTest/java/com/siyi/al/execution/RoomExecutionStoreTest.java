@@ -22,6 +22,7 @@ import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
+import com.siyi.al.execution.bridge.FallbackJournal;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -29,6 +30,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.UUID;
 import org.json.JSONObject;
 import org.json.JSONArray;
 import org.junit.After;
@@ -165,6 +167,452 @@ public class RoomExecutionStoreTest {
             localTurnId, attempt.attemptId, changedReceipt, 1001L));
         assertEquals(3, store.replyParts(localTurnId).size());
         assertEquals(changes, rowCount("change_events"));
+    }
+
+    @Test
+    public void androidFallbackCommitsOneV2CheckpointReceiptAndDeterministicVisibleGroup()
+        throws Exception {
+        String localTurnId = "local-v3-android-fallback";
+        store.submitTurn(yuqiFallbackSubmission(
+            localTurnId, "msg-android-fallback-3", 180L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 181L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        ReplyPartEntity draft = textPart(
+            localTurnId, attempt.attemptId, "我在。刚刚去倒了杯水");
+        JSONObject openCheckpoint = new JSONObject(
+            prepared.bridgeAuthorityCheckpointJson);
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitAndroidFallback(
+                localTurnId,
+                attempt.attemptId,
+                Collections.singletonList(draft),
+                "visible",
+                182L
+            ));
+
+        ChatTurnEntity committed = store.turn(localTurnId);
+        String expectedGroup = AuthorityIdentity.groupId(
+            openCheckpoint.getString("authorityLineageKey"));
+        assertEquals("android_fallback", committed.authorityOrigin);
+        assertEquals("android-fallback-commit-v2", committed.commitPayloadVersion);
+        assertEquals(expectedGroup, committed.visibleGroupId);
+        assertEquals("visible", committed.terminalDisposition);
+        assertEquals(AuthorityIdentity.messageId(expectedGroup, 0L),
+            store.replyParts(localTurnId).get(0).replyPartId);
+
+        ExecutionAttemptEntity persisted = store.activeAttempt(localTurnId);
+        JSONObject checkpoint = new JSONObject(
+            persisted.bridgeAuthorityCheckpointJson);
+        assertEquals(2, checkpoint.getInt("version"));
+        assertTrue(checkpoint.getLong("journalSyncSeq") > 0L);
+        assertEquals("cognition-v3-fallback-v1",
+            checkpoint.getJSONObject("fallbackExecution").getString("contract"));
+        JSONObject receipt = checkpoint.getJSONObject("outcome")
+            .getJSONObject("result");
+        JSONObject semanticReceipt = receipt.getJSONObject("semantic");
+        assertEquals("android-fallback-authority-v2",
+            semanticReceipt.getString("contract"));
+        assertTrue(semanticReceipt.isNull("retryOfTurnId"));
+        assertEquals(expectedGroup, semanticReceipt.getString("visibleGroupId"));
+        assertEquals(checkpoint.getLong("journalSyncSeq"),
+            semanticReceipt.getLong("journalSyncSeq"));
+        assertEquals(1, semanticReceipt.getJSONArray("visibleItems").length());
+        assertEquals(
+            openCheckpoint.getJSONObject("normalizedEnvelope").getLong("createdAt"),
+            semanticReceipt.getJSONArray("visibleItems").getJSONObject(0).getLong("sentAt"));
+        JSONObject directInput = semanticReceipt.getJSONObject("input");
+        assertEquals("direct", directInput.getString("kind"));
+        assertTrue(directInput.has("batch"));
+        assertEquals(3, directInput.getJSONObject("batch").getJSONArray("items").length());
+        assertEquals(directInput.getJSONObject("batch").getString("checksum"),
+            directInput.getString("checksum"));
+        assertEquals(receipt.getString("commitChecksum"),
+            BridgeAuthority.sha256CanonicalJson(
+                receipt.getJSONObject("manifest").getJSONObject("semantic")));
+        String publicReceipt = BridgeAuthority.canonicalJson(receipt);
+        assertEquals(false, publicReceipt.contains("fallbackExecution"));
+        assertEquals(false, publicReceipt.contains("configId"));
+        assertEquals(false, publicReceipt.contains("system"));
+        assertEquals(false, publicReceipt.contains("private cognition prompt"));
+
+        long journalSyncSeq = checkpoint.getLong("journalSyncSeq");
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitAndroidFallback(
+                localTurnId,
+                attempt.attemptId,
+                Collections.singletonList(draft),
+                "visible",
+                999L
+            ));
+        JSONObject replay = new JSONObject(
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointJson);
+        assertEquals(journalSyncSeq, replay.getLong("journalSyncSeq"));
+        assertEquals(1, store.replyParts(localTurnId).size());
+    }
+
+    @Test
+    public void androidFallbackRetryReceiptRetainsItsVerifiedRemoteParent() throws Exception {
+        String localTurnId = "local-v3-android-fallback-retry";
+        store.submitTurn(yuqiFallbackSubmission(
+            localTurnId, "msg-android-fallback-retry-3", 185L));
+        TurnSubmission parent = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 186L);
+        JSONObject parentCheckpoint = new JSONObject(parent.bridgeAuthorityCheckpointJson);
+        ExecutionAttemptEntity parentAttempt = store.activeAttempt(localTurnId);
+        BridgeResult failure = BridgeTurnStatus.parseV3(
+            canonicalFailure(parentCheckpoint, true, 187L).toString(),
+            "cloud", "relay-android-fallback-parent");
+        store.commitVerifiedRemoteFailure(
+            localTurnId, parentAttempt.attemptId, failure, 188L);
+
+        ExecutionAttemptEntity childAttempt = store.startRetry(localTurnId, 189L);
+        TurnSubmission child = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 190L);
+        JSONObject childCheckpoint = new JSONObject(child.bridgeAuthorityCheckpointJson);
+        ReplyPartEntity draft = textPart(
+            localTurnId, childAttempt.attemptId, "重试后改由本地完成");
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitAndroidFallback(
+                localTurnId, childAttempt.attemptId,
+                Collections.singletonList(draft), "visible", 191L));
+
+        JSONObject semantic = new JSONObject(
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointJson)
+            .getJSONObject("outcome").getJSONObject("result").getJSONObject("semantic");
+        assertEquals(parent.authoritativeTurnId, semantic.getString("retryOfTurnId"));
+        assertEquals(child.authoritativeTurnId, semantic.getString("authoritativeTurnId"));
+        assertEquals(childCheckpoint.getLong("claimedLineageRevision"),
+            semantic.getLong("lineageRevisionAtCreation"));
+    }
+
+    @Test
+    public void automaticAndroidFallbackSkipCommitsAGroupReceiptWithoutPartsOrUiInbox()
+        throws Exception {
+        String localTurnId = "local-v3-android-fallback-skip";
+        store.submitTurn(yuqiAutomaticFallbackSubmission(localTurnId, 190L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 191L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        JSONObject openCheckpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitAndroidFallback(
+                localTurnId, attempt.attemptId, Collections.emptyList(), "skip", 192L));
+
+        ChatTurnEntity committed = store.turn(localTurnId);
+        JSONObject checkpoint = new JSONObject(
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointJson);
+        JSONObject semantic = checkpoint.getJSONObject("outcome")
+            .getJSONObject("result").getJSONObject("semantic");
+        assertEquals(AuthorityIdentity.groupId(openCheckpoint.getString("authorityLineageKey")),
+            committed.visibleGroupId);
+        assertEquals("skip", committed.terminalDisposition);
+        assertEquals(0, store.replyParts(localTurnId).size());
+        assertEquals(0, semantic.getJSONArray("replyItems").length());
+        assertEquals(0, semantic.getJSONArray("actions").length());
+        assertEquals("automatic", semantic.getJSONObject("input").getString("kind"));
+        assertEquals(committed.completedAt, committed.uiAppliedAt);
+        assertEquals(0, store.unappliedCompletedTurns(10).stream()
+            .filter(turn -> localTurnId.equals(turn.turnId)).count());
+    }
+
+    @Test
+    public void automaticAndroidFallbackVisibleCommitsOneDeterministicReceipt() throws Exception {
+        String localTurnId = "local-v3-android-fallback-automatic-visible";
+        store.submitTurn(yuqiAutomaticFallbackSubmission(localTurnId, 195L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 196L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        ReplyPartEntity draft = textPart(
+            localTurnId, attempt.attemptId, "刚把今天的安排收了一下。");
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitAndroidFallback(
+                localTurnId, attempt.attemptId,
+                Collections.singletonList(draft), "visible", 197L));
+
+        ChatTurnEntity committed = store.turn(localTurnId);
+        JSONObject semantic = new JSONObject(
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointJson)
+            .getJSONObject("outcome").getJSONObject("result").getJSONObject("semantic");
+        assertEquals("visible", committed.terminalDisposition);
+        assertEquals(1, semantic.getJSONArray("replyItems").length());
+        assertEquals("automatic", semantic.getJSONObject("input").getString("kind"));
+        assertEquals(
+            semantic.getJSONObject("input").getJSONObject("trigger").getLong("executedAt"),
+            semantic.getJSONArray("visibleItems").getJSONObject(0).getLong("sentAt"));
+        assertEquals(null, committed.uiAppliedAt);
+    }
+
+    @Test
+    public void automaticAndroidFallbackActionOnlyPinsTheMomentTargetAndOneActionReceipt()
+        throws Exception {
+        String localTurnId = "local-v3-android-fallback-action";
+        store.submitTurn(yuqiMomentFallbackSubmission(localTurnId, 200L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 201L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        ReplyPartEntity action = new ReplyPartEntity();
+        action.replyPartId = "draft-action";
+        action.turnId = localTurnId;
+        action.attemptId = attempt.attemptId;
+        action.sequence = 0;
+        action.type = "MOMENT_ACTION";
+        action.content = "";
+        action.payloadJson = new JSONObject()
+            .put("momentId", "moment-fallback-1")
+            .put("like", true)
+            .toString();
+        action.createdAt = 202L;
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitAndroidFallback(
+                localTurnId, attempt.attemptId,
+                Collections.singletonList(action), "action_only", 202L));
+
+        ChatTurnEntity committed = store.turn(localTurnId);
+        JSONObject checkpoint = new JSONObject(
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointJson);
+        JSONObject semantic = checkpoint.getJSONObject("outcome")
+            .getJSONObject("result").getJSONObject("semantic");
+        assertEquals("action_only", committed.terminalDisposition);
+        assertEquals(0, semantic.getJSONArray("replyItems").length());
+        assertEquals(0, semantic.getJSONArray("visibleItems").length());
+        assertEquals(1, semantic.getJSONArray("actions").length());
+        JSONObject receiptAction = semantic.getJSONArray("actions").getJSONObject(0);
+        assertEquals("moment_like", receiptAction.getString("kind"));
+        assertEquals("moment:moment-fallback-1", receiptAction.getString("targetKey"));
+        assertEquals(AuthorityIdentity.actionId(committed.visibleGroupId, 0),
+            receiptAction.getString("actionId"));
+        assertEquals("MOMENT_ACTION", store.replyParts(localTurnId).get(0).type);
+        assertEquals(null, committed.uiAppliedAt);
+    }
+
+    @Test
+    public void oldEpochAndroidFallbackCommitsOnlyARedactedMetadataCheckpoint()
+        throws Exception {
+        String localTurnId = "local-v3-android-fallback-redacted";
+        store.submitTurn(yuqiFallbackSubmission(
+            localTurnId, "msg-android-fallback-redacted-3", 210L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 211L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        JSONObject open = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        ReplyPartEntity draft = textPart(
+            localTurnId, attempt.attemptId, "这条已经晚于清除边界");
+        store.markConversationCleared("yuqi", 0L, 1L, 212L);
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.REDACTED,
+            store.commitAndroidFallback(
+                localTurnId, attempt.attemptId,
+                Collections.singletonList(draft), "visible", 213L));
+
+        ChatTurnEntity redacted = store.turn(localTurnId);
+        JSONObject checkpoint = new JSONObject(
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointJson);
+        JSONObject outcome = checkpoint.getJSONObject("outcome");
+        assertEquals(TurnState.COMPLETED.name(), redacted.state);
+        assertEquals(Long.valueOf(213L), redacted.deletedAt);
+        assertEquals(null, redacted.visibleGroupId);
+        assertEquals(null, redacted.bridgeCommitChecksum);
+        assertEquals(0, store.replyParts(localTurnId).size());
+        assertEquals(2, checkpoint.getInt("version"));
+        assertEquals(0L, checkpoint.getLong("journalSyncSeq"));
+        assertEquals("redacted", outcome.getString("type"));
+        assertEquals("local", outcome.getString("route"));
+        assertEquals(213L, outcome.getLong("redactedAt"));
+        assertEquals("android-fallback-redacted-v1",
+            outcome.getJSONObject("result").getString("contract"));
+        assertEquals(null, BridgeReceiptCheckpoint.extractLocalAuthorityReceipt(
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointJson,
+            store.activeAttempt(localTurnId).bridgeAuthorityCheckpointChecksum));
+        ConversationAuthorityEntity authority = database.executionDao()
+            .conversationAuthority(open.getString("authorityLineageKey"));
+        assertEquals("CANCELLED", authority.state);
+        assertEquals(null, authority.visibleGroupId);
+        assertEquals(null, authority.commitChecksum);
+    }
+
+    @Test
+    public void everyAndroidFallbackWriteBoundaryRollsBackJournalAuthorityPartsAndCursors()
+        throws Exception {
+        String visibleTurnId = "local-v3-android-fallback-visible-fault";
+        store.submitTurn(yuqiFallbackSubmission(
+            visibleTurnId, "msg-android-fallback-visible-fault-3", 214L));
+        TurnSubmission visiblePrepared = store.prepareBridgeSubmission(
+            persistedSubmission(visibleTurnId), "device_gateway", 215L);
+        JSONObject visibleCheckpoint = new JSONObject(visiblePrepared.bridgeAuthorityCheckpointJson);
+        String visibleAttemptId = store.activeAttempt(visibleTurnId).attemptId;
+        ReplyPartEntity visibleDraft = textPart(
+            visibleTurnId, visibleAttemptId, "这条用来验证本地事务回滚");
+        long visibleChanges = rowCount("change_events");
+        long visibleDiagnostics = rowCount("diagnostics");
+        String[] visibleBoundaries = new String[]{
+            RoomExecutionStore.FAULT_LOCAL_JOURNAL,
+            RoomExecutionStore.FAULT_CHECKPOINT,
+            RoomExecutionStore.FAULT_REPLY_PARTS,
+            RoomExecutionStore.FAULT_AUTHORITY,
+            RoomExecutionStore.FAULT_TURN,
+            RoomExecutionStore.FAULT_ATTEMPT,
+            RoomExecutionStore.FAULT_NATIVE_CURSOR,
+            RoomExecutionStore.FAULT_CHANGE
+        };
+        for (String boundary : visibleBoundaries) {
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> faulted.commitAndroidFallback(
+                visibleTurnId, visibleAttemptId, Collections.singletonList(visibleDraft),
+                "visible", 216L));
+            assertOpenCanonicalAttemptAfterRollback(
+                visibleTurnId, visibleAttemptId, visibleCheckpoint,
+                visibleChanges, visibleDiagnostics);
+            assertNull(database.executionDao().syncCursor("__local_journal_sequence__"));
+        }
+
+        String skipTurnId = "local-v3-android-fallback-skip-fault";
+        store.submitTurn(yuqiAutomaticFallbackSubmission(skipTurnId, 217L));
+        TurnSubmission skipPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(skipTurnId), "device_gateway", 218L);
+        JSONObject skipCheckpoint = new JSONObject(skipPrepared.bridgeAuthorityCheckpointJson);
+        String skipAttemptId = store.activeAttempt(skipTurnId).attemptId;
+        long skipChanges = rowCount("change_events");
+        long skipDiagnostics = rowCount("diagnostics");
+        String[] skipBoundaries = new String[]{
+            RoomExecutionStore.FAULT_LOCAL_JOURNAL,
+            RoomExecutionStore.FAULT_CHECKPOINT,
+            RoomExecutionStore.FAULT_AUTHORITY,
+            RoomExecutionStore.FAULT_TURN,
+            RoomExecutionStore.FAULT_ATTEMPT,
+            RoomExecutionStore.FAULT_NATIVE_CURSOR,
+            RoomExecutionStore.FAULT_UI_CURSOR,
+            RoomExecutionStore.FAULT_CHANGE
+        };
+        for (String boundary : skipBoundaries) {
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> faulted.commitAndroidFallback(
+                skipTurnId, skipAttemptId, Collections.emptyList(), "skip", 219L));
+            assertOpenCanonicalAttemptAfterRollback(
+                skipTurnId, skipAttemptId, skipCheckpoint, skipChanges, skipDiagnostics);
+            assertNull(database.executionDao().syncCursor("__local_journal_sequence__"));
+        }
+
+        String redactedTurnId = "local-v3-android-fallback-redacted-fault";
+        store.submitTurn(yuqiFallbackSubmission(
+            redactedTurnId, "msg-android-fallback-redacted-fault-3", 220L));
+        TurnSubmission redactedPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(redactedTurnId), "device_gateway", 221L);
+        JSONObject redactedCheckpoint = new JSONObject(redactedPrepared.bridgeAuthorityCheckpointJson);
+        String redactedAttemptId = store.activeAttempt(redactedTurnId).attemptId;
+        ReplyPartEntity redactedDraft = textPart(
+            redactedTurnId, redactedAttemptId, "这条必须只留下红删元数据");
+        store.markConversationCleared("yuqi", 0L, 1L, 222L);
+        long redactedChanges = rowCount("change_events");
+        long redactedDiagnostics = rowCount("diagnostics");
+        String[] redactedBoundaries = new String[]{
+            RoomExecutionStore.FAULT_CHECKPOINT,
+            RoomExecutionStore.FAULT_AUTHORITY,
+            RoomExecutionStore.FAULT_TURN,
+            RoomExecutionStore.FAULT_ATTEMPT,
+            RoomExecutionStore.FAULT_CHANGE
+        };
+        for (String boundary : redactedBoundaries) {
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> faulted.commitAndroidFallback(
+                redactedTurnId, redactedAttemptId,
+                Collections.singletonList(redactedDraft), "visible", 223L));
+            assertOpenCanonicalAttemptAfterRollback(
+                redactedTurnId, redactedAttemptId, redactedCheckpoint,
+                redactedChanges, redactedDiagnostics);
+            assertNull(database.executionDao().syncCursor("__local_journal_sequence__"));
+        }
+    }
+
+    @Test
+    public void androidFallbackReceiptAndLaterMessageKeepGlobalOrderAcrossRestartAndAck()
+        throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String name = "android-fallback-journal-" + UUID.randomUUID() + ".db";
+        AlExecutionDatabase durable = Room.databaseBuilder(context, AlExecutionDatabase.class, name)
+            .allowMainThreadQueries()
+            .build();
+        try {
+            RoomExecutionStore durableStore = new RoomExecutionStore(durable);
+            String turnId = "local-v3-android-fallback-journal-restart";
+            durableStore.submitTurn(yuqiAutomaticFallbackSubmission(turnId, 224L));
+            durableStore.prepareBridgeSubmission(
+                persistedSubmission(durableStore, turnId), "device_gateway", 225L);
+            ExecutionAttemptEntity attempt = durableStore.activeAttempt(turnId);
+            ReplyPartEntity draft = textPart(turnId, attempt.attemptId, "先记住这条本地结果");
+            assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+                durableStore.commitAndroidFallback(
+                    turnId, attempt.attemptId, Collections.singletonList(draft),
+                    "visible", 226L));
+            JSONObject checkpoint = new JSONObject(
+                durableStore.activeAttempt(turnId).bridgeAuthorityCheckpointJson);
+            long receiptSequence = checkpoint.getLong("journalSyncSeq");
+
+            long laterSequence = durable.executionDao().allocateJournalSyncSeq(227L);
+            RawMessageEntity later = new RawMessageEntity();
+            later.messageId = "msg-after-android-fallback-receipt";
+            later.turnId = turnId;
+            later.characterId = "yuqi";
+            later.speakerId = "user";
+            later.speakerType = "user";
+            later.recipientId = "yuqi";
+            later.content = "后来的普通消息";
+            later.sentAt = 227L;
+            later.origin = "phone";
+            later.deviceId = "phone";
+            later.deviceSeq = laterSequence;
+            later.syncSeq = laterSequence;
+            later.checksum = RoomExecutionStore.canonicalRawMessageChecksum(later);
+            assertNotEquals(-1L, durable.executionDao().insertRawMessage(later));
+
+            JSONObject beforeRestart = new FallbackJournal(
+                durable.executionDao(), "phone").pendingPacket(10);
+            assertEquals(2, beforeRestart.getJSONArray("entries").length());
+            assertEquals(receiptSequence,
+                beforeRestart.getJSONArray("entries").getJSONObject(0).getLong("seq"));
+            assertEquals("authority_receipt",
+                beforeRestart.getJSONArray("entries").getJSONObject(0).getString("entityType"));
+            assertEquals(laterSequence,
+                beforeRestart.getJSONArray("entries").getJSONObject(1).getLong("seq"));
+
+            durable.close();
+            durable = Room.databaseBuilder(context, AlExecutionDatabase.class, name)
+                .allowMainThreadQueries()
+                .build();
+            FallbackJournal restarted = new FallbackJournal(durable.executionDao(), "phone");
+            JSONObject replay = restarted.pendingPacket(10);
+            assertEquals(BridgeAuthority.canonicalJson(beforeRestart),
+                BridgeAuthority.canonicalJson(replay));
+
+            restarted.acknowledge(receiptSequence);
+            JSONObject afterReceiptAck = restarted.pendingPacket(10);
+            assertEquals(1, afterReceiptAck.getJSONArray("entries").length());
+            assertEquals(laterSequence,
+                afterReceiptAck.getJSONArray("entries").getJSONObject(0).getLong("seq"));
+            restarted.acknowledge(laterSequence);
+
+            durable.close();
+            durable = Room.databaseBuilder(context, AlExecutionDatabase.class, name)
+                .allowMainThreadQueries()
+                .build();
+            assertEquals(0, new FallbackJournal(
+                durable.executionDao(), "phone").pendingPacket(10)
+                .getJSONArray("entries").length());
+        } finally {
+            if (durable.isOpen()) durable.close();
+            context.deleteDatabase(name);
+        }
     }
 
     @Test
@@ -2097,12 +2545,16 @@ public class RoomExecutionStoreTest {
     }
 
     private TurnSubmission persistedSubmission(String turnId) {
-        ChatTurnEntity turn = store.turn(turnId);
+        return persistedSubmission(store, turnId);
+    }
+
+    private static TurnSubmission persistedSubmission(RoomExecutionStore targetStore, String turnId) {
+        ChatTurnEntity turn = targetStore.turn(turnId);
         if (TurnState.QUEUED.name().equals(turn.state)) {
-            store.markStage(
+            targetStore.markStage(
                 turnId, turn.activeAttemptId, TurnState.MEMORY_RUNNING,
                 AttemptStage.MEMORY, Math.max(1L, turn.updatedAt + 1L));
-            turn = store.turn(turnId);
+            turn = targetStore.turn(turnId);
         }
         return new TurnSubmission(
             turn.turnId, turn.characterId, turn.sourceMessageId, TurnKind.valueOf(turn.kind),
@@ -2134,6 +2586,107 @@ public class RoomExecutionStoreTest {
         return new TurnSubmission(
             turnId, "yuqi", lastMessageId, TurnKind.DIRECT_REPLY,
             input.toString(), new JSONObject().put("scene", "chat").toString(), null, createdAt
+        );
+    }
+
+    private static TurnSubmission yuqiFallbackSubmission(
+        String turnId,
+        String lastMessageId,
+        long createdAt
+    ) throws Exception {
+        TurnSubmission base = yuqiThreeBubbleSubmission(
+            turnId, lastMessageId, createdAt);
+        JSONObject semantic = new JSONObject()
+            .put("contract", "cognition-v3")
+            .put("schemaVersion", 3)
+            .put("roleId", "yuqi")
+            .put("hardConstraints", new JSONArray())
+            .put("preferences", new JSONArray())
+            .put("currentStances", new JSONArray())
+            .put("relationship", new JSONObject().put("base", "close"))
+            .put("recentGroups", new JSONArray())
+            .put("verifiedFacts", new JSONArray())
+            .put("lifeSignals", new JSONArray())
+            .put("authorSettings", new JSONObject())
+            .put("fallbackExecution", new JSONObject()
+                .put("contract", "cognition-v3-fallback-v1")
+                .put("deviceId", "device_gateway")
+                .put("cognition", new JSONObject()
+                    .put("configId", "memory-v3")
+                    .put("system", "private cognition prompt")
+                    .put("messages", new JSONArray()))
+                .put("expression", new JSONObject()
+                    .put("configId", "chat-v3")
+                    .put("system", "private expression prompt")
+                    .put("messages", new JSONArray())));
+        return new TurnSubmission(
+            base.turnId,
+            base.characterId,
+            base.sourceMessageId,
+            base.kind,
+            base.inputJson,
+            semantic.toString(),
+            base.cloudJobId,
+            base.createdAt
+        );
+    }
+
+    private static TurnSubmission yuqiAutomaticFallbackSubmission(String turnId, long createdAt)
+        throws Exception {
+        JSONObject snapshot = new JSONObject()
+            .put("contract", "cognition-v3")
+            .put("schemaVersion", 3)
+            .put("roleId", "yuqi")
+            .put("hardConstraints", new JSONArray())
+            .put("preferences", new JSONArray())
+            .put("currentStances", new JSONArray())
+            .put("relationship", new JSONObject().put("base", "close"))
+            .put("recentGroups", new JSONArray())
+            .put("verifiedFacts", new JSONArray())
+            .put("lifeSignals", new JSONArray())
+            .put("authorSettings", new JSONObject())
+            .put("fallbackExecution", new JSONObject()
+                .put("contract", "cognition-v3-fallback-v1")
+                .put("deviceId", "device_gateway")
+                .put("cognition", new JSONObject()
+                    .put("configId", "memory-v3")
+                    .put("system", "private cognition prompt")
+                    .put("messages", new JSONArray()))
+                .put("expression", new JSONObject()
+                    .put("configId", "chat-v3")
+                    .put("system", "private expression prompt")
+                    .put("messages", new JSONArray())));
+        return new TurnSubmission(
+            turnId,
+            "yuqi",
+            "source-" + turnId,
+            TurnKind.PROACTIVE_CHAT,
+            new JSONObject().put("scheduledFor", createdAt).toString(),
+            snapshot.toString(),
+            "job-" + turnId,
+            createdAt
+        );
+    }
+
+    private static TurnSubmission yuqiMomentFallbackSubmission(String turnId, long createdAt)
+        throws Exception {
+        TurnSubmission base = yuqiAutomaticFallbackSubmission(turnId, createdAt);
+        JSONObject input = new JSONObject()
+            .put("scheduledFor", createdAt)
+            .put("momentId", "moment-fallback-1")
+            .put("targetMoment", new JSONObject()
+                .put("momentId", "moment-fallback-1")
+                .put("authorId", "yuqi")
+                .put("revision", 3));
+        return new TurnSubmission(
+            base.turnId,
+            base.characterId,
+            "trigger-" + turnId,
+            TurnKind.MOMENT_INTERACTION,
+            input.toString(),
+            base.snapshotJson,
+            "job-" + turnId,
+            createdAt
         );
     }
 

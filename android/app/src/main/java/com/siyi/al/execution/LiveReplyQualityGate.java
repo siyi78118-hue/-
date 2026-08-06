@@ -108,6 +108,17 @@ public final class LiveReplyQualityGate {
         return result.toString();
     }
 
+    /** Fallback drafts may not persist inferred hard constraints as facts. */
+    public static JSONObject sanitizeFallbackStatePatch(JSONObject statePatch) {
+        try {
+            JSONObject safe = statePatch == null ? new JSONObject() : new JSONObject(statePatch.toString());
+            safe.remove("hardConstraints");
+            return safe;
+        } catch (Exception error) {
+            throw new IllegalArgumentException("invalid fallback state patch", error);
+        }
+    }
+
     public static final class Context {
         public final String scene;
         public final long nowMs;

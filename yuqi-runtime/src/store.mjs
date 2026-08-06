@@ -286,6 +286,530 @@ function deriveTerminalDisposition(turnKind, itemCount, actionCount) {
   return 'skip';
 }
 
+const ANDROID_FALLBACK_CONTRACT = 'cognition-v3-fallback-v1';
+const ANDROID_FALLBACK_COMMIT_PAYLOAD_VERSION = 'android-fallback-commit-v2';
+const ANDROID_FALLBACK_RECEIPT_VERSION = 2;
+const ANDROID_FALLBACK_DISPOSITIONS = new Set(['visible', 'action_only', 'skip']);
+
+function externalObject(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`external authority ${label} conflict`);
+  }
+  return value;
+}
+
+function externalText(value, label) {
+  if (typeof value !== 'string' || !value) throw new Error(`external authority ${label} conflict`);
+  return value;
+}
+
+function externalNullableText(value, label) {
+  if (value === null) return null;
+  return externalText(value, label);
+}
+
+function externalChecksum(value, label) {
+  if (typeof value !== 'string' || !/^[a-f0-9]{64}$/.test(value)) {
+    throw new Error(`external authority ${label} checksum conflict`);
+  }
+  return value;
+}
+
+function externalInteger(value, label, { min = 0 } = {}) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min) {
+    throw new Error(`external authority ${label} conflict`);
+  }
+  return value;
+}
+
+const EXTERNAL_DIRECT_INPUT_KEYS = new Set([
+  'kind', 'batch', 'visibilitySequence', 'clearEpoch', 'checksum'
+]);
+const EXTERNAL_DIRECT_INPUT_WITH_ACTION_KEYS = new Set([
+  ...EXTERNAL_DIRECT_INPUT_KEYS, 'pinnedActionContext'
+]);
+const EXTERNAL_AUTOMATIC_INPUT_KEYS = new Set([
+  'kind', 'trigger', 'visibilitySequence', 'clearEpoch', 'checksum'
+]);
+const EXTERNAL_PINNED_ACTION_CONTEXT_KEYS = new Set([
+  'version', 'payment', 'scene', 'input', 'checksum'
+]);
+const EXTERNAL_PINNED_ACTION_INPUT_KEYS = new Set([
+  'targetMoment', 'targetComment', 'rolePlan'
+]);
+const EXTERNAL_PINNED_MOMENT_KEYS = new Set([
+  'momentId', 'authorId', 'ownerId', 'content', 'createdAt', 'revision'
+]);
+const EXTERNAL_PINNED_COMMENT_KEYS = new Set([
+  'commentId', 'momentId', 'authorId', 'ownerId', 'content', 'createdAt',
+  'revision', 'replyToCommentId'
+]);
+const EXTERNAL_PINNED_ROLE_PLAN_KEYS = new Set([
+  'planId', 'characterId', 'roleId', 'type', 'source', 'title', 'intent',
+  'schedule', 'timeConfidence', 'durationMs', 'origin', 'sourceQuote',
+  'evidenceMessageIds', 'status', 'nextRunAt', 'revision', 'updatedAt'
+]);
+
+function hasExactExternalKeys(value, expected) {
+  const keys = Object.keys(value);
+  return keys.length === expected.size && keys.every(key => expected.has(key));
+}
+
+function normalizeExternalPinnedActionContext(value) {
+  const context = externalObject(value, 'pinned action context');
+  if (!hasExactExternalKeys(context, EXTERNAL_PINNED_ACTION_CONTEXT_KEYS)
+    || context.version !== 1) {
+    throw new Error('external authority pinned action context conflict');
+  }
+  const input = externalObject(context.input, 'pinned action input');
+  if (!hasExactExternalKeys(input, EXTERNAL_PINNED_ACTION_INPUT_KEYS)) {
+    throw new Error('external authority pinned action input conflict');
+  }
+  const nullableObject = (entry, label) => {
+    if (entry === null) return null;
+    return structuredClone(externalObject(entry, label));
+  };
+  const payment = nullableObject(context.payment, 'pinned payment');
+  if (payment !== null) {
+    const paymentKeys = new Set(['kind', 'amount', 'note', 'messageId', 'status']);
+    if (!hasExactExternalKeys(payment, paymentKeys)
+      || !['redpacket', 'transfer'].includes(payment.kind)
+      || typeof payment.amount !== 'number' || !Number.isFinite(payment.amount) || payment.amount <= 0
+      || typeof payment.note !== 'string'
+      || typeof payment.messageId !== 'string' || !payment.messageId
+      || payment.status !== 'pending') {
+      throw new Error('external authority pinned payment conflict');
+    }
+  }
+  const scene = nullableObject(context.scene, 'pinned relationship scene');
+  if (scene !== null) {
+    const relationshipStageKeys = new Set([
+      'id', 'label', 'content', 'since', 'reason', 'confidence', 'base', 'phase'
+    ]);
+    const relationshipPartKeys = new Set([
+      'id', 'label', 'content', 'since', 'reason', 'confidence'
+    ]);
+    const assertRelationshipPart = (part, allowed, label) => {
+      if (!part || typeof part !== 'object' || Array.isArray(part)
+        || Object.keys(part).length === 0
+        || Object.keys(part).some(key => !allowed.has(key))) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+      for (const key of ['id', 'label', 'content', 'reason']) {
+        if (!Object.hasOwn(part, key)) continue;
+        if (typeof part[key] !== 'string'
+          || ((key === 'id' || key === 'label') && !part[key])) {
+          throw new Error(`external authority ${label} conflict`);
+        }
+      }
+      if (Object.hasOwn(part, 'since')
+        && (!Number.isSafeInteger(part.since) || part.since < 0)) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+      if (Object.hasOwn(part, 'confidence')
+        && (typeof part.confidence !== 'number' || !Number.isFinite(part.confidence)
+          || part.confidence < 0 || part.confidence > 1)) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+    };
+    if (!hasExactExternalKeys(scene, new Set(['relationshipStage', 'stagePersonaRevision']))
+      || !Number.isSafeInteger(scene.stagePersonaRevision) || scene.stagePersonaRevision < 0) {
+      throw new Error('external authority pinned relationship scene conflict');
+    }
+    assertRelationshipPart(
+      scene.relationshipStage, relationshipStageKeys, 'pinned relationship stage');
+    for (const key of ['base', 'phase']) {
+      if (!Object.hasOwn(scene.relationshipStage, key)) continue;
+      const part = scene.relationshipStage[key];
+      if (typeof part === 'string') {
+        if (!part) throw new Error('external authority pinned relationship stage conflict');
+      } else {
+        assertRelationshipPart(part, relationshipPartKeys, 'pinned relationship stage part');
+      }
+    }
+  }
+  const assertAllowedTarget = (target, allowed, required, label) => {
+    if (target === null) return null;
+    const keys = Object.keys(target);
+    if (keys.some(key => !allowed.has(key)) || required.some(key => !Object.hasOwn(target, key))) {
+      throw new Error(`external authority ${label} conflict`);
+    }
+    const textFields = ['momentId', 'commentId', 'authorId', 'ownerId', 'content',
+      'replyToCommentId', 'planId', 'characterId', 'roleId', 'type', 'source', 'title',
+      'intent', 'timeConfidence', 'origin', 'sourceQuote', 'status'];
+    for (const key of textFields) {
+      if (!Object.hasOwn(target, key) || (key === 'replyToCommentId' && target[key] === null)) continue;
+      if (typeof target[key] !== 'string'
+        || ((key !== 'content' && key !== 'sourceQuote') && !target[key])) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+    }
+    for (const key of ['createdAt', 'revision', 'durationMs', 'nextRunAt', 'updatedAt']) {
+      if (!Object.hasOwn(target, key) || (key === 'nextRunAt' && target[key] === null)) continue;
+      if (!Number.isSafeInteger(target[key]) || target[key] < 0) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+    }
+    if (Object.hasOwn(target, 'evidenceMessageIds')
+      && (!Array.isArray(target.evidenceMessageIds)
+        || target.evidenceMessageIds.length > 12
+        || new Set(target.evidenceMessageIds).size !== target.evidenceMessageIds.length
+        || target.evidenceMessageIds.some(id => typeof id !== 'string' || !id || id.length > 96))) {
+      throw new Error(`external authority ${label} conflict`);
+    }
+    if (Object.hasOwn(target, 'durationMs') && target.durationMs < 1) {
+      throw new Error(`external authority ${label} conflict`);
+    }
+    const enums = {
+      type: new Set(['private_message', 'moment_post', 'role_schedule']),
+      source: new Set(['spoken', 'accepted_request', 'private_decision', 'user_created']),
+      timeConfidence: new Set(['explicit', 'inferred']),
+      origin: new Set(['ai', 'user'])
+    };
+    for (const [key, allowedValues] of Object.entries(enums)) {
+      if (Object.hasOwn(target, key) && !allowedValues.has(target[key])) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+    }
+    if (Object.hasOwn(target, 'schedule')) {
+      const schedule = target.schedule;
+      if (!schedule || typeof schedule !== 'object' || Array.isArray(schedule)
+        || typeof schedule.kind !== 'string') {
+        throw new Error(`external authority ${label} conflict`);
+      }
+      const requiredByKind = {
+        once: ['kind', 'at'], interval: ['kind', 'startsAt', 'intervalMs'],
+        daily: ['kind', 'time'], weekly: ['kind', 'weekdays', 'time'],
+        monthly: ['kind', 'day', 'time']
+      };
+      const requiredKeys = requiredByKind[schedule.kind];
+      if (!requiredKeys) throw new Error(`external authority ${label} conflict`);
+      const scheduleKeys = Object.keys(schedule);
+      const allowedScheduleKeys = new Set([...requiredKeys, 'endsAt']);
+      if (scheduleKeys.some(key => !allowedScheduleKeys.has(key))
+        || requiredKeys.some(key => !Object.hasOwn(schedule, key))) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+      for (const key of ['at', 'startsAt', 'time', 'endsAt']) {
+        if (Object.hasOwn(schedule, key) && (typeof schedule[key] !== 'string' || !schedule[key])) {
+          throw new Error(`external authority ${label} conflict`);
+        }
+      }
+      if (Object.hasOwn(schedule, 'intervalMs')
+        && (!Number.isSafeInteger(schedule.intervalMs) || schedule.intervalMs < 300000)) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+      if (Object.hasOwn(schedule, 'day')
+        && (!Number.isSafeInteger(schedule.day) || schedule.day < 1 || schedule.day > 31)) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+      if (Object.hasOwn(schedule, 'weekdays')
+        && (!Array.isArray(schedule.weekdays) || schedule.weekdays.length < 1
+          || schedule.weekdays.length > 7 || new Set(schedule.weekdays).size !== schedule.weekdays.length
+          || schedule.weekdays.some(day => !Number.isSafeInteger(day) || day < 0 || day > 6))) {
+        throw new Error(`external authority ${label} conflict`);
+      }
+    }
+    return target;
+  };
+  const targetMoment = nullableObject(input.targetMoment, 'pinned target moment');
+  const targetComment = nullableObject(input.targetComment, 'pinned target comment');
+  const rolePlan = nullableObject(input.rolePlan, 'pinned role plan');
+  const normalizedInput = {
+    targetMoment: assertAllowedTarget(
+      targetMoment, EXTERNAL_PINNED_MOMENT_KEYS, ['momentId'], 'pinned target moment'),
+    targetComment: assertAllowedTarget(
+      targetComment, EXTERNAL_PINNED_COMMENT_KEYS, ['commentId'], 'pinned target comment'),
+    rolePlan: assertAllowedTarget(
+      rolePlan, EXTERNAL_PINNED_ROLE_PLAN_KEYS, ['planId'], 'pinned role plan')
+  };
+  const basis = { version: 1, payment, scene, input: normalizedInput };
+  if (externalChecksum(context.checksum, 'pinned action context') !== contentHash(basis)) {
+    throw new Error('external authority pinned action context checksum conflict');
+  }
+  return { ...basis, checksum: context.checksum };
+}
+
+function normalizeExternalVisibleReceipt(receipt) {
+  const source = externalObject(receipt, 'receipt');
+  if (source.receiptVersion !== ANDROID_FALLBACK_RECEIPT_VERSION) {
+    throw new Error('external authority receipt version conflict');
+  }
+  const semantic = externalObject(source.semantic, 'semantic');
+  const manifest = externalObject(source.manifest, 'manifest');
+  if (canonicalJson(manifest.semantic) !== canonicalJson(semantic)) {
+    throw new Error('external authority manifest semantic conflict');
+  }
+  const commitChecksum = externalChecksum(source.commitChecksum, 'commit');
+  if (manifest.payloadVersion !== ANDROID_FALLBACK_COMMIT_PAYLOAD_VERSION
+    || manifest.authorityOrigin !== 'android_fallback'
+    || externalChecksum(manifest.commitChecksum, 'manifest commit') !== commitChecksum
+    || contentHash(semantic) !== commitChecksum) {
+    throw new Error('external authority commit checksum conflict');
+  }
+  if (semantic.protocolVersion !== 2
+    || semantic.contract !== 'android-fallback-authority-v2'
+    || semantic.authorityOrigin !== 'android_fallback') {
+    throw new Error('external authority contract conflict');
+  }
+  const roleId = externalText(semantic.roleId, 'role');
+  const laneKey = externalText(semantic.laneKey, 'lane');
+  const rootSourceId = externalText(semantic.rootSourceId, 'root');
+  const lineageKey = externalText(semantic.authorityLineageKey, 'lineage');
+  if (deriveAuthorityLineageKey({ roleId, laneKey, rootSourceId }) !== lineageKey) {
+    throw new Error('external authority lineage identity conflict');
+  }
+  const turnId = externalText(semantic.authoritativeTurnId, 'turn');
+  if (!Object.hasOwn(semantic, 'retryOfTurnId')) {
+    throw new Error('external authority retryOfTurnId conflict');
+  }
+  const retryOfTurnId = externalNullableText(semantic.retryOfTurnId, 'retryOfTurnId');
+  externalInteger(semantic.lineageRevisionAtCreation, 'lineage revision', { min: 1 });
+  externalInteger(semantic.turnRevision, 'turn revision', { min: 1 });
+  const groupId = externalText(semantic.visibleGroupId, 'group');
+  if (deriveVisibleGroupId(lineageKey) !== groupId) {
+    throw new Error('external authority group identity conflict');
+  }
+  const deviceId = externalText(semantic.deviceId, 'device');
+  const turnKind = externalText(semantic.turnKind, 'kind');
+  if (semantic.terminalDisposition === 'redacted' || semantic.terminalDisposition === 'cancelled') {
+    throw new Error('external authority redacted/cancelled conflict');
+  }
+  if (!CANONICAL_RESULT_TURN_KINDS.has(turnKind)
+    || !ANDROID_FALLBACK_DISPOSITIONS.has(semantic.terminalDisposition)) {
+    throw new Error('external authority terminal disposition conflict');
+  }
+  if (turnKind === 'DIRECT_REPLY' && semantic.terminalDisposition === 'skip') {
+    throw new Error('external authority direct skip conflict');
+  }
+
+  const input = externalObject(semantic.input, 'input');
+  const inputKind = input.kind;
+  if (!['direct', 'automatic'].includes(inputKind)) {
+    throw new Error('external authority input kind conflict');
+  }
+  if (typeof input.visibilitySequence !== 'number' || !Number.isSafeInteger(input.visibilitySequence)
+    || input.visibilitySequence < 0
+    || typeof input.clearEpoch !== 'number' || !Number.isSafeInteger(input.clearEpoch)
+    || input.clearEpoch < 0
+    || !externalChecksum(input.checksum, 'input')) {
+    throw new Error('external authority input cursor conflict');
+  }
+  let inputUserBatchId;
+  let pinnedActionContext = null;
+  if (inputKind === 'direct') {
+    const inputKeys = new Set(Object.keys(input));
+    if (!(hasExactExternalKeys(input, EXTERNAL_DIRECT_INPUT_KEYS)
+      || hasExactExternalKeys(input, EXTERNAL_DIRECT_INPUT_WITH_ACTION_KEYS))) {
+      throw new Error('external authority direct input keys conflict');
+    }
+    if (inputKeys.has('pinnedActionContext')) {
+      pinnedActionContext = normalizeExternalPinnedActionContext(input.pinnedActionContext);
+    }
+    const batch = externalObject(input.batch, 'batch');
+    const batchKeys = ['batchId', 'characterId', 'sourceMessageId', 'startedAt', 'committedAt', 'checksum', 'items'];
+    if (Object.keys(batch).some(key => !batchKeys.includes(key))
+      || !batchKeys.every(key => Object.hasOwn(batch, key))
+      || batch.characterId !== roleId
+      || !Array.isArray(batch.items)
+      || !batch.items.length
+      || typeof batch.startedAt !== 'number' || !Number.isSafeInteger(batch.startedAt)
+      || typeof batch.committedAt !== 'number' || !Number.isSafeInteger(batch.committedAt)
+      || !externalChecksum(batch.checksum, 'batch')) {
+      throw new Error('external authority direct batch conflict');
+    }
+    const items = batch.items.map((entry, ordinal) => {
+      const item = externalObject(entry, 'batch item');
+      if (item.sequence !== ordinal || externalText(item.messageId, 'batch item id') !== item.messageId
+        || !externalChecksum(item.checksum, 'batch item')) {
+        throw new Error('external authority direct batch item conflict');
+      }
+      const message = externalObject(item.message, 'batch message');
+      if (message.messageId !== item.messageId || typeof message.sentAt !== 'number'
+        || !Number.isSafeInteger(message.sentAt) || contentHash(message) !== item.checksum) {
+        throw new Error('external authority direct batch message checksum conflict');
+      }
+      return { sequence: ordinal, messageId: item.messageId, message, checksum: item.checksum };
+    });
+    const batchHeader = {
+      batchId: batch.batchId,
+      characterId: batch.characterId,
+      sourceMessageId: batch.sourceMessageId,
+      startedAt: batch.startedAt,
+      committedAt: batch.committedAt,
+      messageIds: items.map(item => item.messageId)
+    };
+    const canonicalBatchHeader = {
+      batchId: batchHeader.batchId,
+      sourceMessageId: batchHeader.sourceMessageId,
+      messageIds: batchHeader.messageIds,
+      startedAt: batchHeader.startedAt,
+      committedAt: batchHeader.committedAt
+    };
+    if (contentHash(canonicalBatchHeader) !== batch.checksum
+      || contentHash(canonicalBatchHeader) !== input.checksum) {
+      throw new Error('external authority direct batch commitment conflict');
+    }
+    inputUserBatchId = externalText(batch.batchId, 'batch id');
+  } else {
+    if (!hasExactExternalKeys(input, EXTERNAL_AUTOMATIC_INPUT_KEYS)) {
+      throw new Error('external authority automatic input keys conflict');
+    }
+    const trigger = externalObject(input.trigger, 'trigger');
+    if (!externalText(trigger.triggerId, 'trigger id')
+      || !externalText(trigger.triggerType, 'trigger type')
+      || typeof trigger.scheduledFor !== 'number'
+      || !Number.isSafeInteger(trigger.scheduledFor)
+      || typeof trigger.executedAt !== 'number'
+      || !Number.isSafeInteger(trigger.executedAt)
+      || canonicalJson(Object.keys(trigger).sort()) !== canonicalJson([
+        'context', 'executedAt', 'scheduledFor', 'triggerId', 'triggerType'
+      ])) {
+      throw new Error('external authority automatic trigger conflict');
+    }
+    const triggerCore = {
+      kind: 'automatic', trigger: structuredClone(trigger),
+      visibilitySequence: input.visibilitySequence, clearEpoch: input.clearEpoch
+    };
+    if (contentHash(triggerCore) !== input.checksum) {
+      throw new Error('external authority automatic trigger checksum conflict');
+    }
+    inputUserBatchId = trigger.triggerId;
+  }
+
+  const snapshot = externalObject(semantic.compactSemanticSnapshot, 'semantic snapshot');
+  if (externalChecksum(semantic.agencySnapshotChecksum, 'agency snapshot')
+    !== contentHash(snapshot)) {
+    throw new Error('external authority agency snapshot checksum conflict');
+  }
+  const replyItems = Array.isArray(semantic.replyItems) ? semantic.replyItems : [];
+  const actions = Array.isArray(semantic.actions) ? semantic.actions : [];
+  if (semantic.terminalDisposition === 'visible' && replyItems.length < 1) {
+    throw new Error('external authority visible result conflict');
+  }
+  if (semantic.terminalDisposition === 'action_only' && (replyItems.length || !actions.length)) {
+    throw new Error('external authority action-only result conflict');
+  }
+  if (semantic.terminalDisposition === 'skip' && (replyItems.length || actions.length)) {
+    throw new Error('external authority skip result conflict');
+  }
+  const normalizedItems = replyItems.map((entry, ordinal) => {
+    const item = externalObject(entry, 'reply item');
+    if (item.ordinal !== ordinal || item.messageId !== deriveVisibleMessageId(groupId, ordinal)
+      || !externalChecksum(item.checksum, 'reply item')) {
+      throw new Error('external authority reply item identity conflict');
+    }
+    const message = externalObject(item.message, 'reply message');
+    if (message.messageId !== item.messageId || message.speakerId !== roleId
+      || message.speakerType !== 'character' || message.recipientId !== 'user'
+      || contentHash(message) !== item.checksum) {
+      throw new Error('external authority reply message conflict');
+    }
+    return { ordinal, messageId: item.messageId, message, checksum: item.checksum };
+  });
+  if (!Array.isArray(semantic.visibleItems)
+    || canonicalJson(semantic.visibleItems)
+      !== canonicalJson(normalizedItems.map(item => item.message))) {
+    throw new Error('external authority visible item projection conflict');
+  }
+  const normalizedActions = actions.map((entry, ordinal) => {
+    const action = externalObject(entry, 'action');
+    const keys = ['actionId', 'ordinal', 'kind', 'targetKey', 'targetRevision', 'payload', 'checksum'];
+    if (canonicalJson(Object.keys(action).sort()) !== canonicalJson(keys.sort())
+      || action.ordinal !== ordinal
+      || action.actionId !== deriveVisibleActionId(groupId, ordinal)
+      || typeof action.kind !== 'string' || !action.kind
+      || typeof action.targetKey !== 'string' || !action.targetKey
+      || typeof action.targetRevision !== 'string' || !action.targetRevision
+      || !action.payload || typeof action.payload !== 'object' || Array.isArray(action.payload)
+      || !externalChecksum(action.checksum, 'action')) {
+      throw new Error('external authority action identity conflict');
+    }
+    const canonicalAction = {
+      kind: action.kind, targetKey: action.targetKey,
+      targetRevision: action.targetRevision, payload: action.payload
+    };
+    if (contentHash(canonicalAction) !== action.checksum) {
+      throw new Error('external authority action checksum conflict');
+    }
+    assertExternalCanonicalAction({ action, roleId, lineageKey });
+    assertExternalActionPinnedInput({ action, semantic, input });
+    return { ...canonicalAction, actionId: action.actionId, ordinal, checksum: action.checksum };
+  });
+  const singleActionNamespaces = new Set();
+  for (const action of normalizedActions) {
+    const namespace = action.kind.startsWith('payment_') ? 'payment'
+      : action.kind.startsWith('moment_') ? 'moment'
+        : action.kind === 'relationship_transition' ? 'relationship'
+          : action.kind.startsWith('life_episode_') ? 'life' : null;
+    if (namespace && singleActionNamespaces.has(namespace)) {
+      throw new Error('external authority action compatibility conflict');
+    }
+    if (namespace) singleActionNamespaces.add(namespace);
+  }
+  if (inputKind === 'direct') {
+    if ((normalizedActions.length > 0) !== (pinnedActionContext !== null)) {
+      throw new Error('external authority pinned action context presence conflict');
+    }
+    if (pinnedActionContext !== null) {
+      const kinds = new Set(normalizedActions.map(action => action.kind));
+      const used = {
+        payment: kinds.has('payment_accept') || kinds.has('payment_decline'),
+        scene: kinds.has('relationship_transition'),
+        targetMoment: kinds.has('moment_like') || kinds.has('moment_comment'),
+        targetComment: kinds.has('moment_reply'),
+        rolePlan: [...kinds].some(kind => kind.startsWith('role_plan_')
+          && kind !== 'role_plan_create')
+      };
+      if ((pinnedActionContext.payment !== null) !== used.payment
+        || (pinnedActionContext.scene !== null) !== used.scene
+        || (pinnedActionContext.input.targetMoment !== null) !== used.targetMoment
+        || (pinnedActionContext.input.targetComment !== null) !== used.targetComment
+        || (pinnedActionContext.input.rolePlan !== null) !== used.rolePlan) {
+        throw new Error('external authority pinned action context coverage conflict');
+      }
+    }
+  }
+  const release = externalObject(semantic.release, 'release');
+  const contractChecksum = contentHash({ contract: ANDROID_FALLBACK_CONTRACT, codecVersion: 1 });
+  const releaseChecksum = contentHash({
+    origin: 'android_fallback', contract: ANDROID_FALLBACK_CONTRACT,
+    contractChecksum, codecVersion: 1
+  });
+  if (release.contract !== ANDROID_FALLBACK_CONTRACT
+    || release.codecVersion !== 1
+    || release.contractChecksum !== contractChecksum
+    || release.releaseId !== `android_fallback:${contractChecksum}`
+    || release.releaseChecksum !== releaseChecksum) {
+    throw new Error('external authority release conflict');
+  }
+  if (typeof semantic.journalSyncSeq !== 'number'
+    || !Number.isSafeInteger(semantic.journalSyncSeq) || semantic.journalSyncSeq <= 0) {
+    throw new Error('external authority journal sequence conflict');
+  }
+  return {
+    semantic,
+    commitChecksum,
+    roleId,
+    laneKey,
+    rootSourceId,
+    lineageKey,
+    turnId,
+    retryOfTurnId,
+    groupId,
+    deviceId,
+    turnKind,
+    input,
+    inputKind,
+    inputUserBatchId,
+    snapshot,
+    replyItems: normalizedItems,
+    actions: normalizedActions,
+    release,
+    journalSyncSeq: Number(semantic.journalSyncSeq)
+  };
+}
+
 function mapTurn(row) {
   if (!row) return null;
   return {
@@ -865,6 +1389,328 @@ function assertCanonicalRelationshipActionPayload(payload) {
     || [payload.baseAction, payload.phaseAction]
       .some(part => part !== null && part.changedAt !== payload.changedAt)) {
     throw new Error('canonical relationship action payload type conflict');
+  }
+}
+
+const EXTERNAL_CANONICAL_ACTION_KINDS = new Set([
+  'payment_accept', 'payment_decline',
+  'moment_like', 'moment_comment', 'moment_reply',
+  'role_plan_create', 'role_plan_update', 'role_plan_cancel', 'role_plan_pause',
+  'role_plan_resume', 'role_plan_complete',
+  'relationship_transition'
+]);
+
+function assertOneOfExactCanonicalKeys(value, keySets, label) {
+  const actual = Object.keys(value).sort().join(',');
+  if (!keySets.some(keys => [...keys].sort().join(',') === actual)) {
+    throw new Error(`${label} fields conflict`);
+  }
+}
+
+function assertCanonicalPaymentActionPayload(kind, payload, targetKey) {
+  assertExactCanonicalKeys(payload, ['messageId'], 'canonical payment action payload');
+  if (typeof payload.messageId !== 'string' || !payload.messageId
+    || targetKey !== `payment:${payload.messageId}`
+    || !['payment_accept', 'payment_decline'].includes(kind)) {
+    throw new Error('canonical payment action target conflict');
+  }
+}
+
+function assertCanonicalShaTargetRevision(targetRevision, label) {
+  if (typeof targetRevision !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(targetRevision)) {
+    throw new Error(`canonical ${label} target revision conflict`);
+  }
+}
+
+function assertCanonicalPositiveDecimalTargetRevision(targetRevision, label) {
+  if (typeof targetRevision !== 'string' || !/^[1-9][0-9]{0,15}$/.test(targetRevision)
+    || !Number.isSafeInteger(Number(targetRevision)) || Number(targetRevision) < 1) {
+    throw new Error(`canonical ${label} target revision conflict`);
+  }
+}
+
+function assertCanonicalRolePlanSchedule(schedule) {
+  externalObject(schedule, 'role plan schedule');
+  if (schedule.kind === 'once') {
+    assertOneOfExactCanonicalKeys(schedule, [['kind', 'at'], ['kind', 'at', 'endsAt']], 'canonical role plan schedule');
+    if (typeof schedule.at !== 'string' || !schedule.at
+      || (Object.hasOwn(schedule, 'endsAt')
+        && (typeof schedule.endsAt !== 'string' || !schedule.endsAt))) {
+      throw new Error('canonical role plan schedule type conflict');
+    }
+    return;
+  }
+  if (schedule.kind === 'interval') {
+    assertOneOfExactCanonicalKeys(
+      schedule,
+      [['kind', 'startsAt', 'intervalMs'], ['kind', 'startsAt', 'intervalMs', 'endsAt']],
+      'canonical role plan schedule'
+    );
+    if (typeof schedule.startsAt !== 'string' || !schedule.startsAt
+      || typeof schedule.intervalMs !== 'number' || !Number.isFinite(schedule.intervalMs)
+      || !Number.isSafeInteger(schedule.intervalMs) || schedule.intervalMs < 300_000
+      || (Object.hasOwn(schedule, 'endsAt')
+        && (typeof schedule.endsAt !== 'string' || !schedule.endsAt))) {
+      throw new Error('canonical role plan schedule type conflict');
+    }
+    return;
+  }
+  if (schedule.kind === 'daily') {
+    assertOneOfExactCanonicalKeys(schedule, [['kind', 'time'], ['kind', 'time', 'endsAt']], 'canonical role plan schedule');
+    if (typeof schedule.time !== 'string' || !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(schedule.time)
+      || (Object.hasOwn(schedule, 'endsAt')
+        && (typeof schedule.endsAt !== 'string' || !schedule.endsAt))) {
+      throw new Error('canonical role plan schedule type conflict');
+    }
+    return;
+  }
+  if (schedule.kind === 'weekly') {
+    assertOneOfExactCanonicalKeys(
+      schedule,
+      [['kind', 'weekdays', 'time'], ['kind', 'weekdays', 'time', 'endsAt']],
+      'canonical role plan schedule'
+    );
+    if (!Array.isArray(schedule.weekdays) || schedule.weekdays.length < 1 || schedule.weekdays.length > 7
+      || new Set(schedule.weekdays).size !== schedule.weekdays.length
+      || schedule.weekdays.some(day => !Number.isSafeInteger(day) || day < 0 || day > 6)
+      || typeof schedule.time !== 'string' || !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(schedule.time)
+      || (Object.hasOwn(schedule, 'endsAt')
+        && (typeof schedule.endsAt !== 'string' || !schedule.endsAt))) {
+      throw new Error('canonical role plan schedule type conflict');
+    }
+    return;
+  }
+  if (schedule.kind === 'monthly') {
+    assertOneOfExactCanonicalKeys(
+      schedule,
+      [['kind', 'day', 'time'], ['kind', 'day', 'time', 'endsAt']],
+      'canonical role plan schedule'
+    );
+    if (!Number.isSafeInteger(schedule.day) || schedule.day < 1 || schedule.day > 31
+      || typeof schedule.time !== 'string' || !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(schedule.time)
+      || (Object.hasOwn(schedule, 'endsAt')
+        && (typeof schedule.endsAt !== 'string' || !schedule.endsAt))) {
+      throw new Error('canonical role plan schedule type conflict');
+    }
+    return;
+  }
+  throw new Error('canonical role plan schedule kind conflict');
+}
+
+function assertCanonicalRolePlanEvidence(value) {
+  if (!Array.isArray(value) || value.length > 12
+    || value.some(id => typeof id !== 'string' || !id || id.length > 96)) {
+    throw new Error('canonical role plan evidence conflict');
+  }
+}
+
+function assertCanonicalRolePlanText(value, label, maxLength, { nullable = false } = {}) {
+  if (nullable && value === null) return;
+  if (typeof value !== 'string' || value.length > maxLength || (!nullable && !value)) {
+    throw new Error(`canonical role plan ${label} conflict`);
+  }
+}
+
+function assertCanonicalRolePlanSemanticFields(value, { create = false } = {}) {
+  if (Object.hasOwn(value, 'type')
+    && !['private_message', 'moment_post', 'role_schedule'].includes(value.type)) {
+    throw new Error('canonical role plan type conflict');
+  }
+  if (Object.hasOwn(value, 'source')
+    && !['spoken', 'accepted_request', 'private_decision', 'user_created'].includes(value.source)) {
+    throw new Error('canonical role plan source conflict');
+  }
+  if (Object.hasOwn(value, 'timeConfidence')
+    && !['explicit', 'inferred'].includes(value.timeConfidence)) {
+    throw new Error('canonical role plan time confidence conflict');
+  }
+  if (Object.hasOwn(value, 'origin') && !['ai', 'user'].includes(value.origin)) {
+    throw new Error('canonical role plan origin conflict');
+  }
+  if (Object.hasOwn(value, 'planId')) assertCanonicalRolePlanText(value.planId, 'plan id', 96);
+  if (Object.hasOwn(value, 'title')) assertCanonicalRolePlanText(value.title, 'title', 80);
+  if (Object.hasOwn(value, 'intent')) assertCanonicalRolePlanText(value.intent, 'intent', 600);
+  if (Object.hasOwn(value, 'sourceQuote')) assertCanonicalRolePlanText(value.sourceQuote, 'source quote', 240);
+  if (Object.hasOwn(value, 'durationMs')) {
+    externalInteger(value.durationMs, 'role plan duration', { min: 1 });
+  }
+  if (Object.hasOwn(value, 'evidenceMessageIds')) assertCanonicalRolePlanEvidence(value.evidenceMessageIds);
+  if (Object.hasOwn(value, 'schedule')) assertCanonicalRolePlanSchedule(value.schedule);
+  if (create && (!Object.hasOwn(value, 'type') || !Object.hasOwn(value, 'source')
+    || !Object.hasOwn(value, 'title') || !Object.hasOwn(value, 'intent')
+    || !Object.hasOwn(value, 'schedule') || !Object.hasOwn(value, 'timeConfidence'))) {
+    throw new Error('canonical role plan create fields conflict');
+  }
+}
+
+function assertAllowedAndRequiredCanonicalKeys(value, allowedKeys, requiredKeys, label) {
+  const actual = new Set(Object.keys(value));
+  if ([...actual].some(key => !allowedKeys.has(key))
+    || [...requiredKeys].some(key => !actual.has(key))) {
+    throw new Error(`${label} fields conflict`);
+  }
+}
+
+function assertCanonicalRolePlanActionPayload(kind, payload, targetKey, targetRevision, lineageKey) {
+  const op = kind.slice('role_plan_'.length);
+  if (!['create', 'update', 'cancel', 'pause', 'resume', 'complete'].includes(op)
+    || payload.op !== op) {
+    throw new Error('canonical role plan action kind conflict');
+  }
+  if (op === 'create') {
+    assertAllowedAndRequiredCanonicalKeys(
+      payload,
+      new Set(['op', 'planId', 'type', 'source', 'title', 'intent', 'schedule',
+        'timeConfidence', 'durationMs', 'origin', 'sourceQuote', 'evidenceMessageIds']),
+      new Set(['op', 'type', 'source', 'title', 'intent', 'schedule', 'timeConfidence']),
+      'canonical role plan create action payload'
+    );
+    assertCanonicalRolePlanSemanticFields(payload, { create: true });
+    if (targetKey !== `lineage_create:${lineageKey}:role_plan_create`) {
+      throw new Error('canonical role plan create target conflict');
+    }
+    assertCanonicalPositiveDecimalTargetRevision(targetRevision, 'role plan create');
+    return;
+  }
+
+  const allowed = op === 'update'
+    ? new Set(['op', 'planId', 'patch', 'reason'])
+    : new Set(['op', 'planId', 'reason']);
+  const required = op === 'update'
+    ? new Set(['op', 'planId', 'patch'])
+    : new Set(['op', 'planId']);
+  assertAllowedAndRequiredCanonicalKeys(payload, allowed, required, 'canonical role plan action payload');
+  if (typeof payload.planId !== 'string' || !payload.planId
+    || targetKey !== `role_plan:${payload.planId}`
+    || !/^sha256:[a-f0-9]{64}$/.test(targetRevision)) {
+    throw new Error('canonical role plan target conflict');
+  }
+  if (Object.hasOwn(payload, 'patch')) {
+    externalObject(payload.patch, 'role plan patch');
+    const allowedPatch = new Set([
+      'type', 'source', 'title', 'intent', 'schedule', 'timeConfidence',
+      'durationMs', 'origin', 'sourceQuote', 'evidenceMessageIds'
+    ]);
+    const patchKeys = Object.keys(payload.patch);
+    if (!patchKeys.length || patchKeys.some(key => !allowedPatch.has(key))) {
+      throw new Error('canonical role plan nested target conflict');
+    }
+    assertCanonicalRolePlanSemanticFields(payload.patch);
+  }
+  if (Object.hasOwn(payload, 'reason')) {
+    assertCanonicalRolePlanText(payload.reason, 'reason', 240);
+  }
+}
+
+function assertExternalCanonicalAction({ action, roleId, lineageKey }) {
+  const { kind, targetKey, targetRevision, payload } = action;
+  if (!EXTERNAL_CANONICAL_ACTION_KINDS.has(kind)) {
+    throw new Error('external authority action kind conflict');
+  }
+  if (kind === 'payment_accept' || kind === 'payment_decline') {
+    assertCanonicalShaTargetRevision(targetRevision, 'payment action');
+    assertCanonicalPaymentActionPayload(kind, payload, targetKey);
+    return;
+  }
+  if (['moment_like', 'moment_comment', 'moment_reply'].includes(kind)) {
+    assertCanonicalShaTargetRevision(targetRevision, 'moment action');
+    assertCanonicalMomentActionPayload(kind, payload);
+    const expected = kind === 'moment_reply'
+      ? `comment:${payload.replyToCommentId}`
+      : `moment:${payload.momentId}`;
+    if (targetKey !== expected) throw new Error('canonical moment action target conflict');
+    return;
+  }
+  if (kind === 'relationship_transition') {
+    assertCanonicalShaTargetRevision(targetRevision, 'relationship action');
+    assertCanonicalRelationshipActionPayload(payload);
+    if (targetKey !== `relationship:${roleId}`) {
+      throw new Error('canonical relationship action target conflict');
+    }
+    return;
+  }
+  if (kind.startsWith('role_plan_')) {
+    assertCanonicalRolePlanActionPayload(kind, payload, targetKey, action.targetRevision, lineageKey);
+    return;
+  }
+  // Life actions are still projected by the existing canonical projector. Keep
+  // their kind closed here, while their domain-specific payload remains owned
+  // by that projector until its Android fallback contract is versioned.
+}
+
+function externalActionContext(input) {
+  const pinned = input?.pinnedActionContext;
+  if (pinned && typeof pinned === 'object' && !Array.isArray(pinned)) {
+    return {
+      payment: pinned.payment,
+      scene: pinned.scene,
+      input: pinned.input
+    };
+  }
+  const triggerContext = input?.trigger?.context;
+  return triggerContext && typeof triggerContext === 'object' && !Array.isArray(triggerContext)
+    ? triggerContext
+    : null;
+}
+
+function assertExternalActionPinnedInput({ action, semantic, input }) {
+  const { kind, targetRevision, payload } = action;
+  const context = externalActionContext(input);
+  if (kind === 'role_plan_create') {
+    if (targetRevision !== String(semantic.lineageRevisionAtCreation)) {
+      throw new Error('external authority role plan create target revision conflict');
+    }
+    return;
+  }
+  if (!context) throw new Error('external authority action input context conflict');
+  if (kind === 'payment_accept' || kind === 'payment_decline') {
+    const payment = context.payment;
+    if (!payment || typeof payment !== 'object' || Array.isArray(payment)
+      || payload.messageId !== payment.messageId
+      || targetRevision !== `sha256:${contentHash(payment)}`) {
+      throw new Error('external authority payment target revision conflict');
+    }
+    return;
+  }
+  if (kind === 'moment_like' || kind === 'moment_comment' || kind === 'moment_reply') {
+    const actionInput = context.input;
+    const target = actionInput?.[
+      kind === 'moment_reply' ? 'targetComment' : 'targetMoment'
+    ];
+    const targetId = kind === 'moment_reply' ? payload.replyToCommentId : payload.momentId;
+    const targetField = kind === 'moment_reply' ? 'commentId' : 'momentId';
+    const namespace = kind === 'moment_reply' ? 'comment' : 'moment';
+    if (!target || typeof target !== 'object' || Array.isArray(target)
+      || target[targetField] !== targetId
+      || action.targetKey !== `${namespace}:${targetId}`
+      || targetRevision !== `sha256:${contentHash(target)}`) {
+      throw new Error('external authority moment target revision conflict');
+    }
+    return;
+  }
+  if (kind === 'relationship_transition') {
+    const scene = context.scene;
+    const revision = scene?.stagePersonaRevision;
+    const relationshipStage = scene?.relationshipStage;
+    const target = {
+      relationshipStage: structuredClone(relationshipStage),
+      stagePersonaRevision: revision
+    };
+    if (!scene || !relationshipStage || typeof relationshipStage !== 'object'
+      || Array.isArray(relationshipStage) || !Number.isSafeInteger(revision)
+      || payload.expectedSceneRevision !== revision
+      || targetRevision !== `sha256:${contentHash(target)}`) {
+      throw new Error('external authority relationship target revision conflict');
+    }
+    return;
+  }
+  if (kind.startsWith('role_plan_')) {
+    const rolePlan = context.input?.rolePlan;
+    if (!rolePlan || typeof rolePlan !== 'object' || Array.isArray(rolePlan)
+      || payload.planId !== rolePlan.planId
+      || targetRevision !== `sha256:${contentHash(rolePlan)}`) {
+      throw new Error('external authority role plan target revision conflict');
+    }
   }
 }
 
@@ -3141,8 +3987,19 @@ export class YuqiStore {
         targetRevision: action.targetRevision,
         payload: action.action
       }));
+      const manifestActions = (semantic.actions || []).map(action =>
+        group.authority_origin === 'android_fallback' && action && typeof action === 'object'
+          && Object.hasOwn(action, 'actionId')
+          ? {
+              kind: action.kind,
+              targetKey: action.targetKey,
+              targetRevision: action.targetRevision,
+              payload: action.payload
+            }
+          : action
+      );
       if (canonicalJson(items) !== canonicalJson(semantic.visibleItems || [])
-        || canonicalJson(actions) !== canonicalJson(semantic.actions || [])) {
+        || canonicalJson(actions) !== canonicalJson(manifestActions)) {
         throw new Error(`v12 invariant manifest projection mismatch: ${group.group_id}`);
       }
       actionRows.forEach((action, ordinal) => {
@@ -4066,7 +4923,17 @@ export class YuqiStore {
       actionRows.length
     );
     actionRows.forEach((action, ordinal) => {
-      const expected = semantic.actions[ordinal];
+      const rawExpected = semantic.actions[ordinal];
+      const expected = authority.authority_origin === 'android_fallback'
+        && rawExpected && typeof rawExpected === 'object'
+        && Object.hasOwn(rawExpected, 'actionId')
+        ? {
+            kind: rawExpected.kind,
+            targetKey: rawExpected.targetKey,
+            targetRevision: rawExpected.targetRevision,
+            payload: rawExpected.payload
+          }
+        : rawExpected;
       const descriptor = {
         kind: action.action_kind,
         targetKey: action.target_key,
@@ -6717,6 +7584,554 @@ export class YuqiStore {
     return mapCloudDelivery(this.db.prepare(`
       SELECT * FROM cloud_deliveries WHERE authority_group_id = ? AND peer_id = ?
     `).get(String(groupId), String(peerId)));
+  }
+
+  importExternalVisibleReceiptInternal(receipt) {
+    const recordConflictDiagnostic = error => {
+      const semantic = receipt?.semantic;
+      const lineageKey = typeof semantic?.authorityLineageKey === 'string'
+        ? semantic.authorityLineageKey : null;
+      if (!lineageKey || !this.getTurnAuthorityLineage(lineageKey)) return;
+      const turnId = typeof semantic?.authoritativeTurnId === 'string'
+        ? semantic.authoritativeTurnId : lineageKey;
+      this.transaction(() => {
+        const existing = this.db.prepare(`
+          SELECT 1 FROM diagnostics
+          WHERE turn_id = ? AND stage = 'external_authority_conflict'
+          LIMIT 1
+        `).get(turnId);
+        if (existing) return;
+        this.putDiagnostic({
+          turnId,
+          stage: 'external_authority_conflict',
+          level: 'error',
+          detail: {
+            authorityLineageKey: lineageKey,
+            visibleGroupId: typeof semantic?.visibleGroupId === 'string'
+              ? semantic.visibleGroupId : null,
+            commitChecksum: typeof receipt?.commitChecksum === 'string'
+              ? receipt.commitChecksum : null,
+            reason: error?.message || 'external authority conflict'
+          }
+        });
+      });
+    };
+    let normalized;
+    try {
+      normalized = normalizeExternalVisibleReceipt(receipt);
+    } catch (error) {
+      recordConflictDiagnostic(error);
+      throw error;
+    }
+    const existingLineage = this.getTurnAuthorityLineage(normalized.lineageKey);
+    let retryParent = null;
+    if (existingLineage) {
+      const existingReceipt = this.getVisibleCommitReceipt(normalized.lineageKey);
+      if (existingReceipt?.commitChecksum === normalized.commitChecksum
+        && existingReceipt.visibleGroupId === normalized.groupId
+        && existingReceipt.authoritativeTurnId === normalized.turnId
+        && existingReceipt.authorityOrigin === 'android_fallback') {
+        const existingTurn = this.getTurn(normalized.turnId);
+        if (!existingTurn || existingTurn.retryOfTurnId !== normalized.retryOfTurnId) {
+          const error = new Error('external authority retry parent conflict');
+          recordConflictDiagnostic(error);
+          throw error;
+        }
+        return {
+          authorityOrigin: 'android_fallback',
+          authorityLineageKey: normalized.lineageKey,
+          authoritativeTurnId: normalized.turnId,
+          visibleGroupId: normalized.groupId,
+          commitChecksum: normalized.commitChecksum,
+          exactReplay: true
+        };
+      }
+      if (normalized.retryOfTurnId === null) {
+        recordConflictDiagnostic(new Error('cross-device authority conflict'));
+        throw new Error('cross-device authority conflict');
+      }
+      retryParent = this.getTurn(normalized.retryOfTurnId);
+      const parentFailure = parseJson(retryParent?.errorJson, null);
+      if (!retryParent
+        || retryParent.authorityLineageKey !== normalized.lineageKey
+        || retryParent.state !== 'failed'
+        || existingLineage.state !== 'open'
+        || existingLineage.latestTurnId !== retryParent.turnId
+        || existingLineage.committedGroupId != null
+        || existingLineage.redactedAt != null
+        || Number(existingLineage.revision) !== Number(retryParent.lineageRevisionAtCreation)
+        || Number(normalized.semantic.lineageRevisionAtCreation)
+          !== Number(retryParent.lineageRevisionAtCreation) + 1
+        || !parentFailure
+        || parentFailure.failureClass !== 'transient'
+        || typeof parentFailure.retryAllowed !== 'boolean'
+        || parentFailure.retryAllowed !== true) {
+        const error = new Error('external authority retry parent conflict');
+        recordConflictDiagnostic(error);
+        throw error;
+      }
+    } else if (normalized.retryOfTurnId !== null) {
+      throw new Error('external authority retry parent missing');
+    }
+    if (this.getTurn(normalized.turnId)
+      || this.db.prepare('SELECT 1 FROM visible_result_groups WHERE group_id = ?').get(normalized.groupId)) {
+      throw new Error('external authority identity conflict');
+    }
+
+    const timestamp = normalized.inputKind === 'direct'
+      ? Number(normalized.input.batch.committedAt)
+      : Number(normalized.input.trigger.executedAt);
+    const fault = step => {
+      if (this.importExternalVisibleReceiptFaultStep === step) {
+        throw new Error(`forced external import fault: ${step}`);
+      }
+    };
+    const reuseOrRejectMessage = ({
+      message,
+      turnId,
+      characterId,
+      origin,
+      deviceId,
+      deviceSeq,
+      checksum,
+      authorityGroupId = null,
+      groupOrdinal = null
+    }) => {
+      const existing = this.db.prepare(
+        'SELECT * FROM messages WHERE message_id = ?'
+      ).get(String(message.messageId));
+      if (!existing) return false;
+      const existingOwner = this.getTurn(existing.turn_id);
+      const sameAuthorityRoot = retryParent
+        && existingOwner?.authorityLineageKey === normalized.lineageKey
+        && existingOwner.retryOfTurnId == null;
+      const sameCore = existing.character_id === String(characterId)
+        && existing.speaker_id === String(message.speakerId)
+        && existing.speaker_type === String(message.speakerType)
+        && existing.recipient_id === String(message.recipientId)
+        && existing.content === String(message.content)
+        && Number(existing.sent_at) === Number(message.sentAt)
+        && (existing.authority_group_id ?? null) === (authorityGroupId ?? null)
+        && (existing.group_ordinal ?? null) === (groupOrdinal ?? null);
+      const same = sameCore && (
+        (existing.turn_id === String(turnId)
+          && existing.origin === String(origin)
+          && (existing.device_id ?? null) === (deviceId ?? null)
+          && (existing.device_seq ?? null) === (deviceSeq ?? null)
+          && existing.checksum === String(checksum))
+        || (sameAuthorityRoot
+          && existing.origin === 'phone'
+          && (existing.device_id ?? null) === (existingOwner.deviceId ?? null)
+          && (existing.device_seq ?? null) === (existingOwner.deviceSeq ?? null)
+          && existing.checksum === contentHash({
+            messageId: message.messageId,
+            turnId: existingOwner.turnId,
+            characterId: existingOwner.characterId,
+            speakerId: message.speakerId,
+            speakerType: message.speakerType,
+            recipientId: message.recipientId,
+            content: message.content,
+            sentAt: message.sentAt,
+            origin: 'phone',
+            deviceId: existingOwner.deviceId,
+            deviceSeq: existingOwner.deviceSeq
+          }))
+      );
+      if (!same) throw new Error('external authority message conflict');
+      const batchItem = this.db.prepare(`
+        SELECT message_json FROM current_user_batch_items WHERE message_id = ?
+      `).get(String(message.messageId));
+      if (batchItem && canonicalJson(parseJson(batchItem.message_json, null))
+        !== canonicalJson(message)) {
+        throw new Error('external authority message conflict');
+      }
+      return true;
+    };
+    return this.transaction(() => {
+      const release = normalized.release;
+      const existingRelease = this.getPipelineRelease(release.releaseId);
+      const releaseRow = {
+        releaseId: release.releaseId,
+        pipelineVersion: 'android-fallback-v2',
+        presetVersion: release.contractChecksum,
+        cognitionSchemaVersion: 1,
+        expressionSchemaVersion: 1,
+        evaluatorVersion: 'android-fallback-authority-v1',
+        modelProfile: {
+          origin: 'android_fallback',
+          contract: release.contract,
+          contractChecksum: release.contractChecksum
+        },
+        componentManifest: {
+          origin: 'android_fallback',
+          contract: release.contract,
+          contractChecksum: release.contractChecksum,
+          codecVersion: 1
+        },
+        releaseChecksum: release.releaseChecksum,
+        createdAt: 0,
+        retiredAt: null
+      };
+      if (existingRelease) {
+        if (canonicalJson(existingRelease) !== canonicalJson({
+          ...releaseRow,
+          createdAt: existingRelease.createdAt
+        })) throw new Error('external authority release identity conflict');
+      } else {
+        this.db.prepare(`
+          INSERT INTO pipeline_releases(
+            release_id, pipeline_version, preset_version, cognition_schema_version,
+            expression_schema_version, evaluator_version, model_profile_json,
+            component_manifest_json, release_checksum, created_at, retired_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          releaseRow.releaseId, releaseRow.pipelineVersion, releaseRow.presetVersion,
+          releaseRow.cognitionSchemaVersion, releaseRow.expressionSchemaVersion,
+          releaseRow.evaluatorVersion, canonicalJson(releaseRow.modelProfile),
+          canonicalJson(releaseRow.componentManifest), releaseRow.releaseChecksum,
+          releaseRow.createdAt, releaseRow.retiredAt
+        );
+      }
+      fault('after_release');
+
+      const lane = this.getInteractionLane(normalized.roleId, normalized.laneKey);
+      const laneRevisionBefore = Number(lane?.revision || 0);
+      const laneRevisionAfter = laneRevisionBefore + 1;
+      if (!lane) {
+        this.db.prepare(`
+          INSERT INTO interaction_lanes(
+            role_id, lane_key, revision, generating_turn_id, latest_user_batch_id,
+            latest_authoritative_group_id, native_completed_group_id,
+            native_completed_sequence, ui_applied_group_id, ui_applied_sequence,
+            local_sequence, last_commit_checksum, updated_at, clear_epoch,
+            cleared_through_sequence
+          ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          normalized.roleId, normalized.laneKey, laneRevisionAfter,
+          normalized.inputUserBatchId, normalized.groupId, normalized.groupId,
+          normalized.input.visibilitySequence, normalized.groupId,
+          normalized.input.visibilitySequence, normalized.input.visibilitySequence,
+          normalized.commitChecksum, timestamp, normalized.input.clearEpoch,
+          normalized.input.visibilitySequence
+        );
+      } else {
+        const updated = this.db.prepare(`
+          UPDATE interaction_lanes
+          SET revision = ?, generating_turn_id = NULL, latest_user_batch_id = ?,
+              latest_authoritative_group_id = ?, native_completed_group_id = ?,
+              native_completed_sequence = ?, ui_applied_group_id = ?,
+              ui_applied_sequence = ?, local_sequence = MAX(local_sequence, ?),
+              last_commit_checksum = ?, updated_at = ?, clear_epoch = MAX(clear_epoch, ?),
+              cleared_through_sequence = MAX(cleared_through_sequence, ?)
+          WHERE role_id = ? AND lane_key = ? AND revision = ?
+        `).run(
+          laneRevisionAfter, normalized.inputUserBatchId, normalized.groupId,
+          normalized.groupId, normalized.input.visibilitySequence, normalized.groupId,
+          normalized.input.visibilitySequence, normalized.input.visibilitySequence,
+          normalized.commitChecksum, timestamp, normalized.input.clearEpoch,
+          normalized.input.visibilitySequence, normalized.roleId, normalized.laneKey,
+          laneRevisionBefore
+        );
+        if (Number(updated.changes) !== 1) throw new Error('external authority lane conflict');
+      }
+      fault('after_lane');
+
+      const batchMessage = normalized.inputKind === 'direct'
+        ? normalized.input.batch.items.at(-1).message
+        : null;
+      const envelope = {
+        protocolVersion: 3,
+        turnId: normalized.turnId,
+        characterId: normalized.roleId,
+        deviceId: normalized.deviceId,
+        deviceSeq: normalized.journalSyncSeq,
+        createdAt: timestamp,
+        kind: normalized.turnKind,
+        ...(batchMessage ? { message: batchMessage } : {
+          trigger: structuredClone(normalized.input.trigger)
+        }),
+        context: {
+          ...(normalized.inputKind === 'direct' ? {
+            currentBatch: {
+              ...normalized.input.batch,
+              messageIds: normalized.input.batch.items.map(item => item.messageId),
+              messages: normalized.input.batch.items.map(item => item.message)
+            }
+          } : {}),
+          visibilityCursor: {
+            nativeCompletedTurnId: normalized.turnId,
+            nativeCompletedGroupId: normalized.groupId,
+            nativeCompletedSequence: normalized.input.visibilitySequence,
+            uiAppliedTurnId: normalized.turnId,
+            uiAppliedGroupId: normalized.groupId,
+            uiAppliedSequence: normalized.input.visibilitySequence,
+            localSequence: normalized.input.visibilitySequence,
+            clearedThroughSequence: normalized.input.visibilitySequence,
+            clearEpoch: normalized.input.clearEpoch,
+            chatOpen: false,
+            quotedMessageId: null
+          }
+        },
+        authority: {
+          algorithm: 'al-authority-v1',
+          roleId: normalized.roleId,
+          laneKey: normalized.laneKey,
+          rootSourceId: normalized.rootSourceId,
+          lineageKey: normalized.lineageKey,
+          claimedLineageRevision: normalized.semantic.lineageRevisionAtCreation,
+          retryOfTurnId: normalized.retryOfTurnId
+        }
+      };
+      const envelopeChecksum = contentHash(envelope);
+      this.db.prepare(`
+        INSERT INTO turns(
+          turn_id, character_id, device_id, device_seq, source_message_id,
+          state, origin, envelope_json, envelope_checksum, created_at, updated_at,
+          pipeline_mode, preset_version, annotation_snapshot_json, reply_json,
+          rollout_key, comparison_mode, rollout_revision, rollout_evidence_epoch,
+          pipeline_checksum, shadow_epoch, canary_epoch, canary_slot,
+          authoritative_release_id, comparison_release_id,
+          authoritative_pipeline_checksum, comparison_pipeline_checksum,
+          lane_key, lane_revision, input_visibility_sequence, generation_fingerprint,
+          result_authority_version, authority_lineage_key,
+          lineage_revision_at_creation, turn_revision, retry_of_turn_id,
+          input_user_batch_id, agency_snapshot_checksum, input_clear_epoch
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        normalized.turnId, normalized.roleId, normalized.deviceId, normalized.journalSyncSeq,
+        normalized.rootSourceId, 'committed', 'android_fallback', canonicalJson(envelope),
+        envelopeChecksum, timestamp, timestamp, 'external', release.contractChecksum, '{}',
+        canonicalJson({ messages: normalized.replyItems.map(item => item.message) }),
+        normalized.turnKind, 'none', retryParent?.rolloutRevision ?? 1,
+        retryParent?.rolloutEvidenceEpoch ?? 0, release.releaseChecksum,
+        null, null, null, release.releaseId, null, release.releaseChecksum,
+        null, normalized.laneKey, laneRevisionAfter,
+        normalized.input.visibilitySequence, normalized.commitChecksum, 1,
+        normalized.lineageKey, normalized.semantic.lineageRevisionAtCreation,
+        normalized.semantic.turnRevision, normalized.retryOfTurnId,
+        normalized.inputUserBatchId, normalized.semantic.agencySnapshotChecksum,
+        normalized.input.clearEpoch
+      );
+      fault('after_turn');
+
+      if (normalized.inputKind === 'direct') {
+        const batch = normalized.input.batch;
+        const batchRows = batch.items.map(item => ({
+          sequence: item.sequence, message_id: item.messageId, checksum: item.checksum
+        }));
+        const batchCommitment = currentUserBatchTombstoneCommitment({
+          turnId: normalized.turnId, batchId: batch.batchId, itemRows: batchRows
+        });
+        this.db.prepare(`
+          INSERT INTO current_user_batches(
+            turn_id, batch_id, character_id, source_message_id, started_at, committed_at,
+            checksum, created_at, item_count, tombstone_commitment
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          normalized.turnId, batch.batchId, batch.characterId, batch.sourceMessageId,
+          batch.startedAt, batch.committedAt, batch.checksum, timestamp,
+          batchCommitment.itemCount, batchCommitment.commitment
+        );
+        const batchInsert = this.db.prepare(`
+          INSERT INTO current_user_batch_items(
+            turn_id, batch_id, message_id, sequence, message_json, checksum
+          ) VALUES (?, ?, ?, ?, ?, ?)
+        `);
+        for (const item of batch.items) {
+          const message = item.message;
+          const normalizedMessage = {
+            messageId: message.messageId, turnId: normalized.turnId,
+            characterId: normalized.roleId,
+            speakerId: message.speakerId, speakerType: message.speakerType,
+            recipientId: message.recipientId, content: message.content,
+            sentAt: message.sentAt, origin: 'phone', deviceId: normalized.deviceId,
+            deviceSeq: item.sequence === 0 ? normalized.journalSyncSeq : null
+          };
+          const reused = reuseOrRejectMessage({
+            message,
+            turnId: normalizedMessage.turnId,
+            characterId: normalizedMessage.characterId,
+            origin: normalizedMessage.origin,
+            deviceId: normalizedMessage.deviceId,
+            deviceSeq: normalizedMessage.deviceSeq,
+            checksum: contentHash(normalizedMessage)
+          });
+          batchInsert.run(
+            normalized.turnId, batch.batchId, item.messageId, item.sequence,
+            canonicalJson(item.message), item.checksum
+          );
+          if (!reused) this.db.prepare(`
+            INSERT INTO messages(
+              message_id, turn_id, character_id, speaker_id, speaker_type,
+              recipient_id, content, sent_at, origin, device_id, device_seq, checksum, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            normalizedMessage.messageId, normalizedMessage.turnId, normalized.roleId,
+            normalizedMessage.speakerId, normalizedMessage.speakerType,
+            normalizedMessage.recipientId, normalizedMessage.content, normalizedMessage.sentAt,
+            normalizedMessage.origin, normalizedMessage.deviceId, normalizedMessage.deviceSeq,
+            contentHash(normalizedMessage), timestamp
+          );
+        }
+      }
+      fault('after_input');
+
+      const itemRows = normalized.replyItems.map(item => ({
+        ordinal: item.ordinal, message_id: item.messageId, item_checksum: item.checksum
+      }));
+      const actionRows = normalized.actions.map(action => ({
+        ordinal: action.ordinal, action_id: action.actionId, action_checksum: action.checksum
+      }));
+      const tombstone = visibleResultTombstoneCommitment({
+        groupId: normalized.groupId, itemRows, actionRows
+      });
+      const replyChecksum = contentHash({
+        items: normalized.replyItems.map(item => item.message),
+        actions: normalized.actions.map(action => ({
+          kind: action.kind, targetKey: action.targetKey,
+          targetRevision: action.targetRevision, payload: action.payload
+        }))
+      });
+      const childLineageRevision = Number(normalized.semantic.lineageRevisionAtCreation);
+      const lineageRevisionBefore = childLineageRevision;
+      const lineageRevisionAfter = childLineageRevision + 1;
+      if (retryParent) {
+        const updatedLineage = this.db.prepare(`
+          UPDATE turn_authority_lineages
+          SET latest_turn_id = ?, revision = ?, state = 'committed',
+              committed_group_id = ?, updated_at = ?
+          WHERE lineage_key = ? AND state = 'open' AND latest_turn_id = ?
+            AND revision = ? AND committed_group_id IS NULL
+        `).run(
+          normalized.turnId,
+          lineageRevisionAfter,
+          normalized.groupId,
+          timestamp,
+          normalized.lineageKey,
+          retryParent.turnId,
+          Number(retryParent.lineageRevisionAtCreation)
+        );
+        if (Number(updatedLineage.changes) !== 1) {
+          throw new Error('external authority retry parent conflict');
+        }
+        this.db.prepare(`
+          UPDATE cloud_deliveries
+          SET state = 'superseded', updated_at = ?
+          WHERE turn_id = ? AND peer_id = ? AND authority_group_id IS NULL
+            AND state IN ('waiting', 'pending')
+        `).run(timestamp, retryParent.turnId, retryParent.deviceId);
+      } else {
+        this.db.prepare(`
+          INSERT INTO turn_authority_lineages(
+            lineage_key, role_id, lane_key, root_source_id, latest_turn_id,
+            revision, state, committed_group_id, created_at, updated_at,
+            attempt_count, attempt_commitment
+          ) VALUES (?, ?, ?, ?, ?, ?, 'committed', ?, ?, ?, 0, '')
+        `).run(
+          normalized.lineageKey, normalized.roleId, normalized.laneKey, normalized.rootSourceId,
+          normalized.turnId, childLineageRevision + 1,
+          normalized.groupId, timestamp, timestamp
+        );
+      }
+      fault('after_lineage');
+      this.db.prepare(`
+        INSERT INTO visible_result_groups(
+          group_id, lineage_key, authoritative_turn_id, role_id, lane_key, authority_origin,
+          authoritative_release_id, generation_fingerprint, reply_checksum, created_at,
+          item_count, action_count, tombstone_commitment
+        ) VALUES (?, ?, ?, ?, ?, 'android_fallback', ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        normalized.groupId, normalized.lineageKey, normalized.turnId, normalized.roleId,
+        normalized.laneKey, normalized.release.releaseId, normalized.commitChecksum,
+        replyChecksum, timestamp, tombstone.itemCount, tombstone.actionCount,
+        tombstone.commitment
+      );
+      const itemInsert = this.db.prepare(`
+        INSERT INTO visible_result_items(group_id, ordinal, message_id, item_json, item_checksum)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const item of normalized.replyItems) {
+        const message = item.message;
+        const messageChecksum = contentHash({
+          messageId: message.messageId,
+          content: String(message.content || ''),
+          recipientId: String(message.recipientId || 'user')
+        });
+        const reused = reuseOrRejectMessage({
+          message,
+          turnId: normalized.turnId,
+          characterId: normalized.roleId,
+          origin: 'codex',
+          deviceId: null,
+          deviceSeq: null,
+          checksum: messageChecksum,
+          authorityGroupId: normalized.groupId,
+          groupOrdinal: item.ordinal
+        });
+        itemInsert.run(normalized.groupId, item.ordinal, item.messageId,
+          canonicalJson(item.message), item.checksum);
+        if (!reused) this.db.prepare(`
+          INSERT INTO messages(
+            message_id, turn_id, character_id, speaker_id, speaker_type, recipient_id,
+            content, sent_at, origin, device_id, device_seq, checksum, created_at,
+            authority_group_id, group_ordinal
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'codex', NULL, NULL, ?, ?, ?, ?)
+        `).run(
+          message.messageId, normalized.turnId, normalized.roleId, message.speakerId,
+          message.speakerType, message.recipientId, message.content, message.sentAt,
+          messageChecksum, timestamp, normalized.groupId, item.ordinal
+        );
+      }
+      const actionInsert = this.db.prepare(`
+        INSERT INTO visible_result_actions(
+          group_id, ordinal, action_id, action_kind, target_key, target_revision,
+          action_json, action_checksum
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const action of normalized.actions) {
+        actionInsert.run(
+          normalized.groupId, action.ordinal, action.actionId, action.kind,
+          action.targetKey, action.targetRevision, canonicalJson(action.payload), action.checksum
+        );
+      }
+      fault('after_group');
+      this.db.prepare(`
+        INSERT INTO visible_result_manifests(
+          group_id, authority_origin, payload_version, semantic_json,
+          semantic_checksum, redacted_at, created_at
+        ) VALUES (?, 'android_fallback', ?, ?, ?, NULL, ?)
+      `).run(
+        normalized.groupId, ANDROID_FALLBACK_COMMIT_PAYLOAD_VERSION,
+        canonicalJson(normalized.semantic), normalized.commitChecksum, timestamp
+      );
+      this.db.prepare(`
+        INSERT INTO visible_commit_receipts(
+          lineage_key, group_id, authoritative_turn_id, authority_origin,
+          commit_payload_version, turn_revision_before, turn_revision_after,
+          lineage_revision_before, lineage_revision_after, lane_revision_before,
+          lane_revision_after, cognitive_state_revision_before,
+          cognitive_state_revision_after, commit_checksum, committed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        normalized.lineageKey, normalized.groupId, normalized.turnId,
+        'android_fallback', ANDROID_FALLBACK_COMMIT_PAYLOAD_VERSION,
+        retryParent ? Number(retryParent.turnRevision) : 0,
+        normalized.semantic.turnRevision, lineageRevisionBefore, lineageRevisionAfter,
+        null, null, null, null,
+        normalized.commitChecksum, timestamp
+      );
+      fault('after_receipt');
+      this.refreshLineageAttemptCommitmentInternal(normalized.lineageKey);
+      return {
+        authorityOrigin: 'android_fallback',
+        authorityLineageKey: normalized.lineageKey,
+        authoritativeTurnId: normalized.turnId,
+        visibleGroupId: normalized.groupId,
+        commitChecksum: normalized.commitChecksum,
+        exactReplay: false
+      };
+    });
   }
 
   commitVisibleResultInternal(input) {

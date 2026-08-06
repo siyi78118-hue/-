@@ -56,6 +56,12 @@ public interface AlExecutionDao {
     void upsertSyncCursor(SyncCursorEntity cursor);
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertSyncCursorIfAbsent(SyncCursorEntity cursor);
+
+    @Query("UPDATE yuqi_sync_cursors SET ackSeq = CASE WHEN ackSeq < :ackSeq THEN :ackSeq ELSE ackSeq END, updatedAt = CASE WHEN ackSeq < :ackSeq THEN :updatedAt ELSE updatedAt END WHERE peerId = :peerId")
+    int advanceSyncCursorMonotonic(String peerId, long ackSeq, long updatedAt);
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertYuqiAnnotation(YuqiAnnotationEntity annotation);
 
     @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId ORDER BY sentAt DESC LIMIT :limit")
@@ -78,6 +84,26 @@ public interface AlExecutionDao {
 
     @Query("SELECT COALESCE(MAX(syncSeq), 0) FROM yuqi_annotations")
     long maxAnnotationSyncSeq();
+
+    @Transaction
+    default long allocateJournalSyncSeq(long now) {
+        final String allocatorId = "__local_journal_sequence__";
+        SyncCursorEntity allocator = syncCursor(allocatorId);
+        long current = Math.max(maxRawSyncSeq(), maxAnnotationSyncSeq());
+        if (allocator == null) {
+            allocator = new SyncCursorEntity();
+            allocator.peerId = allocatorId;
+        } else {
+            current = Math.max(current, allocator.ackSeq);
+        }
+        if (current >= 9007199254740991L) {
+            throw new IllegalStateException("local journal sequence exhausted");
+        }
+        allocator.ackSeq = Math.max(1L, current + 1L);
+        allocator.updatedAt = Math.max(1L, now);
+        upsertSyncCursor(allocator);
+        return allocator.ackSeq;
+    }
 
     @Query("SELECT * FROM yuqi_annotations WHERE syncSeq > :afterSeq ORDER BY syncSeq ASC, annotationId ASC LIMIT :limit")
     List<YuqiAnnotationEntity> annotationsAfterSync(long afterSeq, int limit);
@@ -242,6 +268,10 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM execution_attempts WHERE attemptId = :attemptId LIMIT 1")
     ExecutionAttemptEntity attempt(String attemptId);
 
+    @Query("SELECT * FROM execution_attempts WHERE bridgeAuthorityCheckpointJson IS NOT NULL "
+        + "AND bridgeAuthorityCheckpointChecksum IS NOT NULL ORDER BY startedAt ASC, attemptId ASC")
+    List<ExecutionAttemptEntity> authorityReceiptAttempts();
+
     @Query("SELECT * FROM execution_attempts WHERE turnId = :turnId ORDER BY sequence DESC")
     List<ExecutionAttemptEntity> attempts(String turnId);
 
@@ -387,6 +417,16 @@ public interface AlExecutionDao {
 
     @Query("UPDATE execution_attempts SET stage = 'FINISHED', state = 'COMPLETED', heartbeatAt = :now, finishedAt = :now, errorCode = NULL, errorDetail = NULL, retryable = 0 WHERE attemptId = :attemptId AND turnId = :turnId AND state IN ('MEMORY_RUNNING','BRIDGE_WAITING','FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED')")
     int finalizeCanonicalBridgeAttempt(String attemptId, String turnId, long now);
+
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', updatedAt = :now, completedAt = :now, "
+        + "deletedAt = :now, notificationShownAt = NULL, uiAppliedAt = NULL, cloudConfirmedAt = NULL, "
+        + "visibleGroupId = NULL, authorityOrigin = NULL, commitPayloadVersion = NULL, "
+        + "turnRevision = NULL, laneRevision = NULL, generationFingerprint = NULL, "
+        + "pipelineReleaseId = NULL, bridgeCommitChecksum = NULL, terminalDisposition = NULL "
+        + "WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 "
+        + "AND state IN ('MEMORY_RUNNING','BRIDGE_WAITING','FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED') "
+        + "AND visibleGroupId IS NULL AND bridgeCommitChecksum IS NULL")
+    int finalizeLocalFallbackRedactedTurn(String turnId, String attemptId, long now);
 
     @Query("UPDATE chat_turns SET state = :state, updatedAt = :now, completedAt = NULL, notificationShownAt = NULL, uiAppliedAt = NULL, cloudConfirmedAt = NULL WHERE turnId = :turnId AND activeAttemptId = :attemptId AND bridgeProtocolVersion = 3 AND state IN ('MEMORY_RUNNING','BRIDGE_WAITING','FAILED_RETRYABLE','FAILED_FINAL','INTERRUPTED')")
     int finalizeCanonicalBridgeFailureTurn(
