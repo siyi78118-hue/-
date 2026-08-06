@@ -6783,95 +6783,114 @@ git commit -m "feat: handshake Web visibility with cognition v3"
 ### Task 16: Integrate Direct Reply, Payment, Media, Quotes, and Multi-Bubble Semantics
 
 **Files:**
-- Modify: `yuqi-runtime/src/interaction-contract.mjs`
-- Modify: `yuqi-runtime/src/cognitive-state.mjs`
-- Modify: `yuqi-runtime/src/image-attachments.mjs`
-- Modify: `yuqi-runtime/src/orchestrator.mjs`
-- Modify: `yuqi-runtime/test/interaction-contract.test.mjs`
-- Modify: `yuqi-runtime/test/cognitive-state.test.mjs`
-- Modify: `yuqi-runtime/test/image-attachments.test.mjs`
-- Create: `yuqi-runtime/test/direct-reply-v3-features.test.mjs`
-- Modify: `tests/payment-batch-bridge-contract.test.mjs`
+- Modify: `yuqi-runtime/src/protocol.mjs` — v3-only rich `currentBatch.messages` projection and closed native-type validation; v1/v2 normalization remains byte-compatible.
+- Modify: `yuqi-runtime/src/current-user-batch.mjs` — preserve the validated rich message projection and emit `transcript: null` when a voice message has no transcript.
+- Modify: `yuqi-runtime/src/cognition-v3-contract.mjs` — carry the already-authorized payment intent into the canonical draft without allowing expression text to mutate it.
+- Modify: `yuqi-runtime/src/interaction-contract.mjs` — keep response risks as turn-local advisories and derive forbidden moves only from active hard constraints/action authority.
+- Modify: `yuqi-runtime/src/cognitive-state.mjs` — keep response risks out of durable state while preserving existing explicit-boundary/recovery behavior.
+- Modify: `yuqi-runtime/src/image-attachments.mjs` — deterministic `turnId + attachmentChecksum` materialization receipt and path reuse across duplicate calls/restarts.
+- Modify: `yuqi-runtime/src/orchestrator.mjs` — connect rich v3 batch input, canonical payment action, deterministic image receipt, and visible group/checksum without changing legacy commit paths.
+- Modify: `yuqi-runtime/test/protocol-store.test.mjs` — v3 rich-message validation plus v1/v2 byte-compatibility fixtures.
+- Modify: `yuqi-runtime/test/current-user-batch.test.mjs` — closed rich-message projection and unknown voice behavior.
+- Modify: `yuqi-runtime/test/cognition-v3-contract.test.mjs` — payment intent authority and expression non-mutation.
+- Modify: `yuqi-runtime/test/interaction-contract.test.mjs` — advisory-only response-risk assertions.
+- Modify: `yuqi-runtime/test/cognitive-state.test.mjs` — no response-risk persistence and unchanged explicit-boundary recovery.
+- Modify: `yuqi-runtime/test/image-attachments.test.mjs` — deterministic receipt/path reuse and one materialization per checksum.
+- Modify: `yuqi-runtime/test/orchestrator.test.mjs` — production-path canonical payment, mixed batch, image reuse, and three-bubble authority group.
+- Create: `yuqi-runtime/test/direct-reply-v3-features.test.mjs` — focused cross-module contract matrix.
+- Modify: `tests/payment-batch-bridge-contract.test.mjs` — staged payment remains separate from social reply and v3 batch evidence is complete.
 
 **Interfaces:**
-- Consumes: v3 direct adapter, authoritative payment/media/quote objects.
-- Produces: general direct-interaction behavior with payment action separated from social response.
+- Consumes: v3 `currentBatch` with closed message fields; authoritative payment `{ kind, amount, note, messageId, status }`; quote `{ messageId, speakerId, speakerType, text }`; image attachment `{ attachmentId, messageId, kind, mime, bytes, checksum/dataUrl }`.
+- Produces: `currentUserInteractionForCognition(batch)` whose rich message fields are lossless for v3 and unchanged for v1/v2; canonical payment action `{ kind, targetKey, targetRevision, payload: { messageId } }`; deterministic materialization receipt `{ turnId, attachmentChecksum, path }`; one `visibleGroupId` and one `commitChecksum` for all bubbles in a direct result.
+- Recovery boundary: no Room/schema migration. v3 rich fields are normalized only in v3 envelopes/semantic snapshots; v1/v2 and result-authority-version-0 recovery keep their existing normalized bytes and `canonicalCommitPayloadV1` behavior. A materialization receipt is an idempotent local artifact, not an authority row; restart reuses a matching path and re-materializes only when the verified artifact is absent.
+- Closed semantics: voice with no transcript is `transcript: null` and remains unknown; emoji keeps raw type/content and never receives an inferred emotion; quote identity is checked against the referenced original message; payment authority is immutable and independent of visible social text; `responseRisks` are advisory for the current turn only and never enter `forbiddenMoves` or `cognitive-state`; visible bubbles share the same group/checksum.
 
-- [ ] **Step 1: Write red end-to-end feature tests**
+- [ ] **Step 1: Write the failing tests**
+
+Add the following executable cases before implementation:
 
 ```js
-test('a later playful gift can change a prior soft stance without changing payment authority', async () => {
-  await sendBatch([{ id: 'u1', type: 'payment', amount: 50, text: '给你买奶茶' }]);
-  await commitStance({ topic: 'gift_play', position: 'not accepting another today',
-    strength: 0.5, flexibility: 0.8, remainingRelevantUserBatches: 2 });
-  const result = await sendBatch([
-    { id: 'u2', type: 'payment', amount: 100, text: '充值亲亲' },
-    { id: 'u3', type: 'text', text: '这次总能收了吧' }
+test('v3 preserves a mixed ordered batch without losing rich evidence', () => {
+  const normalized = validateEnvelope(v3MixedBatchEnvelope());
+  assert.deepEqual(normalized.context.currentBatch.messages.map(message => message.messageId), [
+    'msg_text', 'msg_image', 'msg_quote', 'msg_voice', 'msg_emoji', 'msg_payment'
   ]);
-  assert.equal(result.cognition.interactionDecision.shouldAcknowledgeBid, true);
-  assert.ok(['accept', 'reject', 'wait'].includes(result.actions.payment.action));
-  assert.ok(result.cognition.selfResponse.stanceTransitions
-    .some(x => ['soften', 'reverse', 'maintain'].includes(x.operation)));
-  assert.doesNotMatch(result.visibleText, /阶段|规则|兑换|交易成立|还没到/);
-});
-
-test('risks do not become persistent forbidden moves', () => {
-  const contract = compileInteractionContract({
-    responseRisks: ['may sound transactional'],
-    hardConstraints: [], currentStances: []
+  assert.equal(normalized.context.currentBatch.messages[3].transcript, null);
+  assert.deepEqual(normalized.context.currentBatch.messages[2].quote, {
+    messageId: 'msg_original', speakerId: 'user', speakerType: 'user', text: '原话'
   });
-  assert.deepEqual(contract.forbiddenMoves, []);
-  assert.equal(JSON.stringify(nextTurnState(contract)).includes('may sound transactional'), false);
+  assert.equal(normalized.context.currentBatch.messages[4].type, 'emoji');
+  assert.equal(normalized.context.currentBatch.messages[4].emotion, undefined);
+  assert.equal(normalized.context.currentBatch.messages[5].payment.messageId, 'msg_payment');
 });
 
-test('ordered batch keeps image quote voice emoji payment and text evidence', async () => {
-  const result = await sendBatch(mixedMediaBatch());
-  assert.deepEqual(result.cognition.interactionRead.evidenceMessageIds,
-    mixedMediaBatch().map(x => x.id));
-  assert.equal(materializationCount('image-1'), 1);
-  assert.equal(result.input.messages.find(x => x.type === 'voice').transcript, null);
-  assert.equal(result.input.messages.find(x => x.type === 'quote').quotedSpeaker, 'assistant');
+test('v1 and v2 normalized snapshots remain byte-compatible', () => {
+  assert.deepEqual(validateEnvelope(legacyV1Envelope()), legacyV1Expected());
+  assert.deepEqual(validateEnvelope(legacyV2Envelope()), legacyV2Expected());
+});
+
+test('canonical payment intent is authoritative and cannot be changed by expression prose', () => {
+  const draft = materializeV3Draft({
+    cognitionPacket: paymentCognitionPacket(),
+    expressionResult: expressionWithText('我先不收，但谢谢你')
+  });
+  const canonical = normalizeCanonicalBrainDraft(draft);
+  assert.equal(canonical.paymentAction, 'received');
+  assert.deepEqual(canonical.actionIntent.payment, paymentCognitionPacket().cognitionResult.actionIntent.payment);
+  assert.throws(() => normalizeCognitionV3Result(forgedPaymentResult(), paymentValidationContext()), /payment target/);
+});
+
+test('response risks remain advisory and never become forbidden moves or durable state', () => {
+  const contract = compileInteractionContract({ conversationFrame: { responseRisks: ['may sound transactional'] } });
+  assert.deepEqual(contract.forbiddenMoves, []);
+  assert.deepEqual(contract.advisories.responseRisks, ['may sound transactional']);
+  assert.equal(JSON.stringify(reduceCognitiveStateFrom(contract)).includes('may sound transactional'), false);
+});
+
+test('three visible bubbles share one group and commit checksum', async () => {
+  const result = await runDirectV3Reply(threeBubbleDraft(['一', '二', '三']));
+  assert.equal(result.visibleItems.length, 3);
+  assert.equal(new Set(result.visibleItems.map(item => item.groupId)).size, 1);
+  assert.equal(new Set(result.visibleItems.map(item => item.commitChecksum)).size, 1);
+});
+
+test('image materialization reuses the same receipt after duplicate call and restart', async () => {
+  const first = await materializeImageAttachments([imageAttachment()], { turnId: 'turn_image_1' });
+  const second = await materializeImageAttachments([imageAttachment()], { turnId: 'turn_image_1' });
+  assert.deepEqual(second.receipt, first.receipt);
+  assert.equal(second.paths[0], first.paths[0]);
 });
 ```
 
-- [ ] **Step 2: Run direct feature tests red**
+The v3 protocol test must also reject unknown rich-message keys, quote identity mismatches, payment mutation, non-native transcript values, and incomplete/duplicate batch members before storage. The current v1/v2 fixtures must be asserted against their existing serialized output rather than regenerated from the new normalizer.
+
+- [ ] **Step 2: Run the focused tests and preserve the real red result**
 
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/direct-reply-v3-features.test.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs tests/payment-batch-bridge-contract.test.mjs
+node --test yuqi-runtime/test/direct-reply-v3-features.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/current-user-batch.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs yuqi-runtime/test/orchestrator.test.mjs tests/payment-batch-bridge-contract.test.mjs
 ```
 
-Expected: FAIL because risks still feed forbidden moves and v3 feature integration is incomplete.
+Expected red assertions are: rich fields are currently dropped by `normalizedBatchMessage`, canonical payment intent is not projected into `canonicalActionSet`, response risks still appear in `forbiddenMoves`, repeated image calls do not reuse a receipt, and the new three-bubble/payment integration tests are not yet implemented. Do not weaken a fixture or add `only`/`skip` to make this gate green.
 
-- [ ] **Step 3: Remove the risk-to-rule path and integrate feature authority**
+- [ ] **Step 3: Implement the smallest v3-only authority changes**
 
-```js
-export function deriveForbiddenMoves({ hardConstraints = [], actionAuthority = {} }) {
-  return [
-    ...hardConstraints.filter(isApplicableActiveConstraint).map(toForbiddenMove),
-    ...deterministicActionProhibitions(actionAuthority)
-  ];
-}
+1. Extend `normalizedBatchMessage` and `currentUserInteractionForCognition` with a closed v3 projection for `messageType/type`, nullable voice `transcript`, exact quote identity, raw emoji fields, immutable payment, and safe attachment references. Reject unknown keys and cross-message quote/payment identity conflicts. Keep the v1/v2 branches byte-for-byte unchanged.
+2. Map `actionIntent.payment` into `normalizeCanonicalBrainDraft` and `canonicalActionSet` using the persisted payment target/revision. The expression reply is display text only; it cannot infer, replace, or mutate the canonical payment action. Preserve the old v1/v2 `paymentAction` output and settlement behavior.
+3. Change `deriveForbiddenMoves` to consume only active hard constraints and deterministic action prohibitions. Expose `responseRisks` under a turn-local advisory object with `persistence: 'none'`; do not write it through `reduceCognitiveState` or any release checkpoint.
+4. Compute `attachmentChecksum` from the validated image bytes and use a deterministic path keyed by `{ turnId, attachmentChecksum }`. Before writing, verify the existing receipt/path and checksum; return it unchanged on duplicate or restart. Do not delete a reusable artifact during a retry; cleanup happens once after the terminal pipeline has released its local reference.
+5. Keep the existing `canonicalVisibleGroup`/`commitVisibleResult` authority path: all three bubbles use one `visibleGroupId` and one `commitChecksum`; no changes to RA0 recovery, v1/v2 payloads, or unrelated modules.
 
-export function compileCurrentTurnAdvisories({ responseRisks = [], ambiguities = [] }) {
-  return { responseRisks: structuredClone(responseRisks), ambiguities: structuredClone(ambiguities),
-    persistence: 'none' };
-}
-```
+- [ ] **Step 4: Run the focused tests green and verify compatibility**
 
-Delete the merge from `responseRisks` into `forbiddenMoves`. New cognition-release turns do not write `activeBoundaries`; persisted result-authority-version-0 turns continue to read their frozen checkpoint during recovery. Payment validation locks message ID, kind, amount, currency, payer/payee, current status, refund, and wallet effects, while cognition independently decides the social response. Image materialization remains exactly once. Voice without transcript remains unknown. Emoji gets no fixed emotion mapping. Quotes retain original speaker/message ID. Visible multi-bubbles share one authority group and commit checksum.
-
-- [ ] **Step 4: Run direct feature tests green**
-
-Run the Step 2 command.
-
-Expected: PASS; the test allows Yuqi to accept or reject but rejects policy leakage, frozen stance, dropped social bid, wrong payment target, invented media content, or missing batch evidence.
+Run the Step 2 command again. Expected: PASS with no `only`/`skip`; the mixed v3 batch retains all six evidence kinds, voice remains unknown without a transcript, emoji has no inferred emotion, quote identity is exact, payment authority is stable against social-text changes, image materialization is deterministic/idempotent, risks stay advisory-only, and three bubbles share one authority group/checksum. The same run must also prove the existing v1/v2 fixtures and result-authority-version-0 recovery are unchanged.
 
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add yuqi-runtime/src/interaction-contract.mjs yuqi-runtime/src/cognitive-state.mjs yuqi-runtime/src/image-attachments.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs yuqi-runtime/test/direct-reply-v3-features.test.mjs tests/payment-batch-bridge-contract.test.mjs
+git add yuqi-runtime/src/protocol.mjs yuqi-runtime/src/current-user-batch.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/interaction-contract.mjs yuqi-runtime/src/cognitive-state.mjs yuqi-runtime/src/image-attachments.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/current-user-batch.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/direct-reply-v3-features.test.mjs tests/payment-batch-bridge-contract.test.mjs
 git commit -m "feat: integrate direct social and structured interactions"
 ```
 
