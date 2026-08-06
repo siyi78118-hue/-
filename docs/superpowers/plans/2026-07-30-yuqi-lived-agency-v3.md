@@ -6906,6 +6906,7 @@ git commit -m "feat: integrate direct social and structured interactions"
 - Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/turn-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
+- Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
 - Modify: `yuqi-runtime/test/life-simulation.test.mjs`
 - Modify: `yuqi-runtime/test/cognition-v3-contract.test.mjs`
 - Modify: `yuqi-runtime/test/cognition-v3-adapters.test.mjs`
@@ -6913,6 +6914,7 @@ git commit -m "feat: integrate direct social and structured interactions"
 - Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
 - Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Modify: `yuqi-runtime/test/turn-dispatcher.test.mjs`
+- Modify: `yuqi-runtime/test/cloud-relay-pump.test.mjs`
 - Create: `yuqi-runtime/test/proactive-chat-v3.test.mjs`
 - Modify: `tests/yuqi-cognition-feature-matrix.test.mjs`
 
@@ -6952,7 +6954,7 @@ git commit -m "feat: integrate direct social and structured interactions"
 3. Eligible life sources are non-cancelled current episodes and non-cancelled episodes that ended no more than six hours before fixed `consideredAt`. Eligible open threads come only from the current `cognitive_states` checksum/revision, have non-empty `threadId`, `summary`, `sourceTurnId`, and a `lastTouchedAt` no more than seven days old. A mood string, vague attention text, timer label, model inference, future episode, cancelled episode, expired thread, or missing checksum is never a candidate. Task 19 owns role-plan commitments; Task 17 emits no `due_commitment` candidate until an exact persisted commitment authority exists.
 4. A candidate already cited by a committed `PROACTIVE_CHAT` result is consumed for that exact source version and is filtered from later fresh turns. Task 17 adds `pc-visible-commit-v3`, whose only delta from v2 is the required closed `proactiveMotiveEvidenceIds`, and uses it only for canonical wire-v3 `PROACTIVE_CHAT`; that immutable manifest field—not visible prose—is the consumption fact source. Skips store `[]`. Failed/cancelled turns, shadow drafts, and uncommitted work consume nothing. Exact replay/restart reads the already-pinned annotation snapshot and committed manifest instead of rebuilding either. Retries inherit the parent snapshot through the existing canonical retry authority. Every other PC result remains `pc-visible-commit-v1/v2` byte-compatible.
 5. Structural silence recognizes only active hard constraints whose channel is `private_chat` or `all`, whose kind is `action` or `consent`, and whose exact machine rule is `deny_proactive_chat` or `deny_all_contact`. It never parses free-form refusal, mood, distance, or a prior one-off skip into a permanent ban.
-6. `motiveEvidenceIds` is an optional property in the shared v3 schema so other kinds remain byte-compatible. The v3 contract makes it mandatory for `PROACTIVE_CHAT`: `send` requires one to three unique IDs, all in the pinned candidate set; `skip` requires `[]`. With zero candidates or structural silence, the orchestrator commits a structural skip before calling `ReleaseExecutor`. With candidates, cognition may still choose an intentional skip.
+6. `motiveEvidenceIds` is an optional property in the shared v3 schema so other kinds remain byte-compatible. The v3 contract makes it mandatory for `PROACTIVE_CHAT`: `send` requires one to three unique IDs, all in the pinned candidate set; `skip` requires `[]` and requires `payment`, `moment`, `rolePlan`, `lifeAdjustment`, and `relationshipReview` all to be `null`. With zero candidates or structural silence, the orchestrator commits a structural skip before calling `ReleaseExecutor`. With candidates, cognition may still choose an intentional skip, but a skip can never smuggle a relationship-stage or other action into an `action_only` result.
 7. No-motive and structural-silence skips bypass `getProactiveChatDeliveryPolicy()` and its legacy skip budget. They use the normal Task 10F terminal commit with `items:[]`, `actions:[]`, no evidence-memory job, no message projection, no placeholder, and no notification payload. A model-produced intentional skip uses the same transaction.
 8. Task 17 changes canonical v3 `PROACTIVE_CHAT` and its collision with canonical v3 `DIRECT_REPLY` only. RA0, wire v1/v2, role-plan kinds, moment kinds, cloud stale-trigger handling, and their serialized outputs remain exact compatibility paths.
 
@@ -7064,7 +7066,7 @@ if (turn.rolloutKey === 'PROACTIVE_CHAT'
 }
 ```
 
-`commitCanonicalProactiveSkip()` must call the same `commitVisibleResult()` path used by other canonical results with empty visible/action sets, the pinned comparison descriptor, and a generation fingerprint whose proactive context revision is `contentHash({agencySnapshotChecksum,proactiveMotiveAuthorityChecksum})`. Visible proactive sends use that same context revision. `commitVisibleResult()` must recompute this exact proactive context revision while every other kind keeps its existing agency-only fingerprint formula. The skip helper must not call the legacy delivery-policy budget and must not create evidence-memory work.
+`commitCanonicalProactiveSkip()` must call the same `commitVisibleResult()` path used by other canonical results with empty visible/action sets, the pinned comparison descriptor, and a generation fingerprint whose proactive context revision is `contentHash({agencySnapshotChecksum,proactiveMotiveAuthorityChecksum})`. Visible proactive sends use that same context revision. `commitVisibleResult()` must recompute this exact proactive context revision while every other kind keeps its existing agency-only fingerprint formula. `canonicalActionSet()` must return `[]` for an already validated proactive skip, and the commit layer must independently reject any non-empty action set when a v3 proactive cognition/manifest says skip. The skip helper must not call the legacy delivery-policy budget and must not create evidence-memory work.
 
 - [ ] **Step 4: Write red atomic collision and recovery tests**
 
@@ -7092,6 +7094,8 @@ test('a proactive trigger arriving behind a direct turn fails retryably with zer
   );
   assert.equal(store.getInteractionLane('yuqi', 'private_chat').generatingTurnId, direct.turnId);
   assert.equal(store.getTurn('turn_proactive_waiting'), null);
+  assert.equal(cloud.acks.length, 0);
+  assert.equal(store.diagnosticsFor('turn_proactive_waiting').length, 0);
 });
 
 test('restart does not revive a superseded proactive result', async () => {
@@ -7103,7 +7107,7 @@ test('restart does not revive a superseded proactive result', async () => {
 });
 ```
 
-Also add a race in which the direct transaction wins while proactive generation is in flight, a race in which proactive commits first and direct follows normally, exact proactive replay with one receipt/group, same-source second trigger filtering, and a canary proactive cancellation. The cancellation must create no `quality_findings`; existing conservative canary cancellation accounting may record the cancelled subject as a rollout failure so the reserved slot is not leaked, but it must use reason `CANARY_SOURCE_SUPERSEDED` and must never masquerade as a model-quality finding.
+Also add a race in which the direct transaction wins while proactive generation is in flight, a race in which proactive commits first and direct follows normally, exact proactive replay with one receipt/group, same-source second trigger filtering, a source whose checksum changes and therefore creates a new motive ID, a canary proactive cancellation, and a provider that rejects only after the proactive lineage was cancelled. The cancellation must create no `quality_findings`; the row-level admission helper must call `settleCanaryFailureInternal()` inside the same outer immediate transaction with reason `CANARY_SOURCE_SUPERSEDED`, so the reserved slot cannot leak and rollback restores both cancellation and rollout counters together. This conservative rollout failure is not a model-quality finding.
 
 - [ ] **Step 5: Implement canonical private-chat admission in the creation transaction**
 
@@ -7117,7 +7121,7 @@ admitCanonicalPrivateChatRowsInternal({
 })
 ```
 
-Before rollout/canary reservation or any turn write, a fresh incoming canonical v3 `PROACTIVE_CHAT` must inspect the pinned lane revision. If a different uncommitted `DIRECT_REPLY` or `PROACTIVE_CHAT` owns it, throw a stable `InteractionLaneBusyError` with code `INTERACTION_LANE_BUSY` and zero database writes. `TurnDispatcher` treats that as retryable scheduling contention, not model/pipeline failure; cloud input is not ACKed until durable acceptance, and the existing stale-trigger gate may later retire it. This avoids creating a cancelled turn with a lane/canary reservation it never owned.
+Before rollout/canary reservation or any turn write, a fresh incoming canonical v3 `PROACTIVE_CHAT` must inspect the pinned lane revision. If a different uncommitted `DIRECT_REPLY` or `PROACTIVE_CHAT` owns it, throw a stable `InteractionLaneBusyError` with code `INTERACTION_LANE_BUSY` and zero database writes. `TurnDispatcher` treats that as retryable scheduling contention, not model/pipeline failure. `CloudRelayPump` must catch only this exact error before its generic failure-diagnostic path: write no diagnostic or duplicate marker, perform no turn/delivery/sync write, send no relay ACK, and leave the relay input retryable; the existing validated stale-trigger gate may later retire it. This avoids creating a cancelled turn with a lane/canary reservation it never owned.
 
 For an admitted fresh turn, the row-level helper handles only these canonical v3 pairs on `private_chat`:
 
@@ -7127,17 +7131,17 @@ For an admitted fresh turn, the row-level helper handles only these canonical v3
 
 All other kinds continue through their existing Task 9/Task 19 paths. Do not invent a SQL turn state named `superseded_by_user_batch`; the persisted turn remains `state:'failed'`, the lineage becomes `state:'cancelled'`, and `error_json.code` carries the reason. `createCanonicalTurnForEnvelope()`, `runCanonicalReleaseTurn()`, `TurnDispatcher.accept/recover`, and their callers must recognize this terminal outcome and return `{status:'superseded', visible:false}` without invoking the model, recording a quality failure, requeueing, or producing a delivery.
 
-After release execution and immediately before drafting actions/quality/commit, `runCanonicalReleaseTurn()` must re-read the turn and lineage. If the direct transaction cancelled it while the model was running, return the same terminal superseded outcome. Any other lane or authority mismatch remains a real error; do not turn arbitrary CAS failures into supersession.
+Before release execution and again immediately before drafting actions/quality/commit, `runCanonicalReleaseTurn()` must re-read the turn and lineage. If the direct transaction cancelled it while the model was running, return the same terminal superseded outcome. If `releaseExecutor.executeTurn()` rejects, the catch path must first perform that same exact turn/lineage check; a persisted `state:'failed'`, lineage `state:'cancelled'`, and `error_json.code:'superseded_by_user_batch'` returns superseded without calling `recordActivePipelineFailure`, requeue, or quality evaluation. Unknown provider, SQLite, and authority errors continue through the existing failure path; do not classify arbitrary failures as supersession.
 
 - [ ] **Step 6: Run the complete Task 17 focused gate**
 
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/proactive-chat-v3.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
+node --test yuqi-runtime/test/proactive-chat-v3.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
 ```
 
-Expected: PASS with no `only`/`skip`. The gate must prove zero-motive and structural-silence execution call no model; a visible send cites pinned evidence; consumed/expired/forged evidence cannot send; canonical skip has zero items/actions/messages/delivery text/memory jobs; direct/proactive races have one lane owner and at most one visible group; close/reopen preserves cancelled and committed authority; and RA0, wire v1/v2, role-plan, moment, and cloud stale-trigger fixtures are unchanged.
+Expected: PASS with no `only`/`skip`. The gate must prove zero-motive and structural-silence execution call no model; a visible send cites pinned evidence; consumed/expired/forged evidence cannot send; a changed persisted checksum yields a new deterministic source version; canonical skip has zero items/actions/messages/delivery text/memory jobs; direct/proactive races have one lane owner and at most one visible group; lane-busy cloud input performs zero store writes/diagnostics/ACK; provider rejection after supersession creates no pipeline or quality failure; close/reopen preserves cancelled and committed authority; and RA0, wire v1/v2, role-plan, moment, and cloud stale-trigger fixtures are unchanged.
 
 - [ ] **Step 7: Run the project regression gate**
 
@@ -7152,7 +7156,7 @@ Expected: PASS with zero failures and zero skipped tests. Run `git diff --check`
 - [ ] **Step 8: Commit**
 
 ```powershell
-git add yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/role-schemas.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/proactive-chat-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
+git add yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/role-schemas.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/proactive-chat-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
 git commit -m "feat: ground proactive chat in lived motives"
 ```
 
