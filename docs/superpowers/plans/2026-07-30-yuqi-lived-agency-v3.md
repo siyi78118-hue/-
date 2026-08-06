@@ -6793,6 +6793,7 @@ git commit -m "feat: handshake Web visibility with cognition v3"
 - Modify: `yuqi-runtime/test/protocol-store.test.mjs` — v3 rich-message validation plus v1/v2 byte-compatibility fixtures.
 - Modify: `yuqi-runtime/test/current-user-batch.test.mjs` — closed rich-message projection and unknown voice behavior.
 - Modify: `yuqi-runtime/test/cognition-v3-contract.test.mjs` — payment intent authority and expression non-mutation.
+- Modify: `yuqi-runtime/test/cognition-v3-adapters.test.mjs` — prove the production v3 adapter consumes the closed rich batch without a second projection or field loss.
 - Modify: `yuqi-runtime/test/interaction-contract.test.mjs` — advisory-only response-risk assertions.
 - Modify: `yuqi-runtime/test/cognitive-state.test.mjs` — no response-risk persistence and unchanged explicit-boundary recovery.
 - Modify: `yuqi-runtime/test/image-attachments.test.mjs` — deterministic receipt/path reuse and one materialization per checksum.
@@ -6863,14 +6864,14 @@ test('image materialization reuses the same receipt after duplicate call and res
 });
 ```
 
-The v3 protocol test must also reject unknown rich-message keys, quote identity mismatches, payment mutation, non-native transcript values, and incomplete/duplicate batch members before storage. The current v1/v2 fixtures must be asserted against their existing serialized output rather than regenerated from the new normalizer.
+The v3 protocol test must also reject unknown rich-message keys, quote identity mismatches, payment mutation, non-native transcript values, and incomplete/duplicate batch members before storage. The current v1/v2 fixtures must be asserted against hard-coded literal serialized output rather than regenerated, cloned, or normalized by the new implementation. `cognition-v3-adapters.test.mjs` must pass the rich batch through the real production adapter and prove that it neither drops nor reinterprets those fields.
 
 - [ ] **Step 2: Run the focused tests and preserve the real red result**
 
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/direct-reply-v3-features.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/current-user-batch.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs yuqi-runtime/test/orchestrator.test.mjs tests/payment-batch-bridge-contract.test.mjs
+node --test yuqi-runtime/test/direct-reply-v3-features.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/current-user-batch.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs yuqi-runtime/test/orchestrator.test.mjs tests/payment-batch-bridge-contract.test.mjs
 ```
 
 Expected red assertions are: rich fields are currently dropped by `normalizedBatchMessage`, canonical payment intent is not projected into `canonicalActionSet`, response risks still appear in `forbiddenMoves`, repeated image calls do not reuse a receipt, and the new three-bubble/payment integration tests are not yet implemented. Do not weaken a fixture or add `only`/`skip` to make this gate green.
@@ -6890,7 +6891,7 @@ Run the Step 2 command again. Expected: PASS with no `only`/`skip`; the mixed v3
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add yuqi-runtime/src/protocol.mjs yuqi-runtime/src/current-user-batch.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/interaction-contract.mjs yuqi-runtime/src/cognitive-state.mjs yuqi-runtime/src/image-attachments.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/current-user-batch.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/direct-reply-v3-features.test.mjs tests/payment-batch-bridge-contract.test.mjs
+git add yuqi-runtime/src/protocol.mjs yuqi-runtime/src/current-user-batch.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/interaction-contract.mjs yuqi-runtime/src/cognitive-state.mjs yuqi-runtime/src/image-attachments.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/current-user-batch.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/interaction-contract.test.mjs yuqi-runtime/test/cognitive-state.test.mjs yuqi-runtime/test/image-attachments.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/direct-reply-v3-features.test.mjs tests/payment-batch-bridge-contract.test.mjs
 git commit -m "feat: integrate direct social and structured interactions"
 ```
 
