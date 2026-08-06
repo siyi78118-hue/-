@@ -23,7 +23,11 @@ function safeAttachmentReference(attachment) {
 function interactionMessage(message) {
   const type = String(message?.messageType || message?.type || message?.kind || 'text');
   const content = String(message?.content || message?.text || '');
-  const transcript = String(message?.transcript || message?.voiceTranscript || '');
+  const transcriptValue = message?.transcript ?? message?.voiceTranscript;
+  if (transcriptValue != null && typeof transcriptValue !== 'string') {
+    throw new Error('voice transcript must be a native string');
+  }
+  const transcript = type === 'voice' ? (transcriptValue == null ? null : transcriptValue) : null;
   return {
     messageId: messageIdOf(message),
     type,

@@ -1,4 +1,4 @@
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -40,24 +40,61 @@ export async function materializeImageAttachments(attachments, options = {}) {
   const directory = join(rootDir, safeId(options.turnId, `turn_${Date.now()}`));
   const paths = [];
   if (!source.length) return { directory, paths, cleanup: async () => {} };
-  await rm(directory, { recursive: true, force: true });
+  const retainReceipt = options.retainReceipt === true;
+  if (!retainReceipt) await rm(directory, { recursive: true, force: true });
   await mkdir(directory, { recursive: true });
   try {
     for (let index = 0; index < source.length; index += 1) {
       const attachment = source[index];
       const decoded = decodeImageDataUrl(attachment);
-      const filename = `${String(index + 1).padStart(2, '0')}_${safeId(attachment.attachmentId, 'image')}.${decoded.extension}`;
+      const checksum = createHash('sha256').update(decoded.bytes).digest('hex');
+      const filename = retainReceipt
+        ? `${checksum}.${decoded.extension}`
+        : `${String(index + 1).padStart(2, '0')}_${safeId(attachment.attachmentId, 'image')}.${decoded.extension}`;
       const path = join(directory, filename);
-      await writeFile(path, decoded.bytes, { flag: 'wx' });
+      let reusable = false;
+      if (retainReceipt) {
+        try {
+          const existing = await readFile(path);
+          reusable = createHash('sha256').update(existing).digest('hex') === checksum;
+          if (!reusable) {
+            const error = new Error('image materialization checksum conflict');
+            error.code = 'IMAGE_CHECKSUM_CONFLICT';
+            throw error;
+          }
+        } catch (error) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
+      }
+      if (!reusable) {
+        try {
+          await writeFile(path, decoded.bytes, { flag: 'wx' });
+        } catch (error) {
+          if (error?.code !== 'EEXIST' || !retainReceipt) throw error;
+          const existing = await readFile(path);
+          if (createHash('sha256').update(existing).digest('hex') !== checksum) {
+            const conflict = new Error('image materialization checksum conflict');
+            conflict.code = 'IMAGE_CHECKSUM_CONFLICT';
+            throw conflict;
+          }
+        }
+      }
       paths.push(path);
     }
     return {
       directory,
       paths,
+      ...(retainReceipt ? {
+        receipt: {
+          turnId: String(options.turnId || ''),
+          attachmentChecksum: createHash('sha256').update(await readFile(paths[0])).digest('hex'),
+          path: paths[0]
+        }
+      } : {}),
       cleanup: () => rm(directory, { recursive: true, force: true })
     };
   } catch (error) {
-    await rm(directory, { recursive: true, force: true });
+    if (error?.code !== 'IMAGE_CHECKSUM_CONFLICT') await rm(directory, { recursive: true, force: true });
     throw error;
   }
 }

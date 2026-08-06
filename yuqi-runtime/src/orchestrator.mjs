@@ -126,8 +126,11 @@ function normalizeRolePlanOperations(value) {
 
 export function normalizeBrainDraft(draft) {
   const momentSource = draft?.momentAction ?? draft?.actionIntent?.moment;
+  const paymentIntentAction = draft?.actionIntent?.payment?.action;
   const paymentAction = ['received', 'refused', 'pending'].includes(draft?.paymentAction)
     ? draft.paymentAction
+    : ['received', 'refused', 'pending'].includes(paymentIntentAction)
+      ? paymentIntentAction
     : null;
   const normalized = {
     ...(draft && typeof draft === 'object' && !Array.isArray(draft) ? draft : {}),
@@ -279,9 +282,11 @@ export function normalizeCanonicalBrainDraft(draft) {
     ? null
     : canonicalRelationshipPayload(relationshipSource);
   const normalized = normalizeBrainDraft(draft);
+  const payment = normalized.actionIntent?.payment;
   return {
     ...normalized,
     momentAction,
+    ...(payment ? { paymentAction: payment.action } : {}),
     ...(relationshipSource == null ? {} : { relationshipStageAction })
   };
 }
@@ -470,6 +475,16 @@ function inferredPaymentAction(text) {
 
 function resolvedPaymentAction(envelope, draft) {
   if (!envelope.context?.payment) return null;
+  if (envelope.protocolVersion === 3) {
+    const payment = draft?.actionIntent?.payment;
+    if (!payment || !['received', 'refused', 'pending'].includes(payment.action)
+      || payment.messageId !== envelope.context.payment.messageId
+      || payment.kind !== envelope.context.payment.kind
+      || payment.amount !== envelope.context.payment.amount) {
+      throw new Error('v3 payment intent authority mismatch');
+    }
+    return payment.action;
+  }
   return inferredPaymentAction(draft.reply) || draft.paymentAction || 'pending';
 }
 
@@ -1640,6 +1655,13 @@ export class YuqiOrchestrator {
 
   canonicalActionSet(turn, draft) {
     const actionInputs = [];
+    if (draft?.paymentAction && draft.paymentAction !== 'pending' && draft?.actionIntent?.payment) {
+      const payment = draft.actionIntent.payment;
+      actionInputs.push({
+        kind: payment.action === 'received' ? 'payment_accept' : 'payment_decline',
+        payload: { messageId: payment.messageId }
+      });
+    }
     if (draft?.momentAction) {
       const payload = canonicalMomentPayload(draft.momentAction);
       const kind = payload.replyToCommentId
@@ -1720,7 +1742,8 @@ export class YuqiOrchestrator {
       Array.isArray(message?.attachments) ? message.attachments : []
     );
     const preparedImages = await materializeImageAttachments(rawAttachments, {
-      turnId: turn.turnId
+      turnId: turn.turnId,
+      retainReceipt: turn.protocolVersion === 3
     });
     let envelope = structuredClone(storedEnvelope);
     let currentBatch = persistedBatch ? structuredClone(persistedBatch) : null;
@@ -1761,6 +1784,7 @@ export class YuqiOrchestrator {
           scene: sceneFromEnvelope(envelope),
           currentBatch,
           localImagePaths: [...preparedImages.paths],
+          ...(preparedImages.receipt ? { localImageReceipt: preparedImages.receipt } : {}),
           agencyView,
           routeDecision: {
             route: turn.route,

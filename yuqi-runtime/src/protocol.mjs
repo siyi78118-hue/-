@@ -502,17 +502,50 @@ function validateDirectContext(
     if (!payment || typeof payment !== 'object' || Array.isArray(payment)) {
       throw new Error('invalid payment context');
     }
-    const kind = String(payment.kind || '');
-    const amount = Number(payment.amount);
-    const note = String(payment.note || '').trim();
-    const messageId = String(payment.messageId || '');
-    const status = String(payment.status || 'pending');
-    if (!['redpacket', 'transfer'].includes(kind)) throw new Error('invalid payment kind');
-    if (!Number.isFinite(amount) || amount <= 0) throw new Error('invalid payment amount');
-    if (note.length > 500) throw new Error('payment note too large');
-    requireId(messageId, 'payment messageId');
-    if (!['pending', 'received', 'refused'].includes(status)) throw new Error('invalid payment status');
-    normalized.payment = { kind, amount, note, messageId, status };
+    if (protocolVersion === 3) {
+      assertClosedKeys(payment, ['kind', 'amount', 'note', 'messageId', 'status'], 'v3 payment context');
+      if (typeof payment.kind !== 'string' || !['redpacket', 'transfer'].includes(payment.kind)) {
+        throw new Error('invalid v3 payment kind');
+      }
+      if (typeof payment.amount !== 'number' || !Number.isFinite(payment.amount) || payment.amount <= 0) {
+        throw new Error('invalid v3 payment amount');
+      }
+      if (typeof payment.note !== 'string' || payment.note.length > 500) {
+        throw new Error('invalid v3 payment note');
+      }
+      if (typeof payment.messageId !== 'string') throw new Error('invalid v3 payment messageId');
+      requireId(payment.messageId, 'payment messageId');
+      if (typeof payment.status !== 'string' || !['pending', 'received', 'refused'].includes(payment.status)) {
+        throw new Error('invalid v3 payment status');
+      }
+      normalized.payment = {
+        kind: payment.kind,
+        amount: payment.amount,
+        note: payment.note,
+        messageId: payment.messageId,
+        status: payment.status
+      };
+    } else {
+      const kind = String(payment.kind || '');
+      const amount = Number(payment.amount);
+      const note = String(payment.note || '').trim();
+      const messageId = String(payment.messageId || '');
+      const status = String(payment.status || 'pending');
+      if (!['redpacket', 'transfer'].includes(kind)) throw new Error('invalid payment kind');
+      if (!Number.isFinite(amount) || amount <= 0) throw new Error('invalid payment amount');
+      if (note.length > 500) throw new Error('payment note too large');
+      requireId(messageId, 'payment messageId');
+      if (!['pending', 'received', 'refused'].includes(status)) throw new Error('invalid payment status');
+      normalized.payment = { kind, amount, note, messageId, status };
+    }
+  }
+  if (protocolVersion === 3 && normalized.currentBatch?.messages) {
+    const paymentMessages = normalized.currentBatch.messages.filter(message => message.payment);
+    if (paymentMessages.length > 1) throw new Error('duplicate current batch payment message');
+    if (paymentMessages.length && (!normalized.payment
+      || canonicalJson(paymentMessages[0].payment) !== canonicalJson(normalized.payment))) {
+      throw new Error('current batch payment authority mismatch');
+    }
   }
   return normalized;
 }
@@ -529,6 +562,77 @@ function normalizedBatchMessage(value, envelope) {
     throw new Error('invalid current batch message');
   }
   const message = structuredClone(value);
+  let emitRichType = false;
+  if (envelope.protocolVersion === 3) {
+    assertNoUnknownKeys(message, [
+      'messageId', 'speakerId', 'speakerType', 'recipientId', 'content', 'sentAt', 'attachments',
+      'type', 'messageType', 'transcript', 'voiceTranscript', 'quote', 'quoteRef', 'payment'
+    ], 'v3 current batch message');
+    const explicitType = Object.hasOwn(message, 'type') || Object.hasOwn(message, 'messageType');
+    const type = message.type ?? message.messageType ?? (
+      message.payment ? 'payment' : message.quote || message.quoteRef ? 'quote'
+        : Array.isArray(message.attachments) && message.attachments.length ? 'image' : 'text'
+    );
+    if (typeof type !== 'string' || !['text', 'image', 'quote', 'voice', 'emoji', 'payment'].includes(type)) {
+      throw new Error('invalid v3 current batch message type');
+    }
+    message.type = type;
+    emitRichType = explicitType || type !== 'text' || message.payment !== undefined
+      || message.quote !== undefined || message.quoteRef !== undefined
+      || message.transcript !== undefined || message.voiceTranscript !== undefined;
+    if (Object.hasOwn(message, 'type') && Object.hasOwn(message, 'messageType')
+      && message.type !== message.messageType) {
+      throw new Error('v3 current batch message type mismatch');
+    }
+    const transcript = message.transcript ?? message.voiceTranscript;
+    if (type === 'voice') {
+      if (transcript !== undefined && transcript !== null && typeof transcript !== 'string') {
+        throw new Error('voice transcript must be a native string');
+      }
+      message.transcript = transcript ?? null;
+    } else if (transcript !== undefined) {
+      throw new Error('transcript is only valid for voice messages');
+    }
+    if (message.quote !== undefined || message.quoteRef !== undefined) {
+      const quote = message.quote ?? message.quoteRef;
+      if (!quote || typeof quote !== 'object' || Array.isArray(quote)) throw new Error('invalid v3 quote');
+      assertClosedKeys(quote, ['messageId', 'speakerId', 'speakerType', 'text'], 'v3 quote');
+      requireId(quote.messageId, 'quote messageId', 'msg_');
+      requireId(quote.speakerId, 'quote speakerId');
+      if (!['user', 'character'].includes(quote.speakerType) || typeof quote.text !== 'string') {
+        throw new Error('invalid v3 quote identity');
+      }
+      if ((quote.speakerType === 'user' && quote.speakerId !== 'user')
+        || (quote.speakerType === 'character' && quote.speakerId !== envelope.characterId)) {
+        throw new Error('v3 quote speaker identity mismatch');
+      }
+      message.quote = {
+        messageId: quote.messageId,
+        speakerId: quote.speakerId,
+        speakerType: quote.speakerType,
+        text: quote.text
+      };
+      delete message.quoteRef;
+    }
+    if (message.payment !== undefined) {
+      const payment = message.payment;
+      if (!payment || typeof payment !== 'object' || Array.isArray(payment)) throw new Error('invalid v3 payment message');
+      assertClosedKeys(payment, ['messageId', 'kind', 'amount', 'note', 'status'], 'v3 payment message');
+      if (typeof payment.messageId !== 'string' || payment.messageId !== message.messageId
+        || !['redpacket', 'transfer'].includes(payment.kind)
+        || typeof payment.amount !== 'number' || !Number.isFinite(payment.amount) || payment.amount <= 0
+        || typeof payment.note !== 'string' || !['pending', 'received', 'refused'].includes(payment.status)) {
+        throw new Error('invalid v3 payment message');
+      }
+      message.payment = {
+        messageId: payment.messageId,
+        kind: payment.kind,
+        amount: payment.amount,
+        note: payment.note,
+        status: payment.status
+      };
+    }
+  }
   message.messageId = canonicalMessageId(message.messageId);
   validateUserMessage(message, envelope);
   if (message.speakerType !== 'user' || message.speakerId !== 'user') {
@@ -537,7 +641,7 @@ function normalizedBatchMessage(value, envelope) {
   if (message.recipientId !== envelope.characterId) {
     throw new Error('current batch recipient mismatch');
   }
-  return {
+  const normalized = {
     messageId: message.messageId,
     speakerId: message.speakerId,
     speakerType: message.speakerType,
@@ -546,6 +650,13 @@ function normalizedBatchMessage(value, envelope) {
     ...(message.attachments ? { attachments: message.attachments } : {}),
     sentAt: message.sentAt
   };
+  if (envelope.protocolVersion === 3) {
+    if (emitRichType) normalized.type = message.type;
+    if (message.type === 'voice') normalized.transcript = message.transcript;
+    if (message.quote) normalized.quote = message.quote;
+    if (message.payment) normalized.payment = message.payment;
+  }
+  return normalized;
 }
 
 function validateCurrentBatch(value, envelope) {

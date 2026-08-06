@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -41,6 +41,86 @@ test('rejects a non-image signature even when the data URL claims JPEG', async (
       mime: 'image/jpeg',
       dataUrl: `data:image/jpeg;base64,${Buffer.from('not a jpeg').toString('base64')}`
     }], { rootDir: root, turnId: 'turn_bad' }), /signature/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('retained image receipts reuse, rebuild missing artifacts, reject corruption, and cleanup once', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-image-retained-test-'));
+  const attachment = {
+    attachmentId: 'att_retained',
+    kind: 'image',
+    mime: 'image/jpeg',
+    dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
+  };
+  try {
+    const first = await materializeImageAttachments([attachment], {
+      rootDir: root,
+      turnId: 'turn_retained',
+      retainReceipt: true
+    });
+    const duplicate = await materializeImageAttachments([attachment], {
+      rootDir: root,
+      turnId: 'turn_retained',
+      retainReceipt: true
+    });
+    assert.deepEqual(duplicate.receipt, first.receipt);
+
+    rmSync(first.paths[0]);
+    const rebuilt = await materializeImageAttachments([attachment], {
+      rootDir: root,
+      turnId: 'turn_retained',
+      retainReceipt: true
+    });
+    assert.deepEqual(rebuilt.receipt, first.receipt);
+    assert.equal(existsSync(rebuilt.paths[0]), true);
+
+    writeFileSync(rebuilt.paths[0], Buffer.from('corrupt retained artifact'));
+    await assert.rejects(
+      materializeImageAttachments([attachment], {
+        rootDir: root,
+        turnId: 'turn_retained',
+        retainReceipt: true
+      }),
+      /image materialization checksum conflict/
+    );
+    assert.equal(readFileSync(rebuilt.paths[0]).toString(), 'corrupt retained artifact');
+
+    await rebuilt.cleanup();
+    assert.equal(existsSync(rebuilt.directory), false);
+    await first.cleanup();
+    await duplicate.cleanup();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('retained changed bytes use a new checksum path without overwriting the old artifact', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-image-retained-change-'));
+  const original = Buffer.from(JPEG_1X1, 'base64');
+  const changed = Buffer.from(original);
+  changed[changed.length - 1] ^= 1;
+  try {
+    const first = await materializeImageAttachments([{
+      attachmentId: 'att_original',
+      kind: 'image',
+      mime: 'image/jpeg',
+      dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
+    }], { rootDir: root, turnId: 'turn_changed', retainReceipt: true });
+    const second = await materializeImageAttachments([{
+      attachmentId: 'att_changed',
+      kind: 'image',
+      mime: 'image/jpeg',
+      dataUrl: `data:image/jpeg;base64,${changed.toString('base64')}`
+    }], { rootDir: root, turnId: 'turn_changed', retainReceipt: true });
+    assert.notEqual(second.receipt.attachmentChecksum, first.receipt.attachmentChecksum);
+    assert.notEqual(second.receipt.path, first.receipt.path);
+    assert.deepEqual(readFileSync(first.paths[0]), original);
+    assert.deepEqual(readFileSync(second.paths[0]), changed);
+    await first.cleanup();
+    assert.equal(existsSync(first.directory), false);
+    await second.cleanup();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

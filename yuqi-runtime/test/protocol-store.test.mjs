@@ -1627,3 +1627,64 @@ test('role session turn counts reset and increment independently', () => withSto
   assert.deepEqual(store.getSessionState('brain'), { threadId: 'thr_replacement', turnCount: 0 });
   assert.equal(store.getSessionState('memory'), null);
 }));
+
+test('v2 normalization remains byte-compatible with the frozen literal projection', () => {
+  const input = validV2Envelope({
+    message: {
+      messageId: 'msg_device2_1',
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: '你好',
+      sentAt: 1784400000000
+    }
+  });
+  const expected = {
+    protocolVersion: 2,
+    turnId: 'turn_device2_1',
+    characterId: 'yuqi',
+    deviceId: 'device2',
+    deviceSeq: 1,
+    createdAt: 1784400000000,
+    message: {
+      messageId: 'msg_device2_1',
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: '你好',
+      sentAt: 1784400000000
+    },
+    kind: 'DIRECT_REPLY'
+  };
+  assert.deepEqual(validateEnvelope(input), expected);
+});
+
+test('v1 normalization remains byte-compatible with the frozen literal projection', () => {
+  const input = validEnvelope({
+    message: {
+      messageId: 'msg_device1_1',
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: '你好',
+      sentAt: 1784400000000
+    }
+  });
+  const expected = {
+    protocolVersion: 1,
+    turnId: 'turn_device1_1',
+    characterId: 'yuqi',
+    deviceId: 'device1',
+    deviceSeq: 1,
+    createdAt: 1784400000000,
+    message: {
+      messageId: 'msg_device1_1',
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: '你好',
+      sentAt: 1784400000000
+    }
+  };
+  assert.deepEqual(validateEnvelope(input), expected);
+});

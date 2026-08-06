@@ -128,7 +128,6 @@ function deriveMustAddress(frame, scene) {
 
 function deriveForbiddenMoves(frame) {
   return [...new Set([
-    ...frame.responseRisks,
     ...(frame.recentCorrection.active ? [frame.recentCorrection.rejectedInterpretation] : [])
   ])];
 }
@@ -151,10 +150,12 @@ function frozenContract(value) {
     value.explicitBoundaries,
     value.mustAddress,
     value.forbiddenMoves,
+    value.advisories.responseRisks,
     value.evidenceMessageIds,
     value.recentCorrection.evidenceMessageIds
   ]) Object.freeze(item);
   Object.freeze(value.recentCorrection);
+  Object.freeze(value.advisories);
   return Object.freeze(value);
 }
 
@@ -188,6 +189,10 @@ export function compileInteractionContract({
     explicitBoundaries: frame.explicitBoundaries,
     mustAddress: deriveMustAddress(frame, scene),
     forbiddenMoves: deriveForbiddenMoves(frame),
+    advisories: {
+      responseRisks: frame.responseRisks,
+      persistence: 'none'
+    },
     recentCorrection: frame.recentCorrection,
     evidenceMessageIds: collectEvidence(frame)
   });
