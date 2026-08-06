@@ -157,7 +157,7 @@ assert.match(html, /async function reconcileNativeExecutionTurns[\s\S]{0,2500}pl
 assert.match(retryPolicy, /SocketException[\s\S]*NETWORK_INTERRUPTED[\s\S]*true/, 'native execution must retain retryable connection interruptions');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_CHAT/, 'native proactive chat results must be applied to chat UI');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_MOMENT/, 'native proactive moment results must be applied to moments UI');
-assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,1200}ROLE_PLAN_CHAT/, 'native role-plan results must be applied through the durable UI inbox');
+assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,1800}ROLE_PLAN_CHAT/, 'native role-plan results must be applied through the durable UI inbox');
 const foregroundSyncSource = html.slice(
   html.indexOf('async function syncFromServiceWorkerState('),
   html.indexOf('async function bootApp()')
@@ -181,7 +181,7 @@ assert.match(rolePlanDomain, /occurrenceId[\s\S]{0,500}type:\s*'role-plan'/, 'ro
 assert.match(script, /rolePlanSnapshotId\(charId, plan\.planId\)/, 'Android must receive a stable per-plan execution snapshot');
 assert.match(script, /role-plan-contract/, 'chat prompt must describe the hidden role plan contract');
 assert.match(script, /const rolePlanDirective = extractRolePlanDirective\(reply\)[\s\S]{0,1800}applyRolePlanOperations\(/, 'foreground replies must apply their hidden plans after reply persistence');
-assert.match(script, /parts\.filter\(part => part\.type === 'PLAN'\)/, 'native reply plan parts must be reconciled into the schedule');
+assert.match(script, /parts\.filter\(part => part\.type === 'PLAN' \|\| part\.type === 'SCHEDULE'\)/, 'native reply plan and schedule parts must be reconciled into the schedule');
 assert.match(html, /id="screen-role-plans"/, 'character settings must expose a dedicated schedule screen');
 assert.match(html, /onclick="openRolePlans\(/, 'character profile and chat settings should open the schedule');
 assert.match(script, /async function renderRolePlansScreen\(/, 'the schedule screen must render persisted plans');
@@ -989,6 +989,9 @@ globalThis.__appTest = {
   proactiveDicePlan,
   proactiveJobUsesCurrentDicePolicy,
   nativeProactiveSnapshotIds,
+  withCognitionV3Snapshot,
+  withLocalFallbackExecution,
+  getYuqiVisibilityCursor,
   chatHasPendingDirectReply,
   extractRolePlanDirective,
   stripRolePlanDirective,
@@ -1002,6 +1005,53 @@ globalThis.__appTest = {
   mirrorAppState,
   RP_PRESETS,
 };`, context);
+
+assert.equal(vm.runInContext('typeof withCognitionV3Snapshot', context), 'function', 'Task15 must expose the bounded cognition-v3 semantic snapshot');
+assert.equal(vm.runInContext('typeof withLocalFallbackExecution', context), 'function', 'Task15 must expose the separate local fallback carrier');
+const task15SnapshotProbe = vm.runInContext(`(() => {
+  const source = {
+    contract: 'cognition-v3', schemaVersion: 3, roleId: 'yuqi',
+    hardConstraints: [{ id: 'h1' }, { id: 'h2' }, { id: 'h3' }, { id: 'h4' }, { id: 'h5' }, { id: 'h6' }],
+    preferences: [{ id: 'p1' }, { id: 'p2' }, { id: 'p3' }, { id: 'p4' }, { id: 'p5' }],
+    currentStances: [{ id: 's1' }, { id: 's2' }, { id: 's3' }],
+    relationship: { stage: 'close', private: 'must-not-leak' },
+    recentGroups: [
+      { messageIds: ['incomplete'], content: 'missing-complete-must-drop', fallbackExecution: { secret: 'must-drop' } },
+      { messageIds: ['explicit-incomplete'], complete: false, content: 'must-drop' },
+      ...Array.from({ length: 22 }, (_, index) => ({
+        messageIds: ['group-' + index + '-1', 'group-' + index + '-2', 'group-' + index + '-3'],
+        complete: true, content: 'g' + index,
+        groupId: 'group-' + index,
+        messages: [{ role: 'user', content: 'bubble-' + index, secret: 'must-drop' }],
+        fallbackExecution: { token: 'must-drop' }
+      }))
+    ],
+    verifiedFacts: [{ id: 'f1' }], lifeSignals: { sleep: 'awake' }, authorSettings: { tone: 'warm' },
+    responseRisks: ['secret'],
+  };
+  const semantic = withCognitionV3Snapshot(source);
+  const local = withLocalFallbackExecution(semantic, {
+    cognition: { configId: 'memory-v1', system: 'memory system', endpoint: 'https://secret', messages: [{ role: 'user', content: 'memory input', apiKey: 'secret' }], extra: 'secret' },
+    expression: { configId: 'chat-v1', system: 'chat system', endpoint: 'https://secret', messages: [{ role: 'user', content: 'chat input', apiKey: 'secret' }], extra: 'secret' },
+  }, 'device-1');
+  return { semantic, local };
+})()`, context);
+assert.equal(task15SnapshotProbe.semantic.contract, 'cognition-v3');
+assert.equal(task15SnapshotProbe.semantic.hardConstraints.length, 5);
+assert.equal(task15SnapshotProbe.semantic.preferences.length, 4);
+assert.equal(task15SnapshotProbe.semantic.currentStances.length, 2);
+assert.equal(task15SnapshotProbe.semantic.recentGroups.length, 20);
+assert.deepEqual(JSON.parse(JSON.stringify(task15SnapshotProbe.semantic.recentGroups[0].messageIds)), ['group-2-1', 'group-2-2', 'group-2-3']);
+assert.deepEqual(JSON.parse(JSON.stringify(task15SnapshotProbe.semantic.recentGroups.at(-1).messageIds)), ['group-21-1', 'group-21-2', 'group-21-3']);
+assert.equal(task15SnapshotProbe.semantic.recentGroups.some(group => group.messageIds.includes('incomplete')), false);
+assert.equal(task15SnapshotProbe.semantic.recentGroups.some(group => group.content || group.fallbackExecution), false, 'recent group projection must drop unknown/reserved fields');
+assert.equal(task15SnapshotProbe.semantic.recentGroups.every(group => group.complete === true), true, 'recent groups must require complete=true');
+assert.equal(task15SnapshotProbe.semantic.recentGroups.every(group => group.messages?.every(message => !('secret' in message))), true, 'nested message projection must be closed');
+assert.equal('responseRisks' in task15SnapshotProbe.semantic, false);
+assert.equal('fallbackExecution' in task15SnapshotProbe.semantic, false);
+assert.deepEqual(Object.keys(task15SnapshotProbe.local.fallbackExecution).sort(), ['cognition', 'contract', 'deviceId', 'expression']);
+assert.equal(task15SnapshotProbe.local.fallbackExecution.contract, 'cognition-v3-fallback-v1');
+assert.equal(task15SnapshotProbe.local.fallbackExecution.deviceId, 'device-1');
 
 const { parseCharacterCard, buildCharPrompt, formatMsg, textFromContent, extractResponseText, streamDeltaText, mergeStreamText, cleanStreamingDraftText, cleanAssistantChatReply, previewText, messagePreview, normalizeChar, normalizePresetKey, resetImportedDeviceBinding, clearImportedCloudJobs, normalizeMemoryProcessedCursor, memoryRelevantMessages, mergeLocalPendingReplies, nativeStateHasMissingChatContent, expireStalePendingReply, fetchModels, selectFetchedModel, recentMessages, localEmbedding, createEmbedding, cosine, cleanApiKey, getTimeContext, getDayPeriod, formatElapsed, normalizeProactiveTriggerMode, proactiveConversationState, chatHasUnansweredProactive, expectedProactiveChatMode, proactiveJobMatchesConversationStage, proactiveHistoryMode, buildProactiveTimeContext, buildProactiveTriggerMessage, proactiveRecentMessages, nativeProactiveChatMessages, buildProactiveMemoryQuery, stripLeakedPromptMetadata, normalizePaymentDirectiveStatus, extractPaymentStatusDirective, stripPaymentStatusDirective, inferPaymentStatusFromReply, updatePaymentStatusFromReply, splitAssistantOutput, extractMomentPostText, withOptionalTemperature, nativeReplyTextParts, appendAssistantMessages, drainNativeUiInbox, nativePendingStateIsCurrent, nativePendingReplyNeedsSubmission, nativePendingReplyText, stopNativeReplyPollingIfIdle, createPromptComposer, chatSceneFromOptions, buildChatSceneSystem, buildMomentInteractionPayload, buildMomentPostPayload, buildMomentReplyPayload, momentSeenNames, renderMomentComment, markMomentCommentSeen, markMomentNotifiedToChar, renderVoiceCard, voiceApiConfig, extractTranscriptionText, buildMemoryQueryPayload, buildMemoryExtractPayload, messageLine, resolveMemoryEventTime, memorySummaryHasRelativeTime, generateMemoryQuery, testMemoryQueryPreset, memoryAliasText, memorySignalTerms, scoreKeywordMemoryText, searchKeywordMemoryRows, composeMemoryPackSections, memoryStatusWithBudget, recordModelCall, getModelCallLogs, getAllModelCallLogs, formatModelCallStatus, formatModelCallDiagnostic, renderDiagnosticsScreen, clearModelCallLogs, shouldKeepEvent, memoryTextIsNoise, memoryTextSimilarity, findMemoryMergeCandidate, mergeMemoryItems, proactiveJobId, proactiveDefaultScheduleOptions, proactiveDicePlan, proactiveJobUsesCurrentDicePolicy, nativeProactiveSnapshotIds, chatHasPendingDirectReply, extractRolePlanDirective, stripRolePlanDirective, buildAndroidUserReplyTask, retryFailedReply, extractAssistantPaymentDirective, stripAssistantPaymentDirective, claimIncomingPayment, refuseIncomingPayment, refreshPaymentExpirations, mirrorAppState, RP_PRESETS } = context.__appTest;
 
@@ -1319,6 +1369,60 @@ assert.equal(durableTask.userText, '刚忙完');
 assert.equal(durableTask.status, 'pending');
 assert.equal(durableTask.createdAt, 1234);
 assert.equal(durableTask.options.paymentMessageId, 'pay-a');
+const fullCursor = {
+  nativeCompletedTurnId: 'native-done',
+  nativeCompletedGroupId: 'group-done',
+  nativeCompletedSequence: 7,
+  uiAppliedTurnId: 'ui-done',
+  uiAppliedGroupId: 'ui-group',
+  uiAppliedSequence: 6,
+  localSequence: 9,
+  clearedThroughSequence: 4,
+  clearEpoch: 2,
+  clearedAt: 1230,
+  chatOpen: true,
+  updatedAt: 1234
+};
+const cursorTask = buildAndroidUserReplyTask('char-a', 'message-cursor', '带游标', { visibilityCursor: fullCursor }, 2346);
+assert.deepEqual(JSON.parse(JSON.stringify(cursorTask.options.visibilityCursor)), fullCursor, 'native task must persist the complete Android visibility cursor closed set');
+const unknownCursorTask = buildAndroidUserReplyTask('char-a', 'message-unknown-cursor', '未知游标', {}, 2347);
+assert.deepEqual(JSON.parse(JSON.stringify(unknownCursorTask.options.visibilityCursor)), {
+  nativeCompletedTurnId: null, nativeCompletedGroupId: null, nativeCompletedSequence: 0,
+  uiAppliedTurnId: null, uiAppliedGroupId: null, uiAppliedSequence: 0,
+  localSequence: 0, clearedThroughSequence: 0, clearEpoch: 0, clearedAt: 0,
+  chatOpen: false, updatedAt: 0
+}, 'missing native cursor must retain an explicit null/zero closed shape');
+const cursorCallLog = [];
+const savedWindow = context.window;
+context.window = context;
+context.setInterval = () => 0;
+context.clearInterval = () => {};
+context.addEventListener = () => {};
+const savedCapacitor = context.window.Capacitor;
+context.window.Capacitor = {
+  isNativePlatform: () => true,
+  Plugins: {
+    AlExecution: {
+      getConversationCursor: async request => {
+        cursorCallLog.push(request.characterId);
+        return { cursor: fullCursor };
+      }
+    }
+  }
+};
+const pluginCursor = await context.__appTest.getYuqiVisibilityCursor('char-a');
+context.window.Capacitor = savedCapacitor;
+context.window = savedWindow;
+assert.deepEqual(JSON.parse(JSON.stringify(pluginCursor)), fullCursor, 'plugin cursor must normalize and preserve the complete native cursor contract');
+assert.deepEqual(cursorCallLog, ['char-a']);
+const cursorTypeProbe = vm.runInContext(`(() => {
+  try { return normalizeYuqiVisibilityCursor({ localSequence: '12' }); } catch (error) { return { error: error.message }; }
+})()`, context);
+assert.match(cursorTypeProbe.error || '', /invalid visibility cursor localSequence/, 'string cursor numbers must be rejected');
+const cursorIdProbe = vm.runInContext(`(() => {
+  try { return normalizeYuqiVisibilityCursor({ uiAppliedTurnId: 12 }); } catch (error) { return { error: error.message }; }
+})()`, context);
+assert.match(cursorIdProbe.error || '', /invalid visibility cursor uiAppliedTurnId/, 'numeric cursor IDs must be rejected');
 const batchedDurableTask = buildAndroidUserReplyTask('char-a', 'message-c', '第一段\n第二段', {
   batchId: 'batch-a',
   batchMessageIds: ['message-b', 'message-c']
@@ -1873,6 +1977,71 @@ await drainNativeUiInbox(
   () => false
 );
 assert.deepEqual(notLandedCalls, ['apply:not-landed'], 'DOM 未实际落地时不得提前记录 uiAppliedAt');
+const multiBubbleLanded = new Set();
+let multiBubbleLimit = 1;
+let multiBubbleAckCount = 0;
+const multiBubbleResult = {
+  turnId: 'multi-bubble-turn',
+  completedAt: 30500,
+  replyParts: [
+    { replyPartId: 'bubble-1', sequence: 0, type: 'TEXT', content: '一' },
+    { replyPartId: 'bubble-2', sequence: 1, type: 'TEXT', content: '二' },
+    { replyPartId: 'bubble-3', sequence: 2, type: 'TEXT', content: '三' }
+  ]
+};
+const multiBubblePlugin = {
+  unappliedCompletedTurns: async () => ({ turns: [multiBubbleResult] }),
+  acknowledgeUiApplied: async () => { multiBubbleAckCount += 1; }
+};
+const applyMultiBubble = async result => {
+  result.replyParts.slice(0, multiBubbleLimit).forEach(part => multiBubbleLanded.add(part.replyPartId));
+  return true;
+};
+const hasAllMultiBubbles = result => result.replyParts.every(part => multiBubbleLanded.has(part.replyPartId));
+await drainNativeUiInbox(multiBubblePlugin, applyMultiBubble, hasAllMultiBubbles);
+assert.equal(multiBubbleAckCount, 0, '一组三泡只落一泡时不得ACK');
+multiBubbleLimit = 2;
+await drainNativeUiInbox(multiBubblePlugin, applyMultiBubble, hasAllMultiBubbles);
+assert.equal(multiBubbleAckCount, 0, '一组三泡只落两泡时不得ACK');
+multiBubbleLimit = 3;
+await drainNativeUiInbox(multiBubblePlugin, applyMultiBubble, hasAllMultiBubbles);
+assert.equal(multiBubbleAckCount, 1, '一组三泡全部落地后只能ACK一次');
+await drainNativeUiInbox(multiBubblePlugin, applyMultiBubble, hasAllMultiBubbles);
+assert.equal(multiBubbleAckCount, 1, '完整组重复event/poll不得产生第二次ACK');
+let skipApplyCount = 0;
+let skipAckCount = 0;
+const skipPlugin = {
+  unappliedCompletedTurns: async () => ({ turns: [{
+    turnId: 'skip-turn', completedAt: 30600, terminalDisposition: 'skip', replyParts: [], actions: []
+  }] }),
+  acknowledgeUiApplied: async () => { skipAckCount += 1; }
+};
+await drainNativeUiInbox(
+  skipPlugin,
+  async () => { skipApplyCount += 1; return true; },
+  result => result.terminalDisposition === 'skip' && result.replyParts.length === 0 && result.actions.length === 0
+);
+assert.equal(skipApplyCount, 1, 'skip只允许一次无DOM语义落地流程');
+assert.equal(skipAckCount, 1, 'skip零part/零action仍需一次ACK');
+let redactedAckCount = 0;
+const redactedChatId = vm.runInContext('Object.keys(allChats)[0]', context);
+const redactedChat = vm.runInContext('allChats[Object.keys(allChats)[0]]', context);
+redactedChat.pendingReply = { nativeTurnId: 'redacted-turn', userMessageId: 'redacted-user' };
+const redactedPlugin = {
+  unappliedCompletedTurns: async () => ({ turns: [{
+    turnId: 'redacted-turn', characterId: redactedChatId, completedAt: 30700, terminalDisposition: 'redacted', redacted: true, replyParts: [], actions: []
+  }] }),
+  acknowledgeUiApplied: async () => { redactedAckCount += 1; }
+};
+const nativeApply = vm.runInContext('applyNativeExecutionTurn', context);
+const redactedChanged = await drainNativeUiInbox(redactedPlugin, nativeApply, () => false);
+assert.equal(redactedChanged, true, 'redacted真实清理必须向reconcile返回changed=true以刷新spinner');
+assert.equal(redactedAckCount, 0, 'redacted结果不得渲染或产生UI ACK');
+assert.equal(redactedChat.pendingReply, undefined, 'redacted必须清理真实pending状态');
+const redactedIdempotentResult = await vm.runInContext(`applyNativeExecutionTurn({
+  turnId: 'redacted-turn-2', characterId: ${JSON.stringify(redactedChatId)}, state: 'COMPLETED', terminalDisposition: 'redacted', redacted: true, replyParts: [], actions: []
+})`, context);
+assert.equal(redactedIdempotentResult, false, '无pending的redacted重放必须幂等返回false');
 const reloadCalls = [];
 const reloadChanged = await context.__appTest.replayRecentNativeCompletedTurns(
   {
@@ -1885,9 +2054,10 @@ assert.equal(reloadChanged, true);
 assert.deepEqual(reloadCalls, ['apply:reload-turn'], 'WebView 重载后必须从原生完成记录恢复未渲染消息');
 const concurrentLandings = new Set();
 let concurrentApplyCount = 0;
+let concurrentAckCount = 0;
 const concurrentPlugin = {
   unappliedCompletedTurns: async () => ({ turns: [{ turnId: 'concurrent-turn', completedAt: 32000 }] }),
-  acknowledgeUiApplied: async () => {}
+  acknowledgeUiApplied: async () => { concurrentAckCount += 1; }
 };
 const concurrentApply = result => context.__appTest.withNativeTurnApplyLock(result.turnId, async () => {
   if (concurrentLandings.has(result.turnId)) return false;
@@ -1902,6 +2072,7 @@ await Promise.all([
 ]);
 await drainNativeUiInbox(concurrentPlugin, concurrentApply, result => concurrentLandings.has(result.turnId));
 assert.equal(concurrentApplyCount, 1, '事件、轮询和重复投递同时到达也只能渲染一次');
+assert.equal(concurrentAckCount, 1, '事件、轮询并发下同一turn只能推进一次uiApplied ACK');
 const hangingApply = context.__appTest.withNativeTurnApplyLock(
   'hung-turn',
   () => new Promise(() => {}),

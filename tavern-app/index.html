@@ -1604,6 +1604,7 @@ let nativeExecutionCompletedListenerReady = false;
 let lastNativeCompletedRecoveryAt = 0;
 const nativeReplyQueuedIds = new Set();
 const nativeTurnApplyPromises = new Map();
+const nativeUiAcknowledgedTurnIds = new Set();
 const CHAT_RENDER_WINDOW_SIZE = 120;
 const CHAT_RENDER_PAGE_SIZE = 120;
 const chatRenderLimits = new Map();
@@ -1934,10 +1935,15 @@ async function applyRolePlanOperations(charId, operations, evidenceMessageIds = 
 }
 async function applyNativePlanParts(charId, parts, sourceTurnId) {
   parts = Array.isArray(parts) ? parts : [];
-  for (const part of parts.filter(part => part.type === 'PLAN')) {
+  let applied = false;
+  let lastResult = null;
+  for (const part of parts.filter(part => part.type === 'PLAN' || part.type === 'SCHEDULE')) {
     const payload = nativePartPayload(part);
-    await applyRolePlanOperations(charId, payload.operations, [sourceTurnId]);
+    lastResult = await applyRolePlanOperations(charId, payload.operations, [sourceTurnId]);
+    if (Array.isArray(lastResult?.rejected) && lastResult.rejected.length > 0) return { applied: false, result: lastResult };
+    if (Array.isArray(payload.operations) && payload.operations.length > 0) applied = true;
   }
+  return { applied, result: lastResult };
 }
 
 function rolePlanTypeLabel(type) {
@@ -2499,7 +2505,10 @@ function buildAndroidUserReplyTask(charId, userMessageId, userText, options = {}
         : [],
       batchStartedAt: Math.max(1, Number(options.batchStartedAt) || Number(createdAt) || Date.now()),
       batchCommittedAt: Math.max(1, Number(options.batchCommittedAt) || Number(createdAt) || Date.now()),
-      attachments: Array.isArray(options.attachments) ? options.attachments.map(item => ({ ...item })) : []
+      attachments: Array.isArray(options.attachments) ? options.attachments.map(item => ({ ...item })) : [],
+      visibilityCursor: options.visibilityCursor && typeof options.visibilityCursor === 'object'
+        ? normalizeYuqiVisibilityCursor(options.visibilityCursor)
+        : unknownYuqiVisibilityCursor()
     },
     status: 'pending',
     createdAt
@@ -2818,6 +2827,230 @@ function nativeDirectorMemorySystem(char, scene) {
 {"memoryPack":"本轮相关记忆或无相关记忆","director":{"schemaVersion":1,"scene":"${scene}","timeGap":"instant|short|hours|overnight|days","silenceCause":"not_applicable|natural_pause|temporary_absence|conflict|explicit_distance|repeated_unexplained|uncertain","previousContactPressure":"none|low|medium|high","relationshipStageId":"new|acquainted|familiar|close|committed","playerIntent":"简短判断","playerIntentConfidence":0,"currentMood":"","moodCause":"","stanceTowardPlayer":"","ownLifeFocus":"","noticedPoint":"","replyImpulse":"answer|share|tease|refuse|check_in|repair|pause|skip","contactPressure":"low|medium|high","openingNeeded":false,"recommendedDirection":"","avoid":[],"evidenceMessageIds":[],"confidence":0}}
 director 不是台词提纲，不得写${charName(char)}要直接发送的句子。`;
 }
+function nativeSnapshotClone(value, fallback = null) {
+  if (value === undefined || value === null) return fallback;
+  try { return JSON.parse(JSON.stringify(value)); } catch { return fallback; }
+}
+function nativeSnapshotList(value, limit) {
+  return (Array.isArray(value) ? value : []).slice(0, limit).map(item => nativeSnapshotClone(item, item));
+}
+function nativeSnapshotObject(value, fallback = {}) {
+  const cloned = nativeSnapshotClone(value, fallback);
+  return cloned && typeof cloned === 'object' && !Array.isArray(cloned) ? cloned : fallback;
+}
+function nativeCompactScalar(value, maxLength = 2000) {
+  if (typeof value === 'string') return value.slice(0, maxLength);
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number' && Number.isFinite(value) && Number.isSafeInteger(value)) return value;
+  return undefined;
+}
+function nativeCompactStringList(value, limit = 20) {
+  if (!Array.isArray(value)) return undefined;
+  const output = value.slice(0, limit).map(item => typeof item === 'string' ? item.slice(0, 256) : null);
+  return output.every(item => item !== null) ? output : undefined;
+}
+function nativeCompactRelationship(value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const output = {};
+  for (const key of ['id', 'label', 'content', 'reason']) {
+    const compact = nativeCompactScalar(source[key]);
+    if (compact !== undefined) output[key] = compact;
+  }
+  for (const key of ['since', 'changedAt']) {
+    const compact = nativeCompactScalar(source[key]);
+    if (compact !== undefined) output[key] = compact;
+  }
+  for (const key of ['confidence']) {
+    if (typeof source[key] === 'number' && Number.isFinite(source[key])) output[key] = Math.max(0, Math.min(1, source[key]));
+  }
+  const evidence = nativeCompactStringList(source.evidenceMessageIds, 20);
+  if (evidence) output.evidenceMessageIds = evidence;
+  for (const nestedName of ['base', 'phase']) {
+    if (!source[nestedName] || typeof source[nestedName] !== 'object' || Array.isArray(source[nestedName])) continue;
+    const nested = nativeCompactRelationship(source[nestedName]);
+    if (Object.keys(nested).length) output[nestedName] = nested;
+  }
+  for (const key of ['from', 'to']) {
+    const compact = nativeCompactScalar(source[key], 256);
+    if (compact !== undefined) output[key] = compact;
+  }
+  return output;
+}
+function nativeCompactLifeSignals(value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const output = {};
+  for (const key of [
+    'mood', 'moodCause', 'currentFocus', 'ownLifeFocus', 'nextEvent', 'timeGap',
+    'silenceCause', 'previousContactPressure', 'contactPressure', 'sleepState', 'replyImpulse',
+    'recommendedDirection'
+  ]) {
+    const compact = nativeCompactScalar(source[key]);
+    if (compact !== undefined) output[key] = compact;
+  }
+  for (const key of ['energy', 'confidence']) {
+    if (typeof source[key] === 'number' && Number.isFinite(source[key])) output[key] = Math.max(0, Math.min(1, source[key]));
+  }
+  for (const key of ['openingNeeded']) if (typeof source[key] === 'boolean') output[key] = source[key];
+  for (const key of ['updatedAt']) {
+    const compact = nativeCompactScalar(source[key]);
+    if (compact !== undefined) output[key] = compact;
+  }
+  for (const key of ['avoid', 'evidenceMessageIds']) {
+    const compact = nativeCompactStringList(source[key], 20);
+    if (compact) output[key] = compact;
+  }
+  if (source.schedule && typeof source.schedule === 'object' && !Array.isArray(source.schedule)) {
+    const schedule = {};
+    for (const key of ['next', 'dueAt', 'timezone']) {
+      const compact = nativeCompactScalar(source.schedule[key], 256);
+      if (compact !== undefined) schedule[key] = compact;
+    }
+    if (Object.keys(schedule).length) output.schedule = schedule;
+  }
+  return output;
+}
+function nativeCompactAuthorSettings(value = {}) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const output = {};
+  for (const key of ['displayName', 'pronouns', 'tone', 'language', 'timezone', 'responseStyle', 'notificationPreference']) {
+    const compact = nativeCompactScalar(source[key], 256);
+    if (compact !== undefined) output[key] = compact;
+  }
+  if (source.quietHours && typeof source.quietHours === 'object' && !Array.isArray(source.quietHours)) {
+    const quietHours = {};
+    for (const key of ['start', 'end']) {
+      const compact = nativeCompactScalar(source.quietHours[key], 64);
+      if (compact !== undefined) quietHours[key] = compact;
+    }
+    if (Object.keys(quietHours).length) output.quietHours = quietHours;
+  }
+  if (source.accessibility && typeof source.accessibility === 'object' && !Array.isArray(source.accessibility)) {
+    const accessibility = {};
+    for (const key of ['reducedMotion', 'largeText']) if (typeof source.accessibility[key] === 'boolean') accessibility[key] = source.accessibility[key];
+    if (Object.keys(accessibility).length) output.accessibility = accessibility;
+  }
+  return output;
+}
+function nativeSemanticRecentGroups(snapshot) {
+  const source = Array.isArray(snapshot.recentGroups)
+    ? snapshot.recentGroups
+    : (Array.isArray(snapshot.scene?.recentGroups) ? snapshot.scene.recentGroups : []);
+  return source.filter(group => group && group.complete === true && Array.isArray(group.messageIds))
+    .slice(-20)
+    .map(group => {
+      const messageIds = group.messageIds.filter(value => typeof value === 'string' && value.length > 0);
+      if (messageIds.length !== group.messageIds.length) return null;
+      const compact = { complete: true, messageIds };
+      for (const key of ['groupId', 'batchId', 'sourceMessageId']) {
+        if (typeof group[key] === 'string' && group[key].length > 0) compact[key] = group[key];
+      }
+      for (const key of ['inputVisibilitySequence', 'inputClearEpoch']) {
+        if (group[key] === undefined) continue;
+        if (typeof group[key] !== 'number' || !Number.isSafeInteger(group[key]) || group[key] < 0) return null;
+        compact[key] = group[key];
+      }
+      if (Array.isArray(group.messages)) {
+        const messages = group.messages.map(message => {
+          if (!message || typeof message !== 'object' || Array.isArray(message)
+            || typeof message.role !== 'string' || typeof message.content !== 'string') return null;
+          return { role: message.role, content: message.content };
+        }).filter(Boolean);
+        compact.messages = messages;
+      }
+      return compact;
+    }).filter(Boolean);
+}
+function withCognitionV3Snapshot(snapshot = {}) {
+  const scene = nativeSnapshotObject(snapshot.scene, {});
+  return {
+    contract: 'cognition-v3',
+    schemaVersion: 3,
+    roleId: String(snapshot.roleId || snapshot.characterId || 'yuqi'),
+    hardConstraints: nativeSnapshotList(snapshot.hardConstraints || scene.hardConstraints, 5),
+    preferences: nativeSnapshotList(snapshot.preferences || scene.preferences, 4),
+    currentStances: nativeSnapshotList(snapshot.currentStances || scene.currentStances, 2),
+    relationship: nativeCompactRelationship(snapshot.relationship || scene.relationshipStage),
+    recentGroups: nativeSemanticRecentGroups(snapshot),
+    verifiedFacts: nativeSnapshotList(snapshot.verifiedFacts || scene.verifiedFacts, 8),
+    lifeSignals: nativeCompactLifeSignals(snapshot.lifeSignals || scene.lifeSignals),
+    authorSettings: nativeCompactAuthorSettings(snapshot.authorSettings || scene.authorSettings)
+  };
+}
+function withLocalFallbackExecution(semanticSnapshot, localModelInputs = {}, deviceId = '') {
+  const semantic = withCognitionV3Snapshot(semanticSnapshot || {});
+  const normalizeModel = (value, fallbackConfigId) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid cognition-v3 fallback model');
+    if (typeof value.configId !== 'string' || value.configId.trim().length === 0
+      || typeof value.system !== 'string' || !Array.isArray(value.messages) || value.messages.length > 200) {
+      throw new Error('invalid cognition-v3 fallback model');
+    }
+    const messages = value.messages.map(message => {
+      if (!message || typeof message !== 'object' || Array.isArray(message)
+        || typeof message.role !== 'string' || typeof message.content !== 'string'
+        || message.role.length > 128 || message.content.length > 100000) {
+        throw new Error('invalid cognition-v3 fallback message');
+      }
+      return { role: message.role, content: message.content };
+    });
+    return { configId: value.configId, system: value.system, messages };
+  };
+  const fallbackExecution = {
+    contract: 'cognition-v3-fallback-v1',
+    deviceId: String(deviceId || ensureDeviceId()),
+    cognition: normalizeModel(localModelInputs.cognition || { configId: 'memory-v1', system: '', messages: [] }, 'memory-v1'),
+    expression: normalizeModel(localModelInputs.expression || { configId: 'chat-v1', system: '', messages: [] }, 'chat-v1')
+  };
+  const fallbackKeys = Object.keys(fallbackExecution).sort();
+  if (fallbackKeys.join('|') !== 'cognition|contract|deviceId|expression') throw new Error('invalid cognition-v3 fallback carrier');
+  return { ...semantic, fallbackExecution };
+}
+function unknownYuqiVisibilityCursor() {
+  return {
+    nativeCompletedTurnId: null,
+    nativeCompletedGroupId: null,
+    nativeCompletedSequence: 0,
+    uiAppliedTurnId: null,
+    uiAppliedGroupId: null,
+    uiAppliedSequence: 0,
+    localSequence: 0,
+    clearedThroughSequence: 0,
+    clearEpoch: 0,
+    clearedAt: 0,
+    chatOpen: false,
+    updatedAt: 0
+  };
+}
+function normalizeYuqiVisibilityCursor(raw = {}) {
+  const source = raw?.cursor && typeof raw.cursor === 'object' ? raw.cursor : raw;
+  const result = unknownYuqiVisibilityCursor();
+  for (const key of [
+    'nativeCompletedSequence', 'uiAppliedSequence', 'localSequence',
+    'clearedThroughSequence', 'clearEpoch', 'clearedAt', 'updatedAt'
+  ]) {
+    if (source?.[key] === undefined || source?.[key] === null) continue;
+    const value = source?.[key];
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new Error(`invalid visibility cursor ${key}`);
+    result[key] = value;
+  }
+  for (const key of ['nativeCompletedTurnId', 'nativeCompletedGroupId', 'uiAppliedTurnId', 'uiAppliedGroupId']) {
+    const value = source?.[key];
+    if (value !== null && value !== undefined && (typeof value !== 'string' || value.length === 0)) throw new Error(`invalid visibility cursor ${key}`);
+    result[key] = value === null || value === undefined ? null : value;
+  }
+  if (source?.chatOpen !== undefined && typeof source.chatOpen !== 'boolean') throw new Error('invalid visibility cursor chatOpen');
+  if (typeof source?.chatOpen === 'boolean') result.chatOpen = source.chatOpen;
+  return result;
+}
+async function getYuqiVisibilityCursor(charId) {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.getConversationCursor) return unknownYuqiVisibilityCursor();
+  try {
+    const raw = await nativeBridgeCall(plugin.getConversationCursor({ characterId: charId }), 'getConversationCursor', 3000);
+    return normalizeYuqiVisibilityCursor(raw);
+  } catch {
+    return unknownYuqiVisibilityCursor();
+  }
+}
 function withCognitionV2Snapshot(snapshot) {
   return {
     ...snapshot,
@@ -2855,10 +3088,14 @@ async function buildNativeExecutionSnapshot(charId, task) {
   });
   const now = new Date();
   const nativeScene = task.options?.payment ? 'payment' : 'chat';
-  return withCognitionV2Snapshot({
+  const semanticSnapshot = withCognitionV3Snapshot({
     scene: buildYuqiDynamicScene(char, chat),
+    roleId: char.id,
     characterName: charName(char),
     playerName: playerName(),
+    recentGroups: task.options?.batchMessages?.length
+      ? [{ batchId: task.options.batchId || '', complete: true, messageIds: task.options.batchMessages.map(message => String(message.messageId || '')) }]
+      : [],
     memoryConfigId: 'memory-v1',
     chatConfigId: 'chat-v1',
     memorySystem: nativeDirectorMemorySystem(char, nativeScene),
@@ -2870,6 +3107,14 @@ async function buildNativeExecutionSnapshot(charId, task) {
     chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
     createdAt: now.toISOString()
   });
+  return withLocalFallbackExecution(semanticSnapshot, {
+    cognition: {
+      configId: 'memory-v1',
+      system: nativeDirectorMemorySystem(char, nativeScene),
+      messages: [{ role: 'user', content: `双方昵称：${playerName()} / ${charName(char)}\n玩家本次消息：${task.userText}\n\n固定最近200条原文：\n${memoryRecent.map((row, index) => `${index + 1}. ${row.role}: ${row.content}`).join('\n')}\n\n候选本地记忆：\n${candidates}` }]
+    },
+    expression: { configId: 'chat-v1', system: prompt.system, messages: chatRecent }
+  }, ensureDeviceId());
 }
 
 function nativeProactiveSnapshotIds(charId, kind = 'chat', job = null) {
@@ -2911,7 +3156,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     chatMessages = nativeProactiveChatMessages(char, chat, now, triggerMode);
     memoryQuery = buildProactiveMemoryQuery(chat, now, triggerMode);
   }
-  const snapshot = withCognitionV2Snapshot({
+  const legacySnapshot = withCognitionV2Snapshot({
     scene: buildYuqiDynamicScene(char, chat),
     characterName: charName(char),
     playerName: playerName(),
@@ -2937,6 +3182,22 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     deviceId: settings.deviceId || '',
     createdAt: now.toISOString()
   });
+  const snapshot = withLocalFallbackExecution(withCognitionV3Snapshot({
+    scene: buildYuqiDynamicScene(char, chat),
+    roleId: char.id,
+    recentGroups: [{ batchId: String(job?.jobId || ''), complete: true, messageIds: [] }]
+  }), {
+    cognition: {
+      configId: legacySnapshot.cognitionConfigId,
+      system: legacySnapshot.cognitionSystem,
+      messages: legacySnapshot.cognitionMessages
+    },
+    expression: {
+      configId: legacySnapshot.expressionConfigId,
+      system: legacySnapshot.expressionSystem,
+      messages: legacySnapshot.expressionMessages
+    }
+  }, ensureDeviceId());
   const record = {
     characterId: charId,
     characterName: charName(char),
@@ -3165,8 +3426,207 @@ async function reconcileNativeReplyState() {
   return true;
 }
 
+function nativeActionEnvelope(part) {
+  try {
+    const parsed = JSON.parse(part?.payloadJson || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function nativeActionCanonicalJson(value) {
+  if (value === null || value === undefined) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(nativeActionCanonicalJson).join(',')}]`;
+  if (typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${nativeActionCanonicalJson(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
+}
+function nativeDerivedLegacyPayload(action) {
+  if (!action || typeof action !== 'object' || Array.isArray(action)) return null;
+  const payload = action.payload === undefined ? {} : action.payload;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  let cloned;
+  try { cloned = JSON.parse(JSON.stringify(payload)); } catch { return null; }
+  if (action.kind === 'relationship_transition') {
+    if (!Object.hasOwn(cloned, 'baseAction')) cloned.baseAction = null;
+    if (!Object.hasOwn(cloned, 'phaseAction')) cloned.phaseAction = null;
+  }
+  return String(action.kind || '').startsWith('role_plan_') ? { operations: [cloned] } : cloned;
+}
+function nativeActionLegacyProjection(envelope) {
+  const action = envelope?.canonicalAction;
+  const derived = nativeDerivedLegacyPayload(action);
+  if (derived === null) return null;
+  if (!Object.hasOwn(envelope || {}, 'legacyPayload')) return derived;
+  const provided = envelope.legacyPayload;
+  if (!provided || typeof provided !== 'object' || Array.isArray(provided)
+    || nativeActionCanonicalJson(provided) !== nativeActionCanonicalJson(derived)) return null;
+  return provided;
+}
+function nativeStructuredActionParts(result, parts = []) {
+  const actionProjection = action => action && typeof action === 'object' ? {
+    actionId: action.actionId,
+    kind: action.kind,
+    targetKey: action.targetKey,
+    targetRevision: action.targetRevision,
+    actionChecksum: action.actionChecksum,
+    payload: action.payload
+  } : null;
+  const sameAction = (left, right) => !!left && !!right
+    && nativeActionCanonicalJson(actionProjection(left)) === nativeActionCanonicalJson(actionProjection(right));
+  const sameProjection = (leftEnvelope, rightEnvelope) => {
+    const left = leftEnvelope?.canonicalAction;
+    const right = rightEnvelope?.canonicalAction;
+    return sameAction(left, right)
+      && nativeActionCanonicalJson(nativeActionLegacyProjection(leftEnvelope))
+        === nativeActionCanonicalJson(nativeActionLegacyProjection(rightEnvelope));
+  };
+  const invalidPart = { replyPartId: '', type: 'INVALID', payloadJson: '{}' };
+  const combined = [];
+  for (const part of Array.isArray(parts) ? parts : []) {
+    if (part?.type === 'TEXT') continue;
+    if (!part || typeof part !== 'object' || Array.isArray(part)) {
+      combined.push(invalidPart);
+      continue;
+    }
+    const duplicate = combined.find(existing => existing.replyPartId === part.replyPartId && part.replyPartId);
+    if (!duplicate) combined.push(part);
+    else if (!sameProjection(nativeActionEnvelope(duplicate), nativeActionEnvelope(part))) combined.push(invalidPart);
+  }
+  const seen = new Set(combined.map(part => part.replyPartId).filter(value => typeof value === 'string' && value));
+  for (const action of Array.isArray(result?.actions) ? result.actions : []) {
+    if (!action || typeof action !== 'object' || Array.isArray(action)) {
+      combined.push(invalidPart);
+      continue;
+    }
+    const actionId = action.actionId;
+    if (typeof actionId !== 'string' || !actionId) {
+      combined.push(invalidPart);
+      continue;
+    }
+    if (seen.has(actionId)) {
+      const duplicate = combined.find(part => part.replyPartId === actionId);
+      const duplicateEnvelope = nativeActionEnvelope(duplicate);
+      const descriptorEnvelope = { canonicalAction: action };
+      if (!sameProjection(duplicateEnvelope, descriptorEnvelope)) combined.push(invalidPart);
+      continue;
+    }
+    const kind = String(action.kind || '');
+    const type = kind.startsWith('payment_') ? 'PAYMENT_STATUS'
+      : kind === 'relationship_transition' ? 'RELATIONSHIP_STAGE'
+        : kind.startsWith('role_plan_') ? 'PLAN'
+          : kind === 'moment_create' ? 'MOMENT_CREATE' : 'MOMENT_ACTION';
+    const legacyPayload = nativeDerivedLegacyPayload(action);
+    if (legacyPayload === null) {
+      combined.push(invalidPart);
+      continue;
+    }
+    combined.push({
+      replyPartId: actionId,
+      type,
+      payloadJson: JSON.stringify({ version: 1, canonicalAction: action, legacyPayload })
+    });
+    seen.add(actionId);
+  }
+  return combined;
+}
+function nativeCanonicalStructuredResult(result, parts) {
+  const structured = nativeStructuredActionParts(result, parts);
+  return {
+    structured,
+    canonical: structured.length > 0
+      && (Number(result?.resultAuthorityVersion || 0) === 1
+        || Number(result?.bridgeProtocolVersion || 0) >= 3
+        || (Array.isArray(result?.actions) && result.actions.length > 0)
+        || structured.some(part => nativeActionEnvelope(part)?.canonicalAction))
+  };
+}
+function nativeCanonicalAction(part, result = {}) {
+  const envelope = nativeActionEnvelope(part);
+  const action = envelope?.canonicalAction;
+  if (!action || typeof action !== 'object' || Array.isArray(action)) return null;
+  const actionId = action.actionId;
+  const partId = part?.replyPartId;
+  const kind = action.kind;
+  const targetKey = action.targetKey;
+  const targetRevision = action.targetRevision;
+  const actionChecksum = action.actionChecksum;
+  const allowedKinds = new Set([
+    'payment_accept', 'payment_decline', 'moment_create', 'moment_like', 'moment_comment',
+    'moment_reply', 'role_plan_create', 'role_plan_update', 'role_plan_cancel',
+    'role_plan_pause', 'role_plan_resume', 'role_plan_complete', 'relationship_transition'
+  ]);
+  const expectedPartType = kind.startsWith('payment_') ? 'PAYMENT_STATUS'
+    : kind === 'relationship_transition' ? 'RELATIONSHIP_STAGE'
+      : kind.startsWith('role_plan_') ? (['PLAN', 'SCHEDULE'].includes(String(part?.type || '')) ? String(part.type) : 'PLAN')
+        : kind === 'moment_create' ? 'MOMENT_CREATE' : 'MOMENT_ACTION';
+  const checkpointChecksum = result?.bridgeAuthorityCheckpointChecksum ?? result?.commitChecksum;
+  const validTargetRevision = /^[a-f0-9]{64}$/.test(targetRevision)
+    || (/^[1-9][0-9]*$/.test(targetRevision) && Number.isSafeInteger(Number(targetRevision)));
+  if ([actionId, partId, kind, targetKey, targetRevision, actionChecksum, checkpointChecksum]
+    .some(value => typeof value !== 'string')
+    || !actionId || actionId !== partId || !allowedKinds.has(kind)
+    || String(part?.type || '') !== expectedPartType
+    || !targetKey || !actionChecksum
+    || !/^[a-f0-9]{64}$/.test(actionChecksum)
+    || !validTargetRevision
+    || !/^[a-f0-9]{64}$/.test(checkpointChecksum)
+    || Object.hasOwn(action, 'checksum')
+    || nativeDerivedLegacyPayload(action) === null
+    || nativeActionLegacyProjection(envelope) === null) {
+    return null;
+  }
+  const targetNamespace = targetKey.split(':', 1)[0];
+  const expectedNamespace = kind.startsWith('payment_') ? 'payment'
+    : kind === 'relationship_transition' ? 'relationship'
+      : kind.startsWith('role_plan_') ? (kind === 'role_plan_create' ? 'lineage_create' : 'role_plan')
+        : kind === 'moment_create' ? 'lineage_create' : kind === 'moment_reply' ? 'comment' : 'moment';
+  if (targetNamespace !== expectedNamespace) return null;
+  return {
+    action: { ...action, actionId, kind, targetKey, targetRevision, actionChecksum },
+    legacyPayload: nativeDerivedLegacyPayload(action),
+    checkpointChecksum
+  };
+}
+function nativeActionProofKey(result, part) {
+  return `${String(result?.turnId || '')}:${String(part?.replyPartId || '')}`;
+}
+function nativeActionProofMatches(chat, result, part, canonical) {
+  const proof = chat?.nativeActionProofs?.[nativeActionProofKey(result, part)];
+  return !!proof
+    && typeof result?.turnId === 'string'
+    && typeof part?.replyPartId === 'string'
+    && proof.turnId === result.turnId
+    && proof.replyPartId === part.replyPartId
+    && proof.actionId === canonical.action.actionId
+    && proof.kind === canonical.action.kind
+    && proof.actionChecksum === canonical.action.actionChecksum
+    && proof.targetKey === canonical.action.targetKey
+    && proof.targetRevision === canonical.action.targetRevision
+    && proof.checkpointChecksum === canonical.checkpointChecksum;
+}
+function nativeRecordActionProof(chat, result, part, canonical) {
+  if (!chat || !result || !part || !canonical) return false;
+  chat.nativeActionProofs = chat.nativeActionProofs && typeof chat.nativeActionProofs === 'object'
+    ? chat.nativeActionProofs : {};
+  chat.nativeActionProofs[nativeActionProofKey(result, part)] = {
+    turnId: String(result.turnId || ''),
+    replyPartId: String(part.replyPartId || ''),
+    actionId: String(canonical.action.actionId || ''),
+    kind: String(canonical.action.kind || ''),
+    actionChecksum: String(canonical.action.actionChecksum || ''),
+    targetKey: String(canonical.action.targetKey || ''),
+    targetRevision: String(canonical.action.targetRevision || ''),
+    checkpointChecksum: canonical.checkpointChecksum
+  };
+  return true;
+}
 function nativePartPayload(part) {
-  try { return JSON.parse(part?.payloadJson || '{}'); } catch { return {}; }
+  const parsed = nativeActionEnvelope(part);
+  if (parsed?.canonicalAction) return nativeDerivedLegacyPayload(parsed.canonicalAction) || {};
+  if (parsed?.legacyPayload && typeof parsed.legacyPayload === 'object') return parsed.legacyPayload;
+  return parsed || {};
 }
 function nativeReplyTextParts(result) {
   return (Array.isArray(result?.replyParts) ? result.replyParts : [])
@@ -3246,15 +3706,46 @@ function nativePendingReplyText(chat, userMessage) {
   if (pending?.userMessageId === userMessage?.id && pending.userText) return String(pending.userText);
   return String(userMessage?.content || '');
 }
+function nativeTerminalUiLanding(result, chat, sourceTurnId) {
+  const disposition = String(result?.terminalDisposition || '');
+  if (disposition === 'redacted' || result?.redacted === true || result?.deletedAt) return false;
+  if (disposition === 'skip') {
+    return !(result?.replyParts?.length || result?.actions?.length);
+  }
+  if (disposition === 'action_only') {
+    const parts = nativeStructuredActionParts(result, result?.replyParts);
+    return parts.length > 0
+      && parts.every(part => part?.type !== 'TEXT'
+        && nativeCanonicalAction(part, result)
+        && nativeActionProofMatches(chat, result, part, nativeCanonicalAction(part, result)));
+  }
+  if (disposition === 'visible' && Array.isArray(result?.replyParts)) {
+    const expected = result.replyParts.filter(part => part?.type === 'TEXT' && String(part.content || '').trim());
+    const structured = nativeStructuredActionParts(result, result.replyParts);
+    const canonicalStructured = structured.length > 0
+      && (Number(result?.resultAuthorityVersion || 0) === 1
+        || Number(result?.bridgeProtocolVersion || 0) >= 3
+        || (Array.isArray(result?.actions) && result.actions.length > 0)
+        || structured.some(part => nativeActionEnvelope(part)?.canonicalAction));
+    const actionsLanded = !canonicalStructured || structured.every(part => {
+      const canonical = nativeCanonicalAction(part, result);
+      return !!canonical && nativeActionProofMatches(chat, result, part, canonical);
+    });
+    return expected.length > 0
+      && expected.every(part => (chat.messages || []).some(message => (
+        message.sourceTurnId === sourceTurnId && message.sourceReplyPartId === part.replyPartId
+      )))
+      && actionsLanded;
+  }
+  return null;
+}
 function nativeTurnHasUiLanding(result) {
   const chat = allChats[result?.characterId];
   if (!chat) return false;
   const kind = String(result?.kind || 'DIRECT_REPLY');
   const sourceTurnId = `native:${result?.turnId || ''}`;
-  if (String(result?.terminalDisposition || '') === 'action_only') {
-    return (Array.isArray(result?.replyParts) ? result.replyParts : [])
-      .some(part => part && part.type !== 'TEXT' && String(part.replyPartId || '').trim());
-  }
+  const terminalLanding = nativeTerminalUiLanding(result, chat, sourceTurnId);
+  if (terminalLanding !== null) return terminalLanding;
   if (['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind)) {
     return (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
   }
@@ -3277,6 +3768,21 @@ function withNativePromiseTimeout(promise, label, timeoutMs) {
 function nativeBridgeCall(promise, label, timeoutMs = NATIVE_BRIDGE_TIMEOUT_MS) {
   return withNativePromiseTimeout(promise, label, timeoutMs);
 }
+async function acknowledgeNativeUiAppliedOnce(plugin, result) {
+  const turnId = String(result?.turnId || '');
+  if (!turnId || nativeUiAcknowledgedTurnIds.has(turnId)) return false;
+  try {
+    await nativeBridgeCall(
+      plugin.acknowledgeUiApplied({ turnId }),
+      'acknowledgeUiApplied'
+    );
+    nativeUiAcknowledgedTurnIds.add(turnId);
+    return true;
+  } catch (error) {
+    nativeUiAcknowledgedTurnIds.delete(turnId);
+    throw error;
+  }
+}
 async function drainNativeUiInbox(
   plugin,
   applyTurn = applyNativeExecutionTurn,
@@ -3295,10 +3801,7 @@ async function drainNativeUiInbox(
     try {
       changed = await applyTurn(result) || changed;
       if (!hasLanded(result)) continue;
-      await nativeBridgeCall(
-        plugin.acknowledgeUiApplied({ turnId: result.turnId }),
-        'acknowledgeUiApplied'
-      );
+      await acknowledgeNativeUiAppliedOnce(plugin, result);
     } catch (err) {
       console.warn('[AL Native Execution] inbox item deferred:', result?.turnId, err.message);
     }
@@ -3448,6 +3951,195 @@ function applyNativeMomentActionPart(charId, part, turnId) {
   return true;
 }
 
+function nativeActionAlreadyPersisted(charId, part, result) {
+  const payload = nativePartPayload(part);
+  const canonical = nativeCanonicalAction(part, result);
+  if (!canonical) return false;
+  if (part.type === 'RELATIONSHIP_STAGE') {
+    const char = characters.find(item => item.id === charId);
+    return !!char?.stagePersona?.history?.some(item => item.sourceTurnId === String(result.turnId || ''));
+  }
+  if (part.type === 'MOMENT_ACTION' || part.type === 'MOMENT_CREATE') {
+    const momentId = String(payload.momentId || '');
+    return (allMoments || []).some(moment =>
+      (moment.id === momentId || moment.sourceTurnId === `native:${result.turnId}`)
+      && Array.isArray(moment.nativeActionTurnIds)
+      && moment.nativeActionTurnIds.includes(result.turnId)
+    );
+  }
+  if (part.type === 'PAYMENT_STATUS') {
+    const targetId = String(canonical.action.targetKey || '').replace(/^payment:/, '');
+    const payment = typeof latestPendingPayment === 'function' ? latestPendingPayment(allChats[charId], targetId) : null;
+    const expected = canonical.action.kind === 'payment_accept' ? 'received' : 'refused';
+    return !!payment
+      && Array.isArray(payment.nativeActionTurnIds)
+      && payment.nativeActionTurnIds.includes(String(result.turnId || ''))
+      && (payment.payStatus === expected || (expected === 'refused' && payment.payDeclinedAt));
+  }
+  if (part.type === 'PLAN' || part.type === 'SCHEDULE') {
+    const plans = rolePlanCache.get(charId) || [];
+    const proof = plans
+      .map(plan => plan?.canonicalActionApplications?.[canonical.action.actionId])
+      .find(Boolean);
+    return !!proof
+      && String(proof.turnId || proof.authoritativeTurnId || '') === String(result.turnId || '')
+      && String(proof.actionChecksum || '') === String(canonical.action.actionChecksum || '');
+  }
+  return false;
+}
+
+function nativeRolePlanOperationProof(charId, part, result, applyResult, canonical) {
+  const payload = canonical?.legacyPayload || nativePartPayload(part);
+  const operations = Array.isArray(payload.operations) ? payload.operations : [];
+  if (!operations.length || !applyResult) return false;
+  const plans = Array.isArray(applyResult.plans) ? applyResult.plans : (rolePlanCache.get(charId) || []);
+  const expectedStatus = {
+    cancel: 'cancelled', pause: 'paused', complete: 'completed'
+  };
+  return operations.every(operation => {
+    const planId = String(operation?.planId || '');
+    const plan = planId
+      ? plans.find(row => String(row?.planId || '') === planId && String(row?.characterId || charId) === String(charId))
+      : plans.find(row => String(row?.characterId || charId) === String(charId)
+        && String(row?.sourceTurnId || '') === String(result.turnId || ''));
+    if (!plan) return false;
+    const requestedEvidence = [
+      ...(Array.isArray(operation.evidenceMessageIds) ? operation.evidenceMessageIds : []),
+      ...(Array.isArray(operation.patch?.evidenceMessageIds) ? operation.patch.evidenceMessageIds : [])
+    ].map(String);
+    const persistedEvidence = Array.isArray(plan.evidenceMessageIds) ? plan.evidenceMessageIds.map(String) : [];
+    const hasTurnEvidence = persistedEvidence.includes(String(result.turnId || ''));
+    if (requestedEvidence.length && !hasTurnEvidence) return false;
+    if (applyResult.changed !== true && !hasTurnEvidence) return false;
+    const expected = expectedStatus[operation.op];
+    if (expected && String(plan.status || '') !== expected) return false;
+    if (operation.op === 'update') {
+      const patch = operation.patch && typeof operation.patch === 'object' ? operation.patch : {};
+      for (const [key, value] of Object.entries(patch)) {
+        if (JSON.stringify(plan[key]) !== JSON.stringify(value)) return false;
+      }
+    }
+    if (operation.op === 'create') {
+      for (const key of ['type', 'source', 'title', 'intent', 'schedule']) {
+        if (Object.hasOwn(operation, key) && JSON.stringify(plan[key]) !== JSON.stringify(operation[key])) return false;
+      }
+    }
+    if (Object.hasOwn(canonical.action, 'targetRevision') && plan.revision != null
+      && ![String(plan.revision), String(plan.updatedAt || '')].includes(String(canonical.action.targetRevision))) return false;
+    return true;
+  });
+}
+
+function nativeCanonicalActionTargetAvailable(charId, chat, part, result, canonical) {
+  const action = canonical?.action || {};
+  const payload = action.payload && typeof action.payload === 'object' && !Array.isArray(action.payload)
+    ? action.payload : {};
+  if (action.kind === 'payment_accept' || action.kind === 'payment_decline') {
+    const paymentId = String(action.targetKey || '').replace(/^payment:/, '');
+    return !!(typeof latestPendingPayment === 'function' && latestPendingPayment(chat, paymentId));
+  }
+  if (action.kind === 'relationship_transition') {
+    const char = characters.find(item => item.id === charId);
+    if (!char) return false;
+    const config = normalizeStagePersonaConfig(char);
+    const base = payload.baseAction || (payload.to ? payload : null);
+    const phase = payload.phaseAction || null;
+    if (!base && !phase) return false;
+    if (base && (!config.stages.some(stage => stage.id === base.to) || config.currentStage !== base.from)) return false;
+    if (phase && (!config.phases.some(item => item.id === phase.to) || config.currentPhase !== phase.from)) return false;
+    return true;
+  }
+  if (action.kind === 'moment_create') return typeof payload.content === 'string' || typeof payload.text === 'string';
+  if (action.kind === 'moment_like' || action.kind === 'moment_comment' || action.kind === 'moment_reply') {
+    const momentId = String(action.targetKey || '').replace(/^moment:/, '');
+    return (allMoments || []).some(moment => String(moment.id || '') === momentId);
+  }
+  if (String(action.kind || '').startsWith('role_plan_')) {
+    if (action.kind === 'role_plan_create') return true;
+    const planId = String(action.targetKey || '').replace(/^role_plan:/, '');
+    return (rolePlanCache.get(charId) || []).some(plan => String(plan.planId || '') === planId);
+  }
+  return false;
+}
+function nativeValidatedStructuredActionParts(charId, chat, result, parts, options = {}) {
+  const actionParts = nativeStructuredActionParts(result, parts);
+  if (!actionParts.length) return options.requireAction === true ? null : [];
+  const validated = [];
+  for (const part of actionParts) {
+    const canonical = nativeCanonicalAction(part, result);
+    if (!canonical) return null;
+    const alreadyProof = nativeActionProofMatches(chat, result, part, canonical)
+      || nativeActionAlreadyPersisted(charId, part, result);
+    if (!alreadyProof && !nativeCanonicalActionTargetAvailable(charId, chat, part, result, canonical)) return null;
+    validated.push({ part, canonical });
+  }
+  return validated;
+}
+
+async function applyAndVerifyNativeStructuredParts(charId, chat, result, parts, options = {}) {
+  const validated = nativeValidatedStructuredActionParts(charId, chat, result, parts, options);
+  if (validated === null) return false;
+  if (!validated.length) return true;
+  let proofCount = 0;
+  for (const { part, canonical } of validated) {
+    if (nativeActionProofMatches(chat, result, part, canonical)
+      || nativeActionAlreadyPersisted(charId, part, result)) {
+      nativeRecordActionProof(chat, result, part, canonical);
+      proofCount += 1;
+      continue;
+    }
+    const payload = canonical.legacyPayload;
+    let applied = false;
+    if (part.type === 'PAYMENT_STATUS') {
+      const targetId = String(canonical.action.targetKey || '').replace(/^payment:/, '');
+      const expected = canonical.action.kind === 'payment_accept' ? 'received' : 'refused';
+      const payment = typeof latestPendingPayment === 'function' ? latestPendingPayment(chat, targetId) : null;
+      if (payment) {
+        if (payment.payStatus === expected || (expected === 'refused' && payment.payDeclinedAt)) {
+          payment.nativeActionTurnIds = Array.isArray(payment.nativeActionTurnIds) ? payment.nativeActionTurnIds : [];
+          payment.nativeActionTurnIds = [...new Set([...payment.nativeActionTurnIds, String(result.turnId || '')])];
+          applied = true;
+        } else {
+          updatePaymentStatusFromReply(chat, targetId, '', charId, expected);
+          const after = latestPendingPayment(chat, targetId);
+          if (after && (after.payStatus === expected || (expected === 'refused' && after.payDeclinedAt))) {
+            after.nativeActionTurnIds = Array.isArray(after.nativeActionTurnIds) ? after.nativeActionTurnIds : [];
+            after.nativeActionTurnIds = [...new Set([...after.nativeActionTurnIds, String(result.turnId || '')])];
+            applied = true;
+          }
+        }
+      }
+    } else if (part.type === 'RELATIONSHIP_STAGE') {
+      applied = applyNativeRelationshipStagePart(charId, part, result.turnId);
+      applied = applied || nativeActionAlreadyPersisted(charId, part, result);
+    } else if (part.type === 'MOMENT_ACTION') {
+      applied = applyNativeMomentActionPart(charId, part, result.turnId);
+      applied = applied || nativeActionAlreadyPersisted(charId, part, result);
+    } else if (part.type === 'MOMENT_CREATE') {
+      const text = String(payload.content || payload.text || '').trim();
+      if (text) {
+        const created = createCharacterMoment(charId, text, {
+          proactive: true,
+          sourceTurnId: `native:${result.turnId}`,
+        });
+        if (created) {
+          created.nativeActionTurnIds = [result.turnId];
+          saveMoments();
+        }
+        applied = nativeActionAlreadyPersisted(charId, part, result);
+      }
+    } else if (part.type === 'PLAN' || part.type === 'SCHEDULE') {
+      const planOutcome = await applyNativePlanParts(charId, [part], result.turnId);
+      applied = nativeRolePlanOperationProof(charId, part, result, planOutcome?.result, canonical)
+        || nativeActionAlreadyPersisted(charId, part, result);
+    }
+    if (!applied) return false;
+    nativeRecordActionProof(chat, result, part, canonical);
+    proofCount += 1;
+  }
+  return proofCount === validated.length;
+}
+
 function nativePendingRetryLineage(pending) {
   return [...new Set([
     ...(Array.isArray(pending?.retryLineageTurnIds) ? pending.retryLineageTurnIds : []),
@@ -3476,6 +4168,35 @@ function nativeDirectTurnIsSuperseded(chat, result) {
   const sourceTurnId = `native:${result?.turnId || ''}`;
   return !replies.some(row => row.sourceTurnId === sourceTurnId);
 }
+function nativeTerminalDispositionLanding(result, chat, allParts) {
+  const disposition = String(result?.terminalDisposition || '');
+  if (disposition === 'redacted' || result?.redacted === true || result?.deletedAt) {
+    let changed = false;
+    if (chat.pendingReply?.nativeTurnId === result.turnId) {
+      delete chat.pendingReply;
+      changed = true;
+    }
+    const sourceMessage = result?.sourceMessageId ? messageById(chat, result.sourceMessageId) : null;
+    if (sourceMessage && (sourceMessage.replyState || sourceMessage.replyError)) {
+      delete sourceMessage.replyState;
+      delete sourceMessage.replyError;
+      changed = true;
+    }
+    if (changed) DB.set('chats', allChats);
+    return { handled: true, changed };
+  }
+  if (String(result?.state || result?.storedState || '') !== 'COMPLETED') return { handled: false, changed: false };
+  if (disposition === 'skip') {
+    if (allParts.length || (Array.isArray(result?.actions) && result.actions.length)) return { handled: true, changed: false };
+    if (chat.pendingReply?.nativeTurnId === result.turnId) delete chat.pendingReply;
+    DB.set('chats', allChats);
+    return { handled: true, changed: true };
+  }
+  if (disposition === 'action_only') {
+    return { handled: false, changed: false };
+  }
+  return { handled: false, changed: false };
+}
 
 async function applyNativeExecutionTurnUnlocked(result) {
   const charId = result?.characterId;
@@ -3483,17 +4204,31 @@ async function applyNativeExecutionTurnUnlocked(result) {
   const kind = String(result?.kind || 'DIRECT_REPLY');
   if (!chat) return false;
   const state = String(result.state || result.storedState || '');
-  const allParts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
   if (nativeDirectTurnIsSuperseded(chat, result)) {
     nativeReplyQueuedIds.delete(result?.turnId);
     return false;
   }
-  if (state === 'COMPLETED') {
-    applyNativeRelationshipStagePart(charId, allParts.find(part => part.type === 'RELATIONSHIP_STAGE'), result.turnId);
+  const allParts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
+  const terminalLanding = nativeTerminalDispositionLanding(result, chat, allParts);
+  if (terminalLanding.handled) return terminalLanding.changed;
+  if (state === 'COMPLETED' && String(result?.terminalDisposition || '') === 'action_only') {
+    const structuredParts = nativeStructuredActionParts(result, allParts);
+    if (allParts.some(part => part?.type === 'TEXT') || structuredParts.length === 0) return false;
+    const applied = await applyAndVerifyNativeStructuredParts(charId, chat, result, allParts, { requireAction: true });
+    if (!applied) return false;
+    result.actionApplied = true;
+    if (chat.pendingReply?.nativeTurnId === result.turnId) delete chat.pendingReply;
+    DB.set('chats', allChats);
+    return true;
   }
   if (['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(kind)) {
     if (state !== 'COMPLETED') return false;
-    applyNativeMomentActionPart(charId, allParts.find(part => part.type === 'MOMENT_ACTION'), result.turnId);
+    const summary = nativeCanonicalStructuredResult(result, allParts);
+    if (summary.canonical) {
+      if (!await applyAndVerifyNativeStructuredParts(charId, chat, result, allParts)) return false;
+    } else {
+      applyNativeMomentActionPart(charId, allParts.find(part => part.type === 'MOMENT_ACTION'), result.turnId);
+    }
     return true;
   }
   const rolePlanTurn = ['ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind);
@@ -3501,7 +4236,12 @@ async function applyNativeExecutionTurnUnlocked(result) {
     const sourceTurnId = `native:${result.turnId}`;
     if (state === 'COMPLETED') {
       const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
-      await applyNativePlanParts(charId, parts, result.turnId);
+      const summary = nativeCanonicalStructuredResult(result, parts);
+      if (summary.canonical) {
+        if (!await applyAndVerifyNativeStructuredParts(charId, chat, result, parts)) return false;
+      } else {
+        await applyNativePlanParts(charId, parts, result.turnId);
+      }
       const text = parts.filter(part => part.type === 'TEXT').map(part => String(part.content || '').trim()).filter(Boolean).join('\n');
       const completedAt = Number(result.completedAt) || Number(result.createdAt) || Date.now();
       const momentTurn = kind === 'PROACTIVE_MOMENT' || kind === 'ROLE_PLAN_MOMENT' || kind === 'ROLE_PLAN_MOMENT_PRIVATE';
@@ -3562,7 +4302,23 @@ async function applyNativeExecutionTurnUnlocked(result) {
   ) return false;
   if (state === 'COMPLETED') {
     const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
-    await applyNativePlanParts(charId, parts, result.turnId);
+    const structuredParts = nativeStructuredActionParts(result, parts);
+    const canonicalStructured = structuredParts.length > 0
+      && (Number(result?.resultAuthorityVersion || 0) === 1
+        || Number(result?.bridgeProtocolVersion || 0) >= 3
+        || (Array.isArray(result?.actions) && result.actions.length > 0)
+        || structuredParts.some(part => nativeActionEnvelope(part)?.canonicalAction));
+    if (canonicalStructured) {
+      const applied = await applyAndVerifyNativeStructuredParts(charId, chat, result, parts);
+      if (!applied) return false;
+    } else {
+      applyNativeRelationshipStagePart(charId, allParts.find(part => part.type === 'RELATIONSHIP_STAGE'), result.turnId);
+    }
+    await applyNativePlanParts(
+      charId,
+      parts.filter(part => (part?.type === 'PLAN' || part?.type === 'SCHEDULE') && !nativeActionEnvelope(part)?.canonicalAction),
+      result.turnId
+    );
     const alreadyAnswered = (chat.messages || []).some(row => row.role === 'assistant' && row.replyToMessageId === userMessage.id);
     const text = nativeReplyTextParts(result).map(part => part.content).join('\n');
     const appendedText = alreadyAnswered ? [] : appendNativeReplyTextParts(chat, result, { replyToMessageId: userMessage.id });
@@ -3854,7 +4610,15 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
   const plugin = nativeExecutionPlugin();
   if (!plugin?.submitTurn) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
   await syncYuqiVisibleHistory(charId, new Set([userMessageId]));
-  const task = buildAndroidUserReplyTask(charId, userMessageId, options.userText || chat.pendingReply?.userText || userMessage.content, options, Number(chat.pendingReply?.createdAt) || Date.now());
+  const visibilityCursor = await getYuqiVisibilityCursor(charId);
+  // Compatibility shape: buildAndroidUserReplyTask(charId, userMessageId, options.userText || chat.pendingReply?.userText || userMessage.content, options, createdAt)
+  const task = buildAndroidUserReplyTask(
+    charId,
+    userMessageId,
+    options.userText || chat.pendingReply?.userText || userMessage.content,
+    { ...options, visibilityCursor },
+    Number(chat.pendingReply?.createdAt) || Date.now()
+  );
   const turnId = nativeTurnIdForMessage(userMessageId);
   chat.pendingReply = {
     userMessageId,

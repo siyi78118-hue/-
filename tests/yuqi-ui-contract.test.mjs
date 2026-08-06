@@ -464,7 +464,7 @@ test('acknowledged native completions remain recoverable until their exact bubbl
 
 test('an applied action-only native result is a UI landing without a chat bubble', () => {
   const landingSource = html.slice(
-    html.indexOf('function nativeTurnHasUiLanding'),
+    html.indexOf('function nativeActionEnvelope'),
     html.indexOf('async function drainNativeUiInbox')
   );
   const makeLanding = new Function(
@@ -473,16 +473,115 @@ test('an applied action-only native result is a UI landing without a chat bubble
     `${landingSource}; return nativeTurnHasUiLanding;`
   );
   const nativeTurnHasUiLanding = makeLanding({
-    yuqi: { messages: [] }
+    yuqi: {
+      messages: [],
+      nativeActionProofs: {
+        'turn_action_only:act_1': {
+          turnId: 'turn_action_only', replyPartId: 'act_1', targetKey: 'relationship:yuqi',
+          actionId: 'act_1', kind: 'relationship_transition', actionChecksum: 'c'.repeat(64),
+          targetRevision: 'b'.repeat(64), checkpointChecksum: 'a'.repeat(64)
+        }
+      }
+    }
   }, []);
+  const nativeCanonicalAction = new Function(
+    `${landingSource}; return nativeCanonicalAction;`
+  )();
+  const validActionPart = {
+    replyPartId: 'act-format', type: 'RELATIONSHIP_STAGE', payloadJson: JSON.stringify({
+      canonicalAction: {
+        actionId: 'act-format', kind: 'relationship_transition', targetKey: 'relationship:yuqi',
+        targetRevision: 'b'.repeat(64), actionChecksum: 'c'.repeat(64), payload: {}
+      }
+    })
+  };
+  const validActionResult = { turnId: 'turn-format', commitChecksum: 'a'.repeat(64) };
+  assert.ok(nativeCanonicalAction(validActionPart, validActionResult), 'plain 64hex action tuple is the wire format');
+  for (const bad of [
+    `sha256:${'c'.repeat(64)}`,
+    'C'.repeat(64),
+    'c'.repeat(63),
+    123
+  ]) {
+    const mutated = JSON.parse(validActionPart.payloadJson);
+    mutated.canonicalAction.actionChecksum = bad;
+    assert.equal(nativeCanonicalAction({ ...validActionPart, payloadJson: JSON.stringify(mutated) }, validActionResult), null, 'prefixed/uppercase/short checksum must fail closed');
+  }
+  for (const bad of [`sha256:${'b'.repeat(64)}`, 'B'.repeat(64), 'b'.repeat(63), 12]) {
+    const mutated = JSON.parse(validActionPart.payloadJson);
+    mutated.canonicalAction.targetRevision = bad;
+    assert.equal(nativeCanonicalAction({ ...validActionPart, payloadJson: JSON.stringify(mutated) }, validActionResult), null, 'prefixed/uppercase/short target revision must fail closed');
+  }
+  assert.equal(nativeCanonicalAction(validActionPart, { turnId: 'turn-format', commitChecksum: 42 }), null, 'numeric checkpoint/commit checksum must fail closed');
 
   assert.equal(nativeTurnHasUiLanding({
     turnId: 'turn_action_only',
     characterId: 'yuqi',
     kind: 'DIRECT_REPLY',
     terminalDisposition: 'action_only',
-    replyParts: [{ replyPartId: 'act_1', type: 'PLAN', payloadJson: '{}' }]
+    actionApplied: true,
+    commitChecksum: 'a'.repeat(64),
+    replyParts: [{
+      replyPartId: 'act_1',
+      type: 'RELATIONSHIP_STAGE',
+      payloadJson: JSON.stringify({
+        version: 1,
+        canonicalAction: {
+          actionId: 'act_1', ordinal: 0, kind: 'relationship_transition',
+          targetKey: 'relationship:yuqi', targetRevision: 'b'.repeat(64),
+          payload: { expectedSceneRevision: 0 }, actionChecksum: 'c'.repeat(64)
+        },
+        legacyPayload: { expectedSceneRevision: 0, baseAction: null, phaseAction: null }
+      })
+    }]
   }), true);
+  assert.equal(nativeTurnHasUiLanding({
+    turnId: 'turn_action_only', characterId: 'yuqi', kind: 'DIRECT_REPLY',
+    terminalDisposition: 'action_only',
+    commitChecksum: 'a'.repeat(64),
+    replyParts: [{
+      replyPartId: 'act_1', type: 'RELATIONSHIP_STAGE',
+      payloadJson: JSON.stringify({ canonicalAction: {
+        actionId: 'act_1', kind: 'relationship_transition', targetKey: 'relationship:yuqi', targetRevision: 'b'.repeat(64),
+        payload: { expectedSceneRevision: 0 }, actionChecksum: 'c'.repeat(64)
+      } })
+    }]
+  }), true, 'persisted action proof must survive reload without transient actionApplied input');
+  assert.equal(nativeTurnHasUiLanding({
+    turnId: 'turn_action_only', characterId: 'yuqi', kind: 'DIRECT_REPLY',
+    terminalDisposition: 'action_only', actionApplied: true,
+    commitChecksum: 'a'.repeat(64),
+    replyParts: [{
+      replyPartId: 'act_1', type: 'RELATIONSHIP_STAGE',
+      payloadJson: JSON.stringify({
+        canonicalAction: {
+          actionId: 'act_1', ordinal: 0, kind: 'relationship_transition',
+          targetKey: 'relationship:yuqi', targetRevision: 'b'.repeat(64),
+          payload: { expectedSceneRevision: 0 }, actionChecksum: 'd'.repeat(64)
+        }, legacyPayload: {}
+      })
+    }]
+  }), false, '相同part/target/revision但actionChecksum变化不得复用旧proof');
+  assert.equal(nativeTurnHasUiLanding({
+    turnId: 'turn_action_missing_proof', characterId: 'yuqi', kind: 'DIRECT_REPLY',
+    terminalDisposition: 'action_only', actionApplied: true,
+    replyParts: [{ replyPartId: 'act_2', type: 'PLAN', payloadJson: '{}' }]
+  }), false, '任意非TEXT标记不能冒充动作落地证明');
+  assert.equal(nativeTurnHasUiLanding({
+    turnId: 'turn_action_bad_target', characterId: 'yuqi', kind: 'DIRECT_REPLY',
+    terminalDisposition: 'action_only', actionApplied: true,
+    commitChecksum: 'a'.repeat(64),
+    replyParts: [{
+      replyPartId: 'act_3', type: 'RELATIONSHIP_STAGE',
+      payloadJson: JSON.stringify({
+        canonicalAction: {
+          actionId: 'act_3', ordinal: 0, kind: 'relationship_transition',
+          targetKey: 'relationship:forged', targetRevision: 'forged', payload: {},
+          actionChecksum: 'c'.repeat(64)
+        }, legacyPayload: {}
+      })
+    }]
+  }), false, '错误动作靶点或revision不得落地');
   assert.equal(nativeTurnHasUiLanding({
     turnId: 'turn_visible_missing',
     characterId: 'yuqi',
@@ -490,6 +589,229 @@ test('an applied action-only native result is a UI landing without a chat bubble
     terminalDisposition: 'visible',
     replyParts: [{ replyPartId: 'msg_1', type: 'TEXT', content: '还没落地' }]
   }), false);
+
+  const mixedLanding = new Function(
+    'allChats', 'allMoments', `${landingSource}; return nativeTurnHasUiLanding;`
+  )({
+    yuqi: {
+      messages: [
+        { sourceTurnId: 'native:turn-mixed', sourceReplyPartId: 'text-1' },
+        { sourceTurnId: 'native:turn-mixed', sourceReplyPartId: 'text-2' },
+        { sourceTurnId: 'native:turn-mixed', sourceReplyPartId: 'text-3' }
+      ],
+      nativeActionProofs: {
+        'turn-mixed:act-mixed': {
+          turnId: 'turn-mixed', replyPartId: 'act-mixed', actionId: 'act-mixed',
+          kind: 'relationship_transition', actionChecksum: 'c'.repeat(64),
+          targetKey: 'relationship:yuqi', targetRevision: 'b'.repeat(64), checkpointChecksum: 'a'.repeat(64)
+        }
+      }
+    }
+  }, []);
+  const mixedParts = [
+    { replyPartId: 'text-1', type: 'TEXT', content: '一' },
+    { replyPartId: 'text-2', type: 'TEXT', content: '二' },
+    { replyPartId: 'text-3', type: 'TEXT', content: '三' },
+    { replyPartId: 'act-mixed', type: 'RELATIONSHIP_STAGE', payloadJson: JSON.stringify({ canonicalAction: {
+      actionId: 'act-mixed', kind: 'relationship_transition', targetKey: 'relationship:yuqi', targetRevision: 'b'.repeat(64),
+      actionChecksum: 'c'.repeat(64), payload: {}
+    } }) }
+  ];
+  assert.equal(mixedLanding({ turnId: 'turn-mixed', characterId: 'yuqi', kind: 'DIRECT_REPLY', terminalDisposition: 'visible', commitChecksum: 'a'.repeat(64), replyParts: mixedParts }), true, 'visible mixed text+action requires all text and action proof');
+  const forgedMixedParts = mixedParts.map(part => part.replyPartId === 'act-mixed'
+    ? { ...part, payloadJson: JSON.stringify({ canonicalAction: {
+      actionId: 'act-mixed', kind: 'relationship_transition', targetKey: 'relationship:yuqi', targetRevision: 'b'.repeat(64),
+      actionChecksum: 'd'.repeat(64), payload: {}
+    } }) }
+    : part);
+  assert.equal(mixedLanding({ turnId: 'turn-mixed', characterId: 'yuqi', kind: 'DIRECT_REPLY', terminalDisposition: 'visible', commitChecksum: 'a'.repeat(64), replyParts: forgedMixedParts }), false, 'visible text cannot mask an invalid structured action');
+  const actionDescriptor = {
+    actionId: 'act-mixed', ordinal: 0, kind: 'relationship_transition', targetKey: 'relationship:yuqi',
+    targetRevision: 'b'.repeat(64), actionChecksum: 'c'.repeat(64), payload: {}
+  };
+  assert.equal(mixedLanding({
+    turnId: 'turn-mixed', characterId: 'yuqi', kind: 'DIRECT_REPLY', terminalDisposition: 'visible', commitChecksum: 'a'.repeat(64),
+    replyParts: [
+      { replyPartId: 'text-1', type: 'TEXT', content: '一' },
+      { replyPartId: 'text-2', type: 'TEXT', content: '二' },
+      { replyPartId: 'text-3', type: 'TEXT', content: '三' }
+    ],
+    actions: [actionDescriptor]
+  }), true, 'wire actions must join the same visible proof gate as text parts');
+  assert.equal(mixedLanding({
+    turnId: 'turn-mixed', characterId: 'yuqi', kind: 'DIRECT_REPLY', terminalDisposition: 'visible', commitChecksum: 'a'.repeat(64),
+    replyParts: [
+      { replyPartId: 'text-1', type: 'TEXT', content: '一' },
+      { replyPartId: 'text-2', type: 'TEXT', content: '二' },
+      { replyPartId: 'text-3', type: 'TEXT', content: '三' }
+    ],
+    actions: [{ ...actionDescriptor, actionChecksum: 'd'.repeat(64) }]
+  }), false, 'wire action checksum corruption cannot be hidden by visible text');
+  assert.equal(mixedLanding({
+    turnId: 'turn-mixed', characterId: 'yuqi', kind: 'DIRECT_REPLY', terminalDisposition: 'visible', commitChecksum: 'a'.repeat(64),
+    replyParts: [
+      { replyPartId: 'text-1', type: 'TEXT', content: '一' },
+      { replyPartId: 'text-2', type: 'TEXT', content: '二' },
+      { replyPartId: 'text-3', type: 'TEXT', content: '三' }
+    ],
+    actions: [{ ...actionDescriptor, actionId: 42 }]
+  }), false, 'malformed action identity cannot be silently dropped beside visible text');
+  assert.equal(mixedLanding({
+    turnId: 'turn-mixed', characterId: 'yuqi', kind: 'DIRECT_REPLY', terminalDisposition: 'visible', commitChecksum: 'a'.repeat(64),
+    replyParts: mixedParts,
+    actions: [actionDescriptor]
+  }), true, 'exact duplicate action descriptors may be deduplicated');
+  assert.equal(mixedLanding({
+    turnId: 'turn-mixed', characterId: 'yuqi', kind: 'DIRECT_REPLY', terminalDisposition: 'visible', commitChecksum: 'a'.repeat(64),
+    replyParts: mixedParts,
+    actions: [{ ...actionDescriptor, actionChecksum: 'd'.repeat(64) }]
+  }), false, 'duplicate action identity with changed checksum must fail closed');
+});
+
+test('native action proofs bind moment creation and role-plan operation output, not input booleans or plan existence', () => {
+  const proofSource = html.slice(
+    html.indexOf('function nativeRolePlanOperationProof'),
+    html.indexOf('async function applyAndVerifyNativeStructuredParts')
+  );
+  const nativeRolePlanOperationProof = new Function(
+    `${proofSource}; return nativeRolePlanOperationProof;`
+  )();
+  const canonical = {
+    legacyPayload: { operations: [{ op: 'update', planId: 'plan-1', evidenceMessageIds: ['turn-plan'], patch: { title: '新标题' } }] },
+    action: { actionId: 'act-plan', actionChecksum: 'c'.repeat(64), targetRevision: 'b'.repeat(64) }
+  };
+  assert.equal(nativeRolePlanOperationProof(
+    'yuqi', {}, { turnId: 'turn-plan' },
+    { changed: true, plans: [{ planId: 'plan-1', characterId: 'yuqi', title: '新标题', status: 'active', evidenceMessageIds: ['turn-plan'] }] },
+    canonical
+  ), true);
+  assert.equal(nativeRolePlanOperationProof(
+    'yuqi', {}, { turnId: 'turn-plan' },
+    { changed: false, plans: [{ planId: 'plan-1', characterId: 'yuqi', title: '新标题', status: 'active' }] },
+    canonical
+  ), false, '仅计划存在或输入applied标记不能证明操作已经落地');
+  assert.equal(nativeRolePlanOperationProof(
+    'yuqi', {}, { turnId: 'turn-plan' },
+    { changed: false, plans: [{ planId: 'plan-1', characterId: 'yuqi', title: '新标题', status: 'active', evidenceMessageIds: ['turn-plan'] }] },
+    canonical
+  ), true, '上次已落地但proof尚未写入时，持久evidence与精确目标状态应恢复proof');
+  assert.match(html, /created\.nativeActionTurnIds\s*=\s*\[result\.turnId\]/);
+  assert.match(html, /proof\.actionChecksum\s*===\s*canonical\.action\.actionChecksum/);
+  const applySource = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  const actionOnlyBlock = applySource.slice(applySource.indexOf("terminalDisposition || '') === 'action_only'"));
+  assert.ok(actionOnlyBlock.indexOf("allParts.some(part => part?.type === 'TEXT')") >= 0, 'action_only must reject text before applying structured actions');
+  assert.ok(actionOnlyBlock.indexOf('nativeStructuredActionParts') >= 0, 'action_only must require canonical structured parts before applying');
+});
+
+test('canonical action validation is closed before any legacy writer and rejects alias or forged legacy payloads', async () => {
+  const landingSource = html.slice(
+    html.indexOf('function nativeActionEnvelope'),
+    html.indexOf('function nativePendingRetryLineage')
+  );
+  const nativeCanonicalAction = new Function(`${landingSource}; return nativeCanonicalAction;`)();
+  const canonicalAction = {
+    actionId: 'act-closed', kind: 'relationship_transition', targetKey: 'relationship:yuqi',
+    targetRevision: 'b'.repeat(64), actionChecksum: 'c'.repeat(64),
+    payload: { expectedSceneRevision: 0, baseAction: { from: 'new', to: 'acquainted' } }
+  };
+  const baseEnvelope = {
+    canonicalAction,
+    legacyPayload: { expectedSceneRevision: 0, baseAction: { from: 'new', to: 'acquainted' }, phaseAction: null }
+  };
+  const basePart = { replyPartId: 'act-closed', type: 'RELATIONSHIP_STAGE', payloadJson: JSON.stringify(baseEnvelope) };
+  assert.ok(nativeCanonicalAction(basePart, { turnId: 'turn-closed', commitChecksum: 'a'.repeat(64) }));
+  assert.equal(nativeCanonicalAction({
+    ...basePart,
+    payloadJson: JSON.stringify({ ...baseEnvelope, legacyPayload: { baseAction: { from: 'new', to: 'forged' } } })
+  }, { turnId: 'turn-closed', commitChecksum: 'a'.repeat(64) }), null, 'legacyPayload must equal canonical derivation');
+  assert.equal(nativeCanonicalAction({
+    ...basePart,
+    payloadJson: JSON.stringify({ canonicalAction: { ...canonicalAction, actionChecksum: undefined, checksum: 'c'.repeat(64) } })
+  }, { turnId: 'turn-closed', commitChecksum: 'a'.repeat(64) }), null, 'action.checksum is not a wire alias');
+
+  const applySource = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  const makeApply = new Function(
+    'allChats', 'nativeDirectTurnIsSuperseded', 'nativeReplyQueuedIds', 'nativeTerminalDispositionLanding',
+    'nativeStructuredActionParts', 'applyAndVerifyNativeStructuredParts', 'applyNativeRelationshipStagePart',
+    'messageById',
+    `${applySource}; return applyNativeExecutionTurnUnlocked;`
+  );
+  let relationshipWrites = 0;
+  const apply = makeApply(
+    { yuqi: { messages: [{ id: 'user-closed', role: 'user', replyState: 'pending' }], pendingReply: { nativeTurnId: 'turn-closed', userMessageId: 'user-closed' } } },
+    () => false,
+    new Set(),
+    () => ({ handled: false, changed: false }),
+    (_result, parts) => parts.filter(part => part?.type !== 'TEXT'),
+    async () => false,
+    () => { relationshipWrites += 1; return true; },
+    chat => chat.messages[0]
+  );
+  const failedCanonicalResult = {
+    characterId: 'yuqi', kind: 'DIRECT_REPLY', state: 'COMPLETED', terminalDisposition: 'visible',
+    resultAuthorityVersion: 1, turnId: 'turn-closed', sourceMessageId: 'user-closed',
+    commitChecksum: 'a'.repeat(64),
+    replyParts: [
+      basePart,
+      { replyPartId: 'payment-forged', type: 'PAYMENT_STATUS', payloadJson: JSON.stringify({ canonicalAction: {
+        actionId: 'payment-forged', kind: 'payment_accept', targetKey: 'payment:missing', targetRevision: 'd'.repeat(64),
+        actionChecksum: 'e'.repeat(64), payload: {}
+      } }) }
+    ]
+  };
+  await apply(failedCanonicalResult);
+  assert.equal(relationshipWrites, 0, 'invalid canonical action must not run relationship/plan/payment writers');
+  for (const invalidPart of [
+    { replyPartId: 'moment-forged', type: 'MOMENT_ACTION', payloadJson: JSON.stringify({ canonicalAction: {
+      actionId: 'moment-forged', kind: 'moment_like', targetKey: 'moment:missing', targetRevision: 'd'.repeat(64),
+      actionChecksum: 'e'.repeat(64), payload: {}
+    } }) },
+    { replyPartId: 'plan-forged', type: 'PLAN', payloadJson: JSON.stringify({ canonicalAction: {
+      actionId: 'plan-forged', kind: 'role_plan_update', targetKey: 'role_plan:missing', targetRevision: 'd'.repeat(64),
+      actionChecksum: 'e'.repeat(64), payload: {}
+    } }) }
+  ]) {
+    relationshipWrites = 0;
+    await apply({ ...failedCanonicalResult, replyParts: [basePart, invalidPart] });
+    assert.equal(relationshipWrites, 0, 'invalid moment/plan targets must not run an earlier relationship writer');
+  }
+});
+
+test('cognition-v3 relationship, life, and author settings use explicit compact allow-lists', () => {
+  const snapshotSource = html.slice(
+    html.indexOf('function nativeSnapshotClone'),
+    html.indexOf('function withLocalFallbackExecution')
+  );
+  const { withCognitionV3Snapshot } = new Function(`${snapshotSource}; return { withCognitionV3Snapshot };`)();
+  const snapshot = withCognitionV3Snapshot({
+    roleId: 'yuqi',
+    relationship: {
+      id: 'acquainted', label: '熟悉', content: '稳定', since: 10, reason: 'evidence', confidence: 0.8,
+      base: { id: 'acquainted', label: '熟悉', content: 'base', changedAt: 11, reason: 'base', confidence: 0.7, evidenceMessageIds: ['m1'], token: 'secret' },
+      phase: { id: 'normal', label: '日常', content: 'phase', since: 12, reason: 'phase', confidence: 0.6, evidenceMessageIds: ['m2'], apiKey: 'secret' },
+      token: 'secret'
+    },
+    lifeSignals: {
+      mood: 'calm', currentFocus: 'work', energy: 0.5, nextEvent: 'later', updatedAt: 20,
+      schedule: { next: 'tomorrow' }, endpoint: 'https://secret', nested: { apiKey: 'secret' }
+    },
+    authorSettings: {
+      displayName: 'Yuqi', tone: 'warm', language: 'zh-CN', timezone: 'Asia/Shanghai',
+      quietHours: { start: '23:00', end: '07:00' }, responseStyle: 'natural', apiKey: 'secret',
+      fallbackExecution: { contract: 'secret' }
+    }
+  });
+  assert.equal(snapshot.relationship.id, 'acquainted');
+  assert.equal(snapshot.relationship.base.evidenceMessageIds[0], 'm1');
+  assert.equal(snapshot.lifeSignals.currentFocus, 'work');
+  assert.equal(snapshot.authorSettings.quietHours.start, '23:00');
+  assert.doesNotMatch(JSON.stringify(snapshot), /secret|endpoint|apiKey|fallbackExecution/);
 });
 
 test('v3 completion uses Room authority before legacy receipts and exposes its UI contract', () => {
@@ -672,4 +994,48 @@ test('canonical role-plan bundles use one browser-side compare-and-swap boundary
   assert.match(memoryDb, /incomingActionIds/);
   assert.match(memoryDb, /canonicalActionApplications/);
   assert.match(memoryDb, /status: 'stale'/);
+});
+
+test('Task15 exposes a bounded cognition-v3 semantic view and separate local fallback carrier', () => {
+  assert.match(html, /function\s+withCognitionV3Snapshot\(/);
+  assert.match(html, /function\s+withLocalFallbackExecution\(/);
+  const snapshot = html.slice(html.indexOf('function withCognitionV3Snapshot'), html.indexOf('async function buildNativeExecutionSnapshot'));
+  for (const key of ['contract', 'schemaVersion', 'roleId', 'hardConstraints', 'preferences', 'currentStances', 'relationship', 'recentGroups', 'verifiedFacts', 'lifeSignals', 'authorSettings']) {
+    assert.match(snapshot, new RegExp(`['"]?${key}['"]?`), `missing semantic key ${key}`);
+  }
+  assert.match(snapshot, /fallbackExecution/);
+  assert.match(snapshot, /cognition-v3-fallback-v1/);
+  assert.match(snapshot, /deviceId/);
+  assert.match(snapshot, /Object\.keys\(fallbackExecution\)/);
+});
+
+test('Task15 keeps local fallback inputs out of direct wire context and allows compact semantic data only for automatic triggers', () => {
+  const queue = html.slice(html.indexOf('async function queueAndroidUserReply'), html.indexOf('async function mirrorAppStateNow'));
+  assert.match(queue, /getYuqiVisibilityCursor/);
+  assert.match(queue, /buildAndroidUserReplyTask/);
+  assert.match(queue, /submitTurn/);
+  assert.ok(queue.indexOf('getYuqiVisibilityCursor') < queue.indexOf('buildAndroidUserReplyTask'), 'cursor must be read before task serialization');
+  assert.ok(queue.indexOf('buildAndroidUserReplyTask') < queue.lastIndexOf('plugin.submitTurn'), 'task serialization must precede native submit');
+  const bridgePreparation = html.slice(html.indexOf('function buildAndroidUserReplyTask'), html.indexOf('async function dumpCharacterMemoryForRunner'));
+  assert.doesNotMatch(bridgePreparation, /fallbackExecution/);
+  const automatic = html.slice(html.indexOf('async function syncNativeProactiveSnapshot'), html.indexOf('function rolePlanSnapshotId'));
+  assert.match(automatic, /snapshot/);
+  assert.match(automatic, /withCognitionV3Snapshot/);
+});
+
+test('Task15 completion handling has one shared event/poll/reload drain and disposition-specific landing rules', () => {
+  const reconcile = html.slice(html.indexOf('async function drainNativeUiInbox'), html.indexOf('function nativeReplyFailureMessage'));
+  assert.match(reconcile, /drainNativeUiInbox/);
+  assert.match(html.slice(html.indexOf('function reconcileNativeExecutionTurns()'), html.indexOf('function startNativeReplyPolling')), /finally/);
+  assert.match(html.slice(html.indexOf('function nativeTerminalUiLanding'), html.indexOf('function withNativePromiseTimeout')), /replyParts/);
+  const apply = html.slice(html.indexOf('function nativeTerminalUiLanding'), html.indexOf('async function applyNativeExecutionTurnUnlocked'));
+  assert.match(apply, /action_only/);
+  assert.match(apply, /skip/);
+  assert.match(apply, /replyParts/);
+  assert.match(html, /acknowledgeUiApplied/);
+  assert.match(html, /notification/i);
+  assert.match(html, /stage === 'queued' \|\| stage === 'pending'/);
+  assert.match(html, /stage\.includes\('cloud_accepted'\)/);
+  assert.match(html, /正在把消息送过去/);
+  assert.match(html, /消息已到云端，正在等待电脑接收/);
 });
