@@ -42,6 +42,12 @@ const VISIBLE_ITEM_FIELDS = new Set([
   'ordinal'
 ]);
 
+const PUBLIC_MOMENT_LANE_KINDS = new Set([
+  'PROACTIVE_MOMENT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_MOMENT_PRIVATE'
+]);
+
 function normalizeVisibleItem(item) {
   exactObject(item, VISIBLE_ITEM_FIELDS, 'visible item');
   const normalized = {
@@ -246,21 +252,73 @@ function canonicalCommitPayloadV1(input) {
   };
 }
 
-export function canonicalCommitPayload(input) {
+function canonicalCommitPayloadV2(input) {
   const payload = canonicalCommitPayloadV1(input);
   payload.payloadVersion = 'pc-visible-commit-v2';
   payload.input.clearEpoch = Number(input.inputClearEpoch ?? 0);
-  if (Number(input.protocolVersion) === 3 && input.turnKind === 'PROACTIVE_CHAT') {
-    const ids = input.proactiveMotiveEvidenceIds;
+  return payload;
+}
+
+function canonicalCommitPayloadV3(input) {
+  const payload = canonicalCommitPayloadV2(input);
+  payload.payloadVersion = 'pc-visible-commit-v3';
+  const ids = input.proactiveMotiveEvidenceIds;
+  if (!Array.isArray(ids) || new Set(ids).size !== ids.length
+    || ids.some(id => typeof id !== 'string' || !id)
+    || ids.length > 3) {
+    throw new Error('PROACTIVE_CHAT motive evidence authority conflict');
+  }
+  payload.proactiveMotiveEvidenceIds = [...ids];
+  return payload;
+}
+
+function canonicalCommitPayloadV4(input) {
+  const payload = canonicalCommitPayloadV2(input);
+  payload.payloadVersion = 'pc-visible-commit-v4';
+  const kind = String(input.turnKind || '');
+  if (kind === 'PROACTIVE_MOMENT') {
+    if (Object.hasOwn(input, 'momentTargetAuthorityChecksum')) {
+      throw new Error('public moment v4 field conflict');
+    }
+    const ids = input.publicMomentEvidenceIds;
     if (!Array.isArray(ids) || new Set(ids).size !== ids.length
       || ids.some(id => typeof id !== 'string' || !id)
       || ids.length > 3) {
-      throw new Error('PROACTIVE_CHAT motive evidence authority conflict');
+      throw new Error('public moment evidence authority conflict');
     }
-    payload.payloadVersion = 'pc-visible-commit-v3';
-    payload.proactiveMotiveEvidenceIds = [...ids];
+    payload.publicMomentEvidenceIds = [...ids];
+  } else if (kind === 'MOMENT_INTERACTION' || kind === 'MOMENT_REPLY') {
+    if (Object.hasOwn(input, 'publicMomentEvidenceIds')) {
+      throw new Error('moment v4 field conflict');
+    }
+    if (typeof input.momentTargetAuthorityChecksum !== 'string'
+      || !/^[a-f0-9]{64}$/.test(input.momentTargetAuthorityChecksum)) {
+      throw new Error('moment target authority conflict');
+    }
+    payload.momentTargetAuthorityChecksum = input.momentTargetAuthorityChecksum;
+  } else {
+    throw new Error('moment v4 kind authority conflict');
   }
   return payload;
+}
+
+function canonicalCommitPayloadForVersion(input, version) {
+  if (version === 'pc-visible-commit-v1') return canonicalCommitPayloadV1(input);
+  if (version === 'pc-visible-commit-v2') return canonicalCommitPayloadV2(input);
+  if (version === 'pc-visible-commit-v3') return canonicalCommitPayloadV3(input);
+  if (version === 'pc-visible-commit-v4') return canonicalCommitPayloadV4(input);
+  throw new Error('canonical commit payload version conflict');
+}
+
+export function canonicalCommitPayload(input) {
+  if (Number(input.protocolVersion) === 3 && input.turnKind === 'PROACTIVE_CHAT') {
+    return canonicalCommitPayloadV3(input);
+  }
+  if (Number(input.protocolVersion) === 3
+    && ['PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(input.turnKind)) {
+    return canonicalCommitPayloadV4(input);
+  }
+  return canonicalCommitPayloadV2(input);
 }
 
 export function commitVisibleResult(input) {
@@ -293,6 +351,10 @@ export function commitVisibleResult(input) {
     };
     const isProactiveV3 = Number(persistedProtocolVersion) === 3
       && persistedTurnKind === 'PROACTIVE_CHAT';
+    const isMomentV3 = Number(persistedProtocolVersion) === 3
+      && ['PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(persistedTurnKind);
+    const isPublicMomentLaneV3 = Number(persistedProtocolVersion) === 3
+      && PUBLIC_MOMENT_LANE_KINDS.has(persistedTurnKind);
     const annotationSnapshot = authority.turn.annotationSnapshot || {};
     const proactiveAuthority = annotationSnapshot?.proactiveMotiveAuthority || null;
     if (isProactiveV3) {
@@ -319,6 +381,65 @@ export function commitVisibleResult(input) {
         throw new Error('PROACTIVE_CHAT motive evidence/result disposition conflict');
       }
     }
+    const momentTargetAuthority = annotationSnapshot?.momentTargetAuthority || null;
+    if (isMomentV3) {
+      if (persistedTurnKind === 'PROACTIVE_MOMENT') {
+        const publicAuthority = annotationSnapshot?.publicMomentAuthority;
+        if (!publicAuthority || typeof publicAuthority !== 'object'
+          || Array.isArray(publicAuthority)
+          || Object.keys(publicAuthority).sort().join(',')
+            !== 'candidates,checksum,consideredAt,structuralSilence,version'
+          || publicAuthority.version !== 'public-moment-authority-v1'
+          || typeof publicAuthority.checksum !== 'string'
+          || !/^[a-f0-9]{64}$/.test(publicAuthority.checksum)
+          || !Number.isSafeInteger(publicAuthority.consideredAt)
+          || contentHash({
+            version: publicAuthority.version,
+            consideredAt: publicAuthority.consideredAt,
+            candidates: publicAuthority.candidates,
+            structuralSilence: publicAuthority.structuralSilence
+          }) !== publicAuthority.checksum) {
+          throw new Error('public moment authority conflict');
+        }
+      } else if (!momentTargetAuthority || typeof momentTargetAuthority !== 'object'
+        || Array.isArray(momentTargetAuthority)
+        || Object.keys(momentTargetAuthority).sort().join(',')
+          !== 'checksum,targetComment,targetMoment,version'
+        || typeof momentTargetAuthority.checksum !== 'string'
+        || contentHash({
+          version: momentTargetAuthority.version,
+          targetMoment: momentTargetAuthority.targetMoment,
+          targetComment: momentTargetAuthority.targetComment
+        }) !== momentTargetAuthority.checksum) {
+        throw new Error('moment target authority conflict');
+      }
+      const allowedMomentActionKinds = new Set(['moment_like', 'moment_comment', 'moment_reply']);
+      for (const action of input.actionSet || []) {
+        if (persistedTurnKind === 'PROACTIVE_MOMENT'
+          || !allowedMomentActionKinds.has(action?.kind)) {
+          throw new Error('canonical moment action authority conflict');
+        }
+      }
+      if ((persistedTurnKind === 'MOMENT_INTERACTION' || persistedTurnKind === 'MOMENT_REPLY')
+        && (input.visibleGroup?.items || []).length > 0) {
+        throw new Error('canonical moment interaction must be action-only');
+      }
+      if (persistedTurnKind === 'PROACTIVE_MOMENT'
+        && (input.actionSet || []).length > 0) {
+        throw new Error('PROACTIVE_MOMENT must not carry actions or visible items');
+      }
+      if ((input.visibleGroup?.items || []).length === 0
+        && (input.actionSet || []).length === 0
+        && (input.memoryJobs || []).length > 0) {
+        throw new Error('canonical moment skip must not carry memory jobs');
+      }
+    }
+    if (isPublicMomentLaneV3
+      && (persistedTurnKind === 'ROLE_PLAN_MOMENT'
+        || persistedTurnKind === 'ROLE_PLAN_MOMENT_PRIVATE')
+      && (input.actionSet || []).some(action => !String(action?.kind || '').startsWith('role_plan_'))) {
+      throw new Error('canonical public moment action authority conflict');
+    }
     const existing = input.store.readCanonicalCommitOutcomeInternal({
       lineageKey: input.authorityLineageKey,
       expectedTurnId: input.turnId,
@@ -329,9 +450,10 @@ export function commitVisibleResult(input) {
       if (existing.status === 'redacted' && !receipt) {
         throw new Error('canonical result lineage is redacted and cancelled');
       }
-      const canonicalPayload = receipt.commitPayloadVersion === 'pc-visible-commit-v1'
-        ? canonicalCommitPayloadV1(persistedInput)
-        : canonicalCommitPayload(persistedInput);
+      const canonicalPayload = canonicalCommitPayloadForVersion(
+        persistedInput,
+        receipt.commitPayloadVersion
+      );
       const commitChecksum = contentHash(canonicalPayload);
       assert.equal(
         receipt.authorityOrigin,
@@ -392,9 +514,12 @@ export function commitVisibleResult(input) {
       if (String(item?.content || '').trim() === '') {
         throw new Error('visible item content must not be blank');
       }
+      const expectedRecipient = isPublicMomentLaneV3
+        ? 'public_moments'
+        : 'user';
       if (String(item?.speakerId || '') !== authority.turn.characterId
         || String(item?.speakerType || '') !== 'character'
-        || String(item?.recipientId || '') !== 'user') {
+        || String(item?.recipientId || '') !== expectedRecipient) {
         throw new Error('visible item identity authority conflict');
       }
     }
@@ -419,7 +544,14 @@ export function commitVisibleResult(input) {
           agencySnapshotChecksum: authority.turn.agencySnapshotChecksum,
           proactiveMotiveAuthorityChecksum: proactiveAuthority.checksum
         })
-      : authority.turn.agencySnapshotChecksum;
+      : isMomentV3
+        ? contentHash({
+            agencySnapshotChecksum: authority.turn.agencySnapshotChecksum,
+            momentTargetAuthorityChecksum: persistedTurnKind === 'PROACTIVE_MOMENT'
+              ? annotationSnapshot?.publicMomentAuthority?.checksum
+              : momentTargetAuthority?.checksum
+          })
+        : authority.turn.agencySnapshotChecksum;
     const expectedFingerprint = computeGenerationFingerprint({
       roleId: authority.turn.characterId,
       laneKey: authority.turn.laneKey,

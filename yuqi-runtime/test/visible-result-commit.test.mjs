@@ -305,6 +305,54 @@ test('PROACTIVE_CHAT wire-v3 commit payload preserves only pinned motive evidenc
   assert.equal('reply' in payload, false);
 });
 
+test('fresh wire-v3 moment kinds use the closed v4 payload fields', () => {
+  const base = {
+    authorityLineageKey: 'lin_public_moment_v4',
+    laneKey: 'public_moment',
+    expectedLatestUserBatchId: null,
+    inputVisibilitySequence: 1,
+    inputClearEpoch: 0,
+    agencySnapshotChecksum: SHA,
+    expectedCognitiveStateRevision: 0,
+    authoritativeReleaseId: 'release_moment',
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    generationFingerprint: SHA,
+    visibleGroup: { items: [] },
+    actionSet: [],
+    statePatch: null,
+    memoryJobs: [],
+    comparisonJob: null,
+    protocolVersion: 3
+  };
+  const proactive = canonicalCommitPayload({
+    ...base,
+    turnKind: 'PROACTIVE_MOMENT',
+    publicMomentEvidenceIds: []
+  });
+  assert.equal(proactive.payloadVersion, 'pc-visible-commit-v4');
+  assert.deepEqual(proactive.publicMomentEvidenceIds, []);
+  assert.equal(Object.hasOwn(proactive, 'momentTargetAuthorityChecksum'), false);
+
+  const interaction = canonicalCommitPayload({
+    ...base,
+    turnKind: 'MOMENT_INTERACTION',
+    momentTargetAuthorityChecksum: SHA
+  });
+  assert.equal(interaction.payloadVersion, 'pc-visible-commit-v4');
+  assert.equal(interaction.momentTargetAuthorityChecksum, SHA);
+  assert.equal(Object.hasOwn(interaction, 'publicMomentEvidenceIds'), false);
+
+  const historicalWire2 = canonicalCommitPayload({
+    ...base,
+    protocolVersion: 2,
+    turnKind: 'MOMENT_INTERACTION',
+    momentTargetAuthorityChecksum: SHA
+  });
+  assert.equal(historicalWire2.payloadVersion, 'pc-visible-commit-v2');
+  assert.equal(Object.hasOwn(historicalWire2, 'momentTargetAuthorityChecksum'), false);
+});
+
 test('canonical memory and compare descriptors default-deny unknown semantic fields', () => {
   const base = {
     authorityLineageKey: 'lin_job_allowlist',
@@ -460,20 +508,16 @@ function momentEnvelope(turnId = 'turn_moment_authority') {
       scheduledFor: 999,
       executedAt: 1000,
       context: {
-        momentId: 'moment_real',
-        input: {
-          targetMoment: { momentId: 'moment_real', revision: 3, ownerId: 'user' },
-          targetComment: {
-            commentId: 'comment_real',
-            momentId: 'moment_real',
-            revision: 2,
-            ownerId: 'user'
-          }
+        targetMoment: {
+          momentId: 'moment_real',
+          authorType: 'character',
+          authorId: 'yuqi',
+          text: '公开动态',
+          createdAt: 900,
+          likes: [],
+          comments: []
         },
-        scene: {
-          relationshipStage: { id: 'new', label: '初识' },
-          stagePersonaRevision: 4
-        }
+        targetComment: null
       }
     },
     context: {
@@ -519,6 +563,12 @@ function withMomentAuthority(run) {
     const envelope = validateEnvelope(momentEnvelope());
     const rollout = store.getCognitionRollout('MOMENT_INTERACTION');
     const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1000 });
+    const targetAuthority = {
+      version: 'moment-target-authority-v1',
+      targetMoment: envelope.trigger.context.targetMoment,
+      targetComment: envelope.trigger.context.targetComment
+    };
+    targetAuthority.checksum = contentHash(targetAuthority);
     const created = store.createCanonicalVisibleTurnInternal({
       envelope,
       rolloutKey: 'MOMENT_INTERACTION',
@@ -532,7 +582,7 @@ function withMomentAuthority(run) {
       inputVisibilitySequence: 1,
       inputClearEpoch: 0,
       agencySnapshotChecksum: agency.checksum,
-      annotationSnapshot: {}
+      annotationSnapshot: { momentTargetAuthority: targetAuthority }
     });
     return run(store, created.turn);
   });
@@ -551,13 +601,19 @@ function commitInput(store, turn) {
     targetRevision: '1',
     payload: { privacy: 'private', content: '雨后的灯。' }
   }];
+  const momentTargetAuthorityChecksum = turn.annotationSnapshot?.momentTargetAuthority?.checksum || null;
   const fingerprint = generationFingerprint({
     roleId: turn.characterId,
     laneKey: turn.laneKey,
     inputVisibilitySequence: turn.inputVisibilitySequence,
     visibleGroup,
     actionSet,
-    contextRevision: turn.agencySnapshotChecksum
+    contextRevision: momentTargetAuthorityChecksum
+      ? contentHash({
+          agencySnapshotChecksum: turn.agencySnapshotChecksum,
+          momentTargetAuthorityChecksum
+        })
+      : turn.agencySnapshotChecksum
   });
   return {
     store,
@@ -574,6 +630,7 @@ function commitInput(store, turn) {
     authoritativeReleaseId: turn.authoritativeReleaseId,
     visibleGroup,
     actionSet,
+    ...(momentTargetAuthorityChecksum ? { momentTargetAuthorityChecksum } : {}),
     statePatch: {
       mood: 'engaged',
       openThreads: [],
@@ -1294,7 +1351,7 @@ test('canonical wire target names are exact while domain target sources stay nat
     }), /target identity conflict/i);
   }));
 
-test('moment and relationship actions commit from fixed authoritative targets', () =>
+test('v3 moment commits reject private relationship actions even with fixed targets', () =>
   withMomentAuthority((store, turn) => {
     const relationshipPayload = {
       baseAction: {
@@ -1319,13 +1376,15 @@ test('moment and relationship actions commit from fixed authoritative targets', 
       ['moment_comment', {
         momentId: 'moment_real', like: true, comment: '我也喜欢这一张。', replyToCommentId: null
       }],
-      ['moment_reply', {
-        momentId: 'moment_real', like: false, comment: '是呀。', replyToCommentId: 'comment_real'
-      }],
-      ['relationship_transition', relationshipPayload]
     ].map(([kind, payload]) => {
       const target = store.resolveCanonicalActionTargetInternal({ turn, action: { kind, payload } });
       return { kind, payload, targetKey: target.targetKey, targetRevision: target.targetRevision };
+    });
+    actions.push({
+      kind: 'relationship_transition',
+      payload: relationshipPayload,
+      targetKey: 'relationship:yuqi',
+      targetRevision: '4'
     });
     const input = commitInput(store, turn);
     input.actionSet = actions;
@@ -1339,14 +1398,12 @@ test('moment and relationship actions commit from fixed authoritative targets', 
       actionSet: input.actionSet,
       contextRevision: turn.agencySnapshotChecksum
     });
-    const receipt = commitVisibleResult(input);
-    assert.deepEqual(
-      store.actionsForGroup(receipt.visibleGroupId).map(action => action.kind),
-      ['moment_like', 'moment_comment', 'moment_reply', 'relationship_transition']
-    );
+    const before = sideEffectCounts(store);
+    assert.throws(() => commitVisibleResult(input), /canonical moment action authority|relationship/i);
+    assert.deepEqual(sideEffectCounts(store), before);
   }));
 
-test('invalid v3 stage persona revisions are rejected before a canonical turn can write', () =>
+test('invalid v3 moment target authority is rejected before a canonical turn can write', () =>
   withStore(store => {
     store.initializeCognitionRolloutsInternal({
       rows: [{
@@ -1360,32 +1417,39 @@ test('invalid v3 stage persona revisions are rejected before a canonical turn ca
     });
     const before = canonicalCreationCounts(store);
     for (const [label, mutate] of [
-      ['missing', scene => { delete scene.stagePersonaRevision; }],
-      ['string', scene => { scene.stagePersonaRevision = '4'; }],
-      ['negative', scene => { scene.stagePersonaRevision = -1; }]
+      ['missing', input => { input.annotationSnapshot = {}; }],
+      ['changed', input => { input.envelope.trigger.context.targetMoment.text = 'changed'; }],
+      ['foreign', input => { input.envelope.trigger.context.targetMoment.momentId = 'moment_foreign'; }]
     ]) {
       const raw = momentEnvelope(`turn_invalid_scene_revision_${label}`);
-      mutate(raw.trigger.context.scene);
+      const envelope = validateEnvelope(raw);
+      const rollout = store.getCognitionRollout('MOMENT_INTERACTION');
+      const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1000 });
+      const authority = {
+        version: 'moment-target-authority-v1',
+        targetMoment: envelope.trigger.context.targetMoment,
+        targetComment: envelope.trigger.context.targetComment
+      };
+      authority.checksum = contentHash(authority);
+      const input = {
+        envelope,
+        rolloutKey: 'MOMENT_INTERACTION',
+        expectedRolloutRevision: rollout.revision,
+        authoritativeReleaseId: rollout.stableReleaseId,
+        comparisonReleaseId: null,
+        comparisonDirection: null,
+        laneKey: envelope.authority.laneKey,
+        expectedLaneRevision: 0,
+        inputUserBatchId: envelope.trigger.triggerId,
+        inputVisibilitySequence: 1,
+        inputClearEpoch: 0,
+        agencySnapshotChecksum: agency.checksum,
+        annotationSnapshot: { momentTargetAuthority: authority }
+      };
+      mutate(input);
       assert.throws(() => {
-        const envelope = validateEnvelope(raw);
-        const rollout = store.getCognitionRollout('MOMENT_INTERACTION');
-        const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1000 });
-        store.createCanonicalVisibleTurnInternal({
-          envelope,
-          rolloutKey: 'MOMENT_INTERACTION',
-          expectedRolloutRevision: rollout.revision,
-          authoritativeReleaseId: rollout.stableReleaseId,
-          comparisonReleaseId: null,
-          comparisonDirection: null,
-          laneKey: envelope.authority.laneKey,
-          expectedLaneRevision: 0,
-          inputUserBatchId: envelope.trigger.triggerId,
-          inputVisibilitySequence: 1,
-          inputClearEpoch: 0,
-          agencySnapshotChecksum: agency.checksum,
-          annotationSnapshot: {}
-        });
-      }, /stagePersonaRevision/i, label);
+        store.createCanonicalVisibleTurnInternal(input);
+      }, /moment target authority|canonical turn authority|authority lane mismatch/i, label);
       assert.deepEqual(canonicalCreationCounts(store), before, label);
     }
   }));
@@ -1494,7 +1558,7 @@ test('moment and relationship payload shapes are closed before canonical writes'
         actionSet: input.actionSet,
         contextRevision: turn.agencySnapshotChecksum
       });
-      assert.throws(() => commitVisibleResult(input), /canonical .* payload|canonical relationship/i);
+      assert.throws(() => commitVisibleResult(input), /canonical .* payload|canonical relationship|moment action authority|action-only/i);
       assert.deepEqual(sideEffectCounts(store), before, kind);
     }
   }));
@@ -1545,6 +1609,7 @@ test('moment aliases foreign identities and changed target proofs fail without v
       targetKey: target.targetKey,
       targetRevision: `${target.targetRevision}_changed`
     }];
+    changed.visibleGroup = { items: [] };
     changed.statePatch = null;
     changed.memoryJobs = [];
     changed.generationFingerprint = generationFingerprint({

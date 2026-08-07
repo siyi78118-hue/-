@@ -149,6 +149,19 @@ const CANONICAL_RESULT_TURN_KINDS = new Set([
   'ROLE_PLAN_CHAT_PRIVATE',
   'ROLE_PLAN_MOMENT_PRIVATE'
 ]);
+const PUBLIC_MOMENT_LANE_KINDS = new Set([
+  'PROACTIVE_MOMENT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_MOMENT_PRIVATE'
+]);
+
+function expectedCanonicalCharacterRecipient({ protocolVersion, turnKind, payloadVersion }) {
+  if (Number(protocolVersion) !== 3 || !PUBLIC_MOMENT_LANE_KINDS.has(turnKind)) return 'user';
+  if (turnKind === 'PROACTIVE_MOMENT' && payloadVersion !== 'pc-visible-commit-v4') {
+    return 'user';
+  }
+  return 'public_moments';
+}
 const BASELINE_V2_CANDIDATE_RELEASE = Object.freeze({
   releaseId: `release_cognition_v2_${BASELINE_V2_CANDIDATE_CHECKSUM.slice(0, 24)}`,
   pipelineVersion: 'cognition-v2-candidate-2026-07-30',
@@ -3433,6 +3446,7 @@ export class YuqiStore {
     const existing = new Set(this.db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table'"
     ).all().map(row => row.name));
+    const hasVisibleResultManifests = existing.has('visible_result_manifests');
     const missing = requiredTables.filter(name => !existing.has(name));
     if (missing.length) throw new Error(`v11 invariant missing tables: ${missing.join(',')}`);
     const assertNoInvariantRow = (code, sql) => {
@@ -3666,7 +3680,8 @@ export class YuqiStore {
       FROM visible_commit_receipts
       WHERE (authority_origin = 'pc'
              AND commit_payload_version NOT IN (
-               'pc-visible-commit-v1', 'pc-visible-commit-v2', 'pc-visible-commit-v3'
+               'pc-visible-commit-v1', 'pc-visible-commit-v2', 'pc-visible-commit-v3',
+               'pc-visible-commit-v4'
              ))
          OR (authority_origin = 'android_fallback'
              AND commit_payload_version NOT IN (
@@ -3765,16 +3780,30 @@ export class YuqiStore {
       SELECT i.group_id, i.ordinal, i.message_id
       FROM visible_result_items i
       JOIN visible_result_groups g ON g.group_id = i.group_id
-      LEFT JOIN messages m
-        ON m.message_id = i.message_id
-       AND m.authority_group_id = i.group_id
-       AND m.group_ordinal = i.ordinal
-       AND m.turn_id = g.authoritative_turn_id
-      WHERE m.message_id IS NULL
-         OR m.character_id IS NOT g.role_id
-         OR m.speaker_id IS NOT g.role_id
-         OR m.speaker_type != 'character'
-         OR m.recipient_id != 'user'
+      ${hasVisibleResultManifests ? 'JOIN visible_result_manifests vm ON vm.group_id = g.group_id' : ''}
+      JOIN turns t ON t.turn_id = g.authoritative_turn_id
+      LEFT JOIN messages msg
+        ON msg.message_id = i.message_id
+       AND msg.authority_group_id = i.group_id
+       AND msg.group_ordinal = i.ordinal
+       AND msg.turn_id = g.authoritative_turn_id
+      WHERE msg.message_id IS NULL
+         OR msg.character_id IS NOT g.role_id
+         OR msg.speaker_id IS NOT g.role_id
+         OR msg.speaker_type != 'character'
+         OR msg.recipient_id != CASE
+              WHEN (
+                json_extract(t.envelope_json, '$.protocolVersion') = 3
+                AND ${hasVisibleResultManifests
+                  ? "((json_extract(t.envelope_json, '$.kind') = 'PROACTIVE_MOMENT' AND vm.payload_version = 'pc-visible-commit-v4') OR json_extract(t.envelope_json, '$.kind') IN ('ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'))"
+                  : '0'}
+              ) OR (
+                json_extract(t.envelope_json, '$.redacted') = 1
+                AND ${hasVisibleResultManifests
+                  ? "((t.rollout_key = 'PROACTIVE_MOMENT' AND vm.payload_version = 'pc-visible-commit-v4') OR t.rollout_key IN ('ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'))"
+                  : '0'}
+              )
+              THEN 'public_moments' ELSE 'user' END
       LIMIT 1
       `);
 
@@ -4413,6 +4442,24 @@ export class YuqiStore {
     const group = groupId == null ? null : this.db.prepare(`
       SELECT * FROM visible_result_groups WHERE group_id = ?
     `).get(String(groupId));
+    const groupManifest = groupId == null ? null : this.db.prepare(`
+      SELECT payload_version FROM visible_result_manifests WHERE group_id = ?
+    `).get(String(groupId));
+    const groupTurn = groupId == null ? null : this.db.prepare(`
+      SELECT envelope_json, rollout_key, result_authority_version
+      FROM turns WHERE turn_id = ?
+    `).get(group.authoritative_turn_id);
+    const groupEnvelope = parseJson(groupTurn?.envelope_json, null);
+    const recipientProtocolVersion = mode === 'redacted'
+      ? (groupManifest?.payload_version === 'pc-visible-commit-v4'
+        || ['ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(groupTurn?.rollout_key)
+        ? 3 : 2)
+      : groupEnvelope?.protocolVersion;
+    const expectedCharacterRecipient = expectedCanonicalCharacterRecipient({
+      protocolVersion: recipientProtocolVersion,
+      turnKind: mode === 'redacted' ? groupTurn?.rollout_key : groupEnvelope?.kind,
+      payloadVersion: groupManifest?.payload_version
+    });
     const expectedCharacterIds = new Set(itemRows.map(item => item.message_id));
     if ((groupId == null && itemRows.length)
       || (groupId != null && (!group
@@ -4431,7 +4478,7 @@ export class YuqiStore {
         || row.turn_id !== group.authoritative_turn_id
         || row.character_id !== group.role_id
         || row.speaker_id !== group.role_id || row.speaker_type !== 'character'
-        || row.recipient_id !== 'user' || row.authority_group_id !== group.group_id
+        || row.recipient_id !== expectedCharacterRecipient || row.authority_group_id !== group.group_id
         || (mode === 'live' && (!semantic
           || row.content !== projection.content
           || row.checksum !== contentHash(projection)))
@@ -4837,6 +4884,7 @@ export class YuqiStore {
     const currentPayload = new Set([
       'pc:pc-visible-commit-v2',
       'pc:pc-visible-commit-v3',
+      'pc:pc-visible-commit-v4',
       'android_fallback:android-fallback-commit-v2'
     ]).has(receiptMatrixKey);
     if ((!historicalPayload && !currentPayload)
@@ -4974,6 +5022,11 @@ export class YuqiStore {
       semantic,
       groupId: groupKey
     });
+    this.assertCanonicalMomentAuthorityInternal({
+      authority,
+      semantic,
+      groupId: groupKey
+    });
 
     const itemRows = this.db.prepare(`
       SELECT i.*, m.content, m.turn_id AS message_turn_id,
@@ -4989,6 +5042,11 @@ export class YuqiStore {
       || itemRows.length !== (semantic.visibleItems || []).length) {
       throw new Error('canonical visible group item authority conflict');
     }
+    const expectedGroupRecipient = expectedCanonicalCharacterRecipient({
+      protocolVersion: parseJson(authority.turn_envelope_json, null)?.protocolVersion,
+      turnKind: authority.turn_kind,
+      payloadVersion: authority.payload_version
+    });
     itemRows.forEach((item, ordinal) => {
       const expected = semantic.visibleItems[ordinal];
       if (Number(item.ordinal) !== ordinal
@@ -5001,7 +5059,7 @@ export class YuqiStore {
         || item.message_character_id !== authority.role_id
         || item.speaker_id !== authority.role_id
         || item.speaker_type !== 'character'
-        || item.recipient_id !== 'user'
+        || item.recipient_id !== expectedGroupRecipient
         || String(item.content) !== String(expected.content)) {
         throw new Error('canonical visible group item authority conflict');
       }
@@ -6672,6 +6730,95 @@ export class YuqiStore {
     };
   }
 
+  rebuildPublicMomentAuthorityInternal({ envelope } = {}) {
+    const consideredAt = canonicalEffectiveAtFromEnvelope(envelope);
+    if (consideredAt === null) throw new Error('public moment authority consideredAt conflict');
+    const episodes = this.listLifeEpisodes(envelope.characterId)
+      .filter(episode => episode?.status === 'completed');
+    const consumedEvidenceIds = new Set(
+      this.listConsumedPublicMomentEvidenceIdsInternal({ roleId: envelope.characterId })
+    );
+    const candidates = [];
+    for (const episode of episodes) {
+      const marker = episode.payload?.publicMomentCandidate;
+      if (!marker || typeof marker !== 'object' || Array.isArray(marker)
+        || canonicalJson(Object.keys(marker).sort())
+          !== canonicalJson(['summary', 'version', 'visibility'])
+        || marker.version !== 'public-moment-candidate-v1'
+        || marker.visibility !== 'public'
+        || typeof marker.summary !== 'string'
+        || marker.summary.trim() !== marker.summary
+        || marker.summary.length < 1 || marker.summary.length > 280) {
+        continue;
+      }
+      const occurredAt = episode.endAt;
+      const expiresAt = occurredAt + 12 * 60 * 60_000;
+      if (!Number.isSafeInteger(occurredAt) || !Number.isSafeInteger(expiresAt)
+        || occurredAt > consideredAt || consideredAt >= expiresAt) continue;
+      const evidenceId = `public_event_${contentHash({
+        sourceEpisodeId: episode.episodeId,
+        sourceChecksum: episode.checksum
+      }).slice(0, 24)}`;
+      if (consumedEvidenceIds.has(evidenceId)) continue;
+      candidates.push({
+        evidenceId,
+        sourceEpisodeId: episode.episodeId,
+        sourceChecksum: episode.checksum,
+        occurredAt,
+        expiresAt,
+        summary: marker.summary
+      });
+    }
+    candidates.sort((left, right) => right.occurredAt - left.occurredAt
+      || left.evidenceId.localeCompare(right.evidenceId));
+    candidates.splice(3);
+    const agency = this.readAgencyAuthoritySnapshotInternal({
+      roleId: envelope.characterId,
+      at: consideredAt
+    });
+    const refs = [];
+    for (const constraint of agency.constraints || []) {
+      const channel = constraint?.scope?.channel;
+      if (constraint?.status === 'active'
+        && (channel === 'public_moment' || channel === 'all')
+        && (constraint.kind === 'action' || constraint.kind === 'consent')
+        && (constraint.rule === 'deny_public_moment' || constraint.rule === 'deny_all_public_actions')
+        && typeof constraint.constraintId === 'string' && constraint.constraintId.trim()
+        && Number.isSafeInteger(constraint.revision) && constraint.revision >= 0) {
+        refs.push({ constraintId: constraint.constraintId.trim(), revision: constraint.revision });
+      }
+    }
+    refs.sort((left, right) => left.constraintId.localeCompare(right.constraintId)
+      || left.revision - right.revision);
+    const authority = {
+      version: 'public-moment-authority-v1',
+      consideredAt,
+      candidates,
+      structuralSilence: refs.length
+        ? { reasonCode: 'ACTIVE_PUBLIC_MOMENT_CONSTRAINT', constraintRefs: refs }
+        : null
+    };
+    return { ...authority, checksum: contentHash(authority) };
+  }
+
+  rebuildMomentTargetAuthorityInternal({ envelope } = {}) {
+    if (!envelope || envelope.protocolVersion !== 3
+      || !['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(envelope.kind)) {
+      throw new Error('moment target authority conflict');
+    }
+    const targetMoment = envelope.trigger?.context?.targetMoment;
+    const targetComment = envelope.trigger?.context?.targetComment ?? null;
+    if (!targetMoment || typeof targetMoment !== 'object' || Array.isArray(targetMoment)) {
+      throw new Error('moment target authority conflict');
+    }
+    const authority = {
+      version: 'moment-target-authority-v1',
+      targetMoment,
+      targetComment
+    };
+    return { ...authority, checksum: contentHash(authority) };
+  }
+
   assertCanonicalProactiveAuthorityInternal({ authority, semantic, groupId = null }) {
     const envelope = parseJson(authority.turn_envelope_json, null);
     const proactive = authority.turn_kind === 'PROACTIVE_CHAT';
@@ -6824,6 +6971,112 @@ export class YuqiStore {
     return motiveAuthority;
   }
 
+  assertCanonicalMomentAuthorityInternal({ authority, semantic } = {}) {
+    const envelope = parseJson(authority?.turn_envelope_json, null);
+    const kind = authority?.turn_kind;
+    const isMoment = ['PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(kind);
+    const hasV4Field = Object.hasOwn(semantic || {}, 'publicMomentEvidenceIds')
+      || Object.hasOwn(semantic || {}, 'momentTargetAuthorityChecksum');
+    if (!isMoment) {
+      if (hasV4Field || authority?.payload_version === 'pc-visible-commit-v4') {
+        throw new Error('canonical moment authority conflict');
+      }
+      return null;
+    }
+    if (Number(envelope?.protocolVersion) !== 3) {
+      if (hasV4Field || authority?.payload_version === 'pc-visible-commit-v4') {
+        throw new Error('canonical moment authority conflict');
+      }
+      return null;
+    }
+    if (authority?.payload_version !== 'pc-visible-commit-v4') {
+      throw new Error('canonical moment authority conflict');
+    }
+    const annotation = parseJson(authority.turn_annotation_snapshot_json, null);
+    if (kind === 'PROACTIVE_MOMENT') {
+      const publicAuthority = annotation?.publicMomentAuthority;
+      const ids = semantic.publicMomentEvidenceIds;
+      if (Object.hasOwn(semantic, 'momentTargetAuthorityChecksum')
+        || !publicAuthority || typeof publicAuthority !== 'object'
+        || Array.isArray(publicAuthority)
+        || Object.keys(publicAuthority).sort().join(',')
+          !== 'candidates,checksum,consideredAt,structuralSilence,version'
+        || publicAuthority.version !== 'public-moment-authority-v1'
+        || typeof publicAuthority.checksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(publicAuthority.checksum)
+        || !Number.isSafeInteger(publicAuthority.consideredAt)
+        || contentHash({
+          version: publicAuthority.version,
+          consideredAt: publicAuthority.consideredAt,
+          candidates: publicAuthority.candidates,
+          structuralSilence: publicAuthority.structuralSilence
+        }) !== publicAuthority.checksum) {
+        throw new Error('public moment authority conflict');
+      }
+      const pinned = new Set((publicAuthority?.candidates || []).map(candidate => candidate?.evidenceId));
+      if (!publicAuthority || !Array.isArray(ids)
+        || new Set(ids).size !== ids.length
+        || ids.some(id => typeof id !== 'string' || !pinned.has(id))
+        || ids.length > 3
+        || ((semantic.visibleItems?.length || semantic.actions?.length) > 0
+          ? ids.length < 1 || ids.length > 3
+          : ids.length !== 0)) {
+        throw new Error('public moment evidence authority conflict');
+      }
+      const contextRevision = contentHash({
+        agencySnapshotChecksum: authority.turn_agency_snapshot_checksum,
+        momentTargetAuthorityChecksum: publicAuthority.checksum
+      });
+      const expectedFingerprint = generationFingerprint({
+        roleId: authority.role_id,
+        laneKey: authority.lane_key,
+        inputVisibilitySequence: authority.input_visibility_sequence,
+        visibleGroup: { items: semantic.visibleItems || [] },
+        actionSet: semantic.actions || [],
+        contextRevision
+      });
+      if (authority.generation_fingerprint !== expectedFingerprint
+        || semantic.generationFingerprint !== expectedFingerprint) {
+        throw new Error('canonical moment generation fingerprint conflict');
+      }
+      return publicAuthority;
+    }
+    const targetAuthority = annotation?.momentTargetAuthority;
+    if (Object.hasOwn(semantic, 'publicMomentEvidenceIds')
+      || !targetAuthority || typeof targetAuthority !== 'object'
+      || Array.isArray(targetAuthority)
+      || Object.keys(targetAuthority).sort().join(',')
+        !== 'checksum,targetComment,targetMoment,version') {
+      throw new Error('moment target authority conflict');
+    }
+    if (typeof semantic.momentTargetAuthorityChecksum !== 'string'
+      || semantic.momentTargetAuthorityChecksum !== targetAuthority.checksum
+      || contentHash({
+        version: targetAuthority.version,
+        targetMoment: targetAuthority.targetMoment,
+        targetComment: targetAuthority.targetComment
+      }) !== targetAuthority.checksum) {
+      throw new Error('moment target authority conflict');
+    }
+    const contextRevision = contentHash({
+      agencySnapshotChecksum: authority.turn_agency_snapshot_checksum,
+      momentTargetAuthorityChecksum: targetAuthority.checksum
+    });
+    const expectedFingerprint = generationFingerprint({
+      roleId: authority.role_id,
+      laneKey: authority.lane_key,
+      inputVisibilitySequence: authority.input_visibility_sequence,
+      visibleGroup: { items: semantic.visibleItems || [] },
+      actionSet: semantic.actions || [],
+      contextRevision
+    });
+    if (authority.generation_fingerprint !== expectedFingerprint
+      || semantic.generationFingerprint !== expectedFingerprint) {
+      throw new Error('canonical moment generation fingerprint conflict');
+    }
+    return targetAuthority;
+  }
+
   createCanonicalVisibleTurnInternal(input = {}) {
     for (const forbidden of [
       'resultAuthorityVersion',
@@ -6923,6 +7176,21 @@ export class YuqiStore {
 
       let validatedRetry = null;
       let freshProactiveAgencySnapshot = null;
+      if (!retry && envelope.protocolVersion === 3 && envelope.kind === 'PROACTIVE_MOMENT') {
+        const expectedAuthority = this.rebuildPublicMomentAuthorityInternal({ envelope });
+        if (canonicalJson(input.annotationSnapshot?.publicMomentAuthority || null)
+          !== canonicalJson(expectedAuthority)) {
+          throw new Error('public moment authority conflict');
+        }
+      }
+      if (!retry && envelope.protocolVersion === 3
+        && ['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(envelope.kind)) {
+        const expectedTargetAuthority = this.rebuildMomentTargetAuthorityInternal({ envelope });
+        if (canonicalJson(input.annotationSnapshot?.momentTargetAuthority || null)
+          !== canonicalJson(expectedTargetAuthority)) {
+          throw new Error('moment target authority conflict');
+        }
+      }
       if (!retry && envelope.protocolVersion === 3 && envelope.kind === 'PROACTIVE_CHAT') {
         const rebuilt = this.rebuildProactiveMotiveAuthorityInternal({ envelope });
         if (canonicalJson(input.annotationSnapshot?.proactiveMotiveAuthority || null)
@@ -7418,7 +7686,8 @@ export class YuqiStore {
     if (!safeTargetId) throw new Error('canonical action target not found');
     const envelope = parseJson(turn.envelopeJson, {});
     const context = envelope.context || envelope.featureContext || {};
-    const triggerInput = envelope.trigger?.context?.input;
+    const triggerContext = envelope.trigger?.context || {};
+    const triggerInput = triggerContext.input || triggerContext;
     const inputSnapshot = (candidate, idKeys) => {
       if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
       const candidateId = idKeys.map(key => candidate[key]).find(value => value != null);
@@ -9402,6 +9671,43 @@ export class YuqiStore {
         throw new Error('proactive motive manifest evidence authority conflict');
       }
       for (const id of evidence) ids.add(id);
+    }
+    return [...ids].sort();
+  }
+
+  listConsumedPublicMomentEvidenceIdsInternal({ roleId = 'yuqi', excludeGroupId = null } = {}) {
+    const rows = this.db.prepare(`
+      SELECT m.group_id, m.semantic_json, m.semantic_checksum
+      FROM visible_result_manifests m
+      JOIN visible_result_groups g ON g.group_id = m.group_id
+      JOIN turns t ON t.turn_id = g.authoritative_turn_id
+      WHERE t.character_id = ?
+        AND t.result_authority_version = 1
+        AND t.rollout_key = 'PROACTIVE_MOMENT'
+        AND json_extract(t.envelope_json, '$.protocolVersion') = 3
+        AND t.state IN ('committed', 'delivered', 'completed')
+        AND m.payload_version = 'pc-visible-commit-v4'
+        AND (? IS NULL OR m.group_id <> ?)
+      ORDER BY m.created_at, t.turn_id
+    `).all(String(roleId), excludeGroupId, excludeGroupId);
+    const ids = new Set();
+    for (const row of rows) {
+      const closure = this.assertVisibleGroupAuthorityInternal(row.group_id, {
+        purpose: 'public_moment_consumption'
+      });
+      if (closure.status === 'redacted') continue;
+      if (closure.status !== 'live' || !closure.manifest?.semantic) {
+        throw new Error('public moment manifest authority conflict');
+      }
+      const manifest = closure.manifest.semantic;
+      if (contentHash(manifest) !== row.semantic_checksum
+        || manifest.payloadVersion !== 'pc-visible-commit-v4'
+        || !Array.isArray(manifest.publicMomentEvidenceIds)
+        || new Set(manifest.publicMomentEvidenceIds).size !== manifest.publicMomentEvidenceIds.length
+        || manifest.publicMomentEvidenceIds.some(id => typeof id !== 'string' || !id.trim())) {
+        throw new Error('public moment manifest evidence authority conflict');
+      }
+      for (const id of manifest.publicMomentEvidenceIds) ids.add(id);
     }
     return [...ids].sort();
   }
@@ -11447,6 +11753,13 @@ export class YuqiStore {
   putLifePlanInternal(characterId, episodes, { sourceTurnId = null } = {}) {
     const safeCharacterId = String(characterId || '');
     if (!safeCharacterId || !Array.isArray(episodes)) throw new Error('invalid life plan');
+    for (const item of episodes) {
+      if (item?.payload && typeof item.payload === 'object'
+        && !Array.isArray(item.payload)
+        && Object.hasOwn(item.payload, 'publicMomentCandidate')) {
+        throw new Error('reserved public moment candidate requires trusted life-result writer');
+      }
+    }
     const forbiddenKinds = /(?:accident|illness|hospital|job_loss|identity_change|new_relationship|事故|生病|疾病|住院|失业|辞职|新恋情|身份变化)/i;
     const normalized = episodes.map(item => {
       const episode = {

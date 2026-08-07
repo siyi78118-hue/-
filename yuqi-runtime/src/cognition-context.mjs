@@ -9,6 +9,37 @@ export const COGNITION_CONTEXT_LIMITS = Object.freeze({
   socialLessons: 5
 });
 
+const PUBLIC_MOMENT_KINDS = new Set([
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_MOMENT_PRIVATE'
+]);
+
+function isPublicMomentKind(kind) {
+  return PUBLIC_MOMENT_KINDS.has(String(kind || ''));
+}
+
+function publicEnvelopeProjection(envelope) {
+  const source = envelope && typeof envelope === 'object' ? envelope : {};
+  const projected = {};
+  for (const key of ['protocolVersion', 'turnId', 'characterId', 'deviceId', 'deviceSeq', 'createdAt', 'kind']) {
+    if (source[key] !== undefined) projected[key] = structuredClone(source[key]);
+  }
+  if (source.trigger && typeof source.trigger === 'object') {
+    const trigger = {};
+    for (const key of ['triggerId', 'triggerType', 'scheduledFor', 'executedAt']) {
+      if (source.trigger[key] !== undefined) trigger[key] = structuredClone(source.trigger[key]);
+    }
+    // Public moment authority is carried in the store-owned turn annotation;
+    // transport trigger context is intentionally not a cognition input.
+    trigger.context = {};
+    projected.trigger = trigger;
+  }
+  return projected;
+}
+
 export class CognitionContextOverflowError extends Error {
   constructor(regionCharacters) {
     super('protected cognition context exceeds model limit');
@@ -183,6 +214,23 @@ export async function buildCognitionContext({
   catalog,
   maxCharacters = 80_000
 }) {
+  if (isPublicMomentKind(envelope?.kind)) {
+    return {
+      kind: envelope?.kind,
+      characterId: envelope?.characterId,
+      currentBatch: { messageIds: [], messages: [] },
+      trigger: envelope?.trigger || null,
+      relationshipStage: null,
+      activeExplicitBoundaries: [],
+      payment: null,
+      recentMessages: [],
+      memoryItems: [],
+      openThreads: [],
+      socialLessons: [],
+      lifeContext: null,
+      trimmedRegions: []
+    };
+  }
   const batchMessages = (currentBatch?.messages || []).map(sanitizeCognitionMessage);
   const currentMessageIds = batchMessages.map(item => item.messageId).filter(Boolean);
   const allMessages = typeof store?.listMessages === 'function'
@@ -251,6 +299,39 @@ export async function buildCognitionContext({
 export async function buildCognitionV3Input(input) {
   const context = await buildCognitionContext(input);
   const roleId = String(input.envelope?.characterId || '');
+  if (isPublicMomentKind(input.envelope?.kind)) {
+    const sourceTurn = input.turn && typeof input.turn === 'object' ? input.turn : {};
+    const annotationSnapshot = {};
+    for (const key of ['publicMomentAuthority', 'momentTargetAuthority']) {
+      if (sourceTurn.annotationSnapshot?.[key] !== undefined) {
+        annotationSnapshot[key] = structuredClone(sourceTurn.annotationSnapshot[key]);
+      }
+    }
+    return {
+      envelope: publicEnvelopeProjection(input.envelope),
+      turn: {
+        protocolVersion: sourceTurn.protocolVersion ?? input.envelope?.protocolVersion,
+        turnKind: sourceTurn.turnKind || sourceTurn.rolloutKey || input.envelope?.kind,
+        rolloutKey: sourceTurn.rolloutKey || input.envelope?.kind,
+        annotationSnapshot
+      },
+      currentBatch: context.currentBatch,
+      relevantHistory: [],
+      verifiedFacts: [],
+      constraints: [],
+      preferences: [],
+      stances: [],
+      relationship: null,
+      lifeSignals: [],
+      socialExperience: [],
+      openThreads: [],
+      publicMomentAuthority: input.turn?.annotationSnapshot?.publicMomentAuthority || null,
+      momentTargetAuthority: input.turn?.annotationSnapshot?.momentTargetAuthority || null,
+      publicPrivacy: input.publicPrivacy && typeof input.publicPrivacy === 'object'
+        ? { allowPublic: input.publicPrivacy.allowPublic === true }
+        : { allowPublic: true }
+    };
+  }
   return {
     ...input,
     currentBatch: context.currentBatch,

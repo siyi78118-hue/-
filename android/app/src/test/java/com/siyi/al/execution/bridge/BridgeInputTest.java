@@ -2,6 +2,7 @@ package com.siyi.al.execution.bridge;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertThrows;
 
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -226,8 +227,11 @@ public class BridgeInputTest {
 
     @Test
     public void v3MomentReplyUsesOneExplicitMomentForItsLaneAndTriggerContext() throws Exception {
+        JSONObject targetMoment = validationMoment();
+        JSONObject targetComment = targetMoment.getJSONArray("comments").getJSONObject(0);
         JSONObject input = new JSONObject()
-            .put("momentId", "moment_authoritative_7")
+            .put("targetMoment", targetMoment)
+            .put("targetComment", targetComment)
             .put("scheduledFor", 4000L)
             .put("comment", "这条我看见了");
         JSONObject snapshot = new JSONObject()
@@ -259,16 +263,124 @@ public class BridgeInputTest {
             BridgeInput.rootSourceId(submission), "lineage_moment_7", 1L, null, cursor
         );
 
-        assertEquals("moment_interaction:moment_authoritative_7", lane);
+        assertEquals("moment_interaction:moment_validation", lane);
         assertEquals(
-            "moment_authoritative_7",
-            envelope.getJSONObject("trigger").getJSONObject("context").getString("momentId")
+            "moment_validation",
+            envelope.getJSONObject("trigger").getJSONObject("context")
+                .getJSONObject("targetMoment").getString("momentId")
         );
-        assertEquals(false, envelope.getJSONObject("trigger").getJSONObject("context")
-            .getJSONObject("snapshot").has("_alBridgeProtocol"));
+        assertEquals("comment_validation", envelope.getJSONObject("trigger")
+            .getJSONObject("context").getJSONObject("targetComment").getString("commentId"));
+        assertEquals(2, envelope.getJSONObject("trigger").getJSONObject("context").length());
         assertEquals(1, envelope.getJSONObject("context").length());
         assertEquals(1L, envelope.getJSONObject("context")
             .getJSONObject("visibilityCursor").getLong("localSequence"));
+    }
+
+    @Test
+    public void v3MomentReplyProjectsOnlyCanonicalTargetMomentAndComment() throws Exception {
+        JSONObject targetMoment = new JSONObject()
+            .put("momentId", "moment_authoritative_8")
+            .put("authorType", "character")
+            .put("authorId", "yuqi")
+            .put("text", "公开动态")
+            .put("createdAt", 3900L)
+            .put("likes", new JSONArray().put("user"))
+            .put("comments", new JSONArray().put(new JSONObject()
+                .put("commentId", "comment_authoritative_8")
+                .put("authorType", "user")
+                .put("authorId", "user")
+                .put("text", "我看到了")
+                .put("createdAt", 3950L)
+                .put("replyToCommentId", JSONObject.NULL)));
+        JSONObject targetComment = targetMoment.getJSONArray("comments").getJSONObject(0);
+        JSONObject input = new JSONObject()
+            .put("targetMoment", targetMoment)
+            .put("targetComment", targetComment)
+            .put("momentId", "legacy_must_not_win")
+            .put("playerComment", "legacy comment")
+            .put("replyToCommentId", "legacy_comment_id")
+            .put("scheduledFor", 4000L);
+        JSONObject snapshot = new JSONObject()
+            .put("scene", new JSONObject().put("kind", "moment_reply"))
+            .put("moment", new JSONObject().put("momentId", "legacy_snapshot_moment"))
+            .put("playerComment", "legacy snapshot comment")
+            .put("replyToCommentId", "legacy_snapshot_comment_id")
+            .put("_alBridgeProtocol", new JSONObject()
+                .put("version", 3)
+                .put("owner", "room-v12"));
+        TurnSubmission submission = new TurnSubmission(
+            "local_moment_reply_8", "yuqi", "moment-trigger-8", TurnKind.MOMENT_REPLY,
+            input.toString(), snapshot.toString(), "cloud-8", 4000L
+        );
+        JSONObject envelope = BridgeInput.prepareV3Envelope(
+            submission, "device1", "turn_local_moment_reply_8",
+            "moment_interaction:moment_authoritative_8", "trigger_moment-trigger-8",
+            "lineage_moment_8", 1L, null, emptyCursor(1L)
+        );
+        JSONObject context = envelope.getJSONObject("trigger").getJSONObject("context");
+
+        assertEquals(2, context.length());
+        assertEquals(BridgeAuthority.canonicalJson(targetMoment),
+            BridgeAuthority.canonicalJson(context.getJSONObject("targetMoment")));
+        assertEquals(BridgeAuthority.canonicalJson(targetComment),
+            BridgeAuthority.canonicalJson(context.getJSONObject("targetComment")));
+        assertFalse(context.has("input"));
+        assertFalse(context.has("snapshot"));
+        assertFalse(context.has("moment"));
+        assertFalse(context.has("momentId"));
+        assertFalse(context.has("playerComment"));
+        assertFalse(context.has("replyToCommentId"));
+    }
+
+    @Test
+    public void v3MomentTargetsRejectFractionNonFiniteAndOverSafeCreatedAt() throws Exception {
+        JSONObject validMoment = validationMoment();
+        JSONObject validComment = validMoment.getJSONArray("comments").getJSONObject(0);
+
+        JSONObject fractionMoment = new JSONObject(validMoment.toString()).put("createdAt", 1000.5d);
+        assertMomentRejected(fractionMoment, validComment);
+
+        JSONObject overflowMoment = new JSONObject(validMoment.toString())
+            .put("createdAt", 9007199254740992L);
+        assertMomentRejected(overflowMoment, validComment);
+
+        JSONObject fractionComment = new JSONObject(validComment.toString()).put("createdAt", 1100.5d);
+        JSONObject fractionCommentMoment = new JSONObject(validMoment.toString())
+            .put("comments", new JSONArray().put(fractionComment));
+        assertMomentRejected(fractionCommentMoment, fractionComment);
+
+        JSONObject overflowComment = new JSONObject(validComment.toString())
+            .put("createdAt", 9007199254740992L);
+        JSONObject overflowCommentMoment = new JSONObject(validMoment.toString())
+            .put("comments", new JSONArray().put(overflowComment));
+        assertMomentRejected(overflowCommentMoment, overflowComment);
+
+        JSONObject validInput = new JSONObject()
+            .put("targetMoment", validMoment)
+            .put("targetComment", validComment)
+            .put("scheduledFor", 4000L);
+        String nonFiniteMoment = validInput.toString()
+            .replaceFirst("\\\"createdAt\\\":1000", "\\\"createdAt\\\":NaN");
+        assertMomentRawRejected(nonFiniteMoment);
+        String nonFiniteComment = validInput.toString()
+            .replaceFirst("\\\"createdAt\\\":1100", "\\\"createdAt\\\":Infinity");
+        assertMomentRawRejected(nonFiniteComment);
+    }
+
+    @Test
+    public void v3MomentTargetsRejectAliasAuthorIdentitiesAndPlayerLike() throws Exception {
+        JSONObject validMoment = validationMoment();
+        JSONObject validComment = validMoment.getJSONArray("comments").getJSONObject(0);
+        JSONObject wrongUser = new JSONObject(validMoment.toString())
+            .put("authorType", "user").put("authorId", "character_1");
+        assertMomentRejected(wrongUser, validComment);
+        JSONObject wrongCharacter = new JSONObject(validMoment.toString())
+            .put("authorType", "character").put("authorId", "user");
+        assertMomentRejected(wrongCharacter, validComment);
+        JSONObject aliasLike = new JSONObject(validMoment.toString())
+            .put("likes", new JSONArray().put("player"));
+        assertMomentRejected(aliasLike, validComment);
     }
 
     @Test
@@ -288,6 +400,13 @@ public class BridgeInputTest {
             JSONObject input = new JSONObject()
                 .put("scheduledFor", 5000L)
                 .put("momentId", "moment_" + suffix);
+            if (kind == TurnKind.MOMENT_INTERACTION || kind == TurnKind.MOMENT_REPLY) {
+                JSONObject targetMoment = validationMoment();
+                input.put("targetMoment", targetMoment);
+                input.put("targetComment", kind == TurnKind.MOMENT_REPLY
+                    ? targetMoment.getJSONArray("comments").getJSONObject(0)
+                    : JSONObject.NULL);
+            }
             JSONObject snapshot = new JSONObject()
                 .put("semantic", "kept_" + suffix)
                 .put("momentId", "moment_" + suffix)
@@ -309,9 +428,17 @@ public class BridgeInputTest {
             assertEquals("trigger_source_" + suffix,
                 envelope.getJSONObject("authority").getString("rootSourceId"));
             JSONObject embedded = envelope.getJSONObject("trigger").getJSONObject("context")
-                .getJSONObject("snapshot");
-            assertEquals("kept_" + suffix, embedded.getString("semantic"));
-            assertEquals(false, embedded.has("_alBridgeProtocol"));
+                ;
+            if (kind == TurnKind.PROACTIVE_MOMENT) {
+                assertEquals(0, embedded.length());
+            } else if (kind == TurnKind.MOMENT_INTERACTION || kind == TurnKind.MOMENT_REPLY) {
+                assertEquals("moment_validation", embedded.getJSONObject("targetMoment")
+                    .getString("momentId"));
+            } else {
+                JSONObject snapshotProjection = embedded.getJSONObject("snapshot");
+                assertEquals("kept_" + suffix, snapshotProjection.getString("semantic"));
+                assertEquals(false, snapshotProjection.has("_alBridgeProtocol"));
+            }
         }
     }
 
@@ -404,6 +531,42 @@ public class BridgeInputTest {
             .put("recipientId", "yuqi")
             .put("content", content)
             .put("sentAt", sentAt);
+    }
+
+    private static JSONObject validationMoment() throws Exception {
+        return new JSONObject()
+            .put("momentId", "moment_validation")
+            .put("authorType", "character")
+            .put("authorId", "yuqi")
+            .put("text", "公开动态")
+            .put("createdAt", 1000L)
+            .put("likes", new JSONArray().put("user"))
+            .put("comments", new JSONArray().put(new JSONObject()
+                .put("commentId", "comment_validation")
+                .put("authorType", "user")
+                .put("authorId", "user")
+                .put("text", "我看到了")
+                .put("createdAt", 1100L)
+                .put("replyToCommentId", JSONObject.NULL)));
+    }
+
+    private static void assertMomentRejected(JSONObject moment, JSONObject comment) throws Exception {
+        JSONObject input = new JSONObject()
+            .put("targetMoment", moment)
+            .put("targetComment", comment)
+            .put("scheduledFor", 4000L);
+        assertMomentRawRejected(input.toString());
+    }
+
+    private static void assertMomentRawRejected(String inputJson) throws Exception {
+        TurnSubmission submission = new TurnSubmission(
+            "local_validation", "yuqi", "moment-validation", TurnKind.MOMENT_REPLY,
+            inputJson, "{}", "cloud-validation", 4000L
+        );
+        assertThrows(Exception.class, () -> BridgeInput.prepareV3Envelope(
+            submission, "device1", "turn_validation", "moment_interaction:moment_validation",
+            "trigger_moment-validation", "lineage_validation", 1L, null, emptyCursor(1L)
+        ));
     }
 
     private static JSONObject openOutcome() throws Exception {

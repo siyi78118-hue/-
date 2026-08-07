@@ -246,7 +246,12 @@ test('v3 dry-run calls cognition and expression without checkpoints or nested sh
     throw new Error('dry-run attempted a checkpoint write');
   };
   let shadowQueued = 0;
-  const client = new FakeClient(cognitionResult(), expressionResult());
+  const client = new FakeClient(
+    cognitionResult({
+      interactionRead: { ...cognitionResult().interactionRead, evidenceMessageIds: [] }
+    }),
+    expressionResult()
+  );
   const result = await runCognitionV3Turn(input({
     store,
     client,
@@ -370,6 +375,72 @@ test('v3 production draft rejects a motive id outside the persisted pinned autho
     }),
     /motiveEvidenceIds must cite one to three pinned motives/
   );
+});
+
+test('v3 public role-plan release path strips raw scene and trigger context at both model calls', async () => {
+  const store = new FakeStore();
+  for (const name of ['listMessages', 'listFacts', 'listActiveConstraints', 'listActiveStances']) {
+    store[name] = () => { throw new Error(`private reader ${name} must not run`); };
+  }
+  const client = new FakeClient(
+    cognitionResult({
+      interactionRead: { ...cognitionResult().interactionRead, evidenceMessageIds: [] }
+    }),
+    expressionResult()
+  );
+  const pipeline = new CognitivePipeline({
+    store,
+    codexClient: client,
+    presetRegistry: { resolvePresetBundle: ({ role }) => `${role}:pinned` }
+  });
+  const rawEnvelope = {
+    ...envelope(),
+    turnKind: 'ROLE_PLAN_MOMENT_PRIVATE',
+    kind: 'ROLE_PLAN_MOMENT_PRIVATE',
+    trigger: {
+      ...envelope().trigger,
+      context: {
+        input: { secret: 'PRIVATE_TRIGGER_INPUT' },
+        snapshot: { secret: 'PRIVATE_TRIGGER_SNAPSHOT' },
+        scene: { secret: 'PRIVATE_TRIGGER_SCENE' }
+      }
+    }
+  };
+  await pipeline.runV3ReleaseDraft({
+    release: v3Release(),
+    execution: {
+      turn: {
+        turnId: 'turn_public_role_plan_pipeline',
+        characterId: 'yuqi',
+        protocolVersion: 3,
+        rolloutKey: 'ROLE_PLAN_MOMENT_PRIVATE',
+        annotationSnapshot: {}
+      },
+      envelope: rawEnvelope,
+      currentBatch: { messages: [{ messageId: 'u1', type: 'text', text: 'hello', sentAt: 100 }] },
+      scene: { secret: 'PRIVATE_EXECUTION_SCENE' },
+      client
+    },
+    dryRun: true
+  });
+  assert.equal(client.calls.length, 2);
+  for (const call of client.calls) {
+    assert.equal(JSON.stringify(call.payload).includes('PRIVATE_'), false);
+  }
+  assert.deepEqual(client.calls[0].payload.cognitionEnvelope.featureContext, {
+    rolePlan: null,
+    occurrence: null,
+    publicPrivacy: {
+      version: 'public-boundary-v1',
+      visibility: 'public',
+      recipientId: 'public_moments',
+      allowPrivateChatContext: false,
+      allowPaymentContext: false,
+      allowRelationshipContext: false,
+      allowPrivateMemoryContext: false
+    }
+  });
+  assert.equal(JSON.stringify(client.calls[1].payload.expressionBrief).includes('PRIVATE_'), false);
 });
 
 test('release draft rejects write capabilities during dry-run before calling a model', async () => {

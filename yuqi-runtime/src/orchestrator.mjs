@@ -22,6 +22,23 @@ export function canonicalActionSetForDraft({ isProactiveV3, draft, resolve }) {
   if (typeof resolve !== 'function') throw new Error('canonical action resolver is required');
   return isProactiveV3 && draft?.action === 'skip' ? [] : resolve();
 }
+
+export function assertCanonicalActionSetForTurn({ turnKind, action, actionSet } = {}) {
+  if (!Array.isArray(actionSet)) throw new Error('canonical moment action authority conflict');
+  const kind = String(turnKind || '');
+  if (!['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(kind)) return true;
+  if (action === 'skip') {
+    if (actionSet.length !== 0) throw new Error('canonical moment action authority conflict');
+    return true;
+  }
+  const allowed = kind === 'MOMENT_REPLY'
+    ? new Set(['moment_reply'])
+    : new Set(['moment_like', 'moment_comment']);
+  if (actionSet.length === 0 || actionSet.some(item => !allowed.has(item?.kind))) {
+    throw new Error('canonical moment action authority conflict');
+  }
+  return true;
+}
 import { generationFingerprint, laneKeyForEnvelope } from './interaction-lanes.mjs';
 import { commitVisibleResult } from './visible-result-commit.mjs';
 import {
@@ -83,6 +100,14 @@ const CANONICAL_TURN_KINDS = new Set([
   'PROACTIVE_MOMENT',
   'MOMENT_INTERACTION',
   'MOMENT_REPLY'
+]);
+
+const PUBLIC_MOMENT_KINDS = new Set([
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_MOMENT_PRIVATE'
 ]);
 
 export function canonicalInteractionAt(envelope, fallback = Date.now()) {
@@ -339,6 +364,13 @@ export function shouldSkipProactiveSilence(turn) {
   const authority = turn?.annotationSnapshot?.proactiveMotiveAuthority;
   if (!authority || !Array.isArray(authority.candidates)) return false;
   return authority.candidates.length === 0 || authority.structuralSilence != null;
+}
+
+export function shouldSkipPublicMomentSilence(turn) {
+  if (Number(turn?.protocolVersion) !== 3 || turn?.rolloutKey !== 'PROACTIVE_MOMENT') return false;
+  const authority = turn?.annotationSnapshot?.publicMomentAuthority;
+  return Boolean(authority && Array.isArray(authority.candidates)
+    && (authority.candidates.length === 0 || authority.structuralSilence != null));
 }
 
 function normalizeConversationFrame(frame) {
@@ -701,7 +733,15 @@ export class YuqiOrchestrator {
               hardConstraints: agencySnapshot.constraints || []
             })
           }
-        : {});
+        : envelope.kind === 'PROACTIVE_MOMENT'
+          ? {
+              publicMomentAuthority: this.store.rebuildPublicMomentAuthorityInternal({ envelope })
+            }
+          : ['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(envelope.kind)
+            ? {
+                momentTargetAuthority: this.store.rebuildMomentTargetAuthorityInternal({ envelope })
+              }
+            : {});
     const creation = this.store.createCanonicalVisibleTurnInternal({
       envelope,
       rolloutKey: envelope.kind,
@@ -1833,6 +1873,62 @@ export class YuqiOrchestrator {
     });
   }
 
+  commitCanonicalMomentSkip(turn, envelope) {
+    const isProactiveMoment = turn.rolloutKey === 'PROACTIVE_MOMENT';
+    const authority = isProactiveMoment
+      ? turn.annotationSnapshot?.publicMomentAuthority
+      : turn.annotationSnapshot?.momentTargetAuthority;
+    const authorityChecksum = authority?.checksum;
+    if (!authority || typeof authorityChecksum !== 'string'
+      || !/^[a-f0-9]{64}$/.test(authorityChecksum)) {
+      throw new Error('moment authority conflict');
+    }
+    const current = this.store.getTurn(turn.turnId);
+    const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
+    const lane = this.store.getInteractionLane(turn.characterId, turn.laneKey);
+    const visibleGroup = { items: [] };
+    const actionSet = [];
+    const fingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup,
+      actionSet,
+      contextRevision: contentHash({
+        agencySnapshotChecksum: turn.agencySnapshotChecksum,
+        momentTargetAuthorityChecksum: authorityChecksum
+      })
+    });
+    return commitVisibleResult({
+      store: this.store,
+      turnId: turn.turnId,
+      authorityLineageKey: turn.authorityLineageKey,
+      laneKey: turn.laneKey,
+      expectedTurnRevision: current.turnRevision,
+      expectedLineageRevision: lineage.revision,
+      expectedLaneRevision: lane.revision,
+      expectedCognitiveStateRevision:
+        Number(this.store.getCognitiveState?.(turn.characterId)?.revision || 0),
+      expectedLatestUserBatchId: turn.inputUserBatchId,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      inputClearEpoch: turn.inputClearEpoch,
+      agencySnapshotChecksum: turn.agencySnapshotChecksum,
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      comparisonReleaseId: turn.comparisonReleaseId,
+      comparisonDirection: comparisonContractForMode(turn.comparisonMode).comparisonDirection,
+      visibleGroup,
+      actionSet,
+      ...(isProactiveMoment
+        ? { publicMomentEvidenceIds: [] }
+        : { momentTargetAuthorityChecksum: authorityChecksum }),
+      statePatch: null,
+      memoryJobs: [],
+      comparisonJob: this.comparisonJobDraftFromCanonicalTurn(turn, envelope),
+      generationFingerprint: fingerprint,
+      now: this.clock()
+    });
+  }
+
   async runCanonicalReleaseTurn(turn) {
     const readSupersededOutcome = () => {
       const current = this.store.getTurn(turn.turnId);
@@ -1867,9 +1963,12 @@ export class YuqiOrchestrator {
     if (existing?.receipt) return existing.receipt;
     if (existing?.status === 'redacted') return existing;
     const storedEnvelope = JSON.parse(turn.envelopeJson);
-    if (shouldSkipProactiveSilence(turn)) {
+    const shouldSkipPublicMoment = shouldSkipPublicMomentSilence(turn);
+    if (shouldSkipProactiveSilence(turn) || shouldSkipPublicMoment) {
       try {
-        return this.commitCanonicalProactiveSkip(turn, storedEnvelope);
+        return shouldSkipPublicMoment
+          ? this.commitCanonicalMomentSkip(turn, storedEnvelope)
+          : this.commitCanonicalProactiveSkip(turn, storedEnvelope);
       } catch (error) {
         const supersededAfterSkipCommitFailure = readSupersededOutcome();
         if (supersededAfterSkipCommitFailure) return supersededAfterSkipCommitFailure;
@@ -1932,7 +2031,9 @@ export class YuqiOrchestrator {
           execution: {
             turn,
             envelope,
-            scene: sceneFromEnvelope(envelope),
+            scene: Number(turn.protocolVersion) === 3 && PUBLIC_MOMENT_KINDS.has(turn.rolloutKey)
+              ? {}
+              : sceneFromEnvelope(envelope),
             currentBatch,
             localImagePaths: [...preparedImages.paths],
             ...(preparedImages.receipt ? { localImageReceipt: preparedImages.receipt } : {}),
@@ -1977,6 +2078,8 @@ export class YuqiOrchestrator {
       };
       const isProactiveV3 = Number(turn.protocolVersion) === 3
         && turn.rolloutKey === 'PROACTIVE_CHAT';
+      const isMomentV3 = Number(turn.protocolVersion) === 3
+        && ['PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(turn.rolloutKey);
       if (isProactiveV3 && draft.action === 'skip') {
         const intent = draft.actionIntent || {};
         const polluted = ['payment', 'moment', 'rolePlan', 'lifeAdjustment', 'relationshipReview']
@@ -1998,8 +2101,17 @@ export class YuqiOrchestrator {
         draft,
         resolve: () => this.canonicalActionSet(turn, draft)
       });
+      assertCanonicalActionSetForTurn({
+        turnKind: turn.rolloutKey,
+        action: draft.action,
+        actionSet
+      });
       const proactiveAuthorityChecksum = isProactiveV3
         ? turn.annotationSnapshot?.proactiveMotiveAuthority?.checksum
+        : null;
+      const momentTargetAuthorityChecksum = isMomentV3
+        && turn.rolloutKey !== 'PROACTIVE_MOMENT'
+        ? turn.annotationSnapshot?.momentTargetAuthority?.checksum
         : null;
       if (isProactiveV3 && (typeof proactiveAuthorityChecksum !== 'string'
         || !/^[a-f0-9]{64}$/.test(proactiveAuthorityChecksum))) {
@@ -2016,7 +2128,15 @@ export class YuqiOrchestrator {
               agencySnapshotChecksum: turn.agencySnapshotChecksum,
               proactiveMotiveAuthorityChecksum: proactiveAuthorityChecksum
             })
-          : turn.agencySnapshotChecksum
+          : isMomentV3
+            ? contentHash({
+                agencySnapshotChecksum: turn.agencySnapshotChecksum,
+                momentTargetAuthorityChecksum:
+                  turn.rolloutKey === 'PROACTIVE_MOMENT'
+                    ? turn.annotationSnapshot?.publicMomentAuthority?.checksum
+                    : momentTargetAuthorityChecksum
+              })
+            : turn.agencySnapshotChecksum
       });
       const current = this.store.getTurn(turn.turnId);
       const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
@@ -2041,6 +2161,16 @@ export class YuqiOrchestrator {
           comparisonDirection: comparisonContractForMode(turn.comparisonMode).comparisonDirection,
           visibleGroup,
           actionSet,
+          ...(isMomentV3
+            ? turn.rolloutKey === 'PROACTIVE_MOMENT'
+              ? {
+                  publicMomentEvidenceIds: draft.action === 'skip'
+                    ? []
+                    : draft.interactionDecision?.publicMomentEvidenceIds
+                      || draft.publicMomentEvidenceIds
+              }
+              : { momentTargetAuthorityChecksum }
+            : {}),
           ...(isProactiveV3
             ? {
                 proactiveMotiveEvidenceIds: draft.action === 'skip'

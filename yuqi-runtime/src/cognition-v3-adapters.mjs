@@ -28,9 +28,30 @@ function relationshipBasePhase(input) {
 }
 
 function publicCommittedEvents(input) {
-  return (input.lifeEvents || input.committedLifeEvents || [])
-    .filter((event) => event?.state === 'committed' && event?.privacy === 'public')
-    .map(clone);
+  const authority = input.turn?.annotationSnapshot?.publicMomentAuthority;
+  if (!authority || !Array.isArray(authority.candidates)) return [];
+  return authority.candidates.map(clone);
+}
+
+function fixedPublicBoundary() {
+  return {
+    version: 'public-boundary-v1',
+    visibility: 'public',
+    recipientId: 'public_moments',
+    allowPrivateChatContext: false,
+    allowPaymentContext: false,
+    allowRelationshipContext: false,
+    allowPrivateMemoryContext: false
+  };
+}
+
+function publicAuthorSettings(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const output = {};
+  for (const key of ['language', 'publicName', 'displayName']) {
+    if (typeof source[key] === 'string' && source[key].trim()) output[key] = source[key].trim();
+  }
+  return output;
 }
 
 function directReplyFeatureContext(input) {
@@ -67,15 +88,25 @@ function proactiveChatFeatureContext(input) {
 function proactiveMomentFeatureContext(input) {
   return {
     committedLifeEvents: publicCommittedEvents(input),
-    publicPrivacy: clone(input.publicPrivacy || {})
+    publicPrivacy: fixedPublicBoundary()
   };
 }
 
 function momentInteractionFeatureContext(input) {
+  const authority = input.turn?.annotationSnapshot?.momentTargetAuthority;
+  if (!authority) {
+    return {
+      targetMoment: null,
+      targetComment: null,
+      thread: [],
+      publicPrivacy: fixedPublicBoundary()
+    };
+  }
   return {
-    targetMoment: clone(input.targetMoment || null),
-    targetComment: clone(input.targetComment || null),
-    thread: clone(input.thread || [])
+    targetMoment: clone(authority.targetMoment || null),
+    targetComment: clone(authority.targetComment || null),
+    thread: clone(authority.targetMoment?.comments || []),
+    publicPrivacy: fixedPublicBoundary()
   };
 }
 
@@ -88,8 +119,12 @@ function rolePlanChatFeatureContext(input) {
 
 function rolePlanMomentFeatureContext(input) {
   return {
-    ...rolePlanChatFeatureContext(input),
-    publicPrivacy: clone(input.publicPrivacy || {})
+    // Task 19 owns the validated occurrence/role-plan authority.  Until that
+    // authority is present, the public lane must not trust direct caller
+    // objects (which may contain private decisions or scene data).
+    rolePlan: null,
+    occurrence: null,
+    publicPrivacy: fixedPublicBoundary()
   };
 }
 
@@ -135,42 +170,63 @@ export function buildCognitionEnvelopeV3(input) {
   const kind = String(input?.envelope?.kind || '');
   const turnAdapter = adapterForTurnKind(kind);
   const featureContext = turnAdapter.buildFeatureContext(input);
-  const agencyView = compileAgencyView({
-    constraints: input.constraints,
-    preferences: input.preferences,
-    stances: input.stances,
-    featureContext: {
-      ...featureContext,
-      kind,
-      now: input.now
-    },
-    limits: {
-      hardConstraints: 5,
-      currentStances: 2,
-      preferences: 4
+  const publicMomentKind = [
+    'PROACTIVE_MOMENT',
+    'MOMENT_INTERACTION',
+    'MOMENT_REPLY',
+    'ROLE_PLAN_MOMENT',
+    'ROLE_PLAN_MOMENT_PRIVATE'
+  ].includes(kind);
+  const agencyView = publicMomentKind
+    ? {
+      hardConstraints: [],
+      currentStances: [],
+      preferences: []
     }
-  });
-  const currentInteraction = currentUserInteractionForCognition(
-    input.currentBatch || input.envelope?.context?.currentBatch
-  );
+    : compileAgencyView({
+      constraints: input.constraints,
+      preferences: input.preferences,
+      stances: input.stances,
+      featureContext: {
+        ...featureContext,
+        kind,
+        now: input.now
+      },
+      limits: {
+        hardConstraints: 5,
+        currentStances: 2,
+        preferences: 4
+      }
+    });
+  const currentInteraction = publicMomentKind
+    ? { messageIds: [], messages: [] }
+    : currentUserInteractionForCognition(
+      input.currentBatch || input.envelope?.context?.currentBatch
+    );
   return {
     schemaVersion: 3,
     turnId: String(input.envelope?.turnId || ''),
     characterId: String(input.envelope?.characterId || ''),
     turnKind: kind,
     currentInteraction,
-    relevantHistory: takeCompleteMessageGroups(
-      (input.relevantHistory || []).map(sanitizeCognitionMessage),
-      20
-    ),
-    verifiedFacts: rankCognitionItems(input.verifiedFacts, 8).map(clone),
+    relevantHistory: publicMomentKind
+      ? []
+      : takeCompleteMessageGroups(
+        (input.relevantHistory || []).map(sanitizeCognitionMessage),
+        20
+      ),
+    verifiedFacts: publicMomentKind ? [] : rankCognitionItems(input.verifiedFacts, 8).map(clone),
     ...agencyView,
-    relationshipBasePhase: relationshipBasePhase(input),
-    lifeSignals: rankCognitionItems(input.lifeSignals, 5).map(clone),
-    authorSettings: clone(input.authorSettings || {}),
+    relationshipBasePhase: publicMomentKind
+      ? { base: null, phase: null, formalFacts: [], allowedFormalTransitions: [], toneTendencies: [] }
+      : relationshipBasePhase(input),
+    lifeSignals: publicMomentKind ? [] : rankCognitionItems(input.lifeSignals, 5).map(clone),
+    authorSettings: publicMomentKind
+      ? publicAuthorSettings(input.authorSettings)
+      : clone(input.authorSettings || {}),
     allowedActions: turnAdapter.allowedActions(input),
     featureContext,
-    socialExperience: rankCognitionItems(input.socialExperience, 3).map(clone),
-    openThreads: rankCognitionItems(input.openThreads, 3).map(clone)
+    socialExperience: publicMomentKind ? [] : rankCognitionItems(input.socialExperience, 3).map(clone),
+    openThreads: publicMomentKind ? [] : rankCognitionItems(input.openThreads, 3).map(clone)
   };
 }

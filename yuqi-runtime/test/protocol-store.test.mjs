@@ -144,7 +144,32 @@ function validV3AutomaticEnvelope(kind, overrides = {}) {
       scheduledFor: 1784400000000,
       executedAt: 1784400001000,
       context: ['MOMENT_INTERACTION', 'MOMENT_REPLY'].includes(kind)
-        ? { momentId: 'moment_protocol_v3' }
+        ? {
+            targetMoment: {
+              momentId: 'moment_protocol_v3',
+              authorType: 'character',
+              authorId: 'yuqi',
+              text: '公开动态',
+              createdAt: 1784400000000,
+              likes: ['user'],
+              comments: [{
+                commentId: 'comment_protocol_v3',
+                authorType: 'user',
+                authorId: 'user',
+                text: '看到了',
+                createdAt: 1784400000001,
+                replyToCommentId: null
+              }]
+            },
+            targetComment: kind === 'MOMENT_REPLY' ? {
+              commentId: 'comment_protocol_v3',
+              authorType: 'user',
+              authorId: 'user',
+              text: '看到了',
+              createdAt: 1784400000001,
+              replyToCommentId: null
+            } : null
+          }
         : {}
     }
   });
@@ -424,7 +449,7 @@ test('protocol v3 preserves one closed native stage persona revision in direct a
   assert.equal(normalizedDirect.context.scene.stagePersonaRevision, 7);
   assert.equal(normalizedDirect.context.scene.effectiveStagePersona, '当前有效的阶段人设。');
 
-  const automatic = validV3AutomaticEnvelope('MOMENT_INTERACTION');
+  const automatic = validV3AutomaticEnvelope('ROLE_PLAN_MOMENT');
   automatic.trigger.context.scene = validDynamicScene({ stagePersonaRevision: 8 });
   const normalizedAutomatic = validateEnvelope(automatic);
   assert.equal(normalizedAutomatic.trigger.context.scene.stagePersonaRevision, 8);

@@ -233,10 +233,15 @@ function createCanonicalFromEnvelope(store, input, { annotationSnapshot = {} } =
     roleId: 'yuqi',
     at: input.message?.sentAt ?? input.trigger.executedAt
   });
-  const effectiveAnnotationSnapshot = kind === 'PROACTIVE_CHAT'
-    && Object.keys(annotationSnapshot || {}).length === 0
-    ? store.rebuildProactiveMotiveAuthorityInternal({ envelope: input }).annotationSnapshot
-    : annotationSnapshot;
+  const effectiveAnnotationSnapshot = Object.keys(annotationSnapshot || {}).length !== 0
+    ? annotationSnapshot
+    : kind === 'PROACTIVE_CHAT'
+      ? store.rebuildProactiveMotiveAuthorityInternal({ envelope: input }).annotationSnapshot
+      : kind === 'PROACTIVE_MOMENT'
+        ? { publicMomentAuthority: store.rebuildPublicMomentAuthorityInternal({ envelope: input }) }
+        : (kind === 'MOMENT_INTERACTION' || kind === 'MOMENT_REPLY')
+          ? store.rebuildMomentTargetAuthorityInternal({ envelope: input }).annotationSnapshot
+          : annotationSnapshot;
   return store.createCanonicalVisibleTurnInternal({
     envelope: input,
     rolloutKey: kind,

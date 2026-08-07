@@ -3708,6 +3708,8 @@ function nativePendingReplyText(chat, userMessage) {
 }
 function nativeTerminalUiLanding(result, chat, sourceTurnId) {
   const disposition = String(result?.terminalDisposition || '');
+  const kind = String(result?.kind || 'DIRECT_REPLY');
+  const momentKind = ['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind);
   if (disposition === 'redacted' || result?.redacted === true || result?.deletedAt) return false;
   if (disposition === 'skip') {
     return !(result?.replyParts?.length || result?.actions?.length);
@@ -3720,6 +3722,9 @@ function nativeTerminalUiLanding(result, chat, sourceTurnId) {
         && nativeActionProofMatches(chat, result, part, nativeCanonicalAction(part, result)));
   }
   if (disposition === 'visible' && Array.isArray(result?.replyParts)) {
+    if (momentKind) {
+      return (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
+    }
     const expected = result.replyParts.filter(part => part?.type === 'TEXT' && String(part.content || '').trim());
     const structured = nativeStructuredActionParts(result, result.replyParts);
     const canonicalStructured = structured.length > 0
@@ -3744,9 +3749,10 @@ function nativeTurnHasUiLanding(result) {
   if (!chat) return false;
   const kind = String(result?.kind || 'DIRECT_REPLY');
   const sourceTurnId = `native:${result?.turnId || ''}`;
+  const momentKind = ['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind);
   const terminalLanding = nativeTerminalUiLanding(result, chat, sourceTurnId);
   if (terminalLanding !== null) return terminalLanding;
-  if (['PROACTIVE_MOMENT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind)) {
+  if (momentKind) {
     return (allMoments || []).some(moment => moment.sourceTurnId === sourceTurnId);
   }
   if (['PROACTIVE_CHAT', 'ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE'].includes(kind)) {
@@ -4580,19 +4586,58 @@ async function queueYuqiMomentTurn(charId, moment, kind, context = {}) {
   const built = await syncNativeProactiveSnapshot(charId, 'moment', {
     jobId: turnId, dueAt: new Date(createdAt).toISOString(), mode: kind.toLowerCase()
   });
-  const input = {
-    reason: kind.toLowerCase(), scheduledFor: createdAt, deviceSeq: createdAt,
-    moment: {
-      id: moment.id, authorType: moment.authorType, charId: moment.charId || '',
-      text: String(moment.text || ''), likes: [...(moment.likes || [])],
-      comments: (moment.comments || []).map(item => ({
-        id: item.id, charId: item.charId, name: item.name, text: item.text,
-        replyToCommentId: item.replyToCommentId || ''
-      }))
-    },
-    playerComment: context.playerComment || null,
-    replyToCommentId: context.replyToCommentId || null
+  const legacyV2 = Number(plugin.bridgeProtocolVersion || plugin.protocolVersion || 0) === 2;
+  const canonicalMoment = {
+    momentId: String(moment.id || '').trim(),
+    authorType: moment.authorType === 'player' ? 'user' : 'character',
+    authorId: moment.authorType === 'player'
+      ? 'user'
+      : String(moment.charId || '').trim(),
+    text: String(moment.text || '').trim(),
+    createdAt: Number(moment.time || moment.createdAt || createdAt),
+    likes: [...new Set((moment.likes || []).map(value => value === 'player' ? 'user' : String(value).trim()))].sort(),
+    comments: (moment.comments || []).map(item => ({
+      commentId: String(item.id || '').trim(),
+      authorType: item.charId === 'player' ? 'user' : 'character',
+      authorId: item.charId === 'player'
+        ? 'user'
+        : String(item.charId || '').trim(),
+      text: String(item.text || '').trim(),
+      createdAt: Number(item.time || item.createdAt || createdAt),
+      replyToCommentId: item.replyToCommentId ? String(item.replyToCommentId) : null
+    }))
   };
+  const playerCommentId = String(context.playerComment?.id || '').trim();
+  const matchingComments = playerCommentId
+    ? canonicalMoment.comments.filter(comment => comment.commentId === playerCommentId)
+    : [];
+  if (context.playerComment && matchingComments.length !== 1) {
+    throw new Error('canonical moment comment authority conflict');
+  }
+  const canonicalComment = context.playerComment
+    ? structuredClone(matchingComments[0])
+    : null;
+  const input = legacyV2
+    ? {
+        reason: kind.toLowerCase(), scheduledFor: createdAt, deviceSeq: createdAt,
+        moment: {
+          id: moment.id, authorType: moment.authorType, charId: moment.charId || '',
+          text: String(moment.text || ''), likes: [...(moment.likes || [])],
+          comments: (moment.comments || []).map(item => ({
+            id: item.id, charId: item.charId, name: item.name, text: item.text,
+            replyToCommentId: item.replyToCommentId || ''
+          }))
+        },
+        playerComment: context.playerComment || null,
+        replyToCommentId: context.replyToCommentId || null
+      }
+    : {
+        reason: kind.toLowerCase(),
+        scheduledFor: createdAt,
+        deviceSeq: createdAt,
+        targetMoment: canonicalMoment,
+        targetComment: canonicalComment
+      };
   const result = await plugin.submitTurn({
     turnId, characterId: charId, sourceMessageId, kind,
     inputJson: JSON.stringify(input), snapshotJson: JSON.stringify(built?.snapshot || {}), createdAt

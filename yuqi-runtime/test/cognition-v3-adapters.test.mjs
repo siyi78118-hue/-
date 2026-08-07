@@ -10,8 +10,8 @@ const TURN_CASES = [
   ['DIRECT_REPLY', ['currentBatch', 'payment', 'attachments', 'quote']],
   ['PROACTIVE_CHAT', ['motiveCandidates', 'openThreads', 'dueCommitments']],
   ['PROACTIVE_MOMENT', ['committedLifeEvents', 'publicPrivacy']],
-  ['MOMENT_INTERACTION', ['targetMoment', 'targetComment', 'thread']],
-  ['MOMENT_REPLY', ['targetMoment', 'targetComment', 'thread']],
+  ['MOMENT_INTERACTION', ['targetMoment', 'targetComment', 'thread', 'publicPrivacy']],
+  ['MOMENT_REPLY', ['targetMoment', 'targetComment', 'thread', 'publicPrivacy']],
   ['ROLE_PLAN_CHAT', ['rolePlan', 'occurrence']],
   ['ROLE_PLAN_MOMENT', ['rolePlan', 'occurrence', 'publicPrivacy']],
   ['ROLE_PLAN_CHAT_PRIVATE', ['rolePlan', 'occurrence']],
@@ -156,17 +156,30 @@ for (const [kind, featureKeys] of TURN_CASES) {
   test(`${kind} receives only its bounded feature context`, () => {
     const input = oversizedInput(kind);
     const result = buildCognitionEnvelopeV3(input);
+    const publicMomentKind = new Set([
+      'PROACTIVE_MOMENT',
+      'MOMENT_INTERACTION',
+      'MOMENT_REPLY',
+      'ROLE_PLAN_MOMENT',
+      'ROLE_PLAN_MOMENT_PRIVATE'
+    ]).has(kind);
 
     assert.deepEqual(Object.keys(result.featureContext).sort(), [...featureKeys].sort());
-    assert.equal(result.currentInteraction.messages.length, input.currentBatch.messages.length);
+    assert.equal(
+      result.currentInteraction.messages.length,
+      publicMomentKind ? 0 : input.currentBatch.messages.length
+    );
     assert.ok(result.relevantHistory.length <= 22);
-    assert.equal(new Set(result.relevantHistory.map((item) => item.turnId)).size, 20);
+    assert.equal(
+      new Set(result.relevantHistory.map((item) => item.turnId)).size,
+      publicMomentKind ? 0 : 20
+    );
     assert.ok(result.verifiedFacts.length <= 8);
     assert.ok(result.hardConstraints.length <= 5);
     assert.ok(result.currentStances.length <= 2);
     assert.ok(result.preferences.length <= 4);
     assert.ok(result.socialExperience.length <= 3);
-    assert.ok(result.openThreads.length <= 3);
+    assert.equal(result.openThreads.length, publicMomentKind ? 0 : 3);
     assert.ok(Array.isArray(result.allowedActions));
     assert.ok(result.allowedActions.length > 0);
   });

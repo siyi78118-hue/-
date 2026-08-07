@@ -126,6 +126,128 @@ public final class BridgeInput {
         return momentId == null ? momentId(snapshot) : momentId;
     }
 
+    private static void requireMomentString(JSONObject value, String key) throws Exception {
+        if (!value.has(key) || value.isNull(key) || !(value.get(key) instanceof String)) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment target string");
+        }
+        String text = value.getString(key);
+        if (!text.equals(text.trim()) || text.trim().isEmpty() || text.length() > 2048) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment target string");
+        }
+    }
+
+    private static void requireMomentKeys(JSONObject value, Set<String> expected) throws Exception {
+        if (!expected.equals(keysOf(value))) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment target keys");
+        }
+    }
+
+    private static void requireMomentAuthorIdentity(JSONObject value) throws Exception {
+        String authorType = value.getString("authorType");
+        String authorId = value.getString("authorId");
+        if (!("user".equals(authorType) || "character".equals(authorType))
+            || ("user".equals(authorType) && !"user".equals(authorId))
+            || ("character".equals(authorType)
+                && ("user".equals(authorId) || "player".equals(authorId)))) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment author identity");
+        }
+    }
+
+    private static long exactMomentTimestamp(JSONObject value, String key) throws Exception {
+        Object raw = value.get(key);
+        if (!(raw instanceof Number)) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment timestamp");
+        }
+        double numeric = ((Number) raw).doubleValue();
+        if (!Double.isFinite(numeric) || numeric < 0.0d
+            || numeric > 9007199254740991d || Math.rint(numeric) != numeric) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment timestamp");
+        }
+        long result = ((Number) raw).longValue();
+        if (result < 0L || result > 9007199254740991L || (double) result != numeric) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment timestamp");
+        }
+        return result;
+    }
+
+    private static JSONObject canonicalMomentTriggerContext(TurnSubmission submission, boolean reply)
+        throws Exception {
+        JSONObject input = source(submission);
+        JSONObject target = input.optJSONObject("targetMoment");
+        if (target == null) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: targetMoment required");
+        }
+        JSONObject moment = new JSONObject(target.toString());
+        requireMomentKeys(moment, new HashSet<>(Arrays.asList(
+            "momentId", "authorType", "authorId", "text", "createdAt", "likes", "comments")));
+        for (String key : new String[]{"momentId", "authorType", "authorId", "text"}) {
+            requireMomentString(moment, key);
+        }
+        requireMomentAuthorIdentity(moment);
+        exactMomentTimestamp(moment, "createdAt");
+        JSONArray likes = moment.getJSONArray("likes");
+        String previousLike = null;
+        Set<String> likeIds = new HashSet<>();
+        for (int index = 0; index < likes.length(); index += 1) {
+            Object rawLike = likes.get(index);
+            if (!(rawLike instanceof String) || ((String) rawLike).trim().isEmpty()
+                || !((String) rawLike).equals(((String) rawLike).trim())
+                || "player".equals(rawLike)
+                || !likeIds.add((String) rawLike)
+                || (previousLike != null && previousLike.compareTo((String) rawLike) > 0)) {
+                throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment likes");
+            }
+            previousLike = (String) rawLike;
+        }
+        JSONArray comments = moment.getJSONArray("comments");
+        Set<String> commentIds = new HashSet<>();
+        for (int index = 0; index < comments.length(); index += 1) {
+            JSONObject comment = comments.getJSONObject(index);
+            requireMomentKeys(comment, new HashSet<>(Arrays.asList(
+                "commentId", "authorType", "authorId", "text", "createdAt", "replyToCommentId")));
+            for (String key : new String[]{"commentId", "authorType", "authorId", "text"}) {
+                requireMomentString(comment, key);
+            }
+            requireMomentAuthorIdentity(comment);
+            exactMomentTimestamp(comment, "createdAt");
+            if ((!comment.isNull("replyToCommentId")
+                  && (!(comment.get("replyToCommentId") instanceof String)
+                    || comment.getString("replyToCommentId").trim().isEmpty()))) {
+                throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: moment comment");
+            }
+            if (!commentIds.add(comment.getString("commentId"))) {
+                throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: duplicate moment comment");
+            }
+        }
+        JSONObject targetComment = input.optJSONObject("targetComment");
+        if (reply) {
+            if (targetComment == null) {
+                throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: targetComment required");
+            }
+            JSONObject comment = new JSONObject(targetComment.toString());
+            if (!"user".equals(comment.optString("authorType"))
+                || !"user".equals(comment.optString("authorId"))) {
+                throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: targetComment author");
+            }
+            boolean exact = false;
+            for (int index = 0; index < comments.length(); index += 1) {
+                if (BridgeAuthority.canonicalJson(comments.getJSONObject(index))
+                    .equals(BridgeAuthority.canonicalJson(comment))) {
+                    exact = true;
+                    break;
+                }
+            }
+            if (!exact) throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: targetComment thread");
+            return new JSONObject()
+                .put("targetMoment", moment)
+                .put("targetComment", comment);
+        }
+        if (input.has("targetComment") && !input.isNull("targetComment")) {
+            throw new IllegalArgumentException("BRIDGE_AUTHORITY_CONFLICT: interaction targetComment");
+        }
+        return new JSONObject().put("targetMoment", moment).put("targetComment", JSONObject.NULL);
+    }
+
     private static String momentId(JSONObject value) {
         String direct = value.optString("momentId", "").trim();
         if (!direct.isEmpty()) return direct;
@@ -300,15 +422,11 @@ public final class BridgeInput {
             }
             if (submission.kind == TurnKind.MOMENT_INTERACTION
                 || submission.kind == TurnKind.MOMENT_REPLY) {
-                String momentId = authoritativeMomentId(submission);
-                if (momentId == null) {
-                    throw new IllegalArgumentException("moment interaction requires an authoritative moment id");
-                }
-                if (triggerContext == null) {
-                    triggerContext = new JSONObject();
-                    envelope.getJSONObject("trigger").put("context", triggerContext);
-                }
-                triggerContext.put("momentId", momentId);
+                JSONObject targetContext = canonicalMomentTriggerContext(
+                    submission, submission.kind == TurnKind.MOMENT_REPLY);
+                envelope.getJSONObject("trigger").put("context", targetContext);
+            } else if (submission.kind == TurnKind.PROACTIVE_MOMENT) {
+                envelope.getJSONObject("trigger").put("context", new JSONObject());
             }
             envelope.put("context", new JSONObject()
                 .put("visibilityCursor", new JSONObject(visibilityCursor.toString())));

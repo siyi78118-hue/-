@@ -176,6 +176,22 @@ function rolePayload({ turn, system, task, content }) {
   };
 }
 
+const PUBLIC_MOMENT_KINDS = new Set([
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_MOMENT_PRIVATE'
+]);
+
+function isPublicMomentTurn(input) {
+  const kind = input?.turn?.turnKind || input?.turn?.rolloutKey
+    || input?.envelope?.kind || input?.cognitionEnvelope?.turnKind;
+  return Number(input?.turn?.protocolVersion ?? input?.envelope?.protocolVersion
+    ?? input?.cognitionEnvelope?.protocolVersion) === 3
+    && PUBLIC_MOMENT_KINDS.has(String(kind || ''));
+}
+
 function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -202,7 +218,7 @@ function v3ValidationContext(cognitionEnvelope, input) {
     relevantStances: cognitionEnvelope.currentStances || [],
     allowedActions: cognitionEnvelope.allowedActions || [],
     allowedActionTargets: v3AllowedTargets(cognitionEnvelope),
-    scene: input.scene || {}
+    scene: isPublicMomentTurn({ ...input, cognitionEnvelope }) ? {} : (input.scene || {})
   };
 }
 
@@ -270,7 +286,7 @@ export async function runCognitionV3Turn(input) {
     || checkpoint.cognitionPacket?.envelope
     || input.cognitionEnvelope
     || null;
-  if (!cognitionEnvelope) {
+  if (!cognitionEnvelope || (isPublicMomentTurn(input) && !checkpoint.cognitionEnvelope)) {
     const loaded = input.contextLoader?.load
       ? await input.contextLoader.load(input)
       : await buildCognitionV3Input(input.contextInput || input);

@@ -225,6 +225,18 @@ const V3_DIRECT_CONTEXT_KEYS = Object.freeze([
   'scene', 'currentBatch', 'retry', 'payment', 'visibilityCursor'
 ]);
 const V3_AUTOMATIC_CONTEXT_KEYS = Object.freeze(['visibilityCursor']);
+const V3_MOMENT_TRIGGER_KINDS = new Set([
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY'
+]);
+const V3_MOMENT_TARGET_CONTEXT_KEYS = Object.freeze(['targetMoment', 'targetComment']);
+const V3_MOMENT_KEYS = new Set([
+  'momentId', 'authorType', 'authorId', 'text', 'createdAt', 'likes', 'comments'
+]);
+const V3_COMMENT_KEYS = new Set([
+  'commentId', 'authorType', 'authorId', 'text', 'createdAt', 'replyToCommentId'
+]);
 const V3_SCENE_KEYS = Object.freeze([
   'playerName',
   'characterName',
@@ -435,7 +447,8 @@ export function validateEnvelope(value) {
       if (value.message !== undefined) throw new Error('automatic turn cannot contain a message');
       delete envelope.message;
       envelope.trigger = validateTrigger(value.trigger, {
-        protocolVersion: envelope.protocolVersion
+        protocolVersion: envelope.protocolVersion,
+        kind: envelope.kind
       });
       if (envelope.protocolVersion === 2) return envelope;
     } else {
@@ -901,7 +914,112 @@ function validateImageAttachments(attachments, messageId) {
   }];
 }
 
-function validateTrigger(trigger, { protocolVersion = 2 } = {}) {
+function validateMomentTarget(value, label, allowedKeys, requiredKeys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`invalid ${label}`);
+  }
+  const actual = Object.keys(value);
+  if (actual.some(key => !allowedKeys.has(key))
+    || requiredKeys.some(key => !Object.hasOwn(value, key))) {
+    throw new Error(`${label} keys conflict`);
+  }
+  const normalized = structuredClone(value);
+  const stringKeys = allowedKeys === V3_MOMENT_KEYS
+    ? ['momentId', 'authorType', 'authorId', 'text']
+    : ['commentId', 'authorType', 'authorId', 'text'];
+  for (const key of stringKeys) {
+    if (typeof normalized[key] !== 'string' || !normalized[key].trim()) {
+      throw new Error(`invalid ${label} ${key}`);
+    }
+    normalized[key] = normalized[key].trim();
+    if (normalized[key].length > 2048) throw new Error(`invalid ${label} ${key}`);
+  }
+  if (!['user', 'character'].includes(normalized.authorType)
+    || (normalized.authorType === 'user' && normalized.authorId !== 'user')
+    || (normalized.authorType === 'character'
+      && (normalized.authorId === 'user' || normalized.authorId === 'player'))) {
+    throw new Error(`invalid ${label} author identity`);
+  }
+  if (Object.hasOwn(normalized, 'replyToCommentId')
+    && normalized.replyToCommentId !== null) {
+    if (typeof normalized.replyToCommentId !== 'string' || !normalized.replyToCommentId.trim()) {
+      throw new Error(`invalid ${label} replyToCommentId`);
+    }
+    normalized.replyToCommentId = normalized.replyToCommentId.trim();
+  }
+  for (const key of ['createdAt', 'revision']) {
+    if (Object.hasOwn(normalized, key)
+      && (typeof normalized[key] !== 'number' || !Number.isSafeInteger(normalized[key]) || normalized[key] < 0)) {
+      throw new Error(`invalid ${label} ${key}`);
+    }
+  }
+  if (Object.hasOwn(normalized, 'likes')) {
+    if (!Array.isArray(normalized.likes)
+      || normalized.likes.some(value => typeof value !== 'string'
+        || !value.trim() || value !== value.trim() || value === 'player')
+      || new Set(normalized.likes).size !== normalized.likes.length
+      || [...normalized.likes].sort().some((value, index) => value !== normalized.likes[index])) {
+      throw new Error(`invalid ${label} likes`);
+    }
+  }
+  if (Object.hasOwn(normalized, 'comments')) {
+    if (!Array.isArray(normalized.comments)) throw new Error(`invalid ${label} comments`);
+    normalized.comments = normalized.comments.map((comment, index) =>
+      validateMomentTarget(
+        comment,
+        `${label} comment ${index}`,
+        V3_COMMENT_KEYS,
+        [...V3_COMMENT_KEYS]
+      ));
+    if (new Set(normalized.comments.map(comment => comment.commentId)).size
+      !== normalized.comments.length) {
+      throw new Error(`invalid ${label} duplicate commentId`);
+    }
+  }
+  return normalized;
+}
+
+function validateV3MomentTriggerContext(context, kind) {
+  if (!context || typeof context !== 'object' || Array.isArray(context)) {
+    throw new Error('invalid v3 moment trigger context');
+  }
+  const interaction = kind === 'MOMENT_INTERACTION' || kind === 'MOMENT_REPLY';
+  if (!interaction) {
+    if (Object.keys(context).length !== 0) throw new Error('v3 moment trigger target keys conflict');
+    return {};
+  }
+  assertNoUnknownKeys(context, V3_MOMENT_TARGET_CONTEXT_KEYS, 'v3 moment trigger context');
+  if (!Object.hasOwn(context, 'targetMoment')) throw new Error('v3 moment targetMoment is required');
+  const targetMoment = validateMomentTarget(
+    context.targetMoment, 'v3 targetMoment', V3_MOMENT_KEYS, [...V3_MOMENT_KEYS]
+  );
+  const rawComment = context.targetComment === undefined ? null : context.targetComment;
+  if (kind === 'MOMENT_REPLY' && rawComment === null) {
+    throw new Error('v3 moment reply targetComment is required');
+  }
+  if (kind === 'MOMENT_INTERACTION' && rawComment !== null) {
+    throw new Error('v3 moment interaction targetComment is not allowed');
+  }
+  let targetComment = null;
+  if (rawComment !== null) {
+    targetComment = validateMomentTarget(
+      rawComment, 'v3 targetComment', V3_COMMENT_KEYS, [...V3_COMMENT_KEYS]
+    );
+    if (targetComment.authorType !== undefined && targetComment.authorType !== 'user') {
+      throw new Error('v3 targetComment author conflict');
+    }
+    if (targetComment.authorId !== 'user') throw new Error('v3 targetComment author conflict');
+    const matching = Array.isArray(targetMoment.comments)
+      ? targetMoment.comments.find(comment => comment.commentId === targetComment.commentId)
+      : null;
+    if (!matching || canonicalJson(matching) !== canonicalJson(targetComment)) {
+      throw new Error('v3 targetComment authority conflict');
+    }
+  }
+  return { targetMoment, targetComment };
+}
+
+function validateTrigger(trigger, { protocolVersion = 2, kind = null } = {}) {
   if (!trigger || typeof trigger !== 'object' || Array.isArray(trigger)) throw new Error('invalid trigger');
   const normalized = {
     triggerId: String(trigger.triggerId || ''),
@@ -917,7 +1035,9 @@ function validateTrigger(trigger, { protocolVersion = 2 } = {}) {
     if (!trigger.context || typeof trigger.context !== 'object' || Array.isArray(trigger.context)) {
       throw new Error('invalid trigger context');
     }
-    normalized.context = structuredClone(trigger.context);
+    normalized.context = V3_MOMENT_TRIGGER_KINDS.has(kind) && protocolVersion === 3
+      ? validateV3MomentTriggerContext(trigger.context, kind)
+      : structuredClone(trigger.context);
     const suppliedScene = trigger.context.scene || trigger.context.snapshot?.scene;
     if (suppliedScene !== undefined) {
       normalized.context.scene = validateScene(suppliedScene, { protocolVersion });

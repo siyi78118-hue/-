@@ -15,6 +15,24 @@ const bridgeClient = readFileSync('android/app/src/main/java/com/siyi/al/executi
 const worker = readFileSync('tavern-app/sw-v11.js', 'utf8');
 const corePreset = readFileSync('tavern-app/lib/yuqi-core-preset.js', 'utf8');
 
+test('v3 moment queue projects player authors and replies from the canonical target thread', () => {
+  const queue = html.slice(
+    html.indexOf('async function queueYuqiMomentTurn'),
+    html.indexOf('async function queueAndroidUserReply', html.indexOf('async function queueYuqiMomentTurn'))
+  );
+  assert.match(queue, /authorType === 'player'[\s\S]{0,80}['"]user['"]/);
+  assert.match(queue, /item\.charId === 'player'[\s\S]{0,80}['"]user['"]/);
+  assert.match(queue, /matchingComments\s*=\s*playerCommentId/);
+  assert.match(queue, /matchingComments\.length !== 1/);
+  assert.match(queue, /structuredClone\(matchingComments\[0\]\)/);
+  const canonicalComment = queue.slice(
+    queue.indexOf('const canonicalComment'),
+    queue.indexOf('const input')
+  );
+  assert.doesNotMatch(canonicalComment, /replyToCommentId:\s*context\.replyToCommentId/);
+  assert.match(queue, /likes:\s*\[\.\.\.new Set\(\(moment\.likes \|\| \[\]\)\.map\(value => value === 'player' \? 'user'/);
+});
+
 test('every phone-side Yuqi scene composes the synchronized core preset after the combined RP foundation', () => {
   assert.match(html, /<script src="\.\/lib\/yuqi-core-preset\.js"><\/script>/);
   assert.match(corePreset, /globalThis\.AL_YUQI_CORE_PROMPT/);
@@ -462,6 +480,48 @@ test('acknowledged native completions remain recoverable until their exact bubbl
   assert.doesNotMatch(landing, /message\.replyToMessageId\s*===\s*userMessage\.id/);
 });
 
+test('wire3 missing moment target cannot virtualize or mark the UI applied', async () => {
+  const landingSource = html.slice(
+    html.indexOf('function nativeActionEnvelope'),
+    html.indexOf('async function drainNativeUiInbox')
+  );
+  const executionSource = html.slice(
+    html.indexOf('function nativeActionEnvelope'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  const allChats = { yuqi: { messages: [], nativeActionProofs: {} } };
+  const allMoments = [];
+  const applyNativeExecutionTurnUnlocked = new Function(
+    'allChats', 'allMoments', 'characters', 'DB',
+    `${executionSource}; return applyNativeExecutionTurnUnlocked;`
+  )(allChats, allMoments, [], { set() {} });
+  const result = {
+    turnId: 'turn_missing_moment_target',
+    characterId: 'yuqi',
+    kind: 'MOMENT_INTERACTION',
+    state: 'COMPLETED',
+    terminalDisposition: 'action_only',
+    resultAuthorityVersion: 1,
+    bridgeProtocolVersion: 3,
+    commitChecksum: 'a'.repeat(64),
+    replyParts: [{
+      replyPartId: 'missing-action',
+      type: 'MOMENT_ACTION',
+      payloadJson: JSON.stringify({ canonicalAction: {
+        actionId: 'missing-action',
+        kind: 'moment_like',
+        targetKey: 'moment:missing_target',
+        targetRevision: '1',
+        actionChecksum: 'b'.repeat(64),
+        payload: { like: true }
+      } })
+    }]
+  };
+  assert.equal(await applyNativeExecutionTurnUnlocked(result), false);
+  assert.deepEqual(allMoments, [], 'unknown v3 target must not materialize a virtual moment');
+  assert.deepEqual(allChats.yuqi.messages, [], 'unknown v3 target must not mark UI/chat applied');
+});
+
 test('an applied action-only native result is a UI landing without a chat bubble', () => {
   const landingSource = html.slice(
     html.indexOf('function nativeActionEnvelope'),
@@ -483,7 +543,7 @@ test('an applied action-only native result is a UI landing without a chat bubble
         }
       }
     }
-  }, []);
+  }, [{ id: 'moment-post', sourceTurnId: 'native:turn_public_moment_visible' }]);
   const nativeCanonicalAction = new Function(
     `${landingSource}; return nativeCanonicalAction;`
   )();
@@ -589,6 +649,29 @@ test('an applied action-only native result is a UI landing without a chat bubble
     terminalDisposition: 'visible',
     replyParts: [{ replyPartId: 'msg_1', type: 'TEXT', content: '还没落地' }]
   }), false);
+
+  assert.equal(nativeTurnHasUiLanding({
+    turnId: 'turn_public_moment_visible',
+    characterId: 'yuqi',
+    kind: 'PROACTIVE_MOMENT',
+    terminalDisposition: 'visible',
+    replyParts: [{ replyPartId: 'moment-post', type: 'TEXT', content: '公开动态' }]
+  }), true, 'public moment visible landing must use allMoments, not chat messages');
+
+  const nativeTerminalUiLanding = new Function(
+    'allChats', 'allMoments', `${landingSource}; return nativeTerminalUiLanding;`
+  )(
+    { yuqi: { messages: [] } },
+    [{ sourceTurnId: 'native:turn_public_moment_visible' }]
+  );
+  assert.equal(nativeTerminalUiLanding({
+    turnId: 'turn_public_moment_visible',
+    characterId: 'yuqi',
+    kind: 'PROACTIVE_MOMENT',
+    terminalDisposition: 'visible',
+    replyParts: [{ replyPartId: 'moment-post', type: 'TEXT', content: '公开动态' }]
+  }, { messages: [] }, 'native:turn_public_moment_visible'), true,
+  'the unique terminal landing helper must use allMoments for public moments');
 
   const mixedLanding = new Function(
     'allChats', 'allMoments', `${landingSource}; return nativeTurnHasUiLanding;`
