@@ -4,6 +4,8 @@ const PRIVATE_FIELDS = new Set([
 ]);
 const DIRECTIONS = new Set(['phone_to_pc', 'pc_to_phone']);
 const YUQI_RELAY_VERSION = '2026-07-19.1';
+const MAX_RELAY_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
+const REFRESH_KEYS = ['deviceId', 'messageId', 'idempotencyKey', 'direction', 'expiresAt'];
 const CORS = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET,POST,OPTIONS',
@@ -19,6 +21,36 @@ function json(value, status = 200) {
 
 function validId(value) {
   return /^[A-Za-z0-9_-]{6,128}$/.test(String(value || ''));
+}
+
+function validNativeId(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{6,128}$/.test(value);
+}
+
+function hasExactKeys(value, expected) {
+  const actual = Object.keys(value).sort();
+  return actual.length === expected.length && actual.every((key, index) => key === [...expected].sort()[index]);
+}
+
+function identityMatches(a, b) {
+  return !!a && !!b && a.deviceId === b.deviceId && a.messageId === b.messageId &&
+    a.idempotencyKey === b.idempotencyKey && a.direction === b.direction;
+}
+
+function contentMatches(a, b) {
+  return !!a && !!b && a.ciphertext === b.ciphertext && a.nonce === b.nonce &&
+    a.byteCount === b.byteCount;
+}
+
+function identityKey(envelope) {
+  return `${envelope.deviceId}:${envelope.idempotencyKey}`;
+}
+
+class RelayInputError extends Error {
+  constructor(message) {
+    super(message);
+    this.statusCode = 400;
+  }
 }
 
 function byteLengthFromBase64(value) {
@@ -67,8 +99,8 @@ async function authorize(request, env, deviceId) {
 
 async function readBody(request) {
   let body;
-  try { body = await request.json(); } catch { throw new Error('invalid JSON'); }
-  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error('invalid body');
+  try { body = await request.json(); } catch { throw new RelayInputError('invalid JSON'); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new RelayInputError('invalid body');
   return body;
 }
 
@@ -119,7 +151,25 @@ async function handleEnqueue(request, env) {
     createdAt: now,
     expiresAt
   });
+  if (saved?.conflict) return json({ ok: false, error: 'relay identity conflict' }, 409);
   return json({ ok: true, messageId: body.messageId, idempotent: !!saved.idempotent }, saved.idempotent ? 200 : 201);
+}
+
+async function handleRefreshExpiry(request, env) {
+  const body = await readBody(request);
+  if (!hasExactKeys(body, REFRESH_KEYS) ||
+      !validNativeId(body.deviceId) || !validNativeId(body.messageId) ||
+      !validNativeId(body.idempotencyKey) || typeof body.direction !== 'string' ||
+      !DIRECTIONS.has(body.direction) || !Number.isSafeInteger(body.expiresAt) || body.expiresAt <= 0) {
+    return json({ ok: false, error: 'invalid refresh request' }, 400);
+  }
+  if (!await authorize(request, env, body.deviceId)) return json({ ok: false, error: 'unauthorized' }, 401);
+  const now = Date.now();
+  if (body.expiresAt <= now) return json({ ok: false, error: 'invalid expiry' }, 400);
+  if (body.expiresAt > now + MAX_RELAY_EXPIRY_MS) return json({ ok: false, error: 'invalid expiry' }, 400);
+  const result = await relayStore(env).refreshExpiry(body, now);
+  if (result?.conflict) return json({ ok: false, error: 'relay identity conflict' }, 409);
+  return json({ ok: true, messageId: body.messageId, expiresAt: result.expiresAt, idempotent: !!result.idempotent }, 200);
 }
 
 async function handlePoll(request, env, url) {
@@ -178,15 +228,17 @@ const relayWorker = {
       if (request.method === 'GET' && url.pathname === '/bridge/health') {
         return json({ ok: true, service: 'yuqi-relay', version: YUQI_RELAY_VERSION, storage: 'ciphertext-only' });
       }
-      if (request.method === 'POST' && url.pathname === '/bridge/register') return handleRegister(request, env);
-      if (request.method === 'POST' && url.pathname === '/bridge/enqueue') return handleEnqueue(request, env);
-      if (request.method === 'GET' && url.pathname === '/bridge/poll') return handlePoll(request, env, url);
-      if (request.method === 'POST' && url.pathname === '/bridge/ack') return handleAck(request, env);
-      if (request.method === 'GET' && url.pathname === '/bridge/quota') return handleQuota(request, env, url);
-      if (request.method === 'GET' && url.pathname === '/bridge/socket') return handleSocket(request, env, url);
+      if (request.method === 'POST' && url.pathname === '/bridge/register') return await handleRegister(request, env);
+      if (request.method === 'POST' && url.pathname === '/bridge/enqueue') return await handleEnqueue(request, env);
+      if (request.method === 'POST' && url.pathname === '/bridge/refresh-expiry') return await handleRefreshExpiry(request, env);
+      if (request.method === 'GET' && url.pathname === '/bridge/poll') return await handlePoll(request, env, url);
+      if (request.method === 'POST' && url.pathname === '/bridge/ack') return await handleAck(request, env);
+      if (request.method === 'GET' && url.pathname === '/bridge/quota') return await handleQuota(request, env, url);
+      if (request.method === 'GET' && url.pathname === '/bridge/socket') return await handleSocket(request, env, url);
       return json({ ok: false, error: 'not found' }, 404);
     } catch (error) {
-      return json({ ok: false, error: String(error?.message || error).slice(0, 200) }, 400);
+      const status = Number(error?.statusCode) || 500;
+      return json({ ok: false, error: status >= 500 ? 'relay internal error' : String(error?.message || error).slice(0, 200) }, status);
     }
   }
 };
@@ -229,21 +281,66 @@ export function createMemoryRelayStore() {
   const envelopes = new Map();
   const idempotency = new Map();
   const usageRows = new Map();
+  function lookup(envelope) {
+    const byMessage = envelopes.get(envelope.messageId) || null;
+    const indexedMessageId = idempotency.get(identityKey(envelope));
+    const byIdempotency = indexedMessageId ? (envelopes.get(indexedMessageId) || null) : null;
+    return { byMessage, byIdempotency, indexedMessageId };
+  }
+  function removeEnvelope(item) {
+    envelopes.delete(item.messageId);
+    const key = identityKey(item);
+    if (idempotency.get(key) === item.messageId) idempotency.delete(key);
+  }
   return {
     async getDevice(deviceId) { return devices.get(deviceId) || null; },
     async saveDevice(device) { devices.set(device.deviceId, structuredClone(device)); return device; },
-    async putEnvelope(envelope) {
-      const key = `${envelope.deviceId}:${envelope.idempotencyKey}`;
-      if (idempotency.has(key)) return { idempotent: true };
-      envelopes.set(envelope.messageId, structuredClone(envelope));
-      idempotency.set(key, envelope.messageId);
+    async putEnvelope(envelope, now = Date.now()) {
+      const { byMessage, byIdempotency, indexedMessageId } = lookup(envelope);
+      if (indexedMessageId && !byIdempotency) return { conflict: true };
+      if (byMessage && byIdempotency && byMessage.messageId !== byIdempotency.messageId) return { conflict: true };
+      const existing = byMessage || byIdempotency;
+      if (existing) {
+        if (!identityMatches(existing, envelope)) return { conflict: true };
+        if (existing.expiresAt > now) return contentMatches(existing, envelope) ? { idempotent: true } : { conflict: true };
+      }
+      const oldMessage = byMessage ? structuredClone(byMessage) : null;
+      const oldIndexedMessageId = indexedMessageId || null;
       const usageKey = `${dayKey(envelope.createdAt)}:${envelope.deviceId}`;
-      const current = usageRows.get(usageKey) || { bytes: 0, writes: 0 };
-      usageRows.set(usageKey, { bytes: current.bytes + Number(envelope.byteCount || 0), writes: current.writes + 1 });
-      return { idempotent: false };
+      const oldUsage = usageRows.has(usageKey) ? structuredClone(usageRows.get(usageKey)) : null;
+      try {
+        if (existing) removeEnvelope(existing);
+        envelopes.set(envelope.messageId, structuredClone(envelope));
+        idempotency.set(identityKey(envelope), envelope.messageId);
+        const current = usageRows.get(usageKey) || { bytes: 0, writes: 0 };
+        usageRows.set(usageKey, { bytes: current.bytes + Number(envelope.byteCount || 0), writes: current.writes + 1 });
+        return { idempotent: false };
+      } catch (error) {
+        envelopes.delete(envelope.messageId);
+        idempotency.delete(identityKey(envelope));
+        if (oldMessage) {
+          envelopes.set(oldMessage.messageId, oldMessage);
+          idempotency.set(identityKey(oldMessage), oldMessage.messageId);
+        } else if (oldIndexedMessageId) {
+          idempotency.set(identityKey(envelope), oldIndexedMessageId);
+        }
+        if (oldUsage) usageRows.set(usageKey, oldUsage); else usageRows.delete(usageKey);
+        throw error;
+      }
+    },
+    async refreshExpiry(identity, now = Date.now()) {
+      const { byMessage, byIdempotency, indexedMessageId } = lookup(identity);
+      if (indexedMessageId && !byIdempotency) return { conflict: true };
+      if (!byMessage || !byIdempotency || byMessage.messageId !== byIdempotency.messageId || !identityMatches(byMessage, identity)) {
+        return { conflict: true };
+      }
+      if (byMessage.expiresAt <= now) return { conflict: true };
+      if (identity.expiresAt <= byMessage.expiresAt) return { idempotent: true, expiresAt: byMessage.expiresAt };
+      if (identity.expiresAt > now + MAX_RELAY_EXPIRY_MS) return { conflict: true };
+      byMessage.expiresAt = identity.expiresAt;
+      return { idempotent: false, expiresAt: byMessage.expiresAt };
     },
     async poll(deviceId, direction, now, limit) {
-      for (const [id, item] of envelopes) if (item.expiresAt <= now) envelopes.delete(id);
       return [...envelopes.values()]
         .filter(item => item.deviceId === deviceId && item.direction === direction && item.expiresAt > now)
         .sort((a, b) => a.createdAt - b.createdAt)
@@ -254,7 +351,7 @@ export function createMemoryRelayStore() {
       let deleted = 0;
       for (const id of messageIds) {
         const item = envelopes.get(id);
-        if (item?.deviceId === deviceId) { envelopes.delete(id); deleted += 1; }
+        if (item?.deviceId === deviceId) { removeEnvelope(item); deleted += 1; }
       }
       return deleted;
     },
@@ -263,6 +360,27 @@ export function createMemoryRelayStore() {
 }
 
 export function createD1RelayStore(db) {
+  async function identityRows(identity) {
+    const result = await db.prepare(`SELECT message_id, device_id, direction, ciphertext, nonce,
+      idempotency_key, byte_count, created_at, expires_at FROM relay_messages
+      WHERE message_id = ?1 OR (device_id = ?2 AND idempotency_key = ?3)`)
+      .bind(identity.messageId, identity.deviceId, identity.idempotencyKey).all();
+    return (result?.results || []).map(row => ({
+      messageId: row.message_id, deviceId: row.device_id, direction: row.direction,
+      ciphertext: row.ciphertext, nonce: row.nonce, idempotencyKey: row.idempotency_key,
+      byteCount: row.byte_count, createdAt: row.created_at, expiresAt: row.expires_at
+    }));
+  }
+  function classifyRows(rows, envelope, now) {
+    if (!rows.length) return null;
+    const byMessage = rows.find(row => row.messageId === envelope.messageId) || null;
+    const byIdempotency = rows.find(row => row.deviceId === envelope.deviceId && row.idempotencyKey === envelope.idempotencyKey) || null;
+    if (byMessage && byIdempotency && byMessage.messageId !== byIdempotency.messageId) return { conflict: true };
+    const existing = byMessage || byIdempotency;
+    if (!existing || !identityMatches(existing, envelope)) return { conflict: true };
+    if (existing.expiresAt > now) return contentMatches(existing, envelope) ? { idempotent: true } : { conflict: true };
+    return { expiredExact: true };
+  }
   return {
     async getDevice(deviceId) {
       const row = await db.prepare('SELECT device_id, token_hash, created_at, updated_at FROM relay_devices WHERE device_id = ?1').bind(deviceId).first();
@@ -275,24 +393,58 @@ export function createD1RelayStore(db) {
         .bind(device.deviceId, device.tokenHash, device.createdAt, device.updatedAt).run();
       return device;
     },
-    async putEnvelope(envelope) {
-      const result = await db.prepare(`INSERT OR IGNORE INTO relay_messages
+    async putEnvelope(envelope, now = Date.now()) {
+      const rows = await identityRows(envelope);
+      const classification = classifyRows(rows, envelope, now);
+      if (classification && !classification.expiredExact) return classification;
+      if (typeof db.batch !== 'function') throw new Error('D1 transactional batch unavailable');
+      const removeExpired = db.prepare(`DELETE FROM relay_messages
+        WHERE message_id = ?1 AND device_id = ?2 AND idempotency_key = ?3 AND direction = ?4 AND expires_at <= ?5`)
+        .bind(envelope.messageId, envelope.deviceId, envelope.idempotencyKey, envelope.direction, now);
+      const insert = db.prepare(`INSERT INTO relay_messages
         (message_id, device_id, direction, ciphertext, nonce, idempotency_key, byte_count, created_at, expires_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`)
         .bind(envelope.messageId, envelope.deviceId, envelope.direction, envelope.ciphertext, envelope.nonce,
-          envelope.idempotencyKey, envelope.byteCount, envelope.createdAt, envelope.expiresAt).run();
-      const inserted = Number(result?.meta?.changes || 0) > 0;
-      if (inserted) {
-        await db.prepare(`INSERT INTO relay_usage(usage_day, device_id, byte_count, write_count)
-          VALUES (?1, ?2, ?3, 1)
-          ON CONFLICT(usage_day, device_id) DO UPDATE SET
-          byte_count=relay_usage.byte_count+excluded.byte_count, write_count=relay_usage.write_count+1`)
-          .bind(dayKey(envelope.createdAt), envelope.deviceId, envelope.byteCount).run();
+          envelope.idempotencyKey, envelope.byteCount, envelope.createdAt, envelope.expiresAt);
+      const usage = db.prepare(`INSERT INTO relay_usage(usage_day, device_id, byte_count, write_count)
+        VALUES (?1, ?2, ?3, 1)
+        ON CONFLICT(usage_day, device_id) DO UPDATE SET
+        byte_count=relay_usage.byte_count+excluded.byte_count, write_count=relay_usage.write_count+1`)
+        .bind(dayKey(envelope.createdAt), envelope.deviceId, envelope.byteCount);
+      try {
+        await db.batch([removeExpired, insert, usage]);
+        return { idempotent: false };
+      } catch (error) {
+        if (!/unique constraint|constraint failed/i.test(String(error?.message || error))) throw error;
+        const after = await identityRows(envelope);
+        const recovered = classifyRows(after, envelope, now);
+        if (recovered?.idempotent) return recovered;
+        if (recovered?.conflict && after.some(row => row.expiresAt > now)) return recovered;
+        throw error;
       }
-      return { idempotent: !inserted };
+    },
+    async refreshExpiry(identity, now = Date.now()) {
+      const rows = await identityRows(identity);
+      const byMessage = rows.find(row => row.messageId === identity.messageId) || null;
+      const byIdempotency = rows.find(row => row.deviceId === identity.deviceId && row.idempotencyKey === identity.idempotencyKey) || null;
+      if (!byMessage || !byIdempotency || byMessage.messageId !== byIdempotency.messageId || !identityMatches(byMessage, identity)) return { conflict: true };
+      const current = byMessage;
+      if (current.expiresAt <= now) return { conflict: true };
+      if (identity.expiresAt <= current.expiresAt) return { idempotent: true, expiresAt: current.expiresAt };
+      if (identity.expiresAt > now + MAX_RELAY_EXPIRY_MS) return { conflict: true };
+      const result = await db.prepare(`UPDATE relay_messages SET expires_at = ?1
+        WHERE device_id = ?2 AND message_id = ?3 AND idempotency_key = ?4 AND direction = ?5
+          AND expires_at > ?6 AND ?1 > expires_at`)
+        .bind(identity.expiresAt, identity.deviceId, identity.messageId, identity.idempotencyKey, identity.direction, now).run();
+      if (Number(result?.meta?.changes || 0) !== 1) {
+        const after = await identityRows(identity);
+        const replay = after.find(row => identityMatches(row, identity));
+        return replay && replay.expiresAt > now && identity.expiresAt <= replay.expiresAt
+          ? { idempotent: true, expiresAt: replay.expiresAt } : { conflict: true };
+      }
+      return { idempotent: false, expiresAt: identity.expiresAt };
     },
     async poll(deviceId, direction, now, limit) {
-      await db.prepare('DELETE FROM relay_messages WHERE expires_at <= ?1').bind(now).run();
       const result = await db.prepare(`SELECT message_id, device_id, direction, ciphertext, nonce,
         idempotency_key, byte_count, created_at, expires_at FROM relay_messages
         WHERE device_id = ?1 AND direction = ?2 AND expires_at > ?3
