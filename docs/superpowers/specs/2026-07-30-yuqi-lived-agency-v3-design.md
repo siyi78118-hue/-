@@ -480,11 +480,17 @@ acceptanceCriteria
 
 ### 12.3 `PROACTIVE_MOMENT`
 
-从已提交生活事件形成公开内容。没有真实内容可以 skip。不得公开私聊、支付金额、用户隐私或未公开关系。
+从已持久且明确标记为 `public-moment-candidate-v1` 的 completed life episode 形成公开内容。Task 18 先把该 marker 设为 reserved key：普通 life-plan、聊天调整、导入恢复和外部 caller 一律不能写；Task 19 只有在 authoritative life result 通过闭集校验后，才由 `commitLifePlanningResultInternal()` 在同一事务使用私有 trusted writer 写入。PC 在 fresh canonical turn 的 immediate transaction 中重建并固定 `publicMomentAuthority`；调度、caller 传入的 `lifeEvents`、episode title、任意 payload、私聊记忆和模型推断都不是公共事实源。没有仍有效且未消费的 public-safe candidate，或存在明确 public-moment hard constraint 时，在模型、图片和外部调用前提交 canonical skip。
+
+公开模型调用是一条独立的数据流：不读取私聊历史、支付、关系 base/phase、私有事实、私有 stance/preference、私有安排或普通记忆检索，只读取固定的 public candidate、public boundary、公开人格设置和公开 social lesson。public boundary 是代码生成的 exact literal `{version:'public-boundary-v1',visibility:'public',recipientId:'public_moments',allowPrivateChatContext:false,allowPaymentContext:false,allowRelationshipContext:false,allowPrivateMemoryContext:false}`，不读取或合并 caller 字段。该边界保证持久私密数据不会进入公开模型输入；它不虚假承诺能够从语义上证明模型永远不会幻觉出任意一句不当文本。结构化 payment、relationship 和 private-plan action 在 commit 前一律拒绝。
+
+可见公开结果用 kind-specific `pc-visible-commit-v4` 保存 `publicMomentEvidenceIds`；发送引用一至三个 pinned ID，skip 引用空数组。live committed manifest 是消费事实，redacted group 不保留或重建语义 ID。
 
 ### 12.4 `MOMENT_INTERACTION` / `MOMENT_REPLY`
 
-读取精确 moment、comment 和线程。认知决定点赞、评论、回复或不动作；程序锁定目标和公共隐私。
+读取 authenticated Web/Android trigger 中闭合、规范化的 exact public target snapshot。wire-v3 只接受 `targetMoment`/`targetComment`，拒绝 generic snapshot 与旧 `moment/playerComment/replyToCommentId`，也不从它们补全或合并 canonical target；旧字段只留在 wire-v2 兼容路径。PC 将 moment、comment 和 thread 固定为 `momentTargetAuthority`，并把其 checksum 纳入 generation fingerprint；模型只能决定点赞、评论、回复或不动作，不能改变目标、作者、线程、公开边界或 action target revision。`MOMENT_REPLY` 的 target comment 必须逐字段存在于 target moment 的 comment list 且由玩家发送；同一 moment 串行，不同 moment 可并行。
+
+like/comment/reply 是零聊天 item 的 `action_only` canonical result；skip 是零 item/零 action；主动朋友圈 post 才生成 `public_moments` visible item。wire-v3 找不到 exact UI target 时 fail closed，不创建 virtual moment，也不记录 UI-applied；legacy v1/v2 virtual fallback 保持兼容。`ROLE_PLAN_MOMENT_PRIVATE` 中的 `PRIVATE` 表示安排来自 private-decision source，公开受众语义不变，因此仍属于 public moment lane，并继续接受同一 public boundary。
 
 ### 12.5 角色安排
 
@@ -1063,13 +1069,20 @@ relay ciphertext 与撤回请求竞态，已清聊天也不会重新出现。
 
 `inputClearEpoch` 是 canonical input authority 的一部分。v13 migration 对历史 turn
 写 0；Task 11 创建新 turn 时从已验证 visibility cursor 固定它，wire v2 缺失时只能
-固定 0。PC 新提交使用 `pc-visible-commit-v2`，其 canonical payload 的 `input`
-固定包含 `{userBatchId, visibilitySequence, clearEpoch}`；Android 新 fallback 使用
-`android-fallback-commit-v2` 并包含同一字段。v1 receipt/manifest 继续只按原 v1
-payload 重算，且必须满足 `input_clear_epoch=0`。不能在仍名为 v1 的 checksum
-payload 中悄悄增加 clear epoch。existing-receipt replay 先闭合验证存储的
-origin/payload version，再选择相应 v1/v2 canonicalizer 重算调用方 input；新 open
-turn 一律只产生 v2。
+固定 0。PC 新提交默认使用 `pc-visible-commit-v2`，canonical wire-v3
+`PROACTIVE_CHAT` 使用 `pc-visible-commit-v3`，canonical wire-v3
+`PROACTIVE_MOMENT/MOMENT_INTERACTION/MOMENT_REPLY` 使用
+`pc-visible-commit-v4`。三者都保留 v2 canonical payload 的精确基础 key set 与
+`input:{userBatchId,visibilitySequence,clearEpoch}`；v3 只增加闭合
+`proactiveMotiveEvidenceIds`，v4 按 kind 只增加闭合
+`publicMomentEvidenceIds` 或 `momentTargetAuthorityChecksum`，`commitChecksum` 始终
+hash 对应 exact payload。Android 新 fallback 使用 `android-fallback-commit-v2` 并
+包含同一 input 字段。v1 receipt/manifest 继续只按原 v1 payload 重算，且必须满足
+`input_clear_epoch=0`。不能在仍名为 v1/v2 的 checksum payload 中悄悄增加新语义。
+existing-receipt replay 先闭合验证存储的 origin/payload version，再选择对应
+v1/v2/v3/v4 canonicalizer 重算调用方 input；旧 v1/v2 只原样回放。live v3/v4
+manifest 验证完整语义；redacted group 只验证 identity/cardinality/checksum tombstone，
+不得重建或消费 motive/public evidence/target prose。
 
 private-chat lane 持久化当前 `clear_epoch + cleared_through_sequence`。fresh turn 的
 input clear epoch 必须等于 lane current epoch；retry 继承 parent 的

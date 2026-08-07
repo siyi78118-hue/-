@@ -6917,6 +6917,9 @@ git commit -m "feat: integrate direct social and structured interactions"
 - Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Modify: `yuqi-runtime/test/turn-dispatcher.test.mjs`
 - Modify: `yuqi-runtime/test/cloud-relay-pump.test.mjs`
+- Modify: `yuqi-runtime/test/bridge-authority-v3.test.mjs`
+- Modify: `yuqi-runtime/test/android-fallback-authority.test.mjs`
+- Modify: `yuqi-runtime/test/v3-runtime-recovery.test.mjs`
 - Create: `yuqi-runtime/test/proactive-chat-v3.test.mjs`
 - Modify: `tests/yuqi-cognition-feature-matrix.test.mjs`
 
@@ -7140,7 +7143,7 @@ Before release execution and again immediately before drafting actions/quality/c
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/proactive-chat-v3.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
+node --test yuqi-runtime/test/proactive-chat-v3.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/bridge-authority-v3.test.mjs yuqi-runtime/test/android-fallback-authority.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
 ```
 
 Expected: PASS with no `only`/`skip`. The gate must prove zero-motive and structural-silence execution call no model; a visible send cites pinned evidence; a two-candidate send consumes only the cited manifest ID while the uncited candidate remains eligible, and a skip consumes none; consumed/expired/forged evidence cannot send; an `updated_at`-only life bookkeeping change keeps the same motive ID while a changed persisted semantic checksum yields a new deterministic source version; schema-v2 rich open-thread state is production-reachable and tamper-closed; canonical skip has zero items/actions/messages/delivery text/memory jobs; direct/proactive races have one lane owner and at most one visible group; lane-busy cloud input creates no turn/lineage/lane/rollout/delivery/diagnostic and sends no relay ACK, while an attached valid recovery snapshot may advance only its independent idempotent sync/message/annotation state exactly once; provider rejection after supersession creates no pipeline or quality failure; close/reopen preserves cancelled and committed authority; and RA0, wire v1/v2, role-plan, moment, and cloud stale-trigger fixtures are unchanged.
@@ -7158,79 +7161,171 @@ Expected: PASS with zero failures and zero skipped tests. Run `git diff --check`
 - [ ] **Step 8: Commit**
 
 ```powershell
-git add yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/role-schemas.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/src/cognitive-pipeline.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/proactive-chat-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
+git add yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/role-schemas.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/src/cognitive-pipeline.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/turn-dispatcher.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/turn-dispatcher.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/bridge-authority-v3.test.mjs yuqi-runtime/test/android-fallback-authority.test.mjs yuqi-runtime/test/v3-runtime-recovery.test.mjs yuqi-runtime/test/proactive-chat-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs
 git commit -m "feat: ground proactive chat in lived motives"
 ```
 
 ### Task 18: Integrate Public Moments and Moment Threads
 
 **Files:**
+- Modify: `yuqi-runtime/src/protocol.mjs`
+- Modify: `yuqi-runtime/src/interaction-lanes.mjs`
+- Modify: `yuqi-runtime/src/life-simulation.mjs`
+- Modify: `yuqi-runtime/src/cognition-context.mjs`
 - Modify: `yuqi-runtime/src/cognition-v3-adapters.mjs`
+- Modify: `yuqi-runtime/src/cognition-v3-contract.mjs`
+- Modify: `yuqi-runtime/src/cognitive-pipeline.mjs`
+- Modify: `yuqi-runtime/src/role-schemas.mjs`
+- Modify: `yuqi-runtime/src/visible-result-commit.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Modify: `yuqi-runtime/src/social-experience.mjs`
+- Modify: `tavern-app/index.html`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java`
+- Modify: `yuqi-runtime/test/protocol-store.test.mjs`
+- Modify: `yuqi-runtime/test/interaction-lanes.test.mjs`
+- Modify: `yuqi-runtime/test/life-simulation.test.mjs`
+- Modify: `yuqi-runtime/test/cognition-context.test.mjs`
+- Modify: `yuqi-runtime/test/cognition-v3-adapters.test.mjs`
+- Modify: `yuqi-runtime/test/cognition-v3-contract.test.mjs`
+- Modify: `yuqi-runtime/test/cognitive-pipeline-v3.test.mjs`
+- Modify: `yuqi-runtime/test/visible-result-commit.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
+- Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Create: `yuqi-runtime/test/moments-v3.test.mjs`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java`
 - Modify: `tests/yuqi-cognition-feature-matrix.test.mjs`
 - Modify: `tests/yuqi-ui-contract.test.mjs`
 
 **Interfaces:**
-- Consumes: committed public life events, exact moment/comment/thread targets, privacy constraints.
-- Produces: authorized public post/like/comment/reply/skip with lane-specific commit.
+- Consumes: explicit public-safe projections already persisted inside completed `life_episodes`; exact authenticated public moment/comment snapshots normalized from the Web/Android trigger; immutable agency privacy constraints; canonical lane/result authority.
+- Produces: a store-owned `publicMomentAuthority` or `momentTargetAuthority` annotation, a closed cognition decision, and exactly one canonical public post, public-thread action-only result, skip, or fail-closed authority conflict.
+- Does not add a moment table or schema version, does not send private chat/history/payment/relationship/private-plan data to a public model call, does not let caller-provided `lifeEvents` invent public evidence, and does not virtualize an unknown v3 target.
+
+**Authority, privacy, and compatibility contract:**
+
+1. `PROACTIVE_MOMENT` may use only a non-cancelled `life_episodes` row whose persisted status is `completed` and whose `payload_json.publicMomentCandidate` is the exact closed object `{version:'public-moment-candidate-v1',visibility:'public',summary}`. `summary` is pre-sanitized public wording, native string, trimmed, 1–280 characters. Episode title, arbitrary payload fields, private memory, chat text, payment state, relationship state, and model-generated facts are not fallback sources. Task 18 reserves this key and makes every existing general writer (`putLifePlanInternal`, chat life adjustment, import/restore, external caller data) reject it before any write; a Task-18 test may seed a pre-existing valid completed row through raw fixture SQL only to exercise the reader, but Task 18 exposes no production writer. Task 19 is the sole production author: after its authoritative life result has passed the closed life-result validator, `commitLifePlanningResultInternal()` may persist the marker in the same transaction as the completed life episode. Historical episodes without it remain valid but produce no public candidate.
+2. A fresh canonical wire-v3 `PROACTIVE_MOMENT` stores the closed `publicMomentAuthority` reserved annotation beside existing annotations:
+
+   ```js
+   {
+     version: 'public-moment-authority-v1',
+     consideredAt,
+     candidates: [{
+       evidenceId,       // public_event_${sha256(...).slice(0,24)}
+       sourceEpisodeId,
+       sourceChecksum,
+       occurredAt,       // completed episode endAt
+       expiresAt,        // endAt + 12 hours
+       summary
+     }],
+     structuralSilence: null | {
+       reasonCode: 'ACTIVE_PUBLIC_MOMENT_CONSTRAINT',
+       constraintRefs: [{ constraintId, revision }]
+     },
+     checksum
+   }
+   ```
+
+   `checksum` hashes the other fields. Candidates are unique, capped at three, and ordered by `occurredAt DESC, evidenceId ASC`. Only hard `action|consent` constraints scoped to `public_moment|all` with machine rule `deny_public_moment|deny_all_public_actions` create structural silence. Fresh creation rebuilds this object from SQLite inside the existing immediate transaction. Replay/retry/reopen validates the pinned closed object and never rebuilds it from later mutable life state. A committed live `pc-visible-commit-v4` manifest consumes only its cited IDs. Redacted groups expose no semantic IDs and are excluded rather than parsed or retained.
+3. The public cognition path is a data-flow isolation boundary, not a prose filter. For `PROACTIVE_MOMENT`, `MOMENT_INTERACTION`, and `MOMENT_REPLY`, `buildCognitionV3Input()`/`buildCognitionEnvelopeV3()` must emit empty private history, verified private facts, payment, relationship base/phase, private stances/preferences, private open threads, life payload, and ordinary memory retrieval. It may emit only the store-owned public authority, the exact public target/thread, fixed public audience rules, public-safe author settings, and public-safe social lessons. `fixedPublicBoundary()` ignores caller input and returns exactly `{version:'public-boundary-v1',visibility:'public',recipientId:'public_moments',allowPrivateChatContext:false,allowPaymentContext:false,allowRelationshipContext:false,allowPrivateMemoryContext:false}` with native booleans and no extra keys. Tests inject unique private canary secrets into every excluded source and inspect the exact model request; a regex assertion over final prose is not accepted as privacy proof. Because no program can prove every possible hallucinated sentence is semantically harmless, the implementation must not claim such a guarantee; it guarantees that persisted private facts are absent from the public model input and that structured private actions cannot commit.
+4. New Web/Android v3 moment triggers use the canonical closed input projection:
+
+   ```js
+   {
+     targetMoment: {
+       momentId, authorType, authorId, text, createdAt,
+       likes: [authorId],
+       comments: [{
+         commentId, authorType, authorId, text, createdAt,
+         replyToCommentId
+       }]
+     },
+     targetComment: null | { commentId, authorType, authorId, text, createdAt, replyToCommentId }
+   }
+   ```
+
+   All keys and native types are closed; strings are bounded, likes are unique/sorted, comment IDs are unique, and comment order is preserved. `MOMENT_REPLY` requires a `targetComment` that appears byte-for-byte in `targetMoment.comments` and is authored by the player. `MOMENT_INTERACTION` requires `targetComment:null`. `validateEnvelope()` normalizes this before any store/reconcile work. A wire-v3 moment-family input accepts only `targetMoment`/`targetComment`: it rejects generic `snapshot`, legacy `moment/playerComment/replyToCommentId`, and any attempt to derive or merge a missing canonical target from those fields. `BridgeInput` keeps the existing wire-v2 legacy shape unchanged on the separate compatibility path.
+5. Fresh canonical creation derives and stores `{version:'moment-target-authority-v1',targetMoment,targetComment,checksum}` from the normalized v3 envelope. Caller side fields cannot override it. The lane is `moment_interaction:<targetMoment.momentId>`. The generation fingerprint includes `contentHash({agencySnapshotChecksum,momentTargetAuthorityChecksum})`. Action targets and revisions come only from the persisted target snapshot. Wrong moment/comment identity, comment not in the moment, changed snapshot, duplicate comment, foreign target, or replay with different target is rejected before writes; exact replay/retry/restart uses the pinned snapshot. Different moments may proceed independently; the same moment serializes.
+6. Canonical commit uses `pc-visible-commit-v4` only for wire-v3 `PROACTIVE_MOMENT`, `MOMENT_INTERACTION`, and `MOMENT_REPLY`. Its base keys are exactly the v2 set `payloadVersion,authorityOrigin,authorityLineageKey,laneKey,input,agency,releases,generationFingerprint,visibleItems,actions,statePatch,memoryJobs,comparison`, with `input.clearEpoch` retained. `PROACTIVE_MOMENT` adds exactly `publicMomentEvidenceIds`; visible post requires one to three pinned IDs and skip requires `[]`. `MOMENT_INTERACTION`/`MOMENT_REPLY` instead add exactly `momentTargetAuthorityChecksum`; neither v4 shape accepts the other kind's extra field or any unknown key. `commitChecksum` is `contentHash()` of that exact canonical v4 object. A live group recomputes the corresponding annotation checksum, cited-ID consumption, item/action projection, fingerprint, manifest checksum, and receipt. Redaction atomically clears `semantic_json` and annotation semantics while retaining the existing identity/cardinality/checksum tombstones; scoped/reopen validation must not parse or reconstruct public evidence IDs or target prose from a redacted group, and consumption readers skip it. `PROACTIVE_MOMENT` send is one or more public-moment items addressed to `public_moments` and has no payment/relationship/private-plan action. Like/comment/reply are `action_only`, contain zero visible/private-chat items and at least one exact moment action. Skip has zero items/actions/messages/jobs. Unknown action kinds, payment, relationship transition, private role-plan operation, mixed public/private recipient, or public text on an action-only thread fail closed before commit and quarantine through the existing canonical authority path.
+7. `ROLE_PLAN_MOMENT_PRIVATE` remains a public moment lane/recipient. Here `PRIVATE` means the schedule was created from a private-decision source; it does not mean a private audience. Task 18 must freeze this existing meaning with tests and must not reroute it into chat. Its public boundary and validated role-plan occurrence remain Task 19 authority; Task 18 only prevents it from receiving private cognition context or bypassing the public commit allowlist.
+8. RA0 and wire v1/v2 keep their current serialized input, virtual-moment fallback, lane, payload, and UI behavior. For result-authority v1/wire-v3, an absent or changed target never calls `materializeVirtualMoment()` and never records UI-applied success. `sourceTurnId`/canonical action proof prevents duplicate posts/comments across page reload. Web landing of `skip` creates nothing; action-only applies only the action; visible creates only the public post. Cloud/LAN input acknowledgement remains tied to durable canonical acceptance, while UI application/receipt remains tied to actual target application.
 
 - [ ] **Step 1: Write red public-privacy and target-integrity tests**
 
 ```js
-test('proactive moment needs a committed public-safe life event', async () => {
-  const skipped = await runKind('PROACTIVE_MOMENT', {
-    lifeEvents: [{ id: 'e1', state: 'draft', privacy: 'public' }]
+test('proactive moment needs a completed store-owned public-safe life projection', async () => {
+  const planned = await runRealCanonicalMoment({
+    episode: lifeEpisode({ status: 'planned', publicCandidate: true })
   });
-  assert.equal(skipped.action, 'skip');
-  const sent = await runKind('PROACTIVE_MOMENT', {
-    lifeEvents: [{ id: 'e2', state: 'committed', privacy: 'public' }]
+  assert.equal(planned.terminalDisposition, 'skip');
+  assert.equal(planned.releaseExecutions, 0);
+
+  const completed = await runRealCanonicalMoment({
+    episode: lifeEpisode({ status: 'completed', publicCandidate: true }),
+    cognition: postWithPublicEvidence()
   });
-  assert.equal(sent.action, 'post');
-  assert.deepEqual(sent.evidenceIds, ['e2']);
+  assert.equal(completed.terminalDisposition, 'visible');
+  assert.deepEqual(completed.manifest.publicMomentEvidenceIds,
+    [completed.authority.candidates[0].evidenceId]);
 });
 
-test('public content cannot reveal private chat payment or unannounced relationship', async () => {
-  const result = await runKind('PROACTIVE_MOMENT', privateLeakContext());
-  assert.doesNotMatch(result.visibleText, /100元|充值亲亲|我们已经在一起/);
+test('public cognition request contains none of the persisted private canaries', async () => {
+  const capture = await captureRealPublicModelRequest(privateCanaryStore());
+  assert.deepEqual(capture.relevantHistory, []);
+  assert.deepEqual(capture.verifiedFacts, []);
+  assert.equal(capture.relationshipBasePhase.base, null);
+  assert.equal(JSON.stringify(capture).includes('PRIVATE_CANARY_7f2c'), false);
 });
 
-test('moment reply is locked to the triggering moment and comment', async () => {
-  const result = await runKind('MOMENT_REPLY', exactThreadContext());
-  assert.equal(result.action.momentId, 'moment-7');
-  assert.equal(result.action.replyToCommentId, 'comment-9');
-  assert.throws(() => commitChangedTarget(result, 'comment-10'), /authority conflict/);
+test('moment reply is pinned to the exact persisted trigger snapshot across restart', async () => {
+  const created = await createRealMomentReply(exactCanonicalThread());
+  await reopenStore();
+  assert.equal((await commitReply(created)).terminalDisposition, 'action_only');
+  await assert.rejects(() => replayWithChangedComment(created), /authority conflict/);
 });
 ```
 
+The red matrix must also cover completed episodes with missing/private/malformed candidate markers; all ordinary life writers rejecting the reserved marker with zero writes; a raw-SQL pre-existing valid marker surviving close/reopen; expired and already-consumed evidence; two candidates with only the cited ID consumed; structural silence; caller `lifeEvents` override attempts; non-canonical Web legacy fields or a generic snapshot on v3; changed/extra/foreign moment/comment fields; comment-not-in-thread; duplicate IDs; invalid native types; same-moment serialization and different-moment independence; public send with payment/relationship/private-plan action; interaction with private-chat text; skip with any item/action; v3 unknown target UI application; exact reload/replay; and RA0/wire-v2 byte-compatible snapshots. Use real `YuqiStore` create/commit/close/reopen fixtures and a real `runV3ReleaseDraft()` adapter path, not a `runKind()` helper that manually supplies validation context.
+
 - [ ] **Step 2: Run moment tests red**
 
-Run: `node --test yuqi-runtime/test/moments-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs tests/yuqi-ui-contract.test.mjs`
+Run:
 
-Expected: FAIL on missing v3 moment integration.
+```powershell
+node --test yuqi-runtime/test/moments-v3.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-context.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs tests/yuqi-ui-contract.test.mjs
+```
+
+Expected red: caller events still reach cognition, private history/facts remain in the public request, old Web fields do not form the canonical target, v3 unknown targets virtualize, no v4 manifest/annotation validator exists, and moment actions may create chat items.
 
 - [ ] **Step 3: Implement public-safe feature context and exact action targets**
 
 ```js
 function proactiveMomentFeatureContext(input) {
+  const authority = input.turn.annotationSnapshot.publicMomentAuthority;
   return {
-    committedLifeEvents: input.lifeEvents.filter(event =>
-      event.state === 'committed' && event.privacy === 'public'),
-    publicPrivacy: compilePublicPrivacyRules(input)
+    committedLifeEvents: structuredClone(authority.candidates),
+    publicPrivacy: fixedPublicBoundary(authority)
   };
 }
 
 function momentInteractionFeatureContext(input) {
+  const authority = input.turn.annotationSnapshot.momentTargetAuthority;
   return {
-    targetMoment: requireExactMoment(input),
-    targetComment: optionalExactComment(input),
-    thread: exactVisibleThread(input)
+    targetMoment: structuredClone(authority.targetMoment),
+    targetComment: structuredClone(authority.targetComment),
+    thread: structuredClone(authority.targetMoment.comments)
   };
 }
 ```
 
-Only committed public-safe facts reach expression. The program layer locks moment/comment IDs and public/private permissions. `moment_interaction:<momentId>` lanes allow unrelated moments to proceed independently while serializing the same thread.
+Add pure `buildPublicMomentAuthority()` and `buildMomentTargetAuthority()` helpers with the exact contracts above. The orchestrator builds the reserved key before creation; store independently rebuilds the fresh public-source authority or derives the target authority from the normalized envelope inside the immediate transaction. Reserve `publicMomentCandidate` at every existing generic life write boundary and reject caller/import/chat-adjustment attempts before mutation; do not add a trusted production author in Task 18. Adapters and validation read only the persisted turn annotation. `normalizeCognitionV3Result()` receives the exact public evidence/target set from the final built cognition envelope; manually injected caller context is not accepted.
+
+`buildCognitionContext()` must branch on the three public moment kinds before listing messages or building an evidence pack. The public branch must not perform those private reads at all, rather than read then delete. Add spies proving zero `listMessages`, evidence retrieval, payment, relationship, private stance/preference, and private life payload access. It may load only the public authority/thread already pinned to the turn.
+
+Extend canonical commit and the v13/v14 group-scoped/reopen validator with the kind-specific `pc-visible-commit-v4` key sets, evidence consumption, annotation checksum, context fingerprint, item/action/recipient shape, and redacted-group behavior. Every consumption reader first runs one group-scoped authority validation and performs zero full-database invariant scans. No migration is added.
+
+Update `queueYuqiMomentTurn()` to emit the canonical target keys and bounded snapshots. Update the Android mapper and its JVM tests so a v3 checkpoint preserves that canonical projection while the v2 legacy shape remains unchanged. In Web application, forbid virtual target creation for an RA1/wire-v3 action; exact missing target returns false and leaves UI cursor/receipt unapplied. Keep virtual fallback only for legacy results.
 
 Every moment-family `action:'skip'` uses the same canonical zero-item/zero-action
 terminal path as proactive chat. A like/comment/reply with no chat bubble is
@@ -7238,16 +7333,28 @@ terminal path as proactive chat. A like/comment/reply with no chat bubble is
 is `visible` and must contain a public-moment item. Neither case may fabricate a
 private-chat bubble merely to satisfy an old “at least one item” invariant.
 
-- [ ] **Step 4: Run moments tests green**
+- [ ] **Step 4: Run the complete Task 18 focused gate**
 
 Run the Step 2 command.
 
-Expected: PASS for `PROACTIVE_MOMENT`, `MOMENT_INTERACTION`, `MOMENT_REPLY`, `ROLE_PLAN_MOMENT`, and `ROLE_PLAN_MOMENT_PRIVATE` matrix rows.
-
-- [ ] **Step 5: Commit**
+Then run:
 
 ```powershell
-git add yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/social-experience.mjs yuqi-runtime/test/moments-v3.test.mjs tests/yuqi-cognition-feature-matrix.test.mjs tests/yuqi-ui-contract.test.mjs
+cd android
+.\gradlew.bat testDebugUnitTest --tests "*BridgeInputTest" --no-daemon --no-problems-report
+cd ..
+```
+
+Expected: all tests pass with no `.only`/`.skip`. The gate must prove real public-source reachability, zero-candidate pre-model skip, private-input read isolation, exact v4 manifests and fingerprints, target identity/restart closure, no private structured action, no private-chat bubble, v3 unknown-target fail-closed UI behavior, and unchanged RA0/wire-v1/v2 plus both role-plan moment variants. `ROLE_PLAN_MOMENT_PRIVATE` must remain a public moment because its suffix describes the plan source, not the audience.
+
+- [ ] **Step 5: Run the project regression gate**
+
+Run `npm.cmd test`, `git diff --check`, and scan every modified test for `.only`/`.skip`. Do not start the PC service, cloud timers, or Android runtime. An attached device is not required for this Task 18 JVM/Web/PC gate; the full connected-device release gate remains later.
+
+- [ ] **Step 6: Commit**
+
+```powershell
+git add yuqi-runtime/src/protocol.mjs yuqi-runtime/src/interaction-lanes.mjs yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/cognition-context.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/src/cognition-v3-contract.mjs yuqi-runtime/src/cognitive-pipeline.mjs yuqi-runtime/src/role-schemas.mjs yuqi-runtime/src/visible-result-commit.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/social-experience.mjs tavern-app/index.html android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/interaction-lanes.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/cognition-context.test.mjs yuqi-runtime/test/cognition-v3-adapters.test.mjs yuqi-runtime/test/cognition-v3-contract.test.mjs yuqi-runtime/test/cognitive-pipeline-v3.test.mjs yuqi-runtime/test/visible-result-commit.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/moments-v3.test.mjs android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java tests/yuqi-cognition-feature-matrix.test.mjs tests/yuqi-ui-contract.test.mjs
 git commit -m "feat: integrate public-safe moment cognition"
 ```
 
@@ -7257,10 +7364,13 @@ git commit -m "feat: integrate public-safe moment cognition"
 - Modify: `yuqi-runtime/src/relationship-stage.mjs`
 - Modify: `yuqi-runtime/src/life-planning-dispatcher.mjs`
 - Modify: `yuqi-runtime/src/life-simulation.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Modify: `yuqi-runtime/src/cognition-v3-adapters.mjs`
 - Modify: `yuqi-runtime/test/relationship-stage.test.mjs`
 - Modify: `yuqi-runtime/test/life-planning-attempt.test.mjs`
+- Modify: `yuqi-runtime/test/life-simulation.test.mjs`
+- Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Modify: `yuqi-runtime/test/orchestrator.test.mjs`
 - Create: `yuqi-runtime/test/role-plan-life-stage-v3.test.mjs`
 - Modify: `tests/role-plan-domain.test.mjs`
@@ -7268,7 +7378,7 @@ git commit -m "feat: integrate public-safe moment cognition"
 
 **Interfaces:**
 - Consumes: exact role-plan occurrence/schedule, life basis checksum, base/phase graph and evidence.
-- Produces: v3 role-plan operations, two-phase life attempts, formal-only stage review.
+- Produces: v3 role-plan operations, two-phase life attempts, the sole validated writer for a closed public-moment candidate, and formal-only stage review.
 
 - [ ] **Step 1: Write red plan/life/stage consistency tests**
 
@@ -7316,6 +7426,19 @@ test('ordinary life generation rejects major unsupported events', () => {
     episodes: [{ type: 'major_event', text: '突然重病住院' }]
   }), /unsupported major life event/);
 });
+
+test('only a committed validated life result may author a public moment candidate', () => {
+  assert.throws(() => store.putLifePlanInternal('yuqi', [episodeWithPublicMarker()]),
+    /reserved public moment candidate/);
+  const attempt = runningLifeAttempt();
+  const committed = store.commitLifePlanningResultInternal({
+    planningId: attempt.planningId,
+    workerId: attempt.leaseOwner,
+    validatedResult: validatedLifeResultWithPublicCandidate()
+  });
+  assert.deepEqual(store.getLifeEpisode(committed.authoritativeResult.episodes[0].episodeId)
+    .payload.publicMomentCandidate, validClosedPublicCandidate());
+});
 ```
 
 - [ ] **Step 2: Run plan/life/stage tests red**
@@ -7323,7 +7446,7 @@ test('ordinary life generation rejects major unsupported events', () => {
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/role-plan-life-stage-v3.test.mjs yuqi-runtime/test/relationship-stage.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs
+node --test yuqi-runtime/test/role-plan-life-stage-v3.test.mjs yuqi-runtime/test/relationship-stage.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs
 ```
 
 Expected: FAIL until formal stage and v3 operations are separated from expression.
@@ -7349,7 +7472,7 @@ export function relationshipExpressionView(state) {
 }
 ```
 
-Do not pass stage thresholds, transition graph labels, or “allowed affection” flags to expression. Preserve user-edited stage-persona text and revision; compile ordinary wording such as “克制、不太主动” into tone tendencies, and compile only explicitly author-marked non-negotiable settings into author hard constraints. Role-plan operations remain the existing closed domain `create/update/cancel/pause/resume/complete` and `private_message/moment_post/role_schedule`; targets, evidence, and time validate deterministically. Life attempt creation fixes rollout/release/epoch/checksums/canary slot/input but creates no compare job. Authoritative result commit creates the compare job in the same transaction. Failed authority creates no compare job; active/canary failure routes to the controller. Chat life adjustments and visible wording must agree.
+Do not pass stage thresholds, transition graph labels, or “allowed affection” flags to expression. Preserve user-edited stage-persona text and revision; compile ordinary wording such as “克制、不太主动” into tone tendencies, and compile only explicitly author-marked non-negotiable settings into author hard constraints. Role-plan operations remain the existing closed domain `create/update/cancel/pause/resume/complete` and `private_message/moment_post/role_schedule`; targets, evidence, and time validate deterministically. Life attempt creation fixes rollout/release/epoch/checksums/canary slot/input but creates no compare job. The closed life-result schema may optionally carry `publicMomentCandidate` only as the exact `{version:'public-moment-candidate-v1',visibility:'public',summary}` object; summary uses the same native-string/trimmed/1–280 limit as Task 18. `commitLifePlanningResultInternal()` revalidates that object from the authoritative result inside its immediate transaction and calls a private trusted life-plan row writer. No generic `putLifePlanInternal`, chat adjustment, import/restore, caller flag, comparison result, failed/shadow draft, or retry-wait attempt can set or preserve the reserved key. Exact replay returns the same result; changed marker/checksum conflicts; close/reopen recomputes the episode checksum and reserved object. Authoritative result commit creates the compare job in the same transaction. Failed authority creates no episode/marker/compare job; active/canary failure routes to the controller. Chat life adjustments and visible wording must agree.
 
 - [ ] **Step 4: Run all plan/life/stage tests green**
 
@@ -7360,7 +7483,7 @@ Expected: PASS for schedule recovery, role-plan history, life restart, base/phas
 - [ ] **Step 5: Commit**
 
 ```powershell
-git add yuqi-runtime/src/relationship-stage.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/test/relationship-stage.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/role-plan-life-stage-v3.test.mjs tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs
+git add yuqi-runtime/src/relationship-stage.mjs yuqi-runtime/src/life-planning-dispatcher.mjs yuqi-runtime/src/life-simulation.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/cognition-v3-adapters.mjs yuqi-runtime/test/relationship-stage.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/life-simulation.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/role-plan-life-stage-v3.test.mjs tests/role-plan-domain.test.mjs tests/role-plan-repository.test.mjs
 git commit -m "feat: integrate plans life and formal relationship stages"
 ```
 
