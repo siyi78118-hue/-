@@ -7879,9 +7879,13 @@ Stop after this commit for independent review.
   wrapper owns only relay ID, direction and expiry; those are not inner ACK keys.
   Android validates this exact
   tuple and only then marks the row `applied` and ACKs that relay envelope.
-  Duplicate/late ACKs are idempotent; changed ACKs quarantine. Persisted
-  `relayMessageId,relayExpiresAt` are separately matched as the Room CAS snapshot,
-  never substituted for role/peer/applied proof.
+  Duplicate/late ACKs are idempotent; changed ACKs quarantine. The lifecycle row's
+  persisted `relayMessageId,relayExpiresAt` identify the outbound phone-to-PC
+  clear command. Room reloads and exact-matches that persisted pair as its own CAS
+  snapshot; it is never compared with the inbound PC-to-phone applied envelope's
+  different relay ID/expiry. The inbound relay ID is used only to ACK that applied
+  envelope after the Room transaction commits, and neither relay identity
+  substitutes for role/peer/applied proof.
 - Boot, wake, service recovery, LAN timeout, cloud timeout, process death after
   claim, and process death after relay acceptance all resume from Room. Two
   workers may cause external at-least-once calls after a lease expiry but use

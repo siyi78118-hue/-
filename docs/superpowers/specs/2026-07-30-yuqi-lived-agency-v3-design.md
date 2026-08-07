@@ -1297,8 +1297,11 @@ lifecycle semantic checksum，末尾 `checksum` hash 其余九字段的 canonica
 relay message ID、direction 与 expiry 属于认证 outer wrapper，不是 inner ACK 字段。
 Android 验证
 control/role/peer/epoch/through/control checksum/ACK checksum 全部相等后才写
-`applied`；持久 relay ID/expiry 另作为 Room CAS 旧快照匹配。手机对这个 applied
-envelope 的 relay ACK 发生在 Room commit 之后。relay 接受 phone→PC ciphertext 绝不能
+`applied`。lifecycle row 中的持久 relay ID/expiry 属于 outbound phone→PC clear
+命令，Room 只把它们作为自己的 CAS 旧快照重读匹配；它们绝不与 inbound PC→phone
+applied envelope 的另一组 relay ID/expiry 比较。入站 relay ID 只在 Room commit 后
+用于 ACK 该 applied envelope。手机对这个 applied envelope 的 relay ACK 发生在 Room
+commit 之后。relay 接受 phone→PC ciphertext 绝不能
 被记成 PC apply。
 `relay_accepted` 在其持久 expiry 进入 refresh window 后重新取得 lease，复用相同
 message ID/idempotency key 并把 expiry 延长到不超过七天；没有 applied ACK 就不会停止。
