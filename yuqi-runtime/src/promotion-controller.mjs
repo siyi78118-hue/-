@@ -317,7 +317,10 @@ export class PromotionController {
   createLifePlanningAttempt({ roleId, planningContext, now = this.clock() }) {
     return this.store.transaction(() => {
       const open = this.store.getOpenLifePlanningAttempt(roleId);
-      if (open) return open;
+      if (open) {
+        this.store.assertPersistedLifePlanningAttemptAuthorityInternal(open.planningId);
+        return open;
+      }
       const { rollout, pair } = this.selectPipelinePairForFreshSubject(
         'LIFE_PLANNING',
         { now }

@@ -595,3 +595,248 @@ test('action-owned supervision failure never asks a model to repair authority', 
   assert.equal(result.attempts.expressionRewrite, 0);
   assert.equal(client.calls.length, 2);
 });
+
+test('relationship expression view survives checkpoint JSON roundtrip and rewrite without entering cognition envelope', async () => {
+  class JsonRoundTripStore extends FakeStore {
+    saveCognitionCheckpointInternal(turnId, packet) {
+      const checkpoint = {
+        ...(this.checkpoints.get(turnId) || {}),
+        cognitionEnvelope: packet.envelope,
+        cognitionPacket: packet
+      };
+      this.checkpoints.set(turnId, JSON.parse(JSON.stringify(checkpoint)));
+    }
+  }
+
+  const store = new JsonRoundTripStore();
+  const relationshipExpression = {
+    formalFacts: [{ factId: 'mutual_contact' }],
+    toneTendencies: ['温和直接的语气']
+  };
+  const formalEnvelope = {
+    ...envelope(),
+    relationshipBasePhase: {
+      base: { id: 'familiar' },
+      phase: { id: 'normal' },
+      formalFacts: relationshipExpression.formalFacts,
+      allowedFormalTransitions: { familiar: ['close'] },
+      stagePersonaRevision: 9
+    }
+  };
+  const firstCalls = [];
+  let reviewCount = 0;
+  const firstClient = {
+    async runRole(role, payload) {
+      firstCalls.push({ role, payload });
+      if (role === 'cognition_fast') {
+        return { routeDecision: 'fast', cognitionResult: cognitionResult() };
+      }
+      if (role === 'expression_v3') return expressionResult();
+      throw new Error(`unexpected role ${role}`);
+    }
+  };
+  const reviewInputs = [];
+  const first = await runCognitionV3Turn(input({
+    store,
+    client: firstClient,
+    cognitionEnvelope: formalEnvelope,
+    relationshipExpression,
+    supervise(reviewInput) {
+      reviewInputs.push(reviewInput);
+      reviewCount += 1;
+      return reviewCount === 1
+        ? {
+          approved: false,
+          findings: [{
+            owner: 'expression',
+            code: 'DIALOGUE_META_NARRATION',
+            evidenceMessageIds: ['u1'],
+            violatedRequirement: 'visible wording',
+            mustPreserve: ['tone'],
+            mustChange: ['rewrite'],
+            acceptanceCriteria: ['in-world wording']
+          }]
+        }
+        : { approved: true, findings: [] };
+    }
+  }));
+
+  assert.equal(first.state, 'completed');
+  assert.equal(firstCalls.filter((call) => call.role === 'expression_v3').length, 2);
+  assert.equal(firstCalls.filter((call) => call.role === 'expression_v3').every((call) =>
+    call.payload.expressionBrief.relationship.toneTendencies.includes('温和直接的语气')), true);
+  assert.equal(JSON.stringify(firstCalls.find((call) => call.role === 'cognition_fast').payload)
+    .includes('温和直接的语气'), false);
+  assert.deepEqual(reviewInputs[0].relationship, relationshipExpression);
+  assert.deepEqual(Object.keys(reviewInputs[0].relationship).sort(), ['formalFacts', 'toneTendencies']);
+  assert.equal(JSON.stringify(reviewInputs[0]).includes('allowedFormalTransitions'), false);
+  assert.equal(JSON.stringify(reviewInputs[0]).includes('stagePersonaRevision'), false);
+  assert.equal(JSON.stringify(reviewInputs[0]).includes('阶段门槛词'), false);
+
+  const checkpoint = store.getTurnCheckpoint('turn_v3');
+  assert.ok(checkpoint.cognitionPacket.relationshipExpression,
+    'named expression checkpoint channel is required for restart');
+  assert.equal(JSON.stringify(checkpoint.cognitionEnvelope).includes('温和直接的语气'), false);
+
+  const restartCalls = [];
+  await runCognitionV3Turn(input({
+    store,
+    cognitionEnvelope: undefined,
+    relationshipExpression: undefined,
+    client: {
+      async runRole(role, payload) {
+        restartCalls.push({ role, payload });
+        if (role === 'expression_v3') return expressionResult();
+        throw new Error(`restart must not call ${role}`);
+      }
+    },
+    supervise: () => ({ approved: true, findings: [] })
+  }));
+  const restartedExpression = restartCalls.find((call) => call.role === 'expression_v3');
+  assert.ok(restartedExpression);
+  assert.deepEqual(restartedExpression.payload.expressionBrief.relationship, relationshipExpression);
+});
+
+test('cognition reconsideration receives no expression relationship side channel', async () => {
+  const calls = [];
+  let reviewCount = 0;
+  const reviewInputs = [];
+  const formalEnvelope = {
+    ...envelope(),
+    relationshipBasePhase: {
+      base: { id: 'familiar' },
+      phase: { id: 'normal' },
+      formalFacts: [{ factId: 'mutual_contact' }],
+      allowedFormalTransitions: { familiar: ['close'] },
+      stagePersonaRevision: 9
+    },
+    allowedActions: ['send', 'relationshipReview']
+  };
+  const relationshipExpression = {
+    formalFacts: [{ factId: 'mutual_contact' }],
+    toneTendencies: ['只给表达式使用的语气']
+  };
+  const cognitionWithFormalRelationshipReview = cognitionResult({
+    actionIntent: {
+      ...cognitionResult().actionIntent,
+      relationshipReview: {
+        base: {
+          current: 'familiar',
+          recommended: 'close',
+          confidence: 0.9,
+          reason: 'formal evidence-backed review',
+          evidenceMessageIds: ['u1'],
+          explicitMutualChange: true
+        },
+        phase: null
+      }
+    }
+  });
+  const client = {
+    async runRole(role, payload) {
+      calls.push({ role, payload });
+      if (role === 'cognition_fast') {
+        return { routeDecision: 'deep', cognitionResult: cognitionWithFormalRelationshipReview };
+      }
+      if (role === 'cognition_deep') return cognitionWithFormalRelationshipReview;
+      if (role === 'expression_v3') return expressionResult();
+      throw new Error(`unexpected role ${role}`);
+    }
+  };
+  const result = await runCognitionV3Turn(input({
+    cognitionEnvelope: formalEnvelope,
+    relationshipExpression,
+    client,
+    supervise(reviewInput) {
+      reviewInputs.push(reviewInput);
+      reviewCount += 1;
+      return reviewCount === 1
+        ? {
+          approved: false,
+          findings: [{
+            owner: 'cognition',
+            code: 'SOCIAL_BID_DROPPED',
+            evidenceMessageIds: ['u1'],
+            violatedRequirement: 'decision needs reconsideration',
+            mustPreserve: ['authorized action'],
+            mustChange: ['cognition reasoning'],
+            acceptanceCriteria: ['decision remains grounded']
+          }]
+        }
+        : { approved: true, findings: [] };
+    }
+  }));
+
+  assert.equal(result.state, 'completed');
+  const cognitionCalls = calls.filter((call) =>
+    call.role === 'cognition_fast' || call.role === 'cognition_deep');
+  assert.equal(cognitionCalls.length, 3);
+  for (const call of cognitionCalls) {
+    assert.equal(JSON.stringify(call.payload).includes('只给表达式使用的语气'), false);
+    assert.equal(JSON.stringify(call.payload).includes('relationshipExpression'), false);
+  }
+  assert.equal(JSON.stringify(cognitionCalls.at(-1).payload).includes('formal evidence-backed review'), true);
+  const expressionCalls = calls.filter((call) => call.role === 'expression_v3');
+  assert.equal(expressionCalls.every((call) =>
+    Object.hasOwn(call.payload.expressionBrief.authorizedActions, 'relationshipReview') === false), true);
+  assert.equal(Object.hasOwn(
+    reviewInputs[0].cognitionPacket.cognitionResult.actionIntent,
+    'relationshipReview'
+  ), false);
+  assert.equal(Object.hasOwn(reviewInputs[0].draft.actionIntent, 'relationshipReview'), false);
+});
+
+test('v3 public moment turns force an empty expression relationship channel', async () => {
+  const publicEnvelope = {
+    ...envelope(),
+    protocolVersion: 3,
+    turnKind: 'MOMENT_INTERACTION',
+    kind: 'MOMENT_INTERACTION'
+  };
+  const maliciousExpression = {
+    formalFacts: [{ secret: 'PRIVATE_FORMAL_FACT' }],
+    toneTendencies: ['PRIVATE_STAGE_PERSONA'],
+    base: 'PRIVATE_BASE',
+    threshold: 0.99
+  };
+  const store = new FakeStore();
+  store.checkpoints.set('turn_v3', {
+    cognitionEnvelope: publicEnvelope,
+    cognitionPacket: {
+      schemaVersion: 3,
+      envelope: publicEnvelope,
+      cognitionResult: cognitionResult(),
+      packetChecksum: 'packet-checksum'
+    },
+    relationshipExpression: maliciousExpression
+  });
+  const calls = [];
+  await runCognitionV3Turn(input({
+    turn: {
+      turnId: 'turn_v3',
+      characterId: 'yuqi',
+      protocolVersion: 3,
+      turnKind: 'MOMENT_INTERACTION'
+    },
+    store,
+    cognitionEnvelope: undefined,
+    relationshipExpression: maliciousExpression,
+    scene: { relationshipExpression: maliciousExpression },
+    client: {
+      async runRole(role, payload) {
+        calls.push({ role, payload });
+        if (role === 'expression_v3') return expressionResult();
+        throw new Error(`public checkpoint must not call ${role}`);
+      }
+    },
+    supervise: () => ({ approved: true, findings: [] })
+  }));
+
+  const expressionCall = calls.find((call) => call.role === 'expression_v3');
+  assert.ok(expressionCall);
+  assert.deepEqual(expressionCall.payload.expressionBrief.relationship, {
+    formalFacts: [],
+    toneTendencies: []
+  });
+  assert.equal(JSON.stringify(expressionCall.payload).includes('PRIVATE_'), false);
+});

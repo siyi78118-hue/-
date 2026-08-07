@@ -70,6 +70,281 @@ const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
 
 const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
 const FAILURE_DELIVERY_LEASE_MS = 60_000;
+const TRUSTED_LIFE_RESULT_WRITER = Symbol('trusted-life-result-writer');
+
+function validateTrustedPublicMomentCandidate(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || canonicalJson(Object.keys(value).sort())
+      !== canonicalJson(['summary', 'version', 'visibility'])
+    || value.version !== 'public-moment-candidate-v1'
+    || value.visibility !== 'public'
+    || typeof value.summary !== 'string'
+    || value.summary.trim() !== value.summary
+    || value.summary.length < 1 || value.summary.length > 280) {
+    throw new Error('public moment candidate authority conflict');
+  }
+  return value;
+}
+
+function lifePlanningContextChecksum(inputSnapshot) {
+  return contentHash({
+    cognitiveState: inputSnapshot?.cognitiveState || {},
+    allowedActions: inputSnapshot?.allowedActions || []
+  });
+}
+
+function assertLifePlanningValidatedResultShape(validatedResult) {
+  if (!validatedResult || typeof validatedResult !== 'object' || Array.isArray(validatedResult)
+    || canonicalJson(Object.keys(validatedResult).sort()) !== canonicalJson(['episodes'])
+    || !Array.isArray(validatedResult.episodes)) {
+    throw new Error('life planning result authority conflict');
+  }
+  return validatedResult;
+}
+
+function assertLifePlanningInputSnapshotBinding(attempt) {
+  const snapshot = attempt?.inputSnapshot;
+  const planningWindow = snapshot?.planningWindow;
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)
+    || snapshot.roleId !== attempt.roleId
+    || !planningWindow || typeof planningWindow !== 'object' || Array.isArray(planningWindow)
+    || canonicalJson(Object.keys(planningWindow).sort())
+      !== canonicalJson(['startAt', 'targetEndAt'])
+    || planningWindow.startAt !== attempt.planningWindowStartAt
+    || planningWindow.targetEndAt !== attempt.planningWindowEndAt
+    || !Number.isSafeInteger(snapshot.planningAnchorAt)
+    || snapshot.planningAnchorAt < 0
+    || snapshot.planningAnchorAt !== planningWindow.startAt) {
+    throw new Error('life planning evidence authority conflict');
+  }
+  if (!Object.hasOwn(snapshot, 'current')) {
+    throw new Error('life planning input authority conflict: current');
+  }
+  const validateReferenceShape = (reference, name) => {
+    if (!reference || typeof reference !== 'object' || Array.isArray(reference)
+      || typeof reference.episodeId !== 'string' || !reference.episodeId.trim()
+      || typeof reference.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(reference.checksum)) {
+      throw new Error(`life planning input authority conflict: ${name}`);
+    }
+  };
+  if (snapshot.current !== null) validateReferenceShape(snapshot.current, 'current');
+  for (const name of ['recent', 'upcoming']) {
+    if (!Array.isArray(snapshot[name])) {
+      throw new Error(`life planning input authority conflict: ${name}`);
+    }
+    snapshot[name].forEach((reference, index) => validateReferenceShape(reference, `${name}[${index}]`));
+  }
+}
+
+function assertLifePlanningInputAuthority(attempt, store) {
+  assertLifePlanningInputSnapshotBinding(attempt);
+  const snapshot = attempt.inputSnapshot;
+  const seenEpisodeIds = new Set();
+  const anchor = snapshot.planningAnchorAt;
+  const validateReference = (reference, name, group) => {
+    if (reference === null) return;
+    const persisted = store.getLifeEpisode(reference.episodeId);
+    if (!persisted || persisted.characterId !== attempt.roleId
+      || persisted.status === 'cancelled'
+      || persisted.checksum !== reference.checksum
+      || canonicalJson(Object.keys(reference).sort())
+        !== canonicalJson(Object.keys(persisted).sort())
+      || canonicalJson(reference) !== canonicalJson(persisted)) {
+      throw new Error(`life planning input authority conflict: ${name}`);
+    }
+    if ((group === 'current' && !(persisted.startAt <= anchor && anchor < persisted.endAt))
+      || (group === 'recent' && persisted.endAt > anchor)
+      || (group === 'upcoming' && persisted.startAt <= anchor)) {
+      throw new Error(`life planning input authority conflict: ${name}`);
+    }
+    if (seenEpisodeIds.has(reference.episodeId)) {
+      throw new Error(`life planning input authority conflict: duplicate ${reference.episodeId}`);
+    }
+    seenEpisodeIds.add(reference.episodeId);
+  };
+  validateReference(snapshot.current, 'current', 'current');
+  for (const name of ['recent', 'upcoming']) {
+    snapshot[name].forEach((reference, index) => validateReference(
+      reference, `${name}[${index}]`, name
+    ));
+  }
+}
+
+const LIFE_PLANNING_REUSE_FIELDS = [
+  'roleId',
+  'requestBaseKey',
+  'requestKey',
+  'planningWindowStartAt',
+  'planningWindowEndAt',
+  'lifeBasisChecksum',
+  'contextChecksum',
+  'rolloutKey',
+  'pipelineMode',
+  'comparisonMode',
+  'authoritativePipeline',
+  'comparisonDirection',
+  'rolloutRevision',
+  'rolloutEvidenceEpoch',
+  'pipelineChecksum',
+  'shadowEpoch',
+  'canaryEpoch',
+  'authoritativeReleaseId',
+  'comparisonReleaseId',
+  'authoritativePipelineChecksum',
+  'comparisonPipelineChecksum',
+  'presetVersion'
+];
+
+function assertLifePlanningAttemptReuseIdentity(stored, incoming) {
+  if (!stored || !incoming) throw new Error('life planning attempt authority conflict');
+  assertLifePlanningAttemptEvidence(stored);
+  const incomingInputChecksum = incoming.inputChecksum
+    || contentHash(incoming.inputSnapshot || {});
+  for (const field of LIFE_PLANNING_REUSE_FIELDS) {
+    if (canonicalJson(stored[field] ?? null) !== canonicalJson(incoming[field] ?? null)) {
+      throw new Error(`life planning attempt authority conflict: ${field}`);
+    }
+  }
+  if (stored.inputChecksum !== incomingInputChecksum
+    || canonicalJson(stored.inputSnapshot || {})
+      !== canonicalJson(incoming.inputSnapshot || {})) {
+    throw new Error('life planning attempt authority conflict: input snapshot');
+  }
+}
+
+function assertLifePlanningAttemptEvidence(attempt) {
+  assertLifePlanningInputSnapshotBinding(attempt);
+  const checksum = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  if (!checksum(attempt?.lifeBasisChecksum)
+    || !checksum(attempt?.contextChecksum)
+    || !checksum(attempt?.inputChecksum)
+    || contentHash(attempt.inputSnapshot || {}) !== attempt.inputChecksum
+    || lifePlanningContextChecksum(attempt.inputSnapshot || {}) !== attempt.contextChecksum) {
+    throw new Error('life planning evidence authority conflict');
+  }
+  const expectedRequestBaseKey = contentHash({
+    roleId: attempt.roleId,
+    startAt: attempt.planningWindowStartAt,
+    endAt: attempt.planningWindowEndAt,
+    lifeBasisChecksum: attempt.lifeBasisChecksum,
+    contextChecksum: attempt.contextChecksum
+  });
+  if (expectedRequestBaseKey !== attempt.requestBaseKey) {
+    throw new Error('life planning basis authority conflict');
+  }
+}
+
+const LIFE_EPISODE_PROJECTION_KEYS = Object.freeze([
+  'episodeId', 'characterId', 'kind', 'title', 'startAt', 'endAt',
+  'status', 'payload', 'checksum', 'sourceTurnId', 'adjustmentReason',
+  'createdAt', 'updatedAt'
+]);
+
+function assertLifePlanningSnapshotEpisodeProjection(reference, roleId, name) {
+  if (!reference || typeof reference !== 'object' || Array.isArray(reference)
+    || canonicalJson(Object.keys(reference).sort())
+      !== canonicalJson([...LIFE_EPISODE_PROJECTION_KEYS].sort())
+    || reference.characterId !== roleId
+    || typeof reference.episodeId !== 'string' || !reference.episodeId
+    || typeof reference.kind !== 'string' || !reference.kind
+    || typeof reference.title !== 'string' || !reference.title
+    || !Number.isSafeInteger(reference.startAt) || reference.startAt < 0
+    || !Number.isSafeInteger(reference.endAt) || reference.endAt <= reference.startAt
+    || !['planned', 'active', 'completed', 'cancelled'].includes(reference.status)
+    || !reference.payload || typeof reference.payload !== 'object'
+      || Array.isArray(reference.payload)
+    || typeof reference.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(reference.checksum)
+    || !(reference.sourceTurnId === null
+      || (typeof reference.sourceTurnId === 'string' && reference.sourceTurnId.length > 0))
+    || typeof reference.adjustmentReason !== 'string'
+    || !Number.isSafeInteger(reference.createdAt) || reference.createdAt < 0
+    || !Number.isSafeInteger(reference.updatedAt) || reference.updatedAt < 0
+    || contentHash({
+      episodeId: reference.episodeId,
+      characterId: reference.characterId,
+      kind: reference.kind,
+      title: reference.title,
+      startAt: reference.startAt,
+      endAt: reference.endAt,
+      payload: reference.payload
+    }) !== reference.checksum) {
+    throw new Error(`life planning attempt authority conflict: ${name}`);
+  }
+}
+
+function assertLifePlanningSnapshotAuthority(attempt) {
+  assertLifePlanningAttemptEvidence(attempt);
+  const snapshot = attempt.inputSnapshot;
+  const seenEpisodeIds = new Set();
+  const validateReference = (reference, name) => {
+    if (reference === null) return;
+    assertLifePlanningSnapshotEpisodeProjection(reference, attempt.roleId, name);
+    if (seenEpisodeIds.has(reference.episodeId)) {
+      throw new Error(`life planning attempt authority conflict: duplicate ${reference.episodeId}`);
+    }
+    seenEpisodeIds.add(reference.episodeId);
+  };
+  validateReference(snapshot.current, 'current');
+  for (const name of ['recent', 'upcoming']) {
+    snapshot[name].forEach((reference, index) => validateReference(reference, `${name}[${index}]`));
+  }
+}
+
+function assertLifePlanningAttemptPins(attempt, store) {
+  assertLifePlanningSnapshotAuthority(attempt);
+  const checksum = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+  const safeNullable = value => value === null
+    || (Number.isSafeInteger(value) && value >= 0);
+  if (attempt.rolloutKey !== 'LIFE_PLANNING'
+    || !['legacy', 'shadow', 'active'].includes(attempt.pipelineMode)
+    || !['none', 'cognition_compare', 'legacy_compare'].includes(attempt.comparisonMode)
+    || !['legacy', 'cognition'].includes(attempt.authoritativePipeline)
+    || (attempt.pipelineMode === 'active' && attempt.authoritativePipeline !== 'cognition')
+    || (attempt.pipelineMode !== 'active' && attempt.authoritativePipeline !== 'legacy')
+    || !Number.isSafeInteger(attempt.rolloutRevision) || attempt.rolloutRevision < 0
+    || !Number.isSafeInteger(attempt.rolloutEvidenceEpoch) || attempt.rolloutEvidenceEpoch < 0
+    || !safeNullable(attempt.shadowEpoch) || !safeNullable(attempt.canaryEpoch)
+    || !safeNullable(attempt.canarySlot)
+    || !checksum(attempt.pipelineChecksum)
+    || !checksum(attempt.authoritativePipelineChecksum)
+    || !checksum(attempt.requestBaseKey)
+    || !checksum(attempt.requestKey)
+    || !checksum(attempt.lifeBasisChecksum)
+    || !checksum(attempt.contextChecksum)
+    || typeof attempt.presetVersion !== 'string' || !attempt.presetVersion) {
+    throw new Error('life planning attempt authority conflict: pins');
+  }
+  const authoritativeRelease = store.getPipelineRelease(attempt.authoritativeReleaseId);
+  if (!authoritativeRelease
+    || authoritativeRelease.releaseChecksum !== attempt.authoritativePipelineChecksum
+    || attempt.pipelineChecksum !== authoritativeRelease.releaseChecksum
+    || attempt.presetVersion !== authoritativeRelease.presetVersion) {
+    throw new Error('life planning attempt authority conflict: authoritative release');
+  }
+  if (attempt.comparisonMode === 'none') {
+    if (attempt.comparisonDirection !== null
+      || attempt.comparisonReleaseId !== null
+      || attempt.comparisonPipelineChecksum !== null
+      || attempt.comparisonState !== 'not_applicable') {
+      throw new Error('life planning attempt authority conflict: comparison pins');
+    }
+    return;
+  }
+  let comparison;
+  try {
+    comparison = comparisonContractForMode(attempt.comparisonMode);
+  } catch {
+    throw new Error('life planning attempt authority conflict: comparison contract');
+  }
+  const comparisonRelease = store.getPipelineRelease(attempt.comparisonReleaseId);
+  if (!comparisonRelease
+    || attempt.comparisonDirection !== comparison.comparisonDirection
+    || comparisonRelease.releaseChecksum !== attempt.comparisonPipelineChecksum
+    || !['not_ready', 'queued', 'running', 'completed', 'failed', 'cancelled']
+      .includes(attempt.comparisonState)) {
+    throw new Error('life planning attempt authority conflict: comparison pins');
+  }
+}
 
 function canonicalEffectiveAtFromEnvelope(envelope) {
   const value = Number(
@@ -11750,14 +12025,21 @@ export class YuqiStore {
     `).all(...values).map(mapLifeEpisode);
   }
 
-  putLifePlanInternal(characterId, episodes, { sourceTurnId = null } = {}) {
+  putLifePlanInternal(characterId, episodes, {
+    sourceTurnId = null,
+    writerToken = null
+  } = {}) {
     const safeCharacterId = String(characterId || '');
     if (!safeCharacterId || !Array.isArray(episodes)) throw new Error('invalid life plan');
+    const trustedWriter = writerToken === TRUSTED_LIFE_RESULT_WRITER;
     for (const item of episodes) {
       if (item?.payload && typeof item.payload === 'object'
         && !Array.isArray(item.payload)
         && Object.hasOwn(item.payload, 'publicMomentCandidate')) {
-        throw new Error('reserved public moment candidate requires trusted life-result writer');
+        if (!trustedWriter) {
+          throw new Error('reserved public moment candidate requires trusted life-result writer');
+        }
+        validateTrustedPublicMomentCandidate(item.payload.publicMomentCandidate);
       }
     }
     const forbiddenKinds = /(?:accident|illness|hospital|job_loss|identity_change|new_relationship|事故|生病|疾病|住院|失业|辞职|新恋情|身份变化)/i;
@@ -11849,13 +12131,44 @@ export class YuqiStore {
     ).get(String(requestKey || '')));
   }
 
+  assertPersistedLifePlanningAttemptAuthorityInternal(planningIdOrAttempt) {
+    const planningId = typeof planningIdOrAttempt === 'string'
+      ? planningIdOrAttempt
+      : planningIdOrAttempt?.planningId;
+    const attempt = this.getLifePlanningAttempt(planningId);
+    if (!attempt) throw new Error('life planning attempt authority conflict: missing');
+    if (!['created', 'running', 'retry_wait', 'result_committed', 'completed', 'failed', 'cancelled']
+      .includes(attempt.executionState)) {
+      throw new Error('life planning attempt authority conflict: execution state');
+    }
+    assertLifePlanningAttemptPins(attempt, this);
+    if (attempt.executionState === 'completed' && !attempt.authoritativeResultChecksum) {
+      throw new Error('life planning attempt authority conflict: completed proof');
+    }
+    return attempt;
+  }
+
   createLifePlanningAttemptInternal(attempt) {
     const roleId = String(attempt?.roleId || '');
     if (!roleId) throw new Error('life planning role is required');
     const existingOpen = this.getOpenLifePlanningAttempt(roleId);
-    if (existingOpen) return existingOpen;
+    if (existingOpen) {
+      this.assertPersistedLifePlanningAttemptAuthorityInternal(existingOpen.planningId);
+      assertLifePlanningAttemptReuseIdentity(existingOpen, { ...attempt, roleId });
+      return existingOpen;
+    }
     const exact = this.getLifePlanningAttemptByRequestKey(attempt.requestKey);
-    if (exact) return exact;
+    if (exact) {
+      this.assertPersistedLifePlanningAttemptAuthorityInternal(exact.planningId);
+      assertLifePlanningAttemptReuseIdentity(exact, { ...attempt, roleId });
+      if (exact.authoritativeResultChecksum) this.assertLifePlanningTerminalReplayInternal(exact);
+      return exact;
+    }
+    assertLifePlanningInputAuthority({
+      ...attempt,
+      roleId,
+      inputSnapshot: attempt.inputSnapshot
+    }, this);
     const rolloutRow = this.db.prepare(
       'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
     ).get('LIFE_PLANNING');
@@ -12005,11 +12318,75 @@ export class YuqiStore {
     return Number(result.changes || 0);
   }
 
+  assertLifePlanningTerminalReplayInternal(attempt) {
+    assertLifePlanningAttemptEvidence(attempt, this);
+    const storedResult = attempt.authoritativeResult;
+    if (!storedResult || typeof storedResult !== 'object' || Array.isArray(storedResult)
+      || !Array.isArray(storedResult.episodes)
+      || contentHash(storedResult) !== attempt.authoritativeResultChecksum) {
+      throw new Error('life planning result authority conflict');
+    }
+    const expectedEpisodes = storedResult.episodes;
+    const expectedIds = expectedEpisodes.map(item => item?.episodeId);
+    if (expectedEpisodes.some(item => !item || typeof item !== 'object' || Array.isArray(item)
+      || typeof item.episodeId !== 'string' || !item.episodeId)
+      || new Set(expectedIds).size !== expectedIds.length) {
+      throw new Error('life planning episode authority conflict');
+    }
+    const persistedEpisodes = this.db.prepare(`
+      SELECT * FROM life_episodes
+      WHERE character_id = ? AND source_turn_id = ?
+      ORDER BY episode_id
+    `).all(attempt.roleId, attempt.planningId).map(mapLifeEpisode);
+    if (persistedEpisodes.length !== expectedEpisodes.length) {
+      throw new Error('life planning episode authority conflict');
+    }
+    const persistedById = new Map(persistedEpisodes.map(item => [item.episodeId, item]));
+    for (const expected of expectedEpisodes) {
+      const persisted = persistedById.get(expected.episodeId);
+      if (!persisted) throw new Error('life planning episode authority conflict');
+      const expectedPayload = expected.payload && typeof expected.payload === 'object'
+        && !Array.isArray(expected.payload) ? expected.payload : {};
+      const expectedStored = {
+        episodeId: expected.episodeId,
+        characterId: attempt.roleId,
+        kind: expected.kind,
+        title: expected.title,
+        startAt: expected.startAt,
+        endAt: expected.endAt,
+        payload: expectedPayload
+      };
+      if (persisted.sourceTurnId !== attempt.planningId
+        || persisted.kind !== expected.kind
+        || persisted.title !== expected.title
+        || persisted.startAt !== expected.startAt
+        || persisted.endAt !== expected.endAt
+        || canonicalJson(persisted.payload) !== canonicalJson(expectedPayload)
+        || persisted.checksum !== contentHash(expectedStored)) {
+        throw new Error('life planning episode authority conflict');
+      }
+      if (Object.hasOwn(expectedPayload, 'publicMomentCandidate')) {
+        validateTrustedPublicMomentCandidate(expectedPayload.publicMomentCandidate);
+      }
+    }
+    if (attempt.comparisonMode === 'none') {
+      if (attempt.compareJobId) throw new Error('life planning comparison authority conflict');
+      return;
+    }
+    const job = this.getConsolidationJob(attempt.compareJobId);
+    if (!job || job.subjectType !== 'life_planning' || job.subjectId !== attempt.planningId
+      || job.payloadChecksum !== contentHash(job.payload)
+      || job.payload.authoritativeResultChecksum !== attempt.authoritativeResultChecksum) {
+      throw new Error('life planning comparison authority conflict');
+    }
+  }
+
   commitLifePlanningResultInternal({ planningId, workerId, validatedResult, now: committedAt = now() }) {
     const attempt = this.getLifePlanningAttempt(planningId);
     if (!attempt) throw new Error('life planning attempt not found');
+    const validated = assertLifePlanningValidatedResultShape(validatedResult);
     const result = {
-      episodes: (validatedResult?.episodes || []).map((item, index) => ({
+      episodes: validated.episodes.map((item, index) => ({
         ...item,
         episodeId: `life:${planningId}:${index + 1}`
       }))
@@ -12017,6 +12394,7 @@ export class YuqiStore {
     const checksum = contentHash(result);
     if (attempt.authoritativeResultChecksum) {
       if (attempt.authoritativeResultChecksum !== checksum) throw new LifePlanningResultConflictError();
+      this.assertLifePlanningTerminalReplayInternal(attempt);
       return attempt;
     }
     if (attempt.executionState !== 'running' || attempt.leaseOwner !== workerId) {
@@ -12046,7 +12424,16 @@ export class YuqiStore {
       });
       return this.getLifePlanningAttempt(planningId);
     }
-    this.putLifePlanInternal(attempt.roleId, result.episodes, { sourceTurnId: planningId });
+    assertLifePlanningAttemptEvidence(attempt, this);
+    for (const episode of result.episodes) {
+      if (episode.payload && Object.hasOwn(episode.payload, 'publicMomentCandidate')) {
+        validateTrustedPublicMomentCandidate(episode.payload.publicMomentCandidate);
+      }
+    }
+    this.putLifePlanInternal(attempt.roleId, result.episodes, {
+      sourceTurnId: planningId,
+      writerToken: TRUSTED_LIFE_RESULT_WRITER
+    });
     let compareJob = null;
     if (attempt.comparisonMode !== 'none') {
       const comparison = comparisonContractForMode(attempt.comparisonMode);

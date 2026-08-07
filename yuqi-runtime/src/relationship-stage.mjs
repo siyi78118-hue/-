@@ -182,6 +182,76 @@ export function sceneFromEnvelope(envelope = {}) {
   return normalizedScene(envelope.context?.scene || envelope.trigger?.context?.scene || {});
 }
 
+function formalAxis(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value ?? null;
+  const id = typeof value.id === 'string' ? value.id.trim() : '';
+  return id ? { id } : null;
+}
+
+function stagePersonaRevision(state) {
+  const candidate = state.stagePersonaRevision ?? state.stagePersona?.revision;
+  return Number.isSafeInteger(candidate) && candidate >= 0 ? candidate : undefined;
+}
+
+function toneTendencies(state) {
+  const output = Array.isArray(state.toneTendencies)
+    ? structuredClone(state.toneTendencies)
+    : Array.isArray(state.stagePersona?.toneTendencies)
+      ? structuredClone(state.stagePersona.toneTendencies)
+      : [];
+  for (const value of [state.effectiveStagePersona, state.content]) {
+    if (typeof value !== 'string') continue;
+    const text = value.trim();
+    if (text && !output.includes(text)) output.push(text);
+  }
+  return output;
+}
+
+export function compileRelationshipForCognition(state = {}) {
+  const result = {
+    base: formalAxis(state.base),
+    phase: formalAxis(state.phase),
+    formalFacts: structuredClone(state.formalFacts || []),
+    allowedFormalTransitions: structuredClone(
+      state.allowedFormalTransitions || state.allowedTransitions || []
+    )
+  };
+  const revision = stagePersonaRevision(state);
+  if (revision !== undefined) result.stagePersonaRevision = revision;
+  return result;
+}
+
+export function relationshipExpressionView(state = {}) {
+  return {
+    formalFacts: structuredClone(state.formalFacts || []),
+    toneTendencies: toneTendencies(state)
+  };
+}
+
+export function relationshipViewsFromScene(scene = {}) {
+  const relationship = scene.relationshipStage && typeof scene.relationshipStage === 'object'
+    ? scene.relationshipStage
+    : {};
+  const formalState = {
+    ...relationship,
+    formalFacts: scene.formalFacts || relationship.formalFacts || [],
+    allowedFormalTransitions: scene.allowedFormalTransitions
+      || relationship.allowedFormalTransitions
+      || relationship.allowedTransitions
+      || [],
+    stagePersonaRevision: scene.stagePersonaRevision,
+    stagePersona: scene.stagePersona,
+    effectiveStagePersona: scene.effectiveStagePersona
+  };
+  const formal = compileRelationshipForCognition(formalState);
+  const expression = relationshipExpressionView({
+    ...formalState,
+    formalFacts: formal.formalFacts,
+    toneTendencies: scene.toneTendencies || relationship.toneTendencies
+  });
+  return { formal, expression };
+}
+
 export function resolveRelationshipStage(scene, review, recentMessages = [], now = Date.now()) {
   const normalized = normalizedScene(scene);
   const available = new Set(recentMessages.map(message => String(message?.messageId || '')).filter(Boolean));

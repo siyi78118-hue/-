@@ -225,7 +225,7 @@ export class LifeSimulationCoordinator {
     const activeEpisodes = episodes.filter(item => item.status !== 'cancelled');
     const current = activeEpisodes.find(item => item.startAt <= now && item.endAt > now) || null;
     const recent = activeEpisodes.filter(item => item.endAt <= now).slice(-3);
-    const upcoming = activeEpisodes.filter(item => item.startAt >= now).slice(0, 3);
+    const upcoming = activeEpisodes.filter(item => item.startAt > now).slice(0, 3);
     const horizonEndAt = activeEpisodes.reduce(
       (maximum, item) => Math.max(maximum, item.endAt),
       0

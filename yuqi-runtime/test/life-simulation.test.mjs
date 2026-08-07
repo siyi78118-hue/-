@@ -185,3 +185,33 @@ test('life context exposes only episode, elapsed time, body, and attention signa
     assert.equal(Object.hasOwn(context.cognitiveSignals, 'attitudeTowardUser'), false);
   });
 });
+
+test('life context uses a half-open current window and excludes its start from upcoming', () => {
+  fixture(({ store }) => {
+    const now = at('2026-07-23T14:00:00+08:00');
+    store.putLifePlan('yuqi', [
+      {
+        episodeId: 'life_current_at_boundary',
+        kind: 'work',
+        title: '当前',
+        startAt: now,
+        endAt: now + 60 * 60_000
+      },
+      {
+        episodeId: 'life_upcoming_after_boundary',
+        kind: 'rest',
+        title: '稍后',
+        startAt: now + 60 * 60_000,
+        endAt: now + 2 * 60 * 60_000
+      }
+    ]);
+    const context = new LifeSimulationCoordinator({ store }).contextFor('yuqi', now);
+    assert.equal(context.current.episodeId, 'life_current_at_boundary');
+    assert.deepEqual(context.upcoming.map(item => item.episodeId), ['life_upcoming_after_boundary']);
+    assert.equal(new Set([
+      context.current?.episodeId,
+      ...context.recent.map(item => item.episodeId),
+      ...context.upcoming.map(item => item.episodeId)
+    ]).size, 2);
+  });
+});

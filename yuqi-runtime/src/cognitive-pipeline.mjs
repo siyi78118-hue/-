@@ -129,10 +129,74 @@ function checkpointFromStore(store, turnId) {
   return store?.getTurnCheckpoint?.(turnId) || {};
 }
 
-function persistV3Checkpoint(store, turn, packet, dryRun = false) {
+function sanitizeRelationshipExpressionView(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {
+    formalFacts: Array.isArray(source.formalFacts) ? structuredClone(source.formalFacts) : [],
+    toneTendencies: Array.isArray(source.toneTendencies)
+      ? structuredClone(source.toneTendencies)
+      : []
+  };
+}
+
+function relationshipExpressionSource(input, checkpoint, loaded = null) {
+  return checkpoint?.relationshipExpression
+    || checkpoint?.cognitionPacket?.relationshipExpression
+    || input?.relationshipExpression
+    || input?.scene?.relationshipExpression
+    || loaded?.relationshipExpression
+    || loaded?.scene?.relationshipExpression
+    || null;
+}
+
+function attachRelationshipExpression(packet, relationshipExpression) {
+  return {
+    ...packet,
+    relationshipExpression: sanitizeRelationshipExpressionView(relationshipExpression)
+  };
+}
+
+function supervisionCognitionPacket(packet, relationshipExpression) {
+  const { relationshipBasePhase: _formalRelationship, ...safeEnvelope } = packet.envelope || {};
+  return {
+    ...packet,
+    envelope: safeEnvelope,
+    cognitionResult: cognitionResultWithoutRelationshipReview(packet.cognitionResult),
+    relationshipExpression: sanitizeRelationshipExpressionView(relationshipExpression)
+  };
+}
+
+function actionIntentWithoutRelationshipReview(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const { relationshipReview: _relationshipReview, ...projected } = source;
+  return projected;
+}
+
+function cognitionResultWithoutRelationshipReview(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {
+    ...source,
+    actionIntent: actionIntentWithoutRelationshipReview(source.actionIntent)
+  };
+}
+
+function supervisionDraft(draft) {
+  return {
+    ...draft,
+    actionIntent: actionIntentWithoutRelationshipReview(draft?.actionIntent)
+  };
+}
+
+function cognitionProviderPacket(packet) {
+  const { relationshipExpression: _expression, ...formalPacket } = packet || {};
+  return formalPacket;
+}
+
+function persistV3Checkpoint(store, turn, packet, relationshipExpression, dryRun = false) {
   if (dryRun) return;
+  const persistedPacket = attachRelationshipExpression(packet, relationshipExpression);
   if (typeof store?.saveCognitionCheckpointInternal === 'function') {
-    store.saveCognitionCheckpointInternal(turn.turnId, packet);
+    store.saveCognitionCheckpointInternal(turn.turnId, persistedPacket);
     return;
   }
   const current = store?.getTurn?.(turn.turnId);
@@ -146,8 +210,8 @@ function persistV3Checkpoint(store, turn, packet, dryRun = false) {
     store.advanceTurn(turn.turnId, 'memory_running', 'memory_done', {
       memoryPacketJson: JSON.stringify({
         packetType: 'cognition-v3',
-        cognitionEnvelope: packet.envelope,
-        cognitionPacket: packet
+        cognitionEnvelope: persistedPacket.envelope,
+        cognitionPacket: persistedPacket
       })
     });
   }
@@ -222,7 +286,13 @@ function v3ValidationContext(cognitionEnvelope, input) {
   };
 }
 
-async function runV3Expression(input, cognitionEnvelope, cognitionPacket, repairPlans = []) {
+async function runV3Expression(
+  input,
+  cognitionEnvelope,
+  cognitionPacket,
+  relationshipExpression,
+  repairPlans = []
+) {
   const agencyView = {
     hardConstraints: cognitionEnvelope.hardConstraints || [],
     preferences: cognitionEnvelope.preferences || [],
@@ -231,8 +301,8 @@ async function runV3Expression(input, cognitionEnvelope, cognitionPacket, repair
   const expressionBrief = compileExpressionBriefV3({
     envelope: cognitionEnvelope,
     agencyView,
-    relationship: cognitionEnvelope.relationshipBasePhase || {},
-    cognitionResult: cognitionPacket.cognitionResult
+    relationship: sanitizeRelationshipExpressionView(relationshipExpression),
+    cognitionResult: cognitionResultWithoutRelationshipReview(cognitionPacket.cognitionResult)
   });
   const expressionRaw = objectResult(await input.client.runRole(
     'expression_v3',
@@ -262,12 +332,13 @@ async function runV3Expression(input, cognitionEnvelope, cognitionPacket, repair
   };
 }
 
-async function reviewV3Draft(input, cognitionPacket, draft, final = false) {
+async function reviewV3Draft(input, cognitionPacket, draft, relationshipExpression, final = false) {
   const custom = final ? input.finalSupervise || input.supervise : input.supervise;
   const reviewInput = {
     highRisk: Boolean(input.highRisk),
-    cognitionPacket,
-    draft,
+    cognitionPacket: supervisionCognitionPacket(cognitionPacket, relationshipExpression),
+    draft: supervisionDraft(draft),
+    relationship: sanitizeRelationshipExpressionView(relationshipExpression),
     currentInteraction: cognitionPacket.envelope.currentInteraction,
     continuity: input.continuity || null,
     applicableChecks: input.applicableChecks || [],
@@ -282,16 +353,23 @@ export async function runCognitionV3Turn(input) {
   const startedAt = input.now?.() ?? Date.now();
   const outerDeadlineMs = Math.max(1, Number(input.outerDeadlineMs) || 300_000);
   const checkpoint = storedV3Checkpoint(input.store, input.turn);
+  let loaded = null;
+  let relationshipExpression = relationshipExpressionSource(input, checkpoint);
   let cognitionEnvelope = checkpoint.cognitionEnvelope
     || checkpoint.cognitionPacket?.envelope
     || input.cognitionEnvelope
     || null;
   if (!cognitionEnvelope || (isPublicMomentTurn(input) && !checkpoint.cognitionEnvelope)) {
-    const loaded = input.contextLoader?.load
+    loaded = input.contextLoader?.load
       ? await input.contextLoader.load(input)
       : await buildCognitionV3Input(input.contextInput || input);
     cognitionEnvelope = buildCognitionEnvelopeV3(loaded);
   }
+  relationshipExpression = isPublicMomentTurn({ ...input, cognitionEnvelope })
+    ? { formalFacts: [], toneTendencies: [] }
+    : sanitizeRelationshipExpressionView(
+      relationshipExpressionSource(input, checkpoint, loaded)
+    );
 
   let cognitionPacket = checkpoint.cognitionPacket || null;
   if (!cognitionPacket) {
@@ -342,10 +420,12 @@ export async function runCognitionV3Turn(input) {
       envelope: cognitionEnvelope,
       cognitionResult
     });
+    cognitionPacket = attachRelationshipExpression(cognitionPacket, relationshipExpression);
     persistV3Checkpoint(
       input.store,
       input.turn,
       cognitionPacket,
+      relationshipExpression,
       input.dryRun === true || input.draftOnly === true
     );
   }
@@ -353,14 +433,15 @@ export async function runCognitionV3Turn(input) {
   let { expressionResult, draft } = await runV3Expression(
     input,
     cognitionEnvelope,
-    cognitionPacket
+    cognitionPacket,
+    relationshipExpression
   );
   const attempts = {
     cognitionReconsideration: 0,
     expressionRewrite: 0,
     finalReview: 0
   };
-  let supervision = await reviewV3Draft(input, cognitionPacket, draft);
+  let supervision = await reviewV3Draft(input, cognitionPacket, draft, relationshipExpression);
   if (!supervision.approved) {
     const actionFindings = supervision.findings.filter((item) => item.owner === 'action');
     if (actionFindings.length) {
@@ -387,7 +468,7 @@ export async function runCognitionV3Turn(input) {
           task: 'reconsider_lived_quality_v3',
           content: {
             cognitionEnvelope,
-            cognitionPacket,
+            cognitionPacket: cognitionProviderPacket(cognitionPacket),
             repairPlans: cognitionFindings.map(repairPlanForFinding)
           }
         }),
@@ -410,6 +491,7 @@ export async function runCognitionV3Turn(input) {
         envelope: cognitionEnvelope,
         cognitionResult: reconsidered
       });
+      cognitionPacket = attachRelationshipExpression(cognitionPacket, relationshipExpression);
       if (input.dryRun !== true
         && input.draftOnly !== true
         && typeof input.store?.saveCognitionCheckpointInternal === 'function') {
@@ -422,11 +504,18 @@ export async function runCognitionV3Turn(input) {
         input,
         cognitionEnvelope,
         cognitionPacket,
+        relationshipExpression,
         [...cognitionFindings, ...expressionFindings].map(repairPlanForFinding)
       ));
     }
     attempts.finalReview = 1;
-    supervision = await reviewV3Draft(input, cognitionPacket, draft, true);
+    supervision = await reviewV3Draft(
+      input,
+      cognitionPacket,
+      draft,
+      relationshipExpression,
+      true
+    );
   }
   const visibleCompletedAt = input.now?.() ?? Date.now();
   const state = supervision.approved ? 'completed' : 'supervision_failed';

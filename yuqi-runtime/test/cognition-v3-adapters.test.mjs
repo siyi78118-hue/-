@@ -5,6 +5,7 @@ import {
   adapterForTurnKind,
   buildCognitionEnvelopeV3
 } from '../src/cognition-v3-adapters.mjs';
+import { runCognitionV3Turn } from '../src/cognitive-pipeline.mjs';
 
 const TURN_CASES = [
   ['DIRECT_REPLY', ['currentBatch', 'payment', 'attachments', 'quote']],
@@ -271,4 +272,110 @@ test('the history budget drops whole old groups and never cuts the boundary batc
 
 test('unknown TurnKinds fail closed instead of receiving a generic action surface', () => {
   assert.throws(() => adapterForTurnKind('UNKNOWN_KIND'), /unsupported cognition-v3 TurnKind/);
+});
+
+test('v3 formal cognition request and expression request receive separate relationship views', async () => {
+  const relationship = {
+    base: { id: 'familiar', label: '熟悉', content: '还没到阶段，不允许靠近' },
+    phase: { id: 'normal', label: '正常', content: '阶段门槛词不应泄漏' },
+    formalFacts: [{ factId: 'rf_1', value: 'mutual_contact' }],
+    allowedFormalTransitions: { familiar: ['close'] },
+    stagePersonaRevision: 9,
+    effectiveStagePersona: '温和直接的编辑语气事实',
+    stagePersona: {
+      toneTendencies: ['温和', '直接'],
+      forbiddenMoves: ['never_leak']
+    },
+    forbiddenMoves: ['never_leak'],
+    stageThresholds: { close: 0.9 }
+  };
+  const envelope = {
+    schemaVersion: 3,
+    turnId: 'relationship_view_turn',
+    characterId: 'yuqi',
+    kind: 'DIRECT_REPLY',
+    protocolVersion: 3,
+    trigger: { triggerType: 'user_message', context: {} }
+  };
+  const calls = [];
+  const client = {
+    async runRole(role, payload) {
+      calls.push({ role, payload });
+      if (role === 'cognition_fast') {
+        return {
+          routeDecision: 'fast',
+          cognitionResult: {
+            interactionRead: {
+              surfaceAct: 'statement', primarySocialMeaning: 'continue',
+              alternativeMeaning: null, confidence: 0.9, evidenceMessageIds: []
+            },
+            selfResponse: {
+              immediateFeeling: 'calm', desire: 'continue', resistance: '',
+              attention: 'message', stanceTransitions: []
+            },
+            interactionDecision: {
+              intendedResponse: 'send', relationshipEffect: 'continue',
+              shouldAcknowledgeBid: false, intentionalNonResponseReason: null,
+              mustConvey: [], mustNotClaim: []
+            },
+            actionIntent: {
+              payment: null, moment: null, rolePlan: null,
+              lifeAdjustment: null, relationshipReview: null
+            },
+            statePatch: { mood: 'calm', currentStances: [], openThreads: [] }
+          }
+        };
+      }
+      if (role === 'expression_v3') {
+        return {
+          action: 'send', reply: '我听到了。', usedFactIds: [],
+          bubblePlan: [{ text: '我听到了。', purpose: 'continue' }], incompatibility: null
+        };
+      }
+      throw new Error(`unexpected role ${role}`);
+    }
+  };
+  await runCognitionV3Turn({
+    turn: { turnId: 'relationship_view_turn', characterId: 'yuqi', protocolVersion: 3, rolloutKey: 'DIRECT_REPLY' },
+    envelope,
+    contextLoader: {
+      load: async () => ({
+        envelope,
+        relationship,
+        relationshipExpression: {
+          formalFacts: relationship.formalFacts,
+          toneTendencies: [
+            ...relationship.stagePersona.toneTendencies,
+            relationship.effectiveStagePersona
+          ]
+        },
+        currentBatch: { messages: [{ messageId: 'u1', type: 'text', text: '你好', sentAt: 1 }] },
+        relevantHistory: [],
+        verifiedFacts: [],
+        constraints: [], preferences: [], stances: [], lifeSignals: [],
+        socialExperience: [], openThreads: [], authorSettings: {}
+      })
+    },
+    client,
+    store: { getTurnCheckpoint: () => ({}) },
+    presetBundles: { cognition: 'cognition', expression: 'expression' },
+    now: () => 100,
+    review: () => ({ approved: true, findings: [] })
+  });
+
+  const cognitionPayload = calls.find(call => call.role === 'cognition_fast').payload;
+  const expressionPayload = calls.find(call => call.role === 'expression_v3').payload;
+  const formal = cognitionPayload.cognitionEnvelope.relationshipBasePhase;
+  assert.deepEqual(Object.keys(formal).sort(), [
+    'allowedFormalTransitions', 'base', 'formalFacts', 'phase', 'stagePersonaRevision'
+  ]);
+  assert.equal(JSON.stringify(cognitionPayload).includes('还没到阶段'), false);
+  assert.equal(JSON.stringify(cognitionPayload).includes('never_leak'), false);
+  assert.deepEqual(expressionPayload.expressionBrief.relationship, {
+    formalFacts: relationship.formalFacts,
+    toneTendencies: [
+      ...relationship.stagePersona.toneTendencies,
+      relationship.effectiveStagePersona
+    ]
+  });
 });

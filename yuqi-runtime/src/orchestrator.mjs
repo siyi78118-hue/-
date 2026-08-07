@@ -3,7 +3,11 @@ import { contentHash, validateEnvelope } from './protocol.mjs';
 import { buildEvidencePack } from './retrieval.mjs';
 import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { DEFAULT_PROFILES, roleExecutionProfile, selectTurnRoute } from './route-policy.mjs';
-import { resolveRelationshipStage, sceneFromEnvelope } from './relationship-stage.mjs';
+import {
+  relationshipViewsFromScene,
+  resolveRelationshipStage,
+  sceneFromEnvelope
+} from './relationship-stage.mjs';
 import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
 import { compileInteractionContract } from './interaction-contract.mjs';
 import { buildGenerationWindow } from './conversation-context.mjs';
@@ -110,6 +114,14 @@ const PUBLIC_MOMENT_KINDS = new Set([
   'ROLE_PLAN_MOMENT_PRIVATE'
 ]);
 
+function cognitionSceneForV3(scene) {
+  const views = relationshipViewsFromScene(scene);
+  return {
+    relationshipStage: views.formal,
+    relationshipExpression: views.expression
+  };
+}
+
 export function canonicalInteractionAt(envelope, fallback = Date.now()) {
   const value = envelope?.message?.sentAt
     ?? envelope?.trigger?.executedAt
@@ -156,6 +168,384 @@ function normalizeRolePlanOperations(value) {
     if (!allowed.has(normalized.op)) throw new Error('brain returned unknown role plan operation');
     return normalized;
   });
+}
+
+export function normalizeCanonicalV3RolePlanOperations(value) {
+  let source = value;
+  if (typeof source === 'string') {
+    const text = source.trim();
+    if (!text || text === '[]') return [];
+    try { source = JSON.parse(text); } catch {
+      throw new Error('canonical v3 role plan operations authority conflict');
+    }
+  }
+  if (!Array.isArray(source)) {
+    throw new Error('canonical v3 role plan operations must be an array');
+  }
+  if (source.length > 12) {
+    throw new Error('canonical v3 role plan operations exceed limit');
+  }
+  return normalizeRolePlanOperations(source);
+}
+
+const ROLE_PLAN_CONFIRMATION_SOURCES = new Set([
+  'spoken', 'accepted_request', 'user_created'
+]);
+const ROLE_PLAN_ALL_SOURCES = new Set([
+  'spoken', 'accepted_request', 'private_decision', 'user_created'
+]);
+const ROLE_PLAN_CONFIRMATION_OPS = new Set([
+  'create', 'update', 'cancel', 'pause', 'resume', 'complete'
+]);
+const ROLE_PLAN_V3_KINDS = new Set([
+  'DIRECT_REPLY',
+  'ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'
+]);
+const ROLE_PLAN_CONFIRMATION_ERROR = 'role plan confirmation authority conflict';
+
+function rolePlanConfirmationConflict(detail = '') {
+  throw new Error(detail ? `${ROLE_PLAN_CONFIRMATION_ERROR}: ${detail}` : ROLE_PLAN_CONFIRMATION_ERROR);
+}
+
+function isPlainRolePlanObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function rolePlanScheduleValue(schedule, label = 'schedule') {
+  if (!isPlainRolePlanObject(schedule)) rolePlanConfirmationConflict(`${label} must be an object`);
+  const allowedByKind = {
+    once: new Set(['kind', 'at', 'endsAt']),
+    interval: new Set(['kind', 'startsAt', 'intervalMs', 'endsAt']),
+    daily: new Set(['kind', 'time', 'endsAt']),
+    weekly: new Set(['kind', 'weekdays', 'time', 'endsAt']),
+    monthly: new Set(['kind', 'day', 'time', 'endsAt'])
+  };
+  const allowed = allowedByKind[schedule.kind];
+  if (!allowed || Object.keys(schedule).some(key => !allowed.has(key))) {
+    rolePlanConfirmationConflict(`${label} fields or kind conflict`);
+  }
+  const hasEndsAt = Object.hasOwn(schedule, 'endsAt');
+  const endsAt = hasEndsAt ? schedule.endsAt : null;
+  const parseTimestamp = (value, fieldLabel) => {
+    if (typeof value !== 'string' || !value.trim()) {
+      rolePlanConfirmationConflict(`${label} ${fieldLabel} is invalid`);
+    }
+    const text = value.trim();
+    let timestamp;
+    if (/(?:Z|[+-]\d\d:\d\d)$/.test(text)) {
+      timestamp = Date.parse(text);
+    } else {
+      const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/.exec(text);
+      if (!match) rolePlanConfirmationConflict(`${label} ${fieldLabel} must use Asia/Shanghai time`);
+      const [, yearText, monthText, dayText, hourText, minuteText, secondText = '0', millisText = '0'] = match;
+      const year = Number(yearText);
+      const month = Number(monthText);
+      const day = Number(dayText);
+      const hour = Number(hourText);
+      const minute = Number(minuteText);
+      const second = Number(secondText);
+      const millis = Number(millisText.padEnd(3, '0'));
+      const utcWallClock = Date.UTC(year, month - 1, day, hour, minute, second, millis);
+      const check = new Date(utcWallClock);
+      if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1
+        || check.getUTCDate() !== day || check.getUTCHours() !== hour
+        || check.getUTCMinutes() !== minute || check.getUTCSeconds() !== second
+        || check.getUTCMilliseconds() !== millis) {
+        rolePlanConfirmationConflict(`${label} ${fieldLabel} is invalid`);
+      }
+      // The protocol defines offset-free schedule values as Asia/Shanghai wall time.
+      timestamp = utcWallClock - (8 * 60 * 60 * 1000);
+    }
+    if (!Number.isFinite(timestamp) || !Number.isSafeInteger(timestamp)) {
+      rolePlanConfirmationConflict(`${label} ${fieldLabel} is invalid`);
+    }
+    return { value: text, timestamp };
+  };
+  const parsedEndsAt = hasEndsAt ? parseTimestamp(endsAt, 'end time') : null;
+  const normalizedEndsAt = parsedEndsAt?.value ?? null;
+  if (schedule.kind === 'once') {
+    const at = parseTimestamp(schedule.at, 'time');
+    return { kind: 'once', at: at.value, endsAt: normalizedEndsAt,
+      endsAtTimestamp: parsedEndsAt?.timestamp ?? null, timestamp: at.timestamp };
+  }
+  if (schedule.kind === 'interval') {
+    const startsAt = parseTimestamp(schedule.startsAt, 'start time');
+    if (!Number.isSafeInteger(schedule.intervalMs) || schedule.intervalMs < 300_000) {
+      rolePlanConfirmationConflict(`${label} interval is invalid`);
+    }
+    return { kind: 'interval', startsAt: startsAt.value, startsAtTimestamp: startsAt.timestamp,
+      intervalMs: schedule.intervalMs, endsAt: normalizedEndsAt,
+      endsAtTimestamp: parsedEndsAt?.timestamp ?? null };
+  }
+  if (schedule.kind === 'daily') {
+    if (typeof schedule.time !== 'string' || !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(schedule.time)) {
+      rolePlanConfirmationConflict(`${label} time is invalid`);
+    }
+    return { kind: 'daily', time: schedule.time, endsAt: normalizedEndsAt,
+      endsAtTimestamp: parsedEndsAt?.timestamp ?? null };
+  }
+  if (schedule.kind === 'weekly') {
+    if (!Array.isArray(schedule.weekdays) || schedule.weekdays.length < 1 || schedule.weekdays.length > 7
+      || new Set(schedule.weekdays).size !== schedule.weekdays.length
+      || schedule.weekdays.some(day => !Number.isSafeInteger(day) || day < 0 || day > 6)
+      || typeof schedule.time !== 'string' || !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(schedule.time)) {
+      rolePlanConfirmationConflict(`${label} weekly rule is invalid`);
+    }
+    return { kind: 'weekly', weekdays: [...schedule.weekdays].sort((a, b) => a - b), time: schedule.time,
+      endsAt: normalizedEndsAt, endsAtTimestamp: parsedEndsAt?.timestamp ?? null };
+  }
+  if (!Number.isSafeInteger(schedule.day) || schedule.day < 1 || schedule.day > 31
+    || typeof schedule.time !== 'string' || !/^(?:[01]?\d|2[0-3]):[0-5]\d$/.test(schedule.time)) {
+    rolePlanConfirmationConflict(`${label} monthly rule is invalid`);
+  }
+  return { kind: 'monthly', day: schedule.day, time: schedule.time, endsAt: normalizedEndsAt,
+    endsAtTimestamp: parsedEndsAt?.timestamp ?? null };
+}
+
+function rolePlanTargetSnapshot(snapshot, operation) {
+  if (!isPlainRolePlanObject(snapshot)) {
+    rolePlanConfirmationConflict(`${operation.op} requires a pinned target snapshot`);
+  }
+  const planId = snapshot.planId ?? snapshot.rolePlanId;
+  if (typeof planId !== 'string' || !planId.trim()) {
+    rolePlanConfirmationConflict('pinned target identity is invalid');
+  }
+  const source = snapshot.source;
+  if (!ROLE_PLAN_ALL_SOURCES.has(source)) {
+    rolePlanConfirmationConflict('pinned target source is not user-authorized');
+  }
+  const title = snapshot.title;
+  if (typeof title !== 'string' || !title.trim() || title.trim().length > 240) {
+    rolePlanConfirmationConflict('pinned target title is invalid');
+  }
+  if (operation.planId != null && operation.planId !== planId) {
+    rolePlanConfirmationConflict('pinned target identity conflict');
+  }
+  if (operation.targetRevision != null && snapshot.targetRevision != null
+    && operation.targetRevision !== snapshot.targetRevision) {
+    rolePlanConfirmationConflict('pinned target revision conflict');
+  }
+  return {
+    planId: planId.trim(),
+    source,
+    title: title.trim(),
+    targetRevision: snapshot.targetRevision ?? null,
+    targetKey: snapshot.targetKey ?? null,
+    schedule: snapshot.schedule ?? null
+  };
+}
+
+function rolePlanOperationNeedsExplicitTime(operation) {
+  if (operation.op === 'create') return true;
+  if (operation.op !== 'update') return false;
+  const patch = operation.patch;
+  return Object.hasOwn(operation, 'schedule')
+    || (isPlainRolePlanObject(patch) && Object.hasOwn(patch, 'schedule'));
+}
+
+function canonicalRolePlanActionPayload(operation) {
+  if (!isPlainRolePlanObject(operation) || !ROLE_PLAN_CONFIRMATION_OPS.has(operation.op)) {
+    rolePlanConfirmationConflict('canonical role plan operation is unknown');
+  }
+  const payload = structuredClone(operation);
+  if (payload.op === 'create' && payload.schedule) {
+    rolePlanScheduleValue(payload.schedule, 'canonical schedule');
+    const { kind, endsAt, ...rest } = payload.schedule;
+    payload.schedule = { kind, ...rest, ...(endsAt != null ? { endsAt } : {}) };
+  }
+  if (payload.op === 'update' && isPlainRolePlanObject(payload.patch)
+    && Object.hasOwn(payload.patch, 'schedule')) {
+    rolePlanScheduleValue(payload.patch.schedule, 'canonical patch schedule');
+    const { kind, endsAt, ...rest } = payload.patch.schedule;
+    payload.patch = {
+      ...payload.patch,
+      schedule: { kind, ...rest, ...(endsAt != null ? { endsAt } : {}) }
+    };
+  }
+  return payload;
+}
+
+function freezeCanonicalRolePlanValue(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value)) freezeCanonicalRolePlanValue(child);
+  return Object.freeze(value);
+}
+
+function canonicalRolePlanDescriptor(descriptor, targetSnapshot = null) {
+  if (!isPlainRolePlanObject(descriptor) || typeof descriptor.kind !== 'string'
+    || !descriptor.kind.startsWith('role_plan_') || !isPlainRolePlanObject(descriptor.payload)) {
+    rolePlanConfirmationConflict('canonical role plan descriptor is invalid');
+  }
+  const operation = descriptor.payload;
+  const op = descriptor.kind.slice('role_plan_'.length);
+  if (operation.op !== op) rolePlanConfirmationConflict('canonical role plan descriptor operation conflict');
+  const validated = validateRolePlanConfirmationOperation(operation, targetSnapshot);
+  const target = validated.target ? { ...validated.target } : null;
+  if (target && operation.op === 'update' && isPlainRolePlanObject(operation.patch)) {
+    if (typeof operation.patch.title === 'string' && operation.patch.title.trim()) {
+      target.title = operation.patch.title.trim();
+    }
+    if (Object.hasOwn(operation.patch, 'schedule')) {
+      rolePlanScheduleValue(operation.patch.schedule, 'canonical patch schedule');
+      target.schedule = structuredClone(operation.patch.schedule);
+    }
+  }
+  return {
+    operation: validated.operation,
+    target,
+    targetRevision: descriptor.targetRevision
+  };
+}
+
+function validateRolePlanConfirmationOperation(operation, targetSnapshot = null) {
+  if (!isPlainRolePlanObject(operation) || !ROLE_PLAN_CONFIRMATION_OPS.has(operation.op)) {
+    rolePlanConfirmationConflict('operation is unknown');
+  }
+  if (operation.source != null && !ROLE_PLAN_ALL_SOURCES.has(operation.source)) {
+    rolePlanConfirmationConflict('operation source is not user-authorized');
+  }
+  if (rolePlanOperationNeedsExplicitTime(operation)) {
+    if (operation.timeConfidence !== 'explicit') {
+      rolePlanConfirmationConflict('explicit time confidence is required');
+    }
+    const schedule = operation.op === 'create'
+      ? operation.schedule
+      : operation.schedule ?? operation.patch?.schedule;
+    rolePlanScheduleValue(schedule);
+  }
+  if (operation.op === 'create') {
+    if (!ROLE_PLAN_CONFIRMATION_SOURCES.has(operation.source)) {
+      rolePlanConfirmationConflict('operation source is not user-confirmation eligible');
+    }
+    if (typeof operation.title !== 'string' || !operation.title.trim()) {
+      rolePlanConfirmationConflict('operation title is invalid');
+    }
+    if (!rolePlanOperationNeedsExplicitTime(operation)) {
+      rolePlanConfirmationConflict('explicit schedule is required');
+    }
+    return { operation, target: null };
+  }
+  const target = rolePlanTargetSnapshot(targetSnapshot, operation);
+  if (!ROLE_PLAN_CONFIRMATION_SOURCES.has(target.source)) {
+    rolePlanConfirmationConflict('pinned target source is not user-confirmation eligible');
+  }
+  if (operation.source != null && operation.source !== target.source) {
+    rolePlanConfirmationConflict('operation source conflicts with pinned target');
+  }
+  return { operation, target };
+}
+
+export function requiresUserConfirmation({
+  protocolVersion,
+  kind,
+  operations,
+  targetSnapshots = []
+} = {}) {
+  if (Number(protocolVersion) !== 3 || kind !== 'DIRECT_REPLY') return false;
+  if (!Array.isArray(operations)) rolePlanConfirmationConflict('operations must be an array');
+  if (operations.length === 0) return false;
+  const sources = operations.map((operation, index) => {
+    if (!isPlainRolePlanObject(operation) || !ROLE_PLAN_CONFIRMATION_OPS.has(operation.op)) {
+      rolePlanConfirmationConflict('operation is unknown');
+    }
+    if (operation.op === 'create') {
+      if (!ROLE_PLAN_ALL_SOURCES.has(operation.source)) {
+        rolePlanConfirmationConflict('operation source is not user-authorized');
+      }
+      return operation.source;
+    }
+    const target = targetSnapshots[index];
+    if (!isPlainRolePlanObject(target) || !ROLE_PLAN_ALL_SOURCES.has(target.source)) {
+      rolePlanConfirmationConflict('pinned target source is not user-authorized');
+    }
+    return target.source;
+  });
+  const privateCount = sources.filter(source => source === 'private_decision').length;
+  if (privateCount === sources.length) return false;
+  if (privateCount > 0) rolePlanConfirmationConflict('mixed private and user role plan operations');
+  operations.map((operation, index) =>
+    validateRolePlanConfirmationOperation(operation, targetSnapshots[index] ?? null)
+  );
+  return true;
+}
+
+function rolePlanScheduleText(schedule, timeZone) {
+  const normalized = rolePlanScheduleValue(schedule);
+  const formatDate = timestamp => {
+    const parts = new Intl.DateTimeFormat('zh-CN', {
+      timeZone,
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23'
+    }).formatToParts(new Date(timestamp));
+    const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+    const weekday = values.weekday?.startsWith('周') ? values.weekday : `周${values.weekday || ''}`;
+    return `${values.year}年${values.month}月${values.day}日（${weekday}）${values.hour}:${values.minute}`;
+  };
+  const endSuffix = normalized.endsAt ? `，截至${formatDate(normalized.endsAtTimestamp)}` : '';
+  if (normalized.kind === 'once') return `${formatDate(normalized.timestamp)}${endSuffix}`;
+  if (normalized.kind === 'interval') {
+    const intervalText = normalized.intervalMs % 60_000 === 0
+      ? `${normalized.intervalMs / 60_000}分钟`
+      : normalized.intervalMs % 1000 === 0
+        ? `${normalized.intervalMs / 1000}秒`
+        : `${normalized.intervalMs}毫秒`;
+    return `从${formatDate(normalized.startsAtTimestamp)}起每${intervalText}${endSuffix}`;
+  }
+  if (normalized.kind === 'daily') return `每天${normalized.time}${endSuffix}`;
+  if (normalized.kind === 'weekly') {
+    const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+    return `每周${normalized.weekdays.map(day => weekdays[day]).join('、')}${normalized.time}${endSuffix}`;
+  }
+  return `每月${normalized.day}日${normalized.time}${endSuffix}`;
+}
+
+export function renderRolePlanConfirmation(operation, targetSnapshot = null, timeZone = 'Asia/Shanghai') {
+  const { operation: normalized, target } = canonicalRolePlanDescriptor(operation, targetSnapshot);
+  if (targetSnapshot?.targetKey != null && operation.targetKey !== targetSnapshot.targetKey) {
+    rolePlanConfirmationConflict('canonical target key conflict');
+  }
+  if (targetSnapshot?.targetRevision != null && operation.targetRevision !== targetSnapshot.targetRevision) {
+    rolePlanConfirmationConflict('canonical target revision conflict');
+  }
+  if (target && operation.targetRevision !== target.targetRevision) {
+    rolePlanConfirmationConflict('canonical target revision conflict');
+  }
+  const title = target?.title || normalized.title.trim();
+  if (normalized.op === 'create') {
+    return `好的，我会在${rolePlanScheduleText(normalized.schedule, timeZone)}提醒你「${title}」。`;
+  }
+  if (normalized.op === 'update' && rolePlanOperationNeedsExplicitTime(normalized)) {
+    const canonicalSchedule = target?.schedule;
+    if (!canonicalSchedule) rolePlanConfirmationConflict('canonical target schedule is missing');
+    return `好的，已将「${title}」调整为${rolePlanScheduleText(
+      canonicalSchedule,
+      timeZone
+    )}。`;
+  }
+  const labels = {
+    update: '更新',
+    cancel: '取消',
+    pause: '暂停',
+    resume: '恢复',
+    complete: '完成'
+  };
+  return `好的，已${labels[normalized.op] || normalized.op}「${title}」。`;
+}
+
+function renderRolePlanConfirmationSet(operations, targetSnapshots, timeZone) {
+  const rendered = operations.map((descriptor, index) =>
+    renderRolePlanConfirmation(descriptor, targetSnapshots[index] ?? null, timeZone)
+  );
+  return rendered.length === 1
+    ? rendered[0]
+    : rendered.map((text, index) => `${index + 1}. ${text}`).join('\n');
 }
 
 export function normalizeBrainDraft(draft) {
@@ -1747,7 +2137,11 @@ export class YuqiOrchestrator {
     };
   }
 
-  canonicalActionSet(turn, draft) {
+  commitCanonicalVisibleResult(input) {
+    return commitVisibleResult(input);
+  }
+
+  canonicalResolvedActionBundle(turn, draft) {
     const actionInputs = [];
     if (draft?.paymentAction && draft.paymentAction !== 'pending' && draft?.actionIntent?.payment) {
       const payment = draft.actionIntent.payment;
@@ -1773,15 +2167,64 @@ export class YuqiOrchestrator {
         payload: canonicalRelationshipPayload(draft.relationshipStageAction)
       });
     }
-    return actionInputs.map(action => {
+    const rolePlanOperations = Number(turn?.protocolVersion) === 3
+      && ROLE_PLAN_V3_KINDS.has(turn?.rolloutKey)
+      && draft?.rolePlanOperations != null
+      ? normalizeCanonicalV3RolePlanOperations(draft.rolePlanOperations)
+      : [];
+    for (const operation of rolePlanOperations) {
+      actionInputs.push({
+        kind: `role_plan_${operation.op}`,
+        payload: canonicalRolePlanActionPayload(operation),
+        rolePlan: true
+      });
+    }
+    const resolved = actionInputs.map(action => {
       const target = this.store.resolveCanonicalActionTargetInternal({ turn, action });
-      return {
+      const descriptor = Object.freeze({
         kind: action.kind,
         targetKey: target.targetKey,
         targetRevision: target.targetRevision,
-        payload: action.payload
+        payload: freezeCanonicalRolePlanValue(structuredClone(action.payload))
+      });
+      const targetSnapshot = action.rolePlan
+        ? freezeCanonicalRolePlanValue({
+            ...(isPlainRolePlanObject(target.canonicalTarget)
+              ? structuredClone(target.canonicalTarget)
+              : {}),
+            ...(isPlainRolePlanObject(target.canonicalTarget)
+              && (target.canonicalTarget.planId ?? target.canonicalTarget.plan_id)
+              ? { planId: target.canonicalTarget.planId ?? target.canonicalTarget.plan_id }
+              : {}),
+            targetKey: target.targetKey,
+            targetRevision: target.targetRevision
+          })
+        : null;
+      return {
+        descriptor,
+        targetSnapshot,
+        rolePlan: Boolean(action.rolePlan)
       };
     });
+    return {
+      actions: resolved.map(entry => entry.descriptor),
+      rolePlan: resolved.filter(entry => entry.rolePlan).map(entry => ({
+        descriptor: entry.descriptor,
+        targetSnapshot: entry.targetSnapshot
+      }))
+    };
+  }
+
+  canonicalActionSet(turn, draft) {
+    return this.canonicalResolvedActionBundle(turn, draft).actions;
+  }
+
+  canonicalRolePlanActionBundle(turn, draft) {
+    const bundle = this.canonicalResolvedActionBundle(turn, draft);
+    return {
+      actions: bundle.rolePlan.map(entry => entry.descriptor),
+      targetSnapshots: bundle.rolePlan.map(entry => entry.targetSnapshot)
+    };
   }
 
   comparisonJobDraftFromCanonicalTurn(turn, envelope) {
@@ -2033,7 +2476,9 @@ export class YuqiOrchestrator {
             envelope,
             scene: Number(turn.protocolVersion) === 3 && PUBLIC_MOMENT_KINDS.has(turn.rolloutKey)
               ? {}
-              : sceneFromEnvelope(envelope),
+              : Number(turn.protocolVersion) === 3
+                ? cognitionSceneForV3(sceneFromEnvelope(envelope))
+                : sceneFromEnvelope(envelope),
             currentBatch,
             localImagePaths: [...preparedImages.paths],
             ...(preparedImages.receipt ? { localImageReceipt: preparedImages.receipt } : {}),
@@ -2053,6 +2498,16 @@ export class YuqiOrchestrator {
       }
       const supersededAfterExecution = readSupersededOutcome();
       if (supersededAfterExecution) return supersededAfterExecution;
+      const rawRolePlanOperations = executionResult?.draft
+        && (Object.hasOwn(executionResult.draft, 'rolePlanOperationsJson')
+          ? executionResult.draft.rolePlanOperationsJson
+          : Object.hasOwn(executionResult.draft, 'rolePlanOperations')
+            ? executionResult.draft.rolePlanOperations
+            : undefined);
+      const isRolePlanV3 = Number(turn.protocolVersion) === 3 && ROLE_PLAN_V3_KINDS.has(turn.rolloutKey);
+      if (isRolePlanV3 && rawRolePlanOperations !== undefined) {
+        normalizeCanonicalV3RolePlanOperations(rawRolePlanOperations);
+      }
       const normalizedDraft = normalizeCanonicalBrainDraft(executionResult.draft);
       let relationshipStageAction = normalizedDraft.relationshipStageAction || null;
       if (!relationshipStageAction && normalizedDraft.relationshipStageReview) {
@@ -2070,7 +2525,7 @@ export class YuqiOrchestrator {
           this.clock()
         ).action;
       }
-      const draft = {
+      let draft = {
         ...normalizedDraft,
         relationshipStageAction: relationshipStageAction
           ? structuredClone(relationshipStageAction)
@@ -2093,14 +2548,44 @@ export class YuqiOrchestrator {
       if (draft.action === 'skip' && !isAutomaticKind(turn.rolloutKey)) {
         throw new Error('DIRECT_REPLY cannot commit an empty canonical result');
       }
-      const visibleGroup = this.canonicalVisibleGroup(turn, envelope, draft);
       // A proactive skip is a terminal zero-result disposition.  A stale
       // relationship review must never smuggle an action into that group.
+      const resolvedActionBundle = this.canonicalResolvedActionBundle(turn, draft);
       const actionSet = canonicalActionSetForDraft({
         isProactiveV3,
         draft,
-        resolve: () => this.canonicalActionSet(turn, draft)
+        resolve: () => resolvedActionBundle.actions
       });
+      const rolePlanBundle = {
+        actions: resolvedActionBundle.rolePlan.map(entry => entry.descriptor),
+        targetSnapshots: resolvedActionBundle.rolePlan.map(entry => entry.targetSnapshot)
+      };
+      const isRolePlanV3Direct = Number(turn.protocolVersion) === 3
+        && turn.rolloutKey === 'DIRECT_REPLY';
+      if (isRolePlanV3Direct && rolePlanBundle.actions.length) {
+        if (draft.action === 'skip') {
+          throw new Error('role plan confirmation authority conflict');
+        }
+        const confirmationRequired = requiresUserConfirmation({
+          protocolVersion: turn.protocolVersion,
+          kind: turn.rolloutKey,
+          operations: rolePlanBundle.actions.map(action => action.payload),
+          targetSnapshots: rolePlanBundle.targetSnapshots
+        });
+        if (confirmationRequired) {
+          const renderedReply = renderRolePlanConfirmationSet(
+            rolePlanBundle.actions,
+            rolePlanBundle.targetSnapshots,
+            'Asia/Shanghai'
+          );
+          draft = {
+            ...draft,
+            reply: renderedReply,
+            bubblePlan: null
+          };
+        }
+      }
+      const visibleGroup = this.canonicalVisibleGroup(turn, envelope, draft);
       assertCanonicalActionSetForTurn({
         turnKind: turn.rolloutKey,
         action: draft.action,
@@ -2142,7 +2627,7 @@ export class YuqiOrchestrator {
       const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
       const lane = this.store.getInteractionLane(turn.characterId, turn.laneKey);
       try {
-        return commitVisibleResult({
+        return this.commitCanonicalVisibleResult({
           store: this.store,
           turnId: turn.turnId,
           authorityLineageKey: turn.authorityLineageKey,

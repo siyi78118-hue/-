@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
+import * as orchestratorModule from '../src/orchestrator.mjs';
 import {
   hardValidateReply,
   normalizeBrainDraft,
@@ -12,6 +13,7 @@ import {
   YuqiOrchestrator
 } from '../src/orchestrator.mjs';
 import { materializeBrainDraft } from '../src/cognition-contract.mjs';
+import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import { PresetRegistry } from '../src/preset-registry.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
@@ -170,6 +172,78 @@ test('canonical social actions preserve combined intent and project relationship
       replyToCommentId: 'comment_1'
     }
   }), /moment reply cannot also like/i);
+});
+
+test('canonical v3 direct role-plan operations become store-resolved action descriptors', () => {
+  const calls = [];
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.store = {
+    resolveCanonicalActionTargetInternal({ action }) {
+      calls.push(action);
+      return {
+        targetKey: action.kind === 'role_plan_create'
+          ? 'lineage_create:lineage_1:role_plan_create'
+          : 'role_plan:plan_7',
+        targetRevision: action.kind === 'role_plan_create' ? '1' : 'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+      };
+    }
+  };
+  const actions = orchestrator.canonicalActionSet({
+    protocolVersion: 3,
+    rolloutKey: 'DIRECT_REPLY',
+    authorityLineageKey: 'lineage_1'
+  }, {
+    rolePlanOperations: [{
+      op: 'create', type: 'private_message', source: 'spoken',
+      title: '提醒', intent: '提醒', schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' },
+      timeConfidence: 'explicit'
+    }]
+  });
+  assert.equal(actions.length, 1);
+  assert.equal(actions[0].kind, 'role_plan_create');
+  assert.equal(actions[0].targetKey, 'lineage_create:lineage_1:role_plan_create');
+  assert.equal(calls[0].payload.op, 'create');
+});
+
+test('all v3 role-plan lanes preserve canonical role-plan action descriptors', () => {
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.store = {
+    resolveCanonicalActionTargetInternal() {
+      return { targetKey: 'role_plan:plan_7', targetRevision: 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' };
+    }
+  };
+  const operation = {
+    op: 'cancel', planId: 'plan_7', source: 'private_decision'
+  };
+  for (const rolloutKey of [
+    'ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE'
+  ]) {
+    assert.equal(orchestrator.canonicalActionSet({ protocolVersion: 3, rolloutKey }, {
+      rolePlanOperations: [operation]
+    })[0].kind, 'role_plan_cancel');
+  }
+});
+
+test('canonical v3 role-plan normalization rejects malformed or over-limit operation lists', () => {
+  assert.equal(typeof orchestratorModule.normalizeCanonicalV3RolePlanOperations, 'function');
+  const operation = {
+    op: 'cancel', planId: 'plan_7', source: 'private_decision'
+  };
+  assert.throws(() => orchestratorModule.normalizeCanonicalV3RolePlanOperations(
+    Array.from({ length: 13 }, () => operation)
+  ), /role plan operations|too many|authority conflict/i);
+  assert.throws(() => orchestratorModule.normalizeCanonicalV3RolePlanOperations({ ...operation }),
+    /role plan operations|array|authority conflict/i);
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.store = {
+    resolveCanonicalActionTargetInternal() {
+      return { targetKey: 'role_plan:plan_7', targetRevision: 'sha256:' + 'a'.repeat(64) };
+    }
+  };
+  assert.throws(() => orchestrator.canonicalRolePlanActionBundle(
+    { protocolVersion: 3, rolloutKey: 'DIRECT_REPLY' },
+    { rolePlanOperations: Array.from({ length: 13 }, () => operation) }
+  ), /role plan operations|too many|authority conflict/i);
 });
 
 test('canonical action sources reject fields and native-type bypasses before target resolution', () => {
@@ -989,6 +1063,452 @@ test('a conversational plan decision is supervised, delivered as a hidden operat
     assert.equal(saved.content, '好，我记着。明天下午三点提醒你。');
     assert.doesNotMatch(saved.content, /<al_plan>/);
   });
+});
+
+test('v3 direct role-plan confirmation is code-owned, explicit, and ordinal', () => {
+  assert.equal(typeof orchestratorModule.renderRolePlanConfirmation, 'function');
+  assert.equal(typeof orchestratorModule.requiresUserConfirmation, 'function');
+  const operations = [{
+    op: 'create',
+    type: 'private_message',
+    source: 'accepted_request',
+    title: '提醒把稿子发给编辑',
+    intent: '到时间后结合最新上下文，自然提醒阿予把稿子发给编辑',
+    sourceQuote: '明天下午三点提醒我把稿子发给编辑',
+    evidenceMessageIds: ['msg_phone_92'],
+    schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' },
+    timeConfidence: 'explicit'
+  }];
+  assert.equal(orchestratorModule.requiresUserConfirmation({
+    protocolVersion: 3, kind: 'DIRECT_REPLY', operations, targetSnapshots: [null]
+  }), true);
+  const rendered = orchestratorModule.renderRolePlanConfirmation(
+    {
+      kind: 'role_plan_create',
+      targetKey: 'lineage_create:lineage_1:role_plan_create',
+      targetRevision: '1',
+      payload: operations[0]
+    },
+    null,
+    'Asia/Shanghai'
+  );
+  assert.equal(rendered, '好的，我会在2026年7月24日（周五）15:00提醒你「提醒把稿子发给编辑」。');
+  assert.doesNotMatch(rendered, /下周一|四点/);
+});
+
+test('v3 role-plan confirmation rejects ambiguous schedule and private or legacy lanes', () => {
+  const inferred = {
+    op: 'create', type: 'private_message', source: 'spoken', title: '提醒',
+    schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' }, timeConfidence: 'inferred'
+  };
+  assert.throws(() => orchestratorModule.requiresUserConfirmation({
+    protocolVersion: 3, kind: 'DIRECT_REPLY', operations: [inferred], targetSnapshots: [null]
+  }), /explicit time confidence|role plan confirmation authority conflict/);
+  for (const kind of ['ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE']) {
+    assert.equal(orchestratorModule.requiresUserConfirmation({
+      protocolVersion: 3, kind, operations: [inferred], targetSnapshots: [null]
+    }), false);
+  }
+  assert.equal(orchestratorModule.requiresUserConfirmation({
+    protocolVersion: 2, kind: 'DIRECT_REPLY', operations: [inferred], targetSnapshots: [null]
+  }), false);
+});
+
+test('v3 role-plan updates use the pinned target identity and render multiple operations in order', () => {
+  const target = {
+    planId: 'plan_7',
+    source: 'user_created',
+    title: '晨间提醒',
+    targetRevision: 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  };
+  const operations = [
+    { op: 'update', planId: 'plan_7', patch: { title: '晨间提醒' }, source: 'user_created' },
+    { op: 'cancel', planId: 'plan_7', source: 'user_created' }
+  ];
+  assert.equal(orchestratorModule.requiresUserConfirmation({
+    protocolVersion: 3,
+    kind: 'DIRECT_REPLY',
+    operations,
+    targetSnapshots: [target, target]
+  }), true);
+  assert.equal(
+    orchestratorModule.renderRolePlanConfirmation({
+      kind: 'role_plan_update', targetKey: 'role_plan:plan_7',
+      targetRevision: target.targetRevision, payload: operations[0]
+    }, target),
+    '好的，已更新「晨间提醒」。'
+  );
+  assert.equal(
+    orchestratorModule.renderRolePlanConfirmation({
+      kind: 'role_plan_cancel', targetKey: 'role_plan:plan_7',
+      targetRevision: target.targetRevision, payload: operations[1]
+    }, target),
+    '好的，已取消「晨间提醒」。'
+  );
+  assert.throws(() => orchestratorModule.requiresUserConfirmation({
+    protocolVersion: 3,
+    kind: 'DIRECT_REPLY',
+    operations: [{ ...operations[1], planId: 'plan_forged', source: 'private_decision' }],
+    targetSnapshots: [target]
+  }), /role plan confirmation authority conflict/);
+});
+
+test('private role-plan operations keep their action without confirmation renderer, while mixed sources fail closed', () => {
+  const privateOperation = { op: 'cancel', planId: 'plan_private', source: 'private_decision' };
+  const target = {
+    planId: 'plan_private', source: 'private_decision', title: '内部安排',
+    targetRevision: 'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+  };
+  assert.equal(orchestratorModule.requiresUserConfirmation({
+    protocolVersion: 3, kind: 'DIRECT_REPLY', operations: [privateOperation], targetSnapshots: [target]
+  }), false);
+  assert.throws(() => orchestratorModule.requiresUserConfirmation({
+    protocolVersion: 3,
+    kind: 'DIRECT_REPLY',
+    operations: [
+      { op: 'cancel', planId: 'plan_private', source: 'private_decision' },
+      { op: 'cancel', planId: 'plan_user', source: 'spoken' }
+    ],
+    targetSnapshots: [target, { ...target, planId: 'plan_user', source: 'spoken', title: '公开安排' }]
+  }), /role plan confirmation authority conflict/);
+});
+
+test('role-plan confirmation renders every closed schedule kind deterministically', () => {
+  const schedules = [
+    ['once', { kind: 'once', at: '2026-07-24T15:00:00+08:00', endsAt: '2026-07-31T15:00:00+08:00' }, /2026年7月24日/, /截至2026年7月31日/],
+    ['interval', { kind: 'interval', startsAt: '2026-07-24T15:00:00+08:00', intervalMs: 3600000, endsAt: '2026-07-31T15:00:00+08:00' }, /每60分钟/, /截至2026年7月31日/],
+    ['daily', { kind: 'daily', time: '15:00', endsAt: '2026-07-31T15:00:00+08:00' }, /每天15:00/, /截至2026年7月31日/],
+    ['weekly', { kind: 'weekly', weekdays: [1, 5], time: '15:00', endsAt: '2026-07-31T15:00:00+08:00' }, /每周周一、周五15:00/, /截至2026年7月31日/],
+    ['monthly', { kind: 'monthly', day: 24, time: '15:00', endsAt: '2026-07-31T15:00:00+08:00' }, /每月24日15:00/, /截至2026年7月31日/]
+  ];
+  for (const [kind, schedule, expected, expectedEndsAt] of schedules) {
+    const rendered = orchestratorModule.renderRolePlanConfirmation({
+      kind: 'role_plan_create', targetKey: `create:${kind}`, targetRevision: '1',
+      payload: {
+        op: 'create', type: 'private_message', source: 'spoken', title: `安排-${kind}`,
+        intent: '确定执行', schedule, timeConfidence: 'explicit'
+      }
+    }, null, 'Asia/Shanghai');
+    assert.match(rendered, expected);
+    assert.match(rendered, expectedEndsAt);
+  }
+  assert.match(orchestratorModule.renderRolePlanConfirmation({
+    kind: 'role_plan_create', targetKey: 'create:tz', targetRevision: '1',
+    payload: {
+      op: 'create', type: 'private_message', source: 'spoken', title: '无时区',
+      intent: '确定执行', schedule: { kind: 'once', at: '2026-07-24T15:00:00', endsAt: '2026-07-24T16:00:00' },
+      timeConfidence: 'explicit'
+    }
+  }, null, 'Asia/Shanghai'), /2026年7月24日（周五）15:00/);
+  assert.match(orchestratorModule.renderRolePlanConfirmation({
+    kind: 'role_plan_create', targetKey: 'create:precision', targetRevision: '1',
+    payload: {
+      op: 'create', type: 'private_message', source: 'spoken', title: '精度',
+      intent: '确定执行', schedule: { kind: 'interval', startsAt: '2026-07-24T07:00:00Z', intervalMs: 301000 },
+      timeConfidence: 'explicit'
+    }
+  }, null, 'Asia/Shanghai'), /每301秒/);
+  assert.match(orchestratorModule.renderRolePlanConfirmation({
+    kind: 'role_plan_create', targetKey: 'create:precision-ms', targetRevision: '1',
+    payload: {
+      op: 'create', type: 'private_message', source: 'spoken', title: '毫秒精度',
+      intent: '确定执行', schedule: { kind: 'interval', startsAt: '2026-07-24T07:00:00Z', intervalMs: 300001 },
+      timeConfidence: 'explicit'
+    }
+  }, null, 'Asia/Shanghai'), /每300001毫秒/);
+});
+
+test('role-plan renderer consumes only the resolved descriptor and computes post-update text', () => {
+  const target = {
+    planId: 'plan_pinned', source: 'spoken', title: '旧备份',
+    targetRevision: 'rev-7',
+    schedule: { kind: 'daily', time: '08:00', endsAt: '2026-07-31T08:00:00+08:00' }
+  };
+  const canonicalPayload = {
+    op: 'update', source: 'spoken',
+    patch: {
+      title: '服务器备份',
+      schedule: { kind: 'daily', time: '09:00', endsAt: '2026-08-01T09:00:00+08:00' }
+    },
+    timeConfidence: 'explicit'
+  };
+  const descriptor = {
+    kind: 'role_plan_update', targetKey: 'role_plan:plan_pinned', targetRevision: 'rev-7',
+    payload: structuredClone(canonicalPayload)
+  };
+  // A raw caller patch is never passed to the renderer and cannot alter the
+  // already-resolved descriptor.
+  canonicalPayload.patch.title = 'caller forged';
+  canonicalPayload.patch.schedule = {
+    kind: 'once', at: '2030-01-01T00:00:00Z', endsAt: '2030-01-02T00:00:00Z'
+  };
+  const rendered = orchestratorModule.renderRolePlanConfirmation(descriptor, target, 'Asia/Shanghai');
+  assert.match(rendered, /服务器备份/);
+  assert.match(rendered, /每天09:00/);
+  assert.match(rendered, /截至2026年8月1日/);
+  assert.doesNotMatch(rendered, /caller forged|2030年/);
+});
+
+test('role-plan confirmation target snapshots come from resolver canonical targets, not envelope caller fields', () => {
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.store = {
+    resolveCanonicalActionTargetInternal() {
+      return {
+        targetKey: 'role_plan:plan_pinned',
+        targetRevision: 'sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+        canonicalTarget: {
+          planId: 'plan_pinned', source: 'spoken', title: '权威安排'
+        }
+      };
+    }
+  };
+  const bundle = orchestrator.canonicalRolePlanActionBundle({
+    protocolVersion: 3, rolloutKey: 'DIRECT_REPLY'
+  }, {
+    rolePlanOperations: [{ op: 'cancel', planId: 'plan_pinned', source: 'spoken' }]
+  });
+  assert.equal(bundle.targetSnapshots[0].title, '权威安排');
+  assert.equal(bundle.targetSnapshots[0].planId, 'plan_pinned');
+});
+
+test('canonical role-plan bundle resolves each action once and freezes descriptor plus sidecar', () => {
+  let resolverCalls = 0;
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.store = {
+    resolveCanonicalActionTargetInternal() {
+      resolverCalls += 1;
+      return resolverCalls === 1
+        ? {
+            targetKey: 'role_plan:plan_once',
+            targetRevision: 'rev-1',
+            canonicalTarget: {
+              planId: 'plan_once', source: 'spoken', title: '旧标题',
+              schedule: { kind: 'daily', time: '08:00', endsAt: '2026-08-01T08:00:00+08:00' }
+            }
+          }
+        : {
+            targetKey: 'role_plan:plan_changed',
+            targetRevision: 'rev-2',
+            canonicalTarget: {
+              planId: 'plan_once', source: 'spoken', title: '不应采用',
+              schedule: { kind: 'once', at: '2030-01-01T00:00:00Z' }
+            }
+          };
+    }
+  };
+  const draft = {
+    rolePlanOperations: [{
+      op: 'update', planId: 'plan_once', source: 'spoken',
+      patch: {
+        title: '规范标题',
+        schedule: { kind: 'daily', time: '09:00', endsAt: '2026-08-02T09:00:00+08:00' }
+      },
+      timeConfidence: 'explicit'
+    }]
+  };
+  const bundle = orchestrator.canonicalResolvedActionBundle(
+    { protocolVersion: 3, rolloutKey: 'DIRECT_REPLY' }, draft
+  );
+  draft.rolePlanOperations[0].patch.title = '草稿篡改';
+  draft.rolePlanOperations[0].patch.schedule.time = '23:00';
+  assert.equal(resolverCalls, 1);
+  assert.equal(bundle.actions[0].targetKey, 'role_plan:plan_once');
+  assert.equal(bundle.actions[0].targetRevision, 'rev-1');
+  assert.equal(bundle.actions[0].payload.patch.title, '规范标题');
+  assert.equal(bundle.rolePlan[0].targetSnapshot.title, '旧标题');
+  assert.equal(bundle.rolePlan[0].targetSnapshot.targetRevision, 'rev-1');
+  assert.equal(Object.isFrozen(bundle.actions[0]), true);
+  assert.equal(Object.isFrozen(bundle.actions[0].payload.patch), true);
+  const rendered = orchestratorModule.renderRolePlanConfirmation(
+    bundle.actions[0], bundle.rolePlan[0].targetSnapshot, 'Asia/Shanghai'
+  );
+  assert.match(rendered, /规范标题/);
+  assert.match(rendered, /每天09:00/);
+  assert.throws(() => orchestratorModule.renderRolePlanConfirmation(
+    bundle.actions[0], { ...bundle.rolePlan[0].targetSnapshot, targetRevision: 'rev-2' }, 'Asia/Shanghai'
+  ), /target revision/);
+});
+
+test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one fingerprinted commit', async () => {
+  const operation = {
+    op: 'create', type: 'private_message', source: 'spoken', title: '发稿提醒',
+    intent: '明天下午提醒发稿', schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' },
+    timeConfidence: 'explicit'
+  };
+  const envelope = {
+    protocolVersion: 3,
+    turnId: 'turn_role_plan_v3',
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq: 1,
+    createdAt: 1784400000000,
+    kind: 'DIRECT_REPLY',
+    message: {
+      messageId: 'msg_role_plan_v3', speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+      content: '明天下午提醒我发稿', sentAt: 1784400000000
+    },
+    context: {}
+  };
+  const turn = {
+    turnId: envelope.turnId,
+    protocolVersion: 3,
+    rolloutKey: 'DIRECT_REPLY',
+    envelopeJson: JSON.stringify(envelope),
+    authorityLineageKey: 'lineage_role_plan_v3',
+    characterId: 'yuqi',
+    laneKey: 'direct',
+    inputUserBatchId: envelope.message.messageId,
+    inputVisibilitySequence: 1,
+    inputClearEpoch: 0,
+    agencySnapshotChecksum: 'a'.repeat(64),
+    authoritativeReleaseId: 'cognition-v3',
+    authoritativePipelineChecksum: 'b'.repeat(64),
+    comparisonReleaseId: null,
+    comparisonMode: 'none',
+    state: 'open',
+    turnRevision: 1
+  };
+  let committed;
+  let resolverCalls = 0;
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.clock = () => 1784400000000;
+  orchestrator.turnImagePaths = new Map();
+  orchestrator.store = {
+    getTurn() { return turn; },
+    getTurnAuthorityLineage() { return { state: 'open', revision: 1 }; },
+    readCanonicalCommitOutcomeInternal() { return null; },
+    getCurrentUserBatch() { return null; },
+    readAgencyAuthoritySnapshotInternal() {
+      return { checksum: turn.agencySnapshotChecksum, constraints: [], preferenceFacts: [], stances: [] };
+    },
+    getCognitiveState() { return { revision: 0 }; },
+    getInteractionLane() { return { revision: 0 }; },
+    resolveCanonicalActionTargetInternal() {
+      resolverCalls += 1;
+      return {
+        targetKey: 'lineage_create:lineage_role_plan_v3:role_plan_create',
+        targetRevision: resolverCalls === 1 ? '1' : 'changed',
+        canonicalTarget: { lineageKey: turn.authorityLineageKey, actionKind: 'role_plan_create' }
+      };
+    }
+  };
+  orchestrator.releaseExecutor = {
+    async executeTurn() {
+      return { draft: { action: 'send', reply: '模型自由回复不应提交', rolePlanOperations: [operation] } };
+    }
+  };
+  orchestrator.commitCanonicalVisibleResult = input => {
+    committed = input;
+    return { status: 'committed', visibleGroupId: 'group_role_plan_v3' };
+  };
+  const result = await orchestrator.runCanonicalReleaseTurn(turn);
+  assert.equal(result.status, 'committed');
+  assert.equal(resolverCalls, 1);
+  assert.equal(committed.visibleGroup.items[0].content,
+    '好的，我会在2026年7月24日（周五）15:00提醒你「发稿提醒」。');
+  assert.equal(committed.actionSet[0].kind, 'role_plan_create');
+  assert.equal(committed.actionSet[0].payload.op, 'create');
+  assert.equal(committed.generationFingerprint, generationFingerprint({
+    roleId: turn.characterId,
+    laneKey: turn.laneKey,
+    inputVisibilitySequence: turn.inputVisibilitySequence,
+    visibleGroup: committed.visibleGroup,
+    actionSet: committed.actionSet,
+    contextRevision: turn.agencySnapshotChecksum
+  }));
+});
+
+test('canonical v3 direct provider receives formal relationship scene plus separate expression sidecar', async () => {
+  const envelope = {
+    protocolVersion: 3,
+    turnId: 'turn_relationship_views',
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq: 1,
+    createdAt: 1784400000000,
+    kind: 'DIRECT_REPLY',
+    message: {
+      messageId: 'msg_relationship_views', speakerId: 'user', speakerType: 'user',
+      recipientId: 'yuqi', content: '继续聊', sentAt: 1784400000000
+    },
+    context: {
+      scene: {
+        relationshipStage: {
+          base: { id: 'familiar', label: '熟悉', content: '还没到阶段，不允许靠近' },
+          phase: { id: 'normal', label: '正常', content: '阶段门槛词不应泄漏' }
+        },
+        stageCatalog: [{ id: 'familiar', label: '熟悉', content: '还没到阶段，不允许靠近' }],
+        phaseCatalog: [{ id: 'normal', label: '正常', content: '阶段门槛词不应泄漏' }],
+        stagePersonaRevision: 12,
+        effectiveStagePersona: '温和直接，不是硬约束',
+        stagePersona: { toneTendencies: ['温和', '直接'], forbiddenMoves: ['private'] }
+      }
+    }
+  };
+  const turn = {
+    turnId: envelope.turnId,
+    protocolVersion: 3,
+    rolloutKey: 'DIRECT_REPLY',
+    envelopeJson: JSON.stringify(envelope),
+    authorityLineageKey: 'lineage_relationship_views',
+    characterId: 'yuqi',
+    laneKey: 'conversation:yuqi',
+    inputUserBatchId: envelope.message.messageId,
+    turnRevision: 1,
+    agencySnapshotChecksum: 'a'.repeat(64),
+    authoritativeReleaseId: 'release_v3',
+    authoritativePipelineChecksum: 'b'.repeat(64),
+    comparisonReleaseId: null,
+    comparisonMode: 'none',
+    inputVisibilitySequence: 1,
+    inputClearEpoch: 0,
+    state: 'queued'
+  };
+  let capturedScene;
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.clock = () => 1784400000000;
+  orchestrator.turnImagePaths = new Map();
+  orchestrator.store = {
+    getTurn() { return turn; },
+    getTurnAuthorityLineage() { return { state: 'open', revision: 1 }; },
+    readCanonicalCommitOutcomeInternal() { return null; },
+    getCurrentUserBatch() { return null; },
+    readAgencyAuthoritySnapshotInternal() {
+      return { checksum: turn.agencySnapshotChecksum, constraints: [], preferenceFacts: [], stances: [] };
+    },
+    getCognitiveState() { return { revision: 0 }; },
+    getInteractionLane() { return { revision: 0 }; }
+  };
+  orchestrator.releaseExecutor = {
+    async executeTurn({ execution }) {
+      capturedScene = structuredClone(execution.scene);
+      return { draft: { action: 'send', reply: '继续聊', rolePlanOperations: [] } };
+    }
+  };
+  orchestrator.canonicalVisibleGroup = () => ({
+    items: [{ itemId: 'item_relationship_views', kind: 'text', content: '继续聊' }]
+  });
+  orchestrator.commitCanonicalVisibleResult = () => ({
+    status: 'committed', visibleGroupId: 'group_relationship_views'
+  });
+
+  const result = await orchestrator.runCanonicalReleaseTurn(turn);
+  assert.equal(result.status, 'committed');
+  assert.deepEqual(capturedScene.relationshipStage, {
+    base: { id: 'familiar' },
+    phase: { id: 'normal' },
+    formalFacts: [],
+    allowedFormalTransitions: [],
+    stagePersonaRevision: 12
+  });
+  assert.deepEqual(capturedScene.relationshipExpression, {
+    formalFacts: [],
+    toneTendencies: [
+      '温和', '直接', '温和直接，不是硬约束', '还没到阶段，不允许靠近'
+    ]
+  });
+  assert.equal(JSON.stringify(capturedScene.relationshipStage).includes('还没到阶段'), false);
+  assert.equal(JSON.stringify(capturedScene).includes('forbiddenMoves'), false);
 });
 
 test('a supervised moment interaction commits its matching life adjustment', async () => {

@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { resolveRelationshipStage } from '../src/relationship-stage.mjs';
+import {
+  compileRelationshipForCognition,
+  relationshipExpressionView,
+  resolveRelationshipStage
+} from '../src/relationship-stage.mjs';
 
 const scene = {
   relationshipStage: {
@@ -21,6 +25,69 @@ const messages = [
   { messageId: 'msg_1', speakerId: 'user', content: '以后常聊啊', sentAt: 1000 },
   { messageId: 'msg_2', speakerId: 'yuqi', content: '行，我也想继续认识你', sentAt: 2000 }
 ];
+
+test('compiles relationship stage for cognition without leaking transition controls', () => {
+  const state = {
+    base: 'familiar',
+    phase: 'normal',
+    formalFacts: ['双方确认保持稳定联系'],
+    allowedTransitions: { familiar: ['close'] },
+    stagePersona: { revision: 7, toneTendencies: ['克制', '直接'] },
+    forbiddenMoves: ['routine_affection_disclaimer'],
+    stageThresholds: { close: 0.9 }
+  };
+
+  assert.deepEqual(compileRelationshipForCognition(state), {
+    base: 'familiar',
+    phase: 'normal',
+    formalFacts: ['双方确认保持稳定联系'],
+    allowedFormalTransitions: { familiar: ['close'] },
+    stagePersonaRevision: 7
+  });
+  assert.deepEqual(relationshipExpressionView(state), {
+    formalFacts: ['双方确认保持稳定联系'],
+    toneTendencies: ['克制', '直接']
+  });
+  assert.equal('forbiddenMoves' in relationshipExpressionView(state), false);
+  assert.equal('stageThresholds' in relationshipExpressionView(state), false);
+});
+
+test('formal and expression views separate persisted stage facts from ordinary persona text', () => {
+  const state = {
+    base: { id: 'familiar', label: '熟悉', content: '还没到阶段，不允许靠近' },
+    phase: { id: 'normal', label: '正常', content: '阶段门槛词不应进入模型' },
+    formalFacts: [{ factId: 'relationship_fact', value: 'mutual_contact' }],
+    allowedTransitions: { familiar: ['close'] },
+    stagePersonaRevision: 11,
+    effectiveStagePersona: '说话温和直接，但不要把这段编辑文字当成禁令',
+    stagePersona: {
+      toneTendencies: ['温和', '直接'],
+      forbiddenMoves: ['never_leak']
+    },
+    forbiddenMoves: ['never_leak'],
+    stageThresholds: { close: 0.9 }
+  };
+
+  const formal = compileRelationshipForCognition(state);
+  assert.deepEqual(formal, {
+    base: { id: 'familiar' },
+    phase: { id: 'normal' },
+    formalFacts: state.formalFacts,
+    allowedFormalTransitions: state.allowedTransitions,
+    stagePersonaRevision: 11
+  });
+  assert.equal('content' in formal.base, false, 'formal axis must not carry persona prose');
+  assert.equal('toneTendencies' in formal, false);
+
+  const expression = relationshipExpressionView(state);
+  assert.deepEqual(expression, {
+    formalFacts: state.formalFacts,
+    toneTendencies: ['温和', '直接', state.effectiveStagePersona]
+  });
+  assert.equal(JSON.stringify(expression).includes('不允许'), false);
+  assert.equal(JSON.stringify(expression).includes('stageThresholds'), false);
+  assert.equal(JSON.stringify(expression).includes('forbiddenMoves'), false);
+});
 
 test('accepts an adjacent evidence-backed stage progression at the threshold', () => {
   const result = resolveRelationshipStage(scene, {

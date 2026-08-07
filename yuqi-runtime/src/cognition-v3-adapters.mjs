@@ -2,6 +2,9 @@ import { compileAgencyView } from './agency-state.mjs';
 import { rankCognitionItems, sanitizeCognitionMessage } from './cognition-context.mjs';
 import { takeCompleteMessageGroups } from './conversation-context.mjs';
 import { currentUserInteractionForCognition } from './current-user-batch.mjs';
+import {
+  compileRelationshipForCognition
+} from './relationship-stage.mjs';
 
 function clone(value) {
   return value == null ? value : structuredClone(value);
@@ -14,17 +17,15 @@ function attachmentReferences(batch) {
 
 function relationshipBasePhase(input) {
   const relationship = input.relationship || input.relationshipStage || {};
-  return {
-    base: clone(relationship.base ?? null),
-    phase: clone(relationship.phase ?? null),
-    formalFacts: clone(relationship.formalFacts || []),
-    allowedFormalTransitions: clone(relationship.allowedFormalTransitions
-      || relationship.allowedTransitions
-      || []),
-    toneTendencies: clone(relationship.toneTendencies
-      || relationship.stagePersona?.toneTendencies
-      || [])
-  };
+  return compileRelationshipForCognition({
+    ...relationship,
+    stagePersonaRevision: relationship.stagePersonaRevision
+      ?? input.stagePersonaRevision,
+    formalFacts: relationship.formalFacts || input.formalFacts,
+    allowedFormalTransitions: relationship.allowedFormalTransitions
+      || input.allowedFormalTransitions,
+    allowedTransitions: relationship.allowedTransitions || input.allowedTransitions
+  });
 }
 
 function publicCommittedEvents(input) {
@@ -218,7 +219,7 @@ export function buildCognitionEnvelopeV3(input) {
     verifiedFacts: publicMomentKind ? [] : rankCognitionItems(input.verifiedFacts, 8).map(clone),
     ...agencyView,
     relationshipBasePhase: publicMomentKind
-      ? { base: null, phase: null, formalFacts: [], allowedFormalTransitions: [], toneTendencies: [] }
+      ? { base: null, phase: null, formalFacts: [], allowedFormalTransitions: [] }
       : relationshipBasePhase(input),
     lifeSignals: publicMomentKind ? [] : rankCognitionItems(input.lifeSignals, 5).map(clone),
     authorSettings: publicMomentKind
