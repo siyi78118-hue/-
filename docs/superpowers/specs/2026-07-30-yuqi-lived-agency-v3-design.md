@@ -460,6 +460,10 @@ acceptanceCriteria
 
 生活规划使用相同人物基础和状态语义，但保持独立会话、持久 attempt、固定 basis checksum 和单并发 dispatcher。
 
+生活规划不是对既成事实的记忆抽取，模型也不是生活事实的证据来源。它的唯一输入证据权威是创建 attempt 的同一事务从数据库固定的六元组：`roleId`、`planningWindowStartAt/planningWindowEndAt`、`lifeBasisChecksum`、`contextChecksum`、`inputChecksum` 和 `requestBaseKey`；其中 `requestBaseKey = contentHash({roleId,startAt,endAt,lifeBasisChecksum,contextChecksum})`，`inputChecksum = contentHash(inputSnapshot)` 独立校验，rollout/release/epoch/canary pins 继续作为独立执行权威，不能被结果覆盖。其中 `inputSnapshot.roleId/planningWindow` 必须与 attempt 列完全相等，即使攻击者同步重算 snapshot/checksum/request key 也不能改变；`current/recent/upcoming` 中出现的每个生活 episode 都必须是当时 store 中同角色、同 ID、同 checksum 的真实行。结果不得携带或借用模型自报的 `evidenceIds/sourceMessageIds/usedFactIds` 等字段，也不得把聊天消息、未送达草稿或生成文本冒充生活 basis。
+
+首次结果提交必须在 authoritative result 的同一个 immediate transaction 中重新闭合上述输入 tuple、重算当前 pre-write life basis、校验 result 顶层精确只有 `episodes`，然后才写 episode、可选的嵌套 `publicMomentCandidate`、compare job 和 attempt 终态。terminal exact replay 不得在新 episode 已经写入后重算 pre-write basis；它以持久 input tuple 作为历史证据 commitment，重算 input/context/request checksums，并闭合校验已存 result、每条 output episode 的 ownership/checksum/source planning ID、compare job 和终态后返回原结果。changed result、伪造 evidence 字段、损坏 input tuple 或缺失/篡改 output projection 一律零写拒绝。
+
 生活系统可以推进普通工作、饮食、休息、兴趣和注意力变化。不得为了活人感随机制造重大事故、疾病、失业、新恋情和身份改变。
 
 实时聊天不等待生活规划。聊天改变安排时，认知决定、可见正文、结构化 `lifeAdjustment` 和时间校验必须一致。

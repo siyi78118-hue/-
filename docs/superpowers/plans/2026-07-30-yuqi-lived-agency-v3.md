@@ -7404,6 +7404,44 @@ test('life planning fixes basis and creates compare only after result commit', a
   assert.ok(store.getComparisonJobForLife(attempt.planningId));
 });
 
+test('life planning evidence is store-pinned input authority, never model-cited ids', () => {
+  const attempt = runningLifeAttempt();
+  assert.equal(attempt.inputSnapshot.roleId, attempt.roleId);
+  assert.deepEqual(attempt.inputSnapshot.planningWindow, {
+    startAt: attempt.planningWindowStartAt,
+    targetEndAt: attempt.planningWindowEndAt
+  });
+  for (const forbidden of ['evidenceIds', 'sourceMessageIds', 'usedFactIds', 'lifeBasisChecksum']) {
+    assert.throws(() => commitLifeResult(attempt, {
+      ...ordinaryLifeResult(), [forbidden]: forbidden === 'lifeBasisChecksum'
+        ? attempt.lifeBasisChecksum : ['model_supplied']
+    }), /life planning result authority conflict/);
+  }
+});
+
+test('coordinated input checksum tampering cannot change attempt role or window', () => {
+  const attempt = runningLifeAttempt();
+  rawTamperAttemptSnapshotAndRehash(attempt.planningId, {
+    ...attempt.inputSnapshot,
+    roleId: 'foreign_role',
+    planningWindow: { ...attempt.inputSnapshot.planningWindow, targetEndAt: 1 }
+  });
+  assert.throws(() => commitLifeResult(attempt, ordinaryLifeResult()),
+    /life planning evidence authority conflict/);
+  assert.deepEqual(lifeResultSideEffects(attempt.planningId), emptyLifeResultSideEffects());
+});
+
+test('terminal life replay validates historical input and stored output without recomputing post-write basis', () => {
+  const attempt = runningLifeAttempt();
+  const result = ordinaryLifeResult();
+  const committed = commitLifeResult(attempt, result);
+  assert.notEqual(store.getLifeBasisChecksum(attempt.roleId, planningWindow(attempt)),
+    attempt.lifeBasisChecksum);
+  assert.deepEqual(commitLifeResult(attempt, result), committed);
+  tamperPersistedLifeEpisode(committed.authoritativeResult.episodes[0].episodeId);
+  assert.throws(() => commitLifeResult(attempt, result), /life planning episode authority conflict/);
+});
+
 test('stage cannot generate a routine affection disclaimer', async () => {
   const result = await runDirectAtStage({ base: 'familiar', phase: 'normal',
     userText: '抱一下' });
@@ -7472,7 +7510,13 @@ export function relationshipExpressionView(state) {
 }
 ```
 
-Do not pass stage thresholds, transition graph labels, or “allowed affection” flags to expression. Preserve user-edited stage-persona text and revision; compile ordinary wording such as “克制、不太主动” into tone tendencies, and compile only explicitly author-marked non-negotiable settings into author hard constraints. Role-plan operations remain the existing closed domain `create/update/cancel/pause/resume/complete` and `private_message/moment_post/role_schedule`; targets, evidence, and time validate deterministically. Life attempt creation fixes rollout/release/epoch/checksums/canary slot/input but creates no compare job. The closed life-result schema may optionally carry `publicMomentCandidate` only as the exact `{version:'public-moment-candidate-v1',visibility:'public',summary}` object; summary uses the same native-string/trimmed/1–280 limit as Task 18. `commitLifePlanningResultInternal()` revalidates that object from the authoritative result inside its immediate transaction and calls a private trusted life-plan row writer. No generic `putLifePlanInternal`, chat adjustment, import/restore, caller flag, comparison result, failed/shadow draft, or retry-wait attempt can set or preserve the reserved key. Exact replay returns the same result; changed marker/checksum conflicts; close/reopen recomputes the episode checksum and reserved object. Authoritative result commit creates the compare job in the same transaction. Failed authority creates no episode/marker/compare job; active/canary failure routes to the controller. Chat life adjustments and visible wording must agree.
+Do not pass stage thresholds, transition graph labels, or “allowed affection” flags to expression. Preserve user-edited stage-persona text and revision; compile ordinary wording such as “克制、不太主动” into tone tendencies, and compile only explicitly author-marked non-negotiable settings into author hard constraints. Role-plan operations remain the existing closed domain `create/update/cancel/pause/resume/complete` and `private_message/moment_post/role_schedule`; targets, evidence, and time validate deterministically. Life attempt creation fixes rollout/release/epoch/checksums/canary slot/input but creates no compare job.
+
+Life planning is future-plan synthesis from a store-pinned snapshot, not fact extraction from model-cited evidence. Its immutable evidence authority is exactly `roleId + planningWindowStartAt + planningWindowEndAt + lifeBasisChecksum + contextChecksum + inputChecksum`, closed by `requestBaseKey = contentHash({roleId,startAt,endAt,lifeBasisChecksum,contextChecksum})`; rollout/release/epoch/canary pins remain the separate execution authority and are revalidated as already required by Task 11. `inputSnapshot.roleId/planningWindow` must equal the attempt columns even if a forged row synchronously changes and rehashes its snapshot/checksums/request key, `contentHash(inputSnapshot)` must equal `inputChecksum`, and every `current/recent/upcoming` episode reference must have belonged to that role and matched a real store row/checksum when the attempt was created. This uses the existing attempt columns and does not add a caller-writable evidence field or a schema version. The closed authoritative result top level is exactly `{episodes}`; `evidence/evidenceIds/sourceMessageIds/usedFactIds/lifeBasisChecksum/contextChecksum/inputChecksum/requestBaseKey` and every other top-level key are rejected before any write. The model cannot authorize its own result by echoing checksums or IDs.
+
+On first commit, `commitLifePlanningResultInternal()` revalidates the full input tuple and current pre-write life basis inside the controller's immediate transaction before writing anything. A stale basis cancels/fails through the controller exactly once and writes no episode/marker/compare job. On terminal exact replay, the newly committed output episodes necessarily change the current basis, so replay must not recompute that pre-write value. It instead revalidates the persisted input/context/request commitments, the caller result checksum, the stored authoritative result checksum, every output episode's role/source planning ID/semantic checksum, the optional reserved object, the compare job and attempt terminal state; only then may it return the original result. Missing or changed projection is an authority conflict with zero writes.
+
+Only an episode payload nested inside that closed result may optionally carry `publicMomentCandidate`, and only as the exact `{version:'public-moment-candidate-v1',visibility:'public',summary}` object; summary uses the same native-string/trimmed/1–280 limit as Task 18. `commitLifePlanningResultInternal()` revalidates that object from the authoritative result inside its immediate transaction and calls a private trusted life-plan row writer. No generic `putLifePlanInternal`, chat adjustment, import/restore, caller flag, comparison result, failed/shadow draft, or retry-wait attempt can set or preserve the reserved key. Exact replay returns the same result; changed marker/checksum conflicts; close/reopen recomputes the episode checksum and reserved object. Authoritative result commit creates the compare job in the same transaction. Failed authority creates no episode/marker/compare job; active/canary failure routes to the controller. Chat life adjustments and visible wording must agree.
 
 - [ ] **Step 4: Run all plan/life/stage tests green**
 
