@@ -32,7 +32,14 @@ const messages = [
     recipientId: 'user',
     content: '我答应你，明天晚上会回来找你',
     sentAt: 1784400001000,
-    origin: 'codex'
+    origin: 'codex',
+    committed: true,
+    resultAuthorityVersion: 1,
+    turnState: 'committed',
+    authorityGroupId: 'grp_turn_1',
+    authorityLineageKey: 'lin_turn_1',
+    authorityCommitChecksum: 'a'.repeat(64),
+    deliveryState: 'confirmed'
   },
   {
     messageId: 'msg_3',
@@ -51,7 +58,7 @@ function promiseCandidate(overrides = {}) {
   return {
     factId: 'fact_promise_1',
     characterId: 'yuqi',
-    type: 'commitment',
+    type: 'formal_commitment',
     subjectId: 'yuqi',
     predicate: 'promised_to_return',
     object: { when: 'tomorrow_evening' },
@@ -144,7 +151,7 @@ test('same words by both sides remain attributable by message ID', () => {
   assert.equal(result.fact.exactQuotes[0].messageId, 'msg_yuqi_same');
 });
 
-test('commits verified facts and keeps ambiguous facts provisional', () => withStore(store => {
+test('legacy explicit facts keep their provisional compatibility path', () => withStore(store => {
   const ambiguous = promiseCandidate({
     factId: 'fact_reported',
     sourceMessageIds: ['msg_3'],
@@ -153,6 +160,7 @@ test('commits verified facts and keeps ambiguous facts provisional', () => withS
   const result = commitVerifiedFacts(store, [promiseCandidate(), ambiguous], messages);
   assert.equal(result.verified.length, 1);
   assert.equal(result.provisional.length, 1);
+  assert.equal(result.rejected.length, 0);
   assert.equal(store.listFacts('yuqi', { status: 'verified' }).length, 1);
   assert.equal(store.listFacts('yuqi', { status: 'provisional' }).length, 1);
 }));
