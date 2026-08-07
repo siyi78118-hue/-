@@ -5931,6 +5931,7 @@ git commit -m "feat: integrate v3 release execution and recovery"
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
 - Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
+- Create: `android/app/src/androidTest/java/com/siyi/al/AlExecutionPluginTest.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionServicePolicy.java`
 - Create: `android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java`
@@ -7585,6 +7586,29 @@ treat relay mailbox acceptance as proof that PC applied a clear.
   message/action projection. Drafts, supervisor judgments, inferred motives,
   mood/current stance, comparison output, automatic skip, and uncommitted or
   withdrawn messages are never fact evidence.
+- Candidate evidence is closed and typed: message evidence uses unique
+  `sourceMessageIds` plus exact `{messageId,speakerId,text}` quotes; action
+  evidence uses unique `sourceActionIds` plus exact
+  `{actionId,kind,targetKey,targetRevision,payload,actionChecksum}` projections
+  from the same scoped canonical loader. At least one source class is non-empty.
+  Unknown, missing, duplicate, changed, undelivered, or cross-group evidence
+  rejects the entire candidate; actions are never disguised as chat quotes.
+- Both source-ID arrays contain native non-empty strings. Quotes have exactly
+  three keys and form a complete one-to-one mapping to `sourceMessageIds`;
+  actions have exactly the six listed keys and map one-to-one to
+  `sourceActionIds`. Candidate identity/object/confidence/commitment fields use
+  their closed native types. `origin`, `evidenceSource`, and
+  `authorityContractVersion` are store-owned fixed/recomputed values, not model
+  assertions.
+- `user_fact` requires user-message evidence. Any character-message or visible
+  action evidence requires the group delivery receipt to be confirmed.
+  `action_only` may support an otherwise valid event/life/commitment candidate,
+  but never a `user_fact`; `skip` supplies no evidence of either class.
+- Every evidence member is type-checked even when messages and actions are
+  mixed. An action-only/mixed life fact accepts only a same-role canonical
+  `life_episode_*` action. A formal-commitment action must carry a native
+  `promisedBy` proof equal to the candidate; a valid message cannot mask an
+  unrelated action.
 - A `stable_preference` requires two independent committed sources. Repeats of
   one source ID, original/retry projections of one lineage, or two facts derived
   from one visible group count once.
@@ -7636,9 +7660,10 @@ with 20B only while its six files remain exclusively owned.
 - `control_kind` is closed to `conversation_clear_v1` and `role_delete_v1`;
   `state` is closed to `waiting`, `pending`, `relay_accepted`, `applied`, and
   `quarantined`. Conversation clears are unique by `(character_id,clear_epoch)`.
-- `LifecycleControlCodec` freezes both closed semantic shapes in 20B. For
+- `LifecycleControlCodec` freezes both closed wire shapes in 20B. For
   `role_delete_v1`, `clear_epoch/cleared_through_sequence` are null and
-  `semantic_json` contains the exact Task 20E backup receipt tuple; 20B does not
+  `semantic_json` contains the exact nine-key Task 20E role-delete wire object,
+  including its exact backup receipt tuple; 20B does not
   yet delete a role, but proves the schema can persist/reopen that future
   control without another migration or lossy parser.
 - `MIGRATION_12_13` only creates this table/index set. It preserves every v12
@@ -7649,25 +7674,62 @@ with 20B only while its six files remain exclusively owned.
 
 **Local clear transaction:**
 - Replace the caller-authoritative plugin API with
-  `createConversationClear(characterId, expectedCursorRevision)`. Room, not
+  `createConversationClear(characterId, expectedCursorChecksum)`. Room, not
   JavaScript, reads the current cursor, sets `clearEpoch=current+1`, fixes
   `clearedThroughSequence=current.localSequence`, derives `controlId` and the
   canonical checksum, and inserts the waiting outbox row.
+- `getConversationCursor` returns `cursorChecksum`, the SHA-256 of exact canonical
+  JSON `{contract:'conversation-cursor-clear-v1',characterId,`
+  `nativeCompletedTurnId,nativeCompletedGroupId,nativeCompletedSequence,`
+  `uiAppliedTurnId,uiAppliedGroupId,uiAppliedSequence,localSequence,`
+  `clearedThroughSequence,clearEpoch,clearedAt,chatOpen,updatedAt}`. Nullable IDs
+  remain explicit JSON `null`; integers and the boolean retain native types.
+  Room recomputes this projection inside the transaction; timestamps are never
+  used as a revision/CAS by themselves.
 - The plugin has no `peerId` argument. It loads `BridgeConfig.deviceId` from
   `AlSecretStore` and passes that store-owned binding to
   `RoomExecutionStore.createConversationClear(...)`; absence of a configured
   peer fails before mutation. Room verifies every affected v3 checkpoint is
   pinned to the same device. JavaScript cannot choose, replace, or omit it.
+  `saveBridgeConfig` must refresh this native binding in the same process;
+  generating or changing a device ID never requires an app restart before a
+  clear can use the new store-owned peer.
 - `controlId` is `ctl_` plus the lowercase SHA-256 of canonical
   `{contract:'android-lifecycle-control-id-v1',controlKind,characterId,peerId,`
-  `clearEpoch,clearedThroughSequence,requestedAt}`. `semantic_json` stores the
-  exact closed wire semantic object and `semantic_checksum` is its UTF-8
-  canonical JSON hash. Both are revalidated on every list/claim/complete/reopen.
+  `clearEpoch,clearedThroughSequence,requestedAt,inputCursorChecksum}`.
+  `semantic_json` stores the exact eleven-key clear wire object including its
+  `checksum`. The wire `checksum` hashes the other ten keys;
+  `semantic_checksum` separately hashes the complete persisted eleven-key object
+  (including `checksum`). Both layers are revalidated on every
+  list/claim/complete/reopen; no later task reconstructs wire from an internal
+  seven-key DTO.
 - In the same `runInTransaction`, validate every affected Task 13C v12
   checkpoint/checksum, replace it with the exact
   `android-bridge-redacted-checkpoint-v1` tombstone, clear reply/raw/action and
-  semantic failure/result/route/relay fields through the boundary, advance
-  native and UI cursor to the clear boundary, and then insert the control.
+  semantic failure/result/route/relay fields through the boundary, advance the
+  dedicated `clearedThroughSequence/clearEpoch` boundary, and then insert the
+  control. Do not invent a turn/group identity at the clear boundary and do not
+  rewrite `nativeCompleted*` or `uiApplied*`: those remain factual delivery/UI
+  watermarks and may legitimately lag the independent clear boundary.
+- The affected snapshot is closed inside that transaction: every existing
+  legacy conversation turn for the role is included because historical v0/v2
+  rows may have no trustworthy visibility sequence; every v3 turn must have a
+  safe sequence and is included iff `inputVisibilitySequence <= boundary`.
+  Legacy rows are redacted/cancelled without inventing a v3 checkpoint. A v3 row
+  missing its sequence or active checkpoint, a one-sided checkpoint/checksum
+  pair, or a corrupt/duplicate remote-member set is an authority conflict that
+  rolls the whole clear back. A historical attempt that provably failed before
+  acquiring any remote member may retain a null/null checkpoint pair, but its
+  attempt semantics are still scrubbed in the transaction. This preflight enumerates every v3
+  row for the role before filtering by the boundary, so a null, negative, or
+  non-safe sequence cannot disappear from the affected-set query; a valid row
+  above the boundary remains byte-for-byte unchanged.
+- For each affected v3 lineage, the same transaction closes the existing
+  `ConversationAuthorityEntity`: state becomes `CANCELLED`, revision advances
+  exactly once from the validated member set, latest member identity is retained,
+  and visible group/checksum/payload version/origin/disposition are cleared.
+  Missing, foreign, duplicate, partially affected, or already-divergent lineage
+  authority rejects before any tombstone is committed.
 - The tombstone retains the existing Task 13C root key set and checkpoint
   version so old rows need no invented migration. It sets
   `normalizedEnvelope=null`; keeps the existing immutable identity/pin fields
@@ -7681,14 +7743,25 @@ with 20B only while its six files remain exclusively owned.
   `normalizedEnvelope`; all non-redacted parsers still require the original
   object. It contains no envelope, text, items, actions, failure detail, route,
   relay ID, fallback packet, or model memory.
+- Per-turn diagnostics and change-event projections inside the affected set may
+  retain their cursor/row identity only after being rewritten to one closed
+  non-semantic redacted form. Old error detail, visible group/disposition,
+  route, model text, or arbitrary payload keys are cleared in the same
+  transaction and participate in every write-boundary rollback assertion.
 - `BridgeReceiptCheckpoint` returns no receipt and `BridgeInput` refuses to
   execute this tombstone without reading `normalizedEnvelope`; tests cover both
   v1 remote and v2 local checkpoint roots.
 - Any missing member, duplicate member, bad checksum, mixed epoch, stale cursor
-  revision, or injected write-boundary failure rolls the transaction back to a
+  checksum, or injected write-boundary failure rolls the transaction back to a
   deep-equal pre-state. A tombstoned attempt cannot execute, fallback, notify,
   emit a completed event, enter the UI inbox, or publish a group receipt.
-- Exact plugin replay returns the same control. A changed replay or two
+- `inputCursorChecksum` is included in the closed clear semantic/wire object.
+  Exact plugin replay returns the same control when the supplied checksum equals
+  that retained pre-clear checksum. If the current epoch's control is not yet
+  `applied`, a page reload presenting the current post-clear checksum also
+  resumes that row instead of allocating another epoch. Only an applied current
+  control permits a later, intentional clear to allocate `clearEpoch+1`.
+  A changed replay or two
   concurrent clear calls yields one row/one epoch; no caller can skip epochs or
   choose an arbitrary sequence.
 
@@ -7704,16 +7777,69 @@ cd android
 adb devices -l
 .\gradlew.bat connectedDebugAndroidTest --tests "*ConversationCursorStoreTest" --tests "*RoomExecutionStoreTest" --no-daemon --no-problems-report
 cd ..
-git add android/app/src/main/java/com/siyi/al/execution/LifecycleControl.java android/app/src/main/java/com/siyi/al/execution/LifecycleControlCodec.java android/app/src/main/java/com/siyi/al/execution/db/LifecycleControlEntity.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/BridgeReceiptCheckpoint.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/test/java/com/siyi/al/execution/LifecycleControlCodecTest.java android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java
+git add android/app/src/main/java/com/siyi/al/execution/LifecycleControl.java android/app/src/main/java/com/siyi/al/execution/LifecycleControlCodec.java android/app/src/main/java/com/siyi/al/execution/db/LifecycleControlEntity.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/BridgeReceiptCheckpoint.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/androidTest/java/com/siyi/al/AlExecutionPluginTest.java android/app/src/test/java/com/siyi/al/execution/LifecycleControlCodecTest.java android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java
 git commit -m "feat: persist Android lifecycle clear authority"
 ```
 
 No attached device is an explicit blocked release gate, not a skipped pass.
 Stop after this commit for independent review.
 
+#### Task 20C0: Make relay expiry refresh real before Android depends on it
+
+**Files:**
+- Modify: `yuqi-relay-worker.js`
+- Modify: `tests/yuqi-relay-worker.test.mjs`
+
+The existing relay `INSERT OR IGNORE` cannot refresh a live envelope: duplicate
+`message_id` or `(device_id,idempotency_key)` returns idempotent without changing
+`expires_at`. Android must not claim durable seven-day refresh until this server
+contract exists.
+
+- Add authenticated `POST /bridge/refresh-expiry`. Its body is closed to exact
+  native strings `deviceId,messageId,idempotencyKey,direction` plus a native safe
+  integer `expiresAt`. It updates only one existing, non-expired row whose full
+  identity matches; ciphertext, nonce, byte count, created time and direction
+  never change. The new expiry must be greater than the persisted expiry and no
+  later than `now+7 days`. Exact/lower replay returns the persisted expiry
+  idempotently; foreign, changed, missing or already-expired identity is zero
+  write and fail-closed.
+- Before normal enqueue, both D1 and memory stores may remove an expired row only
+  when the complete persisted identity simultaneously equals
+  `deviceId,messageId,idempotencyKey,direction` and `expiresAt<=now`. A conflict
+  on only the message ID or only the device/idempotency identity is foreign or
+  changed input: it is zero-write and fail-closed. The expired-row removal,
+  removal of its live identity index, and replacement insert are one store-owned
+  atomic operation: D1 uses one transactional `batch`/equivalent rollback unit;
+  the memory store performs the envelope/index mutation in one synchronous
+  critical section. A failed insert restores neither a half-deleted row nor a
+  stale identity index. Normal ACK likewise removes both the live envelope and
+  its live identity index in memory, matching D1's row-deletion semantics; the
+  index is not a second durable receipt store. The same semantic control can then
+  be encrypted again and inserted with the same stable IDs after ACK or a long
+  offline expiry. A still-live row is never replaced with new ciphertext.
+- Tests cover live refresh, exact replay, changed/foreign identity, expiry bounds,
+  ciphertext immutability, memory/D1-equivalent behavior, ACK index cleanup,
+  transaction/batch rollback, partial-identity conflict, and expired exact
+  re-enqueue. Commit this slice before 20C Android code consumes the endpoint.
+
+```powershell
+node --test tests/yuqi-relay-worker.test.mjs
+git add yuqi-relay-worker.js tests/yuqi-relay-worker.test.mjs
+git commit -m "feat: refresh lifecycle relay expiry safely"
+```
+
+Stop after this commit for independent review.
+
 #### Task 20C: Durable Android LAN/cloud control delivery and PC-applied ACK
 
 **Files:**
+- Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/LifecycleControl.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/LifecycleControlCodec.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
+- Create: `android/app/src/main/java/com/siyi/al/execution/LifecycleControlSender.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionWakeWorker.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
@@ -7724,6 +7850,9 @@ Stop after this commit for independent review.
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
 - Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionServicePolicyTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/LifecycleControlCodecTest.java`
+- Create: `android/app/src/test/java/com/siyi/al/execution/LifecycleControlSenderTest.java`
+- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
 
 **Delivery contract:**
 - The one Room row is the outbox authority. `waiting|expired pending` is claimed
@@ -7746,23 +7875,59 @@ Stop after this commit for independent review.
   claim, and process death after relay acceptance all resume from Room. Two
   workers may cause external at-least-once calls after a lease expiry but use
   the same relay idempotency key; one live lease produces one HTTP call.
+- Store APIs, not BridgeClient, own list/claim/complete/quarantine. Every CAS
+  matches `controlId,semanticChecksum,expectedState,leaseId,leaseAttempt,leasedAt`
+  and the complete persisted relay snapshot when present:
+  `relayMessageId,relayExpiresAt`. The relay ID is recomputed and must equal the
+  stable formula before mutation; a LAN row must keep both relay fields null.
+  A stale lease completion updates zero rows and may only return an
+  already-equivalent terminal outcome; it cannot overwrite a replacement lease,
+  applied row or quarantine.
+- The state shape is exact. `waiting` has attempt zero and no lease/relay/applied
+  fields. `pending` has one active lease; it has no relay identity for a first
+  send, or retains the exact relay ID/old expiry pair for a refresh/re-enqueue.
+  `relay_accepted` has the stable relay ID/expiry and no active lease. `applied`
+  has a positive applied time and no active lease; a cloud row may retain its
+  relay ID/expiry pair as audit proof while a LAN row retains neither.
+  `quarantined` has no lease/relay/applied fields. Pending lease expiry is
+  `leasedAt+60_000`; relay refresh becomes claimable 24 hours before expiry.
+- IDs are recomputed on every claim/complete/reopen, not stored as caller truth:
+  `leaseId='ctllease_'+sha256(canonical {contract:'android-lifecycle-lease-id-v1',`
+  `controlId,semanticChecksum,leaseAttempt})`,
+  `relayMessageId='ctlmsg_'+sha256(canonical {contract:'android-lifecycle-relay-message-id-v1',`
+  `controlId,semanticChecksum})`, and
+  `idempotencyKey='ctlidem_'+sha256(canonical {contract:'android-lifecycle-idempotency-v1',`
+  `controlId,semanticChecksum})`. Lease attempt/time/randomness never changes
+  relay identity.
 - `BridgeRouter` routes controls separately from turns. It never creates a
   `TurnSubmission`, fallback, mirror reply, notification, or completed event.
+- `LifecycleControlSender`/an independent `ControlRouteClient` owns this route;
+  it never calls the turn endpoint. A newly created clear calls
+  `AlExecutionService.requestRun()` after the Room commit so delivery does not
+  wait for an unrelated turn or periodic scan.
+- 20C registers only `conversation_clear_v1`. The shared Room lease/CAS machinery
+  validates `role_delete_v1`, but that kind remains `waiting` and zero-write/
+  zero-send until Task 20E registers its route. Missing route is not quarantine.
 
-- [ ] **20C.1: Add red two-worker, lease-expiry, LAN, cloud, ACK, restart, and
-  turn-path-isolation tests.**
+- [ ] **20C.1: Add red two-Room-connection, exact lease, expiry/refresh, LAN,
+  cloud, ACK, restart, role-delete-hold, and turn-path-isolation tests.**
 - [ ] **20C.2: Wire one shared Room-backed sender into Runtime/service/wake.**
 - [ ] **20C.3: Run focused JVM tests and commit.**
 
 ```powershell
 cd android
 .\gradlew.bat testDebugUnitTest --tests "*BridgeClientTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*ExecutionServicePolicyTest" --no-daemon --no-problems-report
+.\gradlew.bat assembleDebugAndroidTest --no-daemon --no-problems-report
+adb devices -l
+.\gradlew.bat connectedDebugAndroidTest --tests "*RoomExecutionStoreTest" --no-daemon --no-problems-report
 cd ..
-git add android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java android/app/src/main/java/com/siyi/al/execution/AlExecutionWakeWorker.java android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeClient.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java android/app/src/test/java/com/siyi/al/execution/ExecutionServicePolicyTest.java
+git add android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/LifecycleControl.java android/app/src/main/java/com/siyi/al/execution/LifecycleControlCodec.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/LifecycleControlSender.java android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java android/app/src/main/java/com/siyi/al/execution/AlExecutionWakeWorker.java android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeClient.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java android/app/src/test/java/com/siyi/al/execution/ExecutionServicePolicyTest.java android/app/src/test/java/com/siyi/al/execution/LifecycleControlCodecTest.java android/app/src/test/java/com/siyi/al/execution/LifecycleControlSenderTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java
 git commit -m "feat: deliver lifecycle controls durably"
 ```
 
 Stop after this commit for independent review.
+
+No attached device is an explicit blocked release gate, not a skipped pass.
 
 #### Task 20D: PC clear transaction, relay retraction, and application ACK
 
@@ -7782,13 +7947,21 @@ Stop after this commit for independent review.
 - Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Modify: `tests/yuqi-relay-worker.test.mjs`
 
+Task 20D consumes, and must not weaken or reimplement, the committed Task 20C0
+relay contract: `/bridge/refresh-expiry`, exact full-identity refresh, atomic
+expired cleanup/reinsert, ACK live-index cleanup, and live ciphertext/nonce
+immutability remain regression gates. A refresh accepted by the relay followed
+by a failed Android Room CAS is recovered after restart by the same stable relay
+identity; exact/lower refresh returns the persisted expiry and the subsequent
+exact Room CAS applies that returned value without creating a second envelope.
+
 **Wire and authority contract:**
 - `validateConversationClearControl(raw)` accepts exactly
   `protocolVersion,type,controlVersion,controlId,roleId,peerId,clearEpoch,`
-  `clearedThroughSequence,requestedAt,checksum`; values are native types,
+  `clearedThroughSequence,requestedAt,inputCursorChecksum,checksum`; values are native types,
   `protocolVersion=3`, `type=CONVERSATION_CLEAR`, and
   `controlVersion=conversation_clear_v1`. `checksum` is the UTF-8 canonical JSON
-  hash of the other nine fields. Unknown/missing/coerced values reject before
+  hash of the other ten fields. Unknown/missing/coerced values reject before
   store, reconcile, diagnostic, relay ACK, or application ACK.
 - Both ingress paths validate/authenticate first and call
   `applyConversationClearInternal(control)` in one `BEGIN IMMEDIATE`. Cloud ACK
@@ -7907,7 +8080,9 @@ Stop after this commit for independent review.
   `receiptVersion,receiptId,roleId,manifestChecksum,snapshotSha256,`
   `logicalChecksum,createdAt,receiptChecksum`; its version is
   `yuqi-backup-receipt-v1` and both checksums are recomputed. `controlId` is
-  `ctl_` plus the SHA-256 of the canonical ID basis including
+  `ctl_` plus the SHA-256 of exact canonical
+  `{contract:'android-lifecycle-control-id-v1',controlKind:'role_delete_v1',`
+  `roleId,peerId,requestedAt,backupReceiptChecksum}` where the final field equals
   `backupReceipt.receiptChecksum`; the outer checksum covers the complete closed
   object except itself. `/v3/controls/role-delete` and cloud use the same
   validator and the same atomic relay ACK-with-response contract as clear.

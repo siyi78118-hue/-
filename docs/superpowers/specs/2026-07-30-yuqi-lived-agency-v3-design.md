@@ -454,6 +454,18 @@ acceptanceCriteria
 - 重复证据支持的稳定偏好；
 - 事实冲突和取代关系。
 
+证据输入同时闭合 message 与 action：message 使用原生字符串 ID 数组以及与其一一
+对应、无额外字段的 `{messageId,speakerId,text}` 原句；action 使用原生字符串 ID 数组
+以及 action ID、kind、target、revision、payload 与 checksum 的完整 canonical
+projection。两者不得互相伪装，未知/缺失/重复/类型强转/跨 group 的引用整条候选
+拒绝。候选身份、对象、置信度、承诺双方和 store-owned provenance 也必须按闭合原生
+类型验证，模型不能自行填写或改写 `origin/evidenceSource/authorityContractVersion`。
+`user_fact` 只能由 user message 支撑；character message 或 visible action 只有在同 group
+delivery receipt confirmed 后才可作为已成立证据。`action_only` 只在动作自身能直接证明
+候选时开门：生活事实仅接受同角色的 `life_episode_*` 权威动作；正式承诺动作必须携带
+与 `promisedBy` 精确一致的闭合行动者证明。混合 message/action 仍逐项执行同一约束，
+不能用一个合法 message 掩护无关 action；`skip` 没有任何事实证据。
+
 不得写入潜台词、当前心情、临时立场、推测用户性格、监督评价、未送达草稿和模型推导的硬边界。
 
 ## 11. 生活系统
@@ -1156,7 +1168,8 @@ CREATE UNIQUE INDEX idx_lifecycle_clear_epoch
 
 Row-state shape is also closed: `waiting` has no lease/relay/expiry/applied time;
 `pending` has a positive attempt, nonempty lease and positive leased time, may
-retain the stable relay ID/old expiry during a refresh, and has no applied time;
+retain the stable relay ID/old expiry pair during a refresh or post-expiry
+re-enqueue, and has no applied time;
 `relay_accepted` has a stable relay ID, positive expiry, and no active lease or
 applied time; `applied` has positive applied time, no active lease, and nullable
 relay ID/expiry (both null for LAN, both present for cloud); `quarantined` has no
@@ -1165,20 +1178,71 @@ and completion. Exact lease CAS is required for `pending→relay_accepted`; exac
 control/checksum CAS is required for LAN `waiting|pending→applied` and cloud
 `relay_accepted→applied`.
 
+Every lifecycle mutation is store-owned and matches the full persisted snapshot:
+`controlId,semanticChecksum,state,leaseId,leaseAttempt,leasedAt` plus the old
+`relayMessageId,relayExpiresAt` pair when present. The relay ID is recomputed
+from the stable formula before every cloud mutation; LAN controls require both
+relay fields to remain null. `waiting` has attempt zero. Pending lease expiry is
+exactly `leasedAt+60_000`; `relay_accepted` becomes refreshable 24 hours before
+its relay expiry. A stale lease may observe an already-equivalent terminal row,
+but cannot write it. Relay and lease identities are frozen as:
+
+```text
+leaseId = 'ctllease_' + SHA256(canonical {
+  contract:'android-lifecycle-lease-id-v1',
+  controlId,semanticChecksum,leaseAttempt
+})
+relayMessageId = 'ctlmsg_' + SHA256(canonical {
+  contract:'android-lifecycle-relay-message-id-v1',
+  controlId,semanticChecksum
+})
+idempotencyKey = 'ctlidem_' + SHA256(canonical {
+  contract:'android-lifecycle-idempotency-v1',
+  controlId,semanticChecksum
+})
+```
+
+The relay provides authenticated `POST /bridge/refresh-expiry` before Android
+depends on refresh. It changes only `expires_at` for one live exact
+device/message/idempotency/direction tuple and never replaces ciphertext/nonce.
+Exact or lower expiry is idempotent; changed/foreign/expired identity is zero
+write. Normal enqueue may remove an expired row only when the complete
+`deviceId,messageId,idempotencyKey,direction` identity matches and
+`expiresAt<=now`; a partial identity conflict is zero-write. Expired cleanup of
+the envelope and its live identity index plus replacement insertion is one
+atomic store operation (one D1 transactional batch/equivalent rollback unit or
+one memory-store critical section). ACK removes both live envelope and live
+identity index in memory, matching D1 row deletion; this index is not a durable
+receipt store. A phone that was offline beyond expiry may re-encrypt and reinsert
+the same semantic control with the same stable IDs. A still-live row is
+immutable. A relay refresh that succeeds before the Android Room CAS is safe to
+repeat after restart: the same relay identity returns the persisted expiry, and
+only an exact Room snapshot CAS may record it.
+
 `MIGRATION_12_13` 只能建表和索引。它不能从历史 cursor 猜测“用户曾发出清除”，不能
 改写历史 checkpoint，也不能伪造已经送达或已应用的控制。filled v12 的所有旧字段、
 UTF-8 文本、authority、receipt、cursor 与 checkpoint 必须逐字保留。
 
 插件不再相信 JavaScript 给出的 peer/epoch/sequence。`AlExecutionPlugin` 从
 `AlSecretStore.loadBridgeConfig().deviceId` 读取 store-owned peer；插件方法本身没有
-peer 参数，未配置 bridge 时在任何 Room 写入前失败。调用
-`createConversationClear(characterId, expectedCursorRevision)` 后，Room 在一个外层
+peer 参数，未配置 bridge 时在任何 Room 写入前失败。`getConversationCursor` 返回
+`cursorChecksum`：它 hash exact canonical JSON
+`{contract:'conversation-cursor-clear-v1',characterId,nativeCompletedTurnId,`
+`nativeCompletedGroupId,nativeCompletedSequence,uiAppliedTurnId,uiAppliedGroupId,`
+`uiAppliedSequence,localSequence,clearedThroughSequence,clearEpoch,clearedAt,`
+`chatOpen,updatedAt}`；nullable ID 保留 JSON `null`，整数与 boolean 不做字符串
+强转。调用
+`createConversationClear(characterId, expectedCursorChecksum)` 后，Room 在一个外层
 transaction 中读取 cursor，固定
 `clearEpoch=current.clearEpoch+1`、
 `clearedThroughSequence=current.localSequence`，从闭合 payload 派生 control ID 与
 checksum，并完成以下全部写入：
 
-1. CAS cursor revision，阻止两个页面/重载同时选择同一旧边界；
+`saveBridgeConfig` 在同一进程生成或变更 device ID 后，必须立即刷新这个 native
+store-owned binding；清理不能要求重启 App 才看到新 peer，也不能继续使用旧/null peer。
+
+1. 在事务内重算并比较完整 cursor checksum，阻止两个页面/重载同时选择同一旧边界；
+   updatedAt 不能单独充当 revision；
 2. 验证 boundary 内每个 Task 13C bridge checkpoint 的 envelope/checksum/member set；
 3. 将每个 checkpoint 替换为 `android-bridge-redacted-checkpoint-v1`。它保持 Task 13C
    v1/v2 root 的原 key set/version 和 immutable identity/pin/envelope checksum，但令
@@ -1190,14 +1254,34 @@ checksum，并完成以下全部写入：
    必须在读取 envelope/fallback 之前分支；非 redacted 路径继续要求原对象。禁止保留
    normalized envelope、正文、item/action、failure detail、route、relay ID、模型 memory
    或任意 extra key；
-4. 清除 boundary 内 reply/raw/action/working projection，推进 native/UI clear cursor；
-5. 插入 `lifecycle_controls(state='waiting')`。`controlId` 为 `ctl_` 加
+4. 清除 boundary 内 reply/raw/action/working projection；逐 turn diagnostic 与
+   change-event 只可保留 cursor/row identity，并改写为同一个闭合无语义 redacted
+   projection，不能残留 error detail、group/disposition、route、正文或任意旧 payload。
+   只推进独立的
+   `clearedThroughSequence/clearEpoch`；不得为 clear boundary 伪造 turn/group identity，
+   也不得改写仍代表真实投递/UI 落地水位的 `nativeCompleted*` / `uiApplied*`；
+5. 同事务闭合受影响集合：历史 v0/v2 可能没有可信 sequence，因此角色当前已有的
+   legacy conversation turn 全部纳入并做 legacy redaction/cancel，不伪造 v3 checkpoint；
+   v3 必须有 safe `inputVisibilitySequence`，且仅纳入 `<= boundary` 的完整 lineage。
+   preflight 必须先枚举该角色所有 v3 行再做 boundary filter；null、负数或超 JS-safe
+   sequence 不能因 SQL `WHERE` 排除而被静默遗留，合法 `> boundary` 行保持不变。
+   每条受影响 v3 lineage 的 `ConversationAuthorityEntity` 从已验证 member set 精确推进
+   一次到 `CANCELLED`，保留 latest identity，清空 group/checksum/payload version/origin/
+   disposition；缺失、foreign、重复或只清半条 lineage 全部回滚；
+6. 插入 `lifecycle_controls(state='waiting')`。`semantic_json` 直接保存完整十一键
+   clear wire（包括其 `checksum`），而不是另存一份七键内部 DTO。wire `checksum`
+   hash 其余十键，row `semantic_checksum` 再 hash 包含 `checksum` 的完整十一键对象。
+   clear wire 额外闭合包含
+   `inputCursorChecksum`。`controlId` 为 `ctl_` 加
    `android-lifecycle-control-id-v1` canonical basis 的 SHA-256；`semantic_json` 保存
    完整闭合 wire semantic，checksum 每次 list/claim/complete/reopen 都重算。
 
 任一步失败全部回滚。tombstoned attempt 在所有恢复、fallback、notification、completed
 event、UI inbox、receipt 入口都被稳定识别为 `REDACTED`，不能因为旧 engine、旧 mirror
 或 WebView 重载恢复语义。Task 20 不复用普通 `memoryResult` 解析器生成 tombstone。
+同一 plugin 请求在 commit 后丢失响应时，以 row 中保留的 pre-clear checksum 返回原
+control；若 control 尚未 `applied`，page reload 携带当前 post-clear checksum也只恢复
+该 row。仅 current control 已 applied 时，新的 current checksum 才能分配下一 epoch。
 
 控制 outbox 使用 lease：`waiting` 或过期 `pending` 由 CAS 取得唯一 lease；未过期
 `pending` 不被其他 worker 选中。lease ID 可随 attempt 改变，但 relay message ID 与
@@ -1209,6 +1293,11 @@ authenticated 200 可直接证明 PC apply；云 relay 只把本地状态推进�
 之后。relay 接受 phone→PC ciphertext 绝不能被记成 PC apply。
 `relay_accepted` 在其持久 expiry 进入 refresh window 后重新取得 lease，复用相同
 message ID/idempotency key 并把 expiry 延长到不超过七天；没有 applied ACK 就不会停止。
+控制发送由独立 `LifecycleControlSender`/`ControlRouteClient` 完成，绝不构造
+`TurnSubmission`、调用 turn endpoint、fallback/mirror、通知或 completed event。
+创建 clear 的 Room transaction 成功后立即唤醒 service。20C 只注册
+`conversation_clear_v1`；`role_delete_v1` 在 20E 注册 route 前保持 waiting 且不被
+误隔离。
 
 云端的 applied ACK 不依赖一个未定义的 PC 内存队列。已提交的
 `conversation_clear_controls` row 是 apply proof，尚未 ACK 的 phone→PC ciphertext
@@ -1224,11 +1313,11 @@ envelope 保持可 poll。该 endpoint 只处理 ciphertext/nonce/idempotency/ex
 
 ```text
 protocolVersion, type, controlVersion, controlId, roleId, peerId,
-clearEpoch, clearedThroughSequence, requestedAt, checksum
+clearEpoch, clearedThroughSequence, requestedAt, inputCursorChecksum, checksum
 ```
 
 其中 `protocolVersion=3`、`type='CONVERSATION_CLEAR'`、
-`controlVersion='conversation_clear_v1'`，checksum 为其余九字段 canonical JSON 的
+`controlVersion='conversation_clear_v1'`，checksum 为其余十字段 canonical JSON 的
 UTF-8 SHA-256。native number/string 类型必须原生正确，不能使用 `String()`、`Number()`
 或 `opt*` 强转。LAN/cloud 都必须在 reconcile、store lookup、diagnostic 和 relay ACK
 以前验证同一 schema；Cloud ACK phone→PC ciphertext 仅在
@@ -1269,12 +1358,22 @@ wire key 精确为
 `backupReceipt` 精确包含
 `receiptVersion,receiptId,roleId,manifestChecksum,snapshotSha256,logicalChecksum,`
 `createdAt,receiptChecksum`，其 version 为 `yuqi-backup-receipt-v1`。Android
+`controlId` 必须精确等于 `ctl_` 加以下 canonical basis 的 UTF-8 SHA-256：
+
+```text
+{contract:'android-lifecycle-control-id-v1',
+ controlKind:'role_delete_v1',
+ roleId,peerId,requestedAt,
+ backupReceiptChecksum:backupReceipt.receiptChecksum}
+```
+
+不得把整个 receipt 的序列化字节、caller 提供的别名或 row 时间戳混入该 basis。
 `semantic_json` 保存完整对象。PC 只有在
 `sync_log(entity_type='backup_receipt',entity_id=receiptId,operation='create')` 存在唯一
 且 canonical payload/checksum 完全一致时才允许删除；该 audit 与
 `role_deletion` audit 都不能被普通聊天清除删除。
 Web 只有在 `POST /v3/backups/yuqi` 返回 receipt 后才调用 native
-`createRoleDelete(characterId,expectedCursorRevision,backupReceipt)`；peer 仍由
+`createRoleDelete(characterId,expectedCursorChecksum,backupReceipt)`；peer 仍由
 `AlSecretStore` 注入，不是 Web 参数。该 native transaction 先验证并把完整 receipt
 写入 `semantic_json`，再删除/tombstone 本地角色行，同时保留 lifecycle control。
 PC/backup endpoint 不可达、receipt 未持久或 cursor CAS 失败时，本地角色不删除。
