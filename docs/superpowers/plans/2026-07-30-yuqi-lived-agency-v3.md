@@ -7558,247 +7558,437 @@ git commit -m "feat: integrate plans life and formal relationship stages"
 
 ### Task 20: Constrain Memory Consolidation and Complete Data Lifecycle
 
+Task 20 is a five-gate lifecycle migration, not one UI delete handler. Each gate
+must be committed and independently reviewed before the next begins. Task 13C's
+Room-v12 checkpoint contract is the immutable input baseline. PC remains schema
+v14 because `conversation_clear_controls` already exists; Android intentionally
+migrates Room v12 to v13 because it has no durable lifecycle-control authority.
+Do not implement a second redaction path, reuse `change_events` as an outbox, or
+treat relay mailbox acceptance as proof that PC applied a clear.
+
+#### Task 20A: Evidence-only memory consolidation
+
 **Files:**
 - Modify: `yuqi-runtime/src/consolidation-worker.mjs`
 - Modify: `yuqi-runtime/src/evidence-memory.mjs`
 - Modify: `yuqi-runtime/src/retrieval.mjs`
+- Modify: `yuqi-runtime/test/consolidation-worker.test.mjs`
+- Modify: `yuqi-runtime/test/evidence-memory.test.mjs`
+- Create: `yuqi-runtime/test/memory-authority-v3.test.mjs`
+
+**Closed contract:**
+- `validateConsolidationCandidate(candidate, evidence)` accepts only
+  `user_fact`, `delivered_yuqi_life_fact`, `formal_commitment`,
+  `retrievable_event`, `stable_preference`, `fact_conflict`, and
+  `fact_supersession`.
+- Every positive candidate resolves to a committed, non-redacted canonical
+  message/action projection. Drafts, supervisor judgments, inferred motives,
+  mood/current stance, comparison output, automatic skip, and uncommitted or
+  withdrawn messages are never fact evidence.
+- A `stable_preference` requires two independent committed sources. Repeats of
+  one source ID, original/retry projections of one lineage, or two facts derived
+  from one visible group count once.
+- Retrieval excludes redacted, withdrawn, archived, suppressed, superseded, and
+  expired evidence before ranking; the model never sees a filtered record's
+  text in debug metadata or annotations.
+
+- [ ] **20A.1: Add red allowlist, source-authority, retry-deduplication, and
+  retrieval lifecycle tests.**
+- [ ] **20A.2: Implement one validator and one retrieval lifecycle predicate;
+  route the worker and direct evidence writes through them.**
+- [ ] **20A.3: Run the focused gate and commit.**
+
+```powershell
+node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/memory-authority-v3.test.mjs
+git add yuqi-runtime/src/consolidation-worker.mjs yuqi-runtime/src/evidence-memory.mjs yuqi-runtime/src/retrieval.mjs yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/memory-authority-v3.test.mjs
+git commit -m "fix: constrain cognition memory to delivered evidence"
+```
+
+Stop after this commit for independent review. This slice may run in parallel
+with 20B only while its six files remain exclusively owned.
+
+#### Task 20B: Room-v13 lifecycle authority and atomic local clear
+
+**Files:**
+- Create: `android/app/src/main/java/com/siyi/al/execution/LifecycleControl.java`
+- Create: `android/app/src/main/java/com/siyi/al/execution/LifecycleControlCodec.java`
+- Create: `android/app/src/main/java/com/siyi/al/execution/db/LifecycleControlEntity.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/BridgeReceiptCheckpoint.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java`
+- Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
+- Create: `android/app/src/test/java/com/siyi/al/execution/LifecycleControlCodecTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java`
+- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java`
+- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
+
+**Room-v13 schema:**
+- `lifecycle_controls` has one row per immutable `control_id` and columns
+  `control_kind`, `character_id`, `peer_id`, `clear_epoch`,
+  `cleared_through_sequence`, `requested_at`, `semantic_json`,
+  `semantic_checksum`, `state`,
+  `lease_id`, `lease_attempt`, `leased_at`, `relay_message_id`, `applied_at`,
+  `relay_expires_at`, and `updated_at`.
+- `control_kind` is closed to `conversation_clear_v1` and `role_delete_v1`;
+  `state` is closed to `waiting`, `pending`, `relay_accepted`, `applied`, and
+  `quarantined`. Conversation clears are unique by `(character_id,clear_epoch)`.
+- `LifecycleControlCodec` freezes both closed semantic shapes in 20B. For
+  `role_delete_v1`, `clear_epoch/cleared_through_sequence` are null and
+  `semantic_json` contains the exact Task 20E backup receipt tuple; 20B does not
+  yet delete a role, but proves the schema can persist/reopen that future
+  control without another migration or lossy parser.
+- `MIGRATION_12_13` only creates this table/index set. It preserves every v12
+  turn, attempt, cursor, authority, reply, raw message, memory, plan, and UTF-8
+  field byte-for-byte and never fabricates controls or checkpoint tombstones.
+  Fresh v13, populated 12→13, 10→11→12→13, restart, migration fault rollback,
+  and `>13` refusal are release gates.
+
+**Local clear transaction:**
+- Replace the caller-authoritative plugin API with
+  `createConversationClear(characterId, expectedCursorRevision)`. Room, not
+  JavaScript, reads the current cursor, sets `clearEpoch=current+1`, fixes
+  `clearedThroughSequence=current.localSequence`, derives `controlId` and the
+  canonical checksum, and inserts the waiting outbox row.
+- The plugin has no `peerId` argument. It loads `BridgeConfig.deviceId` from
+  `AlSecretStore` and passes that store-owned binding to
+  `RoomExecutionStore.createConversationClear(...)`; absence of a configured
+  peer fails before mutation. Room verifies every affected v3 checkpoint is
+  pinned to the same device. JavaScript cannot choose, replace, or omit it.
+- `controlId` is `ctl_` plus the lowercase SHA-256 of canonical
+  `{contract:'android-lifecycle-control-id-v1',controlKind,characterId,peerId,`
+  `clearEpoch,clearedThroughSequence,requestedAt}`. `semantic_json` stores the
+  exact closed wire semantic object and `semantic_checksum` is its UTF-8
+  canonical JSON hash. Both are revalidated on every list/claim/complete/reopen.
+- In the same `runInTransaction`, validate every affected Task 13C v12
+  checkpoint/checksum, replace it with the exact
+  `android-bridge-redacted-checkpoint-v1` tombstone, clear reply/raw/action and
+  semantic failure/result/route/relay fields through the boundary, advance
+  native and UI cursor to the clear boundary, and then insert the control.
+- The tombstone retains the existing Task 13C root key set and checkpoint
+  version so old rows need no invented migration. It sets
+  `normalizedEnvelope=null`; keeps the existing immutable identity/pin fields
+  and original `envelopeChecksum`; and writes redaction time only at
+  `outcome.redactedAt`. The outcome is exactly
+  `{type:'redacted',route:null,relayMessageId:null,failure:null,`
+  `result:{contract:'conversation-clear-redacted-v1',controlId,clearEpoch,`
+  `clearedThroughSequence},redactedAt}`. A local-v2 root additionally retains
+  its existing `fallbackExecution` and `journalSyncSeq` keys but sets the former
+  to null and the latter to 0. Redacted validators branch before parsing
+  `normalizedEnvelope`; all non-redacted parsers still require the original
+  object. It contains no envelope, text, items, actions, failure detail, route,
+  relay ID, fallback packet, or model memory.
+- `BridgeReceiptCheckpoint` returns no receipt and `BridgeInput` refuses to
+  execute this tombstone without reading `normalizedEnvelope`; tests cover both
+  v1 remote and v2 local checkpoint roots.
+- Any missing member, duplicate member, bad checksum, mixed epoch, stale cursor
+  revision, or injected write-boundary failure rolls the transaction back to a
+  deep-equal pre-state. A tombstoned attempt cannot execute, fallback, notify,
+  emit a completed event, enter the UI inbox, or publish a group receipt.
+- Exact plugin replay returns the same control. A changed replay or two
+  concurrent clear calls yields one row/one epoch; no caller can skip epochs or
+  choose an arbitrary sequence.
+
+- [ ] **20B.1: Add migration and full write-boundary red tests.**
+- [ ] **20B.2: Add the entity/codec/DAO and one store-owned clear transaction.**
+- [ ] **20B.3: Run JVM tests and build the instrumentation APK; run connected
+  migration/Room tests when a device is attached.**
+
+```powershell
+cd android
+.\gradlew.bat testDebugUnitTest --tests "*LifecycleControlCodecTest" --tests "*BridgeReceiptCheckpointTest" --tests "*BridgeInputTest" --no-daemon --no-problems-report
+.\gradlew.bat assembleDebugAndroidTest --no-daemon --no-problems-report
+adb devices -l
+.\gradlew.bat connectedDebugAndroidTest --tests "*ConversationCursorStoreTest" --tests "*RoomExecutionStoreTest" --no-daemon --no-problems-report
+cd ..
+git add android/app/src/main/java/com/siyi/al/execution/LifecycleControl.java android/app/src/main/java/com/siyi/al/execution/LifecycleControlCodec.java android/app/src/main/java/com/siyi/al/execution/db/LifecycleControlEntity.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/ExecutionStore.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/BridgeReceiptCheckpoint.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeInput.java android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/test/java/com/siyi/al/execution/LifecycleControlCodecTest.java android/app/src/test/java/com/siyi/al/execution/BridgeReceiptCheckpointTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeInputTest.java android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java
+git commit -m "feat: persist Android lifecycle clear authority"
+```
+
+No attached device is an explicit blocked release gate, not a skipped pass.
+Stop after this commit for independent review.
+
+#### Task 20C: Durable Android LAN/cloud control delivery and PC-applied ACK
+
+**Files:**
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionWakeWorker.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeClient.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionServicePolicyTest.java`
+
+**Delivery contract:**
+- The one Room row is the outbox authority. `waiting|expired pending` is claimed
+  by exact lease CAS; an unexpired pending row is not selectable. The relay ID
+  and idempotency key are stable for the semantic checksum across retries; a
+  new lease attempt does not generate a new relay identity.
+- `relay_accepted` remains selectable for refresh when its persisted
+  `relayExpiresAt` reaches the retry window. It takes a new exact lease, reuses
+  the same relay ID/idempotency key, and requests a fresh expiry of at most seven
+  days. Thus relay acceptance does not silently become permanent success, and a
+  control continues until a validated PC-applied ACK moves it to `applied`.
+- LAN calls `POST /v3/controls/conversation-clear` and marks `applied` only after
+  the authenticated 200 response carries the exact control ID/checksum/epoch.
+- Cloud sends encrypted `CONVERSATION_CLEAR` through `phone_to_pc`. Relay
+  acceptance advances only to `relay_accepted`; it is not PC application proof.
+  PC later emits encrypted `CONVERSATION_CLEAR_APPLIED` to the same peer. Android
+  validates the exact tuple and only then marks the row `applied` and ACKs that
+  relay envelope. Duplicate/late ACKs are idempotent; changed ACKs quarantine.
+- Boot, wake, service recovery, LAN timeout, cloud timeout, process death after
+  claim, and process death after relay acceptance all resume from Room. Two
+  workers may cause external at-least-once calls after a lease expiry but use
+  the same relay idempotency key; one live lease produces one HTTP call.
+- `BridgeRouter` routes controls separately from turns. It never creates a
+  `TurnSubmission`, fallback, mirror reply, notification, or completed event.
+
+- [ ] **20C.1: Add red two-worker, lease-expiry, LAN, cloud, ACK, restart, and
+  turn-path-isolation tests.**
+- [ ] **20C.2: Wire one shared Room-backed sender into Runtime/service/wake.**
+- [ ] **20C.3: Run focused JVM tests and commit.**
+
+```powershell
+cd android
+.\gradlew.bat testDebugUnitTest --tests "*BridgeClientTest" --tests "*BridgeRouterTest" --tests "*RoomBridgeMirrorTest" --tests "*ExecutionServicePolicyTest" --no-daemon --no-problems-report
+cd ..
+git add android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java android/app/src/main/java/com/siyi/al/execution/AlExecutionWakeWorker.java android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeClient.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java android/app/src/main/java/com/siyi/al/execution/bridge/RoomBridgeMirror.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java android/app/src/test/java/com/siyi/al/execution/bridge/RoomBridgeMirrorTest.java android/app/src/test/java/com/siyi/al/execution/ExecutionServicePolicyTest.java
+git commit -m "feat: deliver lifecycle controls durably"
+```
+
+Stop after this commit for independent review.
+
+#### Task 20D: PC clear transaction, relay retraction, and application ACK
+
+**Files:**
+- Modify: `yuqi-runtime/src/protocol.mjs`
 - Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/local-server.mjs`
 - Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
 - Modify: `yuqi-runtime/src/result-outbox.mjs`
+- Modify: `yuqi-relay-worker.js`
+- Modify: `yuqi-runtime/test/protocol-store.test.mjs`
+- Create: `yuqi-runtime/test/agency-data-lifecycle.test.mjs`
+- Modify: `yuqi-runtime/test/local-server.test.mjs`
+- Modify: `yuqi-runtime/test/cloud-relay-pump.test.mjs`
+- Modify: `yuqi-runtime/test/result-outbox.test.mjs`
+- Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
+- Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
+- Modify: `tests/yuqi-relay-worker.test.mjs`
+
+**Wire and authority contract:**
+- `validateConversationClearControl(raw)` accepts exactly
+  `protocolVersion,type,controlVersion,controlId,roleId,peerId,clearEpoch,`
+  `clearedThroughSequence,requestedAt,checksum`; values are native types,
+  `protocolVersion=3`, `type=CONVERSATION_CLEAR`, and
+  `controlVersion=conversation_clear_v1`. `checksum` is the UTF-8 canonical JSON
+  hash of the other nine fields. Unknown/missing/coerced values reject before
+  store, reconcile, diagnostic, relay ACK, or application ACK.
+- Both ingress paths validate/authenticate first and call
+  `applyConversationClearInternal(control)` in one `BEGIN IMMEDIATE`. Cloud ACK
+  of the phone→PC ciphertext occurs only after commit. The applied ACK is a
+  separate closed `CONVERSATION_CLEAR_APPLIED` envelope containing only control
+  ID/checksum/role/peer/epoch/through/appliedAt and its own checksum.
+- PC does not need a second local ACK-outbox table. The already persisted
+  `conversation_clear_controls` row proves application, while the unacknowledged
+  phone→PC relay ciphertext is the durable retry trigger. CloudRelayPump calls
+  relay `POST /bridge/ack-with-response`, which atomically deletes that exact
+  incoming message and inserts the encrypted PC→phone applied envelope with a
+  deterministic message ID/idempotency key. The D1 implementation uses one
+  transactional batch; the memory store performs the same operation without an
+  observable intermediate state. If PC crashes after its DB commit but before
+  this relay transaction, the incoming ciphertext remains, is polled again, and
+  exact control replay produces the same applied response. If the relay
+  transaction commits but its HTTP response is lost, the incoming message is
+  gone and the applied response remains pollable by Android.
+- `/bridge/ack-with-response` is a closed ciphertext-only relay wrapper. It
+  accepts exactly the authenticated `deviceId`, one incoming `messageId`, and
+  one normal encrypted response envelope; it repeats the existing
+  device/direction/idempotency/size/expiry checks and rejects plaintext fields.
+  It never decrypts or derives lifecycle semantics.
+- Exact `controlId` replay and exact `(roleId,clearEpoch)` replay return the
+  original applied record. Changed checksum, changed boundary, epoch skipping,
+  lower through sequence, foreign peer, or concurrent changed control is zero
+  write. The store boundary is
+  `turn.input_clear_epoch < clearEpoch` OR
+  `(turn.input_clear_epoch = clearEpoch AND input_visibility_sequence <= clearedThroughSequence)`.
+
+**Single clear transaction order:**
+1. Load and CAS the private-chat lane. Freeze the target lineage/group/delivery
+   set and reject any corrupt live authority before mutation.
+2. Cancel open canonical lineages and stop recovery. For committed lineages,
+   invoke the Task 10F redaction implementation, never a UI-specific variant.
+   Keep `rollout_key`, parent counts/commitments, deterministic child IDs and
+   original hashes; erase semantic envelope/message/item/action/manifest/state,
+   old session, linked annotation/diagnostic/sync payload and executable jobs.
+3. Scrub Yuqi authority-v0 turns and exclude them from legacy recovery/outbox.
+   They cannot remain as a hidden plaintext compatibility copy.
+4. Before any delivery payload is cleared, persist exact delivery count and
+   commitment. Waiting rows with no relay ID become `redacted`; mailboxed or
+   confirmed rows become `redaction_pending` with their original deterministic
+   relay ID. No new delivery may be added to a redacted group.
+5. Archive/expire evidence, stance and user-derived constraints whose sole
+   authority is cleared; rebuild current cognitive state without a redacted
+   group. Preserve author/system constraints and global release definitions.
+6. Advance lane clear cursor, insert `conversation_clear_controls`, append only
+   the closed redaction audit, run the scoped redacted lineage/group validator,
+   and commit. An injected failure after every write boundary rolls all of it
+   back.
+
+**Retraction worker:**
+- `ResultOutbox.flushRetractionsOnce(limit)` runs before normal sends and only
+  selects `redaction_pending`. It uses the retained relay ID to call idempotent
+  `/bridge/ack`; missing/already-removed ciphertext counts as success. It marks
+  `redacted` only by exact state/identity CAS. Network failure remains durable;
+  authority failure is quarantined and surfaced, never sent through legacy.
+- A stale outbox snapshot revalidates after concurrent clear/redaction. It may
+  not reconstruct payload, send a redacted result, append semantic diagnostic,
+  or alter Task 20's redaction lifecycle.
+
+- [ ] **20D.1: Add red validator, transaction fault matrix, legacy scrub,
+  retraction, duplicate/control-race, relay atomic exchange, and LAN/cloud ACK
+  tests.**
+- [ ] **20D.2: Implement the one store transaction and one retraction worker.**
+- [ ] **20D.3: Run focused and reopen gates, then commit.**
+
+```powershell
+node --test yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/local-server.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-relay-worker.test.mjs
+git add yuqi-runtime/src/protocol.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/src/result-outbox.mjs yuqi-relay-worker.js yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/local-server.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-relay-worker.test.mjs
+git commit -m "feat: apply distributed conversation clear authority"
+```
+
+Stop after this commit for independent review.
+
+#### Task 20E: Web integration, role deletion, and verified backup/restore
+
+**Files:**
 - Modify: `tavern-app/index.html`
+- Modify: `tests/yuqi-ui-contract.test.mjs`
+- Modify: `tests/test-basic.test.mjs`
+- Modify: `scripts/backup-yuqi-memory.mjs`
+- Modify: `scripts/audit-yuqi-memory.mjs`
+- Create: `scripts/restore-yuqi-memory.mjs`
+- Create: `tests/yuqi-memory-lifecycle.test.mjs`
 - Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
-- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java`
-- Modify: `yuqi-runtime/test/consolidation-worker.test.mjs`
-- Modify: `yuqi-runtime/test/evidence-memory.test.mjs`
-- Create: `yuqi-runtime/test/agency-data-lifecycle.test.mjs`
-- Modify: `yuqi-runtime/test/cloud-relay-pump.test.mjs`
-- Modify: `yuqi-runtime/test/result-outbox.test.mjs`
-- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java`
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
-- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java`
-- Modify: `scripts/backup-yuqi-memory.mjs`
-- Modify: `scripts/audit-yuqi-memory.mjs`
+- Modify: `yuqi-runtime/src/protocol.mjs`
+- Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/src/local-server.mjs`
+- Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
+- Modify: `yuqi-runtime/test/agency-data-lifecycle.test.mjs`
 
-**Interfaces:**
-- Consumes: committed canonical terminal results and source evidence only; an
-  automatic skip is completion evidence but never message/fact evidence.
-- Produces: evidence-only facts/preferences/events; explicit new-table behavior for backup/export/import/clear/delete; monotonic encrypted `conversation_clear_v1` control; durable PC relay retraction; Android late-result suppression; transactional tombstoning of Task 13C Room-v12 bridge-authority checkpoints.
+**Web clear:**
+- In the Android app, `clearCurrentChat()` first awaits the native Room-v13
+  transaction and receives its immutable control. Only then may it remove Web
+  messages/moments/view caches. If the plugin call suspends, fails, or the page
+  reloads, the UI remains intact or visibly pending; it never reports success
+  from localStorage alone.
+- In a non-native desktop browser, the equivalent authenticated PC control must
+  commit before local deletion. Clearing all roles serializes per-role controls;
+  it does not launch overlapping `Promise.all` calls against one authority DB.
+- Event/poll/reload reconciliation checks Room clear epoch before DOM insert.
+  Old results are relay-ACKed but never rendered, notified, or marked UI-applied.
 
-- [ ] **Step 1: Write red memory allowlist and lifecycle tests**
+**Role deletion:**
+- `role_delete_v1` uses the same Android lifecycle outbox/lease/PC-applied ACK
+  path, but has a distinct closed checksum schema and no sequence boundary.
+- Its wire object has exactly `protocolVersion,type,controlVersion,controlId,`
+  `roleId,peerId,requestedAt,backupReceipt,checksum`, with native types,
+  `protocolVersion=3`, `type=ROLE_DELETE`, and
+  `controlVersion=role_delete_v1`. `backupReceipt` has exactly
+  `receiptVersion,receiptId,roleId,manifestChecksum,snapshotSha256,`
+  `logicalChecksum,createdAt,receiptChecksum`; its version is
+  `yuqi-backup-receipt-v1` and both checksums are recomputed. `controlId` is
+  `ctl_` plus the SHA-256 of the canonical ID basis including
+  `backupReceipt.receiptChecksum`; the outer checksum covers the complete closed
+  object except itself. `/v3/controls/role-delete` and cloud use the same
+  validator and the same atomic relay ACK-with-response contract as clear.
+- `LifecycleControlEntity.semantic_json` persists this full object. No backup
+  receipt may exist only in a Web promise, request body, or log message.
+- The operation is allowed only after a verified backup receipt is attached.
+  PC creates that receipt by appending exactly one
+  `sync_log(entity_type='backup_receipt',entity_id=receiptId,operation='create')`
+  whose canonical payload/checksum equals the receipt. It survives role deletion
+  and exact replay. Role-delete validation joins this immutable audit and
+  rejects a missing, changed, foreign-role, duplicate, or postdated receipt
+  before any role row changes.
+  Android tombstones and removes role-scoped Room data in one transaction while
+  retaining the non-semantic control audit. PC verifies the backup receipt,
+  redacts/retracts all role chat first, then deletes role-scoped constraint,
+  stance, state, memory, plan, lane, rollout and authority rows in FK-safe order;
+  global releases remain. A closed `role_deletion` sync audit keyed by controlId
+  is the idempotency proof after role rows are gone. Exact replay returns the
+  proof; changed replay conflicts. Neither endpoint physically deletes audit or
+  control proof.
 
-```js
-test('consolidation rejects inferred motives mood stances and unsent drafts', () => {
-  for (const candidate of [
-    memory('user_trait', '用户其实害怕被抛弃'),
-    memory('mood', '虞栖现在心软了'),
-    memory('current_stance', '今天不收第二次红包'),
-    memory('draft', '未送达的一句话'),
-    memory('supervisor', '这轮像真人')
-  ]) assert.throws(() => validateConsolidationCandidate(candidate), /not persistable/);
-});
+**Backup/restore:**
+- Role deletion first calls authenticated LAN
+  `POST /v3/backups/yuqi` with the closed request
+  `{protocolVersion:3,type:'YUQI_BACKUP_REQUEST',requestVersion:'yuqi-backup-request-v1',`
+  `roleId,peerId,requestedAt,checksum}`. The endpoint invokes the exported
+  `createVerifiedYuqiBackup()` implementation, appends the immutable
+  `backup_receipt` audit, and returns that receipt. No Room/Web role row is
+  deleted before this response is durably stored in `semantic_json`. If PC is
+  offline or backup verification fails, role deletion is blocked; Task 20 does
+  not pretend an unverified phone-only export protects the PC authority DB.
+- Backup uses a transactionally consistent SQLite snapshot and writes the exact
+  closed `yuqi-backup-manifest-v1` object with keys
+  `manifestVersion,createdAt,schemaVersion,snapshotSha256,logicalChecksum,`
+  `tableRowCounts,roleLifecycleHeads,redactedInvariantSummary,manifestChecksum`.
+  Object keys and each role/table array are canonically sorted; the final field
+  is SHA-256 over the other fields. This is a content-addressed integrity
+  manifest, not a claim of public-key authenticity: no unspecified signing key
+  or algorithm may be invented. Trust comes from the local protected database,
+  authenticated bridge, and the immutable `backup_receipt` audit. It includes
+  Room schema/cursor/control-head export metadata when initiated from the app.
+  Plain “VACUUM INTO succeeded” is not acceptance.
+- `restore-yuqi-memory.mjs` restores only into a clone, runs schema migration and
+  full restart invariants there, and atomically replaces the target only after
+  all checks pass and an explicit backup of the current target exists. Import
+  never row-merges two independent authority histories. Newer local release
+  registration is preserved only by an explicit validated overlay step; the
+  default is full-snapshot restore.
+- Clear→backup→restore→restart must remain cleared. A pre-clear backup restored
+  deliberately must restore its pre-clear history and its older clear cursor as
+  one coherent snapshot; it may not merge with newer relay/control state.
 
-test('committed facts commitments events and repeated preferences are allowed with evidence', () => {
-  for (const candidate of validMemoryCandidates()) {
-    assert.doesNotThrow(() => validateConsolidationCandidate(candidate));
-    assert.ok(candidate.sourceMessageIds.length || candidate.sourceActionIds.length);
-  }
-});
-
-test('clear operations preserve or redact canonical v13 authority explicitly', () => {
-  const matrix = lifecycleMatrix();
-  assert.deepEqual(matrix.clearAutomaticTasks.deletedTables.sort(),
-    ['automatic_tasks', 'comparison_jobs'].sort());
-  assert.equal(matrix.clearAutomaticTasks.preservedTables.includes('stance_records'), true);
-  assert.equal(matrix.clearChat.deletedTables.includes('interaction_lanes'), true);
-  assert.equal(matrix.clearChat.revisionActions.constraint_records,
-    'archive_when_sole_message_evidence_is_deleted');
-  assert.equal(matrix.clearChat.actions.visible_result_items,
-    'tombstone_payload_retain_identity_and_checksum');
-  assert.equal(matrix.clearChat.actions.visible_result_groups, 'retain_redacted_header');
-  assert.equal(matrix.clearChat.actions.visible_result_group_commitments,
-    'retain_item_action_counts_and_ordered_identity_checksum');
-  assert.equal(matrix.clearChat.actions.visible_result_manifests,
-    'clear_semantic_json_retain_checksum_and_redaction_time');
-  assert.equal(matrix.clearChat.actions.visible_result_actions,
-    'clear_payload_retain_identity_and_checksum');
-  assert.equal(matrix.clearChat.actions.visible_commit_receipts, 'retain_checksum_only');
-  assert.equal(matrix.clearChat.actions.cloud_deliveries,
-    'redact_all_states_and_clear_payload');
-  assert.equal(matrix.clearChat.actions.turns,
-    'tombstone_envelope_and_clear_working_fields_for_all_lineage_attempts');
-  assert.equal(matrix.clearChat.actions.turn_authority_lineages,
-    'cancel_open_and_mark_all_redacted');
-  assert.equal(matrix.clearChat.actions.turn_authority_lineage_commitments,
-    'retain_attempt_count_and_ordered_attempt_checksum');
-  assert.equal(matrix.clearChat.actions.current_user_batches,
-    'retain_batch_count_and_ordered_identity_checksum');
-  assert.equal(matrix.clearChat.actions.current_user_batch_items,
-    'tombstone_message_json_retain_identity_order_and_checksum');
-  assert.equal(matrix.clearChat.actions.messages, 'clear_user_and_character_content');
-  assert.equal(matrix.clearChat.actions.legacy_yuqi_turns,
-    'scrub_and_exclude_from_recovery_and_outbox');
-  assert.equal(matrix.clearChat.actions.redaction_delivery_commitments,
-    'freeze_pre_clear_delivery_set_before_payload_clear');
-  assert.equal(matrix.clearChat.actions.android_bridge_authority_checkpoints,
-    'tombstone_semantic_envelope_failure_result_route_and_relay_retain_identity_commitment');
-  assert.deepEqual(matrix.clearChat.rowDeletes.sort(),
-    ['annotations_by_turn', 'diagnostics_by_turn', 'sessions_by_role',
-     'sync_log_by_turn_or_message'].sort());
-  assert.equal(matrix.clearMemory.deletedTables.includes('constraint_records'), false);
-  assert.equal(matrix.deleteRole.deletedTables.includes('constraint_records'), true);
-});
-
-test('late clear control never deletes a post-clear message', async () => {
-  await applyConversationClear(control({
-    controlId: 'clear_3',
-    roleId: 'yuqi',
-    clearEpoch: 3,
-    clearedThroughSequence: 7
-  }));
-  const newer = commitAt({ clearEpoch: 3, inputVisibilitySequence: 8 });
-  assert.equal(store.getVisibleResultManifest(newer.visibleGroupId).redactedAt, null);
-  assert.deepEqual(
-    await applyConversationClear(sameControl('clear_3')),
-    store.getConversationClearControl('clear_3')
-  );
-  assert.throws(() => applyConversationClear(changedSameEpochControl()),
-    /clear control authority conflict/);
-});
-
-test('mailboxed pre-clear group is locally sealed and relay retraction survives restart',
-  async () => {
-    const group = mailboxedGroup({ clearEpoch: 2, inputVisibilitySequence: 7 });
-    failRelayAckOnce();
-    await applyConversationClear(control({ clearEpoch: 3, clearedThroughSequence: 7 }));
-    assert.equal(store.outboxForGroup(group.id)[0].state, 'redaction_pending');
-    assert.equal(store.visibleItemsForGroup(group.id)[0].item, null);
-    await restartedResultOutbox().flushRetractionsOnce(50);
-    assert.equal(store.outboxForGroup(group.id)[0].state, 'redacted');
-  });
-```
-
-- [ ] **Step 2: Run memory/lifecycle tests red**
-
-Run:
+- [ ] **20E.1: Add red native-first UI, plugin suspension/reload, role-delete,
+  closed receipt/audit, backup manifest vectors, corrupt restore, and
+  clear/restore/restart tests.**
+- [ ] **20E.2: Implement Web/native integration, role-delete control, and
+  clone-first restore.**
+- [ ] **20E.3: Run the complete Task 20 gate once and commit.**
 
 ```powershell
-node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs
+node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/memory-authority-v3.test.mjs yuqi-runtime/test/protocol-store.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/local-server.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs yuqi-runtime/test/store-visible-authority-v13.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs tests/yuqi-ui-contract.test.mjs tests/test-basic.test.mjs tests/yuqi-memory-lifecycle.test.mjs
 cd android
-.\gradlew.bat testDebugUnitTest --tests "*BridgeRouterTest" --no-daemon --no-problems-report
-```
-
-Expected: FAIL because v10/v11/v12/v13 records are not yet classified by lifecycle.
-
-- [ ] **Step 3: Implement memory allowlist and explicit lifecycle matrix**
-
-```js
-const PERSISTABLE_MEMORY_TYPES = new Set([
-  'user_fact', 'delivered_yuqi_life_fact', 'formal_commitment',
-  'retrievable_event', 'stable_preference', 'fact_conflict', 'fact_supersession'
-]);
-
-export function validateConsolidationCandidate(candidate) {
-  if (!PERSISTABLE_MEMORY_TYPES.has(candidate.type)) throw new Error('memory type is not persistable');
-  if (!hasAuthoritativeDeliveredEvidence(candidate)) throw new Error('memory lacks delivered evidence');
-  if (candidate.type === 'stable_preference' && independentEvidenceCount(candidate) < 2) {
-    throw new Error('stable preference lacks repeated independent evidence');
-  }
-  return candidate;
-}
-```
-
-Implement and test this table:
-
-| operation | constraints | stances/state | canonical result authority | lanes | releases/rollout | quality/audit |
-|---|---|---|---|---|---|---|
-| backup/export | include | include | include lineage/group/manifest/items/actions/receipt/group-delivery plus all v13 parent counts/commitments | include | include | include |
-| import | merge by immutable ID/revision | replace only if newer valid revision | exact lineage/group/checksum and v13 parent-commitment merge only; recompute imported child sets before acceptance and stop on any mismatch | rebuild safe cursor state | preserve local authority unless explicit full restore | append |
-| clear automatic tasks | preserve | preserve | preserve committed authority; delete only unstarted comparison work | preserve | preserve | preserve |
-| clear chat | preserve system/author; archive user constraints whose sole evidence is deleted | expire evidence-dependent stance and remove chat-derived fast state | atomically freeze delivery count/commitment before redacting every local delivery state and clearing payload; tombstone every lineage attempt envelope/current-batch item; clear turn working fields, user/character messages, annotations, diagnostics, sync payloads, old Codex session, item/action payload and manifest semantic JSON; mark turn/batch/item/action/group/manifest with one redaction time; retain each version-1 turn's non-sensitive `rollout_key`, lineage attempt count/commitment, batch item count/commitment, group item/action counts/commitment, delivery set commitment, deterministic IDs and original audit checksums; redacted group cannot deliver/replay/execute | delete/reinitialize | preserve | preserve |
-| clear memory | preserve system/author and explicit user boundaries | expire memory-dependent stance and rebuild snapshot from persona/stage | preserve | preserve cursor | preserve | preserve |
-| delete Yuqi role | delete role rows | delete | delete role lineages/groups/manifests/items/actions/receipts/deliveries in FK-safe order after backup | delete | keep global release definitions; delete role rollout state | retain redacted audit |
-
-Withdrawn/deleted messages are removed from future retrieval; dependent stance/constraint records become released/archived through a new revision rather than being physically rewritten. Non-Yuqi lifecycle remains unchanged.
-The clear-chat implementation must use the Task 10F transaction order and scoped
-redacted validator before commit. It may not implement a second, weaker
-redaction path in the UI or backup layer.
-For Android Room v12, the same native clear transaction rewrites every affected
-attempt's `bridgeAuthorityCheckpointJson` to the closed Task 13C redacted
-tombstone and CASes its checksum. The tombstone retains only local turn/attempt
-identity, attempt sequence, remote-member identity, lineage/lane/clear-epoch
-commitments, and redaction time. It clears `normalizedEnvelope`, failure text,
-canonical result items/actions, authenticated route, and relay message ID. A
-one-sided or changed checkpoint/checksum aborts the clear before reply/action or
-cursor deletion; no legacy `memoryResult` parser may perform this lifecycle.
-
-The distributed clear flow is fixed:
-
-1. `clearCurrentChat()` first calls native
-   `markConversationCleared(characterId, localSequence, clearEpoch+1)`. Room
-   atomically validates and tombstones affected v12 bridge checkpoints, advances
-   the cursor, clears local reply/action rows through the sequence, and persists
-   one outbound `conversation_clear_v1` control before JavaScript deletes its
-   local chat objects.
-2. `BridgeRouter` sends the same encrypted control through LAN
-   `POST /v3/controls/conversation-clear` or cloud `phone_to_pc`. The control ID
-   and checksum remain stable across retries; each relay enqueue has a fresh
-   expiry no more than seven days away until PC acknowledges it.
-3. `local-server.mjs` and `cloud-relay-pump.mjs` validate the closed control
-   schema, then call one store transaction. Cloud ACK occurs only after that
-   transaction commits.
-4. The store inserts `conversation_clear_controls`, cancels/redacts only turns
-   below the epoch/sequence boundary, applies every Task 10F tombstone and
-   state/stance/evidence/lane/session rule, and creates
-   `redaction_pending` delivery retractions for already-enqueued groups. Before
-   clearing any delivery payload, it freezes the exact pre-clear delivery set in
-   `redaction_delivery_count/commitment`; it preserves and revalidates group,
-   batch, and lineage parent commitments rather than recomputing them from
-   surviving children. It leaves every canonical attempt's `turns.rollout_key`
-   unchanged and revalidates the lineage commitment by projecting that column as
-   `turn_kind`; it never tries to recover kind from the redacted envelope.
-5. `ResultOutbox.flushRetractionsOnce()` runs before normal sends, calls relay
-   `/bridge/ack` with each persisted deterministic message ID, and marks the row
-   `redacted` only after idempotent success. Offline failures remain durable and
-   retry after restart.
-6. Android rejects any late bridge result whose `inputClearEpoch` is older than
-   its cursor before Room reply rows, notification, native-completed event, or
-   WebView rendering. It still ACKs the relay envelope so the ciphertext is
-   removed.
-
-Add separate tests for LAN success, cloud-only success, PC offline then restart,
-duplicate control, same epoch/different checksum, control arriving after a new
-epoch-3/sequence-8 message, relay ACK failure/retry, old result before and after
-the clear control in one poll batch, plugin call suspension, and WebView reload.
-No test may treat “localStorage is empty” as proof that PC/Room/relay copies were
-cleared.
-
-- [ ] **Step 4: Run memory, lifecycle, and backup audit tests green**
-
-Run:
-
-```powershell
-node --test yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs
-cd android
-.\gradlew.bat testDebugUnitTest --tests "*BridgeRouterTest" --no-daemon --no-problems-report
+.\gradlew.bat testDebugUnitTest --no-daemon --no-problems-report
 .\gradlew.bat assembleDebugAndroidTest --no-daemon --no-problems-report
+adb devices -l
+.\gradlew.bat connectedDebugAndroidTest --no-daemon --no-problems-report
 cd ..
+node scripts/backup-yuqi-memory.mjs yuqi-runtime/config.json --verify
 node scripts/audit-yuqi-memory.mjs yuqi-runtime/config.json
+npm.cmd test
+git diff --check
 ```
 
-Expected: PASS; audit reports all v10/v11/v12/v13 tables and all v13 parent
-commitment counts, no dangling group/manifest/receipt/delivery/message
-authority, no redacted manifest/action payload remains retrievable or
-executable, no deleted message evidence remains retrievable, and deletion of
-any retained item/action/batch/attempt/delivery tombstone is detected.
-
-- [ ] **Step 5: Commit**
+Expected: every focused gate and full regression passes; connected Android tests
+pass on a real attached device; no semantic field survives a clear tombstone;
+no cleared evidence is retrievable; every relay retraction and lifecycle control
+survives restart; and backup restore proves both live and redacted authority.
 
 ```powershell
-git add yuqi-runtime/src/consolidation-worker.mjs yuqi-runtime/src/evidence-memory.mjs yuqi-runtime/src/retrieval.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/src/result-outbox.mjs tavern-app/index.html android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/main/java/com/siyi/al/execution/bridge/BridgeRouter.java yuqi-runtime/test/consolidation-worker.test.mjs yuqi-runtime/test/evidence-memory.test.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs yuqi-runtime/test/cloud-relay-pump.test.mjs yuqi-runtime/test/result-outbox.test.mjs android/app/src/test/java/com/siyi/al/execution/bridge/BridgeRouterTest.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java android/app/src/androidTest/java/com/siyi/al/execution/ConversationCursorStoreTest.java scripts/backup-yuqi-memory.mjs scripts/audit-yuqi-memory.mjs
-git commit -m "feat: constrain Yuqi memory and agency lifecycle"
+git add tavern-app/index.html tests/yuqi-ui-contract.test.mjs tests/test-basic.test.mjs scripts/backup-yuqi-memory.mjs scripts/audit-yuqi-memory.mjs scripts/restore-yuqi-memory.mjs tests/yuqi-memory-lifecycle.test.mjs android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java yuqi-runtime/src/protocol.mjs yuqi-runtime/src/store.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/src/cloud-relay-pump.mjs yuqi-runtime/test/agency-data-lifecycle.test.mjs
+git commit -m "feat: complete Yuqi data lifecycle"
 ```
 
 ### Task 21: Separate Protocol Regression From Source-Grounded Human Quality Scenes

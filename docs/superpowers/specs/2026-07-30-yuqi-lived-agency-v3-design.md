@@ -1102,6 +1102,202 @@ input clear epoch 必须等于 lane current epoch；retry 继承 parent 的
 `conversation_clear_controls`。PC 主动 turn 从 lane 固定最新 epoch；旧 wire v2
 在 lane epoch 已非 0 时必须升级/失败，不能用 0 绕过 clear boundary。
 
+#### 13.3.2.1 跨端 clear authority 与 Android Room v13
+
+Task 20 的“清除聊天”不是 Web、本机 Room 和 PC 各自删除一次，而是一条由手机
+先取得本地 authority、PC 后应用、relay 最后撤回的分布式操作。三个事实源固定为：
+
+1. Android Room cursor 决定用户按下清除时的本地边界；
+2. PC `conversation_clear_controls` 与 redacted authority shell 决定电脑侧是否已经
+   应用；
+3. relay message ID/retraction state 只证明远端密文的交付或撤回，不代表任一数据库
+   已经清除。
+
+Android 必须从 Room v12 升到 v13。v12 没有持久 lifecycle outbox，不能在进程重启、
+LAN 超时或云端离线后证明同一 clear 仍会重试。v13 只新增：
+
+```sql
+CREATE TABLE lifecycle_controls (
+  control_id TEXT PRIMARY KEY NOT NULL,
+  control_kind TEXT NOT NULL CHECK(control_kind IN (
+    'conversation_clear_v1', 'role_delete_v1'
+  )),
+  character_id TEXT NOT NULL,
+  peer_id TEXT NOT NULL,
+  clear_epoch INTEGER,
+  cleared_through_sequence INTEGER,
+  requested_at INTEGER NOT NULL,
+  semantic_json TEXT NOT NULL,
+  semantic_checksum TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN (
+    'waiting', 'pending', 'relay_accepted', 'applied', 'quarantined'
+  )),
+  lease_id TEXT,
+  lease_attempt INTEGER NOT NULL DEFAULT 0 CHECK(lease_attempt >= 0),
+  leased_at INTEGER,
+  relay_message_id TEXT,
+  relay_expires_at INTEGER,
+  applied_at INTEGER,
+  updated_at INTEGER NOT NULL,
+  CHECK (
+    (control_kind = 'conversation_clear_v1'
+      AND clear_epoch IS NOT NULL AND clear_epoch > 0
+      AND cleared_through_sequence IS NOT NULL
+      AND cleared_through_sequence >= 0)
+    OR
+    (control_kind = 'role_delete_v1'
+      AND clear_epoch IS NULL AND cleared_through_sequence IS NULL)
+  )
+);
+CREATE UNIQUE INDEX idx_lifecycle_clear_epoch
+  ON lifecycle_controls(character_id, clear_epoch)
+  WHERE control_kind = 'conversation_clear_v1';
+```
+
+Row-state shape is also closed: `waiting` has no lease/relay/expiry/applied time;
+`pending` has a positive attempt, nonempty lease and positive leased time, may
+retain the stable relay ID/old expiry during a refresh, and has no applied time;
+`relay_accepted` has a stable relay ID, positive expiry, and no active lease or
+applied time; `applied` has positive applied time, no active lease, and nullable
+relay ID/expiry (both null for LAN, both present for cloud); `quarantined` has no
+lease/relay/expiry/applied time. Unknown combinations fail Room open, list, claim
+and completion. Exact lease CAS is required for `pending→relay_accepted`; exact
+control/checksum CAS is required for LAN `waiting|pending→applied` and cloud
+`relay_accepted→applied`.
+
+`MIGRATION_12_13` 只能建表和索引。它不能从历史 cursor 猜测“用户曾发出清除”，不能
+改写历史 checkpoint，也不能伪造已经送达或已应用的控制。filled v12 的所有旧字段、
+UTF-8 文本、authority、receipt、cursor 与 checkpoint 必须逐字保留。
+
+插件不再相信 JavaScript 给出的 peer/epoch/sequence。`AlExecutionPlugin` 从
+`AlSecretStore.loadBridgeConfig().deviceId` 读取 store-owned peer；插件方法本身没有
+peer 参数，未配置 bridge 时在任何 Room 写入前失败。调用
+`createConversationClear(characterId, expectedCursorRevision)` 后，Room 在一个外层
+transaction 中读取 cursor，固定
+`clearEpoch=current.clearEpoch+1`、
+`clearedThroughSequence=current.localSequence`，从闭合 payload 派生 control ID 与
+checksum，并完成以下全部写入：
+
+1. CAS cursor revision，阻止两个页面/重载同时选择同一旧边界；
+2. 验证 boundary 内每个 Task 13C bridge checkpoint 的 envelope/checksum/member set；
+3. 将每个 checkpoint 替换为 `android-bridge-redacted-checkpoint-v1`。它保持 Task 13C
+   v1/v2 root 的原 key set/version 和 immutable identity/pin/envelope checksum，但令
+   `normalizedEnvelope=null`；redaction time 只存在于 `outcome.redactedAt`。outcome
+   精确为 `{type:'redacted',route:null,relayMessageId:null,failure:null,`
+   `result:{contract:'conversation-clear-redacted-v1',controlId,clearEpoch,`
+   `clearedThroughSequence},redactedAt}`。本地 v2 root 保留
+   `fallbackExecution/journalSyncSeq` 两个 key，但值分别为 null/0。redacted validator
+   必须在读取 envelope/fallback 之前分支；非 redacted 路径继续要求原对象。禁止保留
+   normalized envelope、正文、item/action、failure detail、route、relay ID、模型 memory
+   或任意 extra key；
+4. 清除 boundary 内 reply/raw/action/working projection，推进 native/UI clear cursor；
+5. 插入 `lifecycle_controls(state='waiting')`。`controlId` 为 `ctl_` 加
+   `android-lifecycle-control-id-v1` canonical basis 的 SHA-256；`semantic_json` 保存
+   完整闭合 wire semantic，checksum 每次 list/claim/complete/reopen 都重算。
+
+任一步失败全部回滚。tombstoned attempt 在所有恢复、fallback、notification、completed
+event、UI inbox、receipt 入口都被稳定识别为 `REDACTED`，不能因为旧 engine、旧 mirror
+或 WebView 重载恢复语义。Task 20 不复用普通 `memoryResult` 解析器生成 tombstone。
+
+控制 outbox 使用 lease：`waiting` 或过期 `pending` 由 CAS 取得唯一 lease；未过期
+`pending` 不被其他 worker 选中。lease ID 可随 attempt 改变，但 relay message ID 与
+idempotency key 只由 `controlId + semanticChecksum` 决定，崩溃重试仍相同。LAN 的
+authenticated 200 可直接证明 PC apply；云 relay 只把本地状态推进到
+`relay_accepted`。PC commit 后必须另发闭合
+`CONVERSATION_CLEAR_APPLIED`，Android 验证 control/role/peer/epoch/through/checksum
+全部相等后才写 `applied`。手机对这个 applied envelope 的 relay ACK 发生在 Room commit
+之后。relay 接受 phone→PC ciphertext 绝不能被记成 PC apply。
+`relay_accepted` 在其持久 expiry 进入 refresh window 后重新取得 lease，复用相同
+message ID/idempotency key 并把 expiry 延长到不超过七天；没有 applied ACK 就不会停止。
+
+云端的 applied ACK 不依赖一个未定义的 PC 内存队列。已提交的
+`conversation_clear_controls` row 是 apply proof，尚未 ACK 的 phone→PC ciphertext
+是重启触发器。PC 使用 relay `POST /bridge/ack-with-response`：relay 在同一原子存储
+操作中删除该 incoming message，并写入一个正常的加密 PC→phone applied envelope。
+D1 实现使用 transactional batch；memory implementation 也不得暴露中间态。PC 在
+DB commit 后、relay 原子交换前崩溃时，incoming 仍会被再次 poll，exact clear replay
+生成同一 response。交换已提交但 HTTP response 丢失时，incoming 已消失而 applied
+envelope 保持可 poll。该 endpoint 只处理 ciphertext/nonce/idempotency/expiry 元数据，
+重复现有私密字段禁令，绝不看到 clear 明文。
+
+`conversation_clear_v1` wire payload 的 key 精确为：
+
+```text
+protocolVersion, type, controlVersion, controlId, roleId, peerId,
+clearEpoch, clearedThroughSequence, requestedAt, checksum
+```
+
+其中 `protocolVersion=3`、`type='CONVERSATION_CLEAR'`、
+`controlVersion='conversation_clear_v1'`，checksum 为其余九字段 canonical JSON 的
+UTF-8 SHA-256。native number/string 类型必须原生正确，不能使用 `String()`、`Number()`
+或 `opt*` 强转。LAN/cloud 都必须在 reconcile、store lookup、diagnostic 和 relay ACK
+以前验证同一 schema；Cloud ACK phone→PC ciphertext 仅在
+`applyConversationClearInternal()` 的 immediate transaction 提交后执行。
+
+PC transaction 必须调用 13.3.2 已定义的 Task 10F redaction 顺序，并把 lane/state/
+stance/evidence/session/legacy-v0 scrub 与 `conversation_clear_controls` 插入放在同一
+transaction。它不能从当前 surviving child 重新“计算”历史 commitment；只能先验证
+原 parent commitment，再保留它。exact control replay 返回原 applied row；同
+control ID 或同 role/epoch 的 changed checksum 零写冲突。边界严格为：
+
+```text
+input_clear_epoch < clearEpoch
+OR (input_clear_epoch = clearEpoch
+    AND input_visibility_sequence <= clearedThroughSequence)
+```
+
+clear transaction 冻结 pre-clear delivery set 后，从未入 relay 的 waiting row可直接
+成为 `redacted`；有稳定 relay ID 的 mailboxed/confirmed row 成为
+`redaction_pending`。`ResultOutbox.flushRetractionsOnce()` 必须先于普通发送，用保留的
+relay ID 执行幂等 ACK，然后 exact CAS 到 `redacted`。网络失败留待重试；stale outbox
+snapshot 在 concurrent redaction 后只能无写停止，不能重建 payload、改成 quarantine、
+写语义 diagnostic 或走 legacy delivery。
+
+#### 13.3.2.2 Web、角色删除与备份恢复
+
+Android 内的 Web `clearCurrentChat()` 先等待上述 Room transaction 成功，再删 Web
+messages/moments/view cache。插件悬挂、事务失败或页面 reload 时，旧 UI 仍保留或明确
+显示 pending；`localStorage` 为空不构成成功证据。非 native 浏览器必须等待 PC 的
+authenticated clear commit。批量清理角色按 role 串行，不能用 `Promise.all` 在同一
+authority DB 上并发选择 epoch。
+
+删除角色使用另一闭合 `role_delete_v1`，但复用 Android `lifecycle_controls` 的 lease、
+LAN/cloud 和 PC-applied ACK。它没有 epoch/sequence，必须携带已验证 backup receipt。
+wire key 精确为
+`protocolVersion,type,controlVersion,controlId,roleId,peerId,requestedAt,`
+`backupReceipt,checksum`；版本/type 分别为 3、`ROLE_DELETE`、`role_delete_v1`。
+`backupReceipt` 精确包含
+`receiptVersion,receiptId,roleId,manifestChecksum,snapshotSha256,logicalChecksum,`
+`createdAt,receiptChecksum`，其 version 为 `yuqi-backup-receipt-v1`。Android
+`semantic_json` 保存完整对象。PC 只有在
+`sync_log(entity_type='backup_receipt',entity_id=receiptId,operation='create')` 存在唯一
+且 canonical payload/checksum 完全一致时才允许删除；该 audit 与
+`role_deletion` audit 都不能被普通聊天清除删除。
+Web 只有在 `POST /v3/backups/yuqi` 返回 receipt 后才调用 native
+`createRoleDelete(characterId,expectedCursorRevision,backupReceipt)`；peer 仍由
+`AlSecretStore` 注入，不是 Web 参数。该 native transaction 先验证并把完整 receipt
+写入 `semantic_json`，再删除/tombstone 本地角色行，同时保留 lifecycle control。
+PC/backup endpoint 不可达、receipt 未持久或 cursor CAS 失败时，本地角色不删除。
+PC 先执行全角色 chat redaction/retraction，再按 FK 安全顺序删除该角色的 constraint、
+stance、state、memory、plan、lane、rollout 和 authority rows；全局 release definitions
+保留。角色行删除后，以 `sync_log(entity_type='role_deletion', entity_id=controlId)` 的
+闭合非语义 audit 作为 exact replay proof；同 control 的 changed payload 冲突。Android
+在一个 transaction 中清空角色 Room 数据但保留 lifecycle audit/control proof。任何
+一端都不能在没有 backup receipt 时开始物理删除。
+
+backup 必须是 transactionally consistent SQLite snapshot，并生成 exact
+`yuqi-backup-manifest-v1`：
+`manifestVersion,createdAt,schemaVersion,snapshotSha256,logicalChecksum,`
+`tableRowCounts,roleLifecycleHeads,redactedInvariantSummary,manifestChecksum`。数组按
+table/role identity 排序，manifestChecksum 是其余字段 canonical JSON 的 SHA-256。
+这是 content-addressed integrity manifest，不声称一个不存在的公钥签名；信任边界是
+本机受保护数据库、authenticated bridge 与上面的 immutable backup receipt audit。
+`VACUUM INTO` 成功本身不是验收。restore 只能先写 clone，对 clone 执行迁移、完整 reopen invariant、
+row count/checksum 和 redaction audit，再备份当前目标并原子替换；禁止把两个独立
+authority history 逐 row merge。clear 后的 snapshot 恢复并重启仍必须保持 cleared；
+用户明确恢复 pre-clear snapshot 时，旧历史与旧 cursor/control state 作为一个一致
+整体恢复，不能与较新的 relay/control rows 拼接。
+
 #### 13.3.3 提交前重新校验
 
 `commitVisibleResult()` 在一个 `BEGIN IMMEDIATE` 事务中检查：
