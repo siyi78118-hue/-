@@ -1305,6 +1305,13 @@ commit 之后。relay 接受 phone→PC ciphertext 绝不能
 被记成 PC apply。
 `relay_accepted` 在其持久 expiry 进入 refresh window 后重新取得 lease，复用相同
 message ID/idempotency key 并把 expiry 延长到不超过七天；没有 applied ACK 就不会停止。
+为关闭“relay 已收、Room 未写时进程死亡”的窗口，clear control 单独使用确定性
+AES-GCM nonce：取 HMAC-SHA-256(encryption key,
+`android-lifecycle-gcm-nonce-v1\n<relayMessageId>`) 前 12 字节。control semantic 与
+relay ID 均被同一不可变 checksum 绑定，因此同 nonce 只会重放同 plaintext；普通
+turn/result 仍使用随机 nonce。首次 enqueue 返回 `idempotent=false` 时持久请求 expiry；
+崩溃重试返回 `idempotent=true` 时不得猜测 relay 的旧 expiry，必须先以同一完整身份
+调用 refresh-expiry，并只把返回值写入 Room。
 控制发送由独立 `LifecycleControlSender`/`ControlRouteClient` 完成，绝不构造
 `TurnSubmission`、调用 turn endpoint、fallback/mirror、通知或 completed event。
 创建 clear 的 Room transaction 成功后立即唤醒 service。20C 只注册
@@ -1320,6 +1327,9 @@ DB commit 后、relay 原子交换前崩溃时，incoming 仍会被再次 poll�
 生成同一 response。交换已提交但 HTTP response 丢失时，incoming 已消失而 applied
 envelope 保持可 poll。该 endpoint 只处理 ciphertext/nonce/idempotency/expiry 元数据，
 重复现有私密字段禁令，绝不看到 clear 明文。
+PC applied-response 的稳定 relay ID 也派生确定性 lifecycle-response nonce，使同一
+incoming clear 被并发或重复处理时产生字节相同的加密 response；普通消息仍保留随机
+nonce。
 
 `conversation_clear_v1` wire payload 的 key 精确为：
 

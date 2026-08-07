@@ -7859,6 +7859,21 @@ Stop after this commit for independent review.
   by exact lease CAS; an unexpired pending row is not selectable. The relay ID
   and idempotency key are stable for the semantic checksum across retries; a
   new lease attempt does not generate a new relay identity.
+- The encrypted clear envelope is stable across the crash window as well.
+  Lifecycle controls alone derive the 12-byte AES-GCM nonce as the first 12
+  bytes of HMAC-SHA-256 using the configured 32-byte encryption key over UTF-8
+  `android-lifecycle-gcm-nonce-v1\n<relayMessageId>`. The immutable
+  `semantic_json`, semantic-bound relay ID and Room reopen validator guarantee
+  that one derived nonce is never used for changed plaintext. Ordinary
+  turn/result traffic keeps its existing random nonces.
+- A successful new `/bridge/enqueue` response is closed to
+  `ok,messageId,idempotent`; when `idempotent=false`, Room persists the expiry
+  it requested. When a crash retry returns `idempotent=true`, that response has
+  no authoritative persisted expiry, so Android must call
+  `/bridge/refresh-expiry` with the same full identity before its Room CAS and
+  persist only the returned expiry. A process death after either network call
+  repeats the same ciphertext/identity and converges through that refresh; it
+  never guesses server expiry.
 - `relay_accepted` remains selectable for refresh when its persisted
   `relayExpiresAt` reaches the retry window. It takes a new exact lease, reuses
   the same relay ID/idempotency key, and requests a fresh expiry of at most seven
@@ -8001,6 +8016,12 @@ exact Room CAS applies that returned value without creating a second envelope.
   exact control replay produces the same applied response. If the relay
   transaction commits but its HTTP response is lost, the incoming message is
   gone and the applied response remains pollable by Android.
+- The applied-response relay message ID/idempotency key and encrypted bytes are
+  deterministic for the committed ten-key applied proof. Its AES-GCM nonce uses
+  the corresponding PC-side lifecycle-response contract plus the stable response
+  relay ID. Thus two concurrent processors of the same still-live incoming
+  ciphertext submit byte-identical response envelopes; normal non-lifecycle
+  relay traffic retains random nonces.
 - `/bridge/ack-with-response` is a closed ciphertext-only relay wrapper. It
   accepts exactly the authenticated `deviceId`, one incoming `messageId`, and
   one normal encrypted response envelope; it repeats the existing
