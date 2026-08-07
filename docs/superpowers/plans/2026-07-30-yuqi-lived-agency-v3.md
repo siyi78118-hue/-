@@ -7865,12 +7865,23 @@ Stop after this commit for independent review.
   days. Thus relay acceptance does not silently become permanent success, and a
   control continues until a validated PC-applied ACK moves it to `applied`.
 - LAN calls `POST /v3/controls/conversation-clear` and marks `applied` only after
-  the authenticated 200 response carries the exact control ID/checksum/epoch.
+  the authenticated 200 response carries the exact closed applied proof defined
+  below.
 - Cloud sends encrypted `CONVERSATION_CLEAR` through `phone_to_pc`. Relay
   acceptance advances only to `relay_accepted`; it is not PC application proof.
-  PC later emits encrypted `CONVERSATION_CLEAR_APPLIED` to the same peer. Android
-  validates the exact tuple and only then marks the row `applied` and ACKs that
-  relay envelope. Duplicate/late ACKs are idempotent; changed ACKs quarantine.
+  PC later emits encrypted `CONVERSATION_CLEAR_APPLIED` to the same peer. The
+  relay wrapper has no semantic type, so its decrypted body has exactly ten keys:
+  `protocolVersion,type,controlId,controlChecksum,roleId,peerId,clearEpoch,`
+  `clearedThroughSequence,appliedAt,checksum`. `protocolVersion` is the native
+  integer `3`, `type` is exactly `CONVERSATION_CLEAR_APPLIED`,
+  `controlChecksum` equals the persisted lifecycle `semanticChecksum`, and
+  `checksum` is SHA-256 of canonical JSON of the other nine fields. The relay
+  wrapper owns only relay ID, direction and expiry; those are not inner ACK keys.
+  Android validates this exact
+  tuple and only then marks the row `applied` and ACKs that relay envelope.
+  Duplicate/late ACKs are idempotent; changed ACKs quarantine. Persisted
+  `relayMessageId,relayExpiresAt` are separately matched as the Room CAS snapshot,
+  never substituted for role/peer/applied proof.
 - Boot, wake, service recovery, LAN timeout, cloud timeout, process death after
   claim, and process death after relay acceptance all resume from Room. Two
   workers may cause external at-least-once calls after a lease expiry but use
@@ -7966,8 +7977,14 @@ exact Room CAS applies that returned value without creating a second envelope.
 - Both ingress paths validate/authenticate first and call
   `applyConversationClearInternal(control)` in one `BEGIN IMMEDIATE`. Cloud ACK
   of the phone→PC ciphertext occurs only after commit. The applied ACK is a
-  separate closed `CONVERSATION_CLEAR_APPLIED` envelope containing only control
-  ID/checksum/role/peer/epoch/through/appliedAt and its own checksum.
+  separate closed `CONVERSATION_CLEAR_APPLIED` inner body containing exactly
+  `protocolVersion,type,controlId,controlChecksum,roleId,peerId,clearEpoch,`
+  `clearedThroughSequence,appliedAt,checksum`. `protocolVersion` is native
+  integer `3`, `type` is exactly `CONVERSATION_CLEAR_APPLIED`,
+  `controlChecksum` is the original control semantic checksum, and `checksum`
+  hashes canonical JSON of the other nine fields. Relay identity, direction and
+  expiry remain in the authenticated outer transport wrapper and are not accepted
+  as extra inner keys.
 - PC does not need a second local ACK-outbox table. The already persisted
   `conversation_clear_controls` row proves application, while the unacknowledged
   phone→PC relay ciphertext is the durable retry trigger. CloudRelayPump calls

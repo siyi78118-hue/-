@@ -1288,9 +1288,18 @@ control；若 control 尚未 `applied`，page reload 携带当前 post-clear che
 idempotency key 只由 `controlId + semanticChecksum` 决定，崩溃重试仍相同。LAN 的
 authenticated 200 可直接证明 PC apply；云 relay 只把本地状态推进到
 `relay_accepted`。PC commit 后必须另发闭合
-`CONVERSATION_CLEAR_APPLIED`，Android 验证 control/role/peer/epoch/through/checksum
-全部相等后才写 `applied`。手机对这个 applied envelope 的 relay ACK 发生在 Room commit
-之后。relay 接受 phone→PC ciphertext 绝不能被记成 PC apply。
+`CONVERSATION_CLEAR_APPLIED`。relay outer wrapper 没有 semantic type，因此其解密后的
+inner body 精确只有
+`protocolVersion,type,controlId,controlChecksum,roleId,peerId,clearEpoch,`
+`clearedThroughSequence,appliedAt,checksum`；`protocolVersion` 是原生整数 `3`，
+`type` 精确等于 `CONVERSATION_CLEAR_APPLIED`，`controlChecksum` 等于持久
+lifecycle semantic checksum，末尾 `checksum` hash 其余九字段的 canonical JSON。
+relay message ID、direction 与 expiry 属于认证 outer wrapper，不是 inner ACK 字段。
+Android 验证
+control/role/peer/epoch/through/control checksum/ACK checksum 全部相等后才写
+`applied`；持久 relay ID/expiry 另作为 Room CAS 旧快照匹配。手机对这个 applied
+envelope 的 relay ACK 发生在 Room commit 之后。relay 接受 phone→PC ciphertext 绝不能
+被记成 PC apply。
 `relay_accepted` 在其持久 expiry 进入 refresh window 后重新取得 lease，复用相同
 message ID/idempotency key 并把 expiry 延长到不超过七天；没有 applied ACK 就不会停止。
 控制发送由独立 `LifecycleControlSender`/`ControlRouteClient` 完成，绝不构造
