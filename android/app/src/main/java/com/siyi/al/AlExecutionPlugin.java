@@ -33,6 +33,7 @@ import com.siyi.al.execution.db.RolePlanEntity;
 import com.siyi.al.execution.db.RolePlanHistoryEntity;
 import com.siyi.al.execution.db.SyncCursorEntity;
 import com.siyi.al.execution.db.YuqiAnnotationEntity;
+import com.siyi.al.execution.LifecycleControl;
 import com.siyi.al.execution.RolePlanAlarmScheduler;
 import com.siyi.al.execution.AutomaticTaskAlarmScheduler;
 import com.siyi.al.execution.secure.AlSecretStore;
@@ -57,8 +58,9 @@ public final class AlExecutionPlugin extends Plugin {
     @Override
     public void load() {
         io = Executors.newSingleThreadExecutor();
-        store = new RoomExecutionStore(AlExecutionDatabase.get(getContext()));
         secrets = new AlSecretStore(getContext());
+        BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
+        store = storeForBridgeConfig(AlExecutionDatabase.get(getContext()), bridgeConfig);
         activeInstance = new WeakReference<>(this);
     }
 
@@ -134,8 +136,19 @@ public final class AlExecutionPlugin extends Plugin {
                 integer(call, "turnDeadlineMs", current.turnDeadlineMs)
             );
             secrets.saveBridgeConfig(config);
+            // The persisted peer is authoritative for subsequent clears and
+            // receipts.  Rebind the store immediately so a newly generated or
+            // rotated deviceId is effective without an app restart.
+            store = storeForBridgeConfig(AlExecutionDatabase.get(getContext()), config);
             return bridgeConfigResult(config);
         });
+    }
+
+    static RoomExecutionStore storeForBridgeConfig(
+        AlExecutionDatabase database,
+        BridgeConfig config
+    ) {
+        return new RoomExecutionStore(database, config == null ? null : config.deviceId);
     }
 
     @PluginMethod
@@ -438,21 +451,20 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     @PluginMethod
-    public void markConversationCleared(PluginCall call) {
+    public void createConversationClear(PluginCall call) {
         execute(call, () -> {
             String characterId = required(call, "characterId");
-            Long clearedThroughSequence = call.getLong("clearedThroughSequence");
-            Long clearEpoch = call.getLong("clearEpoch");
-            if (clearedThroughSequence == null || clearEpoch == null) {
-                throw new IllegalArgumentException("clearedThroughSequence and clearEpoch are required");
+            String expectedCursorChecksum = call.getString("expectedCursorChecksum");
+            if (expectedCursorChecksum == null || expectedCursorChecksum.trim().isEmpty()) {
+                throw new IllegalArgumentException("expectedCursorChecksum is required");
             }
-            store.markConversationCleared(
-                characterId,
-                clearedThroughSequence,
-                clearEpoch,
-                System.currentTimeMillis()
-            );
-            return conversationCursorResult(characterId, store.getConversationCursor(characterId));
+            LifecycleControl control = store.createConversationClear(characterId, expectedCursorChecksum);
+            JSObject result = conversationCursorResult(characterId, store.getConversationCursor(characterId));
+            result.put("controlId", control.controlId);
+            result.put("clearEpoch", control.clearEpoch);
+            result.put("clearedThroughSequence", control.clearedThroughSequence);
+            result.put("state", control.state);
+            return result;
         });
     }
 
@@ -729,6 +741,7 @@ public final class AlExecutionPlugin extends Plugin {
             result.put("clearedAt", 0L);
             result.put("chatOpen", false);
             result.put("updatedAt", 0L);
+            result.put("cursorChecksum", RoomExecutionStore.conversationCursorChecksum(characterId, null));
             return result;
         }
         result.put("nativeCompletedTurnId", cursor.nativeCompletedTurnId);
@@ -743,6 +756,7 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("clearedAt", cursor.clearedAt);
         result.put("chatOpen", cursor.chatOpen);
         result.put("updatedAt", cursor.updatedAt);
+        result.put("cursorChecksum", RoomExecutionStore.conversationCursorChecksum(characterId, cursor));
         return result;
     }
 

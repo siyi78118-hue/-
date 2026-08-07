@@ -251,6 +251,9 @@ public class ConversationCursorStoreTest {
         assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
         assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
         assertTrue(hasColumn(db, "chat_turns", "bridgeProtocolVersion"));
+        assertTrue(hasTable(db, "lifecycle_controls"));
+        assertTrue(columnIsNotNull(db, "lifecycle_controls", "leaseAttempt"));
+        assertEquals("0", columnDefault(db, "lifecycle_controls", "leaseAttempt"));
         assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
         assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
         assertFalse(columnIsNotNull(db, "chat_turns", "bridgeProtocolVersion"));
@@ -259,23 +262,90 @@ public class ConversationCursorStoreTest {
     }
 
     @Test
+    public void migration12To13CreatesLifecycleControlsAndPreservesPopulatedV12Rows() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v12-v13-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase db = helper.getWritableDatabase();
+        insertPopulatedV11History(db);
+
+        AlExecutionDatabase.MIGRATION_12_13.migrate(db);
+
+        assertTrue(hasTable(db, "lifecycle_controls"));
+        assertEquals(0L, count(db, "lifecycle_controls"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "controlId"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "controlKind"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "characterId"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "peerId"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "semanticJson"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "semanticChecksum"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "state"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "leaseAttempt"));
+        assertTrue(columnIsNotNull(db, "lifecycle_controls", "leaseAttempt"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "relayMessageId"));
+        assertTrue(hasColumn(db, "lifecycle_controls", "appliedAt"));
+        assertEquals("{\"message\":\"历史\"}", stringValue(db,
+            "SELECT inputJson FROM chat_turns WHERE turnId = 'turn-11'"));
+        assertEquals("{\"legacyMemory\":\"保留\"}", stringValue(db,
+            "SELECT memoryResult FROM execution_attempts WHERE attemptId = 'attempt-11'"));
+        helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void migration12To13FailureAtCreateIndexRollsBackTableAndKeepsV12History() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v12-v13-fault-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase db = helper.getWritableDatabase();
+        insertPopulatedV11History(db);
+        long versionBefore = userVersion(db);
+        long turnsBefore = count(db, "chat_turns");
+        long attemptsBefore = count(db, "execution_attempts");
+        db.execSQL("CREATE TABLE migration_conflict (id INTEGER NOT NULL)");
+        db.execSQL("CREATE INDEX index_lifecycle_controls_characterId_clearEpoch "
+            + "ON migration_conflict (id)");
+
+        boolean failed = false;
+        db.beginTransaction();
+        try {
+            AlExecutionDatabase.MIGRATION_12_13.migrate(db);
+            db.setTransactionSuccessful();
+        } catch (RuntimeException expected) {
+            failed = true;
+        } finally {
+            db.endTransaction();
+        }
+
+        assertTrue(failed);
+        assertEquals(versionBefore, userVersion(db));
+        assertEquals(12L, versionBefore);
+        assertEquals(turnsBefore, count(db, "chat_turns"));
+        assertEquals(attemptsBefore, count(db, "execution_attempts"));
+        assertFalse(hasTable(db, "lifecycle_controls"));
+        assertTrue(hasTable(db, "migration_conflict"));
+        helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
     public void newerVersionIsNotSilentlyRepairedOrDowngraded() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        String databaseName = "cursor-newer-v13-" + System.nanoTime();
+        String databaseName = "cursor-newer-v14-" + System.nanoTime();
         SupportSQLiteOpenHelper helper12 = createV12UpgradeHelper(context, databaseName);
         helper12.getWritableDatabase();
         helper12.close();
-        SupportSQLiteOpenHelper helper13 = new FrameworkSQLiteOpenHelperFactory().create(
+        SupportSQLiteOpenHelper helper14 = new FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(context)
                 .name(databaseName)
-                .callback(new SupportSQLiteOpenHelper.Callback(13) {
+                .callback(new SupportSQLiteOpenHelper.Callback(14) {
                     @Override public void onCreate(SupportSQLiteDatabase db) { }
                     @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
                 })
                 .build()
         );
-        helper13.getWritableDatabase();
-        helper13.close();
+        helper14.getWritableDatabase();
+        helper14.close();
         AlExecutionDatabase incompatible = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
             .allowMainThreadQueries()
             .build();
@@ -342,6 +412,16 @@ public class ConversationCursorStoreTest {
         try {
             assertTrue(cursor.moveToFirst());
             return cursor.isNull(0) ? null : cursor.getString(0);
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static long userVersion(SupportSQLiteDatabase db) {
+        android.database.Cursor cursor = db.query("PRAGMA user_version");
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.getLong(0);
         } finally {
             cursor.close();
         }
@@ -448,6 +528,20 @@ public class ConversationCursorStoreTest {
             while (cursor.moveToNext()) {
                 if (column.equals(cursor.getString(cursor.getColumnIndexOrThrow("name")))) {
                     return cursor.getInt(cursor.getColumnIndexOrThrow("notnull")) != 0;
+                }
+            }
+            throw new AssertionError("missing column " + table + "." + column);
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static String columnDefault(SupportSQLiteDatabase db, String table, String column) {
+        android.database.Cursor cursor = db.query("PRAGMA table_info(`" + table + "`)");
+        try {
+            while (cursor.moveToNext()) {
+                if (column.equals(cursor.getString(cursor.getColumnIndexOrThrow("name")))) {
+                    return cursor.getString(cursor.getColumnIndexOrThrow("dflt_value"));
                 }
             }
             throw new AssertionError("missing column " + table + "." + column);

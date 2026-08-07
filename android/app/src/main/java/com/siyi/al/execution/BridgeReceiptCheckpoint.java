@@ -226,6 +226,34 @@ public final class BridgeReceiptCheckpoint {
         }
     }
 
+    public static String redactForConversationClear(
+        String checkpointJson,
+        String checkpointChecksum,
+        String controlId,
+        long clearEpoch,
+        long clearedThroughSequence,
+        long redactedAt
+    ) {
+        if (checkpointJson == null || checkpointChecksum == null) return null;
+        try {
+            JSONObject checkpoint = new JSONObject(checkpointJson);
+            Object version = checkpoint.opt("version");
+            boolean v1 = exactInteger(version) == 1L;
+            boolean v2 = exactInteger(version) == 2L;
+            Set<String> expected = v1 ? AUTHORITY_CHECKPOINT_KEYS
+                : v2 ? LOCAL_AUTHORITY_CHECKPOINT_KEYS : null;
+            if (expected == null || !expected.equals(keysOf(checkpoint))
+                || !checkpointChecksum.equals(BridgeAuthority.sha256CanonicalJson(checkpoint))) return null;
+            boolean localV2 = v2;
+            JSONObject tombstone = LifecycleControlCodec.redactCheckpoint(
+                checkpoint, controlId, clearEpoch, clearedThroughSequence, redactedAt, localV2
+            );
+            return BridgeAuthority.canonicalJson(tombstone);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private static void validateLocalSemantic(JSONObject checkpoint, JSONObject semantic) throws Exception {
         if (exactInteger(semantic.opt("protocolVersion")) != 2L
             || !"android-fallback-authority-v2".equals(semantic.opt("contract"))

@@ -15,6 +15,8 @@ import androidx.test.platform.app.InstrumentationRegistry;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
+import com.siyi.al.execution.db.ChangeEventEntity;
+import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ConversationAuthorityEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
@@ -2453,6 +2455,438 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void storeOwnedConversationClearCreatesOneControlAndRedactsCheckpointAtomically()
+        throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture("task20b-clear", "visible", 410L);
+        ConversationCursorEntity before = database.executionDao().conversationCursor("yuqi");
+        assertNotNull(before);
+        String beforeChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", before);
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway", beforeChecksum, 420L);
+
+        assertEquals(LifecycleControl.CLEAR_KIND, control.controlKind);
+        assertEquals("device_gateway", control.peerId);
+        assertEquals(1L, control.clearEpoch.longValue());
+        assertEquals(1L, database.executionDao().conversationCursor("yuqi").clearEpoch);
+        ExecutionAttemptEntity redacted = database.executionDao().attempt(
+            store.turn(fixture.localTurnId).activeAttemptId);
+        assertNotNull(redacted);
+        JSONObject tombstone = new JSONObject(redacted.bridgeAuthorityCheckpointJson);
+        assertEquals(JSONObject.NULL, tombstone.get("normalizedEnvelope"));
+        assertEquals("redacted", tombstone.getJSONObject("outcome").getString("type"));
+        assertEquals(1L, database.executionDao().lifecycleControl(control.controlId).clearEpoch.longValue());
+
+        ConversationCursorEntity after = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl replay = configured.createConversationClear(
+            "yuqi", "device_gateway", RoomExecutionStore.conversationCursorChecksum("yuqi", after), 421L);
+        assertEquals(control.controlId, replay.controlId);
+        assertEquals(1L, rowCount("lifecycle_controls"));
+        assertThrows(IllegalArgumentException.class, () -> configured.createConversationClear(
+            "yuqi", "foreign-device", RoomExecutionStore.conversationCursorChecksum("yuqi", after), 422L));
+    }
+
+    @Test
+    public void conversationClearFinalizesInFlightV3TurnAndCancelsOpenAuthorityAtomically()
+        throws Exception {
+        String turnId = "task20b-clear-inflight";
+        store.submitTurn(yuqiThreeBubbleSubmission(turnId, "msg-task20b-clear-inflight", 430L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(turnId), "device_gateway", 431L);
+        ExecutionAttemptEntity beforeAttempt = store.activeAttempt(turnId);
+        ChatTurnEntity beforeTurn = store.turn(turnId);
+        ConversationAuthorityEntity beforeAuthority = database.executionDao().conversationAuthority(
+            beforeTurn.authorityLineageKey);
+        assertEquals(TurnState.MEMORY_RUNNING.name(), beforeTurn.state);
+        assertEquals(AttemptStage.MEMORY.name(), beforeAttempt.stage);
+        assertEquals(TurnState.MEMORY_RUNNING.name(), beforeAttempt.state);
+        assertNotNull(beforeAuthority);
+        assertEquals("OPEN", beforeAuthority.state);
+        assertNotNull(prepared.bridgeAuthorityCheckpointJson);
+
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        String inputChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", cursor);
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway", inputChecksum, 440L);
+
+        ChatTurnEntity clearedTurn = configured.turn(turnId);
+        ExecutionAttemptEntity clearedAttempt = configured.activeAttempt(turnId);
+        ConversationAuthorityEntity cancelled = database.executionDao().conversationAuthority(
+            beforeTurn.authorityLineageKey);
+        assertEquals(LifecycleControl.CLEAR_KIND, control.controlKind);
+        assertEquals(TurnState.COMPLETED.name(), clearedTurn.state);
+        assertNotNull(clearedTurn.completedAt);
+        assertNotNull(clearedTurn.deletedAt);
+        assertEquals(TurnState.COMPLETED.name(), clearedAttempt.state);
+        assertEquals(AttemptStage.FINISHED.name(), clearedAttempt.stage);
+        assertNotNull(clearedAttempt.finishedAt);
+        assertEquals(false, clearedAttempt.retryable);
+        assertEquals("CANCELLED", cancelled.state);
+        assertEquals(beforeAuthority.revision + 1L, cancelled.revision);
+        assertNull(cancelled.visibleGroupId);
+        assertNull(cancelled.commitChecksum);
+        assertEquals(0, configured.replyParts(turnId).size());
+    }
+
+    @Test
+    public void conversationClearFaultsAtEachLifecycleBoundaryRollbackEveryAffectedRow()
+        throws Exception {
+        String turnId = "task20b-clear-faults";
+        store.submitTurn(yuqiThreeBubbleSubmission(turnId, "msg-task20b-clear-faults", 450L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(turnId), "device_gateway", 451L);
+        String attemptId = store.activeAttempt(turnId).attemptId;
+        String lineage = store.turn(turnId).authorityLineageKey;
+        String checkpointJson = store.activeAttempt(turnId).bridgeAuthorityCheckpointJson;
+        String checkpointChecksum = store.activeAttempt(turnId).bridgeAuthorityCheckpointChecksum;
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        long rawBefore = rowCount("yuqi_raw_messages");
+        long replyBefore = store.replyParts(turnId).size();
+        DiagnosticEntity diagnostic = new DiagnosticEntity();
+        diagnostic.turnId = turnId;
+        diagnostic.attemptId = attemptId;
+        diagnostic.code = "TURN_FAILED";
+        diagnostic.detail = "secret model/network detail";
+        diagnostic.createdAt = 455L;
+        database.executionDao().insertDiagnostic(diagnostic);
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.type = "TURN_COMMITTED";
+        change.payloadJson = "{\"visibleGroupId\":\"group-secret\",\"terminalDisposition\":\"visible\",\"route\":\"lan\",\"text\":\"secret\"}";
+        change.createdAt = 456L;
+        database.executionDao().insertChange(change);
+        ChangeEventEntity staleRedacted = new ChangeEventEntity();
+        staleRedacted.turnId = turnId;
+        staleRedacted.type = "TURN_REDACTED";
+        staleRedacted.payloadJson = "{\"visibleGroupId\":\"stale-secret\",\"route\":\"cloud\",\"text\":\"stale secret\"}";
+        staleRedacted.createdAt = 457L;
+        database.executionDao().insertChange(staleRedacted);
+        String changePayloadBefore = staleRedacted.payloadJson;
+        String[] boundaries = new String[]{
+            "lifecycle_checkpoint", "lifecycle_semantics",
+            "lifecycle_cursor", "lifecycle_control"
+        };
+        for (int index = 0; index < boundaries.length; index += 1) {
+            String boundary = boundaries[index];
+            final long requestedAt = 460L + index;
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            assertThrows(IllegalStateException.class, () -> faulted.createConversationClear(
+                "yuqi", "device_gateway", cursorChecksum, requestedAt));
+
+            ChatTurnEntity afterTurn = store.turn(turnId);
+            ExecutionAttemptEntity afterAttempt = database.executionDao().attempt(attemptId);
+            ConversationAuthorityEntity afterAuthority = database.executionDao().conversationAuthority(lineage);
+            assertEquals(TurnState.MEMORY_RUNNING.name(), afterTurn.state);
+            assertEquals(AttemptStage.MEMORY.name(), afterAttempt.stage);
+            assertEquals(TurnState.MEMORY_RUNNING.name(), afterAttempt.state);
+            assertEquals(checkpointJson, afterAttempt.bridgeAuthorityCheckpointJson);
+            assertEquals(checkpointChecksum, afterAttempt.bridgeAuthorityCheckpointChecksum);
+            assertEquals("OPEN", afterAuthority.state);
+            assertEquals(1L, afterAuthority.revision);
+            assertEquals(rawBefore, rowCount("yuqi_raw_messages"));
+            assertEquals(replyBefore, store.replyParts(turnId).size());
+            assertEquals(1L, countForTurn("diagnostics", turnId));
+            assertEquals(changePayloadBefore, changePayloadForTurn(turnId));
+            assertEquals(0L, rowCount("lifecycle_controls"));
+            assertEquals(cursorChecksum, RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", database.executionDao().conversationCursor("yuqi")));
+            assertNotNull(prepared.bridgeAuthorityCheckpointJson);
+        }
+    }
+
+    @Test
+    public void conversationClearRejectsV3NullVisibilitySequenceButRetainsFutureSequence()
+        throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        String nullTurnId = "task20b-clear-v3-null-sequence";
+        store.submitTurn(yuqiThreeBubbleSubmission(nullTurnId, "msg-task20b-null", 580L));
+        ConversationCursorEntity beforeNull = database.executionDao().conversationCursor("yuqi");
+        ChatTurnEntity nullTurnBefore = store.turn(nullTurnId);
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE chat_turns SET inputVisibilitySequence=NULL WHERE turnId=?",
+            new Object[]{nullTurnId});
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", beforeNull);
+        long changes = rowCount("change_events");
+        long diagnostics = rowCount("diagnostics");
+        assertThrows(IllegalStateException.class, () -> configured.createConversationClear(
+            "yuqi", "device_gateway", cursorChecksum, 581L));
+        assertEquals(nullTurnBefore.state, store.turn(nullTurnId).state);
+        assertNull(store.turn(nullTurnId).inputVisibilitySequence);
+        assertEquals(cursorChecksum, RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi")));
+        assertEquals(changes, rowCount("change_events"));
+        assertEquals(diagnostics, rowCount("diagnostics"));
+
+        for (long invalid : new long[]{-1L, 9007199254740992L}) {
+            database.getOpenHelper().getWritableDatabase().execSQL(
+                "UPDATE chat_turns SET inputVisibilitySequence=? WHERE turnId=?",
+                new Object[]{invalid, nullTurnId});
+            assertThrows(IllegalStateException.class, () -> configured.createConversationClear(
+                "yuqi", "device_gateway", cursorChecksum, 583L));
+            assertEquals(Long.valueOf(invalid), store.turn(nullTurnId).inputVisibilitySequence);
+            assertEquals(cursorChecksum, RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", database.executionDao().conversationCursor("yuqi")));
+            assertEquals(changes, rowCount("change_events"));
+            assertEquals(diagnostics, rowCount("diagnostics"));
+        }
+
+        // Restore the malformed row to a valid sequence before exercising the
+        // independent future-boundary retention case.
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE chat_turns SET inputVisibilitySequence=? WHERE turnId=?",
+            new Object[]{beforeNull.localSequence, nullTurnId});
+
+        String futureTurnId = "task20b-clear-v3-future-sequence";
+        store.submitTurn(yuqiThreeBubbleSubmission(futureTurnId, "msg-task20b-future", 590L));
+        ConversationCursorEntity beforeFuture = database.executionDao().conversationCursor("yuqi");
+        ChatTurnEntity futureBefore = store.turn(futureTurnId);
+        long boundary = beforeFuture.localSequence;
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE chat_turns SET inputVisibilitySequence=? WHERE turnId=?",
+            new Object[]{boundary + 100L, futureTurnId});
+        ConversationCursorEntity clearCursor = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", clearCursor), 591L);
+        assertNotNull(control);
+        ChatTurnEntity futureAfter = store.turn(futureTurnId);
+        assertEquals(futureBefore.state, futureAfter.state);
+        assertEquals(Long.valueOf(boundary + 100L), futureAfter.inputVisibilitySequence);
+    }
+
+    @Test
+    public void conversationClearRejectsCheckpointPeerMismatchWithoutAnyWrites()
+        throws Exception {
+        String turnId = "task20b-clear-peer-mismatch";
+        store.submitTurn(yuqiThreeBubbleSubmission(turnId, "msg-task20b-peer-mismatch", 595L));
+        store.prepareBridgeSubmission(persistedSubmission(turnId), "device_A", 596L);
+        ChatTurnEntity beforeTurn = store.turn(turnId);
+        ExecutionAttemptEntity beforeAttempt = store.activeAttempt(turnId);
+        ConversationAuthorityEntity beforeAuthority = database.executionDao()
+            .conversationAuthority(beforeTurn.authorityLineageKey);
+        ConversationCursorEntity beforeCursor = database.executionDao().conversationCursor("yuqi");
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", beforeCursor);
+        long changes = rowCount("change_events");
+        long diagnostics = rowCount("diagnostics");
+        RoomExecutionStore deviceB = new RoomExecutionStore(database, "device_B");
+
+        assertThrows(IllegalStateException.class, () -> deviceB.createConversationClear(
+            "yuqi", "device_B", cursorChecksum, 597L));
+
+        ChatTurnEntity afterTurn = store.turn(turnId);
+        ExecutionAttemptEntity afterAttempt = store.activeAttempt(turnId);
+        ConversationAuthorityEntity afterAuthority = database.executionDao()
+            .conversationAuthority(beforeTurn.authorityLineageKey);
+        assertEquals(beforeTurn.state, afterTurn.state);
+        assertEquals(beforeTurn.updatedAt, afterTurn.updatedAt);
+        assertEquals(beforeAttempt.bridgeAuthorityCheckpointJson,
+            afterAttempt.bridgeAuthorityCheckpointJson);
+        assertEquals(beforeAttempt.bridgeAuthorityCheckpointChecksum,
+            afterAttempt.bridgeAuthorityCheckpointChecksum);
+        assertEquals(beforeAuthority.state, afterAuthority.state);
+        assertEquals(beforeAuthority.revision, afterAuthority.revision);
+        assertEquals(cursorChecksum, RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi")));
+        assertEquals(0L, rowCount("lifecycle_controls"));
+        assertEquals(changes, rowCount("change_events"));
+        assertEquals(diagnostics, rowCount("diagnostics"));
+    }
+
+    @Test
+    public void conversationClearRedactsDiagnosticsAndChangeEventsWithoutDuplicateSemanticEvents()
+        throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        CanonicalFixture fixture = commitCanonicalFixture(
+            "task20b-clear-redact-events", "visible", 600L);
+        DiagnosticEntity diagnostic = new DiagnosticEntity();
+        diagnostic.turnId = fixture.localTurnId;
+        diagnostic.code = "TURN_FAILED";
+        diagnostic.detail = "secret error detail";
+        diagnostic.createdAt = 603L;
+        database.executionDao().insertDiagnostic(diagnostic);
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = fixture.localTurnId;
+        change.type = "TURN_COMMITTED";
+        change.payloadJson = "{\"visibleGroupId\":\"secret-group\",\"terminalDisposition\":\"visible\",\"route\":\"cloud\",\"text\":\"secret text\"}";
+        change.createdAt = 604L;
+        database.executionDao().insertChange(change);
+        ChangeEventEntity staleRedacted = new ChangeEventEntity();
+        staleRedacted.turnId = fixture.localTurnId;
+        staleRedacted.type = "TURN_REDACTED";
+        staleRedacted.payloadJson = "{\"visibleGroupId\":\"stale-group\",\"route\":\"lan\",\"text\":\"stale secret\"}";
+        staleRedacted.createdAt = 605L;
+        database.executionDao().insertChange(staleRedacted);
+        long changeCountBefore = countForTurn("change_events", fixture.localTurnId);
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", cursor), 605L);
+        assertNotNull(control);
+        assertEquals(0L, countForTurn("diagnostics", fixture.localTurnId));
+        String redactedPayload = changePayloadForTurn(fixture.localTurnId);
+        assertEquals("TURN_REDACTED", changeTypeForTurn(fixture.localTurnId));
+        assertTrue(redactedPayload.contains("conversation-clear-v1"));
+        assertTrue(!redactedPayload.contains("visibleGroupId"));
+        assertTrue(!redactedPayload.contains("terminalDisposition"));
+        assertTrue(!redactedPayload.contains("route"));
+        assertTrue(!redactedPayload.contains("secret"));
+        RoomExecutionStore reopened = new RoomExecutionStore(database, "device_gateway");
+        assertNotNull(reopened.turn(fixture.localTurnId));
+        assertEquals("TURN_REDACTED", changeTypeForTurn(fixture.localTurnId));
+        assertEquals(changeCountBefore, countForTurn("change_events", fixture.localTurnId));
+        for (String payload : changePayloadsForTurn(fixture.localTurnId)) {
+            assertEquals(redactedPayload, payload);
+        }
+    }
+
+    @Test
+    public void conversationClearFinalizesBridgeWaitingAndRetryableChildInFlight() throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+
+        String waitingTurnId = "task20b-clear-waiting";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            waitingTurnId, "msg-task20b-clear-waiting", 470L));
+        TurnSubmission waitingPrepared = store.prepareBridgeSubmission(
+            persistedSubmission(waitingTurnId), "device_gateway", 471L);
+        ExecutionAttemptEntity waitingAttempt = store.activeAttempt(waitingTurnId);
+        store.markBridgeWaiting(waitingTurnId, waitingAttempt.attemptId, "cloud", 472L);
+        ConversationCursorEntity waitingCursor = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl waitingControl = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", waitingCursor), 473L);
+        assertEquals(TurnState.COMPLETED.name(), configured.turn(waitingTurnId).state);
+        assertEquals(AttemptStage.FINISHED.name(), configured.activeAttempt(waitingTurnId).stage);
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE lifecycle_controls SET state='APPLIED', appliedAt=?, updatedAt=? WHERE controlId=?",
+            new Object[]{473L, 473L, waitingControl.controlId});
+
+        String retryTurnId = "task20b-clear-retry-child";
+        store.submitTurn(yuqiThreeBubbleSubmission(
+            retryTurnId, "msg-task20b-clear-retry-child", 480L));
+        TurnSubmission parent = store.prepareBridgeSubmission(
+            persistedSubmission(retryTurnId), "device_gateway", 481L);
+        ExecutionAttemptEntity parentAttempt = store.activeAttempt(retryTurnId);
+        BridgeResult failure = BridgeTurnStatus.parseV3(
+            canonicalFailure(new JSONObject(parent.bridgeAuthorityCheckpointJson), true, 482L).toString(),
+            "cloud", "relay-task20b-child");
+        store.commitVerifiedRemoteFailure(retryTurnId, parentAttempt.attemptId, failure, 483L);
+        store.startRetry(retryTurnId, 484L);
+        TurnSubmission child = store.prepareBridgeSubmission(
+            persistedSubmission(retryTurnId), "device_gateway", 485L);
+        ExecutionAttemptEntity childAttempt = store.activeAttempt(retryTurnId);
+        assertNotEquals(parentAttempt.attemptId, childAttempt.attemptId);
+        assertEquals(TurnState.MEMORY_RUNNING.name(), store.turn(retryTurnId).state);
+        assertNotNull(child.bridgeAuthorityCheckpointJson);
+
+        ConversationCursorEntity retryCursor = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl retryControl = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", retryCursor), 486L);
+        assertEquals(LifecycleControl.CLEAR_KIND, retryControl.controlKind);
+        assertEquals(TurnState.COMPLETED.name(), configured.turn(retryTurnId).state);
+        for (ExecutionAttemptEntity attempt : database.executionDao().attempts(retryTurnId)) {
+            assertEquals(TurnState.COMPLETED.name(), attempt.state);
+            assertEquals(AttemptStage.FINISHED.name(), attempt.stage);
+            assertEquals(false, attempt.retryable);
+            assertNotNull(attempt.finishedAt);
+        }
+        ConversationAuthorityEntity authority = database.executionDao().conversationAuthority(
+            configured.turn(retryTurnId).authorityLineageKey);
+        assertEquals("CANCELLED", authority.state);
+    }
+
+    @Test
+    public void sequentialConversationClearPreservesPriorTombstoneAndControlIdentity() throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        CanonicalFixture fixture = commitCanonicalFixture("task20b-clear-sequential", "visible", 490L);
+        LifecycleControl first = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", database.executionDao().conversationCursor("yuqi")), 500L);
+        ExecutionAttemptEntity oldAttempt = database.executionDao().attempt(
+            fixture.localTurnId);
+        String oldTombstone = oldAttempt.bridgeAuthorityCheckpointJson;
+        Long oldDeletedAt = configured.turn(fixture.localTurnId).deletedAt;
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE lifecycle_controls SET state='APPLIED', appliedAt=?, updatedAt=? WHERE controlId=?",
+            new Object[]{500L, 500L, first.controlId});
+
+        TurnSubmission laterLegacy = new TurnSubmission(
+            "task20b-clear-later-legacy", "yuqi", "msg-task20b-clear-later-legacy",
+            TurnKind.DIRECT_REPLY, "{}", "{}", null, 501L);
+        store.submitTurn(laterLegacy);
+        LifecycleControl second = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", database.executionDao().conversationCursor("yuqi")), 510L);
+
+        assertNotEquals(first.controlId, second.controlId);
+        assertEquals(oldTombstone,
+            database.executionDao().attempt(configured.turn(fixture.localTurnId).activeAttemptId)
+                .bridgeAuthorityCheckpointJson);
+        assertEquals(oldDeletedAt, configured.turn(fixture.localTurnId).deletedAt);
+        assertEquals(2L, rowCount("lifecycle_controls"));
+        assertEquals(2L, configured.getConversationCursor("yuqi").clearEpoch);
+    }
+
+    @Test
+    public void sequentialConversationClearRejectsDeletedControlOrReopenedAuthorityWithoutWrites()
+        throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        CanonicalFixture fixture = commitCanonicalFixture("task20b-clear-corrupt", "visible", 520L);
+        LifecycleControl first = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", database.executionDao().conversationCursor("yuqi")), 530L);
+        String oldTombstone = database.executionDao().attempt(
+            configured.turn(fixture.localTurnId).activeAttemptId).bridgeAuthorityCheckpointJson;
+        String beforeCursor = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "DELETE FROM lifecycle_controls WHERE controlId=?", new Object[]{first.controlId});
+        assertThrows(IllegalStateException.class, () -> configured.createConversationClear(
+            "yuqi", "device_gateway", beforeCursor, 540L));
+        assertEquals(beforeCursor, RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi")));
+        assertEquals(oldTombstone, database.executionDao().attempt(
+            configured.turn(fixture.localTurnId).activeAttemptId).bridgeAuthorityCheckpointJson);
+        assertEquals(0L, rowCount("lifecycle_controls"));
+    }
+
+    @Test
+    public void sequentialConversationClearRejectsReopenedAuthorityWithoutWrites() throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        CanonicalFixture fixture = commitCanonicalFixture("task20b-clear-authority-open", "visible", 550L);
+        LifecycleControl first = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", database.executionDao().conversationCursor("yuqi")), 560L);
+        String beforeCursor = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        String lineage = configured.turn(fixture.localTurnId).authorityLineageKey;
+        String oldTombstone = database.executionDao().attempt(
+            configured.turn(fixture.localTurnId).activeAttemptId).bridgeAuthorityCheckpointJson;
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE conversation_authorities SET state='OPEN' WHERE authorityLineageKey=?",
+            new Object[]{lineage});
+        assertThrows(IllegalStateException.class, () -> configured.createConversationClear(
+            "yuqi", "device_gateway", beforeCursor, 570L));
+        assertEquals(beforeCursor, RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi")));
+        assertEquals(oldTombstone, database.executionDao().attempt(
+            configured.turn(fixture.localTurnId).activeAttemptId).bridgeAuthorityCheckpointJson);
+        assertEquals("OPEN", database.executionDao().conversationAuthority(lineage).state);
+        assertEquals(1L, rowCount("lifecycle_controls"));
+        assertEquals(first.controlId,
+            database.executionDao().lifecycleControls().get(0).controlId);
+    }
+
+    @Test
     public void exactTerminalReceiptReplayIsIdempotentButChangedReceiptIsRejected() {
         store.submitTurn(submission("turn-receipt", "message-receipt"));
 
@@ -3147,6 +3581,59 @@ public class RoomExecutionStoreTest {
         try {
             assertTrue(cursor.moveToFirst());
             return cursor.getLong(0);
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private long countForTurn(String table, String turnId) {
+        Cursor cursor = database.getOpenHelper().getReadableDatabase().query(
+            "SELECT COUNT(*) FROM " + table + " WHERE turnId=?",
+            new String[]{turnId}
+        );
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.getLong(0);
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private String changePayloadForTurn(String turnId) {
+        Cursor cursor = database.getOpenHelper().getReadableDatabase().query(
+            "SELECT payloadJson FROM change_events WHERE turnId=? ORDER BY cursor DESC LIMIT 1",
+            new String[]{turnId}
+        );
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.getString(0);
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private List<String> changePayloadsForTurn(String turnId) {
+        Cursor cursor = database.getOpenHelper().getReadableDatabase().query(
+            "SELECT payloadJson FROM change_events WHERE turnId=? ORDER BY cursor ASC",
+            new String[]{turnId}
+        );
+        try {
+            List<String> payloads = new ArrayList<>();
+            while (cursor.moveToNext()) payloads.add(cursor.getString(0));
+            return payloads;
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private String changeTypeForTurn(String turnId) {
+        Cursor cursor = database.getOpenHelper().getReadableDatabase().query(
+            "SELECT type FROM change_events WHERE turnId=? ORDER BY cursor DESC LIMIT 1",
+            new String[]{turnId}
+        );
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.getString(0);
         } finally {
             cursor.close();
         }

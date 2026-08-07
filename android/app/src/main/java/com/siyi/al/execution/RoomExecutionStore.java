@@ -9,6 +9,7 @@ import com.siyi.al.execution.db.ConversationAuthorityEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
+import com.siyi.al.execution.db.LifecycleControlEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.bridge.BridgeInput;
@@ -25,6 +26,7 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import org.json.JSONObject;
 import org.json.JSONArray;
+import org.json.JSONException;
 
 public final class RoomExecutionStore implements ExecutionStore, ExecutionEngineStore,
     BridgeReceiptDeliveryCoordinator.Store {
@@ -61,6 +63,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     private final AlExecutionDatabase database;
     private final AlExecutionDao dao;
     private final TerminalFaultHook terminalFaultHook;
+    private final String storeOwnedPeerId;
     private static final Set<String> CHECKPOINT_KEYS = new HashSet<>(Arrays.asList(
         "version", "localTurnId", "attemptId", "attemptSequence",
         "authoritativeTurnId", "authorityLineageKey", "claimedLineageRevision",
@@ -98,13 +101,117 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     ));
 
     public RoomExecutionStore(AlExecutionDatabase database) {
-        this(database, boundary -> {});
+        this(database, null, boundary -> {});
     }
 
     RoomExecutionStore(AlExecutionDatabase database, TerminalFaultHook terminalFaultHook) {
+        this(database, null, terminalFaultHook);
+    }
+
+    public RoomExecutionStore(AlExecutionDatabase database, String storeOwnedPeerId) {
+        this(database, storeOwnedPeerId, boundary -> {});
+    }
+
+    RoomExecutionStore(
+        AlExecutionDatabase database,
+        String storeOwnedPeerId,
+        TerminalFaultHook terminalFaultHook
+    ) {
         this.database = database;
         this.dao = database.executionDao();
         this.terminalFaultHook = terminalFaultHook;
+        this.storeOwnedPeerId = storeOwnedPeerId == null ? null : storeOwnedPeerId.trim();
+        validatePersistedLifecycleControls();
+    }
+
+    private void validatePersistedLifecycleControls() {
+        for (LifecycleControlEntity row : dao.lifecycleControls()) {
+            validatePersistedLifecycleControl(row);
+        }
+    }
+
+    private static void validatePersistedLifecycleControl(LifecycleControlEntity row) {
+        if (row == null || row.controlId == null || row.controlId.trim().isEmpty()
+            || row.controlKind == null || row.characterId == null || row.peerId == null
+            || row.requestedAt <= 0L || row.updatedAt <= 0L || row.leaseAttempt < 0L
+            || row.updatedAt > 9007199254740991L
+            || row.semanticJson == null || row.semanticChecksum == null) {
+            throw new IllegalStateException("lifecycle control authority conflict");
+        }
+        try {
+            JSONObject semantic = new JSONObject(row.semanticJson);
+            LifecycleControlCodec.validateSemantic(semantic);
+            if (!row.semanticChecksum.equals(LifecycleControlCodec.semanticChecksum(semantic))
+                || !row.controlId.equals(LifecycleControlCodec.controlId(semantic))) {
+                throw new IllegalStateException("lifecycle control checksum conflict");
+            }
+            boolean clear = LifecycleControl.CLEAR_KIND.equals(row.controlKind);
+            boolean roleDelete = LifecycleControl.ROLE_DELETE_KIND.equals(row.controlKind);
+            if (!clear && !roleDelete
+                || (clear && (row.clearEpoch == null || row.clearedThroughSequence == null))
+                || (roleDelete && (row.clearEpoch != null || row.clearedThroughSequence != null))) {
+                throw new IllegalStateException("lifecycle control kind conflict");
+            }
+            if (!row.characterId.equals(semantic.getString("roleId"))
+                || !row.peerId.equals(semantic.getString("peerId"))
+                || row.requestedAt != semantic.getLong("requestedAt")) {
+                throw new IllegalStateException("lifecycle control projection conflict");
+            }
+            if (clear && (row.clearEpoch.longValue() != semantic.getLong("clearEpoch")
+                || row.clearedThroughSequence.longValue() != semantic.getLong("clearedThroughSequence"))) {
+                throw new IllegalStateException("lifecycle clear projection conflict");
+            }
+            if (roleDelete && (row.clearEpoch != null || row.clearedThroughSequence != null)) {
+                throw new IllegalStateException("lifecycle role-delete projection conflict");
+            }
+            if ((row.leasedAt != null && !safeNonNegative(row.leasedAt))
+                || (row.relayExpiresAt != null && !safeNonNegative(row.relayExpiresAt))
+                || (row.appliedAt != null && !safeNonNegative(row.appliedAt))
+                || (row.leasedAt != null && row.relayExpiresAt != null
+                    && row.relayExpiresAt < row.leasedAt)
+                || (row.appliedAt != null && row.appliedAt < row.requestedAt)) {
+                throw new IllegalStateException("lifecycle timestamp conflict");
+            }
+            switch (row.state) {
+                case LifecycleControl.WAITING:
+                    if (row.leaseId != null || row.leasedAt != null || row.relayMessageId != null
+                        || row.relayExpiresAt != null || row.appliedAt != null) {
+                        throw new IllegalStateException("lifecycle waiting lease conflict");
+                    }
+                    break;
+                case LifecycleControl.PENDING:
+                    if (row.leaseId == null || row.leasedAt == null || row.relayExpiresAt == null
+                        || row.relayMessageId != null || row.appliedAt != null || row.leaseAttempt <= 0L) {
+                        throw new IllegalStateException("lifecycle pending lease conflict");
+                    }
+                    break;
+                case LifecycleControl.RELAY_ACCEPTED:
+                    if (row.leaseId == null || row.leasedAt == null || row.relayExpiresAt == null
+                        || row.relayMessageId == null || row.appliedAt != null || row.leaseAttempt <= 0L) {
+                        throw new IllegalStateException("lifecycle relay lease conflict");
+                    }
+                    break;
+                case LifecycleControl.APPLIED:
+                    if (row.appliedAt == null || row.appliedAt <= 0L) {
+                        throw new IllegalStateException("lifecycle applied timestamp conflict");
+                    }
+                    break;
+                case LifecycleControl.QUARANTINED:
+                    if (row.leaseId != null || row.leasedAt != null || row.relayMessageId != null
+                        || row.relayExpiresAt != null || row.appliedAt != null) {
+                        throw new IllegalStateException("lifecycle quarantine lease conflict");
+                    }
+                    break;
+                default:
+                    throw new IllegalStateException("lifecycle state conflict");
+            }
+        } catch (JSONException error) {
+            throw new IllegalStateException("lifecycle semantic conflict", error);
+        }
+    }
+
+    private static boolean safeNonNegative(Long value) {
+        return value != null && value >= 0L && value <= 9007199254740991L;
     }
 
     @Override
@@ -1220,8 +1327,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             : DeliveryDisposition.APPLY;
     }
 
-    @Override
-    public void markConversationCleared(
+    void markConversationCleared(
         String characterId,
         long clearedThroughSequence,
         long clearEpoch,
@@ -1236,6 +1342,279 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             saveCursor(cursor);
             dao.clearReplyPartsThroughSequence(characterId, cursor.clearedThroughSequence);
         });
+    }
+
+    @Override
+    public LifecycleControl createConversationClear(String characterId, String expectedCursorChecksum) {
+        if (storeOwnedPeerId == null || storeOwnedPeerId.isEmpty()) {
+            throw new IllegalStateException("store-owned bridge peer is not configured");
+        }
+        if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("expected cursor checksum is invalid");
+        }
+        return createConversationClear(characterId, storeOwnedPeerId, expectedCursorChecksum,
+            System.currentTimeMillis());
+    }
+
+    public static String conversationCursorChecksum(String characterId, ConversationCursorEntity cursor) {
+        if (characterId == null || characterId.trim().isEmpty()) {
+            throw new IllegalArgumentException("characterId is required");
+        }
+        ConversationCursorEntity value = cursor == null ? new ConversationCursorEntity() : cursor;
+        JSONObject basis = new JSONObject();
+        try {
+            basis.put("contract", "conversation-cursor-clear-v1");
+            basis.put("characterId", characterId);
+            basis.put("nativeCompletedTurnId", value.nativeCompletedTurnId == null ? JSONObject.NULL : value.nativeCompletedTurnId);
+            basis.put("nativeCompletedGroupId", value.nativeCompletedGroupId == null ? JSONObject.NULL : value.nativeCompletedGroupId);
+            basis.put("nativeCompletedSequence", value.nativeCompletedSequence);
+            basis.put("uiAppliedTurnId", value.uiAppliedTurnId == null ? JSONObject.NULL : value.uiAppliedTurnId);
+            basis.put("uiAppliedGroupId", value.uiAppliedGroupId == null ? JSONObject.NULL : value.uiAppliedGroupId);
+            basis.put("uiAppliedSequence", value.uiAppliedSequence);
+            basis.put("localSequence", value.localSequence);
+            basis.put("clearedThroughSequence", value.clearedThroughSequence);
+            basis.put("clearEpoch", value.clearEpoch);
+            basis.put("clearedAt", value.clearedAt);
+            basis.put("chatOpen", value.chatOpen);
+            basis.put("updatedAt", value.updatedAt);
+        } catch (Exception error) {
+            throw new IllegalStateException("cursor checksum serialization failed", error);
+        }
+        return BridgeAuthority.sha256CanonicalJson(basis);
+    }
+
+    LifecycleControl createConversationClear(
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        long requestedAt
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        if (peerId == null || peerId.trim().isEmpty() || !peerId.equals(peerId.trim())) {
+            throw new IllegalArgumentException("store-owned bridge peer is required");
+        }
+        if (requestedAt <= 0L || requestedAt > 9007199254740991L) {
+            throw new IllegalArgumentException("requestedAt is invalid");
+        }
+        if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("expected cursor checksum is invalid");
+        }
+        AtomicReference<LifecycleControl> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            ConversationCursorEntity cursor = dao.conversationCursor(safeCharacterId);
+            boolean newCursor = cursor == null;
+            if (newCursor) {
+                cursor = new ConversationCursorEntity();
+                cursor.characterId = safeCharacterId;
+            }
+            // Every persisted v3 member must carry a native safe visibility
+            // sequence before a clear can touch any row.  A null/negative/
+            // overflow sequence is an authority conflict, not a legacy row.
+            if (dao.invalidV3VisibilitySequence(safeCharacterId) != null) {
+                throw new IllegalStateException("conversation clear v3 visibility sequence conflict");
+            }
+            String currentCursorChecksum = conversationCursorChecksum(safeCharacterId, cursor);
+            LifecycleControlEntity existing = cursor.clearEpoch > 0L
+                ? dao.lifecycleControlForClear(safeCharacterId, cursor.clearEpoch) : null;
+            if (existing != null) {
+                boolean semanticExact;
+                String semanticInputChecksum = null;
+                try {
+                    JSONObject semantic = new JSONObject(existing.semanticJson);
+                    semanticExact = existing.semanticChecksum.equals(LifecycleControlCodec.semanticChecksum(semantic));
+                    semanticInputChecksum = semantic.optString("inputCursorChecksum", null);
+                } catch (Exception error) {
+                    semanticExact = false;
+                }
+                boolean replayPreClear = expectedCursorChecksum.equals(semanticInputChecksum);
+                boolean resumePostClear = expectedCursorChecksum.equals(currentCursorChecksum)
+                    && !LifecycleControl.APPLIED.equals(existing.state);
+                if ((!replayPreClear && !resumePostClear)
+                    || !peerId.equals(existing.peerId) || !semanticExact) {
+                    throw new IllegalStateException("conversation clear identity conflict");
+                }
+                if (replayPreClear || !LifecycleControl.APPLIED.equals(existing.state)) {
+                    result.set(LifecycleControl.fromEntity(existing));
+                    return;
+                }
+            }
+            if (!expectedCursorChecksum.equals(currentCursorChecksum)) {
+                throw new IllegalStateException("conversation clear cursor conflict");
+            }
+            if (newCursor && dao.insertConversationCursor(cursor) == -1L) {
+                throw new IllegalStateException("conversation clear cursor race");
+            }
+            long clearEpoch = cursor.clearEpoch + 1L;
+            long clearedThroughSequence = cursor.localSequence;
+            LifecycleControlCodec.Encoded encoded;
+            try {
+                encoded = LifecycleControlCodec.encodeConversationClear(
+                    safeCharacterId, peerId, clearEpoch, clearedThroughSequence, requestedAt,
+                    expectedCursorChecksum
+                );
+            } catch (Exception error) {
+                throw new IllegalStateException("conversation clear semantic conflict", error);
+            }
+            Set<String> cancelledLineages = new HashSet<>();
+            for (ChatTurnEntity turn : dao.turnsThroughClear(safeCharacterId, clearedThroughSequence)) {
+                if (turn.bridgeProtocolVersion == null) continue;
+                if (turn.activeAttemptId == null) {
+                    throw new IllegalStateException("conversation clear missing active v3 member");
+                }
+                ExecutionAttemptEntity active = dao.attempt(turn.activeAttemptId);
+                if (active == null || active.bridgeAuthorityCheckpointJson == null
+                    || active.bridgeAuthorityCheckpointChecksum == null) {
+                    throw new IllegalStateException("conversation clear missing active v3 checkpoint");
+                }
+                JSONObject activeRoot;
+                try {
+                    activeRoot = new JSONObject(active.bridgeAuthorityCheckpointJson);
+                } catch (Exception error) {
+                    throw new IllegalStateException("conversation clear checkpoint conflict", error);
+                }
+                if ("redacted".equals(activeRoot.optJSONObject("outcome") == null
+                    ? null : activeRoot.optJSONObject("outcome").optString("type"))) {
+                    // A prior clear is not a trust boundary.  Re-validate every
+                    // persisted member and its lifecycle/authority tombstone
+                    // before allowing a later epoch to touch any semantics.
+                    for (ExecutionAttemptEntity candidate : dao.attempts(turn.turnId)) {
+                        boolean hasJson = candidate.bridgeAuthorityCheckpointJson != null;
+                        boolean hasChecksum = candidate.bridgeAuthorityCheckpointChecksum != null;
+                        if (!hasJson || !hasChecksum) {
+                            throw new IllegalStateException("conversation clear tombstone conflict");
+                        }
+                        validateCheckpoint(turn, candidate, false);
+                    }
+                    continue;
+                }
+                // Re-run the complete Task 13C closure against the persisted
+                // member before changing any bytes; a self-consistent forged
+                // checksum is not a washable redaction input.
+                validateCheckpointSet(turn, dao.attempts(turn.turnId), true);
+                JSONObject validatedActive = validateCheckpoint(turn, active, false);
+                assertCanonicalBridgeLifecycle(turn, active, false, validatedActive);
+                for (ExecutionAttemptEntity attempt : dao.attempts(turn.turnId)) {
+                    if (attempt.bridgeAuthorityCheckpointJson == null
+                        || attempt.bridgeAuthorityCheckpointChecksum == null) continue;
+                    JSONObject validatedAttempt = validateCheckpoint(turn, attempt, false);
+                    String checkpointPeer;
+                    try {
+                        checkpointPeer = requireNativeNonEmptyString(
+                            checkpointEnvelope(validatedAttempt), "deviceId", turn.turnId);
+                    } catch (Exception error) {
+                        throw new IllegalStateException("conversation clear checkpoint peer conflict", error);
+                    }
+                    if (!peerId.equals(checkpointPeer)) {
+                        throw new IllegalStateException("conversation clear checkpoint peer conflict");
+                    }
+                    String tombstone = BridgeReceiptCheckpoint.redactForConversationClear(
+                        attempt.bridgeAuthorityCheckpointJson,
+                        attempt.bridgeAuthorityCheckpointChecksum,
+                        encoded.controlId, clearEpoch, clearedThroughSequence, requestedAt
+                    );
+                    if (tombstone == null) {
+                        throw new IllegalStateException("conversation clear checkpoint conflict");
+                    }
+                    String tombstoneChecksum;
+                    try {
+                        tombstoneChecksum = BridgeAuthority.sha256CanonicalJson(new JSONObject(tombstone));
+                    } catch (Exception error) {
+                        throw new IllegalStateException("conversation clear checkpoint conflict", error);
+                    }
+                    if (dao.compareAndSetBridgeAuthorityCheckpoint(
+                        attempt.attemptId, turn.turnId,
+                        attempt.bridgeAuthorityCheckpointJson,
+                        attempt.bridgeAuthorityCheckpointChecksum,
+                        tombstone, tombstoneChecksum
+                    ) != 1) {
+                        throw new IllegalStateException("conversation clear checkpoint race");
+                    }
+                }
+                String lineageKey = turn.authorityLineageKey;
+                if (lineageKey == null || lineageKey.trim().isEmpty()) {
+                    throw new IllegalStateException("conversation clear missing v3 authority lineage");
+                }
+                if (!cancelledLineages.contains(lineageKey)) {
+                    ConversationAuthorityEntity authority = dao.conversationAuthority(lineageKey);
+                    if (authority == null || !turn.characterId.equals(authority.characterId)
+                        || authority.latestTurnId == null || authority.revision < 0L) {
+                        throw new IllegalStateException("conversation clear authority conflict");
+                    }
+                    if ("OPEN".equals(authority.state) || "COMMITTED".equals(authority.state)) {
+                        if (dao.compareAndSetConversationAuthority(
+                            lineageKey, authority.revision, authority.latestTurnId, authority.revision + 1L,
+                            "CANCELLED", null, null, null, null, null, requestedAt
+                        ) != 1) {
+                            throw new IllegalStateException("conversation clear authority race");
+                        }
+                    } else if (!"CANCELLED".equals(authority.state)) {
+                        throw new IllegalStateException("conversation clear authority state conflict");
+                    }
+                    cancelledLineages.add(lineageKey);
+                }
+                terminalFaultHook.after("lifecycle_checkpoint");
+            }
+            dao.clearRawMessagesThroughSequence(safeCharacterId, clearedThroughSequence);
+            dao.clearAttemptSemanticsThroughSequence(safeCharacterId, clearedThroughSequence, requestedAt);
+            dao.clearTurnSemanticsThroughSequence(safeCharacterId, clearedThroughSequence, requestedAt);
+            dao.clearDiagnosticsThroughSequence(safeCharacterId, clearedThroughSequence);
+            String redactedEventPayload;
+            try {
+                redactedEventPayload = BridgeAuthority.canonicalJson(new JSONObject()
+                    .put("contract", "conversation-clear-v1")
+                    .put("state", "redacted")
+                    .put("clearEpoch", clearEpoch)
+                    .put("clearedThroughSequence", clearedThroughSequence));
+            } catch (Exception error) {
+                throw new IllegalStateException("conversation clear audit serialization conflict", error);
+            }
+            dao.redactChangeEventsThroughSequence(
+                safeCharacterId, clearedThroughSequence, redactedEventPayload);
+            terminalFaultHook.after("lifecycle_semantics");
+            cursor.clearedThroughSequence = clearedThroughSequence;
+            cursor.clearEpoch = clearEpoch;
+            cursor.clearedAt = requestedAt;
+            cursor.updatedAt = requestedAt;
+            saveCursor(cursor);
+            terminalFaultHook.after("lifecycle_cursor");
+            LifecycleControlEntity row = encodedToEntity(
+                encoded, safeCharacterId, peerId, requestedAt
+            );
+            if (dao.insertLifecycleControl(row) != 1L) {
+                throw new IllegalStateException("conversation clear already exists");
+            }
+            terminalFaultHook.after("lifecycle_control");
+            dao.clearReplyPartsThroughSequence(safeCharacterId, clearedThroughSequence);
+            result.set(LifecycleControl.fromEntity(row));
+        });
+        return result.get();
+    }
+
+    private static LifecycleControlEntity encodedToEntity(
+        LifecycleControlCodec.Encoded encoded,
+        String characterId,
+        String peerId,
+        long now
+    ) {
+        LifecycleControlEntity row = new LifecycleControlEntity();
+        row.controlId = encoded.controlId;
+        row.controlKind = LifecycleControl.CLEAR_KIND;
+        row.characterId = characterId;
+        row.peerId = peerId;
+        try {
+            JSONObject semantic = encoded.semantic;
+            row.clearEpoch = semantic.getLong("clearEpoch");
+            row.clearedThroughSequence = semantic.getLong("clearedThroughSequence");
+            row.requestedAt = semantic.getLong("requestedAt");
+        } catch (Exception error) {
+            throw new IllegalStateException("conversation clear semantic conflict", error);
+        }
+        row.semanticJson = BridgeAuthority.canonicalJson(encoded.semantic);
+        row.semanticChecksum = encoded.semanticChecksum;
+        row.state = LifecycleControl.WAITING;
+        row.leaseAttempt = 0L;
+        row.updatedAt = now;
+        return row;
     }
 
     public void recordTerminalReceipt(
@@ -3292,6 +3671,15 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 throw bridgeAuthorityConflict(turn.turnId);
             }
             validateCheckpointOutcome(turn, checkpoint, outcome);
+            if ("redacted".equals(outcomeType)
+                && outcome.opt("route") == JSONObject.NULL
+                && "conversation-clear-redacted-v1".equals(
+                    outcome.optJSONObject("result") == null
+                        ? null : outcome.optJSONObject("result").optString("contract"))) {
+                validateConversationClearTombstone(
+                    turn, attempt, checkpoint, outcome, false, requireCurrentPins);
+                return checkpoint;
+            }
             JSONObject envelope = checkpointEnvelope(checkpoint);
             long claimedRevision = exactSafeInteger(checkpoint, "claimedLineageRevision", true);
             long inputVisibilitySequence = exactSafeInteger(
@@ -3386,6 +3774,15 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                     BridgeAuthority.sha256CanonicalJson(checkpoint))) {
                 throw bridgeAuthorityConflict(turn.turnId);
             }
+            JSONObject outcome = checkpoint.optJSONObject("outcome");
+            if (outcome != null && "redacted".equals(outcome.optString("type"))
+                && "conversation-clear-redacted-v1".equals(
+                    outcome.optJSONObject("result") == null
+                        ? null : outcome.optJSONObject("result").optString("contract"))) {
+                validateConversationClearTombstone(
+                    turn, attempt, checkpoint, outcome, true, requireCurrentPins);
+                return checkpoint;
+            }
             JSONObject fallbackExecution = checkpoint.optJSONObject("fallbackExecution");
             JSONObject snapshot = new JSONObject(turn.snapshotJson);
             JSONObject persistedExecution = snapshot.optJSONObject("fallbackExecution");
@@ -3395,7 +3792,6 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 throw bridgeAuthorityConflict(turn.turnId);
             }
             new FallbackCognitionPacketCodec().decode(snapshot);
-            JSONObject outcome = checkpoint.optJSONObject("outcome");
             if (outcome != null && "redacted".equals(outcome.opt("type"))) {
                 validateLocalRedactedCheckpoint(
                     turn, attempt, checkpoint, outcome, requireCurrentPins);
@@ -3497,18 +3893,86 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             || !TurnState.COMPLETED.name().equals(attempt.state)) {
             throw bridgeAuthorityConflict(turn.turnId);
         }
+        if (requireCurrentPins && (!checkpoint.getString("authorityLineageKey").equals(
+                turn.authorityLineageKey)
+            || !checkpoint.getString("laneKey").equals(turn.laneKey)
+            || turn.inputVisibilitySequence == null
+            || turn.inputVisibilitySequence != checkpoint.getLong("inputVisibilitySequence")
+            || turn.inputClearEpoch == null
+            || turn.inputClearEpoch != checkpoint.getLong("inputClearEpoch"))) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+    }
+
+    private void validateConversationClearTombstone(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt,
+        JSONObject checkpoint,
+        JSONObject outcome,
+        boolean localV2,
+        boolean requireCurrentPins
+    ) throws Exception {
+        JSONObject result = outcome.optJSONObject("result");
+        Set<String> resultKeys = new HashSet<>(Arrays.asList(
+            "contract", "controlId", "clearEpoch", "clearedThroughSequence"
+        ));
+        Object redactedAt = outcome.opt("redactedAt");
+        if (!OUTCOME_KEYS.equals(keysOf(outcome))
+            || outcome.opt("route") != JSONObject.NULL
+            || outcome.opt("relayMessageId") != JSONObject.NULL
+            || outcome.opt("failure") != JSONObject.NULL
+            || result == null || !resultKeys.equals(keysOf(result))
+            || !"conversation-clear-redacted-v1".equals(result.opt("contract"))
+            || !(result.opt("controlId") instanceof String)
+            || !((String) result.opt("controlId")).matches("ctl_[a-f0-9]{64}")
+            || !(redactedAt instanceof Number) || redactedAt instanceof Float
+            || redactedAt instanceof Double || ((Number) redactedAt).longValue() <= 0L
+            || exactSafeInteger(result, "clearEpoch", false) < 0L
+            || exactSafeInteger(result, "clearedThroughSequence", false) < 0L
+            || checkpoint.opt("normalizedEnvelope") != JSONObject.NULL
+            || (localV2 && (checkpoint.opt("fallbackExecution") != JSONObject.NULL
+                || exactSafeInteger(checkpoint, "journalSyncSeq", false) != 0L))
+            || !TurnState.COMPLETED.name().equals(turn.state)
+            || turn.deletedAt == null || turn.deletedAt != ((Number) redactedAt).longValue()
+            || turn.visibleGroupId != null || turn.bridgeCommitChecksum != null
+            || turn.commitPayloadVersion != null || turn.terminalDisposition != null
+            || dao.replyPartCount(turn.turnId) != 0
+            || !AttemptStage.FINISHED.name().equals(attempt.stage)
+            || !TurnState.COMPLETED.name().equals(attempt.state)) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        LifecycleControlEntity control = dao.lifecycleControl(result.optString("controlId", ""));
+        if (control == null || !LifecycleControl.CLEAR_KIND.equals(control.controlKind)
+            || !turn.characterId.equals(control.characterId) || control.semanticJson == null
+            || !control.semanticChecksum.equals(LifecycleControlCodec.semanticChecksum(
+                new JSONObject(control.semanticJson)))
+            || !control.controlId.equals(result.optString("controlId"))
+            || control.clearEpoch == null || control.clearEpoch.longValue() != result.getLong("clearEpoch")
+            || control.clearedThroughSequence == null
+            || control.clearedThroughSequence.longValue() != result.getLong("clearedThroughSequence")
+            || control.requestedAt != ((Number) redactedAt).longValue()
+            || control.state == null) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+        JSONObject controlWire = new JSONObject(control.semanticJson);
+        if (!LifecycleControlCodec.controlId(controlWire).equals(control.controlId)
+            || !controlWire.getString("roleId").equals(turn.characterId)
+            || controlWire.getLong("clearEpoch") != result.getLong("clearEpoch")
+            || controlWire.getLong("clearedThroughSequence") != result.getLong("clearedThroughSequence")
+            || controlWire.getLong("requestedAt") != ((Number) redactedAt).longValue()) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
         ConversationAuthorityEntity authority = dao.conversationAuthority(
             checkpoint.getString("authorityLineageKey"));
         if (authority == null || !"CANCELLED".equals(authority.state)
-            || authority.revision != checkpoint.getLong("claimedLineageRevision") + 1L
             || !checkpoint.getString("authoritativeTurnId").equals(authority.latestTurnId)
+            || authority.revision != checkpoint.getLong("claimedLineageRevision") + 1L
             || authority.visibleGroupId != null || authority.commitChecksum != null
             || authority.commitPayloadVersion != null || authority.authorityOrigin != null
             || authority.terminalDisposition != null) {
             throw bridgeAuthorityConflict(turn.turnId);
         }
-        if (requireCurrentPins && (!checkpoint.getString("authorityLineageKey").equals(
-                turn.authorityLineageKey)
+        if (requireCurrentPins && (!checkpoint.getString("authorityLineageKey").equals(turn.authorityLineageKey)
             || !checkpoint.getString("laneKey").equals(turn.laneKey)
             || turn.inputVisibilitySequence == null
             || turn.inputVisibilitySequence != checkpoint.getLong("inputVisibilitySequence")
@@ -3532,6 +3996,17 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         if ("open".equals(type)) {
             if (route != JSONObject.NULL || relay != JSONObject.NULL || failure != JSONObject.NULL
                 || result != JSONObject.NULL || redactedAt != JSONObject.NULL) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+            return;
+        }
+        if ("redacted".equals(type)) {
+            boolean conversationTombstone = route == JSONObject.NULL && relay == JSONObject.NULL;
+            boolean legacyLocalRedaction = "local".equals(route) && relay == JSONObject.NULL;
+            if ((!conversationTombstone && !legacyLocalRedaction)
+                || failure != JSONObject.NULL || !(result instanceof JSONObject)
+                || !(redactedAt instanceof Number) || redactedAt instanceof Float
+                || redactedAt instanceof Double || ((Number) redactedAt).longValue() <= 0L) {
                 throw bridgeAuthorityConflict(turn.turnId);
             }
             return;
@@ -3578,22 +4053,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
             return;
         }
-        if (!"redacted".equals(type)
-            || failure != JSONObject.NULL || !(result instanceof JSONObject)
-            || !(redactedAt instanceof Number)
-            || redactedAt instanceof Float || redactedAt instanceof Double
-            || ((Number) redactedAt).longValue() <= 0L) {
-            throw bridgeAuthorityConflict(turn.turnId);
-        }
-        validatePersistedTerminalOutcome(
-            turn, checkpoint, (JSONObject) result, (String) route,
-            relay == JSONObject.NULL ? null : (String) relay, true);
-        if (!TurnState.COMPLETED.name().equals(turn.state)
-            || turn.deletedAt == null
-            || turn.deletedAt != ((Number) redactedAt).longValue()
-            || !sameTerminalReceipt(turn, (JSONObject) result)) {
-            throw bridgeAuthorityConflict(turn.turnId);
-        }
+        throw bridgeAuthorityConflict(turn.turnId);
     }
 
     private static void validatePersistedTerminalOutcome(

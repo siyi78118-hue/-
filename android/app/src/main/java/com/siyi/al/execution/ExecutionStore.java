@@ -54,7 +54,7 @@ public interface ExecutionStore {
 
     ConversationCursorEntity getConversationCursor(String characterId);
 
-    void markConversationCleared(String characterId, long clearedThroughSequence, long clearEpoch, long now);
+    LifecycleControl createConversationClear(String characterId, String expectedCursorChecksum);
 
     void markCloudConfirmed(String turnId, long now);
 }

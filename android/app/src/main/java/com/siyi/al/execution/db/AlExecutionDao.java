@@ -19,6 +19,25 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertConversationAuthority(ConversationAuthorityEntity authority);
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertLifecycleControl(LifecycleControlEntity control);
+
+    @Query("SELECT * FROM lifecycle_controls WHERE controlId = :controlId LIMIT 1")
+    LifecycleControlEntity lifecycleControl(String controlId);
+
+    @Query("SELECT * FROM lifecycle_controls WHERE characterId = :characterId AND clearEpoch = :clearEpoch LIMIT 1")
+    LifecycleControlEntity lifecycleControlForClear(String characterId, long clearEpoch);
+
+    @Query("SELECT * FROM lifecycle_controls ORDER BY controlId ASC")
+    List<LifecycleControlEntity> lifecycleControls();
+
+    @Query("UPDATE lifecycle_controls SET state = :nextState, leaseId = :leaseId, leaseAttempt = :leaseAttempt, leasedAt = :leasedAt, relayMessageId = :relayMessageId, relayExpiresAt = :relayExpiresAt, appliedAt = :appliedAt, updatedAt = :updatedAt WHERE controlId = :controlId AND state = :expectedState")
+    int compareAndSetLifecycleControl(
+        String controlId, String expectedState, String nextState, String leaseId,
+        long leaseAttempt, Long leasedAt, String relayMessageId, Long relayExpiresAt,
+        Long appliedAt, long updatedAt
+    );
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     void insertAttempt(ExecutionAttemptEntity attempt);
 
@@ -126,6 +145,12 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM chat_turns WHERE turnId = :turnId LIMIT 1")
     ChatTurnEntity turn(String turnId);
 
+    @Query("SELECT * FROM chat_turns WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)) ORDER BY CASE WHEN inputVisibilitySequence IS NULL THEN 0 ELSE 1 END, inputVisibilitySequence ASC, turnId ASC")
+    List<ChatTurnEntity> turnsThroughClear(String characterId, long clearedThroughSequence);
+
+    @Query("SELECT * FROM chat_turns WHERE characterId = :characterId AND bridgeProtocolVersion IS NOT NULL AND (inputVisibilitySequence IS NULL OR inputVisibilitySequence < 0 OR inputVisibilitySequence > 9007199254740991) LIMIT 1")
+    ChatTurnEntity invalidV3VisibilitySequence(String characterId);
+
     @Query("SELECT * FROM conversation_cursors WHERE characterId = :characterId LIMIT 1")
     ConversationCursorEntity conversationCursor(String characterId);
 
@@ -217,8 +242,24 @@ public interface AlExecutionDao {
         String checkpointChecksum
     );
 
-    @Query("DELETE FROM reply_parts WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)")
+    @Query("DELETE FROM reply_parts WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)))")
     int clearReplyPartsThroughSequence(String characterId, long clearedThroughSequence);
+
+    @Query("DELETE FROM yuqi_raw_messages WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)))")
+    int clearRawMessagesThroughSequence(String characterId, long clearedThroughSequence);
+
+    @Query("DELETE FROM diagnostics WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)))")
+    int clearDiagnosticsThroughSequence(String characterId, long clearedThroughSequence);
+
+    @Query("UPDATE change_events SET type = 'TURN_REDACTED', payloadJson = :payloadJson WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)))")
+    int redactChangeEventsThroughSequence(
+        String characterId, long clearedThroughSequence, String payloadJson);
+
+    @Query("UPDATE execution_attempts SET memoryResult = NULL, rawReply = NULL, errorCode = NULL, errorDetail = NULL, stage = 'FINISHED', state = 'COMPLETED', finishedAt = COALESCE(finishedAt, :redactedAt), retryable = 0 WHERE turnId IN (SELECT turnId FROM chat_turns WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)))")
+    int clearAttemptSemanticsThroughSequence(String characterId, long clearedThroughSequence, long redactedAt);
+
+    @Query("UPDATE chat_turns SET state = 'COMPLETED', inputJson = '{}', snapshotJson = '{}', cloudJobId = NULL, notificationShownAt = NULL, uiAppliedAt = NULL, cloudConfirmedAt = NULL, completedAt = COALESCE(completedAt, :redactedAt), deletedAt = COALESCE(deletedAt, :redactedAt), visibleGroupId = NULL, authorityOrigin = NULL, commitPayloadVersion = NULL, generationFingerprint = NULL, pipelineReleaseId = NULL, bridgeCommitChecksum = NULL, terminalDisposition = NULL, updatedAt = :redactedAt WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence))")
+    int clearTurnSemanticsThroughSequence(String characterId, long clearedThroughSequence, long redactedAt);
 
     @Query("SELECT * FROM chat_turns WHERE sourceMessageId = :sourceMessageId LIMIT 1")
     ChatTurnEntity turnBySourceMessage(String sourceMessageId);
