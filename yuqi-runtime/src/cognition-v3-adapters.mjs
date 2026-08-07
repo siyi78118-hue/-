@@ -44,8 +44,21 @@ function directReplyFeatureContext(input) {
 }
 
 function proactiveChatFeatureContext(input) {
+  const persistedAuthority = input.turn?.annotationSnapshot?.proactiveMotiveAuthority;
+  const protocolVersion = Number(input.turn?.protocolVersion ?? input.envelope?.protocolVersion ?? 0);
+  const turnKind = input.turn?.turnKind || input.turn?.rolloutKey || input.envelope?.kind;
+  if (protocolVersion === 3 && turnKind === 'PROACTIVE_CHAT') {
+    return {
+      motiveCandidates: clone(persistedAuthority?.candidates || []),
+      openThreads: rankCognitionItems(input.openThreads, 3).map(clone),
+      dueCommitments: clone(input.dueCommitments || [])
+    };
+  }
+  const authority = persistedAuthority !== undefined
+    ? persistedAuthority
+    : input.proactiveMotiveAuthority;
   return {
-    motiveCandidates: clone(input.motiveCandidates || []),
+    motiveCandidates: clone(authority?.candidates || input.motiveCandidates || []),
     openThreads: rankCognitionItems(input.openThreads, 3).map(clone),
     dueCommitments: clone(input.dueCommitments || [])
   };

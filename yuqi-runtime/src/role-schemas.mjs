@@ -372,13 +372,14 @@ export const COGNITION_SCHEMA_V3 = objectSchema({
     attention: { type: 'string' },
     stanceTransitions: { type: 'array', items: STANCE_TRANSITION_SCHEMA_V3 }
   }, ['immediateFeeling', 'desire', 'resistance', 'attention', 'stanceTransitions']),
-  interactionDecision: objectSchema({
-    intendedResponse: { type: 'string', enum: ['send', 'skip'] },
-    relationshipEffect: { type: 'string' },
-    shouldAcknowledgeBid: { type: 'boolean' },
-    intentionalNonResponseReason: nullable('string'),
-    mustConvey: stringArray(),
-    mustNotClaim: stringArray()
+    interactionDecision: objectSchema({
+      intendedResponse: { type: 'string', enum: ['send', 'skip'] },
+      relationshipEffect: { type: 'string' },
+      shouldAcknowledgeBid: { type: 'boolean' },
+      intentionalNonResponseReason: nullable('string'),
+      mustConvey: stringArray(),
+      mustNotClaim: stringArray(),
+      motiveEvidenceIds: stringArray()
   }, [
     'intendedResponse',
     'relationshipEffect',

@@ -8,8 +8,9 @@ import test from 'node:test';
 
 import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
 import { generationFingerprint, laneKeyForEnvelope } from '../src/interaction-lanes.mjs';
+import { buildProactiveMotiveAuthority } from '../src/life-simulation.mjs';
 import { contentHash, validateEnvelope } from '../src/protocol.mjs';
-import { YuqiStore } from '../src/store.mjs';
+import { InteractionLaneBusyError, YuqiStore } from '../src/store.mjs';
 import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
 const SHA_A = 'a'.repeat(64);
@@ -141,6 +142,51 @@ function envelope(index, kind = 'DIRECT_REPLY') {
   };
 }
 
+function v3AutomaticEnvelope(index, kind = 'PROACTIVE_CHAT') {
+  const triggerId = `trigger_v3_${index}_${kind}`;
+  const cursor = {
+    nativeCompletedTurnId: null,
+    nativeCompletedGroupId: null,
+    nativeCompletedSequence: 0,
+    uiAppliedTurnId: null,
+    uiAppliedGroupId: null,
+    uiAppliedSequence: 0,
+    localSequence: index,
+    clearedThroughSequence: 0,
+    clearEpoch: 0,
+    clearedAt: 0,
+    chatOpen: true,
+    quotedMessageId: null
+  };
+  const input = {
+    protocolVersion: 3,
+    turnId: `turn_v3_${index}`,
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq: index,
+    createdAt: 10_000 + index,
+    kind,
+    trigger: {
+      triggerId,
+      triggerType: kind.toLowerCase(),
+      scheduledFor: 9_000 + index,
+      executedAt: 10_000 + index,
+      context: {}
+    },
+    context: { visibilityCursor: cursor }
+  };
+  input.authority = {
+    algorithm: 'al-authority-v1',
+    roleId: 'yuqi',
+    laneKey: 'private_chat',
+    rootSourceId: triggerId,
+    lineageKey: deriveAuthorityLineageKey({ roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: triggerId }),
+    claimedLineageRevision: 1,
+    retryOfTurnId: null
+  };
+  return input;
+}
+
 function ensureRollout(store, rolloutKey = 'DIRECT_REPLY') {
   if (store.getCognitionRollout(rolloutKey)) return;
   store.initializeCognitionRolloutsInternal({
@@ -177,7 +223,7 @@ function ensureCanonicalRollouts(store) {
   });
 }
 
-function createCanonicalFromEnvelope(store, input) {
+function createCanonicalFromEnvelope(store, input, { annotationSnapshot = {} } = {}) {
   const kind = input.kind;
   ensureRollout(store, kind);
   const rollout = store.getCognitionRollout(kind);
@@ -187,6 +233,10 @@ function createCanonicalFromEnvelope(store, input) {
     roleId: 'yuqi',
     at: input.message?.sentAt ?? input.trigger.executedAt
   });
+  const effectiveAnnotationSnapshot = kind === 'PROACTIVE_CHAT'
+    && Object.keys(annotationSnapshot || {}).length === 0
+    ? store.rebuildProactiveMotiveAuthorityInternal({ envelope: input }).annotationSnapshot
+    : annotationSnapshot;
   return store.createCanonicalVisibleTurnInternal({
     envelope: input,
     rolloutKey: kind,
@@ -199,13 +249,28 @@ function createCanonicalFromEnvelope(store, input) {
     inputUserBatchId: input.message
       ? (input.context?.currentBatch?.batchId || `batch_${input.message.messageId}`)
       : input.trigger.triggerId,
-    inputVisibilitySequence: Number(lane?.localSequence || 0),
+    inputVisibilitySequence: input.protocolVersion === 3
+      ? input.context.visibilityCursor.localSequence
+      : Number(lane?.localSequence || 0),
+    inputClearEpoch: input.protocolVersion === 3
+      ? input.context.visibilityCursor.clearEpoch
+      : Number(lane?.clearEpoch || 0),
     agencySnapshotChecksum: agency.checksum,
-    annotationSnapshot: {}
+    annotationSnapshot: effectiveAnnotationSnapshot
   }).turn;
 }
 
 function createCanonical(store, index, kind = 'DIRECT_REPLY') {
+  if (kind === 'PROACTIVE_CHAT'
+    && !store.listLifeEpisodes('yuqi').some(item => item.episodeId === 'task17_fixture_chat')) {
+    store.putLifePlan('yuqi', [{
+      episodeId: 'task17_fixture_chat',
+      kind: 'personal',
+      title: 'Task17 fixture context',
+      startAt: 0,
+      endAt: 100_000
+    }]);
+  }
   return createCanonicalFromEnvelope(store, envelope(index, kind));
 }
 
@@ -307,6 +372,17 @@ function commitCanonical(store, turn, index, { rich = false, items = undefined, 
       resultingCognitiveStateChecksum: 'd'.repeat(64)
     }
   }] : [];
+  const proactiveV3 = turn.protocolVersion === 3 && turn.rolloutKey === 'PROACTIVE_CHAT';
+  const proactiveAuthority = turn.annotationSnapshot?.proactiveMotiveAuthority;
+  const proactiveEvidenceIds = proactiveV3 && (visibleGroup.items.length || resolvedActionSet.length)
+    ? [proactiveAuthority?.candidates?.[0]?.motiveId].filter(Boolean)
+    : [];
+  const contextRevision = proactiveV3
+    ? contentHash({
+        agencySnapshotChecksum: turn.agencySnapshotChecksum,
+        proactiveMotiveAuthorityChecksum: proactiveAuthority?.checksum
+      })
+    : turn.agencySnapshotChecksum;
   const state = store.getCognitiveState('yuqi');
   return commitVisibleResult({
     store,
@@ -319,10 +395,14 @@ function commitCanonical(store, turn, index, { rich = false, items = undefined, 
     expectedCognitiveStateRevision: Number(state?.revision || 0),
     expectedLatestUserBatchId: turn.inputUserBatchId,
     inputVisibilitySequence: turn.inputVisibilitySequence,
+    inputClearEpoch: turn.inputClearEpoch,
+    protocolVersion: turn.protocolVersion,
+    turnKind: turn.rolloutKey,
     agencySnapshotChecksum: turn.agencySnapshotChecksum,
     authoritativeReleaseId: turn.authoritativeReleaseId,
     visibleGroup,
     actionSet: resolvedActionSet,
+    proactiveMotiveEvidenceIds: proactiveEvidenceIds,
     statePatch,
     memoryJobs,
     comparisonJob: null,
@@ -332,11 +412,508 @@ function commitCanonical(store, turn, index, { rich = false, items = undefined, 
       inputVisibilitySequence: turn.inputVisibilitySequence,
       visibleGroup,
       actionSet: resolvedActionSet,
-      contextRevision: turn.agencySnapshotChecksum
+      contextRevision
     }),
     now: 20_000 + index
   });
 }
+
+test('fresh v3 PROACTIVE_CHAT refuses an occupied direct/proactive lane without writes', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureCanonicalRollouts(store);
+      const firstInput = v3AutomaticEnvelope(1, 'PROACTIVE_CHAT');
+      const rollout = store.getCognitionRollout('PROACTIVE_CHAT');
+      const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: firstInput.createdAt });
+      const first = store.createCanonicalVisibleTurnInternal({
+        envelope: firstInput,
+        rolloutKey: 'PROACTIVE_CHAT',
+        expectedRolloutRevision: rollout.revision,
+        authoritativeReleaseId: rollout.stableReleaseId,
+        comparisonReleaseId: null,
+        comparisonDirection: null,
+        laneKey: 'private_chat',
+        expectedLaneRevision: 0,
+        inputUserBatchId: firstInput.trigger.triggerId,
+        inputVisibilitySequence: 1,
+        inputClearEpoch: 0,
+        agencySnapshotChecksum: agency.checksum,
+        annotationSnapshot: store.rebuildProactiveMotiveAuthorityInternal({ envelope: firstInput }).annotationSnapshot
+      }).turn;
+      const laneBefore = store.getInteractionLane('yuqi', 'private_chat');
+      const secondInput = v3AutomaticEnvelope(2, 'PROACTIVE_CHAT');
+      secondInput.authority.lineageKey = deriveAuthorityLineageKey({
+        roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: secondInput.trigger.triggerId
+      });
+      const before = store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value;
+      assert.throws(() => store.createCanonicalVisibleTurnInternal({
+        envelope: secondInput,
+        rolloutKey: 'PROACTIVE_CHAT',
+        expectedRolloutRevision: rollout.revision,
+        authoritativeReleaseId: rollout.stableReleaseId,
+        comparisonReleaseId: null,
+        comparisonDirection: null,
+        laneKey: 'private_chat',
+        expectedLaneRevision: laneBefore.revision,
+        inputUserBatchId: secondInput.trigger.triggerId,
+        inputVisibilitySequence: 2,
+        inputClearEpoch: 0,
+        agencySnapshotChecksum: agency.checksum,
+        annotationSnapshot: store.rebuildProactiveMotiveAuthorityInternal({ envelope: secondInput }).annotationSnapshot
+      }), error => error instanceof InteractionLaneBusyError || error?.code === 'INTERACTION_LANE_BUSY');
+      assert.equal(Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value), Number(before));
+      assert.equal(store.getInteractionLane('yuqi', 'private_chat').generatingTurnId, first.turnId);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test('Task17 lane collision admission stays limited to v3 direct and proactive chat', () => {
+  for (const [label, makeInput] of [
+    ['wire-v2 direct', index => envelope(index, 'DIRECT_REPLY')],
+    ['v3 proactive moment', index => {
+      const input = v3AutomaticEnvelope(index, 'PROACTIVE_MOMENT');
+      input.authority.laneKey = laneKeyForEnvelope(input);
+      input.authority.lineageKey = deriveAuthorityLineageKey({
+        roleId: input.characterId, laneKey: input.authority.laneKey, rootSourceId: input.authority.rootSourceId
+      });
+      return input;
+    }],
+    ['v3 role plan', index => {
+      const input = v3AutomaticEnvelope(index, 'ROLE_PLAN_CHAT');
+      input.authority.laneKey = laneKeyForEnvelope(input);
+      input.authority.lineageKey = deriveAuthorityLineageKey({
+        roleId: input.characterId, laneKey: input.authority.laneKey, rootSourceId: input.authority.rootSourceId
+      });
+      return input;
+    }]
+  ]) {
+    withTempPath(path => {
+      const store = new YuqiStore(path);
+      try {
+        ensureCanonicalRollouts(store);
+        createCanonicalFromEnvelope(store, makeInput(1));
+        assert.doesNotThrow(() => createCanonicalFromEnvelope(store, makeInput(2)), label);
+      } finally {
+        store.close();
+      }
+    });
+  }
+});
+
+test('v3 direct reply does not requeue a role-plan lane through Task17 admission', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureCanonicalRollouts(store);
+      const plan = v3AutomaticEnvelope(11, 'ROLE_PLAN_CHAT');
+      plan.authority.laneKey = 'private_chat';
+      plan.authority.lineageKey = deriveAuthorityLineageKey({
+        roleId: plan.characterId, laneKey: plan.authority.laneKey, rootSourceId: plan.authority.rootSourceId
+      });
+      plan.context.visibilityCursor.localSequence = 1;
+      createCanonicalFromEnvelope(store, plan);
+      const direct = v3AutomaticEnvelope(12, 'DIRECT_REPLY');
+      delete direct.trigger;
+      direct.message = {
+        messageId: 'msg_direct_after_plan',
+        speakerId: 'user',
+        speakerType: 'user',
+        recipientId: 'yuqi',
+        content: 'direct',
+        sentAt: direct.createdAt
+      };
+      direct.authority.rootSourceId = direct.message.messageId;
+      direct.context.currentBatch = {
+        batchId: 'batch_direct_after_plan',
+        messageIds: [direct.message.messageId],
+        startedAt: direct.message.sentAt,
+        committedAt: direct.createdAt,
+        messages: [direct.message]
+      };
+      direct.authority.laneKey = 'private_chat';
+      direct.authority.lineageKey = deriveAuthorityLineageKey({
+        roleId: direct.characterId, laneKey: direct.authority.laneKey, rootSourceId: direct.authority.rootSourceId
+      });
+      direct.context.visibilityCursor.localSequence =
+        Number(store.getInteractionLane('yuqi', 'private_chat').localSequence || 0) + 1;
+      assert.doesNotThrow(() => createCanonicalFromEnvelope(store, direct));
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test('consumed proactive motives come only from committed v3 manifest evidence ids', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      ensureCanonicalRollouts(store);
+      store.putLifePlan('yuqi', [
+        {
+          episodeId: 'task17_consumed_current',
+          kind: 'personal',
+          title: '当前真实动机',
+          startAt: 9_001,
+          endAt: 100_000
+        },
+        {
+          episodeId: 'task17_consumed_recent',
+          kind: 'personal',
+          title: '最近真实动机',
+          startAt: 8_000,
+          endAt: 9_000
+        }
+      ]);
+      const input = v3AutomaticEnvelope(901, 'PROACTIVE_CHAT');
+      input.context.visibilityCursor.localSequence = 1;
+      const turn = createCanonicalFromEnvelope(store, input);
+      const pinned = turn.annotationSnapshot.proactiveMotiveAuthority.candidates;
+      assert.equal(pinned.length >= 2, true);
+      commitCanonical(store, turn, 901);
+      const group = store.getTurnAuthorityLineage(turn.authorityLineageKey).committedGroupId;
+      const consumed = store.listConsumedProactiveMotiveIdsInternal({ roleId: 'yuqi' });
+      assert.deepEqual(consumed, [pinned[0].motiveId]);
+      assert.equal(consumed.includes(pinned[1].motiveId), false);
+
+      const existingManifest = store.getVisibleResultManifest(group).semantic;
+      const forgedManifest = { ...existingManifest, proactiveMotiveEvidenceIds: ['forged_motive'] };
+      store.db.prepare(`
+        UPDATE visible_result_manifests
+        SET semantic_json = ?, semantic_checksum = ?
+        WHERE group_id = ?
+      `).run(JSON.stringify(forgedManifest), contentHash(forgedManifest), group);
+      assert.throws(
+        () => store.listConsumedProactiveMotiveIdsInternal({ roleId: 'yuqi' }),
+        /canonical visible group authority conflict|proactive motive manifest evidence authority conflict/
+      );
+      assert.throws(
+        () => store.assertVisibleGroupAuthorityInternal(group, { purpose: 'reopen' }),
+        /canonical visible group authority conflict|proactive motive evidence authority conflict|proactive motive authority conflict/
+      );
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test('wire-v2 PROACTIVE_CHAT remains v2-compatible through close and reopen', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      const turn = createCanonical(store, 912, 'PROACTIVE_CHAT');
+      assert.equal(turn.protocolVersion, 2);
+      commitCanonical(store, turn, 912);
+      const groupId = store.getTurnAuthorityLineage(turn.authorityLineageKey).committedGroupId;
+      const manifest = store.getVisibleResultManifest(groupId);
+      assert.equal(manifest.payloadVersion, 'pc-visible-commit-v2');
+      assert.equal(Object.hasOwn(manifest.semantic, 'proactiveMotiveEvidenceIds'), false);
+      assert.equal(store.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }).status, 'live');
+      store.close();
+      const reopened = new YuqiStore(path);
+      try {
+        assert.equal(reopened.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }).status, 'live');
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      try { store.close(); } catch {}
+    }
+  });
+});
+
+test('wire-v3 PROACTIVE_CHAT committed group survives full close and reopen invariants', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    let groupId;
+    try {
+      store.putLifePlan('yuqi', [{
+        episodeId: 'task17_wire3_reopen_current',
+        kind: 'personal',
+        title: '真实 wire3 重启动机',
+        startAt: 0,
+        endAt: 100_000
+      }]);
+      const input = v3AutomaticEnvelope(914, 'PROACTIVE_CHAT');
+      input.context.visibilityCursor.localSequence = 1;
+      const annotationSnapshot = store.rebuildProactiveMotiveAuthorityInternal({
+        envelope: input
+      }).annotationSnapshot;
+      const turn = createCanonicalFromEnvelope(store, input, { annotationSnapshot });
+      assert.equal(turn.protocolVersion, 3);
+      assert.equal(turn.rolloutKey, 'PROACTIVE_CHAT');
+      const receipt = commitCanonical(store, turn, 914);
+      groupId = receipt.visibleGroupId;
+      assert.equal(store.getVisibleResultManifest(groupId).payloadVersion, 'pc-visible-commit-v3');
+      assert.equal(store.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }).status, 'live');
+      store.close();
+
+      const reopened = new YuqiStore(path);
+      try {
+        assert.doesNotThrow(() => reopened.assertVisibleAuthorityV13Invariants());
+        assert.doesNotThrow(() => reopened.assertReleaseAuthorityV14Invariants());
+        assert.equal(
+          reopened.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }).status,
+          'live'
+        );
+      } finally {
+        reopened.close();
+      }
+    } finally {
+      try { store.close(); } catch {}
+    }
+  });
+});
+
+test('wire-v3 receipt with a non-PC authority origin is rejected by scoped and restart validation', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    let groupId;
+    try {
+      store.putLifePlan('yuqi', [{
+        episodeId: 'task17_wire3_wrong_origin',
+        kind: 'personal',
+        title: 'wire3 origin fixture',
+        startAt: 0,
+        endAt: 100_000
+      }]);
+      const input = v3AutomaticEnvelope(915, 'PROACTIVE_CHAT');
+      input.context.visibilityCursor.localSequence = 1;
+      const turn = createCanonicalFromEnvelope(store, input, {
+        annotationSnapshot: store.rebuildProactiveMotiveAuthorityInternal({
+          envelope: input
+        }).annotationSnapshot
+      });
+      groupId = commitCanonical(store, turn, 915).visibleGroupId;
+      store.db.prepare(`
+        UPDATE visible_commit_receipts
+        SET authority_origin = 'android_fallback'
+        WHERE group_id = ?
+      `).run(groupId);
+      assert.throws(
+        () => store.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }),
+        /canonical visible group authority conflict|receipt authority conflict/
+      );
+      store.close();
+      assert.throws(() => new YuqiStore(path), /v11 invariant|authority conflict/);
+    } finally {
+      try { store.close(); } catch {}
+    }
+  });
+});
+
+test('v3 proactive authority preserves trusted annotation siblings and rejects pinned time/source/ref tampering', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      store.putLifePlan('yuqi', [{
+        episodeId: 'task17_sibling_current',
+        kind: 'personal',
+        title: '带可信兄弟字段的真实动机',
+        startAt: 0,
+        endAt: 100_000
+      }]);
+      const input = v3AutomaticEnvelope(913, 'PROACTIVE_CHAT');
+      input.context.visibilityCursor.localSequence = 1;
+      const rebuilt = store.rebuildProactiveMotiveAuthorityInternal({ envelope: input }).annotationSnapshot;
+      const turn = createCanonicalFromEnvelope(store, input, {
+        annotationSnapshot: {
+          ...rebuilt,
+          trustedSibling: { checksum: 'trusted', value: 'preserve' }
+        }
+      });
+      assert.equal(turn.protocolVersion, 3);
+      assert.equal(turn.rolloutKey, 'PROACTIVE_CHAT');
+      assert.equal(typeof turn.annotationSnapshot.proactiveMotiveAuthority.candidates[0].motiveId, 'string');
+      commitCanonical(store, turn, 913);
+      const groupId = store.getTurnAuthorityLineage(turn.authorityLineageKey).committedGroupId;
+      assert.equal(store.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }).status, 'live');
+      const original = JSON.parse(store.db.prepare(
+        'SELECT annotation_snapshot_json FROM turns WHERE turn_id = ?'
+      ).get(turn.turnId).annotation_snapshot_json);
+      const cases = [
+        ['consideredAt', authority => ({ ...authority, consideredAt: authority.consideredAt + 1 })],
+        ['expired', authority => ({
+          ...authority,
+          candidates: authority.candidates.map(candidate => ({
+            ...candidate,
+            expiresAt: authority.consideredAt
+          }))
+        })],
+        ['life source revision', authority => ({
+          ...authority,
+          candidates: authority.candidates.map(candidate => candidate.sourceType === 'current_life_episode'
+            ? { ...candidate, sourceRevision: 0 }
+            : candidate)
+        })],
+        ['structural refs', authority => ({
+          ...authority,
+          structuralSilence: { reasonCode: 'ACTIVE_PRIVATE_CHAT_CONSTRAINT', constraintRefs: [] }
+        })]
+      ];
+      for (const [label, mutate] of cases) {
+        const authority = mutate(original.proactiveMotiveAuthority);
+        authority.checksum = contentHash({
+          version: authority.version,
+          consideredAt: authority.consideredAt,
+          candidates: authority.candidates,
+          structuralSilence: authority.structuralSilence
+        });
+        const annotation = { ...original, proactiveMotiveAuthority: authority };
+        store.db.prepare('UPDATE turns SET annotation_snapshot_json = ? WHERE turn_id = ?')
+          .run(JSON.stringify(annotation), turn.turnId);
+        assert.throws(
+          () => store.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' }),
+          /canonical visible group authority conflict|proactive motive authority conflict/,
+          label
+        );
+        store.db.prepare('UPDATE turns SET annotation_snapshot_json = ? WHERE turn_id = ?')
+          .run(JSON.stringify(original), turn.turnId);
+      }
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test('redacted proactive groups do not make fresh motive scans read tombstone semantics', () => {
+  withTempPath(path => {
+    const fixture = buildRedactedV13Fixture(path, { kind: 'PROACTIVE_CHAT', rich: false });
+    const store = new YuqiStore(fixture.path);
+    try {
+      assert.deepEqual(store.listConsumedProactiveMotiveIdsInternal({ roleId: 'yuqi' }), []);
+    } finally {
+      store.close();
+    }
+  });
+});
+
+test('canonical state patch persists rich schema-v2 open thread projection and reopens it', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    const input = envelope(902);
+    input.protocolVersion = 3;
+    input.context = {
+      currentBatch: {
+        batchId: 'batch_v3_902',
+        messageIds: [input.message.messageId],
+        startedAt: input.message.sentAt,
+        committedAt: input.createdAt,
+        messages: [input.message]
+      },
+      visibilityCursor: {
+        nativeCompletedTurnId: null, nativeCompletedGroupId: null, nativeCompletedSequence: 0,
+        uiAppliedTurnId: null, uiAppliedGroupId: null, uiAppliedSequence: 0,
+        localSequence: 1, clearedThroughSequence: 0, clearEpoch: 0, clearedAt: 0,
+        chatOpen: true, quotedMessageId: null
+      }
+    };
+    input.authority = {
+      algorithm: 'al-authority-v1', roleId: 'yuqi', laneKey: 'private_chat',
+      rootSourceId: input.message.messageId,
+      lineageKey: deriveAuthorityLineageKey({
+        roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: input.message.messageId
+      }),
+      claimedLineageRevision: 1, retryOfTurnId: null
+    };
+    ensureRollout(store, 'DIRECT_REPLY');
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: input.message.sentAt });
+    const turn = store.createCanonicalVisibleTurnInternal({
+      envelope: input,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 0,
+      inputUserBatchId: input.context.currentBatch.batchId,
+      inputVisibilitySequence: 1,
+      inputClearEpoch: 0,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: {}
+    }).turn;
+    commitCanonical(store, turn, 902);
+    const state = store.getCognitiveState('yuqi');
+    assert.equal(state.schemaVersion, 2);
+    assert.deepEqual(state.state.fastState.openThreadIds, ['thread_v12_902']);
+    assert.deepEqual(state.state.fastState.openThreads, [{
+      threadId: 'thread_v12_902',
+      summary: 'thread_v12_902',
+      sourceTurnId: turn.turnId,
+      lastTouchedAt: 9_902
+    }]);
+    store.close();
+    const reopened = new YuqiStore(path);
+    try {
+      assert.deepEqual(reopened.getCognitiveState('yuqi').state.fastState.openThreads, [{
+        threadId: 'thread_v12_902',
+        summary: 'thread_v12_902',
+        sourceTurnId: turn.turnId,
+        lastTouchedAt: 9_902
+      }]);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test('wire-v2 state update removes prior v3 rich thread evidence instead of leaving stale motives', () => {
+  withTempPath(path => {
+    const store = new YuqiStore(path);
+    try {
+      const input = envelope(903);
+      input.protocolVersion = 3;
+      input.context = {
+        currentBatch: {
+          batchId: 'batch_v3_903', messageIds: [input.message.messageId],
+          startedAt: input.message.sentAt, committedAt: input.createdAt, messages: [input.message]
+        },
+        visibilityCursor: {
+          nativeCompletedTurnId: null, nativeCompletedGroupId: null, nativeCompletedSequence: 0,
+          uiAppliedTurnId: null, uiAppliedGroupId: null, uiAppliedSequence: 0,
+          localSequence: 1, clearedThroughSequence: 0, clearEpoch: 0, clearedAt: 0,
+          chatOpen: true, quotedMessageId: null
+        }
+      };
+      input.authority = {
+        algorithm: 'al-authority-v1', roleId: 'yuqi', laneKey: 'private_chat',
+        rootSourceId: input.message.messageId,
+        lineageKey: deriveAuthorityLineageKey({
+          roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: input.message.messageId
+        }),
+        claimedLineageRevision: 1, retryOfTurnId: null
+      };
+      ensureRollout(store, 'DIRECT_REPLY');
+      const rollout = store.getCognitionRollout('DIRECT_REPLY');
+      const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: input.message.sentAt });
+      const v3Turn = store.createCanonicalVisibleTurnInternal({
+        envelope: input, rolloutKey: 'DIRECT_REPLY', expectedRolloutRevision: rollout.revision,
+        authoritativeReleaseId: rollout.stableReleaseId, comparisonReleaseId: null,
+        comparisonDirection: null, laneKey: 'private_chat', expectedLaneRevision: 0,
+        inputUserBatchId: input.context.currentBatch.batchId, inputVisibilitySequence: 1,
+        inputClearEpoch: 0, agencySnapshotChecksum: agency.checksum, annotationSnapshot: {}
+      }).turn;
+      commitCanonical(store, v3Turn, 903);
+
+      const v2Turn = createCanonical(store, 904);
+      commitCanonical(store, v2Turn, 904);
+      const state = store.getCognitiveState('yuqi');
+      assert.deepEqual(state.state.fastState.openThreadIds, ['thread_v12_904']);
+      assert.equal(Object.hasOwn(state.state.fastState, 'openThreads'), false);
+      assert.deepEqual(buildProactiveMotiveAuthority({
+        consideredAt: 9_904,
+        lifeContext: { current: null, recent: [], upcoming: [] },
+        cognitiveState: state
+      }).candidates, []);
+    } finally {
+      store.close();
+    }
+  });
+});
 
 function buildLiveV12Database(path, { groups = 0, statePatches = 0 } = {}) {
   const store = new YuqiStore(path, { targetVersion: 12 });
@@ -2286,13 +2863,16 @@ for (const [name, inject] of [
   }));
 }
 
-test('v13 terminal dispositions permit automatic visible/action-only/skip but reject an empty direct reply', () =>
+test('v13 terminal dispositions permit automatic visible/action-only/skip but reject an empty direct reply', () => {
   withAuthorityV13(store => {
     const direct = createCanonical(store, 81, 'DIRECT_REPLY');
     assert.throws(
       () => commitCanonical(store, direct, 81, { items: [] }),
       /DIRECT_REPLY requires visible result items|terminal disposition/i
     );
+  });
+
+  withAuthorityV13(store => {
 
     const visible = createCanonical(store, 82, 'PROACTIVE_CHAT');
     assert.equal(commitCanonical(store, visible, 82).committed, true);
@@ -2330,6 +2910,112 @@ test('v13 terminal dispositions permit automatic visible/action-only/skip but re
     assert.equal(payload.inputClearEpoch, 0);
     assert.deepEqual(payload.replyParts, []);
     assert.deepEqual(payload.actions, []);
+  });
+});
+
+test('v3 proactive zero-result cannot claim a pinned motive', () =>
+  withAuthorityV13(store => {
+    const envelope = v3AutomaticEnvelope(85, 'PROACTIVE_CHAT');
+    envelope.context.visibilityCursor.localSequence = 1;
+    store.putLifePlan('yuqi', [{
+      episodeId: 'episode_proactive_85',
+      kind: 'personal',
+      title: '测试事件',
+      startAt: envelope.createdAt - 100,
+      endAt: envelope.createdAt + 1000
+    }]);
+    const authority = store.rebuildProactiveMotiveAuthorityInternal({
+      envelope
+    }).annotationSnapshot.proactiveMotiveAuthority;
+    const turn = createCanonicalFromEnvelope(store, envelope, {
+      annotationSnapshot: { proactiveMotiveAuthority: authority }
+    });
+    const lane = store.getInteractionLane('yuqi', turn.laneKey);
+    const lineage = store.getTurnAuthorityLineage(turn.authorityLineageKey);
+    const contextRevision = contentHash({
+      agencySnapshotChecksum: turn.agencySnapshotChecksum,
+      proactiveMotiveAuthorityChecksum: authority.checksum
+    });
+    const before = store.db.prepare('SELECT COUNT(*) AS value FROM visible_result_groups').get().value;
+    assert.throws(() => commitVisibleResult({
+      store,
+      turnId: turn.turnId,
+      authorityLineageKey: turn.authorityLineageKey,
+      laneKey: turn.laneKey,
+      protocolVersion: 3,
+      turnKind: 'PROACTIVE_CHAT',
+      expectedTurnRevision: turn.turnRevision,
+      expectedLineageRevision: lineage.revision,
+      expectedLaneRevision: lane.revision,
+      expectedCognitiveStateRevision: 0,
+      expectedLatestUserBatchId: turn.inputUserBatchId,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      inputClearEpoch: turn.inputClearEpoch,
+      agencySnapshotChecksum: turn.agencySnapshotChecksum,
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      visibleGroup: { items: [] },
+      actionSet: [],
+      statePatch: null,
+      memoryJobs: [],
+      comparisonJob: null,
+      proactiveMotiveEvidenceIds: [authority.candidates[0].motiveId],
+      generationFingerprint: generationFingerprint({
+        roleId: turn.characterId,
+        laneKey: turn.laneKey,
+        inputVisibilitySequence: turn.inputVisibilitySequence,
+        visibleGroup: { items: [] },
+        actionSet: [],
+        contextRevision
+      }),
+      now: envelope.createdAt
+    }), /motive evidence\/result disposition|skip authority/);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM visible_result_groups').get().value, before);
+  }));
+
+test('fresh v3 proactive store creation rejects a self-consistent forged motive snapshot', () =>
+  withAuthorityV13(store => {
+    store.putLifePlan('yuqi', [{
+      episodeId: 'task17_authority_episode',
+      kind: 'personal',
+      title: '真实生活事件',
+      startAt: 29_000,
+      endAt: 31_000
+    }]);
+    const envelope = v3AutomaticEnvelope(86, 'PROACTIVE_CHAT');
+    envelope.context.visibilityCursor.localSequence = 1;
+    const lifeContext = {
+      current: store.listLifeEpisodes('yuqi').find(item => item.status !== 'cancelled'),
+      recent: [],
+      upcoming: []
+    };
+    const authority = buildProactiveMotiveAuthority({
+      consideredAt: envelope.createdAt,
+      lifeContext,
+      cognitiveState: store.getCognitiveState('yuqi'),
+      consumedMotiveIds: [],
+      hardConstraints: store.readAgencyAuthoritySnapshotInternal({
+        roleId: 'yuqi', at: envelope.createdAt
+      }).constraints
+    });
+    const forgedBody = {
+      ...authority,
+      candidates: authority.candidates.map(candidate => ({
+        ...candidate,
+        summary: 'caller-forged summary'
+      }))
+    };
+    const forgedAuthority = {
+      ...forgedBody,
+      checksum: contentHash(forgedBody)
+    };
+    const before = store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value;
+    assert.throws(
+      () => createCanonicalFromEnvelope(store, envelope, {
+        annotationSnapshot: { proactiveMotiveAuthority: forgedAuthority }
+      }),
+      /proactive motive authority conflict/
+    );
+    assert.equal(Number(store.db.prepare('SELECT COUNT(*) AS value FROM turns').get().value), Number(before));
   }));
 
 function v3FailureEnvelope({ suffix, parent = null }) {

@@ -1105,6 +1105,22 @@ test('Android fallback retry imports only an existing failed parent and preserve
     }
   }));
 
+test('a non-Android wire-v2 retry child cannot satisfy canonical failure supersede closure', () =>
+  withStore((store, path) => {
+    const parent = createFailedParent(store, { turnId: 'turn_android_wire2_origin_parent' });
+    const child = retryReceipt(parent, {
+      authoritativeTurnId: 'turn_android_wire2_origin_child'
+    });
+    store.importExternalVisibleReceiptInternal(child);
+    store.db.prepare('UPDATE turns SET origin = ? WHERE turn_id = ?')
+      .run('pc', child.semantic.authoritativeTurnId);
+    store.close();
+    assert.throws(
+      () => new YuqiStore(path),
+      /canonical failure delivery authority conflict/
+    );
+  }));
+
 test('Android fallback retry rejects missing, false-permission, and committed parents without writes', () => {
   withStore(store => {
     const missing = retryReceipt({

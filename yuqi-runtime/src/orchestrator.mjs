@@ -8,11 +8,20 @@ import { buildAuthoritativeInteractionState } from './interaction-state.mjs';
 import { compileInteractionContract } from './interaction-contract.mjs';
 import { buildGenerationWindow } from './conversation-context.mjs';
 import { currentUserBatchForRole, resolveCurrentUserBatch } from './current-user-batch.mjs';
-import { LifeSimulationCoordinator } from './life-simulation.mjs';
+import {
+  LifeSimulationCoordinator,
+  buildProactiveMotiveAuthority,
+  proactiveMotiveSourceContext
+} from './life-simulation.mjs';
 import { materializeImageAttachments } from './image-attachments.mjs';
 import { reduceCognitiveState } from './cognitive-state.mjs';
 import { compileAgencyView } from './agency-state.mjs';
 import { comparisonContractForMode } from './comparison-contract.mjs';
+
+export function canonicalActionSetForDraft({ isProactiveV3, draft, resolve }) {
+  if (typeof resolve !== 'function') throw new Error('canonical action resolver is required');
+  return isProactiveV3 && draft?.action === 'skip' ? [] : resolve();
+}
 import { generationFingerprint, laneKeyForEnvelope } from './interaction-lanes.mjs';
 import { commitVisibleResult } from './visible-result-commit.mjs';
 import {
@@ -323,6 +332,13 @@ export function isAutomaticKind(kind) {
     'ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE',
     'PROACTIVE_CHAT', 'PROACTIVE_MOMENT', 'MOMENT_INTERACTION', 'MOMENT_REPLY'
   ].includes(kind);
+}
+
+export function shouldSkipProactiveSilence(turn) {
+  if (Number(turn?.protocolVersion) !== 3 || turn?.rolloutKey !== 'PROACTIVE_CHAT') return false;
+  const authority = turn?.annotationSnapshot?.proactiveMotiveAuthority;
+  if (!authority || !Array.isArray(authority.candidates)) return false;
+  return authority.candidates.length === 0 || authority.structuralSilence != null;
 }
 
 function normalizeConversationFrame(frame) {
@@ -667,6 +683,25 @@ export class YuqiOrchestrator {
           roleId: envelope.characterId,
           at: canonicalInteractionAt(envelope, this.clock())
         });
+    const annotationSnapshot = exactCanonicalTurn?.annotationSnapshot
+      || retryParent?.annotationSnapshot
+      || (envelope.kind === 'PROACTIVE_CHAT'
+        ? {
+            proactiveMotiveAuthority: buildProactiveMotiveAuthority({
+              consideredAt: canonicalInteractionAt(envelope, this.clock()),
+              lifeContext: proactiveMotiveSourceContext(
+                this.store,
+                envelope.characterId,
+                canonicalInteractionAt(envelope, this.clock())
+              ),
+              cognitiveState: this.store.getCognitiveState?.(envelope.characterId),
+              consumedMotiveIds: this.store.listConsumedProactiveMotiveIdsInternal?.({
+                roleId: envelope.characterId
+              }) || [],
+              hardConstraints: agencySnapshot.constraints || []
+            })
+          }
+        : {});
     const creation = this.store.createCanonicalVisibleTurnInternal({
       envelope,
       rolloutKey: envelope.kind,
@@ -686,7 +721,7 @@ export class YuqiOrchestrator {
         ? envelope.context.visibilityCursor.clearEpoch
         : Number(lane.clearEpoch || 0),
       agencySnapshotChecksum: agencySnapshot.checksum,
-      annotationSnapshot: exactCanonicalTurn?.annotationSnapshot || {}
+      annotationSnapshot
     });
     if (creation.status === 'already_committed') {
       return {
@@ -722,6 +757,25 @@ export class YuqiOrchestrator {
       return { ...(await this.run(turnId)), recoveryPath: 'legacy' };
     }
     const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
+    let failure = null;
+    if (turn.errorJson) {
+      try { failure = JSON.parse(turn.errorJson); } catch { failure = null; }
+    }
+    if (turn.state === 'failed'
+      && lineage?.state === 'cancelled'
+      && failure?.code === 'superseded_by_user_batch') {
+      return {
+        status: 'superseded',
+        state: 'failed',
+        terminal: true,
+        visible: false,
+        turnId: turn.turnId,
+        authorityLineageKey: turn.authorityLineageKey,
+        replyParts: [],
+        actions: [],
+        recoveryPath: 'canonical'
+      };
+    }
     const validLineage = lineage
       && ['open', 'committed'].includes(lineage.state)
       && lineage.latestTurnId === turn.turnId
@@ -1728,7 +1782,84 @@ export class YuqiOrchestrator {
     };
   }
 
+  commitCanonicalProactiveSkip(turn, envelope) {
+    const authority = turn.annotationSnapshot?.proactiveMotiveAuthority;
+    const proactiveAuthorityChecksum = authority?.checksum;
+    if (typeof proactiveAuthorityChecksum !== 'string'
+      || !/^[a-f0-9]{64}$/.test(proactiveAuthorityChecksum)) {
+      throw new Error('proactive motive authority conflict');
+    }
+    const current = this.store.getTurn(turn.turnId);
+    const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
+    const lane = this.store.getInteractionLane(turn.characterId, turn.laneKey);
+    const visibleGroup = { items: [] };
+    const actionSet = [];
+    const fingerprint = generationFingerprint({
+      roleId: turn.characterId,
+      laneKey: turn.laneKey,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      visibleGroup,
+      actionSet,
+      contextRevision: contentHash({
+        agencySnapshotChecksum: turn.agencySnapshotChecksum,
+        proactiveMotiveAuthorityChecksum: proactiveAuthorityChecksum
+      })
+    });
+    return commitVisibleResult({
+      store: this.store,
+      turnId: turn.turnId,
+      authorityLineageKey: turn.authorityLineageKey,
+      laneKey: turn.laneKey,
+      expectedTurnRevision: current.turnRevision,
+      expectedLineageRevision: lineage.revision,
+      expectedLaneRevision: lane.revision,
+      expectedCognitiveStateRevision:
+        Number(this.store.getCognitiveState?.(turn.characterId)?.revision || 0),
+      expectedLatestUserBatchId: turn.inputUserBatchId,
+      inputVisibilitySequence: turn.inputVisibilitySequence,
+      inputClearEpoch: turn.inputClearEpoch,
+      agencySnapshotChecksum: turn.agencySnapshotChecksum,
+      authoritativeReleaseId: turn.authoritativeReleaseId,
+      comparisonReleaseId: turn.comparisonReleaseId,
+      comparisonDirection: comparisonContractForMode(turn.comparisonMode).comparisonDirection,
+      visibleGroup,
+      actionSet,
+      proactiveMotiveEvidenceIds: [],
+      statePatch: null,
+      memoryJobs: [],
+      comparisonJob: this.comparisonJobDraftFromCanonicalTurn(turn, envelope),
+      generationFingerprint: fingerprint,
+      now: this.clock()
+    });
+  }
+
   async runCanonicalReleaseTurn(turn) {
+    const readSupersededOutcome = () => {
+      const current = this.store.getTurn(turn.turnId);
+      const lineage = current?.authorityLineageKey
+        ? this.store.getTurnAuthorityLineage(current.authorityLineageKey)
+        : null;
+      const error = current?.errorJson ? (() => {
+        try { return JSON.parse(current.errorJson); } catch { return null; }
+      })() : null;
+      if (current?.state === 'failed'
+        && lineage?.state === 'cancelled'
+        && error?.code === 'superseded_by_user_batch') {
+        return {
+          status: 'superseded',
+          state: 'failed',
+          terminal: true,
+          visible: false,
+          turnId: current.turnId,
+          authorityLineageKey: current.authorityLineageKey,
+          replyParts: [],
+          actions: []
+        };
+      }
+      return null;
+    };
+    const supersededBeforeExecution = readSupersededOutcome();
+    if (supersededBeforeExecution) return supersededBeforeExecution;
     const existing = this.store.readCanonicalCommitOutcomeInternal({
       lineageKey: turn.authorityLineageKey,
       expectedTurnId: turn.turnId
@@ -1736,15 +1867,31 @@ export class YuqiOrchestrator {
     if (existing?.receipt) return existing.receipt;
     if (existing?.status === 'redacted') return existing;
     const storedEnvelope = JSON.parse(turn.envelopeJson);
+    if (shouldSkipProactiveSilence(turn)) {
+      try {
+        return this.commitCanonicalProactiveSkip(turn, storedEnvelope);
+      } catch (error) {
+        const supersededAfterSkipCommitFailure = readSupersededOutcome();
+        if (supersededAfterSkipCommitFailure) return supersededAfterSkipCommitFailure;
+        throw error;
+      }
+    }
     const declaredBatch = resolveCurrentUserBatch(storedEnvelope);
     const persistedBatch = this.store.getCurrentUserBatch(turn.turnId) || declaredBatch;
     const rawAttachments = (declaredBatch?.messages || []).flatMap(message =>
       Array.isArray(message?.attachments) ? message.attachments : []
     );
-    const preparedImages = await materializeImageAttachments(rawAttachments, {
-      turnId: turn.turnId,
-      retainReceipt: turn.protocolVersion === 3
-    });
+    let preparedImages;
+    try {
+      preparedImages = await materializeImageAttachments(rawAttachments, {
+        turnId: turn.turnId,
+        retainReceipt: turn.protocolVersion === 3
+      });
+    } catch (error) {
+      const supersededAfterImageFailure = readSupersededOutcome();
+      if (supersededAfterImageFailure) return supersededAfterImageFailure;
+      throw error;
+    }
     let envelope = structuredClone(storedEnvelope);
     let currentBatch = persistedBatch ? structuredClone(persistedBatch) : null;
     if (preparedImages.paths.length) {
@@ -1759,6 +1906,8 @@ export class YuqiOrchestrator {
       }
     }
     try {
+      const supersededAfterPreparation = readSupersededOutcome();
+      if (supersededAfterPreparation) return supersededAfterPreparation;
       const agencySnapshot = this.store.readAgencyAuthoritySnapshotInternal({
         roleId: turn.characterId,
         at: canonicalInteractionAt(envelope, this.clock())
@@ -1775,25 +1924,34 @@ export class YuqiOrchestrator {
         featureContext: envelope.context || {},
         limits: { hardConstraints: 5, currentStances: 2, preferences: 4 }
       });
-      const executionResult = await this.releaseExecutor.executeTurn({
-        releaseId: turn.authoritativeReleaseId,
-        releaseChecksum: turn.authoritativePipelineChecksum,
-        execution: {
-          turn,
-          envelope,
-          scene: sceneFromEnvelope(envelope),
-          currentBatch,
-          localImagePaths: [...preparedImages.paths],
-          ...(preparedImages.receipt ? { localImageReceipt: preparedImages.receipt } : {}),
-          agencyView,
-          routeDecision: {
-            route: turn.route,
-            cognitiveState: this.store.getCognitiveState?.(turn.characterId) || {},
-            allowedActionTargets: {}
-          }
-        },
-        dryRun: false
-      });
+      let executionResult;
+      try {
+        executionResult = await this.releaseExecutor.executeTurn({
+          releaseId: turn.authoritativeReleaseId,
+          releaseChecksum: turn.authoritativePipelineChecksum,
+          execution: {
+            turn,
+            envelope,
+            scene: sceneFromEnvelope(envelope),
+            currentBatch,
+            localImagePaths: [...preparedImages.paths],
+            ...(preparedImages.receipt ? { localImageReceipt: preparedImages.receipt } : {}),
+            agencyView,
+            routeDecision: {
+              route: turn.route,
+              cognitiveState: this.store.getCognitiveState?.(turn.characterId) || {},
+              allowedActionTargets: {}
+            }
+          },
+          dryRun: false
+        });
+      } catch (error) {
+        const supersededAfterFailure = readSupersededOutcome();
+        if (supersededAfterFailure) return supersededAfterFailure;
+        throw error;
+      }
+      const supersededAfterExecution = readSupersededOutcome();
+      if (supersededAfterExecution) return supersededAfterExecution;
       const normalizedDraft = normalizeCanonicalBrainDraft(executionResult.draft);
       let relationshipStageAction = normalizedDraft.relationshipStageAction || null;
       if (!relationshipStageAction && normalizedDraft.relationshipStageReview) {
@@ -1817,47 +1975,92 @@ export class YuqiOrchestrator {
           ? structuredClone(relationshipStageAction)
           : null
       };
+      const isProactiveV3 = Number(turn.protocolVersion) === 3
+        && turn.rolloutKey === 'PROACTIVE_CHAT';
+      if (isProactiveV3 && draft.action === 'skip') {
+        const intent = draft.actionIntent || {};
+        const polluted = ['payment', 'moment', 'rolePlan', 'lifeAdjustment', 'relationshipReview']
+          .some(key => intent[key] != null);
+        if (polluted || draft.relationshipStageAction != null
+          || String(draft.reply || '').trim()
+          || (Array.isArray(draft.bubblePlan) && draft.bubblePlan.length)) {
+          throw new Error('PROACTIVE_CHAT skip authority conflict');
+        }
+      }
       if (draft.action === 'skip' && !isAutomaticKind(turn.rolloutKey)) {
         throw new Error('DIRECT_REPLY cannot commit an empty canonical result');
       }
       const visibleGroup = this.canonicalVisibleGroup(turn, envelope, draft);
-      const actionSet = this.canonicalActionSet(turn, draft);
+      // A proactive skip is a terminal zero-result disposition.  A stale
+      // relationship review must never smuggle an action into that group.
+      const actionSet = canonicalActionSetForDraft({
+        isProactiveV3,
+        draft,
+        resolve: () => this.canonicalActionSet(turn, draft)
+      });
+      const proactiveAuthorityChecksum = isProactiveV3
+        ? turn.annotationSnapshot?.proactiveMotiveAuthority?.checksum
+        : null;
+      if (isProactiveV3 && (typeof proactiveAuthorityChecksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(proactiveAuthorityChecksum))) {
+        throw new Error('proactive motive authority conflict');
+      }
       const fingerprint = generationFingerprint({
         roleId: turn.characterId,
         laneKey: turn.laneKey,
         inputVisibilitySequence: turn.inputVisibilitySequence,
         visibleGroup,
         actionSet,
-        contextRevision: turn.agencySnapshotChecksum
+        contextRevision: isProactiveV3
+          ? contentHash({
+              agencySnapshotChecksum: turn.agencySnapshotChecksum,
+              proactiveMotiveAuthorityChecksum: proactiveAuthorityChecksum
+            })
+          : turn.agencySnapshotChecksum
       });
       const current = this.store.getTurn(turn.turnId);
       const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
       const lane = this.store.getInteractionLane(turn.characterId, turn.laneKey);
-      return commitVisibleResult({
-        store: this.store,
-        turnId: turn.turnId,
-        authorityLineageKey: turn.authorityLineageKey,
-        laneKey: turn.laneKey,
-        expectedTurnRevision: current.turnRevision,
-        expectedLineageRevision: lineage.revision,
-        expectedLaneRevision: lane.revision,
-        expectedCognitiveStateRevision:
-          Number(this.store.getCognitiveState?.(turn.characterId)?.revision || 0),
-        expectedLatestUserBatchId: turn.inputUserBatchId,
-        inputVisibilitySequence: turn.inputVisibilitySequence,
-        inputClearEpoch: turn.inputClearEpoch,
-        agencySnapshotChecksum: turn.agencySnapshotChecksum,
-        authoritativeReleaseId: turn.authoritativeReleaseId,
-        comparisonReleaseId: turn.comparisonReleaseId,
-        comparisonDirection: comparisonContractForMode(turn.comparisonMode).comparisonDirection,
-        visibleGroup,
-        actionSet,
-        statePatch: null,
-        memoryJobs: [],
-        comparisonJob: this.comparisonJobDraftFromCanonicalTurn(turn, envelope),
-        generationFingerprint: fingerprint,
-        now: this.clock()
-      });
+      try {
+        return commitVisibleResult({
+          store: this.store,
+          turnId: turn.turnId,
+          authorityLineageKey: turn.authorityLineageKey,
+          laneKey: turn.laneKey,
+          expectedTurnRevision: current.turnRevision,
+          expectedLineageRevision: lineage.revision,
+          expectedLaneRevision: lane.revision,
+          expectedCognitiveStateRevision:
+            Number(this.store.getCognitiveState?.(turn.characterId)?.revision || 0),
+          expectedLatestUserBatchId: turn.inputUserBatchId,
+          inputVisibilitySequence: turn.inputVisibilitySequence,
+          inputClearEpoch: turn.inputClearEpoch,
+          agencySnapshotChecksum: turn.agencySnapshotChecksum,
+          authoritativeReleaseId: turn.authoritativeReleaseId,
+          comparisonReleaseId: turn.comparisonReleaseId,
+          comparisonDirection: comparisonContractForMode(turn.comparisonMode).comparisonDirection,
+          visibleGroup,
+          actionSet,
+          ...(isProactiveV3
+            ? {
+                proactiveMotiveEvidenceIds: draft.action === 'skip'
+                  ? []
+                  : draft.interactionDecision?.motiveEvidenceIds
+              }
+            : {}),
+          statePatch: Number(turn.protocolVersion) === 3
+            ? (draft.statePatch || null)
+            : null,
+          memoryJobs: [],
+          comparisonJob: this.comparisonJobDraftFromCanonicalTurn(turn, envelope),
+          generationFingerprint: fingerprint,
+          now: this.clock()
+        });
+      } catch (error) {
+        const supersededAfterCommitFailure = readSupersededOutcome();
+        if (supersededAfterCommitFailure) return supersededAfterCommitFailure;
+        throw error;
+      }
     } finally {
       this.turnImagePaths.delete(turn.turnId);
       await preparedImages.cleanup();

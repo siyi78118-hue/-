@@ -398,6 +398,16 @@ function v3AutomaticEnvelope({
 function canonicalAutomaticInput(store, rawEnvelope) {
   const envelope = validateEnvelope(rawEnvelope);
   ensureRollout(store, envelope.kind);
+  if (envelope.protocolVersion === 3 && envelope.kind === 'PROACTIVE_CHAT'
+    && !store.listLifeEpisodes('yuqi').length) {
+    store.putLifePlan('yuqi', [{
+      episodeId: 'bridge_task17_fixture',
+      kind: 'personal',
+      title: '桥接测试动机',
+      startAt: 0,
+      endAt: 100_000
+    }]);
+  }
   const rollout = store.getCognitionRollout(envelope.kind);
   const lane = store.getInteractionLane(envelope.characterId, envelope.authority.laneKey);
   const agency = store.readAgencyAuthoritySnapshotInternal({
@@ -416,7 +426,9 @@ function canonicalAutomaticInput(store, rawEnvelope) {
     inputVisibilitySequence: envelope.context.visibilityCursor.localSequence,
     inputClearEpoch: envelope.context.visibilityCursor.clearEpoch,
     agencySnapshotChecksum: agency.checksum,
-    annotationSnapshot: {}
+    annotationSnapshot: envelope.protocolVersion === 3 && envelope.kind === 'PROACTIVE_CHAT'
+      ? store.rebuildProactiveMotiveAuthorityInternal({ envelope }).annotationSnapshot
+      : {}
   };
 }
 
@@ -531,7 +543,8 @@ function commitBridgeResult(store, turn, {
     { content: '第一段', speakerId: 'yuqi', speakerType: 'character', recipientId: 'user' },
     { content: '第二段', speakerId: 'yuqi', speakerType: 'character', recipientId: 'user' }
   ],
-  actionDrafts = [{ kind: 'moment_create', payload: { text: '桥接动态' } }]
+  actionDrafts = [{ kind: 'moment_create', payload: { text: '桥接动态' } }],
+  proactiveMotiveEvidenceIds = undefined
 } = {}) {
   let current = store.setCanonicalTurnRouteInternal({
     turnId: turn.turnId,
@@ -567,6 +580,20 @@ function commitBridgeResult(store, turn, {
     };
   });
   const state = store.getCognitiveState('yuqi');
+  const persistedProactiveAuthority = current.annotationSnapshot?.proactiveMotiveAuthority;
+  const evidenceIds = proactiveMotiveEvidenceIds !== undefined
+    ? proactiveMotiveEvidenceIds
+    : (current.protocolVersion === 3 && current.rolloutKey === 'PROACTIVE_CHAT'
+      ? ((visibleGroup.items.length || actionSet.length)
+        ? [persistedProactiveAuthority?.candidates?.[0]?.motiveId]
+        : [])
+      : undefined);
+  const contextRevision = current.protocolVersion === 3 && current.rolloutKey === 'PROACTIVE_CHAT'
+    ? contentHash({
+        agencySnapshotChecksum: current.agencySnapshotChecksum,
+        proactiveMotiveAuthorityChecksum: persistedProactiveAuthority?.checksum
+      })
+    : current.agencySnapshotChecksum;
   return commitVisibleResult({
     store,
     turnId: current.turnId,
@@ -585,13 +612,14 @@ function commitBridgeResult(store, turn, {
     statePatch: { mood: 'warm', openThreads: [], currentStances: [] },
     memoryJobs: [],
     comparisonJob: null,
+    ...(evidenceIds !== undefined ? { proactiveMotiveEvidenceIds: evidenceIds } : {}),
     generationFingerprint: generationFingerprint({
       roleId: current.characterId,
       laneKey: current.laneKey,
       inputVisibilitySequence: current.inputVisibilitySequence,
       visibleGroup,
       actionSet,
-      contextRevision: current.agencySnapshotChecksum
+      contextRevision
     }),
     now: 20_000
   });

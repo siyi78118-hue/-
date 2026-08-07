@@ -214,6 +214,146 @@ test('stale proactive cloud turn reconciles and acknowledges without dispatching
   assert.deepEqual(diagnostics[0].detail, { ageMs: 12000000 });
 });
 
+test('canonical v3 lane busy stays retryable with no diagnostic, registration, or ACK', async () => {
+  const busyEnvelope = structuredClone(v3Envelope());
+  busyEnvelope.turnId = 'turn_phone_cloud_busy';
+  busyEnvelope.kind = 'PROACTIVE_CHAT';
+  delete busyEnvelope.message;
+  delete busyEnvelope.context.currentBatch;
+  busyEnvelope.trigger = {
+    triggerId: 'trigger_phone_cloud_busy',
+    triggerType: 'proactive_chat',
+    scheduledFor: busyEnvelope.createdAt,
+    executedAt: busyEnvelope.createdAt,
+    context: {}
+  };
+  busyEnvelope.authority.rootSourceId = busyEnvelope.trigger.triggerId;
+  busyEnvelope.authority.lineageKey = deriveAuthorityLineageKey({
+    roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: busyEnvelope.trigger.triggerId
+  });
+  const relay = relayFixture(busyEnvelope);
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    dispatcher: {
+      accept() {
+        events.push('accept');
+        const error = new Error('interaction lane is busy');
+        error.code = 'INTERACTION_LANE_BUSY';
+        throw error;
+      }
+    },
+    store: {
+      registerCloudDelivery() { events.push('register'); },
+      putDiagnostic() { events.push('diagnostic'); }
+    },
+    clock: () => busyEnvelope.createdAt
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, ['accept']);
+  assert.deepEqual(relay.state.acked, []);
+});
+
+test('authenticated recovery is reconciled once before lane-busy retry and never ACKs the busy turn', async () => {
+  const busyEnvelope = structuredClone(v3Envelope());
+  busyEnvelope.turnId = 'turn_phone_cloud_busy_with_recovery';
+  busyEnvelope.kind = 'PROACTIVE_CHAT';
+  delete busyEnvelope.message;
+  delete busyEnvelope.context.currentBatch;
+  busyEnvelope.trigger = {
+    triggerId: 'trigger_phone_cloud_busy_with_recovery',
+    triggerType: 'proactive_chat',
+    scheduledFor: busyEnvelope.createdAt,
+    executedAt: busyEnvelope.createdAt,
+    context: {}
+  };
+  busyEnvelope.authority.rootSourceId = busyEnvelope.trigger.triggerId;
+  busyEnvelope.authority.lineageKey = deriveAuthorityLineageKey({
+    roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: busyEnvelope.trigger.triggerId
+  });
+  const recoveryMessage = {
+    messageId: 'recovery_message_busy',
+    turnId: 'legacy_recovery_turn',
+    characterId: 'yuqi', deviceId: 'phone_cloud', deviceSeq: 1,
+    speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+    content: 'recovered once', sentAt: busyEnvelope.createdAt
+  };
+  const recoveryAnnotation = {
+    annotationId: 'recovery_annotation_busy', roleId: 'yuqi', turnId: 'legacy_recovery_turn',
+    kind: 'recovery_note', value: 'reconciled once'
+  };
+  busyEnvelope.recovery = {
+    peerId: 'phone_cloud',
+    lastCommonSeq: 0,
+    lastSeq: 2,
+    entries: [
+      {
+        seq: 1, entityType: 'message', entityId: recoveryMessage.messageId,
+        operation: 'upsert', payload: recoveryMessage, checksum: contentHash(recoveryMessage)
+      },
+      {
+        seq: 2, entityType: 'annotation', entityId: recoveryAnnotation.annotationId,
+        operation: 'upsert', payload: recoveryAnnotation, checksum: contentHash(recoveryAnnotation)
+      }
+    ]
+  };
+  const relay = relayFixture(busyEnvelope);
+  const events = [];
+  const sync = { value: 0 };
+  const messages = new Map();
+  const annotations = new Map();
+  let dispatches = 0;
+  let diagnostics = 0;
+  const store = {
+    getSyncCursor() { return sync.value; },
+    ackSync(_peerId, seq) { sync.value = Math.max(sync.value, Number(seq)); events.push(`ack-sync:${seq}`); },
+    getMessage(messageId) { return messages.get(messageId) || null; },
+    putMessage(value) { messages.set(value.messageId, structuredClone(value)); events.push(`message:${value.messageId}`); return value; },
+    getAnnotation(annotationId) { return annotations.get(annotationId) || null; },
+    putAnnotation(value) { annotations.set(value.annotationId, structuredClone(value)); events.push(`annotation:${value.annotationId}`); return value; },
+    putDiagnostic() { diagnostics += 1; },
+    registerCloudDelivery() { events.push('legacy-delivery'); }
+  };
+  const reconciler = {
+    async reconcileFrom(value) {
+      events.push(`reconcile:${value.peerId}`);
+      const { YuqiReconciler } = await import('../src/reconcile.mjs');
+      return new YuqiReconciler({ store, codex: {} }).reconcileFrom(value);
+    }
+  };
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl: relay.fetchImpl,
+    reconciler,
+    dispatcher: {
+      accept() {
+        dispatches += 1;
+        const error = new Error('interaction lane is busy');
+        error.code = 'INTERACTION_LANE_BUSY';
+        throw error;
+      }
+    },
+    store,
+    clock: () => busyEnvelope.createdAt
+  });
+  const first = await pump.pumpOnce();
+  const second = await pump.pumpOnce();
+  assert.equal(first.failed, 1);
+  assert.equal(second.failed, 1);
+  assert.equal(dispatches, 2);
+  assert.equal(sync.value, 2);
+  assert.equal(messages.size, 1);
+  assert.equal(annotations.size, 1);
+  assert.equal(events.filter(event => event.startsWith('message:')).length, 1);
+  assert.equal(events.filter(event => event.startsWith('annotation:')).length, 1);
+  assert.equal(diagnostics, 0);
+  assert.equal(events.some(event => event.startsWith('ack-sync:')), true);
+  assert.equal(events.includes('legacy-delivery'), false);
+  assert.deepEqual(relay.state.acked, []);
+});
+
 test('uses deterministic output identity so duplicate cloud delivery cannot create duplicate replies', async () => {
   const relay = relayFixture();
   const pump = new CloudRelayPump({

@@ -274,6 +274,37 @@ test('canonical commit checksum excludes top-level and nested attempt metadata',
   );
 });
 
+test('PROACTIVE_CHAT wire-v3 commit payload preserves only pinned motive evidence', () => {
+  const base = {
+    authorityLineageKey: 'lin_proactive_v3',
+    turnId: 'turn_proactive_v3',
+    laneKey: 'private_chat',
+    expectedLatestUserBatchId: null,
+    inputVisibilitySequence: 4,
+    inputClearEpoch: 0,
+    agencySnapshotChecksum: SHA,
+    expectedCognitiveStateRevision: 2,
+    authoritativeReleaseId: 'release_a',
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    generationFingerprint: SHA,
+    visibleGroup: { items: [] },
+    actionSet: [],
+    statePatch: null,
+    memoryJobs: [],
+    comparisonJob: null,
+    protocolVersion: 3,
+    turnKind: 'PROACTIVE_CHAT',
+    proactiveMotiveEvidenceIds: [],
+    proactiveMotiveAuthorityChecksum: SHA
+  };
+  const payload = canonicalCommitPayload(base);
+  assert.equal(payload.payloadVersion, 'pc-visible-commit-v3');
+  assert.deepEqual(payload.proactiveMotiveEvidenceIds, []);
+  assert.equal(Object.hasOwn(payload, 'proactiveMotiveAuthorityChecksum'), false);
+  assert.equal('reply' in payload, false);
+});
+
 test('canonical memory and compare descriptors default-deny unknown semantic fields', () => {
   const base = {
     authorityLineageKey: 'lin_job_allowlist',

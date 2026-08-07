@@ -194,6 +194,59 @@ test('current interaction preserves every submitted bubble and safe rich-message
   assert.equal(JSON.stringify(result).includes('DO_NOT_COPY'), false);
 });
 
+test('PROACTIVE_CHAT consumes pinned motive authority candidates instead of rebuilding timer input', () => {
+  const input = oversizedInput('PROACTIVE_CHAT');
+  input.motiveCandidates = [{ motiveId: 'legacy_should_not_win' }];
+  input.proactiveMotiveAuthority = {
+    version: 'proactive-motive-v1',
+    consideredAt: 100,
+    candidates: [{
+      motiveId: 'motive_pinned',
+      sourceType: 'open_thread',
+      sourceId: 'thread_1',
+      sourceRevision: 2,
+      sourceChecksum: 'a'.repeat(64),
+      occurredAt: 90,
+      expiresAt: 1000,
+      summary: 'pinned summary'
+    }],
+    structuralSilence: null,
+    checksum: 'b'.repeat(64)
+  };
+  const result = buildCognitionEnvelopeV3(input);
+  assert.deepEqual(result.featureContext.motiveCandidates, input.proactiveMotiveAuthority.candidates);
+  assert.equal(JSON.stringify(result.featureContext).includes('legacy_should_not_win'), false);
+});
+
+test('PROACTIVE_CHAT prefers the persisted turn annotation over caller motive candidates', () => {
+  const input = oversizedInput('PROACTIVE_CHAT');
+  input.motiveCandidates = [{ motiveId: 'caller_must_not_win' }];
+  input.proactiveMotiveAuthority = { candidates: [{ motiveId: 'caller_authority' }] };
+  input.turn = {
+    annotationSnapshot: {
+      proactiveMotiveAuthority: {
+        candidates: [{ motiveId: 'persisted_motive' }]
+      }
+    }
+  };
+  const result = buildCognitionEnvelopeV3(input);
+  assert.deepEqual(result.featureContext.motiveCandidates, [{ motiveId: 'persisted_motive' }]);
+});
+
+test('v3 PROACTIVE_CHAT with no persisted authority never accepts caller motive candidates', () => {
+  const input = oversizedInput('PROACTIVE_CHAT');
+  input.envelope.protocolVersion = 3;
+  input.motiveCandidates = [{ motiveId: 'caller_must_not_win' }];
+  input.proactiveMotiveAuthority = { candidates: [{ motiveId: 'caller_authority' }] };
+  input.turn = {
+    protocolVersion: 3,
+    rolloutKey: 'PROACTIVE_CHAT',
+    annotationSnapshot: {}
+  };
+  const result = buildCognitionEnvelopeV3(input);
+  assert.deepEqual(result.featureContext.motiveCandidates, []);
+});
+
 test('the history budget drops whole old groups and never cuts the boundary batch', () => {
   const input = oversizedInput('DIRECT_REPLY');
   const result = buildCognitionEnvelopeV3(input);

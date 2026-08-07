@@ -8,7 +8,7 @@ import {
   deriveVisibleMessageId
 } from './authority-identity.mjs';
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
-import { decideLaneAdmission, laneKeyForEnvelope } from './interaction-lanes.mjs';
+import { decideLaneAdmission, generationFingerprint, laneKeyForEnvelope } from './interaction-lanes.mjs';
 import { resolvePipelinePair } from './release-pair.mjs';
 import {
   comparisonContractForDirection,
@@ -19,6 +19,11 @@ import {
   projectCanonicalFailureSnapshotForWire,
   projectBridgeResultForWire
 } from './bridge-result-projector.mjs';
+import {
+  buildProactiveMotiveAuthority,
+  motiveIdForSource,
+  proactiveMotiveSourceContext
+} from './life-simulation.mjs';
 import {
   TURN_STATES,
   canonicalJson,
@@ -65,6 +70,70 @@ const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
 
 const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
 const FAILURE_DELIVERY_LEASE_MS = 60_000;
+
+function canonicalEffectiveAtFromEnvelope(envelope) {
+  const value = Number(
+    envelope?.message?.sentAt
+    ?? envelope?.trigger?.executedAt
+    ?? envelope?.trigger?.scheduledFor
+    ?? envelope?.createdAt
+  );
+  return Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function assertCognitiveStateOpenThreadProjection({
+  state,
+  semanticPatch,
+  protocolVersion,
+  authoritativeTurnId,
+  envelope,
+  errorMessage = 'cognitive state authority conflict'
+}) {
+  if (!semanticPatch) throw new Error(errorMessage);
+  const rawIds = Array.isArray(semanticPatch.openThreads) ? semanticPatch.openThreads : [];
+  const expectedIds = rawIds.map(item =>
+    typeof item === 'string' ? item.trim() : String(item?.threadId || '').trim()
+  );
+  if (expectedIds.some(id => !id) || new Set(expectedIds).size !== expectedIds.length) {
+    throw new Error(errorMessage);
+  }
+  const fastState = state && typeof state.fastState === 'object' && !Array.isArray(state.fastState)
+    ? state.fastState
+    : {};
+  if (canonicalJson(fastState.openThreadIds || []) !== canonicalJson(expectedIds)) {
+    throw new Error(errorMessage);
+  }
+  if (Number(protocolVersion) !== 3) {
+    if (Object.hasOwn(fastState, 'openThreads')) throw new Error(errorMessage);
+    return;
+  }
+  const effectiveAt = canonicalEffectiveAtFromEnvelope(envelope);
+  const rich = fastState.openThreads;
+  const keys = ['lastTouchedAt', 'sourceTurnId', 'summary', 'threadId'];
+  if (!Number.isSafeInteger(effectiveAt) || !Array.isArray(rich)
+    || rich.length !== expectedIds.length) throw new Error(errorMessage);
+  rich.forEach((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)
+      || canonicalJson(Object.keys(item).sort()) !== canonicalJson(keys)
+      || item.threadId !== expectedIds[index]
+      || item.summary !== expectedIds[index]
+      || item.sourceTurnId !== authoritativeTurnId
+      || typeof item.lastTouchedAt !== 'number'
+      || !Number.isSafeInteger(item.lastTouchedAt)
+      || item.lastTouchedAt !== effectiveAt) {
+      throw new Error(errorMessage);
+    }
+  });
+}
+
+export class InteractionLaneBusyError extends Error {
+  constructor(message = 'interaction lane is busy') {
+    super(message);
+    this.name = 'InteractionLaneBusyError';
+    this.code = 'INTERACTION_LANE_BUSY';
+    this.retryable = true;
+  }
+}
 
 function stableFailureId(prefix, value) {
   return `${prefix}_${createHash('sha256').update(String(value), 'utf8').digest('hex').slice(0, 24)}`;
@@ -818,6 +887,7 @@ function mapTurn(row) {
     deviceId: row.device_id,
     deviceSeq: row.device_seq,
     sourceMessageId: row.source_message_id,
+    protocolVersion: Number(parseJson(row.envelope_json, {})?.protocolVersion || 0),
     state: row.state,
     route: row.route || 'deep',
     routeReasons: parseJson(row.route_reasons_json, []),
@@ -3595,7 +3665,9 @@ export class YuqiStore {
       SELECT lineage_key, authority_origin, commit_payload_version
       FROM visible_commit_receipts
       WHERE (authority_origin = 'pc'
-             AND commit_payload_version NOT IN ('pc-visible-commit-v1', 'pc-visible-commit-v2'))
+             AND commit_payload_version NOT IN (
+               'pc-visible-commit-v1', 'pc-visible-commit-v2', 'pc-visible-commit-v3'
+             ))
          OR (authority_origin = 'android_fallback'
              AND commit_payload_version NOT IN (
                'android-fallback-commit-v1', 'android-fallback-commit-v2'
@@ -3867,10 +3939,12 @@ export class YuqiStore {
              r.authority_origin AS receipt_origin, m.semantic_json,
              m.semantic_checksum, m.payload_version, m.authority_origin AS manifest_origin,
              g.redacted_at AS group_redacted_at,
-             m.redacted_at AS manifest_redacted_at
+             m.redacted_at AS manifest_redacted_at,
+             t.envelope_json AS group_envelope_json
       FROM visible_result_groups g
       LEFT JOIN visible_commit_receipts r ON r.group_id = g.group_id
       LEFT JOIN visible_result_manifests m ON m.group_id = g.group_id
+      LEFT JOIN turns t ON t.turn_id = g.authoritative_turn_id
     `).all();
     const manifestCount = Number(this.db.prepare(
       'SELECT COUNT(*) AS value FROM visible_result_manifests'
@@ -4079,17 +4153,29 @@ export class YuqiStore {
           || canonicalJson(state.fastState?.openThreadIds || []) !== canonicalJson(expectedOpenThreads)) {
           throw new Error(`v12 invariant manifest cognitive state authority: ${group.group_id}`);
         }
+        const groupEnvelope = parseJson(group.group_envelope_json, {});
+        assertCognitiveStateOpenThreadProjection({
+          state,
+          semanticPatch: semantic.statePatch,
+          protocolVersion: groupEnvelope.protocolVersion,
+          authoritativeTurnId: group.authoritative_turn_id,
+          envelope: groupEnvelope,
+          errorMessage: `v12 invariant manifest cognitive state authority: ${group.group_id}`
+        });
       }
     }
     if (allowHistoricalStatePatch) {
       for (const cognitiveState of this.db.prepare(`
         SELECT c.*, g.role_id AS group_role_id,
-               g.authoritative_turn_id, m.semantic_json
+               g.authoritative_turn_id, m.semantic_json,
+               t.envelope_json AS group_envelope_json
         FROM cognitive_states c
         LEFT JOIN visible_result_groups g
           ON g.group_id = c.last_authority_group_id
         LEFT JOIN visible_result_manifests m
           ON m.group_id = c.last_authority_group_id
+        LEFT JOIN turns t
+          ON t.turn_id = g.authoritative_turn_id
         WHERE c.last_authority_group_id IS NOT NULL
       `).all()) {
         const semantic = parseJson(cognitiveState.semantic_json, null);
@@ -4108,6 +4194,15 @@ export class YuqiStore {
             `v12 invariant current cognitive state authority: ${cognitiveState.role_id}`
           );
         }
+        const groupEnvelope = parseJson(cognitiveState.group_envelope_json, {});
+        assertCognitiveStateOpenThreadProjection({
+          state,
+          semanticPatch: semantic.statePatch,
+          protocolVersion: groupEnvelope.protocolVersion,
+          authoritativeTurnId: cognitiveState.authoritative_turn_id,
+          envelope: groupEnvelope,
+          errorMessage: `v12 invariant current cognitive state authority: ${cognitiveState.role_id}`
+        });
       }
     }
   }
@@ -4688,6 +4783,9 @@ export class YuqiStore {
         t.character_id, t.device_id, t.result_authority_version, t.rollout_key AS turn_kind,
         t.turn_revision, t.input_user_batch_id, t.input_visibility_sequence,
         t.input_clear_epoch, t.authoritative_release_id AS turn_release_id,
+        t.agency_snapshot_checksum AS turn_agency_snapshot_checksum,
+        t.envelope_json AS turn_envelope_json,
+        t.annotation_snapshot_json AS turn_annotation_snapshot_json,
         t.authority_redacted_at AS turn_redacted_at,
         r.authority_origin AS receipt_origin,
         r.commit_payload_version, r.commit_checksum,
@@ -4738,6 +4836,7 @@ export class YuqiStore {
     ]).has(receiptMatrixKey);
     const currentPayload = new Set([
       'pc:pc-visible-commit-v2',
+      'pc:pc-visible-commit-v3',
       'android_fallback:android-fallback-commit-v2'
     ]).has(receiptMatrixKey);
     if ((!historicalPayload && !currentPayload)
@@ -4870,6 +4969,11 @@ export class YuqiStore {
     if (!semantic || contentHash(semantic) !== authority.semantic_checksum) {
       throw new Error('canonical visible group manifest authority conflict');
     }
+    this.assertCanonicalProactiveAuthorityInternal({
+      authority,
+      semantic,
+      groupId: groupKey
+    });
 
     const itemRows = this.db.prepare(`
       SELECT i.*, m.content, m.turn_id AS message_turn_id,
@@ -5012,18 +5116,21 @@ export class YuqiStore {
     `).get(groupKey);
     if (currentState) {
       const state = parseJson(currentState.state_json, {});
-      const expectedOpenThreads = (semantic.statePatch?.openThreads || []).map(item =>
-        typeof item === 'string' ? item : String(item?.threadId || '')
-      ).filter(Boolean);
       if (!semantic.statePatch
         || currentState.role_id !== authority.role_id
         || currentState.last_turn_id !== authority.authoritative_turn_id
         || currentState.checksum !== contentHash(state)
-        || String(state.fastState?.mood || '') !== String(semantic.statePatch.mood || '')
-        || canonicalJson(state.fastState?.openThreadIds || [])
-          !== canonicalJson(expectedOpenThreads)) {
+        || String(state.fastState?.mood || '') !== String(semantic.statePatch.mood || '')) {
         throw new Error('canonical visible group cognitive state authority conflict');
       }
+      assertCognitiveStateOpenThreadProjection({
+        state,
+        semanticPatch: semantic.statePatch,
+        protocolVersion: parseJson(authority.turn_envelope_json, {}).protocolVersion,
+        authoritativeTurnId: authority.authoritative_turn_id,
+        envelope: parseJson(authority.turn_envelope_json, {}),
+        errorMessage: 'canonical visible group cognitive state authority conflict'
+      });
     }
 
     const attempts = this.db.prepare(`
@@ -6538,6 +6645,185 @@ export class YuqiStore {
     }
   }
 
+  rebuildProactiveMotiveAuthorityInternal({ envelope, effectiveAt, excludeGroupId = null }) {
+    const at = canonicalEffectiveAtFromEnvelope(envelope);
+    if (at === null || (effectiveAt !== undefined && Number(effectiveAt) !== at)) {
+      throw new Error('proactive motive authority consideredAt conflict');
+    }
+    const agencySnapshot = this.readAgencyAuthoritySnapshotInternal({
+      roleId: envelope.characterId,
+      at
+    });
+    const lifeContext = proactiveMotiveSourceContext(this, envelope.characterId, at);
+    const authority = buildProactiveMotiveAuthority({
+      consideredAt: at,
+      lifeContext,
+      cognitiveState: this.getCognitiveState(envelope.characterId),
+      consumedMotiveIds: this.listConsumedProactiveMotiveIdsInternal({
+        roleId: envelope.characterId,
+        excludeGroupId
+      }),
+      hardConstraints: agencySnapshot.constraints
+    });
+    return {
+      annotationSnapshot: { proactiveMotiveAuthority: authority },
+      agencySnapshot,
+      effectiveAt: at
+    };
+  }
+
+  assertCanonicalProactiveAuthorityInternal({ authority, semantic, groupId = null }) {
+    const envelope = parseJson(authority.turn_envelope_json, null);
+    const proactive = authority.turn_kind === 'PROACTIVE_CHAT';
+    const evidenceKey = Object.hasOwn(semantic || {}, 'proactiveMotiveEvidenceIds');
+    if (!proactive) {
+      if (evidenceKey || authority.payload_version === 'pc-visible-commit-v3') {
+        throw new Error('canonical proactive motive authority conflict');
+      }
+      return null;
+    }
+    if (Number(envelope?.protocolVersion) !== 3) {
+      if (evidenceKey || authority.payload_version === 'pc-visible-commit-v3'
+        || !['pc-visible-commit-v1', 'pc-visible-commit-v2',
+          'android-fallback-commit-v1', 'android-fallback-commit-v2']
+          .includes(authority.payload_version)) {
+        throw new Error('canonical proactive motive authority conflict');
+      }
+      return null;
+    }
+    if (Number(authority.result_authority_version) !== 1
+      || authority.payload_version !== 'pc-visible-commit-v3'
+      || !evidenceKey) {
+      throw new Error('canonical proactive motive authority conflict');
+    }
+    const storedAnnotation = parseJson(authority.turn_annotation_snapshot_json, null);
+    const motiveAuthority = storedAnnotation?.proactiveMotiveAuthority;
+    if (!motiveAuthority || typeof motiveAuthority !== 'object' || Array.isArray(motiveAuthority)
+      || Object.keys(motiveAuthority).sort().join(',')
+        !== 'candidates,checksum,consideredAt,structuralSilence,version'
+      || motiveAuthority.version !== 'proactive-motive-v1'
+      || typeof motiveAuthority.checksum !== 'string'
+      || !/^[a-f0-9]{64}$/.test(motiveAuthority.checksum)
+      || !Number.isSafeInteger(motiveAuthority.consideredAt)
+      || motiveAuthority.consideredAt < 0
+      || motiveAuthority.consideredAt !== canonicalEffectiveAtFromEnvelope(envelope)
+      || contentHash({
+        version: motiveAuthority.version,
+        consideredAt: motiveAuthority.consideredAt,
+        candidates: motiveAuthority.candidates,
+        structuralSilence: motiveAuthority.structuralSilence
+      }) !== motiveAuthority.checksum) {
+      throw new Error('canonical proactive motive authority conflict');
+    }
+    const evidence = semantic.proactiveMotiveEvidenceIds;
+    if (!Array.isArray(evidence)
+      || new Set(evidence).size !== evidence.length
+      || evidence.some(id => typeof id !== 'string' || !id.trim())) {
+      throw new Error('canonical proactive motive evidence authority conflict');
+    }
+    const candidates = motiveAuthority.candidates;
+    if (!Array.isArray(candidates) || candidates.length > 6) {
+      throw new Error('canonical proactive motive authority conflict');
+    }
+    const candidateKeySet = new Set([
+      'expiresAt', 'motiveId', 'occurredAt', 'sourceChecksum', 'sourceId',
+      'sourceRevision', 'sourceType', 'summary'
+    ]);
+    const sourceTypes = new Set([
+      'current_life_episode', 'recent_life_episode', 'open_thread'
+    ]);
+    for (const candidate of candidates) {
+      const candidateKeys = Object.keys(candidate || {});
+      if (!candidate || candidateKeys.length !== candidateKeySet.size
+        || candidateKeys.some(key => !candidateKeySet.has(key))
+        || typeof candidate.motiveId !== 'string' || !candidate.motiveId.trim()
+        || candidate.motiveId !== candidate.motiveId.trim()
+        || typeof candidate.sourceId !== 'string' || !candidate.sourceId.trim()
+        || candidate.sourceId !== candidate.sourceId.trim()
+        || !sourceTypes.has(candidate.sourceType)
+        || ((candidate.sourceType === 'current_life_episode' || candidate.sourceType === 'recent_life_episode')
+          && candidate.sourceRevision !== null)
+        || (candidate.sourceType === 'open_thread' &&
+          (!Number.isSafeInteger(candidate.sourceRevision) || candidate.sourceRevision < 0))
+        || typeof candidate.sourceChecksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(candidate.sourceChecksum)
+        || !Number.isSafeInteger(candidate.occurredAt) || candidate.occurredAt < 0
+        || !Number.isSafeInteger(candidate.expiresAt) || candidate.expiresAt <= candidate.occurredAt
+        || candidate.occurredAt > motiveAuthority.consideredAt
+        || motiveAuthority.consideredAt >= candidate.expiresAt
+        || typeof candidate.summary !== 'string' || !candidate.summary.trim()
+        || candidate.summary !== candidate.summary.trim()
+        || candidate.summary.length > 2048
+        || motiveIdForSource(candidate) !== candidate.motiveId) {
+        throw new Error('canonical proactive motive authority conflict');
+      }
+    }
+    const sortedCandidates = [...candidates].sort(
+      (left, right) => right.occurredAt - left.occurredAt
+        || left.motiveId.localeCompare(right.motiveId)
+    );
+    if (canonicalJson(sortedCandidates) !== canonicalJson(candidates)
+      || new Set(candidates.map(candidate => candidate.motiveId)).size !== candidates.length) {
+      throw new Error('canonical proactive motive authority conflict');
+    }
+    const structuralSilence = motiveAuthority.structuralSilence;
+    if (structuralSilence !== null && (!structuralSilence
+      || typeof structuralSilence !== 'object'
+      || Object.keys(structuralSilence).sort().join(',') !== 'constraintRefs,reasonCode'
+      || structuralSilence.reasonCode !== 'ACTIVE_PRIVATE_CHAT_CONSTRAINT'
+      || !Array.isArray(structuralSilence.constraintRefs)
+      || structuralSilence.constraintRefs.length === 0
+      || structuralSilence.constraintRefs.some(ref => !ref
+        || Object.keys(ref).sort().join(',') !== 'constraintId,revision'
+        || typeof ref.constraintId !== 'string' || !ref.constraintId.trim()
+        || !Number.isSafeInteger(ref.revision) || ref.revision < 0))) {
+      throw new Error('canonical proactive motive authority conflict');
+    }
+    if (structuralSilence) {
+      const sortedRefs = [...structuralSilence.constraintRefs].sort(
+        (left, right) => left.constraintId.localeCompare(right.constraintId)
+          || left.revision - right.revision
+      );
+      if (new Set(structuralSilence.constraintRefs.map(ref => `${ref.constraintId}:${ref.revision}`)).size
+          !== structuralSilence.constraintRefs.length
+        || canonicalJson(sortedRefs) !== canonicalJson(structuralSilence.constraintRefs)) {
+        throw new Error('canonical proactive motive authority conflict');
+      }
+    }
+    const candidateIds = candidates.map(candidate => candidate.motiveId);
+    const candidateSet = new Set(candidateIds);
+    if (evidence.some(id => !candidateSet.has(id))) {
+      throw new Error('canonical proactive motive evidence authority conflict');
+    }
+    const hasCanonicalOutput = (semantic.visibleItems || []).length > 0
+      || (semantic.actions || []).length > 0;
+    if (hasCanonicalOutput
+      ? (evidence.length < 1 || evidence.length > 3)
+      : evidence.length !== 0) {
+      throw new Error('canonical proactive motive evidence disposition conflict');
+    }
+    if (evidence.some(id => !candidateSet.has(id))) {
+      throw new Error('canonical proactive motive evidence order conflict');
+    }
+    const contextRevision = contentHash({
+      agencySnapshotChecksum: authority.turn_agency_snapshot_checksum,
+      proactiveMotiveAuthorityChecksum: motiveAuthority.checksum
+    });
+    const expectedFingerprint = generationFingerprint({
+      roleId: authority.role_id,
+      laneKey: authority.lane_key,
+      inputVisibilitySequence: authority.input_visibility_sequence,
+      visibleGroup: { items: semantic.visibleItems || [] },
+      actionSet: semantic.actions || [],
+      contextRevision
+    });
+    if (authority.generation_fingerprint !== expectedFingerprint
+      || semantic.generationFingerprint !== expectedFingerprint) {
+      throw new Error('canonical proactive motive generation fingerprint conflict');
+    }
+    return motiveAuthority;
+  }
+
   createCanonicalVisibleTurnInternal(input = {}) {
     for (const forbidden of [
       'resultAuthorityVersion',
@@ -6636,6 +6922,15 @@ export class YuqiStore {
       }
 
       let validatedRetry = null;
+      let freshProactiveAgencySnapshot = null;
+      if (!retry && envelope.protocolVersion === 3 && envelope.kind === 'PROACTIVE_CHAT') {
+        const rebuilt = this.rebuildProactiveMotiveAuthorityInternal({ envelope });
+        if (canonicalJson(input.annotationSnapshot?.proactiveMotiveAuthority || null)
+          !== canonicalJson(rebuilt.annotationSnapshot.proactiveMotiveAuthority)) {
+          throw new Error('proactive motive authority conflict');
+        }
+        freshProactiveAgencySnapshot = rebuilt.agencySnapshot;
+      }
       if (retry) {
         const parent = this.getTurn(retry.retryOfTurnId);
         if (!parent || parent.resultAuthorityVersion !== 1
@@ -6720,6 +7015,77 @@ export class YuqiStore {
       }
       if (inputVisibilitySequence < Number(lane?.localSequence || 0)) {
         throw new Error('input visibility sequence is behind lane authority');
+      }
+      const currentTurn = lane?.generatingTurnId ? this.getTurn(lane.generatingTurnId) : null;
+      const currentEnvelope = currentTurn ? parseJson(currentTurn.envelopeJson, {}) : null;
+      const currentCommitted = Boolean(currentTurn)
+        && (Boolean(currentTurn.replyJson)
+          || ['committed', 'completed', 'delivered'].includes(currentTurn.state));
+      const currentIsTask17V3 = Boolean(currentTurn)
+        && Number(currentTurn.protocolVersion) === 3
+        && Number(currentTurn.resultAuthorityVersion) === 1;
+      const task17LanePair = currentIsTask17V3 && Boolean(currentEnvelope?.kind) && (
+        (envelope.kind === 'PROACTIVE_CHAT'
+          && ['DIRECT_REPLY', 'PROACTIVE_CHAT'].includes(currentEnvelope.kind))
+        || (envelope.kind === 'DIRECT_REPLY' && currentEnvelope.kind === 'PROACTIVE_CHAT')
+      ) && !currentCommitted;
+      const task17LaneAdmission = !retry
+        && Number(envelope.protocolVersion) === 3
+        && ['DIRECT_REPLY', 'PROACTIVE_CHAT'].includes(envelope.kind)
+        && task17LanePair;
+      if (task17LaneAdmission) {
+        const laneDecision = decideLaneAdmission({
+        lane: {
+          ...lane,
+          generatingTurn: currentTurn ? {
+            turnId: currentTurn.turnId,
+            kind: currentEnvelope?.kind,
+            state: currentTurn.state,
+            committed: Boolean(currentTurn.replyJson)
+              || ['committed', 'completed', 'delivered'].includes(currentTurn.state)
+          } : null
+        },
+        incoming: {
+          turnId: envelope.turnId,
+          kind: envelope.kind,
+          state: 'queued',
+          committed: false
+        },
+        now: now()
+        });
+        if (!laneDecision.admitted) {
+          if (envelope.kind === 'PROACTIVE_CHAT') throw new InteractionLaneBusyError();
+          throw new Error(`interaction lane busy: ${laneDecision.reasonCode}`);
+        }
+        if (laneDecision.requeueTurnId) {
+          const requeue = this.getTurn(laneDecision.requeueTurnId);
+          if (requeue?.resultAuthorityVersion === 1) {
+            throw new Error('canonical turn API required for lane requeue');
+          }
+        }
+        if (laneDecision.supersededTurnId) {
+          const superseded = this.getTurn(laneDecision.supersededTurnId);
+          if (!superseded || superseded.resultAuthorityVersion !== 1) {
+            throw new Error('canonical lane supersede authority conflict');
+          }
+          const supersededLineage = this.getTurnAuthorityLineage(superseded.authorityLineageKey);
+          const cancelled = this.cancelCanonicalTurnRowsInternal({
+            turnId: superseded.turnId,
+            authorityLineageKey: superseded.authorityLineageKey,
+            expectedTurnRevision: superseded.turnRevision,
+            expectedLineageRevision: supersededLineage?.revision,
+            reasonCode: laneDecision.reasonCode,
+            supersededByTurnId: envelope.turnId,
+            timestamp: now()
+          });
+          this.settleCanaryFailureInternal({
+            rolloutKey: cancelled.turn.rolloutKey,
+            canaryEpoch: cancelled.turn.canaryEpoch,
+            canarySlot: cancelled.turn.canarySlot,
+            reasonCode: 'CANARY_SOURCE_SUPERSEDED',
+            now: now()
+          });
+        }
       }
       const v3CursorAuthority = envelope.protocolVersion === 3
         ? this.assertCanonicalV3CursorAuthorityInternal({ envelope, lane })
@@ -6851,10 +7217,11 @@ export class YuqiStore {
         ?? envelope.trigger?.scheduledFor
         ?? envelope.createdAt
       );
-      const agencySnapshot = this.readAgencyAuthoritySnapshotInternal({
-        roleId: envelope.characterId,
-        at: agencyEffectiveAt
-      });
+      const agencySnapshot = freshProactiveAgencySnapshot
+        || this.readAgencyAuthoritySnapshotInternal({
+          roleId: envelope.characterId,
+          at: agencyEffectiveAt
+        });
       if (agencySnapshot.checksum !== agencySnapshotChecksum) {
         throw new Error('agency snapshot authority conflict');
       }
@@ -7840,7 +8207,7 @@ export class YuqiStore {
         ? normalized.input.batch.items.at(-1).message
         : null;
       const envelope = {
-        protocolVersion: 3,
+        protocolVersion: Number(normalized.semantic.protocolVersion),
         turnId: normalized.turnId,
         characterId: normalized.roleId,
         deviceId: normalized.deviceId,
@@ -8980,6 +9347,65 @@ export class YuqiStore {
     };
   }
 
+  listConsumedProactiveMotiveIdsInternal({ roleId = 'yuqi', excludeGroupId = null } = {}) {
+    const rows = this.db.prepare(`
+      SELECT m.group_id, m.semantic_json, m.semantic_checksum,
+             t.annotation_snapshot_json
+      FROM visible_result_manifests m
+      JOIN visible_result_groups g ON g.group_id = m.group_id
+      JOIN turns t ON t.turn_id = g.authoritative_turn_id
+      WHERE t.character_id = ?
+        AND t.result_authority_version = 1
+        AND t.rollout_key = 'PROACTIVE_CHAT'
+        AND t.state IN ('committed', 'delivered', 'completed')
+        AND m.payload_version = 'pc-visible-commit-v3'
+        AND (? IS NULL OR m.group_id <> ?)
+      ORDER BY m.created_at, t.turn_id
+    `).all(String(roleId), excludeGroupId, excludeGroupId);
+    const ids = new Set();
+    for (const row of rows) {
+      const closure = this.assertVisibleGroupAuthorityInternal(row.group_id, { purpose: 'proactive_motive_consumption' });
+      if (closure.status === 'redacted') continue;
+      if (closure.status !== 'live' || !closure.manifest?.semantic) {
+        throw new Error('proactive motive manifest authority conflict');
+      }
+      const validatedSemantic = closure.manifest.semantic;
+      const manifest = parseJson(row.semantic_json, null);
+      if (!manifest || contentHash(manifest) !== row.semantic_checksum) {
+        throw new Error('proactive motive manifest checksum authority conflict');
+      }
+      if (contentHash(validatedSemantic) !== row.semantic_checksum) {
+        throw new Error('proactive motive manifest checksum authority conflict');
+      }
+      const evidence = manifest.proactiveMotiveEvidenceIds;
+      const manifestKeys = new Set([
+        'payloadVersion', 'authorityOrigin', 'authorityLineageKey', 'laneKey', 'input',
+        'agency', 'releases', 'generationFingerprint', 'visibleItems', 'actions',
+        'statePatch', 'memoryJobs', 'comparison', 'proactiveMotiveEvidenceIds'
+      ]);
+      const actualManifestKeys = Object.keys(manifest);
+      if (actualManifestKeys.length !== manifestKeys.size
+        || actualManifestKeys.some(key => !manifestKeys.has(key))
+        || manifest.payloadVersion !== 'pc-visible-commit-v3'
+        || !Array.isArray(evidence)
+        || new Set(evidence).size !== evidence.length
+        || evidence.length > 3
+        || evidence.some(id => typeof id !== 'string' || !id.trim())) {
+        throw new Error('proactive motive manifest evidence authority conflict');
+      }
+      const annotation = parseJson(row.annotation_snapshot_json, null);
+      const candidates = annotation?.proactiveMotiveAuthority?.candidates;
+      if (!Array.isArray(candidates)
+        || candidates.some(candidate => typeof candidate?.motiveId !== 'string'
+          || !candidate.motiveId.trim())
+        || evidence.some(id => !candidates.some(candidate => candidate.motiveId === id))) {
+        throw new Error('proactive motive manifest evidence authority conflict');
+      }
+      for (const id of evidence) ids.add(id);
+    }
+    return [...ids].sort();
+  }
+
   setTurnRoute(turnId, route, reasons = []) {
     if (!['fast', 'deep', 'fast_to_deep'].includes(route)) throw new Error('invalid turn route');
     const turn = this.getTurn(turnId);
@@ -9389,10 +9815,13 @@ export class YuqiStore {
       `).get(turn.turnId, turn.authorityLineageKey, Number(turn.lineageRevisionAtCreation) + 1);
       const latest = this.getTurn(lineage.latestTurnId);
       const childWire = parseJson(directChild?.envelope_json, null);
+      const childIsCanonicalV3 = Number(childWire?.protocolVersion) === 3;
+      const childIsAndroidFallbackV2 = directChild?.origin === 'android_fallback'
+        && Number(childWire?.protocolVersion) === 2;
       if (!directChild || !latest
         || directChild.authority_lineage_key !== turn.authorityLineageKey
         || Number(directChild.result_authority_version) !== 1
-        || Number(childWire?.protocolVersion) !== 3
+        || (!childIsCanonicalV3 && !childIsAndroidFallbackV2)
         || latest.authorityLineageKey !== turn.authorityLineageKey
         || Number(latest.resultAuthorityVersion) !== 1
         || !['open', 'committed', 'cancelled'].includes(lineage.state)) {

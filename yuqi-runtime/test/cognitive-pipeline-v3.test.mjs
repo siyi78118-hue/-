@@ -107,6 +107,11 @@ class FakeStore {
       cognitionPacket: packet
     });
   }
+
+  listMessages() { return []; }
+  listFacts() { return []; }
+  getMessage() { return null; }
+  getMessageContext() { return []; }
 }
 
 class FakeClient {
@@ -152,6 +157,38 @@ function v3Release(overrides = {}) {
     expressionSchemaVersion: 3,
     ...overrides
   };
+}
+
+function proactiveEnvelope(motiveCandidates) {
+  return {
+    ...envelope(),
+    turnKind: 'PROACTIVE_CHAT',
+    featureContext: {
+      motiveCandidates,
+      openThreads: [],
+      dueCommitments: []
+    },
+    allowedActions: ['send', 'skip']
+  };
+}
+
+function proactiveTransportEnvelope() {
+  return {
+    protocolVersion: 3,
+    turnId: 'turn_v3_proactive',
+    characterId: 'yuqi',
+    kind: 'PROACTIVE_CHAT',
+    trigger: { triggerId: 'trigger_v3_proactive', triggerType: 'proactive_chat', executedAt: 100 }
+  };
+}
+
+function proactiveCognitionResult(motiveEvidenceIds) {
+  return cognitionResult({
+    interactionDecision: {
+      ...cognitionResult().interactionDecision,
+      motiveEvidenceIds
+    }
+  });
 }
 
 test('fast cognition can escalate before expression with fixed role budgets', async () => {
@@ -270,6 +307,69 @@ test('v3 release draft compiles both non-empty bundles from the immutable releas
     'cognition:2.1.0',
     'expression:2.1.0'
   ]);
+});
+
+test('v3 production draft validates pinned proactive motive evidence and inherited retry annotation', async () => {
+  const pinned = [{ motiveId: 'motive_pinned' }];
+  const client = new FakeClient(proactiveCognitionResult(['motive_pinned']), expressionResult());
+  const store = new FakeStore();
+  const pipeline = new CognitivePipeline({
+    store,
+    codexClient: client,
+    presetRegistry: { resolvePresetBundle: () => 'pinned bundle' }
+  });
+  const result = await pipeline.runV3ReleaseDraft({
+    release: v3Release(),
+    execution: {
+      turn: {
+        turnId: 'turn_v3_retry',
+        characterId: 'yuqi',
+        authoritativeReleaseId: 'release_v3',
+        retryOfTurnId: 'turn_v3_parent',
+        annotationSnapshot: { proactiveMotiveAuthority: { candidates: pinned } }
+      },
+      envelope: proactiveTransportEnvelope(),
+      currentBatch: { messages: [{ messageId: 'u1', type: 'text', text: 'hello', sentAt: 100 }] },
+      scene: {},
+      routeDecision: {},
+      motiveCandidates: [{ motiveId: 'caller_must_not_win' }],
+      client
+    },
+    dryRun: true
+  });
+  assert.equal(result.reply, '行，这次算你多说了两个字。');
+  assert.deepEqual(client.calls[0].payload.cognitionEnvelope.featureContext.motiveCandidates, pinned);
+});
+
+test('v3 production draft rejects a motive id outside the persisted pinned authority', async () => {
+  const pinned = [{ motiveId: 'motive_pinned' }];
+  const client = new FakeClient(proactiveCognitionResult(['motive_forged']), expressionResult());
+  const pipeline = new CognitivePipeline({
+    store: new FakeStore(),
+    codexClient: client,
+    presetRegistry: { resolvePresetBundle: () => 'pinned bundle' }
+  });
+  await assert.rejects(
+    pipeline.runV3ReleaseDraft({
+      release: v3Release(),
+      execution: {
+        turn: {
+          turnId: 'turn_v3_forged',
+          characterId: 'yuqi',
+          authoritativeReleaseId: 'release_v3',
+          annotationSnapshot: { proactiveMotiveAuthority: { candidates: pinned } }
+        },
+        envelope: proactiveTransportEnvelope(),
+        currentBatch: { messages: [{ messageId: 'u1', type: 'text', text: 'hello', sentAt: 100 }] },
+        scene: {},
+        routeDecision: {},
+        motiveCandidates: [{ motiveId: 'caller_must_not_win' }],
+        client
+      },
+      dryRun: true
+    }),
+    /motiveEvidenceIds must cite one to three pinned motives/
+  );
 });
 
 test('release draft rejects write capabilities during dry-run before calling a model', async () => {

@@ -150,10 +150,24 @@ export function validateStatePatchAgainstAgency({
   activeStances,
   currentBatch,
   evidenceIndex,
-  effectiveAt
+  effectiveAt,
+  protocolVersion = 2
 }) {
   const semanticPatch = normalizeStateIntent(patch);
   if (semanticPatch == null) return null;
+  const isWireV3 = Number(protocolVersion) === 3;
+  if (isWireV3) {
+    const normalizedOpenThreads = semanticPatch.openThreads.map(value => {
+      if (typeof value !== 'string') throw new Error('v3 state patch openThreads must be strings');
+      const normalized = value.trim();
+      if (!normalized) throw new Error('v3 state patch openThreads must be non-empty');
+      return normalized;
+    });
+    if (new Set(normalizedOpenThreads).size !== normalizedOpenThreads.length) {
+      throw new Error('v3 state patch openThreads must be unique');
+    }
+    semanticPatch.openThreads = normalizedOpenThreads;
+  }
   const relevantBatch = {
     turnId: turn.turnId,
     messageIds: (currentBatch?.messages || []).map(message => String(message.messageId)),
@@ -175,15 +189,25 @@ export function validateStatePatchAgainstAgency({
     mediumState: {},
     fastState: {}
   };
+  const openThreadIds = semanticPatch.openThreads.map(item =>
+    typeof item === 'string' ? item : String(item?.threadId || '')
+  ).filter(Boolean);
+  const openThreads = openThreadIds.map(threadId => ({
+    threadId,
+    summary: threadId,
+    sourceTurnId: turn.turnId,
+    lastTouchedAt: effectiveAt
+  }));
+  const previousFastState = structuredClone(previous.fastState || {});
+  if (!isWireV3) delete previousFastState.openThreads;
   const nextState = {
     slowState: structuredClone(previous.slowState || {}),
     mediumState: structuredClone(previous.mediumState || {}),
     fastState: {
-      ...(structuredClone(previous.fastState || {})),
+      ...previousFastState,
       mood: semanticPatch.mood,
-      openThreadIds: semanticPatch.openThreads.map(item =>
-        typeof item === 'string' ? item : String(item?.threadId || '')
-      ).filter(Boolean)
+      ...(isWireV3 ? { openThreads } : {}),
+      openThreadIds
     }
   };
   return {
@@ -226,6 +250,16 @@ export function canonicalCommitPayload(input) {
   const payload = canonicalCommitPayloadV1(input);
   payload.payloadVersion = 'pc-visible-commit-v2';
   payload.input.clearEpoch = Number(input.inputClearEpoch ?? 0);
+  if (Number(input.protocolVersion) === 3 && input.turnKind === 'PROACTIVE_CHAT') {
+    const ids = input.proactiveMotiveEvidenceIds;
+    if (!Array.isArray(ids) || new Set(ids).size !== ids.length
+      || ids.some(id => typeof id !== 'string' || !id)
+      || ids.length > 3) {
+      throw new Error('PROACTIVE_CHAT motive evidence authority conflict');
+    }
+    payload.payloadVersion = 'pc-visible-commit-v3';
+    payload.proactiveMotiveEvidenceIds = [...ids];
+  }
   return payload;
 }
 
@@ -233,6 +267,58 @@ export function commitVisibleResult(input) {
   if (!input?.store) throw new Error('visible commit store is required');
   assertContiguousRolePlanActionBlock(input.actionSet || []);
   return input.store.withImmediateTransaction(() => {
+    const authority = input.store.readCommitAuthority({
+      turnId: input.turnId,
+      authorityLineageKey: input.authorityLineageKey,
+      laneKey: input.laneKey
+    });
+    if (!authority.turn || authority.turn.resultAuthorityVersion !== 1) {
+      throw new Error('result authority conflict');
+    }
+    const persistedEnvelope = JSON.parse(authority.turn.envelopeJson);
+    const persistedProtocolVersion = authority.turn.protocolVersion;
+    const persistedTurnKind = authority.turn.rolloutKey || persistedEnvelope.kind;
+    for (const [field, actual] of [
+      ['protocolVersion', persistedProtocolVersion],
+      ['turnKind', persistedTurnKind]
+    ]) {
+      if (Object.hasOwn(input, field) && String(input[field]) !== String(actual)) {
+        throw new Error('visible result authority conflict');
+      }
+    }
+    const persistedInput = {
+      ...input,
+      protocolVersion: persistedProtocolVersion,
+      turnKind: persistedTurnKind
+    };
+    const isProactiveV3 = Number(persistedProtocolVersion) === 3
+      && persistedTurnKind === 'PROACTIVE_CHAT';
+    const annotationSnapshot = authority.turn.annotationSnapshot || {};
+    const proactiveAuthority = annotationSnapshot?.proactiveMotiveAuthority || null;
+    if (isProactiveV3) {
+      if (!proactiveAuthority || typeof proactiveAuthority !== 'object'
+        || typeof proactiveAuthority.checksum !== 'string') {
+        throw new Error('proactive motive authority conflict');
+      }
+      const { checksum, ...semanticAuthority } = proactiveAuthority;
+      if (contentHash(semanticAuthority) !== checksum) {
+        throw new Error('proactive motive authority conflict');
+      }
+      const pinnedIds = new Set((proactiveAuthority.candidates || []).map(item => item?.motiveId));
+      const evidenceIds = persistedInput.proactiveMotiveEvidenceIds;
+      if (!Array.isArray(evidenceIds)
+        || new Set(evidenceIds).size !== evidenceIds.length
+        || evidenceIds.some(id => typeof id !== 'string' || !pinnedIds.has(id))) {
+        throw new Error('proactive motive authority conflict');
+      }
+      const hasCanonicalOutput = (input.visibleGroup?.items || []).length > 0
+        || (input.actionSet || []).length > 0;
+      if (hasCanonicalOutput
+        ? (evidenceIds.length < 1 || evidenceIds.length > 3)
+        : evidenceIds.length !== 0) {
+        throw new Error('PROACTIVE_CHAT motive evidence/result disposition conflict');
+      }
+    }
     const existing = input.store.readCanonicalCommitOutcomeInternal({
       lineageKey: input.authorityLineageKey,
       expectedTurnId: input.turnId,
@@ -244,8 +330,8 @@ export function commitVisibleResult(input) {
         throw new Error('canonical result lineage is redacted and cancelled');
       }
       const canonicalPayload = receipt.commitPayloadVersion === 'pc-visible-commit-v1'
-        ? canonicalCommitPayloadV1(input)
-        : canonicalCommitPayload(input);
+        ? canonicalCommitPayloadV1(persistedInput)
+        : canonicalCommitPayload(persistedInput);
       const commitChecksum = contentHash(canonicalPayload);
       assert.equal(
         receipt.authorityOrigin,
@@ -266,22 +352,13 @@ export function commitVisibleResult(input) {
     }
 
     const canonicalPayload = input.store.userVersion() >= 13
-      ? canonicalCommitPayload(input)
-      : canonicalCommitPayloadV1(input);
+      ? canonicalCommitPayload(persistedInput)
+      : canonicalCommitPayloadV1(persistedInput);
     const commitChecksum = contentHash(canonicalPayload);
-
-    const authority = input.store.readCommitAuthority({
-      turnId: input.turnId,
-      authorityLineageKey: input.authorityLineageKey,
-      laneKey: input.laneKey
-    });
-    if (!authority.turn || authority.turn.resultAuthorityVersion !== 1) {
-      throw new Error('result authority conflict');
-    }
     if (Number(input.inputClearEpoch ?? 0) !== Number(authority.turn.inputClearEpoch || 0)) {
       throw new Error('clear epoch authority conflict');
     }
-    const envelope = JSON.parse(authority.turn.envelopeJson);
+    const envelope = persistedEnvelope;
     const effectiveAt = Number(
       envelope.message?.sentAt
       ?? envelope.trigger?.executedAt
@@ -337,13 +414,19 @@ export function commitVisibleResult(input) {
         payload: structuredClone(action.payload || {})
       };
     });
+    const proactiveContextRevision = isProactiveV3
+      ? contentHash({
+          agencySnapshotChecksum: authority.turn.agencySnapshotChecksum,
+          proactiveMotiveAuthorityChecksum: proactiveAuthority.checksum
+        })
+      : authority.turn.agencySnapshotChecksum;
     const expectedFingerprint = computeGenerationFingerprint({
       roleId: authority.turn.characterId,
       laneKey: authority.turn.laneKey,
       inputVisibilitySequence: authority.turn.inputVisibilitySequence,
       visibleGroup: input.visibleGroup,
       actionSet: resolvedActions,
-      contextRevision: input.agencySnapshotChecksum
+      contextRevision: proactiveContextRevision
     });
     if (input.generationFingerprint !== expectedFingerprint) {
       throw new Error('generation fingerprint authority conflict');
@@ -408,7 +491,8 @@ export function commitVisibleResult(input) {
       activeStances: agencySnapshot.stances,
       currentBatch: batch,
       evidenceIndex,
-      effectiveAt
+      effectiveAt,
+      protocolVersion: authority.turn.protocolVersion
     });
     const semantic = canonicalPayload;
     const normalizedItems = semantic.visibleItems;

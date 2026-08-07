@@ -181,8 +181,20 @@ function sameJson(left, right) {
 }
 
 function v3ValidationContext(cognitionEnvelope, input) {
+  const motiveCandidates = cognitionEnvelope?.featureContext?.motiveCandidates;
+  const proactiveMotiveIds = cognitionEnvelope?.turnKind === 'PROACTIVE_CHAT'
+    ? (Array.isArray(motiveCandidates)
+      ? motiveCandidates.map((candidate) => {
+        if (typeof candidate?.motiveId !== 'string' || !candidate.motiveId.trim()) {
+          throw new Error('PROACTIVE_CHAT pinned motive authority conflict');
+        }
+        return candidate.motiveId;
+      })
+      : [])
+    : [];
   return {
     validMessageIds: v3MessageIds(cognitionEnvelope),
+    proactiveMotiveIds,
     envelope: {
       ...cognitionEnvelope,
       kind: cognitionEnvelope.turnKind

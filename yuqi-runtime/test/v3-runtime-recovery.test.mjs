@@ -162,6 +162,8 @@ function orchestrationFixture({ turns = [], canonicalRouteReasons = ['release-pi
     getTurnAuthorityLineage: lineageKey => lineageMap.get(lineageKey) || null,
     getVisibleCommitReceipt: () => null,
     getCurrentUserBatch: () => null,
+    listLifeEpisodes: () => [],
+    getCharacterLifeState: () => ({ revision: 0 }),
     getInteractionLane: characterId => ({
       roleId: characterId,
       laneKey: `direct:${characterId}`,
@@ -510,6 +512,38 @@ test('persisted version-one recovery uses its pinned authority and never recreat
   assert.equal(fixture.calls.canonicalCreates.length, 0);
   assert.equal(fixture.calls.legacyCreates.length, 0);
   assert.equal(fixture.calls.freshSelections.length, 0);
+});
+
+test('superseded canonical recovery after close/reopen is terminal without quarantine or rerun', async () => {
+  const envelope = directEnvelope({ turnId: 'turn_superseded_recover', messageId: 'msg_superseded_recover' });
+  const persisted = pinnedCanonicalTurn(envelope, {
+    state: 'failed',
+    errorJson: JSON.stringify({ code: 'superseded_by_user_batch' }),
+    turnRevision: 2
+  });
+  const fixture = orchestrationFixture({ turns: [persisted] });
+  const lineage = fixture.lineageMap.get(persisted.authorityLineageKey);
+  Object.assign(lineage, {
+    state: 'cancelled',
+    latestTurnId: persisted.turnId,
+    revision: persisted.lineageRevisionAtCreation + 1
+  });
+  const recovered = await fixture.orchestrator.recover(persisted.turnId);
+  assert.deepEqual(recovered, {
+    status: 'superseded',
+    state: 'failed',
+    terminal: true,
+    visible: false,
+    turnId: persisted.turnId,
+    authorityLineageKey: persisted.authorityLineageKey,
+    replyParts: [],
+    actions: [],
+    recoveryPath: 'canonical'
+  });
+  assert.equal(fixture.calls.releaseExecutions.length, 0);
+  assert.equal(fixture.calls.diagnostics.length, 0);
+  assert.equal(fixture.calls.canonicalRequeues.length, 0);
+  assert.equal(fixture.calls.legacyRequeues.length, 0);
 });
 
 test('missing or inconsistent canonical lineage is quarantined without regeneration', async t => {

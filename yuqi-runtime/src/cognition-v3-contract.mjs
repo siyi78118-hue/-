@@ -237,6 +237,29 @@ export function normalizeCognitionV3Result(value, validationContext = {}) {
     && normalized.interactionDecision.intentionalNonResponseReason !== null) {
     throw new Error('send decision cannot include intentionalNonResponseReason');
   }
+  if (validationContext.envelope?.kind === 'PROACTIVE_CHAT') {
+    const decision = normalized.interactionDecision;
+    if (!Object.hasOwn(decision, 'motiveEvidenceIds') || !Array.isArray(decision.motiveEvidenceIds)) {
+      throw new Error('PROACTIVE_CHAT motiveEvidenceIds are required');
+    }
+    const ids = decision.motiveEvidenceIds;
+    if (new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !id)) {
+      throw new Error('PROACTIVE_CHAT motiveEvidenceIds must be unique non-empty strings');
+    }
+    const pinned = new Set(Array.isArray(validationContext.proactiveMotiveIds)
+      ? validationContext.proactiveMotiveIds.filter(id => typeof id === 'string')
+      : []);
+    if (decision.intendedResponse === 'send') {
+      if (ids.length < 1 || ids.length > 3 || ids.some(id => !pinned.has(id))) {
+        throw new Error('PROACTIVE_CHAT motiveEvidenceIds must cite one to three pinned motives');
+      }
+    } else {
+      if (ids.length !== 0) throw new Error('PROACTIVE_CHAT skip must have empty motiveEvidenceIds');
+      for (const [key, action] of Object.entries(normalized.actionIntent)) {
+        if (action !== null) throw new Error(`PROACTIVE_CHAT skip cannot include ${key} action`);
+      }
+    }
+  }
   validateTransitionCoverage(
     normalized.selfResponse.stanceTransitions,
     validationContext.relevantStances

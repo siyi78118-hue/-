@@ -298,6 +298,12 @@ export class CloudRelayPump {
           summary.processed += 1;
         } catch (error) {
           summary.failed += 1;
+          if (error?.code === 'INTERACTION_LANE_BUSY') {
+            // Lane contention is retryable scheduling state.  It owns no
+            // durable turn/delivery and must not be converted into a
+            // diagnostic or an input ACK.
+            continue;
+          }
           const now = this.clock();
           const relayMessageId = String(message?.messageId || '').slice(0, 128);
           const previous = Number(this.messageDiagnosticTimes.get(relayMessageId) || 0);

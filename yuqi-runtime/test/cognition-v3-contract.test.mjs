@@ -135,6 +135,47 @@ test('DIRECT_REPLY cannot intentionally skip', () => {
   );
 });
 
+test('PROACTIVE_CHAT send must cite one to three pinned motive evidence ids', () => {
+  const value = validCognitionV3({
+    interactionDecision: { ...validCognitionV3().interactionDecision, motiveEvidenceIds: ['motive_1'] }
+  });
+  const context = validationContext({
+    envelope: { ...validationContext().envelope, kind: 'PROACTIVE_CHAT' },
+    proactiveMotiveIds: ['motive_1', 'motive_2']
+  });
+  assert.deepEqual(normalizeCognitionV3Result(value, context).interactionDecision.motiveEvidenceIds, ['motive_1']);
+  for (const candidate of [undefined, [], ['motive_unknown'], ['motive_1', 'motive_1'], ['motive_1', 'motive_2', 'motive_3', 'motive_4']]) {
+    const invalid = validCognitionV3({
+      interactionDecision: {
+        ...validCognitionV3().interactionDecision,
+        ...(candidate === undefined ? {} : { motiveEvidenceIds: candidate })
+      }
+    });
+    assert.throws(() => normalizeCognitionV3Result(invalid, context), /motiveEvidenceIds/);
+  }
+});
+
+test('PROACTIVE_CHAT skip has no action intent and no motive evidence', () => {
+  const value = validCognitionV3({
+    interactionDecision: {
+      ...validCognitionV3().interactionDecision,
+      intendedResponse: 'skip',
+      intentionalNonResponseReason: 'no persisted motive',
+      motiveEvidenceIds: []
+    }
+  });
+  const context = validationContext({
+    envelope: { ...validationContext().envelope, kind: 'PROACTIVE_CHAT' },
+    proactiveMotiveIds: []
+  });
+  assert.deepEqual(normalizeCognitionV3Result(value, context).interactionDecision.motiveEvidenceIds, []);
+  for (const key of ['payment', 'moment', 'rolePlan', 'lifeAdjustment', 'relationshipReview']) {
+    const invalid = structuredClone(value);
+    invalid.actionIntent[key] = { bogus: true };
+    assert.throws(() => normalizeCognitionV3Result(invalid, context), /PROACTIVE_CHAT skip|additional properties|not allowed|does not match/);
+  }
+});
+
 test('structured actions require both an allowed action and the authoritative target', () => {
   const value = validCognitionV3();
   value.actionIntent.payment = {
