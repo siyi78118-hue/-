@@ -508,7 +508,9 @@ like/comment/reply 是零聊天 item 的 `action_only` canonical result；skip �
 - `moment_post`
 - `role_schedule`
 
-认知决定接受、修改、暂停、恢复、取消和完成。可见正文与 operation 必须一致；时间不明确时不得猜测。
+认知决定接受、修改、暂停、恢复、取消和完成。可见正文与 operation 必须一致；时间不明确时不得猜测。这里不靠正则从自由正文反推“三点还是四点”，也不接受模型自报 presentation proof。对于 `DIRECT_REPLY` 中来源为 `spoken/accepted_request/user_created`、确实会改变安排且必须向用户确认的 canonical operation，代码先完成 closed domain、target、revision、evidence 和 explicit-time 校验，再由纯 `renderRolePlanConfirmation(operation,targetSnapshot,'Asia/Shanghai')` 生成完整确认正文；模型自由 reply 不能参与或覆盖这句确认。确认正文、action set、target snapshot 和 generation fingerprint 在同一 visible commit 中固定；多 operation 按 canonical ordinal 逐条渲染。时间非 explicit、renderer 不支持、混入 private decision 或 operation 相互冲突时整组 fail closed，经正常 repair 形成不带 action 的追问，不得保留猜测后的 action 或矛盾正文。
+
+`private_decision` 和四种 `ROLE_PLAN_*` 自动执行 lane 不属于“用户请求的安排确认”，不套用上述 renderer。尤其 `ROLE_PLAN_MOMENT`/`ROLE_PLAN_MOMENT_PRIVATE` 始终是 public-moments 语义；`PRIVATE` 仅表示计划来源，不能把公开动态改写成私聊确认。v1/v2/RA0 保持旧投影，renderer 只约束 v3 的用户可见安排变更。
 
 ### 12.6 支付
 

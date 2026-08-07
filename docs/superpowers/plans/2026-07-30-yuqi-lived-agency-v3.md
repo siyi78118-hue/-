@@ -7384,7 +7384,7 @@ git commit -m "feat: integrate public-safe moment cognition"
 
 ```js
 test('visible role-plan reply and operation cannot contradict', async () => {
-  const result = await runRolePlan({ userText: '明天下午提醒我', now: fixedNow });
+  const result = await runRolePlan({ userText: '明天下午三点提醒我', now: fixedNow });
   assert.equal(result.operation.op, 'create');
   assert.equal(result.operation.schedule.at, '2026-07-31T15:00:00+08:00');
   assert.match(result.visibleText, /明天下午|三点/);
@@ -7394,6 +7394,27 @@ test('unclear time cannot be guessed into a structured schedule', async () => {
   const result = await runRolePlan({ userText: '过几天提醒我' });
   assert.equal(result.operation, null);
   assert.match(result.visibleText, /哪天|什么时候/);
+});
+
+test('v3 user-visible plan confirmation is rendered from the canonical operation', async () => {
+  const result = await runRolePlan({
+    kind: 'DIRECT_REPLY', userText: '明天下午三点提醒我',
+    modelReply: '好，明天下午四点提醒你', now: fixedNow
+  });
+  assert.equal(result.operation.schedule.at, '2026-07-31T15:00:00+08:00');
+  assert.equal(result.visibleText,
+    renderRolePlanConfirmation(result.operation, result.targetSnapshot, 'Asia/Shanghai'));
+  assert.doesNotMatch(result.visibleText, /四点/);
+});
+
+test('automatic and private-decision lanes never receive a private plan confirmation', async () => {
+  for (const kind of ['ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE',
+    'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE']) {
+    const result = await runRolePlan({ kind, source: 'private_decision' });
+    assert.equal(result.usedUserConfirmationRenderer, false);
+  }
+  assert.equal((await runRolePlan({ kind: 'ROLE_PLAN_MOMENT_PRIVATE',
+    source: 'private_decision' })).recipientId, 'public_moments');
 });
 
 test('life planning fixes basis and creates compare only after result commit', async () => {
@@ -7510,7 +7531,11 @@ export function relationshipExpressionView(state) {
 }
 ```
 
-Do not pass stage thresholds, transition graph labels, or “allowed affection” flags to expression. Preserve user-edited stage-persona text and revision; compile ordinary wording such as “克制、不太主动” into tone tendencies, and compile only explicitly author-marked non-negotiable settings into author hard constraints. Role-plan operations remain the existing closed domain `create/update/cancel/pause/resume/complete` and `private_message/moment_post/role_schedule`; targets, evidence, and time validate deterministically. Life attempt creation fixes rollout/release/epoch/checksums/canary slot/input but creates no compare job.
+Do not pass stage thresholds, transition graph labels, or “allowed affection” flags to expression. Preserve user-edited stage-persona text and revision; compile ordinary wording such as “克制、不太主动” into tone tendencies, and compile only explicitly author-marked non-negotiable settings into author hard constraints. Role-plan operations remain the existing closed domain `create/update/cancel/pause/resume/complete` and `private_message/moment_post/role_schedule`; targets, evidence, and time validate deterministically.
+
+Do not compare a free reply with a schedule by regex. Add a pure closed `renderRolePlanConfirmation(operation,targetSnapshot,'Asia/Shanghai')` and a code-owned `requiresUserConfirmation` classifier. The classifier is true only for v3 `DIRECT_REPLY` operations whose normalized persisted source is `spoken/accepted_request/user_created`; update/cancel/pause/resume/complete read that source and identity from the pinned target snapshot, never from model prose. Before rendering, the operation must pass the existing domain/repository/store validators, its target/revision/evidence must be exact, and every user-requested create or schedule-changing update must have `timeConfidence:'explicit'`. When true, the renderer replaces the complete free model reply and renders all canonical operations in ordinal order; the rendered item and action descriptors enter the same visible-result commit and generation fingerprint. Unknown operation/schedule, mixed communicative/private-decision operations, conflicting target snapshots, ambiguous time or renderer failure rejects the whole action set before visible commit and enters the normal repair path; it must not keep the action, guessed time or contradictory free text. `private_decision`, `ROLE_PLAN_CHAT`, `ROLE_PLAN_CHAT_PRIVATE`, `ROLE_PLAN_MOMENT` and `ROLE_PLAN_MOMENT_PRIVATE` never use this user-confirmation renderer. The two moment lanes remain `public_moments`, including `ROLE_PLAN_MOMENT_PRIVATE`; v1/v2/RA0 remain byte-compatible.
+
+Life attempt creation fixes rollout/release/epoch/checksums/canary slot/input but creates no compare job.
 
 Life planning is future-plan synthesis from a store-pinned snapshot, not fact extraction from model-cited evidence. Its immutable evidence authority is exactly `roleId + planningWindowStartAt + planningWindowEndAt + lifeBasisChecksum + contextChecksum + inputChecksum`, closed by `requestBaseKey = contentHash({roleId,startAt,endAt,lifeBasisChecksum,contextChecksum})`; rollout/release/epoch/canary pins remain the separate execution authority and are revalidated as already required by Task 11. `inputSnapshot.roleId/planningWindow` must equal the attempt columns even if a forged row synchronously changes and rehashes its snapshot/checksums/request key, `contentHash(inputSnapshot)` must equal `inputChecksum`, and every `current/recent/upcoming` episode reference must have belonged to that role and matched a real store row/checksum when the attempt was created. This uses the existing attempt columns and does not add a caller-writable evidence field or a schema version. The closed authoritative result top level is exactly `{episodes}`; `evidence/evidenceIds/sourceMessageIds/usedFactIds/lifeBasisChecksum/contextChecksum/inputChecksum/requestBaseKey` and every other top-level key are rejected before any write. The model cannot authorize its own result by echoing checksums or IDs.
 
