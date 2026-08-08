@@ -338,6 +338,12 @@ function createPopulatedV10(path) {
   }
 }
 
+function createDatabaseAtVersion(path, version) {
+  createPopulatedV10(path);
+  const store = new YuqiStore(path, { targetVersion: version });
+  store.close();
+}
+
 function v2Envelope(turnId, deviceSeq, {
   messageId = 'msg_source_original',
   content = '测试消息',
@@ -1010,12 +1016,12 @@ for (const [name, corrupt] of [
   }));
 }
 
-test('populated PC v10 migrates through v11 and v12 to v13 without inventing historical authority', () =>
+test('populated PC v10 migrates through v11-v15 without inventing historical authority', () =>
   withDatabase(path => {
     const before = createPopulatedV10(path);
     let store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 14);
+      assert.equal(store.userVersion(), 15);
       assert.deepEqual(tableCounts(store.db), before);
       const oldTurn = store.getTurn('turn_v2');
       assert.equal(oldTurn.resultAuthorityVersion, 0);
@@ -1026,7 +1032,7 @@ test('populated PC v10 migrates through v11 and v12 to v13 without inventing his
       store.close();
 
       store = new YuqiStore(path);
-      assert.equal(store.userVersion(), 14);
+      assert.equal(store.userVersion(), 15);
       assert.deepEqual(tableCounts(store.db), before);
       assert.equal(store.listTurnAuthorityLineages().length, 0);
     } finally {
@@ -1034,7 +1040,133 @@ test('populated PC v10 migrates through v11 and v12 to v13 without inventing his
     }
   }));
 
-test('clean v11 creates its v12 manifest then v13 tombstone schema and remains restart-idempotent', () =>
+test('populated v10 without sync_log gains an empty current schema at v15 and remains restart-idempotent', () =>
+  withDatabase(path => {
+    const before = createPopulatedV10(path);
+    let store = new YuqiStore(path);
+    try {
+      assert.equal(store.userVersion(), 15);
+      assert.deepEqual(tableCounts(store.db), before);
+      const syncSchema = store.db.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sync_log'
+      `).get();
+      assert.match(String(syncSchema?.sql || ''), /seq INTEGER PRIMARY KEY AUTOINCREMENT/);
+      assert.deepEqual(
+        store.db.prepare('PRAGMA table_info(sync_log)').all().map(column => [
+          column.name,
+          column.type,
+          column.notnull,
+          column.pk
+        ]),
+        [
+          ['seq', 'INTEGER', 0, 1],
+          ['entity_type', 'TEXT', 1, 0],
+          ['entity_id', 'TEXT', 1, 0],
+          ['operation', 'TEXT', 1, 0],
+          ['payload_json', 'TEXT', 1, 0],
+          ['checksum', 'TEXT', 1, 0],
+          ['created_at', 'INTEGER', 1, 0]
+        ]
+      );
+      assert.deepEqual(
+        store.db.prepare(`
+          SELECT name FROM sqlite_master
+          WHERE type = 'index' AND tbl_name = 'sync_log'
+          ORDER BY name
+        `).all(),
+        []
+      );
+      assert.equal(
+        Number(store.db.prepare('SELECT COUNT(*) AS value FROM sync_log').get().value),
+        0
+      );
+      const beforeRows = store.db.prepare(
+        'SELECT turn_id, envelope_json, envelope_checksum FROM turns ORDER BY turn_id'
+      ).all();
+      store.close();
+
+      store = new YuqiStore(path);
+      assert.equal(store.userVersion(), 15);
+      assert.deepEqual(
+        store.db.prepare(
+          'SELECT turn_id, envelope_json, envelope_checksum FROM turns ORDER BY turn_id'
+        ).all(),
+        beforeRows
+      );
+      assert.equal(
+        Number(store.db.prepare('SELECT COUNT(*) AS value FROM sync_log').get().value),
+        0
+      );
+    } finally {
+      store.close();
+    }
+  }));
+
+test('populated v10 with a malformed sync_log fails closed without mutation', () =>
+  withDatabase(path => {
+    createPopulatedV10(path);
+    mutateRaw(path, database => {
+      database.exec(`
+        CREATE TABLE sync_log (
+          seq INTEGER PRIMARY KEY,
+          entity_type TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          checksum TEXT NOT NULL
+        );
+      `);
+    });
+    const before = rawLogicalSnapshot(path);
+    assert.throws(() => new YuqiStore(path), /sync_log schema conflict/i);
+    assert.deepEqual(rawLogicalSnapshot(path), before);
+  }));
+
+for (const version of [12, 13, 14, 15]) {
+  test(`same-version v${version} reopen rejects a missing sync_log without mutation`, () =>
+    withDatabase(path => {
+      createDatabaseAtVersion(path, version);
+      mutateRaw(path, database => database.exec('DROP TABLE sync_log;'));
+      const before = rawLogicalSnapshot(path);
+      assert.throws(() => new YuqiStore(path, { targetVersion: version }), /sync_log schema conflict/i);
+      assert.deepEqual(rawLogicalSnapshot(path), before);
+    }));
+
+  test(`same-version v${version} reopen rejects a malformed sync_log without mutation`, () =>
+    withDatabase(path => {
+      createDatabaseAtVersion(path, version);
+      mutateRaw(path, database => database.exec(`
+        DROP TABLE sync_log;
+        CREATE TABLE sync_log (
+          seq INTEGER PRIMARY KEY,
+          entity_type TEXT NOT NULL,
+          entity_id TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          checksum TEXT NOT NULL,
+          created_at INTEGER
+        );
+      `));
+      const before = rawLogicalSnapshot(path);
+      assert.throws(() => new YuqiStore(path, { targetVersion: version }), /sync_log schema conflict/i);
+      assert.deepEqual(rawLogicalSnapshot(path), before);
+    }));
+
+  test(`same-version v${version} reopen accepts a valid sync_log without mutation`, () =>
+    withDatabase(path => {
+      createDatabaseAtVersion(path, version);
+      const before = rawLogicalSnapshot(path);
+      const store = new YuqiStore(path, { targetVersion: version });
+      try {
+        assert.equal(store.userVersion(), version);
+      } finally {
+        store.close();
+      }
+      assert.deepEqual(rawLogicalSnapshot(path), before);
+    }));
+}
+
+test('clean v11 creates its v12 manifest then v15 tombstone schema and remains restart-idempotent', () =>
   withDatabase(path => {
     createPopulatedV10(path);
     const migrated = new YuqiStore(path, { targetVersion: 12 });
@@ -1047,7 +1179,7 @@ test('clean v11 creates its v12 manifest then v13 tombstone schema and remains r
     });
     let store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 14);
+      assert.equal(store.userVersion(), 15);
       assert.equal(
         Number(store.db.prepare(
           'SELECT COUNT(*) AS value FROM visible_result_manifests'
@@ -1059,7 +1191,7 @@ test('clean v11 creates its v12 manifest then v13 tombstone schema and remains r
     }
     store = new YuqiStore(path);
     try {
-      assert.equal(store.userVersion(), 14);
+      assert.equal(store.userVersion(), 15);
     } finally {
       store.close();
     }
@@ -1083,7 +1215,7 @@ test('v11 canonical authority without a manifest refuses v12 migration without m
     assert.deepEqual(after, before);
   }));
 
-test('migration CLI preserves a raw populated v10 source and produces a restart-stable v14 clone report', () =>
+test('migration CLI preserves a raw populated v10 source and produces a restart-stable v15 clone report', () =>
   withDatabase(path => {
     createPopulatedV10(path);
     const directory = join(path, '..');
@@ -1104,11 +1236,11 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     assert.equal(fileSha256(path), sourceHash);
     const report = JSON.parse(readFileSync(reportPath, 'utf8'));
     assert.equal(report.sourceUserVersion, 10);
-    assert.equal(report.workingUserVersion, 14);
+    assert.equal(report.workingUserVersion, 15);
     assert.equal(report.sourceDatabaseSha256, sourceHash);
     assert.equal(report.sourceDatabaseSha256After, sourceHash);
     assert.match(report.workingDatabaseSha256, /^[a-f0-9]{64}$/);
-    assert.equal(report.v14InvariantSummary.userVersion, 14);
+    assert.equal(report.v14InvariantSummary.userVersion, 15);
     assert.match(report.v14InvariantSummary.checksum, /^[a-f0-9]{64}$/);
     assert.ok(Object.hasOwn(report.sourceTableCounts, 'turns'));
     assert.ok(Object.hasOwn(
@@ -1134,7 +1266,7 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     assert.equal(applyCommand.status, 0, applyCommand.stderr || applyCommand.stdout);
     const applied = JSON.parse(readFileSync(applyReportPath, 'utf8'));
     assert.equal(applied.applied, true);
-    assert.equal(applied.workingUserVersion, 14);
+    assert.equal(applied.workingUserVersion, 15);
     assert.equal(
       applied.v14InvariantSummary.checksum,
       report.v14InvariantSummary.checksum
@@ -1148,7 +1280,7 @@ test('migration CLI preserves a raw populated v10 source and produces a restart-
     first.close();
     const second = new YuqiStore(clone);
     assert.deepEqual(tableCounts(second.db), logicalBefore.counts);
-    assert.equal(second.userVersion(), 14);
+    assert.equal(second.userVersion(), 15);
     second.close();
   }));
 
@@ -1518,9 +1650,11 @@ test('a retry of a legacy or missing parent cannot enter canonical creation', ()
     }
   }));
 
-test('user versions above v14 stop without rewriting', () => withDatabase(path => {
+test('user versions above v15 stop without rewriting', () => withDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 15;');
+  database.exec('PRAGMA user_version = 16;');
+  const before = rawLogicalSnapshot(path);
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*15/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*16/i);
+  assert.deepEqual(rawLogicalSnapshot(path), before);
 }));

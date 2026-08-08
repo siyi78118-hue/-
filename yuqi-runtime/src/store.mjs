@@ -2181,6 +2181,7 @@ export class YuqiStore {
       throw new Error(`unsupported database user_version ${initialVersion}`);
     }
     if (initialVersion === 15) {
+      this.assertSyncLogSchemaInternal();
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV13Invariants();
       this.assertReleaseAuthorityV14Invariants();
@@ -2189,6 +2190,7 @@ export class YuqiStore {
       return;
     }
     if (initialVersion === 14 && targetVersion === 14) {
+      this.assertSyncLogSchemaInternal();
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV13Invariants();
       this.assertReleaseAuthorityV14Invariants();
@@ -2196,12 +2198,14 @@ export class YuqiStore {
       return;
     }
     if (initialVersion === 13 && targetVersion === 13) {
+      this.assertSyncLogSchemaInternal();
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV13Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
       return;
     }
     if (initialVersion === 12 && targetVersion === 12) {
+      this.assertSyncLogSchemaInternal();
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV12Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
@@ -2209,6 +2213,10 @@ export class YuqiStore {
     }
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      // v10 databases may predate the audit stream entirely.  Recreate only
+      // the empty current base table before any later-version invariant reads
+      // it; this does not invent historical audit rows or alter existing data.
+      this.ensureSyncLogSchemaInternal();
       if (initialVersion < 9) {
         this.db.exec(`
       CREATE TABLE IF NOT EXISTS turns (
@@ -2816,6 +2824,47 @@ export class YuqiStore {
 
   userVersion() {
     return Number(this.db.prepare('PRAGMA user_version').get()?.user_version || 0);
+  }
+
+  ensureSyncLogSchemaInternal() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS sync_log (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        operation TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        checksum TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    `);
+    this.assertSyncLogSchemaInternal();
+  }
+
+  assertSyncLogSchemaInternal() {
+    const expectedColumns = [
+      ['seq', 'INTEGER', 0, 1],
+      ['entity_type', 'TEXT', 1, 0],
+      ['entity_id', 'TEXT', 1, 0],
+      ['operation', 'TEXT', 1, 0],
+      ['payload_json', 'TEXT', 1, 0],
+      ['checksum', 'TEXT', 1, 0],
+      ['created_at', 'INTEGER', 1, 0]
+    ];
+    const actualColumns = this.db.prepare('PRAGMA table_info(sync_log)').all().map(column => [
+      column.name,
+      column.type,
+      column.notnull,
+      column.pk
+    ]);
+    const tableSql = this.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sync_log'
+    `).get()?.sql;
+    if (JSON.stringify(actualColumns) !== JSON.stringify(expectedColumns)
+      || typeof tableSql !== 'string'
+      || !/\bseq\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/i.test(tableSql)) {
+      throw new Error('sync_log schema conflict');
+    }
   }
 
   addColumnIfMissing(table, column, definition) {
