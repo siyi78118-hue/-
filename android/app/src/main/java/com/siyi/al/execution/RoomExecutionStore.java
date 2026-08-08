@@ -1750,6 +1750,126 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return row;
     }
 
+    LifecycleControl createRoleDelete(
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        long requestedAt,
+        Runnable durableWakePrearm
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        if (peerId == null || peerId.trim().isEmpty() || !peerId.equals(peerId.trim())) {
+            throw new IllegalArgumentException("store-owned bridge peer is required");
+        }
+        if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("expected cursor checksum is invalid");
+        }
+        if (requestedAt <= 0L || requestedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("requestedAt is invalid");
+        }
+        JSONObject verifiedReceipt = LifecycleControlCodec.validateBackupReceipt(backupReceipt);
+        AtomicReference<LifecycleControl> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            List<LifecycleControlEntity> existingRows = dao.roleDeleteControlsForCharacter(safeCharacterId);
+            if (!existingRows.isEmpty()) {
+                if (existingRows.size() != 1) {
+                    throw new IllegalStateException("role delete authority set conflict");
+                }
+                LifecycleControlEntity existing = existingRows.get(0);
+                validatePersistedLifecycleControl(existing);
+                try {
+                    JSONObject semantic = new JSONObject(existing.semanticJson);
+                    JSONObject persistedReceipt = semantic.getJSONObject("backupReceipt");
+                    if (!peerId.equals(existing.peerId)
+                        || !safeCharacterId.equals(existing.characterId)
+                        || !BridgeAuthority.canonicalJson(verifiedReceipt).equals(
+                            BridgeAuthority.canonicalJson(persistedReceipt))) {
+                        throw new IllegalStateException("role delete identity conflict");
+                    }
+                } catch (IllegalStateException error) {
+                    throw error;
+                } catch (Exception error) {
+                    throw new IllegalStateException("role delete identity conflict", error);
+                }
+                if (!LifecycleControl.APPLIED.equals(existing.state) && durableWakePrearm != null) {
+                    durableWakePrearm.run();
+                }
+                result.set(LifecycleControl.fromEntity(existing));
+                return;
+            }
+
+            ConversationCursorEntity cursor = dao.conversationCursor(safeCharacterId);
+            String currentCursorChecksum = conversationCursorChecksum(safeCharacterId, cursor);
+            if (!expectedCursorChecksum.equals(currentCursorChecksum)) {
+                throw new IllegalStateException("role delete cursor conflict");
+            }
+            LifecycleControlCodec.Encoded encoded;
+            try {
+                encoded = LifecycleControlCodec.encodeRoleDelete(
+                    safeCharacterId, peerId, requestedAt, verifiedReceipt);
+            } catch (Exception error) {
+                throw new IllegalStateException("role delete semantic conflict", error);
+            }
+            LifecycleControlEntity row = encodedToRoleDeleteEntity(
+                encoded, safeCharacterId, peerId, requestedAt);
+            if (dao.insertLifecycleControl(row) != 1L) {
+                throw new IllegalStateException("role delete already exists");
+            }
+            terminalFaultHook.after("role_delete_control");
+
+            dao.deleteAnnotationsForRole(safeCharacterId);
+            dao.deleteDiagnosticsForRole(safeCharacterId);
+            dao.deleteChangesForRole(safeCharacterId);
+            dao.deleteRawMessagesForRole(safeCharacterId);
+            dao.deleteReplyPartsForRole(safeCharacterId);
+            dao.deleteAttemptsForRole(safeCharacterId);
+            dao.deleteTurnsForRole(safeCharacterId);
+            terminalFaultHook.after("role_delete_turn_children");
+
+            dao.deleteMemoryForRole(safeCharacterId);
+            dao.deleteEvidenceForRole(safeCharacterId);
+            dao.deleteSnapshotsForRole(safeCharacterId);
+            dao.deleteRolePlanOccurrencesForRole(safeCharacterId);
+            dao.deleteRolePlanHistoryForCharacter(safeCharacterId);
+            dao.deleteRolePlansForCharacter(safeCharacterId);
+            terminalFaultHook.after("role_delete_role_data");
+
+            dao.deleteConversationAuthoritiesForRole(safeCharacterId);
+            dao.deleteConversationCursorForRole(safeCharacterId);
+            terminalFaultHook.after("role_delete_authority");
+
+            dao.deletePriorLifecycleAckTombstonesForRole(safeCharacterId, row.controlId);
+            dao.deletePriorLifecycleControlsForRole(safeCharacterId, row.controlId);
+            terminalFaultHook.after("role_delete_lifecycle");
+            if (durableWakePrearm != null) durableWakePrearm.run();
+            result.set(LifecycleControl.fromEntity(row));
+        });
+        return result.get();
+    }
+
+    private static LifecycleControlEntity encodedToRoleDeleteEntity(
+        LifecycleControlCodec.Encoded encoded,
+        String characterId,
+        String peerId,
+        long requestedAt
+    ) {
+        LifecycleControlEntity row = new LifecycleControlEntity();
+        row.controlId = encoded.controlId;
+        row.controlKind = LifecycleControl.ROLE_DELETE_KIND;
+        row.characterId = characterId;
+        row.peerId = peerId;
+        row.clearEpoch = null;
+        row.clearedThroughSequence = null;
+        row.requestedAt = requestedAt;
+        row.semanticJson = BridgeAuthority.canonicalJson(encoded.semantic);
+        row.semanticChecksum = encoded.semanticChecksum;
+        row.state = LifecycleControl.WAITING;
+        row.leaseAttempt = 0L;
+        row.updatedAt = requestedAt;
+        return row;
+    }
+
     public void recordTerminalReceipt(
         String turnId,
         String authorityLineageKey,

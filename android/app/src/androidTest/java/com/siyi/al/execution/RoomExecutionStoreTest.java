@@ -18,11 +18,17 @@ import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
+import com.siyi.al.execution.db.EvidenceFactEntity;
 import com.siyi.al.execution.db.LifecycleControlEntity;
+import com.siyi.al.execution.db.MemoryRecordEntity;
 import com.siyi.al.execution.db.ConversationAuthorityEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
+import com.siyi.al.execution.db.RolePlanEntity;
+import com.siyi.al.execution.db.RolePlanHistoryEntity;
+import com.siyi.al.execution.db.RolePlanOccurrenceEntity;
+import com.siyi.al.execution.db.YuqiAnnotationEntity;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
 import com.siyi.al.execution.bridge.BridgeClient;
@@ -100,6 +106,78 @@ public class RoomExecutionStoreTest {
         );
         assertThrows(IllegalArgumentException.class,
             () -> configured.androidRoomBackupHead("yuqi", 199L));
+    }
+
+    @Test
+    public void roleDeletePersistsTheVerifiedReceiptBeforeRemovingEveryRoomRoleRow()
+        throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture("task20e-role-delete", "visible", 300L);
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", cursor);
+        JSONObject receipt = backupReceipt("yuqi", 400L);
+        seedRoleOwnedRows(fixture.localTurnId);
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        boolean[] wakeSawDurableDeletion = {false};
+
+        LifecycleControl control = configured.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, receipt, 401L,
+            () -> wakeSawDurableDeletion[0] = rowCount("lifecycle_controls") == 1L
+                && rowCount("chat_turns") == 0L
+        );
+
+        assertTrue(wakeSawDurableDeletion[0]);
+        assertEquals(LifecycleControl.ROLE_DELETE_KIND, control.controlKind);
+        assertNull(control.clearEpoch);
+        assertNull(control.clearedThroughSequence);
+        JSONObject semantic = new JSONObject(control.semanticJson);
+        assertEquals(receipt.toString(), semantic.getJSONObject("backupReceipt").toString());
+        assertNull(configured.turn(fixture.localTurnId));
+        assertNull(database.executionDao().conversationCursor("yuqi"));
+        assertNull(database.executionDao().conversationAuthority(fixture.result.authorityLineageKey));
+        for (String table : new String[] {
+            "chat_turns", "execution_attempts", "reply_parts", "yuqi_raw_messages",
+            "diagnostics", "change_events", "conversation_authorities", "conversation_cursors",
+            "yuqi_annotations", "memory_records", "yuqi_evidence_facts", "character_snapshots",
+            "role_plan_occurrences", "role_plan_history", "role_plans"
+        }) assertEquals(table, 0L, rowCount(table));
+        assertEquals(1L, rowCount("lifecycle_controls"));
+
+        LifecycleControl replay = configured.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, receipt, 402L, null);
+        assertEquals(control.controlId, replay.controlId);
+        assertEquals(1L, rowCount("lifecycle_controls"));
+        JSONObject changedReceipt = backupReceipt("yuqi", 403L);
+        assertThrows(IllegalStateException.class, () -> configured.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, changedReceipt, 404L, null));
+        assertEquals(1L, rowCount("lifecycle_controls"));
+    }
+
+    @Test
+    public void everyRoleDeleteBoundaryRollsBackTheControlReceiptAndRoleRows()
+        throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture("task20e-role-delete-fault", "visible", 500L);
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", cursor);
+        JSONObject receipt = backupReceipt("yuqi", 600L);
+        String[] boundaries = {
+            "role_delete_control", "role_delete_turn_children", "role_delete_role_data",
+            "role_delete_authority", "role_delete_lifecycle"
+        };
+        for (int index = 0; index < boundaries.length; index += 1) {
+            String boundary = boundaries[index];
+            RoomExecutionStore faulted = new RoomExecutionStore(database, "device_gateway", reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+            long requestedAt = 601L + index;
+            assertThrows(IllegalStateException.class, () -> faulted.createRoleDelete(
+                "yuqi", "device_gateway", cursorChecksum, receipt, requestedAt, null));
+            assertNotNull(faulted.turn(fixture.localTurnId));
+            assertNotNull(database.executionDao().conversationCursor("yuqi"));
+            assertNotNull(database.executionDao().conversationAuthority(fixture.result.authorityLineageKey));
+            assertEquals(0L, rowCount("lifecycle_controls"));
+            assertEquals(cursorChecksum, RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", database.executionDao().conversationCursor("yuqi")));
+        }
     }
 
     @Test
@@ -3935,6 +4013,96 @@ public class RoomExecutionStoreTest {
         char[] output = new char[length];
         java.util.Arrays.fill(output, value);
         return new String(output);
+    }
+
+    private static JSONObject backupReceipt(String roleId, long createdAt) throws Exception {
+        String manifestChecksum = repeat('a', 64);
+        String snapshotSha256 = repeat('b', 64);
+        String logicalChecksum = repeat('c', 64);
+        JSONObject idBasis = new JSONObject()
+            .put("contract", "yuqi-backup-receipt-id-v1")
+            .put("roleId", roleId)
+            .put("manifestChecksum", manifestChecksum)
+            .put("snapshotSha256", snapshotSha256)
+            .put("logicalChecksum", logicalChecksum)
+            .put("createdAt", createdAt);
+        JSONObject receipt = new JSONObject()
+            .put("receiptVersion", "yuqi-backup-receipt-v1")
+            .put("receiptId", "bkrcpt_"
+                + BridgeAuthority.sha256CanonicalJson(idBasis).substring(0, 24))
+            .put("roleId", roleId)
+            .put("manifestChecksum", manifestChecksum)
+            .put("snapshotSha256", snapshotSha256)
+            .put("logicalChecksum", logicalChecksum)
+            .put("createdAt", createdAt);
+        return receipt.put("receiptChecksum", BridgeAuthority.sha256CanonicalJson(receipt));
+    }
+
+    private void seedRoleOwnedRows(String turnId) {
+        MemoryRecordEntity memory = new MemoryRecordEntity();
+        memory.memoryId = "memory-role-delete";
+        memory.sourceKey = "role-delete-source";
+        memory.characterId = "yuqi";
+        memory.title = "旧记忆";
+        memory.content = "需要随角色删除";
+        memory.eventTime = 1L;
+        memory.createdAt = 1L;
+        memory.updatedAt = 1L;
+        database.executionDao().upsertMemory(Collections.singletonList(memory));
+
+        EvidenceFactEntity fact = new EvidenceFactEntity();
+        fact.factId = "fact-role-delete";
+        fact.characterId = "yuqi";
+        fact.subjectId = "yuqi";
+        fact.predicate = "likes";
+        fact.objectJson = "\"tea\"";
+        fact.checksum = repeat('d', 64);
+        fact.updatedAt = 1L;
+        database.executionDao().upsertEvidenceFacts(Collections.singletonList(fact));
+
+        CharacterSnapshotEntity snapshot = new CharacterSnapshotEntity();
+        snapshot.snapshotId = "snapshot-role-delete";
+        snapshot.characterId = "yuqi";
+        snapshot.characterName = "虞栖";
+        snapshot.playerName = "用户";
+        snapshot.createdAt = 1L;
+        database.executionDao().upsertSnapshot(snapshot);
+
+        RolePlanEntity plan = new RolePlanEntity();
+        plan.planId = "plan-role-delete";
+        plan.characterId = "yuqi";
+        plan.updatedAt = 1L;
+        database.executionDao().upsertRolePlans(Collections.singletonList(plan));
+        RolePlanHistoryEntity history = new RolePlanHistoryEntity();
+        history.historyId = "history-role-delete";
+        history.planId = plan.planId;
+        history.createdAt = 1L;
+        database.executionDao().upsertRolePlanHistory(Collections.singletonList(history));
+        RolePlanOccurrenceEntity occurrence = new RolePlanOccurrenceEntity();
+        occurrence.occurrenceId = "occurrence-role-delete";
+        occurrence.planId = plan.planId;
+        occurrence.characterId = "yuqi";
+        occurrence.turnId = "occurrence-turn-role-delete";
+        occurrence.scheduledFor = 1L;
+        occurrence.updatedAt = 1L;
+        database.executionDao().insertRolePlanOccurrence(occurrence);
+
+        YuqiAnnotationEntity annotation = new YuqiAnnotationEntity();
+        annotation.annotationId = "annotation-role-delete";
+        annotation.turnId = turnId;
+        annotation.createdAt = 1L;
+        annotation.syncSeq = 1L;
+        annotation.checksum = repeat('e', 64);
+        database.executionDao().insertYuqiAnnotation(annotation);
+        DiagnosticEntity diagnostic = new DiagnosticEntity();
+        diagnostic.turnId = turnId;
+        diagnostic.code = "ROLE_DELETE_TEST";
+        diagnostic.createdAt = 1L;
+        database.executionDao().insertDiagnostic(diagnostic);
+        ChangeEventEntity change = new ChangeEventEntity();
+        change.turnId = turnId;
+        change.createdAt = 1L;
+        database.executionDao().insertChange(change);
     }
 
     private static JSONObject without(JSONObject source, String key) throws Exception {

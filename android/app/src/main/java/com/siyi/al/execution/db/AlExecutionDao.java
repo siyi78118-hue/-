@@ -47,6 +47,19 @@ public interface AlExecutionDao {
         + "ORDER BY requestedAt DESC, controlId DESC LIMIT 1")
     LifecycleControlEntity latestLifecycleControlForCharacter(String characterId);
 
+    @Query("SELECT * FROM lifecycle_controls WHERE characterId = :characterId "
+        + "AND controlKind = 'role_delete_v1' ORDER BY requestedAt ASC, controlId ASC")
+    List<LifecycleControlEntity> roleDeleteControlsForCharacter(String characterId);
+
+    @Query("DELETE FROM lifecycle_inbound_ack_tombstones WHERE controlId IN ("
+        + "SELECT controlId FROM lifecycle_controls WHERE characterId = :characterId "
+        + "AND controlId != :retainedControlId)")
+    int deletePriorLifecycleAckTombstonesForRole(String characterId, String retainedControlId);
+
+    @Query("DELETE FROM lifecycle_controls WHERE characterId = :characterId "
+        + "AND controlId != :retainedControlId")
+    int deletePriorLifecycleControlsForRole(String characterId, String retainedControlId);
+
     @Query("SELECT * FROM lifecycle_controls WHERE controlKind = 'conversation_clear_v1' AND ("
         + "state = 'waiting' "
         + "OR (state = 'pending' AND leasedAt IS NOT NULL AND leasedAt <= :leaseCutoff) "
@@ -402,6 +415,50 @@ public interface AlExecutionDao {
 
     @Query("DELETE FROM role_plans WHERE characterId = :characterId")
     int deleteRolePlansForCharacter(String characterId);
+
+    @Query("DELETE FROM yuqi_annotations WHERE turnId IN ("
+        + "SELECT turnId FROM chat_turns WHERE characterId = :characterId)")
+    int deleteAnnotationsForRole(String characterId);
+
+    @Query("DELETE FROM diagnostics WHERE turnId IN ("
+        + "SELECT turnId FROM chat_turns WHERE characterId = :characterId)")
+    int deleteDiagnosticsForRole(String characterId);
+
+    @Query("DELETE FROM change_events WHERE turnId IN ("
+        + "SELECT turnId FROM chat_turns WHERE characterId = :characterId)")
+    int deleteChangesForRole(String characterId);
+
+    @Query("DELETE FROM yuqi_raw_messages WHERE characterId = :characterId")
+    int deleteRawMessagesForRole(String characterId);
+
+    @Query("DELETE FROM reply_parts WHERE turnId IN ("
+        + "SELECT turnId FROM chat_turns WHERE characterId = :characterId)")
+    int deleteReplyPartsForRole(String characterId);
+
+    @Query("DELETE FROM execution_attempts WHERE turnId IN ("
+        + "SELECT turnId FROM chat_turns WHERE characterId = :characterId)")
+    int deleteAttemptsForRole(String characterId);
+
+    @Query("DELETE FROM chat_turns WHERE characterId = :characterId")
+    int deleteTurnsForRole(String characterId);
+
+    @Query("DELETE FROM memory_records WHERE characterId = :characterId")
+    int deleteMemoryForRole(String characterId);
+
+    @Query("DELETE FROM yuqi_evidence_facts WHERE characterId = :characterId")
+    int deleteEvidenceForRole(String characterId);
+
+    @Query("DELETE FROM character_snapshots WHERE characterId = :characterId")
+    int deleteSnapshotsForRole(String characterId);
+
+    @Query("DELETE FROM role_plan_occurrences WHERE characterId = :characterId")
+    int deleteRolePlanOccurrencesForRole(String characterId);
+
+    @Query("DELETE FROM conversation_authorities WHERE characterId = :characterId")
+    int deleteConversationAuthoritiesForRole(String characterId);
+
+    @Query("DELETE FROM conversation_cursors WHERE characterId = :characterId")
+    int deleteConversationCursorForRole(String characterId);
 
     @Query("SELECT * FROM execution_attempts WHERE attemptId = :attemptId LIMIT 1")
     ExecutionAttemptEntity attempt(String attemptId);
