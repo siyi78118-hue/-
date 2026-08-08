@@ -234,6 +234,44 @@ export function validateAndroidRoomBackupHead(raw, { roleId: expectedRoleId } = 
   return { ...normalized, checksum: raw.checksum };
 }
 
+const YUQI_BACKUP_REQUEST_KEYS = Object.freeze([
+  'protocolVersion', 'type', 'requestVersion', 'roleId', 'peerId',
+  'requestedAt', 'androidRoomHead', 'checksum'
+]);
+
+export function validateYuqiBackupRequest(raw) {
+  assertClosedKeys(raw, YUQI_BACKUP_REQUEST_KEYS, 'Yuqi backup request');
+  if (raw.protocolVersion !== 3 || raw.type !== 'YUQI_BACKUP_REQUEST'
+    || raw.requestVersion !== 'yuqi-backup-request-v1') {
+    throw new Error('invalid Yuqi backup request identity');
+  }
+  const roleId = requireNativeBackupId(raw.roleId, 'Yuqi backup request roleId');
+  const peerId = requireNativeBackupId(raw.peerId, 'Yuqi backup request peerId');
+  const requestedAt = requireNativeBackupInteger(
+    raw.requestedAt, 'Yuqi backup request requestedAt', { positive: true });
+  if (raw.androidRoomHead == null) throw new Error('Android Room backup head is required');
+  const androidRoomHead = validateAndroidRoomBackupHead(raw.androidRoomHead, { roleId });
+  if (androidRoomHead.capturedAt !== requestedAt
+    || (androidRoomHead.lifecycleHead != null
+      && androidRoomHead.lifecycleHead.peerId !== peerId)) {
+    throw new Error('Yuqi backup request Android Room authority conflict');
+  }
+  const normalized = {
+    protocolVersion: 3,
+    type: 'YUQI_BACKUP_REQUEST',
+    requestVersion: 'yuqi-backup-request-v1',
+    roleId,
+    peerId,
+    requestedAt,
+    androidRoomHead
+  };
+  if (typeof raw.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.checksum)
+    || raw.checksum !== contentHash(normalized)) {
+    throw new Error('Yuqi backup request checksum conflict');
+  }
+  return { ...normalized, checksum: raw.checksum };
+}
+
 export function deriveYuqiBackupReceiptId({
   roleId,
   manifestChecksum,

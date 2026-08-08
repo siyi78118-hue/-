@@ -99,6 +99,15 @@ test('runtime uses native proxy-aware fetch only for explicit proxy mode', () =>
   assert.match(main, /explicitProxy\s*\?\s*globalThis\.fetch\s*:\s*createSystemCloudFetch\(\)/);
 });
 
+test('runtime wires the authenticated Android backup endpoint to the verified snapshot authority', () => {
+  const main = readFileSync('yuqi-runtime/src/main.mjs', 'utf8');
+  assert.match(main, /import \{ createVerifiedYuqiBackup \} from '\.\.\/\.\.\/scripts\/backup-yuqi-memory\.mjs'/);
+  assert.match(main, /createVerifiedBackup:\s*\(\{ roleId, requestedAt, androidRoomHead \}\)\s*=>/);
+  for (const field of ['databasePath', 'snapshotsDir', 'roleId', 'createdAt: requestedAt', 'androidRoomHead']) {
+    assert.match(main, new RegExp(field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  }
+});
+
 test('Android build disables the Gradle problems-report collision on Windows', () => {
   const packageJson = JSON.parse(readFileSync('package.json', 'utf8'));
   assert.match(packageJson.scripts['android:debug'], /--no-problems-report/);

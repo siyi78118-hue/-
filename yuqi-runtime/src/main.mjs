@@ -15,6 +15,7 @@ import { selectTurnRoute } from './route-policy.mjs';
 import { YuqiStore } from './store.mjs';
 import { composeYuqiExecutionRuntime } from './runtime-composition.mjs';
 import { createSystemCloudFetch } from '../../scripts/cloud-http.mjs';
+import { createVerifiedYuqiBackup } from '../../scripts/backup-yuqi-memory.mjs';
 
 const runtimeDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const configPath = resolve(process.argv[2] || join(runtimeDir, 'config.json'));
@@ -22,6 +23,9 @@ const config = JSON.parse(readFileSync(configPath, 'utf8'));
 const databasePath = isAbsolute(config.databasePath || '')
   ? config.databasePath
   : resolve(runtimeDir, config.databasePath || 'data/yuqi-runtime.sqlite');
+const snapshotsDir = isAbsolute(config.snapshotsDir || '')
+  ? config.snapshotsDir
+  : resolve(runtimeDir, config.snapshotsDir || 'snapshots');
 mkdirSync(dirname(databasePath), { recursive: true });
 
 const store = new YuqiStore(databasePath);
@@ -98,6 +102,14 @@ const server = createYuqiServer({
   orchestrator,
   dispatcher,
   reconciler,
+  createVerifiedBackup: ({ roleId, requestedAt, androidRoomHead }) =>
+    createVerifiedYuqiBackup({
+      databasePath,
+      snapshotsDir,
+      roleId,
+      createdAt: requestedAt,
+      androidRoomHead
+    }),
   getCloudRelayStatus: () => cloudPump?.status() || {
     enabled: false,
     proxyEnabled: explicitProxy,

@@ -6,7 +6,9 @@ import {
   validateAuthorityDeliveryReceipt,
   validateConversationClearApplied,
   validateConversationClearControl,
-  validateEnvelope
+  validateEnvelope,
+  validateYuqiBackupReceipt,
+  validateYuqiBackupRequest
 } from './protocol.mjs';
 import { normalizeRecoverySnapshot } from './reconcile.mjs';
 import { isCanonicalAuthorityConflictError } from './bridge-result-projector.mjs';
@@ -147,6 +149,7 @@ export function createYuqiServer({
   orchestrator,
   dispatcher = null,
   reconciler = null,
+  createVerifiedBackup = null,
   getCloudRelayStatus = null,
   clock = Date.now,
   maxBodyBytes = 256 * 1024,
@@ -306,6 +309,32 @@ export function createYuqiServer({
     let body = null;
     if (rawBody) {
       try { body = JSON.parse(rawBody); } catch { return json(response, 400, { ok: false, error: 'invalid JSON' }); }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v3/backups/yuqi') {
+      let backupRequest;
+      try {
+        backupRequest = validateYuqiBackupRequest(body);
+        if (Math.abs(clock() - backupRequest.requestedAt) > maxClockSkewMs) {
+          throw new Error('Yuqi backup request time conflict');
+        }
+      } catch (error) {
+        return json(response, 400, { ok: false, error: error.message });
+      }
+      if (typeof createVerifiedBackup !== 'function') {
+        return json(response, 503, { ok: false, error: 'verified backup service is unavailable' });
+      }
+      const result = await createVerifiedBackup({
+        roleId: backupRequest.roleId,
+        peerId: backupRequest.peerId,
+        requestedAt: backupRequest.requestedAt,
+        androidRoomHead: backupRequest.androidRoomHead
+      });
+      const receipt = validateYuqiBackupReceipt(result?.receipt);
+      if (receipt.roleId !== backupRequest.roleId || receipt.createdAt !== backupRequest.requestedAt) {
+        throw new Error('Yuqi backup receipt authority conflict');
+      }
+      return json(response, 200, receipt);
     }
 
     if (request.method === 'POST' && url.pathname === '/v3/controls/conversation-clear') {

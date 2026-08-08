@@ -4,7 +4,7 @@ import test from 'node:test';
 
 import { decryptRelayPayload } from '../src/cloud-relay-pump.mjs';
 import { createYuqiServer, signBridgeRequest } from '../src/local-server.mjs';
-import { contentHash, validateEnvelope } from '../src/protocol.mjs';
+import { contentHash, deriveYuqiBackupReceiptId, validateEnvelope } from '../src/protocol.mjs';
 import { ResultOutbox } from '../src/result-outbox.mjs';
 
 const keyBase64 = Buffer.alloc(32, 9).toString('base64');
@@ -99,6 +99,71 @@ function conversationClearApplied(control, appliedAt = 1784400000100) {
     appliedAt
   };
   return { ...body, checksum: contentHash(body) };
+}
+
+function androidRoomBackupHead(overrides = {}) {
+  const cursor = {
+    characterId: 'yuqi',
+    nativeCompletedTurnId: null,
+    nativeCompletedGroupId: null,
+    nativeCompletedSequence: 0,
+    uiAppliedTurnId: null,
+    uiAppliedGroupId: null,
+    uiAppliedSequence: 0,
+    localSequence: 0,
+    clearedThroughSequence: 0,
+    clearEpoch: 0,
+    clearedAt: 0,
+    chatOpen: false,
+    updatedAt: 1784400000000
+  };
+  cursor.cursorChecksum = contentHash({ contract: 'conversation-cursor-clear-v1', ...cursor });
+  const basis = {
+    headVersion: 'android-room-backup-head-v1',
+    roleId: 'yuqi',
+    roomSchemaVersion: 14,
+    cursor,
+    lifecycleHead: null,
+    capturedAt: 1784400000100,
+    ...overrides
+  };
+  return { ...basis, checksum: contentHash(basis) };
+}
+
+function yuqiBackupRequest(overrides = {}) {
+  const basis = {
+    protocolVersion: 3,
+    type: 'YUQI_BACKUP_REQUEST',
+    requestVersion: 'yuqi-backup-request-v1',
+    roleId: 'yuqi',
+    peerId: 'phone_lan',
+    requestedAt: 1784400000100,
+    androidRoomHead: androidRoomBackupHead(),
+    ...overrides
+  };
+  return { ...basis, checksum: contentHash(basis) };
+}
+
+function yuqiBackupReceipt(request) {
+  const manifestChecksum = 'a'.repeat(64);
+  const snapshotSha256 = 'b'.repeat(64);
+  const logicalChecksum = 'c'.repeat(64);
+  const basis = {
+    receiptVersion: 'yuqi-backup-receipt-v1',
+    receiptId: deriveYuqiBackupReceiptId({
+      roleId: request.roleId,
+      manifestChecksum,
+      snapshotSha256,
+      logicalChecksum,
+      createdAt: request.requestedAt
+    }),
+    roleId: request.roleId,
+    manifestChecksum,
+    snapshotSha256,
+    logicalChecksum,
+    createdAt: request.requestedAt
+  };
+  return { ...basis, receiptChecksum: contentHash(basis) };
 }
 
 function call(port, { method = 'GET', path = '/', body = '', secret = '', nonce = 'nonce-1', timestamp = Date.now() }) {
@@ -1297,6 +1362,71 @@ test('conversation clear exact replay returns the persisted proof bytes without 
     ]);
     assert.equal(calls, 2);
     assert.equal('ok' in requests[0].body, false);
+  } finally {
+    await server.close();
+  }
+});
+
+test('Android backup request validates the Room head before creating one verified receipt', async () => {
+  const requestBody = yuqiBackupRequest();
+  const expectedReceipt = yuqiBackupReceipt(requestBody);
+  const calls = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    clock: () => requestBody.requestedAt,
+    store: { getSyncDelta: () => [], ackSync: () => 0 },
+    orchestrator: { process: async () => ({}) },
+    createVerifiedBackup: async options => {
+      calls.push(options);
+      return { receipt: expectedReceipt };
+    }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const response = await call(server.address().port, {
+      method: 'POST', path: '/v3/backups/yuqi', body: requestBody,
+      secret: 'test-pairing-secret', timestamp: requestBody.requestedAt,
+      nonce: 'android-backup-valid'
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, expectedReceipt);
+    assert.deepEqual(calls, [{
+      roleId: 'yuqi', peerId: 'phone_lan', requestedAt: requestBody.requestedAt,
+      androidRoomHead: requestBody.androidRoomHead
+    }]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('Android backup request rejects changed or missing Room authority before snapshot work', async () => {
+  const valid = yuqiBackupRequest();
+  let calls = 0;
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    clock: () => valid.requestedAt,
+    store: { getSyncDelta: () => [], ackSync: () => 0 },
+    orchestrator: { process: async () => ({}) },
+    createVerifiedBackup: async () => { calls += 1; throw new Error('must not run'); }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const variants = [
+      { ...valid, androidRoomHead: null },
+      { ...valid, requestedAt: valid.requestedAt + 1 },
+      { ...valid, roleId: 'other' },
+      { ...valid, androidRoomHead: { ...valid.androidRoomHead, secret: 'leak' } },
+      { ...valid, checksum: 'f'.repeat(64) }
+    ];
+    for (const [index, body] of variants.entries()) {
+      const response = await call(server.address().port, {
+        method: 'POST', path: '/v3/backups/yuqi', body,
+        secret: 'test-pairing-secret', timestamp: valid.requestedAt,
+        nonce: `android-backup-invalid-${index}`
+      });
+      assert.equal(response.status, 400);
+    }
+    assert.equal(calls, 0);
   } finally {
     await server.close();
   }
