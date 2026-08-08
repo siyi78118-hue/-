@@ -8027,6 +8027,43 @@ exact Room CAS applies that returned value without creating a second envelope.
   one normal encrypted response envelope; it repeats the existing
   device/direction/idempotency/size/expiry checks and rejects plaintext fields.
   It never decrypts or derives lifecycle semantics.
+
+**PC schema-v15 control authority amendment:**
+- Task 20D raises the PC SQLite `user_version` from 14 to 15 before adding the
+  production clear writer. `conversation_clear_controls` is rebuilt with the
+  exact columns `control_id,role_id,peer_id,clear_epoch,cleared_through_sequence,`
+  `requested_at,applied_at,input_cursor_checksum,checksum,authority_version,`
+  `semantic_json`. `authority_version` is exactly `0|1`.
+- A v15 authority-v1 row is the sole durable proof for a new protocol-v3 clear:
+  `peer_id` and `input_cursor_checksum` are non-null native wire projections;
+  `semantic_json` is exactly `canonicalJson(validateConversationClearControl(raw))`;
+  `checksum` is the lower-case SHA-256 of the first ten wire fields; and every
+  scalar column must equal its projection from that JSON. The production writer
+  inserts only authority-v1 rows and rebuilds every applied response from this
+  persisted row, never from request-layer values.
+- Populated v14 rows retain all seven historical values byte-for-byte and migrate
+  as authority-v0 audit shells with `peer_id,input_cursor_checksum,semantic_json`
+  null. Migration must not infer a peer from a current lane/device or invent a
+  cursor checksum. An authority-v0 row can neither authorize protocol-v3 replay
+  nor produce an applied response; a new control colliding by `control_id` or
+  `(role_id,clear_epoch)` fails closed with zero writes instead of overwriting it.
+- The v14→v15 migration runs in one immediate transaction with real fault
+  checkpoints after new-table creation, row copy, projection verification,
+  table swap/index recreation and version write. Every injected failure leaves
+  the source schema, rows and `user_version=14` unchanged. Fresh databases and
+  populated v10/v12/v13/v14 databases must converge to the same exact v15 schema;
+  v13 redacted groups, v14 canary indexes and authority-v0 shells remain valid.
+  Reopen invariants recompute every authority-v1 semantic projection and reject
+  missing/extra columns, partial authority-v1 rows, forged JSON/checksum, changed
+  peer/cursor/boundary/time, duplicate role/epoch, and an authority-v0 row that
+  contains any v1-only value.
+- Export two independent closed protocol helpers:
+  `validateConversationClearControl(raw)` for the eleven-key command and
+  `validateConversationClearApplied(raw)` for the ten-key applied proof. Both
+  require native string/number types before hashing; they must not reuse the
+  legacy `String(...)`/`Number(...)` coercing helpers. The applied projector
+  accepts only a reopened authority-v1 row plus its committed lane state and
+  returns the same ten-key bytes on exact replay/restart.
 - Exact `controlId` replay and exact `(roleId,clearEpoch)` replay return the
   original applied record. Changed checksum, changed boundary, epoch skipping,
   lower through sequence, foreign peer, or concurrent changed control is zero
@@ -8069,6 +8106,12 @@ exact Room CAS applies that returned value without creating a second envelope.
 - [ ] **20D.1: Add red validator, transaction fault matrix, legacy scrub,
   retraction, duplicate/control-race, relay atomic exchange, and LAN/cloud ACK
   tests.**
+- [ ] **20D.1a: Add the v14→v15 red migration/reopen/fault matrix before the
+  first production clear write.** Cover a populated v14 audit shell without
+  fabricating peer/cursor semantics, a fresh authority-v1 row, exact replay,
+  every scalar/JSON/checksum mutation, partial v1 rows, v0/v1 collision, all
+  migration fault checkpoints, and `>15` refusal. Update the v10/v13/v14
+  invariant version domains explicitly; do not weaken their historical checks.
 - [ ] **20D.2: Implement the one store transaction and one retraction worker.**
 - [ ] **20D.3: Run focused and reopen gates, then commit.**
 
