@@ -7968,12 +7968,18 @@ No attached device is an explicit blocked release gate, not a skipped pass.
 - Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
 - Modify: `yuqi-runtime/src/result-outbox.mjs`
 - Modify: `yuqi-runtime/src/turn-status.mjs`
+- Modify: `yuqi-runtime/src/evidence-memory.mjs`
+- Modify: `yuqi-runtime/src/retrieval.mjs`
+- Modify: `yuqi-runtime/src/consolidation-worker.mjs`
 - Modify: `yuqi-relay-worker.js`
 - Modify: `yuqi-runtime/test/protocol-store.test.mjs`
 - Create: `yuqi-runtime/test/agency-data-lifecycle.test.mjs`
 - Modify: `yuqi-runtime/test/local-server.test.mjs`
 - Modify: `yuqi-runtime/test/cloud-relay-pump.test.mjs`
 - Modify: `yuqi-runtime/test/result-outbox.test.mjs`
+- Modify: `yuqi-runtime/test/evidence-memory.test.mjs`
+- Modify: `yuqi-runtime/test/retrieval.test.mjs`
+- Modify: `yuqi-runtime/test/consolidation-worker.test.mjs`
 - Modify: `yuqi-runtime/test/store-visible-authority-v13.test.mjs`
 - Modify: `yuqi-runtime/test/store-release-authority-v14.test.mjs`
 - Modify: `tests/yuqi-relay-worker.test.mjs`
@@ -8205,6 +8211,83 @@ exact Room CAS applies that returned value without creating a second envelope.
   fallback, route, stage, reply, action or error detail from a redacted v0 turn.
 
 **Evidence, memory, stance, constraint, and current-state pruning:**
+- The turn/group scrub and the memory prune consume one store-owned,
+  transaction-local affected-authority closure. Freeze it before the first
+  mutation as a closed object containing sorted unique `turnIds,lineageKeys,`
+  `groupIds,messageIds,actionIds`. Every ID comes from the already validated
+  RA1 group/lineage closure or the validated RA0 turn/batch/message closure;
+  callers, text matching, role-wide queries and model output cannot add IDs.
+  This object is not added to either wire payload or the closed legacy
+  redaction audit. The current turn/delivery implementation must expose this
+  single helper to the later pruning phase in the same `BEGIN IMMEDIATE`, not
+  rebuild a second affected set after plaintext has been erased.
+- Add one store-owned evidence-source resolver. For an active user-derived
+  fact it reads the closed `sourceMessageIds`, `sourceActionIds` and optional
+  `evidenceAuthority.{authorityGroupIds,lineageKeys,commitChecksums}` from the
+  persisted fact, resolves every source to its persisted message/action,
+  turn, group, lineage and commit receipt, and returns `affected`, `surviving`
+  or `unresolved`. If `evidenceAuthority` exists, it must equal the exact
+  tuple derived from the resolved sources. Historical facts may omit that
+  object only when their non-empty legacy source-message/action lists resolve
+  completely; it is then derived, never guessed. An active user-derived fact
+  with no source, a missing/foreign source, mismatched authority tuple, mixed
+  role, or ambiguous public/private lane fails before the first clear write.
+  Already archived legacy facts are not revived. Author/system/preset/global
+  rows are recognized only by their closed persisted authority/source-config
+  contract, not by free-form `origin` text.
+- A sole-affected fact is converted by an exact old-checksum CAS into a
+  non-semantic archived shell. Its exact SQL projection is
+  `subject_id='__redacted__',predicate='redacted',object_json='null',`
+  `evidence_mode='redacted',source_message_ids_json='[]',exact_quotes_json='[]',`
+  `status='archived',confidence=0,origin='redacted',verified_at=NULL`; its
+  `supersedes` and `created_at` identity/history values remain unchanged.
+  `fact_json` is exactly the closed canonical object
+  `{factId,characterId,status:'archived',redacted:true,redactedAt}` and the row
+  `checksum` is the hash of that object, never the old semantic checksum.
+  `listFacts()` recognizes only this exact shell as redacted and neither it nor
+  a partial imitation is retrievable. One closed sync audit
+  `fact_redaction_v1` retains exactly
+  `controlId,roleId,factId,oldChecksum,newChecksum,redactedAt,replacementFactId`
+  plus its audit-version field; it retains no subject, predicate, object,
+  quote, action or source ID.
+  A mixed-source fact first receives that same archived shell, then appends a
+  deterministic replacement whose ID is derived from the old fact ID,
+  control ID and surviving-evidence checksum using
+  `stableId('fact_prune', oldFactId + ':' + controlId + ':' +
+  survivingEvidenceChecksum)`, whose `supersedes` points to the old fact, and
+  whose evidence/quotes/actions/authority tuple contains only surviving
+  sources. The replacement keeps the old fact's semantic subject/predicate/
+  object, status and confidence, sets `createdAt=redactedAt`, retains
+  `verifiedAt` only when every surviving source remains verified, and receives
+  the normal canonical fact checksum. The audit's `replacementFactId` is that
+  ID or null for a sole-affected fact. Exact replay verifies the old shell,
+  audit and replacement and performs no write. This is
+  the only store-owned lifecycle path allowed to change an existing fact;
+  normal `putFact` immutability remains unchanged. Constraint revisions and
+  stance revisions use their existing append-only revision models instead of
+  mutating historical semantic revisions.
+- `listRetrievableFacts()` and retrieval ranking must call one store-owned
+  authority-lifecycle validator, not only `suppressed_messages`. Any source
+  whose turn/group/lineage is redacted, cancelled by the clear, unresolved or
+  superseded is non-retrievable; action-only evidence is covered identically.
+  Consolidation/retrieval workers re-run the same validator after claim and
+  immediately before model invocation and commit. A clear racing an old
+  worker lease therefore rejects the old completion and cannot recreate a
+  fact from a cleared draft or cached snapshot.
+- Rebuilding `cognitive_states` never retains a redacted `last_turn_id`. If a
+  surviving authoritative turn exists, rebuild from the latest surviving
+  authority in deterministic `(effectiveAt,turnId)` order. If none exists,
+  persist one store-owned schema-v2 empty anchor rather than deleting the row:
+  `last_turn_id=stableId('cognitive_clear_anchor', roleId + ':' + controlId)`,
+  `last_authority_group_id=NULL`, and exact state
+  `{fastState:{mood:'',openThreadIds:[],openThreads:[]},mediumState:{},`
+  `slowState:{preferenceFactIds:[]}}`. Its checksum is the canonical state
+  hash, revision is the prior revision plus one (or one if no prior row), and
+  `updated_at=appliedAt`. Exact clear replay does not increment it. The v15
+  reopen invariant accepts that otherwise-non-turn anchor only when its ID,
+  time, checksum and role match the latest applied clear control; every normal
+  state still requires a real surviving turn/group. A later committed turn
+  advances from the anchor revision normally, preserving monotonic history.
 - Perform this only after all affected canonical and legacy turn shells are
   valid. Delete or archive a fact, stance or user-derived constraint only when
   every persisted supporting message/turn/group belongs to the affected set.
