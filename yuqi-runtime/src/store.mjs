@@ -26,6 +26,10 @@ import {
   proactiveMotiveSourceContext
 } from './life-simulation.mjs';
 import {
+  currentBatchEvidenceAuthorityProjection,
+  validateConsolidationCandidate
+} from './evidence-memory.mjs';
+import {
   TURN_STATES,
   canonicalJson,
   contentHash,
@@ -74,6 +78,41 @@ const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
 const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
 const FAILURE_DELIVERY_LEASE_MS = 60_000;
 const TRUSTED_LIFE_RESULT_WRITER = Symbol('trusted-life-result-writer');
+
+const MEMORY_SOURCE_ORIGINS = new Set(['consolidation', 'legacy', 'memory']);
+const MEMORY_CONFIG_ORIGINS = new Set(['author', 'system', 'preset', 'global']);
+
+function classifyMemoryFactAuthority(fact) {
+  const origin = typeof fact?.origin === 'string' ? fact.origin.trim() : '';
+  if (MEMORY_SOURCE_ORIGINS.has(origin)) return { kind: 'source', origin };
+  if (!MEMORY_CONFIG_ORIGINS.has(origin)) throw new Error('memory fact origin authority conflict');
+  const keys = ['authority', 'evidenceMode', 'sourceConfigRef', 'sourceMessageIds', 'sourceActionIds'];
+  if (fact?.authority !== origin || fact?.evidenceMode !== 'config'
+    || typeof fact?.sourceConfigRef !== 'string' || !fact.sourceConfigRef.trim()
+    || !Array.isArray(fact?.sourceMessageIds) || fact.sourceMessageIds.length !== 0
+    || !Array.isArray(fact?.sourceActionIds || []) || (fact.sourceActionIds || []).length !== 0) {
+    throw new Error('memory fact closed config authority conflict');
+  }
+  const exactConfigRef = fact.sourceConfigRef.trim();
+  if (exactConfigRef !== fact.sourceConfigRef || exactConfigRef.length > 256) {
+    throw new Error('memory fact config source authority conflict');
+  }
+  return { kind: 'config', origin };
+}
+
+function factRedactionSetCommitment({ controlId, roleId, entries }) {
+  return contentHash({
+    auditVersion: 'fact-redaction-set-v1',
+    controlId: String(controlId),
+    roleId: String(roleId),
+    facts: [...entries].map(entry => ({
+      factId: entry.factId,
+      oldChecksum: entry.oldChecksum,
+      newChecksum: entry.newChecksum,
+      replacementFactId: entry.replacementFactId ?? null
+    })).sort((left, right) => left.factId.localeCompare(right.factId))
+  });
+}
 
 function validateTrustedPublicMomentCandidate(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -7967,6 +8006,11 @@ export class YuqiStore {
       ).get(currentControl.controlId);
       if (byId) {
         const proof = assertPersistedRow(byId);
+        this.assertMemoryPruneClosureInternal({
+          controlId: currentControl.controlId,
+          roleId: currentControl.roleId,
+          redactedAt: Number(byId.applied_at)
+        });
         if (canonicalJson(parseJson(byId.semantic_json, null)) !== canonicalJson(currentControl)) {
           throw new Error('conversation clear control replay conflict');
         }
@@ -8037,6 +8081,16 @@ export class YuqiStore {
         clearEpoch: currentControl.clearEpoch,
         boundary: currentControl.clearedThroughSequence
       });
+      // Freeze and validate every memory source projection before the first
+      // authority/control mutation.  The resulting plan is reused after the
+      // turn/lineage scrub; it is never recomputed from partially redacted
+      // rows.
+      const memoryPrunePlan = this.prepareMemoryPruneInternal({
+        roleId: currentControl.roleId,
+        frozen: frozenAuthority.frozen,
+        controlId: currentControl.controlId,
+        redactedAt: appliedAt
+      });
       const semanticJson = canonicalJson(currentControl);
       const appliedBody = {
         protocolVersion: 3,
@@ -8091,6 +8145,17 @@ export class YuqiStore {
           fault
         });
       }
+      this.applyMemoryPrunePlanInternal(memoryPrunePlan, {
+        roleId: currentControl.roleId,
+        controlId: currentControl.controlId,
+        redactedAt: appliedAt
+      });
+      this.assertMemoryPruneClosureInternal({
+        controlId: currentControl.controlId,
+        roleId: currentControl.roleId,
+        redactedAt: appliedAt
+      });
+      fault('after_memory_prune');
 
       const updatedLane = this.db.prepare(`
         UPDATE interaction_lanes
@@ -11464,6 +11529,61 @@ export class YuqiStore {
     };
   }
 
+  resolveCurrentBatchAuthorityForMemoryInternal({ turnId, messageId, roleId }) {
+    const turn = this.getTurn(turnId);
+    const expectedRoleId = String(roleId || turn?.characterId || '').trim();
+    if (!turn || !expectedRoleId || turn.characterId !== expectedRoleId
+      || Number(turn.resultAuthorityVersion) !== 1 || turn.state === 'cancelled') {
+      throw new Error('memory current-batch turn authority conflict');
+    }
+    const envelope = parseJson(turn.envelopeJson, null);
+    if (!envelope || envelope.protocolVersion !== 3 || envelope.turnId !== turn.turnId
+      || envelope.characterId !== expectedRoleId) {
+      throw new Error('memory current-batch envelope authority conflict');
+    }
+    const batch = this.getCurrentUserBatch(turn.turnId);
+    if (!batch || batch.characterId !== expectedRoleId
+      || !batch.messageIds.includes(String(messageId))) {
+      throw new Error('memory current-batch source authority conflict');
+    }
+    if (typeof this.assertCanonicalTurnInputAuthorityInternal === 'function') {
+      this.assertCanonicalTurnInputAuthorityInternal({
+        storedTurn: turn,
+        incomingEnvelope: envelope,
+        mode: 'live_reopen'
+      });
+    }
+    const message = this.db.prepare(
+      'SELECT * FROM messages WHERE turn_id = ? AND message_id = ?'
+    ).get(turn.turnId, String(messageId));
+    const batchMessage = batch.messages.find(item => item?.messageId === String(messageId));
+    const expectedMessageChecksum = message ? contentHash({
+      messageId: message.message_id,
+      turnId: message.turn_id,
+      characterId: message.character_id,
+      speakerId: message.speaker_id,
+      speakerType: message.speaker_type,
+      recipientId: message.recipient_id,
+      content: message.content,
+      sentAt: message.sent_at,
+      origin: message.origin,
+      deviceId: message.device_id,
+      deviceSeq: message.device_seq
+    }) : null;
+    if (!message || !batchMessage || typeof message.content !== 'string' || !message.content.trim()
+      || message.character_id !== expectedRoleId || message.speaker_type !== 'user'
+      || message.content !== batchMessage.content || Number(message.sent_at) !== Number(batchMessage.sentAt)
+      || message.checksum !== expectedMessageChecksum) {
+      throw new Error('memory current-batch message authority conflict');
+    }
+    return {
+      turn,
+      batch,
+      message,
+      ...currentBatchEvidenceAuthorityProjection({ lineageKey: turn.authorityLineageKey })
+    };
+  }
+
   getProactiveChatDeliveryPolicy(characterId, { windowSize = 4, maxSkips = 1 } = {}) {
     const safeWindowSize = Math.max(1, Math.min(20, Number(windowSize) || 4));
     const parsedMaxSkips = Number(maxSkips);
@@ -13498,7 +13618,7 @@ export class YuqiStore {
     return rows.slice(Math.max(0, index - safeRadius), index + safeRadius + 1);
   }
 
-  putFact(fact) {
+  putFactInternal(fact) {
     if (!fact?.factId || !fact.characterId || !fact.subjectId || !fact.predicate) throw new Error('invalid fact');
     const normalized = {
       ...fact,
@@ -13509,29 +13629,31 @@ export class YuqiStore {
       exactQuotes: fact.exactQuotes || []
     };
     const checksum = contentHash(normalized);
-    return this.transaction(() => {
-      const existing = this.db.prepare('SELECT checksum FROM facts WHERE fact_id = ?').get(normalized.factId);
-      if (existing) {
-        if (existing.checksum !== checksum) throw new Error('fact checksum conflict');
-        return normalized;
-      }
-      this.db.prepare(`
-        INSERT INTO facts(
-          fact_id, character_id, subject_id, predicate, object_json, evidence_mode,
-          source_message_ids_json, exact_quotes_json, status, confidence, supersedes,
-          origin, checksum, created_at, verified_at, fact_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        normalized.factId, normalized.characterId, normalized.subjectId, normalized.predicate,
-        canonicalJson(normalized.object ?? null), normalized.evidenceMode || 'uncertain',
-        canonicalJson(normalized.sourceMessageIds), canonicalJson(normalized.exactQuotes),
-        normalized.status, normalized.confidence, normalized.supersedes || null,
-        normalized.origin, checksum, normalized.createdAt || now(), normalized.verifiedAt || null,
-        canonicalJson(normalized)
-      );
-      this.appendSync('fact', normalized.factId, 'insert', normalized);
+    const existing = this.db.prepare('SELECT checksum FROM facts WHERE fact_id = ?').get(normalized.factId);
+    if (existing) {
+      if (existing.checksum !== checksum) throw new Error('fact checksum conflict');
       return normalized;
-    });
+    }
+    this.db.prepare(`
+      INSERT INTO facts(
+        fact_id, character_id, subject_id, predicate, object_json, evidence_mode,
+        source_message_ids_json, exact_quotes_json, status, confidence, supersedes,
+        origin, checksum, created_at, verified_at, fact_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalized.factId, normalized.characterId, normalized.subjectId, normalized.predicate,
+      canonicalJson(normalized.object ?? null), normalized.evidenceMode || 'uncertain',
+      canonicalJson(normalized.sourceMessageIds), canonicalJson(normalized.exactQuotes),
+      normalized.status, normalized.confidence, normalized.supersedes || null,
+      normalized.origin, checksum, normalized.createdAt || now(), normalized.verifiedAt || null,
+      canonicalJson(normalized)
+    );
+    this.appendSync('fact', normalized.factId, 'insert', normalized);
+    return normalized;
+  }
+
+  putFact(fact) {
+    return this.transaction(() => this.putFactInternal(fact));
   }
 
 
@@ -13546,9 +13668,426 @@ export class YuqiStore {
     const suppressed = new Set(this.db.prepare(
       'SELECT message_id FROM suppressed_messages'
     ).all().map(row => row.message_id));
-    return this.listFacts(characterId, options).filter(fact =>
-      !(fact.sourceMessageIds || []).some(messageId => suppressed.has(messageId))
-    );
+    return this.listFacts(characterId, options).filter(fact => {
+      if ((fact.sourceMessageIds || []).some(messageId => suppressed.has(messageId))) return false;
+      return this.validateMemoryFactLifecycleInternal(fact);
+    });
+  }
+
+  /**
+   * Resolve a persisted fact against the same store-owned authority used by
+   * conversation clear.  This is intentionally independent of model output:
+   * source IDs are joined to durable message/action and turn/group rows, and
+   * the optional authority tuple must be an exact projection of those rows.
+   */
+  resolveMemoryFactEvidenceInternal(fact, { frozen = null, roleId = null } = {}) {
+    if (!fact || typeof fact !== 'object' || Array.isArray(fact)) {
+      throw new Error('memory fact authority conflict');
+    }
+    const messageIds = fact.sourceMessageIds;
+    const actionIds = fact.sourceActionIds == null ? [] : fact.sourceActionIds;
+    const nativeIds = value => Array.isArray(value)
+      && value.every(id => typeof id === 'string' && id.trim().length > 0)
+      && new Set(value).size === value.length;
+    if (!nativeIds(messageIds) || !nativeIds(actionIds)
+      || (!messageIds.length && !actionIds.length)) {
+      throw new Error('memory fact source IDs conflict');
+    }
+    const expectedRoleId = String(roleId || fact.characterId || '').trim();
+    if (!expectedRoleId) throw new Error('memory fact role authority conflict');
+    const messages = [];
+    const actions = [];
+    const lanes = new Set();
+    const authorities = [];
+    const affectedMessageIds = new Set(frozen?.messageIds || []);
+    const affectedActionIds = new Set(frozen?.actionIds || []);
+    const affectedTurnIds = new Set(frozen?.turnIds || []);
+    const sourceMessageSet = new Set(messageIds);
+    const sourceActionSet = new Set(actionIds);
+    for (const messageId of messageIds) {
+      const row = this.db.prepare(`
+        SELECT m.*, t.result_authority_version, t.lane_key, t.envelope_json, t.authority_lineage_key,
+               t.character_id AS turn_character_id, t.state AS turn_state,
+               g.group_id AS authority_group_id, g.redacted_at AS group_redacted_at,
+               r.commit_checksum AS authority_commit_checksum
+        FROM messages m
+        JOIN turns t ON t.turn_id = m.turn_id
+        LEFT JOIN visible_result_groups g ON g.group_id = m.authority_group_id
+        LEFT JOIN visible_commit_receipts r ON r.group_id = g.group_id
+        WHERE m.message_id = ?
+      `).get(messageId);
+      if (!row || row.character_id !== expectedRoleId) {
+        throw new Error(`memory fact source message authority conflict: ${messageId}`);
+      }
+      if (row.turn_character_id !== expectedRoleId) {
+        throw new Error(`memory fact source message turn authority conflict: ${messageId}`);
+      }
+      if (row.turn_state === 'cancelled' || typeof row.content !== 'string' || !row.content.trim()) {
+        throw new Error(`memory fact source message lifecycle conflict: ${messageId}`);
+      }
+      let currentBatchAuthority = null;
+      if (Number(row.result_authority_version) === 1 && !row.authority_group_id) {
+        currentBatchAuthority = this.resolveCurrentBatchAuthorityForMemoryInternal({
+          turnId: row.turn_id, messageId, roleId: expectedRoleId
+        });
+      } else if (Number(row.result_authority_version) === 1
+        && (!row.authority_commit_checksum || row.group_redacted_at != null
+          || !/^[a-f0-9]{64}$/.test(row.authority_commit_checksum))) {
+        throw new Error(`memory fact source message receipt conflict: ${messageId}`);
+      }
+      let lane = currentBatchAuthority?.lane || String(row.lane_key || '').trim();
+      if (!lane) {
+        const envelope = parseJson(row.envelope_json, null);
+        lane = Number(envelope?.protocolVersion) === 1
+          ? 'private_chat'
+          : (envelope ? laneKeyForEnvelope(envelope) : '');
+      }
+      if (!lane) throw new Error(`memory fact source message lane conflict: ${messageId}`);
+      lanes.add(lane);
+      const authority = {
+        authorityGroupId: currentBatchAuthority?.authorityGroupId || row.authority_group_id || null,
+        authorityLineageKey: currentBatchAuthority?.authorityLineageKey || row.authority_lineage_key || null,
+        authorityCommitChecksum: currentBatchAuthority?.authorityCommitChecksum || row.authority_commit_checksum || null
+      };
+      messages.push({ row, messageId, lane, affected: affectedMessageIds.has(messageId)
+        || affectedTurnIds.has(row.turn_id), authority });
+      authorities.push(authority);
+    }
+    for (const actionId of actionIds) {
+      const row = this.db.prepare(`
+        SELECT a.*, g.group_id, g.role_id, g.lineage_key, g.authoritative_turn_id,
+               g.authority_origin, r.commit_checksum, t.lane_key, t.character_id,
+               t.result_authority_version, t.state AS turn_state, t.envelope_json,
+               g.redacted_at AS group_redacted_at
+        FROM visible_result_actions a
+        JOIN visible_result_groups g ON g.group_id = a.group_id
+        JOIN turns t ON t.turn_id = g.authoritative_turn_id
+        LEFT JOIN visible_commit_receipts r ON r.group_id = g.group_id
+        WHERE a.action_id = ?
+      `).get(actionId);
+      if (!row || row.role_id !== expectedRoleId || row.character_id !== expectedRoleId) {
+        throw new Error(`memory fact source action authority conflict: ${actionId}`);
+      }
+      if (row.turn_state === 'cancelled' || row.redacted_at != null || row.group_redacted_at != null) {
+        throw new Error(`memory fact source action lifecycle conflict: ${actionId}`);
+      }
+      if (Number(row.result_authority_version) !== 1
+        || !row.group_id || !row.commit_checksum
+        || !/^[a-f0-9]{64}$/.test(row.commit_checksum)) {
+        throw new Error(`memory fact source action receipt conflict: ${actionId}`);
+      }
+      let lane = String(row.lane_key || '').trim();
+      if (!lane) {
+        const envelope = parseJson(row.envelope_json, null);
+        lane = Number(envelope?.protocolVersion) === 1
+          ? 'private_chat'
+          : (envelope ? laneKeyForEnvelope(envelope) : '');
+      }
+      if (!lane) throw new Error(`memory fact source action lane conflict: ${actionId}`);
+      lanes.add(lane);
+      const authority = {
+        authorityGroupId: row.group_id || null,
+        authorityLineageKey: row.lineage_key || null,
+        authorityCommitChecksum: row.commit_checksum || null
+      };
+      actions.push({ row, actionId, lane, affected: affectedActionIds.has(actionId)
+        || affectedTurnIds.has(row.authoritative_turn_id), authority });
+      authorities.push(authority);
+    }
+    if (lanes.size > 1) throw new Error('memory fact mixed lane authority conflict');
+    const lane = [...lanes][0];
+    if (!['private_chat', 'public_moment', 'moment_thread'].includes(lane)) {
+      throw new Error('memory fact lane authority conflict');
+    }
+    const derivedEvidenceAuthority = {
+      authorityGroupIds: [...new Set(authorities.map(item => item.authorityGroupId).filter(Boolean))].sort(),
+      lineageKeys: [...new Set(authorities.map(item => item.authorityLineageKey).filter(Boolean))].sort(),
+      commitChecksums: [...new Set(authorities.map(item => item.authorityCommitChecksum).filter(Boolean))].sort()
+    };
+    const survivingAuthorities = [
+      ...messages.filter(item => !item.affected).map(item => item.authority),
+      ...actions.filter(item => !item.affected).map(item => item.authority)
+    ];
+    const survivingEvidenceAuthority = {
+      authorityGroupIds: [...new Set(survivingAuthorities.map(item => item.authorityGroupId).filter(Boolean))].sort(),
+      lineageKeys: [...new Set(survivingAuthorities.map(item => item.authorityLineageKey).filter(Boolean))].sort(),
+      commitChecksums: [...new Set(survivingAuthorities.map(item => item.authorityCommitChecksum).filter(Boolean))].sort()
+    };
+    if (fact.evidenceAuthority != null) {
+      const supplied = fact.evidenceAuthority;
+      const keys = ['authorityGroupIds', 'commitChecksums', 'lineageKeys'];
+      if (!supplied || typeof supplied !== 'object' || Array.isArray(supplied)
+        || canonicalJson(Object.keys(supplied).sort()) !== canonicalJson([...keys].sort())
+        || keys.some(key => !Array.isArray(supplied[key])
+          || supplied[key].some(value => typeof value !== 'string' || !value.trim())
+          || new Set(supplied[key]).size !== supplied[key].length)
+        || canonicalJson(supplied) !== canonicalJson(derivedEvidenceAuthority)) {
+        throw new Error('memory fact evidence authority conflict');
+      }
+    }
+    return {
+      lane,
+      messages,
+      actions,
+      authorities,
+      derivedEvidenceAuthority,
+      survivingEvidenceAuthority,
+      affected: [...messages.filter(item => item.affected).map(item => item.messageId),
+        ...actions.filter(item => item.affected).map(item => item.actionId)].sort(),
+      surviving: [...messages.filter(item => !item.affected).map(item => item.messageId),
+        ...actions.filter(item => !item.affected).map(item => item.actionId)].sort(),
+      sourceMessageSet,
+      sourceActionSet
+    };
+  }
+
+  validateMemoryFactLifecycleInternal(fact) {
+    if (!fact || fact.status !== 'verified' || fact.redacted || fact.archived
+      || fact.withdrawn || fact.superseded) return false;
+    let authority;
+    try {
+      authority = classifyMemoryFactAuthority(fact);
+    } catch {
+      return false;
+    }
+    if (authority.kind === 'config') return true;
+    try {
+      const resolved = this.resolveMemoryFactEvidenceInternal(fact);
+      if (['public_moment', 'moment_thread'].includes(resolved.lane)) return true;
+      return resolved.lane === 'private_chat' && resolved.affected.length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  prepareMemoryPruneInternal({ roleId, frozen, controlId, redactedAt }) {
+    const rows = this.db.prepare(`
+      SELECT * FROM facts
+      WHERE character_id = ? AND status NOT IN ('archived', 'redacted')
+      ORDER BY fact_id
+    `).all(String(roleId));
+    const plan = [];
+    for (const row of rows) {
+      const fact = mapFact(row);
+      if (!fact) throw new Error('memory fact authority conflict');
+      const authority = classifyMemoryFactAuthority(fact);
+      if (authority.kind === 'config') continue;
+      const resolved = this.resolveMemoryFactEvidenceInternal(fact, { frozen, roleId });
+      if (resolved.lane !== 'private_chat') {
+        if (resolved.affected.length) throw new Error(`memory fact public lane conflict: ${fact.factId}`);
+        continue;
+      }
+      if (!resolved.affected.length) continue;
+      if (resolved.surviving.length && resolved.lane !== 'private_chat') {
+        throw new Error(`memory fact mixed lane conflict: ${fact.factId}`);
+      }
+      plan.push({ row, fact, resolved, controlId: String(controlId), redactedAt: Number(redactedAt) });
+    }
+    return { facts: plan };
+  }
+
+  appendSyncAtInternal(entityType, entityId, operation, payload, createdAt) {
+    const payloadJson = canonicalJson(payload);
+    const checksum = contentHash(payload);
+    const result = this.db.prepare(`
+      INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(entityType, entityId, operation, payloadJson, checksum, Number(createdAt));
+    return Number(result.lastInsertRowid);
+  }
+
+  assertMemoryPruneClosureInternal({ controlId, roleId, redactedAt }) {
+    const audits = this.db.prepare(`
+      SELECT * FROM sync_log WHERE entity_type = 'fact_redaction' ORDER BY seq
+    `).all();
+    const matching = [];
+    for (const row of audits) {
+      const payload = parseJson(row.payload_json, null);
+      if (payload?.controlId === String(controlId)) matching.push({ row, payload });
+    }
+    const summaries = this.db.prepare(
+      "SELECT * FROM sync_log WHERE entity_type = 'fact_redaction_set' AND entity_id = ? ORDER BY seq"
+    ).all(String(controlId));
+    if (summaries.length !== 1) throw new Error('memory fact redaction set audit conflict');
+    const summaryPayload = parseJson(summaries[0].payload_json, null);
+    const summaryKeys = [
+      'auditVersion', 'controlId', 'factCommitment', 'factCount', 'redactedAt', 'roleId'
+    ];
+    if (!summaryPayload || canonicalJson(Object.keys(summaryPayload).sort())
+      !== canonicalJson(summaryKeys.sort())
+      || summaryPayload.auditVersion !== 'fact-redaction-set-v1'
+      || summaryPayload.controlId !== String(controlId)
+      || summaryPayload.roleId !== String(roleId)
+      || summaryPayload.redactedAt !== Number(redactedAt)
+      || !Number.isSafeInteger(summaryPayload.factCount)
+      || summaryPayload.factCount !== matching.length
+      || !/^[a-f0-9]{64}$/.test(summaryPayload.factCommitment || '')
+      || summaries[0].checksum !== contentHash(summaryPayload)) {
+      throw new Error('memory fact redaction set summary conflict');
+    }
+    const seen = new Set();
+    for (const { row, payload } of matching) {
+      const expectedKeys = [
+        'auditVersion', 'controlId', 'factId', 'newChecksum', 'oldChecksum',
+        'redactedAt', 'replacementFactId', 'roleId'
+      ];
+      if (canonicalJson(Object.keys(payload).sort()) !== canonicalJson(expectedKeys.sort())
+        || payload.auditVersion !== 'fact_redaction_v1'
+        || payload.roleId !== String(roleId)
+        || payload.factId !== row.entity_id
+        || payload.redactedAt !== Number(redactedAt)
+        || !/^[a-f0-9]{64}$/.test(payload.oldChecksum || '')
+        || !/^[a-f0-9]{64}$/.test(payload.newChecksum || '')
+        || row.checksum !== contentHash(payload)
+        || seen.has(payload.factId)) {
+        throw new Error(`memory fact redaction audit conflict: ${row.entity_id}`);
+      }
+      seen.add(payload.factId);
+      const factRow = this.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get(payload.factId);
+      const shell = {
+        factId: payload.factId,
+        characterId: String(roleId),
+        status: 'archived',
+        redacted: true,
+        redactedAt: Number(redactedAt)
+      };
+      if (!factRow || factRow.checksum !== payload.newChecksum
+        || canonicalJson(parseJson(factRow.fact_json, null)) !== canonicalJson(shell)
+        || factRow.subject_id !== '__redacted__' || factRow.predicate !== 'redacted'
+        || factRow.object_json !== 'null' || factRow.evidence_mode !== 'redacted'
+        || factRow.source_message_ids_json !== '[]' || factRow.exact_quotes_json !== '[]'
+        || factRow.status !== 'archived' || Number(factRow.confidence) !== 0
+        || factRow.origin !== 'redacted' || factRow.verified_at != null) {
+        throw new Error(`memory fact redaction shell conflict: ${payload.factId}`);
+      }
+      if (payload.replacementFactId != null) {
+        if (typeof payload.replacementFactId !== 'string' || !payload.replacementFactId.trim()) {
+          throw new Error(`memory fact replacement identity conflict: ${payload.factId}`);
+        }
+        const replacement = this.db.prepare(
+          'SELECT * FROM facts WHERE fact_id = ?'
+        ).get(payload.replacementFactId);
+        const replacementFact = mapFact(replacement);
+        if (!replacement || !replacementFact || replacementFact.supersedes !== payload.factId
+          || replacementFact.status === 'archived' || replacementFact.redacted
+          || !this.validateMemoryFactLifecycleInternal(replacementFact)) {
+          throw new Error(`memory fact replacement conflict: ${payload.factId}`);
+        }
+      }
+    }
+    if (summaryPayload.factCommitment !== factRedactionSetCommitment({
+      controlId, roleId, entries: matching.map(({ payload }) => payload)
+    })) {
+      throw new Error('memory fact redaction set commitment conflict');
+    }
+    return matching.length;
+  }
+
+  applyMemoryPrunePlanInternal(plan, { roleId, controlId, redactedAt }) {
+    const facts = Array.isArray(plan) ? plan : (plan?.facts || []);
+    const auditEntries = [];
+    for (const entry of facts) {
+      const { row, fact, resolved } = entry;
+      if (row.checksum !== contentHash(fact)) throw new Error(`memory fact checksum conflict: ${fact.factId}`);
+      const survivingMessageIds = fact.sourceMessageIds.filter(id => resolved.surviving.includes(id));
+      const survivingActionIds = (fact.sourceActionIds || []).filter(id => resolved.surviving.includes(id));
+      if (!survivingMessageIds.length && !survivingActionIds.length) {
+        const shell = {
+          factId: fact.factId,
+          characterId: fact.characterId,
+          status: 'archived',
+          redacted: true,
+          redactedAt: Number(redactedAt)
+        };
+        const newChecksum = contentHash(shell);
+        const updated = this.db.prepare(`
+          UPDATE facts SET subject_id = '__redacted__', predicate = 'redacted',
+            object_json = 'null', evidence_mode = 'redacted',
+            source_message_ids_json = '[]', exact_quotes_json = '[]',
+            status = 'archived', confidence = 0, origin = 'redacted',
+            checksum = ?, verified_at = NULL, fact_json = ?
+          WHERE fact_id = ? AND checksum = ? AND status NOT IN ('archived', 'redacted')
+        `).run(newChecksum, canonicalJson(shell), fact.factId, row.checksum);
+        if (Number(updated.changes) !== 1) throw new Error(`memory fact CAS conflict: ${fact.factId}`);
+        const audit = {
+          auditVersion: 'fact_redaction_v1',
+          controlId: String(controlId),
+          roleId: String(roleId),
+          factId: fact.factId,
+          oldChecksum: row.checksum,
+          newChecksum,
+          redactedAt: Number(redactedAt),
+          replacementFactId: null
+        };
+        this.appendSyncAtInternal('fact_redaction', fact.factId, 'redact', audit, redactedAt);
+        auditEntries.push(audit);
+        continue;
+      }
+      const survivingEvidenceChecksum = contentHash({
+        sourceMessageIds: survivingMessageIds,
+        sourceActionIds: survivingActionIds,
+        evidenceAuthority: resolved.survivingEvidenceAuthority
+      });
+      const replacementFactId = stableId('fact_prune', `${fact.factId}:${controlId}:${survivingEvidenceChecksum}`);
+      const replacement = {
+        ...fact,
+        factId: replacementFactId,
+        supersedes: fact.factId,
+        sourceMessageIds: survivingMessageIds,
+        sourceActionIds: survivingActionIds,
+        exactQuotes: (fact.exactQuotes || []).filter(quote => survivingMessageIds.includes(quote.messageId)),
+        exactActions: (fact.exactActions || []).filter(action => survivingActionIds.includes(action.actionId)),
+        evidenceAuthority: resolved.survivingEvidenceAuthority,
+        createdAt: Number(redactedAt),
+        verifiedAt: resolved.messages.every(item => item.row.delivery_state === 'confirmed')
+          ? (fact.verifiedAt ?? Number(redactedAt)) : null
+      };
+      const replacementChecksum = contentHash(replacement);
+      const archivedChecksum = contentHash({ factId: fact.factId, characterId: fact.characterId,
+        status: 'archived', redacted: true, redactedAt: Number(redactedAt) });
+      const archived = this.db.prepare(`
+        UPDATE facts SET subject_id = '__redacted__', predicate = 'redacted',
+          object_json = 'null', evidence_mode = 'redacted', source_message_ids_json = '[]',
+          exact_quotes_json = '[]', status = 'archived', confidence = 0, origin = 'redacted',
+          checksum = ?, verified_at = NULL, fact_json = ?
+        WHERE fact_id = ? AND checksum = ? AND status NOT IN ('archived', 'redacted')
+      `).run(archivedChecksum,
+      canonicalJson({ factId: fact.factId, characterId: fact.characterId, status: 'archived',
+        redacted: true, redactedAt: Number(redactedAt) }), fact.factId, row.checksum);
+      if (Number(archived.changes) !== 1) throw new Error(`memory fact CAS conflict: ${fact.factId}`);
+      this.db.prepare(`
+        INSERT INTO facts(
+          fact_id, character_id, subject_id, predicate, object_json, evidence_mode,
+          source_message_ids_json, exact_quotes_json, status, confidence, supersedes,
+          origin, checksum, created_at, verified_at, fact_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        replacement.factId, replacement.characterId, replacement.subjectId, replacement.predicate,
+        canonicalJson(replacement.object ?? null), replacement.evidenceMode || 'uncertain',
+        canonicalJson(replacement.sourceMessageIds), canonicalJson(replacement.exactQuotes),
+        replacement.status, replacement.confidence, replacement.supersedes,
+        replacement.origin, replacementChecksum, replacement.createdAt, replacement.verifiedAt,
+        canonicalJson(replacement)
+      );
+      const audit = {
+        auditVersion: 'fact_redaction_v1', controlId: String(controlId), roleId: String(roleId),
+        factId: fact.factId, oldChecksum: row.checksum,
+        newChecksum: archivedChecksum,
+        redactedAt: Number(redactedAt), replacementFactId
+      };
+      this.appendSyncAtInternal('fact_redaction', fact.factId, 'redact', audit, redactedAt);
+      this.appendSyncAtInternal('fact', replacement.factId, 'insert', replacement, redactedAt);
+      auditEntries.push(audit);
+    }
+    const summary = {
+      auditVersion: 'fact-redaction-set-v1',
+      controlId: String(controlId),
+      roleId: String(roleId),
+      factCount: auditEntries.length,
+      factCommitment: factRedactionSetCommitment({ controlId, roleId, entries: auditEntries }),
+      redactedAt: Number(redactedAt)
+    };
+    this.appendSyncAtInternal('fact_redaction_set', String(controlId), 'redact', summary, redactedAt);
   }
 
   getSyncDelta(afterSeq = 0, limit = 500) {
@@ -14475,6 +15014,128 @@ export class YuqiStore {
     return mapConsolidationJob(this.db.prepare(
       'SELECT * FROM consolidation_jobs WHERE job_id = ?'
     ).get(String(jobId)));
+  }
+
+  validateConsolidationJobLifecycleInternal({
+    jobId, workerId, roleId, sourceMessageIds = [], sourceActionIds = [], now: at = now()
+  } = {}) {
+    const job = this.db.prepare('SELECT * FROM consolidation_jobs WHERE job_id = ?')
+      .get(String(jobId || ''));
+    if (!job || job.state !== 'running' || job.lease_owner !== String(workerId || '')
+      || !Number.isSafeInteger(Number(job.lease_expires_at))
+      || Number(job.lease_expires_at) <= Number(at)) {
+      throw new Error('consolidation job lease lifecycle conflict');
+    }
+    if (String(job.role_id || '') !== String(roleId || '')) {
+      throw new Error('consolidation job role lifecycle conflict');
+    }
+    if (!Array.isArray(sourceMessageIds) && !Array.isArray(sourceActionIds)) {
+      throw new Error('consolidation source IDs conflict');
+    }
+    if (sourceMessageIds.length === 0 && sourceActionIds.length === 0) {
+      return { job: mapConsolidationJob(job), resolved: null };
+    }
+    const fact = {
+      factId: `job:${job.job_id}`,
+      characterId: String(roleId || ''),
+      status: 'verified',
+      origin: 'consolidation',
+      sourceMessageIds,
+      sourceActionIds
+    };
+    const resolved = this.resolveMemoryFactEvidenceInternal(fact, { roleId });
+    if (!resolved || resolved.affected.length) throw new Error('consolidation source lifecycle conflict');
+    return { job: mapConsolidationJob(job), resolved };
+  }
+
+  /**
+   * Commit consolidation facts only after the final source projection and
+   * worker lease have been revalidated in the same BEGIN IMMEDIATE transaction
+   * as the first fact write.  Conversation clear uses the same transaction
+   * boundary, so whichever transaction wins the source CAS is authoritative.
+   */
+  commitConsolidationFactsInternal({
+    jobId, workerId, roleId, candidates = [], rawMessages = [], now: at = now(),
+    faultAfterStep = null
+  } = {}) {
+    if (!Array.isArray(candidates) || !Array.isArray(rawMessages)) {
+      throw new Error('consolidation candidate input conflict');
+    }
+    return this.transaction(() => {
+      const sourceMessageIds = [...new Set(candidates.flatMap(candidate =>
+        Array.isArray(candidate?.sourceMessageIds) ? candidate.sourceMessageIds : []))];
+      const sourceActionIds = [...new Set(candidates.flatMap(candidate =>
+        Array.isArray(candidate?.sourceActionIds) ? candidate.sourceActionIds : []))];
+      const gate = this.validateConsolidationJobLifecycleInternal({
+        jobId, workerId, roleId, sourceMessageIds, sourceActionIds, now: at
+      });
+      if (faultAfterStep === 'after_source_revalidation') {
+        throw new Error('forced consolidation commit fault: after_source_revalidation');
+      }
+      const persistedEvidence = [
+        ...(gate.resolved?.messages || []).map(item => ({
+          messageId: item.row.message_id,
+          speakerId: item.row.speaker_id,
+          speakerType: item.row.speaker_type,
+          content: item.row.content,
+          sentAt: item.row.sent_at,
+          committed: true,
+          authorityVerified: true,
+          resultAuthorityVersion: Number(item.row.result_authority_version) || 1,
+          turnState: item.row.turn_state || 'committed',
+          authorityGroupId: item.authority.authorityGroupId,
+          authorityLineageKey: item.authority.authorityLineageKey,
+          authorityCommitChecksum: item.authority.authorityCommitChecksum,
+          deliveryState: item.row.delivery_state
+            || (item.row.speaker_type === 'character' ? 'confirmed' : 'input'),
+          redacted: false
+        })),
+        ...(gate.resolved?.actions || []).map(item => ({
+          evidenceKind: 'action',
+          actionId: item.row.action_id,
+          kind: item.row.kind,
+          targetKey: item.row.target_key,
+          targetRevision: item.row.target_revision,
+          payload: parseJson(item.row.payload_json, null),
+          actionChecksum: item.row.action_checksum,
+          authorityVerified: true,
+          resultAuthorityVersion: Number(item.row.result_authority_version) || 1,
+          turnState: item.row.turn_state || 'committed',
+          authorityGroupId: item.authority.authorityGroupId,
+          authorityLineageKey: item.authority.authorityLineageKey,
+          authorityCommitChecksum: item.authority.authorityCommitChecksum,
+          authorityRoleId: roleId,
+          deliveryState: 'confirmed',
+          redacted: false
+        }))
+      ];
+      const result = { verified: [], provisional: [], rejected: [] };
+      const verified = [];
+      for (const candidate of candidates) {
+        // rawMessages is retained only for the worker API shape; all candidate
+        // quote/action content is checked against the persisted projection
+        // captured above, never against a caller/model-owned array.
+        const validation = validateConsolidationCandidate(candidate, persistedEvidence);
+        if (validation.status === 'rejected') {
+          result.rejected.push(validation);
+          continue;
+        }
+        if (validation.fact.characterId !== String(roleId || '')) {
+          throw new Error('consolidation candidate role authority conflict');
+        }
+        this.resolveMemoryFactEvidenceInternal(validation.fact, { roleId });
+        verified.push(validation);
+      }
+      for (const validation of verified) {
+        this.putFactInternal(validation.fact);
+        result.verified.push(validation);
+      }
+      if (faultAfterStep === 'after_fact_write') {
+        throw new Error('forced consolidation commit fault: after_fact_write');
+      }
+      void gate;
+      return result;
+    });
   }
 
   loadComparisonExecutionAuthorityInternal({ jobId, workerId }) {

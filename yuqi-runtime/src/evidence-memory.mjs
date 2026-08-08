@@ -18,7 +18,7 @@ const CONSOLIDATION_COMMON_KEYS = new Set([
   'factId', 'characterId', 'type', 'subjectId', 'predicate', 'object',
   'evidenceMode', 'sourceMessageIds', 'exactQuotes', 'confidence',
   'sourceActionIds', 'exactActions', 'origin', 'evidenceSource',
-  'authorityContractVersion'
+  'authorityContractVersion', 'evidenceAuthority'
 ]);
 
 const CANONICAL_ACTION_KEYS = new Set([
@@ -106,6 +106,22 @@ function rejectCandidate(candidate, reasons) {
     status: 'rejected',
     reasons,
     fact: normalizeCandidate(candidate || {}, 'rejected')
+  };
+}
+
+// A v3 current-batch message is input evidence.  It shares the turn lineage
+// but is deliberately not a visible-result group, so group and commit proof
+// are both null.  Worker, retrieval, and store validators all consume this
+// one projection rather than independently inventing a group identity.
+export function currentBatchEvidenceAuthorityProjection({ lineageKey } = {}) {
+  if (typeof lineageKey !== 'string' || !lineageKey.trim()) {
+    throw new Error('current-batch authority lineage conflict');
+  }
+  return {
+    lane: 'private_chat',
+    authorityGroupId: null,
+    authorityLineageKey: lineageKey,
+    authorityCommitChecksum: null
   };
 }
 
@@ -231,10 +247,13 @@ export function validateConsolidationCandidate(candidate, evidence) {
       || !Number.isSafeInteger(message.sentAt)) {
       reasons.push(`source message is not a committed canonical projection: ${sourceId}`);
     }
+    const hasCurrentBatchAuthority = messageGroupId == null && messageCommitChecksum == null;
+    const hasResultAuthority = isNativeNonEmptyString(messageGroupId)
+      && /^[a-f0-9]{64}$/.test(messageCommitChecksum || '');
     if (message.authorityVerified !== true
-      || !isNativeNonEmptyString(messageGroupId)
       || !isNativeNonEmptyString(messageLineageKey)
-      || !/^[a-f0-9]{64}$/.test(messageCommitChecksum || '')) {
+      || (!hasCurrentBatchAuthority && !hasResultAuthority)
+      || (messageGroupId == null) !== (messageCommitChecksum == null)) {
       reasons.push(`source authority proof is incomplete: ${sourceId}`);
     }
     if (message.redacted === true || message.withdrawn === true || message.archived === true
@@ -374,6 +393,26 @@ export function validateConsolidationCandidate(candidate, evidence) {
   if (candidate.evidenceSource !== expectedEvidenceSource(allEvidence)) {
     reasons.push('candidate evidenceSource does not match its authoritative sources');
   }
+  const derivedEvidenceAuthority = {
+    authorityGroupIds: [...new Set(authorities.map(item => item.authorityGroupId).filter(Boolean))]
+      .sort(),
+    lineageKeys: [...new Set(authorities.map(item => item.authorityLineageKey).filter(Boolean))]
+      .sort(),
+    commitChecksums: [...new Set(authorities.map(item => item.authorityCommitChecksum).filter(Boolean))]
+      .sort()
+  };
+  if (Object.prototype.hasOwnProperty.call(candidate, 'evidenceAuthority')) {
+    const suppliedAuthority = candidate.evidenceAuthority;
+    const exactAuthorityKeys = ['authorityGroupIds', 'commitChecksums', 'lineageKeys'];
+    const arraysClosed = isPlainJsonObject(suppliedAuthority)
+      && canonicalJson(Object.keys(suppliedAuthority).sort()) === canonicalJson(exactAuthorityKeys)
+      && exactAuthorityKeys.every(key => Array.isArray(suppliedAuthority[key])
+        && suppliedAuthority[key].every(value => typeof value === 'string' && value.trim())
+        && new Set(suppliedAuthority[key]).size === suppliedAuthority[key].length);
+    if (!arraysClosed || canonicalJson(suppliedAuthority) !== canonicalJson(derivedEvidenceAuthority)) {
+      reasons.push('candidate evidenceAuthority does not exactly match resolved sources');
+    }
+  }
   if (candidate.type === 'formal_commitment') {
     if (typeof candidate.promisedBy !== 'string' || !candidate.promisedBy.trim()) {
       reasons.push('formal commitment promisedBy is required');
@@ -440,11 +479,7 @@ export function validateConsolidationCandidate(candidate, evidence) {
       sourceMessageIds: sourceIds,
       sourceActionIds,
       exactActions: exactActions.map(action => ({ ...action })),
-      evidenceAuthority: {
-        authorityGroupIds: [...new Set(authorities.map(item => item.authorityGroupId).filter(Boolean))],
-        lineageKeys: [...new Set(authorities.map(item => item.authorityLineageKey).filter(Boolean))],
-        commitChecksums: [...new Set(authorities.map(item => item.authorityCommitChecksum).filter(Boolean))]
-      }
+      evidenceAuthority: derivedEvidenceAuthority
     }, 'verified')
   };
 }

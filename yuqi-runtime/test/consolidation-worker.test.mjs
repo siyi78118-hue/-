@@ -102,6 +102,45 @@ test('a turn consolidation job commits evidence-backed facts once and completes 
   });
 });
 
+test('worker revalidates source lifecycle and lease after model await before committing facts', async () => {
+  const calls = [];
+  const store = {
+    resolveMemoryFactEvidenceInternal() {
+      calls.push('resolve');
+      return { lane: 'private_chat', affected: [] };
+    },
+    validateConsolidationJobLifecycleInternal() {
+      calls.push('lease');
+      if (calls.filter(call => call === 'lease').length > 1) {
+        throw new Error('consolidation source lifecycle conflict');
+      }
+      return true;
+    },
+    putFact() {
+      throw new Error('putFact must not run after clear race');
+    }
+  };
+  const presetRegistry = {
+    current: () => ({ version: '2.0.0' }),
+    resolvePresetBundle: () => '只整理有原文证据的记忆'
+  };
+  const worker = new ConsolidationWorker({
+    store,
+    presetRegistry,
+    codexClient: { async runTurn() { return { text: JSON.stringify({ candidates: [] }) }; } },
+    clock: () => 1784400001000
+  });
+  worker.evidenceForJob = () => ({
+    turn: { turnId: 'turn_v3', resultAuthorityVersion: 1, characterId: 'yuqi', state: 'committed' },
+    messages: [{ messageId: 'msg_v3', evidenceKind: 'message', speakerType: 'user', content: 'fact evidence', sentAt: 1784400000001 }]
+  });
+  await assert.rejects(() => worker.processJob({
+    jobId: 'job_v3', roleId: 'yuqi', leaseOwner: 'yuqi-consolidation', attemptCount: 1,
+    payload: { messageIds: ['msg_v3'] }
+  }), /lease|lifecycle|source|conflict/i);
+  assert.deepEqual(calls, ['resolve', 'lease', 'lease']);
+});
+
 test('an undelivered Yuqi message is excluded from consolidation evidence', async () => {
   await withFixture(async ({ store, presetRegistry }) => {
     const turn = store.submitTurn(envelope(2), {

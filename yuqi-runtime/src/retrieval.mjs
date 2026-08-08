@@ -71,6 +71,8 @@ function actionEvidenceForFact(fact) {
 }
 
 function factIsRetrievable(store, fact, now) {
+  if (typeof store?.validateMemoryFactLifecycleInternal === 'function'
+    && !store.validateMemoryFactLifecycleInternal(fact)) return false;
   if (!fact || fact.status !== 'verified') return false;
   if (fact.redacted || fact.withdrawn || fact.archived || fact.suppressed || fact.superseded) return false;
   if (fact.lifecycleStatus != null

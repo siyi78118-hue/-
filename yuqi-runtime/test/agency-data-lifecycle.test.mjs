@@ -18,6 +18,7 @@ import {
 } from '../src/protocol.mjs';
 import { YuqiStore } from '../src/store.mjs';
 import { commitVisibleResult } from '../src/visible-result-commit.mjs';
+import { ConsolidationWorker } from '../src/consolidation-worker.mjs';
 
 const V15_COLUMNS = [
   'control_id', 'role_id', 'peer_id', 'clear_epoch', 'cleared_through_sequence',
@@ -2235,6 +2236,214 @@ for (const [label, mutate] of [
   });
 }
 
+test('v3 current-batch user fact resolves without result-group authority and is pruned by private clear', () => {
+  const { dir, path } = tempPath('yuqi-memory-v3-current-batch-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { includeRetry: false, deliveryState: 'waiting' });
+    const batch = store.getCurrentUserBatch(fixture.terminal.turnId);
+    assert.ok(batch?.messageIds?.length);
+    const sourceMessageId = batch.messageIds[0];
+    const source = store.getMessage(sourceMessageId);
+    assert.equal(source.authorityGroupId ?? null, null);
+    store.putFact({
+      factId: 'fact_v3_current_batch_user', characterId: 'yuqi', type: 'user_fact',
+      subjectId: 'user', predicate: 'likes_food', object: { value: 'noodles' },
+      evidenceMode: 'direct', sourceMessageIds: [sourceMessageId],
+      exactQuotes: [{ messageId: sourceMessageId, speakerId: source.speakerId, text: source.content }],
+      status: 'verified', confidence: 0.9, origin: 'memory',
+      evidenceSource: 'user_visible_message', authorityContractVersion: 'v3'
+    });
+    assert.doesNotThrow(() => store.resolveMemoryFactEvidenceInternal(
+      store.listFacts('yuqi').find(fact => fact.factId === 'fact_v3_current_batch_user')
+    ));
+    assert.equal(store.listRetrievableFacts('yuqi').some(fact => fact.factId === 'fact_v3_current_batch_user'), true);
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400120000 }
+    );
+    assert.equal(store.listRetrievableFacts('yuqi').some(fact => fact.factId === 'fact_v3_current_batch_user'), false);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('real consolidation worker uses the store-owned current-batch authority through retrieval and clear', async () => {
+  const { dir, path } = tempPath('yuqi-memory-worker-current-batch-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { includeRetry: false, deliveryState: 'waiting' });
+    const batch = store.getCurrentUserBatch(fixture.terminal.turnId);
+    const source = store.getMessage(batch.messageIds[0]);
+    const job = store.getConsolidationJob('job_redaction_fixture');
+    assert.ok(job);
+    const presetRegistry = {
+      current: () => ({ version: '2.0.0' }),
+      resolvePresetBundle: () => '只整理有原文证据的记忆'
+    };
+    const worker = new ConsolidationWorker({
+      store,
+      presetRegistry,
+      clock: () => 1784400124000,
+      codexClient: {
+        async runTurn() {
+          return { text: JSON.stringify({ candidates: [{
+            factId: 'fact_worker_current_batch', characterId: 'yuqi', type: 'user_fact',
+            subjectId: 'user', predicate: 'likes_food', object: { value: 'noodles' },
+            evidenceMode: 'direct', sourceMessageIds: [source.messageId],
+            exactQuotes: [{ messageId: source.messageId, speakerId: source.speakerId, text: source.content }],
+            confidence: 0.9
+          }] }) };
+        }
+      }
+    });
+    const claimed = store.claimDueConsolidationJob({
+      workerId: 'worker_current_batch', jobTypes: ['turn_consolidation'],
+      now: 1784400124000, leaseMs: 60_000
+    });
+    assert.equal(claimed.jobId, job.jobId);
+    const result = await worker.processJob(claimed);
+    assert.equal(result.verified.length, 1);
+    assert.equal(store.listRetrievableFacts('yuqi').some(fact => fact.factId === 'fact_worker_current_batch'), true);
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400125000 }
+    );
+    assert.equal(store.listRetrievableFacts('yuqi').some(fact => fact.factId === 'fact_worker_current_batch'), false);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('store-owned consolidation commit loses cleanly to a prior conversation clear', async () => {
+  const { dir, path } = tempPath('yuqi-memory-worker-clear-race-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { includeRetry: false, deliveryState: 'waiting' });
+    const batch = store.getCurrentUserBatch(fixture.terminal.turnId);
+    const source = store.getMessage(batch.messageIds[0]);
+    const job = store.getConsolidationJob('job_redaction_fixture');
+    assert.ok(job);
+    const claimed = store.claimDueConsolidationJob({
+      workerId: 'worker_clear_race', jobTypes: ['turn_consolidation'],
+      now: 1784400126000, leaseMs: 60_000
+    });
+    assert.equal(claimed.jobId, job.jobId);
+    const candidate = {
+      factId: 'fact_worker_clear_race', characterId: 'yuqi', type: 'user_fact',
+      subjectId: 'user', predicate: 'likes_food', object: { value: 'noodles' },
+      evidenceMode: 'direct', sourceMessageIds: [source.messageId],
+      exactQuotes: [{ messageId: source.messageId, speakerId: source.speakerId, text: source.content }],
+      confidence: 0.9, origin: 'consolidation', evidenceSource: 'user_visible_message',
+      authorityContractVersion: 'v3'
+    };
+    const beforeFactCount = store.listFacts('yuqi').length;
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400127000 }
+    );
+    assert.throws(() => store.commitConsolidationFactsInternal({
+      jobId: claimed.jobId, workerId: claimed.leaseOwner, roleId: 'yuqi',
+      candidates: [candidate], rawMessages: [source], now: 1784400127001
+    }), /consolidation|source|lease|authority|conflict/i);
+    assert.equal(store.listFacts('yuqi').length, beforeFactCount);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('public consolidation facts remain retrievable across private clear', () => {
+  const { dir, path } = tempPath('yuqi-memory-public-fact-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const sourceMessageId = `msg_reply_${fixture.publicMoment.turnId}`;
+    const source = store.getMessage(sourceMessageId);
+    store.putFact({
+      factId: 'fact_public_moment', characterId: 'yuqi', type: 'public_fact',
+      subjectId: 'public_moment', predicate: 'public_text', object: { value: source.content },
+      evidenceMode: 'direct', sourceMessageIds: [sourceMessageId],
+      exactQuotes: [{ messageId: sourceMessageId, speakerId: source.speakerId, text: source.content }],
+      status: 'verified', confidence: 0.9, origin: 'consolidation',
+      evidenceSource: 'user_visible_message', authorityContractVersion: 'v3'
+    });
+    assert.equal(store.listRetrievableFacts('yuqi').some(fact => fact.factId === 'fact_public_moment'), true);
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400121000 }
+    );
+    assert.equal(store.listRetrievableFacts('yuqi').some(fact => fact.factId === 'fact_public_moment'), true);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('legacy user-derived facts are pruned while closed author authority is retained and forged origin fails closed', () => {
+  const { dir, path } = tempPath('yuqi-memory-origin-authority-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const sourceMessageId = `msg_${fixture.v1.turnId}`;
+    const source = store.getMessage(sourceMessageId);
+    store.putFact({
+      factId: 'fact_legacy_user', characterId: 'yuqi', type: 'user_fact', subjectId: 'user',
+      predicate: 'prefers_quiet', object: { value: true }, evidenceMode: 'direct',
+      sourceMessageIds: [sourceMessageId], exactQuotes: [{ messageId: sourceMessageId, speakerId: source.speakerId, text: source.content }],
+      status: 'verified', confidence: 0.9, origin: 'legacy'
+    });
+    store.putFact({
+      factId: 'fact_author_config', characterId: 'yuqi', type: 'author_fact', subjectId: 'yuqi',
+      predicate: 'style', object: { value: 'warm' }, evidenceMode: 'config', sourceMessageIds: [],
+      exactQuotes: [], status: 'verified', confidence: 1, origin: 'author',
+      authority: 'author', sourceConfigRef: 'author-style-v1'
+    });
+    store.putFact({
+      factId: 'fact_forged_author', characterId: 'yuqi', type: 'user_fact', subjectId: 'user',
+      predicate: 'secret', object: { value: true }, evidenceMode: 'direct', sourceMessageIds: [sourceMessageId],
+      exactQuotes: [{ messageId: sourceMessageId, speakerId: source.speakerId, text: source.content }],
+      status: 'verified', confidence: 0.9, origin: 'author'
+    });
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400122000 }
+    ), /origin|authority|fact|source|conflict/i);
+    assert.equal(store.db.prepare('SELECT status FROM facts WHERE fact_id = ?').get('fact_legacy_user').status, 'verified');
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM conversation_clear_controls').get().value, 0);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('fact redaction set audit is exact and replay rejects missing or extra fact entries', () => {
+  const { dir, path } = tempPath('yuqi-memory-fact-set-audit-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const sourceMessageId = `msg_${fixture.v1.turnId}`;
+    const source = store.getMessage(sourceMessageId);
+    store.putFact({
+      factId: 'fact_set_audit', characterId: 'yuqi', type: 'user_fact', subjectId: 'user',
+      predicate: 'prefers_quiet', object: { value: true }, evidenceMode: 'direct', sourceMessageIds: [sourceMessageId],
+      exactQuotes: [{ messageId: sourceMessageId, speakerId: source.speakerId, text: source.content }],
+      status: 'verified', confidence: 0.9, origin: 'consolidation'
+    });
+    const control = emptySessionClear({ clearedThroughSequence: 3 });
+    store.applyConversationClearInternal(control, { appliedAt: 1784400123000 });
+    const summary = store.db.prepare(
+      "SELECT payload_json FROM sync_log WHERE entity_type = 'fact_redaction_set' AND entity_id = ?"
+    ).get(control.controlId);
+    assert.ok(summary);
+    const payload = JSON.parse(summary.payload_json);
+    assert.equal(payload.factCount, 1);
+    store.db.prepare('DELETE FROM sync_log WHERE entity_type = ? AND entity_id = ?')
+      .run('fact_redaction_set', control.controlId);
+    assert.throws(() => store.applyConversationClearInternal(control, { appliedAt: 1784400123000 }), /fact|redaction|audit|closure|conflict/i);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
 for (const [label, mutate] of [
   ['missing outer source message', store => {
     store.db.prepare('DELETE FROM messages WHERE message_id = ?')
@@ -2331,6 +2540,124 @@ for (const protocolVersion of [1, 2]) {
     });
   }
 }
+
+test('conversation clear archives a sole-source fact and removes it from retrieval', () => {
+  const { dir, path } = tempPath('yuqi-clear-memory-sole-source-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { now: 1784400100000 });
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const sourceMessageId = `msg_${fixture.v1.turnId}`;
+    const source = store.getMessage(sourceMessageId);
+    store.putFact({
+      factId: 'fact_sole_source', characterId: 'yuqi', type: 'user_fact',
+      subjectId: 'user', predicate: 'prefers_quiet', object: { value: true },
+      evidenceMode: 'direct', sourceMessageIds: [sourceMessageId],
+      exactQuotes: [{ messageId: sourceMessageId, speakerId: source.speakerId, text: source.content }],
+      status: 'verified', confidence: 0.9, origin: 'consolidation',
+      evidenceSource: 'user_visible_message', authorityContractVersion: 'v3'
+    });
+    const before = store.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get('fact_sole_source');
+    assert.ok(before);
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+    );
+    const after = store.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get('fact_sole_source');
+    assert.equal(after.status, 'archived');
+    assert.equal(after.subject_id, '__redacted__');
+    assert.equal(after.predicate, 'redacted');
+    assert.equal(after.object_json, 'null');
+    assert.deepEqual(JSON.parse(after.source_message_ids_json), []);
+    assert.equal(after.confidence, 0);
+    assert.deepEqual(store.listRetrievableFacts('yuqi'), []);
+    const audit = store.db.prepare(
+      "SELECT payload_json FROM sync_log WHERE entity_type = 'fact_redaction' AND entity_id = ?"
+    ).get('fact_sole_source');
+    assert.ok(audit);
+    const payload = JSON.parse(audit.payload_json);
+    assert.deepEqual(Object.keys(payload).sort(), [
+      'auditVersion', 'controlId', 'factId', 'newChecksum', 'oldChecksum',
+      'redactedAt', 'replacementFactId', 'roleId'
+    ].sort());
+    assert.equal(payload.auditVersion, 'fact_redaction_v1');
+    assert.equal(payload.replacementFactId, null);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('conversation clear rejects a fact mixing private and public evidence before writes', () => {
+  const { dir, path } = tempPath('yuqi-clear-memory-mixed-source-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { now: 1784400100000 });
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const privateMessageId = `msg_${fixture.v1.turnId}`;
+    const publicMessageId = `msg_reply_${fixture.publicMoment.turnId}`;
+    const privateMessage = store.getMessage(privateMessageId);
+    const publicMessage = store.getMessage(publicMessageId);
+    store.putFact({
+      factId: 'fact_mixed_lane', characterId: 'yuqi', type: 'user_fact',
+      subjectId: 'user', predicate: 'mixed', object: { value: true },
+      evidenceMode: 'direct', sourceMessageIds: [privateMessageId, publicMessageId],
+      exactQuotes: [
+        { messageId: privateMessageId, speakerId: privateMessage.speakerId, text: privateMessage.content },
+        { messageId: publicMessageId, speakerId: publicMessage.speakerId, text: publicMessage.content }
+      ],
+      status: 'verified', confidence: 0.9, origin: 'consolidation',
+      evidenceSource: 'user_visible_message', authorityContractVersion: 'v3'
+    });
+    const before = {
+      fact: store.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get('fact_mixed_lane'),
+      controls: store.db.prepare('SELECT * FROM conversation_clear_controls').all(),
+      turn: store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(fixture.v1.turnId)
+    };
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+    ), /evidence|lane|authority|ambiguous|memory|conflict/i);
+    assert.deepEqual(store.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get('fact_mixed_lane'), before.fact);
+    assert.deepEqual(store.db.prepare('SELECT * FROM conversation_clear_controls').all(), before.controls);
+    assert.deepEqual(store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(fixture.v1.turnId), before.turn);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('conversation clear memory prune fault rolls facts and control back atomically', () => {
+  const { dir, path } = tempPath('yuqi-clear-memory-fault-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { now: 1784400100000 });
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const sourceMessageId = `msg_${fixture.v1.turnId}`;
+    const source = store.getMessage(sourceMessageId);
+    store.putFact({
+      factId: 'fact_memory_fault', characterId: 'yuqi', type: 'user_fact',
+      subjectId: 'user', predicate: 'prefers_quiet', object: { value: true },
+      evidenceMode: 'direct', sourceMessageIds: [sourceMessageId],
+      exactQuotes: [{ messageId: sourceMessageId, speakerId: source.speakerId, text: source.content }],
+      status: 'verified', confidence: 0.9, origin: 'consolidation',
+      evidenceSource: 'user_visible_message', authorityContractVersion: 'v3'
+    });
+    const before = {
+      fact: store.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get('fact_memory_fault'),
+      controls: store.db.prepare('SELECT * FROM conversation_clear_controls').all(),
+      turn: store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(fixture.v1.turnId)
+    };
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }),
+      { appliedAt: 1784400110000, faultAfterStep: 'after_memory_prune' }
+    ), /forced conversation clear fault/);
+    assert.deepEqual(store.db.prepare('SELECT * FROM facts WHERE fact_id = ?').get('fact_memory_fault'), before.fact);
+    assert.deepEqual(store.db.prepare('SELECT * FROM conversation_clear_controls').all(), before.controls);
+    assert.deepEqual(store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(fixture.v1.turnId), before.turn);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
 
 test('authority-v0 v2 three-bubble scrub preserves batch identity and tombstone closure', () => {
   const { dir, path } = tempPath('yuqi-clear-authority-v0-v2-three-success-');

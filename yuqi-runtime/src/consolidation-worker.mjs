@@ -1,4 +1,7 @@
-import { commitVerifiedFacts } from './evidence-memory.mjs';
+import {
+  commitVerifiedFacts,
+  currentBatchEvidenceAuthorityProjection
+} from './evidence-memory.mjs';
 import { canonicalJson, contentHash } from './protocol.mjs';
 
 const RETRY_DELAYS_MS = [60_000, 5 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
@@ -51,16 +54,19 @@ function nativeString(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function authorityMessage(canonical, message, deliveryState) {
+function authorityMessage(canonical, message, deliveryState, {
+  authorityGroupId = canonical.visibleGroupId,
+  authorityCommitChecksum = canonical.commitChecksum
+} = {}) {
   return {
     ...message,
     committed: true,
     authorityVerified: true,
     resultAuthorityVersion: 1,
     turnState: 'committed',
-    authorityGroupId: canonical.visibleGroupId,
+    authorityGroupId,
     authorityLineageKey: canonical.authorityLineageKey,
-    authorityCommitChecksum: canonical.commitChecksum,
+    authorityCommitChecksum,
     deliveryState,
     redacted: false
   };
@@ -234,7 +240,13 @@ function currentBatchEvidenceForTurn(store, turn, canonical) {
             .includes(message.lifecycleStatus)))) {
       return { messages: [], invalid: true };
     }
-    projected.push(authorityMessage(canonical, message, 'input'));
+    // Current-batch user messages are input evidence, not result-group
+    // evidence.  Keep the lineage identity but leave group/commit null so
+    // retrieval, pruning, and the worker all consume the same projection.
+    const authority = currentBatchEvidenceAuthorityProjection({
+      lineageKey: canonical.authorityLineageKey
+    });
+    projected.push(authorityMessage(canonical, message, 'input', authority));
   }
   return { messages: projected, invalid: false };
 }
@@ -360,6 +372,44 @@ export class ConsolidationWorker {
 
   async processJob(job) {
     const { turn, messages } = this.evidenceForJob(job);
+    const sourceMessageIds = messages
+      .filter(message => message?.evidenceKind !== 'action')
+      .map(message => message.messageId);
+    const sourceActionIds = messages
+      .filter(message => message?.evidenceKind === 'action')
+      .map(action => action.actionId);
+    const validateLease = () => {
+      if (job?.leaseOwner && typeof this.store.validateConsolidationJobLifecycleInternal === 'function') {
+        this.store.validateConsolidationJobLifecycleInternal({
+          jobId: job.jobId,
+          workerId: job.leaseOwner,
+          roleId: job.roleId,
+          sourceMessageIds,
+          sourceActionIds,
+          now: this.clock()
+        });
+      }
+    };
+    if (turn?.resultAuthorityVersion === 1
+      && typeof this.store.resolveMemoryFactEvidenceInternal === 'function') {
+      if (sourceMessageIds.length || sourceActionIds.length) {
+        // Reuse the store-owned lifecycle resolver used by retrieval and
+        // clear.  This is a pre-model gate: a stale/redacted/foreign source
+        // fails before a worker can produce a durable candidate.
+        const resolved = this.store.resolveMemoryFactEvidenceInternal({
+          factId: `job:${job.jobId}`,
+          characterId: job.roleId,
+          status: 'verified',
+          origin: 'consolidation',
+          sourceMessageIds,
+          sourceActionIds
+        }, { roleId: job.roleId });
+        if (!['private_chat', 'public_moment', 'moment_thread'].includes(resolved.lane)) {
+          throw new Error('consolidation evidence lane authority conflict');
+        }
+      }
+    }
+    validateLease();
     const presetVersion = turn?.presetVersion || this.presetRegistry.current().version;
     const system = this.presetRegistry.resolvePresetBundle({
       role: 'consolidation',
@@ -475,6 +525,21 @@ export class ConsolidationWorker {
             : 'legacy')
       };
     });
+    // The model may have yielded while conversation clear or another worker
+    // changed the source lineage.  Re-read the store-owned evidence and lease
+    // immediately before the first durable fact write.
+    validateLease();
+    if (turn?.resultAuthorityVersion === 1
+      && job?.leaseOwner && typeof this.store.commitConsolidationFactsInternal === 'function') {
+      return this.store.commitConsolidationFactsInternal({
+        jobId: job.jobId,
+        workerId: job.leaseOwner,
+        roleId: job.roleId,
+        candidates,
+        rawMessages: messages,
+        now: this.clock()
+      });
+    }
     return commitVerifiedFacts(this.store, candidates, messages);
   }
 

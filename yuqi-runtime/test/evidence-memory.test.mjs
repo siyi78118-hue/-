@@ -6,7 +6,8 @@ import test from 'node:test';
 
 import {
   commitVerifiedFacts,
-  validateFactCandidate
+  validateFactCandidate,
+  validateConsolidationCandidate
 } from '../src/evidence-memory.mjs';
 import { buildEvidencePack } from '../src/retrieval.mjs';
 import { YuqiStore } from '../src/store.mjs';
@@ -39,6 +40,7 @@ const messages = [
     authorityGroupId: 'grp_turn_1',
     authorityLineageKey: 'lin_turn_1',
     authorityCommitChecksum: 'a'.repeat(64),
+    authorityVerified: true,
     deliveryState: 'confirmed'
   },
   {
@@ -80,7 +82,36 @@ function withStore(run) {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-evidence-'));
   const store = new YuqiStore(join(dir, 'runtime.sqlite'));
   try {
-    messages.forEach(message => store.putMessage(message));
+    const grouped = new Map();
+    for (const message of messages) {
+      const list = grouped.get(message.turnId) || [];
+      list.push(message);
+      grouped.set(message.turnId, list);
+    }
+    [...grouped.values()].forEach((group, index) => {
+      const first = group.find(message => message.speakerType === 'user') || group[0];
+      const inputMessage = first.speakerType === 'character'
+        ? {
+          messageId: `msg_input_${first.messageId}`,
+          speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+          content: `input for ${first.messageId}`, sentAt: first.sentAt - 1
+        }
+        : first;
+      store.submitTurn({
+        protocolVersion: 2,
+        turnId: first.turnId,
+        characterId: 'yuqi',
+        deviceId: `device_evidence_${index + 1}`,
+        deviceSeq: index + 1,
+        createdAt: first.sentAt,
+        kind: 'DIRECT_REPLY',
+        message: inputMessage
+      });
+      store.db.prepare('DELETE FROM messages WHERE message_id = ?').run(inputMessage.messageId);
+      for (const message of group) {
+        store.putMessage(message);
+      }
+    });
     return run(store);
   } finally {
     store.close();
@@ -151,6 +182,67 @@ test('same words by both sides remain attributable by message ID', () => {
   assert.equal(result.fact.exactQuotes[0].messageId, 'msg_yuqi_same');
 });
 
+test('rejects a self-consistent candidate whose evidence authority tuple is forged', () => {
+  const result = validateConsolidationCandidate({
+    factId: 'fact_forged_authority',
+    characterId: 'yuqi',
+    type: 'formal_commitment',
+    subjectId: 'yuqi',
+    predicate: 'promised_to_return',
+    object: { when: 'tomorrow_evening' },
+    promisedBy: 'yuqi',
+    promisedTo: 'user',
+    evidenceMode: 'direct',
+    sourceMessageIds: ['msg_2'],
+    exactQuotes: [{
+      messageId: 'msg_2',
+      speakerId: 'yuqi',
+      text: '我答应你，明天晚上会回来找你'
+    }],
+    confidence: 0.98,
+    origin: 'consolidation',
+    evidenceSource: 'yuqi_delivered_message',
+    authorityContractVersion: 'v3',
+    evidenceAuthority: {
+      authorityGroupIds: ['forged-group'],
+      lineageKeys: ['lin_turn_1'],
+      commitChecksums: ['a'.repeat(64)]
+    }
+  }, messages);
+  assert.equal(result.status, 'rejected');
+  assert.match(result.reasons.join(' '), /authority/i);
+});
+
+test('accepts a candidate whose evidence authority tuple exactly matches its sources', () => {
+  const result = validateConsolidationCandidate({
+    factId: 'fact_exact_authority',
+    characterId: 'yuqi',
+    type: 'formal_commitment',
+    subjectId: 'yuqi',
+    predicate: 'promised_to_return',
+    object: { when: 'tomorrow_evening' },
+    promisedBy: 'yuqi',
+    promisedTo: 'user',
+    evidenceMode: 'direct',
+    sourceMessageIds: ['msg_2'],
+    exactQuotes: [{
+      messageId: 'msg_2',
+      speakerId: 'yuqi',
+      text: '我答应你，明天晚上会回来找你'
+    }],
+    confidence: 0.98,
+    origin: 'consolidation',
+    evidenceSource: 'yuqi_delivered_message',
+    authorityContractVersion: 'v3',
+    evidenceAuthority: {
+      authorityGroupIds: ['grp_turn_1'],
+      lineageKeys: ['lin_turn_1'],
+      commitChecksums: ['a'.repeat(64)]
+    }
+  }, messages);
+  assert.equal(result.status, 'verified');
+});
+
 test('legacy explicit facts keep their provisional compatibility path', () => withStore(store => {
   const ambiguous = promiseCandidate({
     factId: 'fact_reported',
@@ -189,3 +281,27 @@ test('retrieval pack includes speaker, exact quote, and neighboring context', ()
   assert.equal(pack.facts[0].evidence[0].text, '我答应你，明天晚上会回来找你');
   assert.deepEqual(pack.facts[0].evidence[0].context.map(item => item.messageId), ['msg_1', 'msg_2', 'msg_3']);
 }));
+
+test('orphan legacy message evidence fails closed before retrieval or pruning', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'yuqi-evidence-orphan-'));
+  const store = new YuqiStore(join(dir, 'runtime.sqlite'));
+  try {
+    store.putMessage({
+      messageId: 'msg_orphan_legacy', turnId: 'turn_missing', characterId: 'yuqi',
+      speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+      content: 'orphan source', sentAt: 1784400004000, origin: 'phone'
+    });
+    store.putFact({
+      factId: 'fact_orphan_legacy', characterId: 'yuqi', type: 'user_fact', subjectId: 'user',
+      predicate: 'orphaned', object: { value: true }, evidenceMode: 'direct',
+      sourceMessageIds: ['msg_orphan_legacy'], exactQuotes: [{
+        messageId: 'msg_orphan_legacy', speakerId: 'user', text: 'orphan source'
+      }], status: 'verified', confidence: 0.9, origin: 'legacy'
+    });
+    assert.equal(store.listRetrievableFacts('yuqi').some(fact => fact.factId === 'fact_orphan_legacy'), false);
+    assert.throws(() => store.resolveMemoryFactEvidenceInternal(store.listFacts('yuqi')[0]), /authority|turn|source|conflict/i);
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
