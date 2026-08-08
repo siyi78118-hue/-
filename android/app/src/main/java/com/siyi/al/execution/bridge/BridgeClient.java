@@ -2,6 +2,7 @@ package com.siyi.al.execution.bridge;
 
 import android.util.Base64;
 import com.siyi.al.execution.AuthorityIdentity;
+import com.siyi.al.execution.AndroidRoomBackupHead;
 import com.siyi.al.execution.BridgeAuthority;
 import com.siyi.al.execution.LifecycleControl;
 import com.siyi.al.execution.LifecycleControlCodec;
@@ -148,6 +149,40 @@ public final class BridgeClient {
 
     public BridgeRouter.RouteClient lanRoute() { return this::sendLan; }
     public BridgeRouter.RouteClient cloudRoute() { return this::sendCloud; }
+
+    public JSONObject requestVerifiedBackup(
+        String roleId, JSONObject androidRoomHead, long requestedAt
+    ) throws Exception {
+        if (!config.hasLan()) throw new BridgeFinalException("LAN_BRIDGE_NOT_CONFIGURED", false);
+        if (roleId == null || !roleId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+            || config.deviceId == null
+            || !config.deviceId.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+            || requestedAt <= 0L || requestedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("Yuqi backup request identity conflict");
+        }
+        JSONObject head = AndroidRoomBackupHead.validate(androidRoomHead, roleId);
+        if (head.getLong("capturedAt") != requestedAt) {
+            throw new IllegalArgumentException("Yuqi backup request Room time conflict");
+        }
+        JSONObject request = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "YUQI_BACKUP_REQUEST")
+            .put("requestVersion", "yuqi-backup-request-v1")
+            .put("roleId", roleId)
+            .put("peerId", config.deviceId)
+            .put("requestedAt", requestedAt)
+            .put("androidRoomHead", head);
+        request.put("checksum", BridgeAuthority.sha256CanonicalJson(request));
+        HttpResult response = signedLan("POST", "/v3/backups/yuqi", request.toString());
+        requireSuccess(response, "LAN verified backup");
+        JSONObject receipt = LifecycleControlCodec.validateBackupReceipt(
+            new JSONObject(response.body == null ? "{}" : response.body));
+        if (!roleId.equals(receipt.getString("roleId"))
+            || receipt.getLong("createdAt") != requestedAt) {
+            throw new IllegalArgumentException("Yuqi backup receipt authority conflict");
+        }
+        return receipt;
+    }
 
     static boolean matchesTurn(TurnSubmission submission, String remoteTurnId) {
         return BridgeInput.wireTurnId(submission).equals(remoteTurnId);

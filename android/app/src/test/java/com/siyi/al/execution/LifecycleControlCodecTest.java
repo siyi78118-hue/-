@@ -35,15 +35,7 @@ public class LifecycleControlCodecTest {
 
     @Test
     public void roleDeleteShapeUsesNullSequenceFieldsAndClosedBackupReceipt() throws Exception {
-        JSONObject receipt = new JSONObject()
-            .put("receiptVersion", "yuqi-backup-receipt-v1")
-            .put("receiptId", "receipt-1")
-            .put("roleId", "yuqi")
-            .put("manifestChecksum", repeatHex('a'))
-            .put("snapshotSha256", repeatHex('b'))
-            .put("logicalChecksum", repeatHex('c'))
-            .put("createdAt", 1L);
-        receipt.put("receiptChecksum", BridgeAuthority.sha256CanonicalJson(receipt));
+        JSONObject receipt = backupReceipt("yuqi", 1L);
         LifecycleControlCodec.Encoded encoded = LifecycleControlCodec.encodeRoleDelete(
             "yuqi", "device-1", 100L, receipt
         );
@@ -61,25 +53,11 @@ public class LifecycleControlCodecTest {
 
     @Test
     public void roleDeleteBindsBackupRoleAndCreationTime() throws Exception {
-        JSONObject foreignReceipt = new JSONObject()
-            .put("receiptVersion", "yuqi-backup-receipt-v1")
-            .put("receiptId", "receipt-foreign")
-            .put("roleId", "other-role")
-            .put("manifestChecksum", repeatHex('a'))
-            .put("snapshotSha256", repeatHex('b'))
-            .put("logicalChecksum", repeatHex('c'))
-            .put("createdAt", 90L);
-        foreignReceipt.put("receiptChecksum", BridgeAuthority.sha256CanonicalJson(foreignReceipt));
+        JSONObject foreignReceipt = backupReceipt("other-role", 90L);
         assertThrows(IllegalArgumentException.class, () -> LifecycleControlCodec.encodeRoleDelete(
             "yuqi", "device-1", 100L, foreignReceipt));
 
-        JSONObject futureReceipt = new JSONObject(foreignReceipt.toString())
-            .put("receiptId", "receipt-future")
-            .put("roleId", "yuqi")
-            .put("createdAt", 101L);
-        JSONObject futureBasis = new JSONObject(futureReceipt.toString());
-        futureBasis.remove("receiptChecksum");
-        futureReceipt.put("receiptChecksum", BridgeAuthority.sha256CanonicalJson(futureBasis));
+        JSONObject futureReceipt = backupReceipt("yuqi", 101L);
         assertThrows(IllegalArgumentException.class, () -> LifecycleControlCodec.encodeRoleDelete(
             "yuqi", "device-1", 100L, futureReceipt));
     }
@@ -144,5 +122,28 @@ public class LifecycleControlCodecTest {
         char[] chars = new char[64];
         Arrays.fill(chars, value);
         return new String(chars);
+    }
+
+    private static JSONObject backupReceipt(String roleId, long createdAt) throws Exception {
+        String manifestChecksum = repeatHex('a');
+        String snapshotSha256 = repeatHex('b');
+        String logicalChecksum = repeatHex('c');
+        JSONObject idBasis = new JSONObject()
+            .put("contract", "yuqi-backup-receipt-id-v1")
+            .put("roleId", roleId)
+            .put("manifestChecksum", manifestChecksum)
+            .put("snapshotSha256", snapshotSha256)
+            .put("logicalChecksum", logicalChecksum)
+            .put("createdAt", createdAt);
+        JSONObject receipt = new JSONObject()
+            .put("receiptVersion", "yuqi-backup-receipt-v1")
+            .put("receiptId", "bkrcpt_"
+                + BridgeAuthority.sha256CanonicalJson(idBasis).substring(0, 24))
+            .put("roleId", roleId)
+            .put("manifestChecksum", manifestChecksum)
+            .put("snapshotSha256", snapshotSha256)
+            .put("logicalChecksum", logicalChecksum)
+            .put("createdAt", createdAt);
+        return receipt.put("receiptChecksum", BridgeAuthority.sha256CanonicalJson(receipt));
     }
 }

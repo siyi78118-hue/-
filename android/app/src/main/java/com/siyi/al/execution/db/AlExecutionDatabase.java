@@ -28,10 +28,11 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         LifecycleControlEntity.class,
         LifecycleInboundAckTombstoneEntity.class
     },
-    version = 14,
+    version = AlExecutionDatabase.SCHEMA_VERSION,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
+    public static final int SCHEMA_VERSION = 14;
     private static volatile AlExecutionDatabase instance;
     private static final Migration MIGRATION_1_2 = new Migration(1, 2) {
         @Override

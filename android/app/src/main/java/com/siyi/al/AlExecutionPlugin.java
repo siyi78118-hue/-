@@ -17,6 +17,7 @@ import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.api.ApiConfig;
+import com.siyi.al.execution.bridge.BridgeClient;
 import com.siyi.al.execution.bridge.BridgeConfig;
 import com.siyi.al.execution.bridge.BridgeMode;
 import com.siyi.al.execution.bridge.BridgeStatusProbe;
@@ -447,6 +448,18 @@ public final class AlExecutionPlugin extends Plugin {
         execute(call, () -> {
             String characterId = required(call, "characterId");
             return conversationCursorResult(characterId, store.getConversationCursor(characterId));
+        });
+    }
+
+    @PluginMethod
+    public void requestVerifiedYuqiBackup(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            long requestedAt = System.currentTimeMillis();
+            JSONObject androidRoomHead = store.androidRoomBackupHead(characterId, requestedAt);
+            JSONObject receipt = new BridgeClient(secrets.loadBridgeConfig())
+                .requestVerifiedBackup(characterId, androidRoomHead, requestedAt);
+            return new JSObject(receipt.toString());
         });
     }
 

@@ -43,6 +43,10 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM lifecycle_controls ORDER BY controlId ASC")
     List<LifecycleControlEntity> lifecycleControls();
 
+    @Query("SELECT * FROM lifecycle_controls WHERE characterId = :characterId "
+        + "ORDER BY requestedAt DESC, controlId DESC LIMIT 1")
+    LifecycleControlEntity latestLifecycleControlForCharacter(String characterId);
+
     @Query("SELECT * FROM lifecycle_controls WHERE controlKind = 'conversation_clear_v1' AND ("
         + "state = 'waiting' "
         + "OR (state = 'pending' AND leasedAt IS NOT NULL AND leasedAt <= :leaseCutoff) "

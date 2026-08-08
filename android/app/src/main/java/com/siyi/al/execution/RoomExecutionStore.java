@@ -1316,6 +1316,71 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return dao.conversationCursor(requireCharacterId(characterId));
     }
 
+    public JSONObject androidRoomBackupHead(String characterId, long capturedAt) {
+        String safeCharacterId = requireCharacterId(characterId);
+        if (capturedAt <= 0L || capturedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("Android Room backup capturedAt is invalid");
+        }
+        AtomicReference<JSONObject> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            ConversationCursorEntity persistedCursor = dao.conversationCursor(safeCharacterId);
+            ConversationCursorEntity cursor = persistedCursor == null
+                ? new ConversationCursorEntity() : persistedCursor;
+            if (persistedCursor == null) cursor.characterId = safeCharacterId;
+            LifecycleControlEntity lifecycle = dao.latestLifecycleControlForCharacter(safeCharacterId);
+            if (lifecycle != null) validatePersistedLifecycleControl(lifecycle);
+            try {
+                JSONObject cursorProjection = new JSONObject()
+                    .put("characterId", safeCharacterId)
+                    .put("nativeCompletedTurnId", cursor.nativeCompletedTurnId == null
+                        ? JSONObject.NULL : cursor.nativeCompletedTurnId)
+                    .put("nativeCompletedGroupId", cursor.nativeCompletedGroupId == null
+                        ? JSONObject.NULL : cursor.nativeCompletedGroupId)
+                    .put("nativeCompletedSequence", cursor.nativeCompletedSequence)
+                    .put("uiAppliedTurnId", cursor.uiAppliedTurnId == null
+                        ? JSONObject.NULL : cursor.uiAppliedTurnId)
+                    .put("uiAppliedGroupId", cursor.uiAppliedGroupId == null
+                        ? JSONObject.NULL : cursor.uiAppliedGroupId)
+                    .put("uiAppliedSequence", cursor.uiAppliedSequence)
+                    .put("localSequence", cursor.localSequence)
+                    .put("clearedThroughSequence", cursor.clearedThroughSequence)
+                    .put("clearEpoch", cursor.clearEpoch)
+                    .put("clearedAt", cursor.clearedAt)
+                    .put("chatOpen", cursor.chatOpen)
+                    .put("updatedAt", cursor.updatedAt)
+                    .put("cursorChecksum", conversationCursorChecksum(safeCharacterId, cursor));
+                JSONObject lifecycleProjection = lifecycle == null ? null : new JSONObject()
+                    .put("controlId", lifecycle.controlId)
+                    .put("controlKind", lifecycle.controlKind)
+                    .put("peerId", lifecycle.peerId)
+                    .put("state", lifecycle.state)
+                    .put("semanticChecksum", lifecycle.semanticChecksum)
+                    .put("clearEpoch", lifecycle.clearEpoch == null ? JSONObject.NULL : lifecycle.clearEpoch)
+                    .put("clearedThroughSequence", lifecycle.clearedThroughSequence == null
+                        ? JSONObject.NULL : lifecycle.clearedThroughSequence)
+                    .put("requestedAt", lifecycle.requestedAt)
+                    .put("appliedAt", lifecycle.appliedAt == null ? JSONObject.NULL : lifecycle.appliedAt)
+                    .put("updatedAt", lifecycle.updatedAt);
+                JSONObject basis = new JSONObject()
+                    .put("headVersion", "android-room-backup-head-v1")
+                    .put("roleId", safeCharacterId)
+                    .put("roomSchemaVersion", AlExecutionDatabase.SCHEMA_VERSION)
+                    .put("cursor", cursorProjection)
+                    .put("lifecycleHead", lifecycleProjection == null ? JSONObject.NULL : lifecycleProjection)
+                    .put("capturedAt", capturedAt);
+                JSONObject head = new JSONObject(basis.toString())
+                    .put("checksum", BridgeAuthority.sha256CanonicalJson(basis));
+                result.set(AndroidRoomBackupHead.validate(head, safeCharacterId));
+            } catch (Exception error) {
+                if (error instanceof IllegalArgumentException) {
+                    throw (IllegalArgumentException) error;
+                }
+                throw new IllegalStateException("Android Room backup head projection conflict", error);
+            }
+        });
+        return result.get();
+    }
+
     public void markNativeCompleted(
         String characterId,
         String turnId,

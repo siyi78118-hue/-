@@ -63,6 +63,46 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void androidRoomBackupHeadIsReadOnlyAndProjectsTheLatestValidatedLifecycle()
+        throws Exception {
+        JSONObject emptyHead = store.androidRoomBackupHead("yuqi", 100L);
+        assertEquals(AlExecutionDatabase.SCHEMA_VERSION, emptyHead.getLong("roomSchemaVersion"));
+        assertEquals("yuqi", emptyHead.getString("roleId"));
+        assertTrue(emptyHead.isNull("lifecycleHead"));
+        assertEquals(0L, rowCount("conversation_cursors"));
+        assertEquals(0L, rowCount("lifecycle_controls"));
+        assertEquals(
+            BridgeAuthority.canonicalJson(emptyHead),
+            BridgeAuthority.canonicalJson(AndroidRoomBackupHead.validate(emptyHead, "yuqi"))
+        );
+
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi",
+            "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", new ConversationCursorEntity()),
+            200L
+        );
+        JSONObject liveHead = configured.androidRoomBackupHead("yuqi", 201L);
+        JSONObject lifecycle = liveHead.getJSONObject("lifecycleHead");
+        assertEquals(control.controlId, lifecycle.getString("controlId"));
+        assertEquals(LifecycleControl.CLEAR_KIND, lifecycle.getString("controlKind"));
+        assertEquals(LifecycleControl.WAITING, lifecycle.getString("state"));
+        assertEquals(1L, lifecycle.getLong("clearEpoch"));
+        assertEquals(0L, lifecycle.getLong("clearedThroughSequence"));
+        assertEquals(200L, lifecycle.getLong("requestedAt"));
+        assertEquals(200L, lifecycle.getLong("updatedAt"));
+        assertEquals(control.controlId,
+            database.executionDao().latestLifecycleControlForCharacter("yuqi").controlId);
+        assertEquals(
+            BridgeAuthority.canonicalJson(liveHead),
+            BridgeAuthority.canonicalJson(AndroidRoomBackupHead.validate(liveHead, "yuqi"))
+        );
+        assertThrows(IllegalArgumentException.class,
+            () -> configured.androidRoomBackupHead("yuqi", 199L));
+    }
+
+    @Test
     public void canonicalVisibleTerminalCommitsReceiptPartsRawMessagesAuthorityAndCursorAtomically()
         throws Exception {
         String localTurnId = "local-v3-terminal";

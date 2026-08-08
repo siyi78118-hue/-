@@ -167,8 +167,13 @@ public final class LifecycleControlCodec {
         return next;
     }
 
-    private static void validateBackupReceipt(JSONObject value) {
+    public static JSONObject validateBackupReceipt(JSONObject value) {
         validateBackupReceiptShape(value);
+        try {
+            return new JSONObject(value.toString());
+        } catch (Exception error) {
+            throw new IllegalArgumentException("backup receipt clone conflict", error);
+        }
     }
 
     private static Set<String> keysOf(JSONObject object) {
@@ -337,7 +342,10 @@ public final class LifecycleControlCodec {
         if (!"yuqi-backup-receipt-v1".equals(requireString(value, "receiptVersion"))) {
             throw new IllegalArgumentException("backup receipt version conflict");
         }
-        requireId(value.opt("receiptId"), "receiptId");
+        String receiptId = requireString(value, "receiptId");
+        if (!receiptId.matches("bkrcpt_[a-f0-9]{24}")) {
+            throw new IllegalArgumentException("backup receipt id conflict");
+        }
         requireId(value.opt("roleId"), "roleId");
         for (String key : new String[] {"manifestChecksum", "snapshotSha256", "logicalChecksum", "receiptChecksum"}) {
             String checksum = requireString(value, key);
@@ -351,6 +359,21 @@ public final class LifecycleControlCodec {
         if (!((String) value.opt("receiptChecksum")).equals(
             checksumWithoutNamedField(value, "receiptChecksum"))) {
             throw new IllegalArgumentException("backup receipt checksum conflict");
+        }
+        try {
+            JSONObject idBasis = new JSONObject()
+                .put("contract", "yuqi-backup-receipt-id-v1")
+                .put("roleId", value.getString("roleId"))
+                .put("manifestChecksum", value.getString("manifestChecksum"))
+                .put("snapshotSha256", value.getString("snapshotSha256"))
+                .put("logicalChecksum", value.getString("logicalChecksum"))
+                .put("createdAt", value.getLong("createdAt"));
+            String expectedId = "bkrcpt_" + BridgeAuthority.sha256CanonicalJson(idBasis).substring(0, 24);
+            if (!receiptId.equals(expectedId)) {
+                throw new IllegalArgumentException("backup receipt id conflict");
+            }
+        } catch (JSONException error) {
+            throw new IllegalArgumentException("backup receipt identity conflict", error);
         }
     }
 }

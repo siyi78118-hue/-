@@ -8,6 +8,7 @@ import static org.junit.Assert.assertThrows;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.AuthorityIdentity;
+import com.siyi.al.execution.AndroidRoomBackupHead;
 import com.siyi.al.execution.BridgeAuthority;
 import com.siyi.al.execution.LifecycleControl;
 import com.siyi.al.execution.LifecycleControlCodec;
@@ -62,6 +63,53 @@ public class BridgeClientTest {
         assertEquals("http://lan.example/v3/controls/conversation-clear", transport.targets.get(0));
         assertFalse(transport.bodies.get(0).contains("turnId"));
         assertFalse(transport.bodies.get(0).contains("reply_json"));
+    }
+
+    @Test public void verifiedBackupUsesOneClosedSignedLanRequestAndValidatesTheReceipt() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        JSONObject receipt = backupReceipt("yuqi", 1784400000100L);
+        transport.responses.add(new BridgeClient.HttpResult(200, receipt.toString()));
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport, () -> 1784400000100L,
+            millis -> {}, null
+        );
+        JSONObject head = androidRoomBackupHead();
+
+        assertEquals(receipt.toString(),
+            client.requestVerifiedBackup("yuqi", head, 1784400000100L).toString());
+        assertEquals(1, transport.targets.size());
+        assertTrue(transport.targets.get(0).endsWith("/v3/backups/yuqi"));
+        JSONObject sent = new JSONObject(transport.bodies.get(0));
+        assertEquals(8, sent.length());
+        assertEquals(3L, sent.getLong("protocolVersion"));
+        assertEquals("YUQI_BACKUP_REQUEST", sent.getString("type"));
+        assertEquals(head.toString(), sent.getJSONObject("androidRoomHead").toString());
+        assertEquals(checksumWithout(sent, "checksum"), sent.getString("checksum"));
+    }
+
+    @Test public void verifiedBackupRejectsMalformedRoomHeadAndForgedReceiptId() throws Exception {
+        FakeTransport noSend = new FakeTransport();
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, noSend, () -> 1784400000100L,
+            millis -> {}, null
+        );
+        JSONObject badHead = new JSONObject(androidRoomBackupHead().toString())
+            .put("roomSchemaVersion", "14");
+        assertThrows(IllegalArgumentException.class,
+            () -> client.requestVerifiedBackup("yuqi", badHead, 1784400000100L));
+        assertTrue(noSend.targets.isEmpty());
+
+        FakeTransport forged = new FakeTransport();
+        JSONObject receipt = backupReceipt("yuqi", 1784400000100L)
+            .put("receiptId", "bkrcpt_aaaaaaaaaaaaaaaaaaaaaaaa");
+        receipt.put("receiptChecksum", checksumWithout(receipt, "receiptChecksum"));
+        forged.responses.add(new BridgeClient.HttpResult(200, receipt.toString()));
+        BridgeClient forgedClient = new BridgeClient(
+            config("http://lan.example"), null, forged, () -> 1784400000100L,
+            millis -> {}, null
+        );
+        assertThrows(IllegalArgumentException.class,
+            () -> forgedClient.requestVerifiedBackup("yuqi", androidRoomBackupHead(), 1784400000100L));
     }
 
     @Test public void lifecycleLanRouteRejectsA200WithoutTheAppliedProof() throws Exception {
@@ -1254,6 +1302,62 @@ public class BridgeClientTest {
                     return Base64.getEncoder().encodeToString(value);
                 }
             });
+    }
+
+    private static JSONObject androidRoomBackupHead() throws Exception {
+        JSONObject cursor = new JSONObject()
+            .put("characterId", "yuqi")
+            .put("nativeCompletedTurnId", JSONObject.NULL)
+            .put("nativeCompletedGroupId", JSONObject.NULL)
+            .put("nativeCompletedSequence", 0L)
+            .put("uiAppliedTurnId", JSONObject.NULL)
+            .put("uiAppliedGroupId", JSONObject.NULL)
+            .put("uiAppliedSequence", 0L)
+            .put("localSequence", 0L)
+            .put("clearedThroughSequence", 0L)
+            .put("clearEpoch", 0L)
+            .put("clearedAt", 0L)
+            .put("chatOpen", false)
+            .put("updatedAt", 1784400000000L);
+        JSONObject cursorBasis = new JSONObject(cursor.toString())
+            .put("contract", "conversation-cursor-clear-v1");
+        cursor.put("cursorChecksum", BridgeAuthority.sha256CanonicalJson(cursorBasis));
+        JSONObject basis = new JSONObject()
+            .put("headVersion", "android-room-backup-head-v1")
+            .put("roleId", "yuqi")
+            .put("roomSchemaVersion", 14L)
+            .put("cursor", cursor)
+            .put("lifecycleHead", JSONObject.NULL)
+            .put("capturedAt", 1784400000100L);
+        JSONObject head = new JSONObject(basis.toString())
+            .put("checksum", BridgeAuthority.sha256CanonicalJson(basis));
+        return AndroidRoomBackupHead.validate(head, "yuqi");
+    }
+
+    private static JSONObject backupReceipt(String roleId, long createdAt) throws Exception {
+        JSONObject idBasis = new JSONObject()
+            .put("contract", "yuqi-backup-receipt-id-v1")
+            .put("roleId", roleId)
+            .put("manifestChecksum", repeat('a', 64))
+            .put("snapshotSha256", repeat('b', 64))
+            .put("logicalChecksum", repeat('c', 64))
+            .put("createdAt", createdAt);
+        JSONObject receipt = new JSONObject()
+            .put("receiptVersion", "yuqi-backup-receipt-v1")
+            .put("receiptId", "bkrcpt_" + BridgeAuthority.sha256CanonicalJson(idBasis).substring(0, 24))
+            .put("roleId", roleId)
+            .put("manifestChecksum", repeat('a', 64))
+            .put("snapshotSha256", repeat('b', 64))
+            .put("logicalChecksum", repeat('c', 64))
+            .put("createdAt", createdAt);
+        receipt.put("receiptChecksum", BridgeAuthority.sha256CanonicalJson(receipt));
+        return receipt;
+    }
+
+    private static String checksumWithout(JSONObject value, String field) throws Exception {
+        JSONObject basis = new JSONObject(value.toString());
+        basis.remove(field);
+        return BridgeAuthority.sha256CanonicalJson(basis);
     }
 
     private static final class FakeTransport implements BridgeClient.Transport {
