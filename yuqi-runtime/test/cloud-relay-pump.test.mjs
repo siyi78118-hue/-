@@ -404,6 +404,55 @@ test('v2 cloud ingress acknowledges after durable dispatch without waiting for t
   ]);
 });
 
+test('cloud pump flushes redactions first and blocks ordinary outbox while pending', async () => {
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64,
+    fetchImpl: async url => {
+      assert.equal(new URL(url).pathname, '/bridge/poll');
+      return Response.json({ ok: true, messages: [] });
+    },
+    dispatcher: { accept() { events.push('ordinary-dispatch'); } },
+    store: { registerCloudDelivery() {} },
+    outbox: {
+      async flushRetractionsOnce() { events.push('retractions'); return { pending: 1 }; },
+      async flushOnce() { events.push('ordinary-outbox'); return { delivered: 1 }; }
+    }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.processed, 0);
+  assert.deepEqual(events, ['retractions']);
+});
+
+test('one peer redaction failure blocks only that peer while unrelated outbox work proceeds', async () => {
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64,
+    fetchImpl: async url => {
+      const path = new URL(url).pathname;
+      events.push(path);
+      return Response.json({ ok: true, messages: [] });
+    },
+    dispatcher: { accept() { events.push('dispatch'); } },
+    store: { registerCloudDelivery() {} },
+    outbox: {
+      async flushRetractionsOnce() {
+        events.push('retractions');
+        return { completed: 0, failed: 1, waiting: 1, fatal: 1, blockedPeerIds: ['phone_a'] };
+      },
+      async flushOnce(_limit, options) {
+        events.push(['ordinary-outbox', options?.blockedPeerIds]);
+        return { delivered: 1, failed: 0, waiting: 0 };
+      }
+    }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, ['retractions', '/bridge/poll', ['ordinary-outbox', ['phone_a']]]);
+});
+
 test('canonical v2 and v3 cloud turns acknowledge once without creating a legacy delivery', async () => {
   for (const incoming of [v2Envelope, v3Envelope('canonical cloud turn')]) {
     const relay = relayFixture(incoming);

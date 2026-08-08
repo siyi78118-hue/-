@@ -127,6 +127,28 @@ export class CloudRelayPump {
     this.running = true;
     const summary = { processed: 0, failed: 0, suppressed: 0, skipped: false };
     try {
+      let blockedPeerIds = [];
+      if (this.outbox && typeof this.outbox.flushRetractionsOnce === 'function') {
+        const retractions = await this.outbox.flushRetractionsOnce(50);
+        blockedPeerIds = Array.isArray(retractions?.blockedPeerIds)
+          ? retractions.blockedPeerIds.map(value => String(value)) : [];
+        summary.failed += Number(retractions?.failed || 0);
+        if (Number(retractions?.pending || 0) > 0
+          || Number(retractions?.failed || 0) > 0
+          || Number(retractions?.waiting || 0) > 0
+          || Number(retractions?.fatal || 0) > 0) {
+          if (blockedPeerIds.length > 0) {
+            // Independent peers may still drain ordinary work; the blocked
+            // identity is passed to the outbox filter below.
+          } else {
+            return summary;
+          }
+        }
+        if (Number(retractions?.pending || 0) > 0
+          && blockedPeerIds.length === 0) {
+          return summary;
+        }
+      }
       const url = `${this.relayUrl}/bridge/poll?deviceId=${encodeURIComponent(this.deviceId)}&direction=phone_to_pc&limit=50`;
       const response = await this.fetch(url, { headers: this.headers() });
       if (!response.ok) throw new Error(`cloud relay poll HTTP ${response.status}`);
@@ -321,7 +343,10 @@ export class CloudRelayPump {
           }
         }
       }
-      if (this.outbox && typeof this.outbox.flushOnce === 'function') await this.outbox.flushOnce();
+      if (this.outbox && typeof this.outbox.flushOnce === 'function') {
+        const outbox = await this.outbox.flushOnce(50, { blockedPeerIds });
+        summary.failed += Number(outbox?.failed || 0);
+      }
       this.relayStatus = {
         ...this.relayStatus,
         connected: true,

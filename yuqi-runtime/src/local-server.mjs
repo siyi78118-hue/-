@@ -103,6 +103,37 @@ export function createYuqiServer({
   }
 
   function resolveCanonicalTerminalStatus(turn) {
+    // Legacy RA0 redactions have no canonical result payload to project.  The
+    // store-owned status token is the only authority that may expose their
+    // terminal state; an envelope/status shell alone is never sufficient.
+    let legacyShell = false;
+    if (Number(turn?.resultAuthorityVersion) === 0) {
+      try {
+        legacyShell = (typeof store.hasLegacyRedactionMarkerInternal === 'function'
+          && store.hasLegacyRedactionMarkerInternal(turn.turnId))
+          || turn?.authorityRedactedAt != null
+          || (turn?.envelopeJson && JSON.parse(turn.envelopeJson)?.redacted === true);
+      } catch {
+        legacyShell = true;
+      }
+    }
+    if (Number(turn?.resultAuthorityVersion) === 0
+      && typeof store.publicLegacyRedactedTurnStatusInternal !== 'function') {
+      if (legacyShell) return { error: 'LEGACY_AUTHORITY_CONFLICT' };
+    } else if (Number(turn?.resultAuthorityVersion) === 0) {
+      try {
+        const legacyStatus = store.publicLegacyRedactedTurnStatusInternal(turn.turnId);
+        if (legacyStatus?.status === 'redacted'
+          && legacyStatus.deliverable === false
+          && legacyStatus.terminal === true) {
+          return { error: 'LEGACY_RESULT_REDACTED' };
+        }
+      } catch {
+        if (legacyShell) return { error: 'LEGACY_AUTHORITY_CONFLICT' };
+        // A live/non-redacted legacy turn continues through the byte-compatible
+        // status path. Validation failures on a redacted shell never do.
+      }
+    }
     const authoritativeVersion = Number(turn?.resultAuthorityVersion) === 1;
     const committed = ['committed', 'delivered', 'completed'].includes(turn?.state);
     const canonicalFailure = authoritativeVersion
@@ -205,9 +236,25 @@ export function createYuqiServer({
         const recovery = await reconciler.reconcileFrom(recoveryInput);
         recoveryAckSeq = Number(recovery.ackSeq || 0);
       }
+      // A redacted turn is terminal before dispatch.  In particular, do not
+      // let a replayed RA0 POST recreate/parse semantic input before returning
+      // the semantic-free 410.
+      const existingTurn = typeof store.getTurn === 'function'
+        ? store.getTurn(envelope.turnId)
+        : null;
+      if (existingTurn) {
+        const existingResolved = resolveCanonicalTerminalStatus(existingTurn);
+        if (existingResolved.error) {
+          return json(response,
+        ['CANONICAL_RESULT_REDACTED', 'LEGACY_RESULT_REDACTED'].includes(existingResolved.error)
+              ? 410 : 409,
+            { ok: false, error: existingResolved.error });
+        }
+      }
       const turn = dispatcher.accept(envelope);
       const resolved = resolveCanonicalTerminalStatus(turn);
-      if (resolved.error) return json(response, resolved.error === 'CANONICAL_RESULT_REDACTED' ? 410 : 409, {
+      if (resolved.error) return json(response,
+        ['CANONICAL_RESULT_REDACTED', 'LEGACY_RESULT_REDACTED'].includes(resolved.error) ? 410 : 409, {
         ok: false,
         error: resolved.error
       });
@@ -226,7 +273,8 @@ export function createYuqiServer({
       const turn = store.getTurn(decodeURIComponent(v2TurnMatch[1]));
       if (!turn) return json(response, 404, { ok: false, error: 'turn not found' });
       const resolved = resolveCanonicalTerminalStatus(turn);
-      if (resolved.error) return json(response, resolved.error === 'CANONICAL_RESULT_REDACTED' ? 410 : 409, {
+      if (resolved.error) return json(response,
+        ['CANONICAL_RESULT_REDACTED', 'LEGACY_RESULT_REDACTED'].includes(resolved.error) ? 410 : 409, {
         ok: false,
         error: resolved.error
       });

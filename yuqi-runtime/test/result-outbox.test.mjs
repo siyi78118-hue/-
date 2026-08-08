@@ -154,6 +154,7 @@ test('two result outboxes claim one canonical failure lease and enqueue it once'
   let marked = 0;
   let calls = 0;
   const store = {
+    listPendingCloudDeliveries() { return []; },
     listPendingAuthorityCloudDeliveries: () => [],
     listPendingCanonicalFailureCloudDeliveries: () => [{
       deliveryType: 'canonical_failure', turnId: failure.turnId, peerId: 'phone_cloud', updatedAt: 1
@@ -793,4 +794,261 @@ test('fifty canonical sends perform fifty scoped validations and zero full scans
   assert.equal(validationCounts.fullDatabase, 0);
   assert.equal(validationCounts.groupScoped, 50);
   assert.equal(fetchBodies.length, 50);
+});
+
+test('flushRetractionsOnce claims retained relay ids and completes redaction idempotently', async () => {
+  const events = [];
+  const store = {
+    listPendingCloudDeliveries() { return []; },
+    listPendingRedactionDeliveries(limit) {
+      assert.equal(limit, 10);
+      return [{ turnId: 'turn_redact_1', peerId: 'phone_cloud', relayMessageId: 'relay_redact_1' }];
+    },
+    claimRedactionDeliveryInternal(input) {
+      events.push(['claim', input.turnId, input.peerId]);
+      return { ...input, relayMessageId: 'relay_redact_1' };
+    },
+    completeRedactionDeliveryInternal(input) {
+      events.push(['complete', input.relayMessageId]);
+      return { state: 'redacted' };
+    }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async (url, request) => {
+      events.push(['fetch', new URL(url).pathname, JSON.parse(request.body).messageIds]);
+      return Response.json({ ok: true, deleted: 1 }, { status: 200 });
+    }
+  });
+  assert.deepEqual(await outbox.flushRetractionsOnce(10), { completed: 1, failed: 0, waiting: 0 });
+  assert.deepEqual(events, [
+    ['claim', 'turn_redact_1', 'phone_cloud'],
+    ['fetch', '/bridge/ack', ['relay_redact_1']],
+    ['complete', 'relay_redact_1']
+  ]);
+});
+
+test('redaction authority conflict is surfaced without ACK, semantic fetch, or diagnostic', async () => {
+  const events = [];
+  const store = {
+    listPendingCloudDeliveries() { return []; },
+    listPendingRedactionDeliveries() {
+      return [{ turnId: 'turn_redact_corrupt', peerId: 'phone_cloud', relayMessageId: 'relay_corrupt' }];
+    },
+    claimRedactionDeliveryInternal() {
+      throw new Error('redaction delivery authority conflict');
+    },
+    putDiagnostic() { events.push('diagnostic'); }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async () => { events.push('fetch'); return Response.json({ ok: true, deleted: 1 }); }
+  });
+  assert.deepEqual(await outbox.flushRetractionsOnce(), {
+    completed: 0, failed: 1, waiting: 0, fatal: 1, blockedPeerIds: ['phone_cloud']
+  });
+  assert.deepEqual(events, []);
+});
+
+test('authority conflict durably quarantines one redaction target and blocks it on replay', async () => {
+  let quarantines = 0;
+  let claims = 0;
+  let replay = false;
+  const store = {
+    listPendingCloudDeliveries() { return []; },
+    listPendingRedactionDeliveries() {
+      return replay ? [] : [{
+        turnId: 'turn_quarantine', peerId: 'phone_a', relayMessageId: 'relay_quarantine',
+        redactionRequestedAt: 9
+      }];
+    },
+    claimRedactionDeliveryInternal() {
+      claims += 1;
+      throw new Error('redaction delivery authority conflict');
+    },
+    quarantineRedactionDeliveryInternal(input) {
+      quarantines += 1;
+      assert.deepEqual(input, {
+        turnId: 'turn_quarantine', peerId: 'phone_a',
+        relayMessageId: 'relay_quarantine', requestAt: 9,
+        reasonCode: 'authority_conflict'
+      });
+      replay = true;
+      return { quarantineOutcome: 'quarantined' };
+    },
+    listQuarantinedRedactionPeerIdsInternal() { return replay ? ['phone_a'] : []; }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async () => { throw new Error('must not send'); }
+  });
+  const first = await outbox.flushRetractionsOnce();
+  const second = await outbox.flushRetractionsOnce();
+  assert.equal(first.fatal, 1);
+  assert.deepEqual(first.blockedPeerIds, ['phone_a']);
+  assert.deepEqual(second.blockedPeerIds, ['phone_a']);
+  assert.equal(quarantines, 1);
+  assert.equal(claims, 1);
+});
+
+test('redaction list authority corruption is durably quarantined before ordinary sends', async () => {
+  let quarantines = 0;
+  const store = {
+    listPendingCloudDeliveries() { return []; },
+    listPendingRedactionDeliveries() {
+      const error = new Error('redaction delivery authority conflict');
+      Object.assign(error, {
+        turnId: 'turn_list_corrupt', peerId: 'phone_list',
+        relayMessageId: 'relay_list_corrupt', requestAt: 11
+      });
+      throw error;
+    },
+    quarantineRedactionDeliveryInternal(input) {
+      quarantines += 1;
+      assert.deepEqual(input, {
+        turnId: 'turn_list_corrupt', peerId: 'phone_list',
+        relayMessageId: 'relay_list_corrupt', requestAt: 11,
+        reasonCode: 'authority_conflict'
+      });
+      return { quarantineOutcome: 'quarantined' };
+    }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64,
+    store, fetchImpl: async () => { throw new Error('must not send'); }
+  });
+  assert.deepEqual(await outbox.flushRetractionsOnce(), {
+    completed: 0, failed: 1, waiting: 0, fatal: 1, blockedPeerIds: ['phone_list']
+  });
+  assert.equal(quarantines, 1);
+});
+
+test('ordinary outbox revalidates before semantic payload and before mailbox CAS', async () => {
+  const targets = [{ turnId: 'turn_stale_1', peerId: 'phone_cloud', updatedAt: 1 }];
+  let validationCalls = 0;
+  let prepared = 0;
+  let mailboxed = 0;
+  let fetchCalls = 0;
+  const store = {
+    listPendingCloudDeliveries() { return targets; },
+    getTurn(turnId) { return { turnId, state: 'committed', createdAt: 1, updatedAt: 1 }; },
+    assertCloudDeliverySendableInternal() {
+      validationCalls += 1;
+      if (validationCalls <= 2) return;
+      throw new Error('cloud delivery stale redaction conflict');
+    },
+    prepareCloudDelivery() { prepared += 1; return { checksum: 'a'.repeat(64) }; },
+    markCloudDeliveryAttempt() {},
+    markCloudDeliveryMailboxed() { mailboxed += 1; }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async () => { fetchCalls += 1; return Response.json({ ok: true }, { status: 201 }); }
+  });
+  assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 1, waiting: 0 });
+  assert.equal(validationCalls, 3);
+  assert.equal(prepared, 1);
+  assert.equal(fetchCalls, 1);
+  assert.equal(mailboxed, 0);
+});
+
+test('late clear after enqueue gets a compensating ACK with the reserved relay id', async () => {
+  let validationCalls = 0;
+  let cleared = false;
+  const requests = [];
+  const store = {
+    listPendingCloudDeliveries() {
+      return [{ turnId: 'turn_late_clear', peerId: 'phone_cloud', updatedAt: 1 }];
+    },
+    getTurn(turnId) { return { turnId, state: 'committed', createdAt: 1, updatedAt: 1 }; },
+    assertCloudDeliverySendableInternal() {
+      validationCalls += 1;
+      if (cleared) throw new Error('cloud delivery stale redaction conflict');
+    },
+    prepareCloudDelivery() { return { checksum: 'b'.repeat(64) }; },
+    markCloudDeliveryAttempt() {},
+    reserveCloudDeliveryRelayInternal({ relayMessageId }) { return { relayMessageId }; },
+    readCloudDeliveryInternal() {
+      return cleared
+        ? { state: 'redaction_pending', turnId: 'turn_late_clear', peerId: 'phone_cloud',
+          relayMessageId: 'reserved_relay', redactionRequestedAt: 7 }
+        : { state: 'pending' };
+    },
+    completeRedactionDeliveryInternal() {},
+    markCloudDeliveryMailboxed() { throw new Error('mailbox must not be marked after clear'); }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async (url, request) => {
+      const path = new URL(url).pathname;
+      const body = JSON.parse(request.body);
+      requests.push({ path, body });
+      if (path === '/bridge/enqueue') {
+        cleared = true;
+        return Response.json({ ok: true }, { status: 201 });
+      }
+      return Response.json({ ok: true, deleted: 0 }, { status: 200 });
+    }
+  });
+  assert.deepEqual(await outbox.flushOnce(), { delivered: 0, failed: 1, waiting: 0 });
+  assert.equal(validationCalls, 2);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].path, '/bridge/enqueue');
+  assert.equal(requests[1].path, '/bridge/ack');
+  assert.deepEqual(requests[1].body.messageIds, [requests[0].body.messageId]);
+});
+
+test('redaction target-set corruption is fatal for its peer and never sent through legacy', async () => {
+  const store = {
+    listPendingCloudDeliveries() { return []; },
+    listPendingRedactionDeliveries() {
+      return [{ turnId: 'turn_target_corrupt', peerId: 'phone_a', relayMessageId: 'relay_target_corrupt' }];
+    },
+    claimRedactionDeliveryInternal() {
+      throw new Error('redaction delivery target set conflict');
+    }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async () => { throw new Error('must not send'); }
+  });
+  const result = await outbox.flushRetractionsOnce();
+  assert.equal(result.failed, 1);
+  assert.equal(result.fatal, 1);
+  assert.deepEqual(result.blockedPeerIds, ['phone_a']);
+});
+
+test('retraction limit still blocks a peer with redactions left beyond the batch', async () => {
+  const targets = Array.from({ length: 50 }, (_, index) => ({
+    turnId: `turn_redact_batch_${index}`,
+    peerId: 'phone_a',
+    relayMessageId: `relay_redact_batch_${index}`
+  }));
+  const store = {
+    listPendingRedactionDeliveries(limit) {
+      assert.equal(limit, 50);
+      return targets;
+    },
+    claimRedactionDeliveryInternal(value) {
+      return { ...value, relayMessageId: value.turnId.replace('turn_', 'relay_'), requestAt: 1 };
+    },
+    completeRedactionDeliveryInternal() {},
+    listPendingRedactionPeerIdsInternal() { return ['phone_a']; },
+    listPendingCloudDeliveries() { return []; }
+  };
+  const outbox = new ResultOutbox({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud',
+    deviceToken: 'device-token-123456789', encryptionKeyBase64: keyBase64, store,
+    fetchImpl: async () => Response.json({ ok: true, deleted: 1 })
+  });
+  const result = await outbox.flushRetractionsOnce(50);
+  assert.equal(result.completed, 50);
+  assert.deepEqual(result.blockedPeerIds, ['phone_a']);
 });

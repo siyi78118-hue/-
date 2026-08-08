@@ -892,6 +892,63 @@ for (const deliveryState of ['waiting', 'mailboxed', 'confirmed']) {
   });
 }
 
+test('redaction delivery authority conflict quarantines once and reopens as a non-semantic shell', () => {
+  const { dir, path } = tempPath('yuqi-redaction-quarantine-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { deliveryState: 'mailboxed' });
+    store.applyConversationClearInternal(emptySessionClear({ clearedThroughSequence: 2 }), {
+      appliedAt: 1784400036000
+    });
+    const before = store.db.prepare(`
+      SELECT peer_id, state, payload_json, checksum, attempts, relay_message_id,
+             redaction_requested_at, redaction_acknowledged_at FROM cloud_deliveries
+      WHERE authority_group_id = ?
+    `).get(fixture.groupId);
+    const first = store.quarantineRedactionDeliveryInternal({
+      turnId: fixture.committed.turnId,
+      peerId: before.peer_id,
+      relayMessageId: before.relay_message_id,
+      requestAt: before.redaction_requested_at,
+      reasonCode: 'authority_conflict'
+    });
+    const second = store.quarantineRedactionDeliveryInternal({
+      turnId: fixture.committed.turnId,
+      peerId: before.peer_id,
+      relayMessageId: before.relay_message_id,
+      requestAt: before.redaction_requested_at,
+      reasonCode: 'authority_conflict'
+    });
+    assert.equal(first.quarantineOutcome, 'quarantined');
+    assert.equal(second.quarantineOutcome, 'already_quarantined');
+    assert.equal(store.db.prepare(`
+      SELECT COUNT(*) AS value FROM diagnostics
+      WHERE turn_id = ? AND stage = 'canonical_redaction_delivery_quarantined'
+    `).get(fixture.committed.turnId).value, 1);
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.equal(reopened.db.prepare(`
+      SELECT state, payload_json, checksum, relay_message_id
+      FROM cloud_deliveries WHERE authority_group_id = ?
+    `).get(fixture.groupId).state, 'quarantined');
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('live legacy turns expose no redacted status until a validated shell exists', () => {
+  const { dir, path } = tempPath('yuqi-live-legacy-status-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    assert.equal(store.publicLegacyRedactedTurnStatusInternal(fixture.v2.turnId), null);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
 test('canonical RA1 corrupted commitment is rejected with zero writes', () => {
   const { dir, path } = tempPath('yuqi-clear-corrupt-commitment-');
   try {

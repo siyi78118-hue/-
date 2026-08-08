@@ -38,7 +38,221 @@ export class ResultOutbox {
     this.running = false;
   }
 
-  async flushOnce(limit = 50) {
+  // Redaction races are checked at each semantic boundary.  The store owns
+  // the authority proof; older/fake stores simply do not expose this optional
+  // guard and retain their existing behavior.
+  revalidateSendable(target, checksum = null) {
+    if (typeof this.store.assertCloudDeliverySendableInternal !== 'function') return true;
+    this.store.assertCloudDeliverySendableInternal({
+      turnId: target.turnId,
+      peerId: target.peerId,
+      authorityGroupId: target.authorityGroupId || null,
+      checksum
+    });
+    return true;
+  }
+
+  reserveRelay(target, checksum, relayMessageId) {
+    if (typeof this.store.reserveCloudDeliveryRelayInternal !== 'function') {
+      return { relayMessageId };
+    }
+    return this.store.reserveCloudDeliveryRelayInternal({
+      turnId: target.turnId,
+      peerId: target.peerId,
+      authorityGroupId: target.authorityGroupId || null,
+      checksum,
+      relayMessageId,
+      attemptAt: this.clock()
+    });
+  }
+
+  readDelivery(target) {
+    if (typeof this.store.readCloudDeliveryInternal === 'function') {
+      return this.store.readCloudDeliveryInternal({
+        turnId: target.turnId,
+        peerId: target.peerId,
+        authorityGroupId: target.authorityGroupId || null
+      });
+    }
+    if (typeof this.store.listCloudDeliveries === 'function') {
+      return this.store.listCloudDeliveries(target.turnId)
+        .find(row => row.peerId === target.peerId
+          && (target.authorityGroupId == null || row.authorityGroupId === target.authorityGroupId)) || null;
+    }
+    return null;
+  }
+
+  async compensateRedaction(target, output) {
+    const response = await this.fetch(`${this.relayUrl}/bridge/ack`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${this.deviceToken}`,
+        accept: 'application/json',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({ deviceId: this.deviceId, messageIds: [output.messageId] })
+    });
+    if (!response.ok) throw new Error(`cloud relay redaction compensation HTTP ${response.status}`);
+    const body = await response.json().catch(() => null);
+    if (!body || body.ok !== true || ![0, 1].includes(body.deleted)) {
+      throw new Error('cloud relay redaction compensation response conflict');
+    }
+    const current = this.readDelivery(target);
+    if (current?.state === 'redaction_pending'
+      && typeof this.store.completeRedactionDeliveryInternal === 'function') {
+      this.store.completeRedactionDeliveryInternal({
+        turnId: target.turnId,
+        peerId: target.peerId,
+        relayMessageId: output.messageId,
+        requestAt: current.redactionRequestedAt,
+        ackAt: this.clock()
+      });
+    }
+  }
+
+  async finalizeEnqueue(target, output, checksum) {
+    const current = this.readDelivery(target);
+    if (current && ['redaction_pending', 'redacted'].includes(current.state)) {
+      await this.compensateRedaction(target, output);
+      return false;
+    }
+    this.revalidateSendable(target, checksum);
+    return true;
+  }
+
+  async flushRetractionsOnce(limit = 50) {
+    if (typeof this.store.listPendingRedactionDeliveries !== 'function') {
+      return { completed: 0, failed: 0, waiting: 0 };
+    }
+    const summary = { completed: 0, failed: 0, waiting: 0 };
+    const blockedPeerIds = new Set();
+    let fatal = 0;
+    const block = target => {
+      const peerId = String(target?.peerId || '');
+      if (peerId) blockedPeerIds.add(peerId);
+    };
+    let targets;
+    try {
+      targets = this.store.listPendingRedactionDeliveries(limit);
+    } catch (error) {
+      const peerId = typeof error?.peerId === 'string' && error.peerId
+        ? error.peerId : '';
+      if (peerId && typeof this.store.quarantineRedactionDeliveryInternal === 'function') {
+        try {
+          this.store.quarantineRedactionDeliveryInternal({
+            turnId: error.turnId,
+            peerId,
+            relayMessageId: error.relayMessageId,
+            requestAt: error.requestAt,
+            reasonCode: 'authority_conflict'
+          });
+        } catch {
+          // A malformed target remains fatal and blocked; never send or
+          // reinterpret it as an ordinary delivery.
+        }
+      }
+      return {
+        ...summary,
+        failed: 1,
+        fatal: 1,
+        blockedPeerIds: peerId ? [peerId] : []
+      };
+    }
+    for (const target of targets) {
+      let claim;
+      try {
+        claim = this.store.claimRedactionDeliveryInternal({
+          turnId: target.turnId,
+          peerId: target.peerId,
+          requestAt: this.clock()
+        });
+        if (!claim) {
+          summary.waiting += 1;
+          block(target);
+          continue;
+        }
+      } catch {
+        summary.failed += 1;
+        fatal += 1;
+        block(target);
+        if (typeof this.store.quarantineRedactionDeliveryInternal === 'function') {
+          try {
+            this.store.quarantineRedactionDeliveryInternal({
+              turnId: target.turnId,
+              peerId: target.peerId,
+              relayMessageId: target.relayMessageId,
+              requestAt: target.redactionRequestedAt,
+              reasonCode: 'authority_conflict'
+            });
+          } catch {
+            // A malformed target cannot be safely rewritten; fatal remains
+            // durable at the caller boundary and this peer stays blocked.
+          }
+        }
+        continue;
+      }
+      try {
+        const response = await this.fetch(`${this.relayUrl}/bridge/ack`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${this.deviceToken}`,
+            accept: 'application/json',
+            'content-type': 'application/json'
+          },
+          body: JSON.stringify({ deviceId: this.deviceId, messageIds: [claim.relayMessageId] })
+        });
+        if (!response.ok) throw new Error(`cloud relay redaction ack HTTP ${response.status}`);
+        const body = await response.json().catch(() => null);
+        if (!body || body.ok !== true || ![0, 1].includes(body.deleted)) {
+          throw new Error('cloud relay redaction ack response conflict');
+        }
+        this.store.completeRedactionDeliveryInternal({
+          turnId: claim.turnId,
+          peerId: claim.peerId,
+          relayMessageId: claim.relayMessageId,
+          requestAt: claim.requestAt,
+          ackAt: this.clock()
+        });
+        summary.completed += 1;
+      } catch {
+        summary.failed += 1;
+        block(target);
+      }
+    }
+    if (typeof this.store.listPendingRedactionPeerIdsInternal === 'function') {
+      try {
+        for (const peerId of this.store.listPendingRedactionPeerIdsInternal() || []) {
+          const normalized = String(peerId || '');
+          if (normalized) blockedPeerIds.add(normalized);
+        }
+      } catch {
+        fatal += 1;
+        summary.failed += 1;
+        for (const target of targets) block(target);
+      }
+    }
+    if (typeof this.store.listQuarantinedRedactionPeerIdsInternal === 'function') {
+      try {
+        for (const peerId of this.store.listQuarantinedRedactionPeerIdsInternal() || []) {
+          const normalized = String(peerId || '');
+          if (normalized) blockedPeerIds.add(normalized);
+        }
+      } catch {
+        fatal += 1;
+        summary.failed += 1;
+      }
+    }
+    if (fatal || summary.failed || summary.waiting || blockedPeerIds.size) {
+      return {
+        ...summary,
+        ...(fatal ? { fatal } : {}),
+        blockedPeerIds: [...blockedPeerIds].sort()
+      };
+    }
+    return summary;
+  }
+
+  async flushOnce(limit = 50, { blockedPeerIds = [] } = {}) {
     if (this.running) return { delivered: 0, failed: 0, waiting: 0, skipped: true };
     this.running = true;
     const summary = { delivered: 0, failed: 0, waiting: 0 };
@@ -50,7 +264,10 @@ export class ResultOutbox {
         ? this.store.listPendingCanonicalFailureCloudDeliveries(limit, this.clock())
         : [];
       const legacyTargets = this.store.listPendingCloudDeliveries(limit);
-      const targets = [...authorityTargets, ...failureTargets, ...legacyTargets].sort((left, right) =>
+      const blocked = new Set((blockedPeerIds || []).map(value => String(value)));
+      const targets = [...authorityTargets, ...failureTargets, ...legacyTargets].filter(target =>
+        !blocked.has(String(target.peerId || ''))
+      ).sort((left, right) =>
         Number(left.updatedAt || 0) - Number(right.updatedAt || 0)
         || String(left.authorityGroupId || left.turnId).localeCompare(
           String(right.authorityGroupId || right.turnId)
@@ -90,6 +307,12 @@ export class ResultOutbox {
             }
             throw error;
           }
+          try {
+            this.revalidateSendable(target, claim.rawStatusChecksum);
+          } catch {
+            summary.failed += 1;
+            continue;
+          }
           const encrypted = encryptRelayPayload(claim.payload, this.encryptionKeyBase64);
           const output = {
             deviceId: this.deviceId,
@@ -115,6 +338,15 @@ export class ResultOutbox {
             continue;
           }
           if (!response.ok) {
+            summary.failed += 1;
+            continue;
+          }
+          try {
+            if (!await this.finalizeEnqueue(target, output, claim.rawStatusChecksum)) {
+              summary.failed += 1;
+              continue;
+            }
+          } catch {
             summary.failed += 1;
             continue;
           }
@@ -147,6 +379,7 @@ export class ResultOutbox {
           let publicPayload;
           let delivery;
           try {
+            this.revalidateSendable(target, target.checksum || null);
             const persistedTurn = this.store.getTurn(target.turnId);
             const canonicalResult = this.store.loadCanonicalBridgeResultInternal(target.turnId);
             if (canonicalResult?.status === 'redacted') {
@@ -172,6 +405,7 @@ export class ResultOutbox {
               target.authorityGroupId,
               target.peerId
             );
+            this.revalidateSendable(target, delivery.checksum);
           } catch (error) {
             if (isCanonicalAuthorityConflictError(error)
               && typeof this.store.quarantineCanonicalVisibleDeliveryInternal === 'function') {
@@ -186,13 +420,28 @@ export class ResultOutbox {
               summary.failed += 1;
               continue;
             }
+            if (error?.message === 'cloud delivery stale redaction conflict') {
+              summary.failed += 1;
+              continue;
+            }
             throw error;
           }
-          const encrypted = encryptRelayPayload(publicPayload, this.encryptionKeyBase64);
           const identity = `${target.authorityGroupId}:${target.peerId}:${target.authorityCommitChecksum}`;
+          let reserved;
+          try {
+            reserved = this.reserveRelay(
+              target,
+              delivery.checksum,
+              stableId('relay_pc', identity)
+            );
+          } catch {
+            summary.failed += 1;
+            continue;
+          }
+          const encrypted = encryptRelayPayload(publicPayload, this.encryptionKeyBase64);
           const output = {
             deviceId: this.deviceId,
-            messageId: stableId('relay_pc', identity),
+            messageId: reserved.relayMessageId,
             idempotencyKey: stableId('reply', identity),
             direction: 'pc_to_phone',
             ...encrypted,
@@ -218,6 +467,15 @@ export class ResultOutbox {
             continue;
           }
           try {
+            if (!await this.finalizeEnqueue(target, output, delivery.checksum)) {
+              summary.failed += 1;
+              continue;
+            }
+          } catch {
+            summary.failed += 1;
+            continue;
+          }
+          try {
             this.store.markAuthorityCloudDeliveryMailboxed(
               target.authorityGroupId,
               target.peerId,
@@ -231,6 +489,12 @@ export class ResultOutbox {
           continue;
         }
         const turn = this.store.getTurn(target.turnId);
+        try {
+          this.revalidateSendable(target, target.checksum || null);
+        } catch {
+          summary.failed += 1;
+          continue;
+        }
         const status = publicTurnStatus(turn);
         if (!status?.terminal) {
           summary.waiting += 1;
@@ -240,11 +504,17 @@ export class ResultOutbox {
           const publicPayload = { ok: true, ...status, recoveryAckSeq: target.recoveryAckSeq };
           const delivery = this.store.prepareCloudDelivery(target.turnId, target.peerId, publicPayload);
           this.store.markCloudDeliveryAttempt(target.turnId, target.peerId);
-          const encrypted = encryptRelayPayload(publicPayload, this.encryptionKeyBase64);
+          this.revalidateSendable(target, delivery.checksum);
           const identity = `${target.turnId}:${target.peerId}:${delivery.checksum}`;
+          const reserved = this.reserveRelay(
+            target,
+            delivery.checksum,
+            stableId('relay_pc', identity)
+          );
+          const encrypted = encryptRelayPayload(publicPayload, this.encryptionKeyBase64);
           const output = {
             deviceId: this.deviceId,
-            messageId: stableId('relay_pc', identity),
+            messageId: reserved.relayMessageId,
             idempotencyKey: stableId('reply', identity),
             direction: 'pc_to_phone',
             ...encrypted,
@@ -260,6 +530,10 @@ export class ResultOutbox {
             body: JSON.stringify(output)
           });
           if (!response.ok) throw new Error(`cloud relay enqueue HTTP ${response.status}`);
+          if (!await this.finalizeEnqueue(target, output, delivery.checksum)) {
+            summary.failed += 1;
+            continue;
+          }
           this.store.markCloudDeliveryMailboxed(target.turnId, target.peerId, delivery.checksum);
           summary.delivered += 1;
         } catch {

@@ -5074,6 +5074,19 @@ export class YuqiStore {
       }
       return;
     }
+    if (delivery.state === 'quarantined') {
+      if (typeof delivery.relay_message_id !== 'string' || !delivery.relay_message_id
+        || request !== at || acknowledged !== null
+        || typeof delivery.attempts !== 'number' || delivery.attempts !== 0) {
+        throw new Error('redacted authority delivery quarantine conflict');
+      }
+      const turn = this.getTurn(delivery.turn_id);
+      const stage = Number(turn?.resultAuthorityVersion) === 0
+        ? 'legacy_redaction_delivery_quarantined'
+        : 'canonical_redaction_delivery_quarantined';
+      this.assertRedactionQuarantineDiagnosticsForTurnsInternal([delivery.turn_id], stage);
+      return;
+    }
     if (delivery.state !== 'redacted') {
       throw new Error('redacted authority delivery lifecycle conflict');
     }
@@ -5087,6 +5100,43 @@ export class YuqiStore {
     if (request !== null || acknowledged !== at) {
       throw new Error('redacted authority delivery lifecycle conflict');
     }
+  }
+
+  assertRedactionQuarantineDiagnosticsForTurnsInternal(turnIds, stage) {
+    const ids = [...new Set((turnIds || []).filter(value => typeof value === 'string' && value))];
+    const marks = ids.map(() => '?').join(',') || "''";
+    const diagnostics = this.db.prepare(`
+      SELECT turn_id, detail_json FROM diagnostics
+      WHERE turn_id IN (${marks}) AND stage = ?
+      ORDER BY turn_id, diagnostic_id
+    `).all(...ids, stage);
+    const quarantined = this.db.prepare(`
+      SELECT turn_id, peer_id, relay_message_id FROM cloud_deliveries
+      WHERE turn_id IN (${marks}) AND state = 'quarantined'
+      ORDER BY turn_id, peer_id
+    `).all(...ids);
+    const allDiagnostics = this.db.prepare(`
+      SELECT turn_id, stage FROM diagnostics
+      WHERE turn_id IN (${marks})
+    `).all(...ids);
+    if (allDiagnostics.length !== diagnostics.length || diagnostics.length !== quarantined.length) {
+      throw new Error('redacted authority quarantine diagnostic closure conflict');
+    }
+    const expectedKeys = 'peerId,reasonCode,redacted,relayMessageId';
+    for (const row of quarantined) {
+      const matches = diagnostics.filter(entry => entry.turn_id === row.turn_id)
+        .map(entry => parseJson(entry.detail_json, null))
+        .filter(detail => detail
+          && Object.keys(detail).sort().join(',') === expectedKeys
+          && detail.redacted === true
+          && detail.peerId === row.peer_id
+          && detail.relayMessageId === row.relay_message_id
+          && ['authority_conflict', 'target_set_conflict'].includes(detail.reasonCode));
+      if (matches.length !== 1) {
+        throw new Error('redacted authority quarantine diagnostic closure conflict');
+      }
+    }
+    return true;
   }
 
   assertAuthorityRedactionAuditInternal({
@@ -5334,12 +5384,13 @@ export class YuqiStore {
     const messages = messageClosure.messages;
     const messageIds = messages.map(message => message.message_id);
     const messageMarks = messageIds.map(() => '?').join(',') || "''";
+    this.assertRedactionQuarantineDiagnosticsForTurnsInternal(
+      turnIds, 'canonical_redaction_delivery_quarantined'
+    );
     const retainedContext = [
       Number(this.db.prepare(`SELECT COUNT(*) AS value FROM annotations
         WHERE turn_id IN (${turnMarks}) OR source_message_id IN (${messageMarks})`)
         .get(...turnIds, ...messageIds).value),
-      Number(this.db.prepare(`SELECT COUNT(*) AS value FROM diagnostics
-        WHERE turn_id IN (${turnMarks})`).get(...turnIds).value),
       Number(this.db.prepare(`SELECT COUNT(*) AS value FROM sessions
         WHERE role IN (${[...new Set(attempts.map(turn => turn.character_id))]
           .map(() => '?').join(',') || "''"})`)
@@ -8391,7 +8442,6 @@ export class YuqiStore {
     const directLinkedCounts = [
       ['turn_stages', 'SELECT COUNT(*) AS value FROM turn_stages WHERE turn_id = ?'],
       ['annotations', 'SELECT COUNT(*) AS value FROM annotations WHERE turn_id = ?'],
-      ['diagnostics', 'SELECT COUNT(*) AS value FROM diagnostics WHERE turn_id = ?'],
       ['consolidation_jobs', `SELECT COUNT(*) AS value FROM consolidation_jobs
         WHERE turn_id = ? AND state IN ('queued','retry_wait','running')`],
       ['stance_records', `SELECT COUNT(*) AS value FROM stance_records
@@ -8415,6 +8465,9 @@ export class YuqiStore {
     const deliveries = this.db.prepare(
       'SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id'
     ).all(turn.turn_id);
+    this.assertRedactionQuarantineDiagnosticsForTurnsInternal(
+      [turn.turn_id], 'legacy_redaction_delivery_quarantined'
+    );
     if (deliveries.length !== payload.deliveries.length) {
       throw new Error('legacy redaction delivery count conflict');
     }
@@ -8494,7 +8547,8 @@ export class YuqiStore {
         const expectedRelay = original.originalChecksum
           ? stableId('relay_pc', `${turn.turn_id}:${original.peerId}:${original.originalChecksum}`)
           : null;
-        if (current.state !== 'redaction_pending' || !current.relay_message_id
+        if (!['redaction_pending', 'quarantined'].includes(current.state)
+          || !current.relay_message_id
           || current.relay_message_id !== expectedRelay
           || original.relayMessageId !== expectedRelay
           || Number(current.redaction_requested_at) !== Number(payload.redactedAt)
@@ -8527,8 +8581,35 @@ export class YuqiStore {
   }
 
   publicLegacyRedactedTurnStatusInternal(turnId) {
+    const id = String(turnId || '');
+    const turn = this.db.prepare(`
+      SELECT authority_redacted_at, envelope_json FROM turns WHERE turn_id = ?
+    `).get(id);
+    const audit = this.db.prepare(`
+      SELECT 1 FROM sync_log
+      WHERE entity_type = 'legacy_turn_redaction' AND entity_id = ?
+      LIMIT 1
+    `).get(id);
+    const marked = Boolean(audit)
+      || Boolean(turn && (turn.authority_redacted_at != null
+        || canonicalJson(parseJson(turn.envelope_json, null)) === '{"redacted":true}'));
+    if (!marked) return null;
     this.loadValidatedLegacyTurnRedactionInternal(turnId);
     return Object.freeze({ status: 'redacted', deliverable: false, terminal: true });
+  }
+
+  hasLegacyRedactionMarkerInternal(turnId) {
+    const turn = this.db.prepare(`
+      SELECT authority_redacted_at, envelope_json FROM turns WHERE turn_id = ?
+    `).get(String(turnId || ''));
+    if (!turn) return false;
+    if (turn.authority_redacted_at != null
+      || canonicalJson(parseJson(turn.envelope_json, null)) === '{"redacted":true}') return true;
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM sync_log
+      WHERE entity_type = 'legacy_turn_redaction' AND entity_id = ?
+      LIMIT 1
+    `).get(String(turnId || '')));
   }
 
   assertLegacyRedactionAuditClosureInternal() {
@@ -10984,6 +11065,71 @@ export class YuqiStore {
     `).get(String(groupId), String(peerId)));
   }
 
+  reserveCloudDeliveryRelayInternal({
+    turnId, peerId, authorityGroupId = null, checksum, relayMessageId, attemptAt = now()
+  }) {
+    if (typeof turnId !== 'string' || !turnId
+      || typeof peerId !== 'string' || !peerId
+      || typeof checksum !== 'string' || !checksum
+      || typeof attemptAt !== 'number' || !Number.isSafeInteger(attemptAt) || attemptAt <= 0) {
+      throw new Error('cloud delivery relay reservation conflict');
+    }
+    return this.withImmediateTransaction(() => {
+      const row = authorityGroupId
+        ? this.db.prepare(`SELECT * FROM cloud_deliveries
+            WHERE turn_id = ? AND peer_id = ? AND authority_group_id = ?`).get(
+          turnId, peerId, String(authorityGroupId))
+        : this.db.prepare(`SELECT * FROM cloud_deliveries
+            WHERE turn_id = ? AND peer_id = ? AND authority_group_id IS NULL`).get(
+          turnId, peerId);
+      if (!row || !['pending', 'redaction_pending'].includes(row.state)) {
+        throw new Error('cloud delivery relay reservation conflict');
+      }
+      const expectedRelayMessageId = stableId(
+        'relay_pc',
+        authorityGroupId
+          ? `${authorityGroupId}:${peerId}:${row.authority_commit_checksum}`
+          : `${turnId}:${peerId}:${checksum}`
+      );
+      if (relayMessageId != null && relayMessageId !== expectedRelayMessageId) {
+        throw new Error('cloud delivery relay identity conflict');
+      }
+      if (row.state === 'redaction_pending') {
+        if (row.relay_message_id !== expectedRelayMessageId) {
+          throw new Error('cloud delivery relay identity conflict');
+        }
+        return {
+          ...mapCloudDelivery(row),
+          relayMessageId: expectedRelayMessageId
+        };
+      }
+      if (row.checksum !== checksum) {
+        throw new Error('cloud delivery relay reservation conflict');
+      }
+      const updated = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET relay_message_id = COALESCE(relay_message_id, ?), updated_at = ?
+        WHERE turn_id = ? AND peer_id = ?
+          AND ${authorityGroupId ? 'authority_group_id = ?' : 'authority_group_id IS NULL'}
+          AND state = 'pending' AND checksum = ?
+          AND (relay_message_id IS NULL OR relay_message_id = ?)
+      `).run(
+        expectedRelayMessageId, attemptAt, turnId, peerId,
+        ...(authorityGroupId ? [String(authorityGroupId)] : []), checksum,
+        expectedRelayMessageId
+      );
+      if (Number(updated.changes) !== 1) {
+        throw new Error('cloud delivery relay reservation CAS conflict');
+      }
+      return {
+        ...mapCloudDelivery(this.db.prepare(`
+          SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+        `).get(turnId, peerId)),
+        relayMessageId: expectedRelayMessageId
+      };
+    });
+  }
+
   markAuthorityCloudDeliveryAttempt(groupId, peerId) {
     const result = this.db.prepare(`
       UPDATE cloud_deliveries SET attempts = attempts + 1, updated_at = ?
@@ -12854,6 +13000,22 @@ export class YuqiStore {
     `).all(turnId).map(mapCloudDelivery);
   }
 
+  readCloudDeliveryInternal({ turnId, peerId, authorityGroupId = null }) {
+    const row = authorityGroupId
+      ? this.db.prepare(`SELECT * FROM cloud_deliveries
+          WHERE turn_id = ? AND peer_id = ? AND authority_group_id = ?`).get(
+        String(turnId), String(peerId), String(authorityGroupId))
+      : this.db.prepare(`SELECT * FROM cloud_deliveries
+          WHERE turn_id = ? AND peer_id = ? AND authority_group_id IS NULL`).get(
+        String(turnId), String(peerId));
+    if (!row) return null;
+    return {
+      ...mapCloudDelivery(row),
+      redactionRequestedAt: row.redaction_requested_at == null ? null : row.redaction_requested_at,
+      redactionAcknowledgedAt: row.redaction_acknowledged_at == null ? null : row.redaction_acknowledged_at
+    };
+  }
+
   listPendingCloudDeliveries(limit = 50) {
     const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
     return this.db.prepare(`
@@ -12878,6 +13040,261 @@ export class YuqiStore {
       ORDER BY d.updated_at ASC, d.authority_group_id ASC, d.peer_id ASC
       LIMIT ?
     `).all(safeLimit).map(mapCloudDelivery);
+  }
+
+  listPendingRedactionDeliveries(limit = 50) {
+    const safeLimit = Math.max(1, Math.min(500, Number(limit) || 50));
+    const rows = this.db.prepare(`
+      SELECT d.*
+      FROM cloud_deliveries d
+      WHERE d.state = 'redaction_pending'
+      ORDER BY d.redaction_requested_at ASC, d.turn_id ASC, d.peer_id ASC
+    `).all().map(row => ({
+      ...mapCloudDelivery(row),
+      redactionRequestedAt: row.redaction_requested_at == null ? null : row.redaction_requested_at,
+      redactionAcknowledgedAt: row.redaction_acknowledged_at == null ? null : row.redaction_acknowledged_at
+    }));
+    for (const row of rows) {
+      try {
+        this.assertRedactionDeliveryAuthorityInternal(row);
+      } catch (error) {
+        error.peerId = row.peerId;
+        error.turnId = row.turnId;
+        error.relayMessageId = row.relayMessageId;
+        error.requestAt = row.redactionRequestedAt;
+        throw error;
+      }
+    }
+    return rows.slice(0, safeLimit);
+  }
+
+  listPendingRedactionPeerIdsInternal() {
+    const rows = this.db.prepare(`
+      SELECT d.*
+      FROM cloud_deliveries d
+      WHERE d.state = 'redaction_pending'
+      ORDER BY d.peer_id ASC, d.turn_id ASC
+    `).all().map(mapCloudDelivery);
+    for (const row of rows) this.assertRedactionDeliveryAuthorityInternal(row);
+    return [...new Set(rows.map(row => row.peerId))].sort();
+  }
+
+  listQuarantinedRedactionPeerIdsInternal() {
+    return [...new Set(this.db.prepare(`
+      SELECT DISTINCT d.peer_id
+      FROM cloud_deliveries d
+      JOIN diagnostics x ON x.turn_id = d.turn_id
+      WHERE d.state = 'quarantined'
+        AND x.stage IN ('legacy_redaction_delivery_quarantined',
+                        'canonical_redaction_delivery_quarantined')
+      ORDER BY d.peer_id
+    `).all().map(row => row.peer_id))].sort();
+  }
+
+  assertRedactionDeliveryAuthorityInternal(row) {
+    if (!row || row.state !== 'redaction_pending'
+      || typeof row.relayMessageId !== 'string' || row.relayMessageId.length === 0
+      || row.payloadJson !== null || row.checksum !== ''
+      || typeof row.updatedAt !== 'number' || !Number.isSafeInteger(row.updatedAt)
+      || row.updatedAt <= 0) {
+      throw new Error('redaction delivery authority conflict');
+    }
+    const turn = this.getTurn(row.turnId);
+    if (!turn) throw new Error('redaction delivery turn conflict');
+    if (Number(turn.resultAuthorityVersion) === 0) {
+      this.loadValidatedLegacyTurnRedactionInternal(row.turnId);
+    } else if (Number(turn.resultAuthorityVersion) === 1) {
+      const lineage = this.getTurnAuthorityLineage(turn.authorityLineageKey);
+      if (!lineage || lineage.redactedAt == null) throw new Error('redaction delivery lineage conflict');
+      if (lineage.committedGroupId) {
+        this.assertVisibleGroupAuthorityInternal(lineage.committedGroupId, { purpose: 'reopen' });
+      } else {
+        this.assertRedactedLineageAuthorityInternal(lineage.lineageKey, { purpose: 'reopen' });
+      }
+    } else {
+      throw new Error('redaction delivery authority version conflict');
+    }
+    return row;
+  }
+
+  claimRedactionDeliveryInternal({ turnId, peerId, requestAt = now() }) {
+    return this.withImmediateTransaction(() => {
+      const row = this.db.prepare(`
+        SELECT * FROM cloud_deliveries
+        WHERE turn_id = ? AND peer_id = ?
+      `).get(String(turnId || ''), String(peerId || ''));
+      if (!row) return null;
+      const mapped = mapCloudDelivery(row);
+      if (mapped.state !== 'redaction_pending') return null;
+      if (typeof row.redaction_requested_at !== 'number'
+        || !Number.isSafeInteger(row.redaction_requested_at)
+        || row.redaction_requested_at <= 0
+        || typeof row.relay_message_id !== 'string'
+        || row.relay_message_id.length === 0) {
+        throw new Error('redaction delivery authority conflict');
+      }
+      if (typeof requestAt !== 'number' || !Number.isSafeInteger(requestAt) || requestAt <= 0) {
+        throw new Error('redaction delivery request time conflict');
+      }
+      this.assertRedactionDeliveryAuthorityInternal(mapped);
+      return Object.freeze({
+        turnId: mapped.turnId,
+        peerId: mapped.peerId,
+        relayMessageId: mapped.relayMessageId,
+        requestAt: row.redaction_requested_at,
+        authorityVersion: Number(this.getTurn(turnId).resultAuthorityVersion)
+      });
+    });
+  }
+
+  completeRedactionDeliveryInternal({
+    turnId, peerId, relayMessageId, requestAt, ackAt = now()
+  }) {
+    return this.withImmediateTransaction(() => {
+      const row = this.db.prepare(`
+        SELECT * FROM cloud_deliveries
+        WHERE turn_id = ? AND peer_id = ?
+      `).get(String(turnId || ''), String(peerId || ''));
+      if (!row) return { state: 'redacted', alreadyRemoved: true };
+      if (row.state === 'redacted' && row.relay_message_id === String(relayMessageId || '')) {
+        return mapCloudDelivery(row);
+      }
+      if (typeof ackAt !== 'number' || !Number.isSafeInteger(ackAt) || ackAt <= 0
+        || typeof row.redaction_requested_at !== 'number'
+        || !Number.isSafeInteger(row.redaction_requested_at)
+        || typeof requestAt !== 'number' || !Number.isSafeInteger(requestAt)
+        || row.redaction_requested_at !== requestAt
+        || row.state !== 'redaction_pending'
+        || row.relay_message_id !== String(relayMessageId || '')
+        || row.payload_json !== null || row.checksum !== null) {
+        throw new Error('redaction delivery completion conflict');
+      }
+      this.assertRedactionDeliveryAuthorityInternal(mapCloudDelivery(row));
+      const result = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'redacted', redaction_acknowledged_at = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND state = 'redaction_pending'
+          AND relay_message_id = ? AND redaction_requested_at = ?
+          AND payload_json IS NULL AND checksum IS NULL
+      `).run(Number(ackAt), Number(ackAt), String(turnId), String(peerId),
+        String(relayMessageId), requestAt);
+      if (Number(result.changes) !== 1) throw new Error('redaction delivery completion CAS conflict');
+      return mapCloudDelivery(this.db.prepare(
+        'SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?'
+      ).get(String(turnId), String(peerId)));
+    });
+  }
+
+  quarantineRedactionDeliveryInternal({
+    turnId, peerId, relayMessageId, requestAt, reasonCode = 'authority_conflict'
+  }) {
+    const validReasons = new Set(['authority_conflict', 'target_set_conflict']);
+    if (typeof turnId !== 'string' || !turnId
+      || typeof peerId !== 'string' || !peerId
+      || typeof relayMessageId !== 'string' || !relayMessageId
+      || typeof requestAt !== 'number' || !Number.isSafeInteger(requestAt) || requestAt <= 0
+      || !validReasons.has(reasonCode)) {
+      throw new Error('redaction quarantine input conflict');
+    }
+    return this.withImmediateTransaction(() => {
+      const row = this.db.prepare(`
+        SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+      `).get(turnId, peerId);
+      if (!row) return { quarantineOutcome: 'already_removed', state: null };
+      const turn = this.db.prepare(
+        'SELECT result_authority_version, authority_redacted_at, authority_lineage_key, envelope_json '
+        + 'FROM turns WHERE turn_id = ?'
+      ).get(turnId);
+      const version = Number(turn?.result_authority_version);
+      if (!turn || ![0, 1].includes(version)
+        || (version === 0
+          ? turn.authority_redacted_at == null
+          : !turn.authority_lineage_key || !this.db.prepare(
+            'SELECT redacted_at FROM turn_authority_lineages WHERE lineage_key = ?'
+          ).get(turn.authority_lineage_key)?.redacted_at)) {
+        throw new Error('redaction quarantine authority conflict');
+      }
+      const stage = version === 0
+        ? 'legacy_redaction_delivery_quarantined'
+        : 'canonical_redaction_delivery_quarantined';
+      const detail = {
+        redacted: true,
+        peerId,
+        relayMessageId,
+        reasonCode
+      };
+      const diagnostics = this.db.prepare(`
+        SELECT diagnostic_id, detail_json FROM diagnostics
+        WHERE turn_id = ? AND stage = ?
+      `).all(turnId, stage);
+      if (row.state === 'quarantined') {
+        if (row.payload_json !== null || row.checksum !== null
+          || row.relay_message_id !== relayMessageId
+          || row.redaction_requested_at !== requestAt
+          || row.redaction_acknowledged_at !== null
+          || row.attempts !== 0 || diagnostics.length !== 1
+          || diagnostics[0].detail_json !== canonicalJson(detail)) {
+          throw new Error('redaction quarantine replay conflict');
+        }
+        return { ...mapCloudDelivery(row), quarantineOutcome: 'already_quarantined' };
+      }
+      if (row.state !== 'redaction_pending'
+        || row.payload_json !== null || row.checksum !== null
+        || row.relay_message_id !== relayMessageId
+        || row.redaction_requested_at !== requestAt
+        || row.redaction_acknowledged_at !== null
+        || typeof row.attempts !== 'number' || !Number.isSafeInteger(row.attempts)
+        || row.attempts < 0 || diagnostics.length !== 0) {
+        throw new Error('redaction quarantine target conflict');
+      }
+      const updated = this.db.prepare(`
+        UPDATE cloud_deliveries
+        SET state = 'quarantined', payload_json = NULL, checksum = NULL,
+            attempts = 0, redaction_acknowledged_at = NULL, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND state = 'redaction_pending'
+          AND relay_message_id = ? AND redaction_requested_at = ?
+          AND payload_json IS NULL AND checksum IS NULL AND attempts = ?
+          AND redaction_acknowledged_at IS NULL
+      `).run(now(), turnId, peerId, relayMessageId, requestAt, row.attempts);
+      if (Number(updated.changes) !== 1) {
+        throw new Error('redaction quarantine CAS conflict');
+      }
+      this.putDiagnostic({
+        turnId,
+        stage,
+        level: 'error',
+        detail
+      });
+      return {
+        ...mapCloudDelivery(this.db.prepare(
+          'SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?'
+        ).get(turnId, peerId)),
+        quarantineOutcome: 'quarantined'
+      };
+    });
+  }
+
+  assertCloudDeliverySendableInternal({ turnId, peerId, authorityGroupId = null, checksum = null }) {
+    const row = authorityGroupId
+      ? this.db.prepare(`SELECT d.* FROM cloud_deliveries d
+          WHERE d.turn_id = ? AND d.peer_id = ? AND d.authority_group_id = ?`).get(
+        String(turnId), String(peerId), String(authorityGroupId))
+      : this.db.prepare(`SELECT d.* FROM cloud_deliveries d
+          WHERE d.turn_id = ? AND d.peer_id = ? AND d.authority_group_id IS NULL`).get(
+        String(turnId), String(peerId));
+    if (!row || ['redacted', 'redaction_pending'].includes(row.state)
+      || (checksum != null && row.checksum !== String(checksum))) {
+      throw new Error('cloud delivery stale redaction conflict');
+    }
+    if (authorityGroupId) {
+      this.assertVisibleGroupAuthorityInternal(authorityGroupId, { purpose: 'delivery' });
+    } else if (Number(this.getTurn(turnId)?.resultAuthorityVersion) === 0) {
+      const status = this.publicLegacyRedactedTurnStatusInternal;
+      if (typeof status === 'function') {
+        try { status.call(this, turnId); } catch { /* live legacy turns remain sendable */ }
+      }
+    }
+    return mapCloudDelivery(row);
   }
 
   assertCanonicalFailureDeliveryInternal(delivery) {

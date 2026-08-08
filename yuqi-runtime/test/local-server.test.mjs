@@ -128,6 +128,90 @@ test('serves health and accepts one signed turn without exposing unsigned APIs',
   }
 });
 
+test('legacy RA0 redacted GET and POST return a semantic-free 410', async () => {
+  let dispatches = 0;
+  const turn = {
+    turnId: 'turn_legacy_redacted_http', state: 'cancelled', protocolVersion: 1,
+    resultAuthorityVersion: 0, characterId: 'yuqi', deviceId: 'phone_legacy'
+  };
+  const store = {
+    getTurn: id => id === turn.turnId ? turn : null,
+    publicLegacyRedactedTurnStatusInternal: id => {
+      if (id !== turn.turnId) throw new Error('not found');
+      return { status: 'redacted', deliverable: false, terminal: true };
+    },
+    getSyncDelta: () => [],
+    ackSync: (_peer, seq) => seq
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret', store,
+    orchestrator: { async process() { return turn; } },
+    dispatcher: { accept: () => { dispatches += 1; return turn; } }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const get = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${turn.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'legacy-redacted-get'
+    });
+    const post = await call(server.address().port, {
+      method: 'POST', path: '/v2/turns', body: {
+        protocolVersion: 1, turnId: turn.turnId, characterId: 'yuqi',
+        deviceId: 'phone_legacy', deviceSeq: 1, createdAt: 1784400000000,
+        message: {
+          messageId: 'msg_legacy_redacted_http', speakerId: 'user', speakerType: 'user',
+          recipientId: 'yuqi', content: 'legacy', sentAt: 1784400000000
+        }
+      },
+      secret: 'test-pairing-secret', nonce: 'legacy-redacted-post'
+    });
+    assert.equal(get.status, 410);
+    assert.deepEqual(get.body, { ok: false, error: 'LEGACY_RESULT_REDACTED' });
+    assert.equal(post.status, 410);
+    assert.deepEqual(post.body, { ok: false, error: 'LEGACY_RESULT_REDACTED' });
+    assert.equal(dispatches, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('malformed RA0 redaction is a stable authority conflict and never dispatches or reads reply JSON', async () => {
+  let dispatches = 0;
+  const turn = {
+    turnId: 'turn_legacy_corrupt_http', state: 'cancelled', protocolVersion: 1,
+    resultAuthorityVersion: 0, characterId: 'yuqi', deviceId: 'phone_legacy',
+    envelopeJson: JSON.stringify({ redacted: true }),
+    authorityRedactedAt: 1784400000000,
+    replyJson: JSON.stringify({ secret: 'must-not-be-read' })
+  };
+  const store = {
+    getTurn: id => id === turn.turnId ? turn : null,
+    publicLegacyRedactedTurnStatusInternal() {
+      throw new Error('legacy redaction authority conflict');
+    },
+    getSyncDelta: () => [],
+    ackSync: (_peer, seq) => seq
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret', store,
+    orchestrator: { async process() { return turn; } },
+    dispatcher: { accept: () => { dispatches += 1; return turn; } }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const response = await call(server.address().port, {
+      method: 'GET', path: `/v2/turns/${turn.turnId}`,
+      secret: 'test-pairing-secret', nonce: 'legacy-corrupt-get'
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, { ok: false, error: 'LEGACY_AUTHORITY_CONFLICT' });
+    assert.equal(JSON.stringify(response.body).includes('must-not-be-read'), false);
+    assert.equal(dispatches, 0);
+  } finally {
+    await server.close();
+  }
+});
+
 test('health exposes only the non-sensitive cloud relay connection summary', async () => {
   const relayStatus = {
     enabled: true,
