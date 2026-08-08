@@ -78,4 +78,33 @@ public class ExecutionServicePolicyTest {
         assertFalse(AlNotificationPolicy.shouldNotifyCompletedTurn("action_only", 1, false));
         assertFalse(AlNotificationPolicy.shouldNotifyCompletedTurn("redacted", 1, false));
     }
+
+    @Test
+    public void lifecycleWakePolicyUsesLeaseAndRefreshExpiryInsteadOfTurnRecovery() {
+        LifecycleControl pending = new LifecycleControl(
+            "ctl_" + repeat('a'), LifecycleControl.CLEAR_KIND, "yuqi", "device-1",
+            1L, 7L, 100L, "{}", repeat('b'), LifecycleControl.PENDING,
+            "lease", 1L, 1_000L, null, null, null, 100L);
+        LifecycleControl accepted = new LifecycleControl(
+            "ctl_" + repeat('a'), LifecycleControl.CLEAR_KIND, "yuqi", "device-1",
+            1L, 7L, 100L, "{}", repeat('b'), LifecycleControl.RELAY_ACCEPTED,
+            null, 1L, null, "ctlmsg_" + repeat('c'), null, 100_000_000L, 100L);
+
+        assertEquals(61_000L, LifecycleControlSender.nextEligibleAt(pending, 1_000L));
+        assertEquals(
+            100_000_000L - LifecycleControlSender.REFRESH_WINDOW_MILLIS,
+            LifecycleControlSender.nextEligibleAt(accepted, 1_000L));
+    }
+
+    @Test
+    public void lifecycleWakeUsesAnIndependentUniqueWorkName() {
+        assertFalse(AlExecutionWakeWorker.lifecycleWorkName()
+            .equals(AlExecutionWakeWorker.generalWorkName()));
+    }
+
+    private static String repeat(char value) {
+        StringBuilder result = new StringBuilder();
+        for (int index = 0; index < 64; index += 1) result.append(value);
+        return result.toString();
+    }
 }

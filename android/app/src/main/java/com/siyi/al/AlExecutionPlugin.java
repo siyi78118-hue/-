@@ -459,6 +459,7 @@ public final class AlExecutionPlugin extends Plugin {
                 throw new IllegalArgumentException("expectedCursorChecksum is required");
             }
             LifecycleControl control = store.createConversationClear(characterId, expectedCursorChecksum);
+            AlExecutionService.requestRun(getContext());
             JSObject result = conversationCursorResult(characterId, store.getConversationCursor(characterId));
             result.put("controlId", control.controlId);
             result.put("clearEpoch", control.clearEpoch);

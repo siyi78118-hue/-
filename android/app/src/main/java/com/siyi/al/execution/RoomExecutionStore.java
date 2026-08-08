@@ -21,6 +21,7 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
@@ -131,10 +132,12 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     }
 
     private static void validatePersistedLifecycleControl(LifecycleControlEntity row) {
-        if (row == null || row.controlId == null || row.controlId.trim().isEmpty()
-            || row.controlKind == null || row.characterId == null || row.peerId == null
-            || row.requestedAt <= 0L || row.updatedAt <= 0L || row.leaseAttempt < 0L
-            || row.updatedAt > 9007199254740991L
+            if (row == null || row.controlId == null || row.controlId.trim().isEmpty()
+                || row.controlKind == null || row.characterId == null || row.peerId == null
+                || row.requestedAt <= 0L || row.updatedAt <= 0L || row.leaseAttempt < 0L
+                || row.requestedAt > LifecycleControlSender.MAX_SAFE_INTEGER
+                || row.updatedAt > LifecycleControlSender.MAX_SAFE_INTEGER
+                || row.leaseAttempt > LifecycleControlSender.MAX_SAFE_INTEGER
             || row.semanticJson == null || row.semanticChecksum == null) {
             throw new IllegalStateException("lifecycle control authority conflict");
         }
@@ -172,21 +175,33 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 || (row.appliedAt != null && row.appliedAt < row.requestedAt)) {
                 throw new IllegalStateException("lifecycle timestamp conflict");
             }
+            LifecycleControl persisted = LifecycleControl.fromEntity(row);
+            if (row.relayMessageId != null
+                && !LifecycleControlSender.relayMessageId(persisted).equals(row.relayMessageId)) {
+                throw new IllegalStateException("lifecycle relay identity conflict");
+            }
+            if ((LifecycleControl.PENDING.equals(row.state)
+                    || LifecycleControl.RELAY_ACCEPTED.equals(row.state))
+                && row.leaseId != null
+                && !LifecycleControlSender.leaseId(persisted, row.leaseAttempt).equals(row.leaseId)) {
+                throw new IllegalStateException("lifecycle lease identity conflict");
+            }
             switch (row.state) {
                 case LifecycleControl.WAITING:
-                    if (row.leaseId != null || row.leasedAt != null || row.relayMessageId != null
+                    if (row.leaseAttempt != 0L || row.leaseId != null || row.leasedAt != null || row.relayMessageId != null
                         || row.relayExpiresAt != null || row.appliedAt != null) {
                         throw new IllegalStateException("lifecycle waiting lease conflict");
                     }
                     break;
                 case LifecycleControl.PENDING:
-                    if (row.leaseId == null || row.leasedAt == null || row.relayExpiresAt == null
-                        || row.relayMessageId != null || row.appliedAt != null || row.leaseAttempt <= 0L) {
+                    if (row.leaseId == null || row.leasedAt == null
+                        || (row.relayMessageId == null) != (row.relayExpiresAt == null)
+                        || row.appliedAt != null || row.leaseAttempt <= 0L) {
                         throw new IllegalStateException("lifecycle pending lease conflict");
                     }
                     break;
                 case LifecycleControl.RELAY_ACCEPTED:
-                    if (row.leaseId == null || row.leasedAt == null || row.relayExpiresAt == null
+                    if (row.leaseId != null || row.leasedAt != null || row.relayExpiresAt == null
                         || row.relayMessageId == null || row.appliedAt != null || row.leaseAttempt <= 0L) {
                         throw new IllegalStateException("lifecycle relay lease conflict");
                     }
@@ -194,6 +209,10 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 case LifecycleControl.APPLIED:
                     if (row.appliedAt == null || row.appliedAt <= 0L) {
                         throw new IllegalStateException("lifecycle applied timestamp conflict");
+                    }
+                    if ((row.relayMessageId == null) != (row.relayExpiresAt == null)
+                        || row.leaseId != null || row.leasedAt != null) {
+                        throw new IllegalStateException("lifecycle applied relay conflict");
                     }
                     break;
                 case LifecycleControl.QUARANTINED:
@@ -1848,6 +1867,370 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 && BridgeAuthority.sha256CanonicalJson(wire).equals(receipt.idempotencyKey);
         } catch (Exception error) {
             return false;
+        }
+    }
+
+    @Override
+    public List<LifecycleControl> lifecycleControls() {
+        List<LifecycleControl> result = new java.util.ArrayList<>();
+        for (LifecycleControlEntity row : dao.lifecycleControls()) {
+            validatePersistedLifecycleControl(row);
+            result.add(LifecycleControl.fromEntity(row));
+        }
+        return result;
+    }
+
+    @Override
+    public LifecycleControl lifecycleControl(String controlId) {
+        if (controlId == null || controlId.trim().isEmpty()) return null;
+        LifecycleControlEntity row = dao.lifecycleControl(controlId);
+        if (row == null) return null;
+        validatePersistedLifecycleControl(row);
+        return LifecycleControl.fromEntity(row);
+    }
+
+    @Override
+    public LifecycleControl claimLifecycleControl(long now) {
+        if (now <= 0L || now > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("invalid lifecycle claim time");
+        }
+        AtomicReference<LifecycleControl> claimed = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.nextLifecycleControl(
+                now - LifecycleControlSender.LEASE_MILLIS,
+                now > LifecycleControlSender.MAX_SAFE_INTEGER - LifecycleControlSender.REFRESH_WINDOW_MILLIS
+                    ? LifecycleControlSender.MAX_SAFE_INTEGER
+                    : now + LifecycleControlSender.REFRESH_WINDOW_MILLIS);
+            if (row == null) return;
+            validatePersistedLifecycleControl(row);
+            long nextAttempt = row.leaseAttempt + 1L;
+            if (nextAttempt <= 0L || nextAttempt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+                throw new IllegalStateException("lifecycle lease attempt exhausted");
+            }
+            String nextLeaseId = LifecycleControlSender.leaseId(
+                LifecycleControl.fromEntity(row), nextAttempt);
+            String expectedState = row.state;
+            String nextRelayId = row.relayMessageId;
+            Long nextRelayExpiry = row.relayExpiresAt;
+            int updated = dao.claimLifecycleControlExact(
+                row.controlId, row.semanticChecksum, expectedState,
+                row.leaseId, row.leaseAttempt, row.leasedAt,
+                row.relayMessageId, row.relayExpiresAt,
+                LifecycleControl.PENDING, nextLeaseId, nextAttempt, now,
+                nextRelayId, nextRelayExpiry, now);
+            if (updated == 1) {
+                claimed.set(LifecycleControl.fromEntity(dao.lifecycleControl(row.controlId)));
+            }
+        });
+        return claimed.get();
+    }
+
+    @Override
+    public boolean acceptLifecycleRelay(
+        String controlId,
+        String semanticChecksum,
+        String leaseId,
+        long leaseAttempt,
+        long leasedAt,
+        String relayMessageId,
+        long relayExpiresAt,
+        long now
+    ) {
+        if (controlId == null || semanticChecksum == null || leaseId == null
+            || relayMessageId == null || now <= 0L
+            || now > LifecycleControlSender.MAX_SAFE_INTEGER
+            || !LifecycleControlSender.validRelayExpiry(now, relayExpiresAt)) return false;
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.lifecycleControl(controlId);
+            if (row == null || !semanticChecksum.equals(row.semanticChecksum)) return;
+            validatePersistedLifecycleControl(row);
+            String expectedRelayMessageId = LifecycleControlSender.relayMessageId(
+                LifecycleControl.fromEntity(row));
+            if (!expectedRelayMessageId.equals(relayMessageId)) return;
+            if (LifecycleControl.RELAY_ACCEPTED.equals(row.state)
+                && relayMessageId.equals(row.relayMessageId)
+                && Long.valueOf(relayExpiresAt).equals(row.relayExpiresAt)) {
+                result.set(true);
+                return;
+            }
+            if (!LifecycleControl.PENDING.equals(row.state)
+                || !leaseId.equals(row.leaseId) || row.leaseAttempt != leaseAttempt
+                || row.leasedAt == null || row.leasedAt.longValue() != leasedAt
+                || ((row.relayMessageId == null) != (row.relayExpiresAt == null))) return;
+            result.set(dao.acceptLifecycleRelayExact(
+                controlId, semanticChecksum, leaseId, leaseAttempt, leasedAt,
+                row.relayMessageId, row.relayExpiresAt,
+                relayMessageId, relayExpiresAt, now) == 1);
+        });
+        return result.get();
+    }
+
+    @Override
+    public boolean applyLifecycleControl(
+        String controlId,
+        String semanticChecksum,
+        Long clearEpoch,
+        Long clearedThroughSequence,
+        long appliedAt,
+        long now
+    ) {
+        return applyLifecycleControl(
+            controlId, semanticChecksum, clearEpoch, clearedThroughSequence,
+            appliedAt, now, null);
+    }
+
+    @Override
+    public boolean applyLifecycleControl(
+        String controlId,
+        String semanticChecksum,
+        Long clearEpoch,
+        Long clearedThroughSequence,
+        long appliedAt,
+        long now,
+        String inboundRelayMessageId
+    ) {
+        if (controlId == null || semanticChecksum == null || appliedAt <= 0L
+            || appliedAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || now <= 0L || now > LifecycleControlSender.MAX_SAFE_INTEGER) return false;
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.lifecycleControl(controlId);
+            if (row == null || !semanticChecksum.equals(row.semanticChecksum)) return;
+            validatePersistedLifecycleControl(row);
+            if (LifecycleControl.APPLIED.equals(row.state)) {
+                if (row.appliedAt != null && row.appliedAt.longValue() == appliedAt) {
+                    if (Objects.equals(row.clearEpoch, clearEpoch)
+                        && Objects.equals(row.clearedThroughSequence, clearedThroughSequence)) {
+                        result.set(true);
+                    } else {
+                        result.set(recordAppliedAckConflictInTransaction(
+                            row, semanticChecksum, inboundRelayMessageId, now));
+                    }
+                    return;
+                }
+                result.set(recordAppliedAckConflictInTransaction(
+                    row, semanticChecksum, inboundRelayMessageId, now));
+                return;
+            }
+            if (!Objects.equals(row.clearEpoch, clearEpoch)
+                || !Objects.equals(row.clearedThroughSequence, clearedThroughSequence)) return;
+            boolean lan = row.relayMessageId == null && row.relayExpiresAt == null;
+            boolean cloud = row.state.equals(LifecycleControl.RELAY_ACCEPTED)
+                && row.relayMessageId != null && row.relayExpiresAt != null;
+            if (!(lan || cloud) || (lan && !LifecycleControl.PENDING.equals(row.state))
+                || now <= 0L || now > LifecycleControlSender.MAX_SAFE_INTEGER) return;
+            result.set(dao.applyLifecycleControlExact(
+                controlId, semanticChecksum, row.state, row.leaseId, row.leaseAttempt,
+                row.leasedAt, row.relayMessageId, row.relayExpiresAt,
+                row.relayMessageId, row.relayExpiresAt, appliedAt, now) == 1);
+        });
+        return result.get();
+    }
+
+    @Override
+    public boolean applyLifecycleControl(
+        String controlId,
+        String semanticChecksum,
+        Long clearEpoch,
+        Long clearedThroughSequence,
+        String leaseId,
+        long leaseAttempt,
+        Long leasedAt,
+        long appliedAt,
+        long now
+    ) {
+        if (controlId == null || semanticChecksum == null || leaseId == null
+            || leaseId.trim().isEmpty() || leaseAttempt <= 0L
+            || leaseAttempt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || leasedAt == null || leasedAt <= 0L
+            || leasedAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || appliedAt <= 0L || appliedAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || now <= 0L || now > LifecycleControlSender.MAX_SAFE_INTEGER) return false;
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.lifecycleControl(controlId);
+            if (row == null || !semanticChecksum.equals(row.semanticChecksum)) return;
+            validatePersistedLifecycleControl(row);
+            if (!LifecycleControl.PENDING.equals(row.state)
+                || !leaseId.equals(row.leaseId)
+                || row.leaseAttempt != leaseAttempt
+                || row.leasedAt == null || row.leasedAt.longValue() != leasedAt
+                || row.relayMessageId != null || row.relayExpiresAt != null
+                || !Objects.equals(row.clearEpoch, clearEpoch)
+                || !Objects.equals(row.clearedThroughSequence, clearedThroughSequence)) return;
+            result.set(dao.applyLifecycleControlExact(
+                controlId, semanticChecksum, LifecycleControl.PENDING,
+                leaseId, leaseAttempt, leasedAt, null, null,
+                null, null, appliedAt, now) == 1);
+        });
+        return result.get();
+    }
+
+    @Override
+    public boolean recordLifecycleAppliedAckConflict(
+        String controlId,
+        String expectedControlChecksum,
+        String conflictChecksum,
+        String inboundRelayMessageId,
+        long now
+    ) {
+        if (controlId == null || expectedControlChecksum == null || now <= 0L
+            || now > LifecycleControlSender.MAX_SAFE_INTEGER) return false;
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.lifecycleControl(controlId);
+            if (row == null || !expectedControlChecksum.equals(row.semanticChecksum)) return;
+            validatePersistedLifecycleControl(row);
+            result.set(recordAppliedAckConflictInTransaction(
+                row, conflictChecksum, inboundRelayMessageId, now));
+        });
+        return result.get();
+    }
+
+    private boolean recordAppliedAckConflictInTransaction(
+        LifecycleControlEntity row,
+        String conflictChecksum,
+        String inboundRelayMessageId,
+        long now
+    ) {
+        if (row == null || !LifecycleControl.APPLIED.equals(row.state)) return false;
+        String detail = lifecycleAppliedAckConflictDetail(
+            row.controlId, inboundRelayMessageId, conflictChecksum);
+        if (dao.diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", detail) == 0) {
+            insertDiagnostic(
+                "lifecycle-control", null, "WARN",
+                "LIFECYCLE_CONTROL_QUARANTINED", detail, now);
+        }
+        // The persisted APPLIED proof remains the authority.  The changed inbound
+        // proof is handled as closed and may now be ACKed without re-polling it.
+        return true;
+    }
+
+    @Override
+    public boolean quarantineLifecycleControl(String controlId, String semanticChecksum, long now) {
+        if (controlId == null || semanticChecksum == null || now <= 0L
+            || now > LifecycleControlSender.MAX_SAFE_INTEGER) return false;
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.lifecycleControl(controlId);
+            if (row == null || !semanticChecksum.equals(row.semanticChecksum)) return;
+            validatePersistedLifecycleControl(row);
+            if (LifecycleControl.QUARANTINED.equals(row.state)) {
+                result.set(true);
+                return;
+            }
+            // The legacy three-argument entry point has no lease snapshot and
+            // therefore can only operate on an unleased waiting row.  Pending
+            // rows must use the exact lease overload below; otherwise an old
+            // worker could quarantine a replacement worker's lease.
+            if (!LifecycleControl.WAITING.equals(row.state)
+                || row.leaseAttempt != 0L || row.leaseId != null || row.leasedAt != null
+                || row.relayMessageId != null || row.relayExpiresAt != null) return;
+            result.set(dao.quarantineLifecycleControlExact(
+                controlId, semanticChecksum, row.state, row.leaseId, row.leaseAttempt,
+                row.leasedAt, row.relayMessageId, row.relayExpiresAt, now) == 1);
+        });
+        return result.get();
+    }
+
+    @Override
+    public boolean quarantineLifecycleControl(
+        String controlId,
+        String semanticChecksum,
+        String leaseId,
+        long leaseAttempt,
+        Long leasedAt,
+        long now
+    ) {
+        if (controlId == null || semanticChecksum == null || leaseId == null
+            || leaseId.trim().isEmpty() || leaseAttempt <= 0L
+            || leaseAttempt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || leasedAt == null || leasedAt <= 0L
+            || leasedAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || now <= 0L || now > LifecycleControlSender.MAX_SAFE_INTEGER) return false;
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.lifecycleControl(controlId);
+            if (row == null || !semanticChecksum.equals(row.semanticChecksum)) return;
+            validatePersistedLifecycleControl(row);
+            if (!LifecycleControl.PENDING.equals(row.state)
+                || !leaseId.equals(row.leaseId)
+                || row.leaseAttempt != leaseAttempt
+                || row.leasedAt == null || row.leasedAt.longValue() != leasedAt
+                || row.relayMessageId != null || row.relayExpiresAt != null) return;
+            result.set(dao.quarantineLifecycleControlExact(
+                controlId, semanticChecksum, LifecycleControl.PENDING,
+                leaseId, leaseAttempt, leasedAt, null, null, now) == 1);
+        });
+        return result.get();
+    }
+
+    @Override
+    public boolean quarantineLifecycleRelayAcceptedExact(
+        String controlId, String semanticChecksum,
+        String relayMessageId, long relayExpiresAt, long now
+    ) {
+        return quarantineLifecycleRelayAcceptedExact(
+            controlId, semanticChecksum, relayMessageId, relayExpiresAt,
+            null, null, now);
+    }
+
+    @Override
+    public boolean quarantineLifecycleRelayAcceptedExact(
+        String controlId,
+        String semanticChecksum,
+        String relayMessageId,
+        long relayExpiresAt,
+        String inboundRelayMessageId,
+        String conflictChecksum,
+        long now
+    ) {
+        if (controlId == null || semanticChecksum == null || relayMessageId == null
+            || now <= 0L || now > LifecycleControlSender.MAX_SAFE_INTEGER
+            || relayExpiresAt <= 0L || relayExpiresAt > LifecycleControlSender.MAX_SAFE_INTEGER) return false;
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleControlEntity row = dao.lifecycleControl(controlId);
+            if (row == null || !semanticChecksum.equals(row.semanticChecksum)) return;
+            validatePersistedLifecycleControl(row);
+            String detail = lifecycleAppliedAckConflictDetail(
+                row.controlId, inboundRelayMessageId, conflictChecksum);
+            if (LifecycleControl.QUARANTINED.equals(row.state)) {
+                result.set(dao.diagnosticCountByCodeAndDetail(
+                    "LIFECYCLE_CONTROL_QUARANTINED", detail) == 1);
+                return;
+            }
+            if (!LifecycleControl.RELAY_ACCEPTED.equals(row.state)
+                || !relayMessageId.equals(row.relayMessageId)
+                || row.relayExpiresAt == null || row.relayExpiresAt.longValue() != relayExpiresAt) return;
+            boolean quarantined = dao.quarantineLifecycleRelayAcceptedExact(
+                controlId, semanticChecksum, relayMessageId, relayExpiresAt, now) == 1;
+            if (!quarantined) return;
+            if (dao.diagnosticCountByCodeAndDetail("LIFECYCLE_CONTROL_QUARANTINED", detail) == 0) {
+                insertDiagnostic(
+                    "lifecycle-control", null, "WARN", "LIFECYCLE_CONTROL_QUARANTINED", detail, now);
+            }
+            result.set(true);
+        });
+        return result.get();
+    }
+
+    private static String lifecycleAppliedAckConflictDetail(
+        String controlId, String inboundRelayMessageId, String conflictChecksum
+    ) {
+        try {
+            return BridgeAuthority.canonicalJson(new JSONObject()
+                .put("redacted", true)
+                .put("reason", "applied_ack_conflict")
+                .put("controlId", limit(controlId, 96))
+                .put("inboundRelayMessageId",
+                    inboundRelayMessageId == null ? JSONObject.NULL : limit(inboundRelayMessageId, 96))
+                .put("controlChecksum", LifecycleControlSender.appliedAckConflictChecksum(
+                    conflictChecksum)));
+        } catch (JSONException error) {
+            throw new IllegalStateException("lifecycle ACK diagnostic serialization conflict", error);
         }
     }
 

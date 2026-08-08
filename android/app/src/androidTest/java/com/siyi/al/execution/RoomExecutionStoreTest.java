@@ -18,12 +18,14 @@ import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
+import com.siyi.al.execution.db.LifecycleControlEntity;
 import com.siyi.al.execution.db.ConversationAuthorityEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
+import com.siyi.al.execution.bridge.BridgeClient;
 import com.siyi.al.execution.bridge.FallbackJournal;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
 import java.util.ArrayList;
@@ -33,6 +35,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.UUID;
+import java.lang.reflect.Method;
 import org.json.JSONObject;
 import org.json.JSONArray;
 import org.junit.After;
@@ -169,6 +172,34 @@ public class RoomExecutionStoreTest {
             localTurnId, attempt.attemptId, changedReceipt, 1001L));
         assertEquals(3, store.replyParts(localTurnId).size());
         assertEquals(changes, rowCount("change_events"));
+    }
+
+    @Test
+    public void lifecycleSelectorNeverClaimsRoleDeleteInAnyDurableState() {
+        String[] states = {"waiting", "pending", "relay_accepted"};
+        for (int index = 0; index < states.length; index += 1) {
+            LifecycleControlEntity roleDelete = new LifecycleControlEntity();
+            roleDelete.controlId = "role-delete-selector-" + index;
+            roleDelete.controlKind = LifecycleControl.ROLE_DELETE_KIND;
+            roleDelete.characterId = "yuqi";
+            roleDelete.peerId = "device-1";
+            roleDelete.clearEpoch = null;
+            roleDelete.clearedThroughSequence = null;
+            roleDelete.requestedAt = 100L + index;
+            roleDelete.semanticJson = "{}";
+            roleDelete.semanticChecksum = repeat('b', 64);
+            roleDelete.state = states[index];
+            roleDelete.leaseId = "pending".equals(states[index]) ? "lease" : null;
+            roleDelete.leaseAttempt = "waiting".equals(states[index]) ? 0L : 1L;
+            roleDelete.leasedAt = "pending".equals(states[index]) ? 100L : null;
+            roleDelete.relayMessageId = "relay_accepted".equals(states[index]) ? "relay" : null;
+            roleDelete.relayExpiresAt = "relay_accepted".equals(states[index]) ? 100L : null;
+            roleDelete.appliedAt = null;
+            roleDelete.updatedAt = 100L;
+            database.executionDao().insertLifecycleControl(roleDelete);
+        }
+
+        assertNull(database.executionDao().nextLifecycleControl(1_000L, 1_000L));
     }
 
     @Test
@@ -2856,6 +2887,253 @@ public class RoomExecutionStoreTest {
         assertEquals(oldTombstone, database.executionDao().attempt(
             configured.turn(fixture.localTurnId).activeAttemptId).bridgeAuthorityCheckpointJson);
         assertEquals(0L, rowCount("lifecycle_controls"));
+    }
+
+    @Test
+    public void lifecycleStoreRecomputesRelayIdentityFromPersistedSemanticBeforeAccepting()
+        throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture("task20c-relay-identity", "visible", 430L);
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", cursor), 440L);
+        LifecycleControl claimed = configured.claimLifecycleControl(450L);
+        assertNotNull(claimed);
+        String expectedRelay = LifecycleControlSender.relayMessageId(claimed);
+        String foreignRelay = expectedRelay.substring(0, expectedRelay.length() - 1) + "0";
+        assertNotEquals(expectedRelay, foreignRelay);
+
+        assertTrue(!configured.acceptLifecycleRelay(
+            claimed.controlId, claimed.semanticChecksum, claimed.leaseId,
+            claimed.leaseAttempt, claimed.leasedAt,
+            foreignRelay, 1_000L, 451L));
+        LifecycleControl after = configured.lifecycleControl(control.controlId);
+        assertEquals(LifecycleControl.PENDING, after.state);
+        assertNull(after.relayMessageId);
+        assertNull(after.relayExpiresAt);
+    }
+
+    @Test
+    public void changedAppliedAtIsHandledOnceWithoutDowngradingApplied() throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture("task20c-applied-conflict", "visible", 460L);
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", cursor), 470L);
+        LifecycleControl claimed = configured.claimLifecycleControl(480L);
+        String relay = LifecycleControlSender.relayMessageId(claimed);
+        assertTrue(configured.acceptLifecycleRelay(
+            claimed.controlId, claimed.semanticChecksum, claimed.leaseId,
+            claimed.leaseAttempt, claimed.leasedAt, relay, 1_000L, 481L));
+        assertTrue(configured.applyLifecycleControl(
+            claimed.controlId, claimed.semanticChecksum, claimed.clearEpoch,
+            claimed.clearedThroughSequence, 500L, 501L));
+
+        assertTrue(configured.applyLifecycleControl(
+            claimed.controlId, claimed.semanticChecksum, claimed.clearEpoch,
+            claimed.clearedThroughSequence, 501L, 502L, "inbound-applied-1"));
+        LifecycleControl after = configured.lifecycleControl(claimed.controlId);
+        assertEquals(LifecycleControl.APPLIED, after.state);
+        assertEquals(Long.valueOf(500L), after.appliedAt);
+        String detail = BridgeAuthority.canonicalJson(new JSONObject()
+            .put("redacted", true)
+            .put("reason", "applied_ack_conflict")
+            .put("controlId", claimed.controlId)
+            .put("inboundRelayMessageId", "inbound-applied-1")
+            .put("controlChecksum", claimed.semanticChecksum));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", detail));
+        assertTrue(configured.applyLifecycleControl(
+            claimed.controlId, claimed.semanticChecksum, claimed.clearEpoch,
+            claimed.clearedThroughSequence, 501L, 503L, "inbound-applied-1"));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", detail));
+        assertTrue(configured.applyLifecycleControl(
+            claimed.controlId, claimed.semanticChecksum,
+            claimed.clearEpoch + 1L, claimed.clearedThroughSequence,
+            500L, 504L, "inbound-applied-epoch"));
+        String epochDetail = BridgeAuthority.canonicalJson(new JSONObject()
+            .put("redacted", true)
+            .put("reason", "applied_ack_conflict")
+            .put("controlId", claimed.controlId)
+            .put("inboundRelayMessageId", "inbound-applied-epoch")
+            .put("controlChecksum", claimed.semanticChecksum));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", epochDetail));
+    }
+
+    @Test
+    public void changedAppliedAckChecksumIsHandledOnceWithoutDowngradingApplied()
+        throws Exception {
+        CanonicalFixture fixture = commitCanonicalFixture("task20c-applied-checksum", "visible", 490L);
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", cursor), 500L);
+        LifecycleControl claimed = configured.claimLifecycleControl(510L);
+        String relay = LifecycleControlSender.relayMessageId(claimed);
+        assertTrue(configured.acceptLifecycleRelay(
+            claimed.controlId, claimed.semanticChecksum, claimed.leaseId,
+            claimed.leaseAttempt, claimed.leasedAt, relay, 1_000L, 511L));
+        assertTrue(configured.applyLifecycleControl(
+            claimed.controlId, claimed.semanticChecksum, claimed.clearEpoch,
+            claimed.clearedThroughSequence, 520L, 521L));
+
+        String changedChecksum = repeat('c', 64);
+        assertTrue(configured.recordLifecycleAppliedAckConflict(
+            claimed.controlId, claimed.semanticChecksum, changedChecksum,
+            "inbound-applied-checksum", 522L));
+        LifecycleControl after = configured.lifecycleControl(claimed.controlId);
+        assertEquals(LifecycleControl.APPLIED, after.state);
+        assertEquals(Long.valueOf(520L), after.appliedAt);
+        String detail = BridgeAuthority.canonicalJson(new JSONObject()
+            .put("redacted", true)
+            .put("reason", "applied_ack_conflict")
+            .put("controlId", claimed.controlId)
+            .put("inboundRelayMessageId", "inbound-applied-checksum")
+            .put("controlChecksum", changedChecksum));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", detail));
+        assertTrue(configured.recordLifecycleAppliedAckConflict(
+            claimed.controlId, claimed.semanticChecksum, changedChecksum,
+            "inbound-applied-checksum", 523L));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", detail));
+    }
+
+    @Test
+    public void changedAckOnRelayAcceptedQuarantinesAndHandlesInboundExactlyOnce()
+        throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        LifecycleControl control = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", new ConversationCursorEntity()),
+            600L);
+        LifecycleControl claimed = configured.claimLifecycleControl(610L);
+        String outboundRelay = LifecycleControlSender.relayMessageId(claimed);
+        assertTrue(configured.acceptLifecycleRelay(
+            claimed.controlId, claimed.semanticChecksum, claimed.leaseId,
+            claimed.leaseAttempt, claimed.leasedAt, outboundRelay, 2_000L, 611L));
+
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            database.executionDao(), configured, "device_gateway");
+        Method factory = ExecutionRuntime.class.getDeclaredMethod(
+            "cloudInboxConsumer", RoomBridgeMirror.class, RoomExecutionStore.class);
+        factory.setAccessible(true);
+        BridgeClient.CloudInboxConsumer consumer = (BridgeClient.CloudInboxConsumer) factory.invoke(
+            null, mirror, configured);
+        JSONObject changedType = LifecycleControlSender.encodeAppliedAck(control, 620L)
+            .put("type", "WRONG_ACK_TYPE");
+        String inboundRelay = "inbound-applied-conflict-1";
+        assertTrue(consumer.applyLifecycleControl(
+            changedType.toString(), inboundRelay, 2_100L, 621L));
+        assertEquals(LifecycleControl.QUARANTINED,
+            configured.lifecycleControl(control.controlId).state);
+        String detail = BridgeAuthority.canonicalJson(new JSONObject()
+            .put("redacted", true)
+            .put("reason", "applied_ack_conflict")
+            .put("controlId", control.controlId)
+            .put("inboundRelayMessageId", inboundRelay)
+            .put("controlChecksum", control.semanticChecksum));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", detail));
+        assertTrue(consumer.applyLifecycleControl(
+            changedType.toString(), inboundRelay, 2_100L, 622L));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "LIFECYCLE_CONTROL_QUARANTINED", detail));
+    }
+
+    @Test
+    public void twoFileBackedRoomConnectionsHaveSingleLeaseWinnerAndRejectLateOldLeaseAfterReopen()
+        throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String name = "task20c-dual-room-" + UUID.randomUUID() + ".db";
+        AlExecutionDatabase firstDb = null;
+        AlExecutionDatabase secondDb = null;
+        AlExecutionDatabase reopenedDb = null;
+        try {
+            firstDb = Room.databaseBuilder(context, AlExecutionDatabase.class, name)
+                .allowMainThreadQueries().build();
+            secondDb = Room.databaseBuilder(context, AlExecutionDatabase.class, name)
+                .allowMainThreadQueries().build();
+            RoomExecutionStore first = new RoomExecutionStore(firstDb, "device_gateway");
+            RoomExecutionStore second = new RoomExecutionStore(secondDb, "device_gateway");
+            String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", new ConversationCursorEntity());
+            LifecycleControl created = first.createConversationClear(
+                "yuqi", "device_gateway", cursorChecksum, 900L);
+            LifecycleControl oldLease = first.claimLifecycleControl(1_000L);
+            assertNotNull(oldLease);
+            assertNull(second.claimLifecycleControl(1_000L));
+            assertNull(second.claimLifecycleControl(60_999L));
+            LifecycleControl replacement = second.claimLifecycleControl(61_000L);
+            assertNotNull(replacement);
+            assertEquals(oldLease.controlId, replacement.controlId);
+            assertEquals(oldLease.leaseAttempt + 1L, replacement.leaseAttempt);
+            assertNotEquals(oldLease.leaseId, replacement.leaseId);
+
+            assertTrue(!second.acceptLifecycleRelay(
+                oldLease.controlId, oldLease.semanticChecksum, oldLease.leaseId,
+                oldLease.leaseAttempt, oldLease.leasedAt,
+                LifecycleControlSender.relayMessageId(oldLease), 70_000L, 61_001L));
+            assertTrue(!second.applyLifecycleControl(
+                oldLease.controlId, oldLease.semanticChecksum, oldLease.clearEpoch,
+                oldLease.clearedThroughSequence, oldLease.leaseId, oldLease.leaseAttempt,
+                oldLease.leasedAt, 61_002L, 61_003L));
+            assertTrue(!second.quarantineLifecycleControl(
+                oldLease.controlId, oldLease.semanticChecksum, oldLease.leaseId,
+                oldLease.leaseAttempt, oldLease.leasedAt, 61_004L));
+            assertTrue(!second.quarantineLifecycleControl(
+                oldLease.controlId, oldLease.semanticChecksum, 61_004L));
+
+            firstDb.close();
+            secondDb.close();
+            reopenedDb = Room.databaseBuilder(context, AlExecutionDatabase.class, name)
+                .allowMainThreadQueries().build();
+            RoomExecutionStore reopened = new RoomExecutionStore(reopenedDb, "device_gateway");
+            LifecycleControl afterRestart = reopened.lifecycleControl(created.controlId);
+            assertEquals(LifecycleControl.PENDING, afterRestart.state);
+            assertEquals(replacement.leaseId, afterRestart.leaseId);
+            assertEquals(replacement.leaseAttempt, afterRestart.leaseAttempt);
+            assertEquals(replacement.leasedAt, afterRestart.leasedAt);
+            assertTrue(!reopened.applyLifecycleControl(
+                oldLease.controlId, oldLease.semanticChecksum, oldLease.clearEpoch,
+                oldLease.clearedThroughSequence, oldLease.leaseId, oldLease.leaseAttempt,
+                oldLease.leasedAt, 61_005L, 61_006L));
+            assertEquals(LifecycleControl.PENDING,
+                reopened.lifecycleControl(created.controlId).state);
+
+            String relay = LifecycleControlSender.relayMessageId(replacement);
+            assertTrue(reopened.acceptLifecycleRelay(
+                replacement.controlId, replacement.semanticChecksum, replacement.leaseId,
+                replacement.leaseAttempt, replacement.leasedAt, relay, 70_000L, 61_010L));
+            assertEquals(LifecycleControl.RELAY_ACCEPTED,
+                reopened.lifecycleControl(created.controlId).state);
+            assertTrue(reopened.applyLifecycleControl(
+                replacement.controlId, replacement.semanticChecksum,
+                replacement.clearEpoch, replacement.clearedThroughSequence,
+                61_011L, 61_012L, "inbound-applied-dual-room"));
+            reopenedDb.close();
+            reopenedDb = Room.databaseBuilder(context, AlExecutionDatabase.class, name)
+                .allowMainThreadQueries().build();
+            RoomExecutionStore appliedAgain = new RoomExecutionStore(reopenedDb, "device_gateway");
+            assertEquals(LifecycleControl.APPLIED,
+                appliedAgain.lifecycleControl(created.controlId).state);
+            assertEquals(Long.valueOf(61_011L),
+                appliedAgain.lifecycleControl(created.controlId).appliedAt);
+            assertTrue(appliedAgain.applyLifecycleControl(
+                replacement.controlId, replacement.semanticChecksum,
+                replacement.clearEpoch, replacement.clearedThroughSequence,
+                61_011L, 61_013L, "inbound-applied-dual-room"));
+        } finally {
+            if (firstDb != null && firstDb.isOpen()) firstDb.close();
+            if (secondDb != null && secondDb.isOpen()) secondDb.close();
+            if (reopenedDb != null && reopenedDb.isOpen()) reopenedDb.close();
+            context.deleteDatabase(name);
+        }
     }
 
     @Test

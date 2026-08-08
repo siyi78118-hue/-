@@ -231,6 +231,7 @@ public final class LifecycleControlCodec {
         requireId(value.opt("peerId"), "peerId");
         requireSafeInteger(value.opt("clearEpoch"), "clearEpoch");
         requireSafeInteger(value.opt("clearedThroughSequence"), "clearedThroughSequence");
+        requireSafeInteger(value.opt("requestedAt"), "requestedAt");
         requirePositiveSafe(((Number) value.opt("requestedAt")).longValue(), "requestedAt");
         requireChecksum(value.opt("inputCursorChecksum"), "inputCursorChecksum");
         requireChecksum(value.opt("checksum"), "checksum");
@@ -278,6 +279,7 @@ public final class LifecycleControlCodec {
         if (!(requestedAt instanceof Number) || requestedAt instanceof Float || requestedAt instanceof Double) {
             throw new IllegalArgumentException("invalid requestedAt");
         }
+        requireSafeInteger(requestedAt, "requestedAt");
         requirePositiveSafe(((Number) requestedAt).longValue(), "requestedAt");
         JSONObject receipt = value.optJSONObject("backupReceipt");
         validateBackupReceipt(receipt);

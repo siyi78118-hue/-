@@ -9,6 +9,9 @@ import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
 import com.siyi.al.execution.AuthorityIdentity;
 import com.siyi.al.execution.BridgeAuthority;
+import com.siyi.al.execution.LifecycleControl;
+import com.siyi.al.execution.LifecycleControlCodec;
+import com.siyi.al.execution.LifecycleControlSender;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
@@ -39,6 +42,272 @@ public class BridgeClientTest {
         method.setAccessible(true);
         JSONObject envelope = (JSONObject) method.invoke(new BridgeClient(BridgeConfig.disabled()), submission);
         assertEquals("你好 我是姜隽侑", envelope.getJSONObject("message").getString("content"));
+    }
+
+    @Test public void lifecycleLanRouteUsesOnlyTheIndependentConversationClearEndpoint() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport, () -> 1784400000000L,
+            millis -> {}, null
+        );
+        LifecycleControl clear = clearControl(LifecycleControl.WAITING, null, null, null, null);
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            LifecycleControlSender.encodeAppliedAck(clear, 1784400000100L).toString()));
+
+        LifecycleControlSender.ControlDelivery delivery = client.lifecycleControlRoute(false)
+            .send(clear, "relay-ignored", "idem-ignored", 1784400000000L + 86_400_000L);
+
+        assertTrue(delivery.applied);
+        assertEquals(1, transport.targets.size());
+        assertEquals("http://lan.example/v3/controls/conversation-clear", transport.targets.get(0));
+        assertFalse(transport.bodies.get(0).contains("turnId"));
+        assertFalse(transport.bodies.get(0).contains("reply_json"));
+    }
+
+    @Test public void lifecycleLanRouteRejectsA200WithoutTheAppliedProof() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        BridgeClient client = new BridgeClient(
+            config("http://lan.example"), null, transport, () -> 1784400000000L,
+            millis -> {}, null
+        );
+        LifecycleControl clear = clearControl(LifecycleControl.WAITING, null, null, null, null);
+        assertThrows(IllegalArgumentException.class, () -> client.lifecycleControlRoute(false)
+            .send(clear, "relay-inbound", "idem", 1784400000000L + 86_400_000L));
+    }
+
+    @Test public void lifecycleCloudRefreshUsesRefreshExpiryWithoutReencryptingOrEnqueueing() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            "{\"ok\":true,\"messageId\":\""
+                + LifecycleControlSender.relayMessageId(clearControl(LifecycleControl.WAITING, null, null, null, null))
+                + "\",\"expiresAt\":1784486400000,\"idempotent\":true}"));
+        BridgeClient client = new BridgeClient(
+            cloudConfig(), null, transport, () -> 1784400000000L,
+            millis -> {}, null
+        );
+        LifecycleControl accepted = clearControl(
+            LifecycleControl.RELAY_ACCEPTED,
+            "lease-1", 1784400000000L - 10_000L,
+            LifecycleControlSender.relayMessageId(clearControl(LifecycleControl.WAITING, null, null, null, null)),
+            1784400000000L + 1_000L
+        );
+
+        LifecycleControlSender.ControlDelivery delivery = client.lifecycleControlRoute(true)
+            .send(accepted, accepted.relayMessageId, LifecycleControlSender.idempotencyKey(accepted),
+                1784400000000L + 86_400_000L);
+
+        assertFalse(delivery.applied);
+        assertEquals(1, transport.targets.size());
+        assertTrue(transport.targets.get(0).endsWith("/bridge/refresh-expiry"));
+        assertFalse(transport.bodies.get(0).contains("ciphertext"));
+        assertFalse(transport.bodies.get(0).contains("nonce"));
+    }
+
+    @Test public void lifecycleCloudRefreshRejectsForeignMessageOrFalseOk() throws Exception {
+        LifecycleControl accepted = clearControl(
+            LifecycleControl.RELAY_ACCEPTED, "lease-1", 1784400000000L - 10_000L,
+            LifecycleControlSender.relayMessageId(clearControl(LifecycleControl.WAITING, null, null, null, null)),
+            1784486400000L);
+        for (String body : new String[] {
+            "{\"ok\":false,\"messageId\":\"" + accepted.relayMessageId
+                + "\",\"expiresAt\":1784486400001,\"idempotent\":false}",
+            "{\"ok\":true,\"messageId\":\"foreign\",\"expiresAt\":1784486400001,\"idempotent\":true}",
+            "{\"ok\":true,\"messageId\":\"" + accepted.relayMessageId
+                + "\",\"expiresAt\":\"1784486400001\",\"idempotent\":true}"
+        }) {
+            FakeTransport transport = new FakeTransport();
+            transport.responses.add(new BridgeClient.HttpResult(200, body));
+            BridgeClient client = lifecycleCloudClient(transport);
+            assertThrows(IllegalArgumentException.class, () -> client.lifecycleControlRoute(true)
+                .send(accepted, accepted.relayMessageId,
+                    LifecycleControlSender.idempotencyKey(accepted),
+                    1784400000000L + 86_400_000L));
+        }
+    }
+
+    @Test public void lifecycleCloudRefreshExactReplayMayReturnPersistedExpiryAtSameMillisecond()
+        throws Exception {
+        LifecycleControl accepted = clearControl(
+            LifecycleControl.RELAY_ACCEPTED, "lease-1", 1784400000000L - 10_000L,
+            LifecycleControlSender.relayMessageId(clearControl(
+                LifecycleControl.WAITING, null, null, null, null)),
+            1784486400000L);
+        String messageId = accepted.relayMessageId;
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            "{\"ok\":true,\"messageId\":\"" + messageId
+                + "\",\"expiresAt\":1784486400000,\"idempotent\":true}"));
+        BridgeClient client = lifecycleCloudClient(transport);
+
+        LifecycleControlSender.ControlDelivery delivery = client.lifecycleControlRoute(true).send(
+            accepted, messageId, LifecycleControlSender.idempotencyKey(accepted),
+            1784486400001L);
+
+        assertFalse(delivery.applied);
+        assertEquals(1784486400000L, delivery.relayExpiresAt);
+        assertEquals(1, transport.targets.size());
+    }
+
+    @Test public void lifecycleCloudInitialRequiresStableAcceptedResponse() throws Exception {
+        LifecycleControl clear = clearControl(LifecycleControl.WAITING, null, null, null, null);
+        for (String body : new String[] {
+            "{\"ok\":false,\"messageId\":\"" + LifecycleControlSender.relayMessageId(clear) + "\",\"idempotent\":true}",
+            "{\"ok\":true,\"messageId\":\"foreign\",\"idempotent\":true}",
+            "{\"ok\":true,\"messageId\":\"" + LifecycleControlSender.relayMessageId(clear) + "\",\"idempotent\":\"true\"}"
+        }) {
+            FakeTransport transport = new FakeTransport();
+            transport.responses.add(new BridgeClient.HttpResult(200, body));
+            BridgeClient client = lifecycleCloudClient(transport);
+            assertThrows(IllegalArgumentException.class, () -> client.lifecycleControlRoute(true)
+                .send(clear, LifecycleControlSender.relayMessageId(clear),
+                    LifecycleControlSender.idempotencyKey(clear),
+                    1784400000000L + 86_400_000L));
+        }
+    }
+
+    @Test public void lifecycleInitialEnqueueUsesDeterministicCiphertextAndNonce() throws Exception {
+        LifecycleControl clear = clearControl(LifecycleControl.WAITING, null, null, null, null);
+        String messageId = LifecycleControlSender.relayMessageId(clear);
+        String response = "{\"ok\":true,\"messageId\":\"" + messageId
+            + "\",\"idempotent\":false}";
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200, response));
+        transport.responses.add(new BridgeClient.HttpResult(200, response));
+        BridgeClient client = lifecycleCloudClient(transport);
+        client.lifecycleControlRoute(true).send(
+            clear, messageId, LifecycleControlSender.idempotencyKey(clear),
+            1784400000000L + 86_400_000L);
+        client.lifecycleControlRoute(true).send(
+            clear, messageId, LifecycleControlSender.idempotencyKey(clear),
+            1784400000000L + 86_400_000L);
+        JSONObject first = new JSONObject(transport.bodies.get(0));
+        JSONObject second = new JSONObject(transport.bodies.get(1));
+        assertEquals(first.getString("ciphertext"), second.getString("ciphertext"));
+        assertEquals(first.getString("nonce"), second.getString("nonce"));
+    }
+
+    @Test public void idempotentInitialEnqueueRefreshesAndUsesServerExpiry() throws Exception {
+        LifecycleControl clear = clearControl(LifecycleControl.WAITING, null, null, null, null);
+        String messageId = LifecycleControlSender.relayMessageId(clear);
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            "{\"ok\":true,\"messageId\":\"" + messageId + "\",\"idempotent\":true}"));
+        transport.responses.add(new BridgeClient.HttpResult(200,
+            "{\"ok\":true,\"messageId\":\"" + messageId
+                + "\",\"expiresAt\":1784572800000,\"idempotent\":true}"));
+        BridgeClient client = lifecycleCloudClient(transport);
+        LifecycleControlSender.ControlDelivery delivery = client.lifecycleControlRoute(true).send(
+            clear, messageId, LifecycleControlSender.idempotencyKey(clear),
+            1784400000000L + 86_400_000L);
+        assertEquals(1784572800000L, delivery.relayExpiresAt);
+        assertEquals(2, transport.targets.size());
+        assertTrue(transport.targets.get(1).endsWith("/bridge/refresh-expiry"));
+    }
+
+    @Test public void cloudAppliedAckValidatesInnerEightFieldsBeforeRelayAck() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        List<String> appliedBodies = new ArrayList<>();
+        BridgeClient.CloudInboxConsumer consumer = new BridgeClient.CloudInboxConsumer() {
+            @Override public boolean persist(String raw) { return false; }
+            @Override public boolean applyLifecycleControl(
+                String raw, String relayMessageId, Long relayExpiresAt, long now
+            ) {
+                appliedBodies.add(raw);
+                assertEquals("inbound-applied-relay", relayMessageId);
+                return true;
+            }
+        };
+        BridgeClient client = new BridgeClient(
+            cloudConfig(), null, transport, () -> 1784400000000L,
+            millis -> {}, null, consumer
+        );
+        LifecycleControl clear = clearControl(LifecycleControl.RELAY_ACCEPTED,
+            "lease-1", 1784399990000L,
+            LifecycleControlSender.relayMessageId(clearControl(LifecycleControl.WAITING, null, null, null, null)),
+            1784486400000L);
+        JSONObject wrapper = LifecycleControlSender.encodeAppliedAck(clear, 1784400000100L);
+
+        assertTrue(client.processDecodedCloudInboxItem(
+            new JSONObject().put("messageId", "inbound-applied-relay").put("expiresAt", clear.relayExpiresAt),
+            wrapper));
+        assertEquals(1, appliedBodies.size());
+        assertEquals(10, new JSONObject(appliedBodies.get(0)).length());
+        assertEquals("ack", transport.targets.get(0).endsWith("/bridge/ack") ? "ack" : "wrong");
+    }
+
+    @Test public void ackExclusiveControlChecksumRoutesChangedTypeToLifecycleConsumer() throws Exception {
+        FakeTransport transport = new FakeTransport();
+        transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+        int[] applyCalls = {0};
+        BridgeClient.CloudInboxConsumer consumer = new BridgeClient.CloudInboxConsumer() {
+            @Override public boolean persist(String raw) {
+                throw new AssertionError("changed lifecycle ACK must not enter generic persist");
+            }
+            @Override public boolean applyLifecycleControl(
+                String raw, String relayMessageId, Long relayExpiresAt, long now
+            ) {
+                applyCalls[0] += 1;
+                return false; // known conflict is never ACKed
+            }
+        };
+        BridgeClient client = new BridgeClient(
+            cloudConfig(), null, transport, () -> 1784400000000L,
+            millis -> {}, null, consumer
+        );
+        LifecycleControl clear = clearControl(LifecycleControl.RELAY_ACCEPTED,
+            "lease-1", 1784399990000L,
+            LifecycleControlSender.relayMessageId(clearControl(LifecycleControl.WAITING, null, null, null, null)),
+            1784486400000L);
+        JSONObject changed = LifecycleControlSender.encodeAppliedAck(clear, 1784400000100L)
+            .put("type", "WRONG_TYPE");
+        assertFalse(client.processDecodedCloudInboxItem(
+            new JSONObject().put("messageId", "inbound-changed")
+                .put("expiresAt", clear.relayExpiresAt), changed));
+        assertEquals(1, applyCalls[0]);
+        assertTrue(transport.targets.isEmpty());
+    }
+
+    @Test public void lifecycleExclusiveFieldsCannotFallIntoGenericV3PersistWhenMarkersAreRemoved()
+        throws Exception {
+        LifecycleControl clear = clearControl(LifecycleControl.RELAY_ACCEPTED,
+            "lease-1", 1784399990000L,
+            LifecycleControlSender.relayMessageId(clearControl(LifecycleControl.WAITING, null, null, null, null)),
+            1784486400000L);
+        JSONObject valid = LifecycleControlSender.encodeAppliedAck(clear, 1784400000100L);
+        JSONObject removedMarkers = new JSONObject(valid.toString());
+        removedMarkers.remove("type");
+        removedMarkers.remove("controlChecksum");
+        JSONObject forgedType = new JSONObject(valid.toString()).put(
+            "type", "NOT_CONVERSATION_CLEAR_APPLIED");
+        forgedType.remove("controlChecksum");
+        for (JSONObject malformed : new JSONObject[] {removedMarkers, forgedType}) {
+            FakeTransport transport = new FakeTransport();
+            transport.responses.add(new BridgeClient.HttpResult(200, "{}"));
+            int[] applyCalls = {0};
+            BridgeClient.CloudInboxConsumer consumer = new BridgeClient.CloudInboxConsumer() {
+                @Override public boolean persist(String raw) {
+                    throw new AssertionError("lifecycle-exclusive fields must not enter generic persist");
+                }
+                @Override public boolean applyLifecycleControl(
+                    String raw, String relayMessageId, Long relayExpiresAt, long now
+                ) {
+                    applyCalls[0] += 1;
+                    return false;
+                }
+            };
+            BridgeClient client = new BridgeClient(
+                cloudConfig(), null, transport, () -> 1784400000000L,
+                millis -> {}, null, consumer
+            );
+
+            assertFalse(client.processDecodedCloudInboxItem(
+                new JSONObject().put("messageId", "inbound-malformed-lifecycle")
+                    .put("expiresAt", clear.relayExpiresAt), malformed));
+            assertEquals(1, applyCalls[0]);
+            assertTrue(transport.targets.isEmpty());
+        }
     }
 
     @Test public void legacyPaymentMessageIdGetsACanonicalWirePrefix() throws Exception {
@@ -935,9 +1204,47 @@ public class BridgeClientTest {
         );
     }
 
+    private static BridgeConfig cloudConfig() {
+        return new BridgeConfig(
+            true, BridgeMode.CLOUD, "http://lan.example", "https://relay.example", "device_123456",
+            "pairing-secret-123", "device-token-123456", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            500, 2_000, 60, 100, 1_200_000
+        );
+    }
+
+    private static LifecycleControl clearControl(
+        String state, String leaseId, Long leasedAt, String relayMessageId, Long relayExpiresAt
+    ) throws Exception {
+        long requestedAt = 1_784_400_000_000L;
+        String cursorChecksum = repeat('e', 64);
+        LifecycleControlCodec.Encoded encoded = LifecycleControlCodec.encodeConversationClear(
+            "yuqi", "device_123456", 1L, 7L, requestedAt, cursorChecksum);
+        return new LifecycleControl(
+            encoded.controlId, LifecycleControl.CLEAR_KIND, "yuqi", "device_123456",
+            1L, 7L, requestedAt, encoded.semantic.toString(), encoded.semanticChecksum,
+            state, leaseId, leaseId == null ? 0L : 1L, leasedAt, relayMessageId, null,
+            relayExpiresAt, requestedAt
+        );
+    }
+
     private static BridgeClient receiptClient(FakeTransport transport, MutableTime time) {
         return new BridgeClient(
             config("http://lan.example"), null, transport, time, millis -> {}, null, null,
+            new BridgeClient.Base64Codec() {
+                @Override public byte[] decode(String value) {
+                    return Base64.getDecoder().decode(value);
+                }
+
+                @Override public String encode(byte[] value) {
+                    return Base64.getEncoder().encodeToString(value);
+                }
+            });
+    }
+
+    private static BridgeClient lifecycleCloudClient(FakeTransport transport) {
+        return new BridgeClient(
+            cloudConfig(), null, transport, () -> 1784400000000L,
+            millis -> {}, null, null,
             new BridgeClient.Base64Codec() {
                 @Override public byte[] decode(String value) {
                     return Base64.getDecoder().decode(value);

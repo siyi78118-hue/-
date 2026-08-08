@@ -132,6 +132,28 @@ public final class AlExecutionService extends Service {
             try {
                 boolean continueDraining;
                 do {
+                    try {
+                        while (ExecutionRuntime.drainLifecycleControl(this)) {
+                            // Controls are an independent outbox; do not route them through turn execution.
+                        }
+                    } catch (Exception controlError) {
+                        executionStore.recordDiagnostic(
+                            "lifecycle-control", null, "WARN", "LIFECYCLE_CONTROL_RETRY",
+                            controlError.getMessage() == null ? "control delivery failed" : controlError.getMessage(),
+                            System.currentTimeMillis());
+                    } finally {
+                        try {
+                            long lifecycleDelay = ExecutionRuntime.nextLifecycleDelay(this);
+                            if (lifecycleDelay >= 0L) {
+                                AlExecutionWakeWorker.enqueueLifecycle(this, lifecycleDelay);
+                            }
+                        } catch (RuntimeException scheduleError) {
+                            executionStore.recordDiagnostic(
+                                "lifecycle-control", null, "WARN", "LIFECYCLE_CONTROL_WAKE_RETRY",
+                                scheduleError.getMessage() == null ? "control wake scheduling failed" : scheduleError.getMessage(),
+                                System.currentTimeMillis());
+                        }
+                    }
                     executionStore.recoverDueRetries(System.currentTimeMillis());
                     engine.recoverInterruptedWork();
                     while (!Thread.currentThread().isInterrupted() && engine.runNext()) {

@@ -31,6 +31,87 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM lifecycle_controls ORDER BY controlId ASC")
     List<LifecycleControlEntity> lifecycleControls();
 
+    @Query("SELECT * FROM lifecycle_controls WHERE controlKind = 'conversation_clear_v1' AND ("
+        + "state = 'waiting' "
+        + "OR (state = 'pending' AND leasedAt IS NOT NULL AND leasedAt <= :leaseCutoff) "
+        + "OR (state = 'relay_accepted' AND relayExpiresAt IS NOT NULL AND relayExpiresAt <= :refreshCutoff)) "
+        + "ORDER BY requestedAt ASC, controlId ASC LIMIT 1")
+    LifecycleControlEntity nextLifecycleControl(long leaseCutoff, long refreshCutoff);
+
+    @Query("UPDATE lifecycle_controls SET state = :nextState, leaseId = :nextLeaseId, "
+        + "leaseAttempt = :nextLeaseAttempt, leasedAt = :nextLeasedAt, "
+        + "relayMessageId = :nextRelayMessageId, relayExpiresAt = :nextRelayExpiresAt, "
+        + "appliedAt = NULL, updatedAt = :updatedAt "
+        + "WHERE controlId = :controlId AND semanticChecksum = :semanticChecksum "
+        + "AND state = :expectedState AND leaseAttempt = :expectedLeaseAttempt "
+        + "AND ((leaseId IS NULL AND :expectedLeaseId IS NULL) OR leaseId = :expectedLeaseId) "
+        + "AND ((leasedAt IS NULL AND :expectedLeasedAt IS NULL) OR leasedAt = :expectedLeasedAt) "
+        + "AND ((relayMessageId IS NULL AND :expectedRelayMessageId IS NULL) OR relayMessageId = :expectedRelayMessageId) "
+        + "AND ((relayExpiresAt IS NULL AND :expectedRelayExpiresAt IS NULL) OR relayExpiresAt = :expectedRelayExpiresAt) "
+        + "AND appliedAt IS NULL")
+    int claimLifecycleControlExact(
+        String controlId, String semanticChecksum, String expectedState,
+        String expectedLeaseId, long expectedLeaseAttempt, Long expectedLeasedAt,
+        String expectedRelayMessageId, Long expectedRelayExpiresAt,
+        String nextState, String nextLeaseId, long nextLeaseAttempt, Long nextLeasedAt,
+        String nextRelayMessageId, Long nextRelayExpiresAt, long updatedAt
+    );
+
+    @Query("UPDATE lifecycle_controls SET state = 'relay_accepted', leaseId = NULL, leasedAt = NULL, "
+        + "relayMessageId = :relayMessageId, relayExpiresAt = :relayExpiresAt, appliedAt = NULL, updatedAt = :updatedAt "
+        + "WHERE controlId = :controlId AND semanticChecksum = :semanticChecksum AND state = 'pending' "
+        + "AND leaseId = :leaseId AND leaseAttempt = :leaseAttempt AND leasedAt = :leasedAt "
+        + "AND ((relayMessageId IS NULL AND :expectedRelayMessageId IS NULL) OR relayMessageId = :expectedRelayMessageId) "
+        + "AND ((relayExpiresAt IS NULL AND :expectedRelayExpiresAt IS NULL) OR relayExpiresAt = :expectedRelayExpiresAt) "
+        + "AND appliedAt IS NULL")
+    int acceptLifecycleRelayExact(
+        String controlId, String semanticChecksum, String leaseId, long leaseAttempt, long leasedAt,
+        String expectedRelayMessageId, Long expectedRelayExpiresAt,
+        String relayMessageId, long relayExpiresAt, long updatedAt
+    );
+
+    @Query("UPDATE lifecycle_controls SET state = 'applied', leaseId = NULL, leasedAt = NULL, "
+        + "relayMessageId = :nextRelayMessageId, relayExpiresAt = :nextRelayExpiresAt, appliedAt = :appliedAt, updatedAt = :updatedAt "
+        + "WHERE controlId = :controlId AND semanticChecksum = :semanticChecksum AND state = :expectedState "
+        + "AND ((leaseId IS NULL AND :expectedLeaseId IS NULL) OR leaseId = :expectedLeaseId) "
+        + "AND leaseAttempt = :expectedLeaseAttempt "
+        + "AND ((leasedAt IS NULL AND :expectedLeasedAt IS NULL) OR leasedAt = :expectedLeasedAt) "
+        + "AND ((relayMessageId IS NULL AND :expectedRelayMessageId IS NULL) OR relayMessageId = :expectedRelayMessageId) "
+        + "AND ((relayExpiresAt IS NULL AND :expectedRelayExpiresAt IS NULL) OR relayExpiresAt = :expectedRelayExpiresAt) "
+        + "AND appliedAt IS NULL")
+    int applyLifecycleControlExact(
+        String controlId, String semanticChecksum, String expectedState,
+        String expectedLeaseId, long expectedLeaseAttempt, Long expectedLeasedAt,
+        String expectedRelayMessageId, Long expectedRelayExpiresAt,
+        String nextRelayMessageId, Long nextRelayExpiresAt, long appliedAt, long updatedAt
+    );
+
+    @Query("UPDATE lifecycle_controls SET state = 'quarantined', leaseId = NULL, leasedAt = NULL, "
+        + "relayMessageId = NULL, relayExpiresAt = NULL, appliedAt = NULL, updatedAt = :updatedAt "
+        + "WHERE controlId = :controlId AND semanticChecksum = :semanticChecksum AND state = :expectedState "
+        + "AND ((leaseId IS NULL AND :expectedLeaseId IS NULL) OR leaseId = :expectedLeaseId) "
+        + "AND leaseAttempt = :expectedLeaseAttempt "
+        + "AND ((leasedAt IS NULL AND :expectedLeasedAt IS NULL) OR leasedAt = :expectedLeasedAt) "
+        + "AND ((relayMessageId IS NULL AND :expectedRelayMessageId IS NULL) OR relayMessageId = :expectedRelayMessageId) "
+        + "AND ((relayExpiresAt IS NULL AND :expectedRelayExpiresAt IS NULL) OR relayExpiresAt = :expectedRelayExpiresAt) "
+        + "AND appliedAt IS NULL")
+    int quarantineLifecycleControlExact(
+        String controlId, String semanticChecksum, String expectedState,
+        String expectedLeaseId, long expectedLeaseAttempt, Long expectedLeasedAt,
+        String expectedRelayMessageId, Long expectedRelayExpiresAt, long updatedAt
+    );
+
+    @Query("UPDATE lifecycle_controls SET state = 'quarantined', leaseId = NULL, leasedAt = NULL, "
+        + "relayMessageId = NULL, relayExpiresAt = NULL, appliedAt = NULL, updatedAt = :updatedAt "
+        + "WHERE controlId = :controlId AND semanticChecksum = :semanticChecksum "
+        + "AND controlKind = 'conversation_clear_v1' AND state = 'relay_accepted' "
+        + "AND leaseId IS NULL AND leasedAt IS NULL AND relayMessageId = :expectedRelayMessageId "
+        + "AND relayExpiresAt = :expectedRelayExpiresAt AND appliedAt IS NULL")
+    int quarantineLifecycleRelayAcceptedExact(
+        String controlId, String semanticChecksum,
+        String expectedRelayMessageId, long expectedRelayExpiresAt, long updatedAt
+    );
+
     @Query("UPDATE lifecycle_controls SET state = :nextState, leaseId = :leaseId, leaseAttempt = :leaseAttempt, leasedAt = :leasedAt, relayMessageId = :relayMessageId, relayExpiresAt = :relayExpiresAt, appliedAt = :appliedAt, updatedAt = :updatedAt WHERE controlId = :controlId AND state = :expectedState")
     int compareAndSetLifecycleControl(
         String controlId, String expectedState, String nextState, String leaseId,

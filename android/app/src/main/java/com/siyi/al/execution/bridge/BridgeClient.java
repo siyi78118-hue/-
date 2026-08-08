@@ -3,6 +3,9 @@ package com.siyi.al.execution.bridge;
 import android.util.Base64;
 import com.siyi.al.execution.AuthorityIdentity;
 import com.siyi.al.execution.BridgeAuthority;
+import com.siyi.al.execution.LifecycleControl;
+import com.siyi.al.execution.LifecycleControlCodec;
+import com.siyi.al.execution.LifecycleControlSender;
 import com.siyi.al.execution.TurnSubmission;
 import java.io.BufferedReader;
 import java.io.InputStream;
@@ -38,6 +41,9 @@ public final class BridgeClient {
     public interface CloudInboxConsumer {
         boolean persist(String raw) throws Exception;
         default void recordRejected(String relayMessageId, String reason, long now) throws Exception {}
+        default boolean applyLifecycleControl(
+            String raw, String relayMessageId, Long relayExpiresAt, long now
+        ) throws Exception { return false; }
     }
 
     interface Transport {
@@ -71,6 +77,10 @@ public final class BridgeClient {
         "protocolVersion", "type", "peerId", "turnId", "authorityLineageKey",
         "visibleGroupId", "commitChecksum", "terminalDisposition", "deliveredAt",
         "_checkpointChecksum", "_deliveryRoute", "_relayMessageId"));
+    private static final Set<String> LIFECYCLE_ACCEPTED_RESPONSE_KEYS = new HashSet<>(Arrays.asList(
+        "ok", "messageId", "expiresAt", "idempotent"));
+    private static final Set<String> LIFECYCLE_ENQUEUE_RESPONSE_KEYS = new HashSet<>(Arrays.asList(
+        "ok", "messageId", "idempotent"));
     private final BridgeConfig config;
     private final FallbackJournal journal;
     private final Transport transport;
@@ -205,6 +215,147 @@ public final class BridgeClient {
         throw new IllegalStateException("unreachable");
     }
 
+    /** Independent control route; it never uses a turn endpoint or TurnSubmission. */
+    public LifecycleControlSender.ControlRoute lifecycleControlRoute(boolean cloud) {
+        return (control, relayMessageId, idempotencyKey, expiresAt) ->
+            sendConversationClear(control, cloud, relayMessageId, idempotencyKey, expiresAt);
+    }
+
+    private LifecycleControlSender.ControlDelivery sendConversationClear(
+        LifecycleControl control,
+        boolean cloud,
+        String relayMessageId,
+        String idempotencyKey,
+        long expiresAt
+    ) throws Exception {
+        if (control == null || !LifecycleControl.CLEAR_KIND.equals(control.controlKind)) {
+            throw new IllegalArgumentException("unsupported lifecycle control kind");
+        }
+        LifecycleControlCodec.validateSemantic(new JSONObject(control.semanticJson));
+        if (!config.enabled) throw new BridgeFinalException("BRIDGE_NOT_CONFIGURED", false);
+        if (!cloud) {
+            if (!config.hasLan()) throw new BridgeFinalException("LAN_BRIDGE_NOT_CONFIGURED", false);
+            HttpResult response = signedLan(
+                "POST", "/v3/controls/conversation-clear", control.semanticJson);
+            requireSuccess(response, "LAN conversation clear");
+            JSONObject applied = new JSONObject(response.body == null ? "{}" : response.body);
+            LifecycleControlSender.validateAppliedAck(applied, control);
+            return new LifecycleControlSender.ControlDelivery(
+                true, null, 0L, applied.getLong("appliedAt"));
+        }
+        long capturedNow = clock.now();
+        if (!config.hasCloud() || relayMessageId == null || idempotencyKey == null
+            || !LifecycleControlSender.validRelayExpiry(capturedNow, expiresAt)) {
+            throw new BridgeFinalException("CLOUD_BRIDGE_NOT_CONFIGURED", false);
+        }
+        if (control.relayMessageId != null) {
+            if (!relayMessageId.equals(control.relayMessageId)
+                || control.relayExpiresAt == null || expiresAt <= control.relayExpiresAt) {
+                throw new IllegalArgumentException("lifecycle relay refresh identity conflict");
+            }
+            JSONObject refresh = new JSONObject()
+                .put("deviceId", config.deviceId)
+                .put("messageId", relayMessageId)
+                .put("idempotencyKey", idempotencyKey)
+                .put("direction", "phone_to_pc")
+                .put("expiresAt", expiresAt);
+            long persistedExpiry = refreshLifecycleExpiry(
+                refresh, relayMessageId, capturedNow, control.relayExpiresAt);
+            return new LifecycleControlSender.ControlDelivery(false, relayMessageId, persistedExpiry);
+        }
+        Encrypted encrypted = encryptLifecycle(control.semanticJson, relayMessageId);
+        JSONObject enqueue = new JSONObject()
+            .put("deviceId", config.deviceId)
+            .put("messageId", relayMessageId)
+            .put("idempotencyKey", idempotencyKey)
+            .put("direction", "phone_to_pc")
+            .put("ciphertext", encrypted.ciphertext)
+            .put("nonce", encrypted.nonce)
+            .put("expiresAt", expiresAt);
+        HttpResult response = request(
+            "POST", config.cloudUrl + "/bridge/enqueue", enqueue.toString(), bearerHeaders());
+        requireSuccess(response, "cloud conversation clear");
+        boolean idempotent = validateLifecycleEnqueueResponse(response.body, relayMessageId);
+        if (idempotent) {
+            long refreshTarget = capturedNow > LifecycleControlSender.MAX_SAFE_INTEGER
+                - LifecycleControlSender.MAX_RELAY_LIFETIME_MILLIS
+                ? LifecycleControlSender.MAX_SAFE_INTEGER
+                : capturedNow + LifecycleControlSender.MAX_RELAY_LIFETIME_MILLIS;
+            JSONObject refresh = new JSONObject()
+                .put("deviceId", config.deviceId)
+                .put("messageId", relayMessageId)
+                .put("idempotencyKey", idempotencyKey)
+                .put("direction", "phone_to_pc")
+                .put("expiresAt", refreshTarget);
+            long persistedExpiry = refreshLifecycleExpiry(
+                refresh, relayMessageId, capturedNow, expiresAt);
+            return new LifecycleControlSender.ControlDelivery(false, relayMessageId, persistedExpiry);
+        }
+        return new LifecycleControlSender.ControlDelivery(false, relayMessageId, expiresAt);
+    }
+
+    private long refreshLifecycleExpiry(
+        JSONObject refresh, String relayMessageId, long now, Long oldExpiry
+    ) throws Exception {
+        Object requested = refresh.opt("expiresAt");
+        if (!(requested instanceof Number) || requested instanceof Float || requested instanceof Double) {
+            throw new IllegalArgumentException("cloud lifecycle refresh request conflict");
+        }
+        long requestedExpiry = ((Number) requested).longValue();
+        if (!LifecycleControlSender.validRelayExpiry(now, requestedExpiry)
+            || (oldExpiry != null && requestedExpiry <= oldExpiry)) {
+            throw new IllegalArgumentException("cloud lifecycle refresh request conflict");
+        }
+        HttpResult response = request(
+            "POST", config.cloudUrl + "/bridge/refresh-expiry", refresh.toString(), bearerHeaders());
+        requireSuccess(response, "cloud conversation clear expiry refresh");
+        long persistedExpiry = validateLifecycleAcceptedResponse(
+            response.body, relayMessageId, now, oldExpiry);
+        if (persistedExpiry > requestedExpiry) {
+            throw new IllegalArgumentException("cloud relay refresh expiry conflict");
+        }
+        return persistedExpiry;
+    }
+
+    private static boolean validateLifecycleEnqueueResponse(
+        String raw, String expectedMessageId
+    ) throws Exception {
+        JSONObject body = new JSONObject(raw == null ? "{}" : raw);
+        if (!LIFECYCLE_ENQUEUE_RESPONSE_KEYS.equals(keysOf(body))
+            || !(body.opt("ok") instanceof Boolean) || !body.getBoolean("ok")
+            || !(body.opt("messageId") instanceof String)
+            || !expectedMessageId.equals(body.getString("messageId"))
+            || !(body.opt("idempotent") instanceof Boolean)) {
+            throw new IllegalArgumentException("cloud lifecycle enqueue acceptance conflict");
+        }
+        return body.getBoolean("idempotent");
+    }
+
+    private static long validateLifecycleAcceptedResponse(
+        String raw, String expectedMessageId, long now, Long oldExpiry
+    ) throws Exception {
+        JSONObject body = new JSONObject(raw == null ? "{}" : raw);
+        if (!LIFECYCLE_ACCEPTED_RESPONSE_KEYS.equals(keysOf(body))
+            || !(body.opt("ok") instanceof Boolean) || !body.getBoolean("ok")
+            || !(body.opt("messageId") instanceof String)
+            || !expectedMessageId.equals(body.getString("messageId"))
+            || !(body.opt("idempotent") instanceof Boolean)) {
+            throw new IllegalArgumentException("cloud lifecycle acceptance conflict");
+        }
+        Object rawExpiry = body.opt("expiresAt");
+        if (!(rawExpiry instanceof Number)
+            || rawExpiry instanceof Float || rawExpiry instanceof Double) {
+            throw new IllegalArgumentException("cloud lifecycle acceptance expiry conflict");
+        }
+        long expiry = ((Number) rawExpiry).longValue();
+        boolean idempotent = body.getBoolean("idempotent");
+        if (!LifecycleControlSender.validRelayExpiry(now, expiry)
+            || (oldExpiry != null && (idempotent ? expiry < oldExpiry : expiry <= oldExpiry))) {
+            throw new IllegalArgumentException("cloud lifecycle acceptance expiry conflict");
+        }
+        return expiry;
+    }
+
     static void completeCloudHandoff() throws BridgeAcceptedException {
         throw new BridgeAcceptedException("cloud");
     }
@@ -249,6 +400,24 @@ public final class BridgeClient {
         String relayMessageId = item == null ? "" : item.optString("messageId", "").trim();
         if (relayMessageId.isEmpty() || decoded == null) return false;
         rejectPredeclaredTransportMetadata(decoded);
+        if (isLifecycleControlCandidate(decoded)) {
+            Object rawExpiry = item.opt("expiresAt");
+            Long relayExpiresAt = null;
+            if (rawExpiry != null && !JSONObject.NULL.equals(rawExpiry)) {
+                if (!(rawExpiry instanceof Number)
+                    || rawExpiry instanceof Float || rawExpiry instanceof Double) {
+                    throw new IllegalArgumentException("lifecycle applied relay expiry conflict");
+                }
+                relayExpiresAt = ((Number) rawExpiry).longValue();
+            }
+            if (inboxConsumer == null
+                || !inboxConsumer.applyLifecycleControl(
+                    decoded.toString(), relayMessageId, relayExpiresAt, clock.now())) {
+                return false;
+            }
+            acknowledgeCloud(relayMessageId);
+            return true;
+        }
         int protocolVersion = declaredProtocolVersion(decoded);
         if (protocolVersion == 0 && hasCanonicalAuthorityMarker(decoded)) {
             throw new IllegalArgumentException("canonical bridge protocol marker conflict");
@@ -302,12 +471,26 @@ public final class BridgeClient {
         return false;
     }
 
+    private static boolean isLifecycleControlCandidate(JSONObject value) {
+        if (value == null) return false;
+        if ("CONVERSATION_CLEAR_APPLIED".equals(value.opt("type"))) return true;
+        for (String marker : new String[] {
+            "controlId", "controlChecksum", "clearEpoch", "clearedThroughSequence", "appliedAt"
+        }) {
+            if (value.has(marker)) return true;
+        }
+        return false;
+    }
+
     static boolean isCanonicalInboxRejection(Throwable error) {
         if (error == null) return false;
         if (error instanceof BridgeTurnStatus.CanonicalPayloadRejectedException) return true;
         String message = error.getMessage() == null ? "" : error.getMessage();
         if ("BRIDGE_AUTHORITY_CONFLICT".equals(message)
             && (error instanceof IllegalStateException || error instanceof IllegalArgumentException)) return true;
+        if ("LIFECYCLE_APPLIED_ACK_CONFLICT".equals(message)
+            && error instanceof IllegalArgumentException) return true;
+        if (LifecycleControlSender.isAppliedAckConflict(error)) return true;
         if (!(error instanceof IllegalArgumentException)) return false;
         return "bridge protocol version conflict".equals(message)
             || "canonical bridge protocol marker conflict".equals(message)
@@ -320,6 +503,10 @@ public final class BridgeClient {
             || "canonical bridge protocol marker conflict".equals(message)
             || "canonical bridge transport metadata conflict".equals(message)) {
             return "protocol_conflict";
+        }
+        if (LifecycleControlSender.isAppliedAckConflict(error)
+            || "LIFECYCLE_APPLIED_ACK_CONFLICT".equals(message)) {
+            return "lifecycle_ack_conflict";
         }
         if (error instanceof BridgeTurnStatus.CanonicalPayloadRejectedException) {
             return "parse_conflict";
@@ -686,6 +873,23 @@ public final class BridgeClient {
         if (key.length != 32) throw new IllegalArgumentException("cloud encryption key must be 256-bit");
         byte[] nonce = new byte[12];
         RANDOM.nextBytes(nonce);
+        return encryptWithNonce(plaintext, key, nonce);
+    }
+
+    private Encrypted encryptLifecycle(String plaintext, String relayMessageId) throws Exception {
+        byte[] key = base64Codec.decode(config.encryptionKeyBase64);
+        if (key.length != 32 || relayMessageId == null || relayMessageId.trim().isEmpty()) {
+            throw new IllegalArgumentException("cloud lifecycle encryption identity conflict");
+        }
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(key, "HmacSHA256"));
+        byte[] fullNonce = mac.doFinal(("android-lifecycle-gcm-nonce-v1\n" + relayMessageId)
+            .getBytes(StandardCharsets.UTF_8));
+        byte[] nonce = java.util.Arrays.copyOf(fullNonce, 12);
+        return encryptWithNonce(plaintext, key, nonce);
+    }
+
+    private Encrypted encryptWithNonce(String plaintext, byte[] key, byte[] nonce) throws Exception {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
         byte[] ciphertext = cipher.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));
