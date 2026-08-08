@@ -12,7 +12,7 @@ import { YuqiStore } from '../src/store.mjs';
 function withStore(run) {
   const dir = mkdtempSync(join(tmpdir(), 'yuqi-v14-'));
   const path = join(dir, 'runtime.sqlite');
-  const store = new YuqiStore(path);
+  const store = new YuqiStore(path, { targetVersion: 14 });
   try {
     return run(store, path);
   } finally {

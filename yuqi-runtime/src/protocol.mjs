@@ -184,6 +184,165 @@ export function validateAuthorityDeliveryReceipt(value) {
   };
 }
 
+const CONVERSATION_CLEAR_CONTROL_KEYS = Object.freeze([
+  'protocolVersion',
+  'type',
+  'controlVersion',
+  'controlId',
+  'roleId',
+  'peerId',
+  'clearEpoch',
+  'clearedThroughSequence',
+  'requestedAt',
+  'inputCursorChecksum',
+  'checksum'
+]);
+
+export function validateConversationClearControl(raw) {
+  let value = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new Error('invalid conversation clear control JSON');
+    }
+  }
+  assertClosedKeys(value, CONVERSATION_CLEAR_CONTROL_KEYS, 'conversation clear control');
+  if (value.protocolVersion !== 3
+    || value.type !== 'CONVERSATION_CLEAR'
+    || value.controlVersion !== 'conversation_clear_v1') {
+    throw new Error('invalid conversation clear control identity');
+  }
+  const controlId = requireNativeConversationClearId(value.controlId, 'conversation clear control id');
+  const roleId = requireNativeConversationClearId(value.roleId, 'conversation clear role id');
+  const peerId = requireNativeConversationClearId(value.peerId, 'conversation clear peer id');
+  if (typeof value.clearEpoch !== 'number'
+    || !Number.isSafeInteger(value.clearEpoch) || value.clearEpoch < 1) {
+    throw new Error('invalid conversation clear epoch');
+  }
+  if (typeof value.clearedThroughSequence !== 'number'
+    || !Number.isSafeInteger(value.clearedThroughSequence)
+    || value.clearedThroughSequence < 0) {
+    throw new Error('invalid conversation clear boundary');
+  }
+  const requestedAt = requireNativeConversationClearTimestamp(
+    value.requestedAt, 'conversation clear requestedAt'
+  );
+  if (typeof value.inputCursorChecksum !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.inputCursorChecksum)) {
+    throw new Error('invalid conversation clear cursor checksum');
+  }
+  if (typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(value.checksum)) {
+    throw new Error('invalid conversation clear checksum');
+  }
+  const withoutChecksum = { ...value };
+  delete withoutChecksum.checksum;
+  if (contentHash(withoutChecksum) !== value.checksum) {
+    throw new Error('conversation clear checksum conflict');
+  }
+  return {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR',
+    controlVersion: 'conversation_clear_v1',
+    controlId,
+    roleId,
+    peerId,
+    clearEpoch: value.clearEpoch,
+    clearedThroughSequence: value.clearedThroughSequence,
+    requestedAt,
+    inputCursorChecksum: value.inputCursorChecksum,
+    checksum: value.checksum
+  };
+}
+
+const CONVERSATION_CLEAR_APPLIED_KEYS = Object.freeze([
+  'protocolVersion',
+  'type',
+  'controlId',
+  'controlChecksum',
+  'roleId',
+  'peerId',
+  'clearEpoch',
+  'clearedThroughSequence',
+  'appliedAt',
+  'checksum'
+]);
+
+export function validateConversationClearApplied(raw) {
+  let value = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new Error('invalid conversation clear applied JSON');
+    }
+  }
+  assertClosedKeys(value, CONVERSATION_CLEAR_APPLIED_KEYS, 'conversation clear applied');
+  if (value.protocolVersion !== 3 || value.type !== 'CONVERSATION_CLEAR_APPLIED') {
+    throw new Error('invalid conversation clear applied identity');
+  }
+  const requireAppliedId = (candidate, label) => {
+    if (typeof candidate !== 'string' || !ID_PATTERN.test(candidate)) {
+      throw new Error(`invalid ${label}`);
+    }
+    return candidate;
+  };
+  const controlId = requireAppliedId(value.controlId, 'conversation clear applied control id');
+  const roleId = requireAppliedId(value.roleId, 'conversation clear applied role id');
+  const peerId = requireAppliedId(value.peerId, 'conversation clear applied peer id');
+  if (typeof value.controlChecksum !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.controlChecksum)) {
+    throw new Error('invalid conversation clear applied control checksum');
+  }
+  if (typeof value.clearEpoch !== 'number'
+    || !Number.isSafeInteger(value.clearEpoch) || value.clearEpoch < 1) {
+    throw new Error('invalid conversation clear applied epoch');
+  }
+  if (typeof value.clearedThroughSequence !== 'number'
+    || !Number.isSafeInteger(value.clearedThroughSequence)
+    || value.clearedThroughSequence < 0) {
+    throw new Error('invalid conversation clear applied boundary');
+  }
+  if (typeof value.appliedAt !== 'number'
+    || !Number.isSafeInteger(value.appliedAt) || value.appliedAt <= 0) {
+    throw new Error('invalid conversation clear applied time');
+  }
+  if (typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(value.checksum)) {
+    throw new Error('invalid conversation clear applied checksum');
+  }
+  const withoutChecksum = { ...value };
+  delete withoutChecksum.checksum;
+  if (contentHash(withoutChecksum) !== value.checksum) {
+    throw new Error('conversation clear applied checksum conflict');
+  }
+  return {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR_APPLIED',
+    controlId,
+    controlChecksum: value.controlChecksum,
+    roleId,
+    peerId,
+    clearEpoch: value.clearEpoch,
+    clearedThroughSequence: value.clearedThroughSequence,
+    appliedAt: value.appliedAt,
+    checksum: value.checksum
+  };
+}
+
+function requireNativeConversationClearId(value, label) {
+  if (typeof value !== 'string' || !ID_PATTERN.test(value)) {
+    throw new Error(`invalid ${label}`);
+  }
+  return value;
+}
+
+function requireNativeConversationClearTimestamp(value, label) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`invalid ${label}`);
+  }
+  return value;
+}
+
 function requireId(value, label, prefix = '') {
   const text = String(value || '');
   if (!ID_PATTERN.test(text) || (prefix && !text.startsWith(prefix))) {

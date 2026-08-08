@@ -10,10 +10,123 @@ import {
   canonicalJson,
   contentHash,
   deliveryItemsForResult,
+  validateConversationClearControl,
+  validateConversationClearApplied,
   validateEnvelope
 } from '../src/protocol.mjs';
 import { deriveAuthorityLineageKey, YuqiStore } from '../src/store.mjs';
 import { publicTurnStatus } from '../src/turn-status.mjs';
+
+function validConversationClearControl(overrides = {}) {
+  const body = {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR',
+    controlVersion: 'conversation_clear_v1',
+    controlId: 'clear_device1_1',
+    roleId: 'yuqi',
+    peerId: 'device1',
+    clearEpoch: 1,
+    clearedThroughSequence: 4,
+    requestedAt: 1784400000000,
+    inputCursorChecksum: 'a'.repeat(64),
+    ...overrides
+  };
+  return { ...body, checksum: contentHash(body) };
+}
+
+test('conversation clear validator is exact, native, and checksum closed', () => {
+  const valid = validConversationClearControl();
+  assert.deepEqual(validateConversationClearControl(valid), valid);
+  assert.deepEqual(validateConversationClearControl(JSON.stringify(valid)), valid);
+
+  const invalid = [
+    ['unknown key', { extra: true }],
+    ['missing key', { peerId: undefined }],
+    ['coerced protocol', { protocolVersion: '3' }],
+    ['coerced epoch', { clearEpoch: '1' }],
+    ['coerced timestamp', { requestedAt: '1784400000000' }],
+    ['wrong type', { type: 'CONVERSATION_CLEAR_APPLIED' }],
+    ['wrong checksum', { checksum: 'b'.repeat(64) }],
+    ['negative boundary', { clearedThroughSequence: -1 }],
+    ['zero request time', { requestedAt: 0 }]
+  ];
+  for (const [label, changes] of invalid) {
+    const candidate = validConversationClearControl();
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined) delete candidate[key];
+      else candidate[key] = value;
+    }
+    assert.throws(() => validateConversationClearControl(candidate), /conversation clear/i, label);
+  }
+});
+
+test('conversation clear validator rejects coerced native ids and times with a self-consistent checksum', () => {
+  const cases = [
+    ['numeric control id', { controlId: 17 }],
+    ['array role id', { roleId: ['yuqi'] }],
+    ['object peer id', { peerId: { value: 'device1' } }],
+    ['string requestedAt', { requestedAt: '1784400000000' }],
+    ['wrapped requestedAt', { requestedAt: { value: 1784400000000 } }]
+  ];
+  for (const [label, change] of cases) {
+    const candidate = validConversationClearControl(change);
+    const withoutChecksum = { ...candidate };
+    delete withoutChecksum.checksum;
+    candidate.checksum = contentHash(withoutChecksum);
+    assert.throws(
+      () => validateConversationClearControl(candidate),
+      /conversation clear/i,
+      label
+    );
+  }
+});
+
+function validConversationClearApplied(overrides = {}) {
+  const body = {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR_APPLIED',
+    controlId: 'clear_device1_1',
+    controlChecksum: validConversationClearControl().checksum,
+    roleId: 'yuqi',
+    peerId: 'device1',
+    clearEpoch: 1,
+    clearedThroughSequence: 4,
+    appliedAt: 1784400000100,
+    ...overrides
+  };
+  return { ...body, checksum: contentHash(body) };
+}
+
+test('conversation clear applied validator is exact ten-key native and checksum closed', () => {
+  const valid = validConversationClearApplied();
+  assert.deepEqual(validateConversationClearApplied(valid), valid);
+  assert.deepEqual(validateConversationClearApplied(JSON.stringify(valid)), valid);
+  const invalid = [
+    ['unknown key', { extra: true }],
+    ['missing control checksum', { controlChecksum: undefined }],
+    ['coerced protocol', { protocolVersion: '3' }],
+    ['array control id', { controlId: ['clear_device1_1'] }],
+    ['object peer id', { peerId: { value: 'device1' } }],
+    ['fractional epoch', { clearEpoch: 1.5 }],
+    ['string applied time', { appliedAt: '1784400000100' }],
+    ['wrong type', { type: 'CONVERSATION_CLEAR' }],
+    ['wrong checksum', { checksum: 'b'.repeat(64) }]
+  ];
+  for (const [label, changes] of invalid) {
+    const candidate = validConversationClearApplied();
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined) delete candidate[key];
+      else candidate[key] = value;
+    }
+    if (label !== 'wrong checksum') {
+      const withoutChecksum = { ...candidate };
+      delete withoutChecksum.checksum;
+      candidate.checksum = contentHash(withoutChecksum);
+    }
+    assert.throws(() => validateConversationClearApplied(candidate), /conversation clear applied/i, label);
+  }
+  assert.throws(() => validateConversationClearApplied(validConversationClearControl()), /conversation clear applied/i);
+});
 
 function validEnvelope(overrides = {}) {
   return {

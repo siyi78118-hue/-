@@ -32,7 +32,9 @@ import {
   authorityLaneKeyForEnvelope,
   validateAuthorityDeliveryReceipt,
   validateDeliveryReceipt,
-  validateEnvelope
+  validateConversationClearApplied,
+  validateEnvelope,
+  validateConversationClearControl
 } from './protocol.mjs';
 
 const TURN_PATCH_COLUMNS = new Map([
@@ -2131,14 +2133,22 @@ export class YuqiStore {
         `migration source version mismatch: expected ${this.migrationOptions.expectedSourceVersion}, got ${initialVersion}`
       );
     }
-    const targetVersion = Number(this.migrationOptions?.targetVersion || 14);
-    if (![12, 13, 14].includes(targetVersion)) {
+    const targetVersion = Number(this.migrationOptions?.targetVersion || 15);
+    if (![12, 13, 14, 15].includes(targetVersion)) {
       throw new Error(`unsupported migration target version ${targetVersion}`);
     }
-    if (initialVersion > 14) {
+    if (initialVersion > 15) {
       throw new Error(`unsupported database user_version ${initialVersion}`);
     }
-    if (initialVersion === 14) {
+    if (initialVersion === 15) {
+      this.assertAgencyV10Invariants();
+      this.assertVisibleAuthorityV13Invariants();
+      this.assertReleaseAuthorityV14Invariants();
+      this.assertConversationClearAuthorityV15Invariants();
+      this.assertExpectedPostMigrationInvariantChecksum();
+      return;
+    }
+    if (initialVersion === 14 && targetVersion === 14) {
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV13Invariants();
       this.assertReleaseAuthorityV14Invariants();
@@ -2726,9 +2736,21 @@ export class YuqiStore {
       if (initialVersion < 14) {
         this.migrateReleaseAuthorityV14Internal();
       }
+      if (targetVersion === 14) {
+        this.assertAgencyV10Invariants();
+        this.assertVisibleAuthorityV13Invariants();
+        this.assertReleaseAuthorityV14Invariants();
+        this.assertExpectedPostMigrationInvariantChecksum();
+        this.db.exec('COMMIT');
+        return;
+      }
+      if (initialVersion < 15) {
+        this.migrateConversationClearAuthorityV15Internal();
+      }
       this.assertAgencyV10Invariants();
       this.assertVisibleAuthorityV13Invariants();
       this.assertReleaseAuthorityV14Invariants();
+      this.assertConversationClearAuthorityV15Invariants();
       this.assertExpectedPostMigrationInvariantChecksum();
       this.db.exec('COMMIT');
     } catch (error) {
@@ -3578,6 +3600,191 @@ export class YuqiStore {
     this.db.exec('PRAGMA user_version = 14;');
   }
 
+  maybeFailV15Migration(step) {
+    if (this.migrationOptions?.v15MigrationFaultStep === step) {
+      throw new Error(`forced v15 migration fault: ${step}`);
+    }
+  }
+
+  migrateConversationClearAuthorityV15Internal() {
+    if (this.userVersion() !== 14) {
+      throw new Error(`v15 migration source version mismatch: ${this.userVersion()}`);
+    }
+    const sourceColumns = this.db.prepare(
+      'PRAGMA table_info(conversation_clear_controls)'
+    ).all().map(row => row.name);
+    const legacyColumns = [
+      'control_id', 'role_id', 'clear_epoch', 'cleared_through_sequence',
+      'requested_at', 'applied_at', 'checksum'
+    ];
+    if (canonicalJson(sourceColumns) !== canonicalJson(legacyColumns)) {
+      throw new Error('v15 migration source schema conflict');
+    }
+    this.db.exec(`
+      CREATE TABLE conversation_clear_controls_v15 (
+        control_id TEXT PRIMARY KEY,
+        role_id TEXT NOT NULL,
+        peer_id TEXT,
+        clear_epoch INTEGER NOT NULL CHECK(clear_epoch > 0),
+        cleared_through_sequence INTEGER NOT NULL CHECK(cleared_through_sequence >= 0),
+        requested_at INTEGER NOT NULL,
+        applied_at INTEGER NOT NULL,
+        input_cursor_checksum TEXT,
+        checksum TEXT NOT NULL,
+        applied_checksum TEXT,
+        authority_version INTEGER NOT NULL CHECK(authority_version IN (0, 1)),
+        semantic_json TEXT,
+        UNIQUE(role_id, clear_epoch),
+        CHECK(
+          (authority_version = 0
+            AND peer_id IS NULL
+            AND input_cursor_checksum IS NULL
+            AND applied_checksum IS NULL
+            AND semantic_json IS NULL)
+          OR
+          (authority_version = 1
+            AND peer_id IS NOT NULL
+            AND input_cursor_checksum IS NOT NULL
+            AND applied_checksum IS NOT NULL
+            AND semantic_json IS NOT NULL)
+        )
+      );
+    `);
+    this.maybeFailV15Migration('after_new_table');
+    this.db.exec(`
+      INSERT INTO conversation_clear_controls_v15(
+        control_id, role_id, clear_epoch, cleared_through_sequence,
+        requested_at, applied_at, checksum,
+        peer_id, input_cursor_checksum, applied_checksum, authority_version, semantic_json
+      )
+      SELECT control_id, role_id, clear_epoch, cleared_through_sequence,
+             requested_at, applied_at, checksum,
+             NULL, NULL, NULL, 0, NULL
+      FROM conversation_clear_controls;
+    `);
+    this.maybeFailV15Migration('after_row_copy');
+    const sourceCount = Number(this.db.prepare(
+      'SELECT COUNT(*) AS count FROM conversation_clear_controls'
+    ).get().count);
+    const copiedCount = Number(this.db.prepare(
+      'SELECT COUNT(*) AS count FROM conversation_clear_controls_v15'
+    ).get().count);
+    if (sourceCount !== copiedCount) throw new Error('v15 migration row copy conflict');
+    this.maybeFailV15Migration('after_projection_verification');
+    this.db.exec(`
+      ALTER TABLE conversation_clear_controls RENAME TO conversation_clear_controls_v14;
+      ALTER TABLE conversation_clear_controls_v15 RENAME TO conversation_clear_controls;
+    `);
+    this.maybeFailV15Migration('after_table_swap');
+    this.db.exec(`
+      CREATE UNIQUE INDEX ux_conversation_clear_controls_role_epoch_v15
+      ON conversation_clear_controls(role_id, clear_epoch);
+    `);
+    this.maybeFailV15Migration('after_index_recreation');
+    this.db.exec('DROP TABLE conversation_clear_controls_v14;');
+    this.db.exec('PRAGMA user_version = 15;');
+    this.maybeFailV15Migration('after_version_write');
+  }
+
+  assertConversationClearAuthorityV15SchemaInternal() {
+    if (this.userVersion() !== 15) {
+      throw new Error(`v15 authority schema user_version mismatch: ${this.userVersion()}`);
+    }
+    const expected = [
+      'control_id', 'role_id', 'peer_id', 'clear_epoch', 'cleared_through_sequence',
+      'requested_at', 'applied_at', 'input_cursor_checksum', 'checksum', 'applied_checksum',
+      'authority_version', 'semantic_json'
+    ];
+    const actual = this.db.prepare(
+      'PRAGMA table_info(conversation_clear_controls)'
+    ).all().map(row => row.name);
+    if (canonicalJson(actual) !== canonicalJson(expected)) {
+      throw new Error('v15 authority schema column conflict');
+    }
+  }
+
+  assertConversationClearAuthorityV15Invariants() {
+    this.assertConversationClearAuthorityV15SchemaInternal();
+    const rows = this.db.prepare(
+      'SELECT * FROM conversation_clear_controls ORDER BY control_id'
+    ).all();
+    const seenRoleEpoch = new Set();
+    for (const row of rows) {
+      if (!Number.isInteger(row.authority_version)
+        || ![0, 1].includes(row.authority_version)
+        || !Number.isSafeInteger(row.clear_epoch) || row.clear_epoch <= 0
+        || !Number.isSafeInteger(row.cleared_through_sequence)
+        || row.cleared_through_sequence < 0
+        || !Number.isSafeInteger(row.requested_at)
+        || !Number.isSafeInteger(row.applied_at)
+        || typeof row.control_id !== 'string' || !row.control_id
+        || typeof row.role_id !== 'string' || !row.role_id) {
+        throw new Error(`v15 authority row shape conflict: ${row.control_id}`);
+      }
+      const roleEpoch = `${row.role_id}\u0000${row.clear_epoch}`;
+      if (seenRoleEpoch.has(roleEpoch)) {
+        throw new Error(`v15 authority duplicate role epoch: ${row.role_id}`);
+      }
+      seenRoleEpoch.add(roleEpoch);
+      if (row.authority_version === 0) {
+        if (row.peer_id !== null || row.input_cursor_checksum !== null
+          || row.applied_checksum !== null || row.semantic_json !== null) {
+          throw new Error(`v15 authority-v0 projection conflict: ${row.control_id}`);
+        }
+        continue;
+      }
+      if (typeof row.peer_id !== 'string' || !row.peer_id
+        || typeof row.input_cursor_checksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(row.input_cursor_checksum)
+        || typeof row.checksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(row.checksum)
+        || typeof row.applied_checksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(row.applied_checksum)
+        || typeof row.semantic_json !== 'string') {
+        throw new Error(`v15 authority-v1 projection conflict: ${row.control_id}`);
+      }
+      if (row.requested_at <= 0 || row.applied_at <= 0) {
+        throw new Error(`v15 authority-v1 timestamp conflict: ${row.control_id}`);
+      }
+      const wire = parseJson(row.semantic_json, null);
+      let validated;
+      try {
+        validated = validateConversationClearControl(wire);
+      } catch {
+        throw new Error(`v15 authority semantic conflict: ${row.control_id}`);
+      }
+      if (canonicalJson(validated) !== row.semantic_json
+        || validated.controlId !== row.control_id
+        || validated.roleId !== row.role_id
+        || validated.peerId !== row.peer_id
+        || validated.clearEpoch !== row.clear_epoch
+        || validated.clearedThroughSequence !== row.cleared_through_sequence
+        || validated.requestedAt !== row.requested_at
+        || validated.inputCursorChecksum !== row.input_cursor_checksum
+        || validated.checksum !== row.checksum) {
+        throw new Error(`v15 authority semantic projection conflict: ${row.control_id}`);
+      }
+      const appliedBody = {
+        protocolVersion: 3,
+        type: 'CONVERSATION_CLEAR_APPLIED',
+        controlId: row.control_id,
+        controlChecksum: row.checksum,
+        roleId: row.role_id,
+        peerId: row.peer_id,
+        clearEpoch: row.clear_epoch,
+        clearedThroughSequence: row.cleared_through_sequence,
+        appliedAt: row.applied_at
+      };
+      const appliedWire = validateConversationClearApplied({
+        ...appliedBody,
+        checksum: contentHash(appliedBody)
+      });
+      if (appliedWire.checksum !== row.applied_checksum) {
+        throw new Error(`v15 authority applied proof conflict: ${row.control_id}`);
+      }
+    }
+  }
+
   assertReleaseAuthorityV14PreflightInternal() {
     const invalidSlot = this.db.prepare(`
       SELECT turn_id, canary_slot
@@ -3651,7 +3858,7 @@ export class YuqiStore {
 
   assertReleaseAuthorityV14IndexShapeInternal({ allowVersionThirteen = false } = {}) {
     const version = this.userVersion();
-    if (version !== 14 && !(allowVersionThirteen && version === 13)) {
+    if (version !== 14 && version !== 15 && !(allowVersionThirteen && version === 13)) {
       throw new Error(`v14 invariant user_version mismatch: ${version}`);
     }
     const indexes = new Map(this.db.prepare(`
@@ -3695,12 +3902,15 @@ export class YuqiStore {
     allowVersionTen = false,
     allowVersionTwelve = false,
     allowVersionThirteen = false,
-    allowVersionFourteen = false
+    allowVersionFourteen = false,
+    allowVersionFifteen = false
   } = {}) {
     const version = this.userVersion();
-    const allowV13Semantics = allowVersionThirteen || allowVersionFourteen;
-    const expectedVersion = allowVersionFourteen
-      ? 14
+    const allowV13Semantics = allowVersionThirteen || allowVersionFourteen || allowVersionFifteen;
+    const expectedVersion = allowVersionFifteen
+      ? 15
+      : allowVersionFourteen
+        ? 14
       : allowVersionThirteen
         ? 13
         : allowVersionTwelve
@@ -4511,10 +4721,7 @@ export class YuqiStore {
     }
   }
 
-  assertVisibleAuthorityV13SchemaInternal() {
-    if (![13, 14].includes(this.userVersion())) {
-      throw new Error(`v13 invariant user_version mismatch: ${this.userVersion()}`);
-    }
+  assertVisibleAuthorityV13SharedSchemaInternal() {
     const exactColumns = (table, expected) => {
       const actual = this.db.prepare(`PRAGMA table_info("${table}")`).all()
         .map(row => row.name);
@@ -4532,10 +4739,6 @@ export class YuqiStore {
     exactColumns('visible_result_actions', [
       'group_id', 'ordinal', 'action_id', 'action_kind', 'target_key',
       'target_revision', 'action_json', 'action_checksum', 'redacted_at'
-    ]);
-    exactColumns('conversation_clear_controls', [
-      'control_id', 'role_id', 'clear_epoch', 'cleared_through_sequence',
-      'requested_at', 'applied_at', 'checksum'
     ]);
     for (const [table, columns] of Object.entries({
       turns: ['authority_redacted_at', 'input_clear_epoch'],
@@ -4557,6 +4760,30 @@ export class YuqiStore {
         throw new Error(`v13 invariant schema missing ${table}: ${missing.join(',')}`);
       }
     }
+  }
+
+  assertVisibleAuthorityV13SchemaInternal() {
+    if (![13, 14].includes(this.userVersion())) {
+      throw new Error(`v13 invariant user_version mismatch: ${this.userVersion()}`);
+    }
+    this.assertVisibleAuthorityV13SharedSchemaInternal();
+    const actual = this.db.prepare(
+      'PRAGMA table_info(conversation_clear_controls)'
+    ).all().map(row => row.name);
+    const expected = [
+      'control_id', 'role_id', 'clear_epoch', 'cleared_through_sequence',
+      'requested_at', 'applied_at', 'checksum'
+    ];
+    if (canonicalJson(actual) !== canonicalJson(expected)) {
+      throw new Error('v13 invariant schema mismatch: conversation_clear_controls');
+    }
+  }
+
+  assertVisibleAuthorityV15LayerSchemaInternal() {
+    if (this.userVersion() !== 15) {
+      throw new Error(`v15 invariant user_version mismatch: ${this.userVersion()}`);
+    }
+    this.assertVisibleAuthorityV13SharedSchemaInternal();
   }
 
   assertCanonicalTurnInputAuthorityInternal({
@@ -5590,11 +5817,14 @@ export class YuqiStore {
   }
 
   assertVisibleAuthorityV13Invariants() {
-    this.assertVisibleAuthorityV13SchemaInternal();
+    if (this.userVersion() === 15) this.assertVisibleAuthorityV15LayerSchemaInternal();
+    else this.assertVisibleAuthorityV13SchemaInternal();
     this.assertVisibleAuthorityV11Invariants(
-      this.userVersion() === 14
-        ? { allowVersionFourteen: true }
-        : { allowVersionThirteen: true }
+      this.userVersion() === 15
+        ? { allowVersionFifteen: true }
+        : this.userVersion() === 14
+          ? { allowVersionFourteen: true }
+          : { allowVersionThirteen: true }
     );
     for (const lineage of this.db.prepare(`
       SELECT lineage_key, state, committed_group_id, redacted_at,
@@ -5840,7 +6070,7 @@ export class YuqiStore {
       : allowPreFinalVersion
         ? version === 10
         : version === 10 || version === 11 || version === 12
-          || version === 13 || version === 14;
+          || version === 13 || version === 14 || version === 15;
     if (!versionAllowed) {
       throw new Error(`v10 invariant user_version mismatch: ${version}`);
     }

@@ -1007,7 +1007,7 @@ test('fresh and populated v12 migrate atomically to exact v13 tombstone schema',
   withTempPath(path => {
     buildLiveV12Database(path, { groups: 2, statePatches: 2 });
     const before = snapshotDatabase(path);
-    const store = new YuqiStore(path);
+    const store = new YuqiStore(path, { targetVersion: 14 });
     try {
       assert.equal(store.userVersion(), 14);
       assert.deepEqual(columns(store, 'visible_result_items'), [
@@ -1052,7 +1052,7 @@ test('fresh and populated v12 migrate atomically to exact v13 tombstone schema',
     } finally {
       store.close();
     }
-    assert.doesNotThrow(() => new YuqiStore(path).close());
+    assert.doesNotThrow(() => new YuqiStore(path, { targetVersion: 14 }).close());
   }));
 
 test('v12 to v13 migration anchors every live parent with count and tombstone commitments',
