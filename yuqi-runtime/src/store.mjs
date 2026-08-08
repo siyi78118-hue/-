@@ -40,7 +40,10 @@ import {
   validateDeliveryReceipt,
   validateConversationClearApplied,
   validateEnvelope,
-  validateConversationClearControl
+  validateConversationClearControl,
+  validateRoleDeleteApplied,
+  validateRoleDeleteControl,
+  validateRoleDeletePending
 } from './protocol.mjs';
 
 const TURN_PATCH_COLUMNS = new Map([
@@ -2188,6 +2191,7 @@ export class YuqiStore {
       this.assertReleaseAuthorityV14Invariants();
       this.assertConversationClearAuthorityV15Invariants();
       this.assertBackupReceiptAuditClosureInternal();
+      this.assertRoleDeletionAuditClosureInternal();
       this.assertExpectedPostMigrationInvariantChecksum();
       return;
     }
@@ -2802,6 +2806,7 @@ export class YuqiStore {
       this.assertReleaseAuthorityV14Invariants();
       this.assertConversationClearAuthorityV15Invariants();
       this.assertBackupReceiptAuditClosureInternal();
+      this.assertRoleDeletionAuditClosureInternal();
       this.assertExpectedPostMigrationInvariantChecksum();
       this.db.exec('COMMIT');
     } catch (error) {
@@ -2894,6 +2899,150 @@ export class YuqiStore {
       }
       seen.add(receipt.receiptId);
     }
+  }
+
+  loadRoleDeletionRequestAuditInternal(controlId) {
+    const rows = this.db.prepare(`
+      SELECT * FROM sync_log
+      WHERE entity_type = 'role_deletion_request' AND entity_id = ?
+      ORDER BY seq
+    `).all(String(controlId || ''));
+    if (rows.length !== 1) throw new Error('role deletion request audit conflict');
+    const row = rows[0];
+    let control;
+    try {
+      control = validateRoleDeleteControl(JSON.parse(row.payload_json));
+    } catch (error) {
+      throw new Error('role deletion request audit conflict', { cause: error });
+    }
+    if (row.operation !== 'request'
+      || row.entity_id !== control.controlId
+      || row.payload_json !== canonicalJson(control)
+      || row.checksum !== contentHash(control)
+      || Number(row.created_at) !== control.requestedAt) {
+      throw new Error('role deletion request audit conflict');
+    }
+    const receiptRows = this.db.prepare(`
+      SELECT * FROM sync_log
+      WHERE entity_type = 'backup_receipt' AND entity_id = ?
+      ORDER BY seq
+    `).all(control.backupReceipt.receiptId);
+    if (receiptRows.length !== 1
+      || receiptRows[0].operation !== 'create'
+      || receiptRows[0].payload_json !== canonicalJson(control.backupReceipt)
+      || receiptRows[0].checksum !== contentHash(control.backupReceipt)
+      || Number(receiptRows[0].created_at) !== control.backupReceipt.createdAt) {
+      throw new Error('role delete backup receipt audit conflict');
+    }
+    return { row, control };
+  }
+
+  loadRoleDeletionAppliedAuditInternal(controlId) {
+    const rows = this.db.prepare(`
+      SELECT * FROM sync_log
+      WHERE entity_type = 'role_deletion' AND entity_id = ?
+      ORDER BY seq
+    `).all(String(controlId || ''));
+    if (!rows.length) return null;
+    if (rows.length !== 1) throw new Error('role deletion applied audit conflict');
+    const request = this.loadRoleDeletionRequestAuditInternal(controlId);
+    const row = rows[0];
+    let applied;
+    try {
+      applied = validateRoleDeleteApplied(JSON.parse(row.payload_json));
+    } catch (error) {
+      throw new Error('role deletion applied audit conflict', { cause: error });
+    }
+    if (row.operation !== 'apply'
+      || row.entity_id !== applied.controlId
+      || row.payload_json !== canonicalJson(applied)
+      || row.checksum !== contentHash(applied)
+      || Number(row.created_at) !== applied.appliedAt
+      || applied.controlChecksum !== request.control.checksum
+      || applied.roleId !== request.control.roleId
+      || applied.peerId !== request.control.peerId
+      || applied.backupReceiptId !== request.control.backupReceipt.receiptId) {
+      throw new Error('role deletion applied audit conflict');
+    }
+    return { row, applied, request };
+  }
+
+  assertRoleDeletedRowsInternal(roleId) {
+    const checks = [
+      ['turns', 'character_id'],
+      ['messages', 'character_id'],
+      ['current_user_batches', 'character_id'],
+      ['facts', 'character_id'],
+      ['sessions', 'role'],
+      ['life_episodes', 'character_id'],
+      ['character_life_state', 'character_id'],
+      ['cognitive_states', 'role_id'],
+      ['consolidation_jobs', 'role_id'],
+      ['consolidation_backfill_cursors', 'role_id'],
+      ['cognition_life_planning_attempts', 'role_id'],
+      ['constraint_records', 'role_id'],
+      ['stance_records', 'role_id'],
+      ['interaction_lanes', 'role_id'],
+      ['state_migration_audit', 'role_id'],
+      ['turn_authority_lineages', 'role_id'],
+      ['visible_result_groups', 'role_id'],
+      ['conversation_clear_controls', 'role_id']
+    ];
+    for (const [table, column] of checks) {
+      const count = Number(this.db.prepare(
+        `SELECT COUNT(*) AS value FROM "${table}" WHERE "${column}" = ?`
+      ).get(roleId).value);
+      if (count !== 0) throw new Error(`role deletion retained ${table} conflict`);
+    }
+    return true;
+  }
+
+  assertRoleDeletionAuditClosureInternal() {
+    const requests = this.db.prepare(`
+      SELECT entity_id FROM sync_log
+      WHERE entity_type = 'role_deletion_request'
+      ORDER BY entity_id, seq
+    `).all();
+    const seenControls = new Set();
+    const seenRoles = new Map();
+    for (const { entity_id: controlId } of requests) {
+      if (seenControls.has(controlId)) throw new Error('role deletion request audit conflict');
+      const request = this.loadRoleDeletionRequestAuditInternal(controlId);
+      const prior = seenRoles.get(request.control.roleId);
+      if (prior && prior !== controlId) throw new Error('role deletion role authority conflict');
+      seenControls.add(controlId);
+      seenRoles.set(request.control.roleId, controlId);
+    }
+    const appliedRows = this.db.prepare(`
+      SELECT entity_id FROM sync_log
+      WHERE entity_type = 'role_deletion'
+      ORDER BY entity_id, seq
+    `).all();
+    const seenApplied = new Set();
+    for (const { entity_id: controlId } of appliedRows) {
+      if (seenApplied.has(controlId) || !seenControls.has(controlId)) {
+        throw new Error('role deletion applied audit conflict');
+      }
+      const applied = this.loadRoleDeletionAppliedAuditInternal(controlId);
+      this.assertRoleDeletedRowsInternal(applied.applied.roleId);
+      seenApplied.add(controlId);
+    }
+    return true;
+  }
+
+  assertRoleDeletionAllowsNewWorkInternal(roleId) {
+    const rows = this.db.prepare(`
+      SELECT entity_id FROM sync_log
+      WHERE entity_type = 'role_deletion_request'
+      ORDER BY entity_id, seq
+    `).all();
+    for (const row of rows) {
+      const request = this.loadRoleDeletionRequestAuditInternal(row.entity_id);
+      if (request.control.roleId === String(roleId || '')) {
+        throw new Error('role deletion blocks new role work');
+      }
+    }
+    return true;
   }
 
   addColumnIfMissing(table, column, definition) {
@@ -7914,13 +8063,27 @@ export class YuqiStore {
       throw new Error('agency prune audit closure conflict');
     }
     const controlRow = this.db.prepare(`
-      SELECT control_id, role_id, applied_at, authority_version
+      SELECT control_id, role_id, applied_at, authority_version, input_cursor_checksum
       FROM conversation_clear_controls WHERE control_id = ?
     `).get(String(controlId));
     if (!controlRow || controlRow.role_id !== safeRoleId
       || Number(controlRow.applied_at) !== at
       || Number(controlRow.authority_version) !== 1) {
       throw new Error('agency prune control closure conflict');
+    }
+    const roleDeletionRequests = this.db.prepare(`
+      SELECT entity_id FROM sync_log
+      WHERE entity_type = 'role_deletion_request'
+      ORDER BY entity_id, seq
+    `).all();
+    let roleDeletionScope = false;
+    for (const requestRow of roleDeletionRequests) {
+      const request = this.loadRoleDeletionRequestAuditInternal(requestRow.entity_id);
+      if (request.control.roleId === safeRoleId
+        && request.control.checksum === controlRow.input_cursor_checksum) {
+        roleDeletionScope = true;
+        break;
+      }
     }
     const state = this.db.prepare('SELECT * FROM cognitive_states WHERE role_id = ?').get(safeRoleId);
     if (validateCurrentCognitive && (!state
@@ -7982,7 +8145,8 @@ export class YuqiStore {
       : [];
     if (scopedTurns.length !== agencyAudit.affectedTurnIds.length
       || scopedTurns.some(row => row.character_id !== safeRoleId
-        || (Number(row.result_authority_version) === 1 && row.lane_key !== 'private_chat')
+        || (!roleDeletionScope
+          && Number(row.result_authority_version) === 1 && row.lane_key !== 'private_chat')
         || (Number(row.result_authority_version) === 1
           ? Number(row.authority_redacted_at) !== at
           : !(Number(row.result_authority_version) === 0
@@ -7997,7 +8161,8 @@ export class YuqiStore {
       : [];
     if (scopedLineages.length !== agencyAudit.affectedLineageKeys.length
       || scopedLineages.some(row => row.role_id !== safeRoleId
-        || row.lane_key !== 'private_chat' || Number(row.redacted_at) !== at)) {
+        || (!roleDeletionScope && row.lane_key !== 'private_chat')
+        || Number(row.redacted_at) !== at)) {
       throw new Error('agency prune lineage scope closure conflict');
     }
     const scopedGroups = agencyAudit.affectedGroupIds.length
@@ -8008,7 +8173,8 @@ export class YuqiStore {
       : [];
     if (scopedGroups.length !== agencyAudit.affectedGroupIds.length
       || scopedGroups.some(row => row.role_id !== safeRoleId
-        || row.lane_key !== 'private_chat' || Number(row.redacted_at) !== at)) {
+        || (!roleDeletionScope && row.lane_key !== 'private_chat')
+        || Number(row.redacted_at) !== at)) {
       throw new Error('agency prune group scope closure conflict');
     }
     const scopedMessages = agencyAudit.affectedMessageIds.length
@@ -8019,7 +8185,7 @@ export class YuqiStore {
       : [];
     if (scopedMessages.length !== agencyAudit.affectedMessageIds.length
       || scopedMessages.some(row => row.character_id !== safeRoleId
-        || (row.lane_key != null && row.lane_key !== 'private_chat'))) {
+        || (!roleDeletionScope && row.lane_key != null && row.lane_key !== 'private_chat'))) {
       throw new Error('agency prune message scope closure conflict');
     }
     const redactedLineages = new Set(agencyAudit.affectedLineageKeys);
@@ -8395,12 +8561,20 @@ export class YuqiStore {
     const controlRow = this.db.prepare(
       'SELECT * FROM conversation_clear_controls WHERE control_id = ?'
     ).get(payload.controlId);
-    if (!controlRow || Number(controlRow.authority_version) !== 1
-      || controlRow.role_id !== turn.character_id
-      || Number(controlRow.applied_at) !== Number(payload.redactedAt)) {
-      throw new Error('legacy redaction control conflict');
+    if (controlRow) {
+      if (Number(controlRow.authority_version) !== 1
+        || controlRow.role_id !== turn.character_id
+        || Number(controlRow.applied_at) !== Number(payload.redactedAt)) {
+        throw new Error('legacy redaction control conflict');
+      }
+      validateConversationClearControl(parseJson(controlRow.semantic_json, null));
+    } else {
+      const request = this.loadRoleDeletionRequestAuditInternal(payload.controlId);
+      if (request.control.roleId !== turn.character_id
+        || request.control.requestedAt > Number(payload.redactedAt)) {
+        throw new Error('legacy redaction control conflict');
+      }
     }
-    validateConversationClearControl(parseJson(controlRow.semantic_json, null));
     const messages = this.db.prepare(
       'SELECT * FROM messages WHERE turn_id = ? ORDER BY message_id'
     ).all(turn.turn_id);
@@ -8706,7 +8880,13 @@ export class YuqiStore {
     for (const row of redactedTurns) this.loadValidatedLegacyTurnRedactionInternal(row.turn_id);
   }
 
-  redactCanonicalConversationLineageInternal({ lineage, redactedAt, fault, faultAfterStep = null }) {
+  redactCanonicalConversationLineageInternal({
+    lineage,
+    redactedAt,
+    fault,
+    faultAfterStep = null,
+    reasonCode = 'conversation_clear'
+  }) {
     const attempts = this.db.prepare(`
       SELECT * FROM turns WHERE authority_lineage_key = ?
       ORDER BY lineage_revision_at_creation, turn_id
@@ -8840,7 +9020,7 @@ export class YuqiStore {
             redacted_at = ?, updated_at = ?
         WHERE lineage_key = ?`).run(redactedAt, redactedAt, lineage.lineage_key);
       fault('after_group');
-      const payload = { groupId: null, reasonCode: 'conversation_clear', redactedAt };
+      const payload = { groupId: null, reasonCode, redactedAt };
       this.db.prepare(`INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
         VALUES ('authority_redaction', ?, 'redact', ?, ?, ?)`)
         .run(lineage.lineage_key, canonicalJson(payload), contentHash(payload), redactedAt);
@@ -8913,7 +9093,7 @@ export class YuqiStore {
       SET redacted_at = ?, updated_at = ? WHERE lineage_key = ?`)
       .run(redactedAt, redactedAt, lineage.lineage_key);
     fault('after_delivery');
-    const payload = { groupId, reasonCode: 'conversation_clear', redactedAt };
+    const payload = { groupId, reasonCode, redactedAt };
     this.db.prepare(`INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
       VALUES ('authority_redaction', ?, 'redact', ?, ?, ?)`)
       .run(groupId, canonicalJson(payload), contentHash(payload), redactedAt);
@@ -9238,6 +9418,497 @@ export class YuqiStore {
         normalized.createdAt
       );
       return normalized;
+    });
+  }
+
+  roleDeletionPendingProjectionInternal(control, pendingRetractions) {
+    const body = {
+      protocolVersion: 3,
+      type: 'ROLE_DELETE_PENDING',
+      controlId: control.controlId,
+      controlChecksum: control.checksum,
+      roleId: control.roleId,
+      peerId: control.peerId,
+      state: 'pending_retractions',
+      pendingRetractions: Number(pendingRetractions),
+      requestedAt: control.requestedAt
+    };
+    return validateRoleDeletePending({ ...body, checksum: contentHash(body) });
+  }
+
+  roleDeletionAppliedProjectionInternal(control, appliedAt) {
+    const body = {
+      protocolVersion: 3,
+      type: 'ROLE_DELETE_APPLIED',
+      controlId: control.controlId,
+      controlChecksum: control.checksum,
+      roleId: control.roleId,
+      peerId: control.peerId,
+      backupReceiptId: control.backupReceipt.receiptId,
+      appliedAt: Number(appliedAt)
+    };
+    return validateRoleDeleteApplied({ ...body, checksum: contentHash(body) });
+  }
+
+  createRoleDeletionClearControlInternal(control) {
+    const lane = this.getInteractionLane(control.roleId, 'private_chat');
+    const latestControlEpoch = Number(this.db.prepare(`
+      SELECT COALESCE(MAX(clear_epoch), 0) AS value
+      FROM conversation_clear_controls WHERE role_id = ?
+    `).get(control.roleId).value);
+    const maxTurnSequence = Number(this.db.prepare(`
+      SELECT COALESCE(MAX(input_visibility_sequence), 0) AS value
+      FROM turns WHERE character_id = ?
+    `).get(control.roleId).value);
+    const body = {
+      protocolVersion: 3,
+      type: 'CONVERSATION_CLEAR',
+      controlVersion: 'conversation_clear_v1',
+      roleId: control.roleId,
+      peerId: control.peerId,
+      clearEpoch: Math.max(latestControlEpoch, Number(lane?.clearEpoch || 0)) + 1,
+      clearedThroughSequence: Math.max(
+        Number(lane?.localSequence || 0), Number(lane?.clearedThroughSequence || 0),
+        Number(lane?.nativeCompletedSequence || 0), Number(lane?.uiAppliedSequence || 0),
+        Number.isSafeInteger(maxTurnSequence) ? maxTurnSequence : 0
+      ),
+      requestedAt: control.requestedAt,
+      inputCursorChecksum: control.checksum
+    };
+    body.controlId = `ctl_${contentHash({
+      contract: 'android-lifecycle-control-id-v1',
+      controlKind: 'conversation_clear_v1',
+      characterId: body.roleId,
+      peerId: body.peerId,
+      clearEpoch: body.clearEpoch,
+      clearedThroughSequence: body.clearedThroughSequence,
+      requestedAt: body.requestedAt,
+      inputCursorChecksum: body.inputCursorChecksum
+    })}`;
+    return validateConversationClearControl({ ...body, checksum: contentHash(body) });
+  }
+
+  freezeRoleDeletionAuthorityInternal(roleId) {
+    this.assertVisibleAuthorityV13Invariants();
+    const canonicalRows = this.db.prepare(`
+      SELECT * FROM turns
+      WHERE character_id = ? AND result_authority_version = 1
+      ORDER BY authority_lineage_key, lineage_revision_at_creation, turn_id
+    `).all(roleId);
+    const closures = [];
+    for (const lineageKey of [...new Set(canonicalRows
+      .map(row => row.authority_lineage_key).filter(Boolean))]) {
+      const lineage = this.db.prepare(
+        'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
+      ).get(lineageKey);
+      if (!lineage || lineage.role_id !== roleId) {
+        throw new Error('role deletion canonical lineage conflict');
+      }
+      if (lineage.redacted_at != null) {
+        if (lineage.committed_group_id) {
+          this.assertVisibleGroupAuthorityInternal(lineage.committed_group_id, { purpose: 'reopen' });
+        } else {
+          this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, { purpose: 'reopen' });
+        }
+        continue;
+      }
+      if (lineage.state === 'committed') {
+        this.assertVisibleGroupAuthorityInternal(lineage.committed_group_id, { purpose: 'reopen' });
+      } else if (lineage.state === 'open') {
+        this.assertCanonicalLineageMessageAuthorityInternal({ lineageKey, mode: 'live' });
+      } else if (lineage.state !== 'cancelled') {
+        throw new Error('role deletion canonical lineage state conflict');
+      }
+      closures.push({ lineage });
+    }
+
+    const legacy = [];
+    for (const row of this.db.prepare(`
+      SELECT * FROM turns
+      WHERE character_id = ? AND result_authority_version = 0
+      ORDER BY turn_id
+    `).all(roleId)) {
+      if (row.authority_redacted_at != null) {
+        this.loadValidatedLegacyTurnRedactionInternal(row.turn_id);
+        continue;
+      }
+      let envelope;
+      try {
+        envelope = validateEnvelope(parseJson(row.envelope_json, null));
+      } catch (error) {
+        throw new Error(`role deletion legacy envelope conflict: ${row.turn_id}`, { cause: error });
+      }
+      if (contentHash(envelope) !== row.envelope_checksum
+        || ![1, 2].includes(Number(envelope.protocolVersion))
+        || row.authority_lineage_key != null
+        || row.lineage_revision_at_creation != null
+        || row.retry_of_turn_id != null
+        || row.input_user_batch_id != null
+        || row.agency_snapshot_checksum != null
+        || (row.lane_key != null
+          && row.lane_key !== (Number(envelope.protocolVersion) === 1
+            ? 'private_chat' : laneKeyForEnvelope(envelope)))) {
+        throw new Error(`role deletion legacy authority conflict: ${row.turn_id}`);
+      }
+      const canonicalRefs = this.db.prepare(`
+        SELECT 1 FROM visible_result_groups WHERE authoritative_turn_id = ?
+        UNION ALL SELECT 1 FROM visible_commit_receipts WHERE authoritative_turn_id = ?
+        UNION ALL SELECT 1 FROM cloud_deliveries
+          WHERE turn_id = ? AND (authority_group_id IS NOT NULL OR authority_commit_checksum IS NOT NULL)
+        LIMIT 1
+      `).get(row.turn_id, row.turn_id, row.turn_id);
+      if (canonicalRefs) throw new Error(`role deletion legacy projection conflict: ${row.turn_id}`);
+      this.assertLegacyConversationClearInputBatchInternal({ row, envelope });
+      const deliveries = this.db.prepare(
+        'SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id'
+      ).all(row.turn_id);
+      for (const delivery of deliveries) this.assertLegacyConversationClearDeliveryInternal(delivery);
+      legacy.push({ row, envelope, deliveries });
+    }
+
+    const turnIds = [...new Set([
+      ...closures.flatMap(({ lineage }) => canonicalRows
+        .filter(row => row.authority_lineage_key === lineage.lineage_key)
+        .map(row => row.turn_id)),
+      ...legacy.map(entry => entry.row.turn_id)
+    ])].sort();
+    const lineageKeys = closures.map(({ lineage }) => lineage.lineage_key).sort();
+    const groupIds = closures.map(({ lineage }) => lineage.committed_group_id)
+      .filter(Boolean).sort();
+    const messageIds = turnIds.length ? this.db.prepare(`
+      SELECT message_id FROM messages
+      WHERE turn_id IN (${turnIds.map(() => '?').join(',')}) ORDER BY message_id
+    `).all(...turnIds).map(row => row.message_id) : [];
+    const actionIds = groupIds.length ? this.db.prepare(`
+      SELECT action_id FROM visible_result_actions
+      WHERE group_id IN (${groupIds.map(() => '?').join(',')}) ORDER BY action_id
+    `).all(...groupIds).map(row => row.action_id) : [];
+    return {
+      closures,
+      legacy,
+      frozen: Object.freeze({
+        turnIds: Object.freeze(turnIds),
+        lineageKeys: Object.freeze(lineageKeys),
+        groupIds: Object.freeze(groupIds),
+        messageIds: Object.freeze([...new Set(messageIds)].sort()),
+        actionIds: Object.freeze([...new Set(actionIds)].sort())
+      })
+    };
+  }
+
+  redactRoleAuthorityForDeletionInternal(control, { redactedAt, fault }) {
+    return this.withImmediateTransaction(() => {
+      const request = this.loadRoleDeletionRequestAuditInternal(control.controlId);
+      if (canonicalJson(request.control) !== canonicalJson(control)) {
+        throw new Error('role deletion request replay conflict');
+      }
+      const frozenAuthority = this.freezeRoleDeletionAuthorityInternal(control.roleId);
+      if (!frozenAuthority.frozen.turnIds.length) return false;
+      const auditControl = this.createRoleDeletionClearControlInternal(control);
+      const memoryPrunePlan = this.prepareMemoryPruneInternal({
+        roleId: control.roleId,
+        frozen: frozenAuthority.frozen,
+        controlId: auditControl.controlId,
+        redactedAt
+      });
+      const agencyPrunePlan = this.freezeAgencyPruneAuthorityInternal({
+        roleId: control.roleId,
+        frozen: frozenAuthority.frozen,
+        controlId: auditControl.controlId,
+        redactedAt
+      });
+      const appliedBody = {
+        protocolVersion: 3,
+        type: 'CONVERSATION_CLEAR_APPLIED',
+        controlId: auditControl.controlId,
+        controlChecksum: auditControl.checksum,
+        roleId: auditControl.roleId,
+        peerId: auditControl.peerId,
+        clearEpoch: auditControl.clearEpoch,
+        clearedThroughSequence: auditControl.clearedThroughSequence,
+        appliedAt: redactedAt
+      };
+      const applied = validateConversationClearApplied({
+        ...appliedBody, checksum: contentHash(appliedBody)
+      });
+      this.db.prepare(`
+        INSERT INTO conversation_clear_controls(
+          control_id, role_id, peer_id, clear_epoch, cleared_through_sequence,
+          requested_at, applied_at, input_cursor_checksum, checksum,
+          applied_checksum, authority_version, semantic_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      `).run(
+        auditControl.controlId, auditControl.roleId, auditControl.peerId,
+        auditControl.clearEpoch, auditControl.clearedThroughSequence,
+        auditControl.requestedAt, redactedAt, auditControl.inputCursorChecksum,
+        auditControl.checksum, applied.checksum, canonicalJson(auditControl)
+      );
+      fault('after_redaction_control');
+      for (const { lineage } of frozenAuthority.closures) {
+        this.redactCanonicalConversationLineageInternal({
+          lineage,
+          redactedAt,
+          fault,
+          reasonCode: 'role_delete'
+        });
+      }
+      for (const entry of frozenAuthority.legacy) {
+        this.redactLegacyConversationTurnInternal({
+          entry, redactedAt, control: auditControl, fault
+        });
+      }
+      this.applyMemoryPrunePlanInternal(memoryPrunePlan, {
+        roleId: control.roleId,
+        controlId: auditControl.controlId,
+        redactedAt
+      });
+      this.applyAgencyPrunePlanInternal(agencyPrunePlan, {
+        roleId: control.roleId,
+        controlId: auditControl.controlId,
+        redactedAt
+      });
+      this.writeAgencyPruneAuditInternal(agencyPrunePlan, {
+        roleId: control.roleId,
+        controlId: auditControl.controlId,
+        redactedAt
+      });
+      const lane = this.getInteractionLane(control.roleId, 'private_chat');
+      if (lane) {
+        const changed = this.db.prepare(`
+          UPDATE interaction_lanes
+          SET revision = revision + 1, clear_epoch = ?, cleared_through_sequence = ?, updated_at = ?
+          WHERE role_id = ? AND lane_key = 'private_chat' AND revision = ?
+        `).run(
+          auditControl.clearEpoch, auditControl.clearedThroughSequence, redactedAt,
+          control.roleId, lane.revision
+        );
+        if (Number(changed.changes) !== 1) throw new Error('role deletion lane CAS conflict');
+      }
+      this.assertMemoryPruneClosureInternal({
+        controlId: auditControl.controlId, roleId: control.roleId, redactedAt
+      });
+      this.assertAgencyPruneClosureInternal({
+        roleId: control.roleId, controlId: auditControl.controlId, redactedAt
+      });
+      for (const entry of frozenAuthority.legacy) {
+        this.loadValidatedLegacyTurnRedactionInternal(entry.row.turn_id);
+      }
+      for (const { lineage } of frozenAuthority.closures) {
+        if (lineage.committed_group_id) {
+          this.assertVisibleGroupAuthorityInternal(lineage.committed_group_id, { purpose: 'reopen' });
+        } else {
+          this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, { purpose: 'reopen' });
+        }
+      }
+      fault('after_role_redaction');
+      return true;
+    });
+  }
+
+  deleteRoleRowsInternal({ roleId, controlId, backupReceiptId, fault }) {
+    const ids = rows => rows.map(row => String(Object.values(row)[0]));
+    const turnIds = ids(this.db.prepare(
+      'SELECT turn_id FROM turns WHERE character_id = ? ORDER BY turn_id'
+    ).all(roleId));
+    const lineageKeys = ids(this.db.prepare(
+      'SELECT lineage_key FROM turn_authority_lineages WHERE role_id = ? ORDER BY lineage_key'
+    ).all(roleId));
+    const groupIds = ids(this.db.prepare(
+      'SELECT group_id FROM visible_result_groups WHERE role_id = ? ORDER BY group_id'
+    ).all(roleId));
+    const messageIds = ids(this.db.prepare(
+      'SELECT message_id FROM messages WHERE character_id = ? ORDER BY message_id'
+    ).all(roleId));
+    const batchIds = ids(this.db.prepare(
+      'SELECT batch_id FROM current_user_batches WHERE character_id = ? ORDER BY batch_id'
+    ).all(roleId));
+    const factIds = ids(this.db.prepare(
+      'SELECT fact_id FROM facts WHERE character_id = ? ORDER BY fact_id'
+    ).all(roleId));
+    const episodeIds = ids(this.db.prepare(
+      'SELECT episode_id FROM life_episodes WHERE character_id = ? ORDER BY episode_id'
+    ).all(roleId));
+    const jobIds = ids(this.db.prepare(
+      'SELECT job_id FROM consolidation_jobs WHERE role_id = ? ORDER BY job_id'
+    ).all(roleId));
+    const planningIds = ids(this.db.prepare(
+      'SELECT planning_id FROM cognition_life_planning_attempts WHERE role_id = ? ORDER BY planning_id'
+    ).all(roleId));
+    const clearControlIds = ids(this.db.prepare(
+      'SELECT control_id FROM conversation_clear_controls WHERE role_id = ? ORDER BY control_id'
+    ).all(roleId));
+    const constraintIds = ids(this.db.prepare(
+      'SELECT DISTINCT constraint_id FROM constraint_records WHERE role_id = ? ORDER BY constraint_id'
+    ).all(roleId));
+    const stanceIds = ids(this.db.prepare(
+      'SELECT DISTINCT stance_id FROM stance_records WHERE role_id = ? ORDER BY stance_id'
+    ).all(roleId));
+    const linkedIds = [...new Set([
+      roleId, ...turnIds, ...lineageKeys, ...groupIds, ...messageIds, ...batchIds,
+      ...factIds, ...episodeIds, ...jobIds, ...planningIds, ...clearControlIds,
+      ...constraintIds, ...stanceIds
+    ])].filter(id => id !== controlId && id !== backupReceiptId);
+    const marks = values => values.map(() => '?').join(',');
+    const removeByIds = (table, column, values) => {
+      if (values.length) this.db.prepare(
+        `DELETE FROM "${table}" WHERE "${column}" IN (${marks(values)})`
+      ).run(...values);
+    };
+
+    removeByIds('sync_log', 'entity_id', linkedIds);
+    removeByIds('cognition_shadow_runs', 'turn_id', turnIds);
+    removeByIds('cognition_shadow_runs', 'subject_id', [...turnIds, ...planningIds]);
+    removeByIds('delivery_receipt_items', 'turn_id', turnIds);
+    removeByIds('cloud_deliveries', 'turn_id', turnIds);
+    removeByIds('suppressed_messages', 'message_id', messageIds);
+    removeByIds('annotations', 'turn_id', turnIds);
+    removeByIds('annotations', 'source_message_id', messageIds);
+    removeByIds('diagnostics', 'turn_id', turnIds);
+    this.db.prepare('DELETE FROM consolidation_jobs WHERE role_id = ?').run(roleId);
+    removeByIds('current_user_batch_items', 'turn_id', turnIds);
+    removeByIds('visible_result_items', 'group_id', groupIds);
+    removeByIds('visible_result_actions', 'group_id', groupIds);
+    removeByIds('visible_result_manifests', 'group_id', groupIds);
+    removeByIds('visible_commit_receipts', 'group_id', groupIds);
+    removeByIds('messages', 'message_id', messageIds);
+    removeByIds('current_user_batches', 'turn_id', turnIds);
+    removeByIds('turn_stages', 'turn_id', turnIds);
+    removeByIds('visible_result_groups', 'group_id', groupIds);
+    removeByIds('turns', 'turn_id', turnIds);
+    removeByIds('turn_authority_lineages', 'lineage_key', lineageKeys);
+    fault('after_role_authority');
+
+    this.db.prepare('DELETE FROM facts WHERE character_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM sessions WHERE role = ?').run(roleId);
+    this.db.prepare('DELETE FROM life_episodes WHERE character_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM character_life_state WHERE character_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM cognitive_states WHERE role_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM consolidation_backfill_cursors WHERE role_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM cognition_life_planning_attempts WHERE role_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM constraint_records WHERE role_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM stance_records WHERE role_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM state_migration_audit WHERE role_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM interaction_lanes WHERE role_id = ?').run(roleId);
+    this.db.prepare('DELETE FROM conversation_clear_controls WHERE role_id = ?').run(roleId);
+    fault('after_role_semantics');
+  }
+
+  applyRoleDeleteInternal(control, { appliedAt, faultAfterStep = null } = {}) {
+    const normalized = validateRoleDeleteControl(control);
+    if (typeof appliedAt !== 'number' || !Number.isSafeInteger(appliedAt) || appliedAt <= 0) {
+      throw new Error('role delete appliedAt conflict');
+    }
+    const fault = step => {
+      if (faultAfterStep === step) throw new Error(`forced role delete fault: ${step}`);
+    };
+
+    const requestState = this.withImmediateTransaction(() => {
+      const current = validateRoleDeleteControl(control);
+      if (canonicalJson(current) !== canonicalJson(normalized)) {
+        throw new Error('role delete control changed during transaction');
+      }
+      const applied = this.loadRoleDeletionAppliedAuditInternal(current.controlId);
+      if (applied) {
+        if (canonicalJson(applied.request.control) !== canonicalJson(current)) {
+          throw new Error('role deletion applied replay conflict');
+        }
+        this.assertRoleDeletedRowsInternal(current.roleId);
+        return { applied: applied.applied };
+      }
+      const roleRequests = this.db.prepare(`
+        SELECT entity_id FROM sync_log
+        WHERE entity_type = 'role_deletion_request'
+        ORDER BY entity_id, seq
+      `).all();
+      for (const row of roleRequests) {
+        const existing = this.loadRoleDeletionRequestAuditInternal(row.entity_id);
+        if (existing.control.roleId === current.roleId
+          && existing.control.controlId !== current.controlId) {
+          throw new Error('role deletion role authority conflict');
+        }
+      }
+      const existingRows = this.db.prepare(`
+        SELECT * FROM sync_log
+        WHERE entity_type = 'role_deletion_request' AND entity_id = ?
+        ORDER BY seq
+      `).all(current.controlId);
+      if (existingRows.length) {
+        const existing = this.loadRoleDeletionRequestAuditInternal(current.controlId);
+        if (canonicalJson(existing.control) !== canonicalJson(current)) {
+          throw new Error('role deletion request replay conflict');
+        }
+        return { request: existing.control };
+      }
+      const receiptRows = this.db.prepare(`
+        SELECT * FROM sync_log
+        WHERE entity_type = 'backup_receipt' AND entity_id = ?
+        ORDER BY seq
+      `).all(current.backupReceipt.receiptId);
+      if (receiptRows.length !== 1
+        || receiptRows[0].operation !== 'create'
+        || receiptRows[0].payload_json !== canonicalJson(current.backupReceipt)
+        || receiptRows[0].checksum !== contentHash(current.backupReceipt)
+        || Number(receiptRows[0].created_at) !== current.backupReceipt.createdAt) {
+        throw new Error('role delete backup receipt audit conflict');
+      }
+      this.db.prepare(`
+        INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+        VALUES ('role_deletion_request', ?, 'request', ?, ?, ?)
+      `).run(
+        current.controlId, canonicalJson(current), contentHash(current), current.requestedAt
+      );
+      fault('after_request');
+      return { request: current };
+    });
+    if (requestState.applied) return requestState.applied;
+
+    const unredactedRoleTurns = Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM turns
+      WHERE character_id = ? AND authority_redacted_at IS NULL
+    `).get(normalized.roleId).value);
+    if (unredactedRoleTurns > 0) {
+      this.redactRoleAuthorityForDeletionInternal(normalized, { redactedAt: appliedAt, fault });
+    }
+
+    return this.withImmediateTransaction(() => {
+      const request = this.loadRoleDeletionRequestAuditInternal(normalized.controlId);
+      if (canonicalJson(request.control) !== canonicalJson(normalized)) {
+        throw new Error('role deletion request replay conflict');
+      }
+      const existingApplied = this.loadRoleDeletionAppliedAuditInternal(normalized.controlId);
+      if (existingApplied) return existingApplied.applied;
+      const pendingRetractions = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value
+        FROM cloud_deliveries d JOIN turns t ON t.turn_id = d.turn_id
+        WHERE t.character_id = ? AND d.state = 'redaction_pending'
+      `).get(normalized.roleId).value);
+      if (pendingRetractions > 0) {
+        return this.roleDeletionPendingProjectionInternal(normalized, pendingRetractions);
+      }
+      const unsafeDeliveries = Number(this.db.prepare(`
+        SELECT COUNT(*) AS value
+        FROM cloud_deliveries d JOIN turns t ON t.turn_id = d.turn_id
+        WHERE t.character_id = ? AND d.state <> 'redacted'
+      `).get(normalized.roleId).value);
+      if (unsafeDeliveries !== 0) throw new Error('role delete delivery retraction conflict');
+      this.deleteRoleRowsInternal({
+        roleId: normalized.roleId,
+        controlId: normalized.controlId,
+        backupReceiptId: normalized.backupReceipt.receiptId,
+        fault
+      });
+      const applied = this.roleDeletionAppliedProjectionInternal(normalized, appliedAt);
+      this.db.prepare(`
+        INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+        VALUES ('role_deletion', ?, 'apply', ?, ?, ?)
+      `).run(
+        normalized.controlId, canonicalJson(applied), contentHash(applied), applied.appliedAt
+      );
+      fault('after_applied_audit');
+      this.assertRoleDeletedRowsInternal(normalized.roleId);
+      this.assertRoleDeletionAuditClosureInternal();
+      fault('after_post_write_validation');
+      return applied;
     });
   }
 
@@ -10151,6 +10822,7 @@ export class YuqiStore {
         });
         return outcome || { status: 'created', turn: exactTurn };
       }
+      this.assertRoleDeletionAllowsNewWorkInternal(envelope.characterId);
 
       let validatedRetry = null;
       let freshProactiveAgencySnapshot = null;
@@ -12406,6 +13078,7 @@ export class YuqiStore {
     }
 
     return this.transaction(() => {
+      this.assertRoleDeletionAllowsNewWorkInternal(envelope.characterId);
       let effectivePin = { ...pin };
       let rollout = null;
       if (pin.rolloutKey) {
@@ -15689,6 +16362,7 @@ export class YuqiStore {
       if (exact.authoritativeResultChecksum) this.assertLifePlanningTerminalReplayInternal(exact);
       return exact;
     }
+    this.assertRoleDeletionAllowsNewWorkInternal(roleId);
     assertLifePlanningInputAuthority({
       ...attempt,
       roleId,

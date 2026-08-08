@@ -14,7 +14,10 @@ import {
   canonicalJson,
   contentHash,
   validateConversationClearApplied,
-  validateConversationClearControl
+  validateConversationClearControl,
+  validateRoleDeleteApplied,
+  validateRoleDeleteControl,
+  validateRoleDeletePending
 } from '../src/protocol.mjs';
 import { YuqiStore } from '../src/store.mjs';
 import { commitVisibleResult } from '../src/visible-result-commit.mjs';
@@ -113,6 +116,48 @@ function appliedWire(wire, appliedAt = 1784400000100) {
     clearedThroughSequence: wire.clearedThroughSequence,
     appliedAt
   };
+  return { ...body, checksum: contentHash(body) };
+}
+
+function roleDeleteBackupReceipt(roleId = 'yuqi', createdAt = 1784400200000) {
+  const body = {
+    receiptVersion: 'yuqi-backup-receipt-v1',
+    roleId,
+    manifestChecksum: 'b'.repeat(64),
+    snapshotSha256: 'c'.repeat(64),
+    logicalChecksum: 'd'.repeat(64),
+    createdAt
+  };
+  body.receiptId = `bkrcpt_${contentHash({
+    contract: 'yuqi-backup-receipt-id-v1',
+    roleId,
+    manifestChecksum: body.manifestChecksum,
+    snapshotSha256: body.snapshotSha256,
+    logicalChecksum: body.logicalChecksum,
+    createdAt
+  }).slice(0, 24)}`;
+  return { ...body, receiptChecksum: contentHash(body) };
+}
+
+function roleDeleteControl(overrides = {}) {
+  const body = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE',
+    controlVersion: 'role_delete_v1',
+    roleId: 'yuqi',
+    peerId: 'device1',
+    requestedAt: 1784400200100,
+    backupReceipt: roleDeleteBackupReceipt(),
+    ...overrides
+  };
+  body.controlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'role_delete_v1',
+    roleId: body.roleId,
+    peerId: body.peerId,
+    requestedAt: body.requestedAt,
+    backupReceiptChecksum: body.backupReceipt.receiptChecksum
+  })}`;
   return { ...body, checksum: contentHash(body) };
 }
 
@@ -2295,6 +2340,194 @@ for (const [label, mutate] of [
       assert.deepEqual(redactionDatabaseSnapshot(store), before);
       assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM conversation_clear_controls').get().value, 0);
       store.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+test('role deletion requires an audited backup, waits for remote retraction, then deletes the role exactly once', () => {
+  const { dir, path } = tempPath('yuqi-role-delete-two-phase-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { deliveryState: 'mailboxed' });
+    const control = validateRoleDeleteControl(roleDeleteControl());
+    const beforeMissingReceipt = redactionDatabaseSnapshot(store);
+    assert.throws(
+      () => store.applyRoleDeleteInternal(control, { appliedAt: 1784400200200 }),
+      /backup receipt|role delete/i
+    );
+    assert.deepEqual(redactionDatabaseSnapshot(store), beforeMissingReceipt);
+
+    store.registerBackupReceiptInternal(control.backupReceipt);
+    const pending = store.applyRoleDeleteInternal(control, { appliedAt: 1784400200200 });
+    assert.deepEqual(validateRoleDeletePending(pending), pending);
+    assert.equal(pending.pendingRetractions, 1);
+    assert.equal(store.db.prepare(
+      "SELECT COUNT(*) AS count FROM sync_log WHERE entity_type = 'role_deletion_request' AND entity_id = ?"
+    ).get(control.controlId).count, 1);
+    assert.equal(store.db.prepare(
+      'SELECT state FROM cloud_deliveries WHERE authority_group_id = ?'
+    ).get(fixture.groupId).state, 'redaction_pending');
+    assert.throws(
+      () => store.submitTurn(legacyV2AboveEnvelope('turn_during_delete', 'yuqi', 'device1')),
+      /role deletion|role delete/i
+    );
+
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.deepEqual(
+      reopened.applyRoleDeleteInternal(control, { appliedAt: 1784400200300 }),
+      pending
+    );
+    reopened.completeRedactionDeliveryInternal({
+      turnId: fixture.terminal.turnId,
+      peerId: 'device1',
+      relayMessageId: `relay_${fixture.terminal.turnId}`,
+      requestAt: 1784400200200,
+      ackAt: 1784400200400
+    });
+    const applied = reopened.applyRoleDeleteInternal(control, { appliedAt: 1784400200500 });
+    assert.deepEqual(validateRoleDeleteApplied(applied), applied);
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM turns WHERE character_id = ?'
+    ).get('yuqi').count, 0);
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM interaction_lanes WHERE role_id = ?'
+    ).get('yuqi').count, 0);
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM turn_authority_lineages WHERE role_id = ?'
+    ).get('yuqi').count, 0);
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM visible_result_groups WHERE role_id = ?'
+    ).get('yuqi').count, 0);
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM conversation_clear_controls WHERE role_id = ?'
+    ).get('yuqi').count, 0);
+    assert.ok(reopened.getTurn(fixture.above.turnId), 'another role must remain intact');
+    assert.equal(reopened.db.prepare(
+      "SELECT COUNT(*) AS count FROM sync_log WHERE entity_type = 'backup_receipt' AND entity_id = ?"
+    ).get(control.backupReceipt.receiptId).count, 1);
+    assert.equal(reopened.db.prepare(
+      "SELECT COUNT(*) AS count FROM sync_log WHERE entity_type = 'role_deletion_request' AND entity_id = ?"
+    ).get(control.controlId).count, 1);
+    assert.equal(reopened.db.prepare(
+      "SELECT COUNT(*) AS count FROM sync_log WHERE entity_type = 'role_deletion' AND entity_id = ?"
+    ).get(control.controlId).count, 1);
+    assert.deepEqual(
+      reopened.applyRoleDeleteInternal(control, { appliedAt: 1784400200600 }),
+      applied
+    );
+    reopened.close();
+    const finalReopen = new YuqiStore(path);
+    assert.deepEqual(
+      finalReopen.applyRoleDeleteInternal(control, { appliedAt: 1784400200700 }),
+      applied
+    );
+    finalReopen.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('role deletion retracts a canonical public-moment delivery before removing every lane', () => {
+  const { dir, path } = tempPath('yuqi-role-delete-public-moment-');
+  try {
+    const store = new YuqiStore(path);
+    store.initializeCognitionRolloutsInternal({
+      rows: [
+        { rolloutKey: 'DIRECT_REPLY', currentMode: 'legacy', rolloutPhase: 'stable',
+          presetVersion: '1.9.2', pipelineChecksum: 'a'.repeat(64) },
+        { rolloutKey: 'PROACTIVE_MOMENT', currentMode: 'legacy', rolloutPhase: 'stable',
+          presetVersion: '1.9.2', pipelineChecksum: 'b'.repeat(64) }
+      ],
+      now: 1784400100000
+    });
+    seedPrivateLane(store, { now: 1784400100000 });
+    const fixture = createCanonicalV3PublicMomentFixture(store);
+    const delivery = store.db.prepare(
+      'SELECT * FROM cloud_deliveries WHERE authority_group_id = ?'
+    ).get(fixture.groupId);
+    const payload = { groupId: fixture.groupId, commitChecksum: delivery.authority_commit_checksum };
+    store.db.prepare(`
+      UPDATE cloud_deliveries
+      SET state = 'mailboxed', payload_json = ?, checksum = ?, attempts = 1,
+          relay_message_id = ?, delivered_at = ?, updated_at = ?
+      WHERE turn_id = ? AND peer_id = ?
+    `).run(
+      canonicalJson(payload), contentHash(payload), `relay_${fixture.turn.turnId}`,
+      1784400200150, 1784400200150, fixture.turn.turnId, fixture.turn.deviceId
+    );
+    const control = roleDeleteControl();
+    store.registerBackupReceiptInternal(control.backupReceipt);
+    const pending = store.applyRoleDeleteInternal(control, { appliedAt: 1784400200200 });
+    assert.equal(validateRoleDeletePending(pending).pendingRetractions, 1);
+    assert.equal(store.db.prepare(
+      'SELECT state FROM cloud_deliveries WHERE authority_group_id = ?'
+    ).get(fixture.groupId).state, 'redaction_pending');
+    store.close();
+    const reopened = new YuqiStore(path);
+    reopened.completeRedactionDeliveryInternal({
+      turnId: fixture.turn.turnId,
+      peerId: fixture.turn.deviceId,
+      relayMessageId: `relay_${fixture.turn.turnId}`,
+      requestAt: 1784400200200,
+      ackAt: 1784400200300
+    });
+    const applied = reopened.applyRoleDeleteInternal(control, { appliedAt: 1784400200400 });
+    assert.equal(validateRoleDeleteApplied(applied).roleId, 'yuqi');
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM interaction_lanes WHERE role_id = ?'
+    ).get('yuqi').count, 0);
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM turns WHERE character_id = ?'
+    ).get('yuqi').count, 0);
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const faultAfterStep of [
+  'after_role_authority',
+  'after_role_semantics',
+  'after_applied_audit',
+  'after_post_write_validation'
+]) {
+  test(`role deletion final fault ${faultAfterStep} rolls the physical delete and proof back`, () => {
+    const { dir, path } = tempPath(`yuqi-role-delete-fault-${faultAfterStep}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createCanonicalRedactionFixture(store, { deliveryState: 'mailboxed' });
+      const control = roleDeleteControl();
+      store.registerBackupReceiptInternal(control.backupReceipt);
+      const pending = store.applyRoleDeleteInternal(control, { appliedAt: 1784400200200 });
+      assert.equal(validateRoleDeletePending(pending).pendingRetractions, 1);
+      store.completeRedactionDeliveryInternal({
+        turnId: fixture.terminal.turnId,
+        peerId: fixture.terminal.deviceId,
+        relayMessageId: `relay_${fixture.terminal.turnId}`,
+        requestAt: 1784400200200,
+        ackAt: 1784400200300
+      });
+      const before = redactionDatabaseSnapshot(store);
+      assert.throws(
+        () => store.applyRoleDeleteInternal(control, {
+          appliedAt: 1784400200400,
+          faultAfterStep
+        }),
+        /forced role delete fault/
+      );
+      assert.deepEqual(redactionDatabaseSnapshot(store), before);
+      assert.equal(store.db.prepare(
+        "SELECT COUNT(*) AS count FROM sync_log WHERE entity_type = 'role_deletion' AND entity_id = ?"
+      ).get(control.controlId).count, 0);
+      assert.ok(store.getTurn(fixture.terminal.turnId));
+      store.close();
+      const reopened = new YuqiStore(path);
+      const applied = reopened.applyRoleDeleteInternal(control, { appliedAt: 1784400200500 });
+      assert.equal(validateRoleDeleteApplied(applied).roleId, 'yuqi');
+      reopened.close();
     } finally {
       closeDir(dir);
     }

@@ -8493,6 +8493,55 @@ Stop after this commit for independent review.
   is the idempotency proof after role rows are gone. Exact replay returns the
   proof; changed replay conflicts. Neither endpoint physically deletes audit or
   control proof.
+- Role deletion is a two-phase authority lifecycle; it is never implemented as
+  one eager series of `DELETE` statements. In the first immediate transaction,
+  PC validates the exact `backup_receipt` and appends exactly one closed
+  `role_deletion_request` sync audit keyed by `controlId`. That durable request
+  immediately freezes the role against every new direct, automatic, retry and
+  life-planning turn. A resumable follow-up transaction then applies the existing
+  canonical/legacy redaction machinery to all role conversations. A crash between
+  these transactions is safe: restart sees the request, keeps the role frozen and
+  resumes redaction; it never treats the request alone as applied deletion. Every
+  already-enqueued PC-to-phone delivery keeps its immutable remote relay identity
+  and enters the existing retraction lifecycle. The request audit is the
+  restart-stable phase source; exact replay resumes it and a changed control
+  conflicts before any write.
+- The first phase returns a stable pending result while any role delivery is
+  `redaction_pending`. LAN returns HTTP 202 with the closed pending projection;
+  cloud deliberately does not ACK the incoming role-delete control yet, so the
+  relay retries the same immutable control. This is safe because the PC relay
+  loop drains outbound retractions before polling inbound controls. Pending is
+  not success: Android keeps the lifecycle control and role tombstone, and the
+  Web UI must not remove the visible role merely because phase one committed.
+- After every role retraction is durably acknowledged, an exact replay performs
+  phase two in one immediate transaction. It revalidates the request and backup
+  audits, proves that no pending/outbound role delivery remains, then deletes
+  every role-scoped PC row and child projection in FK-safe order. It retains the
+  immutable `backup_receipt`, `role_deletion_request`, and final
+  `role_deletion` audits, but no message, action, memory, evidence, state,
+  stance, plan, lane, lineage, delivery, diagnostic, comparison or semantic
+  redaction row for the deleted role. Global release definitions remain.
+- The closed pending projection has exactly
+  `protocolVersion,type,controlId,controlChecksum,roleId,peerId,state,`
+  `pendingRetractions,requestedAt,checksum`; `type` is
+  `ROLE_DELETE_PENDING`, `state` is `pending_retractions`, and the final applied
+  projection remains the exact nine-key `ROLE_DELETE_APPLIED` contract. Both are
+  computed solely from persistent audit/delivery state. Cloud ACK-with-response
+  occurs only for final applied replay; LAN 202 pending never fabricates an
+  Android applied ACK.
+- The retained Android `role_delete_v1` lifecycle control is the local
+  tombstone after application. Any late LAN/cloud turn, reply, result, action,
+  notification, UI inbox item or Room recovery row for that role is relay-ACKed
+  when applicable but suppressed before Room/Web recreation. Backup receipt,
+  request/final audits and the Android tombstone are metadata-only and must not
+  retain role chat or memory semantics.
+- Tests must cover first-phase restart, exact pending replay, changed replay,
+  new-turn rejection during pending/applied deletion, waiting and already
+  mailboxed deliveries, redaction acknowledgement before finalization, final
+  fault rollback at every write boundary, exact applied replay, two concurrent
+  finalizers, and close/reopen proof that only the three allowed metadata audits
+  remain. They must also prove that a stale outbox snapshot cannot enqueue or
+  quarantine a delivery after the role-deletion phase changes.
 
 **Backup/restore:**
 - Role deletion first calls authenticated LAN

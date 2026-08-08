@@ -681,6 +681,74 @@ export function validateRoleDeleteControl(raw) {
   return normalized;
 }
 
+const ROLE_DELETE_PENDING_KEYS = Object.freeze([
+  'protocolVersion',
+  'type',
+  'controlId',
+  'controlChecksum',
+  'roleId',
+  'peerId',
+  'state',
+  'pendingRetractions',
+  'requestedAt',
+  'checksum'
+]);
+
+export function validateRoleDeletePending(raw) {
+  let value = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new Error('invalid role delete pending JSON');
+    }
+  }
+  assertClosedKeys(value, ROLE_DELETE_PENDING_KEYS, 'role delete pending');
+  if (value.protocolVersion !== 3
+    || value.type !== 'ROLE_DELETE_PENDING'
+    || value.state !== 'pending_retractions') {
+    throw new Error('invalid role delete pending identity');
+  }
+  const controlId = requireNativeConversationClearId(
+    value.controlId, 'role delete pending control id'
+  );
+  const roleId = requireNativeConversationClearId(value.roleId, 'role delete pending role id');
+  const peerId = requireNativeConversationClearId(value.peerId, 'role delete pending peer id');
+  if (typeof value.controlChecksum !== 'string'
+    || !/^[a-f0-9]{64}$/.test(value.controlChecksum)) {
+    throw new Error('invalid role delete pending control checksum');
+  }
+  if (typeof value.pendingRetractions !== 'number'
+    || !Number.isSafeInteger(value.pendingRetractions)
+    || value.pendingRetractions < 0) {
+    throw new Error('invalid role delete pending retraction count');
+  }
+  const requestedAt = requireNativeConversationClearTimestamp(
+    value.requestedAt, 'role delete pending requestedAt'
+  );
+  if (typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(value.checksum)) {
+    throw new Error('invalid role delete pending checksum');
+  }
+  const normalized = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_PENDING',
+    controlId,
+    controlChecksum: value.controlChecksum,
+    roleId,
+    peerId,
+    state: 'pending_retractions',
+    pendingRetractions: value.pendingRetractions,
+    requestedAt,
+    checksum: value.checksum
+  };
+  const withoutChecksum = { ...normalized };
+  delete withoutChecksum.checksum;
+  if (contentHash(withoutChecksum) !== value.checksum) {
+    throw new Error('role delete pending checksum conflict');
+  }
+  return normalized;
+}
+
 const ROLE_DELETE_APPLIED_KEYS = Object.freeze([
   'protocolVersion',
   'type',

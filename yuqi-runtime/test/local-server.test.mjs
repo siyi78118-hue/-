@@ -166,6 +166,60 @@ function yuqiBackupReceipt(request) {
   return { ...basis, receiptChecksum: contentHash(basis) };
 }
 
+function roleDeleteControl(overrides = {}) {
+  const request = yuqiBackupRequest();
+  const backupReceipt = yuqiBackupReceipt(request);
+  const basis = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE',
+    controlVersion: 'role_delete_v1',
+    roleId: request.roleId,
+    peerId: request.peerId,
+    requestedAt: request.requestedAt + 100,
+    backupReceipt,
+    ...overrides
+  };
+  basis.controlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'role_delete_v1',
+    roleId: basis.roleId,
+    peerId: basis.peerId,
+    requestedAt: basis.requestedAt,
+    backupReceiptChecksum: basis.backupReceipt.receiptChecksum
+  })}`;
+  basis.checksum = contentHash(basis);
+  return basis;
+}
+
+function roleDeletePending(control, pendingRetractions = 1) {
+  const basis = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_PENDING',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    state: 'pending_retractions',
+    pendingRetractions,
+    requestedAt: control.requestedAt
+  };
+  return { ...basis, checksum: contentHash(basis) };
+}
+
+function roleDeleteApplied(control, appliedAt = 1784400000300) {
+  const basis = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_APPLIED',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    backupReceiptId: control.backupReceipt.receiptId,
+    appliedAt
+  };
+  return { ...basis, checksum: contentHash(basis) };
+}
+
 function call(port, { method = 'GET', path = '/', body = '', secret = '', nonce = 'nonce-1', timestamp = Date.now() }) {
   const payload = typeof body === 'string' ? body : JSON.stringify(body);
   const headers = { 'content-type': 'application/json' };
@@ -1426,6 +1480,75 @@ test('Android backup request rejects changed or missing Room authority before sn
       });
       assert.equal(response.status, 400);
     }
+    assert.equal(calls, 0);
+  } finally {
+    await server.close();
+  }
+});
+
+test('role delete LAN route returns closed pending and applied proofs with distinct status codes', async () => {
+  const control = roleDeleteControl();
+  const pending = roleDeletePending(control, 2);
+  const applied = roleDeleteApplied(control);
+  const calls = [];
+  const proofs = [pending, applied];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    clock: () => applied.appliedAt,
+    store: {
+      getSyncDelta: () => [],
+      ackSync: () => 0,
+      applyRoleDeleteInternal(value, options) {
+        calls.push({ value, options });
+        return proofs.shift();
+      }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const first = await call(server.address().port, {
+      method: 'POST', path: '/v3/controls/role-delete', body: control,
+      secret: 'test-pairing-secret', timestamp: applied.appliedAt,
+      nonce: 'role-delete-pending'
+    });
+    const second = await call(server.address().port, {
+      method: 'POST', path: '/v3/controls/role-delete', body: control,
+      secret: 'test-pairing-secret', timestamp: applied.appliedAt,
+      nonce: 'role-delete-applied'
+    });
+    assert.deepEqual(first, { status: 202, body: pending });
+    assert.deepEqual(second, { status: 200, body: applied });
+    assert.deepEqual(calls, [
+      { value: control, options: { appliedAt: applied.appliedAt } },
+      { value: control, options: { appliedAt: applied.appliedAt } }
+    ]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('role delete LAN route rejects malformed control before store work', async () => {
+  const control = roleDeleteControl();
+  let calls = 0;
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    clock: () => 1784400000300,
+    store: {
+      getSyncDelta: () => [],
+      ackSync: () => 0,
+      applyRoleDeleteInternal() { calls += 1; }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const response = await call(server.address().port, {
+      method: 'POST', path: '/v3/controls/role-delete', body: { ...control, secret: 'leak' },
+      secret: 'test-pairing-secret', timestamp: 1784400000300,
+      nonce: 'role-delete-invalid'
+    });
+    assert.equal(response.status, 400);
     assert.equal(calls, 0);
   } finally {
     await server.close();

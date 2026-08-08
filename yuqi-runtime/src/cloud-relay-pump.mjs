@@ -6,7 +6,10 @@ import {
   validateAuthorityDeliveryReceipt,
   validateConversationClearApplied,
   validateConversationClearControl,
-  validateEnvelope
+  validateEnvelope,
+  validateRoleDeleteApplied,
+  validateRoleDeleteControl,
+  validateRoleDeletePending
 } from './protocol.mjs';
 import { normalizeRecoverySnapshot } from './reconcile.mjs';
 
@@ -38,9 +41,17 @@ function encryptSerializedRelayPayload(serialized, encryptionKeyBase64, nonce) {
 
 function isConversationClearCandidate(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (isRoleDeleteCandidate(value)) return false;
   if (value.type === 'CONVERSATION_CLEAR') return true;
   return ['controlVersion', 'controlId', 'inputCursorChecksum', 'clearEpoch', 'clearedThroughSequence']
     .some(key => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function isRoleDeleteCandidate(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return value.type === 'ROLE_DELETE'
+    || value.controlVersion === 'role_delete_v1'
+    || Object.prototype.hasOwnProperty.call(value, 'backupReceipt');
 }
 
 function deriveConversationClearResponse(proof, encryptionKeyBase64, now) {
@@ -57,6 +68,32 @@ function deriveConversationClearResponse(proof, encryptionKeyBase64, now) {
   const expiresAt = validated.appliedAt + 7 * 24 * 60 * 60 * 1000;
   if (validated.appliedAt > now || !Number.isSafeInteger(expiresAt) || expiresAt <= now) {
     throw new Error('invalid conversation clear response expiry');
+  }
+  const encrypted = encryptSerializedRelayPayload(canonicalJson(validated), encryptionKeyBase64, nonce);
+  return {
+    deviceId: validated.peerId,
+    messageId: responseMessageId,
+    direction: 'pc_to_phone',
+    ...encrypted,
+    idempotencyKey,
+    expiresAt
+  };
+}
+
+function deriveRoleDeleteResponse(proof, encryptionKeyBase64, now) {
+  const validated = validateRoleDeleteApplied(proof);
+  const responseMessageId = stableId(
+    'ctlack', `pc-lifecycle-response-message-id-v1\n${validated.controlId}\n${validated.checksum}`
+  );
+  const idempotencyKey = stableId(
+    'ctlackidem', `pc-lifecycle-response-idempotency-v1\n${validated.controlId}\n${validated.checksum}`
+  );
+  const nonce = createHmac('sha256', keyBytes(encryptionKeyBase64))
+    .update(`pc-lifecycle-response-gcm-nonce-v1\n${responseMessageId}`, 'utf8')
+    .digest().subarray(0, 12);
+  const expiresAt = validated.appliedAt + 7 * 24 * 60 * 60 * 1000;
+  if (validated.appliedAt > now || !Number.isSafeInteger(expiresAt) || expiresAt <= now) {
+    throw new Error('invalid role delete response expiry');
   }
   const encrypted = encryptSerializedRelayPayload(canonicalJson(validated), encryptionKeyBase64, nonce);
   return {
@@ -202,6 +239,48 @@ export class CloudRelayPump {
         let envelope = null;
         try {
           const rawEnvelope = decryptRelayPayload(message, this.encryptionKeyBase64);
+          if (isRoleDeleteCandidate(rawEnvelope)) {
+            let control;
+            try {
+              control = validateRoleDeleteControl(rawEnvelope);
+              if (control.peerId !== this.deviceId) throw new Error('role delete peer mismatch');
+            } catch (error) {
+              error.suppressStoreDiagnostic = true;
+              throw error;
+            }
+            if (!this.store || typeof this.store.applyRoleDeleteInternal !== 'function') {
+              throw new Error('role delete store is unavailable');
+            }
+            const outcome = await this.store.applyRoleDeleteInternal(control, { appliedAt: this.clock() });
+            if (outcome?.type === 'ROLE_DELETE_PENDING') {
+              validateRoleDeletePending(outcome);
+              continue;
+            }
+            const responseEnvelope = deriveRoleDeleteResponse(
+              validateRoleDeleteApplied(outcome), this.encryptionKeyBase64, this.clock()
+            );
+            const exchanged = await this.fetch(`${this.relayUrl}/bridge/ack-with-response`, {
+              method: 'POST', headers: this.headers(true),
+              body: JSON.stringify({
+                deviceId: this.deviceId,
+                incomingMessageId: message.messageId,
+                response: responseEnvelope
+              })
+            });
+            if (!exchanged.ok) throw new Error(`cloud relay ack-with-response HTTP ${exchanged.status}`);
+            const exchangeBody = await exchanged.json();
+            const exchangeKeys = exchangeBody && typeof exchangeBody === 'object' && !Array.isArray(exchangeBody)
+              ? Object.keys(exchangeBody).sort() : [];
+            if (JSON.stringify(exchangeKeys) !== JSON.stringify(['idempotent', 'incomingMessageId', 'ok', 'responseMessageId'])
+              || exchangeBody.ok !== true
+              || exchangeBody.incomingMessageId !== message.messageId
+              || exchangeBody.responseMessageId !== responseEnvelope.messageId
+              || typeof exchangeBody.idempotent !== 'boolean') {
+              throw new Error('invalid cloud role delete exchange response');
+            }
+            summary.processed += 1;
+            continue;
+          }
           if (isConversationClearCandidate(rawEnvelope)) {
             let control;
             try {

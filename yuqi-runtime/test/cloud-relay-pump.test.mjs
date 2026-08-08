@@ -7,7 +7,7 @@ import {
   encryptRelayPayload
 } from '../src/cloud-relay-pump.mjs';
 import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
-import { contentHash } from '../src/protocol.mjs';
+import { contentHash, deriveYuqiBackupReceiptId } from '../src/protocol.mjs';
 
 const keyBase64 = Buffer.alloc(32, 7).toString('base64');
 const envelope = {
@@ -147,6 +147,70 @@ function clearAppliedProof(control, appliedAt = 1784400000200) {
     peerId: control.peerId,
     clearEpoch: control.clearEpoch,
     clearedThroughSequence: control.clearedThroughSequence,
+    appliedAt
+  };
+  return { ...value, checksum: contentHash(value) };
+}
+
+function roleDeleteControl(overrides = {}) {
+  const manifestChecksum = 'a'.repeat(64);
+  const snapshotSha256 = 'b'.repeat(64);
+  const logicalChecksum = 'c'.repeat(64);
+  const createdAt = 1784400000100;
+  const receiptBasis = {
+    receiptVersion: 'yuqi-backup-receipt-v1',
+    receiptId: deriveYuqiBackupReceiptId({
+      roleId: 'yuqi', manifestChecksum, snapshotSha256, logicalChecksum, createdAt
+    }),
+    roleId: 'yuqi', manifestChecksum, snapshotSha256, logicalChecksum, createdAt
+  };
+  const backupReceipt = { ...receiptBasis, receiptChecksum: contentHash(receiptBasis) };
+  const value = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE',
+    controlVersion: 'role_delete_v1',
+    roleId: 'yuqi',
+    peerId: 'phone_cloud',
+    requestedAt: 1784400000200,
+    backupReceipt,
+    ...overrides
+  };
+  value.controlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'role_delete_v1',
+    roleId: value.roleId,
+    peerId: value.peerId,
+    requestedAt: value.requestedAt,
+    backupReceiptChecksum: value.backupReceipt.receiptChecksum
+  })}`;
+  value.checksum = contentHash(value);
+  return value;
+}
+
+function roleDeletePending(control, pendingRetractions = 1) {
+  const value = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_PENDING',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    state: 'pending_retractions',
+    pendingRetractions,
+    requestedAt: control.requestedAt
+  };
+  return { ...value, checksum: contentHash(value) };
+}
+
+function roleDeleteApplied(control, appliedAt = 1784400000300) {
+  const value = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_APPLIED',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    backupReceiptId: control.backupReceipt.receiptId,
     appliedAt
   };
   return { ...value, checksum: contentHash(value) };
@@ -1064,4 +1128,103 @@ test('encrypted non-native v3 receipt dispositions never call the store or ackno
     assert.equal(calls, 0);
     assert.deepEqual(relay.state.acked, []);
   }
+});
+
+test('role delete cloud ingress leaves pending control unacknowledged until retractions finish', async () => {
+  const control = roleDeleteControl();
+  const pending = roleDeletePending(control, 2);
+  const encrypted = encryptRelayPayload(control, keyBase64, Buffer.alloc(12, 12));
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64,
+    clock: () => 1784400000300,
+    fetchImpl: async url => {
+      const path = new URL(url).pathname;
+      if (path === '/bridge/poll') {
+        return Response.json({ ok: true, messages: [{ messageId: 'relay_role_delete_pending', ...encrypted }] });
+      }
+      events.push(`unexpected:${path}`);
+      throw new Error('pending role delete must not ACK');
+    },
+    store: {
+      applyRoleDeleteInternal(value, options) {
+        events.push({ kind: 'delete', value, options });
+        return pending;
+      },
+      applyConversationClearInternal() {
+        events.push({ kind: 'wrong-clear-route' });
+        throw new Error('role delete must not use conversation clear');
+      }
+    },
+    orchestrator: { async process() { throw new Error('must not dispatch control'); } }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.processed, 0);
+  assert.equal(result.failed, 0);
+  assert.deepEqual(events, [{ kind: 'delete', value: control, options: { appliedAt: 1784400000300 } }]);
+});
+
+test('role delete cloud ingress ACKs with one deterministic response only after applied proof', async () => {
+  const control = roleDeleteControl();
+  const applied = roleDeleteApplied(control);
+  const encrypted = encryptRelayPayload(control, keyBase64, Buffer.alloc(12, 13));
+  const exchanges = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64,
+    clock: () => applied.appliedAt,
+    fetchImpl: async (url, options = {}) => {
+      const path = new URL(url).pathname;
+      if (path === '/bridge/poll') {
+        return Response.json({ ok: true, messages: [{ messageId: 'relay_role_delete_applied', ...encrypted }] });
+      }
+      if (path === '/bridge/ack-with-response') {
+        const body = JSON.parse(options.body);
+        exchanges.push(body);
+        return Response.json({
+          ok: true,
+          incomingMessageId: body.incomingMessageId,
+          responseMessageId: body.response.messageId,
+          idempotent: false
+        });
+      }
+      throw new Error(`unexpected relay path ${path}`);
+    },
+    store: { applyRoleDeleteInternal: () => applied },
+    orchestrator: { async process() { throw new Error('must not dispatch control'); } }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.processed, 1);
+  assert.equal(result.failed, 0);
+  assert.equal(exchanges.length, 1);
+  assert.equal(exchanges[0].incomingMessageId, 'relay_role_delete_applied');
+  assert.deepEqual(decryptRelayPayload(exchanges[0].response, keyBase64), applied);
+});
+
+test('invalid role delete cloud control is rejected before either lifecycle store or ACK', async () => {
+  const control = { ...roleDeleteControl(), secret: 'leak' };
+  const encrypted = encryptRelayPayload(control, keyBase64, Buffer.alloc(12, 14));
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64,
+    fetchImpl: async url => {
+      const path = new URL(url).pathname;
+      if (path === '/bridge/poll') {
+        return Response.json({ ok: true, messages: [{ messageId: 'relay_role_delete_invalid', ...encrypted }] });
+      }
+      events.push(`ack:${path}`);
+      throw new Error('invalid role delete must not ACK');
+    },
+    store: {
+      applyRoleDeleteInternal() { events.push('role-delete'); },
+      applyConversationClearInternal() { events.push('conversation-clear'); }
+    },
+    orchestrator: { async process() { events.push('dispatch'); } }
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.processed, 0);
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, []);
 });

@@ -7,6 +7,9 @@ import {
   validateConversationClearApplied,
   validateConversationClearControl,
   validateEnvelope,
+  validateRoleDeleteApplied,
+  validateRoleDeleteControl,
+  validateRoleDeletePending,
   validateYuqiBackupReceipt,
   validateYuqiBackupRequest
 } from './protocol.mjs';
@@ -139,6 +142,38 @@ function isConversationClearAuthorityConflict(error) {
   const message = String(error?.message || '');
   if (CONVERSATION_CLEAR_AUTHORITY_MESSAGES.has(message)) return true;
   return CONVERSATION_CLEAR_AUTHORITY_PREFIXES.some(prefix => (
+    message.startsWith(prefix) && message.length > prefix.length
+  ));
+}
+
+const ROLE_DELETE_AUTHORITY_MESSAGES = new Set([
+  'role delete appliedAt conflict',
+  'role delete backup receipt audit conflict',
+  'role delete control changed during transaction',
+  'role delete delivery retraction conflict',
+  'role deletion applied audit conflict',
+  'role deletion applied replay conflict',
+  'role deletion canonical lineage conflict',
+  'role deletion canonical lineage state conflict',
+  'role deletion lane CAS conflict',
+  'role deletion request audit conflict',
+  'role deletion request replay conflict',
+  'role deletion role authority conflict'
+]);
+
+const ROLE_DELETE_AUTHORITY_PREFIXES = Object.freeze([
+  'role deletion legacy envelope conflict: ',
+  'role deletion legacy authority conflict: ',
+  'role deletion legacy projection conflict: ',
+  'role deletion retained '
+]);
+
+function isRoleDeleteAuthorityConflict(error) {
+  if (error instanceof TypeError) return false;
+  if (error?.code === 'ROLE_DELETE_AUTHORITY_CONFLICT') return true;
+  const message = String(error?.message || '');
+  if (ROLE_DELETE_AUTHORITY_MESSAGES.has(message)) return true;
+  return ROLE_DELETE_AUTHORITY_PREFIXES.some(prefix => (
     message.startsWith(prefix) && message.length > prefix.length
   ));
 }
@@ -335,6 +370,30 @@ export function createYuqiServer({
         throw new Error('Yuqi backup receipt authority conflict');
       }
       return json(response, 200, receipt);
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v3/controls/role-delete') {
+      let control;
+      try {
+        control = validateRoleDeleteControl(body);
+      } catch (error) {
+        return json(response, 400, { ok: false, error: error.message });
+      }
+      if (typeof store.applyRoleDeleteInternal !== 'function') {
+        return json(response, 503, { ok: false, error: 'role delete store is unavailable' });
+      }
+      try {
+        const proof = await store.applyRoleDeleteInternal(control, { appliedAt: clock() });
+        if (proof?.type === 'ROLE_DELETE_PENDING') {
+          return json(response, 202, validateRoleDeletePending(proof));
+        }
+        return json(response, 200, validateRoleDeleteApplied(proof));
+      } catch (error) {
+        if (isRoleDeleteAuthorityConflict(error)) {
+          return json(response, 409, { ok: false, error: 'ROLE_DELETE_AUTHORITY_CONFLICT' });
+        }
+        throw error;
+      }
     }
 
     if (request.method === 'POST' && url.pathname === '/v3/controls/conversation-clear') {

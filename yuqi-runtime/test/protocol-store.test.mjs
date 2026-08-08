@@ -14,6 +14,7 @@ import {
   validateConversationClearApplied,
   validateRoleDeleteApplied,
   validateRoleDeleteControl,
+  validateRoleDeletePending,
   validateEnvelope
 } from '../src/protocol.mjs';
 import { deriveAuthorityLineageKey, YuqiStore } from '../src/store.mjs';
@@ -240,6 +241,49 @@ function validRoleDeleteApplied(overrides = {}) {
   };
   return { ...body, checksum: contentHash(body) };
 }
+
+function validRoleDeletePending(overrides = {}) {
+  const control = validRoleDeleteControl();
+  const body = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_PENDING',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    state: 'pending_retractions',
+    pendingRetractions: 2,
+    requestedAt: control.requestedAt,
+    ...overrides
+  };
+  return { ...body, checksum: contentHash(body) };
+}
+
+test('role delete pending validator closes the persistent retraction projection', () => {
+  const valid = validRoleDeletePending();
+  assert.deepEqual(validateRoleDeletePending(valid), valid);
+  assert.deepEqual(validateRoleDeletePending(JSON.stringify(valid)), valid);
+  for (const [label, changes] of [
+    ['unknown key', { extra: true }],
+    ['coerced count', { pendingRetractions: '2' }],
+    ['negative count', { pendingRetractions: -1 }],
+    ['wrong state', { state: 'applied' }],
+    ['array peer', { peerId: ['device1'] }],
+    ['wrong checksum', { checksum: 'f'.repeat(64) }]
+  ]) {
+    const candidate = validRoleDeletePending();
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined) delete candidate[key];
+      else candidate[key] = value;
+    }
+    if (label !== 'wrong checksum') {
+      const withoutChecksum = { ...candidate };
+      delete withoutChecksum.checksum;
+      candidate.checksum = contentHash(withoutChecksum);
+    }
+    assert.throws(() => validateRoleDeletePending(candidate), /role delete pending/i, label);
+  }
+});
 
 test('role delete applied proof is an exact native checksum-closed response', () => {
   const valid = validRoleDeleteApplied();
