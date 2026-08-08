@@ -6758,6 +6758,165 @@ export class YuqiStore {
     return this.transaction(run);
   }
 
+  applyConversationClearInternal(control, { appliedAt, faultAfterStep = null } = {}) {
+    const normalizedControl = validateConversationClearControl(control);
+    if (typeof appliedAt !== 'number' || !Number.isSafeInteger(appliedAt) || appliedAt <= 0) {
+      throw new Error('conversation clear appliedAt conflict');
+    }
+    const fault = step => {
+      if (faultAfterStep === step) throw new Error(`forced conversation clear fault: ${step}`);
+    };
+    const laneKey = 'private_chat';
+    const mapAppliedProof = row => {
+      const body = {
+        protocolVersion: 3,
+        type: 'CONVERSATION_CLEAR_APPLIED',
+        controlId: row.control_id,
+        controlChecksum: row.checksum,
+        roleId: row.role_id,
+        peerId: row.peer_id,
+        clearEpoch: Number(row.clear_epoch),
+        clearedThroughSequence: Number(row.cleared_through_sequence),
+        appliedAt: Number(row.applied_at)
+      };
+      const proof = validateConversationClearApplied({ ...body, checksum: contentHash(body) });
+      if (row.applied_checksum !== proof.checksum) {
+        throw new Error(`conversation clear applied proof conflict: ${row.control_id}`);
+      }
+      return proof;
+    };
+    const assertPersistedRow = row => {
+      if (!row || Number(row.authority_version) !== 1) {
+        throw new Error('conversation clear persisted authority conflict');
+      }
+      const persisted = validateConversationClearControl(parseJson(row.semantic_json, null));
+      if (canonicalJson(persisted) !== row.semantic_json
+        || persisted.controlId !== row.control_id
+        || persisted.roleId !== row.role_id
+        || persisted.peerId !== row.peer_id
+        || persisted.clearEpoch !== Number(row.clear_epoch)
+        || persisted.clearedThroughSequence !== Number(row.cleared_through_sequence)
+        || persisted.requestedAt !== Number(row.requested_at)
+        || persisted.inputCursorChecksum !== row.input_cursor_checksum
+        || persisted.checksum !== row.checksum) {
+        throw new Error(`conversation clear persisted semantic conflict: ${row.control_id}`);
+      }
+      return mapAppliedProof(row);
+    };
+    return this.withImmediateTransaction(() => {
+      // Revalidate the closed wire while the write lock is held. The cursor
+      // checksum is retained as command identity; PC has no source-of-truth
+      // cursor projection from which to recompute it.
+      const currentControl = validateConversationClearControl(control);
+      if (canonicalJson(currentControl) !== canonicalJson(normalizedControl)) {
+        throw new Error('conversation clear control changed during transaction');
+      }
+      const byId = this.db.prepare(
+        'SELECT * FROM conversation_clear_controls WHERE control_id = ?'
+      ).get(currentControl.controlId);
+      if (byId) {
+        const proof = assertPersistedRow(byId);
+        if (canonicalJson(parseJson(byId.semantic_json, null)) !== canonicalJson(currentControl)) {
+          throw new Error('conversation clear control replay conflict');
+        }
+        return proof;
+      }
+      const byRoleEpoch = this.db.prepare(
+        `SELECT * FROM conversation_clear_controls
+         WHERE role_id = ? AND clear_epoch = ?`
+      ).get(currentControl.roleId, currentControl.clearEpoch);
+      if (byRoleEpoch) {
+        throw new Error('conversation clear role epoch collision');
+      }
+
+      const lane = this.getInteractionLane(currentControl.roleId, laneKey);
+      if (!lane || lane.roleId !== currentControl.roleId || lane.laneKey !== laneKey) {
+        throw new Error('conversation clear role lane conflict');
+      }
+      for (const field of [
+        'revision', 'clearEpoch', 'clearedThroughSequence',
+        'nativeCompletedSequence', 'uiAppliedSequence'
+      ]) {
+        if (!Number.isSafeInteger(lane[field]) || lane[field] < 0) {
+          throw new Error(`conversation clear lane ${field} conflict`);
+        }
+      }
+      const expectedEpoch = Number(lane.clearEpoch) + 1;
+      if (currentControl.clearEpoch !== expectedEpoch) {
+        throw new Error('conversation clear epoch conflict');
+      }
+      const currentBoundary = Math.max(
+        Number(lane.clearedThroughSequence),
+        Number(lane.nativeCompletedSequence),
+        Number(lane.uiAppliedSequence)
+      );
+      if (currentControl.clearedThroughSequence < currentBoundary) {
+        throw new Error('conversation clear boundary conflict');
+      }
+
+      const updatedLane = this.db.prepare(`
+        UPDATE interaction_lanes
+        SET revision = revision + 1,
+            clear_epoch = ?,
+            cleared_through_sequence = ?,
+            updated_at = ?
+        WHERE role_id = ? AND lane_key = ? AND revision = ?
+      `).run(
+        currentControl.clearEpoch,
+        currentControl.clearedThroughSequence,
+        appliedAt,
+        currentControl.roleId,
+        laneKey,
+        Number(lane.revision)
+      );
+      if (Number(updatedLane.changes) !== 1) throw new Error('conversation clear lane CAS conflict');
+      fault('after_lane_update');
+
+      const semanticJson = canonicalJson(currentControl);
+      const appliedBody = {
+        protocolVersion: 3,
+        type: 'CONVERSATION_CLEAR_APPLIED',
+        controlId: currentControl.controlId,
+        controlChecksum: currentControl.checksum,
+        roleId: currentControl.roleId,
+        peerId: currentControl.peerId,
+        clearEpoch: currentControl.clearEpoch,
+        clearedThroughSequence: currentControl.clearedThroughSequence,
+        appliedAt
+      };
+      const applied = validateConversationClearApplied({
+        ...appliedBody,
+        checksum: contentHash(appliedBody)
+      });
+      this.db.prepare(`
+        INSERT INTO conversation_clear_controls(
+          control_id, role_id, peer_id, clear_epoch, cleared_through_sequence,
+          requested_at, applied_at, input_cursor_checksum, checksum,
+          applied_checksum, authority_version, semantic_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      `).run(
+        currentControl.controlId,
+        currentControl.roleId,
+        currentControl.peerId,
+        currentControl.clearEpoch,
+        currentControl.clearedThroughSequence,
+        currentControl.requestedAt,
+        appliedAt,
+        currentControl.inputCursorChecksum,
+        currentControl.checksum,
+        applied.checksum,
+        semanticJson
+      );
+      fault('after_control_insert');
+      const persisted = this.db.prepare(
+        'SELECT * FROM conversation_clear_controls WHERE control_id = ?'
+      ).get(currentControl.controlId);
+      if (!persisted) throw new Error('conversation clear persisted row missing');
+      fault('after_applied_projection');
+      return assertPersistedRow(persisted);
+    });
+  }
+
   appendSync(entityType, entityId, operation, payload) {
     const payloadJson = canonicalJson(payload);
     const checksum = contentHash(payload);

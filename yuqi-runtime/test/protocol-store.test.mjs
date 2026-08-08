@@ -22,7 +22,6 @@ function validConversationClearControl(overrides = {}) {
     protocolVersion: 3,
     type: 'CONVERSATION_CLEAR',
     controlVersion: 'conversation_clear_v1',
-    controlId: 'clear_device1_1',
     roleId: 'yuqi',
     peerId: 'device1',
     clearEpoch: 1,
@@ -31,6 +30,18 @@ function validConversationClearControl(overrides = {}) {
     inputCursorChecksum: 'a'.repeat(64),
     ...overrides
   };
+  if (!Object.hasOwn(overrides, 'controlId')) {
+    body.controlId = `ctl_${contentHash({
+      contract: 'android-lifecycle-control-id-v1',
+      controlKind: 'conversation_clear_v1',
+      characterId: body.roleId,
+      peerId: body.peerId,
+      clearEpoch: body.clearEpoch,
+      clearedThroughSequence: body.clearedThroughSequence,
+      requestedAt: body.requestedAt,
+      inputCursorChecksum: body.inputCursorChecksum
+    })}`;
+  }
   return { ...body, checksum: contentHash(body) };
 }
 
@@ -79,6 +90,18 @@ test('conversation clear validator rejects coerced native ids and times with a s
       label
     );
   }
+});
+
+test('conversation clear controlId is the frozen cross-end authority identity, not caller text', () => {
+  const valid = validConversationClearControl();
+  assert.equal(valid.controlId, 'ctl_c8590195cf5a91c4e857796e051b7bae4754f9929ac06d2d4839c06d95671e19');
+  const forged = { ...valid, controlId: 'ctl_' + '0'.repeat(64) };
+  delete forged.checksum;
+  forged.checksum = contentHash(forged);
+  assert.throws(
+    () => validateConversationClearControl(forged),
+    /control id|authority identity|conversation clear/i
+  );
 });
 
 function validConversationClearApplied(overrides = {}) {

@@ -70,17 +70,29 @@ function clearWire(overrides = {}) {
     protocolVersion: 3,
     type: 'CONVERSATION_CLEAR',
     controlVersion: 'conversation_clear_v1',
-    controlId: 'clear_device1_1',
     roleId: 'yuqi',
     peerId: 'device1',
     clearEpoch: 1,
     clearedThroughSequence: 4,
     requestedAt: 1784400000000,
     inputCursorChecksum: 'a'.repeat(64),
-    ...overrides
+    ...overrides,
+    controlId: null
   };
+  body.controlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'conversation_clear_v1',
+    characterId: body.roleId,
+    peerId: body.peerId,
+    clearEpoch: body.clearEpoch,
+    clearedThroughSequence: body.clearedThroughSequence,
+    requestedAt: body.requestedAt,
+    inputCursorChecksum: body.inputCursorChecksum
+  })}`;
   return { ...body, checksum: contentHash(body) };
 }
+
+const V1_FIXTURE_CONTROL_ID = clearWire().controlId;
 
 function appliedWire(wire, appliedAt = 1784400000100) {
   const body = {
@@ -203,25 +215,25 @@ const V1_CORRUPTIONS = [
     name: 'partial-v1',
     mutate: db => db.prepare(
       'UPDATE conversation_clear_controls SET peer_id = NULL WHERE control_id = ?'
-    ).run('clear_device1_1')
+    ).run(V1_FIXTURE_CONTROL_ID)
   },
   {
     name: 'forged-peer',
     mutate: db => db.prepare(
       'UPDATE conversation_clear_controls SET peer_id = ? WHERE control_id = ?'
-    ).run('device2', 'clear_device1_1')
+    ).run('device2', V1_FIXTURE_CONTROL_ID)
   },
   {
     name: 'forged-semantic',
     mutate: db => db.prepare(
       'UPDATE conversation_clear_controls SET semantic_json = ? WHERE control_id = ?'
-    ).run('{"forged":true}', 'clear_device1_1')
+    ).run('{"forged":true}', V1_FIXTURE_CONTROL_ID)
   },
   {
     name: 'changed-applied-at',
     mutate: db => db.prepare(
       'UPDATE conversation_clear_controls SET applied_at = applied_at + 1 WHERE control_id = ?'
-    ).run('clear_device1_1')
+    ).run(V1_FIXTURE_CONTROL_ID)
   },
   {
     name: 'v0-with-v1-fields',
@@ -229,7 +241,7 @@ const V1_CORRUPTIONS = [
       `UPDATE conversation_clear_controls
        SET authority_version = 0, peer_id = ?, input_cursor_checksum = ?, semantic_json = ?, applied_checksum = ?
        WHERE control_id = ?`
-    ).run('device1', 'a'.repeat(64), '{}', 'b'.repeat(64), 'clear_device1_1')
+    ).run('device1', 'a'.repeat(64), '{}', 'b'.repeat(64), V1_FIXTURE_CONTROL_ID)
   }
 ];
 
@@ -261,7 +273,7 @@ test('v15 control identity collisions fail closed without overwriting the first 
   try {
     const store = new YuqiStore(path, { targetVersion: 15 });
     const first = insertV1Row(store);
-    const second = clearWire({ controlId: 'clear_device1_2' });
+    const second = clearWire({ peerId: 'device2' });
     assert.throws(
       () => insertV1Row(store, { ...second, clearEpoch: first.wire.clearEpoch }),
       /constraint|unique/i
@@ -320,3 +332,196 @@ test('database user_version above v15 is rejected before reopening', () => {
     closeDir(dir);
   }
 });
+
+function seedPrivateLane(store, {
+  roleId = 'yuqi',
+  revision = 0,
+  clearEpoch = 0,
+  clearedThroughSequence = 0,
+  localSequence = 0,
+  lastCommitChecksum = null,
+  now = 1784400000000
+} = {}) {
+  return store.claimInteractionLaneInternal({
+    roleId,
+    laneKey: 'private_chat',
+    expectedRevision: revision,
+    clearEpoch,
+    clearedThroughSequence,
+    localSequence,
+    lastCommitChecksum,
+    now
+  });
+}
+
+function clearStateSnapshot(store) {
+  return {
+    lane: store.db.prepare(
+      `SELECT role_id, lane_key, revision, clear_epoch, cleared_through_sequence,
+              local_sequence, last_commit_checksum, updated_at
+       FROM interaction_lanes ORDER BY role_id, lane_key`
+    ).all(),
+    controls: store.db.prepare(
+      `SELECT control_id, role_id, peer_id, clear_epoch, cleared_through_sequence,
+              requested_at, applied_at, input_cursor_checksum, checksum,
+              applied_checksum, authority_version, semantic_json
+       FROM conversation_clear_controls ORDER BY control_id`
+    ).all()
+  };
+}
+
+function emptySessionClear(overrides = {}) {
+  return clearWire({
+    controlId: 'clear_device1_empty_1',
+    clearedThroughSequence: 0,
+    ...overrides
+  });
+}
+
+test('empty private lane applies a closed clear atomically and returns persisted applied proof', () => {
+  const { dir, path } = tempPath('yuqi-clear-empty-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { lastCommitChecksum: null });
+    const control = emptySessionClear();
+    const proof = store.applyConversationClearInternal(control, { appliedAt: 1784400000100 });
+    assert.deepEqual(proof, appliedWire(control, 1784400000100));
+    assert.deepEqual(store.getInteractionLane('yuqi', 'private_chat'), {
+      roleId: 'yuqi', laneKey: 'private_chat', revision: 2,
+      generatingTurnId: null, latestUserBatchId: null,
+      latestAuthoritativeGroupId: null, nativeCompletedGroupId: null,
+      nativeCompletedSequence: 0, uiAppliedGroupId: null, uiAppliedSequence: 0,
+      localSequence: 0, clearEpoch: 1, clearedThroughSequence: 0,
+      lastCommitChecksum: null, updatedAt: 1784400000100
+    });
+    assert.equal(store.db.prepare(
+      'SELECT COUNT(*) AS count FROM conversation_clear_controls'
+    ).get().count, 1);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('exact control replay and restart return original appliedAt and bytes without a second row', () => {
+  const { dir, path } = tempPath('yuqi-clear-replay-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { nativeCompletedSequence: 4, clearedThroughSequence: 4 });
+    const control = emptySessionClear({ clearedThroughSequence: 4 });
+    const first = store.applyConversationClearInternal(control, { appliedAt: 1784400000100 });
+    const replay = store.applyConversationClearInternal(control, { appliedAt: 1784400000999 });
+    assert.deepEqual(replay, first);
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.deepEqual(
+      reopened.applyConversationClearInternal(control, { appliedAt: 1784400001999 }),
+      first
+    );
+    assert.equal(reopened.db.prepare(
+      'SELECT COUNT(*) AS count FROM conversation_clear_controls'
+    ).get().count, 1);
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('changed clear identity and lower/skip epoch or boundary reject without writes', () => {
+  const { dir, path } = tempPath('yuqi-clear-conflicts-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { nativeCompletedSequence: 4, clearedThroughSequence: 4 });
+    const control = emptySessionClear({ clearedThroughSequence: 4 });
+    store.applyConversationClearInternal(control, { appliedAt: 1784400000100 });
+    const before = clearStateSnapshot(store);
+    const cases = [
+      ['peer', { peerId: 'device2', controlId: 'clear_device2_empty_1' }],
+      ['cursor', { inputCursorChecksum: 'b'.repeat(64), controlId: 'clear_device1_cursor_1' }],
+      ['epoch-skip', { clearEpoch: 3, controlId: 'clear_device1_skip_1' }],
+      ['epoch-lower', { clearEpoch: 0, controlId: 'clear_device1_lower_1' }],
+      ['boundary-lower', { clearedThroughSequence: 3, clearEpoch: 2, controlId: 'clear_device1_lower_2' }],
+      ['checksum', { checksum: 'c'.repeat(64) }]
+    ];
+    for (const [name, overrides] of cases) {
+      assert.throws(
+        () => store.applyConversationClearInternal(emptySessionClear(overrides), { appliedAt: 1784400000200 }),
+        /conflict|invalid|epoch|boundary|checksum/i,
+        name
+      );
+      assert.deepEqual(clearStateSnapshot(store), before, name);
+    }
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('v0 shell at the same role epoch is a collision, not an upgrade path', () => {
+  const { dir, path } = tempPath('yuqi-clear-v0-collision-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store);
+    store.db.prepare(`
+      INSERT INTO conversation_clear_controls(
+        control_id, role_id, peer_id, clear_epoch, cleared_through_sequence,
+        requested_at, applied_at, input_cursor_checksum, checksum,
+        applied_checksum, authority_version, semantic_json
+      ) VALUES (?, ?, NULL, ?, ?, ?, ?, NULL, ?, NULL, 0, NULL)
+    `).run('legacy_clear_epoch_1', 'yuqi', 1, 0, 1000, 1001, 'legacy-history-checksum');
+    const before = clearStateSnapshot(store);
+    assert.throws(
+      () => store.applyConversationClearInternal(emptySessionClear(), { appliedAt: 1784400000100 }),
+      /collision|conflict/i
+    );
+    assert.deepEqual(clearStateSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('two Room handles converge on one exact empty-lane control row', () => {
+  const { dir, path } = tempPath('yuqi-clear-two-handles-');
+  try {
+    const first = new YuqiStore(path);
+    seedPrivateLane(first);
+    const second = new YuqiStore(path);
+    const control = emptySessionClear();
+    const applied = first.applyConversationClearInternal(control, { appliedAt: 1784400000100 });
+    assert.deepEqual(
+      second.applyConversationClearInternal(control, { appliedAt: 1784400000200 }),
+      applied
+    );
+    assert.equal(second.db.prepare(
+      'SELECT COUNT(*) AS count FROM conversation_clear_controls'
+    ).get().count, 1);
+    second.close();
+    first.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const faultAfterStep of ['after_lane_update', 'after_control_insert']) {
+  test(`empty clear fault ${faultAfterStep} rolls back every write`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-fault-${faultAfterStep}-`);
+    try {
+      const store = new YuqiStore(path);
+      seedPrivateLane(store);
+      const control = emptySessionClear();
+      const before = clearStateSnapshot(store);
+      assert.throws(
+        () => store.applyConversationClearInternal(control, {
+          appliedAt: 1784400000100,
+          faultAfterStep
+        }),
+        /forced|fault/i
+      );
+      assert.deepEqual(clearStateSnapshot(store), before);
+      store.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}

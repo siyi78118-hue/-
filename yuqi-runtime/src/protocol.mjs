@@ -232,6 +232,19 @@ export function validateConversationClearControl(raw) {
     || !/^[a-f0-9]{64}$/.test(value.inputCursorChecksum)) {
     throw new Error('invalid conversation clear cursor checksum');
   }
+  const expectedControlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'conversation_clear_v1',
+    characterId: roleId,
+    peerId,
+    clearEpoch: value.clearEpoch,
+    clearedThroughSequence: value.clearedThroughSequence,
+    requestedAt,
+    inputCursorChecksum: value.inputCursorChecksum
+  })}`;
+  if (controlId !== expectedControlId) {
+    throw new Error('conversation clear control id authority conflict');
+  }
   if (typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(value.checksum)) {
     throw new Error('invalid conversation clear checksum');
   }
