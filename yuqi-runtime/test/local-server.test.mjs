@@ -59,6 +59,48 @@ function authorityDeliveryReceipt(overrides = {}) {
   };
 }
 
+function conversationClearControl(overrides = {}) {
+  const base = {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR',
+    controlVersion: 'conversation_clear_v1',
+    roleId: 'yuqi',
+    peerId: 'phone_lan',
+    clearEpoch: 1,
+    clearedThroughSequence: 3,
+    requestedAt: 1784400000000,
+    inputCursorChecksum: 'a'.repeat(64)
+  };
+  const value = { ...base, ...overrides };
+  value.controlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'conversation_clear_v1',
+    characterId: value.roleId,
+    peerId: value.peerId,
+    clearEpoch: value.clearEpoch,
+    clearedThroughSequence: value.clearedThroughSequence,
+    requestedAt: value.requestedAt,
+    inputCursorChecksum: value.inputCursorChecksum
+  })}`;
+  value.checksum = contentHash(value);
+  return value;
+}
+
+function conversationClearApplied(control, appliedAt = 1784400000100) {
+  const body = {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR_APPLIED',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    clearEpoch: control.clearEpoch,
+    clearedThroughSequence: control.clearedThroughSequence,
+    appliedAt
+  };
+  return { ...body, checksum: contentHash(body) };
+}
+
 function call(port, { method = 'GET', path = '/', body = '', secret = '', nonce = 'nonce-1', timestamp = Date.now() }) {
   const payload = typeof body === 'string' ? body : JSON.stringify(body);
   const headers = { 'content-type': 'application/json' };
@@ -1099,6 +1141,162 @@ test('v2 rejects forged Android lastSeq recovery variants before any side effect
       assert.equal(result.status, 400);
     }
     assert.deepEqual(events, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test('conversation clear LAN route validates before side effects and returns the exact applied proof', async () => {
+  const control = conversationClearControl();
+  const proof = conversationClearApplied(control);
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    clock: () => 1784400000100,
+    store: {
+      getSyncDelta: () => [],
+      ackSync: () => 0,
+      applyConversationClearInternal(value, options) {
+        events.push({ kind: 'apply', value, options });
+        return proof;
+      }
+    },
+    reconciler: { reconcileFrom: async () => { events.push({ kind: 'reconcile' }); } },
+    dispatcher: { accept: () => { events.push({ kind: 'dispatch' }); } },
+    orchestrator: { process: async () => { events.push({ kind: 'orchestrator' }); } }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const response = await call(server.address().port, {
+      method: 'POST',
+      path: '/v3/controls/conversation-clear',
+      body: control,
+      secret: 'test-pairing-secret',
+      timestamp: 1784400000100,
+      nonce: 'conversation-clear-valid'
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, proof);
+    assert.deepEqual(events, [{ kind: 'apply', value: control, options: { appliedAt: 1784400000100 } }]);
+  } finally {
+    await server.close();
+  }
+});
+
+test('conversation clear rejects malformed controls before reconcile, dispatch, orchestrator, or diagnostic writes', async () => {
+  const valid = conversationClearControl();
+  const events = [];
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    clock: () => 1784400000100,
+    store: {
+      getSyncDelta: () => [],
+      ackSync: () => 0,
+      applyConversationClearInternal: () => { events.push('apply'); },
+      recordDiagnostic: () => { events.push('diagnostic'); }
+    },
+    reconciler: { reconcileFrom: async () => { events.push('reconcile'); } },
+    dispatcher: { accept: () => { events.push('dispatch'); } },
+    orchestrator: { process: async () => { events.push('orchestrator'); } }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const variants = [
+      { ...valid, controlId: 7, checksum: contentHash({ ...valid, controlId: 7 }) },
+      { ...valid, requestedAt: String(valid.requestedAt), checksum: contentHash({ ...valid, requestedAt: String(valid.requestedAt) }) },
+      { ...valid, unknown: true, checksum: contentHash({ ...valid, unknown: true }) },
+      { ...valid, checksum: 'b'.repeat(64) }
+    ];
+    for (const [index, body] of variants.entries()) {
+      const response = await call(server.address().port, {
+        method: 'POST',
+        path: '/v3/controls/conversation-clear',
+        body,
+        secret: 'test-pairing-secret',
+        timestamp: 1784400000100,
+        nonce: `conversation-clear-invalid-${index}`
+      });
+      assert.equal(response.status, 400);
+    }
+    assert.deepEqual(events, []);
+  } finally {
+    await server.close();
+  }
+});
+
+test('conversation clear maps known authority conflicts to fixed 409 and leaves runtime failures as 500', async () => {
+  const control = conversationClearControl();
+  const cases = [
+    { error: new Error('conversation clear epoch conflict'), status: 409 },
+    { error: new Error('canonical conversation clear lineage conflict: lin_1'), status: 409 },
+    { error: new TypeError('conversation clear authority conflict'), status: 500 },
+    { error: new Error('SQLITE_BUSY: database is locked'), status: 500 }
+  ];
+  for (const [index, expected] of cases.entries()) {
+    const server = createYuqiServer({
+      secret: 'test-pairing-secret',
+      clock: () => 1784400000100,
+      store: {
+        getSyncDelta: () => [],
+        ackSync: () => 0,
+        applyConversationClearInternal: () => { throw expected.error; }
+      },
+      orchestrator: { process: async () => ({}) }
+    });
+    await server.listen({ host: '127.0.0.1', port: 0 });
+    try {
+      const response = await call(server.address().port, {
+        method: 'POST',
+        path: '/v3/controls/conversation-clear',
+        body: control,
+        secret: 'test-pairing-secret',
+        timestamp: 1784400000100,
+        nonce: `conversation-clear-error-${index}`
+      });
+      assert.equal(response.status, expected.status);
+      if (expected.status === 409) assert.deepEqual(response.body, {
+        ok: false,
+        error: 'CONVERSATION_CLEAR_AUTHORITY_CONFLICT'
+      });
+    } finally {
+      await server.close();
+    }
+  }
+});
+
+test('conversation clear exact replay returns the persisted proof bytes without an ok wrapper', async () => {
+  const control = conversationClearControl();
+  const proof = conversationClearApplied(control);
+  let calls = 0;
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    clock: () => 1784400000100,
+    store: {
+      getSyncDelta: () => [],
+      ackSync: () => 0,
+      applyConversationClearInternal: () => { calls += 1; return proof; }
+    },
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const requests = await Promise.all(['conversation-clear-replay-a', 'conversation-clear-replay-b'].map(nonce => call(
+      server.address().port,
+      {
+        method: 'POST',
+        path: '/v3/controls/conversation-clear',
+        body: control,
+        secret: 'test-pairing-secret',
+        timestamp: 1784400000100,
+        nonce
+      }
+    )));
+    assert.deepEqual(requests, [
+      { status: 200, body: proof },
+      { status: 200, body: proof }
+    ]);
+    assert.equal(calls, 2);
+    assert.equal('ok' in requests[0].body, false);
   } finally {
     await server.close();
   }

@@ -2,7 +2,12 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 
 import { publicTurnStatus } from './turn-status.mjs';
-import { validateAuthorityDeliveryReceipt, validateEnvelope } from './protocol.mjs';
+import {
+  validateAuthorityDeliveryReceipt,
+  validateConversationClearApplied,
+  validateConversationClearControl,
+  validateEnvelope
+} from './protocol.mjs';
 import { normalizeRecoverySnapshot } from './reconcile.mjs';
 import { isCanonicalAuthorityConflictError } from './bridge-result-projector.mjs';
 
@@ -39,6 +44,101 @@ function preflightEnvelope(raw) {
       ? null
       : normalizeRecoverySnapshot(raw.recovery, { expectedDeviceId: envelope.deviceId })
   };
+}
+
+const CONVERSATION_CLEAR_AUTHORITY_MESSAGES = new Set([
+  'conversation clear appliedAt conflict',
+  'conversation clear authority conflict',
+  'conversation clear replay conflict',
+  'conversation clear CAS conflict',
+  'conversation clear lineage conflict',
+  'conversation clear redaction conflict',
+  'conversation clear persisted authority conflict',
+  'conversation clear control replay conflict',
+  'conversation clear role epoch collision',
+  'conversation clear role lane conflict',
+  'conversation clear epoch conflict',
+  'conversation clear boundary conflict',
+  'conversation clear control changed during transaction',
+  'conversation clear replay lineage conflict',
+  'conversation clear lane CAS conflict',
+  'conversation clear lane revision conflict',
+  'conversation clear lane clearEpoch conflict',
+  'conversation clear lane clearedThroughSequence conflict',
+  'conversation clear lane nativeCompletedSequence conflict',
+  'conversation clear lane uiAppliedSequence conflict',
+  'conversation clear control conflict',
+  'canonical conversation clear boundary conflict',
+  'canonical conversation clear committed group conflict',
+  'canonical conversation clear attempt conflict',
+  'canonical conversation clear group conflict',
+  'canonical conversation clear delivery lineage conflict',
+  'canonical conversation clear delivery CAS conflict',
+  'legacy conversation clear delivery authority conflict',
+  'legacy conversation clear waiting attempts conflict',
+  'legacy conversation clear delivery timestamp conflict',
+  'legacy conversation clear waiting delivery conflict',
+  'legacy conversation clear delivery payload conflict',
+  'legacy conversation clear pending relay conflict',
+  'legacy conversation clear pending delivery conflict',
+  'legacy conversation clear relay identity conflict',
+  'legacy conversation clear mailbox receipt conflict',
+  'legacy conversation clear confirmed receipt conflict',
+  'legacy conversation clear delivered receipt conflict'
+]);
+
+const CONVERSATION_CLEAR_AUTHORITY_PREFIXES = Object.freeze([
+  'conversation clear applied proof conflict: ',
+  'conversation clear persisted semantic conflict: ',
+  'conversation clear role lane conflict: ',
+  'canonical conversation clear lineage conflict: ',
+  'canonical conversation clear lineage lane conflict: ',
+  'canonical conversation clear redacted lineage conflict: ',
+  'canonical conversation clear envelope conflict: ',
+  'canonical conversation clear protocol conflict: ',
+  'canonical conversation clear envelope checksum conflict: ',
+  'canonical conversation clear lane conflict: ',
+  'canonical conversation clear sequence conflict: ',
+  'canonical conversation clear attempt commitment conflict: ',
+  'canonical conversation clear open group conflict: ',
+  'canonical conversation clear lineage terminal conflict: ',
+  'canonical conversation clear input batch conflict: ',
+  'canonical conversation clear input batch projection conflict: ',
+  'canonical conversation clear input batch source conflict: ',
+  'canonical conversation clear input batch parent conflict: ',
+  'canonical conversation clear input batch item conflict: ',
+  'canonical conversation clear input batch tombstone conflict: ',
+  'canonical conversation clear canonical reference conflict: ',
+  'canonical conversation clear canonical projection conflict: ',
+  'canonical conversation clear delivery CAS conflict: ',
+  'legacy conversation clear envelope identity conflict: ',
+  'legacy conversation clear envelope conflict: ',
+  'legacy conversation clear envelope checksum conflict: ',
+  'legacy conversation clear outer source conflict: ',
+  'legacy conversation clear outer source closure conflict: ',
+  'legacy conversation clear v1 batch conflict: ',
+  'legacy conversation clear batch protocol conflict: ',
+  'legacy conversation clear input batch conflict: ',
+  'legacy conversation clear input batch projection conflict: ',
+  'legacy conversation clear input batch source conflict: ',
+  'legacy conversation clear input batch parent conflict: ',
+  'legacy conversation clear input batch item conflict: ',
+  'legacy conversation clear input batch tombstone conflict: ',
+  'legacy conversation clear canonical reference conflict: ',
+  'legacy conversation clear canonical projection conflict: ',
+  'legacy conversation clear protocol conflict: ',
+  'legacy conversation clear lane conflict: ',
+  'legacy conversation clear sequence conflict: '
+]);
+
+function isConversationClearAuthorityConflict(error) {
+  if (error instanceof TypeError) return false;
+  if (error?.code === 'CONVERSATION_CLEAR_AUTHORITY_CONFLICT') return true;
+  const message = String(error?.message || '');
+  if (CONVERSATION_CLEAR_AUTHORITY_MESSAGES.has(message)) return true;
+  return CONVERSATION_CLEAR_AUTHORITY_PREFIXES.some(prefix => (
+    message.startsWith(prefix) && message.length > prefix.length
+  ));
 }
 
 export function createYuqiServer({
@@ -206,6 +306,28 @@ export function createYuqiServer({
     let body = null;
     if (rawBody) {
       try { body = JSON.parse(rawBody); } catch { return json(response, 400, { ok: false, error: 'invalid JSON' }); }
+    }
+
+    if (request.method === 'POST' && url.pathname === '/v3/controls/conversation-clear') {
+      let control;
+      try {
+        control = validateConversationClearControl(body);
+      } catch (error) {
+        return json(response, 400, { ok: false, error: error.message });
+      }
+      try {
+        const appliedAt = clock();
+        const proof = await store.applyConversationClearInternal(control, { appliedAt });
+        return json(response, 200, validateConversationClearApplied(proof));
+      } catch (error) {
+        if (isConversationClearAuthorityConflict(error)) {
+          return json(response, 409, {
+            ok: false,
+            error: 'CONVERSATION_CLEAR_AUTHORITY_CONFLICT'
+          });
+        }
+        throw error;
+      }
     }
 
     if (request.method === 'POST' && url.pathname === '/v1/turns') {
