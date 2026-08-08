@@ -110,6 +110,48 @@ function relayFixture(payload = envelope) {
   return { state, fetchImpl };
 }
 
+function conversationClearControl(overrides = {}) {
+  const base = {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR',
+    controlVersion: 'conversation_clear_v1',
+    roleId: 'yuqi',
+    peerId: 'phone_cloud',
+    clearEpoch: 1,
+    clearedThroughSequence: 3,
+    requestedAt: 1784400000100,
+    inputCursorChecksum: 'a'.repeat(64)
+  };
+  const value = { ...base, ...overrides };
+  value.controlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'conversation_clear_v1',
+    characterId: value.roleId,
+    peerId: value.peerId,
+    clearEpoch: value.clearEpoch,
+    clearedThroughSequence: value.clearedThroughSequence,
+    requestedAt: value.requestedAt,
+    inputCursorChecksum: value.inputCursorChecksum
+  })}`;
+  value.checksum = contentHash(value);
+  return value;
+}
+
+function clearAppliedProof(control, appliedAt = 1784400000200) {
+  const value = {
+    protocolVersion: 3,
+    type: 'CONVERSATION_CLEAR_APPLIED',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    clearEpoch: control.clearEpoch,
+    clearedThroughSequence: control.clearedThroughSequence,
+    appliedAt
+  };
+  return { ...value, checksum: contentHash(value) };
+}
+
 test('decrypts a phone envelope, reconciles first, and enqueues one opaque reply', async () => {
   const relay = relayFixture();
   const events = [];
@@ -254,6 +296,163 @@ test('canonical v3 lane busy stays retryable with no diagnostic, registration, o
   assert.equal(result.failed, 1);
   assert.deepEqual(events, ['accept']);
   assert.deepEqual(relay.state.acked, []);
+});
+
+test('conversation clear ingress commits first and exchanges one deterministic applied response', async () => {
+  const control = conversationClearControl();
+  const proof = clearAppliedProof(control);
+  const encrypted = encryptRelayPayload(control, keyBase64, Buffer.alloc(12, 9));
+  const state = { requests: [], inbound: [{ messageId: 'relay_clear_1', ...encrypted }] };
+  const fetchImpl = async (url, options = {}) => {
+    const path = new URL(url).pathname;
+    if (path === '/bridge/poll') return Response.json({ ok: true, messages: state.inbound });
+    if (path === '/bridge/ack-with-response') {
+      state.requests.push({ path, body: JSON.parse(options.body) });
+      return Response.json({ ok: true, incomingMessageId: 'relay_clear_1', responseMessageId: state.requests.at(-1).body.response.messageId, idempotent: false });
+    }
+    throw new Error(`unexpected relay path ${path}`);
+  };
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl,
+    dispatcher: { accept() { throw new Error('clear control must not enter turn dispatcher'); } },
+    store: {
+      registerCloudDelivery() { throw new Error('clear control must not register a turn delivery'); },
+      applyConversationClearInternal(value) { events.push(['apply', value]); return proof; },
+      putDiagnostic() { throw new Error('valid clear control must not diagnose'); }
+    },
+    clock: () => 1784400000200
+  });
+
+  const result = await pump.pumpOnce();
+  assert.equal(result.processed, 1);
+  assert.equal(result.failed, 0);
+  assert.deepEqual(events, [['apply', control]]);
+  assert.equal(state.requests.length, 1);
+  const requestBody = state.requests[0].body;
+  assert.deepEqual(Object.keys(requestBody).sort(), ['deviceId', 'incomingMessageId', 'response']);
+  assert.equal(requestBody.deviceId, 'phone_cloud');
+  assert.equal(requestBody.incomingMessageId, 'relay_clear_1');
+  assert.deepEqual(decryptRelayPayload(requestBody.response, keyBase64), proof);
+  assert.equal(requestBody.response.direction, 'pc_to_phone');
+  assert.match(requestBody.response.messageId, /^ctlack_[a-f0-9]{24}$/);
+  assert.match(requestBody.response.idempotencyKey, /^ctlackidem_[a-f0-9]{24}$/);
+  assert.equal(requestBody.response.expiresAt, proof.appliedAt + 7 * 24 * 60 * 60 * 1000);
+});
+
+test('invalid conversation clear controls are rejected before store, diagnostic, or ACK', async () => {
+  const control = conversationClearControl({ peerId: 'other_device' });
+  const encrypted = encryptRelayPayload(control, keyBase64, Buffer.alloc(12, 10));
+  const state = { acked: 0 };
+  const fetchImpl = async (url) => {
+    const path = new URL(url).pathname;
+    if (path === '/bridge/poll') return Response.json({ ok: true, messages: [{ messageId: 'relay_clear_invalid', ...encrypted }] });
+    if (path === '/bridge/ack' || path === '/bridge/ack-with-response') { state.acked += 1; throw new Error('invalid control must not ACK'); }
+    throw new Error(`unexpected relay path ${path}`);
+  };
+  const events = [];
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl,
+    dispatcher: { accept() { events.push('dispatch'); } },
+    store: {
+      registerCloudDelivery() { events.push('register'); },
+      applyConversationClearInternal() { events.push('apply'); },
+      putDiagnostic() { events.push('diagnostic'); }
+    },
+    clock: () => 1784400000200
+  });
+  const result = await pump.pumpOnce();
+  assert.equal(result.failed, 1);
+  assert.deepEqual(events, []);
+  assert.equal(state.acked, 0);
+});
+
+test('clear exchange response loss replays the persisted proof with identical bytes', async () => {
+  const control = conversationClearControl({ clearEpoch: 2, clearedThroughSequence: 4 });
+  const proof = clearAppliedProof(control, 1784400000300);
+  const encrypted = encryptRelayPayload(control, keyBase64, Buffer.alloc(12, 11));
+  const state = { requests: [], calls: 0 };
+  const fetchImpl = async (url, options = {}) => {
+    const path = new URL(url).pathname;
+    if (path === '/bridge/poll') return Response.json({ ok: true, messages: [{ messageId: 'relay_clear_loss', ...encrypted }] });
+    if (path === '/bridge/ack-with-response') {
+      state.requests.push(JSON.parse(options.body));
+      state.calls += 1;
+      if (state.calls === 1) throw new Error('response lost after exchange');
+      return Response.json({ ok: true, incomingMessageId: 'relay_clear_loss', responseMessageId: state.requests.at(-1).response.messageId, idempotent: true });
+    }
+    throw new Error(`unexpected relay path ${path}`);
+  };
+  let applyCount = 0;
+  const pump = new CloudRelayPump({
+    relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+    encryptionKeyBase64: keyBase64, fetchImpl,
+    dispatcher: { accept() { throw new Error('clear control must not dispatch'); } },
+    store: {
+      registerCloudDelivery() { throw new Error('clear control must not register'); },
+      applyConversationClearInternal(value) { applyCount += 1; assert.deepEqual(value, control); return proof; }
+    },
+    clock: () => 1784400000300
+  });
+  const first = await pump.pumpOnce();
+  const second = await pump.pumpOnce();
+  assert.equal(first.failed, 1);
+  assert.equal(second.processed, 1);
+  assert.equal(applyCount, 2);
+  assert.equal(state.requests.length, 2);
+  assert.deepEqual(state.requests[0].response, state.requests[1].response);
+});
+
+test('ordinary relay payloads retain random nonces outside the clear-response path', () => {
+  const first = encryptRelayPayload({ type: 'ordinary', value: 1 }, keyBase64);
+  const second = encryptRelayPayload({ type: 'ordinary', value: 1 }, keyBase64);
+  assert.notEqual(first.nonce, second.nonce);
+  assert.deepEqual(decryptRelayPayload(first, keyBase64), { type: 'ordinary', value: 1 });
+});
+
+test('clear exchange rejects extra or missing success fields without a second store commit', async () => {
+  for (const body of [
+    { ok: true, incomingMessageId: 'relay_clear_shape', responseMessageId: 'ctlack_shape', idempotent: false, extra: true },
+    { ok: true, incomingMessageId: 'relay_clear_shape', responseMessageId: 'ctlack_shape' }
+  ]) {
+    const control = conversationClearControl({ clearEpoch: body.extra ? 3 : 4, clearedThroughSequence: body.extra ? 5 : 6 });
+    const proof = clearAppliedProof(control, 1784400000400);
+    const encrypted = encryptRelayPayload(control, keyBase64, Buffer.alloc(12, body.extra ? 12 : 13));
+    let applyCount = 0;
+    const pump = new CloudRelayPump({
+      relayUrl: 'https://relay.example', deviceId: 'phone_cloud', deviceToken: 'device-token-123456789',
+      encryptionKeyBase64: keyBase64,
+      fetchImpl: async (url, options = {}) => {
+        const path = new URL(url).pathname;
+        if (path === '/bridge/poll') return Response.json({ ok: true, messages: [{ messageId: 'relay_clear_shape', ...encrypted }] });
+        if (path === '/bridge/ack-with-response') {
+          const requestBody = JSON.parse(options.body);
+          const exact = {
+            ok: true,
+            incomingMessageId: 'relay_clear_shape',
+            responseMessageId: requestBody.response.messageId,
+            idempotent: false
+          };
+          return Response.json(body.extra ? { ...exact, extra: true } : {
+            ok: true, incomingMessageId: exact.incomingMessageId, idempotent: exact.idempotent,
+            responseMessageId: undefined
+          });
+        }
+        throw new Error(`unexpected relay path ${path}`);
+      },
+      dispatcher: { accept() { throw new Error('clear control must not dispatch'); } },
+      store: {
+        registerCloudDelivery() { throw new Error('clear control must not register'); },
+        applyConversationClearInternal() { applyCount += 1; return proof; }
+      },
+      clock: () => 1784400000400
+    });
+    const result = await pump.pumpOnce();
+    assert.equal(result.failed, 1);
+    assert.equal(applyCount, 1);
+  }
 });
 
 test('authenticated recovery is reconciled once before lane-busy retry and never ACKs the busy turn', async () => {

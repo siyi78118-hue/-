@@ -51,6 +51,19 @@ function relayEnvelope(overrides = {}) {
   };
 }
 
+function clearResponseEnvelope(overrides = {}) {
+  return {
+    deviceId: 'device_123456',
+    messageId: 'ctlack_message_1',
+    idempotencyKey: 'ctlackidem_1',
+    direction: 'pc_to_phone',
+    ciphertext: 'Y2lwaGVyLXJlc3BvbnNl',
+    nonce: 'MDEyMzQ1Njc4OWFi',
+    expiresAt: Date.now() + 60_000,
+    ...overrides
+  };
+}
+
 function createFakeD1() {
   const devices = new Map();
   const messages = new Map();
@@ -58,6 +71,8 @@ function createFakeD1() {
   let failBatch = false;
   let failInsert = false;
   let failUsage = false;
+  let beforeNextBatch = null;
+  const batchSizes = [];
 
   function cloneState() {
     return {
@@ -100,6 +115,10 @@ function createFakeD1() {
       },
       async all() {
         if (normalized.startsWith('select message_id')) {
+          if (normalized.includes('where message_id = ?1') && !normalized.includes(' or ')) {
+            const rows = [...messages.values()].filter(item => item.message_id === values[0]);
+            return { results: rows.map(row => structuredClone(row)) };
+          }
           if (normalized.includes(' or ')) {
             const rows = [...messages.values()].filter(item =>
               item.message_id === values[0] ||
@@ -121,10 +140,16 @@ function createFakeD1() {
           });
           return { meta: { changes: 1 } };
         }
-        if (normalized.includes('insert') && normalized.includes('relay_messages')) {
+        if (normalized.startsWith('insert into relay_messages')) {
           if (failInsert) {
             failInsert = false;
             throw new Error('injected D1 insert failure');
+          }
+          if (normalized.includes('select')) {
+            const source = [...messages.values()].find(item =>
+              item.message_id === values[9] && item.device_id === values[10]
+              && item.direction === values[11] && item.expires_at > values[12]);
+            if (!source) return { meta: { changes: 0 } };
           }
           const row = {
             message_id: values[0], device_id: values[1], direction: values[2], ciphertext: values[3],
@@ -145,6 +170,13 @@ function createFakeD1() {
             failUsage = false;
             throw new Error('UNIQUE constraint failed: relay_usage');
           }
+          if (normalized.includes('select')) {
+            const response = [...messages.values()].find(item =>
+              item.message_id === values[3] && item.device_id === values[4]
+              && item.direction === values[5] && item.idempotency_key === values[6]
+              && item.created_at === values[7]);
+            if (!response) return { meta: { changes: 0 } };
+          }
           const key = `${values[0]}:${values[1]}`;
           const current = usage.get(key) || { byte_count: 0, write_count: 0 };
           usage.set(key, { byte_count: current.byte_count + values[2], write_count: current.write_count + 1 });
@@ -158,6 +190,33 @@ function createFakeD1() {
           return { meta: { changes } };
         }
         if (normalized.startsWith('delete from relay_messages where message_id')) {
+          if (normalized.includes('exists')) {
+            const response = [...messages.values()].find(item =>
+              item.message_id === values[4] && item.device_id === values[5]
+              && item.direction === values[6] && item.idempotency_key === values[7]
+              && item.created_at === values[8]);
+            if (!response) return { meta: { changes: 0 } };
+            let changes = 0;
+            for (const [key, row] of messages) {
+              if (row.message_id === values[0] && row.device_id === values[1]
+                && row.direction === values[2] && row.expires_at > values[3]) {
+                messages.delete(key);
+                changes += 1;
+              }
+            }
+            return { meta: { changes } };
+          }
+          if (normalized.includes('and direction = ?3')) {
+            let changes = 0;
+            for (const [key, row] of messages) {
+              if (row.message_id === values[0] && row.device_id === values[1]
+                && row.direction === values[2] && row.expires_at > values[3]) {
+                messages.delete(key);
+                changes += 1;
+              }
+            }
+            return { meta: { changes } };
+          }
           let changes = 0;
           for (const [key, row] of messages) {
             if (row.message_id === values[0] && row.device_id === values[1] &&
@@ -194,6 +253,12 @@ function createFakeD1() {
     async batch(statements) {
       const snapshot = cloneState();
       try {
+        batchSizes.push(statements.length);
+        if (beforeNextBatch) {
+          const hook = beforeNextBatch;
+          beforeNextBatch = null;
+          hook();
+        }
         if (failBatch) {
           failBatch = false;
           throw new Error('injected D1 batch failure');
@@ -209,6 +274,9 @@ function createFakeD1() {
     failNextBatch() { failBatch = true; },
     failNextInsert() { failInsert = true; },
     failNextUsage() { failUsage = true; },
+    beforeNextBatch(fn) { beforeNextBatch = fn; },
+    removeMessage(messageId) { messages.delete(messageId); },
+    batchSizes,
     snapshot() { return cloneState(); }
   };
 }
@@ -531,4 +599,151 @@ test('D1 usage constraint failure after expired delete rolls back and surfaces 5
   }), env));
   assert.equal(result.status, 500);
   assert.deepEqual(db.snapshot(), before);
+});
+
+test('D1 ack-with-response deletes inbound, inserts response, and rolls back every batch boundary', async () => {
+  const now = Date.now();
+  const incoming = relayEnvelope({ messageId: 'control_incoming_d1', idempotencyKey: 'control_incoming_d1_idem', direction: 'phone_to_pc', expiresAt: now + 60_000, createdAt: now });
+  const response = { ...clearResponseEnvelope({ messageId: 'ctlack_message_d1', idempotencyKey: 'ctlackidem_d1', expiresAt: now + 120_000 }), byteCount: 16 };
+  for (const failure of ['batch', 'insert', 'usage']) {
+    const db = createFakeD1();
+    const store = createD1RelayStore(db);
+    await store.putEnvelope(incoming, now);
+    const before = db.snapshot();
+    if (failure === 'batch') db.failNextBatch();
+    if (failure === 'insert') db.failNextInsert();
+    if (failure === 'usage') db.failNextUsage();
+    let failed = false;
+    try {
+      await store.ackWithResponse({ deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response, now });
+    } catch (error) {
+      failed = /injected|constraint/i.test(String(error?.message || error));
+    }
+    assert.equal(failed, true, `expected ${failure} boundary to fail`);
+    assert.deepEqual(db.snapshot(), before);
+  }
+  const db = createFakeD1();
+  const store = createD1RelayStore(db);
+  await store.putEnvelope(incoming, now);
+  const first = await store.ackWithResponse({ deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response, now });
+  assert.deepEqual(first, { idempotent: false });
+  assert.equal(db.batchSizes.at(-1), 3);
+  const replay = await store.ackWithResponse({ deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response, now });
+  assert.deepEqual(replay, { idempotent: true });
+  assert.equal((await store.poll(incoming.deviceId, 'phone_to_pc', now, 10)).length, 0);
+  assert.equal((await store.poll(incoming.deviceId, 'pc_to_phone', now, 10)).length, 1);
+});
+
+test('D1 exact replay is bound to the authenticated device, and a pre-read race is all-zero', async () => {
+  const now = Date.now();
+  const incoming = relayEnvelope({ messageId: 'control_incoming_race', idempotencyKey: 'control_incoming_race_idem', direction: 'phone_to_pc', expiresAt: now + 60_000, createdAt: now });
+  const response = { ...clearResponseEnvelope({ messageId: 'ctlack_race', idempotencyKey: 'ctlackidem_race', expiresAt: now + 120_000 }), byteCount: 16 };
+
+  const db = createFakeD1();
+  const store = createD1RelayStore(db);
+  await store.putEnvelope(incoming, now);
+  const before = db.snapshot();
+  db.beforeNextBatch(() => db.removeMessage(incoming.messageId));
+  assert.deepEqual(await store.ackWithResponse({ deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response, now }), { conflict: true });
+  const afterRace = db.snapshot();
+  assert.deepEqual(afterRace.messages, new Map([...before.messages].filter(([key]) => key !== incoming.messageId)));
+  assert.deepEqual(afterRace.usage, before.usage);
+  assert.equal((await store.poll(incoming.deviceId, 'pc_to_phone', now, 10)).length, 0);
+
+  const db2 = createFakeD1();
+  const store2 = createD1RelayStore(db2);
+  await store2.putEnvelope({ ...incoming, messageId: 'control_incoming_device_b', idempotencyKey: 'control_incoming_device_b_idem' }, now);
+  await store2.ackWithResponse({ deviceId: incoming.deviceId, incomingMessageId: 'control_incoming_device_b', response: { ...response, deviceId: 'device_123456' }, now });
+  assert.deepEqual(await store2.ackWithResponse({ deviceId: 'device_other', incomingMessageId: 'control_incoming_device_b', response: { ...response, deviceId: 'device_123456' }, now }), { conflict: true });
+});
+
+test('ack-with-response atomically exchanges an inbound clear control and is byte-idempotent', async () => {
+  const env = envFixture();
+  await register(env);
+  const incoming = {
+    deviceId: 'device_123456', messageId: 'control_incoming_1', idempotencyKey: 'control_incoming_idem_1',
+    direction: 'phone_to_pc', ciphertext: 'Y29udHJvbA==', nonce: 'bm9uY2U=', expiresAt: Date.now() + 60_000
+  };
+  const response = clearResponseEnvelope();
+  await relayWorker.fetch(request('/bridge/enqueue', { method: 'POST', token: 'device-token-123456789', body: incoming }), env);
+  const first = await jsonResponse(await relayWorker.fetch(request('/bridge/ack-with-response', {
+    method: 'POST', token: 'device-token-123456789',
+    body: { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response }
+  }), env));
+  assert.equal(first.status, 200);
+  assert.deepEqual(first.body, {
+    ok: true, incomingMessageId: incoming.messageId, responseMessageId: response.messageId, idempotent: false
+  });
+  assert.equal((await env.YUQI_RELAY_STORE.poll(incoming.deviceId, 'phone_to_pc', Date.now(), 10)).length, 0);
+  const outgoing = (await env.YUQI_RELAY_STORE.poll(incoming.deviceId, 'pc_to_phone', Date.now(), 10))[0];
+  const { byteCount: _byteCount, createdAt: _createdAt, ...publicOutgoing } = outgoing;
+  assert.deepEqual(publicOutgoing, response);
+
+  const replay = await jsonResponse(await relayWorker.fetch(request('/bridge/ack-with-response', {
+    method: 'POST', token: 'device-token-123456789',
+    body: { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response }
+  }), env));
+  assert.equal(replay.status, 200);
+  assert.deepEqual(replay.body, {
+    ok: true, incomingMessageId: incoming.messageId, responseMessageId: response.messageId, idempotent: true
+  });
+
+  for (const changed of [
+    { ...response, ciphertext: 'Y2hhbmdlZA==' },
+    { ...response, nonce: 'MDEyMzQ1Njc4OWFj' },
+    { ...response, expiresAt: response.expiresAt + 1 },
+    { ...response, idempotencyKey: 'ctlackidem_2' },
+    { ...response, deviceId: 'device_foreign' }
+  ]) {
+    const conflict = await jsonResponse(await relayWorker.fetch(request('/bridge/ack-with-response', {
+      method: 'POST', token: 'device-token-123456789',
+      body: { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response: changed }
+    }), env));
+    assert.equal(conflict.status, changed.deviceId === incoming.deviceId ? 409 : 400);
+  }
+  const stable = (await env.YUQI_RELAY_STORE.poll(incoming.deviceId, 'pc_to_phone', Date.now(), 10))[0];
+  const { byteCount: _stableByteCount, createdAt: _stableCreatedAt, ...stablePublic } = stable;
+  assert.deepEqual(stablePublic, response);
+});
+
+test('ack-with-response rejects partial and foreign exchanges without deleting the inbound row', async () => {
+  const store = createMemoryRelayStore();
+  const now = Date.now();
+  const incoming = relayEnvelope({ direction: 'phone_to_pc', messageId: 'control_incoming_2', idempotencyKey: 'control_incoming_idem_2', expiresAt: now + 60_000 });
+  await store.putEnvelope(incoming, now);
+  const response = clearResponseEnvelope({ messageId: 'ctlack_message_2', idempotencyKey: 'ctlackidem_2' });
+  assert.deepEqual(await store.ackWithResponse({
+    deviceId: 'device_foreign', incomingMessageId: incoming.messageId, response, now
+  }), { conflict: true });
+  await store.ackWithResponse({ deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response, now });
+  assert.deepEqual(await store.ackWithResponse({
+    deviceId: incoming.deviceId, incomingMessageId: incoming.messageId,
+    response: { ...response, idempotencyKey: 'different_idem' }, now
+  }), { conflict: true });
+  assert.equal((await store.poll(incoming.deviceId, 'phone_to_pc', now, 10)).length, 0);
+});
+
+test('ack-with-response closes the wrapper and response schema before any exchange mutation', async () => {
+  const env = envFixture();
+  await register(env);
+  const now = Date.now();
+  const incoming = { ...relayEnvelope({ messageId: 'control_incoming_schema', idempotencyKey: 'control_incoming_schema_idem', expiresAt: now + 60_000 }), direction: 'phone_to_pc' };
+  const response = clearResponseEnvelope({ messageId: 'ctlack_schema', idempotencyKey: 'ctlackidem_schema', expiresAt: now + 60_000 });
+  await env.YUQI_RELAY_STORE.putEnvelope(incoming, now);
+  const before = await env.YUQI_RELAY_STORE.poll(incoming.deviceId, incoming.direction, now, 10);
+  const invalidBodies = [
+    { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId },
+    { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response: { ...response, extra: true } },
+    { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response: { ...response, expiresAt: String(response.expiresAt) } },
+    { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response: { ...response, nonce: 'bad' } },
+    { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response: { ...response, direction: 'phone_to_pc' } },
+    { deviceId: incoming.deviceId, incomingMessageId: incoming.messageId, response: { ...response, deviceId: ['device_123456'] } }
+  ];
+  for (const body of invalidBodies) {
+    const result = await jsonResponse(await relayWorker.fetch(request('/bridge/ack-with-response', {
+      method: 'POST', token: 'device-token-123456789', body
+    }), env));
+    assert.equal(result.status, 400);
+    assert.deepEqual(await env.YUQI_RELAY_STORE.poll(incoming.deviceId, incoming.direction, now, 10), before);
+  }
 });

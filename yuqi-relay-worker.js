@@ -6,6 +6,8 @@ const DIRECTIONS = new Set(['phone_to_pc', 'pc_to_phone']);
 const YUQI_RELAY_VERSION = '2026-07-19.1';
 const MAX_RELAY_EXPIRY_MS = 7 * 24 * 60 * 60 * 1000;
 const REFRESH_KEYS = ['deviceId', 'messageId', 'idempotencyKey', 'direction', 'expiresAt'];
+const ACK_WITH_RESPONSE_KEYS = ['deviceId', 'incomingMessageId', 'response'];
+const ACK_RESPONSE_KEYS = ['deviceId', 'messageId', 'direction', 'ciphertext', 'nonce', 'idempotencyKey', 'expiresAt'];
 const CORS = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'GET,POST,OPTIONS',
@@ -40,6 +42,10 @@ function identityMatches(a, b) {
 function contentMatches(a, b) {
   return !!a && !!b && a.ciphertext === b.ciphertext && a.nonce === b.nonce &&
     a.byteCount === b.byteCount;
+}
+
+function exchangeMatches(a, b) {
+  return identityMatches(a, b) && contentMatches(a, b) && a.expiresAt === b.expiresAt;
 }
 
 function identityKey(envelope) {
@@ -192,6 +198,43 @@ async function handleAck(request, env) {
   return json({ ok: true, deleted });
 }
 
+async function handleAckWithResponse(request, env) {
+  const body = await readBody(request);
+  if (!hasExactKeys(body, ACK_WITH_RESPONSE_KEYS)
+    || !validNativeId(body.deviceId)
+    || !validNativeId(body.incomingMessageId)
+    || !body.response || typeof body.response !== 'object' || Array.isArray(body.response)
+    || !hasExactKeys(body.response, ACK_RESPONSE_KEYS)
+    || typeof body.response.deviceId !== 'string'
+    || body.response.deviceId !== body.deviceId
+    || !validNativeId(body.response.messageId)
+    || body.response.direction !== 'pc_to_phone'
+    || !validNativeId(body.response.idempotencyKey)
+    || typeof body.response.ciphertext !== 'string'
+    || typeof body.response.nonce !== 'string') {
+    return json({ ok: false, error: 'invalid clear response exchange' }, 400);
+  }
+  const byteCount = byteLengthFromBase64(body.response.ciphertext);
+  if (byteCount < 1 || byteCount > 512 * 1024 || byteLengthFromBase64(body.response.nonce) !== 12
+    || typeof body.response.expiresAt !== 'number' || !Number.isSafeInteger(body.response.expiresAt)) {
+    return json({ ok: false, error: 'invalid clear response envelope' }, 400);
+  }
+  const now = Date.now();
+  if (body.response.expiresAt <= now || body.response.expiresAt > now + MAX_RELAY_EXPIRY_MS) {
+    return json({ ok: false, error: 'invalid clear response expiry' }, 400);
+  }
+  if (!await authorize(request, env, body.deviceId)) return json({ ok: false, error: 'unauthorized' }, 401);
+  const saved = await relayStore(env).ackWithResponse({
+    deviceId: body.deviceId,
+    incomingMessageId: body.incomingMessageId,
+    response: { ...body.response, byteCount },
+    now
+  });
+  if (saved?.conflict) return json({ ok: false, error: 'clear response identity conflict' }, 409);
+  return json({ ok: true, incomingMessageId: body.incomingMessageId, responseMessageId: body.response.messageId,
+    idempotent: saved?.idempotent === true });
+}
+
 async function handleQuota(request, env, url) {
   const deviceId = String(url.searchParams.get('deviceId') || '');
   if (!await authorize(request, env, deviceId)) return json({ ok: false, error: 'unauthorized' }, 401);
@@ -233,6 +276,7 @@ const relayWorker = {
       if (request.method === 'POST' && url.pathname === '/bridge/refresh-expiry') return await handleRefreshExpiry(request, env);
       if (request.method === 'GET' && url.pathname === '/bridge/poll') return await handlePoll(request, env, url);
       if (request.method === 'POST' && url.pathname === '/bridge/ack') return await handleAck(request, env);
+      if (request.method === 'POST' && url.pathname === '/bridge/ack-with-response') return await handleAckWithResponse(request, env);
       if (request.method === 'GET' && url.pathname === '/bridge/quota') return await handleQuota(request, env, url);
       if (request.method === 'GET' && url.pathname === '/bridge/socket') return await handleSocket(request, env, url);
       return json({ ok: false, error: 'not found' }, 404);
@@ -355,6 +399,45 @@ export function createMemoryRelayStore() {
       }
       return deleted;
     },
+    async ackWithResponse({ deviceId, incomingMessageId, response, now = Date.now() }) {
+      const incoming = envelopes.get(incomingMessageId) || null;
+      const { byMessage, byIdempotency, indexedMessageId } = lookup(response);
+      if (indexedMessageId && !byIdempotency) return { conflict: true };
+      if (byMessage && byIdempotency && byMessage.messageId !== byIdempotency.messageId) return { conflict: true };
+      const existingResponse = byMessage || byIdempotency;
+      if (existingResponse) {
+        if (incoming) return { conflict: true };
+        return existingResponse.deviceId === deviceId
+          && existingResponse.direction === 'pc_to_phone'
+          && exchangeMatches(existingResponse, response)
+          ? { idempotent: true } : { conflict: true };
+      }
+      if (!incoming || incoming.deviceId !== deviceId || incoming.direction !== 'phone_to_pc'
+        || incoming.expiresAt <= now || response.deviceId !== deviceId || response.direction !== 'pc_to_phone') {
+        return { conflict: true };
+      }
+      const usageKey = `${dayKey(now)}:${deviceId}`;
+      const snapshot = {
+        incoming: structuredClone(incoming),
+        usage: usageRows.has(usageKey) ? structuredClone(usageRows.get(usageKey)) : null
+      };
+      try {
+        removeEnvelope(incoming);
+        const stored = { ...structuredClone(response), createdAt: now };
+        envelopes.set(stored.messageId, stored);
+        idempotency.set(identityKey(stored), stored.messageId);
+        const current = usageRows.get(usageKey) || { bytes: 0, writes: 0 };
+        usageRows.set(usageKey, { bytes: current.bytes + Number(stored.byteCount || 0), writes: current.writes + 1 });
+        return { idempotent: false };
+      } catch (error) {
+        const stored = envelopes.get(response.messageId);
+        if (stored) removeEnvelope(stored);
+        envelopes.set(snapshot.incoming.messageId, snapshot.incoming);
+        idempotency.set(identityKey(snapshot.incoming), snapshot.incoming.messageId);
+        if (snapshot.usage) usageRows.set(usageKey, snapshot.usage); else usageRows.delete(usageKey);
+        throw error;
+      }
+    },
     async usage(deviceId, day) { return usageRows.get(`${day}:${deviceId}`) || { bytes: 0, writes: 0 }; }
   };
 }
@@ -365,6 +448,16 @@ export function createD1RelayStore(db) {
       idempotency_key, byte_count, created_at, expires_at FROM relay_messages
       WHERE message_id = ?1 OR (device_id = ?2 AND idempotency_key = ?3)`)
       .bind(identity.messageId, identity.deviceId, identity.idempotencyKey).all();
+    return (result?.results || []).map(row => ({
+      messageId: row.message_id, deviceId: row.device_id, direction: row.direction,
+      ciphertext: row.ciphertext, nonce: row.nonce, idempotencyKey: row.idempotency_key,
+      byteCount: row.byte_count, createdAt: row.created_at, expiresAt: row.expires_at
+    }));
+  }
+  async function messageRows(messageId) {
+    const result = await db.prepare(`SELECT message_id, device_id, direction, ciphertext, nonce,
+      idempotency_key, byte_count, created_at, expires_at FROM relay_messages WHERE message_id = ?1`)
+      .bind(messageId).all();
     return (result?.results || []).map(row => ({
       messageId: row.message_id, deviceId: row.device_id, direction: row.direction,
       ciphertext: row.ciphertext, nonce: row.nonce, idempotencyKey: row.idempotency_key,
@@ -460,6 +553,62 @@ export function createD1RelayStore(db) {
       const result = await db.prepare(`DELETE FROM relay_messages WHERE device_id = ?1 AND message_id IN (${placeholders})`)
         .bind(deviceId, ...messageIds).run();
       return Number(result?.meta?.changes || 0);
+    },
+    async ackWithResponse({ deviceId, incomingMessageId, response, now = Date.now() }) {
+      const incoming = (await messageRows(incomingMessageId))[0] || null;
+      const rows = await identityRows(response);
+      const classification = classifyRows(rows, response, now);
+      if (classification?.idempotent) {
+        const existing = rows.find(row => identityMatches(row, response));
+        return incoming || existing?.deviceId !== deviceId || !exchangeMatches(existing, response)
+          ? { conflict: true } : { idempotent: true };
+      }
+      if (classification?.conflict) return { conflict: true };
+      if (!incoming || incoming.deviceId !== deviceId || incoming.direction !== 'phone_to_pc'
+        || incoming.expiresAt <= now || response.deviceId !== deviceId || response.direction !== 'pc_to_phone') {
+        return { conflict: true };
+      }
+      if (typeof db.batch !== 'function') throw new Error('D1 transactional batch unavailable');
+      const insert = db.prepare(`INSERT INTO relay_messages
+        (message_id, device_id, direction, ciphertext, nonce, idempotency_key, byte_count, created_at, expires_at)
+        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
+        WHERE EXISTS (SELECT 1 FROM relay_messages
+          WHERE message_id = ?10 AND device_id = ?11 AND direction = ?12 AND expires_at > ?13)`)
+        .bind(response.messageId, response.deviceId, response.direction, response.ciphertext, response.nonce,
+          response.idempotencyKey, response.byteCount, now, response.expiresAt,
+          incomingMessageId, deviceId, 'phone_to_pc', now);
+      const usage = db.prepare(`INSERT INTO relay_usage(usage_day, device_id, byte_count, write_count)
+        SELECT ?1, ?2, ?3, 1
+        WHERE EXISTS (SELECT 1 FROM relay_messages
+          WHERE message_id = ?4 AND device_id = ?5 AND direction = ?6 AND idempotency_key = ?7 AND created_at = ?8)
+        ON CONFLICT(usage_day, device_id) DO UPDATE SET
+        byte_count=relay_usage.byte_count+excluded.byte_count, write_count=relay_usage.write_count+1`)
+        .bind(dayKey(now), deviceId, response.byteCount, response.messageId, response.deviceId,
+          response.direction, response.idempotencyKey, now);
+      const removeIncoming = db.prepare(`DELETE FROM relay_messages
+        WHERE message_id = ?1 AND device_id = ?2 AND direction = ?3 AND expires_at > ?4
+          AND EXISTS (SELECT 1 FROM relay_messages
+            WHERE message_id = ?5 AND device_id = ?6 AND direction = ?7 AND idempotency_key = ?8 AND created_at = ?9)`)
+        .bind(incomingMessageId, deviceId, 'phone_to_pc', now, response.messageId, response.deviceId,
+          response.direction, response.idempotencyKey, now);
+      try {
+        const results = await db.batch([insert, usage, removeIncoming]);
+        const changes = results.map(result => Number(result?.meta?.changes || 0));
+        if (changes.every(value => value === 1)) return { idempotent: false };
+        const afterIncoming = await messageRows(incomingMessageId);
+        const afterResponse = await identityRows(response);
+        if (!afterIncoming.length && classifyRows(afterResponse, response, now)?.idempotent
+          && exchangeMatches(afterResponse.find(row => identityMatches(row, response)), response)) return { idempotent: true };
+        return { conflict: true };
+      } catch (error) {
+        if (!/unique constraint|constraint failed/i.test(String(error?.message || error))) throw error;
+        const afterIncoming = await messageRows(incomingMessageId);
+        const afterResponse = await identityRows(response);
+        if (!afterIncoming.length && classifyRows(afterResponse, response, now)?.idempotent
+          && exchangeMatches(afterResponse.find(row => identityMatches(row, response)), response)) return { idempotent: true };
+        if (afterResponse.some(row => !contentMatches(row, response) || !identityMatches(row, response))) return { conflict: true };
+        throw error;
+      }
     },
     async usage(deviceId, day) {
       const row = await db.prepare('SELECT byte_count, write_count FROM relay_usage WHERE usage_day = ?1 AND device_id = ?2').bind(day, deviceId).first();

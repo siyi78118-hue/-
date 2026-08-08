@@ -1,6 +1,13 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from 'node:crypto';
 
-import { contentHash, validateAuthorityDeliveryReceipt, validateEnvelope } from './protocol.mjs';
+import {
+  canonicalJson,
+  contentHash,
+  validateAuthorityDeliveryReceipt,
+  validateConversationClearApplied,
+  validateConversationClearControl,
+  validateEnvelope
+} from './protocol.mjs';
 import { normalizeRecoverySnapshot } from './reconcile.mjs';
 
 function keyBytes(value) {
@@ -16,13 +23,50 @@ export function stableId(prefix, value) {
 export function encryptRelayPayload(value, encryptionKeyBase64, suppliedNonce = null) {
   const nonce = suppliedNonce ? Buffer.from(suppliedNonce) : randomBytes(12);
   if (nonce.length !== 12) throw new Error('AES-GCM nonce must contain 12 bytes');
+  return encryptSerializedRelayPayload(JSON.stringify(value), encryptionKeyBase64, nonce);
+}
+
+function encryptSerializedRelayPayload(serialized, encryptionKeyBase64, nonce) {
   const cipher = createCipheriv('aes-256-gcm', keyBytes(encryptionKeyBase64), nonce);
   const ciphertext = Buffer.concat([
-    cipher.update(JSON.stringify(value), 'utf8'),
+    cipher.update(serialized, 'utf8'),
     cipher.final(),
     cipher.getAuthTag()
   ]);
   return { ciphertext: ciphertext.toString('base64'), nonce: nonce.toString('base64') };
+}
+
+function isConversationClearCandidate(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (value.type === 'CONVERSATION_CLEAR') return true;
+  return ['controlVersion', 'controlId', 'inputCursorChecksum', 'clearEpoch', 'clearedThroughSequence']
+    .some(key => Object.prototype.hasOwnProperty.call(value, key));
+}
+
+function deriveConversationClearResponse(proof, encryptionKeyBase64, now) {
+  const validated = validateConversationClearApplied(proof);
+  const responseMessageId = stableId(
+    'ctlack', `pc-lifecycle-response-message-id-v1\n${validated.controlId}\n${validated.checksum}`
+  );
+  const idempotencyKey = stableId(
+    'ctlackidem', `pc-lifecycle-response-idempotency-v1\n${validated.controlId}\n${validated.checksum}`
+  );
+  const nonce = createHmac('sha256', keyBytes(encryptionKeyBase64))
+    .update(`pc-lifecycle-response-gcm-nonce-v1\n${responseMessageId}`, 'utf8')
+    .digest().subarray(0, 12);
+  const expiresAt = validated.appliedAt + 7 * 24 * 60 * 60 * 1000;
+  if (validated.appliedAt > now || !Number.isSafeInteger(expiresAt) || expiresAt <= now) {
+    throw new Error('invalid conversation clear response expiry');
+  }
+  const encrypted = encryptSerializedRelayPayload(canonicalJson(validated), encryptionKeyBase64, nonce);
+  return {
+    deviceId: validated.peerId,
+    messageId: responseMessageId,
+    direction: 'pc_to_phone',
+    ...encrypted,
+    idempotencyKey,
+    expiresAt
+  };
 }
 
 export function decryptRelayPayload(value, encryptionKeyBase64) {
@@ -158,6 +202,42 @@ export class CloudRelayPump {
         let envelope = null;
         try {
           const rawEnvelope = decryptRelayPayload(message, this.encryptionKeyBase64);
+          if (isConversationClearCandidate(rawEnvelope)) {
+            let control;
+            try {
+              control = validateConversationClearControl(rawEnvelope);
+              if (control.peerId !== this.deviceId) throw new Error('conversation clear peer mismatch');
+            } catch (error) {
+              error.suppressStoreDiagnostic = true;
+              throw error;
+            }
+            if (!this.store || typeof this.store.applyConversationClearInternal !== 'function') {
+              throw new Error('conversation clear store is unavailable');
+            }
+            const applied = await this.store.applyConversationClearInternal(control, { appliedAt: this.clock() });
+            const responseEnvelope = deriveConversationClearResponse(applied, this.encryptionKeyBase64, this.clock());
+            const exchanged = await this.fetch(`${this.relayUrl}/bridge/ack-with-response`, {
+              method: 'POST', headers: this.headers(true),
+              body: JSON.stringify({
+                deviceId: this.deviceId,
+                incomingMessageId: message.messageId,
+                response: responseEnvelope
+              })
+            });
+            if (!exchanged.ok) throw new Error(`cloud relay ack-with-response HTTP ${exchanged.status}`);
+            const exchangeBody = await exchanged.json();
+            const exchangeKeys = exchangeBody && typeof exchangeBody === 'object' && !Array.isArray(exchangeBody)
+              ? Object.keys(exchangeBody).sort() : [];
+            if (JSON.stringify(exchangeKeys) !== JSON.stringify(['idempotent', 'incomingMessageId', 'ok', 'responseMessageId'])
+              || exchangeBody.ok !== true
+              || exchangeBody.incomingMessageId !== message.messageId
+              || exchangeBody.responseMessageId !== responseEnvelope.messageId
+              || typeof exchangeBody.idempotent !== 'boolean') {
+              throw new Error('invalid cloud clear exchange response');
+            }
+            summary.processed += 1;
+            continue;
+          }
           if (rawEnvelope.type === 'AUTHORITY_DELIVERY_RECEIPT') {
             if (!this.store || typeof this.store.confirmAuthorityCloudDeliveryInternal !== 'function') {
               throw new Error('authority delivery receipt store is unavailable');
