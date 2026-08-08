@@ -611,6 +611,139 @@ export function validateConversationClearApplied(raw) {
   };
 }
 
+const ROLE_DELETE_CONTROL_KEYS = Object.freeze([
+  'protocolVersion',
+  'type',
+  'controlVersion',
+  'controlId',
+  'roleId',
+  'peerId',
+  'requestedAt',
+  'backupReceipt',
+  'checksum'
+]);
+
+export function validateRoleDeleteControl(raw) {
+  let value = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new Error('invalid role delete control JSON');
+    }
+  }
+  assertClosedKeys(value, ROLE_DELETE_CONTROL_KEYS, 'role delete control');
+  if (value.protocolVersion !== 3
+    || value.type !== 'ROLE_DELETE'
+    || value.controlVersion !== 'role_delete_v1') {
+    throw new Error('invalid role delete control identity');
+  }
+  const controlId = requireNativeConversationClearId(value.controlId, 'role delete control id');
+  const roleId = requireNativeConversationClearId(value.roleId, 'role delete role id');
+  const peerId = requireNativeConversationClearId(value.peerId, 'role delete peer id');
+  const requestedAt = requireNativeConversationClearTimestamp(
+    value.requestedAt, 'role delete requestedAt'
+  );
+  const backupReceipt = validateYuqiBackupReceipt(value.backupReceipt);
+  if (backupReceipt.roleId !== roleId || backupReceipt.createdAt > requestedAt) {
+    throw new Error('role delete backup receipt binding conflict');
+  }
+  const expectedControlId = `ctl_${contentHash({
+    contract: 'android-lifecycle-control-id-v1',
+    controlKind: 'role_delete_v1',
+    roleId,
+    peerId,
+    requestedAt,
+    backupReceiptChecksum: backupReceipt.receiptChecksum
+  })}`;
+  if (controlId !== expectedControlId) {
+    throw new Error('role delete control id authority conflict');
+  }
+  if (typeof value.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(value.checksum)) {
+    throw new Error('invalid role delete checksum');
+  }
+  const normalized = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE',
+    controlVersion: 'role_delete_v1',
+    controlId,
+    roleId,
+    peerId,
+    requestedAt,
+    backupReceipt,
+    checksum: value.checksum
+  };
+  const withoutChecksum = { ...normalized };
+  delete withoutChecksum.checksum;
+  if (contentHash(withoutChecksum) !== value.checksum) {
+    throw new Error('role delete checksum conflict');
+  }
+  return normalized;
+}
+
+const ROLE_DELETE_APPLIED_KEYS = Object.freeze([
+  'protocolVersion',
+  'type',
+  'controlId',
+  'controlChecksum',
+  'roleId',
+  'peerId',
+  'backupReceiptId',
+  'appliedAt',
+  'checksum'
+]);
+
+export function validateRoleDeleteApplied(raw) {
+  let value = raw;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      throw new Error('invalid role delete applied JSON');
+    }
+  }
+  assertClosedKeys(value, ROLE_DELETE_APPLIED_KEYS, 'role delete applied');
+  if (value.protocolVersion !== 3 || value.type !== 'ROLE_DELETE_APPLIED') {
+    throw new Error('invalid role delete applied identity');
+  }
+  const controlId = requireNativeConversationClearId(
+    value.controlId, 'role delete applied control id'
+  );
+  const roleId = requireNativeConversationClearId(value.roleId, 'role delete applied role id');
+  const peerId = requireNativeConversationClearId(value.peerId, 'role delete applied peer id');
+  const backupReceiptId = requireNativeConversationClearId(
+    value.backupReceiptId, 'role delete applied backup receipt id'
+  );
+  for (const [field, candidate] of [
+    ['control checksum', value.controlChecksum],
+    ['checksum', value.checksum]
+  ]) {
+    if (typeof candidate !== 'string' || !/^[a-f0-9]{64}$/.test(candidate)) {
+      throw new Error(`invalid role delete applied ${field}`);
+    }
+  }
+  const appliedAt = requireNativeConversationClearTimestamp(
+    value.appliedAt, 'role delete applied time'
+  );
+  const normalized = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_APPLIED',
+    controlId,
+    controlChecksum: value.controlChecksum,
+    roleId,
+    peerId,
+    backupReceiptId,
+    appliedAt,
+    checksum: value.checksum
+  };
+  const withoutChecksum = { ...normalized };
+  delete withoutChecksum.checksum;
+  if (contentHash(withoutChecksum) !== value.checksum) {
+    throw new Error('role delete applied checksum conflict');
+  }
+  return normalized;
+}
+
 function requireNativeConversationClearId(value, label) {
   if (typeof value !== 'string' || !ID_PATTERN.test(value)) {
     throw new Error(`invalid ${label}`);

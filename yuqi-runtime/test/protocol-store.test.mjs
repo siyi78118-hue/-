@@ -12,6 +12,8 @@ import {
   deliveryItemsForResult,
   validateConversationClearControl,
   validateConversationClearApplied,
+  validateRoleDeleteApplied,
+  validateRoleDeleteControl,
   validateEnvelope
 } from '../src/protocol.mjs';
 import { deriveAuthorityLineageKey, YuqiStore } from '../src/store.mjs';
@@ -149,6 +151,120 @@ test('conversation clear applied validator is exact ten-key native and checksum 
     assert.throws(() => validateConversationClearApplied(candidate), /conversation clear applied/i, label);
   }
   assert.throws(() => validateConversationClearApplied(validConversationClearControl()), /conversation clear applied/i);
+});
+
+function validBackupReceipt(roleId = 'yuqi', createdAt = 1784400000200) {
+  const body = {
+    receiptVersion: 'yuqi-backup-receipt-v1',
+    roleId,
+    manifestChecksum: 'b'.repeat(64),
+    snapshotSha256: 'c'.repeat(64),
+    logicalChecksum: 'd'.repeat(64),
+    createdAt
+  };
+  body.receiptId = `bkrcpt_${contentHash({
+    contract: 'yuqi-backup-receipt-id-v1',
+    roleId,
+    manifestChecksum: body.manifestChecksum,
+    snapshotSha256: body.snapshotSha256,
+    logicalChecksum: body.logicalChecksum,
+    createdAt
+  }).slice(0, 24)}`;
+  return { ...body, receiptChecksum: contentHash(body) };
+}
+
+function validRoleDeleteControl(overrides = {}) {
+  const body = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE',
+    controlVersion: 'role_delete_v1',
+    roleId: 'yuqi',
+    peerId: 'device1',
+    requestedAt: 1784400000300,
+    backupReceipt: validBackupReceipt(),
+    ...overrides
+  };
+  if (!Object.prototype.hasOwnProperty.call(overrides, 'controlId')) {
+    body.controlId = `ctl_${contentHash({
+      contract: 'android-lifecycle-control-id-v1',
+      controlKind: 'role_delete_v1',
+      roleId: body.roleId,
+      peerId: body.peerId,
+      requestedAt: body.requestedAt,
+      backupReceiptChecksum: body.backupReceipt.receiptChecksum
+    })}`;
+  }
+  return { ...body, checksum: contentHash(body) };
+}
+
+test('role delete control validator closes the backup-bound nine-key authority wire', () => {
+  const valid = validRoleDeleteControl();
+  assert.deepEqual(validateRoleDeleteControl(valid), valid);
+  assert.deepEqual(validateRoleDeleteControl(JSON.stringify(valid)), valid);
+  for (const [label, changes] of [
+    ['unknown key', { extra: true }],
+    ['missing receipt', { backupReceipt: undefined }],
+    ['coerced protocol', { protocolVersion: '3' }],
+    ['array role', { roleId: ['yuqi'] }],
+    ['string time', { requestedAt: '1784400000300' }],
+    ['postdated receipt', { backupReceipt: validBackupReceipt('yuqi', 1784400000301) }],
+    ['foreign receipt', { backupReceipt: validBackupReceipt('other', 1784400000200) }],
+    ['wrong checksum', { checksum: 'f'.repeat(64) }]
+  ]) {
+    const candidate = validRoleDeleteControl();
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined) delete candidate[key];
+      else candidate[key] = value;
+    }
+    if (label !== 'wrong checksum') {
+      const withoutChecksum = { ...candidate };
+      delete withoutChecksum.checksum;
+      candidate.checksum = contentHash(withoutChecksum);
+    }
+    assert.throws(() => validateRoleDeleteControl(candidate), /role delete|backup receipt/i, label);
+  }
+});
+
+function validRoleDeleteApplied(overrides = {}) {
+  const control = validRoleDeleteControl();
+  const body = {
+    protocolVersion: 3,
+    type: 'ROLE_DELETE_APPLIED',
+    controlId: control.controlId,
+    controlChecksum: control.checksum,
+    roleId: control.roleId,
+    peerId: control.peerId,
+    backupReceiptId: control.backupReceipt.receiptId,
+    appliedAt: 1784400000400,
+    ...overrides
+  };
+  return { ...body, checksum: contentHash(body) };
+}
+
+test('role delete applied proof is an exact native checksum-closed response', () => {
+  const valid = validRoleDeleteApplied();
+  assert.deepEqual(validateRoleDeleteApplied(valid), valid);
+  assert.deepEqual(validateRoleDeleteApplied(JSON.stringify(valid)), valid);
+  for (const [label, changes] of [
+    ['unknown key', { extra: true }],
+    ['missing receipt id', { backupReceiptId: undefined }],
+    ['coerced protocol', { protocolVersion: '3' }],
+    ['array peer', { peerId: ['device1'] }],
+    ['string time', { appliedAt: '1784400000400' }],
+    ['wrong checksum', { checksum: 'e'.repeat(64) }]
+  ]) {
+    const candidate = validRoleDeleteApplied();
+    for (const [key, value] of Object.entries(changes)) {
+      if (value === undefined) delete candidate[key];
+      else candidate[key] = value;
+    }
+    if (label !== 'wrong checksum') {
+      const withoutChecksum = { ...candidate };
+      delete withoutChecksum.checksum;
+      candidate.checksum = contentHash(withoutChecksum);
+    }
+    assert.throws(() => validateRoleDeleteApplied(candidate), /role delete applied/i, label);
+  }
 });
 
 function validEnvelope(overrides = {}) {
