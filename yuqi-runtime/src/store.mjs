@@ -6758,6 +6758,350 @@ export class YuqiStore {
     return this.transaction(run);
   }
 
+  assertCanonicalConversationClearAffectedSetInternal({ roleId, clearEpoch, boundary }) {
+    if (typeof roleId !== 'string' || !roleId
+      || !Number.isSafeInteger(clearEpoch) || clearEpoch <= 0
+      || !Number.isSafeInteger(boundary) || boundary < 0) {
+      throw new Error('canonical conversation clear boundary conflict');
+    }
+    const rows = this.db.prepare(`
+      SELECT t.*
+      FROM turns t
+      WHERE t.character_id = ? AND t.result_authority_version = 1
+      ORDER BY t.authority_lineage_key, t.lineage_revision_at_creation, t.turn_id
+    `).all(roleId);
+    const canonical = [];
+    const checkedRedactedLineages = new Set();
+    for (const row of rows) {
+      if (!row.authority_lineage_key) {
+        throw new Error(`canonical conversation clear missing lineage authority: ${row.turn_id}`);
+      }
+      const lineage = this.db.prepare(
+        'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
+      ).get(row.authority_lineage_key);
+      if (!lineage) throw new Error(`canonical conversation clear lineage conflict: ${row.authority_lineage_key}`);
+      if (row.authority_redacted_at != null) {
+        if (!checkedRedactedLineages.has(row.authority_lineage_key)) {
+          if (lineage.state === 'committed' && lineage.committed_group_id) {
+            this.assertVisibleGroupAuthorityInternal(lineage.committed_group_id, { purpose: 'reopen' });
+          } else if (lineage.state === 'cancelled') {
+            this.assertRedactedLineageAuthorityInternal(row.authority_lineage_key, { purpose: 'reopen' });
+          } else {
+            throw new Error(`canonical conversation clear redacted lineage conflict: ${row.authority_lineage_key}`);
+          }
+          checkedRedactedLineages.add(row.authority_lineage_key);
+        }
+        continue;
+      }
+      let wire;
+      try {
+        wire = validateEnvelope(parseJson(row.envelope_json, null));
+      } catch (error) {
+        throw new Error(`canonical conversation clear envelope conflict: ${row.turn_id}`, { cause: error });
+      }
+      if (typeof wire.protocolVersion !== 'number'
+        || !Number.isSafeInteger(wire.protocolVersion)
+        || ![2, 3].includes(wire.protocolVersion)) {
+        throw new Error(`canonical conversation clear protocol conflict: ${row.turn_id}`);
+      }
+      if (contentHash(wire) !== row.envelope_checksum) {
+        throw new Error(`canonical conversation clear envelope checksum conflict: ${row.turn_id}`);
+      }
+      if (wire.protocolVersion === 3) canonical.push({ ...row, protocolVersion: 3 });
+    }
+    for (const row of canonical) {
+      if (row.input_visibility_sequence == null
+        || !Number.isSafeInteger(Number(row.input_visibility_sequence))
+        || Number(row.input_visibility_sequence) < 0
+        || row.input_clear_epoch == null
+        || !Number.isSafeInteger(Number(row.input_clear_epoch))
+        || Number(row.input_clear_epoch) < 0) {
+        throw new Error(`canonical conversation clear sequence conflict: ${row.turn_id}`);
+      }
+    }
+    const affected = canonical.filter(row =>
+      Number(row.input_clear_epoch) < clearEpoch
+      || (Number(row.input_clear_epoch) === clearEpoch
+        && Number(row.input_visibility_sequence) <= boundary)
+    );
+    const lineageKeys = [...new Set(affected.map(row => row.authority_lineage_key).filter(Boolean))];
+    const closures = [];
+    for (const lineageKey of lineageKeys) {
+      const lineage = this.db.prepare(
+        'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
+      ).get(lineageKey);
+      if (!lineage || !['open', 'committed', 'cancelled'].includes(lineage.state)) {
+        throw new Error(`canonical conversation clear lineage conflict: ${lineageKey}`);
+      }
+      if (lineage.redacted_at != null) {
+        if (lineage.state === 'committed' && lineage.committed_group_id) {
+          this.assertVisibleGroupAuthorityInternal(lineage.committed_group_id, { purpose: 'reopen' });
+        } else if (lineage.state === 'cancelled') {
+          this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, { purpose: 'reopen' });
+        } else {
+          throw new Error(`canonical conversation clear redacted lineage conflict: ${lineageKey}`);
+        }
+        closures.push({ lineage, alreadyRedacted: true });
+        continue;
+      }
+      if (lineage.state === 'committed') {
+        if (!lineage.committed_group_id) throw new Error('canonical conversation clear committed group conflict');
+        this.assertVisibleGroupAuthorityInternal(lineage.committed_group_id, { purpose: 'reopen' });
+      } else if (lineage.state === 'open') {
+        const attemptRows = this.db.prepare(`
+          SELECT t.lineage_revision_at_creation, t.turn_id,
+                 t.rollout_key AS turn_kind, t.retry_of_turn_id,
+                 t.input_user_batch_id, t.envelope_checksum,
+                 b.tombstone_commitment AS batch_tombstone_commitment
+          FROM turns t LEFT JOIN current_user_batches b ON b.turn_id = t.turn_id
+          WHERE t.authority_lineage_key = ? AND t.result_authority_version = 1
+          ORDER BY t.lineage_revision_at_creation, t.turn_id
+        `).all(lineageKey);
+        const attemptCommitment = authorityLineageAttemptsCommitment({
+          lineageKey, attemptRows
+        });
+        if (attemptCommitment.attemptCount !== Number(lineage.attempt_count)
+          || attemptCommitment.commitment !== lineage.attempt_commitment) {
+          throw new Error(`canonical conversation clear attempt commitment conflict: ${lineageKey}`);
+        }
+        this.assertCanonicalLineageMessageAuthorityInternal({ lineageKey, mode: 'live' });
+        const retainedGroup = this.db.prepare(`
+          SELECT 1 FROM visible_result_groups WHERE lineage_key = ?
+          UNION ALL SELECT 1 FROM visible_commit_receipts WHERE lineage_key = ?
+          UNION ALL SELECT 1 FROM cloud_deliveries
+            WHERE turn_id IN (SELECT turn_id FROM turns WHERE authority_lineage_key = ?)
+              AND authority_group_id IS NOT NULL
+          LIMIT 1
+        `).get(lineageKey, lineageKey, lineageKey);
+        if (retainedGroup) throw new Error(`canonical conversation clear open group conflict: ${lineageKey}`);
+      } else {
+        throw new Error(`canonical conversation clear lineage terminal conflict: ${lineageKey}`);
+      }
+      closures.push({ lineage, alreadyRedacted: false });
+    }
+    return { rows, canonical, affected, closures };
+  }
+
+  redactCanonicalConversationLineageInternal({ lineage, redactedAt, fault, faultAfterStep = null }) {
+    const attempts = this.db.prepare(`
+      SELECT * FROM turns WHERE authority_lineage_key = ?
+      ORDER BY lineage_revision_at_creation, turn_id
+    `).all(lineage.lineage_key);
+    if (!attempts.length) throw new Error('canonical conversation clear attempt conflict');
+    const turnIds = attempts.map(row => row.turn_id);
+    const turnMarks = turnIds.map(() => '?').join(',');
+    const groupId = lineage.state === 'committed' ? lineage.committed_group_id : null;
+    const group = groupId == null ? null : this.db.prepare(
+      'SELECT * FROM visible_result_groups WHERE group_id = ?'
+    ).get(groupId);
+    if (groupId != null && !group) throw new Error('canonical conversation clear group conflict');
+    const messages = this.db.prepare(`
+      SELECT * FROM messages WHERE turn_id IN (${turnMarks})
+        ${groupId == null ? '' : 'OR authority_group_id = ?'}
+    `).all(...turnIds, ...(groupId == null ? [] : [groupId]));
+    const messageIds = messages.map(row => row.message_id);
+    const messageMarks = messageIds.map(() => '?').join(',') || "''";
+    const batchRows = this.db.prepare(`
+      SELECT * FROM current_user_batches WHERE turn_id IN (${turnMarks})
+    `).all(...turnIds);
+    const batchItems = this.db.prepare(`
+      SELECT * FROM current_user_batch_items WHERE turn_id IN (${turnMarks})
+      ORDER BY turn_id, sequence
+    `).all(...turnIds);
+    const itemRows = groupId == null ? [] : this.db.prepare(`
+      SELECT * FROM visible_result_items WHERE group_id = ? ORDER BY ordinal
+    `).all(groupId);
+    const actionRows = groupId == null ? [] : this.db.prepare(`
+      SELECT * FROM visible_result_actions WHERE group_id = ? ORDER BY ordinal
+    `).all(groupId);
+    const deliveries = this.db.prepare(`
+      SELECT * FROM cloud_deliveries WHERE turn_id IN (${turnMarks})
+    `).all(...turnIds);
+    if (deliveries.some(delivery =>
+      delivery.authority_group_id != null && delivery.authority_group_id !== groupId)) {
+      throw new Error('canonical conversation clear delivery lineage conflict');
+    }
+    for (const delivery of deliveries.filter(row => row.authority_group_id == null)) {
+      this.assertCanonicalFailureDeliveryInternal(delivery);
+    }
+    const shell = canonicalJson({ redacted: true });
+
+    // Clear every directly linked semantic/executable projection before the
+    // authority shell is written. These rows are all in the enclosing clear
+    // transaction and therefore cannot outlive a failed boundary.
+    this.db.prepare(`DELETE FROM annotations
+      WHERE turn_id IN (${turnMarks}) OR source_message_id IN (${messageMarks})`)
+      .run(...turnIds, ...messageIds);
+    this.db.prepare(`DELETE FROM diagnostics WHERE turn_id IN (${turnMarks})`).run(...turnIds);
+    this.db.prepare(`DELETE FROM consolidation_jobs
+      WHERE turn_id IN (${turnMarks})${groupId == null ? '' : ' OR authority_group_id = ?'}`)
+      .run(...turnIds, ...(groupId == null ? [] : [groupId]));
+    this.db.prepare(`DELETE FROM stance_records
+      WHERE source_turn_id IN (${turnMarks})${groupId == null ? '' : ' OR authority_group_id = ?'}`)
+      .run(...turnIds, ...(groupId == null ? [] : [groupId]));
+    this.db.prepare(`DELETE FROM cognitive_states
+      WHERE last_turn_id IN (${turnMarks})${groupId == null ? '' : ' OR last_authority_group_id = ?'}`)
+      .run(...turnIds, ...(groupId == null ? [] : [groupId]));
+    this.db.prepare(`UPDATE interaction_lanes SET generating_turn_id = NULL
+      WHERE generating_turn_id IN (${turnMarks})`).run(...turnIds);
+    const batchIds = batchRows.map(row => row.batch_id);
+    if (batchIds.length) {
+      const batchMarks = batchIds.map(() => '?').join(',');
+      this.db.prepare(`UPDATE interaction_lanes SET latest_user_batch_id = NULL
+        WHERE latest_user_batch_id IN (${batchMarks})`).run(...batchIds);
+    }
+    if (groupId != null) {
+      this.db.prepare(`UPDATE interaction_lanes
+        SET latest_authoritative_group_id = CASE WHEN latest_authoritative_group_id = ? THEN NULL ELSE latest_authoritative_group_id END,
+            native_completed_group_id = CASE WHEN native_completed_group_id = ? THEN NULL ELSE native_completed_group_id END,
+            ui_applied_group_id = CASE WHEN ui_applied_group_id = ? THEN NULL ELSE ui_applied_group_id END
+        WHERE latest_authoritative_group_id = ? OR native_completed_group_id = ? OR ui_applied_group_id = ?`)
+        .run(groupId, groupId, groupId, groupId, groupId, groupId);
+    }
+    const roles = [...new Set(attempts.map(row => row.character_id))];
+    const roleMarks = roles.map(() => '?').join(',') || "''";
+    this.db.prepare(`DELETE FROM sessions WHERE role IN (${roleMarks})`).run(...roles);
+    const linkedIds = [...new Set([
+      lineage.lineage_key, ...(groupId == null ? [] : [groupId]), ...turnIds,
+      ...messageIds, ...batchRows.map(row => row.batch_id)
+    ])];
+    const linkedMarks = linkedIds.map(() => '?').join(',') || "''";
+    this.db.prepare(`DELETE FROM sync_log WHERE entity_id IN (${linkedMarks})`).run(...linkedIds);
+    fault('after_direct_refs');
+
+    for (const batch of batchRows) {
+      const items = batchItems.filter(row => row.turn_id === batch.turn_id);
+      this.db.prepare(`UPDATE current_user_batch_items
+        SET message_json = NULL, redacted_at = ? WHERE turn_id = ?`).run(redactedAt, batch.turn_id);
+      const commitment = currentUserBatchTombstoneCommitment({
+        turnId: batch.turn_id, batchId: batch.batch_id, itemRows: items
+      });
+      this.db.prepare(`UPDATE current_user_batches
+        SET item_count = ?, tombstone_commitment = ? WHERE turn_id = ?`)
+        .run(commitment.itemCount, commitment.commitment, batch.turn_id);
+    }
+    fault('after_batches');
+
+    for (const message of messages) {
+      this.db.prepare('UPDATE messages SET content = ? WHERE message_id = ?')
+        .run('', message.message_id);
+    }
+    this.db.prepare(`UPDATE turns
+      SET state = CASE WHEN turn_id = ? AND ? IS NOT NULL THEN 'committed' ELSE 'cancelled' END,
+          worker_id = NULL, memory_packet_json = NULL, brain_draft_json = NULL,
+          supervisor_json = NULL, reply_json = NULL, error_json = NULL,
+          envelope_json = ?, envelope_checksum = envelope_checksum,
+          route_reasons_json = '[]', annotation_snapshot_json = '{}',
+          authority_redacted_at = ?,
+          updated_at = ?
+      WHERE authority_lineage_key = ?`).run(
+      lineage.latest_turn_id, groupId, shell, redactedAt,
+      redactedAt, lineage.lineage_key
+    );
+    fault('after_messages');
+
+    if (groupId == null) {
+      for (const delivery of deliveries) {
+        const removed = this.db.prepare(`DELETE FROM cloud_deliveries
+          WHERE turn_id = ? AND peer_id = ? AND state = ?
+            AND payload_json IS ? AND checksum IS ? AND relay_message_id IS ?
+            AND authority_group_id IS ? AND authority_commit_checksum IS ?`)
+          .run(delivery.turn_id, delivery.peer_id, delivery.state,
+            delivery.payload_json, delivery.checksum, delivery.relay_message_id,
+            delivery.authority_group_id, delivery.authority_commit_checksum);
+        if (Number(removed.changes) !== 1) throw new Error('canonical conversation clear delivery CAS conflict');
+      }
+      this.db.prepare(`UPDATE turn_authority_lineages
+        SET state = 'cancelled', committed_group_id = NULL, revision = revision + 1,
+            redacted_at = ?, updated_at = ?
+        WHERE lineage_key = ?`).run(redactedAt, redactedAt, lineage.lineage_key);
+      fault('after_group');
+      const payload = { groupId: null, reasonCode: 'conversation_clear', redactedAt };
+      this.db.prepare(`INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+        VALUES ('authority_redaction', ?, 'redact', ?, ?, ?)`)
+        .run(lineage.lineage_key, canonicalJson(payload), contentHash(payload), redactedAt);
+      if (faultAfterStep === 'after_audit_invalid_shell') {
+        this.db.prepare('UPDATE turns SET envelope_json = ? WHERE authority_lineage_key = ?')
+          .run('{"redacted":false}', lineage.lineage_key);
+      }
+      this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, { purpose: 'reopen' });
+      fault('after_audit');
+      return;
+    }
+
+    // A failed/retry attempt may still have a legacy canonical-failure
+    // delivery row. It is directly linked to this lineage, but has no result
+    // group authority; remove it rather than leaving a redacted envelope that
+    // the failure-delivery validator could interpret as recoverable.
+    for (const delivery of deliveries.filter(row => row.authority_group_id == null)) {
+      const removed = this.db.prepare(`DELETE FROM cloud_deliveries
+        WHERE turn_id = ? AND peer_id = ? AND state = ?
+          AND payload_json IS ? AND checksum IS ? AND relay_message_id IS ?
+          AND authority_group_id IS ? AND authority_commit_checksum IS ?`)
+        .run(delivery.turn_id, delivery.peer_id, delivery.state,
+          delivery.payload_json, delivery.checksum, delivery.relay_message_id,
+          delivery.authority_group_id, delivery.authority_commit_checksum);
+      if (Number(removed.changes) !== 1) throw new Error('canonical conversation clear delivery CAS conflict');
+    }
+
+    this.db.prepare(`UPDATE visible_result_items
+      SET item_json = NULL, redacted_at = ? WHERE group_id = ?`).run(redactedAt, groupId);
+    this.db.prepare(`UPDATE visible_result_actions
+      SET action_kind = NULL, target_key = NULL, target_revision = NULL,
+          action_json = NULL, redacted_at = ? WHERE group_id = ?`).run(redactedAt, groupId);
+    this.db.prepare(`UPDATE visible_result_manifests
+      SET semantic_json = NULL, redacted_at = ? WHERE group_id = ?`).run(redactedAt, groupId);
+    const tombstone = visibleResultTombstoneCommitment({
+      groupId, itemRows: this.db.prepare('SELECT * FROM visible_result_items WHERE group_id = ?').all(groupId),
+      actionRows: this.db.prepare('SELECT * FROM visible_result_actions WHERE group_id = ?').all(groupId)
+    });
+    fault('after_group');
+
+    for (const delivery of deliveries.filter(row => row.authority_group_id === groupId)) {
+      const hasRelay = delivery.relay_message_id != null;
+      const updatedDelivery = this.db.prepare(`UPDATE cloud_deliveries
+        SET state = ?, payload_json = NULL, checksum = NULL,
+            redaction_requested_at = ?, redaction_acknowledged_at = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND state = ?
+          AND payload_json IS ? AND checksum IS ? AND relay_message_id IS ?
+          AND authority_group_id IS ? AND authority_commit_checksum IS ?`)
+        .run(hasRelay ? 'redaction_pending' : 'redacted', hasRelay ? redactedAt : null,
+          hasRelay ? null : redactedAt, redactedAt, delivery.turn_id, delivery.peer_id,
+          delivery.state, delivery.payload_json, delivery.checksum, delivery.relay_message_id,
+          delivery.authority_group_id, delivery.authority_commit_checksum);
+      if (Number(updatedDelivery.changes) !== 1) {
+        throw new Error('canonical conversation clear delivery CAS conflict');
+      }
+    }
+    const finalDeliveries = this.db.prepare(
+      'SELECT * FROM cloud_deliveries WHERE authority_group_id = ?'
+    ).all(groupId);
+    const deliveryCommitment = authorityRedactionDeliveriesCommitment({
+      groupId, deliveryRows: finalDeliveries
+    });
+    this.db.prepare(`UPDATE visible_result_groups
+      SET redacted_at = ?, tombstone_commitment = ?,
+          redaction_delivery_count = ?, redaction_delivery_commitment = ?
+      WHERE group_id = ?`).run(
+      redactedAt, tombstone.commitment, deliveryCommitment.deliveryCount,
+      deliveryCommitment.commitment, groupId
+    );
+    this.db.prepare(`UPDATE turn_authority_lineages
+      SET redacted_at = ?, updated_at = ? WHERE lineage_key = ?`)
+      .run(redactedAt, redactedAt, lineage.lineage_key);
+    fault('after_delivery');
+    const payload = { groupId, reasonCode: 'conversation_clear', redactedAt };
+    this.db.prepare(`INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+      VALUES ('authority_redaction', ?, 'redact', ?, ?, ?)`)
+      .run(groupId, canonicalJson(payload), contentHash(payload), redactedAt);
+    if (faultAfterStep === 'after_audit_invalid_shell') {
+      this.db.prepare('UPDATE visible_result_manifests SET semantic_json = ? WHERE group_id = ?')
+        .run('{"corrupt":true}', groupId);
+    }
+    this.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' });
+    fault('after_audit');
+  }
+
   applyConversationClearInternal(control, { appliedAt, faultAfterStep = null } = {}) {
     const normalizedControl = validateConversationClearControl(control);
     if (typeof appliedAt !== 'number' || !Number.isSafeInteger(appliedAt) || appliedAt <= 0) {
@@ -6852,6 +7196,22 @@ export class YuqiStore {
       );
       if (currentControl.clearedThroughSequence < currentBoundary) {
         throw new Error('conversation clear boundary conflict');
+      }
+
+      const affectedAuthority = this.assertCanonicalConversationClearAffectedSetInternal({
+        roleId: currentControl.roleId,
+        clearEpoch: currentControl.clearEpoch,
+        boundary: currentControl.clearedThroughSequence
+      });
+      for (const closure of affectedAuthority.closures) {
+        if (!closure.alreadyRedacted) {
+          this.redactCanonicalConversationLineageInternal({
+            lineage: closure.lineage,
+            redactedAt: appliedAt,
+            fault,
+            faultAfterStep
+          });
+        }
       }
 
       const updatedLane = this.db.prepare(`

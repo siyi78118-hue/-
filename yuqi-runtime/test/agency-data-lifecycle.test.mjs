@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
+import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import {
   canonicalJson,
   contentHash,
@@ -12,6 +14,7 @@ import {
   validateConversationClearControl
 } from '../src/protocol.mjs';
 import { YuqiStore } from '../src/store.mjs';
+import { commitVisibleResult } from '../src/visible-result-commit.mjs';
 
 const V15_COLUMNS = [
   'control_id', 'role_id', 'peer_id', 'clear_epoch', 'cleared_through_sequence',
@@ -525,3 +528,602 @@ for (const faultAfterStep of ['after_lane_update', 'after_control_insert']) {
     }
   });
 }
+
+function canonicalRedactionEnvelope(index, { retryOfTurnId = null, roleId = 'yuqi' } = {}) {
+  const messages = [0, 1, 2].map(offset => ({
+    messageId: `msg_redact_${index}_${offset}`,
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: roleId,
+    content: `redaction bubble ${offset}`,
+    sentAt: 1784400010000 + index * 10 + offset,
+    type: 'text'
+  }));
+  const rootSourceId = messages.at(-1).messageId;
+  const triggerId = `redact_trigger_${index}`;
+  const cursor = {
+    nativeCompletedTurnId: null,
+    nativeCompletedGroupId: null,
+    nativeCompletedSequence: 0,
+    uiAppliedTurnId: null,
+    uiAppliedGroupId: null,
+    uiAppliedSequence: 0,
+    localSequence: index,
+    clearedThroughSequence: 0,
+    clearEpoch: 0,
+    clearedAt: 0,
+    chatOpen: true,
+    quotedMessageId: null
+  };
+  const envelope = {
+    protocolVersion: 3,
+    turnId: `turn_redact_${index}`,
+    characterId: roleId,
+    deviceId: 'device1',
+    deviceSeq: index,
+    createdAt: 1784400020000 + index,
+    kind: 'DIRECT_REPLY',
+    message: messages.at(-1),
+    context: {
+      currentBatch: {
+        batchId: `batch_redact_${index}`,
+        messageIds: messages.map(message => message.messageId),
+        startedAt: messages[0].sentAt,
+        committedAt: 1784400020000 + index,
+        messages
+      },
+      visibilityCursor: cursor
+    },
+    authority: {
+      algorithm: 'al-authority-v1',
+      roleId,
+      laneKey: 'private_chat',
+      rootSourceId,
+      lineageKey: deriveAuthorityLineageKey({
+        roleId, laneKey: 'private_chat', rootSourceId
+      }),
+      claimedLineageRevision: retryOfTurnId ? 2 : 1,
+      retryOfTurnId
+    }
+  };
+  return envelope;
+}
+
+function legacyV2AboveEnvelope(turnId = 'turn_legacy_above') {
+  return {
+    protocolVersion: 2,
+    turnId,
+    characterId: 'yuqi',
+    deviceId: 'device1',
+    deviceSeq: 3,
+    createdAt: 1784400020003,
+    kind: 'DIRECT_REPLY',
+    message: {
+      messageId: 'msg_legacy_above',
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: 'legacy above boundary',
+      sentAt: 1784400010030
+    }
+  };
+}
+
+function ensureDirectRollout(store) {
+  if (store.getCognitionRollout('DIRECT_REPLY')) return;
+  store.initializeCognitionRolloutsInternal({
+    rows: [{
+      rolloutKey: 'DIRECT_REPLY', currentMode: 'legacy', rolloutPhase: 'stable',
+      presetVersion: '1.9.2', pipelineChecksum: 'a'.repeat(64)
+    }],
+    now: 1
+  });
+}
+
+function createCanonicalRedactionFixture(store, {
+  deliveryState = 'waiting',
+  includeRetry = true
+} = {}) {
+  ensureDirectRollout(store);
+  seedPrivateLane(store, { now: 1784400000000 });
+  const firstInput = canonicalRedactionEnvelope(1);
+  const rollout = store.getCognitionRollout('DIRECT_REPLY');
+  const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: firstInput.createdAt });
+  const first = store.createCanonicalVisibleTurnInternal({
+    envelope: firstInput,
+    rolloutKey: 'DIRECT_REPLY',
+    expectedRolloutRevision: rollout.revision,
+    authoritativeReleaseId: rollout.stableReleaseId,
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    laneKey: 'private_chat',
+    expectedLaneRevision: 1,
+    inputUserBatchId: firstInput.context.currentBatch.batchId,
+    inputVisibilitySequence: firstInput.context.visibilityCursor.localSequence,
+    inputClearEpoch: firstInput.context.visibilityCursor.clearEpoch,
+    agencySnapshotChecksum: agency.checksum,
+    annotationSnapshot: {}
+  }).turn;
+  let terminal = first;
+  let committed;
+  if (includeRetry) {
+    terminal = store.recordCanonicalTurnFailureInternal({
+      turnId: first.turnId,
+      expectedState: first.state,
+      expectedTurnRevision: first.turnRevision,
+      failure: {
+        name: 'TimeoutError',
+        code: 'YUQI_TRANSIENT_EXECUTION_FAILURE',
+        message: 'redaction retry fixture',
+        failureClass: 'transient',
+        retryAllowed: true
+      }
+    });
+    const retryInput = canonicalRedactionEnvelope(2, { retryOfTurnId: first.turnId });
+    retryInput.context.currentBatch = firstInput.context.currentBatch;
+    retryInput.context.visibilityCursor = firstInput.context.visibilityCursor;
+    retryInput.context.visibilityCursor.localSequence = 2;
+    retryInput.message = firstInput.message;
+    retryInput.authority.rootSourceId = firstInput.authority.rootSourceId;
+    retryInput.authority.lineageKey = firstInput.authority.lineageKey;
+    retryInput.context.retry = {
+      retryOfTurnId: first.turnId,
+      canonicalMessageId: firstInput.message.messageId
+    };
+    const retry = store.createCanonicalVisibleTurnInternal({
+      envelope: retryInput,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: Number(store.getInteractionLane('yuqi', 'private_chat').revision),
+      inputUserBatchId: first.inputUserBatchId,
+      inputVisibilitySequence: 2,
+      inputClearEpoch: first.inputClearEpoch,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: first.annotationSnapshot
+    }).turn;
+    terminal = retry;
+  }
+  const actionDraft = { kind: 'moment_create', payload: { text: 'redaction action' } };
+  const resolved = store.resolveCanonicalActionTargetInternal({ turn: terminal, action: actionDraft });
+  const actionSet = [{ ...actionDraft, targetKey: resolved.targetKey, targetRevision: resolved.targetRevision }];
+  const visibleGroup = {
+    items: [0, 1, 2].map(offset => ({
+      content: `reply ${offset}`,
+      speakerId: 'yuqi', speakerType: 'character', recipientId: 'user'
+    }))
+  };
+  const state = store.getCognitiveState('yuqi');
+  committed = commitVisibleResult({
+    store,
+    turnId: terminal.turnId,
+    authorityLineageKey: terminal.authorityLineageKey,
+    laneKey: terminal.laneKey,
+    expectedTurnRevision: terminal.turnRevision,
+    expectedLineageRevision: store.getTurnAuthorityLineage(terminal.authorityLineageKey).revision,
+    expectedLaneRevision: store.getInteractionLane('yuqi', terminal.laneKey).revision,
+    expectedCognitiveStateRevision: Number(state?.revision || 0),
+    expectedLatestUserBatchId: terminal.inputUserBatchId,
+    inputVisibilitySequence: terminal.inputVisibilitySequence,
+    inputClearEpoch: terminal.inputClearEpoch,
+    protocolVersion: terminal.protocolVersion,
+    turnKind: terminal.rolloutKey,
+    agencySnapshotChecksum: terminal.agencySnapshotChecksum,
+    authoritativeReleaseId: terminal.authoritativeReleaseId,
+    visibleGroup,
+    actionSet,
+    proactiveMotiveEvidenceIds: [],
+    statePatch: {
+      mood: 'warm',
+      currentStances: [{
+        operation: 'create',
+        stanceId: 'stance_redaction_fixture',
+        topic: 'topic',
+        position: 'position',
+        reason: 'reason',
+        strength: 0.7,
+        flexibility: 0.8,
+        evidenceMessageIds: [terminal.inputUserBatchId
+          ? JSON.parse(terminal.envelopeJson).message.messageId : 'msg_redact_2_2'],
+        expiresAt: 1784400090000,
+        remainingRelevantUserBatches: 3
+      }],
+      openThreads: []
+    },
+    memoryJobs: [{
+      jobId: 'job_redaction_fixture',
+      jobType: 'turn_consolidation',
+      dueAt: 1784400023000,
+      workerId: 'worker_redaction',
+      payload: {
+        turnId: terminal.turnId,
+        createdAt: 1784400023000,
+        cognitionPacketChecksum: 'b'.repeat(64),
+        resultingCognitiveStateChecksum: 'c'.repeat(64)
+      }
+    }],
+    comparisonJob: null,
+    generationFingerprint: generationFingerprint({
+      roleId: terminal.characterId,
+      laneKey: terminal.laneKey,
+      inputVisibilitySequence: terminal.inputVisibilitySequence,
+      visibleGroup,
+      actionSet,
+      contextRevision: terminal.agencySnapshotChecksum
+    }),
+    now: 1784400021000
+  });
+  const aboveInput = legacyV2AboveEnvelope();
+  const above = store.createTurnWithReleasePinInternal({
+    envelope: aboveInput,
+    rolloutKey: 'DIRECT_REPLY',
+    laneKey: 'private_chat',
+    expectedLaneRevision: Number(store.getInteractionLane('yuqi', 'private_chat').revision),
+    inputVisibilitySequence: 3,
+    presetVersion: rollout.presetVersion,
+    annotationSnapshot: {}
+  });
+  if (deliveryState === 'mailboxed' || deliveryState === 'confirmed') {
+    const delivery = store.db.prepare(
+      'SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id LIMIT 1'
+    ).get(terminal.turnId);
+    const deliveryPayload = canonicalJson({
+      groupId: committed.visibleGroupId,
+      commitChecksum: committed.commitChecksum
+    });
+    store.db.prepare(`
+      UPDATE cloud_deliveries
+      SET state = ?, payload_json = ?, checksum = ?, attempts = 1,
+          relay_message_id = ?, delivered_at = ?, confirmed_at = ?, updated_at = ?
+      WHERE turn_id = ? AND peer_id = ?
+    `).run(
+      deliveryState,
+      deliveryPayload,
+      contentHash(JSON.parse(deliveryPayload)),
+      `relay_${terminal.turnId}`,
+      1784400021100,
+      deliveryState === 'confirmed' ? 1784400021200 : null,
+      1784400021300,
+      delivery.turn_id,
+      delivery.peer_id
+    );
+  }
+  return {
+    first,
+    terminal,
+    committed: store.getTurn(committed.authoritativeTurnId),
+    groupId: committed.visibleGroupId,
+    lineageKey: terminal.authorityLineageKey,
+    above
+  };
+}
+
+function canonicalAuthoritySnapshot(store, turnId) {
+  const turn = store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turnId);
+  const lineage = store.db.prepare('SELECT * FROM turn_authority_lineages WHERE lineage_key = ?')
+    .get(turn.authority_lineage_key);
+  return {
+    turn,
+    lineage,
+    batches: store.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').all(turnId),
+    batchItems: store.db.prepare('SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence').all(turnId),
+    messages: store.db.prepare('SELECT * FROM messages WHERE turn_id = ? ORDER BY message_id').all(turnId),
+    deliveries: store.db.prepare('SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id').all(turnId)
+  };
+}
+
+function redactionDatabaseSnapshot(store) {
+  const tables = [
+    'interaction_lanes', 'conversation_clear_controls', 'turns',
+    'turn_authority_lineages', 'current_user_batches', 'current_user_batch_items',
+    'messages', 'visible_result_groups', 'visible_result_items',
+    'visible_result_actions', 'visible_result_manifests', 'visible_commit_receipts',
+    'cloud_deliveries', 'annotations', 'diagnostics', 'consolidation_jobs',
+    'stance_records', 'cognitive_states', 'sessions', 'sync_log'
+  ];
+  return Object.fromEntries(tables.map(table => [table,
+    store.db.prepare(`SELECT * FROM "${table}"`).all()
+      .map(row => JSON.stringify(row)).sort()
+  ]));
+}
+
+for (const deliveryState of ['waiting', 'mailboxed', 'confirmed']) {
+  test(`canonical RA1 ${deliveryState} delivery closes with exact redaction lifecycle`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-${deliveryState}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createCanonicalRedactionFixture(store, { deliveryState });
+      const beforeTurns = store.db.prepare(`
+        SELECT turn_id, turn_revision, input_clear_epoch, input_visibility_sequence
+        FROM turns WHERE authority_lineage_key = ? ORDER BY lineage_revision_at_creation, turn_id
+      `).all(fixture.lineageKey);
+      store.applyConversationClearInternal(emptySessionClear({ clearedThroughSequence: 2 }), {
+        appliedAt: 1784400035000
+      });
+      const afterTurns = store.db.prepare(`
+        SELECT turn_id, turn_revision, input_clear_epoch, input_visibility_sequence
+        FROM turns WHERE authority_lineage_key = ? ORDER BY lineage_revision_at_creation, turn_id
+      `).all(fixture.lineageKey);
+      assert.deepEqual(afterTurns, beforeTurns);
+      const delivery = store.db.prepare(
+        'SELECT state, relay_message_id, payload_json, checksum, redaction_requested_at, redaction_acknowledged_at '
+        + 'FROM cloud_deliveries WHERE authority_group_id = ?'
+      ).get(fixture.groupId);
+      if (deliveryState === 'waiting') {
+        assert.equal(delivery.state, 'redacted');
+        assert.equal(delivery.relay_message_id, null);
+        assert.equal(delivery.payload_json, null);
+        assert.equal(delivery.checksum, null);
+        assert.equal(delivery.redaction_requested_at, null);
+        assert.equal(delivery.redaction_acknowledged_at, 1784400035000);
+      } else {
+        assert.equal(delivery.state, 'redaction_pending');
+        assert.equal(delivery.relay_message_id, `relay_${fixture.terminal.turnId}`);
+        assert.equal(delivery.payload_json, null);
+        assert.equal(delivery.checksum, null);
+        assert.equal(delivery.redaction_requested_at, 1784400035000);
+        assert.equal(delivery.redaction_acknowledged_at, null);
+      }
+      store.close();
+      const reopened = new YuqiStore(path);
+      assert.doesNotThrow(() => reopened.assertVisibleGroupAuthorityInternal(
+        fixture.groupId, { purpose: 'reopen' }
+      ));
+      reopened.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+test('canonical RA1 corrupted commitment is rejected with zero writes', () => {
+  const { dir, path } = tempPath('yuqi-clear-corrupt-commitment-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store);
+    store.db.prepare('UPDATE visible_result_groups SET tombstone_commitment = ? WHERE group_id = ?')
+      .run('f'.repeat(64), fixture.groupId);
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 2 }), { appliedAt: 1784400036000 }
+    ), /authority|commitment|conflict/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const [label, mutateEnvelope] of [
+  ['missing protocol', envelope => { delete envelope.protocolVersion; }],
+  ['string protocol', envelope => { envelope.protocolVersion = '3'; }],
+  ['fractional protocol', envelope => { envelope.protocolVersion = 3.5; }],
+  ['unknown protocol', envelope => { envelope.protocolVersion = 4; }],
+  ['null protocol', envelope => { envelope.protocolVersion = null; }]
+]) {
+  test(`canonical RA1 ${label} is rejected before affected-set filtering`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-malformed-envelope-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createCanonicalRedactionFixture(store);
+      const envelope = JSON.parse(fixture.terminal.envelopeJson);
+      mutateEnvelope(envelope);
+      store.db.prepare('UPDATE turns SET envelope_json = ? WHERE turn_id = ?')
+        .run(JSON.stringify(envelope), fixture.terminal.turnId);
+      const before = redactionDatabaseSnapshot(store);
+      assert.throws(() => store.applyConversationClearInternal(
+        emptySessionClear({ clearedThroughSequence: 2 }), { appliedAt: 1784400036500 }
+      ), /envelope|protocol|authority|conflict/i);
+      assert.deepEqual(redactionDatabaseSnapshot(store), before);
+      store.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+test('canonical RA1 corrupt null-group failure delivery is rejected before deletion', () => {
+  const { dir, path } = tempPath('yuqi-clear-corrupt-failure-delivery-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store);
+    const failedTurnId = fixture.first.turnId;
+    store.db.prepare(`UPDATE cloud_deliveries
+      SET payload_json = ?, checksum = ?, attempts = 1, updated_at = ?
+      WHERE turn_id = ? AND authority_group_id IS NULL`).run(
+      '{"failure":"corrupt"}', 'f'.repeat(64), 1784400025000, failedTurnId
+    );
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 2 }), { appliedAt: 1784400036600 }
+    ), /failure|delivery|authority|conflict/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('canonical RA1 post-audit shell validation failure rolls back the complete transaction', () => {
+  const { dir, path } = tempPath('yuqi-clear-post-audit-shell-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store);
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 2 }), {
+        appliedAt: 1784400036700,
+        faultAfterStep: 'after_audit_invalid_shell'
+      }
+    ), /redacted|shell|fault|conflict/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('canonical RA1 null visibility sequence fails closed with zero writes', () => {
+  const { dir, path } = tempPath('yuqi-clear-null-sequence-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store);
+    store.db.prepare('UPDATE turns SET input_visibility_sequence = NULL WHERE turn_id = ?')
+      .run(fixture.terminal.turnId);
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 2 }), { appliedAt: 1784400037000 }
+    ), /sequence|conflict/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('canonical RA1 open lineage is cancelled and reopens as a redacted shell', () => {
+  const { dir, path } = tempPath('yuqi-clear-open-lineage-');
+  try {
+    const store = new YuqiStore(path);
+    ensureDirectRollout(store);
+    seedPrivateLane(store, { now: 1784400000000 });
+    const input = canonicalRedactionEnvelope(1);
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: input.createdAt });
+    const turn = store.createCanonicalVisibleTurnInternal({
+      envelope: input,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: rollout.stableReleaseId,
+      comparisonReleaseId: null,
+      comparisonDirection: null,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 1,
+      inputUserBatchId: input.context.currentBatch.batchId,
+      inputVisibilitySequence: 1,
+      inputClearEpoch: 0,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: {}
+    }).turn;
+    const proof = store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 1 }), { appliedAt: 1784400038000 }
+    );
+    assert.equal(proof.type, 'CONVERSATION_CLEAR_APPLIED');
+    const lineage = store.getTurnAuthorityLineage(turn.authorityLineageKey);
+    assert.equal(lineage.state, 'cancelled');
+    assert.equal(lineage.committedGroupId, null);
+    assert.doesNotThrow(() => store.assertRedactedLineageAuthorityInternal(
+      turn.authorityLineageKey, { purpose: 'reopen' }
+    ));
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.doesNotThrow(() => reopened.assertRedactedLineageAuthorityInternal(
+      turn.authorityLineageKey, { purpose: 'reopen' }
+    ));
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const faultAfterStep of [
+  'after_direct_refs', 'after_batches', 'after_messages', 'after_group',
+  'after_delivery', 'after_audit', 'after_lane_update',
+  'after_control_insert', 'after_applied_projection'
+]) {
+  test(`canonical RA1 fault ${faultAfterStep} rolls back the complete clear transaction`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-fault-${faultAfterStep}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createCanonicalRedactionFixture(store);
+      const before = redactionDatabaseSnapshot(store);
+      assert.throws(() => store.applyConversationClearInternal(
+        emptySessionClear({ clearedThroughSequence: 2 }), {
+          appliedAt: 1784400040000,
+          faultAfterStep
+        }
+      ), /forced conversation clear fault/i);
+      assert.deepEqual(redactionDatabaseSnapshot(store), before);
+      store.close();
+      const reopened = new YuqiStore(path);
+      assert.deepEqual(redactionDatabaseSnapshot(reopened), before);
+      reopened.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+test('canonical RA1 clear redacts a real three-bubble retry lineage and preserves above-boundary bytes', () => {
+  const { dir, path } = tempPath('yuqi-clear-canonical-redaction-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { deliveryState: 'waiting' });
+    assert.doesNotThrow(() => store.assertVisibleGroupAuthorityInternal(fixture.groupId, { purpose: 'reopen' }));
+    const aboveBefore = canonicalAuthoritySnapshot(store, fixture.above.turnId);
+    const targetTurnIds = store.db.prepare(
+      'SELECT turn_id FROM turns WHERE authority_lineage_key = ? ORDER BY turn_id'
+    ).all(fixture.lineageKey).map(row => row.turn_id);
+    store.db.prepare(`INSERT INTO annotations(
+      annotation_id, turn_id, source_message_id, preset_version, annotation_json, status, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(
+      'annotation_redaction_fixture', targetTurnIds[0], null, '1.9.2', '{}', 'active', 1784400022000
+    );
+    store.db.prepare(`INSERT INTO diagnostics(turn_id, stage, level, detail_json, created_at)
+      VALUES (?, ?, ?, ?, ?)`).run(targetTurnIds[0], 'brain', 'error', '{"secret":"x"}', 1784400022001);
+    store.db.prepare(`INSERT INTO sessions(role, thread_id, turn_count, updated_at)
+      VALUES ('yuqi', 'unrelated_thread', 1, ?)`).run(1784400023000);
+    store.db.prepare(`INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+      VALUES ('turn', ?, 'update', ?, ?, ?)`).run(
+      targetTurnIds[0], '{}', contentHash({}), 1784400023000
+    );
+    store.db.prepare(`UPDATE interaction_lanes
+      SET generating_turn_id = ?, latest_authoritative_group_id = ?,
+          native_completed_group_id = ?, ui_applied_group_id = ?
+      WHERE role_id = 'yuqi' AND lane_key = 'private_chat'`).run(
+      targetTurnIds.at(-1), fixture.groupId, fixture.groupId, fixture.groupId
+    );
+    const clear = emptySessionClear({ clearedThroughSequence: 2 });
+    const applied = store.applyConversationClearInternal(clear, { appliedAt: 1784400030000 });
+    assert.equal(applied.type, 'CONVERSATION_CLEAR_APPLIED');
+    assert.equal(store.db.prepare(
+      'SELECT redacted_at FROM visible_result_groups WHERE group_id = ?'
+    ).get(fixture.groupId).redacted_at, 1784400030000);
+    assert.equal(store.db.prepare(
+      'SELECT COUNT(*) AS value FROM cloud_deliveries WHERE turn_id IN '
+      + '(SELECT turn_id FROM turns WHERE authority_lineage_key = ?) AND authority_group_id IS NULL'
+    ).get(fixture.lineageKey).value, 0);
+    assert.doesNotThrow(() => store.assertVisibleGroupAuthorityInternal(
+      fixture.groupId, { purpose: 'reopen' }
+    ));
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.doesNotThrow(() => reopened.assertVisibleGroupAuthorityInternal(
+      fixture.groupId, { purpose: 'reopen' }
+    ));
+    assert.deepEqual(
+      reopened.applyConversationClearInternal(clear, { appliedAt: 1784400040000 }),
+      applied
+    );
+    assert.deepEqual(canonicalAuthoritySnapshot(reopened, fixture.above.turnId), aboveBefore);
+    assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM annotations WHERE turn_id IN ('
+      + targetTurnIds.map(() => '?').join(',') + ')').get(...targetTurnIds).value, 0);
+    assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM diagnostics WHERE turn_id IN ('
+      + targetTurnIds.map(() => '?').join(',') + ')').get(...targetTurnIds).value, 0);
+    assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM consolidation_jobs WHERE authority_group_id = ?')
+      .get(fixture.groupId).value, 0);
+    assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM stance_records WHERE authority_group_id = ?')
+      .get(fixture.groupId).value, 0);
+    assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM cognitive_states WHERE last_authority_group_id = ?')
+      .get(fixture.groupId).value, 0);
+    assert.equal(reopened.db.prepare("SELECT COUNT(*) AS value FROM sessions WHERE role = 'yuqi'").get().value, 0);
+    assert.equal(reopened.db.prepare("SELECT COUNT(*) AS value FROM sync_log WHERE entity_id = ? AND entity_type != 'authority_redaction'")
+      .get(targetTurnIds[0]).value, 0);
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
