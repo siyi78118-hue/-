@@ -25,9 +25,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         YuqiAnnotationEntity.class,
         ConversationCursorEntity.class,
         ConversationAuthorityEntity.class,
-        LifecycleControlEntity.class
+        LifecycleControlEntity.class,
+        LifecycleInboundAckTombstoneEntity.class
     },
-    version = 13,
+    version = 14,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
@@ -168,6 +169,19 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                 + "ON `lifecycle_controls` (`characterId`, `clearEpoch`)");
         }
     };
+    public static final Migration MIGRATION_13_14 = new Migration(13, 14) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `lifecycle_inbound_ack_tombstones` ("
+                + "`ackKey` TEXT NOT NULL, `peerId` TEXT NOT NULL, "
+                + "`inboundRelayMessageId` TEXT NOT NULL, `relayExpiresAt` INTEGER NOT NULL, "
+                + "`controlId` TEXT NOT NULL, `controlChecksum` TEXT NOT NULL, "
+                + "`ackChecksum` TEXT NOT NULL, `reasonCode` TEXT NOT NULL, "
+                + "`createdAt` INTEGER NOT NULL, PRIMARY KEY(`ackKey`))");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS "
+                + "`index_lifecycle_inbound_ack_tombstones_peerId_inboundRelayMessageId` "
+                + "ON `lifecycle_inbound_ack_tombstones` (`peerId`, `inboundRelayMessageId`)");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -182,7 +196,8 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                     ).addMigrations(
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
-                        MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13
+                        MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
+                        MIGRATION_13_14
                     ).build();
                 }
             }

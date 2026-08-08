@@ -81,6 +81,39 @@ public class LifecycleControlSenderTest {
     }
 
     @Test
+    public void appliedAckShapeIsSelfContainedAndRejectsNativeCoercion() throws Exception {
+        LifecycleControl control = control(
+            LifecycleControl.WAITING, null, null, null, null, 0L);
+        JSONObject ack = LifecycleControlSender.encodeAppliedAck(control, 300L);
+        LifecycleControlSender.validateAppliedAckShape(ack);
+
+        JSONObject stringProtocol = new JSONObject(ack.toString()).put("protocolVersion", "3");
+        stringProtocol.put("checksum", BridgeAuthority.sha256CanonicalJson(
+            without(stringProtocol, "checksum")));
+        assertThrows(IllegalArgumentException.class,
+            () -> LifecycleControlSender.validateAppliedAckShape(stringProtocol));
+
+        JSONObject arrayId = new JSONObject(ack.toString()).put("controlId", new org.json.JSONArray());
+        arrayId.put("checksum", BridgeAuthority.sha256CanonicalJson(without(arrayId, "checksum")));
+        assertThrows(IllegalArgumentException.class,
+            () -> LifecycleControlSender.validateAppliedAckShape(arrayId));
+
+        JSONObject extra = new JSONObject(ack.toString()).put("extra", true);
+        assertThrows(IllegalArgumentException.class,
+            () -> LifecycleControlSender.validateAppliedAckShape(extra));
+    }
+
+    private static JSONObject without(JSONObject source, String key) throws Exception {
+        JSONObject copy = new JSONObject();
+        java.util.Iterator<String> keys = source.keys();
+        while (keys.hasNext()) {
+            String current = keys.next();
+            if (!key.equals(current)) copy.put(current, source.get(current));
+        }
+        return copy;
+    }
+
+    @Test
     public void appliedAckConflictClassifierIsClosed() {
         assertTrue(LifecycleControlSender.isAppliedAckConflict(
             new IllegalArgumentException("invalid lifecycle ACK header")));

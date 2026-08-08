@@ -22,6 +22,18 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertLifecycleControl(LifecycleControlEntity control);
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertLifecycleInboundAckTombstone(LifecycleInboundAckTombstoneEntity tombstone);
+
+    @Query("SELECT * FROM lifecycle_inbound_ack_tombstones WHERE peerId = :peerId AND inboundRelayMessageId = :relayMessageId LIMIT 1")
+    LifecycleInboundAckTombstoneEntity lifecycleInboundAckTombstone(String peerId, String relayMessageId);
+
+    @Query("SELECT COUNT(*) FROM lifecycle_inbound_ack_tombstones")
+    long lifecycleInboundAckTombstoneCount();
+
+    @Query("SELECT * FROM lifecycle_inbound_ack_tombstones ORDER BY ackKey ASC")
+    List<LifecycleInboundAckTombstoneEntity> lifecycleInboundAckTombstones();
+
     @Query("SELECT * FROM lifecycle_controls WHERE controlId = :controlId LIMIT 1")
     LifecycleControlEntity lifecycleControl(String controlId);
 

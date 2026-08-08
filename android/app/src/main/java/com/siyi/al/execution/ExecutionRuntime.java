@@ -19,24 +19,25 @@ final class ExecutionRuntime {
 
     static ExecutionEngine create(Context context) {
         AlExecutionDatabase database = AlExecutionDatabase.get(context);
-        RoomExecutionStore store = new RoomExecutionStore(database);
         AlSecretStore secrets = new AlSecretStore(context);
+        RoomExecutionStore store = new RoomExecutionStore(database);
         NativeModelGateway gateway = new NativeModelGateway(
             secrets,
             new OpenAiCompatibleClient(new UrlConnectionTransport())
         );
         gateway.setBridgeRouterProvider(() -> {
             BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
+            RoomExecutionStore bridgeStore = new RoomExecutionStore(database, bridgeConfig.deviceId);
             FallbackJournal fallbackJournal = new FallbackJournal(database.executionDao(), bridgeConfig.deviceId);
             RoomBridgeMirror mirror = new RoomBridgeMirror(
-                database.executionDao(), store, bridgeConfig.deviceId);
+                database.executionDao(), bridgeStore, bridgeConfig.deviceId);
             BridgeClient bridgeClient = new BridgeClient(
                 bridgeConfig,
                 fallbackJournal,
                 (turnId, raw) -> store.recordDiagnostic(
                     turnId, null, "INFO", "BRIDGE_STATUS", raw, System.currentTimeMillis()
                 ),
-                cloudInboxConsumer(mirror, store)
+                cloudInboxConsumer(mirror, bridgeStore, bridgeConfig.deviceId)
             );
             return new BridgeRouter(
                 bridgeConfig,
@@ -55,9 +56,9 @@ final class ExecutionRuntime {
         BridgeConfig config = secrets.loadBridgeConfig();
         if (!config.hasCloud()) return 0;
         FallbackJournal journal = new FallbackJournal(database.executionDao(), config.deviceId);
-        RoomExecutionStore store = new RoomExecutionStore(database);
+        RoomExecutionStore store = new RoomExecutionStore(database, config.deviceId);
         RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), store, config.deviceId);
-        BridgeClient client = new BridgeClient(config, journal, null, cloudInboxConsumer(mirror, store));
+        BridgeClient client = new BridgeClient(config, journal, null, cloudInboxConsumer(mirror, store, config.deviceId));
         return client.drainCloudInbox();
     }
 
@@ -108,7 +109,7 @@ final class ExecutionRuntime {
     }
 
     private static BridgeClient.CloudInboxConsumer cloudInboxConsumer(
-        RoomBridgeMirror mirror, RoomExecutionStore store
+        RoomBridgeMirror mirror, RoomExecutionStore store, String verifiedPeerId
     ) {
         return new BridgeClient.CloudInboxConsumer() {
             @Override public boolean persist(String raw) throws Exception {
@@ -125,9 +126,31 @@ final class ExecutionRuntime {
                 String raw, String relayMessageId, Long relayExpiresAt, long now
             ) throws Exception {
                 JSONObject ack = new JSONObject(raw == null ? "{}" : raw);
+                try {
+                    LifecycleControlSender.validateAppliedAckShape(ack);
+                } catch (IllegalArgumentException invalid) {
+                    return false;
+                }
+                if (verifiedPeerId == null || verifiedPeerId.trim().isEmpty()
+                    || !verifiedPeerId.equals(ack.optString("peerId", ""))
+                    || !LifecycleControlSender.validInboundRelayMessageId(relayMessageId)
+                    || relayExpiresAt == null
+                    || !LifecycleControlSender.validRelayExpiry(now, relayExpiresAt)) {
+                    throw new IllegalArgumentException("lifecycle applied ACK authority conflict");
+                }
                 String controlId = ack.optString("controlId", "").trim();
                 LifecycleControl control = store.lifecycleControl(controlId);
-                if (control == null || !LifecycleControl.CLEAR_KIND.equals(control.controlKind)
+                if (control == null) {
+                    try {
+                        return store.recordUnknownLifecycleAckTerminal(
+                            verifiedPeerId, relayMessageId, relayExpiresAt,
+                            ack.getString("controlId"), ack.getString("controlChecksum"),
+                            ack.getString("checksum"), now);
+                    } catch (IllegalArgumentException conflict) {
+                        return false;
+                    }
+                }
+                if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)
                     || relayMessageId == null || relayExpiresAt == null) return false;
                 try {
                     LifecycleControlSender.validateAppliedAck(ack, control);

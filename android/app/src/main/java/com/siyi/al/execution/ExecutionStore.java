@@ -123,6 +123,19 @@ public interface ExecutionStore {
         return false;
     }
 
+    /** Durably consumes a valid applied ACK whose local control is unknown. */
+    default boolean recordUnknownLifecycleAckTerminal(
+        String peerId,
+        String inboundRelayMessageId,
+        long relayExpiresAt,
+        String controlId,
+        String controlChecksum,
+        String ackChecksum,
+        long createdAt
+    ) {
+        return false;
+    }
+
     boolean quarantineLifecycleControl(String controlId, String semanticChecksum, long now);
 
     /** Quarantines only the pending lease snapshot supplied by the caller. */

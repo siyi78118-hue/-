@@ -54,7 +54,7 @@ public class RoomExecutionStoreTest {
         database = Room.inMemoryDatabaseBuilder(context, AlExecutionDatabase.class)
             .allowMainThreadQueries()
             .build();
-        store = new RoomExecutionStore(database);
+        store = new RoomExecutionStore(database, "device_gateway");
     }
 
     @After
@@ -172,6 +172,76 @@ public class RoomExecutionStoreTest {
             localTurnId, attempt.attemptId, changedReceipt, 1001L));
         assertEquals(3, store.replyParts(localTurnId).size());
         assertEquals(changes, rowCount("change_events"));
+    }
+
+    @Test
+    public void unknownAppliedAckTombstoneIsExactReplayAndChangedRelayConflicts() throws Exception {
+        JSONObject ack = new JSONObject()
+            .put("protocolVersion", 3)
+            .put("type", "CONVERSATION_CLEAR_APPLIED")
+            .put("controlId", "ctl_unknown_" + repeat('a', 64))
+            .put("controlChecksum", repeat('b', 64))
+            .put("roleId", "yuqi")
+            .put("peerId", "device_gateway")
+            .put("clearEpoch", 1L)
+            .put("clearedThroughSequence", 0L)
+            .put("appliedAt", 500L);
+        ack.put("checksum", BridgeAuthority.sha256CanonicalJson(without(ack, "checksum")));
+        LifecycleControlSender.validateAppliedAckShape(ack);
+
+        assertTrue(store.recordUnknownLifecycleAckTerminal(
+            "device_gateway", "relay-inbound-1", 1_000L,
+            ack.getString("controlId"), ack.getString("controlChecksum"),
+            ack.getString("checksum"), 500L));
+        assertTrue(store.recordUnknownLifecycleAckTerminal(
+            "device_gateway", "relay-inbound-1", 1_000L,
+            ack.getString("controlId"), ack.getString("controlChecksum"),
+            ack.getString("checksum"), 501L));
+        assertThrows(IllegalArgumentException.class, () -> store.recordUnknownLifecycleAckTerminal(
+            "device_gateway", "relay-inbound-1", 1_000L,
+            ack.getString("controlId"), repeat('c', 64), ack.getString("checksum"), 502L));
+        assertThrows(IllegalArgumentException.class, () -> store.recordUnknownLifecycleAckTerminal(
+            "device_gateway", "relay-inbound-1", 1_001L,
+            ack.getString("controlId"), ack.getString("controlChecksum"),
+            ack.getString("checksum"), 503L));
+        RoomExecutionStore otherPeerStore = new RoomExecutionStore(database, "device-other");
+        assertTrue(otherPeerStore.recordUnknownLifecycleAckTerminal(
+            "device-other", "relay-inbound-1", 1_000L,
+            ack.getString("controlId"), ack.getString("controlChecksum"),
+            ack.getString("checksum"), 504L));
+        assertEquals(2L, count("lifecycle_inbound_ack_tombstones"));
+    }
+
+    @Test
+    public void twoRoomConnectionsConvergeUnknownAckToOneDurableRow() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "unknown-ack-race-" + System.nanoTime();
+        AlExecutionDatabase firstDb = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries().build();
+        AlExecutionDatabase secondDb = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries().build();
+        RoomExecutionStore first = new RoomExecutionStore(firstDb, "device_gateway");
+        RoomExecutionStore second = new RoomExecutionStore(secondDb, "device_gateway");
+        String controlId = "ctl_race_" + repeat('d', 64);
+        String controlChecksum = repeat('e', 64);
+        String ackChecksum = repeat('f', 64);
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            Future<Boolean> one = executor.submit(() -> first.recordUnknownLifecycleAckTerminal(
+                "device_gateway", "relay-race", 1_000L,
+                controlId, controlChecksum, ackChecksum, 500L));
+            Future<Boolean> two = executor.submit(() -> second.recordUnknownLifecycleAckTerminal(
+                "device_gateway", "relay-race", 1_000L,
+                controlId, controlChecksum, ackChecksum, 501L));
+            assertTrue(one.get());
+            assertTrue(two.get());
+            assertEquals(1L, countFrom(firstDb, "lifecycle_inbound_ack_tombstones"));
+        } finally {
+            executor.shutdownNow();
+            firstDb.close();
+            secondDb.close();
+            context.deleteDatabase(databaseName);
+        }
     }
 
     @Test
@@ -3794,6 +3864,31 @@ public class RoomExecutionStoreTest {
         char[] output = new char[length];
         java.util.Arrays.fill(output, value);
         return new String(output);
+    }
+
+    private static JSONObject without(JSONObject source, String key) throws Exception {
+        JSONObject copy = new JSONObject();
+        java.util.Iterator<String> keys = source.keys();
+        while (keys.hasNext()) {
+            String current = keys.next();
+            if (!key.equals(current)) copy.put(current, source.get(current));
+        }
+        return copy;
+    }
+
+    private long count(String table) {
+        return countFrom(database, table);
+    }
+
+    private static long countFrom(AlExecutionDatabase source, String table) {
+        Cursor cursor = source.getOpenHelper().getWritableDatabase().query(
+            "SELECT COUNT(*) FROM `" + table + "`");
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.getLong(0);
+        } finally {
+            cursor.close();
+        }
     }
 
     private interface PayloadMutation {

@@ -252,6 +252,7 @@ public class ConversationCursorStoreTest {
         assertTrue(hasColumn(db, "execution_attempts", "bridgeAuthorityCheckpointChecksum"));
         assertTrue(hasColumn(db, "chat_turns", "bridgeProtocolVersion"));
         assertTrue(hasTable(db, "lifecycle_controls"));
+        assertTrue(hasTable(db, "lifecycle_inbound_ack_tombstones"));
         assertTrue(columnIsNotNull(db, "lifecycle_controls", "leaseAttempt"));
         assertEquals("0", columnDefault(db, "lifecycle_controls", "leaseAttempt"));
         assertFalse(columnIsNotNull(db, "execution_attempts", "bridgeAuthorityCheckpointJson"));
@@ -289,6 +290,82 @@ public class ConversationCursorStoreTest {
         assertEquals("{\"legacyMemory\":\"保留\"}", stringValue(db,
             "SELECT memoryResult FROM execution_attempts WHERE attemptId = 'attempt-11'"));
         helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void migration13To14CreatesUnknownAckTombstonesAndPreservesControls() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v13-v14-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase db = helper.getWritableDatabase();
+        AlExecutionDatabase.MIGRATION_12_13.migrate(db);
+        db.execSQL("INSERT INTO lifecycle_controls (controlId, controlKind, characterId, peerId, clearEpoch, clearedThroughSequence, requestedAt, semanticJson, semanticChecksum, state, leaseAttempt, updatedAt) VALUES ('ctl_keep', 'conversation_clear_v1', 'yuqi', 'device-1', 1, 2, 100, '{}', '" + repeat('a', 64) + "', 'waiting', 0, 100)");
+
+        AlExecutionDatabase.MIGRATION_13_14.migrate(db);
+
+        assertTrue(hasTable(db, "lifecycle_inbound_ack_tombstones"));
+        assertEquals(0L, count(db, "lifecycle_inbound_ack_tombstones"));
+        assertEquals(1L, count(db, "lifecycle_controls"));
+        assertTrue(hasColumn(db, "lifecycle_inbound_ack_tombstones", "ackKey"));
+        assertTrue(hasColumn(db, "lifecycle_inbound_ack_tombstones", "relayExpiresAt"));
+        assertTrue(hasColumn(db, "lifecycle_inbound_ack_tombstones", "reasonCode"));
+        helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void migration13To14FailureAtIndexRollsBackTableAndPreservesV13Rows() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v13-v14-fault-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase db = helper.getWritableDatabase();
+        AlExecutionDatabase.MIGRATION_12_13.migrate(db);
+        db.execSQL("INSERT INTO lifecycle_controls (controlId, controlKind, characterId, peerId, requestedAt, semanticJson, semanticChecksum, state, leaseAttempt, updatedAt) VALUES ('ctl_fault', 'conversation_clear_v1', 'yuqi', 'device-1', 100, '{}', '" + repeat('a', 64) + "', 'waiting', 0, 100)");
+        db.execSQL("CREATE TABLE migration_conflict_v14 (id INTEGER NOT NULL)");
+        db.execSQL("CREATE INDEX index_lifecycle_inbound_ack_tombstones_peerId_inboundRelayMessageId ON migration_conflict_v14 (id)");
+        long before = count(db, "lifecycle_controls");
+        boolean failed = false;
+        db.beginTransaction();
+        try {
+            AlExecutionDatabase.MIGRATION_13_14.migrate(db);
+            db.setTransactionSuccessful();
+        } catch (RuntimeException expected) {
+            failed = true;
+        } finally {
+            db.endTransaction();
+        }
+        assertTrue(failed);
+        assertFalse(hasTable(db, "lifecycle_inbound_ack_tombstones"));
+        assertEquals(before, count(db, "lifecycle_controls"));
+        helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void fullTenToFourteenChainPreservesPopulatedRowsAndIsRestartStable() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v10-v14-chain-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV10Helper(context, databaseName);
+        SupportSQLiteDatabase old = helper.getWritableDatabase();
+        old.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('chain-turn', 'yuqi', 'chain-message', 'DIRECT_REPLY', 'QUEUED', '{}', '{}', 1, 1)");
+        helper.close();
+        AlExecutionDatabase current = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .addMigrations(
+                AlExecutionDatabase.MIGRATION_10_11,
+                AlExecutionDatabase.MIGRATION_11_12,
+                AlExecutionDatabase.MIGRATION_12_13,
+                AlExecutionDatabase.MIGRATION_13_14)
+            .allowMainThreadQueries().build();
+        SupportSQLiteDatabase upgraded = current.getOpenHelper().getWritableDatabase();
+        assertEquals(14L, userVersion(upgraded));
+        assertEquals(1L, count(upgraded, "chat_turns"));
+        assertTrue(hasTable(upgraded, "lifecycle_inbound_ack_tombstones"));
+        current.close();
+        AlExecutionDatabase reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .addMigrations(AlExecutionDatabase.MIGRATION_13_14).allowMainThreadQueries().build();
+        assertEquals(14L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+        reopened.close();
         context.deleteDatabase(databaseName);
     }
 
@@ -331,14 +408,14 @@ public class ConversationCursorStoreTest {
     @Test
     public void newerVersionIsNotSilentlyRepairedOrDowngraded() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        String databaseName = "cursor-newer-v14-" + System.nanoTime();
+        String databaseName = "cursor-newer-v15-" + System.nanoTime();
         SupportSQLiteOpenHelper helper12 = createV12UpgradeHelper(context, databaseName);
         helper12.getWritableDatabase();
         helper12.close();
         SupportSQLiteOpenHelper helper14 = new FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(context)
                 .name(databaseName)
-                .callback(new SupportSQLiteOpenHelper.Callback(14) {
+                .callback(new SupportSQLiteOpenHelper.Callback(15) {
                     @Override public void onCreate(SupportSQLiteDatabase db) { }
                     @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
                 })
@@ -351,7 +428,7 @@ public class ConversationCursorStoreTest {
             .build();
         try {
             incompatible.getOpenHelper().getWritableDatabase();
-            fail("v12 must not silently downgrade or repair a newer database");
+            fail("v15 must not silently downgrade or repair a newer database");
         } catch (IllegalStateException expected) {
             assertTrue(expected.getMessage().contains("downgrade"));
         } finally {
@@ -405,6 +482,12 @@ public class ConversationCursorStoreTest {
         } finally {
             cursor.close();
         }
+    }
+
+    private static String repeat(char value, int length) {
+        char[] output = new char[length];
+        java.util.Arrays.fill(output, value);
+        return new String(output);
     }
 
     private static String stringValue(SupportSQLiteDatabase db, String sql) {

@@ -46,7 +46,10 @@ public final class LifecycleControlSender {
             "invalid lifecycle ACK appliedAt",
             "invalid lifecycle ACK checksum",
             "lifecycle applied ACK authority conflict",
-            "lifecycle applied ACK shape conflict"
+            "lifecycle applied ACK shape conflict",
+            "lifecycle unknown ACK authority conflict",
+            "lifecycle unknown ACK relay expiry conflict",
+            "lifecycle unknown ACK peer is not store-owned"
         )));
 
     private LifecycleControlSender() { }
@@ -277,12 +280,8 @@ public final class LifecycleControlSender {
         }
     }
 
-    /** Validate an applied proof against the persisted control identity. */
-    public static void validateAppliedAck(JSONObject wire, LifecycleControl control) {
-        requireControl(control);
-        if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)) {
-            throw new IllegalArgumentException("lifecycle applied ACK kind conflict");
-        }
+    /** Validate only the closed, self-authenticating applied-proof shape. */
+    public static void validateAppliedAckShape(JSONObject wire) {
         if (wire == null || !APPLIED_ACK_KEYS.equals(keysOf(wire))) {
             throw new IllegalArgumentException("lifecycle applied ACK keys conflict");
         }
@@ -301,13 +300,28 @@ public final class LifecycleControlSender {
         requireNativeLong(wire.opt("appliedAt"), "appliedAt", true);
         requireNativeChecksum(wire.opt("checksum"), "checksum");
         try {
+            if (!wire.getString("checksum").equals(checksumWithoutField(wire))) {
+                throw new IllegalArgumentException("lifecycle applied ACK authority conflict");
+            }
+        } catch (JSONException error) {
+            throw new IllegalArgumentException("lifecycle applied ACK shape conflict", error);
+        }
+    }
+
+    /** Validate an applied proof against the persisted control identity. */
+    public static void validateAppliedAck(JSONObject wire, LifecycleControl control) {
+        requireControl(control);
+        if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)) {
+            throw new IllegalArgumentException("lifecycle applied ACK kind conflict");
+        }
+        validateAppliedAckShape(wire);
+        try {
             if (!control.controlId.equals(wire.getString("controlId"))
                 || !control.characterId.equals(wire.getString("roleId"))
                 || !control.peerId.equals(wire.getString("peerId"))
                 || !control.semanticChecksum.equals(wire.getString("controlChecksum"))
                 || !Objects.equals(nullableLong(wire.opt("clearEpoch")), control.clearEpoch)
-                || !Objects.equals(nullableLong(wire.opt("clearedThroughSequence")), control.clearedThroughSequence)
-                || !wire.getString("checksum").equals(checksumWithoutField(wire))) {
+                || !Objects.equals(nullableLong(wire.opt("clearedThroughSequence")), control.clearedThroughSequence)) {
                 throw new IllegalArgumentException("lifecycle applied ACK authority conflict");
             }
         } catch (JSONException error) {
@@ -339,6 +353,11 @@ public final class LifecycleControlSender {
         return now > 0L && now <= MAX_SAFE_INTEGER
             && relayExpiresAt > now && relayExpiresAt <= MAX_SAFE_INTEGER
             && relayExpiresAt - now <= MAX_RELAY_LIFETIME_MILLIS;
+    }
+
+    /** Closed outer relay identity accepted for an inbound terminal ACK. */
+    public static boolean validInboundRelayMessageId(String value) {
+        return value != null && value.matches("[A-Za-z0-9][A-Za-z0-9_-]{0,127}");
     }
 
     private static long checkedExpiry(long now) {

@@ -10,6 +10,7 @@ import com.siyi.al.execution.db.ConversationCursorEntity;
 import com.siyi.al.execution.db.DiagnosticEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.LifecycleControlEntity;
+import com.siyi.al.execution.db.LifecycleInboundAckTombstoneEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
 import com.siyi.al.execution.bridge.BridgeInput;
@@ -123,11 +124,35 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         this.terminalFaultHook = terminalFaultHook;
         this.storeOwnedPeerId = storeOwnedPeerId == null ? null : storeOwnedPeerId.trim();
         validatePersistedLifecycleControls();
+        validatePersistedLifecycleInboundAckTombstones();
     }
 
     private void validatePersistedLifecycleControls() {
         for (LifecycleControlEntity row : dao.lifecycleControls()) {
             validatePersistedLifecycleControl(row);
+        }
+    }
+
+    private void validatePersistedLifecycleInboundAckTombstones() {
+        for (LifecycleInboundAckTombstoneEntity row : dao.lifecycleInboundAckTombstones()) {
+            if (row == null || row.ackKey == null || !row.ackKey.matches("[a-f0-9]{64}")
+                || row.peerId == null || row.inboundRelayMessageId == null
+                || row.controlId == null || row.controlChecksum == null || row.ackChecksum == null
+                || !"unknown_control".equals(row.reasonCode)
+                || row.relayExpiresAt <= 0L || row.relayExpiresAt > LifecycleControlSender.MAX_SAFE_INTEGER
+                || row.createdAt <= 0L || row.createdAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+                throw new IllegalStateException("lifecycle unknown ACK tombstone authority conflict");
+            }
+            requireBridgeIdentity(row.peerId, "lifecycle unknown ACK peer");
+            requireBridgeIdentity(row.inboundRelayMessageId, "lifecycle unknown ACK relay");
+            requireBridgeIdentity(row.controlId, "lifecycle unknown ACK control");
+            requireLowerSha(row.controlChecksum, "lifecycle unknown ACK control checksum");
+            requireLowerSha(row.ackChecksum, "lifecycle unknown ACK checksum");
+            if (!row.ackKey.equals(unknownLifecycleAckKey(
+                row.peerId, row.inboundRelayMessageId, row.relayExpiresAt,
+                row.controlId, row.controlChecksum, row.ackChecksum, row.reasonCode))) {
+                throw new IllegalStateException("lifecycle unknown ACK tombstone authority conflict");
+            }
         }
     }
 
@@ -2086,6 +2111,105 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 row, conflictChecksum, inboundRelayMessageId, now));
         });
         return result.get();
+    }
+
+    @Override
+    public boolean recordUnknownLifecycleAckTerminal(
+        String peerId,
+        String inboundRelayMessageId,
+        long relayExpiresAt,
+        String controlId,
+        String controlChecksum,
+        String ackChecksum,
+        long createdAt
+    ) {
+        if (storeOwnedPeerId == null || storeOwnedPeerId.isEmpty()
+            || !storeOwnedPeerId.equals(peerId)) {
+            throw new IllegalArgumentException("lifecycle unknown ACK peer is not store-owned");
+        }
+        requireBridgeIdentity(peerId, "lifecycle unknown ACK peer");
+        requireBridgeIdentity(inboundRelayMessageId, "lifecycle unknown ACK relay");
+        requireBridgeIdentity(controlId, "lifecycle unknown ACK control");
+        requireLowerSha(controlChecksum, "lifecycle unknown ACK control checksum");
+        requireLowerSha(ackChecksum, "lifecycle unknown ACK checksum");
+        if (createdAt <= 0L || createdAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || relayExpiresAt <= createdAt
+            || relayExpiresAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || !LifecycleControlSender.validRelayExpiry(createdAt, relayExpiresAt)) {
+            throw new IllegalArgumentException("lifecycle unknown ACK relay expiry conflict");
+        }
+        final String reasonCode = "unknown_control";
+        final String ackKey = unknownLifecycleAckKey(
+            peerId, inboundRelayMessageId, relayExpiresAt,
+            controlId, controlChecksum, ackChecksum, reasonCode);
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            LifecycleInboundAckTombstoneEntity existing =
+                dao.lifecycleInboundAckTombstone(peerId, inboundRelayMessageId);
+            if (existing != null) {
+                if (!ackKey.equals(existing.ackKey)
+                    || existing.relayExpiresAt != relayExpiresAt
+                    || !controlId.equals(existing.controlId)
+                    || !controlChecksum.equals(existing.controlChecksum)
+                    || !ackChecksum.equals(existing.ackChecksum)
+                    || !reasonCode.equals(existing.reasonCode)) {
+                    throw new IllegalArgumentException("lifecycle unknown ACK authority conflict");
+                }
+                result.set(true);
+                return;
+            }
+            LifecycleInboundAckTombstoneEntity row = new LifecycleInboundAckTombstoneEntity();
+            row.ackKey = ackKey;
+            row.peerId = peerId;
+            row.inboundRelayMessageId = inboundRelayMessageId;
+            row.relayExpiresAt = relayExpiresAt;
+            row.controlId = controlId;
+            row.controlChecksum = controlChecksum;
+            row.ackChecksum = ackChecksum;
+            row.reasonCode = reasonCode;
+            row.createdAt = createdAt;
+            long inserted = dao.insertLifecycleInboundAckTombstone(row);
+            if (inserted == -1L) {
+                LifecycleInboundAckTombstoneEntity raced =
+                    dao.lifecycleInboundAckTombstone(peerId, inboundRelayMessageId);
+                if (raced == null || !ackKey.equals(raced.ackKey)
+                    || raced.relayExpiresAt != relayExpiresAt
+                    || !controlId.equals(raced.controlId)
+                    || !controlChecksum.equals(raced.controlChecksum)
+                    || !ackChecksum.equals(raced.ackChecksum)
+                    || !reasonCode.equals(raced.reasonCode)) {
+                    throw new IllegalArgumentException("lifecycle unknown ACK authority conflict");
+                }
+            }
+            result.set(true);
+        });
+        return result.get();
+    }
+
+    private static String unknownLifecycleAckKey(
+        String peerId, String inboundRelayMessageId, long relayExpiresAt,
+        String controlId, String controlChecksum, String ackChecksum, String reasonCode
+    ) {
+        try {
+            JSONObject basis = new JSONObject()
+                .put("contract", "android-lifecycle-unknown-applied-ack-v1")
+                .put("peerId", peerId)
+                .put("inboundRelayMessageId", inboundRelayMessageId)
+                .put("relayExpiresAt", relayExpiresAt)
+                .put("controlId", controlId)
+                .put("controlChecksum", controlChecksum)
+                .put("ackChecksum", ackChecksum)
+                .put("reasonCode", reasonCode);
+            return BridgeAuthority.sha256CanonicalJson(basis);
+        } catch (JSONException error) {
+            throw new IllegalArgumentException("lifecycle unknown ACK key failed", error);
+        }
+    }
+
+    private static void requireLowerSha(String value, String name) {
+        if (value == null || !value.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException(name);
+        }
     }
 
     private boolean recordAppliedAckConflictInTransaction(
