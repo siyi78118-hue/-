@@ -3823,6 +3823,27 @@ export class YuqiStore {
         throw new Error(`v15 authority applied proof conflict: ${row.control_id}`);
       }
     }
+    const agencyAudits = this.db.prepare(`
+      SELECT s.entity_id, s.created_at, c.role_id
+      FROM sync_log s
+      JOIN conversation_clear_controls c ON c.control_id = s.entity_id
+      WHERE s.entity_type = 'agency_redaction' AND s.operation = 'redact'
+      ORDER BY s.seq
+    `).all();
+    const latestAgencyByRole = new Map();
+    for (const audit of agencyAudits) latestAgencyByRole.set(audit.role_id, audit.entity_id);
+    for (const audit of agencyAudits) {
+      const control = this.db.prepare(
+        'SELECT role_id, applied_at FROM conversation_clear_controls WHERE control_id = ?'
+      ).get(audit.entity_id);
+      if (!control) throw new Error(`agency redaction control conflict: ${audit.entity_id}`);
+      this.assertAgencyPruneClosureInternal({
+        roleId: control.role_id,
+        controlId: audit.entity_id,
+        redactedAt: Number(audit.created_at),
+        validateCurrentCognitive: latestAgencyByRole.get(control.role_id) === audit.entity_id
+      });
+    }
   }
 
   assertReleaseAuthorityV14PreflightInternal() {
@@ -5325,8 +5346,12 @@ export class YuqiStore {
         .get(...new Set(attempts.map(turn => turn.character_id))).value)
     ].some(Boolean);
     const executable = Number(this.db.prepare(`
-      SELECT COUNT(*) AS value FROM consolidation_jobs WHERE turn_id IN (${turnMarks})
-      UNION ALL SELECT COUNT(*) AS value FROM stance_records WHERE source_turn_id IN (${turnMarks})
+      SELECT COUNT(*) AS value FROM consolidation_jobs
+        WHERE turn_id IN (${turnMarks}) AND state IN ('queued','retry_wait','running')
+      UNION ALL SELECT COUNT(*) AS value FROM stance_records
+        WHERE source_turn_id IN (${turnMarks}) AND status = 'active'
+          AND revision = (SELECT MAX(latest.revision) FROM stance_records latest
+            WHERE latest.stance_id = stance_records.stance_id)
       UNION ALL SELECT COUNT(*) AS value FROM cognitive_states WHERE last_turn_id IN (${turnMarks})
       UNION ALL SELECT COUNT(*) AS value FROM interaction_lanes WHERE generating_turn_id IN (${turnMarks})
     `).all(...turnIds, ...turnIds, ...turnIds, ...turnIds)
@@ -5521,10 +5546,14 @@ export class YuqiStore {
         );
       }
       const retainedJobs = Number(this.db.prepare(`
-        SELECT COUNT(*) AS value FROM consolidation_jobs WHERE authority_group_id = ?
+        SELECT COUNT(*) AS value FROM consolidation_jobs
+        WHERE authority_group_id = ? AND state IN ('queued','retry_wait','running')
       `).get(groupKey).value);
       const retainedStances = Number(this.db.prepare(`
-        SELECT COUNT(*) AS value FROM stance_records WHERE authority_group_id = ?
+        SELECT COUNT(*) AS value FROM stance_records
+        WHERE authority_group_id = ?
+          AND revision = (SELECT MAX(latest.revision) FROM stance_records latest
+            WHERE latest.stance_id = stance_records.stance_id)
       `).get(groupKey).value);
       const retainedState = Number(this.db.prepare(`
         SELECT COUNT(*) AS value FROM cognitive_states WHERE last_authority_group_id = ?
@@ -6210,26 +6239,46 @@ export class YuqiStore {
   }
 
   putConstraintRevisionInternal(record) {
-    const normalized = {
-      constraintId: String(record?.constraintId || ''),
-      revision: Number(record?.revision),
-      roleId: String(record?.roleId || ''),
-      authority: String(record?.authority || ''),
-      kind: String(record?.kind || ''),
-      subject: String(record?.subject || ''),
-      scope: record?.scope || {},
-      rule: String(record?.rule || ''),
-      sourceMessageIds: Array.isArray(record?.sourceMessageIds) ? record.sourceMessageIds : [],
-      sourceConfigRef: record?.sourceConfigRef ?? null,
-      releaseCondition: record?.releaseCondition ?? null,
-      status: String(record?.status || ''),
-      supersedes: record?.supersedes ?? null,
-      createdAt: Number(record?.createdAt || now()),
-      updatedAt: Number(record?.updatedAt || record?.createdAt || now())
-    };
-    if (!normalized.constraintId || !normalized.roleId || !Number.isInteger(normalized.revision)) {
+    const authorities = new Set(['system', 'author', 'user']);
+    const kinds = new Set(['capability', 'consent', 'privacy', 'action', 'commitment', 'relationship_fact']);
+    const statuses = new Set(['active', 'released', 'archived']);
+    const isText = value => typeof value === 'string' && value.trim() === value && value.length > 0;
+    const isSafeTime = value => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+      || !isText(record.constraintId) || !isText(record.roleId)
+      || typeof record.revision !== 'number' || !Number.isSafeInteger(record.revision)
+      || record.revision < 1 || !authorities.has(record.authority)
+      || !kinds.has(record.kind) || !statuses.has(record.status)
+      || !isText(record.subject) || !isText(record.rule)
+      || !record.scope || typeof record.scope !== 'object' || Array.isArray(record.scope)
+      || !Array.isArray(record.sourceMessageIds)
+      || record.sourceMessageIds.some(id => !isText(id))
+      || new Set(record.sourceMessageIds).size !== record.sourceMessageIds.length
+      || (record.authority === 'user' && record.status === 'active'
+        && record.sourceMessageIds.length === 0)
+      || (record.sourceConfigRef != null && !isText(record.sourceConfigRef))
+      || (record.releaseCondition != null && !isText(record.releaseCondition))
+      || (record.supersedes != null && !isText(record.supersedes))
+      || !isSafeTime(record.createdAt) || !isSafeTime(record.updatedAt)) {
       throw new Error('invalid constraint revision');
     }
+    const normalized = {
+      constraintId: record.constraintId,
+      revision: record.revision,
+      roleId: record.roleId,
+      authority: record.authority,
+      kind: record.kind,
+      subject: record.subject,
+      scope: structuredClone(record.scope),
+      rule: record.rule,
+      sourceMessageIds: [...record.sourceMessageIds],
+      sourceConfigRef: record.sourceConfigRef ?? null,
+      releaseCondition: record.releaseCondition ?? null,
+      status: record.status,
+      supersedes: record.supersedes ?? null,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt
+    };
     const existing = mapConstraintRecord(this.db.prepare(`
       SELECT * FROM constraint_records WHERE constraint_id = ? AND revision = ?
     `).get(normalized.constraintId, normalized.revision));
@@ -6238,6 +6287,18 @@ export class YuqiStore {
         throw new Error('constraint revision conflict');
       }
       return existing;
+    }
+    const latest = this.db.prepare(`
+      SELECT revision FROM constraint_records
+      WHERE constraint_id = ? ORDER BY revision DESC LIMIT 1
+    `).get(normalized.constraintId);
+    if (latest) {
+      if (normalized.revision !== Number(latest.revision) + 1
+        || normalized.supersedes !== `${normalized.constraintId}@${latest.revision}`) {
+        throw new Error('constraint revision supersedes conflict');
+      }
+    } else if (normalized.revision !== 1 || normalized.supersedes !== null) {
+      throw new Error('constraint revision supersedes conflict');
     }
     this.db.prepare(`
       INSERT INTO constraint_records(
@@ -6281,29 +6342,53 @@ export class YuqiStore {
   }
 
   putStanceRevisionInternal(record) {
-    const normalized = {
-      stanceId: String(record?.stanceId || ''),
-      revision: Number(record?.revision),
-      roleId: String(record?.roleId || ''),
-      topic: String(record?.topic || ''),
-      position: String(record?.position || ''),
-      reason: String(record?.reason || ''),
-      strength: Number(record?.strength),
-      flexibility: Number(record?.flexibility),
-      sourceTurnId: String(record?.sourceTurnId || ''),
-      sourceMessageIds: Array.isArray(record?.sourceMessageIds) ? record.sourceMessageIds : [],
-      createdAt: Number(record?.createdAt || now()),
-      lastConfirmedAt: Number(record?.lastConfirmedAt || record?.createdAt || now()),
-      expiresAt: record?.expiresAt ?? null,
-      remainingRelevantUserBatches: Number(record?.remainingRelevantUserBatches),
-      status: String(record?.status || ''),
-      supersedes: record?.supersedes ?? null,
-      authorityGroupId: record?.authorityGroupId ?? null,
-      authorityOrdinal: record?.authorityOrdinal ?? null
-    };
-    if (!normalized.stanceId || !normalized.roleId || !Number.isInteger(normalized.revision)) {
+    const statuses = new Set(['active', 'expired', 'superseded']);
+    const isText = value => typeof value === 'string' && value.trim() === value && value.length > 0;
+    const isSafeTime = value => typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
+    const isSafeCount = value => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+      || !isText(record.stanceId) || !isText(record.roleId)
+      || typeof record.revision !== 'number' || !Number.isSafeInteger(record.revision)
+      || record.revision < 1 || !isText(record.topic) || !isText(record.position)
+      || typeof record.reason !== 'string' || record.reason.trim() !== record.reason
+      || typeof record.strength !== 'number' || !Number.isFinite(record.strength)
+      || record.strength < 0 || record.strength > 1
+      || typeof record.flexibility !== 'number' || !Number.isFinite(record.flexibility)
+      || record.flexibility < 0 || record.flexibility > 1
+      || !isText(record.sourceTurnId) || !Array.isArray(record.sourceMessageIds)
+      || record.sourceMessageIds.some(id => !isText(id))
+      || new Set(record.sourceMessageIds).size !== record.sourceMessageIds.length
+      || !isSafeTime(record.createdAt) || !isSafeTime(record.lastConfirmedAt)
+      || (record.expiresAt != null && !isSafeTime(record.expiresAt))
+      || !isSafeCount(record.remainingRelevantUserBatches)
+      || !statuses.has(record.status)
+      || (record.supersedes != null && !isText(record.supersedes))
+      || (record.authorityGroupId != null && !isText(record.authorityGroupId))
+      || (record.authorityOrdinal != null
+        && (typeof record.authorityOrdinal !== 'number'
+          || !Number.isSafeInteger(record.authorityOrdinal) || record.authorityOrdinal < 0))) {
       throw new Error('invalid stance revision');
     }
+    const normalized = {
+      stanceId: record.stanceId,
+      revision: record.revision,
+      roleId: record.roleId,
+      topic: record.topic,
+      position: record.position,
+      reason: record.reason,
+      strength: record.strength,
+      flexibility: record.flexibility,
+      sourceTurnId: record.sourceTurnId,
+      sourceMessageIds: [...record.sourceMessageIds],
+      createdAt: record.createdAt,
+      lastConfirmedAt: record.lastConfirmedAt,
+      expiresAt: record.expiresAt ?? null,
+      remainingRelevantUserBatches: record.remainingRelevantUserBatches,
+      status: record.status,
+      supersedes: record.supersedes ?? null,
+      authorityGroupId: record.authorityGroupId ?? null,
+      authorityOrdinal: record.authorityOrdinal ?? null
+    };
     const existing = mapStanceRecord(this.db.prepare(`
       SELECT * FROM stance_records WHERE stance_id = ? AND revision = ?
     `).get(normalized.stanceId, normalized.revision));
@@ -6312,6 +6397,18 @@ export class YuqiStore {
         throw new Error('stance revision conflict');
       }
       return existing;
+    }
+    const latest = this.db.prepare(`
+      SELECT revision FROM stance_records
+      WHERE stance_id = ? ORDER BY revision DESC LIMIT 1
+    `).get(normalized.stanceId);
+    if (latest) {
+      if (normalized.revision !== Number(latest.revision) + 1
+        || normalized.supersedes !== `${normalized.stanceId}@${latest.revision}`) {
+        throw new Error('stance revision supersedes conflict');
+      }
+    } else if (normalized.revision !== 1 || normalized.supersedes !== null) {
+      throw new Error('stance revision supersedes conflict');
     }
     this.db.prepare(`
       INSERT INTO stance_records(
@@ -7236,6 +7333,719 @@ export class YuqiStore {
     };
   }
 
+  freezeAgencyPruneAuthorityInternal({ roleId, frozen, controlId, redactedAt }) {
+    const safeRoleId = String(roleId || '');
+    const affectedTurnIds = new Set((frozen?.turnIds || []).map(String));
+    const affectedMessageIds = new Set((frozen?.messageIds || []).map(String));
+    const affectedGroupIds = new Set((frozen?.groupIds || []).map(String));
+    const affectedActionIds = new Set((frozen?.actionIds || []).map(String));
+    if (!safeRoleId || !frozen || !String(controlId || '')
+      || !Number.isSafeInteger(Number(redactedAt)) || Number(redactedAt) <= 0) {
+      throw new Error('agency prune authority input conflict');
+    }
+    const sourceMessage = id => this.db.prepare(
+      'SELECT * FROM messages WHERE message_id = ?'
+    ).get(String(id));
+    const validateSourceMessages = (ids, label) => {
+      const evidence = ids.map(sourceMessage);
+      if (evidence.some(item => !item || item.character_id !== safeRoleId
+        || typeof item.checksum !== 'string' || item.checksum !== contentHash({
+          messageId: item.message_id, turnId: item.turn_id, characterId: item.character_id,
+          speakerId: item.speaker_id, speakerType: item.speaker_type,
+          recipientId: item.recipient_id, content: item.content, sentAt: item.sent_at,
+          origin: item.origin, deviceId: item.device_id ?? null,
+          deviceSeq: item.device_seq == null ? null : Number(item.device_seq)
+        }))) {
+        throw new Error(`agency prune ${label} evidence conflict`);
+      }
+      return evidence;
+    };
+    const parseIds = (json, label) => {
+      const ids = parseJson(json, null);
+      if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id.trim())
+        || new Set(ids).size !== ids.length) {
+        throw new Error(`agency prune ${label} source conflict`);
+      }
+      return ids.map(id => id.trim());
+    };
+    const allConstraints = this.db.prepare(
+      'SELECT * FROM constraint_records WHERE role_id = ? ORDER BY constraint_id, revision'
+    ).all(safeRoleId);
+    const latestConstraintRevision = new Map();
+    for (const row of allConstraints) {
+      const ids = parseIds(row.source_message_ids_json, 'constraint');
+      if (!['system', 'author', 'user'].includes(row.authority)
+        || !['capability', 'consent', 'privacy', 'action', 'commitment', 'relationship_fact'].includes(row.kind)
+        || !['active', 'released', 'archived'].includes(row.status)
+        || typeof row.constraint_id !== 'string' || !row.constraint_id.trim()
+        || !Number.isSafeInteger(Number(row.revision)) || Number(row.revision) < 1
+        || (row.authority === 'user' && row.status === 'active' && ids.length === 0)) {
+        throw new Error('agency prune constraint authority conflict');
+      }
+      const prior = latestConstraintRevision.get(row.constraint_id);
+      if (prior != null && (Number(row.revision) !== prior + 1
+        || row.supersedes !== `${row.constraint_id}@${prior}`)) {
+        throw new Error('agency prune constraint revision conflict');
+      }
+      if (prior == null && (Number(row.revision) !== 1 || row.supersedes !== null)) {
+        throw new Error('agency prune constraint revision conflict');
+      }
+      latestConstraintRevision.set(row.constraint_id, Number(row.revision));
+    }
+    const constraints = [];
+    for (const row of allConstraints.filter(row =>
+      row.authority === 'user' && row.status === 'active'
+      && Number(row.revision) === latestConstraintRevision.get(row.constraint_id))) {
+      const ids = parseIds(row.source_message_ids_json, 'constraint');
+      if (!ids.length) throw new Error('agency prune user constraint source conflict');
+      const evidence = ids.map(sourceMessage);
+      if (evidence.some(item => !item || item.character_id !== safeRoleId
+        || typeof item.checksum !== 'string' || item.checksum !== contentHash({
+          messageId: item.message_id, turnId: item.turn_id, characterId: item.character_id,
+          speakerId: item.speaker_id, speakerType: item.speaker_type,
+          recipientId: item.recipient_id, content: item.content, sentAt: item.sent_at,
+          origin: item.origin, deviceId: item.device_id ?? null,
+          deviceSeq: item.device_seq == null ? null : Number(item.device_seq)
+        }))) {
+        throw new Error('agency prune user constraint evidence conflict');
+      }
+      const hit = ids.filter(id => affectedMessageIds.has(id));
+      if (!hit.length) continue;
+      constraints.push({
+        row,
+        sourceMessageIds: ids,
+        survivingMessageIds: ids.filter(id => !affectedMessageIds.has(id))
+      });
+    }
+    for (const row of allConstraints.filter(row =>
+      row.authority !== 'user' && row.status === 'active'
+      && Number(row.revision) === latestConstraintRevision.get(row.constraint_id))) {
+      const ids = parseIds(row.source_message_ids_json, 'constraint');
+      if (ids.some(id => affectedMessageIds.has(id))) {
+        throw new Error('agency prune non-user constraint source conflict');
+      }
+      validateSourceMessages(ids, 'constraint');
+    }
+    const stances = [];
+    for (const row of this.db.prepare(
+      'SELECT * FROM stance_records WHERE role_id = ? ORDER BY stance_id, revision'
+    ).all(safeRoleId)) {
+      const ids = parseIds(row.source_message_ids_json, 'stance');
+      const sourceTurnId = row.source_turn_id == null ? null : String(row.source_turn_id);
+      const evidence = ids.map(sourceMessage);
+      if (evidence.some(item => !item || item.character_id !== safeRoleId)) {
+        throw new Error('agency prune stance evidence conflict');
+      }
+      const affectedIds = ids.filter(id => affectedMessageIds.has(id));
+      const affected = (sourceTurnId && affectedTurnIds.has(sourceTurnId)) || affectedIds.length > 0;
+      if (!affected) continue;
+      const survivingIds = ids.filter(id => !affectedMessageIds.has(id));
+      stances.push({ row, sourceMessageIds: ids, survivingMessageIds: survivingIds, sourceTurnId });
+    }
+    const jobs = [];
+    for (const row of this.db.prepare(
+      `SELECT * FROM consolidation_jobs WHERE role_id = ?
+       AND state IN ('queued','retry_wait','running') ORDER BY job_id`
+    ).all(safeRoleId)) {
+      const payload = parseJson(row.payload_json, null);
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        throw new Error('agency prune job payload conflict');
+      }
+      const refs = [];
+      const collect = (value, key = '') => {
+        if (Array.isArray(value)) {
+          for (const item of value) collect(item, key);
+          return;
+        }
+        if (value && typeof value === 'object') {
+          for (const [nestedKey, nestedValue] of Object.entries(value)) {
+            collect(nestedValue, nestedKey);
+          }
+          return;
+        }
+        if (typeof value === 'string' && [
+          'turnId', 'sourceTurnId', 'messageId', 'sourceMessageId',
+          'actionId', 'sourceActionId', 'authorityGroupId', 'groupId',
+          'lineageKey', 'sourceLineageKey'
+        ].includes(key)) {
+          refs.push({ key, value });
+        }
+      };
+      collect(payload);
+      for (const ref of refs) {
+        if (['turnId', 'sourceTurnId'].includes(ref.key)) {
+          const source = this.db.prepare(
+            'SELECT character_id FROM turns WHERE turn_id = ?'
+          ).get(ref.value);
+          if (!source || source.character_id !== safeRoleId) {
+            throw new Error('agency prune job turn source conflict');
+          }
+        } else if (['messageId', 'sourceMessageId'].includes(ref.key)) {
+          const source = this.db.prepare(
+            'SELECT character_id FROM messages WHERE message_id = ?'
+          ).get(ref.value);
+          if (!source || source.character_id !== safeRoleId) {
+            throw new Error('agency prune job message source conflict');
+          }
+        } else if (['lineageKey', 'sourceLineageKey'].includes(ref.key)) {
+          const source = this.db.prepare(
+            'SELECT role_id FROM turn_authority_lineages WHERE lineage_key = ?'
+          ).get(ref.value);
+          if (!source || source.role_id !== safeRoleId) {
+            throw new Error('agency prune job lineage source conflict');
+          }
+        } else if (['authorityGroupId', 'groupId'].includes(ref.key)) {
+          const source = this.db.prepare(`
+            SELECT t.character_id FROM visible_result_groups g
+            JOIN turns t ON t.turn_id = g.authoritative_turn_id
+            WHERE g.group_id = ?
+          `).get(ref.value);
+          if (!source || source.character_id !== safeRoleId) {
+            throw new Error('agency prune job group source conflict');
+          }
+        } else if (['actionId', 'sourceActionId'].includes(ref.key)) {
+          const source = this.db.prepare(`
+            SELECT t.character_id FROM visible_result_actions a
+            JOIN visible_result_groups g ON g.group_id = a.group_id
+            JOIN turns t ON t.turn_id = g.authoritative_turn_id
+            WHERE a.action_id = ?
+          `).get(ref.value);
+          if (!source || source.character_id !== safeRoleId) {
+            throw new Error('agency prune job action source conflict');
+          }
+        }
+      }
+      const hit = (row.turn_id && affectedTurnIds.has(String(row.turn_id)))
+        || (row.authority_group_id && affectedGroupIds.has(String(row.authority_group_id)))
+        || (row.subject_type === 'turn' && affectedTurnIds.has(String(row.subject_id)))
+        || refs.some(ref => affectedTurnIds.has(ref.value) || affectedGroupIds.has(ref.value)
+          || affectedMessageIds.has(ref.value) || affectedActionIds.has(ref.value)
+          || (frozen.lineageKeys || []).includes(ref.value));
+      if (hit) jobs.push({ row, payload });
+    }
+    const cognitive = this.db.prepare(
+      'SELECT * FROM cognitive_states WHERE role_id = ?'
+    ).get(safeRoleId);
+    return Object.freeze({
+      roleId: safeRoleId,
+      controlId: String(controlId),
+      redactedAt: Number(redactedAt),
+      turnIds: Object.freeze([...affectedTurnIds].sort()),
+      messageIds: Object.freeze([...affectedMessageIds].sort()),
+      groupIds: Object.freeze([...affectedGroupIds].sort()),
+      actionIds: Object.freeze([...affectedActionIds].sort()),
+      lineageKeys: Object.freeze([...(frozen.lineageKeys || [])].map(String).sort()),
+      constraints: Object.freeze(constraints),
+      stances: Object.freeze(stances),
+      jobs: Object.freeze(jobs),
+      cognitive: cognitive ? Object.freeze({ ...cognitive }) : null
+    });
+  }
+
+  applyAgencyPrunePlanInternal(plan, { roleId, controlId, redactedAt }) {
+    const safeRoleId = String(roleId || plan?.roleId || '');
+    const at = Number(redactedAt || plan?.redactedAt);
+    for (const entry of plan?.constraints || []) {
+      const row = entry.row;
+      const nextRevision = Number(row.revision) + 1;
+      this.putConstraintRevisionInternal({
+        constraintId: row.constraint_id,
+        revision: nextRevision,
+        roleId: safeRoleId,
+        authority: 'user',
+        kind: row.kind,
+        subject: row.subject,
+        scope: parseJson(row.scope_json, {}),
+        rule: row.rule_text,
+        sourceMessageIds: entry.survivingMessageIds || [],
+        sourceConfigRef: row.source_config_ref,
+        releaseCondition: row.release_condition,
+        status: (entry.survivingMessageIds || []).length ? 'active' : 'archived',
+        supersedes: `${row.constraint_id}@${row.revision}`,
+        createdAt: Number(row.created_at),
+        updatedAt: at
+      });
+    }
+    for (const entry of plan?.stances || []) {
+      const row = entry.row;
+      const survivingIds = entry.survivingMessageIds || [];
+      const nextRevision = Number(row.revision) + 1;
+      const survivingSourceTurnId = survivingIds.length
+        ? this.db.prepare(`
+          SELECT turn_id FROM messages
+          WHERE message_id IN (${survivingIds.map(() => '?').join(',')})
+          ORDER BY sent_at ASC, message_id ASC LIMIT 1
+        `).get(...survivingIds)?.turn_id
+        : null;
+      this.putStanceRevisionInternal({
+        stanceId: row.stance_id,
+        revision: nextRevision,
+        roleId: safeRoleId,
+        topic: row.topic,
+        position: row.position_text,
+        reason: row.reason_text,
+        strength: Number(row.strength),
+        flexibility: Number(row.flexibility),
+        // An active mixed-source revision must not retain a redacted source
+        // turn.  Derive its source turn from the surviving message authority;
+        // sole-source redaction remains an expired historical revision.
+        sourceTurnId: survivingSourceTurnId || row.source_turn_id || '',
+        sourceMessageIds: survivingIds,
+        createdAt: Number(row.created_at),
+        lastConfirmedAt: at,
+        expiresAt: survivingIds.length ? row.expires_at : at,
+        remainingRelevantUserBatches: survivingIds.length
+          ? Number(row.remaining_relevant_user_batches) : 0,
+        status: survivingIds.length ? 'active' : 'expired',
+        supersedes: `${row.stance_id}@${row.revision}`,
+        authorityGroupId: null,
+        authorityOrdinal: null
+      });
+    }
+    for (const entry of plan?.jobs || []) {
+      const row = entry.row;
+      this.db.prepare(`UPDATE consolidation_jobs
+        SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+            last_error_code = 'SOURCE_REDACTED', updated_at = ?
+        WHERE job_id = ? AND state IN ('queued','retry_wait','running')`)
+        .run(at, row.job_id);
+    }
+    const current = this.db.prepare('SELECT * FROM cognitive_states WHERE role_id = ?').get(safeRoleId);
+    const redactedTurns = new Set((this.db.prepare(`
+      SELECT turn_id FROM turns WHERE character_id = ? AND authority_redacted_at IS NOT NULL
+    `).all(safeRoleId)).map(row => String(row.turn_id)));
+    const currentIsAffected = !current || (redactedTurns.has(String(current.last_turn_id))
+      || (current.last_authority_group_id && (plan?.groupIds || []).includes(current.last_authority_group_id)));
+    if (!currentIsAffected) return;
+    const survivorCandidates = this.db.prepare(`
+      SELECT t.turn_id, t.updated_at, t.authority_lineage_key,
+             l.role_id AS lineage_role_id, l.lane_key AS lineage_lane_key,
+             l.redacted_at AS lineage_redacted_at, l.state AS lineage_state,
+             l.committed_group_id
+      FROM turns t
+      JOIN turn_authority_lineages l ON l.lineage_key = t.authority_lineage_key
+      WHERE t.character_id = ? AND t.result_authority_version = 1
+        AND t.lane_key = 'private_chat' AND t.authority_redacted_at IS NULL
+        AND l.role_id = ? AND l.lane_key = 'private_chat'
+        AND l.redacted_at IS NULL
+        AND l.state = 'committed'
+        AND t.state IN ('committed','completed','delivered')
+      ORDER BY t.updated_at DESC, t.turn_id DESC
+    `).all(safeRoleId, safeRoleId);
+    let survivor = null;
+    for (const candidate of survivorCandidates) {
+      if (candidate.lineage_role_id !== safeRoleId
+        || candidate.lineage_lane_key !== 'private_chat'
+        || candidate.lineage_redacted_at != null
+        || candidate.lineage_state !== 'committed') continue;
+      if (candidate.committed_group_id == null) {
+        survivor = candidate;
+        break;
+      }
+      const group = this.db.prepare(`
+        SELECT group_id, role_id, lane_key, authoritative_turn_id,
+               lineage_key, redacted_at
+        FROM visible_result_groups WHERE group_id = ?
+      `).get(candidate.committed_group_id);
+      if (!group || group.role_id !== safeRoleId || group.lane_key !== 'private_chat'
+        || group.authoritative_turn_id !== candidate.turn_id
+        || group.lineage_key !== candidate.authority_lineage_key
+        || group.redacted_at != null) continue;
+      try {
+        this.assertVisibleGroupAuthorityInternal(candidate.committed_group_id, {
+          purpose: 'reopen'
+        });
+      } catch {
+        continue;
+      }
+      survivor = candidate;
+      break;
+    }
+    const emptyState = {
+      fastState: { mood: '', openThreadIds: [], openThreads: [] },
+      mediumState: {},
+      slowState: { preferenceFactIds: [] }
+    };
+    // The old row may contain mood, medium-scale boundaries, or preferences
+    // learned from the cleared authority.  There is no per-turn immutable
+    // cognitive projection to prove those fields came from the survivor, so
+    // rebuilding from that row would reintroduce deleted semantics.  The
+    // deterministic post-clear tuple therefore starts from the closed empty
+    // schema-v2 state; only the independently verified survivor identity
+    // below is retained.
+    const nextState = emptyState;
+    const lastTurnId = survivor?.turn_id || stableId('cognitive_clear_anchor', `${safeRoleId}:${controlId}`);
+    const lastGroupId = survivor?.committed_group_id || null;
+    const nextRevision = Math.max(1, Number(current?.revision || 0) + 1);
+    const checksum = contentHash(nextState);
+    this.db.prepare(`
+      INSERT INTO cognitive_states(
+        role_id, schema_version, revision, last_turn_id, state_json, checksum, updated_at,
+        last_authority_group_id
+      ) VALUES (?, 2, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(role_id) DO UPDATE SET
+        schema_version = excluded.schema_version, revision = excluded.revision,
+        last_turn_id = excluded.last_turn_id, state_json = excluded.state_json,
+        checksum = excluded.checksum, updated_at = excluded.updated_at,
+        last_authority_group_id = excluded.last_authority_group_id
+    `).run(safeRoleId, nextRevision, lastTurnId, canonicalJson(nextState), checksum, at, lastGroupId);
+  }
+
+  writeAgencyPruneAuditInternal(plan, { roleId, controlId, redactedAt }) {
+    const state = this.db.prepare(
+      'SELECT revision, last_turn_id, last_authority_group_id, checksum, updated_at FROM cognitive_states WHERE role_id = ?'
+    ).get(String(roleId));
+    if (!state || !Number.isSafeInteger(Number(state.revision)) || Number(state.revision) < 1
+      || typeof state.last_turn_id !== 'string' || !state.last_turn_id
+      || (state.last_authority_group_id != null && typeof state.last_authority_group_id !== 'string')
+      || typeof state.checksum !== 'string'
+      || !Number.isSafeInteger(Number(state.updated_at)) || Number(state.updated_at) <= 0) {
+      throw new Error('agency prune cognitive audit authority conflict');
+    }
+    const payload = {
+      auditVersion: 'agency_prune_v1',
+      controlId: String(controlId),
+      roleId: String(roleId),
+      redactedAt: Number(redactedAt),
+      cognitiveRevision: Number(state.revision),
+      cognitiveLastTurnId: state.last_turn_id,
+      cognitiveLastAuthorityGroupId: state.last_authority_group_id ?? null,
+      cognitiveChecksum: state.checksum,
+      cognitiveUpdatedAt: Number(state.updated_at),
+      affectedTurnIds: [...new Set((plan?.turnIds || []).map(String))].sort(),
+      affectedLineageKeys: [...new Set((plan?.lineageKeys || []).map(String))].sort(),
+      affectedGroupIds: [...new Set((plan?.groupIds || []).map(String))].sort(),
+      affectedMessageIds: [...new Set((plan?.messageIds || []).map(String))].sort(),
+      actionIds: [...new Set((plan?.actionIds || []).map(String))].sort(),
+      jobIds: [...new Set((plan?.jobs || []).map(entry => String(entry.row.job_id)))].sort()
+    };
+    this.db.prepare(`
+      INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+      VALUES ('agency_redaction', ?, 'redact', ?, ?, ?)
+    `).run(String(controlId), canonicalJson(payload), contentHash(payload), Number(redactedAt));
+    return payload;
+  }
+
+  assertAgencyPruneClosureInternal({
+    roleId, controlId, redactedAt, validateCurrentCognitive = true
+  }) {
+    const safeRoleId = String(roleId || '');
+    const at = Number(redactedAt);
+    const anchorId = stableId('cognitive_clear_anchor', `${safeRoleId}:${controlId}`);
+    const agencyAuditRows = this.db.prepare(`
+      SELECT * FROM sync_log
+      WHERE entity_type = 'agency_redaction' AND entity_id = ?
+      ORDER BY seq
+    `).all(String(controlId));
+    if (agencyAuditRows.length !== 1) {
+      throw new Error('agency prune audit closure conflict');
+    }
+    const agencyAudit = parseJson(agencyAuditRows[0].payload_json, null);
+    const expectedAuditKeys = [
+      'actionIds', 'affectedGroupIds', 'affectedLineageKeys', 'affectedMessageIds',
+      'affectedTurnIds', 'auditVersion', 'cognitiveChecksum',
+      'cognitiveLastAuthorityGroupId', 'cognitiveLastTurnId',
+      'cognitiveRevision', 'cognitiveUpdatedAt', 'controlId',
+      'jobIds', 'redactedAt', 'roleId'
+    ];
+    if (!agencyAudit || typeof agencyAudit !== 'object' || Array.isArray(agencyAudit)
+      || canonicalJson(Object.keys(agencyAudit).sort()) !== canonicalJson(expectedAuditKeys)
+      || agencyAudit.auditVersion !== 'agency_prune_v1'
+      || agencyAudit.controlId !== String(controlId)
+      || agencyAudit.roleId !== safeRoleId
+      || !Number.isSafeInteger(agencyAudit.redactedAt) || agencyAudit.redactedAt !== at
+      || !Number.isSafeInteger(agencyAudit.cognitiveRevision) || agencyAudit.cognitiveRevision < 1
+      || typeof agencyAudit.cognitiveLastTurnId !== 'string' || !agencyAudit.cognitiveLastTurnId
+      || (agencyAudit.cognitiveLastAuthorityGroupId != null
+        && (typeof agencyAudit.cognitiveLastAuthorityGroupId !== 'string'
+          || !agencyAudit.cognitiveLastAuthorityGroupId))
+      || !Number.isSafeInteger(agencyAudit.cognitiveUpdatedAt)
+      || typeof agencyAudit.cognitiveChecksum !== 'string'
+      || !Array.isArray(agencyAudit.affectedTurnIds)
+      || !Array.isArray(agencyAudit.affectedLineageKeys)
+      || !Array.isArray(agencyAudit.affectedGroupIds)
+      || !Array.isArray(agencyAudit.affectedMessageIds)
+      || !Array.isArray(agencyAudit.actionIds)
+      || agencyAudit.actionIds.some(id => typeof id !== 'string' || !id)
+      || canonicalJson([...agencyAudit.actionIds].sort()) !== canonicalJson(agencyAudit.actionIds)
+      || new Set(agencyAudit.actionIds).size !== agencyAudit.actionIds.length
+      || !Array.isArray(agencyAudit.jobIds)
+      || agencyAudit.jobIds.some(id => typeof id !== 'string' || !id)
+      || canonicalJson([...agencyAudit.jobIds].sort()) !== canonicalJson(agencyAudit.jobIds)
+      || new Set(agencyAudit.jobIds).size !== agencyAudit.jobIds.length
+      || [agencyAudit.affectedTurnIds, agencyAudit.affectedLineageKeys,
+        agencyAudit.affectedGroupIds, agencyAudit.affectedMessageIds].some(ids =>
+        ids.some(id => typeof id !== 'string' || !id)
+          || canonicalJson([...ids].sort()) !== canonicalJson(ids)
+          || new Set(ids).size !== ids.length)
+      || agencyAuditRows[0].operation !== 'redact'
+      || Number(agencyAuditRows[0].created_at) !== at
+      || agencyAuditRows[0].payload_json !== canonicalJson(agencyAudit)
+      || agencyAuditRows[0].checksum !== contentHash(agencyAudit)) {
+      throw new Error('agency prune audit closure conflict');
+    }
+    const controlRow = this.db.prepare(`
+      SELECT control_id, role_id, applied_at, authority_version
+      FROM conversation_clear_controls WHERE control_id = ?
+    `).get(String(controlId));
+    if (!controlRow || controlRow.role_id !== safeRoleId
+      || Number(controlRow.applied_at) !== at
+      || Number(controlRow.authority_version) !== 1) {
+      throw new Error('agency prune control closure conflict');
+    }
+    const state = this.db.prepare('SELECT * FROM cognitive_states WHERE role_id = ?').get(safeRoleId);
+    if (validateCurrentCognitive && (!state
+      || Number(state.revision) !== agencyAudit.cognitiveRevision
+      || state.last_turn_id !== agencyAudit.cognitiveLastTurnId
+      || (state.last_authority_group_id ?? null) !== agencyAudit.cognitiveLastAuthorityGroupId
+      || Number(state.updated_at) !== agencyAudit.cognitiveUpdatedAt
+      || state.checksum !== agencyAudit.cognitiveChecksum)) {
+      throw new Error('agency prune cognitive tuple conflict');
+    }
+    if (validateCurrentCognitive && state && state.last_turn_id === anchorId
+      && (Number(state.updated_at) !== at || Number(state.schema_version) !== 2
+        || contentHash(parseJson(state.state_json, null)) !== state.checksum)) {
+      throw new Error('agency prune cognitive anchor conflict');
+    }
+    if (validateCurrentCognitive && state && Number(state.updated_at) === at) {
+      const rebuiltState = parseJson(state.state_json, null);
+      if (!rebuiltState || typeof rebuiltState !== 'object' || Array.isArray(rebuiltState)
+        || contentHash(rebuiltState) !== state.checksum
+        || !rebuiltState.fastState || typeof rebuiltState.fastState !== 'object'
+        || !rebuiltState.slowState || typeof rebuiltState.slowState !== 'object'
+        || canonicalJson(rebuiltState.fastState.openThreadIds || []) !== '[]'
+        || canonicalJson(rebuiltState.fastState.openThreads || []) !== '[]'
+        || canonicalJson(rebuiltState.slowState.preferenceFactIds || []) !== '[]') {
+        throw new Error('agency prune cognitive rebuilt state conflict');
+      }
+    }
+    const redactedTurns = new Set(agencyAudit.affectedTurnIds);
+    const redactedMessages = new Set(agencyAudit.affectedMessageIds);
+    const assertLiveSourceMessages = (ids, label) => {
+      for (const id of ids) {
+        const message = this.db.prepare('SELECT * FROM messages WHERE message_id = ?').get(id);
+        if (!message || message.character_id !== safeRoleId
+          || typeof message.checksum !== 'string'
+          || message.checksum !== contentHash({
+            messageId: message.message_id, turnId: message.turn_id,
+            characterId: message.character_id, speakerId: message.speaker_id,
+            speakerType: message.speaker_type, recipientId: message.recipient_id,
+            content: message.content, sentAt: message.sent_at, origin: message.origin,
+            deviceId: message.device_id ?? null,
+            deviceSeq: message.device_seq == null ? null : Number(message.device_seq)
+          })) {
+          throw new Error(`agency prune ${label} evidence closure conflict`);
+        }
+      }
+    };
+    const redactedGroups = new Set(agencyAudit.affectedGroupIds);
+    const redactedActions = new Set(redactedGroups.size
+      ? this.db.prepare(`
+        SELECT action_id FROM visible_result_actions
+        WHERE group_id IN (${[...redactedGroups].map(() => '?').join(',')})
+      `).all(...redactedGroups).map(row => String(row.action_id))
+      : []);
+    const scopedTurns = agencyAudit.affectedTurnIds.length
+      ? this.db.prepare(`SELECT turn_id, character_id, lane_key, result_authority_version,
+          authority_redacted_at, envelope_json
+          FROM turns WHERE turn_id IN (${agencyAudit.affectedTurnIds.map(() => '?').join(',')})`)
+        .all(...agencyAudit.affectedTurnIds)
+      : [];
+    if (scopedTurns.length !== agencyAudit.affectedTurnIds.length
+      || scopedTurns.some(row => row.character_id !== safeRoleId
+        || (Number(row.result_authority_version) === 1 && row.lane_key !== 'private_chat')
+        || (Number(row.result_authority_version) === 1
+          ? Number(row.authority_redacted_at) !== at
+          : !(Number(row.result_authority_version) === 0
+            && row.envelope_json === canonicalJson({ redacted: true })))) ) {
+      throw new Error('agency prune turn scope closure conflict');
+    }
+    const scopedLineages = agencyAudit.affectedLineageKeys.length
+      ? this.db.prepare(`SELECT lineage_key, role_id, lane_key, redacted_at
+          FROM turn_authority_lineages
+          WHERE lineage_key IN (${agencyAudit.affectedLineageKeys.map(() => '?').join(',')})`)
+        .all(...agencyAudit.affectedLineageKeys)
+      : [];
+    if (scopedLineages.length !== agencyAudit.affectedLineageKeys.length
+      || scopedLineages.some(row => row.role_id !== safeRoleId
+        || row.lane_key !== 'private_chat' || Number(row.redacted_at) !== at)) {
+      throw new Error('agency prune lineage scope closure conflict');
+    }
+    const scopedGroups = agencyAudit.affectedGroupIds.length
+      ? this.db.prepare(`SELECT group_id, role_id, lane_key, redacted_at
+          FROM visible_result_groups
+          WHERE group_id IN (${agencyAudit.affectedGroupIds.map(() => '?').join(',')})`)
+        .all(...agencyAudit.affectedGroupIds)
+      : [];
+    if (scopedGroups.length !== agencyAudit.affectedGroupIds.length
+      || scopedGroups.some(row => row.role_id !== safeRoleId
+        || row.lane_key !== 'private_chat' || Number(row.redacted_at) !== at)) {
+      throw new Error('agency prune group scope closure conflict');
+    }
+    const scopedMessages = agencyAudit.affectedMessageIds.length
+      ? this.db.prepare(`SELECT m.message_id, t.character_id, t.lane_key
+          FROM messages m JOIN turns t ON t.turn_id = m.turn_id
+          WHERE m.message_id IN (${agencyAudit.affectedMessageIds.map(() => '?').join(',')})`)
+        .all(...agencyAudit.affectedMessageIds)
+      : [];
+    if (scopedMessages.length !== agencyAudit.affectedMessageIds.length
+      || scopedMessages.some(row => row.character_id !== safeRoleId
+        || (row.lane_key != null && row.lane_key !== 'private_chat'))) {
+      throw new Error('agency prune message scope closure conflict');
+    }
+    const redactedLineages = new Set(agencyAudit.affectedLineageKeys);
+    const expectedActionIds = redactedGroups.size
+      ? this.db.prepare(`
+        SELECT action_id FROM visible_result_actions
+        WHERE group_id IN (${[...redactedGroups].map(() => '?').join(',')})
+        ORDER BY action_id
+      `).all(...redactedGroups).map(row => String(row.action_id))
+      : [];
+    if (canonicalJson(expectedActionIds) !== canonicalJson(agencyAudit.actionIds)) {
+      throw new Error('agency prune action audit closure conflict');
+    }
+    if (validateCurrentCognitive && state && (redactedTurns.has(String(state.last_turn_id))
+      || (state.last_authority_group_id != null
+        && redactedGroups.has(String(state.last_authority_group_id))))) {
+      throw new Error('agency prune cognitive source closure conflict');
+    }
+    const constraintRows = this.db.prepare(
+      'SELECT * FROM constraint_records WHERE role_id = ? ORDER BY constraint_id, revision'
+    ).all(safeRoleId);
+    const latestConstraints = new Map();
+    const latestConstraintRows = new Map();
+    for (const row of constraintRows) {
+      const ids = parseJson(row.source_message_ids_json, null);
+      if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id.trim())
+        || new Set(ids).size !== ids.length || !['system', 'author', 'user'].includes(row.authority)
+        || !['capability', 'consent', 'privacy', 'action', 'commitment', 'relationship_fact'].includes(row.kind)
+        || !['active', 'released', 'archived'].includes(row.status)
+        || !Number.isSafeInteger(Number(row.revision)) || Number(row.revision) < 1) {
+        throw new Error('agency prune constraint closure conflict');
+      }
+      const previous = latestConstraints.get(row.constraint_id);
+      if (previous != null && (Number(row.revision) !== previous + 1
+        || row.supersedes !== `${row.constraint_id}@${previous}`)) {
+        throw new Error('agency prune constraint revision closure conflict');
+      }
+      if (previous == null && (Number(row.revision) !== 1 || row.supersedes !== null)) {
+        throw new Error('agency prune constraint revision closure conflict');
+      }
+      latestConstraints.set(row.constraint_id, Number(row.revision));
+      latestConstraintRows.set(row.constraint_id, { row, ids });
+    }
+    for (const { ids } of latestConstraintRows.values()) {
+      assertLiveSourceMessages(ids, 'constraint');
+      if (ids.some(id => redactedMessages.has(id))) {
+        throw new Error('agency prune constraint source closure conflict');
+      }
+    }
+    const stanceRows = this.db.prepare(
+      'SELECT * FROM stance_records WHERE role_id = ? ORDER BY stance_id, revision'
+    ).all(safeRoleId);
+    const latestStances = new Map();
+    const latestStanceRows = new Map();
+    for (const row of stanceRows) {
+      const ids = parseJson(row.source_message_ids_json, null);
+      if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string' || !id.trim())
+        || new Set(ids).size !== ids.length || !['active', 'expired', 'superseded'].includes(row.status)
+        || !Number.isSafeInteger(Number(row.revision)) || Number(row.revision) < 1) {
+        throw new Error('agency prune stance closure conflict');
+      }
+      const previous = latestStances.get(row.stance_id);
+      if (previous != null && (Number(row.revision) !== previous + 1
+        || row.supersedes !== `${row.stance_id}@${previous}`)) {
+        throw new Error('agency prune stance revision closure conflict');
+      }
+      if (previous == null && (Number(row.revision) !== 1 || row.supersedes !== null)) {
+        throw new Error('agency prune stance revision closure conflict');
+      }
+      latestStances.set(row.stance_id, Number(row.revision));
+      latestStanceRows.set(row.stance_id, { row, ids });
+    }
+    for (const { row, ids } of latestStanceRows.values()) {
+      assertLiveSourceMessages(ids, 'stance');
+      if (row.status === 'expired' && ids.length !== 0) {
+        throw new Error('agency prune stance source closure conflict');
+      }
+      if (row.status !== 'expired'
+        && (ids.some(id => redactedMessages.has(id)) || redactedTurns.has(String(row.source_turn_id)))) {
+        throw new Error('agency prune stance source closure conflict');
+      }
+    }
+    const collectJobRefs = (value, key = '', refs = []) => {
+      if (Array.isArray(value)) {
+        value.forEach(item => collectJobRefs(item, key, refs));
+      } else if (value && typeof value === 'object') {
+        for (const [nestedKey, nestedValue] of Object.entries(value)) {
+          collectJobRefs(nestedValue, nestedKey, refs);
+        }
+      } else if (typeof value === 'string' && [
+        'turnId', 'sourceTurnId', 'messageId', 'sourceMessageId',
+        'actionId', 'sourceActionId', 'authorityGroupId', 'groupId',
+        'lineageKey', 'sourceLineageKey'
+      ].includes(key)) {
+        refs.push({ key, value });
+      }
+      return refs;
+    };
+    for (const row of this.db.prepare(`
+      SELECT * FROM consolidation_jobs
+      WHERE role_id = ? AND state IN ('queued','retry_wait','running')
+    `).all(safeRoleId)) {
+      const payload = parseJson(row.payload_json, null);
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+        throw new Error('agency prune job payload closure conflict');
+      }
+      const refs = collectJobRefs(payload);
+      const affected = (row.turn_id && redactedTurns.has(String(row.turn_id)))
+        || (row.authority_group_id && redactedGroups.has(String(row.authority_group_id)))
+        || (row.subject_type === 'turn' && redactedTurns.has(String(row.subject_id)))
+        || refs.some(ref => {
+          if (['turnId', 'sourceTurnId'].includes(ref.key)) {
+            return redactedTurns.has(ref.value);
+          }
+          if (['messageId', 'sourceMessageId'].includes(ref.key)) {
+            return redactedMessages.has(ref.value);
+          }
+          if (['authorityGroupId', 'groupId'].includes(ref.key)) {
+            return redactedGroups.has(ref.value);
+          }
+          if (['actionId', 'sourceActionId'].includes(ref.key)) {
+            return redactedActions.has(ref.value);
+          }
+          if (['lineageKey', 'sourceLineageKey'].includes(ref.key)) {
+            return redactedLineages.has(ref.value);
+          }
+          return false;
+        });
+      if (affected) throw new Error('agency prune executable job source closure conflict');
+    }
+    const auditedJobRows = agencyAudit.jobIds.length
+      ? this.db.prepare(`
+        SELECT job_id, state, lease_owner, lease_expires_at, last_error_code
+        FROM consolidation_jobs
+        WHERE role_id = ? AND job_id IN (${agencyAudit.jobIds.map(() => '?').join(',')})
+      `).all(safeRoleId, ...agencyAudit.jobIds)
+      : [];
+    if (auditedJobRows.length !== agencyAudit.jobIds.length
+      || auditedJobRows.some(row => row.state !== 'cancelled'
+        || row.lease_owner !== null || row.lease_expires_at !== null
+        || row.last_error_code !== 'SOURCE_REDACTED')) {
+      throw new Error('agency prune job audit closure conflict');
+    }
+    const executable = redactedTurns.size || redactedGroups.size
+      ? this.db.prepare(`
+        SELECT COUNT(*) AS value FROM consolidation_jobs
+        WHERE role_id = ? AND state IN ('queued','retry_wait','running')
+          AND (turn_id IN (${[...redactedTurns].map(() => '?').join(',') || "''"})
+            OR authority_group_id IN (${[...redactedGroups].map(() => '?').join(',') || "''"}))
+      `).get(safeRoleId, ...redactedTurns, ...redactedGroups).value
+      : 0;
+    if (Number(executable) !== 0) throw new Error('agency prune executable job closure conflict');
+    return true;
+  }
+
   redactLegacyConversationTurnInternal({ entry, redactedAt, control, fault }) {
     const { row, envelope, deliveries } = entry;
     const turnId = row.turn_id;
@@ -7301,11 +8111,15 @@ export class YuqiStore {
       WHERE turn_id = ? OR source_message_id IN (${messages.map(() => '?').join(',') || "''"})`)
       .run(turnId, ...messages.map(message => message.message_id));
     this.db.prepare('DELETE FROM diagnostics WHERE turn_id = ?').run(turnId);
-    this.db.prepare('DELETE FROM consolidation_jobs WHERE turn_id = ?').run(turnId);
-    this.db.prepare(`DELETE FROM consolidation_jobs
-      WHERE subject_type = 'turn' AND subject_id = ?`).run(turnId);
-    this.db.prepare('DELETE FROM stance_records WHERE source_turn_id = ?').run(turnId);
-    this.db.prepare('DELETE FROM cognitive_states WHERE last_turn_id = ?').run(turnId);
+    this.db.prepare(`UPDATE consolidation_jobs
+      SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+          last_error_code = 'SOURCE_REDACTED', updated_at = ?
+      WHERE (turn_id = ? OR (subject_type = 'turn' AND subject_id = ?))
+        AND state IN ('queued','retry_wait','running')`)
+      .run(redactedAt, turnId, turnId);
+    // Stances and cognitive state are append-only/derived agency authority.
+    // Their clear-time revisions are written by applyAgencyPrunePlanInternal
+    // from the pre-scrub frozen source projection.
     this.db.prepare(`UPDATE interaction_lanes SET generating_turn_id = NULL,
       latest_user_batch_id = CASE WHEN latest_user_batch_id IN (${batches.map(() => '?').join(',') || "''"})
         THEN NULL ELSE latest_user_batch_id END
@@ -7578,8 +8392,12 @@ export class YuqiStore {
       ['turn_stages', 'SELECT COUNT(*) AS value FROM turn_stages WHERE turn_id = ?'],
       ['annotations', 'SELECT COUNT(*) AS value FROM annotations WHERE turn_id = ?'],
       ['diagnostics', 'SELECT COUNT(*) AS value FROM diagnostics WHERE turn_id = ?'],
-      ['consolidation_jobs', 'SELECT COUNT(*) AS value FROM consolidation_jobs WHERE turn_id = ?'],
-      ['stance_records', 'SELECT COUNT(*) AS value FROM stance_records WHERE source_turn_id = ?'],
+      ['consolidation_jobs', `SELECT COUNT(*) AS value FROM consolidation_jobs
+        WHERE turn_id = ? AND state IN ('queued','retry_wait','running')`],
+      ['stance_records', `SELECT COUNT(*) AS value FROM stance_records
+        WHERE source_turn_id = ? AND status = 'active'
+          AND revision = (SELECT MAX(latest.revision) FROM stance_records latest
+            WHERE latest.stance_id = stance_records.stance_id)`],
       ['cognitive_states', 'SELECT COUNT(*) AS value FROM cognitive_states WHERE last_turn_id = ?']
     ];
     for (const [table, sql] of directLinkedCounts) {
@@ -7590,6 +8408,7 @@ export class YuqiStore {
     if (Number(this.db.prepare(`
       SELECT COUNT(*) AS value FROM consolidation_jobs
       WHERE subject_type = 'turn' AND subject_id = ?
+        AND state IN ('queued','retry_wait','running')
     `).get(turn.turn_id).value) !== 0) {
       throw new Error('legacy redaction consolidation job closure conflict');
     }
@@ -7779,15 +8598,15 @@ export class YuqiStore {
       WHERE turn_id IN (${turnMarks}) OR source_message_id IN (${messageMarks})`)
       .run(...turnIds, ...messageIds);
     this.db.prepare(`DELETE FROM diagnostics WHERE turn_id IN (${turnMarks})`).run(...turnIds);
-    this.db.prepare(`DELETE FROM consolidation_jobs
-      WHERE turn_id IN (${turnMarks})${groupId == null ? '' : ' OR authority_group_id = ?'}`)
-      .run(...turnIds, ...(groupId == null ? [] : [groupId]));
-    this.db.prepare(`DELETE FROM stance_records
-      WHERE source_turn_id IN (${turnMarks})${groupId == null ? '' : ' OR authority_group_id = ?'}`)
-      .run(...turnIds, ...(groupId == null ? [] : [groupId]));
-    this.db.prepare(`DELETE FROM cognitive_states
-      WHERE last_turn_id IN (${turnMarks})${groupId == null ? '' : ' OR last_authority_group_id = ?'}`)
-      .run(...turnIds, ...(groupId == null ? [] : [groupId]));
+    this.db.prepare(`UPDATE consolidation_jobs
+      SET state = 'cancelled', lease_owner = NULL, lease_expires_at = NULL,
+          last_error_code = 'SOURCE_REDACTED', updated_at = ?
+      WHERE (turn_id IN (${turnMarks})${groupId == null ? '' : ' OR authority_group_id = ?'})
+        AND state IN ('queued','retry_wait','running')`)
+      .run(redactedAt, ...turnIds, ...(groupId == null ? [] : [groupId]));
+    // Agency state is intentionally not deleted with the lineage shell. The
+    // frozen clear plan appends stance revisions and deterministically rebuilds
+    // the cognitive row after semantic redaction.
     this.db.prepare(`UPDATE interaction_lanes SET generating_turn_id = NULL
       WHERE generating_turn_id IN (${turnMarks})`).run(...turnIds);
     const batchIds = batchRows.map(row => row.batch_id);
@@ -7870,7 +8689,6 @@ export class YuqiStore {
         this.db.prepare('UPDATE turns SET envelope_json = ? WHERE authority_lineage_key = ?')
           .run('{"redacted":false}', lineage.lineage_key);
       }
-      this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, { purpose: 'reopen' });
       fault('after_audit');
       return;
     }
@@ -7944,7 +8762,6 @@ export class YuqiStore {
       this.db.prepare('UPDATE visible_result_manifests SET semantic_json = ? WHERE group_id = ?')
         .run('{"corrupt":true}', groupId);
     }
-    this.assertVisibleGroupAuthorityInternal(groupId, { purpose: 'reopen' });
     fault('after_audit');
   }
 
@@ -8011,6 +8828,11 @@ export class YuqiStore {
           roleId: currentControl.roleId,
           redactedAt: Number(byId.applied_at)
         });
+        this.assertAgencyPruneClosureInternal({
+          roleId: currentControl.roleId,
+          controlId: currentControl.controlId,
+          redactedAt: Number(byId.applied_at)
+        });
         if (canonicalJson(parseJson(byId.semantic_json, null)) !== canonicalJson(currentControl)) {
           throw new Error('conversation clear control replay conflict');
         }
@@ -8025,11 +8847,13 @@ export class YuqiStore {
             this.loadValidatedLegacyTurnRedactionInternal(audit.entity_id);
           }
         }
-        const replayLineages = this.db.prepare(`
-          SELECT DISTINCT authority_lineage_key FROM turns
-          WHERE character_id = ? AND result_authority_version = 1
-            AND lane_key = 'private_chat' AND authority_redacted_at IS NOT NULL
-        `).all(currentControl.roleId);
+        const replayAudit = this.db.prepare(`
+          SELECT payload_json FROM sync_log
+          WHERE entity_type = 'agency_redaction' AND entity_id = ?
+        `).get(currentControl.controlId);
+        const replayPayload = parseJson(replayAudit?.payload_json, null);
+        const replayLineages = (replayPayload?.affectedLineageKeys || [])
+          .map(lineageKey => ({ authority_lineage_key: lineageKey }));
         for (const row of replayLineages) {
           const lineage = this.db.prepare(
             'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
@@ -8086,6 +8910,12 @@ export class YuqiStore {
       // turn/lineage scrub; it is never recomputed from partially redacted
       // rows.
       const memoryPrunePlan = this.prepareMemoryPruneInternal({
+        roleId: currentControl.roleId,
+        frozen: frozenAuthority.frozen,
+        controlId: currentControl.controlId,
+        redactedAt: appliedAt
+      });
+      const agencyPrunePlan = this.freezeAgencyPruneAuthorityInternal({
         roleId: currentControl.roleId,
         frozen: frozenAuthority.frozen,
         controlId: currentControl.controlId,
@@ -8150,12 +8980,28 @@ export class YuqiStore {
         controlId: currentControl.controlId,
         redactedAt: appliedAt
       });
+      this.applyAgencyPrunePlanInternal(agencyPrunePlan, {
+        roleId: currentControl.roleId,
+        controlId: currentControl.controlId,
+        redactedAt: appliedAt
+      });
+      this.writeAgencyPruneAuditInternal(agencyPrunePlan, {
+        roleId: currentControl.roleId,
+        controlId: currentControl.controlId,
+        redactedAt: appliedAt
+      });
+      this.assertAgencyPruneClosureInternal({
+        roleId: currentControl.roleId,
+        controlId: currentControl.controlId,
+        redactedAt: appliedAt
+      });
       this.assertMemoryPruneClosureInternal({
         controlId: currentControl.controlId,
         roleId: currentControl.roleId,
         redactedAt: appliedAt
       });
       fault('after_memory_prune');
+      fault('after_agency_prune');
 
       const updatedLane = this.db.prepare(`
         UPDATE interaction_lanes
@@ -14929,7 +15775,7 @@ export class YuqiStore {
   }
 
   deleteCognitiveStateInternal(roleId) {
-    return Number(this.db.prepare('DELETE FROM cognitive_states WHERE role_id = ?').run(roleId).changes);
+    throw new CognitiveStateConflictError('cognitive state deletion is unsupported');
   }
 
   createConsolidationJobInternal(job) {

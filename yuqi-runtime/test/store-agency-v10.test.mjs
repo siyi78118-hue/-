@@ -253,11 +253,11 @@ function cognitiveSnapshotV2() {
   };
 }
 
-test('clean v9 passes through the historical schemas and finishes at v14', () => withTemporaryDatabase(path => {
+test('clean v9 passes through the historical schemas and finishes at v15', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: false });
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 14);
+    assert.equal(store.userVersion(), 15);
     for (const table of V10_TABLES) {
       assert.equal(
         Boolean(store.db.prepare(
@@ -270,23 +270,23 @@ test('clean v9 passes through the historical schemas and finishes at v14', () =>
     assert.equal(store.listPipelineReleases().length, 2);
     assert.ok(store.listCognitionRollouts().every(row => row.candidatePhase === 'none'));
     store.migrate();
-    assert.equal(store.userVersion(), 14);
+    assert.equal(store.userVersion(), 15);
     assert.equal(store.listPipelineReleases().length, 2);
   } finally {
     store.close();
   }
 }));
 
-test('populated v9 through v10, v11, v12, v13, and v14 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
+test('populated v9 through v10, v11, v12, v13, v14, and v15 is non-destructive and idempotent', () => withTemporaryDatabase(path => {
   createV9Database(path, { populated: true });
   const before = countStructuralRows(path);
   const store = new YuqiStore(path);
   try {
-    assert.equal(store.userVersion(), 14);
+    assert.equal(store.userVersion(), 15);
     assert.deepEqual(countStructuralRows(path), before);
     assert.equal(store.listCognitionRollouts()[0].candidatePhase, 'none');
     store.migrate();
-    assert.equal(store.userVersion(), 14);
+    assert.equal(store.userVersion(), 15);
     assert.equal(store.listPipelineReleases().length, 2);
     assert.deepEqual(countStructuralRows(path), before);
   } finally {
@@ -294,11 +294,11 @@ test('populated v9 through v10, v11, v12, v13, and v14 is non-destructive and id
   }
 }));
 
-test('versions above v14 stop instead of being rewritten', () => withTemporaryDatabase(path => {
+test('versions above v15 stop instead of being rewritten', () => withTemporaryDatabase(path => {
   const database = new DatabaseSync(path);
-  database.exec('PRAGMA user_version = 15;');
+  database.exec('PRAGMA user_version = 16;');
   database.close();
-  assert.throws(() => new YuqiStore(path), /unsupported.*15/i);
+  assert.throws(() => new YuqiStore(path), /unsupported.*16/i);
 }));
 
 test('new turns pin release pair and lane revision while old turns remain readable', () =>
@@ -368,7 +368,7 @@ test('constraint and stance revisions are append-only and active reads are time-
         rule: 'stop',
         sourceMessageIds: ['u2'],
         status: 'released',
-        supersedes: 'c1',
+        supersedes: 'c1@1',
         createdAt: 1000,
         updatedAt: 2000
       });

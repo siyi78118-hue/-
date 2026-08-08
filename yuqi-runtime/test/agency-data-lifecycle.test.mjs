@@ -1126,10 +1126,18 @@ test('canonical RA1 clear redacts a real three-bubble retry lineage and preserve
       + targetTurnIds.map(() => '?').join(',') + ')').get(...targetTurnIds).value, 0);
     assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM diagnostics WHERE turn_id IN ('
       + targetTurnIds.map(() => '?').join(',') + ')').get(...targetTurnIds).value, 0);
-    assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM consolidation_jobs WHERE authority_group_id = ?')
-      .get(fixture.groupId).value, 0);
-    assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM stance_records WHERE authority_group_id = ?')
-      .get(fixture.groupId).value, 0);
+    assert.deepEqual(reopened.db.prepare(`
+      SELECT state, lease_owner, lease_expires_at, last_error_code
+      FROM consolidation_jobs WHERE authority_group_id = ?
+    `).all(fixture.groupId).map(row => ({ ...row })), [{
+      state: 'cancelled', lease_owner: null, lease_expires_at: null,
+      last_error_code: 'SOURCE_REDACTED'
+    }]);
+    assert.equal(reopened.db.prepare(`SELECT COUNT(*) AS value FROM stance_records
+      WHERE authority_group_id = ? AND revision = (
+        SELECT MAX(latest.revision) FROM stance_records latest
+        WHERE latest.stance_id = stance_records.stance_id
+      )`).get(fixture.groupId).value, 0);
     assert.equal(reopened.db.prepare('SELECT COUNT(*) AS value FROM cognitive_states WHERE last_authority_group_id = ?')
       .get(fixture.groupId).value, 0);
     assert.equal(reopened.db.prepare("SELECT COUNT(*) AS value FROM sessions WHERE role = 'yuqi'").get().value, 0);
@@ -2235,6 +2243,392 @@ for (const [label, mutate] of [
     }
   });
 }
+
+test('agency redaction cognitive audit is validated on store startup before replay', () => {
+  const { dir, path } = tempPath('yuqi-agency-startup-audit-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const control = emptySessionClear({ clearedThroughSequence: 3 });
+    store.applyConversationClearInternal(control, { appliedAt: 1784400131800 });
+    store.close();
+    const raw = new DatabaseSync(path);
+    try {
+      raw.prepare(`UPDATE cognitive_states
+        SET revision = revision + 1
+        WHERE role_id = ?`).run('yuqi');
+    } finally {
+      raw.close();
+    }
+    assert.throws(() => new YuqiStore(path), /agency|cognitive|audit|conflict/i);
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('multiple clear audits keep prior action scope isolated on restart', () => {
+  const { dir, path } = tempPath('yuqi-agency-audit-history-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { lastCommitChecksum: null });
+    const first = emptySessionClear({ clearEpoch: 1, clearedThroughSequence: 0 });
+    store.applyConversationClearInternal(first, { appliedAt: 1784400131810 });
+    const second = emptySessionClear({ clearEpoch: 2, clearedThroughSequence: 0 });
+    store.applyConversationClearInternal(second, { appliedAt: 1784400131820 });
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.equal(reopened.db.prepare(
+      "SELECT COUNT(*) AS count FROM sync_log WHERE entity_type = 'agency_redaction'"
+    ).get().count, 2);
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('conversation clear cancels an affected running consolidation job and rejects its old lease completion', () => {
+  const { dir, path } = tempPath('yuqi-clear-job-cancel-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { includeRetry: false, deliveryState: 'waiting' });
+    const claimed = store.claimDueConsolidationJob({
+      workerId: 'worker_clear_job',
+      jobTypes: ['turn_consolidation'],
+      now: 1784400023000,
+      leaseMs: 60000
+    });
+    assert.ok(claimed);
+    assert.equal(claimed.state, 'running');
+    assert.equal(claimed.leaseOwner, 'worker_clear_job');
+    const indirect = store.createConsolidationJobInternal({
+      jobId: 'job_clear_role_history', subjectType: 'role_history',
+      subjectId: 'history_clear', roleId: 'yuqi', jobType: 'history_backfill',
+      payload: { roleHistory: { sourceTurnId: fixture.terminal.turnId } },
+      createdAt: 1784400024000, dueAt: 1784400024000
+    });
+    assert.ok(indirect);
+
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 2 }),
+      { appliedAt: 1784400130000 }
+    );
+
+    const cancelled = store.getConsolidationJob(claimed.jobId);
+    assert.ok(cancelled);
+    assert.equal(cancelled.state, 'cancelled');
+    assert.equal(cancelled.leaseOwner, null);
+    assert.equal(cancelled.leaseExpiresAt, null);
+    assert.equal(cancelled.lastErrorCode, 'SOURCE_REDACTED');
+    assert.throws(() => store.completeConsolidationJob({
+      jobId: claimed.jobId,
+      workerId: claimed.leaseOwner,
+      now: 1784400130001
+    }), /lease mismatch|consolidation/i);
+    assert.equal(store.getConsolidationJob(indirect.jobId).state, 'cancelled');
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('conversation clear cancels an action-only job by its canonical action source', () => {
+  const { dir, path } = tempPath('yuqi-clear-action-job-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { includeRetry: false, deliveryState: 'waiting' });
+    const actionId = store.db.prepare(
+      'SELECT action_id FROM visible_result_actions WHERE group_id = ? ORDER BY ordinal LIMIT 1'
+    ).get(fixture.groupId).action_id;
+    const job = store.createConsolidationJobInternal({
+      jobId: 'job_clear_action_only', subjectType: 'role_history',
+      subjectId: 'history_action_only', roleId: 'yuqi', jobType: 'history_backfill',
+      payload: { roleHistory: { sourceActionId: actionId } },
+      createdAt: 1784400024000, dueAt: 1784400024000
+    });
+    assert.equal(job.state, 'queued');
+    const claimed = store.claimDueConsolidationJob({
+      workerId: 'worker_action_only', jobTypes: ['history_backfill'],
+      now: 1784400024000, leaseMs: 60000
+    });
+    assert.equal(claimed.jobId, job.jobId);
+    assert.equal(claimed.state, 'running');
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 2 }), { appliedAt: 1784400130500 }
+    );
+    const cancelled = store.getConsolidationJob(job.jobId);
+    assert.equal(cancelled.state, 'cancelled');
+    assert.equal(cancelled.leaseOwner, null);
+    assert.equal(cancelled.leaseExpiresAt, null);
+    assert.equal(cancelled.lastErrorCode, 'SOURCE_REDACTED');
+    assert.throws(() => store.completeConsolidationJob({
+      jobId: claimed.jobId, workerId: claimed.leaseOwner, now: 1784400130501
+    }), /lease mismatch|consolidation/i);
+    const control = emptySessionClear({ clearedThroughSequence: 2 });
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.doesNotThrow(() => reopened.applyConversationClearInternal(control, {
+      appliedAt: 1784400130999
+    }));
+    assert.equal(reopened.getConsolidationJob(job.jobId).state, 'cancelled');
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('conversation clear appends archived constraint and expired stance revisions and rebuilds a deterministic cognitive anchor', () => {
+  const { dir, path } = tempPath('yuqi-clear-agency-state-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const sourceMessageId = `msg_${fixture.v1.turnId}`;
+    const constraint = store.putConstraintRevisionInternal({
+      constraintId: 'constraint_clear_user', revision: 1, roleId: 'yuqi', authority: 'user',
+      kind: 'privacy', subject: 'user', scope: { channel: 'private_chat', target: 'all' },
+      rule: 'keep private', sourceMessageIds: [sourceMessageId], sourceConfigRef: null,
+      releaseCondition: null, status: 'active', supersedes: null,
+      createdAt: 1784400100000, updatedAt: 1784400100000
+    });
+    const stance = store.putStanceRevisionInternal({
+      stanceId: 'stance_clear_user', revision: 1, roleId: 'yuqi', topic: 'privacy',
+      position: 'private', reason: 'source-backed', strength: 0.8, flexibility: 0.2,
+      sourceTurnId: fixture.v1.turnId, sourceMessageIds: [sourceMessageId],
+      createdAt: 1784400100000, lastConfirmedAt: 1784400100000, expiresAt: null,
+      remainingRelevantUserBatches: 2, status: 'active', supersedes: null
+    });
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi', schemaVersion: 2, revision: 1, lastTurnId: fixture.v1.turnId,
+      state: { fastState: { mood: 'warm', openThreadIds: [], openThreads: [] },
+        mediumState: {}, slowState: { preferenceFactIds: [] } }, updatedAt: 1784400100000
+    });
+
+    const beforeConstraint = store.db.prepare(
+      'SELECT * FROM constraint_records WHERE constraint_id = ? AND revision = 1'
+    ).get(constraint.constraintId);
+    const beforeStance = store.db.prepare(
+      'SELECT * FROM stance_records WHERE stance_id = ? AND revision = 1'
+    ).get(stance.stanceId);
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400131000 }
+    );
+
+    assert.deepEqual({ ...store.db.prepare(
+      'SELECT * FROM constraint_records WHERE constraint_id = ? AND revision = 1'
+    ).get(constraint.constraintId) }, { ...beforeConstraint });
+    const archivedConstraint = store.db.prepare(
+      'SELECT * FROM constraint_records WHERE constraint_id = ? AND revision = 2'
+    ).get(constraint.constraintId);
+    assert.equal(archivedConstraint.status, 'archived');
+    assert.equal(archivedConstraint.supersedes, 'constraint_clear_user@1');
+    assert.deepEqual({ ...store.db.prepare(
+      'SELECT * FROM stance_records WHERE stance_id = ? AND revision = 1'
+    ).get(stance.stanceId) }, { ...beforeStance });
+    const expiredStance = store.db.prepare(
+      'SELECT * FROM stance_records WHERE stance_id = ? AND revision = 2'
+    ).get(stance.stanceId);
+    assert.equal(expiredStance.status, 'expired');
+    assert.equal(expiredStance.supersedes, 'stance_clear_user@1');
+
+    const state = store.getCognitiveState('yuqi');
+    assert.equal(state.schemaVersion, 2);
+    assert.equal(state.lastTurnId, stableId(
+      'cognitive_clear_anchor',
+      `yuqi:${emptySessionClear({ clearedThroughSequence: 3 }).controlId}`
+    ));
+    assert.equal(state.revision, 2);
+    assert.deepEqual(state.state, {
+      fastState: { mood: '', openThreadIds: [], openThreads: [] },
+      mediumState: {}, slowState: { preferenceFactIds: [] }
+    });
+    const replay = store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400131999 }
+    );
+    assert.equal(store.getCognitiveState('yuqi').revision, 2);
+    assert.equal(replay.type, 'CONVERSATION_CLEAR_APPLIED');
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('agency revision writers reject malformed authority and non-contiguous supersedes', () => {
+  const { dir, path } = tempPath('yuqi-agency-writer-closure-');
+  try {
+    const store = new YuqiStore(path);
+    const baseConstraint = {
+      constraintId: 'writer_constraint', revision: 1, roleId: 'yuqi', authority: 'user',
+      kind: 'privacy', subject: 'user', scope: { channel: 'private_chat' }, rule: 'keep',
+      sourceMessageIds: ['m1'], sourceConfigRef: null, releaseCondition: null,
+      status: 'active', supersedes: null, createdAt: 1784400100000, updatedAt: 1784400100000
+    };
+    assert.throws(() => store.putConstraintRevisionInternal({
+      ...baseConstraint, constraintId: 'writer_bad_authority', authority: 'alien'
+    }), /constraint|authority/i);
+    assert.throws(() => store.putConstraintRevisionInternal({
+      ...baseConstraint, constraintId: 'writer_bad_status', status: 'pending'
+    }), /constraint|status/i);
+    assert.throws(() => store.putConstraintRevisionInternal({
+      ...baseConstraint, revision: 3, supersedes: 'writer_constraint@2'
+    }), /constraint|revision|supersedes/i);
+    assert.throws(() => store.putStanceRevisionInternal({
+      stanceId: 'writer_bad_stance', revision: 2, roleId: 'yuqi', topic: 't',
+      position: 'p', reason: 'r', strength: 0.5, flexibility: 0.5, sourceTurnId: 'turn',
+      sourceMessageIds: ['m1'], createdAt: 1784400100000, lastConfirmedAt: 1784400100000,
+      expiresAt: null, remainingRelevantUserBatches: 1, status: 'active',
+      supersedes: 'writer_bad_stance@1'
+    }), /stance|revision|supersedes/i);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('mixed user constraint keeps only surviving evidence in a new active revision', () => {
+  const { dir, path } = tempPath('yuqi-agency-mixed-constraint-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const privateMessageId = `msg_${fixture.v1.turnId}`;
+    const publicMessageId = `msg_reply_${fixture.publicMoment.turnId}`;
+    store.putConstraintRevisionInternal({
+      constraintId: 'constraint_mixed_user', revision: 1, roleId: 'yuqi', authority: 'user',
+      kind: 'privacy', subject: 'user', scope: { channel: 'private_chat' }, rule: 'keep',
+      sourceMessageIds: [privateMessageId, publicMessageId], sourceConfigRef: null,
+      releaseCondition: null, status: 'active', supersedes: null,
+      createdAt: 1784400100000, updatedAt: 1784400100000
+    });
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400132000 }
+    );
+    const head = store.db.prepare(
+      'SELECT * FROM constraint_records WHERE constraint_id = ? AND revision = 2'
+    ).get('constraint_mixed_user');
+    assert.equal(head.status, 'active');
+    assert.deepEqual(JSON.parse(head.source_message_ids_json), [publicMessageId]);
+    assert.equal(head.supersedes, 'constraint_mixed_user@1');
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('mixed stance keeps a surviving source turn in its append-only active revision', () => {
+  const { dir, path } = tempPath('yuqi-agency-mixed-stance-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const privateMessageId = `msg_${fixture.v1.turnId}`;
+    const publicMessageId = `msg_reply_${fixture.publicMoment.turnId}`;
+    store.putStanceRevisionInternal({
+      stanceId: 'stance_mixed_user', revision: 1, roleId: 'yuqi', topic: 'privacy',
+      position: 'private', reason: 'source-backed', strength: 0.8, flexibility: 0.2,
+      sourceTurnId: fixture.v1.turnId, sourceMessageIds: [privateMessageId, publicMessageId],
+      createdAt: 1784400100000, lastConfirmedAt: 1784400100000, expiresAt: null,
+      remainingRelevantUserBatches: 2, status: 'active', supersedes: null
+    });
+    store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400132500 }
+    );
+    const head = store.db.prepare(
+      'SELECT * FROM stance_records WHERE stance_id = ? AND revision = 2'
+    ).get('stance_mixed_user');
+    assert.equal(head.status, 'active');
+    assert.equal(head.source_turn_id, fixture.publicMoment.turnId);
+    assert.deepEqual(JSON.parse(head.source_message_ids_json), [publicMessageId]);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('cognitive state deletion is rejected and clear replay validates the rebuilt anchor', () => {
+  const { dir, path } = tempPath('yuqi-agency-cognitive-no-delete-');
+  try {
+    const store = new YuqiStore(path);
+    store.putCognitiveStateInternal({
+      roleId: 'yuqi', schemaVersion: 2, revision: 1, lastTurnId: 'turn_anchor',
+      state: { fastState: { mood: 'x', openThreadIds: [], openThreads: [] },
+        mediumState: {}, slowState: { preferenceFactIds: [] } }, updatedAt: 1784400100000
+    });
+    assert.throws(() => store.deleteCognitiveStateInternal('yuqi'), /cognitive|delete|unsupported/i);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const [label, mutate] of [
+  ['revision', db => db.prepare(
+    'UPDATE cognitive_states SET revision = revision + 1 WHERE role_id = ?'
+  ).run('yuqi')],
+  ['last turn identity', db => db.prepare(
+    'UPDATE cognitive_states SET last_turn_id = ? WHERE role_id = ?'
+  ).run('forged-anchor', 'yuqi')],
+  ['state', db => db.prepare(
+    'UPDATE cognitive_states SET state_json = ? WHERE role_id = ?'
+  ).run('{}', 'yuqi')],
+  ['checksum', db => db.prepare(
+    'UPDATE cognitive_states SET checksum = ? WHERE role_id = ?'
+  ).run('f'.repeat(64), 'yuqi')]
+]) {
+  test(`cognitive clear replay rejects a tampered ${label} after restart`, () => {
+    const { dir, path } = tempPath(`yuqi-agency-cognitive-replay-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createAuthorityV0ScrubFixture(store);
+      store.putCognitiveStateInternal({
+        roleId: 'yuqi', schemaVersion: 2, revision: 1, lastTurnId: fixture.v1.turnId,
+        state: { fastState: { mood: 'x', openThreadIds: [], openThreads: [] },
+          mediumState: {}, slowState: { preferenceFactIds: [] } }, updatedAt: 1784400100000
+      });
+      const control = emptySessionClear({ clearedThroughSequence: 3 });
+      store.applyConversationClearInternal(control, { appliedAt: 1784400131500 });
+      store.close();
+      const raw = new DatabaseSync(path);
+      try {
+        mutate(raw);
+      } finally {
+        raw.close();
+      }
+      assert.throws(() => new YuqiStore(path), /agency|cognitive|conflict/i);
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+test('agency prune fault rolls back constraints, stances, cognitive state, and jobs with the clear', () => {
+  const { dir, path } = tempPath('yuqi-agency-prune-fault-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const sourceMessageId = `msg_${fixture.v1.turnId}`;
+    store.putConstraintRevisionInternal({
+      constraintId: 'constraint_fault_user', revision: 1, roleId: 'yuqi', authority: 'user',
+      kind: 'privacy', subject: 'user', scope: { channel: 'private_chat', target: 'all' },
+      rule: 'keep', sourceMessageIds: [sourceMessageId], sourceConfigRef: null,
+      releaseCondition: null, status: 'active', supersedes: null,
+      createdAt: 1784400100000, updatedAt: 1784400100000
+    });
+    store.putStanceRevisionInternal({
+      stanceId: 'stance_fault_user', revision: 1, roleId: 'yuqi', topic: 'privacy',
+      position: 'private', reason: 'source-backed', strength: 0.8, flexibility: 0.2,
+      sourceTurnId: fixture.v1.turnId, sourceMessageIds: [sourceMessageId],
+      createdAt: 1784400100000, lastConfirmedAt: 1784400100000, expiresAt: null,
+      remainingRelevantUserBatches: 2, status: 'active', supersedes: null,
+      authorityGroupId: null, authorityOrdinal: null
+    });
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }),
+      { appliedAt: 1784400133000, faultAfterStep: 'after_agency_prune' }
+    ), /forced conversation clear fault/);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
 
 test('v3 current-batch user fact resolves without result-group authority and is pruned by private clear', () => {
   const { dir, path } = tempPath('yuqi-memory-v3-current-batch-');
