@@ -8157,10 +8157,15 @@ exact Room CAS applies that returned value without creating a second envelope.
   `operation='redact'`, `created_at=appliedAt`, canonical payload and checksum.
   The payload is a closed object with exactly
   `auditVersion,controlId,roleId,turnId,protocolVersion,redactedAt,deliveryCount,`
-  `deliveries,deliveryCommitment`; `auditVersion` is
+  `deliveries,deliveryCommitment,messageTombstoneCount,`
+  `messageTombstoneCommitment,batchTombstoneCount,batchTombstoneCommitment`;
+  `auditVersion` is
   `legacy_turn_redaction_v1`. `deliveries` is sorted by `peerId` and each entry
-  has exactly `peerId,originalState,relayMessageId,deliveredAt,confirmedAt,`
-  `recoveryAckSeq`. `originalState` is a native string in the closed set
+  has exactly `peerId,originalState,originalChecksum,relayMessageId,deliveredAt,`
+  `confirmedAt,recoveryAckSeq`. `originalChecksum` is null for `waiting` and
+  the original lowercase SHA-256 for every prepared state, so reopen can
+  independently recompute the stable relay identity after payload removal.
+  `originalState` is a native string in the closed set
   `waiting,pending,mailboxed,confirmed,delivered`; `peerId` is a non-empty native
   string, `relayMessageId` is a non-empty native string or null, the two times are
   positive safe integers or null, and `recoveryAckSeq` is a native non-negative
@@ -8168,6 +8173,26 @@ exact Room CAS applies that returned value without creating a second envelope.
   field. `deliveryCommitment` is the lowercase SHA-256 of canonical
   `{auditVersion:'legacy-turn-deliveries-v1',turnId,deliveries}` and
   `deliveryCount===deliveries.length`.
+- Before erasing content, freeze the exact RA0 message and v2 batch tombstone
+  projections into the same audit. `messageTombstoneCount` is the retained
+  turn-linked message count and `messageTombstoneCommitment` hashes canonical
+  `{auditVersion:'legacy-turn-messages-v1',turnId,messages}` where sorted
+  `messages` entries contain exactly
+  `messageId,turnId,characterId,speakerId,speakerType,recipientId,sentAt,origin,`
+  `deviceId,deviceSeq,batchId,batchSequence,checksum`, never content.
+  `batchTombstoneCount` counts retained v2 batches and
+  `batchTombstoneCommitment` hashes canonical
+  `{auditVersion:'legacy-turn-batches-v1',turnId,batches}`. Each sorted batch
+  entry contains exactly `turnId,batchId,characterId,sourceMessageId,startedAt,`
+  `committedAt,checksum,itemCount,itemCommitment`; `itemCommitment` hashes the
+  ordered closed tuples `sequence,messageId,checksum`. Protocol v1 has an empty
+  batch set and the fixed canonical empty commitment. The transaction retains
+  the batch/item identities, ordinals and original checksums, sets every item
+  `message_json=NULL,redacted_at=appliedAt`, and writes the existing batch
+  `item_count/tombstone_commitment`; it never deletes the batch authority.
+  Reopen recomputes both audit commitments from the retained empty-content
+  message rows and batch/item tombstones and rejects a missing, extra, foreign,
+  reordered or restored projection.
 - Before clearing a legacy delivery payload/checksum, freeze the complete target
   set into that audit. Validate this closed source matrix before the first write:
   `waiting` has null payload/checksum/relay/delivered/confirmed and zero attempts;
@@ -8176,7 +8201,8 @@ exact Room CAS applies that returned value without creating a second envelope.
   delivered time and null confirmed time; historical `delivered` has a positive
   delivered time and permits a null or positive confirmed time; `confirmed` has
   both times positive. Every prepared state has a
-  non-empty lowercase checksum; a retained relay ID is either null or exactly
+  non-empty lowercase checksum; its audit `originalChecksum` equals that value;
+  a retained relay ID is either null or exactly
   `stableId('relay_pc', turnId + ':' + peerId + ':' + checksum)`. An unknown state,
   waiting row with prepared data, prepared row with missing/non-canonical payload
   or checksum, impossible time shape, foreign group/commit authority, or mismatched
@@ -8203,12 +8229,24 @@ exact Room CAS applies that returned value without creating a second envelope.
   including historical `delivered` with `confirmedAt=null`.
 - Add one store-owned scoped `loadValidatedLegacyTurnRedactionInternal(turnId)`
   that closes the turn shell, applied control, unique `legacy_turn_redaction`
-  audit and exact delivery set without a full scan. `publicTurnStatus()` receives
-  only that validated result and branches before legacy `reply_json/error_json`
-  parsing; `envelope_json={"redacted":true}` alone is never sufficient. It returns
-  one fixed non-semantic terminal redacted result, and LAN maps it to the same fixed
+  audit and exact delivery set without a full scan. Its validation evidence is
+  internal and is not a caller-supplied capability: do not export a branding
+  symbol or accept a shape-compatible token in `publicTurnStatus()`. Add
+  store-owned `publicLegacyRedactedTurnStatusInternal(turnId)`, which calls the
+  scoped loader and returns the fixed projection in the same trusted call. The
+  standalone status projector rejects every redacted legacy turn before
+  `reply_json/error_json` parsing; `envelope_json={"redacted":true}` alone is
+  never sufficient. The store method returns one fixed non-semantic terminal
+  redacted result, and LAN maps it to the same fixed
   HTTP 410 body used for canonical redaction. It must never surface `thinking`,
   fallback, route, stage, reply, action or error detail from a redacted v0 turn.
+- After inserting the v1 clear control, but before commit, invoke the scoped RA0
+  loader for every newly redacted legacy turn and the existing scoped RA1
+  validator for every affected lineage/group. Exact-control and exact
+  role/epoch replay fast paths run the same applied-closure validation before
+  returning the persisted proof; they never trust the control row alone. Thus
+  an audit, message/batch tombstone, delivery or authority shell corrupted in
+  the same process is rejected on replay without requiring a database reopen.
 
 **Evidence, memory, stance, constraint, and current-state pruning:**
 - The turn/group scrub and the memory prune consume one store-owned,
