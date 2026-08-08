@@ -7967,6 +7967,7 @@ No attached device is an explicit blocked release gate, not a skipped pass.
 - Modify: `yuqi-runtime/src/local-server.mjs`
 - Modify: `yuqi-runtime/src/cloud-relay-pump.mjs`
 - Modify: `yuqi-runtime/src/result-outbox.mjs`
+- Modify: `yuqi-runtime/src/turn-status.mjs`
 - Modify: `yuqi-relay-worker.js`
 - Modify: `yuqi-runtime/test/protocol-store.test.mjs`
 - Create: `yuqi-runtime/test/agency-data-lifecycle.test.mjs`
@@ -8085,6 +8086,13 @@ exact Room CAS applies that returned value without creating a second envelope.
   write. The store boundary is
   `turn.input_clear_epoch < clearEpoch` OR
   `(turn.input_clear_epoch = clearEpoch AND input_visibility_sequence <= clearedThroughSequence)`.
+  This predicate is evaluated only inside the persisted `(roleId,'private_chat')`
+  lane. Both result-authority-v1 protocol-v2 and protocol-v3 canonical attempts
+  are eligible; a canonical candidate must have `turn.lane_key`, lineage lane and
+  the validated envelope-derived lane all equal `private_chat`, plus a persisted
+  non-negative sequence/epoch pair. A canonical v2 row is never skipped merely
+  because it predates the v3 wire. Public-moment and moment-thread rows are outside
+  the affected set and remain byte-identical.
 
 **Single clear transaction order:**
 1. Load and CAS the private-chat lane. Freeze the target lineage/group/delivery
@@ -8108,12 +8116,125 @@ exact Room CAS applies that returned value without creating a second envelope.
    and commit. An injected failure after every write boundary rolls all of it
    back.
 
+**Authority-v0 legacy redaction authority:**
+- A live `result_authority_version=0` turn is selected by the same persisted
+  `(input_clear_epoch,input_visibility_sequence)` boundary as a canonical turn.
+  Protocol v1 and v2 are both accepted only after `validateEnvelope()` and the
+  persisted `envelope_checksum` are revalidated inside the clear transaction.
+  Protocol v1 is the historical private-chat-only contract. Protocol v2 is
+  eligible only when `laneKeyForEnvelope(validatedEnvelope)==='private_chat'`;
+  `PROACTIVE_MOMENT`, moment interaction/reply and every other non-private lane
+  are excluded and byte-identical after clear.
+  Historical authority-v0 rows legitimately predate visibility cursors:
+  `input_visibility_sequence=NULL` is interpreted as legacy baseline sequence
+  zero only for affected-set selection, and is never rewritten or presented as a
+  newly proven cursor. A non-null sequence and `input_clear_epoch` must be native
+  non-negative safe integers; the v13 default epoch zero is the pre-clear epoch.
+  A malformed live envelope, invalid sequence/epoch, foreign role, or an
+  authority-v0 row already carrying canonical group/receipt authority rejects
+  before the first write. A previously redacted v0 turn is validated and skipped;
+  it is never redacted a second time.
+- Redaction never upgrades the turn. It preserves `turn_id`, character/device
+  identity, device sequence, source message identity, `result_authority_version=0`,
+  the original `envelope_checksum`, release pins and revisions. It sets the
+  terminal state to `cancelled`, writes `authority_redacted_at=appliedAt`, replaces
+  `envelope_json` with exact `{"redacted":true}`, clears worker/model/memory/
+  supervisor/reply/error/route/annotation semantics, deletes `turn_stages`, and
+  tombstones any complete v2 batch and turn-linked message without changing their
+  retained identities. Linked diagnostics, non-redaction sync rows, sessions and
+  executable jobs are removed in the same transaction. The legacy recovery,
+  status and delivery writers must branch before parsing the redacted envelope
+  and must never requeue, prepare or reconstruct this turn.
+- No schema v16 is introduced. Existing `sync_log` is the authority anchor. The
+  transaction appends exactly one row per newly redacted v0 turn with
+  `entity_type='legacy_turn_redaction'`, `entity_id=turnId`,
+  `operation='redact'`, `created_at=appliedAt`, canonical payload and checksum.
+  The payload is a closed object with exactly
+  `auditVersion,controlId,roleId,turnId,protocolVersion,redactedAt,deliveryCount,`
+  `deliveries,deliveryCommitment`; `auditVersion` is
+  `legacy_turn_redaction_v1`. `deliveries` is sorted by `peerId` and each entry
+  has exactly `peerId,originalState,relayMessageId,deliveredAt,confirmedAt,`
+  `recoveryAckSeq`. `originalState` is a native string in the closed set
+  `waiting,pending,mailboxed,confirmed,delivered`; `peerId` is a non-empty native
+  string, `relayMessageId` is a non-empty native string or null, the two times are
+  positive safe integers or null, and `recoveryAckSeq` is a native non-negative
+  safe integer. It contains no payload, reply, error, route, content or model
+  field. `deliveryCommitment` is the lowercase SHA-256 of canonical
+  `{auditVersion:'legacy-turn-deliveries-v1',turnId,deliveries}` and
+  `deliveryCount===deliveries.length`.
+- Before clearing a legacy delivery payload/checksum, freeze the complete target
+  set into that audit. Validate this closed source matrix before the first write:
+  `waiting` has null payload/checksum/relay/delivered/confirmed and zero attempts;
+  `pending` has canonical payload whose SHA-256 is the stored checksum, null
+  delivered/confirmed times and non-negative attempts; `mailboxed` adds a positive
+  delivered time and null confirmed time; historical `delivered` has a positive
+  delivered time and permits a null or positive confirmed time; `confirmed` has
+  both times positive. Every prepared state has a
+  non-empty lowercase checksum; a retained relay ID is either null or exactly
+  `stableId('relay_pc', turnId + ':' + peerId + ':' + checksum)`. An unknown state,
+  waiting row with prepared data, prepared row with missing/non-canonical payload
+  or checksum, impossible time shape, foreign group/commit authority, or mismatched
+  relay rejects before mutation and cannot be washed into a valid audit.
+- A valid `waiting` row becomes `redacted` with no relay ID, null request time,
+  local acknowledgement at `appliedAt`, zero attempts and no delivery/confirmation
+  time. A valid `pending`, `mailboxed`, `confirmed` or historical `delivered` row
+  retains or deterministically derives the legacy relay ID
+  `stableId('relay_pc', turnId + ':' + peerId + ':' + checksum)`, becomes
+  `redaction_pending`, records `redaction_requested_at=appliedAt`, clears attempts,
+  payload and checksum, and retains its original delivered/confirmed times for
+  audit comparison. A stale legacy sender must re-read the turn and exact delivery
+  state after clear; it may neither enqueue nor mark mailboxed. The retraction
+  worker later consumes only the retained relay ID.
+- The v15 reopen invariant validates every redacted authority-v0 turn against
+  exactly one legacy audit and the applied v1 clear control: shell/time/role,
+  original envelope hash, message/batch tombstones, absence of stages and semantic
+  projections, exact delivery target set, audit count/commitment, relay identity,
+  and redaction lifecycle. Deleted/extra/foreign delivery rows, duplicate audit,
+  unknown audit keys, changed original state/time/relay/count/commitment, restored
+  plaintext, or a recoverable/outbox-visible redacted turn fail closed. Exact clear
+  replay returns the existing applied proof without appending another audit.
+  Positive close/reopen and fault-rollback fixtures cover every legal source state,
+  including historical `delivered` with `confirmedAt=null`.
+- Add one store-owned scoped `loadValidatedLegacyTurnRedactionInternal(turnId)`
+  that closes the turn shell, applied control, unique `legacy_turn_redaction`
+  audit and exact delivery set without a full scan. `publicTurnStatus()` receives
+  only that validated result and branches before legacy `reply_json/error_json`
+  parsing; `envelope_json={"redacted":true}` alone is never sufficient. It returns
+  one fixed non-semantic terminal redacted result, and LAN maps it to the same fixed
+  HTTP 410 body used for canonical redaction. It must never surface `thinking`,
+  fallback, route, stage, reply, action or error detail from a redacted v0 turn.
+
+**Evidence, memory, stance, constraint, and current-state pruning:**
+- Perform this only after all affected canonical and legacy turn shells are
+  valid. Delete or archive a fact, stance or user-derived constraint only when
+  every persisted supporting message/turn/group belongs to the affected set.
+  Mixed-source records retain only surviving evidence and receive a recomputed
+  canonical checksum/revision. Author/system constraints, preset/persona source
+  records, global release definitions and unrelated-role rows are immutable to
+  conversation clear.
+- Cancel pending consolidation/retrieval jobs whose input authority was cleared;
+  no cleared draft, unconfirmed output or redacted evidence may remain
+  retrievable. Rebuild the role's current cognitive-state projection from the
+  surviving authority rows in deterministic order, preserving its monotonic
+  revision while removing redacted `last_turn_id`, authority-group references,
+  open threads and user-derived state. A fault after pruning or rebuild rolls the
+  entire clear transaction back, including all turn redactions and the control.
+- Tests must cover sole-source deletion, mixed-source evidence pruning,
+  author/system preservation, unrelated-role byte equality, no retrieval of
+  cleared content, deterministic restart rebuild, and every new write boundary.
+
 **Retraction worker:**
 - `ResultOutbox.flushRetractionsOnce(limit)` runs before normal sends and only
-  selects `redaction_pending`. It uses the retained relay ID to call idempotent
-  `/bridge/ack`; missing/already-removed ciphertext counts as success. It marks
-  `redacted` only by exact state/identity CAS. Network failure remains durable;
-  authority failure is quarantined and surfaced, never sent through legacy.
+  selects `redaction_pending`, then explicitly dispatches either a scoped RA1
+  group-redaction validator or the scoped RA0 `legacy_turn_redaction` validator.
+  A null-group row without the exact RA0 audit, a grouped row without RA1
+  authority, or any cross-version mixture fails closed; state alone is never the
+  authority discriminator. The worker uses the validator-returned retained relay
+  ID to call idempotent `/bridge/ack`; missing/already-removed ciphertext counts as
+  success. It marks `redacted` only by exact turn/peer/relay/request-time/state CAS
+  and records `redaction_acknowledged_at`; it never reconstructs payload. Network
+  failure remains durable; authority failure is quarantined and surfaced, never
+  sent through legacy.
 - A stale outbox snapshot revalidates after concurrent clear/redaction. It may
   not reconstruct payload, send a redacted result, append semantic diagnostic,
   or alter Task 20's redaction lifecycle.
