@@ -3051,6 +3051,97 @@ async function getYuqiVisibilityCursor(charId) {
     return unknownYuqiVisibilityCursor();
   }
 }
+const YUQI_CLEAR_CURSOR_KEYS = Object.freeze([
+  'characterId', 'nativeCompletedTurnId', 'nativeCompletedGroupId', 'nativeCompletedSequence',
+  'uiAppliedTurnId', 'uiAppliedGroupId', 'uiAppliedSequence', 'localSequence',
+  'clearedThroughSequence', 'clearEpoch', 'clearedAt', 'chatOpen', 'updatedAt', 'cursorChecksum'
+]);
+function validateYuqiClearCursorPayload(charId, raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+    || Object.keys(raw).sort().join('|') !== YUQI_CLEAR_CURSOR_KEYS.slice().sort().join('|')
+    || typeof raw.characterId !== 'string' || raw.characterId !== charId
+    || typeof raw.cursorChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.cursorChecksum)
+    || typeof raw.chatOpen !== 'boolean') throw new Error('invalid native cursor shape');
+  for (const key of [
+    'nativeCompletedSequence', 'uiAppliedSequence', 'localSequence',
+    'clearedThroughSequence', 'clearEpoch', 'clearedAt', 'updatedAt'
+  ]) {
+    if (typeof raw[key] !== 'number' || !Number.isSafeInteger(raw[key]) || raw[key] < 0) {
+      throw new Error(`invalid native cursor ${key}`);
+    }
+  }
+  const cursor = normalizeYuqiVisibilityCursor(raw);
+  return { cursor, cursorChecksum: raw.cursorChecksum };
+}
+async function getYuqiClearCursorForClear(charId, plugin = nativeExecutionPlugin()) {
+  if (!plugin?.getConversationCursor) throw new Error('Android clear plugin unavailable');
+  const raw = await nativeBridgeCall(plugin.getConversationCursor({ characterId: charId }), 'getConversationCursor', 3000);
+  return validateYuqiClearCursorPayload(charId, raw);
+}
+async function nativeFirstConversationClear(charId, { plugin = nativeExecutionPlugin(), applyLocal = null } = {}) {
+  if (!plugin?.getConversationCursor || !plugin?.createConversationClear) throw new Error('Android clear plugin unavailable');
+  const { cursorChecksum } = await getYuqiClearCursorForClear(charId, plugin);
+  const control = await nativeBridgeCall(
+    plugin.createConversationClear({ characterId: charId, expectedCursorChecksum: cursorChecksum }),
+    'createConversationClear',
+    5000
+  );
+  const validStates = new Set(['waiting', 'pending', 'relay_accepted', 'applied']);
+  const controlKeys = [...YUQI_CLEAR_CURSOR_KEYS, 'controlId', 'state'];
+  if (!control || typeof control !== 'object' || Array.isArray(control)
+    || Object.keys(control).sort().join('|') !== controlKeys.slice().sort().join('|')) {
+    throw new Error('invalid native clear response');
+  }
+  try {
+    validateYuqiClearCursorPayload(
+      charId,
+      Object.fromEntries(YUQI_CLEAR_CURSOR_KEYS.map(key => [key, control[key]]))
+    );
+  } catch {
+    throw new Error('invalid native clear response');
+  }
+  if (typeof control.characterId !== 'string' || control.characterId !== charId
+    || typeof control.controlId !== 'string' || !/^ctl_[a-f0-9]{64}$/.test(control.controlId)
+    || typeof control.clearEpoch !== 'number' || !Number.isSafeInteger(control.clearEpoch) || control.clearEpoch <= 0
+    || typeof control.clearedThroughSequence !== 'number' || !Number.isSafeInteger(control.clearedThroughSequence) || control.clearedThroughSequence < 0
+    || typeof control.state !== 'string' || !validStates.has(control.state)) {
+    throw new Error('invalid native clear response');
+  }
+  if (typeof applyLocal === 'function') await applyLocal(control);
+  return { control, pending: String(control.state || '').toUpperCase() !== 'APPLIED' };
+}
+async function runNativeClearAllSerial(charIds, clearOne) {
+  const results = [];
+  for (const charId of charIds) {
+    try {
+      const outcome = await clearOne(charId);
+      results.push({ characterId: charId, ...outcome, ok: outcome?.ok !== false });
+    } catch (error) {
+      results.push({ characterId: charId, ok: false, error: String(error?.message || error) });
+    }
+  }
+  return results;
+}
+async function nativeResultSuppressedByClear(result) {
+  const sequence = result?.inputVisibilitySequence;
+  const epoch = result?.inputClearEpoch;
+  if (!isNativeApp()) return false;
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.getConversationCursor) return true;
+  try {
+    const { cursor } = await getYuqiClearCursorForClear(result.characterId, plugin);
+    if (typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 0
+      || typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) {
+      return cursor.clearEpoch > 0;
+    }
+    if (cursor.clearEpoch === 0 && epoch === 0) return false;
+    if (epoch > cursor.clearEpoch) return true;
+    return epoch < cursor.clearEpoch
+      || (epoch === cursor.clearEpoch && sequence <= cursor.clearedThroughSequence);
+  } catch {
+    return true;
+  }
+}
 function withCognitionV2Snapshot(snapshot) {
   return {
     ...snapshot,
@@ -4209,6 +4300,10 @@ async function applyNativeExecutionTurnUnlocked(result) {
   const chat = allChats[charId];
   const kind = String(result?.kind || 'DIRECT_REPLY');
   if (!chat) return false;
+  if (typeof nativeResultSuppressedByClear === 'function' && await nativeResultSuppressedByClear(result)) {
+    nativeReplyQueuedIds.delete(result?.turnId);
+    return false;
+  }
   const state = String(result.state || result.storedState || '');
   if (nativeDirectTurnIsSuperseded(chat, result)) {
     nativeReplyQueuedIds.delete(result?.turnId);
@@ -12371,20 +12466,59 @@ function savePreset() {
   showScreen('chat');
   toast('已保存');
 }
+async function clearConversationForCharacter(charId, { render = false } = {}) {
+  const char = characters.find(c => c.id === charId);
+  if (!char) return { ok: false, error: '找不到待清空的角色' };
+  const old = allChats[charId] || {};
+  const native = isNativeApp();
+  let nativeOutcome = null;
+  if (native) {
+    const plugin = nativeExecutionPlugin();
+    if (!plugin?.getConversationCursor || !plugin?.createConversationClear) {
+      const error = new Error('当前 Android 不支持原生清空');
+      return { ok: false, error: error.message };
+    }
+    try {
+      nativeOutcome = await nativeFirstConversationClear(charId, { plugin });
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error) };
+    }
+  }
+  const cleanupResults = await Promise.allSettled([
+    cancelCloudProactiveQuick(charId, native ? '原生清除已接受' : '清空当前聊天'),
+    invalidateMemoryExtraction(charId),
+    ...(native ? [MemoryDB.clearChar(charId)] : [])
+  ]);
+  const cleanupWarnings = cleanupResults
+    .filter(result => result.status === 'rejected')
+    .map(result => String(result.reason?.message || result.reason));
+  allChats[charId] = {
+    messages: [chatClearedSystemMessage(char)],
+    charPrompt: buildCharPrompt(char),
+    extraPrompt: old.extraPrompt || '',
+    unread: 0,
+    pinned: !!old.pinned,
+    muted: !!old.muted
+  };
+  const stateResults = await Promise.allSettled([
+    MemoryDB.setMeta(memoryMetaKey(charId), 0),
+    setMemoryExtractStatus(charId, 'idle', '聊天已清空，增量整理游标已复位。', { processedTo: 0, batchSize: 0 })
+  ]);
+  for (const result of stateResults) {
+    if (result.status === 'rejected') cleanupWarnings.push(String(result.reason?.message || result.reason));
+  }
+  DB.set('chats', allChats);
+  if (render) {
+    renderMessages();
+    showScreen('chat');
+  }
+  return { ok: true, pending: !!nativeOutcome?.pending, control: nativeOutcome?.control || null, cleanupWarnings };
+}
 async function clearCurrentChat() {
   if (!currentCharId || !confirm('清空当前聊天？')) return;
-  const char = characters.find(c => c.id === currentCharId);
-  const old = allChats[currentCharId] || {};
-  await Promise.all([
-    cancelCloudProactiveQuick(currentCharId, '清空当前聊天'),
-    invalidateMemoryExtraction(currentCharId)
-  ]);
-  allChats[currentCharId] = { messages: [chatClearedSystemMessage(char)], charPrompt: buildCharPrompt(char), extraPrompt: old.extraPrompt || '', unread: 0, pinned: !!old.pinned, muted: !!old.muted };
-  await MemoryDB.setMeta(memoryMetaKey(currentCharId), 0);
-  await setMemoryExtractStatus(currentCharId, 'idle', '聊天已清空，增量整理游标已复位。', { processedTo: 0, batchSize: 0 });
-  DB.set('chats', allChats);
-  renderMessages();
-  showScreen('chat');
+  const outcome = await clearConversationForCharacter(currentCharId, { render: true });
+  if (outcome.ok) toast(outcome.cleanupWarnings?.length ? '已清空，部分本地缓存清理待重试' : (outcome.pending ? '清除请求已提交，正在等待原生确认' : '已清空'));
+  else toast('清空失败，聊天记录未改动');
 }
 async function deleteCurrentRole() {
   if (!currentCharId || !confirm('删除这个角色？会同时删除它的聊天、云闹钟、本地记忆库和朋友圈痕迹。')) return;
@@ -12419,16 +12553,20 @@ function openCurrentProfile() {
 async function clearAllHistory() {
   if (!confirm('清空全部聊天记录？')) return;
   const clearedCharIds = Object.keys(allChats);
-  await Promise.allSettled(clearedCharIds.map(charId => invalidateMemoryExtraction(charId)));
-  await Promise.allSettled(clearedCharIds.flatMap(charId => [
-    cancelCloudProactiveQuick(charId, '清空全部聊天'),
-    MemoryDB.setMeta(memoryMetaKey(charId), 0),
-    setMemoryExtractStatus(charId, 'idle', '全部聊天记录已清空，增量整理游标已复位。', { processedTo: 0, batchSize: 0 })
-  ]));
-  allChats = {};
+  if (!isNativeApp()) {
+    const desktopResults = await runNativeClearAllSerial(clearedCharIds, charId => clearConversationForCharacter(charId));
+    const desktopFailures = desktopResults.filter(result => !result.ok);
+    DB.set('chats', allChats);
+    renderChats();
+    toast(desktopFailures.length ? `部分角色清除失败（${desktopFailures.length} 个）` : '已清空');
+    return;
+  }
+  const results = await runNativeClearAllSerial(clearedCharIds, charId => clearConversationForCharacter(charId));
+  const failures = results.filter(result => !result.ok);
+  const warnings = results.reduce((count, result) => count + (result.cleanupWarnings?.length || 0), 0);
   DB.set('chats', allChats);
   renderChats();
-  toast('已清空');
+  toast(failures.length ? `部分角色清除失败（${failures.length} 个），失败角色数据已保留` : (warnings ? '已清空，部分本地缓存清理待重试' : '已清空'));
 }
 
 async function syncFromServiceWorkerState(options = {}) {

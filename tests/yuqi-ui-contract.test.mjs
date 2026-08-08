@@ -237,11 +237,12 @@ test('every manual retry anchors to the original deterministic message turn', ()
 test('Room persists fresh retry turns and only deduplicates an exact turn id', () => {
   assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
   assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
-  assert.match(executionDatabase, /version\s*=\s*12/);
+  assert.match(executionDatabase, /version\s*=\s*13/);
   assert.match(executionDatabase, /new Migration\(8,\s*9\)/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
-  assert.match(executionDatabase, /MIGRATION_9_10,\s*MIGRATION_10_11,\s*MIGRATION_11_12/);
+  assert.match(executionDatabase, /MIGRATION_12_13/);
+  assert.match(executionDatabase, /MIGRATION_9_10,\s*MIGRATION_10_11,\s*MIGRATION_11_12,\s*MIGRATION_12_13/);
   assert.match(executionDatabase, /DROP INDEX IF EXISTS `index_chat_turns_sourceMessageId`/);
   assert.match(executionDatabase, /CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId`/);
   const submit = executionStore.slice(
@@ -260,6 +261,40 @@ test('native retry is accepted only when Room returns the requested turn id', ()
     retry.indexOf("String(result?.turnId || '') !== turnId") < retry.indexOf('nativeAcceptedAt'),
     'a mismatched native turn must be rejected before the retry is marked accepted'
   );
+});
+
+test('Android chat clear is native-first and does not use the desktop localStorage path', () => {
+  const clear = html.slice(html.indexOf('async function getYuqiClearCursorForClear'), html.indexOf('async function deleteCurrentRole'));
+  assert.match(clear, /getConversationCursor/);
+  assert.match(clear, /createConversationClear/);
+  assert.ok(clear.indexOf('getConversationCursor') < clear.indexOf('createConversationClear'));
+  assert.ok(clear.indexOf('createConversationClear') < clear.indexOf('DB.set'));
+  assert.match(clear, /expectedCursorChecksum/);
+  assert.match(clear, /catch[\s\S]{0,500}(?:失败|pending|等待)/i);
+  assert.match(clear, /isNativeApp\(\)/);
+});
+
+test('clear-all history is explicitly serial and reports per-role failures', () => {
+  const clearAll = html.slice(html.indexOf('async function clearAllHistory'), html.indexOf('async function syncFromServiceWorkerState'));
+  assert.match(clearAll, /runNativeClearAllSerial\(clearedCharIds/);
+  assert.doesNotMatch(clearAll, /Promise\.all/);
+  assert.doesNotMatch(clearAll, /allChats\s*=\s*\{\}/);
+  assert.match(clearAll, /DB\.set\('chats', allChats\)/);
+  assert.match(clearAll, /failed|失败|partial|部分/i);
+});
+
+test('native late results are cursor-gated before UI application', () => {
+  const apply = html.slice(html.indexOf('async function applyNativeExecutionTurnUnlocked'), html.indexOf('function applyNativeExecutionTurn(result)'));
+  assert.match(apply, /getConversationCursor|nativeResultSuppressedByClear/);
+  const gateAt = Math.min(...['getConversationCursor', 'nativeResultSuppressedByClear'].map(token => {
+    const index = apply.indexOf(token);
+    return index < 0 ? Number.POSITIVE_INFINITY : index;
+  }));
+  const writeAt = Math.min(...['nativeTerminalDispositionLanding', 'appendNativeReplyTextParts', 'createCharacterMoment'].map(token => {
+    const index = apply.indexOf(token);
+    return index < 0 ? Number.POSITIVE_INFINITY : index;
+  }));
+  assert.ok(gateAt < writeAt, 'cursor suppression must run before DOM/cache writes');
 });
 
 test('a completed retry ancestor wins over its pending descendant', () => {
@@ -327,10 +362,11 @@ test('native completed turns are serialized across submit, poll, inbox, and fore
 });
 
 test('native delivery diagnostics persist and expose four independent convergence stages', () => {
-  assert.match(executionDatabase, /version\s*=\s*12/);
+  assert.match(executionDatabase, /version\s*=\s*13/);
   assert.match(executionDatabase, /MIGRATION_9_10/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
+  assert.match(executionDatabase, /MIGRATION_12_13/);
   assert.match(chatTurnEntity, /Long\s+notificationShownAt/);
   assert.match(chatTurnEntity, /Long\s+cloudConfirmedAt/);
   assert.match(executionDao, /markNotificationShown/);

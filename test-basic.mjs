@@ -109,10 +109,10 @@ assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS run
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopService\(/, 'clearing automatic tasks must not stop the 24-hour background guard');
-for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
+for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'getConversationCursor', 'createConversationClear', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*12[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9[\s\S]*MIGRATION_9_10[\s\S]*MIGRATION_10_11[\s\S]*MIGRATION_11_12/, 'Room must migrate existing installs through the conversation-authority and bridge-checkpoint schemas without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*13[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9[\s\S]*MIGRATION_9_10[\s\S]*MIGRATION_10_11[\s\S]*MIGRATION_11_12[\s\S]*MIGRATION_12_13/, 'Room must migrate existing installs through the conversation-authority, bridge-checkpoint, and lifecycle-control schemas without destructive reset');
 assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors[\s\S]*yuqi_annotations/, 'Room v7 must retain raw messages, evidence facts, sync cursors, and annotations on the phone');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
@@ -157,7 +157,7 @@ assert.match(html, /async function reconcileNativeExecutionTurns[\s\S]{0,2500}pl
 assert.match(retryPolicy, /SocketException[\s\S]*NETWORK_INTERRUPTED[\s\S]*true/, 'native execution must retain retryable connection interruptions');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_CHAT/, 'native proactive chat results must be applied to chat UI');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_MOMENT/, 'native proactive moment results must be applied to moments UI');
-assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,1800}ROLE_PLAN_CHAT/, 'native role-plan results must be applied through the durable UI inbox');
+assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,3000}ROLE_PLAN_CHAT/, 'native role-plan results must be applied through the durable UI inbox');
 const foregroundSyncSource = html.slice(
   html.indexOf('async function syncFromServiceWorkerState('),
   html.indexOf('async function bootApp()')
@@ -344,7 +344,7 @@ assert.match(script, /const batchEnd = chat\.messages\.length;/);
 assert.match(script, /MemoryDB\.setMeta\(memoryMetaKey\(charId\), batchEnd\)/);
 assert.doesNotMatch(script, /MemoryDB\.setMeta\(memoryMetaKey\(charId\), chat\.messages\.length\)/);
 assert.match(script, /游标未前移，下次会重试同一批/);
-assert.match(script, /invalidateMemoryExtraction\(currentCharId\)/);
+assert.match(script, /invalidateMemoryExtraction\(charId\)/);
 assert.match(script, /item\.manual = true;/);
 assert.match(script, /await upsertMemoryItem\('profiles', item, profileRows\)/);
 assert.match(script, /await upsertMemoryItem\('events', item, eventRows\)/);
@@ -630,16 +630,17 @@ assert.match(script, /function removeCharacterMomentTraces\(charId\)/);
 assert.match(script, /async function cancelCloudProactiveQuick\(charId, reason = '操作'\)/);
 assert.match(script, /await withTimeout\(cancelCloudProactive\(charId, 'all'\), 8000, `\$\{reason\}取消云闹钟超时`\)/);
 assert.match(script, /async function clearCurrentChat\(\)/);
-assert.match(script, /cancelCloudProactiveQuick\(currentCharId, '清空当前聊天'\)/);
-assert.match(script, /invalidateMemoryExtraction\(currentCharId\)/);
-assert.match(script, /MemoryDB\.setMeta\(memoryMetaKey\(currentCharId\), 0\)/);
+assert.match(script, /async function nativeFirstConversationClear\(/);
+assert.match(script, /async function clearConversationForCharacter\([\s\S]*nativeFirstConversationClear\(/);
+assert.match(script, /clearConversationForCharacter\(currentCharId, \{ render: true \}\)/);
+assert.match(script, /MemoryDB\.setMeta\(memoryMetaKey\(charId\), 0\)/);
 assert.match(script, /聊天已清空，增量整理游标已复位/);
 assert.match(script, /messages: \[chatClearedSystemMessage\(char\)\]/);
 assert.doesNotMatch(script, /role:'assistant', content:char\.firstMessage/);
 assert.match(script, /async function deleteCurrentRole\(\)/);
 assert.match(script, /cancelCloudProactiveQuick\(deletedId, '删除角色'\)/);
 assert.match(script, /async function clearAllHistory\(\)/);
-assert.match(script, /cancelCloudProactiveQuick\(charId, '清空全部聊天'\)/);
+assert.match(script, /runNativeClearAllSerial\(clearedCharIds, charId => clearConversationForCharacter\(charId\)\)/);
 assert.match(script, /MemoryDB\.clearChar\(deletedId\)/);
 assert.match(script, /removeCharacterMomentTraces\(deletedId\)/);
 assert.match(script, /会同时删除它的聊天、云闹钟、本地记忆库和朋友圈痕迹/);
@@ -2707,5 +2708,254 @@ assert.equal(JSON.parse(storage.get('rpchat_settings')).chatApiUrl, 'https://cha
 assert.equal(JSON.parse(storage.get('rpchat_settings')).memoryApiUrl, 'https://memory.example/v1');
 assert.equal(JSON.parse(storage.get('rpchat_settings')).chatApiKey, 'sk-chat');
 assert.equal(JSON.parse(storage.get('rpchat_settings')).memoryApiKey, 'sk-memory');
+
+const task20eSourceBetween = (startToken, endToken) => {
+  const start = html.indexOf(startToken);
+  const end = html.indexOf(endToken, start + startToken.length);
+  assert.ok(start >= 0, `missing ${startToken}`);
+  assert.ok(end > start, `missing ${endToken}`);
+  return html.slice(start, end);
+};
+const unknownCursorSource = task20eSourceBetween('function unknownYuqiVisibilityCursor', 'function normalizeYuqiVisibilityCursor');
+const normalizeCursorSource = task20eSourceBetween('function normalizeYuqiVisibilityCursor', 'async function getYuqiVisibilityCursor');
+const clearSupportSource = task20eSourceBetween('const YUQI_CLEAR_CURSOR_KEYS', 'async function getYuqiClearCursorForClear');
+const nativeFirstClearSource = `${unknownCursorSource}\n${normalizeCursorSource}\n${clearSupportSource}\n${task20eSourceBetween('async function nativeFirstConversationClear', 'async function runNativeClearAllSerial')}`;
+const nativeFirstCursorCalls = [];
+const nativeFirstCreateCalls = [];
+let nativeFirstLocalApplied = 0;
+const nativeFirstClear = new Function(
+  'getYuqiClearCursorForClear',
+  'nativeBridgeCall',
+  `${nativeFirstClearSource}; return nativeFirstConversationClear;`
+)(async characterId => {
+  nativeFirstCursorCalls.push(characterId);
+  return { cursorChecksum: 'a'.repeat(64) };
+}, async promise => promise);
+const nativeFirstOutcome = await nativeFirstClear('yuqi', {
+  plugin: { getConversationCursor: async () => ({}), createConversationClear: async value => {
+    nativeFirstCreateCalls.push(value);
+    return {
+      characterId: 'yuqi', nativeCompletedTurnId: null, nativeCompletedGroupId: null, nativeCompletedSequence: 0,
+      uiAppliedTurnId: null, uiAppliedGroupId: null, uiAppliedSequence: 0, localSequence: 0,
+      clearedThroughSequence: 0, clearEpoch: 1, clearedAt: 0, chatOpen: false, updatedAt: 0,
+      cursorChecksum: '1'.repeat(64), controlId: `ctl_${'1'.repeat(64)}`, state: 'waiting'
+    };
+  } },
+  applyLocal: async () => { nativeFirstLocalApplied += 1; }
+});
+assert.deepEqual(nativeFirstCursorCalls, ['yuqi']);
+assert.deepEqual(nativeFirstCreateCalls, [{ characterId: 'yuqi', expectedCursorChecksum: 'a'.repeat(64) }]);
+assert.equal(nativeFirstLocalApplied, 1);
+assert.equal(nativeFirstOutcome.pending, true);
+
+for (const createConversationClear of [
+  async () => { throw new Error('native rejected'); },
+  () => new Promise(() => {})
+]) {
+  const rejectedClear = new Function(
+    'getYuqiClearCursorForClear',
+    'nativeBridgeCall',
+    `${nativeFirstClearSource}; return nativeFirstConversationClear;`
+  )(async () => ({ cursorChecksum: 'b'.repeat(64) }), async promise => promise);
+  let localApplied = 0;
+  const outcome = rejectedClear('yuqi', {
+    plugin: { getConversationCursor: async () => ({}), createConversationClear },
+    applyLocal: async () => { localApplied += 1; }
+  });
+  if (createConversationClear.toString().includes('new Promise')) {
+    await assert.rejects(Promise.race([
+      outcome,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('suspended')), 20))
+    ]), /suspended/);
+  } else {
+    await assert.rejects(outcome, /native rejected/);
+  }
+  assert.equal(localApplied, 0);
+}
+
+const serialClearSource = task20eSourceBetween('async function runNativeClearAllSerial', 'async function nativeResultSuppressedByClear');
+const serialClearRunner = new Function(`${serialClearSource}; return runNativeClearAllSerial;`)();
+const serialEvents = [];
+const serialResults = await serialClearRunner(['a', 'b', 'c'], async characterId => {
+  serialEvents.push(`start:${characterId}`);
+  await new Promise(resolve => setTimeout(resolve, characterId === 'a' ? 5 : 0));
+  if (characterId === 'b') throw new Error('native rejected');
+  serialEvents.push(`done:${characterId}`);
+  return { characterId, ok: true };
+});
+assert.deepEqual(serialEvents, ['start:a', 'done:a', 'start:b', 'start:c', 'done:c']);
+assert.deepEqual(serialResults.map(result => result.characterId), ['a', 'b', 'c']);
+assert.equal(serialResults[1].ok, false);
+assert.match(serialResults[1].error, /native rejected/);
+
+const lateSuppressionSource = task20eSourceBetween('async function nativeResultSuppressedByClear', 'function withCognitionV2Snapshot');
+const lateSuppression = new Function(
+  'isNativeApp',
+  'nativeExecutionPlugin',
+  'getYuqiClearCursorForClear',
+  `${lateSuppressionSource}; return nativeResultSuppressedByClear;`
+)(() => true, () => ({ getConversationCursor: true }), async () => ({
+  cursor: { clearEpoch: 2, clearedThroughSequence: 4 }, cursorChecksum: 'c'.repeat(64)
+}));
+assert.equal(await lateSuppression({ characterId: 'yuqi', inputClearEpoch: 1, inputVisibilitySequence: 99 }), true);
+assert.equal(await lateSuppression({ characterId: 'yuqi', inputClearEpoch: 2, inputVisibilitySequence: 4 }), true);
+assert.equal(await lateSuppression({ characterId: 'yuqi', inputClearEpoch: 2, inputVisibilitySequence: 5 }), false);
+assert.equal(await lateSuppression({ characterId: 'yuqi' }), true);
+assert.equal(await lateSuppression({ characterId: 'yuqi', inputClearEpoch: 3, inputVisibilitySequence: 5 }), true);
+
+const bootstrapSuppression = new Function(
+  'isNativeApp',
+  'nativeExecutionPlugin',
+  'getYuqiClearCursorForClear',
+  `${lateSuppressionSource}; return nativeResultSuppressedByClear;`
+)(() => true, () => ({ getConversationCursor: true }), async () => ({
+  cursor: { clearEpoch: 0, clearedThroughSequence: 0 }, cursorChecksum: '0'.repeat(64)
+}));
+assert.equal(await bootstrapSuppression({ characterId: 'yuqi', inputClearEpoch: 0, inputVisibilitySequence: 0 }), false);
+
+const clearCursorSource = task20eSourceBetween('const YUQI_CLEAR_CURSOR_KEYS', 'async function nativeFirstConversationClear');
+const clearCursorReader = new Function(
+  'nativeBridgeCall',
+  `${unknownCursorSource}\n${normalizeCursorSource}\n${clearCursorSource}; return getYuqiClearCursorForClear;`
+)(async promise => promise);
+const exactClearCursor = {
+  characterId: 'yuqi',
+  nativeCompletedTurnId: null,
+  nativeCompletedGroupId: null,
+  nativeCompletedSequence: 0,
+  uiAppliedTurnId: null,
+  uiAppliedGroupId: null,
+  uiAppliedSequence: 0,
+  localSequence: 0,
+  clearedThroughSequence: 0,
+  clearEpoch: 0,
+  clearedAt: 0,
+  chatOpen: false,
+  updatedAt: 0,
+  cursorChecksum: '0'.repeat(64)
+};
+assert.equal((await clearCursorReader('yuqi', { getConversationCursor: async () => exactClearCursor })).cursorChecksum, exactClearCursor.cursorChecksum);
+for (const invalidCursor of [
+  Object.fromEntries(Object.entries(exactClearCursor).filter(([key]) => key !== 'updatedAt')),
+  { ...exactClearCursor, extra: true },
+  { ...exactClearCursor, characterId: 'other' },
+  { ...exactClearCursor, nativeCompletedSequence: '0' }
+]) {
+  await assert.rejects(
+    clearCursorReader('yuqi', { getConversationCursor: async () => invalidCursor }),
+    /invalid native cursor/
+  );
+}
+
+const clearResponseValidatorSource = nativeFirstClearSource;
+const clearResponseValidator = new Function(
+  'getYuqiClearCursorForClear',
+  'nativeBridgeCall',
+  `${unknownCursorSource}\n${normalizeCursorSource}\n${clearResponseValidatorSource}; return nativeFirstConversationClear;`
+)(async () => ({ cursorChecksum: 'a'.repeat(64) }), async promise => promise);
+const validClearControl = {
+  characterId: 'yuqi',
+  nativeCompletedTurnId: null,
+  nativeCompletedGroupId: null,
+  nativeCompletedSequence: 0,
+  uiAppliedTurnId: null,
+  uiAppliedGroupId: null,
+  uiAppliedSequence: 0,
+  localSequence: 0,
+  clearedThroughSequence: 0,
+  clearedAt: 0,
+  chatOpen: false,
+  updatedAt: 0,
+  cursorChecksum: '1'.repeat(64),
+  controlId: `ctl_${'a'.repeat(64)}`,
+  clearEpoch: 1,
+  state: 'waiting'
+};
+const validClearResult = await clearResponseValidator('yuqi', {
+  plugin: { getConversationCursor: async () => ({}), createConversationClear: async () => validClearControl }
+});
+assert.equal(validClearResult.control.controlId, validClearControl.controlId);
+for (const invalidControl of [
+  { ...validClearControl, characterId: 'other' },
+  { ...validClearControl, controlId: 'ctl_bad' },
+  { ...validClearControl, clearEpoch: 0 },
+  { ...validClearControl, clearedThroughSequence: -1 },
+  { ...validClearControl, state: 'unknown' }
+]) {
+  await assert.rejects(
+    clearResponseValidator('yuqi', {
+      plugin: { getConversationCursor: async () => ({}), createConversationClear: async () => invalidControl }
+    }),
+    /native clear response|native clear was not accepted/
+  );
+}
+
+const clearConversationSource = task20eSourceBetween('async function clearConversationForCharacter', 'async function clearCurrentChat');
+const clearConversationDeps = {
+  characters: [{ id: 'yuqi', name: 'Yuqi' }],
+  allChats: { yuqi: { messages: [{ role: 'user', content: 'keep until native commit' }], extraPrompt: 'extra' } },
+  dbWrites: 0,
+  nativeFirstConversationClear: async () => ({ control: { controlId: 'ctl_2', state: 'waiting' }, pending: true })
+};
+const clearConversationProbe = new Function(
+  'characters', 'allChats', 'isNativeApp', 'nativeExecutionPlugin', 'nativeFirstConversationClear',
+  'cancelCloudProactiveQuick', 'invalidateMemoryExtraction', 'MemoryDB', 'chatClearedSystemMessage',
+  'buildCharPrompt', 'memoryMetaKey', 'setMemoryExtractStatus', 'DB', 'renderMessages', 'showScreen',
+  `${clearConversationSource}; return clearConversationForCharacter;`
+)(
+  clearConversationDeps.characters,
+  clearConversationDeps.allChats,
+  () => true,
+  () => ({ getConversationCursor: true, createConversationClear: true }),
+  clearConversationDeps.nativeFirstConversationClear,
+  async () => { throw new Error('cancel cleanup unavailable'); },
+  async () => { throw new Error('memory extraction cleanup unavailable'); },
+  {
+    clearChar: async () => { throw new Error('memory cache cleanup unavailable'); },
+    setMeta: async () => { throw new Error('memory meta cleanup unavailable'); }
+  },
+  char => ({ role: 'system', content: `cleared ${char.name}` }),
+  () => 'prompt',
+  () => 'meta',
+  async () => true,
+  { set: () => { clearConversationDeps.dbWrites += 1; } },
+  () => {},
+  () => {}
+);
+const cleanupWarningOutcome = await clearConversationProbe('yuqi');
+assert.equal(cleanupWarningOutcome.ok, true);
+assert.equal(cleanupWarningOutcome.pending, true);
+assert.ok(cleanupWarningOutcome.cleanupWarnings.length >= 3);
+assert.equal(clearConversationDeps.allChats.yuqi.messages[0].role, 'system');
+assert.equal(clearConversationDeps.dbWrites, 1);
+
+const desktopChats = { good: { messages: ['old-good'] }, failed: { messages: ['old-failed'] } };
+let desktopPersisted = null;
+const desktopClearAllSource = task20eSourceBetween('async function clearAllHistory', 'async function syncFromServiceWorkerState');
+const desktopClearAll = new Function(
+  'allChats', 'confirm', 'isNativeApp', 'runNativeClearAllSerial', 'clearConversationForCharacter', 'DB', 'renderChats', 'toast',
+  `${desktopClearAllSource}; return clearAllHistory;`
+)(
+  desktopChats,
+  () => true,
+  () => false,
+  async (ids, clearOne) => {
+    const results = [];
+    for (const id of ids) results.push({ characterId: id, ...(await clearOne(id)) });
+    return results;
+  },
+  async id => {
+    if (id === 'failed') return { ok: false, error: 'desktop failure' };
+    desktopChats[id] = { messages: ['cleared'] };
+    return { ok: true };
+  },
+  { set: (_key, value) => { desktopPersisted = value; } },
+  () => {},
+  () => {}
+);
+await desktopClearAll();
+assert.deepEqual(desktopChats.good, { messages: ['cleared'] });
+assert.deepEqual(desktopChats.failed, { messages: ['old-failed'] });
+assert.equal(desktopPersisted, desktopChats);
 
 console.log('basic app checks passed');
