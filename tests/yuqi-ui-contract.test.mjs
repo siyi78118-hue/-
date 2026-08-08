@@ -274,6 +274,23 @@ test('Android chat clear is native-first and does not use the desktop localStora
   assert.match(clear, /isNativeApp\(\)/);
 });
 
+test('Android clear durably prearms lifecycle recovery before its Room transaction commits', () => {
+  const pluginClear = plugin.slice(
+    plugin.indexOf('void createConversationClear(PluginCall call)'),
+    plugin.indexOf('@PluginMethod', plugin.indexOf('void createConversationClear(PluginCall call)') + 1)
+  );
+  assert.match(pluginClear, /createConversationClear\([\s\S]{0,300}prearmLifecycle/);
+  assert.ok(pluginClear.indexOf('prearmLifecycle') < pluginClear.indexOf('requestRun'));
+
+  const nativeClear = executionStore.slice(
+    executionStore.indexOf('LifecycleControl createConversationClear('),
+    executionStore.indexOf('private static LifecycleControlEntity encodedToEntity')
+  );
+  assert.match(nativeClear, /database\.runInTransaction\([\s\S]*durableWakePrearm\.run\(\)/);
+  assert.equal(nativeClear.match(/durableWakePrearm\.run\(\)/g)?.length, 2);
+  assert.ok(nativeClear.indexOf('insertLifecycleControl') < nativeClear.lastIndexOf('durableWakePrearm.run()'));
+});
+
 test('clear-all history is explicitly serial and reports per-role failures', () => {
   const clearAll = html.slice(html.indexOf('async function clearAllHistory'), html.indexOf('async function syncFromServiceWorkerState'));
   assert.match(clearAll, /runNativeClearAllSerial\(clearedCharIds/);

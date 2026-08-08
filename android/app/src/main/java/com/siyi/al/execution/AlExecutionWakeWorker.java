@@ -8,16 +8,20 @@ import androidx.work.Constraints;
 import androidx.work.ExistingWorkPolicy;
 import androidx.work.NetworkType;
 import androidx.work.OneTimeWorkRequest;
+import androidx.work.Operation;
 import androidx.work.OutOfQuotaPolicy;
 import androidx.work.WorkManager;
 import androidx.work.Worker;
 import androidx.work.WorkerParameters;
 import androidx.work.Data;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public final class AlExecutionWakeWorker extends Worker {
     private static final String WORK_NAME = "al-execution-wake";
     private static final String LIFECYCLE_WORK_NAME = "al-execution-lifecycle-wake";
+    private static final String LIFECYCLE_PREARM_WORK_NAME = "al-execution-lifecycle-prearm";
 
     public AlExecutionWakeWorker(@NonNull Context context, @NonNull WorkerParameters params) {
         super(context, params);
@@ -66,6 +70,7 @@ public final class AlExecutionWakeWorker extends Worker {
 
     static String lifecycleWorkName() { return LIFECYCLE_WORK_NAME; }
     static String generalWorkName() { return WORK_NAME; }
+    static String lifecyclePrearmWorkName() { return LIFECYCLE_PREARM_WORK_NAME; }
 
     public static void enqueue(Context context, long delaySeconds) {
         enqueue(context, delaySeconds, null);
@@ -80,12 +85,30 @@ public final class AlExecutionWakeWorker extends Worker {
         enqueueInternal(context, delaySeconds, null, LIFECYCLE_WORK_NAME);
     }
 
+    /**
+     * Durably records an independent near-term lifecycle wake before the Room
+     * transaction that created the lifecycle control is allowed to commit.
+     * The worker cannot observe the control until that transaction commits;
+     * if the transaction rolls back, the prearmed wake is harmless.
+     */
+    public static void prearmLifecycle(Context context) {
+        Operation operation = enqueueInternal(context, 5L, null, LIFECYCLE_PREARM_WORK_NAME);
+        try {
+            operation.getResult().get(10L, TimeUnit.SECONDS);
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("lifecycle wake prearm interrupted", error);
+        } catch (ExecutionException | TimeoutException error) {
+            throw new IllegalStateException("lifecycle wake prearm failed", error);
+        }
+    }
+
     private static void enqueue(Context context, long delaySeconds, Data input) {
         enqueueInternal(context, delaySeconds, input,
             input == null ? WORK_NAME : WORK_NAME + "-" + input.getString("planId"));
     }
 
-    private static void enqueueInternal(Context context, long delaySeconds, Data input, String uniqueName) {
+    private static Operation enqueueInternal(Context context, long delaySeconds, Data input, String uniqueName) {
         Constraints constraints = new Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build();
@@ -97,7 +120,7 @@ public final class AlExecutionWakeWorker extends Worker {
             builder.setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST);
         }
         if (delaySeconds > 0) builder.setInitialDelay(delaySeconds, TimeUnit.SECONDS);
-        WorkManager.getInstance(context.getApplicationContext()).enqueueUniqueWork(
+        return WorkManager.getInstance(context.getApplicationContext()).enqueueUniqueWork(
             uniqueName,
             ExistingWorkPolicy.REPLACE,
             builder.build()
@@ -107,5 +130,6 @@ public final class AlExecutionWakeWorker extends Worker {
     public static void cancel(Context context) {
         WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(WORK_NAME);
         WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(LIFECYCLE_WORK_NAME);
+        WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(LIFECYCLE_PREARM_WORK_NAME);
     }
 }

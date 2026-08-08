@@ -1390,6 +1390,14 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     @Override
     public LifecycleControl createConversationClear(String characterId, String expectedCursorChecksum) {
+        return createConversationClear(characterId, expectedCursorChecksum, null);
+    }
+
+    public LifecycleControl createConversationClear(
+        String characterId,
+        String expectedCursorChecksum,
+        Runnable durableWakePrearm
+    ) {
         if (storeOwnedPeerId == null || storeOwnedPeerId.isEmpty()) {
             throw new IllegalStateException("store-owned bridge peer is not configured");
         }
@@ -1397,7 +1405,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             throw new IllegalArgumentException("expected cursor checksum is invalid");
         }
         return createConversationClear(characterId, storeOwnedPeerId, expectedCursorChecksum,
-            System.currentTimeMillis());
+            System.currentTimeMillis(), durableWakePrearm);
     }
 
     public static String conversationCursorChecksum(String characterId, ConversationCursorEntity cursor) {
@@ -1432,6 +1440,17 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         String peerId,
         String expectedCursorChecksum,
         long requestedAt
+    ) {
+        return createConversationClear(
+            characterId, peerId, expectedCursorChecksum, requestedAt, null);
+    }
+
+    LifecycleControl createConversationClear(
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        long requestedAt,
+        Runnable durableWakePrearm
     ) {
         String safeCharacterId = requireCharacterId(characterId);
         if (peerId == null || peerId.trim().isEmpty() || !peerId.equals(peerId.trim())) {
@@ -1478,6 +1497,10 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                     throw new IllegalStateException("conversation clear identity conflict");
                 }
                 if (replayPreClear || !LifecycleControl.APPLIED.equals(existing.state)) {
+                    if (!LifecycleControl.APPLIED.equals(existing.state)
+                        && durableWakePrearm != null) {
+                        durableWakePrearm.run();
+                    }
                     result.set(LifecycleControl.fromEntity(existing));
                     return;
                 }
@@ -1629,6 +1652,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
             terminalFaultHook.after("lifecycle_control");
             dao.clearReplyPartsThroughSequence(safeCharacterId, clearedThroughSequence);
+            if (durableWakePrearm != null) durableWakePrearm.run();
             result.set(LifecycleControl.fromEntity(row));
         });
         return result.get();

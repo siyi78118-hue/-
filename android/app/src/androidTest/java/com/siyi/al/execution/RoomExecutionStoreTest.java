@@ -2556,6 +2556,37 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void durableWakePrearmRunsInsideClearTransactionAndFailureRollsEverythingBack()
+        throws Exception {
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        ConversationCursorEntity initial = new ConversationCursorEntity();
+        String checksum = RoomExecutionStore.conversationCursorChecksum("yuqi", initial);
+
+        assertThrows(IllegalStateException.class, () -> configured.createConversationClear(
+            "yuqi", "device_gateway", checksum, 400L,
+            () -> { throw new IllegalStateException("durable wake prearm failed"); }));
+        assertEquals(0L, rowCount("lifecycle_controls"));
+        assertNull(database.executionDao().conversationCursor("yuqi"));
+
+        boolean[] sawPersistedControl = {false};
+        LifecycleControl created = configured.createConversationClear(
+            "yuqi", "device_gateway", checksum, 401L,
+            () -> sawPersistedControl[0] = rowCount("lifecycle_controls") == 1L);
+        assertTrue(sawPersistedControl[0]);
+        assertNotNull(database.executionDao().lifecycleControl(created.controlId));
+
+        ConversationCursorEntity after = database.executionDao().conversationCursor("yuqi");
+        boolean[] replayPrearmed = {false};
+        LifecycleControl replay = configured.createConversationClear(
+            "yuqi", "device_gateway",
+            RoomExecutionStore.conversationCursorChecksum("yuqi", after), 402L,
+            () -> replayPrearmed[0] = true);
+        assertTrue(replayPrearmed[0]);
+        assertEquals(created.controlId, replay.controlId);
+        assertEquals(1L, rowCount("lifecycle_controls"));
+    }
+
+    @Test
     public void storeOwnedConversationClearCreatesOneControlAndRedactsCheckpointAtomically()
         throws Exception {
         CanonicalFixture fixture = commitCanonicalFixture("task20b-clear", "visible", 410L);

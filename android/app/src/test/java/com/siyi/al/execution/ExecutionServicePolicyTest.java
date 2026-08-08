@@ -102,6 +102,14 @@ public class ExecutionServicePolicyTest {
             .equals(AlExecutionWakeWorker.generalWorkName()));
     }
 
+    @Test
+    public void lifecyclePrearmUsesAThirdIndependentDurableWorkName() {
+        assertFalse(AlExecutionWakeWorker.lifecyclePrearmWorkName()
+            .equals(AlExecutionWakeWorker.generalWorkName()));
+        assertFalse(AlExecutionWakeWorker.lifecyclePrearmWorkName()
+            .equals(AlExecutionWakeWorker.lifecycleWorkName()));
+    }
+
     private static String repeat(char value) {
         StringBuilder result = new StringBuilder();
         for (int index = 0; index < 64; index += 1) result.append(value);

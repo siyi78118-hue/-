@@ -458,7 +458,11 @@ public final class AlExecutionPlugin extends Plugin {
             if (expectedCursorChecksum == null || expectedCursorChecksum.trim().isEmpty()) {
                 throw new IllegalArgumentException("expectedCursorChecksum is required");
             }
-            LifecycleControl control = store.createConversationClear(characterId, expectedCursorChecksum);
+            LifecycleControl control = store.createConversationClear(
+                characterId,
+                expectedCursorChecksum,
+                () -> AlExecutionWakeWorker.prearmLifecycle(getContext())
+            );
             AlExecutionService.requestRun(getContext());
             JSObject result = conversationCursorResult(characterId, store.getConversationCursor(characterId));
             result.put("controlId", control.controlId);
