@@ -14,9 +14,14 @@ function immersiveStage(stage, terminal) {
 }
 
 export function publicTurnStatus(turn, {
-  stages = [], canonicalResult = null, canonicalFailure = null, wireVersion = null, clock = Date.now
+  stages = [], canonicalResult = null, canonicalFailure = null, wireVersion = null,
+  clock = Date.now
 } = {}) {
   if (!turn) return null;
+  if (turn.authorityRedactedAt != null
+    || parseStoredJson(turn.envelopeJson)?.redacted === true) {
+    throw new Error('validated legacy redaction authority required');
+  }
   const committed = ['committed', 'delivered', 'completed'].includes(turn.state);
   const failed = ['failed', 'fallback'].includes(turn.state);
   const authoritativeVersion = Number(turn.resultAuthorityVersion) === 1;

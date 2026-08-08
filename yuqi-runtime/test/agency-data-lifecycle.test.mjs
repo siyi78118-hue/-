@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { copyFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
@@ -6,7 +7,9 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
+import { stableId } from '../src/cloud-relay-pump.mjs';
 import { generationFingerprint } from '../src/interaction-lanes.mjs';
+import { publicTurnStatus } from '../src/turn-status.mjs';
 import {
   canonicalJson,
   contentHash,
@@ -589,12 +592,14 @@ function canonicalRedactionEnvelope(index, { retryOfTurnId = null, roleId = 'yuq
   return envelope;
 }
 
-function legacyV2AboveEnvelope(turnId = 'turn_legacy_above') {
+function legacyV2AboveEnvelope(
+  turnId = 'turn_legacy_above', roleId = 'yuqi', deviceId = 'device1'
+) {
   return {
     protocolVersion: 2,
     turnId,
-    characterId: 'yuqi',
-    deviceId: 'device1',
+    characterId: roleId,
+    deviceId,
     deviceSeq: 3,
     createdAt: 1784400020003,
     kind: 'DIRECT_REPLY',
@@ -602,7 +607,7 @@ function legacyV2AboveEnvelope(turnId = 'turn_legacy_above') {
       messageId: 'msg_legacy_above',
       speakerId: 'user',
       speakerType: 'user',
-      recipientId: 'yuqi',
+      recipientId: roleId,
       content: 'legacy above boundary',
       sentAt: 1784400010030
     }
@@ -756,12 +761,19 @@ function createCanonicalRedactionFixture(store, {
     }),
     now: 1784400021000
   });
-  const aboveInput = legacyV2AboveEnvelope();
+  if (!store.getInteractionLane('other', 'private_chat')) {
+    store.claimInteractionLaneInternal({
+      roleId: 'other', laneKey: 'private_chat', expectedRevision: 0,
+      clearEpoch: 0, clearedThroughSequence: 0, localSequence: 0,
+      now: 1784400000000
+    });
+  }
+  const aboveInput = legacyV2AboveEnvelope('turn_legacy_above', 'other', 'device_other_above');
   const above = store.createTurnWithReleasePinInternal({
     envelope: aboveInput,
     rolloutKey: 'DIRECT_REPLY',
     laneKey: 'private_chat',
-    expectedLaneRevision: Number(store.getInteractionLane('yuqi', 'private_chat').revision),
+    expectedLaneRevision: Number(store.getInteractionLane('other', 'private_chat').revision),
     inputVisibilitySequence: 3,
     presetVersion: rollout.presetVersion,
     annotationSnapshot: {}
@@ -1032,7 +1044,7 @@ test('canonical RA1 open lineage is cancelled and reopens as a redacted shell', 
 for (const faultAfterStep of [
   'after_direct_refs', 'after_batches', 'after_messages', 'after_group',
   'after_delivery', 'after_audit', 'after_lane_update',
-  'after_control_insert', 'after_applied_projection'
+  'after_control_insert', 'after_post_write_validation', 'after_applied_projection'
 ]) {
   test(`canonical RA1 fault ${faultAfterStep} rolls back the complete clear transaction`, () => {
     const { dir, path } = tempPath(`yuqi-clear-fault-${faultAfterStep}-`);
@@ -1127,3 +1139,1282 @@ test('canonical RA1 clear redacts a real three-bubble retry lineage and preserve
     closeDir(dir);
   }
 });
+
+function legacyV1ScrubEnvelope(turnId, deviceId, deviceSeq) {
+  return {
+    protocolVersion: 1,
+    turnId,
+    characterId: 'yuqi',
+    deviceId,
+    deviceSeq,
+    createdAt: 1784400100000 + deviceSeq,
+    message: {
+      messageId: `msg_${turnId}`,
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: 'yuqi',
+      content: 'legacy private plaintext',
+      sentAt: 1784400100000 + deviceSeq
+    }
+  };
+}
+
+function legacyV2ScrubEnvelope(
+  turnId, deviceId, deviceSeq, roleId = 'yuqi', kind = 'DIRECT_REPLY'
+) {
+  const envelope = {
+    protocolVersion: 2,
+    turnId,
+    characterId: roleId,
+    deviceId,
+    deviceSeq,
+    createdAt: 1784400101000 + deviceSeq,
+    kind,
+    message: {
+      messageId: `msg_${turnId}`,
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: roleId,
+      content: 'legacy v2 private plaintext',
+      sentAt: 1784400101000 + deviceSeq
+    }
+  };
+  if (kind === 'PROACTIVE_MOMENT') {
+    delete envelope.message;
+    envelope.trigger = {
+      triggerId: `trigger_${turnId}`,
+      triggerType: 'proactive_moment',
+      scheduledFor: envelope.createdAt,
+      executedAt: envelope.createdAt
+    };
+  }
+  return envelope;
+}
+
+function legacyV2ThreeBubbleEnvelope(turnId = 'turn_ra0_v2_three', deviceId = 'device_v2_three') {
+  const messages = [1, 2, 3].map(index => ({
+    messageId: `msg_${turnId}_${index}`,
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: 'yuqi',
+    content: `legacy v2 bubble ${index}`,
+    sentAt: 1784400101000 + index
+  }));
+  const envelope = legacyV2ScrubEnvelope(turnId, deviceId, 88);
+  envelope.message = messages[2];
+  envelope.context = {
+    currentBatch: {
+      batchId: `batch_${turnId}`,
+      messageIds: messages.map(message => message.messageId),
+      startedAt: messages[0].sentAt,
+      committedAt: messages[2].sentAt,
+      messages
+    }
+  };
+  return envelope;
+}
+
+function createAuthorityV0ScrubFixture(store) {
+  if (!store.getInteractionLane('yuqi', 'private_chat')) {
+    seedPrivateLane(store, { now: 1784400100000 });
+  }
+  const makeTurn = (envelope, { failed = false } = {}) => {
+    const turn = store.submitTurn(envelope);
+    store.claimTurnById(turn.turnId, `legacy-worker-${turn.turnId}`);
+    store.advanceTurn(turn.turnId, 'memory_running', failed ? 'failed' : 'memory_done', {
+      memoryPacketJson: JSON.stringify({ secretMemory: 'legacy memory secret' }),
+      brainDraftJson: JSON.stringify({ reply: 'legacy failed draft secret' }),
+      ...(failed ? {
+        errorJson: JSON.stringify({ name: 'LegacyError', message: 'legacy error secret' })
+      } : {})
+    });
+    if (failed) return store.getTurn(turn.turnId);
+    store.advanceTurn(turn.turnId, 'memory_done', 'brain_running');
+    store.advanceTurn(turn.turnId, 'brain_running', 'brain_done', {
+      brainDraftJson: JSON.stringify({ reply: 'legacy brain secret' })
+    });
+    store.advanceTurn(turn.turnId, 'brain_done', 'supervisor_running');
+    store.advanceTurn(turn.turnId, 'supervisor_running', 'approved', {
+      supervisorJson: JSON.stringify({ approved: true, secret: 'legacy supervisor secret' })
+    });
+    store.advanceTurn(turn.turnId, 'approved', 'committed', {
+      replyJson: JSON.stringify({
+        reply: { content: 'legacy reply secret' },
+        actions: [{ kind: 'legacy_action', payload: { secret: 'legacy action secret' } }],
+        route: 'legacy route secret'
+      })
+    });
+    store.putMessage({
+      messageId: `msg_reply_${turn.turnId}`,
+      turnId: turn.turnId,
+      characterId: 'yuqi',
+      speakerId: 'yuqi',
+      speakerType: 'character',
+      recipientId: 'user',
+      content: 'legacy reply message secret',
+      sentAt: 1784400105000,
+      origin: 'legacy'
+    });
+    return store.getTurn(turn.turnId);
+  };
+  const v1 = makeTurn(legacyV1ScrubEnvelope('turn_ra0_v1', 'device_v1', 1));
+  // RA0/v1 historical turns have no current-user-batch authority.  The
+  // submit path may materialize a compatibility batch; remove it here so the
+  // positive scrub fixture reflects the real legacy shape and the preflight
+  // rejection is exercised separately below.
+  store.db.prepare('DELETE FROM current_user_batch_items WHERE turn_id = ?').run(v1.turnId);
+  store.db.prepare('DELETE FROM current_user_batches WHERE turn_id = ?').run(v1.turnId);
+  const v2 = makeTurn(legacyV2ScrubEnvelope('turn_ra0_v2', 'device_v2', 2));
+  const failed = makeTurn(
+    legacyV2ScrubEnvelope('turn_ra0_failed', 'device_failed', 3),
+    { failed: true }
+  );
+  const confirmed = makeTurn(legacyV2ScrubEnvelope('turn_ra0_confirmed', 'device_confirmed', 4));
+  const delivered = makeTurn(legacyV2ScrubEnvelope('turn_ra0_delivered', 'device_delivered', 5));
+  const publicMoment = makeTurn(legacyV2ScrubEnvelope(
+    'turn_ra0_public_moment', 'device_public_moment', 6, 'yuqi', 'PROACTIVE_MOMENT'
+  ));
+  const targetTurns = [v1, v2, failed, confirmed, delivered];
+  const deliveryStates = new Map([
+    [v1.turnId, 'waiting'],
+    [v2.turnId, 'pending'],
+    [failed.turnId, 'mailboxed'],
+    [confirmed.turnId, 'confirmed'],
+    [delivered.turnId, 'delivered']
+  ]);
+  for (const turn of targetTurns) {
+    store.registerCloudDelivery(turn.turnId, 'phone_legacy', 7);
+    const state = deliveryStates.get(turn.turnId);
+    if (state !== 'waiting') {
+      const prepared = store.prepareCloudDelivery(turn.turnId, 'phone_legacy', {
+        turnId: turn.turnId,
+        secret: 'legacy delivery secret'
+      });
+      if (state !== 'pending') {
+        store.markCloudDeliveryAttempt(turn.turnId, 'phone_legacy');
+        store.markCloudDeliveryMailboxed(turn.turnId, 'phone_legacy', prepared.checksum);
+      }
+      if (state === 'confirmed') {
+        const message = store.getMessage(`msg_reply_${turn.turnId}`);
+        const contentSha256 = createHash('sha256').update(message.content, 'utf8').digest('hex');
+        store.confirmCloudDelivery(turn.turnId, 'phone_legacy', {
+          messageId: message.messageId,
+          contentSha256,
+          receivedAt: Date.now() + 1000
+        });
+        // The legacy API does not persist a stable relay identity; keep only
+        // that historical transport fact as a deterministic raw fixture.
+        store.db.prepare(`
+          UPDATE cloud_deliveries SET relay_message_id = ?
+          WHERE turn_id = ? AND peer_id = ?
+        `).run(stableId('relay_pc', `${turn.turnId}:phone_legacy:${prepared.checksum}`),
+          turn.turnId, 'phone_legacy');
+      } else if (state === 'delivered') {
+        // Explicit historical compatibility shape: delivered without a
+        // receipt/confirmedAt, but with the production relay identity.
+        store.db.prepare(`
+          UPDATE cloud_deliveries SET state = 'delivered', confirmed_at = NULL,
+            relay_message_id = ?
+          WHERE turn_id = ? AND peer_id = ?
+        `).run(stableId('relay_pc', `${turn.turnId}:phone_legacy:${prepared.checksum}`),
+          turn.turnId, 'phone_legacy');
+      } else if (state === 'mailboxed') {
+        store.db.prepare(`
+          UPDATE cloud_deliveries SET relay_message_id = ?
+          WHERE turn_id = ? AND peer_id = ?
+        `).run(stableId('relay_pc', `${turn.turnId}:phone_legacy:${prepared.checksum}`),
+          turn.turnId, 'phone_legacy');
+      }
+    }
+    store.putDiagnostic({
+      turnId: turn.turnId,
+      stage: 'legacy_secret',
+      level: 'error',
+      detail: { secret: 'legacy diagnostic secret' }
+    });
+  }
+  store.db.prepare('INSERT INTO sessions(role, thread_id, turn_count, updated_at) VALUES (?, ?, ?, ?)')
+    .run('yuqi', 'legacy-session', 3, 1784400106000);
+  const other = store.submitTurn(legacyV2ScrubEnvelope(
+    'turn_other_role', 'device_other', 1, 'other'
+  ));
+  const publicBefore = store.db.prepare(
+    'SELECT * FROM turns WHERE turn_id = ?'
+  ).get(publicMoment.turnId);
+  const publicScopeBefore = {
+    turn: publicBefore,
+    messages: store.db.prepare('SELECT * FROM messages WHERE turn_id = ?').all(publicMoment.turnId),
+    batches: store.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').all(publicMoment.turnId),
+    batchItems: store.db.prepare('SELECT * FROM current_user_batch_items WHERE turn_id = ?').all(publicMoment.turnId),
+    sync: store.db.prepare('SELECT * FROM sync_log WHERE entity_id = ? ORDER BY seq').all(publicMoment.turnId)
+  };
+  const targetIds = targetTurns.map(turn => turn.turnId);
+  const deliveryBefore = store.db.prepare(`
+    SELECT turn_id, peer_id, state, payload_json, checksum, relay_message_id,
+           delivered_at, confirmed_at, recovery_ack_seq
+    FROM cloud_deliveries WHERE turn_id IN (${targetIds.map(() => '?').join(',')})
+    ORDER BY turn_id, peer_id
+  `).all(...targetIds).map(row => ({ ...row }));
+  const before = redactionDatabaseSnapshot(store);
+  const immutable = store.db.prepare(`
+    SELECT turn_id, character_id, device_id, device_seq, source_message_id,
+           envelope_checksum, result_authority_version
+    FROM turns WHERE turn_id IN (${targetIds.map(() => '?').join(',')}) ORDER BY turn_id
+  `).all(...targetIds).map(row => ({ ...row }));
+  return {
+    v1, v2, failed, confirmed, delivered, publicMoment, other, publicBefore, publicScopeBefore,
+    targetIds, before, immutable, deliveryBefore
+  };
+}
+
+function createCanonicalV2TurnFixture(store, { kind, laneKey, index }) {
+  const envelope = canonicalRedactionEnvelope(index);
+  envelope.protocolVersion = 2;
+  envelope.kind = kind;
+  delete envelope.authority;
+  if (kind === 'MOMENT_REPLY' || kind === 'PROACTIVE_MOMENT') {
+    delete envelope.message;
+    delete envelope.context;
+    envelope.trigger = {
+      triggerId: `trigger_legacy_moment_${index}`,
+      triggerType: kind === 'MOMENT_REPLY' ? 'moment_reply' : 'proactive_moment',
+      scheduledFor: envelope.createdAt,
+      executedAt: envelope.createdAt,
+      ...(kind === 'MOMENT_REPLY' ? { context: {
+        targetMoment: { momentId: 'moment_legacy', authorType: 'user', authorId: 'user' },
+        targetComment: { commentId: 'comment_legacy', authorType: 'user', authorId: 'user' }
+      } } : {})
+    };
+  }
+  const lane = store.getInteractionLane('yuqi', laneKey)
+    || store.claimInteractionLaneInternal({
+      roleId: 'yuqi', laneKey, expectedRevision: 0,
+      clearEpoch: 0, clearedThroughSequence: 0, localSequence: 0,
+      now: 1784400100000
+    });
+  const rollout = store.getCognitionRollout(kind);
+  if (!rollout) throw new Error(`missing rollout fixture: ${kind}`);
+  const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: envelope.createdAt });
+  const turn = store.createCanonicalVisibleTurnInternal({
+    envelope,
+    rolloutKey: kind,
+    expectedRolloutRevision: rollout.revision,
+    authoritativeReleaseId: rollout.stableReleaseId,
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    laneKey,
+    expectedLaneRevision: Number(lane.revision),
+    inputUserBatchId: envelope.context?.currentBatch?.batchId || envelope.trigger?.triggerId,
+    inputVisibilitySequence: Number(lane.localSequence || 0),
+    inputClearEpoch: Number(lane.clearEpoch || 0),
+    agencySnapshotChecksum: agency.checksum,
+    annotationSnapshot: {}
+  }).turn;
+  const before = store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turn.turnId);
+  return { turn, before };
+}
+
+function createCanonicalV3PublicMomentFixture(store) {
+  const triggerId = 'trigger_public_moment_v3_scrub';
+  const envelope = {
+    protocolVersion: 3,
+    turnId: 'turn_public_moment_v3_scrub',
+    characterId: 'yuqi',
+    deviceId: 'device_public_v3',
+    deviceSeq: 30,
+    createdAt: 1784400103000,
+    kind: 'PROACTIVE_MOMENT',
+    trigger: {
+      triggerId,
+      triggerType: 'proactive_moment',
+      scheduledFor: 1784400103000,
+      executedAt: 1784400103000,
+      context: {}
+    },
+    context: {
+      visibilityCursor: {
+        nativeCompletedTurnId: null,
+        nativeCompletedGroupId: null,
+        nativeCompletedSequence: 0,
+        uiAppliedTurnId: null,
+        uiAppliedGroupId: null,
+        uiAppliedSequence: 0,
+        localSequence: 1,
+        clearedThroughSequence: 0,
+        clearEpoch: 0,
+        clearedAt: 0,
+        chatOpen: true,
+        quotedMessageId: null
+      }
+    },
+    authority: {
+      algorithm: 'al-authority-v1',
+      roleId: 'yuqi',
+      laneKey: 'public_moment',
+      rootSourceId: triggerId,
+      lineageKey: deriveAuthorityLineageKey({
+        roleId: 'yuqi', laneKey: 'public_moment', rootSourceId: triggerId
+      }),
+      claimedLineageRevision: 1,
+      retryOfTurnId: null
+    }
+  };
+  const lane = store.getInteractionLane('yuqi', 'public_moment')
+    || store.claimInteractionLaneInternal({
+      roleId: 'yuqi', laneKey: 'public_moment', expectedRevision: 0,
+      clearEpoch: 0, clearedThroughSequence: 0, localSequence: 0,
+      now: 1784400100000
+    });
+  const rollout = store.getCognitionRollout('PROACTIVE_MOMENT');
+  const authority = store.rebuildPublicMomentAuthorityInternal({ envelope });
+  const agency = store.readAgencyAuthoritySnapshotInternal({
+    roleId: 'yuqi', at: envelope.createdAt
+  });
+  const turn = store.createCanonicalVisibleTurnInternal({
+    envelope,
+    rolloutKey: 'PROACTIVE_MOMENT',
+    expectedRolloutRevision: rollout.revision,
+    authoritativeReleaseId: rollout.stableReleaseId,
+    comparisonReleaseId: null,
+    comparisonDirection: null,
+    laneKey: 'public_moment',
+    expectedLaneRevision: Number(lane.revision),
+    inputUserBatchId: triggerId,
+    inputVisibilitySequence: 1,
+    inputClearEpoch: 0,
+    agencySnapshotChecksum: agency.checksum,
+    annotationSnapshot: { publicMomentAuthority: authority }
+  }).turn;
+  const contextRevision = contentHash({
+    agencySnapshotChecksum: agency.checksum,
+    momentTargetAuthorityChecksum: authority.checksum
+  });
+  const fingerprint = generationFingerprint({
+    roleId: 'yuqi',
+    laneKey: 'public_moment',
+    inputVisibilitySequence: turn.inputVisibilitySequence,
+    visibleGroup: { items: [] },
+    actionSet: [],
+    contextRevision
+  });
+  const committed = commitVisibleResult({
+    store,
+    turnId: turn.turnId,
+    authorityLineageKey: turn.authorityLineageKey,
+    laneKey: turn.laneKey,
+    expectedTurnRevision: turn.turnRevision,
+    expectedLineageRevision: store.getTurnAuthorityLineage(turn.authorityLineageKey).revision,
+    expectedLaneRevision: store.getInteractionLane('yuqi', 'public_moment').revision,
+    expectedCognitiveStateRevision: Number(store.getCognitiveState('yuqi')?.revision || 0),
+    expectedLatestUserBatchId: triggerId,
+    inputVisibilitySequence: turn.inputVisibilitySequence,
+    inputClearEpoch: 0,
+    protocolVersion: 3,
+    turnKind: 'PROACTIVE_MOMENT',
+    agencySnapshotChecksum: agency.checksum,
+    authoritativeReleaseId: rollout.stableReleaseId,
+    visibleGroup: { items: [] },
+    actionSet: [],
+    publicMomentEvidenceIds: [],
+    statePatch: null,
+    memoryJobs: [],
+    comparisonJob: null,
+    generationFingerprint: fingerprint,
+    now: 1784400104000
+  });
+  const groupId = committed.visibleGroupId;
+  const snapshot = {
+    lane: store.db.prepare(
+      'SELECT * FROM interaction_lanes WHERE role_id = ? AND lane_key = ?'
+    ).get('yuqi', 'public_moment'),
+    turn: store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(turn.turnId),
+    lineage: store.db.prepare(
+      'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
+    ).get(turn.authorityLineageKey),
+    batches: store.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').all(turn.turnId),
+    batchItems: store.db.prepare('SELECT * FROM current_user_batch_items WHERE turn_id = ?').all(turn.turnId),
+    messages: store.db.prepare('SELECT * FROM messages WHERE turn_id = ?').all(turn.turnId),
+    groups: store.db.prepare('SELECT * FROM visible_result_groups WHERE group_id = ?').all(groupId),
+    items: store.db.prepare('SELECT * FROM visible_result_items WHERE group_id = ?').all(groupId),
+    actions: store.db.prepare('SELECT * FROM visible_result_actions WHERE group_id = ?').all(groupId),
+    manifests: store.db.prepare('SELECT * FROM visible_result_manifests WHERE group_id = ?').all(groupId),
+    receipts: store.db.prepare('SELECT * FROM visible_commit_receipts WHERE group_id = ?').all(groupId),
+    deliveries: store.db.prepare('SELECT * FROM cloud_deliveries WHERE authority_group_id = ?').all(groupId),
+    diagnostics: store.db.prepare('SELECT * FROM diagnostics WHERE turn_id = ?').all(turn.turnId),
+    jobs: store.db.prepare('SELECT * FROM consolidation_jobs WHERE authority_group_id = ?').all(groupId),
+    sync: store.db.prepare(
+      'SELECT * FROM sync_log WHERE entity_id IN (?, ?, ?) ORDER BY seq'
+    ).all(turn.turnId, turn.authorityLineageKey, groupId)
+  };
+  return { turn, groupId, snapshot };
+}
+
+function readCanonicalV3PublicMomentSnapshot(store, fixture) {
+  return {
+    lane: store.db.prepare(
+      'SELECT * FROM interaction_lanes WHERE role_id = ? AND lane_key = ?'
+    ).get('yuqi', 'public_moment'),
+    turn: store.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(fixture.turn.turnId),
+    lineage: store.db.prepare(
+      'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
+    ).get(fixture.turn.authorityLineageKey),
+    batches: store.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').all(fixture.turn.turnId),
+    batchItems: store.db.prepare('SELECT * FROM current_user_batch_items WHERE turn_id = ?').all(fixture.turn.turnId),
+    messages: store.db.prepare('SELECT * FROM messages WHERE turn_id = ?').all(fixture.turn.turnId),
+    groups: store.db.prepare('SELECT * FROM visible_result_groups WHERE group_id = ?').all(fixture.groupId),
+    items: store.db.prepare('SELECT * FROM visible_result_items WHERE group_id = ?').all(fixture.groupId),
+    actions: store.db.prepare('SELECT * FROM visible_result_actions WHERE group_id = ?').all(fixture.groupId),
+    manifests: store.db.prepare('SELECT * FROM visible_result_manifests WHERE group_id = ?').all(fixture.groupId),
+    receipts: store.db.prepare('SELECT * FROM visible_commit_receipts WHERE group_id = ?').all(fixture.groupId),
+    deliveries: store.db.prepare('SELECT * FROM cloud_deliveries WHERE authority_group_id = ?').all(fixture.groupId),
+    diagnostics: store.db.prepare('SELECT * FROM diagnostics WHERE turn_id = ?').all(fixture.turn.turnId),
+    jobs: store.db.prepare('SELECT * FROM consolidation_jobs WHERE authority_group_id = ?').all(fixture.groupId),
+    sync: store.db.prepare(
+      'SELECT * FROM sync_log WHERE entity_id IN (?, ?, ?) ORDER BY seq'
+    ).all(fixture.turn.turnId, fixture.turn.authorityLineageKey, fixture.groupId)
+  };
+}
+
+test('authority-v0 v1/v2 Yuqi scrub clears plaintext and legacy recovery/delivery surfaces without RA1 upgrade', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-v0-');
+  try {
+     const store = new YuqiStore(path);
+     store.initializeCognitionRolloutsInternal({
+       rows: [
+         { rolloutKey: 'DIRECT_REPLY', currentMode: 'legacy', rolloutPhase: 'stable',
+           presetVersion: '1.9.2', pipelineChecksum: 'a'.repeat(64) },
+         { rolloutKey: 'PROACTIVE_MOMENT', currentMode: 'legacy', rolloutPhase: 'stable',
+           presetVersion: '1.9.2', pipelineChecksum: 'b'.repeat(64) }
+       ],
+       now: 1784400100000
+     });
+     seedPrivateLane(store, { now: 1784400100000 });
+     const canonicalV2Private = createCanonicalV2TurnFixture(
+       store, { kind: 'DIRECT_REPLY', laneKey: 'private_chat', index: 20 }
+     );
+     const canonicalV3Public = createCanonicalV3PublicMomentFixture(store);
+     const fixture = createAuthorityV0ScrubFixture(store);
+      const otherBefore = store.getTurn(fixture.other.turnId);
+    const control = emptySessionClear({ clearedThroughSequence: 3 });
+    const applied = store.applyConversationClearInternal(control, { appliedAt: 1784400110000 });
+    assert.equal(applied.type, 'CONVERSATION_CLEAR_APPLIED');
+     const rows = store.db.prepare(`
+       SELECT turn_id, character_id, device_id, device_seq, source_message_id,
+              envelope_checksum, result_authority_version, envelope_json,
+              input_clear_epoch, input_visibility_sequence,
+              memory_packet_json, brain_draft_json, supervisor_json, reply_json,
+              error_json, route_reasons_json
+       FROM turns WHERE turn_id IN (${fixture.targetIds.map(() => '?').join(',')}) ORDER BY turn_id
+     `).all(...fixture.targetIds);
+    assert.deepEqual(rows.map(row => ({
+      turn_id: row.turn_id,
+      character_id: row.character_id,
+      device_id: row.device_id,
+      device_seq: row.device_seq,
+      source_message_id: row.source_message_id,
+      envelope_checksum: row.envelope_checksum,
+      result_authority_version: row.result_authority_version
+    })), fixture.immutable);
+     for (const row of rows) {
+       assert.equal(Number(row.result_authority_version), 0);
+       assert.equal(row.input_visibility_sequence, null);
+       assert.equal(row.input_clear_epoch, 0);
+       assert.equal(row.envelope_json, canonicalJson({ redacted: true }));
+       assert.equal(row.memory_packet_json, null);
+      assert.equal(row.brain_draft_json, null);
+      assert.equal(row.supervisor_json, null);
+      assert.equal(row.reply_json, null);
+      assert.equal(row.error_json, null);
+      assert.deepEqual(JSON.parse(row.route_reasons_json), []);
+      assert.equal(JSON.stringify(row).includes('secret'), false);
+    }
+    assert.equal(store.db.prepare(`SELECT COUNT(*) AS value FROM turn_stages
+      WHERE turn_id IN (${fixture.targetIds.map(() => '?').join(',')})`).get(...fixture.targetIds).value, 0);
+    assert.equal(store.db.prepare(`SELECT COUNT(*) AS value FROM messages
+      WHERE turn_id IN (${fixture.targetIds.map(() => '?').join(',')}) AND content <> ''`)
+      .get(...fixture.targetIds).value, 0);
+    assert.equal(store.db.prepare(`SELECT COUNT(*) AS value FROM diagnostics
+      WHERE turn_id IN (${fixture.targetIds.map(() => '?').join(',')})`).get(...fixture.targetIds).value, 0);
+    assert.equal(store.db.prepare("SELECT COUNT(*) AS value FROM sessions WHERE role = 'yuqi'").get().value, 0);
+    assert.equal(store.listRecoverableTurns().some(turn => fixture.targetIds.includes(turn.turnId)), false);
+    assert.equal(store.listPendingCloudDeliveries().some(delivery => fixture.targetIds.includes(delivery.turnId)), false);
+    assert.equal(store.db.prepare(`SELECT COUNT(*) AS value FROM cloud_deliveries
+      WHERE turn_id IN (${fixture.targetIds.map(() => '?').join(',')}) AND payload_json IS NOT NULL`)
+      .get(...fixture.targetIds).value, 0);
+     assert.equal(store.db.prepare(`SELECT COUNT(*) AS value FROM visible_result_groups
+       WHERE authoritative_turn_id IN (${fixture.targetIds.map(() => '?').join(',')})`)
+       .get(...fixture.targetIds).value, 0);
+     const deliveries = store.db.prepare(`
+       SELECT turn_id, peer_id, state, payload_json, checksum, relay_message_id,
+              delivered_at, confirmed_at, attempts, redaction_requested_at,
+              redaction_acknowledged_at, recovery_ack_seq
+       FROM cloud_deliveries WHERE turn_id IN (${fixture.targetIds.map(() => '?').join(',')})
+       ORDER BY turn_id, peer_id
+     `).all(...fixture.targetIds);
+     assert.equal(deliveries.length, fixture.targetIds.length);
+     for (const delivery of deliveries) {
+       const before = fixture.deliveryBefore.find(row =>
+         row.turn_id === delivery.turn_id && row.peer_id === delivery.peer_id);
+       assert.ok(before);
+       if (before.state === 'waiting') {
+         assert.equal(delivery.state, 'redacted');
+         assert.equal(delivery.relay_message_id, null);
+         assert.equal(delivery.redaction_requested_at, null);
+         assert.equal(delivery.redaction_acknowledged_at, 1784400110000);
+       } else {
+       assert.equal(delivery.state, 'redaction_pending');
+         assert.equal(delivery.relay_message_id, before.relay_message_id || stableId(
+           'relay_pc', `${before.turn_id}:${before.peer_id}:${before.checksum}`
+         ));
+         assert.equal(delivery.redaction_requested_at, 1784400110000);
+         assert.equal(delivery.redaction_acknowledged_at, null);
+       }
+       assert.equal(delivery.payload_json, null);
+       assert.equal(delivery.checksum, null);
+       assert.equal(delivery.attempts, 0);
+       assert.equal(Number(delivery.recovery_ack_seq), Number(before.recovery_ack_seq));
+     }
+     const auditRows = store.db.prepare(`
+       SELECT seq, entity_type, entity_id, operation, payload_json, checksum, created_at
+       FROM sync_log WHERE entity_type = 'legacy_turn_redaction'
+         AND entity_id IN (${fixture.targetIds.map(() => '?').join(',')})
+       ORDER BY entity_id
+     `).all(...fixture.targetIds);
+     assert.equal(auditRows.length, fixture.targetIds.length);
+     for (const audit of auditRows) {
+       const turn = rows.find(row => row.turn_id === audit.entity_id);
+       const beforeDeliveries = fixture.deliveryBefore
+         .filter(row => row.turn_id === turn.turn_id)
+         .map(row => ({
+           peerId: row.peer_id,
+           originalState: row.state,
+           relayMessageId: row.relay_message_id || (row.checksum
+             ? stableId('relay_pc', `${row.turn_id}:${row.peer_id}:${row.checksum}`) : null),
+           deliveredAt: row.delivered_at == null ? null : Number(row.delivered_at),
+           confirmedAt: row.confirmed_at == null ? null : Number(row.confirmed_at),
+           recoveryAckSeq: Number(row.recovery_ack_seq),
+           originalChecksum: row.checksum
+         }));
+       const payload = JSON.parse(audit.payload_json);
+       assert.deepEqual(Object.keys(payload).sort(), [
+         'auditVersion', 'controlId', 'deliveryCommitment', 'deliveryCount',
+         'deliveries', 'messageTombstoneCommitment', 'messageTombstoneCount',
+         'batchTombstoneCommitment', 'batchTombstoneCount', 'protocolVersion',
+         'redactedAt', 'roleId', 'turnId'
+       ].sort());
+       assert.equal(payload.auditVersion, 'legacy_turn_redaction_v1');
+       assert.equal(payload.controlId, control.controlId);
+       assert.equal(payload.roleId, 'yuqi');
+       assert.equal(payload.turnId, turn.turn_id);
+       assert.equal(payload.protocolVersion, turn.turn_id === fixture.v1.turnId ? 1 : 2);
+       assert.equal(payload.redactedAt, 1784400110000);
+       assert.equal(payload.deliveryCount, beforeDeliveries.length);
+       assert.deepEqual(payload.deliveries, beforeDeliveries);
+       assert.equal(payload.messageTombstoneCount, store.db.prepare(
+         'SELECT COUNT(*) AS value FROM messages WHERE turn_id = ?'
+       ).get(turn.turn_id).value);
+       assert.equal(payload.batchTombstoneCount, turn.turn_id === fixture.v1.turnId ? 0 : 1);
+       const persistedMessages = store.db.prepare(
+         'SELECT * FROM messages WHERE turn_id = ? ORDER BY message_id'
+       ).all(turn.turn_id);
+       const persistedItems = store.db.prepare(
+         'SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence'
+       ).all(turn.turn_id);
+       const itemByMessage = new Map(persistedItems.map(item => [item.message_id, item]));
+       const expectedMessageTuples = persistedMessages.map(message => {
+         const item = itemByMessage.get(message.message_id);
+         return {
+           messageId: message.message_id,
+           turnId: message.turn_id,
+           batchId: item?.batch_id ?? null,
+           batchSequence: item == null ? null : Number(item.sequence),
+           characterId: message.character_id,
+           speakerId: message.speaker_id,
+           speakerType: message.speaker_type,
+           recipientId: message.recipient_id,
+           sentAt: Number(message.sent_at),
+           origin: message.origin,
+           deviceId: message.device_id ?? null,
+           deviceSeq: message.device_seq == null ? null : Number(message.device_seq),
+           checksum: message.checksum
+         };
+       });
+       if (expectedMessageTuples.length) {
+         assert.deepEqual(Object.keys(expectedMessageTuples[0]).sort(), [
+           'batchId', 'batchSequence', 'characterId', 'checksum', 'deviceId',
+           'deviceSeq', 'messageId', 'origin', 'recipientId', 'sentAt',
+           'speakerId', 'speakerType', 'turnId'
+         ].sort());
+       }
+       assert.equal(payload.messageTombstoneCommitment, contentHash({
+         auditVersion: 'legacy-turn-messages-v1',
+         turnId: turn.turn_id,
+         messages: expectedMessageTuples
+       }));
+       const persistedBatches = store.db.prepare(
+         'SELECT * FROM current_user_batches WHERE turn_id = ? ORDER BY batch_id'
+       ).all(turn.turn_id);
+       const expectedBatchTuples = persistedBatches.map(batch => {
+         const batchItems = persistedItems.filter(item => item.batch_id === batch.batch_id)
+           .map(item => ({
+             sequence: Number(item.sequence), messageId: item.message_id, checksum: item.checksum
+           }));
+         return {
+           turnId: batch.turn_id,
+           batchId: batch.batch_id,
+           characterId: batch.character_id,
+           sourceMessageId: batch.source_message_id,
+           startedAt: Number(batch.started_at),
+           committedAt: Number(batch.committed_at),
+           checksum: batch.checksum,
+           itemCount: Number(batch.item_count),
+           itemCommitment: contentHash({
+             auditVersion: 'legacy-turn-batch-items-v1',
+             turnId: batch.turn_id,
+             batchId: batch.batch_id,
+             items: batchItems
+           })
+         };
+       });
+       if (expectedBatchTuples.length) {
+         assert.deepEqual(Object.keys(expectedBatchTuples[0]).sort(), [
+           'batchId', 'characterId', 'checksum', 'committedAt', 'itemCommitment',
+           'itemCount', 'sourceMessageId', 'startedAt', 'turnId'
+         ].sort());
+       }
+       assert.equal(payload.batchTombstoneCommitment, contentHash({
+         auditVersion: 'legacy-turn-batches-v1',
+         turnId: turn.turn_id,
+         batches: expectedBatchTuples
+       }));
+       assert.equal(payload.deliveryCommitment, contentHash({
+         auditVersion: 'legacy-turn-deliveries-v1',
+         turnId: turn.turn_id,
+         deliveries: beforeDeliveries
+       }));
+       assert.equal(audit.operation, 'redact');
+       assert.equal(Number(audit.created_at), 1784400110000);
+       assert.equal(audit.checksum, contentHash(payload));
+     }
+     assert.equal(JSON.stringify(store.getTurn(fixture.v2.turnId)).includes('secret'), false);
+     assert.equal(JSON.stringify(store.getTurn(fixture.failed.turnId)).includes('secret'), false);
+     assert.throws(() => store.recoverFailedDraft(fixture.failed.turnId),
+       /redacted|cancelled|authority|conflict/i);
+      assert.equal(typeof store.loadValidatedLegacyTurnRedactionInternal, 'function');
+      assert.throws(() => publicTurnStatus(store.getTurn(fixture.v2.turnId)),
+        /validated|authority|redaction/i);
+      assert.throws(() => publicTurnStatus(store.getTurn(fixture.v2.turnId), {
+        legacyRedaction: { kind: 'legacy_turn_redaction_v1', turnId: fixture.v2.turnId }
+      }), /validated|authority|redaction/i);
+      const publicStatus = store.publicLegacyRedactedTurnStatusInternal(fixture.v2.turnId);
+      assert.deepEqual(publicStatus, {
+        status: 'redacted',
+        deliverable: false,
+        terminal: true
+      });
+      assert.equal(JSON.stringify(publicStatus).includes('secret'), false);
+
+      // A redacted RA0 turn must not be writable through any legacy delivery
+      // or recovery entry point. Each call is checked against the complete
+      // database snapshot so a hidden upsert/updated_at mutation cannot pass.
+      const blockedLegacyWriters = [
+        () => store.registerCloudDelivery(fixture.v2.turnId, 'phone_legacy', 0),
+        () => store.prepareCloudDelivery(fixture.v2.turnId, 'phone_legacy', {
+          turnId: fixture.v2.turnId, secret: 'must-not-persist'
+        }),
+        () => store.markCloudDeliveryAttempt(fixture.v2.turnId, 'phone_legacy'),
+        () => store.markCloudDeliveryMailboxed(
+          fixture.v2.turnId, 'phone_legacy', 'f'.repeat(64)
+        ),
+        () => store.confirmCloudDelivery(fixture.v2.turnId, 'phone_legacy', {
+          messageId: 'missing-redacted-message',
+          contentSha256: '0'.repeat(64),
+          receivedAt: 1784400111000
+        }),
+        () => store.recoverFailedDraft(fixture.v2.turnId, {
+          peerId: 'phone_legacy', sentAt: 1784400111000
+        }),
+        () => store.requeueTransientFailedTurn(fixture.v2.turnId)
+      ];
+      for (const write of blockedLegacyWriters) {
+        const beforeBlocked = redactionDatabaseSnapshot(store);
+        assert.throws(write, /redacted|cancelled|authority|conflict|delivery|turn/i);
+        assert.deepEqual(redactionDatabaseSnapshot(store), beforeBlocked);
+      }
+     store.close();
+    const reopened = new YuqiStore(path);
+    assert.deepEqual(reopened.applyConversationClearInternal(control, { appliedAt: 1784400120000 }), applied);
+     assert.deepEqual(reopened.db.prepare(`
+       SELECT turn_id, character_id, device_id, device_seq, source_message_id,
+              envelope_checksum, result_authority_version
+       FROM turns WHERE turn_id IN (${fixture.targetIds.map(() => '?').join(',')}) ORDER BY turn_id
+     `).all(...fixture.targetIds).map(row => ({ ...row })), fixture.immutable);
+     assert.deepEqual(reopened.getTurn(fixture.other.turnId), otherBefore);
+     assert.deepEqual(reopened.db.prepare(
+       'SELECT * FROM turns WHERE turn_id = ?'
+     ).get(fixture.publicMoment.turnId), fixture.publicBefore);
+     assert.deepEqual({
+       turn: reopened.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(fixture.publicMoment.turnId),
+       messages: reopened.db.prepare('SELECT * FROM messages WHERE turn_id = ?').all(fixture.publicMoment.turnId),
+       batches: reopened.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').all(fixture.publicMoment.turnId),
+       batchItems: reopened.db.prepare('SELECT * FROM current_user_batch_items WHERE turn_id = ?').all(fixture.publicMoment.turnId),
+       sync: reopened.db.prepare('SELECT * FROM sync_log WHERE entity_id = ? ORDER BY seq').all(fixture.publicMoment.turnId)
+     }, fixture.publicScopeBefore);
+     const reopenedCanonicalV2 = reopened.db.prepare(
+       'SELECT * FROM turns WHERE turn_id = ?'
+     ).get(canonicalV2Private.turn.turnId);
+     assert.equal(reopenedCanonicalV2.result_authority_version, 1);
+     assert.equal(reopenedCanonicalV2.envelope_json, canonicalJson({ redacted: true }));
+     assert.deepEqual(
+       readCanonicalV3PublicMomentSnapshot(reopened, canonicalV3Public),
+       canonicalV3Public.snapshot
+     );
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('authority-v0 scrub fault rolls back Yuqi legacy rows and leaves other role unchanged', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-v0-fault-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const before = redactionDatabaseSnapshot(store);
+    const otherBefore = store.getTurn(fixture.other.turnId);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), {
+        appliedAt: 1784400115000,
+        faultAfterStep: 'after_legacy_scrub'
+      }
+    ), /legacy|fault|scrub|conversation clear/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    assert.deepEqual(store.getTurn(fixture.other.turnId), otherBefore);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('authority-v0 selector rejects a self-consistent envelope whose stored checksum is stale', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-v0-envelope-checksum-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const row = store.db.prepare('SELECT envelope_json FROM turns WHERE turn_id = ?')
+      .get(fixture.v2.turnId);
+    const envelope = JSON.parse(row.envelope_json);
+    envelope.message.content = 'forged legacy content';
+    store.db.prepare('UPDATE turns SET envelope_json = ? WHERE turn_id = ?')
+      .run(canonicalJson(envelope), fixture.v2.turnId);
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400116000 }
+    ), /envelope|checksum|authority|conflict/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('canonical RA1 selector rejects a lineage lane changed to public before first mutation', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-ra1-lane-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createCanonicalRedactionFixture(store, { includeRetry: false });
+    store.db.prepare('UPDATE turn_authority_lineages SET lane_key = ? WHERE lineage_key = ?')
+      .run('public_moment', fixture.lineageKey);
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 2 }), { appliedAt: 1784400117000 }
+    ), /lane|authority|conflict/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('authority-v0 rejects canonical refs and noncanonical delivery payloads before any scrub write', () => {
+  for (const [label, mutate] of [
+    ['canonical group ref', store => {
+      store.db.prepare(`UPDATE cloud_deliveries SET authority_group_id = ?, authority_commit_checksum = ?
+        WHERE turn_id = ? AND peer_id = ?`).run('rogue_group', 'f'.repeat(64), 'turn_ra0_v2', 'phone_legacy');
+    }],
+    ['waiting attempts', store => {
+      store.db.prepare(`UPDATE cloud_deliveries SET attempts = 1
+        WHERE turn_id = ? AND peer_id = ?`).run('turn_ra0_v1', 'phone_legacy');
+    }],
+    ['noncanonical payload', store => {
+      const row = store.db.prepare(`SELECT payload_json, checksum FROM cloud_deliveries
+        WHERE turn_id = ? AND peer_id = ?`).get('turn_ra0_v2', 'phone_legacy');
+      const payload = JSON.parse(row.payload_json);
+      store.db.prepare(`UPDATE cloud_deliveries SET payload_json = ?, checksum = ?
+        WHERE turn_id = ? AND peer_id = ?`).run(` ${canonicalJson(payload)} `, contentHash(payload),
+        'turn_ra0_v2', 'phone_legacy');
+    }],
+    ['pending relay identity', store => {
+      store.db.prepare(`UPDATE cloud_deliveries SET relay_message_id = ?
+        WHERE turn_id = ? AND peer_id = ?`).run('relay_wrong', 'turn_ra0_v2', 'phone_legacy');
+    }]
+  ]) {
+    const { dir, path } = tempPath(`yuqi-clear-authority-v0-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      createAuthorityV0ScrubFixture(store);
+      mutate(store);
+      const before = redactionDatabaseSnapshot(store);
+      assert.throws(() => store.applyConversationClearInternal(
+        emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400118000 }
+      ), /canonical|delivery|attempt|relay|conflict/i, label);
+      assert.deepEqual(redactionDatabaseSnapshot(store), before, label);
+      store.close();
+    } finally {
+      closeDir(dir);
+    }
+  }
+});
+
+test('authority-v0 exact replay re-runs the scoped shell validator after same-process corruption', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-v0-replay-corrupt-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const control = emptySessionClear({ clearedThroughSequence: 3 });
+    const applied = store.applyConversationClearInternal(control, { appliedAt: 1784400119000 });
+    store.db.prepare('UPDATE messages SET content = ? WHERE turn_id = ?')
+      .run('restored plaintext', fixture.v2.turnId);
+    assert.throws(() => store.applyConversationClearInternal(control, { appliedAt: 1784400120000 }),
+      /message|redaction|authority|closure|conflict/i);
+    assert.equal(store.db.prepare('SELECT content FROM messages WHERE turn_id = ?')
+      .get(fixture.v2.turnId).content, 'restored plaintext');
+    store.db.prepare('UPDATE messages SET content = ? WHERE turn_id = ?')
+      .run('', fixture.v2.turnId);
+    assert.deepEqual(store.applyConversationClearInternal(control, { appliedAt: 1784400121000 }), applied);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const [label, mutateAudit] of [
+  ['extra audit key', (store, row) => {
+    const payload = JSON.parse(row.payload_json);
+    payload.secret = 'must reject';
+    store.db.prepare('UPDATE sync_log SET payload_json = ?, checksum = ? WHERE seq = ?')
+      .run(canonicalJson(payload), contentHash(payload), row.seq);
+  }],
+  ['deleted audit', (store, row) => {
+    store.db.prepare('DELETE FROM sync_log WHERE seq = ?').run(row.seq);
+  }],
+  ['foreign audit', (store, row) => {
+    store.db.prepare('UPDATE sync_log SET entity_id = ? WHERE seq = ?')
+      .run('turn_other_role', row.seq);
+  }],
+  ['duplicate audit', (store, row) => {
+    store.db.prepare(`
+      INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+      SELECT entity_type, entity_id, operation, payload_json, checksum, created_at
+      FROM sync_log WHERE seq = ?
+    `).run(row.seq);
+  }],
+  ['self-consistent audit relay mutation', (store, row) => {
+    const payload = JSON.parse(row.payload_json);
+    const delivery = payload.deliveries.find(item => item.originalState !== 'waiting');
+    delivery.relayMessageId = stableId('relay_pc', `${payload.turnId}:${delivery.peerId}:${'b'.repeat(64)}`);
+    store.db.prepare('UPDATE sync_log SET payload_json = ?, checksum = ? WHERE seq = ?')
+      .run(canonicalJson(payload), contentHash(payload), row.seq);
+  }]
+]) {
+  test(`authority-v0 ${label} is rejected on close/reopen`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-authority-v0-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createAuthorityV0ScrubFixture(store);
+      const control = emptySessionClear({ clearedThroughSequence: 3 });
+      const applied = store.applyConversationClearInternal(control, { appliedAt: 1784400110000 });
+      assert.equal(applied.type, 'CONVERSATION_CLEAR_APPLIED');
+      const auditTurnId = label === 'self-consistent audit relay mutation'
+        ? fixture.v2.turnId : fixture.v1.turnId;
+      const audit = store.db.prepare(`
+        SELECT seq, payload_json FROM sync_log
+        WHERE entity_type = 'legacy_turn_redaction' AND entity_id = ?
+      `).get(auditTurnId);
+      assert.ok(audit);
+      mutateAudit(store, audit);
+      store.close();
+      assert.throws(() => new YuqiStore(path), /legacy|redaction|audit|authority|conflict/i);
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+for (const [label, mutateDelivery] of [
+  ['deleted delivery', (store, row) => {
+    store.db.prepare(`DELETE FROM cloud_deliveries
+      WHERE turn_id = ? AND peer_id = ?`).run(row.turn_id, row.peer_id);
+  }],
+  ['extra delivery', (store, row) => {
+    store.db.prepare(`INSERT INTO cloud_deliveries(
+      turn_id, peer_id, recovery_ack_seq, state, attempts, created_at, updated_at
+    ) VALUES (?, ?, 0, 'redaction_pending', 0, ?, ?)`)
+      .run(row.turn_id, 'foreign_extra_peer', 1784400110000, 1784400110000);
+  }],
+  ['foreign delivery', (store, row) => {
+    store.db.prepare(`UPDATE cloud_deliveries SET peer_id = ?
+      WHERE turn_id = ? AND peer_id = ?`).run('foreign_peer', row.turn_id, row.peer_id);
+  }],
+  ['relay identity corruption', (store, row) => {
+    store.db.prepare(`UPDATE cloud_deliveries SET relay_message_id = ?
+      WHERE turn_id = ? AND peer_id = ?`).run('relay_wrong', row.turn_id, row.peer_id);
+  }],
+  ['delivery time corruption', (store, row) => {
+    store.db.prepare(`UPDATE cloud_deliveries SET delivered_at = ?
+      WHERE turn_id = ? AND peer_id = ?`).run(0, row.turn_id, row.peer_id);
+  }],
+  ['final attempts corruption', (store, row) => {
+    store.db.prepare(`UPDATE cloud_deliveries SET attempts = ?
+      WHERE turn_id = ? AND peer_id = ?`).run(1, row.turn_id, row.peer_id);
+  }]
+]) {
+  test(`authority-v0 ${label} is rejected on close/reopen`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-authority-v0-delivery-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createAuthorityV0ScrubFixture(store);
+      const applied = store.applyConversationClearInternal(
+        emptySessionClear({ clearedThroughSequence: 3 }),
+        { appliedAt: 1784400110000 }
+      );
+      assert.equal(applied.type, 'CONVERSATION_CLEAR_APPLIED');
+      const delivery = store.db.prepare(`
+        SELECT * FROM cloud_deliveries WHERE turn_id = ? AND peer_id = ?
+      `).get(fixture.failed.turnId, 'phone_legacy');
+      assert.ok(delivery);
+      mutateDelivery(store, delivery);
+      store.close();
+      assert.throws(() => new YuqiStore(path), /legacy|delivery|redaction|authority|conflict/i);
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+test('authority-v0 audit time fields remain native after self-consistent corruption', () => {
+  for (const [field, value] of [['deliveredAt', '1784400109000'], ['confirmedAt', [1784400109000]]]) {
+    const { dir, path } = tempPath(`yuqi-clear-authority-v0-audit-${field}-`);
+    try {
+      const store = new YuqiStore(path);
+      const fixture = createAuthorityV0ScrubFixture(store);
+      const control = emptySessionClear({ clearedThroughSequence: 3 });
+      store.applyConversationClearInternal(control, { appliedAt: 1784400110000 });
+      const audit = store.db.prepare(`SELECT seq, payload_json FROM sync_log
+        WHERE entity_type = 'legacy_turn_redaction' AND entity_id = ?`)
+        .get(fixture.confirmed.turnId);
+      const payload = JSON.parse(audit.payload_json);
+      const delivery = payload.deliveries.find(item => item.originalState === 'confirmed');
+      delivery[field] = value;
+      store.db.prepare('UPDATE sync_log SET payload_json = ?, checksum = ? WHERE seq = ?')
+        .run(canonicalJson(payload), contentHash(payload), audit.seq);
+      assert.throws(() => store.loadValidatedLegacyTurnRedactionInternal(fixture.confirmed.turnId),
+        /delivery|audit|time|native|redaction|authority/i);
+      store.close();
+      assert.throws(() => new YuqiStore(path), /delivery|audit|time|native|redaction|authority/i);
+    } finally {
+      closeDir(dir);
+    }
+  }
+});
+
+test('authority-v0 scoped closure tracks source-message annotations, role sessions and subject jobs', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-v0-linked-');
+  try {
+    const store = new YuqiStore(path);
+    const fixture = createAuthorityV0ScrubFixture(store);
+    const control = emptySessionClear({ clearedThroughSequence: 3 });
+    store.applyConversationClearInternal(control, { appliedAt: 1784400110000 });
+    const messageId = store.db.prepare('SELECT message_id FROM messages WHERE turn_id = ? LIMIT 1')
+      .get(fixture.v2.turnId).message_id;
+    store.db.prepare(`INSERT INTO annotations(annotation_id, turn_id, source_message_id,
+      preset_version, annotation_json, status, created_at)
+      VALUES (?, ?, ?, '1.0', '{}', 'active', ?)`)
+      .run('ann-restored', 'unrelated-turn', messageId, 1784400111000);
+    store.db.prepare(`INSERT INTO consolidation_jobs(job_id, subject_type, subject_id, turn_id,
+      role_id, job_type, state, attempt_count, due_at, payload_json, payload_checksum, created_at, updated_at)
+      VALUES (?, 'role_history', ?, NULL, 'yuqi', 'restore', 'queued', 0, ?, '{}', ?, ?, ?)`)
+      .run('job-restored', fixture.v2.turnId, 1784400111000, contentHash({}), 1784400111000, 1784400111000);
+    store.db.prepare('UPDATE sessions SET thread_id = ?, turn_count = ?, updated_at = ? WHERE role = ?')
+      .run('old-session-restored', 3, 1784400109000, 'yuqi');
+    assert.throws(() => store.loadValidatedLegacyTurnRedactionInternal(fixture.v2.turnId),
+      /annotation|session|job|linked|redaction|authority/i);
+    store.db.prepare('DELETE FROM annotations WHERE annotation_id = ?').run('ann-restored');
+    store.db.prepare('DELETE FROM consolidation_jobs WHERE job_id = ?').run('job-restored');
+    store.db.prepare('INSERT INTO sessions(role, thread_id, turn_count, updated_at) VALUES (?, ?, ?, ?)')
+      .run('yuqi', 'new-session', 1, 1784400110001);
+    assert.deepEqual(store.publicLegacyRedactedTurnStatusInternal(fixture.v2.turnId), {
+      status: 'redacted', deliverable: false, terminal: true
+    });
+    store.db.prepare('UPDATE sessions SET thread_id = ?, turn_count = ?, updated_at = ? WHERE role = ?')
+      .run('old-session-restored', 3, 1784400109000, 'yuqi');
+    assert.throws(() => store.applyConversationClearInternal(control, { appliedAt: 1784400120000 }),
+      /session|redaction|authority|closure/i);
+    store.close();
+    assert.throws(() => new YuqiStore(path), /session|redaction|authority|closure/i);
+  } finally {
+    closeDir(dir);
+  }
+});
+
+test('authority-v0 v1 rejects persisted user batches before control insert', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-v0-v1-batch-');
+  try {
+    const store = new YuqiStore(path);
+    const envelope = legacyV1ScrubEnvelope('turn_ra0_v1_batch', 'device_v1_batch', 99);
+    const turn = store.submitTurn(envelope);
+    assert.ok(store.db.prepare('SELECT 1 FROM current_user_batches WHERE turn_id = ?')
+      .get(turn.turnId), 'submitTurn must expose the persisted v1 batch that clear rejects');
+    const before = redactionDatabaseSnapshot(store);
+    assert.throws(() => store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+    ), /batch|legacy|authority|conflict/i);
+    assert.deepEqual(redactionDatabaseSnapshot(store), before);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM conversation_clear_controls').get().value, 0);
+    store.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const [label, mutate] of [
+  ['deleted middle item', store => {
+    store.db.prepare('DELETE FROM current_user_batch_items WHERE turn_id = ? AND sequence = 1')
+      .run('turn_ra0_v2_three');
+  }],
+  ['reordered item', store => {
+    store.db.prepare('UPDATE current_user_batch_items SET sequence = 9 WHERE turn_id = ? AND sequence = 1')
+      .run('turn_ra0_v2_three');
+  }],
+  ['extra item', store => {
+    const row = store.db.prepare(`SELECT batch_id FROM current_user_batches WHERE turn_id = ?`)
+      .get('turn_ra0_v2_three');
+    const message = { messageId: 'msg_extra', speakerId: 'user', speakerType: 'user',
+      recipientId: 'yuqi', content: 'extra', sentAt: 1784400101004 };
+    store.db.prepare(`INSERT INTO current_user_batch_items(
+      turn_id, batch_id, message_id, sequence, message_json, checksum
+    ) VALUES (?, ?, ?, ?, ?, ?)`)
+      .run('turn_ra0_v2_three', row.batch_id, message.messageId, 3,
+        canonicalJson(message), contentHash(message));
+  }],
+  ['self-consistent content mutation', store => {
+    const message = { messageId: 'msg_turn_ra0_v2_three_2', speakerId: 'user',
+      speakerType: 'user', recipientId: 'yuqi', content: 'forged bubble', sentAt: 1784400101003 };
+    store.db.prepare(`UPDATE current_user_batch_items SET message_json = ?, checksum = ?
+      WHERE turn_id = ? AND sequence = 2`)
+      .run(canonicalJson(message), contentHash(message), 'turn_ra0_v2_three');
+  }]
+]) {
+  test(`authority-v0 v2 three-bubble ${label} rejects before control insert`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-authority-v0-v2-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      const envelope = legacyV2ThreeBubbleEnvelope();
+      store.submitTurn(envelope);
+      mutate(store);
+      const before = redactionDatabaseSnapshot(store);
+      assert.throws(() => store.applyConversationClearInternal(
+        emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+      ), /batch|input|legacy|authority|conflict/i);
+      assert.deepEqual(redactionDatabaseSnapshot(store), before);
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM conversation_clear_controls').get().value, 0);
+      store.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+for (const [label, mutate] of [
+  ['missing outer source message', store => {
+    store.db.prepare('DELETE FROM messages WHERE message_id = ?')
+      .run('msg_turn_ra0_v1_authority');
+  }],
+  ['foreign outer owner with self-consistent checksum', store => {
+    const row = store.db.prepare('SELECT * FROM messages WHERE message_id = ?')
+      .get('msg_turn_ra0_v1_authority');
+    const projection = {
+      messageId: row.message_id, turnId: row.turn_id, characterId: 'other',
+      speakerId: row.speaker_id, speakerType: row.speaker_type,
+      recipientId: row.recipient_id, content: row.content, sentAt: row.sent_at,
+      origin: row.origin, deviceId: row.device_id, deviceSeq: row.device_seq
+    };
+    store.db.prepare('UPDATE messages SET character_id = ?, checksum = ? WHERE message_id = ?')
+      .run('other', contentHash(projection), row.message_id);
+  }],
+  ['self-consistent outer content mutation', store => {
+    const row = store.db.prepare('SELECT * FROM messages WHERE message_id = ?')
+      .get('msg_turn_ra0_v1_authority');
+    const projection = {
+      messageId: row.message_id, turnId: row.turn_id, characterId: row.character_id,
+      speakerId: row.speaker_id, speakerType: row.speaker_type,
+      recipientId: row.recipient_id, content: 'forged v1 outer message', sentAt: row.sent_at,
+      origin: row.origin, deviceId: row.device_id, deviceSeq: row.device_seq
+    };
+    store.db.prepare('UPDATE messages SET content = ?, checksum = ? WHERE message_id = ?')
+      .run(projection.content, contentHash(projection), row.message_id);
+  }]
+]) {
+  test(`authority-v0 v1 outer source ${label} rejects before control insert`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-authority-v0-v1-outer-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      seedPrivateLane(store, { now: 1784400100000 });
+      const turn = store.submitTurn(legacyV1ScrubEnvelope(
+        'turn_ra0_v1_authority', 'device_v1_authority', 101
+      ));
+      store.db.prepare('DELETE FROM current_user_batch_items WHERE turn_id = ?').run(turn.turnId);
+      store.db.prepare('DELETE FROM current_user_batches WHERE turn_id = ?').run(turn.turnId);
+      mutate(store);
+      const before = redactionDatabaseSnapshot(store);
+      assert.throws(() => store.applyConversationClearInternal(
+        emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+      ), /message|source|batch|legacy|authority|conflict/i);
+      assert.deepEqual(redactionDatabaseSnapshot(store), before);
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM conversation_clear_controls').get().value, 0);
+      store.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}
+
+for (const protocolVersion of [1, 2]) {
+  for (const field of ['turnId', 'characterId', 'deviceId', 'deviceSeq']) {
+    test(`authority-v0 v${protocolVersion} rejects self-consistent envelope ${field} identity drift`, () => {
+      const { dir, path } = tempPath(`yuqi-clear-authority-v0-v${protocolVersion}-${field}-`);
+      try {
+        const store = new YuqiStore(path);
+        seedPrivateLane(store, { now: 1784400100000 });
+        const envelope = protocolVersion === 1
+          ? legacyV1ScrubEnvelope('turn_ra0_v1_identity', 'device_v1_identity', 102)
+          : legacyV2ThreeBubbleEnvelope('turn_ra0_v2_identity', 'device_v2_identity');
+        const turn = store.submitTurn(envelope);
+        if (protocolVersion === 1) {
+          store.db.prepare('DELETE FROM current_user_batch_items WHERE turn_id = ?').run(turn.turnId);
+          store.db.prepare('DELETE FROM current_user_batches WHERE turn_id = ?').run(turn.turnId);
+        }
+        const persisted = store.db.prepare(
+          'SELECT envelope_json FROM turns WHERE turn_id = ?'
+        ).get(turn.turnId);
+        const forged = JSON.parse(persisted.envelope_json);
+        const alternate = {
+          turnId: 'turn_forged_identity',
+          characterId: 'other',
+          deviceId: 'device_forged_identity',
+          deviceSeq: 999
+        };
+        forged[field] = alternate[field];
+        store.db.prepare(
+          'UPDATE turns SET envelope_json = ?, envelope_checksum = ? WHERE turn_id = ?'
+        ).run(canonicalJson(forged), contentHash(forged), turn.turnId);
+        const before = redactionDatabaseSnapshot(store);
+        assert.throws(() => store.applyConversationClearInternal(
+          emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+        ), /envelope|turn|character|device|source|batch|legacy|authority|conflict/i);
+        assert.deepEqual(redactionDatabaseSnapshot(store), before);
+        assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM conversation_clear_controls').get().value, 0);
+        store.close();
+      } finally {
+        closeDir(dir);
+      }
+    });
+  }
+}
+
+test('authority-v0 v2 three-bubble scrub preserves batch identity and tombstone closure', () => {
+  const { dir, path } = tempPath('yuqi-clear-authority-v0-v2-three-success-');
+  try {
+    const store = new YuqiStore(path);
+    seedPrivateLane(store, { now: 1784400100000 });
+    const envelope = legacyV2ThreeBubbleEnvelope();
+    const turn = store.submitTurn(envelope);
+    const before = store.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').get(turn.turnId);
+    assert.equal(before.item_count, 3);
+    const applied = store.applyConversationClearInternal(
+      emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+    );
+    assert.equal(applied.type, 'CONVERSATION_CLEAR_APPLIED');
+    const batch = store.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').get(turn.turnId);
+    const items = store.db.prepare(
+      'SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence'
+    ).all(turn.turnId);
+    assert.equal(batch.batch_id, before.batch_id);
+    assert.equal(batch.item_count, 3);
+    assert.equal(items.length, 3);
+    assert.deepEqual(items.map(item => item.sequence), [0, 1, 2]);
+    assert.equal(items.every(item => item.message_json === null
+      && item.redacted_at === 1784400110000), true);
+    assert.deepEqual(store.publicLegacyRedactedTurnStatusInternal(turn.turnId), {
+      status: 'redacted', deliverable: false, terminal: true
+    });
+    store.close();
+    const reopened = new YuqiStore(path);
+    assert.deepEqual(reopened.publicLegacyRedactedTurnStatusInternal(turn.turnId), {
+      status: 'redacted', deliverable: false, terminal: true
+    });
+    reopened.close();
+  } finally {
+    closeDir(dir);
+  }
+});
+
+for (const [label, mutate] of [
+  ['missing outer source message', store => {
+    store.db.prepare('DELETE FROM messages WHERE message_id = ?')
+      .run('msg_turn_ra0_v2_three_3');
+  }],
+  ['foreign outer owner with self-consistent checksum', store => {
+    const row = store.db.prepare('SELECT * FROM messages WHERE message_id = ?')
+      .get('msg_turn_ra0_v2_three_3');
+    const projection = {
+      messageId: row.message_id, turnId: row.turn_id, characterId: 'other',
+      speakerId: row.speaker_id, speakerType: row.speaker_type,
+      recipientId: row.recipient_id, content: row.content, sentAt: row.sent_at,
+      origin: row.origin, deviceId: row.device_id, deviceSeq: row.device_seq
+    };
+    store.db.prepare('UPDATE messages SET character_id = ?, checksum = ? WHERE message_id = ?')
+      .run('other', contentHash(projection), row.message_id);
+  }],
+  ['self-consistent outer content mutation', store => {
+    const row = store.db.prepare('SELECT * FROM messages WHERE message_id = ?')
+      .get('msg_turn_ra0_v2_three_3');
+    const projection = {
+      messageId: row.message_id, turnId: row.turn_id, characterId: row.character_id,
+      speakerId: row.speaker_id, speakerType: row.speaker_type,
+      recipientId: row.recipient_id, content: 'forged outer bubble', sentAt: row.sent_at,
+      origin: row.origin, deviceId: row.device_id, deviceSeq: row.device_seq
+    };
+    store.db.prepare('UPDATE messages SET content = ?, checksum = ? WHERE message_id = ?')
+      .run(projection.content, contentHash(projection), row.message_id);
+  }]
+]) {
+  test(`authority-v0 v2 outer source ${label} rejects before control insert`, () => {
+    const { dir, path } = tempPath(`yuqi-clear-authority-v0-outer-${label.replaceAll(' ', '-')}-`);
+    try {
+      const store = new YuqiStore(path);
+      seedPrivateLane(store, { now: 1784400100000 });
+      store.submitTurn(legacyV2ThreeBubbleEnvelope());
+      mutate(store);
+      const before = redactionDatabaseSnapshot(store);
+      assert.throws(() => store.applyConversationClearInternal(
+        emptySessionClear({ clearedThroughSequence: 3 }), { appliedAt: 1784400110000 }
+      ), /message|source|batch|legacy|authority|conflict/i);
+      assert.deepEqual(redactionDatabaseSnapshot(store), before);
+      assert.equal(store.db.prepare('SELECT COUNT(*) AS value FROM conversation_clear_controls').get().value, 0);
+      store.close();
+    } finally {
+      closeDir(dir);
+    }
+  });
+}

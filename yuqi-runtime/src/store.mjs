@@ -8,6 +8,7 @@ import {
   deriveVisibleMessageId
 } from './authority-identity.mjs';
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
+import { stableId } from './cloud-relay-pump.mjs';
 import { decideLaneAdmission, generationFingerprint, laneKeyForEnvelope } from './interaction-lanes.mjs';
 import { resolvePipelinePair } from './release-pair.mjs';
 import {
@@ -5937,6 +5938,7 @@ export class YuqiStore {
       }
     }
     this.assertAuthorityRedactionAuditClosureInternal();
+    this.assertLegacyRedactionAuditClosureInternal();
   }
 
   visibleAuthorityV13InvariantSummary() {
@@ -6780,6 +6782,10 @@ export class YuqiStore {
         'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
       ).get(row.authority_lineage_key);
       if (!lineage) throw new Error(`canonical conversation clear lineage conflict: ${row.authority_lineage_key}`);
+      if (lineage.role_id !== row.character_id
+        || lineage.lane_key !== row.lane_key) {
+        throw new Error(`canonical conversation clear lineage lane conflict: ${row.turn_id}`);
+      }
       if (row.authority_redacted_at != null) {
         if (!checkedRedactedLineages.has(row.authority_lineage_key)) {
           if (lineage.state === 'committed' && lineage.committed_group_id) {
@@ -6807,7 +6813,16 @@ export class YuqiStore {
       if (contentHash(wire) !== row.envelope_checksum) {
         throw new Error(`canonical conversation clear envelope checksum conflict: ${row.turn_id}`);
       }
-      if (wire.protocolVersion === 3) canonical.push({ ...row, protocolVersion: 3 });
+      const derivedLane = authorityLaneKeyForEnvelope(wire);
+      if (row.lane_key !== derivedLane) {
+        throw new Error(`canonical conversation clear lane conflict: ${row.turn_id}`);
+      }
+      // Conversation clear is private-chat only. Public moment/thread lanes
+      // remain byte-identical, while both canonical wire-v2 and wire-v3
+      // private turns participate in the affected-set calculation.
+      if (derivedLane === 'private_chat') canonical.push({
+        ...row, protocolVersion: wire.protocolVersion
+      });
     }
     for (const row of canonical) {
       if (row.input_visibility_sequence == null
@@ -6880,6 +6895,798 @@ export class YuqiStore {
       closures.push({ lineage, alreadyRedacted: false });
     }
     return { rows, canonical, affected, closures };
+  }
+
+  assertLegacyConversationClearDeliveryInternal(delivery) {
+    const state = String(delivery?.state || '');
+    const allowed = new Set(['waiting', 'pending', 'mailboxed', 'confirmed', 'delivered']);
+    if (!delivery || !allowed.has(state)
+      || typeof delivery.peer_id !== 'string' || !delivery.peer_id.trim()
+      || typeof delivery.attempts !== 'number' || !Number.isSafeInteger(delivery.attempts)
+      || delivery.attempts < 0
+      || typeof delivery.recovery_ack_seq !== 'number'
+      || !Number.isSafeInteger(delivery.recovery_ack_seq)
+      || delivery.recovery_ack_seq < 0) {
+      throw new Error('legacy conversation clear delivery authority conflict');
+    }
+    if (state === 'waiting' && delivery.attempts !== 0) {
+      throw new Error('legacy conversation clear waiting attempts conflict');
+    }
+    const payload = parseJson(delivery.payload_json, null);
+    const hasPayload = ['pending', 'mailboxed', 'confirmed', 'delivered'].includes(state);
+    if (typeof delivery.created_at !== 'number' || !Number.isSafeInteger(delivery.created_at)
+      || delivery.created_at <= 0
+      || typeof delivery.updated_at !== 'number' || !Number.isSafeInteger(delivery.updated_at)
+      || delivery.updated_at <= 0) {
+      throw new Error('legacy conversation clear delivery timestamp conflict');
+    }
+    if (state === 'waiting') {
+      if (delivery.payload_json !== null || delivery.checksum !== null
+        || delivery.relay_message_id !== null || delivery.delivered_at !== null
+        || delivery.confirmed_at !== null) {
+        throw new Error('legacy conversation clear waiting delivery conflict');
+      }
+      return delivery;
+    }
+    if (!hasPayload || !payload || typeof payload !== 'object' || Array.isArray(payload)
+      || !delivery.checksum || !/^[a-f0-9]{64}$/.test(delivery.checksum)
+      || delivery.checksum !== contentHash(payload)
+      || delivery.payload_json !== canonicalJson(payload)) {
+      throw new Error('legacy conversation clear delivery payload conflict');
+    }
+    const expectedRelay = stableId(
+      'relay_pc', `${delivery.turn_id}:${delivery.peer_id}:${delivery.checksum}`
+    );
+    if (state === 'pending') {
+      if (delivery.relay_message_id !== null && delivery.relay_message_id !== expectedRelay) {
+        throw new Error('legacy conversation clear pending relay conflict');
+      }
+      if (delivery.delivered_at !== null
+        || delivery.confirmed_at !== null) {
+        throw new Error('legacy conversation clear pending delivery conflict');
+      }
+    } else {
+      if (delivery.relay_message_id !== expectedRelay
+        || typeof delivery.delivered_at !== 'number'
+        || !Number.isSafeInteger(delivery.delivered_at)
+        || delivery.delivered_at <= 0) {
+        throw new Error('legacy conversation clear relay identity conflict');
+      }
+      if (state === 'mailboxed' && delivery.confirmed_at !== null) {
+        throw new Error('legacy conversation clear mailbox receipt conflict');
+      }
+      if (state === 'confirmed'
+        && (typeof delivery.confirmed_at !== 'number'
+          || !Number.isSafeInteger(delivery.confirmed_at)
+          || delivery.confirmed_at < delivery.delivered_at)) {
+        throw new Error('legacy conversation clear confirmed receipt conflict');
+      }
+      if (state === 'delivered' && delivery.confirmed_at !== null
+        && (typeof delivery.confirmed_at !== 'number'
+          || !Number.isSafeInteger(delivery.confirmed_at)
+          || delivery.confirmed_at < delivery.delivered_at)) {
+        throw new Error('legacy conversation clear delivered receipt conflict');
+      }
+    }
+    return delivery;
+  }
+
+  assertLegacyConversationClearInputBatchInternal({ row, envelope }) {
+    const protocolVersion = Number(envelope?.protocolVersion);
+    if (envelope?.turnId !== row.turn_id
+      || envelope?.characterId !== row.character_id
+      || envelope?.deviceId !== row.device_id
+      || !Number.isSafeInteger(envelope?.deviceSeq)
+      || envelope.deviceSeq !== row.device_seq) {
+      throw new Error(`legacy conversation clear envelope identity conflict: ${row.turn_id}`);
+    }
+    const batches = this.db.prepare(
+      'SELECT * FROM current_user_batches WHERE turn_id = ? ORDER BY batch_id'
+    ).all(row.turn_id);
+    const items = this.db.prepare(
+      'SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence'
+    ).all(row.turn_id);
+    const source = envelope.message;
+    if (!source || typeof source.messageId !== 'string' || !source.messageId
+      || typeof source.content !== 'string' || !source.content.trim()
+      || !Number.isSafeInteger(source.sentAt)
+      || source.speakerId !== 'user'
+      || source.speakerType !== 'user'
+      || source.recipientId !== row.character_id) {
+      throw new Error(`legacy conversation clear outer source conflict: ${row.turn_id}`);
+    }
+    const persistedSource = this.db.prepare(
+      'SELECT * FROM messages WHERE message_id = ?'
+    ).get(source.messageId);
+    const expectedSource = {
+      messageId: source.messageId,
+      turnId: row.turn_id,
+      characterId: row.character_id,
+      speakerId: 'user',
+      speakerType: 'user',
+      recipientId: row.character_id,
+      content: source.content,
+      sentAt: source.sentAt,
+      origin: 'phone',
+      deviceId: row.device_id,
+      deviceSeq: row.device_seq
+    };
+    if (!persistedSource
+      || persistedSource.turn_id !== expectedSource.turnId
+      || persistedSource.character_id !== expectedSource.characterId
+      || persistedSource.speaker_id !== expectedSource.speakerId
+      || persistedSource.speaker_type !== expectedSource.speakerType
+      || persistedSource.recipient_id !== expectedSource.recipientId
+      || persistedSource.content !== expectedSource.content
+      || persistedSource.sent_at !== expectedSource.sentAt
+      || persistedSource.origin !== expectedSource.origin
+      || persistedSource.device_id !== expectedSource.deviceId
+      || persistedSource.device_seq !== expectedSource.deviceSeq
+      || persistedSource.checksum !== contentHash(expectedSource)) {
+      throw new Error(`legacy conversation clear outer source closure conflict: ${row.turn_id}`);
+    }
+    if (protocolVersion === 1) {
+      if (batches.length !== 0 || items.length !== 0) {
+        throw new Error(`legacy conversation clear v1 batch conflict: ${row.turn_id}`);
+      }
+      return null;
+    }
+    if (protocolVersion !== 2) throw new Error(`legacy conversation clear batch protocol conflict: ${row.turn_id}`);
+    let normalized;
+    try {
+      normalized = resolveCurrentUserBatch(envelope);
+    } catch (error) {
+      throw new Error(`legacy conversation clear input batch conflict: ${row.turn_id}`, { cause: error });
+    }
+    if (!normalized || normalized.complete !== true || normalized.missingMessageIds.length
+      || !Array.isArray(normalized.messageIds) || normalized.messageIds.length === 0
+      || new Set(normalized.messageIds).size !== normalized.messageIds.length
+      || batches.length !== 1 || items.length !== normalized.messageIds.length) {
+      throw new Error(`legacy conversation clear input batch conflict: ${row.turn_id}`);
+    }
+    const supplied = envelope.context?.currentBatch;
+    if (supplied) {
+      if (!Array.isArray(supplied.messageIds)
+        || supplied.messageIds.length !== normalized.messageIds.length
+        || new Set(supplied.messageIds).size !== supplied.messageIds.length
+        || canonicalJson(supplied.messageIds) !== canonicalJson(normalized.messageIds)
+        || !Array.isArray(supplied.messages)
+        || supplied.messages.length !== normalized.messages.length
+        || supplied.messages.some((message, index) =>
+          canonicalJson(message) !== canonicalJson(normalized.messages[index]))) {
+        throw new Error(`legacy conversation clear input batch projection conflict: ${row.turn_id}`);
+      }
+      const last = normalized.messages[normalized.messages.length - 1];
+      if (!envelope.message || canonicalJson(envelope.message) !== canonicalJson(last)) {
+        throw new Error(`legacy conversation clear input batch source conflict: ${row.turn_id}`);
+      }
+    }
+    const batch = batches[0];
+    const expectedBatch = {
+      batchId: normalized.batchId,
+      sourceMessageId: normalized.sourceMessageId,
+      messageIds: normalized.messageIds,
+      startedAt: normalized.startedAt,
+      committedAt: normalized.committedAt
+    };
+    if (batch.batch_id !== expectedBatch.batchId
+      || batch.character_id !== row.character_id
+      || batch.source_message_id !== expectedBatch.sourceMessageId
+      || Number(batch.started_at) !== expectedBatch.startedAt
+      || Number(batch.committed_at) !== expectedBatch.committedAt
+      || batch.checksum !== contentHash(expectedBatch)) {
+      throw new Error(`legacy conversation clear input batch parent conflict: ${row.turn_id}`);
+    }
+    const byId = new Map(normalized.messages.map(message => [String(message.messageId || ''), message]));
+    for (let sequence = 0; sequence < items.length; sequence += 1) {
+      const item = items[sequence];
+      const message = byId.get(item.message_id);
+      if (!message || item.batch_id !== batch.batch_id
+        || Number(item.sequence) !== sequence
+        || item.message_id !== normalized.messageIds[sequence]
+        || item.message_json !== canonicalJson(message)
+        || item.checksum !== contentHash(message)) {
+        throw new Error(`legacy conversation clear input batch item conflict: ${row.turn_id}`);
+      }
+    }
+    if (this.userVersion() >= 13) {
+      const tombstone = currentUserBatchTombstoneCommitment({
+        turnId: row.turn_id,
+        batchId: batch.batch_id,
+        itemRows: items
+      });
+      if (Number(batch.item_count) !== tombstone.itemCount
+        || batch.tombstone_commitment !== tombstone.commitment) {
+        throw new Error(`legacy conversation clear input batch tombstone conflict: ${row.turn_id}`);
+      }
+    }
+    return { batch, items, normalized };
+  }
+
+  freezeConversationClearAffectedAuthorityInternal({ roleId, clearEpoch, boundary }) {
+    const authority = this.assertCanonicalConversationClearAffectedSetInternal({
+      roleId, clearEpoch, boundary
+    });
+    const legacy = [];
+    const legacyRows = this.db.prepare(`
+      SELECT * FROM turns
+      WHERE character_id = ? AND result_authority_version = 0
+      ORDER BY turn_id
+    `).all(roleId);
+    for (const row of legacyRows) {
+      let envelope;
+      try {
+        envelope = validateEnvelope(parseJson(row.envelope_json, null));
+      } catch (error) {
+        throw new Error(`legacy conversation clear envelope conflict: ${row.turn_id}`, { cause: error });
+      }
+      if (contentHash(envelope) !== row.envelope_checksum) {
+        throw new Error(`legacy conversation clear envelope checksum conflict: ${row.turn_id}`);
+      }
+      if (row.authority_lineage_key != null
+        || row.lineage_revision_at_creation != null
+        || row.retry_of_turn_id != null
+        || row.input_user_batch_id != null
+        || row.agency_snapshot_checksum != null
+        || row.generation_fingerprint != null) {
+        throw new Error(`legacy conversation clear canonical reference conflict: ${row.turn_id}`);
+      }
+      const canonicalRefs = this.db.prepare(`
+        SELECT 1 FROM visible_result_groups WHERE authoritative_turn_id = ?
+        UNION ALL SELECT 1 FROM visible_commit_receipts WHERE authoritative_turn_id = ?
+        UNION ALL SELECT 1 FROM cloud_deliveries
+          WHERE turn_id = ? AND (authority_group_id IS NOT NULL OR authority_commit_checksum IS NOT NULL)
+        LIMIT 1
+      `).get(row.turn_id, row.turn_id, row.turn_id);
+      if (canonicalRefs) {
+        throw new Error(`legacy conversation clear canonical projection conflict: ${row.turn_id}`);
+      }
+      if (![1, 2].includes(Number(envelope.protocolVersion))) {
+        throw new Error(`legacy conversation clear protocol conflict: ${row.turn_id}`);
+      }
+      const derivedLane = Number(envelope.protocolVersion) === 1
+        ? 'private_chat' : laneKeyForEnvelope(envelope);
+      if (row.lane_key != null && row.lane_key !== derivedLane) {
+        throw new Error(`legacy conversation clear lane conflict: ${row.turn_id}`);
+      }
+      if (derivedLane !== 'private_chat') continue;
+      this.assertLegacyConversationClearInputBatchInternal({ row, envelope });
+      const sequence = row.input_visibility_sequence == null
+        ? 0 : Number(row.input_visibility_sequence);
+      const epoch = row.input_clear_epoch == null ? 0 : Number(row.input_clear_epoch);
+      if (!Number.isSafeInteger(sequence) || sequence < 0
+        || !Number.isSafeInteger(epoch) || epoch < 0) {
+        throw new Error(`legacy conversation clear sequence conflict: ${row.turn_id}`);
+      }
+      if (!(epoch < clearEpoch || (epoch === clearEpoch && sequence <= boundary))) continue;
+      const deliveries = this.db.prepare(
+        'SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id'
+      ).all(row.turn_id);
+      for (const delivery of deliveries) this.assertLegacyConversationClearDeliveryInternal(delivery);
+      legacy.push({ row, envelope, deliveries });
+    }
+
+    const turnIds = [...new Set([
+      ...authority.affected.map(row => row.turn_id),
+      ...legacy.map(entry => entry.row.turn_id)
+    ])].sort();
+    const lineageKeys = [...new Set(authority.closures.map(entry => entry.lineage.lineage_key))].sort();
+    const groupIds = [...new Set(authority.closures
+      .map(entry => entry.lineage.committed_group_id)
+      .filter(Boolean))].sort();
+    const messageIds = turnIds.length
+      ? this.db.prepare(`SELECT message_id FROM messages
+          WHERE turn_id IN (${turnIds.map(() => '?').join(',')}) ORDER BY message_id`)
+        .all(...turnIds).map(row => row.message_id)
+      : [];
+    const actionIds = groupIds.length
+      ? this.db.prepare(`SELECT action_id FROM visible_result_actions
+          WHERE group_id IN (${groupIds.map(() => '?').join(',')}) ORDER BY action_id`)
+        .all(...groupIds).map(row => row.action_id)
+      : [];
+    return {
+      authority,
+      legacy,
+      frozen: Object.freeze({
+        turnIds: Object.freeze(turnIds),
+        lineageKeys: Object.freeze(lineageKeys),
+        groupIds: Object.freeze(groupIds),
+        messageIds: Object.freeze([...new Set(messageIds)].sort()),
+        actionIds: Object.freeze([...new Set(actionIds)].sort())
+      })
+    };
+  }
+
+  redactLegacyConversationTurnInternal({ entry, redactedAt, control, fault }) {
+    const { row, envelope, deliveries } = entry;
+    const turnId = row.turn_id;
+    const messages = this.db.prepare('SELECT * FROM messages WHERE turn_id = ?').all(turnId);
+    const batches = this.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').all(turnId);
+    const batchItems = this.db.prepare(
+      'SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence'
+    ).all(turnId);
+    const protocolVersion = Number(envelope.protocolVersion);
+    const batchItemByMessage = new Map(batchItems.map(item => [item.message_id, item]));
+    const messageTuples = messages.map(message => ({
+      messageId: message.message_id,
+      turnId: message.turn_id,
+      batchId: batchItemByMessage.get(message.message_id)?.batch_id ?? null,
+      batchSequence: batchItemByMessage.has(message.message_id)
+        ? Number(batchItemByMessage.get(message.message_id).sequence) : null,
+      characterId: message.character_id,
+      speakerId: message.speaker_id,
+      speakerType: message.speaker_type,
+      recipientId: message.recipient_id,
+      sentAt: Number(message.sent_at),
+      origin: message.origin,
+      deviceId: message.device_id ?? null,
+      deviceSeq: message.device_seq == null ? null : Number(message.device_seq),
+      checksum: message.checksum
+    })).sort((a, b) => a.messageId.localeCompare(b.messageId));
+    const messageTombstoneCommitment = contentHash({
+      auditVersion: 'legacy-turn-messages-v1', turnId, messages: messageTuples
+    });
+    const batchTuples = protocolVersion === 1 ? [] : batches.map(batch => {
+      const items = batchItems.filter(item => item.turn_id === batch.turn_id)
+        .map(item => ({
+          sequence: Number(item.sequence), messageId: item.message_id, checksum: item.checksum
+        }));
+      const itemCommitment = contentHash({
+        auditVersion: 'legacy-turn-batch-items-v1',
+        turnId: batch.turn_id,
+        batchId: batch.batch_id,
+        items
+      });
+      return {
+        turnId: batch.turn_id,
+        batchId: batch.batch_id,
+        characterId: batch.character_id,
+        sourceMessageId: batch.source_message_id,
+        startedAt: Number(batch.started_at),
+        committedAt: Number(batch.committed_at),
+        checksum: batch.checksum,
+        itemCount: items.length,
+        itemCommitment
+      };
+    });
+    const batchTombstoneCommitment = contentHash({
+      auditVersion: 'legacy-turn-batches-v1', turnId, batches: batchTuples
+    });
+    const linkedIds = [...new Set([
+      turnId,
+      ...messages.map(message => message.message_id),
+      ...batches.map(batch => batch.batch_id)
+    ])];
+    const linkedMarks = linkedIds.map(() => '?').join(',') || "''";
+    this.db.prepare(`DELETE FROM annotations
+      WHERE turn_id = ? OR source_message_id IN (${messages.map(() => '?').join(',') || "''"})`)
+      .run(turnId, ...messages.map(message => message.message_id));
+    this.db.prepare('DELETE FROM diagnostics WHERE turn_id = ?').run(turnId);
+    this.db.prepare('DELETE FROM consolidation_jobs WHERE turn_id = ?').run(turnId);
+    this.db.prepare(`DELETE FROM consolidation_jobs
+      WHERE subject_type = 'turn' AND subject_id = ?`).run(turnId);
+    this.db.prepare('DELETE FROM stance_records WHERE source_turn_id = ?').run(turnId);
+    this.db.prepare('DELETE FROM cognitive_states WHERE last_turn_id = ?').run(turnId);
+    this.db.prepare(`UPDATE interaction_lanes SET generating_turn_id = NULL,
+      latest_user_batch_id = CASE WHEN latest_user_batch_id IN (${batches.map(() => '?').join(',') || "''"})
+        THEN NULL ELSE latest_user_batch_id END
+      WHERE generating_turn_id = ?${batches.length ? ` OR latest_user_batch_id IN (${batches.map(() => '?').join(',')})` : ''}`)
+      .run(...batches.map(batch => batch.batch_id), turnId, ...batches.map(batch => batch.batch_id));
+    this.db.prepare('DELETE FROM sessions WHERE role = ?').run(row.character_id);
+    this.db.prepare(`DELETE FROM sync_log WHERE entity_id IN (${linkedMarks})`).run(...linkedIds);
+    if (protocolVersion === 1) {
+      this.db.prepare('DELETE FROM current_user_batch_items WHERE turn_id = ?').run(turnId);
+      this.db.prepare('DELETE FROM current_user_batches WHERE turn_id = ?').run(turnId);
+    } else {
+      for (const batch of batches) {
+        this.db.prepare(`UPDATE current_user_batch_items
+          SET message_json = NULL, redacted_at = ? WHERE turn_id = ?`)
+          .run(redactedAt, batch.turn_id);
+        const items = batchItems.filter(item => item.turn_id === batch.turn_id);
+        const itemCommitment = contentHash({
+          auditVersion: 'legacy-turn-batch-items-v1',
+          turnId: batch.turn_id,
+          batchId: batch.batch_id,
+          items: items.map(item => ({
+            sequence: Number(item.sequence), messageId: item.message_id, checksum: item.checksum
+          }))
+        });
+        this.db.prepare(`UPDATE current_user_batches
+          SET item_count = ?, tombstone_commitment = ? WHERE turn_id = ?`)
+          .run(items.length, itemCommitment, batch.turn_id);
+      }
+    }
+    this.db.prepare(`DELETE FROM turn_stages WHERE turn_id = ?`).run(turnId);
+    for (const message of messages) {
+      this.db.prepare('UPDATE messages SET content = ? WHERE message_id = ?')
+        .run('', message.message_id);
+    }
+    fault('after_legacy_scrub');
+
+    const originalDeliveries = deliveries.map(delivery => ({
+      peerId: delivery.peer_id,
+      originalState: delivery.state,
+      relayMessageId: delivery.relay_message_id || (
+        delivery.checksum
+          ? stableId('relay_pc', `${delivery.turn_id}:${delivery.peer_id}:${delivery.checksum}`)
+          : null
+      ),
+      deliveredAt: delivery.delivered_at == null ? null : Number(delivery.delivered_at),
+      confirmedAt: delivery.confirmed_at == null ? null : Number(delivery.confirmed_at),
+      recoveryAckSeq: Number(delivery.recovery_ack_seq),
+      originalChecksum: delivery.checksum
+    }));
+    for (const delivery of deliveries) {
+      const nextState = delivery.state === 'waiting' ? 'redacted' : 'redaction_pending';
+      const relayMessageId = delivery.relay_message_id || (
+        delivery.checksum
+          ? stableId('relay_pc', `${delivery.turn_id}:${delivery.peer_id}:${delivery.checksum}`)
+          : null
+      );
+      const updated = this.db.prepare(`UPDATE cloud_deliveries
+        SET state = ?, payload_json = NULL, checksum = NULL, relay_message_id = ?,
+            attempts = 0, redaction_requested_at = ?, redaction_acknowledged_at = ?, updated_at = ?
+        WHERE turn_id = ? AND peer_id = ? AND state = ?
+          AND payload_json IS ? AND checksum IS ? AND relay_message_id IS ?
+          AND delivered_at IS ? AND confirmed_at IS ?`)
+        .run(nextState, relayMessageId,
+          nextState === 'redaction_pending' ? redactedAt : null,
+          nextState === 'redacted' ? redactedAt : null,
+          redactedAt, delivery.turn_id, delivery.peer_id, delivery.state,
+          delivery.payload_json, delivery.checksum, delivery.relay_message_id,
+          delivery.delivered_at, delivery.confirmed_at);
+      if (Number(updated.changes) !== 1) throw new Error('legacy conversation clear delivery CAS conflict');
+    }
+    const auditPayload = {
+      auditVersion: 'legacy_turn_redaction_v1',
+      controlId: control.controlId,
+      deliveryCommitment: contentHash({
+        auditVersion: 'legacy-turn-deliveries-v1', turnId, deliveries: originalDeliveries
+      }),
+      deliveryCount: originalDeliveries.length,
+      deliveries: originalDeliveries,
+      messageTombstoneCommitment,
+      messageTombstoneCount: messageTuples.length,
+      batchTombstoneCommitment,
+      batchTombstoneCount: batchTuples.length,
+      protocolVersion: Number(envelope.protocolVersion),
+      redactedAt,
+      roleId: row.character_id,
+      turnId
+    };
+    this.db.prepare(`INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+      VALUES ('legacy_turn_redaction', ?, 'redact', ?, ?, ?)`)
+      .run(turnId, canonicalJson(auditPayload), contentHash(auditPayload), redactedAt);
+    this.db.prepare(`UPDATE turns SET state = 'cancelled', worker_id = NULL,
+      memory_packet_json = NULL, brain_draft_json = NULL, supervisor_json = NULL,
+      reply_json = NULL, error_json = NULL, envelope_json = ?, route_reasons_json = '[]',
+      annotation_snapshot_json = '{}', authority_redacted_at = ?, updated_at = ?
+      WHERE turn_id = ? AND result_authority_version = 0`)
+      .run(canonicalJson({ redacted: true }), redactedAt, redactedAt, turnId);
+    fault('after_legacy_audit');
+  }
+
+  loadValidatedLegacyTurnRedactionInternal(turnId) {
+    const turn = this.db.prepare('SELECT * FROM turns WHERE turn_id = ?').get(String(turnId));
+    if (!turn || Number(turn.result_authority_version) !== 0
+      || turn.state !== 'cancelled'
+      || canonicalJson(parseJson(turn.envelope_json, null)) !== canonicalJson({ redacted: true })
+      || turn.authority_redacted_at == null
+      || turn.memory_packet_json !== null || turn.brain_draft_json !== null
+      || turn.supervisor_json !== null || turn.reply_json !== null
+      || turn.error_json !== null || turn.route_reasons_json !== '[]'
+      || turn.annotation_snapshot_json !== '{}'
+      || turn.authority_lineage_key != null
+      || turn.lineage_revision_at_creation != null
+      || turn.retry_of_turn_id != null
+      || turn.input_user_batch_id != null
+      || turn.agency_snapshot_checksum != null) {
+      throw new Error('legacy redaction authority conflict');
+    }
+    const audits = this.db.prepare(`
+      SELECT * FROM sync_log
+      WHERE entity_type = 'legacy_turn_redaction' AND entity_id = ?
+      ORDER BY seq
+    `).all(String(turnId));
+    if (audits.length !== 1) throw new Error('legacy redaction audit conflict');
+    const audit = audits[0];
+    const payload = parseJson(audit.payload_json, null);
+    const expectedKeys = [
+      'auditVersion', 'controlId', 'deliveryCommitment', 'deliveryCount',
+      'deliveries', 'messageTombstoneCommitment', 'messageTombstoneCount',
+      'batchTombstoneCommitment', 'batchTombstoneCount', 'protocolVersion',
+      'redactedAt', 'roleId', 'turnId'
+    ];
+    if (!payload || canonicalJson(Object.keys(payload).sort()) !== canonicalJson([...expectedKeys].sort())
+      || audit.operation !== 'redact' || audit.checksum !== contentHash(payload)
+      || payload.auditVersion !== 'legacy_turn_redaction_v1'
+      || payload.turnId !== turn.turn_id || payload.roleId !== turn.character_id
+      || payload.redactedAt !== Number(turn.authority_redacted_at)
+      || ![1, 2].includes(Number(payload.protocolVersion))
+      || !Number.isSafeInteger(payload.redactedAt) || payload.redactedAt <= 0
+      || !Array.isArray(payload.deliveries)
+      || payload.deliveryCount !== payload.deliveries.length
+      || !Number.isSafeInteger(payload.messageTombstoneCount)
+      || !Number.isSafeInteger(payload.batchTombstoneCount)) {
+      throw new Error('legacy redaction audit payload conflict');
+    }
+    const controlRow = this.db.prepare(
+      'SELECT * FROM conversation_clear_controls WHERE control_id = ?'
+    ).get(payload.controlId);
+    if (!controlRow || Number(controlRow.authority_version) !== 1
+      || controlRow.role_id !== turn.character_id
+      || Number(controlRow.applied_at) !== Number(payload.redactedAt)) {
+      throw new Error('legacy redaction control conflict');
+    }
+    validateConversationClearControl(parseJson(controlRow.semantic_json, null));
+    const messages = this.db.prepare(
+      'SELECT * FROM messages WHERE turn_id = ? ORDER BY message_id'
+    ).all(turn.turn_id);
+    const batchItems = this.db.prepare(
+      'SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY batch_id, sequence'
+    ).all(turn.turn_id);
+    const batchItemByMessage = new Map(batchItems.map(item => [item.message_id, item]));
+    const messageTuples = messages.map(message => ({
+      messageId: message.message_id,
+      turnId: message.turn_id,
+      batchId: batchItemByMessage.get(message.message_id)?.batch_id ?? null,
+      batchSequence: batchItemByMessage.has(message.message_id)
+        ? Number(batchItemByMessage.get(message.message_id).sequence) : null,
+      characterId: message.character_id,
+      speakerId: message.speaker_id,
+      speakerType: message.speaker_type,
+      recipientId: message.recipient_id,
+      sentAt: Number(message.sent_at),
+      origin: message.origin,
+      deviceId: message.device_id ?? null,
+      deviceSeq: message.device_seq == null ? null : Number(message.device_seq),
+      checksum: message.checksum
+    })).sort((a, b) => a.messageId.localeCompare(b.messageId));
+    if (messageTuples.length !== payload.messageTombstoneCount
+      || messages.some(message => message.content !== '')
+      || payload.messageTombstoneCommitment !== contentHash({
+        auditVersion: 'legacy-turn-messages-v1', turnId: turn.turn_id, messages: messageTuples
+      })) {
+      throw new Error('legacy redaction message closure conflict');
+    }
+    const batches = this.db.prepare(
+      'SELECT * FROM current_user_batches WHERE turn_id = ? ORDER BY batch_id'
+    ).all(turn.turn_id);
+    if (Number(payload.protocolVersion) === 1
+      ? batches.length !== 0 || batchItems.length !== 0 || payload.batchTombstoneCount !== 0
+      : payload.batchTombstoneCount !== batches.length) {
+      throw new Error('legacy redaction batch closure conflict');
+    }
+    const batchTuples = batches.map(batch => {
+      const items = batchItems.filter(item => item.turn_id === batch.turn_id);
+      if (items.some(item => item.message_json !== null
+        || Number(item.redacted_at) !== Number(payload.redactedAt))) {
+        throw new Error('legacy redaction batch item closure conflict');
+      }
+      const itemCommitment = contentHash({
+        auditVersion: 'legacy-turn-batch-items-v1',
+        turnId: batch.turn_id,
+        batchId: batch.batch_id,
+        items: items.map(item => ({
+          sequence: Number(item.sequence), messageId: item.message_id, checksum: item.checksum
+        }))
+      });
+      if (Number(batch.item_count) !== items.length
+        || batch.tombstone_commitment !== itemCommitment) {
+        throw new Error('legacy redaction batch parent closure conflict');
+      }
+      return {
+        turnId: batch.turn_id,
+        batchId: batch.batch_id,
+        characterId: batch.character_id,
+        sourceMessageId: batch.source_message_id,
+        startedAt: Number(batch.started_at),
+        committedAt: Number(batch.committed_at),
+        checksum: batch.checksum,
+        itemCount: items.length,
+        itemCommitment
+      };
+    });
+    if (payload.batchTombstoneCommitment !== contentHash({
+      auditVersion: 'legacy-turn-batches-v1', turnId: turn.turn_id, batches: batchTuples
+    })) {
+      throw new Error('legacy redaction batch commitment conflict');
+    }
+    const linkedIds = [
+      turn.turn_id,
+      ...messages.map(message => message.message_id),
+      ...batches.map(batch => batch.batch_id)
+    ];
+    const linkedMarks = linkedIds.map(() => '?').join(',') || "''";
+    if (Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM sync_log
+      WHERE entity_id IN (${linkedMarks}) AND entity_type <> 'legacy_turn_redaction'
+    `).get(...linkedIds).value) !== 0) {
+      throw new Error('legacy redaction linked sync closure conflict');
+    }
+    const messageIdSet = new Set(messages.map(message => message.message_id));
+    const messageMarksForAnnotations = [...messageIdSet].map(() => '?').join(',') || "''";
+    if (Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM annotations
+      WHERE turn_id = ? OR source_message_id IN (${messageMarksForAnnotations})
+    `).get(turn.turn_id, ...messageIdSet).value) !== 0) {
+      throw new Error('legacy redaction annotation closure conflict');
+    }
+    const session = this.db.prepare(
+      'SELECT updated_at FROM sessions WHERE role = ?'
+    ).get(turn.character_id);
+    if (session && (typeof session.updated_at !== 'number'
+      || !Number.isSafeInteger(session.updated_at)
+      || session.updated_at <= Number(payload.redactedAt))) {
+      throw new Error('legacy redaction session closure conflict');
+    }
+    if (Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM interaction_lanes
+      WHERE generating_turn_id = ? OR latest_user_batch_id IN (
+        SELECT batch_id FROM current_user_batches WHERE turn_id = ?
+      )
+    `).get(turn.turn_id, turn.turn_id).value) !== 0) {
+      throw new Error('legacy redaction interaction lane closure conflict');
+    }
+    if (this.db.prepare(`
+      SELECT 1 FROM visible_result_groups WHERE authoritative_turn_id = ?
+      UNION ALL SELECT 1 FROM visible_commit_receipts WHERE authoritative_turn_id = ?
+      LIMIT 1
+    `).get(turn.turn_id, turn.turn_id)) {
+      throw new Error('legacy redaction canonical result closure conflict');
+    }
+    const directLinkedCounts = [
+      ['turn_stages', 'SELECT COUNT(*) AS value FROM turn_stages WHERE turn_id = ?'],
+      ['annotations', 'SELECT COUNT(*) AS value FROM annotations WHERE turn_id = ?'],
+      ['diagnostics', 'SELECT COUNT(*) AS value FROM diagnostics WHERE turn_id = ?'],
+      ['consolidation_jobs', 'SELECT COUNT(*) AS value FROM consolidation_jobs WHERE turn_id = ?'],
+      ['stance_records', 'SELECT COUNT(*) AS value FROM stance_records WHERE source_turn_id = ?'],
+      ['cognitive_states', 'SELECT COUNT(*) AS value FROM cognitive_states WHERE last_turn_id = ?']
+    ];
+    for (const [table, sql] of directLinkedCounts) {
+      if (Number(this.db.prepare(sql).get(turn.turn_id).value) !== 0) {
+        throw new Error(`legacy redaction ${table} closure conflict`);
+      }
+    }
+    if (Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM consolidation_jobs
+      WHERE subject_type = 'turn' AND subject_id = ?
+    `).get(turn.turn_id).value) !== 0) {
+      throw new Error('legacy redaction consolidation job closure conflict');
+    }
+    const deliveries = this.db.prepare(
+      'SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id'
+    ).all(turn.turn_id);
+    if (deliveries.length !== payload.deliveries.length) {
+      throw new Error('legacy redaction delivery count conflict');
+    }
+    const seen = new Set();
+    for (const original of payload.deliveries) {
+      const keys = [
+        'confirmedAt', 'deliveredAt', 'originalChecksum', 'originalState',
+        'peerId', 'recoveryAckSeq', 'relayMessageId'
+      ];
+      if (!original || canonicalJson(Object.keys(original).sort()) !== canonicalJson(keys)
+        || typeof original.peerId !== 'string' || !original.peerId.trim()
+        || seen.has(original.peerId)
+        || !['waiting', 'pending', 'mailboxed', 'confirmed', 'delivered'].includes(original.originalState)
+        || !Number.isSafeInteger(original.recoveryAckSeq) || original.recoveryAckSeq < 0
+        || (original.originalChecksum !== null
+          && (typeof original.originalChecksum !== 'string'
+            || !/^[a-f0-9]{64}$/.test(original.originalChecksum)))
+        || (original.relayMessageId !== null
+          && (typeof original.relayMessageId !== 'string' || !original.relayMessageId.trim()))) {
+        throw new Error('legacy redaction delivery audit conflict');
+      }
+      if (original.originalState === 'waiting'
+        && (original.originalChecksum !== null || original.relayMessageId !== null)) {
+        throw new Error('legacy redaction waiting audit conflict');
+      }
+      if (original.originalState !== 'waiting' && original.originalChecksum === null) {
+        throw new Error('legacy redaction original checksum conflict');
+      }
+      const nativeTime = (value, name, { positive = false } = {}) => {
+        if (value !== null && (typeof value !== 'number'
+          || !Number.isSafeInteger(value)
+          || (positive && value <= 0))) {
+          throw new Error(`legacy redaction ${name} timestamp conflict`);
+        }
+        return value;
+      };
+      const deliveredAt = nativeTime(original.deliveredAt, 'deliveredAt', {
+        positive: original.originalState !== 'waiting' && original.originalState !== 'pending'
+      });
+      const confirmedAt = nativeTime(original.confirmedAt, 'confirmedAt', {
+        positive: original.originalState === 'confirmed'
+          || (original.originalState === 'delivered' && original.confirmedAt !== null)
+      });
+      if (['waiting', 'pending'].includes(original.originalState)
+        && (deliveredAt !== null || confirmedAt !== null)) {
+        throw new Error('legacy redaction delivery time state conflict');
+      }
+      if (original.originalState === 'mailboxed'
+        && (deliveredAt === null || confirmedAt !== null)) {
+        throw new Error('legacy redaction mailbox time conflict');
+      }
+      if (original.originalState === 'confirmed'
+        && (deliveredAt === null || confirmedAt === null || confirmedAt < deliveredAt)) {
+        throw new Error('legacy redaction confirmed time conflict');
+      }
+      if (original.originalState === 'delivered'
+        && deliveredAt === null) {
+        throw new Error('legacy redaction delivered time conflict');
+      }
+      seen.add(original.peerId);
+      const current = deliveries.find(row => row.peer_id === original.peerId);
+      if (!current || current.payload_json !== null || current.checksum !== null
+        || current.authority_group_id !== null || current.authority_commit_checksum !== null
+        || current.attempts !== 0
+        || typeof current.attempts !== 'number'
+        || Number(current.recovery_ack_seq) !== original.recoveryAckSeq) {
+        throw new Error('legacy redaction delivery closure conflict');
+      }
+      if (original.originalState === 'waiting') {
+        if (current.state !== 'redacted' || current.relay_message_id !== null
+          || Number(current.redaction_acknowledged_at) !== Number(payload.redactedAt)
+          || current.redaction_requested_at !== null
+          || current.delivered_at !== null || current.confirmed_at !== null) {
+          throw new Error('legacy redaction waiting closure conflict');
+        }
+      } else {
+        const expectedRelay = original.originalChecksum
+          ? stableId('relay_pc', `${turn.turn_id}:${original.peerId}:${original.originalChecksum}`)
+          : null;
+        if (current.state !== 'redaction_pending' || !current.relay_message_id
+          || current.relay_message_id !== expectedRelay
+          || original.relayMessageId !== expectedRelay
+          || Number(current.redaction_requested_at) !== Number(payload.redactedAt)
+          || current.redaction_acknowledged_at !== null
+          || (current.delivered_at == null ? deliveredAt !== null
+            : (typeof current.delivered_at !== 'number'
+              || !Number.isSafeInteger(current.delivered_at)
+              || current.delivered_at !== deliveredAt))
+          || (current.confirmed_at == null ? confirmedAt !== null
+            : (typeof current.confirmed_at !== 'number'
+              || !Number.isSafeInteger(current.confirmed_at)
+              || current.confirmed_at !== confirmedAt))) {
+          throw new Error('legacy redaction pending closure conflict');
+        }
+      }
+    }
+    if (seen.size !== deliveries.length
+      || payload.deliveryCommitment !== contentHash({
+        auditVersion: 'legacy-turn-deliveries-v1',
+        turnId: turn.turn_id,
+        deliveries: payload.deliveries
+      })) {
+      throw new Error('legacy redaction delivery commitment conflict');
+    }
+    return Object.freeze({
+      kind: 'legacy_turn_redaction_v1',
+      turnId: turn.turn_id,
+      auditChecksum: audit.checksum
+    });
+  }
+
+  publicLegacyRedactedTurnStatusInternal(turnId) {
+    this.loadValidatedLegacyTurnRedactionInternal(turnId);
+    return Object.freeze({ status: 'redacted', deliverable: false, terminal: true });
+  }
+
+  assertLegacyRedactionAuditClosureInternal() {
+    const rows = this.db.prepare(`
+      SELECT entity_id FROM sync_log
+      WHERE entity_type = 'legacy_turn_redaction'
+      ORDER BY entity_id
+    `).all();
+    for (const row of rows) this.loadValidatedLegacyTurnRedactionInternal(row.entity_id);
+    const redactedTurns = this.db.prepare(`
+      SELECT turn_id FROM turns
+      WHERE result_authority_version = 0
+        AND envelope_json = ?
+      ORDER BY turn_id
+    `).all(canonicalJson({ redacted: true }));
+    for (const row of redactedTurns) this.loadValidatedLegacyTurnRedactionInternal(row.turn_id);
   }
 
   redactCanonicalConversationLineageInternal({ lineage, redactedAt, fault, faultAfterStep = null }) {
@@ -7163,6 +7970,33 @@ export class YuqiStore {
         if (canonicalJson(parseJson(byId.semantic_json, null)) !== canonicalJson(currentControl)) {
           throw new Error('conversation clear control replay conflict');
         }
+        const replayAudits = this.db.prepare(`
+          SELECT entity_id, payload_json FROM sync_log
+          WHERE entity_type = 'legacy_turn_redaction'
+          ORDER BY entity_id
+        `).all();
+        for (const audit of replayAudits) {
+          const payload = parseJson(audit.payload_json, null);
+          if (payload?.controlId === currentControl.controlId) {
+            this.loadValidatedLegacyTurnRedactionInternal(audit.entity_id);
+          }
+        }
+        const replayLineages = this.db.prepare(`
+          SELECT DISTINCT authority_lineage_key FROM turns
+          WHERE character_id = ? AND result_authority_version = 1
+            AND lane_key = 'private_chat' AND authority_redacted_at IS NOT NULL
+        `).all(currentControl.roleId);
+        for (const row of replayLineages) {
+          const lineage = this.db.prepare(
+            'SELECT * FROM turn_authority_lineages WHERE lineage_key = ?'
+          ).get(row.authority_lineage_key);
+          if (!lineage) throw new Error('conversation clear replay lineage conflict');
+          if (lineage.committed_group_id) {
+            this.assertVisibleGroupAuthorityInternal(lineage.committed_group_id, { purpose: 'reopen' });
+          } else {
+            this.assertRedactedLineageAuthorityInternal(lineage.lineage_key, { purpose: 'reopen' });
+          }
+        }
         return proof;
       }
       const byRoleEpoch = this.db.prepare(
@@ -7198,40 +8032,11 @@ export class YuqiStore {
         throw new Error('conversation clear boundary conflict');
       }
 
-      const affectedAuthority = this.assertCanonicalConversationClearAffectedSetInternal({
+      const frozenAuthority = this.freezeConversationClearAffectedAuthorityInternal({
         roleId: currentControl.roleId,
         clearEpoch: currentControl.clearEpoch,
         boundary: currentControl.clearedThroughSequence
       });
-      for (const closure of affectedAuthority.closures) {
-        if (!closure.alreadyRedacted) {
-          this.redactCanonicalConversationLineageInternal({
-            lineage: closure.lineage,
-            redactedAt: appliedAt,
-            fault,
-            faultAfterStep
-          });
-        }
-      }
-
-      const updatedLane = this.db.prepare(`
-        UPDATE interaction_lanes
-        SET revision = revision + 1,
-            clear_epoch = ?,
-            cleared_through_sequence = ?,
-            updated_at = ?
-        WHERE role_id = ? AND lane_key = ? AND revision = ?
-      `).run(
-        currentControl.clearEpoch,
-        currentControl.clearedThroughSequence,
-        appliedAt,
-        currentControl.roleId,
-        laneKey,
-        Number(lane.revision)
-      );
-      if (Number(updatedLane.changes) !== 1) throw new Error('conversation clear lane CAS conflict');
-      fault('after_lane_update');
-
       const semanticJson = canonicalJson(currentControl);
       const appliedBody = {
         protocolVersion: 3,
@@ -7268,10 +8073,58 @@ export class YuqiStore {
         semanticJson
       );
       fault('after_control_insert');
+      for (const closure of frozenAuthority.authority.closures) {
+        if (!closure.alreadyRedacted) {
+          this.redactCanonicalConversationLineageInternal({
+            lineage: closure.lineage,
+            redactedAt: appliedAt,
+            fault,
+            faultAfterStep
+          });
+        }
+      }
+      for (const entry of frozenAuthority.legacy) {
+        this.redactLegacyConversationTurnInternal({
+          entry,
+          redactedAt: appliedAt,
+          control: currentControl,
+          fault
+        });
+      }
+
+      const updatedLane = this.db.prepare(`
+        UPDATE interaction_lanes
+        SET revision = revision + 1,
+            clear_epoch = ?,
+            cleared_through_sequence = ?,
+            updated_at = ?
+        WHERE role_id = ? AND lane_key = ? AND revision = ?
+      `).run(
+        currentControl.clearEpoch,
+        currentControl.clearedThroughSequence,
+        appliedAt,
+        currentControl.roleId,
+        laneKey,
+        Number(lane.revision)
+      );
+      if (Number(updatedLane.changes) !== 1) throw new Error('conversation clear lane CAS conflict');
+      fault('after_lane_update');
+
       const persisted = this.db.prepare(
         'SELECT * FROM conversation_clear_controls WHERE control_id = ?'
       ).get(currentControl.controlId);
       if (!persisted) throw new Error('conversation clear persisted row missing');
+      for (const entry of frozenAuthority.legacy) {
+        this.loadValidatedLegacyTurnRedactionInternal(entry.row.turn_id);
+      }
+      for (const closure of frozenAuthority.authority.closures) {
+        if (closure.lineage.committed_group_id) {
+          this.assertVisibleGroupAuthorityInternal(closure.lineage.committed_group_id, { purpose: 'reopen' });
+        } else {
+          this.assertRedactedLineageAuthorityInternal(closure.lineage.lineage_key, { purpose: 'reopen' });
+        }
+      }
+      fault('after_post_write_validation');
       fault('after_applied_projection');
       return assertPersistedRow(persisted);
     });
@@ -11009,6 +11862,7 @@ export class YuqiStore {
   registerCloudDelivery(turnId, peerId, recoveryAckSeq = 0) {
     const turn = this.getTurn(turnId);
     if (!turn) throw new Error('turn not found');
+    this.assertLegacyTurnMutableInternal(turn);
     if (turn.resultAuthorityVersion === 1) {
       throw new Error('canonical delivery API required');
     }
@@ -11539,6 +12393,7 @@ export class YuqiStore {
   recoverFailedDraft(turnId, { peerId, sentAt = null } = {}) {
     const current = this.getTurn(turnId);
     if (!current) throw new Error('turn not found');
+    this.assertLegacyTurnMutableInternal(current);
     if (current.resultAuthorityVersion === 1) {
       throw new Error('canonical turn API required for failed draft recovery');
     }
@@ -11607,6 +12462,7 @@ export class YuqiStore {
   requeueTransientFailedTurn(turnId) {
     const current = this.getTurn(turnId);
     if (!current) throw new Error('turn not found');
+    this.assertLegacyTurnMutableInternal(current);
     if (current.resultAuthorityVersion === 1) {
       throw new Error('canonical turn API required for transient requeue');
     }
@@ -11728,8 +12584,17 @@ export class YuqiStore {
       WHERE d.turn_id = ? AND d.peer_id = ?
     `).get(String(turnId), String(peerId));
     if (!row) throw new Error('cloud delivery not found');
+    const turn = this.getTurn(turnId);
+    this.assertLegacyTurnMutableInternal(turn);
     if (row.authority_group_id != null || Number(row.result_authority_version) !== 0) {
       throw new Error('canonical delivery API required');
+    }
+  }
+
+  assertLegacyTurnMutableInternal(turn) {
+    if (!turn || turn.authorityRedactedAt != null
+      || canonicalJson(parseJson(turn.envelopeJson, null)) === canonicalJson({ redacted: true })) {
+      throw new Error('redacted legacy turn is immutable');
     }
   }
 
