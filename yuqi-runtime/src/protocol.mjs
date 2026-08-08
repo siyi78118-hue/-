@@ -61,6 +61,237 @@ export function contentHash(value) {
   return createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex');
 }
 
+const YUQI_BACKUP_RECEIPT_KEYS = Object.freeze([
+  'receiptVersion',
+  'receiptId',
+  'roleId',
+  'manifestChecksum',
+  'snapshotSha256',
+  'logicalChecksum',
+  'createdAt',
+  'receiptChecksum'
+]);
+
+const ANDROID_ROOM_BACKUP_HEAD_KEYS = Object.freeze([
+  'headVersion', 'roleId', 'roomSchemaVersion', 'cursor',
+  'lifecycleHead', 'capturedAt', 'checksum'
+]);
+const ANDROID_ROOM_CURSOR_KEYS = Object.freeze([
+  'characterId', 'nativeCompletedTurnId', 'nativeCompletedGroupId',
+  'nativeCompletedSequence', 'uiAppliedTurnId', 'uiAppliedGroupId',
+  'uiAppliedSequence', 'localSequence', 'clearedThroughSequence',
+  'clearEpoch', 'clearedAt', 'chatOpen', 'updatedAt', 'cursorChecksum'
+]);
+const ANDROID_ROOM_LIFECYCLE_HEAD_KEYS = Object.freeze([
+  'controlId', 'controlKind', 'peerId', 'state', 'semanticChecksum',
+  'clearEpoch', 'clearedThroughSequence', 'requestedAt', 'appliedAt', 'updatedAt'
+]);
+const ANDROID_LIFECYCLE_STATES = new Set([
+  'waiting', 'pending', 'relay_accepted', 'applied', 'quarantined'
+]);
+
+function requireNativeBackupId(value, label) {
+  if (typeof value !== 'string' || !ID_PATTERN.test(value)) throw new Error(`invalid ${label}`);
+  return value;
+}
+
+function requireNativeBackupInteger(value, label, { positive = false } = {}) {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)
+    || value < (positive ? 1 : 0)) throw new Error(`invalid ${label}`);
+  return value;
+}
+
+function requireNullableBackupId(value, label) {
+  return value == null ? null : requireNativeBackupId(value, label);
+}
+
+function validateAndroidRoomCursor(raw, roleId) {
+  assertClosedKeys(raw, ANDROID_ROOM_CURSOR_KEYS, 'Android Room backup cursor');
+  const cursor = {
+    characterId: requireNativeBackupId(raw.characterId, 'Android Room backup cursor characterId'),
+    nativeCompletedTurnId: requireNullableBackupId(raw.nativeCompletedTurnId, 'Android Room backup cursor native turn'),
+    nativeCompletedGroupId: requireNullableBackupId(raw.nativeCompletedGroupId, 'Android Room backup cursor native group'),
+    nativeCompletedSequence: requireNativeBackupInteger(raw.nativeCompletedSequence, 'Android Room backup cursor native sequence'),
+    uiAppliedTurnId: requireNullableBackupId(raw.uiAppliedTurnId, 'Android Room backup cursor UI turn'),
+    uiAppliedGroupId: requireNullableBackupId(raw.uiAppliedGroupId, 'Android Room backup cursor UI group'),
+    uiAppliedSequence: requireNativeBackupInteger(raw.uiAppliedSequence, 'Android Room backup cursor UI sequence'),
+    localSequence: requireNativeBackupInteger(raw.localSequence, 'Android Room backup cursor local sequence'),
+    clearedThroughSequence: requireNativeBackupInteger(raw.clearedThroughSequence, 'Android Room backup cursor cleared sequence'),
+    clearEpoch: requireNativeBackupInteger(raw.clearEpoch, 'Android Room backup cursor clear epoch'),
+    clearedAt: requireNativeBackupInteger(raw.clearedAt, 'Android Room backup cursor clearedAt'),
+    chatOpen: raw.chatOpen,
+    updatedAt: requireNativeBackupInteger(raw.updatedAt, 'Android Room backup cursor updatedAt')
+  };
+  if (cursor.characterId !== roleId || typeof cursor.chatOpen !== 'boolean') {
+    throw new Error('Android Room backup cursor authority conflict');
+  }
+  for (const [turnKey, groupKey, sequenceKey] of [
+    ['nativeCompletedTurnId', 'nativeCompletedGroupId', 'nativeCompletedSequence'],
+    ['uiAppliedTurnId', 'uiAppliedGroupId', 'uiAppliedSequence']
+  ]) {
+    const absent = cursor[turnKey] == null && cursor[groupKey] == null;
+    const present = cursor[turnKey] != null && cursor[groupKey] != null;
+    if ((!absent && !present) || (cursor[sequenceKey] === 0 ? !absent : !present)) {
+      throw new Error('Android Room backup cursor identity conflict');
+    }
+  }
+  if (cursor.uiAppliedSequence > cursor.nativeCompletedSequence
+    || cursor.nativeCompletedSequence > cursor.localSequence
+    || cursor.clearedThroughSequence > cursor.localSequence
+    || (cursor.nativeCompletedSequence === cursor.uiAppliedSequence
+      && cursor.nativeCompletedSequence > 0
+      && (cursor.nativeCompletedTurnId !== cursor.uiAppliedTurnId
+        || cursor.nativeCompletedGroupId !== cursor.uiAppliedGroupId))) {
+    throw new Error('Android Room backup cursor sequence conflict');
+  }
+  if (typeof raw.cursorChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.cursorChecksum)) {
+    throw new Error('Android Room backup cursor checksum conflict');
+  }
+  const checksum = contentHash({ contract: 'conversation-cursor-clear-v1', ...cursor });
+  if (raw.cursorChecksum !== checksum) throw new Error('Android Room backup cursor checksum conflict');
+  return { ...cursor, cursorChecksum: checksum };
+}
+
+function validateAndroidRoomLifecycleHead(raw) {
+  if (raw == null) return null;
+  assertClosedKeys(raw, ANDROID_ROOM_LIFECYCLE_HEAD_KEYS, 'Android Room backup lifecycle head');
+  const controlKind = raw.controlKind;
+  const state = raw.state;
+  if (controlKind !== 'conversation_clear_v1' && controlKind !== 'role_delete_v1') {
+    throw new Error('Android Room backup lifecycle kind conflict');
+  }
+  if (typeof state !== 'string' || !ANDROID_LIFECYCLE_STATES.has(state)) {
+    throw new Error('Android Room backup lifecycle state conflict');
+  }
+  if (typeof raw.semanticChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.semanticChecksum)) {
+    throw new Error('Android Room backup lifecycle checksum conflict');
+  }
+  const clearEpoch = raw.clearEpoch == null ? null
+    : requireNativeBackupInteger(raw.clearEpoch, 'Android Room backup lifecycle clear epoch');
+  const clearedThroughSequence = raw.clearedThroughSequence == null ? null
+    : requireNativeBackupInteger(raw.clearedThroughSequence, 'Android Room backup lifecycle cleared sequence');
+  if (controlKind === 'conversation_clear_v1'
+    ? clearEpoch == null || clearedThroughSequence == null
+    : clearEpoch != null || clearedThroughSequence != null) {
+    throw new Error('Android Room backup lifecycle projection conflict');
+  }
+  const appliedAt = raw.appliedAt == null ? null
+    : requireNativeBackupInteger(raw.appliedAt, 'Android Room backup lifecycle appliedAt', { positive: true });
+  const requestedAt = requireNativeBackupInteger(
+    raw.requestedAt, 'Android Room backup lifecycle requestedAt', { positive: true });
+  const updatedAt = requireNativeBackupInteger(
+    raw.updatedAt, 'Android Room backup lifecycle updatedAt', { positive: true });
+  if ((state === 'applied') !== (appliedAt != null)
+    || updatedAt < requestedAt || (appliedAt != null && (appliedAt < requestedAt || appliedAt > updatedAt))) {
+    throw new Error('Android Room backup lifecycle time conflict');
+  }
+  return {
+    controlId: requireNativeBackupId(raw.controlId, 'Android Room backup lifecycle controlId'),
+    controlKind,
+    peerId: requireNativeBackupId(raw.peerId, 'Android Room backup lifecycle peerId'),
+    state,
+    semanticChecksum: raw.semanticChecksum,
+    clearEpoch,
+    clearedThroughSequence,
+    requestedAt,
+    appliedAt,
+    updatedAt
+  };
+}
+
+export function validateAndroidRoomBackupHead(raw, { roleId: expectedRoleId } = {}) {
+  assertClosedKeys(raw, ANDROID_ROOM_BACKUP_HEAD_KEYS, 'Android Room backup head');
+  if (raw.headVersion !== 'android-room-backup-head-v1') {
+    throw new Error('invalid Android Room backup head version');
+  }
+  const roleId = requireNativeBackupId(raw.roleId, 'Android Room backup head roleId');
+  if (expectedRoleId != null && roleId !== expectedRoleId) {
+    throw new Error('Android Room backup head role conflict');
+  }
+  const normalized = {
+    headVersion: 'android-room-backup-head-v1',
+    roleId,
+    roomSchemaVersion: requireNativeBackupInteger(
+      raw.roomSchemaVersion, 'Android Room backup head schema', { positive: true }),
+    cursor: validateAndroidRoomCursor(raw.cursor, roleId),
+    lifecycleHead: validateAndroidRoomLifecycleHead(raw.lifecycleHead),
+    capturedAt: requireNativeBackupInteger(
+      raw.capturedAt, 'Android Room backup head capturedAt', { positive: true })
+  };
+  if (normalized.capturedAt < normalized.cursor.updatedAt
+    || (normalized.lifecycleHead != null
+      && normalized.capturedAt < normalized.lifecycleHead.updatedAt)
+    || (normalized.lifecycleHead?.controlKind === 'conversation_clear_v1'
+      && (normalized.lifecycleHead.clearEpoch !== normalized.cursor.clearEpoch
+        || normalized.lifecycleHead.clearedThroughSequence
+          !== normalized.cursor.clearedThroughSequence))) {
+    throw new Error('Android Room backup head lifecycle projection conflict');
+  }
+  if (typeof raw.checksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.checksum)
+    || raw.checksum !== contentHash(normalized)) {
+    throw new Error('Android Room backup head checksum conflict');
+  }
+  return { ...normalized, checksum: raw.checksum };
+}
+
+export function deriveYuqiBackupReceiptId({
+  roleId,
+  manifestChecksum,
+  snapshotSha256,
+  logicalChecksum,
+  createdAt
+}) {
+  const basis = {
+    contract: 'yuqi-backup-receipt-id-v1',
+    roleId,
+    manifestChecksum,
+    snapshotSha256,
+    logicalChecksum,
+    createdAt
+  };
+  return `bkrcpt_${contentHash(basis).slice(0, 24)}`;
+}
+
+export function validateYuqiBackupReceipt(raw) {
+  assertClosedKeys(raw, YUQI_BACKUP_RECEIPT_KEYS, 'Yuqi backup receipt');
+  if (raw.receiptVersion !== 'yuqi-backup-receipt-v1') {
+    throw new Error('invalid Yuqi backup receipt version');
+  }
+  for (const key of ['receiptId', 'roleId', 'manifestChecksum', 'snapshotSha256', 'logicalChecksum', 'receiptChecksum']) {
+    if (typeof raw[key] !== 'string') throw new Error(`invalid Yuqi backup receipt ${key}`);
+  }
+  const receiptId = requireId(raw.receiptId, 'Yuqi backup receipt id', 'bkrcpt_');
+  const roleId = requireId(raw.roleId, 'Yuqi backup receipt role');
+  const checksums = {};
+  for (const key of ['manifestChecksum', 'snapshotSha256', 'logicalChecksum', 'receiptChecksum']) {
+    if (!/^[a-f0-9]{64}$/.test(raw[key])) throw new Error(`invalid Yuqi backup receipt ${key}`);
+    checksums[key] = raw[key];
+  }
+  if (typeof raw.createdAt !== 'number') throw new Error('invalid Yuqi backup receipt createdAt');
+  const createdAt = requireTimestamp(raw.createdAt, 'Yuqi backup receipt createdAt');
+  const expectedId = deriveYuqiBackupReceiptId({
+    roleId,
+    manifestChecksum: checksums.manifestChecksum,
+    snapshotSha256: checksums.snapshotSha256,
+    logicalChecksum: checksums.logicalChecksum,
+    createdAt
+  });
+  if (receiptId !== expectedId) throw new Error('Yuqi backup receipt id conflict');
+  const normalized = {
+    receiptVersion: 'yuqi-backup-receipt-v1',
+    receiptId,
+    roleId,
+    manifestChecksum: checksums.manifestChecksum,
+    snapshotSha256: checksums.snapshotSha256,
+    logicalChecksum: checksums.logicalChecksum,
+    createdAt
+  };
+  if (checksums.receiptChecksum !== contentHash(normalized)) {
+    throw new Error('Yuqi backup receipt checksum conflict');
+  }
+  return { ...normalized, receiptChecksum: checksums.receiptChecksum };
+}
+
 export function deliveryItemsForResult(result = {}) {
   const turnId = String(result?.turnId || '');
   if (!turnId) return [];

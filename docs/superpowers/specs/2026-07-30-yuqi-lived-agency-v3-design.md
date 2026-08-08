@@ -1394,7 +1394,11 @@ wire key 精确为
 `sync_log(entity_type='backup_receipt',entity_id=receiptId,operation='create')` 存在唯一
 且 canonical payload/checksum 完全一致时才允许删除；该 audit 与
 `role_deletion` audit 都不能被普通聊天清除删除。
-Web 只有在 `POST /v3/backups/yuqi` 返回 receipt 后才调用 native
+Web/Android 以闭合
+`{protocolVersion:3,type:'YUQI_BACKUP_REQUEST',requestVersion:'yuqi-backup-request-v1',`
+`roleId,peerId,requestedAt,androidRoomHead,checksum}` 调用
+`POST /v3/backups/yuqi`；安卓发起时 `androidRoomHead` 必须存在，桌面/CLI 捕获才为
+null。Web 只有在 endpoint 返回 receipt 后才调用 native
 `createRoleDelete(characterId,expectedCursorChecksum,backupReceipt)`；peer 仍由
 `AlSecretStore` 注入，不是 Web 参数。该 native transaction 先验证并把完整 receipt
 写入 `semantic_json`，再删除/tombstone 本地角色行，同时保留 lifecycle control。
@@ -1409,8 +1413,15 @@ stance、state、memory、plan、lane、rollout 和 authority rows；全局 rele
 backup 必须是 transactionally consistent SQLite snapshot，并生成 exact
 `yuqi-backup-manifest-v1`：
 `manifestVersion,createdAt,schemaVersion,snapshotSha256,logicalChecksum,`
-`tableRowCounts,roleLifecycleHeads,redactedInvariantSummary,manifestChecksum`。数组按
+`tableRowCounts,roleLifecycleHeads,redactedInvariantSummary,androidRoomHead,`
+`manifestChecksum`。数组按
 table/role identity 排序，manifestChecksum 是其余字段 canonical JSON 的 SHA-256。
+`androidRoomHead` 为 null，或闭合
+`{headVersion,roleId,roomSchemaVersion,cursor,lifecycleHead,capturedAt,checksum}`；其中
+cursor 逐字段复用 `conversation-cursor-clear-v1` checksum，lifecycleHead 只允许当前
+clear/delete 控制的闭合身份、状态、epoch/boundary 与时间投影，顶层 checksum 再覆盖
+完整 Room head。它是受验证的 Android schema/cursor/control-head 元数据，不把 Room
+行伪装成 PC snapshot 内的数据，也不宣称仅凭该 summary 可以恢复 Room。
 这是 content-addressed integrity manifest，不声称一个不存在的公钥签名；信任边界是
 本机受保护数据库、authenticated bridge 与上面的 immutable backup receipt audit。
 `VACUUM INTO` 成功本身不是验收。restore 只能先写 clone，对 clone 执行迁移、完整 reopen invariant、

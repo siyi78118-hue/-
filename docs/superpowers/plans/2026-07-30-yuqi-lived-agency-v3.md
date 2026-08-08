@@ -8432,6 +8432,8 @@ Stop after this commit for independent review.
 - Modify: `tavern-app/index.html`
 - Modify: `tests/yuqi-ui-contract.test.mjs`
 - Modify: `tests/test-basic.test.mjs`
+- Modify: `tests/yuqi-memory-backup.test.mjs`
+- Modify: `package.json`
 - Modify: `scripts/backup-yuqi-memory.mjs`
 - Modify: `scripts/audit-yuqi-memory.mjs`
 - Create: `scripts/restore-yuqi-memory.mjs`
@@ -8496,7 +8498,9 @@ Stop after this commit for independent review.
 - Role deletion first calls authenticated LAN
   `POST /v3/backups/yuqi` with the closed request
   `{protocolVersion:3,type:'YUQI_BACKUP_REQUEST',requestVersion:'yuqi-backup-request-v1',`
-  `roleId,peerId,requestedAt,checksum}`. The endpoint invokes the exported
+  `roleId,peerId,requestedAt,androidRoomHead,checksum}`. `androidRoomHead` is
+  required for an Android-initiated role-deletion backup and is null only for a
+  desktop/CLI capture. The endpoint invokes the exported
   `createVerifiedYuqiBackup()` implementation, appends the immutable
   `backup_receipt` audit, and returns that receipt. No Room/Web role row is
   deleted before this response is durably stored in `semantic_json`. If PC is
@@ -8505,7 +8509,8 @@ Stop after this commit for independent review.
 - Backup uses a transactionally consistent SQLite snapshot and writes the exact
   closed `yuqi-backup-manifest-v1` object with keys
   `manifestVersion,createdAt,schemaVersion,snapshotSha256,logicalChecksum,`
-  `tableRowCounts,roleLifecycleHeads,redactedInvariantSummary,manifestChecksum`.
+  `tableRowCounts,roleLifecycleHeads,redactedInvariantSummary,androidRoomHead,`
+  `manifestChecksum`.
   Object keys and each role/table array are canonically sorted; the final field
   is SHA-256 over the other fields. This is a content-addressed integrity
   manifest, not a claim of public-key authenticity: no unspecified signing key
@@ -8522,6 +8527,87 @@ Stop after this commit for independent review.
 - Clear→backup→restore→restart must remain cleared. A pre-clear backup restored
   deliberately must restore its pre-clear history and its older clear cursor as
   one coherent snapshot; it may not merge with newer relay/control state.
+
+**Exact backup artifact and receipt contract (20E authority amendment):**
+- One capture owns one native-safe-integer `createdAt`. It first checkpoints the
+  source, writes a `VACUUM INTO` snapshot, closes the source handle, and then
+  derives every manifest field from the immutable snapshot file rather than
+  rereading the live database. The verified role-delete artifact is stored in
+  `snapshots/verified/<receiptId>/` as exactly `snapshot.sqlite` and
+  `manifest.json`; ordinary rotating snapshots never prune a verified directory
+  referenced by a `backup_receipt` audit.
+- `tableRowCounts` is a table-name-sorted array of exact objects
+  `{tableName,rowCount}`. `logicalChecksum` is SHA-256 of UTF-8 canonical JSON of
+  `{contract:'yuqi-backup-logical-v1',schemaVersion,tables}`. `tables` is sorted
+  by `tableName`; each entry is exactly `{tableName,createSql,rows}`. Every row is
+  encoded as an array in `PRAGMA table_info` column order. Each SQLite cell is
+  one closed tagged object: `{type:'null'}`, `{type:'integer',value:'<decimal>'}`,
+  `{type:'real',value:'<SQLite quote() text>'}`, `{type:'text',value:'<text>'}` or
+  `{type:'blob',value:'<lowercase hex>'}`. Rows sort by their canonical tagged
+  representation and duplicates remain duplicated. This makes null/text/blob,
+  integer width, row order and duplicate rows unambiguous across Node versions.
+- `roleLifecycleHeads` is a role-id-sorted array. Every entry is exactly
+  `{roleId,clearHead,laneHeads,lineageHeads}`. `clearHead` is null or the highest
+  clear epoch projected as
+  `{controlId,clearEpoch,clearedThroughSequence,appliedAt,checksum}`.
+  `laneHeads` sorts by `laneKey` and contains exactly
+  `{laneKey,revision,clearEpoch,clearedThroughSequence,lastCommitChecksum}`.
+  `lineageHeads` sorts by `lineageKey` and contains exactly
+  `{lineageKey,laneKey,latestTurnId,revision,state,committedGroupId,redactedAt}`.
+  Roles are the sorted union present in controls, lanes and lineages; no current
+  UI character list is allowed to hide an authority-bearing role.
+- `androidRoomHead` is null for a desktop/CLI capture. For an Android-initiated
+  capture it is the exact closed object
+  `{headVersion,roleId,roomSchemaVersion,cursor,lifecycleHead,capturedAt,checksum}`.
+  `headVersion` is `android-room-backup-head-v1`; roleId must equal the requested
+  backup role; schema/capture values are native safe integers; checksum hashes
+  the other six fields. `cursor` is exactly
+  `{characterId,nativeCompletedTurnId,nativeCompletedGroupId,`
+  `nativeCompletedSequence,uiAppliedTurnId,uiAppliedGroupId,uiAppliedSequence,`
+  `localSequence,clearedThroughSequence,clearEpoch,clearedAt,chatOpen,updatedAt,`
+  `cursorChecksum}`. Its IDs, sequence order and native types are validated and
+  `cursorChecksum` is recomputed from the existing
+  `conversation-cursor-clear-v1` basis. `lifecycleHead` is null or exactly
+  `{controlId,controlKind,peerId,state,semanticChecksum,clearEpoch,`
+  `clearedThroughSequence,requestedAt,appliedAt,updatedAt}`. Kind is clear/delete,
+  state is one of waiting/pending/relay_accepted/applied/quarantined, clear fields
+  are present only for clear, and appliedAt is present only for applied. This is
+  authenticated Room head metadata for deletion/restore diagnostics, not a claim
+  that the PC SQLite snapshot contains or can independently restore Room rows.
+- `redactedInvariantSummary` is exactly
+  `{legacyRedactedTurns,redactedLineages,redactedGroups,authorityRedactionAudits,`
+  `agencyRedactionAudits,factRedactionAudits,factRedactionSetAudits}` with native
+  non-negative safe-integer counts read from the snapshot after a disposable
+  clone successfully opens through the full `YuqiStore` restart invariant. It
+  is an inspection summary, not a substitute for that invariant.
+- `manifestChecksum` is SHA-256 of canonical JSON of the other nine manifest
+  fields. `snapshotSha256` hashes the closed snapshot bytes before any validator
+  opens a copy. Creation succeeds only when a fresh disposable copy passes
+  snapshot SHA, logical checksum, manifest checksum, schema and complete restart
+  invariants. The original snapshot bytes must remain unchanged by verification.
+- A receipt is created only after that verification. `receiptId` is `bkrcpt_`
+  plus the first 24 lowercase hex characters of SHA-256 over canonical
+  `{contract:'yuqi-backup-receipt-id-v1',roleId,manifestChecksum,snapshotSha256,`
+  `logicalChecksum,createdAt}`. `receiptChecksum` hashes the other seven exact
+  receipt fields. In one immediate transaction, PC rejects any foreign or
+  changed row and appends exactly one canonical
+  `sync_log('backup_receipt',receiptId,'create')`; only that committed row may be
+  returned to Android. A crash before the audit may leave an orphan verified
+  directory, but it cannot authorize role deletion.
+- Verification and restore accept only a manifest and snapshot from the same
+  verified directory. They reject symlinks, path escape, extra manifest keys,
+  unsafe numbers, changed schema/count/head/summary/logical hashes, and any byte
+  mismatch before touching the target. The backup snapshot itself is never
+  migrated in place.
+- Restore requires the runtime to be stopped. It checkpoints the target, refuses
+  a non-empty live WAL, creates and verifies a separate pre-restore protected
+  backup, copies the requested snapshot to a sibling `restore-ready` file, opens
+  only that copy through migration and full restart invariants, closes it, then
+  replaces the target on the same volume. `-wal`/`-shm` files cannot be carried
+  across histories. It reopens and revalidates the replaced target; on failure it
+  restores the verified pre-restore snapshot. A report records source manifest,
+  pre-restore receipt, pre/post schema and logical checksums. No row merge or
+  release overlay occurs unless a later separately specified command requests it.
 
 - [ ] **20E.1: Add red native-first UI, plugin suspension/reload, role-delete,
   closed receipt/audit, backup manifest vectors, corrupt restore, and

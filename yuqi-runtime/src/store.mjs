@@ -36,6 +36,7 @@ import {
   deliveryItemsForResult,
   authorityLaneKeyForEnvelope,
   validateAuthorityDeliveryReceipt,
+  validateYuqiBackupReceipt,
   validateDeliveryReceipt,
   validateConversationClearApplied,
   validateEnvelope,
@@ -2186,6 +2187,7 @@ export class YuqiStore {
       this.assertVisibleAuthorityV13Invariants();
       this.assertReleaseAuthorityV14Invariants();
       this.assertConversationClearAuthorityV15Invariants();
+      this.assertBackupReceiptAuditClosureInternal();
       this.assertExpectedPostMigrationInvariantChecksum();
       return;
     }
@@ -2799,6 +2801,7 @@ export class YuqiStore {
       this.assertVisibleAuthorityV13Invariants();
       this.assertReleaseAuthorityV14Invariants();
       this.assertConversationClearAuthorityV15Invariants();
+      this.assertBackupReceiptAuditClosureInternal();
       this.assertExpectedPostMigrationInvariantChecksum();
       this.db.exec('COMMIT');
     } catch (error) {
@@ -2864,6 +2867,32 @@ export class YuqiStore {
       || typeof tableSql !== 'string'
       || !/\bseq\s+INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b/i.test(tableSql)) {
       throw new Error('sync_log schema conflict');
+    }
+  }
+
+  assertBackupReceiptAuditClosureInternal() {
+    const rows = this.db.prepare(`
+      SELECT * FROM sync_log
+      WHERE entity_type = 'backup_receipt'
+      ORDER BY entity_id, seq
+    `).all();
+    const seen = new Set();
+    for (const row of rows) {
+      let receipt;
+      try {
+        receipt = validateYuqiBackupReceipt(JSON.parse(row.payload_json));
+      } catch (error) {
+        throw new Error('Yuqi backup receipt audit conflict', { cause: error });
+      }
+      if (seen.has(receipt.receiptId)
+        || row.entity_id !== receipt.receiptId
+        || row.operation !== 'create'
+        || row.payload_json !== canonicalJson(receipt)
+        || row.checksum !== contentHash(receipt)
+        || Number(row.created_at) !== receipt.createdAt) {
+        throw new Error('Yuqi backup receipt audit conflict');
+      }
+      seen.add(receipt.receiptId);
     }
   }
 
@@ -9179,6 +9208,37 @@ export class YuqiStore {
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(entityType, entityId, operation, payloadJson, checksum, now());
     return Number(result.lastInsertRowid);
+  }
+
+  registerBackupReceiptInternal(receipt) {
+    const normalized = validateYuqiBackupReceipt(receipt);
+    return this.withImmediateTransaction(() => {
+      const rows = this.db.prepare(`
+        SELECT * FROM sync_log
+        WHERE entity_type = 'backup_receipt' AND entity_id = ?
+        ORDER BY seq
+      `).all(normalized.receiptId);
+      if (rows.length) {
+        if (rows.length !== 1
+          || rows[0].operation !== 'create'
+          || rows[0].payload_json !== canonicalJson(normalized)
+          || rows[0].checksum !== contentHash(normalized)
+          || Number(rows[0].created_at) !== normalized.createdAt) {
+          throw new Error('Yuqi backup receipt audit conflict');
+        }
+        return normalized;
+      }
+      this.db.prepare(`
+        INSERT INTO sync_log(entity_type, entity_id, operation, payload_json, checksum, created_at)
+        VALUES ('backup_receipt', ?, 'create', ?, ?, ?)
+      `).run(
+        normalized.receiptId,
+        canonicalJson(normalized),
+        contentHash(normalized),
+        normalized.createdAt
+      );
+      return normalized;
+    });
   }
 
   getCognitionRollout(rolloutKey) {
