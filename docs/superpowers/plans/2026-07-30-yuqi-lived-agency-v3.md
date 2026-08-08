@@ -8037,10 +8037,14 @@ exact Room CAS applies that returned value without creating a second envelope.
 - A v15 authority-v1 row is the sole durable proof for a new protocol-v3 clear:
   `peer_id` and `input_cursor_checksum` are non-null native wire projections;
   `semantic_json` is exactly `canonicalJson(validateConversationClearControl(raw))`;
-  `checksum` is the lower-case SHA-256 of the first ten wire fields; and every
-  scalar column must equal its projection from that JSON. The production writer
-  inserts only authority-v1 rows and rebuilds every applied response from this
-  persisted row, never from request-layer values.
+  and `checksum` is the lower-case SHA-256 of the first ten wire fields. The v1
+  columns `control_id,role_id,peer_id,clear_epoch,cleared_through_sequence,`
+  `requested_at,input_cursor_checksum,checksum` must each equal their projection
+  from that JSON. `authority_version` is the store-owned native integer `1`, and
+  `applied_at` is the store commit timestamp; neither is an inbound command field
+  nor appears in `semantic_json`. The production writer inserts only authority-v1
+  rows and rebuilds every applied response from this persisted row, never from
+  request-layer values.
 - Populated v14 rows retain all seven historical values byte-for-byte and migrate
   as authority-v0 audit shells with `peer_id,input_cursor_checksum,semantic_json`
   null. Migration must not infer a peer from a current lane/device or invent a
@@ -8057,6 +8061,11 @@ exact Room CAS applies that returned value without creating a second envelope.
   missing/extra columns, partial authority-v1 rows, forged JSON/checksum, changed
   peer/cursor/boundary/time, duplicate role/epoch, and an authority-v0 row that
   contains any v1-only value.
+- The normal migration target becomes 15. Opening an existing version-15 database
+  runs the v15 reopen invariant directly; versions above 15 refuse. The historical
+  v13/v14 seven-column schema validator remains exact for its source versions and
+  is not weakened or reused against v15; v15 has a separate exact schema and row
+  invariant layered on all still-applicable v10/v11/v13/v14 authority checks.
 - Export two independent closed protocol helpers:
   `validateConversationClearControl(raw)` for the eleven-key command and
   `validateConversationClearApplied(raw)` for the ten-key applied proof. Both
