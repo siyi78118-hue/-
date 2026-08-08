@@ -8034,6 +8034,36 @@ exact Room CAS applies that returned value without creating a second envelope.
   one normal encrypted response envelope; it repeats the existing
   device/direction/idempotency/size/expiry checks and rejects plaintext fields.
   It never decrypts or derives lifecycle semantics.
+- The wrapper shape is exactly
+  `{deviceId,incomingMessageId,response}`. `response` has exactly the normal
+  encrypted-envelope keys
+  `{deviceId,messageId,direction,ciphertext,nonce,idempotencyKey,expiresAt}`;
+  its `deviceId` equals the authenticated outer device, its direction is
+  `pc_to_phone`, and the deleted incoming row must be the same device's live
+  `phone_to_pc` row identified by `incomingMessageId`. The success body is
+  exactly `{ok,incomingMessageId,responseMessageId,idempotent}`. Missing,
+  foreign, changed or partially matching identities fail closed without
+  deleting the incoming row or inserting/changing a response.
+- For a validated, reopened ten-key applied proof `proof`, derive the response
+  relay message ID as `ctlack_` plus the first 24 lowercase hex characters of
+  `SHA-256(UTF-8("pc-lifecycle-response-message-id-v1\n" + proof.controlId +
+  "\n" + proof.checksum))`; derive the idempotency key in the same way with
+  prefix `ctlackidem_` and domain
+  `pc-lifecycle-response-idempotency-v1`. Serialize the encrypted plaintext as
+  UTF-8 canonical JSON of `proof`. Its 12-byte AES-GCM nonce is the first 12
+  bytes of `HMAC-SHA-256(encryptionKey,
+  "pc-lifecycle-response-gcm-nonce-v1\n" + responseMessageId)`. The response
+  expiry is exactly `proof.appliedAt + 604800000` after safe-integer and
+  captured-clock validation. These fields are therefore byte-identical for
+  replay and concurrent processors; normal relay messages retain their random
+  nonce and caller-selected expiry.
+- Relay atomic exchange is exact-replay idempotent. If the incoming row is
+  already absent but the complete response identity and encrypted bytes are
+  present, return the same success with `idempotent=true`. Any changed response
+  byte, nonce, direction, idempotency key or expiry is a 409 conflict. Memory
+  storage performs all preflight checks before one unobservable mutation; D1
+  deletes the incoming row, inserts the response and accounts for its usage in
+  one transactional batch. A failed batch leaves all three facts unchanged.
 
 **PC schema-v15 control authority amendment:**
 - Task 20D raises the PC SQLite `user_version` from 14 to 15 before adding the
