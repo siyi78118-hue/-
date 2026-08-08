@@ -8155,6 +8155,13 @@ exact Room CAS applies that returned value without creating a second envelope.
   transaction appends exactly one row per newly redacted v0 turn with
   `entity_type='legacy_turn_redaction'`, `entity_id=turnId`,
   `operation='redact'`, `created_at=appliedAt`, canonical payload and checksum.
+  This is an application-integrity authority, not an external cryptographic
+  signature. Validators must reject application bugs, interrupted writes and
+  independent/mismatched corruption of the audit or its retained projections.
+  A local administrator who can rewrite the authority audit, every dependent
+  row and every checksum in one coordinated operation is outside this model;
+  detecting that requires a signing key or append-only root outside the SQLite
+  database and is not to be simulated by a second mutable in-database hash.
   The payload is a closed object with exactly
   `auditVersion,controlId,roleId,turnId,protocolVersion,redactedAt,deliveryCount,`
   `deliveries,deliveryCommitment,messageTombstoneCount,`
@@ -8179,13 +8186,17 @@ exact Room CAS applies that returned value without creating a second envelope.
   `{auditVersion:'legacy-turn-messages-v1',turnId,messages}` where sorted
   `messages` entries contain exactly
   `messageId,turnId,characterId,speakerId,speakerType,recipientId,sentAt,origin,`
-  `deviceId,deviceSeq,batchId,batchSequence,checksum`, never content.
+  `deviceId,deviceSeq,batchId,batchSequence,checksum`, never content. `batchId`
+  and `batchSequence` come from the unique retained batch-item row for that
+  message in this turn, or are both null when no such row exists.
   `batchTombstoneCount` counts retained v2 batches and
   `batchTombstoneCommitment` hashes canonical
   `{auditVersion:'legacy-turn-batches-v1',turnId,batches}`. Each sorted batch
   entry contains exactly `turnId,batchId,characterId,sourceMessageId,startedAt,`
-  `committedAt,checksum,itemCount,itemCommitment`; `itemCommitment` hashes the
-  ordered closed tuples `sequence,messageId,checksum`. Protocol v1 has an empty
+  `committedAt,checksum,itemCount,itemCommitment`; `itemCommitment` hashes
+  canonical `{auditVersion:'legacy-turn-batch-items-v1',turnId,batchId,items}`
+  where `items` is the ordered array of closed tuples
+  `sequence,messageId,checksum`. Protocol v1 has an empty
   batch set and the fixed canonical empty commitment. The transaction retains
   the batch/item identities, ordinals and original checksums, sets every item
   `message_json=NULL,redacted_at=appliedAt`, and writes the existing batch
@@ -8227,6 +8238,11 @@ exact Room CAS applies that returned value without creating a second envelope.
   replay returns the existing applied proof without appending another audit.
   Positive close/reopen and fault-rollback fixtures cover every legal source state,
   including historical `delivered` with `confirmedAt=null`.
+  Authority-v0 has no visible group identity. Group-linked jobs, state and lane
+  pointers for a clear that also affects authority-v1 data remain owned by the
+  existing scoped redacted lineage/group validator, which runs in the same
+  post-write and replay closure. The legacy loader must not invent a group for
+  an authority-v0 turn or reject unrelated live authority-v1 group pointers.
 - Add one store-owned scoped `loadValidatedLegacyTurnRedactionInternal(turnId)`
   that closes the turn shell, applied control, unique `legacy_turn_redaction`
   audit and exact delivery set without a full scan. Its validation evidence is
