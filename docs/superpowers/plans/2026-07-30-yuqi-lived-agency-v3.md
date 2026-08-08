@@ -8032,8 +8032,8 @@ exact Room CAS applies that returned value without creating a second envelope.
 - Task 20D raises the PC SQLite `user_version` from 14 to 15 before adding the
   production clear writer. `conversation_clear_controls` is rebuilt with the
   exact columns `control_id,role_id,peer_id,clear_epoch,cleared_through_sequence,`
-  `requested_at,applied_at,input_cursor_checksum,checksum,authority_version,`
-  `semantic_json`. `authority_version` is exactly `0|1`.
+  `requested_at,applied_at,input_cursor_checksum,checksum,applied_checksum,`
+  `authority_version,semantic_json`. `authority_version` is exactly `0|1`.
 - A v15 authority-v1 row is the sole durable proof for a new protocol-v3 clear:
   `peer_id` and `input_cursor_checksum` are non-null native wire projections;
   `semantic_json` is exactly `canonicalJson(validateConversationClearControl(raw))`;
@@ -8042,15 +8042,21 @@ exact Room CAS applies that returned value without creating a second envelope.
   `requested_at,input_cursor_checksum,checksum` must each equal their projection
   from that JSON. `authority_version` is the store-owned native integer `1`, and
   `applied_at` is the store commit timestamp; neither is an inbound command field
-  nor appears in `semantic_json`. The production writer inserts only authority-v1
-  rows and rebuilds every applied response from this persisted row, never from
-  request-layer values.
+  nor appears in `semantic_json`. `applied_checksum` is the lower-case SHA-256 of
+  the closed ten-key `CONVERSATION_CLEAR_APPLIED` proof rebuilt from the persisted
+  v1 command columns plus `applied_at`; it is the independent commitment that
+  makes changed applied time fail reopen. The production writer inserts only
+  authority-v1 rows and rebuilds every applied response from this persisted row,
+  never from request-layer values.
 - Populated v14 rows retain all seven historical values byte-for-byte and migrate
   as authority-v0 audit shells with `peer_id,input_cursor_checksum,semantic_json`
-  null. Migration must not infer a peer from a current lane/device or invent a
-  cursor checksum. An authority-v0 row can neither authorize protocol-v3 replay
-  nor produce an applied response; a new control colliding by `control_id` or
-  `(role_id,clear_epoch)` fails closed with zero writes instead of overwriting it.
+  null; `applied_checksum` is also null. Migration must not infer a peer from a
+  current lane/device, invent a cursor checksum, or reinterpret an arbitrary
+  historical `checksum` string as a v1 SHA-256. The v1 hash/type rules apply only
+  after `authority_version=1` is established. An authority-v0 row can neither
+  authorize protocol-v3 replay nor produce an applied response; a new control
+  colliding by `control_id` or `(role_id,clear_epoch)` fails closed with zero
+  writes instead of overwriting it.
 - The v14→v15 migration runs in one immediate transaction with real fault
   checkpoints after new-table creation, row copy, projection verification,
   table swap/index recreation and version write. Every injected failure leaves
@@ -8059,8 +8065,8 @@ exact Room CAS applies that returned value without creating a second envelope.
   v13 redacted groups, v14 canary indexes and authority-v0 shells remain valid.
   Reopen invariants recompute every authority-v1 semantic projection and reject
   missing/extra columns, partial authority-v1 rows, forged JSON/checksum, changed
-  peer/cursor/boundary/time, duplicate role/epoch, and an authority-v0 row that
-  contains any v1-only value.
+  peer/cursor/boundary/time/applied proof, duplicate role/epoch, and an authority-v0
+  row that contains any v1-only value.
 - The normal migration target becomes 15. Opening an existing version-15 database
   runs the v15 reopen invariant directly; versions above 15 refuse. The historical
   v13/v14 seven-column schema validator remains exact for its source versions and
