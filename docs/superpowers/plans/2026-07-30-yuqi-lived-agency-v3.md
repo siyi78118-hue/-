@@ -9826,6 +9826,116 @@ git add yuqi-runtime/src/store.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtim
 git commit -m "feat: expose Yuqi v3 authority diagnostics"
 ```
 
+### Task 24A: Move Android Service Runtime Initialization Off the Main Thread
+
+**Files:**
+- Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
+- Create: `android/app/src/androidTest/java/com/siyi/al/execution/AlExecutionServiceStartupTest.java`
+
+**Interfaces:**
+- Preserves: foreground notification and `START_STICKY` service contract.
+- Produces: worker-owned runtime/Room initialization before the first drain.
+
+This release-blocking defect was exposed by the first real Task 25 connected
+run: `AlExecutionService.onCreate()` synchronously calls
+`ExecutionRuntime.create()`, whose `RoomExecutionStore` constructor validates
+persisted authority rows through Room. Room correctly rejects that query on the
+Android main thread with `Cannot access database on the main thread`. Enabling
+`allowMainThreadQueries`, weakening store validation, force-stopping the service
+before tests, or bypassing the production service is forbidden.
+
+- [ ] **Step 1: Preserve the real connected red failure and add a focused startup red test**
+
+`AlExecutionServiceStartupTest` first uses the public Room/store APIs to create
+one ordinary Yuqi turn and a verified `role_delete_v1` control whose durable
+role-notification cancellation intent remains waiting. It then starts the actual
+foreground service directly with an explicit `Intent` and
+`ContextCompat.startForegroundService`; it must not call `requestRun`, because
+that helper may fall back to `AlWakeWorker` and falsely pass without ever
+creating the service. The test polls with a bounded condition until the real
+service worker consumes the pre-seeded cancellation intent, then explicitly
+stops the service and cleans the test database. The test must fail on the
+current main-thread Room exception. An object-non-null assertion, a direct
+background call to `ExecutionRuntime.create()`, or merely observing a wake
+request is not evidence that the production service worker initialized and ran.
+
+Run:
+
+```powershell
+cd android
+.\gradlew.bat connectedDebugAndroidTest --no-daemon --no-problems-report `
+  -Pandroid.testInstrumentationRunnerArguments.class=com.siyi.al.execution.AlExecutionServiceStartupTest
+```
+
+Expected before the fix: FAIL with the exact main-thread Room access stack.
+
+- [ ] **Step 2: Initialize all Room-dependent service state on its single worker**
+
+`onCreate()` may create channels/foreground notification, the executor,
+wake-lock and other objects that do not read Room. It must not create
+`ExecutionEngine`, `AlExecutionDatabase`, `RoomExecutionStore`, bridge receipt
+coordinator, role/automatic coordinators or a scheduler closure that can run
+before those fields exist. The service owns a closed initialization state such
+as `NEW | INITIALIZING | READY | STOPPING`, safely published to the main thread
+and written only through one explicit synchronization boundary. `kick()` must
+reject new work after `STOPPING`; otherwise it queues work on the existing
+single executor. The first queued worker calls one idempotent initializer:
+
+- `NEW -> INITIALIZING` creates every Room-dependent object in worker-local
+  variables. Only after all constructors succeed are the complete fields
+  published atomically and the state changed to `READY`; no half-initialized
+  field may become observable.
+- an initialization failure closes/clears partial objects and returns to `NEW`
+  unless destruction has already changed the state to `STOPPING`, so a later
+  wake can retry instead of leaving the service permanently wedged;
+- the recovery scheduler is started exactly once and only after `READY`; a
+  repeated wake must not create a second runtime, scheduler or database owner;
+- before publishing worker-local objects or changing `INITIALIZING -> READY`,
+  the initializer re-enters the same state boundary and proves the state is
+  still `INITIALIZING`; if destruction has set `STOPPING`, it closes only its
+  unpublished local objects and exits without publishing or starting the
+  scheduler;
+- `onDestroy()` first changes the state to `STOPPING`, so no new `kick`, READY
+  publication or drain may start, then cancels the scheduler and queues one
+  terminal cleanup behind any already-running worker operation before orderly
+  executor shutdown. The main thread must not close or null engine/store/
+  database fields while a worker can still use them. The terminal worker cleanup
+  (or an equivalent joined synchronization boundary) closes and clears the
+  published resources only after the current initializer/drain has exited.
+  Initialization-failure cleanup of unpublished locals follows the same
+  ownership rule. Repeated destruction is idempotent.
+
+After a successful initialization the same worker performs the drain. The
+single executor serializes simultaneous `onStartCommand` wakeups, while the
+explicit state/safe-publication rule closes races with `onDestroy()` and calls
+arriving from the main thread.
+
+Role-notification cancellation is not lost: the worker's first
+`ExecutionRuntime.drainLifecycleControl()` call performs that persisted cleanup
+before ordinary turn execution. Do not move the DAO query back into `onCreate`.
+
+- [ ] **Step 3: Run the focused startup and existing service gates**
+
+```powershell
+cd android
+.\gradlew.bat testDebugUnitTest assembleDebugAndroidTest --no-daemon --no-problems-report
+.\gradlew.bat connectedDebugAndroidTest --no-daemon --no-problems-report `
+  -Pandroid.testInstrumentationRunnerArguments.class=com.siyi.al.execution.AlExecutionServiceStartupTest
+```
+
+Expected: PASS; direct startup of the real service no longer performs a
+main-thread Room query, its worker removes the pre-seeded durable notification
+cancellation intent, repeated wakeups do not create a second runtime/scheduler,
+and stop/destroy is clean. A foreground-start fallback path is not accepted as
+startup evidence.
+
+- [ ] **Step 4: Commit the focused Android startup fix**
+
+```powershell
+git add android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java android/app/src/androidTest/java/com/siyi/al/execution/AlExecutionServiceStartupTest.java
+git commit -m "fix: initialize Android execution runtime off main thread"
+```
+
 ### Task 25: Add One Reproducible Release-Readiness Gate and Run the Full Matrix
 
 **Files:**
