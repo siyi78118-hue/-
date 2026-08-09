@@ -23,13 +23,20 @@ import com.siyi.al.execution.api.UrlConnectionTransport;
 import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.json.JSONObject;
 
 public final class AlExecutionService extends Service {
     private static final long WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L;
+    enum StartupState { NEW, INITIALIZING, READY, STOPPING, STOPPED }
     private final ExecutionDrainGate drainGate = new ExecutionDrainGate();
+    private final Object startupLock = new Object();
+    private volatile StartupState startupState = StartupState.NEW;
+    private volatile boolean initializationScheduled;
+    private volatile boolean startRequested;
+    private int recoveryCallbacksInFlight;
     private ExecutorService executor;
     private ScheduledExecutorService recoveryScheduler;
     private ExecutionEngine engine;
@@ -59,64 +66,205 @@ public final class AlExecutionService extends Service {
         notifications.ensureChannels();
         startForeground(AlNotificationFactory.GUARD_NOTIFICATION_ID, notifications.guardNotification());
         executor = Executors.newSingleThreadExecutor();
-        engine = ExecutionRuntime.create(this);
-        database = AlExecutionDatabase.get(this);
-        executionStore = new RoomExecutionStore(database);
-        bridgeReceiptCoordinator = new BridgeReceiptDeliveryCoordinator(
-            executionStore,
-            receipt -> {
-                JSONObject transportPayload = new JSONObject(receipt.wireJson)
-                    .put("_checkpointChecksum", receipt.checkpointChecksum)
-                    .put("_deliveryRoute", receipt.route);
-                if (receipt.relayMessageId != null) {
-                    transportPayload.put("_relayMessageId", receipt.relayMessageId);
+        scheduleInitialization();
+    }
+
+    private void scheduleInitialization() {
+        ExecutorService worker;
+        synchronized (startupLock) {
+            if (startupState == StartupState.STOPPING || startupState == StartupState.STOPPED
+                || initializationScheduled) return;
+            startupState = StartupState.INITIALIZING;
+            initializationScheduled = true;
+            worker = executor;
+        }
+        if (worker == null || worker.isShutdown()) {
+            synchronized (startupLock) {
+                initializationScheduled = false;
+                if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
+                    startupState = StartupState.NEW;
                 }
-                if (!ExecutionRuntime.confirmAppliedResult(this, transportPayload.toString())) {
-                    throw new IllegalStateException("authority receipt transport is unavailable");
-                }
-            },
-            System::currentTimeMillis);
-        PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
-        wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AL:Execution");
-        wakeLock.setReferenceCounted(false);
-        recoveryScheduler = Executors.newSingleThreadScheduledExecutor();
-        recoveryScheduler.scheduleWithFixedDelay(() -> {
-            try {
-                int imported = ExecutionRuntime.drainCloudInbox(this);
-                if (imported > 0) {
-                    executionStore.recordDiagnostic(
-                        "cloud-inbox", null, "INFO", "CLOUD_INBOX_IMPORTED",
-                        "count=" + imported, System.currentTimeMillis()
-                    );
-                }
-                new RolePlanCoordinator(database).dispatchDue(System.currentTimeMillis());
-                new AutomaticTaskCoordinator(database).dispatchDue(System.currentTimeMillis());
-                kick();
-            } catch (Exception error) {
-                executionStore.recordDiagnostic("background-scan", null, "WARN", "BACKGROUND_SCAN_FAILED", error.getMessage(), System.currentTimeMillis());
             }
-        }, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS, TimeUnit.SECONDS);
+            return;
+        }
+        try {
+            worker.execute(this::initializeOnWorker);
+        } catch (RejectedExecutionException rejected) {
+            synchronized (startupLock) {
+                initializationScheduled = false;
+                if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
+                    startupState = StartupState.NEW;
+                }
+            }
+        }
+    }
+
+    private void initializeOnWorker() {
+        AlExecutionDatabase localDatabase = null;
+        ExecutionEngine localEngine = null;
+        RoomExecutionStore localStore = null;
+        BridgeReceiptDeliveryCoordinator localCoordinator = null;
+        PowerManager.WakeLock localWakeLock = null;
+        try {
+            // All Room access and complete runtime construction stays on the
+            // service worker.  onCreate only owns notification/foreground
+            // setup and scheduling this method.
+            localDatabase = AlExecutionDatabase.get(this);
+            localEngine = ExecutionRuntime.create(this);
+            localStore = new RoomExecutionStore(localDatabase);
+            final RoomExecutionStore coordinatorStore = localStore;
+            localCoordinator = new BridgeReceiptDeliveryCoordinator(
+                coordinatorStore,
+                receipt -> {
+                    JSONObject transportPayload = new JSONObject(receipt.wireJson)
+                        .put("_checkpointChecksum", receipt.checkpointChecksum)
+                        .put("_deliveryRoute", receipt.route);
+                    if (receipt.relayMessageId != null) {
+                        transportPayload.put("_relayMessageId", receipt.relayMessageId);
+                    }
+                    if (!ExecutionRuntime.confirmAppliedResult(this, transportPayload.toString())) {
+                        throw new IllegalStateException("authority receipt transport is unavailable");
+                    }
+                },
+                System::currentTimeMillis);
+            PowerManager power = (PowerManager) getSystemService(POWER_SERVICE);
+            localWakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AL:Execution");
+            localWakeLock.setReferenceCounted(false);
+            boolean kickNow;
+            synchronized (startupLock) {
+                if (startupState == StartupState.STOPPING || startupState == StartupState.STOPPED) {
+                    initializationScheduled = false;
+                    releaseWakeLock(localWakeLock);
+                    return;
+                }
+                // Publish the complete runtime graph as one state transition.
+                // Readers can therefore observe either NEW/INITIALIZING or a
+                // fully usable READY graph, never a partially initialized one.
+                database = localDatabase;
+                engine = localEngine;
+                executionStore = localStore;
+                bridgeReceiptCoordinator = localCoordinator;
+                wakeLock = localWakeLock;
+                initializationScheduled = false;
+                startupState = StartupState.READY;
+                kickNow = startRequested;
+                startRequested = false;
+            }
+            try {
+                // Scheduler creation is deliberately after READY publication,
+                // with a second state check inside the method.
+                startRecoverySchedulerOnWorker();
+            } catch (Throwable schedulerFailure) {
+                resetPublishedInitializationAfterFailure();
+                return;
+            }
+            if (kickNow && startupState == StartupState.READY) kick();
+        } catch (Throwable error) {
+            releaseWakeLock(localWakeLock);
+            resetInitializationAfterFailure(localDatabase, localEngine, localStore, localCoordinator, localWakeLock);
+        }
+    }
+
+    private void startRecoverySchedulerOnWorker() {
+        synchronized (startupLock) {
+            if (startupState != StartupState.READY) return;
+            if (recoveryScheduler != null && !recoveryScheduler.isShutdown()) return;
+        }
+        final ScheduledExecutorService candidate = Executors.newSingleThreadScheduledExecutor();
+        synchronized (startupLock) {
+            if (startupState != StartupState.READY) {
+                candidate.shutdownNow();
+                return;
+            }
+            recoveryScheduler = candidate;
+        }
+        try {
+            candidate.scheduleWithFixedDelay(() -> {
+                if (!beginRecoveryCallback()) return;
+                try {
+                    if (!isReadyForWork()) return;
+                    int imported = ExecutionRuntime.drainCloudInbox(this);
+                    if (!isReadyForWork()) return;
+                    if (imported > 0) {
+                        executionStore.recordDiagnostic(
+                            "cloud-inbox", null, "INFO", "CLOUD_INBOX_IMPORTED",
+                            "count=" + imported, System.currentTimeMillis()
+                        );
+                    }
+                    if (!isReadyForWork()) return;
+                    new RolePlanCoordinator(database).dispatchDue(System.currentTimeMillis());
+                    if (!isReadyForWork()) return;
+                    new AutomaticTaskCoordinator(database).dispatchDue(System.currentTimeMillis());
+                    if (!isReadyForWork()) return;
+                    kick();
+                } catch (Exception error) {
+                    if (isReadyForWork() && executionStore != null) {
+                        executionStore.recordDiagnostic("background-scan", null, "WARN", "BACKGROUND_SCAN_FAILED", error.getMessage(), System.currentTimeMillis());
+                    }
+                } finally {
+                    endRecoveryCallback();
+                }
+            }, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS, TimeUnit.SECONDS);
+        } catch (RuntimeException | Error scheduleFailure) {
+            synchronized (startupLock) {
+                if (recoveryScheduler == candidate) recoveryScheduler = null;
+            }
+            candidate.shutdownNow();
+            throw scheduleFailure;
+        }
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        synchronized (startupLock) {
+            if (startupState == StartupState.STOPPING || startupState == StartupState.STOPPED) {
+                return START_NOT_STICKY;
+            }
+            startRequested = true;
+        }
+        if (startupState != StartupState.READY) scheduleInitialization();
         kick();
         return ExecutionServicePolicy.restartAfterProcessReclaim() ? START_STICKY : START_NOT_STICKY;
     }
 
     @Override
     public void onTaskRemoved(Intent rootIntent) {
-        AlExecutionWakeWorker.enqueue(this, 5);
+        if (startupState == StartupState.READY) AlExecutionWakeWorker.enqueue(this, 5);
         super.onTaskRemoved(rootIntent);
     }
 
     @Override
     public void onDestroy() {
-        if (executor != null) executor.shutdownNow();
-        if (recoveryScheduler != null) recoveryScheduler.shutdownNow();
+        ExecutorService worker;
+        synchronized (startupLock) {
+            if (shouldIgnoreDestroy(startupState)) return;
+            startupState = StartupState.STOPPING;
+            startRequested = false;
+            worker = executor;
+        }
         drainGate.close();
-        if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+        if (worker == null) {
+            cleanupOnWorker();
+        } else {
+            try {
+                // Queue terminal cleanup behind any in-flight drain.  No
+                // Room/runtime/wakelock resources are never released by the
+                // main thread; this closure owns their terminal cleanup.
+                worker.execute(this::cleanupOnWorker);
+                worker.shutdown();
+            } catch (RejectedExecutionException rejected) {
+                worker.shutdownNow();
+                // The executor was already externally shut down.  There is no
+                // worker left that can own cleanup, so perform the emergency
+                // fallback rather than leaving a live wakelock forever.
+                cleanupOnWorker();
+            }
+        }
         super.onDestroy();
+    }
+
+    static boolean shouldIgnoreDestroy(StartupState state) {
+        return state == StartupState.STOPPING || state == StartupState.STOPPED;
     }
 
     @Nullable
@@ -126,40 +274,87 @@ public final class AlExecutionService extends Service {
     }
 
     private void kick() {
+        ExecutorService worker;
+        PowerManager.WakeLock workerWakeLock;
+        synchronized (startupLock) {
+            if (startupState != StartupState.READY || executor == null || engine == null
+                || executionStore == null || wakeLock == null) {
+                if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
+                    startRequested = true;
+                }
+                worker = null;
+                workerWakeLock = null;
+            } else {
+                startRequested = false;
+                worker = executor;
+                workerWakeLock = wakeLock;
+            }
+        }
+        if (worker == null) {
+            if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
+                scheduleInitialization();
+            }
+            return;
+        }
         if (!drainGate.request()) return;
-        executor.execute(() -> {
-            acquireWakeLock();
+        try {
+            worker.execute(() -> {
+            acquireWakeLock(workerWakeLock);
             try {
                 boolean continueDraining;
                 do {
+                    if (!isReadyForWork()) {
+                        drainGate.finishCycle();
+                        return;
+                    }
                     try {
-                        while (ExecutionRuntime.drainLifecycleControl(this)) {
+                        while (isReadyForWork() && ExecutionRuntime.drainLifecycleControl(this)) {
                             // Controls are an independent outbox; do not route them through turn execution.
                         }
                     } catch (Exception controlError) {
-                        executionStore.recordDiagnostic(
+                        if (isReadyForWork()) executionStore.recordDiagnostic(
                             "lifecycle-control", null, "WARN", "LIFECYCLE_CONTROL_RETRY",
                             controlError.getMessage() == null ? "control delivery failed" : controlError.getMessage(),
                             System.currentTimeMillis());
                     } finally {
                         try {
+                            if (!isReadyForWork()) {
+                                drainGate.finishCycle();
+                                return;
+                            }
                             long lifecycleDelay = ExecutionRuntime.nextLifecycleDelay(this);
                             if (lifecycleDelay >= 0L) {
                                 AlExecutionWakeWorker.enqueueLifecycle(this, lifecycleDelay);
                             }
                         } catch (RuntimeException scheduleError) {
-                            executionStore.recordDiagnostic(
+                            if (isReadyForWork()) executionStore.recordDiagnostic(
                                 "lifecycle-control", null, "WARN", "LIFECYCLE_CONTROL_WAKE_RETRY",
                                 scheduleError.getMessage() == null ? "control wake scheduling failed" : scheduleError.getMessage(),
                                 System.currentTimeMillis());
                         }
                     }
+                    if (!isReadyForWork()) {
+                        drainGate.finishCycle();
+                        return;
+                    }
                     executionStore.recoverDueRetries(System.currentTimeMillis());
+                    if (!isReadyForWork()) {
+                        drainGate.finishCycle();
+                        return;
+                    }
                     engine.recoverInterruptedWork();
-                    while (!Thread.currentThread().isInterrupted() && engine.runNext()) {
+                    while (isReadyForWork() && engine.runNext()) {
                         // Drain the single Room-backed queue before checking for a concurrent wake.
                     }
+                    if (!isReadyForWork()) {
+                        drainGate.finishCycle();
+                        return;
+                    }
                     notifyCompletedTurns();
+                    if (!isReadyForWork()) {
+                        drainGate.finishCycle();
+                        return;
+                    }
                     RetryRecoveryResult retries = executionStore.recoverDueRetries(System.currentTimeMillis());
                     if (retries.nextDelaySeconds >= 0L) {
                         AlExecutionWakeWorker.enqueue(this, retries.nextDelaySeconds);
@@ -170,16 +365,129 @@ public final class AlExecutionService extends Service {
                 } while (continueDraining);
             } catch (RuntimeException error) {
                 boolean restart = drainGate.abortCycle();
-                if (restart && executor != null && !executor.isShutdown()) kick();
+                if (restart && startupState == StartupState.READY && !worker.isShutdown()) kick();
                 throw error;
             } finally {
-                if (wakeLock.isHeld()) wakeLock.release();
+                releaseWakeLock(workerWakeLock);
             }
-        });
+            });
+        } catch (RejectedExecutionException rejected) {
+            drainGate.abortCycle();
+            synchronized (startupLock) {
+                if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
+                    startRequested = true;
+                }
+            }
+        }
     }
 
-    private void acquireWakeLock() {
-        if (!wakeLock.isHeld()) wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS);
+    private void acquireWakeLock(PowerManager.WakeLock target) {
+        if (target != null && !target.isHeld()) target.acquire(WAKE_LOCK_TIMEOUT_MS);
+    }
+
+    private static void releaseWakeLock(PowerManager.WakeLock target) {
+        if (target != null && target.isHeld()) target.release();
+    }
+
+    private void resetInitializationAfterFailure(
+        AlExecutionDatabase localDatabase,
+        ExecutionEngine localEngine,
+        RoomExecutionStore localStore,
+        BridgeReceiptDeliveryCoordinator localCoordinator,
+        PowerManager.WakeLock localWakeLock
+    ) {
+        synchronized (startupLock) {
+            if (database == localDatabase) database = null;
+            if (engine == localEngine) engine = null;
+            if (executionStore == localStore) executionStore = null;
+            if (bridgeReceiptCoordinator == localCoordinator) bridgeReceiptCoordinator = null;
+            if (wakeLock == localWakeLock) wakeLock = null;
+            initializationScheduled = false;
+            if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
+                startupState = StartupState.NEW;
+            }
+        }
+        releaseWakeLock(localWakeLock);
+    }
+
+    private void resetPublishedInitializationAfterFailure() {
+        ScheduledExecutorService scheduler;
+        PowerManager.WakeLock publishedWakeLock;
+        synchronized (startupLock) {
+            scheduler = recoveryScheduler;
+            recoveryScheduler = null;
+            publishedWakeLock = wakeLock;
+            wakeLock = null;
+            database = null;
+            engine = null;
+            executionStore = null;
+            bridgeReceiptCoordinator = null;
+            initializationScheduled = false;
+            if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
+                startupState = StartupState.NEW;
+            }
+        }
+        if (scheduler != null) scheduler.shutdownNow();
+        releaseWakeLock(publishedWakeLock);
+    }
+
+    private void cleanupOnWorker() {
+        ScheduledExecutorService scheduler;
+        PowerManager.WakeLock publishedWakeLock;
+        synchronized (startupLock) {
+            scheduler = recoveryScheduler;
+            recoveryScheduler = null;
+        }
+        if (scheduler != null) scheduler.shutdownNow();
+        awaitRecoveryCallbacksStopped();
+        synchronized (startupLock) {
+            publishedWakeLock = wakeLock;
+            wakeLock = null;
+            database = null;
+            engine = null;
+            executionStore = null;
+            bridgeReceiptCoordinator = null;
+            initializationScheduled = false;
+            startRequested = false;
+            startupState = StartupState.STOPPED;
+        }
+        releaseWakeLock(publishedWakeLock);
+    }
+
+    private boolean beginRecoveryCallback() {
+        synchronized (startupLock) {
+            if (startupState != StartupState.READY) return false;
+            recoveryCallbacksInFlight++;
+            return true;
+        }
+    }
+
+    private void endRecoveryCallback() {
+        synchronized (startupLock) {
+            if (recoveryCallbacksInFlight > 0) recoveryCallbacksInFlight--;
+            startupLock.notifyAll();
+        }
+    }
+
+    private void awaitRecoveryCallbacksStopped() {
+        boolean interrupted = false;
+        synchronized (startupLock) {
+            while (recoveryCallbacksInFlight > 0) {
+                try {
+                    startupLock.wait();
+                } catch (InterruptedException interruption) {
+                    interrupted = true;
+                    // The callback still owns the published graph and will
+                    // signal completion in endRecoveryCallback.  Do not clear
+                    // fields or publish STOPPED early.
+                }
+            }
+        }
+        if (interrupted) Thread.currentThread().interrupt();
+    }
+
+    private boolean isReadyForWork() {
+        return startupState == StartupState.READY && !Thread.currentThread().isInterrupted();
     }
 
     private void notifyCompletedTurns() {
