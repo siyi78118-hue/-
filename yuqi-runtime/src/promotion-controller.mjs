@@ -102,25 +102,86 @@ export class PromotionController {
   }
 
   selectPipelinePairForFreshSubject(rolloutKey, { now = this.clock() } = {}) {
-    const rollout = this.getStatus(rolloutKey);
+    let rollout = this.getStatus(rolloutKey);
     if (!rollout) throw new Error(`cognition rollout is unavailable: ${rolloutKey}`);
-    const pair = this.resolvePipelinePair(rollout);
+    let pair = this.resolvePipelinePair(rollout);
+    let rolledBack = false;
     if (pair.candidatePhase === 'canary') {
       const outstanding = this.store.readCanaryOutstandingAuthorityInternal({
         rolloutKey,
         canaryEpoch: rollout.canaryEpoch
       });
       const deadlineBreached = outstanding.oldestAt !== null
-        && Number(now) - Number(outstanding.oldestAt) > rollout.canaryCompareDeadlineMs;
+        && Number(now) - Number(outstanding.oldestAt) >= rollout.canaryCompareDeadlineMs;
       const allocatesComparison = pair.comparisonReleaseId !== null;
       if (deadlineBreached
         || (allocatesComparison && outstanding.count >= rollout.canaryMaxOutstanding)) {
-        const error = new Error('canary comparison backlog');
-        error.code = 'CANARY_COMPARE_BACKLOG';
-        throw error;
+        rollout = this.rollbackCandidate({
+          rolloutKey,
+          expectedRevision: rollout.revision,
+          reasonCode: deadlineBreached ? 'CANARY_COMPARE_DEADLINE' : 'CANARY_COMPARE_BACKLOG'
+        });
+        pair = this.resolvePipelinePair(rollout);
+        rolledBack = true;
       }
     }
-    return { rollout, pair };
+    return { rollout, pair, rolledBack };
+  }
+
+  promotionCheck(rolloutKey) {
+    const rollout = this.getStatus(rolloutKey);
+    if (!rollout) throw new Error(`cognition rollout is unavailable: ${rolloutKey}`);
+    const evidence = this.store.readCognitionPromotionEvidenceInternal(rolloutKey);
+    const outstanding = rollout.candidatePhase === 'canary'
+      ? this.store.readCanaryOutstandingAuthorityInternal({
+        rolloutKey,
+        canaryEpoch: rollout.canaryEpoch
+      })
+      : { count: 0, oldestAt: null };
+    return {
+      rolloutKey: rollout.rolloutKey,
+      revision: rollout.revision,
+      candidatePhase: rollout.candidatePhase,
+      liveShadowSuccessCount: evidence.liveShadowSuccessCount,
+      liveShadowFailureCount: evidence.liveShadowFailureCount,
+      staleEvidenceCount: evidence.staleEvidenceCount,
+      outstandingComparisonCount: evidence.outstandingComparisonCount,
+      oldestOutstandingComparisonAt: evidence.oldestOutstandingComparisonAt,
+      replayCount: evidence.replayCount,
+      criticalErrors: evidence.liveShadowFailureCount,
+      canaryOutstandingCount: outstanding.count,
+      canaryOldestOutstandingAt: outstanding.oldestAt,
+      canaryObserveUntil: rollout.canaryObserveUntil,
+      canaryCompareDeadlineMs: rollout.canaryCompareDeadlineMs,
+      lastReasonCode: rollout.lastReasonCode
+    };
+  }
+
+  registerCandidate(input) {
+    return this.store.registerCognitionCandidateInternal({ ...input, now: this.clock() });
+  }
+
+  promoteToCanary(input) {
+    return this.store.promoteCognitionCandidateInternal({ ...input, now: this.clock() });
+  }
+
+  graduateCandidate(input) {
+    return this.store.graduateCognitionCandidateInternal({ ...input, now: this.clock() });
+  }
+
+  rollbackCandidate(input) {
+    return this.store.rollbackCognitionCandidateInternal({ ...input, now: this.clock() });
+  }
+
+  recordCriticalFinding(input) {
+    return this.store.recordCriticalFindingInternal({
+      ...input,
+      ...(input?.occurredAt === undefined ? {} : { occurredAt: input.occurredAt })
+    });
+  }
+
+  recordHardActionFinding(input) {
+    return this.store.recordHardActionFindingInternal({ ...input, now: input.now ?? this.clock() });
   }
 
   createTurn({ envelope, presetVersion, annotationSnapshot, now = this.clock() }) {
@@ -173,9 +234,15 @@ export class PromotionController {
     reportChecksum = null,
     metadata = {}
   }) {
+    if (toMode === 'active' && toPhase === 'canary') {
+      throw new Error('active canary requires promotion candidate API');
+    }
     const current = this.getStatus(rolloutKey);
     if (!current || current.revision !== Number(expectedRevision)) {
       throw new RolloutRevisionConflictError();
+    }
+    if (current.candidatePhase !== 'none') {
+      throw new Error('candidate phase transitions require the candidate API');
     }
     let report = null;
     if (reportId) {
@@ -189,9 +256,6 @@ export class PromotionController {
     const initialShadow = current.currentMode === 'legacy'
       && toMode === 'shadow'
       && ['bootstrap', 'manual'].includes(String(actor));
-    if (toMode === 'active' && toPhase === 'canary' && !report) {
-      throw new Error('active canary requires a materialized promotion report');
-    }
     if (current.currentMode === 'legacy' && toMode === 'active' && rolloutKey !== 'DIRECT_REPLY') {
       throw new Error('only DIRECT_REPLY may initially promote directly to active');
     }
@@ -287,16 +351,15 @@ export class PromotionController {
       summary,
       createdAt: now
     });
-    const transitioned = this.store.transitionCognitionRolloutInternal({
+    const transitioned = this.store.rollbackCognitionCandidateInternal({
       rolloutKey: rollout.rolloutKey,
       expectedRevision: rollout.revision,
-      toMode: 'shadow',
-      toPhase: 'rolled_back',
-      actor: 'orchestrator',
       reasonCode: errorCode || 'ACTIVE_PRECOMMIT_CRITICAL',
+      findingIds: [],
       reportId,
       reportChecksum: stored.artifactChecksum,
       metadata: summary,
+      actor: 'orchestrator',
       now
     });
     return { staleForRollout: false, rolledBack: true, rollout: transitioned };
@@ -433,16 +496,15 @@ export class PromotionController {
             summary: { planningId, errorCode, failureClass, ...(report.summary || {}) },
             createdAt: now
           });
-          this.store.transitionCognitionRolloutInternal({
+          this.store.rollbackCognitionCandidateInternal({
             rolloutKey: 'LIFE_PLANNING',
             expectedRevision: rollout.revision,
-            toMode: 'shadow',
-            toPhase: 'rolled_back',
-            actor: 'life_planning_dispatcher',
             reasonCode: errorCode || 'LIFE_PLANNING_ACTIVE_FAILURE',
+            findingIds: [],
             reportId: stored.reportId,
             reportChecksum: stored.artifactChecksum,
             metadata: { planningId, failureClass },
+            actor: 'life_planning_dispatcher',
             now
           });
         }

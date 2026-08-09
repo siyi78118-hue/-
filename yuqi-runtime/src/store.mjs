@@ -11,6 +11,7 @@ import { resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { stableId } from './cloud-relay-pump.mjs';
 import { decideLaneAdmission, generationFingerprint, laneKeyForEnvelope } from './interaction-lanes.mjs';
 import { resolvePipelinePair } from './release-pair.mjs';
+import { supportsPipelineVersion } from './release-executor.mjs';
 import {
   comparisonContractForDirection,
   comparisonContractForMode
@@ -82,6 +83,69 @@ const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
 const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
 const FAILURE_DELIVERY_LEASE_MS = 60_000;
 const TRUSTED_LIFE_RESULT_WRITER = Symbol('trusted-life-result-writer');
+
+function candidateReleaseChecksum(release) {
+  return contentHash({
+    pipelineVersion: release.pipelineVersion,
+    presetVersion: release.presetVersion,
+    cognitionSchemaVersion: release.cognitionSchemaVersion,
+    expressionSchemaVersion: release.expressionSchemaVersion,
+    evaluatorVersion: release.evaluatorVersion,
+    modelProfile: release.modelProfile,
+    componentManifest: release.componentManifest,
+    createdAt: release.createdAt
+  });
+}
+
+function assertCandidateReleaseDefinitionInternal(candidate) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    throw new Error('candidate release definition is unavailable');
+  }
+  const allowed = new Set([
+    'pipelineVersion', 'presetVersion', 'cognitionSchemaVersion', 'expressionSchemaVersion',
+    'evaluatorVersion', 'modelProfile', 'componentManifest', 'createdAt',
+    'releaseId', 'releaseChecksum', 'retiredAt'
+  ]);
+  if (Object.keys(candidate).some(key => !allowed.has(key))) {
+    throw new Error('candidate release contains unknown fields');
+  }
+  for (const key of ['pipelineVersion', 'presetVersion', 'evaluatorVersion', 'releaseId', 'releaseChecksum']) {
+    if (typeof candidate[key] !== 'string' || candidate[key].length === 0) {
+      throw new Error(`candidate release ${key} type conflict`);
+    }
+  }
+  if (!supportsPipelineVersion(candidate.pipelineVersion)) {
+    throw new Error('release executor unavailable');
+  }
+  for (const key of ['cognitionSchemaVersion', 'expressionSchemaVersion']) {
+    const value = candidate[key];
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error(`candidate release ${key} type conflict`);
+    }
+  }
+  if (!candidate.modelProfile || typeof candidate.modelProfile !== 'object' || Array.isArray(candidate.modelProfile)
+    || !candidate.componentManifest || typeof candidate.componentManifest !== 'object'
+    || Array.isArray(candidate.componentManifest)) {
+    throw new Error('candidate release manifest type conflict');
+  }
+  if (!Number.isSafeInteger(candidate.createdAt) || candidate.createdAt < 0) {
+    throw new Error('candidate release createdAt type conflict');
+  }
+  if (Object.hasOwn(candidate, 'retiredAt')
+    && candidate.retiredAt !== null
+    && (!Number.isSafeInteger(candidate.retiredAt) || candidate.retiredAt < 0)) {
+    throw new Error('candidate release retiredAt type conflict');
+  }
+  if (!/^[0-9a-f]{64}$/.test(candidate.releaseChecksum)) {
+    throw new Error('candidate release checksum format conflict');
+  }
+  const expectedChecksum = candidateReleaseChecksum(candidate);
+  const expectedId = `quality_candidate_${expectedChecksum.slice(0, 16)}`;
+  if (candidate.releaseChecksum !== expectedChecksum || candidate.releaseId !== expectedId) {
+    throw new Error('candidate release checksum conflict');
+  }
+  return candidate;
+}
 
 const MEMORY_SOURCE_ORIGINS = new Set(['consolidation', 'legacy', 'memory']);
 const MEMORY_CONFIG_ORIGINS = new Set(['author', 'system', 'preset', 'global']);
@@ -2131,6 +2195,7 @@ export class YuqiStore {
     this.filename = filename;
     this.db = new DatabaseSync(filename);
     this.closed = false;
+    this.transactionDepth = 0;
     this.migrationOptions = migrationOptions;
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
     try {
@@ -7160,6 +7225,7 @@ export class YuqiStore {
 
   transaction(run) {
     this.db.exec('BEGIN IMMEDIATE');
+    this.transactionDepth += 1;
     try {
       const result = run();
       this.db.exec('COMMIT');
@@ -7167,6 +7233,8 @@ export class YuqiStore {
     } catch (error) {
       try { this.db.exec('ROLLBACK'); } catch {}
       throw error;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -9950,6 +10018,794 @@ export class YuqiStore {
     }));
   }
 
+  loadMaterializedPromotionReportInternal({ rolloutKey, reportId, reportChecksum }) {
+    const row = this.db.prepare(
+      'SELECT * FROM cognition_evaluation_reports WHERE report_id = ?'
+    ).get(String(reportId || ''));
+    const report = mapEvaluationReport(row);
+    if (!report
+      || report.rolloutKey !== String(rolloutKey || '')
+      || report.artifactState !== 'materialized'
+      || report.artifactChecksum !== String(reportChecksum || '')
+      || report.summary?.eligible !== true) {
+      throw new Error('eligible materialized quality report is required');
+    }
+    const { candidate, stable } = this.validateMaterializedPromotionReportInputInternal({
+      rolloutKey,
+      summary: report.summary
+    });
+    return { report, candidate: structuredClone(candidate), stable };
+  }
+
+  validateMaterializedPromotionReportInputInternal({ rolloutKey, summary }) {
+    if (!summary || summary.eligible !== true) {
+      throw new Error('eligible materialized quality report is required');
+    }
+    const candidate = assertCandidateReleaseDefinitionInternal(summary.candidateRelease);
+    const stable = this.getPipelineRelease(this.getCognitionRollout(rolloutKey)?.stableReleaseId);
+    if (!stable
+      || summary.stableBaselineReleaseId !== stable.releaseId
+      || summary.stableBaselineReleaseChecksum !== stable.releaseChecksum
+      || summary.evaluatorVersion !== candidate.evaluatorVersion
+      || typeof summary.suiteChecksum !== 'string'
+      || summary.suiteChecksum.length === 0) {
+      throw new Error('promotion baseline or evaluator authority conflict');
+    }
+    return { candidate: structuredClone(candidate), stable };
+  }
+
+  registerCognitionCandidateInternal({
+    rolloutKey, expectedRevision, releaseId, reportId, reportChecksum, now: registeredAt = now()
+  }) {
+    return this.transaction(() => {
+      const key = String(rolloutKey || '');
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(key);
+      if (!current || Number(current.revision) !== Number(expectedRevision)) {
+        throw new RolloutRevisionConflictError();
+      }
+      const authority = this.loadMaterializedPromotionReportInternal({
+        rolloutKey: key, reportId, reportChecksum
+      });
+      if (authority.candidate.releaseId !== String(releaseId || '')) {
+        throw new Error('candidate release identity conflict');
+      }
+      if ((current.candidate_phase === 'shadow' || current.candidate_phase === 'canary')
+        && (current.candidate_release_id !== authority.candidate.releaseId
+          || current.last_report_id !== String(reportId))) {
+        throw new Error('candidate registration phase conflict');
+      }
+      const release = this.putPipelineReleaseInternal(authority.candidate);
+      if (current.candidate_phase === 'shadow' || current.candidate_phase === 'canary') {
+        return this.getCognitionRollout(key);
+      }
+      const nextRevision = Number(current.revision) + 1;
+      const updated = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET current_mode = 'shadow', rollout_phase = 'collecting', revision = ?,
+            candidate_release_id = ?, candidate_phase = 'shadow',
+            evidence_epoch = evidence_epoch + 1, shadow_epoch = shadow_epoch + 1,
+            live_shadow_first_at = NULL, live_shadow_last_at = NULL,
+            live_shadow_success_count = 0, live_shadow_failure_count = 0,
+            canary_started_count = 0, canary_completed_count = 0,
+            canary_failure_count = 0, canary_started_at = NULL,
+            canary_observe_until = NULL, last_report_id = ?,
+            last_report_checksum = ?, last_reason_code = 'candidate_registered',
+            updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(
+        nextRevision, release.releaseId, String(reportId), String(reportChecksum),
+        Number(registeredAt), key, Number(expectedRevision)
+      );
+      if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      this.appendPromotionHistoryInternal({
+        eventId: `promotion_${contentHash({ key, nextRevision, reportId }).slice(0, 24)}`,
+        rolloutKey: key,
+        fromMode: current.current_mode,
+        toMode: 'shadow',
+        fromPhase: current.rollout_phase,
+        toPhase: 'collecting',
+        fromRevision: Number(current.revision),
+        toRevision: nextRevision,
+        actor: 'promotion_controller',
+        reasonCode: 'candidate_registered',
+        reportId,
+        reportChecksum,
+        metadata: { candidateReleaseId: release.releaseId },
+        createdAt: registeredAt
+      });
+      return this.getCognitionRollout(key);
+    });
+  }
+
+  promoteCognitionCandidateInternal({
+    rolloutKey, expectedRevision, reportId, reportChecksum, now: promotedAt = now()
+  }) {
+    return this.transaction(() => {
+      const key = String(rolloutKey || '');
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(key);
+      if (!current || Number(current.revision) !== Number(expectedRevision)
+        || current.current_mode !== 'shadow' || current.candidate_phase !== 'shadow') {
+        throw new RolloutRevisionConflictError('candidate is not in shadow phase');
+      }
+      const authority = this.loadMaterializedPromotionReportInternal({
+        rolloutKey: key, reportId, reportChecksum
+      });
+      if (current.candidate_release_id !== authority.candidate.releaseId) {
+        throw new Error('candidate release identity conflict');
+      }
+      const evidence = this.readCognitionPromotionEvidenceInternal(key);
+      const minimum = key === 'DIRECT_REPLY' ? 10 : key === 'LIFE_PLANNING' ? 30 : 30;
+      if (evidence.liveShadowSuccessCount < minimum
+        || evidence.liveShadowFailureCount > 0
+        || evidence.staleEvidenceCount > 0
+        || evidence.outstandingComparisonCount > 0
+        || evidence.liveShadowFirstAt === null
+        || evidence.liveShadowLastAt - evidence.liveShadowFirstAt < 72 * 60 * 60 * 1000) {
+        throw new Error('live shadow promotion gate is incomplete');
+      }
+      const nextRevision = Number(current.revision) + 1;
+      const nextEpoch = Number(current.canary_epoch) + 1;
+      const updated = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET current_mode = 'active', rollout_phase = 'canary', revision = ?,
+            candidate_phase = 'canary', canary_epoch = ?,
+            canary_started_count = 0, canary_completed_count = 0,
+            canary_failure_count = 0, canary_started_at = ?,
+            canary_observe_until = ?, last_report_id = ?,
+            last_report_checksum = ?, last_reason_code = 'candidate_canary',
+            activated_at = ?, updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(
+        nextRevision, nextEpoch, Number(promotedAt), Number(promotedAt) + 48 * 60 * 60 * 1000,
+        String(reportId), String(reportChecksum), Number(promotedAt), Number(promotedAt),
+        key, Number(expectedRevision)
+      );
+      if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      this.appendPromotionHistoryInternal({
+        eventId: `promotion_${contentHash({ key, nextRevision, reportId, phase: 'canary' }).slice(0, 24)}`,
+        rolloutKey: key, fromMode: current.current_mode, toMode: 'active',
+        fromPhase: current.rollout_phase, toPhase: 'canary',
+        fromRevision: Number(current.revision), toRevision: nextRevision,
+        actor: 'promotion_controller', reasonCode: 'candidate_canary',
+        reportId, reportChecksum,
+        metadata: { candidateReleaseId: authority.candidate.releaseId }, createdAt: promotedAt
+      });
+      return this.getCognitionRollout(key);
+    });
+  }
+
+  graduateCognitionCandidateInternal({
+    rolloutKey, expectedRevision, reportId, reportChecksum, now: graduatedAt = now()
+  }) {
+    return this.transaction(() => {
+      const key = String(rolloutKey || '');
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(key);
+      if (!current || Number(current.revision) !== Number(expectedRevision)
+        || current.current_mode !== 'active' || current.candidate_phase !== 'canary') {
+        throw new RolloutRevisionConflictError('candidate is not in canary phase');
+      }
+      const authority = this.loadMaterializedPromotionReportInternal({
+        rolloutKey: key, reportId, reportChecksum
+      });
+      if (current.candidate_release_id !== authority.candidate.releaseId) {
+        throw new Error('candidate release identity conflict');
+      }
+      const outstanding = this.readCanaryOutstandingAuthorityInternal({
+        rolloutKey: key, canaryEpoch: Number(current.canary_epoch)
+      });
+      if (Number(current.canary_completed_count) < Number(current.canary_target_count)
+        || outstanding.count > 0 || Number(graduatedAt) < Number(current.canary_observe_until || Infinity)) {
+        throw new Error('active canary observation gate is incomplete');
+      }
+      const oldStable = current.stable_release_id;
+      const nextRevision = Number(current.revision) + 1;
+      const updated = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET stable_release_id = candidate_release_id, candidate_release_id = ?,
+            candidate_phase = 'none', current_mode = 'active', rollout_phase = 'stable',
+            revision = ?, last_reason_code = 'candidate_graduated',
+            updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(
+        oldStable, nextRevision, Number(graduatedAt), key, Number(expectedRevision)
+      );
+      if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      this.appendPromotionHistoryInternal({
+        eventId: `promotion_${contentHash({ key, nextRevision, phase: 'graduated' }).slice(0, 24)}`,
+        rolloutKey: key, fromMode: current.current_mode, toMode: 'active',
+        fromPhase: current.rollout_phase, toPhase: 'stable',
+        fromRevision: Number(current.revision), toRevision: nextRevision,
+        actor: 'promotion_controller', reasonCode: 'candidate_graduated',
+        reportId, reportChecksum, metadata: { promotedReleaseId: current.candidate_release_id },
+        createdAt: graduatedAt
+      });
+      return this.getCognitionRollout(key);
+    });
+  }
+
+  rollbackCognitionCandidateStateInternal({
+    key, current, reasonCode, findingIds = [], reportId = null, reportChecksum = null,
+    metadata = {}, actor = 'promotion_controller', rolledBackAt = now()
+  }) {
+    if (!current || current.candidate_phase === 'none') {
+      throw new Error('candidate rollback phase conflict');
+    }
+    if (current.candidate_phase === 'rolled_back' && current.current_mode === 'shadow') {
+      return this.getCognitionRollout(key);
+    }
+    const nextRevision = Number(current.revision) + 1;
+    const normalizedReason = String(reasonCode || 'MANUAL_SAFETY_ROLLBACK');
+    const updated = this.db.prepare(`
+      UPDATE cognition_kind_rollouts
+      SET current_mode = 'shadow', rollout_phase = 'rolled_back', revision = ?,
+          candidate_phase = 'rolled_back', shadow_epoch = shadow_epoch + 1,
+          rolled_back_at = ?, last_reason_code = ?, updated_at = ?
+      WHERE rollout_key = ? AND revision = ?
+    `).run(
+      nextRevision, Number(rolledBackAt), normalizedReason,
+      Number(rolledBackAt), key, Number(current.revision)
+    );
+    if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+    this.appendPromotionHistoryInternal({
+      eventId: `promotion_${contentHash({ key, nextRevision, phase: 'rollback' }).slice(0, 24)}`,
+      rolloutKey: key, fromMode: current.current_mode, toMode: 'shadow',
+      fromPhase: current.rollout_phase, toPhase: 'rolled_back',
+      fromRevision: Number(current.revision), toRevision: nextRevision,
+      actor, reasonCode: normalizedReason,
+      reportId,
+      reportChecksum,
+      metadata: {
+        ...metadata,
+        findingIds: [...new Set(findingIds.map(String))]
+      },
+      createdAt: rolledBackAt
+    });
+    return this.getCognitionRollout(key);
+  }
+
+  rollbackCognitionCandidateInternal({
+    rolloutKey, expectedRevision, reasonCode, findingIds = [], reportId = null,
+    reportChecksum = null, metadata = {}, actor = 'promotion_controller', now: rolledBackAt = now()
+  }) {
+    const rollback = () => {
+      const key = String(rolloutKey || '');
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(key);
+      if (!current || Number(current.revision) !== Number(expectedRevision)) {
+        throw new RolloutRevisionConflictError();
+      }
+      return this.rollbackCognitionCandidateStateInternal({
+        key, current, reasonCode, findingIds, reportId, reportChecksum, metadata, actor, rolledBackAt
+      });
+    };
+    // PromotionController may call this while its outer life-attempt
+    // transaction is already open.  Reuse that transaction so rollback and
+    // the caller's final CAS are one atomic unit instead of throwing a nested
+    // BEGIN error.
+    return this.transactionDepth > 0 ? rollback() : this.transaction(rollback);
+  }
+
+  readCognitionComparisonBacklogInternal(rolloutKey, rollout) {
+    const key = String(rolloutKey || '');
+    const evidenceEpoch = Number(rollout.evidenceEpoch);
+    const shadowEpoch = rollout.shadowEpoch == null ? null : Number(rollout.shadowEpoch);
+    const subjects = new Set();
+    let oldestAt = null;
+    const addOutstanding = (subjectType, subjectId, createdAt) => {
+      const type = typeof subjectType === 'string' && subjectType.length > 0
+        ? subjectType : 'unknown';
+      const id = typeof subjectId === 'string' && subjectId.length > 0
+        ? subjectId : 'unknown';
+      subjects.add(`${type}:${id}`);
+      const at = Number(createdAt);
+      if (Number.isSafeInteger(at) && (oldestAt === null || at < oldestAt)) oldestAt = at;
+    };
+    const shadowRows = this.db.prepare(`
+      SELECT subject_type, subject_id, state, stale_for_rollout, created_at
+      FROM cognition_shadow_runs
+      WHERE rollout_key = ? AND source = 'live'
+        AND evidence_epoch = ? AND shadow_epoch IS ?
+    `).all(key, evidenceEpoch, shadowEpoch);
+    for (const row of shadowRows) {
+      if (Number(row.stale_for_rollout) === 1) continue;
+      if (['queued', 'running', 'retry_wait'].includes(row.state)) {
+        addOutstanding(row.subject_type, row.subject_id, row.created_at);
+      }
+    }
+    const jobRows = this.db.prepare(`
+      SELECT subject_type, subject_id, state, payload_json, payload_checksum, created_at
+      FROM consolidation_jobs
+      WHERE job_type IN ('shadow_cognition', 'active_canary_compare')
+        AND state IN ('queued', 'running', 'retry_wait')
+    `).all();
+    for (const job of jobRows) {
+      const payload = parseJson(job.payload_json, null);
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue;
+      if (payload.rolloutKey !== key) continue;
+      if (typeof job.payload_checksum !== 'string'
+        || contentHash(payload) !== job.payload_checksum
+        || typeof payload.rolloutEvidenceEpoch !== 'number'
+        || !Number.isSafeInteger(payload.rolloutEvidenceEpoch)
+        || payload.rolloutEvidenceEpoch !== evidenceEpoch
+        || (shadowEpoch === null
+          ? payload.shadowEpoch !== null
+          : (typeof payload.shadowEpoch !== 'number'
+            || !Number.isSafeInteger(payload.shadowEpoch)
+            || payload.shadowEpoch !== shadowEpoch))) {
+        throw new Error('cognition comparison backlog authority conflict');
+      }
+      addOutstanding(job.subject_type, job.subject_id, job.created_at);
+    }
+    return {
+      outstandingComparisonCount: subjects.size,
+      oldestOutstandingComparisonAt: oldestAt
+    };
+  }
+
+  readCognitionPromotionEvidenceInternal(rolloutKey) {
+    const key = String(rolloutKey || '');
+    const rollout = this.getCognitionRollout(key);
+    if (!rollout) throw new Error(`cognition rollout is unavailable: ${key}`);
+    const backlog = this.readCognitionComparisonBacklogInternal(key, rollout);
+    if (key === 'LIFE_PLANNING') {
+      const rows = this.db.prepare(`
+        SELECT planning_id, created_at, execution_state, comparison_state,
+               comparison_direction
+        FROM cognition_life_planning_attempts
+        WHERE rollout_key = 'LIFE_PLANNING'
+          AND rollout_revision = ? AND rollout_evidence_epoch = ?
+          AND shadow_epoch IS ?
+        ORDER BY created_at
+      `).all(Number(rollout.revision), Number(rollout.evidenceEpoch),
+        rollout.shadowEpoch == null ? null : Number(rollout.shadowEpoch));
+      const runRows = this.db.prepare(`
+        SELECT subject_id, comparison_direction, state, critical_findings_json,
+               stale_for_rollout, error_code, created_at
+        FROM cognition_shadow_runs
+        WHERE rollout_key = 'LIFE_PLANNING' AND source = 'live'
+          AND subject_type = 'life_planning'
+          AND evidence_epoch = ? AND shadow_epoch IS ?
+      `).all(Number(rollout.evidenceEpoch),
+        rollout.shadowEpoch == null ? null : Number(rollout.shadowEpoch));
+      const runsBySubject = new Map();
+      for (const run of runRows) {
+        if (!runsBySubject.has(run.subject_id)) runsBySubject.set(run.subject_id, []);
+        runsBySubject.get(run.subject_id).push(run);
+      }
+      let liveShadowSuccessCount = 0;
+      let liveShadowFailureCount = 0;
+      let staleEvidenceCount = 0;
+      const completedAt = [];
+      for (const run of runRows) {
+        if (Number(run.stale_for_rollout) === 1) staleEvidenceCount += 1;
+      }
+      const expectedSubjects = new Set();
+      for (const row of rows) {
+        expectedSubjects.add(row.planning_id);
+        if (row.execution_state !== 'completed' || row.comparison_state !== 'completed') {
+          liveShadowFailureCount += 1;
+          continue;
+        }
+        const candidates = runsBySubject.get(row.planning_id) || [];
+        const valid = candidates.length === 1
+          && candidates[0].comparison_direction === row.comparison_direction
+          && candidates[0].state === 'completed'
+          && Number(candidates[0].stale_for_rollout) === 0
+          && !candidates[0].error_code;
+        const findings = candidates.length === 1
+          ? parseJson(candidates[0].critical_findings_json, null) : null;
+        if (!valid || !Array.isArray(findings) || findings.length > 0) {
+          liveShadowFailureCount += 1;
+          continue;
+        }
+        liveShadowSuccessCount += 1;
+        completedAt.push(Number(row.created_at));
+      }
+      for (const run of runRows) {
+        if (!expectedSubjects.has(run.subject_id)) liveShadowFailureCount += 1;
+      }
+      completedAt.sort((left, right) => left - right);
+      return {
+        liveShadowSuccessCount,
+        liveShadowFailureCount,
+        staleEvidenceCount,
+        liveShadowFirstAt: completedAt.length ? completedAt[0] : null,
+        liveShadowLastAt: completedAt.length ? completedAt[completedAt.length - 1] : null,
+        ...backlog,
+        replayCount: Number(this.db.prepare(
+          'SELECT COUNT(*) AS value FROM cognition_replay_runs WHERE rollout_key = ?'
+        ).get(key).value)
+      };
+    }
+    const rows = this.db.prepare(`
+      SELECT critical_findings_json, state, stale_for_rollout, error_code FROM cognition_shadow_runs
+      WHERE rollout_key = ? AND source = 'live'
+        AND evidence_epoch = ? AND shadow_epoch = ?
+    `).all(key, Number(rollout.evidenceEpoch), Number(rollout.shadowEpoch));
+    const staleEvidenceCount = Number(this.db.prepare(`
+      SELECT COUNT(*) AS value FROM cognition_shadow_runs
+      WHERE rollout_key = ? AND source = 'live' AND stale_for_rollout = 1
+        AND evidence_epoch = ? AND shadow_epoch = ?
+    `).get(key, Number(rollout.evidenceEpoch), Number(rollout.shadowEpoch)).value);
+    let liveShadowSuccessCount = 0;
+    let liveShadowFailureCount = 0;
+    const completedAt = [];
+    for (const row of rows) {
+      if (Number(row.stale_for_rollout) === 1) continue;
+      if (row.state === 'completed') {
+        const findings = parseJson(row.critical_findings_json, null);
+        if (!Array.isArray(findings) || findings.length > 0 || row.error_code) liveShadowFailureCount += 1;
+        else liveShadowSuccessCount += 1;
+      } else if (['queued', 'running', 'retry_wait', 'failed', 'cancelled'].includes(row.state)) {
+        liveShadowFailureCount += 1;
+      } else {
+        liveShadowFailureCount += 1;
+      }
+    }
+    const completedRows = this.db.prepare(`
+      SELECT created_at FROM cognition_shadow_runs
+      WHERE rollout_key = ? AND source = 'live' AND stale_for_rollout = 0 AND state = 'completed'
+        AND evidence_epoch = ? AND shadow_epoch = ?
+      ORDER BY created_at
+    `).all(key, Number(rollout.evidenceEpoch), Number(rollout.shadowEpoch));
+    completedRows.forEach(row => completedAt.push(Number(row.created_at)));
+    const replayCount = Number(this.db.prepare(
+      'SELECT COUNT(*) AS value FROM cognition_replay_runs WHERE rollout_key = ?'
+    ).get(key).value);
+    return {
+      liveShadowSuccessCount,
+      liveShadowFailureCount,
+      staleEvidenceCount,
+      liveShadowFirstAt: completedAt.length ? completedAt[0] : null,
+      liveShadowLastAt: completedAt.length ? completedAt[completedAt.length - 1] : null,
+      ...backlog,
+      replayCount
+    };
+  }
+
+  recordHardActionFindingInternal({
+    rolloutKey,
+    comparisonRunId,
+    findingId,
+    subjectId,
+    subjectChecksum,
+    findingChecksum,
+    now: occurredAt = now()
+  }) {
+    const key = rolloutKey;
+    const runId = comparisonRunId;
+    const id = findingId;
+    const subject = subjectId;
+    if (!key || !runId || !id || !subject
+      || typeof key !== 'string' || typeof runId !== 'string'
+      || typeof id !== 'string' || typeof subject !== 'string'
+      || typeof subjectChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(subjectChecksum)
+      || typeof findingChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(findingChecksum)) {
+      throw new Error('hard action finding authority conflict');
+    }
+    const hardCodes = new Set([
+      'ACTION_TARGET_MISMATCH', 'ACTION_TARGET_ESCALATION', 'DIRECT_REPLY_SKIP',
+      'PAYMENT_TARGET_MISMATCH',
+      'PAYMENT_OBJECT_MUTATION', 'ILLEGAL_STAGE_TRANSITION', 'DUPLICATE_VISIBLE_EFFECT',
+      'PRIVATE_TO_PUBLIC_LEAK', 'PUBLIC_PRIVACY_VIOLATION', 'CURRENT_BATCH_OMISSION',
+      'SCHEMA_INVALID', 'PIPELINE_AUTHORITY_CONFLICT', 'PRESET_UNAVAILABLE',
+      'PIPELINE_UNAVAILABLE', 'ACTIVE_PIPELINE_UNAVAILABLE', 'PINNED_PIPELINE_UNAVAILABLE'
+    ]);
+    return this.transaction(() => {
+      const rollout = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(key);
+      const run = this.db.prepare(`
+        SELECT * FROM cognition_shadow_runs
+        WHERE run_id = ? AND rollout_key = ? AND source = 'live'
+      `).get(runId, key);
+      if (!rollout || !run || run.state !== 'completed' || Number(run.stale_for_rollout) !== 0
+        || run.subject_id !== subject || typeof run.comparison_direction !== 'string'
+        || !Number.isSafeInteger(run.evidence_epoch) || run.evidence_epoch < 0
+        || !Number.isSafeInteger(run.rollout_revision) || run.rollout_revision < 0
+        || typeof run.pipeline_checksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(run.pipeline_checksum)) {
+        throw new Error('hard action finding comparison authority conflict');
+      }
+      const findings = parseJson(run.critical_findings_json, null);
+      if (!Array.isArray(findings) || findings.length === 0) {
+        throw new Error('hard action finding evidence is missing');
+      }
+      const finding = findings.find(item => item && item.findingId === id);
+      const allowedFindingKeys = new Set([
+        'findingId', 'code', 'severity', 'subjectId', 'subjectChecksum',
+        'action', 'target', 'toStage'
+      ]);
+      if (!finding || typeof finding !== 'object' || Array.isArray(finding)
+        || Object.keys(finding).some(field => !allowedFindingKeys.has(field))
+        || Object.keys(finding).length < 5
+        || ['findingId', 'code', 'severity', 'subjectId', 'subjectChecksum']
+          .some(field => typeof finding[field] !== 'string' || finding[field].length === 0)
+        || ['action', 'target', 'toStage'].some(field =>
+          finding[field] !== undefined
+          && (typeof finding[field] !== 'string' || finding[field].length === 0))
+        || finding.severity !== 'critical' || finding.subjectId !== subject
+        || finding.subjectChecksum !== subjectChecksum || !hardCodes.has(finding.code)
+        || contentHash(finding) !== findingChecksum) {
+        throw new Error('hard action finding evidence conflict');
+      }
+      let proofReport = null;
+      for (const report of this.db.prepare(`
+        SELECT * FROM cognition_evaluation_reports
+        WHERE source_type = 'comparison_run'
+          AND json_extract(summary_json, '$.comparisonRunId') = ?
+        ORDER BY created_at DESC, report_id DESC
+      `).all(runId)) {
+        const summary = parseJson(report.summary_json, null);
+        if (summary && summary.comparisonRunId === runId
+          && summary.rolloutKey === key && summary.subjectId === subject) {
+          proofReport = { report, summary };
+          break;
+        }
+      }
+      if (!proofReport) throw new Error('hard action comparison proof is unavailable');
+      const jobId = proofReport.summary.jobId;
+      const job = typeof jobId === 'string' && jobId
+        ? this.db.prepare('SELECT * FROM consolidation_jobs WHERE job_id = ?').get(jobId)
+        : null;
+      const payload = job ? parseJson(job.payload_json, null) : null;
+      let contract = null;
+      try { contract = comparisonContractForDirection(run.comparison_direction); } catch {}
+      if (!job || job.state !== 'completed' || !payload
+        || contentHash(payload) !== job.payload_checksum
+        || !contract || contract.jobType !== job.job_type
+        || job.subject_type !== run.subject_type || job.subject_id !== run.subject_id
+        || (job.turn_id || null) !== (run.turn_id || null)
+        || payload.comparisonDirection !== run.comparison_direction
+        || payload.rolloutEvidenceEpoch !== run.evidence_epoch
+        || (payload.shadowEpoch ?? null) !== (run.shadow_epoch ?? null)
+        || (payload.canaryEpoch ?? null) !== (run.canary_epoch ?? null)
+        || (payload.canarySlot ?? null) !== (run.canary_slot ?? null)
+        || payload.authoritativeResultChecksum !== run.authoritative_result_checksum
+        || (payload.rolloutKey !== undefined && payload.rolloutKey !== key)
+        || (payload.subjectType !== undefined && payload.subjectType !== run.subject_type)
+        || (payload.subjectId !== undefined && payload.subjectId !== run.subject_id)
+        || (payload.turnId !== undefined && (payload.turnId || null) !== (run.turn_id || null))
+        || (payload.rolloutRevision !== undefined
+          && payload.rolloutRevision !== run.rollout_revision)) {
+        throw new Error('hard action comparison proof conflict');
+      }
+      if (run.subject_type === 'turn') {
+        const turn = run.turn_id ? this.getTurn(run.turn_id) : null;
+        const receipt = turn ? this.getVisibleCommitReceipt(run.subject_id) : null;
+        if (!turn || !receipt || turn.authorityLineageKey !== run.subject_id
+          || turn.rolloutKey !== key || turn.resultAuthorityVersion !== 1
+          || turn.comparisonPipelineChecksum !== run.pipeline_checksum
+          || Number(turn.rolloutEvidenceEpoch) !== Number(run.evidence_epoch)
+          || (turn.shadowEpoch ?? null) !== (run.shadow_epoch ?? null)
+          || (turn.canaryEpoch ?? null) !== (run.canary_epoch ?? null)
+          || (turn.canarySlot ?? null) !== (run.canary_slot ?? null)
+          || Number(turn.rolloutRevision) !== Number(run.rollout_revision)
+          || receipt.commitChecksum !== run.authoritative_result_checksum) {
+          throw new Error('hard action turn authority conflict');
+        }
+      } else if (run.subject_type === 'life_planning') {
+        const attempt = this.getLifePlanningAttempt(run.subject_id);
+        if (!attempt || attempt.planningId !== run.subject_id
+          || attempt.rolloutKey !== key
+          || attempt.comparisonPipelineChecksum !== run.pipeline_checksum
+          || Number(attempt.rolloutEvidenceEpoch) !== Number(run.evidence_epoch)
+          || (attempt.shadowEpoch ?? null) !== (run.shadow_epoch ?? null)
+          || (attempt.canaryEpoch ?? null) !== (run.canary_epoch ?? null)
+          || (attempt.canarySlot ?? null) !== (run.canary_slot ?? null)
+          || Number(attempt.rolloutRevision) !== Number(run.rollout_revision)
+          || attempt.authoritativeResultChecksum !== run.authoritative_result_checksum) {
+          throw new Error('hard action life authority conflict');
+        }
+      } else {
+        throw new Error('hard action subject authority conflict');
+      }
+      const existingRows = this.db.prepare(`
+        SELECT reason_code, metadata_json FROM cognition_promotion_history
+        WHERE rollout_key = ? AND json_extract(metadata_json, '$.findingId') = ?
+      `).all(key, id);
+      if (existingRows.length) {
+        const exact = existingRows.some(row => {
+          const metadata = parseJson(row.metadata_json, null);
+          return row.reason_code === finding.code && metadata
+            && metadata.comparisonRunId === runId
+            && metadata.subjectId === subject
+            && metadata.subjectChecksum === subjectChecksum
+            && metadata.findingChecksum === findingChecksum;
+        });
+        if (!exact) throw new Error('hard action finding replay conflict');
+        return this.getCognitionRollout(key);
+      }
+      if (!['shadow', 'canary'].includes(rollout.candidate_phase)
+        || !['shadow', 'active'].includes(rollout.current_mode)
+        || Number(run.evidence_epoch) !== Number(rollout.evidence_epoch)
+        || Number(run.rollout_revision) > Number(rollout.revision)
+        || (rollout.candidate_phase === 'canary'
+          ? Number(run.canary_epoch) !== Number(rollout.canary_epoch)
+          : Number(run.shadow_epoch) !== Number(rollout.shadow_epoch))) {
+        throw new Error('hard action finding rollout authority conflict');
+      }
+      const rolledBack = this.rollbackCognitionCandidateStateInternal({
+        key,
+        current: rollout,
+        reasonCode: finding.code,
+        findingIds: [id],
+        rolledBackAt: Number(occurredAt)
+      });
+      this.appendPromotionHistoryInternal({
+        eventId: `hard_finding_${contentHash({ key, runId, id }).slice(0, 24)}`,
+        rolloutKey: key,
+        fromMode: rollout.current_mode,
+        toMode: 'shadow',
+        fromPhase: rollout.rollout_phase,
+        toPhase: 'rolled_back',
+        fromRevision: Number(rollout.revision),
+        toRevision: Number(rolledBack.revision),
+        actor: 'comparison_evaluator',
+        reasonCode: finding.code,
+        metadata: {
+          findingId: id,
+          comparisonRunId: runId,
+          subjectId: subject,
+          subjectChecksum,
+          findingChecksum
+        },
+        createdAt: Number(occurredAt)
+      });
+      return rolledBack;
+    });
+  }
+
+  recordCriticalFindingInternal({
+    rolloutKey, findingId, subjectId, severity, code, judgments, occurredAt, confirmed,
+    subjectChecksum, judgmentFindingIds
+  }) {
+    if (confirmed !== undefined) throw new Error('caller confirmation is not authoritative');
+    const key = String(rolloutKey || '');
+    const id = String(findingId || '');
+    const subject = String(subjectId || '');
+    const findingCode = String(code || '');
+    if (!id || !subject || severity !== 'critical' || !findingCode) {
+      throw new Error('two independent evaluator judgments are required');
+    }
+    const evaluatorIds = new Set();
+    const judgmentIds = new Set();
+    if (judgmentFindingIds !== undefined) {
+      if (!Array.isArray(judgmentFindingIds) || judgmentFindingIds.length !== 2
+        || new Set(judgmentFindingIds).size !== 2
+        || judgmentFindingIds.some(value => typeof value !== 'string' || value.length === 0)
+        || typeof subjectChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(subjectChecksum)) {
+        throw new Error('persisted evaluator evidence is required');
+      }
+      const rows = judgmentFindingIds.map(judgmentFindingId => this.db.prepare(`
+        SELECT q.*, r.state AS eval_state, r.completed_at AS eval_completed_at
+        FROM quality_findings q
+        JOIN quality_eval_runs r ON r.eval_run_id = q.eval_run_id
+        WHERE q.finding_id = ? AND q.rollout_key = ?
+      `).get(judgmentFindingId, key));
+      if (rows.some(row => !row || row.eval_state !== 'completed'
+        || row.severity !== 'critical' || row.code !== findingCode
+        || row.scene_id !== subject)) {
+        throw new Error('persisted evaluator evidence is unavailable');
+      }
+      for (const row of rows) {
+        const evidence = parseJson(row.evidence_json, null);
+        if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)
+          || canonicalJson(Object.keys(evidence).sort())
+            !== canonicalJson(['evaluatorId', 'judgmentId', 'subjectChecksum', 'subjectId'])
+          || evidence.subjectId !== subject || evidence.subjectChecksum !== subjectChecksum
+          || typeof evidence.evaluatorId !== 'string' || !evidence.evaluatorId
+          || typeof evidence.judgmentId !== 'string' || !evidence.judgmentId
+          || row.owner !== evidence.evaluatorId) {
+          throw new Error('persisted evaluator evidence shape conflict');
+        }
+        evaluatorIds.add(evidence.evaluatorId);
+        judgmentIds.add(evidence.judgmentId);
+      }
+      if (evaluatorIds.size !== 2 || judgmentIds.size !== 2) {
+        throw new Error('persisted evaluator evidence is not independent');
+      }
+      const evidenceTimes = rows.map(row => {
+        if (!Number.isSafeInteger(row.created_at) || row.created_at < 0
+          || !Number.isSafeInteger(row.eval_completed_at) || row.eval_completed_at < 0
+          || row.eval_completed_at < row.created_at || row.eval_completed_at > now()) {
+          throw new Error('persisted evaluator evidence time conflict');
+        }
+        return row.eval_completed_at;
+      });
+      const confirmedAt = Math.max(...evidenceTimes);
+      if (occurredAt !== undefined
+        && (typeof occurredAt !== 'number' || !Number.isSafeInteger(occurredAt)
+          || occurredAt !== confirmedAt)) {
+        throw new Error('caller confirmation time is not authoritative');
+      }
+      const expectedFindingId = `finding_${contentHash({
+        rolloutKey: key,
+        subjectId: subject,
+        subjectChecksum,
+        code: findingCode,
+        judgmentFindingIds: [...judgmentFindingIds].sort()
+      }).slice(0, 24)}`;
+      if (id !== expectedFindingId) throw new Error('persisted finding identity conflict');
+      return this.transaction(() => {
+        const existing = this.db.prepare(`
+          SELECT event_id FROM cognition_promotion_history
+          WHERE rollout_key = ? AND reason_code = 'CONFIRMED_CRITICAL'
+            AND json_extract(metadata_json, '$.findingId') = ?
+        `).get(key, id);
+        if (existing) return this.getCognitionRollout(key);
+        const existingSubject = this.db.prepare(`
+          SELECT event_id FROM cognition_promotion_history
+          WHERE rollout_key = ? AND reason_code = 'CONFIRMED_CRITICAL'
+            AND created_at >= ? AND json_extract(metadata_json, '$.subjectId') = ?
+        `).get(key, confirmedAt - 15 * 60 * 1000, subject);
+        if (existingSubject) return this.getCognitionRollout(key);
+        const current = this.db.prepare(
+          'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+        ).get(key);
+        if (!current) throw new Error('cognition rollout is unavailable');
+        this.appendPromotionHistoryInternal({
+          eventId: `finding_${contentHash({ key, id }).slice(0, 24)}`,
+          rolloutKey: key, fromMode: current.current_mode, toMode: current.current_mode,
+          fromPhase: current.rollout_phase, toPhase: current.rollout_phase,
+          fromRevision: Number(current.revision), toRevision: Number(current.revision),
+          actor: 'quality_fuse', reasonCode: 'CONFIRMED_CRITICAL',
+          metadata: {
+            findingId: id,
+            subjectId: subject,
+            subjectChecksum,
+            severity: 'critical',
+            code: findingCode,
+            evaluatorIds: [...evaluatorIds].sort(),
+            judgmentIds: [...judgmentIds].sort()
+          }, createdAt: confirmedAt
+        });
+        const count = Number(this.db.prepare(`
+          SELECT COUNT(DISTINCT json_extract(metadata_json, '$.subjectId')) AS value
+          FROM cognition_promotion_history
+          WHERE rollout_key = ? AND reason_code = 'CONFIRMED_CRITICAL'
+            AND created_at >= ? AND json_extract(metadata_json, '$.severity') = 'critical'
+        `).get(key, confirmedAt - 15 * 60 * 1000).value);
+        if (count < 2
+          || current.current_mode !== 'active'
+          || current.candidate_phase !== 'canary') return this.getCognitionRollout(key);
+        const nextRevision = Number(current.revision) + 1;
+        const reasonCode = findingCode || 'QUALITY_FUSE_CRITICAL';
+        const updated = this.db.prepare(`
+          UPDATE cognition_kind_rollouts
+          SET current_mode = 'shadow', rollout_phase = 'rolled_back', revision = ?,
+              shadow_epoch = shadow_epoch + 1, candidate_phase = 'rolled_back',
+              rolled_back_at = ?, last_reason_code = ?, updated_at = ?
+          WHERE rollout_key = ? AND revision = ?
+        `).run(nextRevision, confirmedAt, reasonCode, confirmedAt, key, Number(current.revision));
+        if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+        this.appendPromotionHistoryInternal({
+          eventId: `promotion_${contentHash({ key, nextRevision, fuse: true }).slice(0, 24)}`,
+          rolloutKey: key, fromMode: current.current_mode, toMode: 'shadow',
+          fromPhase: current.rollout_phase, toPhase: 'rolled_back',
+          fromRevision: Number(current.revision), toRevision: nextRevision,
+          actor: 'quality_fuse', reasonCode,
+          metadata: { findingIds: [id], subjectIds: [subject] }, createdAt: confirmedAt
+        });
+        return this.getCognitionRollout(key);
+      });
+    } else {
+      // Evaluator identity is a persisted quality-evidence fact, never a caller
+      // supplied array that can manufacture independent judgments.
+      if (Array.isArray(judgments)) {
+        throw new Error('persisted evaluator evidence is required');
+      }
+      throw new Error('two independent evaluator judgments are required');
+    }
+  }
+
   initializeCognitionRolloutsInternal({ rows, now: initializedAt = now() }) {
     if (!Array.isArray(rows) || !rows.length) throw new Error('rollout rows are required');
     return this.transaction(() => {
@@ -10040,6 +10896,12 @@ export class YuqiStore {
       if (!current || Number(current.revision) !== Number(expectedRevision)) {
         throw new RolloutRevisionConflictError();
       }
+      if (String(current.candidate_phase || 'none') !== 'none') {
+        throw new Error('candidate phase transitions require the candidate API');
+      }
+      if (toMode === 'active' && toPhase === 'canary') {
+        throw new Error('active canary requires promotion candidate API');
+      }
       const newShadowWindow = toMode === 'shadow'
         && (current.current_mode !== 'shadow' || toPhase !== current.rollout_phase);
       const newCanary = toMode === 'active' && toPhase === 'canary'
@@ -10084,13 +10946,11 @@ export class YuqiStore {
         rolloutKey, Number(expectedRevision)
       );
       if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
-      const candidatePhase = toMode === 'shadow'
-        ? 'shadow'
-        : toMode === 'active' && toPhase === 'canary'
-          ? 'canary'
-          : current.current_mode !== 'legacy' && toMode === 'legacy'
-            ? 'rolled_back'
-            : current.candidate_phase;
+      // Generic transition() is the legacy compatibility path.  It may move
+      // an unregistered rollout between legacy/shadow modes, but it must never
+      // manufacture or mutate candidate authority.  Candidate phases are
+      // owned exclusively by register/promote/graduate/rollback APIs above.
+      const candidatePhase = current.candidate_phase;
       this.db.prepare(`
         UPDATE cognition_kind_rollouts
         SET candidate_phase = ?
@@ -11039,14 +11899,15 @@ export class YuqiStore {
         lineageRevision = lineage.revision + 1;
         retryOfTurnId = parent.turnId;
       } else {
-        const rolloutRow = this.db.prepare(
+        let rolloutRow = this.db.prepare(
           'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
         ).get(rolloutKey);
         if (!rolloutRow || Number(rolloutRow.revision) !== expectedRolloutRevision) {
           throw new RolloutRevisionConflictError();
         }
-        const rollout = mapCognitionRollout(rolloutRow);
-        const pair = resolvePipelinePair(rollout);
+        let rollout = mapCognitionRollout(rolloutRow);
+        let pair = resolvePipelinePair(rollout);
+        let didStoreRollback = false;
         const projectionIsValid = pair.candidatePhase === 'shadow'
           ? rollout.currentMode === 'shadow'
           : pair.candidatePhase === 'canary'
@@ -11058,17 +11919,55 @@ export class YuqiStore {
         if (!projectionIsValid) {
           throw new RolloutRevisionConflictError('rollout phase projection conflict');
         }
-        if (String(input.authoritativeReleaseId || '') !== pair.visibleReleaseId
-          || String(input.comparisonReleaseId || '') !== String(pair.comparisonReleaseId || '')
-          || String(input.comparisonDirection || '') !== String(pair.comparisonDirection || '')) {
-          throw new RolloutRevisionConflictError('rollout release pair conflict');
-        }
-        const authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
-        const comparisonRelease = pair.comparisonReleaseId
+        let authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
+        let comparisonRelease = pair.comparisonReleaseId
           ? this.getPipelineRelease(pair.comparisonReleaseId)
           : null;
         if (!authoritativeRelease || (pair.comparisonReleaseId && !comparisonRelease)) {
           throw new Error('canonical release authority is unavailable');
+        }
+        if (pair.candidatePhase === 'canary' && pair.comparisonReleaseId !== null) {
+          const authorityOutstanding = this.readCanaryOutstandingAuthorityInternal({
+            rolloutKey,
+            canaryEpoch: Number(rolloutRow.canary_epoch)
+          });
+          const authorityNow = Number(now());
+          const authorityDeadlineBreached = envelope.protocolVersion === 3
+            && authorityOutstanding.oldestAt !== null
+            && authorityNow - Number(authorityOutstanding.oldestAt)
+              >= Number(rolloutRow.canary_compare_deadline_ms);
+          const authorityBacklogBreached = envelope.protocolVersion === 3
+            && authorityOutstanding.count
+            >= Number(rolloutRow.canary_max_outstanding);
+          if (authorityDeadlineBreached || authorityBacklogBreached) {
+            this.rollbackCognitionCandidateStateInternal({
+              key: rolloutKey,
+              current: rolloutRow,
+              reasonCode: authorityDeadlineBreached
+                ? 'CANARY_COMPARE_DEADLINE' : 'CANARY_COMPARE_BACKLOG',
+              rolledBackAt: authorityNow
+            });
+            rolloutRow = this.db.prepare(
+              'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+            ).get(rolloutKey);
+            if (!rolloutRow) throw new RolloutRevisionConflictError();
+            rollout = mapCognitionRollout(rolloutRow);
+            pair = resolvePipelinePair(rollout);
+            didStoreRollback = true;
+            authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
+            comparisonRelease = pair.comparisonReleaseId
+              ? this.getPipelineRelease(pair.comparisonReleaseId)
+              : null;
+            if (!authoritativeRelease || (pair.comparisonReleaseId && !comparisonRelease)) {
+              throw new Error('canonical release authority is unavailable after rollback');
+            }
+          }
+        }
+        if (!didStoreRollback
+          && (String(input.authoritativeReleaseId || '') !== pair.visibleReleaseId
+            || String(input.comparisonReleaseId || '') !== String(pair.comparisonReleaseId || '')
+            || String(input.comparisonDirection || '') !== String(pair.comparisonDirection || ''))) {
+          throw new RolloutRevisionConflictError('rollout release pair conflict');
         }
         const existingLineage = this.getTurnAuthorityLineage(lineageKey);
         if (existingLineage) {
@@ -11106,11 +12005,13 @@ export class YuqiStore {
           comparisonPipelineChecksum: comparisonRelease?.releaseChecksum || null
         };
         if (reservesCanaryComparison) {
-          const outstanding = Number(rolloutRow.canary_started_count)
-            - Number(rolloutRow.canary_completed_count)
-            - Number(rolloutRow.canary_failure_count);
-          if (outstanding >= Number(rolloutRow.canary_max_outstanding)) {
-            throw new Error('canary outstanding authority limit reached');
+          if (envelope.protocolVersion !== 3) {
+            const outstanding = Number(rolloutRow.canary_started_count)
+              - Number(rolloutRow.canary_completed_count)
+              - Number(rolloutRow.canary_failure_count);
+            if (outstanding >= Number(rolloutRow.canary_max_outstanding)) {
+              throw new Error('canary outstanding authority limit reached');
+            }
           }
           const reservation = this.db.prepare(`
             UPDATE cognition_kind_rollouts
@@ -11122,7 +12023,7 @@ export class YuqiStore {
               AND (
                 canary_started_count - canary_completed_count - canary_failure_count
               ) < canary_max_outstanding
-          `).run(now(), now(), rolloutKey, expectedRolloutRevision);
+          `).run(now(), now(), rolloutKey, Number(rolloutRow.revision));
           if (Number(reservation.changes) !== 1) {
             throw new RolloutRevisionConflictError('canary reservation conflict');
           }
@@ -13086,14 +13987,51 @@ export class YuqiStore {
           'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
         ).get(String(pin.rolloutKey));
         if (!rollout) throw new Error(`cognition rollout is unavailable: ${pin.rolloutKey}`);
+        const rolloutProjection = mapCognitionRollout(rollout);
+        let pair = resolvePipelinePair(rolloutProjection);
+        if (pair.candidatePhase === 'none' && rollout.current_mode !== 'active') {
+          pair = {
+            visibleReleaseId: rollout.stable_release_id,
+            comparisonReleaseId: rollout.candidate_release_id,
+            comparisonDirection: 'stable_authoritative_candidate_compare',
+            candidatePhase: 'shadow'
+          };
+        }
+        if (pair.candidatePhase === 'canary' && pair.comparisonReleaseId !== null) {
+          const outstanding = this.readCanaryOutstandingAuthorityInternal({
+            rolloutKey: rollout.rollout_key,
+            canaryEpoch: Number(rollout.canary_epoch)
+          });
+          const authorityNow = Number(now());
+          const deadlineBreached = outstanding.oldestAt !== null
+            && authorityNow - Number(outstanding.oldestAt)
+              >= Number(rollout.canary_compare_deadline_ms);
+          const backlogBreached = outstanding.count
+            >= Number(rollout.canary_max_outstanding);
+          if (deadlineBreached || backlogBreached) {
+            this.rollbackCognitionCandidateStateInternal({
+              key: rollout.rollout_key,
+              current: rollout,
+              reasonCode: deadlineBreached ? 'CANARY_COMPARE_DEADLINE' : 'CANARY_COMPARE_BACKLOG',
+              rolledBackAt: authorityNow
+            });
+            rollout = this.db.prepare(
+              'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+            ).get(String(pin.rolloutKey));
+            pair = resolvePipelinePair(mapCognitionRollout(rollout));
+          }
+        }
         const stableRelease = this.getPipelineRelease(rollout.stable_release_id);
-        const candidateRelease = this.getPipelineRelease(rollout.candidate_release_id);
-        if (!stableRelease || !candidateRelease) {
+        const authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
+        const comparisonRelease = pair.comparisonReleaseId
+          ? this.getPipelineRelease(pair.comparisonReleaseId)
+          : null;
+        if (!stableRelease || !authoritativeRelease || (pair.comparisonReleaseId && !comparisonRelease)) {
           throw new Error(`cognition rollout release authority is unavailable: ${pin.rolloutKey}`);
         }
-        const candidateIsAuthoritative = rollout.current_mode === 'active';
-        const authoritativeRelease = candidateIsAuthoritative ? candidateRelease : stableRelease;
-        const comparisonRelease = candidateIsAuthoritative ? stableRelease : candidateRelease;
+        const comparisonMode = pair.comparisonDirection
+          ? comparisonContractForDirection(pair.comparisonDirection).comparisonMode
+          : 'none';
         effectivePin = {
           ...effectivePin,
           pipelineMode: rollout.current_mode,
@@ -13105,19 +14043,15 @@ export class YuqiStore {
           canaryEpoch: rollout.current_mode === 'active' && rollout.rollout_phase === 'canary'
             ? Number(rollout.canary_epoch)
             : null,
-          comparisonMode: rollout.current_mode === 'shadow'
-            ? 'cognition_compare'
-            : rollout.current_mode === 'active' && rollout.rollout_phase === 'canary'
-              ? 'legacy_compare'
-              : 'none',
-          canarySlot: rollout.current_mode === 'active' && rollout.rollout_phase === 'canary'
+          comparisonMode,
+          canarySlot: pair.candidatePhase === 'canary' && pair.comparisonReleaseId !== null
             ? Number(rollout.canary_started_count) + 1
             : null,
           presetVersion: rollout.preset_version,
           authoritativeReleaseId: authoritativeRelease.releaseId,
-          comparisonReleaseId: comparisonRelease.releaseId,
+          comparisonReleaseId: comparisonRelease?.releaseId || null,
           authoritativePipelineChecksum: authoritativeRelease.releaseChecksum,
-          comparisonPipelineChecksum: comparisonRelease.releaseChecksum
+          comparisonPipelineChecksum: comparisonRelease?.releaseChecksum || null
         };
       }
       if (envelope.message && !canonicalRetryMessage) {
@@ -16368,26 +17302,28 @@ export class YuqiStore {
       roleId,
       inputSnapshot: attempt.inputSnapshot
     }, this);
-    const rolloutRow = this.db.prepare(
+    let rolloutRow = this.db.prepare(
       'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
     ).get('LIFE_PLANNING');
     if (!rolloutRow || Number(rolloutRow.revision) !== Number(attempt.rolloutRevision)) {
       throw new RolloutRevisionConflictError();
     }
-    const rollout = mapCognitionRollout(rolloutRow);
-    const pair = resolvePipelinePair(rollout);
-    const comparison = comparisonContractForDirection(pair.comparisonDirection);
-    if (String(attempt.authoritativeReleaseId || '') !== pair.visibleReleaseId
-      || String(attempt.comparisonReleaseId || '') !== String(pair.comparisonReleaseId || '')
-      || String(attempt.comparisonDirection || '') !== String(comparison.comparisonDirection || '')
-      || String(attempt.comparisonMode || '') !== comparison.comparisonMode
-      || String(attempt.pipelineMode || '') !== rollout.currentMode) {
-      throw new RolloutRevisionConflictError('life planning rollout release pair conflict');
-    }
-    const authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
-    const comparisonRelease = pair.comparisonReleaseId
+    let rollout = mapCognitionRollout(rolloutRow);
+    let pair = resolvePipelinePair(rollout);
+    let comparison = comparisonContractForDirection(pair.comparisonDirection);
+    let authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
+    let comparisonRelease = pair.comparisonReleaseId
       ? this.getPipelineRelease(pair.comparisonReleaseId)
       : null;
+    let didStoreRollback = false;
+    const inputPairMatches = () => String(attempt.authoritativeReleaseId || '') === pair.visibleReleaseId
+      && String(attempt.comparisonReleaseId || '') === String(pair.comparisonReleaseId || '')
+      && String(attempt.comparisonDirection || '') === String(comparison.comparisonDirection || '')
+      && String(attempt.comparisonMode || '') === comparison.comparisonMode
+      && String(attempt.pipelineMode || '') === rollout.currentMode;
+    if (!didStoreRollback && !inputPairMatches()) {
+      throw new RolloutRevisionConflictError('life planning rollout release pair conflict');
+    }
     if (!authoritativeRelease
       || authoritativeRelease.releaseChecksum !== attempt.authoritativePipelineChecksum
       || attempt.pipelineChecksum !== authoritativeRelease.releaseChecksum
@@ -16397,9 +17333,9 @@ export class YuqiStore {
         : attempt.comparisonPipelineChecksum != null)) {
       throw new Error('life planning release checksum authority conflict');
     }
-    const reservesCanaryComparison = pair.candidatePhase === 'canary'
+    let reservesCanaryComparison = pair.candidatePhase === 'canary'
       && pair.comparisonReleaseId !== null;
-    const canarySlot = reservesCanaryComparison
+    let canarySlot = reservesCanaryComparison
       ? Number(rollout.canaryStartedCount) + 1
       : null;
     if (reservesCanaryComparison) {
@@ -16407,28 +17343,57 @@ export class YuqiStore {
         rolloutKey: 'LIFE_PLANNING',
         canaryEpoch: rollout.canaryEpoch
       });
-      if (outstanding.count >= rollout.canaryMaxOutstanding) {
-        throw new Error('canary outstanding authority limit reached');
+      const authorityNow = Number(attempt.now || now());
+      const deadlineBreached = outstanding.oldestAt !== null
+        && authorityNow - Number(outstanding.oldestAt)
+          >= Number(rollout.canaryCompareDeadlineMs);
+      const backlogBreached = outstanding.count >= rollout.canaryMaxOutstanding;
+      if (deadlineBreached || backlogBreached) {
+        this.rollbackCognitionCandidateStateInternal({
+          key: 'LIFE_PLANNING',
+          current: rolloutRow,
+          reasonCode: deadlineBreached ? 'CANARY_COMPARE_DEADLINE' : 'CANARY_COMPARE_BACKLOG',
+          rolledBackAt: authorityNow
+        });
+        rolloutRow = this.db.prepare(
+          'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+        ).get('LIFE_PLANNING');
+        if (!rolloutRow) throw new RolloutRevisionConflictError();
+        rollout = mapCognitionRollout(rolloutRow);
+        pair = resolvePipelinePair(rollout);
+        comparison = comparisonContractForDirection(pair.comparisonDirection);
+        authoritativeRelease = this.getPipelineRelease(pair.visibleReleaseId);
+        comparisonRelease = pair.comparisonReleaseId
+          ? this.getPipelineRelease(pair.comparisonReleaseId)
+          : null;
+        if (!authoritativeRelease || (pair.comparisonReleaseId && !comparisonRelease)) {
+          throw new Error('life planning release authority is unavailable after rollback');
+        }
+        didStoreRollback = true;
+        reservesCanaryComparison = false;
+        canarySlot = null;
       }
-      const reservation = this.db.prepare(`
-        UPDATE cognition_kind_rollouts
-        SET revision = revision + 1,
-            canary_started_count = canary_started_count + 1,
-            canary_started_at = COALESCE(canary_started_at, ?),
-            updated_at = ?
-        WHERE rollout_key = ? AND revision = ?
-          AND canary_started_count < canary_target_count
-          AND (
-            canary_started_count - canary_completed_count - canary_failure_count
-          ) < canary_max_outstanding
-      `).run(
-        Number(attempt.now || now()),
-        Number(attempt.now || now()),
-        'LIFE_PLANNING',
-        Number(attempt.rolloutRevision)
-      );
-      if (Number(reservation.changes) !== 1) {
-        throw new RolloutRevisionConflictError('life canary reservation conflict');
+      if (reservesCanaryComparison) {
+        const reservation = this.db.prepare(`
+          UPDATE cognition_kind_rollouts
+          SET revision = revision + 1,
+              canary_started_count = canary_started_count + 1,
+              canary_started_at = COALESCE(canary_started_at, ?),
+              updated_at = ?
+          WHERE rollout_key = ? AND revision = ?
+            AND canary_started_count < canary_target_count
+            AND (
+              canary_started_count - canary_completed_count - canary_failure_count
+            ) < canary_max_outstanding
+        `).run(
+          Number(attempt.now || now()),
+          Number(attempt.now || now()),
+          'LIFE_PLANNING',
+          Number(rolloutRow.revision)
+        );
+        if (Number(reservation.changes) !== 1) {
+          throw new RolloutRevisionConflictError('life canary reservation conflict');
+        }
       }
     }
     const revision = Number(this.db.prepare(`
@@ -16439,7 +17404,15 @@ export class YuqiStore {
     const timestamp = Number(attempt.now || now());
     const inputSnapshotJson = canonicalJson(attempt.inputSnapshot || {});
     const inputChecksum = contentHash(attempt.inputSnapshot || {});
-    const comparisonMode = String(attempt.comparisonMode || 'none');
+    const effectivePipelineMode = rollout.currentMode;
+    const effectiveComparisonMode = comparison.comparisonMode;
+    const effectiveComparisonDirection = comparison.comparisonDirection;
+    const effectivePipelineChecksum = authoritativeRelease.releaseChecksum;
+    const effectiveAuthoritativePipeline = effectivePipelineMode === 'active' ? 'cognition' : 'legacy';
+    const effectiveShadowEpoch = pair.candidatePhase === 'shadow' ? Number(rollout.shadowEpoch) : null;
+    const effectiveCanaryEpoch = pair.candidatePhase === 'canary' ? Number(rollout.canaryEpoch) : null;
+    const effectiveRolloutRevision = Number(rolloutRow.revision);
+    const comparisonMode = effectiveComparisonMode;
     this.db.prepare(`
       INSERT INTO cognition_life_planning_attempts(
         planning_id, request_base_key, request_key, role_id, planning_revision,
@@ -16456,13 +17429,13 @@ export class YuqiStore {
     `).run(
       planningId, attempt.requestBaseKey, attempt.requestKey, roleId, revision,
       Number(attempt.planningWindowStartAt), Number(attempt.planningWindowEndAt),
-      attempt.lifeBasisChecksum, attempt.contextChecksum, attempt.pipelineMode,
-      comparisonMode, attempt.authoritativePipeline, attempt.comparisonDirection || null,
-      Number(attempt.rolloutRevision), Number(attempt.rolloutEvidenceEpoch),
-      attempt.pipelineChecksum, attempt.shadowEpoch ?? null, attempt.canaryEpoch ?? null,
+      attempt.lifeBasisChecksum, attempt.contextChecksum, effectivePipelineMode,
+      comparisonMode, effectiveAuthoritativePipeline, effectiveComparisonDirection || null,
+      effectiveRolloutRevision, Number(rollout.evidenceEpoch),
+      effectivePipelineChecksum, effectiveShadowEpoch, effectiveCanaryEpoch,
       canarySlot, authoritativeRelease.releaseId, comparisonRelease?.releaseId || null,
       authoritativeRelease.releaseChecksum, comparisonRelease?.releaseChecksum || null,
-      attempt.presetVersion, inputSnapshotJson, inputChecksum,
+      authoritativeRelease.presetVersion, inputSnapshotJson, inputChecksum,
       comparisonMode === 'none' ? 'not_applicable' : 'not_ready',
       Number(attempt.dueAt || timestamp), timestamp, timestamp
     );
@@ -17710,9 +18683,10 @@ export class YuqiStore {
       const stale = !validEpoch;
       if (!run || typeof run !== 'object') throw new Error('comparison run is required');
       const reportInput = report && typeof report === 'object' ? report : {};
+      const comparisonRunId = run.runId || `run_${contentHash({ jobId, payload }).slice(0, 24)}`;
       this.putCognitionShadowRunInternal({
         ...run,
-        runId: run.runId || `run_${contentHash({ jobId, payload }).slice(0, 24)}`,
+        runId: comparisonRunId,
         subjectType: freshAuthority ? authority.subjectType : payload.subjectType,
         subjectId: freshAuthority ? authority.subjectId : payload.subjectId,
         turnId: freshAuthority && authority.subjectType === 'turn'
@@ -17738,6 +18712,9 @@ export class YuqiStore {
         ...(reportInput.summary || {}),
         rolloutKey,
         jobId,
+        comparisonRunId,
+        subjectType: freshAuthority ? authority.subjectType : payload.subjectType,
+        subjectId: freshAuthority ? authority.subjectId : payload.subjectId,
         staleForRollout: stale,
         criticalFindings
       };
@@ -17794,7 +18771,7 @@ export class YuqiStore {
         if (rollback) {
           this.appendPromotionHistoryInternal({
             eventId: `promotion_${contentHash({ jobId, reportId, recordedAt }).slice(0, 24)}`,
-            rolloutKey: payload.rolloutKey,
+            rolloutKey,
             fromMode: rollout.current_mode,
             toMode: 'shadow',
             fromPhase: rollout.rollout_phase,
