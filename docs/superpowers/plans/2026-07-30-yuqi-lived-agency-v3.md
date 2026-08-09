@@ -9936,6 +9936,120 @@ git add android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java 
 git commit -m "fix: initialize Android execution runtime off main thread"
 ```
 
+### Task 24B: Register `AlExecution` Without Main-Thread Room Access
+
+**Files:**
+- Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
+- Create: `android/app/src/androidTest/java/com/siyi/al/execution/AlExecutionPluginStartupTest.java`
+
+**Interfaces:**
+- Preserves: the public Capacitor plugin name and every existing plugin method.
+- Produces: a registered WebView proxy immediately, with retryable worker-owned
+  secret/database/store initialization before the first method operation.
+
+The first real Task 25 WebView case exposed a second release blocker after
+Task 24A: `MainActivity` does register `AlExecutionPlugin`, but Capacitor calls
+`Plugin.load()` synchronously while building the Activity bridge. The current
+`load()` constructs `RoomExecutionStore`, whose authority validation reads Room.
+That main-thread failure is wrapped as a plugin-load failure, so Capacitor omits
+`AlExecution` from `window.Capacitor.Plugins` while the rest of the page appears
+healthy. Adding a JavaScript proxy, calling `registerPlugin` from the page,
+enabling `allowMainThreadQueries`, weakening store validation, or making the
+Task 25 harness call Room directly is forbidden.
+
+- [ ] **Step 1: Preserve the real missing-proxy red failure**
+
+`AlExecutionPluginStartupTest` launches the production `MainActivity` and waits
+for the real Capacitor WebView. It evaluates JavaScript in that WebView and
+asserts that `window.Capacitor.Plugins.AlExecution` exists and that an actual
+asynchronous `getConversationCursor` call returns a valid cursor object. Merely
+instantiating the Java plugin, checking the annotation, inspecting
+`MainActivity.registerPlugin`, or injecting a mock proxy is not acceptable.
+
+Run:
+
+```powershell
+cd android
+.\gradlew.bat connectedDebugAndroidTest --no-daemon --no-problems-report `
+  -Pandroid.testInstrumentationRunnerArguments.class=com.siyi.al.execution.AlExecutionPluginStartupTest
+```
+
+Expected before the fix: FAIL because the production WebView plugin list omits
+`AlExecution`. Preserve the plugin list and plugin-load exception as diagnostic
+evidence.
+
+- [ ] **Step 2: Make plugin registration side-effect free and initialize on one worker**
+
+`load()` may create the single executor and publish the active plugin reference.
+It must not load secrets, open Room, construct `RoomExecutionStore`, validate
+authority rows or execute any other blocking/failure-prone persisted-state work.
+
+Every public plugin method continues through the existing common `execute`
+boundary. On that single worker, one idempotent initializer creates
+`AlSecretStore`, loads the bridge configuration, opens the database and builds
+`RoomExecutionStore` in worker-local variables. Only after all steps succeed are
+the complete fields published together; operations never observe a partial
+graph. An initialization failure rejects that `PluginCall`, leaves no partial
+published graph, and permits the next method call to retry. The connected
+failure/retry proof must use a real persisted bad configuration or real Room
+initialization failure, not a fake initializer. `saveBridgeConfig` continues to
+rebind the store on the same worker, but it must not leave a persisted new peer
+paired with the old in-memory store when rebinding fails: construct and validate
+the replacement graph first, then publish the mutually consistent persisted and
+in-memory state through the worker-owned update boundary or restore the prior
+persisted configuration before rejecting the call.
+
+The lifecycle is closed and explicit:
+
+- registration starts in `NEW`; the first worker operation moves through
+  `INITIALIZING` to `READY`;
+- the single executor serializes initialization, bridge-config rebinding and all
+  store/secret consumers, so no second graph can race into publication;
+- destruction changes the plugin to `STOPPING`, clears the active reference and
+  prevents new work from being accepted. It does not null/close fields on the
+  main thread while queued or running worker code may still use them;
+- a rejected executor submission produces a stable plugin-call rejection rather
+  than a crash or a permanently pending JavaScript Promise. PluginCalls still
+  queued when destruction begins are explicitly rejected rather than silently
+  discarded by `shutdownNow`; repeated destruction is harmless.
+
+The implementation must retain the same Capacitor plugin name and JS API. Task
+25 must consume the real generated native proxy; no test-only registration path
+is allowed.
+
+- [ ] **Step 3: Prove registration, worker initialization, retry and teardown**
+
+The connected test must prove all of the following through the production
+Activity/WebView/plugin path:
+
+1. `AlExecution` appears in the generated plugin map before any plugin method is
+   called;
+2. the first `getConversationCursor` call initializes Room off the main thread
+   and resolves with the authoritative cursor shape;
+3. a forced first initialization failure rejects exactly that call, a later call
+   can retry successfully, and no half-initialized store is used;
+4. Activity destroy/recreate does not leave a stale active instance, duplicate
+   executor or hanging Promise.
+
+Run:
+
+```powershell
+cd android
+.\gradlew.bat testDebugUnitTest assembleDebugAndroidTest --no-daemon --no-problems-report
+.\gradlew.bat connectedDebugAndroidTest --no-daemon --no-problems-report `
+  -Pandroid.testInstrumentationRunnerArguments.class=com.siyi.al.execution.AlExecutionPluginStartupTest
+```
+
+Expected: PASS, with no main-thread Room access, no synthetic JS proxy and no
+change to legacy plugin method payloads.
+
+- [ ] **Step 4: Commit only the focused plugin-startup fix**
+
+```powershell
+git add android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/androidTest/java/com/siyi/al/execution/AlExecutionPluginStartupTest.java
+git commit -m "fix: initialize Android plugin state off main thread"
+```
+
 ### Task 25: Add One Reproducible Release-Readiness Gate and Run the Full Matrix
 
 **Files:**
