@@ -9522,8 +9522,10 @@ landing path merely to recreate it.
 
 **Files:**
 - Modify: `yuqi-runtime/src/store.mjs`
+- Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Create: `yuqi-runtime/src/v3-diagnostics.mjs`
 - Modify: `yuqi-runtime/src/local-server.mjs`
+- Modify: `yuqi-runtime/test/orchestrator.test.mjs`
 - Create: `yuqi-runtime/test/v3-diagnostics.test.mjs`
 - Modify: `yuqi-runtime/test/local-server.test.mjs`
 - Create: `tests/yuqi-v3-races.test.mjs`
@@ -9563,6 +9565,13 @@ helpers, and the production local server. Cover all of these outcomes:
 9. serialized output contains none of `reply_json`, prompt/model text,
    `immediateFeeling`, evaluator prose, private scene paths, secrets, message
    bodies, action payloads, or annotation snapshots.
+10. a real `YuqiOrchestrator.comparisonJobDraftFromCanonicalTurn()` result for
+    both `shadow_cognition` and `active_canary_compare` passes through
+    `canonicalCommitPayload()` and a real canonical visible-result commit,
+    inserts exactly one comparison job for the lineage, and can be loaded by
+    the production comparison authority loader. The test must fail if the
+    orchestrator emits fields outside the closed comparison payload contract;
+    it must not replace the production writer with a manually inserted job.
 
 The HTTP tests require authentication before any store read, a canonical
 percent-decoded turn ID, `404` for a missing turn, `200` for a valid sanitized
@@ -9578,10 +9587,23 @@ comparison/fallback invariant errors into that type. It must not reuse a broad
 Invented prefixes, `TypeError`, SQLite/IO errors, and unexpected exceptions must
 remain untyped and reach the existing 5xx path.
 
+The production comparison writer and the commit normalizer use one closed
+payload contract. `comparisonJobDraftFromCanonicalTurn()` emits only
+`turnId`, `comparisonReleaseId`, `comparisonDirection`,
+`rolloutEvidenceEpoch`, `shadowEpoch`, `canaryEpoch`, `canarySlot`,
+`annotationSnapshotChecksum`, and `inputChecksum` inside `job.payload`.
+`subject_type='turn'`, `subject_id=authorityLineageKey`, the authoritative
+release, authority group, and authoritative result checksum are store-owned
+columns or commit-time projections and must not be duplicated as caller-owned
+payload fields. In particular, do not widen `normalizeComparisonJob()` to
+accept the current stray `subjectType`, `subjectId`, or
+`authoritativeReleaseId` fields: remove them from the orchestrator draft and
+prove the resulting real job remains executable and diagnostics-readable.
+
 - [ ] **Step 2: Run the diagnostics tests red**
 
 ```powershell
-node --test yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs
+node --test yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs
 ```
 
 Expected: FAIL because the scoped loader, closed projector, and endpoint do not
@@ -9784,7 +9806,7 @@ fixture passes once; meta-tests must not make a fake thirteenth race pass.
 - [ ] **Step 5: Run diagnostics, races, and the full source gate**
 
 ```powershell
-node --test yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-v3-race-runner.test.mjs tests/yuqi-ui-contract.test.mjs
+node --test yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-v3-race-runner.test.mjs tests/yuqi-ui-contract.test.mjs
 node scripts/verify-yuqi-v3-races.mjs --out artifacts/yuqi-lived-agency-v3/race-report.json
 npm.cmd test
 ```
@@ -9800,7 +9822,7 @@ hidden as a race pass.
 - [ ] **Step 6: Commit only the Task 24 implementation**
 
 ```powershell
-git add yuqi-runtime/src/store.mjs yuqi-runtime/src/v3-diagnostics.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-v3-race-runner.test.mjs scripts/verify-yuqi-v3-races.mjs package.json
+git add yuqi-runtime/src/store.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/src/v3-diagnostics.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-v3-race-runner.test.mjs scripts/verify-yuqi-v3-races.mjs package.json
 git commit -m "feat: expose Yuqi v3 authority diagnostics"
 ```
 
