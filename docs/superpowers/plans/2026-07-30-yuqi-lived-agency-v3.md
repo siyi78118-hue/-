@@ -7561,9 +7561,12 @@ git commit -m "feat: integrate plans life and formal relationship stages"
 
 Task 20 is a five-gate lifecycle migration, not one UI delete handler. Each gate
 must be committed and independently reviewed before the next begins. Task 13C's
-Room-v12 checkpoint contract is the immutable input baseline. PC remains schema
-v14 because `conversation_clear_controls` already exists; Android intentionally
-migrates Room v12 to v13 because it has no durable lifecycle-control authority.
+Room-v12 checkpoint contract is the immutable input baseline. Android advances
+through Room v13 lifecycle authority and the already-implemented v14 inbound-ACK
+tombstone schema, then Task 20E performs the explicit current v14→v15
+notification-cancellation migration. Separately, the PC database advances to
+its own schema v15 for `conversation_clear_controls`; equal version numbers do
+not imply a shared schema or migration domain.
 Do not implement a second redaction path, reuse `change_events` as an outbox, or
 treat relay mailbox acceptance as proof that PC applied a clear.
 
@@ -8440,7 +8443,11 @@ Stop after this commit for independent review.
 - Create: `tests/yuqi-memory-lifecycle.test.mjs`
 - Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
 - Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDatabase.java`
+- Create: `android/app/src/main/java/com/siyi/al/execution/db/RoleNotificationCancellationEntity.java`
 - Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
 - Modify: `yuqi-runtime/src/protocol.mjs`
 - Modify: `yuqi-runtime/src/store.mjs`
@@ -8535,6 +8542,54 @@ Stop after this commit for independent review.
   when applicable but suppressed before Room/Web recreation. Backup receipt,
   request/final audits and the Android tombstone are metadata-only and must not
   retain role chat or memory semantics.
+- Android Room schema 15 is reached only through registered
+  `MIGRATION_14_15`; fresh databases create the same v15 schema. Populated v14
+  rows migrate unchanged, every migration fault rolls back, and a database
+  newer than v15 is rejected rather than silently downgraded or repaired. Room
+  v15 adds one transient, metadata-only
+  `role_notification_cancellations` outbox. Role deletion computes the distinct
+  deterministic notification IDs for the role's turns and inserts exact
+  `waiting` cancellation intents in the same Room transaction that inserts the
+  lifecycle tombstone and deletes role semantics. That transaction never calls
+  `NotificationManager`: a later injected fault must roll back the control,
+  deletion and cancellation intents with zero external cancellation. Only after
+  commit may the plugin/service drain the intents by invoking `cancel(id)` and
+  then exact-CAS removing/completing that intent. A crash after `cancel` but
+  before CAS retries the same ID idempotently; a thrown cancellation retains the
+  intent. Service startup and lifecycle wakes drain the same durable queue, so
+  recovery does not depend on the original Web promise or process. The table
+  contains no turn text, notification content, chat payload, memory, or action,
+  and successful drain leaves no cancellation row behind; the lifecycle control
+  remains the only durable role-deletion tombstone.
+- The table shape is exact:
+  `cancellation_key TEXT PRIMARY KEY, control_id TEXT NOT NULL, character_id TEXT`
+  ` NOT NULL, notification_id INTEGER NOT NULL, intent_checksum TEXT NOT NULL,`
+  ` state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL`,
+  with a unique index on `(control_id,notification_id)`. State is exactly
+  `waiting`; successful completion deletes the row, so no second terminal state
+  is invented. All strings are native non-empty canonical identities,
+  notification IDs are native Android integers in the deterministic message
+  notification range, and times are positive native safe integers with
+  `updated_at>=created_at`. `intent_checksum` is SHA-256 of canonical JSON
+  `{contract:'android-role-notification-cancellation-v1',controlId,characterId,`
+  `notificationId,createdAt}` and `cancellation_key` is `rncan_` plus that full
+  lowercase checksum. Every list/drain/reopen joins exactly one retained
+  `role_delete_v1` lifecycle control with matching `control_id` and
+  `character_id`, then recomputes the key/checksum before any external cancel.
+  Missing, foreign, duplicate or corrupt control/intent sets fail closed with
+  zero cancellation and zero row mutation.
+- After `cancel(notificationId)` returns, completion deletes only the exact
+  snapshot matching `cancellation_key,control_id,character_id,notification_id,`
+  `intent_checksum,state,created_at,updated_at`. Concurrent drainers may repeat
+  the same idempotent Android cancel, but only one exact delete succeeds; a
+  stale snapshot can never complete or cancel a changed/foreign intent. An
+  already-absent exact intent is an idempotent completed outcome only after the
+  role-delete control remains valid. Service startup drains and validates this
+  outbox immediately after opening Room and before ordinary turn recovery,
+  completed-turn events/notifications, continuation scheduling, or lifecycle
+  delivery. Every lifecycle wake repeats that ordering. A corrupt pending set
+  blocks deleted-role side effects and is surfaced as an authority conflict;
+  it is never ignored in order to continue ordinary notification work.
 - Tests must cover first-phase restart, exact pending replay, changed replay,
   new-turn rejection during pending/applied deletion, waiting and already
   mailboxed deliveries, redaction acknowledgement before finalization, final
@@ -8542,6 +8597,10 @@ Stop after this commit for independent review.
   finalizers, and close/reopen proof that only the three allowed metadata audits
   remain. They must also prove that a stale outbox snapshot cannot enqueue or
   quarantine a delivery after the role-deletion phase changes.
+  Android tests additionally cover populated Room 14→15 and fresh-15 schema,
+  rollback with zero external cancellation at every post-intent failure point,
+  successful post-commit cancellation, cancellation failure/retry, and
+  close/reopen compensation before any deleted-role notification can survive.
 
 **Backup/restore:**
 - Role deletion first calls authenticated LAN
