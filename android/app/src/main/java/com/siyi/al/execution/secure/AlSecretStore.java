@@ -10,6 +10,7 @@ import com.siyi.al.execution.bridge.BridgeConfig;
 import com.siyi.al.execution.bridge.BridgeMode;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
+import java.util.concurrent.atomic.AtomicReference;
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
@@ -20,6 +21,10 @@ public final class AlSecretStore {
     private static final String PREFS_NAME = "al.execution.secrets.v1.prefs";
     private static final String TRANSFORMATION = "AES/GCM/NoPadding";
     private static final String SEPARATOR = ".";
+    // Test-only outcome seam.  It changes only the commit result; encryption,
+    // SharedPreferences, and the Room graph remain real.  Tests must reset it.
+    private static final AtomicReference<String> failNextBridgeCommitForDeviceId =
+        new AtomicReference<>();
     private final SharedPreferences preferences;
 
     public AlSecretStore(Context context) {
@@ -59,19 +64,46 @@ public final class AlSecretStore {
     }
 
     public synchronized void saveBridgeConfig(BridgeConfig config) {
-        put("yuqi-bridge", "enabled", Boolean.toString(config.enabled));
-        put("yuqi-bridge", "mode", config.mode.name());
-        put("yuqi-bridge", "lanUrl", config.lanUrl);
-        put("yuqi-bridge", "cloudUrl", config.cloudUrl);
-        put("yuqi-bridge", "deviceId", config.deviceId);
-        put("yuqi-bridge", "pairingSecret", config.pairingSecret);
-        put("yuqi-bridge", "deviceToken", config.deviceToken);
-        put("yuqi-bridge", "encryptionKey", config.encryptionKeyBase64);
-        put("yuqi-bridge", "connectTimeoutMs", Integer.toString(config.connectTimeoutMs));
-        put("yuqi-bridge", "readTimeoutMs", Integer.toString(config.readTimeoutMs));
-        put("yuqi-bridge", "cloudPollAttempts", Integer.toString(config.cloudPollAttempts));
-        put("yuqi-bridge", "cloudPollIntervalMs", Integer.toString(config.cloudPollIntervalMs));
-        put("yuqi-bridge", "turnDeadlineMs", Integer.toString(config.turnDeadlineMs));
+        String[] fields = new String[] {
+            "enabled", "mode", "lanUrl", "cloudUrl", "deviceId", "pairingSecret",
+            "deviceToken", "encryptionKey", "connectTimeoutMs", "readTimeoutMs",
+            "cloudPollAttempts", "cloudPollIntervalMs", "turnDeadlineMs"
+        };
+        String[] values = new String[] {
+            Boolean.toString(config.enabled), config.mode.name(), config.lanUrl, config.cloudUrl,
+            config.deviceId, config.pairingSecret, config.deviceToken, config.encryptionKeyBase64,
+            Integer.toString(config.connectTimeoutMs), Integer.toString(config.readTimeoutMs),
+            Integer.toString(config.cloudPollAttempts), Integer.toString(config.cloudPollIntervalMs),
+            Integer.toString(config.turnDeadlineMs)
+        };
+        SharedPreferences.Editor editor = preferences.edit();
+        try {
+            for (int i = 0; i < fields.length; i++) {
+                editor.putString(storageKey("yuqi-bridge", fields[i]), encrypt(values[i]));
+            }
+            String failureToken = failNextBridgeCommitForDeviceId.get();
+            boolean forcedFailure = failureToken != null
+                && failureToken.equals(config.deviceId)
+                && failNextBridgeCommitForDeviceId.compareAndSet(failureToken, null);
+            boolean committed = !forcedFailure && editor.commit();
+            if (!committed) {
+                throw new IllegalStateException("Unable to persist bridge configuration");
+            }
+        } catch (IllegalStateException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalStateException("Unable to encrypt API configuration", error);
+        }
+    }
+
+    static void setForcedCommitOutcomeForTests(String deviceId) {
+        if (deviceId != null && (deviceId.trim().isEmpty()
+            || "true".equalsIgnoreCase(deviceId)
+            || "false".equalsIgnoreCase(deviceId)
+            || "success".equalsIgnoreCase(deviceId))) {
+            throw new IllegalArgumentException("commit failure token must be a device id");
+        }
+        failNextBridgeCommitForDeviceId.set(deviceId);
     }
 
     public synchronized BridgeConfig loadBridgeConfig() {
@@ -101,16 +133,19 @@ public final class AlSecretStore {
 
     private void put(String configId, String field, String value) {
         try {
-            Cipher cipher = Cipher.getInstance(TRANSFORMATION);
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey());
-            byte[] encrypted = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
-            String encoded = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)
-                + SEPARATOR
-                + Base64.encodeToString(encrypted, Base64.NO_WRAP);
-            preferences.edit().putString(storageKey(configId, field), encoded).apply();
+            preferences.edit().putString(storageKey(configId, field), encrypt(value)).apply();
         } catch (Exception error) {
             throw new IllegalStateException("Unable to encrypt API configuration", error);
         }
+    }
+
+    private static String encrypt(String value) throws Exception {
+        Cipher cipher = Cipher.getInstance(TRANSFORMATION);
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey());
+        byte[] encrypted = cipher.doFinal(value.getBytes(StandardCharsets.UTF_8));
+        return Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP)
+            + SEPARATOR
+            + Base64.encodeToString(encrypted, Base64.NO_WRAP);
     }
 
     private String get(String configId, String field) {

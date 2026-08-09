@@ -38,10 +38,13 @@ import com.siyi.al.execution.LifecycleControl;
 import com.siyi.al.execution.RolePlanAlarmScheduler;
 import com.siyi.al.execution.AutomaticTaskAlarmScheduler;
 import com.siyi.al.execution.secure.AlSecretStore;
+import android.content.Context;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.UUID;
 import java.lang.ref.WeakReference;
 import android.os.Handler;
@@ -53,35 +56,75 @@ import org.json.JSONObject;
 
 @CapacitorPlugin(name = "AlExecution")
 public final class AlExecutionPlugin extends Plugin {
-    private static WeakReference<AlExecutionPlugin> activeInstance = new WeakReference<>(null);
+    private static volatile WeakReference<AlExecutionPlugin> activeInstance = new WeakReference<>(null);
+    private static final AtomicLong generationCounter = new AtomicLong(0L);
+    private enum LifecycleState { NEW, INITIALIZING, READY, STOPPING }
+    private final Object lifecycleLock = new Object();
+    private LifecycleState lifecycleState = LifecycleState.NEW;
     private ExecutorService io;
     private RoomExecutionStore store;
     private AlSecretStore secrets;
+    private Context applicationContext;
+    private long generation;
 
     @Override
     public void load() {
-        io = Executors.newSingleThreadExecutor();
-        secrets = new AlSecretStore(getContext());
-        BridgeConfig bridgeConfig = secrets.loadBridgeConfig();
-        store = storeForBridgeConfig(AlExecutionDatabase.get(getContext()), bridgeConfig);
-        activeInstance = new WeakReference<>(this);
+        synchronized (lifecycleLock) {
+            if (lifecycleState != LifecycleState.NEW) return;
+            applicationContext = getContext().getApplicationContext();
+            io = Executors.newSingleThreadExecutor();
+            generation = generationCounter.incrementAndGet();
+            activeInstance = new WeakReference<>(this);
+        }
     }
 
     @Override
     protected void handleOnDestroy() {
-        AlExecutionPlugin current = activeInstance.get();
-        if (current == this) activeInstance.clear();
-        if (io != null) io.shutdownNow();
+        ExecutorService executor;
+        synchronized (lifecycleLock) {
+            if (lifecycleState == LifecycleState.STOPPING) return;
+            lifecycleState = LifecycleState.STOPPING;
+            AlExecutionPlugin current = activeInstance.get();
+            if (current == this) activeInstance.clear();
+            executor = io;
+        }
+        if (executor == null) return;
+        try {
+            executor.execute(() -> {
+                synchronized (lifecycleLock) {
+                    secrets = null;
+                    store = null;
+                    applicationContext = null;
+                    io = null;
+                }
+                executor.shutdown();
+            });
+        } catch (RejectedExecutionException ignored) {
+            // A concurrent executor rejection is terminal cleanup ownership;
+            // never clear worker-owned fields on the main thread.
+        }
     }
 
     public static void notifyCompletedTurn(String turnId, long updatedAt) {
         AlExecutionPlugin plugin = activeInstance.get();
         if (plugin == null) return;
+        final long postedGeneration;
+        synchronized (plugin.lifecycleLock) {
+            if (activeInstance.get() != plugin || plugin.lifecycleState == LifecycleState.STOPPING) return;
+            postedGeneration = plugin.generation;
+        }
         new Handler(Looper.getMainLooper()).post(() -> {
-            JSObject payload = new JSObject();
-            payload.put("turnId", turnId == null ? "" : turnId);
-            payload.put("updatedAt", updatedAt);
-            plugin.notifyListeners("executionCompleted", payload, true);
+            synchronized (plugin.lifecycleLock) {
+                if (activeInstance.get() != plugin
+                    || plugin.generation != postedGeneration
+                    || plugin.lifecycleState == LifecycleState.STOPPING) {
+                    return;
+                }
+                JSObject payload = new JSObject();
+                payload.put("turnId", turnId == null ? "" : turnId);
+                payload.put("updatedAt", updatedAt);
+                plugin.notifyListeners("executionCompleted", payload, true);
+            }
         });
     }
 
@@ -138,11 +181,13 @@ public final class AlExecutionPlugin extends Plugin {
                 integer(call, "cloudPollIntervalMs", current.cloudPollIntervalMs),
                 integer(call, "turnDeadlineMs", current.turnDeadlineMs)
             );
+            // Build and validate the replacement graph before persisting the
+            // new peer.  If either step fails, the old persisted peer and the
+            // old in-memory store remain paired.
+            RoomExecutionStore rebound = storeForBridgeConfig(
+                AlExecutionDatabase.get(applicationContext), config);
             secrets.saveBridgeConfig(config);
-            // The persisted peer is authoritative for subsequent clears and
-            // receipts.  Rebind the store immediately so a newly generated or
-            // rotated deviceId is effective without an app restart.
-            store = storeForBridgeConfig(AlExecutionDatabase.get(getContext()), config);
+            store = rebound;
             return bridgeConfigResult(config);
         });
     }
@@ -858,14 +903,82 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     private void execute(PluginCall call, Operation operation) {
-        io.execute(() -> {
-            try {
-                call.resolve(operation.run());
-            } catch (Exception error) {
-                String detail = error.getMessage();
-                call.reject(detail == null ? error.getClass().getSimpleName() : detail, error);
+        ExecutorService executor;
+        synchronized (lifecycleLock) {
+            if (lifecycleState == LifecycleState.STOPPING || io == null) {
+                call.reject("AlExecution plugin is stopping");
+                return;
             }
-        });
+            executor = io;
+        }
+        try {
+            executor.execute(() -> {
+                try {
+                    synchronized (lifecycleLock) {
+                        if (lifecycleState == LifecycleState.STOPPING) {
+                            call.reject("AlExecution plugin is stopping");
+                            return;
+                        }
+                    }
+                    initializeOnWorker();
+                    JSObject result = operation.run();
+                    synchronized (lifecycleLock) {
+                        if (lifecycleState == LifecycleState.STOPPING) {
+                            call.reject("AlExecution plugin is stopping");
+                            return;
+                        }
+                        call.resolve(result);
+                    }
+                } catch (Exception error) {
+                    String detail = error.getMessage();
+                    synchronized (lifecycleLock) {
+                        if (lifecycleState == LifecycleState.STOPPING) {
+                            call.reject("AlExecution plugin is stopping", error);
+                        } else {
+                            call.reject(detail == null ? error.getClass().getSimpleName() : detail, error);
+                        }
+                    }
+                }
+            });
+        } catch (RejectedExecutionException error) {
+            call.reject("AlExecution plugin is stopping", error);
+        }
+    }
+
+    private void initializeOnWorker() throws Exception {
+        synchronized (lifecycleLock) {
+            if (lifecycleState == LifecycleState.STOPPING) {
+                throw new IllegalStateException("AlExecution plugin is stopping");
+            }
+            if (lifecycleState == LifecycleState.READY && secrets != null && store != null) return;
+            lifecycleState = LifecycleState.INITIALIZING;
+        }
+
+        AlSecretStore localSecrets = null;
+        RoomExecutionStore localStore = null;
+        try {
+            localSecrets = new AlSecretStore(applicationContext);
+            BridgeConfig bridgeConfig = localSecrets.loadBridgeConfig();
+            AlExecutionDatabase database = AlExecutionDatabase.get(applicationContext);
+            localStore = storeForBridgeConfig(database, bridgeConfig);
+            synchronized (lifecycleLock) {
+                if (lifecycleState == LifecycleState.STOPPING) {
+                    throw new IllegalStateException("AlExecution plugin is stopping");
+                }
+                secrets = localSecrets;
+                store = localStore;
+                lifecycleState = LifecycleState.READY;
+            }
+        } catch (Exception error) {
+            synchronized (lifecycleLock) {
+                if (lifecycleState != LifecycleState.STOPPING) {
+                    secrets = null;
+                    store = null;
+                    lifecycleState = LifecycleState.NEW;
+                }
+            }
+            throw error;
+        }
     }
 
     private static String required(PluginCall call, String name) {
