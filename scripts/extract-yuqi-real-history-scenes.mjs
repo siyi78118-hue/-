@@ -641,6 +641,331 @@ function eligibleRows(database) {
   return database.prepare(`SELECT * FROM turns WHERE result_authority_version = 1 AND rollout_key = 'DIRECT_REPLY' AND state IN ('committed','delivered','completed') AND authority_redacted_at IS NULL ORDER BY character_id, lane_key, created_at, turn_id`).all();
 }
 
+const LEGACY_RA0_PROVENANCE = Object.freeze({
+  sourceAuthority: 'legacy_ra0_confirmed',
+  qualityOnly: true,
+  authorityEvidenceEligible: false,
+  promotionEvidenceEligible: false
+});
+const LEGACY_DELIVERY_KEYS = Object.freeze([
+  'content', 'contentSha256', 'messageId', 'recipientId', 'speakerId', 'speakerType', 'turnId'
+]);
+
+function assertSafeInteger(value, label, { positive = false } = {}) {
+  if (!Number.isSafeInteger(value) || (positive && value <= 0)) throw new Error(`${label} has invalid native time`);
+}
+
+function assertNativeSafeInteger(value, label, { positive = false } = {}) {
+  if (typeof value !== 'number') throw new Error(`${label} must be a native number`);
+  assertSafeInteger(value, label, { positive });
+}
+
+function legacyMessageChecksum(row) {
+  return contentHash({
+    messageId: row.message_id, turnId: row.turn_id, characterId: row.character_id,
+    speakerId: row.speaker_id, speakerType: row.speaker_type, recipientId: row.recipient_id,
+    content: row.content, sentAt: row.sent_at, origin: row.origin,
+    deviceId: row.device_id, deviceSeq: row.device_seq
+  });
+}
+
+function legacyBatchCommitment(batch, items) {
+  return contentHash({
+    version: 'current-user-batch-tombstone-v1', turnId: String(batch.turn_id),
+    batchId: String(batch.batch_id), itemCount: items.length,
+    items: items.map(item => ({ sequence: Number(item.sequence), messageId: String(item.message_id), checksum: String(item.checksum) }))
+  });
+}
+
+function assertLegacyBatch(database, turn, sourceMessage) {
+  const batch = database.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').get(turn.turn_id);
+  if (!batch) throw new Error(`legacy current user batch missing for ${turn.turn_id}`);
+  if (typeof batch.character_id !== 'string' || batch.character_id !== turn.character_id
+    || typeof batch.source_message_id !== 'string' || batch.source_message_id !== sourceMessage.message_id) {
+    throw new Error(`legacy current user batch identity conflict for ${turn.turn_id}`);
+  }
+  assertNativeSafeInteger(batch.started_at, 'legacy batch startedAt');
+  assertNativeSafeInteger(batch.committed_at, 'legacy batch committedAt');
+  if (typeof batch.batch_id !== 'string' || batch.batch_id.length === 0
+    || typeof batch.checksum !== 'string' || !HEX64.test(batch.checksum)
+    || typeof batch.item_count !== 'number' || !Number.isSafeInteger(batch.item_count)) {
+    throw new Error(`legacy current user batch scalar conflict for ${turn.turn_id}`);
+  }
+  if (batch.committed_at < batch.started_at) throw new Error('legacy batch time order conflict');
+  const items = database.prepare('SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence').all(turn.turn_id);
+  const messageIds = items.map(item => item.message_id);
+  const canonicalHeader = {
+    batchId: batch.batch_id, sourceMessageId: batch.source_message_id, messageIds,
+    startedAt: batch.started_at, committedAt: batch.committed_at
+  };
+  if (items.length < 1 || batch.item_count !== items.length || batch.checksum !== contentHash(canonicalHeader)
+    || typeof batch.tombstone_commitment !== 'string' || batch.tombstone_commitment !== legacyBatchCommitment(batch, items)) {
+    throw new Error(`legacy current user batch commitment conflict for ${turn.turn_id}`);
+  }
+  let expected = 0;
+  let sourceOccurrences = 0;
+  const batchMessages = [];
+  for (const item of items) {
+    if (typeof item.sequence !== 'number' || item.sequence !== expected++ || typeof item.batch_id !== 'string'
+      || item.batch_id !== batch.batch_id || typeof item.message_id !== 'string' || item.redacted_at != null) {
+      throw new Error(`legacy current user batch item conflict for ${turn.turn_id}`);
+    }
+    const value = jsonValue(item.message_json, `legacy batch item ${item.message_id}`);
+    if (typeof item.checksum !== 'string' || !HEX64.test(item.checksum) || contentHash(value) !== item.checksum) {
+      throw new Error(`legacy batch item checksum conflict for ${turn.turn_id}`);
+    }
+    if (typeof value.messageId !== 'string' || value.messageId !== item.message_id || value.speakerId !== 'user'
+      || value.speakerType !== 'user' || typeof value.recipientId !== 'string' || value.recipientId !== turn.character_id
+      || typeof value.content !== 'string' || value.content.length === 0
+      || typeof value.sentAt !== 'number' || !Number.isSafeInteger(value.sentAt)) {
+      throw new Error(`legacy batch message shape conflict for ${turn.turn_id}`);
+    }
+    const messageRows = database.prepare('SELECT * FROM messages WHERE message_id = ? AND turn_id = ?').all(item.message_id, turn.turn_id);
+    if (messageRows.length > 1) throw new Error(`legacy batch message closure conflict for ${turn.turn_id}`);
+    const message = messageRows.length === 1 ? messageRows[0] : {
+      message_id: item.message_id, turn_id: turn.turn_id, character_id: turn.character_id,
+      device_id: turn.device_id, speaker_id: value.speakerId, speaker_type: value.speakerType,
+      recipient_id: value.recipientId, content: value.content, sent_at: value.sentAt,
+      origin: 'phone', device_seq: item.sequence === 0 ? turn.device_seq : null,
+      checksum: null
+    };
+    if (message.character_id !== turn.character_id || message.device_id !== turn.device_id
+      || message.speaker_id !== 'user' || message.speaker_type !== 'user' || message.origin !== 'phone'
+      || (messageRows.length === 1 && message.checksum !== legacyMessageChecksum(message)) || message.content !== value.content
+      || message.sent_at !== value.sentAt || message.recipient_id !== value.recipientId) {
+      throw new Error(`legacy batch message authority conflict for ${turn.turn_id}`);
+    }
+    if (database.prepare('SELECT 1 FROM suppressed_messages WHERE message_id = ? LIMIT 1').get(item.message_id)) {
+      throw new Error(`legacy batch message suppressed for ${turn.turn_id}`);
+    }
+    if (item.message_id === sourceMessage.message_id) sourceOccurrences += 1;
+    if (value.sentAt < batch.started_at || value.sentAt > batch.committed_at
+      || (batchMessages.length > 0 && value.sentAt < batchMessages.at(-1).sent_at)) {
+      throw new Error(`legacy batch message time order conflict for ${turn.turn_id}`);
+    }
+    batchMessages.push(message);
+  }
+  if (sourceOccurrences !== 1 || batch.source_message_id !== items.at(-1).message_id) {
+    throw new Error(`legacy batch source position conflict for ${turn.turn_id}`);
+  }
+  return { ...batch, items, messages: batchMessages };
+}
+
+function assertLegacyDelivery(database, turn, characterMessage) {
+  const rows = database.prepare('SELECT * FROM cloud_deliveries WHERE turn_id = ? ORDER BY peer_id').all(turn.turn_id);
+  if (rows.length !== 1) throw new Error(`legacy delivery target set conflict for ${turn.turn_id}`);
+  const delivery = rows[0];
+  if (typeof delivery.peer_id !== 'string' || typeof turn.device_id !== 'string'
+    || delivery.peer_id !== turn.device_id || delivery.authority_group_id != null
+    || delivery.state !== 'confirmed' || typeof delivery.payload_json !== 'string') {
+    throw new Error(`legacy delivery state conflict for ${turn.turn_id}`);
+  }
+  assertNativeSafeInteger(delivery.attempts, 'legacy delivery attempts');
+  if (delivery.attempts < 1 || typeof delivery.recovery_ack_seq !== 'number'
+    || !Number.isSafeInteger(delivery.recovery_ack_seq) || delivery.recovery_ack_seq < 0
+    || (delivery.relay_message_id != null && typeof delivery.relay_message_id !== 'string')) {
+    throw new Error(`legacy delivery identity/type conflict for ${turn.turn_id}`);
+  }
+  assertNativeSafeInteger(delivery.delivered_at, 'legacy deliveredAt', { positive: true });
+  assertNativeSafeInteger(delivery.confirmed_at, 'legacy confirmedAt', { positive: true });
+  if (delivery.delivered_at < characterMessage.sent_at) throw new Error(`legacy delivery/character time conflict for ${turn.turn_id}`);
+  if (delivery.confirmed_at < delivery.delivered_at) throw new Error('legacy delivery time order conflict');
+  const payload = jsonValue(delivery.payload_json, `legacy delivery ${turn.turn_id}`);
+  assertExactKeys(payload, LEGACY_DELIVERY_KEYS, `legacy delivery ${turn.turn_id}`);
+  if (typeof delivery.checksum !== 'string' || !HEX64.test(delivery.checksum)
+    || delivery.checksum !== contentHash(payload)) throw new Error(`legacy delivery checksum conflict for ${turn.turn_id}`);
+  if (payload.turnId !== turn.turn_id || payload.messageId !== characterMessage.message_id
+    || payload.speakerId !== characterMessage.speaker_id || payload.speakerType !== 'character'
+    || payload.recipientId !== characterMessage.recipient_id || payload.content !== characterMessage.content
+    || payload.contentSha256 !== rawSha256(String(characterMessage.content))) {
+    throw new Error(`legacy delivery payload/message conflict for ${turn.turn_id}`);
+  }
+  return { ...delivery, payload };
+}
+
+function rawSha256(value) {
+  return createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
+
+function assertLegacyRa0Turn(database, turn, seenSourceMessages) {
+  if (typeof turn.result_authority_version !== 'number' || turn.result_authority_version !== 0
+    || typeof turn.state !== 'string' || !['committed', 'delivered', 'completed'].includes(turn.state)
+    || turn.authority_redacted_at != null || typeof turn.character_id !== 'string' || turn.character_id.length === 0
+    || (turn.lane_key != null && (typeof turn.lane_key !== 'string' || turn.lane_key !== 'private_chat'))) {
+    throw new Error(`legacy RA0 turn authority conflict for ${turn.turn_id}`);
+  }
+  if (typeof turn.device_id !== 'string' || typeof turn.device_seq !== 'number' || !Number.isSafeInteger(turn.device_seq)) {
+    throw new Error(`legacy turn identity/type conflict for ${turn.turn_id}`);
+  }
+  if (typeof turn.turn_id !== 'string' || typeof turn.source_message_id !== 'string') {
+    throw new Error(`legacy turn identity fields conflict for ${turn.turn_id}`);
+  }
+  if (turn.authority_lineage_key != null
+    || database.prepare('SELECT 1 FROM visible_result_groups WHERE authoritative_turn_id = ? LIMIT 1').get(turn.turn_id)
+    || database.prepare('SELECT 1 FROM visible_commit_receipts WHERE authoritative_turn_id = ? LIMIT 1').get(turn.turn_id)) {
+    throw new Error(`legacy turn has canonical authority references for ${turn.turn_id}`);
+  }
+  assertNativeSafeInteger(turn.created_at, 'legacy turn createdAt');
+  const envelope = jsonValue(turn.envelope_json, `legacy envelope ${turn.turn_id}`);
+  const normalized = validateEnvelope(envelope);
+  if (typeof normalized.protocolVersion !== 'number' || ![1, 2].includes(normalized.protocolVersion)
+    || (normalized.protocolVersion === 2 && normalized.kind !== 'DIRECT_REPLY')
+    || (normalized.protocolVersion === 1 && normalized.kind !== undefined && normalized.kind !== 'DIRECT_REPLY')
+    || typeof turn.envelope_checksum !== 'string' || !HEX64.test(turn.envelope_checksum)
+    || contentHash(envelope) !== turn.envelope_checksum) {
+    throw new Error(`legacy envelope authority conflict for ${turn.turn_id}`);
+  }
+  const source = database.prepare('SELECT * FROM messages WHERE message_id = ? AND turn_id = ?').all(turn.source_message_id, turn.turn_id);
+  if (source.length !== 1) throw new Error(`legacy source message closure conflict for ${turn.turn_id}`);
+  const sourceMessage = source[0];
+  if (normalized.turnId !== turn.turn_id || normalized.characterId !== turn.character_id
+    || normalized.deviceId !== turn.device_id || normalized.deviceSeq !== turn.device_seq
+    || normalized.createdAt !== turn.created_at
+    || !normalized.message || normalized.message.messageId !== sourceMessage.message_id
+    || normalized.message.speakerId !== sourceMessage.speaker_id
+    || normalized.message.speakerType !== sourceMessage.speaker_type
+    || normalized.message.recipientId !== sourceMessage.recipient_id
+    || normalized.message.content !== sourceMessage.content
+    || normalized.message.sentAt !== sourceMessage.sent_at) {
+    throw new Error(`legacy envelope/source message binding conflict for ${turn.turn_id}`);
+  }
+  if (typeof sourceMessage.character_id !== 'string' || sourceMessage.character_id !== turn.character_id
+    || typeof sourceMessage.device_id !== 'string' || sourceMessage.device_id !== turn.device_id
+    || sourceMessage.speaker_type !== 'user' || sourceMessage.speaker_id !== 'user'
+    || sourceMessage.recipient_id !== turn.character_id || sourceMessage.origin !== 'phone'
+    || sourceMessage.authority_group_id != null || sourceMessage.group_ordinal != null
+    || sourceMessage.checksum !== legacyMessageChecksum(sourceMessage)) {
+    throw new Error(`legacy source message authority conflict for ${turn.turn_id}`);
+  }
+  if (seenSourceMessages.has(String(sourceMessage.message_id))) throw new Error('legacy source message reused across turns');
+  seenSourceMessages.add(String(sourceMessage.message_id));
+  assertNativeSafeInteger(sourceMessage.sent_at, 'legacy source sentAt');
+  assertNativeSafeInteger(sourceMessage.device_seq, 'legacy source deviceSeq');
+  if (typeof sourceMessage.content !== 'string' || sourceMessage.content.length === 0
+    || database.prepare('SELECT 1 FROM suppressed_messages WHERE message_id = ? LIMIT 1').get(sourceMessage.message_id)) {
+    throw new Error(`legacy source message content/suppression conflict for ${turn.turn_id}`);
+  }
+  const otherCharacters = database.prepare("SELECT message_id FROM messages WHERE turn_id = ? AND speaker_type = 'character'").all(turn.turn_id);
+  if (otherCharacters.length !== 1) throw new Error(`legacy character output count conflict for ${turn.turn_id}`);
+  const characterMessage = database.prepare("SELECT * FROM messages WHERE message_id = ?").get(otherCharacters[0].message_id);
+  if (typeof characterMessage.character_id !== 'string' || characterMessage.character_id !== turn.character_id
+    || typeof characterMessage.speaker_id !== 'string' || characterMessage.speaker_id !== turn.character_id
+    || characterMessage.speaker_type !== 'character' || characterMessage.recipient_id !== 'user'
+    || typeof characterMessage.content !== 'string' || characterMessage.content.length === 0
+    || characterMessage.authority_group_id != null
+    || characterMessage.group_ordinal != null || characterMessage.checksum !== legacyMessageChecksum(characterMessage)) {
+    throw new Error(`legacy character message authority conflict for ${turn.turn_id}`);
+  }
+  assertNativeSafeInteger(characterMessage.sent_at, 'legacy character sentAt');
+  assertNativeSafeInteger(characterMessage.device_seq, 'legacy character deviceSeq');
+  const batch = assertLegacyBatch(database, turn, sourceMessage);
+  if (characterMessage.sent_at < batch.committed_at) throw new Error(`legacy character time order conflict for ${turn.turn_id}`);
+  const delivery = assertLegacyDelivery(database, turn, characterMessage);
+  return { turn, envelope: normalized, sourceMessage, characterMessage, batch, delivery };
+}
+
+function legacyEligibleRows(database) {
+  const rows = database.prepare("SELECT * FROM turns WHERE result_authority_version = 0 ORDER BY character_id, COALESCE(lane_key, 'private_chat'), created_at, turn_id").all();
+  if (!rows.length) throw new Error('legacy RA0 source contains no turns');
+  if (database.prepare('SELECT 1 FROM turns WHERE result_authority_version IS NOT NULL AND result_authority_version != 0 LIMIT 1').get()) {
+    throw new Error('legacy source cannot mix non-RA0 authority');
+  }
+  const seen = new Set();
+  return rows.map(turn => {
+    if (typeof turn.result_authority_version !== 'number' || turn.result_authority_version !== 0) return { turn, closure: null };
+    const candidateSeen = new Set(seen);
+    try {
+      const closure = assertLegacyRa0Turn(database, turn, candidateSeen);
+      for (const id of candidateSeen) seen.add(id);
+      return { turn, closure };
+    } catch {
+      return { turn, closure: null };
+    }
+  });
+}
+
+function buildLegacyCandidateTurn(closure, mapping) {
+  const project = (message, speaker) => ({
+    at: Number(message.sent_at), speaker,
+    batch: [{ messageId: stableAnonId(String(message.message_id), mapping, 'message'), type: 'text', text: String(message.content) }]
+  });
+  const userBatch = closure.batch.messages.map(message => ({
+    messageId: stableAnonId(String(message.message_id), mapping, 'message'), type: 'text', text: String(message.content)
+  }));
+  return {
+    sourceTurnId: closure.turn.turn_id,
+    at: Number(closure.batch.started_at),
+    speaker: 'user',
+    batch: userBatch,
+    assistant: project(closure.characterMessage, 'assistant'),
+    persisted: {
+      batchId: stableAnonId(String(closure.batch.batch_id), mapping, 'batch'),
+      batchChecksum: String(closure.batch.checksum),
+      deliveryChecksum: String(closure.delivery.checksum),
+      itemCount: Number(closure.batch.item_count)
+    }
+  };
+}
+
+function buildLegacyCandidates(database, entries) {
+  const candidates = [];
+  let current = null;
+  const flush = () => {
+    if (current && current.turnRows.length >= 2) candidates.push(current);
+    current = null;
+  };
+  for (const entry of entries) {
+    if (!entry.closure) {
+      flush();
+      continue;
+    }
+    const row = { ...entry.turn, closure: entry.closure };
+    const closure = entry.closure;
+    const startedAt = Number(closure.batch.started_at);
+    const endedAt = Math.max(closure.batch.committed_at, closure.characterMessage.sent_at, closure.delivery.confirmed_at);
+    const gap = current && startedAt - current.endedAt;
+    const same = current && current.roleId === row.character_id && current.laneKey === 'private_chat'
+      && gap >= 0 && gap <= 15 * 60 * 1000;
+    if (!same || current.turnRows.length >= 6) {
+      flush();
+      current = { roleId: row.character_id, laneKey: 'private_chat', startedAt, endedAt, turnRows: [] };
+    }
+    current.turnRows.push(row);
+    current.endedAt = endedAt;
+  }
+  flush();
+  return candidates.map((window, index) => {
+    const raw = {
+      roleId: window.roleId, laneKey: window.laneKey, startedAt: window.startedAt,
+      endedAt: window.endedAt, turns: window.turnRows.map(row => ({
+        turnId: row.turn_id, sourceMessageId: row.source_message_id,
+        envelopeChecksum: row.envelope_checksum,
+        batchChecksum: row.closure.batch.checksum,
+        deliveryChecksum: row.closure.delivery.checksum
+      }))
+    };
+    const sourceWindowChecksum = contentHash(raw);
+    const mapping = new Map();
+    const turns = window.turnRows.flatMap(row => {
+      const candidate = buildLegacyCandidateTurn(row.closure, mapping);
+      return [{ at: candidate.at, speaker: candidate.speaker, batch: candidate.batch }, candidate.assistant];
+    });
+    if (turns.length < 4 || turns.length > 12) throw new Error(`legacy candidate window turn count is outside 4..12: ${window.turnRows.length}`);
+    const candidate = {
+      windowId: `history_window_${String(index).padStart(3, '0')}`,
+      sourceWindowChecksum, roleId: 'anon_role_1', laneKey: 'anon_private_chat',
+      startedAt: window.startedAt, endedAt: window.endedAt, turns,
+      persistedContextProjection: {
+        roleId: 'anon_role_1', laneKey: 'anon_private_chat', turnCount: window.turnRows.length,
+        batchChecksums: window.turnRows.map(row => row.closure.batch.checksum),
+        deliveryStates: window.turnRows.map(row => 'confirmed')
+      },
+      ...LEGACY_RA0_PROVENANCE
+    };
+    return candidate;
+  });
+}
+
 function authorityWindowProjection(database, rows) {
   return rows.map(row => {
     const lineage = database.prepare('SELECT * FROM turn_authority_lineages WHERE lineage_key = ?').get(row.authority_lineage_key);
@@ -864,9 +1189,10 @@ function atomicWritePair(output, outputText, manifest, manifestText, { faultAt =
   }
 }
 
-export function extractRealHistoryScenes({ databasePath, outputPath, manifestPath, candidatesPath, labelsPath, limit = 30, root = process.cwd() }) {
+export function extractRealHistoryScenes({ databasePath, outputPath, manifestPath, candidatesPath, labelsPath, limit = 30, root = process.cwd(), sourceAuthority = 'canonical_ra1' }) {
   if (!databasePath || !isAbsolute(databasePath)) throw new Error('databasePath must be an absolute path');
   if (!Number.isSafeInteger(limit) || limit !== 30) throw new Error('real history extraction requires exactly 30 scenes');
+  if (!['canonical_ra1', 'legacy_ra0_confirmed'].includes(sourceAuthority)) throw new Error(`unsupported source authority: ${sourceAuthority}`);
   const candidateOutput = privatePath(root, candidatesPath, 'artifacts/yuqi-lived-agency-v3/private/real-history-candidates.jsonl');
   const output = privatePath(root, outputPath, 'artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl');
   const manifest = privatePath(root, manifestPath, 'artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json');
@@ -874,8 +1200,9 @@ export function extractRealHistoryScenes({ databasePath, outputPath, manifestPat
   const database = new DatabaseSync(databasePath, { readOnly: true });
   try {
     assertReadonlyV15Schema(database);
-    assertAuthorityClosure(database);
-    const candidates = buildCandidates(database, eligibleRows(database));
+    const candidates = sourceAuthority === 'legacy_ra0_confirmed'
+      ? buildLegacyCandidates(database, legacyEligibleRows(database))
+      : (assertAuthorityClosure(database), buildCandidates(database, eligibleRows(database)));
     if (candidates.length < limit) throw new Error(`need at least ${limit} eligible 4..12 turn windows; got ${candidates.length}`);
     const selectedCandidates = candidates.slice(0, limit);
     const candidateText = `${selectedCandidates.map(candidate => JSON.stringify(candidate)).join('\n')}\n`;
@@ -908,12 +1235,16 @@ export function extractRealHistoryScenes({ databasePath, outputPath, manifestPat
         expectedStateTransitions: label.expectedStateTransitions,
         forbiddenStateTransitions: label.forbiddenStateTransitions,
         sourceAnnotation: { file: 'private_history_labels', heading: label.structure },
+        ...(candidate.sourceAuthority === 'legacy_ra0_confirmed' ? LEGACY_RA0_PROVENANCE : {}),
         severity: label.severity
       };
     });
     const jsonl = `${scenes.map(scene => JSON.stringify(scene)).join('\n')}\n`;
     const scenesChecksum = contentHash(scenes);
-    const manifestValue = { schemaVersion: 1, sceneIds: scenes.map(scene => scene.sceneId), scenesChecksum };
+    const manifestValue = {
+      schemaVersion: 1, sceneIds: scenes.map(scene => scene.sceneId), scenesChecksum,
+      ...(sourceAuthority === 'legacy_ra0_confirmed' ? LEGACY_RA0_PROVENANCE : {})
+    };
     atomicWritePair(output, jsonl, manifest, `${JSON.stringify(manifestValue)}\n`);
     const after = sourceSha256(databasePath);
     if (after !== before) throw new Error('source database changed during readonly extraction');
@@ -930,7 +1261,8 @@ if (isMain()) {
   const root = resolve(typeof args.get('root') === 'string' ? args.get('root') : process.cwd());
   const result = extractRealHistoryScenes({
     databasePath: resolve(databasePath), root, labelsPath: typeof args.get('labels') === 'string' ? resolve(args.get('labels')) : null,
-    outputPath: args.get('out'), manifestPath: args.get('manifest'), candidatesPath: args.get('candidates'), limit: Number(args.get('limit') || 30)
+    outputPath: args.get('out'), manifestPath: args.get('manifest'), candidatesPath: args.get('candidates'), limit: Number(args.get('limit') || 30),
+    sourceAuthority: args.get('source-authority') || 'canonical_ra1'
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }

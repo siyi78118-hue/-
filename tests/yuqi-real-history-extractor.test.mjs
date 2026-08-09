@@ -125,6 +125,96 @@ function createRealV15Fixture(path, { windows = 30, turnsPerWindow = 4, mutate =
   } finally { store.close(); }
 }
 
+function legacyRa0Envelope(index, at, { multiBubble = false } = {}) {
+  const turnId = `turn_ra0_quality_${index}`;
+  const messageId = `msg_ra0_quality_${index}`;
+  const batchId = `batch_ra0_quality_${index}`;
+  const message = {
+    messageId, speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+    content: `synthetic user ${index}`, sentAt: at
+  };
+  const messages = multiBubble ? [0, 1, 2].map(bubble => ({
+    messageId: `${messageId}_${bubble}`, speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+    content: `synthetic user ${index} bubble ${bubble}`, sentAt: at + bubble
+  })) : [message];
+  const source = messages.at(-1);
+  return {
+    protocolVersion: 2, turnId, characterId: 'yuqi', deviceId: 'device-ra0',
+    deviceSeq: index + 1, createdAt: at, kind: 'DIRECT_REPLY', message: source,
+    context: {
+      currentBatch: {
+        batchId, messageIds: messages.map(item => item.messageId), startedAt: at, committedAt: at + (multiBubble ? 3 : 1),
+        messages
+      }
+    }
+  };
+}
+
+function rawSha256(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function legacyMessageRowChecksum(row) {
+  return contentHash({
+    messageId: row.message_id, turnId: row.turn_id, characterId: row.character_id,
+    speakerId: row.speaker_id, speakerType: row.speaker_type, recipientId: row.recipient_id,
+    content: row.content, sentAt: row.sent_at, origin: row.origin,
+    deviceId: row.device_id, deviceSeq: row.device_seq
+  });
+}
+
+function recomputeLegacyBatchCommitments(store, turnId) {
+  const batch = store.db.prepare('SELECT * FROM current_user_batches WHERE turn_id = ?').get(turnId);
+  const items = store.db.prepare('SELECT * FROM current_user_batch_items WHERE turn_id = ? ORDER BY sequence').all(turnId);
+  const tombstoneCommitment = contentHash({
+    version: 'current-user-batch-tombstone-v1', turnId: batch.turn_id, batchId: batch.batch_id,
+    itemCount: items.length, items: items.map(item => ({ sequence: item.sequence, messageId: item.message_id, checksum: item.checksum }))
+  });
+  store.db.prepare('UPDATE current_user_batches SET checksum = ?, item_count = ?, tombstone_commitment = ? WHERE turn_id = ?')
+    .run(contentHash({ batchId: batch.batch_id, sourceMessageId: batch.source_message_id, messageIds: items.map(item => item.message_id), startedAt: batch.started_at, committedAt: batch.committed_at }), items.length, tombstoneCommitment, turnId);
+}
+
+function createLegacyRa0Fixture(path, { windows = 30, turnsPerWindow = 2, mutate = null, multiBubbleFirst = false } = {}) {
+  const store = new YuqiStore(path);
+  const base = Date.now();
+  try {
+    let index = 0;
+    for (let window = 0; window < windows; window += 1) {
+      for (let offset = 0; offset < turnsPerWindow; offset += 1) {
+        const at = base + (window * 20 * 60_000) + (offset * 60_000);
+        const envelope = legacyRa0Envelope(index, at, { multiBubble: multiBubbleFirst && index === 0 });
+        const turn = store.submitTurn(envelope);
+        store.db.prepare('UPDATE turns SET state = ? WHERE turn_id = ?').run('completed', turn.turnId);
+        const reply = {
+          messageId: `msg_ra0_reply_${index}`, turnId: turn.turnId, characterId: 'yuqi',
+          speakerId: 'yuqi', speakerType: 'character', recipientId: 'user',
+          content: `synthetic assistant ${index}`, sentAt: at + 5_000, origin: 'legacy',
+          deviceId: 'device-ra0', deviceSeq: index + 1
+        };
+        store.putMessage(reply);
+        const payload = {
+          turnId: turn.turnId, messageId: reply.messageId, speakerId: reply.speakerId,
+          speakerType: reply.speakerType, recipientId: reply.recipientId, content: reply.content,
+          contentSha256: rawSha256(reply.content)
+        };
+        store.registerCloudDelivery(turn.turnId, 'device-ra0', 0);
+        const prepared = store.prepareCloudDelivery(turn.turnId, 'device-ra0', payload);
+        store.markCloudDeliveryAttempt(turn.turnId, 'device-ra0');
+        store.markCloudDeliveryMailboxed(turn.turnId, 'device-ra0', prepared.checksum);
+        store.confirmCloudDelivery(turn.turnId, 'device-ra0', {
+          messageId: reply.messageId, contentSha256: rawSha256(reply.content), receivedAt: at + 7_000
+        });
+        store.db.prepare('UPDATE cloud_deliveries SET delivered_at = ?, confirmed_at = ?, updated_at = ? WHERE turn_id = ?')
+          .run(at + 6_000, at + 7_000, at + 7_000, turn.turnId);
+        index += 1;
+      }
+    }
+    if (mutate) mutate(store);
+  } finally {
+    store.close();
+  }
+}
+
 function insertClearControls(store, { includeV0 = true, includeV1 = true } = {}) {
   if (includeV0) {
     store.db.prepare(`
@@ -187,6 +277,218 @@ function writeLabels(root, labels) {
   writeFileSync(path, `${labels.map(label => JSON.stringify(label)).join('\n')}\n`, 'utf8');
   return path;
 }
+
+test('legacy_ra0_confirmed explicit source authority accepts synthetic confirmed legacy windows', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-red-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database);
+    const result = JSON.parse(runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']));
+    const candidates = readFileSync(result.candidatesPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(result.count, 30);
+    assert.equal(candidates.length, 30);
+    for (const candidate of candidates) {
+      assert.deepEqual({
+        sourceAuthority: candidate.sourceAuthority,
+        qualityOnly: candidate.qualityOnly,
+        authorityEvidenceEligible: candidate.authorityEvidenceEligible,
+        promotionEvidenceEligible: candidate.promotionEvidenceEligible
+      }, {
+        sourceAuthority: 'legacy_ra0_confirmed', qualityOnly: true,
+        authorityEvidenceEligible: false, promotionEvidenceEligible: false
+      });
+      assert.equal(Object.hasOwn(candidate, 'shadow'), false);
+      assert.equal(Object.hasOwn(candidate, 'rollout'), false);
+      assert.equal(Object.hasOwn(candidate, 'promotion'), false);
+      assert.equal(candidate.turns.length, 4);
+    }
+    const labels = writeLabels(root, candidates.map((candidate, index) => makeLabel(candidate, index)));
+    const labeled = JSON.parse(runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed', '--labels', labels]));
+    const manifest = JSON.parse(readFileSync(labeled.manifest, 'utf8'));
+    assert.deepEqual({
+      sourceAuthority: manifest.sourceAuthority,
+      qualityOnly: manifest.qualityOnly,
+      authorityEvidenceEligible: manifest.authorityEvidenceEligible,
+      promotionEvidenceEligible: manifest.promotionEvidenceEligible
+    }, {
+      sourceAuthority: 'legacy_ra0_confirmed', qualityOnly: true,
+      authorityEvidenceEligible: false, promotionEvidenceEligible: false
+    });
+    const scenes = readFileSync(labeled.output, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(scenes.every(scene => scene.sourceAuthority === 'legacy_ra0_confirmed' && scene.qualityOnly === true), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy_ra0_confirmed rejects malformed delivery/message/batch provenance before publication', () => {
+  const cases = [
+    ['mailboxed delivery', store => store.db.prepare("UPDATE cloud_deliveries SET state = 'mailboxed', confirmed_at = NULL").run(), /delivery|state|window|eligible/i],
+    ['foreign delivery peer', store => store.db.prepare("UPDATE cloud_deliveries SET peer_id = 'foreign-peer'").run(), /delivery|peer|target/i],
+    ['reversed delivery time', store => store.db.prepare('UPDATE cloud_deliveries SET confirmed_at = delivered_at - 1').run(), /delivery|time/i],
+    ['missing confirmed time', store => store.db.prepare('UPDATE cloud_deliveries SET confirmed_at = NULL').run(), /delivery|time|confirmed/i],
+    ['payload checksum drift', store => store.db.prepare("UPDATE cloud_deliveries SET payload_json = replace(payload_json, 'synthetic assistant 0', 'forged'), checksum = checksum").run(), /delivery|checksum|payload/i],
+    ['self-consistent payload semantic drift', store => {
+      const row = store.db.prepare("SELECT * FROM cloud_deliveries WHERE turn_id = 'turn_ra0_quality_0'").get();
+      const payload = JSON.parse(row.payload_json);
+      payload.content = 'forged but rehashed';
+      payload.contentSha256 = rawSha256(payload.content);
+      store.db.prepare('UPDATE cloud_deliveries SET payload_json = ?, checksum = ? WHERE turn_id = ?')
+        .run(JSON.stringify(payload), contentHash(payload), row.turn_id);
+    }, /delivery|payload|message/i],
+    ['self-consistent envelope semantic drift', store => {
+      const row = store.db.prepare("SELECT * FROM turns WHERE turn_id = 'turn_ra0_quality_0'").get();
+      const envelope = JSON.parse(row.envelope_json);
+      envelope.message.content = 'forged envelope';
+      store.db.prepare('UPDATE turns SET envelope_json = ?, envelope_checksum = ? WHERE turn_id = ?')
+        .run(JSON.stringify(envelope), contentHash(envelope), row.turn_id);
+    }, /envelope|source|message/i],
+    ['source owner drift', store => store.db.prepare("UPDATE messages SET device_id = 'foreign-device' WHERE speaker_type = 'user'").run(), /source|message|owner|authority/i],
+    ['character output identity drift', store => store.db.prepare("UPDATE messages SET speaker_id = 'foreign-character' WHERE speaker_type = 'character'").run(), /character|message|authority/i],
+    ['multiple character outputs', store => store.putMessage({
+      messageId: 'msg_ra0_extra_character', turnId: 'turn_ra0_quality_0', characterId: 'yuqi', speakerId: 'yuqi',
+      speakerType: 'character', recipientId: 'user', content: 'extra output', sentAt: Date.now(), origin: 'legacy',
+      deviceId: 'device-ra0', deviceSeq: 999
+    }), /character|message|count/i],
+    ['extra delivery target', store => store.registerCloudDelivery('turn_ra0_quality_0', 'foreign-peer', 0), /delivery|target|peer/i],
+    ['native timestamp coercion', store => store.db.prepare("UPDATE cloud_deliveries SET delivered_at = 'not-a-number'").run(), /delivery|time|native/i],
+    ['missing batch', store => { store.db.prepare('DELETE FROM current_user_batch_items').run(); store.db.prepare('DELETE FROM current_user_batches').run(); }, /batch|authority/i],
+    ['reused source message', store => store.db.prepare("UPDATE turns SET source_message_id = 'msg_ra0_quality_0' WHERE turn_id = 'turn_ra0_quality_1'").run(), /source|message|closure/i]
+  ];
+  for (const [name, mutate, pattern] of cases) {
+    const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-reject-'));
+    const database = join(root, 'history.sqlite');
+    try {
+      createLegacyRa0Fixture(database, { mutate });
+      assert.throws(() => runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']), new RegExp(`${pattern.source}|window|eligible`, pattern.flags), name);
+      assert.equal(existsSync(privateDir(root)) ? readdirSync(privateDir(root)).length : 0, 0, `${name} must not publish candidates`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('legacy_ra0_confirmed requires thirty complete windows and preserves the source bytes', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-count-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database, { windows: 29 });
+    const before = sha256File(database);
+    assert.throws(() => runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']), /30|window/i);
+    assert.equal(sha256File(database), before);
+    const validRoot = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-valid-'));
+    const validDatabase = join(validRoot, 'history.sqlite');
+    try {
+      createLegacyRa0Fixture(validDatabase);
+      const validBefore = sha256File(validDatabase);
+      const result = JSON.parse(runExtractor(validDatabase, validRoot, ['--source-authority', 'legacy_ra0_confirmed']));
+      assert.equal(result.count, 30);
+      assert.equal(sha256File(validDatabase), validBefore);
+    } finally {
+      rmSync(validRoot, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a malformed legacy row terminates a window without bridging valid exchanges across it', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-boundary-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database, {
+      windows: 31,
+      mutate: store => store.db.prepare("UPDATE turns SET state = 'failed' WHERE turn_id = 'turn_ra0_quality_30'").run()
+    });
+    const result = JSON.parse(runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']));
+    assert.equal(result.count, 30);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy multi-bubble batch uses item JSON for early bubbles and only source row needs messages authority', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-bubbles-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database, { multiBubbleFirst: true });
+    const result = JSON.parse(runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']));
+    assert.equal(result.count, 30);
+    const candidates = readFileSync(result.candidatesPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(candidates[0].turns[0].batch.length, 3);
+    assert.match(candidates[0].turns[0].batch[0].text, /bubble 0/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy source authority refuses a database that also contains canonical RA1 authority', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-mix-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database, { mutate: store => store.db.prepare(
+      "UPDATE turns SET result_authority_version = 1 WHERE turn_id = 'turn_ra0_quality_0'"
+    ).run() });
+    assert.throws(() => runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']), /mix|RA1|canonical|authority/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy RA0 time, recipient, source-position, and ordering boundaries fail closed per row', () => {
+  const cases = [
+    ['createdAt mismatch', store => store.db.prepare("UPDATE turns SET created_at = created_at + 1 WHERE turn_id = 'turn_ra0_quality_0'").run(), /created|envelope|window|eligible/i],
+    ['source recipient mismatch', store => store.db.prepare("UPDATE messages SET recipient_id = 'other-role' WHERE message_id = 'msg_ra0_quality_0'").run(), /source|recipient|message|window|eligible/i],
+    ['character before batch', store => {
+      const message = store.db.prepare("SELECT * FROM messages WHERE message_id = 'msg_ra0_reply_0'").get();
+      const batch = store.db.prepare("SELECT committed_at FROM current_user_batches WHERE turn_id = 'turn_ra0_quality_0'").get();
+      message.sent_at = batch.committed_at - 1;
+      store.db.prepare('UPDATE messages SET sent_at = ?, checksum = ? WHERE message_id = ?')
+        .run(message.sent_at, legacyMessageRowChecksum(message), message.message_id);
+    }, /character|time|window|eligible/i],
+    ['delivery before character', store => store.db.prepare("UPDATE cloud_deliveries SET delivered_at = delivered_at - 100000 WHERE turn_id = 'turn_ra0_quality_0'").run(), /delivery|time|window|eligible/i]
+  ];
+  for (const [name, mutate, pattern] of cases) {
+    const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-order-'));
+    const database = join(root, 'history.sqlite');
+    try {
+      createLegacyRa0Fixture(database, { mutate });
+      assert.throws(() => runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']), pattern, name);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const multiRoot = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-order-multi-'));
+  const multiDatabase = join(multiRoot, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(multiDatabase, { multiBubbleFirst: true, mutate: store => {
+      const batch = store.db.prepare("SELECT * FROM current_user_batches WHERE turn_id = 'turn_ra0_quality_0'").get();
+      const items = store.db.prepare("SELECT * FROM current_user_batch_items WHERE turn_id = 'turn_ra0_quality_0' ORDER BY sequence").all();
+      const first = JSON.parse(items[0].message_json);
+      first.recipientId = 'other-role';
+      store.db.prepare('UPDATE current_user_batch_items SET message_json = ?, checksum = ? WHERE turn_id = ? AND sequence = 0')
+        .run(JSON.stringify(first), contentHash(first), batch.turn_id);
+      recomputeLegacyBatchCommitments(store, batch.turn_id);
+      store.db.prepare("UPDATE current_user_batches SET source_message_id = ? WHERE turn_id = 'turn_ra0_quality_0'")
+        .run(items[0].message_id);
+    } });
+    assert.throws(() => runExtractor(multiDatabase, multiRoot, ['--source-authority', 'legacy_ra0_confirmed']), /recipient|source|batch|window|eligible/i);
+  } finally {
+    rmSync(multiRoot, { recursive: true, force: true });
+  }
+});
+
+test('legacy_ra0_confirmed rejects non-authority source selection and canonical default remains RA1-only', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-provenance-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database);
+    assert.throws(() => runExtractor(database, root, ['--source-authority', 'made_up']), /source authority|unsupported/i);
+    assert.throws(() => runExtractor(database, root), /eligible|authority|candidate|window/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('v15 authority snapshot yields candidates only until a private labels sidecar is supplied', () => {
   const root = mkdtempSync(join(tmpdir(), 'yuqi-history-candidates-'));
