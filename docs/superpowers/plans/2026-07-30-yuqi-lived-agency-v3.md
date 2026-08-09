@@ -8907,6 +8907,9 @@ git commit -m "test: separate protocol and lived quality evidence"
 - Modify: `yuqi-runtime/test/comparison-evaluator.test.mjs`
 - Create: `scripts/run-yuqi-lived-quality-replay.mjs`
 - Create: `scripts/report-yuqi-lived-quality.mjs`
+- Modify: `scripts/compile-yuqi-lived-quality-scenes.mjs`
+- Modify: `tests/yuqi-lived-quality-contract.test.mjs`
+- Create: `tests/fixtures/yuqi-lived-quality-v1/source-grounding-index.json`
 - Modify: `package.json`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/quality-report.json`
 
@@ -8952,6 +8955,45 @@ test('approved candidate meets every numerical gate', () => {
   assert.equal(report.structuralRegressionCount, 0);
   assert.equal(report.eligible, true);
 });
+
+test('missing, duplicate, unresolved, or incomplete evidence can never pass', () => {
+  for (const evidence of [
+    emptyEvidence(), missingOneSentinelRun(), missingOneCoverageRun(),
+    missingOneHistoryRun(), duplicateEvidenceKey(), unresolvedDimensionScore(),
+    scoreWithMissingDimension(), scoreWithNonIntegerDimension()
+  ]) {
+    const report = aggregateQualityGate(evidence);
+    assert.equal(report.eligible, false);
+    assert.ok(report.failedGates.includes('INCOMPLETE_QUALITY_EVIDENCE'));
+  }
+});
+
+test('blind projection is closed and excludes every release and execution side channel', () => {
+  const input = projectBlindEvaluationInput(pairWithAllInternalMetadata(), { seed: 17 });
+  assert.deepEqual(Object.keys(input).sort(), [
+    'dimensions', 'outputs', 'sceneAnnotation', 'version'
+  ]);
+  assert.equal(recursiveContainsForbiddenMetadata(input), false);
+  assertLabelsIndependentOfSourceOrder(input, { seed: 17 });
+  assert.throws(() => projectBlindEvaluationInput(pairWithUnknownNestedKey()),
+    /blind evaluation input shape/);
+});
+
+test('clean checkout compiles source-grounded scenes without private annotation files', () => {
+  const suite = compileQualityScenes({ rootDir: cleanCheckoutWithoutPresetReferences() });
+  assert.equal(suite.sentinelSeeds.length, 24);
+  assert.equal(suite.coverageScenes.length, 72);
+});
+
+test('one closed adapter executes every scene through the pinned release executor', async () => {
+  const execution = compileSceneExecutionInput(validDirectScene());
+  const pairRecord = await runScenePair(execution, frozenReleasePair());
+  assert.equal(pairRecord.stable.dryRun, true);
+  assert.equal(pairRecord.candidate.dryRun, true);
+  assert.equal(pairRecord.executionChecksum, contentHash(pairRecord.execution));
+  assert.equal(pairRecord.stableInputChecksum, pairRecord.executionChecksum);
+  assert.equal(pairRecord.candidateInputChecksum, pairRecord.executionChecksum);
+});
 ```
 
 - [ ] **Step 2: Run quality evaluator tests red**
@@ -8969,8 +9011,15 @@ export const QUALITY_DIMENSIONS = Object.freeze([
 ]);
 
 export function aggregateQualityGate(evidence) {
+  const completeness = validateExactEvidenceSet(evidence, {
+    sentinelRuns: 72,
+    coverageRuns: 144,
+    historyRuns: 30,
+    dimensions: QUALITY_DIMENSIONS
+  });
   const summary = summarizeEvidence(evidence);
   const failedGates = [
+    !completeness.ok && 'INCOMPLETE_QUALITY_EVIDENCE',
     summary.protocolFailures > 0 && 'PROTOCOL_REGRESSION',
     summary.sentinelSevereFailureCount > 0 && 'SENTINEL_SEVERE_FAILURE',
     summary.dimensionAverages.some(x => x.average < 4) && 'DIMENSION_BELOW_FOUR',
@@ -8983,6 +9032,39 @@ export function aggregateQualityGate(evidence) {
   return { ...summary, failedGates, eligible: failedGates.length === 0 };
 }
 ```
+
+`validateExactEvidenceSet()` is fail-closed. The finalized evidence identity is
+exactly `(layer, sceneId, repeatIndex)`: the materialized set must contain one
+and only one finalized result for each expected identity, totaling 72 sentinel,
+144 coverage, and 30 local-history results. Raw evaluator attempts are
+append-only children with the closed identity
+`(layer, sceneId, repeatIndex, attemptIndex, evaluatorId)`; retries never create
+a second finalized result and an identity with zero or multiple accepted
+completions is unresolved. Duplicate attempt/final identities, a gap in native
+non-negative `attemptIndex`, an unexpected scene, an unresolved final result,
+or any missing, non-native-integer, or out-of-range score in the six fixed
+dimensions makes the report ineligible. Empty arrays and `NaN` aggregates are
+never eligible.
+
+`projectBlindEvaluationInput()` is the sole model-evaluator input builder. Its
+closed output contains only `version`, `sceneAnnotation`, `dimensions`, and
+`outputs`. Unknown or missing fields are rejected, never silently stripped.
+`version` is the native integer `1`; `dimensions` is exactly the six literal
+dimension names in their frozen order. `sceneAnnotation` is a closed object of
+`{sceneId,severity,focus,turns,requiredChecks,allowedVariation}`; its turns and
+structured feature records use the closed Task 21 scene projection and contain
+only user-visible scenario content, never source file/heading paths. `outputs`
+is an array of exactly two closed
+`{label,terminalDisposition,replyParts,actions}` objects. Labels are exactly A
+and B; reply parts/actions use an identity-free closed evaluator projection
+with native types and recursively reject unknown keys. No nested object may
+contain release IDs, pipeline names, checksums, model profiles, latency,
+attempt/order/source-side labels, rollout keys, paths, timestamps, or transport
+metadata. The A/B permutation key is exactly
+`contentHash({sceneId,repeatIndex,evaluationSeed})`; it contains no release,
+output order, latency, checksum, or path input. Swapping stable/candidate source
+order under the same key must preserve the permutation rule without revealing
+which release produced either label.
 
 Layer 1 runs deterministic schema/target/privacy/stage/duplicate/state-authority checks. Layer 2 gives a reviewer two identity-free, seed-shuffled outputs plus the scene annotations and six dimensions. It may not see pipeline names, checksums, latency, or which side is current. Layer 3 creates a manual review queue for any critical finding, evaluator disagreement, score 1, or sampled structured feature. Manual review records evidence and a decision; it cannot edit raw model output.
 
@@ -8999,6 +9081,41 @@ for (const scene of localHistoryScenes) runPair(scene, { repeats: 1 });
 ```
 
 Each repeat gets a fixed input/checkpoint checksum, independent model calls, randomized blind labels, full latency, deterministic findings, six scores, pairwise result, and evaluator version. A retry appends an attempt under the same run/scene/repeat key; it cannot replace a completed record.
+
+The replay script owns one closed `compileSceneExecutionInput(scene)` adapter.
+It validates the Task 21 scene shape and deterministically projects it to the
+exact Task 11 `ReleaseExecutor` execution input, including rollout kind,
+ordered turns, context/state checkpoint, and structured-action targets. It
+computes one execution checksum before selecting a release, then invokes both
+frozen release IDs/checksums through the same `ReleaseExecutor` with
+`dryRun:true`. Stable and candidate may not use separate scene compilers,
+production turn creators, store writers, or caller-supplied draft shortcuts;
+the Task 22 pair record (not `ReleaseExecutor`) stores the canonical execution,
+its checksum, and identical `stableInputChecksum`/`candidateInputChecksum`.
+The executor interface remains unchanged. Both calls must use zero
+visible/action capabilities.
+
+Task 21 source grounding must also be reproducible from a clean checkout.
+Commit `source-grounding-index.json` as a privacy-safe deterministic object with
+exactly `{schemaVersion,sentinels}`. `schemaVersion` is native integer `1` and
+`sentinels` is an object with exactly the 24 expected sentinel scene IDs; each
+value is the closed object
+`{file,heading,headingChecksum,sceneChecksum}`. Both checksums are lowercase
+SHA-256: `headingChecksum` commits the exact normalized heading, while
+`sceneChecksum` commits the full canonical sentinel seed (including its source
+annotation and variants), so a valid heading cannot be reused for substituted
+scene content. Unknown/duplicate/missing scene mappings, duplicate scene IDs,
+or any mismatch among the scene source annotation, heading commitment, and
+scene checksum is fatal. It must not contain quoted private chat or annotation
+bodies. The compiler always validates every sentinel and all 72 derived
+coverage scenes through their parent sentinel against this committed index.
+When a private source Markdown is present locally it additionally verifies the
+document heading; when it is absent, clean-checkout compilation still succeeds
+from the committed commitments without weakening the scene-to-source binding.
+Tests must cover absent private sources, wrong heading/checksum, substituted
+scene content, missing/extra/duplicate mapping, and a coverage scene with the
+wrong parent. No committed test or script may require the untracked
+`真人聊天训练批注-第四轮-交接.md` file.
 
 The materialized report embeds `candidateRelease` with every
 `pipeline_releases` field (`releaseId`, `pipelineVersion`, `presetVersion`,
@@ -9043,17 +9160,24 @@ Run:
 
 ```powershell
 node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/comparison-evaluator.test.mjs
+node --test tests/yuqi-lived-quality-contract.test.mjs yuqi-runtime/test/replay-runner.test.mjs
 npm run cognition:quality:check
 npm run cognition:quality:replay -- --stable-from artifacts/yuqi-lived-agency-v3/baseline.json --candidate-preset 2.1.0
 npm run cognition:quality:report -- --out artifacts/yuqi-lived-agency-v3/quality-report.json
 ```
 
-Expected: tests PASS. The report records all 72 sentinel runs, 144 coverage runs, 30 history runs, all six dimension aggregates, pairwise rates, severe findings, structural results, the complete checksummed stable/candidate release definitions, and `eligible`. If `eligible=false`, stop before registering a production candidate; do not weaken gates.
+Expected: tests PASS from a clean checkout without private annotation Markdown.
+The report records exactly all 72 sentinel runs, 144 coverage runs, 30 history
+runs, all six dimension aggregates, pairwise rates, severe findings, structural
+results, the complete checksummed stable/candidate release definitions, and
+`eligible`. Any missing, duplicate, unresolved, malformed, identity-leaking, or
+non-dry-run evidence makes `eligible=false`. If `eligible=false`, stop before
+registering a production candidate; do not weaken gates.
 
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add yuqi-runtime/src/quality-evaluator.mjs yuqi-runtime/src/comparison-evaluator.mjs yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/comparison-evaluator.test.mjs scripts/run-yuqi-lived-quality-replay.mjs scripts/report-yuqi-lived-quality.mjs package.json
+git add yuqi-runtime/src/quality-evaluator.mjs yuqi-runtime/src/comparison-evaluator.mjs yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/comparison-evaluator.test.mjs scripts/run-yuqi-lived-quality-replay.mjs scripts/report-yuqi-lived-quality.mjs scripts/compile-yuqi-lived-quality-scenes.mjs tests/yuqi-lived-quality-contract.test.mjs tests/fixtures/yuqi-lived-quality-v1/source-grounding-index.json package.json
 git commit -m "feat: gate Yuqi v3 with blind lived quality evidence"
 ```
 
