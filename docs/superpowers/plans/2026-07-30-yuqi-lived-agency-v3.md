@@ -9940,6 +9940,7 @@ git commit -m "fix: initialize Android execution runtime off main thread"
 
 **Files:**
 - Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/secure/AlSecretStore.java`
 - Create: `android/app/src/androidTest/java/com/siyi/al/execution/AlExecutionPluginStartupTest.java`
 
 **Interfaces:**
@@ -9995,9 +9996,13 @@ failure/retry proof must use a real persisted bad configuration or real Room
 initialization failure, not a fake initializer. `saveBridgeConfig` continues to
 rebind the store on the same worker, but it must not leave a persisted new peer
 paired with the old in-memory store when rebinding fails: construct and validate
-the replacement graph first, then publish the mutually consistent persisted and
-in-memory state through the worker-owned update boundary or restore the prior
-persisted configuration before rejecting the call.
+the replacement graph first. `AlSecretStore.saveBridgeConfig` must encrypt all
+closed bridge fields into worker-local values before mutating preferences, then
+write the complete map with one `SharedPreferences.Editor.commit()` operation.
+An encryption error or `commit() == false` rejects without any persisted field
+change. Only after that atomic persistence succeeds may the plugin publish the
+replacement store. Per-field `apply()`, best-effort rollback through the same
+failing writer, or accepting a partially updated bridge record is forbidden.
 
 The lifecycle is closed and explicit:
 
@@ -10008,6 +10013,13 @@ The lifecycle is closed and explicit:
 - destruction changes the plugin to `STOPPING`, clears the active reference and
   prevents new work from being accepted. It does not null/close fields on the
   main thread while queued or running worker code may still use them;
+- one operation whose body has already begun may finish its existing bounded
+  network/transaction cleanup, but after observing `STOPPING` it must reject
+  rather than resolve successfully or notify the destroyed WebView. Operations
+  queued behind it must observe `STOPPING`, reject without entering their
+  operation bodies and then allow terminal worker cleanup to run. The task does
+  not claim that `shutdownNow` can forcibly abort an uninterruptible platform
+  network call; all such calls retain their existing finite timeouts;
 - a rejected executor submission produces a stable plugin-call rejection rather
   than a crash or a permanently pending JavaScript Promise. PluginCalls still
   queued when destruction begins are explicitly rejected rather than silently
@@ -10028,8 +10040,14 @@ Activity/WebView/plugin path:
    and resolves with the authoritative cursor shape;
 3. a forced first initialization failure rejects exactly that call, a later call
    can retry successfully, and no half-initialized store is used;
-4. Activity destroy/recreate does not leave a stale active instance, duplicate
-   executor or hanging Promise.
+4. bridge-config encryption/commit failure leaves every persisted bridge field
+   and the live store on the old peer; success changes both together. A test seam
+   may inject only the preference commit outcome, not replace crypto, Room or the
+   plugin initialization path;
+5. a bounded deliberately held worker call followed by queued calls and plugin
+   destruction proves: the running call does not publish success to the stale
+   instance, every submitted call settles exactly once, no queued operation body
+   runs after `STOPPING`, and Activity recreate produces a new working plugin.
 
 Run:
 
@@ -10046,7 +10064,7 @@ change to legacy plugin method payloads.
 - [ ] **Step 4: Commit only the focused plugin-startup fix**
 
 ```powershell
-git add android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/androidTest/java/com/siyi/al/execution/AlExecutionPluginStartupTest.java
+git add android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/main/java/com/siyi/al/execution/secure/AlSecretStore.java android/app/src/androidTest/java/com/siyi/al/execution/AlExecutionPluginStartupTest.java
 git commit -m "fix: initialize Android plugin state off main thread"
 ```
 
