@@ -1,7 +1,14 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { contentHash } from '../yuqi-runtime/src/protocol.mjs';
+
+const VERIFIED_COMPILED_SUITES = new WeakSet();
+
+export function isVerifiedCompiledQualitySuite(value) {
+  return Boolean(value && typeof value === 'object' && VERIFIED_COMPILED_SUITES.has(value));
+}
 
 const VARIANT_KINDS = Object.freeze([
   'surface_rewording',
@@ -95,18 +102,56 @@ function materializeVariant(seed, coverage) {
   };
 }
 
-function assertAnnotationSource(scene, sources, rootDir) {
+function assertAnnotationSource(scene, sources, sourceGroundingIndex, rootDir) {
   const source = sources.sentinels?.[scene.sceneId] || sources.sentinels?.[scene.parentSentinelId];
   if (!source) throw new Error(`missing source map for ${scene.sceneId}`);
   if (source.file !== scene.sourceAnnotation.file || source.heading !== scene.sourceAnnotation.heading) {
     throw new Error(`source map mismatch for ${scene.sceneId}`);
   }
+  const index = sourceGroundingIndex.sentinels?.[scene.parentSentinelId || scene.sceneId];
+  if (!index || index.file !== source.file || index.heading !== source.heading) {
+    throw new Error(`source grounding mismatch for ${scene.sceneId}`);
+  }
   const markdownPath = join(rootDir, 'preset-references', source.file);
+  if (!existsSync(markdownPath)) return;
   const markdown = readFileSync(markdownPath, 'utf8');
   const heading = String(source.heading).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   if (!new RegExp(`^#{1,6}\\s+${heading}\\s*$`, 'm').test(markdown)) {
     throw new Error(`source heading not found for ${scene.sceneId}: ${source.file}#${source.heading}`);
   }
+}
+
+function validateSourceGroundingIndex(index, sources, rawSentinelSeeds) {
+  if (!index || index.schemaVersion !== 1 || !index.sentinels || Array.isArray(index.sentinels)) {
+    throw new Error('invalid source grounding index');
+  }
+  if (Object.keys(index).sort().join(',') !== 'schemaVersion,sentinels') {
+    throw new Error('source grounding index has unknown keys');
+  }
+  const sourceIds = Object.keys(sources.sentinels || {}).sort();
+  const indexIds = Object.keys(index.sentinels).sort();
+  if (indexIds.length !== 24 || indexIds.join('\u0000') !== sourceIds.join('\u0000')) {
+    throw new Error('source grounding sentinel set mismatch');
+  }
+  const rawById = new Map(rawSentinelSeeds.map(seed => [seed.sceneId, seed]));
+  for (const id of indexIds) {
+    const entry = index.sentinels[id];
+    if (!entry || Object.keys(entry).sort().join(',') !== 'file,heading,headingChecksum,sceneChecksum') {
+      throw new Error(`invalid source grounding entry for ${id}`);
+    }
+    const source = sources.sentinels[id];
+    const raw = rawById.get(id);
+    if (!source || !raw || entry.file !== source.file || entry.heading !== source.heading) {
+      throw new Error(`source grounding parent mismatch for ${id}`);
+    }
+    if (entry.headingChecksum !== contentHash(entry.heading) || entry.sceneChecksum !== contentHash(raw)) {
+      throw new Error(`source grounding checksum mismatch for ${id}`);
+    }
+    if (!/^[0-9a-f]{64}$/.test(entry.headingChecksum) || !/^[0-9a-f]{64}$/.test(entry.sceneChecksum)) {
+      throw new Error(`source grounding checksum format mismatch for ${id}`);
+    }
+  }
+  return index;
 }
 
 function validateScene(scene) {
@@ -171,16 +216,20 @@ function enrichScene(scene) {
     allowedPersonalityVariation: ['warm', 'teasing', 'reserved', 'brief'],
     expectedStateTransitions: { allow: ['create', 'maintain', 'soften', 'reverse'] },
     forbiddenStateTransitions: { hardConstraintFromYuqiPreference: true },
-    ...scene
+    ...scene,
+    rolloutKey: scene.rolloutKey || 'DIRECT_REPLY'
   };
 }
 
-export function compileQualitySuite({ rootDir = process.cwd(), checkOnly = false } = {}) {
+export function compileQualitySuite({ rootDir = process.cwd(), checkOnly = false, sourceGroundingIndex } = {}) {
   const suiteRoot = resolve(rootDir, 'tests/fixtures/yuqi-lived-quality-v1');
   const manifest = readJson(join(suiteRoot, 'manifest.json'));
-  const sentinelSeeds = readJsonLines(join(suiteRoot, 'sentinel-seeds.jsonl')).map(enrichScene);
+  const rawSentinelSeeds = readJsonLines(join(suiteRoot, 'sentinel-seeds.jsonl'));
+  const sentinelSeeds = rawSentinelSeeds.map(enrichScene);
   const coveragePlan = readJsonLines(join(suiteRoot, 'coverage-scenes.jsonl'));
   const sources = readJson(join(suiteRoot, 'sources.json'));
+  const groundingIndex = sourceGroundingIndex || readJson(join(suiteRoot, 'source-grounding-index.json'));
+  validateSourceGroundingIndex(groundingIndex, sources, rawSentinelSeeds);
   if (manifest.suitePurpose !== 'source_grounded_human_quality' || manifest.qualityEvidenceEligible !== true) {
     throw new Error('quality manifest does not declare source-grounded human quality purpose');
   }
@@ -192,7 +241,7 @@ export function compileQualitySuite({ rootDir = process.cwd(), checkOnly = false
   for (const scene of sentinelSeeds) {
     scene.turns = baseTurns(scene);
     validateScene(scene);
-    assertAnnotationSource(scene, sources, rootDir);
+    assertAnnotationSource(scene, sources, groundingIndex, rootDir);
   }
   const coverageScenes = coveragePlan.map(coverage => {
     const seed = seedById.get(coverage.parentSentinelId);
@@ -202,7 +251,7 @@ export function compileQualitySuite({ rootDir = process.cwd(), checkOnly = false
   const variantsByParent = new Map();
   for (const scene of coverageScenes) {
     validateScene(scene);
-    assertAnnotationSource(scene, sources, rootDir);
+    assertAnnotationSource(scene, sources, groundingIndex, rootDir);
     const list = variantsByParent.get(scene.parentSentinelId) || [];
     list.push(scene);
     variantsByParent.set(scene.parentSentinelId, list);
@@ -217,12 +266,32 @@ export function compileQualitySuite({ rootDir = process.cwd(), checkOnly = false
   }
   if (variantsByParent.size !== sentinelSeeds.length) throw new Error('a sentinel has no coverage variants');
   const coverageByRolloutKey = validateCoverageDistribution(coverageScenes);
-  return { manifest, sentinelSeeds, coverageScenes, sources, coverageByRolloutKey, checkOnly };
+  const compiledSuite = {
+    manifest,
+    sentinelSeeds,
+    coverageScenes,
+    sources,
+    sourceGroundingIndex: groundingIndex,
+    coverageByRolloutKey,
+    checkOnly
+  };
+  VERIFIED_COMPILED_SUITES.add(compiledSuite);
+  return compiledSuite;
 }
 
-if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+function cliOption(name) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
+}
+
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+
+if (isMain) {
   const checkOnly = process.argv.includes('--check');
-  const suite = compileQualitySuite({ checkOnly });
+  const rootDir = cliOption('--root') || process.cwd();
+  const indexPath = cliOption('--source-grounding-index');
+  const sourceGroundingIndex = indexPath ? readJson(resolve(rootDir, indexPath)) : undefined;
+  const suite = compileQualitySuite({ rootDir, checkOnly, sourceGroundingIndex });
   process.stdout.write(`${JSON.stringify({
     suiteId: suite.manifest.suiteId,
     sentinelCount: suite.sentinelSeeds.length,

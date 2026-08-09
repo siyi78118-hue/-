@@ -8961,8 +8961,11 @@ git commit -m "test: separate protocol and lived quality evidence"
 
 **Files:**
 - Create: `yuqi-runtime/src/quality-evaluator.mjs`
+- Create: `yuqi-runtime/src/quality-replay.mjs`
 - Modify: `yuqi-runtime/src/comparison-evaluator.mjs`
 - Create: `yuqi-runtime/test/quality-evaluator.test.mjs`
+- Create: `yuqi-runtime/test/quality-replay.test.mjs`
+- Create: `yuqi-runtime/test/quality-report.test.mjs`
 - Modify: `yuqi-runtime/test/comparison-evaluator.test.mjs`
 - Create: `scripts/run-yuqi-lived-quality-replay.mjs`
 - Create: `scripts/report-yuqi-lived-quality.mjs`
@@ -9218,7 +9221,7 @@ Add scripts:
 Run:
 
 ```powershell
-node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/comparison-evaluator.test.mjs
+node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/quality-report.test.mjs yuqi-runtime/test/comparison-evaluator.test.mjs
 node --test tests/yuqi-lived-quality-contract.test.mjs yuqi-runtime/test/replay-runner.test.mjs
 npm run cognition:quality:check
 npm run cognition:quality:replay -- --stable-from artifacts/yuqi-lived-agency-v3/baseline.json --candidate-preset 2.1.0
@@ -9236,7 +9239,7 @@ registering a production candidate; do not weaken gates.
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add yuqi-runtime/src/quality-evaluator.mjs yuqi-runtime/src/comparison-evaluator.mjs yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/comparison-evaluator.test.mjs scripts/run-yuqi-lived-quality-replay.mjs scripts/report-yuqi-lived-quality.mjs scripts/compile-yuqi-lived-quality-scenes.mjs tests/yuqi-lived-quality-contract.test.mjs tests/fixtures/yuqi-lived-quality-v1/source-grounding-index.json package.json
+git add yuqi-runtime/src/quality-evaluator.mjs yuqi-runtime/src/quality-replay.mjs yuqi-runtime/src/comparison-evaluator.mjs yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/quality-report.test.mjs yuqi-runtime/test/comparison-evaluator.test.mjs scripts/run-yuqi-lived-quality-replay.mjs scripts/report-yuqi-lived-quality.mjs scripts/compile-yuqi-lived-quality-scenes.mjs tests/yuqi-lived-quality-contract.test.mjs tests/fixtures/yuqi-lived-quality-v1/source-grounding-index.json package.json
 git commit -m "feat: gate Yuqi v3 with blind lived quality evidence"
 ```
 

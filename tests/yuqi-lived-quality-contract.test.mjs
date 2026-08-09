@@ -8,6 +8,22 @@ import { compileQualitySuite } from '../scripts/compile-yuqi-lived-quality-scene
 
 const rootDir = process.cwd();
 const protocolRoot = resolve(rootDir, 'tests/fixtures/yuqi-cognition-protocol-v1');
+const qualityRoot = resolve(rootDir, 'tests/fixtures/yuqi-lived-quality-v1');
+
+test('quality CLI package scripts are declared without production release registration', () => {
+  const packageJson = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
+  assert.equal(packageJson.scripts['cognition:quality:check'], 'node scripts/compile-yuqi-lived-quality-scenes.mjs --check');
+  assert.equal(packageJson.scripts['cognition:quality:replay'], 'node scripts/run-yuqi-lived-quality-replay.mjs');
+  assert.equal(packageJson.scripts['cognition:quality:report'], 'node scripts/report-yuqi-lived-quality.mjs');
+  const replaySource = readFileSync(resolve(rootDir, 'scripts/run-yuqi-lived-quality-replay.mjs'), 'utf8');
+  assert.match(replaySource, /--stable-from/);
+  assert.match(replaySource, /--candidate-preset/);
+  assert.match(replaySource, /--plan/);
+  const reportSource = readFileSync(resolve(rootDir, 'scripts/report-yuqi-lived-quality.mjs'), 'utf8');
+  for (const option of ['--plan', '--history', '--history-manifest', '--evidence', '--candidate-release', '--manual-review']) {
+    assert.match(reportSource, new RegExp(option.replaceAll('-', '\\-')));
+  }
+});
 
 function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
@@ -59,4 +75,58 @@ test('quality source map names all sentinels and only committed annotation headi
     assert.equal(source.file, scene.sourceAnnotation.file);
     assert.equal(source.heading, scene.sourceAnnotation.heading);
   }
+});
+
+test('source grounding index is a closed, exact 24-sentinel integrity manifest', () => {
+  const index = readJson(resolve(qualityRoot, 'source-grounding-index.json'));
+  assert.deepEqual(Object.keys(index).sort(), ['schemaVersion', 'sentinels']);
+  assert.equal(index.schemaVersion, 1);
+  assert.equal(Object.keys(index.sentinels).length, 24);
+  for (const [sceneId, entry] of Object.entries(index.sentinels)) {
+    assert.ok(sceneId && typeof sceneId === 'string');
+    assert.deepEqual(Object.keys(entry).sort(), [
+      'file', 'heading', 'headingChecksum', 'sceneChecksum'
+    ]);
+    assert.equal(typeof entry.file, 'string');
+    assert.equal(typeof entry.heading, 'string');
+    assert.match(entry.headingChecksum, /^[0-9a-f]{64}$/);
+    assert.match(entry.sceneChecksum, /^[0-9a-f]{64}$/);
+  }
+});
+
+test('compiled quality suite carries the committed source grounding index', () => {
+  const suite = compileQualitySuite({ rootDir, checkOnly: true });
+  const index = readJson(resolve(qualityRoot, 'source-grounding-index.json'));
+  assert.deepEqual(suite.sourceGroundingIndex, index);
+});
+
+test('source grounding index rejects a substituted scene checksum', () => {
+  const index = readJson(resolve(qualityRoot, 'source-grounding-index.json'));
+  const original = index.sentinels.first_sleep_deprived_still_working.sceneChecksum;
+  index.sentinels.first_sleep_deprived_still_working.sceneChecksum = '0'.repeat(64);
+  assert.notEqual(index.sentinels.first_sleep_deprived_still_working.sceneChecksum, original);
+  assert.throws(
+    () => compileQualitySuite({ rootDir, checkOnly: true, sourceGroundingIndex: index }),
+    /scene checksum|source grounding/i
+  );
+});
+
+test('source grounding index rejects missing, extra, and wrong-parent mappings', () => {
+  const index = readJson(resolve(qualityRoot, 'source-grounding-index.json'));
+  const missing = structuredClone(index);
+  delete missing.sentinels.first_sleep_deprived_still_working;
+  assert.throws(() => compileQualitySuite({ rootDir, sourceGroundingIndex: missing }), /sentinel set mismatch/);
+
+  const extra = structuredClone(index);
+  extra.sentinels.extra_sentinel = {
+    file: '真人聊天训练批注-第一轮.md',
+    heading: 'extra',
+    headingChecksum: '0'.repeat(64),
+    sceneChecksum: '0'.repeat(64)
+  };
+  assert.throws(() => compileQualitySuite({ rootDir, sourceGroundingIndex: extra }), /sentinel set mismatch/);
+
+  const wrongParent = structuredClone(index);
+  wrongParent.sentinels.first_i_miss_you = structuredClone(wrongParent.sentinels.first_sleep_deprived_still_working);
+  assert.throws(() => compileQualitySuite({ rootDir, sourceGroundingIndex: wrongParent }), /parent mismatch|checksum mismatch/);
 });
