@@ -79,6 +79,26 @@ public class ExecutionEngineTest {
     }
 
     @Test
+    public void roleDeleteAfterPrepareSuppressesNetworkDispatch() throws Exception {
+        FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));
+        store.rejectPreparedBridge = true;
+        TurnBridgeGateway gateway = new TurnBridgeGateway() {
+            @Override public boolean hasBridge() { return true; }
+            @Override public String bridgeDeviceId() { return "device-from-gateway"; }
+            @Override public BridgeResult executeBridgeTurn(TurnSubmission submission) {
+                store.bridgePreparationEvents.add("network");
+                return BridgeResult.skipped("codex", "{}");
+            }
+            @Override public String call(String configId, String system, JSONArray messages, int maxTokens) {
+                throw new AssertionError("legacy must not run");
+            }
+        };
+
+        assertTrue(new ExecutionEngine(store, gateway, new ReplyParser(), () -> 100L).runNext());
+        assertEquals("prepare", String.join(",", store.bridgePreparationEvents));
+    }
+
+    @Test
     public void parsedV3TerminalUsesOnlyTheCanonicalWriter() throws Exception {
         ChatTurnEntity turn = turn("QUEUED", null);
         turn.bridgeProtocolVersion = 3;
@@ -722,6 +742,7 @@ public class ExecutionEngineTest {
         final List<String> bridgePreparationEvents = new ArrayList<>();
         String preparedBridgeDeviceId;
         RuntimeException canonicalApplyFailure;
+        boolean rejectPreparedBridge;
 
         FakeStore(ChatTurnEntity turn, ExecutionAttemptEntity attempt) {
             this.turn = turn;
@@ -746,6 +767,10 @@ public class ExecutionEngineTest {
             bridgePreparationEvents.add("prepare");
             preparedBridgeDeviceId = bridgeDeviceId;
             return submission;
+        }
+
+        @Override public void assertBridgeSubmissionStillAllowed(TurnSubmission submission) {
+            if (rejectPreparedBridge) throw new IllegalStateException("role delete tombstone prevents bridge dispatch");
         }
 
         @Override public RoomExecutionStore.DeliveryDisposition commitBridgedTerminal(

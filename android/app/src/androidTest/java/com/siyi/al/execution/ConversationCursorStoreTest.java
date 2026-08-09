@@ -315,6 +315,94 @@ public class ConversationCursorStoreTest {
     }
 
     @Test
+    public void migration14To15CreatesDurableRoleNotificationCancellationQueue() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v14-v15-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase db = helper.getWritableDatabase();
+        AlExecutionDatabase.MIGRATION_12_13.migrate(db);
+        AlExecutionDatabase.MIGRATION_13_14.migrate(db);
+        db.execSQL("INSERT INTO lifecycle_controls (controlId, controlKind, characterId, peerId, requestedAt, semanticJson, semanticChecksum, state, leaseAttempt, updatedAt) VALUES ('ctl_keep_v15', 'role_delete_v1', 'yuqi', 'device-1', 100, '{}', '" + repeat('a', 64) + "', 'waiting', 0, 100)");
+
+        AlExecutionDatabase.MIGRATION_14_15.migrate(db);
+
+        assertTrue(hasTable(db, "role_notification_cancellations"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "cancellation_key"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "control_id"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "character_id"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "notification_id"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "intent_checksum"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "state"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "created_at"));
+        assertTrue(hasColumn(db, "role_notification_cancellations", "updated_at"));
+        assertEquals(1L, count(db, "lifecycle_controls"));
+        assertEquals(0L, count(db, "role_notification_cancellations"));
+        helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void migration10To15AndFresh15AreRestartStableAndNewerVersionRejects() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v10-v15-chain-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV10Helper(context, databaseName);
+        SupportSQLiteDatabase old = helper.getWritableDatabase();
+        old.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('chain-v15-turn', 'yuqi', 'chain-v15-message', 'DIRECT_REPLY', 'QUEUED', '{}', '{}', 1, 1)");
+        helper.close();
+        AlExecutionDatabase current = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .addMigrations(
+                AlExecutionDatabase.MIGRATION_10_11,
+                AlExecutionDatabase.MIGRATION_11_12,
+                AlExecutionDatabase.MIGRATION_12_13,
+                AlExecutionDatabase.MIGRATION_13_14,
+                AlExecutionDatabase.MIGRATION_14_15)
+            .allowMainThreadQueries().build();
+        SupportSQLiteDatabase upgraded = current.getOpenHelper().getWritableDatabase();
+        assertEquals(15L, userVersion(upgraded));
+        assertEquals(1L, count(upgraded, "chat_turns"));
+        assertTrue(hasTable(upgraded, "role_notification_cancellations"));
+        current.close();
+
+        AlExecutionDatabase reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .addMigrations(AlExecutionDatabase.MIGRATION_14_15).allowMainThreadQueries().build();
+        assertEquals(15L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+        reopened.close();
+        context.deleteDatabase(databaseName);
+
+        String freshName = "cursor-fresh-v15-" + System.nanoTime();
+        AlExecutionDatabase fresh = Room.databaseBuilder(context, AlExecutionDatabase.class, freshName)
+            .allowMainThreadQueries().build();
+        assertEquals(15L, userVersion(fresh.getOpenHelper().getWritableDatabase()));
+        assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "role_notification_cancellations"));
+        fresh.close();
+        context.deleteDatabase(freshName);
+
+        String newerName = "cursor-newer-v16-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper15 = new FrameworkSQLiteOpenHelperFactory().create(
+            SupportSQLiteOpenHelper.Configuration.builder(context)
+                .name(newerName)
+                .callback(new SupportSQLiteOpenHelper.Callback(16) {
+                    @Override public void onCreate(SupportSQLiteDatabase db) { }
+                    @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
+                })
+                .build()
+        );
+        helper15.getWritableDatabase();
+        helper15.close();
+        AlExecutionDatabase incompatible = Room.databaseBuilder(context, AlExecutionDatabase.class, newerName)
+            .allowMainThreadQueries().build();
+        try {
+            incompatible.getOpenHelper().getWritableDatabase();
+            fail("v16 must not silently downgrade or repair a newer database");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("downgrade"));
+        } finally {
+            incompatible.close();
+            context.deleteDatabase(newerName);
+        }
+    }
+
+    @Test
     public void migration13To14FailureAtIndexRollsBackTableAndPreservesV13Rows() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         String databaseName = "cursor-v13-v14-fault-" + System.nanoTime();
@@ -408,14 +496,14 @@ public class ConversationCursorStoreTest {
     @Test
     public void newerVersionIsNotSilentlyRepairedOrDowngraded() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        String databaseName = "cursor-newer-v15-" + System.nanoTime();
+        String databaseName = "cursor-newer-v16-" + System.nanoTime();
         SupportSQLiteOpenHelper helper12 = createV12UpgradeHelper(context, databaseName);
         helper12.getWritableDatabase();
         helper12.close();
         SupportSQLiteOpenHelper helper14 = new FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(context)
                 .name(databaseName)
-                .callback(new SupportSQLiteOpenHelper.Callback(15) {
+                .callback(new SupportSQLiteOpenHelper.Callback(16) {
                     @Override public void onCreate(SupportSQLiteDatabase db) { }
                     @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
                 })

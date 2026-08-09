@@ -80,6 +80,31 @@ public class ExecutionServicePolicyTest {
     }
 
     @Test
+    public void roleDeletedCompletedTurnSkipsOrdinaryCloudAndSemanticSideEffects() {
+        assertFalse(ExecutionServicePolicy.shouldRunCompletedTurnSideEffects(true));
+        assertTrue(ExecutionServicePolicy.shouldRunCompletedTurnSideEffects(false));
+    }
+
+    @Test
+    public void everyCompletedTurnStageIsFencedBeforeAndAfterTheSideEffect() {
+        final boolean[] deleted = new boolean[] { false };
+        final int[] calls = new int[] { 0 };
+        assertFalse(ExecutionServicePolicy.runFencedCompletedTurnStage(
+            () -> deleted[0], () -> { calls[0] += 1; deleted[0] = true; }));
+        assertEquals(1, calls[0]);
+
+        deleted[0] = true;
+        assertFalse(ExecutionServicePolicy.runFencedCompletedTurnStage(
+            () -> deleted[0], () -> calls[0] += 1));
+        assertEquals(1, calls[0]);
+
+        deleted[0] = false;
+        assertTrue(ExecutionServicePolicy.runFencedCompletedTurnStage(
+            () -> deleted[0], () -> calls[0] += 1));
+        assertEquals(2, calls[0]);
+    }
+
+    @Test
     public void lifecycleWakePolicyUsesLeaseAndRefreshExpiryInsteadOfTurnRecovery() {
         LifecycleControl pending = new LifecycleControl(
             "ctl_" + repeat('a'), LifecycleControl.CLEAR_KIND, "yuqi", "device-1",
@@ -94,6 +119,13 @@ public class ExecutionServicePolicyTest {
         assertEquals(
             100_000_000L - LifecycleControlSender.REFRESH_WINDOW_MILLIS,
             LifecycleControlSender.nextEligibleAt(accepted, 1_000L));
+
+        LifecycleControl roleDelete = new LifecycleControl(
+            "ctl_" + repeat('d'), LifecycleControl.ROLE_DELETE_KIND, "yuqi", "device-1",
+            null, null, 100L, "{}", repeat('e'), LifecycleControl.WAITING,
+            null, 0L, null, null, null, null, 100L);
+        assertEquals(0L, ExecutionRuntime.nextLifecycleDelayForControls(
+            java.util.Collections.singletonList(roleDelete), 1_000L));
     }
 
     @Test

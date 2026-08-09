@@ -81,6 +81,30 @@ public class LifecycleControlSenderTest {
     }
 
     @Test
+    public void roleDeleteAppliedAckIsTheClosedNineFieldReceiptBoundToBackup() throws Exception {
+        LifecycleControl control = roleDeleteControl(
+            LifecycleControl.WAITING, null, null, null, null, 0L);
+        JSONObject ack = LifecycleControlSender.encodeAppliedAck(control, 300L);
+
+        LifecycleControlSender.validateAppliedAckShape(ack);
+        LifecycleControlSender.validateAppliedAck(ack, control);
+        assertEquals(9, ack.length());
+        assertEquals("ROLE_DELETE_APPLIED", ack.getString("type"));
+        assertEquals(
+            new JSONObject(control.semanticJson).getJSONObject("backupReceipt").getString("receiptId"),
+            ack.getString("backupReceiptId"));
+        assertFalse(ack.has("clearEpoch"));
+        assertFalse(ack.has("clearedThroughSequence"));
+
+        JSONObject changedReceipt = new JSONObject(ack.toString())
+            .put("backupReceiptId", "backup_yuqi_2");
+        changedReceipt.put("checksum", BridgeAuthority.sha256CanonicalJson(
+            without(changedReceipt, "checksum")));
+        assertThrows(IllegalArgumentException.class,
+            () -> LifecycleControlSender.validateAppliedAck(changedReceipt, control));
+    }
+
+    @Test
     public void appliedAckShapeIsSelfContainedAndRejectsNativeCoercion() throws Exception {
         LifecycleControl control = control(
             LifecycleControl.WAITING, null, null, null, null, 0L);
@@ -146,16 +170,14 @@ public class LifecycleControlSenderTest {
     }
 
     @Test
-    public void roleDeleteIsNeverSentByTheConversationClearDrain() throws Exception {
-        LifecycleControl roleDelete = new LifecycleControl(
-            "ctl_" + repeat('a'), LifecycleControl.ROLE_DELETE_KIND, "yuqi", "device-1",
-            null, null, 100L, "{}", repeat('b'), LifecycleControl.WAITING, null, 0L,
-            null, null, null, null, 100L);
+    public void roleDeleteIsSentAndAppliedByTheSharedLifecycleDrain() throws Exception {
+        LifecycleControl roleDelete = roleDeleteControl(
+            LifecycleControl.WAITING, null, null, null, null, 0L);
         int[] applyCalls = {0};
         ExecutionStore store = fakeStore(roleDelete, applyCalls, new int[] {0}, new int[] {0});
         int[] routeCalls = {0};
 
-        assertFalse(LifecycleControlSender.drainOne(
+        assertTrue(LifecycleControlSender.drainOne(
             store,
             (ignored, relayId, idempotency, expiresAt) -> {
                 routeCalls[0] += 1;
@@ -164,8 +186,34 @@ public class LifecycleControlSenderTest {
             false,
             1_000L
         ));
-        assertEquals(0, routeCalls[0]);
+        assertEquals(1, routeCalls[0]);
+        assertEquals(1, applyCalls[0]);
+    }
+
+    @Test
+    public void roleDeleteLanPendingProofKeepsTheClaimForRetryWithoutCloudFallback() throws Exception {
+        LifecycleControl roleDelete = roleDeleteControl(
+            LifecycleControl.WAITING, null, null, null, null, 0L);
+        int[] applyCalls = {0};
+        int[] lanCalls = {0};
+        int[] cloudCalls = {0};
+        ExecutionStore store = fakeStore(roleDelete, applyCalls, new int[] {0}, new int[] {0});
+
+        assertFalse(LifecycleControlSender.drainOneAuto(
+            store,
+            (ignored, relayId, idempotency, expiresAt) -> {
+                lanCalls[0] += 1;
+                return new LifecycleControlSender.ControlDelivery(false, null, 0L, 0L);
+            },
+            (ignored, relayId, idempotency, expiresAt) -> {
+                cloudCalls[0] += 1;
+                return new LifecycleControlSender.ControlDelivery(false, relayId, expiresAt);
+            },
+            1_000L
+        ));
+        assertEquals(1, lanCalls[0]);
         assertEquals(0, applyCalls[0]);
+        assertEquals(0, cloudCalls[0]);
     }
 
     @Test
@@ -295,6 +343,37 @@ public class LifecycleControlSenderTest {
             "ctl_" + repeat(leaseAttempt == 0L ? 'a' : 'c'), LifecycleControl.CLEAR_KIND, "yuqi", "device-1",
             1L, 7L, 100L, "{}", repeat(leaseAttempt == 0L ? 'b' : 'd'), state, leaseId, leaseAttempt,
             leasedAt, relayId, null, relayExpiresAt, 100L
+        );
+    }
+
+    private static LifecycleControl roleDeleteControl(
+        String state, String leaseId, Long leasedAt, String relayId,
+        Long relayExpiresAt, long leaseAttempt
+    ) throws Exception {
+        JSONObject idBasis = new JSONObject()
+            .put("contract", "yuqi-backup-receipt-id-v1")
+            .put("roleId", "yuqi")
+            .put("manifestChecksum", repeat('1'))
+            .put("snapshotSha256", repeat('2'))
+            .put("logicalChecksum", repeat('3'))
+            .put("createdAt", 90L);
+        JSONObject receipt = new JSONObject()
+            .put("receiptVersion", "yuqi-backup-receipt-v1")
+            .put("receiptId", "bkrcpt_"
+                + BridgeAuthority.sha256CanonicalJson(idBasis).substring(0, 24))
+            .put("roleId", "yuqi")
+            .put("manifestChecksum", repeat('1'))
+            .put("snapshotSha256", repeat('2'))
+            .put("logicalChecksum", repeat('3'))
+            .put("createdAt", 90L);
+        receipt.put("receiptChecksum", BridgeAuthority.sha256CanonicalJson(
+            without(receipt, "receiptChecksum")));
+        LifecycleControlCodec.Encoded encoded = LifecycleControlCodec.encodeRoleDelete(
+            "yuqi", "device-1", 100L, receipt);
+        return new LifecycleControl(
+            encoded.controlId, LifecycleControl.ROLE_DELETE_KIND, "yuqi", "device-1",
+            null, null, 100L, encoded.semantic.toString(), encoded.semanticChecksum,
+            state, leaseId, leaseAttempt, leasedAt, relayId, null, relayExpiresAt, 100L
         );
     }
 

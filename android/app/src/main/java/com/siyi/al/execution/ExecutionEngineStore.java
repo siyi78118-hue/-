@@ -12,6 +12,10 @@ public interface ExecutionEngineStore {
     ChatTurnEntity turn(String turnId);
     ExecutionAttemptEntity activeAttempt(String turnId);
     TurnSubmission prepareBridgeSubmission(TurnSubmission base, String bridgeDeviceId, long now);
+    /** Re-check retained lifecycle tombstones immediately before network dispatch. */
+    default void assertBridgeSubmissionStillAllowed(TurnSubmission submission) {
+        // Legacy test stores and non-Room adapters have no lifecycle authority.
+    }
     RoomExecutionStore.DeliveryDisposition commitBridgedTerminal(
         String turnId, String attemptId, BridgeResult result, long now);
     RoomExecutionStore.DeliveryDisposition commitAndroidFallback(

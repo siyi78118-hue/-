@@ -65,6 +65,34 @@ public class BridgeClientTest {
         assertFalse(transport.bodies.get(0).contains("reply_json"));
     }
 
+    @Test public void roleDeleteLanRouteDistinguishesPendingFromFinalApplied() throws Exception {
+        LifecycleControl roleDelete = roleDeleteControl(
+            LifecycleControl.WAITING, null, null, null, null);
+
+        FakeTransport pendingTransport = new FakeTransport();
+        pendingTransport.responses.add(new BridgeClient.HttpResult(202,
+            roleDeletePending(roleDelete, 2L).toString()));
+        BridgeClient pendingClient = new BridgeClient(
+            config("http://lan.example"), null, pendingTransport, () -> 1784400000000L,
+            millis -> {}, null);
+        LifecycleControlSender.ControlDelivery pending = pendingClient.lifecycleControlRoute(false)
+            .send(roleDelete, "relay-ignored", "idem-ignored", 1784486400000L);
+        assertFalse(pending.applied);
+        assertEquals("http://lan.example/v3/controls/role-delete",
+            pendingTransport.targets.get(0));
+
+        FakeTransport appliedTransport = new FakeTransport();
+        appliedTransport.responses.add(new BridgeClient.HttpResult(200,
+            LifecycleControlSender.encodeAppliedAck(roleDelete, 1784400000100L).toString()));
+        BridgeClient appliedClient = new BridgeClient(
+            config("http://lan.example"), null, appliedTransport, () -> 1784400000000L,
+            millis -> {}, null);
+        LifecycleControlSender.ControlDelivery applied = appliedClient.lifecycleControlRoute(false)
+            .send(roleDelete, "relay-ignored", "idem-ignored", 1784486400000L);
+        assertTrue(applied.applied);
+        assertEquals(1784400000100L, applied.appliedAt);
+    }
+
     @Test public void verifiedBackupUsesOneClosedSignedLanRequestAndValidatesTheReceipt() throws Exception {
         FakeTransport transport = new FakeTransport();
         JSONObject receipt = backupReceipt("yuqi", 1784400000100L);
@@ -1273,6 +1301,38 @@ public class BridgeClientTest {
             state, leaseId, leaseId == null ? 0L : 1L, leasedAt, relayMessageId, null,
             relayExpiresAt, requestedAt
         );
+    }
+
+    private static LifecycleControl roleDeleteControl(
+        String state, String leaseId, Long leasedAt, String relayMessageId, Long relayExpiresAt
+    ) throws Exception {
+        long requestedAt = 1_784_400_000_000L;
+        JSONObject receipt = backupReceipt("yuqi", requestedAt - 100L);
+        LifecycleControlCodec.Encoded encoded = LifecycleControlCodec.encodeRoleDelete(
+            "yuqi", "device_123456", requestedAt, receipt);
+        return new LifecycleControl(
+            encoded.controlId, LifecycleControl.ROLE_DELETE_KIND, "yuqi", "device_123456",
+            null, null, requestedAt, encoded.semantic.toString(), encoded.semanticChecksum,
+            state, leaseId, leaseId == null ? 0L : 1L, leasedAt, relayMessageId, null,
+            relayExpiresAt, requestedAt
+        );
+    }
+
+    private static JSONObject roleDeletePending(
+        LifecycleControl control, long pendingRetractions
+    ) throws Exception {
+        JSONObject pending = new JSONObject()
+            .put("protocolVersion", 3L)
+            .put("type", "ROLE_DELETE_PENDING")
+            .put("controlId", control.controlId)
+            .put("controlChecksum", new JSONObject(control.semanticJson).getString("checksum"))
+            .put("roleId", control.characterId)
+            .put("peerId", control.peerId)
+            .put("state", "pending_retractions")
+            .put("pendingRetractions", pendingRetractions)
+            .put("requestedAt", control.requestedAt);
+        pending.put("checksum", BridgeAuthority.sha256CanonicalJson(pending));
+        return pending;
     }
 
     private static BridgeClient receiptClient(FakeTransport transport, MutableTime time) {

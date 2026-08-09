@@ -4,6 +4,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
@@ -35,11 +36,14 @@ import com.siyi.al.execution.bridge.BridgeClient;
 import com.siyi.al.execution.bridge.FallbackJournal;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.UUID;
 import java.lang.reflect.Method;
 import org.json.JSONObject;
@@ -150,6 +154,499 @@ public class RoomExecutionStoreTest {
         assertThrows(IllegalStateException.class, () -> configured.createRoleDelete(
             "yuqi", "device_gateway", cursorChecksum, changedReceipt, 404L, null));
         assertEquals(1L, rowCount("lifecycle_controls"));
+        assertThrows(IllegalStateException.class, () -> configured.submitTurn(
+            yuqiThreeBubbleSubmission("late-after-role-delete", "msg-late-role-delete", 405L)));
+        assertEquals(0L, rowCount("chat_turns"));
+    }
+
+    @Test
+    public void roleDeleteCancelsEveryDeterministicMessageNotificationOnlyAfterTurnRowsAreRemoved()
+        throws Exception {
+        String firstTurnId = "task20e-role-delete-notification-first";
+        String secondTurnId = "task20e-role-delete-notification-second";
+        store.submitTurn(new TurnSubmission(
+            firstTurnId, "yuqi", "task20e-role-delete-notification-first-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"你好\"}", "{\"messages\":[]}", null, 1L));
+        store.submitTurn(new TurnSubmission(
+            secondTurnId, "yuqi", "task20e-role-delete-notification-second-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"你好\"}", "{\"messages\":[]}", null, 2L));
+        ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", cursor);
+        JSONObject receipt = backupReceipt("yuqi", 410L);
+        List<Integer> cancelled = new ArrayList<>();
+        boolean[] sawRowsAfterRemoval = {false};
+
+        RoomExecutionStore configured = new RoomExecutionStore(database, "device_gateway");
+        LifecycleControl control = configured.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, receipt, 411L,
+            null,
+            notificationId -> {
+                sawRowsAfterRemoval[0] = sawRowsAfterRemoval[0]
+                    || database.executionDao().turnIdsForCharacter("yuqi").isEmpty();
+                cancelled.add(notificationId);
+            }
+        );
+
+        assertNotNull(control);
+        assertTrue(sawRowsAfterRemoval[0]);
+        assertEquals(
+            Arrays.asList(
+                AlNotificationFactory.messageNotificationId(firstTurnId),
+                AlNotificationFactory.messageNotificationId(secondTurnId)
+            ),
+            cancelled
+        );
+        assertEquals(0, database.executionDao().turnIdsForCharacter("yuqi").size());
+    }
+
+    @Test
+    public void collidingNotificationIdsProduceOneDurableCancellationIntent() throws Exception {
+        String firstTurnId = "task20e-role-delete-collision-Aa";
+        String secondTurnId = "task20e-role-delete-collision-BB";
+        assertEquals(
+            AlNotificationFactory.messageNotificationId(firstTurnId),
+            AlNotificationFactory.messageNotificationId(secondTurnId));
+        store.submitTurn(new TurnSubmission(
+            firstTurnId, "yuqi", "task20e-role-delete-collision-first-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"一\"}", "{\"messages\":[]}", null, 1L));
+        store.submitTurn(new TurnSubmission(
+            secondTurnId, "yuqi", "task20e-role-delete-collision-second-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"二\"}", "{\"messages\":[]}", null, 2L));
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+
+        LifecycleControl control = store.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, backupReceipt("yuqi", 415L), 416L, null);
+
+        assertNotNull(control);
+        assertEquals(1L, database.executionDao().roleNotificationCancellationCount());
+        assertEquals(0, database.executionDao().turnIdsForCharacter("yuqi").size());
+    }
+
+    @Test
+    public void roleDeleteDurablyQueuesNotificationsAndDrainsOnlyAfterCommit() throws Exception {
+        String firstTurnId = "task20e-role-delete-queue-first";
+        String secondTurnId = "task20e-role-delete-queue-second";
+        store.submitTurn(new TurnSubmission(
+            firstTurnId, "yuqi", "task20e-role-delete-queue-first-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"一\"}", "{\"messages\":[]}", null, 1L));
+        store.submitTurn(new TurnSubmission(
+            secondTurnId, "yuqi", "task20e-role-delete-queue-second-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"二\"}", "{\"messages\":[]}", null, 2L));
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        LifecycleControl control = store.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, backupReceipt("yuqi", 420L), 421L, null);
+
+        assertNotNull(control);
+        assertEquals(2L, database.executionDao().roleNotificationCancellationCount());
+        assertEquals(
+            2,
+            store.drainPendingRoleNotificationCancellations(notificationId -> {
+                assertEquals(0, database.executionDao().turnIdsForCharacter("yuqi").size());
+            })
+        );
+        assertEquals(0L, database.executionDao().roleNotificationCancellationCount());
+    }
+
+    @Test
+    public void notificationCancellationFailureLeavesWaitingIntentForIdempotentRetry() throws Exception {
+        String turnId = "task20e-role-delete-queue-retry";
+        store.submitTurn(new TurnSubmission(
+            turnId, "yuqi", "task20e-role-delete-queue-retry-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"重试\"}", "{\"messages\":[]}", null, 1L));
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        store.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, backupReceipt("yuqi", 430L), 431L, null);
+
+        assertThrows(RuntimeException.class, () ->
+            store.drainPendingRoleNotificationCancellations(notificationId -> {
+                throw new IllegalStateException("notification manager unavailable");
+            }));
+        assertEquals(1L, database.executionDao().roleNotificationCancellationCount());
+        assertEquals(1, store.drainPendingRoleNotificationCancellations(notificationId -> {}));
+        assertEquals(0L, database.executionDao().roleNotificationCancellationCount());
+    }
+
+    @Test
+    public void roleDeleteFaultRollsBackCancellationIntentsAndDoesNotCallCanceller() throws Exception {
+        String turnId = "task20e-role-delete-queue-fault";
+        store.submitTurn(new TurnSubmission(
+            turnId, "yuqi", "task20e-role-delete-queue-fault-message",
+            TurnKind.DIRECT_REPLY, "{\"text\":\"故障\"}", "{\"messages\":[]}", null, 1L));
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        RoomExecutionStore faulted = new RoomExecutionStore(database, "device_gateway", boundary -> {
+            if ("role_delete_control".equals(boundary)) {
+                throw new IllegalStateException("fault after cancellation intents");
+            }
+        });
+        int[] cancellerCalls = {0};
+        assertThrows(IllegalStateException.class, () -> faulted.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, backupReceipt("yuqi", 440L), 441L,
+            null, notificationId -> cancellerCalls[0]++));
+        assertEquals(0, cancellerCalls[0]);
+        assertEquals(0L, database.executionDao().roleNotificationCancellationCount());
+        assertEquals(0L, rowCount("lifecycle_controls"));
+        assertEquals(1, database.executionDao().turnIdsForCharacter("yuqi").size());
+    }
+
+    @Test
+    public void rolePlanAndAutomaticDispatchWaitForRoleDeleteGateBeforeCreatingRows() throws Exception {
+        final String characterId = "yuqi";
+        final long now = 900L;
+        RolePlanEntity plan = new RolePlanEntity();
+        plan.planId = "task20e-gated-role-plan";
+        plan.characterId = characterId;
+        plan.status = "active";
+        plan.planJson = "{\"type\":\"private_message\",\"source\":\"spoken\"}";
+        plan.nextRunAt = 899L;
+        plan.updatedAt = 899L;
+        database.executionDao().upsertRolePlans(Collections.singletonList(plan));
+        CharacterSnapshotEntity rolePlanSnapshot = new CharacterSnapshotEntity();
+        rolePlanSnapshot.snapshotId = characterId + ":role-plan:" + plan.planId;
+        rolePlanSnapshot.characterId = characterId;
+        rolePlanSnapshot.characterName = "虞栖";
+        rolePlanSnapshot.playerName = "姜隽倚";
+        rolePlanSnapshot.systemPrompt = "{}";
+        rolePlanSnapshot.momentSystemPrompt = "{}";
+        rolePlanSnapshot.chatConfigId = "chat";
+        rolePlanSnapshot.memoryConfigId = "memory";
+        rolePlanSnapshot.createdAt = 898L;
+        rolePlanSnapshot.contextJson = "{}";
+        database.executionDao().upsertSnapshot(rolePlanSnapshot);
+
+        CharacterSnapshotEntity automaticSnapshot = new CharacterSnapshotEntity();
+        automaticSnapshot.snapshotId = characterId + ":chat";
+        automaticSnapshot.characterId = characterId;
+        automaticSnapshot.characterName = "虞栖";
+        automaticSnapshot.playerName = "姜隽倚";
+        automaticSnapshot.systemPrompt = "{}";
+        automaticSnapshot.momentSystemPrompt = "{}";
+        automaticSnapshot.chatConfigId = "chat";
+        automaticSnapshot.memoryConfigId = "memory";
+        automaticSnapshot.createdAt = 897L;
+        automaticSnapshot.jobSnapshot = true;
+        automaticSnapshot.automaticTasksEnabled = true;
+        automaticSnapshot.automaticKind = "chat";
+        automaticSnapshot.cloudJobId = "task20e-gated-automatic";
+        automaticSnapshot.scheduledFor = 899L;
+        automaticSnapshot.contextJson = "{}";
+        database.executionDao().upsertSnapshot(automaticSnapshot);
+
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            characterId, database.executionDao().conversationCursor(characterId));
+        JSONObject receipt = backupReceipt(characterId, 901L);
+        CountDownLatch gateEntered = new CountDownLatch(1);
+        CountDownLatch dispatchesStarted = new CountDownLatch(1);
+        CountDownLatch releaseGate = new CountDownLatch(1);
+        ExecutorService workers = Executors.newFixedThreadPool(3);
+        try {
+            Future<Boolean> held = workers.submit(() -> store.runRoleSideEffectIfNotDeleted(
+                characterId,
+                () -> {
+                    gateEntered.countDown();
+                    try {
+                        if (!dispatchesStarted.await(2, TimeUnit.SECONDS)) {
+                            throw new AssertionError("dispatch start timed out");
+                        }
+                        store.createRoleDelete(
+                            characterId, "device_gateway", cursorChecksum, receipt, 902L, null);
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(error);
+                    }
+                }
+            ));
+            assertTrue(gateEntered.await(2, TimeUnit.SECONDS));
+            Future<Integer> rolePlanDispatch = workers.submit(
+                () -> new RolePlanCoordinator(database).dispatchDue(now));
+            Future<Integer> automaticDispatch = workers.submit(
+                () -> new AutomaticTaskCoordinator(database).dispatchDue(now));
+            Thread.sleep(100L);
+            assertFalse(rolePlanDispatch.isDone());
+            assertFalse(automaticDispatch.isDone());
+            assertEquals(0L, rowCount("chat_turns"));
+            assertEquals(0L, rowCount("role_plan_occurrences"));
+            dispatchesStarted.countDown();
+            releaseGate.countDown();
+            assertFalse(held.get(2, TimeUnit.SECONDS));
+            assertEquals(0, rolePlanDispatch.get(2, TimeUnit.SECONDS).intValue());
+            assertEquals(0, automaticDispatch.get(2, TimeUnit.SECONDS).intValue());
+            assertTrue(store.isRoleDeleteTombstoned(characterId));
+            assertEquals(0L, rowCount("chat_turns"));
+            assertEquals(0L, rowCount("role_plan_occurrences"));
+            assertEquals(0L, rowCount("diagnostics"));
+        } finally {
+            releaseGate.countDown();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    public void retainedRoleDeleteTombstoneBlocksLateSemanticFinalizersAndDirectGate()
+        throws Exception {
+        String turnId = "task20e-gate-turn";
+        store.submitTurn(submission(turnId, "task20e-gate-message"));
+        String attemptId = store.activeAttempt(turnId).attemptId;
+        insertRoleDeleteTombstone("char-1", 100L);
+
+        ReplyPartEntity part = new ReplyPartEntity();
+        part.replyPartId = "task20e-gate-part";
+        part.turnId = turnId;
+        part.attemptId = attemptId;
+        part.sequence = 0;
+        part.type = "TEXT";
+        part.content = "迟到语义";
+        part.payloadJson = "{}";
+        part.createdAt = 101L;
+
+        assertThrows(IllegalStateException.class,
+            () -> store.commitReply(turnId, attemptId, Collections.singletonList(part), 102L));
+        assertThrows(IllegalStateException.class,
+            () -> store.commitSkip(turnId, attemptId, 103L));
+        assertThrows(IllegalStateException.class,
+            () -> store.markNotificationShown(turnId, 104L));
+        assertThrows(IllegalStateException.class,
+            () -> store.acknowledgeUiApplied(turnId, 105L));
+        assertThrows(IllegalStateException.class,
+            () -> store.markCloudConfirmed(turnId, 106L));
+        assertThrows(IllegalStateException.class,
+            () -> store.assertRoleAcceptsSemanticWrite("char-1"));
+
+        assertEquals(TurnState.QUEUED.name(), store.turn(turnId).state);
+        assertEquals(0L, rowCount("reply_parts"));
+    }
+
+    @Test
+    public void roleDeleteCompetesWithStoreOwnedSideEffectGateWithoutCheckToRunRace()
+        throws Exception {
+        String characterId = "yuqi";
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            characterId, database.executionDao().conversationCursor(characterId));
+        JSONObject receipt = backupReceipt(characterId, 130L);
+        CountDownLatch effectStarted = new CountDownLatch(1);
+        CountDownLatch releaseEffect = new CountDownLatch(1);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<Boolean> sideEffect = workers.submit(() -> store.runRoleSideEffectIfNotDeleted(
+                characterId,
+                () -> {
+                    effectStarted.countDown();
+                    try {
+                        if (!releaseEffect.await(2, TimeUnit.SECONDS)) {
+                            throw new AssertionError("effect release timed out");
+                        }
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(error);
+                    }
+                }
+            ));
+            assertTrue(effectStarted.await(2, TimeUnit.SECONDS));
+            Future<LifecycleControl> delete = workers.submit(() -> store.createRoleDelete(
+                characterId, "device_gateway", cursorChecksum, receipt, 131L, null));
+            Thread.sleep(100L);
+            assertFalse(delete.isDone());
+            releaseEffect.countDown();
+            assertTrue(sideEffect.get(2, TimeUnit.SECONDS));
+            assertNotNull(delete.get(2, TimeUnit.SECONDS));
+            assertTrue(store.isRoleDeleteTombstoned(characterId));
+        } finally {
+            releaseEffect.countDown();
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    public void suppressRoleDeletedCompletedTurnHidesItAcrossRestartWithoutSemanticWrites()
+        throws Exception {
+        String turnId = "task20e-suppress-completed";
+        store.submitTurn(submission(turnId, "task20e-suppress-message"));
+        store.commitSkip(turnId, store.activeAttempt(turnId).attemptId, 120L);
+        int diagnosticsBefore = database.executionDao().latestDiagnostics(100).size();
+        insertRoleDeleteTombstone("char-1", 121L);
+
+        assertTrue(store.suppressRoleDeletedTurn(turnId, "char-1", 122L));
+        ChatTurnEntity suppressed = store.turn(turnId);
+        assertEquals(TurnState.COMPLETED.name(), suppressed.state);
+        assertEquals(Long.valueOf(122L), suppressed.deletedAt);
+        assertEquals(0, store.recentCompletedTurns(50).size());
+        assertEquals(0, store.unappliedCompletedTurns(50).size());
+        assertEquals(diagnosticsBefore, database.executionDao().latestDiagnostics(100).size());
+
+        RoomExecutionStore restarted = new RoomExecutionStore(database, "device_gateway");
+        assertEquals(0, restarted.recentCompletedTurns(50).size());
+        assertTrue(restarted.suppressRoleDeletedTurn(turnId, "char-1", 123L));
+        assertEquals(Long.valueOf(122L), restarted.turn(turnId).deletedAt);
+    }
+
+    @Test
+    public void suppressRoleDeletedTurnAllowsAppliedOrMissingReplayButRejectsForeignAndUntombstoned()
+        throws Exception {
+        String appliedTurnId = "task20e-suppress-applied";
+        store.submitTurn(submission(appliedTurnId, "task20e-applied-message"));
+        store.commitSkip(appliedTurnId, store.activeAttempt(appliedTurnId).attemptId, 130L);
+        insertRoleDeleteTombstone("char-1", 131L);
+        assertTrue(store.suppressRoleDeletedTurn(appliedTurnId, "char-1", 132L));
+        database.executionDao().deleteTurnsForRole("char-1");
+        assertTrue(store.suppressRoleDeletedTurn(appliedTurnId, "char-1", 133L));
+
+        String liveTurnId = "task20e-suppress-foreign";
+        store.submitTurn(new TurnSubmission(
+            liveTurnId, "char-2", "task20e-foreign-message", TurnKind.DIRECT_REPLY,
+            "{}", "{}", null, 134L));
+        assertThrows(IllegalStateException.class,
+            () -> store.suppressRoleDeletedTurn(liveTurnId, "char-1", 134L));
+        assertNull(store.turn(liveTurnId).deletedAt);
+
+        assertThrows(IllegalStateException.class,
+            () -> store.suppressRoleDeletedTurn(liveTurnId, "char-2", 135L));
+        assertNull(store.turn(liveTurnId).deletedAt);
+    }
+
+    @Test
+    public void rolePlanQueueCreatesOccurrenceAndTurnInOneStoreTransaction() throws Exception {
+        RolePlanOccurrenceEntity occurrence = new RolePlanOccurrenceEntity();
+        occurrence.occurrenceId = "task20e-atomic-occurrence";
+        occurrence.planId = "task20e-atomic-plan";
+        occurrence.characterId = "char-1";
+        occurrence.state = "CLAIMED";
+        occurrence.turnId = "task20e-atomic-turn";
+        occurrence.jobId = "job-atomic";
+        occurrence.scheduledFor = 200L;
+        occurrence.claimedAt = 201L;
+        occurrence.updatedAt = 201L;
+        TurnSubmission turn = new TurnSubmission(
+            occurrence.turnId, "char-1", occurrence.occurrenceId, TurnKind.ROLE_PLAN_CHAT,
+            "{\"planId\":\"task20e-atomic-plan\"}", "{}", occurrence.jobId, 201L);
+
+        insertRoleDeleteTombstone("char-1", 199L);
+        assertThrows(IllegalStateException.class,
+            () -> store.submitRolePlanOccurrence(occurrence, turn));
+        assertEquals(0L, rowCount("role_plan_occurrences"));
+        assertEquals(0L, rowCount("chat_turns"));
+        assertEquals(0L, rowCount("diagnostics"));
+    }
+
+    @Test
+    public void rolePlanQueueAtomicallyPersistsOccurrenceTurnAttemptAndClaimDiagnostic() {
+        RolePlanOccurrenceEntity occurrence = new RolePlanOccurrenceEntity();
+        occurrence.occurrenceId = "task20e-atomic-positive-occurrence";
+        occurrence.planId = "task20e-atomic-positive-plan";
+        occurrence.characterId = "char-1";
+        occurrence.state = "CLAIMED";
+        occurrence.turnId = "task20e-atomic-positive-turn";
+        occurrence.jobId = "job-atomic-positive";
+        occurrence.scheduledFor = 210L;
+        occurrence.claimedAt = 211L;
+        occurrence.updatedAt = 211L;
+        TurnSubmission turnSubmission = new TurnSubmission(
+            occurrence.turnId, occurrence.characterId, occurrence.occurrenceId,
+            TurnKind.ROLE_PLAN_CHAT, "{\"planId\":\"task20e-atomic-positive-plan\"}",
+            "{}", occurrence.jobId, 211L);
+
+        ChatTurnEntity turn = store.submitRolePlanOccurrence(occurrence, turnSubmission);
+
+        assertNotNull(turn);
+        assertNotNull(store.turn(occurrence.turnId));
+        assertNotNull(store.activeAttempt(occurrence.turnId));
+        assertNotNull(database.executionDao().rolePlanOccurrence(occurrence.occurrenceId));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "ROLE_PLAN_CLAIMED", "role-plan occurrence claimed"));
+    }
+
+    @Test
+    public void rolePlanAtomicFaultRollsBackOccurrenceTurnAttemptAndDiagnostic() {
+        RolePlanOccurrenceEntity occurrence = new RolePlanOccurrenceEntity();
+        occurrence.occurrenceId = "task20e-atomic-fault-occurrence";
+        occurrence.planId = "task20e-atomic-fault-plan";
+        occurrence.characterId = "char-1";
+        occurrence.state = "CLAIMED";
+        occurrence.turnId = "task20e-atomic-fault-turn";
+        occurrence.jobId = "job-atomic-fault";
+        occurrence.scheduledFor = 220L;
+        occurrence.claimedAt = 221L;
+        occurrence.updatedAt = 221L;
+        TurnSubmission malformed = new TurnSubmission(
+            occurrence.turnId, occurrence.characterId, occurrence.occurrenceId,
+            null, "{}", "{}", occurrence.jobId, 221L);
+        long occurrences = rowCount("role_plan_occurrences");
+        long turns = rowCount("chat_turns");
+        long attempts = rowCount("execution_attempts");
+        long diagnostics = rowCount("diagnostics");
+
+        assertThrows(IllegalStateException.class,
+            () -> store.submitRolePlanOccurrence(occurrence, malformed));
+        assertEquals(occurrences, rowCount("role_plan_occurrences"));
+        assertEquals(turns, rowCount("chat_turns"));
+        assertEquals(attempts, rowCount("execution_attempts"));
+        assertEquals(diagnostics, rowCount("diagnostics"));
+    }
+
+    @Test
+    public void rolePlanAtomicFaultsAtEveryWriteBoundaryLeaveNoOrphanRows() {
+        String[] boundaries = {
+            "role_plan_occurrence_insert", "role_plan_turn_attempt", "role_plan_diagnostic"
+        };
+        for (String boundary : boundaries) {
+            RolePlanOccurrenceEntity occurrence = new RolePlanOccurrenceEntity();
+            occurrence.occurrenceId = "task20e-boundary-" + boundary;
+            occurrence.planId = "task20e-boundary-plan-" + boundary;
+            occurrence.characterId = "char-1";
+            occurrence.state = "CLAIMED";
+            occurrence.turnId = "task20e-boundary-turn-" + boundary;
+            occurrence.jobId = "job-boundary-" + boundary;
+            occurrence.scheduledFor = 230L;
+            occurrence.claimedAt = 231L;
+            occurrence.updatedAt = 231L;
+            TurnSubmission submission = new TurnSubmission(
+                occurrence.turnId, occurrence.characterId, occurrence.occurrenceId,
+                TurnKind.ROLE_PLAN_CHAT, "{\"planId\":\"" + occurrence.planId + "\"}",
+                "{}", occurrence.jobId, 231L);
+            long occurrences = rowCount("role_plan_occurrences");
+            long turns = rowCount("chat_turns");
+            long attempts = rowCount("execution_attempts");
+            long diagnostics = rowCount("diagnostics");
+            RoomExecutionStore faulted = new RoomExecutionStore(database, reached -> {
+                if (boundary.equals(reached)) throw new IllegalStateException("fault:" + reached);
+            });
+
+            assertThrows(IllegalStateException.class,
+                () -> faulted.submitRolePlanOccurrence(occurrence, submission));
+            assertEquals(occurrences, rowCount("role_plan_occurrences"));
+            assertEquals(turns, rowCount("chat_turns"));
+            assertEquals(attempts, rowCount("execution_attempts"));
+            assertEquals(diagnostics, rowCount("diagnostics"));
+        }
+    }
+
+    @Test
+    public void roleScopedDispatchDiagnosticsAreAtomicWithTheRoleDeleteFence() throws Exception {
+        assertTrue(store.recordRolePreflightDiagnosticIfActive(
+            "task20e-role-preflight", "char-1", "WARN", "SNAPSHOT_MISSING", "job-preflight", 299L));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "SNAPSHOT_MISSING", "job-preflight"));
+        String turnId = "task20e-role-diagnostic-fence";
+        store.submitTurn(submission(turnId, "task20e-role-diagnostic-message"));
+        String attemptId = store.activeAttempt(turnId).attemptId;
+        assertTrue(store.recordRoleDispatchDiagnosticsIfActive(
+            turnId, "char-1", attemptId, 300L,
+            "FCM_RECEIVED", "chat:job-fence",
+            "FCM_PRIORITY", "original=1;delivered=1"));
+        assertEquals(1L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "FCM_RECEIVED", "chat:job-fence"));
+        insertRoleDeleteTombstone("char-1", 301L);
+        assertFalse(store.recordRolePreflightDiagnosticIfActive(
+            "task20e-role-preflight-after-delete", "char-1",
+            "WARN", "SNAPSHOT_MISSING", "job-preflight-after-delete", 302L));
+        assertFalse(store.recordRoleDispatchDiagnosticsIfActive(
+            turnId, "char-1", attemptId, 303L,
+            "FCM_RECEIVED", "chat:job-fence-2",
+            "FCM_PRIORITY", "original=1;delivered=1"));
+        assertEquals(0L, database.executionDao().diagnosticCountByCodeAndDetail(
+            "FCM_RECEIVED", "chat:job-fence-2"));
     }
 
     @Test
@@ -363,7 +860,7 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
-    public void lifecycleSelectorNeverClaimsRoleDeleteInAnyDurableState() {
+    public void lifecycleSelectorIncludesRoleDeleteInTheSharedDurableOutbox() {
         String[] states = {"waiting", "pending", "relay_accepted"};
         for (int index = 0; index < states.length; index += 1) {
             LifecycleControlEntity roleDelete = new LifecycleControlEntity();
@@ -387,7 +884,10 @@ public class RoomExecutionStoreTest {
             database.executionDao().insertLifecycleControl(roleDelete);
         }
 
-        assertNull(database.executionDao().nextLifecycleControl(1_000L, 1_000L));
+        LifecycleControlEntity next = database.executionDao().nextLifecycleControl(1_000L, 1_000L);
+        assertNotNull(next);
+        assertEquals(LifecycleControl.ROLE_DELETE_KIND, next.controlKind);
+        assertEquals("role-delete-selector-0", next.controlId);
     }
 
     @Test
@@ -3473,6 +3973,25 @@ public class RoomExecutionStoreTest {
             null,
             1L
         );
+    }
+
+    private void insertRoleDeleteTombstone(String characterId, long requestedAt)
+        throws Exception {
+        JSONObject receipt = backupReceipt(characterId, requestedAt - 1L);
+        LifecycleControlCodec.Encoded encoded = LifecycleControlCodec.encodeRoleDelete(
+            characterId, "device_gateway", requestedAt, receipt);
+        LifecycleControlEntity row = new LifecycleControlEntity();
+        row.controlId = encoded.controlId;
+        row.controlKind = LifecycleControl.ROLE_DELETE_KIND;
+        row.characterId = characterId;
+        row.peerId = "device_gateway";
+        row.requestedAt = requestedAt;
+        row.semanticJson = encoded.semantic.toString();
+        row.semanticChecksum = encoded.semanticChecksum;
+        row.state = LifecycleControl.WAITING;
+        row.leaseAttempt = 0L;
+        row.updatedAt = requestedAt;
+        database.executionDao().insertLifecycleControl(row);
     }
 
     private TurnSubmission persistedSubmission(String turnId) {

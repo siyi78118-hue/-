@@ -298,6 +298,53 @@ public class RoomBridgeMirrorTest {
         assertEquals(0, inserted.size());
     }
 
+    @Test public void roleDeletionGateSuppressesLanAndCloudSemanticWritesButAcceptsRelay()
+        throws Exception {
+        List<RawMessageEntity> inserted = new ArrayList<>();
+        List<String> canonicalEvents = new ArrayList<>();
+        RoomBridgeMirror.CanonicalApplier applier = new RoomBridgeMirror.CanonicalApplier() {
+            @Override public RoomExecutionStore.CanonicalCloudTarget resolve(
+                String lineageKey, String remoteTurnId
+            ) {
+                canonicalEvents.add("resolve");
+                return new RoomExecutionStore.CanonicalCloudTarget("local", "attempt");
+            }
+            @Override public RoomExecutionStore.DeliveryDisposition commitTerminal(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) {
+                canonicalEvents.add("commit");
+                return RoomExecutionStore.DeliveryDisposition.APPLY;
+            }
+            @Override public void commitFailure(
+                RoomExecutionStore.CanonicalCloudTarget target, BridgeResult result, long now
+            ) { canonicalEvents.add("failure"); }
+            @Override public void recordRejected(
+                RoomExecutionStore.CanonicalCloudTarget target, String relayMessageId,
+                String reason, long now
+            ) { canonicalEvents.add("rejected"); }
+        };
+        RoomBridgeMirror mirror = new RoomBridgeMirror(
+            dao(inserted), applier, "phone_a", roleId -> "yuqi".equals(roleId));
+        TurnSubmission submission = new TurnSubmission(
+            "turn_deleted", "yuqi", "msg_deleted", TurnKind.DIRECT_REPLY,
+            "{\"text\":\"不应落库\"}", "{}", null, 1784400000000L);
+
+        mirror.persistSubmission(submission);
+        mirror.persistReply(submission, BridgeResult.success("lan", "也不应落库"));
+        assertTrue(mirror.persistCloudInboxReply(
+            "{\"turnId\":\"turn_cloud_deleted\",\"state\":\"committed\","
+                + "\"terminal\":true,\"reply\":{\"messageId\":\"msg_deleted_cloud\","
+                + "\"characterId\":\"yuqi\",\"content\":\"迟到消息\","
+                + "\"sentAt\":1784390000000,\"origin\":\"codex\"}}"));
+        JSONObject canonical = canonicalSkipWire()
+            .put("_relayMessageId", "relay_deleted")
+            .put("_deliveryRoute", "cloud");
+        assertTrue(mirror.persistCloudInboxReply(canonical.toString()));
+
+        assertEquals(0, inserted.size());
+        assertTrue(canonicalEvents.isEmpty());
+    }
+
     @Test public void canonicalCloudApplyConflictRecordsOnlyARedactedPendingDiagnostic()
         throws Exception {
         List<String> events = new ArrayList<>();

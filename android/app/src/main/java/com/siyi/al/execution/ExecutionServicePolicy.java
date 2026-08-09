@@ -19,6 +19,29 @@ public final class ExecutionServicePolicy {
         return true;
     }
 
+    /** Role deletion suppresses every ordinary completed-turn side effect. */
+    public static boolean shouldRunCompletedTurnSideEffects(boolean roleDeleted) {
+        return !roleDeleted;
+    }
+
+    /**
+     * Runs one observable completed-turn stage only while the role-delete
+     * fence is clear.  The second read closes the staged race for all
+     * following stages; callers must stop the pipeline when this returns false.
+     */
+    public static boolean runFencedCompletedTurnStage(
+        RoleDeleteFence fence,
+        Runnable sideEffect
+    ) {
+        if (fence == null || sideEffect == null || fence.isDeleted()) return false;
+        sideEffect.run();
+        return !fence.isDeleted();
+    }
+
+    public interface RoleDeleteFence {
+        boolean isDeleted();
+    }
+
     public static boolean isRedacted(Long deletedAt) {
         return deletedAt != null;
     }

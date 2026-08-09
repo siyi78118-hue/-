@@ -1,6 +1,7 @@
 package com.siyi.al.execution;
 
 import android.content.Context;
+import androidx.core.app.NotificationManagerCompat;
 import com.siyi.al.execution.api.OpenAiCompatibleClient;
 import com.siyi.al.execution.api.ReplyParser;
 import com.siyi.al.execution.api.UrlConnectionTransport;
@@ -19,6 +20,7 @@ final class ExecutionRuntime {
 
     static ExecutionEngine create(Context context) {
         AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        drainRoleNotificationCancellations(context, database);
         AlSecretStore secrets = new AlSecretStore(context);
         RoomExecutionStore store = new RoomExecutionStore(database);
         NativeModelGateway gateway = new NativeModelGateway(
@@ -52,6 +54,7 @@ final class ExecutionRuntime {
 
     static int drainCloudInbox(Context context) throws Exception {
         AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        drainRoleNotificationCancellations(context, database);
         AlSecretStore secrets = new AlSecretStore(context);
         BridgeConfig config = secrets.loadBridgeConfig();
         if (!config.hasCloud()) return 0;
@@ -64,6 +67,7 @@ final class ExecutionRuntime {
 
     static boolean drainLifecycleControl(Context context) throws Exception {
         AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        drainRoleNotificationCancellations(context, database);
         AlSecretStore secrets = new AlSecretStore(context);
         BridgeConfig config = secrets.loadBridgeConfig();
         if (!config.enabled) return false;
@@ -91,14 +95,31 @@ final class ExecutionRuntime {
         return false;
     }
 
+    private static int drainRoleNotificationCancellations(
+        Context context, AlExecutionDatabase database
+    ) {
+        Context app = context.getApplicationContext();
+        RoomExecutionStore store = new RoomExecutionStore(database);
+        return store.drainPendingRoleNotificationCancellations(
+            notificationId -> NotificationManagerCompat.from(app).cancel(notificationId));
+    }
+
     /** Return the next store-owned lifecycle wake delay in seconds, or -1 when none is due. */
     static long nextLifecycleDelay(Context context) {
         AlExecutionDatabase database = AlExecutionDatabase.get(context);
         RoomExecutionStore store = new RoomExecutionStore(database);
         long now = System.currentTimeMillis();
+        return nextLifecycleDelayForControls(store.lifecycleControls(), now);
+    }
+
+    static long nextLifecycleDelayForControls(
+        java.util.List<LifecycleControl> controls, long now
+    ) {
         long next = Long.MAX_VALUE;
-        for (LifecycleControl control : store.lifecycleControls()) {
-            if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)) continue;
+        if (controls == null) return -1L;
+        for (LifecycleControl control : controls) {
+            if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)
+                && !LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)) continue;
             long candidate = LifecycleControlSender.nextEligibleAt(control, now);
             if (candidate < next) next = candidate;
         }
@@ -150,14 +171,16 @@ final class ExecutionRuntime {
                         return false;
                     }
                 }
-                if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)
+                if ((!LifecycleControl.CLEAR_KIND.equals(control.controlKind)
+                    && !LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind))
                     || relayMessageId == null || relayExpiresAt == null) return false;
                 try {
                     LifecycleControlSender.validateAppliedAck(ack, control);
+                    boolean roleDelete = LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind);
                     return store.applyLifecycleControl(
                         control.controlId, control.semanticChecksum,
-                        nullableLong(ack.opt("clearEpoch")),
-                        nullableLong(ack.opt("clearedThroughSequence")),
+                        roleDelete ? null : nullableLong(ack.opt("clearEpoch")),
+                        roleDelete ? null : nullableLong(ack.opt("clearedThroughSequence")),
                         ack.getLong("appliedAt"), now, relayMessageId);
                 } catch (IllegalArgumentException conflict) {
                     if (!LifecycleControlSender.isAppliedAckConflict(conflict)) throw conflict;

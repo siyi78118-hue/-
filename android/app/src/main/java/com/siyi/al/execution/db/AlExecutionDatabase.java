@@ -26,13 +26,14 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         ConversationCursorEntity.class,
         ConversationAuthorityEntity.class,
         LifecycleControlEntity.class,
-        LifecycleInboundAckTombstoneEntity.class
+        LifecycleInboundAckTombstoneEntity.class,
+        RoleNotificationCancellationEntity.class
     },
     version = AlExecutionDatabase.SCHEMA_VERSION,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
-    public static final int SCHEMA_VERSION = 14;
+    public static final int SCHEMA_VERSION = 15;
     private static volatile AlExecutionDatabase instance;
     private static final Migration MIGRATION_1_2 = new Migration(1, 2) {
         @Override
@@ -183,6 +184,22 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                 + "ON `lifecycle_inbound_ack_tombstones` (`peerId`, `inboundRelayMessageId`)");
         }
     };
+    public static final Migration MIGRATION_14_15 = new Migration(14, 15) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `role_notification_cancellations` ("
+                + "`cancellation_key` TEXT NOT NULL, `control_id` TEXT NOT NULL, "
+                + "`character_id` TEXT NOT NULL, `notification_id` INTEGER NOT NULL, "
+                + "`intent_checksum` TEXT NOT NULL, `state` TEXT NOT NULL, "
+                + "`created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, "
+                + "PRIMARY KEY(`cancellation_key`))");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS "
+                + "`index_role_notification_cancellations_control_id_notification_id` "
+                + "ON `role_notification_cancellations` (`control_id`, `notification_id`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS "
+                + "`index_role_notification_cancellations_state_created_at` "
+                + "ON `role_notification_cancellations` (`state`, `created_at`)");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -198,7 +215,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
-                        MIGRATION_13_14
+                        MIGRATION_13_14, MIGRATION_14_15
                     ).build();
                 }
             }

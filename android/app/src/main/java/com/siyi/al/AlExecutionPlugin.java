@@ -46,7 +46,9 @@ import java.util.UUID;
 import java.lang.ref.WeakReference;
 import android.os.Handler;
 import android.os.Looper;
+import androidx.core.app.NotificationManagerCompat;
 import org.json.JSONArray;
+import org.json.JSONException;
 import org.json.JSONObject;
 
 @CapacitorPlugin(name = "AlExecution")
@@ -191,6 +193,8 @@ public final class AlExecutionPlugin extends Plugin {
             YuqiAnnotationEntity annotation = new YuqiAnnotationEntity();
             annotation.annotationId = optional(call, "annotationId", "annotation_" + UUID.randomUUID().toString().replace("-", ""));
             annotation.turnId = required(call, "turnId");
+            ChatTurnEntity annotatedTurn = store.turn(annotation.turnId);
+            if (annotatedTurn != null) store.assertRoleAcceptsSemanticWrite(annotatedTurn.characterId);
             String sourceMessageId = optional(call, "sourceMessageId", "");
             annotation.sourceMessageId = sourceMessageId.isEmpty() ? null : sourceMessageId;
             annotation.presetVersion = optional(call, "presetVersion", "1.0.0");
@@ -198,12 +202,17 @@ public final class AlExecutionPlugin extends Plugin {
             annotation.desiredBehavior = desiredBehavior;
             annotation.status = "proposed";
             annotation.createdAt = System.currentTimeMillis();
-            annotation.syncSeq = AlExecutionDatabase.get(getContext()).executionDao()
-                .allocateJournalSyncSeq(annotation.createdAt);
             annotation.checksum = annotation.annotationId;
-            long inserted = AlExecutionDatabase.get(getContext()).executionDao().insertYuqiAnnotation(annotation);
+            AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
+            final long[] inserted = new long[] { -1L };
+            database.runInTransaction(() -> {
+                ChatTurnEntity currentTurn = store.turn(annotation.turnId);
+                if (currentTurn != null) store.assertRoleAcceptsSemanticWrite(currentTurn.characterId);
+                annotation.syncSeq = database.executionDao().allocateJournalSyncSeq(annotation.createdAt);
+                inserted[0] = database.executionDao().insertYuqiAnnotation(annotation);
+            });
             JSObject result = new JSObject();
-            result.put("saved", inserted != -1L);
+            result.put("saved", inserted[0] != -1L);
             result.put("annotationId", annotation.annotationId);
             result.put("syncSeq", annotation.syncSeq);
             result.put("presetVersion", annotation.presetVersion);
@@ -232,7 +241,11 @@ public final class AlExecutionPlugin extends Plugin {
             snapshot.memoryConfigId = call.getString("memoryConfigId", "memory-v1");
             Long createdAt = call.getLong("createdAt", System.currentTimeMillis());
             snapshot.createdAt = createdAt == null ? System.currentTimeMillis() : createdAt;
-            AlExecutionDatabase.get(getContext()).executionDao().upsertSnapshot(snapshot);
+            AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
+            database.runInTransaction(() -> {
+                store.assertRoleAcceptsSemanticWrite(snapshot.characterId);
+                database.executionDao().upsertSnapshot(snapshot);
+            });
             if (snapshot.jobSnapshot && snapshot.scheduledFor != null && snapshot.automaticTasksEnabled) {
                 AutomaticTaskAlarmScheduler.schedule(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
             }
@@ -248,50 +261,56 @@ public final class AlExecutionPlugin extends Plugin {
         execute(call, () -> {
             String characterId = required(call, "characterId");
             JSONArray values = new JSONArray(call.getString("messagesJson", "[]"));
-            int inserted = 0;
-            for (int index = 0; index < values.length(); index += 1) {
-                JSONObject value = values.getJSONObject(index);
-                String messageId = requiredJson(value, "messageId");
-                if (AlExecutionDatabase.get(getContext()).executionDao().rawMessage(messageId) != null) continue;
-                String speakerType = value.optString("speakerType", "").trim();
-                String speakerId = value.optString("speakerId", "").trim();
-                if ("user".equals(speakerType) && !"user".equals(speakerId)) {
-                    throw new IllegalArgumentException("user speaker attribution mismatch");
+            AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
+            final int[] inserted = new int[] { 0 };
+            database.runInTransaction(() -> {
+                store.assertRoleAcceptsSemanticWrite(characterId);
+                for (int index = 0; index < values.length(); index += 1) {
+                    JSONObject value;
+                    try {
+                        value = values.getJSONObject(index);
+                    } catch (JSONException error) {
+                        throw new IllegalArgumentException("messagesJson item is invalid", error);
+                    }
+                    String messageId = requiredJson(value, "messageId");
+                    if (database.executionDao().rawMessage(messageId) != null) continue;
+                    String speakerType = value.optString("speakerType", "").trim();
+                    String speakerId = value.optString("speakerId", "").trim();
+                    if ("user".equals(speakerType) && !"user".equals(speakerId)) {
+                        throw new IllegalArgumentException("user speaker attribution mismatch");
+                    }
+                    if ("character".equals(speakerType) && !characterId.equals(speakerId)) {
+                        throw new IllegalArgumentException("character speaker attribution mismatch");
+                    }
+                    if (!"user".equals(speakerType) && !"character".equals(speakerType)) {
+                        throw new IllegalArgumentException("speakerType is invalid");
+                    }
+                    RawMessageEntity row = new RawMessageEntity();
+                    row.messageId = messageId;
+                    row.turnId = value.optString("turnId", "turn_legacy_" + messageId).trim();
+                    if (row.turnId.isEmpty()) row.turnId = "turn_legacy_" + messageId;
+                    row.characterId = characterId;
+                    row.speakerId = speakerId;
+                    row.speakerType = speakerType;
+                    row.recipientId = "user".equals(speakerType) ? characterId : "user";
+                    row.content = requiredJson(value, "content");
+                    row.sentAt = Math.max(1L, value.optLong("sentAt", System.currentTimeMillis()));
+                    row.origin = value.optString("origin", "user".equals(speakerType) ? "phone" : "legacy_fallback");
+                    row.deviceId = secrets.loadBridgeConfig().deviceId + ":visible";
+                    long syncSeq = database.executionDao().allocateJournalSyncSeq(System.currentTimeMillis());
+                    row.deviceSeq = syncSeq;
+                    row.syncSeq = syncSeq;
+                    row.checksum = messageId;
+                    if (database.executionDao().insertRawMessage(row) != -1L) inserted[0] += 1;
                 }
-                if ("character".equals(speakerType) && !characterId.equals(speakerId)) {
-                    throw new IllegalArgumentException("character speaker attribution mismatch");
-                }
-                if (!"user".equals(speakerType) && !"character".equals(speakerType)) {
-                    throw new IllegalArgumentException("speakerType is invalid");
-                }
-                RawMessageEntity row = new RawMessageEntity();
-                row.messageId = messageId;
-                row.turnId = value.optString("turnId", "turn_legacy_" + messageId).trim();
-                if (row.turnId.isEmpty()) row.turnId = "turn_legacy_" + messageId;
-                row.characterId = characterId;
-                row.speakerId = speakerId;
-                row.speakerType = speakerType;
-                row.recipientId = "user".equals(speakerType) ? characterId : "user";
-                row.content = requiredJson(value, "content");
-                row.sentAt = Math.max(1L, value.optLong("sentAt", System.currentTimeMillis()));
-                row.origin = value.optString("origin", "user".equals(speakerType) ? "phone" : "legacy_fallback");
-                row.deviceId = secrets.loadBridgeConfig().deviceId + ":visible";
-                long syncSeq = AlExecutionDatabase.get(getContext()).executionDao()
-                    .allocateJournalSyncSeq(System.currentTimeMillis());
-                row.deviceSeq = syncSeq;
-                row.syncSeq = syncSeq;
-                row.checksum = messageId;
-                if (AlExecutionDatabase.get(getContext()).executionDao().insertRawMessage(row) != -1L) {
-                    inserted += 1;
-                }
-            }
+            });
             JSObject result = new JSObject();
             result.put("saved", true);
-            result.put("inserted", inserted);
-            result.put("pending", AlExecutionDatabase.get(getContext()).executionDao().rawMessageCountAfterSync(
-                AlExecutionDatabase.get(getContext()).executionDao().syncCursor("yuqi_pc") == null
+            result.put("inserted", inserted[0]);
+            result.put("pending", database.executionDao().rawMessageCountAfterSync(
+                database.executionDao().syncCursor("yuqi_pc") == null
                     ? 0L
-                    : AlExecutionDatabase.get(getContext()).executionDao().syncCursor("yuqi_pc").ackSeq
+                    : database.executionDao().syncCursor("yuqi_pc").ackSeq
             ));
             return result;
         });
@@ -464,6 +483,47 @@ public final class AlExecutionPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void createRoleDelete(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            String expectedCursorChecksum = required(call, "expectedCursorChecksum");
+            JSONObject backupReceipt = new JSONObject(required(call, "backupReceiptJson"));
+            LifecycleControl control = store.createRoleDelete(
+                characterId,
+                expectedCursorChecksum,
+                backupReceipt,
+                () -> AlExecutionWakeWorker.prearmLifecycle(getContext()),
+                notificationId -> NotificationManagerCompat.from(getContext()).cancel(notificationId)
+            );
+            AlExecutionService.requestRun(getContext());
+            return roleDeleteControlResult(characterId, control);
+        });
+    }
+
+    @PluginMethod
+    public void getRoleDeleteStatus(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            return roleDeleteControlResult(characterId, store.roleDeleteControl(characterId));
+        });
+    }
+
+    @PluginMethod
+    public void suppressRoleDeletedTurn(PluginCall call) {
+        execute(call, () -> {
+            String turnId = required(call, "turnId");
+            String characterId = required(call, "characterId");
+            boolean suppressed = store.suppressRoleDeletedTurn(
+                turnId, characterId, System.currentTimeMillis());
+            JSObject result = new JSObject();
+            result.put("turnId", turnId);
+            result.put("characterId", characterId);
+            result.put("suppressed", suppressed);
+            return result;
+        });
+    }
+
+    @PluginMethod
     public void createConversationClear(PluginCall call) {
         execute(call, () -> {
             String characterId = required(call, "characterId");
@@ -600,7 +660,11 @@ public final class AlExecutionPlugin extends Plugin {
                 row.createdAt = value.optLong("createdAt", System.currentTimeMillis());
                 history.add(row);
             }
-            AlExecutionDatabase.get(getContext()).executionDao().replaceRolePlans(characterId, plans, history);
+            AlExecutionDatabase database = AlExecutionDatabase.get(getContext());
+            database.runInTransaction(() -> {
+                store.assertRoleAcceptsSemanticWrite(characterId);
+                database.executionDao().replaceRolePlans(characterId, plans, history);
+            });
             RolePlanAlarmScheduler.rescheduleAll(getContext());
             JSObject result = new JSObject();
             result.put("saved", true);
@@ -835,6 +899,29 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("cloudPollAttempts", config.cloudPollAttempts);
         result.put("cloudPollIntervalMs", config.cloudPollIntervalMs);
         result.put("turnDeadlineMs", config.turnDeadlineMs);
+        return result;
+    }
+
+    private static JSObject roleDeleteControlResult(String characterId, LifecycleControl control) {
+        JSObject result = new JSObject();
+        result.put("characterId", characterId);
+        if (control == null) {
+            result.put("controlId", "");
+            result.put("state", "none");
+            result.put("requestedAt", 0L);
+            result.put("appliedAt", JSONObject.NULL);
+            result.put("semanticChecksum", "");
+            return result;
+        }
+        if (!LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+            || !characterId.equals(control.characterId)) {
+            throw new IllegalStateException("role delete authority conflict");
+        }
+        result.put("controlId", control.controlId);
+        result.put("state", control.state);
+        result.put("requestedAt", control.requestedAt);
+        result.put("appliedAt", control.appliedAt == null ? JSONObject.NULL : control.appliedAt);
+        result.put("semanticChecksum", control.semanticChecksum);
         return result;
     }
 

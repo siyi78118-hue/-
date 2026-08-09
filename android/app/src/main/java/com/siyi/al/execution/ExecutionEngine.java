@@ -171,6 +171,11 @@ public final class ExecutionEngine {
         );
         String bridgeDeviceId = gateway.bridgeDeviceId();
         TurnSubmission prepared = store.prepareBridgeSubmission(submission, bridgeDeviceId, clock.now());
+        // A role deletion may be committed after preparation.  Re-read the
+        // retained lifecycle authority immediately before crossing the network
+        // boundary; the terminal Room writer alone is too late to prevent
+        // already-prepared semantic data from leaving the device.
+        store.assertBridgeSubmissionStillAllowed(prepared);
         BridgeResult result = gateway.executeBridgeTurn(prepared);
         if (result.kind == BridgeResult.Kind.CANONICAL_TERMINAL) {
             try {

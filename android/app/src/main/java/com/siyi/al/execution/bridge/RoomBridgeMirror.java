@@ -18,6 +18,9 @@ import java.util.List;
 import org.json.JSONObject;
 
 public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
+    interface RoleDeletionGate {
+        boolean tombstoned(String roleId);
+    }
     interface CanonicalApplier {
         RoomExecutionStore.CanonicalCloudTarget resolve(
             String lineageKey, String authoritativeTurnId);
@@ -35,9 +38,10 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
     private final AlExecutionDao dao;
     private final CanonicalApplier canonicalApplier;
     private final String deviceId;
+    private final RoleDeletionGate roleDeletionGate;
 
     public RoomBridgeMirror(AlExecutionDao dao, String deviceId) {
-        this(dao, (CanonicalApplier) null, deviceId);
+        this(dao, (CanonicalApplier) null, deviceId, roleId -> false);
     }
 
     public RoomBridgeMirror(
@@ -45,17 +49,26 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         RoomExecutionStore store,
         String deviceId
     ) {
-        this(dao, canonicalApplier(store), deviceId);
+        this(dao, canonicalApplier(store), deviceId, store::isRoleDeleteTombstoned);
     }
 
     RoomBridgeMirror(AlExecutionDao dao, CanonicalApplier canonicalApplier, String deviceId) {
+        this(dao, canonicalApplier, deviceId, roleId -> false);
+    }
+
+    RoomBridgeMirror(
+        AlExecutionDao dao, CanonicalApplier canonicalApplier, String deviceId,
+        RoleDeletionGate roleDeletionGate
+    ) {
         this.dao = dao;
         this.canonicalApplier = canonicalApplier;
         this.deviceId = deviceId == null || deviceId.trim().isEmpty() ? "phone" : deviceId.trim();
+        this.roleDeletionGate = roleDeletionGate == null ? roleId -> false : roleDeletionGate;
     }
 
     @Override public void persistSubmission(TurnSubmission submission) throws Exception {
         if (submission.kind != TurnKind.DIRECT_REPLY) return;
+        if (roleDeletionGate.tombstoned(submission.characterId)) return;
         JSONObject raw = BridgeInput.userMessage(submission);
         String content = raw.optString("content", "");
         if (content.trim().isEmpty()) throw new IllegalArgumentException("raw user message is empty");
@@ -77,6 +90,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
     }
 
     @Override public void persistReply(TurnSubmission submission, BridgeResult result) throws Exception {
+        if (roleDeletionGate.tombstoned(submission.characterId)) return;
         JSONObject response = new JSONObject(result.responseJson == null ? "{}" : result.responseJson);
         JSONObject remoteReply = response.optJSONObject("reply");
         RawMessageEntity entity = new RawMessageEntity();
@@ -115,6 +129,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
             localTurnId = remoteTurnId;
             turn = dao.turn(localTurnId);
         }
+        if (turn != null && roleDeletionGate.tombstoned(turn.characterId)) return true;
 
         if (reply == null) {
             if (response.optBoolean("terminal", false) && "skip".equals(response.optString("action", ""))) {
@@ -142,6 +157,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         if (characterId.isEmpty() && turn != null) characterId = turn.characterId;
         if (characterId.isEmpty()) characterId = response.optString("characterId", "").trim();
         if (characterId.isEmpty()) return false;
+        if (roleDeletionGate.tombstoned(characterId)) return true;
 
         RawMessageEntity entity = new RawMessageEntity();
         entity.messageId = messageId;
@@ -228,6 +244,7 @@ public final class RoomBridgeMirror implements BridgeRouter.MessageMirror {
         long now = System.currentTimeMillis();
         try {
             result = BridgeTurnStatus.parseV3(wire.toString(), "cloud", relayMessageId);
+            if (roleDeletionGate.tombstoned(result.roleId)) return true;
             target = canonicalApplier.resolve(
                 result.authorityLineageKey, result.authoritativeTurnId);
             if (result.kind == BridgeResult.Kind.CANONICAL_TERMINAL) {

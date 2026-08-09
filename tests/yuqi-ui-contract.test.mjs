@@ -238,11 +238,13 @@ test('Room persists fresh retry turns and only deduplicates an exact turn id', (
   assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
   assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
   assert.match(executionDatabase, /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION/);
-  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*14/);
+  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*15/);
   assert.match(executionDatabase, /new Migration\(8,\s*9\)/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
   assert.match(executionDatabase, /MIGRATION_12_13/);
+  assert.match(executionDatabase, /MIGRATION_13_14/);
+  assert.match(executionDatabase, /MIGRATION_14_15/);
   assert.match(executionDatabase, /MIGRATION_9_10,\s*MIGRATION_10_11,\s*MIGRATION_11_12,\s*MIGRATION_12_13,[\s\S]*MIGRATION_13_14/);
   assert.match(executionDatabase, /DROP INDEX IF EXISTS `index_chat_turns_sourceMessageId`/);
   assert.match(executionDatabase, /CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId`/);
@@ -273,6 +275,460 @@ test('Android chat clear is native-first and does not use the desktop localStora
   assert.match(clear, /expectedCursorChecksum/);
   assert.match(clear, /catch[\s\S]{0,500}(?:失败|pending|等待)/i);
   assert.match(clear, /isNativeApp\(\)/);
+});
+
+test('Android role deletion is backup-first, remains visible while pending, and only cleans the browser after native applied', () => {
+  const deletion = html.slice(
+    html.indexOf('async function roleDeleteControlStatus'),
+    html.indexOf('function openCurrentProfile')
+  );
+  assert.match(plugin, /void\s+createRoleDelete\(PluginCall call\)/);
+  assert.match(plugin, /void\s+getRoleDeleteStatus\(PluginCall call\)/);
+
+  assert.match(deletion, /requestVerifiedYuqiBackup/);
+  assert.match(deletion, /createRoleDelete/);
+  assert.match(deletion, /getRoleDeleteStatus/);
+  const nativeFirstDelete = deletion.slice(
+    deletion.indexOf('async function nativeFirstRoleDelete'),
+    deletion.indexOf('async function enforceNativeRoleDeletionTombstones')
+  );
+  assert.ok(nativeFirstDelete.indexOf('requestVerifiedYuqiBackup') < nativeFirstDelete.indexOf('createRoleDelete'));
+  assert.match(deletion, /roleDeletePending/);
+  const deleteCurrentRole = deletion.slice(
+    deletion.indexOf('async function deleteCurrentRole'),
+    deletion.indexOf('function openCurrentProfile')
+  );
+  assert.match(deleteCurrentRole, /control\.state\s*===\s*['"]applied['"]/);
+  const appliedGate = deleteCurrentRole.indexOf("control.state === 'applied'");
+  assert.ok(
+    appliedGate < deleteCurrentRole.indexOf('finalizeBrowserRoleDeletion', appliedGate),
+    'the browser role deletion must be gated by native applied state'
+  );
+  assert.match(deletion, /restorePendingRoleDeletions/);
+});
+
+test('a native role-deletion tombstone blocks late UI results, new work, mirrors, and backup resurrection', () => {
+  assert.match(html, /function\s+roleDeletionFrozen\(charId\)/);
+
+  const apply = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  assert.match(apply, /roleDeletionFrozen\(charId\)/);
+  assert.ok(
+    apply.indexOf('roleDeletionFrozen(charId)') < apply.indexOf('nativeTerminalDispositionLanding'),
+    'role deletion must suppress a late native result before any chat, action, moment, or plan landing'
+  );
+
+  for (const [start, end] of [
+    ['async function syncYuqiVisibleHistory', 'async function queueAndroidProactiveTurn'],
+    ['async function queueAndroidProactiveTurn', 'async function queueYuqiMomentTurn'],
+    ['async function queueYuqiMomentTurn', 'async function queueAndroidUserReply'],
+    ['async function queueAndroidUserReply', 'async function mirrorAppStateNow']
+  ]) {
+    const source = html.slice(html.indexOf(start), html.indexOf(end));
+    assert.match(source, /assertRoleDeletionAcceptsWork\(charId\)|roleDeletionFrozen\(charId\)/, `${start} must honor the retained deletion tombstone`);
+  }
+
+  const mirror = html.slice(
+    html.indexOf('async function restoreAppStateFromMirror'),
+    html.indexOf('const RELATIONSHIP_STAGE_DEFS')
+  );
+  assert.match(mirror, /assertNativeRoleDeletionAllowsStateReplacement/);
+
+  const enforcement = html.slice(
+    html.indexOf('async function enforceNativeRoleDeletionTombstones'),
+    html.indexOf('async function finalizeBrowserRoleDeletion')
+  );
+  assert.match(enforcement, /roleDeletePending\s*=\s*\{[\s\S]{0,300}state:\s*['"]unknown['"]/);
+  const failureBranch = enforcement.slice(enforcement.indexOf('catch (error)'), enforcement.indexOf("if (control.state === 'none')"));
+  assert.doesNotMatch(failureBranch, /MemoryDB\.clearChar|removeCharacterMomentTraces|getRolePlanRepository\(\)\.replace/);
+
+  const restore = html.slice(
+    html.indexOf('async function restorePendingRoleDeletions'),
+    html.indexOf('async function deleteCurrentRole')
+  );
+  const restoreFailure = restore.slice(restore.indexOf('catch (error)'), restore.indexOf("if (control.state === 'none')"));
+  assert.match(restoreFailure, /roleDeletePending\s*=\s*\{[\s\S]{0,220}state:\s*['"]unknown['"]/);
+  assert.match(restore, /control\.state === 'none'[\s\S]{0,180}delete\s+char\.roleDeletePending/);
+
+  for (const [start, end] of [
+    ['async function importChatBackup', 'async function importBackup'],
+    ['async function importBackup', 'let mirrorTimer']
+  ]) {
+    const source = html.slice(html.indexOf(start), html.indexOf(end));
+    assert.match(source, /assertNativeRoleDeletionAllowsStateReplacement/, `${start} must not resurrect a native-deleted role`);
+  }
+
+  const stagedWrite = html.slice(
+    html.indexOf('function stagePlayerMessage'),
+    html.indexOf('function commitStagedBatch')
+  );
+  assert.match(stagedWrite, /assertRoleDeletionAcceptsChat\(chat\)/);
+  const pendingWrite = html.slice(
+    html.indexOf('function createPendingUserMessage'),
+    html.indexOf('async function retryFailedReply')
+  );
+  assert.match(pendingWrite, /assertRoleDeletionAcceptsChat\(chat\)/);
+  const retry = html.slice(
+    html.indexOf('async function retryFailedReply'),
+    html.indexOf('function showReplyFailureReason')
+  );
+  assert.match(retry, /assertRoleDeletionAcceptsWork\(charId\)/);
+  const retryFinalGate = retry.lastIndexOf('await assertNativeRoleDeletionAcceptsWork(charId');
+  assert.ok(
+    retryFinalGate >= 0 && retryFinalGate < retry.indexOf('plugin.submitTurn'),
+    'retry must recheck native deletion authority immediately before submission'
+  );
+
+  for (const [start, end] of [
+    ['async function queueAndroidProactiveTurn', 'async function queueYuqiMomentTurn'],
+    ['async function queueYuqiMomentTurn', 'async function queueAndroidUserReply'],
+    ['async function queueAndroidUserReply', 'async function mirrorAppStateNow']
+  ]) {
+    const source = html.slice(html.indexOf(start), html.indexOf(end));
+    const finalGate = source.lastIndexOf('await assertNativeRoleDeletionAcceptsWork(charId');
+    const submit = source.indexOf('plugin.submitTurn');
+    assert.ok(finalGate >= 0 && finalGate < submit, `${start} must recheck Room authority before native submit`);
+  }
+
+  const payment = html.slice(
+    html.indexOf('async function submitPayMessage'),
+    html.indexOf('function uid')
+  );
+  assert.ok(
+    payment.indexOf('await assertNativeRoleDeletionAcceptsWork') >= 0
+      && payment.indexOf('await assertNativeRoleDeletionAcceptsWork') < payment.indexOf('stagePlayerMessage'),
+    'payment must verify the native tombstone before creating the message or changing the wallet'
+  );
+  assert.ok(
+    payment.indexOf('stagePlayerMessage') < payment.indexOf('saveWalletBalance'),
+    'wallet balance may change only after the role-deletion-aware message write succeeds'
+  );
+});
+
+test('role deletion suppresses stale native UI without using the ordinary UI-applied receipt', () => {
+  const drain = html.slice(
+    html.indexOf('async function drainNativeUiInbox'),
+    html.indexOf('async function replayRecentNativeCompletedTurns')
+  );
+  const suppression = html.slice(
+    html.indexOf('async function nativeRoleDeletionResultDisposition'),
+    html.indexOf('async function drainNativeUiInbox')
+  );
+  assert.match(drain, /suppressNativeRoleDeletedResult/);
+  assert.doesNotMatch(drain, /roleDeletionFrozen[\s\S]{0,500}acknowledgeNativeUiAppliedOnce/);
+  assert.match(suppression, /getRoleDeleteStatus/);
+  assert.match(suppression, /!plugin\?\.suppressRoleDeletedTurn[\s\S]{0,80}return null/);
+  assert.ok(
+    suppression.indexOf('suppressRoleDeletedTurn') < suppression.indexOf('nativeUiAcknowledgedTurnIds.add'),
+    'native suppression must commit before the Web inbox marks a turn handled'
+  );
+  const replay = html.slice(
+    html.indexOf('async function replayRecentNativeCompletedTurns'),
+    html.indexOf('function nativeRetryLineageTurnIds')
+  );
+  assert.match(replay, /suppressNativeRoleDeletedResult/);
+});
+
+test('native result suppression is durable for an applied deleted role and defers without proof', async () => {
+  const source = html.slice(
+    html.indexOf('async function nativeRoleDeletionResultDisposition'),
+    html.indexOf('async function drainNativeUiInbox')
+  );
+  const build = new Function('state', `
+    const nativeReplyQueuedIds = new Set(state.queued || []);
+    const nativeUiAcknowledgedTurnIds = new Set();
+    function roleDeletionFrozen(characterId){ return state.localFrozen === characterId; }
+    async function roleDeleteControlStatus(characterId, plugin){ return plugin.getRoleDeleteStatus({ characterId }); }
+    async function nativeBridgeCall(promise){ return promise; }
+    ${source}
+    return { suppressNativeRoleDeletedResult, nativeReplyQueuedIds, nativeUiAcknowledgedTurnIds };
+  `);
+
+  const appliedState = { queued: ['late-turn'], localFrozen: '' };
+  const applied = build(appliedState);
+  const suppressCalls = [];
+  const appliedPlugin = {
+    async getRoleDeleteStatus(){ return { state: 'applied' }; },
+    async suppressRoleDeletedTurn(input){ suppressCalls.push(input); return { suppressed: true }; }
+  };
+  assert.equal(await applied.suppressNativeRoleDeletedResult(appliedPlugin, {
+    turnId: 'late-turn', characterId: 'deleted-role'
+  }), true);
+  assert.deepEqual(suppressCalls, [{ turnId: 'late-turn', characterId: 'deleted-role' }]);
+  assert.equal(applied.nativeReplyQueuedIds.has('late-turn'), false);
+  assert.equal(applied.nativeUiAcknowledgedTurnIds.has('late-turn'), true);
+
+  const missingState = { queued: ['defer-turn'], localFrozen: 'deleted-role' };
+  const missing = build(missingState);
+  assert.equal(await missing.suppressNativeRoleDeletedResult({
+    async getRoleDeleteStatus(){ return { state: 'applied' }; }
+  }, { turnId: 'defer-turn', characterId: 'deleted-role' }), null);
+  assert.equal(missing.nativeReplyQueuedIds.has('defer-turn'), true);
+  assert.equal(missing.nativeUiAcknowledgedTurnIds.size, 0);
+
+  const unknownState = { queued: ['unknown-turn'], localFrozen: '' };
+  const unknown = build(unknownState);
+  assert.equal(await unknown.suppressNativeRoleDeletedResult({
+    async getRoleDeleteStatus(){ throw new Error('bridge unavailable'); },
+    async suppressRoleDeletedTurn(){ throw new Error('must not run'); }
+  }, { turnId: 'unknown-turn', characterId: 'deleted-role' }), null);
+  assert.equal(unknown.nativeReplyQueuedIds.has('unknown-turn'), true);
+  assert.equal(unknown.nativeUiAcknowledgedTurnIds.size, 0);
+
+  const oldPluginState = { queued: ['old-plugin-turn'], localFrozen: '' };
+  const oldPlugin = build(oldPluginState);
+  assert.equal(await oldPlugin.suppressNativeRoleDeletedResult({}, {
+    turnId: 'old-plugin-turn', characterId: 'deleted-role'
+  }), false, 'a legacy binary with neither role-delete method has no retained tombstone to suppress');
+  assert.equal(oldPlugin.nativeReplyQueuedIds.has('old-plugin-turn'), true);
+  assert.equal(oldPlugin.nativeUiAcknowledgedTurnIds.size, 0);
+
+  const partialPluginState = { queued: ['partial-plugin-turn'], localFrozen: '' };
+  const partialPlugin = build(partialPluginState);
+  assert.equal(await partialPlugin.suppressNativeRoleDeletedResult({
+    async suppressRoleDeletedTurn(){ throw new Error('must not run without status proof'); }
+  }, { turnId: 'partial-plugin-turn', characterId: 'deleted-role' }), null);
+  assert.equal(partialPlugin.nativeReplyQueuedIds.has('partial-plugin-turn'), true);
+  assert.equal(partialPlugin.nativeUiAcknowledgedTurnIds.size, 0);
+});
+
+test('role deletion stays frozen but preserves Web semantics until native applied', () => {
+  const enforcement = html.slice(
+    html.indexOf('async function enforceNativeRoleDeletionTombstones'),
+    html.indexOf('async function finalizeBrowserRoleDeletion')
+  );
+  const pendingBranch = enforcement.slice(
+    enforcement.indexOf('markRoleDeletePending'),
+    enforcement.indexOf('return changed')
+  );
+  assert.doesNotMatch(
+    pendingBranch,
+    /MemoryDB\.clearChar|removeCharacterMomentTraces|getRolePlanRepository\(\)\.replace|rolePlanCache\.delete/,
+    'pending/quarantined role deletion may freeze Web state but cannot erase it before applied'
+  );
+  assert.match(
+    pendingBranch,
+    /retained\s*\|\|\s*allChats\[char\.id\]\s*\|\|/,
+    'a newly discovered pending tombstone must retain the current chat instead of replacing it with an empty shell'
+  );
+
+  for (const [start, end] of [
+    ['async function importChatBackup', 'async function importBackup'],
+    ['async function importBackup', 'let mirrorTimer'],
+    ['async function restoreAppStateFromMirror', 'const RELATIONSHIP_STAGE_DEFS']
+  ]) {
+    const source = html.slice(html.indexOf(start), html.indexOf(end));
+    assert.match(
+      source,
+      /await assertNativeRoleDeletionAllowsStateReplacement/,
+      `${start} must reject a stale replacement before it can overwrite a retained native tombstone`
+    );
+    const validations = source.match(/await assertNativeRoleDeletionAllowsStateReplacement/g) || [];
+    assert.ok(validations.length >= 2, `${start} must revalidate after the replacement work completes`);
+    assert.match(source, /restoreWebStateReplacementSnapshot/);
+    if (start !== 'async function restoreAppStateFromMirror') {
+      assert.ok(
+        source.indexOf('await mirrorAppStateNow()') < source.indexOf('replacementCommitted = true'),
+        `${start} must not commit until its durable Web mirror succeeds`
+      );
+    }
+  }
+});
+
+test('failed Web state replacement restores the exact pre-import semantic snapshot', async () => {
+  const source = html.slice(
+    html.indexOf('function cloneWebStateValue'),
+    html.indexOf('async function importChatBackup')
+  );
+  const build = new Function('initial', `
+    const localRows = new Map(Object.entries(initial.localStorage));
+    const localStorage = {
+      getItem(key){ return localRows.has(key) ? localRows.get(key) : null; },
+      setItem(key, value){ localRows.set(key, String(value)); },
+      removeItem(key){ localRows.delete(key); }
+    };
+    let settings = structuredClone(initial.settings);
+    let characters = structuredClone(initial.characters);
+    let allChats = structuredClone(initial.allChats);
+    let allMoments = structuredClone(initial.allMoments);
+    let currentCharId = initial.currentCharId;
+    let restoredMemory = null;
+    async function dumpChatMemoryStores(){ return structuredClone(initial.chatMemory); }
+    async function dumpMemoryStores(){ return structuredClone(initial.fullMemory); }
+    async function restoreChatMemoryStores(value){ restoredMemory = { mode: 'chat', value: structuredClone(value) }; }
+    async function restoreMemoryStores(value){ restoredMemory = { mode: 'full', value: structuredClone(value) }; }
+    ${source}
+    return {
+      captureWebStateReplacementSnapshot,
+      restoreWebStateReplacementSnapshot,
+      replace(){
+        settings = { changed: true };
+        characters = [{ id: 'imported' }];
+        allChats = { imported: { messages: ['stale'] } };
+        allMoments = [{ id: 'stale' }];
+        currentCharId = 'imported';
+        localStorage.setItem('rpchat_settings', 'new-settings');
+        localStorage.setItem('rpchat_characters', 'new-characters');
+        localStorage.setItem('rpchat_chats', 'new-chats');
+        localStorage.setItem('rpchat_moments', 'new-moments');
+        localStorage.setItem('rpchat_app_state_updated_at', '999');
+      },
+      read(){ return {
+        settings, characters, allChats, allMoments, currentCharId, restoredMemory,
+        localStorage: Object.fromEntries(localRows)
+      }; }
+    };
+  `);
+  const initial = {
+    settings: { theme: 'pink' },
+    characters: [{ id: 'retained' }],
+    allChats: { retained: { messages: [{ id: 'm1', content: 'keep' }] } },
+    allMoments: [{ id: 'moment1', charId: 'retained' }],
+    currentCharId: 'retained',
+    localStorage: {
+      rpchat_settings: 'old-settings',
+      rpchat_characters: 'old-characters',
+      rpchat_chats: 'old-chats',
+      rpchat_moments: 'old-moments',
+      rpchat_app_state_updated_at: '123'
+    },
+    chatMemory: { summaries: [{ id: 's1', charId: 'retained' }] },
+    fullMemory: { events: [{ id: 'e1', charId: 'retained' }] }
+  };
+  const runtime = build(initial);
+  const snapshot = await runtime.captureWebStateReplacementSnapshot('full');
+  runtime.replace();
+  await runtime.restoreWebStateReplacementSnapshot(snapshot);
+  assert.deepEqual(runtime.read(), {
+    settings: initial.settings,
+    characters: initial.characters,
+    allChats: initial.allChats,
+    allMoments: initial.allMoments,
+    currentCharId: 'retained',
+    restoredMemory: { mode: 'full', value: initial.fullMemory },
+    localStorage: initial.localStorage
+  });
+});
+
+test('a newly observed native role tombstone rolls back only unaccepted local semantic work', () => {
+  assert.match(html, /function\s+suppressPendingWebTurnForRoleDeletion\(charId\)/);
+  const suppress = html.slice(
+    html.indexOf('function suppressPendingWebTurnForRoleDeletion'),
+    html.indexOf('function markRoleDeletePending')
+  );
+  assert.match(suppress, /nativeAcceptedAt/);
+  assert.match(suppress, /refundStagedOutgoingPayment/);
+  assert.match(suppress, /deliveryState\s*=\s*['"]staged['"]/);
+  assert.match(suppress, /provisionalNativeOnly/);
+  assert.match(suppress, /previousReplyState/);
+  assert.match(suppress, /delete\s+chat\.pendingReply/);
+
+  const markPending = html.slice(
+    html.indexOf('function markRoleDeletePending'),
+    html.indexOf('async function roleDeleteControlStatus')
+  );
+  assert.ok(
+    markPending.indexOf('suppressPendingWebTurnForRoleDeletion') >= 0
+      && markPending.indexOf('suppressPendingWebTurnForRoleDeletion') < markPending.indexOf("DB.set('characters'"),
+    'the semantic rollback must happen as soon as a native tombstone is observed'
+  );
+
+  const retry = html.slice(
+    html.indexOf('async function retryFailedReply'),
+    html.indexOf('function showReplyFailureReason')
+  );
+  assert.match(retry, /previousReplyState/);
+  const voice = html.slice(
+    html.indexOf('async function sendVoicePlaceholderMessage'),
+    html.indexOf('async function sendVoiceMessage')
+  );
+  assert.match(voice, /provisionalNativeOnly:\s*true/);
+});
+
+test('role-deletion rollback refunds once and distinguishes staged, provisional, retry, and accepted work', () => {
+  const batchHelpers = html.slice(
+    html.indexOf('function currentStagedBatch'),
+    html.indexOf('function commitStagedBatch')
+  );
+  const refund = html.slice(
+    html.indexOf('function refundStagedOutgoingPayment'),
+    html.indexOf('async function retractMessage')
+  );
+  const suppress = html.slice(
+    html.indexOf('function suppressPendingWebTurnForRoleDeletion'),
+    html.indexOf('function markRoleDeletePending')
+  );
+  const build = new Function('state', `
+    let allChats = state.allChats;
+    let wallet = state.wallet;
+    const nativeReplyQueuedIds = new Set(state.queued || []);
+    const DB = { set(){ state.writes += 1; } };
+    function walletBalance(){ return wallet; }
+    function saveWalletBalance(value){ wallet = value; state.wallet = value; }
+    function uid(prefix){ return prefix + '_test'; }
+    function messageById(chat, id){ return (chat?.messages || []).find(message => message.id === id); }
+    ${batchHelpers}
+    ${refund}
+    ${suppress}
+    return { suppressPendingWebTurnForRoleDeletion, nativeReplyQueuedIds };
+  `);
+
+  const state = {
+    wallet: 70,
+    writes: 0,
+    queued: ['turn-batch'],
+    allChats: {
+      role: {
+        messages: [
+          { id: 'text', role: 'user', content: 'hi', batchId: 'b', deliveryState: 'sent', batchCommittedAt: 10 },
+          { id: 'pay', role: 'user', type: 'transfer', payType: 'transfer', amount: 30, batchId: 'b', deliveryState: 'sent', batchCommittedAt: 10 }
+        ],
+        pendingReply: {
+          userMessageId: 'pay', nativeTurnId: 'turn-batch', batchId: 'b',
+          batchMessageIds: ['text', 'pay'], batchStartedAt: 5, createdAt: 10
+        }
+      }
+    }
+  };
+  const runtime = build(state);
+  assert.equal(runtime.suppressPendingWebTurnForRoleDeletion('role'), true);
+  assert.equal(state.wallet, 100);
+  assert.equal(state.allChats.role.messages[0].deliveryState, 'staged');
+  assert.equal(state.allChats.role.messages[1].deliveryState, 'cancelled');
+  assert.equal(state.allChats.role.messages[1].refunded, true);
+  assert.deepEqual(state.allChats.role.stagedBatch.messageIds, ['text']);
+  assert.equal(state.allChats.role.pendingReply, undefined);
+  assert.equal(runtime.nativeReplyQueuedIds.has('turn-batch'), false);
+  assert.equal(runtime.suppressPendingWebTurnForRoleDeletion('role'), false);
+  assert.equal(state.wallet, 100, 'a repeated tombstone must not refund twice');
+
+  state.allChats.voice = {
+    messages: [{ id: 'voice', role: 'user', type: 'voice', provisionalNativeOnly: true, replyState: 'pending' }],
+    pendingReply: { userMessageId: 'voice', nativeTurnId: 'turn-voice' }
+  };
+  assert.equal(runtime.suppressPendingWebTurnForRoleDeletion('voice'), true);
+  assert.deepEqual(state.allChats.voice.messages, []);
+
+  state.allChats.retry = {
+    messages: [{ id: 'retry', role: 'user', replyState: 'pending' }],
+    pendingReply: {
+      userMessageId: 'retry', nativeTurnId: 'turn-retry',
+      previousReplyState: 'failed', previousReplyError: 'old failure'
+    }
+  };
+  assert.equal(runtime.suppressPendingWebTurnForRoleDeletion('retry'), true);
+  assert.equal(state.allChats.retry.messages[0].replyState, 'failed');
+  assert.equal(state.allChats.retry.messages[0].replyError, 'old failure');
+
+  state.allChats.accepted = {
+    messages: [{ id: 'accepted', role: 'user', replyState: 'pending' }],
+    pendingReply: { userMessageId: 'accepted', nativeTurnId: 'turn-accepted', nativeAcceptedAt: 99 }
+  };
+  assert.equal(runtime.suppressPendingWebTurnForRoleDeletion('accepted'), true);
+  assert.equal(state.allChats.accepted.messages[0].replyState, 'suppressed');
+  assert.equal(state.allChats.accepted.pendingReply, undefined);
 });
 
 test('Android clear durably prearms lifecycle recovery before its Room transaction commits', () => {
@@ -381,11 +837,13 @@ test('native completed turns are serialized across submit, poll, inbox, and fore
 
 test('native delivery diagnostics persist and expose four independent convergence stages', () => {
   assert.match(executionDatabase, /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION/);
-  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*14/);
+  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*15/);
   assert.match(executionDatabase, /MIGRATION_9_10/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
   assert.match(executionDatabase, /MIGRATION_12_13/);
+  assert.match(executionDatabase, /MIGRATION_13_14/);
+  assert.match(executionDatabase, /MIGRATION_14_15/);
   assert.match(chatTurnEntity, /Long\s+notificationShownAt/);
   assert.match(chatTurnEntity, /Long\s+cloudConfirmedAt/);
   assert.match(executionDao, /markNotificationShown/);

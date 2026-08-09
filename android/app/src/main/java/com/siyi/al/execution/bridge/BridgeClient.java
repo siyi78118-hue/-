@@ -253,27 +253,37 @@ public final class BridgeClient {
     /** Independent control route; it never uses a turn endpoint or TurnSubmission. */
     public LifecycleControlSender.ControlRoute lifecycleControlRoute(boolean cloud) {
         return (control, relayMessageId, idempotencyKey, expiresAt) ->
-            sendConversationClear(control, cloud, relayMessageId, idempotencyKey, expiresAt);
+            sendLifecycleControl(control, cloud, relayMessageId, idempotencyKey, expiresAt);
     }
 
-    private LifecycleControlSender.ControlDelivery sendConversationClear(
+    private LifecycleControlSender.ControlDelivery sendLifecycleControl(
         LifecycleControl control,
         boolean cloud,
         String relayMessageId,
         String idempotencyKey,
         long expiresAt
     ) throws Exception {
-        if (control == null || !LifecycleControl.CLEAR_KIND.equals(control.controlKind)) {
+        if (control == null || (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)
+            && !LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind))) {
             throw new IllegalArgumentException("unsupported lifecycle control kind");
         }
         LifecycleControlCodec.validateSemantic(new JSONObject(control.semanticJson));
         if (!config.enabled) throw new BridgeFinalException("BRIDGE_NOT_CONFIGURED", false);
         if (!cloud) {
             if (!config.hasLan()) throw new BridgeFinalException("LAN_BRIDGE_NOT_CONFIGURED", false);
+            boolean roleDelete = LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind);
             HttpResult response = signedLan(
-                "POST", "/v3/controls/conversation-clear", control.semanticJson);
-            requireSuccess(response, "LAN conversation clear");
+                "POST", roleDelete ? "/v3/controls/role-delete"
+                    : "/v3/controls/conversation-clear", control.semanticJson);
+            requireSuccess(response, roleDelete ? "LAN role delete" : "LAN conversation clear");
             JSONObject applied = new JSONObject(response.body == null ? "{}" : response.body);
+            if (roleDelete && response.status == 202) {
+                LifecycleControlSender.validateRoleDeletePending(applied, control);
+                return new LifecycleControlSender.ControlDelivery(false, null, 0L, 0L);
+            }
+            if (response.status != 200) {
+                throw new IllegalArgumentException("lifecycle LAN response status conflict");
+            }
             LifecycleControlSender.validateAppliedAck(applied, control);
             return new LifecycleControlSender.ControlDelivery(
                 true, null, 0L, applied.getLong("appliedAt"));
@@ -508,9 +518,11 @@ public final class BridgeClient {
 
     private static boolean isLifecycleControlCandidate(JSONObject value) {
         if (value == null) return false;
-        if ("CONVERSATION_CLEAR_APPLIED".equals(value.opt("type"))) return true;
+        if ("CONVERSATION_CLEAR_APPLIED".equals(value.opt("type"))
+            || "ROLE_DELETE_APPLIED".equals(value.opt("type"))) return true;
         for (String marker : new String[] {
-            "controlId", "controlChecksum", "clearEpoch", "clearedThroughSequence", "appliedAt"
+            "controlId", "controlChecksum", "clearEpoch", "clearedThroughSequence",
+            "backupReceiptId", "appliedAt"
         }) {
             if (value.has(marker)) return true;
         }

@@ -2403,28 +2403,89 @@ async function exportChatBackup() {
   }
 }
 
+function cloneWebStateValue(value) {
+  if (typeof structuredClone === 'function') return structuredClone(value);
+  return JSON.parse(JSON.stringify(value));
+}
+
+const WEB_STATE_REPLACEMENT_STORAGE_KEYS = [
+  'rpchat_settings',
+  'rpchat_characters',
+  'rpchat_chats',
+  'rpchat_moments',
+  'rpchat_app_state_updated_at'
+];
+
+function webStateReplacementRoleIds(candidateCharacters = []) {
+  return [...new Set([
+    ...(characters || []).map(char => String(char?.id || '')),
+    ...(candidateCharacters || []).map(char => String(char?.id || ''))
+  ].filter(Boolean))];
+}
+
+async function captureWebStateReplacementSnapshot(memoryMode = 'none') {
+  return {
+    settings: cloneWebStateValue(settings),
+    characters: cloneWebStateValue(characters),
+    allChats: cloneWebStateValue(allChats),
+    allMoments: cloneWebStateValue(allMoments),
+    currentCharId,
+    localStorageRows: Object.fromEntries(
+      WEB_STATE_REPLACEMENT_STORAGE_KEYS.map(key => [key, localStorage.getItem(key)])
+    ),
+    memoryMode,
+    memory: memoryMode === 'chat'
+      ? await dumpChatMemoryStores()
+      : (memoryMode === 'full' ? await dumpMemoryStores() : null)
+  };
+}
+
+async function restoreWebStateReplacementSnapshot(snapshot) {
+  if (!snapshot) return false;
+  settings = snapshot.settings;
+  characters = snapshot.characters;
+  allChats = snapshot.allChats;
+  allMoments = snapshot.allMoments;
+  currentCharId = snapshot.currentCharId;
+  for (const key of WEB_STATE_REPLACEMENT_STORAGE_KEYS) {
+    const value = snapshot.localStorageRows?.[key];
+    if (value === null || value === undefined) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  }
+  if (snapshot.memoryMode === 'chat') await restoreChatMemoryStores(snapshot.memory || {});
+  else if (snapshot.memoryMode === 'full') await restoreMemoryStores(snapshot.memory || {});
+  return true;
+}
+
 async function importChatBackup(event) {
   const input = event?.target;
   const file = input?.files?.[0];
   if (input) input.value = '';
   if (!file) return;
   if (!confirm('恢复会替换当前角色、聊天、朋友圈和记忆库，但保留 API、钱包、设备与云闹钟设置。继续？')) return;
+  let rollbackSnapshot = null;
+  let replacementCommitted = false;
   try {
     const data = JSON.parse(await file.text());
     if (!data || typeof data !== 'object' || data.app !== 'AL-chat-history') throw new Error('不是 AL 聊天数据备份');
+    const importedCharacters = Array.isArray(data.characters) ? data.characters.map(normalizeChar) : [];
+    const replacementRoleIds = webStateReplacementRoleIds(importedCharacters);
+    await assertNativeRoleDeletionAllowsStateReplacement(importedCharacters, nativeExecutionPlugin(), replacementRoleIds);
+    rollbackSnapshot = await captureWebStateReplacementSnapshot('chat');
     await Promise.allSettled(Object.keys(allChats || {}).flatMap(charId =>
       PROACTIVE_JOB_KINDS.map(kind => cancelCloudProactive(charId, kind))
     ));
-    characters = Array.isArray(data.characters) ? data.characters.map(normalizeChar) : [];
+    characters = importedCharacters;
     allChats = clearImportedCloudJobs(data.allChats && typeof data.allChats === 'object' ? data.allChats : {});
     allMoments = Array.isArray(data.allMoments) ? data.allMoments : [];
     scrubEmptyReplyMessages(allChats);
     repairKnownDeliveredReplyStates(allChats);
+    await restoreChatMemoryStores(data.memory || {});
+    await assertNativeRoleDeletionAllowsStateReplacement(importedCharacters, nativeExecutionPlugin(), replacementRoleIds);
     localStorage.setItem('rpchat_characters', JSON.stringify(characters));
     localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
     localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
     localStorage.setItem('rpchat_app_state_updated_at', String(Date.now()));
-    await restoreChatMemoryStores(data.memory || {});
     currentCharId = characters.find(char => allChats[char.id])?.id || characters[0]?.id || null;
     if (currentCharId && !allChats[currentCharId]) {
       const char = characters.find(item => item.id === currentCharId);
@@ -2432,6 +2493,7 @@ async function importChatBackup(event) {
       localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
     }
     await mirrorAppStateNow();
+    replacementCommitted = true;
     renderChats();
     renderContacts();
     renderMoments();
@@ -2440,6 +2502,10 @@ async function importChatBackup(event) {
     ensureCloudProactiveScheduled({ force: true }).catch(err => console.warn('[AL Timer] restored chat schedule skipped:', err.message));
     toast('聊天数据已恢复，当前 API Key 和云闹钟设置未改变', 3000);
   } catch (err) {
+    if (rollbackSnapshot && !replacementCommitted) {
+      await restoreWebStateReplacementSnapshot(rollbackSnapshot);
+      await restorePendingRoleDeletions().catch(() => {});
+    }
     toast('聊天数据恢复失败：' + friendlyErrorMessage(err), 3600);
   }
 }
@@ -2450,24 +2516,39 @@ async function importBackup(event) {
   if (input) input.value = '';
   if (!file) return;
   if (!confirm('导入会覆盖当前本机设置、角色、聊天、朋友圈和记忆库。继续？')) return;
+  let rollbackSnapshot = null;
+  let replacementCommitted = false;
   try {
     const data = JSON.parse(await file.text());
     if (!data || typeof data !== 'object' || data.app !== 'AL') throw new Error('不是 AL 备份文件');
+    const importedCharacters = Array.isArray(data.characters) ? data.characters.map(normalizeChar) : [];
+    const replacementRoleIds = webStateReplacementRoleIds(importedCharacters);
+    await assertNativeRoleDeletionAllowsStateReplacement(importedCharacters, nativeExecutionPlugin(), replacementRoleIds);
+    rollbackSnapshot = await captureWebStateReplacementSnapshot('full');
     settings = resetImportedDeviceBinding(data.settings || {});
-    characters = Array.isArray(data.characters) ? data.characters.map(normalizeChar) : [];
+    characters = importedCharacters;
     allChats = clearImportedCloudJobs(data.allChats && typeof data.allChats === 'object' ? data.allChats : (data.chats || {}));
     allMoments = Array.isArray(data.allMoments) ? data.allMoments : (Array.isArray(data.moments) ? data.moments : []);
     scrubEmptyReplyMessages(allChats);
     repairKnownDeliveredReplyStates(allChats);
+    await restoreMemoryStores(data.memory || {});
+    await assertNativeRoleDeletionAllowsStateReplacement(importedCharacters, nativeExecutionPlugin(), replacementRoleIds);
+    currentCharId = characters.find(c => allChats[c.id])?.id || characters[0]?.id || null;
+    if (currentCharId && !allChats[currentCharId]) {
+      allChats[currentCharId] = {
+        messages: [],
+        charPrompt: buildCharPrompt(characters.find(c => c.id === currentCharId)),
+        extraPrompt: '',
+        unread: 0
+      };
+    }
     localStorage.setItem('rpchat_settings', JSON.stringify(settings));
     localStorage.setItem('rpchat_characters', JSON.stringify(characters));
     localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
     localStorage.setItem('rpchat_moments', JSON.stringify(allMoments));
     localStorage.setItem('rpchat_app_state_updated_at', String(Date.now()));
-    await restoreMemoryStores(data.memory || {});
     await mirrorAppStateNow();
-    currentCharId = characters.find(c => allChats[c.id])?.id || characters[0]?.id || null;
-    if (currentCharId && !allChats[currentCharId]) allChats[currentCharId] = { messages: [], charPrompt: buildCharPrompt(characters.find(c => c.id === currentCharId)), extraPrompt: '', unread: 0 };
+    replacementCommitted = true;
     renderChats();
     renderContacts();
     renderMoments();
@@ -2476,6 +2557,10 @@ async function importBackup(event) {
     showScreen('chats');
     toast('备份已导入，云闹钟需重新绑定');
   } catch (err) {
+    if (rollbackSnapshot && !replacementCommitted) {
+      await restoreWebStateReplacementSnapshot(rollbackSnapshot);
+      await restorePendingRoleDeletions().catch(() => {});
+    }
     toast('导入失败：' + friendlyErrorMessage(err), 3600);
   }
 }
@@ -3836,6 +3921,7 @@ function nativeTerminalUiLanding(result, chat, sourceTurnId) {
   return null;
 }
 function nativeTurnHasUiLanding(result) {
+  if (typeof roleDeletionFrozen === 'function' && roleDeletionFrozen(result?.characterId)) return true;
   const chat = allChats[result?.characterId];
   if (!chat) return false;
   const kind = String(result?.kind || 'DIRECT_REPLY');
@@ -3880,6 +3966,36 @@ async function acknowledgeNativeUiAppliedOnce(plugin, result) {
     throw error;
   }
 }
+async function nativeRoleDeletionResultDisposition(plugin, characterId) {
+  const charId = String(characterId || '');
+  if (!charId) return 'open';
+  if (typeof roleDeletionFrozen === 'function' && roleDeletionFrozen(charId)) return 'blocked';
+  // A legacy binary exposes neither role-delete method and therefore cannot
+  // own a retained role-delete tombstone. A partially upgraded bridge is not
+  // safe to guess: if suppression exists without status, defer the result.
+  if (!plugin?.getRoleDeleteStatus) return plugin?.suppressRoleDeletedTurn ? 'unknown' : 'open';
+  try {
+    const control = await roleDeleteControlStatus(charId, plugin);
+    return control.state === 'none' ? 'open' : 'blocked';
+  } catch (error) {
+    return 'unknown';
+  }
+}
+async function suppressNativeRoleDeletedResult(plugin, result) {
+  const disposition = await nativeRoleDeletionResultDisposition(plugin, result?.characterId);
+  if (disposition === 'open') return false;
+  if (disposition === 'unknown' || !plugin?.suppressRoleDeletedTurn) return null;
+  await nativeBridgeCall(
+    plugin.suppressRoleDeletedTurn({
+      turnId: String(result?.turnId || ''),
+      characterId: String(result?.characterId || '')
+    }),
+    'suppressRoleDeletedTurn'
+  );
+  nativeReplyQueuedIds.delete(result?.turnId);
+  nativeUiAcknowledgedTurnIds.add(String(result?.turnId || ''));
+  return true;
+}
 async function drainNativeUiInbox(
   plugin,
   applyTurn = applyNativeExecutionTurn,
@@ -3896,6 +4012,12 @@ async function drainNativeUiInbox(
   let changed = false;
   for (const result of turns) {
     try {
+      const suppressed = await suppressNativeRoleDeletedResult(plugin, result);
+      if (suppressed === true) {
+        changed = true;
+        continue;
+      }
+      if (suppressed === null) continue;
       changed = await applyTurn(result) || changed;
       if (!hasLanded(result)) continue;
       await acknowledgeNativeUiAppliedOnce(plugin, result);
@@ -3920,8 +4042,14 @@ async function replayRecentNativeCompletedTurns(
     .sort((a, b) => Number(a.completedAt || a.createdAt) - Number(b.completedAt || b.createdAt));
   let changed = false;
   for (const result of turns) {
-    if (hasLanded(result)) continue;
     try {
+      const suppressed = await suppressNativeRoleDeletedResult(plugin, result);
+      if (suppressed === true) {
+        changed = true;
+        continue;
+      }
+      if (suppressed === null) continue;
+      if (hasLanded(result)) continue;
       changed = await applyTurn(result) || changed;
     } catch (err) {
       console.warn('[AL Native Execution] completed recovery deferred:', result?.turnId, err.message);
@@ -4300,6 +4428,10 @@ async function applyNativeExecutionTurnUnlocked(result) {
   const chat = allChats[charId];
   const kind = String(result?.kind || 'DIRECT_REPLY');
   if (!chat) return false;
+  if (typeof roleDeletionFrozen === 'function' && roleDeletionFrozen(charId)) {
+    nativeReplyQueuedIds.delete(result?.turnId);
+    return false;
+  }
   if (typeof nativeResultSuppressedByClear === 'function' && await nativeResultSuppressedByClear(result)) {
     nativeReplyQueuedIds.delete(result?.turnId);
     return false;
@@ -4609,8 +4741,10 @@ function stableLegacyVisibleMessageId(charId, message, index) {
 
 async function syncYuqiVisibleHistory(charId, excludedMessageIds = new Set()) {
   if (!isNativeApp()) return { saved: false, inserted: 0 };
+  if (roleDeletionFrozen(charId)) return { saved: false, inserted: 0, suppressed: true };
   const plugin = nativeExecutionPlugin();
   if (!plugin?.ingestVisibleMessages) return { saved: false, inserted: 0 };
+  await assertNativeRoleDeletionAcceptsWork(charId, plugin);
   const chat = allChats[charId];
   if (!chat) return { saved: false, inserted: 0 };
   const messages = (chat.messages || []).flatMap((message, index) => {
@@ -4635,6 +4769,7 @@ async function syncYuqiVisibleHistory(charId, excludedMessageIds = new Set()) {
 }
 
 async function queueAndroidProactiveTurn(charId, job = null, triggerMode = 'planned') {
+  assertRoleDeletionAcceptsWork(charId);
   const plugin = nativeExecutionPlugin();
   if (!plugin?.submitTurn) throw new Error('安卓原生执行组件不可用，请更新或重新安装 AL');
   await syncYuqiVisibleHistory(charId);
@@ -4648,6 +4783,7 @@ async function queueAndroidProactiveTurn(charId, job = null, triggerMode = 'plan
     dueAt: new Date(scheduledFor).toISOString(),
     mode: triggerMode
   });
+  await assertNativeRoleDeletionAcceptsWork(charId, plugin);
   const result = await plugin.submitTurn({
     turnId,
     characterId: charId,
@@ -4669,6 +4805,7 @@ async function queueAndroidProactiveTurn(charId, job = null, triggerMode = 'plan
 }
 
 async function queueYuqiMomentTurn(charId, moment, kind, context = {}) {
+  assertRoleDeletionAcceptsWork(charId);
   const plugin = nativeExecutionPlugin();
   if (!plugin?.submitTurn) throw new Error('Android native execution is unavailable');
   await saveNativeExecutionApiConfigs();
@@ -4733,6 +4870,7 @@ async function queueYuqiMomentTurn(charId, moment, kind, context = {}) {
         targetMoment: canonicalMoment,
         targetComment: canonicalComment
       };
+  await assertNativeRoleDeletionAcceptsWork(charId, plugin);
   const result = await plugin.submitTurn({
     turnId, characterId: charId, sourceMessageId, kind,
     inputJson: JSON.stringify(input), snapshotJson: JSON.stringify(built?.snapshot || {}), createdAt
@@ -4743,6 +4881,7 @@ async function queueYuqiMomentTurn(charId, moment, kind, context = {}) {
 }
 
 async function queueAndroidUserReply(charId, userMessageId, options = {}) {
+  assertRoleDeletionAcceptsWork(charId);
   const chat = allChats[charId];
   const userMessage = messageById(chat, userMessageId);
   if (!chat || !messageAvailableToAI(userMessage)) return false;
@@ -4795,6 +4934,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     const wireSourceMessage = wireBatchMessages.find(message => message.messageId === userMessageId)
       || wireBatchMessages.at(-1)
       || batchMessageForAI(charId, userMessage);
+    await assertNativeRoleDeletionAcceptsWork(charId, plugin);
     const result = await plugin.submitTurn({
       turnId,
       characterId: charId,
@@ -4951,13 +5091,33 @@ async function restoreAppStateFromMirror() {
   if (!mirrored?.updatedAt) return false;
   const localUpdatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || 0;
   if (mirrored.updatedAt <= localUpdatedAt) return false;
+  const mirroredCharacters = (mirrored.characters || characters).map(normalizeChar);
+  const replacementRoleIds = webStateReplacementRoleIds(mirroredCharacters);
+  const rollbackSnapshot = await captureWebStateReplacementSnapshot('none');
+  try {
+    await assertNativeRoleDeletionAllowsStateReplacement(
+      mirroredCharacters, nativeExecutionPlugin(), replacementRoleIds
+    );
+  } catch (error) {
+    await restorePendingRoleDeletions();
+    return false;
+  }
   const localChats = allChats;
   settings = migrateSettings(mirrored.settings || settings);
-  characters = (mirrored.characters || characters).map(normalizeChar);
+  characters = mirroredCharacters;
   allChats = mergeLocalPendingReplies(mirrored.allChats || allChats, localChats);
   allMoments = Array.isArray(mirrored.allMoments) ? mirrored.allMoments : allMoments;
   scrubEmptyReplyMessages(allChats);
   repairKnownDeliveredReplyStates(allChats);
+  try {
+    await assertNativeRoleDeletionAllowsStateReplacement(
+      mirroredCharacters, nativeExecutionPlugin(), replacementRoleIds
+    );
+  } catch (error) {
+    await restoreWebStateReplacementSnapshot(rollbackSnapshot);
+    await restorePendingRoleDeletions();
+    return false;
+  }
   localStorage.setItem('rpchat_settings', JSON.stringify(settings));
   localStorage.setItem('rpchat_characters', JSON.stringify(characters));
   localStorage.setItem('rpchat_chats', JSON.stringify(allChats));
@@ -5270,6 +5430,7 @@ function currentStagedBatch(chat) {
 }
 function stagePlayerMessage(chat, content, extra = {}, now = Date.now()) {
   if (!chat) return null;
+  assertRoleDeletionAcceptsChat(chat);
   const batch = currentStagedBatch(chat) || {
     batchId: uid('batch'),
     messageIds: [],
@@ -6648,7 +6809,9 @@ function renderChats() {
   const roleRows = characters.map(c => {
     const chat = allChats[c.id];
     const last = lastVisibleMessage(chat);
-    const preview = last ? messagePreview(last) : (c.firstMessage || c.description || c.personality || '');
+    const preview = c.roleDeletePending
+      ? '删除处理中，正在等待手机与电脑确认。'
+      : (last ? messagePreview(last) : (c.firstMessage || c.description || c.personality || ''));
     const unread = chat?.unread || 0;
     return { c, last, preview, unread, time: last?.time || 0, pinned: !!chat?.pinned, muted: !!chat?.muted };
   }).filter(r => !keyword || [r.c.name, r.preview, r.c.description, r.c.personality].some(v => String(v || '').toLowerCase().includes(keyword)))
@@ -6663,7 +6826,7 @@ function renderChats() {
     <button class="row ${r.pinned ? 'pinned' : ''}" onclick="openChat('${r.c.id}')">
       ${avatarHtml(r.c)}
       <div class="row-main">
-        <div class="row-line"><div class="row-name">${esc(r.c.name)}</div><div class="row-time">${fmtTime(r.time) || ''}</div></div>
+        <div class="row-line"><div class="row-name">${esc(r.c.name)}${r.c.roleDeletePending ? '（删除处理中）' : ''}</div><div class="row-time">${fmtTime(r.time) || ''}</div></div>
         <div class="row-line"><div class="row-preview">${esc(r.preview)}</div>${r.unread ? `<span class="badge">${r.unread}</span>` : ''}</div>
       </div>
       ${r.muted ? '<span class="mute"></span>' : ''}
@@ -6706,7 +6869,7 @@ function renderContacts() {
     ${group.rows.map(c => `
       <button class="row" onclick="openContactProfile('${c.id}')">
         ${avatarHtml(c)}
-        <div class="row-main"><div class="row-name">${esc(c.name)}</div><div class="row-preview">${esc(c.description || c.personality || '')}</div></div>
+        <div class="row-main"><div class="row-name">${esc(c.name)}${c.roleDeletePending ? '（删除处理中）' : ''}</div><div class="row-preview">${esc(c.roleDeletePending ? '删除处理中，角色会在确认完成前保留在这里。' : (c.description || c.personality || ''))}</div></div>
       </button>`).join('')}`
   ).join('');
 }
@@ -8882,6 +9045,7 @@ async function continueAssistantTurn(requestCharId, userText, options = {}) {
   return run;
 }
 function createPendingUserMessage(chat, content, extra = {}) {
+  assertRoleDeletionAcceptsChat(chat);
   const message = { id: uid('msg'), role: 'user', content, time: Date.now(), replyState: 'pending', ...extra };
   chat.messages.push(message);
   chat.pendingReply = {
@@ -8895,6 +9059,7 @@ function createPendingUserMessage(chat, content, extra = {}) {
   return message;
 }
 async function retryFailedReply(charId, userMessageId) {
+  assertRoleDeletionAcceptsWork(charId);
   const chat = allChats[charId];
   const message = messageById(chat, userMessageId);
   if (!chat || !messageAvailableToAI(message) || message.role !== 'user' || message.replyState !== 'failed') return false;
@@ -8902,6 +9067,8 @@ async function retryFailedReply(charId, userMessageId) {
   if (activeChatRequests.has(charId)) return false;
   const oldPending = chat.pendingReply?.userMessageId === userMessageId ? chat.pendingReply : null;
   const savedOptions = oldPending?.options || {};
+  const previousReplyState = message.replyState;
+  const previousReplyError = message.replyError;
   const retryStartedAt = Date.now();
   const nativeRetry = isNativeApp();
   const retryOfTurnId = nativeRetry ? nativeRetryRootTurnId(userMessageId) : '';
@@ -8917,7 +9084,9 @@ async function retryFailedReply(charId, userMessageId) {
     state: 'pending',
     createdAt: retryStartedAt,
     updatedAt: retryStartedAt,
-    ...(nativeRetry ? { nativeTurnId: turnId, retryOfTurnId, retryLineageTurnIds } : {})
+    ...(nativeRetry ? { nativeTurnId: turnId, retryOfTurnId, retryLineageTurnIds } : {}),
+    previousReplyState: previousReplyState || 'failed',
+    previousReplyError: previousReplyError || ''
   };
   message.replyState = 'pending';
   delete message.replyError;
@@ -8930,6 +9099,7 @@ async function retryFailedReply(charId, userMessageId) {
       await saveNativeExecutionApiConfigs();
       const task = buildAndroidUserReplyTask(charId, userMessageId, chat.pendingReply.userText, savedOptions, chat.pendingReply.createdAt);
       const snapshot = await buildNativeExecutionSnapshot(charId, task);
+      await assertNativeRoleDeletionAcceptsWork(charId, plugin);
       const result = await plugin.submitTurn({
         turnId,
         characterId: charId,
@@ -9092,6 +9262,16 @@ function renderPayScreen() {
 }
 async function submitPayMessage() {
   if (!currentCharId || isStreaming) return;
+  if (roleDeletionFrozen(currentCharId)) {
+    toast('角色删除处理中，不能再发送红包或转账');
+    return false;
+  }
+  try {
+    await assertNativeRoleDeletionAcceptsWork(currentCharId);
+  } catch (error) {
+    toast(error?.message || '角色删除状态无法确认');
+    return false;
+  }
   const kind = payDraftKind === 'redpacket' ? 'redpacket' : 'transfer';
   const char = characters.find(c => c.id === currentCharId);
   const amountInput = document.getElementById('pay-amount-input');
@@ -9103,13 +9283,12 @@ async function submitPayMessage() {
   const chat = allChats[currentCharId];
   if (!chat) return;
   cancelCloudProactive(currentCharId, 'chat');
-  saveWalletBalance(walletBalance() - amount);
   closeComposerPanels();
   const content = kind === 'redpacket'
     ? `${playerName()}给${char?.name || '对方'}发了一个红包：${formatMoney(amount)}${note ? `，备注：${note}` : ''}`
     : `${playerName()}向${char?.name || '对方'}转账${formatMoney(amount)}${note ? `，备注：${note}` : ''}`;
   const sentAt = Date.now();
-  stagePlayerMessage(chat, content, {
+  const staged = stagePlayerMessage(chat, content, {
     type: kind,
     payType: kind,
     amount,
@@ -9118,6 +9297,8 @@ async function submitPayMessage() {
     payExpiresAt: null,
     time: sentAt
   });
+  if (!staged) return false;
+  saveWalletBalance(walletBalance() - amount);
   DB.set('chats', allChats);
   if (amountInput) amountInput.value = '';
   if (noteInput) noteInput.value = '';
@@ -10010,6 +10191,10 @@ async function sendMessage() {
   const text = input.value.trim();
   if (!text || isStreaming || !currentCharId) return;
   const requestCharId = currentCharId;
+  if (roleDeletionFrozen(requestCharId)) {
+    toast('角色删除处理中，不能再发送消息');
+    return false;
+  }
   input.value = '';
   input.style.height = 'auto';
   document.getElementById('btn-send').className = 'send inactive';
@@ -10024,6 +10209,10 @@ async function sendMessage() {
 }
 async function finishStagedBatch(charId = currentCharId) {
   if (!charId || isStreaming) return false;
+  if (roleDeletionFrozen(charId)) {
+    toast('角色删除处理中，不能发送这批消息');
+    return false;
+  }
   const chat = allChats[charId];
   const committed = commitStagedBatch(chat);
   if (!committed?.sourceMessage) return false;
@@ -10139,13 +10328,19 @@ async function transcribeVoiceBlob(blob, duration, charId = currentCharId) {
 async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random() * 7), reason = '') {
   if (isStreaming || !currentCharId) return;
   const requestCharId = currentCharId;
+  if (roleDeletionFrozen(requestCharId)) {
+    toast('角色删除处理中，不能再发送语音');
+    return false;
+  }
   const chat = allChats[requestCharId];
   if (!chat) return;
   closeComposerPanels();
   const actualDuration = Math.max(1, Math.min(60, Number(duration) || 4));
   const content = `[语音消息 ${actualDuration}秒，未转文字]`;
   cancelCloudProactive(requestCharId, 'chat');
-  const message = createPendingUserMessage(chat, content, { type: 'voice', voiceDuration: actualDuration });
+  const message = createPendingUserMessage(chat, content, {
+    type: 'voice', voiceDuration: actualDuration, provisionalNativeOnly: true
+  });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (reason) toast(reason, 2200);
@@ -10162,11 +10357,17 @@ async function sendVoiceTranscriptMessage(transcript, duration) {
   const text = String(transcript || '').trim();
   if (!text) return sendVoicePlaceholderMessage(duration, '语音没有识别出文字');
   const requestCharId = currentCharId;
+  if (roleDeletionFrozen(requestCharId)) {
+    toast('角色删除处理中，不能再发送语音');
+    return false;
+  }
   const chat = allChats[requestCharId];
   if (!chat) return;
   closeComposerPanels();
   cancelCloudProactive(requestCharId, 'chat');
-  const message = createPendingUserMessage(chat, text, { type: 'voice', transcript: text, voiceDuration: duration });
+  const message = createPendingUserMessage(chat, text, {
+    type: 'voice', transcript: text, voiceDuration: duration, provisionalNativeOnly: true
+  });
   DB.set('chats', allChats);
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
@@ -12520,13 +12721,289 @@ async function clearCurrentChat() {
   if (outcome.ok) toast(outcome.cleanupWarnings?.length ? '已清空，部分本地缓存清理待重试' : (outcome.pending ? '清除请求已提交，正在等待原生确认' : '已清空'));
   else toast('清空失败，聊天记录未改动');
 }
-async function deleteCurrentRole() {
-  if (!currentCharId || !confirm('删除这个角色？会同时删除它的聊天、云闹钟、本地记忆库和朋友圈痕迹。')) return;
-  const deletedId = currentCharId;
+
+const ROLE_DELETE_CONTROL_STATES = new Set(['waiting', 'pending', 'relay_accepted', 'applied', 'quarantined']);
+const ROLE_DELETE_CONTROL_KEYS = Object.freeze([
+  'characterId', 'controlId', 'state', 'requestedAt', 'appliedAt', 'semanticChecksum'
+]);
+
+function roleDeletionFrozen(charId) {
+  if (!isNativeApp() || !charId) return false;
+  const pending = characters.find(item => item.id === charId)?.roleDeletePending;
+  return !!pending && pending.state !== 'none';
+}
+
+function assertRoleDeletionAcceptsWork(charId) {
+  if (roleDeletionFrozen(charId)) {
+    throw new Error('角色删除处理中，不能再发送或更新内容');
+  }
+}
+
+function assertRoleDeletionAcceptsChat(chat) {
+  const entry = Object.entries(allChats || {}).find(([, value]) => value === chat);
+  if (entry) assertRoleDeletionAcceptsWork(entry[0]);
+}
+
+function roleDeletionPreservedChats() {
+  const preserved = {};
+  for (const char of characters || []) {
+    if (!char?.roleDeletePending || !allChats?.[char.id]) continue;
+    preserved[char.id] = typeof structuredClone === 'function'
+      ? structuredClone(allChats[char.id])
+      : JSON.parse(JSON.stringify(allChats[char.id]));
+  }
+  return preserved;
+}
+
+async function assertNativeRoleDeletionAllowsStateReplacement(
+  candidateCharacters = [],
+  plugin = nativeExecutionPlugin(),
+  requiredRoleIds = []
+) {
+  if (!isNativeApp()) return true;
+  if (!plugin?.getRoleDeleteStatus) {
+    throw new Error('无法确认角色删除状态，已阻止覆盖本地数据');
+  }
+  const roleIds = [...new Set([
+    ...(requiredRoleIds || []).map(roleId => String(roleId || '')),
+    ...(characters || []).map(char => String(char?.id || '')),
+    ...(candidateCharacters || []).map(char => String(char?.id || ''))
+  ].filter(Boolean))];
+  for (const roleId of roleIds) {
+    const control = await roleDeleteControlStatus(roleId, plugin);
+    if (control.state !== 'none') {
+      throw new Error('角色删除处理中，不能导入或恢复旧数据');
+    }
+  }
+  return true;
+}
+
+function validateNativeRoleDeleteControl(charId, raw, { allowNone = false } = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+    || Object.keys(raw).sort().join('|') !== ROLE_DELETE_CONTROL_KEYS.slice().sort().join('|')
+    || raw.characterId !== charId || typeof raw.state !== 'string') {
+    throw new Error('invalid native role deletion response');
+  }
+  if (allowNone && raw.state === 'none') {
+    if (raw.controlId !== '' || raw.requestedAt !== 0 || raw.appliedAt !== null || raw.semanticChecksum !== '') {
+      throw new Error('invalid native role deletion response');
+    }
+    return raw;
+  }
+  if (!ROLE_DELETE_CONTROL_STATES.has(raw.state)
+    || typeof raw.controlId !== 'string' || !/^ctl_[a-f0-9]{64}$/.test(raw.controlId)
+    || typeof raw.semanticChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(raw.semanticChecksum)
+    || typeof raw.requestedAt !== 'number' || !Number.isSafeInteger(raw.requestedAt) || raw.requestedAt <= 0
+    || (raw.appliedAt !== null && (typeof raw.appliedAt !== 'number' || !Number.isSafeInteger(raw.appliedAt) || raw.appliedAt <= 0))) {
+    throw new Error('invalid native role deletion response');
+  }
+  if ((raw.state === 'applied') !== (raw.appliedAt !== null)) {
+    throw new Error('invalid native role deletion response');
+  }
+  return raw;
+}
+
+function suppressPendingWebTurnForRoleDeletion(charId) {
+  const chat = allChats?.[charId];
+  if (!chat) return false;
+  const pending = chat.pendingReply;
+  const accepted = Number(pending?.nativeAcceptedAt) > 0;
+  let changed = false;
+
+  // A staged payment has not crossed the native authority boundary. Refund it
+  // exactly once and remove it from the sendable batch as soon as a retained
+  // role-delete tombstone is observed.
+  for (const message of chat.messages || []) {
+    if (message?.deliveryState !== 'staged'
+      || !['redpacket', 'transfer'].includes(message.payType || message.type)) continue;
+    if (refundStagedOutgoingPayment(message)) changed = true;
+    message.deliveryState = 'cancelled';
+    removeMessageFromStagedBatch(chat, message.id);
+  }
+
+  if (!pending) {
+    if (changed) DB.set('chats', allChats);
+    return changed;
+  }
+
+  if (accepted) {
+    const acceptedSource = messageById(chat, pending.userMessageId);
+    if (acceptedSource) {
+      acceptedSource.replyState = 'suppressed';
+      delete acceptedSource.replyError;
+    }
+    if (pending.nativeTurnId) nativeReplyQueuedIds.delete(pending.nativeTurnId);
+    delete chat.pendingReply;
+    DB.set('chats', allChats);
+    return true;
+  }
+
+  const batchIds = Array.isArray(pending.batchMessageIds)
+    ? [...new Set(pending.batchMessageIds.map(String).filter(Boolean))]
+    : [];
+  const restoredIds = [];
+  for (const messageId of batchIds) {
+    const message = messageById(chat, messageId);
+    if (!message) continue;
+    delete message.batchCommittedAt;
+    delete message.payExpiresAt;
+    delete message.replyState;
+    delete message.replyError;
+    if (['redpacket', 'transfer'].includes(message.payType || message.type)) {
+      message.deliveryState = 'staged';
+      refundStagedOutgoingPayment(message);
+      message.deliveryState = 'cancelled';
+      continue;
+    }
+    message.deliveryState = 'staged';
+    restoredIds.push(message.id);
+  }
+  if (restoredIds.length) {
+    chat.stagedBatch = {
+      batchId: String(pending.batchId || messageById(chat, restoredIds[0])?.batchId || uid('batch')),
+      messageIds: restoredIds,
+      createdAt: Number(pending.batchStartedAt || pending.createdAt) || Date.now()
+    };
+  } else if (pending.batchId && chat.stagedBatch?.batchId === pending.batchId) {
+    delete chat.stagedBatch;
+  }
+
+  const sourceMessage = messageById(chat, pending.userMessageId);
+  if (!batchIds.length && sourceMessage?.provisionalNativeOnly) {
+    chat.messages = (chat.messages || []).filter(message => message.id !== sourceMessage.id);
+  } else if (!batchIds.length && sourceMessage && pending.previousReplyState) {
+    sourceMessage.replyState = pending.previousReplyState;
+    if (pending.previousReplyError) sourceMessage.replyError = pending.previousReplyError;
+    else delete sourceMessage.replyError;
+  }
+  if (pending.nativeTurnId) nativeReplyQueuedIds.delete(pending.nativeTurnId);
+  delete chat.pendingReply;
+  DB.set('chats', allChats);
+  return true;
+}
+
+function markRoleDeletePending(charId, control) {
+  const char = characters.find(item => item.id === charId);
+  if (!char) return false;
+  suppressPendingWebTurnForRoleDeletion(charId);
+  char.roleDeletePending = {
+    controlId: control.controlId,
+    state: control.state,
+    semanticChecksum: control.semanticChecksum,
+    requestedAt: control.requestedAt,
+    appliedAt: control.appliedAt
+  };
+  DB.set('characters', characters);
+  return true;
+}
+
+async function roleDeleteControlStatus(charId, plugin = nativeExecutionPlugin()) {
+  if (!plugin?.getRoleDeleteStatus) throw new Error('Android role deletion plugin unavailable');
+  const raw = await nativeBridgeCall(
+    plugin.getRoleDeleteStatus({ characterId: charId }),
+    'getRoleDeleteStatus',
+    5000
+  );
+  return validateNativeRoleDeleteControl(charId, raw, { allowNone: true });
+}
+
+async function assertNativeRoleDeletionAcceptsWork(charId, plugin = nativeExecutionPlugin()) {
+  assertRoleDeletionAcceptsWork(charId);
+  if (!isNativeApp() || !plugin?.getRoleDeleteStatus) return true;
+  const char = characters.find(item => item.id === charId);
+  let control;
+  try {
+    control = await roleDeleteControlStatus(charId, plugin);
+  } catch (error) {
+    if (char) {
+      char.roleDeletePending = { ...(char.roleDeletePending || {}), state: 'unknown' };
+      DB.set('characters', characters);
+    }
+    throw new Error('无法确认角色删除状态，已暂停发送');
+  }
+  if (control.state === 'none') {
+    if (char?.roleDeletePending) {
+      delete char.roleDeletePending;
+      DB.set('characters', characters);
+    }
+    return true;
+  }
+  if (control.state === 'applied') await finalizeBrowserRoleDeletion(charId);
+  else markRoleDeletePending(charId, control);
+  throw new Error('角色删除处理中，不能再发送或更新内容');
+}
+
+async function nativeFirstRoleDelete(charId, { plugin = nativeExecutionPlugin() } = {}) {
+  if (!plugin?.requestVerifiedYuqiBackup || !plugin?.createRoleDelete || !plugin?.getConversationCursor) {
+    throw new Error('当前 Android 不支持原生角色删除');
+  }
+  const { cursorChecksum } = await getYuqiClearCursorForClear(charId, plugin);
+  const backupReceipt = await nativeBridgeCall(
+    plugin.requestVerifiedYuqiBackup({ characterId: charId }),
+    'requestVerifiedYuqiBackup',
+    15000
+  );
+  if (!backupReceipt || typeof backupReceipt !== 'object' || Array.isArray(backupReceipt)) {
+    throw new Error('invalid verified backup receipt');
+  }
+  const control = await nativeBridgeCall(
+    plugin.createRoleDelete({
+      characterId: charId,
+      expectedCursorChecksum: cursorChecksum,
+      backupReceiptJson: JSON.stringify(backupReceipt)
+    }),
+    'createRoleDelete',
+    5000
+  );
+  return validateNativeRoleDeleteControl(charId, control);
+}
+
+async function enforceNativeRoleDeletionTombstones({ preservedChats = {} } = {}) {
+  if (!isNativeApp() || !nativeExecutionPlugin()?.getRoleDeleteStatus) return false;
+  let changed = false;
+  for (const char of [...characters]) {
+    let control;
+    try {
+      control = await roleDeleteControlStatus(char.id);
+    } catch (error) {
+      char.roleDeletePending = {
+        ...(char.roleDeletePending || {}),
+        state: 'unknown'
+      };
+      changed = true;
+      continue;
+    }
+    if (control.state === 'none') {
+      if (char.roleDeletePending) {
+        delete char.roleDeletePending;
+        changed = true;
+      }
+      continue;
+    }
+    if (control.state === 'applied') {
+      await finalizeBrowserRoleDeletion(char.id);
+      changed = true;
+      continue;
+    }
+    markRoleDeletePending(char.id, control);
+    const retained = preservedChats?.[char.id];
+    allChats[char.id] = retained || allChats[char.id] || {
+      messages: [],
+      charPrompt: buildCharPrompt(char),
+      extraPrompt: '',
+      unread: 0
+    };
+    changed = true;
+  }
+  return changed;
+}
+
+async function finalizeBrowserRoleDeletion(deletedId) {
   const deletedName = characters.find(c => c.id === deletedId)?.name || '这个角色';
+  suppressPendingWebTurnForRoleDeletion(deletedId);
   await invalidateMemoryExtraction(deletedId);
   await Promise.allSettled([
-    cancelCloudProactiveQuick(deletedId, '删除角色'),
+    cancelCloudProactiveQuick(deletedId, '原生角色删除已确认'),
     MemoryDB.clearChar(deletedId),
     getRolePlanRepository().replace(deletedId, [], [])
   ]);
@@ -12538,13 +13015,78 @@ async function deleteCurrentRole() {
   DB.set('characters', characters);
   DB.set('chats', allChats);
   saveMoments();
-  currentCharId = null;
+  if (currentCharId === deletedId) currentCharId = null;
   if (profileCharId === deletedId) profileCharId = '';
   renderChats();
   renderContacts();
   renderMoments();
-  showScreen('contacts');
-  toast(`已删除${deletedName}`);
+  if (activeScreen === 'chat' || activeScreen === 'chat-info') showScreen('contacts');
+  return deletedName;
+}
+
+async function restorePendingRoleDeletions() {
+  if (!isNativeApp() || !nativeExecutionPlugin()?.getRoleDeleteStatus) return false;
+  let changed = false;
+  for (const char of [...characters]) {
+    let control;
+    try {
+      control = await roleDeleteControlStatus(char.id);
+    } catch (error) {
+      char.roleDeletePending = { ...(char.roleDeletePending || {}), state: 'unknown' };
+      changed = true;
+      continue;
+    }
+    if (control.state === 'none') {
+      if (char.roleDeletePending) {
+        delete char.roleDeletePending;
+        changed = true;
+      }
+      continue;
+    }
+    if (control.state === 'applied') {
+      await finalizeBrowserRoleDeletion(char.id);
+      changed = true;
+      continue;
+    }
+    const previous = char.roleDeletePending || {};
+    if (previous.controlId !== control.controlId || previous.state !== control.state
+      || previous.semanticChecksum !== control.semanticChecksum || previous.appliedAt !== control.appliedAt) {
+      markRoleDeletePending(char.id, control);
+      changed = true;
+    }
+  }
+  if (changed) DB.set('characters', characters);
+  return changed;
+}
+
+async function deleteCurrentRole() {
+  if (!currentCharId || !confirm('删除这个角色？会同时删除它的聊天、云闹钟、本地记忆库和朋友圈痕迹。')) return;
+  const deletedId = currentCharId;
+  if (!isNativeApp()) {
+    const deletedName = await finalizeBrowserRoleDeletion(deletedId);
+    toast(`已删除${deletedName}`);
+    return;
+  }
+  const char = characters.find(item => item.id === deletedId);
+  if (char?.roleDeletePending) {
+    await restorePendingRoleDeletions();
+    if (characters.some(item => item.id === deletedId)) toast('角色删除处理中，确认完成后会自动移除。');
+    return;
+  }
+  try {
+    const control = await nativeFirstRoleDelete(deletedId);
+    if (control.state === 'applied') {
+      const deletedName = await finalizeBrowserRoleDeletion(deletedId);
+      toast(`已删除${deletedName}`);
+      return;
+    }
+    markRoleDeletePending(deletedId, control);
+    renderChats();
+    renderContacts();
+    toast('删除请求已提交，角色会在确认完成前保留在列表中。');
+  } catch (error) {
+    toast(`删除失败，角色数据未改动：${error?.message || error}`, 3600);
+  }
 }
 function openCurrentProfile() {
   const char = characters.find(c => c.id === currentCharId);
@@ -12571,11 +13113,15 @@ async function clearAllHistory() {
 
 async function syncFromServiceWorkerState(options = {}) {
   const mirrorChanged = await restoreAppStateFromMirror();
+  const roleDeleteChanged = await restorePendingRoleDeletions().catch(err => {
+    console.warn('[AL Native] role deletion status reconcile skipped:', err.message);
+    return false;
+  });
   const executionChanged = await reconcileNativeExecutionTurns().catch(err => {
     console.warn('[AL Native Execution] foreground reconcile skipped:', err.message);
     return false;
   });
-  const changed = mirrorChanged || executionChanged;
+  const changed = mirrorChanged || roleDeleteChanged || executionChanged;
   if (changed) {
     renderPlayerProfile();
     if (activeScreen === 'chat') renderMessages();

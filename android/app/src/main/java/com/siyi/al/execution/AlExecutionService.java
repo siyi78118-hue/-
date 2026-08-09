@@ -191,47 +191,87 @@ public final class AlExecutionService extends Service {
         RolePlanCoordinator rolePlanCoordinator = new RolePlanCoordinator(this);
         rolePlanCoordinator.reconcileFailedTurns(System.currentTimeMillis());
         for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
-            AlExecutionPlugin.notifyCompletedTurn(turn.turnId, turn.updatedAt);
-            confirmBridgeDelivery(turn, bridgeReceipts);
-            acknowledgeCloudTurn(turn, acknowledged);
-            continueAutomaticTask(turn, proactiveContinued);
-            continueRolePlan(turn, continued);
-            rolePlanCoordinator.completeForTurn(turn.turnId, System.currentTimeMillis());
-            java.util.List<ReplyPartEntity> notificationParts =
-                database.executionDao().replyParts(turn.turnId);
-            if (!AlNotificationPolicy.shouldNotifyCompletedTurn(
-                    turn.terminalDisposition, notificationParts.size(), turn.deletedAt != null)) {
+            ExecutionServicePolicy.RoleDeleteFence roleDeleteFence =
+                () -> executionStore.isRoleDeleteTombstoned(turn.characterId);
+            boolean roleDeleted = roleDeleteFence.isDeleted();
+            // A role-delete tombstone is a hard boundary for this preloaded
+            // completed row: do not emit ordinary receipts, ACKs, diagnostics,
+            // continuations, notifications, or completion events after it wins.
+            if (!ExecutionServicePolicy.shouldRunCompletedTurnSideEffects(roleDeleted)) continue;
+            if (!executionStore.runRoleSideEffectIfNotDeleted(
+                turn.characterId, () -> AlExecutionPlugin.notifyCompletedTurn(turn.turnId, turn.updatedAt))) {
                 continue;
             }
-            String key = "turn." + turn.turnId;
-            int notificationId = AlNotificationFactory.messageNotificationId(turn.turnId);
-            if (notified.getBoolean(key, false) || turn.notificationShownAt != null) {
-                if (!notified.getBoolean(key, false)) {
+            if (!executionStore.runRoleSideEffectIfNotDeleted(
+                turn.characterId, () -> confirmBridgeDelivery(turn, bridgeReceipts))) {
+                continue;
+            }
+            if (!executionStore.runRoleSideEffectIfNotDeleted(
+                turn.characterId, () -> acknowledgeCloudTurn(turn, acknowledged))) {
+                continue;
+            }
+            if (!executionStore.runRoleSideEffectIfNotDeleted(
+                turn.characterId, () -> continueAutomaticTask(turn, proactiveContinued))) {
+                continue;
+            }
+            if (!executionStore.runRoleSideEffectIfNotDeleted(
+                turn.characterId, () -> continueRolePlan(turn, continued))) {
+                continue;
+            }
+            if (!executionStore.runRoleSideEffectIfNotDeleted(
+                turn.characterId, () -> rolePlanCoordinator.completeForTurn(
+                    turn.turnId, System.currentTimeMillis()))) {
+                continue;
+            }
+            if (!executionStore.runRoleSideEffectIfNotDeleted(turn.characterId, () -> {
+                if (roleDeleteFence.isDeleted()) return;
+                java.util.List<ReplyPartEntity> notificationParts =
+                    database.executionDao().replyParts(turn.turnId);
+                if (roleDeleteFence.isDeleted()
+                    || !AlNotificationPolicy.shouldNotifyCompletedTurn(
+                        turn.terminalDisposition, notificationParts.size(), turn.deletedAt != null)) {
+                    return;
+                }
+                String key = "turn." + turn.turnId;
+                int notificationId = AlNotificationFactory.messageNotificationId(turn.turnId);
+                if (notified.getBoolean(key, false) || turn.notificationShownAt != null) {
+                    if (!notified.getBoolean(key, false)) {
+                        notified.edit().putBoolean(key, true).commit();
+                    }
+                    if (turn.notificationShownAt == null) {
+                        executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
+                    }
+                    return;
+                }
+                String title = characterName(turn);
+                String text = notificationText(turn);
+                AlNotificationStatus.Snapshot notificationStatus = AlNotificationStatus.inspect(this);
+                if (!notificationStatus.permissionGranted
+                    || !notificationStatus.appEnabled
+                    || !notificationStatus.channelExists
+                    || notificationStatus.importance <= 0) {
+                    return;
+                }
+                try {
+                    NotificationManagerCompat.from(this).notify(
+                        notificationId,
+                        notifications.messageNotification(title, text, turn.turnId.hashCode())
+                    );
+                    if (roleDeleteFence.isDeleted()) {
+                        NotificationManagerCompat.from(this).cancel(notificationId);
+                        return;
+                    }
                     notified.edit().putBoolean(key, true).commit();
-                }
-                if (turn.notificationShownAt == null) {
+                    if (roleDeleteFence.isDeleted()) {
+                        NotificationManagerCompat.from(this).cancel(notificationId);
+                        return;
+                    }
                     executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
+                } catch (SecurityException ignored) {
+                    // Android 13+ will deliver after the user grants notification permission.
                 }
+            })) {
                 continue;
-            }
-            String title = characterName(turn);
-            String text = notificationText(turn);
-            AlNotificationStatus.Snapshot notificationStatus = AlNotificationStatus.inspect(this);
-            if (!notificationStatus.permissionGranted
-                || !notificationStatus.appEnabled
-                || !notificationStatus.channelExists
-                || notificationStatus.importance <= 0) {
-                continue;
-            }
-            try {
-                NotificationManagerCompat.from(this).notify(
-                    notificationId,
-                    notifications.messageNotification(title, text, turn.turnId.hashCode())
-                );
-                notified.edit().putBoolean(key, true).commit();
-                executionStore.markNotificationShown(turn.turnId, System.currentTimeMillis());
-            } catch (SecurityException ignored) {
-                // Android 13+ will deliver after the user grants notification permission.
             }
         }
     }
@@ -339,16 +379,19 @@ public final class AlExecutionService extends Service {
             BridgeReceiptDeliveryCoordinator.Outcome outcome =
                 bridgeReceiptCoordinator.deliver(turn.turnId);
             if (outcome.status == BridgeReceiptDeliveryCoordinator.OutcomeStatus.CONFIRMED) {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 executionStore.recordDiagnostic(
                     turn.turnId, turn.activeAttemptId, "INFO", "AUTHORITY_RECEIPT_CONFIRMED",
                     outcome.receipt == null ? "" : outcome.receipt.idempotencyKey,
                     System.currentTimeMillis());
             } else if (outcome.status == BridgeReceiptDeliveryCoordinator.OutcomeStatus.RETRYABLE) {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 executionStore.recordDiagnostic(
                     turn.turnId, turn.activeAttemptId, "WARN", "AUTHORITY_RECEIPT_PENDING",
                     outcome.reason, System.currentTimeMillis());
             }
         } catch (Exception error) {
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             executionStore.recordDiagnostic(
                 turn.turnId, turn.activeAttemptId, "WARN", "AUTHORITY_RECEIPT_PENDING",
                 error.getMessage(), System.currentTimeMillis());
@@ -379,12 +422,16 @@ public final class AlExecutionService extends Service {
                 body.toString()
             );
             if (response.status >= 200 && response.status < 300) {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 acknowledged.edit().putBoolean(key, true).apply();
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "INFO", "ACK_OK", "status=" + response.status, System.currentTimeMillis());
             } else {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ACK_FAILED", "status=" + response.status, System.currentTimeMillis());
             }
         } catch (Exception error) {
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ACK_FAILED", error.getMessage(), System.currentTimeMillis());
             // Keep the ack pending. The sticky service retries it on the next kick.
         }
@@ -407,11 +454,13 @@ public final class AlExecutionService extends Service {
             Long nextRunAt = RolePlanSchedule.nextOccurrence(schedule, after);
             long now = System.currentTimeMillis();
             if (nextRunAt == null) {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 plan.put("status", "completed");
                 plan.put("completedAt", now);
                 plan.put("lastRunAt", now);
                 plan.put("cloudJobId", JSONObject.NULL);
                 persistRolePlanContinuation(turn, snapshot, plan, null, now);
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 continued.edit().putBoolean(continuationKey, true).apply();
                 return;
             }
@@ -435,18 +484,23 @@ public final class AlExecutionService extends Service {
                 body.toString()
             );
             if (response.status < 200 || response.status >= 300) {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ROLE_PLAN_RESCHEDULE_FAILED", "status=" + response.status, now);
                 return;
             }
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             plan.put("status", "active");
             plan.put("nextRunAt", nextRunAt);
             plan.put("lastRunAt", now);
             plan.put("cloudJobId", jobId);
             plan.put("updatedAt", now);
             persistRolePlanContinuation(turn, snapshot, plan, jobId, now);
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             continued.edit().putBoolean(continuationKey, true).apply();
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "INFO", "ROLE_PLAN_RESCHEDULED", jobId, now);
         } catch (Exception error) {
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "ROLE_PLAN_RESCHEDULE_FAILED", error.getMessage(), System.currentTimeMillis());
         }
     }
@@ -486,6 +540,7 @@ public final class AlExecutionService extends Service {
                 nextRunAt = now + AutomaticTaskContinuationPolicy.delayMs(interval, chance, maxRolls, Math.random());
             }
             if (nextRunAt <= now) {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 continued.edit().putBoolean(continuationKey, true).apply();
                 return;
             }
@@ -513,18 +568,24 @@ public final class AlExecutionService extends Service {
                 nextJob.toString()
             );
             if (response.status < 200 || response.status >= 300) {
+                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
                 executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "PROACTIVE_RESCHEDULE_FAILED", "status=" + response.status, now);
                 return;
             }
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             snapshot.put("cloudJobId", jobId);
             snapshot.put("scheduledFor", nextRunAt);
             snapshot.put("proactiveJob", nextJob);
             snapshot.put("createdAt", isoTime(now));
             persistAutomaticSnapshot(turn, snapshot, kind, jobId, nextRunAt, now);
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             AutomaticTaskAlarmScheduler.schedule(this, jobId, nextRunAt);
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             continued.edit().putBoolean(continuationKey, true).apply();
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "INFO", "PROACTIVE_RESCHEDULED", jobId, now);
         } catch (Exception error) {
+            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "PROACTIVE_RESCHEDULE_FAILED", error.getMessage(), System.currentTimeMillis());
         }
     }

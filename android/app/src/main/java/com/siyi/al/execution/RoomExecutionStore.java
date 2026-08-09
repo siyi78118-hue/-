@@ -13,6 +13,8 @@ import com.siyi.al.execution.db.LifecycleControlEntity;
 import com.siyi.al.execution.db.LifecycleInboundAckTombstoneEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import com.siyi.al.execution.db.RawMessageEntity;
+import com.siyi.al.execution.db.RolePlanOccurrenceEntity;
+import com.siyi.al.execution.db.RoleNotificationCancellationEntity;
 import com.siyi.al.execution.bridge.BridgeInput;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
@@ -26,6 +28,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.ConcurrentHashMap;
 import org.json.JSONObject;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -33,6 +36,12 @@ import org.json.JSONException;
 public final class RoomExecutionStore implements ExecutionStore, ExecutionEngineStore,
     BridgeReceiptDeliveryCoordinator.Store {
     public enum DeliveryDisposition { APPLY, REDACTED }
+    /** A role-plan claim failed inside its atomic Room transaction. */
+    public static final class AtomicRolePlanSubmissionException extends IllegalStateException {
+        public AtomicRolePlanSubmissionException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
     public static final class CanonicalCloudTarget {
         public final String localTurnId;
         public final String activeAttemptId;
@@ -66,6 +75,13 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     private final AlExecutionDao dao;
     private final TerminalFaultHook terminalFaultHook;
     private final String storeOwnedPeerId;
+    /**
+     * Process-local role boundary.  The retained lifecycle tombstone remains
+     * the durable authority across process death; this monitor closes the
+     * check-to-side-effect window while this process is alive.
+     */
+    private static final ConcurrentHashMap<String, Object> ROLE_SIDE_EFFECT_GATES =
+        new ConcurrentHashMap<>();
     private static final Set<String> CHECKPOINT_KEYS = new HashSet<>(Arrays.asList(
         "version", "localTurnId", "attemptId", "attemptSequence",
         "authoritativeTurnId", "authorityLineageKey", "claimedLineageRevision",
@@ -101,6 +117,8 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     private static final Set<String> CANONICAL_ACTION_KEYS = new HashSet<>(Arrays.asList(
         "actionId", "ordinal", "kind", "targetKey", "targetRevision", "payload", "actionChecksum"
     ));
+    private static final String ROLE_NOTIFICATION_CANCELLATION_CONTRACT =
+        "android-role-notification-cancellation-v1";
 
     public RoomExecutionStore(AlExecutionDatabase database) {
         this(database, null, boundary -> {});
@@ -125,6 +143,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         this.storeOwnedPeerId = storeOwnedPeerId == null ? null : storeOwnedPeerId.trim();
         validatePersistedLifecycleControls();
         validatePersistedLifecycleInboundAckTombstones();
+        validatePersistedRoleNotificationCancellations();
     }
 
     private void validatePersistedLifecycleControls() {
@@ -153,6 +172,55 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 row.controlId, row.controlChecksum, row.ackChecksum, row.reasonCode))) {
                 throw new IllegalStateException("lifecycle unknown ACK tombstone authority conflict");
             }
+        }
+    }
+
+    private void validatePersistedRoleNotificationCancellations() {
+        for (RoleNotificationCancellationEntity row : dao.roleNotificationCancellations()) {
+            validatePersistedRoleNotificationCancellation(row);
+        }
+    }
+
+    private void validatePersistedRoleNotificationCancellation(
+        RoleNotificationCancellationEntity row
+    ) {
+        if (row == null || row.cancellationKey == null || row.controlId == null
+            || row.characterId == null || row.intentChecksum == null
+            || row.state == null || !"waiting".equals(row.state)
+            || !row.cancellationKey.matches("rncan_[a-f0-9]{64}")
+            || !row.intentChecksum.matches("[a-f0-9]{64}")
+            || !RoleNotificationCancellationContract.isValidNotificationId(row.notificationId)
+            || row.createdAt <= 0L || row.updatedAt < row.createdAt
+            || row.createdAt > LifecycleControlSender.MAX_SAFE_INTEGER
+            || row.updatedAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalStateException("role notification cancellation authority conflict");
+        }
+        LifecycleControlEntity control = dao.lifecycleControl(row.controlId);
+        if (control == null || !LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+            || !row.characterId.equals(control.characterId)) {
+            throw new IllegalStateException("role notification cancellation control conflict");
+        }
+        String expectedChecksum = roleNotificationCancellationChecksum(
+            row.controlId, row.characterId, row.notificationId, row.createdAt);
+        if (!row.intentChecksum.equals(expectedChecksum)
+            || !row.cancellationKey.equals("rncan_" + expectedChecksum)) {
+            throw new IllegalStateException("role notification cancellation checksum conflict");
+        }
+    }
+
+    private static String roleNotificationCancellationChecksum(
+        String controlId, String characterId, int notificationId, long createdAt
+    ) {
+        try {
+            JSONObject basis = new JSONObject()
+                .put("contract", ROLE_NOTIFICATION_CANCELLATION_CONTRACT)
+                .put("controlId", controlId)
+                .put("characterId", characterId)
+                .put("notificationId", notificationId)
+                .put("createdAt", createdAt);
+            return BridgeAuthority.sha256CanonicalJson(basis);
+        } catch (JSONException error) {
+            throw new IllegalStateException("role notification cancellation checksum failed", error);
         }
     }
 
@@ -261,38 +329,94 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     @Override
     public ChatTurnEntity submitTurn(TurnSubmission submission) {
         AtomicReference<ChatTurnEntity> result = new AtomicReference<>();
-        database.runInTransaction(() -> {
-            String safeSnapshotJson = snapshotForNewTurn(submission.snapshotJson, submission.characterId);
-            ChatTurnEntity existing = dao.turn(submission.turnId);
-            if (existing != null) {
-                result.set(existing);
-                return;
-            }
-            long now = submission.createdAt > 0 ? submission.createdAt : System.currentTimeMillis();
-            String attemptId = newAttemptId(submission.turnId, 1);
-            ChatTurnEntity turn = new ChatTurnEntity();
-            turn.turnId = submission.turnId;
-            turn.characterId = submission.characterId;
-            turn.sourceMessageId = submission.sourceMessageId;
-            turn.cloudJobId = submission.cloudJobId;
-            turn.kind = submission.kind.name();
-            turn.state = TurnState.QUEUED.name();
-            turn.activeAttemptId = attemptId;
-            turn.inputJson = submission.inputJson;
-            turn.snapshotJson = safeSnapshotJson;
-            turn.bridgeProtocolVersion = "yuqi".equals(submission.characterId) ? 3 : null;
-            turn.createdAt = now;
-            turn.updatedAt = now;
-            if (dao.insertTurn(turn) == -1L) {
-                result.set(dao.turn(submission.turnId));
-                return;
-            }
-            dao.insertAttempt(newAttempt(turn.turnId, attemptId, 1, now));
-            insertTurnChange(turn.turnId, "TURN_QUEUED", now);
-            insertDiagnostic(turn.turnId, attemptId, "INFO", "TURN_QUEUED", turn.kind, now);
-            result.set(turn);
-        });
+        database.runInTransaction(() -> result.set(submitTurnInTransaction(submission)));
         return result.get();
+    }
+
+    /**
+     * Atomically claims a role-plan occurrence and creates its turn/attempt.
+     * The tombstone check, unique occurrence insert, turn creation and claim
+     * diagnostic all share one Room transaction, so a deletion race cannot
+     * leave an orphan occurrence or diagnostic behind.
+     */
+    public ChatTurnEntity submitRolePlanOccurrence(
+        RolePlanOccurrenceEntity occurrence,
+        TurnSubmission submission
+    ) {
+        AtomicReference<ChatTurnEntity> result = new AtomicReference<>();
+        try {
+            database.runInTransaction(() -> {
+                if (occurrence == null || submission == null
+                    || occurrence.occurrenceId == null || occurrence.occurrenceId.trim().isEmpty()
+                    || occurrence.turnId == null || occurrence.turnId.trim().isEmpty()
+                    || occurrence.characterId == null
+                    || !occurrence.characterId.equals(submission.characterId)
+                    || !occurrence.turnId.equals(submission.turnId)
+                    || !occurrence.occurrenceId.equals(submission.sourceMessageId)) {
+                    throw new IllegalArgumentException("role plan occurrence/turn identity conflict");
+                }
+                assertRoleAcceptsSemanticWrite(occurrence.characterId);
+                if (dao.rolePlanOccurrence(occurrence.occurrenceId) != null
+                    || dao.turn(occurrence.turnId) != null) {
+                    result.set(null);
+                    return;
+                }
+                if (dao.insertRolePlanOccurrence(occurrence) == -1L) {
+                    result.set(null);
+                    return;
+                }
+                terminalFaultHook.after("role_plan_occurrence_insert");
+                ChatTurnEntity turn = submitTurnInTransaction(submission);
+                if (turn == null || !occurrence.turnId.equals(turn.turnId)) {
+                    throw new IllegalStateException("role plan turn creation conflict");
+                }
+                terminalFaultHook.after("role_plan_turn_attempt");
+                insertDiagnostic(
+                    turn.turnId,
+                    turn.activeAttemptId,
+                    "INFO",
+                    "ROLE_PLAN_CLAIMED",
+                    "role-plan occurrence claimed",
+                    occurrence.updatedAt > 0L ? occurrence.updatedAt : System.currentTimeMillis()
+                );
+                terminalFaultHook.after("role_plan_diagnostic");
+                result.set(turn);
+            });
+        } catch (RuntimeException error) {
+            throw new AtomicRolePlanSubmissionException(
+                "ROLE_PLAN_ATOMIC_SUBMISSION_FAILED", error);
+        }
+        return result.get();
+    }
+
+    private ChatTurnEntity submitTurnInTransaction(TurnSubmission submission) {
+        if (submission == null || submission.turnId == null || submission.turnId.trim().isEmpty()) {
+            throw new IllegalArgumentException("turn submission is required");
+        }
+        String safeSnapshotJson = snapshotForNewTurn(submission.snapshotJson, submission.characterId);
+        ChatTurnEntity existing = dao.turn(submission.turnId);
+        if (existing != null) return existing;
+        assertRoleAcceptsSemanticWrite(submission.characterId);
+        long now = submission.createdAt > 0 ? submission.createdAt : System.currentTimeMillis();
+        String attemptId = newAttemptId(submission.turnId, 1);
+        ChatTurnEntity turn = new ChatTurnEntity();
+        turn.turnId = submission.turnId;
+        turn.characterId = submission.characterId;
+        turn.sourceMessageId = submission.sourceMessageId;
+        turn.cloudJobId = submission.cloudJobId;
+        turn.kind = submission.kind.name();
+        turn.state = TurnState.QUEUED.name();
+        turn.activeAttemptId = attemptId;
+        turn.inputJson = submission.inputJson;
+        turn.snapshotJson = safeSnapshotJson;
+        turn.bridgeProtocolVersion = "yuqi".equals(submission.characterId) ? 3 : null;
+        turn.createdAt = now;
+        turn.updatedAt = now;
+        if (dao.insertTurn(turn) == -1L) return dao.turn(submission.turnId);
+        dao.insertAttempt(newAttempt(turn.turnId, attemptId, 1, now));
+        insertTurnChange(turn.turnId, "TURN_QUEUED", now);
+        insertDiagnostic(turn.turnId, attemptId, "INFO", "TURN_QUEUED", turn.kind, now);
+        return turn;
     }
 
     @Override
@@ -305,6 +429,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         AtomicReference<ExecutionAttemptEntity> result = new AtomicReference<>();
         database.runInTransaction(() -> {
             ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             if (dao.replyPartCount(turnId) > 0) {
                 throw new TurnAlreadyCompletedException(turnId);
             }
@@ -383,6 +508,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 || turn.activeAttemptId == null) {
                 throw bridgeAuthorityConflict(localTurnId);
             }
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             List<ExecutionAttemptEntity> attempts = dao.attempts(localTurnId);
             List<MemberCheckpoint> members = validateCheckpointSet(turn, attempts, true);
             int matchingMembers = 0;
@@ -424,6 +550,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     private TurnSubmission prepareBridgeSubmissionCore(TurnSubmission base, String bridgeDeviceId, long now)
         throws Exception {
         ChatTurnEntity turn = requireTurn(base.turnId);
+        assertRoleAcceptsSemanticWrite(turn.characterId);
         if (!turn.characterId.equals(base.characterId)
             || !turn.sourceMessageId.equals(base.sourceMessageId)
             || !turn.kind.equals(base.kind.name())
@@ -620,6 +747,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     ) {
         database.runInTransaction(() -> {
             ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             if (!attemptId.equals(turn.activeAttemptId)
                 || TurnState.COMPLETED.name().equals(turn.state)
                 || dao.replyPartCount(turnId) > 0) {
@@ -654,25 +782,33 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         if (parts == null || parts.isEmpty()) {
             throw new IllegalArgumentException("reply parts are required");
         }
-        ChatTurnEntity turn = requireTurn(turnId);
-        if (!attemptId.equals(turn.activeAttemptId)) {
-            throw new StaleAttemptException(turnId, attemptId);
-        }
-        if (turn.inputVisibilitySequence != null
-            && classifyIncomingGroup(turn.characterId, groupId(turn), turn.inputVisibilitySequence)
-                == DeliveryDisposition.REDACTED) {
-            throw new IllegalStateException("LATE_RESULT_REDACTED: " + turnId);
-        }
-        dao.commitReply(turnId, attemptId, parts, now);
-        markNativeCompleted(turn.characterId, turnId, groupId(turn), visibilitySequence(turn), now);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            if (!attemptId.equals(turn.activeAttemptId)) {
+                throw new StaleAttemptException(turnId, attemptId);
+            }
+            if (turn.inputVisibilitySequence != null
+                && classifyIncomingGroup(turn.characterId, groupId(turn), turn.inputVisibilitySequence)
+                    == DeliveryDisposition.REDACTED) {
+                throw new IllegalStateException("LATE_RESULT_REDACTED: " + turnId);
+            }
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            dao.commitReply(turnId, attemptId, parts, now);
+            markNativeCompletedInternal(
+                turn.characterId, turnId, groupId(turn), visibilitySequence(turn), now);
+        });
     }
 
     @Override
     public void commitSkip(String turnId, String attemptId, long now) {
-        ChatTurnEntity turn = requireTurn(turnId);
-        if (!attemptId.equals(turn.activeAttemptId)) throw new StaleAttemptException(turnId, attemptId);
-        dao.commitSkip(turnId, attemptId, now);
-        markNativeCompleted(turn.characterId, turnId, groupId(turn), visibilitySequence(turn), now);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            if (!attemptId.equals(turn.activeAttemptId)) throw new StaleAttemptException(turnId, attemptId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            dao.commitSkip(turnId, attemptId, now);
+            markNativeCompletedInternal(
+                turn.characterId, turnId, groupId(turn), visibilitySequence(turn), now);
+        });
     }
 
     @Override
@@ -706,6 +842,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             List<ReplyPartEntity> suppliedParts = parts == null
                 ? java.util.Collections.emptyList() : parts;
             ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             if (!isStoreOwnedV3(turn) || !attemptId.equals(turn.activeAttemptId)) {
                 throw bridgeAuthorityConflict(turnId);
             }
@@ -963,6 +1100,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 throw bridgeAuthorityConflict(turnId);
             }
             ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             if (!isStoreOwnedV3(turn) || !attemptId.equals(turn.activeAttemptId)) {
                 throw bridgeAuthorityConflict(turnId);
             }
@@ -1108,6 +1246,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 throw bridgeAuthorityConflict(turnId);
             }
             ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
             if (!isStoreOwnedV3(turn) || !attemptId.equals(turn.activeAttemptId)) {
                 throw bridgeAuthorityConflict(turnId);
             }
@@ -1249,6 +1388,74 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         insertDiagnostic(turnId, attemptId, level, code, detail, now);
     }
 
+    /**
+     * Inserts the two dispatch diagnostics only if the role-delete tombstone
+     * is still absent.  The check and both inserts share one Room transaction;
+     * a later role-delete transaction removes the rows as part of its normal
+     * cleanup, so a deletion race cannot leave an orphan dispatch diagnostic.
+     */
+    public boolean recordRoleDispatchDiagnosticsIfActive(
+        String turnId,
+        String characterId,
+        String attemptId,
+        long now,
+        String firstCode,
+        String firstDetail,
+        String secondCode,
+        String secondDetail
+    ) {
+        AtomicReference<Boolean> inserted = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            if (isRoleDeleteTombstoned(characterId)) return;
+            ChatTurnEntity turn = dao.turn(turnId);
+            if (turn == null || !Objects.equals(turn.characterId, characterId)) return;
+            insertDiagnostic(turnId, attemptId, "INFO", firstCode, firstDetail, now);
+            insertDiagnostic(turnId, attemptId, "INFO", secondCode, secondDetail, now);
+            inserted.set(true);
+        });
+        return Boolean.TRUE.equals(inserted.get());
+    }
+
+    public boolean recordRoleDiagnosticIfActive(
+        String turnId,
+        String characterId,
+        String attemptId,
+        String level,
+        String code,
+        String detail,
+        long now
+    ) {
+        AtomicReference<Boolean> inserted = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            if (isRoleDeleteTombstoned(characterId)) return;
+            ChatTurnEntity turn = dao.turn(turnId);
+            if (turn == null || !Objects.equals(turn.characterId, characterId)) return;
+            insertDiagnostic(turnId, attemptId, level, code, detail, now);
+            inserted.set(true);
+        });
+        return Boolean.TRUE.equals(inserted.get());
+    }
+
+    /** Role-scoped preflight diagnostic for a turn that may not exist yet. */
+    public boolean recordRolePreflightDiagnosticIfActive(
+        String diagnosticId,
+        String characterId,
+        String level,
+        String code,
+        String detail,
+        long now
+    ) {
+        AtomicReference<Boolean> inserted = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            if (isRoleDeleteTombstoned(characterId)) return;
+            ChatTurnEntity turn = dao.turn(diagnosticId);
+            if (turn != null && !Objects.equals(turn.characterId, characterId)) return;
+            insertDiagnostic(diagnosticId, null, level, code, detail, now);
+            inserted.set(true);
+        });
+        return Boolean.TRUE.equals(inserted.get());
+    }
+
     public void recordCanonicalCloudRejectionOnce(
         CanonicalCloudTarget target,
         String relayMessageId,
@@ -1295,20 +1502,27 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     @Override
     public void markNotificationShown(String turnId, long now) {
-        ChatTurnEntity turn = requireTurn(turnId);
-        if (turn.notificationShownAt != null) return;
-        if (dao.markNotificationShown(turnId, now) != 1) {
-            throw new IllegalStateException("Unable to record notification for " + turnId);
-        }
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            if (turn.notificationShownAt != null) return;
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            if (dao.markNotificationShown(turnId, now) != 1) {
+                throw new IllegalStateException("Unable to record notification for " + turnId);
+            }
+        });
     }
 
     @Override
     public void acknowledgeUiApplied(String turnId, long now) {
-        ChatTurnEntity turn = requireTurn(turnId);
-        if (turn.uiAppliedAt == null && dao.acknowledgeUiApplied(turnId, now) != 1) {
-            throw new IllegalStateException("Unable to acknowledge UI result for " + turnId);
-        }
-        markUiApplied(turn.characterId, turnId, groupId(turn), visibilitySequence(turn), now);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            if (turn.uiAppliedAt == null && dao.acknowledgeUiApplied(turnId, now) != 1) {
+                throw new IllegalStateException("Unable to acknowledge UI result for " + turnId);
+            }
+            markUiAppliedInternal(
+                turn.characterId, turnId, groupId(turn), visibilitySequence(turn), now);
+        });
     }
 
     @Override
@@ -1389,20 +1603,27 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         long now
     ) {
         database.runInTransaction(() -> {
-            ConversationCursorEntity cursor = cursorFor(characterId, now);
-            if ((cursor.clearEpoch > 0L && localSequence <= cursor.clearedThroughSequence)
-                || localSequence < cursor.localSequence) return;
-            boolean advancesNative = localSequence > cursor.nativeCompletedSequence
-                || (localSequence == cursor.nativeCompletedSequence
-                    && (cursor.nativeCompletedGroupId == null || cursor.nativeCompletedGroupId.equals(visibleGroupId)));
-            if (!advancesNative) return;
-            cursor.nativeCompletedTurnId = turnId;
-            cursor.nativeCompletedGroupId = visibleGroupId;
-            cursor.nativeCompletedSequence = localSequence;
-            cursor.localSequence = Math.max(cursor.localSequence, localSequence);
-            cursor.updatedAt = now;
-            saveCursor(cursor);
+            markNativeCompletedInternal(characterId, turnId, visibleGroupId, localSequence, now);
         });
+    }
+
+    private void markNativeCompletedInternal(
+        String characterId, String turnId, String visibleGroupId, long localSequence, long now
+    ) {
+        assertRoleAcceptsSemanticWrite(characterId);
+        ConversationCursorEntity cursor = cursorFor(characterId, now);
+        if ((cursor.clearEpoch > 0L && localSequence <= cursor.clearedThroughSequence)
+            || localSequence < cursor.localSequence) return;
+        boolean advancesNative = localSequence > cursor.nativeCompletedSequence
+            || (localSequence == cursor.nativeCompletedSequence
+                && (cursor.nativeCompletedGroupId == null || cursor.nativeCompletedGroupId.equals(visibleGroupId)));
+        if (!advancesNative) return;
+        cursor.nativeCompletedTurnId = turnId;
+        cursor.nativeCompletedGroupId = visibleGroupId;
+        cursor.nativeCompletedSequence = localSequence;
+        cursor.localSequence = Math.max(cursor.localSequence, localSequence);
+        cursor.updatedAt = now;
+        saveCursor(cursor);
     }
 
     public void markUiApplied(
@@ -1413,23 +1634,31 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         long now
     ) {
         database.runInTransaction(() -> {
-            ConversationCursorEntity cursor = cursorFor(characterId, now);
-            if ((cursor.clearEpoch > 0L && localSequence <= cursor.clearedThroughSequence)
-                || localSequence < cursor.localSequence) return;
-            boolean advancesUi = localSequence > cursor.uiAppliedSequence
-                || (localSequence == cursor.uiAppliedSequence
-                    && (cursor.uiAppliedGroupId == null || cursor.uiAppliedGroupId.equals(visibleGroupId)));
-            if (!advancesUi) return;
-            cursor.uiAppliedTurnId = turnId;
-            cursor.uiAppliedGroupId = visibleGroupId;
-            cursor.uiAppliedSequence = localSequence;
-            cursor.localSequence = Math.max(cursor.localSequence, localSequence);
-            cursor.updatedAt = now;
-            saveCursor(cursor);
+            markUiAppliedInternal(characterId, turnId, visibleGroupId, localSequence, now);
         });
     }
 
+    private void markUiAppliedInternal(
+        String characterId, String turnId, String visibleGroupId, long localSequence, long now
+    ) {
+        assertRoleAcceptsSemanticWrite(characterId);
+        ConversationCursorEntity cursor = cursorFor(characterId, now);
+        if ((cursor.clearEpoch > 0L && localSequence <= cursor.clearedThroughSequence)
+            || localSequence < cursor.localSequence) return;
+        boolean advancesUi = localSequence > cursor.uiAppliedSequence
+            || (localSequence == cursor.uiAppliedSequence
+                && (cursor.uiAppliedGroupId == null || cursor.uiAppliedGroupId.equals(visibleGroupId)));
+        if (!advancesUi) return;
+        cursor.uiAppliedTurnId = turnId;
+        cursor.uiAppliedGroupId = visibleGroupId;
+        cursor.uiAppliedSequence = localSequence;
+        cursor.localSequence = Math.max(cursor.localSequence, localSequence);
+        cursor.updatedAt = now;
+        saveCursor(cursor);
+    }
+
     public DeliveryDisposition classifyIncomingGroup(String characterId, String visibleGroupId, long localSequence) {
+        if (isRoleDeleteTombstoned(characterId)) return DeliveryDisposition.REDACTED;
         ConversationCursorEntity cursor = dao.conversationCursor(requireCharacterId(characterId));
         return cursor != null && cursor.clearEpoch > 0L && localSequence <= cursor.clearedThroughSequence
             ? DeliveryDisposition.REDACTED
@@ -1750,6 +1979,138 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return row;
     }
 
+    public LifecycleControl createRoleDelete(
+        String characterId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        Runnable durableWakePrearm
+    ) {
+        if (storeOwnedPeerId == null || storeOwnedPeerId.isEmpty()) {
+            throw new IllegalStateException("store-owned bridge peer is not configured");
+        }
+        if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("expected cursor checksum is invalid");
+        }
+        return createRoleDelete(
+            characterId, storeOwnedPeerId, expectedCursorChecksum, backupReceipt,
+            System.currentTimeMillis(), durableWakePrearm, null);
+    }
+
+    public LifecycleControl createRoleDelete(
+        String characterId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        Runnable durableWakePrearm,
+        RoleDeletionDispatchPolicy.NotificationCanceller notificationCanceller
+    ) {
+        if (storeOwnedPeerId == null || storeOwnedPeerId.isEmpty()) {
+            throw new IllegalStateException("store-owned bridge peer is not configured");
+        }
+        if (expectedCursorChecksum == null || !expectedCursorChecksum.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("expected cursor checksum is invalid");
+        }
+        return createRoleDelete(
+            characterId, storeOwnedPeerId, expectedCursorChecksum, backupReceipt,
+            System.currentTimeMillis(), durableWakePrearm, notificationCanceller);
+    }
+
+    public LifecycleControl roleDeleteControl(String characterId) {
+        String safeCharacterId = requireCharacterId(characterId);
+        List<LifecycleControlEntity> rows = dao.roleDeleteControlsForCharacter(safeCharacterId);
+        if (rows.isEmpty()) return null;
+        if (rows.size() != 1) throw new IllegalStateException("role delete authority set conflict");
+        validatePersistedLifecycleControl(rows.get(0));
+        return LifecycleControl.fromEntity(rows.get(0));
+    }
+
+    public boolean isRoleDeleteTombstoned(String characterId) {
+        return roleDeleteControl(characterId) != null;
+    }
+
+    /**
+     * Runs one observable role-scoped side effect only while holding the
+     * process-local deletion gate.  Role deletion takes the same gate before
+     * persisting its tombstone, so it cannot commit between the tombstone
+     * check and the beginning of the effect.  The durable tombstone remains
+     * the source of truth after process restart.
+     */
+    public boolean runRoleSideEffectIfNotDeleted(String characterId, Runnable sideEffect) {
+        String safeCharacterId = requireCharacterId(characterId);
+        if (sideEffect == null) throw new IllegalArgumentException("role side effect is required");
+        Object gate = ROLE_SIDE_EFFECT_GATES.computeIfAbsent(safeCharacterId, ignored -> new Object());
+        synchronized (gate) {
+            if (roleDeleteControl(safeCharacterId) != null) return false;
+            sideEffect.run();
+            return roleDeleteControl(safeCharacterId) == null;
+        }
+    }
+
+    /**
+     * Marks a completed/unapplied turn as metadata-only deleted under the
+     * retained role-delete authority.  No semantic payload, cursor, receipt,
+     * or diagnostic is written; the existing deletedAt column makes all
+     * completed/recovery selectors hide it and makes exact replays idempotent.
+     */
+    public boolean suppressRoleDeletedTurn(String turnId, String characterId, long now) {
+        String safeTurnId = requireBridgeIdentity(turnId, "role delete turn");
+        String safeCharacterId = requireCharacterId(characterId);
+        if (!safeNonNegative(now) || now == 0L) {
+            throw new IllegalArgumentException("role delete suppression time is invalid");
+        }
+        AtomicReference<Boolean> result = new AtomicReference<>(false);
+        Object roleGate = ROLE_SIDE_EFFECT_GATES.computeIfAbsent(
+            safeCharacterId, ignored -> new Object());
+        synchronized (roleGate) {
+            database.runInTransaction(() -> {
+            if (roleDeleteControl(safeCharacterId) == null) {
+                throw new IllegalStateException("role delete tombstone required");
+            }
+            ChatTurnEntity turn = dao.turn(safeTurnId);
+            if (turn == null) {
+                result.set(true);
+                return;
+            }
+            if (!safeCharacterId.equals(turn.characterId)) {
+                throw new IllegalStateException("role delete turn target conflict");
+            }
+            if (turn.deletedAt != null) {
+                result.set(true);
+                return;
+            }
+            if (dao.suppressRoleDeletedTurn(safeTurnId, safeCharacterId, now) == 1) {
+                result.set(true);
+                return;
+            }
+            ChatTurnEntity after = dao.turn(safeTurnId);
+            if (after == null || after.deletedAt != null) {
+                result.set(true);
+                return;
+            }
+            throw new IllegalStateException("role delete suppression conflict");
+            });
+        }
+        return Boolean.TRUE.equals(result.get());
+    }
+
+    public void assertRoleAcceptsSemanticWrite(String characterId) {
+        if (roleDeleteControl(characterId) != null) {
+            throw new IllegalStateException("role delete tombstone prevents semantic write");
+        }
+    }
+
+    @Override
+    public void assertBridgeSubmissionStillAllowed(TurnSubmission submission) {
+        if (submission == null) throw new IllegalArgumentException("bridge submission is required");
+        ChatTurnEntity turn = requireTurn(submission.turnId);
+        if (!submission.characterId.equals(turn.characterId)
+            || !submission.sourceMessageId.equals(turn.sourceMessageId)
+            || !submission.inputJson.equals(turn.inputJson)
+            || !submission.snapshotJson.equals(turn.snapshotJson)) {
+            throw bridgeAuthorityConflict(submission.turnId);
+        }
+        assertRoleAcceptsSemanticWrite(turn.characterId);
+    }
+
     LifecycleControl createRoleDelete(
         String characterId,
         String peerId,
@@ -1757,6 +2118,20 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         JSONObject backupReceipt,
         long requestedAt,
         Runnable durableWakePrearm
+    ) {
+        return createRoleDelete(
+            characterId, peerId, expectedCursorChecksum, backupReceipt, requestedAt,
+            durableWakePrearm, null);
+    }
+
+    LifecycleControl createRoleDelete(
+        String characterId,
+        String peerId,
+        String expectedCursorChecksum,
+        JSONObject backupReceipt,
+        long requestedAt,
+        Runnable durableWakePrearm,
+        RoleDeletionDispatchPolicy.NotificationCanceller notificationCanceller
     ) {
         String safeCharacterId = requireCharacterId(characterId);
         if (peerId == null || peerId.trim().isEmpty() || !peerId.equals(peerId.trim())) {
@@ -1770,6 +2145,9 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         }
         JSONObject verifiedReceipt = LifecycleControlCodec.validateBackupReceipt(backupReceipt);
         AtomicReference<LifecycleControl> result = new AtomicReference<>();
+        Object roleGate = ROLE_SIDE_EFFECT_GATES.computeIfAbsent(
+            safeCharacterId, ignored -> new Object());
+        synchronized (roleGate) {
         database.runInTransaction(() -> {
             List<LifecycleControlEntity> existingRows = dao.roleDeleteControlsForCharacter(safeCharacterId);
             if (!existingRows.isEmpty()) {
@@ -1813,9 +2191,12 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
             LifecycleControlEntity row = encodedToRoleDeleteEntity(
                 encoded, safeCharacterId, peerId, requestedAt);
+            List<String> roleTurnIds = dao.turnIdsForCharacter(safeCharacterId);
             if (dao.insertLifecycleControl(row) != 1L) {
                 throw new IllegalStateException("role delete already exists");
             }
+            insertRoleNotificationCancellationIntents(
+                row.controlId, safeCharacterId, roleTurnIds, requestedAt);
             terminalFaultHook.after("role_delete_control");
 
             dao.deleteAnnotationsForRole(safeCharacterId);
@@ -1845,7 +2226,61 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             if (durableWakePrearm != null) durableWakePrearm.run();
             result.set(LifecycleControl.fromEntity(row));
         });
+        }
+        // NotificationManager is an external side effect.  Drain only after
+        // the tombstone, cancellation intents, and semantic deletion commit.
+        // A callback failure leaves the waiting rows durable for restart retry.
+        if (notificationCanceller != null) {
+            drainPendingRoleNotificationCancellations(notificationCanceller);
+        }
         return result.get();
+    }
+
+    private void insertRoleNotificationCancellationIntents(
+        String controlId, String characterId, List<String> turnIds, long createdAt
+    ) {
+        for (int notificationId :
+            RoleNotificationCancellationContract.notificationIdsForTurns(turnIds)) {
+            String checksum = roleNotificationCancellationChecksum(
+                controlId, characterId, notificationId, createdAt);
+            RoleNotificationCancellationEntity intent = new RoleNotificationCancellationEntity();
+            intent.cancellationKey = "rncan_" + checksum;
+            intent.controlId = controlId;
+            intent.characterId = characterId;
+            intent.notificationId = notificationId;
+            intent.intentChecksum = checksum;
+            intent.state = "waiting";
+            intent.createdAt = createdAt;
+            intent.updatedAt = createdAt;
+            if (dao.insertRoleNotificationCancellation(intent) != 1L) {
+                throw new IllegalStateException("role notification cancellation already exists");
+            }
+        }
+    }
+
+    /**
+     * Drains metadata-only cancellation intents.  Every row is validated and
+     * joined to its retained role-delete control before the first external
+     * cancel call, so corrupt/foreign rows fail closed with zero cancellation.
+     */
+    public int drainPendingRoleNotificationCancellations(
+        RoleDeletionDispatchPolicy.NotificationCanceller canceller
+    ) {
+        if (canceller == null) throw new IllegalArgumentException("notification canceller is required");
+        List<RoleNotificationCancellationEntity> all = dao.roleNotificationCancellations();
+        for (RoleNotificationCancellationEntity row : all) {
+            validatePersistedRoleNotificationCancellation(row);
+        }
+        int completed = 0;
+        for (RoleNotificationCancellationEntity row : all) {
+            if (!"waiting".equals(row.state)) continue;
+            canceller.cancel(row.notificationId);
+            int deleted = dao.deleteRoleNotificationCancellationExact(
+                row.cancellationKey, row.controlId, row.characterId, row.notificationId,
+                row.intentChecksum, row.state, row.createdAt, row.updatedAt);
+            if (deleted == 1) completed++;
+        }
+        return completed;
     }
 
     private static LifecycleControlEntity encodedToRoleDeleteEntity(
@@ -2569,14 +3004,17 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
     @Override
     public void markCloudConfirmed(String turnId, long now) {
-        ChatTurnEntity turn = requireTurn(turnId);
-        if (turn.cloudConfirmedAt != null) return;
-        if (turn.uiAppliedAt == null) {
-            throw new IllegalStateException("Cannot confirm cloud delivery before UI landing for " + turnId);
-        }
-        if (dao.markCloudConfirmed(turnId, now) != 1) {
-            throw new IllegalStateException("Unable to record cloud confirmation for " + turnId);
-        }
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = requireTurn(turnId);
+            assertRoleAcceptsSemanticWrite(turn.characterId);
+            if (turn.cloudConfirmedAt != null) return;
+            if (turn.uiAppliedAt == null) {
+                throw new IllegalStateException("Cannot confirm cloud delivery before UI landing for " + turnId);
+            }
+            if (dao.markCloudConfirmed(turnId, now) != 1) {
+                throw new IllegalStateException("Unable to record cloud confirmation for " + turnId);
+            }
+        });
     }
 
     @Override

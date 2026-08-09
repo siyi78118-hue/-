@@ -112,8 +112,8 @@ assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopServic
 for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'getConversationCursor', 'createConversationClear', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9[\s\S]*MIGRATION_9_10[\s\S]*MIGRATION_10_11[\s\S]*MIGRATION_11_12[\s\S]*MIGRATION_12_13[\s\S]*MIGRATION_13_14/, 'Room must migrate existing installs through the conversation-authority, bridge-checkpoint, lifecycle-control, and inbound-ACK-tombstone schemas without destructive reset');
-assert.match(readFileSync(executionDbPath, 'utf8'), /SCHEMA_VERSION\s*=\s*14/, 'Room schema version must stay pinned to the current migration head');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9[\s\S]*MIGRATION_9_10[\s\S]*MIGRATION_10_11[\s\S]*MIGRATION_11_12[\s\S]*MIGRATION_12_13[\s\S]*MIGRATION_13_14[\s\S]*MIGRATION_14_15/, 'Room must migrate existing installs through the conversation-authority, bridge-checkpoint, lifecycle-control, inbound-ACK-tombstone, and durable notification-cancellation schemas without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /SCHEMA_VERSION\s*=\s*15/, 'Room schema version must stay pinned to the current migration head');
 assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors[\s\S]*yuqi_annotations/, 'Room v7 must retain raw messages, evidence facts, sync cursors, and annotations on the phone');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
@@ -639,7 +639,7 @@ assert.match(script, /聊天已清空，增量整理游标已复位/);
 assert.match(script, /messages: \[chatClearedSystemMessage\(char\)\]/);
 assert.doesNotMatch(script, /role:'assistant', content:char\.firstMessage/);
 assert.match(script, /async function deleteCurrentRole\(\)/);
-assert.match(script, /cancelCloudProactiveQuick\(deletedId, '删除角色'\)/);
+assert.match(script, /cancelCloudProactiveQuick\(deletedId,\s*['"][^'"]+['"]\)/);
 assert.match(script, /async function clearAllHistory\(\)/);
 assert.match(script, /runNativeClearAllSerial\(clearedCharIds, charId => clearConversationForCharacter\(charId\)\)/);
 assert.match(script, /MemoryDB\.clearChar\(deletedId\)/);

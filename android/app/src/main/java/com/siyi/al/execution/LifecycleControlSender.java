@@ -26,9 +26,17 @@ public final class LifecycleControlSender {
     public static final long MAX_RELAY_LIFETIME_MILLIS = 7L * 24L * 60L * 60L * 1000L;
     /** Inner applied body field name; relay identity stays outside this body. */
     public static final String APPLIED_CHECKSUM_FIELD = "controlChecksum";
-    private static final Set<String> APPLIED_ACK_KEYS = new HashSet<>(Arrays.asList(
+    private static final Set<String> CLEAR_APPLIED_ACK_KEYS = new HashSet<>(Arrays.asList(
         "protocolVersion", "type", "controlId", "controlChecksum", "roleId", "peerId",
         "clearEpoch", "clearedThroughSequence", "appliedAt", "checksum"
+    ));
+    private static final Set<String> ROLE_DELETE_APPLIED_ACK_KEYS = new HashSet<>(Arrays.asList(
+        "protocolVersion", "type", "controlId", "controlChecksum", "roleId", "peerId",
+        "backupReceiptId", "appliedAt", "checksum"
+    ));
+    private static final Set<String> ROLE_DELETE_PENDING_KEYS = new HashSet<>(Arrays.asList(
+        "protocolVersion", "type", "controlId", "controlChecksum", "roleId", "peerId",
+        "state", "pendingRetractions", "requestedAt", "checksum"
     ));
     private static final Set<String> APPLIED_ACK_CONFLICT_MESSAGES = Collections.unmodifiableSet(
         new HashSet<>(Arrays.asList(
@@ -88,9 +96,7 @@ public final class LifecycleControlSender {
         if (store == null || route == null) return false;
         LifecycleControl control = store.claimLifecycleControl(now);
         if (control == null) return false;
-        if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)) {
-            return false; // role_delete remains durable waiting until 20E.
-        }
+        if (!supportedControlKind(control.controlKind)) return false;
         return deliverClaimed(store, route, cloud, control, now);
     }
 
@@ -103,7 +109,7 @@ public final class LifecycleControlSender {
     ) throws Exception {
         if (store == null || (lan == null && cloud == null)) return false;
         LifecycleControl control = store.claimLifecycleControl(now);
-        if (control == null || !LifecycleControl.CLEAR_KIND.equals(control.controlKind)) return false;
+        if (control == null || !supportedControlKind(control.controlKind)) return false;
         Exception lanFailure = null;
         if (lan != null) {
             try {
@@ -154,6 +160,12 @@ public final class LifecycleControlSender {
                 control.controlId, control.semanticChecksum, control.leaseId,
                 control.leaseAttempt, control.leasedAt == null ? 0L : control.leasedAt,
                 delivery.relayMessageId, delivery.relayExpiresAt, now);
+        }
+        if (!delivery.applied
+            && LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+            && delivery.relayMessageId == null && delivery.relayExpiresAt == 0L
+            && delivery.appliedAt == 0L) {
+            return false; // Validated LAN 202: keep the exact lease for retry.
         }
         if (!delivery.applied || delivery.relayMessageId != null || delivery.relayExpiresAt != 0L) {
             throw new IllegalStateException("lifecycle LAN applied proof conflict");
@@ -264,14 +276,25 @@ public final class LifecycleControlSender {
         JSONObject wire = new JSONObject();
         try {
             wire.put("protocolVersion", 3L);
-            wire.put("type", "CONVERSATION_CLEAR_APPLIED");
             wire.put("controlId", control.controlId);
             wire.put("roleId", control.characterId);
             wire.put("peerId", control.peerId);
-            wire.put("clearEpoch", control.clearEpoch == null ? JSONObject.NULL : control.clearEpoch);
-            wire.put("clearedThroughSequence",
-                control.clearedThroughSequence == null ? JSONObject.NULL : control.clearedThroughSequence);
-            wire.put("controlChecksum", control.semanticChecksum);
+            if (LifecycleControl.CLEAR_KIND.equals(control.controlKind)) {
+                wire.put("type", "CONVERSATION_CLEAR_APPLIED");
+                wire.put("clearEpoch", control.clearEpoch == null ? JSONObject.NULL : control.clearEpoch);
+                wire.put("clearedThroughSequence",
+                    control.clearedThroughSequence == null ? JSONObject.NULL : control.clearedThroughSequence);
+            } else if (LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)) {
+                JSONObject semantic = new JSONObject(control.semanticJson);
+                LifecycleControlCodec.validateSemantic(semantic);
+                wire.put("type", "ROLE_DELETE_APPLIED");
+                wire.put("backupReceiptId",
+                    semantic.getJSONObject("backupReceipt").getString("receiptId"));
+            } else {
+                throw new IllegalArgumentException("lifecycle applied ACK kind conflict");
+            }
+            wire.put("controlChecksum", LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+                ? roleDeleteControlChecksum(control) : control.semanticChecksum);
             wire.put("appliedAt", appliedAt);
             wire.put("checksum", BridgeAuthority.sha256CanonicalJson(wire));
             return wire;
@@ -282,20 +305,32 @@ public final class LifecycleControlSender {
 
     /** Validate only the closed, self-authenticating applied-proof shape. */
     public static void validateAppliedAckShape(JSONObject wire) {
-        if (wire == null || !APPLIED_ACK_KEYS.equals(keysOf(wire))) {
+        if (wire == null) {
+            throw new IllegalArgumentException("lifecycle applied ACK keys conflict");
+        }
+        Object rawType = wire.opt("type");
+        if (!(rawType instanceof String)) throw new IllegalArgumentException("invalid lifecycle ACK header");
+        boolean clear = "CONVERSATION_CLEAR_APPLIED".equals(rawType);
+        boolean roleDelete = "ROLE_DELETE_APPLIED".equals(rawType);
+        Set<String> expectedKeys = clear ? CLEAR_APPLIED_ACK_KEYS
+            : roleDelete ? ROLE_DELETE_APPLIED_ACK_KEYS : Collections.emptySet();
+        if (!expectedKeys.equals(keysOf(wire))) {
             throw new IllegalArgumentException("lifecycle applied ACK keys conflict");
         }
         requireNativeLong(wire.opt("protocolVersion"), "protocolVersion", false);
         if (((Number) wire.opt("protocolVersion")).longValue() != 3L
-            || !(wire.opt("type") instanceof String)
-            || !"CONVERSATION_CLEAR_APPLIED".equals(wire.opt("type"))) {
+            || (!clear && !roleDelete)) {
             throw new IllegalArgumentException("invalid lifecycle ACK header");
         }
         requireNativeId(wire.opt("controlId"), "controlId");
         requireNativeId(wire.opt("roleId"), "roleId");
         requireNativeId(wire.opt("peerId"), "peerId");
-        requireNullableSafe(wire.opt("clearEpoch"), "clearEpoch");
-        requireNullableSafe(wire.opt("clearedThroughSequence"), "clearedThroughSequence");
+        if (clear) {
+            requireNullableSafe(wire.opt("clearEpoch"), "clearEpoch");
+            requireNullableSafe(wire.opt("clearedThroughSequence"), "clearedThroughSequence");
+        } else {
+            requireNativeId(wire.opt("backupReceiptId"), "backupReceiptId");
+        }
         requireNativeChecksum(wire.opt("controlChecksum"), "controlChecksum");
         requireNativeLong(wire.opt("appliedAt"), "appliedAt", true);
         requireNativeChecksum(wire.opt("checksum"), "checksum");
@@ -311,17 +346,23 @@ public final class LifecycleControlSender {
     /** Validate an applied proof against the persisted control identity. */
     public static void validateAppliedAck(JSONObject wire, LifecycleControl control) {
         requireControl(control);
-        if (!LifecycleControl.CLEAR_KIND.equals(control.controlKind)) {
-            throw new IllegalArgumentException("lifecycle applied ACK kind conflict");
-        }
         validateAppliedAckShape(wire);
         try {
-            if (!control.controlId.equals(wire.getString("controlId"))
+            boolean clear = LifecycleControl.CLEAR_KIND.equals(control.controlKind);
+            boolean roleDelete = LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind);
+            if ((!clear && !roleDelete)
+                || (clear && !"CONVERSATION_CLEAR_APPLIED".equals(wire.getString("type")))
+                || (roleDelete && !"ROLE_DELETE_APPLIED".equals(wire.getString("type")))
+                || !control.controlId.equals(wire.getString("controlId"))
                 || !control.characterId.equals(wire.getString("roleId"))
                 || !control.peerId.equals(wire.getString("peerId"))
-                || !control.semanticChecksum.equals(wire.getString("controlChecksum"))
-                || !Objects.equals(nullableLong(wire.opt("clearEpoch")), control.clearEpoch)
-                || !Objects.equals(nullableLong(wire.opt("clearedThroughSequence")), control.clearedThroughSequence)) {
+                || !(roleDelete ? roleDeleteControlChecksum(control) : control.semanticChecksum)
+                    .equals(wire.getString("controlChecksum"))
+                || (clear && (!Objects.equals(nullableLong(wire.opt("clearEpoch")), control.clearEpoch)
+                    || !Objects.equals(nullableLong(wire.opt("clearedThroughSequence")),
+                        control.clearedThroughSequence)))
+                || (roleDelete && !roleDeleteBackupReceiptId(control).equals(
+                    wire.getString("backupReceiptId")))) {
                 throw new IllegalArgumentException("lifecycle applied ACK authority conflict");
             }
         } catch (JSONException error) {
@@ -335,6 +376,38 @@ public final class LifecycleControlSender {
             && APPLIED_ACK_CONFLICT_MESSAGES.contains(error.getMessage());
     }
 
+    /** Validate the closed 202 proof without changing the durable local control. */
+    public static void validateRoleDeletePending(JSONObject wire, LifecycleControl control) {
+        requireControl(control);
+        if (!LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+            || wire == null || !ROLE_DELETE_PENDING_KEYS.equals(keysOf(wire))) {
+            throw new IllegalArgumentException("role delete pending keys conflict");
+        }
+        requireNativeLong(wire.opt("protocolVersion"), "protocolVersion", false);
+        requireNativeId(wire.opt("controlId"), "controlId");
+        requireNativeId(wire.opt("roleId"), "roleId");
+        requireNativeId(wire.opt("peerId"), "peerId");
+        requireNativeChecksum(wire.opt("controlChecksum"), "controlChecksum");
+        requireNativeLong(wire.opt("pendingRetractions"), "pendingRetractions", false);
+        requireNativeLong(wire.opt("requestedAt"), "requestedAt", true);
+        requireNativeChecksum(wire.opt("checksum"), "checksum");
+        try {
+            if (((Number) wire.get("protocolVersion")).longValue() != 3L
+                || !"ROLE_DELETE_PENDING".equals(wire.opt("type"))
+                || !"pending_retractions".equals(wire.opt("state"))
+                || !control.controlId.equals(wire.getString("controlId"))
+                || !control.characterId.equals(wire.getString("roleId"))
+                || !control.peerId.equals(wire.getString("peerId"))
+                || !roleDeleteControlChecksum(control).equals(wire.getString("controlChecksum"))
+                || ((Number) wire.get("requestedAt")).longValue() != control.requestedAt
+                || !wire.getString("checksum").equals(checksumWithoutField(wire))) {
+                throw new IllegalArgumentException("role delete pending authority conflict");
+            }
+        } catch (JSONException error) {
+            throw new IllegalArgumentException("role delete pending shape conflict", error);
+        }
+    }
+
     /**
      * Return only a closed checksum token for a rejected ACK diagnostic.  A malformed
      * caller value is represented by a fixed sentinel so secrets never enter diagnostics.
@@ -346,6 +419,31 @@ public final class LifecycleControlSender {
 
     public static String appliedAckConflictChecksum(String raw) {
         return raw != null && raw.matches("[a-f0-9]{64}") ? raw : "invalid";
+    }
+
+    private static boolean supportedControlKind(String kind) {
+        return LifecycleControl.CLEAR_KIND.equals(kind)
+            || LifecycleControl.ROLE_DELETE_KIND.equals(kind);
+    }
+
+    private static String roleDeleteBackupReceiptId(LifecycleControl control) {
+        try {
+            JSONObject semantic = new JSONObject(control.semanticJson);
+            LifecycleControlCodec.validateSemantic(semantic);
+            return semantic.getJSONObject("backupReceipt").getString("receiptId");
+        } catch (Exception error) {
+            throw new IllegalArgumentException("lifecycle applied ACK shape conflict", error);
+        }
+    }
+
+    private static String roleDeleteControlChecksum(LifecycleControl control) {
+        try {
+            JSONObject semantic = new JSONObject(control.semanticJson);
+            LifecycleControlCodec.validateSemantic(semantic);
+            return semantic.getString("checksum");
+        } catch (Exception error) {
+            throw new IllegalArgumentException("lifecycle applied ACK shape conflict", error);
+        }
     }
 
     /** Validate a generated relay expiry against one captured clock value. */

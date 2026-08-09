@@ -33,7 +33,10 @@ public final class RolePlanCoordinator {
         int queued = 0;
         List<RolePlanEntity> plans = database.executionDao().dueRolePlans(now, 50);
         for (RolePlanEntity plan : plans) {
-            if (plan.nextRunAt != null && claimAndQueue(plan, plan.nextRunAt, cloudJobId(plan), now, false)) queued += 1;
+            if (plan.nextRunAt != null
+                && claimAndQueueUnderRoleGate(plan, plan.nextRunAt, cloudJobId(plan), now, false)) {
+                queued += 1;
+            }
         }
         return queued;
     }
@@ -41,17 +44,19 @@ public final class RolePlanCoordinator {
     public boolean dispatch(String planId, long scheduledFor, String jobId, long now) {
         RolePlanEntity plan = database.executionDao().rolePlan(planId);
         if (plan == null || plan.nextRunAt == null || plan.nextRunAt.longValue() != scheduledFor) return false;
-        return claimAndQueue(plan, scheduledFor, jobId, now, false);
+        return claimAndQueueUnderRoleGate(plan, scheduledFor, jobId, now, false);
     }
 
     public boolean dispatchCurrent(String planId, String jobId, long now) {
         RolePlanEntity plan = database.executionDao().rolePlan(planId);
-        return plan != null && plan.nextRunAt != null && claimAndQueue(plan, plan.nextRunAt, jobId, now, false);
+        return plan != null && plan.nextRunAt != null
+            && claimAndQueueUnderRoleGate(plan, plan.nextRunAt, jobId, now, false);
     }
 
     public boolean runNow(String planId, long now) {
         RolePlanEntity plan = database.executionDao().rolePlan(planId);
-        return plan != null && claimAndQueue(plan, now, "manual_" + safe(planId) + "_" + now, now, true);
+        return plan != null
+            && claimAndQueueUnderRoleGate(plan, now, "manual_" + safe(planId) + "_" + now, now, true);
     }
 
     public void completeForTurn(String turnId, long now) {
@@ -60,6 +65,7 @@ public final class RolePlanCoordinator {
         final Long[] nextAlarm = new Long[] { null };
         database.runInTransaction(() -> {
             RolePlanEntity plan = database.executionDao().rolePlan(occurrence.planId);
+            if (plan != null && store.isRoleDeleteTombstoned(plan.characterId)) return;
             if (plan != null
                 && "active".equals(plan.status)
                 && plan.nextRunAt != null
@@ -82,6 +88,8 @@ public final class RolePlanCoordinator {
             database.executionDao().completeRolePlanOccurrence(occurrence.occurrenceId, now);
         });
         if (context != null && nextAlarm[0] != null) {
+            RolePlanEntity current = database.executionDao().rolePlan(occurrence.planId);
+            if (current != null && store.isRoleDeleteTombstoned(current.characterId)) return;
             RolePlanAlarmScheduler.schedule(context, occurrence.planId, nextAlarm[0]);
         }
     }
@@ -91,6 +99,7 @@ public final class RolePlanCoordinator {
         for (RolePlanOccurrenceEntity occurrence : database.executionDao().failedRolePlanOccurrences(50)) {
             database.runInTransaction(() -> {
                 RolePlanEntity plan = database.executionDao().rolePlan(occurrence.planId);
+                if (plan != null && store.isRoleDeleteTombstoned(plan.characterId)) return;
                 if (plan != null
                     && "active".equals(plan.status)
                     && plan.nextRunAt != null
@@ -136,13 +145,16 @@ public final class RolePlanCoordinator {
     private boolean claimAndQueue(RolePlanEntity plan, long scheduledFor, String jobId, long now, boolean force) {
         try {
             JSONObject planJson = new JSONObject(plan.planJson);
+            store.assertRoleAcceptsSemanticWrite(plan.characterId);
             String type = planJson.optString("type", "");
             boolean runnableType = "private_message".equals(type) || "moment_post".equals(type);
             if (force ? (!"active".equals(plan.status) || !runnableType)
                 : !RolePlanRecoveryPolicy.claimable(plan.status, type, scheduledFor, now)) return false;
             CharacterSnapshotEntity snapshot = database.executionDao().latestSnapshot(plan.characterId + ":role-plan:" + plan.planId);
             if (snapshot == null || snapshot.contextJson == null || snapshot.contextJson.trim().isEmpty()) {
-                store.recordDiagnostic("plan_" + safe(plan.planId), null, "WARN", "ROLE_PLAN_SNAPSHOT_MISSING", plan.planId, now);
+                store.recordRolePreflightDiagnosticIfActive(
+                    "plan_" + safe(plan.planId), plan.characterId,
+                    "WARN", "ROLE_PLAN_SNAPSHOT_MISSING", plan.planId, now);
                 return false;
             }
 
@@ -158,8 +170,6 @@ public final class RolePlanCoordinator {
             occurrence.scheduledFor = scheduledFor;
             occurrence.claimedAt = now;
             occurrence.updatedAt = now;
-            if (database.executionDao().insertRolePlanOccurrence(occurrence) == -1L) return false;
-
             JSONObject context = new JSONObject(snapshot.contextJson);
             context.put("scheduledFor", scheduledFor);
             context.put("executedAt", now);
@@ -176,19 +186,33 @@ public final class RolePlanCoordinator {
             input.put("occurrenceId", occurrenceId);
             input.put("scheduledFor", scheduledFor);
             input.put("executedAt", now);
-            ChatTurnEntity turn = store.submitTurn(new TurnSubmission(
+            ChatTurnEntity turn = store.submitRolePlanOccurrence(occurrence, new TurnSubmission(
                 turnId, plan.characterId, occurrenceId, kind, input.toString(), context.toString(), jobId, now
             ));
-            if (turn == null) {
-                database.executionDao().failRolePlanOccurrence(occurrenceId, "TURN_QUEUE_FAILED", now);
+            return turn != null;
+        } catch (Exception error) {
+            // submitRolePlanOccurrence wraps every Room transaction failure.
+            // The transaction has already rolled back its occurrence, turn,
+            // attempt and claim diagnostic; writing a second ordinary
+            // diagnostic here would create an orphan after a delete/fault race.
+            if (error instanceof RoomExecutionStore.AtomicRolePlanSubmissionException) {
                 return false;
             }
-            store.recordDiagnostic(turnId, turn.activeAttemptId, "INFO", "ROLE_PLAN_CLAIMED", RolePlanRecoveryPolicy.timingContext(scheduledFor, now), now);
-            return true;
-        } catch (Exception error) {
+            if (store.isRoleDeleteTombstoned(plan.characterId)) return false;
             store.recordDiagnostic("plan_" + safe(plan.planId), null, "ERROR", "ROLE_PLAN_CLAIM_FAILED", error.getMessage(), now);
             return false;
         }
+    }
+
+    private boolean claimAndQueueUnderRoleGate(
+        RolePlanEntity plan, long scheduledFor, String jobId, long now, boolean force
+    ) {
+        final boolean[] queued = {false};
+        boolean gateCompleted = store.runRoleSideEffectIfNotDeleted(
+            plan.characterId,
+            () -> queued[0] = claimAndQueue(plan, scheduledFor, jobId, now, force)
+        );
+        return gateCompleted && queued[0];
     }
 
     private static String cloudJobId(RolePlanEntity plan) {

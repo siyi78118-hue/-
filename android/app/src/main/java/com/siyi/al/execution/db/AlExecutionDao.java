@@ -25,6 +25,28 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertLifecycleInboundAckTombstone(LifecycleInboundAckTombstoneEntity tombstone);
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertRoleNotificationCancellation(RoleNotificationCancellationEntity cancellation);
+
+    @Query("SELECT * FROM role_notification_cancellations WHERE state = 'waiting' "
+        + "ORDER BY created_at ASC, cancellation_key ASC")
+    List<RoleNotificationCancellationEntity> pendingRoleNotificationCancellations();
+
+    @Query("SELECT * FROM role_notification_cancellations ORDER BY created_at ASC, cancellation_key ASC")
+    List<RoleNotificationCancellationEntity> roleNotificationCancellations();
+
+    @Query("DELETE FROM role_notification_cancellations WHERE cancellation_key = :cancellationKey "
+        + "AND control_id = :controlId AND character_id = :characterId "
+        + "AND notification_id = :notificationId AND intent_checksum = :intentChecksum "
+        + "AND state = :state AND created_at = :createdAt AND updated_at = :updatedAt")
+    int deleteRoleNotificationCancellationExact(
+        String cancellationKey, String controlId, String characterId, int notificationId,
+        String intentChecksum, String state, long createdAt, long updatedAt
+    );
+
+    @Query("SELECT COUNT(*) FROM role_notification_cancellations WHERE state = 'waiting'")
+    long roleNotificationCancellationCount();
+
     @Query("SELECT * FROM lifecycle_inbound_ack_tombstones WHERE peerId = :peerId AND inboundRelayMessageId = :relayMessageId LIMIT 1")
     LifecycleInboundAckTombstoneEntity lifecycleInboundAckTombstone(String peerId, String relayMessageId);
 
@@ -60,7 +82,7 @@ public interface AlExecutionDao {
         + "AND controlId != :retainedControlId")
     int deletePriorLifecycleControlsForRole(String characterId, String retainedControlId);
 
-    @Query("SELECT * FROM lifecycle_controls WHERE controlKind = 'conversation_clear_v1' AND ("
+    @Query("SELECT * FROM lifecycle_controls WHERE controlKind IN ('conversation_clear_v1', 'role_delete_v1') AND ("
         + "state = 'waiting' "
         + "OR (state = 'pending' AND leasedAt IS NOT NULL AND leasedAt <= :leaseCutoff) "
         + "OR (state = 'relay_accepted' AND relayExpiresAt IS NOT NULL AND relayExpiresAt <= :refreshCutoff)) "
@@ -254,6 +276,9 @@ public interface AlExecutionDao {
 
     @Query("SELECT * FROM chat_turns WHERE turnId = :turnId LIMIT 1")
     ChatTurnEntity turn(String turnId);
+
+    @Query("SELECT turnId FROM chat_turns WHERE characterId = :characterId ORDER BY createdAt ASC, turnId ASC")
+    List<String> turnIdsForCharacter(String characterId);
 
     @Query("SELECT * FROM chat_turns WHERE characterId = :characterId AND (bridgeProtocolVersion IS NULL OR (inputVisibilitySequence IS NOT NULL AND inputVisibilitySequence <= :clearedThroughSequence)) ORDER BY CASE WHEN inputVisibilitySequence IS NULL THEN 0 ELSE 1 END, inputVisibilitySequence ASC, turnId ASC")
     List<ChatTurnEntity> turnsThroughClear(String characterId, long clearedThroughSequence);
@@ -503,6 +528,9 @@ public interface AlExecutionDao {
 
     @Query("UPDATE chat_turns SET notificationShownAt = :now WHERE turnId = :turnId AND state = 'COMPLETED' AND notificationShownAt IS NULL")
     int markNotificationShown(String turnId, long now);
+
+    @Query("UPDATE chat_turns SET deletedAt = :now WHERE turnId = :turnId AND characterId = :characterId AND deletedAt IS NULL")
+    int suppressRoleDeletedTurn(String turnId, String characterId, long now);
 
     @Query("UPDATE chat_turns SET cloudConfirmedAt = :now WHERE turnId = :turnId AND state = 'COMPLETED' AND uiAppliedAt IS NOT NULL AND cloudConfirmedAt IS NULL")
     int markCloudConfirmed(String turnId, long now);
