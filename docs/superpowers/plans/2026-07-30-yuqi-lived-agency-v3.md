@@ -9634,6 +9634,59 @@ const raceCases = [
 ];
 ```
 
+The names are not sufficient evidence by themselves. Their minimum production
+paths and outcomes are fixed as follows:
+
+- `proactive_generating_then_user_batch` uses the store-owned lane admission
+  transaction. A user batch atomically supersedes the uncommitted proactive
+  turn, closes its lineage with `superseded_by_user_batch`, advances the lane
+  once, admits one direct turn and preserves the result across reopen.
+- `proactive_outbox_then_user_batch` first commits the proactive authority and
+  creates its real group delivery. The later user batch cannot retroactively
+  supersede that committed group; both turns retain exactly one authority and
+  the lane/delivery ordering survives reopen.
+- `runtime_restart_before_visible_commit` crosses a real visible-commit fault
+  boundary before the transaction completes. Reopen observes no partial group,
+  receipt, job, action or delivery; normal recovery can commit exactly once.
+- `runtime_restart_after_visible_commit` closes the database after the commit
+  transaction but before caller-side continuation. Reopen and exact replay
+  return the same receipt and never create a second group, action, job or
+  delivery.
+- `original_retry_and_sibling_retry_compete` uses two connections against one
+  failed retry-authorized lineage. Exactly one sibling child is admitted; the
+  other receives the stable authority/CAS rejection and leaves zero rows.
+- `populated_v15_migrates_and_restarts` starts from a populated v14 fixture with
+  canonical turn, lineage, group/receipt, lane, rollout and delivery authority,
+  migrates only a clone to v15, reopens it, and proves the source bytes did not
+  change. A single queued placeholder row is not a populated fixture.
+- `canary_rollback_while_turn_in_flight` reaches canary through the production
+  controller/report path and triggers rollback through the production fuse and
+  clock. The already-created turn keeps its release/epoch/slot pins while a new
+  turn observes the rolled-back pair; raw SQL timestamp edits are not evidence.
+- `same_fingerprint_adjacent_revisions` uses a failed parent and its authorized
+  retry in one lineage. Identical input visibility/context may yield the same
+  generation fingerprint while turn/lane/lineage revisions differ; a stale
+  parent revision cannot commit or overwrite the retry authority.
+- `cloud_waiting_does_not_block_next_local_turn` holds a real ResultOutbox
+  network attempt/lease open while a second connection admits the next local
+  user turn. The old target remains exactly once and the new turn is not delayed
+  or merged; release of the network attempt preserves relay idempotency.
+- `pc_android_receipt_conflict_is_quarantined` submits a valid Android fallback
+  authority receipt that conflicts with an already-persisted PC authority (or
+  the symmetric real ordering) through `importExternalVisibleReceiptInternal`.
+  It records exactly one redacted `external_authority_conflict`, preserves the
+  first authority, and creates no second group/delivery. Calling a quarantine
+  writer directly is not evidence of conflict detection.
+- `conversation_clear_after_outbox_snapshot` takes a real outbox selection,
+  applies the authenticated clear transaction from another connection, then
+  resumes the stale worker. The stale claim/send is rejected, the group follows
+  the redaction lifecycle, and reopen preserves the clear cursor and zero
+  semantic send.
+- `redacted_group_stale_outbox_snapshot_does_not_send` drives the same stale
+  selection through `ResultOutbox` after group redaction and proves zero HTTP
+  enqueue, zero legacy/failure fallback, zero new diagnostic/semantic payload
+  and no re-selection after reopen.
+
 The remaining eleven cases are cross-runtime device obligations, not Node
 passes: `native_completed_before_ui_open`, `ui_open_before_notification`,
 `event_and_poll_same_group`, `event_lost_poll_recovers`,
