@@ -10,6 +10,17 @@ const rootDir = process.cwd();
 const protocolRoot = resolve(rootDir, 'tests/fixtures/yuqi-cognition-protocol-v1');
 const qualityRoot = resolve(rootDir, 'tests/fixtures/yuqi-lived-quality-v1');
 
+test('real-history extractor is explicitly readonly and never opens production config/store', () => {
+  const source = readFileSync(resolve(rootDir, 'scripts/extract-yuqi-real-history-scenes.mjs'), 'utf8');
+  assert.match(source, /DatabaseSync/);
+  assert.match(source, /readOnly:\s*true/);
+  assert.match(source, /--database/);
+  assert.match(source, /manifest/);
+  assert.doesNotMatch(source, /YuqiStore/);
+  assert.doesNotMatch(source, /config\.json/);
+  assert.doesNotMatch(source, /journal_mode\s*=\s*WAL/i);
+});
+
 test('quality CLI package scripts are declared without production release registration', () => {
   const packageJson = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
   assert.equal(packageJson.scripts['cognition:quality:check'], 'node scripts/compile-yuqi-lived-quality-scenes.mjs --check');

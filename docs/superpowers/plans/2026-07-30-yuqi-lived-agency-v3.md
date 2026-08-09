@@ -8764,6 +8764,7 @@ git commit -m "feat: complete Yuqi data lifecycle"
 - Create: `scripts/compile-yuqi-lived-quality-scenes.mjs`
 - Create: `scripts/extract-yuqi-real-history-scenes.mjs`
 - Create: `tests/yuqi-lived-quality-contract.test.mjs`
+- Create: `tests/yuqi-real-history-extractor.test.mjs`
 - Modify: `.gitignore`
 - Read: `preset-references/真人聊天训练批注-第一轮.md`
 - Read: `preset-references/真人聊天训练批注-第二轮.md`
@@ -8919,22 +8920,29 @@ Across the 72 coverage scenes, the compiler enforces these minimums: `DIRECT_REP
 
 - [ ] **Step 5: Extract 30 local real-history scenes without committing private content**
 
-```js
-export function selectRealHistoryScenes({ store, limit = 30 }) {
-  return diversifyByFailureStructure(
-    store.listReplayEligibleTurns({ rolloutKey: 'DIRECT_REPLY', limit: 200 }),
-    {
-      limit,
-      requiredStructures: [
-        'social_bid', 'temporary_stance', 'stage_leak', 'proactive_collision',
-        'payment', 'repair', 'time_gap', 'multi_bubble', 'media_or_quote'
-      ]
-    }
-  ).map(redactIdentifiersButKeepSemantics);
-}
-```
+The extractor takes an explicit absolute `--database` path to a frozen v10
+validation snapshot. It must use SQLite read-only mode directly: it may not
+load `yuqi-runtime/config.json`, construct `YuqiStore`, migrate the source,
+change journal mode, or create production release/shadow rows. Before and after
+the read it verifies the database plus non-empty WAL/rollback-journal content;
+process-local SHM lock bytes are excluded from source identity.
 
-Write them to `artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl`; add that private directory to `.gitignore`. Preserve exact semantic text locally because replacing it with numbered dummy text would destroy evaluation value. Record a SHA-256 and counts in the public report, never raw private content.
+Only closed, canonical `DIRECT_REPLY` authority lineages are eligible. The
+extractor validates the root attempt, retry chain/cycle closure, latest member,
+role/device/source ownership, message projection and checksum, then emits
+exactly 30 scenes containing all nine required structures. Output is a closed
+Task 22 scene projection: unknown fields, speakers, structures, nested state,
+attachments, actions, or severity values fail the whole extraction instead of
+being copied or guessed. Identifiers are replaced while user-visible semantic
+text is preserved locally.
+
+Publish `real-history-scenes.jsonl` together with
+`real-history-scenes.manifest.json` under
+`artifacts/yuqi-lived-agency-v3/private/`. The manifest binds the ordered scene
+IDs and SHA-256 generation checksum. Both files are staged and verified before
+publication; readers reject a missing or mismatched pair. The private directory
+remains ignored and no raw private content is committed or copied into public
+reports.
 
 - [ ] **Step 6: Compile and verify both suites**
 
@@ -8942,8 +8950,8 @@ Run:
 
 ```powershell
 node scripts/compile-yuqi-lived-quality-scenes.mjs --check
-node scripts/extract-yuqi-real-history-scenes.mjs --config yuqi-runtime/config.json --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl
-node --test tests/yuqi-lived-quality-contract.test.mjs yuqi-runtime/test/replay-runner.test.mjs
+node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v10-validation-snapshot> --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
+node --test tests/yuqi-lived-quality-contract.test.mjs tests/yuqi-real-history-extractor.test.mjs yuqi-runtime/test/replay-runner.test.mjs
 npm run cognition:replay
 npm run cognition:replay-report
 ```
@@ -8953,7 +8961,7 @@ Expected: 270 protocol cases PASS; 24 sentinel and 72 coverage scenes validate; 
 - [ ] **Step 7: Commit public suite and tooling only**
 
 ```powershell
-git add tests/fixtures/yuqi-cognition-protocol-v1 tests/fixtures/yuqi-lived-quality-v1 scripts/generate-yuqi-replay-fixtures.mjs scripts/run-yuqi-cognition-replay.mjs scripts/report-yuqi-cognition-replay.mjs scripts/compile-yuqi-lived-quality-scenes.mjs scripts/extract-yuqi-real-history-scenes.mjs yuqi-runtime/src/replay-runner.mjs yuqi-runtime/test/replay-runner.test.mjs tests/yuqi-lived-quality-contract.test.mjs .gitignore
+git add tests/fixtures/yuqi-cognition-protocol-v1 tests/fixtures/yuqi-lived-quality-v1 scripts/generate-yuqi-replay-fixtures.mjs scripts/run-yuqi-cognition-replay.mjs scripts/report-yuqi-cognition-replay.mjs scripts/compile-yuqi-lived-quality-scenes.mjs scripts/extract-yuqi-real-history-scenes.mjs yuqi-runtime/src/replay-runner.mjs yuqi-runtime/test/replay-runner.test.mjs tests/yuqi-lived-quality-contract.test.mjs tests/yuqi-real-history-extractor.test.mjs .gitignore docs/superpowers/plans/2026-07-30-yuqi-lived-agency-v3.md
 git commit -m "test: separate protocol and lived quality evidence"
 ```
 
