@@ -9459,191 +9459,235 @@ git add yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuq
 git commit -m "feat: control Yuqi stable candidate rollout by release"
 ```
 
-### Task 24: Expose End-to-End Delivery, Release, Lane, and Quality Diagnostics
+### Task 24: Expose Sanitized PC Authority Diagnostics and Execute the Real Race Matrix
+
+The Android/Web four-stage diagnostic work is already complete at this
+baseline. `AlExecutionPlugin.nativeDiagnostics()` persists and exposes
+`cloudConfirmed`, `nativeCompleted`, `notificationShown`, and `uiApplied`
+independently, and `tavern-app/index.html` already renders the four labels.
+Task 24 consumes that contract and must not rewrite the Android service or Web
+landing path merely to recreate it.
 
 **Files:**
-- Modify: `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
-- Modify: `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
-- Modify: `tavern-app/index.html`
+- Modify: `yuqi-runtime/src/store.mjs`
+- Create: `yuqi-runtime/src/v3-diagnostics.mjs`
 - Modify: `yuqi-runtime/src/local-server.mjs`
-- Modify: `yuqi-runtime/src/main.mjs`
-- Create: `scripts/verify-yuqi-v3-races.mjs`
-- Modify: `tests/yuqi-ui-contract.test.mjs`
-- Modify: `test-basic.mjs`
 - Create: `yuqi-runtime/test/v3-diagnostics.test.mjs`
+- Modify: `yuqi-runtime/test/local-server.test.mjs`
+- Create: `tests/yuqi-v3-races.test.mjs`
+- Create: `scripts/verify-yuqi-v3-races.mjs`
+- Modify: `package.json`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/race-report.json`
 
 **Interfaces:**
-- Consumes: turn, lineage, canonical group, commit receipt, group delivery, cursor, lane, release/rollout, comparison, and quality findings.
-- Produces: one joined authority chain, separate observable stages, and a checksummed race report.
+- `store.loadTurnDiagnosticsAuthorityInternal(turnId) -> closed projection`
+- `store.loadTurnComparisonDiagnosticsInternal({ turnId, lineageKey, turnPin }) -> closed counts`
+- `projectV3Diagnostics(closedProjection) -> sanitized diagnostic JSON`
+- authenticated `GET /v3/diagnostics/turns/{turnId}`
+- `runPcRaceMatrix({ cases, execute }) -> checksummed PC evidence report`
 
-- [ ] **Step 1: Write red diagnostics tests**
+- [ ] **Step 1: Write red scoped-diagnostics tests**
 
-```js
-test('diagnostics do not collapse four delivery stages', async () => {
-  const value = await diagnosticsFor('turn-1');
-  assert.deepEqual(Object.keys(value.delivery).sort(), [
-    'cloudConfirmed', 'nativeCompleted', 'notificationShown', 'uiApplied'
-  ]);
-  assert.equal(value.transport.stage, 'PC_ACCEPTED');
-  assert.equal(value.delivery.nativeCompleted, true);
-  assert.equal(value.delivery.uiApplied, false);
-});
+Use real temporary SQLite stores, canonical creation/commit/failure/fallback
+helpers, and the production local server. Cover all of these outcomes:
 
-test('diagnostics name release pair and lane authority', async () => {
-  const value = await diagnosticsFor('turn-1');
-  assert.equal(value.pipeline.authoritativeReleaseId, 'candidate-r3');
-  assert.equal(value.pipeline.comparisonReleaseId, 'stable-r2');
-  assert.equal(value.pipeline.candidatePhase, 'canary');
-  assert.equal(value.lane.key, 'private_chat');
-  assert.equal(value.lane.revision, 8);
-  assert.equal(value.visibleGroup.id, 'group-1');
-  assert.equal(value.authority.lineageKey, 'lineage-1');
-  assert.equal(value.authority.origin, 'pc');
-  assert.equal(value.authority.chainValid, true);
-  assert.equal(value.authority.commitChecksum, 'commit-sha256');
-  assert.equal(value.outbox.authorityGroupId, 'group-1');
-});
+1. authority-version-0 returns `authority.kind=legacy_turn_identity`; it is not
+   described as a failed v3 join and no group/checksum is invented;
+2. live PC authority validates the exact
+   `turn → lineage → receipt → group → one device delivery → lane → release`
+   chain before exposing identifiers;
+3. Android fallback validates the external authority graph, requires zero PC
+   delivery rows, and reports `outbox.state=not_applicable_external_visibility`;
+4. wire-v3 canonical failure is loaded only through the closed failure loader;
+5. committed-redacted and cancelled-redacted authority returns one
+   metadata-only `redacted` projection with no item/action/message/reply data;
+6. a corrupt receipt, group, delivery, release, lane, comparison job/run, or
+   checksum raises the typed diagnostic authority conflict and never falls
+   back to `turn.reply_json` or `turn.error_json`;
+7. one live group performs scoped validation only; full v11/v13/v14/v15 scans
+   remain zero on the endpoint hot path;
+8. unknown projector input fields and non-native values fail before output;
+9. serialized output contains none of `reply_json`, prompt/model text,
+   `immediateFeeling`, evaluator prose, private scene paths, secrets, message
+   bodies, action payloads, or annotation snapshots.
 
-test('diagnostics never fabricate authority from turn reply JSON', async () => {
-  corruptReceiptJoinWithoutChangingTurnProjection('turn-1');
-  const value = await diagnosticsFor('turn-1');
-  assert.equal(value.authority.chainValid, false);
-  assert.equal(value.visibleGroup, null);
-  assert.equal(value.authority.errorCode, 'VISIBLE_AUTHORITY_INVARIANT');
-});
+The HTTP tests require authentication before any store read, a canonical
+percent-decoded turn ID, `404` for a missing turn, `200` for a valid sanitized
+projection, and a fixed `409 {ok:false,error:'V3_DIAGNOSTIC_AUTHORITY_CONFLICT'}`
+only for the closed authority-conflict class. Unknown programming/SQLite errors
+remain 5xx and are not mislabeled as authority corruption.
 
-test('raw internal cognition text and private quality scenes are not exposed', async () => {
-  const json = JSON.stringify(await diagnosticsFor('turn-1'));
-  assert.equal(json.includes('immediateFeeling'), false);
-  assert.equal(json.includes('real-history-scenes'), false);
-});
-```
+Define one exported `V3DiagnosticAuthorityConflict` (or an equivalent typed
+error carrying the exact code above). The diagnostics loader may translate only
+an explicit, test-owned allow-list of stable receipt/group/delivery/release/lane/
+comparison/fallback invariant errors into that type. It must not reuse a broad
+`/canonical.*conflict/` classifier or the bridge loader's catch-all wrapper.
+Invented prefixes, `TypeError`, SQLite/IO errors, and unexpected exceptions must
+remain untyped and reach the existing 5xx path.
 
-- [ ] **Step 2: Run diagnostics tests red**
-
-Run:
+- [ ] **Step 2: Run the diagnostics tests red**
 
 ```powershell
-node --test yuqi-runtime/test/v3-diagnostics.test.mjs tests/yuqi-ui-contract.test.mjs test-basic.mjs
+node --test yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs
 ```
 
-Expected: FAIL on missing release/lane/quality diagnostics.
+Expected: FAIL because the scoped loader, closed projector, and endpoint do not
+yet exist.
 
-- [ ] **Step 3: Implement a sanitized diagnostic projection**
+- [ ] **Step 3: Implement one store-owned scoped loader and one closed projector**
+
+The store loader is the only component allowed to join persistence rows. It
+must call the existing scoped canonical group/failure/redaction validators and
+must not reconstruct authority from JSON projections. It must not call
+`loadComparisonExecutionAuthorityInternal()`, because that API requires an
+active worker lease and exposes execution material. A new read-only scoped
+comparison loader instead joins only the turn's pinned lineage member,
+comparison job and `cognition_shadow_runs` rows. It requires unique subject,
+direction, release-pair, pipeline checksum, rollout revision, evidence/shadow/
+canary epoch and slot agreement, validates job/run checksums and closed states,
+and returns only state counts, stale count and allow-listed critical codes. A
+duplicate, foreign, mismatched or unclosed job/run is typed authority
+corruption; absence is `null`, not a fabricated successful comparison.
+
+The main loader returns only the fields the projector needs:
 
 ```js
-function projectTurnDiagnostics({
-  turn, lineage, group, receipt, delivery, lane, rollout, comparison, findings
-}) {
-  const authority = validateVisibleAuthorityJoin({
-    turn, lineage, group, receipt, delivery, lane
-  });
-  return {
-    turnId: turn.turnId,
-    kind: turn.rolloutKey,
-    state: turn.state,
-    transport: {
-      stage: normalizeTransportStage(turn),
-      localQueuedAt: turn.localQueuedAt,
-      cloudAcceptedAt: turn.cloudAcceptedAt,
-      pcAcceptedAt: turn.pcAcceptedAt
-    },
-    delivery: {
-      cloudConfirmed: Boolean(delivery?.cloudConfirmedAt),
-      nativeCompleted: Boolean(delivery?.nativeCompletedAt),
-      notificationShown: Boolean(delivery?.notificationShownAt),
-      uiApplied: Boolean(delivery?.uiAppliedAt)
-    },
-    authority: authority.valid ? {
-      lineageKey: lineage.lineageKey,
-      lineageRevision: lineage.revision,
-      turnRevision: turn.turnRevision,
-      origin: receipt.authorityOrigin,
-      commitPayloadVersion: receipt.commitPayloadVersion,
-      commitChecksum: receipt.commitChecksum,
-      chainValid: true
-    } : {
-      lineageKey: turn.authorityLineageKey,
-      chainValid: false,
-      errorCode: 'VISIBLE_AUTHORITY_INVARIANT'
-    },
-    visibleGroup: authority.valid ? {
-      id: group.groupId,
-      authoritativeTurnId: group.authoritativeTurnId,
-      redacted: Boolean(group.redactedAt)
-    } : null,
-    outbox: authority.valid && delivery ? {
-      authorityGroupId: delivery.authorityGroupId,
-      peerId: delivery.peerId,
-      state: delivery.state
-    } : authority.valid && receipt.authorityOrigin === 'android_fallback'
-      ? { authorityGroupId: group.groupId, state: 'not_applicable_external_visibility' }
-      : null,
-    lane: { key: lane.laneKey, revision: lane.revision, localSequence: lane.localSequence },
-    pipeline: {
-      authoritativeReleaseId: turn.authoritativeReleaseId,
-      comparisonReleaseId: turn.comparisonReleaseId,
-      candidatePhase: rollout.candidatePhase,
-      evidenceEpoch: rollout.evidenceEpoch
-    },
-    comparison: summarizeComparison(comparison),
-    quality: summarizeFindingCodes(findings),
-    timings: sanitizeTimings(turn)
-  };
+{
+  turn: { turnId, kind, state, protocolVersion, resultAuthorityVersion,
+    turnRevision, inputVisibilitySequence, inputClearEpoch, createdAt, updatedAt },
+  authority: { kind, lineageKey, lineageRevision, origin,
+    commitPayloadVersion, commitChecksum, chainValid, errorCode },
+  visibleGroup: null | { groupId, authoritativeTurnId, redacted },
+  outbox: null | { authorityGroupId, peerId, state, recoveryAckSeq },
+  lane: null | { key, revision, localSequence, clearEpoch, clearedThroughSequence },
+  pipeline: {
+    turnPin: { authoritativeReleaseId, comparisonReleaseId,
+      authoritativePipelineChecksum, comparisonPipelineChecksum,
+      rolloutRevision, evidenceEpoch, shadowEpoch, canaryEpoch, canarySlot },
+    currentRollout: { candidatePhase, revision, evidenceEpoch,
+      stableReleaseId, candidateReleaseId, lastReasonCode }
+  },
+  comparison: { stateCounts, staleCount, criticalCodes },
+  timings: { acceptedAt, updatedAt, committedAt }
 }
 ```
 
-`diagnosticsFor()` performs the join from `turn.authority_lineage_key → turn_authority_lineages → visible_commit_receipts → visible_result_groups`, and for origin `pc` additionally requires matching `cloud_deliveries`. Origin `android_fallback` must have no PC delivery and reports `not_applicable_external_visibility`. It never reads `turn.reply_json` to obtain group/checksum and never reports a synthetic success when any key, revision, origin, release, lane or checksum disagrees. Legacy authority-version-0 turns are labeled `legacy_turn_identity`, not failed v3 joins.
+`pipeline.turnPin` and `pipeline.currentRollout` are deliberately separate: a
+later promotion/rollback must not rewrite or misdescribe an in-flight turn's
+release pins. Comparison output contains only counts and closed finding codes;
+it exposes no evaluator IDs, summaries, private scenes, or model text.
 
-Android native diagnostics expose four stage timestamps, local authority lineage/group/checksum/origin/revisions, cursor IDs, local sequence, fallback contract, and last native error. Web displays each stage independently and never marks success merely because a notification has body text. PC exposes no prompt bodies, private scene text, secrets, or full cognitive chain.
+`acceptedAt` has no independent persisted PC fact in the current schema and is
+therefore always `null`; it must not be inferred from `createdAt`, an Android
+cursor or network time. `committedAt` is read only from the canonical receipt;
+`updatedAt` is the stored turn timestamp. Later schema work may add an accepted
+fact, but Task 24 must not fabricate one.
 
-The transport projection is separate from delivery: `LOCAL_QUEUED`, `CLOUD_ACCEPTED`, `PC_ACCEPTED`, `COMPLETED`, and `UI_APPLIED` remain distinguishable. `BRIDGE_WAITING` is a persisted execution state corresponding to `CLOUD_ACCEPTED`; it is neither runnable nor fallback-eligible.
+The pure projector accepts an exact top-level and nested key set, verifies
+native strings/integers/booleans/nulls, and returns a structured clone. The
+closed outcome matrix is:
 
-- [ ] **Step 4: Execute the fixed race matrix**
+- `legacy_turn_identity`: exposes only legacy turn identity/state/timestamps;
+  canonical group, receipt, comparison and release fields are `null`, and the
+  loader rejects any attached canonical authority rows;
+- `pc_canonical_live`: exposes the validated group/receipt, exactly one device
+  delivery, lane, release pin/current rollout and optional scoped comparison;
+- `android_fallback`: exposes the validated external authority identity and
+  `outbox.state=not_applicable_external_visibility`, requires zero PC delivery
+  rows, and never invents a PC commit/delivery timestamp;
+- `canonical_failure`: exposes only the closed failure code/retry boolean and
+  failure target state produced by the canonical failure loader, never raw
+  `error_json`;
+- `redacted`: exposes only `turnId`, terminal state, authority version and
+  `authority.kind=redacted`; group/checksum/lineage/outbox/lane/pipeline/
+  comparison/timestamps and all semantic material are `null`;
+- recognized corruption throws `V3DiagnosticAuthorityConflict`; it does not
+  return a partially filled diagnostic object. Unknown errors are thrown.
 
-`verify-yuqi-v3-races.mjs` must run and record:
+The PC endpoint exposes PC-observable transport/outbox state only. It must not
+fabricate Android timestamps. The already-shipped Android/Web diagnostic
+contract remains the source for the four native stages and continues to be
+covered by the existing `yuqi-ui-contract` tests.
+
+- [ ] **Step 4: Write a PC race runner that executes tests instead of declaring pass**
+
+`tests/yuqi-v3-races.test.mjs` must use production APIs and real temporary
+SQLite stores. Task 24 owns the following twelve PC-verifiable cases; every
+named case has at least one non-skipped assertion, including zero-write/zero-ACK
+and close/restart assertions where relevant:
 
 ```js
 const raceCases = [
   'proactive_generating_then_user_batch',
   'proactive_outbox_then_user_batch',
-  'native_completed_before_ui_open',
-  'ui_open_before_notification',
-  'event_and_poll_same_group',
-  'event_lost_poll_recovers',
-  'plugin_promise_hangs_then_replay',
-  'page_reload_before_ui_ack',
   'runtime_restart_before_visible_commit',
   'runtime_restart_after_visible_commit',
   'original_retry_and_sibling_retry_compete',
-  'populated_v10_migrates_then_restarts_v13',
+  'populated_v15_migrates_and_restarts',
   'canary_rollback_while_turn_in_flight',
   'same_fingerprint_adjacent_revisions',
   'cloud_waiting_does_not_block_next_local_turn',
-  'ambiguous_remote_timeout_never_falls_back',
-  'android_fallback_receipt_syncs_without_pc_redelivery',
-  'pc_android_receipt_conflict_is_quarantined'
+  'pc_android_receipt_conflict_is_quarantined',
+  'conversation_clear_after_outbox_snapshot',
+  'redacted_group_stale_outbox_snapshot_does_not_send'
 ];
 ```
 
-Each case asserts one visible authority group, correct state-write count, no duplicate action/notification, expected cursor/lane revision, and correct release pin. The report stores inputs/result checksums and failures.
+The remaining eleven cases are cross-runtime device obligations, not Node
+passes: `native_completed_before_ui_open`, `ui_open_before_notification`,
+`event_and_poll_same_group`, `event_lost_poll_recovers`,
+`plugin_promise_hangs_then_replay`, `page_reload_before_ui_ack`,
+`ambiguous_remote_timeout_never_falls_back`,
+`android_fallback_receipt_syncs_without_pc_redelivery`,
+`conversation_clear_while_result_in_flight`,
+`role_delete_pending_suppresses_late_lan_result`, and
+`role_delete_applied_acks_late_cloud_without_semantic_write`. Static source
+contracts, DOM mocks, or JVM mocks may remain regression tests, but they do not
+count as execution evidence for these cases. Task 24 records them as
+`pending_connected_android` with zero passed count. Task 25 must map each to an
+exact connected Android/Web integration test and execute them on a device; no
+device means release readiness is false.
 
-- [ ] **Step 5: Run diagnostics/race tests green**
+Each PC case must assert its relevant single-authority, state-write, action,
+cursor/lane, release-pin, retry/fallback, clear and ACK counts. Notification/UI
+counts belong only to the connected-device cases above.
+`populated_v15_migrates_and_restarts` replaces the obsolete v10→v13 case; no
+task may claim the current production schema is v13/v14.
 
-Run:
+`verify-yuqi-v3-races.mjs` owns a closed registry mapping every PC case ID to a
+real test file and an anchored exact test-name pattern. It spawns the test
+command, requires the named test itself to appear as passed at least once and
+requires `fail = 0`; skips caused solely by other nonmatching tests in the same
+file are ignored, while a skipped/missing named test fails the case. This rule
+prevents Node's `--test-name-pattern` from making an unmatched case look green.
+The runner rejects a missing, duplicate, or unexecuted case and writes no
+database. A second closed registry lists the eleven device obligations with
+status `pending_connected_android`; they are included in the overall checksum
+but never in `passedCases`. The report contains the
+case-registry checksum, source-file checksums, sanitized command outcome
+checksums, start/end times, pass/fail counts, and one overall checksum. It does
+not embed raw logs, private content, or claim `connectedDebugAndroidTest` ran.
+
+- [ ] **Step 5: Run diagnostics, races, and the full source gate**
 
 ```powershell
-node --test yuqi-runtime/test/v3-diagnostics.test.mjs tests/yuqi-ui-contract.test.mjs test-basic.mjs
+node --test yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-ui-contract.test.mjs
 node scripts/verify-yuqi-v3-races.mjs --out artifacts/yuqi-lived-agency-v3/race-report.json
+npm.cmd test
 ```
 
-Expected: tests PASS; all 18 race cases pass and report checksum is materialized.
+Expected: all 12 PC cases execute and pass; all 11 device obligations are
+explicitly pending; the report checksum recomputes; the endpoint uses scoped
+authority validation; Android/Web four-stage source contracts remain green.
+The Task 24 command exits zero when its PC scope is green, but its report says
+`releaseEligible=false` until Task 25 replaces every pending device obligation
+with connected-device evidence. Absence of a connected Android device is never
+hidden as a race pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Commit only the Task 24 implementation**
 
 ```powershell
-git add android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java tavern-app/index.html yuqi-runtime/src/local-server.mjs yuqi-runtime/src/main.mjs scripts/verify-yuqi-v3-races.mjs tests/yuqi-ui-contract.test.mjs test-basic.mjs yuqi-runtime/test/v3-diagnostics.test.mjs
+git add yuqi-runtime/src/store.mjs yuqi-runtime/src/v3-diagnostics.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs scripts/verify-yuqi-v3-races.mjs package.json
 git commit -m "feat: expose Yuqi v3 authority diagnostics"
 ```
 
@@ -9652,6 +9696,8 @@ git commit -m "feat: expose Yuqi v3 authority diagnostics"
 **Files:**
 - Create: `scripts/verify-yuqi-v3-readiness.mjs`
 - Create: `tests/yuqi-v3-readiness.test.mjs`
+- Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceTest.java`
+- Create: `tests/yuqi-v3-connected-race-contract.test.mjs`
 - Modify: `package.json`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/readiness-report.json`
 
@@ -9667,7 +9713,8 @@ test('readiness requires every design completion artifact for the same candidate
   assert.equal(result.ready, true);
   for (const missing of [
     'baseline', 'migration', 'protocol', 'quality', 'races',
-    'androidFallback', 'rolloutStatus', 'nodeTests', 'androidTests'
+    'androidFallback', 'rolloutStatus', 'nodeTests', 'androidTests',
+    'connectedDeviceRaces'
   ]) {
     const evidence = completeEvidenceFixture();
     delete evidence[missing];
@@ -9695,7 +9742,8 @@ Expected: FAIL on missing readiness verifier.
 export function verifyReadiness(evidence) {
   const required = [
     'baseline', 'migration', 'protocol', 'quality', 'races',
-    'androidFallback', 'rolloutStatus', 'nodeTests', 'androidTests'
+    'androidFallback', 'rolloutStatus', 'nodeTests', 'androidTests',
+    'connectedDeviceRaces'
   ];
   const failedGates = required.filter(key => !evidence[key])
     .map(key => `MISSING_${key.toUpperCase()}`);
@@ -9719,7 +9767,25 @@ Add:
 }
 ```
 
-With `--run`, the command executes `npm.cmd test` and Android `gradlew.bat testDebugUnitTest assembleDebugAndroidTest connectedDebugAndroidTest`, captures exit codes and SHA-256 hashes of sanitized logs under the evidence directory, then validates all pre-existing reports. It computes file checksums itself; it never trusts a report's self-declared checksum without recomputing it.
+With `--run`, the command executes `npm.cmd test` and Android
+`gradlew.bat testDebugUnitTest assembleDebugAndroidTest
+connectedDebugAndroidTest`, captures exit codes and SHA-256 hashes of sanitized
+logs under the evidence directory, then validates all pre-existing reports. It
+computes file checksums itself; it never trusts a report's self-declared
+checksum without recomputing it.
+
+`YuqiV3ConnectedRaceTest` owns exactly the eleven device obligations deferred
+by Task 24. Each is a real, separately named instrumentation test using Room,
+the production bridge/plugin/service path and a device WebView where the case
+crosses UI application; mocks or source-text assertions do not count. The
+readiness verifier parses the connected-test XML/results and requires every
+exact test name to be present, passed once, and not skipped. It then replaces
+the corresponding `pending_connected_android` entries from the checksummed
+Task 24 registry with device result checksums. A missing device, missing result
+file, unmatched name, skip, failure, or changed registry checksum adds
+`CONNECTED_DEVICE_RACES_INCOMPLETE`; it never silently degrades to the source
+contract. `tests/yuqi-v3-connected-race-contract.test.mjs` only freezes the
+one-to-one names/registry and must not count as runtime evidence.
 
 Readiness also enforces visible-path latency evidence from quality/history/race runs:
 
@@ -9745,12 +9811,16 @@ node scripts/verify-yuqi-v3-races.mjs --out artifacts/yuqi-lived-agency-v3/race-
 npm run cognition:v3:readiness -- --run --evidence-dir artifacts/yuqi-lived-agency-v3 --out artifacts/yuqi-lived-agency-v3/readiness-report.json
 ```
 
-Expected: every command exits 0 and readiness says `ready=true`. If quality report is not eligible, migration validation differs, a race fails, or Android fallback fails, stop before versioning or publishing.
+Expected: every command exits 0, all 12 PC race cases and all 11 connected
+device cases are proven, and readiness says `ready=true`. If no Android device
+is attached, quality is not eligible, migration validation differs, a race
+fails, or Android fallback fails, readiness must say `ready=false` and stop
+before versioning or publishing.
 
 - [ ] **Step 5: Commit the verifier after green**
 
 ```powershell
-git add scripts/verify-yuqi-v3-readiness.mjs tests/yuqi-v3-readiness.test.mjs package.json
+git add scripts/verify-yuqi-v3-readiness.mjs tests/yuqi-v3-readiness.test.mjs android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceTest.java tests/yuqi-v3-connected-race-contract.test.mjs package.json
 git commit -m "test: gate Yuqi v3 release readiness"
 ```
 
