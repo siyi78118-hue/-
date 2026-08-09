@@ -9841,27 +9841,42 @@ git commit -m "feat: expose Yuqi v3 authority diagnostics"
 
 **Interfaces:**
 - Consumes: baseline, clone migration, protocol, quality, races, rollout status, Node and Android test results.
-- Produces: `verifyReadiness(evidence) -> { ready, failedGates, checksums }`.
+- Produces: `loadReadinessManifest({ manifestPath, evidenceDirectory }) -> evidence` and
+  `verifyReadiness(evidence) -> { ready, failedGates, checksums }`.
+
+`verifyReadiness` never accepts the on-disk manifest shape directly. The only
+manifest ingestion path is `loadReadinessManifest`: it validates the closed
+manifest, resolves every declared path below the evidence directory, reads the
+ten manifest artifacts plus the connected wrapper's referenced XML, recomputes
+their raw-byte SHA-256 values, parses their closed
+schemas, and returns the loaded top-level evidence object consumed by
+`verifyReadiness`. Tests must exercise a temporary-directory disk round trip
+through this loader. An in-memory object with convenient top-level
+`baseline/migration/...` properties is not manifest evidence and cannot make a
+run ready.
 
 - [ ] **Step 1: Write a red test that refuses missing or stale evidence**
 
 ```js
-test('readiness requires every design completion artifact for the same candidate', () => {
-  const result = verifyReadiness(completeEvidenceFixture());
+test('readiness requires every real design completion artifact for the same candidate', () => {
+  const fixture = writeCompleteReadinessFixtureToTemporaryDirectory();
+  const result = verifyReadiness(loadReadinessManifest(fixture));
   assert.equal(result.ready, true);
   for (const missing of [
     'baseline', 'migration', 'protocol', 'quality', 'races',
     'androidFallback', 'rolloutStatus', 'nodeTests', 'androidTests',
     'connectedDeviceRaces'
   ]) {
-    const evidence = completeEvidenceFixture();
-    delete evidence[missing];
-    assert.equal(verifyReadiness(evidence).ready, false, missing);
+    const broken = writeCompleteReadinessFixtureToTemporaryDirectory();
+    deleteArtifactFileOrManifestEntry(broken, missing);
+    assert.throws(() => loadReadinessManifest(broken), /readiness evidence/,
+      missing);
   }
 });
 
-test('readiness rejects checksum or release identity mismatch', () => {
-  const evidence = completeEvidenceFixture();
+test('readiness rejects checksum or release identity mismatch after disk loading', () => {
+  const fixture = writeCompleteReadinessFixtureToTemporaryDirectory();
+  const evidence = loadReadinessManifest(fixture);
   evidence.quality.candidateReleaseId = 'different-release';
   assert.deepEqual(verifyReadiness(evidence).failedGates,
     ['CANDIDATE_RELEASE_MISMATCH']);
@@ -9953,7 +9968,7 @@ constructing `ExecutionRuntime`:
 | `plugin_promise_hangs_then_replay` | hold the first Web plugin Promise past its bounded timeout, reload/replay from persisted Room authority, and prove the stale Promise cannot block or duplicate the result |
 | `page_reload_before_ui_ack` | reload after DOM insertion but before UI acknowledgement; the reopened page must reconcile the exact group once and persist one acknowledgement |
 | `ambiguous_remote_timeout_never_falls_back` | hold a real loopback LAN response beyond the ambiguous timeout after the request is accepted; assert no local-model fallback, no second semantic result and later exact PC recovery |
-| `android_fallback_receipt_syncs_without_pc_redelivery` | commit through `commitAndroidFallback`, send the production receipt to the loopback PC, then poll/replay and prove PC delivery is not rendered a second time |
+| `android_fallback_receipt_syncs_without_pc_redelivery` | commit through `commitAndroidFallback`, send exactly one production receipt request to the loopback boundary, then poll/replay the same persisted group and prove Android performs no second native/UI application or receipt request; PC import/non-redelivery authority is proved separately by the checksummed Node `android-fallback-authority` suite in `nodeTests`, not inferred from the loopback stub |
 | `conversation_clear_while_result_in_flight` | hold a real accepted result, apply the production clear control before Room/UI commit, then release it; assert redacted/suppressed Room outcome, no DOM/notification and advanced clear cursor after reopen |
 | `role_delete_pending_suppresses_late_lan_result` | persist a real pending role-delete control, release a late LAN result, and assert relay handling without Room semantic write, DOM application, receipt or notification |
 | `role_delete_applied_acks_late_cloud_without_semantic_write` | apply the real role-delete tombstone, deliver a repeated cloud terminal result, and assert one relay ACK with zero turn/message/action/UI/notification resurrection after process-style reopen |
@@ -9973,6 +9988,7 @@ closed top-level shape is:
   "candidateReleaseId": "",
   "sourceHead": "",
   "createdAt": 0,
+  "deviceSerial": "",
   "artifacts": {
     "baseline": {"path": "", "sha256": ""},
     "migration": {"path": "", "sha256": ""},
@@ -9994,7 +10010,9 @@ closed top-level shape is:
 }
 ```
 
-All keys are required and closed. Paths are resolved under the selected
+All keys are required and closed. `deviceSerial` is the exact authorized,
+online device selected for this run and must equal the serial recorded inside
+the connected-device report. Paths are resolved under the selected
 evidence directory and may not escape it. The verifier reads every file and
 recomputes raw-byte SHA-256; a syntactically valid self-declared checksum is
 not evidence. Candidate-bound reports (`quality`, `androidFallback`,
@@ -10008,10 +10026,22 @@ and no generated test result may predate the current `--run` start.
 
 With `--run`, create a unique run directory below the evidence directory and
 write sanitized `node-test-report.json`, `android-test-report.json`, the copied
-connected XML and their hashes there. Invoke commands from the repository root
+connected XML, `connected-device-race-report.json` and their hashes there. The
+connected report is the `connectedDeviceRaces` artifact; it has a closed shape
+containing the exact `deviceSerial`, test classname, run start/end timestamps,
+relative XML path, raw XML SHA-256, and the eleven parsed one-pass/no-skip
+results. `android-test-report.json.deviceSerial`, the connected report's
+`deviceSerial`, and manifest `deviceSerial` must be identical. The raw XML has
+no invented serial field and is accepted only through that wrapper after its
+bytes and mtime are verified. Invoke commands from the repository root
 using absolute `npm.cmd` and `android/gradlew.bat` paths. Before Gradle, parse
-`adb devices -l`: zero or multiple unauthorized/offline targets fails closed;
-the selected serial is recorded. Remove or ignore all prior connected result
+`adb devices -l`: unless `ANDROID_SERIAL` explicitly selects one authorized,
+online device, there must be exactly one authorized, online device and no
+ambiguous second candidate. Zero devices, a selected unauthorized/offline
+device, an unknown `ANDROID_SERIAL`, or multiple eligible devices without an
+explicit selection fails closed. The exact selected serial is passed to adb and
+Gradle and recorded in both `readiness-input.json` and the connected-device
+report. Remove or ignore all prior connected result
 files, pass the exact instrumentation class filter, and accept only XML whose
 mtime is at or after the current run start, whose classname is exactly
 `com.siyi.al.execution.YuqiV3ConnectedRaceTest`, and whose eleven exact method
@@ -10023,11 +10053,50 @@ on-device; `--run` must not assume an undeclared service on
 The `--run` command materializes `readiness-input.json` itself from the fixed
 pre-existing artifact names `baseline.json`, `migration-report.json`,
 `protocol-report.json`, `quality-report.json`, `race-report.json`,
-`android-fallback-report.json`, and `rollout-status.json`, plus the three files
-from its unique run directory. It fails closed when any fixed input is absent;
+`android-fallback-report.json`, and `rollout-status.json`, plus the three
+manifest artifacts `node-test-report.json`, `android-test-report.json`, and
+`connected-device-race-report.json` from its unique run directory (the copied
+XML is evidence referenced and checksummed by the last artifact). It fails
+closed when any fixed input is absent;
 it never manufactures a passed prior-task report. A no-`--run` verification
 reads an explicitly supplied manifest and is used by Node tests with temporary
 real files.
+
+`node-test-report.json` contains both the full `npm.cmd test` result and a
+separately executed fixed sentinel suite entry for
+`yuqi-runtime/test/android-fallback-authority.test.mjs`. That entry records the
+exact normalized command/path, exit code, native safe passed/failed/skipped
+counts and sanitized output checksum. The verifier requires exit code zero,
+passed greater than zero, failed/skipped zero, and the exact sentinel path;
+neither a generic full-suite success nor a caller-supplied boolean proves the
+PC import/non-redelivery half of
+`android_fallback_receipt_syncs_without_pc_redelivery`.
+
+`readiness-report.json` has the following closed output shape:
+
+```json
+{
+  "schemaVersion": "yuqi-v3-readiness-report-v1",
+  "ready": false,
+  "failedGates": [],
+  "candidateReleaseId": "",
+  "sourceHead": "",
+  "inputSha256": "",
+  "artifactChecksums": {},
+  "deviceSerial": "",
+  "startedAt": 0,
+  "completedAt": 0,
+  "reportChecksum": ""
+}
+```
+
+`artifactChecksums` has exactly the ten manifest artifact keys and their
+recomputed lowercase SHA-256 values. `inputSha256` is the raw-byte checksum of
+the exact `readiness-input.json` consumed. `reportChecksum` is SHA-256 of the
+canonical JSON object containing every preceding field and excluding only
+`reportChecksum` itself. All keys and native types are closed; timestamps are
+safe integers with `startedAt <= completedAt`, candidate/source/device equal
+the input, and `ready` is true exactly when `failedGates` is the empty array.
 
 Readiness also enforces visible-path latency evidence from quality/history/race runs:
 
@@ -10085,6 +10154,18 @@ git commit -m "test: gate Yuqi v3 release readiness"
 **Interfaces:**
 - Consumes: Task 25 readiness, local source/artifacts, remote formal release tags/update channel through authenticated GitHub REST.
 - Produces: one resolved version, source-consistent release commit, signed APK, canonical OTA manifest, verification evidence.
+
+Task 26's first operation, before reading or changing any version source, is to
+load the fixed path `artifacts/yuqi-lived-agency-v3/readiness-report.json` and
+fail closed unless its schema is exactly the Task 25 readiness-report version,
+`ready === true`, `failedGates` is the empty array, its candidate release and
+source HEAD equal the current release candidate/HEAD, its report checksum
+recomputes, and every artifact checksum equals the current Task 25 manifest and
+file bytes. A missing, stale, malformed, false, differently bound or
+checksum-mismatched report stops Task 26 before remote lookup, version
+resolution, source edits, git writes, workflow dispatch or publication. The
+resolver test must spy on those effects and prove they remain zero for each
+rejection.
 
 - [ ] **Step 1: Write a red resolver test using occupied-version fixtures**
 
