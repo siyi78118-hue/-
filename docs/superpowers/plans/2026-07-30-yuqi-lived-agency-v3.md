@@ -8918,29 +8918,52 @@ The other 23 seeds must be authored from their named source headings with origin
 
 Across the 72 coverage scenes, the compiler enforces these minimums: `DIRECT_REPLY ≥ 18`, `PROACTIVE_CHAT ≥ 6`, `PROACTIVE_MOMENT ≥ 6`, `MOMENT_INTERACTION ≥ 6`, `MOMENT_REPLY ≥ 6`, each of the four role-plan TurnKinds `≥ 4`, and `LIFE_PLANNING ≥ 4`. One scene may cover only one primary rollout key; counts cannot be inflated by aliases.
 
-- [ ] **Step 5: Extract 30 local real-history scenes without committing private content**
+- [ ] **Step 5: Extract verified candidates, then label 30 local real-history scenes without committing private content**
 
-The extractor takes an explicit absolute `--database` path to a frozen v10
-validation snapshot. It must use SQLite read-only mode directly: it may not
-load `yuqi-runtime/config.json`, construct `YuqiStore`, migrate the source,
+The extractor takes an explicit absolute `--database` path to a frozen PC v15
+authority snapshot. Raw v0/v10/v13/v14 (or any version below v15) input fails
+closed before output and is never migrated; the extractor must not invent
+authority for legacy turns. It must use SQLite read-only mode directly: it may
+not load `yuqi-runtime/config.json`, construct `YuqiStore`, migrate the source,
 change journal mode, or create production release/shadow rows. Before and after
-the read it verifies the database plus non-empty WAL/rollback-journal content;
-process-local SHM lock bytes are excluded from source identity.
+the read it verifies the main database plus non-empty WAL/rollback-journal
+content; process-local SHM lock bytes are excluded from source identity.
 
 Only closed, canonical `DIRECT_REPLY` authority lineages are eligible. The
-extractor validates the root attempt, retry chain/cycle closure, latest member,
-role/device/source ownership, message projection and checksum, then emits
-exactly 30 scenes containing all nine required structures. Output is a closed
-Task 22 scene projection: unknown fields, speakers, structures, nested state,
-attachments, actions, or severity values fail the whole extraction instead of
-being copied or guessed. Identifiers are replaced while user-visible semantic
-text is preserved locally.
+read-only validator covers the complete v13/v14/v15 closure: lineage/root/retry
+and revision, canonical turn/envelope and message identity/checksums,
+current-user batch/items, visible group/items/actions, manifest/receipt,
+release pins, interaction lane/cursor, redaction state, and v15 clear-control
+schema. It validates the root attempt, retry chain/cycle closure, latest member,
+role/device/source ownership and all persisted checksums. It aggregates windows
+of 2–6 complete persisted exchanges (4–12 ordered turns) from persisted user batches/messages and committed
+visible result items/actions on the same role and lane; it never reads
+`reply_json`, annotation snapshots, or guesses structure from keywords.
+
+The first stage emits only private candidate JSONL. Every candidate is a closed
+`{windowId,sourceWindowChecksum,role,lane,timeBounds,turns,persistedContextProjection}`
+projection; identifiers are deterministically replaced while user-visible
+semantic text is preserved locally. A second, independent `--labels <absolute
+private JSONL>` sidecar is the sole source of `initialState`, Task 22 evaluation
+annotations, nine-category structure, and severity. Labels must bind the exact
+candidate window/checksum and annotator version, and may not contain or replace
+turns/actions. Without labels no final scenes are generated. With labels, the
+extractor requires exactly 30 unique windows and complete coverage of all nine
+structures, then writes the closed final scenes. Missing/stale/duplicate/unknown
+labels fail closed. A migration clone is validation-only and cannot invent
+legacy authority or serve as a 30-scene source.
+
+Output is a closed Task 22 scene projection: unknown fields, speakers,
+structures, nested state, attachments, actions, or severity values fail the
+whole extraction instead of being copied or guessed.
 
 Publish `real-history-scenes.jsonl` together with
 `real-history-scenes.manifest.json` under
 `artifacts/yuqi-lived-agency-v3/private/`. The manifest binds the ordered scene
 IDs and SHA-256 generation checksum. Both files are staged and verified before
-publication; readers reject a missing or mismatched pair. The private directory
+publication, with backup rollback on a publication error; readers reject a
+missing or mismatched pair (the two-file rename is not claimed crash-proof).
+The private directory
 remains ignored and no raw private content is committed or copied into public
 reports.
 
@@ -8950,13 +8973,14 @@ Run:
 
 ```powershell
 node scripts/compile-yuqi-lived-quality-scenes.mjs --check
-node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v10-validation-snapshot> --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
+node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v15-authority-snapshot> --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
+node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v15-authority-snapshot> --labels <absolute-private-history-labels.jsonl> --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
 node --test tests/yuqi-lived-quality-contract.test.mjs tests/yuqi-real-history-extractor.test.mjs yuqi-runtime/test/replay-runner.test.mjs
 npm run cognition:replay
 npm run cognition:replay-report
 ```
 
-Expected: 270 protocol cases PASS; 24 sentinel and 72 coverage scenes validate; exactly 30 local history scenes exist; live shadow counts remain unchanged before/after these commands.
+Expected: 270 protocol cases PASS; 24 sentinel and 72 coverage scenes validate; the first extraction emits only private candidates, and exactly 30 final local-history scenes exist only when the independent labels sidecar passes; live shadow counts remain unchanged before/after these commands.
 
 - [ ] **Step 7: Commit public suite and tooling only**
 

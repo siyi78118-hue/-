@@ -21,6 +21,15 @@ test('real-history extractor is explicitly readonly and never opens production c
   assert.doesNotMatch(source, /journal_mode\s*=\s*WAL/i);
 });
 
+test('real-history extraction is candidate-first and labels cannot supply persisted dialogue', () => {
+  const source = readFileSync(resolve(rootDir, 'scripts/extract-yuqi-real-history-scenes.mjs'), 'utf8');
+  assert.match(source, /--labels/);
+  assert.match(source, /candidatesPath/);
+  assert.match(source, /persistedContextProjection/);
+  assert.doesNotMatch(source, /historyScene/);
+  assert.doesNotMatch(source, /annotation_snapshot/);
+});
+
 test('quality CLI package scripts are declared without production release registration', () => {
   const packageJson = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
   assert.equal(packageJson.scripts['cognition:quality:check'], 'node scripts/compile-yuqi-lived-quality-scenes.mjs --check');
