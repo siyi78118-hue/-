@@ -9475,6 +9475,7 @@ landing path merely to recreate it.
 - Create: `yuqi-runtime/test/v3-diagnostics.test.mjs`
 - Modify: `yuqi-runtime/test/local-server.test.mjs`
 - Create: `tests/yuqi-v3-races.test.mjs`
+- Create: `tests/yuqi-v3-race-runner.test.mjs`
 - Create: `scripts/verify-yuqi-v3-races.mjs`
 - Modify: `package.json`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/race-report.json`
@@ -9556,7 +9557,7 @@ The main loader returns only the fields the projector needs:
   turn: { turnId, kind, state, protocolVersion, resultAuthorityVersion,
     turnRevision, inputVisibilitySequence, inputClearEpoch, createdAt, updatedAt },
   authority: { kind, lineageKey, lineageRevision, origin,
-    commitPayloadVersion, commitChecksum, chainValid, errorCode },
+    commitPayloadVersion, commitChecksum, chainValid, errorCode, retryAllowed },
   visibleGroup: null | { groupId, authoritativeTurnId, redacted },
   outbox: null | { authorityGroupId, peerId, state, recoveryAckSeq },
   lane: null | { key, revision, localSequence, clearEpoch, clearedThroughSequence },
@@ -9668,10 +9669,17 @@ case-registry checksum, source-file checksums, sanitized command outcome
 checksums, start/end times, pass/fail counts, and one overall checksum. It does
 not embed raw logs, private content, or claim `connectedDebugAndroidTest` ran.
 
+`tests/yuqi-v3-race-runner.test.mjs` is a separate meta-gate and is never one
+of the twelve race cases. It proves that the runner rejects zero tests, a
+missing or duplicate named pass, an extra test, a skip, failure, cancellation,
+non-zero exit, or a result whose name is not the registry's anchored exact
+pattern. It also freezes raw-byte source SHA-256 behavior. The exact twelve-case
+fixture passes once; meta-tests must not make a fake thirteenth race pass.
+
 - [ ] **Step 5: Run diagnostics, races, and the full source gate**
 
 ```powershell
-node --test yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-ui-contract.test.mjs
+node --test yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-v3-race-runner.test.mjs tests/yuqi-ui-contract.test.mjs
 node scripts/verify-yuqi-v3-races.mjs --out artifacts/yuqi-lived-agency-v3/race-report.json
 npm.cmd test
 ```
@@ -9687,7 +9695,7 @@ hidden as a race pass.
 - [ ] **Step 6: Commit only the Task 24 implementation**
 
 ```powershell
-git add yuqi-runtime/src/store.mjs yuqi-runtime/src/v3-diagnostics.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs scripts/verify-yuqi-v3-races.mjs package.json
+git add yuqi-runtime/src/store.mjs yuqi-runtime/src/v3-diagnostics.mjs yuqi-runtime/src/local-server.mjs yuqi-runtime/test/v3-diagnostics.test.mjs yuqi-runtime/test/local-server.test.mjs tests/yuqi-v3-races.test.mjs tests/yuqi-v3-race-runner.test.mjs scripts/verify-yuqi-v3-races.mjs package.json
 git commit -m "feat: expose Yuqi v3 authority diagnostics"
 ```
 
