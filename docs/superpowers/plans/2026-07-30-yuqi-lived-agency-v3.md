@@ -9832,8 +9832,11 @@ git commit -m "feat: expose Yuqi v3 authority diagnostics"
 - Create: `scripts/verify-yuqi-v3-readiness.mjs`
 - Create: `tests/yuqi-v3-readiness.test.mjs`
 - Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceTest.java`
+- Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceFixture.java`
+- Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3WebViewHarness.java`
 - Create: `tests/yuqi-v3-connected-race-contract.test.mjs`
 - Modify: `package.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/readiness-input.json`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/readiness-report.json`
 
 **Interfaces:**
@@ -9922,6 +9925,110 @@ file, unmatched name, skip, failure, or changed registry checksum adds
 contract. `tests/yuqi-v3-connected-race-contract.test.mjs` only freezes the
 one-to-one names/registry and must not count as runtime evidence.
 
+The two additional `androidTest` files are test-only adapters, not alternate
+production implementations. `YuqiV3ConnectedRaceFixture` may clear the debug
+application's singleton Room database between cases, save a real `BridgeConfig`
+through `AlSecretStore`, start a loopback `ServerSocket` that represents only
+the remote PC/relay boundary, seed inputs through public `RoomExecutionStore`
+APIs, invoke `ExecutionRuntime`/`AlExecutionService`, and inspect persisted
+Room rows plus `NotificationManager`. It must not update Room tables by raw SQL,
+replace a production state transition, call a private commit writer through
+reflection, or declare a case passed from source text. `YuqiV3WebViewHarness`
+launches the real `MainActivity` with `ActivityScenario`, obtains Capacitor's
+real WebView, evaluates the shipped `tavern-app` JavaScript on the UI thread,
+waits on explicit DOM/plugin state with a bounded timeout, and reloads that
+same WebView. It may suppress an event or hold a JavaScript Promise only to
+create the named race; polling, replay, deduplication and UI application must
+still be performed by production code.
+
+Each of the eleven methods must prove its own fixed outcome rather than merely
+constructing `ExecutionRuntime`:
+
+| Connected method | Minimum real evidence |
+|---|---|
+| `native_completed_before_ui_open` | commit one canonical visible result in Room before launching `MainActivity`; launch the real WebView, observe exactly one DOM result and one UI cursor advance, then reopen Room and prove the same receipt |
+| `ui_open_before_notification` | launch the real WebView first, commit through the production service path, observe one completion event/UI apply and at most one posted notification identity |
+| `event_and_poll_same_group` | deliver the same persisted group once through the native event and once through the polling API; assert one DOM application, one UI receipt and no duplicate action |
+| `event_lost_poll_recovers` | suppress only the event emission, leave the persisted completion intact, and prove production polling applies it once |
+| `plugin_promise_hangs_then_replay` | hold the first Web plugin Promise past its bounded timeout, reload/replay from persisted Room authority, and prove the stale Promise cannot block or duplicate the result |
+| `page_reload_before_ui_ack` | reload after DOM insertion but before UI acknowledgement; the reopened page must reconcile the exact group once and persist one acknowledgement |
+| `ambiguous_remote_timeout_never_falls_back` | hold a real loopback LAN response beyond the ambiguous timeout after the request is accepted; assert no local-model fallback, no second semantic result and later exact PC recovery |
+| `android_fallback_receipt_syncs_without_pc_redelivery` | commit through `commitAndroidFallback`, send the production receipt to the loopback PC, then poll/replay and prove PC delivery is not rendered a second time |
+| `conversation_clear_while_result_in_flight` | hold a real accepted result, apply the production clear control before Room/UI commit, then release it; assert redacted/suppressed Room outcome, no DOM/notification and advanced clear cursor after reopen |
+| `role_delete_pending_suppresses_late_lan_result` | persist a real pending role-delete control, release a late LAN result, and assert relay handling without Room semantic write, DOM application, receipt or notification |
+| `role_delete_applied_acks_late_cloud_without_semantic_write` | apply the real role-delete tombstone, deliver a repeated cloud terminal result, and assert one relay ACK with zero turn/message/action/UI/notification resurrection after process-style reopen |
+
+Every case starts from cleared debug-app Room/preferences/notifications and
+ends by closing its loopback server/activity. Bounded waits fail rather than
+skip. The connected class contains exactly these eleven public `@Test` methods;
+helper methods live in the two fixture classes so the XML name/class mapping is
+unambiguous.
+
+`readiness-input.json` is the sole manifest accepted by the verifier. Its
+closed top-level shape is:
+
+```json
+{
+  "schemaVersion": "yuqi-v3-readiness-input-v1",
+  "candidateReleaseId": "",
+  "sourceHead": "",
+  "createdAt": 0,
+  "artifacts": {
+    "baseline": {"path": "", "sha256": ""},
+    "migration": {"path": "", "sha256": ""},
+    "protocol": {"path": "", "sha256": ""},
+    "quality": {"path": "", "sha256": ""},
+    "races": {"path": "", "sha256": ""},
+    "androidFallback": {"path": "", "sha256": ""},
+    "rolloutStatus": {"path": "", "sha256": ""},
+    "nodeTests": {"path": "", "sha256": ""},
+    "androidTests": {"path": "", "sha256": ""},
+    "connectedDeviceRaces": {"path": "", "sha256": ""}
+  },
+  "metrics": {
+    "directReplyMedianMs": 0,
+    "directReplyP95Ms": 0,
+    "maximumVisibleMs": 0,
+    "shadowBlockedVisibleCount": 0
+  }
+}
+```
+
+All keys are required and closed. Paths are resolved under the selected
+evidence directory and may not escape it. The verifier reads every file and
+recomputes raw-byte SHA-256; a syntactically valid self-declared checksum is
+not evidence. Candidate-bound reports (`quality`, `androidFallback`,
+`rolloutStatus`, `nodeTests`, `androidTests`, `connectedDeviceRaces`) must carry
+the manifest's exact candidate release ID. The immutable baseline and migration
+reports are instead bound by their recorded source/report checksum. Protocol,
+quality, race and rollout schemas are validated for their required eligible or
+passed outcomes; a present failed report is not a green gate. `createdAt` and
+all artifact/result timestamps are native safe integers, not in the future,
+and no generated test result may predate the current `--run` start.
+
+With `--run`, create a unique run directory below the evidence directory and
+write sanitized `node-test-report.json`, `android-test-report.json`, the copied
+connected XML and their hashes there. Invoke commands from the repository root
+using absolute `npm.cmd` and `android/gradlew.bat` paths. Before Gradle, parse
+`adb devices -l`: zero or multiple unauthorized/offline targets fails closed;
+the selected serial is recorded. Remove or ignore all prior connected result
+files, pass the exact instrumentation class filter, and accept only XML whose
+mtime is at or after the current run start, whose classname is exactly
+`com.siyi.al.execution.YuqiV3ConnectedRaceTest`, and whose eleven exact method
+names each occur once with no failure, error or skipped child. Old XML cannot
+make a new run ready. When a loopback PC endpoint is required, the test owns it
+on-device; `--run` must not assume an undeclared service on
+`127.0.0.1:17892`.
+
+The `--run` command materializes `readiness-input.json` itself from the fixed
+pre-existing artifact names `baseline.json`, `migration-report.json`,
+`protocol-report.json`, `quality-report.json`, `race-report.json`,
+`android-fallback-report.json`, and `rollout-status.json`, plus the three files
+from its unique run directory. It fails closed when any fixed input is absent;
+it never manufactures a passed prior-task report. A no-`--run` verification
+reads an explicitly supplied manifest and is used by Node tests with temporary
+real files.
+
 Readiness also enforces visible-path latency evidence from quality/history/race runs:
 
 ```js
@@ -9955,7 +10062,7 @@ before versioning or publishing.
 - [ ] **Step 5: Commit the verifier after green**
 
 ```powershell
-git add scripts/verify-yuqi-v3-readiness.mjs tests/yuqi-v3-readiness.test.mjs android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceTest.java tests/yuqi-v3-connected-race-contract.test.mjs package.json
+git add scripts/verify-yuqi-v3-readiness.mjs tests/yuqi-v3-readiness.test.mjs android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceTest.java android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceFixture.java android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3WebViewHarness.java tests/yuqi-v3-connected-race-contract.test.mjs package.json
 git commit -m "test: gate Yuqi v3 release readiness"
 ```
 
