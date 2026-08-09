@@ -6,6 +6,7 @@ import { decryptRelayPayload } from '../src/cloud-relay-pump.mjs';
 import { createYuqiServer, signBridgeRequest } from '../src/local-server.mjs';
 import { contentHash, deriveYuqiBackupReceiptId, validateEnvelope } from '../src/protocol.mjs';
 import { ResultOutbox } from '../src/result-outbox.mjs';
+import { V3DiagnosticAuthorityConflict } from '../src/v3-diagnostics.mjs';
 
 const keyBase64 = Buffer.alloc(32, 9).toString('base64');
 
@@ -286,6 +287,95 @@ test('serves health and accepts one signed turn without exposing unsigned APIs',
     assert.equal(processed.length, 1);
   } finally {
     await server.close();
+  }
+});
+
+test('authenticated v3 diagnostics reads the store-owned sanitized projection', async () => {
+  const turnId = 'turn_diagnostic_http/1';
+  const projection = {
+    turn: {
+      turnId,
+      kind: 'legacy_turn_identity',
+      state: 'completed',
+      protocolVersion: 1,
+      resultAuthorityVersion: 0,
+      turnRevision: 1,
+      inputVisibilitySequence: 0,
+      inputClearEpoch: 0,
+      createdAt: 1784400000000,
+      updatedAt: 1784400000100
+    },
+    authority: {
+      kind: 'legacy_turn_identity',
+      lineageKey: null,
+      lineageRevision: null,
+      origin: 'legacy',
+      commitPayloadVersion: null,
+      commitChecksum: null,
+      chainValid: true,
+      errorCode: null,
+      retryAllowed: null
+    },
+    visibleGroup: null,
+    outbox: null,
+    lane: null,
+    pipeline: { turnPin: null, currentRollout: null },
+    comparison: null,
+    timings: { acceptedAt: null, updatedAt: 1784400000100, committedAt: null }
+  };
+  let reads = 0;
+  const store = {
+    loadTurnDiagnosticsAuthorityInternal(id) {
+      reads += 1;
+      return id === turnId ? projection : null;
+    },
+    getSyncDelta: () => [],
+    ackSync: (_peer, seq) => seq
+  };
+  const server = createYuqiServer({
+    secret: 'test-pairing-secret',
+    store,
+    orchestrator: { process: async () => ({}) }
+  });
+  await server.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const response = await call(server.address().port, {
+      method: 'GET',
+      path: `/v3/diagnostics/turns/${encodeURIComponent(turnId)}`,
+      secret: 'test-pairing-secret',
+      nonce: 'diagnostic-http-1'
+    });
+    assert.equal(response.status, 200);
+    assert.equal(response.body.authority.kind, 'legacy_turn_identity');
+    assert.equal(reads, 1);
+  } finally {
+    await server.close();
+  }
+});
+
+test('v3 diagnostics keeps typed conflicts at 409 and unknown errors at 500', async () => {
+  const makeServer = error => createYuqiServer({
+    secret: 'test-pairing-secret',
+    store: { loadTurnDiagnosticsAuthorityInternal: () => { throw error; }, getSyncDelta: () => [], ackSync: (_peer, seq) => seq },
+    orchestrator: { process: async () => ({}) }
+  });
+  const requestDiagnostic = async (server, nonce) => call(server.address().port, {
+    method: 'GET', path: '/v3/diagnostics/turns/unknown', secret: 'test-pairing-secret', nonce
+  });
+  const typed = makeServer(new V3DiagnosticAuthorityConflict('canonical visible group authority conflict'));
+  const unknown = makeServer(new Error('canonical made_up conflict'));
+  await typed.listen({ host: '127.0.0.1', port: 0 });
+  await unknown.listen({ host: '127.0.0.1', port: 0 });
+  try {
+    const typedResponse = await requestDiagnostic(typed, 'diagnostic-typed-conflict');
+    const unknownResponse = await requestDiagnostic(unknown, 'diagnostic-unknown-error');
+    assert.equal(typedResponse.status, 409);
+    assert.deepEqual(typedResponse.body, { ok: false, error: 'V3_DIAGNOSTIC_AUTHORITY_CONFLICT' });
+    assert.equal(unknownResponse.status, 500);
+    assert.notDeepEqual(unknownResponse.body, { ok: false, error: 'V3_DIAGNOSTIC_AUTHORITY_CONFLICT' });
+  } finally {
+    await typed.close();
+    await unknown.close();
   }
 });
 

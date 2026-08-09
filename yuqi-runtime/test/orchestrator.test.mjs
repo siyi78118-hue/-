@@ -15,7 +15,9 @@ import {
 import { materializeBrainDraft } from '../src/cognition-contract.mjs';
 import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import { PresetRegistry } from '../src/preset-registry.mjs';
-import { YuqiStore } from '../src/store.mjs';
+import { deriveAuthorityLineageKey, YuqiStore } from '../src/store.mjs';
+import { resolvePipelinePair } from '../src/release-pair.mjs';
+import { contentHash } from '../src/protocol.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const presetDir = join(here, '..', 'presets');
@@ -2544,3 +2546,138 @@ test('a legacy direct turn ignores an available cognition pipeline', async () =>
     assert.equal(calls, 0);
   });
 });
+
+for (const [mode, jobType] of [
+  ['cognition_compare', 'shadow_cognition'],
+  ['legacy_compare', 'active_canary_compare']
+]) {
+  test(`comparison ${mode} draft uses only commit-owned production identity fields`, () => {
+    const orchestrator = Object.create(YuqiOrchestrator.prototype);
+    const turn = {
+      turnId: `turn_${mode}`,
+      authorityLineageKey: `lineage_${mode}`,
+      comparisonMode: mode,
+      authoritativeReleaseId: 'release_authoritative',
+      comparisonReleaseId: 'release_comparison',
+      authoritativePipelineChecksum: 'a'.repeat(64),
+      comparisonPipelineChecksum: 'b'.repeat(64),
+      rolloutRevision: 3,
+      rolloutEvidenceEpoch: 4,
+      shadowEpoch: 5,
+      canaryEpoch: mode === 'legacy_compare' ? 6 : null,
+      canarySlot: mode === 'legacy_compare' ? 2 : null,
+      annotationSnapshot: { authority: 'closed' }
+    };
+    const draft = orchestrator.comparisonJobDraftFromCanonicalTurn(turn, {
+      protocolVersion: 3,
+      turnId: turn.turnId,
+      message: { messageId: 'msg_input', content: 'input' }
+    });
+    assert.equal(draft.jobType, jobType);
+    assert.deepEqual(Object.keys(draft.payload).sort(), [
+      'annotationSnapshotChecksum', 'canaryEpoch', 'canarySlot',
+      'comparisonDirection', 'comparisonReleaseId', 'inputChecksum',
+      'rolloutEvidenceEpoch', 'shadowEpoch', 'turnId'
+    ]);
+    assert.equal(draft.payload.turnId, turn.turnId);
+    assert.equal(Object.hasOwn(draft.payload, 'subjectType'), false);
+    assert.equal(Object.hasOwn(draft.payload, 'subjectId'), false);
+    assert.equal(Object.hasOwn(draft.payload, 'authoritativeReleaseId'), false);
+  });
+}
+
+for (const [phase, expectedMode, expectedJobType] of [
+  ['shadow', 'cognition_compare', 'shadow_cognition'],
+  ['canary', 'legacy_compare', 'active_canary_compare']
+]) {
+  test(`real ${phase} comparison writer commits one production job for diagnostics`, async () => {
+    const root = mkdtempSync(join(tmpdir(), `yuqi-comparison-${phase}-`));
+    const store = new YuqiStore(join(root, 'runtime.sqlite'));
+    try {
+      store.initializeCognitionRolloutsInternal({ rows: [{
+        rolloutKey: 'DIRECT_REPLY', currentMode: 'legacy', rolloutPhase: 'stable',
+        presetVersion: '1.9.2', pipelineChecksum: 'a'.repeat(64)
+      }], now: 1 });
+      const stable = store.getCognitionRollout('DIRECT_REPLY');
+      const candidate = store.listPipelineReleases().find(release => release.releaseId !== stable.stableReleaseId);
+      assert.ok(candidate);
+      store.db.prepare(`UPDATE cognition_kind_rollouts
+        SET current_mode = ?, rollout_phase = ?, candidate_release_id = ?, candidate_phase = ?,
+            pipeline_checksum = ?, revision = revision + 1, shadow_epoch = ?, canary_epoch = ?,
+            canary_started_count = 0, canary_completed_count = 0, canary_failure_count = 0,
+            canary_started_at = NULL, canary_observe_until = 0
+        WHERE rollout_key = 'DIRECT_REPLY'`).run(
+        phase === 'shadow' ? 'shadow' : 'active', phase === 'shadow' ? 'collecting' : 'canary', candidate.releaseId, phase,
+        phase === 'shadow' ? stable.pipelineChecksum : candidate.releaseChecksum,
+        phase === 'shadow' ? 1 : 0, phase === 'canary' ? 1 : 0
+      );
+      store.claimInteractionLaneInternal({ roleId: 'yuqi', laneKey: 'private_chat', expectedRevision: 0,
+        localSequence: 0, now: 1000 });
+      const message = {
+        messageId: `msg_compare_${phase}`, speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+        content: 'comparison input', sentAt: 1000
+      };
+      const envelopeValue = {
+        protocolVersion: 3, turnId: `turn_compare_${phase}`, characterId: 'yuqi', deviceId: 'device_compare',
+        deviceSeq: 1, createdAt: 1000, kind: 'DIRECT_REPLY', message,
+        context: { currentBatch: { batchId: `batch_compare_${phase}`, messageIds: [message.messageId],
+          startedAt: 1000, committedAt: 1000, messages: [message] }, visibilityCursor: {
+            nativeCompletedTurnId: null, nativeCompletedGroupId: null, nativeCompletedSequence: 0,
+            uiAppliedTurnId: null, uiAppliedGroupId: null, uiAppliedSequence: 0, localSequence: 1,
+            clearedThroughSequence: 0, clearEpoch: 0, clearedAt: 0, chatOpen: true, quotedMessageId: null
+          } },
+        authority: { algorithm: 'al-authority-v1', roleId: 'yuqi', laneKey: 'private_chat',
+          rootSourceId: message.messageId,
+          lineageKey: deriveAuthorityLineageKey({ roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: message.messageId }),
+          claimedLineageRevision: 1, retryOfTurnId: null }
+      };
+      const rollout = store.getCognitionRollout('DIRECT_REPLY');
+      const pair = resolvePipelinePair(rollout);
+      const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1000 });
+      const turn = store.createCanonicalVisibleTurnInternal({
+        envelope: envelopeValue, rolloutKey: 'DIRECT_REPLY', expectedRolloutRevision: rollout.revision,
+        authoritativeReleaseId: pair.visibleReleaseId, comparisonReleaseId: pair.comparisonReleaseId,
+        comparisonDirection: pair.comparisonDirection, laneKey: 'private_chat', expectedLaneRevision: 1,
+        inputUserBatchId: envelopeValue.context.currentBatch.batchId, inputVisibilitySequence: 1,
+        agencySnapshotChecksum: agency.checksum, annotationSnapshot: {}
+      }).turn;
+      const orchestrator = new YuqiOrchestrator({
+        store, presets: { current: () => ({ version: '2.0.0' }), compileFor: () => ({}) }, codex: {},
+        releaseExecutor: { executeTurn: async () => ({ draft: {
+          action: 'send', reply: 'comparison reply', bubblePlan: [{ text: 'comparison reply', purpose: 'reply' }],
+          usedFactIds: [], actionIntent: {}
+        } }), executeLife: async () => { throw new Error('unused'); } },
+        clock: () => 1001, lifePlanningEnabled: false
+      });
+      await orchestrator.run(turn.turnId);
+      const committed = store.getTurn(turn.turnId);
+      const receipt = store.getVisibleCommitReceipt(committed.authorityLineageKey);
+      const jobs = store.comparisonJobsForGroup(receipt.visibleGroupId);
+      assert.equal(committed.comparisonMode, expectedMode);
+      assert.equal(jobs.length, 1);
+      assert.equal(jobs[0].jobType, expectedJobType);
+      assert.equal(jobs[0].subjectId, committed.authorityLineageKey);
+      const comparison = store.loadTurnComparisonDiagnosticsInternal({
+        turnId: committed.turnId, lineageKey: committed.authorityLineageKey,
+        rolloutKey: committed.rolloutKey, groupId: receipt.visibleGroupId,
+        turnPin: {
+          authoritativeReleaseId: committed.authoritativeReleaseId,
+          comparisonReleaseId: committed.comparisonReleaseId,
+          rolloutRevision: committed.rolloutRevision,
+          evidenceEpoch: committed.rolloutEvidenceEpoch,
+          shadowEpoch: committed.shadowEpoch ?? 0,
+          canaryEpoch: committed.canaryEpoch ?? 0,
+          canarySlot: committed.canarySlot,
+          authoritativePipelineChecksum: committed.authoritativePipelineChecksum,
+          comparisonPipelineChecksum: committed.comparisonPipelineChecksum
+        }
+      });
+      assert.deepEqual(comparison.stateCounts, {});
+      assert.equal(comparison.criticalCodes.length, 0);
+      assert.equal(contentHash(jobs[0].payload), jobs[0].payloadChecksum);
+    } finally {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}

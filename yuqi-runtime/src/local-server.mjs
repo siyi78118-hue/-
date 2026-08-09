@@ -15,6 +15,10 @@ import {
 } from './protocol.mjs';
 import { normalizeRecoverySnapshot } from './reconcile.mjs';
 import { isCanonicalAuthorityConflictError } from './bridge-result-projector.mjs';
+import {
+  isV3DiagnosticAuthorityConflict,
+  projectV3Diagnostics
+} from './v3-diagnostics.mjs';
 
 function bodyHash(body) {
   return createHash('sha256').update(String(body || ''), 'utf8').digest('hex');
@@ -344,6 +348,32 @@ export function createYuqiServer({
     let body = null;
     if (rawBody) {
       try { body = JSON.parse(rawBody); } catch { return json(response, 400, { ok: false, error: 'invalid JSON' }); }
+    }
+
+    const diagnosticsMatch = /^\/v3\/diagnostics\/turns\/([^/]+)$/.exec(url.pathname);
+    if (request.method === 'GET' && diagnosticsMatch) {
+      let diagnosticTurnId;
+      try {
+        diagnosticTurnId = decodeURIComponent(diagnosticsMatch[1]);
+      } catch {
+        return json(response, 400, { ok: false, error: 'invalid turn id' });
+      }
+      try {
+        if (typeof store.loadTurnDiagnosticsAuthorityInternal !== 'function') {
+          throw new Error('diagnostic authority loader is unavailable');
+        }
+        const projection = store.loadTurnDiagnosticsAuthorityInternal(diagnosticTurnId);
+        if (projection === null) return json(response, 404, { ok: false, error: 'turn not found' });
+        return json(response, 200, projectV3Diagnostics(projection));
+      } catch (error) {
+        if (isV3DiagnosticAuthorityConflict(error)) {
+          return json(response, 409, {
+            ok: false,
+            error: 'V3_DIAGNOSTIC_AUTHORITY_CONFLICT'
+          });
+        }
+        throw error;
+      }
     }
 
     if (request.method === 'POST' && url.pathname === '/v3/backups/yuqi') {

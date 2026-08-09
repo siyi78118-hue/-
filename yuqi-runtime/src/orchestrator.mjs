@@ -2238,10 +2238,7 @@ export class YuqiOrchestrator {
       }).slice(0, 24)}`,
       jobType: contract.jobType,
       payload: {
-        subjectType: 'turn',
-        subjectId: turn.authorityLineageKey,
         turnId: turn.turnId,
-        authoritativeReleaseId: turn.authoritativeReleaseId,
         comparisonReleaseId: turn.comparisonReleaseId,
         comparisonDirection: contract.comparisonDirection,
         rolloutEvidenceEpoch: turn.rolloutEvidenceEpoch,

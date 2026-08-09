@@ -26,6 +26,8 @@ import {
   motiveIdForSource,
   proactiveMotiveSourceContext
 } from './life-simulation.mjs';
+import { V3DiagnosticAuthorityConflict } from './v3-diagnostics.mjs';
+import { COMPARISON_CRITICAL_CODES } from './comparison-evaluator.mjs';
 import {
   currentBatchEvidenceAuthorityProjection,
   validateConsolidationCandidate
@@ -83,6 +85,38 @@ const BASELINE_V2_CANDIDATE_MANIFEST = Object.freeze({
 const BASELINE_V2_CANDIDATE_CHECKSUM = contentHash(BASELINE_V2_CANDIDATE_MANIFEST);
 const FAILURE_DELIVERY_LEASE_MS = 60_000;
 const TRUSTED_LIFE_RESULT_WRITER = Symbol('trusted-life-result-writer');
+const DIAGNOSTIC_COMPARISON_STATES = new Set(['queued', 'retry_wait', 'running', 'completed', 'failed', 'cancelled']);
+const DIAGNOSTIC_COMPARISON_DIRECTIONS = new Set([
+  'stable_authoritative_candidate_compare',
+  'candidate_authoritative_stable_compare'
+]);
+const DIAGNOSTIC_CRITICAL_CODES = new Set(COMPARISON_CRITICAL_CODES);
+const DIAGNOSTIC_AUTHORITY_MESSAGES = new Set([
+  'diagnostic lineage authority conflict',
+  'unsupported diagnostic authority version',
+  'diagnostic terminal authority unavailable',
+  'diagnostic receipt authority conflict',
+  'diagnostic group authority conflict',
+  'diagnostic delivery authority conflict',
+  'diagnostic lane authority conflict',
+  'redacted group authority conflict',
+  'canonical comparison authority conflict',
+  'canonical comparison job authority conflict',
+  'canonical comparison run authority conflict',
+  'canonical comparison release authority conflict',
+  'canonical visible group authority conflict',
+  'diagnostic release authority conflict',
+  'canonical failure authority conflict',
+  'canonical failure target set conflict',
+  'canonical failure delivery authority conflict',
+  'canonical failure delivery lease conflict',
+  'canonical failure delivery lease time conflict',
+  'canonical failure delivery checksum conflict',
+  'canonical failure delivery state conflict',
+  'canonical failure relay identity conflict',
+  'canonical failure delivery time conflict',
+  'canonical failure delivery quarantine diagnostic conflict'
+]);
 
 function candidateReleaseChecksum(release) {
   return contentHash({
@@ -6049,6 +6083,13 @@ export class YuqiStore {
               !['authorityGroupId', 'authoritativeResultChecksum'].includes(key)))
           }
         : payload;
+      const expectedSemanticJob = comparisonJob
+        ? {
+            ...expectedJobs[ordinal],
+            jobType: job.job_type,
+            ...(Object.hasOwn(payload, 'turnId') ? { turnId: job.turn_id } : {})
+          }
+        : expectedJobs[ordinal];
       if (job.role_id !== authority.role_id
         || job.turn_id !== authority.authoritative_turn_id
         || job.subject_type !== 'turn'
@@ -6057,7 +6098,7 @@ export class YuqiStore {
           : authority.authoritative_turn_id)
         || Number(job.authority_ordinal) !== ordinal
         || contentHash(payload) !== job.payload_checksum
-        || canonicalJson(semanticJob) !== canonicalJson(expectedJobs[ordinal])) {
+        || canonicalJson(semanticJob) !== canonicalJson(expectedSemanticJob)) {
         throw new Error('canonical visible group job authority conflict');
       }
     });
@@ -11162,7 +11203,9 @@ export class YuqiStore {
       Number(cursor.uiAppliedSequence),
       Number(cursor.clearedThroughSequence)
     );
-    if (Number(cursor.localSequence) !== priorWatermark + 1) {
+    const retryInheritsInputSequence = Boolean(envelope.context?.retry)
+      && Number(cursor.localSequence) === Number(lane?.localSequence || 0);
+    if (!retryInheritsInputSequence && Number(cursor.localSequence) !== priorWatermark + 1) {
       throw new Error('input visibility sequence authority conflict');
     }
     if (
@@ -12500,6 +12543,587 @@ export class YuqiStore {
       action: parseJson(row.action_json, {}),
       actionChecksum: row.action_checksum
     }));
+  }
+
+  loadTurnComparisonDiagnosticsInternal({ turnId, lineageKey, rolloutKey, groupId, turnPin }) {
+    const jobs = this.db.prepare(`
+      SELECT * FROM consolidation_jobs
+      WHERE authority_group_id = ? AND job_type IN ('shadow_cognition','active_canary_compare')
+      ORDER BY authority_ordinal, job_id
+    `).all(String(groupId || ''));
+    const runs = this.db.prepare(`
+      SELECT * FROM cognition_shadow_runs
+      WHERE subject_type = 'turn' AND subject_id = ? AND turn_id = ?
+        AND rollout_key = ? AND source = 'live'
+      ORDER BY comparison_direction, run_id
+    `).all(String(lineageKey || ''), String(turnId || ''), String(rolloutKey || ''));
+    const expectedJobTypes = new Map([
+      ['stable_authoritative_candidate_compare', 'shadow_cognition'],
+      ['candidate_authoritative_stable_compare', 'active_canary_compare']
+    ]);
+    const comparisonModeContracts = new Map([
+      ['cognition_compare', {
+        jobType: 'shadow_cognition',
+        direction: 'stable_authoritative_candidate_compare'
+      }],
+      ['legacy_compare', {
+        jobType: 'active_canary_compare',
+        direction: 'candidate_authoritative_stable_compare'
+      }]
+    ]);
+    const expectedRunStates = DIAGNOSTIC_COMPARISON_STATES;
+    const turnAuthority = this.db.prepare(`
+      SELECT envelope_json, annotation_snapshot_json,
+             comparison_mode,
+             authoritative_release_id, comparison_release_id,
+             authoritative_pipeline_checksum, comparison_pipeline_checksum,
+             rollout_revision, rollout_evidence_epoch,
+             shadow_epoch, canary_epoch, canary_slot
+      FROM turns WHERE turn_id = ?
+    `).get(String(turnId || ''));
+    if (!turnAuthority) throw new V3DiagnosticAuthorityConflict('diagnostic terminal authority unavailable');
+    const comparisonMode = turnAuthority.comparison_mode || 'none';
+    const hasComparison = jobs.length > 0 || runs.length > 0;
+    const modeContract = comparisonModeContracts.get(comparisonMode);
+    if (!hasComparison && comparisonMode === 'none') return null;
+    if (!hasComparison && modeContract) {
+      throw new V3DiagnosticAuthorityConflict('canonical comparison job authority conflict');
+    }
+    if (!modeContract) {
+      throw new V3DiagnosticAuthorityConflict('canonical comparison mode authority conflict');
+    }
+    if (jobs.length > 1 || runs.length > 1) {
+      throw new V3DiagnosticAuthorityConflict('canonical comparison direction authority conflict');
+    }
+    if (jobs.length === 1 && jobs[0].job_type !== modeContract.jobType) {
+      throw new V3DiagnosticAuthorityConflict('canonical comparison direction authority conflict');
+    }
+    const persistedPin = {
+      authoritativeReleaseId: turnAuthority.authoritative_release_id || null,
+      comparisonReleaseId: turnAuthority.comparison_release_id || null,
+      authoritativePipelineChecksum: turnAuthority.authoritative_pipeline_checksum || null,
+      comparisonPipelineChecksum: turnAuthority.comparison_pipeline_checksum || null,
+      rolloutRevision: Number(turnAuthority.rollout_revision),
+      evidenceEpoch: Number(turnAuthority.rollout_evidence_epoch),
+      shadowEpoch: turnAuthority.shadow_epoch == null ? null : Number(turnAuthority.shadow_epoch),
+      canaryEpoch: turnAuthority.canary_epoch == null ? null : Number(turnAuthority.canary_epoch),
+      canarySlot: turnAuthority.canary_slot == null ? null : Number(turnAuthority.canary_slot)
+    };
+    if (!turnPin || turnPin.authoritativeReleaseId !== persistedPin.authoritativeReleaseId
+      || turnPin.comparisonReleaseId !== persistedPin.comparisonReleaseId
+      || turnPin.authoritativePipelineChecksum !== persistedPin.authoritativePipelineChecksum
+      || turnPin.comparisonPipelineChecksum !== persistedPin.comparisonPipelineChecksum
+      || Number(turnPin.rolloutRevision) !== persistedPin.rolloutRevision
+      || Number(turnPin.evidenceEpoch) !== persistedPin.evidenceEpoch
+      || (persistedPin.shadowEpoch == null
+        ? ![null, 0].includes(turnPin.shadowEpoch)
+        : Number(turnPin.shadowEpoch) !== persistedPin.shadowEpoch)
+      || (persistedPin.canaryEpoch == null
+        ? ![null, 0].includes(turnPin.canaryEpoch)
+        : Number(turnPin.canaryEpoch) !== persistedPin.canaryEpoch)
+      || (turnPin.canarySlot ?? null) !== persistedPin.canarySlot) {
+      throw new V3DiagnosticAuthorityConflict('canonical comparison release authority conflict');
+    }
+    const envelope = parseJson(turnAuthority.envelope_json, null);
+    const authoritativeRelease = this.getPipelineRelease(persistedPin.authoritativeReleaseId);
+    const comparisonRelease = this.getPipelineRelease(persistedPin.comparisonReleaseId);
+    const expectedInputChecksum = contentHash({
+      envelope,
+      authoritativeReleaseId: persistedPin.authoritativeReleaseId,
+      authoritativePipelineChecksum: persistedPin.authoritativePipelineChecksum,
+      comparisonReleaseId: persistedPin.comparisonReleaseId,
+      comparisonPipelineChecksum: persistedPin.comparisonPipelineChecksum,
+      rolloutRevision: persistedPin.rolloutRevision,
+      rolloutEvidenceEpoch: persistedPin.evidenceEpoch,
+      shadowEpoch: persistedPin.shadowEpoch,
+      canaryEpoch: persistedPin.canaryEpoch,
+      canarySlot: persistedPin.canarySlot
+    });
+    const authoritativeResultChecksum = this.db.prepare(
+      'SELECT commit_checksum FROM visible_commit_receipts WHERE group_id = ? AND lineage_key = ?'
+    ).get(String(groupId || ''), String(lineageKey || ''))?.commit_checksum || null;
+    if (!authoritativeRelease || !comparisonRelease
+      || authoritativeRelease.releaseChecksum !== persistedPin.authoritativePipelineChecksum
+      || comparisonRelease.releaseChecksum !== persistedPin.comparisonPipelineChecksum
+      || !authoritativeResultChecksum) {
+      throw new V3DiagnosticAuthorityConflict('canonical comparison release authority conflict');
+    }
+    const checkedJobs = new Set();
+    for (const job of jobs) {
+      if (job.subject_type !== 'turn' || job.subject_id !== String(lineageKey || '')
+        || job.turn_id !== String(turnId || '')
+        || job.authority_group_id !== String(groupId || '')
+        || !Number.isSafeInteger(Number(job.authority_ordinal))
+        || !expectedJobTypes.has(job.job_type === 'shadow_cognition'
+          ? 'stable_authoritative_candidate_compare'
+          : job.job_type === 'active_canary_compare'
+            ? 'candidate_authoritative_stable_compare' : '')) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison job authority conflict');
+      }
+      if (checkedJobs.has(job.job_type)) throw new V3DiagnosticAuthorityConflict('canonical comparison job authority conflict');
+      checkedJobs.add(job.job_type);
+      const payload = parseJson(job.payload_json, null);
+      const expectedDirection = job.job_type === 'shadow_cognition'
+        ? 'stable_authoritative_candidate_compare'
+        : 'candidate_authoritative_stable_compare';
+      if (modeContract && (job.job_type !== modeContract.jobType
+        || expectedDirection !== modeContract.direction)) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison direction authority conflict');
+      }
+      const expectedPayload = {
+        turnId: String(turnId || ''),
+        comparisonReleaseId: persistedPin.comparisonReleaseId,
+        comparisonDirection: expectedDirection,
+        rolloutEvidenceEpoch: persistedPin.evidenceEpoch,
+        shadowEpoch: persistedPin.shadowEpoch,
+        canaryEpoch: persistedPin.canaryEpoch,
+        canarySlot: persistedPin.canarySlot,
+        annotationSnapshotChecksum: contentHash(
+          parseJson(turnAuthority.annotation_snapshot_json, {})
+        ),
+        inputChecksum: expectedInputChecksum,
+        authorityGroupId: String(groupId || ''),
+        authoritativeResultChecksum
+      };
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || contentHash(payload) !== job.payload_checksum
+        || DIAGNOSTIC_COMPARISON_DIRECTIONS.has(payload.comparisonDirection) === false
+        || expectedJobTypes.get(payload.comparisonDirection) !== job.job_type
+        || payload.turnId !== String(turnId || '')
+        || canonicalJson(payload) !== canonicalJson(expectedPayload)) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison job authority conflict');
+      }
+      if (!DIAGNOSTIC_COMPARISON_STATES.has(job.state)) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison job authority conflict');
+      }
+    }
+    const stateCounts = {};
+    const criticalCodes = new Set();
+    let staleCount = 0;
+    const checkedDirections = new Set();
+    if (jobs.length === 1) {
+      if (jobs[0].state === 'completed' && runs.length !== 1) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison completion authority conflict');
+      }
+      if (jobs[0].state !== 'completed' && runs.length > 0) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison state authority conflict');
+      }
+    }
+    for (const run of runs) {
+      if (checkedDirections.has(run.comparison_direction)
+        || !DIAGNOSTIC_COMPARISON_DIRECTIONS.has(run.comparison_direction)
+        || run.subject_type !== 'turn' || run.subject_id !== String(lineageKey || '')
+        || run.turn_id !== String(turnId || '')
+        || run.rollout_key !== String(rolloutKey || '')
+        || run.source !== 'live'
+        || Number(run.rollout_revision) !== persistedPin.rolloutRevision
+        || Number(run.evidence_epoch) !== persistedPin.evidenceEpoch
+        || Number(run.shadow_epoch ?? 0) !== Number(persistedPin.shadowEpoch ?? 0)
+        || Number(run.canary_epoch ?? 0) !== Number(persistedPin.canaryEpoch ?? 0)
+        || (run.canary_slot ?? null) !== persistedPin.canarySlot
+        || typeof run.pipeline_checksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(run.pipeline_checksum)
+        || run.pipeline_checksum !== (persistedPin.comparisonPipelineChecksum || persistedPin.authoritativePipelineChecksum)
+        || !DIAGNOSTIC_COMPARISON_STATES.has(run.state)
+        || ![0, 1].includes(Number(run.stale_for_rollout))) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison run authority conflict');
+      }
+      if (!modeContract || run.comparison_direction !== modeContract.direction) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison direction authority conflict');
+      }
+      if (run.authoritative_result_checksum !== authoritativeResultChecksum
+        || typeof run.comparison_result_checksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(run.comparison_result_checksum)
+        || (run.state === 'completed' && !/^[a-f0-9]{64}$/.test(run.comparison_result_checksum))) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison run checksum authority conflict');
+      }
+      const expectedJobType = expectedJobTypes.get(run.comparison_direction);
+      const matchingJob = jobs.find(job => job.job_type === expectedJobType);
+      if (!matchingJob || matchingJob.subject_id !== String(lineageKey || '')
+        || matchingJob.turn_id !== String(turnId || '')
+        || matchingJob.authority_group_id !== String(groupId || '')) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison run authority conflict');
+      }
+      checkedDirections.add(run.comparison_direction);
+      stateCounts[run.state] = (stateCounts[run.state] || 0) + 1;
+      if (Number(run.stale_for_rollout) === 1) staleCount += 1;
+      const findings = parseJson(run.critical_findings_json, null);
+      if (!Array.isArray(findings)) throw new V3DiagnosticAuthorityConflict('canonical comparison run authority conflict');
+      for (const finding of findings) {
+        if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+          throw new V3DiagnosticAuthorityConflict('canonical comparison run authority conflict');
+        }
+        const keys = Object.keys(finding);
+        if (keys.some(key => !['findingId', 'code', 'action', 'target', 'toStage'].includes(key))
+          || typeof finding.code !== 'string' || !DIAGNOSTIC_CRITICAL_CODES.has(finding.code)
+          || (Object.hasOwn(finding, 'findingId') && typeof finding.findingId !== 'string')
+          || (Object.hasOwn(finding, 'action') && typeof finding.action !== 'string')
+          || (Object.hasOwn(finding, 'target') && typeof finding.target !== 'string')
+          || (Object.hasOwn(finding, 'toStage') && typeof finding.toStage !== 'string')) {
+          throw new V3DiagnosticAuthorityConflict('canonical comparison run authority conflict');
+        }
+        criticalCodes.add(finding.code);
+      }
+      const reports = this.db.prepare(`
+        SELECT report_type, rollout_key, source_type, source_ref, artifact_checksum, summary_json
+        FROM cognition_evaluation_reports
+        WHERE source_type = 'comparison_run' AND source_ref = ?
+        ORDER BY report_id
+      `).all(matchingJob.job_id);
+      if (reports.length !== 1) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison evaluation report authority conflict');
+      }
+      const report = reports[0];
+      const summary = parseJson(report.summary_json, null);
+      const expectedReportType = modeContract.jobType === 'shadow_cognition'
+        ? 'live_shadow' : 'active_canary';
+      const expectedSummaryKeys = [
+        'rolloutKey', 'jobId', 'comparisonRunId', 'subjectType', 'subjectId',
+        'staleForRollout', 'authoritativeResultChecksum',
+        'comparisonResultChecksum', 'criticalFindings'
+      ];
+      if (!summary || typeof summary !== 'object' || Array.isArray(summary)
+        || canonicalJson(Object.keys(summary).sort()) !== canonicalJson(expectedSummaryKeys.slice().sort())
+        || report.source_ref !== matchingJob.job_id
+        || report.report_type !== expectedReportType
+        || report.rollout_key !== String(rolloutKey || '')
+        || report.artifact_checksum !== contentHash(summary)
+        || summary.rolloutKey !== String(rolloutKey || '')
+        || summary.jobId !== matchingJob.job_id
+        || summary.comparisonRunId !== run.run_id
+        || summary.subjectType !== 'turn'
+        || summary.subjectId !== String(lineageKey || '')
+        || typeof summary.staleForRollout !== 'boolean'
+        || summary.staleForRollout !== (Number(run.stale_for_rollout) === 1)
+        || summary.authoritativeResultChecksum !== authoritativeResultChecksum
+        || summary.comparisonResultChecksum !== run.comparison_result_checksum
+        || canonicalJson(summary.criticalFindings) !== canonicalJson(findings)) {
+        throw new V3DiagnosticAuthorityConflict('canonical comparison evaluation report authority conflict');
+      }
+    }
+    return {
+      stateCounts,
+      staleCount,
+      criticalCodes: [...criticalCodes].sort()
+    };
+  }
+
+  loadTurnDiagnosticsAuthorityInternal(turnId) {
+    const lookupId = String(turnId || '');
+    // Diagnostics must not parse semantic reply/error columns before authority
+    // routing. Read only scalar/pin columns; canonical failure loading below
+    // is the sole path allowed to verify the closed failure projection.
+    const turnRow = this.db.prepare(`
+      SELECT turn_id, character_id, device_id, device_seq, state,
+             envelope_json, created_at, updated_at, rollout_key,
+             rollout_revision, rollout_evidence_epoch, pipeline_checksum,
+             shadow_epoch, canary_epoch, canary_slot,
+             authoritative_release_id, comparison_release_id,
+             authoritative_pipeline_checksum, comparison_pipeline_checksum,
+             lane_key, lane_revision, input_visibility_sequence, input_clear_epoch,
+             authority_redacted_at, generation_fingerprint,
+             result_authority_version, authority_lineage_key,
+             lineage_revision_at_creation, turn_revision, retry_of_turn_id,
+             input_user_batch_id, agency_snapshot_checksum, preset_version,
+             annotation_snapshot_json
+      FROM turns WHERE turn_id = ?
+    `).get(lookupId);
+    const turn = turnRow ? {
+      turnId: turnRow.turn_id,
+      characterId: turnRow.character_id,
+      deviceId: turnRow.device_id,
+      deviceSeq: turnRow.device_seq,
+      createdAt: turnRow.created_at,
+      updatedAt: turnRow.updated_at,
+      protocolVersion: Number(parseJson(turnRow.envelope_json, {})?.protocolVersion || 0),
+      state: turnRow.state,
+      envelopeJson: turnRow.envelope_json,
+      rolloutKey: turnRow.rollout_key || null,
+      rolloutRevision: Number(turnRow.rollout_revision || 0),
+      rolloutEvidenceEpoch: Number(turnRow.rollout_evidence_epoch || 0),
+      pipelineChecksum: turnRow.pipeline_checksum || '',
+      shadowEpoch: turnRow.shadow_epoch ?? null,
+      canaryEpoch: turnRow.canary_epoch ?? null,
+      canarySlot: turnRow.canary_slot ?? null,
+      authoritativeReleaseId: turnRow.authoritative_release_id || null,
+      comparisonReleaseId: turnRow.comparison_release_id || null,
+      authoritativePipelineChecksum: turnRow.authoritative_pipeline_checksum || null,
+      comparisonPipelineChecksum: turnRow.comparison_pipeline_checksum || null,
+      laneKey: turnRow.lane_key || null,
+      laneRevision: turnRow.lane_revision ?? null,
+      inputVisibilitySequence: turnRow.input_visibility_sequence ?? null,
+      inputClearEpoch: Number(turnRow.input_clear_epoch || 0),
+      authorityRedactedAt: turnRow.authority_redacted_at ?? null,
+      generationFingerprint: turnRow.generation_fingerprint || null,
+      resultAuthorityVersion: Number(turnRow.result_authority_version || 0),
+      authorityLineageKey: turnRow.authority_lineage_key || null,
+      lineageRevisionAtCreation: turnRow.lineage_revision_at_creation ?? null,
+      turnRevision: Number(turnRow.turn_revision || 0),
+      retryOfTurnId: turnRow.retry_of_turn_id || null,
+      inputUserBatchId: turnRow.input_user_batch_id || null,
+      agencySnapshotChecksum: turnRow.agency_snapshot_checksum || null,
+      presetVersion: turnRow.preset_version || '1.9.1',
+      annotationSnapshot: parseJson(turnRow.annotation_snapshot_json, {})
+    } : null;
+    if (!turn) return null;
+    const baseTurn = {
+      turnId: turn.turnId,
+      kind: turn.rolloutKey || 'legacy_turn_identity',
+      state: turn.state,
+      protocolVersion: Number(turn.protocolVersion),
+      resultAuthorityVersion: Number(turn.resultAuthorityVersion),
+      turnRevision: Number(turn.turnRevision),
+      inputVisibilitySequence: Number(turn.inputVisibilitySequence ?? 0),
+      inputClearEpoch: Number(turn.inputClearEpoch ?? 0),
+      createdAt: Number(turn.createdAt),
+      updatedAt: Number(turn.updatedAt)
+    };
+    const emptyPipeline = { turnPin: null, currentRollout: null };
+    const emptyTiming = { acceptedAt: null, updatedAt: baseTurn.updatedAt, committedAt: null };
+    const legacy = () => ({
+      turn: baseTurn,
+      authority: {
+        kind: 'legacy_turn_identity',
+        lineageKey: null,
+        lineageRevision: null,
+        origin: 'legacy',
+        commitPayloadVersion: null,
+        commitChecksum: null,
+        chainValid: true,
+        errorCode: null,
+        retryAllowed: null
+      },
+      visibleGroup: null,
+      outbox: null,
+      lane: null,
+      pipeline: emptyPipeline,
+      comparison: null,
+      timings: emptyTiming
+    });
+    try {
+      if (Number(turn.resultAuthorityVersion) === 0) {
+        const attached = this.db.prepare(`
+          SELECT 1 AS value FROM visible_result_groups WHERE authoritative_turn_id = ?
+          UNION ALL
+            SELECT 1 AS value FROM visible_commit_receipts WHERE authoritative_turn_id = ?
+          UNION ALL
+            SELECT 1 AS value FROM turn_authority_lineages
+             WHERE latest_turn_id = ?
+          UNION ALL
+            SELECT 1 AS value
+              FROM turn_authority_lineages l
+              JOIN turns root ON root.authority_lineage_key = l.lineage_key
+             WHERE root.turn_id = ? AND root.retry_of_turn_id IS NULL
+          UNION ALL
+            SELECT 1 AS value FROM cloud_deliveries
+             WHERE turn_id = ? AND (authority_group_id IS NOT NULL OR authority_commit_checksum IS NOT NULL)
+          LIMIT 1
+        `).get(lookupId, lookupId, lookupId, lookupId, lookupId);
+        if (attached) throw new V3DiagnosticAuthorityConflict('legacy turn has canonical rows');
+        return legacy();
+      }
+      if (Number(turn.resultAuthorityVersion) !== 1 || !turn.authorityLineageKey) {
+        throw new V3DiagnosticAuthorityConflict('unsupported diagnostic authority version');
+      }
+      const lineage = this.getTurnAuthorityLineage(turn.authorityLineageKey);
+      if (!lineage) throw new V3DiagnosticAuthorityConflict('diagnostic lineage authority conflict');
+      const redacted = lineage.redactedAt != null || turn.authorityRedactedAt != null;
+      if (redacted) {
+        if (lineage.committedGroupId) {
+          const closure = this.assertVisibleGroupAuthorityInternal(lineage.committedGroupId, {
+            purpose: 'diagnostics', expectedLineageKey: lineage.lineageKey
+          });
+          if (closure.status !== 'redacted') throw new V3DiagnosticAuthorityConflict('redacted group authority conflict');
+        } else {
+          this.assertRedactedLineageAuthorityInternal(lineage.lineageKey, { purpose: 'diagnostics' });
+        }
+        return {
+          turn: baseTurn,
+          authority: {
+            kind: 'redacted', lineageKey: null, lineageRevision: null,
+            origin: null, commitPayloadVersion: null, commitChecksum: null,
+            chainValid: true, errorCode: null, retryAllowed: null
+          },
+          visibleGroup: null,
+          outbox: null,
+          lane: null,
+          pipeline: emptyPipeline,
+          comparison: null,
+          timings: emptyTiming
+        };
+      }
+      if (turn.state === 'failed' && Number(turn.protocolVersion) === 3) {
+        const failure = this.loadCanonicalFailureForBridgeInternal(lookupId);
+        if (failure?.status === 'redacted') {
+          return {
+            turn: baseTurn,
+            authority: {
+              kind: 'redacted', lineageKey: null, lineageRevision: null,
+              origin: null, commitPayloadVersion: null, commitChecksum: null,
+              chainValid: true, errorCode: null, retryAllowed: null
+            },
+            visibleGroup: null, outbox: null, lane: null,
+            pipeline: emptyPipeline, comparison: null, timings: emptyTiming
+          };
+        }
+        const delivery = this.db.prepare(`
+          SELECT state, recovery_ack_seq FROM cloud_deliveries
+          WHERE turn_id = ? AND authority_group_id IS NULL AND peer_id = ?
+        `).get(lookupId, turn.deviceId);
+        return {
+          turn: baseTurn,
+          authority: {
+            kind: 'canonical_failure',
+            lineageKey: turn.authorityLineageKey,
+            lineageRevision: lineage.revision,
+            origin: 'pc',
+            commitPayloadVersion: 'canonical-failure-status-v1',
+            commitChecksum: null,
+            chainValid: true,
+            errorCode: failure.errorCode,
+            retryAllowed: failure.retryAllowed
+          },
+          visibleGroup: null,
+            outbox: delivery ? {
+              authorityGroupId: null,
+              peerId: turn.deviceId,
+              state: delivery.state,
+              recoveryAckSeq: Number(delivery.recovery_ack_seq || 0)
+            } : null,
+          lane: null,
+          pipeline: emptyPipeline,
+          comparison: null,
+          timings: emptyTiming
+        };
+      }
+      if (!['committed', 'delivered', 'completed'].includes(turn.state)
+        || !lineage.committedGroupId) {
+        throw new V3DiagnosticAuthorityConflict('diagnostic terminal authority unavailable');
+      }
+      const closure = this.assertVisibleGroupAuthorityInternal(lineage.committedGroupId, {
+        purpose: 'diagnostics', expectedLineageKey: lineage.lineageKey
+      });
+      if (closure.status === 'redacted') {
+        return {
+          turn: baseTurn,
+          authority: {
+            kind: 'redacted', lineageKey: null, lineageRevision: null,
+            origin: null, commitPayloadVersion: null, commitChecksum: null,
+            chainValid: true, errorCode: null, retryAllowed: null
+          },
+          visibleGroup: null, outbox: null, lane: null,
+          pipeline: emptyPipeline, comparison: null, timings: emptyTiming
+        };
+      }
+      const receipt = closure.receipt;
+      const manifest = closure.manifest;
+      if (!receipt || !manifest) throw new V3DiagnosticAuthorityConflict('diagnostic receipt authority conflict');
+      const group = this.db.prepare(`
+        SELECT group_id, authoritative_turn_id, authority_origin, role_id, lane_key,
+               authoritative_release_id
+        FROM visible_result_groups WHERE group_id = ?
+      `).get(lineage.committedGroupId);
+      if (!group) throw new V3DiagnosticAuthorityConflict('diagnostic group authority conflict');
+      const groupRelease = this.getPipelineRelease(group.authoritative_release_id);
+      if (!groupRelease || groupRelease.releaseChecksum !== turn.authoritativePipelineChecksum) {
+        throw new V3DiagnosticAuthorityConflict('diagnostic release authority conflict');
+      }
+      const deliveries = this.db.prepare(`
+        SELECT authority_group_id, peer_id, state, recovery_ack_seq
+        FROM cloud_deliveries WHERE authority_group_id = ?
+      `).all(group.group_id);
+      if (deliveries.some(delivery => !Number.isSafeInteger(Number(delivery.recovery_ack_seq))
+        || Number(delivery.recovery_ack_seq) < 0)) {
+        throw new V3DiagnosticAuthorityConflict('diagnostic delivery authority conflict');
+      }
+      if (group.authority_origin === 'pc' && deliveries.length !== 1) {
+        throw new V3DiagnosticAuthorityConflict('diagnostic delivery authority conflict');
+      }
+      const lane = this.getInteractionLane(group.role_id, group.lane_key);
+      if (!lane) throw new V3DiagnosticAuthorityConflict('diagnostic lane authority conflict');
+      if (lane.roleId !== group.role_id || lane.laneKey !== group.lane_key
+        || Number(lane.clearEpoch) !== Number(turn.input_clear_epoch ?? 0)) {
+        throw new V3DiagnosticAuthorityConflict('diagnostic lane authority conflict');
+      }
+      const rollout = this.getCognitionRollout(turn.rolloutKey);
+      const turnPin = {
+        authoritativeReleaseId: turn.authoritativeReleaseId,
+        comparisonReleaseId: turn.comparisonReleaseId,
+        authoritativePipelineChecksum: turn.authoritativePipelineChecksum,
+        comparisonPipelineChecksum: turn.comparisonPipelineChecksum,
+        rolloutRevision: Number(turn.rolloutRevision),
+        evidenceEpoch: Number(turn.rolloutEvidenceEpoch),
+        shadowEpoch: Number(turn.shadowEpoch ?? 0),
+        canaryEpoch: Number(turn.canaryEpoch ?? 0),
+        canarySlot: turn.canarySlot == null ? null : Number(turn.canarySlot)
+      };
+      const currentRollout = rollout ? {
+        candidatePhase: ['shadow', 'canary', 'rolled_back'].includes(rollout.candidatePhase)
+          ? rollout.candidatePhase : 'none',
+        revision: Number(rollout.revision),
+        evidenceEpoch: Number(rollout.evidenceEpoch),
+        stableReleaseId: rollout.stableReleaseId,
+        candidateReleaseId: rollout.candidateReleaseId,
+        lastReasonCode: rollout.lastReasonCode || null
+      } : null;
+      const comparison = this.loadTurnComparisonDiagnosticsInternal({
+        turnId: turn.turnId,
+        lineageKey: lineage.lineageKey,
+        rolloutKey: turn.rolloutKey,
+        groupId: group.group_id,
+        turnPin
+      });
+      return {
+        turn: baseTurn,
+        authority: {
+          kind: group.authority_origin === 'android_fallback' ? 'android_fallback' : 'pc_canonical_live',
+          lineageKey: lineage.lineageKey,
+          lineageRevision: lineage.revision,
+          origin: group.authority_origin,
+          commitPayloadVersion: receipt.commitPayloadVersion,
+          commitChecksum: receipt.commitChecksum,
+          chainValid: true,
+          errorCode: null,
+          retryAllowed: null
+        },
+        visibleGroup: {
+          groupId: group.group_id,
+          authoritativeTurnId: group.authoritative_turn_id,
+          redacted: false
+        },
+        outbox: group.authority_origin === 'android_fallback'
+          ? { authorityGroupId: group.group_id, peerId: null, state: 'not_applicable_external_visibility', recoveryAckSeq: 0 }
+          : deliveries.length === 1
+            ? {
+                authorityGroupId: deliveries[0].authority_group_id,
+                peerId: deliveries[0].peer_id,
+                state: deliveries[0].state,
+                recoveryAckSeq: Number(deliveries[0].recovery_ack_seq || 0)
+              }
+            : null,
+        lane: {
+          key: lane.laneKey,
+          revision: lane.revision,
+          localSequence: lane.localSequence,
+          clearEpoch: lane.clearEpoch,
+          clearedThroughSequence: lane.clearedThroughSequence
+        },
+        pipeline: { turnPin, currentRollout },
+        comparison,
+        timings: {
+          acceptedAt: null,
+          updatedAt: baseTurn.updatedAt,
+          committedAt: Number(receipt.committedAt)
+        }
+      };
+    } catch (error) {
+      if (error instanceof V3DiagnosticAuthorityConflict) throw error;
+      const message = String(error?.message || '');
+      if (DIAGNOSTIC_AUTHORITY_MESSAGES.has(message)) {
+        throw new V3DiagnosticAuthorityConflict(message);
+      }
+      throw error;
+    }
   }
 
   loadCanonicalBridgeResultInternal(turnId) {
@@ -15407,11 +16031,11 @@ export class YuqiStore {
         SELECT d.*, t.result_authority_version, t.device_id
         FROM cloud_deliveries d
         JOIN turns t ON t.turn_id = d.turn_id
-        WHERE d.turn_id = ? AND d.peer_id = ?
+        WHERE d.turn_id = ?
           AND d.authority_group_id = ? AND d.authority_commit_checksum = ?
-          AND t.result_authority_version = 1 AND t.device_id = d.peer_id
+          AND t.result_authority_version = 1 AND d.peer_id = t.device_id
       `).get(
-        String(turnId), String(peerId), String(authorityGroupId), String(authorityCommitChecksum)
+        String(turnId), String(authorityGroupId), String(authorityCommitChecksum)
       );
       if (!row) {
         const turn = this.getTurn(String(turnId));
@@ -15424,7 +16048,7 @@ export class YuqiStore {
       const detail = canonicalJson({
         redacted: true,
         groupId: String(authorityGroupId),
-        peerId: String(peerId),
+        peerId: String(row.device_id),
         reason: String(reason)
       });
       const diagnosticRows = this.db.prepare(`
@@ -15468,7 +16092,7 @@ export class YuqiStore {
           AND relay_message_id IS ? AND delivered_at IS ? AND updated_at = ?
       `).run(
         timestamp,
-        String(turnId), String(peerId), String(authorityGroupId), String(authorityCommitChecksum),
+        String(turnId), String(row.device_id), String(authorityGroupId), String(authorityCommitChecksum),
         expected.state,
         expected.payloadJson ?? null, expected.checksum || null, Number(expected.attempts),
         expected.relayMessageId ?? null, expected.deliveredAt ?? null, Number(expected.updatedAt)
@@ -15480,12 +16104,17 @@ export class YuqiStore {
         turnId: String(turnId),
         stage: 'canonical_visible_delivery_quarantined',
         level: 'error',
-        detail: JSON.parse(detail)
+        detail: JSON.parse(canonicalJson({
+          redacted: true,
+          groupId: String(authorityGroupId),
+          peerId: String(row.device_id),
+          reason: String(reason)
+        }))
       });
       return { ...mapCloudDelivery(this.db.prepare(`
         SELECT * FROM cloud_deliveries
         WHERE turn_id = ? AND peer_id = ? AND authority_group_id = ?
-      `).get(String(turnId), String(peerId), String(authorityGroupId))), quarantineOutcome: 'quarantined' };
+      `).get(String(turnId), String(row.device_id), String(authorityGroupId))), quarantineOutcome: 'quarantined' };
     });
   }
 
@@ -18716,6 +19345,8 @@ export class YuqiStore {
         subjectType: freshAuthority ? authority.subjectType : payload.subjectType,
         subjectId: freshAuthority ? authority.subjectId : payload.subjectId,
         staleForRollout: stale,
+        authoritativeResultChecksum: payload.authoritativeResultChecksum,
+        comparisonResultChecksum: run.comparisonResultChecksum,
         criticalFindings
       };
       const reportId = reportInput.reportId
