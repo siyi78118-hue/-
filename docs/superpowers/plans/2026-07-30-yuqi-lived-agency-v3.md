@@ -8929,16 +8929,63 @@ change journal mode, or create production release/shadow rows. Before and after
 the read it verifies the main database plus non-empty WAL/rollback-journal
 content; process-local SHM lock bytes are excluded from source identity.
 
-Only closed, canonical `DIRECT_REPLY` authority lineages are eligible. The
-read-only validator covers the complete v13/v14/v15 closure: lineage/root/retry
-and revision, canonical turn/envelope and message identity/checksums,
-current-user batch/items, visible group/items/actions, manifest/receipt,
-release pins, interaction lane/cursor, redaction state, and v15 clear-control
-schema. It validates the root attempt, retry chain/cycle closure, latest member,
-role/device/source ownership and all persisted checksums. It aggregates windows
-of 2–6 complete persisted exchanges (4–12 ordered turns) from persisted user batches/messages and committed
-visible result items/actions on the same role and lane; it never reads
-`reply_json`, annotation snapshots, or guesses structure from keywords.
+The extractor has two explicit and disjoint source-authority modes. The default
+`canonical_ra1` mode accepts only closed canonical `DIRECT_REPLY` authority
+lineages. Its read-only validator covers the complete v13/v14/v15 closure:
+lineage/root/retry and revision, canonical turn/envelope and message
+identity/checksums, current-user batch/items, visible group/items/actions,
+manifest/receipt, release pins, interaction lane/cursor, redaction state, and
+v15 clear-control schema. It validates the root attempt, retry chain/cycle
+closure, latest member, role/device/source ownership and all persisted
+checksums. It aggregates windows of 2–6 complete persisted exchanges (4–12
+ordered turns) from persisted user batches/messages and committed visible
+result items/actions on the same role and lane; it never reads `reply_json`,
+annotation snapshots, or guesses structure from keywords.
+
+An explicit `--source-authority legacy_ra0_confirmed` mode may supply only
+private, human-expression quality scenes when no historical RA1 snapshot
+exists. It is not canonical authority evidence and can never satisfy protocol,
+state/action authority, live-shadow, canary, rollout or promotion gates. The
+manifest and every candidate carry the closed provenance
+`{sourceAuthority:'legacy_ra0_confirmed',qualityOnly:true,authorityEvidenceEligible:false,promotionEvidenceEligible:false}`.
+The branch accepts only protocol v1/v2, `result_authority_version=0`,
+`DIRECT_REPLY`, committed, non-redacted turns and derives the lane only as
+`private_chat`. It additionally requires all of the following:
+
+1. canonical envelope JSON rehashes to `envelope_checksum` and the persisted
+   `source_message_id` identifies exactly one unsuppressed user message owned by
+   the same turn/role/device with native time/sequence and a recomputed message
+   checksum; one source message cannot back two accepted turns;
+2. exactly one non-empty character message belongs to the turn and its
+   identity, recipient, timestamp and checksum close; multiple legacy outputs
+   are rejected because RA0 has no item ordinal authority;
+3. exactly one null-group legacy delivery belongs to the turn/device, is
+   `confirmed`, has canonical payload/checksum matching that character message,
+   uses native safe timestamps, and has `confirmed_at >= delivered_at`;
+   mailboxed, missing, duplicated, foreign, time-reversed or malformed delivery
+   rows are rejected;
+4. a persisted current-user batch, when present, closes its header, ordered
+   items, identities and checksums. Missing batch authority is never rebuilt
+   from the envelope; that row terminates rather than bridges a window;
+5. accepted rows are grouped only by the same role and derived private lane,
+   in monotonic persisted time, into non-overlapping 2–6 exchange windows. Any
+   invalid or ambiguous row ends the current window, and fewer than 30 complete
+   windows fails closed.
+
+The legacy branch may preserve user-visible semantic text only in the ignored
+private candidate files needed for independent labeling. It exposes no raw IDs,
+delivery tokens, paths or transport metadata in public reports and may not
+invent actions, relationship state, batch structure, retries, release pins or
+authority revisions that RA0 did not persist.
+
+`tests/yuqi-real-history-extractor.test.mjs` first records red fixtures for this
+branch and then retains them permanently: one valid multi-exchange confirmed
+window; missing/mailboxed/duplicate/foreign/time-reversed delivery; payload or
+message checksum drift; wrong source-message owner; reused source message;
+multiple character outputs; missing or corrupt persisted batch; a broken row
+that terminates rather than bridges a window; fewer than 30 windows; source
+mutation/WAL mutation; and any attempt to mark legacy candidates as authority,
+shadow, canary or promotion evidence. No fixture may use real private text.
 
 The first stage emits only private candidate JSONL. Every candidate is a closed
 `{windowId,sourceWindowChecksum,role,lane,timeBounds,turns,persistedContextProjection}`
@@ -8950,8 +8997,11 @@ candidate window/checksum and annotator version, and may not contain or replace
 turns/actions. Without labels no final scenes are generated. With labels, the
 extractor requires exactly 30 unique windows and complete coverage of all nine
 structures, then writes the closed final scenes. Missing/stale/duplicate/unknown
-labels fail closed. A migration clone is validation-only and cannot invent
-legacy authority or serve as a 30-scene source.
+labels fail closed. A migration clone never invents authority. It may serve as
+the read-only source for `legacy_ra0_confirmed` quality-only candidates only
+when its migration report proves the original database bytes were unchanged
+and the extractor verifies the clone as v15; those candidates retain the
+non-authority provenance above.
 
 Output is a closed Task 22 scene projection: unknown fields, speakers,
 structures, nested state, attachments, actions, or severity values fail the
@@ -8975,6 +9025,8 @@ Run:
 node scripts/compile-yuqi-lived-quality-scenes.mjs --check
 node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v15-authority-snapshot> --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
 node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v15-authority-snapshot> --labels <absolute-private-history-labels.jsonl> --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
+node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v15-migration-clone> --source-authority legacy_ra0_confirmed --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
+node scripts/extract-yuqi-real-history-scenes.mjs --database <absolute-v15-migration-clone> --source-authority legacy_ra0_confirmed --labels <absolute-private-history-labels.jsonl> --limit 30 --out artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl --manifest artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json
 node --test tests/yuqi-lived-quality-contract.test.mjs tests/yuqi-real-history-extractor.test.mjs yuqi-runtime/test/replay-runner.test.mjs
 npm run cognition:replay
 npm run cognition:replay-report
