@@ -247,12 +247,20 @@ git commit -m "feat: persist restart-safe Yuqi quality calls"
 - Modify: `scripts/run-yuqi-lived-quality-replay.mjs`
 - Test: `yuqi-runtime/test/quality-evaluator.test.mjs`
 - Test: `yuqi-runtime/test/quality-replay.test.mjs`
+- Modify: `yuqi-runtime/src/quality-replay-production-bridge.mjs`
+- Test: `yuqi-runtime/test/quality-replay-production-bridge.test.mjs`
+- Modify: `yuqi-runtime/src/quality-replay-ledger.mjs`
+- Test: `yuqi-runtime/test/quality-replay-ledger.test.mjs`
+- Modify: `yuqi-runtime/src/runtime-composition.mjs`
+- Test: `yuqi-runtime/test/runtime-composition.test.mjs`
 
-**Produces:** `finalizeBlindJudgments(primary, secondary)` and ledger-driven `runQualityReplayPlan()`.
+**Produces:** `finalizeBlindJudgments(primary, secondary)`, ledger-driven `runQualityReplayPlan()`, module-branded phase-client slots, and a single-side production execution API.
+
+The four-file JSON-ledger implementation attempted before this amendment is not acceptable evidence. Task 5 uses the Task 4 SQLite ledger as its sole state authority and the Task 3 branded stores/runtimes as its sole execution authority. Do not preserve or add a second JSON phase/final state machine.
 
 - [ ] **Step 1: Write judgment-closure red tests**
 
-Reject release-side preference labels. Persist both complete judgments. Mark manual review for any score, preference, unresolved, or normalized-finding difference. Add turn/life A/B permutation tests proving release identity and phase order are absent.
+Reject release-side preference labels and native-type coercions. Persist both complete normalized judgments with evaluator identity/version and input/output checksums. Mark manual review for any score, preference, unresolved, or normalized-finding difference. Add turn/life A/B permutation tests proving release identity, phase order, side, model, session, prompt, and attestation are absent. LIFE uses the closed `life_plan` output/rubric and never the turn comparison path.
 
 - [ ] **Step 2: Write CLI/run-identity red tests**
 
@@ -262,17 +270,43 @@ Implement and test:
 - first-run generated UUID `runId` printed and persisted;
 - `--resume-run <runId>` required for continuation;
 - `--only-final-key <finalKey>` selects exactly one member of the full bound plan;
-- missing, duplicate, changed-plan, changed-source, changed-release, and changed-attestation resumes reject;
+- missing, duplicate, unknown, or valueless options reject; production `--max-items` is forbidden;
+- missing, duplicate, changed-plan, changed-source, changed-release, changed-attestation, changed-artifact, and finalized/blocked run resumes reject as applicable;
 - removing the selector resumes all remaining finals in the same run.
+
+The immutable SQLite header has exact native keys `{version,runId,finalKeys,planChecksum,sourceHead,stableRelease,candidateRelease,attestation,attestationChecksum,artifactPaths,createdAt}`. `version` is the exact supported integer, `runId` is a UUID string, `finalKeys` is the ordered 246-key unique array, checksums are lowercase SHA-256 strings, and `createdAt` is a non-negative safe integer.
+
+Each release snapshot has exact keys `{releaseId,pipelineVersion,presetVersion,cognitionSchemaVersion,expressionSchemaVersion,evaluatorVersion,modelProfile,componentManifest,releaseChecksum,createdAt,retiredAt}` with the same native types as the persisted release row. The ledger re-reads the exact row, validates its registry/manifest checksum, and requires canonical byte equality with the header.
+
+`attestation` has exact keys `{version,sourceHead,stableRuntime,candidateRuntime,evaluatorPrimary,evaluatorSecondary}`. Each runtime entry is the exact closed value returned by `assertProductionRuntimeAttestation()`. Each evaluator entry has exact keys `{evaluatorId,evaluatorVersion,modelProfileChecksum,clientConfigChecksum,sessionNamespaceChecksum}`; evaluator identities and namespace checksums must differ. `attestationChecksum === contentHash(attestation)` is recomputed on every open. `artifactPaths` has exact keys `{plan,ledger,raw}`; values are distinct project-root-relative forward-slash paths with no drive, leading slash, backslash, empty segment, `.` or `..`, and their resolved locations must stay under the fixed ignored private artifact root. The database header checksum is canonical `contentHash(header)` and every nested checksum is rederived, never trusted from a caller.
+
+A pilot selector never changes that header. Header drift rejects before temporary runtime or model-client creation.
 
 - [ ] **Step 3: Write phase-resume red tests**
 
-Interrupt after each of the four phases and inside variable nested model-call sequences. Restart with the same ledger and prove completed phases/subcalls do not increase remote-call counters. `uncertain` blocks the final and the whole run.
+Interrupt in `prepared`, `starting`, and `running`, immediately before and after the awaited `onTurnStarted`, and immediately before and after call/phase completion. Restart with the same SQLite ledger and prove completed phases/subcalls do not increase app-server counters. A persisted `starting`/`running` call accepts only the one exact completed new remote turn; zero, active, multiple, changed-input, changed-client-ID, or conflicting candidates become `uncertain`. `uncertain` is never auto-reissued and atomically blocks the final and whole run.
+
+Add an additive Task 3 interface:
+
+```js
+executeQualitySubjectSide(context, subject, {
+  side: 'stable' | 'candidate',
+  phaseClientSlot
+})
+```
+
+`prepareQualitySubject()` still creates the common seed and independent byte clones, but stable and candidate execution are separate phase calls. The runner must never call combined `executeQualitySubject()` as production evidence. Each runtime is composed initially with its own module-branded, unbound phase-client slot supplied through the existing runtime factory boundary. After the matching ledger phase reaches `running`, the slot binds exactly once to `LedgerBackedModelClient.forPhase()`. Before binding, after conflicting rebinding, or when shared across side/final/phase it rejects. The runtime's store, release, authority snapshot, source head, adapter registry, release executor, client identity, and attestation are revalidated immediately before and after the selected side executes. No public runtime/client field is mutated.
+
+The exact construction order is: create two distinct module-private unbound slots before `prepareQualitySubject()`; pass the matching slot as an immutable input to `composeYuqiExecutionRuntime()`; store its identity only in module-private runtime metadata/WeakMap; build and freeze the runtime; atomically advance the SQLite phase to `running`; bind that one slot to the exact `(runId,finalKey,side phase,inputChecksum)`; execute once. `runtime-composition.mjs` exposes a narrow identity assertion for the bridge, not the slot or mutable setter. Bind-before-running, run-before-bind, duplicate/conflicting bind, and cross-side/final/phase reuse reject.
+
+The production CLI cannot accept caller `stableRuntime`, `candidateRuntime`, `runtimeFactory`, `runtimeInput`, store, executor, or slot objects. Only the later module-branded `createQualityReplayExecutionConfig()` may supply the fixed composition factory and four clients. Tests use a separate explicitly test-only factory that is always `evidenceEligible:false` and cannot satisfy a production run header/attestation.
+
+Task 4's ledger client gains a module-private branded phase slot and preserves the exact production `deadlineMs`/`outerDeadlineMs` to `turnTimeoutMs` calculation in `runRole()`. `forPhase()` is executable only for a persisted `running` phase; nested calls keep deterministic ordinals starting at zero per phase and never call an underlying `runRole()` bypass.
 
 - [ ] **Step 4: Verify red**
 
 ```powershell
-node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs
+node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs
 ```
 
 - [ ] **Step 5: Implement sequential persisted phases**
@@ -283,11 +317,32 @@ stable_execution -> candidate_execution -> evaluator_primary -> evaluator_second
 
 Each phase uses its own `LedgerBackedModelClient`. Export artifacts only from ledger rows; never append partial duplicate records.
 
+For every selected final:
+
+1. compile and prepare the exact frozen subject;
+2. derive phase identity from the closed subject checksum and prepared authority input checksum;
+3. `preparePhase()` and reuse an exact `succeeded` output locally, otherwise atomically advance `prepared -> starting -> running`;
+4. bind the matching phase slot/client and execute only that phase;
+5. persist the complete phase output before any later phase starts;
+6. stop after failure and block after uncertainty;
+7. after both evaluator phases, call `finalizeBlindJudgments()` and persist one closed final object containing the two complete judgment records, their checksums, differences, manual-review/unresolved state, and stable/candidate/blind-input authority checksums.
+
+`quality_finals.value_json` has exact keys `{version,finalKey,subjectType,subjectChecksum,stablePhase,candidatePhase,blindInputChecksum,primary,secondary,comparison}`. `subjectType` is exactly `turn|life_planning`; each execution phase has exact `{inputChecksum,outputChecksum}`. Each judgment record has exact `{evaluatorId,evaluatorVersion,inputChecksum,output,outputChecksum}`. `output` is the exact normalized blind object `{version,scores,preference,findings,unresolved}`: scores have every fixed dimension exactly once with native integers 1..5; preference is exactly `A|B|tie|unresolved`; unresolved is a native boolean; each finding is exact `{code,severity,owner,summary,critical}` with the existing native closed enums/types. Judgment metadata and evaluator input/output may not contain release, side, phase, model, session, prompt, client, thread, or attestation fields.
+
+`comparison` has exact keys `{version,differences,manualReview,unresolved,agreedCriticalFindings}`. Differences are unique, canonical-order members of `scores|preference|unresolved|findings`; `manualReview` equals whether a difference exists or either judgment is unresolved; `unresolved` is the boolean OR of the judgments; agreed critical findings are the canonical intersection of identical normalized critical findings. Every `inputChecksum`, `outputChecksum`, phase checksum, blind-input checksum, difference, and intersection is rederived from persisted phase outputs. Missing/unknown keys, native-type coercion, missing secondary judgment, release-side labels, and raw or self-consistent checksum mutation reject in `finalize()` and on reopen. An evaluator `unresolved` result is preserved as a finalized manual-review record; only ledger/model-call `uncertain` blocks finalization and the run. A finalized final is read only from SQLite and never reconstructed from caller JSON.
+
+Phase/client mapping is fixed: `stable_execution` uses only the stable runtime/slot; `candidate_execution` uses only the candidate runtime/slot; `evaluator_primary` and `evaluator_secondary` use two other independent ledger-backed evaluator clients, session namespaces, and threads and never a release runtime. Turn evaluator input uses only the closed `turn_output` union. LIFE evaluator input uses only `life_plan`, the planning window, LIFE rubric, and closed transcript summary; it excludes episode IDs, release/side/phase/model/session/prompt/attestation and never enters turn comparison/action logic.
+
+A `failed` phase is terminal for that run and is never implicitly reissued by `--resume-run`; later phases for that final do not start. Continuing it requires an explicitly new `runId` after the underlying cause is fixed. An `uncertain` call/phase additionally changes the current run to blocked. Exact succeeded phases replay locally.
+
 - [ ] **Step 6: Run and commit**
 
 ```powershell
-node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs
-git add yuqi-runtime/src/quality-evaluator.mjs scripts/run-yuqi-lived-quality-replay.mjs yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs
+node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/test/codex-client.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/test/runtime-composition.test.mjs
+node --check yuqi-runtime/src/quality-evaluator.mjs
+node --check scripts/run-yuqi-lived-quality-replay.mjs
+git diff --check
+git add yuqi-runtime/src/quality-evaluator.mjs scripts/run-yuqi-lived-quality-replay.mjs yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/src/quality-replay-production-bridge.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/src/quality-replay-ledger.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/src/runtime-composition.mjs yuqi-runtime/test/runtime-composition.test.mjs
 git commit -m "feat: resume complete Yuqi blind quality evidence"
 ```
 

@@ -110,6 +110,10 @@ Each final has four independent high-level phases:
 3. evaluator A;
 4. evaluator B.
 
+The stable and candidate executions are not one combined function call. `prepareQualitySubject()` may prepare both isolated stores and immutable execution inputs, but the evidence runner executes them through two single-side calls. Before preparation it creates two distinct module-branded, initially unbound ledger phase-client slots. Each slot is an immutable input to `composeYuqiExecutionRuntime()` and is retained only in module-private runtime metadata. After the corresponding SQLite phase is atomically `running`, the slot binds exactly once to that phase's `LedgerBackedModelClient`; before binding it fails closed. Bind-before-running, repeated/conflicting binding, and cross-side/final/phase reuse reject. The runner never mutates an already composed runtime's public `codex` or `cognitivePipeline.codexClient` field.
+
+This additive phase interface preserves the existing production runtime brand. The isolated store, release row, source head, authority snapshot, release executor, adapter registry, runtime object, model client, and session namespace are all revalidated before the one selected side executes. The legacy combined helper remains test compatibility only and is forbidden as production evidence.
+
 ### 5. Unforgeable production adapter attestation
 
 An object that merely implements `executeTurn()` is not evidence. `runtime-composition.mjs` owns a module-private `WeakSet` brand. Only an object created by `composeYuqiExecutionRuntime()` can pass `assertProductionRuntimeAttestation(runtime)`.
@@ -140,7 +144,11 @@ The ledger contains:
 - `prepared`, `starting`, `running`, `succeeded`, `failed`, or `uncertain` state;
 - one finalized row after all phases and deterministic judgment comparison complete.
 
+The immutable run header stores the complete ordered 246-key plan identity, the exact full stable and candidate release snapshots/manifests, the full closed stable/candidate runtime and primary/secondary evaluator attestations plus their recomputed checksum, source head, and canonical project-root-relative private artifact paths. Header and nested objects use exact keys/native types; current release rows and registry manifests are re-read and compared canonically on every open. A one-item pilot changes only the selected work for that invocation; it never changes the run header. Reopening with a changed plan, source, release, attestation, or artifact identity fails before runtime or model-client construction.
+
 `LedgerBackedModelClient` wraps both `runTurn()` and `runRole()`, resets a deterministic ordinal counter at phase entry, and replays completed nested memory, brain, supervisor, cognition, expression, repair, capacity-fallback, and evaluator calls.
+
+`forPhase()` is executable only after the matching persisted phase is `running`. `runRole()` preserves the production `deadlineMs`/`outerDeadlineMs` calculation when it maps to `runTurn()`; the ledger wrapper must not silently change timeout behavior. A module-private brand protects the unbound/bound phase slot so a plain object cannot be inserted into an attested runtime.
 
 Before `turn/start`, the wrapper persists the role thread ID, a `thread/read(includeTurns=true)` baseline, exact request checksum, deterministic call ID, and `starting` state. After `turn/start` returns, the client invokes an awaited `onTurnStarted` hook so the ledger persists the remote turn ID before waiting for completion.
 
@@ -151,11 +159,13 @@ On restart:
 - zero, multiple, active, conflicting, or unprovable candidates become `uncertain`;
 - `uncertain` is never automatically reissued.
 
+The runner itself never maintains a second JSON state machine. SQLite `quality_runs`, `quality_phases`, `quality_model_calls`, and `quality_finals` are the only resume authority. Phase outputs and exported evidence are read back from those rows. A failed phase is terminal for that run, is never implicitly reissued, and stops later phases for that final; an uncertain call or phase atomically blocks the whole run. An evaluator's valid `unresolved` judgment is different: it is finalized as a manual-review record so the evidence is preserved.
+
 The deterministic IDs are provenance, not a claim of provider billing idempotency. The system promises no automatic duplicate paid call after uncertainty; it does not promise that a process crash can make the remote platform exactly-once.
 
 ### 7. Blind evaluation
 
-Both evaluators receive only a deterministic A/B projection and return a closed object. The input includes `subjectType` and the corresponding closed output union (`turn_output` or `life_plan`). Release IDs/checksums, side names, prompts, model identities, execution order, and attestation data are excluded.
+Both evaluators receive only a deterministic A/B projection and return a closed object. The input includes `subjectType` and the corresponding closed output union (`turn_output` or `life_plan`). Turn outputs contain only disposition plus anonymized ordered reply/action projections. LIFE outputs contain only the planning window, LIFE rubric, transcript summary, and anonymized ordered episodes; they never enter turn comparison or action logic. Release IDs/checksums, side names, phase names, prompts, model/client/session/thread identities, execution order, and attestation data are excluded.
 
 Formal preference values are `A`, `B`, `tie`, or `unresolved`; release-side labels are rejected. The raw artifact retains both complete judgments, evaluator identity/version, input/output checksums, and latency. Any difference in a score, preference, unresolved flag, or normalized finding marks the final for manual review. Critical findings count only after independent agreement; disagreement itself is preserved as a blocking finding.
 
