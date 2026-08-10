@@ -23,19 +23,24 @@ import com.siyi.al.execution.api.UrlConnectionTransport;
 import java.util.Collections;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONObject;
 
 public final class AlExecutionService extends Service {
     private static final long WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L;
+    private static volatile CountDownLatch testStopLatch = new CountDownLatch(0);
     enum StartupState { NEW, INITIALIZING, READY, STOPPING, STOPPED }
     private final ExecutionDrainGate drainGate = new ExecutionDrainGate();
     private final Object startupLock = new Object();
+    private CountDownLatch stopLatch;
     private volatile StartupState startupState = StartupState.NEW;
     private volatile boolean initializationScheduled;
     private volatile boolean startRequested;
+    private final AtomicBoolean cleanupClaimed = new AtomicBoolean(false);
     private int recoveryCallbacksInFlight;
     private ExecutorService executor;
     private ScheduledExecutorService recoveryScheduler;
@@ -62,6 +67,8 @@ public final class AlExecutionService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        stopLatch = new CountDownLatch(1);
+        testStopLatch = stopLatch;
         notifications = new AlNotificationFactory(this);
         notifications.ensureChannels();
         startForeground(AlNotificationFactory.GUARD_NOTIFICATION_ID, notifications.guardNotification());
@@ -254,10 +261,10 @@ public final class AlExecutionService extends Service {
                 worker.shutdown();
             } catch (RejectedExecutionException rejected) {
                 worker.shutdownNow();
-                // The executor was already externally shut down.  There is no
-                // worker left that can own cleanup, so perform the emergency
-                // fallback rather than leaving a live wakelock forever.
-                cleanupOnWorker();
+                // Never clean resources on this caller while the rejected
+                // worker may still be running. A fallback worker waits for
+                // termination and becomes the sole cleanup owner.
+                deferCleanupAfterRejectedWorker(worker, this::cleanupOnWorker);
             }
         }
         super.onDestroy();
@@ -265,6 +272,37 @@ public final class AlExecutionService extends Service {
 
     static boolean shouldIgnoreDestroy(StartupState state) {
         return state == StartupState.STOPPING || state == StartupState.STOPPED;
+    }
+
+    /** Package-private race seam used by the JVM regression test. */
+    static void deferCleanupAfterRejectedWorker(ExecutorService rejectedWorker, Runnable cleanup) {
+        if (rejectedWorker == null || cleanup == null) {
+            throw new IllegalArgumentException("cleanup worker required");
+        }
+        ExecutorService waiter = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "al-execution-cleanup-waiter");
+            thread.setDaemon(true);
+            return thread;
+        });
+        waiter.execute(() -> {
+            boolean interrupted = false;
+            try {
+                for (;;) {
+                    try {
+                        if (rejectedWorker.awaitTermination(100L, TimeUnit.MILLISECONDS)) break;
+                    } catch (InterruptedException interruption) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                try {
+                    cleanup.run();
+                } finally {
+                    waiter.shutdown();
+                    if (interrupted) Thread.currentThread().interrupt();
+                }
+            }
+        });
     }
 
     @Nullable
@@ -432,8 +470,10 @@ public final class AlExecutionService extends Service {
     }
 
     private void cleanupOnWorker() {
+        if (!cleanupClaimed.compareAndSet(false, true)) return;
         ScheduledExecutorService scheduler;
         PowerManager.WakeLock publishedWakeLock;
+        CountDownLatch completedLatch;
         synchronized (startupLock) {
             scheduler = recoveryScheduler;
             recoveryScheduler = null;
@@ -450,8 +490,15 @@ public final class AlExecutionService extends Service {
             initializationScheduled = false;
             startRequested = false;
             startupState = StartupState.STOPPED;
+            completedLatch = stopLatch;
         }
         releaseWakeLock(publishedWakeLock);
+        if (completedLatch != null) completedLatch.countDown();
+    }
+
+    /** Test-only observation of worker-owned terminal cleanup; not a control path. */
+    static boolean awaitStoppedForTest(long timeoutMs) throws InterruptedException {
+        return testStopLatch.await(timeoutMs, TimeUnit.MILLISECONDS);
     }
 
     private boolean beginRecoveryCallback() {

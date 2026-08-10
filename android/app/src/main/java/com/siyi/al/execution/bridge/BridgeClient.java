@@ -1,6 +1,7 @@
 package com.siyi.al.execution.bridge;
 
 import android.util.Base64;
+import androidx.annotation.VisibleForTesting;
 import com.siyi.al.execution.AuthorityIdentity;
 import com.siyi.al.execution.AndroidRoomBackupHead;
 import com.siyi.al.execution.BridgeAuthority;
@@ -23,6 +24,8 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.UUID;
@@ -47,7 +50,14 @@ public final class BridgeClient {
         ) throws Exception { return false; }
     }
 
-    interface Transport {
+    /**
+     * Test-only transport injection.  The public bytecode visibility is retained
+     * solely because the connected harness lives in the parent execution
+     * package; @VisibleForTesting marks it as non-production API and production
+     * callers continue to use the configured HTTP transport.
+     */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    public interface Transport {
         HttpResult request(String method, String target, String body, String[][] headers) throws Exception;
     }
 
@@ -63,10 +73,11 @@ public final class BridgeClient {
     interface Clock { long now(); }
     interface Sleeper { void sleep(long millis) throws Exception; }
 
-    static final class HttpResult {
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    public static final class HttpResult {
         final int status;
         final String body;
-        HttpResult(int status, String body) { this.status = status; this.body = body; }
+        public HttpResult(int status, String body) { this.status = status; this.body = body; }
     }
 
     private static final SecureRandom RANDOM = new SecureRandom();
@@ -78,6 +89,9 @@ public final class BridgeClient {
         "protocolVersion", "type", "peerId", "turnId", "authorityLineageKey",
         "visibleGroupId", "commitChecksum", "terminalDisposition", "deliveredAt",
         "_checkpointChecksum", "_deliveryRoute", "_relayMessageId"));
+    private static final Set<String> CLOUD_POLL_ENVELOPE_KEYS = new HashSet<>(Arrays.asList(
+        "messageId", "deviceId", "direction", "ciphertext", "nonce", "idempotencyKey",
+        "byteCount", "createdAt", "expiresAt"));
     private static final Set<String> LIFECYCLE_ACCEPTED_RESPONSE_KEYS = new HashSet<>(Arrays.asList(
         "ok", "messageId", "expiresAt", "idempotent"));
     private static final Set<String> LIFECYCLE_ENQUEUE_RESPONSE_KEYS = new HashSet<>(Arrays.asList(
@@ -109,6 +123,18 @@ public final class BridgeClient {
         CloudInboxConsumer inboxConsumer
     ) {
         this(config, journal, null, System::currentTimeMillis, Thread::sleep, statusListener, inboxConsumer);
+    }
+
+    /** Narrow test ingress factory; it keeps the production decoder/consumer path intact. */
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    public static BridgeClient forTestingTransport(
+        BridgeConfig config, FallbackJournal journal, Transport transport,
+        CloudInboxConsumer inboxConsumer
+    ) {
+        if (transport == null) throw new IllegalArgumentException("transport required");
+        return new BridgeClient(
+            config, journal, transport, System::currentTimeMillis, Thread::sleep,
+            null, inboxConsumer);
     }
 
     BridgeClient(
@@ -414,10 +440,97 @@ public final class BridgeClient {
         requireSuccess(polled, "cloud poll");
         JSONArray messages = new JSONObject(polled.body).optJSONArray("messages");
         if (messages == null) return 0;
-        return processCloudInboxBatch(messages, item -> {
+        JSONArray normalized = normalizeCloudPollBatch(messages, config.deviceId, clock.now());
+        return processCloudInboxBatch(normalized, item -> {
             String plaintext = decrypt(item.optString("ciphertext"), item.optString("nonce"));
             return new JSONObject(plaintext);
         });
+    }
+
+    /**
+     * Validates and de-duplicates the complete cloud poll envelope before any
+     * ciphertext is decrypted or inbox consumer is invoked.  A repeated relay
+     * id is accepted only when all nine persisted outer fields are identical;
+     * any self-consistent mutation poisons the whole batch.
+     */
+    static JSONArray normalizeCloudPollBatch(
+        JSONArray messages, String expectedDeviceId, long now
+    ) throws Exception {
+        if (messages == null || expectedDeviceId == null || expectedDeviceId.trim().isEmpty()) {
+            throw new IllegalArgumentException("cloud poll envelope conflict");
+        }
+        Map<String, JSONObject> unique = new LinkedHashMap<>();
+        for (int index = 0; index < messages.length(); index += 1) {
+            JSONObject item = messages.optJSONObject(index);
+            if (item == null || !CLOUD_POLL_ENVELOPE_KEYS.equals(keysOf(item))) {
+                throw new IllegalArgumentException("cloud poll envelope conflict");
+            }
+            String messageId = requireWorkerId(item, "messageId");
+            String deviceId = requireWorkerId(item, "deviceId");
+            String direction = requireNativeNonEmptyString(item, "direction");
+            requireNativeNonEmptyString(item, "ciphertext");
+            String nonce = requireNativeNonEmptyString(item, "nonce");
+            requireWorkerId(item, "idempotencyKey");
+            if (!expectedDeviceId.equals(deviceId) || !"pc_to_phone".equals(direction)) {
+                throw new IllegalArgumentException("cloud poll envelope authority conflict");
+            }
+            Object byteCountValue = item.opt("byteCount");
+            Object createdAtValue = item.opt("createdAt");
+            Object expiresAtValue = item.opt("expiresAt");
+            if (!isSafeInteger(byteCountValue) || !isSafeInteger(createdAtValue)
+                || !isSafeInteger(expiresAtValue)) {
+                throw new IllegalArgumentException("cloud poll envelope integer conflict");
+            }
+            long byteCount = ((Number) byteCountValue).longValue();
+            long createdAt = ((Number) createdAtValue).longValue();
+            long expiresAt = ((Number) expiresAtValue).longValue();
+            if (byteCount < 1L || byteCount > 512L * 1024L
+                || createdAt <= 0L || expiresAt <= createdAt) {
+                throw new IllegalArgumentException("cloud poll envelope time conflict");
+            }
+            if (base64DecodedLength(nonce) != 12
+                || base64DecodedLength(item.getString("ciphertext")) != byteCount) {
+                throw new IllegalArgumentException("cloud poll envelope bytes conflict");
+            }
+            JSONObject prior = unique.get(messageId);
+            if (prior == null) {
+                unique.put(messageId, item);
+            } else if (!BridgeAuthority.canonicalJson(prior)
+                .equals(BridgeAuthority.canonicalJson(item))) {
+                throw new IllegalArgumentException("cloud poll duplicate relay conflict");
+            }
+        }
+        JSONArray normalized = new JSONArray();
+        for (JSONObject item : unique.values()) normalized.put(item);
+        return normalized;
+    }
+
+    private static String requireWorkerId(JSONObject value, String key) {
+        Object raw = value == null ? null : value.opt(key);
+        if (!(raw instanceof String)
+            || !((String) raw).matches("[A-Za-z0-9_-]{6,128}")) {
+            throw new IllegalArgumentException("cloud poll envelope identity conflict");
+        }
+        return (String) raw;
+    }
+
+    private static int base64DecodedLength(String value) {
+        if (value == null || value.isEmpty() || (value.length() % 4) != 0
+            || !value.matches("[A-Za-z0-9+/]*={0,2}")
+            || (value.indexOf('=') >= 0 && value.indexOf('=') < value.length() - 2
+                && value.charAt(value.length() - 2) != '=')) {
+            return -1;
+        }
+        int padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0;
+        return (value.length() / 4) * 3 - padding;
+    }
+
+    private static boolean isSafeInteger(Object value) {
+        if (!(value instanceof Number) || value instanceof Float || value instanceof Double) return false;
+        long integer = ((Number) value).longValue();
+        return integer >= 0L && integer <= 9007199254740991L
+            && !(value instanceof java.math.BigDecimal
+                && ((java.math.BigDecimal) value).scale() > 0);
     }
 
     int processCloudInboxBatch(JSONArray messages, CloudInboxDecoder decoder) throws Exception {

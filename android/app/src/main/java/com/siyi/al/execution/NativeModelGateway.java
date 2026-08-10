@@ -55,6 +55,22 @@ public final class NativeModelGateway implements TurnBridgeGateway {
         return current.execute(submission);
     }
 
+    @Override
+    public BridgeResult executeBridgeTurnPinned(
+        TurnSubmission submission, String expectedDeviceId
+    ) throws Exception {
+        // Resolve the provider once for this network crossing.  The identity
+        // captured during checkpoint preparation must match the router that
+        // actually sends the request; a config/provider swap therefore fails
+        // closed before any route client is invoked.
+        BridgeRouter current = currentBridgeRouter();
+        if (current == null || !current.isEnabled()
+            || expectedDeviceId == null || !expectedDeviceId.equals(current.deviceId())) {
+            throw new IllegalStateException("BRIDGE_AUTHORITY_CONFLICT: bridge device changed");
+        }
+        return current.execute(submission);
+    }
+
     public BridgeResult executeFallback(TurnSubmission submission) throws Exception {
         JSONObject snapshot = new JSONObject(submission.snapshotJson);
         FallbackCognitionPacketCodec.FallbackContext packet =

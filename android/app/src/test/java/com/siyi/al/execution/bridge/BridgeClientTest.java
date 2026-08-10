@@ -313,6 +313,53 @@ public class BridgeClientTest {
         assertEquals("ack", transport.targets.get(0).endsWith("/bridge/ack") ? "ack" : "wrong");
     }
 
+    @Test public void cloudPollWorkerEnvelopeUsesNineFieldClosedDomainAndFreshBounds() throws Exception {
+        long now = 1784400000000L;
+        JSONObject valid = new JSONObject()
+            .put("messageId", "relay_123456")
+            .put("deviceId", "device_123456")
+            .put("direction", "pc_to_phone")
+            .put("ciphertext", "AAAAAAAAAAAAAAAAAAAAAA==")
+            .put("nonce", "AAAAAAAAAAAAAAAA")
+            .put("idempotencyKey", "idem_123456")
+            .put("byteCount", 16L)
+            .put("createdAt", now - 1L)
+            .put("expiresAt", now + 1_000L);
+        assertEquals(1, BridgeClient.normalizeCloudPollBatch(
+            new JSONArray().put(valid), "device_123456", now).length());
+
+        for (JSONObject invalid : new JSONObject[] {
+            new JSONObject(valid.toString()).put("messageId", "short"),
+            new JSONObject(valid.toString()).put("deviceId", "foreign"),
+            new JSONObject(valid.toString()).put("idempotencyKey", "bad"),
+            new JSONObject(valid.toString()).put("byteCount", 0L),
+            new JSONObject(valid.toString()).put("expiresAt", now - 1L),
+            new JSONObject(valid.toString()).put("unknown", true)
+        }) {
+            assertThrows(IllegalArgumentException.class, () -> BridgeClient.normalizeCloudPollBatch(
+                new JSONArray().put(invalid), "device_123456", now));
+        }
+    }
+
+    @Test public void cloudPollDuplicateOuterFieldsMustMatchBeforeAnyDecode() throws Exception {
+        JSONObject valid = new JSONObject()
+            .put("messageId", "relay_123456")
+            .put("deviceId", "device_123456")
+            .put("direction", "pc_to_phone")
+            .put("ciphertext", "AAAAAAAAAAAAAAAAAAAAAA==")
+            .put("nonce", "AAAAAAAAAAAAAAAA")
+            .put("idempotencyKey", "idem_123456")
+            .put("byteCount", 16L)
+            .put("createdAt", 1784399999999L)
+            .put("expiresAt", 1784400001000L);
+        assertEquals(1, BridgeClient.normalizeCloudPollBatch(
+            new JSONArray().put(valid).put(new JSONObject(valid.toString())),
+            "device_123456", 1784400000000L).length());
+        assertThrows(IllegalArgumentException.class, () -> BridgeClient.normalizeCloudPollBatch(
+            new JSONArray().put(valid).put(new JSONObject(valid.toString()).put("expiresAt", 1784400001001L)),
+            "device_123456", 1784400000000L));
+    }
+
     @Test public void ackExclusiveControlChecksumRoutesChangedTypeToLifecycleConsumer() throws Exception {
         FakeTransport transport = new FakeTransport();
         transport.responses.add(new BridgeClient.HttpResult(200, "{}"));

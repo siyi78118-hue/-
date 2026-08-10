@@ -9,17 +9,103 @@ import com.siyi.al.execution.api.ReplyParser;
 import com.siyi.al.execution.bridge.BridgeResult;
 import com.siyi.al.execution.bridge.BridgeTurnStatus;
 import com.siyi.al.execution.bridge.BridgeAcceptedException;
+import com.siyi.al.execution.bridge.BridgeConfig;
+import com.siyi.al.execution.bridge.BridgeMode;
+import com.siyi.al.execution.bridge.BridgeRouter;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ExecutionAttemptEntity;
 import com.siyi.al.execution.db.ReplyPartEntity;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
 
 public class ExecutionEngineTest {
+    @Test
+    public void rejectedWorkerCleanupWaitsForTerminationAndRunsOnce() throws Exception {
+        ExecutorService worker = Executors.newSingleThreadExecutor();
+        CountDownLatch running = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger cleanupCalls = new AtomicInteger();
+        try {
+            worker.execute(() -> {
+                running.countDown();
+                for (;;) {
+                    try {
+                        if (release.await(25L, TimeUnit.MILLISECONDS)) return;
+                    } catch (InterruptedException ignored) {
+                        // Model a worker that is still in its bounded operation
+                        // cleanup despite shutdownNow interruption.
+                    }
+                }
+            });
+            assertTrue(running.await(2L, TimeUnit.SECONDS));
+            worker.shutdownNow();
+            AlExecutionService.deferCleanupAfterRejectedWorker(worker, cleanupCalls::incrementAndGet);
+            assertEquals(0, cleanupCalls.get());
+            release.countDown();
+            assertTrue(worker.awaitTermination(2L, TimeUnit.SECONDS));
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2L);
+            while (cleanupCalls.get() == 0 && System.nanoTime() < deadline) {
+                Thread.yield();
+            }
+            assertEquals(1, cleanupCalls.get());
+        } finally {
+            release.countDown();
+            worker.shutdownNow();
+            worker.awaitTermination(2L, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    public void pinnedGatewayRejectsProviderSwapBeforeNetworkAndAcceptsStableIdentity() throws Exception {
+        AtomicInteger selected = new AtomicInteger(0);
+        AtomicInteger networkCalls = new AtomicInteger(0);
+        BridgeRouter routerA = router("device-A", networkCalls);
+        BridgeRouter routerB = router("device-B", networkCalls);
+        NativeModelGateway gateway = new NativeModelGateway(null, null);
+        gateway.setBridgeRouterProvider(() -> selected.get() == 0 ? routerA : routerB);
+        TurnSubmission submission = new TurnSubmission(
+            "turn-pinned", "yuqi", "source-pinned", TurnKind.DIRECT_REPLY,
+            "{}", "{}", null, 1L);
+
+        String pinned = gateway.bridgeDeviceId();
+        selected.set(1);
+        assertThrows(IllegalStateException.class,
+            () -> gateway.executeBridgeTurnPinned(submission, pinned));
+        assertEquals(0, networkCalls.get());
+
+        selected.set(0);
+        assertEquals(BridgeResult.Kind.LEGACY_V2,
+            gateway.executeBridgeTurnPinned(submission, "device-A").kind);
+        assertEquals(1, networkCalls.get());
+    }
+
+    private static BridgeRouter router(String deviceId, AtomicInteger networkCalls) {
+        BridgeConfig config = new BridgeConfig(
+            true, BridgeMode.LAN, "http://127.0.0.1:1", "", deviceId,
+            "pairing-secret-123", "", "", 1200, 2000, 1, 100);
+        return new BridgeRouter(
+            config,
+            submission -> {
+                networkCalls.incrementAndGet();
+                return BridgeResult.skipped("lan", "{}");
+            },
+            submission -> BridgeResult.skipped("cloud", "{}"),
+            submission -> BridgeResult.success("fallback", "fallback"),
+            new BridgeRouter.MessageMirror() {
+                @Override public void persistSubmission(TurnSubmission ignored) {}
+                @Override public void persistReply(TurnSubmission ignored, BridgeResult result) {}
+            });
+    }
+
     @Test
     public void directReplyRunsMemoryBeforeChatAndCommitsOnce() throws Exception {
         FakeStore store = new FakeStore(turn("QUEUED", null), attempt("QUEUED", null));

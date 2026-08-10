@@ -45,7 +45,8 @@ public final class AlNotificationStatus {
             importance,
             hasSound,
             vibrationEnabled,
-            lockscreenVisibility
+            lockscreenVisibility,
+            Build.VERSION.SDK_INT
         );
         return new Snapshot(
             permissionGranted,
@@ -56,7 +57,8 @@ public final class AlNotificationStatus {
             vibrationEnabled,
             lockscreenVisibility,
             healthy,
-            summary(permissionGranted, appEnabled, channelExists, importance, hasSound, vibrationEnabled, lockscreenVisibility)
+            summary(permissionGranted, appEnabled, channelExists, importance, hasSound, vibrationEnabled,
+                lockscreenVisibility, Build.VERSION.SDK_INT)
         );
     }
 
@@ -84,13 +86,31 @@ public final class AlNotificationStatus {
         boolean vibrationEnabled,
         int lockscreenVisibility
     ) {
+        return isHealthy(permissionGranted, appEnabled, channelExists, importance, hasSound,
+            vibrationEnabled, lockscreenVisibility, Build.VERSION_CODES.Q);
+    }
+
+    static boolean isHealthy(
+        boolean permissionGranted,
+        boolean appEnabled,
+        boolean channelExists,
+        int importance,
+        boolean hasSound,
+        boolean vibrationEnabled,
+        int lockscreenVisibility,
+        int sdkInt
+    ) {
+        // Android 11+ no longer respects app-supplied channel lockscreen
+        // visibility. The connected gate checks the actual posted message.
+        boolean lockscreenHealthy = sdkInt >= Build.VERSION_CODES.R
+            || lockscreenVisibility == Notification.VISIBILITY_PUBLIC;
         return permissionGranted
             && appEnabled
             && channelExists
             && importance >= NotificationManager.IMPORTANCE_HIGH
             && hasSound
             && vibrationEnabled
-            && lockscreenVisibility == Notification.VISIBILITY_PUBLIC;
+            && lockscreenHealthy;
     }
 
     static String summary(
@@ -102,13 +122,27 @@ public final class AlNotificationStatus {
         boolean vibrationEnabled,
         int lockscreenVisibility
     ) {
+        return summary(permissionGranted, appEnabled, channelExists, importance, hasSound,
+            vibrationEnabled, lockscreenVisibility, Build.VERSION_CODES.Q);
+    }
+
+    static String summary(
+        boolean permissionGranted,
+        boolean appEnabled,
+        boolean channelExists,
+        int importance,
+        boolean hasSound,
+        boolean vibrationEnabled,
+        int lockscreenVisibility,
+        int sdkInt
+    ) {
         if (!permissionGranted) return "通知权限未开启，请进入系统设置允许 AL 通知";
         if (!appEnabled) return "AL 的应用通知已被系统关闭";
         if (!channelExists) return "新消息通知渠道尚未建立，请重新打开 AL";
         if (importance < NotificationManager.IMPORTANCE_HIGH) return "新消息通知重要级别过低，请在系统设置中改为重要";
         if (!hasSound) return "新消息通知声音已关闭，请在系统设置中选择提示音";
         if (!vibrationEnabled) return "新消息通知震动已关闭";
-        if (lockscreenVisibility != Notification.VISIBILITY_PUBLIC) return "锁屏消息正文未公开显示，请检查系统锁屏通知设置";
+        if (sdkInt < Build.VERSION_CODES.R && lockscreenVisibility != Notification.VISIBILITY_PUBLIC) return "锁屏消息正文未公开显示，请检查系统锁屏通知设置";
         return "通知正常：角色消息会响铃、震动并在锁屏显示正文";
     }
 

@@ -835,6 +835,25 @@ test('native completed turns are serialized across submit, poll, inbox, and fore
   assert.match(html, /if\s*\(nativeExecutionReconcilePromise\)\s*return\s+nativeExecutionReconcilePromise/);
 });
 
+test('native inbox flushes the coalesced durable app_state mirror before acknowledgement', () => {
+  const apply = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  const drain = html.slice(
+    html.indexOf('async function drainNativeUiInbox'),
+    html.indexOf('async function replayRecentNativeCompletedTurns')
+  );
+  assert.ok(apply.includes("DB.set('chats', allChats)"));
+  assert.doesNotMatch(apply, /await\s+mirrorAppStateNow\(\)/,
+    'terminal apply must not bypass the coalesced mirror scheduler');
+  const flush = drain.indexOf('await flushLatestAppStateMirror()');
+  const ack = drain.indexOf('await acknowledgeNativeUiAppliedOnce');
+  assert.ok(flush >= 0 && flush < ack,
+    'native acknowledgement must follow the unified durable mirror gate');
+  assert.match(html, /async function flushLatestAppStateMirror\(\)/);
+});
+
 test('native delivery diagnostics persist and expose four independent convergence stages', () => {
   assert.match(executionDatabase, /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION/);
   assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*15/);
@@ -888,6 +907,18 @@ test('native completion event and polling share a bounded self-clearing reconcil
   );
   assert.match(listener, /reconcileNativeReplyState\(\)/);
   assert.doesNotMatch(listener, /drainNativeUiInbox\(plugin\)/);
+});
+
+test('native boot starts critical poll/listener before optional Browser and push awaits', () => {
+  const boot = html.slice(html.indexOf('async function bootApp()'), html.indexOf('bootApp();'));
+  assert.ok(boot.indexOf('startNativeReplyPolling();') < boot.indexOf('closeStaleUpdateBrowser().catch'));
+  assert.match(boot, /ensureNativeExecutionCompletedListener\(\)\.catch/);
+  assert.doesNotMatch(boot, /await\s+ensureNativeExecutionCompletedListener/);
+  assert.doesNotMatch(boot, /await\s+ensureNativePushListeners/);
+  const listener = html.slice(html.indexOf('async function ensureNativeExecutionCompletedListener()'), html.indexOf('function yuqiImmersiveProgressText'));
+  assert.match(listener, /nativeExecutionCompletedListenerInFlight/);
+  assert.match(listener, /nativeBridgeCall\(/);
+  assert.match(listener, /nativeExecutionCompletedListenerReady\s*=\s*true/);
 });
 
 test('long chats mount only the latest 120 visible messages and expand in bounded pages', () => {

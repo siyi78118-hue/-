@@ -856,11 +856,11 @@ public final class AlExecutionPlugin extends Plugin {
         JSObject result = new JSObject();
         result.put("characterId", characterId);
         if (cursor == null) {
-            result.put("nativeCompletedTurnId", (Object) null);
-            result.put("nativeCompletedGroupId", (Object) null);
+            result.put("nativeCompletedTurnId", JSONObject.NULL);
+            result.put("nativeCompletedGroupId", JSONObject.NULL);
             result.put("nativeCompletedSequence", 0L);
-            result.put("uiAppliedTurnId", (Object) null);
-            result.put("uiAppliedGroupId", (Object) null);
+            result.put("uiAppliedTurnId", JSONObject.NULL);
+            result.put("uiAppliedGroupId", JSONObject.NULL);
             result.put("uiAppliedSequence", 0L);
             result.put("localSequence", 0L);
             result.put("clearedThroughSequence", 0L);
@@ -871,11 +871,11 @@ public final class AlExecutionPlugin extends Plugin {
             result.put("cursorChecksum", RoomExecutionStore.conversationCursorChecksum(characterId, null));
             return result;
         }
-        result.put("nativeCompletedTurnId", cursor.nativeCompletedTurnId);
-        result.put("nativeCompletedGroupId", cursor.nativeCompletedGroupId);
+        result.put("nativeCompletedTurnId", cursor.nativeCompletedTurnId == null ? JSONObject.NULL : cursor.nativeCompletedTurnId);
+        result.put("nativeCompletedGroupId", cursor.nativeCompletedGroupId == null ? JSONObject.NULL : cursor.nativeCompletedGroupId);
         result.put("nativeCompletedSequence", cursor.nativeCompletedSequence);
-        result.put("uiAppliedTurnId", cursor.uiAppliedTurnId);
-        result.put("uiAppliedGroupId", cursor.uiAppliedGroupId);
+        result.put("uiAppliedTurnId", cursor.uiAppliedTurnId == null ? JSONObject.NULL : cursor.uiAppliedTurnId);
+        result.put("uiAppliedGroupId", cursor.uiAppliedGroupId == null ? JSONObject.NULL : cursor.uiAppliedGroupId);
         result.put("uiAppliedSequence", cursor.uiAppliedSequence);
         result.put("localSequence", cursor.localSequence);
         result.put("clearedThroughSequence", cursor.clearedThroughSequence);

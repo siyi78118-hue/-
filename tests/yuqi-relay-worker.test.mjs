@@ -43,7 +43,7 @@ function relayEnvelope(overrides = {}) {
     idempotencyKey: 'idem_1',
     direction: 'phone_to_pc',
     ciphertext: 'Y2lwaGVyLWE=',
-    nonce: 'bm9uY2U=',
+    nonce: 'MDEyMzQ1Njc4OWFi',
     byteCount: 8,
     createdAt: 100,
     expiresAt: 10_000,
@@ -307,7 +307,7 @@ test('persists ciphertext-only envelopes idempotently and rejects plaintext fiel
     idempotencyKey: 'idem_1',
     direction: 'phone_to_pc',
     ciphertext: 'b3BhcXVlLWNpcGhlcnRleHQ=',
-    nonce: 'bm9uY2UxMjM0NTY3OA==',
+    nonce: 'MDEyMzQ1Njc4OWFi',
     expiresAt: Date.now() + 60_000
   };
   const first = await jsonResponse(await relayWorker.fetch(request('/bridge/enqueue', {
@@ -328,13 +328,88 @@ test('persists ciphertext-only envelopes idempotently and rejects plaintext fiel
   assert.equal(plaintext.status, 400);
 });
 
+test('enqueue rejects noncanonical encrypted bytes and coerced native fields before any write', async () => {
+  const now = Date.now();
+  const valid = {
+    deviceId: 'device_123456',
+    messageId: 'relay_canonical_1',
+    idempotencyKey: 'idem_canonical_1',
+    direction: 'phone_to_pc',
+    ciphertext: 'Y2lwaGVyLWE=',
+    nonce: 'MDEyMzQ1Njc4OWFi',
+    expiresAt: now + 60_000
+  };
+  const invalidCases = [
+    { nonce: 'bm9uY2U=' },
+    { nonce: '________________' },
+    { ciphertext: 'Y2lwaGVyLWE=\n' },
+    { ciphertext: '________________' },
+    { ciphertext: 'Y2lwaGVyLWE' },
+    { messageId: 123456 },
+    { expiresAt: String(valid.expiresAt) }
+  ];
+  for (const [index, override] of invalidCases.entries()) {
+    const env = envFixture();
+    await register(env);
+    const body = { ...valid, ...override,
+      messageId: override.messageId === undefined ? `relay_canonical_${index + 1}` : override.messageId,
+      idempotencyKey: `idem_canonical_${index + 1}` };
+    const result = await jsonResponse(await relayWorker.fetch(request('/bridge/enqueue', {
+      method: 'POST', token: 'device-token-123456789', body
+    }), env));
+    assert.equal(result.status, 400, `case ${index} must be rejected`);
+    assert.equal((await env.YUQI_RELAY_STORE.poll('device_123456', 'phone_to_pc', now, 10)).length, 0);
+  }
+});
+
+test('ack-with-response rejects noncanonical response bytes and coerced fields before exchange mutation', async () => {
+  const now = Date.now();
+  const incoming = relayEnvelope({
+    messageId: 'incoming_canonical_1',
+    idempotencyKey: 'incoming_canonical_1_idem',
+    nonce: 'MDEyMzQ1Njc4OWFi',
+    createdAt: now,
+    expiresAt: now + 60_000
+  });
+  const response = clearResponseEnvelope({
+    deviceId: incoming.deviceId,
+    expiresAt: now + 60_000
+  });
+  const invalidCases = [
+    { nonce: 'bm9uY2U=' },
+    { nonce: '________________' },
+    { ciphertext: `${response.ciphertext}\n` },
+    { ciphertext: '________________' },
+    { ciphertext: 'Y2lwaGVyLWE' },
+    { messageId: 123456 },
+    { expiresAt: String(response.expiresAt) },
+    { deviceId: ['device_123456'] }
+  ];
+  for (const override of invalidCases) {
+    const env = envFixture();
+    await register(env);
+    await env.YUQI_RELAY_STORE.putEnvelope(incoming, now);
+    const result = await jsonResponse(await relayWorker.fetch(request('/bridge/ack-with-response', {
+      method: 'POST', token: 'device-token-123456789',
+      body: {
+        deviceId: incoming.deviceId,
+        incomingMessageId: incoming.messageId,
+        response: { ...response, ...override }
+      }
+    }), env));
+    assert.equal(result.status, 400);
+    assert.equal((await env.YUQI_RELAY_STORE.poll(incoming.deviceId, 'phone_to_pc', now, 10)).length, 1);
+    assert.equal((await env.YUQI_RELAY_STORE.poll(incoming.deviceId, 'pc_to_phone', now, 10)).length, 0);
+  }
+});
+
 test('enforces device ownership and deletes acknowledged envelopes', async () => {
   const env = envFixture();
   await register(env);
   await relayWorker.fetch(request('/bridge/enqueue', {
     method: 'POST', token: 'device-token-123456789', body: {
       deviceId: 'device_123456', messageId: 'relay_message_1', idempotencyKey: 'idem_1',
-      direction: 'pc_to_phone', ciphertext: 'Y2lwaGVy', nonce: 'bm9uY2U=', expiresAt: Date.now() + 60_000
+      direction: 'pc_to_phone', ciphertext: 'Y2lwaGVy', nonce: 'MDEyMzQ1Njc4OWFi', expiresAt: Date.now() + 60_000
     }
   }), env);
 
@@ -360,7 +435,7 @@ test('omits expired messages and returns 50/75/90 quota warning levels', async (
   const env = envFixture({ RELAY_DAILY_BYTE_BUDGET: '20', RELAY_DAILY_WRITE_BUDGET: '4' });
   await register(env);
   const base = {
-    deviceId: 'device_123456', direction: 'phone_to_pc', nonce: 'bm9uY2U=',
+    deviceId: 'device_123456', direction: 'phone_to_pc', nonce: 'MDEyMzQ1Njc4OWFi',
     ciphertext: 'MTIzNDU2Nzg5MA=='
   };
   for (let index = 1; index <= 2; index += 1) {
@@ -408,7 +483,7 @@ test('refresh-expiry updates only a live exact envelope and lower replay keeps t
   const now = Date.now();
   const original = {
     deviceId: 'device_123456', messageId: 'relay_message_1', idempotencyKey: 'idem_1',
-    direction: 'phone_to_pc', ciphertext: 'Y2lwaGVyLWE=', nonce: 'bm9uY2U=', expiresAt: now + 60_000
+    direction: 'phone_to_pc', ciphertext: 'Y2lwaGVyLWE=', nonce: 'MDEyMzQ1Njc4OWFi', expiresAt: now + 60_000
   };
   await relayWorker.fetch(request('/bridge/enqueue', { method: 'POST', token: 'device-token-123456789', body: original }), env);
   const before = (await env.YUQI_RELAY_STORE.poll(original.deviceId, original.direction, now, 10))[0];
@@ -488,7 +563,7 @@ test('live changed enqueue and partial identity conflicts never replace cipherte
   await register(env);
   const original = {
     deviceId: 'device_123456', messageId: 'relay_message_1', idempotencyKey: 'idem_1',
-    direction: 'phone_to_pc', ciphertext: 'Y2lwaGVyLWE=', nonce: 'bm9uY2U=', expiresAt: Date.now() + 60_000
+    direction: 'phone_to_pc', ciphertext: 'Y2lwaGVyLWE=', nonce: 'MDEyMzQ1Njc4OWFi', expiresAt: Date.now() + 60_000
   };
   await relayWorker.fetch(request('/bridge/enqueue', { method: 'POST', token: 'device-token-123456789', body: original }), env);
   const changedCiphertext = await jsonResponse(await relayWorker.fetch(request('/bridge/enqueue', {
@@ -575,7 +650,7 @@ test('unknown D1 batch failures surface as 5xx instead of input 400', async () =
   const result = await jsonResponse(await relayWorker.fetch(request('/bridge/enqueue', {
     method: 'POST', token: 'device-token-123456789', body: {
       deviceId: 'device_123456', messageId: 'relay_message_1', idempotencyKey: 'idem_1',
-      direction: 'phone_to_pc', ciphertext: 'Y2lwaGVy', nonce: 'bm9uY2U=', expiresAt: Date.now() + 60_000
+      direction: 'phone_to_pc', ciphertext: 'Y2lwaGVy', nonce: 'MDEyMzQ1Njc4OWFi', expiresAt: Date.now() + 60_000
     }
   }), env));
   assert.equal(result.status, 500);
@@ -662,7 +737,7 @@ test('ack-with-response atomically exchanges an inbound clear control and is byt
   await register(env);
   const incoming = {
     deviceId: 'device_123456', messageId: 'control_incoming_1', idempotencyKey: 'control_incoming_idem_1',
-    direction: 'phone_to_pc', ciphertext: 'Y29udHJvbA==', nonce: 'bm9uY2U=', expiresAt: Date.now() + 60_000
+    direction: 'phone_to_pc', ciphertext: 'Y29udHJvbA==', nonce: 'MDEyMzQ1Njc4OWFi', expiresAt: Date.now() + 60_000
   };
   const response = clearResponseEnvelope();
   await relayWorker.fetch(request('/bridge/enqueue', { method: 'POST', token: 'device-token-123456789', body: incoming }), env);

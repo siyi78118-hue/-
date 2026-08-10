@@ -59,11 +59,23 @@ class RelayInputError extends Error {
   }
 }
 
-function byteLengthFromBase64(value) {
-  const text = String(value || '').replace(/\s/g, '');
-  if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(text)) return -1;
-  const padding = (text.match(/=+$/)?.[0].length || 0);
-  return Math.max(0, Math.floor(text.length * 3 / 4) - padding);
+function canonicalBase64Bytes(value, maxBytes = Number.MAX_SAFE_INTEGER) {
+  if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0
+    || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return null;
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  const expectedLength = (value.length / 4) * 3 - padding;
+  if (!Number.isSafeInteger(expectedLength) || expectedLength < 1 || expectedLength > maxBytes) return null;
+  try {
+    const decoded = atob(value);
+    return btoa(decoded) === value ? decoded : null;
+  } catch {
+    return null;
+  }
+}
+
+function canonicalBase64ByteLength(value, maxBytes = Number.MAX_SAFE_INTEGER) {
+  const decoded = canonicalBase64Bytes(value, maxBytes);
+  return decoded === null ? -1 : decoded.length;
 }
 
 async function sha256(value) {
@@ -132,16 +144,21 @@ async function handleEnqueue(request, env) {
   for (const field of Object.keys(body)) {
     if (PRIVATE_FIELDS.has(field)) return json({ ok: false, error: `plaintext field is forbidden: ${field}` }, 400);
   }
-  const deviceId = String(body.deviceId || '');
-  if (!await authorize(request, env, deviceId)) return json({ ok: false, error: 'unauthorized' }, 401);
-  if (!validId(body.messageId) || !validId(body.idempotencyKey) || !DIRECTIONS.has(body.direction)) {
+  if (!validNativeId(body.deviceId) || !validNativeId(body.messageId)
+    || !validNativeId(body.idempotencyKey) || typeof body.direction !== 'string'
+    || !DIRECTIONS.has(body.direction) || typeof body.ciphertext !== 'string'
+    || typeof body.nonce !== 'string' || typeof body.expiresAt !== 'number'
+    || !Number.isSafeInteger(body.expiresAt)) {
     return json({ ok: false, error: 'invalid envelope identity' }, 400);
   }
-  const byteCount = byteLengthFromBase64(body.ciphertext);
-  if (byteCount < 1 || byteCount > 512 * 1024 || byteLengthFromBase64(body.nonce) < 1) {
+  const deviceId = body.deviceId;
+  if (!await authorize(request, env, deviceId)) return json({ ok: false, error: 'unauthorized' }, 401);
+  const byteCount = canonicalBase64ByteLength(body.ciphertext, 512 * 1024);
+  const nonceBytes = canonicalBase64Bytes(body.nonce, 12);
+  if (byteCount < 1 || nonceBytes === null || nonceBytes.length !== 12) {
     return json({ ok: false, error: 'invalid encrypted payload' }, 400);
   }
-  const expiresAt = Number(body.expiresAt);
+  const expiresAt = body.expiresAt;
   const now = Date.now();
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt > now + 7 * 24 * 60 * 60 * 1000) {
     return json({ ok: false, error: 'invalid expiry' }, 400);
@@ -205,7 +222,7 @@ async function handleAckWithResponse(request, env) {
     || !validNativeId(body.incomingMessageId)
     || !body.response || typeof body.response !== 'object' || Array.isArray(body.response)
     || !hasExactKeys(body.response, ACK_RESPONSE_KEYS)
-    || typeof body.response.deviceId !== 'string'
+    || !validNativeId(body.response.deviceId)
     || body.response.deviceId !== body.deviceId
     || !validNativeId(body.response.messageId)
     || body.response.direction !== 'pc_to_phone'
@@ -214,8 +231,9 @@ async function handleAckWithResponse(request, env) {
     || typeof body.response.nonce !== 'string') {
     return json({ ok: false, error: 'invalid clear response exchange' }, 400);
   }
-  const byteCount = byteLengthFromBase64(body.response.ciphertext);
-  if (byteCount < 1 || byteCount > 512 * 1024 || byteLengthFromBase64(body.response.nonce) !== 12
+  const byteCount = canonicalBase64ByteLength(body.response.ciphertext, 512 * 1024);
+  const nonceBytes = canonicalBase64Bytes(body.response.nonce, 12);
+  if (byteCount < 1 || nonceBytes === null || nonceBytes.length !== 12
     || typeof body.response.expiresAt !== 'number' || !Number.isSafeInteger(body.response.expiresAt)) {
     return json({ ok: false, error: 'invalid clear response envelope' }, 400);
   }

@@ -1,4 +1,6 @@
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { pathToFileURL } from 'node:url';
@@ -20,6 +22,8 @@ import {
 import { evaluatePipelineComparison } from '../yuqi-runtime/src/comparison-evaluator.mjs';
 import { contentHash } from '../yuqi-runtime/src/protocol.mjs';
 import { ReleaseExecutor } from '../yuqi-runtime/src/release-executor.mjs';
+
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function readJsonLines(path) {
   return readFileSync(path, 'utf8').split(/\r?\n/).filter(Boolean).map(JSON.parse);
@@ -55,6 +59,24 @@ export function loadLocalHistoryManifest({ rootDir = process.cwd(), path } = {})
   return JSON.parse(readFileSync(manifestPath, 'utf8'));
 }
 
+export function captureCleanSourceHead({ rootDir = process.cwd() } = {}) {
+  let status;
+  let sourceHead;
+  try {
+    status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+      cwd: rootDir, encoding: 'utf8'
+    });
+    sourceHead = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+      cwd: rootDir, encoding: 'utf8'
+    }).trim();
+  } catch (error) {
+    throw new Error(`quality source identity unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (status.trim()) throw new Error('quality source tree is dirty');
+  if (!/^[0-9a-f]{40}$/.test(sourceHead)) throw new Error('quality source HEAD invalid');
+  return sourceHead;
+}
+
 export async function runQualityReplayPlan({
   plan,
   releasePair,
@@ -65,9 +87,12 @@ export async function runQualityReplayPlan({
   secondaryEvaluatorVersion = 'blind-evaluator-v1b',
   maxItems = null,
   onSideEffect = () => {},
-  now = () => Date.now()
+  now = () => Date.now(),
+  sourceRootDir = process.cwd()
 } = {}) {
   const verifiedPlan = assertVerifiedQualityReplayPlan(plan);
+  const sourceHead = captureCleanSourceHead({ rootDir: sourceRootDir });
+  const runId = randomUUID();
   if (typeof evaluator !== 'function') throw new Error('blind evaluator required');
   const items = maxItems == null ? verifiedPlan.items : verifiedPlan.items.slice(0, maxItems);
   if (!items.length) throw new Error('quality replay plan required');
@@ -103,6 +128,7 @@ export async function runQualityReplayPlan({
     const finalKey = `${item.layer}:${item.sceneId}:${item.repeatIndex}`;
     executionPairs.push({
       finalKey,
+      sourceHead,
       stableReleaseId: pairRecord.stable.releaseId,
       stableReleaseChecksum: pairRecord.stable.releaseChecksum,
       candidateReleaseId: pairRecord.candidate.releaseId,
@@ -228,11 +254,20 @@ export async function runQualityReplayPlan({
       attempts: [attempt]
     });
   }
+  const endingSourceHead = captureCleanSourceHead({ rootDir: sourceRootDir });
+  if (endingSourceHead !== sourceHead) {
+    throw new Error('quality source identity changed during replay');
+  }
+  const replayProvenance = { runId, sourceHead, executionPairs, modelRuns };
   return {
+    runId,
     finalized,
     attempts,
     pairRecords,
-    replayProvenance: { executionPairs, modelRuns },
+    replayProvenance: {
+      ...replayProvenance,
+      provenanceChecksum: contentHash(replayProvenance)
+    },
     sentinelRuns: finalized.filter(row => row.layer === 'sentinel'),
     coverageRuns: finalized.filter(row => row.layer === 'coverage'),
     historyRuns: finalized.filter(row => row.layer === 'history')
@@ -242,21 +277,52 @@ export async function runQualityReplayPlan({
 export function appendQualityReplayArtifact({ artifactPath, result } = {}) {
   if (typeof artifactPath !== 'string' || !artifactPath) throw new Error('replay artifact path required');
   if (!result || !Array.isArray(result.attempts) || !Array.isArray(result.finalized)
-    || !result.replayProvenance) throw new Error('replay result required');
+    || !result.replayProvenance
+    || !Array.isArray(result.replayProvenance.executionPairs)
+    || !Array.isArray(result.replayProvenance.modelRuns)) throw new Error('replay result required');
+  const runId = result.runId || result.replayProvenance.runId;
+  if (typeof runId !== 'string' || !RUN_ID_PATTERN.test(runId)
+    || result.replayProvenance.runId !== runId) throw new Error('replay run identity required');
+  const assertNoConflictingRunId = (rows, label) => {
+    for (const row of rows) {
+      if (row && Object.prototype.hasOwnProperty.call(row, 'runId') && row.runId !== runId) {
+        throw new Error(`${label} run identity conflict`);
+      }
+    }
+  };
+  assertNoConflictingRunId(result.attempts, 'attempt');
+  assertNoConflictingRunId(result.finalized, 'final');
+  assertNoConflictingRunId(result.replayProvenance.executionPairs, 'execution');
+  assertNoConflictingRunId(result.replayProvenance.modelRuns, 'model');
+  assertNoConflictingRunId(result.finalized.flatMap(row => row?.attempts || []), 'nested attempt');
+  if (existsSync(artifactPath)) {
+    const existing = readJsonLines(artifactPath);
+    if (existing.some(row => !row || typeof row !== 'object' || row.runId !== runId)) {
+      throw new Error('replay artifact run identity conflict');
+    }
+  }
   const finalizedByKey = new Map(result.finalized.map(row => [
     `${row.layer}:${row.sceneId}:${row.repeatIndex}`, row
   ]));
   const records = [
-    ...result.attempts.map(attempt => ({ recordType: 'attempt', ...attempt })),
+    ...result.attempts.map(attempt => ({ recordType: 'attempt', runId, ...attempt })),
     ...result.finalized.map(row => ({
       recordType: 'final',
+      runId,
       ...row,
       attempts: row.attempts
     })),
-    ...result.replayProvenance.executionPairs.map(pair => ({ recordType: 'execution', ...pair })),
-    ...result.replayProvenance.modelRuns.map(run => ({ recordType: 'model', ...run })),
+    {
+      recordType: 'provenance',
+      runId,
+      sourceHead: result.replayProvenance.sourceHead,
+      provenanceChecksum: result.replayProvenance.provenanceChecksum
+    },
+    ...result.replayProvenance.executionPairs.map(pair => ({ recordType: 'execution', runId, ...pair })),
+    ...result.replayProvenance.modelRuns.map(run => ({ recordType: 'model', runId, ...run })),
     ...[...finalizedByKey.values()].map(row => ({
       recordType: 'final-checksum',
+      runId,
       finalKey: `${row.layer}:${row.sceneId}:${row.repeatIndex}`,
       executionChecksum: row.executionChecksum,
       latencyMs: row.latencyMs,
@@ -322,8 +388,8 @@ if (isMain) {
         : createQualityReplayPlan({ rootDir, historyScenes, historyManifest });
       const planPath = resolve(rootDir, cliOption('--plan-out')
         || 'artifacts/yuqi-lived-agency-v3/quality-replay-plan.json');
-      writeQualityReplayPlanArtifact(plan, planPath);
       if (!execute) {
+        writeQualityReplayPlanArtifact(plan, planPath);
         process.stdout.write(`${JSON.stringify({
           version: plan.version,
           planChecksum: plan.planChecksum,
@@ -351,8 +417,10 @@ if (isMain) {
         evaluatorSecondary: config.evaluatorSecondary,
         evaluatorVersion: config.evaluatorVersion,
         secondaryEvaluatorVersion: config.secondaryEvaluatorVersion,
-        maxItems: cliOption('--max-items') ? Number(cliOption('--max-items')) : null
+        maxItems: cliOption('--max-items') ? Number(cliOption('--max-items')) : null,
+        sourceRootDir: rootDir
       });
+      writeQualityReplayPlanArtifact(plan, planPath);
       const replayPath = resolve(rootDir, cliOption('--replay-out')
         || 'artifacts/yuqi-lived-agency-v3/quality-replay.jsonl');
       appendQualityReplayArtifact({ artifactPath: replayPath, result });
@@ -360,6 +428,8 @@ if (isMain) {
         version: 1,
         executed: true,
         planChecksum: plan.planChecksum,
+        sourceHead: result.replayProvenance.sourceHead,
+        provenanceChecksum: result.replayProvenance.provenanceChecksum,
         replayArtifact: replayPath,
         total: result.finalized.length,
         productionReleaseMutation: false,

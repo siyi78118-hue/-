@@ -18,6 +18,16 @@ public interface ExecutionEngineStore {
     }
     RoomExecutionStore.DeliveryDisposition commitBridgedTerminal(
         String turnId, String attemptId, BridgeResult result, long now);
+    /**
+     * Terminal v3 result with the authenticated bridge peer captured before
+     * transport.  Room implementations may consume a retained role-delete
+     * tombstone when the turn was removed while the request was in flight.
+     */
+    default RoomExecutionStore.DeliveryDisposition commitBridgedTerminalWithPeer(
+        String turnId, String attemptId, BridgeResult result, String authenticatedPeerId, long now
+    ) {
+        return commitBridgedTerminal(turnId, attemptId, result, now);
+    }
     RoomExecutionStore.DeliveryDisposition commitAndroidFallback(
         String turnId,
         String attemptId,
@@ -27,6 +37,12 @@ public interface ExecutionEngineStore {
     );
     void commitVerifiedRemoteFailure(
         String turnId, String attemptId, BridgeResult result, long now);
+    /** Same retained-role-delete handling for a strictly parsed v3 failure. */
+    default void commitVerifiedRemoteFailureWithPeer(
+        String turnId, String attemptId, BridgeResult result, String authenticatedPeerId, long now
+    ) {
+        commitVerifiedRemoteFailure(turnId, attemptId, result, now);
+    }
     void markStage(String turnId, String attemptId, TurnState state, AttemptStage stage, long now);
     void markBridgeWaiting(String turnId, String attemptId, String route, long now);
     void saveMemoryResult(String turnId, String attemptId, String memory, long now);

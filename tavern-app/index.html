@@ -1601,10 +1601,12 @@ let voiceRecordingCharId = '';
 let nativeReplyPollTimer = null;
 let nativeExecutionReconcilePromise = null;
 let nativeExecutionCompletedListenerReady = false;
+let nativeExecutionCompletedListenerInFlight = null;
 let lastNativeCompletedRecoveryAt = 0;
 const nativeReplyQueuedIds = new Set();
 const nativeTurnApplyPromises = new Map();
 const nativeUiAcknowledgedTurnIds = new Set();
+const nativeUiAcknowledgementPromises = new Map();
 const CHAT_RENDER_WINDOW_SIZE = 120;
 const CHAT_RENDER_PAGE_SIZE = 120;
 const chatRenderLimits = new Map();
@@ -2569,6 +2571,7 @@ let mirrorTimer = null;
 let mirrorRunning = null;
 let mirrorRequested = false;
 let mirrorWaiters = [];
+let mirrorFlushRequested = false;
 function buildAndroidUserReplyTask(charId, userMessageId, userText, options = {}, createdAt = Date.now()) {
   return {
     taskId: `reply_${userMessageId}`,
@@ -3954,17 +3957,32 @@ function nativeBridgeCall(promise, label, timeoutMs = NATIVE_BRIDGE_TIMEOUT_MS) 
 async function acknowledgeNativeUiAppliedOnce(plugin, result) {
   const turnId = String(result?.turnId || '');
   if (!turnId || nativeUiAcknowledgedTurnIds.has(turnId)) return false;
-  try {
-    await nativeBridgeCall(
-      plugin.acknowledgeUiApplied({ turnId }),
-      'acknowledgeUiApplied'
-    );
-    nativeUiAcknowledgedTurnIds.add(turnId);
-    return true;
-  } catch (error) {
-    nativeUiAcknowledgedTurnIds.delete(turnId);
-    throw error;
-  }
+  const inFlight = nativeUiAcknowledgementPromises.get(turnId);
+  if (inFlight) return inFlight;
+  let request = null;
+  const runAcknowledgement = async () => {
+    // Yield once so the in-flight placeholder is installed before a plugin
+    // implementation can synchronously throw.
+    await Promise.resolve();
+    try {
+      await nativeBridgeCall(
+        plugin.acknowledgeUiApplied({ turnId }),
+        'acknowledgeUiApplied'
+      );
+      nativeUiAcknowledgedTurnIds.add(turnId);
+      return true;
+    } catch (error) {
+      nativeUiAcknowledgedTurnIds.delete(turnId);
+      throw error;
+    } finally {
+      if (nativeUiAcknowledgementPromises.get(turnId) === request) {
+        nativeUiAcknowledgementPromises.delete(turnId);
+      }
+    }
+  };
+  request = runAcknowledgement();
+  nativeUiAcknowledgementPromises.set(turnId, request);
+  return request;
 }
 async function nativeRoleDeletionResultDisposition(plugin, characterId) {
   const charId = String(characterId || '');
@@ -4020,6 +4038,7 @@ async function drainNativeUiInbox(
       if (suppressed === null) continue;
       changed = await applyTurn(result) || changed;
       if (!hasLanded(result)) continue;
+      await flushLatestAppStateMirror();
       await acknowledgeNativeUiAppliedOnce(plugin, result);
     } catch (err) {
       console.warn('[AL Native Execution] inbox item deferred:', result?.turnId, err.message);
@@ -4707,13 +4726,38 @@ function startNativeReplyPolling() {
 async function ensureNativeExecutionCompletedListener() {
   const plugin = nativeExecutionPlugin();
   if (!isNativeApp() || !plugin?.addListener || nativeExecutionCompletedListenerReady) return;
-  nativeExecutionCompletedListenerReady = true;
-  await plugin.addListener('executionCompleted', () => {
+  if (nativeExecutionCompletedListenerInFlight) return nativeExecutionCompletedListenerInFlight;
+  const callback = () => {
     // The event is only a wake-up. Room remains authoritative and the exact
     // turn/checksum is drained through the same idempotent inbox path.
     reconcileNativeReplyState()
       .catch(err => console.warn('[AL Native Execution] completed event deferred:', err.message));
-  });
+  };
+  const attempt = { raw: null, promise: null };
+  attempt.raw = Promise.resolve().then(() => plugin.addListener('executionCompleted', callback));
+  attempt.promise = nativeBridgeCall(attempt.raw, 'executionCompleted listener', 5000)
+    .then(handle => {
+      if (nativeExecutionCompletedListenerInFlight !== attempt) {
+        handle?.remove?.().catch?.(() => {});
+        return false;
+      }
+      nativeExecutionCompletedListenerReady = true;
+      return true;
+    })
+    .catch(error => {
+      nativeExecutionCompletedListenerReady = false;
+      throw error;
+    })
+    .finally(() => {
+      if (nativeExecutionCompletedListenerInFlight === attempt) nativeExecutionCompletedListenerInFlight = null;
+    });
+  nativeExecutionCompletedListenerInFlight = attempt;
+  attempt.raw.then(handle => {
+    if (nativeExecutionCompletedListenerInFlight !== attempt) {
+      handle?.remove?.().catch?.(() => {});
+    }
+  }).catch(() => {});
+  return attempt.promise;
 }
 
 function yuqiImmersiveProgressText(pending = {}) {
@@ -4990,6 +5034,16 @@ async function mirrorAppState() {
   scheduleAppStateMirror();
   return promise;
 }
+async function flushLatestAppStateMirror() {
+  if (typeof MemoryDB === 'undefined') return true;
+  mirrorRequested = true;
+  mirrorFlushRequested = true;
+  const promise = new Promise((resolve, reject) => {
+    mirrorWaiters.push({ resolve, reject });
+  });
+  scheduleAppStateMirror(0);
+  return promise;
+}
 function scheduleAppStateMirror(delay = 60) {
   if (mirrorTimer || mirrorRunning) return;
   mirrorTimer = setTimeout(runScheduledAppStateMirror, delay);
@@ -4998,11 +5052,15 @@ async function runScheduledAppStateMirror() {
   if (mirrorTimer) clearTimeout(mirrorTimer);
   mirrorTimer = null;
   if (mirrorRunning) return;
-  if (typeof pendingNativeReplyCount === 'function' && pendingNativeReplyCount() > 0) {
+  if (typeof pendingNativeReplyCount === 'function'
+    && pendingNativeReplyCount() > 0
+    && !mirrorFlushRequested) {
+    if (mirrorRequested || mirrorWaiters.length) scheduleAppStateMirror(60);
     return;
   }
   if (!mirrorRequested) return;
   mirrorRequested = false;
+  mirrorFlushRequested = false;
   const batch = mirrorWaiters;
   mirrorWaiters = [];
   mirrorRunning = mirrorAppStateNow();
@@ -10679,34 +10737,44 @@ async function manualCheckCloudTimerVersion() {
 }
 let nativePushListenersReady = false;
 let nativePushRegistrationWaiter = null;
+let nativePushListenersInFlight = null;
 async function ensureNativePushListeners() {
   const PushNotifications = window.Capacitor?.Plugins?.PushNotifications;
   if (!isNativeApp() || !PushNotifications?.addListener || nativePushListenersReady) return;
-  nativePushListenersReady = true;
-  await PushNotifications.addListener('registration', token => {
+  if (nativePushListenersInFlight) return nativePushListenersInFlight;
+  const attempt = (async () => {
+    await nativeBridgeCall(PushNotifications.addListener('registration', token => {
     settings.nativeFcmToken = String(token?.value || '');
     settings.pushTransport = 'fcm';
     settings.pushSubscription = settings.nativeFcmToken ? { transport: 'fcm', token: settings.nativeFcmToken } : null;
     DB.set('settings', settings);
     nativePushRegistrationWaiter?.resolve?.(settings.nativeFcmToken);
     nativePushRegistrationWaiter = null;
-  });
-  await PushNotifications.addListener('registrationError', error => {
+    }), 'push registration listener', 5000);
+    await nativeBridgeCall(PushNotifications.addListener('registrationError', error => {
     const message = error?.error || error?.message || 'FCM 注册失败';
     nativePushRegistrationWaiter?.reject?.(new Error(message));
     nativePushRegistrationWaiter = null;
     setCloudTimerStatus('FCM 注册失败：' + message);
-  });
-  await PushNotifications.addListener('pushNotificationReceived', () => {
+    }), 'push registration error listener', 5000);
+    await nativeBridgeCall(PushNotifications.addListener('pushNotificationReceived', () => {
     setCloudTimerStatus('本机已收到 FCM 唤醒，后台正在生成消息。');
     setTimeout(() => syncFromServiceWorkerState(), 2500);
     setTimeout(() => syncFromServiceWorkerState(), 10000);
-  });
-  await PushNotifications.addListener('pushNotificationActionPerformed', async event => {
+    }), 'push received listener', 5000);
+    await nativeBridgeCall(PushNotifications.addListener('pushNotificationActionPerformed', async event => {
     await syncFromServiceWorkerState();
     const charId = event?.notification?.data?.charId;
     if (charId && allChats[charId]) openChat(charId);
+    }), 'push action listener', 5000);
+    nativePushListenersReady = true;
+    return true;
+  })();
+  nativePushListenersInFlight = attempt;
+  attempt.catch(() => { nativePushListenersReady = false; }).finally(() => {
+    if (nativePushListenersInFlight === attempt) nativePushListenersInFlight = null;
   });
+  return attempt;
 }
 async function requestNativeFcmToken() {
   const PushNotifications = window.Capacitor?.Plugins?.PushNotifications;
@@ -13136,11 +13204,15 @@ async function syncFromServiceWorkerState(options = {}) {
   }
 }
 async function bootApp() {
-  await closeStaleUpdateBrowser();
   refreshAppVersionDisplay();
-  if (isNativeApp()) await ensureNativePushListeners().catch(err => console.warn('[AL Native] push listeners skipped:', err.message));
-  if (isNativeApp()) {
-    await ensureNativeExecutionCompletedListener().catch(err => console.warn('[AL Native] execution listener skipped:', err.message));
+  const native = isNativeApp();
+  if (native) {
+    // Critical native execution wake-up paths must not wait behind optional
+    // Browser/FCM startup. They are independently bounded and retryable.
+    startNativeReplyPolling();
+    ensureNativeExecutionCompletedListener().catch(err => console.warn('[AL Native] execution listener skipped:', err.message));
+    ensureNativePushListeners().catch(err => console.warn('[AL Native] push listeners skipped:', err.message));
+    closeStaleUpdateBrowser().catch(() => {});
     const App = window.Capacitor?.Plugins?.App;
     App?.addListener?.('appStateChange', state => {
       if (state?.isActive) {
@@ -13151,6 +13223,8 @@ async function bootApp() {
         });
       }
     });
+  } else {
+    await closeStaleUpdateBrowser();
   }
   refreshNativeCloudRegistration().catch(err => console.warn('[AL Native] cloud capability refresh skipped:', err.message));
   await syncFromServiceWorkerState({ checkProactive: false });

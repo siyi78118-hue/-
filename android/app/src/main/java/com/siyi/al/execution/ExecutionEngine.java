@@ -176,10 +176,11 @@ public final class ExecutionEngine {
         // boundary; the terminal Room writer alone is too late to prevent
         // already-prepared semantic data from leaving the device.
         store.assertBridgeSubmissionStillAllowed(prepared);
-        BridgeResult result = gateway.executeBridgeTurn(prepared);
+        BridgeResult result = gateway.executeBridgeTurnPinned(prepared, bridgeDeviceId);
         if (result.kind == BridgeResult.Kind.CANONICAL_TERMINAL) {
             try {
-                store.commitBridgedTerminal(turn.turnId, attempt.attemptId, result, clock.now());
+                store.commitBridgedTerminalWithPeer(
+                    turn.turnId, attempt.attemptId, result, bridgeDeviceId, clock.now());
             } catch (RuntimeException error) {
                 throw new CanonicalBridgeApplyException(error);
             }
@@ -187,7 +188,8 @@ public final class ExecutionEngine {
         }
         if (result.kind == BridgeResult.Kind.VERIFIED_REMOTE_FAILURE) {
             try {
-                store.commitVerifiedRemoteFailure(turn.turnId, attempt.attemptId, result, clock.now());
+                store.commitVerifiedRemoteFailureWithPeer(
+                    turn.turnId, attempt.attemptId, result, bridgeDeviceId, clock.now());
             } catch (RuntimeException error) {
                 throw new CanonicalBridgeApplyException(error);
             }

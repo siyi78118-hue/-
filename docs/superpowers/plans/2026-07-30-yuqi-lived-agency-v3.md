@@ -10071,31 +10071,103 @@ git commit -m "fix: initialize Android plugin state off main thread"
 ### Task 25: Add One Reproducible Release-Readiness Gate and Run the Full Matrix
 
 **Files:**
+- Create: `scripts/generate-yuqi-v3-readiness-inputs.mjs`
+- Create: `scripts/generate-yuqi-visible-path-metrics.mjs`
+- Create: `scripts/export-yuqi-visible-path-pc.mjs`
+- Create: `scripts/run-yuqi-visible-path-formal.mjs`
 - Create: `scripts/verify-yuqi-v3-readiness.mjs`
+- Modify (reuse the single full v15 read-only authority validator):
+  `scripts/extract-yuqi-real-history-scenes.mjs`
+- Modify: `scripts/run-yuqi-lived-quality-replay.mjs`
+- Modify: `scripts/report-yuqi-lived-quality.mjs`
+- Modify: `yuqi-runtime/test/quality-replay.test.mjs`
+- Modify: `yuqi-runtime/test/quality-report.test.mjs`
+- Create: `tests/yuqi-v3-readiness-inputs.test.mjs`
+- Create: `tests/yuqi-visible-path-metrics.test.mjs`
+- Create: `tests/yuqi-visible-path-pc-export.test.mjs`
+- Create: `tests/yuqi-visible-path-formal-run.test.mjs`
 - Create: `tests/yuqi-v3-readiness.test.mjs`
 - Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceTest.java`
 - Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceFixture.java`
 - Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3WebViewHarness.java`
+- Create: `android/app/src/androidTest/java/com/siyi/al/execution/YuqiVisiblePathExportTest.java`
+- Create: `android/app/src/androidTest/java/com/siyi/al/execution/bridge/CloudInboxTestHarness.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/RoomExecutionStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/db/AlExecutionDao.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngine.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionEngineStore.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/ExecutionRuntime.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/NativeModelGateway.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/TurnBridgeGateway.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/bridge/BridgeClient.java`
+- Modify: `android/app/src/androidTest/java/com/siyi/al/execution/RoomExecutionStoreTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/ExecutionEngineTest.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/bridge/BridgeClientTest.java`
+- Modify (cursor JSON compatibility): `android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java`
+- Modify (test-only lifecycle barrier): `android/app/src/main/java/com/siyi/al/execution/AlExecutionService.java`
+- Modify: `android/app/src/main/java/com/siyi/al/execution/AlNotificationStatus.java`
+- Modify: `android/app/src/test/java/com/siyi/al/execution/AlNotificationStatusTest.java`
+- Modify (event/poll ACK single-flight): `tavern-app/index.html`
+- Modify: `test-basic.mjs`
+- Modify: `tests/yuqi-ui-contract.test.mjs`
+- Modify (relay envelope byte contract): `yuqi-relay-worker.js`
+- Modify: `tests/yuqi-relay-worker.test.mjs`
 - Create: `tests/yuqi-v3-connected-race-contract.test.mjs`
+- Modify: `scripts/verify-yuqi-v3-readiness.mjs` (the `--run` gate must copy and
+  verify the shipped WebView assets before compiling or running connected tests)
 - Modify: `package.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/protocol-report.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/android-fallback-report.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/rollout-status.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/visible-path-metrics.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/quality-replay-plan.json`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/quality-replay.jsonl`
+- Create at runtime: `artifacts/yuqi-lived-agency-v3/quality-manual-review.jsonl`
+- Consume at runtime: `artifacts/yuqi-lived-agency-v3/history-source-v15.sqlite`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/readiness-input.json`
 - Create at runtime: `artifacts/yuqi-lived-agency-v3/readiness-report.json`
 
 **Interfaces:**
-- Consumes: baseline, clone migration, protocol, quality, races, rollout status, Node and Android test results.
-- Produces: `loadReadinessManifest({ manifestPath, evidenceDirectory }) -> evidence` and
+- Consumes: baseline, clone migration, protocol, the quality report plus its raw
+  plan/replay/manual-review authority artifacts, races, rollout status,
+  candidate-specific Android visible-path metrics, and Node/Android test results.
+- Produces: `loadReadinessManifest({ manifestPath, evidenceDirectory, sourceDirectory }) -> evidence` and
   `verifyReadiness(evidence) -> { ready, failedGates, checksums }`.
+
+`sourceDirectory` is the immutable candidate worktree root used to re-open the
+attested Gradle XML source. Tests may explicitly use their temporary source root;
+the CLI always passes its candidate `repoRoot` and never guesses a different tree.
 
 `verifyReadiness` never accepts the on-disk manifest shape directly. The only
 manifest ingestion path is `loadReadinessManifest`: it validates the closed
 manifest, resolves every declared path below the evidence directory, reads the
-ten manifest artifacts plus the connected wrapper's referenced XML, recomputes
+fifteen manifest artifacts plus the connected wrapper's referenced XML, recomputes
 their raw-byte SHA-256 values, parses their closed
 schemas, and returns the loaded top-level evidence object consumed by
 `verifyReadiness`. Tests must exercise a temporary-directory disk round trip
 through this loader. An in-memory object with convenient top-level
 `baseline/migration/...` properties is not manifest evidence and cannot make a
 run ready.
+
+Task 25 has two deliberately separate phases. First, the implementation,
+tests, input producers and verifier are reviewed and committed. Second, the
+formal evidence is generated from that exact immutable commit in a dedicated
+clean candidate worktree. Do not generate a green report from an uncommitted
+implementation and then commit it: that changes `sourceHead` and makes the
+report stale immediately. The shared development worktree may retain unrelated
+user dirt; it is never reset or cleaned to manufacture readiness. The clean
+candidate worktree is created at the reviewed Task 25 commit, and Task 26 must
+consume the report from that same commit/worktree.
+
+The baseline is an older immutable anchor, not the candidate source. Its own
+recorded `gitHead` and raw-file checksum remain unchanged and must not equal the
+candidate `sourceHead`. Migration evidence likewise binds its declared source
+database identity, clone identity, schema transition and raw report checksum.
+Only the readiness manifest, candidate-bound reports and generated test reports
+bind the exact current candidate `sourceHead`. A candidate run whose tracked or
+untracked source set is dirty (excluding only the selected evidence output
+directory) writes a closed `ready=false` report with
+`SOURCE_TREE_NOT_IMMUTABLE`; it cannot write `ready=true`.
 
 - [ ] **Step 1: Write a red test that refuses missing or stale evidence**
 
@@ -10105,9 +10177,9 @@ test('readiness requires every real design completion artifact for the same cand
   const result = verifyReadiness(loadReadinessManifest(fixture));
   assert.equal(result.ready, true);
   for (const missing of [
-    'baseline', 'migration', 'protocol', 'quality', 'races',
+    'baseline', 'migration', 'migrationClone', 'protocol', 'quality', 'races',
     'androidFallback', 'rolloutStatus', 'nodeTests', 'androidTests',
-    'connectedDeviceRaces'
+    'connectedDeviceRaces', 'visiblePathMetrics'
   ]) {
     const broken = writeCompleteReadinessFixtureToTemporaryDirectory();
     deleteArtifactFileOrManifestEntry(broken, missing);
@@ -10136,9 +10208,9 @@ Expected: FAIL on missing readiness verifier.
 ```js
 export function verifyReadiness(evidence) {
   const required = [
-    'baseline', 'migration', 'protocol', 'quality', 'races',
+    'baseline', 'migration', 'migrationClone', 'protocol', 'quality', 'races',
     'androidFallback', 'rolloutStatus', 'nodeTests', 'androidTests',
-    'connectedDeviceRaces'
+    'connectedDeviceRaces', 'visiblePathMetrics'
   ];
   const failedGates = required.filter(key => !evidence[key])
     .map(key => `MISSING_${key.toUpperCase()}`);
@@ -10162,9 +10234,48 @@ Add:
 }
 ```
 
-With `--run`, the command executes `npm.cmd test` and Android
-`gradlew.bat testDebugUnitTest assembleDebugAndroidTest
-connectedDebugAndroidTest`, captures exit codes and SHA-256 hashes of sanitized
+`generate-yuqi-v3-readiness-inputs.mjs` owns the three previously missing
+fixed report producers. The protocol producer actually executes the structural
+fixture batch and records exactly 30 cases for each of the nine closed rollout
+kinds, 270 total, zero failed/critical cases and zero live-shadow writes; an
+invented command string is not execution evidence. The Android-fallback
+producer executes the fixed Node sentinel and closes its command, source,
+fixture, output and TAP-count checksums. The rollout producer accepts only an
+explicit configured database, opens a read-only snapshot and validates an
+isolated `VACUUM INTO` clone; it never opens or migrates the source through
+`YuqiStore`. A missing database/config, multiple candidate identities, a
+pre-current schema or inconsistent rollout rows produces a closed unavailable
+report and can never be silently repaired into eligibility.
+
+With `--run`, the command first resolves the real 40-hex `git rev-parse HEAD`,
+verifies the candidate source worktree is immutable, and preflights every fixed
+report before any npm, Gradle, adb or device work. A missing private-history
+quality input, `eligible=false`, unavailable rollout database or another fixed
+gate failure materializes a checksummed `ready=false` report with the exact
+failure reason and exits without spending the device/build budget. It must not
+throw while trying to force a candidate ID from an ineligible quality report.
+
+Before any directory creation, artifact read or write, the evidence root must
+resolve below the candidate's `artifacts/yuqi-lived-agency-v3/` tree. Existing
+ancestors and every artifact parent/target are checked for symlinks, junctions,
+reparse escapes and realpath containment; the repository root, source folders,
+siblings and lexical `..` escapes are rejected with zero I/O outside the evidence
+tree. Source preflight returns a checksum-bound authority token over the exact
+HEAD, evidence realpath and NUL-safe outside-evidence porcelain status. The token
+is recomputed after runtime validation, immediately before formal collection and
+again after collection; any drift stops before the next expensive step. Runtime
+config, the read-only v15 database and candidate release are preflighted even when
+a test/custom formal finalizer is supplied, so changing the finalizer cannot skip
+production authority validation.
+Only an eligible preflight then verifies that the immutable candidate already
+contains its synchronized Android WebView assets. The formal runner must not run
+`npm.cmd run android:copy` or another source-mutating copy command. It fails closed
+unless the raw-byte SHA-256 of every shipped WebView file
+under `tavern-app/` matches its corresponding
+`android/app/src/main/assets/public/` file (with only Capacitor-generated
+cordova support files allowed on the Android side). Only then does it execute
+`npm.cmd test` and Android `gradlew.bat testDebugUnitTest
+assembleDebugAndroidTest connectedDebugAndroidTest`, captures exit codes and SHA-256 hashes of sanitized
 logs under the evidence directory, then validates all pre-existing reports. It
 computes file checksums itself; it never trusts a report's self-declared
 checksum without recomputing it.
@@ -10198,6 +10309,21 @@ same WebView. It may suppress an event or hold a JavaScript Promise only to
 create the named race; polling, replay, deduplication and UI application must
 still be performed by production code.
 
+The connected fixture may use the package-private `AlExecutionService` cleanup
+barrier published only after worker-owned cleanup reaches `STOPPED`. This is a
+test observation point, not a production control path; service-record absence
+from `ActivityManager` or a timed sleep is insufficient because Android may
+remove the service record before the worker releases Room/runtime resources.
+
+Scenes 9-11 exercise production cancellation, retained tombstone, LAN/cloud
+ingress and relay-envelope boundaries that were not visible when the original
+Task 25 file list was drafted. The added store, gateway, bridge, notification,
+WebView and relay files above are therefore explicit Task 25 scope, not
+unreviewed scope expansion. If any listed file also contains Task 20 lifecycle
+hunks, those lifecycle changes must be committed as a reviewed prerequisite or
+staged separately; unrelated hunks do not become Task 25 changes merely because
+the path appears in this list.
+
 Each of the eleven methods must prove its own fixed outcome rather than merely
 constructing `ExecutionRuntime`:
 
@@ -10210,7 +10336,7 @@ constructing `ExecutionRuntime`:
 | `plugin_promise_hangs_then_replay` | hold the first Web plugin Promise past its bounded timeout, reload/replay from persisted Room authority, and prove the stale Promise cannot block or duplicate the result |
 | `page_reload_before_ui_ack` | reload after DOM insertion but before UI acknowledgement; the reopened page must reconcile the exact group once and persist one acknowledgement |
 | `ambiguous_remote_timeout_never_falls_back` | hold a real loopback LAN response beyond the ambiguous timeout after the request is accepted; assert no local-model fallback, no second semantic result and later exact PC recovery |
-| `android_fallback_receipt_syncs_without_pc_redelivery` | commit through `commitAndroidFallback`, send exactly one production receipt request to the loopback boundary, then poll/replay the same persisted group and prove Android performs no second native/UI application or receipt request; PC import/non-redelivery authority is proved separately by the checksummed Node `android-fallback-authority` suite in `nodeTests`, not inferred from the loopback stub |
+| `android_fallback_receipt_syncs_without_pc_redelivery` | `commitAndroidFallback` remains checkpoint-v2 `JOURNAL_ONLY` for `android_fallback`/`local`: it emits neither `AUTHORITY_DELIVERY_RECEIPT` nor a legacy receipt.  A later legal LAN recovery request must carry the unique `authority_receipt` entry from `FallbackJournal`; the loopback returns `recoveryAckSeq`, after which the pending journal entry clears and polling/replay of the same persisted group proves zero second native/UI application, zero second journal send, and zero PC redelivery.  An independent probe turn may trigger recovery, but the completed fallback turn must never be resubmitted and the journal must not be faked by the test.  PC import/non-redelivery authority is proved separately by the checksummed Node `android-fallback-authority` suite in `nodeTests`. |
 | `conversation_clear_while_result_in_flight` | hold a real accepted result, apply the production clear control before Room/UI commit, then release it; assert redacted/suppressed Room outcome, no DOM/notification and advanced clear cursor after reopen |
 | `role_delete_pending_suppresses_late_lan_result` | persist a real pending role-delete control, release a late LAN result, and assert relay handling without Room semantic write, DOM application, receipt or notification |
 | `role_delete_applied_acks_late_cloud_without_semantic_write` | apply the real role-delete tombstone, deliver a repeated cloud terminal result, and assert one relay ACK with zero turn/message/action/UI/notification resurrection after process-style reopen |
@@ -10234,6 +10360,7 @@ closed top-level shape is:
   "artifacts": {
     "baseline": {"path": "", "sha256": ""},
     "migration": {"path": "", "sha256": ""},
+    "migrationClone": {"path": "", "sha256": ""},
     "protocol": {"path": "", "sha256": ""},
     "quality": {"path": "", "sha256": ""},
     "races": {"path": "", "sha256": ""},
@@ -10241,13 +10368,8 @@ closed top-level shape is:
     "rolloutStatus": {"path": "", "sha256": ""},
     "nodeTests": {"path": "", "sha256": ""},
     "androidTests": {"path": "", "sha256": ""},
-    "connectedDeviceRaces": {"path": "", "sha256": ""}
-  },
-  "metrics": {
-    "directReplyMedianMs": 0,
-    "directReplyP95Ms": 0,
-    "maximumVisibleMs": 0,
-    "shadowBlockedVisibleCount": 0
+    "connectedDeviceRaces": {"path": "", "sha256": ""},
+    "visiblePathMetrics": {"path": "", "sha256": ""}
   }
 }
 ```
@@ -10257,10 +10379,13 @@ online device selected for this run and must equal the serial recorded inside
 the connected-device report. Paths are resolved under the selected
 evidence directory and may not escape it. The verifier reads every file and
 recomputes raw-byte SHA-256; a syntactically valid self-declared checksum is
-not evidence. Candidate-bound reports (`quality`, `androidFallback`,
-`rolloutStatus`, `nodeTests`, `androidTests`, `connectedDeviceRaces`) must carry
-the manifest's exact candidate release ID. The immutable baseline and migration
-reports are instead bound by their recorded source/report checksum. Protocol,
+not evidence. Candidate-bound reports (`protocol`, `quality`, `androidFallback`,
+`rolloutStatus`, `nodeTests`, `androidTests`, `connectedDeviceRaces`,
+`visiblePathMetrics`) must carry
+the manifest's exact candidate release ID, candidate release checksum and clean
+candidate `sourceHead`. The immutable baseline, migration report and migration
+clone, plus the immutable Task 24 race report, are source anchors rather than
+candidate reports and are bound by their recorded/raw checksums. Protocol,
 quality, race and rollout schemas are validated for their required eligible or
 passed outcomes; a present failed report is not a green gate. `createdAt` and
 all artifact/result timestamps are native safe integers, not in the future,
@@ -10276,7 +10401,14 @@ results. `android-test-report.json.deviceSerial`, the connected report's
 `deviceSerial`, and manifest `deviceSerial` must be identical. The raw XML has
 no invented serial field and is accepted only through that wrapper after its
 bytes and mtime are verified. Invoke commands from the repository root
-using absolute `npm.cmd` and `android/gradlew.bat` paths. Before Gradle, parse
+using absolute `npm.cmd` and `android/gradlew.bat` paths. npm commands run from
+the repository root; Gradle runs with `android/` as its project working
+directory (an absolute wrapper path alone does not select the Gradle project).
+The Android command uses `--rerun-tasks`, and `android-test-report.json` derives
+its pass count from the unique fresh connected XML rather than expecting Node
+TAP counters in Gradle console output. The same report carries the Gradle output
+SHA-256 and the pre/post-build WebView asset SHA-256 map, so the manifest binds
+the bytes actually checked before the device run. Before Gradle, parse
 `adb devices -l`: unless `ANDROID_SERIAL` explicitly selects one authorized,
 online device, there must be exactly one authorized, online device and no
 ambiguous second candidate. Zero devices, a selected unauthorized/offline
@@ -10293,16 +10425,53 @@ on-device; `--run` must not assume an undeclared service on
 `127.0.0.1:17892`.
 
 The `--run` command materializes `readiness-input.json` itself from the fixed
-pre-existing artifact names `baseline.json`, `migration-report.json`,
+pre-existing artifact names `baseline.json`, `history-source-v15-migration-report.json`,
+`history-source-v15.sqlite`,
 `protocol-report.json`, `quality-report.json`, `race-report.json`,
-`android-fallback-report.json`, and `rollout-status.json`, plus the three
+`android-fallback-report.json`, `rollout-status.json`, and
+`visible-path-metrics.json`, together with `quality-replay-plan.json`,
+`quality-replay.jsonl`, and `quality-manual-review.jsonl`, plus the three
 manifest artifacts `node-test-report.json`, `android-test-report.json`, and
 `connected-device-race-report.json` from its unique run directory (the copied
 XML is evidence referenced and checksummed by the last artifact). It fails
 closed when any fixed input is absent;
 it never manufactures a passed prior-task report. A no-`--run` verification
 reads an explicitly supplied manifest and is used by Node tests with temporary
-real files.
+real files. The similarly named historical `migration-report.json` is an
+agency-state decision report, not the populated v14→v15 clone-migration proof,
+and must never satisfy the migration gate. The migration report is accepted
+only together with its referenced/source-bound v15 clone and closed
+`sourceUserVersion=14`, `workingUserVersion=15`, source-before/source-after
+identity, populated table counts and invariant summary. The clone is a separate
+`migrationClone` manifest artifact whose raw SHA-256 must equal
+`workingDatabaseSha256`; the verifier reopens it read-only and independently
+checks user version 15, populated table counts and the semantic invariant
+summary. A report without its exact clone bytes cannot pass.
+
+The connected wrapper also records `sourceRaceReportSha256` for the immutable
+Task 24 report bytes, `sourceRaceOverallChecksum`, `sourceRegistryChecksum` and
+the exact eleven `pending_connected_android` names it replaces. Those three
+checksums must recompute/equal the loaded source race report, and its result set
+must be a one-to-one match with those pending names;
+the other twelve PC results remain those of the original checksummed race
+report. A wrapper that merely contains eleven passing XML methods without that
+registry binding is not release evidence.
+
+The quality report is likewise never accepted as a self-authenticating summary.
+The readiness manifest carries three separate raw quality authorities: the exact
+verified replay plan JSON, append-only replay JSONL, and manual-review JSONL.
+Their raw byte checksums are committed by the report and recomputed by the
+readiness loader. One shared deep validator must reconstruct every expected
+`finalKey` from the plan and join it exactly once to its final row, attempt rows,
+execution pair and model-run rows. The final and attempt execution checksums must
+equal the pair execution checksum; every pair must bind the same clean
+`sourceHead`, stable release, candidate release ID/checksum and stable/candidate
+input checksums; duplicate, missing, extra or mismatched rows fail closed. The
+quality gate and manual-review result are re-derived from those loaded raw rows,
+not trusted from booleans in `quality-report.json`. Replay captures clean HEAD
+before the first execution and verifies the same clean HEAD again after the last
+execution and before appending evidence. A source or resource mutation during a
+run invalidates the whole run.
 
 `node-test-report.json` contains both the full `npm.cmd test` result and a
 separately executed fixed sentinel suite entry for
@@ -10310,6 +10479,12 @@ separately executed fixed sentinel suite entry for
 exact normalized command/path, exit code, native safe passed/failed/skipped
 counts and sanitized output checksum. The verifier requires exit code zero,
 passed greater than zero, failed/skipped zero, and the exact sentinel path;
+the full `npm test` command may contain multiple sequential `node --test`
+processes, so every TAP counter block must contain exactly
+`tests/pass/fail/skipped`, close independently as
+`tests = pass + fail + skipped`, and only then be aggregated. A missing,
+partial or internally inconsistent block fails closed. Both the full Node log
+and sentinel log SHA-256 values are stored in the checksummed report;
 neither a generic full-suite success nor a caller-supplied boolean proves the
 PC import/non-redelivery half of
 `android_fallback_receipt_syncs_without_pc_redelivery`.
@@ -10332,7 +10507,7 @@ PC import/non-redelivery half of
 }
 ```
 
-`artifactChecksums` has exactly the ten manifest artifact keys and their
+`artifactChecksums` has exactly the fifteen manifest artifact keys and their
 recomputed lowercase SHA-256 values. `inputSha256` is the raw-byte checksum of
 the exact `readiness-input.json` consumed. `reportChecksum` is SHA-256 of the
 canonical JSON object containing every preceding field and excluding only
@@ -10340,7 +10515,160 @@ canonical JSON object containing every preceding field and excluding only
 safe integers with `startedAt <= completedAt`, candidate/source/device equal
 the input, and `ready` is true exactly when `failedGates` is the empty array.
 
-Readiness also enforces visible-path latency evidence from quality/history/race runs:
+The same schema has one explicit blocked variant. When `ready=false`,
+`failedGates` is non-empty; `candidateReleaseId`, `sourceHead`, `inputSha256`
+and `deviceSerial` are either their already-verified native values or `null`
+(never invented empty-string identities). `artifactChecksums` still has exactly
+the fifteen keys, with a raw SHA-256 only for an artifact that was actually read
+and validated and `null` otherwise. A public blocked-report constructor never
+copies caller-supplied candidate/source/device identities; only an internal token
+returned by the corresponding completed validator may retain a verified identity.
+`ready=true` rejects every null and requires
+the complete manifest/candidate/device identities described above. The report
+checksum covers either closed variant.
+
+Visible-path performance is a separate candidate artifact, never an extra field
+smuggled into `quality-report.json` and never evaluator `latencyMs`. Its closed
+schema is `yuqi-v3-visible-path-metrics-v1` and contains the exact candidate
+release ID/checksum, clean `sourceHead`, device serial, one run ID, native safe
+start/end timestamps, `productionReleaseMutation=false`, a closed array of raw
+metadata-only samples, the four derived metrics below, and a canonical report
+checksum. Every sample is bound to one persisted candidate turn and contains
+only `sampleId`, `turnIdSha256`, `kind`, `pipelineReleaseId`,
+`authorityLineageKeySha256`, `visibleGroupIdSha256`, `createdAt`, `uiAppliedAt`,
+`elapsedMs`, `terminalDisposition`, and `authorityMode`; it contains no message,
+prompt, reply, memory or action content. `sampleId` and every identity hash are
+recomputed, `elapsedMs === uiAppliedAt - createdAt`, and every row must carry the
+manifest candidate release through the persisted Android `pipelineReleaseId`.
+
+The producer reads candidate-specific metadata from the Android Room database
+through a bounded instrumentation/export path and joins the authority mode to
+the matching checksummed PC lineage/group metadata. It must include at least
+twenty real `DIRECT_REPLY` samples and at least one real visible sample for every
+other turn/group rollout kind that can produce a visible terminal result.
+`LIFE_PLANNING` is excluded because its result lives in the independent two-phase
+life-attempt authority and has no canonical visible group. Formal performance
+coverage counts only candidate-authoritative `active_canary` samples. A normal shadow
+row is stable-authoritative/candidate-comparison and is excluded from candidate
+performance samples; when a window mixes active candidate rows with normal stable
+shadow rows, only the active candidate rows are exported. A candidate-authoritative
+shadow invariant conflict makes the metrics evidence unavailable rather than becoming
+a positive sample. Therefore a successful formal report has
+`shadowBlockedVisibleCount === 0`; any nonzero value is a
+`SHADOW_BLOCKED_VISIBLE_PATH` failure. The producer and verifier bind the raw Android export checksum, raw PC
+authority export checksum, device serial, candidate/source/run identity and the
+complete sample-set checksum. Connected fixture timing, canned loopback replies,
+blind-evaluator latency, caller-supplied aggregates and default zeroes are not
+performance evidence. Until this artifact exists and closes, the stable failure
+is `METRICS_EVIDENCE_UNAVAILABLE` and `ready=false`.
+
+The two raw inputs have fixed paths
+`private/visible-path-android.jsonl` and `private/visible-path-pc.jsonl`. Each
+starts with one closed metadata record and is followed by closed metadata-only
+rows; blank records and unknown keys fail closed. The Android metadata binds
+`candidateReleaseId`, `deviceSerial`, `runId`, `startedAt` and `completedAt`.
+Its rows own the Room timing fields and contain the hashed turn/lineage/group
+identities, rollout kind, release ID, disposition, `createdAt`, `uiAppliedAt`
+and derived elapsed time. Android does not own or copy the rollout authority
+mode. The independent PC metadata binds the same candidate ID, `runId`,
+`startedAt` and `completedAt`, plus the candidate release checksum and clean
+`sourceHead`; its rows contain only the hashed authority tuple, rollout kind,
+release ID and the authority mode derived from the pinned turn pipeline/comparison
+columns. The PC exporter selects every matching candidate receipt whose persisted
+`committed_at` is inside that closed run window. It may not accept an Android
+tuple allow-list, silently omit a matching PC row, or copy Android-only
+per-sample timing. PC rows must not copy Android-only timing or the
+final `sampleId`. Join exactly once on the turn/lineage/group hash tuple and then
+recompute every final sample ID. Missing, duplicate, foreign-release or cross-run
+rows fail closed. The verifier rereads both raw files from inside the evidence
+directory and recomputes their byte hashes and the same join instead of trusting
+the generated report. `directReplyMedianMs` uses the ordinary statistical median
+(for an even sample count, the arithmetic mean of the two middle values); P95
+uses the nearest-rank definition.
+
+Those JSONL files are outputs, not caller-authored inputs. The Android file is
+created only by a bounded Room authority exporter running against the selected
+device database; its closed attestation records producer version, Room user
+version, candidate/device/run identity, selected-row count and selection
+checksum. The PC file is created only by a read-only authority exporter against
+the configured runtime database. Before selecting any row it must run the same
+complete read-only v15 schema and authority-closure validator used by private
+history extraction; `user_version=15` plus a hand-made subset of tables is never
+a v15 authority source. Live and redacted groups both pass that full closure
+before redacted semantics may be omitted. Its closed attestation records producer
+version, source database raw SHA-256, read-only mode, user version,
+candidate/source/run identity, the same closed run timestamps, selected-row
+count and selection checksum. Each attestation has its own canonical checksum
+and is committed by the metrics report. The exporter snapshots the main database
+and the existence, size, mtime and SHA-256 of both `-wal` and `-journal` after its
+own read-only schema preflight, rechecks that complete signature after selection,
+immediately before atomic rename and immediately after rename, and removes an
+output whose final recheck fails. A non-empty sidecar or any external signature
+change is a failed run, never a best-effort snapshot.
+
+Formal collection is deliberately two-phase because a finish-time command cannot
+truthfully invent a start time before the real conversations happened. The begin
+operation runs from the clean candidate commit and writes only the private,
+closed `visible-path-collection-start.json`. It refuses any existing start/raw/
+metrics/failure output and freezes one UUID `runId`, the exact source HEAD, candidate
+release ID/checksum, one selected device serial, the configured runtime database
+path hash and a native-safe `startedAt`; its checksum covers every preceding
+field. It does not export samples. The same source candidate then accumulates
+real Android-visible interactions. Final readiness `--run` loads that start
+control. Before it invokes the formal finalizer or spends any adb/device/Gradle
+budget, readiness validates every fixed input other than the intentionally pending
+visible metrics, validates the runtime config and proves the source tree is clean
+while excluding only the selected directory below
+`artifacts/yuqi-lived-agency-v3/`; an arbitrary source directory cannot be hidden
+as evidence. It then proves the HEAD/candidate/device/database binding is unchanged, freezes
+`completedAt` after UI acknowledgements have settled, and invokes both exporters
+itself. It uses a run-specific app-private directory, resolves one absolute adb
+executable for device discovery, `run-as`, directory creation and pull, requires
+one passing instrumentation XML whose source path, device/test identity, mtime and
+run-before/run-after file snapshot prove it is new for this invocation, pulls
+the Android bytes with `adb exec-out run-as`, invokes
+the PC exporter against the bound database, and refuses any pre-existing PC raw
+or metrics output instead of deleting or reusing it. Any finalize failure writes
+one checksum-bound metadata-only `visible-path-collection-failed.json` beside the
+partial private evidence; the failed directory is immutable and a retry must use
+a new evidence directory rather than deleting or completing the old run.
+The top-level `readiness-report.json` is likewise created exclusively inside that
+evidence root. A blocked or completed report is never overwritten by a later
+attempt; a retry uses a new evidence directory.
+
+The finalizer rereads the selected XML from its repository-relative Gradle result
+path and requires its bytes and truncated mtime to equal the runner snapshot before
+copying it into evidence. Both the pre/post instrumentation snapshot and final
+reread walk every existing component from the candidate root through
+`connected/debug` to the XML with `lstat`, reject symlinks/junctions/reparse escapes,
+and require stable contained realpaths plus the same opened-file identity before and
+after reading; replacing the XML or any parent after the snapshot is a hard failure
+before raw/metrics evidence is written. Readiness independently scans the connected/debug result
+tree through that same no-follow reader and requires that attested fresh exporter XML to be the unique file with the
+bound bytes; a second self-consistent replay path is a hard failure. The Android
+collection attestation also carries a closed `android-pull` command descriptor,
+checksum and zero exit code. Its command is an absolute `adb` executable and its
+arguments must be exactly the selected serial plus `exec-out run-as com.siyi.al cat`
+for the run-bound app-private output path; instrumentation and pull are never
+collapsed into one unverifiable command claim.
+
+The resulting `visible-path-metrics.json` remains the fifteenth manifest artifact
+and adds one closed `collectionAttestation`; no sixteenth manifest artifact is
+created. That attestation binds the start-control checksum, UUID/source/candidate/
+device/time tuple, hashes of the exact Android and PC command descriptors, both
+exit codes, the fresh instrumentation XML source path/mtime/launch time and
+SHA-256, both raw JSONL SHA-256 values,
+and the PC exporter read-only/source-database proof. Its own canonical checksum
+excludes only that checksum field, while the metrics report checksum includes the
+whole attestation. The readiness verifier rereads the start control, XML and both
+raw files, recomputes every bound hash and rejects a caller-authored structural
+post-processor report that lacks this formal record. Explicit raw paths remain
+available only for isolated post-processor tests and can never produce
+`ready=true`. The PC exporter selects candidate receipts solely by persisted
+`committed_at` inside the frozen closed window; group creation may predate the
+window, and no caller turn/lineage/group allow-list is accepted.
+
+Readiness enforces the following derived values from that artifact:
 
 ```js
 if (metrics.directReplyMedianMs > 60_000) failedGates.push('DIRECT_MEDIAN_ABOVE_TARGET');
@@ -10351,31 +10679,61 @@ if (metrics.shadowBlockedVisibleCount > 0) failedGates.push('SHADOW_BLOCKED_VISI
 
 The one-minute median is the performance target; any visible reply above five minutes is a hard release failure.
 
-- [ ] **Step 4: Run the complete source and platform verification**
+- [ ] **Step 4: Prove the implementation gates and commit the reviewed candidate**
 
-Run:
+Run the focused verifier/input-producer tests, the fixed Node and Android
+source gates, the eleven connected cases and the full repository suite. Review
+and stage only the Task 25 whitelist (and any separately reviewed prerequisite
+lifecycle commit); never stage unrelated shared-worktree dirt. Commit the
+implementation before generating formal release evidence so the candidate has
+one immutable source HEAD.
+
+```powershell
+git add <reviewed Task 25 whitelist only>
+git commit -m "test: gate Yuqi v3 release readiness"
+```
+
+- [ ] **Step 5: Generate formal evidence from the clean candidate commit**
+
+Create a dedicated clean worktree at the exact Step 4 commit. Run all following
+commands from that worktree; generated evidence stays below its selected
+evidence directory and does not authorize edits to the shared development
+worktree. First generate and validate the candidate/quality identity:
 
 ```powershell
 npm run cognition:quality:check
 npm run cognition:replay
 npm run cognition:replay-report
+npm run cognition:quality:replay -- --stable-from artifacts/yuqi-lived-agency-v3/baseline.json --candidate-preset 2.1.0
 npm run cognition:quality:report -- --out artifacts/yuqi-lived-agency-v3/quality-report.json
+```
+
+Before real candidate use begins, create the immutable collection start control
+once. The begin command derives the candidate ID/checksum from that validated
+quality bundle and proves the same release exists in the configured v15 runtime:
+
+```powershell
+npm run cognition:v3:visible-path:formal -- --begin --evidence-dir artifacts/yuqi-lived-agency-v3 --runtime-config <absolute-private-runtime-config>
+```
+
+Use only that candidate/device/runtime until the required real visible samples
+have accumulated. A failed or stale begin record is never overwritten in place;
+start a new evidence directory/run instead.
+
+After the sample minimum is genuinely present, finish the remaining evidence and
+readiness gates:
+
+```powershell
 node scripts/verify-yuqi-v3-races.mjs --out artifacts/yuqi-lived-agency-v3/race-report.json
-npm run cognition:v3:readiness -- --run --evidence-dir artifacts/yuqi-lived-agency-v3 --out artifacts/yuqi-lived-agency-v3/readiness-report.json
+npm run cognition:v3:readiness -- --run --evidence-dir artifacts/yuqi-lived-agency-v3 --runtime-config <absolute-private-runtime-config> --out artifacts/yuqi-lived-agency-v3/readiness-report.json
 ```
 
 Expected: every command exits 0, all 12 PC race cases and all 11 connected
 device cases are proven, and readiness says `ready=true`. If no Android device
-is attached, quality is not eligible, migration validation differs, a race
+is attached, quality is not eligible, real candidate visible-path samples are
+missing, migration validation differs, a race
 fails, or Android fallback fails, readiness must say `ready=false` and stop
 before versioning or publishing.
-
-- [ ] **Step 5: Commit the verifier after green**
-
-```powershell
-git add scripts/verify-yuqi-v3-readiness.mjs tests/yuqi-v3-readiness.test.mjs android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceTest.java android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3ConnectedRaceFixture.java android/app/src/androidTest/java/com/siyi/al/execution/YuqiV3WebViewHarness.java tests/yuqi-v3-connected-race-contract.test.mjs package.json
-git commit -m "test: gate Yuqi v3 release readiness"
-```
 
 ### Task 26: Select an Unused Android Version and Publish a Matching Signed OTA
 

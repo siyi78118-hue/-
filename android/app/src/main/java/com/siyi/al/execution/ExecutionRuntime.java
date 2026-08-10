@@ -13,6 +13,7 @@ import com.siyi.al.execution.bridge.BridgeRouter;
 import com.siyi.al.execution.bridge.BridgeMode;
 import com.siyi.al.execution.bridge.FallbackJournal;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.json.JSONObject;
 
 final class ExecutionRuntime {
@@ -36,8 +37,8 @@ final class ExecutionRuntime {
             BridgeClient bridgeClient = new BridgeClient(
                 bridgeConfig,
                 fallbackJournal,
-                (turnId, raw) -> store.recordDiagnostic(
-                    turnId, null, "INFO", "BRIDGE_STATUS", raw, System.currentTimeMillis()
+                (turnId, raw) -> store.recordBridgeStatusIfActive(
+                    turnId, raw, System.currentTimeMillis()
                 ),
                 cloudInboxConsumer(mirror, bridgeStore, bridgeConfig.deviceId)
             );
@@ -53,6 +54,20 @@ final class ExecutionRuntime {
     }
 
     static int drainCloudInbox(Context context) throws Exception {
+        return drainCloudInboxInternal(context, null, null);
+    }
+
+    /** Test-only ingress seam: transport is injected, while config/journal/mirror/consumer stay real. */
+    static int drainCloudInboxForTesting(
+        Context context, BridgeClient.Transport transport, AtomicInteger persistCalls
+    ) throws Exception {
+        if (transport == null) throw new IllegalArgumentException("cloud transport required");
+        return drainCloudInboxInternal(context, transport, persistCalls);
+    }
+
+    private static int drainCloudInboxInternal(
+        Context context, BridgeClient.Transport transport, AtomicInteger persistCalls
+    ) throws Exception {
         AlExecutionDatabase database = AlExecutionDatabase.get(context);
         drainRoleNotificationCancellations(context, database);
         AlSecretStore secrets = new AlSecretStore(context);
@@ -61,7 +76,28 @@ final class ExecutionRuntime {
         FallbackJournal journal = new FallbackJournal(database.executionDao(), config.deviceId);
         RoomExecutionStore store = new RoomExecutionStore(database, config.deviceId);
         RoomBridgeMirror mirror = new RoomBridgeMirror(database.executionDao(), store, config.deviceId);
-        BridgeClient client = new BridgeClient(config, journal, null, cloudInboxConsumer(mirror, store, config.deviceId));
+        BridgeClient.CloudInboxConsumer consumer = cloudInboxConsumer(mirror, store, config.deviceId);
+        if (persistCalls != null) {
+            BridgeClient.CloudInboxConsumer delegate = consumer;
+            consumer = new BridgeClient.CloudInboxConsumer() {
+                @Override public boolean persist(String raw) throws Exception {
+                    persistCalls.incrementAndGet();
+                    return delegate.persist(raw);
+                }
+                @Override public void recordRejected(String relayMessageId, String reason, long now)
+                    throws Exception {
+                    delegate.recordRejected(relayMessageId, reason, now);
+                }
+                @Override public boolean applyLifecycleControl(
+                    String raw, String relayMessageId, Long relayExpiresAt, long now
+                ) throws Exception {
+                    return delegate.applyLifecycleControl(raw, relayMessageId, relayExpiresAt, now);
+                }
+            };
+        }
+        BridgeClient client = transport == null
+            ? new BridgeClient(config, journal, null, consumer)
+            : BridgeClient.forTestingTransport(config, journal, transport, consumer);
         return client.drainCloudInbox();
     }
 

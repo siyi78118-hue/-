@@ -523,6 +523,28 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT :limit")
     List<ChatTurnEntity> recentCompletedTurns(int limit);
 
+    /**
+     * Bounded read-only source rows for the Android visible-path exporter.
+     * The exporter performs the remaining authority/receipt closure checks;
+     * this query must never mutate or manufacture Room rows.
+     */
+    @Query("SELECT * FROM chat_turns "
+        + "WHERE state = 'COMPLETED' AND deletedAt IS NULL "
+        + "AND uiAppliedAt IS NOT NULL AND pipelineReleaseId = :pipelineReleaseId "
+        + "AND createdAt >= :fromCreatedAt AND createdAt <= :toCreatedAt "
+        + "AND uiAppliedAt >= :fromCreatedAt AND uiAppliedAt <= :toCreatedAt "
+        + "ORDER BY createdAt ASC, turnId ASC")
+    List<ChatTurnEntity> visiblePathRowsInWindow(
+        String pipelineReleaseId, long fromCreatedAt, long toCreatedAt);
+
+    @Query("SELECT COUNT(*) FROM chat_turns "
+        + "WHERE state = 'COMPLETED' AND deletedAt IS NULL "
+        + "AND uiAppliedAt IS NOT NULL AND pipelineReleaseId = :pipelineReleaseId "
+        + "AND createdAt >= :fromCreatedAt AND createdAt <= :toCreatedAt "
+        + "AND uiAppliedAt >= :fromCreatedAt AND uiAppliedAt <= :toCreatedAt")
+    long visiblePathRowCountInWindow(
+        String pipelineReleaseId, long fromCreatedAt, long toCreatedAt);
+
     @Query("UPDATE chat_turns SET uiAppliedAt = :now WHERE turnId = :turnId AND state = 'COMPLETED' AND uiAppliedAt IS NULL")
     int acknowledgeUiApplied(String turnId, long now);
 

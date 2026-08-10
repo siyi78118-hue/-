@@ -36,6 +36,24 @@ import org.json.JSONException;
 public final class RoomExecutionStore implements ExecutionStore, ExecutionEngineStore,
     BridgeReceiptDeliveryCoordinator.Store {
     public enum DeliveryDisposition { APPLY, REDACTED }
+    interface TestDeliveryDispositionObserver {
+        void onDisposition(DeliveryDisposition disposition);
+    }
+    private static volatile TestDeliveryDispositionObserver testDeliveryDispositionObserver;
+
+    static void setTestDeliveryDispositionObserver(TestDeliveryDispositionObserver observer) {
+        testDeliveryDispositionObserver = observer;
+    }
+
+    private static void observeTestDeliveryDisposition(DeliveryDisposition disposition) {
+        TestDeliveryDispositionObserver observer = testDeliveryDispositionObserver;
+        if (observer == null || disposition == null) return;
+        try {
+            observer.onDisposition(disposition);
+        } catch (Throwable ignored) {
+            // Test-only observation must never alter the transaction outcome.
+        }
+    }
     /** A role-plan claim failed inside its atomic Room transaction. */
     public static final class AtomicRolePlanSubmissionException extends IllegalStateException {
         public AtomicRolePlanSubmissionException(String message, Throwable cause) {
@@ -1085,6 +1103,29 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         AtomicReference<DeliveryDisposition> disposition = new AtomicReference<>();
         database.runInTransaction(() -> disposition.set(
             commitBridgedTerminalInternal(turnId, attemptId, result, now)));
+        observeTestDeliveryDisposition(disposition.get());
+        return disposition.get();
+    }
+
+    @Override
+    public DeliveryDisposition commitBridgedTerminalWithPeer(
+        String turnId,
+        String attemptId,
+        BridgeResult result,
+        String authenticatedPeerId,
+        long now
+    ) {
+        AtomicReference<DeliveryDisposition> disposition = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            if (tryConsumeLateRoleDeleteResult(
+                turnId, result, authenticatedPeerId, BridgeResult.Kind.CANONICAL_TERMINAL)) {
+                disposition.set(DeliveryDisposition.REDACTED);
+                return;
+            }
+            disposition.set(commitBridgedTerminalInternal(
+                turnId, attemptId, result, now, authenticatedPeerId));
+        });
+        observeTestDeliveryDisposition(disposition.get());
         return disposition.get();
     }
 
@@ -1094,6 +1135,16 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         BridgeResult result,
         long now
     ) {
+        return commitBridgedTerminalInternal(turnId, attemptId, result, now, null);
+    }
+
+    private DeliveryDisposition commitBridgedTerminalInternal(
+        String turnId,
+        String attemptId,
+        BridgeResult result,
+        long now,
+        String authenticatedPeerId
+    ) {
         try {
             if (result == null || result.kind != BridgeResult.Kind.CANONICAL_TERMINAL
                 || now <= 0L || now > 9007199254740991L) {
@@ -1101,10 +1152,14 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
             ChatTurnEntity turn = requireTurn(turnId);
             assertRoleAcceptsSemanticWrite(turn.characterId);
-            if (!isStoreOwnedV3(turn) || !attemptId.equals(turn.activeAttemptId)) {
+            if (!attemptId.equals(turn.activeAttemptId)) {
                 throw bridgeAuthorityConflict(turnId);
             }
             ExecutionAttemptEntity activeAttempt = dao.attempt(attemptId);
+            boolean clearTombstoneReplay = isConversationClearTombstoneReplay(turn, activeAttempt);
+            if (!clearTombstoneReplay && !isStoreOwnedV3(turn)) {
+                throw bridgeAuthorityConflict(turnId);
+            }
             if (activeAttempt == null || !turnId.equals(activeAttempt.turnId)
                 || activeAttempt.sequence != dao.maxAttemptSequence(turnId)) {
                 throw bridgeAuthorityConflict(turnId);
@@ -1119,6 +1174,21 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
 
             JSONObject activeOutcome = activeCheckpoint.getJSONObject("outcome");
             String activeOutcomeType = activeOutcome.getString("type");
+            if ("redacted".equals(activeOutcomeType)
+                && "conversation-clear-redacted-v1".equals(
+                    activeOutcome.optJSONObject("result") == null
+                        ? null : activeOutcome.optJSONObject("result").optString("contract"))) {
+                // A canonical result that was already in flight when a
+                // conversation clear won is a validated tombstone replay. It
+                // must be consumed without resurrecting COMMITTED authority,
+                // semantic parts, raw messages, diagnostics, or cursor state.
+                validateConversationClearTombstone(
+                    turn, activeAttempt, activeCheckpoint, activeOutcome, false, true);
+                assertAuthenticatedPeerMatchesClearControl(
+                    authenticatedPeerId, activeOutcome, turnId);
+                return DeliveryDisposition.REDACTED;
+            }
+            assertAuthenticatedPeerMatchesCheckpoint(authenticatedPeerId, activeCheckpoint, turnId);
             if ("committed".equals(activeOutcomeType) || "redacted".equals(activeOutcomeType)
                 || TurnState.COMPLETED.name().equals(turn.state)) {
                 return validateExactCanonicalTerminalReplay(
@@ -1232,6 +1302,103 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     ) {
         database.runInTransaction(() -> commitVerifiedRemoteFailureInternal(
             turnId, attemptId, result, now));
+        observeTestDeliveryDisposition(DeliveryDisposition.APPLY);
+    }
+
+    @Override
+    public void commitVerifiedRemoteFailureWithPeer(
+        String turnId,
+        String attemptId,
+        BridgeResult result,
+        String authenticatedPeerId,
+        long now
+    ) {
+        AtomicReference<DeliveryDisposition> disposition = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            if (tryConsumeLateRoleDeleteResult(
+                turnId, result, authenticatedPeerId, BridgeResult.Kind.VERIFIED_REMOTE_FAILURE)) {
+                disposition.set(DeliveryDisposition.REDACTED);
+                return;
+            }
+            commitVerifiedRemoteFailureInternal(
+                turnId, attemptId, result, now, authenticatedPeerId);
+            disposition.set(DeliveryDisposition.APPLY);
+        });
+        observeTestDeliveryDisposition(disposition.get());
+    }
+
+    /**
+     * A v3 LAN result can arrive after role deletion has durably removed its
+     * turn.  Only the authenticated, store-owned peer and the retained
+     * role-delete control authorize this zero-write terminal outcome.  This is
+     * deliberately shared by canonical terminals and verified failures; all
+     * other routes/kinds continue through the ordinary turn-bound validators.
+     */
+    private boolean tryConsumeLateRoleDeleteResult(
+        String turnId,
+        BridgeResult result,
+        String authenticatedPeerId,
+        BridgeResult.Kind expectedKind
+    ) {
+        if (dao.turn(turnId) != null) return false;
+        if (result == null || result.kind != expectedKind || result.protocolVersion != 3
+            || !"lan".equals(result.origin) || result.deliveryRoute == null
+            || !"lan".equals(result.deliveryRoute) || result.relayMessageId != null
+            || result.roleId == null || result.roleId.trim().isEmpty()
+            || authenticatedPeerId == null || authenticatedPeerId.trim().isEmpty()) {
+            throw bridgeAuthorityConflict(turnId);
+        }
+        LifecycleControl control = roleDeleteControl(result.roleId);
+        if (control == null || !LifecycleControl.ROLE_DELETE_KIND.equals(control.controlKind)
+            || !authenticatedPeerId.equals(control.peerId)) {
+            throw bridgeAuthorityConflict(turnId);
+        }
+        return true;
+    }
+
+    /**
+     * Peer-aware LAN entry points must bind the authenticated transport peer to
+     * the device identity frozen in the validated checkpoint before any
+     * ordinary terminal/failure mutation is attempted.  The legacy overloads
+     * pass null and intentionally retain their historical behavior.
+     */
+    private static void assertAuthenticatedPeerMatchesCheckpoint(
+        String authenticatedPeerId,
+        JSONObject checkpoint,
+        String turnId
+    ) {
+        if (authenticatedPeerId == null) return;
+        try {
+            String checkpointPeer = requireNativeNonEmptyString(
+                checkpointEnvelope(checkpoint), "deviceId", turnId);
+            if (!authenticatedPeerId.equals(checkpointPeer)) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw bridgeAuthorityConflict(turnId);
+        }
+    }
+
+    private void assertAuthenticatedPeerMatchesClearControl(
+        String authenticatedPeerId,
+        JSONObject outcome,
+        String turnId
+    ) {
+        if (authenticatedPeerId == null) return;
+        try {
+            JSONObject result = outcome.getJSONObject("result");
+            LifecycleControlEntity control = dao.lifecycleControl(result.getString("controlId"));
+            if (control == null || !LifecycleControl.CLEAR_KIND.equals(control.controlKind)
+                || !authenticatedPeerId.equals(control.peerId)) {
+                throw bridgeAuthorityConflict(turnId);
+            }
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw bridgeAuthorityConflict(turnId);
+        }
     }
 
     private void commitVerifiedRemoteFailureInternal(
@@ -1240,6 +1407,16 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         BridgeResult result,
         long now
     ) {
+        commitVerifiedRemoteFailureInternal(turnId, attemptId, result, now, null);
+    }
+
+    private void commitVerifiedRemoteFailureInternal(
+        String turnId,
+        String attemptId,
+        BridgeResult result,
+        long now,
+        String authenticatedPeerId
+    ) {
         try {
             if (result == null || result.kind != BridgeResult.Kind.VERIFIED_REMOTE_FAILURE
                 || now <= 0L || now > 9007199254740991L) {
@@ -1247,10 +1424,12 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
             ChatTurnEntity turn = requireTurn(turnId);
             assertRoleAcceptsSemanticWrite(turn.characterId);
-            if (!isStoreOwnedV3(turn) || !attemptId.equals(turn.activeAttemptId)) {
+            ExecutionAttemptEntity attempt = dao.attempt(attemptId);
+            boolean clearTombstoneReplay = isConversationClearTombstoneReplay(turn, attempt);
+            if ((!clearTombstoneReplay && !isStoreOwnedV3(turn))
+                || !attemptId.equals(turn.activeAttemptId)) {
                 throw bridgeAuthorityConflict(turnId);
             }
-            ExecutionAttemptEntity attempt = dao.attempt(attemptId);
             if (attempt == null || !turnId.equals(attempt.turnId)
                 || attempt.sequence != dao.maxAttemptSequence(turnId)) {
                 throw bridgeAuthorityConflict(turnId);
@@ -1259,8 +1438,21 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             validateCheckpointSet(turn, attempts, true);
             JSONObject checkpoint = validateCheckpoint(turn, attempt, false);
             assertCanonicalBridgeLifecycle(turn, attempt, false, checkpoint);
-            validateCanonicalFailureResult(turn, checkpoint, result);
             JSONObject currentOutcome = checkpoint.getJSONObject("outcome");
+            if (clearTombstoneReplay
+                && "redacted".equals(currentOutcome.optString("type"))
+                && "conversation-clear-redacted-v1".equals(
+                    currentOutcome.optJSONObject("result") == null
+                        ? null : currentOutcome.optJSONObject("result").optString("contract"))) {
+                validateCanonicalFailureResult(turn, checkpoint, result);
+                validateConversationClearTombstone(
+                    turn, attempt, checkpoint, currentOutcome, false, true);
+                assertAuthenticatedPeerMatchesClearControl(
+                    authenticatedPeerId, currentOutcome, turnId);
+                return;
+            }
+            assertAuthenticatedPeerMatchesCheckpoint(authenticatedPeerId, checkpoint, turnId);
+            validateCanonicalFailureResult(turn, checkpoint, result);
             if ("verified_remote_failure".equals(currentOutcome.getString("type"))) {
                 if (!BridgeAuthority.canonicalJson(currentOutcome.getJSONObject("failure"))
                     .equals(BridgeAuthority.canonicalJson(result.authorityPayload()))
@@ -1386,6 +1578,25 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         long now
     ) {
         insertDiagnostic(turnId, attemptId, level, code, detail, now);
+    }
+
+    /**
+     * Persist a bridge status only while its live turn and role authority still
+     * exist. A late LAN response after role deletion is transport evidence, not
+     * a semantic diagnostic, and must be suppressed in the same Room boundary.
+     */
+    public boolean recordBridgeStatusIfActive(String turnId, String detail, long now) {
+        AtomicReference<Boolean> inserted = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = dao.turn(turnId);
+            if (turn == null || isRoleDeleteTombstoned(turn.characterId)) return;
+            ExecutionAttemptEntity attempt = turn.activeAttemptId == null
+                ? null : dao.attempt(turn.activeAttemptId);
+            if (isConversationClearTombstoneReplay(turn, attempt)) return;
+            insertDiagnostic(turnId, turn.activeAttemptId, "INFO", "BRIDGE_STATUS", detail, now);
+            inserted.set(true);
+        });
+        return Boolean.TRUE.equals(inserted.get());
     }
 
     /**
@@ -1643,8 +1854,12 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     ) {
         assertRoleAcceptsSemanticWrite(characterId);
         ConversationCursorEntity cursor = cursorFor(characterId, now);
-        if ((cursor.clearEpoch > 0L && localSequence <= cursor.clearedThroughSequence)
-            || localSequence < cursor.localSequence) return;
+        if (cursor.clearEpoch > 0L && localSequence <= cursor.clearedThroughSequence) return;
+        // A later local turn may have advanced localSequence before an older
+        // completed result is applied in the UI.  That result is still valid
+        // when it is newer than the UI anchor; only the clear boundary and a
+        // stale UI sequence suppress it.
+        if (localSequence < cursor.uiAppliedSequence) return;
         boolean advancesUi = localSequence > cursor.uiAppliedSequence
             || (localSequence == cursor.uiAppliedSequence
                 && (cursor.uiAppliedGroupId == null || cursor.uiAppliedGroupId.equals(visibleGroupId)));
@@ -3973,8 +4188,8 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             // separate while walking the member chain.
             representatives.add(new MemberCheckpoint(aggregate.first.attempt, outcome.checkpoint));
         }
-        MemberCheckpoint previousDistinct = null;
-        for (MemberCheckpoint member : representatives) {
+            MemberCheckpoint previousDistinct = null;
+            for (MemberCheckpoint member : representatives) {
             if (previousDistinct == null) {
                 assertDeterministicMember(turn, member, null);
                 previousDistinct = member;
@@ -4529,6 +4744,10 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         MemberCheckpoint parent
     ) {
         try {
+            if (isConversationClearTombstoneCheckpoint(turn, member.checkpoint)) {
+                assertConversationClearTombstoneMember(turn, member);
+                return;
+            }
             TurnSubmission persisted = new TurnSubmission(
                 turn.turnId, turn.characterId, turn.sourceMessageId, TurnKind.valueOf(turn.kind),
                 turn.inputJson, turn.snapshotJson, turn.cloudJobId, turn.createdAt
@@ -4556,6 +4775,72 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             }
             String expectedRemote = AuthorityIdentity.remoteRetryTurnId(member.attempt.attemptId);
             if (!expectedRemote.equals(checkpoint.getString("authoritativeTurnId"))) {
+                throw bridgeAuthorityConflict(turn.turnId);
+            }
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw bridgeAuthorityConflict(turn.turnId);
+        }
+    }
+
+    private static boolean isConversationClearTombstoneReplay(
+        ChatTurnEntity turn,
+        ExecutionAttemptEntity attempt
+    ) {
+        if (turn == null || turn.bridgeProtocolVersion == null
+            || turn.bridgeProtocolVersion != 3 || attempt == null
+            || attempt.bridgeAuthorityCheckpointJson == null
+            || attempt.bridgeAuthorityCheckpointChecksum == null) {
+            return false;
+        }
+        try {
+            JSONObject checkpoint = new JSONObject(attempt.bridgeAuthorityCheckpointJson);
+            return isConversationClearTombstoneCheckpoint(turn, checkpoint);
+        } catch (Exception error) {
+            return false;
+        }
+    }
+
+    private static boolean isConversationClearTombstoneCheckpoint(
+        ChatTurnEntity turn,
+        JSONObject checkpoint
+    ) {
+        if (turn == null || turn.bridgeProtocolVersion == null
+            || turn.bridgeProtocolVersion != 3 || checkpoint == null) return false;
+        JSONObject outcome = checkpoint.optJSONObject("outcome");
+        JSONObject result = outcome == null ? null : outcome.optJSONObject("result");
+        return exactSafeInteger(checkpoint, "version", false) == 1L
+            && outcome != null
+            && "redacted".equals(outcome.optString("type"))
+            && result != null
+            && "conversation-clear-redacted-v1".equals(result.optString("contract"));
+    }
+
+    private static void assertConversationClearTombstoneMember(
+        ChatTurnEntity turn,
+        MemberCheckpoint member
+    ) {
+        try {
+            JSONObject checkpoint = member.checkpoint;
+            String retryOf = nullableString(checkpoint, "retryOfTurnId");
+            String expectedRemote = retryOf == null
+                ? BridgeInput.wireTurnId(turn.turnId, TurnKind.valueOf(turn.kind))
+                : AuthorityIdentity.remoteRetryTurnId(member.attempt.attemptId);
+            String lineage = checkpoint.getString("authorityLineageKey");
+            String lane = checkpoint.getString("laneKey");
+            if (!expectedRemote.equals(checkpoint.getString("authoritativeTurnId"))
+                || turn.authorityLineageKey == null
+                || !lineage.equals(turn.authorityLineageKey)
+                || turn.laneKey == null || !lane.equals(turn.laneKey)
+                || turn.lineageRevision == null
+                || turn.lineageRevision != checkpoint.getLong("claimedLineageRevision")
+                || turn.inputVisibilitySequence == null
+                || turn.inputVisibilitySequence != checkpoint.getLong("inputVisibilitySequence")
+                || turn.inputClearEpoch == null
+                || turn.inputClearEpoch != checkpoint.getLong("inputClearEpoch")
+                || !"{}".equals(turn.inputJson)
+                || !"{}".equals(turn.snapshotJson)) {
                 throw bridgeAuthorityConflict(turn.turnId);
             }
         } catch (RuntimeException error) {
@@ -4712,10 +4997,37 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 if (candidate.bridgeAuthorityCheckpointJson == null) continue;
                 try {
                     JSONObject checkpoint = validateCheckpoint(anchor, candidate, false);
-                    remoteTurnId = checkpoint.getString("authoritativeTurnId");
                     JSONObject outcome = checkpoint.getJSONObject("outcome");
-                    if ("committed".equals(outcome.getString("type"))) {
-                        remoteTurnId = outcome.getJSONObject("result").getString("turnId");
+                    long checkpointVersion = exactSafeInteger(checkpoint, "version", false);
+                    if (checkpointVersion == 1L && "committed".equals(outcome.getString("type"))) {
+                        // Canonical PC results carry their authoritative turn at
+                        // result.turnId.  validateCheckpoint has already closed the
+                        // complete v1 result shape before this projection.
+                        Object resultTurnId = outcome.getJSONObject("result").opt("turnId");
+                        if (!(resultTurnId instanceof String) || ((String) resultTurnId).isEmpty()) {
+                            throw bridgeAuthorityConflict(characterId);
+                        }
+                        remoteTurnId = (String) resultTurnId;
+                    } else if (checkpointVersion == 2L
+                        && "committed".equals(outcome.getString("type"))) {
+                        // The validated v2 local fallback receipt intentionally has
+                        // no top-level result.turnId. Reuse the existing extractor
+                        // (rather than a second receipt validator) and bind the
+                        // semantic authority back to the checkpoint tuple.
+                        JSONObject receipt = BridgeReceiptCheckpoint.extractLocalAuthorityReceipt(
+                            candidate.bridgeAuthorityCheckpointJson,
+                            candidate.bridgeAuthorityCheckpointChecksum);
+                        if (receipt == null) throw bridgeAuthorityConflict(characterId);
+                        JSONObject semantic = receipt.optJSONObject("semantic");
+                        String fallbackTurnId = semantic == null
+                            ? null : semantic.optString("authoritativeTurnId", null);
+                        if (fallbackTurnId == null || fallbackTurnId.isEmpty()
+                            || !fallbackTurnId.equals(checkpoint.getString("authoritativeTurnId"))) {
+                            throw bridgeAuthorityConflict(characterId);
+                        }
+                        remoteTurnId = fallbackTurnId;
+                    } else {
+                        remoteTurnId = checkpoint.getString("authoritativeTurnId");
                     }
                     remoteGroupId = anchor.visibleGroupId == null ? remoteTurnId : anchor.visibleGroupId;
                     break;
@@ -5119,6 +5431,11 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         ConversationAuthorityEntity authority = dao.conversationAuthority(
             checkpoint.getString("authorityLineageKey"));
         if (authority == null || !"CANCELLED".equals(authority.state)
+            || !turn.characterId.equals(authority.characterId)
+            || !checkpoint.getString("laneKey").equals(authority.laneKey)
+            || !checkpoint.getString("authorityLineageKey").equals(
+                AuthorityIdentity.lineageKey(
+                    authority.characterId, authority.laneKey, authority.rootSourceId))
             || !checkpoint.getString("authoritativeTurnId").equals(authority.latestTurnId)
             || authority.revision != checkpoint.getLong("claimedLineageRevision") + 1L
             || authority.visibleGroupId != null || authority.commitChecksum != null

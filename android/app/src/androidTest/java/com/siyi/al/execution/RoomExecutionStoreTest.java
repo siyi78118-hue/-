@@ -790,6 +790,29 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void peerAwareTerminalCommitRejectsForeignAuthenticatedPeerBeforeAnyWrite() throws Exception {
+        String turnId = "local-v3-peer-aware-terminal";
+        store.submitTurn(yuqiThreeBubbleSubmission(turnId, "msg-peer-aware-terminal-3", 205L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(turnId), "device_gateway", 206L);
+        ExecutionAttemptEntity attempt = store.activeAttempt(turnId);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalTerminal(checkpoint, "visible", 3, new JSONArray()).toString(),
+            "lan", null);
+        long changes = rowCount("change_events");
+        assertThrows(IllegalStateException.class, () -> store.commitBridgedTerminalWithPeer(
+            turnId, attempt.attemptId, result, "foreign-peer", 207L));
+        assertEquals(TurnState.MEMORY_RUNNING.name(), store.turn(turnId).state);
+        assertEquals(0, store.replyParts(turnId).size());
+        assertEquals(changes, rowCount("change_events"));
+
+        assertEquals(RoomExecutionStore.DeliveryDisposition.APPLY,
+            store.commitBridgedTerminalWithPeer(
+                turnId, attempt.attemptId, result, "device_gateway", 208L));
+    }
+
+    @Test
     public void unknownAppliedAckTombstoneIsExactReplayAndChangedRelayConflicts() throws Exception {
         JSONObject ack = new JSONObject()
             .put("protocolVersion", 3)
@@ -1504,6 +1527,62 @@ public class RoomExecutionStoreTest {
             changedFailure.toString(), "cloud", "relay-failure-1");
         assertThrows(IllegalStateException.class, () -> store.commitVerifiedRemoteFailure(
             localTurnId, attempt.attemptId, changed, 304L));
+    }
+
+    @Test
+    public void peerAwareVerifiedFailureRejectsForeignPeerBeforeAnyWrite() throws Exception {
+        String localTurnId = "local-v3-peer-failure";
+        store.submitTurn(yuqiThreeBubbleSubmission(localTurnId, "msg-peer-failure-3", 306L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 307L);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalFailure(checkpoint, false, 308L).toString(), "lan", null);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        ChatTurnEntity beforeTurn = store.turn(localTurnId);
+        long beforeChanges = rowCount("change_events");
+        long beforeDiagnostics = rowCount("diagnostics");
+        assertThrows(IllegalStateException.class, () -> store.commitVerifiedRemoteFailureWithPeer(
+            localTurnId, attempt.attemptId, result, "foreign-peer", 309L));
+        ChatTurnEntity afterReject = store.turn(localTurnId);
+        assertEquals(beforeTurn.state, afterReject.state);
+        assertEquals(0, store.replyParts(localTurnId).size());
+        assertEquals(beforeChanges, rowCount("change_events"));
+        assertEquals(beforeDiagnostics, rowCount("diagnostics"));
+        store.commitVerifiedRemoteFailureWithPeer(
+            localTurnId, attempt.attemptId, result, "device_gateway", 310L);
+        assertEquals(TurnState.FAILED_FINAL.name(), store.turn(localTurnId).state);
+    }
+
+    @Test
+    public void peerAwareVerifiedFailureClearTombstoneIsRedactedAndForeignPeerIsRejected()
+        throws Exception {
+        String localTurnId = "local-v3-clear-failure-peer";
+        store.submitTurn(yuqiThreeBubbleSubmission(localTurnId, "msg-clear-failure-peer", 312L));
+        TurnSubmission prepared = store.prepareBridgeSubmission(
+            persistedSubmission(localTurnId), "device_gateway", 313L);
+        JSONObject checkpoint = new JSONObject(prepared.bridgeAuthorityCheckpointJson);
+        BridgeResult result = BridgeTurnStatus.parseV3(
+            canonicalFailure(checkpoint, false, 314L).toString(), "lan", null);
+        ExecutionAttemptEntity attempt = store.activeAttempt(localTurnId);
+        ConversationCursorEntity cursor = store.getConversationCursor("yuqi");
+        LifecycleControl clear = store.createConversationClear(
+            "yuqi", RoomExecutionStore.conversationCursorChecksum("yuqi", cursor));
+        assertNotNull(clear);
+        ChatTurnEntity redacted = store.turn(localTurnId);
+        long beforeChanges = rowCount("change_events");
+        long beforeDiagnostics = rowCount("diagnostics");
+        store.commitVerifiedRemoteFailureWithPeer(
+            localTurnId, attempt.attemptId, result, "device_gateway", 315L);
+        assertEquals(beforeChanges, rowCount("change_events"));
+        assertEquals(beforeDiagnostics, rowCount("diagnostics"));
+        assertEquals(TurnState.COMPLETED.name(), store.turn(localTurnId).state);
+        assertEquals(redacted.deletedAt, store.turn(localTurnId).deletedAt);
+        assertEquals(0, store.replyParts(localTurnId).size());
+        assertThrows(IllegalStateException.class, () -> store.commitVerifiedRemoteFailureWithPeer(
+            localTurnId, attempt.attemptId, result, "foreign-peer", 316L));
+        assertEquals(beforeChanges, rowCount("change_events"));
+        assertEquals(beforeDiagnostics, rowCount("diagnostics"));
     }
 
     @Test

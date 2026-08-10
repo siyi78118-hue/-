@@ -18,6 +18,7 @@ import {
   validateConversationClearControl,
   validateEnvelope
 } from '../yuqi-runtime/src/protocol.mjs';
+import { projectBridgeResultForWire } from '../yuqi-runtime/src/bridge-result-projector.mjs';
 
 const REQUIRED_STRUCTURES = Object.freeze([
   'social_bid', 'temporary_stance', 'stage_leak', 'proactive_collision',
@@ -29,10 +30,11 @@ const REQUIRED_AUTHORITY_TABLES = Object.freeze([
   'turn_authority_lineages', 'visible_result_groups', 'visible_result_items',
   'visible_result_actions', 'visible_result_manifests', 'visible_commit_receipts',
   'cloud_deliveries', 'interaction_lanes', 'cognition_kind_rollouts',
-  'pipeline_releases', 'cognitive_states', 'conversation_clear_controls'
+  'cognition_promotion_history', 'pipeline_releases', 'cognitive_states',
+  'conversation_clear_controls'
 ]);
 const REQUIRED_COLUMNS = Object.freeze({
-  turns: ['turn_id', 'character_id', 'device_id', 'device_seq', 'source_message_id', 'state', 'origin', 'envelope_json', 'envelope_checksum', 'created_at', 'updated_at', 'rollout_key', 'lane_key', 'authority_lineage_key', 'retry_of_turn_id', 'lineage_revision_at_creation', 'result_authority_version', 'authority_redacted_at', 'input_user_batch_id', 'input_visibility_sequence', 'input_clear_epoch', 'authoritative_release_id', 'authoritative_pipeline_checksum'],
+  turns: ['turn_id', 'character_id', 'device_id', 'device_seq', 'source_message_id', 'state', 'origin', 'envelope_json', 'envelope_checksum', 'created_at', 'updated_at', 'rollout_key', 'lane_key', 'authority_lineage_key', 'retry_of_turn_id', 'lineage_revision_at_creation', 'turn_revision', 'result_authority_version', 'authority_redacted_at', 'input_user_batch_id', 'input_visibility_sequence', 'input_clear_epoch', 'pipeline_mode', 'comparison_mode', 'rollout_revision', 'rollout_evidence_epoch', 'pipeline_checksum', 'shadow_epoch', 'canary_epoch', 'canary_slot', 'authoritative_release_id', 'comparison_release_id', 'authoritative_pipeline_checksum', 'comparison_pipeline_checksum'],
   messages: ['message_id', 'turn_id', 'character_id', 'speaker_id', 'speaker_type', 'recipient_id', 'content', 'sent_at', 'origin', 'device_id', 'device_seq', 'checksum', 'authority_group_id', 'group_ordinal'],
   turn_authority_lineages: ['lineage_key', 'role_id', 'lane_key', 'root_source_id', 'latest_turn_id', 'revision', 'state', 'committed_group_id', 'redacted_at', 'attempt_count', 'attempt_commitment'],
   current_user_batches: ['turn_id', 'batch_id', 'character_id', 'source_message_id', 'started_at', 'committed_at', 'checksum', 'item_count', 'tombstone_commitment'],
@@ -45,6 +47,8 @@ const REQUIRED_COLUMNS = Object.freeze({
   cloud_deliveries: ['turn_id', 'peer_id', 'authority_group_id', 'authority_commit_checksum', 'recovery_ack_seq', 'state', 'payload_json', 'checksum', 'relay_message_id', 'redaction_requested_at', 'redaction_acknowledged_at'],
   interaction_lanes: ['role_id', 'lane_key', 'revision', 'local_sequence', 'latest_user_batch_id', 'clear_epoch', 'cleared_through_sequence'],
   pipeline_releases: ['release_id', 'release_checksum'],
+  cognition_kind_rollouts: ['rollout_key', 'current_mode', 'rollout_phase', 'revision', 'pipeline_checksum', 'evidence_epoch', 'shadow_epoch', 'canary_epoch', 'stable_release_id', 'candidate_release_id', 'candidate_phase'],
+  cognition_promotion_history: ['rollout_key', 'from_mode', 'to_mode', 'from_phase', 'to_phase', 'from_revision', 'to_revision', 'metadata_json', 'created_at'],
   cognitive_states: ['role_id', 'revision', 'last_turn_id', 'checksum'],
   conversation_clear_controls: [
     'control_id', 'role_id', 'peer_id', 'clear_epoch', 'cleared_through_sequence',
@@ -315,6 +319,110 @@ function assertConversationClearAuthority(database) {
   }
 }
 
+function assertReceiptAuthority(receipt, { turn, lineage, lane, group }) {
+  const pcVersions = new Set([
+    'pc-visible-commit-v1', 'pc-visible-commit-v2',
+    'pc-visible-commit-v3', 'pc-visible-commit-v4'
+  ]);
+  const fallbackVersions = new Set(['android-fallback-commit-v1', 'android-fallback-commit-v2']);
+  const versionAllowed = receipt.authority_origin === 'pc'
+    ? pcVersions.has(receipt.commit_payload_version)
+    : receipt.authority_origin === 'android_fallback'
+      && fallbackVersions.has(receipt.commit_payload_version);
+  if (!versionAllowed
+    || Number(receipt.turn_revision_after) !== Number(receipt.turn_revision_before) + 1
+    || Number(receipt.lineage_revision_after) !== Number(receipt.lineage_revision_before) + 1
+    || Number(receipt.turn_revision_after) !== Number(turn.turn_revision)
+    || Number(receipt.lineage_revision_after) !== Number(lineage.revision)) {
+    throw new Error(`v15 receipt revision authority conflict for ${group.group_id}`);
+  }
+  if (receipt.authority_origin === 'pc') {
+    if (!Number.isSafeInteger(receipt.lane_revision_before)
+      || Number(receipt.lane_revision_after) !== Number(receipt.lane_revision_before) + 1
+      || !Number.isSafeInteger(receipt.cognitive_state_revision_before)
+      || ![Number(receipt.cognitive_state_revision_before), Number(receipt.cognitive_state_revision_before) + 1]
+        .includes(Number(receipt.cognitive_state_revision_after))
+      || Number(lane.revision) < Number(receipt.lane_revision_after)) {
+      throw new Error(`v15 receipt PC revision authority conflict for ${group.group_id}`);
+    }
+  } else if (receipt.lane_revision_before !== null || receipt.lane_revision_after !== null
+    || receipt.cognitive_state_revision_before !== null || receipt.cognitive_state_revision_after !== null) {
+    throw new Error(`v15 receipt fallback revision authority conflict for ${group.group_id}`);
+  }
+}
+
+function terminalDispositionFor(turn, items, actions) {
+  if (turn.rollout_key === 'DIRECT_REPLY') {
+    if (items.length === 0) throw new Error(`v15 direct visible result is empty for ${turn.turn_id}`);
+    return 'visible';
+  }
+  if (!AUTOMATIC_TURN_KINDS.has(String(turn.rollout_key))) {
+    throw new Error(`v15 visible result turn kind conflict for ${turn.turn_id}`);
+  }
+  if (items.length > 0) return 'visible';
+  if (actions.length > 0) return 'action_only';
+  return 'skip';
+}
+
+function assertLiveDeliveryPayload({ delivery, turn, group, receipt, envelope, itemValues, actionRows }) {
+  const empty = delivery.payload_json == null && delivery.checksum == null;
+  if (delivery.state === 'waiting') {
+    if (!empty || Number(delivery.attempts) !== 0 || delivery.relay_message_id != null
+      || delivery.delivered_at != null || delivery.confirmed_at != null) {
+      throw new Error(`v15 live delivery waiting payload conflict for ${group.group_id}`);
+    }
+    return;
+  }
+  if (delivery.state === 'quarantined') {
+    if (!empty || Number(delivery.attempts) !== 0 || delivery.relay_message_id != null
+      || delivery.delivered_at != null || delivery.confirmed_at != null) {
+      throw new Error(`v15 live delivery quarantine payload conflict for ${group.group_id}`);
+    }
+    return;
+  }
+  if (!['pending', 'mailboxed', 'confirmed'].includes(String(delivery.state))
+    || typeof delivery.payload_json !== 'string' || typeof delivery.checksum !== 'string') {
+    throw new Error(`v15 live delivery state payload conflict for ${group.group_id}`);
+  }
+  const stored = jsonValue(delivery.payload_json, `delivery ${group.group_id}`);
+  if (contentHash(stored) !== delivery.checksum) {
+    throw new Error(`v15 live delivery payload checksum conflict for ${group.group_id}`);
+  }
+  const canonicalResult = {
+    protocolVersion: 3,
+    turnId: String(turn.turn_id), roleId: String(turn.character_id),
+    authorityOrigin: String(receipt.authority_origin),
+    authorityLineageKey: String(receipt.lineage_key), visibleGroupId: String(group.group_id),
+    lineageRevision: Number(receipt.lineage_revision_after), turnRevision: Number(receipt.turn_revision_after),
+    laneKey: String(turn.lane_key), laneRevision: Number(receipt.lane_revision_after),
+    inputVisibilitySequence: Number(turn.input_visibility_sequence), inputClearEpoch: Number(turn.input_clear_epoch),
+    generationFingerprint: String(group.generation_fingerprint), releaseId: String(group.authoritative_release_id),
+    commitPayloadVersion: String(receipt.commit_payload_version), commitChecksum: String(receipt.commit_checksum),
+    terminalDisposition: terminalDispositionFor(turn, itemValues, actionRows),
+    replyParts: itemValues.map(({ value, row }, ordinal) => ({
+      ...value, messageId: String(row.message_id), ordinal, itemChecksum: String(row.item_checksum)
+    })),
+    actions: actionRows.map(({ value, row }, ordinal) => ({
+      actionId: String(row.action_id), ordinal, actionChecksum: String(row.action_checksum),
+      kind: String(row.action_kind), targetKey: String(row.target_key),
+      targetRevision: String(row.target_revision), payload: value
+    }))
+  };
+  let expected;
+  try {
+    expected = {
+      ok: true,
+      ...projectBridgeResultForWire(canonicalResult, Number(envelope.protocolVersion) === 3 ? 3 : 2),
+      recoveryAckSeq: Number(delivery.recovery_ack_seq || 0)
+    };
+  } catch {
+    throw new Error(`v15 live delivery projection conflict for ${group.group_id}`);
+  }
+  if (canonicalJson(stored) !== canonicalJson(expected)) {
+    throw new Error(`v15 live delivery authoritative payload conflict for ${group.group_id}`);
+  }
+}
+
 function assertAuthorityClosure(database) {
   assertConversationClearAuthority(database);
   const allTurns = database.prepare('SELECT * FROM turns WHERE result_authority_version = 1').all();
@@ -405,6 +513,7 @@ function assertAuthorityClosure(database) {
         || typeof receipt.authority_origin !== 'string' || receipt.authority_origin !== group.authority_origin) {
         throw new Error(`v15 receipt authority closure mismatch for ${groupId}`);
       }
+      assertReceiptAuthority(receipt, { turn, lineage, lane, group });
       const redactedValues = [turn.authority_redacted_at, lineage.redacted_at, group.redacted_at, manifest.redacted_at]
         .filter(value => value !== null && value !== undefined).map(Number);
       const isRedacted = redactedValues.length > 0;
@@ -435,6 +544,7 @@ function assertAuthorityClosure(database) {
         throw new Error(`v15 result tombstone commitment mismatch for ${groupId}`);
       }
       const itemValues = [];
+      const deliveryItemRows = [];
       for (const item of groupItems) {
         assertHex(item.item_checksum, `result item ${item.message_id}`);
         if (isRedacted && (item.item_json !== null || Number(item.redacted_at) !== redactedValues[0])) throw new Error(`v15 redacted result item closure mismatch for ${item.message_id}`);
@@ -443,6 +553,7 @@ function assertAuthorityClosure(database) {
           const itemValue = jsonValue(item.item_json, `result item ${item.message_id}`);
           if (!isRedacted && contentHash(itemValue) !== item.item_checksum) throw new Error(`v15 result item checksum mismatch for ${item.message_id}`);
           itemValues.push(itemValue);
+          deliveryItemRows.push({ value: itemValue, row: item });
         } else itemValues.push(null);
         const resultMessage = database.prepare('SELECT * FROM messages WHERE message_id = ?').get(item.message_id);
         if (!resultMessage || resultMessage.authority_group_id !== groupId || Number(resultMessage.group_ordinal) !== Number(item.ordinal)
@@ -463,6 +574,7 @@ function assertAuthorityClosure(database) {
         }
       }
       const actionValues = [];
+      const deliveryActionRows = [];
       for (const action of groupActions) {
         assertHex(action.action_checksum, `result action ${action.action_id}`);
         if (isRedacted) {
@@ -479,6 +591,7 @@ function assertAuthorityClosure(database) {
         if (typeof action.action_kind !== 'string' || !CLOSED_ACTION_KINDS.has(action.action_kind)
           || typeof action.target_key !== 'string' || !action.target_key) throw new Error(`v15 result action authority mismatch for ${action.action_id}`);
         actionValues.push({ kind: action.action_kind, targetKey: action.target_key, targetRevision: action.target_revision == null ? null : String(action.target_revision), payload: actionValue });
+        deliveryActionRows.push({ value: actionValue, row: action });
       }
       if (!isRedacted && String(group.reply_checksum) !== contentHash({ items: itemValues, actions: actionValues })) {
         throw new Error(`v15 result reply checksum mismatch for ${groupId}`);
@@ -522,6 +635,11 @@ function assertAuthorityClosure(database) {
             })) {
             throw new Error(`v15 redacted delivery lifecycle mismatch for ${groupId}`);
           }
+        } else {
+          assertLiveDeliveryPayload({
+            delivery: deliveries[0], turn, group, receipt, envelope,
+            itemValues: deliveryItemRows, actionRows: deliveryActionRows
+          });
         }
       }
     }
@@ -1252,7 +1370,14 @@ export function extractRealHistoryScenes({ databasePath, outputPath, manifestPat
   } finally { database.close(); }
 }
 
-export { CLOSED_ACTION_KINDS, assertAuthorityClosure, rootAttempt, atomicWritePair };
+export {
+  CLOSED_ACTION_KINDS,
+  assertAuthorityClosure,
+  assertReadonlyV15Schema,
+  rootAttempt,
+  sourceSha256,
+  atomicWritePair
+};
 
 if (isMain()) {
   const args = argumentMap();

@@ -12,7 +12,8 @@ import { compileQualitySuite } from '../../scripts/compile-yuqi-lived-quality-sc
 import {
   buildCandidateReleaseDefinition,
   deriveManualReviewRequirements,
-  materializeQualityReport as materializeQualityReportImpl
+  materializeQualityReport as materializeQualityReportImpl,
+  materializeQualityReportFromArtifacts
 } from '../../scripts/report-yuqi-lived-quality.mjs';
 
 const COMPILED_SUITE = compileQualitySuite({ rootDir: process.cwd(), checkOnly: true });
@@ -26,23 +27,27 @@ const AUTHORITY_PLAN = buildVerifiedQualityReplayPlan({
     scenesChecksum: contentHash(HISTORY_SCENES)
   }
 });
+const SOURCE_HEAD = 'd'.repeat(40);
 
 function evidence() {
   const make = (layer) => AUTHORITY_PLAN.items.filter(item => item.layer === layer).map(item => ({
     layer, sceneId: item.sceneId, repeatIndex: item.repeatIndex, finalized: true,
     scores: Object.fromEntries(QUALITY_DIMENSIONS.map(key => [key, 4])),
     preference: 'candidate', regression: false, severe: false, tie: false,
-    unresolved: false, structuralRegression: false, protocolFailure: false,
-    attempts: [{ attemptIndex: 0, evaluatorId: `${layer}-${item.sceneId}-${item.repeatIndex}`, accepted: true, unresolved: false }]
+    findings: [], unresolved: false, structuralRegression: false, protocolFailure: false,
+    attempts: [{ attemptIndex: 0, evaluatorId: `${layer}-${item.sceneId}-${item.repeatIndex}`,
+      accepted: true, unresolved: false, executionChecksum: 'b'.repeat(64),
+      latencyMs: 0, evaluatorVersion: 'blind-evaluator-v1' }],
+    executionChecksum: 'b'.repeat(64), latencyMs: 0, evaluatorVersion: 'blind-evaluator-v1'
   }));
   return { sentinelRuns: make('sentinel'), coverageRuns: make('coverage'), historyRuns: make('history') };
 }
 
 function replayProvenance(plan, candidate) {
   const keys = plan.items.map(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}`);
-  return {
-    executionPairs: keys.map(finalKey => ({
+  const executionPairs = keys.map(finalKey => ({
       finalKey,
+      sourceHead: SOURCE_HEAD,
       stableReleaseId: 'stable-release-v1',
       stableReleaseChecksum: 'a'.repeat(64),
       candidateReleaseId: candidate.releaseId,
@@ -52,15 +57,16 @@ function replayProvenance(plan, candidate) {
       candidateInputChecksum: 'b'.repeat(64),
       dryRun: true,
       capabilities: { visible: false, actions: false }
-    })),
-    modelRuns: keys.map(finalKey => ({
+    }));
+  const modelRuns = keys.map(finalKey => ({
       finalKey,
       attemptIndex: 0,
       evaluatorId: 'blind-evaluator-v1',
       inputChecksum: 'c'.repeat(64),
       completed: true
-    }))
-  };
+    }));
+  const provenance = { sourceHead: SOURCE_HEAD, executionPairs, modelRuns };
+  return { ...provenance, provenanceChecksum: contentHash(provenance) };
 }
 
 const AUTHORITY_DIRECTORY = mkdtempSync(join(tmpdir(), 'yuqi-quality-report-authority-'));
@@ -123,6 +129,60 @@ test('candidate release definition and quality report are deterministic and meta
   assert.equal(report.qualityGate.eligible, true);
   assert.equal(report.productionReleaseMutation, false);
   assert.deepEqual(report.candidateRelease, candidate);
+  assert.equal(report.sourceHead, SOURCE_HEAD);
+});
+
+test('report rejects final and attempt evidence without exact execution/input/source/candidate pair joins', () => {
+  const candidate = buildCandidateReleaseDefinition({
+    pipelineVersion: 'yuqi-lived-agency-v3', presetVersion: '2.1.0',
+    cognitionSchemaVersion: 'v3', expressionSchemaVersion: 'v2', evaluatorVersion: 'quality-evaluator-v1',
+    modelProfile: 'blind-fixed', componentManifest: {}, createdAt: 0
+  });
+  const forgedEvidence = evidence();
+  delete forgedEvidence.historyRuns[0].attempts[0].executionChecksum;
+  const report = materializeQualityReport({
+    evidence: forgedEvidence, expectedPlan: AUTHORITY_PLAN, candidateRelease: candidate,
+    manualReviewQueue: manualQueueFor(forgedEvidence)
+  });
+  assert.equal(report.eligible, false);
+});
+
+test('report rejects mixed, missing, or mismatched execution source/candidate provenance', () => {
+  const candidate = buildCandidateReleaseDefinition({
+    pipelineVersion: 'yuqi-lived-agency-v3', presetVersion: '2.1.0',
+    cognitionSchemaVersion: 'v3', expressionSchemaVersion: 'v2', evaluatorVersion: 'quality-evaluator-v1',
+    modelProfile: 'blind-fixed', componentManifest: {}, createdAt: 0
+  });
+  const variants = [
+    provenance => {
+      delete provenance.executionPairs[0].sourceHead;
+      provenance.provenanceChecksum = contentHash({
+        sourceHead: provenance.sourceHead, executionPairs: provenance.executionPairs, modelRuns: provenance.modelRuns
+      });
+    },
+    provenance => {
+      provenance.executionPairs[1].sourceHead = 'e'.repeat(40);
+      provenance.provenanceChecksum = contentHash({
+        sourceHead: provenance.sourceHead, executionPairs: provenance.executionPairs, modelRuns: provenance.modelRuns
+      });
+    },
+    provenance => {
+      provenance.executionPairs[2].candidateReleaseChecksum = 'f'.repeat(64);
+      provenance.provenanceChecksum = contentHash({
+        sourceHead: provenance.sourceHead, executionPairs: provenance.executionPairs, modelRuns: provenance.modelRuns
+      });
+    }
+  ];
+  for (const mutate of variants) {
+    const provenance = replayProvenance(AUTHORITY_PLAN, candidate);
+    mutate(provenance);
+    const report = materializeQualityReport({
+      evidence: evidence(), expectedPlan: AUTHORITY_PLAN, candidateRelease: candidate,
+      replayProvenance: provenance
+    });
+    assert.equal(report.eligible, false);
+    assert.ok(report.failedGates.includes('QUALITY_REPORT_AUTHORITY_INVALID'));
+  }
 });
 
 test('report rejects unresolved evidence and caller-supplied release identity', () => {
@@ -359,4 +419,67 @@ test('materializeQualityReport cannot pass without replay provenance and a disk 
   });
   assert.equal(report.eligible, false);
   assert.ok(report.failedGates.includes('REPLAY_PROVENANCE_REQUIRED'));
+});
+
+test('formal quality reporter selects one raw run and binds all three artifact checksums', () => {
+  const candidate = buildCandidateReleaseDefinition({
+    pipelineVersion: 'yuqi-lived-agency-v3', presetVersion: '2.1.0', cognitionSchemaVersion: 'v3',
+    expressionSchemaVersion: 'v2', evaluatorVersion: 'quality-evaluator-v1', modelProfile: 'blind-fixed',
+    componentManifest: {}, createdAt: 0
+  });
+  const directory = mkdtempSync(join(tmpdir(), 'yuqi-quality-bundle-'));
+  try {
+    const runId = '22222222-2222-4222-8222-222222222222';
+    const base = replayProvenance(AUTHORITY_PLAN, candidate);
+    const provenanceBase = { runId, sourceHead: base.sourceHead, executionPairs: base.executionPairs, modelRuns: base.modelRuns };
+    const provenance = { ...provenanceBase, provenanceChecksum: contentHash(provenanceBase) };
+    const rows = [
+      ...Object.values(evidence()).flatMap(group => group.flatMap(row => row.attempts.map(attempt => ({
+        recordType: 'attempt', runId, layer: row.layer, sceneId: row.sceneId, repeatIndex: row.repeatIndex, ...attempt
+      })))),
+      ...Object.values(evidence()).flatMap(group => group.map(row => ({ recordType: 'final', runId, ...row }))),
+      { recordType: 'provenance', runId, sourceHead: provenance.sourceHead, provenanceChecksum: provenance.provenanceChecksum },
+      ...provenance.executionPairs.map(row => ({ recordType: 'execution', runId, ...row })),
+      ...provenance.modelRuns.map(row => ({ recordType: 'model', runId, ...row })),
+      ...Object.values(evidence()).flatMap(group => group.map(row => ({
+        recordType: 'final-checksum', runId, finalKey: `${row.layer}:${row.sceneId}:${row.repeatIndex}`,
+        executionChecksum: row.executionChecksum, latencyMs: row.latencyMs, evaluatorVersion: row.attempts[0].evaluatorVersion || 'blind-evaluator-v1'
+      })))
+    ];
+    const requirements = deriveManualReviewRequirements(evidence(), AUTHORITY_PLAN, { includePassingSample: true });
+    const manualRows = [
+      { recordType: 'metadata', runId, sourceHead: SOURCE_HEAD, candidateReleaseId: candidate.releaseId,
+        candidateReleaseChecksum: candidate.releaseChecksum, planChecksum: AUTHORITY_PLAN.planChecksum },
+      ...requirements.map((requirement, index) => ({
+        recordType: 'review', runId, reviewId: `review-${index}`, evalRunId: runId,
+        sceneId: requirement.sceneId, repeatIndex: requirement.repeatIndex,
+        evidenceFindingIds: requirement.evidenceFindingIds, decision: 'confirm', reason: 'fixture',
+        reviewer: 'central_window', createdAt: 0
+      }))
+    ];
+    const planPath = AUTHORITY_PLAN_PATH;
+    const replayPath = join(directory, 'quality-replay.jsonl');
+    const manualPath = join(directory, 'quality-manual-review.jsonl');
+    writeFileSync(replayPath, `${rows.map(row => JSON.stringify(row)).join('\n')}\n`);
+    writeFileSync(manualPath, `${manualRows.map(row => JSON.stringify(row)).join('\n')}\n`);
+    const report = materializeQualityReportFromArtifacts({
+      planArtifactPath: planPath, replayArtifactPath: replayPath, manualReviewArtifactPath: manualPath,
+      rootDir: process.cwd(), historyPath: AUTHORITY_HISTORY_PATH, historyManifestPath: AUTHORITY_MANIFEST_PATH,
+      candidateRelease: candidate
+    });
+    assert.equal(report.replayRunId, runId);
+    assert.match(report.qualityPlanSha256, /^[0-9a-f]{64}$/);
+    assert.match(report.qualityReplaySha256, /^[0-9a-f]{64}$/);
+    assert.match(report.qualityManualReviewSha256, /^[0-9a-f]{64}$/);
+    const replayRows = readFileSync(replayPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+    replayRows[0].runId = '33333333-3333-4333-8333-333333333333';
+    writeFileSync(replayPath, `${replayRows.map(row => JSON.stringify(row)).join('\n')}\n`);
+    assert.throws(() => materializeQualityReportFromArtifacts({
+      planArtifactPath: planPath, replayArtifactPath: replayPath, manualReviewArtifactPath: manualPath,
+      rootDir: process.cwd(), historyPath: AUTHORITY_HISTORY_PATH, historyManifestPath: AUTHORITY_MANIFEST_PATH,
+      candidateRelease: candidate
+    }), /run identity|run/i);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

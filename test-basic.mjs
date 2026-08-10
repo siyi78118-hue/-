@@ -939,6 +939,7 @@ globalThis.__appTest = {
   nativeReplyTextParts,
   appendAssistantMessages,
   drainNativeUiInbox,
+  acknowledgeNativeUiAppliedOnce,
   replayRecentNativeCompletedTurns,
   withNativeTurnApplyLock,
   nativePendingStateIsCurrent,
@@ -2075,6 +2076,25 @@ await Promise.all([
 await drainNativeUiInbox(concurrentPlugin, concurrentApply, result => concurrentLandings.has(result.turnId));
 assert.equal(concurrentApplyCount, 1, '事件、轮询和重复投递同时到达也只能渲染一次');
 assert.equal(concurrentAckCount, 1, '事件、轮询并发下同一turn只能推进一次uiApplied ACK');
+let synchronousAckAttempts = 0;
+const synchronousThrowPlugin = {
+  acknowledgeUiApplied: () => {
+    synchronousAckAttempts += 1;
+    throw new Error('synchronous ack failure');
+  }
+};
+await assert.rejects(
+  context.__appTest.acknowledgeNativeUiAppliedOnce(
+    synchronousThrowPlugin, { turnId: 'sync-throw-turn' }
+  ),
+  /synchronous ack failure/,
+  '同步抛错也必须让本轮 ACK Promise 失败'
+);
+await context.__appTest.acknowledgeNativeUiAppliedOnce(
+  { acknowledgeUiApplied: async () => { synchronousAckAttempts += 1; } },
+  { turnId: 'sync-throw-turn' }
+);
+assert.equal(synchronousAckAttempts, 2, '同步抛错后同一turn必须允许一次真实重试');
 const hangingApply = context.__appTest.withNativeTurnApplyLock(
   'hung-turn',
   () => new Promise(() => {}),

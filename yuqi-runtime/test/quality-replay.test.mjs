@@ -13,13 +13,43 @@ import {
 import {
   createQualityReplayPlan,
   appendQualityReplayArtifact,
-  runQualityReplayPlan
+  captureCleanSourceHead,
+  runQualityReplayPlan as runQualityReplayPlanImpl
 } from '../../scripts/run-yuqi-lived-quality-replay.mjs';
 import { contentHash } from '../src/protocol.mjs';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
+
+const SOURCE_ROOT = mkdtempSync(join(tmpdir(), 'yuqi-quality-source-'));
+writeFileSync(join(SOURCE_ROOT, 'source-marker.txt'), 'clean source fixture\n');
+execFileSync('git', ['init'], { cwd: SOURCE_ROOT, stdio: 'ignore' });
+execFileSync('git', ['config', 'user.email', 'quality-fixture@example.invalid'], { cwd: SOURCE_ROOT });
+execFileSync('git', ['config', 'user.name', 'quality-fixture'], { cwd: SOURCE_ROOT });
+execFileSync('git', ['add', 'source-marker.txt'], { cwd: SOURCE_ROOT });
+execFileSync('git', ['commit', '-m', 'quality source fixture'], { cwd: SOURCE_ROOT, stdio: 'ignore' });
+test.after(() => rmSync(SOURCE_ROOT, { recursive: true, force: true }));
+
+test('replay source provenance rejects a dirty source tree before execution', () => {
+  const dirtyRoot = mkdtempSync(join(tmpdir(), 'yuqi-quality-dirty-source-'));
+  try {
+    writeFileSync(join(dirtyRoot, 'source-marker.txt'), 'clean source fixture\n');
+    execFileSync('git', ['init'], { cwd: dirtyRoot, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'quality-fixture@example.invalid'], { cwd: dirtyRoot });
+    execFileSync('git', ['config', 'user.name', 'quality-fixture'], { cwd: dirtyRoot });
+    execFileSync('git', ['add', 'source-marker.txt'], { cwd: dirtyRoot });
+    execFileSync('git', ['commit', '-m', 'quality source fixture'], { cwd: dirtyRoot, stdio: 'ignore' });
+    writeFileSync(join(dirtyRoot, 'dirty.txt'), 'uncommitted\n');
+    assert.throws(() => captureCleanSourceHead({ rootDir: dirtyRoot }), /source tree is dirty/);
+  } finally {
+    rmSync(dirtyRoot, { recursive: true, force: true });
+  }
+});
+
+function runQualityReplayPlan(args) {
+  return runQualityReplayPlanImpl({ ...args, sourceRootDir: SOURCE_ROOT });
+}
 
 function scenes(prefix, count) {
   return Array.from({ length: count }, (_, index) => ({ sceneId: `${prefix}-${index}` }));
@@ -161,9 +191,54 @@ test('replay execution uses one dry-run executor and appends one finalized resul
   assert.equal(result.finalized[0].protocolFailure, true);
   assert.equal(result.replayProvenance.executionPairs.length, 1);
   assert.equal(result.replayProvenance.modelRuns.length, 1);
+  assert.match(result.replayProvenance.sourceHead, /^[0-9a-f]{40}$/);
+  assert.equal(result.replayProvenance.executionPairs[0].sourceHead, result.replayProvenance.sourceHead);
+  assert.equal(result.replayProvenance.provenanceChecksum.length, 64);
   assert.equal(result.replayProvenance.executionPairs[0].dryRun, true);
   assert.equal(result.replayProvenance.modelRuns[0].completed, true);
   assert.equal(sideEffects, 0);
+});
+
+test('replay rejects a source HEAD or dirty-tree change detected after execution', async () => {
+  const sourceRoot = mkdtempSync(join(tmpdir(), 'yuqi-quality-source-change-'));
+  try {
+    writeFileSync(join(sourceRoot, 'source-marker.txt'), 'clean source fixture\n');
+    execFileSync('git', ['init'], { cwd: sourceRoot, stdio: 'ignore' });
+    execFileSync('git', ['config', 'user.email', 'quality-fixture@example.invalid'], { cwd: sourceRoot });
+    execFileSync('git', ['config', 'user.name', 'quality-fixture'], { cwd: sourceRoot });
+    execFileSync('git', ['add', 'source-marker.txt'], { cwd: sourceRoot });
+    execFileSync('git', ['commit', '-m', 'quality source fixture'], { cwd: sourceRoot, stdio: 'ignore' });
+    const historyScenes = scenes('history', 30);
+    const plan = createQualityReplayPlan({
+      rootDir: process.cwd(),
+      historyScenes,
+      historyManifest: historyManifest(historyScenes)
+    });
+    const evaluation = {
+      version: 1,
+      scores: Object.fromEntries(['socialUnderstanding', 'agency', 'relationshipParticipation',
+        'stateContinuityFlexibility', 'livedExpression', 'actionFactIntegrity'].map(key => [key, 4])),
+      preference: 'candidate', findings: [], unresolved: false
+    };
+    await assert.rejects(() => runQualityReplayPlanImpl({
+      plan,
+      sourceRootDir: sourceRoot,
+      releasePair: {
+        stable: { releaseId: 'stable', releaseChecksum: 'stable-checksum' },
+        candidate: { releaseId: 'candidate', releaseChecksum: 'candidate-checksum' }
+      },
+      executor: {
+        async executeTurn() {
+          writeFileSync(join(sourceRoot, 'dirty-during-replay.txt'), 'changed while running\n');
+          return { draft: { output: { terminalDisposition: 'visible', replyParts: [], actions: [] } } };
+        }
+      },
+      maxItems: 1,
+      evaluator: async () => evaluation
+    }), /source tree|source HEAD|changed/i);
+  } finally {
+    rmSync(sourceRoot, { recursive: true, force: true });
+  }
 });
 
 test('severe blind findings require agreement from two independent evaluators', async () => {
@@ -249,7 +324,10 @@ test('replay execution persists append-only attempts, finals, checksums, latency
     appendQualityReplayArtifact({ artifactPath, result });
     appendQualityReplayArtifact({ artifactPath, result });
     const rows = readFileSync(artifactPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-    assert.equal(rows.length, 12);
+    assert.equal(rows.length, 14);
+    assert.match(result.runId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    assert.equal(result.replayProvenance.runId, result.runId);
+    assert.ok(rows.every(row => row.runId === result.runId));
     assert.ok(rows.some(row => row.recordType === 'attempt' && row.executionChecksum));
     assert.ok(rows.some(row => row.recordType === 'final' && row.latencyMs >= 0));
     assert.ok(rows.some(row => row.recordType === 'execution' && row.dryRun === true));
