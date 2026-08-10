@@ -396,8 +396,13 @@ git commit -m "feat: resume complete Yuqi blind quality evidence"
 
 **Files:**
 - Modify: `scripts/report-yuqi-lived-quality.mjs`
+- Modify: `scripts/run-yuqi-lived-quality-replay.mjs`
+- Modify: `scripts/verify-yuqi-v3-readiness.mjs`
 - Modify: `yuqi-runtime/src/quality-replay.mjs`
 - Test: `yuqi-runtime/test/quality-report.test.mjs`
+- Test: `yuqi-runtime/test/quality-replay.test.mjs`
+- Test: `yuqi-runtime/test/promotion-controller.test.mjs`
+- Test: `tests/cognition-rollout-quality-boundary.test.mjs`
 - Test: `tests/yuqi-v3-readiness.test.mjs`
 - Test: `tests/yuqi-lived-quality-contract.test.mjs`
 
@@ -405,29 +410,66 @@ git commit -m "feat: resume complete Yuqi blind quality evidence"
 
 - [ ] **Step 1: Write v2 schema red tests**
 
-Require exactly 246 execution records, 984 phase records, 492 evaluator judgment records, 246 finals/checksums, and a variable non-zero model-call set. Every model row has exact `(finalKey, phase, ordinal)`, role, call ID, request/output checksum, thread/turn identities, and succeeded state.
+The production JSONL artifact is an exact, closed version-2 projection of one finalized production SQLite run. Every row has native `schemaVersion:2`, a closed `recordType`, and the same canonical UUID `runId`. Row order is deterministic: one `run`; 246 `execution` rows in verified plan final-key order; 984 `phase` rows in final-key then fixed phase order; every `model_call` row in final-key, phase, ordinal order; 492 `judgment` rows in final-key and primary/secondary order; 246 `final` rows in final-key order; and one trailing `provenance` row. No caller summary, caller count, or caller-supplied checksum enters the artifact.
 
-Reject missing/duplicate phases, phase-owner mismatch, ordinal gaps, model calls without phases, phase completion without owned calls, uncertain/running/failed calls, changed output checksums, evaluator judgment mismatch, and source/release/attestation drift.
+Record shapes are exact:
+
+- `run`: `{schemaVersion,recordType,runId,header,headerChecksum,state,createdAt,finalizedAt}`. `state` is exactly `finalized`; the complete header and checksum must equal the reopened production run.
+- `execution`: `{schemaVersion,recordType,runId,finalKey,subjectType,subjectChecksum,stablePhase,candidatePhase,executionChecksum}`. Each side phase is exact `{inputChecksum,outputChecksum}` and `executionChecksum=contentHash({finalKey,subjectType,subjectChecksum,stablePhase,candidatePhase})`.
+- `phase`: `{schemaVersion,recordType,runId,finalKey,phase,state,subjectChecksum,authorityInputChecksum,input,inputChecksum,output,outputChecksum,createdAt,startingAt,runningAt,updatedAt}`. `phase` is one of the four fixed phases, `state` is exactly `succeeded`, and every JSON/checksum pair is recomputed from the SQLite row.
+- `model_call`: `{schemaVersion,recordType,runId,finalKey,phase,ordinal,state,role,callId,clientUserMessageId,threadId,turnId,baseline,baselineChecksum,request,requestChecksum,model,effort,schemaChecksum,output,outputChecksum,runningAt,createdAt,updatedAt}`. Ordinals start at zero and are contiguous per `(finalKey,phase)`; every phase owns at least one succeeded call; the exact baseline, request, output, identities, model profile, and checksums come from SQLite.
+- `judgment`: `{schemaVersion,recordType,runId,finalKey,phase,evaluatorId,evaluatorVersion,inputChecksum,output,outputChecksum,judgmentChecksum}`. `phase` is exactly `evaluator_primary|evaluator_secondary`; the other fields equal the matching finalized judgment; `judgmentChecksum=contentHash({finalKey,phase,evaluatorId,evaluatorVersion,inputChecksum,output,outputChecksum})`.
+- `final`: `{schemaVersion,recordType,runId,finalKey,value,valueChecksum,executionChecksum,finalizedAt}`. `value` is the complete Task 5 final value, `valueChecksum` is recomputed, and `executionChecksum` equals the matching execution record.
+- `provenance`: `{schemaVersion,recordType,runId,recordCounts,recordsChecksum,provenanceChecksum}`. Counts are exact closed `{run,execution,phase,modelCall,judgment,final}`; `recordsChecksum=contentHash(all preceding ordered rows)` and `provenanceChecksum=contentHash({runId,headerChecksum,recordCounts,recordsChecksum})`.
+
+`recordsChecksum` means exactly `contentHash(orderedRowsArray)`, where `orderedRowsArray` is the complete array of row objects before the trailing provenance row; it is not a hash of bytes, concatenated lines, or per-row hashes. JSONL bytes are exactly one `canonicalJson(row)` plus `\n` for every member of `orderedRowsArray`, followed by the same encoding for the provenance row. Export, report, and readiness rederive the same array/checksums independently.
+
+All keys are present exactly once. `schemaVersion` and every ordinal/count/timestamp are native safe integers; `schemaVersion===2`; every checksum is a native lowercase 64-hex string. IDs, final keys, phases, roles, call IDs, client message IDs, thread/turn IDs, model, effort, and schema checksum are native non-empty strings and satisfy their Task 5 identity/domain rules. Production succeeded phase/model-call rows have native `state:'succeeded'`, non-null safe-integer running/completion times, and monotonic `createdAt<=startingAt<=runningAt<=updatedAt` where the persisted fields apply. Phase `input/output`, model-call `baseline/request`, and final `value` are the exact canonical JSON values accepted by the Task 5 invariant; nullable database fields are nullable only in states that are ineligible for production export, so no exported succeeded row contains a missing/null authority input, request, output, identity, or checksum. Booleans, arrays, numbers, strings, empty values, and coercible lookalikes are rejected wherever the closed Task 5 field expects a different native type.
+
+Require exactly 246 execution records, 984 phase records, 492 evaluator judgment records, 246 final records with checksums, and a variable non-zero model-call set that owns every phase. The only production export API is `exportQualityReplayV2({sourceRootDir,ledgerPath,runAuthority,runId,artifactPath})`: it first calls `assertQualityRunAuthority(runAuthority)`, requires the branded authority's production configuration to name the same canonical ledger path/run/header, and opens that ledger only with `openProductionQualityReplayLedger({filename:ledgerPath,runAuthority,readOnly:true,sourceRootDir})`. Path-only descriptors, fixture ledgers, caller evidence classes, caller stores/rows, and reporter/readiness access to SQLite are forbidden. The Task 5 runner is the sole production caller; reporter/readiness consume only the exported JSONL.
+
+The exporter reads deterministically, validates every row and join, writes a same-directory private temporary file, fsyncs and closes it, atomically replaces the target, fsyncs the parent directory where supported, and removes a failed temporary file without altering a prior valid target. It snapshots/rechecks the production source/header/release/attestation and proves the SQLite logical state/checksum unchanged before/after export. The Task 5 runner must call this v2 exporter; its interim `attempt|model|final-checksum` production projection is removed rather than left as a second production format.
+
+The two judgment rows are projections, not new authorities: `evaluator_primary` is exactly `quality_finals.value.primary`, `evaluator_secondary` is exactly `.secondary`, and each evaluator ID/version/input/output/checksum must equal both the finalized value and corresponding succeeded phase. Their judgment checksums are recomputed only from the documented basis. The execution checksum is recomputed only from its matching execution record; each final's `valueChecksum` equals the reopened `quality_finals.value_checksum`, and its execution checksum equals the matching execution row. Any raw SQLite/JSONL mutation—including a self-consistent mutation with locally recomputed child checksums—must be rejected by reopen, export, report, and readiness against the persisted parent/header/plan/release/attestation commitments.
+
+Reject unknown/extra/missing keys, non-native types, record reordering, missing/duplicate phases, phase-owner mismatch, ordinal gaps, model calls without phases, phase completion without owned calls, uncertain/running/failed calls, changed input/output checksums, evaluator judgment mismatch, execution/final mismatch, provenance/count mutation, and source/release/attestation drift. Reopening, exporting twice, and reporting twice must produce byte-identical JSONL and checksums.
+
+The existing execution helper's `allowAuthorityFallback` is forbidden for production and is removed from the production runner: every phase input checksum comes from the explicit branded bridge/ledger authority and never from a caller object or semantic-input fallback. The old `appendQualityReplayArtifact` path is fixture-only, writes an explicit legacy structural marker, and can return only `evidenceClass:'legacy_structural',evidenceEligible:false`; a branded production result is rejected rather than serialized through it.
 
 - [ ] **Step 2: Preserve protocol-only legacy readability**
 
-If old structural replay artifacts remain supported, keep that parser isolated and explicitly ineligible for production quality readiness. Do not weaken the v2 production evidence gate.
+If old structural replay artifacts remain supported, keep that parser isolated and explicitly return `evidenceClass:'legacy_structural'`, `evidenceEligible:false`, and a stable ineligibility reason. It may be viewed for protocol regression only; it cannot produce manual-review input, candidate release approval, promotion evidence, or readiness success. `validateQualityArtifactBundle` may remain as a compatibility facade, but its production-eligible branch accepts only the exact v2 projection above.
+
+The production manual-review artifact is also a closed version-2 JSONL, never a caller summary and never the old `metadata|review` shape. It is ordered as one `manual_metadata` row, required `review` rows in verified final-key order, then one `manual_provenance` row:
+
+- `manual_metadata`: `{schemaVersion,recordType,runId,sourceHead,candidateReleaseId,candidateReleaseChecksum,planChecksum,replayProvenanceChecksum,requirementsChecksum}`. Each ordered requirement is exact `{finalKey,primaryJudgmentChecksum,secondaryJudgmentChecksum,executionChecksum,finalValueChecksum,evidenceFindingIds}` and `requirementsChecksum=contentHash(orderedRequirements)`; requirements are rederived from v2 finals/judgments/comparisons and the existing deterministic passing-sample rule.
+- `review`: `{schemaVersion,recordType,runId,reviewId,finalKey,primaryJudgmentChecksum,secondaryJudgmentChecksum,executionChecksum,finalValueChecksum,evidenceFindingIds,decision,resolvedOutput,reason,reviewer,createdAt}`. `reviewId='qreview_'+contentHash({runId,finalKey,primaryJudgmentChecksum,secondaryJudgmentChecksum,executionChecksum,finalValueChecksum}).slice(0,48)`; all four checksums must equal the v2 replay rows; finding IDs are the exact ordered requirement set; `reviewer` is exactly `central_window`; and `decision` is exactly `accept_primary|accept_secondary|merge|reject_both|unresolved`.
+- `manual_provenance`: `{schemaVersion,recordType,runId,recordCounts,recordsChecksum,manualProvenanceChecksum}`. `recordCounts` is exact `{manualMetadata:1,review:N}`; `recordsChecksum=contentHash([manualMetadata,...orderedReviews])`; and `manualProvenanceChecksum=contentHash({runId,requirementsChecksum,recordCounts,recordsChecksum})`.
+
+For `accept_primary|accept_secondary`, `resolvedOutput` must exactly equal the selected complete normalized judgment output. For `merge`, it must itself pass the complete closed blind-output validator. For `reject_both|unresolved`, it is exactly `null` and the quality report remains ineligible. Missing, duplicate, unexpected, changed-basis, legacy, or self-consistently forged reviews reject. A final whose two outputs differ/unresolve, contains a critical finding or score 1, exercises a structured-action critical rule, or is selected by the deterministic passing sample requires exactly one review. When no review is required, the two judgments must be identical and the primary output is the effective output. When review is required, only a bound resolved output becomes the effective output; the reporter never silently chooses one evaluator. If the manual artifact is absent, the reporter may emit the exact ordered requirements and an ineligible report, but readiness can never pass.
 
 - [ ] **Step 3: Verify red**
 
 ```powershell
-node --test yuqi-runtime/test/quality-report.test.mjs tests/yuqi-v3-readiness.test.mjs tests/yuqi-lived-quality-contract.test.mjs
+node --test yuqi-runtime/test/quality-report.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/promotion-controller.test.mjs tests/cognition-rollout-quality-boundary.test.mjs tests/yuqi-v3-readiness.test.mjs tests/yuqi-lived-quality-contract.test.mjs
 ```
 
 - [ ] **Step 4: Implement ledger export and rederived joins**
 
-The reporter must compute its provenance checksum from exported rows rather than trusting a caller summary. Manual-review records bind both complete evaluator judgments and the final execution checksum.
+`quality-replay.mjs` owns the closed v2 row validator, canonical ordering, and checksum derivation and must not import runner, reporter, readiness, or ledger modules. The dependency direction is `runner -> ledger + quality-replay` and `reporter/readiness -> quality-replay`; no new ESM cycle is allowed. `run-yuqi-lived-quality-replay.mjs` owns only the branded read-only ledger export and atomic file replacement. The reporter consumes the v2 rows, rederives all joins and counts, and computes its report/provenance from those rows rather than trusting a caller summary. Manual-review records bind both complete evaluator judgments, the matching final value/value checksum, and the final execution checksum. The report derives exactly 246 decisions and exposes unresolved/difference/manual-review totals from finalized comparisons; it never turns a missing or invalid record into a default score.
+
+`verify-yuqi-v3-readiness.mjs` must call the same v2 validator and require the v2 provenance, exact source head, release/attestation header, 246/984/492/246 joins, every required bound manual review, and zero missing or unresolved review requirements before readiness can pass; resolved review rows are expected and are not themselves blockers. A legacy structural artifact, a v2 artifact with caller-supplied counts, or any alternate parser path is permanently ineligible. Existing callers such as rollout/formal verification may use the compatibility facade, but cannot bypass the v2 eligible branch. Their existing fixtures in `promotion-controller.test.mjs` and `cognition-rollout-quality-boundary.test.mjs` must be migrated to genuine v2 rows or explicitly asserted legacy/ineligible; no old fixture remains an eligible release proof.
 
 - [ ] **Step 5: Run and commit**
 
 ```powershell
-node --test yuqi-runtime/test/quality-report.test.mjs tests/yuqi-v3-readiness.test.mjs tests/yuqi-lived-quality-contract.test.mjs
-git add scripts/report-yuqi-lived-quality.mjs yuqi-runtime/src/quality-replay.mjs yuqi-runtime/test/quality-report.test.mjs tests/yuqi-v3-readiness.test.mjs tests/yuqi-lived-quality-contract.test.mjs
+node --test yuqi-runtime/test/quality-report.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/promotion-controller.test.mjs tests/cognition-rollout-quality-boundary.test.mjs tests/yuqi-v3-readiness.test.mjs tests/yuqi-lived-quality-contract.test.mjs
+node --check scripts/report-yuqi-lived-quality.mjs
+node --check scripts/run-yuqi-lived-quality-replay.mjs
+node --check scripts/verify-yuqi-v3-readiness.mjs
+node --check yuqi-runtime/src/quality-replay.mjs
+git diff --check
+git add scripts/report-yuqi-lived-quality.mjs scripts/run-yuqi-lived-quality-replay.mjs scripts/verify-yuqi-v3-readiness.mjs yuqi-runtime/src/quality-replay.mjs yuqi-runtime/test/quality-report.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/promotion-controller.test.mjs tests/cognition-rollout-quality-boundary.test.mjs tests/yuqi-v3-readiness.test.mjs tests/yuqi-lived-quality-contract.test.mjs
 git commit -m "fix: verify variable Yuqi quality model evidence"
 ```
 
