@@ -29,6 +29,12 @@ import {
 import { V3DiagnosticAuthorityConflict } from './v3-diagnostics.mjs';
 import { COMPARISON_CRITICAL_CODES } from './comparison-evaluator.mjs';
 import {
+  LIFE_CONTEXT_AUTHORITY_VERSION,
+  assertLifePlanningContextAuthority,
+  lifePlanningContextChecksum as lifePlanningContextChecksumV2,
+  lifePlanningRequestBaseKey
+} from './life-planning-authority.mjs';
+import {
   currentBatchEvidenceAuthorityProjection,
   validateConsolidationCandidate
 } from './evidence-memory.mjs';
@@ -231,6 +237,14 @@ function validateTrustedPublicMomentCandidate(value) {
 }
 
 function lifePlanningContextChecksum(inputSnapshot) {
+  if (Object.hasOwn(inputSnapshot || {}, 'contextAuthorityVersion')) {
+    if (inputSnapshot.contextAuthorityVersion !== LIFE_CONTEXT_AUTHORITY_VERSION
+      || !Number.isSafeInteger(inputSnapshot.contextAuthorityVersion)) {
+      throw new Error('life planning context authority version conflict');
+    }
+    assertLifePlanningContextAuthority(inputSnapshot);
+    return lifePlanningContextChecksumV2(inputSnapshot);
+  }
   return contentHash({
     cognitiveState: inputSnapshot?.cognitiveState || {},
     allowedActions: inputSnapshot?.allowedActions || []
@@ -263,6 +277,9 @@ function assertLifePlanningInputSnapshotBinding(attempt) {
   }
   if (!Object.hasOwn(snapshot, 'current')) {
     throw new Error('life planning input authority conflict: current');
+  }
+  if (Object.hasOwn(snapshot, 'contextAuthorityVersion')) {
+    assertLifePlanningContextAuthority(snapshot);
   }
   const validateReferenceShape = (reference, name) => {
     if (!reference || typeof reference !== 'object' || Array.isArray(reference)
@@ -366,7 +383,7 @@ function assertLifePlanningAttemptEvidence(attempt) {
     || lifePlanningContextChecksum(attempt.inputSnapshot || {}) !== attempt.contextChecksum) {
     throw new Error('life planning evidence authority conflict');
   }
-  const expectedRequestBaseKey = contentHash({
+  const expectedRequestBaseKey = lifePlanningRequestBaseKey({
     roleId: attempt.roleId,
     startAt: attempt.planningWindowStartAt,
     endAt: attempt.planningWindowEndAt,

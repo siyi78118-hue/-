@@ -1002,7 +1002,11 @@ export class YuqiOrchestrator {
     return this;
   }
 
-  accept(rawEnvelope) {
+  accept(rawEnvelope, options = {}) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)
+      || Object.keys(options).some(key => key !== 'qualitySubject')) {
+      throw new Error('orchestrator accept options conflict');
+    }
     const envelope = validateEnvelope(rawEnvelope);
     if (this.promotionController && !this.releaseExecutorAttached) {
       throw new Error('canonical release executor is not attached');
@@ -1014,7 +1018,7 @@ export class YuqiOrchestrator {
       && CANONICAL_TURN_KINDS.has(String(envelope?.kind || ''))
     );
     let submitted = canonical
-      ? this.createCanonicalTurnForEnvelope(envelope)
+      ? this.createCanonicalTurnForEnvelope(envelope, options)
       : this.promotionController
         ? this.promotionController.createTurn({
             envelope,
@@ -1055,7 +1059,7 @@ export class YuqiOrchestrator {
     return submitted;
   }
 
-  createCanonicalTurnForEnvelope(envelope) {
+  createCanonicalTurnForEnvelope(envelope, options = {}) {
     const exactTurn = this.store.getTurn(envelope.turnId);
     const exactCanonicalTurn = Number(exactTurn?.resultAuthorityVersion || 0) === 1
       ? exactTurn
@@ -1107,7 +1111,7 @@ export class YuqiOrchestrator {
           roleId: envelope.characterId,
           at: canonicalInteractionAt(envelope, this.clock())
         });
-    const annotationSnapshot = exactCanonicalTurn?.annotationSnapshot
+    let annotationSnapshot = exactCanonicalTurn?.annotationSnapshot
       || retryParent?.annotationSnapshot
       || (envelope.kind === 'PROACTIVE_CHAT'
         ? {
@@ -1134,6 +1138,12 @@ export class YuqiOrchestrator {
                 momentTargetAuthority: this.store.rebuildMomentTargetAuthorityInternal({ envelope })
               }
             : {});
+    if (options.qualitySubject !== undefined) {
+      annotationSnapshot = {
+        ...annotationSnapshot,
+        qualitySubject: structuredClone(options.qualitySubject)
+      };
+    }
     const creation = this.store.createCanonicalVisibleTurnInternal({
       envelope,
       rolloutKey: envelope.kind,
@@ -1386,8 +1396,21 @@ export class YuqiOrchestrator {
     this.lifePlanningDispatcher = dispatcher;
   }
 
-  buildLifePlanningReleaseExecution(attempt) {
-    return { attempt };
+  buildLifePlanningReleaseExecution(attempt, options = {}) {
+    if (!attempt || typeof attempt !== 'object') throw new Error('life execution attempt is required');
+    const inputChecksum = attempt.inputChecksum;
+    if (typeof inputChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(inputChecksum)) {
+      throw new Error('life execution input checksum authority is required');
+    }
+    return {
+      attempt,
+      inputSnapshot: attempt.inputSnapshot || null,
+      context: attempt.context || null,
+      inputChecksum,
+      ...(options.qualityAuthorityId ? { qualityAuthorityId: options.qualityAuthorityId } : {}),
+      ...(options.qualitySemanticInputChecksum
+        ? { qualitySemanticInputChecksum: options.qualitySemanticInputChecksum } : {})
+    };
   }
 
   async executeLegacyReleaseTurnDraft({ release, execution }) {
@@ -1831,7 +1854,10 @@ export class YuqiOrchestrator {
 
   buildCanonicalReleaseExecution(turnId, options = {}) {
     if (!options || typeof options !== 'object' || Array.isArray(options)
-      || Object.keys(options).some(key => !['localImagePaths', 'localImageReceipt'].includes(key))) {
+      || Object.keys(options).some(key => ![
+        'localImagePaths', 'localImageReceipt', 'qualityAuthorityId',
+        'qualitySemanticInputChecksum'
+      ].includes(key))) {
       throw new Error('canonical release execution options conflict');
     }
     const turn = this.store.getTurn(String(turnId || ''));
@@ -1932,23 +1958,70 @@ export class YuqiOrchestrator {
       featureContext: envelope.context || {},
       limits: { hardConstraints: 5, currentStances: 2, preferences: 4 }
     });
+    const qualitySubject = turn.annotationSnapshot?.qualitySubject || null;
+    const qualitySemanticInput = qualitySubject?.semanticInput || null;
+    const qualityScene = qualitySemanticInput ? {
+      relationshipStage: 'normal',
+      conversationExtraPrompt: JSON.stringify({
+        context: qualitySemanticInput.context,
+        turns: qualitySemanticInput.turns,
+        stateCheckpoint: qualitySemanticInput.stateCheckpoint,
+        structuredActionTargets: qualitySemanticInput.structuredActionTargets,
+        sceneId: qualitySemanticInput.sceneId,
+        turnKind: qualitySemanticInput.turnKind
+      }),
+      globalExtraPrompt: JSON.stringify(qualitySemanticInput.context),
+      rolePlanCatalog: JSON.stringify(qualitySemanticInput.structuredActionTargets),
+      roleScheduleContext: JSON.stringify(qualitySemanticInput.stateCheckpoint),
+      momentContext: JSON.stringify(qualitySemanticInput.turns),
+      currentStances: [],
+      verifiedFacts: [],
+      relationshipStageEvidence: []
+    } : null;
+    const scene = qualityScene || (Number(turn.protocolVersion) === 3 && PUBLIC_MOMENT_KINDS.has(turn.rolloutKey)
+      ? {}
+      : Number(turn.protocolVersion) === 3
+        ? cognitionSceneForV3(sceneFromEnvelope(envelope))
+        : sceneFromEnvelope(envelope));
+    const routeDecision = {
+      route: turn.route,
+      cognitiveState: this.store.getCognitiveState?.(turn.characterId) || {},
+      allowedActionTargets: qualitySemanticInput?.structuredActionTargets || {}
+    };
+    const inputChecksum = contentHash({
+      version: 1,
+      turn,
+      envelope,
+      currentBatch,
+      scene,
+      agencyView,
+      routeDecision,
+      releasePins: {
+        authoritativeReleaseId: turn.authoritativeReleaseId,
+        authoritativePipelineChecksum: turn.authoritativePipelineChecksum,
+        comparisonReleaseId: turn.comparisonReleaseId || null,
+        comparisonPipelineChecksum: turn.comparisonPipelineChecksum || null
+      },
+      revisions: {
+        turnRevision: turn.turnRevision,
+        lineageRevision: turn.lineageRevisionAtCreation,
+        laneRevision: turn.laneRevision,
+        agencyRevision: agencySnapshot.revision || 0
+      }
+    });
     return {
       turn,
       envelope,
-      scene: Number(turn.protocolVersion) === 3 && PUBLIC_MOMENT_KINDS.has(turn.rolloutKey)
-        ? {}
-        : Number(turn.protocolVersion) === 3
-          ? cognitionSceneForV3(sceneFromEnvelope(envelope))
-          : sceneFromEnvelope(envelope),
+      scene,
       currentBatch,
       localImagePaths: [...localImagePaths],
       ...(localImageReceipt ? { localImageReceipt: structuredClone(localImageReceipt) } : {}),
       agencyView,
-      routeDecision: {
-        route: turn.route,
-        cognitiveState: this.store.getCognitiveState?.(turn.characterId) || {},
-        allowedActionTargets: {}
-      }
+      routeDecision,
+      inputChecksum,
+      ...(options.qualityAuthorityId ? { qualityAuthorityId: options.qualityAuthorityId } : {}),
+      ...(options.qualitySemanticInputChecksum
+        ? { qualitySemanticInputChecksum: options.qualitySemanticInputChecksum } : {})
     };
   }
 

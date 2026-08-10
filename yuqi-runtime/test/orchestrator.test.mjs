@@ -2793,7 +2793,7 @@ test('canonical runtime consumes the shared persisted release execution builder'
     const execution = orchestrator.buildCanonicalReleaseExecution(turn.turnId);
 
     assert.deepEqual(Object.keys(execution).sort(), [
-      'agencyView', 'currentBatch', 'envelope', 'localImagePaths',
+      'agencyView', 'currentBatch', 'envelope', 'inputChecksum', 'localImagePaths',
       'routeDecision', 'scene', 'turn'
     ]);
     assert.equal(execution.turn.turnId, turn.turnId);

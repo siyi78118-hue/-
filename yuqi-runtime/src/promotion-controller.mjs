@@ -7,6 +7,11 @@ import {
 import { laneKeyForEnvelope } from './interaction-lanes.mjs';
 import { resolveCurrentUserBatch } from './current-user-batch.mjs';
 import { RolloutRevisionConflictError } from './store.mjs';
+import {
+  LIFE_CONTEXT_AUTHORITY_VERSION,
+  lifePlanningContextChecksum,
+  lifePlanningRequestBaseKey
+} from './life-planning-authority.mjs';
 
 export const COGNITION_ROLLOUT_KEYS = Object.freeze([
   'DIRECT_REPLY',
@@ -406,6 +411,7 @@ export class PromotionController {
         to: endAt
       });
       const inputSnapshot = {
+        contextAuthorityVersion: LIFE_CONTEXT_AUTHORITY_VERSION,
         roleId: String(roleId),
         planningAnchorAt: startAt,
         planningWindow: { startAt, targetEndAt: endAt },
@@ -415,11 +421,8 @@ export class PromotionController {
         cognitiveState: this.store.getCognitiveState(roleId)?.state || {},
         allowedActions: ['create_life_episode']
       };
-      const contextChecksum = contentHash({
-        cognitiveState: inputSnapshot.cognitiveState,
-        allowedActions: inputSnapshot.allowedActions
-      });
-      const requestBaseKey = contentHash({
+      const contextChecksum = lifePlanningContextChecksum(inputSnapshot);
+      const requestBaseKey = lifePlanningRequestBaseKey({
         roleId, startAt, endAt, lifeBasisChecksum, contextChecksum
       });
       const requestKey = contentHash({

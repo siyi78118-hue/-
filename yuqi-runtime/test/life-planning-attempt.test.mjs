@@ -35,6 +35,7 @@ test('life attempt pins rollout identity without creating compare before the res
   });
   assert.equal(attempt.executionState, 'created');
   assert.equal(attempt.comparisonState, 'not_applicable');
+  assert.equal(attempt.inputSnapshot.contextAuthorityVersion, 2);
   assert.equal(store.getOpenLifePlanningAttempt('yuqi').planningId, attempt.planningId);
   assert.equal(store.listRecoverableConsolidationJobs().length, 0);
   let rolloutReads = 0;
@@ -49,6 +50,40 @@ test('life attempt pins rollout identity without creating compare before the res
     now: 2_000
   }).planningId, attempt.planningId);
   assert.equal(rolloutReads, 0);
+}));
+
+test('legacy life attempts without a context marker remain v1-compatible', () => withStore(store => {
+  const controller = new PromotionController({ store, presetRegistry: registry(), clock: () => 1_000 });
+  controller.initialize();
+  const created = controller.createLifePlanningAttempt({
+    roleId: 'yuqi',
+    planningContext: { planWindowStartAt: 10_000, targetPlanEndAt: 50_000 },
+    now: 1_000
+  });
+  const legacySnapshot = { ...created.inputSnapshot };
+  delete legacySnapshot.contextAuthorityVersion;
+  const legacyContextChecksum = contentHash({
+    cognitiveState: legacySnapshot.cognitiveState,
+    allowedActions: legacySnapshot.allowedActions
+  });
+  const legacyRequestBaseKey = contentHash({
+    roleId: created.roleId,
+    startAt: created.planningWindowStartAt,
+    endAt: created.planningWindowEndAt,
+    lifeBasisChecksum: created.lifeBasisChecksum,
+    contextChecksum: legacyContextChecksum
+  });
+  store.db.prepare(`
+    UPDATE cognition_life_planning_attempts
+    SET input_snapshot_json = ?, input_checksum = ?, context_checksum = ?, request_base_key = ?
+    WHERE planning_id = ?
+  `).run(
+    JSON.stringify(legacySnapshot), contentHash(legacySnapshot), legacyContextChecksum,
+    legacyRequestBaseKey, created.planningId
+  );
+  assert.doesNotThrow(() => store.assertPersistedLifePlanningAttemptAuthorityInternal(
+    created.planningId
+  ));
 }));
 
 test('controller open coalescing rejects a corrupted persisted attempt before returning', () => withStore(store => {

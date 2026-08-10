@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { composeYuqiExecutionRuntime } from '../src/runtime-composition.mjs';
+import {
+  assertProductionRuntimeAttestation,
+  composeYuqiExecutionRuntime,
+} from '../src/runtime-composition.mjs';
 
 function runtimeFixture() {
   const releases = new Map();
@@ -34,4 +37,15 @@ test('production composition injects one complete release executor before exposu
     () => runtime.orchestrator.attachReleaseExecutor(runtime.releaseExecutor),
     /release executor already attached/
   );
+});
+
+test('production composition rejects fake dependencies at the attestation boundary', () => {
+  const runtime = composeYuqiExecutionRuntime({
+    ...runtimeFixture(),
+    sourceHead: 'a'.repeat(40),
+  });
+  assert.throws(() => assertProductionRuntimeAttestation(runtime, {
+    sourceHead: 'a'.repeat(40),
+  }), /production runtime dependencies/);
+  assert.throws(() => assertProductionRuntimeAttestation({ ...runtime }, {}), /production runtime attestation/);
 });
