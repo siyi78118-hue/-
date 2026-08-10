@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -48,7 +48,9 @@ function installCleanSourceRunner({ head = currentSourceHead(), status = '' } = 
 }
 
 function promotionEvidenceTempDir(prefix) {
-  return mkdtempSync(join(process.cwd(), 'artifacts', 'yuqi-lived-agency-v3', `.tmp-${prefix}-`));
+  const evidenceRoot = join(process.cwd(), 'artifacts', 'yuqi-lived-agency-v3');
+  mkdirSync(evidenceRoot, { recursive: true });
+  return mkdtempSync(join(evidenceRoot, `.tmp-${prefix}-`));
 }
 
 function sha256File(path) {
