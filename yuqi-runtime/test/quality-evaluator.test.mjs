@@ -6,6 +6,9 @@ import {
   aggregateQualityGate,
   buildBlindEvaluation,
   compileSceneExecutionInput,
+  compileQualitySubject,
+  executionMethodForSubject,
+  normalizeQualityExecutionOutput,
   normalizeBlindEvaluation,
   projectBlindEvaluationInput,
   runScenePair,
@@ -18,7 +21,23 @@ import {
 } from '../src/quality-replay.mjs';
 import { compileQualitySuite } from '../../scripts/compile-yuqi-lived-quality-scenes.mjs';
 
-const HISTORY_SCENES = Array.from({ length: 30 }, (_, index) => ({ sceneId: `history-${index}` }));
+const HISTORY_SCENES = Array.from({ length: 30 }, (_, index) => ({
+  sceneId: `history-${index}`,
+  rolloutKey: 'DIRECT_REPLY',
+  severity: 'high',
+  focus: `history focus ${index}`,
+  turns: [
+    { at: '2026-01-02T00:00:00.000Z', speaker: 'user', batch: [{ messageId: `h-${index}-u1`, type: 'text', text: 'hello' }] },
+    { at: '2026-01-02T00:00:10.000Z', speaker: 'assistant', batch: [{ messageId: `h-${index}-a1`, type: 'text', text: 'hi' }] },
+    { at: '2026-01-02T00:01:00.000Z', speaker: 'user', batch: [{ messageId: `h-${index}-u2`, type: 'text', text: 'follow up' }] },
+    { at: '2026-01-02T00:01:10.000Z', speaker: 'system', event: 'candidate_response' }
+  ],
+  requiredActionIntegrity: { responseMustTarget: 'current_user_turn' },
+  expectedStateTransitions: { allow: ['maintain'] },
+  forbiddenStateTransitions: { hardConstraintFromYuqiPreference: true },
+  mustNotice: ['current bid'],
+  allowedPersonalityVariation: ['warm']
+}));
 const AUTHORITY_PLAN = buildVerifiedQualityReplayPlan({
   compiledSuite: compileQualitySuite({ rootDir: process.cwd(), checkOnly: true }),
   historyScenes: HISTORY_SCENES,
@@ -47,7 +66,7 @@ function validEvaluation() {
   return {
     version: 1,
     scores: Object.fromEntries(QUALITY_DIMENSIONS.map(dimension => [dimension, 4])),
-    preference: 'candidate',
+    preference: 'B',
     findings: [],
     unresolved: false
   };
@@ -91,7 +110,7 @@ function validScene() {
       { speaker: 'user', batch: [{ messageId: 'u1', type: 'text', text: '你好' }] },
       { speaker: 'assistant', batch: [{ messageId: 'a1', type: 'text', text: '嗯' }] },
       { speaker: 'user', batch: [{ messageId: 'u2', type: 'text', text: '在吗' }] },
-      { speaker: 'system', event: 'candidate_response' }
+      { at: '2026-01-01T00:00:00.000Z', speaker: 'system', event: 'candidate_response' }
     ],
     sourceAnnotation: { file: 'source.md', heading: 'Scene' },
     requiredActionIntegrity: { responseMustTarget: 'current_user_turn' },
@@ -104,6 +123,30 @@ function validScene() {
   };
 }
 
+function subjectItem(rolloutKey = 'DIRECT_REPLY', overrides = {}) {
+  const scene = {
+    ...validScene(),
+    sceneId: overrides.sceneId || `scene-${rolloutKey.toLowerCase()}`,
+    rolloutKey,
+    ...overrides.scene
+  };
+  return {
+    layer: overrides.layer || 'sentinel',
+    sceneId: scene.sceneId,
+    repeatIndex: overrides.repeatIndex || 0,
+    scene
+  };
+}
+
+function hasNonEmptyAttachments(value) {
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some(hasNonEmptyAttachments);
+  return Object.entries(value).some(([key, nested]) =>
+    (key === 'attachments' && !(nested === null || (Array.isArray(nested) && nested.length === 0)))
+    || hasNonEmptyAttachments(nested)
+  );
+}
+
 test('blind evaluator cannot see release identity or output order', () => {
   const input = buildBlindEvaluation(stableCandidatePair(), { seed: 7 });
   assert.equal(JSON.stringify(input).includes('stable'), false);
@@ -111,10 +154,33 @@ test('blind evaluator cannot see release identity or output order', () => {
   assert.deepEqual([...input.labels].sort(), ['A', 'B']);
 });
 
+test('frozen authority plan has 246 finals, eight life finals, and no binary attachments', () => {
+  assert.equal(AUTHORITY_PLAN.items.length, 246);
+  assert.equal(AUTHORITY_PLAN.items.filter(item => item.scene.rolloutKey === 'LIFE_PLANNING').length, 8);
+  assert.equal(AUTHORITY_PLAN.items.filter(item => hasNonEmptyAttachments(item.scene)).length, 0);
+  const subjects = AUTHORITY_PLAN.items.map(compileQualitySubject);
+  assert.equal(subjects.length, 246);
+  assert.equal(new Set(subjects.map(subject => subject.finalKey)).size, 246);
+  assert.equal(new Set(subjects.map(subject => `${subject.finalKey}:${subject.semanticInputChecksum}`)).size, 246);
+  assert.equal(subjects.filter(subject => subject.subjectType === 'life_planning').length, 8);
+});
+
 test('six dimensions normalize to integer 1 through 5', () => {
   const result = normalizeBlindEvaluation(validEvaluation());
   assert.deepEqual(Object.keys(result.scores).sort(), [...QUALITY_DIMENSIONS].sort());
   assert.ok(Object.values(result.scores).every(x => Number.isInteger(x) && x >= 1 && x <= 5));
+});
+
+test('formal blind preference is release-agnostic and rejects candidate/stable labels', () => {
+  for (const preference of ['A', 'B', 'tie', 'unresolved']) {
+    assert.equal(normalizeBlindEvaluation({ ...validEvaluation(), preference }).preference, preference);
+  }
+  for (const preference of ['candidate', 'stable']) {
+    assert.throws(
+      () => normalizeBlindEvaluation({ ...validEvaluation(), preference }),
+      /preference/i
+    );
+  }
 });
 
 test('average cannot hide a severe sentinel failure', () => {
@@ -194,7 +260,7 @@ test('blind projection is closed and excludes every release and execution side c
     } }
   }, { seed: 17 });
   assert.deepEqual(Object.keys(input).sort(), [
-    'dimensions', 'outputs', 'sceneAnnotation', 'version'
+    'dimensions', 'outputs', 'sceneAnnotation', 'subjectType', 'version'
   ]);
   assert.equal(JSON.stringify(input).includes('releaseId'), false);
   assert.deepEqual(input.outputs.map(output => output.label).sort(), ['A', 'B']);
@@ -344,4 +410,171 @@ test('one closed adapter executes every scene through the pinned release executo
   assert.equal(pairRecord.candidate.dryRun, true);
   assert.equal(pairRecord.executionChecksum, pairRecord.stableInputChecksum);
   assert.equal(pairRecord.executionChecksum, pairRecord.candidateInputChecksum);
+});
+
+test('compiles all nine turn kinds and LIFE_PLANNING into a closed subject union', () => {
+  const turnKinds = [
+    'DIRECT_REPLY', 'PROACTIVE_CHAT', 'PROACTIVE_MOMENT',
+    'MOMENT_INTERACTION', 'MOMENT_REPLY', 'ROLE_PLAN_CHAT',
+    'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE'
+  ];
+  for (const kind of turnKinds) {
+    const item = subjectItem(kind);
+    const subject = compileQualitySubject(item);
+    assert.deepEqual(Object.keys(subject).sort(), [
+      'blindAnnotation', 'finalKey', 'semanticInput', 'semanticInputChecksum',
+      'subjectType', 'turnKind', 'version'
+    ]);
+    assert.equal(subject.finalKey, `${item.layer}:${item.sceneId}:${item.repeatIndex}`);
+    assert.equal(subject.subjectType, 'turn');
+    assert.equal(subject.turnKind, kind);
+    assert.equal(executionMethodForSubject(subject), 'executeTurn');
+    assert.match(subject.semanticInputChecksum, /^[a-f0-9]{64}$/);
+    assert.equal(subject.blindAnnotation.sceneId, item.sceneId);
+  }
+  const lifeItem = subjectItem('LIFE_PLANNING');
+  const life = compileQualitySubject(lifeItem);
+  assert.equal(life.subjectType, 'life_planning');
+  assert.equal(executionMethodForSubject(life), 'executeLife');
+  assert.throws(() => compileQualitySubject(subjectItem('UNKNOWN_KIND')), /unsupported|rollout/i);
+  assert.throws(() => executionMethodForSubject({ subjectType: 'unknown' }), /subject type|quality/i);
+  assert.throws(() => executionMethodForSubject({ subjectType: 'turn', privatePath: 'secret' }), /unknown|quality/i);
+});
+
+test('quality subject rejects any non-empty attachment payload before execution', () => {
+  const item = subjectItem('DIRECT_REPLY', {
+    scene: {
+      turns: [{ speaker: 'user', batch: [{
+        messageId: 'u-attachment', type: 'text', text: 'hello', attachments: [{ kind: 'image' }]
+      }] }]
+    }
+  });
+  assert.throws(() => compileQualitySubject(item), /attachment/i);
+});
+
+test('quality execution output union normalizes turn and life outputs', () => {
+  const turn = normalizeQualityExecutionOutput(
+    { subjectType: 'turn' },
+    { subjectType: 'turn', terminalDisposition: 'visible', replyParts: [{ ordinal: 0, type: 'text', text: 'ok' }], actions: [] }
+  );
+  assert.deepEqual(turn, {
+    subjectType: 'turn',
+    terminalDisposition: 'visible',
+    replyParts: [{ ordinal: 0, type: 'text', text: 'ok' }],
+    actions: []
+  });
+  const life = normalizeQualityExecutionOutput(
+    { subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 } },
+    { episodes: [{ episodeId: 'private-id', ordinal: 0, kind: 'routine', title: 'plan', startAt: 10, endAt: 20 }] }
+  );
+  assert.deepEqual(life, {
+    subjectType: 'life_planning',
+    episodes: [{ episodeId: 'private-id', ordinal: 0, kind: 'routine', title: 'plan', startAt: 10, endAt: 20 }]
+  });
+  const blind = projectBlindEvaluationInput({
+    subjectType: 'life_planning',
+    planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 },
+    sceneId: 'life-scene', repeatIndex: 0, evaluationSeed: 1,
+    sceneAnnotation: { sceneId: 'life-scene', severity: 'high', focus: 'life', turns: [] },
+    stable: { output: { ...life, episodes: [{ ...life.episodes[0], title: 'stable' }] } },
+    candidate: { output: { ...life, episodes: [{ ...life.episodes[0], title: 'candidate' }] } }
+  }, { seed: 1 });
+  assert.deepEqual(Object.keys(blind.outputs[0]).sort(), ['episodes', 'label']);
+  assert.equal(blind.subjectType, 'life_planning');
+  assert.deepEqual(Object.keys(blind.dimensionRubric).sort(), [...QUALITY_DIMENSIONS].sort());
+  assert.equal(Object.hasOwn(blind.outputs[0].episodes[0], 'episodeId'), false);
+  assert.equal(Object.hasOwn(blind, 'dimensionRubric'), true);
+  const builtLife = buildBlindEvaluation({
+    subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 },
+    sceneId: 'life-scene', repeatIndex: 0,
+    sceneAnnotation: { sceneId: 'life-scene', severity: 'high', focus: 'life', turns: [] },
+    stable: { output: life }, candidate: { output: life }
+  }, { seed: 1 });
+  assert.equal(builtLife.subjectType, 'life_planning');
+  assert.equal(Object.hasOwn(builtLife, 'dimensionRubric'), true);
+  const swapDirections = new Set();
+  for (let seed = 1; seed <= 100; seed += 1) {
+    const swapped = projectBlindEvaluationInput({
+      subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 },
+      sceneId: `life-scene-${seed}`, repeatIndex: 0, evaluationSeed: 1,
+      sceneAnnotation: { sceneId: `life-scene-${seed}`, severity: 'high', focus: 'life', turns: [] },
+      stable: { output: { ...life, episodes: [{ ...life.episodes[0], title: 'stable' }] } },
+      candidate: { output: { ...life, episodes: [{ ...life.episodes[0], title: 'candidate' }] } }
+    }, { seed: 1 });
+    swapDirections.add(swapped.outputs.find(output => output.episodes[0].title === 'stable').label);
+  }
+  assert.deepEqual([...swapDirections].sort(), ['A', 'B']);
+  const turnOutput = { subjectType: 'turn', terminalDisposition: 'visible', replyParts: [], actions: [] };
+  assert.throws(() => projectBlindEvaluationInput({
+    subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 },
+    sceneId: 'life-scene', repeatIndex: 0, evaluationSeed: 1,
+    sceneAnnotation: { sceneId: 'life-scene', severity: 'high', focus: 'life', turns: [] },
+    stable: { output: turnOutput }, candidate: { output: life }
+  }, { seed: 1 }), /life|episode|subject/i);
+  assert.throws(() => normalizeQualityExecutionOutput(
+    { subjectType: 'turn', turnKind: 'DIRECT_REPLY' },
+    life
+  ), /turn|output|blind/i);
+  assert.throws(() => normalizeQualityExecutionOutput(
+    { subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 } },
+    { ...life, replyParts: [] }
+  ), /life|unknown/i);
+  assert.throws(() => normalizeQualityExecutionOutput(
+    { subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 } },
+    { ...life, actions: [] }
+  ), /life|unknown/i);
+  assert.throws(() => normalizeQualityExecutionOutput(
+    { subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 } },
+    { ...life, releaseId: 'side-channel' }
+  ), /life|unknown/i);
+  assert.throws(() => normalizeQualityExecutionOutput(
+    { subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 } },
+    { episodes: [
+      { episodeId: 'one', ordinal: 0, kind: 'routine', title: 'one', startAt: 10, endAt: 20 },
+      { episodeId: 'two', ordinal: 1, kind: 'routine', title: 'two', startAt: 19, endAt: 30 }
+    ] }
+  ), /overlap|unordered/i);
+  assert.throws(() => normalizeQualityExecutionOutput(
+    { subjectType: 'life_planning', planningWindow: { startAt: 0, targetEndAt: 12 * 60 * 60 * 1000 } },
+    { episodes: [{ episodeId: 'late', ordinal: 0, kind: 'routine', title: 'late', startAt: 10, endAt: 12 * 60 * 60 * 1000 + 1 }] }
+  ), /window/i);
+});
+
+test('LIFE_PLANNING requires one parseable candidate_response anchor and a twelve-hour window', () => {
+  const missing = subjectItem('LIFE_PLANNING', {
+    scene: { turns: validScene().turns.slice(0, 3) }
+  });
+  assert.throws(() => compileQualitySubject(missing), /candidate_response|anchor/i);
+  const duplicate = subjectItem('LIFE_PLANNING', {
+    scene: { turns: [...validScene().turns, { at: '2026-01-01T00:02:00Z', speaker: 'system', event: 'candidate_response' }] }
+  });
+  assert.throws(() => compileQualitySubject(duplicate), /candidate_response|anchor/i);
+  const invalidAt = subjectItem('LIFE_PLANNING', {
+    scene: { turns: validScene().turns.map(turn => turn.event === 'candidate_response' ? { ...turn, at: 'not-a-time' } : turn) }
+  });
+  assert.throws(() => compileQualitySubject(invalidAt), /timestamp|candidate_response/i);
+  const subject = compileQualitySubject(subjectItem('LIFE_PLANNING'));
+  assert.deepEqual(subject.semanticInput.planningWindow, {
+    startAt: Date.parse('2026-01-01T00:00:00.000Z'),
+    targetEndAt: Date.parse('2026-01-01T00:00:00.000Z') + 12 * 60 * 60 * 1000
+  });
+});
+
+test('runScenePair dispatches each subject method sequentially', async () => {
+  const calls = [];
+  const executor = {
+    async executeTurn(request) { calls.push(`turn:${request.releaseId}`); return { draft: { value: request.releaseId } }; },
+    async executeLife(request) { calls.push(`life:${request.releaseId}`); return { draft: { value: request.releaseId } }; }
+  };
+  await runScenePair(compileQualitySubject(subjectItem('DIRECT_REPLY')), {
+    stable: { releaseId: 'stable', releaseChecksum: 'a'.repeat(64) },
+    candidate: { releaseId: 'candidate', releaseChecksum: 'b'.repeat(64) },
+    executor
+  });
+  await runScenePair(compileQualitySubject(subjectItem('LIFE_PLANNING')), {
+    stable: { releaseId: 'stable', releaseChecksum: 'a'.repeat(64) },
+    candidate: { releaseId: 'candidate', releaseChecksum: 'b'.repeat(64) },
+    executor
+  });
+  assert.deepEqual(calls, ['turn:stable', 'turn:candidate', 'life:stable', 'life:candidate']);
 });

@@ -38,6 +38,34 @@ const ATTEMPT_KEYS = new Set([
   'attemptIndex', 'evaluatorId', 'accepted', 'unresolved',
   'executionChecksum', 'latencyMs', 'evaluatorVersion'
 ]);
+const QUALITY_TURN_KINDS = new Set([
+  'DIRECT_REPLY',
+  'PROACTIVE_CHAT',
+  'PROACTIVE_MOMENT',
+  'MOMENT_INTERACTION',
+  'MOMENT_REPLY',
+  'ROLE_PLAN_CHAT',
+  'ROLE_PLAN_MOMENT',
+  'ROLE_PLAN_CHAT_PRIVATE',
+  'ROLE_PLAN_MOMENT_PRIVATE'
+]);
+const QUALITY_SUBJECT_KEYS = new Set([
+  'version', 'subjectType', 'finalKey', 'turnKind', 'semanticInput',
+  'semanticInputChecksum', 'blindAnnotation', 'planningWindow'
+]);
+const TURN_RAW_OUTPUT_KEYS = new Set(['subjectType', 'terminalDisposition', 'replyParts', 'actions']);
+const LIFE_RAW_OUTPUT_KEYS = new Set(['subjectType', 'episodes']);
+const LIFE_EPISODE_KEYS = new Set(['ordinal', 'episodeId', 'kind', 'title', 'startAt', 'endAt']);
+const PLANNING_WINDOW_KEYS = new Set(['startAt', 'targetEndAt']);
+const LIFE_PLANNING_WINDOW_MS = 12 * 60 * 60 * 1000;
+export const LIFE_DIMENSION_RUBRIC = Object.freeze({
+  socialUnderstanding: 'do not hard-code one interpretation of an ambiguous conversation',
+  agency: 'preserve a coherent independent routine',
+  relationshipParticipation: 'avoid unearned service promises or invented history',
+  stateContinuityFlexibility: 'preserve temporal continuity',
+  livedExpression: 'avoid template-like planning',
+  actionFactIntegrity: 'preserve episode integrity and remain silent when required'
+});
 
 function assertPlainObject(value, message) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -54,6 +82,55 @@ function assertClosedKeys(value, allowed, message) {
 
 function assertNativeSafeInteger(value, message, { min = 0 } = {}) {
   if (!Number.isSafeInteger(value) || value < min) throw new Error(message);
+}
+
+function assertPlanningWindow(value) {
+  assertClosedKeys(value, PLANNING_WINDOW_KEYS, 'life planning window');
+  assertNativeSafeInteger(value.startAt, 'life planning window startAt');
+  assertNativeSafeInteger(value.targetEndAt, 'life planning window targetEndAt');
+  if (value.targetEndAt - value.startAt !== LIFE_PLANNING_WINDOW_MS) {
+    throw new Error('life planning window interval');
+  }
+  return { startAt: value.startAt, targetEndAt: value.targetEndAt };
+}
+
+function planningWindowForScene(scene) {
+  if (!Array.isArray(scene.turns)) throw new Error('life planning scene turns');
+  const anchors = scene.turns.filter(turn =>
+    turn?.speaker === 'system' && turn?.event === 'candidate_response'
+  );
+  if (anchors.length !== 1 || typeof anchors[0].at !== 'string') {
+    throw new Error('life planning requires one candidate_response anchor');
+  }
+  const anchorAt = Date.parse(anchors[0].at);
+  if (!Number.isSafeInteger(anchorAt) || anchorAt < 0) {
+    throw new Error('life planning candidate_response timestamp');
+  }
+  return { startAt: anchorAt, targetEndAt: anchorAt + LIFE_PLANNING_WINDOW_MS };
+}
+
+function planningWindowForSubject(subject) {
+  const window = subject.planningWindow || subject.semanticInput?.planningWindow;
+  if (!window) throw new Error('life planning window is required');
+  return assertPlanningWindow(window);
+}
+
+function assertNoNonEmptyAttachments(value, seen = new Set()) {
+  if (value === null || typeof value !== 'object') return;
+  if (seen.has(value)) throw new Error('quality scene contains cyclic input');
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) assertNoNonEmptyAttachments(item, seen);
+  } else {
+    for (const [key, nested] of Object.entries(value)) {
+      if (key === 'attachments') {
+        const empty = nested === null || (Array.isArray(nested) && nested.length === 0);
+        if (!empty) throw new Error('quality plan attachment-bearing input is unsupported');
+      }
+      assertNoNonEmptyAttachments(nested, seen);
+    }
+  }
+  seen.delete(value);
 }
 
 function projectClosedValue(value, allowedKeys, message) {
@@ -230,7 +307,7 @@ export function normalizeBlindEvaluation(value) {
     }
     scores[dimension] = score;
   }
-  if (!['A', 'B', 'candidate', 'stable', 'tie', 'unresolved'].includes(value.preference)) {
+  if (!['A', 'B', 'tie', 'unresolved'].includes(value.preference)) {
     throw new Error('blind evaluation preference');
   }
   if (!Array.isArray(value.findings) || typeof value.unresolved !== 'boolean') {
@@ -251,11 +328,14 @@ export function normalizeBlindEvaluation(value) {
  */
 export function projectBlindEvaluationInput(pair, { seed }) {
   assertClosedKeys(pair, new Set([
-    'sceneId', 'repeatIndex', 'evaluationSeed', 'sceneAnnotation', 'stable', 'candidate'
+    'subjectType', 'planningWindow', 'sceneId', 'repeatIndex', 'evaluationSeed',
+    'sceneAnnotation', 'stable', 'candidate'
   ]), 'blind evaluation input shape');
   if (typeof pair.sceneId !== 'string' || !pair.sceneId) throw new Error('blind scene id');
   assertNativeSafeInteger(pair.repeatIndex, 'blind repeat index');
   assertNativeSafeInteger(seed, 'blind evaluation seed');
+  const subjectType = pair.subjectType === undefined ? 'turn' : pair.subjectType;
+  if (!['turn', 'life_planning'].includes(subjectType)) throw new Error('blind subject type');
   if (pair.sceneAnnotation?.sceneId !== pair.sceneId) throw new Error('blind scene id mismatch');
   const sceneAnnotation = projectSceneAnnotation(pair.sceneAnnotation);
   const sides = [
@@ -263,9 +343,28 @@ export function projectBlindEvaluationInput(pair, { seed }) {
     { label: 'B', value: pair.candidate?.output }
   ];
   if (!pair.stable || !pair.candidate) throw new Error('blind pair releases');
-  const projected = sides.map(side => ({
+  let projected = sides.map(side => ({
     label: side.label,
-    ...identityFreeOutput(side.value)
+    ...(subjectType === 'turn'
+      ? (() => {
+        const normalized = normalizeQualityExecutionOutput({ subjectType }, side.value);
+        return {
+          terminalDisposition: normalized.terminalDisposition,
+          replyParts: normalized.replyParts,
+          actions: normalized.actions
+        };
+      })()
+      : (() => {
+        const normalized = normalizeQualityExecutionOutput({
+          subjectType,
+          planningWindow: pair.planningWindow
+        }, side.value);
+        return {
+          episodes: normalized.episodes.map(({ ordinal, kind, title, startAt, endAt }) => ({
+            ordinal, kind, title, startAt, endAt
+          }))
+        };
+      })())
   }));
   if (!Number.isSafeInteger(pair.evaluationSeed) || pair.evaluationSeed < 0) {
     throw new Error('blind evaluation seed');
@@ -274,12 +373,21 @@ export function projectBlindEvaluationInput(pair, { seed }) {
     sceneId: pair.sceneId,
     repeatIndex: pair.repeatIndex,
     evaluationSeed: pair.evaluationSeed
-  })) projected.reverse();
+  })) {
+    projected = projected.reverse().map((output, index) => ({
+      ...output,
+      label: index === 0 ? 'A' : 'B'
+    }));
+  }
   return {
     version: 1,
+    subjectType,
     sceneAnnotation,
     dimensions: [...QUALITY_DIMENSIONS],
-    outputs: projected
+    outputs: projected,
+    ...(subjectType === 'life_planning'
+      ? { dimensionRubric: JSON.parse(canonicalJson(LIFE_DIMENSION_RUBRIC)) }
+      : {})
   };
 }
 
@@ -304,33 +412,164 @@ export function compileSceneExecutionInput(scene) {
   return JSON.parse(canonicalJson(execution));
 }
 
+/** Map the closed quality subject union to its production execution method. */
+export function executionMethodForSubject(subject) {
+  assertPlainObject(subject, 'quality subject required');
+  if (Object.keys(subject).some(key => !QUALITY_SUBJECT_KEYS.has(key))) {
+    throw new Error('quality subject has unknown key');
+  }
+  if (subject.subjectType === 'turn') {
+    if (typeof subject.turnKind !== 'string' || !QUALITY_TURN_KINDS.has(subject.turnKind)) {
+      throw new Error('quality subject turn kind unsupported');
+    }
+    return 'executeTurn';
+  }
+  if (subject.subjectType === 'life_planning') {
+    if (subject.turnKind !== 'LIFE_PLANNING') {
+      throw new Error('quality subject life kind mismatch');
+    }
+    return 'executeLife';
+  }
+  throw new Error('quality subject type unsupported');
+}
+
+function normalizeLifeOutput(raw, planningWindow) {
+  const window = assertPlanningWindow(planningWindow);
+  assertClosedKeys(raw, LIFE_RAW_OUTPUT_KEYS, 'life planning output shape');
+  if (raw.subjectType !== undefined && raw.subjectType !== 'life_planning') {
+    throw new Error('life planning output subject type');
+  }
+  if (!Array.isArray(raw.episodes) || raw.episodes.length === 0) {
+    throw new Error('life planning output episodes');
+  }
+  const episodeIds = new Set();
+  const episodes = raw.episodes.map((episode, index) => {
+    assertClosedKeys(episode, LIFE_EPISODE_KEYS, `life planning episode ${index}`);
+    if (episode.ordinal !== index) throw new Error(`life planning episode ${index} ordinal`);
+    if (typeof episode.episodeId !== 'string' || !episode.episodeId
+      || typeof episode.kind !== 'string' || !episode.kind
+      || typeof episode.title !== 'string' || !episode.title) {
+      throw new Error(`life planning episode ${index} identity`);
+    }
+    if (episodeIds.has(episode.episodeId)) throw new Error('life planning episode identity duplicate');
+    episodeIds.add(episode.episodeId);
+    assertNativeSafeInteger(episode.startAt, `life planning episode ${index} startAt`);
+    assertNativeSafeInteger(episode.endAt, `life planning episode ${index} endAt`);
+    if (episode.endAt <= episode.startAt) throw new Error(`life planning episode ${index} interval`);
+    if (episode.startAt < window.startAt || episode.endAt > window.targetEndAt) {
+      throw new Error(`life planning episode ${index} outside planning window`);
+    }
+    return {
+      ordinal: episode.ordinal,
+      episodeId: episode.episodeId,
+      kind: episode.kind,
+      title: episode.title,
+      startAt: episode.startAt,
+      endAt: episode.endAt
+    };
+  });
+  for (let index = 1; index < episodes.length; index += 1) {
+    if (episodes[index].startAt < episodes[index - 1].endAt) {
+      throw new Error('life planning episodes overlap or are unordered');
+    }
+  }
+  return { subjectType: 'life_planning', episodes };
+}
+
+function normalizeTurnOutput(raw) {
+  assertClosedKeys(raw, TURN_RAW_OUTPUT_KEYS, 'blind turn output shape');
+  if (raw.subjectType !== undefined && raw.subjectType !== 'turn') {
+    throw new Error('turn output subject type');
+  }
+  const { subjectType: ignored, ...output } = raw;
+  return { subjectType: 'turn', ...identityFreeOutput(output) };
+}
+
+/** Normalize a production result into the subject's closed canonical output union. */
+export function normalizeQualityExecutionOutput(subject, raw) {
+  const method = executionMethodForSubject({
+    ...subject,
+    turnKind: subject.turnKind ?? (subject.subjectType === 'turn' ? 'DIRECT_REPLY' : 'LIFE_PLANNING')
+  });
+  const value = raw?.draft?.output ?? raw?.output ?? raw?.draft ?? raw;
+  if (method === 'executeTurn') {
+    return normalizeTurnOutput(value);
+  }
+  return normalizeLifeOutput(value, planningWindowForSubject(subject));
+}
+
+/** Compile a plan item into a closed, checksummed turn or life-planning subject. */
+export function compileQualitySubject(item) {
+  assertClosedKeys(item, new Set(['layer', 'sceneId', 'repeatIndex', 'scene']), 'quality subject item');
+  if (typeof item.layer !== 'string' || !item.layer
+    || typeof item.sceneId !== 'string' || !item.sceneId
+    || !Number.isSafeInteger(item.repeatIndex) || item.repeatIndex < 0) {
+    throw new Error('quality subject item identity');
+  }
+  assertPlainObject(item.scene, 'quality subject scene');
+  if (item.scene.sceneId !== item.sceneId) throw new Error('quality subject scene id mismatch');
+  assertNoNonEmptyAttachments(item.scene);
+  const turnKind = item.scene.rolloutKey;
+  if (typeof turnKind !== 'string'
+    || (!QUALITY_TURN_KINDS.has(turnKind) && turnKind !== 'LIFE_PLANNING')) {
+    throw new Error(`unsupported quality rollout kind ${turnKind}`);
+  }
+  const semanticBase = compileSceneExecutionInput(item.scene);
+  const semanticInput = turnKind === 'LIFE_PLANNING'
+    ? JSON.parse(canonicalJson({
+      ...semanticBase,
+      planningWindow: planningWindowForScene(item.scene)
+    }))
+    : semanticBase;
+  const blindAnnotation = projectSceneAnnotation({
+    sceneId: item.sceneId,
+    severity: item.scene.severity,
+    focus: item.scene.focus || '',
+    turns: item.scene.turns,
+    requiredChecks: item.scene.mustNotice || [],
+    allowedVariation: item.scene.allowedPersonalityVariation || []
+  });
+  const subject = {
+    version: 1,
+    subjectType: turnKind === 'LIFE_PLANNING' ? 'life_planning' : 'turn',
+    finalKey: `${item.layer}:${item.sceneId}:${item.repeatIndex}`,
+    turnKind,
+    semanticInput,
+    semanticInputChecksum: contentHash(semanticInput),
+    blindAnnotation
+  };
+  assertClosedKeys(subject, QUALITY_SUBJECT_KEYS, 'quality subject');
+  return JSON.parse(canonicalJson(subject));
+}
+
 /** Execute stable and candidate through the same dry-run ReleaseExecutor. */
 export async function runScenePair(execution, pair) {
   assertPlainObject(execution, 'quality execution input');
-  if (!pair?.executor || typeof pair.executor.executeTurn !== 'function') {
+  const subjectAware = execution.subjectType !== undefined;
+  const subject = subjectAware ? execution : {
+    subjectType: 'turn',
+    turnKind: execution.turnKind
+  };
+  const method = executionMethodForSubject(subject);
+  const executionInput = subjectAware ? execution.semanticInput : execution;
+  assertPlainObject(executionInput, 'quality semantic execution input');
+  if (!pair?.executor || typeof pair.executor[method] !== 'function') {
     throw new Error('quality release executor required');
   }
   if (!pair.stable?.releaseId || !pair.candidate?.releaseId) {
     throw new Error('quality release pair required');
   }
-  const executionChecksum = contentHash(execution);
+  const executionChecksum = contentHash(executionInput);
   const capabilities = Object.freeze({ visible: false, actions: false });
-  const [stableRaw, candidateRaw] = await Promise.all([
-    pair.executor.executeTurn({
-      releaseId: pair.stable.releaseId,
-      releaseChecksum: pair.stable.releaseChecksum,
-      execution,
-      dryRun: true,
-      capabilities
-    }),
-    pair.executor.executeTurn({
-      releaseId: pair.candidate.releaseId,
-      releaseChecksum: pair.candidate.releaseChecksum,
-      execution,
-      dryRun: true,
-      capabilities
-    })
-  ]);
+  const invoke = release => pair.executor[method]({
+    releaseId: release.releaseId,
+    releaseChecksum: release.releaseChecksum,
+    execution: executionInput,
+    dryRun: true,
+    capabilities
+  });
+  const stableRaw = await invoke(pair.stable);
+  const candidateRaw = await invoke(pair.candidate);
   const stable = {
     dryRun: true,
     releaseId: pair.stable.releaseId,
@@ -344,7 +583,11 @@ export async function runScenePair(execution, pair) {
     draft: candidateRaw?.draft ?? candidateRaw
   };
   return {
-    execution,
+    execution: executionInput,
+    ...(subjectAware ? { subjectType: subject.subjectType, executionMethod: method } : {}),
+    ...(subjectAware && subject.subjectType === 'life_planning'
+      ? { planningWindow: executionInput.planningWindow }
+      : {}),
     executionChecksum,
     stableInputChecksum: executionChecksum,
     candidateInputChecksum: executionChecksum,
@@ -534,6 +777,8 @@ export function aggregateQualityGate(evidence, expected = null) {
 
 export function buildBlindEvaluation(pair, { seed }) {
   const input = projectBlindEvaluationInput({
+    ...(pair.subjectType === undefined ? {} : { subjectType: pair.subjectType }),
+    ...(pair.planningWindow === undefined ? {} : { planningWindow: pair.planningWindow }),
     sceneId: pair.sceneId || 'quality-scene',
     repeatIndex: pair.repeatIndex || 0,
     evaluationSeed: seed,
