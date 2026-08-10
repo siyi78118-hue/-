@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { commitVerifiedFacts } from './evidence-memory.mjs';
 import { contentHash, validateEnvelope } from './protocol.mjs';
 import { buildEvidencePack } from './retrieval.mjs';
@@ -1827,6 +1829,129 @@ export class YuqiOrchestrator {
     });
   }
 
+  buildCanonicalReleaseExecution(turnId, options = {}) {
+    if (!options || typeof options !== 'object' || Array.isArray(options)
+      || Object.keys(options).some(key => !['localImagePaths', 'localImageReceipt'].includes(key))) {
+      throw new Error('canonical release execution options conflict');
+    }
+    const turn = this.store.getTurn(String(turnId || ''));
+    if (!turn || Number(turn.resultAuthorityVersion) !== 1
+      || turn.authorityRedactedAt != null
+      || !turn.authorityLineageKey
+      || !turn.agencySnapshotChecksum) {
+      throw new Error('canonical release execution authority conflict');
+    }
+    const lineage = this.store.getTurnAuthorityLineage(turn.authorityLineageKey);
+    if (!lineage || lineage.state !== 'open'
+      || lineage.latestTurnId !== turn.turnId
+      || lineage.committedGroupId != null) {
+      throw new Error('canonical release execution authority conflict');
+    }
+    let storedEnvelope;
+    try {
+      storedEnvelope = JSON.parse(turn.envelopeJson);
+    } catch {
+      throw new Error('canonical release execution envelope conflict');
+    }
+    if (!storedEnvelope || storedEnvelope.redacted === true
+      || storedEnvelope.turnId !== turn.turnId
+      || storedEnvelope.characterId !== turn.characterId) {
+      throw new Error('canonical release execution envelope conflict');
+    }
+    if (typeof this.store.assertCanonicalTurnInputAuthorityInternal !== 'function') {
+      throw new Error('canonical release execution authority conflict');
+    }
+    this.store.assertCanonicalTurnInputAuthorityInternal({
+      storedTurn: turn,
+      incomingEnvelope: storedEnvelope,
+      mode: 'live_reopen'
+    });
+    const declaredBatch = resolveCurrentUserBatch(storedEnvelope);
+    const persistedBatch = this.store.getCurrentUserBatch(turn.turnId) || declaredBatch;
+    const rawAttachments = (declaredBatch?.messages || []).flatMap(message =>
+      Array.isArray(message?.attachments) ? message.attachments : []
+    );
+    const localImagePaths = options.localImagePaths === undefined
+      ? []
+      : options.localImagePaths;
+    if (!Array.isArray(localImagePaths)
+      || localImagePaths.some(path => typeof path !== 'string' || !path.trim())
+      || new Set(localImagePaths).size !== localImagePaths.length
+      || localImagePaths.length !== rawAttachments.length
+      || (Number(turn.protocolVersion) === 3 && localImagePaths.length > 1)) {
+      throw new Error('canonical release execution image paths conflict');
+    }
+    const localImageReceipt = options.localImageReceipt ?? null;
+    if (localImageReceipt !== null) {
+      if (!localImageReceipt || typeof localImageReceipt !== 'object' || Array.isArray(localImageReceipt)
+        || Object.keys(localImageReceipt).sort().join(',') !== 'attachmentChecksum,path,turnId'
+        || localImageReceipt.turnId !== turn.turnId
+        || localImageReceipt.path !== localImagePaths[0]
+        || typeof localImageReceipt.attachmentChecksum !== 'string'
+        || !/^[a-f0-9]{64}$/.test(localImageReceipt.attachmentChecksum)) {
+        throw new Error('canonical release execution image receipt conflict');
+      }
+      const declaredImage = String(rawAttachments[0]?.dataUrl || '').match(
+        /^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/i
+      );
+      const declaredChecksum = declaredImage
+        ? createHash('sha256').update(Buffer.from(declaredImage[1], 'base64')).digest('hex')
+        : null;
+      if (declaredChecksum !== localImageReceipt.attachmentChecksum) {
+        throw new Error('canonical release execution image receipt conflict');
+      }
+    }
+    if ((Number(turn.protocolVersion) === 3 && localImagePaths.length > 0) !== Boolean(localImageReceipt)) {
+      throw new Error('canonical release execution image receipt conflict');
+    }
+    const envelope = structuredClone(storedEnvelope);
+    const currentBatch = persistedBatch ? structuredClone(persistedBatch) : null;
+    if (localImagePaths.length) {
+      envelope.message = stripAttachmentData(envelope.message);
+      if (Array.isArray(envelope.context?.currentBatch?.messages)) {
+        envelope.context.currentBatch.messages =
+          envelope.context.currentBatch.messages.map(stripAttachmentData);
+      }
+      if (Array.isArray(currentBatch.messages)) {
+        currentBatch.messages = currentBatch.messages.map(stripAttachmentData);
+      }
+    }
+    const agencySnapshot = this.store.readAgencyAuthoritySnapshotInternal({
+      roleId: turn.characterId,
+      at: canonicalInteractionAt(envelope, this.clock())
+    });
+    if (agencySnapshot.checksum !== turn.agencySnapshotChecksum) {
+      const error = new Error('canonical agency authority is stale');
+      error.code = 'AGENCY_AUTHORITY_STALE';
+      throw error;
+    }
+    const agencyView = compileAgencyView({
+      constraints: agencySnapshot.constraints,
+      preferences: agencySnapshot.preferenceFacts || [],
+      stances: agencySnapshot.stances,
+      featureContext: envelope.context || {},
+      limits: { hardConstraints: 5, currentStances: 2, preferences: 4 }
+    });
+    return {
+      turn,
+      envelope,
+      scene: Number(turn.protocolVersion) === 3 && PUBLIC_MOMENT_KINDS.has(turn.rolloutKey)
+        ? {}
+        : Number(turn.protocolVersion) === 3
+          ? cognitionSceneForV3(sceneFromEnvelope(envelope))
+          : sceneFromEnvelope(envelope),
+      currentBatch,
+      localImagePaths: [...localImagePaths],
+      ...(localImageReceipt ? { localImageReceipt: structuredClone(localImageReceipt) } : {}),
+      agencyView,
+      routeDecision: {
+        route: turn.route,
+        cognitiveState: this.store.getCognitiveState?.(turn.characterId) || {},
+        allowedActionTargets: {}
+      }
+    };
+  }
+
   async run(turnId) {
     let current = this.store.getTurn(turnId);
     if (!current) throw new Error('turn not found');
@@ -2431,61 +2556,26 @@ export class YuqiOrchestrator {
       if (supersededAfterImageFailure) return supersededAfterImageFailure;
       throw error;
     }
-    let envelope = structuredClone(storedEnvelope);
-    let currentBatch = persistedBatch ? structuredClone(persistedBatch) : null;
     if (preparedImages.paths.length) {
       this.turnImagePaths.set(turn.turnId, preparedImages.paths);
-      envelope.message = stripAttachmentData(envelope.message);
-      if (Array.isArray(envelope.context?.currentBatch?.messages)) {
-        envelope.context.currentBatch.messages =
-          envelope.context.currentBatch.messages.map(stripAttachmentData);
-      }
-      if (Array.isArray(currentBatch?.messages)) {
-        currentBatch.messages = currentBatch.messages.map(stripAttachmentData);
-      }
     }
     try {
       const supersededAfterPreparation = readSupersededOutcome();
       if (supersededAfterPreparation) return supersededAfterPreparation;
-      const agencySnapshot = this.store.readAgencyAuthoritySnapshotInternal({
-        roleId: turn.characterId,
-        at: canonicalInteractionAt(envelope, this.clock())
+      const execution = this.buildCanonicalReleaseExecution(turn.turnId, {
+        localImagePaths: [...preparedImages.paths],
+        ...(preparedImages.receipt ? { localImageReceipt: preparedImages.receipt } : {})
       });
-      if (agencySnapshot.checksum !== turn.agencySnapshotChecksum) {
-        const error = new Error('canonical agency authority is stale');
-        error.code = 'AGENCY_AUTHORITY_STALE';
-        throw error;
+      if (contentHash(execution.turn) !== contentHash(turn)) {
+        throw new Error('canonical release execution identity conflict');
       }
-      const agencyView = compileAgencyView({
-        constraints: agencySnapshot.constraints,
-        preferences: agencySnapshot.preferenceFacts || [],
-        stances: agencySnapshot.stances,
-        featureContext: envelope.context || {},
-        limits: { hardConstraints: 5, currentStances: 2, preferences: 4 }
-      });
+      const { envelope, currentBatch } = execution;
       let executionResult;
       try {
         executionResult = await this.releaseExecutor.executeTurn({
           releaseId: turn.authoritativeReleaseId,
           releaseChecksum: turn.authoritativePipelineChecksum,
-          execution: {
-            turn,
-            envelope,
-            scene: Number(turn.protocolVersion) === 3 && PUBLIC_MOMENT_KINDS.has(turn.rolloutKey)
-              ? {}
-              : Number(turn.protocolVersion) === 3
-                ? cognitionSceneForV3(sceneFromEnvelope(envelope))
-                : sceneFromEnvelope(envelope),
-            currentBatch,
-            localImagePaths: [...preparedImages.paths],
-            ...(preparedImages.receipt ? { localImageReceipt: preparedImages.receipt } : {}),
-            agencyView,
-            routeDecision: {
-              route: turn.route,
-              cognitiveState: this.store.getCognitiveState?.(turn.characterId) || {},
-              allowedActionTargets: {}
-            }
-          },
+          execution,
           dryRun: false
         });
       } catch (error) {

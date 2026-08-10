@@ -1354,6 +1354,7 @@ test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one finge
   const turn = {
     turnId: envelope.turnId,
     protocolVersion: 3,
+    resultAuthorityVersion: 1,
     rolloutKey: 'DIRECT_REPLY',
     envelopeJson: JSON.stringify(envelope),
     authorityLineageKey: 'lineage_role_plan_v3',
@@ -1377,7 +1378,12 @@ test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one finge
   orchestrator.turnImagePaths = new Map();
   orchestrator.store = {
     getTurn() { return turn; },
-    getTurnAuthorityLineage() { return { state: 'open', revision: 1 }; },
+    getTurnAuthorityLineage() {
+      return { state: 'open', revision: 1, latestTurnId: turn.turnId, committedGroupId: null };
+    },
+    assertCanonicalTurnInputAuthorityInternal({ storedTurn, incomingEnvelope }) {
+      assert.equal(contentHash(incomingEnvelope), contentHash(JSON.parse(storedTurn.envelopeJson)));
+    },
     readCanonicalCommitOutcomeInternal() { return null; },
     getCurrentUserBatch() { return null; },
     readAgencyAuthoritySnapshotInternal() {
@@ -1450,6 +1456,7 @@ test('canonical v3 direct provider receives formal relationship scene plus separ
   const turn = {
     turnId: envelope.turnId,
     protocolVersion: 3,
+    resultAuthorityVersion: 1,
     rolloutKey: 'DIRECT_REPLY',
     envelopeJson: JSON.stringify(envelope),
     authorityLineageKey: 'lineage_relationship_views',
@@ -1472,7 +1479,12 @@ test('canonical v3 direct provider receives formal relationship scene plus separ
   orchestrator.turnImagePaths = new Map();
   orchestrator.store = {
     getTurn() { return turn; },
-    getTurnAuthorityLineage() { return { state: 'open', revision: 1 }; },
+    getTurnAuthorityLineage() {
+      return { state: 'open', revision: 1, latestTurnId: turn.turnId, committedGroupId: null };
+    },
+    assertCanonicalTurnInputAuthorityInternal({ storedTurn, incomingEnvelope }) {
+      assert.equal(contentHash(incomingEnvelope), contentHash(JSON.parse(storedTurn.envelopeJson)));
+    },
     readCanonicalCommitOutcomeInternal() { return null; },
     getCurrentUserBatch() { return null; },
     readAgencyAuthoritySnapshotInternal() {
@@ -2681,3 +2693,231 @@ for (const [phase, expectedMode, expectedJobType] of [
     }
   });
 }
+
+test('canonical runtime consumes the shared persisted release execution builder', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-canonical-execution-builder-'));
+  const store = new YuqiStore(join(root, 'store.sqlite'));
+  try {
+    store.initializeCognitionRolloutsInternal({ rows: [{
+      rolloutKey: 'DIRECT_REPLY',
+      currentMode: 'legacy',
+      rolloutPhase: 'stable',
+      presetVersion: '1.9.2',
+      pipelineChecksum: 'a'.repeat(64)
+    }], now: 1 });
+    store.claimInteractionLaneInternal({
+      roleId: 'yuqi', laneKey: 'private_chat', expectedRevision: 0,
+      localSequence: 0, now: 1000
+    });
+    const messages = [
+      { messageId: 'msg_builder_1', content: '你', sentAt: 998 },
+      { messageId: 'msg_builder_2', content: '回来', sentAt: 999 },
+      { messageId: 'msg_builder_3', content: '了吗', sentAt: 1000 }
+    ].map(value => ({
+      ...value, speakerId: 'user', speakerType: 'user', recipientId: 'yuqi'
+    }));
+    const message = messages.at(-1);
+    const envelope = {
+      protocolVersion: 3,
+      turnId: 'turn_builder_1',
+      characterId: 'yuqi',
+      deviceId: 'phone',
+      deviceSeq: 1,
+      createdAt: 1000,
+      kind: 'DIRECT_REPLY',
+      message,
+      context: {
+        currentBatch: {
+          batchId: 'batch_builder_1',
+          messageIds: messages.map(item => item.messageId),
+          startedAt: 998,
+          committedAt: 1000,
+          messages
+        },
+        visibilityCursor: {
+          nativeCompletedTurnId: null,
+          nativeCompletedGroupId: null,
+          nativeCompletedSequence: 0,
+          uiAppliedTurnId: null,
+          uiAppliedGroupId: null,
+          uiAppliedSequence: 0,
+          localSequence: 1,
+          clearedThroughSequence: 0,
+          clearEpoch: 0,
+          clearedAt: 0,
+          chatOpen: true,
+          quotedMessageId: null
+        }
+      },
+      authority: {
+        algorithm: 'al-authority-v1',
+        roleId: 'yuqi',
+        laneKey: 'private_chat',
+        rootSourceId: message.messageId,
+        lineageKey: deriveAuthorityLineageKey({
+          roleId: 'yuqi', laneKey: 'private_chat', rootSourceId: message.messageId
+        }),
+        claimedLineageRevision: 1,
+        retryOfTurnId: null
+      }
+    };
+    const rollout = store.getCognitionRollout('DIRECT_REPLY');
+    const pair = resolvePipelinePair(rollout);
+    const agency = store.readAgencyAuthoritySnapshotInternal({ roleId: 'yuqi', at: 1000 });
+    const turn = store.createCanonicalVisibleTurnInternal({
+      envelope,
+      rolloutKey: 'DIRECT_REPLY',
+      expectedRolloutRevision: rollout.revision,
+      authoritativeReleaseId: pair.visibleReleaseId,
+      comparisonReleaseId: pair.comparisonReleaseId,
+      comparisonDirection: pair.comparisonDirection,
+      laneKey: 'private_chat',
+      expectedLaneRevision: 1,
+      inputUserBatchId: envelope.context.currentBatch.batchId,
+      inputVisibilitySequence: 1,
+      agencySnapshotChecksum: agency.checksum,
+      annotationSnapshot: {}
+    }).turn;
+    const orchestrator = new YuqiOrchestrator({
+      store,
+      presets: { current: () => ({ version: '2.0.0' }), compileFor: () => ({}) },
+      codex: {},
+      releaseExecutor: {
+        executeTurn: async () => { throw new Error('not called by builder'); },
+        executeLife: async () => { throw new Error('not called by builder'); }
+      },
+      clock: () => 1001,
+      lifePlanningEnabled: false
+    });
+
+    const execution = orchestrator.buildCanonicalReleaseExecution(turn.turnId);
+
+    assert.deepEqual(Object.keys(execution).sort(), [
+      'agencyView', 'currentBatch', 'envelope', 'localImagePaths',
+      'routeDecision', 'scene', 'turn'
+    ]);
+    assert.equal(execution.turn.turnId, turn.turnId);
+    assert.equal(execution.envelope.turnId, turn.turnId);
+    assert.deepEqual(execution.currentBatch.messageIds, messages.map(item => item.messageId));
+    assert.deepEqual(execution.localImagePaths, []);
+    assert.equal(execution.routeDecision.route, turn.route);
+    assert.deepEqual(execution.routeDecision.allowedActionTargets, {});
+
+    assert.throws(
+      () => orchestrator.buildCanonicalReleaseExecution('turn_builder_missing'),
+      /canonical release execution authority conflict/
+    );
+    store.db.exec('SAVEPOINT canonical_builder_batch_corruption');
+    try {
+      store.db.prepare(`
+        DELETE FROM current_user_batch_items
+        WHERE turn_id = ? AND sequence = 1
+      `).run(turn.turnId);
+      assert.throws(
+        () => orchestrator.buildCanonicalReleaseExecution(turn.turnId),
+        /canonical turn input authority conflict/
+      );
+    } finally {
+      store.db.exec('ROLLBACK TO canonical_builder_batch_corruption');
+      store.db.exec('RELEASE canonical_builder_batch_corruption');
+    }
+    const realGetTurn = store.getTurn.bind(store);
+    for (const [name, mutation] of [
+      ['authority-v0', { resultAuthorityVersion: 0 }],
+      ['redacted', { authorityRedactedAt: 1002 }],
+      ['foreign-lineage', { authorityLineageKey: 'lineage_foreign_builder' }]
+    ]) {
+      store.getTurn = id => {
+        const stored = realGetTurn(id);
+        return stored?.turnId === turn.turnId ? { ...stored, ...mutation } : stored;
+      };
+      assert.throws(
+        () => orchestrator.buildCanonicalReleaseExecution(turn.turnId),
+        /canonical release execution authority conflict/,
+        name
+      );
+    }
+    store.getTurn = realGetTurn;
+    const realAgencyRead = store.readAgencyAuthoritySnapshotInternal.bind(store);
+    store.readAgencyAuthoritySnapshotInternal = input => ({
+      ...realAgencyRead(input), checksum: 'f'.repeat(64)
+    });
+    assert.throws(
+      () => orchestrator.buildCanonicalReleaseExecution(turn.turnId),
+      /canonical agency authority is stale/
+    );
+    store.readAgencyAuthoritySnapshotInternal = realAgencyRead;
+    assert.throws(
+      () => orchestrator.buildCanonicalReleaseExecution(turn.turnId, {
+        localImagePaths: ['C:/unexpected/image.png']
+      }),
+      /canonical release execution image paths conflict/
+    );
+    assert.throws(
+      () => orchestrator.buildCanonicalReleaseExecution(turn.turnId, {
+        localImageReceipt: {
+          turnId: turn.turnId,
+          attachmentChecksum: 'a'.repeat(64),
+          path: 'C:/unexpected/image.png'
+        }
+      }),
+      /canonical release execution image receipt conflict/
+    );
+
+    const build = orchestrator.buildCanonicalReleaseExecution.bind(orchestrator);
+    let builderCalls = 0;
+    let receivedExecution = null;
+    let corruptExecutionTurn = true;
+    orchestrator.buildCanonicalReleaseExecution = (...args) => {
+      builderCalls += 1;
+      const built = build(...args);
+      return corruptExecutionTurn
+        ? {
+            ...built,
+            turn: { ...built.turn, authoritativeReleaseId: 'foreign_release' }
+          }
+        : built;
+    };
+    let modelCalls = 0;
+    orchestrator.releaseExecutor = {
+      async executeTurn() {
+        modelCalls += 1;
+        throw new Error('release executor must not receive a mixed authority snapshot');
+      },
+      async executeLife() { throw new Error('unused'); }
+    };
+    await assert.rejects(
+      () => orchestrator.run(turn.turnId),
+      /canonical release execution identity conflict/
+    );
+    assert.equal(modelCalls, 0);
+    corruptExecutionTurn = false;
+    orchestrator.releaseExecutor = {
+      async executeTurn(input) {
+        modelCalls += 1;
+        receivedExecution = structuredClone(input.execution);
+        return { draft: {
+          action: 'send',
+          reply: '回来了。',
+          bubblePlan: [{ text: '回来了。', purpose: 'reply' }],
+          usedFactIds: [],
+          actionIntent: {}
+        } };
+      },
+      async executeLife() { throw new Error('unused'); }
+    };
+
+    await orchestrator.run(turn.turnId);
+
+    assert.equal(builderCalls, 2);
+    assert.equal(modelCalls, 1);
+    assert.deepEqual(receivedExecution, execution);
+    assert.throws(
+      () => build(turn.turnId),
+      /canonical release execution authority conflict/
+    );
+  } finally {
+    store.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

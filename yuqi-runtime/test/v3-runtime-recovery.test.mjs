@@ -161,6 +161,9 @@ function orchestrationFixture({ turns = [], canonicalRouteReasons = ['release-pi
     getTurn: turnId => turnMap.get(turnId) || null,
     getTurnAuthorityLineage: lineageKey => lineageMap.get(lineageKey) || null,
     getVisibleCommitReceipt: () => null,
+    assertCanonicalTurnInputAuthorityInternal({ storedTurn, incomingEnvelope }) {
+      assert.deepEqual(incomingEnvelope, JSON.parse(storedTurn.envelopeJson));
+    },
     getCurrentUserBatch: () => null,
     listLifeEpisodes: () => [],
     getCharacterLifeState: () => ({ revision: 0 }),
@@ -762,10 +765,17 @@ test('canonical creation and recovery use the same persisted interaction time or
 });
 
 test('canonical image execution strips data urls, forwards local paths, and always cleans them', async () => {
-  const envelope = directEnvelope({
-    turnId: 'turn_canonical_image',
-    messageId: 'msg_canonical_image',
-    content: '[图片]'
+  const envelope = v3DirectEnvelope();
+  envelope.turnId = 'turn_canonical_image';
+  envelope.message.messageId = 'msg_canonical_image';
+  envelope.message.content = '[图片]';
+  envelope.context.currentBatch.batchId = 'batch_canonical_image';
+  envelope.context.currentBatch.messageIds = [envelope.message.messageId];
+  envelope.authority.rootSourceId = envelope.message.messageId;
+  envelope.authority.lineageKey = deriveAuthorityLineageKey({
+    roleId: envelope.characterId,
+    laneKey: envelope.authority.laneKey,
+    rootSourceId: envelope.message.messageId
   });
   envelope.message.attachments = [{
     attachmentId: 'att_canonical_image',
@@ -778,7 +788,11 @@ test('canonical image execution strips data urls, forwards local paths, and alwa
     bytes: Buffer.from(JPEG_1X1, 'base64').length,
     dataUrl: `data:image/jpeg;base64,${JPEG_1X1}`
   }];
-  const persisted = pinnedCanonicalTurn(envelope, { state: 'memory_done' });
+  const persisted = pinnedCanonicalTurn(envelope, {
+    state: 'memory_done',
+    authorityLineageKey: envelope.authority.lineageKey,
+    laneKey: envelope.authority.laneKey
+  });
   const fixture = orchestrationFixture({ turns: [persisted] });
   fixture.store.readCanonicalCommitOutcomeInternal = () => null;
   fixture.releaseExecutor.executeTurn = async input => {
@@ -793,7 +807,20 @@ test('canonical image execution strips data urls, forwards local paths, and alwa
 
   const execution = fixture.calls.releaseExecutions[0].execution;
   assert.equal(execution.localImagePaths.length, 1);
+  assert.equal(execution.localImageReceipt.turnId, persisted.turnId);
+  assert.equal(execution.localImageReceipt.path, execution.localImagePaths[0]);
+  assert.match(execution.localImageReceipt.attachmentChecksum, /^[a-f0-9]{64}$/);
   assert.equal(existsSync(execution.localImagePaths[0]), false);
   assert.doesNotMatch(JSON.stringify(execution.envelope), /base64,/);
   assert.doesNotMatch(JSON.stringify(execution.currentBatch), /base64,/);
+  assert.throws(
+    () => fixture.orchestrator.buildCanonicalReleaseExecution(persisted.turnId, {
+      localImagePaths: execution.localImagePaths,
+      localImageReceipt: {
+        ...execution.localImageReceipt,
+        attachmentChecksum: 'f'.repeat(64)
+      }
+    }),
+    /canonical release execution image receipt conflict/
+  );
 });
