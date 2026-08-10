@@ -10,6 +10,7 @@ import {
   executionMethodForSubject,
   normalizeQualityExecutionOutput,
   normalizeBlindEvaluation,
+  finalizeBlindJudgments,
   projectBlindEvaluationInput,
   runScenePair,
   validateExactEvidenceSet
@@ -181,6 +182,17 @@ test('formal blind preference is release-agnostic and rejects candidate/stable l
       /preference/i
     );
   }
+});
+
+test('finalizeBlindJudgments retains both complete judgments and flags every semantic difference', () => {
+  const primary = validEvaluation();
+  const secondary = { ...validEvaluation(), preference: 'A', scores: { ...primary.scores, agency: 3 } };
+  const result = finalizeBlindJudgments(primary, secondary);
+  assert.equal(result.judgments.length, 2);
+  assert.equal(result.manualReview, true);
+  assert.deepEqual(result.differences.sort(), ['preference', 'scores']);
+  assert.equal(JSON.stringify(result).includes('stable'), false);
+  assert.equal(JSON.stringify(result).includes('candidate'), false);
 });
 
 test('average cannot hide a severe sentinel failure', () => {

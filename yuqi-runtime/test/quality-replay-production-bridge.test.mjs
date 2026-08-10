@@ -18,10 +18,20 @@ import {
 } from '../src/runtime-composition.mjs';
 import { YuqiStore } from '../src/store.mjs';
 import {
+  createQualityPhaseClientSlot,
+  createQualityPhaseBinding,
+  LedgerBackedModelClient,
+  QualityReplayLedger,
+} from '../src/quality-replay-ledger.mjs';
+import {
   authorityIdFor,
+  createQualityProductionExecutionConfig,
+  createQualityRunAuthority,
   createQualityProductionContext,
   executeQualitySubject,
+  executeQualitySubjectSide,
   prepareQualitySubject,
+  registerQualityPhaseBinding,
 } from '../src/quality-replay-production-bridge.mjs';
 
 const SOURCE_HEAD = 'a'.repeat(40);
@@ -87,9 +97,13 @@ class ControlledCodex {
 
   async runTurn(role, input) {
     this.runTurnCalls.push({ role, input });
-    if (role === 'memory') return { text: JSON.stringify({ query: '', keywords: [], candidates: [] }) };
-    if (role === 'supervisor') return { text: JSON.stringify({ approved: true, issues: [] }) };
     const request = JSON.parse(input);
+    if (role === 'memory' && !request.cognitionEnvelope
+      && !['understand_and_decide_v3', 'reconsider_and_decide_v3',
+        'reconsider_lived_quality_v3'].includes(request.task)) {
+      return { text: JSON.stringify({ query: '', keywords: [], candidates: [] }) };
+    }
+    if (role === 'supervisor') return { text: JSON.stringify({ approved: true, issues: [] }) };
     this.modelRequests.push({ role, request });
     if (request.cognitionEnvelope && !request.expressionBrief
       && (request.task === 'understand_and_decide_v3'
@@ -151,7 +165,7 @@ class ControlledCodex {
   }
 }
 
-function makeRuntime(store, clock = () => 1_000, { shadowTurn = false } = {}) {
+function makeRuntime(store, clock = () => 1_000, { shadowTurn = false, qualityPhaseClientSlot } = {}) {
   const codex = new ControlledCodex();
   const presets = new PresetRegistry({ presetDir: PRESET_DIR, store, clock });
   const promotionController = new PromotionController({ store, presetRegistry: presets, clock });
@@ -215,6 +229,7 @@ function makeRuntime(store, clock = () => 1_000, { shadowTurn = false } = {}) {
   });
   const runtime = composeYuqiExecutionRuntime({
     store, presets, codex, promotionController, cognitivePipeline, sourceHead: SOURCE_HEAD,
+    qualityPhaseClientSlot,
   });
   return { runtime, codex, presets, promotionController };
 }
@@ -226,6 +241,40 @@ function releasePair(store) {
     .find(row => row.releaseId !== stableRelease.releaseId && row.componentManifest);
   assert.ok(stableRelease && candidateRelease, 'fixture must have a real release pair');
   return { stableRelease, candidateRelease };
+}
+
+function ledgerRelease(release) {
+  return {
+    releaseId: release.releaseId,
+    pipelineVersion: release.pipelineVersion,
+    presetVersion: release.presetVersion,
+    cognitionSchemaVersion: release.cognitionSchemaVersion,
+    expressionSchemaVersion: release.expressionSchemaVersion,
+    evaluatorVersion: release.evaluatorVersion,
+    modelProfile: release.modelProfile,
+    componentManifest: release.componentManifest,
+    releaseChecksum: release.releaseChecksum,
+    createdAt: Number(release.createdAt),
+    retiredAt: release.retiredAt == null ? null : Number(release.retiredAt),
+  };
+}
+
+function ledgerAttestation(sourceHead) {
+  const attestation = {
+    version: 1, sourceHead,
+    stableRuntime: { sourceHead }, candidateRuntime: { sourceHead },
+    evaluatorPrimary: {
+      evaluatorId: 'evaluator-primary', evaluatorVersion: 'quality-test',
+      modelProfileChecksum: '1'.repeat(64), clientConfigChecksum: '2'.repeat(64),
+      sessionNamespaceChecksum: '3'.repeat(64),
+    },
+    evaluatorSecondary: {
+      evaluatorId: 'evaluator-secondary', evaluatorVersion: 'quality-test',
+      modelProfileChecksum: '4'.repeat(64), clientConfigChecksum: '5'.repeat(64),
+      sessionNamespaceChecksum: '6'.repeat(64),
+    },
+  };
+  return { attestation, attestationChecksum: contentHash(attestation) };
 }
 
 let FROZEN_SUBJECTS;
@@ -266,7 +315,9 @@ function candidateResponseAnchorAt(subject) {
   return value;
 }
 
-async function withRealFixture(kind, ordinal, run, finalKey = `${kind}-${ordinal}`) {
+async function withRealFixture(
+  kind, ordinal, run, finalKey = `${kind}-${ordinal}`, fixtureOptions = {},
+) {
   const root = mkdtempSync(join(tmpdir(), `yuqi-quality-bridge-${kind}-`));
   const seedPath = join(root, 'seed.sqlite');
   const stablePath = join(root, 'stable.sqlite');
@@ -276,6 +327,7 @@ async function withRealFixture(kind, ordinal, run, finalKey = `${kind}-${ordinal
   const fixtureClock = () => anchorAt;
   const seedStore = new YuqiStore(seedPath);
   const seed = makeRuntime(seedStore, fixtureClock, { shadowTurn: kind === 'turn' });
+  let qualityLedgers = null;
   try {
     if (kind === 'turn') {
       seedStore.claimInteractionLaneInternal({
@@ -285,24 +337,43 @@ async function withRealFixture(kind, ordinal, run, finalKey = `${kind}-${ordinal
     }
     const { stableRelease, candidateRelease } = releasePair(seedStore);
     const runtimeCodexes = [];
+    qualityLedgers = fixtureOptions.qualitySlots ? {
+      stable: new QualityReplayLedger(join(root, 'quality-slot-stable.sqlite')),
+      candidate: new QualityReplayLedger(join(root, 'quality-slot-candidate.sqlite')),
+    } : null;
+    const stablePhaseClientSlot = createQualityPhaseClientSlot({
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey, phase: 'stable_execution', side: 'stable'
+    }, qualityLedgers ? { ledger: qualityLedgers.stable } : null);
+    const candidatePhaseClientSlot = createQualityPhaseClientSlot({
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey, phase: 'candidate_execution', side: 'candidate'
+    }, qualityLedgers ? { ledger: qualityLedgers.candidate } : null);
     const context = createQualityProductionContext({
-      runId: 'quality-run-real', finalKey, ordinal,
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey, ordinal,
       sourceHead: SOURCE_HEAD, anchorAt, planChecksum: FROZEN_PLAN_CHECKSUM,
       seedStore, seedRuntime: seed.runtime,
+      evidenceEligible: false,
       seedDatabasePath: seedPath, stableDatabasePath: stablePath,
       candidateDatabasePath: candidatePath,
       stableRelease, candidateRelease,
-      runtimeFactory: ({ store }) => {
-        const built = makeRuntime(store, fixtureClock, { shadowTurn: kind === 'turn' });
+      stablePhaseClientSlot: fixtureOptions.qualitySlots ? stablePhaseClientSlot : undefined,
+      candidatePhaseClientSlot: fixtureOptions.qualitySlots ? candidatePhaseClientSlot : undefined,
+      runtimeFactory: ({ store, side, qualityPhaseClientSlot }) => {
+        const built = makeRuntime(store, fixtureClock, {
+          shadowTurn: kind === 'turn',
+          qualityPhaseClientSlot: fixtureOptions.qualitySlots && !fixtureOptions.ignoreQualitySlot
+            ? qualityPhaseClientSlot : undefined,
+        });
         runtimeCodexes.push(built.codex);
         return built.runtime;
       },
     });
-    await run({ context, seed, stableRelease, candidateRelease, root, runtimeCodexes });
+    await run({ context, seed, stableRelease, candidateRelease, root, runtimeCodexes, qualityLedgers });
   } finally {
     // Context.close is idempotent and owns the cloned stores after preparation.
     // If preparation failed before ownership transfer, close the seed here.
     try { seedStore.close(); } catch {}
+    try { qualityLedgers?.stable.close(); } catch {}
+    try { qualityLedgers?.candidate.close(); } catch {}
     try { rmSync(root, { recursive: true, force: true }); } catch {}
   }
 }
@@ -317,6 +388,51 @@ test('authority ids are independent of execution side', () => {
 test('plain or fake production dependencies cannot obtain attestation', () => {
   assert.throws(() => assertProductionRuntimeAttestation({ store: {}, releaseExecutor: {} }), /attestation/);
   assert.throws(() => assertProductionRuntimeAttestation(Object.freeze({}), {}), /attestation/);
+});
+
+test('production authority rejects callback/client-instance and incomplete run materials before branding', () => {
+  const descriptor = {
+    version: 1, runId: '123e4567-e89b-42d3-a456-426614174001',
+    finalKeys: Array.from({ length: 246 }, (_, i) => `turn:scene-${i}:0`),
+    planChecksum: FROZEN_PLAN_CHECKSUM, sourceHead: SOURCE_HEAD,
+    stableRelease: {}, candidateRelease: {}, attestation: {},
+    attestationChecksum: '0'.repeat(64),
+    artifactPaths: { plan: 'plan', ledger: 'ledger', raw: 'raw' },
+    ledgerPath: 'ledger', createdAt: 1_000, evidenceEligible: true,
+  };
+  assert.throws(() => createQualityProductionExecutionConfig({
+    descriptor, materials: {
+      runtimeConfig: {}, seedDatabasePath: 'seed.sqlite',
+      stableDatabasePath: 'stable.sqlite', candidateDatabasePath: 'candidate.sqlite',
+      clientConfigs: {
+        stable_execution: { runTurn() {} }, candidate_execution: {},
+        evaluator_primary: {}, evaluator_secondary: {},
+      }, clientConfigChecksums: {},
+    }, contextFactory: () => null,
+  }), /shape|authority|client|checksum|option|preflight/i);
+  assert.throws(() => createQualityRunAuthority({ descriptor, productionConfig: Object.freeze({}) }), /branded|config|preflight/i);
+});
+
+test('runtime factory injection is explicitly non-evidence eligible', () => {
+  const base = {
+    runId: 'run-injection', finalKey: 'turn-injection', ordinal: 0, sourceHead: SOURCE_HEAD,
+    runtimeFactory: () => null,
+  };
+  assert.throws(() => createQualityProductionContext(base), /evidenceEligible=false/);
+  const context = createQualityProductionContext({ ...base, evidenceEligible: false });
+  context.close();
+});
+
+test('an unbound-ledger slot cannot enter a production quality context', () => {
+  const slot = createQualityPhaseClientSlot({
+    runId: 'run-slot-identity', finalKey: 'turn-slot-identity',
+    phase: 'stable_execution', side: 'stable',
+  });
+  assert.throws(() => createQualityProductionContext({
+    runId: 'run-slot-identity', finalKey: 'turn-slot-identity', ordinal: 0,
+    sourceHead: SOURCE_HEAD, evidenceEligible: false,
+    stablePhaseClientSlot: slot,
+  }), /ledger identity|ledger.*required/i);
 });
 
 test('recursive attachment closure rejects before store accept', async () => {
@@ -351,6 +467,179 @@ test('real v15 turn uses accept, shared builder and both production release exec
   }, subject.finalKey);
 });
 
+test('quality side execution requires a persisted running phase and routes model calls through its slot', async () => {
+  const subject = compiledSubject('DIRECT_REPLY', 6);
+  await withRealFixture('turn', 6, async ({ context, runtimeCodexes, stableRelease, candidateRelease, qualityLedgers }) => {
+    const prepared = await prepareQualitySubject(context, subject);
+    const slot = createQualityPhaseClientSlot({
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey,
+      phase: 'stable_execution', side: 'stable'
+    });
+    await assert.rejects(() => executeQualitySubjectSide(context, subject, {
+      side: 'stable', phaseClientSlot: slot
+    }), /phase slot|running|bound/i);
+    const makeLedger = (ledger, phase, checksum, attestationChecksum) => {
+      ledger.createOrOpenRun({
+      version: 1, runId: '123e4567-e89b-42d3-a456-426614174001', finalKeys: frozenSubjects().map(item => item.finalKey),
+      planChecksum: FROZEN_PLAN_CHECKSUM, sourceHead: SOURCE_HEAD,
+      stableRelease: ledgerRelease(stableRelease),
+      candidateRelease: ledgerRelease(candidateRelease),
+      ...ledgerAttestation(SOURCE_HEAD),
+      artifactPaths: { plan: 'plan', ledger: 'ledger', raw: 'raw' }, createdAt: 1_000,
+      });
+      const phaseInput = {
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey, phase,
+      subjectChecksum: subject.semanticInputChecksum,
+      authorityInputChecksum: checksum,
+      input: { subjectChecksum: subject.semanticInputChecksum, authorityInputChecksum: checksum },
+      now: 1_000,
+      };
+      ledger.preparePhase(phaseInput);
+      ledger.startPhase(phaseInput, { now: 1_001 });
+      ledger.markPhaseRunning(phaseInput, { now: 1_002 });
+      return { ledger, phaseInput };
+    };
+    const stablePhase = makeLedger(
+      qualityLedgers.stable, 'stable_execution', prepared.execution.inputChecksum, 'b'.repeat(64),
+    );
+    const candidatePhase = makeLedger(
+      qualityLedgers.candidate, 'candidate_execution',
+      prepared.candidateExecution.inputChecksum, 'd'.repeat(64),
+    );
+    const { ledger, phaseInput } = stablePhase;
+    const candidateLedger = candidatePhase.ledger;
+    const candidatePhaseInput = candidatePhase.phaseInput;
+    const codex = runtimeCodexes[0];
+    const publicCodex = context.prepared.stableRuntime.orchestrator.codex;
+    const publicPipelineClient = context.prepared.stableRuntime.orchestrator.cognitivePipeline.codexClient;
+    const underlying = {
+      turnTimeoutMs: 180_000,
+      async ensureThread(role) { return `quality-thread-${role}`; },
+      async readThread(id) { return { id, turns: [] }; },
+      async runTurn(role, input, options = {}) {
+        assert.equal(context.prepared.stableRuntime.orchestrator.codex, publicCodex);
+        assert.equal(
+          context.prepared.stableRuntime.orchestrator.cognitivePipeline.codexClient,
+          publicPipelineClient,
+        );
+        await options.onTurnStarted({ threadId: `quality-thread-${role}`, turnId: `quality-turn-${role}` });
+        return codex.runTurn(role, input, options);
+      },
+    };
+    const phaseClient = new LedgerBackedModelClient({ ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174001' });
+    const candidateCodex = runtimeCodexes[1];
+    const candidatePublicCodex = context.prepared.candidateRuntime.orchestrator.codex;
+    const candidatePublicPipelineClient = context.prepared.candidateRuntime.orchestrator.cognitivePipeline.codexClient;
+    const candidateUnderlying = {
+      turnTimeoutMs: 180_000,
+      async ensureThread(role) { return `candidate-thread-${role}`; },
+      async readThread(id) { return { id, turns: [] }; },
+      async runTurn(role, input, options = {}) {
+        assert.equal(context.prepared.candidateRuntime.orchestrator.codex, candidatePublicCodex);
+        assert.equal(
+          context.prepared.candidateRuntime.orchestrator.cognitivePipeline.codexClient,
+          candidatePublicPipelineClient,
+        );
+        await options.onTurnStarted({ threadId: `candidate-thread-${role}`, turnId: `candidate-turn-${role}` });
+        return candidateCodex.runTurn(role, input, options);
+      },
+    };
+    const candidateClient = new LedgerBackedModelClient({
+      ledger: candidateLedger, underlying: candidateUnderlying, runId: '123e4567-e89b-42d3-a456-426614174001',
+    });
+    registerQualityPhaseBinding(
+      context, 'stable', createQualityPhaseBinding(phaseClient, phaseInput),
+    );
+    registerQualityPhaseBinding(
+      context, 'candidate', createQualityPhaseBinding(candidateClient, candidatePhaseInput),
+    );
+    await assert.rejects(() => executeQualitySubjectSide(context, subject, {
+      side: 'stable', phaseClientSlot: context.config.stablePhaseClientSlot,
+      phaseClient,
+    }), /injection|forbidden/i);
+    const [result, candidateResult] = await Promise.all([
+      executeQualitySubjectSide(context, subject, {
+        side: 'stable', phaseClientSlot: context.config.stablePhaseClientSlot,
+      }),
+      executeQualitySubjectSide(context, subject, {
+        side: 'candidate', phaseClientSlot: context.config.candidatePhaseClientSlot,
+      }),
+    ]);
+    assert.ok(result.stable);
+    assert.ok(candidateResult.candidate);
+    assert.ok(runtimeCodexes.some(codex => codex.runRoleCalls.length + codex.runTurnCalls.length > 0));
+    assert.ok(ledger.getModelCall({
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey,
+      phase: 'stable_execution', ordinal: 0,
+    }));
+    assert.ok(Number(ledger.db.prepare(
+      'SELECT COUNT(*) AS count FROM quality_model_calls WHERE run_id=? AND final_key=? AND phase=?'
+    ).get('123e4567-e89b-42d3-a456-426614174001', subject.finalKey, 'stable_execution').count) >= 1);
+    assert.ok(Number(candidateLedger.db.prepare(
+      'SELECT COUNT(*) AS count FROM quality_model_calls WHERE run_id=? AND final_key=? AND phase=?'
+    ).get('123e4567-e89b-42d3-a456-426614174001', subject.finalKey, 'candidate_execution').count) >= 1);
+  }, subject.finalKey, { qualitySlots: true });
+});
+
+test('quality side execution rejects authority drift after a slot-routed model call', async () => {
+  const subject = compiledSubject('DIRECT_REPLY', 7);
+  await withRealFixture('turn', 7, async ({ context, runtimeCodexes, stableRelease, candidateRelease, qualityLedgers }) => {
+    const prepared = await prepareQualitySubject(context, subject);
+    const ledger = qualityLedgers.stable;
+    ledger.createOrOpenRun({
+      version: 1, runId: '123e4567-e89b-42d3-a456-426614174001', finalKeys: frozenSubjects().map(item => item.finalKey),
+      planChecksum: FROZEN_PLAN_CHECKSUM, sourceHead: SOURCE_HEAD,
+      stableRelease: ledgerRelease(stableRelease),
+      candidateRelease: ledgerRelease(candidateRelease),
+      ...ledgerAttestation(SOURCE_HEAD),
+      artifactPaths: { plan: 'plan', ledger: 'ledger', raw: 'raw' }, createdAt: 1_000,
+    });
+    const phaseInput = {
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey, phase: 'stable_execution',
+      subjectChecksum: subject.semanticInputChecksum,
+      authorityInputChecksum: prepared.execution.inputChecksum,
+      input: { subjectChecksum: subject.semanticInputChecksum, authorityInputChecksum: prepared.execution.inputChecksum },
+      now: 1_000,
+    };
+    ledger.preparePhase(phaseInput);
+    ledger.startPhase(phaseInput, { now: 1_001 });
+    ledger.markPhaseRunning(phaseInput, { now: 1_002 });
+    const codex = runtimeCodexes[0];
+    const underlying = {
+      turnTimeoutMs: 180_000,
+      async ensureThread(role) { return `quality-thread-${role}`; },
+      async readThread(id) { return { id, turns: [] }; },
+      async runTurn(role, input, options = {}) {
+        await options.onTurnStarted({ threadId: `quality-thread-${role}`, turnId: `quality-turn-${role}` });
+        const result = await codex.runTurn(role, input, options);
+        context.prepared.stableStore.db.prepare(
+          'UPDATE turns SET lane_revision = lane_revision + 1 WHERE turn_id = ?'
+        ).run(context.prepared.persistedSubject.turnId);
+        return result;
+      },
+    };
+    const phaseClient = new LedgerBackedModelClient({ ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174001' });
+    registerQualityPhaseBinding(
+      context, 'stable', createQualityPhaseBinding(phaseClient, phaseInput),
+    );
+    await assert.rejects(() => executeQualitySubjectSide(context, subject, {
+      side: 'stable', phaseClientSlot: context.config.stablePhaseClientSlot,
+    }), /authority|input|lane|changed/i);
+    assert.ok(ledger.getModelCall({
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey,
+      phase: 'stable_execution', ordinal: 0,
+    }));
+  }, subject.finalKey, { qualitySlots: true });
+});
+
+test('a cloned slot or runtime factory that ignores the slot cannot prepare quality evidence', async () => {
+  const subject = compiledSubject('DIRECT_REPLY', 8);
+  await withRealFixture('turn', 8, async ({ context, runtimeCodexes }) => {
+    await assert.rejects(() => prepareQualitySubject(context, subject), /phase slot|identity|quality runtime/i);
+    assert.equal(runtimeCodexes.reduce((sum, codex) => sum + codex.modelRequests.length, 0), 0);
+  }, subject.finalKey, { qualitySlots: true, ignoreQualitySlot: true });
+});
+
 test('eight LIFE finals use real putLifePlan/contextFor/attempt/build/execute APIs', async () => {
   for (let ordinal = 0; ordinal < 8; ordinal += 1) {
     const subject = compiledSubject('LIFE_PLANNING', ordinal);
@@ -374,7 +663,7 @@ test('prepared authority rejects wrong method, authority, input and release drif
     await assert.rejects(executeQualitySubject(context, { authorityId: 'foreign' }), /identity conflict/);
     await assert.rejects(executeQualitySubject(context, { inputChecksum: 'changed' }), /input checksum/);
     assert.equal(prepared.authorityId, authorityIdFor({
-      runId: 'quality-run-real', finalKey: subject.finalKey, ordinal: 1,
+      runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey, ordinal: 1,
     }));
   }, subject.finalKey);
 });

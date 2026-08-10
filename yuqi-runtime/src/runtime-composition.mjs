@@ -9,9 +9,15 @@ import { CognitivePipeline } from './cognitive-pipeline.mjs';
 import { PresetRegistry } from './preset-registry.mjs';
 import { PromotionController } from './promotion-controller.mjs';
 import { YuqiStore } from './store.mjs';
+import {
+  createQualityPhaseClientRouter,
+  qualityPhaseClientSlotHasLedger,
+  isQualityPhaseClientSlot,
+} from './quality-replay-ledger.mjs';
 
 const PRODUCTION_RUNTIME_BRAND = new WeakSet();
 const PRODUCTION_RUNTIME_METADATA = new WeakMap();
+const QUALITY_RUNTIME_SLOT = new WeakMap();
 
 function assertSourceHead(value) {
   if (value == null || value === '') return null;
@@ -123,15 +129,49 @@ export function assertProductionRuntimeAttestation(runtime, expected = {}) {
   });
 }
 
+export function assertQualityPhaseClientSlot(runtime, slot) {
+  if (!runtime || !PRODUCTION_RUNTIME_BRAND.has(runtime)
+    || !isQualityPhaseClientSlot(slot)
+    || QUALITY_RUNTIME_SLOT.get(runtime) !== slot) {
+    throw new Error('quality runtime phase slot identity conflict');
+  }
+  return true;
+}
+
 export function composeYuqiExecutionRuntime(input = {}) {
+  if (input.qualityPhaseClientSlot !== undefined
+    && !isQualityPhaseClientSlot(input.qualityPhaseClientSlot)) {
+    throw new Error('quality runtime phase slot is not authentic');
+  }
+  if (input.qualityPhaseClientSlot !== undefined
+    && !qualityPhaseClientSlotHasLedger(input.qualityPhaseClientSlot)) {
+    throw new Error('quality runtime phase ledger identity is required');
+  }
+  const qualityRouter = input.qualityPhaseClientSlot === undefined
+    ? null
+    : createQualityPhaseClientRouter(input.qualityPhaseClientSlot);
+  const sourcePipeline = input.cognitivePipeline;
+  const cognitivePipeline = qualityRouter && sourcePipeline instanceof CognitivePipeline
+    ? new CognitivePipeline({
+      store: input.store,
+      codexClient: qualityRouter,
+      presetRegistry: sourcePipeline.presetRegistry,
+      routePolicy: sourcePipeline.routePolicy,
+      clock: sourcePipeline.clock,
+      diagnostics: sourcePipeline.diagnostics,
+      contextBuilder: sourcePipeline.contextBuilder,
+    })
+    : sourcePipeline;
   const orchestrator = new YuqiOrchestrator({
     ...input,
+    codex: qualityRouter || input.codex,
+    cognitivePipeline,
     releaseExecutor: null,
     lifePlanningDispatcher: null
   });
   const adapters = createProductionReleaseAdapters({
     orchestrator,
-    cognitivePipeline: input.cognitivePipeline
+    cognitivePipeline,
   });
   const releaseExecutor = new ReleaseExecutor({
     store: input.store,
@@ -154,7 +194,7 @@ export function composeYuqiExecutionRuntime(input = {}) {
     releaseExecutor,
     promotionController: input.promotionController,
     legacyVersionZeroComparisonExecutor:
-      execution => input.cognitivePipeline.runShadow(execution),
+      execution => cognitivePipeline.runShadow(execution),
     foregroundActivity: { isBusy: () => turnDispatcher.inflight.size > 0 }
   });
   const runtime = Object.freeze({
@@ -166,6 +206,9 @@ export function composeYuqiExecutionRuntime(input = {}) {
     shadowDispatcher
   });
   PRODUCTION_RUNTIME_BRAND.add(runtime);
+  if (input.qualityPhaseClientSlot !== undefined) {
+    QUALITY_RUNTIME_SLOT.set(runtime, input.qualityPhaseClientSlot);
+  }
   PRODUCTION_RUNTIME_METADATA.set(runtime, Object.freeze({
     store: input.store,
     sourceHead: assertSourceHead(input.sourceHead),

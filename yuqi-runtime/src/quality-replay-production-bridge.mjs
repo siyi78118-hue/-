@@ -1,13 +1,35 @@
-import { copyFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, rmSync, lstatSync, realpathSync, mkdtempSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { dirname, join, resolve, relative, isAbsolute } from 'node:path';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { CodexAppServerClient } from './codex-client.mjs';
 
 import { contentHash } from './protocol.mjs';
+import { compileQualitySubject } from './quality-evaluator.mjs';
 import { deriveAuthorityLineageKey } from './authority-identity.mjs';
 import { YuqiStore } from './store.mjs';
+import { CognitivePipeline } from './cognitive-pipeline.mjs';
+import { PresetRegistry } from './preset-registry.mjs';
+import { PromotionController } from './promotion-controller.mjs';
 import {
   assertProductionRuntimeAttestation,
+  assertQualityPhaseClientSlot,
   composeYuqiExecutionRuntime,
 } from './runtime-composition.mjs';
+import {
+  bindQualityPhaseClientSlot,
+  assertQualityPhaseClientSlotBinding,
+  isQualityPhaseBinding,
+  isQualityPhaseClientSlot,
+  qualityPhaseClientSlotHasLedger,
+  createQualityPhaseClientSlot,
+  createQualityPhaseBinding,
+  LedgerBackedModelClient,
+  qualityPhaseBindingScope,
+  qualityPhaseClientLedger,
+} from './quality-replay-ledger.mjs';
 
 const ATTACHMENT_KEYS = Object.freeze(['attachments', 'images', 'imagePaths', 'attachmentPaths']);
 const SUBJECT_TYPES = new Set(['turn', 'life_planning']);
@@ -37,7 +59,649 @@ const COMPILED_SEMANTIC_KEYS = Object.freeze([
 ]);
 const CLOSED_STORES = new WeakSet();
 const CONTEXT_BINDINGS = new WeakMap();
+const CONTEXT_PHASE_BINDINGS = new WeakMap();
+const QUALITY_PRODUCTION_CONFIG_BRAND = new WeakSet();
+const QUALITY_PRODUCTION_CONFIG_STATE = new WeakMap();
+const QUALITY_RUN_AUTHORITY_BRAND = new WeakSet();
+const QUALITY_RUN_AUTHORITY_STATE = new WeakMap();
+const INTERNAL_PRODUCTION_CONTEXT_TOKEN = Symbol('quality-production-context');
+const PRODUCTION_AUTHORITY_TOKEN = Symbol('quality-production-authority');
 const TRACKED_PLAN_CHECKSUM = 'dc704d836d1b0224f0202b5771f38334292df90eaedd7c8f8880c7c3bb89243c';
+
+const PRODUCTION_CONFIG_DESCRIPTOR_KEYS = Object.freeze([
+  'version', 'runId', 'finalKeys', 'planChecksum', 'sourceHead',
+  'stableRelease', 'candidateRelease', 'attestation', 'attestationChecksum',
+  'artifactPaths', 'ledgerPath', 'createdAt', 'evidenceEligible'
+]);
+const RUN_AUTHORITY_KEYS = Object.freeze([
+  'version', 'runId', 'finalKeys', 'planChecksum', 'sourceHead',
+  'stableRelease', 'candidateRelease', 'attestation', 'attestationChecksum',
+  'artifactPaths', 'ledgerPath', 'createdAt', 'evidenceEligible'
+]);
+
+/** Shared source identity gate used before any production brand is minted. */
+export function assertCleanQualitySourceIdentity({ sourceRootDir = process.cwd(), expectedHead } = {}) {
+  let status;
+  let head;
+  try {
+    status = execFileSync('git', ['status', '--porcelain', '--untracked-files=all'], {
+      cwd: sourceRootDir, encoding: 'utf8'
+    });
+    head = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
+      cwd: sourceRootDir, encoding: 'utf8'
+    }).trim();
+  } catch (error) {
+    throw new Error(`quality source identity unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const blocking = status.split(/\r?\n/).filter(Boolean).filter(line => {
+    const porcelainStatus = line.slice(0, 2);
+    const path = line.slice(3).replace(/^"|"$/g, '').replaceAll('\\', '/');
+    const privateUntracked = porcelainStatus === '??'
+      && path.startsWith('artifacts/yuqi-lived-agency-v3/private/');
+    return !privateUntracked;
+  });
+  if (blocking.length) throw new Error('quality source tree is dirty');
+  if (!/^[0-9a-f]{40}$/i.test(head)) throw new Error('quality source HEAD invalid');
+  if (expectedHead !== undefined && head.toLowerCase() !== String(expectedHead).toLowerCase()) {
+    throw new Error('quality source HEAD drift');
+  }
+  return head;
+}
+
+function assertDataOnlyClientConfig(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || Object.keys(value).some(key => typeof value[key] === 'function')) {
+    throw new Error(`${label} data-only client config required`);
+  }
+  const allowed = new Set([
+    'command', 'args', 'cwd', 'env', 'clientInfo', 'requestTimeoutMs',
+    'turnTimeoutMs', 'maxRoleTurns'
+  ]);
+  if (Object.keys(value).some(key => !allowed.has(key))) {
+    throw new Error(`${label} client config shape conflict`);
+  }
+  if (value.args !== undefined && (!Array.isArray(value.args)
+    || value.args.some(item => typeof item !== 'string'))) {
+    throw new Error(`${label} client args conflict`);
+  }
+  return Object.freeze(structuredClone(value));
+}
+
+function assertProductionMaterials(materials) {
+  if (!materials || typeof materials !== 'object' || Array.isArray(materials)) {
+    throw new Error('quality production data materials required');
+  }
+  const expected = ['runtimeConfig', 'seedDatabasePath', 'stableDatabasePath',
+    'candidateDatabasePath', 'clientConfigs', 'clientConfigChecksums'];
+  if (Object.keys(materials).sort().join(',') !== expected.sort().join(',')) {
+    throw new Error('quality production data materials shape conflict');
+  }
+  for (const key of ['seedDatabasePath', 'stableDatabasePath', 'candidateDatabasePath']) {
+    if (typeof materials[key] !== 'string' || !materials[key] || materials[key].includes('..')) {
+      throw new Error(`quality production ${key} conflict`);
+    }
+  }
+  if (!materials.runtimeConfig || typeof materials.runtimeConfig !== 'object'
+    || Array.isArray(materials.runtimeConfig)
+    || Object.keys(materials.runtimeConfig).some(key => typeof materials.runtimeConfig[key] === 'function')) {
+    throw new Error('quality production runtime config must be data-only');
+  }
+  const configs = materials.clientConfigs;
+  if (!configs || typeof configs !== 'object' || Array.isArray(configs)
+    || Object.keys(configs).sort().join(',') !== 'candidate_execution,evaluator_primary,evaluator_secondary,stable_execution') {
+    throw new Error('quality production client configs shape conflict');
+  }
+  const checksums = materials.clientConfigChecksums;
+  if (!checksums || typeof checksums !== 'object' || Array.isArray(checksums)
+    || Object.keys(checksums).sort().join(',') !== Object.keys(configs).sort().join(',')) {
+    throw new Error('quality production client config attestation conflict');
+  }
+  const normalizedConfigs = Object.fromEntries(
+    Object.entries(configs).map(([key, value]) => [key, assertDataOnlyClientConfig(value, key)])
+  );
+  for (const key of Object.keys(normalizedConfigs)) {
+    if (checksums[key] !== contentHash(normalizedConfigs[key])) {
+      throw new Error(`quality production ${key} client config checksum conflict`);
+    }
+  }
+  return Object.freeze({
+    runtimeConfig: Object.freeze(structuredClone(materials.runtimeConfig)),
+    seedDatabasePath: materials.seedDatabasePath,
+    stableDatabasePath: materials.stableDatabasePath,
+    candidateDatabasePath: materials.candidateDatabasePath,
+    clientConfigs: Object.freeze(normalizedConfigs),
+    clientConfigChecksums: Object.freeze(structuredClone(checksums)),
+  });
+}
+
+export function createQualityRunAuthority(options = {}) {
+  if (!options || typeof options !== 'object' || Object.keys(options).some(key =>
+    !['descriptor', 'productionConfig', 'materials', 'productionToken'].includes(key))) {
+    throw new Error('quality run authority option conflict');
+  }
+  const { descriptor, productionConfig, materials, productionToken } = options;
+  if (productionToken !== PRODUCTION_AUTHORITY_TOKEN) {
+    throw new Error('quality run authority preflight is private');
+  }
+  assertQualityProductionExecutionConfig(productionConfig);
+  if (!descriptor || typeof descriptor !== 'object'
+    || Object.keys(descriptor).sort().join(',') !== [...RUN_AUTHORITY_KEYS].sort().join(',')) {
+    throw new Error('quality run authority descriptor conflict');
+  }
+  if (descriptor.evidenceEligible !== true
+    || !Array.isArray(descriptor.finalKeys) || descriptor.finalKeys.length !== 246
+    || descriptor.finalKeys.some(key => typeof key !== 'string')
+    || descriptor.runId !== productionConfig.runId
+    || descriptor.planChecksum !== productionConfig.planChecksum
+    || descriptor.sourceHead !== productionConfig.sourceHead
+    || descriptor.ledgerPath !== productionConfig.ledgerPath
+    || descriptor.createdAt !== productionConfig.createdAt
+    || descriptor.attestationChecksum !== productionConfig.attestationChecksum
+    || contentHash(descriptor.finalKeys) !== contentHash(productionConfig.finalKeys)
+    || contentHash(descriptor.stableRelease) !== contentHash(productionConfig.stableRelease)
+    || contentHash(descriptor.candidateRelease) !== contentHash(productionConfig.candidateRelease)
+    || contentHash(descriptor.attestation) !== contentHash(productionConfig.attestation)
+    || contentHash(descriptor.artifactPaths) !== contentHash(productionConfig.artifactPaths)) {
+    throw new Error('quality run authority identity conflict');
+  }
+  const dataMaterials = materials || QUALITY_PRODUCTION_CONFIG_STATE.get(productionConfig)?.materials;
+  assertProductionMaterials(dataMaterials);
+  const authority = Object.freeze(structuredClone(descriptor));
+  QUALITY_RUN_AUTHORITY_BRAND.add(authority);
+  QUALITY_RUN_AUTHORITY_STATE.set(authority, Object.freeze({
+    productionConfig,
+    materials: dataMaterials,
+  }));
+  return authority;
+}
+
+export function assertQualityRunAuthority(authority) {
+  if (!QUALITY_RUN_AUTHORITY_BRAND.has(authority)) {
+    throw new Error('quality run authority is not branded');
+  }
+  return true;
+}
+
+export function qualityRunAuthorityProductionConfig(authority) {
+  assertQualityRunAuthority(authority);
+  return QUALITY_RUN_AUTHORITY_STATE.get(authority).productionConfig;
+}
+
+export function createQualityProductionExecutionConfig(options = {}) {
+  if (!options || typeof options !== 'object' || Object.keys(options).some(key =>
+    !['descriptor', 'materials', 'productionToken'].includes(key))) {
+    throw new Error('quality production config option conflict');
+  }
+  const { descriptor, materials, productionToken } = options;
+  if (productionToken !== PRODUCTION_AUTHORITY_TOKEN) {
+    throw new Error('quality production preflight is private');
+  }
+  if (!descriptor || typeof descriptor !== 'object' || Array.isArray(descriptor)) {
+    throw new Error('quality production config descriptor required');
+  }
+  const keys = Object.keys(descriptor).sort();
+  if (keys.join(',') !== [...PRODUCTION_CONFIG_DESCRIPTOR_KEYS].sort().join(',')) {
+    throw new Error('quality production config descriptor shape conflict');
+  }
+  if (descriptor.version !== 1 || descriptor.evidenceEligible !== true
+    || typeof descriptor.runId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(descriptor.runId)
+    || !Array.isArray(descriptor.finalKeys) || descriptor.finalKeys.length !== 246
+    || descriptor.finalKeys.some(key => typeof key !== 'string')
+    || typeof descriptor.sourceHead !== 'string' || !/^[a-f0-9]{40}$/i.test(descriptor.sourceHead)
+    || descriptor.planChecksum !== TRACKED_PLAN_CHECKSUM
+    || !Number.isSafeInteger(descriptor.createdAt) || descriptor.createdAt < 0) {
+    throw new Error('quality production config authority conflict');
+  }
+  const dataMaterials = assertProductionMaterials(materials);
+  if (descriptor.ledgerPath !== descriptor.artifactPaths?.ledger
+    || !descriptor.artifactPaths
+    || Object.keys(descriptor.artifactPaths).sort().join(',') !== 'ledger,plan,raw') {
+    throw new Error('quality production ledger path authority conflict');
+  }
+  if (descriptor.attestationChecksum !== contentHash(descriptor.attestation)) {
+    throw new Error('quality production attestation checksum conflict');
+  }
+  const config = Object.freeze(structuredClone(descriptor));
+  QUALITY_PRODUCTION_CONFIG_BRAND.add(config);
+  QUALITY_PRODUCTION_CONFIG_STATE.set(config, Object.freeze({
+    materials: dataMaterials,
+  }));
+  return config;
+}
+
+/**
+ * The sole public production authority entrance.  It performs the complete
+ * read-only preflight before minting either private brand, so callers cannot
+ * compose a descriptor/config pair or select an evidence class themselves.
+ */
+export function createQualityProductionExecutionAuthority({
+  descriptor, materials, sourceRootDir = process.cwd()
+} = {}) {
+  assertCleanQualitySourceIdentity({ sourceRootDir, expectedHead: descriptor?.sourceHead });
+  const config = createQualityProductionExecutionConfig({
+    descriptor, materials, productionToken: PRODUCTION_AUTHORITY_TOKEN,
+  });
+  assertQualityProductionPreflight({
+    productionConfig: config,
+    sourceRootDir,
+    ledgerPath: descriptor?.ledgerPath,
+    planChecksum: descriptor?.planChecksum,
+    finalKeys: descriptor?.finalKeys,
+  });
+  assertCleanQualitySourceIdentity({ sourceRootDir, expectedHead: descriptor?.sourceHead });
+  return createQualityRunAuthority({
+    descriptor,
+    productionConfig: config,
+    materials,
+    productionToken: PRODUCTION_AUTHORITY_TOKEN,
+  });
+}
+
+export function createQualityProductionContextFactory(base = {}) {
+  throw new Error('callback-backed production context factory is forbidden; use run authority materials');
+}
+
+export function assertQualityProductionExecutionConfig(config) {
+  if (!QUALITY_PRODUCTION_CONFIG_BRAND.has(config)) {
+    throw new Error('quality production config is not branded');
+  }
+  const state = QUALITY_PRODUCTION_CONFIG_STATE.get(config);
+  if (!state || !state.materials) {
+    throw new Error('quality production config state conflict');
+  }
+  const descriptor = config;
+  if (!Array.isArray(descriptor.finalKeys) || descriptor.finalKeys.length !== 246
+    || new Set(descriptor.finalKeys).size !== 246) {
+    throw new Error('quality production final key authority conflict');
+  }
+  if (!descriptor.artifactPaths || Object.keys(descriptor.artifactPaths).sort().join(',') !== 'ledger,plan,raw'
+    || new Set(Object.values(descriptor.artifactPaths)).size !== 3) {
+    throw new Error('quality production artifact authority conflict');
+  }
+  for (const release of [descriptor.stableRelease, descriptor.candidateRelease]) {
+    if (!release || typeof release !== 'object'
+      || typeof release.releaseId !== 'string' || !release.releaseId
+      || typeof release.releaseChecksum !== 'string' || !/^[a-f0-9]{64}$/i.test(release.releaseChecksum)
+      || !release.componentManifest || typeof release.componentManifest !== 'object') {
+      throw new Error('quality production release authority conflict');
+    }
+  }
+  if (!descriptor.attestation || descriptor.attestation.version !== 1
+    || descriptor.attestation.sourceHead !== descriptor.sourceHead
+    || contentHash(descriptor.attestation) !== descriptor.attestationChecksum) {
+    throw new Error('quality production attestation conflict');
+  }
+  for (const key of ['evaluatorPrimary', 'evaluatorSecondary']) {
+    const evaluator = descriptor.attestation[key];
+    if (!evaluator || typeof evaluator.evaluatorId !== 'string' || !evaluator.evaluatorId
+      || typeof evaluator.evaluatorVersion !== 'string' || !evaluator.evaluatorVersion) {
+      throw new Error('quality production evaluator attestation conflict');
+    }
+  }
+  if (descriptor.attestation.evaluatorPrimary.evaluatorId
+    === descriptor.attestation.evaluatorSecondary.evaluatorId) {
+    throw new Error('quality production evaluator identity conflict');
+  }
+  return true;
+}
+
+/**
+ * Read-only production preflight.  This is deliberately a validator rather
+ * than a constructor: it opens the source database read-only, verifies the
+ * release/attestation/material identity, and performs no ledger or artifact
+ * writes.  The replay runner must call it before opening its writable ledger.
+ */
+export function assertQualityProductionPreflight({
+  productionConfig, runAuthority, sourceRootDir = process.cwd(),
+  ledgerPath, planChecksum, finalKeys
+} = {}) {
+  assertQualityProductionExecutionConfig(productionConfig);
+  if (runAuthority !== undefined && runAuthority !== null) {
+    assertQualityRunAuthority(runAuthority);
+    if (qualityRunAuthorityProductionConfig(runAuthority) !== productionConfig) {
+      throw new Error('quality production preflight authority identity conflict');
+    }
+  }
+  if (planChecksum !== undefined && planChecksum !== productionConfig.planChecksum) {
+    throw new Error('quality production preflight plan conflict');
+  }
+  if (finalKeys !== undefined
+    && (contentHash(finalKeys) !== contentHash(productionConfig.finalKeys))) {
+    throw new Error('quality production preflight final key conflict');
+  }
+  const root = realpathSync(sourceRootDir);
+  const privateRoot = resolve(root, 'artifacts/yuqi-lived-agency-v3/private');
+  if (!existsSync(privateRoot) || lstatSync(privateRoot).isSymbolicLink()) {
+    throw new Error('quality production private materials root unavailable');
+  }
+  const privateReal = realpathSync(privateRoot);
+  const state = QUALITY_PRODUCTION_CONFIG_STATE.get(productionConfig);
+  const paths = [state.materials.seedDatabasePath, state.materials.stableDatabasePath,
+    state.materials.candidateDatabasePath];
+  for (const candidate of paths) assertPrivateDataPath(root, candidate);
+  if (ledgerPath !== undefined) {
+    assertPrivateDataPath(root, ledgerPath);
+    const ledgerAbsolute = isAbsolute(ledgerPath) ? resolve(ledgerPath)
+      : resolvePathUnderRoot(root, ledgerPath);
+    const ledgerRelative = relative(privateReal, ledgerAbsolute);
+    if (ledgerRelative.startsWith('..') || ledgerRelative.includes(':')) {
+      throw new Error('quality production ledger path must be private');
+    }
+  }
+  let sourceAuthorityBefore = null;
+  for (const [index, path] of paths.entries()) {
+    const absolute = isAbsolute(path) ? resolve(path) : resolvePathUnderRoot(root, path);
+    const materialRelative = relative(privateReal, absolute);
+    if (materialRelative.startsWith('..') || materialRelative.includes(':')) {
+      throw new Error('quality production material path must be private');
+    }
+    if (!existsSync(absolute)) throw new Error('quality production source database missing');
+    const db = new DatabaseSync(absolute, { readOnly: true });
+    try {
+      const version = Number(db.prepare('PRAGMA user_version').get().user_version);
+      if (version !== 15) throw new Error('quality production source schema conflict');
+      const integrity = String(db.prepare('PRAGMA quick_check').get().quick_check || '');
+      if (integrity !== 'ok') throw new Error('quality production source integrity conflict');
+      if (index === 0) {
+        const table = db.prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='pipeline_releases'"
+        ).get();
+        if (!table) throw new Error('quality production release authority unavailable');
+        const sourceReleases = [];
+        for (const release of [productionConfig.stableRelease, productionConfig.candidateRelease]) {
+          const row = db.prepare(`
+            SELECT release_id,release_checksum,component_manifest_json FROM pipeline_releases WHERE release_id=?
+          `).get(release.releaseId);
+          if (!row || row.release_checksum !== release.releaseChecksum) {
+            throw new Error('quality production release row conflict');
+          }
+          let manifest;
+          try { manifest = JSON.parse(row.component_manifest_json); } catch { throw new Error('quality production release manifest conflict'); }
+          if (contentHash(manifest) !== contentHash(release.componentManifest)) {
+            throw new Error('quality production release manifest conflict');
+          }
+          sourceReleases.push({ releaseId: row.release_id,
+            releaseChecksum: row.release_checksum, manifest });
+        }
+        sourceAuthorityBefore = { schemaVersion: version, releases: sourceReleases };
+      }
+    } finally { db.close(); }
+  }
+  // Rebuild a model-free, real branded runtime on a temporary byte clone and
+  // recompute its attestation.  This must happen before the writable ledger is
+  // opened; all resources are closed even when the attestation drifts.
+  const preflightDir = mkdtempSync(join(tmpdir(), 'yuqi-quality-preflight-'));
+  const preflightPaths = {
+    stable: join(preflightDir, 'stable.sqlite'),
+    candidate: join(preflightDir, 'candidate.sqlite'),
+  };
+  const preflightStores = [];
+  const runtimeAttestations = {};
+  try {
+    const seedSourceAbsolute = isAbsolute(state.materials.seedDatabasePath)
+      ? resolve(state.materials.seedDatabasePath)
+      : resolvePathUnderRoot(root, state.materials.seedDatabasePath);
+    for (const side of ['stable', 'candidate']) {
+      const preflightPath = preflightPaths[side];
+      copyDatabaseBytes(seedSourceAbsolute, preflightPath);
+      const preflightStore = new YuqiStore(preflightPath);
+      preflightStores.push(preflightStore);
+      const runtimeInput = createProductionRuntimeInput({
+        store: preflightStore, side, sourceHead: productionConfig.sourceHead,
+        release: side === 'stable' ? productionConfig.stableRelease : productionConfig.candidateRelease,
+        materials: state.materials, attestationOnly: true,
+      });
+      const runtime = composeYuqiExecutionRuntime({
+        ...runtimeInput, sourceHead: productionConfig.sourceHead,
+      });
+      runtimeAttestations[side] = assertProductionRuntimeAttestation(runtime, {
+        sourceHead: productionConfig.sourceHead,
+        ...(side === 'stable'
+          ? { stableRelease: productionConfig.stableRelease }
+          : { candidateRelease: productionConfig.candidateRelease }),
+      });
+    }
+    for (const side of ['stable', 'candidate']) {
+      const expected = productionConfig.attestation?.[`${side}Runtime`];
+      if (!expected || contentHash(expected) !== contentHash(runtimeAttestations[side])) {
+        throw new Error(`quality production ${side} runtime attestation conflict`);
+      }
+    }
+  } finally {
+    for (const store of preflightStores) closeStore(store);
+    rmSync(preflightDir, { recursive: true, force: true });
+  }
+  // Re-read the source identity after temporary runtime construction.  A
+  // release/manifest change during attestation invalidates the whole run.
+  const postAttestation = new DatabaseSync(
+    isAbsolute(state.materials.seedDatabasePath) ? resolve(state.materials.seedDatabasePath)
+      : resolvePathUnderRoot(root, state.materials.seedDatabasePath),
+    { readOnly: true }
+  );
+  try {
+    const schemaVersion = Number(postAttestation.prepare('PRAGMA user_version').get().user_version);
+    if (schemaVersion !== sourceAuthorityBefore?.schemaVersion) {
+      throw new Error('quality production source schema drift');
+    }
+    const postReleases = [];
+    for (const release of [productionConfig.stableRelease, productionConfig.candidateRelease]) {
+      const row = postAttestation.prepare(`
+        SELECT release_id,release_checksum,component_manifest_json
+        FROM pipeline_releases WHERE release_id=?
+      `).get(release.releaseId);
+      if (!row) throw new Error('quality production release row drift');
+      let manifest;
+      try { manifest = JSON.parse(row.component_manifest_json); } catch {
+        throw new Error('quality production release manifest drift');
+      }
+      postReleases.push({ releaseId: row.release_id,
+        releaseChecksum: row.release_checksum, manifest });
+    }
+    if (contentHash(postReleases) !== contentHash(sourceAuthorityBefore?.releases || [])) {
+      throw new Error('quality production release authority drift');
+    }
+  } finally { postAttestation.close(); }
+  for (const release of [productionConfig.stableRelease, productionConfig.candidateRelease]) {
+    if (contentHash(release.componentManifest) !== release.componentManifestChecksum
+      && release.componentManifestChecksum !== undefined) {
+      throw new Error('quality production release manifest checksum conflict');
+    }
+  }
+  return true;
+}
+
+function resolvePathUnderRoot(root, value) {
+  if (typeof value !== 'string' || !value || value.includes('\\')
+    || value.startsWith('/') || /^[A-Za-z]:/.test(value)) {
+    throw new Error('quality production path shape conflict');
+  }
+  if (value.split('/').some(segment => !segment || segment === '.' || segment === '..')) {
+    throw new Error('quality production path shape conflict');
+  }
+  const absolute = resolve(root, value);
+  const relativePath = relative(root, absolute);
+  if (!relativePath || relativePath.startsWith('..') || relativePath.includes(':')) {
+    throw new Error('quality production path escape');
+  }
+  return absolute;
+}
+
+function assertPrivateDataPath(root, value) {
+  const absolute = isAbsolute(value)
+    ? resolve(value)
+    : resolvePathUnderRoot(root, value);
+  const rootRelative = relative(root, absolute);
+  if (rootRelative.startsWith('..') || rootRelative.includes(':')) {
+    throw new Error('quality production path containment conflict');
+  }
+  const parent = dirname(absolute);
+  const parentReal = existsSync(parent) ? realpathSync(parent) : realpathSync(nearestExisting(parent));
+  const parentRelative = relative(root, parentReal);
+  if (parentRelative.startsWith('..') || parentRelative.includes(':')) {
+    throw new Error('quality production path containment conflict');
+  }
+  if (existsSync(absolute) && lstatSync(absolute).isSymbolicLink()) {
+    throw new Error('quality production path symlink conflict');
+  }
+}
+
+function nearestExisting(path) {
+  let cursor = path;
+  while (!existsSync(cursor)) {
+    const next = dirname(cursor);
+    if (next === cursor) throw new Error('quality production path parent missing');
+    cursor = next;
+  }
+  return cursor;
+}
+
+export function isQualityProductionExecutionConfig(config) {
+  return QUALITY_PRODUCTION_CONFIG_BRAND.has(config);
+}
+
+export async function prepareQualityProductionSubject(config, input) {
+  assertQualityProductionExecutionConfig(config);
+  const state = QUALITY_PRODUCTION_CONFIG_STATE.get(config);
+  const context = await createProductionContextForFinal(config, state.materials, input);
+  let subject;
+  try { subject = input?.item?.subject || compileQualitySubject(input.item); }
+  catch (error) {
+    context.close?.();
+    throw error;
+  }
+  try {
+    await prepareQualitySubject(context, subject);
+  } catch (error) {
+    context.close?.();
+    throw error;
+  }
+  context.subject = subject;
+  if (!context || typeof context !== 'object' || !context.subject) {
+    context.close?.();
+    throw new Error('quality production context subject unavailable');
+  }
+  return context;
+}
+
+function createAttestationOnlyClient() {
+  const reject = async () => { throw new Error('attestation-only client cannot execute model calls'); };
+  return Object.freeze({
+    turnTimeoutMs: 180_000,
+    ensureThread: reject,
+    readThread: reject,
+    runTurn: reject,
+    runRole: reject,
+  });
+}
+
+function createProductionRuntimeInput({ store, side, sourceHead, release, materials,
+  attestationOnly = false }) {
+  const runtimeConfig = materials.runtimeConfig;
+  const presetDir = runtimeConfig.presetDir
+    || join(dirname(fileURLToPath(import.meta.url)), '..', 'presets');
+  const clientConfig = materials.clientConfigs[side === 'stable' ? 'stable_execution' : 'candidate_execution'];
+  const codex = attestationOnly
+    ? createAttestationOnlyClient()
+    : new CodexAppServerClient({ ...clientConfig, store });
+  const presets = new PresetRegistry({ presetDir, store, clock: runtimeConfig.clock || (() => Date.now()) });
+  const promotionController = new PromotionController({
+    store, presetRegistry: presets, clock: runtimeConfig.clock || (() => Date.now()),
+  });
+  promotionController.initialize();
+  const cognitivePipeline = new CognitivePipeline({
+    store, codexClient: codex, presetRegistry: presets,
+    clock: runtimeConfig.clock || (() => Date.now()),
+  });
+  return {
+    store, codex, presets, promotionController, cognitivePipeline, sourceHead,
+    release,
+  };
+}
+
+export function bindQualityProductionPhase(context, phaseInput) {
+  if (!context?.prepared || !phaseInput || !['stable_execution', 'candidate_execution'].includes(phaseInput.phase)) {
+    throw new Error('quality production phase binding input conflict');
+  }
+  const side = phaseInput.phase === 'stable_execution' ? 'stable' : 'candidate';
+  const slot = side === 'stable'
+    ? context.config.stablePhaseClientSlot : context.config.candidatePhaseClientSlot;
+  const ledger = qualityPhaseClientLedger(slot);
+  const materials = context.config.productionMaterials;
+  if (!materials) throw new Error('quality production materials unavailable');
+  const underlying = new CodexAppServerClient({
+    ...materials.clientConfigs[phaseInput.phase],
+    store: context.prepared[side === 'stable' ? 'stableStore' : 'candidateStore'],
+  });
+  const client = new LedgerBackedModelClient({
+    ledger, underlying, runId: context.config.runId,
+  });
+  const binding = createQualityPhaseBinding(client, phaseInput);
+  registerQualityPhaseBinding(context, side, binding);
+  return binding;
+}
+
+async function createProductionContextForFinal(config, materials, input = {}) {
+  if (!input || typeof input !== 'object' || !input.item || !input.ledger) {
+    throw new Error('production context ledger/input required');
+  }
+  const finalKey = String(input.finalKey || `${input.item.layer}:${input.item.sceneId}:${input.item.repeatIndex}`);
+  const ordinal = Number.isSafeInteger(input.ordinal) ? input.ordinal : Number(input.item.repeatIndex || 0);
+  const stableSlot = createQualityPhaseClientSlot({
+    runId: config.runId, finalKey, phase: 'stable_execution', side: 'stable'
+  }, { ledger: input.ledger });
+  const candidateSlot = createQualityPhaseClientSlot({
+    runId: config.runId, finalKey, phase: 'candidate_execution', side: 'candidate'
+  }, { ledger: input.ledger });
+  const tempStem = `${materials.seedDatabasePath}.quality-${contentHash({
+    runId: config.runId, finalKey,
+  }).slice(0, 24)}`;
+  const seedPath = `${tempStem}.seed.sqlite`;
+  const stablePath = `${tempStem}.stable.sqlite`;
+  const candidatePath = `${tempStem}.candidate.sqlite`;
+  copyDatabaseBytes(materials.seedDatabasePath, seedPath);
+  const seedStore = new YuqiStore(seedPath);
+  const seedInput = createProductionRuntimeInput({
+    store: seedStore, side: 'stable', sourceHead: config.sourceHead,
+    release: config.stableRelease, materials,
+  });
+  copyDatabaseBytes(seedPath, stablePath);
+  copyDatabaseBytes(seedPath, candidatePath);
+  const stableStore = new YuqiStore(stablePath);
+  const candidateStore = new YuqiStore(candidatePath);
+  const stableInput = createProductionRuntimeInput({
+    store: stableStore, side: 'stable', sourceHead: config.sourceHead,
+    release: config.stableRelease, materials,
+  });
+  const candidateInput = createProductionRuntimeInput({
+    store: candidateStore, side: 'candidate', sourceHead: config.sourceHead,
+    release: config.candidateRelease, materials,
+  });
+  // The runtime composition owns the actual store/client graph.  The seed
+  // graph is used only to materialize the frozen subject before cloning.
+  stableInput.qualityPhaseClientSlot = stableSlot;
+  candidateInput.qualityPhaseClientSlot = candidateSlot;
+  const context = createQualityProductionContext({
+    runId: config.runId, finalKey, ordinal, sourceHead: config.sourceHead,
+    anchorAt: input.item.anchorAt, planChecksum: config.planChecksum,
+    seedStore, seedRuntime: composeYuqiExecutionRuntime({
+      ...seedInput, qualityPhaseClientSlot: undefined,
+    }),
+    seedDatabasePath: seedPath,
+    stableDatabasePath: stablePath,
+    candidateDatabasePath: candidatePath,
+    stableStore, candidateStore,
+    stableRelease: config.stableRelease,
+    candidateRelease: config.candidateRelease,
+    stablePhaseClientSlot: stableSlot,
+    candidatePhaseClientSlot: candidateSlot,
+    runtimeInputs: { stable: stableInput, candidate: candidateInput },
+    productionMaterials: materials,
+    evidenceEligible: true,
+    [INTERNAL_PRODUCTION_CONTEXT_TOKEN]: true,
+    temporaryPaths: [seedPath, stablePath, candidatePath],
+  });
+  return context;
+}
 
 function requiredString(value, label) {
   const result = String(value || '');
@@ -408,7 +1072,10 @@ function openStore(path, factory) {
 
 function runtimeFor({ runtime, runtimeFactory, runtimeInput, store, side, sourceHead }) {
   if (runtime) return runtime;
-  if (typeof runtimeFactory === 'function') return runtimeFactory({ store, side, sourceHead });
+  if (typeof runtimeFactory === 'function') return runtimeFactory({
+    store, side, sourceHead,
+    qualityPhaseClientSlot: runtimeInput?.qualityPhaseClientSlot,
+  });
   if (runtimeInput && typeof runtimeInput === 'object') {
     return composeYuqiExecutionRuntime({ ...runtimeInput, store, sourceHead });
   }
@@ -617,7 +1284,12 @@ function rereadPreparedAuthority(context, binding) {
 
 export function createQualityProductionContext(config = {}) {
   assertRunIdentity(config);
-  if (config.stableStore || config.candidateStore || config.stableRuntime || config.candidateRuntime) {
+  const internalProduction = config[INTERNAL_PRODUCTION_CONTEXT_TOKEN] === true;
+  if (typeof config.runtimeFactory === 'function' && config.evidenceEligible !== false) {
+    throw new Error('runtime factory injection requires evidenceEligible=false');
+  }
+  if (!internalProduction && (config.stableStore || config.candidateStore
+    || config.stableRuntime || config.candidateRuntime)) {
     throw new Error('caller-provided clone stores/runtimes are not permitted');
   }
   for (const key of ['executeTurn', 'executeSubject', 'executeLife']) {
@@ -628,6 +1300,26 @@ export function createQualityProductionContext(config = {}) {
   if (config.stableRelease && config.candidateRelease
     && String(config.stableRelease.releaseId) === String(config.candidateRelease.releaseId)) {
     throw new Error('stable and candidate release identities must differ');
+  }
+  if (config.stablePhaseClientSlot !== undefined
+    && !isQualityPhaseClientSlot(config.stablePhaseClientSlot)) {
+    throw new Error('stable quality phase slot is not authentic');
+  }
+  if (config.candidatePhaseClientSlot !== undefined
+    && !isQualityPhaseClientSlot(config.candidatePhaseClientSlot)) {
+    throw new Error('candidate quality phase slot is not authentic');
+  }
+  if (config.stablePhaseClientSlot !== undefined
+    && !qualityPhaseClientSlotHasLedger(config.stablePhaseClientSlot)) {
+    throw new Error('stable quality phase ledger identity is required');
+  }
+  if (config.candidatePhaseClientSlot !== undefined
+    && !qualityPhaseClientSlotHasLedger(config.candidatePhaseClientSlot)) {
+    throw new Error('candidate quality phase ledger identity is required');
+  }
+  if (config.stablePhaseClientSlot !== undefined
+    && config.stablePhaseClientSlot === config.candidatePhaseClientSlot) {
+    throw new Error('stable and candidate quality phase slots must be independent');
   }
   if (config.stableDatabasePath && config.candidateDatabasePath
     && String(config.stableDatabasePath) === String(config.candidateDatabasePath)) {
@@ -661,9 +1353,37 @@ export function createQualityProductionContext(config = {}) {
   };
   context.close = () => {
     for (const store of context.ownedStores) closeStore(store);
+    for (const path of context.config.temporaryPaths || []) {
+      for (const suffix of ['', '-wal', '-shm', '-journal']) {
+        try { rmSync(`${path}${suffix}`, { force: true }); } catch {}
+      }
+    }
     context.phase = 'closed';
   };
   return context;
+}
+
+// The phase client never enters the per-call options object.  A branded
+// ledger binding is registered once against the prepared context and retained
+// only in this module-private map.
+export function registerQualityPhaseBinding(context, side, binding) {
+  if (!context || (side !== 'stable' && side !== 'candidate')
+    || !isQualityPhaseBinding(binding)) {
+    throw new Error('quality phase binding registration conflict');
+  }
+  const slot = side === 'stable'
+    ? context.config.stablePhaseClientSlot : context.config.candidatePhaseClientSlot;
+  const scope = qualityPhaseBindingScope(binding);
+  if (!slot || slot.identity?.side !== side
+    || slot.identity?.runId !== String(scope.runId)
+    || slot.identity?.finalKey !== String(scope.finalKey)
+    || slot.identity?.phase !== String(scope.phase)) {
+    throw new Error('quality phase binding identity conflict');
+  }
+  assertQualityPhaseClientSlotBinding(slot, binding);
+  const existing = CONTEXT_PHASE_BINDINGS.get(context) || {};
+  if (existing[side]) throw new Error('quality phase binding already registered');
+  CONTEXT_PHASE_BINDINGS.set(context, Object.freeze({ ...existing, [side]: binding }));
 }
 
 export async function prepareQualitySubject(context, subject) {
@@ -761,18 +1481,24 @@ export async function prepareQualitySubject(context, subject) {
   const stableRuntime = runtimeFor({
     runtime: config.stableRuntime,
     runtimeFactory: config.runtimeFactory,
-    runtimeInput: config.runtimeInput,
     store: stableStore,
     side: 'stable',
     sourceHead: config.sourceHead,
+    runtimeInput: {
+      ...(config.runtimeInputs?.stable || config.runtimeInput || {}),
+      qualityPhaseClientSlot: config.stablePhaseClientSlot,
+    },
   });
   const candidateRuntime = runtimeFor({
     runtime: config.candidateRuntime,
     runtimeFactory: config.runtimeFactory,
-    runtimeInput: config.runtimeInput,
     store: candidateStore,
     side: 'candidate',
     sourceHead: config.sourceHead,
+    runtimeInput: {
+      ...(config.runtimeInputs?.candidate || config.runtimeInput || {}),
+      qualityPhaseClientSlot: config.candidatePhaseClientSlot,
+    },
   });
   if (stableRuntime === candidateRuntime
     || stableRuntime.store !== stableStore || candidateRuntime.store !== candidateStore
@@ -809,6 +1535,12 @@ export async function prepareQualitySubject(context, subject) {
   };
   assertProductionRuntimeAttestation(stableRuntime, stableAttestation);
   assertProductionRuntimeAttestation(candidateRuntime, candidateAttestation);
+  if (config.stablePhaseClientSlot !== undefined) {
+    assertQualityPhaseClientSlot(stableRuntime, config.stablePhaseClientSlot);
+  }
+  if (config.candidatePhaseClientSlot !== undefined) {
+    assertQualityPhaseClientSlot(candidateRuntime, config.candidatePhaseClientSlot);
+  }
   let candidateLifeAttempt = null;
   if (type === 'life_planning') {
     const roleId = persistedSubject.roleId;
@@ -953,4 +1685,95 @@ export async function executeQualitySubject(context, subject = {}) {
   const stable = await prepared.stableRuntime.releaseExecutor[expectedMethod](stableCall);
   const candidate = await prepared.candidateRuntime.releaseExecutor[expectedMethod](candidateCall);
   return { stable, candidate, authorityId: binding.authorityId };
+}
+
+export async function executeQualitySubjectSide(context, subject = {}, options = {}) {
+  if (!context?.prepared || context.phase !== 'prepared') {
+    throw new Error('quality subject is not prepared');
+  }
+  const binding = CONTEXT_BINDINGS.get(context);
+  if (!binding) throw new Error('quality subject authority binding is missing');
+  const side = options.side;
+  if (side !== 'stable' && side !== 'candidate') throw new Error('quality subject side is invalid');
+  const runtime = side === 'stable' ? context.prepared.stableRuntime : context.prepared.candidateRuntime;
+  const expectedSlot = side === 'stable'
+    ? context.config.stablePhaseClientSlot
+    : context.config.candidatePhaseClientSlot;
+  if (!expectedSlot || options.phaseClientSlot !== expectedSlot) {
+    throw new Error('quality subject phase slot conflict');
+  }
+  assertQualityPhaseClientSlot(runtime, options.phaseClientSlot);
+  rereadPreparedAuthority(context, binding);
+  if (Object.hasOwn(options, 'phaseClient') || Object.hasOwn(options, 'phaseInput')) {
+    throw new Error('quality phase client injection is forbidden');
+  }
+  const phaseBinding = CONTEXT_PHASE_BINDINGS.get(context)?.[side];
+  if (!phaseBinding) {
+    throw new Error('quality phase ledger binding is required');
+  }
+  const phaseInput = qualityPhaseBindingScope(phaseBinding);
+  const expectedPhase = side === 'stable' ? 'stable_execution' : 'candidate_execution';
+  if (phaseInput.phase !== expectedPhase
+    || String(phaseInput.runId) !== String(context.config.runId)
+    || String(phaseInput.finalKey) !== String(context.config.finalKey)
+    || String(phaseInput.subjectChecksum) !== String(binding.semanticInputChecksum)
+    || String(phaseInput.authorityInputChecksum)
+      !== String(side === 'stable' ? binding.stableInputChecksum : binding.candidateInputChecksum)) {
+    throw new Error('quality phase input authority conflict');
+  }
+  // This is intentionally the first operation that can touch the model
+  // client.  bindQualityPhaseClientSlot only performs a read-only lookup and
+  // accepts an exact persisted running phase/input identity.
+  bindQualityPhaseClientSlot(options.phaseClientSlot, phaseBinding);
+  const type = binding.type;
+  const expectedMethod = type === 'turn' ? 'executeTurn' : 'executeLife';
+  if (subject.method && subject.method !== expectedMethod) throw new Error('quality subject method authority conflict');
+  if (subject.authorityId && String(subject.authorityId) !== String(binding.authorityId)) {
+    throw new Error('quality subject authority identity conflict');
+  }
+  const execution = side === 'stable' ? context.prepared.execution : context.prepared.candidateExecution;
+  const release = side === 'stable' ? binding.stableRelease : binding.candidateRelease;
+  const call = {
+    releaseId: release.releaseId,
+    releaseChecksum: release.releaseChecksum,
+    // The composition-installed private router is the only client.  Omit any
+    // legacy execution.client field so CognitivePipeline cannot bypass it.
+    execution: (() => {
+      const { client: _ignoredClient, ...withoutClient } = execution;
+      return withoutClient;
+    })(),
+    dryRun: side === 'candidate',
+  };
+  const value = await runtime.releaseExecutor[expectedMethod](call);
+  // A model call may race a release/turn/LIFE mutation.  The result is never
+  // accepted as phase evidence unless the complete authority rereads cleanly.
+  rereadPreparedAuthority(context, binding);
+  if ((side === 'stable' ? context.config.stablePhaseClientSlot : context.config.candidatePhaseClientSlot)
+    !== options.phaseClientSlot) {
+    throw new Error('quality phase slot authority changed');
+  }
+  return { [side]: value, authorityId: binding.authorityId };
+}
+
+export async function executeQualityEvaluatorSide(config, {
+  side, role = 'brain', input, phaseInput, ledger, options = {}
+} = {}) {
+  assertQualityProductionExecutionConfig(config);
+  if (side !== 'primary' && side !== 'secondary') {
+    throw new Error('quality evaluator side is invalid');
+  }
+  if (typeof input !== 'string' || !input.trim()) {
+    throw new Error('quality evaluator input is required');
+  }
+  const state = QUALITY_PRODUCTION_CONFIG_STATE.get(config);
+  if (!phaseInput || !ledger) throw new Error('quality evaluator phase authority is required');
+  const expectedPhase = side === 'primary' ? 'evaluator_primary' : 'evaluator_secondary';
+  if (phaseInput.phase !== expectedPhase || phaseInput.runId !== config.runId) {
+    throw new Error('quality evaluator phase identity conflict');
+  }
+  const clientConfig = state.materials.clientConfigs[expectedPhase];
+  const underlying = new CodexAppServerClient({ ...clientConfig });
+  const owner = new LedgerBackedModelClient({ ledger, underlying, runId: config.runId });
+  const phaseClient = owner.forPhase(phaseInput);
+  return phaseClient.runRole(role, input, options);
 }

@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 
 import {
+  bindQualityPhaseClientSlot,
+  createQualityPhaseBinding,
+  createQualityPhaseClientSlot,
   LedgerBackedModelClient,
   QualityReplayLedger,
   qualityClientUserMessageId
@@ -36,26 +40,65 @@ function withLedger(run) {
   }
 }
 
+test('public ledger constructor cannot create a production meta row', () => withLedger(({ path }) => {
+  assert.throws(() => new QualityReplayLedger(path, { evidenceClass: 'production' }), /production|private|authority/i);
+  assert.equal(existsSync(path), false);
+}));
+
 function runHeader(overrides = {}) {
   const finalKeys = Array.from({ length: 246 }, (_, index) => `coverage:scene-${index}:0`);
+  const sourceHead = 'a'.repeat(40);
+  const stableRelease = {
+    releaseId: 'stable-r2', pipelineVersion: 'yuqi-lived-agency-v3', presetVersion: '2.0.0',
+    cognitionSchemaVersion: 3, expressionSchemaVersion: 3, evaluatorVersion: 'quality-test',
+    modelProfile: { cognition: 'test', expression: 'test' }, componentManifest: { test: 'stable' },
+    releaseChecksum: 'b'.repeat(64), createdAt: 900, retiredAt: null,
+  };
+  const candidateRelease = {
+    ...stableRelease, releaseId: 'candidate-r3', componentManifest: { test: 'candidate' },
+    releaseChecksum: 'c'.repeat(64),
+  };
+  const attestation = {
+    version: 1, sourceHead,
+    stableRuntime: { sourceHead, adapterIds: { turn: [], life: [] } },
+    candidateRuntime: { sourceHead, adapterIds: { turn: [], life: [] } },
+    evaluatorPrimary: {
+      evaluatorId: 'evaluator-primary', evaluatorVersion: 'quality-test',
+      modelProfileChecksum: '1'.repeat(64), clientConfigChecksum: '2'.repeat(64),
+      sessionNamespaceChecksum: '3'.repeat(64),
+    },
+    evaluatorSecondary: {
+      evaluatorId: 'evaluator-secondary', evaluatorVersion: 'quality-test',
+      modelProfileChecksum: '4'.repeat(64), clientConfigChecksum: '5'.repeat(64),
+      sessionNamespaceChecksum: '6'.repeat(64),
+    },
+  };
   return {
     version: 1,
-    runId: 'run_quality_1',
+    runId: '123e4567-e89b-42d3-a456-426614174000',
     finalKeys,
     planChecksum: contentHash(finalKeys),
-    sourceHead: 'a'.repeat(40),
-    stableRelease: { releaseId: 'stable-r2', releaseChecksum: 'b'.repeat(64) },
-    candidateRelease: { releaseId: 'candidate-r3', releaseChecksum: 'c'.repeat(64) },
-    attestationChecksum: 'd'.repeat(64),
+    sourceHead, stableRelease, candidateRelease, attestation,
+    attestationChecksum: contentHash(attestation),
     artifactPaths: { plan: 'plan.json', ledger: 'quality.sqlite', raw: 'raw.jsonl' },
     createdAt: 1000,
     ...overrides
   };
 }
 
+test('quality ledger meta is immutable and distinguishes fixture evidence', () => withLedger(({ path }) => {
+  const ledger = new QualityReplayLedger(path);
+  assert.deepEqual(ledger.getMeta(), { schemaVersion: 1, evidenceClass: 'fixture' });
+  ledger.close();
+  const db = new DatabaseSync(path, {});
+  db.prepare('UPDATE quality_ledger_meta SET evidence_class=?').run('production');
+  db.close();
+  assert.throws(() => new QualityReplayLedger(path), /meta authority conflict/);
+}));
+
 function phaseInput(overrides = {}) {
   return {
-    runId: 'run_quality_1',
+    runId: '123e4567-e89b-42d3-a456-426614174000',
     finalKey: 'coverage:scene-0:0',
     phase: 'stable_execution',
     subjectChecksum: '1'.repeat(64),
@@ -69,7 +112,7 @@ function phaseInput(overrides = {}) {
 function callInput(overrides = {}) {
   const { request: requestOverride = {}, ...identityOverrides } = overrides;
   const scope = {
-    runId: identityOverrides.runId || 'run_quality_1',
+    runId: identityOverrides.runId || '123e4567-e89b-42d3-a456-426614174000',
     finalKey: identityOverrides.finalKey || 'coverage:scene-0:0',
     phase: identityOverrides.phase || 'stable_execution',
     ordinal: identityOverrides.ordinal ?? 0
@@ -111,6 +154,32 @@ function succeedOwnedPhase(ledger, input, ordinal = 0, baseNow = input.now + 160
   return ledger.succeedPhase(input, { output: { phase: input.phase }, now: baseNow + 3 });
 }
 
+function exactFinalValue(finalKey, finalIndex = 0) {
+  const scores = Object.fromEntries([
+    'socialUnderstanding', 'agency', 'relationshipParticipation',
+    'stateContinuityFlexibility', 'livedExpression', 'actionFactIntegrity'
+  ].map(key => [key, 4]));
+  const output = { version: 1, scores, preference: 'tie', findings: [], unresolved: false };
+  const inputChecksum = '7'.repeat(64);
+  const judgment = id => ({ evaluatorId: id, evaluatorVersion: 'quality-test',
+    inputChecksum, output, outputChecksum: contentHash(output) });
+  const phaseInputChecksum = contentHash({
+    subjectChecksum: '1'.repeat(64), authorityInputChecksum: '2'.repeat(64),
+    input: { subjectType: 'turn', value: 'same' }
+  });
+  return {
+    version: 1, finalKey, subjectType: 'turn', subjectChecksum: '1'.repeat(64),
+    stablePhase: { inputChecksum: phaseInputChecksum,
+      outputChecksum: contentHash({ phase: 'stable_execution' }) },
+    candidatePhase: { inputChecksum: phaseInputChecksum,
+      outputChecksum: contentHash({ phase: 'candidate_execution' }) },
+    blindInputChecksum: inputChecksum, primary: judgment('primary'),
+    secondary: judgment('secondary'),
+    comparison: { version: 1, differences: [], manualReview: false,
+      unresolved: false, agreedCriticalFindings: [] },
+  };
+}
+
 test('run header binds the full plan and reopens only with exact authority', () => withLedger(({ path }) => {
   const invalid = new QualityReplayLedger(path.replace('.sqlite', '-invalid.sqlite'));
   assert.throws(() => invalid.createOrOpenRun(runHeader({
@@ -129,16 +198,16 @@ test('run header binds the full plan and reopens only with exact authority', () 
 
   const reopened = new QualityReplayLedger(path);
   assert.deepEqual(reopened.createOrOpenRun(header), created);
-  assert.throws(() => reopened.createOrOpenRun(runHeader({ sourceHead: 'e'.repeat(40) })), /run header.*conflict/i);
+  assert.throws(() => reopened.createOrOpenRun(runHeader({ sourceHead: 'e'.repeat(40) })), /conflict/i);
   assert.throws(() => reopened.createOrOpenRun(runHeader({
     stableRelease: { releaseId: 'stable-r2', releaseChecksum: 'e'.repeat(64) }
-  })), /run header.*conflict/i);
+  })), /conflict/i);
   assert.throws(() => reopened.createOrOpenRun(runHeader({
     candidateRelease: { releaseId: 'candidate-r4', releaseChecksum: 'c'.repeat(64) }
-  })), /run header.*conflict/i);
+  })), /conflict/i);
   assert.throws(() => reopened.createOrOpenRun(runHeader({
     attestationChecksum: 'e'.repeat(64)
-  })), /run header.*conflict/i);
+  })), /conflict/i);
   assert.throws(() => reopened.createOrOpenRun(runHeader({
     artifactPaths: { plan: 'changed.json', ledger: 'quality.sqlite', raw: 'raw.jsonl' }
   })), /run header.*conflict/i);
@@ -160,7 +229,7 @@ test('restart invariants reject corrupted checksums, call gaps, and incomplete f
     const { file, ledger } = make('phase');
     ledger.preparePhase(phaseInput());
     ledger.db.prepare(`UPDATE quality_phases SET input_json=? WHERE run_id=?`).run(
-      JSON.stringify({ subjectType: 'turn', value: 'tampered' }), 'run_quality_1'
+      JSON.stringify({ subjectType: 'turn', value: 'tampered' }), '123e4567-e89b-42d3-a456-426614174000'
     );
     ledger.close();
     assert.throws(() => new QualityReplayLedger(file), /ledger invariant.*phase/i);
@@ -172,7 +241,7 @@ test('restart invariants reject corrupted checksums, call gaps, and incomplete f
     ledger.startPhase(phaseInput(), { now: 1101 });
     ledger.markPhaseRunning(phaseInput(), { now: 1102 });
     ledger.prepareModelCall(callInput());
-    ledger.db.prepare(`UPDATE quality_model_calls SET ordinal=2 WHERE run_id=?`).run('run_quality_1');
+    ledger.db.prepare(`UPDATE quality_model_calls SET ordinal=2 WHERE run_id=?`).run('123e4567-e89b-42d3-a456-426614174000');
     ledger.close();
     assert.throws(() => new QualityReplayLedger(file), /ledger invariant.*call/i);
   }
@@ -188,7 +257,7 @@ test('restart invariants reject corrupted checksums, call gaps, and incomplete f
       UPDATE quality_model_calls
       SET client_user_message_id=?,request_json=?,request_checksum=?
       WHERE run_id=?
-    `).run('forged_client', JSON.stringify(forged), contentHash(forged), 'run_quality_1');
+    `).run('forged_client', JSON.stringify(forged), contentHash(forged), '123e4567-e89b-42d3-a456-426614174000');
     ledger.close();
     assert.throws(() => new QualityReplayLedger(file), /ledger invariant.*call/i);
   }
@@ -236,14 +305,14 @@ test('restart invariants reject corrupted checksums, call gaps, and incomplete f
       succeedOwnedPhase(ledger, input);
     }
     ledger.finalize({
-      runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
-      value: { decision: 'tie' }, now: 1400
+      runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
+      value: exactFinalValue('coverage:scene-0:0'), now: 1400
     });
     ledger.db.prepare(`
       UPDATE quality_phases
       SET state='failed',output_json=NULL,output_checksum=NULL,error_json=?
       WHERE run_id=? AND phase=?
-    `).run(JSON.stringify({ code: 'tampered' }), 'run_quality_1', 'evaluator_secondary');
+    `).run(JSON.stringify({ code: 'tampered' }), '123e4567-e89b-42d3-a456-426614174000', 'evaluator_secondary');
     ledger.close();
     assert.throws(() => new QualityReplayLedger(file), /ledger invariant.*final/i);
   }
@@ -285,6 +354,8 @@ test('phase state machine survives restart and binds subject plus authority inpu
   })), /phase input.*conflict/i);
   assert.throws(() => ledger.preparePhase({ ...phaseInput(), ignored: true }), /phase input shape.*conflict/i);
   assert.equal(ledger.startPhase(phaseInput(), { now: 1200 }).state, 'starting');
+  assert.equal(ledger.resetStartingPhase(phaseInput(), { now: 1210 }).state, 'prepared');
+  assert.equal(ledger.startPhase(phaseInput(), { now: 1220 }).state, 'starting');
   ledger.close();
   ledger = new QualityReplayLedger(path);
   assert.equal(ledger.markPhaseRunning(phaseInput(), { now: 1250 }).state, 'running');
@@ -402,19 +473,21 @@ test('finalization requires four succeeded phases and is exact on replay', () =>
     ledger.succeedPhase(input, { output: { phase }, now: 1300 });
   }
   const final = ledger.finalize({
-    runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
-    value: { decision: 'manual_review', judgmentChecksums: ['a', 'b'] }, now: 1400
+    runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
+    value: exactFinalValue('coverage:scene-0:0'), now: 1400
   });
   assert.equal(final.state, 'finalized');
   assert.deepEqual(ledger.finalize({
-    runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
-    value: { decision: 'manual_review', judgmentChecksums: ['a', 'b'] }, now: 1400
+    runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
+    value: exactFinalValue('coverage:scene-0:0'), now: 1400
   }), final);
   assert.throws(() => ledger.finalize({
-    runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
-    value: { decision: 'changed' }, now: 1400
+    runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
+    value: { ...exactFinalValue('coverage:scene-0:0'), comparison: { version: 1,
+      differences: ['scores'], manualReview: true, unresolved: false,
+      agreedCriticalFindings: [] } }, now: 1400
   }), /final.*conflict/i);
-  assert.throws(() => ledger.finalizeRun({ runId: 'run_quality_1', now: 1500 }), /246.*final/i);
+  assert.throws(() => ledger.finalizeRun({ runId: '123e4567-e89b-42d3-a456-426614174000', now: 1500 }), /246.*final/i);
   ledger.close();
 }));
 
@@ -436,7 +509,7 @@ test('a run seals only after all 246 finals and 984 owned phases are complete', 
     ledger.finalize({
       runId: header.runId,
       finalKey,
-      value: { decision: 'tie', finalIndex },
+      value: exactFinalValue(finalKey, finalIndex),
       now: baseNow + 190
     });
   }
@@ -474,7 +547,7 @@ test('ledger-backed client maps runRole through runTurn and replays succeeded ne
     },
     async runRole() { throw new Error('runRole bypassed ledger'); }
   };
-  const client = new LedgerBackedModelClient({ ledger, underlying, runId: 'run_quality_1' });
+  const client = new LedgerBackedModelClient({ ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174000' });
   const scoped = client.forPhase(phaseInput());
   const first = await scoped.runRole('expression_v3', { turnId: 't1' }, {
     model: 'gpt-5.6-sol', effort: 'high', outputSchema: { type: 'object' }
@@ -488,6 +561,111 @@ test('ledger-backed client maps runRole through runTurn and replays succeeded ne
   assert.equal(calls.length, callCount);
   assert.equal(calls.some(call => call[0] === 'runRole'), false);
   ledger.close();
+}));
+
+test('unbound phase slots are inert until their exact persisted phase is running', async () => withLedger(async ({ path }) => {
+  const ledger = new QualityReplayLedger(path);
+  ledger.createOrOpenRun(runHeader());
+  const underlying = {
+    async readThread(id) { return { id, turns: [] }; },
+    async ensureThread(role) { return `thr_${role}`; },
+    async runTurn(_role, input, options) {
+      await options.onTurnStarted({ threadId: 'thr_brain', turnId: 'remote_1' });
+      return { threadId: 'thr_brain', turnId: 'remote_1', status: 'completed', text: String(input) };
+    },
+  };
+  const client = new LedgerBackedModelClient({ ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174000' });
+  const raw = phaseInput();
+  const slot = createQualityPhaseClientSlot({
+    runId: raw.runId, finalKey: raw.finalKey, phase: raw.phase, side: 'stable'
+  });
+  assert.throws(() => createQualityPhaseClientSlot({
+    runId: raw.runId, finalKey: raw.finalKey, phase: raw.phase, side: 'evil'
+  }), /slot|side/i);
+  assert.throws(() => createQualityPhaseClientSlot({
+    runId: raw.runId, finalKey: raw.finalKey, phase: 'candidate_execution', side: 'stable'
+  }), /slot|side/i);
+  await assert.rejects(() => slot.runTurn('brain', { hello: 'before' }), /phase slot.*bound|running/i);
+  const phaseRowCount = () => Number(ledger.db.prepare(
+    'SELECT COUNT(*) AS count FROM quality_phases'
+  ).get().count);
+  assert.throws(() => client.forPhase(raw), /persisted|running/i);
+  assert.equal(phaseRowCount(), 0);
+  ledger.preparePhase(raw);
+  const preparedCount = phaseRowCount();
+  assert.throws(() => client.forPhase(raw), /running/i);
+  assert.equal(phaseRowCount(), preparedCount);
+  assert.throws(() => bindQualityPhaseClientSlot(slot, client, raw), /running/i);
+  ledger.startPhase(raw, { now: 1101 });
+  ledger.markPhaseRunning(raw, { now: 1102 });
+  const bound = bindQualityPhaseClientSlot(slot, client, raw);
+  assert.equal(bound, slot);
+  const result = await slot.runTurn('brain', { hello: 'after' });
+  assert.equal(result.text, JSON.stringify({ hello: 'after' }));
+  assert.throws(() => bindQualityPhaseClientSlot(slot, client, raw), /bound|conflict/i);
+  const roleResult = await slot.runRole('expression_v3', { hello: 'role' }, {});
+  assert.equal(roleResult.status, 'completed');
+  ledger.close();
+}));
+
+test('ledger phase runRole preserves production deadline conversion and never calls underlying runRole', async () => withLedger(async ({ path }) => {
+  const ledger = new QualityReplayLedger(path);
+  ledger.createOrOpenRun(runHeader());
+  const calls = [];
+  const underlying = {
+    turnTimeoutMs: 180000,
+    async readThread(id) { return { id, turns: [] }; },
+    async ensureThread(role) { return `thr_${role}`; },
+    async runRole() { throw new Error('underlying runRole bypass'); },
+    async runTurn(role, input, options) {
+      calls.push({ role, input, options });
+      await options.onTurnStarted({ threadId: 'thr_brain', turnId: 'remote_deadline' });
+      return { threadId: 'thr_brain', turnId: 'remote_deadline', status: 'completed', text: String(input) };
+    },
+  };
+  const client = new LedgerBackedModelClient({ ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174000' });
+  const raw = phaseInput();
+  ledger.preparePhase(raw); ledger.startPhase(raw, { now: 1101 }); ledger.markPhaseRunning(raw, { now: 1102 });
+  const scoped = client.forPhase(raw);
+  await scoped.runRole('expression_v3', { hello: 'deadline' }, { deadlineMs: 9000, outerDeadlineMs: 4000 });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].role, 'brain');
+  assert.equal(calls[0].options.turnTimeoutMs, 4000);
+  ledger.close();
+}));
+
+test('foreign ledger identity is rejected before either ledger can record a call', async () => withLedger(async ({ root }) => {
+  const first = new QualityReplayLedger(join(root, 'first.sqlite'));
+  const second = new QualityReplayLedger(join(root, 'second.sqlite'));
+  first.createOrOpenRun(runHeader());
+  second.createOrOpenRun(runHeader());
+  const raw = phaseInput();
+  first.preparePhase(raw); first.startPhase(raw, { now: 1101 }); first.markPhaseRunning(raw, { now: 1102 });
+  second.preparePhase(raw); second.startPhase(raw, { now: 1101 }); second.markPhaseRunning(raw, { now: 1102 });
+  const underlying = {
+    async ensureThread(role) { return `thr_${role}`; },
+    async readThread(id) { return { id, turns: [] }; },
+    async runTurn(role, input, options) {
+      await options.onTurnStarted({ threadId: `thr_${role}`, turnId: 'foreign-turn' });
+      return { threadId: `thr_${role}`, turnId: 'foreign-turn', status: 'completed', text: String(input) };
+    },
+  };
+  const firstClient = new LedgerBackedModelClient({ ledger: first, underlying, runId: raw.runId });
+  const secondClient = new LedgerBackedModelClient({ ledger: second, underlying, runId: raw.runId });
+  const slot = createQualityPhaseClientSlot({
+    runId: raw.runId, finalKey: raw.finalKey, phase: raw.phase, side: 'stable'
+  }, { ledger: first });
+  const foreignCallsBefore = Number(second.db.prepare(
+    'SELECT COUNT(*) AS count FROM quality_model_calls'
+  ).get().count);
+  assert.throws(() => bindQualityPhaseClientSlot(
+    slot, createQualityPhaseBinding(secondClient, raw),
+  ), /ledger identity|conflict/i);
+  assert.equal(Number(second.db.prepare(
+    'SELECT COUNT(*) AS count FROM quality_model_calls'
+  ).get().count), foreignCallsBefore);
+  bindQualityPhaseClientSlot(slot, createQualityPhaseBinding(firstClient, raw));
+  first.close(); second.close();
 }));
 
 function remoteTurn({
@@ -538,7 +716,7 @@ function seedInterruptedCall(ledger, { running = false } = {}) {
   const request = {
     ...requestBasis,
     clientUserMessageId: `quality_${contentHash({
-      runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
+      runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
       phase: 'stable_execution', ordinal: 0,
       requestBasisChecksum: contentHash(requestBasis)
     }).slice(0, 48)}`
@@ -570,7 +748,7 @@ test('a single exact completed remote turn recovers both sides of the awaited st
       ]
     };
     const client = new LedgerBackedModelClient({
-      ledger, underlying: recoveryUnderlying(snapshot, calls), runId: 'run_quality_1'
+      ledger, underlying: recoveryUnderlying(snapshot, calls), runId: '123e4567-e89b-42d3-a456-426614174000'
     });
     const result = await client.forPhase(phaseInput()).runTurn('brain', { turnId: 't1' }, {
       model: 'gpt-5.6-sol', effort: 'high', outputSchema: { type: 'object' }
@@ -579,7 +757,7 @@ test('a single exact completed remote turn recovers both sides of the awaited st
     assert.equal(result.text, 'recovered');
     assert.deepEqual(calls, [['read', 'thr_brain']]);
     assert.equal(ledger.getModelCall({
-      runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
+      runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
       phase: 'stable_execution', ordinal: 0
     }).state, 'succeeded');
     ledger.close();
@@ -619,14 +797,14 @@ test('zero active multiple changed input changed client and conflicting baseline
     const client = new LedgerBackedModelClient({
       ledger,
       underlying: recoveryUnderlying(makeSnapshot(identity.baseline.turns[0], identity), calls),
-      runId: 'run_quality_1'
+      runId: '123e4567-e89b-42d3-a456-426614174000'
     });
     await assert.rejects(() => client.forPhase(phaseInput()).runTurn('brain', { turnId: 't1' }, {
       model: 'gpt-5.6-sol', effort: 'high', outputSchema: { type: 'object' }
     }), /uncertain/i, name);
     assert.deepEqual(calls, [['read', 'thr_brain']], name);
     assert.equal(ledger.getModelCall({
-      runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
+      runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
       phase: 'stable_execution', ordinal: 0
     }).state, 'uncertain', name);
     assert.equal(ledger.createOrOpenRun(runHeader()).state, 'blocked', name);
@@ -636,7 +814,7 @@ test('zero active multiple changed input changed client and conflicting baseline
     const retryCalls = [];
     const replay = new LedgerBackedModelClient({
       ledger, underlying: recoveryUnderlying(makeSnapshot(identity.baseline.turns[0], identity), retryCalls),
-      runId: 'run_quality_1'
+      runId: '123e4567-e89b-42d3-a456-426614174000'
     });
     await assert.rejects(() => replay.forPhase(phaseInput()).runTurn('brain', { turnId: 't1' }, {
       model: 'gpt-5.6-sol', effort: 'high', outputSchema: { type: 'object' }
@@ -661,7 +839,7 @@ test('changed local request is rejected before a succeeded replay or recovery re
       return { threadId: 'thr_brain', turnId: 'remote_1', text: 'done' };
     }
   };
-  const client = new LedgerBackedModelClient({ ledger, underlying, runId: 'run_quality_1' });
+  const client = new LedgerBackedModelClient({ ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174000' });
   await client.forPhase(phaseInput()).runTurn('brain', { turnId: 't1' }, {
     model: 'gpt-5.6-sol', effort: 'high', outputSchema: { type: 'object' }
   });
@@ -700,7 +878,7 @@ test('all production role families share one contiguous ledger ordinal sequence 
     await scoped.runRole('expression_v3', { step: 'repair' }),
     await scoped.runRole('cognition_deep', { step: 'fallback' })
   ];
-  const client = new LedgerBackedModelClient({ ledger, underlying, runId: 'run_quality_1' });
+  const client = new LedgerBackedModelClient({ ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174000' });
   const firstScope = client.forPhase(phaseInput());
   await assert.rejects(() => firstScope.runTurn('repair', { step: 'bypass' }), /unknown.*role/i);
   const first = await sequence(firstScope);
@@ -711,7 +889,7 @@ test('all production role families share one contiguous ledger ordinal sequence 
   const ordinals = ledger.db.prepare(`
     SELECT ordinal,role FROM quality_model_calls
     WHERE run_id=? AND final_key=? AND phase=? ORDER BY ordinal
-  `).all('run_quality_1', 'coverage:scene-0:0', 'stable_execution');
+  `).all('123e4567-e89b-42d3-a456-426614174000', 'coverage:scene-0:0', 'stable_execution');
   assert.deepEqual(ordinals.map(row => Number(row.ordinal)), [0, 1, 2, 3, 4, 5, 6]);
   assert.deepEqual(ordinals.map(row => row.role), [
     'memory', 'brain', 'supervisor', 'memory', 'brain', 'brain', 'memory'
@@ -751,7 +929,7 @@ test('two ledger-backed processes race one starting row but only one may issue t
     }
   };
   const run = ledger => new LedgerBackedModelClient({
-    ledger, underlying, runId: 'run_quality_1'
+    ledger, underlying, runId: '123e4567-e89b-42d3-a456-426614174000'
   }).forPhase(phaseInput()).runTurn('brain', { turnId: 't1' }, {
     model: 'gpt-5.6-sol', effort: 'high', outputSchema: { type: 'object' }
   });
@@ -761,7 +939,7 @@ test('two ledger-backed processes race one starting row but only one may issue t
   assert.equal(settled.filter(item => item.status === 'rejected').length, 1);
   assert.match(settled.find(item => item.status === 'rejected').reason.message, /already starting/i);
   assert.equal(firstLedger.getModelCall({
-    runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
+    runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
     phase: 'stable_execution', ordinal: 0
   }).state, 'succeeded');
   firstLedger.close();
@@ -838,7 +1016,7 @@ test('two operating-system processes CAS the same model-call start to one remote
   assert.deepEqual(readFileSync(counter, 'utf8').trim().split(/\r?\n/), ['remote-start']);
   const ledger = new QualityReplayLedger(path);
   assert.equal(ledger.getModelCall({
-    runId: 'run_quality_1', finalKey: 'coverage:scene-0:0',
+    runId: '123e4567-e89b-42d3-a456-426614174000', finalKey: 'coverage:scene-0:0',
     phase: 'stable_execution', ordinal: 0
   }).state, 'starting');
   ledger.close();

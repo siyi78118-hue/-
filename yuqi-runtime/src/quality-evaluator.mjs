@@ -187,8 +187,9 @@ function identityFreeOutput(value) {
 function normalizeBlindFinding(value) {
   assertClosedKeys(value, FINDING_KEYS, 'blind finding shape');
   if (typeof value.code !== 'string' || !value.code
+    || !/^[A-Z][A-Z0-9_]{0,63}$/.test(value.code)
     || typeof value.severity !== 'string' || !['critical', 'warning', 'info'].includes(value.severity)
-    || typeof value.owner !== 'string' || !value.owner
+    || typeof value.owner !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(value.owner)
     || typeof value.summary !== 'string'
     || typeof value.critical !== 'boolean') {
     throw new Error('blind finding native shape');
@@ -319,6 +320,32 @@ export function normalizeBlindEvaluation(value) {
     preference: value.preference,
     findings: value.findings.map(normalizeBlindFinding),
     unresolved: value.unresolved
+  };
+}
+
+/**
+ * Close the two independent blinded judgments without exposing release-side
+ * identity. Both complete normalized judgments are retained; any semantic
+ * disagreement requires manual review instead of silently selecting a side.
+ */
+export function finalizeBlindJudgments(primary, secondary) {
+  const first = normalizeBlindEvaluation(primary);
+  const second = normalizeBlindEvaluation(secondary);
+  const differences = [];
+  if (contentHash(first.scores) !== contentHash(second.scores)) differences.push('scores');
+  if (first.preference !== second.preference) differences.push('preference');
+  if (first.unresolved !== second.unresolved) differences.push('unresolved');
+  if (contentHash(first.findings) !== contentHash(second.findings)) differences.push('findings');
+  return {
+    version: 1,
+    judgments: [first, second],
+    scores: first.scores,
+    preference: first.preference,
+    unresolved: first.unresolved || second.unresolved,
+    findings: first.findings,
+    normalizedFindings: [first.findings, second.findings],
+    differences,
+    manualReview: differences.length > 0
   };
 }
 

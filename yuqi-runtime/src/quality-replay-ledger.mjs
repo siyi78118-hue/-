@@ -1,8 +1,14 @@
 import { DatabaseSync } from 'node:sqlite';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { dirname, relative, resolve, isAbsolute } from 'node:path';
 
 import { canonicalJson, contentHash } from './protocol.mjs';
 import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { sessionRoleForPipelineRole } from './codex-client.mjs';
+import {
+  assertQualityRunAuthority,
+  qualityRunAuthorityProductionConfig
+} from './quality-replay-production-bridge.mjs';
 
 const PHASES = Object.freeze([
   'stable_execution', 'candidate_execution', 'evaluator_primary', 'evaluator_secondary'
@@ -12,10 +18,23 @@ const MODEL_SESSION_ROLES = new Set(['memory', 'brain', 'supervisor']);
 const SHA256 = /^[a-f0-9]{64}$/;
 const RUN_HEADER_KEYS = Object.freeze([
   'version', 'runId', 'finalKeys', 'planChecksum', 'sourceHead',
-  'stableRelease', 'candidateRelease', 'attestationChecksum', 'artifactPaths', 'createdAt'
+  'stableRelease', 'candidateRelease', 'attestation', 'attestationChecksum', 'artifactPaths', 'createdAt'
 ]);
-const RELEASE_KEYS = Object.freeze(['releaseId', 'releaseChecksum']);
+const RELEASE_KEYS = Object.freeze([
+  'releaseId', 'pipelineVersion', 'presetVersion', 'cognitionSchemaVersion',
+  'expressionSchemaVersion', 'evaluatorVersion', 'modelProfile', 'componentManifest',
+  'releaseChecksum', 'createdAt', 'retiredAt'
+]);
 const ARTIFACT_KEYS = Object.freeze(['plan', 'ledger', 'raw']);
+const ATTESTATION_KEYS = Object.freeze([
+  'version', 'sourceHead', 'stableRuntime', 'candidateRuntime',
+  'evaluatorPrimary', 'evaluatorSecondary'
+]);
+const INTERNAL_PRODUCTION_LEDGER_OPEN = Symbol('internal-production-ledger-open');
+const EVALUATOR_ATTESTATION_KEYS = Object.freeze([
+  'evaluatorId', 'evaluatorVersion', 'modelProfileChecksum',
+  'clientConfigChecksum', 'sessionNamespaceChecksum'
+]);
 const REQUEST_KEYS = Object.freeze([
   'input', 'model', 'effort', 'outputSchema', 'localImagePaths', 'clientUserMessageId'
 ]);
@@ -25,11 +44,22 @@ const REQUEST_BASIS_KEYS = Object.freeze([
 const PHASE_INPUT_KEYS = Object.freeze([
   'runId', 'finalKey', 'phase', 'subjectChecksum', 'authorityInputChecksum', 'input', 'now'
 ]);
+const PHASE_SLOT_KEYS = Object.freeze(['runId', 'finalKey', 'phase', 'side']);
 const CALL_INPUT_KEYS = Object.freeze([
   'runId', 'finalKey', 'phase', 'ordinal', 'role', 'threadId', 'baseline', 'request', 'now'
 ]);
 const LEDGER_SCHEMA_VERSION = 1;
+const QUALITY_PHASE_SLOT_BRAND = new WeakSet();
+const QUALITY_PHASE_SLOT_STATE = new WeakMap();
+const QUALITY_PHASE_BINDING_BRAND = new WeakSet();
+const QUALITY_PHASE_BINDING_STATE = new WeakMap();
+const QUALITY_PHASE_CLIENT_BRAND = new WeakSet();
 const LEDGER_SCHEMA_SQL = `
+  CREATE TABLE quality_ledger_meta(
+    schema_version INTEGER NOT NULL,
+    evidence_class TEXT NOT NULL CHECK(evidence_class IN ('production','fixture')),
+    CHECK(schema_version = 1)
+  );
   CREATE TABLE quality_runs(
     run_id TEXT PRIMARY KEY,
     header_json TEXT NOT NULL,
@@ -96,7 +126,7 @@ const LEDGER_SCHEMA_SQL = `
   );
 `;
 const LEDGER_TABLES = Object.freeze([
-  'quality_finals', 'quality_model_calls', 'quality_phases', 'quality_runs'
+  'quality_finals', 'quality_ledger_meta', 'quality_model_calls', 'quality_phases', 'quality_runs'
 ]);
 let expectedSchemaSql = null;
 const SQLITE_BUSY_WAIT = new Int32Array(new SharedArrayBuffer(4));
@@ -197,7 +227,10 @@ function ensureWalMode(db) {
 function validateRunHeader(header) {
   exactKeys(header, RUN_HEADER_KEYS, 'quality run header shape conflict');
   if (header.version !== 1) throw new Error('quality run header version conflict');
-  nonEmpty(header.runId, 'quality run id conflict');
+  if (typeof header.runId !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(header.runId)) {
+    throw new Error('quality run id conflict');
+  }
   if (!Array.isArray(header.finalKeys) || header.finalKeys.length !== 246
     || header.finalKeys.some(key => typeof key !== 'string' || !key)
     || new Set(header.finalKeys).size !== header.finalKeys.length) {
@@ -212,12 +245,64 @@ function validateRunHeader(header) {
   ]) {
     exactKeys(release, RELEASE_KEYS, `quality run ${name} release shape conflict`);
     nonEmpty(release.releaseId, `quality run ${name} release id conflict`);
+    nonEmpty(release.pipelineVersion, `quality run ${name} pipeline version conflict`);
+    nonEmpty(release.presetVersion, `quality run ${name} preset version conflict`);
+    if (!Number.isSafeInteger(release.cognitionSchemaVersion)
+      || !Number.isSafeInteger(release.expressionSchemaVersion)) {
+      throw new Error(`quality run ${name} schema version conflict`);
+    }
+    nonEmpty(release.evaluatorVersion, `quality run ${name} evaluator version conflict`);
+    if (!isObject(release.modelProfile) || !isObject(release.componentManifest)) {
+      throw new Error(`quality run ${name} manifest conflict`);
+    }
     checksum(release.releaseChecksum, `quality run ${name} release checksum conflict`);
+    nativeInteger(release.createdAt, `quality run ${name} createdAt conflict`);
+    if (release.retiredAt !== null && !Number.isSafeInteger(release.retiredAt)) {
+      throw new Error(`quality run ${name} retiredAt conflict`);
+    }
   }
-  checksum(header.attestationChecksum, 'quality run attestation checksum conflict');
+  exactKeys(header.attestation, ATTESTATION_KEYS, 'quality run attestation shape conflict');
+  if (header.attestation.version !== 1
+    || header.attestation.sourceHead !== header.sourceHead) {
+    throw new Error('quality run attestation identity conflict');
+  }
+  for (const [name, runtime] of [
+    ['stableRuntime', header.attestation.stableRuntime],
+    ['candidateRuntime', header.attestation.candidateRuntime]
+  ]) {
+    if (!isObject(runtime) || runtime.sourceHead !== header.sourceHead) {
+      throw new Error(`quality run ${name} attestation conflict`);
+    }
+  }
+  for (const [name, evaluator] of [
+    ['evaluatorPrimary', header.attestation.evaluatorPrimary],
+    ['evaluatorSecondary', header.attestation.evaluatorSecondary]
+  ]) {
+    exactKeys(evaluator, EVALUATOR_ATTESTATION_KEYS, `quality run ${name} attestation shape conflict`);
+    for (const key of ['evaluatorId', 'evaluatorVersion']) {
+      nonEmpty(evaluator[key], `quality run ${name} attestation ${key} conflict`);
+    }
+    for (const key of ['modelProfileChecksum', 'clientConfigChecksum', 'sessionNamespaceChecksum']) {
+      checksum(evaluator[key], `quality run ${name} attestation ${key} conflict`);
+    }
+  }
+  if (header.attestation.evaluatorPrimary.evaluatorId
+    === header.attestation.evaluatorSecondary.evaluatorId
+    || header.attestation.evaluatorPrimary.sessionNamespaceChecksum
+      === header.attestation.evaluatorSecondary.sessionNamespaceChecksum) {
+    throw new Error('quality evaluator identities must be independent');
+  }
+  if (contentHash(header.attestation) !== header.attestationChecksum) {
+    throw new Error('quality run attestation checksum conflict');
+  }
   exactKeys(header.artifactPaths, ARTIFACT_KEYS, 'quality run artifact paths conflict');
-  Object.values(header.artifactPaths).forEach(value =>
-    nonEmpty(value, 'quality run artifact path conflict'));
+  const artifactValues = Object.values(header.artifactPaths);
+  if (new Set(artifactValues).size !== artifactValues.length
+    || artifactValues.some(value => typeof value !== 'string' || !value
+      || value.includes('\\') || value.startsWith('/') || /^[A-Za-z]:/.test(value)
+      || value.split('/').some(part => !part || part === '.' || part === '..'))) {
+    throw new Error('quality run artifact path conflict');
+  }
   nativeInteger(header.createdAt, 'quality run createdAt conflict');
   return JSON.parse(canonicalJson(header));
 }
@@ -293,6 +378,144 @@ function mapFinal(row) {
     checksum: row.value_checksum,
     finalizedAt: Number(row.finalized_at)
   };
+}
+
+const FINAL_KEYS = Object.freeze([
+  'version', 'finalKey', 'subjectType', 'subjectChecksum',
+  'stablePhase', 'candidatePhase', 'blindInputChecksum',
+  'primary', 'secondary', 'comparison'
+]);
+const FINAL_PHASE_KEYS = Object.freeze(['inputChecksum', 'outputChecksum']);
+const FINAL_JUDGMENT_KEYS = Object.freeze([
+  'evaluatorId', 'evaluatorVersion', 'inputChecksum', 'output', 'outputChecksum'
+]);
+const FINAL_OUTPUT_KEYS = Object.freeze(['version', 'scores', 'preference', 'findings', 'unresolved']);
+const FINAL_COMPARISON_KEYS = Object.freeze([
+  'version', 'differences', 'manualReview', 'unresolved', 'agreedCriticalFindings'
+]);
+const QUALITY_DIMENSIONS = Object.freeze([
+  'socialUnderstanding', 'agency', 'relationshipParticipation',
+  'stateContinuityFlexibility', 'livedExpression', 'actionFactIntegrity'
+]);
+
+function validateFinalFinding(value) {
+  exactKeys(value, ['code', 'severity', 'owner', 'summary', 'critical'], 'quality final finding conflict');
+  if (typeof value.code !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(value.code)) {
+    throw new Error('quality final finding code conflict');
+  }
+  if (typeof value.severity !== 'string' || !['critical', 'warning', 'info'].includes(value.severity)) {
+    throw new Error('quality final finding severity conflict');
+  }
+  if (typeof value.owner !== 'string' || !/^[a-z][a-z0-9-]{0,63}$/.test(value.owner)) {
+    throw new Error('quality final finding owner conflict');
+  }
+  if (typeof value.summary !== 'string' || !value.summary) {
+    throw new Error('quality final finding summary conflict');
+  }
+  if (typeof value.critical !== 'boolean') throw new Error('quality final finding type conflict');
+}
+
+function validateFinalOutput(value) {
+  exactKeys(value, FINAL_OUTPUT_KEYS, 'quality final judgment output conflict');
+  if (value.version !== 1 || !isObject(value.scores) || !Array.isArray(value.findings)
+    || typeof value.unresolved !== 'boolean'
+    || !['A', 'B', 'tie', 'unresolved'].includes(value.preference)) {
+    throw new Error('quality final judgment output conflict');
+  }
+  exactKeys(value.scores, QUALITY_DIMENSIONS, 'quality final scores conflict');
+  for (const dimension of QUALITY_DIMENSIONS) {
+    if (!Number.isSafeInteger(value.scores[dimension]) || value.scores[dimension] < 1
+      || value.scores[dimension] > 5) throw new Error('quality final score type conflict');
+  }
+  value.findings.forEach(validateFinalFinding);
+}
+
+function validateFinalJudgment(value) {
+  exactKeys(value, FINAL_JUDGMENT_KEYS, 'quality final judgment conflict');
+  nonEmpty(value.evaluatorId, 'quality final evaluator id conflict');
+  nonEmpty(value.evaluatorVersion, 'quality final evaluator version conflict');
+  checksum(value.inputChecksum, 'quality final evaluator input checksum conflict');
+  checksum(value.outputChecksum, 'quality final evaluator output checksum conflict');
+  validateFinalOutput(value.output);
+  if (contentHash(value.output) !== value.outputChecksum) {
+    throw new Error('quality final evaluator output checksum conflict');
+  }
+}
+
+function validateFinalValue(value, expectedFinalKey = null, phaseRows = null,
+  strictEvidence = false, evaluatorCalls = null) {
+  exactKeys(value, FINAL_KEYS, 'quality final shape conflict');
+  if (value.version !== 1 || !['turn', 'life_planning'].includes(value.subjectType)
+    || (expectedFinalKey !== null && value.finalKey !== expectedFinalKey)) {
+    throw new Error('quality final identity conflict');
+  }
+  checksum(value.subjectChecksum, 'quality final subject checksum conflict');
+  checksum(value.blindInputChecksum, 'quality final blind input checksum conflict');
+  for (const key of ['stablePhase', 'candidatePhase']) {
+    exactKeys(value[key], FINAL_PHASE_KEYS, `quality final ${key} conflict`);
+    checksum(value[key].inputChecksum, `quality final ${key} input conflict`);
+    checksum(value[key].outputChecksum, `quality final ${key} output conflict`);
+    if (phaseRows?.[key]
+      && (phaseRows[key].inputChecksum !== value[key].inputChecksum
+        || phaseRows[key].outputChecksum !== value[key].outputChecksum
+        || phaseRows[key].subjectChecksum !== value.subjectChecksum)) {
+      throw new Error('quality final phase authority conflict');
+    }
+  }
+  validateFinalJudgment(value.primary);
+  validateFinalJudgment(value.secondary);
+  if (value.primary.evaluatorId === value.secondary.evaluatorId
+    || value.primary.inputChecksum !== value.secondary.inputChecksum) {
+    throw new Error('quality final evaluator independence conflict');
+  }
+  exactKeys(value.comparison, FINAL_COMPARISON_KEYS, 'quality final comparison conflict');
+  if (value.comparison.version !== 1 || typeof value.comparison.manualReview !== 'boolean'
+    || typeof value.comparison.unresolved !== 'boolean'
+    || !Array.isArray(value.comparison.differences)
+    || !Array.isArray(value.comparison.agreedCriticalFindings)) {
+    throw new Error('quality final comparison conflict');
+  }
+  const allowedDifferences = new Set(['scores', 'preference', 'unresolved', 'findings']);
+  if (new Set(value.comparison.differences).size !== value.comparison.differences.length
+    || value.comparison.differences.some(item => !allowedDifferences.has(item))) {
+    throw new Error('quality final comparison difference conflict');
+  }
+  value.comparison.agreedCriticalFindings.forEach(validateFinalFinding);
+  const expectedManual = value.comparison.differences.length > 0
+    || value.primary.output.unresolved || value.secondary.output.unresolved;
+  if (value.comparison.manualReview !== expectedManual
+    || value.comparison.unresolved !== (value.primary.output.unresolved || value.secondary.output.unresolved)) {
+    throw new Error('quality final comparison derivation conflict');
+  }
+  if (strictEvidence) {
+    if (!Array.isArray(evaluatorCalls) || evaluatorCalls.length === 0) {
+      throw new Error('quality final evaluator evidence conflict');
+    }
+    const finalCalls = ['evaluator_primary', 'evaluator_secondary'].map(phase => {
+      const rows = evaluatorCalls.filter(call => call?.phase === phase);
+      return rows.length ? rows[rows.length - 1] : null;
+    });
+    if (finalCalls.some(call => !call)) throw new Error('quality final evaluator evidence conflict');
+    for (const call of finalCalls) {
+      if (!call || call.state !== 'succeeded' || !call.request
+        || typeof call.request.input !== 'string') {
+        throw new Error('quality final evaluator request conflict');
+      }
+      let requestInput;
+      try { requestInput = JSON.parse(call.request.input); } catch {
+        throw new Error('quality final evaluator request conflict');
+      }
+      if (contentHash(requestInput) !== value.blindInputChecksum
+        || call.requestChecksum !== contentHash(call.request)) {
+        throw new Error('quality final evaluator request checksum conflict');
+      }
+    }
+    if (value.primary.inputChecksum !== value.blindInputChecksum
+      || value.secondary.inputChecksum !== value.blindInputChecksum) {
+      throw new Error('quality final blind input authority conflict');
+    }
+  }
+  return JSON.parse(canonicalJson(value));
 }
 
 function phaseIdentity(input) {
@@ -387,6 +610,9 @@ function callIdentity(input) {
 }
 
 function assertLedgerInvariants(db) {
+  const ledgerEvidenceClass = db.prepare(
+    'SELECT evidence_class FROM quality_ledger_meta LIMIT 1'
+  ).get()?.evidence_class || 'fixture';
   const runs = new Map();
   for (const row of db.prepare('SELECT * FROM quality_runs').all()) {
     let header;
@@ -548,6 +774,49 @@ function assertLedgerInvariants(db) {
     const owned = PHASES.map(phase => phases.get(`${row.run_id}\0${row.final_key}\0${phase}`));
     if (!run || !run.header.finalKeys.includes(row.final_key) || value === undefined
       || canonicalJson(value) !== row.value_json || contentHash(value) !== row.value_checksum
+      || (() => {
+        try {
+          const phaseRows = Object.fromEntries(PHASES.map(phase => {
+            const ownedPhase = phases.get(`${row.run_id}\0${row.final_key}\0${phase}`);
+            return [phase === 'stable_execution' ? 'stablePhase'
+              : phase === 'candidate_execution' ? 'candidatePhase' : phase, {
+              subjectChecksum: ownedPhase?.subject_checksum,
+              inputChecksum: ownedPhase?.input_checksum,
+              outputChecksum: ownedPhase?.output_checksum,
+            }];
+          }));
+          const stableRow = phases.get(`${row.run_id}\0${row.final_key}\0stable_execution`);
+          const candidateRow = phases.get(`${row.run_id}\0${row.final_key}\0candidate_execution`);
+          const stableOutput = parse(stableRow?.output_json, undefined);
+          const candidateOutput = parse(candidateRow?.output_json, undefined);
+          if (ledgerEvidenceClass === 'production') {
+            if (stableOutput === undefined || candidateOutput === undefined) {
+              throw new Error('quality production final output missing');
+            }
+            const expectedBlindInput = {
+              version: 1,
+              finalKey: row.final_key,
+              subjectType: value.subjectType,
+              subjectChecksum: value.subjectChecksum,
+              stable: stableOutput,
+              candidate: candidateOutput,
+            };
+            if (value.blindInputChecksum !== contentHash(expectedBlindInput)) {
+              throw new Error('quality production blind input checksum conflict');
+            }
+          }
+          const evaluatorCalls = db.prepare(`
+            SELECT * FROM quality_model_calls
+            WHERE run_id=? AND final_key=? AND phase IN ('evaluator_primary','evaluator_secondary')
+            ORDER BY phase,ordinal
+          `).all(row.run_id, row.final_key).map(mapCall);
+          validateFinalValue(value, row.final_key, phaseRows,
+            ledgerEvidenceClass === 'production', evaluatorCalls);
+          return false;
+        } catch {
+          return true;
+        }
+      })()
       || !Number.isSafeInteger(Number(row.finalized_at))
       || owned.some(phase => Number(phase.updated_at) > Number(row.finalized_at))
       || owned.some(phase => !phase || phase.state !== 'succeeded')) {
@@ -573,17 +842,29 @@ function assertLedgerInvariants(db) {
 }
 
 export class QualityReplayLedger {
-  constructor(filename) {
+  constructor(filename, options = {}) {
+    const { readOnly = false, evidenceClass = 'fixture' } = options;
     if (typeof filename !== 'string' || !filename) throw new Error('quality ledger filename required');
     this.filename = filename;
-    this.db = new DatabaseSync(filename);
+    this.readOnly = readOnly === true;
+    if (evidenceClass !== 'fixture' && evidenceClass !== 'production') {
+      throw new Error('quality ledger evidence class conflict');
+    }
+    if (evidenceClass === 'production' && options[INTERNAL_PRODUCTION_LEDGER_OPEN] !== true) {
+      throw new Error('production ledger requires branded run authority');
+    }
+    this.evidenceClass = evidenceClass;
+    this.db = new DatabaseSync(filename, this.readOnly ? { readOnly: true } : {});
     this.closed = false;
     try {
       this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
-      ensureWalMode(this.db);
+      if (!this.readOnly) ensureWalMode(this.db);
       const version = Number(this.db.prepare('PRAGMA user_version').get().user_version);
       const tables = Object.keys(schemaSql(this.db));
-      if (version === 0 && tables.length === 0) {
+      if (this.readOnly && version === 0 && tables.length === 0) {
+        throw new Error('quality ledger schema missing');
+      }
+      if (!this.readOnly && version === 0 && tables.length === 0) {
         this.db.exec('BEGIN IMMEDIATE');
         try {
           const lockedVersion = Number(this.db.prepare('PRAGMA user_version').get().user_version);
@@ -591,6 +872,9 @@ export class QualityReplayLedger {
           if (lockedVersion === 0 && lockedTables.length === 0) {
             this.db.exec(LEDGER_SCHEMA_SQL);
             this.db.exec(`PRAGMA user_version = ${LEDGER_SCHEMA_VERSION}`);
+            this.db.prepare(`
+              INSERT INTO quality_ledger_meta(schema_version,evidence_class) VALUES (?,?)
+            `).run(1, evidenceClass);
           } else if (lockedVersion !== LEDGER_SCHEMA_VERSION) {
             throw new Error('quality ledger schema conflict');
           }
@@ -603,6 +887,11 @@ export class QualityReplayLedger {
         throw new Error('quality ledger schema conflict');
       }
       assertLedgerSchema(this.db);
+      const metaRows = this.db.prepare('SELECT schema_version,evidence_class FROM quality_ledger_meta').all();
+      if (metaRows.length !== 1 || Number(metaRows[0].schema_version) !== 1
+        || metaRows[0].evidence_class !== evidenceClass) {
+        throw new Error('quality ledger meta authority conflict');
+      }
       assertLedgerInvariants(this.db);
     } catch (error) {
       this.closed = true;
@@ -615,6 +904,11 @@ export class QualityReplayLedger {
     if (this.closed) return;
     this.closed = true;
     this.db.close();
+  }
+
+  getMeta() {
+    const row = this.db.prepare('SELECT schema_version,evidence_class FROM quality_ledger_meta').get();
+    return row ? { schemaVersion: Number(row.schema_version), evidenceClass: row.evidence_class } : null;
   }
 
   immediate(callback) {
@@ -658,6 +952,11 @@ export class QualityReplayLedger {
     return row;
   }
 
+  getRun({ runId } = {}) {
+    nonEmpty(runId, 'quality run id conflict');
+    return mapRun(this.db.prepare('SELECT * FROM quality_runs WHERE run_id=?').get(runId));
+  }
+
   assertRunWritable(runId, { allowBlocked = false } = {}) {
     const row = this.db.prepare('SELECT state FROM quality_runs WHERE run_id=?').get(runId);
     if (!row || (row.state !== 'open' && !(allowBlocked && row.state === 'blocked'))) {
@@ -670,6 +969,14 @@ export class QualityReplayLedger {
     return mapPhase(this.db.prepare(`
       SELECT * FROM quality_phases WHERE run_id=? AND final_key=? AND phase=?
     `).get(runId, finalKey, phase));
+  }
+
+  getFinal({ runId, finalKey }) {
+    nonEmpty(runId, 'quality final run id conflict');
+    nonEmpty(finalKey, 'quality final key conflict');
+    return mapFinal(this.db.prepare(
+      'SELECT * FROM quality_finals WHERE run_id=? AND final_key=?'
+    ).get(runId, finalKey));
   }
 
   preparePhase(rawInput) {
@@ -718,6 +1025,28 @@ export class QualityReplayLedger {
         WHERE run_id=? AND final_key=? AND phase=? AND state='prepared'
       `).run(now, now, input.runId, input.finalKey, input.phase);
       if (Number(result.changes) !== 1) throw new Error('quality phase state conflict');
+      return this.getPhase(input);
+    });
+  }
+
+  resetStartingPhase(rawInput, { now }) {
+    const input = phaseIdentity({ ...rawInput, now: rawInput.now });
+    nativeInteger(now, 'quality phase recovery timestamp conflict');
+    return this.immediate(() => {
+      this.assertRunWritable(input.runId);
+      const existing = this.getPhase(input);
+      if (!existing || existing.inputChecksum !== input.inputChecksum
+        || existing.state !== 'starting') {
+        throw new Error('quality phase recovery state conflict');
+      }
+      const calls = this.listModelCalls(input);
+      if (calls.length !== 0) throw new Error('quality phase starting call claim conflict');
+      if (now < existing.updatedAt) throw new Error('quality phase recovery timestamp conflict');
+      const result = this.db.prepare(`
+        UPDATE quality_phases SET state='prepared',starting_at=NULL,updated_at=?
+        WHERE run_id=? AND final_key=? AND phase=? AND state='starting'
+      `).run(now, input.runId, input.finalKey, input.phase);
+      if (Number(result.changes) !== 1) throw new Error('quality phase recovery state conflict');
       return this.getPhase(input);
     });
   }
@@ -809,6 +1138,17 @@ export class QualityReplayLedger {
       SELECT * FROM quality_model_calls
       WHERE run_id=? AND final_key=? AND phase=? AND ordinal=?
     `).get(runId, finalKey, phase, ordinal));
+  }
+
+  listModelCalls({ runId, finalKey, phase } = {}) {
+    nonEmpty(runId, 'quality model call run id conflict');
+    nonEmpty(finalKey, 'quality model call final key conflict');
+    nonEmpty(phase, 'quality model call phase conflict');
+    if (!PHASE_SET.has(phase)) throw new Error('quality model call phase conflict');
+    return this.db.prepare(`
+      SELECT * FROM quality_model_calls
+      WHERE run_id=? AND final_key=? AND phase=? ORDER BY ordinal
+    `).all(runId, finalKey, phase).map(mapCall);
   }
 
   prepareModelCall(rawInput) {
@@ -950,9 +1290,36 @@ export class QualityReplayLedger {
     nonEmpty(runId, 'quality final run id conflict');
     nonEmpty(finalKey, 'quality final key conflict');
     nativeInteger(now, 'quality final timestamp conflict');
-    if (!isObject(value)) throw new Error('quality final value conflict');
-    const valueJson = canonicalJson(value);
-    const valueChecksum = contentHash(value);
+    const phaseRows = Object.fromEntries(this.db.prepare(`
+      SELECT phase,subject_checksum,input_checksum,output_checksum,output_json
+      FROM quality_phases WHERE run_id=? AND final_key=?
+    `).all(runId, finalKey).map(row => [row.phase === 'stable_execution'
+      ? 'stablePhase' : row.phase === 'candidate_execution' ? 'candidatePhase' : row.phase, {
+      subjectChecksum: row.subject_checksum,
+      inputChecksum: row.input_checksum,
+      outputChecksum: row.output_checksum,
+      output: parse(row.output_json, undefined)
+    }]));
+    const evaluatorCalls = this.db.prepare(`
+      SELECT * FROM quality_model_calls
+      WHERE run_id=? AND final_key=? AND phase IN ('evaluator_primary','evaluator_secondary')
+      ORDER BY phase,ordinal
+    `).all(runId, finalKey).map(mapCall);
+    if (this.evidenceClass === 'production') {
+      const stable = phaseRows.stablePhase?.output;
+      const candidate = phaseRows.candidatePhase?.output;
+      if (stable === undefined || candidate === undefined
+        || value.blindInputChecksum !== contentHash({
+          version: 1, finalKey, subjectType: value.subjectType,
+          subjectChecksum: value.subjectChecksum, stable, candidate
+        })) {
+        throw new Error('quality production blind input checksum conflict');
+      }
+    }
+    const validatedValue = validateFinalValue(value, finalKey, phaseRows,
+      this.evidenceClass === 'production', evaluatorCalls);
+    const valueJson = canonicalJson(validatedValue);
+    const valueChecksum = contentHash(validatedValue);
     return this.immediate(() => {
       this.assertFinalMember(runId, finalKey);
       const existing = mapFinal(this.db.prepare(`
@@ -1030,6 +1397,66 @@ export class QualityReplayLedger {
   }
 }
 
+function resolveProductionLedgerPath(sourceRootDir, configuredPath, actualFilename) {
+  if (typeof sourceRootDir !== 'string' || !sourceRootDir
+    || typeof configuredPath !== 'string' || !configuredPath
+    || configuredPath.includes('\\') || isAbsolute(configuredPath)
+    || configuredPath.split('/').some(part => !part || part === '.' || part === '..')) {
+    throw new Error('production ledger path authority conflict');
+  }
+  const root = realpathSync(sourceRootDir);
+  const privateRoot = resolve(root, 'artifacts/yuqi-lived-agency-v3/private');
+  if (!existsSync(privateRoot) || lstatSync(privateRoot).isSymbolicLink()) {
+    throw new Error('production ledger path authority conflict');
+  }
+  const expected = resolve(root, configuredPath);
+  const privateRelative = relative(privateRoot, expected);
+  if (!privateRelative || privateRelative.startsWith('..') || privateRelative.includes(':')) {
+    throw new Error('production ledger path authority conflict');
+  }
+  const privateReal = realpathSync(privateRoot);
+  const checkPath = target => {
+    const targetRelative = relative(privateRoot, target);
+    if (!targetRelative || targetRelative.startsWith('..') || targetRelative.includes(':')) {
+      throw new Error('production ledger path authority conflict');
+    }
+    let cursor = privateRoot;
+    for (const part of targetRelative.split(/[\\/]/)) {
+      cursor = `${cursor}/${part}`;
+      if (!existsSync(cursor)) break;
+      const stat = lstatSync(cursor);
+      if (stat.isSymbolicLink()) throw new Error('production ledger path authority conflict');
+      const real = realpathSync(cursor);
+      const realRelative = relative(privateReal, real);
+      if (realRelative.startsWith('..') || realRelative.includes(':')) {
+        throw new Error('production ledger path authority conflict');
+      }
+    }
+  };
+  checkPath(expected);
+  const actual = isAbsolute(String(actualFilename))
+    ? resolve(String(actualFilename)) : resolve(root, String(actualFilename));
+  if (resolve(actual) !== resolve(expected)) {
+    throw new Error('production ledger path authority conflict');
+  }
+  checkPath(actual);
+  return expected;
+}
+
+/** Open production evidence only from the bridge's branded run authority. */
+export function openProductionQualityReplayLedger({
+  filename, runAuthority, readOnly = false, sourceRootDir = process.cwd()
+} = {}) {
+  assertQualityRunAuthority(runAuthority);
+  const config = qualityRunAuthorityProductionConfig(runAuthority);
+  resolveProductionLedgerPath(sourceRootDir, config.ledgerPath, filename);
+  return new QualityReplayLedger(filename, {
+    readOnly: readOnly === true,
+    evidenceClass: 'production',
+    [INTERNAL_PRODUCTION_LEDGER_OPEN]: true,
+  });
+}
+
 function deterministicClientId(scope, ordinal, requestBasis) {
   return qualityClientUserMessageId({ ...scope, ordinal }, requestBasis);
 }
@@ -1067,6 +1494,7 @@ class LedgerPhaseModelClient {
     this.owner = owner;
     this.scope = scope;
     this.ordinal = 0;
+    QUALITY_PHASE_CLIENT_BRAND.add(this);
   }
 
   runTurn(role, input, options = {}) {
@@ -1077,7 +1505,14 @@ class LedgerPhaseModelClient {
     const mapped = sessionRoleForPipelineRole(role);
     if (!mapped) return Promise.reject(new Error(`unknown pipeline role: ${role}`));
     const { deadlineMs, outerDeadlineMs, ...turnOptions } = options;
-    return this.runMappedTurn(mapped, payload, turnOptions);
+    const defaultTurnTimeoutMs = Number(this.owner.underlying.turnTimeoutMs) || 180_000;
+    return this.runMappedTurn(mapped, payload, {
+      ...turnOptions,
+      turnTimeoutMs: Math.max(1, Math.min(
+        Number(deadlineMs) || defaultTurnTimeoutMs,
+        Number(outerDeadlineMs) || Number.MAX_SAFE_INTEGER
+      )),
+    });
   }
 
   async runMappedTurn(role, input, options) {
@@ -1087,21 +1522,175 @@ class LedgerPhaseModelClient {
   }
 }
 
+export function isLedgerBackedPhaseClient(value) {
+  return QUALITY_PHASE_CLIENT_BRAND.has(value);
+}
+
+export function qualityPhaseClientLedger(value) {
+  if (!QUALITY_PHASE_CLIENT_BRAND.has(value)) throw new Error('quality phase client is not authentic');
+  return value.owner.ledger;
+}
+
+export function qualityPhaseClientScope(value) {
+  if (!QUALITY_PHASE_CLIENT_BRAND.has(value)) throw new Error('quality phase client is not authentic');
+  return Object.freeze({ ...value.scope });
+}
+
+class QualityPhaseClientSlot {
+  constructor(identity, ledger = null) {
+    this.identity = Object.freeze({
+      runId: String(identity.runId), finalKey: String(identity.finalKey),
+      phase: String(identity.phase), side: String(identity.side),
+    });
+    QUALITY_PHASE_SLOT_BRAND.add(this);
+    QUALITY_PHASE_SLOT_STATE.set(this, { bound: null, ledger });
+    Object.freeze(this);
+  }
+
+  runTurn(...args) {
+    const state = QUALITY_PHASE_SLOT_STATE.get(this);
+    if (!state?.bound) return Promise.reject(new Error('quality phase slot is not bound to a running phase'));
+    return state.bound.runTurn(...args);
+  }
+
+  runRole(...args) {
+    const state = QUALITY_PHASE_SLOT_STATE.get(this);
+    if (!state?.bound) return Promise.reject(new Error('quality phase slot is not bound to a running phase'));
+    return state.bound.runRole(...args);
+  }
+}
+
+function assertPhaseSlotIdentity(slot, rawScope) {
+  if (!QUALITY_PHASE_SLOT_BRAND.has(slot) || !rawScope
+    || slot.identity.runId !== String(rawScope.runId)
+    || slot.identity.finalKey !== String(rawScope.finalKey)
+    || slot.identity.phase !== String(rawScope.phase)) {
+    throw new Error('quality phase slot identity conflict');
+  }
+}
+
+export function createQualityPhaseClientSlot(identity = {}, options = null) {
+  exactKeys(identity, PHASE_SLOT_KEYS, 'quality phase slot identity shape conflict');
+  if (options != null) exactKeys(options, ['ledger'], 'quality phase slot options shape conflict');
+  if (options?.ledger != null && !(options.ledger instanceof QualityReplayLedger)) {
+    throw new Error('quality phase slot ledger identity is invalid');
+  }
+  if (!identity.runId || !identity.finalKey || !identity.phase
+    || (identity.side !== 'stable' && identity.side !== 'candidate')) {
+    throw new Error('quality phase slot identity required');
+  }
+  const expectedPhase = identity.side === 'stable' ? 'stable_execution' : 'candidate_execution';
+  if (identity.phase !== expectedPhase) throw new Error('quality phase slot side conflict');
+  return new QualityPhaseClientSlot(identity, options?.ledger || null);
+}
+
+export function isQualityPhaseClientSlot(value) {
+  return QUALITY_PHASE_SLOT_BRAND.has(value);
+}
+
+export function qualityPhaseClientSlotHasLedger(slot) {
+  return QUALITY_PHASE_SLOT_BRAND.has(slot)
+    && QUALITY_PHASE_SLOT_STATE.get(slot)?.ledger instanceof QualityReplayLedger;
+}
+
+export function assertQualityPhaseClientSlotBinding(slot, binding) {
+  if (!QUALITY_PHASE_SLOT_BRAND.has(slot) || !QUALITY_PHASE_BINDING_BRAND.has(binding)) {
+    throw new Error('quality phase ledger identity conflict');
+  }
+  const slotState = QUALITY_PHASE_SLOT_STATE.get(slot);
+  const bindingStateValue = QUALITY_PHASE_BINDING_STATE.get(binding);
+  if (!(slotState?.ledger instanceof QualityReplayLedger)
+    || slotState.ledger !== bindingStateValue?.ledger) {
+    throw new Error('quality phase ledger identity conflict');
+  }
+  return true;
+}
+
+export function createQualityPhaseBinding(client, rawScope) {
+  if (!(client instanceof LedgerBackedModelClient)) throw new Error('quality phase binding client conflict');
+  const scope = phaseIdentity(rawScope);
+  const binding = Object.freeze({});
+  QUALITY_PHASE_BINDING_BRAND.add(binding);
+  QUALITY_PHASE_BINDING_STATE.set(binding, {
+    client, scope: Object.freeze({ ...rawScope }), ledger: client.ledger,
+  });
+  return binding;
+}
+
+export function isQualityPhaseBinding(value) {
+  return QUALITY_PHASE_BINDING_BRAND.has(value);
+}
+
+function bindingState(binding) {
+  if (!QUALITY_PHASE_BINDING_BRAND.has(binding)) throw new Error('quality phase binding is not authentic');
+  return QUALITY_PHASE_BINDING_STATE.get(binding);
+}
+
+export function qualityPhaseBindingScope(binding) {
+  const state = bindingState(binding);
+  return { ...state.scope };
+}
+
+export function bindQualityPhaseClientSlot(slot, clientOrBinding, rawScope = null) {
+  let client = clientOrBinding;
+  let scope = rawScope;
+  if (QUALITY_PHASE_BINDING_BRAND.has(clientOrBinding)) {
+    const bound = bindingState(clientOrBinding);
+    client = bound.client;
+    scope = bound.scope;
+  }
+  assertPhaseSlotIdentity(slot, scope);
+  if (!(client instanceof LedgerBackedModelClient)) throw new Error('quality phase slot client conflict');
+  if (slot.identity.side === 'stable' && scope.phase !== 'stable_execution') {
+    throw new Error('quality phase slot side conflict');
+  }
+  if (slot.identity.side === 'candidate' && scope.phase !== 'candidate_execution') {
+    throw new Error('quality phase slot side conflict');
+  }
+  const state = QUALITY_PHASE_SLOT_STATE.get(slot);
+  if (state.ledger && state.ledger !== client.ledger) {
+    throw new Error('quality phase ledger identity conflict');
+  }
+  const phase = client.ledger.getPhase(scope);
+  if (!phase || phase.state !== 'running') throw new Error('quality phase slot requires a running phase');
+  if (state.bound) throw new Error('quality phase slot is already bound');
+  state.bound = client.forPhase(scope);
+  state.ledger = client.ledger;
+  return slot;
+}
+
+export function createQualityPhaseClientRouter(slot) {
+  if (!QUALITY_PHASE_SLOT_BRAND.has(slot)) throw new Error('quality phase slot is not authentic');
+  const router = Object.freeze({
+    runTurn: (...args) => slot.runTurn(...args),
+    runRole: (...args) => slot.runRole(...args),
+  });
+  return router;
+}
+
 export class LedgerBackedModelClient {
-  constructor({ ledger, underlying, runId }) {
+  constructor({ ledger, underlying, runId, now = () => Date.now() }) {
     if (!(ledger instanceof QualityReplayLedger) || !underlying) {
       throw new Error('quality ledger model client dependencies required');
     }
     this.ledger = ledger;
     this.underlying = underlying;
     this.runId = nonEmpty(runId, 'quality ledger model client run id conflict');
+    if (typeof now !== 'function') throw new Error('quality ledger model client clock conflict');
+    this.now = now;
   }
 
   forPhase(rawScope) {
     const phase = phaseIdentity(rawScope);
     if (phase.runId !== this.runId) throw new Error('quality phase run conflict');
-    const stored = this.ledger.preparePhase(rawScope);
+    // Binding is deliberately read-only.  A caller must prepare/start the
+    // persisted phase through the ledger lifecycle before a model client can
+    // be attached; probing an absent or non-running phase must never create a
+    // row as a side effect.
+    const stored = this.ledger.getPhase(rawScope);
+    if (!stored) throw new Error('quality phase is not persisted');
     if (stored.inputChecksum !== phase.inputChecksum) throw new Error('quality phase input conflict');
+    if (stored.state !== 'running') throw new Error('quality phase is not running');
     return new LedgerPhaseModelClient(this, {
       runId: phase.runId,
       finalKey: phase.finalKey,
@@ -1130,9 +1719,9 @@ export class LedgerBackedModelClient {
       const output = outputFromRecoveredTurn(row.threadId, exact[0]);
       if (!output) throw new Error('REMOTE_RESULT_UNPROVABLE');
       if (row.state === 'starting') {
-        this.ledger.markModelCallRunning(identity, { turnId: exact[0].id, now: Date.now() });
+        this.ledger.markModelCallRunning(identity, { turnId: exact[0].id, now: this.now() });
       }
-      this.ledger.succeedModelCall(identity, { output, now: Date.now() });
+      this.ledger.succeedModelCall(identity, { output, now: this.now() });
       return output;
     } catch (error) {
       const current = this.ledger.getModelCall(identity);
@@ -1143,7 +1732,7 @@ export class LedgerBackedModelClient {
               ? String(error.message)
               : 'REMOTE_RESULT_UNPROVABLE'
           },
-          now: Date.now()
+          now: this.now()
         });
       }
       throw new Error('quality model call is uncertain');
@@ -1181,7 +1770,7 @@ export class LedgerBackedModelClient {
     const threadId = await this.underlying.ensureThread(role);
     const baseline = await this.underlying.readThread(threadId);
     const identity = {
-      ...key, role, threadId, baseline, request, now: Date.now()
+      ...key, role, threadId, baseline, request, now: this.now()
     };
     const claim = this.ledger.claimModelCallStart(identity);
     if (!claim.claimed) {
@@ -1198,20 +1787,20 @@ export class LedgerBackedModelClient {
         clientUserMessageId,
         onTurnStarted: async started => {
           this.ledger.markModelCallRunning(identity, {
-            turnId: started.turnId, now: Date.now()
+            turnId: started.turnId, now: this.now()
           });
           await options.onTurnStarted?.(started);
         }
       });
-      this.ledger.succeedModelCall(identity, { output: result, now: Date.now() });
+      this.ledger.succeedModelCall(identity, { output: result, now: this.now() });
       return result;
     } catch (error) {
       const current = this.ledger.getModelCall(key);
       const detail = { name: error?.name || 'Error', message: String(error?.message || error) };
       if (current && current.state === 'running' && error?.status && error.status !== 'timeout') {
-        this.ledger.failModelCall(identity, { error: detail, now: Date.now() });
+        this.ledger.failModelCall(identity, { error: detail, now: this.now() });
       } else if (current && ['starting', 'running'].includes(current.state)) {
-        this.ledger.markModelCallUncertain(identity, { reason: detail, now: Date.now() });
+        this.ledger.markModelCallUncertain(identity, { reason: detail, now: this.now() });
       }
       throw error;
     }
