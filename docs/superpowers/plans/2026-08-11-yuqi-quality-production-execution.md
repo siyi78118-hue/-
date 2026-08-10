@@ -120,8 +120,10 @@ git commit -m "refactor: share canonical release execution authority"
 - Create: `yuqi-runtime/src/life-planning-authority.mjs`
 - Create: `yuqi-runtime/test/life-planning-authority.test.mjs`
 - Modify: `yuqi-runtime/src/runtime-composition.mjs`
+- Modify: `yuqi-runtime/src/orchestrator.mjs`
 - Modify: `yuqi-runtime/src/promotion-controller.mjs`
 - Modify: `yuqi-runtime/src/store.mjs`
+- Test: `yuqi-runtime/test/orchestrator.test.mjs`
 - Test: `yuqi-runtime/test/runtime-composition.test.mjs`
 - Test: `yuqi-runtime/test/promotion-controller.test.mjs`
 - Test: `yuqi-runtime/test/life-planning-attempt.test.mjs`
@@ -132,6 +134,8 @@ git commit -m "refactor: share canonical release execution authority"
 - [ ] **Step 1: Write real-store bridge red tests**
 
 Materialize one common subject seed through production APIs, close it, then byte-clone it into independent temporary v15 databases and use real `composeYuqiExecutionRuntime()` on each clone. For turn subjects assert `accept in seed -> clone -> persisted stable pin check -> buildCanonicalReleaseExecution -> executeTurn`. For life subjects assert `putLifePlan in seed -> contextFor in each clone -> createLifePlanningAttempt -> buildLifePlanningReleaseExecution -> executeLife` and zero turn execution.
+
+The turn materializer must consume the exact Task 1 compiled semantic input. It must persist every prior user/assistant message through production store APIs, preserve typed batch items and system events in a closed scene projection, derive the current batch from the final user batch before `candidate_response`, and project `context`, `stateCheckpoint`, and `structuredActionTargets` into the same production scene/trigger/state inputs used by the ordinary runtime. It must not replace them with fixture comments, moments, motives, generic text, or any other synthesized semantic substitute. Deterministic protocol identities may derive from `(runId, finalKey, ordinal)` and the compiled semantic input, but semantic facts and targets may not be invented.
 
 Cover all eight frozen life finals. The deterministic context episode must use the exact feature type/text/message ID and a transcript derived from the scene; it ends before `anchorAt`, contains no annotation/evaluator/release data, and is byte-identical—including lifecycle timestamps—across the two clones.
 
@@ -144,6 +148,8 @@ Write red tests proving a feature text/payload/reference mutation changes `conte
 - [ ] **Step 3: Write release-pin and isolation red tests**
 
 Derive authority IDs from `(runId, finalKey, ordinal)` with no side. Assert stable/candidate authority input checksums match while stores, lanes, attempts, sessions, and clients differ. After `accept()`, re-read the turn and require the frozen stable release ID/checksum. Before candidate execution require the exact candidate row installed by `putPipelineReleaseInternal()`. Wrong/missing release, changed plan input, wrong method, attachment, or foreign authority must fail before the model client.
+
+`buildCanonicalReleaseExecution()` must return an explicit closed canonical input checksum covering the persisted turn, envelope, complete current batch, scene, agency/state view, route decision, and release pins. The quality bridge must consume that field directly; it may not fall back to hashing an arbitrary execution object, `turn.contentHash`, or an attempt snapshot. The bridge separately binds its deterministic quality authority ID and compiled semantic-input checksum. Before either side executes, raw and self-consistent mutations of every covered persisted component must be rejected before a model call.
 
 - [ ] **Step 4: Write unforgeable-attestation red tests**
 
@@ -160,18 +166,20 @@ Plain objects, cloned/frozen attestations, subclassed executors, changed release
 - [ ] **Step 5: Verify red**
 
 ```powershell
-node --test yuqi-runtime/test/life-planning-authority.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/test/runtime-composition.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs
+node --test yuqi-runtime/test/life-planning-authority.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/test/runtime-composition.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs
 ```
 
 - [ ] **Step 6: Implement bridge and attestation**
 
 Install the frozen candidate definition only in temporary stores. Do not register/promote/activate it. The persisted subject remains stable-authoritative and candidate execution is a dry-run comparison with `{visible:false, actions:false}`.
 
+Validate the subject with native types and exact closed kind sets, and bind the exact frozen plan identity/checksum. For LIFE, require `planningWindow.startAt === candidate_response.at` and the frozen twelve-hour end, and derive the closed transcript field deterministically from the scene turns. For turns, prove in tests that every formal input component is observable in the production execution/model request and that no fixed `quality fixture` semantic value is present. Caller-supplied pre-opened clone stores or aliased database paths must not bypass the close-and-byte-clone origin proof.
+
 - [ ] **Step 7: Run and commit**
 
 ```powershell
-node --test yuqi-runtime/test/life-planning-authority.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/test/runtime-composition.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs
-git add yuqi-runtime/src/life-planning-authority.mjs yuqi-runtime/test/life-planning-authority.test.mjs yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/src/quality-replay-production-bridge.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/src/runtime-composition.mjs yuqi-runtime/test/runtime-composition.test.mjs
+node --test yuqi-runtime/test/life-planning-authority.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/test/runtime-composition.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs
+git add yuqi-runtime/src/life-planning-authority.mjs yuqi-runtime/test/life-planning-authority.test.mjs yuqi-runtime/src/orchestrator.mjs yuqi-runtime/test/orchestrator.test.mjs yuqi-runtime/src/promotion-controller.mjs yuqi-runtime/src/store.mjs yuqi-runtime/test/promotion-controller.test.mjs yuqi-runtime/test/life-planning-attempt.test.mjs yuqi-runtime/test/store-release-authority-v14.test.mjs yuqi-runtime/src/quality-replay-production-bridge.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/src/runtime-composition.mjs yuqi-runtime/test/runtime-composition.test.mjs
 git commit -m "feat: add isolated Yuqi production quality bridge"
 ```
 
