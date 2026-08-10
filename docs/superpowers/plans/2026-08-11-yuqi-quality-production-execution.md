@@ -184,6 +184,7 @@ git commit -m "feat: add isolated Yuqi production quality bridge"
 - Create: `yuqi-runtime/test/quality-replay-ledger.test.mjs`
 - Modify: `yuqi-runtime/src/codex-client.mjs`
 - Test: `yuqi-runtime/test/codex-client.test.mjs`
+- Test fixture: `yuqi-runtime/test/fixtures/fake-app-server.mjs`
 
 **Produces:** `QualityReplayLedger`, `LedgerBackedModelClient`, `CodexAppServerClient.readThread()`, and an awaited `onTurnStarted` hook.
 
@@ -225,7 +226,7 @@ Create closed `quality_runs`, `quality_phases`, `quality_model_calls`, and `qual
 
 ```powershell
 node --test yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/test/codex-client.test.mjs
-git add yuqi-runtime/src/quality-replay-ledger.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/src/codex-client.mjs yuqi-runtime/test/codex-client.test.mjs
+git add yuqi-runtime/src/quality-replay-ledger.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/src/codex-client.mjs yuqi-runtime/test/codex-client.test.mjs yuqi-runtime/test/fixtures/fake-app-server.mjs
 git commit -m "feat: persist restart-safe Yuqi quality calls"
 ```
 
