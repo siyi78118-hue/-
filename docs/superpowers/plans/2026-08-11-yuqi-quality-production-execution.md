@@ -254,9 +254,39 @@ git commit -m "feat: persist restart-safe Yuqi quality calls"
 - Modify: `yuqi-runtime/src/runtime-composition.mjs`
 - Test: `yuqi-runtime/test/runtime-composition.test.mjs`
 
-**Produces:** `finalizeBlindJudgments(primary, secondary)`, ledger-driven `runQualityReplayPlan()`, module-branded phase-client slots, and a single-side production execution API.
+**Produces:** `finalizeBlindJudgments(primary, secondary)`, a run-level branded production execution authority, ledger-driven `runQualityReplayPlan()`, module-branded phase-client slots, and a single-side production execution API.
 
 The four-file JSON-ledger implementation attempted before this amendment is not acceptable evidence. Task 5 uses the Task 4 SQLite ledger as its sole state authority and the Task 3 branded stores/runtimes as its sole execution authority. Do not preserve or add a second JSON phase/final state machine.
+
+#### Run-level production execution authority (mandatory boundary)
+
+Task 5 owns one immutable run authority, not a caller-supplied collection of per-final callbacks. The authority is created only after source/release/artifact preflight and binds one UUID run to the ordered 246 `finalKeys`, the exact plan checksum, clean source head, complete stable/candidate release snapshots and manifest checksums, runtime/evaluator attestations, private artifact paths, and the SQLite ledger identity. Its public descriptor contains data-only identity fields; its operational state is held in module-private `WeakMap` storage and its object is marked by a module-private `WeakSet`. A copied, frozen, subclassed, proxied, or structurally identical object is invalid.
+
+The production consumer accepts only:
+
+```js
+runQualityReplayPlan({
+  plan,
+  ledgerPath,
+  runAuthority,
+  selector: { onlyFinalKey: null | finalKey },
+  resumeRun: null | runId
+})
+```
+
+It must reject `callback`, `subjectFactory`, `phaseExecutor`, `evaluator`, `evaluatorSecondary`, `createStore`, `runtimeFactory`, `runtime`, `client`, `executor`, `slot`, and any unknown option before opening the ledger or creating a runtime/client. The runner receives only `runAuthority`, `item`, and the current phase identity; it never receives a generic callback or a mutable runtime field.
+
+Task 7 may pass only local data materials—fixed paths, the reviewed plan/history paths, candidate preset/release input, runtime configuration path, and fixed client configuration. The bridge must internally open v15 `YuqiStore` instances, byte-clone the seed, call `composeYuqiExecutionRuntime()`, create the real `ReleaseExecutor`, and create the four Task 4 `LedgerBackedModelClient` lanes. Task 7 must not construct stores, runtimes, clients, executors, or slots and pass them into production.
+
+For each final, the bridge creates exactly two fresh **unbound runtime slots** before composing the independent stable/candidate runtimes. Those slots have the exact `(runId,finalKey,stable_execution|candidate_execution,side)` identity and the same SQLite ledger identity, and they are passed immutably into the matching runtime at composition. Only after the matching phase row is atomically `running` does the bridge create that phase's `LedgerBackedModelClient` binding and bind the already-composed slot exactly once. The evaluator phases do not use runtime slots: after each evaluator phase becomes `running`, the bridge creates a distinct ledger-backed phase client from its fixed primary/secondary underlying-client authority and calls that phase client directly. The result is two runtime slots but four distinct phase clients/bindings, all on the same ledger/run/final and with distinct phase, session, thread, and client identities. Slot/binding identity, ledger ownership, and phase input checksum are retained only in private `WeakMap`s. There is no setter, swap, try/finally mutation, or public current-client field.
+
+The bridge alone constructs the blind evaluator input from the persisted stable/candidate phase outputs. The exact serialized blind input is sent through the corresponding evaluator slot; the model-call request checksum, judgment input checksum, final blind-input checksum, and persisted phase-output checksums must be equal by derivation. Turn uses `turn_output`; LIFE uses only the closed `life_plan` projection and rubric. A caller cannot supply evaluator input or evaluator callback.
+
+`only-final-key` is an execution selector only. It never changes the header's 246-key set or plan identity, and a partial run cannot be finalized or exported as production evidence. `runAuthority` creation, ledger header creation, runtime/client creation, and export all fail closed on any identity drift.
+
+The test fixture path is separate. Every Task 5 SQLite database has an immutable one-row `quality_ledger_meta` authority with exact `{schemaVersion,evidenceClass}`; `evidenceClass` is exactly `production|fixture`, is fixed before any run row is inserted, and is validated on every open. Only the branded run-authority path may create `production`; the callback fixture API can create only `fixture` and is additionally branded `evidenceEligible:false`. A fixture database cannot create a production header/attestation, cannot be opened by the production exporter/readiness validator, and cannot share a production ledger path. Changing, deleting, duplicating, or self-consistently recreating the meta row fails reopen. JSONL is an atomic export of validated SQLite rows only; it is never a state source, append log, resume source, or substitute ledger.
+
+Task 5's ten files are sufficient for the consumer, brand, and bridge boundary. Task 7 may add only `scripts/yuqi-quality-production-execution-config.mjs`, its test, and the private-artifact ignore rule; it may construct the run authority from data materials but may not add a production callback or injection seam. No extra Task 5 production file is authorized.
 
 - [ ] **Step 1: Write judgment-closure red tests**
 
@@ -271,8 +301,11 @@ Implement and test:
 - `--resume-run <runId>` required for continuation;
 - `--only-final-key <finalKey>` selects exactly one member of the full bound plan;
 - missing, duplicate, unknown, or valueless options reject; production `--max-items` is forbidden;
+- production rejects every callback/object injection and accepts only the branded run authority;
 - missing, duplicate, changed-plan, changed-source, changed-release, changed-attestation, changed-artifact, and finalized/blocked run resumes reject as applicable;
 - removing the selector resumes all remaining finals in the same run.
+
+The red tests must attempt a plain descriptor, a spread/frozen clone, a proxy/subclass, a callback-bearing module, and a test-only fixture marker as `runAuthority`; each must fail before ledger creation, runtime construction, or model-client construction. A valid authority with a changed plan, stale source head, changed release/manifest, changed attestation, duplicate slot identity, or escaped private artifact path must fail at the same preflight boundary.
 
 The immutable SQLite header has exact native keys `{version,runId,finalKeys,planChecksum,sourceHead,stableRelease,candidateRelease,attestation,attestationChecksum,artifactPaths,createdAt}`. `version` is the exact supported integer, `runId` is a UUID string, `finalKeys` is the ordered 246-key unique array, checksums are lowercase SHA-256 strings, and `createdAt` is a non-negative safe integer.
 
@@ -280,11 +313,13 @@ Each release snapshot has exact keys `{releaseId,pipelineVersion,presetVersion,c
 
 `attestation` has exact keys `{version,sourceHead,stableRuntime,candidateRuntime,evaluatorPrimary,evaluatorSecondary}`. Each runtime entry is the exact closed value returned by `assertProductionRuntimeAttestation()`. Each evaluator entry has exact keys `{evaluatorId,evaluatorVersion,modelProfileChecksum,clientConfigChecksum,sessionNamespaceChecksum}`; evaluator identities and namespace checksums must differ. `attestationChecksum === contentHash(attestation)` is recomputed on every open. `artifactPaths` has exact keys `{plan,ledger,raw}`; values are distinct project-root-relative forward-slash paths with no drive, leading slash, backslash, empty segment, `.` or `..`, and their resolved locations must stay under the fixed ignored private artifact root. The database header checksum is canonical `contentHash(header)` and every nested checksum is rederived, never trusted from a caller.
 
-A pilot selector never changes that header. Header drift rejects before temporary runtime or model-client creation.
+A pilot selector never changes that header. Before any ledger write or runtime/client creation, preflight must re-read the clean source head, exact release rows and manifests, attestation inputs, and realpath-checked private artifact paths. Header drift rejects before temporary runtime or model-client creation. The header may not synthesize release rows, manifests, runtime entries, or evaluator checksums from caller data.
 
 - [ ] **Step 3: Write phase-resume red tests**
 
 Interrupt in `prepared`, `starting`, and `running`, immediately before and after the awaited `onTurnStarted`, and immediately before and after call/phase completion. Restart with the same SQLite ledger and prove completed phases/subcalls do not increase app-server counters. A persisted `starting`/`running` call accepts only the one exact completed new remote turn; zero, active, multiple, changed-input, changed-client-ID, or conflicting candidates become `uncertain`. `uncertain` is never auto-reissued and atomically blocks the final and whole run.
+
+The recovery matrix must include: `prepared` with zero calls resumes; `starting` with zero calls is atomically returned to `prepared`; `starting` with a claimed call is resolved through Task 4 recovery; an orphaned `running` phase is never blindly re-entered; deterministic bridge validation is `failed`; remote ambiguity is `uncertain`; and a finalized/blocked run is never reopened for writes. Every case closes and reopens SQLite, checks raw row checksums, and asserts no new app-server request in the succeeded/no-call path.
 
 Add an additive Task 3 interface:
 
@@ -295,11 +330,11 @@ executeQualitySubjectSide(context, subject, {
 })
 ```
 
-`prepareQualitySubject()` still creates the common seed and independent byte clones, but stable and candidate execution are separate phase calls. The runner must never call combined `executeQualitySubject()` as production evidence. Each runtime is composed initially with its own module-branded, unbound phase-client slot supplied through the existing runtime factory boundary. After the matching ledger phase reaches `running`, the slot binds exactly once to `LedgerBackedModelClient.forPhase()`. Before binding, after conflicting rebinding, or when shared across side/final/phase it rejects. The runtime's store, release, authority snapshot, source head, adapter registry, release executor, client identity, and attestation are revalidated immediately before and after the selected side executes. No public runtime/client field is mutated.
+`prepareQualitySubject()` still creates the common seed and independent byte clones, but stable and candidate execution are separate phase calls. The runner must never call combined `executeQualitySubject()` as production evidence. Each runtime is composed internally by the bridge with its own module-branded, unbound phase-client slot; no caller-supplied `createStore` or `runtimeFactory` is accepted on the production path. After the matching ledger phase reaches `running`, the slot binds exactly once to `LedgerBackedModelClient.forPhase()`. Before binding, after conflicting rebinding, or when shared across side/final/phase it rejects. The runtime's store, release, authority snapshot, source head, adapter registry, release executor, client identity, and attestation are revalidated immediately before and after the selected side executes. No public runtime/client field is mutated.
 
-The exact construction order is: create two distinct module-private unbound slots before `prepareQualitySubject()`; pass the matching slot as an immutable input to `composeYuqiExecutionRuntime()`; store its identity only in module-private runtime metadata/WeakMap; build and freeze the runtime; atomically advance the SQLite phase to `running`; bind that one slot to the exact `(runId,finalKey,side phase,inputChecksum)`; execute once. `runtime-composition.mjs` exposes a narrow identity assertion for the bridge, not the slot or mutable setter. Bind-before-running, run-before-bind, duplicate/conflicting bind, and cross-side/final/phase reuse reject.
+The exact construction order is: complete source/release/artifact and runtime-configuration preflight without creating a ledger/runtime/client; internally create the temporary seed/runtime material needed to derive and verify the two real runtime attestations, close it on any failure, then create the run-level authority; open/create the `production` SQLite meta row and immutable run header; for each selected final create the two unbound ledger-owned stable/candidate slots; prepare the subject and independent byte clones and compose both runtimes with those slots; atomically move only the current phase to `running`; create its exact ledger-backed phase binding and, for execution phases, bind the pre-existing slot to `(runId,finalKey,phase,inputChecksum)`; execute once; close/reopen and revalidate. Evaluator phases create no runtime slot and use their direct primary/secondary phase clients only after `running`. `runtime-composition.mjs` exposes a narrow identity assertion for the bridge, not the slot or mutable setter. Bind-before-running, run-before-bind, duplicate/conflicting bind, and cross-side/final/phase reuse reject.
 
-The production CLI cannot accept caller `stableRuntime`, `candidateRuntime`, `runtimeFactory`, `runtimeInput`, store, executor, or slot objects. Only the later module-branded `createQualityReplayExecutionConfig()` may supply the fixed composition factory and four clients. Tests use a separate explicitly test-only factory that is always `evidenceEligible:false` and cannot satisfy a production run header/attestation.
+The production CLI cannot accept caller `stableRuntime`, `candidateRuntime`, `runtimeFactory`, `runtimeInput`, store, executor, client, or slot objects. The later Task 7 module-branded factory supplies only data-material paths/configuration and returns the run-level authority; the bridge creates all runtime/client/slot objects internally. Tests use a separate explicitly test-only factory that is always `evidenceEligible:false`, writes only the fixture SQLite marker, and cannot satisfy a production run header/attestation.
 
 Task 4's ledger client gains a module-private branded phase slot and preserves the exact production `deadlineMs`/`outerDeadlineMs` to `turnTimeoutMs` calculation in `runRole()`. `forPhase()` is executable only for a persisted `running` phase; nested calls keep deterministic ordinals starting at zero per phase and never call an underlying `runRole()` bypass.
 
@@ -315,7 +350,7 @@ node --test yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quali
 stable_execution -> candidate_execution -> evaluator_primary -> evaluator_secondary -> final
 ```
 
-Each phase uses its own `LedgerBackedModelClient`. Export artifacts only from ledger rows; never append partial duplicate records.
+Each phase uses its own `LedgerBackedModelClient`. The production runner never accepts a generic phase client factory. Export artifacts only from a read-only SQLite row projection after the run is finalized; never append partial duplicate records or export a selected/blocked/open run.
 
 For every selected final:
 
@@ -326,6 +361,7 @@ For every selected final:
 5. persist the complete phase output before any later phase starts;
 6. stop after failure and block after uncertainty;
 7. after both evaluator phases, call `finalizeBlindJudgments()` and persist one closed final object containing the two complete judgment records, their checksums, differences, manual-review/unresolved state, and stable/candidate/blind-input authority checksums.
+8. after all selected work is complete, call `finalizeRun()` only when all 246 final rows, all 984 phase rows, all evaluator judgment rows, and every model-call ownership/ordinal/checksum join are complete. A selector run remains open and is never exported as production evidence.
 
 `quality_finals.value_json` has exact keys `{version,finalKey,subjectType,subjectChecksum,stablePhase,candidatePhase,blindInputChecksum,primary,secondary,comparison}`. `subjectType` is exactly `turn|life_planning`; each execution phase has exact `{inputChecksum,outputChecksum}`. Each judgment record has exact `{evaluatorId,evaluatorVersion,inputChecksum,output,outputChecksum}`. `output` is the exact normalized blind object `{version,scores,preference,findings,unresolved}`: scores have every fixed dimension exactly once with native integers 1..5; preference is exactly `A|B|tie|unresolved`; unresolved is a native boolean; each finding is exact `{code,severity,owner,summary,critical}` with the existing native closed enums/types. Judgment metadata and evaluator input/output may not contain release, side, phase, model, session, prompt, client, thread, or attestation fields.
 
@@ -334,6 +370,14 @@ For every selected final:
 Phase/client mapping is fixed: `stable_execution` uses only the stable runtime/slot; `candidate_execution` uses only the candidate runtime/slot; `evaluator_primary` and `evaluator_secondary` use two other independent ledger-backed evaluator clients, session namespaces, and threads and never a release runtime. Turn evaluator input uses only the closed `turn_output` union. LIFE evaluator input uses only `life_plan`, the planning window, LIFE rubric, and closed transcript summary; it excludes episode IDs, release/side/phase/model/session/prompt/attestation and never enters turn comparison/action logic.
 
 A `failed` phase is terminal for that run and is never implicitly reissued by `--resume-run`; later phases for that final do not start. Continuing it requires an explicitly new `runId` after the underlying cause is fixed. An `uncertain` call/phase additionally changes the current run to blocked. Exact succeeded phases replay locally.
+
+Restart recovery is explicit: `prepared` remains call-free; `starting` is rolled back to a retryable prepared boundary only when no remote call was claimed; `running` is resolved through Task 4 thread/read and exact baseline/clientUserMessageId/request matching. Exactly one completed remote turn may be recovered; zero, active, multiple, changed, or conflicting results become `uncertain`, block the run, and are never reissued. A deterministic validation failure becomes `failed`, not `uncertain`; no later phase starts. Every recovery transition is an immediate SQLite transaction and is revalidated on reopen.
+
+### Task 5 stop gate and migration rule
+
+The existing dirty Task 5B implementation is migrated as follows: preserve the Task 4 SQLite schema/CAS, branded `LedgerBackedModelClient`/phase-slot primitives, Task 3 production bridge, LIFE/turn method dispatch, and exact final-value validator; delete or make test-only the public generic callback runner, compatibility header/release synthesis, callback-backed `createQualityProductionContextFactory(callback/createStore)` pseudo-brand, caller `createStore`/`runtimeFactory` path, and any JSON append/resume state. Preserve fixture tests only after they use the separate fixture SQLite marker and prove `evidenceEligible:false`; no fixture row may be accepted by production export/readiness.
+
+Before Task 5 is considered complete, TDD must show: forged run authority rejected; every injection key rejected before ledger/runtime/client creation; stale source/release/attestation/path rejected; exactly two distinct pre-composition runtime slots plus four distinct running-phase clients/bindings per final and no public mutation; evaluator phases create no runtime slot; real bridge-owned blind input/request checksum closure; prepared/starting/running crash recovery; failed versus uncertain semantics; selector header preservation; fixture/production meta-row corruption and cross-open rejection; partial/open/blocked export rejection; finalized 246/984/variable-call joins; and read-only deterministic export. The stop gate is the focused Task 5 suite plus `node --check` for all ten files and `git diff --check`; no real model call, production DB mutation, or Task 7 CLI run is permitted at this step.
 
 - [ ] **Step 6: Run and commit**
 
