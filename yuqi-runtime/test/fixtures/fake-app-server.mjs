@@ -4,6 +4,7 @@ import { createInterface } from 'node:readline';
 const logFile = process.env.FAKE_APP_SERVER_LOG || '';
 let threadCounter = 0;
 let turnCounter = 0;
+const threads = new Map();
 
 function write(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -26,6 +27,7 @@ input.on('line', line => {
   }
   if (message.method === 'thread/start') {
     const id = `thr_new_${++threadCounter}`;
+    threads.set(id, []);
     write({ id: message.id, result: { thread: { id, status: { type: 'idle' } } } });
     write({ method: 'thread/started', params: { thread: { id, status: { type: 'idle' } } } });
     return;
@@ -42,10 +44,43 @@ input.on('line', line => {
     write({ id: message.id, result: { thread: { id: message.params.threadId, status: { type: 'idle' } } } });
     return;
   }
+  if (message.method === 'thread/read') {
+    const storedTurns = threads.get(message.params.threadId);
+    write({
+      id: message.id,
+      result: {
+        thread: {
+          id: message.params.threadId,
+          status: { type: 'idle' },
+          turns: message.params.includeTurns === true
+            ? (storedTurns || [{ id: 'turn_existing_1', status: 'completed', items: [], error: null }])
+            : []
+        }
+      }
+    });
+    return;
+  }
   if (message.method === 'turn/start') {
     const turnId = `turn_fake_${++turnCounter}`;
     const text = message.params.input?.find(item => item.type === 'text')?.text || '';
     const output = text.includes('find evidence') ? '{"query":"promise"}' : `reply:${text}`;
+    const completedTurn = {
+      id: turnId,
+      status: 'completed',
+      error: null,
+      items: [
+        {
+          id: `user_${turnId}`,
+          type: 'userMessage',
+          clientId: message.params.clientUserMessageId,
+          content: message.params.input
+        },
+        { id: `item_${turnId}`, type: 'agentMessage', text: output }
+      ]
+    };
+    const storedTurns = threads.get(message.params.threadId) || [];
+    storedTurns.push(completedTurn);
+    threads.set(message.params.threadId, storedTurns);
     write({ id: message.id, result: { turn: { id: turnId, status: 'inProgress', items: [], error: null } } });
     write({ method: 'item/agentMessage/delta', params: { threadId: 'unrelated', turnId: 'turn_other', itemId: 'item_other', delta: 'ignore' } });
     write({ method: 'item/agentMessage/delta', params: { threadId: message.params.threadId, turnId, itemId: `item_${turnId}`, delta: output.slice(0, 5) } });

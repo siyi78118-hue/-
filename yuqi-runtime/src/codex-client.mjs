@@ -13,6 +13,10 @@ const PIPELINE_ROLE_THREADS = Object.freeze({
   consolidation_v3: 'memory'
 });
 
+export function sessionRoleForPipelineRole(role) {
+  return PIPELINE_ROLE_THREADS[String(role || '')] || null;
+}
+
 export class CodexProtocolError extends Error {
   constructor(message, details = null) {
     super(message);
@@ -281,6 +285,23 @@ export class CodexAppServerClient {
     return threadId;
   }
 
+  async readThread(threadId, { includeTurns = true } = {}) {
+    const normalizedThreadId = String(threadId || '').trim();
+    if (!normalizedThreadId || typeof includeTurns !== 'boolean') {
+      throw new Error('Codex thread read input is invalid');
+    }
+    await this.start();
+    const result = await this.request('thread/read', {
+      threadId: normalizedThreadId,
+      includeTurns
+    });
+    if (!result?.thread || result.thread.id !== normalizedThreadId
+      || (includeTurns && !Array.isArray(result.thread.turns))) {
+      throw new CodexProtocolError('thread/read returned an invalid thread snapshot');
+    }
+    return result.thread;
+  }
+
   runTurn(role, input, options = {}) {
     if (!ROLES.has(role)) return Promise.reject(new Error(`unknown Codex role: ${role}`));
     const before = this.roleQueues.get(role) || Promise.resolve();
@@ -293,7 +314,7 @@ export class CodexAppServerClient {
   }
 
   runRole(role, payload, options = {}) {
-    const sessionRole = PIPELINE_ROLE_THREADS[String(role || '')];
+    const sessionRole = sessionRoleForPipelineRole(role);
     if (!sessionRole) return Promise.reject(new Error(`unknown pipeline role: ${role}`));
     const { deadlineMs, outerDeadlineMs, ...turnOptions } = options;
     return this.runTurn(sessionRole, payload, {
@@ -319,9 +340,10 @@ export class CodexAppServerClient {
         .filter(Boolean)
     )];
     const threadId = await this.ensureThread(role);
+    const clientUserMessageId = options.clientUserMessageId || `yuqi_${role}_${randomUUID()}`;
     const result = await this.request('turn/start', {
       threadId,
-      clientUserMessageId: options.clientUserMessageId || `yuqi_${role}_${randomUUID()}`,
+      clientUserMessageId,
       input: [
         { type: 'text', text },
         ...localImagePaths.map(path => ({ type: 'localImage', path }))
@@ -334,6 +356,12 @@ export class CodexAppServerClient {
     const turnId = result?.turn?.id;
     if (!turnId) throw new CodexProtocolError('turn/start returned no turn id');
     this.store?.incrementSessionTurnCount?.(role);
+    if (options.onTurnStarted !== undefined) {
+      if (typeof options.onTurnStarted !== 'function') {
+        throw new Error('onTurnStarted must be a function');
+      }
+      await options.onTurnStarted({ threadId, turnId, clientUserMessageId });
+    }
     const key = `${threadId}:${turnId}`;
 
     const early = this.earlyCompletions.get(key);

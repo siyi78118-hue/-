@@ -208,3 +208,51 @@ test('memory schema remains valid for strict structured output after nested fiel
 
   assertEveryObjectRequiresEveryProperty(started.params.outputSchema, 'memory');
 }));
+
+test('reads a complete thread snapshot with turns for restart recovery', async () => fixture(async ({ client, logFile }) => {
+  const thread = await client.readThread('thr_recovery');
+  assert.equal(thread.id, 'thr_recovery');
+  assert.deepEqual(thread.turns.map(turn => turn.id), ['turn_existing_1']);
+  const read = protocolLines(logFile).find(item => item.method === 'thread/read');
+  assert.deepEqual(read.params, { threadId: 'thr_recovery', includeTurns: true });
+}));
+
+test('awaits onTurnStarted before installing completion handling', async () => fixture(async ({ client }) => {
+  const events = [];
+  const result = await client.runTurn('brain', 'hooked', {
+    clientUserMessageId: 'client_hooked_1',
+    async onTurnStarted(started) {
+      events.push(['hook-start', started]);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      events.push(['hook-finish', started.turnId]);
+    }
+  });
+  events.push(['result', result.turnId]);
+  assert.deepEqual(events, [
+    ['hook-start', {
+      threadId: 'thr_new_1',
+      turnId: 'turn_fake_1',
+      clientUserMessageId: 'client_hooked_1'
+    }],
+    ['hook-finish', 'turn_fake_1'],
+    ['result', 'turn_fake_1']
+  ]);
+}));
+
+test('thread read exposes the exact persisted client provenance and prompt after a completed turn', async () => fixture(async ({ client }) => {
+  const result = await client.runTurn('brain', { turnId: 'quality-fixture' }, {
+    clientUserMessageId: 'quality_client_1',
+    outputSchema: { type: 'object', properties: {}, required: [], additionalProperties: false }
+  });
+  const thread = await client.readThread(result.threadId);
+  assert.equal(thread.turns.length, 1);
+  assert.equal(thread.turns[0].id, result.turnId);
+  assert.equal(thread.turns[0].status, 'completed');
+  assert.deepEqual(thread.turns[0].items[0], {
+    id: `user_${result.turnId}`,
+    type: 'userMessage',
+    clientId: 'quality_client_1',
+    content: [{ type: 'text', text: JSON.stringify({ turnId: 'quality-fixture' }) }]
+  });
+  assert.equal(thread.turns[0].items.at(-1).type, 'agentMessage');
+}));
