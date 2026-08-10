@@ -8920,6 +8920,13 @@ Across the 72 coverage scenes, the compiler enforces these minimums: `DIRECT_REP
 
 - [ ] **Step 5: Extract verified candidates, then label 30 local real-history scenes without committing private content**
 
+This extractor is an optional supplemental real-history source, not a mandatory
+prerequisite for the default quality gate. Task 25F later replaces the missing
+private-history hard dependency with 30 tracked, source-grounded human-annotation
+scenes. Private history, when genuinely available, may still be supplied through
+the explicit `--history` and `--history-manifest` overrides, but absence of that
+optional private dataset must not block compilation of the tracked annotation gate.
+
 The extractor takes an explicit absolute `--database` path to a frozen PC v15
 authority snapshot. Raw v0/v10/v13/v14 (or any version below v15) input fails
 closed before output and is never migrated; the extractor must not invent
@@ -9246,22 +9253,21 @@ Commit `source-grounding-index.json` as a privacy-safe deterministic object with
 exactly `{schemaVersion,sentinels}`. `schemaVersion` is native integer `1` and
 `sentinels` is an object with exactly the 24 expected sentinel scene IDs; each
 value is the closed object
-`{file,heading,headingChecksum,sceneChecksum}`. Both checksums are lowercase
-SHA-256: `headingChecksum` commits the exact normalized heading, while
-`sceneChecksum` commits the full canonical sentinel seed (including its source
-annotation and variants), so a valid heading cannot be reused for substituted
-scene content. Unknown/duplicate/missing scene mappings, duplicate scene IDs,
-or any mismatch among the scene source annotation, heading commitment, and
-scene checksum is fatal. It must not contain quoted private chat or annotation
-bodies. The compiler always validates every sentinel and all 72 derived
-coverage scenes through their parent sentinel against this committed index.
-When a private source Markdown is present locally it additionally verifies the
-document heading; when it is absent, clean-checkout compilation still succeeds
-from the committed commitments without weakening the scene-to-source binding.
-Tests must cover absent private sources, wrong heading/checksum, substituted
-scene content, missing/extra/duplicate mapping, and a coverage scene with the
-wrong parent. No committed test or script may require the untracked
-`真人聊天训练批注-第四轮-交接.md` file.
+`{file,heading,headingChecksum,sourceDocSha256,sectionChecksum,sceneChecksum}`.
+All checksums are lowercase SHA-256. They commit the normalized heading, the
+complete tracked source document, the exact Markdown section, and the full
+canonical sentinel seed respectively. A repeated source section is legal only
+when its document and section commitments are byte-identical; sentinel scene IDs
+and scene checksums remain unique. Unknown/duplicate/missing scene mappings,
+duplicate scene IDs, changed section text, or any mismatch among the scene source
+annotation and these commitments is fatal. The index contains no quoted private
+chat or annotation bodies. The compiler always validates every sentinel and all
+72 derived coverage scenes through their parent sentinel against the tracked
+source document and committed index. Tests cover wrong heading/document/section
+checksums, substituted scene content, missing/extra mapping, explicit repeated
+section commitments, and a coverage scene with the wrong parent. The tracked
+`真人聊天训练批注-第四轮-交接.md` is a methodology source for existing sentinels;
+its unfinished suggested questions are not counted as completed annotation cases.
 
 The materialized report embeds `candidateRelease` with every
 `pipeline_releases` field (`releaseId`, `pipelineVersion`, `presetVersion`,
@@ -10702,10 +10708,11 @@ worktree. First generate and validate the candidate/quality identity:
 
 ```powershell
 npm run cognition:quality:check
+npm run cognition:quality:annotations
 npm run cognition:replay
 npm run cognition:replay-report
-npm run cognition:quality:replay -- --stable-from artifacts/yuqi-lived-agency-v3/baseline.json --candidate-preset 2.1.0
-npm run cognition:quality:report -- --out artifacts/yuqi-lived-agency-v3/quality-report.json
+npm run cognition:quality:replay -- --execute --execution-config <absolute-closed-evaluator-config> --stable-from artifacts/yuqi-lived-agency-v3/baseline.json --candidate-preset 2.1.0 --plan-out artifacts/yuqi-lived-agency-v3/quality-replay-plan.json --replay-out artifacts/yuqi-lived-agency-v3/quality-replay.jsonl
+npm run cognition:quality:report -- --plan artifacts/yuqi-lived-agency-v3/quality-replay-plan.json --candidate-release <absolute-candidate-release-json> --replay-artifact artifacts/yuqi-lived-agency-v3/quality-replay.jsonl --manual-review-artifact <absolute-completed-manual-review-jsonl> --out artifacts/yuqi-lived-agency-v3/quality-report.json
 ```
 
 Before real candidate use begins, create the immutable collection start control
@@ -10734,6 +10741,119 @@ is attached, quality is not eligible, real candidate visible-path samples are
 missing, migration validation differs, a race
 fails, or Android fallback fails, readiness must say `ready=false` and stop
 before versioning or publishing.
+
+### Task 25F: Replace the Missing Private-History Prerequisite With Tracked Human Annotations
+
+**Files:**
+- Track: `preset-references/真人聊天训练批注-第四轮-交接.md`
+- Create: `tests/fixtures/yuqi-lived-quality-v1/task25f-history-source-index.json`
+- Create: `tests/fixtures/yuqi-lived-quality-v1/preset-history-scenes.jsonl`
+- Create: `tests/fixtures/yuqi-lived-quality-v1/preset-history-scenes.manifest.json`
+- Create: `scripts/compile-yuqi-preset-history-scenes.mjs`
+- Create: `tests/yuqi-preset-history-scenes.test.mjs`
+- Modify: `scripts/compile-yuqi-lived-quality-scenes.mjs`
+- Modify: `scripts/run-yuqi-lived-quality-replay.mjs`
+- Modify: `scripts/report-yuqi-lived-quality.mjs`
+- Modify: `scripts/cognition-rollout.mjs`
+- Modify: `scripts/verify-yuqi-v3-readiness.mjs`
+- Create: `tests/cognition-rollout-quality-boundary.test.mjs`
+- Modify: `yuqi-runtime/test/promotion-controller.test.mjs`
+- Modify: `tests/yuqi-v3-readiness.test.mjs`
+- Modify: `yuqi-runtime/test/quality-report.test.mjs`
+- Modify: `tests/yuqi-lived-quality-contract.test.mjs`
+- Modify: `tests/fixtures/yuqi-lived-quality-v1/source-grounding-index.json`
+- Modify: `tests/fixtures/yuqi-lived-quality-v1/manifest.json`
+- Modify: `package.json`
+
+**Authority correction:**
+
+The user-supplied first- and second-round annotation documents are the authority
+for 30 additional human-experience regression scenes. They replace the erroneous
+mandatory dependency on a missing private SQLite/history-label export. The 30
+scenes are not described as real production chats, live-shadow data or independent
+generalization proof. They are `tracked_human_annotations`: deterministic offline
+regression inputs. The scenes alone are not release evidence. Actual stable and
+candidate model executions, two blind evaluators and completed manual review may
+satisfy the offline-quality prerequisite, but production promotion still reads its
+72-hour live-shadow counts only from store-owned production comparisons. No replay
+or annotation row can increment or replace that gate.
+
+The 30 entries use 30 unique completed annotation headings that are not already
+used by the 24 sentinels. Each entry binds the tracked source file SHA-256, exact
+Markdown section SHA-256 and scene-definition checksum. No entry contains an
+accepted assistant answer, reply template or expected response. The fourth-round
+handoff remains tracked because existing sentinels cite its methodology, but its
+unfinished suggested questions are not counted as completed human annotations in
+the new 30-scene layer.
+
+- [ ] **Step 1: Record red source, count, independence and no-template tests**
+
+Require exactly 30 unique scene IDs and 30 unique `(file, heading)` tuples. Reject
+missing or changed source documents, changed headings/sections/index commitments,
+self-consistent scene+manifest substitution, duplicate sentinel/coverage source
+headings, and any reply-template field.
+
+- [ ] **Step 2: Compile and commit deterministic annotation artifacts**
+
+`compile-yuqi-preset-history-scenes.mjs` materializes objective user/time/state
+inputs separately from evaluator-only attention requirements, allowed decision
+ranges and forbidden failure patterns. `compileSceneExecutionInput()` must not
+expose focus, annotation scenarios, must-notice rules, forbidden patterns or an
+accepted answer to either candidate. Only an objective proactive trigger may enter
+candidate context.
+It writes the existing three-key history manifest shape for replay-plan
+compatibility. The default replay/report loaders recompute the tracked annotations
+and require byte-equivalent semantic artifacts. Reports carry the closed
+`evidenceBoundary`: default tracked annotations are offline model-evaluation input,
+never real-history or live-shadow evidence. Explicit history paths remain an
+exploratory override, are labelled `explicit_history_override`, and are rejected by
+formal readiness and production rollout until a future extractor-provenance schema
+is implemented.
+
+The production promotion path is stricter than the report compiler: promotion must
+load `quality-report.json` together with the fixed same-directory
+`quality-replay-plan.json`, `quality-replay.jsonl`, and
+`quality-manual-review.jsonl`. The loader verifies all three raw SHA-256 fields,
+the single `runId`, candidate/source/provenance bindings, the tracked default plan,
+and every `finalKey` execution checksum recomputed as
+`contentHash(compileSceneExecutionInput(planItem.scene))`. It then derives
+`qualityGate`, `manualReview`, and `eligible` from those raw rows and compares them
+canonically with the report; caller-supplied summary values cannot replace this
+derivation. Only the object returned by the successful raw loader is accepted by
+the exported summary function (a module-private validated-bundle marker rejects
+hand-built lookalikes). Missing, changed, or self-consistent forged raw artifacts
+are authority conflicts and must produce zero promotion writes.
+
+Before `promote` opens the writable runtime store or writes a report/rollout,
+the CLI performs a source-authority preflight. It reads the report's
+`sourceHead` and `replayProvenance.sourceHead`, obtains `git rev-parse HEAD`,
+and requires the two values to be the same full commit. Git status is run with
+the scoped evidence-directory exclusion used by the formal runner
+(`gitStatusArgsForEvidence`); only the fixed report/raw directory under
+`artifacts/yuqi-lived-agency-v3/` may be dirty or untracked. Any modified or
+untracked path outside that directory, an evidence path escape, stale
+self-consistent report/raw re-materialization, or a missing source identity
+fails closed before any database open/write. Evidence files remain allowed to
+be created during the run, but they cannot hide source changes. The command
+runner is a module-level test-only dependency; CLI options cannot replace or
+bypass this preflight. Tests cover stale recomputed bundles, dirty outside
+evidence, allowed evidence-only dirt, zero DB writes on rejection, and a
+current-HEAD pass.
+
+- [ ] **Step 3: Prove the corrected quality gate**
+
+```powershell
+npm run cognition:quality:annotations
+node --test tests/yuqi-preset-history-scenes.test.mjs tests/yuqi-lived-quality-contract.test.mjs tests/cognition-rollout-quality-boundary.test.mjs tests/yuqi-v3-readiness.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/quality-report.test.mjs
+node --test yuqi-runtime/test/promotion-controller.test.mjs
+npm.cmd test
+git diff --check
+```
+
+Expected: tracked annotation compilation and plan creation succeed in a clean
+checkout without `artifacts/yuqi-lived-agency-v3/private/`; changing source text or
+derived artifacts fails closed; a plan-only run remains `eligible=false` until
+real model execution and manual review are supplied.
 
 ### Task 26: Select an Unused Android Version and Publish a Matching Signed OTA
 

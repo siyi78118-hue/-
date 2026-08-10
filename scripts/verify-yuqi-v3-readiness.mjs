@@ -15,9 +15,10 @@ import {
   assertEvidenceDirectoryScope, assertEvidencePath, finalizeVisiblePathCollection, gitStatusArgsForEvidence,
   instrumentationXmlSnapshots, loadVisiblePathProductionInputs, validateVisiblePathStartControl
 } from './run-yuqi-visible-path-formal.mjs';
-import { assertQualityReportProvenance } from './report-yuqi-lived-quality.mjs';
+import { assertQualityReportProvenance, evidenceBoundaryChecksum } from './report-yuqi-lived-quality.mjs';
 import { validateQualityArtifactBundle } from './report-yuqi-lived-quality.mjs';
-import { assertVerifiedQualityReplayPlan } from '../yuqi-runtime/src/quality-replay.mjs';
+import { createQualityReplayPlan } from './run-yuqi-lived-quality-replay.mjs';
+import { assertVerifiedQualityReplayPlan, expectedFinalKeysProjection } from '../yuqi-runtime/src/quality-replay.mjs';
 
 const execFileAsync = promisify(execFile);
 const loadedManifests = new WeakSet();
@@ -80,7 +81,12 @@ const MIGRATION_SEMANTIC_COUNT_KEYS = Object.freeze([
 const QUALITY_TOP_LEVEL_KEYS = Object.freeze([
   'version', 'productionReleaseMutation', 'candidateRelease', 'planChecksum',
   'replayProvenance', 'replayRunId', 'qualityPlanSha256', 'qualityReplaySha256',
-  'qualityManualReviewSha256', 'qualityGate', 'manualReview', 'eligible', 'failedGates', 'sourceHead'
+  'qualityManualReviewSha256', 'qualityGate', 'manualReview', 'eligible', 'failedGates', 'sourceHead',
+  'evidenceBoundary', 'evidenceBoundaryChecksum'
+]);
+const QUALITY_EVIDENCE_BOUNDARY_KEYS = Object.freeze([
+  'version', 'inputMode', 'sourceClass', 'offlineModelEvaluation',
+  'realHistoryEvidence', 'liveShadowEvidence'
 ]);
 const QUALITY_BLOCKED_KEYS = Object.freeze([
   'version', 'productionReleaseMutation', 'eligible', 'failedGates', 'blockingReason'
@@ -581,8 +587,24 @@ function validateQualityReport(value, manifest = null) {
     || !/^[a-f0-9]{64}$/.test(value.qualityReplaySha256 || '')
     || !/^[a-f0-9]{64}$/.test(value.qualityManualReviewSha256 || '')
     || value.replayProvenance.runId !== value.replayRunId) fail('quality raw bundle identity');
+  if (!/^[a-f0-9]{64}$/.test(value.evidenceBoundaryChecksum || '')
+    || value.evidenceBoundaryChecksum !== evidenceBoundaryChecksum({
+      evidenceBoundary: value.evidenceBoundary,
+      planChecksum: value.planChecksum,
+      sourceHead: value.sourceHead,
+      provenanceChecksum: value.replayProvenance.provenanceChecksum
+    })) fail('quality evidence boundary checksum');
   exactKeys(value.qualityGate, QUALITY_GATE_KEYS, 'quality gate');
   exactKeys(value.manualReview, QUALITY_MANUAL_KEYS, 'quality manual review');
+  exactKeys(value.evidenceBoundary, QUALITY_EVIDENCE_BOUNDARY_KEYS, 'quality evidence boundary');
+  if (value.evidenceBoundary.version !== 1
+    || value.evidenceBoundary.inputMode !== 'preset_default'
+    || value.evidenceBoundary.sourceClass !== 'tracked_human_annotations'
+    || value.evidenceBoundary.offlineModelEvaluation !== true
+    || value.evidenceBoundary.realHistoryEvidence !== false
+    || value.evidenceBoundary.liveShadowEvidence !== false) {
+    fail('quality evidence boundary');
+  }
   if (typeof value.qualityGate.eligible !== 'boolean' || !Array.isArray(value.qualityGate.failedGates)
     || typeof value.manualReview.eligible !== 'boolean' || !Array.isArray(value.manualReview.failedGates)) {
     fail('quality nested fields');
@@ -599,6 +621,34 @@ function validateQualityReport(value, manifest = null) {
     }
   }
   return { blocked: false };
+}
+
+function validateTrackedQualityPlan({ quality, qualityPlan, sourceDirectory }) {
+  let trackedPlan;
+  try {
+    trackedPlan = createQualityReplayPlan({ rootDir: sourceDirectory });
+  } catch (error) {
+    fail(`quality tracked plan ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (qualityPlan.planChecksum !== trackedPlan.planChecksum
+    || quality.planChecksum !== trackedPlan.planChecksum) {
+    fail('quality tracked plan checksum');
+  }
+  const projection = expectedFinalKeysProjection(trackedPlan);
+  const expectedFinalKeys = [
+    ...projection.finalKeys.sentinelFinalKeys,
+    ...projection.finalKeys.coverageFinalKeys,
+    ...projection.finalKeys.historyFinalKeys
+  ];
+  try {
+    assertQualityReportProvenance(quality.replayProvenance, {
+      expectedFinalKeys,
+      candidateRelease: quality.candidateRelease,
+      sourceHead: quality.sourceHead
+    });
+  } catch (error) {
+    fail(`quality tracked provenance ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function assertUniqueInstrumentationXmlSource(sourceDirectory, attestation) {
@@ -982,7 +1032,12 @@ function validateArtifactValue(key, value, root, manifest, now, sourceDirectory 
   if (key === 'connectedDeviceRaces') validateConnectedWrapper(value, root, manifest.candidateReleaseId, manifest.deviceSerial, now, manifest);
 }
 
-export function loadReadinessManifest({ manifestPath, evidenceDirectory, sourceDirectory = evidenceDirectory }) {
+export function loadReadinessManifest({
+  manifestPath,
+  evidenceDirectory,
+  sourceDirectory = evidenceDirectory,
+  qualitySourceDirectory = process.cwd()
+}) {
   if (typeof manifestPath !== 'string' || typeof evidenceDirectory !== 'string') fail('manifest arguments');
   const root = resolve(evidenceDirectory);
   const file = safePath(root, relative(root, resolve(manifestPath)));
@@ -1044,6 +1099,13 @@ export function loadReadinessManifest({ manifestPath, evidenceDirectory, sourceD
     artifacts[name] = { path: descriptor.path, sha256: actual, value };
   }
   const qualityValue = artifacts.quality?.value;
+  if (qualityValue && qualityValue.eligible === true) {
+    validateTrackedQualityPlan({
+      quality: qualityValue,
+      qualityPlan: artifacts.qualityPlan?.value,
+      sourceDirectory: resolve(qualitySourceDirectory)
+    });
+  }
   if (qualityValue && qualityValue.eligible !== false && manifest.candidateReleaseId !== null) {
     const qualityChecksum = qualityValue.candidateRelease?.releaseChecksum;
     if (!/^[a-f0-9]{64}$/.test(qualityChecksum || '')) fail('quality candidate checksum');
@@ -1343,6 +1405,7 @@ export async function verifyReadinessFromDirectory({
   run = false,
   commandRunner = runCommand,
   repoRoot = process.cwd(),
+  qualitySourceDirectory = repoRoot,
   runtimeConfig = resolve(repoRoot, 'yuqi-runtime', 'config.json'),
   formalFinalizer = finalizeVisiblePathCollection,
   productionInputsLoader = loadVisiblePathProductionInputs
@@ -1354,7 +1417,8 @@ export async function verifyReadinessFromDirectory({
   if (!run) {
     const evidence = loadReadinessManifest({
       manifestPath: join(directory, 'readiness-input.json'), evidenceDirectory: directory,
-      sourceDirectory: repoRoot
+      sourceDirectory: repoRoot,
+      qualitySourceDirectory
     });
     return materializeReadinessReport(evidence, {
       startedAt: evidence.createdAt,
@@ -1610,7 +1674,8 @@ export async function verifyReadinessFromDirectory({
   await writeFile(join(directory, 'readiness-input.json'), `${JSON.stringify(input, null, 2)}\n`, 'utf8');
   const evidence = loadReadinessManifest({
     manifestPath: join(directory, 'readiness-input.json'), evidenceDirectory: directory,
-    sourceDirectory: repoRoot
+    sourceDirectory: repoRoot,
+    qualitySourceDirectory
   });
   return materializeReadinessReport(evidence, { startedAt, completedAt });
 }

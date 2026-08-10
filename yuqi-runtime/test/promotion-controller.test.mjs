@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -15,14 +17,46 @@ import { deriveAuthorityLineageKey } from '../src/authority-identity.mjs';
 import { generationFingerprint } from '../src/interaction-lanes.mjs';
 import { YuqiOrchestrator } from '../src/orchestrator.mjs';
 import { commitVisibleResult } from '../src/visible-result-commit.mjs';
-import { executeRolloutCommand } from '../../scripts/cognition-rollout.mjs';
+import {
+  executeRolloutCommand,
+  loadQualityPromotionRawBundle,
+  preflightRolloutSourceAuthority,
+  reportSummaryFromArtifact,
+  setRolloutCommandRunnerForTests
+} from '../../scripts/cognition-rollout.mjs';
+import { QUALITY_DIMENSIONS, aggregateQualityGate, compileSceneExecutionInput } from '../src/quality-evaluator.mjs';
+import { deriveManualReviewRequirements } from '../../scripts/report-yuqi-lived-quality.mjs';
+import { createQualityReplayPlan } from '../../scripts/run-yuqi-lived-quality-replay.mjs';
+import { expectedFinalKeysProjection, writeQualityReplayPlanArtifact } from '../src/quality-replay.mjs';
 
 function silentStdout() {
   return { write() {} };
 }
 
+function currentSourceHead() {
+  return execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+}
+
+function installCleanSourceRunner({ head = currentSourceHead(), status = '' } = {}) {
+  setRolloutCommandRunnerForTests((executable, args) => {
+    if (executable !== 'git') return { exitCode: 1, stdout: '' };
+    if (args[0] === 'rev-parse') return { exitCode: 0, stdout: `${head}\n` };
+    if (args[0] === 'status') return { exitCode: 0, stdout: status };
+    return { exitCode: 1, stdout: '' };
+  });
+  return () => setRolloutCommandRunnerForTests(null);
+}
+
+function promotionEvidenceTempDir(prefix) {
+  return mkdtempSync(join(process.cwd(), 'artifacts', 'yuqi-lived-agency-v3', `.tmp-${prefix}-`));
+}
+
 function sha256File(path) {
   return contentHash(readFileSync(path).toString('base64'));
+}
+
+function rawFileHash(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
 function criticalJudgments(subjectId, code = 'PUBLIC_PRIVACY_VIOLATION') {
@@ -167,6 +201,91 @@ function qualityReportArtifact(store, rolloutKey = 'DIRECT_REPLY', reportId = 'c
     },
     manualReview: { eligible: true, failedGates: [] }
   };
+}
+
+function writeTrackedRawBundle(directory, artifact, {
+  stableReleaseId = 'stable-r2', stableReleaseChecksum = 'b'.repeat(64),
+  sourceHead = 'a'.repeat(40)
+} = {}) {
+  const plan = createQualityReplayPlan({ rootDir: process.cwd() });
+  const runId = '33333333-3333-4333-8333-333333333333';
+  const executionPairs = plan.items.map(item => {
+    const finalKey = `${item.layer}:${item.sceneId}:${item.repeatIndex}`;
+    const executionChecksum = contentHash(compileSceneExecutionInput(item.scene));
+    return {
+      finalKey, sourceHead, stableReleaseId, stableReleaseChecksum,
+      candidateReleaseId: artifact.candidateRelease.releaseId,
+      candidateReleaseChecksum: artifact.candidateRelease.releaseChecksum,
+      executionChecksum, stableInputChecksum: executionChecksum, candidateInputChecksum: executionChecksum,
+      dryRun: true, capabilities: { visible: false, actions: false }
+    };
+  });
+  const modelRuns = executionPairs.map(pair => ({
+    finalKey: pair.finalKey, attemptIndex: 0, evaluatorId: 'blind-evaluator-v1', inputChecksum: 'c'.repeat(64), completed: true
+  }));
+  const finals = plan.items.map(item => {
+    const finalKey = `${item.layer}:${item.sceneId}:${item.repeatIndex}`;
+    const executionChecksum = executionPairs.find(pair => pair.finalKey === finalKey).executionChecksum;
+    const attempt = { attemptIndex: 0, evaluatorId: 'blind-evaluator-v1', evaluatorVersion: 'blind-evaluator-v1',
+      executionChecksum, latencyMs: 1, accepted: true, unresolved: false };
+    return {
+      layer: item.layer, sceneId: item.sceneId, repeatIndex: item.repeatIndex, finalized: true,
+      scores: Object.fromEntries(QUALITY_DIMENSIONS.map(key => [key, 4])), preference: 'candidate', findings: [],
+      regression: false, severe: false, tie: false, unresolved: false, structuralRegression: false,
+      protocolFailure: false, executionChecksum, latencyMs: 1, evaluatorVersion: 'blind-evaluator-v1', attempts: [attempt]
+    };
+  });
+  const provenanceBase = { runId, sourceHead, executionPairs, modelRuns };
+  const provenance = { ...provenanceBase, provenanceChecksum: contentHash(provenanceBase) };
+  const replayRows = [
+    ...finals.flatMap(row => row.attempts.map(attempt => ({ recordType: 'attempt', runId,
+      layer: row.layer, sceneId: row.sceneId, repeatIndex: row.repeatIndex, ...attempt }))),
+    ...finals.map(row => ({ recordType: 'final', runId, ...row })),
+    { recordType: 'provenance', runId, sourceHead, provenanceChecksum: provenance.provenanceChecksum },
+    ...executionPairs.map(row => ({ recordType: 'execution', runId, ...row })),
+    ...modelRuns.map(row => ({ recordType: 'model', runId, ...row })),
+    ...finals.map(row => ({ recordType: 'final-checksum', runId,
+      finalKey: `${row.layer}:${row.sceneId}:${row.repeatIndex}`, executionChecksum: row.executionChecksum,
+      latencyMs: row.latencyMs, evaluatorVersion: row.evaluatorVersion }))
+  ];
+  const evidence = {
+    sentinelRuns: finals.filter(row => row.layer === 'sentinel'),
+    coverageRuns: finals.filter(row => row.layer === 'coverage'),
+    historyRuns: finals.filter(row => row.layer === 'history')
+  };
+  const expected = expectedFinalKeysProjection(plan);
+  const requirements = deriveManualReviewRequirements(evidence, plan, { includePassingSample: true });
+  const manualRows = [{ recordType: 'metadata', runId, sourceHead,
+    candidateReleaseId: artifact.candidateRelease.releaseId,
+    candidateReleaseChecksum: artifact.candidateRelease.releaseChecksum, planChecksum: plan.planChecksum },
+    ...requirements.map((requirement, index) => ({ recordType: 'review', runId, reviewId: `review-${index}`, evalRunId: runId,
+      sceneId: requirement.sceneId, repeatIndex: requirement.repeatIndex, evidenceFindingIds: requirement.evidenceFindingIds,
+      decision: 'confirm', reason: 'fixture', reviewer: 'central_window', createdAt: 0 }))];
+  const planPath = join(directory, 'quality-replay-plan.json');
+  const replayPath = join(directory, 'quality-replay.jsonl');
+  const manualPath = join(directory, 'quality-manual-review.jsonl');
+  writeQualityReplayPlanArtifact(plan, planPath);
+  writeFileSync(replayPath, `${replayRows.map(row => JSON.stringify(row)).join('\n')}\n`);
+  writeFileSync(manualPath, `${manualRows.map(row => JSON.stringify(row)).join('\n')}\n`);
+  const fileSha = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+  artifact.planChecksum = plan.planChecksum;
+  artifact.sourceHead = sourceHead;
+  artifact.replayRunId = runId;
+  artifact.replayProvenance = provenance;
+  artifact.qualityPlanSha256 = fileSha(planPath);
+  artifact.qualityReplaySha256 = fileSha(replayPath);
+  artifact.qualityManualReviewSha256 = fileSha(manualPath);
+  artifact.qualityGate = aggregateQualityGate(evidence, expected);
+  artifact.manualReview = {
+    eligible: true, failedGates: [], unresolvedCount: 0, requiredCount: requirements.length,
+    requirements, queue: manualRows.slice(1).map(({ recordType: _recordType, runId: _runId, ...row }) => row)
+  };
+  artifact.eligible = artifact.qualityGate.eligible && artifact.manualReview.eligible;
+  artifact.evidenceBoundary = { version: 1, inputMode: 'preset_default', sourceClass: 'tracked_human_annotations',
+    offlineModelEvaluation: true, realHistoryEvidence: false, liveShadowEvidence: false };
+  artifact.evidenceBoundaryChecksum = contentHash({ evidenceBoundary: artifact.evidenceBoundary,
+    planChecksum: artifact.planChecksum, sourceHead, provenanceChecksum: provenance.provenanceChecksum });
+  return artifact;
 }
 
 function registerInput(report, rolloutKey = 'DIRECT_REPLY', expectedRevision = 1) {
@@ -836,7 +955,7 @@ test('status and check use a consistent active-WAL snapshot without hashing SHM 
 });
 
 test('forged CLI reports are fully validated before any report row is written', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'yuqi-rollout-cli-report-'));
+  const dir = promotionEvidenceTempDir('cli-report');
   const databasePath = join(dir, 'runtime.sqlite');
   const configPath = join(dir, 'rollout.json');
   const artifactPath = join(dir, 'forged-report.json');
@@ -859,6 +978,8 @@ test('forged CLI reports are fully validated before any report row is written', 
     },
     qualityGate: { liveShadowSuccessCount: 30, criticalErrors: 0 }
   };
+  const resetSourceRunner = installCleanSourceRunner();
+  writeTrackedRawBundle(dir, artifact, { sourceHead: currentSourceHead() });
   writeFileSync(artifactPath, JSON.stringify(artifact));
   writeFileSync(configPath, JSON.stringify({ databasePath }));
   store.close();
@@ -878,12 +999,13 @@ test('forged CLI reports are fully validated before any report row is written', 
     assert.equal(verify.db.prepare('SELECT COUNT(*) AS n FROM cognition_evaluation_reports').get().n, 0);
     verify.close();
   } finally {
+    resetSourceRunner();
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
   }
 });
 
 test('CLI resumes an exact pending report and rejects same-id authority conflicts', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'yuqi-rollout-cli-pending-'));
+  const dir = promotionEvidenceTempDir('cli-pending');
   const databasePath = join(dir, 'runtime.sqlite');
   const configPath = join(dir, 'rollout.json');
   const artifactPath = join(dir, 'quality-report.json');
@@ -891,17 +1013,18 @@ test('CLI resumes an exact pending report and rejects same-id authority conflict
   const controller = new PromotionController({ store, presetRegistry: registry() });
   controller.initialize();
   const artifact = qualityReportArtifact(store, 'DIRECT_REPLY', 'cli-pending-report');
-  const stable = store.getPipelineRelease(controller.getStatus('DIRECT_REPLY').stableReleaseId);
-  const summary = {
-    eligible: true,
-    candidateRelease: artifact.candidateRelease,
-    stableBaselineReleaseId: stable.releaseId,
-    stableBaselineReleaseChecksum: stable.releaseChecksum,
-    evaluatorVersion: artifact.candidateRelease.evaluatorVersion,
-    suiteChecksum: artifact.planChecksum,
-    liveShadowSuccessCount: 30,
-    criticalErrors: 0
-  };
+  const pendingStable = store.getPipelineRelease(controller.getStatus('DIRECT_REPLY').stableReleaseId);
+  const resetSourceRunner = installCleanSourceRunner();
+  writeTrackedRawBundle(dir, artifact, {
+    stableReleaseId: pendingStable.releaseId,
+    stableReleaseChecksum: pendingStable.releaseChecksum,
+    sourceHead: currentSourceHead()
+  });
+  writeFileSync(artifactPath, JSON.stringify(artifact));
+  const rawBundle = loadQualityPromotionRawBundle({ artifactPath, artifact, rootDir: process.cwd() });
+  const summary = reportSummaryFromArtifact({
+    artifact, rollout: { stableReleaseId: pendingStable.releaseId }, rootDir: process.cwd(), rawBundle
+  });
   store.putEvaluationReportInternal({
     reportId: artifact.reportId,
     reportType: 'promotion',
@@ -912,7 +1035,6 @@ test('CLI resumes an exact pending report and rejects same-id authority conflict
     summary,
     createdAt: 2_100
   });
-  writeFileSync(artifactPath, JSON.stringify(artifact));
   writeFileSync(configPath, JSON.stringify({ databasePath }));
   store.close();
   try {
@@ -948,7 +1070,7 @@ test('CLI resumes an exact pending report and rejects same-id authority conflict
         'candidate-release-id': changed.candidateRelease.releaseId
       },
       stdout: silentStdout()
-    }), /authority conflict|checksum conflict/);
+    }), /authority conflict|checksum conflict|raw bundle identity/);
     const unchanged = new YuqiStore(databasePath);
     assert.deepEqual(unchanged.getCognitionRollout('DIRECT_REPLY'), beforeRollout);
     assert.deepEqual(unchanged.getEvaluationReport(artifact.reportId), beforeReport);
@@ -985,7 +1107,95 @@ test('CLI resumes an exact pending report and rejects same-id authority conflict
     assert.equal(final.getCognitionRollout('PROACTIVE_CHAT').revision, 1);
     final.close();
   } finally {
+    resetSourceRunner();
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('promote rejects a self-consistent stale source bundle before opening or writing the runtime DB', () => {
+  const dir = promotionEvidenceTempDir('source-stale');
+  const databasePath = join(dir, 'runtime.sqlite');
+  const configPath = join(dir, 'rollout.json');
+  const reportPath = join(dir, 'quality-report.json');
+  const store = new YuqiStore(databasePath);
+  store.close();
+  const before = sha256File(databasePath);
+  const staleHead = 'a'.repeat(40);
+  for (const [name, bytes] of [
+    ['quality-replay-plan.json', '{"sourceHead":"stale"}\n'],
+    ['quality-replay.jsonl', '{"runId":"stale"}\n'],
+    ['quality-manual-review.jsonl', '{"runId":"stale"}\n']
+  ]) writeFileSync(join(dir, name), bytes);
+  writeFileSync(reportPath, JSON.stringify({
+    sourceHead: staleHead,
+    replayProvenance: { sourceHead: staleHead },
+    qualityPlanSha256: rawFileHash(join(dir, 'quality-replay-plan.json')),
+    qualityReplaySha256: rawFileHash(join(dir, 'quality-replay.jsonl')),
+    qualityManualReviewSha256: rawFileHash(join(dir, 'quality-manual-review.jsonl'))
+  }));
+  writeFileSync(configPath, JSON.stringify({ databasePath }));
+  const resetSourceRunner = installCleanSourceRunner({ head: 'b'.repeat(40) });
+  try {
+    assert.throws(() => executeRolloutCommand({
+      command: 'promote',
+      options: { config: configPath, report: reportPath, kind: 'DIRECT_REPLY' },
+      stdout: silentStdout()
+    }), /sourceHead is stale/);
+    assert.equal(sha256File(databasePath), before);
+  } finally {
+    resetSourceRunner();
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('source authority preflight allows evidence-only dirt but rejects outside dirt and accepts the current HEAD', () => {
+  const dir = promotionEvidenceTempDir('source-scope');
+  const reportPath = join(dir, 'quality-report.json');
+  const head = currentSourceHead();
+  writeFileSync(reportPath, JSON.stringify({
+    sourceHead: head,
+    replayProvenance: { sourceHead: head }
+  }));
+  try {
+    assert.throws(() => preflightRolloutSourceAuthority({
+      rootDir: process.cwd(), reportPath,
+      commandRunner: (executable, args) => executable === 'git' && args[0] === 'rev-parse'
+        ? { exitCode: 0, stdout: `${head}\n` }
+        : { exitCode: 0, stdout: ' M scripts/modified-outside-evidence.mjs\0' }
+    }), /dirty outside evidence/);
+    assert.deepEqual(preflightRolloutSourceAuthority({
+      rootDir: process.cwd(), reportPath,
+      commandRunner: (executable, args) => executable === 'git' && args[0] === 'rev-parse'
+        ? { exitCode: 0, stdout: `${head}\n` }
+        : { exitCode: 0, stdout: `?? artifacts/yuqi-lived-agency-v3/${dir.split('yuqi-lived-agency-v3\\')[1]}\\quality-report.json\0` }
+    }).sourceHead, head);
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test('promote rejects report/raw directories outside the fixed evidence root before runtime DB access', () => {
+  const outsideDirectories = [
+    mkdtempSync(join(process.cwd(), 'scripts', '.tmp-rollout-scope-')),
+    mkdtempSync(join(process.cwd(), '.tmp-rollout-scope-')),
+    mkdtempSync(join(process.cwd(), 'tests', '.tmp-rollout-scope-'))
+  ];
+  const resetSourceRunner = installCleanSourceRunner();
+  try {
+    for (const directory of outsideDirectories) {
+      const reportPath = join(directory, 'quality-report.json');
+      writeFileSync(reportPath, '{}');
+      assert.throws(() => executeRolloutCommand({
+        command: 'promote',
+        options: { config: join(directory, 'missing-config.json'), report: reportPath, kind: 'DIRECT_REPLY' },
+        stdout: silentStdout()
+      }), /evidence directory scope/);
+    }
+  } finally {
+    resetSourceRunner();
+    for (const directory of outsideDirectories) {
+      try { rmSync(directory, { recursive: true, force: true }); } catch {}
+    }
   }
 });
 

@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { contentHash } from '../yuqi-runtime/src/protocol.mjs';
+import { loadVerifiedPresetHistoryArtifacts } from './compile-yuqi-preset-history-scenes.mjs';
 
 const VERIFIED_COMPILED_SUITES = new WeakSet();
 
@@ -31,6 +33,32 @@ function readJsonLines(path) {
         throw new Error(`${path}:${index + 1} is not JSON: ${error.message}`);
       }
     });
+}
+
+function sha256Utf8(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function sourceSection(markdown, heading, file) {
+  const lines = markdown.replaceAll('\r\n', '\n').split('\n');
+  const matches = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].match(/^(#{2,6})\s+(.+?)\s*$/);
+    if (match && match[2] === heading) matches.push({ index, level: match[1].length });
+  }
+  if (matches.length !== 1) {
+    throw new Error(`annotation heading must be unique for ${file}#${heading}`);
+  }
+  const start = matches[0];
+  let end = lines.length;
+  for (let index = start.index + 1; index < lines.length; index += 1) {
+    const match = lines[index].match(/^(#{2,6})\s+(.+?)\s*$/);
+    if (match && match[1].length <= start.level) {
+      end = index;
+      break;
+    }
+  }
+  return lines.slice(start.index, end).join('\n').trimEnd();
 }
 
 function turn(at, speaker, messageId, text, extra = {}) {
@@ -113,15 +141,22 @@ function assertAnnotationSource(scene, sources, sourceGroundingIndex, rootDir) {
     throw new Error(`source grounding mismatch for ${scene.sceneId}`);
   }
   const markdownPath = join(rootDir, 'preset-references', source.file);
-  if (!existsSync(markdownPath)) return;
+  if (!existsSync(markdownPath)) {
+    throw new Error(`annotation source not found for ${scene.sceneId}: ${source.file}`);
+  }
   const markdown = readFileSync(markdownPath, 'utf8');
-  const heading = String(source.heading).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  if (!new RegExp(`^#{1,6}\\s+${heading}\\s*$`, 'm').test(markdown)) {
-    throw new Error(`source heading not found for ${scene.sceneId}: ${source.file}#${source.heading}`);
+  let section;
+  try {
+    section = sourceSection(markdown, source.heading, source.file);
+  } catch (error) {
+    throw new Error(`source heading not found for ${scene.sceneId}: ${source.file}#${source.heading}: ${error.message}`);
+  }
+  if (sha256Utf8(markdown) !== index.sourceDocSha256 || sha256Utf8(section) !== index.sectionChecksum) {
+    throw new Error(`source document or section checksum mismatch for ${scene.sceneId}`);
   }
 }
 
-function validateSourceGroundingIndex(index, sources, rawSentinelSeeds) {
+function validateSourceGroundingIndex(index, sources, rawSentinelSeeds, rootDir) {
   if (!index || index.schemaVersion !== 1 || !index.sentinels || Array.isArray(index.sentinels)) {
     throw new Error('invalid source grounding index');
   }
@@ -136,7 +171,7 @@ function validateSourceGroundingIndex(index, sources, rawSentinelSeeds) {
   const rawById = new Map(rawSentinelSeeds.map(seed => [seed.sceneId, seed]));
   for (const id of indexIds) {
     const entry = index.sentinels[id];
-    if (!entry || Object.keys(entry).sort().join(',') !== 'file,heading,headingChecksum,sceneChecksum') {
+    if (!entry || Object.keys(entry).sort().join(',') !== 'file,heading,headingChecksum,sceneChecksum,sectionChecksum,sourceDocSha256') {
       throw new Error(`invalid source grounding entry for ${id}`);
     }
     const source = sources.sentinels[id];
@@ -147,8 +182,23 @@ function validateSourceGroundingIndex(index, sources, rawSentinelSeeds) {
     if (entry.headingChecksum !== contentHash(entry.heading) || entry.sceneChecksum !== contentHash(raw)) {
       throw new Error(`source grounding checksum mismatch for ${id}`);
     }
-    if (!/^[0-9a-f]{64}$/.test(entry.headingChecksum) || !/^[0-9a-f]{64}$/.test(entry.sceneChecksum)) {
+    if (!/^[0-9a-f]{64}$/.test(entry.headingChecksum)
+      || !/^[0-9a-f]{64}$/.test(entry.sceneChecksum)
+      || !/^[0-9a-f]{64}$/.test(entry.sourceDocSha256)
+      || !/^[0-9a-f]{64}$/.test(entry.sectionChecksum)) {
       throw new Error(`source grounding checksum format mismatch for ${id}`);
+    }
+    const markdownPath = join(rootDir, 'preset-references', entry.file);
+    if (!existsSync(markdownPath)) throw new Error(`annotation source not found for ${id}: ${entry.file}`);
+    const markdown = readFileSync(markdownPath, 'utf8');
+    let section;
+    try {
+      section = sourceSection(markdown, entry.heading, entry.file);
+    } catch (error) {
+      throw new Error(`source heading not found for ${id}: ${error.message}`);
+    }
+    if (sha256Utf8(markdown) !== entry.sourceDocSha256 || sha256Utf8(section) !== entry.sectionChecksum) {
+      throw new Error(`source document or section checksum mismatch for ${id}`);
     }
   }
   return index;
@@ -229,7 +279,8 @@ export function compileQualitySuite({ rootDir = process.cwd(), checkOnly = false
   const coveragePlan = readJsonLines(join(suiteRoot, 'coverage-scenes.jsonl'));
   const sources = readJson(join(suiteRoot, 'sources.json'));
   const groundingIndex = sourceGroundingIndex || readJson(join(suiteRoot, 'source-grounding-index.json'));
-  validateSourceGroundingIndex(groundingIndex, sources, rawSentinelSeeds);
+  const annotationArtifacts = loadVerifiedPresetHistoryArtifacts({ rootDir });
+  validateSourceGroundingIndex(groundingIndex, sources, rawSentinelSeeds, rootDir);
   if (manifest.suitePurpose !== 'source_grounded_human_quality' || manifest.qualityEvidenceEligible !== true) {
     throw new Error('quality manifest does not declare source-grounded human quality purpose');
   }
@@ -272,6 +323,8 @@ export function compileQualitySuite({ rootDir = process.cwd(), checkOnly = false
     coverageScenes,
     sources,
     sourceGroundingIndex: groundingIndex,
+    humanAnnotationScenes: annotationArtifacts.scenes,
+    humanAnnotationManifest: annotationArtifacts.manifest,
     coverageByRolloutKey,
     checkOnly
   };
@@ -296,6 +349,7 @@ if (isMain) {
     suiteId: suite.manifest.suiteId,
     sentinelCount: suite.sentinelSeeds.length,
     coverageCount: suite.coverageScenes.length,
+    humanAnnotationCount: suite.humanAnnotationScenes.length,
     coverageByRolloutKey: suite.coverageByRolloutKey,
     sourcesChecksum: contentHash(suite.sources)
   }, null, 2)}\n`);

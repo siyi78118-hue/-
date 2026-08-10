@@ -4,9 +4,10 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { canonicalJson, contentHash } from '../yuqi-runtime/src/protocol.mjs';
-import { aggregateQualityGate } from '../yuqi-runtime/src/quality-evaluator.mjs';
+import { aggregateQualityGate, compileSceneExecutionInput } from '../yuqi-runtime/src/quality-evaluator.mjs';
 import { supportsPipelineVersion } from '../yuqi-runtime/src/release-executor.mjs';
 import { loadLocalHistoryManifest, loadLocalHistoryScenes } from './run-yuqi-lived-quality-replay.mjs';
+import { presetHistoryArtifactPaths } from './compile-yuqi-preset-history-scenes.mjs';
 import { loadQualityReplayPlanArtifact } from '../yuqi-runtime/src/quality-replay.mjs';
 import {
   assertVerifiedQualityReplayPlan,
@@ -558,6 +559,22 @@ export function validateQualityArtifactBundle({
     ...expected.finalKeys.sentinelFinalKeys, ...expected.finalKeys.coverageFinalKeys,
     ...expected.finalKeys.historyFinalKeys
   ];
+  const expectedExecutionChecksums = new Map(plan.items.map(item => [
+    `${item.layer}:${item.sceneId}:${item.repeatIndex}`,
+    contentHash(compileSceneExecutionInput(item.scene))
+  ]));
+  if (expectedExecutionChecksums.size !== expectedFinalKeys.length
+    || expectedFinalKeys.some(key => !expectedExecutionChecksums.has(key))) {
+    throw new Error('quality plan execution input identity conflict');
+  }
+  for (const pair of executionPairs) {
+    const expectedChecksum = expectedExecutionChecksums.get(pair.finalKey);
+    if (!expectedChecksum || pair.executionChecksum !== expectedChecksum
+      || pair.stableInputChecksum !== expectedChecksum
+      || pair.candidateInputChecksum !== expectedChecksum) {
+      throw new Error(`quality execution input checksum authority conflict: ${pair.finalKey}`);
+    }
+  }
   assertQualityReportProvenance(provenance, { expectedFinalKeys, candidateRelease, sourceHead: provenance.sourceHead });
   if (finalRows.length !== expectedFinalKeys.length || checksumRows.length !== expectedFinalKeys.length) {
     throw new Error('quality final record count conflict');
@@ -668,6 +685,7 @@ export function materializeQualityReport({
   rootDir = process.cwd(),
   historyPath,
   historyManifestPath,
+  historyInputMode,
   historyScenes,
   historyManifest,
   candidateRelease,
@@ -690,15 +708,17 @@ export function materializeQualityReport({
   if (typeof planArtifactPath !== 'string' || !planArtifactPath) {
     return blocked('QUALITY_PLAN_ARTIFACT_REQUIRED', 'disk-verified quality plan artifact required');
   }
-  if (typeof historyPath !== 'string' || !historyPath
-    || typeof historyManifestPath !== 'string' || !historyManifestPath) {
-    return blocked('QUALITY_HISTORY_ARTIFACT_REQUIRED', 'disk-verified history scenes and manifest required');
-  }
   let verifiedPlan;
   let release;
+  let evidenceBoundary;
   try {
-    const diskHistoryScenes = loadLocalHistoryScenes({ rootDir, path: historyPath });
-    const diskHistoryManifest = loadLocalHistoryManifest({ rootDir, path: historyManifestPath });
+    const {
+      historyScenes: diskHistoryScenes,
+      historyManifest: diskHistoryManifest,
+      historyInputMode: verifiedHistoryInputMode
+    } =
+      loadQualityHistoryArtifacts({ rootDir, historyPath, historyManifestPath, historyInputMode });
+    evidenceBoundary = qualityEvidenceBoundary(verifiedHistoryInputMode);
     verifiedPlan = loadQualityReplayPlanArtifact({
       artifactPath: planArtifactPath,
       rootDir,
@@ -730,9 +750,16 @@ export function materializeQualityReport({
     version: 1,
     productionReleaseMutation: false,
     candidateRelease: release,
+    evidenceBoundary,
     sourceHead: replayProvenance.sourceHead,
     planChecksum: verifiedPlan.planChecksum,
     replayProvenance,
+    evidenceBoundaryChecksum: evidenceBoundaryChecksum({
+      evidenceBoundary,
+      planChecksum: verifiedPlan.planChecksum,
+      sourceHead: replayProvenance.sourceHead,
+      provenanceChecksum: replayProvenance.provenanceChecksum
+    }),
     qualityGate,
     manualReview,
     eligible,
@@ -749,6 +776,7 @@ export function materializeQualityReportFromArtifacts({
   rootDir = process.cwd(),
   historyPath,
   historyManifestPath,
+  historyInputMode,
   historyScenes,
   historyManifest,
   candidateRelease,
@@ -757,8 +785,8 @@ export function materializeQualityReportFromArtifacts({
   if (typeof replayArtifactPath !== 'string' || typeof manualReviewArtifactPath !== 'string') {
     throw new Error('quality raw artifact paths required');
   }
-  const diskHistoryScenes = loadLocalHistoryScenes({ rootDir, path: historyPath });
-  const diskHistoryManifest = loadLocalHistoryManifest({ rootDir, path: historyManifestPath });
+  const { historyScenes: diskHistoryScenes, historyManifest: diskHistoryManifest } =
+    loadQualityHistoryArtifacts({ rootDir, historyPath, historyManifestPath, historyInputMode });
   const verifiedPlan = loadQualityReplayPlanArtifact({
     artifactPath: planArtifactPath,
     rootDir,
@@ -777,6 +805,7 @@ export function materializeQualityReportFromArtifacts({
     rootDir,
     historyPath,
     historyManifestPath,
+    historyInputMode,
     historyScenes: diskHistoryScenes,
     historyManifest: diskHistoryManifest,
     candidateRelease,
@@ -832,20 +861,93 @@ function writeBlockedReport(outPath, error) {
   return report;
 }
 
+export function loadQualityHistoryInputs({
+  rootDir = process.cwd(),
+  historyPath,
+  historyManifestPath
+} = {}) {
+  const hasHistoryPath = typeof historyPath === 'string' && historyPath.length > 0;
+  const hasManifestPath = typeof historyManifestPath === 'string' && historyManifestPath.length > 0;
+  if (hasHistoryPath !== hasManifestPath) {
+    throw new Error('explicit history override requires scenes and manifest paths');
+  }
+  const defaults = presetHistoryArtifactPaths(rootDir);
+  const historyInputMode = hasHistoryPath ? 'explicit_override' : 'preset_default';
+  return {
+    historyPath: historyPath || defaults.scenesPath,
+    historyManifestPath: historyManifestPath || defaults.manifestPath,
+    historyInputMode,
+    historyScenes: loadLocalHistoryScenes({ rootDir, path: hasHistoryPath ? historyPath : undefined }),
+    historyManifest: loadLocalHistoryManifest({ rootDir, path: hasManifestPath ? historyManifestPath : undefined })
+  };
+}
+
+export function loadQualityHistoryArtifacts({ rootDir, historyPath, historyManifestPath, historyInputMode } = {}) {
+  const inferredMode = historyInputMode || (
+    typeof historyPath === 'string' && historyPath && typeof historyManifestPath === 'string' && historyManifestPath
+      ? 'explicit_override'
+      : 'preset_default'
+  );
+  if (!['preset_default', 'explicit_override'].includes(inferredMode)) {
+    throw new Error('quality history input mode conflict');
+  }
+  if (inferredMode === 'preset_default') {
+    const defaults = presetHistoryArtifactPaths(rootDir);
+    if ((historyPath && resolve(historyPath) !== resolve(defaults.scenesPath))
+      || (historyManifestPath && resolve(historyManifestPath) !== resolve(defaults.manifestPath))) {
+      throw new Error('preset history path conflict');
+    }
+    return {
+      historyScenes: loadLocalHistoryScenes({ rootDir }),
+      historyManifest: loadLocalHistoryManifest({ rootDir }),
+      historyInputMode: 'preset_default'
+    };
+  }
+  if (typeof historyPath !== 'string' || !historyPath
+    || typeof historyManifestPath !== 'string' || !historyManifestPath) {
+    throw new Error('explicit history override requires scenes and manifest paths');
+  }
+  return {
+    historyScenes: loadLocalHistoryScenes({ rootDir, path: historyPath }),
+    historyManifest: loadLocalHistoryManifest({ rootDir, path: historyManifestPath }),
+    historyInputMode: 'explicit_override'
+  };
+}
+
+function qualityEvidenceBoundary(historyInputMode) {
+  return {
+    version: 1,
+    inputMode: historyInputMode,
+    sourceClass: historyInputMode === 'preset_default'
+      ? 'tracked_human_annotations'
+      : 'explicit_history_override',
+    offlineModelEvaluation: true,
+    realHistoryEvidence: false,
+    liveShadowEvidence: false
+  };
+}
+
+export function evidenceBoundaryChecksum({ evidenceBoundary, planChecksum, sourceHead, provenanceChecksum }) {
+  return contentHash({ evidenceBoundary, planChecksum, sourceHead, provenanceChecksum });
+}
+
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 
 if (isMain) {
   const rootDir = cliOption('--root') || process.cwd();
   const outPath = resolve(rootDir, cliOption('--out') || 'artifacts/yuqi-lived-agency-v3/quality-report.json');
   try {
-    const historyPath = cliOption('--history') || resolve(
-      rootDir, 'artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl'
-    );
-    const historyManifestPath = cliOption('--history-manifest') || resolve(
-      rootDir, 'artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json'
-    );
-    const historyScenes = loadLocalHistoryScenes({ rootDir, path: historyPath });
-    const historyManifest = loadLocalHistoryManifest({ rootDir, path: historyManifestPath });
+    const {
+      historyPath,
+      historyManifestPath,
+      historyInputMode,
+      historyScenes,
+      historyManifest
+    } = loadQualityHistoryInputs({
+      rootDir,
+      historyPath: cliOption('--history'),
+      historyManifestPath: cliOption('--history-manifest')
+    });
     if (!cliOption('--plan')) throw new Error('quality plan artifact required');
     const expectedPlan = loadQualityReplayPlanArtifact({
       artifactPath: resolve(rootDir, cliOption('--plan')),
@@ -868,6 +970,7 @@ if (isMain) {
         rootDir,
         historyPath,
         historyManifestPath,
+        historyInputMode,
         historyScenes,
         historyManifest,
         candidateRelease,
@@ -888,6 +991,7 @@ if (isMain) {
       rootDir,
       historyPath,
       historyManifestPath,
+      historyInputMode,
       historyScenes,
       historyManifest,
       candidateRelease,

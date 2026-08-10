@@ -25,9 +25,10 @@ import {
 } from '../scripts/verify-yuqi-v3-readiness.mjs';
 import { reportChecksum } from '../scripts/generate-yuqi-v3-readiness-inputs.mjs';
 import { createQualityReplayPlan } from '../scripts/run-yuqi-lived-quality-replay.mjs';
-import { deriveManualReviewRequirements } from '../scripts/report-yuqi-lived-quality.mjs';
-import { aggregateQualityGate } from '../yuqi-runtime/src/quality-evaluator.mjs';
+import { deriveManualReviewRequirements, evidenceBoundaryChecksum } from '../scripts/report-yuqi-lived-quality.mjs';
+import { aggregateQualityGate, compileSceneExecutionInput } from '../yuqi-runtime/src/quality-evaluator.mjs';
 import { expectedFinalKeysProjection } from '../yuqi-runtime/src/quality-replay.mjs';
+import { contentHash } from '../yuqi-runtime/src/protocol.mjs';
 
 const ARTIFACT_NAMES = [
   'baseline', 'migration', 'migrationClone', 'protocol', 'quality', 'races',
@@ -164,15 +165,26 @@ function closedQuality(candidateReleaseId) {
     executionPairs: [executionPair],
     modelRuns: [modelRun]
   };
+  const evidenceBoundary = {
+    version: 1, inputMode: 'preset_default', sourceClass: 'tracked_human_annotations',
+    offlineModelEvaluation: true, realHistoryEvidence: false, liveShadowEvidence: false
+  };
+  const replayProvenance = {
+    ...replayBase,
+    provenanceChecksum: sha256(replayBase)
+  };
   return {
     version: 1, productionReleaseMutation: false, candidateRelease,
-    planChecksum: 'c'.repeat(64), replayProvenance: {
-      ...replayBase, provenanceChecksum: sha256(replayBase)
-    },
+    evidenceBoundary,
+    planChecksum: 'c'.repeat(64), replayProvenance,
     qualityGate, manualReview: {
       eligible: true, failedGates: [], unresolvedCount: 0, requiredCount: 0,
       requirements: [], queue: []
-    }, eligible: true, failedGates: [], sourceHead: SOURCE_HEAD
+    }, eligible: true, failedGates: [], sourceHead: SOURCE_HEAD,
+    evidenceBoundaryChecksum: evidenceBoundaryChecksum({
+      evidenceBoundary, planChecksum: 'c'.repeat(64), sourceHead: SOURCE_HEAD,
+      provenanceChecksum: replayProvenance.provenanceChecksum
+    })
   };
 }
 
@@ -394,22 +406,18 @@ function closedRace(candidateReleaseId) {
 }
 
 function qualityFixturePlan() {
-  const historyScenes = Array.from({ length: 30 }, (_, index) => ({ sceneId: `history-${index}` }));
-  return createQualityReplayPlan({
-    rootDir: process.cwd(),
-    historyScenes,
-    historyManifest: { schemaVersion: 1, sceneIds: historyScenes.map(scene => scene.sceneId), scenesChecksum: sha256(historyScenes) }
-  });
+  return createQualityReplayPlan({ rootDir: process.cwd() });
 }
 
 function buildQualityBundleFixture(root, candidateReleaseId) {
   const plan = qualityFixturePlan();
   const runId = '11111111-1111-4111-8111-111111111111';
   const executionPairs = plan.items.map(item => ({
+    ...(() => { const executionChecksum = contentHash(compileSceneExecutionInput(item.scene)); return { executionChecksum }; })(),
     finalKey: `${item.layer}:${item.sceneId}:${item.repeatIndex}`,
     sourceHead: SOURCE_HEAD, stableReleaseId: 'stable-fixture', stableReleaseChecksum: 'd'.repeat(64),
     candidateReleaseId, candidateReleaseChecksum: CANDIDATE_CHECKSUM,
-    executionChecksum: 'e'.repeat(64), stableInputChecksum: 'e'.repeat(64), candidateInputChecksum: 'e'.repeat(64),
+    stableInputChecksum: contentHash(compileSceneExecutionInput(item.scene)), candidateInputChecksum: contentHash(compileSceneExecutionInput(item.scene)),
     dryRun: true, capabilities: { visible: false, actions: false }
   }));
   const modelRuns = executionPairs.map(pair => ({
@@ -419,7 +427,7 @@ function buildQualityBundleFixture(root, candidateReleaseId) {
     const finalKey = `${item.layer}:${item.sceneId}:${item.repeatIndex}`;
     const attempt = {
       attemptIndex: 0,
-      evaluatorId: 'blind-fixture', evaluatorVersion: 'blind-fixture', executionChecksum: 'e'.repeat(64),
+      evaluatorId: 'blind-fixture', evaluatorVersion: 'blind-fixture', executionChecksum: contentHash(compileSceneExecutionInput(item.scene)),
       latencyMs: 1, accepted: true, unresolved: false
     };
     return {
@@ -427,7 +435,7 @@ function buildQualityBundleFixture(root, candidateReleaseId) {
       scores: Object.fromEntries(['socialUnderstanding', 'agency', 'relationshipParticipation',
         'stateContinuityFlexibility', 'livedExpression', 'actionFactIntegrity'].map(key => [key, 4])),
       preference: 'candidate', findings: [], regression: false, severe: false, tie: false, unresolved: false,
-      structuralRegression: false, protocolFailure: false, executionChecksum: 'e'.repeat(64), latencyMs: 1,
+      structuralRegression: false, protocolFailure: false, executionChecksum: contentHash(compileSceneExecutionInput(item.scene)), latencyMs: 1,
       evaluatorVersion: 'blind-fixture', attempts: [attempt]
     };
   });
@@ -473,13 +481,22 @@ function buildQualityBundleFixture(root, candidateReleaseId) {
     evaluatorVersion: 'quality-evaluator-v1', modelProfile: 'blind-fixed', componentManifest: {}, createdAt: 1,
     releaseId: candidateReleaseId, releaseChecksum: CANDIDATE_CHECKSUM
   };
+  const evidenceBoundary = {
+    version: 1, inputMode: 'preset_default', sourceClass: 'tracked_human_annotations',
+    offlineModelEvaluation: true, realHistoryEvidence: false, liveShadowEvidence: false
+  };
   const quality = {
     version: 1, productionReleaseMutation: false, candidateRelease, planChecksum: plan.planChecksum,
+    evidenceBoundary,
     replayProvenance: provenance, replayRunId: runId,
     qualityPlanSha256: sha256(Buffer.from(`${JSON.stringify(plan)}\n`)),
     qualityReplaySha256: sha256(replayBytes), qualityManualReviewSha256: sha256(manualBytes),
     qualityGate, manualReview, eligible: qualityGate.eligible && manualReview.eligible,
-    failedGates: [...qualityGate.failedGates, ...manualReview.failedGates], sourceHead: SOURCE_HEAD
+    failedGates: [...qualityGate.failedGates, ...manualReview.failedGates], sourceHead: SOURCE_HEAD,
+    evidenceBoundaryChecksum: evidenceBoundaryChecksum({
+      evidenceBoundary, planChecksum: plan.planChecksum, sourceHead: SOURCE_HEAD,
+      provenanceChecksum: provenance.provenanceChecksum
+    })
   };
   return { plan, replayBytes, manualBytes, quality };
 }
@@ -1079,6 +1096,24 @@ test('quality report rejects legacy top-level metrics instead of treating them a
   assert.throws(() => loadReadinessManifest({ manifestPath: fixture.manifestPath, evidenceDirectory: fixture.root }), /quality report keys/);
 });
 
+test('readiness rejects an explicit history override as tracked annotation evidence', () => {
+  const fixture = writeFixture();
+  const file = join(fixture.root, fixture.input.artifacts.quality.path);
+  const quality = JSON.parse(readFileSync(file, 'utf8'));
+  quality.evidenceBoundary = {
+    ...quality.evidenceBoundary,
+    inputMode: 'explicit_override',
+    sourceClass: 'explicit_history_override'
+  };
+  writeFileSync(file, `${JSON.stringify(quality)}\n`);
+  fixture.input.artifacts.quality.sha256 = sha256(readFileSync(file));
+  writeFileSync(fixture.manifestPath, `${JSON.stringify(fixture.input)}\n`);
+  assert.throws(() => loadReadinessManifest({
+    manifestPath: fixture.manifestPath,
+    evidenceDirectory: fixture.root
+  }), /quality evidence boundary/i);
+});
+
 test('readiness manifest rejects legacy top-level metrics; metrics live only in the bound artifact', () => {
   const fixture = writeFixture();
   fixture.input.metrics = { directReplyMedianMs: 1 };
@@ -1125,6 +1160,61 @@ test('quality report candidate id and checksum are bound to the manifest', () =>
     fixture.input.artifacts.quality.sha256 = sha256(readFileSync(file));
     writeFileSync(fixture.manifestPath, `${JSON.stringify(fixture.input)}\n`);
     assert.throws(() => loadReadinessManifest({ manifestPath: fixture.manifestPath, evidenceDirectory: fixture.root }), /quality/);
+  }
+});
+
+test('readiness rejects a self-consistent alternate quality plan and report', () => {
+  const fixture = writeFixture();
+  const planPath = join(fixture.root, fixture.input.artifacts.qualityPlan.path);
+  const qualityPath = join(fixture.root, fixture.input.artifacts.quality.path);
+  const plan = JSON.parse(readFileSync(planPath, 'utf8'));
+  plan.historyManifest = { ...plan.historyManifest, scenesChecksum: 'f'.repeat(64) };
+  plan.commitments = { ...plan.commitments, historyScenesChecksum: 'f'.repeat(64) };
+  plan.planChecksum = contentHash({
+    version: 1,
+    planType: plan.planType,
+    finalKeys: plan.finalKeys,
+    commitments: plan.commitments,
+    historyManifest: plan.historyManifest
+  });
+  writeFileSync(planPath, `${JSON.stringify(plan)}\n`);
+  const quality = JSON.parse(readFileSync(qualityPath, 'utf8'));
+  quality.planChecksum = plan.planChecksum;
+  quality.qualityPlanSha256 = sha256(Buffer.from(`${JSON.stringify(plan)}\n`));
+  quality.evidenceBoundaryChecksum = evidenceBoundaryChecksum({
+    evidenceBoundary: quality.evidenceBoundary,
+    planChecksum: quality.planChecksum,
+    sourceHead: quality.sourceHead,
+    provenanceChecksum: quality.replayProvenance.provenanceChecksum
+  });
+  writeFileSync(qualityPath, `${JSON.stringify(quality)}\n`);
+  fixture.input.artifacts.qualityPlan.sha256 = sha256(readFileSync(planPath));
+  fixture.input.artifacts.quality.sha256 = sha256(readFileSync(qualityPath));
+  writeFileSync(fixture.manifestPath, `${JSON.stringify(fixture.input)}\n`);
+  let failure;
+  try {
+    loadReadinessManifest({ manifestPath: fixture.manifestPath, evidenceDirectory: fixture.root });
+  } catch (error) {
+    failure = error;
+  }
+  assert.ok(failure instanceof Error);
+  assert.match(failure.message, /quality tracked plan checksum/i);
+});
+
+test('readiness tracked quality source is explicit and independent of process cwd', () => {
+  const fixture = writeFixture();
+  const previous = process.cwd();
+  const elsewhere = mkdtempSync(join(tmpdir(), 'yuqi-readiness-cwd-'));
+  try {
+    process.chdir(elsewhere);
+    assert.doesNotThrow(() => loadReadinessManifest({
+      manifestPath: fixture.manifestPath,
+      evidenceDirectory: fixture.root,
+      qualitySourceDirectory: previous
+    }));
+  } finally {
+    process.chdir(previous);
+    rmSync(elsewhere, { recursive: true, force: true });
   }
 });
 
@@ -1312,6 +1402,7 @@ test('run mode invokes formal visible-path finalizer before npm/Gradle and conti
     const result = await verifyReadinessFromDirectory({
       evidenceDir: fixture.evidence,
       repoRoot: fixture.root,
+      qualitySourceDirectory: process.cwd(),
       runtimeConfig,
       productionInputsLoader: () => {
         events.push('runtime');
@@ -1538,6 +1629,7 @@ test('run mode uses one selected device, absolute npm/Gradle commands, exact cla
   const result = await verifyReadinessFromDirectory({
     evidenceDir: evidence,
     repoRoot: root,
+    qualitySourceDirectory: process.cwd(),
     run: true,
     productionInputsLoader: () => ({}),
     formalFinalizer: async () => fixed.visiblePathMetrics,

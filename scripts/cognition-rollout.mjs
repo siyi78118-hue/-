@@ -1,12 +1,52 @@
+import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
 import { canonicalJson, contentHash } from '../yuqi-runtime/src/protocol.mjs';
 import { PromotionController } from '../yuqi-runtime/src/promotion-controller.mjs';
+import {
+  assertQualityReportProvenance,
+  evidenceBoundaryChecksum,
+  loadQualityHistoryArtifacts,
+  validateQualityArtifactBundle
+} from './report-yuqi-lived-quality.mjs';
+import { createQualityReplayPlan } from './run-yuqi-lived-quality-replay.mjs';
+import { expectedFinalKeysProjection, loadQualityReplayPlanArtifact } from '../yuqi-runtime/src/quality-replay.mjs';
+import { assertEvidenceDirectoryScope, gitStatusArgsForEvidence } from './run-yuqi-visible-path-formal.mjs';
+
+const VALIDATED_RAW_BUNDLES = new WeakSet();
 import { YuqiStore } from '../yuqi-runtime/src/store.mjs';
+
+const ROLLOUT_EVIDENCE_ROOT = 'artifacts/yuqi-lived-agency-v3';
+
+function defaultRolloutCommandRunner(executable, args, { cwd } = {}) {
+  try {
+    return { exitCode: 0, stdout: execFileSync(executable, args, {
+      cwd, encoding: 'utf8', windowsHide: true
+    }) };
+  } catch (error) {
+    return {
+      exitCode: Number.isInteger(error.status) ? error.status : 1,
+      stdout: String(error.stdout || ''),
+      stderr: String(error.stderr || ''),
+      error
+    };
+  }
+}
+
+let rolloutCommandRunner = defaultRolloutCommandRunner;
+
+// Test-only seam: the CLI never reads options for this dependency.
+export function setRolloutCommandRunnerForTests(runner = null) {
+  if (runner !== null && typeof runner !== 'function') {
+    throw new TypeError('rollout command runner must be a function or null');
+  }
+  rolloutCommandRunner = runner || defaultRolloutCommandRunner;
+}
 
 function parseArgs(argv) {
   const result = { _: [] };
@@ -35,6 +75,78 @@ function readJson(path, label) {
   } catch (error) {
     throw new Error(`${label} is invalid: ${error.message}`);
   }
+}
+
+function commandOutput(result) {
+  return String(result?.stdout ?? result?.output ?? '');
+}
+
+function pathIsWithin(parent, candidate, allowSame = false) {
+  const rel = relative(parent, candidate);
+  return (allowSame && rel === '') || (rel !== '' && !rel.startsWith('..') && !isAbsolute(rel));
+}
+
+function assertRolloutEvidenceScope(rootDir, evidenceDir) {
+  const fixedRoot = resolve(rootDir, ROLLOUT_EVIDENCE_ROOT);
+  if (!pathIsWithin(fixedRoot, resolve(evidenceDir), true)) {
+    throw new Error('evidence directory scope');
+  }
+  return assertEvidenceDirectoryScope(rootDir, evidenceDir);
+}
+
+function assertScopedStatus(statusText, rootDir, evidenceDir) {
+  const records = String(statusText).split('\0').filter(Boolean);
+  for (const record of records) {
+    const pathText = record.length >= 3 && /^[ MARCUD?!][ MARCUD?!] /.test(record)
+      ? record.slice(3)
+      : record;
+    for (const rawPath of pathText.split(' -> ')) {
+      if (!rawPath) continue;
+      if (isAbsolute(rawPath)) throw new Error('source tree status path is outside repository');
+      const candidate = resolve(rootDir, rawPath);
+      if (!pathIsWithin(rootDir, candidate, true)) {
+        throw new Error('source tree is dirty outside evidence directory');
+      }
+      if (!pathIsWithin(evidenceDir, candidate, true)) {
+        throw new Error('source tree is dirty outside evidence directory');
+      }
+    }
+  }
+}
+
+export function preflightRolloutSourceAuthority({ rootDir = process.cwd(), reportPath, commandRunner = rolloutCommandRunner } = {}) {
+  if (typeof reportPath !== 'string' || !reportPath) throw new Error('quality report path required');
+  const root = resolve(rootDir);
+  const evidenceDir = dirname(resolve(reportPath));
+  assertRolloutEvidenceScope(root, evidenceDir);
+  const report = readJson(resolve(reportPath), 'quality report');
+  const reportHead = report?.sourceHead;
+  const provenanceHead = report?.replayProvenance?.sourceHead;
+  if (!/^[0-9a-f]{40}$/.test(reportHead || '')
+    || provenanceHead !== reportHead) {
+    throw new Error('quality report source authority is unavailable');
+  }
+  const run = (executable, args) => {
+    const result = commandRunner(executable, args, { cwd: root });
+    if (!result || !Number.isInteger(result.exitCode)) {
+      throw new Error('rollout command runner returned an invalid result');
+    }
+    return result;
+  };
+  const headResult = run('git', ['rev-parse', 'HEAD']);
+  if (headResult.exitCode !== 0) throw new Error('git rev-parse HEAD failed');
+  const currentHead = commandOutput(headResult).trim();
+  if (!/^[0-9a-f]{40}$/.test(currentHead) || currentHead !== reportHead) {
+    throw new Error('quality report sourceHead is stale');
+  }
+  const statusResult = run('git', gitStatusArgsForEvidence(root, evidenceDir));
+  if (statusResult.exitCode !== 0) throw new Error('git status source preflight failed');
+  assertScopedStatus(commandOutput(statusResult), root, evidenceDir);
+  return { sourceHead: currentHead, evidenceDir, evidenceScope: 'scoped' };
+}
+
+function rawSha256(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
 }
 
 function fileFingerprint(path) {
@@ -158,13 +270,67 @@ function runtimeFromConfig(configPath, { readOnly = false } = {}) {
   };
 }
 
-function reportSummaryFromArtifact({ artifact, rollout }) {
+export function loadQualityPromotionRawBundle({ artifactPath, artifact, rootDir = process.cwd() }) {
+  if (typeof artifactPath !== 'string' || !artifactPath) throw new Error('quality report path required');
+  const directory = dirname(resolve(artifactPath));
+  const paths = {
+    plan: join(directory, 'quality-replay-plan.json'),
+    replay: join(directory, 'quality-replay.jsonl'),
+    manual: join(directory, 'quality-manual-review.jsonl')
+  };
+  if (Object.values(paths).some(path => !existsSync(path))) {
+    throw new Error('quality raw bundle is incomplete');
+  }
+  const planBytes = readFileSync(paths.plan);
+  const replayBytes = readFileSync(paths.replay);
+  const manualBytes = readFileSync(paths.manual);
+  const history = loadQualityHistoryArtifacts({ rootDir });
+  const plan = loadQualityReplayPlanArtifact({
+    artifactPath: paths.plan,
+    rootDir,
+    historyScenes: history.historyScenes,
+    historyManifest: history.historyManifest
+  });
+  if (!artifact || artifact.qualityPlanSha256 !== rawSha256(planBytes)
+    || artifact.qualityReplaySha256 !== rawSha256(replayBytes)
+    || artifact.qualityManualReviewSha256 !== rawSha256(manualBytes)) {
+    throw new Error('quality raw artifact checksum binding conflict');
+  }
+  const bundle = validateQualityArtifactBundle({
+    plan,
+    replayArtifactPath: paths.replay,
+    manualReviewArtifactPath: paths.manual,
+    candidateRelease: artifact.candidateRelease,
+    qualityReport: artifact
+  });
+  if (bundle.runId !== artifact.replayRunId
+    || canonicalJson(bundle.provenance) !== canonicalJson(artifact.replayProvenance)) {
+    throw new Error('quality raw provenance binding conflict');
+  }
+  const validatedBundle = { ...bundle, plan, paths, checksums: {
+    plan: rawSha256(planBytes), replay: rawSha256(replayBytes), manual: rawSha256(manualBytes)
+  } };
+  VALIDATED_RAW_BUNDLES.add(validatedBundle);
+  return validatedBundle;
+}
+
+export function reportSummaryFromArtifact({ artifact, rollout, rootDir = process.cwd(), rawBundle = null }) {
+  if (!rawBundle || typeof rawBundle !== 'object' || Array.isArray(rawBundle)
+    || !VALIDATED_RAW_BUNDLES.has(rawBundle)
+    || !rawBundle.plan || !rawBundle.provenance || !rawBundle.checksums
+    || typeof rawBundle.checksums.plan !== 'string'
+    || typeof rawBundle.checksums.replay !== 'string'
+    || typeof rawBundle.checksums.manual !== 'string') {
+    throw new Error('validated quality raw bundle is required');
+  }
   if (!artifact || typeof artifact !== 'object' || Array.isArray(artifact)) {
     throw new Error('quality report object is required');
   }
   const allowed = new Set([
     'version', 'productionReleaseMutation', 'eligible', 'failedGates', 'candidateRelease',
-    'planChecksum', 'replayProvenance', 'qualityGate', 'manualReview', 'reportId'
+    'planChecksum', 'replayProvenance', 'qualityGate', 'manualReview', 'reportId',
+    'evidenceBoundary', 'sourceHead', 'replayRunId', 'qualityPlanSha256',
+    'qualityReplaySha256', 'qualityManualReviewSha256', 'evidenceBoundaryChecksum'
   ]);
   if (Object.keys(artifact).some(key => !allowed.has(key))) {
     throw new Error('quality report contains unknown fields');
@@ -185,28 +351,85 @@ function reportSummaryFromArtifact({ artifact, rollout }) {
     || !artifact.manualReview || artifact.manualReview.eligible !== true
     || !Array.isArray(artifact.manualReview.failedGates)
     || artifact.manualReview.failedGates.length !== 0
+    || !artifact.evidenceBoundary
+    || artifact.evidenceBoundary.version !== 1
+    || artifact.evidenceBoundary.inputMode !== 'preset_default'
+    || artifact.evidenceBoundary.sourceClass !== 'tracked_human_annotations'
+    || artifact.evidenceBoundary.offlineModelEvaluation !== true
+    || artifact.evidenceBoundary.realHistoryEvidence !== false
+    || artifact.evidenceBoundary.liveShadowEvidence !== false
+    || !/^[0-9a-f]{40}$/.test(artifact.sourceHead || '')
+    || !/^[0-9a-f]{64}$/.test(artifact.planChecksum || '')
+    || !/^[0-9a-f]{64}$/.test(artifact.evidenceBoundaryChecksum || '')
     || (artifact.reportId !== undefined
       && (typeof artifact.reportId !== 'string' || artifact.reportId.length === 0))) {
     throw new Error('eligible materialized quality report is required');
+  }
+  if (artifact.evidenceBoundaryChecksum !== evidenceBoundaryChecksum({
+    evidenceBoundary: artifact.evidenceBoundary,
+    planChecksum: artifact.planChecksum,
+    sourceHead: artifact.sourceHead,
+    provenanceChecksum: artifact.replayProvenance.provenanceChecksum
+  })) {
+    throw new Error('eligible materialized quality report evidence boundary checksum conflict');
+  }
+  let trackedPlan;
+  try {
+    trackedPlan = createQualityReplayPlan({ rootDir });
+  } catch (error) {
+    throw new Error(`tracked annotation plan unavailable: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (artifact.planChecksum !== trackedPlan.planChecksum) {
+    throw new Error('quality report plan is not the tracked annotation plan');
+  }
+  if (rawBundle.plan.planChecksum !== trackedPlan.planChecksum
+    || canonicalJson(rawBundle.provenance) !== canonicalJson(artifact.replayProvenance)
+    || artifact.qualityPlanSha256 !== rawBundle.checksums.plan
+    || artifact.qualityReplaySha256 !== rawBundle.checksums.replay
+    || artifact.qualityManualReviewSha256 !== rawBundle.checksums.manual
+    || artifact.replayRunId !== rawBundle.runId) {
+    throw new Error('quality raw bundle/report binding conflict');
+  }
+  const expectedProjection = expectedFinalKeysProjection(trackedPlan);
+  const expectedFinalKeys = [
+    ...expectedProjection.finalKeys.sentinelFinalKeys,
+    ...expectedProjection.finalKeys.coverageFinalKeys,
+    ...expectedProjection.finalKeys.historyFinalKeys
+  ];
+  try {
+    assertQualityReportProvenance(artifact.replayProvenance, {
+      expectedFinalKeys,
+      candidateRelease: artifact.candidateRelease,
+      sourceHead: artifact.sourceHead
+    });
+  } catch (error) {
+    throw new Error(`eligible materialized quality report provenance: ${error instanceof Error ? error.message : String(error)}`);
   }
   const pair = artifact.replayProvenance?.executionPairs?.[0] || {};
   const candidate = artifact.candidateRelease;
   return {
     eligible: true,
     candidateRelease: candidate,
-    stableBaselineReleaseId: pair.stableReleaseId || rollout.stableReleaseId,
-    stableBaselineReleaseChecksum: pair.stableReleaseChecksum
-      || null,
+    stableBaselineReleaseId: pair.stableReleaseId,
+    stableBaselineReleaseChecksum: pair.stableReleaseChecksum,
     evaluatorVersion: candidate.evaluatorVersion,
     suiteChecksum: artifact.planChecksum || '',
+    evidenceBoundaryChecksum: artifact.evidenceBoundaryChecksum,
+    sourceHead: artifact.sourceHead,
+    provenanceChecksum: artifact.replayProvenance.provenanceChecksum,
+    replayRunId: rawBundle.runId,
+    qualityPlanSha256: rawBundle.checksums.plan,
+    qualityReplaySha256: rawBundle.checksums.replay,
+    qualityManualReviewSha256: rawBundle.checksums.manual,
     liveShadowSuccessCount: Number(artifact.qualityGate?.liveShadowSuccessCount || 0),
     criticalErrors: Number(artifact.qualityGate?.criticalErrors || 0)
   };
 }
 
-function persistMaterializedReport(store, rolloutKey, artifactPath, rollout) {
+function persistMaterializedReport(store, rolloutKey, artifactPath, rollout, { rootDir = process.cwd() } = {}) {
   const artifact = readJson(resolve(artifactPath), 'quality report');
-  const summary = reportSummaryFromArtifact({ artifact, rollout });
+  const rawBundle = loadQualityPromotionRawBundle({ artifactPath, artifact, rootDir });
+  const summary = reportSummaryFromArtifact({ artifact, rollout, rootDir, rawBundle });
   store.validateMaterializedPromotionReportInputInternal({ rolloutKey, summary });
   const reportId = artifact.reportId
     || `quality_report_${contentHash({ rolloutKey, artifact }).slice(0, 24)}`;
@@ -253,6 +476,13 @@ export function executeRolloutCommand({ command, options, stdout = process.stdou
   const kind = String(options?.kind || 'DIRECT_REPLY');
   const configPath = options?.config;
   if (!configPath) throw new Error('--config is required');
+  const rootDir = options.root ? resolve(String(options.root)) : process.cwd();
+  if (command === 'promote') {
+    preflightRolloutSourceAuthority({
+      rootDir,
+      reportPath: options.report
+    });
+  }
   const runtime = runtimeFromConfig(configPath, { readOnly: command === 'status' || command === 'check' });
   let commandError = null;
   try {
@@ -283,7 +513,9 @@ export function executeRolloutCommand({ command, options, stdout = process.stdou
       return result;
     }
     if (command !== 'promote') throw new Error(`unknown cognition rollout command: ${command}`);
-    const report = persistMaterializedReport(store, kind, options.report, current);
+    const report = persistMaterializedReport(store, kind, options.report, current, {
+      rootDir
+    });
     if (options['candidate-release-id']
       && String(options['candidate-release-id']) !== report.summary.candidateRelease.releaseId) {
       throw new Error('candidate release id does not match materialized quality report');

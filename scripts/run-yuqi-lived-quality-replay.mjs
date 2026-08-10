@@ -7,6 +7,10 @@ import { pathToFileURL } from 'node:url';
 
 import { compileQualitySuite } from './compile-yuqi-lived-quality-scenes.mjs';
 import {
+  loadVerifiedPresetHistoryArtifacts,
+  presetHistoryArtifactPaths
+} from './compile-yuqi-preset-history-scenes.mjs';
+import {
   buildVerifiedQualityReplayPlan,
   assertVerifiedQualityReplayPlan,
   appendQualityAttempt,
@@ -30,33 +34,39 @@ function readJsonLines(path) {
 }
 
 export function createQualityReplayPlan({ rootDir = process.cwd(), historyScenes, historyManifest } = {}) {
-  if (!Array.isArray(historyScenes) || historyScenes.length !== 30) {
-    throw new Error('quality replay requires exactly 30 local history scenes');
+  const resolvedHistoryScenes = historyScenes || loadLocalHistoryScenes({ rootDir });
+  const resolvedHistoryManifest = historyManifest || loadLocalHistoryManifest({ rootDir });
+  if (!Array.isArray(resolvedHistoryScenes) || resolvedHistoryScenes.length !== 30) {
+    throw new Error('quality replay requires exactly 30 human annotation scenes');
   }
   const suite = compileQualitySuite({ rootDir, checkOnly: true });
   return buildVerifiedQualityReplayPlan({
     compiledSuite: suite,
-    historyScenes,
-    historyManifest
+    historyScenes: resolvedHistoryScenes,
+    historyManifest: resolvedHistoryManifest
   });
 }
 
 export function loadLocalHistoryScenes({ rootDir = process.cwd(), path } = {}) {
-  const historyPath = path || resolve(rootDir, 'artifacts/yuqi-lived-agency-v3/private/real-history-scenes.jsonl');
-  if (!existsSync(historyPath)) throw new Error(`local history scenes not found: ${historyPath}`);
+  const historyPath = path || presetHistoryArtifactPaths(rootDir).scenesPath;
+  if (!existsSync(historyPath)) throw new Error(`human annotation scenes not found: ${historyPath}`);
   const raw = readFileSync(historyPath, 'utf8');
   const scenes = raw.trimStart().startsWith('[') ? JSON.parse(raw) : readJsonLines(historyPath);
-  if (scenes.length !== 30) throw new Error('local history scene count must be 30');
+  if (scenes.length !== 30) throw new Error('human annotation scene count must be 30');
+  if (!path) {
+    return loadVerifiedPresetHistoryArtifacts({ rootDir }).scenes;
+  }
   return scenes;
 }
 
 export function loadLocalHistoryManifest({ rootDir = process.cwd(), path } = {}) {
-  const manifestPath = path || resolve(
-    rootDir,
-    'artifacts/yuqi-lived-agency-v3/private/real-history-scenes.manifest.json'
-  );
-  if (!existsSync(manifestPath)) throw new Error(`local history manifest not found: ${manifestPath}`);
-  return JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const manifestPath = path || presetHistoryArtifactPaths(rootDir).manifestPath;
+  if (!existsSync(manifestPath)) throw new Error(`human annotation manifest not found: ${manifestPath}`);
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  if (!path) {
+    return loadVerifiedPresetHistoryArtifacts({ rootDir }).manifest;
+  }
+  return manifest;
 }
 
 export function captureCleanSourceHead({ rootDir = process.cwd() } = {}) {
@@ -441,7 +451,7 @@ if (isMain) {
         version: 1,
         eligible: false,
         productionReleaseMutation: false,
-        failedGates: [execute ? 'QUALITY_REPLAY_EXECUTION_UNAVAILABLE' : 'PRIVATE_HISTORY_OR_PLAN_UNAVAILABLE'],
+        failedGates: [execute ? 'QUALITY_REPLAY_EXECUTION_UNAVAILABLE' : 'ANNOTATION_EVIDENCE_OR_PLAN_UNAVAILABLE'],
         blockingReason: error instanceof Error ? error.message : String(error)
       }, null, 2)}\n`);
       process.exitCode = 2;

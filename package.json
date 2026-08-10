@@ -8,6 +8,7 @@
     "cognition:replay": "node scripts/run-yuqi-cognition-replay.mjs",
     "cognition:replay-report": "node scripts/report-yuqi-cognition-replay.mjs",
     "cognition:quality:check": "node scripts/compile-yuqi-lived-quality-scenes.mjs --check",
+    "cognition:quality:annotations": "node scripts/compile-yuqi-preset-history-scenes.mjs --write",
     "cognition:quality:replay": "node scripts/run-yuqi-lived-quality-replay.mjs",
     "cognition:quality:report": "node scripts/report-yuqi-lived-quality.mjs",
     "cognition:promotion-check": "node scripts/cognition-rollout.mjs check",

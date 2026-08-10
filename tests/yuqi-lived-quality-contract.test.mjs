@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import test from 'node:test';
 
@@ -33,6 +35,10 @@ test('real-history extraction is candidate-first and labels cannot supply persis
 test('quality CLI package scripts are declared without production release registration', () => {
   const packageJson = JSON.parse(readFileSync(resolve(rootDir, 'package.json'), 'utf8'));
   assert.equal(packageJson.scripts['cognition:quality:check'], 'node scripts/compile-yuqi-lived-quality-scenes.mjs --check');
+  assert.equal(
+    packageJson.scripts['cognition:quality:annotations'],
+    'node scripts/compile-yuqi-preset-history-scenes.mjs --write'
+  );
   assert.equal(packageJson.scripts['cognition:quality:replay'], 'node scripts/run-yuqi-lived-quality-replay.mjs');
   assert.equal(packageJson.scripts['cognition:quality:report'], 'node scripts/report-yuqi-lived-quality.mjs');
   const replaySource = readFileSync(resolve(rootDir, 'scripts/run-yuqi-lived-quality-replay.mjs'), 'utf8');
@@ -58,6 +64,8 @@ test('protocol suite contains 270 cases but makes no human-quality claim', () =>
 
 test('human quality suite has exact source-grounded counts and complete annotations', () => {
   const suite = compileQualitySuite({ rootDir, checkOnly: true });
+  assert.equal(suite.manifest.humanAnnotationSceneCount, 30);
+  assert.equal(Object.hasOwn(suite.manifest, 'localHistoryTargetCount'), false);
   assert.equal(suite.sentinelSeeds.length, 24);
   assert.equal(suite.coverageScenes.length, 72);
   for (const scene of [...suite.sentinelSeeds, ...suite.coverageScenes]) {
@@ -105,12 +113,43 @@ test('source grounding index is a closed, exact 24-sentinel integrity manifest',
   for (const [sceneId, entry] of Object.entries(index.sentinels)) {
     assert.ok(sceneId && typeof sceneId === 'string');
     assert.deepEqual(Object.keys(entry).sort(), [
-      'file', 'heading', 'headingChecksum', 'sceneChecksum'
+      'file', 'heading', 'headingChecksum', 'sceneChecksum', 'sectionChecksum', 'sourceDocSha256'
     ]);
     assert.equal(typeof entry.file, 'string');
     assert.equal(typeof entry.heading, 'string');
     assert.match(entry.headingChecksum, /^[0-9a-f]{64}$/);
     assert.match(entry.sceneChecksum, /^[0-9a-f]{64}$/);
+    assert.match(entry.sourceDocSha256, /^[0-9a-f]{64}$/);
+    assert.match(entry.sectionChecksum, /^[0-9a-f]{64}$/);
+  }
+});
+
+test('source grounding commits exact document and markdown section bytes, including shared fourth-round sections', () => {
+  const index = readJson(resolve(qualityRoot, 'source-grounding-index.json'));
+  const repeatedFourth = Object.values(index.sentinels).filter(entry => (
+    entry.file === '真人聊天训练批注-第四轮-交接.md' && entry.heading === '七、建议的第四轮覆盖范围'
+  ));
+  assert.equal(repeatedFourth.length, 7);
+  assert.equal(new Set(repeatedFourth.map(entry => entry.sectionChecksum)).size, 1);
+  for (const entry of Object.values(index.sentinels)) {
+    const markdown = readFileSync(resolve(rootDir, 'preset-references', entry.file), 'utf8');
+    const normalized = markdown.replaceAll('\r\n', '\n');
+    const lines = normalized.split('\n');
+    const headingMatch = new RegExp(`^#{2,6}\\s+${entry.heading.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\s*$`);
+    const headingIndex = lines.findIndex(line => {
+      const match = line.match(/^(#{2,6})\s+(.+?)\s*$/);
+      return match && match[2] === entry.heading;
+    });
+    assert.notEqual(headingIndex, -1, `${entry.file}#${entry.heading}`);
+    const level = lines[headingIndex].match(/^(#{2,6})/)[1].length;
+    let end = lines.length;
+    for (let i = headingIndex + 1; i < lines.length; i += 1) {
+      const match = lines[i].match(/^(#{2,6})\s+(.+?)\s*$/);
+      if (match && match[1].length <= level) { end = i; break; }
+    }
+    const section = lines.slice(headingIndex, end).join('\n').trimEnd();
+    assert.equal(entry.sourceDocSha256, createHash('sha256').update(markdown, 'utf8').digest('hex'));
+    assert.equal(entry.sectionChecksum, createHash('sha256').update(section, 'utf8').digest('hex'));
   }
 });
 
@@ -118,6 +157,34 @@ test('compiled quality suite carries the committed source grounding index', () =
   const suite = compileQualitySuite({ rootDir, checkOnly: true });
   const index = readJson(resolve(qualityRoot, 'source-grounding-index.json'));
   assert.deepEqual(suite.sourceGroundingIndex, index);
+});
+
+test('quality compilation fails when any referenced annotation document is absent', () => {
+  const tempRoot = mkdtempSync(resolve(tmpdir(), 'yuqi-quality-source-'));
+  mkdirSync(resolve(tempRoot, 'tests/fixtures'), { recursive: true });
+  mkdirSync(resolve(tempRoot, 'preset-references'), { recursive: true });
+  cpSync(qualityRoot, resolve(tempRoot, 'tests/fixtures/yuqi-lived-quality-v1'), { recursive: true });
+  for (const file of ['真人聊天训练批注-第一轮.md', '真人聊天训练批注-第二轮.md']) {
+    cpSync(resolve(rootDir, 'preset-references', file), resolve(tempRoot, 'preset-references', file));
+  }
+  assert.throws(() => compileQualitySuite({ rootDir: tempRoot, checkOnly: true }), /source.*not found/i);
+});
+
+test('quality compilation rejects a changed section when its heading is retained', () => {
+  const tempRoot = mkdtempSync(resolve(tmpdir(), 'yuqi-quality-section-'));
+  mkdirSync(resolve(tempRoot, 'tests/fixtures'), { recursive: true });
+  mkdirSync(resolve(tempRoot, 'preset-references'), { recursive: true });
+  cpSync(qualityRoot, resolve(tempRoot, 'tests/fixtures/yuqi-lived-quality-v1'), { recursive: true });
+  for (const file of ['真人聊天训练批注-第一轮.md', '真人聊天训练批注-第二轮.md', '真人聊天训练批注-第四轮-交接.md']) {
+    cpSync(resolve(rootDir, 'preset-references', file), resolve(tempRoot, 'preset-references', file));
+  }
+  const path = resolve(tempRoot, 'preset-references/真人聊天训练批注-第四轮-交接.md');
+  const original = readFileSync(path, 'utf8');
+  writeFileSync(path, original.replace('七、建议的第四轮覆盖范围', '七、建议的第四轮覆盖范围\nsection tampered for closure'), 'utf8');
+  assert.throws(
+    () => compileQualitySuite({ rootDir: tempRoot, checkOnly: true }),
+    /source document|section|checksum/i
+  );
 });
 
 test('source grounding index rejects a substituted scene checksum', () => {

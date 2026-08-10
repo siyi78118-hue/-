@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-import { QUALITY_DIMENSIONS } from '../src/quality-evaluator.mjs';
+import { QUALITY_DIMENSIONS, compileSceneExecutionInput } from '../src/quality-evaluator.mjs';
 import { contentHash } from '../src/protocol.mjs';
 import { buildVerifiedQualityReplayPlan, writeQualityReplayPlanArtifact } from '../src/quality-replay.mjs';
 import { compileQualitySuite } from '../../scripts/compile-yuqi-lived-quality-scenes.mjs';
@@ -17,7 +17,11 @@ import {
 } from '../../scripts/report-yuqi-lived-quality.mjs';
 
 const COMPILED_SUITE = compileQualitySuite({ rootDir: process.cwd(), checkOnly: true });
-const HISTORY_SCENES = Array.from({ length: 30 }, (_, index) => ({ sceneId: `history-${index}` }));
+const HISTORY_SCENES = Array.from({ length: 30 }, (_, index) => ({
+  sceneId: `history-${index}`,
+  rolloutKey: 'direct',
+  turns: []
+}));
 const AUTHORITY_PLAN = buildVerifiedQualityReplayPlan({
   compiledSuite: COMPILED_SUITE,
   historyScenes: HISTORY_SCENES,
@@ -31,14 +35,15 @@ const SOURCE_HEAD = 'd'.repeat(40);
 
 function evidence() {
   const make = (layer) => AUTHORITY_PLAN.items.filter(item => item.layer === layer).map(item => ({
+    ...(() => { const executionChecksum = contentHash(compileSceneExecutionInput(item.scene)); return { executionChecksum }; })(),
     layer, sceneId: item.sceneId, repeatIndex: item.repeatIndex, finalized: true,
     scores: Object.fromEntries(QUALITY_DIMENSIONS.map(key => [key, 4])),
     preference: 'candidate', regression: false, severe: false, tie: false,
     findings: [], unresolved: false, structuralRegression: false, protocolFailure: false,
     attempts: [{ attemptIndex: 0, evaluatorId: `${layer}-${item.sceneId}-${item.repeatIndex}`,
-      accepted: true, unresolved: false, executionChecksum: 'b'.repeat(64),
+      accepted: true, unresolved: false, executionChecksum: contentHash(compileSceneExecutionInput(item.scene)),
       latencyMs: 0, evaluatorVersion: 'blind-evaluator-v1' }],
-    executionChecksum: 'b'.repeat(64), latencyMs: 0, evaluatorVersion: 'blind-evaluator-v1'
+    latencyMs: 0, evaluatorVersion: 'blind-evaluator-v1'
   }));
   return { sentinelRuns: make('sentinel'), coverageRuns: make('coverage'), historyRuns: make('history') };
 }
@@ -46,15 +51,15 @@ function evidence() {
 function replayProvenance(plan, candidate) {
   const keys = plan.items.map(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}`);
   const executionPairs = keys.map(finalKey => ({
+      executionChecksum: contentHash(compileSceneExecutionInput(plan.items.find(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}` === finalKey).scene)),
       finalKey,
       sourceHead: SOURCE_HEAD,
       stableReleaseId: 'stable-release-v1',
       stableReleaseChecksum: 'a'.repeat(64),
       candidateReleaseId: candidate.releaseId,
       candidateReleaseChecksum: candidate.releaseChecksum,
-      executionChecksum: 'b'.repeat(64),
-      stableInputChecksum: 'b'.repeat(64),
-      candidateInputChecksum: 'b'.repeat(64),
+      stableInputChecksum: contentHash(compileSceneExecutionInput(plan.items.find(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}` === finalKey).scene)),
+      candidateInputChecksum: contentHash(compileSceneExecutionInput(plan.items.find(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}` === finalKey).scene)),
       dryRun: true,
       capabilities: { visible: false, actions: false }
     }));
@@ -127,9 +132,23 @@ test('candidate release definition and quality report are deterministic and meta
   assert.match(candidate.releaseChecksum, /^[0-9a-f]{64}$/);
   const report = materializeQualityReport({ evidence: evidence(), expectedPlan: AUTHORITY_PLAN, candidateRelease: candidate });
   assert.equal(report.qualityGate.eligible, true);
+  assert.deepEqual(report.evidenceBoundary, {
+    version: 1,
+    inputMode: 'explicit_override',
+    sourceClass: 'explicit_history_override',
+    offlineModelEvaluation: true,
+    realHistoryEvidence: false,
+    liveShadowEvidence: false
+  });
   assert.equal(report.productionReleaseMutation, false);
   assert.deepEqual(report.candidateRelease, candidate);
   assert.equal(report.sourceHead, SOURCE_HEAD);
+  assert.equal(report.evidenceBoundaryChecksum, contentHash({
+    evidenceBoundary: report.evidenceBoundary,
+    planChecksum: report.planChecksum,
+    sourceHead: report.sourceHead,
+    provenanceChecksum: report.replayProvenance.provenanceChecksum
+  }));
 });
 
 test('report rejects final and attempt evidence without exact execution/input/source/candidate pair joins', () => {
@@ -472,8 +491,50 @@ test('formal quality reporter selects one raw run and binds all three artifact c
     assert.match(report.qualityReplaySha256, /^[0-9a-f]{64}$/);
     assert.match(report.qualityManualReviewSha256, /^[0-9a-f]{64}$/);
     const replayRows = readFileSync(replayPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
-    replayRows[0].runId = '33333333-3333-4333-8333-333333333333';
+    const forgedKey = `${AUTHORITY_PLAN.items[0].layer}:${AUTHORITY_PLAN.items[0].sceneId}:${AUTHORITY_PLAN.items[0].repeatIndex}`;
+    const forgedChecksum = 'c'.repeat(64);
+    for (const row of replayRows) {
+      const rowKey = row.finalKey || `${row.layer}:${row.sceneId}:${row.repeatIndex}`;
+      if (rowKey !== forgedKey) continue;
+      if (row.recordType === 'execution' || row.recordType === 'attempt' || row.recordType === 'final-checksum') {
+        row.executionChecksum = forgedChecksum;
+        if (row.recordType === 'execution') {
+          row.stableInputChecksum = forgedChecksum;
+          row.candidateInputChecksum = forgedChecksum;
+        }
+      }
+      if (row.recordType === 'final') {
+        row.executionChecksum = forgedChecksum;
+        row.attempts = row.attempts.map(attempt => ({ ...attempt, executionChecksum: forgedChecksum }));
+      }
+    }
+    const forgedExecutionPairs = replayRows.filter(row => row.recordType === 'execution').map(row => {
+      const copy = { ...row };
+      delete copy.recordType; delete copy.runId;
+      return copy;
+    });
+    const forgedModelRuns = replayRows.filter(row => row.recordType === 'model').map(row => {
+      const copy = { ...row };
+      delete copy.recordType; delete copy.runId;
+      return copy;
+    });
+    const provenanceRow = replayRows.find(row => row.recordType === 'provenance');
+    const forgedProvenance = {
+      runId, sourceHead: provenanceRow.sourceHead,
+      executionPairs: forgedExecutionPairs, modelRuns: forgedModelRuns
+    };
+    provenanceRow.provenanceChecksum = contentHash(forgedProvenance);
     writeFileSync(replayPath, `${replayRows.map(row => JSON.stringify(row)).join('\n')}\n`);
+    assert.throws(() => materializeQualityReportFromArtifacts({
+      planArtifactPath: planPath, replayArtifactPath: replayPath, manualReviewArtifactPath: manualPath,
+      rootDir: process.cwd(), historyPath: AUTHORITY_HISTORY_PATH, historyManifestPath: AUTHORITY_MANIFEST_PATH,
+      candidateRelease: candidate
+    }), /execution input checksum authority conflict/i);
+    // Recreate the untouched valid raw replay before the independent run-identity mutation.
+    writeFileSync(replayPath, `${rows.map(row => JSON.stringify(row)).join('\n')}\n`);
+    const validRows = rows.map(row => ({ ...row }));
+    validRows[0].runId = '33333333-3333-4333-8333-333333333333';
+    writeFileSync(replayPath, `${validRows.map(row => JSON.stringify(row)).join('\n')}\n`);
     assert.throws(() => materializeQualityReportFromArtifacts({
       planArtifactPath: planPath, replayArtifactPath: replayPath, manualReviewArtifactPath: manualPath,
       rootDir: process.cwd(), historyPath: AUTHORITY_HISTORY_PATH, historyManifestPath: AUTHORITY_MANIFEST_PATH,
