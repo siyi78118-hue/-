@@ -286,7 +286,7 @@ The bridge alone constructs the blind evaluator input from the persisted stable/
 
 The test fixture path is separate. Every Task 5 SQLite database has an immutable one-row `quality_ledger_meta` authority with exact `{schemaVersion,evidenceClass}`; `evidenceClass` is exactly `production|fixture`, is fixed before any run row is inserted, and is validated on every open. Only the branded run-authority path may create `production`; the callback fixture API can create only `fixture` and is additionally branded `evidenceEligible:false`. A fixture database cannot create a production header/attestation, cannot be opened by the production exporter/readiness validator, and cannot share a production ledger path. Changing, deleting, duplicating, or self-consistently recreating the meta row fails reopen. The production exporter accepts no caller `evidenceClass`: it first opens SQLite read-only, reads the unique meta row, and requires `production` before reading any run, phase, call, or final row. JSONL is an atomic export of validated SQLite rows only; it is never a state source, append log, resume source, or substitute ledger.
 
-Task 5's ten files are sufficient for the consumer, brand, and bridge boundary. Task 7 may add only `scripts/yuqi-quality-production-execution-config.mjs`, its test, and the private-artifact ignore rule; it may construct the run authority from data materials but may not add a production callback or injection seam. No extra Task 5 production file is authorized.
+Task 5's ten files are sufficient for the consumer, brand, and bridge boundary as implemented in Task 5. The later independent Task 7 preflight review found that its original three-file limit could not bind immutable input artifacts, four real session lanes, CLI factory arguments, and restart stores without leaving a second brand or unused data-only configuration. The revised Task 7 file list at lines 480–491 therefore authorizes additive closure changes to the existing bridge, ledger, evaluator schema, and runner. It may not add a production callback or injection seam, weaken any Task 5 brand/recovery invariant, or make fixture evidence eligible.
 
 - [ ] **Step 1: Write judgment-closure red tests**
 
@@ -307,11 +307,11 @@ Implement and test:
 
 The red tests must attempt a plain descriptor, a spread/frozen clone, a proxy/subclass, a callback-bearing module, and a test-only fixture marker as `runAuthority`; each must fail before ledger creation, runtime construction, or model-client construction. A valid authority with a changed plan, stale source head, changed release/manifest, changed attestation, duplicate slot identity, or escaped private artifact path must fail at the same preflight boundary.
 
-The immutable SQLite header has exact native keys `{version,runId,finalKeys,planChecksum,sourceHead,stableRelease,candidateRelease,attestation,attestationChecksum,artifactPaths,createdAt}`. `version` is the exact supported integer, `runId` is a UUID string, `finalKeys` is the ordered 246-key unique array, checksums are lowercase SHA-256 strings, and `createdAt` is a non-negative safe integer.
+The immutable SQLite header initially has exact native keys `{version,runId,finalKeys,planChecksum,sourceHead,stableRelease,candidateRelease,attestation,attestationChecksum,artifactPaths,createdAt}`. Task 7 additively upgrades every producer/consumer and fixture in one commit to require `inputArtifactChecksums`; there is no mixed optional form. `version` is the exact supported integer, `runId` is a UUID string, `finalKeys` is the ordered 246-key unique array, checksums are lowercase SHA-256 strings, and `createdAt` is a non-negative safe integer.
 
 Each release snapshot has exact keys `{releaseId,pipelineVersion,presetVersion,cognitionSchemaVersion,expressionSchemaVersion,evaluatorVersion,modelProfile,componentManifest,releaseChecksum,createdAt,retiredAt}` with the same native types as the persisted release row. The ledger re-reads the exact row, validates its registry/manifest checksum, and requires canonical byte equality with the header.
 
-`attestation` has exact keys `{version,sourceHead,stableRuntime,candidateRuntime,evaluatorPrimary,evaluatorSecondary}`. Each runtime entry is the exact closed value returned by `assertProductionRuntimeAttestation()`. Each evaluator entry has exact keys `{evaluatorId,evaluatorVersion,modelProfileChecksum,clientConfigChecksum,sessionNamespaceChecksum}`; evaluator identities and namespace checksums must differ. `attestationChecksum === contentHash(attestation)` is recomputed on every open. `artifactPaths` has exact keys `{plan,ledger,raw}`; values are distinct project-root-relative forward-slash paths with no drive, leading slash, backslash, empty segment, `.` or `..`, and their resolved locations must stay under the fixed ignored private artifact root. The database header checksum is canonical `contentHash(header)` and every nested checksum is rederived, never trusted from a caller.
+`attestation` has exact keys `{version,sourceHead,stableRuntime,candidateRuntime,evaluatorPrimary,evaluatorSecondary}`. Each runtime entry is the exact closed value returned by `assertProductionRuntimeAttestation()`. Each evaluator entry has exact keys `{evaluatorId,evaluatorVersion,modelProfileChecksum,clientConfigChecksum,sessionNamespaceChecksum}`; evaluator identities and namespace checksums must differ. `attestationChecksum === contentHash(attestation)` is recomputed on every open. `artifactPaths` has exact keys `{plan,ledger,raw}`; values are distinct project-root-relative forward-slash paths with no drive, leading slash, backslash, empty segment, `.` or `..`, and their resolved locations must stay under the fixed ignored private artifact root. After the Task 7 additive upgrade, `inputArtifactChecksums` has exact keys `{plan,materials,seedDatabase}`, each a lowercase SHA-256 recomputed from the named immutable input. The database header checksum is canonical `contentHash(header)` and every nested checksum is rederived, never trusted from a caller.
 
 A pilot selector never changes that header. Before any ledger write or runtime/client creation, preflight must re-read the clean source head, exact release rows and manifests, attestation inputs, and realpath-checked private artifact paths. Header drift rejects before temporary runtime or model-client creation. The header may not synthesize release rows, manifests, runtime entries, or evaluator checksums from caller data.
 
@@ -475,44 +475,84 @@ git commit -m "fix: verify variable Yuqi quality model evidence"
 
 ---
 
-### Task 7: Build the real four-client execution configuration
+### Task 7: Close and configure the real four-client execution authority
 
 **Files:**
 - Create: `scripts/yuqi-quality-production-execution-config.mjs`
 - Create: `yuqi-runtime/test/quality-production-config.test.mjs`
-- Modify: `.gitignore`
+- Modify: `yuqi-runtime/src/quality-replay-production-bridge.mjs`
+- Test: `yuqi-runtime/test/quality-replay-production-bridge.test.mjs`
+- Modify: `yuqi-runtime/src/quality-replay-ledger.mjs`
+- Test: `yuqi-runtime/test/quality-replay-ledger.test.mjs`
+- Modify: `yuqi-runtime/src/quality-evaluator.mjs`
+- Test: `yuqi-runtime/test/quality-evaluator.test.mjs`
+- Modify: `scripts/run-yuqi-lived-quality-replay.mjs`
+- Test: `yuqi-runtime/test/quality-replay.test.mjs`
+- Verify/modify only if required: `.gitignore`
 
-**Produces:** `createQualityReplayRunAuthority({rootDir, ledgerPath, plan, resumeRun, artifactPaths})` using data-only configuration; it never returns or accepts a runtime/client/store/slot object.
+**Produces:** `createQualityReplayRunAuthority({rootDir, ledgerPath, plan, resumeRun, artifactPaths})`. The config module reads only closed data, then asks `quality-replay-production-bridge.mjs` to perform the complete read-only preflight and mint the sole module-private production brand. It never creates or accepts a runtime, client, store, slot, executor, callback, or factory.
 
-- [ ] **Step 1: Write configuration and clean-source red tests**
+**Design correction:** the immutable run header stores exact SHA-256 values for the three immutable ignored inputs—`plan`, the fixed production-material manifest, and the pristine v15 seed database—under `inputArtifactChecksums`. The writable ledger, per-final working stores, and exported raw JSONL are outputs whose bytes change during/resume after the run; they remain bound by the ledger/context manifests and final v2 provenance and are not falsely described as immutable start-time checksums.
 
-Require four distinct closed underlying-client configuration records with independent session-store paths/namespaces, exact release profiles, unforgeable runtime attestation inputs, closed evaluator schemas, read-only sandbox, approval `never`, and ignored private output paths. The bridge, not the Task 7 config module, must instantiate the four `CodexAppServerClient` objects and wrap the matching object only after its persisted phase becomes `running`; tests reject any config module that returns or injects a client object.
+- [ ] **Step 1: Write authority, source, path, and resume red tests**
 
-In a clean detached fixture checkout require empty working-tree diff, empty staged diff, and zero non-ignored untracked files. Bind exact Git head plus input plan SHA/checksum. Ignored artifacts are never source; their paths and checksums live in the run header. Dirty tracked or non-ignored source fails before client startup.
+The factory input has exactly `rootDir`, `ledgerPath`, `plan`, `resumeRun`, and `artifactPaths`. Reject unknown keys recursively, functions, proxies/getters, cycles, arrays in object positions, and any client/runtime/store/slot/executor/callback/factory carrier before opening a ledger or starting a process.
 
-- [ ] **Step 2: Verify red**
+In a temporary clean detached checkout require:
+
+- detached `HEAD`, exact 40-character source head, empty tracked and staged diffs, and zero non-ignored untracked files;
+- the existing exact ignore rule for `artifacts/yuqi-lived-agency-v3/private/`, verified with `git check-ignore`, rather than trusting a path prefix;
+- project-relative forward-slash `plan`, `ledger`, and `raw` paths inside the real private root, with distinct identities, no absolute/backslash/dot segments, and no symlink/junction/reparse escape through any existing ancestor;
+- `assertVerifiedQualityReplayPlan(plan)`, the fixed reviewed plan checksum, exact final-key order, exact canonical disk value, and the plan file byte SHA-256;
+- the one fixed private production-material manifest path and byte SHA-256, plus its `seedSourcePath` and the manifest-declared pristine v15 `seedSourceSha256`.
+
+A new run rejects an already-existing writable ledger. A resumed run first opens a separate read-only connection, loads exactly one matching immutable header, reuses its `runId` and `createdAt`, and rejects any source, plan, material, release, attestation, path, or checksum drift. That read-only connection is then closed. Only after the complete preflight succeeds may the runner open its normal writable ledger connection and perform phase/model-call CAS recovery. Any drift fails before the writable reopen with zero ledger writes and zero client/process startup. The selector (`onlyFinalKey`) is not authority input and is never passed to the config factory.
+
+- [ ] **Step 2: Close the bridge material and fixture boundaries**
+
+`createQualityProductionExecutionAuthority()` remains the only production brand mint. Extend its descriptor/run-header closure with exact `inputArtifactChecksums: {plan,materials,seedDatabase}` and compare the complete descriptor before minting. The config module must not define a second brand.
+
+Keep `createQualityProductionContext()` as a test/fixture API only: every non-private call must explicitly set `evidenceEligible:false`; caller-supplied seed/runtime/store/slot values can never become production evidence. The production runner continues to expose only its existing closed `{plan,ledgerPath,runAuthority,selector,resumeRun,sourceRootDir}` API. Its internally owned callbacks may drive the generic SQLite state machine, but no caller callback or fixture context may enter the production path.
+
+Define four exact client-lane records: `stable_execution`, `candidate_execution`, `evaluator_primary`, and `evaluator_secondary`. Every record is data-only and has a distinct checksum, private session-store root, session-namespace prefix, and request profile. All four require approval `never` and sandbox `read-only`. The bridge derives a deterministic, distinct store path and namespace from `(runId, finalKey, lane)`; a bare shared role/thread key is not a session scope.
+
+- Stable/candidate request profiles bind `releaseSide`, `releaseId`, `releaseChecksum`, and the canonical checksum of the persisted release model profile. Their session stores are the same deterministic per-final stable/candidate clone stores used by their production runtimes.
+- Primary/secondary evaluator profiles bind distinct evaluator IDs, versions, model/effort values, and the exported closed blind-evaluation output schema plus checksum. Their per-final session stores are separate private SQLite stores and never share execution or each other.
+- Runtime, release, client-config, request-profile, output-schema, and session-namespace checksums join exactly to the run attestation. Duplicate/aliased lanes or self-consistent substitutions reject.
+
+- [ ] **Step 3: Implement restart-safe bridge-owned clients**
+
+The bridge, not the config module, creates the matching `CodexAppServerClient` only after the persisted phase is `running` and the exact phase input is bound. It strips Task 7 metadata before constructing the client, supplies the stable/candidate runtime store or the appropriate evaluator session store, and uses the closed evaluator request profile instead of caller options.
+
+All four client lanes persist thread and authority identity across process restart. The immutable `seedSourcePath` is always read-only and is identified only by `inputArtifactChecksums.seedDatabase`; it never receives a context manifest. Together with the separate per-final `seedWorkingStorePath`, there are five deterministic writable per-final SQLite files: seed working, stable, candidate, evaluator primary, and evaluator secondary. A new working file is built from `seedSourcePath` (or as a fresh v15 evaluator session store) at a unique sibling temporary path, receives a one-row metadata-only context manifest inside that SQLite transaction, closes cleanly, and is atomically renamed to its deterministic final path. The exact manifest binds version, run, final key, lane, source head, plan/material/seed checksums, release or evaluator profile, client/session checksum, creation time, and its own canonical checksum. An existing final path is opened read-only first and must contain exactly that manifest; it is never copied over or repaired from a caller object. Creation leftovers are never selected as a session store.
+
+Resume reopens the validated existing store and never overwrites it with a fresh seed. Missing/extra/changed manifest rows, aliased lane paths, changed immutable source/release/subject authority rows, or a final path without the atomic manifest reject before a client. Terminal final cleanup may remove the three execution working stores and two evaluator session stores only after the final and all four phase/model-call rows are durably succeeded.
+
+A succeeded ledger model call exact-replays without starting a client; a recoverable persisted thread resumes through the same lane store. Preserve the Task 5 recovery matrix exactly: a `starting` phase with zero model-call rows atomically returns to `prepared`; a claimed call is resolved through the persisted remote-recovery path; zero/active/multiple/changed/conflicting remote candidates for that claimed call become `uncertain` and never issue a replacement request. Every underlying client and opened session store closes in `finally`. Revalidate source, release rows, seed/material checksum, runtime attestation, lane checksum, context manifest, and phase binding immediately before each phase can touch a client.
+
+Tests use a local fake app-server only. They first reproduce the current overwrite defect: prepare a final, persist a lane thread/marker, close, prepare the same final again, and prove the old implementation replaces it. The green implementation must preserve the exact thread/marker and context manifest. Add red cases for each of the five deterministic stores: pre-existing foreign file, missing/extra/changed manifest, changed seed checksum, interrupted temporary creation, and two-process first creation. They prove one atomic winner, no overwrite, no second remote call on restart, four different client sessions, exact primary/secondary schemas, no cross-lane thread reuse, no model process before preflight, and zero production/store/cloud/rollout mutation.
+
+- [ ] **Step 4: Wire the CLI without widening authority**
+
+Execution requires an existing `--plan` artifact. The CLI computes project-relative `artifactPaths`, passes the exact five factory fields, and keeps `onlyFinalKey` solely in the runner selector. It must not write a plan, ledger, raw artifact, or material file before the config and bridge preflight succeeds.
+
+`createQualityRunHeader()` and `QualityReplayLedger` add the exact closed `inputArtifactChecksums: {plan,materials,seedDatabase}` field. Existing fixture headers are updated explicitly; no optional compatibility alias is accepted. On resume the header bytes must match before any phase recovery. Final JSONL provenance continues to own the changing ledger/raw output checksums.
+
+- [ ] **Step 5: Run all non-model gates**
 
 ```powershell
-node --test yuqi-runtime/test/quality-production-config.test.mjs
-```
-
-- [ ] **Step 3: Implement four independent ledger-backed lanes**
-
-Stable/candidate client configurations use release model profiles. Evaluator configurations use independent profiles and the closed blind schema. The bridge derives a distinct session scope per final key while preserving persisted thread identities for recovery, instantiates all client objects internally, and revalidates attestation and release rows before every phase.
-
-- [ ] **Step 4: Run all non-model gates**
-
-```powershell
-node --test yuqi-runtime/test/quality-production-config.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/quality-report.test.mjs
+node --test yuqi-runtime/test/quality-production-config.test.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/test/quality-evaluator.test.mjs yuqi-runtime/test/quality-replay.test.mjs yuqi-runtime/test/quality-report.test.mjs
 npm.cmd test
 ```
 
-Expected: all tests PASS, zero external model calls, zero production mutations.
+Expected: all tests PASS, zero external model calls, zero production mutations. A source/process spy must prove no `CodexAppServerClient` process is started by any rejection case.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Independent review and commit**
+
+The 常务 window independently constructs counterexamples for arbitrary 246-key plans, attached checkout, non-ignored dirt, ignored-path junction escape, material/plan byte drift, duplicate lanes, evaluator session reuse, fixture injection, changed resume header, and process startup before preflight.
 
 ```powershell
-git add scripts/yuqi-quality-production-execution-config.mjs yuqi-runtime/test/quality-production-config.test.mjs .gitignore
+git add scripts/yuqi-quality-production-execution-config.mjs yuqi-runtime/test/quality-production-config.test.mjs yuqi-runtime/src/quality-replay-production-bridge.mjs yuqi-runtime/test/quality-replay-production-bridge.test.mjs yuqi-runtime/src/quality-replay-ledger.mjs yuqi-runtime/test/quality-replay-ledger.test.mjs yuqi-runtime/src/quality-evaluator.mjs yuqi-runtime/test/quality-evaluator.test.mjs scripts/run-yuqi-lived-quality-replay.mjs yuqi-runtime/test/quality-replay.test.mjs .gitignore
 git commit -m "feat: configure isolated Yuqi quality model lanes"
 ```
 
