@@ -5,11 +5,26 @@ import {
   appendQualityAttempt,
   assertVerifiedQualityReplayPlan,
   buildQualityReplayPlan,
+  validateQualityReplayV2Rows,
+  canonicalQualityReplayV2Jsonl,
   qualityFinalKey,
   qualityAttemptKey,
   loadQualityReplayPlanArtifact,
   writeQualityReplayPlanArtifact
 } from '../src/quality-replay.mjs';
+
+test('v2 replay validator exposes canonical row collections and rejects legacy rows', () => {
+  const run = {
+    schemaVersion: 2, recordType: 'run', runId: '123e4567-e89b-42d3-a456-426614174111',
+    header: { version: 1 }, headerChecksum: 'a'.repeat(64), state: 'finalized',
+    createdAt: 1, finalizedAt: 2
+  };
+  assert.throws(() => validateQualityReplayV2Rows({
+    rows: [{ recordType: 'attempt', runId: run.runId }],
+    plan: { finalKeys: [] }
+  }), /v2|record|schema/i);
+  assert.throws(() => canonicalQualityReplayV2Jsonl({ rows: [run] }), /provenance|v2|record/i);
+});
 import {
   createQualityReplayPlan,
   appendQualityReplayArtifact,
@@ -548,7 +563,13 @@ test('replay execution persists append-only attempts, finals, checksums, latency
   const directory = mkdtempSync(join(tmpdir(), 'yuqi-quality-replay-artifact-'));
   try {
     const artifactPath = join(directory, 'replay.jsonl');
-    appendQualityReplayArtifact({ artifactPath, result });
+    result.evidenceClass = 'production';
+    assert.throws(() => appendQualityReplayArtifact({ artifactPath, result }), /fixture|legacy|result/i);
+    result.evidenceClass = 'fixture';
+    const legacyArtifact = appendQualityReplayArtifact({ artifactPath, result });
+    assert.deepEqual(legacyArtifact, {
+      artifactPath, evidenceClass: 'legacy_structural', evidenceEligible: false
+    });
     appendQualityReplayArtifact({ artifactPath, result });
     const rows = readFileSync(artifactPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
     assert.equal(rows.length, 6);
@@ -561,4 +582,200 @@ test('replay execution persists append-only attempts, finals, checksums, latency
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+function makeV2Rows(finalKeys = ['sentinel:scene-0:0']) {
+  const runId = '123e4567-e89b-42d3-a456-426614174111';
+  const header = { version: 1, finalKeys: [...finalKeys] };
+  const headerChecksum = contentHash(header);
+  const run = {
+    schemaVersion: 2, recordType: 'run', runId, header, headerChecksum,
+    state: 'finalized', createdAt: 1, finalizedAt: 1000
+  };
+  const executions = [];
+  const phases = [];
+  const calls = [];
+  const judgments = [];
+  const finals = [];
+  for (const [finalIndex, finalKey] of finalKeys.entries()) {
+    const subjectType = 'turn';
+    const subjectChecksum = contentHash({ finalKey, subjectType, finalIndex });
+    const phaseMap = {};
+    for (const [phaseIndex, phase] of [
+      'stable_execution', 'candidate_execution', 'evaluator_primary', 'evaluator_secondary'
+    ].entries()) {
+      const input = { finalKey, phase, finalIndex };
+      const authorityInputChecksum = contentHash({ finalKey, phase, authority: true });
+      const inputChecksum = contentHash({ subjectChecksum, authorityInputChecksum, input });
+      const evaluation = phase.startsWith('evaluator_')
+        ? { version: 1,
+          scores: Object.fromEntries(['socialUnderstanding', 'agency', 'relationshipParticipation',
+            'stateContinuityFlexibility', 'livedExpression', 'actionFactIntegrity'].map(key => [key, 4])),
+          preference: 'tie', findings: [], unresolved: false }
+        : null;
+      const output = evaluation ?? { finalKey, phase, ok: true };
+      const outputChecksum = contentHash(output);
+      phaseMap[phase] = { inputChecksum, outputChecksum };
+      phases.push({ schemaVersion: 2, recordType: 'phase', runId, finalKey, phase,
+        state: 'succeeded', subjectChecksum, authorityInputChecksum, input, inputChecksum,
+        output, outputChecksum, createdAt: 10 + phaseIndex, startingAt: 10 + phaseIndex,
+        runningAt: 10 + phaseIndex, updatedAt: 20 + phaseIndex });
+      const blindInput = { version: 1, finalKey, subjectType, subjectChecksum };
+      const request = phase.startsWith('evaluator_')
+        ? { input: JSON.stringify(blindInput), phase }
+        : { phase, finalKey };
+      const modelOutput = { phase, ok: true };
+      calls.push({ schemaVersion: 2, recordType: 'model_call', runId, finalKey, phase,
+        ordinal: 0, state: 'succeeded', role: 'brain', callId: `call-${finalIndex}-${phase}`,
+        clientUserMessageId: `msg-${finalIndex}-${phase}`, threadId: `thread-${finalIndex}`,
+        turnId: `turn-${finalIndex}-${phase}`, baseline: { phase },
+        baselineChecksum: contentHash({ phase }), request, requestChecksum: contentHash(request),
+        model: 'model-v1', effort: 'high', schemaChecksum: contentHash({ schema: 1 }),
+        output: modelOutput, outputChecksum: contentHash(modelOutput), runningAt: 10 + phaseIndex,
+        createdAt: 10 + phaseIndex, updatedAt: 15 + phaseIndex });
+      if (phase.startsWith('evaluator_')) {
+        const evaluatorId = phase === 'evaluator_primary' ? 'evaluator-primary' : 'evaluator-secondary';
+        const evaluatorVersion = phase === 'evaluator_primary' ? 'eval-v1' : 'eval-v1b';
+        judgments.push({ schemaVersion: 2, recordType: 'judgment', runId, finalKey, phase,
+          evaluatorId, evaluatorVersion, inputChecksum: contentHash(blindInput), output,
+          outputChecksum, judgmentChecksum: contentHash({
+            finalKey, phase, evaluatorId, evaluatorVersion,
+            inputChecksum: contentHash(blindInput), output, outputChecksum
+          }) });
+      }
+    }
+    const blindInput = { version: 1, finalKey, subjectType, subjectChecksum };
+    const blindInputChecksum = contentHash(blindInput);
+    const output = { version: 1,
+      scores: Object.fromEntries(['socialUnderstanding', 'agency', 'relationshipParticipation',
+        'stateContinuityFlexibility', 'livedExpression', 'actionFactIntegrity'].map(key => [key, 4])),
+      preference: 'tie', findings: [], unresolved: false };
+    const judgment = phase => {
+      const row = judgments.find(item => item.finalKey === finalKey && item.phase === phase);
+      return { evaluatorId: row.evaluatorId, evaluatorVersion: row.evaluatorVersion,
+        inputChecksum: row.inputChecksum, output: row.output, outputChecksum: row.outputChecksum };
+    };
+    const value = { version: 1, finalKey, subjectType, subjectChecksum,
+      stablePhase: { ...phaseMap.stable_execution }, candidatePhase: { ...phaseMap.candidate_execution },
+      blindInputChecksum, primary: judgment('evaluator_primary'),
+      secondary: judgment('evaluator_secondary'),
+      comparison: { version: 1, differences: [], manualReview: false,
+        unresolved: false, agreedCriticalFindings: [] } };
+    const execution = { schemaVersion: 2, recordType: 'execution', runId, finalKey, subjectType,
+      subjectChecksum, stablePhase: phaseMap.stable_execution, candidatePhase: phaseMap.candidate_execution };
+    execution.executionChecksum = contentHash({ finalKey, subjectType, subjectChecksum,
+      stablePhase: execution.stablePhase, candidatePhase: execution.candidatePhase });
+    executions.push(execution);
+    finals.push({ schemaVersion: 2, recordType: 'final', runId, finalKey, value,
+      valueChecksum: contentHash(value), executionChecksum: execution.executionChecksum, finalizedAt: 100 });
+  }
+  const rows = [run, ...executions, ...phases, ...calls, ...judgments, ...finals];
+  const recordCounts = { run: 1, execution: executions.length, phase: phases.length,
+    modelCall: calls.length, judgment: judgments.length, final: finals.length };
+  const provenance = { schemaVersion: 2, recordType: 'provenance', runId, recordCounts,
+    recordsChecksum: contentHash(rows), provenanceChecksum: contentHash({
+      runId, headerChecksum, recordCounts, recordsChecksum: contentHash(rows)
+    }) };
+  return [...rows, provenance];
+}
+
+function rehashV2Rows(rows, { legacyProvenance = false } = {}) {
+  const body = rows.filter(row => row.recordType !== 'provenance');
+  const provenance = rows.find(row => row.recordType === 'provenance');
+  provenance.recordsChecksum = contentHash(body);
+  const run = rows.find(row => row.recordType === 'run');
+  const basis = legacyProvenance
+    ? { runId: provenance.runId, recordCounts: provenance.recordCounts,
+      recordsChecksum: provenance.recordsChecksum }
+    : { runId: provenance.runId, headerChecksum: run.headerChecksum,
+      recordCounts: provenance.recordCounts, recordsChecksum: provenance.recordsChecksum };
+  provenance.provenanceChecksum = contentHash(basis);
+}
+
+test('v2 provenance binds header checksum and rejects legacy self-consistent header mutation', () => {
+  const rows = makeV2Rows();
+  const run = rows.find(row => row.recordType === 'run');
+  run.header.extra = 'forged';
+  run.headerChecksum = contentHash(run.header);
+  rehashV2Rows(rows, { legacyProvenance: true });
+  assert.throws(() => validateQualityReplayV2Rows({ rows, plan: { finalKeys: [run.header.finalKeys[0]] } }), /provenance|header/i);
+});
+
+test('v2 judgment checksum binds complete output, not only output checksum', () => {
+  const rows = makeV2Rows();
+  const judgment = rows.find(row => row.recordType === 'judgment' && row.phase === 'evaluator_primary');
+  const final = rows.find(row => row.recordType === 'final');
+  judgment.output.scores.agency = 5;
+  judgment.outputChecksum = contentHash(judgment.output);
+  judgment.judgmentChecksum = contentHash({ finalKey: judgment.finalKey, phase: judgment.phase,
+    evaluatorId: judgment.evaluatorId, evaluatorVersion: judgment.evaluatorVersion,
+    inputChecksum: judgment.inputChecksum, outputChecksum: judgment.outputChecksum });
+  final.value.primary.output = judgment.output;
+  final.value.primary.outputChecksum = judgment.outputChecksum;
+  final.valueChecksum = contentHash(final.value);
+  rehashV2Rows(rows, { legacyProvenance: true });
+  assert.throws(() => validateQualityReplayV2Rows({ rows, plan: { finalKeys: [final.finalKey] } }), /judgment|checksum|output/i);
+});
+
+test('v2 rows enforce plan order and reject orphan phase/call/judgment records', () => {
+  const keys = ['sentinel:scene-0:0', 'sentinel:scene-1:0'];
+  const rows = makeV2Rows(keys);
+  const firstFinal = rows.findIndex(row => row.recordType === 'final');
+  const finals = rows.filter(row => row.recordType === 'final').reverse();
+  rows.splice(firstFinal, finals.length, ...finals);
+  rehashV2Rows(rows);
+  assert.throws(() => validateQualityReplayV2Rows({ rows, plan: { finalKeys: keys } }), /order|final/i);
+  const orphanRows = makeV2Rows();
+  const orphan = { ...orphanRows.find(row => row.recordType === 'phase'), finalKey: 'orphan:scene:0' };
+  orphanRows.splice(orphanRows.findIndex(row => row.recordType === 'provenance'), 0, orphan);
+  rehashV2Rows(orphanRows);
+  assert.throws(() => validateQualityReplayV2Rows({ rows: orphanRows, plan: { finalKeys: ['sentinel:scene-0:0'] } }), /orphan|owner|phase|join/i);
+});
+
+test('v2 execution joins stable and candidate phase authority exactly', () => {
+  const rows = makeV2Rows();
+  const execution = rows.find(row => row.recordType === 'execution');
+  const final = rows.find(row => row.recordType === 'final');
+  execution.stablePhase.outputChecksum = 'f'.repeat(64);
+  execution.executionChecksum = contentHash({ finalKey: execution.finalKey, subjectType: execution.subjectType,
+    subjectChecksum: execution.subjectChecksum, stablePhase: execution.stablePhase,
+    candidatePhase: execution.candidatePhase });
+  final.executionChecksum = execution.executionChecksum;
+  rehashV2Rows(rows, { legacyProvenance: true });
+  assert.throws(() => validateQualityReplayV2Rows({ rows, plan: { finalKeys: [final.finalKey] } }), /phase|execution|authority|join/i);
+});
+
+test('v2 evaluator phase output joins its judgment output exactly', () => {
+  const rows = makeV2Rows();
+  const phase = rows.find(row => row.recordType === 'phase' && row.phase === 'evaluator_primary');
+  phase.output = { ...phase.output, ok: false };
+  phase.outputChecksum = contentHash(phase.output);
+  rehashV2Rows(rows);
+  assert.throws(() => validateQualityReplayV2Rows({ rows, plan: { finalKeys: [phase.finalKey] } }), /phase|judgment|output|join/i);
+});
+
+test('v2 evaluator judgment input binds blind input and owned evaluator request', () => {
+  const rows = makeV2Rows();
+  const final = rows.find(row => row.recordType === 'final');
+  const call = rows.find(row => row.recordType === 'model_call' && row.phase === 'evaluator_primary');
+  call.request = { ...call.request, input: JSON.stringify({ forged: true }) };
+  call.requestChecksum = contentHash(call.request);
+  rehashV2Rows(rows, { legacyProvenance: true });
+  assert.throws(() => validateQualityReplayV2Rows({ rows, plan: { finalKeys: [final.finalKey] } }), /blind|input|request|judgment/i);
+});
+
+test('v2 final requires complete non-null Task5 value and exact judgment/comparison join', () => {
+  const rows = makeV2Rows();
+  const final = rows.find(row => row.recordType === 'final');
+  final.value = null;
+  final.valueChecksum = contentHash(null);
+  rehashV2Rows(rows, { legacyProvenance: true });
+  assert.throws(() => validateQualityReplayV2Rows({ rows, plan: { finalKeys: [final.finalKey] } }), /final|value|judgment/i);
+
+  const forgedRows = makeV2Rows();
+  const forgedFinal = forgedRows.find(row => row.recordType === 'final');
+  forgedFinal.value.primary.output.scores.agency = 1;
+  forgedFinal.valueChecksum = contentHash(forgedFinal.value);
+  rehashV2Rows(forgedRows, { legacyProvenance: true });
+  assert.throws(() => validateQualityReplayV2Rows({ rows: forgedRows, plan: { finalKeys: [forgedFinal.finalKey] } }), /final|judgment|output|comparison/i);
 });

@@ -8,10 +8,15 @@ import { tmpdir } from 'node:os';
 import { QUALITY_DIMENSIONS, compileSceneExecutionInput } from '../src/quality-evaluator.mjs';
 import { contentHash } from '../src/protocol.mjs';
 import { buildVerifiedQualityReplayPlan, writeQualityReplayPlanArtifact } from '../src/quality-replay.mjs';
+import * as qualityReplayModule from '../src/quality-replay.mjs';
 import { compileQualitySuite } from '../../scripts/compile-yuqi-lived-quality-scenes.mjs';
 import {
   buildCandidateReleaseDefinition,
   deriveManualReviewRequirements,
+  deriveManualV2RequirementsFromValidated,
+  assessManualReviewQueue,
+  projectV2Evidence,
+  validateManualV2Rows,
   materializeQualityReport as materializeQualityReportImpl,
   materializeQualityReportFromArtifacts
 } from '../../scripts/report-yuqi-lived-quality.mjs';
@@ -32,6 +37,15 @@ const AUTHORITY_PLAN = buildVerifiedQualityReplayPlan({
   }
 });
 const SOURCE_HEAD = 'd'.repeat(40);
+
+test('Task6 v2 validator is the shared authority and rejects legacy replay rows', () => {
+  assert.equal(typeof qualityReplayModule.validateQualityReplayV2Rows, 'function',
+    'quality-replay.mjs must export the shared v2 validator');
+  assert.throws(() => qualityReplayModule.validateQualityReplayV2Rows({
+    rows: [{ recordType: 'attempt', runId: '11111111-1111-4111-8111-111111111111' }],
+    plan: AUTHORITY_PLAN
+  }), /v2|schema|record|legacy/i);
+});
 
 function evidence() {
   const make = (layer) => AUTHORITY_PLAN.items.filter(item => item.layer === layer).map(item => ({
@@ -131,6 +145,8 @@ test('candidate release definition and quality report are deterministic and meta
   assert.match(candidate.releaseId, /^quality_candidate_/);
   assert.match(candidate.releaseChecksum, /^[0-9a-f]{64}$/);
   const report = materializeQualityReport({ evidence: evidence(), expectedPlan: AUTHORITY_PLAN, candidateRelease: candidate });
+  assert.equal(report.eligible, false);
+  assert.ok(report.failedGates.includes('QUALITY_REPORT_RAW_BUNDLE_REQUIRED'));
   assert.equal(report.qualityGate.eligible, true);
   assert.deepEqual(report.evidenceBoundary, {
     version: 1,
@@ -149,6 +165,139 @@ test('candidate release definition and quality report are deterministic and meta
     sourceHead: report.sourceHead,
     provenanceChecksum: report.replayProvenance.provenanceChecksum
   }));
+});
+
+test('unmarked legacy evidence is view-only and can never materialize eligible quality', () => {
+  const candidate = buildCandidateReleaseDefinition({
+    pipelineVersion: 'yuqi-lived-agency-v3', presetVersion: '2.1.0', cognitionSchemaVersion: 'v3',
+    expressionSchemaVersion: 'v2', evaluatorVersion: 'quality-evaluator-v1', modelProfile: 'blind-fixed',
+    componentManifest: {}, createdAt: 0
+  });
+  const legacyEvidence = { ...evidence(), evidenceClass: 'legacy_structural', evidenceEligible: false };
+  const report = materializeQualityReport({
+    evidence: legacyEvidence,
+    expectedPlan: AUTHORITY_PLAN,
+    candidateRelease: candidate,
+    manualReviewQueue: manualQueueFor(legacyEvidence)
+  });
+  assert.equal(report.eligible, false);
+  assert.ok(report.failedGates.includes('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE'));
+});
+
+test('manual v2 binds each review to the exact output and deterministic requirement', () => {
+  const candidate = buildCandidateReleaseDefinition({
+    pipelineVersion: 'yuqi-lived-agency-v3', presetVersion: '2.1.0', cognitionSchemaVersion: 'v3',
+    expressionSchemaVersion: 'v2', evaluatorVersion: 'quality-evaluator-v1', modelProfile: 'blind-fixed',
+    componentManifest: {}, createdAt: 0
+  });
+  const runId = '44444444-4444-4444-8444-444444444444';
+  const evidenceValue = evidence();
+  const finalRows = AUTHORITY_PLAN.items.map(item => {
+    const finalKey = `${item.layer}:${item.sceneId}:${item.repeatIndex}`;
+    return { finalKey, executionChecksum: contentHash(compileSceneExecutionInput(item.scene)) };
+  });
+  const judgments = finalRows.flatMap(({ finalKey }) => [
+    { finalKey, phase: 'evaluator_primary', judgmentChecksum: '1'.repeat(64) },
+    { finalKey, phase: 'evaluator_secondary', judgmentChecksum: '2'.repeat(64) }
+  ]);
+  const validated = { finals: finalRows, judgments };
+  const provenanceChecksum = '3'.repeat(64);
+  const requirements = deriveManualReviewRequirements(evidenceValue, AUTHORITY_PLAN, { includePassingSample: true })
+    .map(requirement => {
+      const match = finalRows.filter(row => {
+        const [, sceneId, repeatIndex] = row.finalKey.split(':');
+        return sceneId === requirement.sceneId && Number(repeatIndex) === requirement.repeatIndex;
+      });
+      assert.equal(match.length, 1);
+      const pair = judgments.filter(row => row.finalKey === match[0].finalKey);
+      return {
+        finalKey: match[0].finalKey,
+        primaryJudgmentChecksum: pair[0].judgmentChecksum,
+        secondaryJudgmentChecksum: pair[1].judgmentChecksum,
+        executionChecksum: match[0].executionChecksum,
+        finalValueChecksum: '4'.repeat(64),
+        evidenceFindingIds: requirement.evidenceFindingIds
+      };
+    });
+  const preRows = [
+    {
+      schemaVersion: 2, recordType: 'manual_metadata', runId, sourceHead: SOURCE_HEAD,
+      candidateReleaseId: candidate.releaseId, candidateReleaseChecksum: candidate.releaseChecksum,
+      planChecksum: AUTHORITY_PLAN.planChecksum, replayProvenanceChecksum: provenanceChecksum,
+      requirementsChecksum: contentHash(requirements)
+    },
+    ...requirements.map(requirement => ({
+      schemaVersion: 2, recordType: 'review', runId, reviewId: `review-${requirement.finalKey}`,
+      ...requirement, decision: 'accept_primary', resolvedOutput: { version: 1, scores: {}, preference: 'A', findings: [], unresolved: false },
+      reason: 'reviewed', reviewer: 'central_window', createdAt: 0
+    })),
+  ];
+  const rows = [...preRows, {
+    schemaVersion: 2, recordType: 'manual_provenance', runId,
+    recordCounts: { manualMetadata: 1, review: requirements.length },
+    recordsChecksum: contentHash(preRows),
+    manualProvenanceChecksum: '5'.repeat(64)
+  }];
+  assert.throws(() => validateManualV2Rows(rows, {
+    runId, plan: AUTHORITY_PLAN, provenanceRow: { provenanceChecksum }, sourceHead: SOURCE_HEAD,
+    candidateRelease: candidate, evidence: evidenceValue, validated
+  }), /manual|review|resolved|checksum|output/i);
+});
+
+test('v2 evidence is projected from the selected blind output, never the final envelope', () => {
+  const key = 'sentinel:projection-scene:0';
+  const outputA = {
+    version: 1,
+    scores: Object.fromEntries(QUALITY_DIMENSIONS.map(dimension => [dimension, 5])),
+    preference: 'A', findings: [], unresolved: false
+  };
+  const outputB = {
+    version: 1,
+    scores: Object.fromEntries(QUALITY_DIMENSIONS.map(dimension => [dimension, 2])),
+    preference: 'B', findings: [], unresolved: false
+  };
+  const final = {
+    finalKey: key,
+    executionChecksum: 'a'.repeat(64),
+    value: {
+      version: 1, finalKey: key, subjectType: 'turn',
+      primary: { output: outputA }, secondary: { output: outputB },
+      comparison: { differences: ['scores'] }
+    }
+  };
+  const validated = {
+    finals: [final],
+    judgments: [
+      { finalKey: key, phase: 'evaluator_primary', evaluatorId: 'p', evaluatorVersion: 'v' },
+      { finalKey: key, phase: 'evaluator_secondary', evaluatorId: 's', evaluatorVersion: 'v' }
+    ]
+  };
+  const selected = projectV2Evidence(validated, new Map([[key, outputB]])).sentinelRuns[0];
+  assert.deepEqual(selected.scores, outputB.scores);
+  assert.equal(selected.preference, 'B');
+  assert.deepEqual(selected.findings, []);
+  assert.equal(projectV2Evidence(validated).sentinelRuns.length, 0);
+  assert.equal(projectV2Evidence(validated, new Map([[key, null]])).sentinelRuns.length, 0);
+  const merged = { ...outputB, preference: 'tie' };
+  const mergedRow = projectV2Evidence(validated, new Map([[key, merged]])).sentinelRuns[0];
+  assert.equal(mergedRow.preference, 'tie');
+});
+
+test('v2 manual requirements remain frozen when secondary or merge removes primary findings', () => {
+  const base = {
+    schemaVersion: 2, recordType: 'review', runId: '123e4567-e89b-42d3-a456-426614174111',
+    reviewId: 'qreview-frozen', finalKey: 'sentinel:frozen:0',
+    primaryJudgmentChecksum: 'a'.repeat(64), secondaryJudgmentChecksum: 'b'.repeat(64),
+    executionChecksum: 'c'.repeat(64), finalValueChecksum: 'd'.repeat(64),
+    evidenceFindingIds: ['score_1'], decision: 'accept_secondary',
+    resolvedOutput: { version: 1, scores: Object.fromEntries(QUALITY_DIMENSIONS.map(key => [key, 4])),
+      preference: 'B', findings: [], unresolved: false }, reason: 'resolved', reviewer: 'central_window', createdAt: 1
+  };
+  const frozen = [{ finalKey: base.finalKey, sceneId: 'frozen', repeatIndex: 0,
+    evidenceFindingIds: ['score_1'], executionChecksum: base.executionChecksum, finalValueChecksum: base.finalValueChecksum }];
+  assert.equal(assessManualReviewQueue([base], { sentinelRuns: [], coverageRuns: [], historyRuns: [] }, {}, { frozenRequirements: frozen }).eligible, true);
+  const merged = { ...base, decision: 'merge', resolvedOutput: { ...base.resolvedOutput, preference: 'tie' } };
+  assert.equal(assessManualReviewQueue([merged], { sentinelRuns: [], coverageRuns: [], historyRuns: [] }, {}, { frozenRequirements: frozen }).eligible, true);
 });
 
 test('report rejects final and attempt evidence without exact execution/input/source/candidate pair joins', () => {
@@ -275,7 +424,8 @@ test('manual review requirements are recomputed from findings rather than caller
     evidence: criticalEvidence, expectedPlan: AUTHORITY_PLAN, candidateRelease: candidate,
     manualReviewQueue: manualQueueFor(criticalEvidence)
   });
-  assert.equal(report.eligible, true);
+  assert.equal(report.eligible, false);
+  assert.ok(report.failedGates.includes('QUALITY_REPORT_RAW_BUNDLE_REQUIRED'));
   assert.equal(report.manualReview.eligible, true);
   const missing = materializeQualityReport({
     evidence: criticalEvidence, expectedPlan: AUTHORITY_PLAN, candidateRelease: candidate
@@ -374,14 +524,15 @@ test('report CLI reloads the closed plan artifact instead of trusting caller key
         createdAt: 0
       })).join('\n');
     writeFileSync(manualReviewPath, `${queue}${queue ? '\n' : ''}`);
-    execFileSync(process.execPath, [
+    assert.throws(() => execFileSync(process.execPath, [
       'scripts/report-yuqi-lived-quality.mjs', '--root', process.cwd(), '--plan', planPath,
       '--history', historyPath, '--history-manifest', manifestPath, '--evidence', evidencePath,
       '--candidate-release', candidatePath, '--replay-provenance', provenancePath,
       '--manual-review', manualReviewPath, '--out', outPath
-    ], { cwd: process.cwd(), encoding: 'utf8' });
+    ], { cwd: process.cwd(), encoding: 'utf8' }));
     const report = JSON.parse(readFileSync(outPath, 'utf8'));
-    assert.equal(report.eligible, true);
+    assert.equal(report.eligible, false);
+    assert.ok(report.failedGates.includes('QUALITY_REPORT_RAW_BUNDLE_REQUIRED'));
     assert.equal(report.productionReleaseMutation, false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -486,10 +637,11 @@ test('formal quality reporter selects one raw run and binds all three artifact c
       rootDir: process.cwd(), historyPath: AUTHORITY_HISTORY_PATH, historyManifestPath: AUTHORITY_MANIFEST_PATH,
       candidateRelease: candidate
     });
-    assert.equal(report.replayRunId, runId);
-    assert.match(report.qualityPlanSha256, /^[0-9a-f]{64}$/);
-    assert.match(report.qualityReplaySha256, /^[0-9a-f]{64}$/);
-    assert.match(report.qualityManualReviewSha256, /^[0-9a-f]{64}$/);
+    assert.equal(report.eligible, false);
+    assert.ok(report.failedGates.includes('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE'));
+    assert.deepEqual(Object.keys(report).sort(), [
+      'blockingReason', 'eligible', 'failedGates', 'productionReleaseMutation', 'version'
+    ].sort());
     const replayRows = readFileSync(replayPath, 'utf8').trim().split(/\r?\n/).map(JSON.parse);
     const forgedKey = `${AUTHORITY_PLAN.items[0].layer}:${AUTHORITY_PLAN.items[0].sceneId}:${AUTHORITY_PLAN.items[0].repeatIndex}`;
     const forgedChecksum = 'c'.repeat(64);

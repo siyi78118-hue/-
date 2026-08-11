@@ -18,10 +18,15 @@ import {
 import { assertQualityReportProvenance, evidenceBoundaryChecksum } from './report-yuqi-lived-quality.mjs';
 import { validateQualityArtifactBundle } from './report-yuqi-lived-quality.mjs';
 import { createQualityReplayPlan } from './run-yuqi-lived-quality-replay.mjs';
-import { assertVerifiedQualityReplayPlan, expectedFinalKeysProjection } from '../yuqi-runtime/src/quality-replay.mjs';
+import {
+  assertVerifiedQualityReplayPlan, expectedFinalKeysProjection, validateQualityReplayV2Rows
+} from '../yuqi-runtime/src/quality-replay.mjs';
 
 const execFileAsync = promisify(execFile);
 const loadedManifests = new WeakSet();
+const LEGACY_QUALITY_EVIDENCE_ELIGIBLE = false;
+const LEGACY_QUALITY_RESULT = Object.freeze({ evidenceEligible: false });
+// legacy_structural bundles are readable compatibility evidence only.
 const SAFE_MAX = Number.MAX_SAFE_INTEGER;
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -99,7 +104,8 @@ const QUALITY_GATE_KEYS = Object.freeze([
   'protocolFailures', 'sentinelSevereFailureCount', 'dimensionAverages', 'scoreOneCount',
   'candidatePreferredRate', 'regressionRate', 'tieOrUnresolvedRate', 'structuralRegressionCount',
   'candidateWins', 'stableWins', 'tieCount', 'unresolvedCount', 'completedPairs',
-  'evidenceCount', 'failedGates', 'eligible'
+  'evidenceCount', 'failedGates', 'eligible', 'decisionCount', 'differenceCount',
+  'comparisonUnresolvedCount', 'comparisonManualReviewCount'
 ]);
 const QUALITY_MANUAL_KEYS = Object.freeze([
   'eligible', 'failedGates', 'unresolvedCount', 'requiredCount', 'requirements', 'queue'
@@ -609,7 +615,12 @@ function validateQualityReport(value, manifest = null) {
     || typeof value.manualReview.eligible !== 'boolean' || !Array.isArray(value.manualReview.failedGates)) {
     fail('quality nested fields');
   }
-  if (value.eligible !== (value.qualityGate.eligible && value.manualReview.eligible)) fail('quality eligibility binding');
+  for (const key of ['decisionCount', 'differenceCount', 'comparisonUnresolvedCount', 'comparisonManualReviewCount']) {
+    if (!Number.isSafeInteger(value.qualityGate[key]) || value.qualityGate[key] < 0
+      || value.qualityGate[key] > value.qualityGate.decisionCount) fail(`quality comparison ${key}`);
+  }
+  if (value.eligible !== (value.qualityGate.eligible && value.manualReview.eligible
+    && value.qualityGate.comparisonUnresolvedCount === 0)) fail('quality eligibility binding');
   if (value.eligible === true) {
     try {
       assertQualityReportProvenance(value.replayProvenance, {
@@ -640,11 +651,14 @@ function validateTrackedQualityPlan({ quality, qualityPlan, sourceDirectory }) {
     ...projection.finalKeys.coverageFinalKeys,
     ...projection.finalKeys.historyFinalKeys
   ];
+  if (quality.qualityGate.decisionCount !== expectedFinalKeys.length) fail('quality comparison decision count');
   try {
     assertQualityReportProvenance(quality.replayProvenance, {
       expectedFinalKeys,
       candidateRelease: quality.candidateRelease,
-      sourceHead: quality.sourceHead
+      sourceHead: quality.sourceHead,
+      allowDistinctPhaseInputs: quality.replayProvenance.executionPairs?.some(pair =>
+        pair.stableInputChecksum !== pair.executionChecksum || pair.candidateInputChecksum !== pair.executionChecksum)
     });
   } catch (error) {
     fail(`quality tracked provenance ${error instanceof Error ? error.message : String(error)}`);
@@ -1099,6 +1113,7 @@ export function loadReadinessManifest({
     artifacts[name] = { path: descriptor.path, sha256: actual, value };
   }
   const qualityValue = artifacts.quality?.value;
+  let legacyQualityEvidence = false;
   if (qualityValue && qualityValue.eligible === true) {
     validateTrackedQualityPlan({
       quality: qualityValue,
@@ -1121,20 +1136,33 @@ export function loadReadinessManifest({
   if (artifacts.qualityPlan?.value && artifacts.qualityReplay?.value && artifacts.qualityManualReview?.value) {
     if (!qualityValue || qualityValue.eligible !== true) fail('quality raw bundle requires eligible report');
     try {
-      const bundle = validateQualityArtifactBundle({
-        plan: artifacts.qualityPlan.value,
-        replayArtifactPath: join(root, artifacts.qualityReplay.path),
-        manualReviewArtifactPath: join(root, artifacts.qualityManualReview.path),
-        candidateRelease: qualityValue.candidateRelease,
-        qualityReport: qualityValue
-      });
-      const rawPlanSha = sha256(readFileSync(join(root, artifacts.qualityPlan.path)));
-      if (qualityValue.qualityPlanSha256 !== rawPlanSha
-        || qualityValue.qualityReplaySha256 !== artifacts.qualityReplay.sha256
-        || qualityValue.qualityManualReviewSha256 !== artifacts.qualityManualReview.sha256) {
-        fail('quality raw artifact checksum binding');
+      const replayRows = artifacts.qualityReplay.value;
+      if (!replayRows.some(row => row?.schemaVersion === 2 || row?.recordType === 'run')) {
+        // Legacy rows remain readable for protocol inspection only.  Mark the
+        // loaded evidence so verifyReadiness can fail the production gate
+        // without turning the compatibility parser into a success path.
+        legacyQualityEvidence = true;
+      } else {
+        validateQualityReplayV2Rows({ rows: replayRows, plan: artifacts.qualityPlan.value });
       }
-      if (bundle.runId !== qualityValue.replayRunId) fail('quality replay run binding');
+      if (replayRows.some(row => row?.schemaVersion === 2 || row?.recordType === 'run')) {
+        const bundle = validateQualityArtifactBundle({
+          plan: artifacts.qualityPlan.value,
+          replayArtifactPath: join(root, artifacts.qualityReplay.path),
+          manualReviewArtifactPath: join(root, artifacts.qualityManualReview.path),
+          candidateRelease: qualityValue.candidateRelease,
+          qualityReport: qualityValue
+        });
+        const rawPlanSha = sha256(readFileSync(join(root, artifacts.qualityPlan.path)));
+        if (qualityValue.qualityPlanSha256 !== rawPlanSha
+          || qualityValue.qualityReplaySha256 !== artifacts.qualityReplay.sha256
+          || qualityValue.qualityManualReviewSha256 !== artifacts.qualityManualReview.sha256) {
+          fail('quality raw artifact checksum binding');
+        }
+        if (bundle.evidenceClass === 'quality_replay_v2' && bundle.runId !== qualityValue.replayRunId) {
+          fail('quality replay run binding');
+        }
+      }
     } catch (error) {
       fail(`quality raw bundle ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -1147,7 +1175,8 @@ export function loadReadinessManifest({
     deviceSerial: manifest.deviceSerial,
     artifacts,
     metrics: artifacts.visiblePathMetrics?.value?.metrics ?? null,
-    inputSha256: sha256(readFileSync(file))
+    inputSha256: sha256(readFileSync(file)),
+    legacyQualityEvidence
   };
   loadedManifests.add(evidence);
   return evidence;
@@ -1156,6 +1185,7 @@ export function loadReadinessManifest({
 export function verifyReadiness(evidence) {
   if (!loadedManifests.has(evidence)) fail('verifyReadiness requires loadReadinessManifest');
   const failedGates = [];
+  if (evidence.legacyQualityEvidence === true) failedGates.push('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE');
   for (const name of READINESS_ARTIFACT_NAMES) {
     if (!evidence.artifacts?.[name]) failedGates.push(`MISSING_${name.toUpperCase()}`);
   }

@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync,
-  lstatSync, realpathSync } from 'node:fs';
+  lstatSync, realpathSync, openSync, fsyncSync, closeSync, unlinkSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolve, dirname, relative, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,9 @@ import {
   assertVerifiedQualityReplayPlan,
   appendQualityAttempt,
   writeQualityReplayPlanArtifact,
-  loadQualityReplayPlanArtifact
+  loadQualityReplayPlanArtifact,
+  validateQualityReplayV2Rows,
+  canonicalQualityReplayV2Jsonl
 } from '../yuqi-runtime/src/quality-replay.mjs';
 import {
   compileSceneExecutionInput,
@@ -42,7 +44,8 @@ import {
 } from '../yuqi-runtime/src/quality-replay-ledger.mjs';
 
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const SQLITE_REPLAY_RESULT_BRAND = new WeakSet();
+const FIXTURE_REPLAY_RESULT_BRAND = new WeakSet();
+const PRODUCTION_REPLAY_RESULT_BRAND = new WeakSet();
 const PRODUCTION_RUN_TOKEN = Symbol('quality-production-run');
 
 export function createQualityRunHeader({
@@ -156,6 +159,9 @@ export async function runQualityReplayPlanSqlite({
   if (evidenceClass !== 'fixture'
     && (evidenceClass !== 'production' || productionToken !== PRODUCTION_RUN_TOKEN)) {
     throw new Error('production ledger authority is private');
+  }
+  if (evidenceClass === 'production' && allowAuthorityFallback) {
+    throw new Error('production quality authority fallback is forbidden');
   }
   if (typeof subjectFactory !== 'function' || typeof executeQualitySubjectSide !== 'function'
     || typeof evaluator !== 'function' || typeof evaluatorSecondary !== 'function') {
@@ -389,7 +395,10 @@ export async function runQualityReplayPlanSqlite({
     if (onlyFinalKey === null && selected.length === 246) {
       ledger.finalizeRun({ runId, now: now() });
     }
-    return { runId, results, ledgerPath, run: ledger.getRun({ runId }) };
+    const replayResult = { runId, results, ledgerPath, run: ledger.getRun({ runId }),
+      evidenceClass, evidenceEligible: evidenceClass === 'production' };
+    (evidenceClass === 'production' ? PRODUCTION_REPLAY_RESULT_BRAND : FIXTURE_REPLAY_RESULT_BRAND).add(replayResult);
+    return replayResult;
   } catch (error) {
     ledger.close();
     throw error;
@@ -571,8 +580,9 @@ export async function runQualityReplayFixture({
       replayProvenance: { ...replayProvenance, provenanceChecksum: contentHash(replayProvenance) },
       sentinelRuns: finalized.filter(row => row.layer === 'sentinel'),
       coverageRuns: finalized.filter(row => row.layer === 'coverage'),
-      historyRuns: finalized.filter(row => row.layer === 'history') };
-    SQLITE_REPLAY_RESULT_BRAND.add(replayResult);
+      historyRuns: finalized.filter(row => row.layer === 'history'),
+      evidenceClass: 'fixture', evidenceEligible: false };
+    FIXTURE_REPLAY_RESULT_BRAND.add(replayResult);
     return replayResult;
   })();
 }
@@ -781,115 +791,143 @@ function assertProductionArtifactPath(rootDir, artifactPath) {
 function writeAtomicText(artifactPath, text) {
   mkdirSync(dirname(artifactPath), { recursive: true });
   const tempPath = `${artifactPath}.tmp-${randomUUID()}`;
-  writeFileSync(tempPath, text, 'utf8');
-  renameSync(tempPath, artifactPath);
+  let fd = null;
+  try {
+    fd = openSync(tempPath, 'w');
+    writeFileSync(fd, text, 'utf8');
+    try { fsyncSync(fd); } catch (error) {
+      // Windows can reject fsync for a freshly-created text handle; atomic
+      // replace remains the durable boundary on that platform.
+      if (error?.code !== 'EPERM' && error?.code !== 'EINVAL') throw error;
+    }
+    closeSync(fd); fd = null;
+    renameSync(tempPath, artifactPath);
+    const parentFd = openSync(dirname(artifactPath), 'r');
+    try {
+      try { fsyncSync(parentFd); } catch (error) {
+        if (error?.code !== 'EPERM' && error?.code !== 'EINVAL') throw error;
+      }
+    } finally { closeSync(parentFd); }
+  } catch (error) {
+    if (fd !== null) { try { closeSync(fd); } catch {} }
+    try { unlinkSync(tempPath); } catch {}
+    throw error;
+  }
 }
 
-export function exportQualityReplayArtifact({ ledgerPath, runId, artifactPath, header,
-  productionConfig, runAuthority = null, sourceRootDir = process.cwd() } = {}) {
-  if (typeof ledgerPath !== 'string' || !ledgerPath || typeof runId !== 'string') {
-    throw new Error('SQLite quality ledger export identity required');
+function buildQualityReplayV2RowsFromLedger({ ledger, runId, finalKeys }) {
+  const run = ledger.getRun({ runId });
+  if (!run || run.state !== 'finalized') throw new Error('quality replay v2 export requires finalized run');
+  const keys = [...finalKeys];
+  const rows = [{ schemaVersion: 2, recordType: 'run', runId,
+    header: Object.fromEntries(Object.entries(run).filter(([key]) => !['headerChecksum', 'state', 'finalizedAt'].includes(key))),
+    headerChecksum: run.headerChecksum, state: run.state, createdAt: run.createdAt,
+    finalizedAt: run.finalizedAt }];
+  const executions = [];
+  const phases = [];
+  const calls = [];
+  const judgments = [];
+  const finals = [];
+  for (const finalKey of keys) {
+    const final = ledger.getFinal({ runId, finalKey });
+    if (!final) throw new Error('quality replay v2 final row missing');
+    const phaseMap = Object.fromEntries(['stable_execution', 'candidate_execution', 'evaluator_primary', 'evaluator_secondary']
+      .map(phase => [phase, ledger.getPhase({ runId, finalKey, phase })]));
+    if (Object.values(phaseMap).some(phase => !phase || phase.state !== 'succeeded')) throw new Error('quality replay v2 phase row missing');
+    const value = final.value;
+    const execution = {
+      schemaVersion: 2, recordType: 'execution', runId, finalKey,
+      subjectType: value.subjectType, subjectChecksum: value.subjectChecksum,
+      stablePhase: { inputChecksum: phaseMap.stable_execution.inputChecksum, outputChecksum: phaseMap.stable_execution.outputChecksum },
+      candidatePhase: { inputChecksum: phaseMap.candidate_execution.inputChecksum, outputChecksum: phaseMap.candidate_execution.outputChecksum },
+    };
+    execution.executionChecksum = contentHash({ finalKey, subjectType: execution.subjectType,
+      subjectChecksum: execution.subjectChecksum, stablePhase: execution.stablePhase,
+      candidatePhase: execution.candidatePhase });
+    executions.push(execution);
+    for (const phase of ['stable_execution', 'candidate_execution', 'evaluator_primary', 'evaluator_secondary']) {
+      const phaseRow = phaseMap[phase];
+      phases.push({ schemaVersion: 2, recordType: 'phase', runId, finalKey, phase,
+        state: 'succeeded', subjectChecksum: phaseRow.subjectChecksum,
+        authorityInputChecksum: phaseRow.authorityInputChecksum, input: phaseRow.input,
+        inputChecksum: phaseRow.inputChecksum, output: phaseRow.output,
+        outputChecksum: phaseRow.outputChecksum, createdAt: phaseRow.createdAt,
+        startingAt: phaseRow.startingAt, runningAt: phaseRow.runningAt, updatedAt: phaseRow.updatedAt });
+      for (const call of ledger.listModelCalls({ runId, finalKey, phase })) {
+        if (call.state !== 'succeeded') throw new Error('quality replay v2 model call incomplete');
+        calls.push({ schemaVersion: 2, recordType: 'model_call', runId, finalKey, phase,
+          ordinal: call.ordinal, state: 'succeeded', role: call.role, callId: call.callId,
+          clientUserMessageId: call.clientUserMessageId, threadId: call.threadId, turnId: call.turnId,
+          baseline: call.baseline, baselineChecksum: call.baselineChecksum, request: call.request,
+          requestChecksum: call.requestChecksum, model: call.model, effort: call.effort,
+          schemaChecksum: call.schemaChecksum, output: call.output, outputChecksum: call.outputChecksum,
+          runningAt: call.runningAt, createdAt: call.createdAt, updatedAt: call.updatedAt });
+      }
+    }
+    for (const phase of ['evaluator_primary', 'evaluator_secondary']) {
+      const judgment = value[phase === 'evaluator_primary' ? 'primary' : 'secondary'];
+      const row = { schemaVersion: 2, recordType: 'judgment', runId, finalKey, phase,
+        evaluatorId: judgment.evaluatorId, evaluatorVersion: judgment.evaluatorVersion,
+        inputChecksum: judgment.inputChecksum, output: judgment.output,
+        outputChecksum: judgment.outputChecksum };
+      row.judgmentChecksum = contentHash({ finalKey, phase, evaluatorId: row.evaluatorId,
+        evaluatorVersion: row.evaluatorVersion, inputChecksum: row.inputChecksum,
+        output: row.output, outputChecksum: row.outputChecksum });
+      judgments.push(row);
+    }
+    const finalRow = { schemaVersion: 2, recordType: 'final', runId, finalKey,
+      value, valueChecksum: final.checksum, executionChecksum: execution.executionChecksum,
+      finalizedAt: final.finalizedAt };
+    finals.push(finalRow);
   }
-  if (typeof artifactPath !== 'string' || !artifactPath) throw new Error('replay artifact path required');
-  assertQualityProductionExecutionConfig(productionConfig);
+  rows.push(...executions, ...phases, ...calls, ...judgments, ...finals);
+  const recordCounts = {
+    run: 1, execution: executions.length, phase: phases.length,
+    modelCall: calls.length, judgment: judgments.length, final: finals.length
+  };
+  const recordsChecksum = contentHash(rows);
+  rows.push({ schemaVersion: 2, recordType: 'provenance', runId, recordCounts,
+    recordsChecksum, provenanceChecksum: contentHash({ runId, headerChecksum: run.headerChecksum,
+      recordCounts, recordsChecksum }) });
+  return rows;
+}
+
+export function exportQualityReplayV2(options = {}) {
+  if (!options || typeof options !== 'object' || Array.isArray(options)
+    || Object.keys(options).some(key => !['sourceRootDir', 'ledgerPath', 'runAuthority', 'runId', 'artifactPath'].includes(key))) {
+    throw new Error('quality replay v2 exporter option conflict');
+  }
+  const { ledgerPath, runId, artifactPath, runAuthority,
+    sourceRootDir = process.cwd() } = options;
+  if (!runAuthority) throw new Error('quality replay v2 branded run authority required');
+  assertQualityRunAuthority(runAuthority);
+  const productionConfig = qualityRunAuthorityProductionConfig(runAuthority);
+  if (typeof ledgerPath !== 'string' || ledgerPath !== productionConfig.ledgerPath
+    || runId !== productionConfig.runId) throw new Error('quality replay v2 ledger authority conflict');
+  if (typeof artifactPath !== 'string' || !artifactPath) throw new Error('quality replay v2 artifact path required');
   assertProductionArtifactPath(sourceRootDir, artifactPath);
-  const ledger = openProductionQualityReplayLedger({
-    filename: ledgerPath, runAuthority, readOnly: true, sourceRootDir
-  });
+  const ledger = openProductionQualityReplayLedger({ filename: ledgerPath, runAuthority,
+    readOnly: true, sourceRootDir });
   try {
-    const run = ledger.getRun({ runId });
-    if (!run) throw new Error('quality replay run not found');
-    if (run.state !== 'finalized') throw new Error('quality replay export requires finalized run');
-    if (contentHash(run.finalKeys) !== contentHash(productionConfig.finalKeys)
-      || run.planChecksum !== productionConfig.planChecksum
-      || run.sourceHead !== productionConfig.sourceHead
-      || run.runId !== productionConfig.runId) {
-      throw new Error('quality replay export production header conflict');
-    }
-    const finalCount = Number(ledger.db.prepare(
-      'SELECT COUNT(*) AS count FROM quality_finals WHERE run_id=?'
-    ).get(runId).count);
-    const phaseCount = Number(ledger.db.prepare(
-      "SELECT COUNT(*) AS count FROM quality_phases WHERE run_id=? AND state='succeeded'"
-    ).get(runId).count);
-    const callRows = ledger.db.prepare(
-      'SELECT state FROM quality_model_calls WHERE run_id=?'
-    ).all(runId);
-    if (finalCount !== 246 || phaseCount !== 246 * 4 || callRows.length === 0
-      || callRows.some(row => row.state !== 'succeeded')) {
-      throw new Error('quality replay export requires complete owned calls');
-    }
-    const storedHeader = {
-      version: run.version, runId: run.runId, finalKeys: run.finalKeys,
-      planChecksum: run.planChecksum, sourceHead: run.sourceHead,
-      stableRelease: run.stableRelease, candidateRelease: run.candidateRelease,
-      attestation: run.attestation, attestationChecksum: run.attestationChecksum,
-      artifactPaths: run.artifactPaths, createdAt: run.createdAt,
-    };
-    if (header && contentHash(header) !== contentHash(storedHeader)) {
-      throw new Error('quality replay header identity conflict');
-    }
-    const expectedHeader = {
-      version: 1,
-      runId: productionConfig.runId,
-      finalKeys: productionConfig.finalKeys,
-      planChecksum: productionConfig.planChecksum,
-      sourceHead: productionConfig.sourceHead,
-      stableRelease: productionConfig.stableRelease,
-      candidateRelease: productionConfig.candidateRelease,
-      attestation: productionConfig.attestation,
-      attestationChecksum: productionConfig.attestationChecksum,
-      artifactPaths: productionConfig.artifactPaths,
-      createdAt: productionConfig.createdAt,
-    };
-    if (contentHash(storedHeader) !== contentHash(expectedHeader)
-      || storedHeader.planChecksum !== productionConfig.planChecksum
-      || storedHeader.sourceHead !== productionConfig.sourceHead
-      || contentHash(storedHeader.finalKeys) !== contentHash(productionConfig.finalKeys)
-      || storedHeader.attestationChecksum !== productionConfig.attestationChecksum) {
-      throw new Error('quality replay stored header production conflict');
-    }
-    const records = [];
-    for (const finalKey of run.finalKeys) {
-      const final = ledger.getFinal({ runId, finalKey });
-      if (!final) continue;
-      const phases = Object.fromEntries(['stable_execution', 'candidate_execution',
-        'evaluator_primary', 'evaluator_secondary'].map(phase => [phase,
-        ledger.getPhase({ runId, finalKey, phase })]));
-      const calls = Object.values(phases).flatMap(phase =>
-        ledger.listModelCalls({ runId, finalKey, phase: phase.phase }));
-      const executionChecksum = contentHash({
-        stable: phases.stable_execution.outputChecksum,
-        candidate: phases.candidate_execution.outputChecksum,
-      });
-      records.push({ recordType: 'attempt', runId, finalKey, attemptIndex: 0,
-        evaluatorId: 'quality-ledger', evaluatorVersion: 'quality-ledger-v1',
-        executionChecksum, latencyMs: 0, accepted: !final.value.comparison.unresolved,
-        unresolved: final.value.comparison.unresolved });
-      records.push({ recordType: 'final', runId, finalKey, value: final.value,
-        checksum: final.checksum });
-      records.push(...calls.map(call => ({ recordType: 'model', runId, finalKey,
-        phase: call.phase, ordinal: call.ordinal, evaluatorId: call.role,
-        inputChecksum: call.requestChecksum, outputChecksum: call.outputChecksum,
-        completed: call.state === 'succeeded' })));
-      records.push({ recordType: 'final-checksum', runId, finalKey, executionChecksum,
-        latencyMs: 0, evaluatorVersion: 'quality-ledger-v1' });
-    }
-    const provenance = { recordType: 'provenance', runId, sourceHead: run.sourceHead,
-      headerChecksum: run.headerChecksum, provenanceChecksum: contentHash({
-        runId, sourceHead: run.sourceHead, headerChecksum: run.headerChecksum,
-      }) };
-    records.splice(2, 0, provenance);
-    writeAtomicText(artifactPath, `${records.map(record => JSON.stringify(record)).join('\n')}\n`);
-    return artifactPath;
-  } finally {
-    ledger.close();
-  }
+    const rows = buildQualityReplayV2RowsFromLedger({ ledger, runId, finalKeys: productionConfig.finalKeys });
+    const validated = validateQualityReplayV2Rows({ rows, plan: { finalKeys: productionConfig.finalKeys }, expectedHeader: rows[0].header });
+    const text = canonicalQualityReplayV2Jsonl({ rows: validated.rows, plan: { finalKeys: productionConfig.finalKeys } });
+    writeAtomicText(artifactPath, text);
+    return { artifactPath, evidenceClass: 'production', evidenceEligible: true,
+      run: validated.run, provenance: validated.provenance, executions: validated.executions,
+      phases: validated.phases, modelCalls: validated.modelCalls, judgments: validated.judgments,
+      finals: validated.finals };
+  } finally { ledger.close(); }
+}
+
+// Compatibility name now resolves only to the branded v2 production exporter.
+export function exportQualityReplayArtifact(options = {}) {
+  return exportQualityReplayV2(options);
 }
 
 export function appendQualityReplayArtifact({ artifactPath, result } = {}) {
   if (typeof artifactPath !== 'string' || !artifactPath) throw new Error('replay artifact path required');
-  if (!result || !SQLITE_REPLAY_RESULT_BRAND.has(result)
+  if (!result || !FIXTURE_REPLAY_RESULT_BRAND.has(result) || result.evidenceClass !== 'fixture'
     || !Array.isArray(result.attempts) || !Array.isArray(result.finalized)
     || !result.replayProvenance
     || !Array.isArray(result.replayProvenance.executionPairs)
@@ -938,7 +976,7 @@ export function appendQualityReplayArtifact({ artifactPath, result } = {}) {
     }))
   ];
   writeAtomicText(artifactPath, `${records.map(record => JSON.stringify(record)).join('\n')}\n`);
-  return artifactPath;
+  return { artifactPath, evidenceClass: 'legacy_structural', evidenceEligible: false };
 }
 
 const CLI_VALUE_OPTIONS = new Map([
@@ -1063,9 +1101,9 @@ if (isMain) {
       const replayPath = resolve(rootDir, cli.replayOut
         || 'artifacts/yuqi-lived-agency-v3/private/quality-replay.jsonl');
       assertProductionArtifactPath(rootDir, replayPath);
-      exportQualityReplayArtifact({ artifactPath: replayPath,
+      exportQualityReplayV2({ artifactPath: replayPath,
         ledgerPath: resolve(rootDir, cli.ledger), runId: result.runId,
-        productionConfig: qualityRunAuthorityProductionConfig(runAuthority), runAuthority,
+        runAuthority,
         sourceRootDir: rootDir });
       process.stdout.write(`${JSON.stringify({
         version: 1,

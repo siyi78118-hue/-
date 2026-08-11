@@ -27,7 +27,9 @@ import {
 import { QUALITY_DIMENSIONS, aggregateQualityGate, compileSceneExecutionInput } from '../src/quality-evaluator.mjs';
 import { deriveManualReviewRequirements } from '../../scripts/report-yuqi-lived-quality.mjs';
 import { createQualityReplayPlan } from '../../scripts/run-yuqi-lived-quality-replay.mjs';
-import { expectedFinalKeysProjection, writeQualityReplayPlanArtifact } from '../src/quality-replay.mjs';
+import { expectedFinalKeysProjection, validateQualityReplayV2Rows, writeQualityReplayPlanArtifact } from '../src/quality-replay.mjs';
+import { deriveManualV2RequirementsFromValidated, projectV2Provenance, evidenceBoundaryChecksum,
+  validateQualityArtifactBundle } from '../../scripts/report-yuqi-lived-quality.mjs';
 
 function silentStdout() {
   return { write() {} };
@@ -288,6 +290,119 @@ function writeTrackedRawBundle(directory, artifact, {
   artifact.evidenceBoundaryChecksum = contentHash({ evidenceBoundary: artifact.evidenceBoundary,
     planChecksum: artifact.planChecksum, sourceHead, provenanceChecksum: provenance.provenanceChecksum });
   return artifact;
+}
+
+function writeGenuineV2PendingBundle(directory, artifact, stableRelease) {
+  const plan = createQualityReplayPlan({ rootDir: process.cwd() });
+  const runId = '44444444-4444-4444-8444-444444444444';
+  const finalKeys = plan.items.map(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}`);
+  const header = { version: 1, sourceHead: currentSourceHead(), finalKeys,
+    stableRelease: { releaseId: stableRelease.releaseId, releaseChecksum: stableRelease.releaseChecksum },
+    candidateRelease: artifact.candidateRelease };
+  const run = { schemaVersion: 2, recordType: 'run', runId, header, headerChecksum: contentHash(header), state: 'finalized', createdAt: 1, finalizedAt: 1000 };
+  const executions = [], phases = [], calls = [], judgments = [], finals = [];
+  const dimensions = [...QUALITY_DIMENSIONS];
+  for (const [index, finalKey] of finalKeys.entries()) {
+    const subjectType = 'turn';
+    const subjectChecksum = contentHash({ finalKey, subjectType, index });
+    const phaseMap = {};
+    for (const [phaseIndex, phase] of ['stable_execution', 'candidate_execution', 'evaluator_primary', 'evaluator_secondary'].entries()) {
+      const input = { finalKey, phase, index };
+      const authorityInputChecksum = contentHash({ finalKey, phase, authority: true });
+      const inputChecksum = contentHash({ subjectChecksum, authorityInputChecksum, input });
+      const evaluation = phase.startsWith('evaluator_')
+        ? { version: 1, scores: Object.fromEntries(dimensions.map(key => [key, 4])), preference: 'B', findings: [], unresolved: false }
+        : null;
+      const output = evaluation ?? { finalKey, phase, ok: true };
+      const outputChecksum = contentHash(output);
+      phaseMap[phase] = { inputChecksum, outputChecksum };
+      phases.push({ schemaVersion: 2, recordType: 'phase', runId, finalKey, phase, state: 'succeeded', subjectChecksum, authorityInputChecksum,
+        input, inputChecksum, output, outputChecksum, createdAt: 10 + phaseIndex, startingAt: 10 + phaseIndex, runningAt: 10 + phaseIndex, updatedAt: 20 + phaseIndex });
+      const blindInput = { version: 1, finalKey, subjectType, subjectChecksum };
+      const request = phase.startsWith('evaluator_') ? { input: JSON.stringify(blindInput), phase } : { phase, finalKey };
+      const modelOutput = { phase, ok: true };
+      calls.push({ schemaVersion: 2, recordType: 'model_call', runId, finalKey, phase, ordinal: 0, state: 'succeeded', role: 'brain',
+        callId: `call-${index}-${phase}`, clientUserMessageId: `msg-${index}-${phase}`, threadId: `thread-${index}`, turnId: `turn-${index}-${phase}`,
+        baseline: { phase }, baselineChecksum: contentHash({ phase }), request, requestChecksum: contentHash(request), model: 'model-v1', effort: 'high',
+        schemaChecksum: contentHash({ schema: 1 }), output: modelOutput, outputChecksum: contentHash(modelOutput), runningAt: 10 + phaseIndex,
+        createdAt: 10 + phaseIndex, updatedAt: 15 + phaseIndex });
+      if (phase.startsWith('evaluator_')) {
+        const evaluatorId = phase === 'evaluator_primary' ? 'evaluator-primary' : 'evaluator-secondary';
+        const evaluatorVersion = phase === 'evaluator_primary' ? 'eval-v1' : 'eval-v1b';
+        const inputChecksumForJudgment = contentHash(blindInput);
+        const outputChecksumForJudgment = outputChecksum;
+        judgments.push({ schemaVersion: 2, recordType: 'judgment', runId, finalKey, phase, evaluatorId, evaluatorVersion, inputChecksum: inputChecksumForJudgment,
+          output: evaluation, outputChecksum: outputChecksumForJudgment, judgmentChecksum: contentHash({ finalKey, phase, evaluatorId, evaluatorVersion,
+            inputChecksum: inputChecksumForJudgment, output: evaluation, outputChecksum: outputChecksumForJudgment }) });
+      }
+    }
+    const primary = judgments.find(row => row.finalKey === finalKey && row.phase === 'evaluator_primary');
+    const secondary = judgments.find(row => row.finalKey === finalKey && row.phase === 'evaluator_secondary');
+    const value = { version: 1, finalKey, subjectType, subjectChecksum, stablePhase: phaseMap.stable_execution, candidatePhase: phaseMap.candidate_execution,
+      blindInputChecksum: primary.inputChecksum,
+      primary: { evaluatorId: primary.evaluatorId, evaluatorVersion: primary.evaluatorVersion, inputChecksum: primary.inputChecksum, output: primary.output, outputChecksum: primary.outputChecksum },
+      secondary: { evaluatorId: secondary.evaluatorId, evaluatorVersion: secondary.evaluatorVersion, inputChecksum: secondary.inputChecksum, output: secondary.output, outputChecksum: secondary.outputChecksum },
+      comparison: { version: 1, differences: [], manualReview: false, unresolved: false, agreedCriticalFindings: [] } };
+    const execution = { schemaVersion: 2, recordType: 'execution', runId, finalKey, subjectType, subjectChecksum, stablePhase: phaseMap.stable_execution, candidatePhase: phaseMap.candidate_execution };
+    execution.executionChecksum = contentHash({ finalKey, subjectType, subjectChecksum, stablePhase: execution.stablePhase, candidatePhase: execution.candidatePhase });
+    executions.push(execution);
+    finals.push({ schemaVersion: 2, recordType: 'final', runId, finalKey, value, valueChecksum: contentHash(value), executionChecksum: execution.executionChecksum, finalizedAt: 100 });
+  }
+  const bodyRows = [run, ...executions, ...phases, ...calls, ...judgments, ...finals];
+  const recordCounts = { run: 1, execution: executions.length, phase: phases.length, modelCall: calls.length, judgment: judgments.length, final: finals.length };
+  const provenance = { schemaVersion: 2, recordType: 'provenance', runId, recordCounts, recordsChecksum: contentHash(bodyRows),
+    provenanceChecksum: contentHash({ runId, headerChecksum: run.headerChecksum, recordCounts, recordsChecksum: contentHash(bodyRows) }) };
+  const validated = validateQualityReplayV2Rows({ rows: [...bodyRows, provenance], plan });
+  const requirements = deriveManualV2RequirementsFromValidated(validated, plan);
+  const requirementRows = requirements.map(requirement => {
+    const js = validated.judgments.filter(row => row.finalKey === requirement.finalKey);
+    return { finalKey: requirement.finalKey, primaryJudgmentChecksum: js.find(row => row.phase === 'evaluator_primary').judgmentChecksum,
+      secondaryJudgmentChecksum: js.find(row => row.phase === 'evaluator_secondary').judgmentChecksum, executionChecksum: requirement.executionChecksum,
+      finalValueChecksum: requirement.finalValueChecksum, evidenceFindingIds: requirement.evidenceFindingIds };
+  });
+  const meta = { schemaVersion: 2, recordType: 'manual_metadata', runId, sourceHead: header.sourceHead, candidateReleaseId: artifact.candidateRelease.releaseId,
+    candidateReleaseChecksum: artifact.candidateRelease.releaseChecksum, planChecksum: plan.planChecksum, replayProvenanceChecksum: provenance.provenanceChecksum,
+    requirementsChecksum: contentHash(requirementRows) };
+  const reviews = requirementRows.map((item, index) => {
+    const final = validated.finals.find(row => row.finalKey === item.finalKey);
+    return { schemaVersion: 2, recordType: 'review', runId, reviewId: `qreview_${contentHash({ runId, finalKey: item.finalKey,
+        primaryJudgmentChecksum: item.primaryJudgmentChecksum, secondaryJudgmentChecksum: item.secondaryJudgmentChecksum,
+        executionChecksum: item.executionChecksum, finalValueChecksum: item.finalValueChecksum }).slice(0, 48)}`,
+      finalKey: item.finalKey, primaryJudgmentChecksum: item.primaryJudgmentChecksum, secondaryJudgmentChecksum: item.secondaryJudgmentChecksum,
+      executionChecksum: item.executionChecksum, finalValueChecksum: item.finalValueChecksum, evidenceFindingIds: item.evidenceFindingIds,
+      decision: 'accept_primary', resolvedOutput: final.value.primary.output, reason: 'fixture', reviewer: 'central_window', createdAt: index };
+  });
+  const manualBody = [meta, ...reviews];
+  const manualRecordCounts = { manualMetadata: 1, review: reviews.length };
+  const manualProvenance = { schemaVersion: 2, recordType: 'manual_provenance', runId, recordCounts: manualRecordCounts,
+    recordsChecksum: contentHash(manualBody), manualProvenanceChecksum: contentHash({ runId, requirementsChecksum: meta.requirementsChecksum,
+      recordCounts: manualRecordCounts, recordsChecksum: contentHash(manualBody) }) };
+  const planPath = join(directory, 'quality-replay-plan.json');
+  const replayPath = join(directory, 'quality-replay.jsonl');
+  const manualPath = join(directory, 'quality-manual-review.jsonl');
+  writeQualityReplayPlanArtifact(plan, planPath);
+  writeFileSync(replayPath, `${[...bodyRows, provenance].map(row => JSON.stringify(row)).join('\n')}\n`);
+  writeFileSync(manualPath, `${[...manualBody, manualProvenance].map(row => JSON.stringify(row)).join('\n')}\n`);
+  const hash = path => createHash('sha256').update(readFileSync(path)).digest('hex');
+  artifact.planChecksum = plan.planChecksum; artifact.sourceHead = header.sourceHead; artifact.replayRunId = runId;
+  artifact.replayProvenance = projectV2Provenance(validated);
+  artifact.evidenceBoundary = { version: 1, inputMode: 'preset_default', sourceClass: 'tracked_human_annotations',
+    offlineModelEvaluation: true, realHistoryEvidence: false, liveShadowEvidence: false };
+  artifact.evidenceBoundaryChecksum = evidenceBoundaryChecksum({ evidenceBoundary: artifact.evidenceBoundary,
+    planChecksum: artifact.planChecksum, sourceHead: artifact.sourceHead,
+    provenanceChecksum: artifact.replayProvenance.provenanceChecksum });
+  artifact.qualityPlanSha256 = hash(planPath); artifact.qualityReplaySha256 = hash(replayPath); artifact.qualityManualReviewSha256 = hash(manualPath);
+  const rawBundle = validateQualityArtifactBundle({
+    plan,
+    replayArtifactPath: replayPath,
+    manualReviewArtifactPath: manualPath,
+    candidateRelease: artifact.candidateRelease
+  });
+  artifact.qualityGate = rawBundle.qualityGate;
+  artifact.manualReview = rawBundle.manualReview;
+  artifact.eligible = rawBundle.derivedEligible;
+  writeFileSync(join(directory, 'quality-report.json'), JSON.stringify(artifact));
+  return { artifact, artifactPath: join(directory, 'quality-report.json') };
 }
 
 function registerInput(report, rolloutKey = 'DIRECT_REPLY', expectedRevision = 1) {
@@ -996,7 +1111,7 @@ test('forged CLI reports are fully validated before any report row is written', 
         'candidate-release-id': candidate.releaseId
       },
       stdout: silentStdout()
-    }), /unknown fields|candidate release|promotion baseline|eligible materialized quality report/);
+    }), /unknown fields|candidate release|promotion baseline|eligible materialized quality report|legacy|ineligible/);
     const verify = new YuqiStore(databasePath);
     assert.equal(verify.db.prepare('SELECT COUNT(*) AS n FROM cognition_evaluation_reports').get().n, 0);
     verify.close();
@@ -1006,7 +1121,7 @@ test('forged CLI reports are fully validated before any report row is written', 
   }
 });
 
-test('CLI resumes an exact pending report and rejects same-id authority conflicts', () => {
+test('CLI resumes an exact pending v2 report and rejects same-id authority conflicts', () => {
   const dir = promotionEvidenceTempDir('cli-pending');
   const databasePath = join(dir, 'runtime.sqlite');
   const configPath = join(dir, 'rollout.json');
@@ -1017,98 +1132,49 @@ test('CLI resumes an exact pending report and rejects same-id authority conflict
   const artifact = qualityReportArtifact(store, 'DIRECT_REPLY', 'cli-pending-report');
   const pendingStable = store.getPipelineRelease(controller.getStatus('DIRECT_REPLY').stableReleaseId);
   const resetSourceRunner = installCleanSourceRunner();
-  writeTrackedRawBundle(dir, artifact, {
-    stableReleaseId: pendingStable.releaseId,
-    stableReleaseChecksum: pendingStable.releaseChecksum,
-    sourceHead: currentSourceHead()
-  });
-  writeFileSync(artifactPath, JSON.stringify(artifact));
-  const rawBundle = loadQualityPromotionRawBundle({ artifactPath, artifact, rootDir: process.cwd() });
-  const summary = reportSummaryFromArtifact({
-    artifact, rollout: { stableReleaseId: pendingStable.releaseId }, rootDir: process.cwd(), rawBundle
-  });
-  store.putEvaluationReportInternal({
-    reportId: artifact.reportId,
-    reportType: 'promotion',
-    rolloutKey: 'DIRECT_REPLY',
-    sourceType: 'aggregate_gate',
-    sourceRef: artifactPath,
-    artifactPath,
-    summary,
-    createdAt: 2_100
-  });
-  writeFileSync(configPath, JSON.stringify({ databasePath }));
-  store.close();
   try {
-    executeRolloutCommand({
-      command: 'promote',
-      options: {
-        config: configPath,
-        kind: 'DIRECT_REPLY',
-        report: artifactPath,
-        'expected-revision': '1',
-        'candidate-release-id': artifact.candidateRelease.releaseId
-      },
-      stdout: silentStdout()
-    });
+    const genuine = writeGenuineV2PendingBundle(dir, artifact, pendingStable);
+    const rawBundle = loadQualityPromotionRawBundle({ artifactPath: genuine.artifactPath, artifact: genuine.artifact, rootDir: process.cwd() });
+    const summary = reportSummaryFromArtifact({ artifact: genuine.artifact, rollout: { stableReleaseId: pendingStable.releaseId }, rootDir: process.cwd(), rawBundle });
+    store.putEvaluationReportInternal({ reportId: genuine.artifact.reportId, reportType: 'promotion', rolloutKey: 'DIRECT_REPLY',
+      sourceType: 'aggregate_gate', sourceRef: artifactPath, artifactPath, summary, createdAt: 2_100 });
+    writeFileSync(configPath, JSON.stringify({ databasePath }));
+    store.close();
+    executeRolloutCommand({ command: 'promote', options: { config: configPath, kind: 'DIRECT_REPLY', report: artifactPath,
+      'expected-revision': '1', 'candidate-release-id': genuine.artifact.candidateRelease.releaseId }, stdout: silentStdout() });
     const recovered = new YuqiStore(databasePath);
-    assert.equal(recovered.getEvaluationReport(artifact.reportId).artifactState, 'materialized');
+    assert.equal(recovered.getEvaluationReport(genuine.artifact.reportId).artifactState, 'materialized');
     assert.equal(recovered.getCognitionRollout('DIRECT_REPLY').candidatePhase, 'shadow');
+    const beforeRollout = recovered.getCognitionRollout('DIRECT_REPLY');
+    const beforeReport = recovered.getEvaluationReport(genuine.artifact.reportId);
+    const beforeProactive = recovered.getCognitionRollout('PROACTIVE_CHAT');
     assert.equal(recovered.listPromotionHistory()
       .filter(event => event.reasonCode === 'candidate_registered').length, 1);
-    const beforeRollout = recovered.getCognitionRollout('DIRECT_REPLY');
-    const beforeReport = recovered.getEvaluationReport(artifact.reportId);
     recovered.close();
-
-    const changed = { ...artifact, planChecksum: 'changed-plan-checksum' };
+    const changed = { ...genuine.artifact, planChecksum: 'changed-plan-checksum' };
     writeFileSync(artifactPath, JSON.stringify(changed));
-    assert.throws(() => executeRolloutCommand({
-      command: 'promote',
-      options: {
-        config: configPath,
-        kind: 'DIRECT_REPLY',
-        report: artifactPath,
-        'expected-revision': String(beforeRollout.revision),
-        'candidate-release-id': changed.candidateRelease.releaseId
-      },
-      stdout: silentStdout()
-    }), /authority conflict|checksum conflict|raw bundle identity/);
+    assert.throws(() => executeRolloutCommand({ command: 'promote', options: { config: configPath, kind: 'DIRECT_REPLY', report: artifactPath,
+      'expected-revision': String(beforeRollout.revision), 'candidate-release-id': changed.candidateRelease.releaseId }, stdout: silentStdout() }), /authority conflict|checksum conflict|raw bundle identity|raw derivation|eligible materialized quality report/);
     const unchanged = new YuqiStore(databasePath);
     assert.deepEqual(unchanged.getCognitionRollout('DIRECT_REPLY'), beforeRollout);
-    assert.deepEqual(unchanged.getEvaluationReport(artifact.reportId), beforeReport);
+    assert.deepEqual(unchanged.getEvaluationReport(genuine.artifact.reportId), beforeReport);
     unchanged.close();
-
-    writeFileSync(artifactPath, JSON.stringify(artifact));
     const movedArtifactPath = join(dir, 'moved-quality-report.json');
-    writeFileSync(movedArtifactPath, JSON.stringify(artifact));
-    assert.throws(() => executeRolloutCommand({
-      command: 'promote',
-      options: {
-        config: configPath,
-        kind: 'DIRECT_REPLY',
-        report: movedArtifactPath,
-        'expected-revision': String(beforeRollout.revision),
-        'candidate-release-id': artifact.candidateRelease.releaseId
-      },
-      stdout: silentStdout()
-    }), /authority conflict/);
-    assert.throws(() => executeRolloutCommand({
-      command: 'promote',
-      options: {
-        config: configPath,
-        kind: 'PROACTIVE_CHAT',
-        report: artifactPath,
-        'expected-revision': '1',
-        'candidate-release-id': artifact.candidateRelease.releaseId
-      },
-      stdout: silentStdout()
-    }), /authority conflict/);
-    const final = new YuqiStore(databasePath);
-    assert.deepEqual(final.getCognitionRollout('DIRECT_REPLY'), beforeRollout);
-    assert.deepEqual(final.getEvaluationReport(artifact.reportId), beforeReport);
-    assert.equal(final.getCognitionRollout('PROACTIVE_CHAT').revision, 1);
-    final.close();
+    writeFileSync(movedArtifactPath, JSON.stringify(genuine.artifact));
+    assert.throws(() => executeRolloutCommand({ command: 'promote', options: { config: configPath, kind: 'DIRECT_REPLY', report: movedArtifactPath,
+      'expected-revision': String(beforeRollout.revision), 'candidate-release-id': genuine.artifact.candidateRelease.releaseId }, stdout: silentStdout() }), /authority conflict|raw bundle|scope/);
+    assert.throws(() => executeRolloutCommand({ command: 'promote', options: { config: configPath, kind: 'PROACTIVE_CHAT', report: artifactPath,
+      'expected-revision': '1', 'candidate-release-id': genuine.artifact.candidateRelease.releaseId }, stdout: silentStdout() }), /authority conflict|rollout|candidate|raw derivation|eligible materialized quality report/);
+    const reopened = new YuqiStore(databasePath);
+    assert.deepEqual(reopened.getCognitionRollout('DIRECT_REPLY'), beforeRollout);
+    assert.deepEqual(reopened.getEvaluationReport(genuine.artifact.reportId), beforeReport);
+    assert.deepEqual(reopened.getCognitionRollout('PROACTIVE_CHAT'), beforeProactive);
+    assert.equal(reopened.getCognitionRollout('PROACTIVE_CHAT').revision, 1);
+    assert.equal(reopened.listPromotionHistory()
+      .filter(event => event.reasonCode === 'candidate_registered').length, 1);
+    reopened.close();
   } finally {
+    store.close();
     resetSourceRunner();
     try { rmSync(dir, { recursive: true, force: true }); } catch {}
   }

@@ -51,6 +51,21 @@ test('quality CLI package scripts are declared without production release regist
   }
 });
 
+test('Task6 production report and readiness are wired to the shared v2/manual-review contract', () => {
+  const reportSource = readFileSync(resolve(rootDir, 'scripts/report-yuqi-lived-quality.mjs'), 'utf8');
+  const readinessSource = readFileSync(resolve(rootDir, 'scripts/verify-yuqi-v3-readiness.mjs'), 'utf8');
+  assert.match(reportSource, /validateQualityReplayV2Rows/);
+  assert.match(readinessSource, /validateQualityReplayV2Rows/);
+  for (const field of [
+    'manual_metadata', 'manual_provenance', 'primaryJudgmentChecksum',
+    'secondaryJudgmentChecksum', 'finalValueChecksum', 'resolvedOutput'
+  ]) {
+    assert.match(reportSource, new RegExp(field));
+  }
+  assert.match(reportSource, /legacy_structural/);
+  assert.match(reportSource, /evidenceEligible\s*:\s*false/);
+});
+
 function readJson(path) {
   return JSON.parse(readFileSync(path, 'utf8'));
 }

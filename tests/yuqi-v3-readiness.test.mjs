@@ -42,6 +42,13 @@ const VISIBLE_PATH_START_FILE = 'private/visible-path-collection-start.json';
 const VISIBLE_PATH_XML_FILE = 'private/visible-path-android-test.xml';
 const VISIBLE_PATH_PC_SOURCE_DATABASE_SHA = '6'.repeat(64);
 
+test('readiness must consume the shared v2 validator before any eligible gate', () => {
+  const source = readFileSync(join(process.cwd(), 'scripts/verify-yuqi-v3-readiness.mjs'), 'utf8');
+  assert.match(source, /validateQualityReplayV2Rows/);
+  assert.match(source, /legacy_structural/);
+  assert.match(source, /evidenceEligible\s*:\s*false/);
+});
+
 test('readiness is a fifteen-artifact bundle and blocked reports carry all keys', () => {
   assert.equal(READINESS_ARTIFACT_NAMES.length, 15);
   const blocked = materializeBlockedReadinessReport({ failedGate: 'QUALITY_BUNDLE_UNAVAILABLE' });
@@ -142,6 +149,8 @@ function closedQuality(candidateReleaseId) {
     regressionRate: 0, tieOrUnresolvedRate: 0, structuralRegressionCount: 0,
     candidateWins: 1, stableWins: 0, tieCount: 0, unresolvedCount: 0,
     completedPairs: 1, evidenceCount: 1, failedGates: [], eligible: true
+    , decisionCount: 1, differenceCount: 0, comparisonUnresolvedCount: 0,
+    comparisonManualReviewCount: 0
   };
   const executionPair = {
     finalKey: 'sentinel:quality-fixture:0',
@@ -471,7 +480,13 @@ function buildQualityBundleFixture(root, candidateReleaseId) {
   ];
   const replayBytes = Buffer.from(`${replayRows.map(row => JSON.stringify(row)).join('\n')}\n`);
   const manualBytes = Buffer.from(`${manualRows.map(row => JSON.stringify(row)).join('\n')}\n`);
-  const qualityGate = aggregateQualityGate(evidence, expected);
+  const qualityGate = {
+    ...aggregateQualityGate(evidence, expected),
+    decisionCount: finals.length,
+    differenceCount: 0,
+    comparisonUnresolvedCount: 0,
+    comparisonManualReviewCount: 0
+  };
   const manualReview = {
     eligible: true, failedGates: [], unresolvedCount: 0, requiredCount: requirements.length,
     requirements, queue: manualRows.slice(1).map(({ recordType: _recordType, runId: _runId, ...row }) => row)
@@ -695,7 +710,8 @@ test('readiness loads only a real disk manifest and validates every raw artifact
   );
   const evidence = loadReadinessManifest({ manifestPath: fixture.manifestPath, evidenceDirectory: fixture.root });
   const result = verifyReadiness(evidence);
-  assert.equal(result.ready, true);
+  assert.equal(result.ready, false);
+  assert.ok(result.failedGates.includes('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE'));
   assert.equal(Object.keys(result.checksums).length, 15);
   const rawManifest = JSON.parse(readFileSync(fixture.manifestPath, 'utf8'));
   rawManifest.artifacts.quality.sha256 = '0'.repeat(64);
@@ -1349,7 +1365,8 @@ test('readiness report is a closed checksum-bound output with no invented connec
     'failedGates', 'inputSha256', 'ready', 'reportChecksum', 'schemaVersion',
     'sourceHead', 'startedAt'
   ].sort());
-  assert.equal(report.ready, true);
+  assert.equal(report.ready, false);
+  assert.ok(report.failedGates.includes('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE'));
   const { reportChecksum, ...withoutChecksum } = report;
   assert.equal(reportChecksum, sha256(withoutChecksum));
 });
@@ -1417,7 +1434,8 @@ test('run mode invokes formal visible-path finalizer before npm/Gradle and conti
       'command:git', 'command:git', 'runtime', 'command:git', 'command:git', 'formal'
     ]);
     assert.equal(existsSync(join(fixture.evidence, 'visible-path-metrics.json')), true);
-    assert.equal(result.ready, true);
+    assert.equal(result.ready, false);
+    assert.ok(result.failedGates.includes('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE'));
     assert.ok(calls.length > 0);
   } finally {
     fixture.cleanup();
@@ -1651,7 +1669,8 @@ test('run mode uses one selected device, absolute npm/Gradle commands, exact cla
       return { command, args, output: 'ℹ tests 10\nℹ pass 10\nℹ fail 0\nℹ skipped 0\n', exitCode: 0, outputSha256: sha256('node') };
     }
   });
-  assert.equal(result.ready, true);
+  assert.equal(result.ready, false);
+  assert.ok(result.failedGates.includes('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE'));
   assert.equal(calls.length, 10);
   assert.equal(calls[0].command, 'git');
   assert.equal(calls[1].command, 'git');

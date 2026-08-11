@@ -4,11 +4,11 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { canonicalJson, contentHash } from '../yuqi-runtime/src/protocol.mjs';
-import { aggregateQualityGate, compileSceneExecutionInput } from '../yuqi-runtime/src/quality-evaluator.mjs';
+import { aggregateQualityGate, compileSceneExecutionInput, normalizeBlindEvaluation } from '../yuqi-runtime/src/quality-evaluator.mjs';
 import { supportsPipelineVersion } from '../yuqi-runtime/src/release-executor.mjs';
 import { loadLocalHistoryManifest, loadLocalHistoryScenes } from './run-yuqi-lived-quality-replay.mjs';
 import { presetHistoryArtifactPaths } from './compile-yuqi-preset-history-scenes.mjs';
-import { loadQualityReplayPlanArtifact } from '../yuqi-runtime/src/quality-replay.mjs';
+import { loadQualityReplayPlanArtifact, validateQualityReplayV2Rows } from '../yuqi-runtime/src/quality-replay.mjs';
 import {
   assertVerifiedQualityReplayPlan,
   expectedFinalKeysProjection
@@ -20,6 +20,7 @@ const RELEASE_FIELDS = Object.freeze([
 ]);
 
 const CANDIDATE_RELEASE_FIELDS = Object.freeze([...RELEASE_FIELDS, 'releaseId', 'releaseChecksum']);
+const ARTIFACT_MATERIALIZATION_TOKEN = Symbol('quality-artifact-materialization');
 
 function assertReleaseFields(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('release definition object required');
@@ -82,6 +83,351 @@ const MODEL_PROVENANCE_KEYS = new Set([
 ]);
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const MANUAL_V2_DECISIONS = new Set(['accept_primary', 'accept_secondary', 'merge', 'reject_both', 'unresolved']);
+const MANUAL_V2_METADATA_KEYS = Object.freeze([
+  'schemaVersion', 'recordType', 'runId', 'sourceHead', 'candidateReleaseId',
+  'candidateReleaseChecksum', 'planChecksum', 'replayProvenanceChecksum', 'requirementsChecksum'
+]);
+const MANUAL_V2_REVIEW_KEYS = Object.freeze([
+  'schemaVersion', 'recordType', 'runId', 'reviewId', 'finalKey',
+  'primaryJudgmentChecksum', 'secondaryJudgmentChecksum', 'executionChecksum',
+  'finalValueChecksum', 'evidenceFindingIds', 'decision', 'resolvedOutput', 'reason',
+  'reviewer', 'createdAt'
+]);
+const MANUAL_V2_PROVENANCE_KEYS = Object.freeze([
+  'schemaVersion', 'recordType', 'runId', 'recordCounts', 'recordsChecksum', 'manualProvenanceChecksum'
+]);
+
+function exactKeysV2(value, keys, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || JSON.stringify(Object.keys(value).sort()) !== JSON.stringify([...keys].sort())) {
+    throw new Error(`${label} closed schema conflict`);
+  }
+}
+
+function parseV2FinalKey(finalKey) {
+  const parts = typeof finalKey === 'string' ? finalKey.split(':') : [];
+  if (parts.length !== 3 || !parts[0] || !parts[1] || !/^\d+$/.test(parts[2])) {
+    throw new Error('quality replay v2 final key conflict');
+  }
+  return { layer: parts[0], sceneId: parts[1], repeatIndex: Number(parts[2]) };
+}
+
+function manualReviewId({ runId, finalKey, primaryJudgmentChecksum, secondaryJudgmentChecksum, executionChecksum, finalValueChecksum }) {
+  return `qreview_${contentHash({
+    runId, finalKey, primaryJudgmentChecksum, secondaryJudgmentChecksum, executionChecksum, finalValueChecksum
+  }).slice(0, 48)}`;
+}
+
+export function validateManualV2Rows(rows, { runId, plan, provenanceRow, sourceHead, candidateRelease, evidence, validated }) {
+  if (!Array.isArray(rows) || rows.length < 2) throw new Error('quality manual review v2 rows required');
+  const metadata = rows.filter(row => row?.recordType === 'manual_metadata');
+  const reviews = rows.filter(row => row?.recordType === 'review');
+  const provenance = rows.filter(row => row?.recordType === 'manual_provenance');
+  if (metadata.length !== 1 || provenance.length !== 1) throw new Error('quality manual review v2 cardinality conflict');
+  exactKeysV2(metadata[0], MANUAL_V2_METADATA_KEYS, 'manual metadata');
+  exactKeysV2(provenance[0], MANUAL_V2_PROVENANCE_KEYS, 'manual provenance');
+  const meta = metadata[0];
+  if (meta.schemaVersion !== 2 || meta.runId !== runId || meta.sourceHead !== sourceHead
+    || meta.candidateReleaseId !== candidateRelease.releaseId
+    || meta.candidateReleaseChecksum !== candidateRelease.releaseChecksum
+    || meta.planChecksum !== plan.planChecksum
+    || !isSha256(meta.replayProvenanceChecksum)
+    || meta.replayProvenanceChecksum !== provenanceRow.provenanceChecksum
+    || !isSha256(meta.requirementsChecksum)) {
+    throw new Error('quality manual review v2 binding conflict');
+  }
+  const projection = expectedFinalKeysProjection(plan);
+  const orderedFinalKeys = [
+    ...projection.finalKeys.sentinelFinalKeys,
+    ...projection.finalKeys.coverageFinalKeys,
+    ...projection.finalKeys.historyFinalKeys
+  ];
+  const finalKeys = new Set(orderedFinalKeys);
+  const orderedRequirements = deriveManualV2RequirementsFromValidated(validated, plan);
+  const orderedRequirementRows = orderedRequirements.map(requirement => {
+    const judgments = validated.judgments.filter(row => row.finalKey === requirement.finalKey);
+    return {
+      finalKey: requirement.finalKey,
+      primaryJudgmentChecksum: judgments.find(row => row.phase === 'evaluator_primary')?.judgmentChecksum,
+      secondaryJudgmentChecksum: judgments.find(row => row.phase === 'evaluator_secondary')?.judgmentChecksum,
+      executionChecksum: requirement.executionChecksum,
+      finalValueChecksum: requirement.finalValueChecksum,
+      evidenceFindingIds: requirement.evidenceFindingIds
+    };
+  });
+  const seen = new Set();
+  const effectiveOutputs = new Map();
+  const requiredFinalKeys = orderedRequirements.map(requirement => requirement.finalKey);
+  if (reviews.length !== requiredFinalKeys.length) throw new Error('quality manual review v2 missing or extra review');
+  for (const [index, row] of reviews.entries()) {
+    exactKeysV2(row, MANUAL_V2_REVIEW_KEYS, 'manual review');
+    if (row.schemaVersion !== 2 || row.runId !== runId || row.finalKey !== requiredFinalKeys[index] || !finalKeys.has(row.finalKey)
+      || seen.has(row.finalKey) || typeof row.reviewId !== 'string' || !row.reviewId
+      || !isSha256(row.primaryJudgmentChecksum) || !isSha256(row.secondaryJudgmentChecksum)
+      || !isSha256(row.executionChecksum) || !isSha256(row.finalValueChecksum)
+      || !Array.isArray(row.evidenceFindingIds)
+      || row.evidenceFindingIds.some(id => typeof id !== 'string' || !id)
+      || !MANUAL_V2_DECISIONS.has(row.decision) || typeof row.reason !== 'string' || !row.reason
+      || (row.resolvedOutput !== null && (typeof row.resolvedOutput !== 'object' || Array.isArray(row.resolvedOutput)))
+      || (['accept_primary', 'accept_secondary', 'merge'].includes(row.decision) && row.resolvedOutput === null)
+      || (['reject_both', 'unresolved'].includes(row.decision) && row.resolvedOutput !== null)
+      || new Set(row.evidenceFindingIds).size !== row.evidenceFindingIds.length
+      || row.reviewer !== 'central_window' || !Number.isSafeInteger(row.createdAt) || row.createdAt < 0) {
+      throw new Error('quality manual review v2 row conflict');
+    }
+    const final = validated.finals.find(item => item.finalKey === row.finalKey);
+    const judgments = validated.judgments.filter(item => item.finalKey === row.finalKey);
+    if (!final || judgments.length !== 2) throw new Error('quality manual review v2 review join conflict');
+    const primary = judgments.find(item => item.phase === 'evaluator_primary');
+    const secondary = judgments.find(item => item.phase === 'evaluator_secondary');
+    if (!primary || !secondary || row.primaryJudgmentChecksum !== primary.judgmentChecksum
+      || row.secondaryJudgmentChecksum !== secondary.judgmentChecksum
+      || row.executionChecksum !== final.executionChecksum
+      || row.finalValueChecksum !== final.valueChecksum
+      || row.reviewId !== manualReviewId({
+        runId, finalKey: row.finalKey, primaryJudgmentChecksum: primary.judgmentChecksum,
+        secondaryJudgmentChecksum: secondary.judgmentChecksum,
+        executionChecksum: final.executionChecksum, finalValueChecksum: final.valueChecksum
+      })) {
+      throw new Error('quality manual review v2 deterministic binding conflict');
+    }
+    const requirement = orderedRequirements[index];
+    if (!requirement || canonicalJson([...row.evidenceFindingIds]) !== canonicalJson([...requirement.evidenceFindingIds])) {
+      throw new Error('quality manual review v2 finding binding conflict');
+    }
+    const primaryOutput = requirement.primary;
+    const secondaryOutput = requirement.secondary;
+    let effectiveOutput = null;
+    if (row.decision === 'accept_primary' && canonicalJson(row.resolvedOutput) !== canonicalJson(primaryOutput)) {
+      throw new Error('quality manual review v2 primary output conflict');
+    }
+    if (row.decision === 'accept_primary') effectiveOutput = primaryOutput;
+    if (row.decision === 'accept_secondary' && canonicalJson(row.resolvedOutput) !== canonicalJson(secondaryOutput)) {
+      throw new Error('quality manual review v2 secondary output conflict');
+    }
+    if (row.decision === 'accept_secondary') effectiveOutput = secondaryOutput;
+    if (row.decision === 'merge') {
+      try { effectiveOutput = normalizeBlindEvaluation(row.resolvedOutput); } catch (error) {
+        throw new Error(`quality manual review v2 merge output conflict: ${error.message}`);
+      }
+    }
+    if (row.decision === 'reject_both' || row.decision === 'unresolved') effectiveOutput = null;
+    effectiveOutputs.set(row.finalKey, effectiveOutput);
+    seen.add(row.finalKey);
+  }
+  if (meta.requirementsChecksum !== contentHash(orderedRequirementRows)) {
+    throw new Error('quality manual review v2 requirements checksum conflict');
+  }
+  const body = rows.filter(row => row.recordType !== 'manual_provenance');
+  const recordCounts = { manualMetadata: 1, review: reviews.length };
+  if (provenance[0].schemaVersion !== 2 || provenance[0].runId !== runId
+    || canonicalJson(provenance[0].recordCounts) !== canonicalJson(recordCounts)
+    || provenance[0].recordsChecksum !== contentHash(body)
+    || provenance[0].manualProvenanceChecksum !== contentHash({
+      runId, requirementsChecksum: meta.requirementsChecksum, recordCounts,
+      recordsChecksum: provenance[0].recordsChecksum
+    })) {
+    throw new Error('quality manual review v2 provenance conflict');
+  }
+  for (const finalKey of orderedFinalKeys) {
+    if (requiredFinalKeys.includes(finalKey)) continue;
+    const final = validated.finals.find(item => item.finalKey === finalKey);
+    const primary = normalizeBlindEvaluation(final?.value?.primary?.output);
+    const secondary = normalizeBlindEvaluation(final?.value?.secondary?.output);
+    if (canonicalJson(primary) !== canonicalJson(secondary)) {
+      throw new Error('quality manual review v2 missing difference review');
+    }
+    effectiveOutputs.set(finalKey, primary);
+  }
+  return {
+    metadata: meta,
+    reviews,
+    provenance: provenance[0],
+    eligible: reviews.every(row => row.decision !== 'reject_both' && row.decision !== 'unresolved'),
+    effectiveOutputs,
+    requirements: orderedRequirementRows.map(row => ({
+      finalKey: row.finalKey,
+      sceneId: parseV2FinalKey(row.finalKey).sceneId,
+      repeatIndex: parseV2FinalKey(row.finalKey).repeatIndex,
+      evidenceFindingIds: row.evidenceFindingIds,
+      executionChecksum: row.executionChecksum,
+      finalValueChecksum: row.finalValueChecksum
+    }))
+  };
+}
+
+export function deriveManualV2RequirementsFromValidated(validated, expectedPlan, { includePassingSample = true } = {}) {
+  const projection = expectedFinalKeysProjection(expectedPlan);
+  const orderedFinalKeys = [
+    ...projection.finalKeys.sentinelFinalKeys,
+    ...projection.finalKeys.coverageFinalKeys,
+    ...projection.finalKeys.historyFinalKeys
+  ];
+  const planByKey = new Map((expectedPlan?.items || []).map(item => [
+    `${item.layer}:${item.sceneId}:${item.repeatIndex}`, item
+  ]));
+  const requirements = [];
+  for (const finalKey of orderedFinalKeys) {
+    const final = validated.finals.find(row => row.finalKey === finalKey);
+    const primary = final?.value?.primary?.output;
+    const secondary = final?.value?.secondary?.output;
+    if (!final || !primary || !secondary) throw new Error('quality manual v2 judgment output missing');
+    const first = normalizeBlindEvaluation(primary);
+    const second = normalizeBlindEvaluation(secondary);
+    const findingIds = [...new Set([...first.findings, ...second.findings]
+      .filter(finding => finding?.critical === true || finding?.severity === 'critical')
+      .map(finding => finding.code)
+      .filter(code => typeof code === 'string'))];
+    const scoreOne = Object.values(first.scores).some(score => score === 1)
+      || Object.values(second.scores).some(score => score === 1);
+    const structured = [...first.findings, ...second.findings].some(finding =>
+      STRUCTURED_ACTION_CODES.has(finding?.code)
+      && (finding?.critical === true || finding?.severity === 'critical'));
+    const difference = canonicalJson(first) !== canonicalJson(second)
+      || (final.value.comparison?.differences?.length || 0) > 0;
+    const parsed = parseV2FinalKey(finalKey);
+    const item = planByKey.get(finalKey);
+    const sampledPassing = includePassingSample && !findingIds.length && !scoreOne && !structured
+      && !difference && isSampledPassingScene({
+        kind: sceneKind(item?.scene), sceneId: parsed.sceneId, repeatIndex: parsed.repeatIndex
+      });
+    if (findingIds.length || scoreOne || structured || difference || sampledPassing) {
+      const reasons = [...findingIds];
+      if (scoreOne) reasons.push('score_1');
+      if (structured) reasons.push('structured_action');
+      if (difference) reasons.push('judgment_difference');
+      if (sampledPassing) reasons.push('sampled_structured_action');
+      requirements.push({
+        finalKey,
+        sceneId: parsed.sceneId,
+        repeatIndex: parsed.repeatIndex,
+        evidenceFindingIds: [...new Set(reasons)],
+        primary: first,
+        secondary: second,
+        executionChecksum: final.executionChecksum,
+        finalValueChecksum: final.valueChecksum
+      });
+    }
+  }
+  return requirements;
+}
+
+export function projectV2Evidence(validated, effectiveOutputs = new Map()) {
+  const groups = { sentinelRuns: [], coverageRuns: [], historyRuns: [] };
+  for (const final of validated.finals) {
+    const identity = parseV2FinalKey(final.finalKey);
+    const value = final.value;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('quality replay v2 final value conflict');
+    const judgments = validated.judgments.filter(row => row.finalKey === final.finalKey);
+    const primaryOutput = value.primary?.output;
+    const secondaryOutput = value.secondary?.output;
+    const fallbackOutput = canonicalJson(primaryOutput) === canonicalJson(secondaryOutput)
+      ? normalizeBlindEvaluation(primaryOutput) : null;
+    const effective = effectiveOutputs.has(final.finalKey)
+      ? effectiveOutputs.get(final.finalKey)
+      : fallbackOutput;
+    // reject_both/unresolved intentionally leave no effective output. Keep
+    // that row absent so the exact evidence-set gate blocks without choosing
+    // either evaluator by default.
+    if (!effective) continue;
+    const attempts = judgments.map((judgment, index) => ({
+      attemptIndex: index,
+      evaluatorId: judgment.evaluatorId,
+      evaluatorVersion: judgment.evaluatorVersion,
+      executionChecksum: final.executionChecksum,
+      latencyMs: 0,
+      accepted: index === 0,
+      unresolved: index !== 0 || effective.unresolved === true
+    }));
+    const row = {
+      ...identity,
+      finalized: true,
+      scores: effective.scores,
+      preference: effective.preference,
+      regression: effective.preference === 'A',
+      severe: Object.values(effective.scores).some(score => score === 1)
+        || effective.findings.some(finding => finding?.critical === true || finding?.severity === 'critical'),
+      tie: effective.preference === 'tie',
+      unresolved: effective.unresolved,
+      structuralRegression: effective.findings.some(finding => finding?.code === 'ILLEGAL_STAGE_TRANSITION'),
+      protocolFailure: effective.findings.some(finding => finding?.code === 'DIRECT_REPLY_SKIP'),
+      findings: effective.findings,
+      executionChecksum: final.executionChecksum,
+      latencyMs: Number.isSafeInteger(value.latencyMs) ? value.latencyMs : 0,
+      evaluatorVersion: judgments[0]?.evaluatorVersion || 'quality-replay-v2',
+      attempts
+    };
+    const group = identity.layer === 'sentinel' ? groups.sentinelRuns
+      : identity.layer === 'history' ? groups.historyRuns : groups.coverageRuns;
+    group.push(row);
+  }
+  return groups;
+}
+
+export function projectV2ComparisonSummary(validated, expectedFinalKeys = null) {
+  const finals = Array.isArray(validated?.finals) ? validated.finals : [];
+  const expected = expectedFinalKeys ? [...expectedFinalKeys] : finals.map(row => row.finalKey);
+  if (new Set(expected).size !== expected.length || finals.length !== expected.length
+    || finals.some(row => !expected.includes(row.finalKey))) {
+    throw new Error('quality v2 comparison final set conflict');
+  }
+  const summary = {
+    decisionCount: finals.length,
+    differenceCount: 0,
+    comparisonUnresolvedCount: 0,
+    comparisonManualReviewCount: 0
+  };
+  for (const row of finals) {
+    const comparison = row?.value?.comparison;
+    if (!comparison || typeof comparison !== 'object' || Array.isArray(comparison)
+      || !Array.isArray(comparison.differences)
+      || typeof comparison.unresolved !== 'boolean'
+      || typeof comparison.manualReview !== 'boolean') {
+      throw new Error('quality v2 comparison summary conflict');
+    }
+    if (comparison.differences.length > 0) summary.differenceCount += 1;
+    if (comparison.unresolved) summary.comparisonUnresolvedCount += 1;
+    if (comparison.manualReview) summary.comparisonManualReviewCount += 1;
+  }
+  return summary;
+}
+
+export function projectV2Provenance(validated) {
+  const header = validated?.run?.header;
+  const stable = header?.stableRelease;
+  const candidate = header?.candidateRelease;
+  if (!header || !stable || !candidate || typeof header.sourceHead !== 'string') {
+    throw new Error('quality replay v2 provenance release/header missing');
+  }
+  const executionPairs = validated.executions.map(execution => ({
+    finalKey: execution.finalKey,
+    sourceHead: header.sourceHead,
+    stableReleaseId: stable.releaseId,
+    stableReleaseChecksum: stable.releaseChecksum,
+    candidateReleaseId: candidate.releaseId,
+    candidateReleaseChecksum: candidate.releaseChecksum,
+    executionChecksum: execution.executionChecksum,
+    stableInputChecksum: execution.stablePhase.inputChecksum,
+    candidateInputChecksum: execution.candidatePhase.inputChecksum,
+    dryRun: true,
+    capabilities: { visible: false, actions: false }
+  }));
+  if (executionPairs.some(pair => !isSha256(pair.stableInputChecksum)
+    || !isSha256(pair.candidateInputChecksum))) {
+    throw new Error('quality replay v2 phase input provenance missing');
+  }
+  const modelRuns = validated.finals.flatMap(final =>
+    ['evaluator_primary', 'evaluator_secondary'].map((phase, attemptIndex) => {
+      const judgment = validated.judgments.find(row => row.finalKey === final.finalKey && row.phase === phase);
+      return { finalKey: final.finalKey, attemptIndex,
+        evaluatorId: judgment.evaluatorId, inputChecksum: judgment.inputChecksum, completed: true };
+    }));
+  const basis = { runId: validated.run.runId, sourceHead: header.sourceHead,
+    phaseInputMode: 'v2', executionPairs, modelRuns };
+  return { ...basis, provenanceChecksum: contentHash(basis) };
+}
+
 function readJsonLinesArtifact(path, label) {
   if (typeof path !== 'string' || !path || !existsSync(path)) throw new Error(`${label} artifact missing`);
   const bytes = readFileSync(path);
@@ -110,16 +456,18 @@ function isSha256(value) {
 
 export function assertQualityReportProvenance(
   provenance,
-  { expectedFinalKeys = null, candidateRelease = null, sourceHead = null } = {}
+  { expectedFinalKeys = null, candidateRelease = null, sourceHead = null, allowDistinctPhaseInputs = false } = {}
 ) {
   if (!provenance || typeof provenance !== 'object' || Array.isArray(provenance)
     || !(['executionPairs,modelRuns,provenanceChecksum,sourceHead',
-      'executionPairs,modelRuns,provenanceChecksum,runId,sourceHead'].includes(Object.keys(provenance).sort().join(',')))
+      'executionPairs,modelRuns,provenanceChecksum,runId,sourceHead',
+      'executionPairs,modelRuns,phaseInputMode,provenanceChecksum,runId,sourceHead'].includes(Object.keys(provenance).sort().join(',')))
     || !Array.isArray(provenance.executionPairs) || !Array.isArray(provenance.modelRuns)
     || provenance.executionPairs.length === 0) {
     throw new Error('replay execution/model provenance required');
   }
-  if (!/^[0-9a-f]{40}$/.test(provenance.sourceHead)
+  if ((provenance.phaseInputMode !== undefined && provenance.phaseInputMode !== 'v2')
+    || !/^[0-9a-f]{40}$/.test(provenance.sourceHead)
     || (sourceHead !== null && provenance.sourceHead !== sourceHead)
     || !isSha256(provenance.provenanceChecksum)) {
     throw new Error('replay source provenance identity conflict');
@@ -147,8 +495,11 @@ export function assertQualityReportProvenance(
       || typeof record.candidateReleaseId !== 'string' || !record.candidateReleaseId
       || !isSha256(record.candidateReleaseChecksum)
       || !isSha256(record.executionChecksum)
-      || record.stableInputChecksum !== record.executionChecksum
-      || record.candidateInputChecksum !== record.executionChecksum
+      || !isSha256(record.stableInputChecksum)
+      || !isSha256(record.candidateInputChecksum)
+      || (!(allowDistinctPhaseInputs || provenance.phaseInputMode === 'v2')
+        && (record.stableInputChecksum !== record.executionChecksum
+          || record.candidateInputChecksum !== record.executionChecksum))
       || record.dryRun !== true
       || !record.capabilities || Object.keys(record.capabilities).sort().join(',') !== 'actions,visible'
       || record.capabilities.actions !== false || record.capabilities.visible !== false) {
@@ -167,6 +518,7 @@ export function assertQualityReportProvenance(
   const provenanceBasis = {
     ...(provenance.runId ? { runId: provenance.runId } : {}),
     sourceHead: provenance.sourceHead,
+    ...(provenance.phaseInputMode ? { phaseInputMode: provenance.phaseInputMode } : {}),
     executionPairs: provenance.executionPairs,
     modelRuns: provenance.modelRuns
   };
@@ -197,14 +549,16 @@ export function assertQualityReportProvenance(
   return provenance;
 }
 
-function assertReplayProvenance(provenance, expectedPlan, candidateRelease) {
+function assertReplayProvenance(provenance, expectedPlan, candidateRelease, { allowDistinctPhaseInputs = false } = {}) {
   if (!provenance || typeof provenance !== 'object' || Array.isArray(provenance)
     || !(['executionPairs,modelRuns,provenanceChecksum,sourceHead',
-      'executionPairs,modelRuns,provenanceChecksum,runId,sourceHead'].includes(Object.keys(provenance).sort().join(',')))
+      'executionPairs,modelRuns,provenanceChecksum,runId,sourceHead',
+      'executionPairs,modelRuns,phaseInputMode,provenanceChecksum,runId,sourceHead'].includes(Object.keys(provenance).sort().join(',')))
     || !Array.isArray(provenance.executionPairs) || !Array.isArray(provenance.modelRuns)) {
     throw new Error('replay execution/model provenance required');
   }
-  if (!/^[0-9a-f]{40}$/.test(provenance.sourceHead)
+  if ((provenance.phaseInputMode !== undefined && provenance.phaseInputMode !== 'v2')
+    || !/^[0-9a-f]{40}$/.test(provenance.sourceHead)
     || !isSha256(provenance.provenanceChecksum)) {
     throw new Error('replay source provenance identity conflict');
   }
@@ -242,8 +596,11 @@ function assertReplayProvenance(provenance, expectedPlan, candidateRelease) {
       || !isSha256(record.stableReleaseChecksum)
       || record.candidateReleaseChecksum !== candidateRelease.releaseChecksum
       || !isSha256(record.executionChecksum)
-      || record.stableInputChecksum !== record.executionChecksum
-      || record.candidateInputChecksum !== record.executionChecksum
+      || !isSha256(record.stableInputChecksum)
+      || !isSha256(record.candidateInputChecksum)
+      || (!(allowDistinctPhaseInputs || provenance.phaseInputMode === 'v2')
+        && (record.stableInputChecksum !== record.executionChecksum
+          || record.candidateInputChecksum !== record.executionChecksum))
       || record.dryRun !== true
       || !record.capabilities || Object.keys(record.capabilities).sort().join(',') !== 'actions,visible'
       || record.capabilities.actions !== false || record.capabilities.visible !== false) {
@@ -253,6 +610,7 @@ function assertReplayProvenance(provenance, expectedPlan, candidateRelease) {
   const provenanceBasis = {
     ...(provenance.runId ? { runId: provenance.runId } : {}),
     sourceHead: provenance.sourceHead,
+    ...(provenance.phaseInputMode ? { phaseInputMode: provenance.phaseInputMode } : {}),
     executionPairs: provenance.executionPairs,
     modelRuns: provenance.modelRuns
   };
@@ -284,8 +642,8 @@ function assertReplayProvenance(provenance, expectedPlan, candidateRelease) {
   return provenance;
 }
 
-function assertEvidenceExecutionJoins(evidence, provenance, expectedFinalKeys) {
-  assertQualityReportProvenance(provenance, { expectedFinalKeys });
+function assertEvidenceExecutionJoins(evidence, provenance, expectedFinalKeys, { allowDistinctPhaseInputs = false } = {}) {
+  assertQualityReportProvenance(provenance, { expectedFinalKeys, allowDistinctPhaseInputs });
   const expected = [...expectedFinalKeys].sort();
   const rows = [
     ...(evidence?.sentinelRuns || []),
@@ -383,6 +741,18 @@ function normalizeManualReviewQueue(queue) {
   if (queue === undefined) return [];
   if (!Array.isArray(queue)) throw new Error('manual review queue must be an array');
   return queue.map(item => {
+    if (item && (item.schemaVersion === 2 || Object.prototype.hasOwnProperty.call(item, 'resolvedOutput')
+      || Object.prototype.hasOwnProperty.call(item, 'finalKey'))) {
+      exactKeysV2(item, MANUAL_V2_REVIEW_KEYS, 'manual v2 review queue');
+      if (item.schemaVersion !== 2 || typeof item.runId !== 'string' || !RUN_ID_PATTERN.test(item.runId)
+        || typeof item.finalKey !== 'string' || !item.finalKey || typeof item.reviewId !== 'string' || !item.reviewId
+        || !MANUAL_V2_DECISIONS.has(item.decision) || !Array.isArray(item.evidenceFindingIds)
+        || item.evidenceFindingIds.some(id => typeof id !== 'string' || !id)
+        || (item.resolvedOutput !== null && (typeof item.resolvedOutput !== 'object' || Array.isArray(item.resolvedOutput)))) {
+        throw new Error('manual v2 review queue closed schema conflict');
+      }
+      return { ...item, evidenceFindingIds: [...item.evidenceFindingIds] };
+    }
     if (!item || typeof item !== 'object' || Array.isArray(item)
       || Object.keys(item).some(key => !MANUAL_REVIEW_KEYS.has(key))
       || Object.keys(item).length !== MANUAL_REVIEW_KEYS.size
@@ -413,13 +783,25 @@ function normalizeManualReviewQueue(queue) {
   });
 }
 
-function assessManualReviewQueue(queue, evidence, expectedPlan, { includePassingSample = false } = {}) {
-  const requirements = deriveManualReviewRequirements(evidence, expectedPlan, { includePassingSample });
+export function assessManualReviewQueue(
+  queue,
+  evidence,
+  expectedPlan,
+  { includePassingSample = false, frozenRequirements = null } = {}
+) {
+  const requirements = frozenRequirements
+    ? frozenRequirements.map(requirement => ({
+      ...requirement,
+      key: requirement.key || `${requirement.sceneId}:${requirement.repeatIndex}`
+    }))
+    : deriveManualReviewRequirements(evidence, expectedPlan, { includePassingSample });
   const normalizedQueue = normalizeManualReviewQueue(queue);
   const requiredByKey = new Map(requirements.map(item => [item.key, item]));
   const queueByKey = new Map();
   for (const item of normalizedQueue) {
-    const key = `${item.sceneId}:${item.repeatIndex}`;
+    const key = item.finalKey
+      ? (() => { const parsed = parseV2FinalKey(item.finalKey); return `${parsed.sceneId}:${parsed.repeatIndex}`; })()
+      : `${item.sceneId}:${item.repeatIndex}`;
     if (queueByKey.has(key)) throw new Error('manual review duplicate evidence identity');
     queueByKey.set(key, item);
   }
@@ -435,16 +817,21 @@ function assessManualReviewQueue(queue, evidence, expectedPlan, { includePassing
       failedGates.push('MISSING_MANUAL_REVIEW');
       continue;
     }
-    if (review.decision === 'unresolved') {
+    if (review.decision === 'unresolved' || review.decision === 'reject_both') {
       unresolvedCount += 1;
-      failedGates.push('UNRESOLVED_MANUAL_REVIEW');
+      failedGates.push(review.decision === 'reject_both'
+        ? 'REJECTED_MANUAL_REVIEW' : 'UNRESOLVED_MANUAL_REVIEW');
     }
   }
   for (const review of normalizedQueue) {
-    if (!requiredByKey.has(`${review.sceneId}:${review.repeatIndex}`)) {
-      if (review.decision === 'unresolved') {
+    const reviewKey = review.finalKey
+      ? (() => { const parsed = parseV2FinalKey(review.finalKey); return `${parsed.sceneId}:${parsed.repeatIndex}`; })()
+      : `${review.sceneId}:${review.repeatIndex}`;
+    if (!requiredByKey.has(reviewKey)) {
+      if (review.decision === 'unresolved' || review.decision === 'reject_both') {
         unresolvedCount += 1;
-        failedGates.push('UNRESOLVED_MANUAL_REVIEW');
+        failedGates.push(review.decision === 'reject_both'
+          ? 'REJECTED_MANUAL_REVIEW' : 'UNRESOLVED_MANUAL_REVIEW');
       } else {
         failedGates.push('UNEXPECTED_MANUAL_REVIEW');
       }
@@ -502,6 +889,95 @@ export function validateQualityArtifactBundle({
     ? { bytes: manualReviewBytes, rows: manualReviewBytes.toString('utf8').split(/\r?\n/).filter(Boolean).map(JSON.parse) }
     : readJsonLinesArtifact(manualReviewArtifactPath, 'quality manual review');
   if (replayArtifact.rows.length === 0 || manualArtifact.rows.length === 0) throw new Error('quality bundle rows missing');
+  const isV2 = replayArtifact.rows.some(row => row?.schemaVersion === 2 || row?.recordType === 'run');
+  if (isV2) {
+    const validated = validateQualityReplayV2Rows({ rows: replayArtifact.rows, plan });
+    const runId = validated.run.runId;
+    const manual = validateManualV2Rows(manualArtifact.rows, {
+      runId,
+      plan,
+      provenanceRow: validated.provenance,
+      sourceHead: validated.run.header?.sourceHead,
+      candidateRelease,
+      evidence: null,
+      validated
+    });
+    const expected = expectedFinalKeysProjection(plan);
+    const expectedFinalKeys = [
+      ...expected.finalKeys.sentinelFinalKeys,
+      ...expected.finalKeys.coverageFinalKeys,
+      ...expected.finalKeys.historyFinalKeys
+    ];
+    const comparisonSummary = projectV2ComparisonSummary(validated, expectedFinalKeys);
+    const evidence = projectV2Evidence(validated, manual.effectiveOutputs);
+    const provenance = projectV2Provenance(validated);
+    assertQualityReportProvenance(provenance, {
+      expectedFinalKeys,
+      candidateRelease,
+      sourceHead: validated.run.header.sourceHead,
+      allowDistinctPhaseInputs: true
+    });
+    const manualQueue = manual.reviews.map(row => ({ ...row }));
+    const expectedProjection = expectedFinalKeysProjection(plan);
+    const qualityGate = {
+      ...aggregateQualityGate(evidence, expectedProjection),
+      ...comparisonSummary
+    };
+    const manualReview = assessManualReviewQueue(
+      manualQueue, evidence, plan, { includePassingSample: true, frozenRequirements: manual.requirements }
+    );
+    const derivedEligible = qualityGate.eligible && manualReview.eligible
+      && comparisonSummary.comparisonUnresolvedCount === 0;
+    if (qualityReport) {
+      if (!qualityReport || typeof qualityReport !== 'object' || Array.isArray(qualityReport)
+        || qualityReport.version !== 1 || qualityReport.productionReleaseMutation !== false
+        || qualityReport.planChecksum !== plan.planChecksum || qualityReport.replayRunId !== runId
+        || qualityReport.sourceHead !== validated.run.header.sourceHead
+        || qualityReport.candidateRelease?.releaseId !== candidateRelease.releaseId
+        || qualityReport.candidateRelease?.releaseChecksum !== candidateRelease.releaseChecksum
+        || canonicalJson(qualityReport.replayProvenance) !== canonicalJson(provenance)
+        || (qualityReport.qualityReplaySha256 !== undefined
+          && qualityReport.qualityReplaySha256 !== artifactSha(replayArtifact.bytes))
+        || (qualityReport.qualityManualReviewSha256 !== undefined
+          && qualityReport.qualityManualReviewSha256 !== artifactSha(manualArtifact.bytes))
+        || (qualityReport.evidenceBoundaryChecksum !== undefined
+          && (!isSha256(qualityReport.evidenceBoundaryChecksum)
+            || qualityReport.evidenceBoundaryChecksum !== evidenceBoundaryChecksum({
+              evidenceBoundary: qualityReport.evidenceBoundary,
+              planChecksum: plan.planChecksum,
+              sourceHead: validated.run.header.sourceHead,
+              provenanceChecksum: provenance.provenanceChecksum
+            })))
+        || canonicalJson(qualityReport.qualityGate) !== canonicalJson(qualityGate)
+        || canonicalJson(qualityReport.manualReview) !== canonicalJson(manualReview)
+        || qualityReport.eligible !== derivedEligible) {
+        throw new Error('quality report raw derivation conflict');
+      }
+    }
+    return {
+      runId,
+      evidenceClass: 'quality_replay_v2',
+      evidenceEligible: manual.eligible === true,
+      v2: validated,
+      manualV2: manual,
+      provenance,
+      evidence,
+      comparisonSummary,
+      qualityGate,
+      manualReview,
+      manualReviewRequirements: manual.requirements,
+      manualReviewQueue: manualQueue,
+      derivedEligible,
+      qualityPlanSha256: null,
+      qualityReplaySha256: artifactSha(replayArtifact.bytes),
+      qualityManualReviewSha256: artifactSha(manualArtifact.bytes)
+    };
+  }
+  // The historical JSONL format is retained only for offline structural compatibility.
+  // A production report supplied with a legacy bundle is always ineligible.
+  if (qualityReport) {
+    throw new Error('quality report legacy_structural bundle is ineligible');
+  }
   const runIds = new Set([...replayArtifact.rows, ...manualArtifact.rows].map(row => row?.runId));
   if (runIds.size !== 1) throw new Error('quality bundle run identity conflict');
   const runId = [...runIds][0];
@@ -670,8 +1146,11 @@ export function validateQualityArtifactBundle({
   }
   return {
     runId,
+    evidenceClass: 'legacy_structural',
+    evidenceEligible: false,
+    ineligibleReason: 'legacy_structural quality replay is view-only',
     provenance,
-    evidence,
+    evidence: { ...evidence, evidenceClass: 'legacy_structural', evidenceEligible: false },
     manualReviewQueue: manualRows,
     qualityPlanSha256: null,
     qualityReplaySha256: artifactSha(replayArtifact.bytes),
@@ -691,7 +1170,10 @@ export function materializeQualityReport({
   candidateRelease,
   manualReviewQueue,
   replayProvenance,
-  outPath = null
+  manualRequirements = null,
+  outPath = null,
+  materializationToken = null,
+  comparisonSummary = null
 } = {}) {
   const blocked = (failedGate, error) => {
     const report = {
@@ -704,6 +1186,9 @@ export function materializeQualityReport({
     if (outPath) writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
     return report;
   };
+  if (evidence?.evidenceClass === 'legacy_structural' || evidence?.evidenceEligible === false) {
+    return blocked('LEGACY_STRUCTURAL_EVIDENCE_INELIGIBLE', 'legacy_structural quality replay is view-only');
+  }
   if (!replayProvenance) return blocked('REPLAY_PROVENANCE_REQUIRED', 'replay execution/model provenance required');
   if (typeof planArtifactPath !== 'string' || !planArtifactPath) {
     return blocked('QUALITY_PLAN_ARTIFACT_REQUIRED', 'disk-verified quality plan artifact required');
@@ -726,13 +1211,17 @@ export function materializeQualityReport({
       historyManifest: diskHistoryManifest
     });
     release = verifyCandidateRelease(candidateRelease);
-    assertReplayProvenance(replayProvenance, verifiedPlan, release);
+    assertReplayProvenance(replayProvenance, verifiedPlan, release, {
+      allowDistinctPhaseInputs: replayProvenance.executionPairs?.some(pair =>
+        pair.stableInputChecksum !== pair.executionChecksum || pair.candidateInputChecksum !== pair.executionChecksum)
+    });
     const expected = expectedFinalKeysProjection(verifiedPlan);
     assertEvidenceExecutionJoins(evidence, replayProvenance, [
       ...expected.finalKeys.sentinelFinalKeys,
       ...expected.finalKeys.coverageFinalKeys,
       ...expected.finalKeys.historyFinalKeys
-    ]);
+    ], { allowDistinctPhaseInputs: replayProvenance.executionPairs?.some(pair =>
+      pair.stableInputChecksum !== pair.executionChecksum || pair.candidateInputChecksum !== pair.executionChecksum) });
   } catch (error) {
     return blocked('QUALITY_REPORT_AUTHORITY_INVALID', error);
   }
@@ -742,7 +1231,7 @@ export function materializeQualityReport({
     manualReviewQueue,
     evidence,
     verifiedPlan,
-    { includePassingSample: true }
+    { includePassingSample: true, frozenRequirements: manualRequirements }
   );
   const failedGates = [...qualityGate.failedGates, ...manualReview.failedGates];
   const eligible = qualityGate.eligible && manualReview.eligible;
@@ -760,10 +1249,15 @@ export function materializeQualityReport({
       sourceHead: replayProvenance.sourceHead,
       provenanceChecksum: replayProvenance.provenanceChecksum
     }),
-    qualityGate,
+    qualityGate: comparisonSummary ? { ...qualityGate, ...comparisonSummary } : qualityGate,
     manualReview,
-    eligible,
-    failedGates
+    eligible: materializationToken === ARTIFACT_MATERIALIZATION_TOKEN
+      ? eligible && (!comparisonSummary || comparisonSummary.comparisonUnresolvedCount === 0)
+      : false,
+    failedGates: materializationToken === ARTIFACT_MATERIALIZATION_TOKEN
+      ? [...failedGates, ...(
+        comparisonSummary?.comparisonUnresolvedCount > 0 ? ['COMPARISON_UNRESOLVED'] : [])]
+      : [...failedGates, 'QUALITY_REPORT_RAW_BUNDLE_REQUIRED']
   };
   if (outPath) writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
   return report;
@@ -810,9 +1304,16 @@ export function materializeQualityReportFromArtifacts({
     historyManifest: diskHistoryManifest,
     candidateRelease,
     manualReviewQueue: bundle.manualReviewQueue,
+    manualRequirements: bundle.manualReviewRequirements || null,
     replayProvenance: bundle.provenance,
+    comparisonSummary: bundle.comparisonSummary,
+    materializationToken: ARTIFACT_MATERIALIZATION_TOKEN,
     outPath: null
   });
+  if (Object.prototype.hasOwnProperty.call(report, 'blockingReason')) {
+    if (outPath) writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+    return report;
+  }
   const result = {
     ...report,
     replayRunId: bundle.runId,
