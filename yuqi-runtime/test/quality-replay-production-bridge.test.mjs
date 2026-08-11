@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { CognitivePipeline } from '../src/cognitive-pipeline.mjs';
+import { COGNITION_SCHEMA_V3, EXPRESSION_SCHEMA_V3, ROLE_OUTPUT_SCHEMAS } from '../src/role-schemas.mjs';
 import { compileQualitySubject } from '../src/quality-evaluator.mjs';
 import { compileQualitySuite } from '../../scripts/compile-yuqi-lived-quality-scenes.mjs';
 import { buildVerifiedQualityReplayPlan } from '../src/quality-replay.mjs';
@@ -28,10 +30,16 @@ import {
   createQualityProductionExecutionConfig,
   createQualityRunAuthority,
   createQualityProductionContext,
+  createQualityProductionExecutionAuthority,
   executeQualitySubject,
   executeQualitySubjectSide,
   prepareQualitySubject,
   registerQualityPhaseBinding,
+  requestProfileFromRelease,
+  releaseExecutionProfileFromRelease,
+  createReleaseProfileClient,
+  readQualityProductionStoreManifest,
+  awaitQualityPublishedStoreSidecarsGone,
 } from '../src/quality-replay-production-bridge.mjs';
 
 const SOURCE_HEAD = 'a'.repeat(40);
@@ -328,6 +336,7 @@ async function withRealFixture(
   const seedStore = new YuqiStore(seedPath);
   const seed = makeRuntime(seedStore, fixtureClock, { shadowTurn: kind === 'turn' });
   let qualityLedgers = null;
+  let context = null;
   try {
     if (kind === 'turn') {
       seedStore.claimInteractionLaneInternal({
@@ -347,7 +356,7 @@ async function withRealFixture(
     const candidatePhaseClientSlot = createQualityPhaseClientSlot({
       runId: '123e4567-e89b-42d3-a456-426614174001', finalKey, phase: 'candidate_execution', side: 'candidate'
     }, qualityLedgers ? { ledger: qualityLedgers.candidate } : null);
-    const context = createQualityProductionContext({
+    context = createQualityProductionContext({
       runId: '123e4567-e89b-42d3-a456-426614174001', finalKey, ordinal,
       sourceHead: SOURCE_HEAD, anchorAt, planChecksum: FROZEN_PLAN_CHECKSUM,
       seedStore, seedRuntime: seed.runtime,
@@ -367,14 +376,26 @@ async function withRealFixture(
         return built.runtime;
       },
     });
-    await run({ context, seed, stableRelease, candidateRelease, root, runtimeCodexes, qualityLedgers });
+    await run({ context, seed, subject, stableRelease, candidateRelease, root, runtimeCodexes, qualityLedgers });
   } finally {
     // Context.close is idempotent and owns the cloned stores after preparation.
     // If preparation failed before ownership transfer, close the seed here.
-    try { seedStore.close(); } catch {}
-    try { qualityLedgers?.stable.close(); } catch {}
-    try { qualityLedgers?.candidate.close(); } catch {}
-    try { rmSync(root, { recursive: true, force: true }); } catch {}
+    const cleanupErrors = [];
+    try {
+      if (context?.closeAsync) await context.closeAsync();
+      else context?.close?.();
+    } catch (error) { cleanupErrors.push(`context: ${error?.message || String(error)}`); }
+    try { seedStore.close(); } catch (error) { cleanupErrors.push(`seed: ${error?.message || String(error)}`); }
+    try { qualityLedgers?.stable.close(); } catch (error) { cleanupErrors.push(`stable ledger: ${error?.message || String(error)}`); }
+    try { qualityLedgers?.candidate.close(); } catch (error) { cleanupErrors.push(`candidate ledger: ${error?.message || String(error)}`); }
+    try {
+      for (let attempt = 0; attempt < 20 && existsSync(root); attempt += 1) {
+        rmSync(root, { recursive: true, force: true });
+        if (existsSync(root)) await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      if (existsSync(root)) throw new Error('fixture root remained after deterministic cleanup retries');
+    } catch (error) { cleanupErrors.push(`fixture root: ${error?.message || String(error)}`); }
+    if (cleanupErrors.length) throw new Error(`quality fixture cleanup failed: ${cleanupErrors.join('; ')}`);
   }
 }
 
@@ -423,6 +444,244 @@ test('runtime factory injection is explicitly non-evidence eligible', () => {
   context.close();
 });
 
+test('release request profiles parse model/effort and never treat cognitionDeep as an effort', () => {
+  const release = {
+    modelProfile: {
+      cognitionFast: 'gpt-5.6-sol/medium', cognitionDeep: 'gpt-5.6-sol/high',
+      expression: 'gpt-5.6-terra/medium', supervisor: 'gpt-5.6-terra/high',
+    }, cognitionSchemaVersion: 3,
+  };
+  const profile = requestProfileFromRelease(release, 'stable_execution');
+  assert.deepEqual(profile, {
+    model: 'gpt-5.6-sol', effort: 'medium', outputSchema: 'cognition-v3',
+    checksum: contentHash({ model: 'gpt-5.6-sol', effort: 'medium', outputSchema: 'cognition-v3' }),
+  });
+  assert.throws(() => requestProfileFromRelease({
+    ...release, modelProfile: { model: 'x', cognitionDeep: 'high' }
+  }, 'stable_execution'), /closed shape|profile/);
+});
+
+test('release execution profile binds all four production roles and the underlying wire request', async () => {
+  const release = {
+    releaseId: 'release-four-role', releaseChecksum: 'f'.repeat(64),
+    cognitionSchemaVersion: 3, expressionSchemaVersion: 3,
+    modelProfile: {
+      cognitionFast: 'gpt-fast/medium', cognitionDeep: 'gpt-deep/high',
+      expression: 'gpt-expression/medium', supervisor: 'gpt-supervisor/low',
+    },
+  };
+  const profile = releaseExecutionProfileFromRelease(release);
+  assert.deepEqual(Object.keys(profile.profiles).sort(), [
+    'cognitionDeep', 'cognitionFast', 'expression', 'supervisor'
+  ]);
+  const calls = [];
+  const client = createReleaseProfileClient({
+    underlying: {
+      runTurn: async (role, input, options) => {
+        calls.push({ role, input, options });
+        return { text: '{}' };
+      }
+    }, release,
+  });
+  await client.runTurn('memory', '{}', {
+    task: 'understand_and_decide', model: 'gpt-fast', effort: 'medium', outputSchema: COGNITION_SCHEMA_V3
+  });
+  await client.runTurn('memory', '{}', {
+    task: 'deep_understand_and_decide', model: 'gpt-deep', effort: 'high', outputSchema: COGNITION_SCHEMA_V3
+  });
+  await client.runTurn('brain', '{}', {
+    model: 'gpt-expression', effort: 'medium', outputSchema: EXPRESSION_SCHEMA_V3
+  });
+  await client.runTurn('supervisor', '{}', {
+    model: 'gpt-supervisor', effort: 'low', outputSchema: ROLE_OUTPUT_SCHEMAS.supervisor
+  });
+  assert.deepEqual(calls.map(call => [call.role, call.options.model, call.options.effort]), [
+    ['memory', 'gpt-fast', 'medium'], ['memory', 'gpt-deep', 'high'],
+    ['brain', 'gpt-expression', 'medium'], ['supervisor', 'gpt-supervisor', 'low'],
+  ]);
+  assert.match(profile.checksum, /^[a-f0-9]{64}$/);
+});
+
+test('external callers cannot mark a quality context evidence eligible', () => {
+  assert.throws(() => createQualityProductionContext({
+    runId: 'run-external', finalKey: 'final-external', ordinal: 0,
+    sourceHead: SOURCE_HEAD, evidenceEligible: true,
+  }), /always ineligible|evidence/i);
+});
+
+test('external contexts default to fixture-ineligible even when the flag is omitted', () => {
+  const context = createQualityProductionContext({
+    runId: 'run-external-default', finalKey: 'final-external-default', ordinal: 0,
+    sourceHead: SOURCE_HEAD,
+  });
+  assert.equal(context.config.evidenceEligible, false);
+  context.close();
+});
+
+test('five production stores are real published authorities and survive ordinary close', async () => {
+  const subject = compiledSubject('DIRECT_REPLY', 0);
+  await withRealFixture('turn', 0, async ({ context }) => {
+    await prepareQualitySubject(context, subject);
+    const expected = context.expectedStoreManifests;
+    assert.equal(Object.keys(expected).length, 5);
+    const lanes = new Set();
+    await context.closeAsync();
+    for (const [path, manifest] of Object.entries(expected)) {
+      const actual = readQualityProductionStoreManifest(path);
+      assert.deepEqual(actual, manifest);
+      lanes.add(actual.lane);
+    }
+    assert.deepEqual([...lanes].sort(), [
+      'candidate_execution', 'evaluator_primary', 'evaluator_secondary', 'seedWorking', 'stable_execution',
+    ]);
+    assert.equal(new Set(Object.keys(expected)).size, 5);
+  }, subject.finalKey);
+});
+
+test('store manifest tampering and schema expansion fail closed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-manifest-tamper-'));
+  const path = join(root, 'store.sqlite');
+  const manifest = {
+    version: 1, runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: 'final-0',
+    lane: 'stable_execution', sourceHead: SOURCE_HEAD, planChecksum: FROZEN_PLAN_CHECKSUM,
+    materialsChecksum: '1'.repeat(64), seedDatabaseSha256: '2'.repeat(64), createdAt: 1_000,
+  };
+  try {
+    const db = new DatabaseSync(path);
+    db.exec("CREATE TABLE quality_production_store_manifest (manifest_id TEXT PRIMARY KEY, manifest_json TEXT NOT NULL, manifest_checksum TEXT NOT NULL)");
+    db.prepare('INSERT INTO quality_production_store_manifest VALUES (?,?,?)')
+      .run('quality-store-manifest-v1', JSON.stringify(manifest), '0'.repeat(64));
+    db.close();
+    assert.throws(() => readQualityProductionStoreManifest(path), /checksum/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('published store manifest rejects a meaningful WAL or journal sidecar', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-manifest-sidecar-'));
+  const path = join(root, 'store.sqlite');
+  const manifest = {
+    version: 1, runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: 'final-0',
+    lane: 'stable_execution', sourceHead: SOURCE_HEAD, planChecksum: FROZEN_PLAN_CHECKSUM,
+    materialsChecksum: '1'.repeat(64), seedDatabaseSha256: '2'.repeat(64), createdAt: 1_000,
+  };
+  try {
+    const db = new DatabaseSync(path);
+    db.exec("CREATE TABLE quality_production_store_manifest (manifest_id TEXT PRIMARY KEY, manifest_json TEXT NOT NULL, manifest_checksum TEXT NOT NULL)");
+    db.prepare('INSERT INTO quality_production_store_manifest VALUES (?,?,?)')
+      .run('quality-store-manifest-v1', JSON.stringify(manifest), contentHash(manifest));
+    db.close();
+    writeFileSync(`${path}-wal`, 'stale');
+    assert.throws(() => readQualityProductionStoreManifest(path), /sidecar|WAL|journal/i);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('published store manifest rejects a meaningful SHM sidecar', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-manifest-shm-'));
+  const path = join(root, 'store.sqlite');
+  const manifest = {
+    version: 1, runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: 'final-0',
+    lane: 'stable_execution', sourceHead: SOURCE_HEAD, planChecksum: FROZEN_PLAN_CHECKSUM,
+    materialsChecksum: '1'.repeat(64), seedDatabaseSha256: '2'.repeat(64), createdAt: 1_000,
+  };
+  try {
+    const db = new DatabaseSync(path);
+    db.exec("CREATE TABLE quality_production_store_manifest (manifest_id TEXT PRIMARY KEY, manifest_json TEXT NOT NULL, manifest_checksum TEXT NOT NULL)");
+    db.prepare('INSERT INTO quality_production_store_manifest VALUES (?,?,?)')
+      .run('quality-store-manifest-v1', JSON.stringify(manifest), contentHash(manifest));
+    db.close();
+    writeFileSync(`${path}-shm`, 'stale');
+    assert.throws(() => readQualityProductionStoreManifest(path), /sidecar|SHM|journal/i);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('temporary cleanup failures are observable instead of being swallowed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-cleanup-failure-'));
+  const context = createQualityProductionContext({
+    runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: 'cleanup-failure', ordinal: 0,
+    sourceHead: SOURCE_HEAD, evidenceEligible: false,
+    unpublishedTempPaths: ['\u0000invalid-cleanup-path'],
+  });
+  assert.throws(() => context.close(), /cleanup/i);
+  rmSync(root, { recursive: true, force: true });
+});
+
+test('running clients require awaited closeAsync and stop failures remain observable', async () => {
+  const context = createQualityProductionContext({
+    runId: '123e4567-e89b-42d3-a456-426614174002', finalKey: 'close-async-stop', ordinal: 0,
+    sourceHead: SOURCE_HEAD, evidenceEligible: false,
+  });
+  context.ownedClients.add({ stop: async () => { throw new Error('wire stop failure'); } });
+  assert.throws(() => context.close(), /closeAsync required/);
+  await assert.rejects(() => context.closeAsync(), /wire stop failure/);
+  assert.ok(context.cleanupErrors.some(error => error.includes('wire stop failure')));
+  assert.equal(context.phase, 'closed');
+});
+
+test('two owner contexts can close in order and parent barrier waits after join', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-close-sidecar-barrier-'));
+  const storePath = join(root, 'stable.sqlite');
+  const sidecar = `${storePath}-shm`;
+  writeFileSync(storePath, Buffer.from('closed-store-marker'));
+  writeFileSync(sidecar, Buffer.from('still-open'));
+  const contextA = createQualityProductionContext({
+    runId: '123e4567-e89b-42d3-a456-426614174003', finalKey: 'close-sidecar-barrier-a', ordinal: 0,
+    sourceHead: SOURCE_HEAD, evidenceEligible: false,
+    publishedStorePaths: [storePath],
+  });
+  const contextB = createQualityProductionContext({
+    runId: '123e4567-e89b-42d3-a456-426614174003', finalKey: 'close-sidecar-barrier-b', ordinal: 1,
+    sourceHead: SOURCE_HEAD, evidenceEligible: false,
+    publishedStorePaths: [storePath],
+  });
+  let ownerAClosed = false;
+  let ownerBClosed = false;
+  contextA.ownedStores.add({ close() { ownerAClosed = true; } });
+  contextB.ownedStores.add({ close() { ownerBClosed = true; rmSync(sidecar, { force: true }); } });
+  const closePromise = contextA.closeAsync();
+  const outcome = await Promise.race([
+    closePromise.then(() => 'closed'),
+    new Promise(resolve => setImmediate(() => resolve('next-turn'))),
+  ]);
+  const sidecarHeldByOtherOwner = existsSync(sidecar);
+  try {
+    await closePromise;
+    assert.equal(ownerAClosed, true);
+    assert.equal(ownerBClosed, false);
+    assert.equal(contextB.phase, 'seed');
+    await contextB.closeAsync();
+    assert.equal(ownerBClosed, true);
+    await awaitQualityPublishedStoreSidecarsGone([storePath], { timeoutMs: 100 });
+    assert.equal(outcome, 'closed');
+    assert.equal(sidecarHeldByOtherOwner, true);
+    assert.equal(existsSync(sidecar), false);
+  } finally {
+    if (contextA.phase !== 'closed') {
+      rmSync(sidecar, { force: true });
+      await closePromise.catch(() => {});
+    }
+    if (contextB.phase !== 'closed') {
+      rmSync(sidecar, { force: true });
+      await contextB.closeAsync().catch(() => {});
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('parent sidecar barrier remains fail-closed for a persistent owner', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-parent-sidecar-barrier-'));
+  const storePath = join(root, 'stable.sqlite');
+  try {
+    writeFileSync(storePath, Buffer.from('closed-store-marker'));
+    writeFileSync(`${storePath}-wal`, Buffer.from('still-open'));
+    await assert.rejects(
+      () => awaitQualityPublishedStoreSidecarsGone([storePath], { timeoutMs: 25 }),
+      /sidecar barrier timed out/
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('an unbound-ledger slot cannot enter a production quality context', () => {
   const slot = createQualityPhaseClientSlot({
     runId: 'run-slot-identity', finalKey: 'turn-slot-identity',
@@ -467,6 +726,35 @@ test('real v15 turn uses accept, shared builder and both production release exec
   }, subject.finalKey);
 });
 
+test('seedWorking is an independently published winner retained across ordinary close', async () => {
+  const subject = compiledSubject('DIRECT_REPLY', 5);
+  await withRealFixture('turn', 5, async ({ context, root }) => {
+    await prepareQualitySubject(context, subject);
+    const seedWorkingPath = context.prepared.seedWorkingPath;
+    assert.ok(seedWorkingPath && readQualityProductionStoreManifest(seedWorkingPath).lane === 'seedWorking');
+    context.close();
+    assert.equal(readQualityProductionStoreManifest(seedWorkingPath).finalKey, subject.finalKey);
+    assert.equal(readQualityProductionStoreManifest(join(root, 'stable.sqlite')).lane, 'stable_execution');
+  }, subject.finalKey);
+});
+
+test('published manifest drift is rejected before any model call', async () => {
+  const subject = compiledSubject('DIRECT_REPLY', 10);
+  await withRealFixture('turn', 10, async ({ context, runtimeCodexes }) => {
+    await prepareQualitySubject(context, subject);
+    const path = context.prepared.seedWorkingPath;
+    const db = new DatabaseSync(path);
+    const row = db.prepare('SELECT manifest_json FROM quality_production_store_manifest').get();
+    const value = JSON.parse(row.manifest_json);
+    value.finalKey = `${value.finalKey}-tampered`;
+    db.prepare('UPDATE quality_production_store_manifest SET manifest_json=?, manifest_checksum=?')
+      .run(JSON.stringify(value), contentHash(value));
+    db.close();
+    await assert.rejects(() => executeQualitySubject(context, { method: 'executeTurn' }), /authority drift|manifest|quality/i);
+    assert.equal(runtimeCodexes.reduce((sum, codex) => sum + codex.modelRequests.length, 0), 0);
+  }, subject.finalKey);
+});
+
 test('quality side execution requires a persisted running phase and routes model calls through its slot', async () => {
   const subject = compiledSubject('DIRECT_REPLY', 6);
   await withRealFixture('turn', 6, async ({ context, runtimeCodexes, stableRelease, candidateRelease, qualityLedgers }) => {
@@ -485,7 +773,9 @@ test('quality side execution requires a persisted running phase and routes model
       stableRelease: ledgerRelease(stableRelease),
       candidateRelease: ledgerRelease(candidateRelease),
       ...ledgerAttestation(SOURCE_HEAD),
-      artifactPaths: { plan: 'plan', ledger: 'ledger', raw: 'raw' }, createdAt: 1_000,
+      artifactPaths: { plan: 'plan', ledger: 'ledger', raw: 'raw' },
+      inputArtifactChecksums: { plan: '1'.repeat(64), materials: '2'.repeat(64), seedDatabase: '3'.repeat(64) },
+      createdAt: 1_000,
       });
       const phaseInput = {
       runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey, phase,
@@ -592,7 +882,9 @@ test('quality side execution rejects authority drift after a slot-routed model c
       stableRelease: ledgerRelease(stableRelease),
       candidateRelease: ledgerRelease(candidateRelease),
       ...ledgerAttestation(SOURCE_HEAD),
-      artifactPaths: { plan: 'plan', ledger: 'ledger', raw: 'raw' }, createdAt: 1_000,
+      artifactPaths: { plan: 'plan', ledger: 'ledger', raw: 'raw' },
+      inputArtifactChecksums: { plan: '1'.repeat(64), materials: '2'.repeat(64), seedDatabase: '3'.repeat(64) },
+      createdAt: 1_000,
     });
     const phaseInput = {
       runId: '123e4567-e89b-42d3-a456-426614174001', finalKey: subject.finalKey, phase: 'stable_execution',

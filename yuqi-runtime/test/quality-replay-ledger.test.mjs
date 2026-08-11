@@ -81,6 +81,7 @@ function runHeader(overrides = {}) {
     sourceHead, stableRelease, candidateRelease, attestation,
     attestationChecksum: contentHash(attestation),
     artifactPaths: { plan: 'plan.json', ledger: 'quality.sqlite', raw: 'raw.jsonl' },
+    inputArtifactChecksums: { plan: 'd'.repeat(64), materials: 'e'.repeat(64), seedDatabase: 'f'.repeat(64) },
     createdAt: 1000,
     ...overrides
   };

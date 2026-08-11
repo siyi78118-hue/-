@@ -7,7 +7,9 @@ import { ROLE_OUTPUT_SCHEMAS } from './role-schemas.mjs';
 import { sessionRoleForPipelineRole } from './codex-client.mjs';
 import {
   assertQualityRunAuthority,
-  qualityRunAuthorityProductionConfig
+  qualityRunAuthorityProductionConfig,
+  assertQualityProductionInputAuthority,
+  assertPrivateNoFollowPath,
 } from './quality-replay-production-bridge.mjs';
 
 const PHASES = Object.freeze([
@@ -18,7 +20,8 @@ const MODEL_SESSION_ROLES = new Set(['memory', 'brain', 'supervisor']);
 const SHA256 = /^[a-f0-9]{64}$/;
 const RUN_HEADER_KEYS = Object.freeze([
   'version', 'runId', 'finalKeys', 'planChecksum', 'sourceHead',
-  'stableRelease', 'candidateRelease', 'attestation', 'attestationChecksum', 'artifactPaths', 'createdAt'
+  'stableRelease', 'candidateRelease', 'attestation', 'attestationChecksum', 'artifactPaths',
+  'inputArtifactChecksums', 'createdAt'
 ]);
 const RELEASE_KEYS = Object.freeze([
   'releaseId', 'pipelineVersion', 'presetVersion', 'cognitionSchemaVersion',
@@ -302,6 +305,11 @@ function validateRunHeader(header) {
       || value.includes('\\') || value.startsWith('/') || /^[A-Za-z]:/.test(value)
       || value.split('/').some(part => !part || part === '.' || part === '..'))) {
     throw new Error('quality run artifact path conflict');
+  }
+  exactKeys(header.inputArtifactChecksums, ['plan', 'materials', 'seedDatabase'],
+    'quality run input artifact checksums conflict');
+  for (const key of ['plan', 'materials', 'seedDatabase']) {
+    checksum(header.inputArtifactChecksums[key], `quality run input ${key} checksum conflict`);
   }
   nativeInteger(header.createdAt, 'quality run createdAt conflict');
   return JSON.parse(canonicalJson(header));
@@ -659,7 +667,7 @@ function assertLedgerInvariants(db) {
       || !Number.isSafeInteger(Number(row.updated_at))
       || Number(row.updated_at) < Number(row.created_at)
       || (row.state === 'prepared' && (startingAt !== null || runningAt !== null
-        || Number(row.updated_at) !== Number(row.created_at)))
+        || Number(row.updated_at) < Number(row.created_at)))
       || (row.state === 'starting' && (!Number.isSafeInteger(startingAt)
         || startingAt < Number(row.created_at) || runningAt !== null
         || Number(row.updated_at) !== startingAt))
@@ -1405,41 +1413,13 @@ function resolveProductionLedgerPath(sourceRootDir, configuredPath, actualFilena
     throw new Error('production ledger path authority conflict');
   }
   const root = realpathSync(sourceRootDir);
-  const privateRoot = resolve(root, 'artifacts/yuqi-lived-agency-v3/private');
-  if (!existsSync(privateRoot) || lstatSync(privateRoot).isSymbolicLink()) {
-    throw new Error('production ledger path authority conflict');
-  }
-  const expected = resolve(root, configuredPath);
-  const privateRelative = relative(privateRoot, expected);
-  if (!privateRelative || privateRelative.startsWith('..') || privateRelative.includes(':')) {
-    throw new Error('production ledger path authority conflict');
-  }
-  const privateReal = realpathSync(privateRoot);
-  const checkPath = target => {
-    const targetRelative = relative(privateRoot, target);
-    if (!targetRelative || targetRelative.startsWith('..') || targetRelative.includes(':')) {
-      throw new Error('production ledger path authority conflict');
-    }
-    let cursor = privateRoot;
-    for (const part of targetRelative.split(/[\\/]/)) {
-      cursor = `${cursor}/${part}`;
-      if (!existsSync(cursor)) break;
-      const stat = lstatSync(cursor);
-      if (stat.isSymbolicLink()) throw new Error('production ledger path authority conflict');
-      const real = realpathSync(cursor);
-      const realRelative = relative(privateReal, real);
-      if (realRelative.startsWith('..') || realRelative.includes(':')) {
-        throw new Error('production ledger path authority conflict');
-      }
-    }
-  };
-  checkPath(expected);
+  const expected = assertPrivateNoFollowPath(root, configuredPath, 'production ledger path');
   const actual = isAbsolute(String(actualFilename))
     ? resolve(String(actualFilename)) : resolve(root, String(actualFilename));
-  if (resolve(actual) !== resolve(expected)) {
+  const actualVerified = assertPrivateNoFollowPath(root, actual, 'production ledger path');
+  if (resolve(actualVerified) !== resolve(expected)) {
     throw new Error('production ledger path authority conflict');
   }
-  checkPath(actual);
   return expected;
 }
 
@@ -1449,6 +1429,7 @@ export function openProductionQualityReplayLedger({
 } = {}) {
   assertQualityRunAuthority(runAuthority);
   const config = qualityRunAuthorityProductionConfig(runAuthority);
+  assertQualityProductionInputAuthority(runAuthority);
   resolveProductionLedgerPath(sourceRootDir, config.ledgerPath, filename);
   return new QualityReplayLedger(filename, {
     readOnly: readOnly === true,
@@ -1591,6 +1572,18 @@ export function isQualityPhaseClientSlot(value) {
 export function qualityPhaseClientSlotHasLedger(slot) {
   return QUALITY_PHASE_SLOT_BRAND.has(slot)
     && QUALITY_PHASE_SLOT_STATE.get(slot)?.ledger instanceof QualityReplayLedger;
+}
+
+export function qualityPhaseClientSlotIsBound(slot) {
+  return QUALITY_PHASE_SLOT_BRAND.has(slot)
+    && Boolean(QUALITY_PHASE_SLOT_STATE.get(slot)?.bound);
+}
+
+export function qualityPhaseClientSlotLedger(slot) {
+  if (!QUALITY_PHASE_SLOT_BRAND.has(slot)) throw new Error('quality phase slot is not authentic');
+  const ledger = QUALITY_PHASE_SLOT_STATE.get(slot)?.ledger;
+  if (!(ledger instanceof QualityReplayLedger)) throw new Error('quality phase slot ledger identity is required');
+  return ledger;
 }
 
 export function assertQualityPhaseClientSlotBinding(slot, binding) {
@@ -1742,12 +1735,15 @@ export class LedgerBackedModelClient {
   async executeCall(scope, ordinal, role, input, options) {
     const wireInput = typeof input === 'string' ? input : JSON.stringify(input);
     if (!wireInput.trim()) throw new Error('quality model call input is empty');
+    const effectiveOptions = typeof this.underlying.resolveRequestOptions === 'function'
+      ? this.underlying.resolveRequestOptions(role, wireInput, options)
+      : options;
     const requestBasis = {
       input: wireInput,
-      model: options.model || 'gpt-5.6-sol',
-      effort: options.effort || 'high',
-      outputSchema: options.outputSchema || ROLE_OUTPUT_SCHEMAS[role],
-      localImagePaths: Array.isArray(options.localImagePaths) ? [...options.localImagePaths] : []
+      model: effectiveOptions.model || 'gpt-5.6-sol',
+      effort: effectiveOptions.effort || 'high',
+      outputSchema: effectiveOptions.outputSchema || ROLE_OUTPUT_SCHEMAS[role],
+      localImagePaths: Array.isArray(effectiveOptions.localImagePaths) ? [...effectiveOptions.localImagePaths] : []
     };
     const clientUserMessageId = deterministicClientId(scope, ordinal, requestBasis);
     const request = { ...requestBasis, clientUserMessageId };
@@ -1779,7 +1775,7 @@ export class LedgerBackedModelClient {
     }
     try {
       const result = await this.underlying.runTurn(role, wireInput, {
-        ...options,
+        ...effectiveOptions,
         model: request.model,
         effort: request.effort,
         outputSchema: request.outputSchema,
@@ -1789,7 +1785,7 @@ export class LedgerBackedModelClient {
           this.ledger.markModelCallRunning(identity, {
             turnId: started.turnId, now: this.now()
           });
-          await options.onTurnStarted?.(started);
+          await effectiveOptions.onTurnStarted?.(started);
         }
       });
       this.ledger.succeedModelCall(identity, { output: result, now: this.now() });

@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   QUALITY_DIMENSIONS,
+  QUALITY_BLIND_EVALUATION_SCHEMA,
   aggregateQualityGate,
   buildBlindEvaluation,
   compileSceneExecutionInput,
@@ -182,6 +183,19 @@ test('formal blind preference is release-agnostic and rejects candidate/stable l
       /preference/i
     );
   }
+});
+
+test('blind evaluator exposes one closed request schema matching its normalizer', () => {
+  assert.equal(QUALITY_BLIND_EVALUATION_SCHEMA.additionalProperties, false);
+  assert.deepEqual(QUALITY_BLIND_EVALUATION_SCHEMA.required,
+    ['version', 'scores', 'preference', 'findings', 'unresolved']);
+  assert.deepEqual(QUALITY_BLIND_EVALUATION_SCHEMA.properties.preference.enum,
+    ['A', 'B', 'tie', 'unresolved']);
+  assert.deepEqual(QUALITY_BLIND_EVALUATION_SCHEMA.properties.scores.required,
+    [...QUALITY_DIMENSIONS]);
+  assert.equal(QUALITY_BLIND_EVALUATION_SCHEMA.properties.findings.items.additionalProperties, false);
+  assert.deepEqual(QUALITY_BLIND_EVALUATION_SCHEMA.properties.findings.items.required,
+    ['code', 'severity', 'owner', 'summary', 'critical']);
 });
 
 test('finalizeBlindJudgments retains both complete judgments and flags every semantic difference', () => {

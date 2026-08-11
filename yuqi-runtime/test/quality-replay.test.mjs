@@ -32,7 +32,8 @@ import {
   runQualityReplayFixture as runQualityReplayPlanImpl,
   runQualityReplayPlanSqlite,
   createQualityRunHeader,
-  parseQualityReplayCliArgs
+  parseQualityReplayCliArgs,
+  assertProductionExecuteCliArgs
 } from '../../scripts/run-yuqi-lived-quality-replay.mjs';
 import { assertCleanQualitySourceIdentity } from '../src/quality-replay-production-bridge.mjs';
 import { contentHash } from '../src/protocol.mjs';
@@ -71,10 +72,11 @@ test('clean source gate only ignores private untracked evidence', () => {
   const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-source-gate-'));
   try {
     writeFileSync(join(root, 'tracked.txt'), 'v1\n');
+    writeFileSync(join(root, '.gitignore'), 'artifacts/yuqi-lived-agency-v3/private/\n');
     execFileSync('git', ['init'], { cwd: root, stdio: 'ignore' });
     execFileSync('git', ['config', 'user.email', 'quality-fixture@example.invalid'], { cwd: root });
     execFileSync('git', ['config', 'user.name', 'quality-fixture'], { cwd: root });
-    execFileSync('git', ['add', 'tracked.txt'], { cwd: root });
+    execFileSync('git', ['add', 'tracked.txt', '.gitignore'], { cwd: root });
     execFileSync('git', ['commit', '-m', 'source gate fixture'], { cwd: root, stdio: 'ignore' });
     const head = assertCleanQualitySourceIdentity({ sourceRootDir: root });
     assert.match(head, /^[0-9a-f]{40}$/);
@@ -125,6 +127,15 @@ test('quality replay CLI parser rejects unknown duplicate valueless and max-item
     execute: true, ledger: 'quality.sqlite', executionConfig: 'authority.mjs'
   });
   assert.throws(() => parseQualityReplayCliArgs(['--run-authority', 'authority.mjs']), /unknown/i);
+});
+
+test('production execute rejects legacy input flags before authority preflight', () => {
+  const base = { execute: true, plan: 'plan.json', ledger: 'ledger.sqlite', executionConfig: 'authority.mjs' };
+  for (const key of ['stableFrom', 'candidatePreset', 'history', 'historyManifest', 'planOut']) {
+    assert.throws(() => assertProductionExecuteCliArgs({ ...base, [key]: 'legacy-input' }), /forbids legacy/i);
+  }
+  assert.equal(assertProductionExecuteCliArgs({ ...base, replayOut: 'raw.jsonl' }), true);
+  assert.throws(() => assertProductionExecuteCliArgs({ execute: true, ledger: 'ledger.sqlite' }), /existing.*plan|execution-config/i);
 });
 
 test('generic callbacks cannot select a production ledger or leave a ledger behind', async () => {

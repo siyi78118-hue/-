@@ -35,7 +35,9 @@ import {
   prepareQualityProductionSubject,
   bindQualityProductionPhase,
   executeQualitySubjectSide as executeBridgedQualitySubjectSide,
-  executeQualityEvaluatorSide as executeBridgedQualityEvaluatorSide
+  executeQualityEvaluatorSide as executeBridgedQualityEvaluatorSide,
+  assertPrivateNoFollowPath,
+  awaitQualityPublishedStoreSidecarsGone,
 } from '../yuqi-runtime/src/quality-replay-production-bridge.mjs';
 import {
   QualityReplayLedger,
@@ -51,6 +53,11 @@ const PRODUCTION_RUN_TOKEN = Symbol('quality-production-run');
 export function createQualityRunHeader({
   runId = randomUUID(), finalKeys, planChecksum, sourceHead,
   stableRelease, candidateRelease, attestation, artifactPaths,
+  inputArtifactChecksums = {
+    plan: contentHash({ artifact: artifactPaths?.plan || 'quality-replay-plan.json' }),
+    materials: contentHash({ artifact: 'quality-production-materials' }),
+    seedDatabase: contentHash({ artifact: 'quality-seed-database' }),
+  },
   createdAt = Date.now()
 } = {}) {
   if (!RUN_ID_PATTERN.test(runId)) throw new Error('quality run identity required');
@@ -73,6 +80,7 @@ export function createQualityRunHeader({
     artifactPaths: structuredClone(artifactPaths || {
       plan: 'quality-replay-plan.json', ledger: 'quality-replay.sqlite', raw: 'quality-replay.jsonl'
     }),
+    inputArtifactChecksums: structuredClone(inputArtifactChecksums),
     createdAt
   };
   return header;
@@ -607,6 +615,15 @@ export async function runQualityReplayPlan(options = {}) {
     throw new Error('production quality replay selector conflict');
   }
   const sourceRootDir = options.sourceRootDir || process.cwd();
+  // A resume begins with a read-only ledger authority check.  No source
+  // material, runtime, client, or writable ledger may be opened until the
+  // persisted header has been proven to be this exact run.
+  assertProductionResumeLedgerState({
+    ledgerPath: options.ledgerPath,
+    runAuthority: options.runAuthority,
+    resumeRun: options.resumeRun,
+    sourceRootDir,
+  });
   const preflightHead = captureCleanSourceHead({ rootDir: sourceRootDir });
   if (preflightHead !== config.sourceHead) throw new Error('production source head drift');
   // The branded bridge owns composition, phase slots, and evaluator clients.
@@ -648,6 +665,7 @@ export async function runQualityReplayPlan(options = {}) {
     candidateRelease: configDescriptor.candidateRelease,
     attestation: configDescriptor.attestation,
     artifactPaths,
+    inputArtifactChecksums: configDescriptor.inputArtifactChecksums,
     createdAt: options.runAuthority.createdAt,
   });
   if (options.header && contentHash(options.header) !== contentHash(expectedHeader)) {
@@ -657,6 +675,11 @@ export async function runQualityReplayPlan(options = {}) {
   const state = {
     context: null,
     preparedByKey: new Map(),
+  };
+  const waitForPublishedStoreBarrier = async () => {
+    const paths = [...state.preparedByKey.values()]
+      .flatMap(context => context.config?.publishedStorePaths || []);
+    if (paths.length) await awaitQualityPublishedStoreSidecarsGone(paths);
   };
   let result;
   try {
@@ -689,12 +712,26 @@ export async function runQualityReplayPlan(options = {}) {
           ? context.config?.stablePhaseClientSlot : context.config?.candidatePhaseClientSlot,
       });
     },
-    evaluator: async ({ blindInput, phaseInput, ledger }) => executeBridgedQualityEvaluatorSide(config, {
-      side: 'primary', role: 'brain', input: JSON.stringify(blindInput), phaseInput, ledger
-    }),
-    evaluatorSecondary: async ({ blindInput, phaseInput, ledger }) => executeBridgedQualityEvaluatorSide(config, {
-      side: 'secondary', role: 'brain', input: JSON.stringify(blindInput), phaseInput, ledger
-    }),
+    evaluator: async ({ blindInput, phaseInput, ledger }) => {
+      const context = state.preparedByKey.get(blindInput.finalKey);
+      if (!context?.evaluatorStores?.primary) throw new Error('primary evaluator store unavailable');
+      return executeBridgedQualityEvaluatorSide(config, {
+        side: 'primary', role: 'brain', input: JSON.stringify(blindInput), phaseInput, ledger,
+        evaluatorStore: context.evaluatorStores.primary,
+        storeManifestAuthority: context.expectedStoreManifests,
+        storeManifestStores: context.openStoreManifestStores,
+      });
+    },
+    evaluatorSecondary: async ({ blindInput, phaseInput, ledger }) => {
+      const context = state.preparedByKey.get(blindInput.finalKey);
+      if (!context?.evaluatorStores?.secondary) throw new Error('secondary evaluator store unavailable');
+      return executeBridgedQualityEvaluatorSide(config, {
+        side: 'secondary', role: 'brain', input: JSON.stringify(blindInput), phaseInput, ledger,
+        evaluatorStore: context.evaluatorStores.secondary,
+        storeManifestAuthority: context.expectedStoreManifests,
+        storeManifestStores: context.openStoreManifestStores,
+      });
+    },
       evaluatorVersions: {
         primary: config.attestation.evaluatorPrimary.evaluatorVersion,
         secondary: config.attestation.evaluatorSecondary.evaluatorVersion,
@@ -706,8 +743,7 @@ export async function runQualityReplayPlan(options = {}) {
     onPhase: ({ finalKey, phase, state: phaseState }) => {
       if (phase === 'evaluator_secondary' && phaseState === 'succeeded') {
         const context = state.preparedByKey.get(finalKey);
-        if (context?.close) context.close();
-        state.preparedByKey.delete(finalKey);
+        if (context) context.evaluatorComplete = true;
       }
     },
     bindProductionPhase: async ({ item, phase, phaseInput }) => {
@@ -721,14 +757,81 @@ export async function runQualityReplayPlan(options = {}) {
       productionAuthority: options.runAuthority,
       sourceRootDir,
     });
+    if (result.run?.state === 'finalized') {
+      for (const context of state.preparedByKey.values()) {
+        context.persistProductionStores = true;
+        if (typeof context.closeAsync === 'function') await context.closeAsync();
+        else context.close?.();
+      }
+      await waitForPublishedStoreBarrier();
+      state.preparedByKey.clear();
+    } else {
+      for (const context of state.preparedByKey.values()) {
+        if (typeof context.closeAsync === 'function') await context.closeAsync();
+        else context.close?.();
+      }
+      await waitForPublishedStoreBarrier();
+      state.preparedByKey.clear();
+    }
   } catch (error) {
-    for (const context of state.preparedByKey.values()) context.close?.();
+    for (const context of state.preparedByKey.values()) {
+      try {
+        if (typeof context.closeAsync === 'function') await context.closeAsync();
+        else context.close?.();
+      }
+      catch (cleanupError) {
+        error.message = `${error.message}; quality cleanup failed: ${cleanupError?.message || String(cleanupError)}`;
+        error.cleanupError = cleanupError;
+      }
+    }
+    try { await waitForPublishedStoreBarrier(); }
+    catch (barrierError) {
+      error.message = `${error.message}; quality published-store barrier failed: ${barrierError?.message || String(barrierError)}`;
+      error.publishedStoreBarrierError = barrierError;
+    }
     state.preparedByKey.clear();
     throw error;
   }
   const postflightHead = captureCleanSourceHead({ rootDir: sourceRootDir });
   if (postflightHead !== preflightHead) throw new Error('production source identity changed during replay');
   return result;
+}
+
+function assertProductionResumeLedgerState({ ledgerPath, runAuthority, resumeRun, sourceRootDir }) {
+  const absolute = resolve(sourceRootDir, ledgerPath);
+  if (resumeRun == null) {
+    if (existsSync(absolute)) throw new Error('existing quality ledger requires --resume-run');
+    return;
+  }
+  if (!existsSync(absolute)) throw new Error('quality resume ledger unavailable');
+  const ledger = openProductionQualityReplayLedger({
+    filename: ledgerPath, runAuthority, readOnly: true, sourceRootDir,
+  });
+  try {
+    const persisted = ledger.getRun({ runId: resumeRun });
+    const meta = ledger.getMeta?.();
+    if (!persisted || persisted.runId !== runAuthority.runId
+      || persisted.createdAt !== runAuthority.createdAt
+      || persisted.planChecksum !== runAuthority.planChecksum
+      || persisted.sourceHead !== runAuthority.sourceHead
+      || contentHash(persisted.finalKeys) !== contentHash(runAuthority.finalKeys)
+      || contentHash(persisted.stableRelease) !== contentHash(runAuthority.stableRelease)
+      || contentHash(persisted.candidateRelease) !== contentHash(runAuthority.candidateRelease)
+      || contentHash(persisted.attestation) !== contentHash(runAuthority.attestation)
+      || contentHash(persisted.artifactPaths) !== contentHash(runAuthority.artifactPaths)
+      || contentHash(persisted.inputArtifactChecksums)
+        !== contentHash(runAuthority.inputArtifactChecksums)
+      || meta?.schemaVersion !== 1
+      || meta?.evidenceClass !== 'production'
+      || persisted.evidenceClass !== undefined && persisted.evidenceClass !== 'production') {
+      throw new Error('quality resume ledger header authority conflict');
+    }
+    if (['finalized', 'blocked'].includes(persisted.state)) {
+      throw new Error('quality run is not resumable');
+    }
+  } finally {
+    ledger.close();
+  }
 }
 
 function assertProductionArtifactPaths(rootDir, artifactPaths) {
@@ -756,6 +859,7 @@ function assertProductionArtifactPaths(rootDir, artifactPaths) {
 }
 
 function assertProductionArtifactPath(rootDir, artifactPath) {
+  assertPrivateNoFollowPath(rootDir, artifactPath, 'production quality artifact');
   const privateRoot = resolve(rootDir, 'artifacts/yuqi-lived-agency-v3/private');
   const rel = relative(privateRoot, resolve(rootDir, artifactPath));
   if (rel.startsWith('..') || rel.includes(':') || rel === '') {
@@ -902,8 +1006,20 @@ export function exportQualityReplayV2(options = {}) {
   if (!runAuthority) throw new Error('quality replay v2 branded run authority required');
   assertQualityRunAuthority(runAuthority);
   const productionConfig = qualityRunAuthorityProductionConfig(runAuthority);
-  if (typeof ledgerPath !== 'string' || ledgerPath !== productionConfig.ledgerPath
-    || runId !== productionConfig.runId) throw new Error('quality replay v2 ledger authority conflict');
+  const requestedLedgerPath = typeof ledgerPath === 'string' && ledgerPath
+    ? resolve(sourceRootDir, ledgerPath) : null;
+  const authorityLedgerPath = typeof productionConfig.ledgerPath === 'string'
+    ? resolve(sourceRootDir, productionConfig.ledgerPath) : null;
+  const canonicalLedgerPath = value => {
+    if (!value) return null;
+    const absolute = resolve(value);
+    return existsSync(absolute) ? realpathSync(absolute) : absolute;
+  };
+  if (!requestedLedgerPath || canonicalLedgerPath(requestedLedgerPath)
+    !== canonicalLedgerPath(authorityLedgerPath)
+    || runId !== productionConfig.runId) {
+    throw new Error('quality replay v2 ledger authority conflict');
+  }
   if (typeof artifactPath !== 'string' || !artifactPath) throw new Error('quality replay v2 artifact path required');
   assertProductionArtifactPath(sourceRootDir, artifactPath);
   const ledger = openProductionQualityReplayLedger({ filename: ledgerPath, runAuthority,
@@ -1028,12 +1144,32 @@ export function parseQualityReplayCliArgs(argv = process.argv.slice(2)) {
   return result;
 }
 
+/**
+ * Production execution may keep the historical offline flags in the global
+ * parser, but none of those inputs may be read alongside the branded
+ * authority path.  Call this immediately after parsing, before loading a
+ * plan/history or touching any ledger/artifact path.
+ */
+export function assertProductionExecuteCliArgs(cli) {
+  if (!cli || cli.execute !== true) return true;
+  for (const key of ['stableFrom', 'candidatePreset', 'history', 'historyManifest', 'planOut']) {
+    if (cli[key] !== undefined) throw new Error(`production --execute forbids legacy option: ${key}`);
+  }
+  if (typeof cli.plan !== 'string' || !cli.plan
+    || typeof cli.executionConfig !== 'string' || !cli.executionConfig
+    || typeof cli.ledger !== 'string' || !cli.ledger) {
+    throw new Error('production --execute requires existing --plan, --execution-config and --ledger');
+  }
+  return true;
+}
+
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 
 if (isMain) {
   (async () => {
     try {
       const cli = parseQualityReplayCliArgs();
+      assertProductionExecuteCliArgs(cli);
       const rootDir = cli.root || process.cwd();
       const stableFrom = cli.stableFrom;
       const candidatePreset = cli.candidatePreset;
@@ -1071,6 +1207,7 @@ if (isMain) {
         }, null, 2)}\n`);
         return;
       }
+      if (!cli.plan) throw new Error('--execute requires an existing --plan artifact');
       if (!cli.executionConfig) throw new Error('--execution-config is required for execution');
       const authorityModule = await import(pathToFileURL(resolve(rootDir, cli.executionConfig)).href);
       const authorityFactory = authorityModule.createQualityReplayRunAuthority;
@@ -1079,8 +1216,12 @@ if (isMain) {
       }
       const runAuthority = await authorityFactory({ rootDir, plan,
         ledgerPath: resolve(rootDir, cli.ledger),
+        artifactPaths: {
+          plan: cli.plan,
+          ledger: cli.ledger,
+          raw: cli.replayOut || 'artifacts/yuqi-lived-agency-v3/private/quality-replay.jsonl',
+        },
         resumeRun: cli.resumeRun || null,
-        onlyFinalKey: cli.onlyFinalKey || null,
       });
       const result = await runQualityReplayPlan({
         plan,

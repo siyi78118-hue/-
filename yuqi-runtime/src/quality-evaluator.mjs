@@ -323,6 +323,43 @@ export function normalizeBlindEvaluation(value) {
   };
 }
 
+// The evaluator request schema is exported from the same closed contract used
+// by normalizeBlindEvaluation.  Production bridges must pass this exact
+// schema to Codex; callers may not invent a second evaluator shape.
+export const QUALITY_BLIND_EVALUATION_SCHEMA = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  required: ['version', 'scores', 'preference', 'findings', 'unresolved'],
+  properties: Object.freeze({
+    version: { type: 'integer', const: 1 },
+    scores: {
+      type: 'object',
+      additionalProperties: false,
+      required: Object.freeze([...QUALITY_DIMENSIONS]),
+      properties: Object.freeze(Object.fromEntries(
+        QUALITY_DIMENSIONS.map(dimension => [dimension, { type: 'integer', minimum: 1, maximum: 5 }])
+      )),
+    },
+    preference: { type: 'string', enum: Object.freeze(['A', 'B', 'tie', 'unresolved']) },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['code', 'severity', 'owner', 'summary', 'critical'],
+        properties: {
+          code: { type: 'string', pattern: '^[A-Z][A-Z0-9_]{0,63}$' },
+          severity: { type: 'string', enum: Object.freeze(['critical', 'warning', 'info']) },
+          owner: { type: 'string', pattern: '^[a-z][a-z0-9-]{0,63}$' },
+          summary: { type: 'string' },
+          critical: { type: 'boolean' },
+        },
+      },
+    },
+    unresolved: { type: 'boolean' },
+  }),
+});
+
 /**
  * Close the two independent blinded judgments without exposing release-side
  * identity. Both complete normalized judgments are retained; any semantic
