@@ -764,6 +764,19 @@ export async function prepareQualityProductionSubject(config, input) {
   return context;
 }
 
+export function qualityProductionSubjectAuthorityInputChecksum(context) {
+  if (!context?.prepared || context.phase !== 'prepared') {
+    throw new Error('quality subject is not prepared');
+  }
+  const binding = CONTEXT_BINDINGS.get(context);
+  if (!binding || typeof binding.stableInputChecksum !== 'string'
+    || !/^[a-f0-9]{64}$/.test(binding.stableInputChecksum)
+    || binding.stableInputChecksum !== binding.candidateInputChecksum) {
+    throw new Error('quality subject authority input checksum conflict');
+  }
+  return binding.stableInputChecksum;
+}
+
 function createAttestationOnlyClient() {
   const reject = async () => { throw new Error('attestation-only client cannot execute model calls'); };
   return Object.freeze({

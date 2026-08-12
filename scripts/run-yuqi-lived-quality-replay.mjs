@@ -33,6 +33,7 @@ import {
   assertQualityProductionPreflight,
   qualityRunAuthorityProductionConfig,
   prepareQualityProductionSubject,
+  qualityProductionSubjectAuthorityInputChecksum,
   bindQualityProductionPhase,
   executeQualitySubjectSide as executeBridgedQualitySubjectSide,
   executeQualityEvaluatorSide as executeBridgedQualityEvaluatorSide,
@@ -228,10 +229,19 @@ export async function runQualityReplayPlanSqlite({
         });
         continue;
       }
-      const subject = await subjectFactory(item, { ledger, runId, finalKey });
+      const subjectResult = await subjectFactory(item, { ledger, runId, finalKey });
+      const wrappedSubject = subjectResult && typeof subjectResult === 'object'
+        && Object.hasOwn(subjectResult, 'qualitySubject');
+      if (wrappedSubject && Object.keys(subjectResult).sort().join(',')
+        !== 'executionAuthorityInputChecksum,qualitySubject') {
+        throw new Error('quality subject authority wrapper conflict');
+      }
+      const subject = wrappedSubject ? subjectResult.qualitySubject : subjectResult;
       if (!subject || typeof subject !== 'object') throw new Error('compiled quality subject required');
       const subjectChecksum = contentHash(subject);
-      const authorityInputChecksum = subject.executionAuthorityInputChecksum;
+      const authorityInputChecksum = wrappedSubject
+        ? subjectResult.executionAuthorityInputChecksum
+        : subject.executionAuthorityInputChecksum;
       if (typeof authorityInputChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(authorityInputChecksum)) {
         if (!allowAuthorityFallback) throw new Error('quality authority input checksum is required');
       }
@@ -701,7 +711,10 @@ export async function runQualityReplayPlan(options = {}) {
       const subject = context.subject || item.subject;
       if (!subject) throw new Error('branded quality context subject unavailable');
       state.preparedByKey.set(`${item.layer}:${item.sceneId}:${item.repeatIndex}`, context);
-      return subject;
+      return {
+        qualitySubject: subject,
+        executionAuthorityInputChecksum: qualityProductionSubjectAuthorityInputChecksum(context),
+      };
     },
     executeQualitySubjectSide: async ({ item, subject, side, phase }) => {
       const key = `${item.layer}:${item.sceneId}:${item.repeatIndex}`;

@@ -244,9 +244,14 @@ test('SQLite replay runs one final through the ordered four-phase ledger', async
     preference: 'tie', findings: [], unresolved: false };
   const result = await runQualityReplayPlanSqlite({
     plan, ledgerPath, header, onlyFinalKey: finalKeys[0],
-    subjectFactory: async item => ({ finalKey: finalKeys[0], sceneId: item.sceneId,
-      semanticInput: { sceneId: item.sceneId }, semanticInputChecksum: contentHash({ sceneId: item.sceneId }) }),
-    executeQualitySubjectSide: async ({ side, phaseClient }) => {
+    subjectFactory: async item => ({
+      qualitySubject: { finalKey: finalKeys[0], sceneId: item.sceneId,
+        semanticInput: { sceneId: item.sceneId }, semanticInputChecksum: contentHash({ sceneId: item.sceneId }) },
+      executionAuthorityInputChecksum: 'f'.repeat(64),
+    }),
+    executeQualitySubjectSide: async ({ side, phaseClient, subject }) => {
+      assert.equal(subject.sceneId, plan.items[0].sceneId);
+      assert.equal(Object.hasOwn(subject, 'qualitySubject'), false);
       await phaseClient.runTurn('brain', JSON.stringify({ side }), {
         model: 'quality-controlled-v1', effort: 'high', outputSchema: { type: 'object' }
       });
@@ -264,7 +269,6 @@ test('SQLite replay runs one final through the ordered four-phase ledger', async
       });
       return evaluation;
     },
-    allowAuthorityFallback: true,
     phaseClientFactory: async ({ ledger, runId, phaseInput, now: clock }) => {
       const underlying = {
         turnTimeoutMs: 180_000,
