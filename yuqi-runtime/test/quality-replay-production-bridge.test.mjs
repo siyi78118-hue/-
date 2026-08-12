@@ -461,6 +461,36 @@ test('release request profiles parse model/effort and never treat cognitionDeep 
   }, 'stable_execution'), /closed shape|profile/);
 });
 
+test('GPT-5.6 release profiles preserve xhigh without accepting unknown effort values', () => {
+  const release = {
+    releaseId: 'release_candidate_xhigh',
+    releaseChecksum: 'a'.repeat(64),
+    cognitionSchemaVersion: 3,
+    expressionSchemaVersion: 3,
+    evaluatorVersion: 'local-lived-quality-v1',
+    modelProfile: {
+      cognitionFast: 'gpt-5.6-sol/medium',
+      cognitionDeep: 'gpt-5.6-sol/xhigh',
+      expression: 'gpt-5.6-sol/medium',
+      supervisor: 'gpt-5.6-sol/medium',
+    },
+  };
+  assert.equal(
+    releaseExecutionProfileFromRelease(release).profiles.cognitionDeep.effort,
+    'xhigh'
+  );
+  for (const invalid of ['ultra', '', ' xhigh', 'xhigh ']) {
+    assert.throws(() => releaseExecutionProfileFromRelease({
+      ...release,
+      modelProfile: { ...release.modelProfile, cognitionDeep: `gpt-5.6-sol/${invalid}` },
+    }), /cognitionDeep (?:effort )?conflict|must be model\/effort/);
+  }
+  assert.throws(() => releaseExecutionProfileFromRelease({
+    ...release,
+    modelProfile: { ...release.modelProfile, cognitionDeep: 7 },
+  }), /cognitionDeep conflict/);
+});
+
 test('release execution profile binds all four production roles and the underlying wire request', async () => {
   const release = {
     releaseId: 'release-four-role', releaseChecksum: 'f'.repeat(64),
