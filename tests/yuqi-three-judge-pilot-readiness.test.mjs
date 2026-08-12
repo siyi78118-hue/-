@@ -75,6 +75,10 @@ test('four isolated lanes bind the approved models and cap one final at 32 role 
 
 test('pilot material manifest binds one detached source and one isolated database per side', async () => {
   const module = await import(pathToFileURL(SCRIPT).href);
+  assert.equal(
+    module.THREE_JUDGE_MATERIAL_FILE,
+    'artifacts/yuqi-lived-agency-v3/private/quality-production-config.json',
+  );
   const stableRelease = { releaseId: 'stable', modelProfile: module.STABLE_THREE_JUDGE_PROFILE };
   const candidateRelease = { releaseId: 'candidate', modelProfile: module.CANDIDATE_THREE_JUDGE_PROFILE };
   const manifest = module.buildPilotMaterialManifest({

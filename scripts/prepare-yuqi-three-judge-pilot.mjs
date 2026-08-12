@@ -15,6 +15,7 @@ import { assertVerifiedQualityReplayPlan } from '../yuqi-runtime/src/quality-rep
 import { contentHash } from '../yuqi-runtime/src/protocol.mjs';
 
 const PRIVATE_ROOT = 'artifacts/yuqi-lived-agency-v3/private/three-judge';
+export const THREE_JUDGE_MATERIAL_FILE = 'artifacts/yuqi-lived-agency-v3/private/quality-production-config.json';
 const SOURCE_HEAD = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 
@@ -310,7 +311,7 @@ export function prepareThreeJudgePilotMaterials({ rootDir, planSourcePath, codex
     candidateRelease,
     seedDatabaseSha256: sha256(readFileSync(seedPath)),
   });
-  const materialPath = join(privateRoot, 'quality-production-config.json');
+  const materialPath = join(root, ...THREE_JUDGE_MATERIAL_FILE.split('/'));
   writeFileSync(materialPath, JSON.stringify(manifest));
   return Object.freeze({
     sourceHead,
