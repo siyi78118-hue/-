@@ -140,3 +140,29 @@ test('production CLI reports its original execute failure instead of crashing in
   assert.deepEqual(report.failedGates, ['QUALITY_REPLAY_EXECUTION_UNAVAILABLE']);
   assert.match(report.blockingReason, /ENOENT|not found|unavailable/i);
 });
+
+test('completed evaluator transport is normalized from its structured text payload', async () => {
+  const runner = await import(pathToFileURL(RUNNER).href);
+  const evaluation = {
+    version: 1,
+    scores: {
+      socialUnderstanding: 5,
+      agency: 4,
+      relationshipParticipation: 5,
+      stateContinuityFlexibility: 4,
+      livedExpression: 5,
+      actionFactIntegrity: 4,
+    },
+    preference: 'A',
+    findings: [],
+    unresolved: false,
+  };
+  assert.deepEqual(runner.normalizeBlindEvaluatorPhaseOutput({
+    status: 'completed', error: null, text: JSON.stringify(evaluation),
+    threadId: 'thread-evaluator', turnId: 'turn-evaluator',
+  }), evaluation);
+  assert.throws(() => runner.normalizeBlindEvaluatorPhaseOutput({
+    status: 'completed', error: null, text: JSON.stringify(evaluation),
+    threadId: 'thread-evaluator', turnId: 'turn-evaluator', extra: true,
+  }), /transport shape/);
+});

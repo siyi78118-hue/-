@@ -46,6 +46,33 @@ import {
   openProductionQualityReplayLedger
 } from '../yuqi-runtime/src/quality-replay-ledger.mjs';
 
+const EVALUATOR_TRANSPORT_KEYS = Object.freeze([
+  'error', 'status', 'text', 'threadId', 'turnId'
+]);
+
+export function normalizeBlindEvaluatorPhaseOutput(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('blind evaluator phase output shape');
+  }
+  if (!Object.hasOwn(value, 'text')) return normalizeBlindEvaluation(value);
+  const actualKeys = Object.keys(value).sort();
+  const expectedKeys = [...EVALUATOR_TRANSPORT_KEYS].sort();
+  if (actualKeys.length !== expectedKeys.length
+    || actualKeys.some((key, index) => key !== expectedKeys[index])) {
+    throw new Error('blind evaluator transport shape');
+  }
+  if (value.status !== 'completed' || value.error !== null
+    || typeof value.threadId !== 'string' || !value.threadId
+    || typeof value.turnId !== 'string' || !value.turnId
+    || typeof value.text !== 'string' || !value.text.trim()) {
+    throw new Error('blind evaluator transport value');
+  }
+  let parsed;
+  try { parsed = JSON.parse(value.text); }
+  catch { throw new Error('blind evaluator transport text'); }
+  return normalizeBlindEvaluation(parsed);
+}
+
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FIXTURE_REPLAY_RESULT_BRAND = new WeakSet();
 const PRODUCTION_REPLAY_RESULT_BRAND = new WeakSet();
@@ -376,8 +403,8 @@ export async function runQualityReplayPlanSqlite({
           throw error;
         }
       }
-      const primary = normalizeBlindEvaluation(phaseOutputs.evaluator_primary);
-      const secondary = normalizeBlindEvaluation(phaseOutputs.evaluator_secondary);
+      const primary = normalizeBlindEvaluatorPhaseOutput(phaseOutputs.evaluator_primary);
+      const secondary = normalizeBlindEvaluatorPhaseOutput(phaseOutputs.evaluator_secondary);
       const blindInput = {
         version: 1, finalKey, subjectType, subjectChecksum,
         stable: phaseOutputs.stable_execution || {},
