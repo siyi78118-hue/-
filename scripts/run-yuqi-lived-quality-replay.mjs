@@ -136,8 +136,19 @@ export function loadLocalHistoryManifest({ rootDir = process.cwd(), path } = {})
   return manifest;
 }
 
+function replaySubjectChecksum(subject) {
+  const semantic = subject?.semanticInputChecksum;
+  if (typeof semantic === 'string' && /^[a-f0-9]{64}$/.test(semantic)) {
+    if (subject.semanticInput !== undefined && contentHash(subject.semanticInput) !== semantic) {
+      throw new Error('quality subject semantic checksum conflict');
+    }
+    return semantic;
+  }
+  return contentHash(subject);
+}
+
 function qualityPhaseInput({ runId, finalKey, phase, subject, authorityInputChecksum, now }) {
-  const subjectChecksum = contentHash(subject);
+  const subjectChecksum = replaySubjectChecksum(subject);
   return {
     runId, finalKey, phase, subjectChecksum,
     authorityInputChecksum,
@@ -238,7 +249,7 @@ export async function runQualityReplayPlanSqlite({
       }
       const subject = wrappedSubject ? subjectResult.qualitySubject : subjectResult;
       if (!subject || typeof subject !== 'object') throw new Error('compiled quality subject required');
-      const subjectChecksum = contentHash(subject);
+      const subjectChecksum = replaySubjectChecksum(subject);
       const authorityInputChecksum = wrappedSubject
         ? subjectResult.executionAuthorityInputChecksum
         : subject.executionAuthorityInputChecksum;

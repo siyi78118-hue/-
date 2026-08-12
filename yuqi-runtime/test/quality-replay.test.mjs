@@ -288,6 +288,10 @@ test('SQLite replay runs one final through the ordered four-phase ledger', async
   try {
     assert.equal(check.getRun({ runId }).state, 'open');
     assert.equal(check.getFinal({ runId, finalKey: finalKeys[0] }).state, 'finalized');
+    assert.equal(
+      check.getPhase({ runId, finalKey: finalKeys[0], phase: 'stable_execution' }).subjectChecksum,
+      contentHash({ sceneId: plan.items[0].sceneId }),
+    );
     assert.deepEqual(['stable_execution', 'candidate_execution', 'evaluator_primary', 'evaluator_secondary']
       .map(phase => check.getPhase({ runId, finalKey: finalKeys[0], phase }).state),
       ['succeeded', 'succeeded', 'succeeded', 'succeeded']);
