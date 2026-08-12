@@ -166,3 +166,32 @@ test('completed evaluator transport is normalized from its structured text paylo
     threadId: 'thread-evaluator', turnId: 'turn-evaluator', extra: true,
   }), /transport shape/);
 });
+
+test('production evaluator input exposes anonymous A/B outputs instead of release-side names', async () => {
+  const runner = await import(pathToFileURL(RUNNER).href);
+  const item = {
+    sceneId: 'blind_scene', repeatIndex: 0,
+    scene: {
+      severity: 'high', focus: 'read the social bid', turns: [],
+      mustNotice: ['notice the bid'], allowedPersonalityVariation: ['brief'],
+    },
+  };
+  const input = runner.buildAnonymousBlindEvaluatorInput({
+    item,
+    subjectType: 'turn',
+    phaseOutputs: {
+      stable_execution: { stable: { draft: { action: 'send', reply: 'stable text' } } },
+      candidate_execution: { candidate: { draft: { action: 'send', reply: 'candidate text' } } },
+    },
+  });
+  assert.deepEqual(Object.keys(input), [
+    'version', 'subjectType', 'sceneAnnotation', 'dimensions', 'outputs',
+  ]);
+  assert.equal(Object.hasOwn(input, 'stable'), false);
+  assert.equal(Object.hasOwn(input, 'candidate'), false);
+  assert.deepEqual(input.outputs.map(output => output.label), ['A', 'B']);
+  assert.deepEqual(
+    input.outputs.map(output => output.replyParts[0].text).sort(),
+    ['candidate text', 'stable text'],
+  );
+});

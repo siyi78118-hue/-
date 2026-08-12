@@ -73,6 +73,60 @@ export function normalizeBlindEvaluatorPhaseOutput(value) {
   return normalizeBlindEvaluation(parsed);
 }
 
+function directReplyDraftFromPhase(output, side) {
+  const sideResult = output?.[side];
+  const draft = sideResult?.draft;
+  if (!draft || typeof draft !== 'object' || Array.isArray(draft)
+    || !['send', 'skip'].includes(draft.action)) {
+    throw new Error('blind evaluator direct-reply draft shape');
+  }
+  const actionValues = [
+    draft.paymentAction, draft.momentAction, draft.lifePlan, draft.lifeAdjustment,
+    draft.relationshipStageAction,
+    ...(Array.isArray(draft.rolePlanOperations) ? draft.rolePlanOperations : []),
+    ...(draft.actionIntent && typeof draft.actionIntent === 'object'
+      ? Object.values(draft.actionIntent) : []),
+  ];
+  if (actionValues.some(value => value !== undefined && value !== null)) {
+    throw new Error('blind evaluator stage-one action output conflict');
+  }
+  const reply = String(draft.reply || '');
+  if (draft.action === 'send' && !reply.trim()) {
+    throw new Error('blind evaluator visible reply required');
+  }
+  return {
+    terminalDisposition: draft.action === 'skip' ? 'skip' : 'visible',
+    replyParts: draft.action === 'skip'
+      ? [] : [{ ordinal: 0, type: 'text', text: reply }],
+    actions: [],
+  };
+}
+
+export function buildAnonymousBlindEvaluatorInput({ item, subjectType, phaseOutputs } = {}) {
+  if (!item?.scene || subjectType !== 'turn') {
+    throw new Error('blind evaluator stage-one subject conflict');
+  }
+  const evaluationSeed = Number.parseInt(contentHash({
+    sceneId: item.sceneId, repeatIndex: item.repeatIndex
+  }).slice(0, 12), 16);
+  return projectBlindEvaluationInput({
+    subjectType,
+    sceneId: item.sceneId,
+    repeatIndex: item.repeatIndex,
+    evaluationSeed,
+    sceneAnnotation: {
+      sceneId: item.sceneId,
+      severity: item.scene.severity,
+      focus: item.scene.focus || '',
+      turns: item.scene.turns,
+      requiredChecks: item.scene.mustNotice || [],
+      allowedVariation: item.scene.allowedPersonalityVariation || [],
+    },
+    stable: { output: directReplyDraftFromPhase(phaseOutputs?.stable_execution, 'stable') },
+    candidate: { output: directReplyDraftFromPhase(phaseOutputs?.candidate_execution, 'candidate') },
+  }, { seed: evaluationSeed });
+}
+
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FIXTURE_REPLAY_RESULT_BRAND = new WeakSet();
 const PRODUCTION_REPLAY_RESULT_BRAND = new WeakSet();
@@ -361,11 +415,9 @@ export async function runQualityReplayPlanSqlite({
           } else {
             const blind = phase === 'evaluator_primary'
               ? evaluator : evaluatorSecondary;
-            const blindInput = {
-              version: 1, finalKey, subjectType, subjectChecksum,
-              stable: phaseOutputs.stable_execution || {},
-              candidate: phaseOutputs.candidate_execution || {},
-            };
+            const blindInput = buildAnonymousBlindEvaluatorInput({
+              item, subjectType, phaseOutputs,
+            });
             output = await blind({ item, subject, finalKey, runId, phase,
               phaseClient, blindInput, phaseInput, ledger });
           }
