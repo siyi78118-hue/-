@@ -74,6 +74,10 @@ test('four isolated lanes bind the approved models and cap one final at 32 role 
     title: 'Yuqi Quality Three-Judge Pilot',
     version: '1.0.0',
   });
+  assert.deepEqual(
+    Object.values(lanes).map(lane => lane.turnTimeoutMs),
+    [600_000, 600_000, 600_000, 600_000],
+  );
   assert.equal(Object.values(lanes).reduce((sum, lane) => sum + lane.maxRoleTurns, 0), 32);
   assert.equal(new Set(Object.values(lanes).map(lane => lane.sessionStorePath)).size, 4);
   assert.equal(new Set(Object.values(lanes).map(lane => lane.sessionNamespace)).size, 4);

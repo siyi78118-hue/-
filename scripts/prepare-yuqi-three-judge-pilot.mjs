@@ -94,7 +94,7 @@ export function buildThreeJudgeLaneDefinitions({ rootDir, codexCommand }) {
       version: '1.0.0',
     },
     requestTimeoutMs: 30_000,
-    turnTimeoutMs: 300_000,
+    turnTimeoutMs: 600_000,
     maxRoleTurns: 8,
     sessionStorePath: `artifacts/yuqi-lived-agency-v3/private/three-judge/sessions/${name}.sqlite`,
     sessionNamespace: `quality/three-judge/stage-1/${name}`,
