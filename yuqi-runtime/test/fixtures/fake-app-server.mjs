@@ -46,6 +46,12 @@ input.on('line', line => {
   }
   if (message.method === 'thread/read') {
     const storedTurns = threads.get(message.params.threadId);
+    if (process.env.FAKE_UNMATERIALIZED_EMPTY_THREAD === '1'
+      && message.params.includeTurns === true && Array.isArray(storedTurns) && storedTurns.length === 0) {
+      write({ id: message.id, error: { code: -32003,
+        message: `thread ${message.params.threadId} is not materialized yet; includeTurns is unavailable before first user message` } });
+      return;
+    }
     write({
       id: message.id,
       result: {

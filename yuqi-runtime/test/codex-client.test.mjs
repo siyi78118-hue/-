@@ -217,6 +217,18 @@ test('reads a complete thread snapshot with turns for restart recovery', async (
   assert.deepEqual(read.params, { threadId: 'thr_recovery', includeTurns: true });
 }));
 
+test('treats a newly started unmaterialized thread as an empty recovery baseline', async () => fixture(async ({ client, store }) => {
+  const threadId = await client.ensureThread('brain');
+  assert.deepEqual(store.getSessionState('brain'), { threadId, turnCount: 0 });
+  const baseline = await client.readThread(threadId);
+  assert.equal(baseline.id, threadId);
+  assert.deepEqual(baseline.turns, []);
+  const result = await client.runTurn('brain', 'first materializing turn');
+  assert.equal(result.threadId, threadId);
+}, {
+  env: { ...process.env, FAKE_APP_SERVER_LOG: '', FAKE_UNMATERIALIZED_EMPTY_THREAD: '1' },
+}));
+
 test('awaits onTurnStarted before installing completion handling', async () => fixture(async ({ client }) => {
   const events = [];
   const result = await client.runTurn('brain', 'hooked', {

@@ -40,6 +40,12 @@ function isMissingRolloutError(error) {
   return /\bno rollout found for thread id\b/i.test(message);
 }
 
+function isUnmaterializedEmptyThreadError(error) {
+  if (!(error instanceof CodexProtocolError)) return false;
+  const message = [error.message, error.details?.message].filter(Boolean).join('\n');
+  return /\bnot materialized yet\b.*\bincludeTurns is unavailable before first user message\b/i.test(message);
+}
+
 export class CodexAppServerClient {
   constructor(options = {}) {
     this.command = options.command || 'codex';
@@ -291,10 +297,21 @@ export class CodexAppServerClient {
       throw new Error('Codex thread read input is invalid');
     }
     await this.start();
-    const result = await this.request('thread/read', {
-      threadId: normalizedThreadId,
-      includeTurns
-    });
+    let result;
+    try {
+      result = await this.request('thread/read', {
+        threadId: normalizedThreadId,
+        includeTurns
+      });
+    } catch (error) {
+      const isKnownEmptyLocalThread = includeTurns && isUnmaterializedEmptyThreadError(error)
+        && [...ROLES].some(role => {
+          const state = this.store?.getSessionState?.(role);
+          return state?.threadId === normalizedThreadId && Number(state.turnCount || 0) === 0;
+        });
+      if (!isKnownEmptyLocalThread) throw error;
+      return { id: normalizedThreadId, status: { type: 'idle' }, turns: [] };
+    }
     if (!result?.thread || result.thread.id !== normalizedThreadId
       || (includeTurns && !Array.isArray(result.thread.turns))) {
       throw new CodexProtocolError('thread/read returned an invalid thread snapshot');
