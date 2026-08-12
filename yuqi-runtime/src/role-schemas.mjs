@@ -386,7 +386,8 @@ export const COGNITION_SCHEMA_V3 = objectSchema({
     'shouldAcknowledgeBid',
     'intentionalNonResponseReason',
     'mustConvey',
-    'mustNotClaim'
+    'mustNotClaim',
+    'motiveEvidenceIds'
   ]),
   actionIntent: ACTION_INTENT_SCHEMA_V3,
   statePatch: STATE_PATCH_SCHEMA_V3

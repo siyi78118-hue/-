@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
 import { CodexAppServerClient } from '../src/codex-client.mjs';
+import { COGNITION_SCHEMA_V3 } from '../src/role-schemas.mjs';
 import { YuqiStore } from '../src/store.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -208,6 +209,10 @@ test('memory schema remains valid for strict structured output after nested fiel
 
   assertEveryObjectRequiresEveryProperty(started.params.outputSchema, 'memory');
 }));
+
+test('cognition-v3 schema requires every declared property for strict structured output', () => {
+  assertEveryObjectRequiresEveryProperty(COGNITION_SCHEMA_V3, 'cognition-v3');
+});
 
 test('reads a complete thread snapshot with turns for restart recovery', async () => fixture(async ({ client, logFile }) => {
   const thread = await client.readThread('thr_recovery');

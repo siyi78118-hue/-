@@ -214,8 +214,17 @@ function validateTransitionCoverage(transitions, relevantStances) {
 }
 
 export function normalizeCognitionV3Result(value, validationContext = {}) {
-  validateSchema(value, COGNITION_SCHEMA_V3, 'cognitionV3');
   const normalized = clone(value);
+  // Strict App Server schemas must require every declared property.  Historical
+  // non-proactive v3 checkpoints predate motive evidence and legitimately omit
+  // this field, so normalize only that compatibility shape to an empty list.
+  // PROACTIVE_CHAT keeps its explicit, persisted-evidence requirement below.
+  if (validationContext.envelope?.kind !== 'PROACTIVE_CHAT'
+    && normalized?.interactionDecision
+    && !Object.hasOwn(normalized.interactionDecision, 'motiveEvidenceIds')) {
+    normalized.interactionDecision.motiveEvidenceIds = [];
+  }
+  validateSchema(normalized, COGNITION_SCHEMA_V3, 'cognitionV3');
   if (normalized.interactionRead.confidence < 0 || normalized.interactionRead.confidence > 1) {
     throw new Error('interactionRead confidence must be between zero and one');
   }
