@@ -5,6 +5,7 @@ import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
 const SCRIPT = join(process.cwd(), 'scripts', 'prepare-yuqi-three-judge-pilot.mjs');
+const RUNNER = join(process.cwd(), 'scripts', 'run-yuqi-lived-quality-replay.mjs');
 
 test('three-judge pilot has a dedicated non-model preparer', () => {
   assert.equal(existsSync(SCRIPT), true);
@@ -96,4 +97,17 @@ test('pilot material manifest binds one detached source and one isolated databas
   assert.equal(new Set([
     manifest.seedDatabasePath, manifest.stableDatabasePath, manifest.candidateDatabasePath,
   ]).size, 3);
+});
+
+test('production CLI preserves the private relative ledger authority path', async () => {
+  const runner = await import(pathToFileURL(RUNNER).href);
+  const relative = 'artifacts/yuqi-lived-agency-v3/private/three-judge/quality-replay-state.sqlite';
+  assert.equal(runner.productionLedgerAuthorityPath(relative), relative);
+  for (const invalid of [
+    'C:/outside/quality.sqlite',
+    '../private/quality.sqlite',
+    'artifacts\\private\\quality.sqlite',
+  ]) {
+    assert.throws(() => runner.productionLedgerAuthorityPath(invalid), /ledger path conflict/);
+  }
 });

@@ -1163,6 +1163,15 @@ export function assertProductionExecuteCliArgs(cli) {
   return true;
 }
 
+export function productionLedgerAuthorityPath(value) {
+  if (typeof value !== 'string' || !value || value.includes('\\')
+    || value.startsWith('/') || /^[A-Za-z]:/.test(value)
+    || value.split('/').some(part => !part || part === '.' || part === '..')) {
+    throw new Error('production quality ledger path conflict');
+  }
+  return value;
+}
+
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
 
 if (isMain) {
@@ -1215,7 +1224,7 @@ if (isMain) {
         throw new Error('createQualityReplayRunAuthority export required');
       }
       const runAuthority = await authorityFactory({ rootDir, plan,
-        ledgerPath: resolve(rootDir, cli.ledger),
+        ledgerPath: productionLedgerAuthorityPath(cli.ledger),
         artifactPaths: {
           plan: cli.plan,
           ledger: cli.ledger,
@@ -1226,7 +1235,7 @@ if (isMain) {
       const result = await runQualityReplayPlan({
         plan,
         sourceRootDir: rootDir,
-        ledgerPath: resolve(rootDir, cli.ledger),
+        ledgerPath: productionLedgerAuthorityPath(cli.ledger),
         runAuthority,
         selector: { onlyFinalKey: cli.onlyFinalKey || null },
         resumeRun: cli.resumeRun || null,
