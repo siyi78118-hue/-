@@ -127,6 +127,15 @@ export function buildAnonymousBlindEvaluatorInput({ item, subjectType, phaseOutp
   }, { seed: evaluationSeed });
 }
 
+export function qualityFinalKeyFromItem(item) {
+  if (!item || typeof item.layer !== 'string' || !item.layer
+    || typeof item.sceneId !== 'string' || !item.sceneId
+    || !Number.isSafeInteger(item.repeatIndex) || item.repeatIndex < 0) {
+    throw new Error('quality item identity conflict');
+  }
+  return `${item.layer}:${item.sceneId}:${item.repeatIndex}`;
+}
+
 const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FIXTURE_REPLAY_RESULT_BRAND = new WeakSet();
 const PRODUCTION_REPLAY_RESULT_BRAND = new WeakSet();
@@ -815,8 +824,8 @@ export async function runQualityReplayPlan(options = {}) {
           ? context.config?.stablePhaseClientSlot : context.config?.candidatePhaseClientSlot,
       });
     },
-    evaluator: async ({ blindInput, phaseInput, ledger }) => {
-      const context = state.preparedByKey.get(blindInput.finalKey);
+    evaluator: async ({ item, blindInput, phaseInput, ledger }) => {
+      const context = state.preparedByKey.get(qualityFinalKeyFromItem(item));
       if (!context?.evaluatorStores?.primary) throw new Error('primary evaluator store unavailable');
       return executeBridgedQualityEvaluatorSide(config, {
         side: 'primary', role: 'brain', input: JSON.stringify(blindInput), phaseInput, ledger,
@@ -825,8 +834,8 @@ export async function runQualityReplayPlan(options = {}) {
         storeManifestStores: context.openStoreManifestStores,
       });
     },
-    evaluatorSecondary: async ({ blindInput, phaseInput, ledger }) => {
-      const context = state.preparedByKey.get(blindInput.finalKey);
+    evaluatorSecondary: async ({ item, blindInput, phaseInput, ledger }) => {
+      const context = state.preparedByKey.get(qualityFinalKeyFromItem(item));
       if (!context?.evaluatorStores?.secondary) throw new Error('secondary evaluator store unavailable');
       return executeBridgedQualityEvaluatorSide(config, {
         side: 'secondary', role: 'brain', input: JSON.stringify(blindInput), phaseInput, ledger,

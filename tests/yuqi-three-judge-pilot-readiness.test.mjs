@@ -195,3 +195,13 @@ test('production evaluator input exposes anonymous A/B outputs instead of releas
     ['candidate text', 'stable text'],
   );
 });
+
+test('production evaluator resolves its private context from the plan item, not blind input', async () => {
+  const runner = await import(pathToFileURL(RUNNER).href);
+  assert.equal(runner.qualityFinalKeyFromItem({
+    layer: 'sentinel', sceneId: 'blind_scene', repeatIndex: 2,
+  }), 'sentinel:blind_scene:2');
+  assert.throws(() => runner.qualityFinalKeyFromItem({
+    layer: 'sentinel', sceneId: 'blind_scene', repeatIndex: '2',
+  }), /item identity/);
+});
