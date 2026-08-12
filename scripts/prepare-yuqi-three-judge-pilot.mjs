@@ -88,7 +88,11 @@ export function buildThreeJudgeLaneDefinitions({ rootDir, codexCommand }) {
     args: ['app-server'],
     cwd: rootDir,
     env: {},
-    clientInfo: { protocol: 'codex-app-server-v1' },
+    clientInfo: {
+      name: 'yuqi_quality_three_judge',
+      title: 'Yuqi Quality Three-Judge Pilot',
+      version: '1.0.0',
+    },
     requestTimeoutMs: 30_000,
     turnTimeoutMs: 300_000,
     maxRoleTurns: 8,

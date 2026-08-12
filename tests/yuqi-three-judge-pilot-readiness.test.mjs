@@ -69,6 +69,11 @@ test('four isolated lanes bind the approved models and cap one final at 32 role 
   assert.deepEqual(lanes.candidate_execution.modelProfile, module.CANDIDATE_THREE_JUDGE_PROFILE);
   assert.equal(lanes.evaluator_primary.modelProfile, 'gpt-5.6-sol/medium');
   assert.equal(lanes.evaluator_secondary.modelProfile, 'gpt-5.6-terra/high');
+  assert.deepEqual(lanes.stable_execution.clientInfo, {
+    name: 'yuqi_quality_three_judge',
+    title: 'Yuqi Quality Three-Judge Pilot',
+    version: '1.0.0',
+  });
   assert.equal(Object.values(lanes).reduce((sum, lane) => sum + lane.maxRoleTurns, 0), 32);
   assert.equal(new Set(Object.values(lanes).map(lane => lane.sessionStorePath)).size, 4);
   assert.equal(new Set(Object.values(lanes).map(lane => lane.sessionNamespace)).size, 4);
