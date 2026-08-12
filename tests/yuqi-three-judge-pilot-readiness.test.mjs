@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -114,4 +115,19 @@ test('production CLI preserves the private relative ledger authority path', asyn
   ]) {
     assert.throws(() => runner.productionLedgerAuthorityPath(invalid), /ledger path conflict/);
   }
+});
+
+test('production CLI reports its original execute failure instead of crashing in the reporter', () => {
+  const result = spawnSync(process.execPath, [
+    RUNNER,
+    '--execute',
+    '--ledger', 'artifacts/yuqi-lived-agency-v3/private/missing.sqlite',
+    '--plan', 'artifacts/yuqi-lived-agency-v3/private/missing-plan.json',
+    '--execution-config', 'scripts/missing-config.mjs',
+  ], { cwd: process.cwd(), encoding: 'utf8' });
+  assert.equal(result.status, 2);
+  assert.doesNotMatch(result.stderr, /ReferenceError: execute is not defined/);
+  const report = JSON.parse(result.stdout);
+  assert.deepEqual(report.failedGates, ['QUALITY_REPLAY_EXECUTION_UNAVAILABLE']);
+  assert.match(report.blockingReason, /ENOENT|not found|unavailable/i);
 });

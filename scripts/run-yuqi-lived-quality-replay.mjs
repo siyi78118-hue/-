@@ -1176,8 +1176,10 @@ const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(pro
 
 if (isMain) {
   (async () => {
+    let executing = false;
     try {
       const cli = parseQualityReplayCliArgs();
+      executing = cli.execute;
       assertProductionExecuteCliArgs(cli);
       const rootDir = cli.root || process.cwd();
       const stableFrom = cli.stableFrom;
@@ -1277,7 +1279,7 @@ if (isMain) {
         version: 1,
         eligible: false,
         productionReleaseMutation: false,
-        failedGates: [execute ? 'QUALITY_REPLAY_EXECUTION_UNAVAILABLE' : 'ANNOTATION_EVIDENCE_OR_PLAN_UNAVAILABLE'],
+        failedGates: [executing ? 'QUALITY_REPLAY_EXECUTION_UNAVAILABLE' : 'ANNOTATION_EVIDENCE_OR_PLAN_UNAVAILABLE'],
         blockingReason: error instanceof Error ? error.message : String(error)
       }, null, 2)}\n`);
       process.exitCode = 2;
