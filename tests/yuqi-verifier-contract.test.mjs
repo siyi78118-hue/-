@@ -18,3 +18,8 @@ test('Yuqi verifier covers every deterministic delivery gate', () => {
   }
   assert.equal(pkg.scripts['yuqi:verify'], 'node scripts/verify-yuqi-runtime.mjs');
 });
+
+test('protocol verifier scopes the v1 prohibition to new turn submissions', () => {
+  assert.match(verifier, /input\.includes\('\.put\("protocolVersion", 1\)'\)/);
+  assert.doesNotMatch(verifier, /bridgeSources\.includes\('\.put\("protocolVersion", 1\)'\)/);
+});
