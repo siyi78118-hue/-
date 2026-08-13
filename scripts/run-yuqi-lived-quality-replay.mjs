@@ -204,6 +204,33 @@ export function createQualityReplayPlan({ rootDir = process.cwd(), historyScenes
   });
 }
 
+/**
+ * Production executions may replace only the private, deidentified history
+ * layer.  The tracked sentinel/coverage suite remains the executable source
+ * authority, while the replacement history layer proves its own manifest.
+ */
+export function assertProductionQualityPlanSourceBoundary({ plan, rootDir = process.cwd() } = {}) {
+  assertVerifiedQualityReplayPlan(plan);
+  const tracked = createQualityReplayPlan({ rootDir });
+  const trackedItems = tracked.items.filter(item => item.layer !== 'history');
+  const suppliedItems = plan.items.filter(item => item.layer !== 'history');
+  if (contentHash(suppliedItems) !== contentHash(trackedItems)
+    || contentHash(plan.finalKeys.sentinelFinalKeys) !== contentHash(tracked.finalKeys.sentinelFinalKeys)
+    || contentHash(plan.finalKeys.coverageFinalKeys) !== contentHash(tracked.finalKeys.coverageFinalKeys)
+    || plan.commitments.sourceGroundingChecksum !== tracked.commitments.sourceGroundingChecksum
+    || plan.commitments.sentinelContentChecksum !== tracked.commitments.sentinelContentChecksum
+    || plan.commitments.coverageContentChecksum !== tracked.commitments.coverageContentChecksum) {
+    throw new Error('production quality tracked source commitment conflict');
+  }
+  const historyItems = plan.items.filter(item => item.layer === 'history');
+  if (historyItems.length !== 30
+    || plan.historyManifest.sceneIds.join('\u0000') !== historyItems.map(item => item.sceneId).join('\u0000')
+    || plan.historyManifest.scenesChecksum !== contentHash(historyItems.map(item => item.scene))) {
+    throw new Error('production quality private history source commitment conflict');
+  }
+  return true;
+}
+
 export function loadLocalHistoryScenes({ rootDir = process.cwd(), path } = {}) {
   const historyPath = path || presetHistoryArtifactPaths(rootDir).scenesPath;
   if (!existsSync(historyPath)) throw new Error(`human annotation scenes not found: ${historyPath}`);
@@ -1318,16 +1345,24 @@ if (isMain) {
       const stableFrom = cli.stableFrom;
       const candidatePreset = cli.candidatePreset;
       const execute = cli.execute;
-      const historyScenes = loadLocalHistoryScenes({ rootDir, path: cli.history });
-      const historyManifest = loadLocalHistoryManifest({ rootDir, path: cli.historyManifest });
-      const plan = cli.plan
-        ? loadQualityReplayPlanArtifact({
-          artifactPath: resolve(rootDir, cli.plan),
-          rootDir,
-          historyScenes,
-          historyManifest
-        })
-        : createQualityReplayPlan({ rootDir, historyScenes, historyManifest });
+      let plan;
+      if (execute) {
+        const productionPlanPath = resolve(rootDir, cli.plan);
+        assertProductionArtifactPath(rootDir, productionPlanPath);
+        plan = JSON.parse(readFileSync(productionPlanPath, 'utf8'));
+        assertProductionQualityPlanSourceBoundary({ plan, rootDir });
+      } else {
+        const historyScenes = loadLocalHistoryScenes({ rootDir, path: cli.history });
+        const historyManifest = loadLocalHistoryManifest({ rootDir, path: cli.historyManifest });
+        plan = cli.plan
+          ? loadQualityReplayPlanArtifact({
+            artifactPath: resolve(rootDir, cli.plan),
+            rootDir,
+            historyScenes,
+            historyManifest
+          })
+          : createQualityReplayPlan({ rootDir, historyScenes, historyManifest });
+      }
       const planPath = resolve(rootDir, cli.planOut
         || 'artifacts/yuqi-lived-agency-v3/private/quality-replay-plan.json');
       assertProductionArtifactPath(rootDir, planPath);

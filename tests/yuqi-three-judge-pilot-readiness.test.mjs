@@ -8,12 +8,53 @@ import { pathToFileURL } from 'node:url';
 import { PresetRegistry } from '../yuqi-runtime/src/preset-registry.mjs';
 import { PromotionController } from '../yuqi-runtime/src/promotion-controller.mjs';
 import { YuqiStore } from '../yuqi-runtime/src/store.mjs';
+import { createQualityReplayPlan } from '../scripts/run-yuqi-lived-quality-replay.mjs';
+import { contentHash } from '../yuqi-runtime/src/protocol.mjs';
 
 const SCRIPT = join(process.cwd(), 'scripts', 'prepare-yuqi-three-judge-pilot.mjs');
 const RUNNER = join(process.cwd(), 'scripts', 'run-yuqi-lived-quality-replay.mjs');
 
 test('three-judge pilot has a dedicated non-model preparer', () => {
   assert.equal(existsSync(SCRIPT), true);
+});
+
+test('production plan loader permits a private history layer while pinning every tracked suite commitment', async () => {
+  const module = await import(pathToFileURL(RUNNER).href);
+  const tracked = createQualityReplayPlan({ rootDir: process.cwd() });
+  const custom = structuredClone(tracked);
+  const historyItems = custom.items.filter(item => item.layer === 'history');
+  historyItems.forEach((item, index) => {
+    item.scene.sceneId = `private_real_history_${String(index).padStart(2, '0')}`;
+    item.sceneId = item.scene.sceneId;
+  });
+  custom.finalKeys.historyFinalKeys = historyItems.map(item => `history:${item.sceneId}:0`);
+  custom.historyManifest = {
+    schemaVersion: 1,
+    sceneIds: historyItems.map(item => item.sceneId),
+    scenesChecksum: contentHash(historyItems.map(item => item.scene)),
+  };
+  custom.commitments.historyScenesChecksum = custom.historyManifest.scenesChecksum;
+  custom.commitments.itemsChecksum = contentHash(custom.items);
+  custom.planChecksum = contentHash({
+    version: custom.version,
+    planType: custom.planType,
+    finalKeys: custom.finalKeys,
+    commitments: custom.commitments,
+    historyManifest: custom.historyManifest,
+  });
+  assert.equal(module.assertProductionQualityPlanSourceBoundary({ plan: custom, rootDir: process.cwd() }), true);
+
+  const forged = structuredClone(custom);
+  forged.items.find(item => item.layer === 'sentinel').scene.focus = 'forged tracked suite content';
+  forged.commitments.itemsChecksum = contentHash(forged.items);
+  forged.planChecksum = contentHash({
+    version: forged.version,
+    planType: forged.planType,
+    finalKeys: forged.finalKeys,
+    commitments: forged.commitments,
+    historyManifest: forged.historyManifest,
+  });
+  assert.throws(() => module.assertProductionQualityPlanSourceBoundary({ plan: forged, rootDir: process.cwd() }), /tracked|source|commitment/i);
 });
 
 test('stage one freezes two reviewed questions and the approved model profiles', async () => {
