@@ -13,6 +13,7 @@ import { contentHash } from '../yuqi-runtime/src/protocol.mjs';
 
 const SCRIPT = join(process.cwd(), 'scripts', 'prepare-yuqi-three-judge-pilot.mjs');
 const RUNNER = join(process.cwd(), 'scripts', 'run-yuqi-lived-quality-replay.mjs');
+const EXECUTION_CONFIG = join(process.cwd(), 'scripts', 'yuqi-quality-production-execution-config.mjs');
 
 test('three-judge pilot has a dedicated non-model preparer', () => {
   assert.equal(existsSync(SCRIPT), true);
@@ -43,6 +44,8 @@ test('production plan loader permits a private history layer while pinning every
     historyManifest: custom.historyManifest,
   });
   assert.equal(module.assertProductionQualityPlanSourceBoundary({ plan: custom, rootDir: process.cwd() }), true);
+  const executionConfig = await import(pathToFileURL(EXECUTION_CONFIG).href);
+  assert.equal(executionConfig.assertProductionQualityPlanSourceBoundary(custom), true);
 
   const forged = structuredClone(custom);
   forged.items.find(item => item.layer === 'sentinel').scene.focus = 'forged tracked suite content';
@@ -55,6 +58,7 @@ test('production plan loader permits a private history layer while pinning every
     historyManifest: forged.historyManifest,
   });
   assert.throws(() => module.assertProductionQualityPlanSourceBoundary({ plan: forged, rootDir: process.cwd() }), /tracked|source|commitment/i);
+  assert.throws(() => executionConfig.assertProductionQualityPlanSourceBoundary(forged), /tracked|source|commitment/i);
 });
 
 test('stage one freezes two reviewed questions and the approved model profiles', async () => {
