@@ -155,6 +155,12 @@ function v3Release(overrides = {}) {
     presetVersion: '2.1.0',
     cognitionSchemaVersion: 3,
     expressionSchemaVersion: 3,
+    modelProfile: {
+      cognitionFast: 'gpt-5.6-sol/medium',
+      cognitionDeep: 'gpt-5.6-sol/xhigh',
+      expression: 'gpt-5.6-sol/medium',
+      supervisor: 'gpt-5.6-sol/medium'
+    },
     ...overrides
   };
 }
@@ -397,6 +403,63 @@ test('v3 release draft compiles both non-empty bundles from the immutable releas
     'cognition:2.1.0',
     'expression:2.1.0'
   ]);
+});
+
+test('v3 release draft uses the pinned release profile for every model call', async () => {
+  const client = new FakeClient(
+    { routeDecision: 'deep', cognitionResult: cognitionResult() },
+    cognitionResult(),
+    expressionResult()
+  );
+  const pipeline = new CognitivePipeline({
+    store: new FakeStore(),
+    codexClient: client,
+    presetRegistry: { resolvePresetBundle: ({ role }) => `${role}:pinned` }
+  });
+
+  await pipeline.runV3ReleaseDraft({
+    release: v3Release(),
+    execution: {
+      turn: { turnId: 'turn_v3', characterId: 'yuqi' },
+      cognitionEnvelope: envelope(),
+      supervise: () => ({ approved: true, findings: [] })
+    }
+  });
+
+  assert.deepEqual(client.calls.map(({ role, options }) => [role, options.model, options.effort]), [
+    ['cognition_fast', 'gpt-5.6-sol', 'medium'],
+    ['cognition_deep', 'gpt-5.6-sol', 'xhigh'],
+    ['expression_v3', 'gpt-5.6-sol', 'medium']
+  ]);
+});
+
+test('v3 release draft rejects a malformed release profile before any model call', async () => {
+  const valid = v3Release().modelProfile;
+  const malformed = [
+    { ...valid, extra: 'gpt-5.6-sol/medium' },
+    { ...valid, cognitionFast: ' gpt-5.6-sol/medium' },
+    { ...valid, cognitionDeep: 'gpt-5.6-sol/ultra' },
+    { ...valid, expression: 7 },
+    { cognitionFast: valid.cognitionFast, cognitionDeep: valid.cognitionDeep, expression: valid.expression }
+  ];
+
+  for (const modelProfile of malformed) {
+    const client = new FakeClient(cognitionResult(), expressionResult());
+    const pipeline = new CognitivePipeline({
+      store: new FakeStore(),
+      codexClient: client,
+      presetRegistry: { resolvePresetBundle: ({ role }) => `${role}:pinned` }
+    });
+    await assert.rejects(() => pipeline.runV3ReleaseDraft({
+      release: v3Release({ modelProfile }),
+      execution: {
+        turn: { turnId: 'turn_v3', characterId: 'yuqi' },
+        cognitionEnvelope: envelope(),
+        supervise: () => ({ approved: true, findings: [] })
+      }
+    }), /release model profile/);
+    assert.equal(client.calls.length, 0);
+  }
 });
 
 test('v3 production draft validates pinned proactive motive evidence and inherited retry annotation', async () => {

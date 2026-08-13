@@ -21,6 +21,7 @@ import {
 } from './role-schemas.mjs';
 import { resolveRelationshipStage } from './relationship-stage.mjs';
 import { repairPlanForFinding, superviseLivedTurn } from './lived-quality-supervisor.mjs';
+import { parseReleaseModelProfile } from './release-model-profile.mjs';
 
 const COGNITION_FAST_ROUTE_SCHEMA_V3 = Object.freeze({
   type: 'object',
@@ -43,6 +44,13 @@ const RELEASE_DRAFT_CONTRACTS = Object.freeze({
     cognitionSchemaVersion: 3,
     expressionSchemaVersion: 3
   })
+});
+
+const DEFAULT_V3_MODEL_PROFILES = Object.freeze({
+  cognitionFast: Object.freeze({ model: 'gpt-5.6-terra', effort: 'medium' }),
+  cognitionDeep: Object.freeze({ model: 'gpt-5.6-sol', effort: 'medium' }),
+  expression: Object.freeze({ model: 'gpt-5.6-sol', effort: 'medium' }),
+  supervisor: Object.freeze({ model: 'gpt-5.6-terra', effort: 'medium' })
 });
 
 function assertReleaseDraftContract(release, contract) {
@@ -323,6 +331,7 @@ async function runV3Expression(
   relationshipExpression,
   repairPlans = []
 ) {
+  const expressionProfile = input.modelProfiles?.expression || DEFAULT_V3_MODEL_PROFILES.expression;
   const agencyView = {
     hardConstraints: cognitionEnvelope.hardConstraints || [],
     preferences: cognitionEnvelope.preferences || [],
@@ -352,8 +361,8 @@ async function runV3Expression(
       deadlineMs: 60_000,
       outerDeadlineMs: Math.max(1, Number(input.outerDeadlineMs) || 300_000),
       outputSchema: EXPRESSION_SCHEMA_V3,
-      model: 'gpt-5.6-sol',
-      effort: 'medium'
+      model: expressionProfile.model,
+      effort: expressionProfile.effort
     }
   ), 'expression_v3');
   const expressionResult = normalizeExpressionV3Result(expressionRaw);
@@ -394,6 +403,7 @@ async function reviewV3Draft(
 export async function runCognitionV3Turn(input) {
   const startedAt = input.now?.() ?? Date.now();
   const outerDeadlineMs = Math.max(1, Number(input.outerDeadlineMs) || 300_000);
+  const modelProfiles = input.modelProfiles || DEFAULT_V3_MODEL_PROFILES;
   const checkpoint = storedV3Checkpoint(input.store, input.turn);
   let loaded = null;
   let relationshipExpression = relationshipExpressionSource(input, checkpoint);
@@ -427,8 +437,8 @@ export async function runCognitionV3Turn(input) {
         deadlineMs: 45_000,
         outerDeadlineMs,
         outputSchema: COGNITION_FAST_ROUTE_SCHEMA_V3,
-        model: 'gpt-5.6-terra',
-        effort: 'medium'
+        model: modelProfiles.cognitionFast.model,
+        effort: modelProfiles.cognitionFast.effort
       }
     ), 'cognition_fast');
     let cognitionCandidate = fastResponse.cognitionResult || fastResponse;
@@ -448,8 +458,8 @@ export async function runCognitionV3Turn(input) {
           deadlineMs: 120_000,
           outerDeadlineMs,
           outputSchema: COGNITION_SCHEMA_V3,
-          model: 'gpt-5.6-sol',
-          effort: 'medium'
+          model: modelProfiles.cognitionDeep.model,
+          effort: modelProfiles.cognitionDeep.effort
         }
       ), 'cognition_deep');
       cognitionCandidate = deepResponse.cognitionResult || deepResponse;
@@ -524,8 +534,8 @@ export async function runCognitionV3Turn(input) {
           deadlineMs: 120_000,
           outerDeadlineMs,
           outputSchema: COGNITION_SCHEMA_V3,
-          model: 'gpt-5.6-sol',
-          effort: 'medium'
+          model: modelProfiles.cognitionDeep.model,
+          effort: modelProfiles.cognitionDeep.effort
         }
       ), 'cognition_deep');
       const reconsidered = normalizeCognitionV3Result(
@@ -856,6 +866,7 @@ export class CognitivePipeline {
   async runV3ReleaseDraft({ release, execution, dryRun = false, capabilities = null }) {
     assertReleaseDraftContract(release, RELEASE_DRAFT_CONTRACTS.v3);
     assertDryRunCapabilities(dryRun, capabilities);
+    const modelProfiles = parseReleaseModelProfile(release.modelProfile);
     const presetBundles = this.compilePinnedReleaseBundles(release, execution);
     const pinnedTurn = {
       ...(execution?.turn || {}),
@@ -867,6 +878,7 @@ export class CognitivePipeline {
       turn: pinnedTurn,
       store: this.store,
       client: execution?.client || this.codexClient,
+      modelProfiles,
       presetBundles,
       dryRun: Boolean(dryRun),
       draftOnly: true,
