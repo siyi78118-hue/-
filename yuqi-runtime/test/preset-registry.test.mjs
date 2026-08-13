@@ -53,7 +53,7 @@ test('schema 2 stores immutable legacy, current, and candidate versions', () => 
   assert.equal(registry.current().version, '1.9.2');
   assert.deepEqual(
     store.listPresetVersions().map((preset) => preset.version).sort(),
-    ['1.9.1', '1.9.2', '2.0.0', '2.1.0']
+    ['1.9.1', '1.9.2', '2.0.0', '2.1.0', '2.1.1']
   );
   assert.ok(store.getPresetVersion('2.0.0'));
   assert.equal(store.getCurrentPresetVersion(), '1.9.2');
@@ -72,6 +72,27 @@ test('2.1.0 is an immutable complete v3 seed without replacing older versions', 
       'socialExperience',
       'supervisor'
     ]);
+    assert.equal(store.getCurrentPresetVersion(), '1.9.2');
+  }));
+
+test('2.1.1 separates private understanding from public dialogue obligations', () =>
+  withRegistry((registry, store) => {
+    const previous = store.getPresetVersion('2.1.0');
+    const preset = store.getPresetVersion('2.1.1');
+    assert.ok(previous);
+    assert.ok(preset);
+    assert.match(preset.modules.cognition, /mustConvey.*公开互动义务.*不是.*心理诊断/s);
+    assert.match(preset.modules.expression, /理解.*决定.*回应.*不是.*台词素材/s);
+    assert.match(preset.modules.supervisor, /证明.*懂.*DIALOGUE_META_NARRATION/s);
+    assert.deepEqual(Object.keys(preset.modules).sort(), [
+      'cognition',
+      'consolidation',
+      'expression',
+      'foundation',
+      'socialExperience',
+      'supervisor'
+    ]);
+    assert.equal(store.getPresetVersion('2.1.0').checksum, previous.checksum);
     assert.equal(store.getCurrentPresetVersion(), '1.9.2');
   }));
 
@@ -383,14 +404,14 @@ test('publishes an annotation as a child version and can roll back immutably', (
   assert.equal(published.parentVersion, '1.9.2');
   assert.deepEqual(published.annotationIds, ['ann_1']);
   assert.match(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 5);
+  assert.equal(store.listPresetVersions().length, 6);
 
   const rollback = registry.rollback('1.9.1');
   assert.equal(rollback.version, '1.9.4');
   assert.equal(rollback.parentVersion, '1.9.3');
   assert.equal(rollback.rollbackOf, '1.9.1');
   assert.doesNotMatch(registry.compileFor('brain', { stage: 'familiar' }), /撒娇试探时先轻轻追问态度/);
-  assert.equal(store.listPresetVersions().length, 6);
+  assert.equal(store.listPresetVersions().length, 7);
 }));
 
 test('rejects annotations that try to inject hidden biography as known fact', () => withRegistry(registry => {
