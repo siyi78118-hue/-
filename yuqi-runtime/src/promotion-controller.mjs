@@ -170,6 +170,10 @@ export class PromotionController {
     return this.store.promoteCognitionCandidateInternal({ ...input, now: this.clock() });
   }
 
+  startOwnerPreview(input) {
+    return this.store.promoteCognitionOwnerPreviewInternal({ ...input, now: this.clock() });
+  }
+
   graduateCandidate(input) {
     return this.store.graduateCognitionCandidateInternal({ ...input, now: this.clock() });
   }

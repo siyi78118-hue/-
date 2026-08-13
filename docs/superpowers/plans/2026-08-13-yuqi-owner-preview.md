@@ -50,7 +50,7 @@ Extract the existing quality-lane parser into one pure shared module, then make 
 
 - requires exactly four profile keys;
 - parses exact `model/effort` strings without coercion or trimming;
-- accepts only the current closed production model set (`gpt-5.6-sol|gpt-5.6-terra`) and Codex efforts already supported by the release runtime (`none|low|medium|high|xhigh|max`);
+- requires a non-empty, whitespace-stable model name and accepts only Codex efforts already supported by the release runtime (`none|low|medium|high|xhigh|max`);
 - returns immutable `{ model, effort }` records;
 - is invoked before any model call;
 - receives `release.modelProfile` from `runV3ReleaseDraft()` and supplies fast, deep and expression options to `runCognitionV3Turn()`.
@@ -74,6 +74,7 @@ feat: pin Yuqi v3 calls to release model profile
 ## Task 2: Add the owner-preview evidence contract and promotion transaction
 
 **Files:**
+- Create: `yuqi-runtime/src/owner-preview-contract.mjs`
 - Modify: `yuqi-runtime/src/store.mjs`
 - Modify: `yuqi-runtime/src/promotion-controller.mjs`
 - Modify: `yuqi-runtime/test/promotion-controller.test.mjs`

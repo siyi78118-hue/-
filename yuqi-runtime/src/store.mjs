@@ -27,6 +27,11 @@ import {
   proactiveMotiveSourceContext
 } from './life-simulation.mjs';
 import { V3DiagnosticAuthorityConflict } from './v3-diagnostics.mjs';
+import {
+  OWNER_PREVIEW_ROLLOUT_KEY,
+  assertOwnerPreviewSummary,
+  isOwnerPreviewSummary
+} from './owner-preview-contract.mjs';
 import { COMPARISON_CRITICAL_CODES } from './comparison-evaluator.mjs';
 import {
   LIFE_CONTEXT_AUTHORITY_VERSION,
@@ -10192,6 +10197,9 @@ export class YuqiStore {
       const authority = this.loadMaterializedPromotionReportInternal({
         rolloutKey: key, reportId, reportChecksum
       });
+      if (isOwnerPreviewSummary(authority.report.summary)) {
+        throw new Error('owner preview evidence cannot satisfy formal promotion');
+      }
       if (current.candidate_release_id !== authority.candidate.releaseId) {
         throw new Error('candidate release identity conflict');
       }
@@ -10236,6 +10244,105 @@ export class YuqiStore {
     });
   }
 
+  promoteCognitionOwnerPreviewInternal({
+    rolloutKey,
+    expectedRevision,
+    reportId,
+    reportChecksum,
+    authorizationId,
+    sourceHead,
+    now: promotedAt = now()
+  }) {
+    return this.transaction(() => {
+      const key = String(rolloutKey || '');
+      if (key !== OWNER_PREVIEW_ROLLOUT_KEY) {
+        throw new Error('owner preview supports DIRECT_REPLY only');
+      }
+      const current = this.db.prepare(
+        'SELECT * FROM cognition_kind_rollouts WHERE rollout_key = ?'
+      ).get(key);
+      if (!current) throw new RolloutRevisionConflictError();
+      const authority = this.loadMaterializedPromotionReportInternal({
+        rolloutKey: key,
+        reportId,
+        reportChecksum
+      });
+      if (authority.report.reportType !== 'promotion'
+        || authority.report.sourceType !== 'promotion_snapshot'
+        || contentHash(authority.report.summary) !== authority.report.artifactChecksum) {
+        throw new Error('owner preview report authority conflict');
+      }
+      assertOwnerPreviewSummary(authority.report.summary, {
+        candidate: authority.candidate,
+        stable: authority.stable,
+        authorizationId: String(authorizationId || ''),
+        sourceHead: String(sourceHead || '')
+      });
+      const exactReplay = current.current_mode === 'active'
+        && current.candidate_phase === 'canary'
+        && Number(current.revision) === Number(expectedRevision) + 1
+        && current.candidate_release_id === authority.candidate.releaseId
+        && current.last_report_id === String(reportId)
+        && current.last_report_checksum === String(reportChecksum)
+        && current.last_reason_code === 'owner_preview_started';
+      if (exactReplay) return this.getCognitionRollout(key);
+      if (Number(current.revision) !== Number(expectedRevision)
+        || current.current_mode !== 'shadow'
+        || current.candidate_phase !== 'shadow') {
+        throw new RolloutRevisionConflictError('candidate is not in owner preview shadow phase');
+      }
+      if (current.candidate_release_id !== authority.candidate.releaseId) {
+        throw new Error('candidate release identity conflict');
+      }
+      const nextRevision = Number(current.revision) + 1;
+      const nextEpoch = Number(current.canary_epoch) + 1;
+      const updated = this.db.prepare(`
+        UPDATE cognition_kind_rollouts
+        SET current_mode = 'active', rollout_phase = 'canary', revision = ?,
+            candidate_phase = 'canary', canary_epoch = ?,
+            canary_started_count = 0, canary_completed_count = 0,
+            canary_failure_count = 0, canary_started_at = ?,
+            canary_observe_until = ?, last_report_id = ?,
+            last_report_checksum = ?, last_reason_code = 'owner_preview_started',
+            activated_at = ?, updated_at = ?
+        WHERE rollout_key = ? AND revision = ?
+      `).run(
+        nextRevision,
+        nextEpoch,
+        Number(promotedAt),
+        Number(promotedAt) + 48 * 60 * 60 * 1000,
+        String(reportId),
+        String(reportChecksum),
+        Number(promotedAt),
+        Number(promotedAt),
+        key,
+        Number(expectedRevision)
+      );
+      if (Number(updated.changes) !== 1) throw new RolloutRevisionConflictError();
+      this.appendPromotionHistoryInternal({
+        eventId: `promotion_${contentHash({ key, nextRevision, reportId, phase: 'owner-preview' }).slice(0, 24)}`,
+        rolloutKey: key,
+        fromMode: current.current_mode,
+        toMode: 'active',
+        fromPhase: current.rollout_phase,
+        toPhase: 'canary',
+        fromRevision: Number(current.revision),
+        toRevision: nextRevision,
+        actor: 'owner_preview_controller',
+        reasonCode: 'owner_preview_started',
+        reportId,
+        reportChecksum,
+        metadata: {
+          evidenceClass: authority.report.summary.evidenceClass,
+          authorizationId: authority.report.summary.authorizationId,
+          candidateReleaseId: authority.candidate.releaseId
+        },
+        createdAt: promotedAt
+      });
+      return this.getCognitionRollout(key);
+    });
+  }
+
   graduateCognitionCandidateInternal({
     rolloutKey, expectedRevision, reportId, reportChecksum, now: graduatedAt = now()
   }) {
@@ -10251,6 +10358,9 @@ export class YuqiStore {
       const authority = this.loadMaterializedPromotionReportInternal({
         rolloutKey: key, reportId, reportChecksum
       });
+      if (isOwnerPreviewSummary(authority.report.summary)) {
+        throw new Error('owner preview evidence cannot satisfy formal graduation');
+      }
       if (current.candidate_release_id !== authority.candidate.releaseId) {
         throw new Error('candidate release identity conflict');
       }
