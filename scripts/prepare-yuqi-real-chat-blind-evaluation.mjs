@@ -200,10 +200,6 @@ export function prepareRealChatBlindEvaluation({
     schemaVersion: 1,
     sceneIds: scenes.map(scene => scene.sceneId),
     scenesChecksum: contentHash(scenes),
-    sourceAuthority: 'legacy_ra0_confirmed',
-    qualityOnly: true,
-    authorityEvidenceEligible: false,
-    promotionEvidenceEligible: false,
   };
   const output = privateOutputPath(root, outputDir);
   const historyScenesPath = join(output, 'history-scenes.jsonl');
