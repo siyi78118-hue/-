@@ -620,7 +620,6 @@ export async function runQualityReplayFixture({
       verifiedPlan, runId: resumeRun || randomUUID(), sourceHead, releasePair,
       evaluatorVersion, secondaryEvaluatorVersion, createdAt: now(),
     });
-    const outputsByKey = new Map();
     const selectedKey = onlyFinalKey || null;
     const subjectBuilder = subjectFactory || (async item => compileSceneExecutionInput(item.scene));
     const sideExecutor = phaseExecutor || (async ({ side, item, phaseClient }) => {
@@ -635,32 +634,20 @@ export async function runQualityReplayFixture({
         item, dryRun: true, capabilities: { visible: false, actions: false }, side,
       });
       const key = `${item.layer}:${item.sceneId}:${item.repeatIndex}`;
-      const pair = outputsByKey.get(key) || {};
-      outputsByKey.set(key, { ...pair, [side]: value });
-      return value;
+      // Keep the evidence-ineligible fixture on the same phase-output boundary
+      // as the production bridge.  The blind-input builder must never learn a
+      // second, fixture-only result shape.
+      return { [side]: value, authorityId: `quality-fixture:${key}` };
     });
     const blind = async ({ item, finalKey, phase, phaseClient, blindInput }) => {
       if (!phaseClient) throw new Error('fixture phase client required');
-      const pair = outputsByKey.get(finalKey) || {};
-      const evaluationSeed = Number.parseInt(contentHash({
-        sceneId: item.sceneId, repeatIndex: item.repeatIndex
-      }).slice(0, 12), 16);
-      const sceneAnnotation = {
-        sceneId: item.sceneId, severity: item.scene.severity, focus: item.scene.focus,
-        turns: item.scene.turns, requiredChecks: item.scene.mustNotice || [],
-        allowedVariation: item.scene.allowedPersonalityVariation || []
-      };
-      const input = projectBlindEvaluationInput({
-        sceneId: item.sceneId, repeatIndex: item.repeatIndex, evaluationSeed,
-        sceneAnnotation,
-        stable: { output: pair.stable?.draft?.output || pair.stable?.draft || pair.stable || {} },
-        candidate: { output: pair.candidate?.draft?.output || pair.candidate?.draft || pair.candidate || {} },
-      }, { seed: evaluationSeed });
       await phaseClient.runTurn('brain', JSON.stringify(blindInput), {
         model: phase === 'evaluator_primary' ? evaluatorVersion : secondaryEvaluatorVersion,
         effort: 'high', outputSchema: { type: 'object' }
       });
-      return phase === 'evaluator_primary' ? evaluator(input) : evaluatorSecondary(input);
+      return phase === 'evaluator_primary'
+        ? evaluator(blindInput)
+        : evaluatorSecondary(blindInput);
     };
     const result = await runQualityReplayPlanSqlite({
       plan: verifiedPlan, ledgerPath, header, resumeRun, onlyFinalKey: selectedKey,

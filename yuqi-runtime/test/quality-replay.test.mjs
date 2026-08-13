@@ -179,8 +179,8 @@ test('orphan running phase with zero calls becomes uncertain without replaying t
   const seededSubject = { finalKey, semanticInput: { finalKey },
     semanticInputChecksum: contentHash({ finalKey }) };
   const phaseInput = { runId, finalKey, phase: 'stable_execution',
-    subjectChecksum: contentHash(seededSubject), authorityInputChecksum: seededSubject.semanticInputChecksum,
-    input: { finalKey, subjectChecksum: contentHash(seededSubject),
+    subjectChecksum: seededSubject.semanticInputChecksum, authorityInputChecksum: seededSubject.semanticInputChecksum,
+    input: { finalKey, subjectChecksum: seededSubject.semanticInputChecksum,
       authorityInputChecksum: seededSubject.semanticInputChecksum }, now: 2 };
   const seed = new QualityReplayLedger(ledgerPath);
   seed.createOrOpenRun(header);
@@ -539,7 +539,7 @@ test('replay execution uses one dry-run executor and appends one finalized resul
       async executeTurn(request) {
         assert.equal(request.dryRun, true);
         assert.deepEqual(request.capabilities, { visible: false, actions: false });
-        return { draft: { output: { terminalDisposition: 'visible', replyParts: [], actions: [] } } };
+        return { draft: { action: 'send', reply: 'fixture reply' } };
       }
     },
     maxItems: 1,
@@ -612,7 +612,7 @@ test('replay rejects a source HEAD or dirty-tree change detected after execution
       executor: {
         async executeTurn() {
           writeFileSync(join(sourceRoot, 'dirty-during-replay.txt'), 'changed while running\n');
-          return { draft: { output: { terminalDisposition: 'visible', replyParts: [], actions: [] } } };
+          return { draft: { action: 'send', reply: 'fixture reply' } };
         }
       },
       evaluator: async () => evaluation,
@@ -646,7 +646,7 @@ test('severe blind findings require agreement from two independent evaluators', 
       candidate: { releaseId: 'candidate', releaseChecksum: 'candidate-checksum' }
     },
     executor: { async executeTurn() {
-      return { draft: { output: { terminalDisposition: 'visible', replyParts: [], actions: [] } } };
+      return { draft: { action: 'send', reply: 'fixture reply' } };
     } },
     maxItems: 1,
     evaluator: async () => critical,
@@ -661,7 +661,7 @@ test('severe blind findings require agreement from two independent evaluators', 
       candidate: { releaseId: 'candidate', releaseChecksum: 'candidate-checksum' }
     },
     executor: { async executeTurn() {
-      return { draft: { output: { terminalDisposition: 'visible', replyParts: [], actions: [] } } };
+      return { draft: { action: 'send', reply: 'fixture reply' } };
     } },
     maxItems: 1,
     evaluator: async () => benign,
@@ -690,7 +690,7 @@ test('replay execution persists append-only attempts, finals, checksums, latency
       candidate: { releaseId: 'candidate', releaseChecksum: 'candidate-checksum' }
     },
     executor: { async executeTurn() {
-      return { draft: { output: { terminalDisposition: 'visible', replyParts: [], actions: [] } } };
+      return { draft: { action: 'send', reply: 'fixture reply' } };
     } },
     maxItems: 1,
     evaluator: async () => evaluation,
