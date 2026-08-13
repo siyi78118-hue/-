@@ -321,6 +321,62 @@ test('legacy_ra0_confirmed explicit source authority accepts synthetic confirmed
   }
 });
 
+test('legacy confirmed PC character output may omit phone device identity without weakening user provenance', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-pc-output-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database, { mutate: store => {
+      const rows = store.db.prepare("SELECT * FROM messages WHERE speaker_type = 'character'").all();
+      const update = store.db.prepare('UPDATE messages SET origin = ?, device_id = NULL, device_seq = NULL, checksum = ? WHERE message_id = ?');
+      const updateDelivery = store.db.prepare('UPDATE cloud_deliveries SET payload_json = ?, checksum = ? WHERE turn_id = ?');
+      for (const row of rows) {
+        const projected = { ...row, origin: 'codex', device_id: null, device_seq: null };
+        const checksum = legacyMessageRowChecksum(projected);
+        update.run(projected.origin, checksum, row.message_id);
+        const reply = {
+          messageId: projected.message_id, turnId: projected.turn_id, characterId: projected.character_id,
+          speakerId: projected.speaker_id, speakerType: projected.speaker_type, recipientId: projected.recipient_id,
+          content: projected.content, sentAt: projected.sent_at, origin: projected.origin,
+          deviceId: '', deviceSeq: null, batchId: '', batchSequence: null, checksum
+        };
+        const payload = {
+          action: 'send', allowFallback: false, deliveryItems: [{
+            id: reply.messageId, kind: 'message',
+            checksum: contentHash({ messageId: reply.messageId, content: reply.content, recipientId: reply.recipientId })
+          }],
+          displayStage: '', errorCode: '', momentAction: null, ok: true, origin: 'codex', paymentAction: null,
+          recoveryAckSeq: 0, relationshipStageAction: null, reply, retryAfterMs: 0, rolePlanOperations: [],
+          route: 'fast', routeReasons: [], stageEffort: '', stageElapsedMs: 0, stageModel: '',
+          state: 'committed', technicalStage: 'committed', terminal: true, totalElapsedMs: 1,
+          turnId: projected.turn_id, updatedAt: projected.sent_at
+        };
+        updateDelivery.run(JSON.stringify(payload), contentHash(payload), projected.turn_id);
+      }
+    } });
+    const result = JSON.parse(runExtractor(database, root, ['--source-authority', 'legacy_ra0_confirmed']));
+    assert.equal(result.count, 30);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy sliding-pair extraction yields thirty overlapping real-chat contexts without duplicating a target turn', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-legacy-ra0-sliding-pairs-'));
+  const database = join(root, 'history.sqlite');
+  try {
+    createLegacyRa0Fixture(database, { windows: 1, turnsPerWindow: 31 });
+    const result = JSON.parse(runExtractor(database, root, [
+      '--source-authority', 'legacy_ra0_confirmed', '--window-mode', 'sliding_pairs'
+    ]));
+    const candidates = readFileSync(result.candidatesPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    assert.equal(candidates.length, 30);
+    assert.equal(candidates.every(candidate => candidate.turns.length === 4), true);
+    assert.equal(new Set(candidates.map(candidate => candidate.sourceWindowChecksum)).size, 30);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('legacy_ra0_confirmed rejects malformed delivery/message/batch provenance before publication', () => {
   const cases = [
     ['mailboxed delivery', store => store.db.prepare("UPDATE cloud_deliveries SET state = 'mailboxed', confirmed_at = NULL").run(), /delivery|state|window|eligible/i],

@@ -768,6 +768,17 @@ const LEGACY_RA0_PROVENANCE = Object.freeze({
 const LEGACY_DELIVERY_KEYS = Object.freeze([
   'content', 'contentSha256', 'messageId', 'recipientId', 'speakerId', 'speakerType', 'turnId'
 ]);
+const LEGACY_STATUS_DELIVERY_KEYS = Object.freeze([
+  'action', 'allowFallback', 'displayStage', 'errorCode', 'momentAction', 'ok', 'origin',
+  'paymentAction', 'recoveryAckSeq', 'relationshipStageAction', 'reply', 'retryAfterMs',
+  'rolePlanOperations', 'route', 'routeReasons', 'stageEffort', 'stageElapsedMs',
+  'stageModel', 'state', 'technicalStage', 'terminal', 'totalElapsedMs', 'turnId', 'updatedAt'
+]);
+const LEGACY_STATUS_REPLY_KEYS = Object.freeze([
+  'batchId', 'batchSequence', 'characterId', 'checksum', 'content', 'deviceId', 'deviceSeq',
+  'messageId', 'origin', 'recipientId', 'sentAt', 'speakerId', 'speakerType', 'turnId'
+]);
+const LEGACY_STATUS_DELIVERY_ITEM_KEYS = Object.freeze(['checksum', 'id', 'kind']);
 
 function assertSafeInteger(value, label, { positive = false } = {}) {
   if (!Number.isSafeInteger(value) || (positive && value <= 0)) throw new Error(`${label} has invalid native time`);
@@ -889,14 +900,63 @@ function assertLegacyDelivery(database, turn, characterMessage) {
   if (delivery.delivered_at < characterMessage.sent_at) throw new Error(`legacy delivery/character time conflict for ${turn.turn_id}`);
   if (delivery.confirmed_at < delivery.delivered_at) throw new Error('legacy delivery time order conflict');
   const payload = jsonValue(delivery.payload_json, `legacy delivery ${turn.turn_id}`);
-  assertExactKeys(payload, LEGACY_DELIVERY_KEYS, `legacy delivery ${turn.turn_id}`);
   if (typeof delivery.checksum !== 'string' || !HEX64.test(delivery.checksum)
     || delivery.checksum !== contentHash(payload)) throw new Error(`legacy delivery checksum conflict for ${turn.turn_id}`);
-  if (payload.turnId !== turn.turn_id || payload.messageId !== characterMessage.message_id
-    || payload.speakerId !== characterMessage.speaker_id || payload.speakerType !== 'character'
-    || payload.recipientId !== characterMessage.recipient_id || payload.content !== characterMessage.content
-    || payload.contentSha256 !== rawSha256(String(characterMessage.content))) {
-    throw new Error(`legacy delivery payload/message conflict for ${turn.turn_id}`);
+  const keySignature = Object.keys(payload).sort().join(',');
+  const simpleSignature = [...LEGACY_DELIVERY_KEYS].sort().join(',');
+  const statusSignature = [...LEGACY_STATUS_DELIVERY_KEYS].sort().join(',');
+  const statusWithItemsSignature = [...LEGACY_STATUS_DELIVERY_KEYS, 'deliveryItems'].sort().join(',');
+  if (keySignature === simpleSignature) {
+    if (payload.turnId !== turn.turn_id || payload.messageId !== characterMessage.message_id
+      || payload.speakerId !== characterMessage.speaker_id || payload.speakerType !== 'character'
+      || payload.recipientId !== characterMessage.recipient_id || payload.content !== characterMessage.content
+      || payload.contentSha256 !== rawSha256(String(characterMessage.content))) {
+      throw new Error(`legacy delivery payload/message conflict for ${turn.turn_id}`);
+    }
+  } else if (keySignature === statusSignature || keySignature === statusWithItemsSignature) {
+    assertExactKeys(payload.reply, LEGACY_STATUS_REPLY_KEYS, `legacy status reply ${turn.turn_id}`);
+    if (payload.ok !== true || payload.terminal !== true || payload.action !== 'send'
+      || !['committed', 'delivered', 'completed'].includes(payload.state)
+      || payload.turnId !== turn.turn_id || payload.reply.turnId !== turn.turn_id
+      || payload.reply.messageId !== characterMessage.message_id
+      || payload.reply.characterId !== turn.character_id
+      || payload.reply.speakerId !== characterMessage.speaker_id
+      || payload.reply.speakerType !== 'character'
+      || payload.reply.recipientId !== characterMessage.recipient_id
+      || payload.reply.content !== characterMessage.content
+      || payload.reply.sentAt !== characterMessage.sent_at
+      || payload.reply.origin !== characterMessage.origin
+      || payload.reply.deviceId !== (characterMessage.device_id ?? '')
+      || payload.reply.deviceSeq !== characterMessage.device_seq
+      || payload.reply.checksum !== characterMessage.checksum) {
+      throw new Error(`legacy status delivery payload/message conflict for ${turn.turn_id}`);
+    }
+    if (Object.hasOwn(payload, 'deliveryItems')) {
+      if (!Array.isArray(payload.deliveryItems) || payload.deliveryItems.length < 1) {
+        throw new Error(`legacy status delivery items conflict for ${turn.turn_id}`);
+      }
+      const identities = new Set();
+      let characterItemCount = 0;
+      for (const item of payload.deliveryItems) {
+        assertExactKeys(item, LEGACY_STATUS_DELIVERY_ITEM_KEYS, `legacy status delivery item ${turn.turn_id}`);
+        if (typeof item.id !== 'string' || item.id.length === 0 || typeof item.kind !== 'string'
+          || item.kind.length === 0 || typeof item.checksum !== 'string' || !HEX64.test(item.checksum)
+          || identities.has(`${item.kind}:${item.id}`)) {
+          throw new Error(`legacy status delivery item identity conflict for ${turn.turn_id}`);
+        }
+        identities.add(`${item.kind}:${item.id}`);
+        const expectedDeliveryItemChecksum = contentHash({
+          messageId: characterMessage.message_id,
+          content: characterMessage.content,
+          recipientId: characterMessage.recipient_id
+        });
+        if (item.kind === 'message' && item.id === characterMessage.message_id
+          && item.checksum === expectedDeliveryItemChecksum) characterItemCount += 1;
+      }
+      if (characterItemCount !== 1) throw new Error(`legacy status delivery message item conflict for ${turn.turn_id}`);
+    }
+  } else {
+    throw new Error(`legacy delivery ${turn.turn_id} has unknown or missing fields`);
   }
   return { ...delivery, payload };
 }
@@ -975,7 +1035,15 @@ function assertLegacyRa0Turn(database, turn, seenSourceMessages) {
     throw new Error(`legacy character message authority conflict for ${turn.turn_id}`);
   }
   assertNativeSafeInteger(characterMessage.sent_at, 'legacy character sentAt');
-  assertNativeSafeInteger(characterMessage.device_seq, 'legacy character deviceSeq');
+  const pcGeneratedCharacter = characterMessage.origin === 'codex'
+    && characterMessage.device_id == null && characterMessage.device_seq == null;
+  const deviceGeneratedCharacter = typeof characterMessage.device_id === 'string'
+    && characterMessage.device_id.length > 0
+    && typeof characterMessage.device_seq === 'number'
+    && Number.isSafeInteger(characterMessage.device_seq);
+  if (!pcGeneratedCharacter && !deviceGeneratedCharacter) {
+    throw new Error(`legacy character message device provenance conflict for ${turn.turn_id}`);
+  }
   const batch = assertLegacyBatch(database, turn, sourceMessage);
   if (characterMessage.sent_at < batch.committed_at) throw new Error(`legacy character time order conflict for ${turn.turn_id}`);
   const delivery = assertLegacyDelivery(database, turn, characterMessage);
@@ -1025,34 +1093,7 @@ function buildLegacyCandidateTurn(closure, mapping) {
   };
 }
 
-function buildLegacyCandidates(database, entries) {
-  const candidates = [];
-  let current = null;
-  const flush = () => {
-    if (current && current.turnRows.length >= 2) candidates.push(current);
-    current = null;
-  };
-  for (const entry of entries) {
-    if (!entry.closure) {
-      flush();
-      continue;
-    }
-    const row = { ...entry.turn, closure: entry.closure };
-    const closure = entry.closure;
-    const startedAt = Number(closure.batch.started_at);
-    const endedAt = Math.max(closure.batch.committed_at, closure.characterMessage.sent_at, closure.delivery.confirmed_at);
-    const gap = current && startedAt - current.endedAt;
-    const same = current && current.roleId === row.character_id && current.laneKey === 'private_chat'
-      && gap >= 0 && gap <= 15 * 60 * 1000;
-    if (!same || current.turnRows.length >= 6) {
-      flush();
-      current = { roleId: row.character_id, laneKey: 'private_chat', startedAt, endedAt, turnRows: [] };
-    }
-    current.turnRows.push(row);
-    current.endedAt = endedAt;
-  }
-  flush();
-  return candidates.map((window, index) => {
+function projectLegacyWindow(window, index) {
     const raw = {
       roleId: window.roleId, laneKey: window.laneKey, startedAt: window.startedAt,
       endedAt: window.endedAt, turns: window.turnRows.map(row => ({
@@ -1081,7 +1122,51 @@ function buildLegacyCandidates(database, entries) {
       ...LEGACY_RA0_PROVENANCE
     };
     return candidate;
-  });
+}
+
+function buildLegacyCandidates(database, entries, { windowMode = 'disjoint' } = {}) {
+  if (!['disjoint', 'sliding_pairs'].includes(windowMode)) throw new Error(`unsupported legacy window mode: ${windowMode}`);
+  const windows = [];
+  let current = null;
+  const flush = () => {
+    if (current && current.turnRows.length >= 2) {
+      if (windowMode === 'sliding_pairs') {
+        for (let index = 1; index < current.turnRows.length; index += 1) {
+          const pair = current.turnRows.slice(index - 1, index + 1);
+          windows.push({
+            roleId: current.roleId, laneKey: current.laneKey,
+            startedAt: pair[0].closure.batch.started_at,
+            endedAt: Math.max(pair[1].closure.batch.committed_at, pair[1].closure.characterMessage.sent_at, pair[1].closure.delivery.confirmed_at),
+            turnRows: pair
+          });
+        }
+      } else {
+        windows.push(current);
+      }
+    }
+    current = null;
+  };
+  for (const entry of entries) {
+    if (!entry.closure) {
+      flush();
+      continue;
+    }
+    const row = { ...entry.turn, closure: entry.closure };
+    const closure = entry.closure;
+    const startedAt = Number(closure.batch.started_at);
+    const endedAt = Math.max(closure.batch.committed_at, closure.characterMessage.sent_at, closure.delivery.confirmed_at);
+    const gap = current && startedAt - current.endedAt;
+    const same = current && current.roleId === row.character_id && current.laneKey === 'private_chat'
+      && gap >= 0 && gap <= 15 * 60 * 1000;
+    if (!same || (windowMode === 'disjoint' && current.turnRows.length >= 6)) {
+      flush();
+      current = { roleId: row.character_id, laneKey: 'private_chat', startedAt, endedAt, turnRows: [] };
+    }
+    current.turnRows.push(row);
+    current.endedAt = endedAt;
+  }
+  flush();
+  return windows.map(projectLegacyWindow);
 }
 
 function authorityWindowProjection(database, rows) {
@@ -1307,7 +1392,7 @@ function atomicWritePair(output, outputText, manifest, manifestText, { faultAt =
   }
 }
 
-export function extractRealHistoryScenes({ databasePath, outputPath, manifestPath, candidatesPath, labelsPath, limit = 30, root = process.cwd(), sourceAuthority = 'canonical_ra1' }) {
+export function extractRealHistoryScenes({ databasePath, outputPath, manifestPath, candidatesPath, labelsPath, limit = 30, root = process.cwd(), sourceAuthority = 'canonical_ra1', windowMode = 'disjoint' }) {
   if (!databasePath || !isAbsolute(databasePath)) throw new Error('databasePath must be an absolute path');
   if (!Number.isSafeInteger(limit) || limit !== 30) throw new Error('real history extraction requires exactly 30 scenes');
   if (!['canonical_ra1', 'legacy_ra0_confirmed'].includes(sourceAuthority)) throw new Error(`unsupported source authority: ${sourceAuthority}`);
@@ -1319,7 +1404,7 @@ export function extractRealHistoryScenes({ databasePath, outputPath, manifestPat
   try {
     assertReadonlyV15Schema(database);
     const candidates = sourceAuthority === 'legacy_ra0_confirmed'
-      ? buildLegacyCandidates(database, legacyEligibleRows(database))
+      ? buildLegacyCandidates(database, legacyEligibleRows(database), { windowMode })
       : (assertAuthorityClosure(database), buildCandidates(database, eligibleRows(database)));
     if (candidates.length < limit) throw new Error(`need at least ${limit} eligible 4..12 turn windows; got ${candidates.length}`);
     const selectedCandidates = candidates.slice(0, limit);
@@ -1387,7 +1472,7 @@ if (isMain()) {
   const result = extractRealHistoryScenes({
     databasePath: resolve(databasePath), root, labelsPath: typeof args.get('labels') === 'string' ? resolve(args.get('labels')) : null,
     outputPath: args.get('out'), manifestPath: args.get('manifest'), candidatesPath: args.get('candidates'), limit: Number(args.get('limit') || 30),
-    sourceAuthority: args.get('source-authority') || 'canonical_ra1'
+    sourceAuthority: args.get('source-authority') || 'canonical_ra1', windowMode: args.get('window-mode') || 'disjoint'
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
