@@ -169,3 +169,59 @@ test('read-only ledger export replaces exact and substantive pairs before produc
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('human review combines non-overlapping successful pairs from audited supplemental runs', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-real-chat-supplement-'));
+  try {
+    const database = join(root, 'source.sqlite');
+    writeFileSync(database, 'read-only-source-fixture', 'utf8');
+    const windows = fixtureWindows();
+    const candidates = join(root, 'candidates.jsonl');
+    writeFileSync(candidates, `${windows.map(value => JSON.stringify(value)).join('\n')}\n`, 'utf8');
+    const selection = join(root, 'selection.json');
+    writeJson(selection, fixtureSelection(windows, sourceSha256(database)));
+    const outputDir = join(root, 'private-output');
+    const prepared = prepareRealChatBlindEvaluation({ root, databasePath: database, candidatesPath: candidates, selectionPath: selection, outputDir });
+    const pool = JSON.parse(readFileSync(prepared.poolPath, 'utf8'));
+    const sources = [
+      { ledgerPath: join(root, 'main.sqlite'), runId: 'run-main' },
+      { ledgerPath: join(root, 'supplement.sqlite'), runId: 'run-supplement' },
+    ];
+    for (const source of sources) {
+      const db = new DatabaseSync(source.ledgerPath);
+      db.exec(`CREATE TABLE quality_phases(
+        run_id TEXT NOT NULL, final_key TEXT NOT NULL, phase TEXT NOT NULL,
+        state TEXT NOT NULL, output_json TEXT, PRIMARY KEY(run_id,final_key,phase)
+      )`);
+      db.close();
+    }
+    const main = new DatabaseSync(sources[0].ledgerPath);
+    const supplement = new DatabaseSync(sources[1].ledgerPath);
+    pool.items.forEach((item, index) => insertSucceededPair(
+      index === 2 ? supplement : main,
+      index === 2 ? sources[1].runId : sources[0].runId,
+      `history:${item.sceneId}:0`, index + 10,
+    ));
+    main.close();
+    supplement.close();
+    const decisionsPath = join(root, 'decisions.json');
+    writeJson(decisionsPath, {
+      version: 1,
+      items: Object.fromEntries(pool.items.map(item => [item.candidateId,
+        { semanticStanceDiffers: true, concreteContentOrActionDiffers: false, feltStyleOrEmotionDiffers: false }])),
+    });
+
+    const result = exportRealChatHumanReview({
+      root, executionSources: sources, poolPath: prepared.poolPath,
+      historyScenesPath: prepared.historyScenesPath,
+      decisionsPath, outputDir, seed: 'supplement-fixture-seed',
+    });
+
+    assert.equal(result.scoredCount, 12);
+    const audit = JSON.parse(readFileSync(result.discriminabilityAuditPath, 'utf8'));
+    assert.deepEqual(audit.sourceRuns, ['run-main', 'run-supplement']);
+    assert.equal(audit.selected.some(item => item.sourceRunId === 'run-supplement'), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -89,46 +89,71 @@ function replyText(output) {
   return output.replyParts.map(part => part.text).join('\n');
 }
 
-function loadExecutionPairs({ ledgerPath, runId, pool, decisions }) {
-  const database = new DatabaseSync(ledgerPath, { readOnly: true });
+function normalizeExecutionSources({ ledgerPath, runId, executionSources }) {
+  const sources = executionSources === undefined
+    ? [{ ledgerPath, runId }]
+    : executionSources;
+  if (!Array.isArray(sources) || !sources.length
+    || sources.some(source => !source || typeof source !== 'object' || Array.isArray(source)
+      || Object.keys(source).sort().join(',') !== 'ledgerPath,runId'
+      || !isAbsolute(source.ledgerPath) || typeof source.runId !== 'string' || !source.runId)
+    || new Set(sources.map(source => source.runId)).size !== sources.length
+    || new Set(sources.map(source => resolve(source.ledgerPath))).size !== sources.length) {
+    throw new Error('human review execution sources conflict');
+  }
+  return sources.map(source => ({ ledgerPath: resolve(source.ledgerPath), runId: source.runId }));
+}
+
+function loadExecutionPairs({ sources, pool, decisions }) {
   const pairsByCandidateId = {};
   const technicalFailures = [];
+  const opened = sources.map(source => {
+    const database = new DatabaseSync(source.ledgerPath, { readOnly: true });
+    return {
+      ...source,
+      database,
+      statement: database.prepare(`
+        SELECT phase,state,output_json FROM quality_phases
+        WHERE run_id=? AND final_key=? AND phase IN ('stable_execution','candidate_execution')
+        ORDER BY phase
+      `),
+    };
+  });
   try {
-    const statement = database.prepare(`
-      SELECT phase,state,output_json FROM quality_phases
-      WHERE run_id=? AND final_key=? AND phase IN ('stable_execution','candidate_execution')
-      ORDER BY phase
-    `);
     for (const item of pool.items) {
       const finalKey = `history:${item.sceneId}:0`;
-      const rows = statement.all(runId, finalKey);
-      const byPhase = Object.fromEntries(rows.map(row => [row.phase, row]));
-      if (!byPhase.stable_execution || !byPhase.candidate_execution
-        || byPhase.stable_execution.state !== 'succeeded'
-        || byPhase.candidate_execution.state !== 'succeeded') {
-        technicalFailures.push({ candidateId: item.candidateId, finalKey, reason: 'execution_phase_incomplete' });
-        continue;
+      const successes = [];
+      const outputErrors = [];
+      for (const source of opened) {
+        const rows = source.statement.all(source.runId, finalKey);
+        const byPhase = Object.fromEntries(rows.map(row => [row.phase, row]));
+        if (byPhase.stable_execution?.state !== 'succeeded'
+          || byPhase.candidate_execution?.state !== 'succeeded') continue;
+        try {
+          const stableOutput = projectExecutionOutput(JSON.parse(byPhase.stable_execution.output_json), 'stable');
+          const candidateOutput = projectExecutionOutput(JSON.parse(byPhase.candidate_execution.output_json), 'candidate');
+          successes.push({ sourceRunId: source.runId, stableOutput, candidateOutput });
+        } catch (error) {
+          outputErrors.push(String(error?.message || error));
+        }
       }
-      try {
-        const stableOutput = projectExecutionOutput(JSON.parse(byPhase.stable_execution.output_json), 'stable');
-        const candidateOutput = projectExecutionOutput(JSON.parse(byPhase.candidate_execution.output_json), 'candidate');
+      if (successes.length === 1) {
+        const [{ sourceRunId, stableOutput, candidateOutput }] = successes;
         pairsByCandidateId[item.candidateId] = {
-          answerA: replyText(stableOutput),
-          answerB: replyText(candidateOutput),
-          checks: decisions.items[item.candidateId],
-          stableOutput,
-          candidateOutput,
+          answerA: replyText(stableOutput), answerB: replyText(candidateOutput),
+          checks: decisions.items[item.candidateId], stableOutput, candidateOutput, sourceRunId,
         };
-      } catch (error) {
+      } else {
         technicalFailures.push({
           candidateId: item.candidateId,
           finalKey,
-          reason: String(error?.message || error),
+          reason: successes.length > 1 ? 'duplicate_successful_execution_sources'
+            : outputErrors[0] || 'execution_phase_incomplete',
         });
       }
     }
   } finally {
-    database.close();
+    for (const source of opened) source.database.close();
   }
   return { pairsByCandidateId, technicalFailures };
 }
@@ -154,18 +179,21 @@ function scoreTemplate(publicPairs) {
 
 export function exportRealChatHumanReview({
   root = process.cwd(), ledgerPath, runId, poolPath, historyScenesPath,
-  decisionsPath, outputDir, seed,
+  executionSources, decisionsPath, outputDir, seed,
 } = {}) {
-  if (!ledgerPath || !isAbsolute(ledgerPath) || typeof runId !== 'string' || !runId
-    || !poolPath || !historyScenesPath || !decisionsPath || typeof seed !== 'string' || !seed) {
+  if (!poolPath || !historyScenesPath || !decisionsPath || typeof seed !== 'string' || !seed) {
     throw new Error('human review export paths and seed are required');
   }
+  const sources = normalizeExecutionSources({ ledgerPath, runId, executionSources });
+  const sourceRuns = sources.map(source => source.runId);
+  const evaluationRunId = sourceRuns.length === 1 ? sourceRuns[0]
+    : `bundle_${contentHash(sourceRuns).slice(0, 24)}`;
   const pool = validateRealChatCandidatePool(readJson(poolPath, 'candidate pool'));
   const decisions = assertDecisions(readJson(decisionsPath, 'discriminability decisions'), pool);
   const scenes = readJsonl(historyScenesPath, 'history scenes');
   const scenesById = new Map(scenes.map(scene => [scene.sceneId, scene]));
   if (scenes.length !== 30 || scenesById.size !== 30) throw new Error('history scene set conflict');
-  const { pairsByCandidateId, technicalFailures } = loadExecutionPairs({ ledgerPath, runId, pool, decisions });
+  const { pairsByCandidateId, technicalFailures } = loadExecutionPairs({ sources, pool, decisions });
   const selection = selectDiscriminatingPairs({ pool, pairsByCandidateId });
   const sealed = selection.selected.map(item => {
     const scene = scenesById.get(item.sceneId);
@@ -185,7 +213,7 @@ export function exportRealChatHumanReview({
   });
   const publicPairs = sealed.map(item => item.publicPair);
   const mappingItems = sealed.map(item => item.sealedMapping);
-  const mappingBasis = { version: 1, runId, items: mappingItems };
+  const mappingBasis = { version: 1, runId: evaluationRunId, items: mappingItems };
   const mapping = { ...mappingBasis, mappingChecksum: contentHash(mappingBasis) };
   const exactReplacementCount = selection.replacements
     .filter(item => item.classification.outcome === 'replace_exact').length;
@@ -193,11 +221,13 @@ export function exportRealChatHumanReview({
     .filter(item => item.classification.outcome === 'replace_substantive').length;
   const audit = {
     version: 1,
-    runId,
+    runId: evaluationRunId,
+    sourceRuns,
     selected: selection.selected.map(item => ({
       candidateId: item.candidateId,
       sceneId: item.sceneId,
       category: item.category,
+      sourceRunId: item.pair.sourceRunId,
       classification: item.classification,
     })),
     replacements: selection.replacements,
@@ -206,7 +236,8 @@ export function exportRealChatHumanReview({
   };
   const summary = {
     version: 1,
-    runId,
+    runId: evaluationRunId,
+    sourceRuns,
     scoredCount: publicPairs.length,
     candidatePoolCount: pool.items.length,
     executedPairCount: Object.keys(pairsByCandidateId).length,
