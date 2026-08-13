@@ -109,6 +109,8 @@ export function deidentifyRealChatWindow(window, options = {}) {
     for (const item of replacements) {
       text = text.replace(new RegExp(replacementPattern(item.value), 'gu'), item.placeholder);
     }
+    text = text.replace(/messageId=[^｜\]】\s]+/gu, 'messageId=[消息引用]');
+    text = text.replace(/speakerId=[^｜\]】\s]+/gu, 'speakerId=[说话者]');
     text = stableReplace(text, 'email', /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/giu);
     text = stableReplace(text, 'link', /https?:\/\/[^\s]+/giu);
     text = stableReplace(text, 'phone', /(?<!\d)1[3-9]\d{9}(?!\d)/gu);

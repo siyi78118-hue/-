@@ -64,7 +64,7 @@ test('de-identification replaces configured names and common direct identifiers 
         { messageId: 'm2', type: 'text', text: '邮箱 a.person@example.com，网址 https://example.com/a' },
       ] },
       { speaker: 'assistant', batch: [
-        { messageId: 'm3', type: 'text', text: '知道了，小周。' },
+        { messageId: 'm3', type: 'text', text: '【引用元数据｜messageId=native_turn_secret_123｜speakerType=user｜speakerId=user】知道了，小周。' },
       ] },
     ],
   };
@@ -74,7 +74,7 @@ test('de-identification replaces configured names and common direct identifiers 
   assert.deepEqual(redacted.turns.map(turn => turn.batch.map(item => item.messageId)), [['m1', 'm2'], ['m3']]);
   assert.match(redacted.turns[0].batch[0].text, /^\[称呼1\]，我手机号是 \[手机号1\]$/);
   assert.equal(redacted.turns[0].batch[1].text, '邮箱 [邮箱1]，网址 [链接1]');
-  assert.equal(redacted.turns[1].batch[0].text, '知道了，[称呼1]。');
+  assert.equal(redacted.turns[1].batch[0].text, '【引用元数据｜messageId=[消息引用]｜speakerType=user｜speakerId=[说话者]】知道了，[称呼1]。');
   assert.equal(JSON.stringify(redacted).includes('13812345678'), false);
   assert.equal(JSON.stringify(redacted).includes('example.com'), false);
 });
