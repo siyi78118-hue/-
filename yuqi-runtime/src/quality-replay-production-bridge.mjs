@@ -80,6 +80,7 @@ function openImmutableReadOnly(databasePath) {
 }
 const CONTEXT_BINDINGS = new WeakMap();
 const CONTEXT_PHASE_BINDINGS = new WeakMap();
+const CONTEXT_PLAN_CHECKSUMS = new WeakMap();
 const QUALITY_PRODUCTION_CONFIG_BRAND = new WeakSet();
 const QUALITY_PRODUCTION_CONFIG_STATE = new WeakMap();
 const QUALITY_PRODUCTION_INPUT_PATHS = new WeakMap();
@@ -2102,6 +2103,7 @@ export function createQualityProductionContext(config = {}) {
     publicationResults: new Map(),
     cleanupErrors: [],
   };
+  CONTEXT_PLAN_CHECKSUMS.set(context, String(config.planChecksum || ''));
   const finishStoresAndTemps = () => {
     const errors = [];
     for (const store of context.ownedStores) {
@@ -2192,6 +2194,9 @@ export async function prepareQualitySubject(context, subject) {
   if (typeof context.config.planChecksum !== 'string'
     || !/^[a-f0-9]{64}$/.test(context.config.planChecksum)) {
     throw new Error('quality plan checksum is required');
+  }
+  if (context.config.planChecksum !== CONTEXT_PLAN_CHECKSUMS.get(context)) {
+    throw new Error('quality plan checksum conflict');
   }
   if (!context.seedStore || !context.seedRuntime) throw new Error('seed store/runtime is required');
   assertV15Store(context.seedStore, 'seed');
