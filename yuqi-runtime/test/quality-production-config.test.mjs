@@ -106,7 +106,32 @@ function buildPlan() {
   return JSON.parse(readFileSync(join(process.cwd(), 'artifacts/yuqi-lived-agency-v3/task25f-plan-preview.json'), 'utf8'));
 }
 
-function createGitFixture({ dirty = false } = {}) {
+function buildPrivateHistoryPlan() {
+  const plan = structuredClone(buildPlan());
+  const historyItems = plan.items.filter(item => item.layer === 'history');
+  historyItems.forEach((item, index) => {
+    item.scene.sceneId = `private_real_history_${String(index).padStart(2, '0')}`;
+    item.sceneId = item.scene.sceneId;
+  });
+  plan.finalKeys.historyFinalKeys = historyItems.map(item => `history:${item.sceneId}:0`);
+  plan.historyManifest = {
+    schemaVersion: 1,
+    sceneIds: historyItems.map(item => item.sceneId),
+    scenesChecksum: contentHash(historyItems.map(item => item.scene)),
+  };
+  plan.commitments.historyScenesChecksum = plan.historyManifest.scenesChecksum;
+  plan.commitments.itemsChecksum = contentHash(plan.items);
+  plan.planChecksum = contentHash({
+    version: plan.version,
+    planType: plan.planType,
+    finalKeys: plan.finalKeys,
+    commitments: plan.commitments,
+    historyManifest: plan.historyManifest,
+  });
+  return plan;
+}
+
+function createGitFixture({ dirty = false, plan = buildPlan() } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'yuqi-quality-production-config-'));
   TEMP_FIXTURES.add(root);
   mkdirSync(join(root, PRIVATE), { recursive: true });
@@ -119,7 +144,6 @@ function createGitFixture({ dirty = false } = {}) {
   execFileSync('git', ['commit', '-qm', 'fixture'], { cwd: root });
   execFileSync('git', ['checkout', '--detach', '-q', 'HEAD'], { cwd: root });
   const sourceHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
-  const plan = buildPlan();
   const planBytes = Buffer.from(JSON.stringify(plan));
   writeFileSync(join(root, PRIVATE, 'quality-replay-plan.json'), planBytes);
   const seedPath = join(root, PRIVATE, 'seed.sqlite');
@@ -398,6 +422,17 @@ test('production config creates a data-only four-lane run authority', () => {
   assert.notEqual(authority.attestation.evaluatorPrimary.evaluatorId,
     authority.attestation.evaluatorSecondary.evaluatorId);
   assert.equal(Object.values(authority).some(value => value && typeof value === 'object' && typeof value.runTurn === 'function'), false);
+});
+
+test('direct production authority accepts a verified private history layer and its own plan checksum', () => {
+  const fixture = createGitFixture({ plan: buildPrivateHistoryPlan() });
+  const descriptor = createQualityReplayRunAuthority(inputs(fixture));
+  const direct = createQualityProductionExecutionAuthority({
+    descriptor,
+    materials: bridgeMaterialsFromFixture(fixture),
+    sourceRootDir: fixture.root,
+  });
+  assert.equal(qualityRunAuthorityProductionConfig(direct).planChecksum, fixture.plan.planChecksum);
 });
 
 test('bridge authority rejects a self-consistent final-key substitution against the frozen plan', () => {

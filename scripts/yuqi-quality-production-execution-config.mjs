@@ -7,7 +7,10 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { canonicalJson, contentHash } from '../yuqi-runtime/src/protocol.mjs';
 import { DatabaseSync } from 'node:sqlite';
-import { assertVerifiedQualityReplayPlan } from '../yuqi-runtime/src/quality-replay.mjs';
+import {
+  assertVerifiedQualityReplayPlan,
+  assertProductionQualityPlanSourceBoundary as assertProductionQualityPlanSourceBoundaryInternal,
+} from '../yuqi-runtime/src/quality-replay.mjs';
 import {
   createQualityProductionExecutionAuthority,
   assertQualityRunAuthority,
@@ -20,15 +23,6 @@ const MATERIAL_FILE = join(PRIVATE_ROOT, 'quality-production-config.json');
 const RUN_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/;
 const SHA40 = /^[0-9a-f]{40}$/;
-const TRACKED_PLAN_SOURCE = Object.freeze({
-  itemCount: 246,
-  staticItemsChecksum: '90ac1c9dc72c1c2ac93efaa3675888f448e873161faf76286a6667a825ba2f62',
-  sentinelFinalKeysChecksum: 'e367c79c040e3be7f6bbfd4b437524f1e56a0ebca15ac1987bc91fd0ce18ce02',
-  coverageFinalKeysChecksum: '60b98913c835456aac8ad32f23e1665bd79bc6dd0743d189e0c779890ee4cf27',
-  sourceGroundingChecksum: '5fd4936ecf248cf108f140f0ef5584b0902423a512463d1d881e98d4b29a31f1',
-  sentinelContentChecksum: '4f3fa9941e726715ce1ecb84e8ee5675845abd616aa2db7ff033d5c4f00987c0',
-  coverageContentChecksum: '6a3677bfc459912d8c709bf88e96d855aebbac3fb5ee66208724a8a4e2e881bd',
-});
 const RELEASE_KEYS = Object.freeze([
   'releaseId', 'pipelineVersion', 'presetVersion', 'cognitionSchemaVersion',
   'expressionSchemaVersion', 'evaluatorVersion', 'modelProfile', 'componentManifest',
@@ -197,23 +191,7 @@ function privatePath(rootDir, value, label) {
 }
 
 export function assertProductionQualityPlanSourceBoundary(plan) {
-  const verified = assertVerifiedQualityReplayPlan(plan);
-  const historyItems = verified.items.filter(item => item.layer === 'history');
-  const staticItems = verified.items.filter(item => item.layer !== 'history');
-  if (verified.items.length !== TRACKED_PLAN_SOURCE.itemCount
-    || contentHash(staticItems) !== TRACKED_PLAN_SOURCE.staticItemsChecksum
-    || contentHash(verified.finalKeys.sentinelFinalKeys) !== TRACKED_PLAN_SOURCE.sentinelFinalKeysChecksum
-    || contentHash(verified.finalKeys.coverageFinalKeys) !== TRACKED_PLAN_SOURCE.coverageFinalKeysChecksum
-    || verified.commitments.sourceGroundingChecksum !== TRACKED_PLAN_SOURCE.sourceGroundingChecksum
-    || verified.commitments.sentinelContentChecksum !== TRACKED_PLAN_SOURCE.sentinelContentChecksum
-    || verified.commitments.coverageContentChecksum !== TRACKED_PLAN_SOURCE.coverageContentChecksum) {
-    throw new Error('quality replay tracked source commitment conflict');
-  }
-  if (historyItems.length !== 30
-    || verified.historyManifest.sceneIds.join('\u0000') !== historyItems.map(item => item.sceneId).join('\u0000')
-    || verified.historyManifest.scenesChecksum !== contentHash(historyItems.map(item => item.scene))) {
-    throw new Error('quality replay private history source commitment conflict');
-  }
+  assertProductionQualityPlanSourceBoundaryInternal(plan);
   return true;
 }
 

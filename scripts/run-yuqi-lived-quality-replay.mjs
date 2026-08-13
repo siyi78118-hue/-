@@ -13,6 +13,7 @@ import {
 import {
   buildVerifiedQualityReplayPlan,
   assertVerifiedQualityReplayPlan,
+  assertProductionQualityPlanSourceBoundary as assertProductionQualityPlanSourceBoundaryInternal,
   appendQualityAttempt,
   writeQualityReplayPlanArtifact,
   loadQualityReplayPlanArtifact,
@@ -210,24 +211,8 @@ export function createQualityReplayPlan({ rootDir = process.cwd(), historyScenes
  * authority, while the replacement history layer proves its own manifest.
  */
 export function assertProductionQualityPlanSourceBoundary({ plan, rootDir = process.cwd() } = {}) {
-  assertVerifiedQualityReplayPlan(plan);
-  const tracked = createQualityReplayPlan({ rootDir });
-  const trackedItems = tracked.items.filter(item => item.layer !== 'history');
-  const suppliedItems = plan.items.filter(item => item.layer !== 'history');
-  if (contentHash(suppliedItems) !== contentHash(trackedItems)
-    || contentHash(plan.finalKeys.sentinelFinalKeys) !== contentHash(tracked.finalKeys.sentinelFinalKeys)
-    || contentHash(plan.finalKeys.coverageFinalKeys) !== contentHash(tracked.finalKeys.coverageFinalKeys)
-    || plan.commitments.sourceGroundingChecksum !== tracked.commitments.sourceGroundingChecksum
-    || plan.commitments.sentinelContentChecksum !== tracked.commitments.sentinelContentChecksum
-    || plan.commitments.coverageContentChecksum !== tracked.commitments.coverageContentChecksum) {
-    throw new Error('production quality tracked source commitment conflict');
-  }
-  const historyItems = plan.items.filter(item => item.layer === 'history');
-  if (historyItems.length !== 30
-    || plan.historyManifest.sceneIds.join('\u0000') !== historyItems.map(item => item.sceneId).join('\u0000')
-    || plan.historyManifest.scenesChecksum !== contentHash(historyItems.map(item => item.scene))) {
-    throw new Error('production quality private history source commitment conflict');
-  }
+  void rootDir;
+  assertProductionQualityPlanSourceBoundaryInternal(plan);
   return true;
 }
 

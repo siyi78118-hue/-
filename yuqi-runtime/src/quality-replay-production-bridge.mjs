@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { CodexAppServerClient } from './codex-client.mjs';
 
 import { contentHash } from './protocol.mjs';
+import { assertProductionQualityPlanSourceBoundary } from './quality-replay.mjs';
 import { compileQualitySubject, QUALITY_BLIND_EVALUATION_SCHEMA } from './quality-evaluator.mjs';
 import { deriveAuthorityLineageKey } from './authority-identity.mjs';
 import { YuqiStore } from './store.mjs';
@@ -86,7 +87,6 @@ const QUALITY_RUN_AUTHORITY_BRAND = new WeakSet();
 const QUALITY_RUN_AUTHORITY_STATE = new WeakMap();
 const INTERNAL_PRODUCTION_CONTEXT_TOKEN = Symbol('quality-production-context');
 const PRODUCTION_AUTHORITY_TOKEN = Symbol('quality-production-authority');
-const TRACKED_PLAN_CHECKSUM = 'dc704d836d1b0224f0202b5771f38334292df90eaedd7c8f8880c7c3bb89243c';
 
 const PRODUCTION_CONFIG_DESCRIPTOR_KEYS = Object.freeze([
   'version', 'runId', 'finalKeys', 'planChecksum', 'sourceHead',
@@ -328,7 +328,7 @@ export function createQualityProductionExecutionConfig(options = {}) {
     || !Array.isArray(descriptor.finalKeys) || descriptor.finalKeys.length !== 246
     || descriptor.finalKeys.some(key => typeof key !== 'string')
     || typeof descriptor.sourceHead !== 'string' || !/^[a-f0-9]{40}$/i.test(descriptor.sourceHead)
-    || descriptor.planChecksum !== TRACKED_PLAN_CHECKSUM
+    || typeof descriptor.planChecksum !== 'string' || !/^[a-f0-9]{64}$/.test(descriptor.planChecksum)
     || !Number.isSafeInteger(descriptor.createdAt) || descriptor.createdAt < 0) {
     throw new Error('quality production config authority conflict');
   }
@@ -435,9 +435,12 @@ function assertDirectProductionAuthorityInputs(sourceRootDir, descriptor, materi
   } catch {
     throw new Error('quality direct authority input JSON conflict');
   }
-  if (plan.planChecksum !== TRACKED_PLAN_CHECKSUM
-    || plan.planChecksum !== descriptor.planChecksum
-    || !Array.isArray(plan.items) || plan.items.length !== 246) {
+  try {
+    assertProductionQualityPlanSourceBoundary(plan);
+  } catch {
+    throw new Error('quality direct authority plan conflict');
+  }
+  if (plan.planChecksum !== descriptor.planChecksum) {
     throw new Error('quality direct authority plan conflict');
   }
   const finalKeys = plan.items.map(item => {
@@ -2209,7 +2212,8 @@ export function registerQualityPhaseBinding(context, side, binding) {
 export async function prepareQualitySubject(context, subject) {
   if (!context || context.phase !== 'seed') throw new Error('quality context is not in seed phase');
   const type = assertSubject(subject);
-  if (context.config.planChecksum !== TRACKED_PLAN_CHECKSUM) {
+  if (typeof context.config.planChecksum !== 'string'
+    || !/^[a-f0-9]{64}$/.test(context.config.planChecksum)) {
     throw new Error('quality plan checksum is required');
   }
   if (!context.seedStore || !context.seedRuntime) throw new Error('seed store/runtime is required');
