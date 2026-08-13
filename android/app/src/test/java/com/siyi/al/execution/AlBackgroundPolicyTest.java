@@ -10,7 +10,7 @@ public class AlBackgroundPolicyTest {
     @Test
     public void periodicRecoveryUsesAndroidMinimumWithoutBusyLooping() {
         assertEquals(15L, AlBackgroundPolicy.PERIODIC_RECOVERY_MINUTES);
-        assertEquals(60L, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS);
+        assertEquals(15L, AlBackgroundPolicy.FOREGROUND_SCAN_SECONDS);
         assertFalse(AlBackgroundPolicy.expedite(5));
     }
 
