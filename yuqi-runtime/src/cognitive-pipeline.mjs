@@ -108,21 +108,51 @@ function objectResult(value, role) {
 }
 
 function v3MessageIds(envelope) {
-  return [
+  const ids = new Set([
     ...(envelope?.currentInteraction?.messages || []),
     ...(envelope?.relevantHistory || [])
-  ].map((message) => String(message?.messageId || '')).filter(Boolean);
+  ].map((message) => String(message?.messageId || '')).filter(Boolean));
+  const feature = envelope?.featureContext || {};
+  for (const comment of [
+    feature.targetComment,
+    ...(feature.thread || []),
+    ...(feature.targetMoment?.comments || [])
+  ]) {
+    const commentId = String(comment?.commentId || '');
+    if (commentId) ids.add(commentId);
+  }
+  return [...ids];
 }
 
 function v3AllowedTargets(envelope) {
   const feature = envelope?.featureContext || {};
+  const commentIds = new Set([
+    feature.targetComment,
+    ...(feature.thread || []),
+    ...(feature.targetMoment?.comments || [])
+  ].map((comment) => String(comment?.commentId || '')).filter(Boolean));
   return {
-    paymentMessageId: feature.payment?.messageId || null,
-    momentId: feature.targetMoment?.momentId || null,
-    commentId: feature.targetComment?.commentId || null,
-    rolePlanId: feature.rolePlan?.rolePlanId || null,
-    occurrenceId: feature.occurrence?.occurrenceId || null
+    momentIds: [String(feature.targetMoment?.momentId || '')].filter(Boolean),
+    commentIds: [...commentIds],
+    rolePlanIds: [String(feature.rolePlan?.rolePlanId || '')].filter(Boolean),
+    lifeEpisodeIds: (Array.isArray(feature.existingEpisodes) ? feature.existingEpisodes : [])
+      .map((episode) => String(episode?.episodeId || ''))
+      .filter(Boolean)
   };
+}
+
+function v3SemanticAllowedActions(actions) {
+  const allowed = new Set((actions || []).map(String));
+  if ([...allowed].some((action) => ['payment_accept', 'payment_decline'].includes(action))) {
+    allowed.add('payment');
+  }
+  if ([...allowed].some((action) => ['post', 'like', 'comment', 'reply'].includes(action))) {
+    allowed.add('moment');
+  }
+  if ([...allowed].some((action) => ['create', 'update', 'delete'].includes(action))) {
+    allowed.add('rolePlan');
+  }
+  return [...allowed];
 }
 
 function checkpointFromStore(store, turnId) {
@@ -280,7 +310,7 @@ function v3ValidationContext(cognitionEnvelope, input) {
       kind: cognitionEnvelope.turnKind
     },
     relevantStances: cognitionEnvelope.currentStances || [],
-    allowedActions: cognitionEnvelope.allowedActions || [],
+    allowedActions: v3SemanticAllowedActions(cognitionEnvelope.allowedActions),
     allowedActionTargets: v3AllowedTargets(cognitionEnvelope),
     scene: isPublicMomentTurn({ ...input, cognitionEnvelope }) ? {} : (input.scene || {})
   };

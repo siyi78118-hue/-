@@ -77,10 +77,11 @@ export function assertStageSelection(stage, finalKeys) {
   return true;
 }
 
-export function buildThreeJudgeLaneDefinitions({ rootDir, codexCommand }) {
+export function buildThreeJudgeLaneDefinitions({ rootDir, codexCommand, stage = 1 }) {
   if (typeof rootDir !== 'string' || !rootDir || typeof codexCommand !== 'string' || !codexCommand) {
     throw new Error('three-judge lane input conflict');
   }
+  if (!THREE_JUDGE_STAGE_KEYS[stage]) throw new Error('three-judge stage conflict');
   const lane = (name, modelProfile, kind) => Object.freeze({
     version: 1,
     lane: name,
@@ -96,8 +97,8 @@ export function buildThreeJudgeLaneDefinitions({ rootDir, codexCommand }) {
     requestTimeoutMs: 30_000,
     turnTimeoutMs: 600_000,
     maxRoleTurns: 8,
-    sessionStorePath: `artifacts/yuqi-lived-agency-v3/private/three-judge/sessions/${name}.sqlite`,
-    sessionNamespace: `quality/three-judge/stage-1/${name}`,
+    sessionStorePath: `artifacts/yuqi-lived-agency-v3/private/three-judge/sessions/stage-${stage}/${name}.sqlite`,
+    sessionNamespace: `quality/three-judge/stage-${stage}/${name}`,
     modelProfile,
     approvalPolicy: 'never',
     sandbox: 'read-only',
@@ -113,6 +114,7 @@ export function buildThreeJudgeLaneDefinitions({ rootDir, codexCommand }) {
 
 export function buildPilotMaterialManifest({
   rootDir, codexCommand, sourceHead, stableRelease, candidateRelease, seedDatabaseSha256,
+  stage = 1,
 }) {
   if (!SOURCE_HEAD.test(sourceHead) || !SHA256.test(seedDatabaseSha256)
     || !stableRelease?.releaseId || !candidateRelease?.releaseId
@@ -133,7 +135,7 @@ export function buildPilotMaterialManifest({
     },
     stableRelease: structuredClone(stableRelease),
     candidateRelease: structuredClone(candidateRelease),
-    lanes: buildThreeJudgeLaneDefinitions({ rootDir, codexCommand }),
+    lanes: buildThreeJudgeLaneDefinitions({ rootDir, codexCommand, stage }),
     stableRuntime: {
       version: 1, attestationVersion: 1, sourceHead, adapterIds,
       stableReleaseId: stableRelease.releaseId, candidateReleaseId: null,
@@ -147,6 +149,56 @@ export function buildPilotMaterialManifest({
     candidateDatabasePath: `${PRIVATE_ROOT}/candidate.sqlite`,
     seedDatabaseSha256,
   });
+}
+
+export function rolloutKeysForThreeJudgeStage({ plan, stage }) {
+  const verified = assertVerifiedQualityReplayPlan(plan);
+  const finalKeys = THREE_JUDGE_STAGE_KEYS[stage];
+  assertStageSelection(stage, finalKeys);
+  const rolloutKeys = [];
+  for (const finalKey of finalKeys) {
+    const item = verified.items.find(value =>
+      `${value.layer}:${value.sceneId}:${value.repeatIndex}` === finalKey);
+    const rolloutKey = item?.scene?.rolloutKey;
+    if (typeof rolloutKey !== 'string' || !rolloutKey) {
+      throw new Error('three-judge selected rollout key conflict');
+    }
+    if (!rolloutKeys.includes(rolloutKey)) rolloutKeys.push(rolloutKey);
+  }
+  return Object.freeze(rolloutKeys);
+}
+
+export function pinThreeJudgeRolloutReleasePair({
+  store, promotion, presets, rolloutKeys, stableRelease, candidateRelease,
+}) {
+  if (!store?.db || typeof promotion?.getStatus !== 'function'
+    || typeof presets?.evidenceManifest !== 'function'
+    || !Array.isArray(rolloutKeys) || rolloutKeys.length === 0
+    || new Set(rolloutKeys).size !== rolloutKeys.length
+    || !stableRelease?.releaseId || !candidateRelease?.releaseId
+    || stableRelease.releaseId === candidateRelease.releaseId
+    || typeof candidateRelease.presetVersion !== 'string' || !candidateRelease.presetVersion) {
+    throw new Error('three-judge rollout release pair conflict');
+  }
+  const update = store.db.prepare(`
+    UPDATE cognition_kind_rollouts
+    SET stable_release_id=?, candidate_release_id=?, current_mode='active', candidate_phase='none',
+        pipeline_checksum=?, preset_version=?
+    WHERE rollout_key=? AND revision=?
+  `);
+  for (const rolloutKey of rolloutKeys) {
+    const rollout = promotion.getStatus(rolloutKey);
+    const result = update.run(
+      stableRelease.releaseId,
+      candidateRelease.releaseId,
+      presets.evidenceManifest(rolloutKey).checksum,
+      candidateRelease.presetVersion,
+      rolloutKey,
+      rollout.revision,
+    );
+    if (Number(result.changes) !== 1) throw new Error('three-judge rollout release pin conflict');
+  }
+  return true;
 }
 
 function sha256(bytes) {
@@ -186,7 +238,9 @@ function removeDatabaseSidecars(path) {
   for (const suffix of ['-wal', '-shm', '-journal']) rmSync(`${path}${suffix}`, { force: true });
 }
 
-export function prepareThreeJudgePilotMaterials({ rootDir, planSourcePath, codexCommand }) {
+export function prepareThreeJudgePilotMaterials({
+  rootDir, planSourcePath, codexCommand, stage = 1,
+}) {
   const root = resolve(rootDir);
   const sourceHead = execFileSync('git', ['rev-parse', '--verify', 'HEAD'], {
     cwd: root, encoding: 'utf8', windowsHide: true,
@@ -210,8 +264,8 @@ export function prepareThreeJudgePilotMaterials({ rootDir, planSourcePath, codex
   const planPath = join(privateRoot, 'quality-replay-plan.json');
   copyFileSync(resolve(planSourcePath), planPath);
   const plan = assertVerifiedQualityReplayPlan(JSON.parse(readFileSync(planPath, 'utf8')));
-  assertStageSelection(1, THREE_JUDGE_STAGE_KEYS[1]);
-  for (const key of THREE_JUDGE_STAGE_KEYS[1]) {
+  assertStageSelection(stage, THREE_JUDGE_STAGE_KEYS[stage]);
+  for (const key of THREE_JUDGE_STAGE_KEYS[stage]) {
     if (!plan.items.some(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}` === key)) {
       throw new Error('three-judge selected question missing from verified plan');
     }
@@ -287,19 +341,14 @@ export function prepareThreeJudgePilotMaterials({ rootDir, planSourcePath, codex
       releaseChecksum: candidateChecksum,
     }));
 
-    const rollout = promotion.getStatus('DIRECT_REPLY');
-    store.db.prepare(`
-      UPDATE cognition_kind_rollouts
-      SET stable_release_id=?, candidate_release_id=?, current_mode='active', candidate_phase='none',
-          pipeline_checksum=?, preset_version=?
-      WHERE rollout_key='DIRECT_REPLY' AND revision=?
-    `).run(
-      stableRelease.releaseId,
-      candidateRelease.releaseId,
-      presets.evidenceManifest('DIRECT_REPLY').checksum,
-      candidateRelease.presetVersion,
-      rollout.revision,
-    );
+    pinThreeJudgeRolloutReleasePair({
+      store,
+      promotion,
+      presets,
+      rolloutKeys: rolloutKeysForThreeJudgeStage({ plan, stage }),
+      stableRelease,
+      candidateRelease,
+    });
   } finally {
     store.close();
   }
@@ -314,18 +363,19 @@ export function prepareThreeJudgePilotMaterials({ rootDir, planSourcePath, codex
     stableRelease,
     candidateRelease,
     seedDatabaseSha256: sha256(readFileSync(seedPath)),
+    stage,
   });
   const materialPath = join(root, ...THREE_JUDGE_MATERIAL_FILE.split('/'));
   writeFileSync(materialPath, JSON.stringify(manifest));
   return Object.freeze({
     sourceHead,
     planChecksum: plan.planChecksum,
-    stage: 1,
-    finalKeys: [...THREE_JUDGE_STAGE_KEYS[1]],
+    stage,
+    finalKeys: [...THREE_JUDGE_STAGE_KEYS[stage]],
     planPath,
     materialPath,
     ledgerPath: join(privateRoot, 'quality-replay-state.sqlite'),
-    limits: pilotLimitsForStage(1),
+    limits: pilotLimitsForStage(stage),
   });
 }
 
@@ -334,12 +384,17 @@ function parseCli(argv) {
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
-    if (!['--root', '--plan-source', '--codex-command'].includes(key) || !value) {
+    if (!['--root', '--plan-source', '--codex-command', '--stage'].includes(key) || !value) {
       throw new Error('three-judge preparer arguments conflict');
     }
     values[key] = value;
   }
-  if (Object.keys(values).length !== 3) throw new Error('three-judge preparer arguments required');
+  for (const required of ['--root', '--plan-source', '--codex-command']) {
+    if (!values[required]) throw new Error('three-judge preparer arguments required');
+  }
+  if (Object.keys(values).length !== (values['--stage'] ? 4 : 3)) {
+    throw new Error('three-judge preparer arguments conflict');
+  }
   return values;
 }
 
@@ -352,6 +407,7 @@ if (isMain) {
       rootDir: cli['--root'],
       planSourcePath: cli['--plan-source'],
       codexCommand: cli['--codex-command'],
+      stage: cli['--stage'] === undefined ? 1 : Number(cli['--stage']),
     });
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
   } catch (error) {

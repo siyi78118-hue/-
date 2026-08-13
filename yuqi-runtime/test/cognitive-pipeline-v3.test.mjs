@@ -191,6 +191,55 @@ function proactiveCognitionResult(motiveEvidenceIds) {
   });
 }
 
+test('moment reply accepts visible comment evidence and rejects a foreign comment id', async () => {
+  const commentId = 'comment_visible';
+  const momentEnvelope = {
+    ...envelope(),
+    turnKind: 'MOMENT_REPLY',
+    currentInteraction: { batchId: 'batch_moment', messages: [] },
+    featureContext: {
+      targetMoment: {
+        momentId: 'moment_1',
+        text: '出去买水。',
+        comments: [{ commentId, text: '我也去。' }]
+      },
+      targetComment: { commentId, text: '我也去。' },
+      thread: [{ commentId, text: '我也去。' }]
+    },
+    allowedActions: ['reply', 'skip']
+  };
+  const withEvidence = (evidenceId) => cognitionResult({
+    interactionRead: {
+      ...cognitionResult().interactionRead,
+      evidenceMessageIds: [evidenceId]
+    },
+    interactionDecision: {
+      ...cognitionResult().interactionDecision,
+      motiveEvidenceIds: [evidenceId]
+    },
+    actionIntent: {
+      ...cognitionResult().actionIntent,
+      moment: {
+        momentId: 'moment_1',
+        like: false,
+        comment: '接住这句。',
+        replyToCommentId: commentId
+      }
+    }
+  });
+
+  const accepted = await runCognitionV3Turn(input({
+    cognitionEnvelope: momentEnvelope,
+    client: new FakeClient(withEvidence(commentId), expressionResult())
+  }));
+  assert.equal(accepted.draft.reply, expressionResult().reply);
+
+  await assert.rejects(() => runCognitionV3Turn(input({
+    cognitionEnvelope: momentEnvelope,
+    client: new FakeClient(withEvidence('comment_foreign'), expressionResult())
+  })), /unknown evidence messageId: comment_foreign/);
+});
+
 test('fast cognition can escalate before expression with fixed role budgets', async () => {
   const client = new FakeClient(
     { routeDecision: 'deep', cognitionResult: cognitionResult() },

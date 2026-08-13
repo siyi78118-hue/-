@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
+
+import { PresetRegistry } from '../yuqi-runtime/src/preset-registry.mjs';
+import { PromotionController } from '../yuqi-runtime/src/promotion-controller.mjs';
+import { YuqiStore } from '../yuqi-runtime/src/store.mjs';
 
 const SCRIPT = join(process.cwd(), 'scripts', 'prepare-yuqi-three-judge-pilot.mjs');
 const RUNNER = join(process.cwd(), 'scripts', 'run-yuqi-lived-quality-replay.mjs');
@@ -56,6 +60,62 @@ test('stage one limits reject widened, duplicate, or unknown question sets', asy
   }
 });
 
+test('stage three resolves and pins every selected turn kind to one release pair', async () => {
+  const module = await import(pathToFileURL(SCRIPT).href);
+  const plan = JSON.parse(readFileSync(join(
+    process.cwd(),
+    'artifacts', 'yuqi-lived-agency-v3', 'private', 'three-judge-pilot',
+    'quality-replay-plan.json',
+  ), 'utf8'));
+  const rolloutKeys = module.rolloutKeysForThreeJudgeStage({ plan, stage: 3 });
+  assert.deepEqual(rolloutKeys, [
+    'DIRECT_REPLY',
+    'PROACTIVE_MOMENT',
+    'MOMENT_REPLY',
+    'ROLE_PLAN_CHAT',
+    'LIFE_PLANNING',
+  ]);
+
+  const store = new YuqiStore(':memory:');
+  try {
+    const presets = new PresetRegistry({
+      presetDir: join(process.cwd(), 'yuqi-runtime', 'presets'),
+      store,
+      clock: () => 1,
+    });
+    const promotion = new PromotionController({ store, presetRegistry: presets, clock: () => 1 });
+    promotion.initialize();
+    const releases = store.listPipelineReleases();
+    const baseline = releases.find(row => row.pipelineVersion === 'stable-visible-baseline-2026-07-30');
+    const cognitionV2 = releases.find(row => row.pipelineVersion === 'cognition-v2-candidate-2026-07-30');
+    assert.ok(baseline);
+    assert.ok(cognitionV2);
+    const unrelatedBefore = promotion.getStatus('MOMENT_INTERACTION');
+
+    module.pinThreeJudgeRolloutReleasePair({
+      store,
+      promotion,
+      presets,
+      rolloutKeys,
+      stableRelease: cognitionV2,
+      candidateRelease: baseline,
+    });
+
+    for (const rolloutKey of rolloutKeys) {
+      const row = promotion.getStatus(rolloutKey);
+      assert.equal(row.stableReleaseId, cognitionV2.releaseId, rolloutKey);
+      assert.equal(row.candidateReleaseId, baseline.releaseId, rolloutKey);
+      assert.equal(row.currentMode, 'active', rolloutKey);
+      assert.equal(row.candidatePhase, 'none', rolloutKey);
+      assert.equal(row.presetVersion, baseline.presetVersion, rolloutKey);
+      assert.equal(row.pipelineChecksum, presets.evidenceManifest(rolloutKey).checksum, rolloutKey);
+    }
+    assert.deepEqual(promotion.getStatus('MOMENT_INTERACTION'), unrelatedBefore);
+  } finally {
+    store.close();
+  }
+});
+
 test('four isolated lanes bind the approved models and cap one final at 32 role calls', async () => {
   const module = await import(pathToFileURL(SCRIPT).href);
   const lanes = module.buildThreeJudgeLaneDefinitions({
@@ -81,6 +141,25 @@ test('four isolated lanes bind the approved models and cap one final at 32 role 
   assert.equal(Object.values(lanes).reduce((sum, lane) => sum + lane.maxRoleTurns, 0), 32);
   assert.equal(new Set(Object.values(lanes).map(lane => lane.sessionStorePath)).size, 4);
   assert.equal(new Set(Object.values(lanes).map(lane => lane.sessionNamespace)).size, 4);
+  const stageThree = module.buildThreeJudgeLaneDefinitions({
+    rootDir: 'C:/detached/yuqi',
+    codexCommand: 'C:/Codex/codex.exe',
+    stage: 3,
+  });
+  assert.equal(
+    Object.values(stageThree).every(lane => lane.sessionNamespace.includes('/stage-3/')),
+    true,
+  );
+  assert.equal(
+    Object.values(stageThree).some((lane, index) =>
+      lane.sessionNamespace === Object.values(lanes)[index].sessionNamespace),
+    false,
+  );
+  assert.equal(
+    Object.values(stageThree).some((lane, index) =>
+      lane.sessionStorePath === Object.values(lanes)[index].sessionStorePath),
+    false,
+  );
 });
 
 test('pilot material manifest binds one detached source and one isolated database per side', async () => {
