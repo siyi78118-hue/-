@@ -197,7 +197,7 @@ test('human review combines non-overlapping successful pairs from audited supple
     }
     const main = new DatabaseSync(sources[0].ledgerPath);
     const supplement = new DatabaseSync(sources[1].ledgerPath);
-    pool.items.forEach((item, index) => insertSucceededPair(
+    pool.items.slice(0, -1).forEach((item, index) => insertSucceededPair(
       index === 2 ? supplement : main,
       index === 2 ? sources[1].runId : sources[0].runId,
       `history:${item.sceneId}:0`, index + 10,
@@ -218,6 +218,8 @@ test('human review combines non-overlapping successful pairs from audited supple
     });
 
     assert.equal(result.scoredCount, 12);
+    assert.equal(result.technicalFailureCount, 0);
+    assert.equal(result.notExecutedCandidateCount, 1);
     const audit = JSON.parse(readFileSync(result.discriminabilityAuditPath, 'utf8'));
     assert.deepEqual(audit.sourceRuns, ['run-main', 'run-supplement']);
     assert.equal(audit.selected.some(item => item.sourceRunId === 'run-supplement'), true);

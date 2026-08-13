@@ -107,6 +107,7 @@ function normalizeExecutionSources({ ledgerPath, runId, executionSources }) {
 function loadExecutionPairs({ sources, pool, decisions }) {
   const pairsByCandidateId = {};
   const technicalFailures = [];
+  const notExecutedCandidateIds = [];
   const opened = sources.map(source => {
     const database = new DatabaseSync(source.ledgerPath, { readOnly: true });
     return {
@@ -124,8 +125,10 @@ function loadExecutionPairs({ sources, pool, decisions }) {
       const finalKey = `history:${item.sceneId}:0`;
       const successes = [];
       const outputErrors = [];
+      let sawExecutionRows = false;
       for (const source of opened) {
         const rows = source.statement.all(source.runId, finalKey);
+        if (rows.length) sawExecutionRows = true;
         const byPhase = Object.fromEntries(rows.map(row => [row.phase, row]));
         if (byPhase.stable_execution?.state !== 'succeeded'
           || byPhase.candidate_execution?.state !== 'succeeded') continue;
@@ -143,19 +146,21 @@ function loadExecutionPairs({ sources, pool, decisions }) {
           answerA: replyText(stableOutput), answerB: replyText(candidateOutput),
           checks: decisions.items[item.candidateId], stableOutput, candidateOutput, sourceRunId,
         };
-      } else {
+      } else if (successes.length > 1 || sawExecutionRows) {
         technicalFailures.push({
           candidateId: item.candidateId,
           finalKey,
           reason: successes.length > 1 ? 'duplicate_successful_execution_sources'
             : outputErrors[0] || 'execution_phase_incomplete',
         });
+      } else {
+        notExecutedCandidateIds.push(item.candidateId);
       }
     }
   } finally {
     for (const source of opened) source.database.close();
   }
-  return { pairsByCandidateId, technicalFailures };
+  return { pairsByCandidateId, technicalFailures, notExecutedCandidateIds };
 }
 
 function scoreTemplate(publicPairs) {
@@ -193,7 +198,7 @@ export function exportRealChatHumanReview({
   const scenes = readJsonl(historyScenesPath, 'history scenes');
   const scenesById = new Map(scenes.map(scene => [scene.sceneId, scene]));
   if (scenes.length !== 30 || scenesById.size !== 30) throw new Error('history scene set conflict');
-  const { pairsByCandidateId, technicalFailures } = loadExecutionPairs({ sources, pool, decisions });
+  const { pairsByCandidateId, technicalFailures, notExecutedCandidateIds } = loadExecutionPairs({ sources, pool, decisions });
   const selection = selectDiscriminatingPairs({ pool, pairsByCandidateId });
   const sealed = selection.selected.map(item => {
     const scene = scenesById.get(item.sceneId);
@@ -232,6 +237,7 @@ export function exportRealChatHumanReview({
     })),
     replacements: selection.replacements,
     technicalFailures,
+    notExecutedCandidateIds,
     discriminabilityRate: selection.discriminabilityRate,
   };
   const summary = {
@@ -245,6 +251,7 @@ export function exportRealChatHumanReview({
     exactReplacementCount,
     substantiveReplacementCount,
     technicalFailureCount: technicalFailures.length,
+    notExecutedCandidateCount: notExecutedCandidateIds.length,
     multiBubbleScoredCount: selection.selected.filter(item => item.multiBubble).length,
     humanReviewChecksum: contentHash(publicPairs),
     sealedMappingChecksum: mapping.mappingChecksum,
