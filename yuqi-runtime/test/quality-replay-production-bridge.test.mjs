@@ -44,10 +44,6 @@ import {
 
 const SOURCE_HEAD = 'a'.repeat(40);
 const PRESET_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'presets');
-const PLAN_PREVIEW_PATH = join(
-  dirname(fileURLToPath(import.meta.url)), '..', '..', 'artifacts',
-  'yuqi-lived-agency-v3', 'task25f-plan-preview.json'
-);
 const FROZEN_PLAN_CHECKSUM = 'dc704d836d1b0224f0202b5771f38334292df90eaedd7c8f8880c7c3bb89243c';
 
 function cognitionResult() {
@@ -289,20 +285,16 @@ let FROZEN_SUBJECTS;
 
 function frozenSubjects() {
   if (FROZEN_SUBJECTS) return FROZEN_SUBJECTS;
-  const preview = JSON.parse(readFileSync(PLAN_PREVIEW_PATH, 'utf8'));
-  if (preview.planChecksum !== FROZEN_PLAN_CHECKSUM || preview.items?.length !== 246) {
-    throw new Error('frozen Task25 plan preview authority conflict');
-  }
   const suite = compileQualitySuite({ rootDir: process.cwd(), checkOnly: true });
   const plan = buildVerifiedQualityReplayPlan({
     compiledSuite: suite,
     historyScenes: suite.humanAnnotationScenes,
     historyManifest: suite.humanAnnotationManifest
   });
-  if (plan.planChecksum !== FROZEN_PLAN_CHECKSUM || plan.planChecksum !== preview.planChecksum) {
+  if (plan.planChecksum !== FROZEN_PLAN_CHECKSUM) {
     throw new Error('compiled Task25 plan checksum conflict');
   }
-  if (plan.items.length !== preview.items.length) throw new Error('frozen plan item identity conflict');
+  if (plan.items.length !== 246) throw new Error('frozen plan item identity conflict');
   FROZEN_SUBJECTS = plan.items.map(compileQualitySubject);
   if (FROZEN_SUBJECTS.length !== 246) throw new Error('compiled frozen subject count mismatch');
   return FROZEN_SUBJECTS;

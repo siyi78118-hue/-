@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
@@ -1224,6 +1224,8 @@ test('source authority preflight allows evidence-only dirt but rejects outside d
     sourceHead: head,
     replayProvenance: { sourceHead: head }
   }));
+  const evidenceRoot = join(process.cwd(), 'artifacts', 'yuqi-lived-agency-v3');
+  const evidenceRelativePath = relative(evidenceRoot, reportPath).replaceAll('\\', '/');
   try {
     assert.throws(() => preflightRolloutSourceAuthority({
       rootDir: process.cwd(), reportPath,
@@ -1235,7 +1237,7 @@ test('source authority preflight allows evidence-only dirt but rejects outside d
       rootDir: process.cwd(), reportPath,
       commandRunner: (executable, args) => executable === 'git' && args[0] === 'rev-parse'
         ? { exitCode: 0, stdout: `${head}\n` }
-        : { exitCode: 0, stdout: `?? artifacts/yuqi-lived-agency-v3/${dir.split('yuqi-lived-agency-v3\\')[1]}\\quality-report.json\0` }
+        : { exitCode: 0, stdout: `?? artifacts/yuqi-lived-agency-v3/${evidenceRelativePath}\0` }
     }).sourceHead, head);
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch {}

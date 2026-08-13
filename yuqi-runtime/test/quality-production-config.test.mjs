@@ -28,6 +28,8 @@ import {
   awaitQualityPublishedStoreSidecarsGone,
 } from '../src/quality-replay-production-bridge.mjs';
 import { openProductionQualityReplayLedger, qualityClientUserMessageId } from '../src/quality-replay-ledger.mjs';
+import { compileQualitySuite } from '../../scripts/compile-yuqi-lived-quality-scenes.mjs';
+import { buildVerifiedQualityReplayPlan } from '../src/quality-replay.mjs';
 
 const PRIVATE = 'artifacts/yuqi-lived-agency-v3/private';
 const TEMP_FIXTURES = new Set();
@@ -102,8 +104,18 @@ function fixtureLane(name, root, modelProfile) {
   };
 }
 
+let FROZEN_TRACKED_PLAN;
+
 function buildPlan() {
-  return JSON.parse(readFileSync(join(process.cwd(), 'artifacts/yuqi-lived-agency-v3/task25f-plan-preview.json'), 'utf8'));
+  if (!FROZEN_TRACKED_PLAN) {
+    const compiledSuite = compileQualitySuite({ rootDir: process.cwd(), checkOnly: true });
+    FROZEN_TRACKED_PLAN = buildVerifiedQualityReplayPlan({
+      compiledSuite,
+      historyScenes: compiledSuite.humanAnnotationScenes,
+      historyManifest: compiledSuite.humanAnnotationManifest,
+    });
+  }
+  return structuredClone(FROZEN_TRACKED_PLAN);
 }
 
 function buildPrivateHistoryPlan() {
