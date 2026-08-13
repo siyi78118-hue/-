@@ -1426,6 +1426,99 @@ test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one finge
   }));
 });
 
+test('runCanonicalReleaseTurn preserves a direct reply while dropping an unconfirmed inferred schedule', async () => {
+  const operation = {
+    op: 'create', type: 'private_message', source: 'spoken', title: '早安',
+    intent: '明天早上发早安', schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' },
+    timeConfidence: 'inferred'
+  };
+  const envelope = {
+    protocolVersion: 3,
+    turnId: 'turn_inferred_role_plan_v3',
+    characterId: 'yuqi',
+    deviceId: 'phone',
+    deviceSeq: 1,
+    createdAt: 1786646002626,
+    kind: 'DIRECT_REPLY',
+    message: {
+      messageId: 'msg_inferred_role_plan_v3', speakerId: 'user', speakerType: 'user', recipientId: 'yuqi',
+      content: '晚安虞姐姐 明天我还能收到你的早安吗？🥺', sentAt: 1786646002626
+    },
+    context: {}
+  };
+  const turn = {
+    turnId: envelope.turnId,
+    protocolVersion: 3,
+    resultAuthorityVersion: 1,
+    rolloutKey: 'DIRECT_REPLY',
+    envelopeJson: JSON.stringify(envelope),
+    authorityLineageKey: 'lineage_inferred_role_plan_v3',
+    characterId: 'yuqi',
+    laneKey: 'direct',
+    inputUserBatchId: envelope.message.messageId,
+    inputVisibilitySequence: 1,
+    inputClearEpoch: 0,
+    agencySnapshotChecksum: 'a'.repeat(64),
+    authoritativeReleaseId: 'cognition-v3',
+    authoritativePipelineChecksum: 'b'.repeat(64),
+    comparisonReleaseId: null,
+    comparisonMode: 'none',
+    state: 'open',
+    turnRevision: 1
+  };
+  let committed;
+  let resolverCalls = 0;
+  const orchestrator = Object.create(YuqiOrchestrator.prototype);
+  orchestrator.clock = () => 1786646002626;
+  orchestrator.turnImagePaths = new Map();
+  orchestrator.store = {
+    getTurn() { return turn; },
+    getTurnAuthorityLineage() {
+      return { state: 'open', revision: 1, latestTurnId: turn.turnId, committedGroupId: null };
+    },
+    assertCanonicalTurnInputAuthorityInternal({ storedTurn, incomingEnvelope }) {
+      assert.equal(contentHash(incomingEnvelope), contentHash(JSON.parse(storedTurn.envelopeJson)));
+    },
+    readCanonicalCommitOutcomeInternal() { return null; },
+    getCurrentUserBatch() { return null; },
+    readAgencyAuthoritySnapshotInternal() {
+      return { checksum: turn.agencySnapshotChecksum, constraints: [], preferenceFacts: [], stances: [] };
+    },
+    getCognitiveState() { return { revision: 0 }; },
+    getInteractionLane() { return { revision: 0 }; },
+    resolveCanonicalActionTargetInternal() {
+      resolverCalls += 1;
+      return {
+        targetKey: 'lineage_create:lineage_inferred_role_plan_v3:role_plan_create',
+        targetRevision: '1',
+        canonicalTarget: { lineageKey: turn.authorityLineageKey, actionKind: 'role_plan_create' }
+      };
+    }
+  };
+  orchestrator.releaseExecutor = {
+    async executeTurn() {
+      return {
+        draft: {
+          action: 'send',
+          reply: '嗯，明天醒了就来找你。晚安。',
+          rolePlanOperations: [operation]
+        }
+      };
+    }
+  };
+  orchestrator.commitCanonicalVisibleResult = input => {
+    committed = input;
+    return { status: 'committed', visibleGroupId: 'group_inferred_role_plan_v3' };
+  };
+
+  const result = await orchestrator.runCanonicalReleaseTurn(turn);
+
+  assert.equal(result.status, 'committed');
+  assert.equal(resolverCalls, 0);
+  assert.equal(committed.visibleGroup.items[0].content, '嗯，明天醒了就来找你。晚安。');
+  assert.deepEqual(committed.actionSet, []);
+});
+
 test('canonical v3 direct provider receives formal relationship scene plus separate expression sidecar', async () => {
   const envelope = {
     protocolVersion: 3,

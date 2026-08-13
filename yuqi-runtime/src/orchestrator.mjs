@@ -347,6 +347,13 @@ function rolePlanOperationNeedsExplicitTime(operation) {
     || (isPlainRolePlanObject(patch) && Object.hasOwn(patch, 'schedule'));
 }
 
+function isUnconfirmedInferredRolePlanOperation(operation) {
+  return isPlainRolePlanObject(operation)
+    && ROLE_PLAN_CONFIRMATION_SOURCES.has(operation.source)
+    && rolePlanOperationNeedsExplicitTime(operation)
+    && operation.timeConfidence === 'inferred';
+}
+
 function canonicalRolePlanActionPayload(operation) {
   if (!isPlainRolePlanObject(operation) || !ROLE_PLAN_CONFIRMATION_OPS.has(operation.op)) {
     rolePlanConfirmationConflict('canonical role plan operation is unknown');
@@ -2691,6 +2698,16 @@ export class YuqiOrchestrator {
           ? structuredClone(relationshipStageAction)
           : null
       };
+      const isRolePlanV3Direct = Number(turn.protocolVersion) === 3
+        && turn.rolloutKey === 'DIRECT_REPLY';
+      if (isRolePlanV3Direct && draft.rolePlanOperations.some(isUnconfirmedInferredRolePlanOperation)) {
+        draft = {
+          ...draft,
+          rolePlanOperations: draft.rolePlanOperations.filter(
+            operation => !isUnconfirmedInferredRolePlanOperation(operation)
+          )
+        };
+      }
       const isProactiveV3 = Number(turn.protocolVersion) === 3
         && turn.rolloutKey === 'PROACTIVE_CHAT';
       const isMomentV3 = Number(turn.protocolVersion) === 3
@@ -2720,8 +2737,6 @@ export class YuqiOrchestrator {
         actions: resolvedActionBundle.rolePlan.map(entry => entry.descriptor),
         targetSnapshots: resolvedActionBundle.rolePlan.map(entry => entry.targetSnapshot)
       };
-      const isRolePlanV3Direct = Number(turn.protocolVersion) === 3
-        && turn.rolloutKey === 'DIRECT_REPLY';
       if (isRolePlanV3Direct && rolePlanBundle.actions.length) {
         if (draft.action === 'skip') {
           throw new Error('role plan confirmation authority conflict');
