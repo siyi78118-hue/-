@@ -39,8 +39,6 @@ function isCanonicalUserMessageRecoveryAlias({ store, peerId, entry, existing })
     || payload.origin !== 'phone'
     || payload.deviceId !== `${peerId}:visible`
     || !Number.isSafeInteger(payload.deviceSeq) || payload.deviceSeq !== Number(entry.seq)
-    || payload.turnId !== `turn_legacy_${payload.messageId}`
-    || existing?.turnId !== `turn_${payload.messageId}`
     || existing.messageId !== payload.messageId
     || existing.characterId !== payload.characterId
     || existing.speakerId !== payload.speakerId
@@ -54,7 +52,11 @@ function isCanonicalUserMessageRecoveryAlias({ store, peerId, entry, existing })
     return false;
   }
   const owner = store.getTurn(existing.turnId);
-  return Number(owner?.resultAuthorityVersion || 0) === 1
+  const legacyVisibleAlias = payload.turnId === `turn_legacy_${payload.messageId}`
+    && existing.turnId === `turn_${payload.messageId}`;
+  const canonicalVisibleEcho = payload.turnId === existing.turnId;
+  return (legacyVisibleAlias || canonicalVisibleEcho)
+    && Number(owner?.resultAuthorityVersion || 0) === 1
     && Number(owner?.protocolVersion || 0) === 3
     && owner.turnId === existing.turnId
     && owner.characterId === payload.characterId

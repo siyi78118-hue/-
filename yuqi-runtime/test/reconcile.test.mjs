@@ -172,6 +172,34 @@ test('a deployed legacy recovery alias converges on its immutable canonical v3 u
   assert.deepEqual(store.getMessage(seeded.message.messageId), before);
 }));
 
+test('a canonical visible recovery echo converges without rewriting its authority row', async () => withStore(async store => {
+  const seeded = seedCanonicalUserMessage(store, { messageId: 'msg_canonical_visible_echo' });
+  const before = store.getMessage(seeded.message.messageId);
+  const echo = messageEntry(73, {
+    ...seeded.message,
+    turnId: seeded.turnId,
+    characterId: 'yuqi',
+    origin: 'phone',
+    deviceId: `${seeded.deviceId}:visible`,
+    deviceSeq: 73
+  });
+  const reconciler = new YuqiReconciler({
+    store,
+    codex: { async runTurn() { assert.fail('an exact recovery echo needs no model call'); } }
+  });
+
+  const result = await reconciler.reconcileFrom({
+    peerId: seeded.deviceId,
+    lastCommonSeq: 72,
+    lastSeq: 73,
+    entries: [echo]
+  });
+
+  assert.equal(result.ackSeq, 73);
+  assert.equal(result.importedMessages, 0);
+  assert.deepEqual(store.getMessage(seeded.message.messageId), before);
+}));
+
 test('canonical recovery alias compatibility rejects every semantic or authority change', async () => {
   const mutations = [
     ['content', payload => { payload.content = '被改过的正文'; }],
@@ -212,6 +240,64 @@ test('canonical recovery alias compatibility rejects every semantic or authority
       );
       assert.equal(store.getSyncCursor(seeded.deviceId), 40, label);
       assert.equal(store.getMessage(seeded.message.messageId).turnId, seeded.turnId, label);
+    });
+  }
+});
+
+test('canonical visible recovery echoes reject every semantic or authority change', async () => {
+  const mutations = [
+    ['content', (_store, _seeded, payload) => { payload.content = '被改过的正文'; }, /message checksum conflict/],
+    ['sentAt', (_store, _seeded, payload) => { payload.sentAt += 1; }, /message checksum conflict/],
+    ['speaker', (_store, _seeded, payload) => {
+      payload.speakerId = 'yuqi';
+      payload.speakerType = 'character';
+    }, /canonical visible result API required/],
+    ['recipient', (_store, _seeded, payload) => { payload.recipientId = 'other'; }, /message checksum conflict/],
+    ['canonical turn', (_store, _seeded, payload) => { payload.turnId = 'turn_unrelated'; }, /message checksum conflict/],
+    ['visible peer', (_store, _seeded, payload) => { payload.deviceId = 'foreign:visible'; }, /message checksum conflict/],
+    ['journal sequence', (_store, _seeded, payload) => { payload.deviceSeq = 74; }, /message checksum conflict/],
+    ['owner authority', (store, seeded) => {
+      store.db.prepare('UPDATE turns SET result_authority_version = 0 WHERE turn_id = ?')
+        .run(seeded.turnId);
+    }, /message checksum conflict/],
+    ['owner protocol', (store, seeded) => {
+      store.db.prepare('UPDATE turns SET envelope_json = ? WHERE turn_id = ?')
+        .run(JSON.stringify({ protocolVersion: 2 }), seeded.turnId);
+    }, /message checksum conflict/]
+  ];
+  for (const [label, mutate, expectedError] of mutations) {
+    await withStore(async store => {
+      const seeded = seedCanonicalUserMessage(store, {
+        messageId: `msg_visible_echo_${label.replaceAll(' ', '_')}`
+      });
+      const before = store.getMessage(seeded.message.messageId);
+      const payload = {
+        ...seeded.message,
+        turnId: seeded.turnId,
+        characterId: 'yuqi',
+        origin: 'phone',
+        deviceId: `${seeded.deviceId}:visible`,
+        deviceSeq: 73
+      };
+      mutate(store, seeded, payload);
+      store.ackSync(seeded.deviceId, 72);
+      const reconciler = new YuqiReconciler({
+        store,
+        codex: { async runTurn() { assert.fail('an invalid recovery echo needs no model call'); } }
+      });
+
+      await assert.rejects(
+        reconciler.reconcileFrom({
+          peerId: seeded.deviceId,
+          lastCommonSeq: 72,
+          lastSeq: 73,
+          entries: [messageEntry(73, payload)]
+        }),
+        expectedError,
+        label
+      );
+      assert.equal(store.getSyncCursor(seeded.deviceId), 72, label);
+      assert.deepEqual(store.getMessage(seeded.message.messageId), before, label);
     });
   }
 });
