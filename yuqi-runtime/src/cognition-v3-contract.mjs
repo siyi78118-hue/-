@@ -296,16 +296,36 @@ function completeCurrentInteraction(envelope) {
   return clone(envelope?.currentInteraction || envelope?.context?.currentBatch || { messages: [] });
 }
 
+const UNDERSTANDING_DISCLOSURE_POLICY_V1 = Object.freeze({
+  version: 1,
+  defaultMode: 'implicit',
+  understandingUse: 'guide_response_not_dialogue',
+  mustConveyUse: 'public_interaction_obligations',
+  unaskedInterpretationLimit: 0,
+  explicitExceptions: Object.freeze([
+    'user_requested_interpretation',
+    'repair_requires_clarification',
+    'safety_or_consent'
+  ])
+});
+
+export function compileUnderstandingDisclosurePolicyV3(presetVersion) {
+  const match = /^2\.1\.(\d+)$/.exec(String(presetVersion || ''));
+  if (!match || Number(match[1]) < 1) return null;
+  return clone(UNDERSTANDING_DISCLOSURE_POLICY_V1);
+}
+
 export function compileExpressionBriefV3({
   envelope,
   agencyView,
   relationship,
-  cognitionResult
+  cognitionResult,
+  presetVersion
 }) {
   if (!cognitionResult?.interactionDecision || !cognitionResult?.actionIntent) {
     throw new Error('expression brief requires an authorized cognition result');
   }
-  return {
+  const brief = {
     schemaVersion: 3,
     personaTone: clone(envelope?.personaTone || []),
     relationship: {
@@ -329,6 +349,9 @@ export function compileExpressionBriefV3({
     authorizedActions: clone(cognitionResult.actionIntent),
     continuityDetails: clone(envelope?.continuityDetails || []).slice(0, 2)
   };
+  const disclosurePolicy = compileUnderstandingDisclosurePolicyV3(presetVersion);
+  if (disclosurePolicy) brief.disclosurePolicy = disclosurePolicy;
+  return brief;
 }
 
 function normalizedVisibleText(value) {

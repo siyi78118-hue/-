@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   compileCognitionPacketV3,
   compileExpressionBriefV3,
+  compileUnderstandingDisclosurePolicyV3,
   materializeV3Draft,
   normalizeCognitionV3Result,
   normalizeExpressionV3Result
@@ -98,6 +99,19 @@ function validExpressionV3(overrides = {}) {
     ...overrides
   };
 }
+
+const expectedDisclosurePolicy = Object.freeze({
+  version: 1,
+  defaultMode: 'implicit',
+  understandingUse: 'guide_response_not_dialogue',
+  mustConveyUse: 'public_interaction_obligations',
+  unaskedInterpretationLimit: 0,
+  explicitExceptions: [
+    'user_requested_interpretation',
+    'repair_requires_clarification',
+    'safety_or_consent'
+  ]
+});
 
 test('v3 requires an intentional decision about an identified social bid', () => {
   const value = validCognitionV3();
@@ -240,6 +254,50 @@ test('response risks and evaluator language cannot appear in the expression brie
     brief.currentInteraction.messages.map(message => message.messageId),
     ['u1']
   );
+});
+
+test('2.1.1 keeps private understanding out of dialogue while older briefs stay byte-shaped', () => {
+  const cognitionResult = validCognitionV3();
+  cognitionResult.interactionRead = {
+    ...cognitionResult.interactionRead,
+    surfaceAct: 'PRIVATE_SURFACE_SENTINEL',
+    primarySocialMeaning: 'PRIVATE_PRIMARY_SENTINEL',
+    alternativeMeaning: 'PRIVATE_ALTERNATIVE_SENTINEL'
+  };
+  cognitionResult.selfResponse = {
+    ...cognitionResult.selfResponse,
+    immediateFeeling: 'PRIVATE_FEELING_SENTINEL',
+    desire: 'PRIVATE_DESIRE_SENTINEL',
+    resistance: 'PRIVATE_RESISTANCE_SENTINEL',
+    attention: 'PRIVATE_ATTENTION_SENTINEL'
+  };
+  const args = {
+    envelope: validationContext().envelope,
+    agencyView: { hardConstraints: [], preferences: [], currentStances: [] },
+    relationship: { formalFacts: [], toneTendencies: [] },
+    cognitionResult
+  };
+  const previous = compileExpressionBriefV3({ ...args, presetVersion: '2.1.0' });
+  const current = compileExpressionBriefV3({ ...args, presetVersion: '2.1.1' });
+
+  assert.equal(Object.hasOwn(previous, 'disclosurePolicy'), false);
+  assert.deepEqual(current.disclosurePolicy, expectedDisclosurePolicy);
+  assert.deepEqual(compileUnderstandingDisclosurePolicyV3('2.1.1'), expectedDisclosurePolicy);
+  assert.deepEqual(compileUnderstandingDisclosurePolicyV3('2.1.9'), expectedDisclosurePolicy);
+  for (const version of [undefined, '', '2.1.0', '2.0.9', '3.0.0', 'not-semver']) {
+    assert.equal(compileUnderstandingDisclosurePolicyV3(version), null);
+  }
+  for (const privateValue of [
+    cognitionResult.interactionRead.primarySocialMeaning,
+    cognitionResult.interactionRead.surfaceAct,
+    cognitionResult.interactionRead.alternativeMeaning,
+    cognitionResult.selfResponse.immediateFeeling,
+    cognitionResult.selfResponse.desire,
+    cognitionResult.selfResponse.resistance,
+    cognitionResult.selfResponse.attention
+  ]) {
+    assert.equal(JSON.stringify(current).includes(privateValue), false);
+  }
 });
 
 test('expression cannot add payment, moment, plan, stage, stance, or factual actions', () => {

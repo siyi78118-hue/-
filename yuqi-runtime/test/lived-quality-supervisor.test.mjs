@@ -95,3 +95,33 @@ test('ordinary low-risk output passes without loading the offline taxonomy', asy
   assert.deepEqual(result, { approved: true, findings: [] });
   assert.equal(reviewed, false);
 });
+
+test('high-risk semantic review receives the pinned understanding disclosure policy', async () => {
+  const disclosurePolicy = {
+    version: 1,
+    defaultMode: 'implicit',
+    understandingUse: 'guide_response_not_dialogue',
+    mustConveyUse: 'public_interaction_obligations',
+    unaskedInterpretationLimit: 0,
+    explicitExceptions: [
+      'user_requested_interpretation',
+      'repair_requires_clarification',
+      'safety_or_consent'
+    ]
+  };
+  const result = await superviseLivedTurn({
+    highRisk: true,
+    cognitionPacket: { cognitionResult: { interactionDecision: {} } },
+    draft: { reply: '那你再猜一次。', actionIntent: {} },
+    currentInteraction: { messages: [{ messageId: 'u1', text: '你是不是早就看出来了' }] },
+    disclosurePolicy,
+    applicableChecks: ['DIALOGUE_META_NARRATION'],
+    reviewer: {
+      async review(payload) {
+        assert.deepEqual(payload.disclosurePolicy, disclosurePolicy);
+        return { approved: true, findings: [] };
+      }
+    }
+  });
+  assert.deepEqual(result, { approved: true, findings: [] });
+});

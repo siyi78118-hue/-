@@ -191,6 +191,19 @@ function proactiveCognitionResult(motiveEvidenceIds) {
   });
 }
 
+const expectedDisclosurePolicy = Object.freeze({
+  version: 1,
+  defaultMode: 'implicit',
+  understandingUse: 'guide_response_not_dialogue',
+  mustConveyUse: 'public_interaction_obligations',
+  unaskedInterpretationLimit: 0,
+  explicitExceptions: [
+    'user_requested_interpretation',
+    'repair_requires_clarification',
+    'safety_or_consent'
+  ]
+});
+
 test('moment reply accepts visible comment evidence and rejects a foreign comment id', async () => {
   const commentId = 'comment_visible';
   const momentEnvelope = {
@@ -238,6 +251,29 @@ test('moment reply accepts visible comment evidence and rejects a foreign commen
     cognitionEnvelope: momentEnvelope,
     client: new FakeClient(withEvidence('comment_foreign'), expressionResult())
   })), /unknown evidence messageId: comment_foreign/);
+});
+
+test('pinned 2.1.1 gives expression and supervision the same implicit-understanding policy', async () => {
+  const client = new FakeClient(cognitionResult(), expressionResult());
+  const reviewInputs = [];
+  const result = await runCognitionV3Turn(input({
+    turn: {
+      turnId: 'turn_v3',
+      characterId: 'yuqi',
+      authoritativeReleaseId: 'release_v3',
+      presetVersion: '2.1.1'
+    },
+    client,
+    supervise(reviewInput) {
+      reviewInputs.push(reviewInput);
+      return { approved: true, findings: [] };
+    }
+  }));
+
+  assert.equal(result.state, 'completed');
+  const expressionCall = client.calls.find((call) => call.role === 'expression_v3');
+  assert.deepEqual(expressionCall.payload.expressionBrief.disclosurePolicy, expectedDisclosurePolicy);
+  assert.deepEqual(reviewInputs[0].disclosurePolicy, expectedDisclosurePolicy);
 });
 
 test('fast cognition can escalate before expression with fixed role budgets', async () => {

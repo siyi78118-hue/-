@@ -332,7 +332,8 @@ async function runV3Expression(
     envelope: cognitionEnvelope,
     agencyView,
     relationship: sanitizeRelationshipExpressionView(relationshipExpression),
-    cognitionResult: cognitionResultWithoutRelationshipReview(cognitionPacket.cognitionResult)
+    cognitionResult: cognitionResultWithoutRelationshipReview(cognitionPacket.cognitionResult),
+    presetVersion: input.turn?.presetVersion
   });
   const expressionRaw = objectResult(await input.client.runRole(
     'expression_v3',
@@ -357,12 +358,20 @@ async function runV3Expression(
   ), 'expression_v3');
   const expressionResult = normalizeExpressionV3Result(expressionRaw);
   return {
+    expressionBrief,
     expressionResult,
     draft: materializeV3Draft({ cognitionPacket, expressionResult })
   };
 }
 
-async function reviewV3Draft(input, cognitionPacket, draft, relationshipExpression, final = false) {
+async function reviewV3Draft(
+  input,
+  cognitionPacket,
+  draft,
+  relationshipExpression,
+  expressionBrief,
+  final = false
+) {
   const custom = final ? input.finalSupervise || input.supervise : input.supervise;
   const reviewInput = {
     highRisk: Boolean(input.highRisk),
@@ -372,6 +381,9 @@ async function reviewV3Draft(input, cognitionPacket, draft, relationshipExpressi
     currentInteraction: cognitionPacket.envelope.currentInteraction,
     continuity: input.continuity || null,
     applicableChecks: input.applicableChecks || [],
+    ...(expressionBrief?.disclosurePolicy
+      ? { disclosurePolicy: structuredClone(expressionBrief.disclosurePolicy) }
+      : {}),
     reviewer: input.reviewer,
     turnSuperseded: input.turnSuperseded,
     actionAuthorized: input.actionAuthorized
@@ -460,7 +472,7 @@ export async function runCognitionV3Turn(input) {
     );
   }
 
-  let { expressionResult, draft } = await runV3Expression(
+  let { expressionBrief, expressionResult, draft } = await runV3Expression(
     input,
     cognitionEnvelope,
     cognitionPacket,
@@ -471,7 +483,13 @@ export async function runCognitionV3Turn(input) {
     expressionRewrite: 0,
     finalReview: 0
   };
-  let supervision = await reviewV3Draft(input, cognitionPacket, draft, relationshipExpression);
+  let supervision = await reviewV3Draft(
+    input,
+    cognitionPacket,
+    draft,
+    relationshipExpression,
+    expressionBrief
+  );
   if (!supervision.approved) {
     const actionFindings = supervision.findings.filter((item) => item.owner === 'action');
     if (actionFindings.length) {
@@ -530,7 +548,7 @@ export async function runCognitionV3Turn(input) {
     }
     if (cognitionFindings.length || expressionFindings.length) {
       attempts.expressionRewrite = 1;
-      ({ expressionResult, draft } = await runV3Expression(
+      ({ expressionBrief, expressionResult, draft } = await runV3Expression(
         input,
         cognitionEnvelope,
         cognitionPacket,
@@ -544,6 +562,7 @@ export async function runCognitionV3Turn(input) {
       cognitionPacket,
       draft,
       relationshipExpression,
+      expressionBrief,
       true
     );
   }

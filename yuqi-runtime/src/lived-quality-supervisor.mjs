@@ -127,6 +127,9 @@ export async function superviseLivedTurn(input) {
     visibleDraft: String(input.draft?.reply || ''),
     currentInteraction: input.currentInteraction || { messages: [] },
     continuity: input.continuity || null,
+    ...(input.disclosurePolicy
+      ? { disclosurePolicy: structuredClone(input.disclosurePolicy) }
+      : {}),
     checks
   });
   const findings = (reviewed?.findings || []).map((item) => finding(item, input));
