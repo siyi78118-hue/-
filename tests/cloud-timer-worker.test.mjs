@@ -11,24 +11,65 @@ globalThis.__alTestSendPush = async (_target, _env, payload) => payload.jobId ==
   ? ({ ok: false, reason: 'temporary FCM outage', retry: true })
   : ({ ok: true, transport: 'fcm', payload: true });
 
-class FakeKV {
+class MemoryTimerStore {
   constructor() {
-    this.rows = new Map();
+    this.devices = new Map();
+    this.jobs = new Map();
+    this.cronSummary = null;
   }
-  async get(key) {
-    return this.rows.get(key) ?? null;
+  async getSubscription(deviceId) {
+    return this.devices.get(deviceId) || null;
   }
-  async put(key, value) {
-    this.rows.set(key, String(value));
+  async saveSubscription(target) {
+    const previous = await this.getSubscription(target.deviceId);
+    const idempotent = previous != null
+      && previous.transport === target.transport
+      && previous.fcmToken === target.fcmToken
+      && previous.backgroundAck === target.backgroundAck
+      && JSON.stringify(previous.subscription) === JSON.stringify(target.subscription);
+    if (!idempotent) this.devices.set(target.deviceId, structuredClone(target));
+    return { idempotent };
   }
-  async delete(key) {
-    this.rows.delete(key);
+  async deleteSubscription(deviceId) {
+    return this.devices.delete(deviceId);
+  }
+  async getJob(jobId) {
+    return this.jobs.get(jobId) || null;
+  }
+  async saveJob(job, logicalKey) {
+    const active = [...this.jobs.values()].find(row => row.logicalKey === logicalKey) || null;
+    const previous = await this.getJob(job.jobId);
+    const comparable = value => JSON.stringify({ ...value, updatedAt: 0, logicalKey: undefined });
+    if (active?.jobId === job.jobId && previous && comparable(previous) === comparable(job)) {
+      return { idempotent: true, replacedJobId: '' };
+    }
+    if (active && active.jobId !== job.jobId) this.jobs.delete(active.jobId);
+    this.jobs.set(job.jobId, { ...structuredClone(job), logicalKey });
+    return { idempotent: false, replacedJobId: active?.jobId || '' };
+  }
+  async deleteJob(jobId) {
+    return this.jobs.delete(jobId);
+  }
+  async dueJobs(now, limit = 100) {
+    return [...this.jobs.values()]
+      .filter(row => Date.parse(row.dueAt) <= now)
+      .sort((left, right) => Date.parse(left.dueAt) - Date.parse(right.dueAt))
+      .slice(0, limit);
+  }
+  async deviceJobs(deviceId) {
+    return [...this.jobs.values()].filter(row => row.deviceId === deviceId);
+  }
+  async getCronSummary() {
+    return this.cronSummary;
+  }
+  async saveCronSummary(summary) {
+    this.cronSummary = structuredClone(summary);
   }
 }
 
-function envFor(kv = new FakeKV()) {
+function envFor(store = new MemoryTimerStore()) {
   return {
-    AL_TIMER_KV: kv,
+    AL_TIMER_STORE: store,
     FIREBASE_PROJECT_ID: 'test-project',
     FIREBASE_CLIENT_EMAIL: 'test@example.com',
     FIREBASE_PRIVATE_KEY: 'unused-by-test-hook'
@@ -70,16 +111,13 @@ async function runCron(env) {
 test('a transient push failure migrates the job into a future retry bucket', async () => {
   const env = envFor();
   const dueAt = new Date(Date.now() - 61000).toISOString();
-  const oldMinute = Math.ceil(Date.parse(dueAt) / 60000);
   await registerAndSchedule(env, { jobId: 'retry-job', dueAt });
   await runCron(env);
 
-  const stored = JSON.parse(await env.AL_TIMER_KV.get('job:retry-job'));
+  const stored = await env.AL_TIMER_STORE.getJob('retry-job');
   assert.ok(Date.parse(stored.dueAt) > Date.now(), 'retry must have a new future dueAt');
   assert.equal(Number(stored.deliveryAttempts), 1);
-  assert.equal(await env.AL_TIMER_KV.get(`due:${oldMinute}`), null, 'past bucket must be cleared');
-  const retryMinute = Math.ceil(Date.parse(stored.dueAt) / 60000);
-  assert.deepEqual(JSON.parse(await env.AL_TIMER_KV.get(`due:${retryMinute}`)), ['retry-job']);
+  assert.deepEqual(await env.AL_TIMER_STORE.dueJobs(Date.now()), [], 'retried job must leave the due query');
 });
 
 test('an accepted FCM push stays pending until the matching phone acknowledges it', async () => {
@@ -88,15 +126,15 @@ test('an accepted FCM push stays pending until the matching phone acknowledges i
   await registerAndSchedule(env, { jobId: 'ack-job', dueAt });
   await runCron(env);
 
-  const waiting = JSON.parse(await env.AL_TIMER_KV.get('job:ack-job'));
+  const waiting = await env.AL_TIMER_STORE.getJob('ack-job');
   assert.equal(waiting.awaitingAck, true);
   assert.equal(waiting.deliveryAttempts, 1);
   const wrong = await post(env, '/ack', { deviceId: 'device-b', jobId: 'ack-job', outcome: 'generated' });
   assert.equal(wrong.status, 400);
-  assert.ok(await env.AL_TIMER_KV.get('job:ack-job'));
+  assert.ok(await env.AL_TIMER_STORE.getJob('ack-job'));
   const acknowledged = await post(env, '/ack', { deviceId: 'device-a', jobId: 'ack-job', outcome: 'generated' });
   assert.equal(acknowledged.status, 200);
-  assert.equal(await env.AL_TIMER_KV.get('job:ack-job'), null);
+  assert.equal(await env.AL_TIMER_STORE.getJob('ack-job'), null);
 });
 
 test('FCM uses the documented Android high priority value and survives short offline periods', async () => {

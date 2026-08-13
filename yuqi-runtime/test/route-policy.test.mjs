@@ -149,3 +149,27 @@ test('role profiles implement the approved model matrix', () => {
   assert.deepEqual(roleExecutionProfile('deep', 'brain'), { model: 'gpt-5.6-sol', effort: 'medium' });
   assert.deepEqual(roleExecutionProfile('deep', 'supervisor'), { model: 'gpt-5.6-terra', effort: 'medium' });
 });
+
+test('configured deep roles accept the supported xhigh reasoning level', () => {
+  const profiles = {
+    deep: {
+      memory: { model: 'gpt-5.6-sol', effort: 'xhigh' }
+    }
+  };
+  assert.deepEqual(roleExecutionProfile('deep', 'memory', profiles), {
+    model: 'gpt-5.6-sol',
+    effort: 'xhigh'
+  });
+});
+
+test('configured roles reject unknown reasoning levels', () => {
+  const profiles = {
+    deep: {
+      brain: { model: 'gpt-5.6-sol', effort: 'extreme' }
+    }
+  };
+  assert.throws(
+    () => roleExecutionProfile('deep', 'brain', profiles),
+    /invalid role execution profile/
+  );
+});

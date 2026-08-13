@@ -1106,6 +1106,9 @@ export function validateEnvelope(value) {
       requireCompleteBatch: envelope.protocolVersion === 3,
       protocolVersion: envelope.protocolVersion
     });
+    if (envelope.protocolVersion === 3) {
+      envelope.message = structuredClone(envelope.context.currentBatch.messages.at(-1));
+    }
   }
   if (envelope.protocolVersion === 3) {
     if (!value.context || typeof value.context !== 'object' || Array.isArray(value.context)) {
@@ -1212,6 +1215,57 @@ function canonicalMessageId(value, label = 'batch messageId') {
   return messageId;
 }
 
+function canonicalQuoteMessageId(value) {
+  const incoming = String(value || '');
+  if (incoming.startsWith('msg_')) return requireId(incoming, 'quote messageId', 'msg_');
+  const deployedNative = /^native_(turn_[A-Za-z0-9_-]{1,127})_(msg_[a-f0-9]{64})_([1-9][0-9]{0,5})$/
+    .exec(incoming);
+  if (!deployedNative) throw new Error('invalid quote messageId');
+  requireId(deployedNative[1], 'quote source turnId', 'turn_');
+  return requireId(deployedNative[2], 'quote messageId', 'msg_');
+}
+
+function normalizeV3Quote(value, envelope) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('invalid v3 quote');
+  }
+  const keys = Object.keys(value).sort();
+  const canonicalKeys = ['messageId', 'speakerId', 'speakerType', 'text'].sort();
+  const deployedUiKeys = ['content', 'contentType', 'messageId', 'speakerId', 'speakerName', 'speakerType'].sort();
+  const isCanonical = canonicalJson(keys) === canonicalJson(canonicalKeys);
+  const isDeployedUi = canonicalJson(keys) === canonicalJson(deployedUiKeys);
+  if (!isCanonical && !isDeployedUi) throw new Error('invalid v3 quote keys');
+
+  const messageId = canonicalQuoteMessageId(value.messageId);
+  requireId(value.speakerId, 'quote speakerId');
+  if (isDeployedUi) {
+    if (value.speakerType !== 'assistant' || value.speakerId !== envelope.characterId
+      || typeof value.speakerName !== 'string' || typeof value.contentType !== 'string'
+      || typeof value.content !== 'string') {
+      throw new Error('invalid v3 quote identity');
+    }
+    return {
+      messageId,
+      speakerId: value.speakerId,
+      speakerType: 'character',
+      text: value.content
+    };
+  }
+  if (!['user', 'character'].includes(value.speakerType) || typeof value.text !== 'string') {
+    throw new Error('invalid v3 quote identity');
+  }
+  if ((value.speakerType === 'user' && value.speakerId !== 'user')
+    || (value.speakerType === 'character' && value.speakerId !== envelope.characterId)) {
+    throw new Error('v3 quote speaker identity mismatch');
+  }
+  return {
+    messageId,
+    speakerId: value.speakerId,
+    speakerType: value.speakerType,
+    text: value.text
+  };
+}
+
 function normalizedBatchMessage(value, envelope) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('invalid current batch message');
@@ -1223,6 +1277,26 @@ function normalizedBatchMessage(value, envelope) {
       'messageId', 'speakerId', 'speakerType', 'recipientId', 'content', 'sentAt', 'attachments',
       'type', 'messageType', 'transcript', 'voiceTranscript', 'quote', 'quoteRef', 'payment'
     ], 'v3 current batch message');
+    const hasQuote = Object.hasOwn(message, 'quote');
+    const hasQuoteRef = Object.hasOwn(message, 'quoteRef');
+    if (hasQuote || hasQuoteRef) {
+      let quote = hasQuote ? message.quote : message.quoteRef;
+      if (hasQuote && hasQuoteRef) {
+        if (message.quote === null && message.quoteRef === null) {
+          quote = null;
+        } else if (message.quote === null || message.quoteRef === null
+          || canonicalJson(message.quote) !== canonicalJson(message.quoteRef)) {
+          throw new Error('v3 quote alias mismatch');
+        }
+      }
+      if (quote === null) {
+        delete message.quote;
+        delete message.quoteRef;
+      } else {
+        message.quote = normalizeV3Quote(quote, envelope);
+        delete message.quoteRef;
+      }
+    }
     const explicitType = Object.hasOwn(message, 'type') || Object.hasOwn(message, 'messageType');
     const type = message.type ?? message.messageType ?? (
       message.payment ? 'payment' : message.quote || message.quoteRef ? 'quote'
@@ -1247,27 +1321,6 @@ function normalizedBatchMessage(value, envelope) {
       message.transcript = transcript ?? null;
     } else if (transcript !== undefined) {
       throw new Error('transcript is only valid for voice messages');
-    }
-    if (message.quote !== undefined || message.quoteRef !== undefined) {
-      const quote = message.quote ?? message.quoteRef;
-      if (!quote || typeof quote !== 'object' || Array.isArray(quote)) throw new Error('invalid v3 quote');
-      assertClosedKeys(quote, ['messageId', 'speakerId', 'speakerType', 'text'], 'v3 quote');
-      requireId(quote.messageId, 'quote messageId', 'msg_');
-      requireId(quote.speakerId, 'quote speakerId');
-      if (!['user', 'character'].includes(quote.speakerType) || typeof quote.text !== 'string') {
-        throw new Error('invalid v3 quote identity');
-      }
-      if ((quote.speakerType === 'user' && quote.speakerId !== 'user')
-        || (quote.speakerType === 'character' && quote.speakerId !== envelope.characterId)) {
-        throw new Error('v3 quote speaker identity mismatch');
-      }
-      message.quote = {
-        messageId: quote.messageId,
-        speakerId: quote.speakerId,
-        speakerType: quote.speakerType,
-        text: quote.text
-      };
-      delete message.quoteRef;
     }
     if (message.payment !== undefined) {
       const payment = message.payment;

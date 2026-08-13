@@ -14,19 +14,19 @@ test('release builds remain unsigned when the formal keystore is unavailable', (
 });
 
 test('formal signing uses the explicit Android release version instead of the workflow run number', () => {
-  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "109"/);
-  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.109"/);
-  assert.match(androidWorkflow, /AL_RELEASE_VERSION_CODE:\s*109/);
-  assert.match(androidWorkflow, /AL_RELEASE_VERSION_NAME:\s*1\.0\.109/);
+  assert.match(androidBuild, /AL_VERSION_CODE"\) \?: "110"/);
+  assert.match(androidBuild, /AL_VERSION_NAME"\) \?: "1\.0\.110"/);
+  assert.match(androidWorkflow, /AL_RELEASE_VERSION_CODE:\s*110/);
+  assert.match(androidWorkflow, /AL_RELEASE_VERSION_NAME:\s*1\.0\.110/);
   assert.doesNotMatch(androidWorkflow, /github\.run_number/);
 });
 
 test('the signed branch build publishes an OTA manifest that names the real release asset', () => {
-  assert.equal(updateManifest.latestBuild, 109);
-  assert.equal(updateManifest.version, '1.0.109');
+  assert.equal(updateManifest.latestBuild, 110);
+  assert.equal(updateManifest.version, '1.0.110');
   assert.equal(
     updateManifest.releaseUrl,
-    'https://github.com/siyi78118-hue/-/releases/download/android-v109/app-release.apk'
+    'https://github.com/siyi78118-hue/-/releases/download/android-v110/app-release.apk'
   );
   assert.match(
     androidWorkflow,

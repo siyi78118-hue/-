@@ -45,6 +45,38 @@ function fallbackBatch() {
   ];
 }
 
+function seedCanonicalUserMessage(store, overrides = {}) {
+  const messageId = overrides.messageId || 'msg_recovery_alias';
+  const turnId = `turn_${messageId}`;
+  const sentAt = overrides.sentAt || 1784400004000;
+  const deviceId = overrides.deviceId || 'phone_a';
+  const message = {
+    messageId,
+    speakerId: 'user',
+    speakerType: 'user',
+    recipientId: 'yuqi',
+    content: overrides.content || '同一个已经提交过的用户气泡',
+    sentAt
+  };
+  store.submitTurn({
+    protocolVersion: 1,
+    turnId,
+    characterId: 'yuqi',
+    deviceId,
+    deviceSeq: overrides.deviceSeq || 41,
+    createdAt: sentAt,
+    message
+  });
+  store.db.prepare(`
+    UPDATE turns
+    SET result_authority_version = 1,
+        state = 'failed',
+        envelope_json = ?
+    WHERE turn_id = ?
+  `).run(JSON.stringify({ protocolVersion: 3 }), turnId);
+  return { message, turnId, deviceId, stored: store.getMessage(messageId) };
+}
+
 test('queues exact fallback messages for background consolidation and never creates a second reply', async () => withStore(async store => {
   const roleCalls = [];
   const codex = {
@@ -111,6 +143,78 @@ test('duplicate recovery batches are idempotent and do not rerun memory', async 
   assert.equal(duplicate.importedMessages, 0);
   assert.equal(duplicate.ackSeq, 12);
 }));
+
+test('a deployed legacy recovery alias converges on its immutable canonical v3 user message', async () => withStore(async store => {
+  const seeded = seedCanonicalUserMessage(store);
+  const before = store.getMessage(seeded.message.messageId);
+  const alias = messageEntry(41, {
+    ...seeded.message,
+    turnId: `turn_legacy_${seeded.message.messageId}`,
+    characterId: 'yuqi',
+    origin: 'phone',
+    deviceId: `${seeded.deviceId}:visible`,
+    deviceSeq: 41
+  });
+  const reconciler = new YuqiReconciler({
+    store,
+    codex: { async runTurn() { throw new AssertionError('an existing user message needs no model call'); } }
+  });
+
+  const result = await reconciler.reconcileFrom({
+    peerId: seeded.deviceId,
+    lastCommonSeq: 40,
+    lastSeq: 41,
+    entries: [alias]
+  });
+
+  assert.equal(result.ackSeq, 41);
+  assert.equal(result.importedMessages, 0);
+  assert.deepEqual(store.getMessage(seeded.message.messageId), before);
+}));
+
+test('canonical recovery alias compatibility rejects every semantic or authority change', async () => {
+  const mutations = [
+    ['content', payload => { payload.content = '被改过的正文'; }],
+    ['sentAt', payload => { payload.sentAt += 1; }],
+    ['speaker', payload => { payload.speakerId = 'yuqi'; payload.speakerType = 'character'; }],
+    ['recipient', payload => { payload.recipientId = 'other'; }],
+    ['legacy owner', payload => { payload.turnId = 'turn_unrelated'; }],
+    ['device identity', payload => { payload.deviceId = 'phone_a'; }],
+    ['device sequence', payload => { payload.deviceSeq = 42; }]
+  ];
+  for (const [label, mutate] of mutations) {
+    await withStore(async store => {
+      const seeded = seedCanonicalUserMessage(store, { messageId: `msg_recovery_${label.replaceAll(' ', '_')}` });
+      const payload = {
+        ...seeded.message,
+        turnId: `turn_legacy_${seeded.message.messageId}`,
+        characterId: 'yuqi',
+        origin: 'phone',
+        deviceId: `${seeded.deviceId}:visible`,
+        deviceSeq: 41
+      };
+      mutate(payload);
+      const reconciler = new YuqiReconciler({
+        store,
+        codex: { async runTurn() { throw new AssertionError('invalid recovery needs no model call'); } }
+      });
+      store.ackSync(seeded.deviceId, 40);
+
+      await assert.rejects(
+        reconciler.reconcileFrom({
+          peerId: seeded.deviceId,
+          lastCommonSeq: 40,
+          lastSeq: 41,
+          entries: [messageEntry(41, payload)]
+        }),
+        /message checksum conflict/,
+        label
+      );
+      assert.equal(store.getSyncCursor(seeded.deviceId), 40, label);
+      assert.equal(store.getMessage(seeded.message.messageId).turnId, seeded.turnId, label);
+    });
+  }
+});
 
 test('a memory provider outage does not block durable reconciliation or its cursor', async () => withStore(async store => {
   const reconciler = new YuqiReconciler({

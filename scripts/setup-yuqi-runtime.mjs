@@ -79,7 +79,11 @@ export function setupYuqiRuntime(options = {}) {
     pairingSecret: prior.pairingSecret || randomToken(36),
     databasePath: join(vaultDir, 'database', 'yuqi-runtime.sqlite'),
     codexCommand: options.codexCommand || prior.codexCommand || 'codex',
-    codexArgs: ['app-server'],
+    codexArgs: Array.isArray(options.codexArgs) && options.codexArgs.length
+      ? options.codexArgs.map(String)
+      : Array.isArray(prior.codexArgs) && prior.codexArgs.length
+        ? prior.codexArgs.map(String)
+        : ['app-server'],
     codexRuntimeDirectory: options.codexRuntimeDirectory || prior.codexRuntimeDirectory || dirname(runtimeDir),
     cloudRelay: {
       enabled: Boolean(cloudEnabled),

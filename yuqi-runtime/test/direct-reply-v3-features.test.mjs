@@ -131,6 +131,79 @@ test('v3 preserves rich currentBatch projection, null voice transcript, quote/pa
   assert.equal(interaction.messages[4].type, 'emoji');
 });
 
+test('v3 normalizes deployed null and UI quote shapes without weakening the quote boundary', () => {
+  const plain = threeBubbleCanonicalV3Envelope();
+  plain.message = { ...plain.message, quote: null };
+  plain.context.currentBatch.messages = plain.context.currentBatch.messages.map((message, index, messages) => (
+    index === messages.length - 1 ? { ...message, quote: null } : message
+  ));
+  const normalizedPlain = validateEnvelope(plain);
+  assert.equal(Object.hasOwn(normalizedPlain.message, 'quote'), false);
+  assert.equal(Object.hasOwn(normalizedPlain.context.currentBatch.messages.at(-1), 'quote'), false);
+
+  const quoted = threeBubbleCanonicalV3Envelope();
+  const deployedQuote = {
+    messageId: 'msg_original',
+    speakerId: 'yuqi',
+    speakerType: 'assistant',
+    speakerName: '虞栖',
+    contentType: 'text',
+    content: '原话'
+  };
+  quoted.message = { ...quoted.message, quote: deployedQuote };
+  quoted.context.currentBatch.messages = quoted.context.currentBatch.messages.map((message, index, messages) => (
+    index === messages.length - 1 ? { ...message, quote: deployedQuote } : message
+  ));
+  const normalizedQuoted = validateEnvelope(quoted);
+  assert.deepEqual(normalizedQuoted.message.quote, {
+    messageId: 'msg_original',
+    speakerId: 'yuqi',
+    speakerType: 'character',
+    text: '原话'
+  });
+  assert.deepEqual(normalizedQuoted.context.currentBatch.messages.at(-1).quote, normalizedQuoted.message.quote);
+
+  const malformed = structuredClone(quoted);
+  malformed.message.quote.secret = 'leak';
+  malformed.context.currentBatch.messages.at(-1).quote.secret = 'leak';
+  assert.throws(() => validateEnvelope(malformed), /quote|key|identity/i);
+});
+
+test('v3 unwraps the deployed native reply item id to its canonical message id', () => {
+  const envelope = threeBubbleCanonicalV3Envelope();
+  const canonicalMessageId = `msg_${'a'.repeat(64)}`;
+  const deployedQuote = {
+    messageId: `native_turn_msg_1786624829345_hjuj14_${canonicalMessageId}_2`,
+    speakerId: 'yuqi',
+    speakerType: 'assistant',
+    speakerName: '虞栖',
+    contentType: 'text',
+    content: '被引用的原话'
+  };
+  envelope.message = { ...envelope.message, quote: deployedQuote };
+  envelope.context.currentBatch.messages = envelope.context.currentBatch.messages.map(
+    (message, index, messages) => index === messages.length - 1
+      ? { ...message, quote: deployedQuote }
+      : message
+  );
+
+  const normalized = validateEnvelope(envelope);
+
+  assert.equal(normalized.message.quote.messageId, canonicalMessageId);
+  assert.equal(normalized.context.currentBatch.messages.at(-1).quote.messageId, canonicalMessageId);
+
+  for (const forged of [
+    `native_turn_msg_1786624829345_hjuj14_${canonicalMessageId}_0`,
+    `native_fake_${canonicalMessageId}_2`,
+    `native_turn_msg_1786624829345_hjuj14_msg_not_a_checksum_2`
+  ]) {
+    const changed = structuredClone(envelope);
+    changed.message.quote.messageId = forged;
+    changed.context.currentBatch.messages.at(-1).quote.messageId = forged;
+    assert.throws(() => validateEnvelope(changed), /quote messageId/);
+  }
+});
+
 test('v3 rejects unknown rich keys, non-native transcript, duplicate/incomplete batches and payment/quote identity mutation', () => {
   assert.throws(() => validateEnvelope(richV3Envelope({ context: { ...richV3Envelope().context, currentBatch: { ...richV3Envelope().context.currentBatch, messages: richMessages().map((item, index) => index === 0 ? { ...item, privateSecret: 'x' } : item) } } })), /key|rich|batch/i);
   assert.throws(() => validateEnvelope(richV3Envelope({ context: { ...richV3Envelope().context, currentBatch: { ...richV3Envelope().context.currentBatch, messages: richMessages().map((item, index) => index === 3 ? { ...item, transcript: 42 } : item) } } })), /transcript|type|voice/i);

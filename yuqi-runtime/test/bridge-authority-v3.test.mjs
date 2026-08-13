@@ -663,6 +663,65 @@ test('v3 canonical creation owns revision claims and cursor sequencing transacti
       /latest|retry lineage authority conflict/i);
   }));
 
+test('a v3 batch adopts exact pre-synced Android visible bubbles without weakening conflicts', () => {
+  const seedVisibleAliases = (store, envelope, mutate = null) => {
+    envelope.context.currentBatch.messages.slice(0, -1).forEach((message, index) => {
+      const alias = {
+        ...message,
+        turnId: `turn_legacy_${message.messageId}`,
+        characterId: envelope.characterId,
+        origin: 'phone',
+        deviceId: `${envelope.deviceId}:visible`,
+        deviceSeq: 40 + index
+      };
+      mutate?.(alias, index);
+      store.putMessage(alias);
+    });
+  };
+
+  withStore(({ store }) => {
+    const raw = v3DirectEnvelope({
+      turnId: 'turn_bridge_v3_visible_alias_batch',
+      rootMessageId: 'msg_bridge_v3_visible_alias_batch'
+    });
+    seedVisibleAliases(store, raw);
+
+    const created = store.createCanonicalVisibleTurnInternal(canonicalCreateInput(store, raw));
+    assert.equal(created.status, 'created');
+    for (const [index, message] of raw.context.currentBatch.messages.entries()) {
+      const saved = store.getMessage(message.messageId);
+      assert.equal(saved.turnId, raw.turnId);
+      assert.equal(saved.deviceId, raw.deviceId);
+      assert.equal(saved.deviceSeq, index === raw.context.currentBatch.messages.length - 1
+        ? raw.deviceSeq : null);
+      assert.equal(saved.content, message.content);
+    }
+    assert.equal(store.getCurrentUserBatch(raw.turnId).messages.length, 3);
+    store.assertVisibleAuthorityV13Invariants();
+  });
+
+  for (const [label, mutate] of [
+    ['content', alias => { alias.content += ' forged'; }],
+    ['recipient', alias => { alias.recipientId = 'foreign'; }],
+    ['device', alias => { alias.deviceId = 'foreign:visible'; }],
+    ['owner', alias => { alias.turnId = 'turn_unrelated'; }]
+  ]) {
+    withStore(({ store }) => {
+      const raw = v3DirectEnvelope({
+        turnId: `turn_bridge_v3_visible_alias_reject_${label}`,
+        rootMessageId: `msg_bridge_v3_visible_alias_reject_${label}`
+      });
+      seedVisibleAliases(store, raw, (alias, index) => {
+        if (index === 0) mutate(alias);
+      });
+      const input = canonicalCreateInput(store, raw);
+      assertZeroWrites(store,
+        () => store.createCanonicalVisibleTurnInternal(input),
+        /message checksum conflict/);
+    });
+  }
+});
+
 test('v3 invalid claims, cursor jumps, clear epochs and changed retry roots leave zero authority writes', () => {
   for (const scenario of [
     {

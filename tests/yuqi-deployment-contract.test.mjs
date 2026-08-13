@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -72,6 +72,24 @@ test('setup creates a durable vault, runtime config and one-tap pairing code', (
     assert.equal(config.cloudRelay.enabled, false);
     assert.match(readFileSync(result.pairingCodePath, 'utf8'), /^YUQI1:/);
     assert.ok(readFileSync(result.readmePath, 'utf8').includes('手机一键配对码'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('setup preserves a pinned standalone Codex CLI command and argument vector', () => {
+  const root = mkdtempSync(join(tmpdir(), 'yuqi-codex-cli-'));
+  const runtimeDir = join(root, 'runtime');
+  const vaultDir = join(root, 'vault');
+  try {
+    const first = setupYuqiRuntime({ runtimeDir, vaultDir, codexCommand: 'node', cloudEnabled: false });
+    const config = JSON.parse(readFileSync(first.configPath, 'utf8'));
+    config.codexArgs = ['runtime-tools/codex-cli/node_modules/@openai/codex/bin/codex.js', 'app-server'];
+    writeFileSync(first.configPath, JSON.stringify(config, null, 2));
+    const second = setupYuqiRuntime({ runtimeDir, vaultDir, cloudEnabled: false });
+    const reopened = JSON.parse(readFileSync(second.configPath, 'utf8'));
+    assert.equal(reopened.codexCommand, 'node');
+    assert.deepEqual(reopened.codexArgs, config.codexArgs);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

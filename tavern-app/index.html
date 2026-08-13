@@ -1407,7 +1407,7 @@ const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
 const NATIVE_BRIDGE_TIMEOUT_MS = 8000;
 const NATIVE_RECONCILE_TIMEOUT_MS = 12000;
 const NATIVE_TURN_APPLY_TIMEOUT_MS = 10000;
-const APP_BUILD_VERSION = '2026-08-13.109';
+const APP_BUILD_VERSION = '2026-08-14.110';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -4595,10 +4595,7 @@ async function applyNativeExecutionTurnUnlocked(result) {
         paymentStatus ? nativePartPayload(paymentStatus).status : ''
       );
     }
-    if (schedule) {
-      const at = parseProactiveScheduleTime(nativePartPayload(schedule).nextProactiveAt);
-      schedulePlannedChatFromReply(charId, at ? { dueAt: at } : null).catch(err => console.warn('[AL Timer] native schedule skipped:', err.message));
-    }
+    rescheduleAfterNativeDirectReply(charId, schedule).catch(err => console.warn('[AL Timer] native schedule skipped:', err.message));
     ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment schedule skipped:', err.message));
     delete userMessage.replyState;
     delete userMessage.replyError;
@@ -4957,6 +4954,7 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
     nativeTurnId: turnId
   };
   userMessage.replyState = 'pending';
+  userMessage.sourceTurnId = `native:${turnId}`;
   delete userMessage.replyError;
   nativeReplyQueuedIds.add(turnId);
   isStreaming = true;
@@ -5576,8 +5574,22 @@ function messageContentForAI(message) {
   const quote = quoteContextText(message.quote);
   return quote ? `${quote}\n用户本次正文：${content}` : content;
 }
+function messageQuoteForWire(charId, quote) {
+  if (!quote || typeof quote !== 'object' || Array.isArray(quote)) return null;
+  if (quote.speakerType !== 'assistant' || String(quote.speakerId || '') !== String(charId || '')) return null;
+  const messageId = String(quote.messageId || '');
+  const text = typeof quote.content === 'string' ? quote.content : '';
+  if (!messageId.startsWith('msg_') || !text) return null;
+  return {
+    messageId,
+    speakerId: String(charId || ''),
+    speakerType: 'character',
+    text
+  };
+}
 function batchMessageForAI(charId, message) {
   const attachments = messageAttachmentsForAI(message);
+  const quote = messageQuoteForWire(charId, message?.quote);
   return {
     messageId: String(message?.id || ''),
     speakerId: 'user',
@@ -5585,7 +5597,7 @@ function batchMessageForAI(charId, message) {
     recipientId: String(charId || ''),
     content: messageContentForAI(message),
     ...(attachments.length ? { attachments } : {}),
-    quote: message?.quote || null,
+    ...(quote ? { quote } : {}),
     sentAt: Math.max(1, Number(message?.time) || Date.now())
   };
 }
@@ -9170,15 +9182,7 @@ async function retryFailedReply(charId, userMessageId) {
             retryOfTurnId,
             canonicalMessageId: userMessageId
           },
-          message: {
-            messageId: userMessageId,
-            speakerId: 'user',
-            speakerType: 'user',
-            recipientId: charId,
-            content: messageContentForAI(message),
-            quote: message.quote || null,
-            sentAt: Number(message.time) || task.createdAt
-          },
+          message: batchMessageForAI(charId, message),
           deviceSeq: Math.max(1, task.createdAt)
         }),
         snapshotJson: JSON.stringify(snapshot),
@@ -11423,6 +11427,12 @@ async function clearAllAutomaticTasks() {
 async function schedulePlannedChatFromReply(charId, directive = null) {
   const dueAt = directive?.dueAt || new Date(Date.now() + proactiveDelayMs('chat'));
   return scheduleCloudProactive(charId, 'chat', { mode: 'planned', dueAt });
+}
+async function rescheduleAfterNativeDirectReply(charId, schedulePart = null) {
+  const at = schedulePart
+    ? parseProactiveScheduleTime(nativePartPayload(schedulePart).nextProactiveAt)
+    : null;
+  return schedulePlannedChatFromReply(charId, at ? { dueAt: at } : null);
 }
 async function scheduleDiceProactive(charId, kind = 'chat') {
   return scheduleCloudProactive(charId, kind, proactiveDiceOptions(kind));

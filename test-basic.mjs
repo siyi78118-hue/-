@@ -169,7 +169,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v109';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v110';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -190,7 +190,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-08-13\.109';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.110';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -297,6 +297,11 @@ assert.match(swScript, /function backgroundStagePersonaBlock\(char, settings = \
 assert.match(swScript, /composer\.add\('stage-persona', backgroundStagePersonaBlock\(char, settings\)/);
 assert.match(script, /continueAssistantTurn[\s\S]*prepareConversationContextSafe\([\s\S]*ensureForegroundReplyQuality/);
 assert.match(script, /chat\.pendingReply = \{[\s\S]*userMessageId/);
+assert.match(
+  script,
+  /const turnId = nativeTurnIdForMessage\(userMessageId\);[\s\S]{0,700}userMessage\.sourceTurnId = `native:\$\{turnId\}`;[\s\S]{0,500}DB\.set\('chats', allChats\)/,
+  'a native direct user bubble must persist its canonical turn identity before later visible-history sync'
+);
 assert.match(script, /function resumePendingAssistantTurns\(\)/);
 assert.match(script, /function mergeLocalPendingReplies\(remoteChats = \{\}, localChats = \{\}, options = \{\}\)/);
 assert.match(script, /function preservePendingRepliesForUnload\(\)/);
@@ -1089,9 +1094,24 @@ assert.match(script, /function selectMessageQuote\(charId, messageId\)/, '必须
 assert.match(script, /onclick="selectSelectedMessageQuote\(\)"/, '长按虞栖消息菜单必须提供引用入口');
 assert.match(script, /stagePlayerMessage\(chat, text, quote \? \{ quote \} : \{\}\)/, '发送消息时必须把引用快照存入用户消息');
 assert.match(script, /function batchMessageForAI\(charId, message\)/, '原生首次发送必须从完整批次构造规范消息');
-assert.match(script, /quote:\s*message\?\.quote \|\| null/, '原生首次发送必须传递每个气泡自己的引用快照');
+assert.match(script, /function messageQuoteForWire\(charId, quote\)/, '原生引用必须通过单一闭集投影转换为 v3 wire 结构');
+assert.doesNotMatch(script, /quote:\s*message\?\.quote \|\| null/, '无引用时不能把 quote:null 发给 v3 协议');
 assert.match(script, /message:\s*wireSourceMessage/, '原生首次发送必须以批次末条作为回复锚点');
-assert.match(script, /quote:\s*message\.quote \|\| null/, '原生重试必须传递同一引用快照');
+assert.match(script, /message:\s*batchMessageForAI\(charId, message\)/, '原生重试必须复用首次发送的规范消息投影');
+const plainWireMessage = JSON.parse(JSON.stringify(context.batchMessageForAI('yuqi', {
+  id: 'msg_plain_wire', role: 'user', content: '普通消息', time: 30
+})));
+assert.equal(Object.hasOwn(plainWireMessage, 'quote'), false, '普通气泡必须完全省略 quote 字段');
+const quotedWireMessage = JSON.parse(JSON.stringify(context.batchMessageForAI('yuqi', {
+  id: 'msg_quoted_wire', role: 'user', content: '接着说', time: 31,
+  quote: {
+    messageId: 'msg_quote_source', speakerId: 'yuqi', speakerType: 'assistant',
+    speakerName: '虞栖', contentType: 'text', content: '我会记得这件事'
+  }
+})));
+assert.deepEqual(quotedWireMessage.quote, {
+  messageId: 'msg_quote_source', speakerId: 'yuqi', speakerType: 'character', text: '我会记得这件事'
+});
 const quoteUiProbe = vm.runInContext(`(() => {
   const oldCharacters = characters;
   const oldChats = allChats;
@@ -2577,6 +2597,27 @@ assert.equal(diceScheduleProbe.job.rollChance, 0.15);
 assert.equal(diceScheduleProbe.job.diceIntervalMs, 600000);
 assert.ok(Math.abs(Date.parse(diceScheduleProbe.job.dueAt) - diceScheduleProbe.startedAt - diceScheduleProbe.job.diceRolls * 600000) < 2000);
 assert.equal(diceScheduleProbe.legacyZeroChanceResult, false, '旧骰子任务仍需在到点时兼容抽签');
+const nativeDirectScheduleProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedChats = allChats;
+  settings = { ...settings, proactiveEnabled: true, cloudTimerEnabled: false, deviceId: 'native-direct-device', proactiveIdleMinutes: 30 };
+  const oldDueAt = new Date(Date.now() + 90 * 60000).toISOString();
+  allChats = { native_direct_char: { messages: [{ role: 'user', content: '还在聊', time: Date.now() }], pendingProactiveJob: { jobId: 'old-dice-job', dueAt: oldDueAt, kind: 'chat', mode: 'dice' } } };
+  const startedAt = Date.now();
+  await rescheduleAfterNativeDirectReply('native_direct_char', null);
+  const fallback = { ...allChats.native_direct_char.pendingProactiveJob };
+  const explicitDueAt = new Date(Date.now() + 2 * 60 * 60000).toISOString();
+  await rescheduleAfterNativeDirectReply('native_direct_char', { payloadJson: JSON.stringify({ nextProactiveAt: explicitDueAt }) });
+  const explicit = { ...allChats.native_direct_char.pendingProactiveJob };
+  settings = savedSettings;
+  allChats = savedChats;
+  return { fallback, explicit, explicitDueAt, startedAt };
+})()`, context);
+assert.equal(nativeDirectScheduleProbe.fallback.mode, 'planned');
+assert.notEqual(nativeDirectScheduleProbe.fallback.jobId, 'old-dice-job');
+assert.ok(Date.parse(nativeDirectScheduleProbe.fallback.dueAt) >= nativeDirectScheduleProbe.startedAt + 29 * 60000);
+assert.equal(nativeDirectScheduleProbe.explicit.mode, 'planned');
+assert.equal(nativeDirectScheduleProbe.explicit.dueAt, nativeDirectScheduleProbe.explicitDueAt);
 const momentDiceScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;

@@ -25,6 +25,43 @@ function validateEntries(entries) {
   }
 }
 
+const ANDROID_MESSAGE_PAYLOAD_KEYS = Object.freeze([
+  'characterId', 'content', 'deviceId', 'deviceSeq', 'messageId', 'origin',
+  'recipientId', 'sentAt', 'speakerId', 'speakerType', 'turnId'
+]);
+
+function isCanonicalUserMessageRecoveryAlias({ store, peerId, entry, existing }) {
+  const payload = entry?.payload;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+    || Object.keys(payload).sort().join(',') !== [...ANDROID_MESSAGE_PAYLOAD_KEYS].sort().join(',')
+    || entry.entityId !== payload.messageId
+    || payload.speakerId !== 'user' || payload.speakerType !== 'user'
+    || payload.origin !== 'phone'
+    || payload.deviceId !== `${peerId}:visible`
+    || !Number.isSafeInteger(payload.deviceSeq) || payload.deviceSeq !== Number(entry.seq)
+    || payload.turnId !== `turn_legacy_${payload.messageId}`
+    || existing?.turnId !== `turn_${payload.messageId}`
+    || existing.messageId !== payload.messageId
+    || existing.characterId !== payload.characterId
+    || existing.speakerId !== payload.speakerId
+    || existing.speakerType !== payload.speakerType
+    || existing.recipientId !== payload.recipientId
+    || existing.content !== payload.content
+    || existing.sentAt !== payload.sentAt
+    || existing.origin !== payload.origin
+    || existing.deviceId !== peerId
+    || !Number.isSafeInteger(existing.deviceSeq) || existing.deviceSeq < 1) {
+    return false;
+  }
+  const owner = store.getTurn(existing.turnId);
+  return Number(owner?.resultAuthorityVersion || 0) === 1
+    && Number(owner?.protocolVersion || 0) === 3
+    && owner.turnId === existing.turnId
+    && owner.characterId === payload.characterId
+    && owner.deviceId === peerId
+    && owner.sourceMessageId === payload.messageId;
+}
+
 export function normalizeRecoverySnapshot(value, { expectedDeviceId = null } = {}) {
   const keys = value && typeof value === 'object' && !Array.isArray(value)
     ? Object.keys(value).sort().join(',')
@@ -103,6 +140,11 @@ export class YuqiReconciler {
       }
       if (entry.entityType !== 'message' || entry.operation === 'delete') continue;
       const before = this.store.getMessage(entry.entityId);
+      if (before && isCanonicalUserMessageRecoveryAlias({
+        store: this.store, peerId, entry, existing: before
+      })) {
+        continue;
+      }
       const saved = this.store.putMessage(entry.payload);
       if (!before) imported.push(saved);
     }

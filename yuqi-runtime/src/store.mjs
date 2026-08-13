@@ -12275,7 +12275,7 @@ export class YuqiStore {
       if (!retry && envelope.message) {
         const initialBatch = resolveCurrentUserBatch(envelope);
         for (const message of initialBatch?.messages || [envelope.message]) {
-          this.putMessageInternal({
+          this.putCanonicalV3UserMessageInternal({
             ...message,
             turnId: envelope.turnId,
             characterId: envelope.characterId,
@@ -12283,7 +12283,7 @@ export class YuqiStore {
             deviceId: envelope.deviceId,
             deviceSeq: message.messageId === envelope.message.messageId
               ? envelope.deviceSeq : null
-          });
+          }, { peerId: envelope.deviceId });
         }
       }
       if (envelope.message) this.putCurrentUserBatchInternal(envelope);
@@ -17308,6 +17308,94 @@ export class YuqiStore {
     );
     const saved = mapMessage(this.db.prepare('SELECT * FROM messages WHERE message_id = ?').get(normalized.messageId));
     this.appendSync('message', normalized.messageId, 'insert', saved);
+    return saved;
+  }
+
+  putCanonicalV3UserMessageInternal(message, { peerId } = {}) {
+    const normalized = {
+      messageId: String(message?.messageId || ''),
+      turnId: String(message?.turnId || ''),
+      characterId: String(message?.characterId || ''),
+      speakerId: String(message?.speakerId || ''),
+      speakerType: String(message?.speakerType || ''),
+      recipientId: String(message?.recipientId || ''),
+      content: String(message?.content || ''),
+      sentAt: Number(message?.sentAt),
+      origin: String(message?.origin || 'codex'),
+      deviceId: message?.deviceId ? String(message.deviceId) : null,
+      deviceSeq: Number.isSafeInteger(message?.deviceSeq) ? message.deviceSeq : null
+    };
+    const desiredChecksum = contentHash(normalized);
+    const existing = this.db.prepare(
+      'SELECT * FROM messages WHERE message_id = ?'
+    ).get(normalized.messageId);
+    if (!existing || existing.checksum === desiredChecksum) {
+      return this.putMessageInternal(message);
+    }
+
+    const canonicalOwner = this.getTurn(normalized.turnId);
+    const legacyTurnId = `turn_legacy_${normalized.messageId}`;
+    const alias = {
+      messageId: existing.message_id,
+      turnId: existing.turn_id,
+      characterId: existing.character_id,
+      speakerId: existing.speaker_id,
+      speakerType: existing.speaker_type,
+      recipientId: existing.recipient_id,
+      content: existing.content,
+      sentAt: existing.sent_at,
+      origin: existing.origin,
+      deviceId: existing.device_id,
+      deviceSeq: existing.device_seq
+    };
+    const batchReferences = Number(this.db.prepare(
+      'SELECT COUNT(*) AS count FROM current_user_batch_items WHERE message_id = ?'
+    ).get(normalized.messageId)?.count || 0);
+    const suppressed = Number(this.db.prepare(
+      'SELECT COUNT(*) AS count FROM suppressed_messages WHERE message_id = ?'
+    ).get(normalized.messageId)?.count || 0);
+    const exactVisibleAlias = canonicalOwner?.resultAuthorityVersion === 1
+      && Number(canonicalOwner.protocolVersion) === 3
+      && canonicalOwner.turnId === normalized.turnId
+      && canonicalOwner.characterId === normalized.characterId
+      && canonicalOwner.deviceId === String(peerId || '')
+      && normalized.deviceId === String(peerId || '')
+      && normalized.speakerId === 'user'
+      && normalized.speakerType === 'user'
+      && normalized.recipientId === normalized.characterId
+      && normalized.origin === 'phone'
+      && existing.turn_id === legacyTurnId
+      && this.getTurn(legacyTurnId) === null
+      && existing.character_id === normalized.characterId
+      && existing.speaker_id === normalized.speakerId
+      && existing.speaker_type === normalized.speakerType
+      && existing.recipient_id === normalized.recipientId
+      && existing.content === normalized.content
+      && Number(existing.sent_at) === normalized.sentAt
+      && existing.origin === normalized.origin
+      && existing.device_id === `${peerId}:visible`
+      && Number.isSafeInteger(Number(existing.device_seq))
+      && Number(existing.device_seq) >= 1
+      && existing.authority_group_id == null
+      && existing.group_ordinal == null
+      && existing.checksum === contentHash(alias)
+      && batchReferences === 0
+      && suppressed === 0;
+    if (!exactVisibleAlias) throw new Error('message checksum conflict');
+
+    const updated = this.db.prepare(`
+      UPDATE messages
+      SET turn_id = ?, device_id = ?, device_seq = ?, checksum = ?
+      WHERE message_id = ? AND turn_id = ? AND checksum = ?
+    `).run(
+      normalized.turnId, normalized.deviceId, normalized.deviceSeq, desiredChecksum,
+      normalized.messageId, legacyTurnId, existing.checksum
+    );
+    if (Number(updated.changes) !== 1) throw new Error('message checksum conflict');
+    const saved = mapMessage(this.db.prepare(
+      'SELECT * FROM messages WHERE message_id = ?'
+    ).get(normalized.messageId));
+    this.appendSync('message', normalized.messageId, 'canonicalize', saved);
     return saved;
   }
 
