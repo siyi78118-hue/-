@@ -257,6 +257,7 @@ export async function runQualityReplayPlanSqlite({
   subjectFactory, executeQualitySubjectSide, evaluator, evaluatorSecondary,
   now = () => Date.now(), onPhase = () => {}, phaseClientFactory = null,
   bindProductionPhase = null,
+  phaseMode = 'all',
   evidenceClass = 'fixture',
   productionToken = null,
   productionAuthority = null,
@@ -266,6 +267,9 @@ export async function runQualityReplayPlanSqlite({
   evaluatorIds = { primary: 'evaluator-primary', secondary: 'evaluator-secondary' }
 } = {}) {
   if (typeof ledgerPath !== 'string' || !ledgerPath) throw new Error('SQLite quality ledger required');
+  if (!['all', 'execution_only'].includes(phaseMode)) {
+    throw new Error('quality phase mode conflict');
+  }
   if (evidenceClass !== 'fixture'
     && (evidenceClass !== 'production' || productionToken !== PRODUCTION_RUN_TOKEN)) {
     throw new Error('production ledger authority is private');
@@ -352,8 +356,10 @@ export async function runQualityReplayPlanSqlite({
       const phaseOutputs = {};
       const subjectType = subject.subjectType
         || (subject.semanticInput?.turnKind === 'LIFE_PLANNING' ? 'life_planning' : 'turn');
-      for (const phase of ['stable_execution', 'candidate_execution',
-        'evaluator_primary', 'evaluator_secondary']) {
+      const phases = phaseMode === 'execution_only'
+        ? ['stable_execution', 'candidate_execution']
+        : ['stable_execution', 'candidate_execution', 'evaluator_primary', 'evaluator_secondary'];
+      for (const phase of phases) {
         const phaseInput = qualityPhaseInput({
           runId, finalKey, phase, subject,
           authorityInputChecksum: effectiveAuthorityInputChecksum, now: now()
@@ -463,6 +469,10 @@ export async function runQualityReplayPlanSqlite({
           }
           throw error;
         }
+      }
+      if (phaseMode === 'execution_only') {
+        results.push({ finalKey, final: null, phases: phaseOutputs });
+        continue;
       }
       const primary = normalizeBlindEvaluatorPhaseOutput(phaseOutputs.evaluator_primary);
       const secondary = normalizeBlindEvaluatorPhaseOutput(phaseOutputs.evaluator_secondary);
@@ -705,7 +715,9 @@ export async function runQualityReplayFixture({
 }
 
 export async function runQualityReplayPlan(options = {}) {
-  const allowed = new Set(['plan', 'ledgerPath', 'runAuthority', 'selector', 'resumeRun', 'sourceRootDir']);
+  const allowed = new Set([
+    'plan', 'ledgerPath', 'runAuthority', 'selector', 'resumeRun', 'sourceRootDir', 'phaseMode',
+  ]);
   if (Object.keys(options).some(key => !allowed.has(key))) {
     throw new Error('production quality replay option conflict');
   }
@@ -722,6 +734,10 @@ export async function runQualityReplayPlan(options = {}) {
   const onlyFinalKey = options.selector.onlyFinalKey;
   if (onlyFinalKey !== null && typeof onlyFinalKey !== 'string') {
     throw new Error('production quality replay selector conflict');
+  }
+  const phaseMode = options.phaseMode || 'all';
+  if (!['all', 'execution_only'].includes(phaseMode)) {
+    throw new Error('production quality phase mode conflict');
   }
   const sourceRootDir = options.sourceRootDir || process.cwd();
   // A resume begins with a read-only ledger authority check.  No source
@@ -798,6 +814,7 @@ export async function runQualityReplayPlan(options = {}) {
     header,
     resumeRun: options.resumeRun,
     onlyFinalKey,
+    phaseMode,
     subjectFactory: async (item, execution) => {
       const context = await prepareQualityProductionSubject(config, {
         item,
@@ -1238,6 +1255,10 @@ export function parseQualityReplayCliArgs(argv = process.argv.slice(2)) {
       result.execute = true;
       continue;
     }
+    if (token === '--execution-only') {
+      result.executionOnly = true;
+      continue;
+    }
     if (token === '--max-items') {
       throw new Error('--max-items is forbidden in production quality replay');
     }
@@ -1352,6 +1373,7 @@ if (isMain) {
         ledgerPath: productionLedgerAuthorityPath(cli.ledger),
         runAuthority,
         selector: { onlyFinalKey: cli.onlyFinalKey || null },
+        phaseMode: cli.executionOnly ? 'execution_only' : 'all',
         resumeRun: cli.resumeRun || null,
       });
       if (result.run?.state !== 'finalized') {

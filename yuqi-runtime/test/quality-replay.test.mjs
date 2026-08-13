@@ -122,9 +122,9 @@ test('quality replay CLI parser rejects unknown duplicate valueless and max-item
   assert.throws(() => parseQualityReplayCliArgs(['--max-items', '1']), /max-items|production/i);
   assert.throws(() => parseQualityReplayCliArgs(['--execute']), /ledger/i);
   assert.deepEqual(parseQualityReplayCliArgs([
-    '--execute', '--ledger', 'quality.sqlite', '--execution-config', 'authority.mjs'
+    '--execute', '--execution-only', '--ledger', 'quality.sqlite', '--execution-config', 'authority.mjs'
   ]), {
-    execute: true, ledger: 'quality.sqlite', executionConfig: 'authority.mjs'
+    execute: true, executionOnly: true, ledger: 'quality.sqlite', executionConfig: 'authority.mjs'
   });
   assert.throws(() => parseQualityReplayCliArgs(['--run-authority', 'authority.mjs']), /unknown/i);
 });
@@ -255,7 +255,7 @@ test('SQLite replay runs one final through the ordered four-phase ledger', async
       await phaseClient.runTurn('brain', JSON.stringify({ side }), {
         model: 'quality-controlled-v1', effort: 'high', outputSchema: { type: 'object' }
       });
-      return { side, output: { terminalDisposition: 'visible', replyParts: [], actions: [] } };
+      return { [side]: { draft: { action: 'send', reply: `reply-${side}` } } };
     },
     evaluator: async ({ phaseClient }) => {
       await phaseClient.runTurn('brain', JSON.stringify({ evaluator: 'primary' }), {
@@ -297,6 +297,126 @@ test('SQLite replay runs one final through the ordered four-phase ledger', async
       ['succeeded', 'succeeded', 'succeeded', 'succeeded']);
   } finally {
     check.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('execution-only replay persists two answer phases and resumes judges without repeating answers', async () => {
+  const historyScenes = scenes('history', 30);
+  const plan = createQualityReplayPlan({
+    rootDir: process.cwd(), historyScenes,
+    historyManifest: historyManifest(historyScenes),
+  });
+  const directory = mkdtempSync(join(tmpdir(), 'yuqi-quality-execution-only-'));
+  const ledgerPath = join(directory, 'quality-replay.sqlite');
+  const runId = '123e4567-e89b-42d3-a456-426614174098';
+  const sourceHead = 'a'.repeat(40);
+  const release = suffix => ({
+    releaseId: `release-${suffix}`, pipelineVersion: 'v3', presetVersion: 'p1',
+    cognitionSchemaVersion: 3, expressionSchemaVersion: 3,
+    evaluatorVersion: 'eval-v1', modelProfile: { id: suffix },
+    componentManifest: { id: suffix }, releaseChecksum: suffix.repeat(64),
+    createdAt: 1, retiredAt: null,
+  });
+  const attestation = {
+    version: 1, sourceHead,
+    stableRuntime: { sourceHead }, candidateRuntime: { sourceHead },
+    evaluatorPrimary: { evaluatorId: 'a', evaluatorVersion: 'v1',
+      modelProfileChecksum: '1'.repeat(64), clientConfigChecksum: '2'.repeat(64),
+      sessionNamespaceChecksum: '3'.repeat(64) },
+    evaluatorSecondary: { evaluatorId: 'b', evaluatorVersion: 'v1',
+      modelProfileChecksum: '4'.repeat(64), clientConfigChecksum: '5'.repeat(64),
+      sessionNamespaceChecksum: '6'.repeat(64) },
+  };
+  const finalKeys = plan.items.map(item => `${item.layer}:${item.sceneId}:${item.repeatIndex}`);
+  const header = createQualityRunHeader({
+    runId, finalKeys, planChecksum: plan.planChecksum, sourceHead,
+    stableRelease: release('a'), candidateRelease: release('b'), attestation,
+    artifactPaths: { plan: 'plan.json', ledger: 'quality-replay.sqlite', raw: 'replay.jsonl' },
+    createdAt: 1,
+  });
+  const evaluation = {
+    version: 1,
+    scores: Object.fromEntries(['socialUnderstanding', 'agency', 'relationshipParticipation',
+      'stateContinuityFlexibility', 'livedExpression', 'actionFactIntegrity'].map(key => [key, 4])),
+    preference: 'tie', findings: [], unresolved: false,
+  };
+  const calls = { stable: 0, candidate: 0, evaluator: 0 };
+  const callbacks = {
+    subjectFactory: async item => ({
+      qualitySubject: {
+        finalKey: finalKeys[0], sceneId: item.sceneId,
+        semanticInput: { sceneId: item.sceneId },
+        semanticInputChecksum: contentHash({ sceneId: item.sceneId }),
+      },
+      executionAuthorityInputChecksum: 'f'.repeat(64),
+    }),
+    executeQualitySubjectSide: async ({ side, phaseClient }) => {
+      calls[side] += 1;
+      await phaseClient.runTurn('brain', JSON.stringify({ side }), {
+        model: 'quality-controlled-v1', effort: 'high', outputSchema: { type: 'object' },
+      });
+      return { [side]: { draft: { action: 'send', reply: `reply-${side}` } } };
+    },
+    evaluator: async ({ phaseClient }) => {
+      calls.evaluator += 1;
+      await phaseClient.runTurn('brain', '{"judge":"primary"}', {
+        model: 'quality-controlled-v1', effort: 'high', outputSchema: { type: 'object' },
+      });
+      return evaluation;
+    },
+    evaluatorSecondary: async ({ phaseClient }) => {
+      calls.evaluator += 1;
+      await phaseClient.runTurn('brain', '{"judge":"secondary"}', {
+        model: 'quality-controlled-v1', effort: 'high', outputSchema: { type: 'object' },
+      });
+      return evaluation;
+    },
+    phaseClientFactory: async ({ ledger, runId: currentRunId, phaseInput, now: clock }) => {
+      const underlying = {
+        turnTimeoutMs: 180_000,
+        async ensureThread() { return `fixture-thread-${currentRunId}`; },
+        async readThread(threadId) { return { id: threadId, turns: [] }; },
+        async runTurn(role, input, options = {}) {
+          await options.onTurnStarted?.({
+            turnId: `fixture-turn-${contentHash({ currentRunId, role, input }).slice(0, 24)}`,
+          });
+          return { status: 'completed', role, input };
+        },
+      };
+      return new LedgerBackedModelClient({
+        ledger, underlying, runId: currentRunId, now: clock,
+      }).forPhase(phaseInput);
+    },
+  };
+  try {
+    const first = await runQualityReplayPlanSqlite({
+      plan, ledgerPath, header, onlyFinalKey: finalKeys[0],
+      phaseMode: 'execution_only', ...callbacks,
+      now: (() => { let value = 1; return () => ++value; })(),
+    });
+    assert.equal(first.results.length, 1);
+    assert.deepEqual(calls, { stable: 1, candidate: 1, evaluator: 0 });
+    let check = new QualityReplayLedger(ledgerPath);
+    try {
+      assert.equal(check.getFinal({ runId, finalKey: finalKeys[0] }), null);
+      assert.equal(check.getPhase({ runId, finalKey: finalKeys[0], phase: 'evaluator_primary' }), null);
+      assert.deepEqual(['stable_execution', 'candidate_execution'].map(phase =>
+        check.getPhase({ runId, finalKey: finalKeys[0], phase }).state), ['succeeded', 'succeeded']);
+    } finally { check.close(); }
+
+    const resumed = await runQualityReplayPlanSqlite({
+      plan, ledgerPath, header, resumeRun: runId, onlyFinalKey: finalKeys[0],
+      phaseMode: 'all', ...callbacks,
+      now: (() => { let value = 100; return () => ++value; })(),
+    });
+    assert.equal(resumed.results.length, 1);
+    assert.deepEqual(calls, { stable: 1, candidate: 1, evaluator: 2 });
+    check = new QualityReplayLedger(ledgerPath);
+    try {
+      assert.equal(check.getFinal({ runId, finalKey: finalKeys[0] }).state, 'finalized');
+    } finally { check.close(); }
+  } finally {
     rmSync(directory, { recursive: true, force: true });
   }
 });
