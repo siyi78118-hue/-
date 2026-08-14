@@ -17,6 +17,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.json.JSONObject;
 
 final class ExecutionRuntime {
+    private static AutomaticScheduleSender automaticScheduleSender;
+    private static String automaticScheduleEndpoint = "";
     private ExecutionRuntime() {}
 
     static ExecutionEngine create(Context context) {
@@ -55,6 +57,48 @@ final class ExecutionRuntime {
 
     static int drainCloudInbox(Context context) throws Exception {
         return drainCloudInboxInternal(context, null, null);
+    }
+
+    static synchronized AutomaticScheduleSender createAutomaticScheduleSender(
+        Context context, AlExecutionDatabase database
+    ) {
+        BridgeConfig config = new AlSecretStore(context).loadBridgeConfig();
+        if (!config.hasCloud()) return null;
+        String endpoint = config.cloudUrl.replaceAll("/+$", "") + "/v2/schedule-transitions";
+        if (automaticScheduleSender == null || !endpoint.equals(automaticScheduleEndpoint)) {
+            automaticScheduleSender = new AutomaticScheduleSender(
+                database, new UrlConnectionTransport(), endpoint, System::currentTimeMillis);
+            automaticScheduleEndpoint = endpoint;
+        }
+        return automaticScheduleSender;
+    }
+
+    static int drainAutomaticScheduleOutbox(Context context) {
+        AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        AutomaticScheduleSender sender = createAutomaticScheduleSender(context, database);
+        if (sender == null) return 0;
+        sender.recoverExpiredLeases(System.currentTimeMillis());
+        int completed = 0;
+        for (int index = 0; index < 16; index += 1) {
+            AutomaticScheduleSender.Outcome outcome = sender.flushOne(System.currentTimeMillis());
+            if (outcome == AutomaticScheduleSender.Outcome.SYNCED
+                || outcome == AutomaticScheduleSender.Outcome.QUARANTINED) {
+                completed += 1;
+                continue;
+            }
+            break;
+        }
+        return completed;
+    }
+
+    /** Return the next authority-outbox wake delay in seconds, or -1 when none/config absent. */
+    static long nextAutomaticScheduleDelay(Context context) {
+        AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        AutomaticScheduleSender sender = createAutomaticScheduleSender(context, database);
+        if (sender == null) return -1L;
+        long delayMs = sender.nextDelayMs(System.currentTimeMillis());
+        if (delayMs == Long.MAX_VALUE) return -1L;
+        return delayMs <= 0L ? 0L : Math.max(1L, (delayMs + 999L) / 1000L);
     }
 
     /** Test-only ingress seam: transport is injected, while config/journal/mirror/consumer stay real. */

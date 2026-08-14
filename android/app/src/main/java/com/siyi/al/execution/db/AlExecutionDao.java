@@ -50,6 +50,28 @@ public interface AlExecutionDao {
         + "ORDER BY o.updatedAt ASC, o.outboxId ASC LIMIT 1")
     AutomaticScheduleOutboxEntity nextAutomaticScheduleOutbox();
 
+    @Query("SELECT * FROM automatic_schedule_outbox o WHERE "
+        + "((o.state = 'waiting' AND o.nextAttemptAt <= :now) "
+        + "OR (o.state = 'pending' AND o.leasedAt IS NOT NULL AND o.leasedAt <= :expiredBefore)) "
+        + "AND NOT EXISTS (SELECT 1 FROM automatic_schedule_outbox prior "
+        + "WHERE prior.streamKey = o.streamKey AND prior.generation < o.generation "
+        + "AND prior.state NOT IN ('synced','superseded')) "
+        + "ORDER BY o.updatedAt ASC, o.outboxId ASC LIMIT 1")
+    AutomaticScheduleOutboxEntity nextAutomaticScheduleOutboxForSend(long now, long expiredBefore);
+
+    @Query("SELECT MIN(CASE WHEN o.state = 'waiting' THEN o.nextAttemptAt "
+        + "WHEN o.state = 'pending' AND o.leasedAt IS NOT NULL THEN o.leasedAt + :leaseMs ELSE NULL END) "
+        + "FROM automatic_schedule_outbox o WHERE o.state IN ('waiting','pending') "
+        + "AND NOT EXISTS (SELECT 1 FROM automatic_schedule_outbox prior "
+        + "WHERE prior.streamKey = o.streamKey AND prior.generation < o.generation "
+        + "AND prior.state NOT IN ('synced','superseded'))")
+    Long nextAutomaticScheduleOutboxAt(long leaseMs);
+
+    @Query("SELECT * FROM automatic_schedule_outbox WHERE state = 'pending' "
+        + "AND leasedAt IS NOT NULL AND leasedAt <= :expiredBefore "
+        + "ORDER BY updatedAt ASC, outboxId ASC")
+    List<AutomaticScheduleOutboxEntity> expiredAutomaticScheduleOutboxes(long expiredBefore);
+
     @Query("SELECT * FROM automatic_schedule_events WHERE streamKey = :streamKey "
         + "ORDER BY generation ASC, createdAt ASC, eventId ASC")
     List<AutomaticScheduleEventEntity> automaticScheduleEvents(String streamKey);
@@ -75,6 +97,34 @@ public interface AlExecutionDao {
     int syncAutomaticScheduleOutboxExact(
         String outboxId, String payloadChecksum, String leaseId,
         long leaseAttempt, long leasedAt, long updatedAt
+    );
+
+    @Query("UPDATE automatic_schedule_outbox SET state = 'waiting', leaseId = NULL, leasedAt = NULL, "
+        + "nextAttemptAt = :nextAttemptAt, lastErrorCode = :errorCode, updatedAt = :updatedAt "
+        + "WHERE outboxId = :outboxId AND payloadChecksum = :payloadChecksum "
+        + "AND state = 'pending' AND leaseId = :leaseId AND leaseAttempt = :leaseAttempt "
+        + "AND leasedAt = :leasedAt")
+    int retryAutomaticScheduleOutboxExact(
+        String outboxId, String payloadChecksum, String leaseId, long leaseAttempt,
+        long leasedAt, String errorCode, long nextAttemptAt, long updatedAt
+    );
+
+    @Query("UPDATE automatic_schedule_outbox SET state = 'quarantined', leaseId = NULL, leasedAt = NULL, "
+        + "lastErrorCode = :errorCode, updatedAt = :updatedAt "
+        + "WHERE outboxId = :outboxId AND payloadChecksum = :payloadChecksum "
+        + "AND state = 'pending' AND leaseId = :leaseId AND leaseAttempt = :leaseAttempt "
+        + "AND leasedAt = :leasedAt")
+    int quarantineAutomaticScheduleOutboxExact(
+        String outboxId, String payloadChecksum, String leaseId, long leaseAttempt,
+        long leasedAt, String errorCode, long updatedAt
+    );
+
+    @Query("UPDATE automatic_schedule_authorities SET cloudSyncState = :nextState, updatedAt = :updatedAt "
+        + "WHERE streamKey = :streamKey AND generation = :generation "
+        + "AND semanticChecksum = :semanticChecksum AND cloudSyncState = :expectedState")
+    int updateAutomaticScheduleCloudSyncExact(
+        String streamKey, long generation, String semanticChecksum,
+        String expectedState, String nextState, long updatedAt
     );
 
     @Query("UPDATE automatic_schedule_authorities SET state = 'claimed', updatedAt = :updatedAt "

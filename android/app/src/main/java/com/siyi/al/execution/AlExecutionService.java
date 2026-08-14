@@ -48,6 +48,7 @@ public final class AlExecutionService extends Service {
     private AlExecutionDatabase database;
     private RoomExecutionStore executionStore;
     private BridgeReceiptDeliveryCoordinator bridgeReceiptCoordinator;
+    private AutomaticScheduleSender automaticScheduleSender;
     private AlNotificationFactory notifications;
     private PowerManager.WakeLock wakeLock;
 
@@ -111,6 +112,7 @@ public final class AlExecutionService extends Service {
         ExecutionEngine localEngine = null;
         RoomExecutionStore localStore = null;
         BridgeReceiptDeliveryCoordinator localCoordinator = null;
+        AutomaticScheduleSender localAutomaticScheduleSender = null;
         PowerManager.WakeLock localWakeLock = null;
         try {
             // All Room access and complete runtime construction stays on the
@@ -119,6 +121,8 @@ public final class AlExecutionService extends Service {
             localDatabase = AlExecutionDatabase.get(this);
             localEngine = ExecutionRuntime.create(this);
             localStore = new RoomExecutionStore(localDatabase);
+            localAutomaticScheduleSender =
+                ExecutionRuntime.createAutomaticScheduleSender(this, localDatabase);
             final RoomExecutionStore coordinatorStore = localStore;
             localCoordinator = new BridgeReceiptDeliveryCoordinator(
                 coordinatorStore,
@@ -151,6 +155,7 @@ public final class AlExecutionService extends Service {
                 engine = localEngine;
                 executionStore = localStore;
                 bridgeReceiptCoordinator = localCoordinator;
+                automaticScheduleSender = localAutomaticScheduleSender;
                 wakeLock = localWakeLock;
                 initializationScheduled = false;
                 startupState = StartupState.READY;
@@ -168,7 +173,8 @@ public final class AlExecutionService extends Service {
             if (kickNow && startupState == StartupState.READY) kick();
         } catch (Throwable error) {
             releaseWakeLock(localWakeLock);
-            resetInitializationAfterFailure(localDatabase, localEngine, localStore, localCoordinator, localWakeLock);
+            resetInitializationAfterFailure(localDatabase, localEngine, localStore,
+                localCoordinator, localAutomaticScheduleSender, localWakeLock);
         }
     }
 
@@ -371,6 +377,22 @@ public final class AlExecutionService extends Service {
                                 System.currentTimeMillis());
                         }
                     }
+                    AutomaticScheduleSender scheduleSender = automaticScheduleSender;
+                    if (isReadyForWork() && scheduleSender != null) {
+                        scheduleSender.recoverExpiredLeases(System.currentTimeMillis());
+                        for (int sent = 0; sent < 16; sent += 1) {
+                            AutomaticScheduleSender.Outcome outcome =
+                                scheduleSender.flushOne(System.currentTimeMillis());
+                            if (outcome != AutomaticScheduleSender.Outcome.SYNCED
+                                && outcome != AutomaticScheduleSender.Outcome.QUARANTINED) break;
+                        }
+                        long automaticDelay = scheduleSender.nextDelayMs(System.currentTimeMillis());
+                        if (automaticDelay != Long.MAX_VALUE) {
+                            long automaticSeconds = automaticDelay <= 0L ? 0L
+                                : Math.max(1L, (automaticDelay + 999L) / 1000L);
+                            AlExecutionWakeWorker.enqueueAutomaticScheduleSync(this, automaticSeconds);
+                        }
+                    }
                     if (!isReadyForWork()) {
                         drainGate.finishCycle();
                         return;
@@ -432,6 +454,7 @@ public final class AlExecutionService extends Service {
         ExecutionEngine localEngine,
         RoomExecutionStore localStore,
         BridgeReceiptDeliveryCoordinator localCoordinator,
+        AutomaticScheduleSender localAutomaticScheduleSender,
         PowerManager.WakeLock localWakeLock
     ) {
         synchronized (startupLock) {
@@ -439,6 +462,7 @@ public final class AlExecutionService extends Service {
             if (engine == localEngine) engine = null;
             if (executionStore == localStore) executionStore = null;
             if (bridgeReceiptCoordinator == localCoordinator) bridgeReceiptCoordinator = null;
+            if (automaticScheduleSender == localAutomaticScheduleSender) automaticScheduleSender = null;
             if (wakeLock == localWakeLock) wakeLock = null;
             initializationScheduled = false;
             if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
@@ -460,6 +484,7 @@ public final class AlExecutionService extends Service {
             engine = null;
             executionStore = null;
             bridgeReceiptCoordinator = null;
+            automaticScheduleSender = null;
             initializationScheduled = false;
             if (startupState != StartupState.STOPPING && startupState != StartupState.STOPPED) {
                 startupState = StartupState.NEW;
@@ -487,6 +512,7 @@ public final class AlExecutionService extends Service {
             engine = null;
             executionStore = null;
             bridgeReceiptCoordinator = null;
+            automaticScheduleSender = null;
             initializationScheduled = false;
             startRequested = false;
             startupState = StartupState.STOPPED;

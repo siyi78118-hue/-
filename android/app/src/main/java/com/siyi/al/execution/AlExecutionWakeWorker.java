@@ -22,6 +22,7 @@ public final class AlExecutionWakeWorker extends Worker {
     private static final String WORK_NAME = "al-execution-wake";
     private static final String LIFECYCLE_WORK_NAME = "al-execution-lifecycle-wake";
     private static final String LIFECYCLE_PREARM_WORK_NAME = "al-execution-lifecycle-prearm";
+    private static final String AUTOMATIC_SCHEDULE_SYNC_WORK_NAME = "al-execution-automatic-schedule-sync";
 
     public AlExecutionWakeWorker(@NonNull Context context, @NonNull WorkerParameters params) {
         super(context, params);
@@ -54,6 +55,12 @@ public final class AlExecutionWakeWorker extends Worker {
                     // WorkManager will retry the wake worker; the Room row remains authoritative.
                 }
             }
+            try {
+                ExecutionRuntime.drainAutomaticScheduleOutbox(getApplicationContext());
+            } finally {
+                long automaticDelay = ExecutionRuntime.nextAutomaticScheduleDelay(getApplicationContext());
+                if (automaticDelay >= 0L) enqueueAutomaticScheduleSync(getApplicationContext(), automaticDelay);
+            }
             ContextCompat.startForegroundService(
                 getApplicationContext(),
                 new Intent(getApplicationContext(), AlExecutionService.class)
@@ -71,6 +78,7 @@ public final class AlExecutionWakeWorker extends Worker {
     static String lifecycleWorkName() { return LIFECYCLE_WORK_NAME; }
     static String generalWorkName() { return WORK_NAME; }
     static String lifecyclePrearmWorkName() { return LIFECYCLE_PREARM_WORK_NAME; }
+    static String automaticScheduleSyncWorkName() { return AUTOMATIC_SCHEDULE_SYNC_WORK_NAME; }
 
     public static void enqueue(Context context, long delaySeconds) {
         enqueue(context, delaySeconds, null);
@@ -92,6 +100,10 @@ public final class AlExecutionWakeWorker extends Worker {
 
     public static void enqueueLifecycle(Context context, long delaySeconds) {
         enqueueInternal(context, delaySeconds, null, LIFECYCLE_WORK_NAME);
+    }
+
+    public static void enqueueAutomaticScheduleSync(Context context, long delaySeconds) {
+        enqueueInternal(context, delaySeconds, null, AUTOMATIC_SCHEDULE_SYNC_WORK_NAME);
     }
 
     /**
@@ -140,5 +152,6 @@ public final class AlExecutionWakeWorker extends Worker {
         WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(WORK_NAME);
         WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(LIFECYCLE_WORK_NAME);
         WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(LIFECYCLE_PREARM_WORK_NAME);
+        WorkManager.getInstance(context.getApplicationContext()).cancelUniqueWork(AUTOMATIC_SCHEDULE_SYNC_WORK_NAME);
     }
 }

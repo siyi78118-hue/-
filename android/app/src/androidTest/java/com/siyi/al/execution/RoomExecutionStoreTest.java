@@ -202,6 +202,173 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void automaticScheduleOutboxReplaysTheExactBodyAfterCrashAndLeaseExpiry()
+        throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "automatic-outbox-restart-" + System.nanoTime();
+        List<String> postedBodies = new ArrayList<>();
+        AlExecutionDatabase firstOpen = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries().build();
+        try {
+            new AutomaticScheduleStore(firstOpen, "device_gateway").configure(
+                "yuqi", "chat", "00112233445566778899aabbccddeeff",
+                automaticSource("bootstrap", "outbox-bootstrap", 'a', 0L, 1_000L),
+                automaticPolicy(), 1_000L);
+            AutomaticScheduleSender crashedSender = new AutomaticScheduleSender(
+                firstOpen,
+                (url, headers, body) -> {
+                    postedBodies.add(body);
+                    throw new AssertionError("process crashed after request left the device");
+                },
+                "https://timer.example/v2/schedule-transitions",
+                () -> 1_000L);
+            assertThrows(AssertionError.class, () -> crashedSender.flushOne(1_000L));
+            assertEquals("pending", firstOpen.executionDao()
+                .automaticScheduleOutbox("active:device_gateway:yuqi:chat:1").state);
+        } finally {
+            firstOpen.close();
+        }
+
+        AlExecutionDatabase reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries().build();
+        try {
+            AutomaticScheduleSender replay = new AutomaticScheduleSender(
+                reopened,
+                (url, headers, body) -> {
+                    postedBodies.add(body);
+                    return new com.siyi.al.execution.api.HttpResponse(
+                        200, "application/json", "{\"ok\":true,\"idempotent\":true}");
+                },
+                "https://timer.example/v2/schedule-transitions",
+                () -> 61_000L);
+            assertEquals(AutomaticScheduleSender.Outcome.NONE, replay.flushOne(60_999L));
+            assertEquals(AutomaticScheduleSender.Outcome.SYNCED, replay.flushOne(61_000L));
+            assertEquals(2, postedBodies.size());
+            assertEquals(postedBodies.get(0), postedBodies.get(1));
+            assertEquals("synced", reopened.executionDao()
+                .automaticScheduleOutbox("active:device_gateway:yuqi:chat:1").state);
+            assertEquals("synced", new AutomaticScheduleStore(reopened, "device_gateway")
+                .status("yuqi", "chat").cloudSyncState);
+            assertEquals(1L, countRows(reopened, "automatic_schedule_outbox"));
+        } finally {
+            reopened.close();
+            context.deleteDatabase(databaseName);
+        }
+    }
+
+    @Test
+    public void twoAutomaticScheduleSendersShareOneRoomLeaseAndPostOnce() throws Exception {
+        new AutomaticScheduleStore(database, "device_gateway").configure(
+            "yuqi", "moment", "00112233445566778899aabbccddeeff",
+            automaticSource("bootstrap", "two-sender-bootstrap", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        java.util.concurrent.atomic.AtomicInteger posts = new java.util.concurrent.atomic.AtomicInteger();
+        com.siyi.al.execution.api.HttpTransport transport = (url, headers, body) -> {
+            posts.incrementAndGet();
+            return new com.siyi.al.execution.api.HttpResponse(200, "application/json", "{\"ok\":true}");
+        };
+        AutomaticScheduleSender first = new AutomaticScheduleSender(
+            database, transport, "https://timer.example/v2/schedule-transitions", () -> 2_000L);
+        AutomaticScheduleSender second = new AutomaticScheduleSender(
+            database, transport, "https://timer.example/v2/schedule-transitions", () -> 2_000L);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            Future<AutomaticScheduleSender.Outcome> left = workers.submit(() -> {
+                start.await();
+                return first.flushOne(2_000L);
+            });
+            Future<AutomaticScheduleSender.Outcome> right = workers.submit(() -> {
+                start.await();
+                return second.flushOne(2_000L);
+            });
+            start.countDown();
+            AutomaticScheduleSender.Outcome leftOutcome = left.get(5L, TimeUnit.SECONDS);
+            AutomaticScheduleSender.Outcome rightOutcome = right.get(5L, TimeUnit.SECONDS);
+            assertEquals(1, posts.get());
+            assertTrue(leftOutcome == AutomaticScheduleSender.Outcome.SYNCED
+                || rightOutcome == AutomaticScheduleSender.Outcome.SYNCED);
+            assertEquals("synced", database.executionDao()
+                .automaticScheduleOutbox("active:device_gateway:yuqi:moment:1").state);
+        } finally {
+            workers.shutdownNow();
+        }
+    }
+
+    @Test
+    public void expiredAutomaticScheduleLeaseRecoversOutboxAndAuthorityTogether() throws Exception {
+        new AutomaticScheduleStore(database, "device_gateway").configure(
+            "yuqi", "chat", "00112233445566778899aabbccddeeff",
+            automaticSource("bootstrap", "lease-recovery-bootstrap", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        com.siyi.al.execution.db.AutomaticScheduleOutboxEntity waiting =
+            database.executionDao().automaticScheduleOutbox("active:device_gateway:yuqi:chat:1");
+        assertEquals(1, database.executionDao().claimAutomaticScheduleOutboxExact(
+            waiting.outboxId, waiting.payloadChecksum, Long.MIN_VALUE,
+            "lease-before-crash", 1_000L, 1_000L));
+        assertEquals(1, database.executionDao().updateAutomaticScheduleCloudSyncExact(
+            waiting.streamKey, waiting.generation, waiting.payloadChecksum,
+            "waiting", "pending", 1_000L));
+
+        AutomaticScheduleSender sender = new AutomaticScheduleSender(
+            database,
+            (url, headers, body) -> new com.siyi.al.execution.api.HttpResponse(
+                200, "application/json", "{\"ok\":true}"),
+            "https://timer.example/v2/schedule-transitions",
+            () -> 61_000L);
+        assertEquals(1, sender.recoverExpiredLeases(61_000L));
+
+        com.siyi.al.execution.db.AutomaticScheduleOutboxEntity recovered =
+            database.executionDao().automaticScheduleOutbox(waiting.outboxId);
+        assertEquals("waiting", recovered.state);
+        assertNull(recovered.leaseId);
+        assertNull(recovered.leasedAt);
+        assertEquals("LEASE_EXPIRED", recovered.lastErrorCode);
+        assertEquals("waiting", new AutomaticScheduleStore(database, "device_gateway")
+            .status("yuqi", "chat").cloudSyncState);
+    }
+
+    @Test
+    public void automaticScheduleOutboxPreservesGenerationOrderAndRejectsTheExpiredLease() {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        String epoch = "00112233445566778899aabbccddeeff";
+        schedules.configure("yuqi", "chat", epoch,
+            automaticSource("bootstrap", "ordered-generation-one", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        schedules.pauseForConversationInternal("yuqi", "chat", epoch,
+            automaticSource("direct_input", "ordered-generation-two", 'b', 1L, 2_000L),
+            2_000L);
+
+        com.siyi.al.execution.db.AutomaticScheduleOutboxEntity first =
+            database.executionDao().nextAutomaticScheduleOutboxForSend(2_000L, Long.MIN_VALUE);
+        assertNotNull(first);
+        assertEquals(1L, first.generation);
+        assertEquals(1, database.executionDao().claimAutomaticScheduleOutboxExact(
+            first.outboxId, first.payloadChecksum, Long.MIN_VALUE,
+            "generation-one-old-lease", 2_000L, 2_000L));
+        com.siyi.al.execution.db.AutomaticScheduleOutboxEntity claimed =
+            database.executionDao().automaticScheduleOutbox(first.outboxId);
+
+        assertNull(database.executionDao().nextAutomaticScheduleOutboxForSend(60_000L, 0L));
+        AutomaticScheduleSender sender = new AutomaticScheduleSender(
+            database,
+            (url, headers, body) -> new com.siyi.al.execution.api.HttpResponse(
+                200, "application/json", "{\"ok\":true}"),
+            "https://timer.example/v2/schedule-transitions",
+            () -> 62_000L);
+        assertEquals(1, sender.recoverExpiredLeases(62_000L));
+        assertEquals(0, database.executionDao().syncAutomaticScheduleOutboxExact(
+            claimed.outboxId, claimed.payloadChecksum, claimed.leaseId,
+            claimed.leaseAttempt, claimed.leasedAt, 62_001L));
+        assertEquals(AutomaticScheduleSender.Outcome.SYNCED, sender.flushOne(62_000L));
+
+        com.siyi.al.execution.db.AutomaticScheduleOutboxEntity second =
+            database.executionDao().nextAutomaticScheduleOutboxForSend(62_001L, 2_001L);
+        assertNotNull(second);
+        assertEquals(2L, second.generation);
+    }
+
+    @Test
     public void androidRoomBackupHeadIsReadOnlyAndProjectsTheLatestValidatedLifecycle()
         throws Exception {
         JSONObject emptyHead = store.androidRoomBackupHead("yuqi", 100L);
