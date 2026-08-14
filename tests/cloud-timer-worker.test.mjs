@@ -11,9 +11,13 @@ const workerSource = readFileSync('cloud-timer-worker.js', 'utf8')
     'async function sendPush(target, env, payload = {}) {\n  if (globalThis.__alTestSendPush) return globalThis.__alTestSendPush(target, env, payload);'
   );
 const worker = await import(`data:text/javascript;base64,${Buffer.from(workerSource).toString('base64')}#worker-state-tests`);
-globalThis.__alTestSendPush = async (_target, _env, payload) => payload.jobId === 'retry-job'
-  ? ({ ok: false, reason: 'temporary FCM outage', retry: true })
-  : ({ ok: true, transport: 'fcm', payload: true });
+const sentPayloads = [];
+globalThis.__alTestSendPush = async (_target, _env, payload) => {
+  sentPayloads.push(structuredClone(payload));
+  return payload.jobId === 'retry-job'
+    ? ({ ok: false, reason: 'temporary FCM outage', retry: true })
+    : ({ ok: true, transport: 'fcm', payload: true });
+};
 
 class MemoryTimerStore {
   constructor() {
@@ -88,7 +92,7 @@ async function post(env, path, body) {
   }), env);
 }
 
-async function registerAndSchedule(env, { jobId, dueAt }) {
+async function registerAndSchedule(env, { jobId, dueAt, test: manualTest = false }) {
   const register = await post(env, '/register', {
     deviceId: 'device-a',
     transport: 'fcm',
@@ -101,7 +105,8 @@ async function registerAndSchedule(env, { jobId, dueAt }) {
     charId: 'char-a',
     jobId,
     kind: 'chat',
-    dueAt
+    dueAt,
+    test: manualTest
   });
   assert.equal(schedule.status, 200);
 }
@@ -178,6 +183,7 @@ test('cron defers an automatic authority job without writing the legacy timer ta
   };
   store.claimAutomaticDelivery = async () => ({ claimed: true });
 
+  sentPayloads.length = 0;
   await runCron(envFor(store));
 
   assert.equal(legacyWrites, 0);
@@ -187,6 +193,37 @@ test('cron defers an automatic authority job without writing the legacy timer ta
   assert.equal(deferred.jobId, automatic.jobId);
   assert.equal(deferred.awaitingAck, true);
   assert.ok(deferred.nextAttemptAt > Date.now());
+  assert.deepEqual(
+    {
+      owner: sentPayloads[0].owner,
+      authorityEpoch: sentPayloads[0].authorityEpoch,
+      generation: sentPayloads[0].generation,
+      jobId: sentPayloads[0].jobId
+    },
+    {
+      owner: 'android-v1',
+      authorityEpoch: automatic.authorityEpoch,
+      generation: automatic.generation,
+      jobId: automatic.jobId
+    },
+    'the phone must receive the exact Room/D1 claim token'
+  );
+});
+
+test('manual push tests use an isolated job and never wait for automatic authority ACK', async () => {
+  const env = envFor();
+  const dueAt = new Date(Date.now() - 1000).toISOString();
+  await registerAndSchedule(env, { jobId: 'manual-test-job', dueAt, test: true });
+  const stored = await env.AL_TIMER_STORE.getJob('manual-test-job');
+  assert.match(stored.logicalKey, /^active:test:/);
+
+  sentPayloads.length = 0;
+  const response = await post(env, '/trigger', {
+    deviceId: 'device-a', charId: 'char-a', jobId: 'manual-test-job', kind: 'chat', test: true
+  });
+  assert.equal(response.status, 200);
+  assert.equal(sentPayloads[0].test, true);
+  assert.equal(await env.AL_TIMER_STORE.getJob('manual-test-job'), null);
 });
 
 test('FCM uses the documented Android high priority value and survives short offline periods', async () => {

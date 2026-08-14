@@ -31,6 +31,11 @@ public class AlFirebaseMessagingService extends MessagingService {
             super.onMessageReceived(remoteMessage);
             return;
         }
+        if (isManualCloudTimerTest(data)) {
+            super.onMessageReceived(remoteMessage);
+            showManualCloudTimerTest(data);
+            return;
+        }
         AutomaticTaskCoordinator.ClaimToken token;
         try {
             token = automaticClaimToken(data);
@@ -80,6 +85,27 @@ public class AlFirebaseMessagingService extends MessagingService {
         token.put("authorityEpoch", data == null ? null : data.get("authorityEpoch"));
         token.put("generation", data == null ? null : data.get("generation"));
         return AutomaticTaskCoordinator.ClaimToken.from(token);
+    }
+
+    static boolean isManualCloudTimerTest(Map<String, String> data) {
+        return data != null && "proactive".equals(data.get("type"))
+            && "true".equals(data.get("test"));
+    }
+
+    private void showManualCloudTimerTest(Map<String, String> data) {
+        String jobId = text(data == null ? null : data.get("jobId"));
+        int notificationId = AlNotificationFactory.messageNotificationId(
+            jobId.isEmpty() ? "cloud-timer-test" : jobId);
+        try {
+            AlNotificationFactory factory = new AlNotificationFactory(this);
+            factory.ensureChannels();
+            NotificationManagerCompat.from(this).notify(
+                notificationId,
+                factory.messageNotification("AL 云闹钟测试", "测试推送已送达；正式主动消息时间未改变。", notificationId)
+            );
+        } catch (RuntimeException ignored) {
+            // Notification permission can be disabled; the Capacitor foreground event still proves delivery.
+        }
     }
 
     private void handleRolePlan(Map<String, String> data, RemoteMessage remoteMessage) {

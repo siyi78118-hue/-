@@ -762,14 +762,17 @@ async function deliverJob(job, env) {
     maxRolls: job.maxRolls,
     dicePrecomputed: !!job.dicePrecomputed,
     dueAt: job.dueAt || '',
-    test: !!job.test
+    test: !!job.test,
+    owner: job.automaticAuthority ? String(job.owner || 'android-v1') : undefined,
+    authorityEpoch: job.automaticAuthority ? String(job.authorityEpoch || '') : undefined,
+    generation: job.automaticAuthority ? Number(job.generation) : undefined
   });
   if (result.expired) {
     await store.deleteSubscription(job.deviceId);
     return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: false };
   }
   if (!result.ok) return { ok: false, reason: result.reason || 'push failed', jobId: job.jobId, retry: true };
-  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false, awaitingAck: result.transport === 'fcm' && Number(target.backgroundAck) >= 1, transport: result.transport || '' };
+  return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false, awaitingAck: !job.test && result.transport === 'fcm' && Number(target.backgroundAck) >= 1, transport: result.transport || '' };
 }
 
 async function getRecentEvents(env) {

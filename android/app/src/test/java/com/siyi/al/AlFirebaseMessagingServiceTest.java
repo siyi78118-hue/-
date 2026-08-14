@@ -54,4 +54,17 @@ public class AlFirebaseMessagingServiceTest {
         org.junit.Assert.assertThrows(IllegalArgumentException.class,
             () -> AlFirebaseMessagingService.automaticClaimToken(data));
     }
+
+    @Test
+    public void manualCloudTimerTestIsNotParsedAsAnAutomaticAuthorityClaim() {
+        HashMap<String, String> data = new HashMap<>();
+        data.put("type", "proactive");
+        data.put("test", "true");
+        data.put("charId", "yuqi");
+        data.put("jobId", "manual-test-job");
+
+        assertTrue(AlFirebaseMessagingService.isManualCloudTimerTest(data));
+        data.put("test", "false");
+        assertFalse(AlFirebaseMessagingService.isManualCloudTimerTest(data));
+    }
 }

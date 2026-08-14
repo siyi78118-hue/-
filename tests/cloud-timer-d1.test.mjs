@@ -7,6 +7,7 @@ import {
   scheduleTransitionChecksum,
   validateScheduleTransition
 } from '../automatic-schedule-contract.mjs';
+import { createProactiveAuthorityHarness } from '../scripts/verify-proactive-single-authority.mjs';
 
 const contractSource = await readFile(new URL('../automatic-schedule-contract.mjs', import.meta.url), 'utf8');
 const contractUrl = `data:text/javascript;base64,${Buffer.from(contractSource).toString('base64')}#automatic-schedule-contract`;
@@ -14,6 +15,22 @@ const workerSource = (await readFile(new URL('../cloud-timer-worker.js', import.
   .replace("from './automatic-schedule-contract.mjs'", `from '${contractUrl}'`);
 const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(workerSource).toString('base64')}#d1-store`);
 const { createD1TimerStore } = await import(`data:text/javascript;base64,${Buffer.from(`${workerSource}\nexport { createD1TimerStore };`).toString('base64')}#d1-store-internals`);
+
+test('actual D1 migration retires three conflicting legacy candidates behind one generation-one claim', async () => {
+  const harness = await createProactiveAuthorityHarness({ kind: 'chat' });
+  try {
+    const transition = await harness.migrateThreeLegacyCandidates();
+    const snapshot = harness.snapshot();
+    assert.equal(transition.generation, 1);
+    assert.equal(snapshot.authorityCount, 1);
+    assert.equal(snapshot.legacyProjectionCount, 0);
+    assert.equal(snapshot.alarmProjectionCount, 1, 'only the new authority projection remains');
+    assert.equal(snapshot.workProjectionCount, 1, 'only the new authority projection remains');
+    assert.deepEqual(snapshot.duplicateOutboxGenerations, []);
+  } finally {
+    harness.closeDatabase();
+  }
+});
 
 class SingleJobD1 {
   constructor() {

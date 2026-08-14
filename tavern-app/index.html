@@ -10802,7 +10802,12 @@ async function ensureNativePushListeners() {
     nativePushRegistrationWaiter = null;
     setCloudTimerStatus('FCM 注册失败：' + message);
     }), 'push registration error listener', 5000);
-    await nativeBridgeCall(PushNotifications.addListener('pushNotificationReceived', () => {
+    await nativeBridgeCall(PushNotifications.addListener('pushNotificationReceived', notification => {
+    const data = notification?.data || {};
+    if (data.test === true || data.test === 'true') {
+      completeCloudTimerTestPush(data).catch(err => console.warn('[AL Timer] test push receipt skipped:', err.message));
+      return;
+    }
     setCloudTimerStatus('本机已收到 FCM 唤醒，后台正在生成消息。');
     setTimeout(() => syncFromServiceWorkerState(), 2500);
     setTimeout(() => syncFromServiceWorkerState(), 10000);

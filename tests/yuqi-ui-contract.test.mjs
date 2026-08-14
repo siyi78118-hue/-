@@ -121,6 +121,12 @@ test('manual cloud timer tests are isolated from the production proactive schedu
   );
   assert.match(foreground, /cloudTimerTestJob[\s\S]*data\.test[\s\S]*completeCloudTimerTestPush/);
 
+  const pushListener = html.slice(
+    html.indexOf("PushNotifications.addListener('pushNotificationReceived'"),
+    html.indexOf("PushNotifications.addListener('pushNotificationActionPerformed'")
+  );
+  assert.match(pushListener, /data\.test[\s\S]*completeCloudTimerTestPush/);
+
   const nativePush = worker.slice(
     worker.indexOf('async function handleProactivePush'),
     worker.indexOf('if \(!automaticTasksEnabled', worker.indexOf('async function handleProactivePush'))
