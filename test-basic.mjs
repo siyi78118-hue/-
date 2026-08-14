@@ -111,11 +111,11 @@ assert.equal(existsSync(nativeBackgroundRunnerPath), false, 'retired QuickJS run
 assert.doesNotMatch(html, /nativeBackgroundRunner|syncNativeBackgroundState|restoreNativeBackgroundState/, 'web state mirroring must not dispatch into the retired QuickJS runtime');
 assert.match(executionPlugin, /@CapacitorPlugin\(name\s*=\s*"AlExecution"\)/);
 assert.doesNotMatch(executionPlugin, /clearAutomaticTasks[\s\S]{0,900}stopService\(/, 'clearing automatic tasks must not stop the 24-hour background guard');
-for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'getConversationCursor', 'createConversationClear', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
+for (const method of ['saveApiConfig', 'removeApiConfig', 'saveBridgeConfig', 'loadBridgeConfig', 'yuqiBridgeStatus', 'saveYuqiAnnotation', 'saveProactiveSnapshot', 'configureAutomaticSchedule', 'getAutomaticScheduleStatus', 'migrateLegacyAutomaticScheduleCandidate', 'submitTurn', 'retryTurn', 'cancelTurn', 'getTurn', 'changesSince', 'unappliedCompletedTurns', 'recentCompletedTurns', 'acknowledgeUiApplied', 'getConversationCursor', 'createConversationClear', 'nativeDiagnostics', 'notificationStatus', 'openNotificationSettings', 'listRolePlans', 'replaceRolePlans', 'rolePlanHistory']) {
   assert.match(executionPlugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`), `AlExecution must expose ${method}`);
 }
-assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9[\s\S]*MIGRATION_9_10[\s\S]*MIGRATION_10_11[\s\S]*MIGRATION_11_12[\s\S]*MIGRATION_12_13[\s\S]*MIGRATION_13_14[\s\S]*MIGRATION_14_15/, 'Room must migrate existing installs through the conversation-authority, bridge-checkpoint, lifecycle-control, inbound-ACK-tombstone, and durable notification-cancellation schemas without destructive reset');
-assert.match(readFileSync(executionDbPath, 'utf8'), /SCHEMA_VERSION\s*=\s*15/, 'Room schema version must stay pinned to the current migration head');
+assert.match(readFileSync(executionDbPath, 'utf8'), /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION[\s\S]*MIGRATION_2_3[\s\S]*MIGRATION_3_4[\s\S]*MIGRATION_4_5[\s\S]*MIGRATION_5_6[\s\S]*MIGRATION_6_7[\s\S]*MIGRATION_7_8[\s\S]*MIGRATION_8_9[\s\S]*MIGRATION_9_10[\s\S]*MIGRATION_10_11[\s\S]*MIGRATION_11_12[\s\S]*MIGRATION_12_13[\s\S]*MIGRATION_13_14[\s\S]*MIGRATION_14_15[\s\S]*MIGRATION_15_16/, 'Room must migrate existing installs through the conversation-authority, bridge-checkpoint, lifecycle-control, inbound-ACK-tombstone, notification-cancellation, and automatic-schedule authority schemas without destructive reset');
+assert.match(readFileSync(executionDbPath, 'utf8'), /SCHEMA_VERSION\s*=\s*16/, 'Room schema version must stay pinned to the current migration head');
 assert.match(readFileSync(executionDbPath, 'utf8'), /yuqi_raw_messages[\s\S]*yuqi_evidence_facts[\s\S]*yuqi_sync_cursors[\s\S]*yuqi_annotations/, 'Room v7 must retain raw messages, evidence facts, sync cursors, and annotations on the phone');
 assert.match(executionDao, /List<DiagnosticEntity>\s+latestDiagnostics\(int limit\)/, 'native diagnostics must be queryable by the UI bridge');
 assert.match(executionDao, /ROLE_PLAN_CHAT[\s\S]{0,240}PROACTIVE_CHAT/, 'explicit role plans must be ordered ahead of ordinary proactive chat');
@@ -145,20 +145,20 @@ assert.match(html, /async function retryFailedReply[\s\S]{0,1200}nativeRetryTurn
 assert.doesNotMatch(html.match(/async function retryFailedReply[\s\S]*?function showReplyFailureReason/)?.[0] || '', /plugin\.retryTurn\(/, 'manual retry must not reuse a terminal Room turn');
 assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(/, 'retract and delete should cancel the native turn');
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
-assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');
-assert.match(html, /async function scheduleCloudProactive[\s\S]{0,5000}syncNativeProactiveSnapshot\(/, 'native snapshot must exist before a cloud timer is scheduled');
-assert.match(html, /const hasReusableFutureJob = hasFutureCloudJob\(chat, kind\) && proactiveJobUsesCurrentDicePolicy\(kind, currentJob\)[\s\S]{0,300}if \(force\)[\s\S]{0,300}resubmitCloudProactive\(char\.id, kind\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must keep their job identity while native snapshots are synchronized after an app upgrade');
+assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'legacy migration may persist one immutable native proactive snapshot');
+assert.match(html, /async function refreshNativeAutomaticScheduleStatuses[\s\S]{0,2600}getAutomaticScheduleStatus[\s\S]{0,2600}migrateLegacyAutomaticScheduleCandidate[\s\S]{0,2600}configureAutomaticSchedule/, 'native scheduling must enter Room through the closed status, migration, and configuration APIs');
+assert.match(html, /async function scheduleCloudProactive[\s\S]{0,350}if\s*\(isNativeApp\(\)\)[\s\S]{0,180}refreshNativeAutomaticScheduleStatuses/, 'the Web scheduler must become status-only for the native owner');
 assert.match(html, /async function triggerProactiveMessage[\s\S]{0,1400}chatHasPendingDirectReply\(chat\)/, 'foreground proactive chat must not replace a pending direct reply');
 assert.match(html, /await syncFromServiceWorkerState\(\{ checkProactive: false \}\)[\s\S]{0,1400}resumePendingAssistantTurns\(\)[\s\S]{0,300}checkProactiveMessages\(\)/, 'boot must resume direct replies before proactive catch-up');
 assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_push_queue/, 'FCM must wake the Room execution engine directly');
-assert.match(androidFcmService, /latestSnapshot\(/);
-assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'FCM must reject a cloud job replaced by a newer snapshot');
-assert.match(androidFcmService, /submitTurn\(/);
+assert.match(androidFcmService, /automaticClaimToken\(data\)/);
+assert.match(androidFcmService, /new AutomaticTaskCoordinator\(this\)\.dispatch\(token, now\)/, 'FCM must claim the exact Room authority token before execution');
+assert.doesNotMatch(androidFcmService.slice(0, androidFcmService.indexOf('private void handleRolePlan')), /submitTurn\(/, 'FCM proactive delivery must not write a second legacy turn path');
 assert.match(androidFcmService, /AlExecutionWakeWorker\.enqueue\(/, 'FCM must extend execution through expedited WorkManager');
-assert.match(executionPlugin, /AutomaticTaskAlarmScheduler\.schedule[\s\S]{0,300}AlExecutionWakeWorker\.enqueueAutomatic/, 'saved proactive jobs must register two independent local wake paths');
-assert.match(executionService, /AutomaticTaskAlarmScheduler\.schedule\(this, jobId, nextRunAt\)[\s\S]{0,180}AlExecutionWakeWorker\.enqueueAutomatic\(this, jobId, nextRunAt\)/, 'native continuations must retain both local wake paths');
-assert.match(executionWakeWorker, /public static void enqueueAutomatic\(Context context, String jobId, long scheduledFor\)/, 'automatic jobs need a durable job-specific WorkManager fallback');
-assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'stale role-plan cloud wakes must be rejected after a plan is rescheduled');
+assert.match(executionPlugin, /reconcileSchedulers\(applicationContext\)[\s\S]{0,200}enqueueAutomaticScheduleSync/, 'plugin configuration must reconcile the Room authority into Alarm, WorkManager, and cloud outbox projections');
+assert.match(executionService, /AutomaticTaskAlarmScheduler\.schedule\(this, token, finalization\.authority\.dueAt\)[\s\S]{0,180}AlExecutionWakeWorker\.enqueueAutomatic\(this, token, finalization\.authority\.dueAt\)/, 'native terminal finalization must retain two exact-token local wake paths');
+assert.match(executionWakeWorker, /public static void enqueueAutomatic\(\s*Context context, AutomaticTaskCoordinator\.ClaimToken token, long scheduledFor\s*\)/, 'automatic jobs need a durable authority-token WorkManager fallback');
+assert.match(androidFcmService, /matchesSnapshotJob\(candidate, jobId\)/, 'stale role-plan cloud wakes must still be rejected after a plan is rescheduled');
 assert.match(html, /async function reconcileNativeExecutionTurns[\s\S]{0,2500}plugin\.changesSince\(/, 'web UI must consume Room changes created while WebView was absent');
 assert.match(retryPolicy, /SocketException[\s\S]*NETWORK_INTERRUPTED[\s\S]*true/, 'native execution must retain retryable connection interruptions');
 assert.match(html, /async function applyNativeExecutionTurn[\s\S]{0,7000}PROACTIVE_CHAT/, 'native proactive chat results must be applied to chat UI');
@@ -386,7 +386,7 @@ assert.match(swScript, /function proactiveDicePlan\(options = \{\}, now = Date\.
 assert.match(script, /if \(job\?\.dicePrecomputed\) return true;/);
 assert.match(swScript, /if \(job\?\.dicePrecomputed\) return true;/);
 assert.match(script, /dicePrecomputed: !!job\.dicePrecomputed/);
-assert.match(swScript, /dicePrecomputed: !!chat\[jobKey\]\.dicePrecomputed/);
+assert.match(swScript, /chat\[jobKey\]\.dicePrecomputed = true/);
 assert.match(script, /sw-v11\.js\?alarm-stream=1&v=\$\{APP_BUILD_VERSION\}/);
 assert.match(script, /\.then\(reg => reg\.update\?\.\(\)\)/);
 assert.match(script, /const API_TIMEOUT_MS = 120000;/);
@@ -463,7 +463,8 @@ assert.match(swScript, /忽略已被新任务替换的旧推送/);
 assert.match(script, /Date\.now\(\)\.toString\(36\).*Math\.random\(\)\.toString\(36\)/);
 assert.match(swScript, /Date\.now\(\)\.toString\(36\).*Math\.random\(\)\.toString\(36\)/);
 assert.match(script, /cancelCloudJobId\(previousJob\.jobId\)/);
-assert.match(swScript, /jobId: previousJob\.jobId/);
+assert.match(swScript, /expectedPreviousJobId = priorClaimed \? String\(previousJob\.jobId \|\| ''\) \|\| null : null/);
+assert.match(swScript, /\/v2\/schedule-transitions/);
 assert.match(script, /async function ensureLocalProactiveScheduled\(\)/);
 assert.match(script, /await ensureLocalProactiveScheduled\(\);\s*await catchUpDueCloudProactive\(\);/);
 const visibleHandoffIndex = swScript.indexOf("if (await hasVisibleClient())");
@@ -721,7 +722,7 @@ assert.match(cloudTimerWorker, /mode: body\.mode === 'dice' \? 'dice' : 'planned
 assert.match(cloudTimerWorker, /rollChance: job\.rollChance/);
 assert.match(cloudTimerWorker, /diceRolls: job\.diceRolls/);
 assert.match(cloudTimerWorker, /dicePrecomputed: !!job\.dicePrecomputed/);
-const cloudWorkerModule = await import(`data:text/javascript;base64,${Buffer.from(cloudTimerWorker).toString('base64')}`);
+const cloudWorkerModule = await import(new URL(`./cloud-timer-worker.js?basic=${Date.now()}`, import.meta.url));
 const idleCronWaits = [];
 const idleCronEnv = {
   AL_TIMER_STORE: {
@@ -1210,6 +1211,86 @@ assert.equal('lastProactiveMomentError' in automaticCleanup.result.chats.char1, 
 assert.equal(automaticCleanup.result.clearedChatJobs, 1);
 assert.equal(automaticCleanup.result.clearedMomentJobs, 1);
 assert.deepEqual(automaticCleanup.logFlags, [true, true, false]);
+
+const nativeScheduleFetchBefore = fetchCalls.length;
+const nativeScheduleReadOnlyProbe = await vm.runInContext(`(async () => {
+  const savedWindow = globalThis.window;
+  const savedSettings = settings;
+  const savedCharacters = characters;
+  const savedChats = allChats;
+  const savedDbSet = DB.set;
+  const savedMirror = mirrorAppStateNow;
+  const savedSnapshot = syncNativeProactiveSnapshot;
+  const savedRender = renderCloudTimerStatus;
+  let dbWrites = 0;
+  let mirrorWrites = 0;
+  let snapshotWrites = 0;
+  let configureCalls = 0;
+  let migrateCalls = 0;
+  let statusCalls = 0;
+  try {
+    globalThis.window = globalThis;
+    globalThis.window.Capacitor = {
+      isNativePlatform: () => true,
+      Plugins: {
+        AlExecution: {
+          getAutomaticScheduleStatus: async ({ characterId, kind }) => {
+            statusCalls += 1;
+            return {
+              characterId, kind, owner: 'android-v1', epochFingerprint: 'a1b2c3d4',
+              generation: 7, state: 'scheduled', jobId: kind === 'moment' ? 'mom_native_7' : 'pro_native_7',
+              dueAt: 1786728600000, cloudSyncState: 'synced',
+              lastChangeSource: 'proactive_terminal', lastChangedAt: 1786720000000
+            };
+          },
+          configureAutomaticSchedule: async () => { configureCalls += 1; throw new Error('unexpected configure'); },
+          migrateLegacyAutomaticScheduleCandidate: async () => { migrateCalls += 1; throw new Error('unexpected migrate'); }
+        }
+      }
+    };
+    settings = { ...settings, proactiveEnabled: true, cloudTimerEnabled: true };
+    characters = [{ id: 'native-status-role', name: '虞栖' }];
+    allChats = {
+      'native-status-role': {
+        messages: [{ id: 'm1', role: 'user', content: '只读检查', time: 1000 }],
+        stableField: 'unchanged'
+      }
+    };
+    DB.set = () => { dbWrites += 1; };
+    mirrorAppStateNow = async () => { mirrorWrites += 1; };
+    syncNativeProactiveSnapshot = async () => { snapshotWrites += 1; };
+    renderCloudTimerStatus = () => {};
+    const before = JSON.stringify(allChats);
+    await checkProactiveMessages();
+    return {
+      before,
+      after: JSON.stringify(allChats),
+      dbWrites,
+      mirrorWrites,
+      snapshotWrites,
+      configureCalls,
+      migrateCalls,
+      statusCalls
+    };
+  } finally {
+    DB.set = savedDbSet;
+    mirrorAppStateNow = savedMirror;
+    syncNativeProactiveSnapshot = savedSnapshot;
+    renderCloudTimerStatus = savedRender;
+    settings = savedSettings;
+    characters = savedCharacters;
+    allChats = savedChats;
+    globalThis.window = savedWindow;
+  }
+})()`, context);
+assert.equal(nativeScheduleReadOnlyProbe.after, nativeScheduleReadOnlyProbe.before, 'native status refresh cannot mutate schedule state');
+assert.equal(nativeScheduleReadOnlyProbe.statusCalls, 2, 'native foreground refresh reads both chat and moment authority');
+assert.equal(nativeScheduleReadOnlyProbe.configureCalls, 0);
+assert.equal(nativeScheduleReadOnlyProbe.migrateCalls, 0);
+assert.equal(nativeScheduleReadOnlyProbe.dbWrites, 0);
+assert.equal(nativeScheduleReadOnlyProbe.mirrorWrites, 0);
+assert.equal(nativeScheduleReadOnlyProbe.snapshotWrites, 0);
+assert.equal(fetchCalls.length - nativeScheduleFetchBefore, 0, 'native status refresh must not POST a schedule');
 
 assert.equal(vm.runInContext('typeof captureChatScrollState', context), 'function', 'chat rendering must expose scroll-state capture');
 assert.equal(vm.runInContext('typeof restoreChatScrollState', context), 'function', 'chat rendering must expose scroll-state restoration');

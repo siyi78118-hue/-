@@ -1504,6 +1504,7 @@ function clearImportedCloudJobs(chats = {}) {
     if (!chat || typeof chat !== 'object') return;
     delete chat.pendingProactiveJob;
     delete chat.pendingMomentJob;
+    delete chat.cloudTimerTestJob;
     delete chat.cloudScheduleSyncedAt;
     delete chat.cloudMomentScheduleSyncedAt;
   });
@@ -1535,7 +1536,7 @@ function clearAutomaticTaskChatState(chats = {}) {
     if (chat.pendingProactiveJob) clearedChatJobs += 1;
     if (chat.pendingMomentJob) clearedMomentJobs += 1;
     [
-      'pendingProactiveJob', 'pendingMomentJob',
+      'pendingProactiveJob', 'pendingMomentJob', 'cloudTimerTestJob',
       'cloudScheduleSyncedAt', 'cloudMomentScheduleSyncedAt',
       'lastProactiveFailedAt', 'lastProactiveChatFailedAt', 'lastProactiveMomentFailedAt',
       'lastProactiveChatError', 'lastProactiveMomentError'
@@ -1586,6 +1587,8 @@ const memoryExtractionEpochs = new Map();
 const momentNotificationFlights = new Map();
 let foregroundProactiveRequestBusy = false;
 let cloudTimerStatusRenderRevision = 0;
+const nativeAutomaticScheduleStatuses = new Map();
+let nativeAutomaticLastCheckedAt = 0;
 let momentReplyTargetId = '';
 let momentReplyCommentId = '';
 let momentReplyCharId = '';
@@ -3289,14 +3292,17 @@ async function buildNativeExecutionSnapshot(charId, task) {
     chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
     createdAt: now.toISOString()
   });
-  return withLocalFallbackExecution(semanticSnapshot, {
+  return {
+    ...withLocalFallbackExecution(semanticSnapshot, {
     cognition: {
       configId: 'memory-v1',
       system: nativeDirectorMemorySystem(char, nativeScene),
       messages: [{ role: 'user', content: `双方昵称：${playerName()} / ${charName(char)}\n玩家本次消息：${task.userText}\n\n固定最近200条原文：\n${memoryRecent.map((row, index) => `${index + 1}. ${row.role}: ${row.content}`).join('\n')}\n\n候选本地记忆：\n${candidates}` }]
     },
     expression: { configId: 'chat-v1', system: prompt.system, messages: chatRecent }
-  }, ensureDeviceId());
+    }, ensureDeviceId()),
+    ...nativeAutomaticPolicySnapshot('chat', chat)
+  };
 }
 
 function nativeProactiveSnapshotIds(charId, kind = 'chat', job = null) {
@@ -3364,7 +3370,8 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     deviceId: settings.deviceId || '',
     createdAt: now.toISOString()
   });
-  const snapshot = withLocalFallbackExecution(withCognitionV3Snapshot({
+  const snapshot = {
+    ...withLocalFallbackExecution(withCognitionV3Snapshot({
     scene: buildYuqiDynamicScene(char, chat),
     roleId: char.id,
     recentGroups: [{ batchId: String(job?.jobId || ''), complete: true, messageIds: [] }]
@@ -3379,7 +3386,9 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
       system: legacySnapshot.expressionSystem,
       messages: legacySnapshot.expressionMessages
     }
-  }, ensureDeviceId());
+    }, ensureDeviceId()),
+    ...nativeAutomaticPolicySnapshot(kind, chat)
+  };
   const record = {
     characterId: charId,
     characterName: charName(char),
@@ -4507,9 +4516,7 @@ async function applyNativeExecutionTurnUnlocked(result) {
         const momentText = extractMomentPostText(text);
         if (!exists && momentText) createCharacterMoment(charId, momentText, { proactive: true, sourceTurnId, ...nativeReplyProvenance(result), time: completedAt });
         if (!rolePlanTurn) {
-          delete chat.pendingMomentJob;
           chat.lastProactiveMomentAt = completedAt;
-          ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment reschedule skipped:', err.message));
         }
       } else {
         const appendedText = text
@@ -4522,7 +4529,6 @@ async function applyNativeExecutionTurnUnlocked(result) {
           appendedPayment = appendAssistantPaymentMessage(chat, { type: String(payload.type || '').toLowerCase(), amount: Number(payload.amount), note: String(payload.note || '') }, { proactive: true, proactiveMode: 'native', sourceTurnId, sourceReplyId: sourceTurnId, ...nativeReplyProvenance(result), time: Number(sentPayment.createdAt) || completedAt });
         }
         if (!rolePlanTurn) {
-          delete chat.pendingProactiveJob;
           chat.lastProactiveAt = completedAt;
           chat.lastProactiveChatAt = chat.lastProactiveAt;
         }
@@ -4589,7 +4595,6 @@ async function applyNativeExecutionTurnUnlocked(result) {
     const changed = appendedText.length > 0 || !!appendedPayment || ownedPending || userMessage.replyState === 'pending' || !!userMessage.replyError;
     if (!changed) return false;
     const paymentStatus = parts.find(part => part.type === 'PAYMENT_STATUS');
-    const schedule = parts.find(part => part.type === 'SCHEDULE');
     const pendingOptions = chat.pendingReply?.userMessageId === userMessage.id ? (chat.pendingReply.options || {}) : {};
     if (pendingOptions.paymentMessageId) {
       updatePaymentStatusFromReply(
@@ -4600,8 +4605,6 @@ async function applyNativeExecutionTurnUnlocked(result) {
         paymentStatus ? nativePartPayload(paymentStatus).status : ''
       );
     }
-    rescheduleAfterNativeDirectReply(charId, schedule).catch(err => console.warn('[AL Timer] native schedule skipped:', err.message));
-    ensureDiceProactiveScheduled(charId, 'moment').catch(err => console.warn('[AL Timer] native moment schedule skipped:', err.message));
     delete userMessage.replyState;
     delete userMessage.replyError;
     if (chat.pendingReply?.userMessageId === userMessage.id) delete chat.pendingReply;
@@ -5020,12 +5023,16 @@ async function queueAndroidUserReply(charId, userMessageId, options = {}) {
 async function mirrorAppStateNow() {
   if (typeof MemoryDB === 'undefined') return;
   const updatedAt = Number(localStorage.getItem('rpchat_app_state_updated_at')) || Date.now();
+  const mirroredChats = isNativeApp()
+    ? clearImportedCloudJobs(cloneWebStateValue(allChats))
+    : allChats;
   await MemoryDB.setMeta('app_state', {
     settings,
     characters,
-    allChats,
+    allChats: mirroredChats,
     allMoments,
     nativeExecution: isNativeApp(),
+    automaticScheduleOwner: isNativeApp() ? 'android-v1' : 'web-v1',
     updatedAt
   });
 }
@@ -5167,6 +5174,7 @@ async function restoreAppStateFromMirror() {
   settings = migrateSettings(mirrored.settings || settings);
   characters = mirroredCharacters;
   allChats = mergeLocalPendingReplies(mirrored.allChats || allChats, localChats);
+  if (isNativeApp()) clearImportedCloudJobs(allChats);
   allMoments = Array.isArray(mirrored.allMoments) ? mirrored.allMoments : allMoments;
   scrubEmptyReplyMessages(allChats);
   repairKnownDeliveredReplyStates(allChats);
@@ -10316,7 +10324,7 @@ async function finishStagedBatch(charId = currentCharId) {
     updatedAt: Date.now()
   };
   sourceMessage.replyState = 'pending';
-  reanchorProactiveAfterUserCommit(charId).catch(err => console.warn('[AL Timer] committed user fallback skipped:', err.message));
+  if (!isNativeApp()) reanchorProactiveAfterUserCommit(charId).catch(err => console.warn('[AL Timer] committed user fallback skipped:', err.message));
   DB.set('chats', allChats);
   refreshFinishBatchButton();
   if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
@@ -10408,7 +10416,7 @@ async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random
     type: 'voice', voiceDuration: actualDuration, provisionalNativeOnly: true
   });
   DB.set('chats', allChats);
-  reanchorProactiveAfterUserCommit(requestCharId).catch(err => console.warn('[AL Timer] voice fallback schedule skipped:', err.message));
+  if (!isNativeApp()) reanchorProactiveAfterUserCommit(requestCharId).catch(err => console.warn('[AL Timer] voice fallback schedule skipped:', err.message));
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (reason) toast(reason, 2200);
   const voicePrompt = `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`;
@@ -10435,7 +10443,7 @@ async function sendVoiceTranscriptMessage(transcript, duration) {
     type: 'voice', transcript: text, voiceDuration: duration, provisionalNativeOnly: true
   });
   DB.set('chats', allChats);
-  reanchorProactiveAfterUserCommit(requestCharId).catch(err => console.warn('[AL Timer] voice fallback schedule skipped:', err.message));
+  if (!isNativeApp()) reanchorProactiveAfterUserCommit(requestCharId).catch(err => console.warn('[AL Timer] voice fallback schedule skipped:', err.message));
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
   await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
@@ -10557,16 +10565,34 @@ function cloudTimerStatusText() {
   else rows.push('云闹钟已开启并绑定。');
 
   const chatRows = getLatestChatRows();
-  const managedIds = new Set(chatRows.filter(row => row.chat?.pendingProactiveJob?.dueAt || row.chat?.pendingMomentJob?.dueAt).map(row => row.char.id));
-  if (chatRows.length) rows.push(`主动角色：${managedIds.size}/${chatRows.length} 个会话`);
-  const nextJob = kind => chatRows
-    .map(row => ({ char: row.char, job: row.chat?.[proactiveJobKey(kind)] }))
-    .filter(row => row.job?.dueAt)
-    .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0] || null;
-  const nextChat = nextJob('chat');
-  const nextMoment = nextJob('moment');
-  if (nextChat) rows.push(`最近私聊（${nextChat.char.name}｜${proactiveModeLabel(nextChat.job)}）：${formatFullTime(new Date(nextChat.job.dueAt))}`);
-  if (nextMoment) rows.push(`最近朋友圈（${nextMoment.char.name}｜${proactiveModeLabel(nextMoment.job)}）：${formatFullTime(new Date(nextMoment.job.dueAt))}`);
+  if (isNativeApp()) {
+    const statuses = [...nativeAutomaticScheduleStatuses.values()];
+    const active = statuses.filter(status => status.state === 'scheduled' || status.state === 'claimed');
+    if (chatRows.length) rows.push(`主动角色：${new Set(active.map(status => status.characterId)).size}/${chatRows.length} 个会话`);
+    for (const kind of PROACTIVE_JOB_KINDS) {
+      const status = active.filter(item => item.kind === kind && Number(item.dueAt) > 0)
+        .sort((a, b) => Number(a.dueAt) - Number(b.dueAt))[0];
+      if (!status) continue;
+      const char = characters.find(item => item.id === status.characterId);
+      const label = kind === 'moment' ? '朋友圈计划时间' : '私聊计划时间';
+      rows.push(`${label}（${char?.name || status.characterId}）：${formatFullTime(new Date(status.dueAt))}`);
+      rows.push(`${kind === 'moment' ? '朋友圈' : '私聊'}任务代数：${status.epochFingerprint}/${status.generation}｜${status.jobId || '无活动任务'}`);
+      rows.push(`${kind === 'moment' ? '朋友圈' : '私聊'}云同步：${status.cloudSyncState}`);
+      rows.push(`${kind === 'moment' ? '朋友圈' : '私聊'}最近真实变更：${formatFullTime(new Date(status.lastChangedAt))}｜${status.lastChangeSource}`);
+    }
+    if (nativeAutomaticLastCheckedAt) rows.push(`最近检查（仅内存）：${formatFullTime(new Date(nativeAutomaticLastCheckedAt))}`);
+  } else {
+    const managedIds = new Set(chatRows.filter(row => row.chat?.pendingProactiveJob?.dueAt || row.chat?.pendingMomentJob?.dueAt).map(row => row.char.id));
+    if (chatRows.length) rows.push(`主动角色：${managedIds.size}/${chatRows.length} 个会话`);
+    const nextJob = kind => chatRows
+      .map(row => ({ char: row.char, job: row.chat?.[proactiveJobKey(kind)] }))
+      .filter(row => row.job?.dueAt)
+      .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0] || null;
+    const nextChat = nextJob('chat');
+    const nextMoment = nextJob('moment');
+    if (nextChat) rows.push(`最近私聊（${nextChat.char.name}｜${proactiveModeLabel(nextChat.job)}）：${formatFullTime(new Date(nextChat.job.dueAt))}`);
+    if (nextMoment) rows.push(`最近朋友圈（${nextMoment.char.name}｜${proactiveModeLabel(nextMoment.job)}）：${formatFullTime(new Date(nextMoment.job.dueAt))}`);
+  }
   const latest = chatRows[0];
   if (latest?.chat?.lastProactiveChatFailedAt) {
     rows.push(`私聊上次失败：${formatFullTime(new Date(latest.chat.lastProactiveChatFailedAt))}${latest.chat.lastProactiveChatError ? '｜' + latest.chat.lastProactiveChatError : ''}`);
@@ -10622,6 +10648,12 @@ async function renderCloudTimerStatus() {
   if (el.textContent !== content) el.textContent = content;
 }
 function setCloudTimerStatus(message, persist = true, kind = 'general') {
+  const statusKey = kind === 'chat' ? 'cloudTimerLastChatStatus'
+    : (kind === 'moment' ? 'cloudTimerLastMomentStatus' : 'cloudTimerLastStatus');
+  if (settings[statusKey] === message) {
+    renderCloudTimerStatus();
+    return false;
+  }
   const now = Date.now();
   if (kind === 'chat') {
     settings.cloudTimerLastChatStatus = message;
@@ -10635,6 +10667,7 @@ function setCloudTimerStatus(message, persist = true, kind = 'general') {
   }
   if (persist) DB.set('settings', settings);
   renderCloudTimerStatus();
+  return true;
 }
 function cloudTraceId(kind = 'chat') {
   return `${kind === 'moment' ? 'mom' : 'chat'}-${Date.now().toString(36).slice(-6)}`;
@@ -10839,7 +10872,7 @@ async function enableNativeCloudTimer() {
   DB.set('settings', settings);
   await registerNativeCloudTarget(token);
   await mirrorAppStateNow();
-  await ensureCloudProactiveScheduled({ force: true });
+  await ensureCloudProactiveScheduled({ configure: true, migrate: true });
   await Promise.allSettled(characters.map(char => syncRolePlanCloudJobs(char.id)));
   setCloudTimerStatus('安卓原生 FCM 已绑定；AL 关闭后也可由系统唤醒。');
   return true;
@@ -10954,6 +10987,117 @@ async function enableCloudTimer() {
 }
 function proactiveJobKey(kind = 'chat') {
   return kind === 'moment' ? 'pendingMomentJob' : 'pendingProactiveJob';
+}
+function nativeAutomaticPolicy(kind = 'chat', chat = null) {
+  const options = proactiveDefaultScheduleOptions(kind, chat);
+  if (options.mode === 'dice') {
+    const intervalMs = Math.max(60000, Number(options.intervalMs) || PROACTIVE_DICE_INTERVAL_MS);
+    const maxRolls = Math.max(1, Math.floor(Number(options.maxRolls) || PROACTIVE_DICE_MAX_ROLLS));
+    return { mode: 'dice', minDelayMs: intervalMs, maxDelayMs: intervalMs * maxRolls };
+  }
+  const delayMs = proactiveDelayMs(kind);
+  return { mode: 'planned', minDelayMs: delayMs, maxDelayMs: delayMs };
+}
+function nativeAutomaticPolicySnapshot(kind = 'chat', chat = null) {
+  const policy = nativeAutomaticPolicy(kind, chat);
+  return {
+    automaticPolicyMode: policy.mode,
+    automaticPolicyMinDelayMs: policy.minDelayMs,
+    automaticPolicyMaxDelayMs: policy.maxDelayMs
+  };
+}
+function automaticSettingsFingerprint(value = {}) {
+  return JSON.stringify({
+    cloudTimerEnabled: !!value.cloudTimerEnabled,
+    proactiveEnabled: !!value.proactiveEnabled,
+    proactiveIdleMinutes: Math.max(1, Number(value.proactiveIdleMinutes) || 30)
+  });
+}
+function validateNativeAutomaticScheduleStatus(raw, characterId, kind) {
+  const keys = [
+    'characterId', 'cloudSyncState', 'dueAt', 'epochFingerprint', 'generation',
+    'jobId', 'kind', 'lastChangeSource', 'lastChangedAt', 'owner', 'state'
+  ];
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+    || Object.keys(raw).sort().join('|') !== keys.sort().join('|')
+    || raw.characterId !== characterId || raw.kind !== kind || raw.owner !== 'android-v1'
+    || typeof raw.epochFingerprint !== 'string' || !/^(?:|[a-f0-9]{8})$/.test(raw.epochFingerprint)
+    || typeof raw.generation !== 'number' || !Number.isSafeInteger(raw.generation) || raw.generation < 0
+    || typeof raw.state !== 'string' || !['unclaimed', 'disabled', 'paused_for_conversation', 'scheduled', 'claimed'].includes(raw.state)
+    || !(raw.jobId === null || typeof raw.jobId === 'string')
+    || !(raw.dueAt === null || (typeof raw.dueAt === 'number' && Number.isSafeInteger(raw.dueAt) && raw.dueAt > 0))
+    || typeof raw.cloudSyncState !== 'string'
+    || typeof raw.lastChangeSource !== 'string'
+    || typeof raw.lastChangedAt !== 'number' || !Number.isSafeInteger(raw.lastChangedAt) || raw.lastChangedAt < 0) {
+    throw new Error('invalid native automatic schedule status');
+  }
+  return Object.freeze({ ...raw });
+}
+async function refreshNativeAutomaticScheduleStatuses(options = {}) {
+  if (!isNativeApp()) return false;
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.getAutomaticScheduleStatus || !plugin?.configureAutomaticSchedule
+    || !plugin?.migrateLegacyAutomaticScheduleCandidate) {
+    throw new Error('Android 主动日程接口不可用');
+  }
+  const configure = options.configure === true;
+  const migrate = options.migrate !== false;
+  let legacyRemoved = false;
+  const scheduleRows = characters
+    .map(char => ({ char, chat: allChats[char.id] }))
+    .filter(row => !!row.chat);
+  for (const { char, chat } of scheduleRows) {
+    for (const kind of PROACTIVE_JOB_KINDS) {
+      let status = validateNativeAutomaticScheduleStatus(
+        await nativeBridgeCall(
+          plugin.getAutomaticScheduleStatus({ characterId: char.id, kind }),
+          'getAutomaticScheduleStatus', 3000),
+        char.id, kind);
+      const jobKey = proactiveJobKey(kind);
+      const legacy = chat?.[jobKey];
+      const legacyDueAt = Date.parse(legacy?.dueAt || '');
+      if (status.state === 'unclaimed' && migrate && legacy?.jobId
+        && Number.isFinite(legacyDueAt) && legacyDueAt > Date.now()) {
+        await syncNativeProactiveSnapshot(char.id, kind, legacy);
+        status = validateNativeAutomaticScheduleStatus(
+          await nativeBridgeCall(plugin.migrateLegacyAutomaticScheduleCandidate({
+            characterId: char.id,
+            kind,
+            dueAt: String(legacyDueAt),
+            legacyJobId: String(legacy.jobId),
+            mode: proactiveJobMode(legacy)
+          }), 'migrateLegacyAutomaticScheduleCandidate', 5000),
+          char.id, kind);
+      } else if (status.state === 'unclaimed' || configure) {
+        const enabled = !!settings.proactiveEnabled;
+        const policy = nativeAutomaticPolicy(kind, chat);
+        if (enabled) await syncNativeProactiveSnapshot(char.id, kind, null);
+        status = validateNativeAutomaticScheduleStatus(
+          await nativeBridgeCall(plugin.configureAutomaticSchedule({
+            characterId: char.id,
+            kind,
+            enabled,
+            ...policy
+          }), 'configureAutomaticSchedule', 5000),
+          char.id, kind);
+      }
+      nativeAutomaticScheduleStatuses.set(`${char.id}:${kind}`, status);
+      if (status.state !== 'unclaimed' && (chat?.pendingProactiveJob || chat?.pendingMomentJob)) {
+        if (chat[jobKey]) {
+          delete chat[jobKey];
+          delete chat[proactiveSyncKey(kind)];
+          legacyRemoved = true;
+        }
+      }
+    }
+  }
+  nativeAutomaticLastCheckedAt = Date.now();
+  if (legacyRemoved) {
+    DB.set('chats', allChats);
+    await mirrorAppStateNow();
+  }
+  renderCloudTimerStatus();
+  return true;
 }
 function proactiveSyncKey(kind = 'chat') {
   return kind === 'moment' ? 'cloudMomentScheduleSyncedAt' : 'cloudScheduleSyncedAt';
@@ -11145,6 +11289,12 @@ function ensureOpenedChatProactive(charId) {
   }
 }
 async function ensureCloudProactiveScheduled(options = {}) {
+  if (isNativeApp()) {
+    return refreshNativeAutomaticScheduleStatuses({
+      configure: options.configure === true,
+      migrate: options.migrate !== false
+    });
+  }
   if (options.kind) return ensureCloudProactiveKindScheduled(options.kind, options);
   let scheduled = false;
   for (const kind of PROACTIVE_JOB_KINDS) {
@@ -11154,6 +11304,7 @@ async function ensureCloudProactiveScheduled(options = {}) {
   return scheduled;
 }
 async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
+  if (isNativeApp()) return refreshNativeAutomaticScheduleStatuses(options);
   const { force = false, resync = false } = options;
   if (!settings.proactiveEnabled || !settings.cloudTimerEnabled || !settings.timerEndpoint || !settings.pushSubscription) return false;
   if (cloudTimerQuotaPauseActive()) return false;
@@ -11196,6 +11347,7 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
   return changed;
 }
 async function repairCloudTimerScheduleOnce() {
+  if (isNativeApp()) return refreshNativeAutomaticScheduleStatuses({ migrate: true });
   if (!settings.cloudTimerEnabled || !settings.pushSubscription || settings.cloudTimerBucketFixV2) return;
   settings.proactiveEnabled = true;
   settings.cloudTimerBucketFixV2 = true;
@@ -11205,6 +11357,7 @@ async function repairCloudTimerScheduleOnce() {
   await ensureCloudProactiveScheduled({ force: true });
 }
 async function scheduleCloudProactive(charId, kind = 'chat', options = {}) {
+  if (isNativeApp()) return refreshNativeAutomaticScheduleStatuses();
   if (!settings.proactiveEnabled) return false;
   const chat = allChats[charId];
   if (!chat?.messages?.length) return false;
@@ -11353,12 +11506,13 @@ async function testCloudTimerPush() {
     return;
   }
   const jobId = `test_${settings.deviceId}_${charId}_${Date.now()}`;
-  chat.pendingProactiveJob = { jobId, dueAt: new Date(Date.now() - 1000).toISOString(), kind: 'chat', test: true };
+  const dueAt = new Date(Date.now() - 1000).toISOString();
+  chat.cloudTimerTestJob = { jobId, dueAt, kind: 'chat', test: true };
   DB.set('chats', allChats);
   await mirrorAppStateNow();
   toast('正在触发云闹钟推送...', 1800);
   try {
-    const body = { deviceId: settings.deviceId, jobId, charId, dueAt: chat.pendingProactiveJob.dueAt, type: 'proactive', kind: 'chat', test: true };
+    const body = { deviceId: settings.deviceId, jobId, charId, dueAt, type: 'proactive', kind: 'chat', test: true };
     const scheduleResp = await fetchWithTimeout(timerUrl('/schedule'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -11371,9 +11525,14 @@ async function testCloudTimerPush() {
       body: JSON.stringify(body)
     }, API_TIMEOUT_MS);
     if (!triggerResp.ok) throw new Error('触发失败：' + triggerResp.status);
-    setCloudTimerStatus('测试推送已触发，等待浏览器通知或后台生成结果。', true, 'chat');
+    setCloudTimerStatus('测试推送已触发，等待本机确认；不会改变正式主动消息时间。', true, 'chat');
     toast('云闹钟已触发，请留意通知', 2600);
   } catch (err) {
+    if (chat.cloudTimerTestJob?.jobId === jobId) {
+      delete chat.cloudTimerTestJob;
+      DB.set('chats', allChats);
+      await mirrorAppStateNow();
+    }
     setCloudTimerStatus('云闹钟测试失败：' + friendlyErrorMessage(err), true, 'chat');
     toast('云闹钟测试失败：' + friendlyErrorMessage(err), 3600);
   }
@@ -11516,9 +11675,11 @@ async function schedulePlannedChatFromReply(charId, directive = null) {
   return scheduleCloudProactive(charId, 'chat', { mode: 'planned', dueAt });
 }
 async function reanchorProactiveAfterUserCommit(charId) {
+  if (isNativeApp()) return false;
   return schedulePlannedChatFromReply(charId, null);
 }
 async function rescheduleAfterNativeDirectReply(charId, schedulePart = null) {
+  if (isNativeApp()) return false;
   const at = schedulePart
     ? parseProactiveScheduleTime(nativePartPayload(schedulePart).nextProactiveAt)
     : null;
@@ -11772,6 +11933,10 @@ async function triggerProactiveMoment(charId, manual = false) {
 }
 async function checkProactiveMessages() {
   if (!settings.proactiveEnabled) return;
+  if (isNativeApp()) {
+    await refreshNativeAutomaticScheduleStatuses({ migrate: true });
+    return;
+  }
   if (cloudTimerTransportReady()) {
     await catchUpDueCloudProactive();
     ensureCloudProactiveScheduled({ resync: true }).catch(err => console.warn('[AL Timer] foreground resync skipped:', err.message));
@@ -11781,6 +11946,7 @@ async function checkProactiveMessages() {
   await catchUpDueCloudProactive();
 }
 async function ensureLocalProactiveScheduled() {
+  if (isNativeApp()) return refreshNativeAutomaticScheduleStatuses({ migrate: true });
   if (!settings.proactiveEnabled || cloudTimerTransportReady()) return false;
   const rows = getLatestChatRows();
   if (!rows.length) return false;
@@ -11797,6 +11963,10 @@ async function ensureLocalProactiveScheduled() {
 }
 async function catchUpDueCloudProactive() {
   if (!settings.proactiveEnabled) return;
+  if (isNativeApp()) {
+    await refreshNativeAutomaticScheduleStatuses({ migrate: true });
+    return;
+  }
   const tasks = [];
   const chatTargets = !proactiveChatBusy && !isStreaming ? findDueCloudProactiveTargets('chat') : [];
   for (const chatTarget of chatTargets) {
@@ -11814,11 +11984,36 @@ async function catchUpDueCloudProactive() {
     if (settings.cloudTimerEnabled) setCloudTimerStatus('前台检查完成：当前本地没有到期的私聊或朋友圈任务。', true);
   }
 }
+async function completeCloudTimerTestPush(data = {}) {
+  const chat = data.charId ? allChats[data.charId] : null;
+  const testJob = chat?.cloudTimerTestJob;
+  if (testJob && (!data.jobId || String(testJob.jobId || '') === String(data.jobId))) {
+    delete chat.cloudTimerTestJob;
+    DB.set('chats', allChats);
+    await mirrorAppStateNow();
+  }
+  setCloudTimerTestAck('本机已收到云闹钟测试推送，闹钟链路正常。');
+  setCloudTimerTriggerAck('测试云闹钟已被本机收到。');
+  setCloudTimerStatus('测试推送已被本机收到；正式主动消息时间没有改变。', true, 'chat');
+  return true;
+}
 async function handleForegroundProactiveRequest(data = {}) {
   if (foregroundProactiveRequestBusy) return;
   foregroundProactiveRequestBusy = true;
   try {
+    if (isNativeApp()) {
+      if (data.test) {
+        await completeCloudTimerTestPush(data);
+        return;
+      }
+      await refreshNativeAutomaticScheduleStatuses({ migrate: true });
+      return;
+    }
     await restoreAppStateFromMirror();
+    if (data.test) {
+      await completeCloudTimerTestPush(data);
+      return;
+    }
     const kind = data.kind === 'moment' ? 'moment' : 'chat';
     const traceId = cloudTraceId(kind);
     const jobKey = proactiveJobKey(kind);
@@ -11860,6 +12055,10 @@ async function handleForegroundDueProactiveRequest(data = {}) {
   if (foregroundProactiveRequestBusy) return;
   foregroundProactiveRequestBusy = true;
   try {
+    if (isNativeApp()) {
+      await refreshNativeAutomaticScheduleStatuses({ migrate: true });
+      return;
+    }
     await restoreAppStateFromMirror();
     if (data.test) setCloudTimerTestAck('本机已收到云闹钟测试推送，闹钟链路正常。');
     setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}云闹钟已被前台收到，正在检查所有到期任务。`);
@@ -12365,11 +12564,18 @@ function readSettingsForm() {
 }
 function saveSettings(options = {}) {
   const { silent = false } = options;
+  const previousAutomaticSettings = automaticSettingsFingerprint(settings);
   settings = readSettingsForm();
+  const automaticSettingsChanged = previousAutomaticSettings !== automaticSettingsFingerprint(settings);
   DB.set('settings', settings);
   startProactiveLoop();
   renderCloudTimerStatus();
-  if (!silent) ensureCloudProactiveScheduled().catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+  if (isNativeApp() && automaticSettingsChanged) {
+    ensureCloudProactiveScheduled({ configure: true, migrate: true })
+      .catch(err => console.warn('[AL Timer] native schedule configuration skipped:', err.message));
+  } else if (!silent) {
+    ensureCloudProactiveScheduled().catch(err => console.warn('[AL Timer] schedule skipped:', err.message));
+  }
   if (!silent) toast('已保存');
 }
 function scheduleSettingsAutosave() {

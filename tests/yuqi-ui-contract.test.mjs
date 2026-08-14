@@ -56,6 +56,78 @@ test('Yuqi controls expose secure AUTO, LAN, and CLOUD bridge settings', () => {
   assert.match(html, /importYuqiPairingCode/);
 });
 
+test('Android proactive scheduling is exposed through a closed native authority projection', () => {
+  for (const method of [
+    'configureAutomaticSchedule',
+    'getAutomaticScheduleStatus',
+    'migrateLegacyAutomaticScheduleCandidate'
+  ]) assert.match(plugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`));
+
+  const projection = plugin.slice(
+    plugin.indexOf('private static JSObject automaticScheduleResult('),
+    plugin.indexOf('private static JSObject bridgeConfigResult(')
+  );
+  for (const key of [
+    'characterId', 'kind', 'owner', 'epochFingerprint', 'generation', 'state',
+    'jobId', 'dueAt', 'cloudSyncState', 'lastChangeSource', 'lastChangedAt'
+  ]) assert.match(projection, new RegExp(`result\\.put\\("${key}"`));
+  for (const secret of ['authorityEpoch', 'semanticJson', 'payloadJson', 'leaseId']) {
+    assert.doesNotMatch(projection, new RegExp(`result\\.put\\("${secret}"`));
+  }
+});
+
+test('native foreground, input, and terminal paths cannot manufacture a Web schedule', () => {
+  const refresh = html.slice(
+    html.indexOf('async function refreshNativeAutomaticScheduleStatuses'),
+    html.indexOf('function proactiveSyncKey')
+  );
+  assert.match(refresh, /getAutomaticScheduleStatus/);
+  assert.match(refresh, /status\.state === 'unclaimed'/);
+  assert.doesNotMatch(refresh, /\/schedule/);
+
+  const apply = html.slice(
+    html.indexOf('async function applyNativeExecutionTurnUnlocked'),
+    html.indexOf('function applyNativeExecutionTurn(result)')
+  );
+  assert.doesNotMatch(apply, /pendingProactiveJob|pendingMomentJob|scheduleCloudProactive|ensureCloudProactiveKindScheduled|saveProactiveSnapshot|rescheduleAfterNativeDirectReply/);
+
+  const direct = html.slice(
+    html.indexOf('async function finishStagedBatch'),
+    html.indexOf('function voiceButtonEl')
+  );
+  assert.match(direct, /if\s*\(!isNativeApp\(\)\)\s*reanchorProactiveAfterUserCommit/);
+  assert.doesNotMatch(direct, /if\s*\(isNativeApp\(\)\)\s*reanchorProactiveAfterUserCommit/);
+
+  for (const name of ['checkProactiveMessages', 'ensureLocalProactiveScheduled', 'catchUpDueCloudProactive']) {
+    const start = html.indexOf(`async function ${name}`);
+    const end = html.indexOf('\n}', start) + 2;
+    const body = html.slice(start, end);
+    assert.match(body, /isNativeApp\(\)[\s\S]*refreshNativeAutomaticScheduleStatuses/);
+  }
+});
+
+test('manual cloud timer tests are isolated from the production proactive schedule', () => {
+  const manualTest = html.slice(
+    html.indexOf('async function testCloudTimerPush'),
+    html.indexOf('async function cancelCloudProactive')
+  );
+  assert.match(manualTest, /chat\.cloudTimerTestJob\s*=/);
+  assert.doesNotMatch(manualTest, /chat\.pendingProactiveJob\s*=/);
+  assert.match(manualTest, /test:\s*true/);
+
+  const foreground = html.slice(
+    html.indexOf('async function completeCloudTimerTestPush'),
+    html.indexOf('async function handleForegroundDueProactiveRequest')
+  );
+  assert.match(foreground, /cloudTimerTestJob[\s\S]*data\.test[\s\S]*completeCloudTimerTestPush/);
+
+  const nativePush = worker.slice(
+    worker.indexOf('async function handleProactivePush'),
+    worker.indexOf('if \(!automaticTasksEnabled', worker.indexOf('async function handleProactivePush'))
+  );
+  assert.match(nativePush, /type:\s*'AL_NATIVE_PROACTIVE_DUE'[\s\S]*test:\s*!!payload\.test/);
+});
+
 test('Yuqi Bridge submission does not require ordinary chat or memory AI settings', () => {
   const sync = html.slice(
     html.indexOf('async function saveNativeExecutionApiConfigs'),
@@ -238,13 +310,14 @@ test('Room persists fresh retry turns and only deduplicates an exact turn id', (
   assert.doesNotMatch(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}, unique = true\)/);
   assert.match(chatTurnEntity, /@Index\(value = \{"sourceMessageId"\}\)/);
   assert.match(executionDatabase, /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION/);
-  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*15/);
+  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*16/);
   assert.match(executionDatabase, /new Migration\(8,\s*9\)/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
   assert.match(executionDatabase, /MIGRATION_12_13/);
   assert.match(executionDatabase, /MIGRATION_13_14/);
   assert.match(executionDatabase, /MIGRATION_14_15/);
+  assert.match(executionDatabase, /MIGRATION_15_16/);
   assert.match(executionDatabase, /MIGRATION_9_10,\s*MIGRATION_10_11,\s*MIGRATION_11_12,\s*MIGRATION_12_13,[\s\S]*MIGRATION_13_14/);
   assert.match(executionDatabase, /DROP INDEX IF EXISTS `index_chat_turns_sourceMessageId`/);
   assert.match(executionDatabase, /CREATE INDEX IF NOT EXISTS `index_chat_turns_sourceMessageId`/);
@@ -856,13 +929,14 @@ test('native inbox flushes the coalesced durable app_state mirror before acknowl
 
 test('native delivery diagnostics persist and expose four independent convergence stages', () => {
   assert.match(executionDatabase, /version\s*=\s*AlExecutionDatabase\.SCHEMA_VERSION/);
-  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*15/);
+  assert.match(executionDatabase, /SCHEMA_VERSION\s*=\s*16/);
   assert.match(executionDatabase, /MIGRATION_9_10/);
   assert.match(executionDatabase, /MIGRATION_10_11/);
   assert.match(executionDatabase, /MIGRATION_11_12/);
   assert.match(executionDatabase, /MIGRATION_12_13/);
   assert.match(executionDatabase, /MIGRATION_13_14/);
   assert.match(executionDatabase, /MIGRATION_14_15/);
+  assert.match(executionDatabase, /MIGRATION_15_16/);
   assert.match(chatTurnEntity, /Long\s+notificationShownAt/);
   assert.match(chatTurnEntity, /Long\s+cloudConfirmedAt/);
   assert.match(executionDao, /markNotificationShown/);

@@ -10,7 +10,11 @@ import com.siyi.al.execution.AlBackgroundCoordinator;
 import com.siyi.al.execution.AlExecutionService;
 import com.siyi.al.execution.AlExecutionWakeWorker;
 import com.siyi.al.execution.AlNotificationStatus;
+import com.siyi.al.execution.AutomaticScheduleContract;
+import com.siyi.al.execution.AutomaticScheduleStore;
 import com.siyi.al.execution.AutomaticTaskCleanupResult;
+import com.siyi.al.execution.AutomaticTaskCoordinator;
+import com.siyi.al.execution.BridgeAuthority;
 import com.siyi.al.execution.BridgeReceiptCheckpoint;
 import com.siyi.al.execution.ExecutionServicePolicy;
 import com.siyi.al.execution.RoomExecutionStore;
@@ -22,6 +26,7 @@ import com.siyi.al.execution.bridge.BridgeConfig;
 import com.siyi.al.execution.bridge.BridgeMode;
 import com.siyi.al.execution.bridge.BridgeStatusProbe;
 import com.siyi.al.execution.db.AlExecutionDatabase;
+import com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
@@ -429,6 +434,123 @@ public final class AlExecutionPlugin extends Plugin {
             result.put("acknowledgedCompletedTurns", cleanup.acknowledgedCompletedTurns);
             result.put("deletedSnapshots", cleanup.deletedSnapshots);
             return result;
+        });
+    }
+
+    @PluginMethod
+    public void configureAutomaticSchedule(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            String kind = automaticScheduleKind(required(call, "kind"));
+            boolean enabled = Boolean.TRUE.equals(call.getBoolean("enabled", true));
+            String mode = automaticScheduleMode(optional(call, "mode", "planned"));
+            long minDelayMs = integer(call, "minDelayMs", 0);
+            long maxDelayMs = integer(call, "maxDelayMs", 0);
+            String explicitAt = optional(call, "explicitAt", null);
+            if (explicitAt.isEmpty()) explicitAt = null;
+            long now = System.currentTimeMillis();
+            AlExecutionDatabase database = AlExecutionDatabase.get(applicationContext);
+            AutomaticScheduleAuthorityEntity current = database.executionDao()
+                .automaticScheduleAuthorityForCharacterKind(characterId, kind);
+            BridgeConfig bridge = secrets.loadBridgeConfig();
+            String deviceId = bridge == null ? "" : bridge.deviceId;
+            if (deviceId == null || deviceId.trim().isEmpty()) {
+                throw new IllegalStateException("automatic schedule bridge device is required");
+            }
+            String epoch = current == null
+                ? UUID.randomUUID().toString().replace("-", "") : current.authorityEpoch;
+            JSONObject policyBasis = automaticPolicyBasis(mode, minDelayMs, maxDelayMs, explicitAt);
+            String policyChecksum = BridgeAuthority.sha256CanonicalJson(policyBasis);
+            long policyRevision = automaticPolicyRevision(current, policyChecksum);
+            String sourceType = current == null ? "bootstrap" : "settings_change";
+            JSONObject sourceBasis = new JSONObject()
+                .put("characterId", characterId)
+                .put("enabled", enabled)
+                .put("kind", kind)
+                .put("policy", policyBasis);
+            String sourceChecksum = BridgeAuthority.sha256CanonicalJson(sourceBasis);
+            AutomaticScheduleContract.Source source = new AutomaticScheduleContract.Source(
+                sourceType, "cfg_" + sourceChecksum.substring(0, 24), sourceChecksum,
+                current == null ? 0L : current.conversationSequence, now);
+            AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, deviceId);
+            AutomaticScheduleAuthorityEntity next;
+            if (enabled) {
+                AutomaticScheduleContract.Policy policy = new AutomaticScheduleContract.Policy(
+                    policyRevision, policyChecksum, mode, minDelayMs, maxDelayMs, explicitAt);
+                next = schedules.configure(characterId, kind, epoch, source, policy, now);
+            } else {
+                next = schedules.disable(characterId, kind, epoch, source, now);
+            }
+            new AutomaticTaskCoordinator(applicationContext).reconcileSchedulers(applicationContext);
+            AlExecutionWakeWorker.enqueueAutomaticScheduleSync(applicationContext, 0L);
+            AlExecutionService.requestRun(applicationContext);
+            return automaticScheduleResult(next);
+        });
+    }
+
+    @PluginMethod
+    public void getAutomaticScheduleStatus(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            String kind = automaticScheduleKind(required(call, "kind"));
+            AutomaticScheduleAuthorityEntity current = AlExecutionDatabase.get(applicationContext)
+                .executionDao().automaticScheduleAuthorityForCharacterKind(characterId, kind);
+            return automaticScheduleResult(characterId, kind, current);
+        });
+    }
+
+    @PluginMethod
+    public void migrateLegacyAutomaticScheduleCandidate(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            String kind = automaticScheduleKind(required(call, "kind"));
+            AlExecutionDatabase database = AlExecutionDatabase.get(applicationContext);
+            AutomaticScheduleAuthorityEntity current = database.executionDao()
+                .automaticScheduleAuthorityForCharacterKind(characterId, kind);
+            if (current != null) return automaticScheduleResult(current);
+            long now = System.currentTimeMillis();
+            String dueAtText = required(call, "dueAt");
+            long dueAt;
+            try {
+                dueAt = Long.parseLong(dueAtText);
+            } catch (NumberFormatException error) {
+                throw new IllegalArgumentException("legacy automatic dueAt is invalid", error);
+            }
+            if (dueAt <= now || dueAt > 9007199254740991L) {
+                throw new IllegalArgumentException("legacy automatic dueAt is invalid");
+            }
+            String mode = automaticScheduleMode(optional(call, "mode", "planned"));
+            String legacyJobId = optional(call, "legacyJobId", "");
+            JSONObject policyBasis = automaticPolicyBasis(mode, 0L, 0L, dueAtText);
+            String policyChecksum = BridgeAuthority.sha256CanonicalJson(policyBasis);
+            JSONObject candidate = new JSONObject()
+                .put("characterId", characterId)
+                .put("dueAt", dueAtText)
+                .put("kind", kind)
+                .put("legacyJobId", legacyJobId)
+                .put("mode", mode);
+            String sourceChecksum = BridgeAuthority.sha256CanonicalJson(candidate);
+            BridgeConfig bridge = secrets.loadBridgeConfig();
+            String deviceId = bridge == null ? "" : bridge.deviceId;
+            if (deviceId == null || deviceId.trim().isEmpty()) {
+                throw new IllegalStateException("automatic schedule bridge device is required");
+            }
+            String epoch = UUID.randomUUID().toString().replace("-", "");
+            AutomaticScheduleContract.Source source = new AutomaticScheduleContract.Source(
+                "migration_claim", "migration_" + sourceChecksum.substring(0, 20),
+                sourceChecksum, 0L, now);
+            AutomaticScheduleContract.Policy policy = new AutomaticScheduleContract.Policy(
+                1L, policyChecksum, mode, 0L, 0L, dueAtText);
+            AutomaticScheduleAuthorityEntity next = new AutomaticScheduleStore(database, deviceId)
+                .migrateLegacyCandidate(characterId, kind, epoch, source, policy, now);
+            if (!legacyJobId.isEmpty()) {
+                AutomaticTaskAlarmScheduler.cancel(applicationContext, legacyJobId);
+                AlExecutionWakeWorker.cancelAutomatic(applicationContext, legacyJobId);
+            }
+            new AutomaticTaskCoordinator(applicationContext).reconcileSchedulers(applicationContext);
+            AlExecutionWakeWorker.enqueueAutomaticScheduleSync(applicationContext, 0L);
+            AlExecutionService.requestRun(applicationContext);
+            return automaticScheduleResult(next);
         });
     }
 
@@ -996,6 +1118,81 @@ public final class AlExecutionPlugin extends Plugin {
     private static int integer(PluginCall call, String name, int fallback) {
         Integer value = call.getInt(name, fallback);
         return value == null ? fallback : value;
+    }
+
+    private static String automaticScheduleKind(String kind) {
+        if (!("chat".equals(kind) || "moment".equals(kind))) {
+            throw new IllegalArgumentException("automatic schedule kind is invalid");
+        }
+        return kind;
+    }
+
+    private static String automaticScheduleMode(String mode) {
+        if (!("planned".equals(mode) || "dice".equals(mode))) {
+            throw new IllegalArgumentException("automatic schedule mode is invalid");
+        }
+        return mode;
+    }
+
+    private static JSONObject automaticPolicyBasis(
+        String mode, long minDelayMs, long maxDelayMs, String explicitAt
+    ) throws JSONException {
+        if (minDelayMs < 0L || maxDelayMs < minDelayMs || maxDelayMs > 9007199254740991L) {
+            throw new IllegalArgumentException("automatic schedule delay is invalid");
+        }
+        return new JSONObject()
+            .put("explicitAt", explicitAt == null ? JSONObject.NULL : explicitAt)
+            .put("maxDelayMs", maxDelayMs)
+            .put("minDelayMs", minDelayMs)
+            .put("mode", mode);
+    }
+
+    private static long automaticPolicyRevision(
+        AutomaticScheduleAuthorityEntity current, String nextChecksum
+    ) throws JSONException {
+        if (current == null) return 1L;
+        JSONObject semantic = new JSONObject(current.semanticJson);
+        long revision = semantic.getLong("policyRevision");
+        if (nextChecksum.equals(semantic.getString("policyChecksum"))) return revision;
+        return Math.addExact(revision, 1L);
+    }
+
+    private static JSObject automaticScheduleResult(AutomaticScheduleAuthorityEntity row)
+        throws JSONException {
+        if (row == null) throw new IllegalStateException("automatic schedule authority is missing");
+        return automaticScheduleResult(row.characterId, row.kind, row);
+    }
+
+    private static JSObject automaticScheduleResult(
+        String characterId, String kind, AutomaticScheduleAuthorityEntity row
+    ) throws JSONException {
+        JSObject result = new JSObject();
+        result.put("characterId", characterId);
+        result.put("kind", kind);
+        result.put("owner", AutomaticScheduleStore.OWNER);
+        if (row == null) {
+            result.put("epochFingerprint", "");
+            result.put("generation", 0L);
+            result.put("state", "unclaimed");
+            result.put("jobId", JSONObject.NULL);
+            result.put("dueAt", JSONObject.NULL);
+            result.put("cloudSyncState", "none");
+            result.put("lastChangeSource", "none");
+            result.put("lastChangedAt", 0L);
+            return result;
+        }
+        JSONObject semantic = new JSONObject(row.semanticJson);
+        AutomaticScheduleContract.validateTransition(semantic);
+        result.put("epochFingerprint",
+            BridgeAuthority.sha256CanonicalJson(row.authorityEpoch).substring(0, 8));
+        result.put("generation", row.generation);
+        result.put("state", row.state);
+        result.put("jobId", row.activeJobId == null ? JSONObject.NULL : row.activeJobId);
+        result.put("dueAt", row.dueAt == null ? JSONObject.NULL : row.dueAt);
+        result.put("cloudSyncState", row.cloudSyncState);
+        result.put("lastChangeSource", semantic.getString("sourceType"));
+        result.put("lastChangedAt", row.updatedAt);
+        return result;
     }
 
     private static JSObject bridgeConfigResult(BridgeConfig config) {

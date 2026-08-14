@@ -1721,9 +1721,121 @@ async function cloudTimerResponseError(resp) {
   err.httpStatus = resp.status;
   return err;
 }
+function canonicalAutomaticScheduleJson(value) {
+  const canonicalize = input => {
+    if (Array.isArray(input)) return input.map(canonicalize);
+    if (input && typeof input === 'object') {
+      return Object.fromEntries(Object.keys(input).sort().map(key => [key, canonicalize(input[key])]));
+    }
+    return input;
+  };
+  return JSON.stringify(canonicalize(value));
+}
+async function automaticScheduleSha256(value) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+function newWebAutomaticEpoch() {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+function webAutomaticStreamKey(settings, charId, kind) {
+  return `active:${encodeURIComponent(settings.deviceId)}:${encodeURIComponent(charId)}:${kind}`;
+}
+async function webAutomaticTransitionChecksum(value) {
+  const { protocolVersion, jobId, transitionChecksum, scheduleChecksum, ...basis } = value;
+  return automaticScheduleSha256(canonicalAutomaticScheduleJson(basis));
+}
+async function webAutomaticScheduleChecksum(value) {
+  const { protocolVersion, scheduleChecksum, ...basis } = value;
+  return automaticScheduleSha256(canonicalAutomaticScheduleJson(basis));
+}
+async function buildWebAutomaticTransition(settings, charId, kind, previousJob, dueAtMs, mode, operation = 'schedule') {
+  const priorClaimed = previousJob?.owner === 'web-v1'
+    && /^[a-f0-9]{32}$/.test(String(previousJob.authorityEpoch || ''))
+    && Number.isSafeInteger(previousJob.generation) && previousJob.generation >= 1;
+  const authorityEpoch = priorClaimed ? previousJob.authorityEpoch : newWebAutomaticEpoch();
+  const generation = priorClaimed ? previousJob.generation + 1 : 1;
+  const expectedPreviousJobId = priorClaimed ? String(previousJob.jobId || '') || null : null;
+  const active = operation === 'schedule';
+  const policyBasis = active
+    ? { kind, mode, proactiveIdleMinutes: Math.max(1, Number(settings.proactiveIdleMinutes) || 30) }
+    : { kind, mode: null, proactiveIdleMinutes: Math.max(1, Number(settings.proactiveIdleMinutes) || 30) };
+  const policyChecksum = active
+    ? await automaticScheduleSha256(canonicalAutomaticScheduleJson(policyBasis))
+    : String(previousJob?.policyChecksum || '0'.repeat(64));
+  const policyRevision = active
+    ? (priorClaimed && previousJob.policyChecksum === policyChecksum
+      ? Number(previousJob.policyRevision || 1)
+      : Number(previousJob?.policyRevision || 0) + 1)
+    : Math.max(1, Number(previousJob?.policyRevision || 1));
+  const sourceBasis = { characterId: charId, generation, kind, operation, previousJobId: expectedPreviousJobId };
+  const sourceChecksum = await automaticScheduleSha256(canonicalAutomaticScheduleJson(sourceBasis));
+  const transition = {
+    protocolVersion: 2,
+    operation,
+    owner: 'web-v1',
+    authorityEpoch,
+    generation,
+    expectedPreviousJobId,
+    deviceId: settings.deviceId,
+    characterId: charId,
+    kind,
+    streamKey: webAutomaticStreamKey(settings, charId, kind),
+    jobId: null,
+    dueAt: active ? dueAtMs : null,
+    mode: active ? mode : null,
+    sourceType: active ? 'proactive_terminal' : 'lifecycle',
+    sourceId: `sw_${kind}_${generation}_${sourceChecksum.slice(0, 12)}`,
+    sourceChecksum,
+    policyRevision,
+    policyChecksum,
+    transitionChecksum: '0'.repeat(64),
+    scheduleChecksum: '0'.repeat(64)
+  };
+  transition.transitionChecksum = await webAutomaticTransitionChecksum(transition);
+  if (active) {
+    transition.jobId = `${kind === 'moment' ? 'mom' : 'pro'}_${transition.transitionChecksum.slice(0, 16)}_${generation}`;
+  }
+  transition.scheduleChecksum = await webAutomaticScheduleChecksum(transition);
+  return transition;
+}
+async function reloadWebAutomaticStatus(state, charId, kind, localEpoch) {
+  const settings = state.settings;
+  const response = await fetchWithTimeout(timerUrl(settings, '/v2/schedule-status'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ deviceId: settings.deviceId, characterId: charId, kind })
+  }, API_TIMEOUT_MS);
+  if (!response.ok) throw await cloudTimerResponseError(response);
+  const status = await response.json();
+  if (!status?.exists) return status;
+  state.automaticScheduleOwner = String(status.owner || '');
+  if (status.owner === 'android-v1') {
+    delete state.allChats?.[charId]?.[proactiveJobKey(kind)];
+    return status;
+  }
+  if (status.owner !== 'web-v1'
+      || String(localEpoch || '').slice(0, 8) !== String(status.authorityEpochFingerprint || '')) {
+    return status;
+  }
+  const chat = state.allChats?.[charId];
+  if (chat && status.jobId && Number.isSafeInteger(status.generation) && Number.isSafeInteger(status.dueAt)) {
+    chat[proactiveJobKey(kind)] = {
+      ...(chat[proactiveJobKey(kind)] || {}),
+      owner: 'web-v1', authorityEpoch: localEpoch, generation: status.generation,
+      jobId: status.jobId, dueAt: new Date(status.dueAt).toISOString(), kind,
+      scheduleChecksum: String(status.scheduleChecksum || '')
+    };
+  }
+  return status;
+}
 async function scheduleNextCloudProactive(state, charId, kind = 'chat', options = {}) {
   const settings = state?.settings || {};
   const chat = state?.allChats?.[charId];
+  if (state?.automaticScheduleOwner === 'android-v1'
+    || settings.automaticScheduleOwner === 'android-v1') return false;
   if (!automaticTasksEnabled(settings) || !settings.timerEndpoint || !settings.pushSubscription || !settings.deviceId || !chat) return false;
   if (cloudTimerQuotaPauseActive(settings)) return false;
   if (!(await automaticTasksStillEnabled())) return false;
@@ -1732,8 +1844,16 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
   const mode = options.mode === 'dice' ? 'dice' : 'planned';
   const dicePlan = mode === 'dice' ? proactiveDicePlan(options) : null;
   const dueAtMs = dicePlan?.dueAt.getTime() || (Date.now() + proactiveDelayMs(settings, kind));
-  const jobId = proactiveJobId(settings, charId, kind);
-  chat[jobKey] = { jobId, dueAt: new Date(dueAtMs).toISOString(), kind, mode };
+  const transition = await buildWebAutomaticTransition(
+    settings, charId, kind, previousJob, dueAtMs, mode);
+  const jobId = transition.jobId;
+  chat[jobKey] = {
+    jobId, dueAt: new Date(dueAtMs).toISOString(), kind, mode,
+    owner: 'web-v1', authorityEpoch: transition.authorityEpoch,
+    generation: transition.generation, policyRevision: transition.policyRevision,
+    policyChecksum: transition.policyChecksum, scheduleChecksum: transition.scheduleChecksum
+  };
+  state.automaticScheduleOwner = 'web-v1';
   if (mode === 'dice') {
     chat[jobKey].rollChance = dicePlan.rollChance;
     chat[jobKey].diceIntervalMs = dicePlan.intervalMs;
@@ -1742,29 +1862,31 @@ async function scheduleNextCloudProactive(state, charId, kind = 'chat', options 
     chat[jobKey].maxRolls = dicePlan.maxRolls;
   }
   try {
-    const resp = await fetchWithTimeout(timerUrl(settings, '/schedule'), {
+    const resp = await fetchWithTimeout(timerUrl(settings, '/v2/schedule-transitions'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ deviceId: settings.deviceId, jobId, charId, dueAt: chat[jobKey].dueAt, type: 'proactive', kind, mode: proactiveJobMode(chat[jobKey]), rollChance: chat[jobKey].rollChance, diceIntervalMs: chat[jobKey].diceIntervalMs, diceRolls: chat[jobKey].diceRolls, dicePrecomputed: !!chat[jobKey].dicePrecomputed })
+      body: JSON.stringify(transition)
     }, API_TIMEOUT_MS);
-    if (!resp.ok) throw await cloudTimerResponseError(resp);
+    if (!resp.ok) {
+      const error = await cloudTimerResponseError(resp);
+      if (resp.status === 409) {
+        await reloadWebAutomaticStatus(state, charId, kind, transition.authorityEpoch);
+        return false;
+      }
+      throw error;
+    }
     delete settings.cloudTimerQuotaRetryAt;
     if (!(await automaticTasksStillEnabled())) {
-      await fetchWithTimeout(timerUrl(settings, '/cancel'), {
+      const disabled = await buildWebAutomaticTransition(
+        settings, charId, kind, chat[jobKey], null, null, 'disable');
+      await fetchWithTimeout(timerUrl(settings, '/v2/schedule-transitions'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceId: settings.deviceId, jobId })
+        body: JSON.stringify(disabled)
       }, 8000).catch(err => console.warn('[AL Push] disabled job cleanup skipped:', err));
       if (previousJob) chat[jobKey] = previousJob;
       else delete chat[jobKey];
       return false;
-    }
-    if (previousJob?.jobId && previousJob.jobId !== chat[jobKey].jobId) {
-      await fetchWithTimeout(timerUrl(settings, '/cancel'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceId: settings.deviceId, jobId: previousJob.jobId })
-      }, 8000).catch(err => console.warn('[AL Push] stale job cleanup skipped:', err));
     }
   } catch (err) {
     if (isCloudTimerQuotaError(err)) {
@@ -1877,7 +1999,8 @@ async function ensureBackgroundReplyQuality(rawReply, settings, prompt, memoryCo
 }
 
 function isAndroidNativeDelivery(payload = {}) {
-  return payload.nativeExecution === true
+  return payload.owner === 'android-v1'
+    || payload.nativeExecution === true
     || payload.platform === 'android'
     || payload.delivery === 'native';
 }
@@ -1885,7 +2008,8 @@ function isAndroidNativeDelivery(payload = {}) {
 async function handleProactivePush(payload) {
   const state = await getMeta('app_state', null);
   if (!state?.settings || !state?.allChats) throw new Error('missing local state');
-  if (isAndroidNativeDelivery(payload) || state.nativeExecution === true) {
+  if (isAndroidNativeDelivery(payload) || state.nativeExecution === true
+    || state.automaticScheduleOwner === 'android-v1') {
     await setMeta('pending_native_proactive', { payload, receivedAt: Date.now() });
     await notifyClients({
       type: 'AL_NATIVE_PROACTIVE_DUE',
@@ -1893,6 +2017,7 @@ async function handleProactivePush(payload) {
       kind: payload.kind === 'moment' ? 'moment' : 'chat',
       mode: payload.mode || 'planned',
       jobId: payload.jobId || '',
+      test: !!payload.test,
       nativeExecution: true
     });
     return true;
