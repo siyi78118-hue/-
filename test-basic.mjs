@@ -147,7 +147,7 @@ assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
 assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');
 assert.match(html, /async function scheduleCloudProactive[\s\S]{0,5000}syncNativeProactiveSnapshot\(/, 'native snapshot must exist before a cloud timer is scheduled');
-assert.match(html, /if \(!force && hasFutureCloudJob\(chat, kind\) && proactiveJobUsesCurrentDicePolicy\(kind, chat\[proactiveJobKey\(kind\)\]\)\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must receive native snapshots after an app upgrade');
+assert.match(html, /if \(!force && hasFutureCloudJob\(chat, kind\) && proactiveJobUsesCurrentDicePolicy\(kind, currentJob\)\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must receive native snapshots after an app upgrade');
 assert.match(html, /async function triggerProactiveMessage[\s\S]{0,1400}chatHasPendingDirectReply\(chat\)/, 'foreground proactive chat must not replace a pending direct reply');
 assert.match(html, /await syncFromServiceWorkerState\(\{ checkProactive: false \}\)[\s\S]{0,1400}resumePendingAssistantTurns\(\)[\s\S]{0,300}checkProactiveMessages\(\)/, 'boot must resume direct replies before proactive catch-up');
 assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_push_queue/, 'FCM must wake the Room execution engine directly');
@@ -174,7 +174,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v113';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v114';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -195,7 +195,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.113';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.114';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -448,7 +448,7 @@ assert.match(script, /if \(!manual\) try \{ await enterProactiveDiceMode\(charId
 assert.match(script, /proactiveDefaultScheduleOptions\(kind, chat\)/);
 assert.match(script, /chatHasUnansweredProactive\(chat\)/);
 assert.match(script, /triggerProactiveMessage\(target\.char\.id, false, proactiveJobMode\(job\)\)/);
-assert.match(script, /triggerProactiveMessage\(data\.charId, false, proactiveJobMode\(localJob \|\| data\)\)/);
+assert.match(script, /async function handleForegroundProactiveRequest[\s\S]{0,5000}runDueProactiveTarget\(target, 'chat'\)/, 'push and foreground catch-up must share the same job consumer');
 assert.match(script, /function proactiveModeLabel\(job\)/);
 assert.match(script, /最近私聊（\$\{nextChat\.char\.name\}｜\$\{proactiveModeLabel\(nextChat\.job\)\}）/);
 assert.doesNotMatch(script, /cancelCloudProactive\(requestCharId, 'all'\)/);
@@ -2583,6 +2583,78 @@ assert.equal(proactiveDicePlan({ rollChance: 0 }, 0, 0.99).rolls, 144, '零概�
 const latestMomentPlan = proactiveDicePlan(proactiveDefaultScheduleOptions('moment'), 0, 1 - Number.EPSILON);
 assert.equal(latestMomentPlan.rolls, 12, '朋友圈随机等待最长只能达到 12 轮');
 assert.equal(latestMomentPlan.dueAt.getTime(), 24 * 60 * 60 * 1000, '朋友圈最迟必须在 24 小时时触发');
+const proactiveConsumptionSingleFlightProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedCharacters = characters;
+  const savedChats = allChats;
+  const savedTrigger = triggerProactiveMessage;
+  const savedSchedule = scheduleCloudProactive;
+  const savedRestore = restoreAppStateFromMirror;
+  const savedMirror = mirrorAppStateNow;
+  const savedForegroundBusy = foregroundProactiveRequestBusy;
+  const dueAt = new Date(Date.now() - 1000).toISOString();
+  settings = {
+    ...settings,
+    proactiveEnabled: true,
+    cloudTimerEnabled: true,
+    timerEndpoint: 'https://timer.example',
+    pushSubscription: { endpoint: 'https://push.example' },
+    deviceId: 'single-flight-device'
+  };
+  characters = [{ id: 'single_flight_char', name: '虞栖' }];
+  allChats = {
+    single_flight_char: {
+      messages: [{ role: 'user', content: '同一个到期任务只能处理一次', time: Date.now() - 2000 }],
+      pendingProactiveJob: { jobId: 'single-flight-job', dueAt, kind: 'chat', mode: 'planned' }
+    }
+  };
+  let calls = 0;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  triggerProactiveMessage = async () => {
+    calls += 1;
+    await gate;
+    return true;
+  };
+  restoreAppStateFromMirror = async () => false;
+  mirrorAppStateNow = async () => true;
+  foregroundProactiveRequestBusy = false;
+  const target = { char: characters[0], chat: allChats.single_flight_char };
+  const attempts = [
+    runDueProactiveTarget(target, 'chat'),
+    runDueProactiveTarget(target, 'chat'),
+    handleForegroundProactiveRequest({
+      charId: 'single_flight_char',
+      jobId: 'single-flight-job',
+      kind: 'chat',
+      mode: 'planned'
+    })
+  ];
+  await new Promise(resolve => setTimeout(resolve, 0));
+  const callsWhileBlocked = calls;
+  release(true);
+  await Promise.all(attempts);
+  let replacementSchedules = 0;
+  scheduleCloudProactive = async () => {
+    replacementSchedules += 1;
+    return true;
+  };
+  await ensureCloudProactiveKindScheduled('chat');
+  const processingAt = Number(allChats.single_flight_char.pendingProactiveJob?.processingAt || 0);
+  settings = savedSettings;
+  characters = savedCharacters;
+  allChats = savedChats;
+  triggerProactiveMessage = savedTrigger;
+  scheduleCloudProactive = savedSchedule;
+  restoreAppStateFromMirror = savedRestore;
+  mirrorAppStateNow = savedMirror;
+  foregroundProactiveRequestBusy = savedForegroundBusy;
+  return { callsWhileBlocked, calls, replacementSchedules, processingAt };
+})()`, context);
+assert.equal(proactiveConsumptionSingleFlightProbe.callsWhileBlocked, 1, '并发前台检查和push必须共用同一个到期任务执行');
+assert.equal(proactiveConsumptionSingleFlightProbe.calls, 1, '同一个jobId在同一轮唤醒中只能提交一次');
+assert.equal(proactiveConsumptionSingleFlightProbe.replacementSchedules, 0, '原生任务处理中不得被前台补排覆盖成新的随机时间');
+assert.ok(proactiveConsumptionSingleFlightProbe.processingAt > 0, '到期任务交给原生执行后必须持久标记为处理中');
 const diceScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;

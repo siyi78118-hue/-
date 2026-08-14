@@ -1407,7 +1407,7 @@ const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
 const NATIVE_BRIDGE_TIMEOUT_MS = 8000;
 const NATIVE_RECONCILE_TIMEOUT_MS = 12000;
 const NATIVE_TURN_APPLY_TIMEOUT_MS = 10000;
-const APP_BUILD_VERSION = '2026-08-14.113';
+const APP_BUILD_VERSION = '2026-08-14.114';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -1426,6 +1426,7 @@ const MOMENT_DICE_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const MOMENT_DICE_CHANCE = 0.20;
 const MOMENT_DICE_MAX_ROLLS = 12;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
+const PROACTIVE_JOB_PROCESSING_LEASE_MS = 30 * 60 * 1000;
 const CALL_LOG_LIMIT = 30;
 const MEMORY_PACK_CHAR_BUDGET = 3600;
 const MEMORY_LINE_CHAR_LIMIT = 360;
@@ -1579,6 +1580,7 @@ let activeScreen = 'chats';
 let proactiveTimer = null;
 let proactiveChatBusy = false;
 let proactiveMomentBusy = false;
+const proactiveJobFlights = new Map();
 const memoryExtractionStates = new Map();
 const memoryExtractionEpochs = new Map();
 const momentNotificationFlights = new Map();
@@ -3352,7 +3354,7 @@ async function syncNativeProactiveSnapshot(charId, kind = 'chat', job = null) {
     chatMaxTokens: normalizedChatMaxTokens(settings.maxTokens),
     proactiveKind: kind,
     proactiveMode: triggerMode,
-    proactiveJob: job ? { ...job } : null,
+    proactiveJob: proactiveSnapshotJob(job),
     continuationDice: proactiveDiceOptions(kind),
     cloudJobId: job?.jobId || '',
     scheduledFor: job?.dueAt ? Date.parse(job.dueAt) : null,
@@ -11058,12 +11060,80 @@ function hasFutureCloudJob(chat, kind = 'chat') {
   const dueAt = Date.parse(chat?.[proactiveJobKey(kind)]?.dueAt || '');
   return Number.isFinite(dueAt) && dueAt > Date.now();
 }
+function proactiveJobIsProcessing(job, now = Date.now()) {
+  const processingAt = Number(job?.processingAt || 0);
+  return !!job?.jobId
+    && Number.isSafeInteger(processingAt)
+    && processingAt > 0
+    && processingAt <= now
+    && now - processingAt < PROACTIVE_JOB_PROCESSING_LEASE_MS;
+}
+function proactiveSnapshotJob(job) {
+  if (!job || typeof job !== 'object') return null;
+  return {
+    jobId: String(job.jobId || ''),
+    dueAt: String(job.dueAt || ''),
+    kind: job.kind === 'moment' ? 'moment' : 'chat',
+    mode: proactiveJobMode(job),
+    ...(Number.isFinite(Number(job.rollChance)) ? { rollChance: Number(job.rollChance) } : {}),
+    ...(Number.isFinite(Number(job.diceIntervalMs)) ? { diceIntervalMs: Number(job.diceIntervalMs) } : {}),
+    ...(Number.isSafeInteger(Number(job.diceRolls)) ? { diceRolls: Number(job.diceRolls) } : {}),
+    ...(job.dicePrecomputed === true ? { dicePrecomputed: true } : {}),
+    ...(Number.isSafeInteger(Number(job.maxRolls)) ? { maxRolls: Number(job.maxRolls) } : {})
+  };
+}
+function proactiveJobFlightKey(charId, kind, jobId) {
+  return `${String(charId || '')}:${kind === 'moment' ? 'moment' : 'chat'}:${String(jobId || 'jobless')}`;
+}
+function clearProactiveJobProcessing(charId, kind, jobId) {
+  const chat = allChats[charId];
+  const job = chat?.[proactiveJobKey(kind)];
+  if (!job || String(job.jobId || '') !== String(jobId || '')) return false;
+  delete job.processingAt;
+  DB.set('chats', allChats);
+  mirrorAppStateNow().catch(err => console.warn('[AL Timer] processing marker cleanup skipped:', err.message));
+  return true;
+}
+function runProactiveJobSingleFlight(target, kind, runner) {
+  const charId = String(target?.char?.id || '');
+  const initialJob = target?.chat?.[proactiveJobKey(kind)] || null;
+  const jobId = String(initialJob?.jobId || '');
+  const flightKey = proactiveJobFlightKey(charId, kind, jobId);
+  const existing = proactiveJobFlights.get(flightKey);
+  if (existing) return existing;
+  let flight;
+  flight = Promise.resolve().then(async () => {
+    const chat = allChats[charId];
+    const currentJob = chat?.[proactiveJobKey(kind)] || null;
+    if (jobId && String(currentJob?.jobId || '') !== jobId) return false;
+    if (jobId && proactiveJobIsProcessing(currentJob)) return false;
+    if (jobId) {
+      currentJob.processingAt = Date.now();
+      DB.set('chats', allChats);
+      await mirrorAppStateNow();
+    }
+    try {
+      const result = await runner({ char: target?.char, chat }, currentJob);
+      if (result === false) clearProactiveJobProcessing(charId, kind, jobId);
+      return result;
+    } catch (err) {
+      clearProactiveJobProcessing(charId, kind, jobId);
+      throw err;
+    }
+  }).finally(() => {
+    if (proactiveJobFlights.get(flightKey) === flight) proactiveJobFlights.delete(flightKey);
+  });
+  proactiveJobFlights.set(flightKey, flight);
+  return flight;
+}
 function ensureOpenedChatProactive(charId) {
   const chat = allChats[charId];
   if (!settings.proactiveEnabled || !chat || !lastVisibleMessage(chat)) return;
   for (const kind of PROACTIVE_JOB_KINDS) {
     const job = chat[proactiveJobKey(kind)];
-    if (job?.dueAt && Date.parse(job.dueAt) <= Date.now()) {
+    if (proactiveJobIsProcessing(job)) {
+      continue;
+    } else if (job?.dueAt && Date.parse(job.dueAt) <= Date.now()) {
       runDueProactiveTarget({ char: characters.find(c => c.id === charId), chat }, kind).catch(err => console.warn(`[AL Timer] open-chat ${kind} due skipped:`, err.message));
     } else if (!hasFutureCloudJob(chat, kind) || !proactiveJobUsesCurrentDicePolicy(kind, job)) {
       scheduleCloudProactive(charId, kind, proactiveDefaultScheduleOptions(kind, chat)).catch(err => console.warn(`[AL Timer] open-chat ${kind} schedule skipped:`, err.message));
@@ -11088,7 +11158,11 @@ async function ensureCloudProactiveKindScheduled(kind = 'chat', options = {}) {
   let changed = false;
   for (const { char, chat } of rows) {
     try {
-      if (!force && hasFutureCloudJob(chat, kind) && proactiveJobUsesCurrentDicePolicy(kind, chat[proactiveJobKey(kind)])) {
+      const currentJob = chat[proactiveJobKey(kind)];
+      if (proactiveJobIsProcessing(currentJob)) {
+        continue;
+      }
+      if (!force && hasFutureCloudJob(chat, kind) && proactiveJobUsesCurrentDicePolicy(kind, currentJob)) {
         await syncNativeProactiveSnapshot(char.id, kind, chat[proactiveJobKey(kind)]);
         const syncKey = proactiveSyncKey(kind);
         const lastSync = Number(chat[syncKey] || 0);
@@ -11459,13 +11533,16 @@ function findDueCloudProactiveTargets(kind = 'chat') {
   const jobKey = proactiveJobKey(kind);
   return getLatestChatRows()
     .filter(({ chat }) => {
-      const dueAt = chat?.[jobKey]?.dueAt;
-      return dueAt && Date.parse(dueAt) <= now;
+      const job = chat?.[jobKey];
+      const dueAt = job?.dueAt;
+      return !proactiveJobIsProcessing(job) && dueAt && Date.parse(dueAt) <= now;
     })
     .sort((a, b) => Date.parse(a.chat[jobKey].dueAt) - Date.parse(b.chat[jobKey].dueAt));
 }
 async function runDueProactiveTarget(target, kind = 'chat') {
-  const job = target?.chat?.[proactiveJobKey(kind)] || null;
+  return runProactiveJobSingleFlight(target, kind, (currentTarget, job) => runDueProactiveTargetUnlocked(currentTarget, kind, job));
+}
+async function runDueProactiveTargetUnlocked(target, kind = 'chat', job = null) {
   if (kind === 'chat' && !proactiveJobMatchesConversationStage(target?.chat, job)) {
     const expectedMode = expectedProactiveChatMode(target?.chat);
     setCloudTimerTrace(kind, cloudTraceId(kind), `忽略阶段不匹配的${proactiveModeLabel(job)}任务，已按当前会话切换为${expectedMode === 'dice' ? '随机抽取' : '计划追发'}`);
@@ -11700,6 +11777,7 @@ async function ensureLocalProactiveScheduled() {
   for (const { char, chat } of rows) {
     for (const kind of PROACTIVE_JOB_KINDS) {
       const job = chat[proactiveJobKey(kind)];
+      if (proactiveJobIsProcessing(job)) continue;
       if ((job?.jobId || job?.dueAt) && proactiveJobUsesCurrentDicePolicy(kind, job)) continue;
       scheduled = await scheduleCloudProactive(char.id, kind, proactiveDefaultScheduleOptions(kind, chat)) || scheduled;
     }
@@ -11740,24 +11818,15 @@ async function handleForegroundProactiveRequest(data = {}) {
       setCloudTimerTrace(kind, traceId, '忽略已被新任务替换的旧推送，避免计划追发与随机抽取串线。');
       return;
     }
-    if (kind === 'chat' && localJob && !proactiveJobMatchesConversationStage(allChats[data.charId], localJob)) {
-      const expectedMode = expectedProactiveChatMode(allChats[data.charId]);
-      setCloudTimerTrace(kind, traceId, `推送阶段与会话不一致，已改排为${expectedMode === 'dice' ? '随机抽取' : '计划追发'}。`);
-      if (expectedMode === 'dice') await scheduleDiceProactive(data.charId, kind);
-      else await schedulePlannedChatFromReply(data.charId, null);
-      return;
-    }
-    if (proactiveJobMode(localJob || data) === 'dice' && data.charId && !rollProactiveDice(kind, localJob || data)) {
-      setCloudTimerTrace(kind, traceId, '骰子未抽中，本轮不调用模型，已安排下一轮');
-      await scheduleDiceProactive(data.charId, kind);
-      return;
-    }
+    const target = data.charId
+      ? { char: characters.find(char => char.id === data.charId), chat: allChats[data.charId] }
+      : null;
     if (data.kind === 'moment') {
       if (data.test) setCloudTimerTestAck('本机已收到朋友圈测试推送，闹钟链路正常。');
       setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}朋友圈闹钟已被前台收到。`);
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，朋友圈闹钟链路正常；正在继续请求聊天模型。' : `云闹钟已触发，正在由前台生成朋友圈。${data.fallback ? '（本地未命中到期任务，已用最近任务兜底）' : ''}`, true, 'moment');
       if (data.charId) {
-        const ok = await triggerProactiveMoment(data.charId, false);
+        const ok = await runDueProactiveTarget(target, 'moment');
         if (!ok) setCloudTimerTrace('moment', traceId, '前台触发朋友圈未写入内容，详见朋友圈结果或最近调用诊断');
       } else await catchUpDueCloudProactive();
     } else {
@@ -11765,7 +11834,7 @@ async function handleForegroundProactiveRequest(data = {}) {
       setCloudTimerTriggerAck(`${data.test ? '测试' : '真实'}私聊闹钟已被前台收到。`);
       setCloudTimerStatus(data.test ? '测试推送已被本机收到，私聊闹钟链路正常；正在继续请求聊天模型。' : `云闹钟已触发，正在由前台生成私聊。${data.fallback ? '（本地未命中到期任务，已用最近任务兜底）' : ''}`, true, 'chat');
       if (data.charId) {
-        const ok = await triggerProactiveMessage(data.charId, false, proactiveJobMode(localJob || data));
+        const ok = await runDueProactiveTarget(target, 'chat');
         if (!ok) setCloudTimerTrace('chat', traceId, '前台触发私聊未写入内容，详见私聊结果或最近调用诊断');
       } else await catchUpDueCloudProactive();
     }
