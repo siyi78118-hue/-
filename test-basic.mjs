@@ -174,7 +174,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v112';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v113';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -195,7 +195,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.112';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.113';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -2604,6 +2604,53 @@ assert.equal(diceScheduleProbe.job.rollChance, 0.15);
 assert.equal(diceScheduleProbe.job.diceIntervalMs, 600000);
 assert.ok(Math.abs(Date.parse(diceScheduleProbe.job.dueAt) - diceScheduleProbe.startedAt - diceScheduleProbe.job.diceRolls * 600000) < 2000);
 assert.equal(diceScheduleProbe.legacyZeroChanceResult, false, '旧骰子任务仍需在到点时兼容抽签');
+const replayedNativeProactiveScheduleProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedChats = allChats;
+  const savedCharacters = characters;
+  const savedMoments = allMoments;
+  const savedProcessMemory = processMemoryAfterTurn;
+  settings = { ...settings, proactiveEnabled: true, cloudTimerEnabled: false, deviceId: 'native-proactive-replay-device' };
+  characters = [{ id: 'native_proactive_char', name: '虞栖' }];
+  allMoments = [];
+  const stableDueAt = new Date(Date.now() + 90 * 60000).toISOString();
+  allChats = {
+    native_proactive_char: {
+      messages: [
+        { id: 'user-before-proactive', role: 'user', content: '你在吗', time: Date.now() - 2000 },
+        { id: 'native-visible-part', role: 'assistant', content: '在。', time: Date.now() - 1000, sourceTurnId: 'native:proactive-turn-1' }
+      ],
+      pendingProactiveJob: { jobId: 'stable-next-proactive-job', dueAt: stableDueAt, kind: 'chat', mode: 'dice', dicePrecomputed: true }
+    }
+  };
+  processMemoryAfterTurn = async () => {};
+  const changed = await applyNativeExecutionTurn({
+    turnId: 'proactive-turn-1',
+    characterId: 'native_proactive_char',
+    kind: 'PROACTIVE_CHAT',
+    state: 'COMPLETED',
+    terminalDisposition: 'visible',
+    completedAt: Date.now() - 1000,
+    replyParts: [{ partId: 'native-visible-part', type: 'TEXT', sequence: 1, content: '在。' }]
+  });
+  await Promise.resolve();
+  const result = {
+    changed,
+    job: { ...allChats.native_proactive_char.pendingProactiveJob },
+    messageCount: allChats.native_proactive_char.messages.length,
+    stableDueAt
+  };
+  settings = savedSettings;
+  allChats = savedChats;
+  characters = savedCharacters;
+  allMoments = savedMoments;
+  processMemoryAfterTurn = savedProcessMemory;
+  return result;
+})()`, context);
+assert.equal(replayedNativeProactiveScheduleProbe.changed, false, '重复投递已落地的主动结果不应再修改聊天');
+assert.equal(replayedNativeProactiveScheduleProbe.job.jobId, 'stable-next-proactive-job', '同一主动结果的重放不得替换下一个闹钟');
+assert.equal(replayedNativeProactiveScheduleProbe.job.dueAt, replayedNativeProactiveScheduleProbe.stableDueAt, '同一主动结果的重放不得重新抽取时间');
+assert.equal(replayedNativeProactiveScheduleProbe.messageCount, 2, '重放不得重复添加气泡');
 const nativeDirectScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;

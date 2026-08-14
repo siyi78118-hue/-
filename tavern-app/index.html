@@ -1407,7 +1407,7 @@ const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
 const NATIVE_BRIDGE_TIMEOUT_MS = 8000;
 const NATIVE_RECONCILE_TIMEOUT_MS = 12000;
 const NATIVE_TURN_APPLY_TIMEOUT_MS = 10000;
-const APP_BUILD_VERSION = '2026-08-14.112';
+const APP_BUILD_VERSION = '2026-08-14.113';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
@@ -4484,7 +4484,9 @@ async function applyNativeExecutionTurnUnlocked(result) {
     return true;
   }
   const rolePlanTurn = ['ROLE_PLAN_CHAT', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT_PRIVATE'].includes(kind);
-  if (kind === 'PROACTIVE_CHAT' || kind === 'PROACTIVE_MOMENT' || rolePlanTurn) {
+  const automaticTurn = kind === 'PROACTIVE_CHAT' || kind === 'PROACTIVE_MOMENT' || rolePlanTurn;
+  if (automaticTurn && state === 'COMPLETED' && nativeTurnHasUiLanding(result)) return false;
+  if (automaticTurn) {
     const sourceTurnId = `native:${result.turnId}`;
     if (state === 'COMPLETED') {
       const parts = Array.isArray(result.replyParts) ? result.replyParts.slice().sort((a, b) => Number(a.sequence) - Number(b.sequence)) : [];
