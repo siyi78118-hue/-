@@ -1,0 +1,35 @@
+{
+  "protocolVersion": 1,
+  "vectors": [
+    {
+      "name": "android-chat-generation-1",
+      "transition": {
+        "protocolVersion": 2,
+        "operation": "schedule",
+        "owner": "android-v1",
+        "authorityEpoch": "00112233445566778899aabbccddeeff",
+        "generation": 1,
+        "expectedPreviousJobId": null,
+        "deviceId": "device-a",
+        "characterId": "char-a",
+        "kind": "chat",
+        "streamKey": "active:device-a:char-a:chat",
+        "jobId": "pro_53fd68a5b14aec79_1",
+        "dueAt": 1786728600000,
+        "mode": "planned",
+        "sourceType": "bootstrap",
+        "sourceId": "bootstrap:char-a:chat",
+        "sourceChecksum": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "policyRevision": 1,
+        "policyChecksum": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "transitionChecksum": "53fd68a5b14aec79a154b157a6fe9f797be18b892a9ab97fff2f359fa2132ed2",
+        "scheduleChecksum": "8bf4550b02d4eba0e919ba5cca9505bd9a3fb732892e9f0ada3c7fb21057d6c2"
+      },
+      "transitionCanonicalJson": "{\"authorityEpoch\":\"00112233445566778899aabbccddeeff\",\"characterId\":\"char-a\",\"deviceId\":\"device-a\",\"dueAt\":1786728600000,\"expectedPreviousJobId\":null,\"generation\":1,\"kind\":\"chat\",\"mode\":\"planned\",\"operation\":\"schedule\",\"owner\":\"android-v1\",\"policyChecksum\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policyRevision\":1,\"sourceChecksum\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"sourceId\":\"bootstrap:char-a:chat\",\"sourceType\":\"bootstrap\",\"streamKey\":\"active:device-a:char-a:chat\"}",
+      "transitionChecksum": "53fd68a5b14aec79a154b157a6fe9f797be18b892a9ab97fff2f359fa2132ed2",
+      "jobId": "pro_53fd68a5b14aec79_1",
+      "scheduleCanonicalJson": "{\"authorityEpoch\":\"00112233445566778899aabbccddeeff\",\"characterId\":\"char-a\",\"deviceId\":\"device-a\",\"dueAt\":1786728600000,\"expectedPreviousJobId\":null,\"generation\":1,\"jobId\":\"pro_53fd68a5b14aec79_1\",\"kind\":\"chat\",\"mode\":\"planned\",\"operation\":\"schedule\",\"owner\":\"android-v1\",\"policyChecksum\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"policyRevision\":1,\"sourceChecksum\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"sourceId\":\"bootstrap:char-a:chat\",\"sourceType\":\"bootstrap\",\"streamKey\":\"active:device-a:char-a:chat\",\"transitionChecksum\":\"53fd68a5b14aec79a154b157a6fe9f797be18b892a9ab97fff2f359fa2132ed2\"}",
+      "scheduleChecksum": "8bf4550b02d4eba0e919ba5cca9505bd9a3fb732892e9f0ada3c7fb21057d6c2"
+    }
+  ]
+}

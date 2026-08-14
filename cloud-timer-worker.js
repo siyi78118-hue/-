@@ -1,3 +1,10 @@
+import {
+  scheduleStreamKey,
+  validateScheduleDeliveryReference,
+  validateScheduleStatusQuery,
+  validateScheduleTransition
+} from './automatic-schedule-contract.mjs';
+
 // Cloudflare Worker: AL cloud timer.
 //
 // Bindings required:
@@ -61,6 +68,51 @@ export default {
         logWorkerEvent('register', { deviceId: shortId(body.deviceId), transport: isFcm ? 'fcm' : 'webpush', idempotent, ok: true });
         return json({ ok: true, transport: isFcm ? 'fcm' : 'webpush', idempotent });
       }
+      if (request.method === 'POST' && url.pathname === '/v2/schedule-transitions') {
+        const body = await validateScheduleTransition(await request.json());
+        const saved = await timerStore(env).transitionAutomaticStream(body);
+        logWorkerEvent('schedule-transition', {
+          deviceId: shortId(body.deviceId),
+          charId: shortId(body.characterId),
+          kind: body.kind,
+          generation: body.generation,
+          operation: body.operation,
+          idempotent: !!saved.idempotent,
+          ok: true
+        });
+        return json({ ok: true, idempotent: !!saved.idempotent });
+      }
+      if (request.method === 'POST' && url.pathname === '/v2/schedule-status') {
+        const query = validateScheduleStatusQuery(await request.json());
+        const row = await timerStore(env).getAutomaticStreamStatus(scheduleStreamKey(query));
+        if (!row) return json({ ok: true, exists: false });
+        const epoch = String(row.authority_epoch ?? row.authorityEpoch ?? '');
+        const semantic = row.payload_json ? JSON.parse(row.payload_json) : row;
+        const activeJobId = row.active_job_id !== undefined ? row.active_job_id : (row.jobId ?? null);
+        const transportDueAt = row.due_at !== undefined ? row.due_at : (row.dueAt ?? null);
+        return json({
+          ok: true,
+          exists: true,
+          owner: row.owner,
+          state: row.state ?? (row.operation === 'schedule' ? 'scheduled' : row.operation === 'pause' ? 'paused' : 'disabled'),
+          generation: Number(row.generation),
+          jobId: activeJobId,
+          dueAt: semantic?.dueAt ?? null,
+          nextDeliveryAttemptAt: transportDueAt,
+          scheduleChecksum: row.schedule_checksum ?? row.scheduleChecksum,
+          authorityEpochFingerprint: epoch.slice(0, 8),
+          deliveryAttempts: Number(row.delivery_attempts ?? 0),
+          updatedAt: Number(row.updated_at ?? 0)
+        });
+      }
+      if (request.method === 'POST' && url.pathname === '/v2/schedule-defer') {
+        const body = validateScheduleDeliveryReference(await request.json(), { defer: true });
+        return json({ ok: true, ...(await timerStore(env).deferAutomaticDelivery(body)) });
+      }
+      if (request.method === 'POST' && url.pathname === '/v2/schedule-ack') {
+        const body = validateScheduleDeliveryReference(await request.json());
+        return json({ ok: true, ...(await timerStore(env).ackAutomaticDelivery(body)) });
+      }
       if (request.method === 'POST' && url.pathname === '/schedule') {
         const body = await request.json();
         if (!body.deviceId || !body.jobId || !body.dueAt) throw new Error('missing deviceId/jobId/dueAt');
@@ -90,7 +142,20 @@ export default {
           test: !!body.test,
           updatedAt: Date.now()
         };
-        const saved = await saveJob(job, env);
+        if (!job.test && job.type !== 'role-plan') {
+          const store = timerStore(env);
+          const claimed = store.getAutomaticStreamStatus
+            ? await store.getAutomaticStreamStatus(logicalTaskKey(job))
+            : null;
+          if (claimed) {
+            const error = new Error('automatic schedule authority conflict');
+            error.code = 'SCHEDULE_AUTHORITY_CONFLICT';
+            throw error;
+          }
+        }
+        const saved = await saveJob(job, env, {
+          requireUnclaimedAutomatic: !job.test && job.type !== 'role-plan'
+        });
         logWorkerEvent('schedule', { deviceId: shortId(job.deviceId), jobId: shortId(job.jobId), charId: shortId(job.charId), kind: job.kind, dueAt: job.dueAt, idempotent: !!saved.idempotent, replacedJobId: shortId(saved.replacedJobId), ok: true });
         return json({ ok: true, dueMinute: minuteKey(dueAtMs), idempotent: !!saved.idempotent, replacedJobId: saved.replacedJobId || '' });
       }
@@ -197,6 +262,14 @@ async function runDueJobs(env) {
     summary.jobsSeen = jobs.length;
     for (const job of jobs) {
       try {
+        if (job.automaticAuthority) {
+          const claimed = await store.claimAutomaticDelivery({
+            ...automaticDeliveryIdentity(job),
+            expectedDueAt: job.deliveryDueAt,
+            leaseUntil: Date.now() + 60_000
+          });
+          if (!claimed.claimed) continue;
+        }
         const delivered = await deliverJob(job, env);
         await appendEvent(env, { type: 'deliver', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', ok: delivered.ok, reason: delivered.reason || delivered.fallbackReason || '', retry: !!delivered.retry, awaitingAck: !!delivered.awaitingAck, payload: delivered.payload !== false });
         if (delivered.awaitingAck) {
@@ -247,6 +320,31 @@ function timerStore(env) {
 
 function createD1TimerStore(db) {
   const parseJob = row => row?.payload_json ? JSON.parse(row.payload_json) : null;
+  const automaticStream = async logicalKey => db.prepare(`SELECT logical_key, device_id, char_id, kind, owner,
+      authority_epoch, generation, state, active_job_id, due_at, payload_json,
+      expected_previous_job_id, schedule_checksum, delivery_attempts, updated_at
+    FROM timer_stream_authorities WHERE logical_key = ?1`).bind(logicalKey).first();
+  const automaticConflict = (code, message) => {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  };
+  const assertAutomaticTransition = (current, input) => {
+    if (current.owner !== input.owner || current.authority_epoch !== input.authorityEpoch
+        || current.device_id !== input.deviceId || current.char_id !== input.characterId
+        || current.kind !== input.kind) {
+      throw automaticConflict('SCHEDULE_AUTHORITY_CONFLICT', 'automatic schedule authority conflict');
+    }
+    if (Number(current.generation) === input.generation) {
+      if (current.schedule_checksum === input.scheduleChecksum) return 'idempotent';
+      throw automaticConflict('SCHEDULE_CHECKSUM_CONFLICT', 'automatic schedule checksum conflict');
+    }
+    if (input.generation !== Number(current.generation) + 1
+        || (current.active_job_id ?? null) !== (input.expectedPreviousJobId ?? null)) {
+      throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+    }
+    return 'advance';
+  };
   return {
     async getSubscription(deviceId) {
       const row = await db.prepare('SELECT target_json FROM timer_devices WHERE device_id = ?1').bind(deviceId).first();
@@ -268,22 +366,143 @@ function createD1TimerStore(db) {
       const result = await db.prepare('DELETE FROM timer_devices WHERE device_id = ?1').bind(deviceId).run();
       return Number(result?.meta?.changes || 0) > 0;
     },
+    async getAutomaticStreamStatus(logicalKey) {
+      return automaticStream(logicalKey);
+    },
+    async transitionAutomaticStream(input) {
+      const state = input.operation === 'schedule' ? 'scheduled' : input.operation === 'pause' ? 'paused' : 'disabled';
+      const activeJobId = input.operation === 'schedule' ? input.jobId : null;
+      const dueAt = input.operation === 'schedule' ? input.dueAt : null;
+      const payloadJson = input.operation === 'schedule' ? JSON.stringify(input) : null;
+      const updatedAt = Date.now();
+      const current = await automaticStream(input.streamKey);
+      if (!current) {
+        if (input.generation !== 1 || input.expectedPreviousJobId !== null) {
+          throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+        }
+        const insertStatement = db.prepare(`INSERT INTO timer_stream_authorities
+          (logical_key, device_id, char_id, kind, owner, authority_epoch, generation, state,
+           active_job_id, due_at, payload_json, expected_previous_job_id, schedule_checksum,
+           delivery_attempts, updated_at)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14)
+          ON CONFLICT(logical_key) DO NOTHING`)
+          .bind(input.streamKey, input.deviceId, input.characterId, input.kind, input.owner,
+            input.authorityEpoch, input.generation, state, activeJobId, dueAt, payloadJson,
+            input.expectedPreviousJobId, input.scheduleChecksum, updatedAt);
+        if (typeof db.batch !== 'function') throw new Error('D1 batch API is required for automatic authority claim');
+        const [inserted] = await db.batch([
+          insertStatement,
+          db.prepare('DELETE FROM timer_jobs WHERE logical_key = ?1').bind(input.streamKey)
+        ]);
+        if (Number(inserted?.meta?.changes || 0) === 1) return { idempotent: false };
+        const winner = await automaticStream(input.streamKey);
+        if (winner && assertAutomaticTransition(winner, input) === 'idempotent') return { idempotent: true };
+        throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+      }
+      if (assertAutomaticTransition(current, input) === 'idempotent') return { idempotent: true };
+      const updated = await db.prepare(`UPDATE timer_stream_authorities SET
+          generation = ?2, state = ?3, active_job_id = ?4, due_at = ?5, payload_json = ?6,
+          expected_previous_job_id = ?7, schedule_checksum = ?8, delivery_attempts = 0, updated_at = ?9
+        WHERE logical_key = ?1 AND owner = ?11 AND authority_epoch = ?12 AND generation = ?13
+          AND ((active_job_id = ?14) OR (active_job_id IS NULL AND ?14 IS NULL))
+          AND schedule_checksum = ?15`)
+        .bind(input.streamKey, input.generation, state, activeJobId, dueAt, payloadJson,
+          input.expectedPreviousJobId, input.scheduleChecksum, updatedAt, null,
+          current.owner, current.authority_epoch, current.generation, current.active_job_id,
+          current.schedule_checksum).run();
+      if (Number(updated?.meta?.changes || 0) === 1) return { idempotent: false };
+      const winner = await automaticStream(input.streamKey);
+      if (winner && assertAutomaticTransition(winner, input) === 'idempotent') return { idempotent: true };
+      throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
+    },
+    async claimAutomaticDelivery(input) {
+      if (!input || typeof input.streamKey !== 'string' || typeof input.authorityEpoch !== 'string'
+          || !Number.isSafeInteger(input.generation) || typeof input.jobId !== 'string'
+          || !Number.isSafeInteger(input.expectedDueAt) || !Number.isSafeInteger(input.leaseUntil)
+          || input.leaseUntil <= input.expectedDueAt) {
+        throw automaticConflict('SCHEDULE_STALE_DELIVERY', 'automatic schedule stale delivery');
+      }
+      const claimed = await db.prepare(`UPDATE timer_stream_authorities SET
+          due_at = ?5, updated_at = ?7
+        WHERE logical_key = ?1 AND authority_epoch = ?2 AND generation = ?3
+          AND active_job_id = ?4 AND due_at = ?6 AND state IN ('scheduled', 'awaiting_ack')`)
+        .bind(input.streamKey, input.authorityEpoch, input.generation, input.jobId,
+          input.leaseUntil, input.expectedDueAt, Date.now()).run();
+      return { claimed: Number(claimed?.meta?.changes || 0) === 1 };
+    },
+    async deferAutomaticDelivery(input) {
+      if (!input || typeof input.streamKey !== 'string' || typeof input.authorityEpoch !== 'string'
+          || !Number.isSafeInteger(input.generation) || typeof input.jobId !== 'string'
+          || !Number.isSafeInteger(input.nextAttemptAt) || input.nextAttemptAt <= 0
+          || typeof input.awaitingAck !== 'boolean') {
+        throw automaticConflict('SCHEDULE_STALE_DELIVERY', 'automatic schedule stale delivery');
+      }
+      const nextState = input.awaitingAck ? 'awaiting_ack' : 'scheduled';
+      const updated = await db.prepare(`UPDATE timer_stream_authorities SET
+          state = ?5, due_at = ?6, delivery_attempts = delivery_attempts + 1, updated_at = ?7
+        WHERE logical_key = ?1 AND authority_epoch = ?2 AND generation = ?3
+          AND active_job_id = ?4 AND state IN ('scheduled', 'awaiting_ack')`)
+        .bind(input.streamKey, input.authorityEpoch, input.generation, input.jobId,
+          nextState, input.nextAttemptAt, Date.now()).run();
+      if (Number(updated?.meta?.changes || 0) !== 1) {
+        throw automaticConflict('SCHEDULE_STALE_DELIVERY', 'automatic schedule stale delivery');
+      }
+      return { deferred: true };
+    },
+    async ackAutomaticDelivery(input) {
+      if (!input || typeof input.streamKey !== 'string' || typeof input.authorityEpoch !== 'string'
+          || !Number.isSafeInteger(input.generation) || typeof input.jobId !== 'string') {
+        throw automaticConflict('SCHEDULE_STALE_DELIVERY', 'automatic schedule stale delivery');
+      }
+      const updated = await db.prepare(`UPDATE timer_stream_authorities SET
+          state = 'paused', active_job_id = NULL, due_at = NULL, payload_json = NULL,
+          expected_previous_job_id = ?4, delivery_attempts = 0, updated_at = ?5
+        WHERE logical_key = ?1 AND authority_epoch = ?2 AND generation = ?3
+          AND active_job_id = ?4 AND state IN ('scheduled', 'awaiting_ack')`)
+        .bind(input.streamKey, input.authorityEpoch, input.generation, input.jobId, Date.now()).run();
+      if (Number(updated?.meta?.changes || 0) !== 1) {
+        throw automaticConflict('SCHEDULE_STALE_DELIVERY', 'automatic schedule stale delivery');
+      }
+      return { acknowledged: true };
+    },
     async getJob(jobId) {
       return parseJob(await db.prepare('SELECT payload_json FROM timer_jobs WHERE job_id = ?1').bind(jobId).first());
     },
-    async saveJob(job, logicalKey, { force = false } = {}) {
+    async saveJob(job, logicalKey, { force = false, requireUnclaimedAutomatic = false } = {}) {
       const activeRow = await db.prepare('SELECT job_id, payload_json FROM timer_jobs WHERE logical_key = ?1').bind(logicalKey).first();
       const active = parseJob(activeRow);
       const previous = await this.getJob(job.jobId);
-      if (!force && active?.jobId === job.jobId && sameScheduledJob(previous, job)) return { idempotent: true, replacedJobId: '' };
-      await db.prepare(`INSERT OR REPLACE INTO timer_jobs
-        (job_id, logical_key, device_id, char_id, type, kind, plan_id, occurrence_id, source,
-         due_at, payload_json, delivery_attempts, awaiting_ack, test, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`)
-        .bind(job.jobId, logicalKey, job.deviceId, job.charId || '', job.type || 'proactive', job.kind || 'chat',
-          job.planId || null, job.occurrenceId || null, job.source || null,
-          Date.parse(job.nextDeliveryAttemptAt || job.dueAt), JSON.stringify(job),
-          Number(job.deliveryAttempts || 0), job.awaitingAck ? 1 : 0, job.test ? 1 : 0, Number(job.updatedAt || Date.now())).run();
+      if (!force && active?.jobId === job.jobId && sameScheduledJob(previous, job)) {
+        if (!requireUnclaimedAutomatic) return { idempotent: true, replacedJobId: '' };
+        const guarded = await db.prepare(`UPDATE timer_jobs SET job_id = job_id
+          WHERE job_id = ?1 AND logical_key = ?2
+            AND NOT EXISTS (SELECT 1 FROM timer_stream_authorities WHERE logical_key = ?3)`)
+          .bind(job.jobId, logicalKey, logicalKey).run();
+        if (Number(guarded?.meta?.changes || 0) === 1) return { idempotent: true, replacedJobId: '' };
+        throw automaticConflict('SCHEDULE_AUTHORITY_CONFLICT', 'automatic schedule authority conflict');
+      }
+      const values = [
+        job.jobId, logicalKey, job.deviceId, job.charId || '', job.type || 'proactive', job.kind || 'chat',
+        job.planId || null, job.occurrenceId || null, job.source || null,
+        Date.parse(job.nextDeliveryAttemptAt || job.dueAt), JSON.stringify(job),
+        Number(job.deliveryAttempts || 0), job.awaitingAck ? 1 : 0, job.test ? 1 : 0, Number(job.updatedAt || Date.now())
+      ];
+      const statement = requireUnclaimedAutomatic
+        ? db.prepare(`INSERT OR REPLACE INTO timer_jobs
+            (job_id, logical_key, device_id, char_id, type, kind, plan_id, occurrence_id, source,
+             due_at, payload_json, delivery_attempts, awaiting_ack, test, updated_at)
+            SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+            WHERE NOT EXISTS (SELECT 1 FROM timer_stream_authorities WHERE logical_key = ?16)`)
+          .bind(...values, logicalKey)
+        : db.prepare(`INSERT OR REPLACE INTO timer_jobs
+            (job_id, logical_key, device_id, char_id, type, kind, plan_id, occurrence_id, source,
+             due_at, payload_json, delivery_attempts, awaiting_ack, test, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`)
+          .bind(...values);
+      const written = await statement.run();
+      if (requireUnclaimedAutomatic && Number(written?.meta?.changes || 0) !== 1) {
+        throw automaticConflict('SCHEDULE_AUTHORITY_CONFLICT', 'automatic schedule authority conflict');
+      }
       return { idempotent: false, replacedJobId: active?.jobId && active.jobId !== job.jobId ? active.jobId : '' };
     },
     async deleteJob(jobId) {
@@ -291,8 +510,38 @@ function createD1TimerStore(db) {
       return Number(result?.meta?.changes || 0) > 0;
     },
     async dueJobs(now, limit = 100) {
-      const result = await db.prepare('SELECT payload_json FROM timer_jobs WHERE due_at <= ?1 ORDER BY due_at ASC LIMIT ?2').bind(now, limit).all();
-      return (result?.results || []).map(parseJob).filter(Boolean);
+      const result = await db.prepare(`SELECT * FROM (
+          SELECT payload_json, due_at, 0 AS automatic_authority, NULL AS logical_key,
+            NULL AS authority_epoch, NULL AS generation, job_id AS active_job_id,
+            char_id, kind, awaiting_ack AS authority_awaiting_ack, delivery_attempts
+          FROM timer_jobs WHERE due_at <= ?1
+          UNION ALL
+          SELECT payload_json, due_at, 1 AS automatic_authority, logical_key,
+            authority_epoch, generation, active_job_id, char_id, kind,
+            CASE WHEN state = 'awaiting_ack' THEN 1 ELSE 0 END AS authority_awaiting_ack,
+            delivery_attempts
+          FROM timer_stream_authorities
+          WHERE state IN ('scheduled', 'awaiting_ack') AND due_at <= ?1
+        ) ORDER BY due_at ASC LIMIT ?2`).bind(now, limit).all();
+      return (result?.results || []).map(row => {
+        const payload = parseJob(row);
+        if (!payload) return null;
+        if (!Number(row.automatic_authority || 0)) return payload;
+        return {
+          ...payload,
+          automaticAuthority: true,
+          streamKey: row.logical_key,
+          authorityEpoch: row.authority_epoch,
+          generation: Number(row.generation),
+          jobId: row.active_job_id,
+          charId: row.char_id,
+          kind: row.kind,
+          awaitingAck: Number(row.authority_awaiting_ack || 0) === 1,
+          deliveryAttempts: Number(row.delivery_attempts || 0),
+          deliveryDueAt: Number(row.due_at),
+          nextDeliveryAttemptAt: new Date(Number(row.due_at)).toISOString()
+        };
+      }).filter(Boolean);
     },
     async deviceJobs(deviceId) {
       const result = await db.prepare('SELECT payload_json FROM timer_jobs WHERE device_id = ?1 ORDER BY due_at ASC').bind(deviceId).all();
@@ -407,7 +656,12 @@ async function jobStatus(jobId, deviceId, env) {
 }
 
 async function clearJobRecord(job, env) {
-  await timerStore(env).deleteJob(job.jobId);
+  const store = timerStore(env);
+  if (job.automaticAuthority) {
+    await store.ackAutomaticDelivery(automaticDeliveryIdentity(job));
+    return;
+  }
+  await store.deleteJob(job.jobId);
 }
 
 function minuteKey(ms) {
@@ -417,11 +671,20 @@ function minuteKey(ms) {
 async function deferForFcmAck(job, env) {
   const attempts = Math.max(0, Number(job.deliveryAttempts) || 0) + 1;
   if (attempts > FCM_ACK_MAX_ATTEMPTS) {
-    await cancelJob(job.jobId, env);
+    if (job.automaticAuthority) await timerStore(env).ackAutomaticDelivery(automaticDeliveryIdentity(job));
+    else await cancelJob(job.jobId, env);
     await appendEvent(env, { type: 'ack-timeout', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', attempts, ok: false, reason: 'phone did not acknowledge background generation' });
     return false;
   }
   const delayMinutes = Math.min(60, 5 * Math.pow(2, Math.min(4, attempts - 1)));
+  if (job.automaticAuthority) {
+    await timerStore(env).deferAutomaticDelivery({
+      ...automaticDeliveryIdentity(job),
+      nextAttemptAt: Date.now() + delayMinutes * 60000,
+      awaitingAck: true
+    });
+    return true;
+  }
   await saveJob({
     ...job,
     nextDeliveryAttemptAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
@@ -436,7 +699,8 @@ async function deferForFcmAck(job, env) {
 async function deferForDeliveryRetry(job, env, reason = '') {
   const attempts = Math.max(0, Number(job.deliveryAttempts) || 0) + 1;
   if (attempts > FCM_ACK_MAX_ATTEMPTS) {
-    await cancelJob(job.jobId, env);
+    if (job.automaticAuthority) await timerStore(env).ackAutomaticDelivery(automaticDeliveryIdentity(job));
+    else await cancelJob(job.jobId, env);
     await appendEvent(env, {
       type: 'delivery-timeout',
       deviceId: shortId(job.deviceId),
@@ -450,6 +714,14 @@ async function deferForDeliveryRetry(job, env, reason = '') {
     return false;
   }
   const delayMinutes = Math.min(30, 2 * Math.pow(2, Math.min(4, attempts - 1)));
+  if (job.automaticAuthority) {
+    await timerStore(env).deferAutomaticDelivery({
+      ...automaticDeliveryIdentity(job),
+      nextAttemptAt: Date.now() + delayMinutes * 60000,
+      awaitingAck: false
+    });
+    return true;
+  }
   await saveJob({
     ...job,
     nextDeliveryAttemptAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
@@ -459,6 +731,15 @@ async function deferForDeliveryRetry(job, env, reason = '') {
     updatedAt: Date.now()
   }, env, { force: true });
   return true;
+}
+
+function automaticDeliveryIdentity(job) {
+  return {
+    streamKey: job.streamKey,
+    authorityEpoch: job.authorityEpoch,
+    generation: job.generation,
+    jobId: job.jobId
+  };
 }
 
 async function deliverJob(job, env) {
@@ -507,6 +788,12 @@ function shortId(value) {
 
 function classifyWorkerError(err, now = Date.now()) {
   const message = String(err?.message || err || 'unknown error').slice(0, 240);
+  if (err?.code === 'SCHEDULE_CONTRACT_INVALID') {
+    return { status: 400, code: err.code, error: message, retryAt: '' };
+  }
+  if (new Set(['SCHEDULE_AUTHORITY_CONFLICT', 'SCHEDULE_GENERATION_CONFLICT', 'SCHEDULE_CHECKSUM_CONFLICT', 'SCHEDULE_STALE_DELIVERY']).has(err?.code)) {
+    return { status: 409, code: err.code, error: message, retryAt: '' };
+  }
   if (/KV put\(\) limit exceeded for the day/i.test(message)) {
     const current = new Date(now);
     const retryAt = new Date(Date.UTC(

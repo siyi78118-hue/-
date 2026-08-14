@@ -2,10 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const workerSource = readFileSync('cloud-timer-worker.js', 'utf8').replace(
-  'async function sendPush(target, env, payload = {}) {',
-  'async function sendPush(target, env, payload = {}) {\n  if (globalThis.__alTestSendPush) return globalThis.__alTestSendPush(target, env, payload);'
-);
+const contractSource = readFileSync('automatic-schedule-contract.mjs', 'utf8');
+const contractUrl = `data:text/javascript;base64,${Buffer.from(contractSource).toString('base64')}#automatic-schedule-contract`;
+const workerSource = readFileSync('cloud-timer-worker.js', 'utf8')
+  .replace("from './automatic-schedule-contract.mjs'", `from '${contractUrl}'`)
+  .replace(
+    'async function sendPush(target, env, payload = {}) {',
+    'async function sendPush(target, env, payload = {}) {\n  if (globalThis.__alTestSendPush) return globalThis.__alTestSendPush(target, env, payload);'
+  );
 const worker = await import(`data:text/javascript;base64,${Buffer.from(workerSource).toString('base64')}#worker-state-tests`);
 globalThis.__alTestSendPush = async (_target, _env, payload) => payload.jobId === 'retry-job'
   ? ({ ok: false, reason: 'temporary FCM outage', retry: true })
@@ -143,13 +147,57 @@ test('an accepted FCM push stays pending until the matching phone acknowledges i
   assert.equal(await env.AL_TIMER_STORE.getJob('ack-job'), null);
 });
 
+test('cron defers an automatic authority job without writing the legacy timer table', async () => {
+  const store = new MemoryTimerStore();
+  const automatic = {
+    automaticAuthority: true,
+    streamKey: 'active:device-a:char-a:chat',
+    authorityEpoch: '00112233445566778899aabbccddeeff',
+    generation: 1,
+    deviceId: 'device-a',
+    characterId: 'char-a',
+    charId: 'char-a',
+    kind: 'chat',
+    jobId: 'pro_authority_1',
+    dueAt: Date.now() - 60_000,
+    nextDeliveryAttemptAt: new Date(Date.now() - 60_000).toISOString()
+  };
+  let legacyWrites = 0;
+  let deferred = null;
+  store.devices.set('device-a', {
+    deviceId: 'device-a', transport: 'fcm', fcmToken: 'token-a', backgroundAck: 1
+  });
+  store.dueJobs = async () => deferred ? [] : [structuredClone(automatic)];
+  store.saveJob = async () => {
+    legacyWrites += 1;
+    return { idempotent: false };
+  };
+  store.deferAutomaticDelivery = async input => {
+    deferred = structuredClone(input);
+    return { deferred: true };
+  };
+  store.claimAutomaticDelivery = async () => ({ claimed: true });
+
+  await runCron(envFor(store));
+
+  assert.equal(legacyWrites, 0);
+  assert.equal(deferred.streamKey, automatic.streamKey);
+  assert.equal(deferred.authorityEpoch, automatic.authorityEpoch);
+  assert.equal(deferred.generation, automatic.generation);
+  assert.equal(deferred.jobId, automatic.jobId);
+  assert.equal(deferred.awaitingAck, true);
+  assert.ok(deferred.nextAttemptAt > Date.now());
+});
+
 test('FCM uses the documented Android high priority value and survives short offline periods', async () => {
   const fcmRequests = [];
   const originalFetch = globalThis.fetch;
-  const isolatedSource = readFileSync('cloud-timer-worker.js', 'utf8').replace(
-    'const accessToken = await getFirebaseAccessToken(env);',
-    "const accessToken = 'test-access-token';"
-  );
+  const isolatedSource = readFileSync('cloud-timer-worker.js', 'utf8')
+    .replace("from './automatic-schedule-contract.mjs'", `from '${contractUrl}'`)
+    .replace(
+      'const accessToken = await getFirebaseAccessToken(env);',
+      "const accessToken = 'test-access-token';"
+    );
   const isolatedWorker = await import(`data:text/javascript;base64,${Buffer.from(isolatedSource).toString('base64')}#fcm-payload-test`);
   globalThis.fetch = async (url, options = {}) => {
     fcmRequests.push({ url: String(url), options });
