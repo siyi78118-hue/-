@@ -3,6 +3,7 @@ package com.siyi.al.execution;
 import androidx.annotation.NonNull;
 import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.AlExecutionDatabase;
+import com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ConversationAuthorityEntity;
@@ -29,6 +30,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.ConcurrentHashMap;
+import java.time.Instant;
 import org.json.JSONObject;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -351,6 +353,342 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         return result.get();
     }
 
+    AutomaticTaskCoordinator.DispatchOutcome claimAutomaticTurn(
+        AutomaticTaskCoordinator.ClaimToken token, String snapshotJson, long now
+    ) {
+        AtomicReference<AutomaticTaskCoordinator.DispatchOutcome> result =
+            new AtomicReference<>(AutomaticTaskCoordinator.DispatchOutcome.STALE);
+        database.runInTransaction(() -> {
+            AutomaticScheduleAuthorityEntity authority =
+                dao.automaticScheduleAuthorityForCharacterKind(token.characterId, token.kind);
+            if (!matchesAutomaticClaim(authority, token) || authority.dueAt == null
+                || authority.dueAt > now) {
+                return;
+            }
+            String turnId = automaticTurnId(token.jobId);
+            ChatTurnEntity existing = dao.turn(turnId);
+            if ("claimed".equals(authority.state)) {
+                if (existing != null && exactAutomaticTurn(existing, token)) {
+                    result.set(AutomaticTaskCoordinator.DispatchOutcome.REPLAY);
+                } else if (existing == null) {
+                    throw new IllegalStateException("automatic claimed turn is missing");
+                } else {
+                    throw new IllegalStateException("automatic claimed turn identity conflict");
+                }
+                return;
+            }
+            if (!"scheduled".equals(authority.state)
+                || dao.claimAutomaticScheduleAuthorityExact(
+                    authority.streamKey, token.authorityEpoch, token.generation,
+                    token.jobId, now) != 1) {
+                return;
+            }
+            if (existing != null) {
+                if (!exactAutomaticTurn(existing, token)) {
+                    throw new IllegalStateException("automatic claim turn identity conflict");
+                }
+                result.set(AutomaticTaskCoordinator.DispatchOutcome.REPLAY);
+                return;
+            }
+            JSONObject pinnedSnapshot;
+            try {
+                pinnedSnapshot = new JSONObject(snapshotJson == null ? "{}" : snapshotJson);
+                pinnedSnapshot.put("_automaticScheduleAuthority", token.toJson());
+            } catch (Exception error) {
+                throw new IllegalArgumentException("automatic claim snapshot is invalid", error);
+            }
+            TurnKind turnKind = "moment".equals(token.kind)
+                ? TurnKind.PROACTIVE_MOMENT : TurnKind.PROACTIVE_CHAT;
+            ChatTurnEntity created = submitTurnInTransaction(new TurnSubmission(
+                turnId, token.characterId, turnId, turnKind, "{}",
+                pinnedSnapshot.toString(), token.jobId, now));
+            if (created == null || !exactAutomaticTurn(created, token)) {
+                throw new IllegalStateException("automatic claim turn creation conflict");
+            }
+            result.set(AutomaticTaskCoordinator.DispatchOutcome.CLAIMED);
+        });
+        return result.get();
+    }
+
+    private static boolean matchesAutomaticClaim(
+        AutomaticScheduleAuthorityEntity authority, AutomaticTaskCoordinator.ClaimToken token
+    ) {
+        return authority != null && AutomaticScheduleStore.OWNER.equals(authority.owner)
+            && token.characterId.equals(authority.characterId)
+            && token.kind.equals(authority.kind)
+            && token.authorityEpoch.equals(authority.authorityEpoch)
+            && token.generation == authority.generation
+            && token.jobId.equals(authority.activeJobId)
+            && ("scheduled".equals(authority.state) || "claimed".equals(authority.state));
+    }
+
+    private static boolean exactAutomaticTurn(
+        ChatTurnEntity turn, AutomaticTaskCoordinator.ClaimToken token
+    ) {
+        String expectedKind = "moment".equals(token.kind)
+            ? TurnKind.PROACTIVE_MOMENT.name() : TurnKind.PROACTIVE_CHAT.name();
+        return turn != null && token.characterId.equals(turn.characterId)
+            && token.jobId.equals(turn.cloudJobId) && expectedKind.equals(turn.kind);
+    }
+
+    public static String automaticTurnId(String jobId) {
+        return "cloud_" + jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
+    }
+
+    public static final class AutomaticFinalization {
+        public final boolean advanced;
+        public final String previousJobId;
+        public final AutomaticScheduleAuthorityEntity authority;
+
+        private AutomaticFinalization(
+            boolean advanced, String previousJobId, AutomaticScheduleAuthorityEntity authority
+        ) {
+            this.advanced = advanced;
+            this.previousJobId = previousJobId;
+            this.authority = authority;
+        }
+
+        static AutomaticFinalization stale() {
+            return new AutomaticFinalization(false, null, null);
+        }
+    }
+
+    /**
+     * The single terminal writer for direct and proactive chat/moment streams.
+     * Turn proof, schedule transition and outbox/event rows share one Room transaction.
+     */
+    public AutomaticFinalization finalizeAutomaticScheduleForTurn(String turnId, long now) {
+        AtomicReference<AutomaticFinalization> result =
+            new AtomicReference<>(AutomaticFinalization.stale());
+        database.runInTransaction(() -> {
+            ChatTurnEntity turn = dao.turn(turnId);
+            if (turn == null || turn.deletedAt != null || isRoleDeleteTombstoned(turn.characterId)) return;
+            boolean direct = TurnKind.DIRECT_REPLY.name().equals(turn.kind);
+            boolean moment = TurnKind.PROACTIVE_MOMENT.name().equals(turn.kind);
+            boolean proactive = moment || TurnKind.PROACTIVE_CHAT.name().equals(turn.kind);
+            if (!direct && !proactive) return;
+            AutomaticScheduleAuthorityEntity current =
+                dao.automaticScheduleAuthorityForCharacterKind(
+                    turn.characterId, moment ? "moment" : "chat");
+            if (current == null || "disabled".equals(current.state)) return;
+
+            AutomaticScheduleContract.TerminalDisposition disposition =
+                terminalDispositionForAutomaticSchedule(turn);
+            if (disposition == null) return;
+            JSONObject currentSemantic;
+            try {
+                currentSemantic = new JSONObject(current.semanticJson);
+                AutomaticScheduleContract.validateTransition(currentSemantic);
+            } catch (Exception error) {
+                throw new IllegalStateException("automatic schedule authority conflict", error);
+            }
+            String deviceId = currentSemantic.optString("deviceId", "");
+            String epoch = currentSemantic.optString("authorityEpoch", "");
+            String resultChecksum = automaticTerminalChecksum(turn, disposition);
+            String sourceType = disposition == AutomaticScheduleContract.TerminalDisposition.FAILED
+                ? "failure_retry" : (direct ? "direct_terminal" : "proactive_terminal");
+            AutomaticScheduleContract.Source source = new AutomaticScheduleContract.Source(
+                sourceType,
+                automaticTerminalSourceId(turn, direct),
+                resultChecksum,
+                current.conversationSequence,
+                automaticTerminalOccurredAt(turn, now));
+            AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, deviceId);
+            String previousJobId = current.activeJobId;
+            AutomaticScheduleAuthorityEntity next;
+            if (direct) {
+                AutomaticScheduleContract.Source pauseSource = directInputSource(turn);
+                String currentSourceType = currentSemantic.optString("sourceType", "");
+                String currentSourceId = currentSemantic.optString("sourceId", "");
+                String currentSourceChecksum = currentSemantic.optString("sourceChecksum", "");
+                boolean ownsPause = "direct_input".equals(currentSourceType)
+                    && pauseSource.id.equals(currentSourceId)
+                    && pauseSource.checksum.equals(currentSourceChecksum);
+                boolean exactTerminalReplay = sourceType.equals(currentSourceType)
+                    && source.id.equals(currentSourceId)
+                    && source.checksum.equals(currentSourceChecksum);
+                if (sourceType.equals(currentSourceType) && source.id.equals(currentSourceId)
+                    && !source.checksum.equals(currentSourceChecksum)) {
+                    throw new IllegalStateException("automatic schedule source checksum conflict");
+                }
+                if (!ownsPause && !exactTerminalReplay) return;
+                AutomaticScheduleContract.Policy policy =
+                    automaticPolicyForTurn(turn, currentSemantic);
+                next = schedules.finalizeDirectInternal(
+                    turn.characterId, "chat", epoch, source, policy, disposition, now);
+            } else {
+                AutomaticTaskCoordinator.ClaimToken token = automaticClaimTokenFromTurn(turn);
+                AutomaticScheduleContract.Policy policy =
+                    automaticPolicyForTurn(turn, currentSemantic);
+                next = schedules.finalizeAutomatic(
+                    turn.characterId, moment ? "moment" : "chat", epoch,
+                    token.generation, token.jobId, source, policy, disposition, now);
+            }
+            result.set(new AutomaticFinalization(
+                next.generation > current.generation, previousJobId, next));
+        });
+        return result.get();
+    }
+
+    private AutomaticTaskCoordinator.ClaimToken automaticClaimTokenFromTurn(ChatTurnEntity turn) {
+        try {
+            JSONObject token = new JSONObject(turn.snapshotJson)
+                .getJSONObject("_automaticScheduleAuthority");
+            HashMap<String, String> raw = new HashMap<>();
+            raw.put("charId", token.getString("characterId"));
+            raw.put("kind", token.getString("kind"));
+            raw.put("jobId", token.getString("jobId"));
+            raw.put("authorityEpoch", token.getString("authorityEpoch"));
+            Object generation = token.get("generation");
+            if (!(generation instanceof Integer) && !(generation instanceof Long)) {
+                throw new IllegalArgumentException("automatic claim generation is invalid");
+            }
+            raw.put("generation", String.valueOf(((Number) generation).longValue()));
+            return AutomaticTaskCoordinator.ClaimToken.from(raw);
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalStateException("automatic terminal claim conflict", error);
+        }
+    }
+
+    private AutomaticScheduleContract.TerminalDisposition terminalDispositionForAutomaticSchedule(
+        ChatTurnEntity turn
+    ) {
+        if (TurnState.FAILED_FINAL.name().equals(turn.state)) {
+            return AutomaticScheduleContract.TerminalDisposition.FAILED;
+        }
+        if (!TurnState.COMPLETED.name().equals(turn.state)) return null;
+        String value = turn.terminalDisposition;
+        if (value == null || value.trim().isEmpty()) {
+            value = dao.replyPartCount(turn.turnId) > 0 ? "visible" : "skip";
+        }
+        switch (value) {
+            case "visible": return AutomaticScheduleContract.TerminalDisposition.VISIBLE;
+            case "action_only": return AutomaticScheduleContract.TerminalDisposition.ACTION_ONLY;
+            case "skip":
+                return TurnKind.DIRECT_REPLY.name().equals(turn.kind)
+                    ? null : AutomaticScheduleContract.TerminalDisposition.SKIP;
+            default: throw new IllegalStateException("automatic terminal disposition conflict");
+        }
+    }
+
+    private AutomaticScheduleContract.Policy automaticPolicyForTurn(
+        ChatTurnEntity turn, JSONObject currentSemantic
+    ) {
+        try {
+            JSONObject snapshot = new JSONObject(turn.snapshotJson);
+            long revision = currentSemantic.getLong("policyRevision");
+            String checksum = currentSemantic.getString("policyChecksum");
+            String mode = currentSemantic.optString("mode", "");
+            if (!("planned".equals(mode) || "dice".equals(mode))) {
+                mode = snapshot.optString("automaticPolicyMode", "planned");
+            }
+            if (snapshot.has("automaticPolicyRevision")
+                && snapshot.getLong("automaticPolicyRevision") != revision) {
+                throw new IllegalStateException("automatic policy revision conflict");
+            }
+            if (snapshot.has("automaticPolicyChecksum")
+                && !checksum.equals(snapshot.getString("automaticPolicyChecksum"))) {
+                throw new IllegalStateException("automatic policy checksum conflict");
+            }
+            long minDelay = snapshot.getLong("automaticPolicyMinDelayMs");
+            long maxDelay = snapshot.getLong("automaticPolicyMaxDelayMs");
+            String explicitAt = explicitAutomaticTime(turn);
+            return new AutomaticScheduleContract.Policy(
+                revision, checksum, mode, minDelay, maxDelay, explicitAt);
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalStateException("automatic terminal policy conflict", error);
+        }
+    }
+
+    private String explicitAutomaticTime(ChatTurnEntity turn) {
+        for (ReplyPartEntity part : dao.replyParts(turn.turnId)) {
+            if (!"SCHEDULE".equals(part.type) || part.payloadJson == null) continue;
+            try {
+                JSONObject payload = new JSONObject(part.payloadJson);
+                Object value = payload.opt("nextProactiveAt");
+                long timestamp;
+                if (value instanceof Integer || value instanceof Long) {
+                    timestamp = ((Number) value).longValue();
+                } else if (value instanceof String) {
+                    String text = ((String) value).trim();
+                    try {
+                        timestamp = Long.parseLong(text);
+                    } catch (NumberFormatException ignored) {
+                        timestamp = Instant.parse(text).toEpochMilli();
+                    }
+                } else {
+                    continue;
+                }
+                if (timestamp > 0L && timestamp <= 9007199254740991L) {
+                    return String.valueOf(timestamp);
+                }
+            } catch (Exception ignored) {
+                // Invalid model scheduling hints are ignored; deterministic policy remains authoritative.
+            }
+        }
+        return null;
+    }
+
+    private String automaticTerminalChecksum(
+        ChatTurnEntity turn, AutomaticScheduleContract.TerminalDisposition disposition
+    ) {
+        if (turn.bridgeCommitChecksum != null
+            && turn.bridgeCommitChecksum.matches("[a-f0-9]{64}")) {
+            return turn.bridgeCommitChecksum;
+        }
+        try {
+            JSONObject basis = new JSONObject()
+                .put("completedAt", turn.completedAt == null ? JSONObject.NULL : turn.completedAt)
+                .put("disposition", disposition.name().toLowerCase(java.util.Locale.ROOT))
+                .put("state", turn.state)
+                .put("turnId", turn.turnId)
+                .put("updatedAt", turn.updatedAt);
+            JSONArray parts = new JSONArray();
+            for (ReplyPartEntity part : dao.replyParts(turn.turnId)) {
+                parts.put(new JSONObject()
+                    .put("content", part.content)
+                    .put("payloadJson", part.payloadJson)
+                    .put("replyPartId", part.replyPartId)
+                    .put("sequence", part.sequence)
+                    .put("type", part.type));
+            }
+            basis.put("parts", parts);
+            ExecutionAttemptEntity attempt = turn.activeAttemptId == null
+                ? null : dao.attempt(turn.activeAttemptId);
+            if (disposition == AutomaticScheduleContract.TerminalDisposition.FAILED) {
+                basis.put("failure", attempt == null ? JSONObject.NULL : new JSONObject()
+                    .put("errorCode", attempt.errorCode == null ? JSONObject.NULL : attempt.errorCode)
+                    .put("errorDetail", attempt.errorDetail == null ? JSONObject.NULL : attempt.errorDetail)
+                    .put("finishedAt", attempt.finishedAt == null ? JSONObject.NULL : attempt.finishedAt)
+                    .put("retryable", attempt.retryable));
+            }
+            return BridgeAuthority.sha256CanonicalJson(basis);
+        } catch (Exception error) {
+            throw new IllegalStateException("automatic terminal checksum conflict", error);
+        }
+    }
+
+    private static String automaticTerminalSourceId(ChatTurnEntity turn, boolean direct) {
+        try {
+            String identity = BridgeAuthority.sha256CanonicalJson(
+                new JSONObject().put("turnId", turn.turnId));
+            return (direct ? "direct-terminal:" : "automatic-terminal:")
+                + identity.substring(0, 32);
+        } catch (Exception error) {
+            throw new IllegalStateException("automatic terminal identity conflict", error);
+        }
+    }
+
+    private static long automaticTerminalOccurredAt(ChatTurnEntity turn, long fallback) {
+        if (turn.completedAt != null && turn.completedAt > 0L) return turn.completedAt;
+        if (turn.updatedAt > 0L) return turn.updatedAt;
+        return fallback;
+    }
+
     /**
      * Atomically claims a role-plan occurrence and creates its turn/attempt.
      * The tombstone check, unique occurrence insert, turn creation and claim
@@ -415,6 +753,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         ChatTurnEntity existing = dao.turn(submission.turnId);
         if (existing != null) return existing;
         assertRoleAcceptsSemanticWrite(submission.characterId);
+        assertManagedAutomaticSubmission(submission);
         long now = submission.createdAt > 0 ? submission.createdAt : System.currentTimeMillis();
         String attemptId = newAttemptId(submission.turnId, 1);
         ChatTurnEntity turn = new ChatTurnEntity();
@@ -434,7 +773,99 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         dao.insertAttempt(newAttempt(turn.turnId, attemptId, 1, now));
         insertTurnChange(turn.turnId, "TURN_QUEUED", now);
         insertDiagnostic(turn.turnId, attemptId, "INFO", "TURN_QUEUED", turn.kind, now);
+        if (TurnKind.DIRECT_REPLY.equals(submission.kind)) {
+            pauseAutomaticChatForDirectInput(turn, now);
+        }
         return turn;
+    }
+
+    private void assertManagedAutomaticSubmission(TurnSubmission submission) {
+        String kind;
+        if (TurnKind.PROACTIVE_CHAT.equals(submission.kind)) kind = "chat";
+        else if (TurnKind.PROACTIVE_MOMENT.equals(submission.kind)) kind = "moment";
+        else return;
+        AutomaticScheduleAuthorityEntity authority =
+            dao.automaticScheduleAuthorityForCharacterKind(submission.characterId, kind);
+        if (authority == null) return; // Authority-v0 history remains recoverable until migration.
+        try {
+            JSONObject tokenJson = new JSONObject(submission.snapshotJson)
+                .getJSONObject("_automaticScheduleAuthority");
+            HashMap<String, String> raw = new HashMap<>();
+            raw.put("charId", tokenJson.getString("characterId"));
+            raw.put("kind", tokenJson.getString("kind"));
+            raw.put("jobId", tokenJson.getString("jobId"));
+            raw.put("authorityEpoch", tokenJson.getString("authorityEpoch"));
+            Object generation = tokenJson.get("generation");
+            if (!(generation instanceof Integer) && !(generation instanceof Long)) {
+                throw new IllegalArgumentException("automatic generation is invalid");
+            }
+            raw.put("generation", String.valueOf(((Number) generation).longValue()));
+            AutomaticTaskCoordinator.ClaimToken token =
+                AutomaticTaskCoordinator.ClaimToken.from(raw);
+            if (!"claimed".equals(authority.state) || !matchesAutomaticClaim(authority, token)
+                || !token.jobId.equals(submission.cloudJobId)
+                || !automaticTurnId(token.jobId).equals(submission.turnId)) {
+                throw new IllegalStateException("automatic submission authority conflict");
+            }
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalStateException("automatic submission authority conflict", error);
+        }
+    }
+
+    private void pauseAutomaticChatForDirectInput(ChatTurnEntity turn, long now) {
+        AutomaticScheduleAuthorityEntity current =
+            dao.automaticScheduleAuthorityForCharacterKind(turn.characterId, "chat");
+        if (current == null || "disabled".equals(current.state)) return;
+        try {
+            ChatTurnEntity claimedTurn = "claimed".equals(current.state)
+                && current.activeJobId != null ? dao.turnForCloudJob(current.activeJobId) : null;
+            if ("claimed".equals(current.state)
+                && (claimedTurn == null || !turn.characterId.equals(claimedTurn.characterId)
+                    || !TurnKind.PROACTIVE_CHAT.name().equals(claimedTurn.kind))) {
+                throw new IllegalStateException("automatic claimed turn authority conflict");
+            }
+            JSONObject semantic = new JSONObject(current.semanticJson);
+            String deviceId = semantic.getString("deviceId");
+            String epoch = semantic.getString("authorityEpoch");
+            long conversationSequence = Math.addExact(current.conversationSequence, 1L);
+            if (conversationSequence > 9007199254740991L) {
+                throw new IllegalStateException("automatic conversation sequence overflow");
+            }
+            AutomaticScheduleContract.Source identity = directInputSource(turn);
+            AutomaticScheduleContract.Source source = new AutomaticScheduleContract.Source(
+                identity.type, identity.id, identity.checksum, conversationSequence, now);
+            new AutomaticScheduleStore(database, deviceId).pauseForConversationInternal(
+                turn.characterId, "chat", epoch, source, now);
+            if (claimedTurn != null && !TurnState.COMPLETED.name().equals(claimedTurn.state)
+                && !TurnState.CANCELLED.name().equals(claimedTurn.state)) {
+                String claimedAttemptId = claimedTurn.activeAttemptId;
+                if (claimedAttemptId != null) dao.cancelAttempt(claimedAttemptId, now);
+                dao.cancelTurn(claimedTurn.turnId, now, false);
+            }
+        } catch (RuntimeException error) {
+            throw error;
+        } catch (Exception error) {
+            throw new IllegalStateException("automatic direct-input pause conflict", error);
+        }
+    }
+
+    private static AutomaticScheduleContract.Source directInputSource(ChatTurnEntity turn) {
+        try {
+            JSONObject basis = new JSONObject()
+                .put("characterId", turn.characterId)
+                .put("createdAt", turn.createdAt)
+                .put("inputJson", turn.inputJson)
+                .put("snapshotJson", turn.snapshotJson)
+                .put("sourceMessageId", turn.sourceMessageId)
+                .put("turnId", turn.turnId);
+            String checksum = BridgeAuthority.sha256CanonicalJson(basis);
+            return new AutomaticScheduleContract.Source(
+                "direct_input", "direct:" + checksum.substring(0, 32), checksum, 0L, turn.createdAt);
+        } catch (Exception error) {
+            throw new IllegalStateException("automatic direct-input identity conflict", error);
+        }
     }
 
     @Override

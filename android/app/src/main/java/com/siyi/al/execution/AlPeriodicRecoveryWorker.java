@@ -13,7 +13,10 @@ public final class AlPeriodicRecoveryWorker extends Worker {
     @NonNull @Override public Result doWork() {
         try {
             new RolePlanCoordinator(getApplicationContext()).dispatchDue(System.currentTimeMillis());
-            new AutomaticTaskCoordinator(getApplicationContext()).dispatchDue(System.currentTimeMillis());
+            AutomaticTaskCoordinator automatic =
+                new AutomaticTaskCoordinator(getApplicationContext());
+            automatic.reconcileSchedulers(getApplicationContext());
+            automatic.dispatchDue(System.currentTimeMillis());
             AlExecutionService.requestRun(getApplicationContext());
             RolePlanAlarmScheduler.rescheduleAll(getApplicationContext());
             return Result.success();

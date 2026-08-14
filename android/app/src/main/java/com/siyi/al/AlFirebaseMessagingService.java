@@ -6,6 +6,7 @@ import com.google.firebase.messaging.RemoteMessage;
 import com.siyi.al.execution.AlExecutionService;
 import com.siyi.al.execution.AlExecutionWakeWorker;
 import com.siyi.al.execution.AlNotificationFactory;
+import com.siyi.al.execution.AutomaticTaskCoordinator;
 import com.siyi.al.execution.RolePlanCoordinator;
 import com.siyi.al.execution.RolePlanOccurrenceKey;
 import com.siyi.al.execution.RoleDeletionDispatchPolicy;
@@ -30,56 +31,33 @@ public class AlFirebaseMessagingService extends MessagingService {
             super.onMessageReceived(remoteMessage);
             return;
         }
-        String characterId = text(data.get("charId"));
-        String jobId = text(data.get("jobId"));
-        String kindName = "moment".equals(data.get("kind")) ? "moment" : "chat";
-        if (characterId.isEmpty() || jobId.isEmpty()) return;
-
+        AutomaticTaskCoordinator.ClaimToken token;
+        try {
+            token = automaticClaimToken(data);
+        } catch (IllegalArgumentException ignored) {
+            return;
+        }
+        String characterId = token.characterId;
         AlExecutionDatabase database = AlExecutionDatabase.get(this);
         RoomExecutionStore store = new RoomExecutionStore(database);
         RoleDeletionDispatchPolicy.TombstoneReader tombstone = store::isRoleDeleteTombstoned;
         if (RoleDeletionDispatchPolicy.blocked(tombstone, characterId)) return;
-        String safeJobId = jobId.replaceAll("[^a-zA-Z0-9_-]", "_");
-        String turnId = "cloud_" + safeJobId;
         long now = System.currentTimeMillis();
-        TurnKind kind = "moment".equals(kindName) ? TurnKind.PROACTIVE_MOMENT : TurnKind.PROACTIVE_CHAT;
-        CharacterSnapshotEntity[] snapshotHolder = new CharacterSnapshotEntity[1];
-        boolean[] submitted = new boolean[1];
+        AutomaticTaskCoordinator.DispatchOutcome outcome;
         try {
-            boolean accepted = store.runRoleSideEffectIfNotDeleted(characterId, () -> {
-                CharacterSnapshotEntity candidate =
-                    database.executionDao().latestSnapshot(snapshotId(characterId, kindName, jobId));
-                if (candidate == null) {
-                    candidate = database.executionDao().latestSnapshot(characterId + ":" + kindName);
-                }
-                snapshotHolder[0] = candidate;
-                if (candidate == null || candidate.contextJson == null
-                    || candidate.contextJson.trim().isEmpty()) {
-                    store.recordRolePreflightDiagnosticIfActive(
-                        turnId, characterId, "WARN", "SNAPSHOT_MISSING", kindName + ":" + jobId, now);
-                    return;
-                }
-                if (!snapshotAllowsAutomaticTask(candidate, jobId)) {
-                    store.recordRolePreflightDiagnosticIfActive(
-                        turnId, characterId, "WARN", "JOB_MISMATCH", kindName + ":" + jobId, now);
-                    return;
-                }
-                store.submitTurn(new TurnSubmission(
-                    turnId, characterId, turnId, kind, "{}", candidate.contextJson, jobId, now));
-                store.recordRoleDispatchDiagnosticsIfActive(
-                    turnId, characterId, null, now,
-                    "FCM_RECEIVED", kindName + ":" + jobId,
-                    "FCM_PRIORITY", priorityDetail(remoteMessage));
-                submitted[0] = true;
-            });
-            if (!accepted || !submitted[0] || snapshotHolder[0] == null) return;
+            outcome = new AutomaticTaskCoordinator(this).dispatch(token, now);
+            if (outcome != AutomaticTaskCoordinator.DispatchOutcome.CLAIMED) return;
         } catch (RuntimeException error) {
             if (RoleDeletionDispatchPolicy.suppressFailure(tombstone, characterId)) return;
             throw error;
         }
+        CharacterSnapshotEntity snapshot =
+            database.executionDao().latestSnapshot(characterId + ":" + token.kind);
+        String characterName = snapshot == null ? characterId : snapshot.characterName;
+        String turnId = RoomExecutionStore.automaticTurnId(token.jobId);
         final int[] notificationId = {-1};
         boolean notificationStage = store.runRoleSideEffectIfNotDeleted(characterId, () -> {
-            notificationId[0] = showPending(turnId, snapshotHolder[0].characterName);
+            notificationId[0] = showPending(turnId, characterName);
             RoleDeletionDispatchPolicy.cancelPostedNotificationIfDeleted(
                 tombstone, characterId, notificationId[0],
                 id -> NotificationManagerCompat.from(this).cancel(id));
@@ -92,6 +70,16 @@ public class AlFirebaseMessagingService extends MessagingService {
             AlExecutionWakeWorker.enqueue(this))) {
             if (notificationId[0] >= 0) NotificationManagerCompat.from(this).cancel(notificationId[0]);
         }
+    }
+
+    static AutomaticTaskCoordinator.ClaimToken automaticClaimToken(Map<String, String> data) {
+        java.util.HashMap<String, String> token = new java.util.HashMap<>();
+        token.put("charId", data == null ? null : data.get("charId"));
+        token.put("kind", data == null ? null : data.get("kind"));
+        token.put("jobId", data == null ? null : data.get("jobId"));
+        token.put("authorityEpoch", data == null ? null : data.get("authorityEpoch"));
+        token.put("generation", data == null ? null : data.get("generation"));
+        return AutomaticTaskCoordinator.ClaimToken.from(token);
     }
 
     private void handleRolePlan(Map<String, String> data, RemoteMessage remoteMessage) {

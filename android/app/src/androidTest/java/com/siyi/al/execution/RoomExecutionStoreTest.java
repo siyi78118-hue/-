@@ -369,6 +369,243 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void alarmAndFcmClaimTheSameAutomaticGenerationOnlyOnce() throws Exception {
+        String epoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority =
+            new AutomaticScheduleStore(database, "device_gateway").configure(
+                "yuqi", "chat", epoch,
+                automaticSource("bootstrap", "dual-entry-bootstrap", 'a', 0L, 1_000L),
+                automaticPolicy(), 1_000L);
+        CharacterSnapshotEntity snapshot = new CharacterSnapshotEntity();
+        snapshot.snapshotId = "yuqi:chat";
+        snapshot.characterId = "yuqi";
+        snapshot.characterName = "虞栖";
+        snapshot.playerName = "我";
+        snapshot.contextJson = new JSONObject()
+            .put("automaticTasksEnabled", true)
+            .put("automaticPolicyRevision", 1L)
+            .put("automaticPolicyChecksum", repeat('9', 64))
+            .put("automaticPolicyMode", "planned")
+            .put("automaticPolicyMinDelayMs", 60_000L)
+            .put("automaticPolicyMaxDelayMs", 600_000L)
+            .put("cloudJobId", authority.activeJobId)
+            .toString();
+        snapshot.automaticTasksEnabled = true;
+        snapshot.cloudJobId = authority.activeJobId;
+        snapshot.scheduledFor = authority.dueAt;
+        snapshot.automaticKind = "chat";
+        snapshot.jobSnapshot = true;
+        database.executionDao().upsertSnapshot(snapshot);
+
+        java.util.Map<String, String> rawToken = new java.util.HashMap<>();
+        rawToken.put("charId", "yuqi");
+        rawToken.put("kind", "chat");
+        rawToken.put("jobId", authority.activeJobId);
+        rawToken.put("authorityEpoch", epoch);
+        rawToken.put("generation", String.valueOf(authority.generation));
+        AutomaticTaskCoordinator.ClaimToken token =
+            AutomaticTaskCoordinator.ClaimToken.from(rawToken);
+        AutomaticTaskCoordinator coordinator = new AutomaticTaskCoordinator(database);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        CountDownLatch start = new CountDownLatch(1);
+        try {
+            Future<AutomaticTaskCoordinator.DispatchOutcome> alarm = workers.submit(() -> {
+                start.await();
+                return coordinator.dispatch(token, authority.dueAt);
+            });
+            Future<AutomaticTaskCoordinator.DispatchOutcome> fcm = workers.submit(() -> {
+                start.await();
+                return coordinator.dispatch(token, authority.dueAt);
+            });
+            start.countDown();
+            AutomaticTaskCoordinator.DispatchOutcome first = alarm.get(5L, TimeUnit.SECONDS);
+            AutomaticTaskCoordinator.DispatchOutcome second = fcm.get(5L, TimeUnit.SECONDS);
+            assertTrue(first == AutomaticTaskCoordinator.DispatchOutcome.CLAIMED
+                || second == AutomaticTaskCoordinator.DispatchOutcome.CLAIMED);
+            assertTrue(first == AutomaticTaskCoordinator.DispatchOutcome.REPLAY
+                || second == AutomaticTaskCoordinator.DispatchOutcome.REPLAY);
+        } finally {
+            workers.shutdownNow();
+        }
+        assertEquals(1L, rowCount("chat_turns"));
+        assertEquals(1L, rowCount("execution_attempts"));
+        assertNotNull(database.executionDao().turn(
+            "cloud_" + authority.activeJobId.replaceAll("[^a-zA-Z0-9_-]", "_")));
+        assertEquals("claimed", new AutomaticScheduleStore(database, "device_gateway")
+            .status("yuqi", "chat").state);
+    }
+
+    @Test
+    public void directSubmissionAtomicallyPausesTheCurrentChatScheduleOnce() {
+        String epoch = "00112233445566778899aabbccddeeff";
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity scheduled = schedules.configure(
+            "yuqi", "chat", epoch,
+            automaticSource("bootstrap", "direct-pause-bootstrap", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+
+        TurnSubmission first = submission("direct-pause-one", "direct-source-one", TurnKind.DIRECT_REPLY);
+        store.submitTurn(first);
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity paused =
+            database.executionDao().automaticScheduleAuthority(scheduled.streamKey);
+        assertEquals("paused_for_conversation", paused.state);
+        assertEquals(scheduled.generation + 1L, paused.generation);
+        assertEquals(scheduled.conversationSequence + 1L, paused.conversationSequence);
+        assertNull(paused.activeJobId);
+        assertEquals(2L, rowCount("automatic_schedule_outbox"));
+
+        store.submitTurn(first);
+        assertEquals(paused.semanticChecksum,
+            database.executionDao().automaticScheduleAuthority(scheduled.streamKey).semanticChecksum);
+        assertEquals(2L, rowCount("automatic_schedule_outbox"));
+
+        store.submitTurn(submission(
+            "direct-pause-two", "direct-source-two", TurnKind.DIRECT_REPLY));
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity newer =
+            database.executionDao().automaticScheduleAuthority(scheduled.streamKey);
+        assertEquals(paused.generation + 1L, newer.generation);
+        assertEquals(paused.conversationSequence + 1L, newer.conversationSequence);
+        assertEquals(3L, rowCount("automatic_schedule_outbox"));
+
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE chat_turns SET state='COMPLETED', terminalDisposition='visible', "
+                + "bridgeCommitChecksum=?, completedAt=3000, updatedAt=3000 WHERE turnId=?",
+            new Object[]{repeat('f', 64), first.turnId});
+        RoomExecutionStore.AutomaticFinalization stale =
+            store.finalizeAutomaticScheduleForTurn(first.turnId, 3_001L);
+        assertNull(stale.authority);
+        assertEquals(newer.semanticChecksum,
+            database.executionDao().automaticScheduleAuthority(scheduled.streamKey).semanticChecksum);
+        assertEquals(3L, rowCount("automatic_schedule_outbox"));
+    }
+
+    @Test
+    public void fourAutomaticTerminalDispositionsAdvanceOnceAndRejectChangedResults()
+        throws Exception {
+        String[] dispositions = {"visible", "action_only", "skip", "failed"};
+        for (int index = 0; index < dispositions.length; index += 1) {
+            String disposition = dispositions[index];
+            String characterId = "automatic-terminal-" + disposition.replace('_', '-');
+            String epoch = String.format(java.util.Locale.ROOT, "%032x", index + 1L);
+            AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+            com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+                characterId, "chat", epoch,
+                automaticSource("bootstrap", "terminal-" + disposition, (char) ('a' + index),
+                    0L, 1_000L + index),
+                automaticPolicy(), 1_000L + index);
+            CharacterSnapshotEntity snapshot = new CharacterSnapshotEntity();
+            snapshot.snapshotId = characterId + ":chat";
+            snapshot.characterId = characterId;
+            snapshot.characterName = "虞栖";
+            snapshot.playerName = "我";
+            snapshot.contextJson = new JSONObject()
+                .put("automaticPolicyRevision", 1L)
+                .put("automaticPolicyChecksum", repeat('9', 64))
+                .put("automaticPolicyMode", "planned")
+                .put("automaticPolicyMinDelayMs", 60_000L)
+                .put("automaticPolicyMaxDelayMs", 600_000L)
+                .toString();
+            snapshot.automaticTasksEnabled = true;
+            snapshot.automaticKind = "chat";
+            snapshot.cloudJobId = authority.activeJobId;
+            snapshot.scheduledFor = authority.dueAt;
+            database.executionDao().upsertSnapshot(snapshot);
+
+            AutomaticTaskCoordinator.ClaimToken token =
+                AutomaticTaskCoordinator.ClaimToken.from(authority);
+            assertEquals(AutomaticTaskCoordinator.DispatchOutcome.CLAIMED,
+                new AutomaticTaskCoordinator(database).dispatch(token, authority.dueAt));
+            String turnId = RoomExecutionStore.automaticTurnId(authority.activeJobId);
+            long terminalAt = authority.dueAt + 10L;
+            if ("failed".equals(disposition)) {
+                database.getOpenHelper().getWritableDatabase().execSQL(
+                    "UPDATE chat_turns SET state='FAILED_FINAL', updatedAt=? WHERE turnId=?",
+                    new Object[]{terminalAt, turnId});
+            } else {
+                database.getOpenHelper().getWritableDatabase().execSQL(
+                    "UPDATE chat_turns SET state='COMPLETED', terminalDisposition=?, "
+                        + "bridgeCommitChecksum=?, completedAt=?, updatedAt=? WHERE turnId=?",
+                    new Object[]{disposition, repeat((char) ('e' + index), 64),
+                        terminalAt, terminalAt, turnId});
+            }
+
+            RoomExecutionStore.AutomaticFinalization first =
+                store.finalizeAutomaticScheduleForTurn(turnId, terminalAt + 1L);
+            RoomExecutionStore.AutomaticFinalization replay =
+                store.finalizeAutomaticScheduleForTurn(turnId, terminalAt + 9_999L);
+            assertTrue(first.advanced);
+            assertFalse(replay.advanced);
+            assertEquals(first.authority.semanticChecksum, replay.authority.semanticChecksum);
+            assertEquals(authority.generation + 1L, first.authority.generation);
+            assertNotNull(database.executionDao().automaticScheduleOutbox(
+                first.authority.streamKey + ":" + first.authority.generation));
+
+            database.getOpenHelper().getWritableDatabase().execSQL(
+                "UPDATE chat_turns SET bridgeCommitChecksum=? WHERE turnId=?",
+                new Object[]{repeat((char) ('1' + index), 64), turnId});
+            assertThrows(IllegalStateException.class,
+                () -> store.finalizeAutomaticScheduleForTurn(turnId, terminalAt + 10_000L));
+        }
+    }
+
+    @Test
+    public void directInputCancelsAJustClaimedAutomaticTurnBeforeItCanCommit() throws Exception {
+        String epoch = "11112222333344445555666677778888";
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "claim-race", "chat", epoch,
+            automaticSource("bootstrap", "claim-race-bootstrap", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        CharacterSnapshotEntity snapshot = new CharacterSnapshotEntity();
+        snapshot.snapshotId = "claim-race:chat";
+        snapshot.characterId = "claim-race";
+        snapshot.characterName = "虞栖";
+        snapshot.playerName = "我";
+        snapshot.contextJson = new JSONObject()
+            .put("automaticPolicyRevision", 1L)
+            .put("automaticPolicyChecksum", repeat('9', 64))
+            .put("automaticPolicyMode", "planned")
+            .put("automaticPolicyMinDelayMs", 60_000L)
+            .put("automaticPolicyMaxDelayMs", 600_000L)
+            .toString();
+        database.executionDao().upsertSnapshot(snapshot);
+        AutomaticTaskCoordinator.ClaimToken token =
+            AutomaticTaskCoordinator.ClaimToken.from(authority);
+        assertEquals(AutomaticTaskCoordinator.DispatchOutcome.CLAIMED,
+            new AutomaticTaskCoordinator(database).dispatch(token, authority.dueAt));
+        String automaticTurnId = RoomExecutionStore.automaticTurnId(authority.activeJobId);
+
+        store.submitTurn(new TurnSubmission(
+            "claim-race-direct", "claim-race", "claim-race-message",
+            TurnKind.DIRECT_REPLY, "{}", snapshot.contextJson, null, authority.dueAt + 1L));
+
+        assertEquals(TurnState.CANCELLED.name(),
+            database.executionDao().turn(automaticTurnId).state);
+        assertEquals("paused_for_conversation",
+            database.executionDao().automaticScheduleAuthority(authority.streamKey).state);
+        assertNull(store.finalizeAutomaticScheduleForTurn(
+            automaticTurnId, authority.dueAt + 2L).authority);
+    }
+
+    @Test
+    public void directTurnRollsBackWhenItsSchedulePauseCannotValidate() {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "atomic-pause", "chat", "99990000111122223333444455556666",
+            automaticSource("bootstrap", "atomic-pause-bootstrap", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE automatic_schedule_authorities SET semanticJson='{}' WHERE streamKey=?",
+            new Object[]{authority.streamKey});
+
+        assertThrows(IllegalStateException.class, () -> store.submitTurn(new TurnSubmission(
+            "atomic-pause-direct", "atomic-pause", "atomic-pause-source",
+            TurnKind.DIRECT_REPLY, "{}", "{}", null, 2_000L)));
+        assertNull(database.executionDao().turn("atomic-pause-direct"));
+        assertEquals(0L, database.executionDao().attempts("atomic-pause-direct").size());
+    }
+
+    @Test
     public void androidRoomBackupHeadIsReadOnlyAndProjectsTheLatestValidatedLifecycle()
         throws Exception {
         JSONObject emptyHead = store.androidRoomBackupHead("yuqi", 100L);

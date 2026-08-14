@@ -40,6 +40,22 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM automatic_schedule_authorities WHERE streamKey = :streamKey LIMIT 1")
     AutomaticScheduleAuthorityEntity automaticScheduleAuthority(String streamKey);
 
+    @Query("SELECT * FROM automatic_schedule_authorities WHERE characterId = :characterId "
+        + "AND kind = :kind LIMIT 1")
+    AutomaticScheduleAuthorityEntity automaticScheduleAuthorityForCharacterKind(
+        String characterId, String kind);
+
+    @Query("SELECT * FROM automatic_schedule_authorities WHERE state = 'scheduled' "
+        + "AND dueAt IS NOT NULL AND dueAt <= :now ORDER BY dueAt ASC, streamKey ASC LIMIT :limit")
+    List<AutomaticScheduleAuthorityEntity> dueAutomaticScheduleAuthorities(long now, int limit);
+
+    @Query("SELECT * FROM automatic_schedule_authorities WHERE state = 'scheduled' "
+        + "AND dueAt IS NOT NULL ORDER BY dueAt ASC, streamKey ASC")
+    List<AutomaticScheduleAuthorityEntity> scheduledAutomaticScheduleAuthorities();
+
+    @Query("SELECT * FROM automatic_schedule_authorities ORDER BY streamKey ASC")
+    List<AutomaticScheduleAuthorityEntity> automaticScheduleAuthorities();
+
     @Query("SELECT * FROM automatic_schedule_outbox WHERE outboxId = :outboxId LIMIT 1")
     AutomaticScheduleOutboxEntity automaticScheduleOutbox(String outboxId);
 
@@ -383,6 +399,9 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM chat_turns WHERE turnId = :turnId LIMIT 1")
     ChatTurnEntity turn(String turnId);
 
+    @Query("SELECT * FROM chat_turns WHERE cloudJobId = :jobId LIMIT 1")
+    ChatTurnEntity turnForCloudJob(String jobId);
+
     @Query("SELECT turnId FROM chat_turns WHERE characterId = :characterId ORDER BY createdAt ASC, turnId ASC")
     List<String> turnIdsForCharacter(String characterId);
 
@@ -622,6 +641,11 @@ public interface AlExecutionDao {
 
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL ORDER BY completedAt DESC LIMIT 50")
     List<ChatTurnEntity> completedTurns();
+
+    @Query("SELECT * FROM chat_turns WHERE kind IN ('DIRECT_REPLY','PROACTIVE_CHAT','PROACTIVE_MOMENT') "
+        + "AND state IN ('COMPLETED','FAILED_FINAL') AND deletedAt IS NULL "
+        + "ORDER BY updatedAt ASC LIMIT 50")
+    List<ChatTurnEntity> terminalAutomaticScheduleTurns();
 
     @Query("SELECT * FROM chat_turns WHERE state = 'COMPLETED' AND deletedAt IS NULL AND uiAppliedAt IS NULL ORDER BY completedAt ASC LIMIT :limit")
     List<ChatTurnEntity> unappliedCompletedTurns(int limit);

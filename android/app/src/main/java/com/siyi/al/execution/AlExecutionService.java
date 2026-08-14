@@ -207,7 +207,9 @@ public final class AlExecutionService extends Service {
                     if (!isReadyForWork()) return;
                     new RolePlanCoordinator(database).dispatchDue(System.currentTimeMillis());
                     if (!isReadyForWork()) return;
-                    new AutomaticTaskCoordinator(database).dispatchDue(System.currentTimeMillis());
+                    AutomaticTaskCoordinator automatic = new AutomaticTaskCoordinator(database);
+                    automatic.reconcileSchedulers(this);
+                    automatic.dispatchDue(System.currentTimeMillis());
                     if (!isReadyForWork()) return;
                     kick();
                 } catch (Exception error) {
@@ -567,10 +569,13 @@ public final class AlExecutionService extends Service {
         SharedPreferences notified = getSharedPreferences("al.execution.notifications", MODE_PRIVATE);
         SharedPreferences acknowledged = getSharedPreferences("al.execution.cloud-acks", MODE_PRIVATE);
         SharedPreferences continued = getSharedPreferences("al.execution.role-plan-continuations", MODE_PRIVATE);
-        SharedPreferences proactiveContinued = getSharedPreferences("al.execution.proactive-continuations", MODE_PRIVATE);
         SharedPreferences bridgeReceipts = getSharedPreferences("al.execution.bridge-receipts", MODE_PRIVATE);
         RolePlanCoordinator rolePlanCoordinator = new RolePlanCoordinator(this);
         rolePlanCoordinator.reconcileFailedTurns(System.currentTimeMillis());
+        for (ChatTurnEntity terminal : database.executionDao().terminalAutomaticScheduleTurns()) {
+            executionStore.runRoleSideEffectIfNotDeleted(
+                terminal.characterId, () -> continueAutomaticTask(terminal));
+        }
         for (ChatTurnEntity turn : database.executionDao().completedTurns()) {
             ExecutionServicePolicy.RoleDeleteFence roleDeleteFence =
                 () -> executionStore.isRoleDeleteTombstoned(turn.characterId);
@@ -589,10 +594,6 @@ public final class AlExecutionService extends Service {
             }
             if (!executionStore.runRoleSideEffectIfNotDeleted(
                 turn.characterId, () -> acknowledgeCloudTurn(turn, acknowledged))) {
-                continue;
-            }
-            if (!executionStore.runRoleSideEffectIfNotDeleted(
-                turn.characterId, () -> continueAutomaticTask(turn, proactiveContinued))) {
                 continue;
             }
             if (!executionStore.runRoleSideEffectIfNotDeleted(
@@ -886,135 +887,30 @@ public final class AlExecutionService extends Service {
         }
     }
 
-    private void continueAutomaticTask(ChatTurnEntity turn, SharedPreferences continued) {
-        boolean moment = TurnKind.PROACTIVE_MOMENT.name().equals(turn.kind);
-        if (!moment && !TurnKind.PROACTIVE_CHAT.name().equals(turn.kind)) return;
-        String continuationKey = "turn." + turn.turnId;
-        if (continued.getBoolean(continuationKey, false)) return;
+    private void continueAutomaticTask(ChatTurnEntity turn) {
         try {
-            JSONObject snapshot = new JSONObject(turn.snapshotJson);
-            if (!snapshot.optBoolean("automaticTasksEnabled", false)) return;
-            String endpoint = snapshot.optString("timerEndpoint", "").replaceAll("/+$", "");
-            String deviceId = snapshot.optString("deviceId", "").trim();
-            JSONObject previousJob = snapshot.optJSONObject("proactiveJob");
-            String kind = moment ? "moment" : "chat";
-            if (endpoint.isEmpty() || deviceId.isEmpty() || previousJob == null) return;
-
-            long now = System.currentTimeMillis();
-            long nextRunAt = 0L;
-            for (ReplyPartEntity part : database.executionDao().replyParts(turn.turnId)) {
-                if (!"SCHEDULE".equals(part.type) || part.payloadJson == null) continue;
-                String value = new JSONObject(part.payloadJson).optString("nextProactiveAt", "");
-                long parsed = parseIso(value);
-                if (parsed > now) { nextRunAt = parsed; break; }
+            RoomExecutionStore.AutomaticFinalization finalization =
+                executionStore.finalizeAutomaticScheduleForTurn(
+                    turn.turnId, System.currentTimeMillis());
+            if (finalization.authority == null) return;
+            if (finalization.advanced && finalization.previousJobId != null) {
+                AutomaticTaskAlarmScheduler.cancel(this, finalization.previousJobId);
+                AlExecutionWakeWorker.cancelAutomatic(this, finalization.previousJobId);
             }
-            boolean hasExplicitSchedule = nextRunAt > now;
-            boolean dice = AutomaticTaskContinuationPolicy.useDiceContinuation(previousJob.optString("mode", "planned"), hasExplicitSchedule);
-            JSONObject dicePolicy = "dice".equals(previousJob.optString("mode", ""))
-                ? previousJob
-                : snapshot.optJSONObject("continuationDice");
-            if (nextRunAt <= now && dice) {
-                if (dicePolicy == null) dicePolicy = new JSONObject();
-                long interval = dicePolicy.optLong("intervalMs", dicePolicy.optLong("diceIntervalMs", 60_000L));
-                double chance = dicePolicy.optDouble("rollChance", 0.5d);
-                int maxRolls = dicePolicy.optInt("maxRolls", 120);
-                nextRunAt = now + AutomaticTaskContinuationPolicy.delayMs(interval, chance, maxRolls, Math.random());
+            if ("scheduled".equals(finalization.authority.state)
+                && finalization.authority.dueAt != null) {
+                AutomaticTaskCoordinator.ClaimToken token =
+                    AutomaticTaskCoordinator.ClaimToken.from(finalization.authority);
+                AutomaticTaskAlarmScheduler.schedule(this, token, finalization.authority.dueAt);
+                AlExecutionWakeWorker.enqueueAutomatic(this, token, finalization.authority.dueAt);
+                AlExecutionWakeWorker.enqueueAutomaticScheduleSync(this, 0L);
             }
-            if (nextRunAt <= now) {
-                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
-                continued.edit().putBoolean(continuationKey, true).apply();
-                return;
-            }
-
-            String prefix = moment ? "mom" : "pro";
-            String jobId = prefix + "_" + safeId(deviceId) + "_" + safeId(turn.characterId) + "_native_" + Long.toString(now, 36);
-            JSONObject nextJob = new JSONObject();
-            nextJob.put("deviceId", deviceId);
-            nextJob.put("jobId", jobId);
-            nextJob.put("charId", turn.characterId);
-            nextJob.put("dueAt", isoTime(nextRunAt));
-            nextJob.put("type", "proactive");
-            nextJob.put("kind", kind);
-            nextJob.put("mode", dice ? "dice" : "planned");
-            if (dice) {
-                if (dicePolicy == null) dicePolicy = new JSONObject();
-                nextJob.put("rollChance", dicePolicy.optDouble("rollChance", 0.5d));
-                nextJob.put("diceIntervalMs", dicePolicy.optLong("intervalMs", dicePolicy.optLong("diceIntervalMs", 60_000L)));
-                nextJob.put("maxRolls", dicePolicy.optInt("maxRolls", 120));
-                nextJob.put("dicePrecomputed", true);
-            }
-            HttpResponse response = new UrlConnectionTransport().post(
-                endpoint + "/schedule",
-                Collections.singletonMap("Content-Type", "application/json; charset=utf-8"),
-                nextJob.toString()
-            );
-            if (response.status < 200 || response.status >= 300) {
-                if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
-                executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "PROACTIVE_RESCHEDULE_FAILED", "status=" + response.status, now);
-                return;
-            }
-            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
-            snapshot.put("cloudJobId", jobId);
-            snapshot.put("scheduledFor", nextRunAt);
-            snapshot.put("proactiveJob", nextJob);
-            snapshot.put("createdAt", isoTime(now));
-            persistAutomaticSnapshot(turn, snapshot, kind, jobId, nextRunAt, now);
-            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
-            AutomaticTaskAlarmScheduler.schedule(this, jobId, nextRunAt);
-            AlExecutionWakeWorker.enqueueAutomatic(this, jobId, nextRunAt);
-            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
-            continued.edit().putBoolean(continuationKey, true).apply();
-            if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
-            executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "INFO", "PROACTIVE_RESCHEDULED", jobId, now);
         } catch (Exception error) {
             if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
-            executionStore.recordDiagnostic(turn.turnId, turn.activeAttemptId, "WARN", "PROACTIVE_RESCHEDULE_FAILED", error.getMessage(), System.currentTimeMillis());
+            executionStore.recordDiagnostic(
+                turn.turnId, turn.activeAttemptId, "WARN", "PROACTIVE_RESCHEDULE_FAILED",
+                error.getMessage(), System.currentTimeMillis());
         }
-    }
-
-    private void persistAutomaticSnapshot(ChatTurnEntity turn, JSONObject context, String kind, String jobId, long scheduledFor, long now) throws Exception {
-        CharacterSnapshotEntity row = new CharacterSnapshotEntity();
-        row.characterId = turn.characterId;
-        row.characterName = context.optString("characterName", "AL");
-        row.playerName = context.optString("playerName", "我");
-        row.systemPrompt = context.optString("chatSystem", "");
-        row.momentSystemPrompt = "moment".equals(kind) ? context.optString("chatSystem", "") : "";
-        row.contextJson = context.toString();
-        row.chatConfigId = context.optString("chatConfigId", "chat-v1");
-        row.memoryConfigId = context.optString("memoryConfigId", "memory-v1");
-        row.createdAt = now;
-        row.scheduledFor = scheduledFor;
-        row.automaticKind = kind;
-        row.cloudJobId = jobId;
-        row.automaticTasksEnabled = true;
-        row.jobSnapshot = false;
-        row.snapshotId = turn.characterId + ":" + kind;
-        database.executionDao().upsertSnapshot(row);
-        CharacterSnapshotEntity jobRow = new CharacterSnapshotEntity();
-        jobRow.snapshotId = row.snapshotId + ":" + jobId;
-        jobRow.characterId = row.characterId;
-        jobRow.characterName = row.characterName;
-        jobRow.playerName = row.playerName;
-        jobRow.systemPrompt = row.systemPrompt;
-        jobRow.momentSystemPrompt = row.momentSystemPrompt;
-        jobRow.contextJson = row.contextJson;
-        jobRow.chatConfigId = row.chatConfigId;
-        jobRow.memoryConfigId = row.memoryConfigId;
-        jobRow.createdAt = row.createdAt;
-        jobRow.scheduledFor = row.scheduledFor;
-        jobRow.automaticKind = row.automaticKind;
-        jobRow.cloudJobId = row.cloudJobId;
-        jobRow.automaticTasksEnabled = true;
-        jobRow.jobSnapshot = true;
-        database.executionDao().upsertSnapshot(jobRow);
-    }
-
-    private static long parseIso(String value) {
-        if (value == null || value.trim().isEmpty()) return 0L;
-        try {
-            java.text.SimpleDateFormat formatter = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX", java.util.Locale.US);
-            return formatter.parse(value.trim()).getTime();
-        } catch (Exception ignored) { return 0L; }
     }
 
     private void persistRolePlanContinuation(ChatTurnEntity turn, JSONObject snapshot, JSONObject plan, String jobId, long now) throws Exception {

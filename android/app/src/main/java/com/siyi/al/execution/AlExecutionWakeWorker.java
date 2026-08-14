@@ -17,6 +17,7 @@ import androidx.work.Data;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.HashMap;
 
 public final class AlExecutionWakeWorker extends Worker {
     private static final String WORK_NAME = "al-execution-wake";
@@ -37,6 +38,13 @@ public final class AlExecutionWakeWorker extends Worker {
             RolePlanCoordinator coordinator = new RolePlanCoordinator(getApplicationContext());
             if (planId != null && !planId.trim().isEmpty() && scheduledFor > 0L) {
                 coordinator.dispatch(planId, scheduledFor, "local:" + RolePlanOccurrenceKey.of(planId, scheduledFor), System.currentTimeMillis());
+            } else if (getInputData().getString("automaticJobId") != null) {
+                AutomaticTaskCoordinator.ClaimToken token = automaticClaimToken(getInputData());
+                if (token == null) return Result.success();
+                long automaticScheduledFor =
+                    getInputData().getLong("automaticScheduledFor", 0L);
+                new AutomaticTaskCoordinator(getApplicationContext())
+                    .dispatch(token, Math.max(System.currentTimeMillis(), automaticScheduledFor));
             } else {
                 coordinator.dispatchDue(System.currentTimeMillis());
                 new AutomaticTaskCoordinator(getApplicationContext()).dispatchDue(System.currentTimeMillis());
@@ -90,12 +98,31 @@ public final class AlExecutionWakeWorker extends Worker {
     }
 
     public static void enqueueAutomatic(Context context, String jobId, long scheduledFor) {
-        String safeJobId = jobId == null ? "" : jobId.trim();
-        if (safeJobId.isEmpty()) return;
+        // Snapshot-only work is intentionally not scheduled; authority token required.
+    }
+
+    public static void enqueueAutomatic(
+        Context context, AutomaticTaskCoordinator.ClaimToken token, long scheduledFor
+    ) {
+        if (token == null || scheduledFor <= 0L) return;
         long remainingMs = Math.max(0L, scheduledFor - System.currentTimeMillis());
         long delaySeconds = remainingMs == 0L ? 0L : Math.max(1L, (remainingMs + 999L) / 1000L);
-        Data input = new Data.Builder().putString("automaticJobId", safeJobId).build();
-        enqueueInternal(context, delaySeconds, input, WORK_NAME + "-automatic-" + safeJobId);
+        Data input = new Data.Builder()
+            .putString("automaticJobId", token.jobId)
+            .putString("automaticCharacterId", token.characterId)
+            .putString("automaticKind", token.kind)
+            .putString("automaticAuthorityEpoch", token.authorityEpoch)
+            .putLong("automaticGeneration", token.generation)
+            .putLong("automaticScheduledFor", scheduledFor)
+            .build();
+        enqueueInternal(context, delaySeconds, input, automaticWorkName(token.jobId));
+    }
+
+    public static void cancelAutomatic(Context context, String jobId) {
+        String safeJobId = jobId == null ? "" : jobId.trim();
+        if (safeJobId.isEmpty()) return;
+        WorkManager.getInstance(context.getApplicationContext())
+            .cancelUniqueWork(automaticWorkName(safeJobId));
     }
 
     public static void enqueueLifecycle(Context context, long delaySeconds) {
@@ -146,6 +173,24 @@ public final class AlExecutionWakeWorker extends Worker {
             ExistingWorkPolicy.REPLACE,
             builder.build()
         );
+    }
+
+    private static String automaticWorkName(String jobId) {
+        return WORK_NAME + "-automatic-" + jobId;
+    }
+
+    private static AutomaticTaskCoordinator.ClaimToken automaticClaimToken(Data input) {
+        HashMap<String, String> raw = new HashMap<>();
+        raw.put("charId", input.getString("automaticCharacterId"));
+        raw.put("kind", input.getString("automaticKind"));
+        raw.put("jobId", input.getString("automaticJobId"));
+        raw.put("authorityEpoch", input.getString("automaticAuthorityEpoch"));
+        raw.put("generation", String.valueOf(input.getLong("automaticGeneration", 0L)));
+        try {
+            return AutomaticTaskCoordinator.ClaimToken.from(raw);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
     }
 
     public static void cancel(Context context) {

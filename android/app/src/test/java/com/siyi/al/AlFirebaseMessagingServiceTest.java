@@ -5,6 +5,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
+import java.util.HashMap;
 import org.junit.Test;
 
 public class AlFirebaseMessagingServiceTest {
@@ -36,5 +37,21 @@ public class AlFirebaseMessagingServiceTest {
         snapshot.contextJson = "{\"cloudJobId\":\"job-current\",\"automaticTasksEnabled\":false}";
 
         assertFalse(AlFirebaseMessagingService.snapshotAllowsAutomaticTask(snapshot, "job-current"));
+    }
+
+    @Test
+    public void proactiveFcmRequiresTheCompleteAuthorityToken() {
+        HashMap<String, String> data = new HashMap<>();
+        data.put("type", "proactive");
+        data.put("charId", "yuqi");
+        data.put("kind", "chat");
+        data.put("jobId", "pro_1234567890abcdef_7");
+        data.put("authorityEpoch", "00112233445566778899aabbccddeeff");
+        data.put("generation", "7");
+
+        assertEquals(7L, AlFirebaseMessagingService.automaticClaimToken(data).generation);
+        data.remove("authorityEpoch");
+        org.junit.Assert.assertThrows(IllegalArgumentException.class,
+            () -> AlFirebaseMessagingService.automaticClaimToken(data));
     }
 }
