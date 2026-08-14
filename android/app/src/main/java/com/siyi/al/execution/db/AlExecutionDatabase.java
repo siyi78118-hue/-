@@ -27,13 +27,16 @@ import androidx.sqlite.db.SupportSQLiteDatabase;
         ConversationAuthorityEntity.class,
         LifecycleControlEntity.class,
         LifecycleInboundAckTombstoneEntity.class,
-        RoleNotificationCancellationEntity.class
+        RoleNotificationCancellationEntity.class,
+        AutomaticScheduleAuthorityEntity.class,
+        AutomaticScheduleOutboxEntity.class,
+        AutomaticScheduleEventEntity.class
     },
     version = AlExecutionDatabase.SCHEMA_VERSION,
     exportSchema = false
 )
 public abstract class AlExecutionDatabase extends RoomDatabase {
-    public static final int SCHEMA_VERSION = 15;
+    public static final int SCHEMA_VERSION = 16;
     private static volatile AlExecutionDatabase instance;
     private static final Migration MIGRATION_1_2 = new Migration(1, 2) {
         @Override
@@ -200,6 +203,49 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                 + "ON `role_notification_cancellations` (`state`, `created_at`)");
         }
     };
+    public static final Migration MIGRATION_15_16 = new Migration(15, 16) {
+        @Override public void migrate(SupportSQLiteDatabase database) {
+            database.execSQL("CREATE TABLE IF NOT EXISTS `automatic_schedule_authorities` ("
+                + "`streamKey` TEXT NOT NULL, `characterId` TEXT NOT NULL, `kind` TEXT NOT NULL, "
+                + "`owner` TEXT NOT NULL, `authorityEpoch` TEXT NOT NULL, `generation` INTEGER NOT NULL, "
+                + "`state` TEXT NOT NULL, `activeJobId` TEXT, `dueAt` INTEGER, "
+                + "`semanticJson` TEXT NOT NULL, `semanticChecksum` TEXT NOT NULL, "
+                + "`cloudSyncState` TEXT NOT NULL, `conversationSequence` INTEGER NOT NULL, "
+                + "`createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`streamKey`), "
+                + "CHECK(`owner` IN ('android-v1','web-v1')), "
+                + "CHECK(`kind` IN ('chat','moment')), "
+                + "CHECK(`generation` >= 1), "
+                + "CHECK(`state` IN ('disabled','paused_for_conversation','scheduled','claimed','terminal_pending_next')), "
+                + "CHECK(`cloudSyncState` IN ('waiting','pending','synced','superseded','quarantined'))) ");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS "
+                + "`index_automatic_schedule_authorities_characterId_kind` "
+                + "ON `automatic_schedule_authorities` (`characterId`, `kind`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_automatic_schedule_authorities_state_dueAt` "
+                + "ON `automatic_schedule_authorities` (`state`, `dueAt`)");
+
+            database.execSQL("CREATE TABLE IF NOT EXISTS `automatic_schedule_outbox` ("
+                + "`outboxId` TEXT NOT NULL, `streamKey` TEXT NOT NULL, `generation` INTEGER NOT NULL, "
+                + "`operation` TEXT NOT NULL, `payloadJson` TEXT NOT NULL, `payloadChecksum` TEXT NOT NULL, "
+                + "`state` TEXT NOT NULL, `leaseId` TEXT, `leaseAttempt` INTEGER NOT NULL, `leasedAt` INTEGER, "
+                + "`nextAttemptAt` INTEGER NOT NULL, `lastErrorCode` TEXT NOT NULL, "
+                + "`createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, PRIMARY KEY(`outboxId`), "
+                + "CHECK(`generation` >= 1), CHECK(`operation` IN ('schedule','pause','disable')), "
+                + "CHECK(`state` IN ('waiting','pending','synced','superseded','quarantined'))) ");
+            database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_automatic_schedule_outbox_streamKey_generation` "
+                + "ON `automatic_schedule_outbox` (`streamKey`, `generation`)");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_automatic_schedule_outbox_state_updatedAt` "
+                + "ON `automatic_schedule_outbox` (`state`, `updatedAt`)");
+
+            database.execSQL("CREATE TABLE IF NOT EXISTS `automatic_schedule_events` ("
+                + "`eventId` TEXT NOT NULL, `streamKey` TEXT NOT NULL, `generation` INTEGER NOT NULL, "
+                + "`eventType` TEXT NOT NULL, `previousJobId` TEXT, `nextJobId` TEXT, "
+                + "`previousDueAt` INTEGER, `nextDueAt` INTEGER, `sourceType` TEXT NOT NULL, "
+                + "`sourceId` TEXT NOT NULL, `sourceChecksum` TEXT NOT NULL, `resultCode` TEXT NOT NULL, "
+                + "`createdAt` INTEGER NOT NULL, PRIMARY KEY(`eventId`))");
+            database.execSQL("CREATE INDEX IF NOT EXISTS `index_automatic_schedule_events_streamKey_generation_createdAt` "
+                + "ON `automatic_schedule_events` (`streamKey`, `generation`, `createdAt`)");
+        }
+    };
 
     public abstract AlExecutionDao executionDao();
 
@@ -215,7 +261,7 @@ public abstract class AlExecutionDatabase extends RoomDatabase {
                         MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5,
                         MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9,
                         MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13,
-                        MIGRATION_13_14, MIGRATION_14_15
+                        MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16
                     ).build();
                 }
             }

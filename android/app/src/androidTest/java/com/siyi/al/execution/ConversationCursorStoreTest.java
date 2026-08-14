@@ -15,6 +15,9 @@ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import com.siyi.al.execution.db.AlExecutionDatabase;
+import com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity;
+import com.siyi.al.execution.db.AutomaticScheduleEventEntity;
+import com.siyi.al.execution.db.AutomaticScheduleOutboxEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
 import org.junit.After;
@@ -342,9 +345,123 @@ public class ConversationCursorStoreTest {
     }
 
     @Test
-    public void migration10To15AndFresh15AreRestartStableAndNewerVersionRejects() {
+    public void migration15To16CreatesEmptyAutomaticAuthorityTablesWithoutRewritingLegacyCandidates() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        String databaseName = "cursor-v10-v15-chain-" + System.nanoTime();
+        String databaseName = "cursor-v15-v16-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper = createV12UpgradeHelper(context, databaseName);
+        SupportSQLiteDatabase db = helper.getWritableDatabase();
+        AlExecutionDatabase.MIGRATION_12_13.migrate(db);
+        AlExecutionDatabase.MIGRATION_13_14.migrate(db);
+        AlExecutionDatabase.MIGRATION_14_15.migrate(db);
+        String contextJson = "[{\"speaker\":\"用户\",\"text\":\"旧聊天必须原样保留\"}]";
+        db.execSQL("INSERT INTO character_snapshots (snapshotId, characterId, characterName, playerName, "
+            + "systemPrompt, momentSystemPrompt, contextJson, chatConfigId, memoryConfigId, createdAt, "
+            + "scheduledFor, automaticKind, cloudJobId, automaticTasksEnabled, jobSnapshot) VALUES "
+            + "('snapshot-v15', 'yuqi', '虞栖', '用户', 'system', 'moment', ?, 'chat', 'memory', 100, "
+            + "1786728600000, 'chat', 'pro_legacy_candidate', 1, 0)", new Object[]{ contextJson });
+        db.execSQL("INSERT INTO lifecycle_controls (controlId, controlKind, characterId, peerId, requestedAt, "
+            + "semanticJson, semanticChecksum, state, leaseAttempt, updatedAt) VALUES "
+            + "('ctl-v15', 'role_delete_v1', 'other-role', 'device-1', 101, '{}', '" + repeat('a', 64)
+            + "', 'waiting', 0, 101)");
+        db.execSQL("INSERT INTO role_notification_cancellations (cancellation_key, control_id, character_id, "
+            + "notification_id, intent_checksum, state, created_at, updated_at) VALUES "
+            + "('cancel-v15', 'ctl-v15', 'other-role', 7, '" + repeat('b', 64)
+            + "', 'waiting', 102, 102)");
+        db.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, "
+            + "snapshotJson, createdAt, updatedAt) VALUES "
+            + "('turn-v15', 'yuqi', 'message-v15', 'DIRECT_REPLY', 'QUEUED', "
+            + "'{\"message\":\"原样保留\"}', '{\"snapshot\":\"旧值\"}', 103, 104)");
+
+        AlExecutionDatabase.MIGRATION_15_16.migrate(db);
+
+        assertTrue(hasTable(db, "automatic_schedule_authorities"));
+        assertTrue(hasTable(db, "automatic_schedule_outbox"));
+        assertTrue(hasTable(db, "automatic_schedule_events"));
+        assertTrue(hasColumn(db, "automatic_schedule_authorities", "authorityEpoch"));
+        assertTrue(hasColumn(db, "automatic_schedule_authorities", "conversationSequence"));
+        assertTrue(hasColumn(db, "automatic_schedule_outbox", "payloadChecksum"));
+        assertTrue(hasColumn(db, "automatic_schedule_outbox", "leaseAttempt"));
+        assertTrue(hasColumn(db, "automatic_schedule_events", "sourceChecksum"));
+        assertFalse(hasColumn(db, "automatic_schedule_events", "semanticJson"));
+        assertFalse(hasColumn(db, "automatic_schedule_events", "payloadJson"));
+        assertEquals(0L, count(db, "automatic_schedule_authorities"));
+        assertEquals(0L, count(db, "automatic_schedule_outbox"));
+        assertEquals(0L, count(db, "automatic_schedule_events"));
+        assertEquals(contextJson, stringValue(db,
+            "SELECT contextJson FROM character_snapshots WHERE snapshotId = 'snapshot-v15'"));
+        assertEquals("pro_legacy_candidate", stringValue(db,
+            "SELECT cloudJobId FROM character_snapshots WHERE snapshotId = 'snapshot-v15'"));
+        assertEquals(1L, count(db, "lifecycle_controls"));
+        assertEquals(1L, count(db, "role_notification_cancellations"));
+        assertEquals("{\"message\":\"原样保留\"}", stringValue(db,
+            "SELECT inputJson FROM chat_turns WHERE turnId = 'turn-v15'"));
+        assertEquals("role_delete_v1", stringValue(db,
+            "SELECT controlKind FROM lifecycle_controls WHERE controlId = 'ctl-v15'"));
+        assertEquals(repeat('b', 64), stringValue(db,
+            "SELECT intent_checksum FROM role_notification_cancellations WHERE cancellation_key = 'cancel-v15'"));
+        helper.close();
+        context.deleteDatabase(databaseName);
+    }
+
+    @Test
+    public void automaticScheduleDaoEnforcesGenerationLeaseAndAuthorityCas() {
+        AutomaticScheduleAuthorityEntity authority = new AutomaticScheduleAuthorityEntity();
+        authority.streamKey = "yuqi:chat";
+        authority.characterId = "yuqi";
+        authority.kind = "chat";
+        authority.authorityEpoch = "epoch_authority_123456";
+        authority.generation = 2L;
+        authority.state = "scheduled";
+        authority.activeJobId = "job_2";
+        authority.dueAt = 2000L;
+        authority.semanticJson = "{\"generation\":2}";
+        authority.semanticChecksum = repeat('a', 64);
+        authority.createdAt = 1000L;
+        authority.updatedAt = 1000L;
+        assertTrue(database.executionDao().upsertAutomaticScheduleAuthority(authority) > 0L);
+        assertEquals(0, database.executionDao().claimAutomaticScheduleAuthorityExact(
+            authority.streamKey, authority.authorityEpoch, 1L, authority.activeJobId, 1100L));
+        assertEquals(1, database.executionDao().claimAutomaticScheduleAuthorityExact(
+            authority.streamKey, authority.authorityEpoch, 2L, authority.activeJobId, 1100L));
+        assertEquals("claimed", database.executionDao()
+            .automaticScheduleAuthority(authority.streamKey).state);
+
+        AutomaticScheduleOutboxEntity first = scheduleOutbox("yuqi:chat:1", "yuqi:chat", 1L, 1000L, 'b');
+        AutomaticScheduleOutboxEntity second = scheduleOutbox("yuqi:chat:2", "yuqi:chat", 2L, 1001L, 'c');
+        assertTrue(database.executionDao().insertAutomaticScheduleOutbox(first) > 0L);
+        assertTrue(database.executionDao().insertAutomaticScheduleOutbox(second) > 0L);
+        assertEquals(first.outboxId, database.executionDao().nextAutomaticScheduleOutbox().outboxId);
+        assertEquals(0, database.executionDao().claimAutomaticScheduleOutboxExact(
+            second.outboxId, second.payloadChecksum, 0L, "lease-2", 1200L, 1200L));
+        assertEquals(1, database.executionDao().claimAutomaticScheduleOutboxExact(
+            first.outboxId, first.payloadChecksum, 0L, "lease-1", 1200L, 1200L));
+        AutomaticScheduleOutboxEntity claimed = database.executionDao().automaticScheduleOutbox(first.outboxId);
+        assertEquals(1L, claimed.leaseAttempt);
+        assertEquals(0, database.executionDao().syncAutomaticScheduleOutboxExact(
+            first.outboxId, first.payloadChecksum, "wrong-lease", 1L, 1200L, 1300L));
+        assertEquals(1, database.executionDao().syncAutomaticScheduleOutboxExact(
+            first.outboxId, first.payloadChecksum, "lease-1", 1L, 1200L, 1300L));
+        assertEquals(second.outboxId, database.executionDao().nextAutomaticScheduleOutbox().outboxId);
+
+        AutomaticScheduleEventEntity event = new AutomaticScheduleEventEntity();
+        event.eventId = "yuqi:chat:2:claimed";
+        event.streamKey = "yuqi:chat";
+        event.generation = 2L;
+        event.eventType = "claimed";
+        event.sourceType = "alarm";
+        event.sourceId = "job_2";
+        event.sourceChecksum = repeat('d', 64);
+        event.resultCode = "CLAIMED";
+        event.createdAt = 1400L;
+        assertTrue(database.executionDao().insertAutomaticScheduleEvent(event) > 0L);
+        assertEquals(event.eventId,
+            database.executionDao().automaticScheduleEvents(event.streamKey).get(0).eventId);
+    }
+
+    @Test
+    public void migration10To16AndFresh16AreRestartStableAndNewerVersionRejects() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "cursor-v10-v16-chain-" + System.nanoTime();
         SupportSQLiteOpenHelper helper = createV10Helper(context, databaseName);
         SupportSQLiteDatabase old = helper.getWritableDatabase();
         old.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('chain-v15-turn', 'yuqi', 'chain-v15-message', 'DIRECT_REPLY', 'QUEUED', '{}', '{}', 1, 1)");
@@ -355,45 +472,50 @@ public class ConversationCursorStoreTest {
                 AlExecutionDatabase.MIGRATION_11_12,
                 AlExecutionDatabase.MIGRATION_12_13,
                 AlExecutionDatabase.MIGRATION_13_14,
-                AlExecutionDatabase.MIGRATION_14_15)
+                AlExecutionDatabase.MIGRATION_14_15,
+                AlExecutionDatabase.MIGRATION_15_16)
             .allowMainThreadQueries().build();
         SupportSQLiteDatabase upgraded = current.getOpenHelper().getWritableDatabase();
-        assertEquals(15L, userVersion(upgraded));
+        assertEquals(16L, userVersion(upgraded));
         assertEquals(1L, count(upgraded, "chat_turns"));
         assertTrue(hasTable(upgraded, "role_notification_cancellations"));
         current.close();
 
         AlExecutionDatabase reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
-            .addMigrations(AlExecutionDatabase.MIGRATION_14_15).allowMainThreadQueries().build();
-        assertEquals(15L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+            .addMigrations(AlExecutionDatabase.MIGRATION_14_15, AlExecutionDatabase.MIGRATION_15_16)
+            .allowMainThreadQueries().build();
+        assertEquals(16L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
         reopened.close();
         context.deleteDatabase(databaseName);
 
-        String freshName = "cursor-fresh-v15-" + System.nanoTime();
+        String freshName = "cursor-fresh-v16-" + System.nanoTime();
         AlExecutionDatabase fresh = Room.databaseBuilder(context, AlExecutionDatabase.class, freshName)
             .allowMainThreadQueries().build();
-        assertEquals(15L, userVersion(fresh.getOpenHelper().getWritableDatabase()));
+        assertEquals(16L, userVersion(fresh.getOpenHelper().getWritableDatabase()));
         assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "role_notification_cancellations"));
+        assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "automatic_schedule_authorities"));
+        assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "automatic_schedule_outbox"));
+        assertTrue(hasTable(fresh.getOpenHelper().getWritableDatabase(), "automatic_schedule_events"));
         fresh.close();
         context.deleteDatabase(freshName);
 
-        String newerName = "cursor-newer-v16-" + System.nanoTime();
-        SupportSQLiteOpenHelper helper15 = new FrameworkSQLiteOpenHelperFactory().create(
+        String newerName = "cursor-newer-v17-" + System.nanoTime();
+        SupportSQLiteOpenHelper helper16 = new FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(context)
                 .name(newerName)
-                .callback(new SupportSQLiteOpenHelper.Callback(16) {
+                .callback(new SupportSQLiteOpenHelper.Callback(17) {
                     @Override public void onCreate(SupportSQLiteDatabase db) { }
                     @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
                 })
                 .build()
         );
-        helper15.getWritableDatabase();
-        helper15.close();
+        helper16.getWritableDatabase();
+        helper16.close();
         AlExecutionDatabase incompatible = Room.databaseBuilder(context, AlExecutionDatabase.class, newerName)
             .allowMainThreadQueries().build();
         try {
             incompatible.getOpenHelper().getWritableDatabase();
-            fail("v16 must not silently downgrade or repair a newer database");
+            fail("v17 must not silently downgrade or repair a newer database");
         } catch (IllegalStateException expected) {
             assertTrue(expected.getMessage().contains("downgrade"));
         } finally {
@@ -431,9 +553,9 @@ public class ConversationCursorStoreTest {
     }
 
     @Test
-    public void fullTenToFourteenChainPreservesPopulatedRowsAndIsRestartStable() {
+    public void fullTenToSixteenChainPreservesPopulatedRowsAndIsRestartStable() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        String databaseName = "cursor-v10-v14-chain-" + System.nanoTime();
+        String databaseName = "cursor-v10-v16-history-" + System.nanoTime();
         SupportSQLiteOpenHelper helper = createV10Helper(context, databaseName);
         SupportSQLiteDatabase old = helper.getWritableDatabase();
         old.execSQL("INSERT INTO chat_turns (turnId, characterId, sourceMessageId, kind, state, inputJson, snapshotJson, createdAt, updatedAt) VALUES ('chain-turn', 'yuqi', 'chain-message', 'DIRECT_REPLY', 'QUEUED', '{}', '{}', 1, 1)");
@@ -443,16 +565,28 @@ public class ConversationCursorStoreTest {
                 AlExecutionDatabase.MIGRATION_10_11,
                 AlExecutionDatabase.MIGRATION_11_12,
                 AlExecutionDatabase.MIGRATION_12_13,
-                AlExecutionDatabase.MIGRATION_13_14)
+                AlExecutionDatabase.MIGRATION_13_14,
+                AlExecutionDatabase.MIGRATION_14_15,
+                AlExecutionDatabase.MIGRATION_15_16)
             .allowMainThreadQueries().build();
         SupportSQLiteDatabase upgraded = current.getOpenHelper().getWritableDatabase();
-        assertEquals(14L, userVersion(upgraded));
+        assertEquals(16L, userVersion(upgraded));
         assertEquals(1L, count(upgraded, "chat_turns"));
         assertTrue(hasTable(upgraded, "lifecycle_inbound_ack_tombstones"));
+        assertTrue(hasTable(upgraded, "role_notification_cancellations"));
+        assertTrue(hasTable(upgraded, "automatic_schedule_authorities"));
+        assertTrue(hasTable(upgraded, "automatic_schedule_outbox"));
+        assertTrue(hasTable(upgraded, "automatic_schedule_events"));
         current.close();
         AlExecutionDatabase reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
-            .addMigrations(AlExecutionDatabase.MIGRATION_13_14).allowMainThreadQueries().build();
-        assertEquals(14L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+            .addMigrations(
+                AlExecutionDatabase.MIGRATION_13_14,
+                AlExecutionDatabase.MIGRATION_14_15,
+                AlExecutionDatabase.MIGRATION_15_16)
+            .allowMainThreadQueries().build();
+        assertEquals(16L, userVersion(reopened.getOpenHelper().getWritableDatabase()));
+        assertEquals(1L, count(reopened.getOpenHelper().getWritableDatabase(), "chat_turns"));
+        assertEquals(0L, count(reopened.getOpenHelper().getWritableDatabase(), "automatic_schedule_authorities"));
         reopened.close();
         context.deleteDatabase(databaseName);
     }
@@ -496,27 +630,27 @@ public class ConversationCursorStoreTest {
     @Test
     public void newerVersionIsNotSilentlyRepairedOrDowngraded() {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        String databaseName = "cursor-newer-v16-" + System.nanoTime();
+        String databaseName = "cursor-newer-v17-" + System.nanoTime();
         SupportSQLiteOpenHelper helper12 = createV12UpgradeHelper(context, databaseName);
         helper12.getWritableDatabase();
         helper12.close();
-        SupportSQLiteOpenHelper helper14 = new FrameworkSQLiteOpenHelperFactory().create(
+        SupportSQLiteOpenHelper helper17 = new FrameworkSQLiteOpenHelperFactory().create(
             SupportSQLiteOpenHelper.Configuration.builder(context)
                 .name(databaseName)
-                .callback(new SupportSQLiteOpenHelper.Callback(16) {
+                .callback(new SupportSQLiteOpenHelper.Callback(17) {
                     @Override public void onCreate(SupportSQLiteDatabase db) { }
                     @Override public void onUpgrade(SupportSQLiteDatabase db, int oldVersion, int newVersion) { }
                 })
                 .build()
         );
-        helper14.getWritableDatabase();
-        helper14.close();
+        helper17.getWritableDatabase();
+        helper17.close();
         AlExecutionDatabase incompatible = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
             .allowMainThreadQueries()
             .build();
         try {
             incompatible.getOpenHelper().getWritableDatabase();
-            fail("v15 must not silently downgrade or repair a newer database");
+            fail("v17 must not silently downgrade or repair a newer database");
         } catch (IllegalStateException expected) {
             assertTrue(expected.getMessage().contains("downgrade"));
         } finally {
@@ -560,6 +694,23 @@ public class ConversationCursorStoreTest {
         assertNotNull(cursor);
         assertEquals("legacy-group", cursor.nativeCompletedGroupId);
         assertEquals(0L, cursor.nativeCompletedSequence);
+    }
+
+    private static AutomaticScheduleOutboxEntity scheduleOutbox(
+        String outboxId, String streamKey, long generation, long createdAt, char checksumChar
+    ) {
+        AutomaticScheduleOutboxEntity row = new AutomaticScheduleOutboxEntity();
+        row.outboxId = outboxId;
+        row.streamKey = streamKey;
+        row.generation = generation;
+        row.operation = "schedule";
+        row.payloadJson = "{\"generation\":" + generation + "}";
+        row.payloadChecksum = repeat(checksumChar, 64);
+        row.state = "waiting";
+        row.nextAttemptAt = createdAt;
+        row.createdAt = createdAt;
+        row.updatedAt = createdAt;
+        return row;
     }
 
     private static long count(SupportSQLiteDatabase db, String table) {

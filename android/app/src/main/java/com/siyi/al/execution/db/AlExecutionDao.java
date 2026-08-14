@@ -28,6 +28,62 @@ public interface AlExecutionDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     long insertRoleNotificationCancellation(RoleNotificationCancellationEntity cancellation);
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    long upsertAutomaticScheduleAuthority(AutomaticScheduleAuthorityEntity authority);
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertAutomaticScheduleOutbox(AutomaticScheduleOutboxEntity outbox);
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    long insertAutomaticScheduleEvent(AutomaticScheduleEventEntity event);
+
+    @Query("SELECT * FROM automatic_schedule_authorities WHERE streamKey = :streamKey LIMIT 1")
+    AutomaticScheduleAuthorityEntity automaticScheduleAuthority(String streamKey);
+
+    @Query("SELECT * FROM automatic_schedule_outbox WHERE outboxId = :outboxId LIMIT 1")
+    AutomaticScheduleOutboxEntity automaticScheduleOutbox(String outboxId);
+
+    @Query("SELECT * FROM automatic_schedule_outbox o WHERE o.state = 'waiting' "
+        + "AND NOT EXISTS (SELECT 1 FROM automatic_schedule_outbox prior "
+        + "WHERE prior.streamKey = o.streamKey AND prior.generation < o.generation "
+        + "AND prior.state NOT IN ('synced','superseded')) "
+        + "ORDER BY o.updatedAt ASC, o.outboxId ASC LIMIT 1")
+    AutomaticScheduleOutboxEntity nextAutomaticScheduleOutbox();
+
+    @Query("SELECT * FROM automatic_schedule_events WHERE streamKey = :streamKey "
+        + "ORDER BY generation ASC, createdAt ASC, eventId ASC")
+    List<AutomaticScheduleEventEntity> automaticScheduleEvents(String streamKey);
+
+    @Query("UPDATE automatic_schedule_outbox SET state = 'pending', leaseId = :leaseId, "
+        + "leaseAttempt = leaseAttempt + 1, leasedAt = :leasedAt, updatedAt = :updatedAt "
+        + "WHERE outboxId = :outboxId AND payloadChecksum = :payloadChecksum "
+        + "AND (state = 'waiting' OR (state = 'pending' AND leasedAt IS NOT NULL AND leasedAt <= :expiredBefore)) "
+        + "AND NOT EXISTS (SELECT 1 FROM automatic_schedule_outbox prior "
+        + "WHERE prior.streamKey = automatic_schedule_outbox.streamKey "
+        + "AND prior.generation < automatic_schedule_outbox.generation "
+        + "AND prior.state NOT IN ('synced','superseded'))")
+    int claimAutomaticScheduleOutboxExact(
+        String outboxId, String payloadChecksum, long expiredBefore,
+        String leaseId, long leasedAt, long updatedAt
+    );
+
+    @Query("UPDATE automatic_schedule_outbox SET state = 'synced', leaseId = NULL, leasedAt = NULL, "
+        + "lastErrorCode = '', updatedAt = :updatedAt "
+        + "WHERE outboxId = :outboxId AND payloadChecksum = :payloadChecksum "
+        + "AND state = 'pending' AND leaseId = :leaseId AND leaseAttempt = :leaseAttempt "
+        + "AND leasedAt = :leasedAt")
+    int syncAutomaticScheduleOutboxExact(
+        String outboxId, String payloadChecksum, String leaseId,
+        long leaseAttempt, long leasedAt, long updatedAt
+    );
+
+    @Query("UPDATE automatic_schedule_authorities SET state = 'claimed', updatedAt = :updatedAt "
+        + "WHERE streamKey = :streamKey AND authorityEpoch = :authorityEpoch "
+        + "AND generation = :generation AND activeJobId = :activeJobId AND state = 'scheduled'")
+    int claimAutomaticScheduleAuthorityExact(
+        String streamKey, String authorityEpoch, long generation, String activeJobId, long updatedAt
+    );
+
     @Query("SELECT * FROM role_notification_cancellations WHERE state = 'waiting' "
         + "ORDER BY created_at ASC, cancellation_key ASC")
     List<RoleNotificationCancellationEntity> pendingRoleNotificationCancellations();
