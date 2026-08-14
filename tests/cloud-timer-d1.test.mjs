@@ -4,6 +4,43 @@ import test from 'node:test';
 
 const workerSource = await readFile(new URL('../cloud-timer-worker.js', import.meta.url), 'utf8');
 const { default: worker } = await import(`data:text/javascript;base64,${Buffer.from(workerSource).toString('base64')}#d1-store`);
+const { createD1TimerStore } = await import(`data:text/javascript;base64,${Buffer.from(`${workerSource}\nexport { createD1TimerStore };`).toString('base64')}#d1-store-internals`);
+
+class SingleJobD1 {
+  constructor() {
+    this.row = null;
+  }
+
+  prepare(sql) {
+    return {
+      bind: (...args) => ({
+        first: async () => {
+          if (sql.includes('WHERE logical_key = ?1')) {
+            return this.row?.logical_key === args[0]
+              ? { job_id: this.row.job_id, payload_json: this.row.payload_json }
+              : null;
+          }
+          if (sql.includes('WHERE job_id = ?1')) {
+            return this.row?.job_id === args[0] ? { payload_json: this.row.payload_json } : null;
+          }
+          throw new Error(`unexpected first SQL: ${sql}`);
+        },
+        run: async () => {
+          if (!sql.includes('INSERT OR REPLACE INTO timer_jobs')) throw new Error(`unexpected run SQL: ${sql}`);
+          this.row = {
+            job_id: args[0],
+            logical_key: args[1],
+            payload_json: args[10],
+            delivery_attempts: args[11],
+            awaiting_ack: args[12],
+            updated_at: args[14]
+          };
+          return { meta: { changes: 1 } };
+        }
+      })
+    };
+  }
+}
 
 class MemoryTimerStore {
   constructor() {
@@ -57,6 +94,42 @@ test('worker configuration and schema use D1 instead of KV task writes', async (
   assert.match(migration, /CREATE TABLE IF NOT EXISTS timer_meta/);
   assert.match(migration, /CREATE INDEX IF NOT EXISTS idx_timer_jobs_due_at/);
   assert.doesNotMatch(workerSource, /AL_TIMER_KV\.(?:put|delete|list)/, 'new timer writes must not use KV');
+});
+
+test('D1 persists FCM acknowledgement state without letting a schedule replay erase it', async () => {
+  const db = new SingleJobD1();
+  const store = createD1TimerStore(db);
+  const logicalKey = 'active:device-a:char-a:chat';
+  const scheduled = {
+    deviceId: 'device-a',
+    jobId: 'ack-job',
+    charId: 'char-a',
+    dueAt: '2026-08-14T10:27:40.294Z',
+    type: 'proactive',
+    kind: 'chat',
+    mode: 'dice',
+    updatedAt: 1000
+  };
+  await store.saveJob(scheduled, logicalKey);
+
+  const awaitingAck = {
+    ...scheduled,
+    nextDeliveryAttemptAt: '2026-08-14T11:10:26.779Z',
+    deliveryAttempts: 1,
+    awaitingAck: true,
+    lastPushedAt: 1786705526779,
+    updatedAt: 2000
+  };
+  const transitioned = await store.saveJob(awaitingAck, logicalKey, { force: true });
+  assert.equal(transitioned.idempotent, false);
+  assert.equal(JSON.parse(db.row.payload_json).awaitingAck, true);
+  assert.equal(db.row.awaiting_ack, 1);
+  assert.equal(db.row.delivery_attempts, 1);
+
+  const replayed = await store.saveJob({ ...scheduled, updatedAt: 3000 }, logicalKey);
+  assert.equal(replayed.idempotent, true);
+  assert.equal(JSON.parse(db.row.payload_json).awaitingAck, true);
+  assert.equal(db.row.updated_at, 2000);
 });
 
 test('D1 timer contract keeps logical singleton jobs and independent role plans', async () => {

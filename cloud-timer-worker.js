@@ -271,11 +271,11 @@ function createD1TimerStore(db) {
     async getJob(jobId) {
       return parseJob(await db.prepare('SELECT payload_json FROM timer_jobs WHERE job_id = ?1').bind(jobId).first());
     },
-    async saveJob(job, logicalKey) {
+    async saveJob(job, logicalKey, { force = false } = {}) {
       const activeRow = await db.prepare('SELECT job_id, payload_json FROM timer_jobs WHERE logical_key = ?1').bind(logicalKey).first();
       const active = parseJob(activeRow);
       const previous = await this.getJob(job.jobId);
-      if (active?.jobId === job.jobId && sameScheduledJob(previous, job)) return { idempotent: true, replacedJobId: '' };
+      if (!force && active?.jobId === job.jobId && sameScheduledJob(previous, job)) return { idempotent: true, replacedJobId: '' };
       await db.prepare(`INSERT OR REPLACE INTO timer_jobs
         (job_id, logical_key, device_id, char_id, type, kind, plan_id, occurrence_id, source,
          due_at, payload_json, delivery_attempts, awaiting_ack, test, updated_at)
@@ -331,8 +331,8 @@ function samePushTarget(left, right) {
     && JSON.stringify(left.subscription || null) === JSON.stringify(right.subscription || null);
 }
 
-async function saveJob(job, env) {
-  return timerStore(env).saveJob(job, logicalTaskKey(job));
+async function saveJob(job, env, options) {
+  return timerStore(env).saveJob(job, logicalTaskKey(job), options);
 }
 
 async function cancelJob(jobId, env) {
@@ -429,7 +429,7 @@ async function deferForFcmAck(job, env) {
     awaitingAck: true,
     lastPushedAt: Date.now(),
     updatedAt: Date.now()
-  }, env);
+  }, env, { force: true });
   return true;
 }
 
@@ -457,7 +457,7 @@ async function deferForDeliveryRetry(job, env, reason = '') {
     awaitingAck: false,
     lastDeliveryError: String(reason || '').slice(0, 160),
     updatedAt: Date.now()
-  }, env);
+  }, env, { force: true });
   return true;
 }
 
