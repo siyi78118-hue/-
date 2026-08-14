@@ -12,9 +12,11 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.Test;
@@ -242,6 +244,9 @@ public class BridgeReceiptDeliveryCoordinatorTest {
         FakeStore store = new FakeStore(snapshot("local_concurrent", "pc_concurrent", "visible", null, 190L, false));
         RecordingTransport firstTransport = new RecordingTransport();
         RecordingTransport secondTransport = new RecordingTransport();
+        CountDownLatch bothSendersEntered = new CountDownLatch(2);
+        firstTransport.sendBarrier = bothSendersEntered;
+        secondTransport.sendBarrier = bothSendersEntered;
         BridgeReceiptDeliveryCoordinator first = coordinator(store, firstTransport);
         BridgeReceiptDeliveryCoordinator second = coordinator(store, secondTransport);
         ExecutorService pool = Executors.newFixedThreadPool(2);
@@ -548,9 +553,16 @@ public class BridgeReceiptDeliveryCoordinatorTest {
         private final List<BridgeReceiptDeliveryCoordinator.AuthorityReceipt> sent =
             Collections.synchronizedList(new ArrayList<>());
         private boolean failOnce;
+        private CountDownLatch sendBarrier;
 
         @Override public void send(BridgeReceiptDeliveryCoordinator.AuthorityReceipt receipt) throws Exception {
             sent.add(receipt);
+            if (sendBarrier != null) {
+                sendBarrier.countDown();
+                if (!sendBarrier.await(5L, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("concurrent receipt send barrier timeout");
+                }
+            }
             if (failOnce) {
                 failOnce = false;
                 throw new Exception("network unavailable");
