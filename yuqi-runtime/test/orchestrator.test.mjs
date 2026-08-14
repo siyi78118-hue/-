@@ -1098,14 +1098,15 @@ test('v3 direct role-plan confirmation is code-owned, explicit, and ordinal', ()
   assert.doesNotMatch(rendered, /下周一|四点/);
 });
 
-test('v3 role-plan confirmation rejects ambiguous schedule and private or legacy lanes', () => {
+test('v3 role-plan confirmation keeps inferred schedules silent while legacy lanes stay unchanged', () => {
   const inferred = {
     op: 'create', type: 'private_message', source: 'spoken', title: '提醒',
-    schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' }, timeConfidence: 'inferred'
+    intent: '明早问候', schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' },
+    timeConfidence: 'inferred'
   };
-  assert.throws(() => orchestratorModule.requiresUserConfirmation({
+  assert.equal(orchestratorModule.requiresUserConfirmation({
     protocolVersion: 3, kind: 'DIRECT_REPLY', operations: [inferred], targetSnapshots: [null]
-  }), /explicit time confidence|role plan confirmation authority conflict/);
+  }), false);
   for (const kind of ['ROLE_PLAN_CHAT', 'ROLE_PLAN_CHAT_PRIVATE', 'ROLE_PLAN_MOMENT', 'ROLE_PLAN_MOMENT_PRIVATE']) {
     assert.equal(orchestratorModule.requiresUserConfirmation({
       protocolVersion: 3, kind, operations: [inferred], targetSnapshots: [null]
@@ -1331,11 +1332,16 @@ test('canonical role-plan bundle resolves each action once and freezes descripto
   ), /target revision/);
 });
 
-test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one fingerprinted commit', async () => {
-  const operation = {
+test('runCanonicalReleaseTurn confirms explicit operations and silently commits inferred operations', async () => {
+  const explicitOperation = {
     op: 'create', type: 'private_message', source: 'spoken', title: '发稿提醒',
     intent: '明天下午提醒发稿', schedule: { kind: 'once', at: '2026-07-24T15:00:00+08:00' },
     timeConfidence: 'explicit'
+  };
+  const inferredOperation = {
+    op: 'create', type: 'private_message', source: 'spoken', title: '早安',
+    intent: '明早问候', schedule: { kind: 'once', at: '2026-07-25T08:00:00+08:00' },
+    timeConfidence: 'inferred'
   };
   const envelope = {
     protocolVersion: 3,
@@ -1402,7 +1408,12 @@ test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one finge
   };
   orchestrator.releaseExecutor = {
     async executeTurn() {
-      return { draft: { action: 'send', reply: '模型自由回复不应提交', rolePlanOperations: [operation] } };
+      return {
+        draft: {
+          action: 'send', reply: '模型自由回复不应提交',
+          rolePlanOperations: [explicitOperation, inferredOperation]
+        }
+      };
     }
   };
   orchestrator.commitCanonicalVisibleResult = input => {
@@ -1411,11 +1422,15 @@ test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one finge
   };
   const result = await orchestrator.runCanonicalReleaseTurn(turn);
   assert.equal(result.status, 'committed');
-  assert.equal(resolverCalls, 1);
+  assert.equal(resolverCalls, 2);
   assert.equal(committed.visibleGroup.items[0].content,
     '好的，我会在2026年7月24日（周五）15:00提醒你「发稿提醒」。');
+  assert.doesNotMatch(committed.visibleGroup.items[0].content, /早安|08:00/);
+  assert.equal(committed.actionSet.length, 2);
   assert.equal(committed.actionSet[0].kind, 'role_plan_create');
   assert.equal(committed.actionSet[0].payload.op, 'create');
+  assert.equal(committed.actionSet[1].kind, 'role_plan_create');
+  assert.equal(committed.actionSet[1].payload.timeConfidence, 'inferred');
   assert.equal(committed.generationFingerprint, generationFingerprint({
     roleId: turn.characterId,
     laneKey: turn.laneKey,
@@ -1426,7 +1441,7 @@ test('runCanonicalReleaseTurn renders v3 direct role-plan reply before one finge
   }));
 });
 
-test('runCanonicalReleaseTurn preserves a direct reply while dropping an unconfirmed inferred schedule', async () => {
+test('runCanonicalReleaseTurn preserves a direct reply while committing an inferred schedule', async () => {
   const operation = {
     op: 'create', type: 'private_message', source: 'spoken', title: '早安',
     intent: '明天早上发早安', schedule: { kind: 'once', at: '2026-08-15T08:00:00+08:00' },
@@ -1514,9 +1529,12 @@ test('runCanonicalReleaseTurn preserves a direct reply while dropping an unconfi
   const result = await orchestrator.runCanonicalReleaseTurn(turn);
 
   assert.equal(result.status, 'committed');
-  assert.equal(resolverCalls, 0);
+  assert.equal(resolverCalls, 1);
   assert.equal(committed.visibleGroup.items[0].content, '嗯，明天醒了就来找你。晚安。');
-  assert.deepEqual(committed.actionSet, []);
+  assert.equal(committed.actionSet.length, 1);
+  assert.equal(committed.actionSet[0].kind, 'role_plan_create');
+  assert.equal(committed.actionSet[0].payload.timeConfidence, 'inferred');
+  assert.equal(committed.actionSet[0].payload.schedule.at, '2026-08-15T08:00:00+08:00');
 });
 
 test('canonical v3 direct provider receives formal relationship scene plus separate expression sidecar', async () => {

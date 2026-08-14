@@ -347,11 +347,14 @@ function rolePlanOperationNeedsExplicitTime(operation) {
     || (isPlainRolePlanObject(patch) && Object.hasOwn(patch, 'schedule'));
 }
 
-function isUnconfirmedInferredRolePlanOperation(operation) {
+function rolePlanOperationUsesInferredTime(operation) {
   return isPlainRolePlanObject(operation)
-    && ROLE_PLAN_CONFIRMATION_SOURCES.has(operation.source)
     && rolePlanOperationNeedsExplicitTime(operation)
     && operation.timeConfidence === 'inferred';
+}
+
+function rolePlanOperationNeedsVisibleConfirmation(operation) {
+  return !rolePlanOperationUsesInferredTime(operation);
 }
 
 function canonicalRolePlanActionPayload(operation) {
@@ -416,8 +419,8 @@ function validateRolePlanConfirmationOperation(operation, targetSnapshot = null)
     rolePlanConfirmationConflict('operation source is not user-authorized');
   }
   if (rolePlanOperationNeedsExplicitTime(operation)) {
-    if (operation.timeConfidence !== 'explicit') {
-      rolePlanConfirmationConflict('explicit time confidence is required');
+    if (!['explicit', 'inferred'].includes(operation.timeConfidence)) {
+      rolePlanConfirmationConflict('time confidence is invalid');
     }
     const schedule = operation.op === 'create'
       ? operation.schedule
@@ -477,7 +480,7 @@ export function requiresUserConfirmation({
   operations.map((operation, index) =>
     validateRolePlanConfirmationOperation(operation, targetSnapshots[index] ?? null)
   );
-  return true;
+  return operations.some(rolePlanOperationNeedsVisibleConfirmation);
 }
 
 function rolePlanScheduleText(schedule, timeZone) {
@@ -2700,14 +2703,6 @@ export class YuqiOrchestrator {
       };
       const isRolePlanV3Direct = Number(turn.protocolVersion) === 3
         && turn.rolloutKey === 'DIRECT_REPLY';
-      if (isRolePlanV3Direct && draft.rolePlanOperations.some(isUnconfirmedInferredRolePlanOperation)) {
-        draft = {
-          ...draft,
-          rolePlanOperations: draft.rolePlanOperations.filter(
-            operation => !isUnconfirmedInferredRolePlanOperation(operation)
-          )
-        };
-      }
       const isProactiveV3 = Number(turn.protocolVersion) === 3
         && turn.rolloutKey === 'PROACTIVE_CHAT';
       const isMomentV3 = Number(turn.protocolVersion) === 3
@@ -2748,9 +2743,13 @@ export class YuqiOrchestrator {
           targetSnapshots: rolePlanBundle.targetSnapshots
         });
         if (confirmationRequired) {
+          const confirmationEntries = rolePlanBundle.actions.map((action, index) => ({
+            action,
+            targetSnapshot: rolePlanBundle.targetSnapshots[index]
+          })).filter(entry => rolePlanOperationNeedsVisibleConfirmation(entry.action.payload));
           const renderedReply = renderRolePlanConfirmationSet(
-            rolePlanBundle.actions,
-            rolePlanBundle.targetSnapshots,
+            confirmationEntries.map(entry => entry.action),
+            confirmationEntries.map(entry => entry.targetSnapshot),
             'Asia/Shanghai'
           );
           draft = {
