@@ -174,7 +174,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v115';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v116';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -195,7 +195,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.115';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.116';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -2938,6 +2938,48 @@ assert.equal(forcedSchedulePreservesFutureJobsProbe.chatJob.jobId, 'stable-chat-
 assert.equal(forcedSchedulePreservesFutureJobsProbe.chatJob.dueAt, forcedSchedulePreservesFutureJobsProbe.chatDueAt);
 assert.equal(forcedSchedulePreservesFutureJobsProbe.momentJob.jobId, 'stable-moment-job');
 assert.equal(forcedSchedulePreservesFutureJobsProbe.momentJob.dueAt, forcedSchedulePreservesFutureJobsProbe.momentDueAt);
+const successfulCloudVerificationIsReadOnlyProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedFetch = fetch;
+  const savedDbSet = DB.set;
+  const persisted = [];
+  settings = {
+    ...settings,
+    deviceId: 'stable-device',
+    timerEndpoint: 'https://timer.example',
+    cloudTimerLastChatTrace: 'chat-stable|original schedule proof',
+    cloudTimerLastChatTraceAt: 123456789
+  };
+  DB.set = (key, value) => persisted.push({ key, value: JSON.parse(JSON.stringify(value)) });
+  fetch = async () => ({
+    ok: true,
+    json: async () => ({
+      exists: true,
+      bucketHasJob: true,
+      subscriptionExists: true,
+      job: { dueAt: '2026-08-14T14:18:40.088Z' }
+    })
+  });
+  const before = {
+    trace: settings.cloudTimerLastChatTrace,
+    traceAt: settings.cloudTimerLastChatTraceAt
+  };
+  const verified = await verifyCloudJobStatus('stable_role', {
+    jobId: 'stable-chat-job',
+    dueAt: '2026-08-14T14:18:40.088Z'
+  }, 'chat');
+  const after = {
+    trace: settings.cloudTimerLastChatTrace,
+    traceAt: settings.cloudTimerLastChatTraceAt
+  };
+  fetch = savedFetch;
+  DB.set = savedDbSet;
+  settings = savedSettings;
+  return { verified, before, after, persisted };
+})()`, context);
+assert.equal(successfulCloudVerificationIsReadOnlyProbe.verified, true);
+assert.deepEqual(successfulCloudVerificationIsReadOnlyProbe.after, successfulCloudVerificationIsReadOnlyProbe.before, '成功的只读云端核验不得生成新的诊断链路或时间');
+assert.equal(successfulCloudVerificationIsReadOnlyProbe.persisted.length, 0, '成功的只读云端核验不得写设置或触发镜像');
 const promiseVector = localEmbedding('周六晚上语音 承诺 不会消失');
 const similarVector = localEmbedding('你是不是忘了周六语音的约定');
 const differentVector = localEmbedding('今天午饭吃什么');
