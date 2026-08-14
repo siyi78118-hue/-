@@ -147,7 +147,7 @@ assert.match(html, /function abortPendingReply[\s\S]{0,1800}plugin\.cancelTurn\(
 assert.match(html, /function expireStalePendingReply[\s\S]{0,500}pending\.nativeTurnId[\s\S]{0,120}return false/, 'web timeout must not override an authoritative native turn');
 assert.match(html, /async function syncNativeProactiveSnapshot\(/, 'cloud scheduling should persist an immutable native proactive snapshot');
 assert.match(html, /async function scheduleCloudProactive[\s\S]{0,5000}syncNativeProactiveSnapshot\(/, 'native snapshot must exist before a cloud timer is scheduled');
-assert.match(html, /if \(!force && hasFutureCloudJob\(chat, kind\) && proactiveJobUsesCurrentDicePolicy\(kind, currentJob\)\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must receive native snapshots after an app upgrade');
+assert.match(html, /const hasReusableFutureJob = hasFutureCloudJob\(chat, kind\) && proactiveJobUsesCurrentDicePolicy\(kind, currentJob\)[\s\S]{0,300}if \(force\)[\s\S]{0,300}resubmitCloudProactive\(char\.id, kind\)[\s\S]{0,1000}syncNativeProactiveSnapshot\(/, 'existing cloud jobs must keep their job identity while native snapshots are synchronized after an app upgrade');
 assert.match(html, /async function triggerProactiveMessage[\s\S]{0,1400}chatHasPendingDirectReply\(chat\)/, 'foreground proactive chat must not replace a pending direct reply');
 assert.match(html, /await syncFromServiceWorkerState\(\{ checkProactive: false \}\)[\s\S]{0,1400}resumePendingAssistantTurns\(\)[\s\S]{0,300}checkProactiveMessages\(\)/, 'boot must resume direct replies before proactive catch-up');
 assert.doesNotMatch(androidFcmService, /RunnerWorker|BackgroundRunner|pending_push_queue/, 'FCM must wake the Room execution engine directly');
@@ -174,7 +174,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v114';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v115';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -195,7 +195,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.114';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.115';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -2655,6 +2655,33 @@ assert.equal(proactiveConsumptionSingleFlightProbe.callsWhileBlocked, 1, '并发
 assert.equal(proactiveConsumptionSingleFlightProbe.calls, 1, '同一个jobId在同一轮唤醒中只能提交一次');
 assert.equal(proactiveConsumptionSingleFlightProbe.replacementSchedules, 0, '原生任务处理中不得被前台补排覆盖成新的随机时间');
 assert.ok(proactiveConsumptionSingleFlightProbe.processingAt > 0, '到期任务交给原生执行后必须持久标记为处理中');
+const cloudTimerStatusRenderRaceProbe = await vm.runInContext(`(async () => {
+  const savedStatusText = cloudTimerStatusText;
+  const savedLogs = getAllModelCallLogs;
+  const savedFormat = formatModelCallStatus;
+  const savedGetElement = document.getElementById;
+  const statusElement = { textContent: '' };
+  const pending = [];
+  let snapshot = '旧闹钟状态';
+  document.getElementById = id => id === 'cloud-timer-status' ? statusElement : savedGetElement.call(document, id);
+  cloudTimerStatusText = () => snapshot;
+  getAllModelCallLogs = () => new Promise(resolve => pending.push(resolve));
+  formatModelCallStatus = row => row?.label || '';
+  const oldRender = renderCloudTimerStatus();
+  snapshot = '最新闹钟状态';
+  const latestRender = renderCloudTimerStatus();
+  pending[1]([{ label: '最新调用' }]);
+  await latestRender;
+  pending[0]([{ label: '旧调用' }]);
+  await oldRender;
+  const result = statusElement.textContent;
+  cloudTimerStatusText = savedStatusText;
+  getAllModelCallLogs = savedLogs;
+  formatModelCallStatus = savedFormat;
+  document.getElementById = savedGetElement;
+  return result;
+})()`, context);
+assert.equal(cloudTimerStatusRenderRaceProbe, '最新闹钟状态\n最新调用', '较晚完成的旧状态渲染不得覆盖最新闹钟状态');
 const diceScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;
@@ -2863,6 +2890,54 @@ const multiRoleScheduleProbe = await vm.runInContext(`(async () => {
 assert.equal(multiRoleScheduleProbe.calls.sort().join(','), 'role_a:chat,role_a:moment,role_b:chat,role_b:moment', '云端补排必须为每个已有会话分别保留私聊与朋友圈任务');
 assert.equal(multiRoleScheduleProbe.verifies.sort().join(','), 'role_a,role_b', '过期同步标记应逐角色做只读核验');
 assert.equal(multiRoleScheduleProbe.resubmits.length, 0, '云端任务存在时不得重复写入');
+const forcedSchedulePreservesFutureJobsProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedCharacters = characters;
+  const savedChats = allChats;
+  const savedSchedule = scheduleCloudProactive;
+  const savedResubmit = resubmitCloudProactive;
+  const savedSnapshot = syncNativeProactiveSnapshot;
+  const scheduleCalls = [];
+  const resubmitCalls = [];
+  const snapshotCalls = [];
+  const chatDueAt = new Date(Date.now() + 90 * 60000).toISOString();
+  const momentDueAt = new Date(Date.now() + 8 * 60 * 60000).toISOString();
+  settings = { ...settings, proactiveEnabled: true, cloudTimerEnabled: true, timerEndpoint: 'https://timer.example', pushSubscription: { endpoint: 'https://push.example' } };
+  characters = [{ id: 'stable_role', name: '虞栖' }];
+  allChats = {
+    stable_role: {
+      messages: [{ role: 'user', content: '保留已经安排好的未来任务', time: Date.now() }],
+      pendingProactiveJob: { jobId: 'stable-chat-job', dueAt: chatDueAt, kind: 'chat', mode: 'planned' },
+      pendingMomentJob: { jobId: 'stable-moment-job', dueAt: momentDueAt, kind: 'moment', mode: 'dice', diceIntervalMs: 2 * 60 * 60 * 1000, rollChance: 0.20, maxRolls: 12, dicePrecomputed: true }
+    }
+  };
+  scheduleCloudProactive = async (charId, kind) => { scheduleCalls.push(charId + ':' + kind); return true; };
+  resubmitCloudProactive = async (charId, kind) => { resubmitCalls.push(charId + ':' + kind); return true; };
+  syncNativeProactiveSnapshot = async (charId, kind, job) => { snapshotCalls.push(charId + ':' + kind + ':' + job.jobId); return true; };
+  await ensureCloudProactiveScheduled({ force: true });
+  const result = {
+    scheduleCalls,
+    resubmitCalls,
+    snapshotCalls,
+    chatDueAt,
+    momentDueAt,
+    chatJob: { ...allChats.stable_role.pendingProactiveJob },
+    momentJob: { ...allChats.stable_role.pendingMomentJob }
+  };
+  settings = savedSettings;
+  characters = savedCharacters;
+  allChats = savedChats;
+  scheduleCloudProactive = savedSchedule;
+  resubmitCloudProactive = savedResubmit;
+  syncNativeProactiveSnapshot = savedSnapshot;
+  return result;
+})()`, context);
+assert.equal(forcedSchedulePreservesFutureJobsProbe.scheduleCalls.length, 0, '强制同步不得把已有未来任务改成新的随机时间');
+assert.equal(forcedSchedulePreservesFutureJobsProbe.resubmitCalls.sort().join(','), 'stable_role:chat,stable_role:moment', '强制同步必须复用同一jobId重新提交现有任务');
+assert.equal(forcedSchedulePreservesFutureJobsProbe.chatJob.jobId, 'stable-chat-job');
+assert.equal(forcedSchedulePreservesFutureJobsProbe.chatJob.dueAt, forcedSchedulePreservesFutureJobsProbe.chatDueAt);
+assert.equal(forcedSchedulePreservesFutureJobsProbe.momentJob.jobId, 'stable-moment-job');
+assert.equal(forcedSchedulePreservesFutureJobsProbe.momentJob.dueAt, forcedSchedulePreservesFutureJobsProbe.momentDueAt);
 const promiseVector = localEmbedding('周六晚上语音 承诺 不会消失');
 const similarVector = localEmbedding('你是不是忘了周六语音的约定');
 const differentVector = localEmbedding('今天午饭吃什么');
