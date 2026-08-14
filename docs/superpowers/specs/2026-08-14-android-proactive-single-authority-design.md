@@ -52,7 +52,7 @@ Android 持久化任务流的 epoch、generation、当前 job、来源事件和�
 
 必需字段：
 
-- `streamKey`：`{deviceId}:{characterId}:{kind}` 的规范化哈希，主键；
+- `streamKey`：`active:${encodeURIComponent(deviceId)}:${encodeURIComponent(characterId)}:${kind}` 的规范字符串，主键；
 - `authorityEpoch`：安装迁移时生成并持久化的 128-bit 随机标识；
 - `generation`：非负单调整数；
 - `owner`：原生模式固定为 `android-v1`；
@@ -108,7 +108,7 @@ Android 只暴露一个 store-owned `transitionAutomaticSchedule()`。所有调�
 
 任务时间随机计算必须可重放：随机种子来自 `authorityEpoch + streamKey + sourceChecksum + policyRevision`。因此同一来源事件在重启后得到相同 dueAt。显式 `SCHEDULE` 使用模型给出的合法时间；无显式时间时才用该确定性抽样。
 
-job ID 由 `authorityEpoch + streamKey + generation + scheduleChecksum` 确定性派生，不使用当前时间。
+为避免 checksum 与 job ID 循环依赖，派生顺序固定为：先对不含 job ID 的闭合 transition tuple 计算 `transitionChecksum`；再用 `kind + transitionChecksum 前16位 + generation` 派生 job ID；最后对包含 job ID 和 transitionChecksum 的完整 schedule tuple 计算 `scheduleChecksum`。三步都不使用当前时间。
 
 ### 5.1 启用、首次安装与设置变化
 
