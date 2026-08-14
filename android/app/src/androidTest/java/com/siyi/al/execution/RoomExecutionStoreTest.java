@@ -73,6 +73,135 @@ public class RoomExecutionStoreTest {
     }
 
     @Test
+    public void automaticScheduleTransitionIsAtomicReplaySafeAndSequenceGuarded() {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        AutomaticScheduleContract.Policy policy = automaticPolicy();
+        AutomaticScheduleContract.Source bootstrap = automaticSource(
+            "bootstrap", "bootstrap-yuqi-chat", 'b', 0L, 1_000L);
+
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity first = schedules.configure(
+            "yuqi", "chat", "00112233445566778899aabbccddeeff", bootstrap, policy, 1_000L);
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity replay = schedules.configure(
+            "yuqi", "chat", "00112233445566778899aabbccddeeff", bootstrap, policy, 9_999_999L);
+
+        assertEquals(first.generation, replay.generation);
+        assertEquals(first.activeJobId, replay.activeJobId);
+        assertEquals(first.dueAt, replay.dueAt);
+        assertEquals(first.semanticChecksum, replay.semanticChecksum);
+        assertEquals(1L, rowCount("automatic_schedule_authorities"));
+        assertEquals(1L, rowCount("automatic_schedule_outbox"));
+        assertEquals(1L, rowCount("automatic_schedule_events"));
+
+        assertThrows(IllegalStateException.class, () -> schedules.configure(
+            "yuqi", "chat", "00112233445566778899aabbccddeeff",
+            automaticSource("bootstrap", "bootstrap-yuqi-chat", 'c', 0L, 1_000L),
+            policy, 2_000L));
+        assertEquals(1L, rowCount("automatic_schedule_outbox"));
+
+        schedules.pauseForConversationInternal(
+            "yuqi", "chat", "00112233445566778899aabbccddeeff",
+            automaticSource("direct_input", "message-new", 'd', 10L, 2_000L), 2_000L);
+        assertThrows(IllegalStateException.class, () -> schedules.finalizeDirectInternal(
+            "yuqi", "chat", "00112233445566778899aabbccddeeff",
+            automaticSource("direct_terminal", "turn-old", 'e', 9L, 2_100L), policy,
+            AutomaticScheduleContract.TerminalDisposition.VISIBLE, 2_100L));
+        assertEquals(2L, rowCount("automatic_schedule_outbox"));
+    }
+
+    @Test
+    public void automaticScheduleFaultsRollBackAuthorityOutboxAndEventTogether() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        for (AutomaticScheduleContract.Operation operation : AutomaticScheduleContract.Operation.values()) {
+            for (int fault = 1; fault <= 3; fault += 1) {
+                AlExecutionDatabase faultDb = Room.inMemoryDatabaseBuilder(context, AlExecutionDatabase.class)
+                    .allowMainThreadQueries().build();
+                try {
+                    AutomaticScheduleStore baseline = new AutomaticScheduleStore(faultDb, "device_gateway");
+                    if (operation != AutomaticScheduleContract.Operation.SCHEDULE) {
+                        baseline.configure("yuqi", "chat", "00112233445566778899aabbccddeeff",
+                            automaticSource("bootstrap", "baseline-" + operation, 'a', 0L, 1_000L),
+                            automaticPolicy(), 1_000L);
+                    }
+                    long authorities = countRows(faultDb, "automatic_schedule_authorities");
+                    long outbox = countRows(faultDb, "automatic_schedule_outbox");
+                    long events = countRows(faultDb, "automatic_schedule_events");
+                    AutomaticScheduleStore injected = new AutomaticScheduleStore(
+                        faultDb, "device_gateway", fault);
+                    AutomaticScheduleContract.Source source = automaticSource(
+                        operation == AutomaticScheduleContract.Operation.SCHEDULE
+                            ? "bootstrap" : (operation == AutomaticScheduleContract.Operation.PAUSE
+                                ? "direct_input" : "lifecycle"),
+                        "fault-" + operation + "-" + fault, (char) ('b' + fault), 1L, 2_000L);
+                    assertThrows(IllegalStateException.class, () -> injected.transitionAutomaticSchedule(
+                        "yuqi", "chat", "00112233445566778899aabbccddeeff", operation,
+                        source, operation == AutomaticScheduleContract.Operation.SCHEDULE
+                            ? automaticPolicy() : null, 2_000L));
+                    assertEquals(authorities, countRows(faultDb, "automatic_schedule_authorities"));
+                    assertEquals(outbox, countRows(faultDb, "automatic_schedule_outbox"));
+                    assertEquals(events, countRows(faultDb, "automatic_schedule_events"));
+                } finally {
+                    faultDb.close();
+                }
+            }
+        }
+    }
+
+    @Test
+    public void automaticTerminalDispositionsReplayOnceAndSurviveRestart() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "automatic-terminal-restart-" + System.nanoTime();
+        AlExecutionDatabase fileDb = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries().build();
+        try {
+            AutomaticScheduleStore schedules = new AutomaticScheduleStore(fileDb, "device_gateway");
+            String epoch = "00112233445566778899aabbccddeeff";
+            com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity current = schedules.configure(
+                "yuqi", "chat", epoch,
+                automaticSource("bootstrap", "terminal-bootstrap", 'a', 0L, 1_000L),
+                automaticPolicy(), 1_000L);
+            for (AutomaticScheduleContract.TerminalDisposition disposition
+                    : AutomaticScheduleContract.TerminalDisposition.values()) {
+                assertTrue(schedules.claim(current.streamKey, epoch, current.generation,
+                    current.activeJobId, current.updatedAt + 1L));
+                AutomaticScheduleContract.Source terminal = automaticSource(
+                    disposition == AutomaticScheduleContract.TerminalDisposition.FAILED
+                        ? "failure_retry" : "proactive_terminal",
+                    "terminal-" + disposition.name().toLowerCase(java.util.Locale.ROOT),
+                    (char) ('b' + disposition.ordinal()), current.conversationSequence,
+                    current.updatedAt + 2L);
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity next =
+                    schedules.finalizeAutomatic("yuqi", "chat", epoch, current.generation,
+                        current.activeJobId, terminal, automaticPolicy(), disposition,
+                        current.updatedAt + 2L);
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity replay =
+                    schedules.finalizeAutomatic("yuqi", "chat", epoch, current.generation,
+                        current.activeJobId, terminal, automaticPolicy(), disposition,
+                        current.updatedAt + 50_000L);
+                assertEquals(next.semanticChecksum, replay.semanticChecksum);
+                assertEquals(next.activeJobId, replay.activeJobId);
+                current = next;
+            }
+            assertEquals(5L, current.generation);
+        } finally {
+            fileDb.close();
+        }
+
+        AlExecutionDatabase reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, databaseName)
+            .allowMainThreadQueries().build();
+        try {
+            AutomaticScheduleStore.Status status =
+                new AutomaticScheduleStore(reopened, "device_gateway").status("yuqi", "chat");
+            assertNotNull(status);
+            assertEquals(5L, status.generation);
+            assertEquals("scheduled", status.state);
+            assertEquals(5L, countRows(reopened, "automatic_schedule_outbox"));
+        } finally {
+            reopened.close();
+            context.deleteDatabase(databaseName);
+        }
+    }
+
+    @Test
     public void androidRoomBackupHeadIsReadOnlyAndProjectsTheLatestValidatedLifecycle()
         throws Exception {
         JSONObject emptyHead = store.androidRoomBackupHead("yuqi", 100L);
@@ -4605,6 +4734,29 @@ public class RoomExecutionStoreTest {
             base.peerId,
             route,
             relayMessageId);
+    }
+
+    private static AutomaticScheduleContract.Policy automaticPolicy() {
+        return new AutomaticScheduleContract.Policy(
+            1L, repeat('9', 64), "planned", 60_000L, 600_000L, null);
+    }
+
+    private static AutomaticScheduleContract.Source automaticSource(
+        String type, String id, char checksum, long conversationSequence, long occurredAt
+    ) {
+        return new AutomaticScheduleContract.Source(
+            type, id, repeat(checksum, 64), conversationSequence, occurredAt);
+    }
+
+    private static long countRows(AlExecutionDatabase target, String table) {
+        Cursor cursor = target.getOpenHelper().getReadableDatabase().query(
+            "SELECT COUNT(*) FROM " + table);
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.getLong(0);
+        } finally {
+            cursor.close();
+        }
     }
 
     private static String repeat(char value, int length) {
