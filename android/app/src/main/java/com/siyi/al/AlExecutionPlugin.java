@@ -293,6 +293,7 @@ public final class AlExecutionPlugin extends Plugin {
             });
             if (snapshot.jobSnapshot && snapshot.scheduledFor != null && snapshot.automaticTasksEnabled) {
                 AutomaticTaskAlarmScheduler.schedule(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
+                AlExecutionWakeWorker.enqueueAutomatic(getContext(), snapshot.cloudJobId, snapshot.scheduledFor);
             }
             JSObject result = new JSObject();
             result.put("saved", true);

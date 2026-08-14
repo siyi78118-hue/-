@@ -935,6 +935,7 @@ public final class AlExecutionService extends Service {
             persistAutomaticSnapshot(turn, snapshot, kind, jobId, nextRunAt, now);
             if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             AutomaticTaskAlarmScheduler.schedule(this, jobId, nextRunAt);
+            AlExecutionWakeWorker.enqueueAutomatic(this, jobId, nextRunAt);
             if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;
             continued.edit().putBoolean(continuationKey, true).apply();
             if (executionStore.isRoleDeleteTombstoned(turn.characterId)) return;

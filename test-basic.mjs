@@ -48,6 +48,7 @@ const notificationFactoryPath = 'android/app/src/main/java/com/siyi/al/execution
 const retryPolicyPath = 'android/app/src/main/java/com/siyi/al/execution/RetryPolicy.java';
 const bootReceiverPath = 'android/app/src/main/java/com/siyi/al/execution/AlBootReceiver.java';
 const executionPluginPath = 'android/app/src/main/java/com/siyi/al/AlExecutionPlugin.java';
+const executionWakeWorkerPath = 'android/app/src/main/java/com/siyi/al/execution/AlExecutionWakeWorker.java';
 const rolePlanEntityPath = 'android/app/src/main/java/com/siyi/al/execution/db/RolePlanEntity.java';
 const rolePlanHistoryEntityPath = 'android/app/src/main/java/com/siyi/al/execution/db/RolePlanHistoryEntity.java';
 assert.match(androidVariablesGradle, /roomVersion\s*=\s*'2\.8\.4'/);
@@ -69,6 +70,7 @@ const executionService = existsSync(executionServicePath) ? readFileSync(executi
 const notificationFactory = existsSync(notificationFactoryPath) ? readFileSync(notificationFactoryPath, 'utf8') : '';
 const retryPolicy = existsSync(retryPolicyPath) ? readFileSync(retryPolicyPath, 'utf8') : '';
 const executionPlugin = existsSync(executionPluginPath) ? readFileSync(executionPluginPath, 'utf8') : '';
+const executionWakeWorker = existsSync(executionWakeWorkerPath) ? readFileSync(executionWakeWorkerPath, 'utf8') : '';
 assert.match(executionDao, /@Transaction[\s\S]*commitReply/);
 assert.match(executionStore, /activeAttemptId[\s\S]*StaleAttemptException/);
 assert.match(executionStore, /startRetry\(String turnId/);
@@ -153,6 +155,9 @@ assert.match(androidFcmService, /latestSnapshot\(/);
 assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'FCM must reject a cloud job replaced by a newer snapshot');
 assert.match(androidFcmService, /submitTurn\(/);
 assert.match(androidFcmService, /AlExecutionWakeWorker\.enqueue\(/, 'FCM must extend execution through expedited WorkManager');
+assert.match(executionPlugin, /AutomaticTaskAlarmScheduler\.schedule[\s\S]{0,300}AlExecutionWakeWorker\.enqueueAutomatic/, 'saved proactive jobs must register two independent local wake paths');
+assert.match(executionService, /AutomaticTaskAlarmScheduler\.schedule\(this, jobId, nextRunAt\)[\s\S]{0,180}AlExecutionWakeWorker\.enqueueAutomatic\(this, jobId, nextRunAt\)/, 'native continuations must retain both local wake paths');
+assert.match(executionWakeWorker, /public static void enqueueAutomatic\(Context context, String jobId, long scheduledFor\)/, 'automatic jobs need a durable job-specific WorkManager fallback');
 assert.match(androidFcmService, /matchesSnapshotJob\(snapshot,\s*jobId\)/, 'stale role-plan cloud wakes must be rejected after a plan is rescheduled');
 assert.match(html, /async function reconcileNativeExecutionTurns[\s\S]{0,2500}plugin\.changesSince\(/, 'web UI must consume Room changes created while WebView was absent');
 assert.match(retryPolicy, /SocketException[\s\S]*NETWORK_INTERRUPTED[\s\S]*true/, 'native execution must retain retryable connection interruptions');
@@ -169,7 +174,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v111';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v112';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -190,7 +195,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.111';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-08-14\.112';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -431,6 +436,8 @@ assert.match(script, /忽略已被新任务替换的旧推送，避免计划追�
 assert.match(swScript, /忽略阶段不匹配的/);
 assert.match(script, /<al_schedule>\{"nextProactiveAt":"YYYY-MM-DDTHH:mm:ss\+08:00"\}<\/al_schedule>/);
 assert.match(script, /async function schedulePlannedChatFromReply\(charId, directive = null\)/);
+assert.match(script, /async function reanchorProactiveAfterUserCommit\(charId\)/, 'a committed user message must create a fallback follow-up before reply success');
+assert.match(script, /async function finishStagedBatch[\s\S]{0,2200}reanchorProactiveAfterUserCommit\(charId\)/, 'direct user batches must not leave proactive recovery dependent on a successful reply');
 assert.match(script, /async function scheduleDiceProactive\(charId, kind = 'chat'\)/);
 assert.match(script, /async function enterProactiveDiceMode\(charId, kind = 'chat'\)/);
 assert.match(script, /return scheduleDiceProactive\(charId, kind\);/);
@@ -694,7 +701,7 @@ const runDueJobsSource = cloudTimerWorkerCode.slice(
   cloudTimerWorkerCode.indexOf('async function getLastCron')
 );
 assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-07-17\.18';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-08-14\.1';/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
@@ -759,7 +766,7 @@ assert.match(wranglerRunScript, /resolveWranglerInvocation/);
 assert.match(wranglerInvocationScript, /node_modules.*wrangler.*bin.*wrangler\.js/s);
 assert.match(wranglerInvocationScript, /shell: false/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-07-17\.18'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-08-14\.1'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);
@@ -2618,6 +2625,19 @@ assert.notEqual(nativeDirectScheduleProbe.fallback.jobId, 'old-dice-job');
 assert.ok(Date.parse(nativeDirectScheduleProbe.fallback.dueAt) >= nativeDirectScheduleProbe.startedAt + 29 * 60000);
 assert.equal(nativeDirectScheduleProbe.explicit.mode, 'planned');
 assert.equal(nativeDirectScheduleProbe.explicit.dueAt, nativeDirectScheduleProbe.explicitDueAt);
+const committedUserFallbackProbe = await vm.runInContext(`(async () => {
+  const savedSettings = settings;
+  const savedChats = allChats;
+  settings = { ...settings, proactiveEnabled: true, cloudTimerEnabled: false, deviceId: 'user-commit-device', proactiveIdleMinutes: 30 };
+  allChats = { user_commit_char: { messages: [{ role: 'user', content: '这条消息的回复即使失败也要保留追发', time: Date.now() }], pendingProactiveJob: { jobId: 'stale-dice', dueAt: new Date(Date.now() + 600000).toISOString(), kind: 'chat', mode: 'dice' } } };
+  await reanchorProactiveAfterUserCommit('user_commit_char');
+  const result = { ...allChats.user_commit_char.pendingProactiveJob };
+  settings = savedSettings;
+  allChats = savedChats;
+  return result;
+})()`, context);
+assert.equal(committedUserFallbackProbe.mode, 'planned');
+assert.notEqual(committedUserFallbackProbe.jobId, 'stale-dice');
 const momentDiceScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;

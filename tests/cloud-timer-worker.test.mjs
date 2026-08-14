@@ -52,8 +52,8 @@ class MemoryTimerStore {
   }
   async dueJobs(now, limit = 100) {
     return [...this.jobs.values()]
-      .filter(row => Date.parse(row.dueAt) <= now)
-      .sort((left, right) => Date.parse(left.dueAt) - Date.parse(right.dueAt))
+      .filter(row => Date.parse(row.nextDeliveryAttemptAt || row.dueAt) <= now)
+      .sort((left, right) => Date.parse(left.nextDeliveryAttemptAt || left.dueAt) - Date.parse(right.nextDeliveryAttemptAt || right.dueAt))
       .slice(0, limit);
   }
   async deviceJobs(deviceId) {
@@ -115,7 +115,8 @@ test('a transient push failure migrates the job into a future retry bucket', asy
   await runCron(env);
 
   const stored = await env.AL_TIMER_STORE.getJob('retry-job');
-  assert.ok(Date.parse(stored.dueAt) > Date.now(), 'retry must have a new future dueAt');
+  assert.equal(stored.dueAt, dueAt, 'transport retry must not rewrite the role\'s scheduled time');
+  assert.ok(Date.parse(stored.nextDeliveryAttemptAt) > Date.now(), 'retry must have a separate future transport deadline');
   assert.equal(Number(stored.deliveryAttempts), 1);
   assert.deepEqual(await env.AL_TIMER_STORE.dueJobs(Date.now()), [], 'retried job must leave the due query');
 });
@@ -129,6 +130,11 @@ test('an accepted FCM push stays pending until the matching phone acknowledges i
   const waiting = await env.AL_TIMER_STORE.getJob('ack-job');
   assert.equal(waiting.awaitingAck, true);
   assert.equal(waiting.deliveryAttempts, 1);
+  assert.equal(waiting.dueAt, dueAt, 'ACK wait must preserve the original proactive deadline');
+  assert.ok(Date.parse(waiting.nextDeliveryAttemptAt) > Date.now());
+  const status = await (await post(env, '/job-status', { deviceId: 'device-a', jobId: 'ack-job' })).json();
+  assert.equal(status.job.dueAt, dueAt);
+  assert.equal(status.job.nextDeliveryAttemptAt, waiting.nextDeliveryAttemptAt);
   const wrong = await post(env, '/ack', { deviceId: 'device-b', jobId: 'ack-job', outcome: 'generated' });
   assert.equal(wrong.status, 400);
   assert.ok(await env.AL_TIMER_STORE.getJob('ack-job'));

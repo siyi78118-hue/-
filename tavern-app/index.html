@@ -1407,14 +1407,14 @@ const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
 const NATIVE_BRIDGE_TIMEOUT_MS = 8000;
 const NATIVE_RECONCILE_TIMEOUT_MS = 12000;
 const NATIVE_TURN_APPLY_TIMEOUT_MS = 10000;
-const APP_BUILD_VERSION = '2026-08-14.111';
+const APP_BUILD_VERSION = '2026-08-14.112';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
   'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
   'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@update-channel/android-update.json'
 ];
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-07-17.18';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-08-14.1';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -10311,7 +10311,7 @@ async function finishStagedBatch(charId = currentCharId) {
     updatedAt: Date.now()
   };
   sourceMessage.replyState = 'pending';
-  cancelCloudProactive(charId, 'chat');
+  reanchorProactiveAfterUserCommit(charId).catch(err => console.warn('[AL Timer] committed user fallback skipped:', err.message));
   DB.set('chats', allChats);
   refreshFinishBatchButton();
   if (activeScreen === 'chat' && currentCharId === charId) renderMessages();
@@ -10399,11 +10399,11 @@ async function sendVoicePlaceholderMessage(duration = 2 + Math.floor(Math.random
   closeComposerPanels();
   const actualDuration = Math.max(1, Math.min(60, Number(duration) || 4));
   const content = `[语音消息 ${actualDuration}秒，未转文字]`;
-  cancelCloudProactive(requestCharId, 'chat');
   const message = createPendingUserMessage(chat, content, {
     type: 'voice', voiceDuration: actualDuration, provisionalNativeOnly: true
   });
   DB.set('chats', allChats);
+  reanchorProactiveAfterUserCommit(requestCharId).catch(err => console.warn('[AL Timer] voice fallback schedule skipped:', err.message));
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (reason) toast(reason, 2200);
   const voicePrompt = `${playerName()}发来一条 ${actualDuration} 秒语音，但没有提供转文字内容。${charName(characters.find(c => c.id === requestCharId))}只能回应“收到语音”这个事实，不能编造语音里的具体内容。`;
@@ -10426,11 +10426,11 @@ async function sendVoiceTranscriptMessage(transcript, duration) {
   const chat = allChats[requestCharId];
   if (!chat) return;
   closeComposerPanels();
-  cancelCloudProactive(requestCharId, 'chat');
   const message = createPendingUserMessage(chat, text, {
     type: 'voice', transcript: text, voiceDuration: duration, provisionalNativeOnly: true
   });
   DB.set('chats', allChats);
+  reanchorProactiveAfterUserCommit(requestCharId).catch(err => console.warn('[AL Timer] voice fallback schedule skipped:', err.message));
   if (activeScreen === 'chat' && currentCharId === requestCharId) renderMessages({ forceBottom: true });
   if (isNativeApp()) return queueAndroidUserReply(requestCharId, message.id, {});
   await continueAssistantTurn(requestCharId, text, { userMessageId: message.id });
@@ -11427,6 +11427,9 @@ async function clearAllAutomaticTasks() {
 async function schedulePlannedChatFromReply(charId, directive = null) {
   const dueAt = directive?.dueAt || new Date(Date.now() + proactiveDelayMs('chat'));
   return scheduleCloudProactive(charId, 'chat', { mode: 'planned', dueAt });
+}
+async function reanchorProactiveAfterUserCommit(charId) {
+  return schedulePlannedChatFromReply(charId, null);
 }
 async function rescheduleAfterNativeDirectReply(charId, schedulePart = null) {
   const at = schedulePart

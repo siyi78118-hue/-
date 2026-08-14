@@ -36,8 +36,8 @@ class MemoryTimerStore {
   }
   async deleteJob(jobId) { return this.jobs.delete(jobId); }
   async dueJobs(now, limit = 100) {
-    return [...this.jobs.values()].filter(row => Date.parse(row.dueAt) <= now)
-      .sort((a, b) => Date.parse(a.dueAt) - Date.parse(b.dueAt)).slice(0, limit);
+    return [...this.jobs.values()].filter(row => Date.parse(row.nextDeliveryAttemptAt || row.dueAt) <= now)
+      .sort((a, b) => Date.parse(a.nextDeliveryAttemptAt || a.dueAt) - Date.parse(b.nextDeliveryAttemptAt || b.dueAt)).slice(0, limit);
   }
   async deviceJobs(deviceId) { return [...this.jobs.values()].filter(row => row.deviceId === deviceId); }
 }

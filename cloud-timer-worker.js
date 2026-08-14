@@ -12,7 +12,7 @@
 // Cron trigger: every 1 minute.
 //
 // This worker stores only timer metadata and push subscriptions:
-// { deviceId, jobId, charId, dueAt, type, planId, occurrenceId, source }. It does not store chat, memory,
+// { deviceId, jobId, charId, dueAt, nextDeliveryAttemptAt, type, planId, occurrenceId, source }. It does not store chat, memory,
 // role prompts, summaries, or API keys.
 //
 // Timer rows live in D1. Cron queries the indexed due_at column directly; no
@@ -23,7 +23,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Yuqi-Registration'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-07-17.18';
+const CLOUD_TIMER_WORKER_VERSION = '2026-08-14.1';
 const FCM_ACK_MAX_ATTEMPTS = 8;
 let lastCronSummary = null;
 
@@ -281,7 +281,8 @@ function createD1TimerStore(db) {
          due_at, payload_json, delivery_attempts, awaiting_ack, test, updated_at)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`)
         .bind(job.jobId, logicalKey, job.deviceId, job.charId || '', job.type || 'proactive', job.kind || 'chat',
-          job.planId || null, job.occurrenceId || null, job.source || null, Date.parse(job.dueAt), JSON.stringify(job),
+          job.planId || null, job.occurrenceId || null, job.source || null,
+          Date.parse(job.nextDeliveryAttemptAt || job.dueAt), JSON.stringify(job),
           Number(job.deliveryAttempts || 0), job.awaitingAck ? 1 : 0, job.test ? 1 : 0, Number(job.updatedAt || Date.now())).run();
       return { idempotent: false, replacedJobId: active?.jobId && active.jobId !== job.jobId ? active.jobId : '' };
     },
@@ -376,7 +377,7 @@ async function cancelDeviceAutomaticTasks(deviceId, env) {
 async function jobStatus(jobId, deviceId, env) {
   const store = timerStore(env);
   const job = await store.getJob(jobId);
-  const dueAtMs = Date.parse(job?.dueAt || '');
+  const dueAtMs = Date.parse(job?.nextDeliveryAttemptAt || job?.dueAt || '');
   const dueMinute = Number.isFinite(dueAtMs) ? minuteKey(dueAtMs) : null;
   const bucketHasJob = !!job;
   const subDeviceId = deviceId || job?.deviceId || '';
@@ -392,6 +393,7 @@ async function jobStatus(jobId, deviceId, env) {
     job: job ? {
       charId: job.charId || '',
       dueAt: job.dueAt || '',
+      nextDeliveryAttemptAt: job.nextDeliveryAttemptAt || '',
       kind: job.kind || '',
       mode: job.mode || '',
       rollChance: job.rollChance,
@@ -422,7 +424,7 @@ async function deferForFcmAck(job, env) {
   const delayMinutes = Math.min(60, 5 * Math.pow(2, Math.min(4, attempts - 1)));
   await saveJob({
     ...job,
-    dueAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
+    nextDeliveryAttemptAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
     deliveryAttempts: attempts,
     awaitingAck: true,
     lastPushedAt: Date.now(),
@@ -450,7 +452,7 @@ async function deferForDeliveryRetry(job, env, reason = '') {
   const delayMinutes = Math.min(30, 2 * Math.pow(2, Math.min(4, attempts - 1)));
   await saveJob({
     ...job,
-    dueAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
+    nextDeliveryAttemptAt: new Date(Date.now() + delayMinutes * 60000).toISOString(),
     deliveryAttempts: attempts,
     awaitingAck: false,
     lastDeliveryError: String(reason || '').slice(0, 160),

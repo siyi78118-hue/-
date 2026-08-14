@@ -81,6 +81,15 @@ public final class AlExecutionWakeWorker extends Worker {
         enqueue(context, 0, input);
     }
 
+    public static void enqueueAutomatic(Context context, String jobId, long scheduledFor) {
+        String safeJobId = jobId == null ? "" : jobId.trim();
+        if (safeJobId.isEmpty()) return;
+        long remainingMs = Math.max(0L, scheduledFor - System.currentTimeMillis());
+        long delaySeconds = remainingMs == 0L ? 0L : Math.max(1L, (remainingMs + 999L) / 1000L);
+        Data input = new Data.Builder().putString("automaticJobId", safeJobId).build();
+        enqueueInternal(context, delaySeconds, input, WORK_NAME + "-automatic-" + safeJobId);
+    }
+
     public static void enqueueLifecycle(Context context, long delaySeconds) {
         enqueueInternal(context, delaySeconds, null, LIFECYCLE_WORK_NAME);
     }
