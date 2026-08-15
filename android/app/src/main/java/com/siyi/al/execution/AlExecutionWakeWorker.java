@@ -24,6 +24,8 @@ public final class AlExecutionWakeWorker extends Worker {
     private static final String LIFECYCLE_WORK_NAME = "al-execution-lifecycle-wake";
     private static final String LIFECYCLE_PREARM_WORK_NAME = "al-execution-lifecycle-prearm";
     private static final String AUTOMATIC_SCHEDULE_SYNC_WORK_NAME = "al-execution-automatic-schedule-sync";
+    private static final int MAX_REMOTE_RECONCILE_RETRIES = 3;
+    private static final int MAX_WORK_ATTEMPTS = 3;
 
     public AlExecutionWakeWorker(@NonNull Context context, @NonNull WorkerParameters params) {
         super(context, params);
@@ -63,6 +65,13 @@ public final class AlExecutionWakeWorker extends Worker {
                     // WorkManager will retry the wake worker; the Room row remains authoritative.
                 }
             }
+            ExecutionRuntime.ReconcileResult reconciliation =
+                ExecutionRuntime.reconcileRemotePausedSchedulesResult(getApplicationContext());
+            if (reconciliation.shouldRetry()) {
+                if (getRunAttemptCount() < MAX_REMOTE_RECONCILE_RETRIES) return Result.retry();
+                enqueueAutomaticScheduleSync(getApplicationContext(), 15L * 60L);
+                return Result.success();
+            }
             try {
                 ExecutionRuntime.drainAutomaticScheduleOutbox(getApplicationContext());
             } finally {
@@ -75,7 +84,8 @@ public final class AlExecutionWakeWorker extends Worker {
             );
             return Result.success();
         } catch (RuntimeException error) {
-            return Result.retry();
+            return getRunAttemptCount() + 1 < MAX_WORK_ATTEMPTS
+                ? Result.retry() : Result.failure();
         }
     }
 
@@ -115,7 +125,7 @@ public final class AlExecutionWakeWorker extends Worker {
             .putLong("automaticGeneration", token.generation)
             .putLong("automaticScheduledFor", scheduledFor)
             .build();
-        enqueueInternal(context, delaySeconds, input, automaticWorkName(token.jobId));
+        enqueueInternal(context, delaySeconds, input, automaticWorkName(token.jobId), automaticReplayWorkPolicy());
     }
 
     public static void cancelAutomatic(Context context, String jobId) {
@@ -131,6 +141,12 @@ public final class AlExecutionWakeWorker extends Worker {
 
     public static void enqueueAutomaticScheduleSync(Context context, long delaySeconds) {
         enqueueInternal(context, delaySeconds, null, AUTOMATIC_SCHEDULE_SYNC_WORK_NAME);
+    }
+
+    /** Wake the Room-owned remote paused reconciliation with an idempotent KEEP work item. */
+    public static void enqueueAutomaticScheduleReconcile(Context context) {
+        enqueueInternal(context, 0L, null, AUTOMATIC_SCHEDULE_SYNC_WORK_NAME,
+            ExistingWorkPolicy.KEEP);
     }
 
     /**
@@ -157,6 +173,12 @@ public final class AlExecutionWakeWorker extends Worker {
     }
 
     private static Operation enqueueInternal(Context context, long delaySeconds, Data input, String uniqueName) {
+        return enqueueInternal(context, delaySeconds, input, uniqueName, ExistingWorkPolicy.REPLACE);
+    }
+
+    private static Operation enqueueInternal(
+        Context context, long delaySeconds, Data input, String uniqueName, ExistingWorkPolicy policy
+    ) {
         Constraints constraints = new Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build();
@@ -170,10 +192,12 @@ public final class AlExecutionWakeWorker extends Worker {
         if (delaySeconds > 0) builder.setInitialDelay(delaySeconds, TimeUnit.SECONDS);
         return WorkManager.getInstance(context.getApplicationContext()).enqueueUniqueWork(
             uniqueName,
-            ExistingWorkPolicy.REPLACE,
+            policy,
             builder.build()
         );
     }
+
+    static ExistingWorkPolicy automaticReplayWorkPolicy() { return ExistingWorkPolicy.KEEP; }
 
     private static String automaticWorkName(String jobId) {
         return WORK_NAME + "-automatic-" + jobId;

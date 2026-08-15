@@ -1,4 +1,4 @@
-const EXPECTED_VERSION = '2026-08-15.9';
+const EXPECTED_VERSION = '2026-08-15.11';
 const DEFAULT_TIMEOUT_MS = 20000;
 
 function normalizeEndpoint(value = '') {

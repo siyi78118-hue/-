@@ -67,4 +67,45 @@ public class AlFirebaseMessagingServiceTest {
         data.put("test", "false");
         assertFalse(AlFirebaseMessagingService.isManualCloudTimerTest(data));
     }
+
+    @Test
+    public void replayWakesExecutionButDoesNotNotifyAgain() {
+        assertTrue(AlFirebaseMessagingService.shouldWake(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.REPLAY));
+        assertFalse(AlFirebaseMessagingService.shouldNotify(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.REPLAY));
+        assertEquals("push_replay_wake", AlFirebaseMessagingService.automaticDeliveryStage(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.REPLAY));
+    }
+
+    @Test
+    public void staleAndClaimedHaveDistinctMetadataStages() {
+        assertFalse(AlFirebaseMessagingService.shouldWake(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.STALE));
+        assertFalse(AlFirebaseMessagingService.shouldNotify(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.STALE));
+        assertEquals("push_stale_resync", AlFirebaseMessagingService.automaticDeliveryStage(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.STALE));
+        assertTrue(AlFirebaseMessagingService.shouldWake(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.CLAIMED));
+        assertTrue(AlFirebaseMessagingService.shouldNotify(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.CLAIMED));
+        assertEquals("push_claimed", AlFirebaseMessagingService.automaticDeliveryStage(
+            com.siyi.al.execution.AutomaticTaskCoordinator.DispatchOutcome.CLAIMED));
+    }
+
+    @Test
+    public void invalidTokenIdentityIsBoundedAndNeverCarriesEpoch() {
+        HashMap<String, String> data = new HashMap<>();
+        data.put("charId", "yuqi");
+        data.put("kind", "chat");
+        data.put("jobId", "pro_1234567890abcdef_7");
+        data.put("authorityEpoch", "not-a-lowercase-epoch");
+        com.siyi.al.execution.AutomaticTaskCoordinator.SafeClaimIdentity identity =
+            com.siyi.al.execution.AutomaticTaskCoordinator.ClaimToken.safeIdentity(data);
+        assertEquals("yuqi", identity.characterId);
+        assertEquals("chat", identity.kind);
+        assertEquals("pro_1234567890abcdef_7", identity.jobId);
+        assertFalse(identity.hasAuthorityEpoch);
+    }
 }

@@ -174,7 +174,7 @@ assert.ok(
 );
 assert.match(html, /sourceTurnId/, 'native proactive results must carry a durable dedupe key');
 assert.match(script, /function nativeTurnHasUiLanding[\s\S]{0,900}ROLE_PLAN_MOMENT[\s\S]{0,500}ROLE_PLAN_CHAT/, 'role-plan results must be acknowledged after their chat or moment reaches the UI');
-assert.match(swScript, /const CACHE_NAME = 'rpchat-v119';/);
+assert.match(swScript, /const CACHE_NAME = 'rpchat-v120';/);
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/api-endpoint\.js[^\]]*\]/);
 assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'role plan domain must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
@@ -195,7 +195,7 @@ assert.match(script, /async function mutateRolePlanFromUi\(/, 'users must be abl
 assert.match(script, /async function createRolePlanFromUi\(/, 'users must be able to add an explicit plan without asking the character');
 assert.match(script, /const MEMORY_DB_VERSION = 2;/);
 assert.match(swScript, /const MEMORY_DB_VERSION = 2;/);
-assert.match(script, /const APP_BUILD_VERSION = '2026-08-15\.119';/);
+assert.match(script, /const APP_BUILD_VERSION = '2026-08-15\.120';/);
 assert.match(html, /id="set-chat-temperature-enabled"/, 'settings must expose a chat temperature parameter switch');
 assert.match(html, /id="set-memory-temperature-enabled"/, 'settings must expose a memory temperature parameter switch');
 assert.match(html, /id="native-notification-status-row"/, 'native settings must expose notification status');
@@ -709,7 +709,7 @@ const runDueJobsSource = cloudTimerWorkerCode.slice(
   cloudTimerWorkerCode.indexOf('async function getLastCron')
 );
 assert.doesNotMatch(runDueJobsSource, /\.list\s*\(/, 'cron path must not scan KV');
-assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-08-15\.9';/);
+assert.match(cloudTimerWorker, /const CLOUD_TIMER_WORKER_VERSION = '2026-08-15\.11';/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/cancel-device-tasks'/);
 assert.match(cloudTimerWorker, /async function sendFcmPush/);
 assert.match(cloudTimerWorker, /url\.pathname === '\/ack'/);
@@ -774,7 +774,7 @@ assert.match(wranglerRunScript, /resolveWranglerInvocation/);
 assert.match(wranglerInvocationScript, /node_modules.*wrangler.*bin.*wrangler\.js/s);
 assert.match(wranglerInvocationScript, /shell: false/);
 assert.match(cloudTimerDeployScript, /scripts\/check-cloud-timer\.mjs/);
-assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-08-15\.9'/);
+assert.match(cloudTimerHealthScript, /EXPECTED_VERSION = '2026-08-15\.11'/);
 assert.match(cloudTimerHealthScript, /Cron: ok=/);
 assert.match(cloudTimerDeployDoc, /CLOUDFLARE_API_TOKEN/);
 assert.match(cloudTimerDeployDoc, /npm run cloud:deploy/);
@@ -1247,9 +1247,11 @@ const nativeScheduleReadOnlyProbe = await vm.runInContext(`(async () => {
               characterId, kind, owner: 'android-v1', epochFingerprint: 'a1b2c3d4',
               generation: 7, state: 'scheduled', jobId: kind === 'moment' ? 'mom_native_7' : 'pro_native_7',
               dueAt: 1786728600000, cloudSyncState: 'synced',
-              lastChangeSource: 'proactive_terminal', lastChangedAt: 1786720000000
+              lastChangeSource: 'proactive_terminal', lastChangedAt: 1786720000000,
+              lastDeliveryStage: 'push_replay_wake', lastDeliveryAt: 1786720001000
             };
           },
+          reconcileAutomaticSchedules: async () => ({ requeued: 0 }),
           configureAutomaticSchedule: async () => { configureCalls += 1; throw new Error('unexpected configure'); },
           migrateLegacyAutomaticScheduleCandidate: async () => { migrateCalls += 1; throw new Error('unexpected migrate'); }
         }
@@ -2778,12 +2780,14 @@ const cloudTimerStatusSummaryProbe = vm.runInContext(`(() => {
     nativeAutomaticScheduleStatuses.set('status-role:chat', {
       characterId: 'status-role', kind: 'chat', owner: 'android-v1', epochFingerprint: 'epoch1234',
       generation: 8, state: 'scheduled', jobId: 'chat_current_8', dueAt: 1786762800000,
-      cloudSyncState: 'synced', lastChangeSource: 'proactive_terminal', lastChangedAt: 1786758000000
+      cloudSyncState: 'synced', lastChangeSource: 'proactive_terminal', lastChangedAt: 1786758000000,
+      lastDeliveryStage: 'push_claimed', lastDeliveryAt: 1786758001000
     });
     nativeAutomaticScheduleStatuses.set('status-role:moment', {
       characterId: 'status-role', kind: 'moment', owner: 'android-v1', epochFingerprint: 'epoch1234',
       generation: 9, state: 'scheduled', jobId: 'moment_current_9', dueAt: 1786766400000,
-      cloudSyncState: 'pending', lastChangeSource: 'migration_claim', lastChangedAt: 1786758060000
+      cloudSyncState: 'pending', lastChangeSource: 'migration_claim', lastChangedAt: 1786758060000,
+      lastDeliveryStage: '', lastDeliveryAt: 0
     });
     const summary = cloudTimerStatusText();
     const diagnostic = typeof cloudTimerDiagnosticText === 'function' ? cloudTimerDiagnosticText() : '';
@@ -2803,7 +2807,8 @@ assert.match(cloudTimerStatusSummaryProbe.summary, /下次私聊（虞栖）：/
 assert.match(cloudTimerStatusSummaryProbe.summary, /下次朋友圈（虞栖）：/);
 assert.match(cloudTimerStatusSummaryProbe.summary, /同步：朋友圈等待云端/);
 assert.doesNotMatch(cloudTimerStatusSummaryProbe.summary, /任务代数|chat_current_8|私聊上次失败|<!doctype|最近调用|云闹钟版本|聊天接口检测/);
-assert.match(cloudTimerStatusSummaryProbe.diagnostic, /私聊任务代数：epoch1234\/8｜chat_current_8/);
+assert.match(cloudTimerStatusSummaryProbe.diagnostic, /当前计划·私聊（虞栖）：/);
+assert.doesNotMatch(cloudTimerStatusSummaryProbe.diagnostic, /任务代数|epoch1234|chat_current_8|status/);
 assert.match(cloudTimerStatusSummaryProbe.diagnostic, /<!doctype html>/);
 assert.match(cloudTimerStatusSummaryProbe.diagnostic, /云闹钟版本/);
 const cloudTimerStatusRenderRaceProbe = await vm.runInContext(`(async () => {

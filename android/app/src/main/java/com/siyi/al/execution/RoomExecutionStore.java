@@ -4,6 +4,8 @@ import androidx.annotation.NonNull;
 import com.siyi.al.execution.db.AlExecutionDao;
 import com.siyi.al.execution.db.AlExecutionDatabase;
 import com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity;
+import com.siyi.al.execution.db.AutomaticScheduleEventEntity;
+import com.siyi.al.execution.db.AutomaticScheduleOutboxEntity;
 import com.siyi.al.execution.db.ChangeEventEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ConversationAuthorityEntity;
@@ -95,6 +97,7 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     private final AlExecutionDao dao;
     private final TerminalFaultHook terminalFaultHook;
     private final String storeOwnedPeerId;
+    private final int automaticScheduleFaultAfterWrite;
     /**
      * Process-local role boundary.  The retained lifecycle tombstone remains
      * the durable authority across process death; this monitor closes the
@@ -141,15 +144,15 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         "android-role-notification-cancellation-v1";
 
     public RoomExecutionStore(AlExecutionDatabase database) {
-        this(database, null, boundary -> {});
+        this(database, null, boundary -> {}, 0);
     }
 
     RoomExecutionStore(AlExecutionDatabase database, TerminalFaultHook terminalFaultHook) {
-        this(database, null, terminalFaultHook);
+        this(database, null, terminalFaultHook, 0);
     }
 
     public RoomExecutionStore(AlExecutionDatabase database, String storeOwnedPeerId) {
-        this(database, storeOwnedPeerId, boundary -> {});
+        this(database, storeOwnedPeerId, boundary -> {}, 0);
     }
 
     RoomExecutionStore(
@@ -157,9 +160,19 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         String storeOwnedPeerId,
         TerminalFaultHook terminalFaultHook
     ) {
+        this(database, storeOwnedPeerId, terminalFaultHook, 0);
+    }
+
+    RoomExecutionStore(
+        AlExecutionDatabase database,
+        String storeOwnedPeerId,
+        TerminalFaultHook terminalFaultHook,
+        int automaticScheduleFaultAfterWrite
+    ) {
         this.database = database;
         this.dao = database.executionDao();
         this.terminalFaultHook = terminalFaultHook;
+        this.automaticScheduleFaultAfterWrite = automaticScheduleFaultAfterWrite;
         this.storeOwnedPeerId = storeOwnedPeerId == null ? null : storeOwnedPeerId.trim();
         validatePersistedLifecycleControls();
         validatePersistedLifecycleInboundAckTombstones();
@@ -359,6 +372,9 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
         AtomicReference<AutomaticTaskCoordinator.DispatchOutcome> result =
             new AtomicReference<>(AutomaticTaskCoordinator.DispatchOutcome.STALE);
         database.runInTransaction(() -> {
+            // Re-read the durable tombstone inside the same transaction as the
+            // authority CAS. The coordinator gate is only an optimization.
+            if (isRoleDeleteTombstoned(token.characterId)) return;
             AutomaticScheduleAuthorityEntity authority =
                 dao.automaticScheduleAuthorityForCharacterKind(token.characterId, token.kind);
             if (!matchesAutomaticClaim(authority, token) || authority.dueAt == null
@@ -378,10 +394,14 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 return;
             }
             if (!"scheduled".equals(authority.state)
+                || isRoleDeleteTombstoned(token.characterId)
                 || dao.claimAutomaticScheduleAuthorityExact(
                     authority.streamKey, token.authorityEpoch, token.generation,
                     token.jobId, now) != 1) {
                 return;
+            }
+            if (isRoleDeleteTombstoned(token.characterId)) {
+                throw new IllegalStateException("automatic claim tombstone race");
             }
             if (existing != null) {
                 if (!exactAutomaticTurn(existing, token)) {
@@ -408,6 +428,247 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             result.set(AutomaticTaskCoordinator.DispatchOutcome.CLAIMED);
         });
         return result.get();
+    }
+
+    /**
+     * Persist one bounded metadata-only FCM delivery stage for the current
+     * Room authority. The deterministic event id makes duplicate pushes
+     * idempotent and never stores epoch, payload, prompt or message text.
+     */
+    public boolean recordAutomaticDeliveryOutcome(
+        AutomaticTaskCoordinator.ClaimToken token, String stage, long now
+    ) {
+        if (token == null) return false;
+        return recordAutomaticDeliveryOutcomeInternal(
+            token.characterId, token.kind, token.jobId, token.generation, stage, now);
+    }
+
+    /** Same metadata-only path for a safely identifiable malformed token. */
+    public boolean recordAutomaticDeliveryOutcome(
+        AutomaticTaskCoordinator.SafeClaimIdentity identity, String stage, long now
+    ) {
+        if (identity == null || identity.characterId.isEmpty() || identity.kind.isEmpty()) return false;
+        return recordAutomaticDeliveryOutcomeInternal(
+            identity.characterId, identity.kind, identity.jobId, null, stage, now);
+    }
+
+    private boolean recordAutomaticDeliveryOutcomeInternal(
+        String characterId, String kind, String jobId, Long generation,
+        String stage, long now
+    ) {
+        String safeStage = stage == null ? "" : stage.trim();
+        if (!("push_claimed".equals(safeStage)
+            || "push_replay_wake".equals(safeStage)
+            || "push_stale_resync".equals(safeStage)
+            || "remote_paused_requeued".equals(safeStage)
+            || "remote_conflict".equals(safeStage))) return false;
+        if (characterId == null || kind == null || jobId == null
+            || !("chat".equals(kind) || "moment".equals(kind)) || now <= 0L) return false;
+        AtomicReference<Boolean> inserted = new AtomicReference<>(false);
+        database.runInTransaction(() -> {
+            if (isRoleDeleteTombstoned(characterId)) return;
+            AutomaticScheduleAuthorityEntity authority =
+                dao.automaticScheduleAuthorityForCharacterKind(characterId, kind);
+            if (authority == null || authority.streamKey == null || authority.streamKey.isEmpty()) return;
+            if (generation != null && authority.generation != generation.longValue()) return;
+            String eventId = authority.streamKey + ":" + authority.generation + ":" + safeStage;
+            if (dao.automaticScheduleEvent(eventId) != null) return;
+            final String sourceChecksum;
+            try {
+                sourceChecksum = BridgeAuthority.sha256CanonicalJson(
+                    new JSONObject()
+                        .put("generation", authority.generation)
+                        .put("jobId", jobId)
+                        .put("stage", safeStage));
+            } catch (JSONException error) {
+                throw new IllegalStateException("delivery event checksum", error);
+            }
+            AutomaticScheduleEventEntity event = new AutomaticScheduleEventEntity();
+            event.eventId = eventId;
+            event.streamKey = authority.streamKey;
+            event.generation = authority.generation;
+            event.eventType = "delivery";
+            event.previousJobId = null;
+            event.nextJobId = jobId;
+            event.previousDueAt = null;
+            event.nextDueAt = null;
+            event.sourceType = "fcm";
+            event.sourceId = jobId.length() > 96 ? jobId.substring(0, 96) : jobId;
+            event.sourceChecksum = sourceChecksum;
+            event.resultCode = safeStage;
+            event.createdAt = now;
+            inserted.set(dao.insertAutomaticScheduleEvent(event) == 1L);
+        });
+        return Boolean.TRUE.equals(inserted.get());
+    }
+
+    public enum RemoteReconcileResult { RECOVERED, NOOP, CONFLICT }
+
+    public boolean requeueRemotePausedScheduleIfExact(
+        AutomaticScheduleSender.RemoteScheduleStatus remote, long now
+    ) {
+        return reconcileRemotePausedScheduleIfExact(remote, now)
+            == RemoteReconcileResult.RECOVERED;
+    }
+
+    public RemoteReconcileResult reconcileRemotePausedScheduleIfExact(
+        AutomaticScheduleSender.RemoteScheduleStatus remote, long now
+    ) {
+        if (remote == null || now <= 0L) return RemoteReconcileResult.NOOP;
+        AtomicReference<RemoteReconcileResult> result =
+            new AtomicReference<>(RemoteReconcileResult.NOOP);
+        database.runInTransaction(() -> {
+            if (remote.characterId == null || remote.kind == null
+                || isRoleDeleteTombstoned(remote.characterId)) return;
+            AutomaticScheduleAuthorityEntity authority =
+                dao.automaticScheduleAuthorityForCharacterKind(remote.characterId, remote.kind);
+            if (authority == null || authority.semanticJson == null) return;
+            JSONObject semantic;
+            AutomaticScheduleContract.ValidatedTransition validated;
+            try {
+                semantic = new JSONObject(authority.semanticJson);
+                validated = AutomaticScheduleContract.validateTransition(semantic);
+            } catch (Exception error) {
+                insertRemoteConflictEvent(authority, remote, now);
+                result.set(RemoteReconcileResult.CONFLICT);
+                return;
+            }
+            boolean identityMatches = false;
+            try {
+                identityMatches = remote.deviceId != null
+                    && remote.characterId.equals(authority.characterId)
+                    && remote.kind.equals(authority.kind)
+                    && remote.deviceId.equals(validated.value.getString("deviceId"))
+                    && remote.characterId.equals(validated.value.getString("characterId"))
+                    && remote.kind.equals(validated.value.getString("kind"));
+            } catch (Exception ignored) {
+                // Remains a closed conflict below.
+            }
+            boolean ownerMatches = Objects.equals(remote.owner, authority.owner);
+            boolean checksumMatches = Objects.equals(
+                remote.scheduleChecksum, authority.semanticChecksum);
+            if (!remote.exists) {
+                insertRemoteConflictEvent(authority, remote, now);
+                result.set(RemoteReconcileResult.CONFLICT);
+                return;
+            }
+            if (!"paused".equals(remote.state)) {
+                if (!identityMatches || !ownerMatches || !checksumMatches) {
+                    insertRemoteConflictEvent(authority, remote, now);
+                    result.set(RemoteReconcileResult.CONFLICT);
+                }
+                return;
+            }
+            if (!"scheduled".equals(authority.state) || !"synced".equals(authority.cloudSyncState)) return;
+            boolean exactPaused = identityMatches && ownerMatches && checksumMatches
+                && remote.generation > 0L
+                && authority.generation == remote.generation
+                && remote.jobId == null && remote.dueAt == null
+                && remote.nextDeliveryAttemptAt == null
+                && remote.deliveryAttempts == 0L
+                && authority.activeJobId != null && authority.dueAt != null
+                && "scheduled".equals(authority.state)
+                && "synced".equals(authority.cloudSyncState)
+                && authority.authorityEpoch != null
+                && authority.authorityEpoch.matches("[a-f0-9]{32}")
+                && Objects.equals(remote.authorityEpochFingerprint,
+                    authority.authorityEpoch.substring(0, 8));
+            try {
+                exactPaused = exactPaused
+                    && validated.streamKey.equals(authority.streamKey)
+                    && validated.scheduleChecksum.equals(authority.semanticChecksum)
+                    && BridgeAuthority.canonicalJson(validated.value).equals(
+                        BridgeAuthority.canonicalJson(semantic))
+                    && validated.value.getString("owner").equals(authority.owner)
+                    && validated.value.getLong("generation") == authority.generation
+                    && validated.jobId.equals(authority.activeJobId)
+                    && validated.value.getLong("dueAt") == authority.dueAt.longValue();
+            } catch (Exception error) {
+                exactPaused = false;
+            }
+            if (!exactPaused) {
+                insertRemoteConflictEvent(authority, remote, now);
+                result.set(RemoteReconcileResult.CONFLICT);
+                return;
+            }
+            AutomaticScheduleOutboxEntity outbox = dao.automaticScheduleOutbox(
+                authority.streamKey + ":" + authority.generation);
+            if (outbox == null || !"synced".equals(outbox.state)
+                || !outbox.outboxId.equals(authority.streamKey + ":" + authority.generation)
+                || !outbox.streamKey.equals(authority.streamKey)
+                || outbox.generation != authority.generation
+                || !outbox.payloadChecksum.equals(authority.semanticChecksum)
+                || !outbox.payloadJson.equals(authority.semanticJson)) {
+                insertRemoteConflictEvent(authority, remote, now);
+                result.set(RemoteReconcileResult.CONFLICT);
+                return;
+            }
+            // An exact paused shell can only repair an authority with no local
+            // automatic turn. A claimed/inconsistent turn is a closed conflict.
+            if (authority.activeJobId != null
+                && dao.turn(automaticTurnId(authority.activeJobId)) != null) {
+                insertRemoteConflictEvent(authority, remote, now);
+                result.set(RemoteReconcileResult.CONFLICT);
+                return;
+            }
+            if (dao.requeueSyncedAutomaticScheduleOutboxExact(
+                outbox.outboxId, outbox.streamKey, outbox.generation,
+                outbox.payloadChecksum, now, now) != 1) return;
+            if (dao.updateAutomaticScheduleCloudSyncExact(
+                authority.streamKey, authority.generation, authority.semanticChecksum,
+                "synced", "waiting", now) != 1) {
+                throw new IllegalStateException("remote paused authority CAS conflict");
+            }
+            AutomaticScheduleEventEntity event = new AutomaticScheduleEventEntity();
+            event.eventId = authority.streamKey + ":" + authority.generation + ":remote_paused_requeued";
+            event.streamKey = authority.streamKey;
+            event.generation = authority.generation;
+            event.eventType = "delivery";
+            event.nextJobId = authority.activeJobId;
+            event.sourceType = "cloud";
+            event.sourceId = "schedule-status";
+            event.sourceChecksum = remote.scheduleChecksum;
+            event.resultCode = "remote_paused_requeued";
+            event.createdAt = now;
+            if (dao.insertAutomaticScheduleEvent(event) != 1L) {
+                throw new IllegalStateException("remote paused event CAS conflict");
+            }
+            result.set(RemoteReconcileResult.RECOVERED);
+        });
+        return result.get();
+    }
+
+    private void insertRemoteConflictEvent(
+        AutomaticScheduleAuthorityEntity authority,
+        AutomaticScheduleSender.RemoteScheduleStatus remote,
+        long now
+    ) {
+        String eventId = authority.streamKey + ":" + authority.generation + ":remote_conflict";
+        if (dao.automaticScheduleEvent(eventId) != null) return;
+        AutomaticScheduleEventEntity event = new AutomaticScheduleEventEntity();
+        event.eventId = eventId;
+        event.streamKey = authority.streamKey;
+        event.generation = authority.generation;
+        event.eventType = "delivery";
+        event.previousJobId = null;
+        event.nextJobId = null;
+        event.previousDueAt = null;
+        event.nextDueAt = null;
+        event.sourceType = "cloud";
+        event.sourceId = "schedule-status";
+        try {
+            event.sourceChecksum = BridgeAuthority.sha256CanonicalJson(
+                new JSONObject().put("stage", "remote_conflict")
+                    .put("state", remote.state == null ? "" : remote.state)
+                    .put("owner", remote.owner == null ? "" : remote.owner));
+        } catch (JSONException error) {
+            throw new IllegalStateException("remote conflict checksum", error);
+        }
+        event.resultCode = "remote_conflict";
+        event.createdAt = now;
+        if (dao.insertAutomaticScheduleEvent(event) != 1L) {
+            throw new IllegalStateException("remote conflict event CAS conflict");
+        }
     }
 
     private static boolean matchesAutomaticClaim(
@@ -2818,6 +3079,10 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
                 } catch (Exception error) {
                     throw new IllegalStateException("role delete identity conflict", error);
                 }
+                new AutomaticScheduleStore(database, peerId, automaticScheduleFaultAfterWrite)
+                    .disableForRoleDeleteInTransaction(
+                        safeCharacterId, existing.controlId, existing.semanticChecksum,
+                        Math.max(requestedAt, existing.requestedAt));
                 if (!LifecycleControl.APPLIED.equals(existing.state) && durableWakePrearm != null) {
                     durableWakePrearm.run();
                 }
@@ -2843,6 +3108,12 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
             if (dao.insertLifecycleControl(row) != 1L) {
                 throw new IllegalStateException("role delete already exists");
             }
+            // Disable existing chat/moment schedules before semantic role rows
+            // are removed. The disable outboxes use the normal sender contract
+            // and are committed atomically with the retained tombstone.
+            new AutomaticScheduleStore(database, peerId, automaticScheduleFaultAfterWrite)
+                .disableForRoleDeleteInTransaction(
+                    safeCharacterId, row.controlId, row.semanticChecksum, requestedAt);
             insertRoleNotificationCancellationIntents(
                 row.controlId, safeCharacterId, roleTurnIds, requestedAt);
             terminalFaultHook.after("role_delete_control");

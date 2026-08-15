@@ -200,7 +200,7 @@ test('cron defers an automatic authority job without writing the legacy timer ta
   assert.equal(deferred.jobId, automatic.jobId);
   assert.equal(deferred.awaitingAck, true);
   assert.ok(deferred.nextAttemptAt > Date.now());
-  assert.equal(store.deliveryProbe?.workerVersion, '2026-08-15.9');
+  assert.equal(store.deliveryProbe?.workerVersion, '2026-08-15.11');
   assert.equal(store.deliveryProbe?.stage, 'awaiting_phone_ack');
   assert.equal(store.deliveryProbe?.jobId, automatic.jobId);
   assert.deepEqual(

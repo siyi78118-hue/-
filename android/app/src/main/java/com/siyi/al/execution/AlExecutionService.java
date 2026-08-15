@@ -208,6 +208,7 @@ public final class AlExecutionService extends Service {
                     new RolePlanCoordinator(database).dispatchDue(System.currentTimeMillis());
                     if (!isReadyForWork()) return;
                     AutomaticTaskCoordinator automatic = new AutomaticTaskCoordinator(database);
+                    automatic.recoverPersistedDeliveryIntents(this);
                     automatic.reconcileSchedulers(this);
                     automatic.dispatchDue(System.currentTimeMillis());
                     if (!isReadyForWork()) return;

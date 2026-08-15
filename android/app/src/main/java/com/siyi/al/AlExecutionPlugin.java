@@ -17,6 +17,7 @@ import com.siyi.al.execution.AutomaticTaskCoordinator;
 import com.siyi.al.execution.BridgeAuthority;
 import com.siyi.al.execution.BridgeReceiptCheckpoint;
 import com.siyi.al.execution.ExecutionServicePolicy;
+import com.siyi.al.execution.ExecutionRuntime;
 import com.siyi.al.execution.RoomExecutionStore;
 import com.siyi.al.execution.TurnKind;
 import com.siyi.al.execution.TurnSubmission;
@@ -496,6 +497,26 @@ public final class AlExecutionPlugin extends Plugin {
             AutomaticScheduleAuthorityEntity current = AlExecutionDatabase.get(applicationContext)
                 .executionDao().automaticScheduleAuthorityForCharacterKind(characterId, kind);
             return automaticScheduleResult(characterId, kind, current);
+        });
+    }
+
+    @PluginMethod
+    public void reconcileAutomaticSchedules(PluginCall call) {
+        execute(call, () -> {
+            ExecutionRuntime.ReconcileResult reconciliation =
+                ExecutionRuntime.reconcileRemotePausedSchedulesResult(applicationContext);
+            boolean retryScheduled = false;
+            if (reconciliation.status == ExecutionRuntime.ReconcileResult.Status.RECOVERED) {
+                AlExecutionWakeWorker.enqueueAutomaticScheduleSync(applicationContext, 0L);
+            } else if (reconciliation.status == ExecutionRuntime.ReconcileResult.Status.RETRYABLE) {
+                AlExecutionWakeWorker.enqueueAutomaticScheduleSync(applicationContext, 15L * 60L);
+                retryScheduled = true;
+            }
+            JSObject result = new JSObject();
+            result.put("status", reconciliation.status.name().toLowerCase(java.util.Locale.ROOT));
+            result.put("requeued", reconciliation.requeued);
+            result.put("retryScheduled", retryScheduled);
+            return result;
         });
     }
 
@@ -1157,13 +1178,13 @@ public final class AlExecutionPlugin extends Plugin {
         return Math.addExact(revision, 1L);
     }
 
-    private static JSObject automaticScheduleResult(AutomaticScheduleAuthorityEntity row)
+    private JSObject automaticScheduleResult(AutomaticScheduleAuthorityEntity row)
         throws JSONException {
         if (row == null) throw new IllegalStateException("automatic schedule authority is missing");
         return automaticScheduleResult(row.characterId, row.kind, row);
     }
 
-    private static JSObject automaticScheduleResult(
+    private JSObject automaticScheduleResult(
         String characterId, String kind, AutomaticScheduleAuthorityEntity row
     ) throws JSONException {
         JSObject result = new JSObject();
@@ -1179,12 +1200,13 @@ public final class AlExecutionPlugin extends Plugin {
             result.put("cloudSyncState", "none");
             result.put("lastChangeSource", "none");
             result.put("lastChangedAt", 0L);
+            result.put("lastDeliveryStage", "");
+            result.put("lastDeliveryAt", 0L);
             return result;
         }
         JSONObject semantic = new JSONObject(row.semanticJson);
         AutomaticScheduleContract.validateTransition(semantic);
-        result.put("epochFingerprint",
-            BridgeAuthority.sha256CanonicalJson(row.authorityEpoch).substring(0, 8));
+        result.put("epochFingerprint", row.authorityEpoch.substring(0, 8));
         result.put("generation", row.generation);
         result.put("state", row.state);
         result.put("jobId", row.activeJobId == null ? JSONObject.NULL : row.activeJobId);
@@ -1192,6 +1214,11 @@ public final class AlExecutionPlugin extends Plugin {
         result.put("cloudSyncState", row.cloudSyncState);
         result.put("lastChangeSource", semantic.getString("sourceType"));
         result.put("lastChangedAt", row.updatedAt);
+        com.siyi.al.execution.db.AutomaticScheduleEventEntity latest =
+            AlExecutionDatabase.get(applicationContext).executionDao()
+                .latestAutomaticScheduleEvent(row.streamKey);
+        result.put("lastDeliveryStage", latest == null || latest.resultCode == null ? "" : latest.resultCode);
+        result.put("lastDeliveryAt", latest == null ? 0L : latest.createdAt);
         return result;
     }
 

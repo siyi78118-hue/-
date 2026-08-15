@@ -11,6 +11,21 @@ import org.json.JSONObject;
 public final class AutomaticTaskCoordinator {
     public enum DispatchOutcome { CLAIMED, REPLAY, STALE }
 
+    /** Bounded identity retained for a rejected push; it deliberately excludes epoch/generation. */
+    public static final class SafeClaimIdentity {
+        public final String characterId;
+        public final String kind;
+        public final String jobId;
+        public final boolean hasAuthorityEpoch;
+
+        private SafeClaimIdentity(String characterId, String kind, String jobId) {
+            this.characterId = characterId;
+            this.kind = kind;
+            this.jobId = jobId;
+            this.hasAuthorityEpoch = false;
+        }
+    }
+
     /** Closed authority token shared by FCM, AlarmManager and WorkManager. */
     public static final class ClaimToken {
         private static final Pattern ID =
@@ -59,6 +74,19 @@ public final class AutomaticTaskCoordinator {
             return new ClaimToken(characterId, kind, jobId, authorityEpoch, generation);
         }
 
+        /** Extract only a bounded stream identity from malformed push data. */
+        public static SafeClaimIdentity safeIdentity(Map<String, String> value) {
+            if (value == null) return new SafeClaimIdentity("", "", "");
+            String characterId = value.get("charId");
+            String kind = value.get("kind");
+            String jobId = value.get("jobId");
+            if (!isSafeId(characterId) || !isSafeId(jobId)
+                || !("chat".equals(kind) || "moment".equals(kind))) {
+                return new SafeClaimIdentity("", "", "");
+            }
+            return new SafeClaimIdentity(characterId.trim(), kind, jobId.trim());
+        }
+
         static ClaimToken from(AutomaticScheduleAuthorityEntity authority) {
             if (authority == null) throw new IllegalArgumentException("automatic authority is required");
             java.util.HashMap<String, String> raw = new java.util.HashMap<>();
@@ -85,10 +113,14 @@ public final class AutomaticTaskCoordinator {
 
         private static String requiredId(String value, String label) {
             String normalized = required(value, label);
-            if (!ID.matcher(normalized).matches()) {
+            if (!isSafeId(normalized)) {
                 throw new IllegalArgumentException("automatic claim " + label + " is invalid");
             }
             return normalized;
+        }
+
+        private static boolean isSafeId(String value) {
+            return value != null && ID.matcher(value.trim()).matches();
         }
 
         private static String required(String value, String label) {
@@ -142,6 +174,40 @@ public final class AutomaticTaskCoordinator {
                 scheduled += 1;
             } catch (Exception ignored) {
                 // Corrupt or obsolete authority never becomes executable work.
+            }
+        }
+        return scheduled;
+    }
+
+    /** Replays durable FCM delivery intents after boot/process recovery. */
+    public int recoverPersistedDeliveryIntents(Context context) {
+        if (context == null) throw new IllegalArgumentException("recovery context is required");
+        int scheduled = 0;
+        for (com.siyi.al.execution.db.AutomaticScheduleEventEntity event
+                : database.executionDao().pendingAutomaticDeliveryRecoveryEvents()) {
+            if (event == null || event.streamKey == null || event.resultCode == null) continue;
+            AutomaticScheduleAuthorityEntity authority =
+                database.executionDao().automaticScheduleAuthority(event.streamKey);
+            if (authority == null || authority.characterId == null
+                || authority.generation != event.generation
+                || (event.nextJobId != null && authority.activeJobId != null
+                    && !event.nextJobId.equals(authority.activeJobId))
+                || store.isRoleDeleteTombstoned(authority.characterId)) continue;
+            try {
+                if ("push_stale_resync".equals(event.resultCode)) {
+                    AlExecutionWakeWorker.enqueueAutomaticScheduleReconcile(context);
+                    scheduled += 1;
+                    continue;
+                }
+                if (!("scheduled".equals(authority.state) || "claimed".equals(authority.state))
+                    || authority.activeJobId == null || authority.authorityEpoch == null) continue;
+                ClaimToken token = ClaimToken.from(authority);
+                long now = System.currentTimeMillis();
+                long dueAt = authority.dueAt == null ? now : Math.max(now, authority.dueAt);
+                AlExecutionWakeWorker.enqueueAutomatic(context, token, dueAt);
+                scheduled += 1;
+            } catch (RuntimeException ignored) {
+                // Malformed/foreign durable rows fail closed without creating work.
             }
         }
         return scheduled;

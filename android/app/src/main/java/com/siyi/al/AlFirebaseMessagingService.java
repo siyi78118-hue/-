@@ -40,6 +40,17 @@ public class AlFirebaseMessagingService extends MessagingService {
         try {
             token = automaticClaimToken(data);
         } catch (IllegalArgumentException ignored) {
+            AutomaticTaskCoordinator.SafeClaimIdentity identity =
+                AutomaticTaskCoordinator.ClaimToken.safeIdentity(data);
+            if (!identity.characterId.isEmpty()) {
+                AlExecutionDatabase database = AlExecutionDatabase.get(this);
+                RoomExecutionStore store = new RoomExecutionStore(database);
+                store.runRoleSideEffectIfNotDeleted(identity.characterId, () -> {
+                    store.recordAutomaticDeliveryOutcome(identity, "push_stale_resync",
+                        System.currentTimeMillis());
+                    AlExecutionWakeWorker.enqueueAutomaticScheduleReconcile(this);
+                });
+            }
             return;
         }
         String characterId = token.characterId;
@@ -51,11 +62,31 @@ public class AlFirebaseMessagingService extends MessagingService {
         AutomaticTaskCoordinator.DispatchOutcome outcome;
         try {
             outcome = new AutomaticTaskCoordinator(this).dispatch(token, now);
-            if (outcome != AutomaticTaskCoordinator.DispatchOutcome.CLAIMED) return;
         } catch (RuntimeException error) {
             if (RoleDeletionDispatchPolicy.suppressFailure(tombstone, characterId)) return;
             throw error;
         }
+        if (outcome == AutomaticTaskCoordinator.DispatchOutcome.STALE) {
+            store.runRoleSideEffectIfNotDeleted(characterId, () -> {
+                store.recordAutomaticDeliveryOutcome(token, "push_stale_resync", now);
+                AlExecutionWakeWorker.enqueueAutomaticScheduleReconcile(this);
+            });
+            return;
+        }
+        if (outcome == AutomaticTaskCoordinator.DispatchOutcome.REPLAY) {
+            store.runRoleSideEffectIfNotDeleted(characterId, () -> {
+                store.recordAutomaticDeliveryOutcome(token, "push_replay_wake", now);
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity replayAuthority =
+                    database.executionDao().automaticScheduleAuthorityForCharacterKind(
+                        token.characterId, token.kind);
+                long scheduledFor = replayAuthority == null || replayAuthority.dueAt == null
+                    ? now : replayAuthority.dueAt;
+                AlExecutionWakeWorker.enqueueAutomatic(this, token, scheduledFor);
+            });
+            return;
+        }
+        if (!store.runRoleSideEffectIfNotDeleted(characterId,
+            () -> store.recordAutomaticDeliveryOutcome(token, "push_claimed", now))) return;
         CharacterSnapshotEntity snapshot =
             database.executionDao().latestSnapshot(characterId + ":" + token.kind);
         String characterName = snapshot == null ? characterId : snapshot.characterName;
@@ -90,6 +121,21 @@ public class AlFirebaseMessagingService extends MessagingService {
     static boolean isManualCloudTimerTest(Map<String, String> data) {
         return data != null && "proactive".equals(data.get("type"))
             && "true".equals(data.get("test"));
+    }
+
+    static boolean shouldWake(AutomaticTaskCoordinator.DispatchOutcome outcome) {
+        return outcome == AutomaticTaskCoordinator.DispatchOutcome.CLAIMED
+            || outcome == AutomaticTaskCoordinator.DispatchOutcome.REPLAY;
+    }
+
+    static boolean shouldNotify(AutomaticTaskCoordinator.DispatchOutcome outcome) {
+        return outcome == AutomaticTaskCoordinator.DispatchOutcome.CLAIMED;
+    }
+
+    static String automaticDeliveryStage(AutomaticTaskCoordinator.DispatchOutcome outcome) {
+        if (outcome == AutomaticTaskCoordinator.DispatchOutcome.CLAIMED) return "push_claimed";
+        if (outcome == AutomaticTaskCoordinator.DispatchOutcome.REPLAY) return "push_replay_wake";
+        return "push_stale_resync";
     }
 
     private void showManualCloudTimerTest(Map<String, String> data) {

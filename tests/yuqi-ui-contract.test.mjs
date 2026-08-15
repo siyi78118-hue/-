@@ -64,16 +64,37 @@ test('Android proactive scheduling is exposed through a closed native authority 
   ]) assert.match(plugin, new RegExp(`void\\s+${method}\\(PluginCall call\\)`));
 
   const projection = plugin.slice(
-    plugin.indexOf('private static JSObject automaticScheduleResult('),
+    plugin.indexOf('private JSObject automaticScheduleResult('),
     plugin.indexOf('private static JSObject bridgeConfigResult(')
   );
   for (const key of [
     'characterId', 'kind', 'owner', 'epochFingerprint', 'generation', 'state',
-    'jobId', 'dueAt', 'cloudSyncState', 'lastChangeSource', 'lastChangedAt'
+    'jobId', 'dueAt', 'cloudSyncState', 'lastChangeSource', 'lastChangedAt',
+    'lastDeliveryStage', 'lastDeliveryAt'
   ]) assert.match(projection, new RegExp(`result\\.put\\("${key}"`));
   for (const secret of ['authorityEpoch', 'semanticJson', 'payloadJson', 'leaseId']) {
     assert.doesNotMatch(projection, new RegExp(`result\\.put\\("${secret}"`));
   }
+});
+
+test('native schedule recovery exposes only a closed delivery-stage projection', () => {
+  assert.match(html, /lastDeliveryStage/);
+  assert.match(html, /push_replay_wake/);
+  assert.match(html, /remote_paused_requeued/);
+  assert.match(html, /reconcileAutomaticSchedules/);
+});
+
+test('manual cloud timer text is explicitly transport-only', () => {
+  assert.match(html, /传输到达/);
+  assert.match(html, /不代表主动消息已生成/);
+});
+
+test('native schedule diagnostics do not expose opaque job identity fields', () => {
+  const start = html.indexOf('function cloudTimerDiagnosticText()');
+  assert.ok(start >= 0);
+  const diagnostic = html.slice(start, start + 2600);
+  assert.doesNotMatch(diagnostic, /任务代数|status\.jobId|status\.generation|status\.epochFingerprint/);
+  assert.match(diagnostic, /当前计划|云同步|最近真实变更/);
 });
 
 test('native foreground, input, and terminal paths cannot manufacture a Web schedule', () => {

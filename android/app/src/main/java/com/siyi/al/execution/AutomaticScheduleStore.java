@@ -116,6 +116,99 @@ public final class AutomaticScheduleStore {
             AutomaticScheduleContract.Operation.DISABLE, source, null, now);
     }
 
+    /**
+     * Role-delete path: called only while RoomExecutionStore's outer
+     * transaction is open. It emits the normal v2 disable transition for each
+     * existing chat/moment authority, binding the lifecycle control identity
+     * into sourceChecksum. No nested Room transaction is opened.
+     */
+    void disableForRoleDeleteInTransaction(
+        String characterId, String controlId, String controlChecksum, long now
+    ) {
+        int writeOrdinal = 0;
+        for (String kind : new String[] {"chat", "moment"}) {
+            String streamKey = AutomaticScheduleContract.streamKey(deviceId, characterId, kind);
+            AutomaticScheduleAuthorityEntity current = dao.automaticScheduleAuthority(streamKey);
+            if (current == null || "disabled".equals(current.state)) continue;
+            assertCurrentAuthority(current, current.authorityEpoch);
+            AutomaticScheduleOutboxEntity predecessor = dao.automaticScheduleOutbox(
+                streamKey + ":" + current.generation);
+            if (!exactOutboxForAuthority(predecessor, current)) {
+                throw new IllegalStateException("role delete predecessor outbox conflict");
+            }
+            if ("quarantined".equals(predecessor.state)
+                && dao.restoreQuarantinedAutomaticScheduleOutboxExact(
+                    predecessor.outboxId, predecessor.streamKey, predecessor.generation,
+                    predecessor.operation, predecessor.payloadChecksum, predecessor.payloadJson,
+                    now, now) != 1) {
+                throw new IllegalStateException("role delete quarantined predecessor restore conflict");
+            }
+            JSONObject sourceBasis;
+            try {
+                sourceBasis = new JSONObject()
+                    .put("characterId", characterId)
+                    .put("controlId", controlId)
+                    .put("controlChecksum", controlChecksum)
+                    .put("kind", kind);
+            } catch (Exception error) {
+                throw new IllegalStateException("role delete disable source checksum", error);
+            }
+            String sourceChecksum = BridgeAuthority.sha256CanonicalJson(sourceBasis);
+            AutomaticScheduleContract.Source source = new AutomaticScheduleContract.Source(
+                "lifecycle", "role_delete_" + controlId + "_" + kind,
+                sourceChecksum, current.conversationSequence, now);
+            if (isExactSourceReplay(current, source, null)) continue;
+            if (isSourceIdentityConflict(current, source)) {
+                throw new IllegalStateException("role delete disable source conflict");
+            }
+            AutomaticScheduleContract.ValidatedTransition transition =
+                AutomaticScheduleContract.create(
+                    "disable", OWNER, current.authorityEpoch, current.generation + 1L,
+                    current.activeJobId, deviceId, characterId, kind, streamKey,
+                    null, null, null, source, currentPolicyRevision(current),
+                    currentPolicyChecksum(current));
+            AutomaticScheduleAuthorityEntity next = authorityRow(
+                current, transition, current.conversationSequence, now);
+            AutomaticScheduleOutboxEntity outbox = outboxRow(transition, now);
+            AutomaticScheduleEventEntity event = eventRow(
+                current, next, transition, source,
+                AutomaticScheduleContract.Operation.DISABLE, now);
+            if (dao.upsertAutomaticScheduleAuthority(next) <= 0L) {
+                throw new IllegalStateException("role delete disable authority write conflict");
+            }
+            maybeFault(++writeOrdinal);
+            if (dao.insertAutomaticScheduleOutbox(outbox) <= 0L) {
+                throw new IllegalStateException("role delete disable outbox write conflict");
+            }
+            maybeFault(++writeOrdinal);
+            if (dao.insertAutomaticScheduleEvent(event) <= 0L) {
+                throw new IllegalStateException("role delete disable event write conflict");
+            }
+            maybeFault(++writeOrdinal);
+        }
+    }
+
+    private static boolean exactOutboxForAuthority(
+        AutomaticScheduleOutboxEntity outbox, AutomaticScheduleAuthorityEntity authority
+    ) {
+        if (outbox == null || authority == null || authority.semanticJson == null) return false;
+        try {
+            JSONObject semantic = parse(authority.semanticJson);
+            String operation = requiredString(semantic, "operation");
+            return ("waiting".equals(outbox.state) || "pending".equals(outbox.state)
+                    || "synced".equals(outbox.state) || "quarantined".equals(outbox.state))
+                && outbox.outboxId.equals(authority.streamKey + ":" + authority.generation)
+                && outbox.streamKey.equals(authority.streamKey)
+                && outbox.generation == authority.generation
+                && outbox.operation.equals(operation)
+                && outbox.payloadChecksum.equals(authority.semanticChecksum)
+                && outbox.state.equals(authority.cloudSyncState)
+                && outbox.payloadJson.equals(authority.semanticJson);
+        } catch (RuntimeException error) {
+            return false;
+        }
+    }
+
     public AutomaticScheduleAuthorityEntity migrateLegacyCandidate(
         String characterId, String kind, String authorityEpoch,
         AutomaticScheduleContract.Source source, AutomaticScheduleContract.Policy policy, long now

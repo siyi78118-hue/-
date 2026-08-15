@@ -4,8 +4,8 @@ permissions:
   contents: write
 
 env:
-  AL_RELEASE_VERSION_CODE: 119
-  AL_RELEASE_VERSION_NAME: 1.0.119
+  AL_RELEASE_VERSION_CODE: 120
+  AL_RELEASE_VERSION_NAME: 1.0.120
 
 on:
   workflow_dispatch:

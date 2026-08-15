@@ -1407,14 +1407,14 @@ const NATIVE_REPLY_STALE_MS = API_TIMEOUT_MS * 3;
 const NATIVE_BRIDGE_TIMEOUT_MS = 8000;
 const NATIVE_RECONCILE_TIMEOUT_MS = 12000;
 const NATIVE_TURN_APPLY_TIMEOUT_MS = 10000;
-const APP_BUILD_VERSION = '2026-08-15.119';
+const APP_BUILD_VERSION = '2026-08-15.120';
 const ANDROID_RELEASE_API = 'https://api.github.com/repos/siyi78118-hue/-/releases/latest';
 const ANDROID_UPDATE_MANIFEST_URLS = [
   'https://raw.githubusercontent.com/siyi78118-hue/-/update-channel/android-update.json',
   'https://raw.githubusercontent.com/siyi78118-hue/-/main/android-update.json',
   'https://cdn.jsdelivr.net/gh/siyi78118-hue/-@update-channel/android-update.json'
 ];
-const EXPECTED_CLOUD_TIMER_VERSION = '2026-08-15.9';
+const EXPECTED_CLOUD_TIMER_VERSION = '2026-08-15.11';
 const PROACTIVE_MEMORY_TIMEOUT_MS = API_TIMEOUT_MS;
 const MEMORY_MAX_TOKENS = 4096;
 const MEMORY_BATCH_SIZE = 30;
@@ -10739,11 +10739,11 @@ function cloudTimerDiagnosticText() {
         .sort((a, b) => Number(a.dueAt) - Number(b.dueAt))[0];
       if (!status) continue;
       const char = characters.find(item => item.id === status.characterId);
-      const label = kind === 'moment' ? '朋友圈计划时间' : '私聊计划时间';
+      const label = kind === 'moment' ? '当前计划·朋友圈' : '当前计划·私聊';
       rows.push(`${label}（${char?.name || status.characterId}）：${formatFullTime(new Date(status.dueAt))}`);
-      rows.push(`${kind === 'moment' ? '朋友圈' : '私聊'}任务代数：${status.epochFingerprint}/${status.generation}｜${status.jobId || '无活动任务'}`);
       rows.push(`${kind === 'moment' ? '朋友圈' : '私聊'}云同步：${status.cloudSyncState}`);
       rows.push(`${kind === 'moment' ? '朋友圈' : '私聊'}最近真实变更：${formatFullTime(new Date(status.lastChangedAt))}｜${status.lastChangeSource}`);
+      if (status.lastDeliveryStage) rows.push(`${kind === 'moment' ? '朋友圈' : '私聊'}最近真实投递：${status.lastDeliveryStage}｜${status.lastDeliveryAt ? formatFullTime(new Date(status.lastDeliveryAt)) : '无时间'}`);
     }
     if (nativeAutomaticLastCheckedAt) rows.push(`最近检查（仅内存）：${formatFullTime(new Date(nativeAutomaticLastCheckedAt))}`);
   } else {
@@ -11198,7 +11198,8 @@ function automaticSettingsFingerprint(value = {}) {
 function validateNativeAutomaticScheduleStatus(raw, characterId, kind) {
   const keys = [
     'characterId', 'cloudSyncState', 'dueAt', 'epochFingerprint', 'generation',
-    'jobId', 'kind', 'lastChangeSource', 'lastChangedAt', 'owner', 'state'
+    'jobId', 'kind', 'lastChangeSource', 'lastChangedAt', 'lastDeliveryAt',
+    'lastDeliveryStage', 'owner', 'state'
   ];
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)
     || Object.keys(raw).sort().join('|') !== keys.sort().join('|')
@@ -11210,7 +11211,10 @@ function validateNativeAutomaticScheduleStatus(raw, characterId, kind) {
     || !(raw.dueAt === null || (typeof raw.dueAt === 'number' && Number.isSafeInteger(raw.dueAt) && raw.dueAt > 0))
     || typeof raw.cloudSyncState !== 'string'
     || typeof raw.lastChangeSource !== 'string'
-    || typeof raw.lastChangedAt !== 'number' || !Number.isSafeInteger(raw.lastChangedAt) || raw.lastChangedAt < 0) {
+    || typeof raw.lastChangedAt !== 'number' || !Number.isSafeInteger(raw.lastChangedAt) || raw.lastChangedAt < 0
+    || typeof raw.lastDeliveryAt !== 'number' || !Number.isSafeInteger(raw.lastDeliveryAt) || raw.lastDeliveryAt < 0
+    || !['', 'push_claimed', 'push_replay_wake', 'push_stale_resync',
+      'remote_paused_requeued', 'remote_conflict'].includes(raw.lastDeliveryStage)) {
     throw new Error('invalid native automatic schedule status');
   }
   return Object.freeze({ ...raw });
@@ -11218,9 +11222,16 @@ function validateNativeAutomaticScheduleStatus(raw, characterId, kind) {
 async function refreshNativeAutomaticScheduleStatuses(options = {}) {
   if (!isNativeApp()) return false;
   const plugin = nativeExecutionPlugin();
-  if (!plugin?.getAutomaticScheduleStatus || !plugin?.configureAutomaticSchedule
+  if (!plugin?.getAutomaticScheduleStatus || !plugin?.reconcileAutomaticSchedules
+    || !plugin?.configureAutomaticSchedule
     || !plugin?.migrateLegacyAutomaticScheduleCandidate) {
     throw new Error('Android 主动日程接口不可用');
+  }
+  // Reconciliation is recovery-only. Read-only status refreshes must not
+  // enqueue WorkManager work or create a WebView/native loop.
+  if (options.reconcile === true) {
+    await nativeBridgeCall(
+      plugin.reconcileAutomaticSchedules({}), 'reconcileAutomaticSchedules', 5000);
   }
   const configure = options.configure === true;
   const migrate = options.migrate !== false;
@@ -12174,9 +12185,9 @@ async function completeCloudTimerTestPush(data = {}) {
     DB.set('chats', allChats);
     await mirrorAppStateNow();
   }
-  setCloudTimerTestAck('本机已收到云闹钟测试推送，闹钟链路正常。');
+  setCloudTimerTestAck('本机已收到云闹钟测试推送；这只证明传输到达，不代表主动消息已生成。');
   setCloudTimerTriggerAck('测试云闹钟已被本机收到。');
-  setCloudTimerStatus('测试推送已被本机收到；正式主动消息时间没有改变。', true, 'chat');
+  setCloudTimerStatus('测试推送已被本机收到（仅传输确认）；正式主动消息时间没有改变。', true, 'chat');
   return true;
 }
 async function handleForegroundProactiveRequest(data = {}) {

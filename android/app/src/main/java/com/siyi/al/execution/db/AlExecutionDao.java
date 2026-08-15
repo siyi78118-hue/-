@@ -92,6 +92,38 @@ public interface AlExecutionDao {
         + "ORDER BY generation ASC, createdAt ASC, eventId ASC")
     List<AutomaticScheduleEventEntity> automaticScheduleEvents(String streamKey);
 
+    @Query("SELECT * FROM automatic_schedule_events WHERE eventId = :eventId LIMIT 1")
+    AutomaticScheduleEventEntity automaticScheduleEvent(String eventId);
+
+    @Query("SELECT * FROM automatic_schedule_events WHERE streamKey = :streamKey "
+        + "AND eventType = 'delivery' "
+        + "ORDER BY createdAt DESC, eventId DESC LIMIT 1")
+    AutomaticScheduleEventEntity latestAutomaticScheduleEvent(String streamKey);
+
+    @Query("SELECT * FROM automatic_schedule_events WHERE eventType = 'delivery' "
+        + "AND resultCode IN ('push_claimed','push_replay_wake','push_stale_resync') "
+        + "ORDER BY createdAt ASC, eventId ASC")
+    List<AutomaticScheduleEventEntity> pendingAutomaticDeliveryRecoveryEvents();
+
+    @Query("UPDATE automatic_schedule_outbox SET state = 'waiting', leaseId = NULL, leasedAt = NULL, "
+        + "nextAttemptAt = :nextAttemptAt, lastErrorCode = '', updatedAt = :updatedAt "
+        + "WHERE outboxId = :outboxId AND streamKey = :streamKey AND generation = :generation "
+        + "AND payloadChecksum = :payloadChecksum AND state = 'synced'")
+    int requeueSyncedAutomaticScheduleOutboxExact(
+        String outboxId, String streamKey, long generation, String payloadChecksum,
+        long nextAttemptAt, long updatedAt
+    );
+
+    @Query("UPDATE automatic_schedule_outbox SET state = 'waiting', leaseId = NULL, leasedAt = NULL, "
+        + "nextAttemptAt = :nextAttemptAt, lastErrorCode = '', updatedAt = :updatedAt "
+        + "WHERE outboxId = :outboxId AND streamKey = :streamKey AND generation = :generation "
+        + "AND operation = :operation AND payloadChecksum = :payloadChecksum "
+        + "AND payloadJson = :payloadJson AND state = 'quarantined'")
+    int restoreQuarantinedAutomaticScheduleOutboxExact(
+        String outboxId, String streamKey, long generation, String operation,
+        String payloadChecksum, String payloadJson, long nextAttemptAt, long updatedAt
+    );
+
     @Query("UPDATE automatic_schedule_outbox SET state = 'pending', leaseId = :leaseId, "
         + "leaseAttempt = leaseAttempt + 1, leasedAt = :leasedAt, updatedAt = :updatedAt "
         + "WHERE outboxId = :outboxId AND payloadChecksum = :payloadChecksum "

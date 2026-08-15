@@ -30,7 +30,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Yuqi-Registration'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-08-15.9';
+const CLOUD_TIMER_WORKER_VERSION = '2026-08-15.11';
 const FCM_ACK_MAX_ATTEMPTS = 8;
 const FIREBASE_FETCH_TIMEOUT_MS = 10_000;
 const PUSH_SUBSCRIPTION_TIMEOUT_MS = 10_000;
@@ -391,7 +391,8 @@ function createD1TimerStore(db) {
             && current.active_job_id == null
             && current.due_at == null
             && current.payload_json == null
-            && current.expected_previous_job_id === input.jobId) {
+            && (current.expected_previous_job_id === input.jobId
+              || current.expected_previous_job_id == null)) {
           return 'recover_paused';
         }
         if ((input.operation === 'schedule' && ['scheduled', 'awaiting_ack'].includes(current.state))

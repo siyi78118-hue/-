@@ -673,6 +673,33 @@ test('an exact schedule replay restores only the empty paused shell left by clou
   assert.deepEqual(db.rows.get(scheduled.streamKey), recoverySnapshot, 'healthy exact replay must not rewrite timestamps');
 });
 
+test('an exact schedule replay restores a legacy paused shell whose predecessor was not retained', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const scheduled = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1();
+  const store = createD1TimerStore(db);
+
+  await store.transitionAutomaticStream(scheduled);
+  await store.ackAutomaticDelivery({
+    streamKey: scheduled.streamKey,
+    authorityEpoch: scheduled.authorityEpoch,
+    generation: scheduled.generation,
+    jobId: scheduled.jobId
+  });
+  db.rows.set(scheduled.streamKey, {
+    ...db.rows.get(scheduled.streamKey),
+    expected_previous_job_id: null
+  });
+
+  assert.deepEqual(await store.transitionAutomaticStream(scheduled), { idempotent: false, recovered: true });
+  const recovered = db.rows.get(scheduled.streamKey);
+  assert.equal(recovered.state, 'scheduled');
+  assert.equal(recovered.active_job_id, scheduled.jobId);
+  assert.equal(recovered.due_at, scheduled.dueAt);
+  assert.deepEqual(JSON.parse(recovered.payload_json), scheduled);
+  assert.equal(recovered.schedule_checksum, scheduled.scheduleChecksum);
+});
+
 test('same-generation replay cannot revive a user pause or a malformed paused shell', async () => {
   const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
   const scheduled = fixture.vectors[0].transition;
@@ -998,4 +1025,44 @@ test('D1 due query returns current automatic authority and a defer cannot resurr
     awaitingAck: false
   });
   assert.deepEqual(await store.dueJobs(transition.dueAt + 30_000, 10), []);
+});
+
+test('a lifecycle disable permanently removes scheduled and awaiting-ack authority from delivery', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+
+  for (const awaitingAck of [false, true]) {
+    const scheduled = fixture.vectors[0].transition;
+    const db = new StreamAuthorityD1();
+    const store = createD1TimerStore(db);
+    await store.transitionAutomaticStream(scheduled);
+    if (awaitingAck) {
+      await store.deferAutomaticDelivery({
+        streamKey: scheduled.streamKey,
+        authorityEpoch: scheduled.authorityEpoch,
+        generation: scheduled.generation,
+        jobId: scheduled.jobId,
+        nextAttemptAt: scheduled.dueAt + 60_000,
+        awaitingAck: true
+      });
+    }
+
+    const disabled = await nextTransition(scheduled, {
+      operation: 'disable', jobId: null, dueAt: null, mode: null, sourceType: 'lifecycle'
+    });
+    assert.deepEqual(await store.transitionAutomaticStream(disabled), { idempotent: false });
+    assert.deepEqual(await store.transitionAutomaticStream(disabled), { idempotent: true });
+    assert.equal(db.rows.get(scheduled.streamKey).state, 'disabled');
+    assert.equal(db.rows.get(scheduled.streamKey).active_job_id, null);
+    assert.equal(db.rows.get(scheduled.streamKey).payload_json, null);
+    assert.deepEqual(await store.dueJobs(Number.MAX_SAFE_INTEGER, 10), []);
+    await assert.rejects(
+      () => store.ackAutomaticDelivery({
+        streamKey: scheduled.streamKey,
+        authorityEpoch: scheduled.authorityEpoch,
+        generation: scheduled.generation,
+        jobId: scheduled.jobId
+      }),
+      error => error.code === 'SCHEDULE_STALE_DELIVERY'
+    );
+  }
 });

@@ -14,6 +14,7 @@ import androidx.room.Room;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
 import androidx.test.platform.app.InstrumentationRegistry;
 import com.siyi.al.execution.db.AlExecutionDatabase;
+import com.siyi.al.execution.db.AutomaticScheduleOutboxEntity;
 import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ChangeEventEntity;
@@ -35,6 +36,8 @@ import com.siyi.al.execution.bridge.BridgeTurnStatus;
 import com.siyi.al.execution.bridge.BridgeClient;
 import com.siyi.al.execution.bridge.FallbackJournal;
 import com.siyi.al.execution.bridge.RoomBridgeMirror;
+import com.siyi.al.execution.api.HttpResponse;
+import com.siyi.al.execution.api.HttpTransport;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -143,6 +146,579 @@ public class RoomExecutionStoreTest {
                     faultDb.close();
                 }
             }
+        }
+    }
+
+    @Test
+    public void automaticDeliveryMetadataIsIdempotentAndContainsNoPayload() {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        String epoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "yuqi", "chat", epoch,
+            automaticSource("bootstrap", "delivery-metadata", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        java.util.HashMap<String, String> raw = new java.util.HashMap<>();
+        raw.put("charId", "yuqi");
+        raw.put("kind", "chat");
+        raw.put("jobId", authority.activeJobId);
+        raw.put("authorityEpoch", epoch);
+        raw.put("generation", String.valueOf(authority.generation));
+        AutomaticTaskCoordinator.ClaimToken token = AutomaticTaskCoordinator.ClaimToken.from(raw);
+        assertTrue(store.recordAutomaticDeliveryOutcome(token, "push_replay_wake", 2_000L));
+        assertFalse(store.recordAutomaticDeliveryOutcome(token, "push_replay_wake", 2_001L));
+        assertEquals(1L, rowCount("automatic_schedule_events"));
+        Cursor cursor = database.getOpenHelper().getReadableDatabase().query(
+            "SELECT sourceType,sourceId,resultCode,nextJobId FROM automatic_schedule_events");
+        try {
+            assertTrue(cursor.moveToFirst());
+            assertEquals("fcm", cursor.getString(0));
+            assertEquals(authority.activeJobId, cursor.getString(1));
+            assertEquals("push_replay_wake", cursor.getString(2));
+            assertEquals(authority.activeJobId, cursor.getString(3));
+        } finally {
+            cursor.close();
+        }
+        assertEquals(0L, rowCount("chat_turns"));
+        assertEquals("push_replay_wake", database.executionDao()
+            .latestAutomaticScheduleEvent(authority.streamKey).resultCode);
+        assertEquals(1, database.executionDao().pendingAutomaticDeliveryRecoveryEvents().size());
+    }
+
+    @Test
+    public void claimAndRoleDeleteUseOneDurableTombstoneBoundary() throws Exception {
+        String epoch = "00112233445566778899aabbccddeeff";
+        store.getConversationCursor("yuqi");
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "yuqi", "chat", epoch,
+            automaticSource("bootstrap", "role-delete-claim", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity momentAuthority = schedules.configure(
+            "yuqi", "moment", epoch,
+            automaticSource("bootstrap", "role-delete-claim-moment", 'b', 0L, 1_001L),
+            automaticPolicy(), 1_001L);
+        String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+            "yuqi", database.executionDao().conversationCursor("yuqi"));
+        LifecycleControl control = store.createRoleDelete(
+            "yuqi", "device_gateway", cursorChecksum, backupReceipt("yuqi", 1_100L), 1_101L, null);
+        assertNotNull(control);
+        assertEquals("disabled", database.executionDao()
+            .automaticScheduleAuthority(authority.streamKey).state);
+        assertNull(database.executionDao().automaticScheduleAuthority(authority.streamKey).activeJobId);
+        com.siyi.al.execution.db.AutomaticScheduleOutboxEntity disabledChatOutbox =
+            database.executionDao().automaticScheduleOutbox(
+                authority.streamKey + ":" + (authority.generation + 1L));
+        assertEquals("disable", disabledChatOutbox.operation);
+        assertEquals(authority.streamKey, disabledChatOutbox.streamKey);
+        JSONObject disabledChatSemantic = new JSONObject(disabledChatOutbox.payloadJson);
+        assertEquals("lifecycle", disabledChatSemantic.getString("sourceType"));
+        assertTrue(disabledChatSemantic.getString("sourceId").contains(control.controlId));
+        assertEquals(control.semanticChecksum.length(),
+            disabledChatSemantic.getString("sourceChecksum").length());
+        JSONObject chatSourceBasis = new JSONObject()
+            .put("characterId", "yuqi")
+            .put("controlId", control.controlId)
+            .put("controlChecksum", control.semanticChecksum)
+            .put("kind", "chat");
+        assertEquals(BridgeAuthority.sha256CanonicalJson(chatSourceBasis),
+            disabledChatSemantic.getString("sourceChecksum"));
+        AutomaticScheduleContract.ValidatedTransition chatTransition =
+            AutomaticScheduleContract.validateTransition(disabledChatSemantic);
+        assertEquals("disable", disabledChatSemantic.getString("operation"));
+        assertEquals(authority.activeJobId, disabledChatSemantic.getString("expectedPreviousJobId"));
+        assertTrue(disabledChatSemantic.isNull("jobId"));
+        assertTrue(disabledChatSemantic.isNull("dueAt"));
+        assertTrue(disabledChatSemantic.isNull("mode"));
+        assertEquals(disabledChatOutbox.payloadChecksum, chatTransition.scheduleChecksum);
+        assertEquals(BridgeAuthority.canonicalJson(disabledChatSemantic),
+            BridgeAuthority.canonicalJson(chatTransition.value));
+        assertEquals("disabled", database.executionDao()
+            .automaticScheduleAuthority(momentAuthority.streamKey).state);
+        assertEquals("disable", database.executionDao().automaticScheduleOutbox(
+            momentAuthority.streamKey + ":" + (momentAuthority.generation + 1L)).operation);
+        assertEquals(0L, rowCount("chat_turns"));
+        java.util.HashMap<String, String> raw = new java.util.HashMap<>();
+        raw.put("charId", "yuqi");
+        raw.put("kind", "chat");
+        raw.put("jobId", authority.activeJobId);
+        raw.put("authorityEpoch", epoch);
+        raw.put("generation", String.valueOf(authority.generation));
+        assertEquals(AutomaticTaskCoordinator.DispatchOutcome.STALE,
+            store.claimAutomaticTurn(AutomaticTaskCoordinator.ClaimToken.from(raw), "{}", 1_200L));
+        assertEquals(0L, rowCount("chat_turns"));
+    }
+
+    @Test
+    public void roleDeleteDisableWriteFaultsRollBackBothStreamsAndTombstone() throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String epoch = "00112233445566778899aabbccddeeff";
+        for (int fault = 1; fault <= 6; fault += 1) {
+            final int faultIndex = fault;
+            AlExecutionDatabase faultDb = Room.inMemoryDatabaseBuilder(
+                context, AlExecutionDatabase.class).allowMainThreadQueries().build();
+            try {
+                RoomExecutionStore baseline = new RoomExecutionStore(faultDb, "device_gateway");
+                baseline.getConversationCursor("yuqi");
+                AutomaticScheduleStore schedules = new AutomaticScheduleStore(faultDb, "device_gateway");
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity chat = schedules.configure(
+                    "yuqi", "chat", epoch,
+                    automaticSource("bootstrap", "role-delete-fault-chat-" + fault, 'a', 0L, 1_000L),
+                    automaticPolicy(), 1_000L);
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity moment = schedules.configure(
+                    "yuqi", "moment", epoch,
+                    automaticSource("bootstrap", "role-delete-fault-moment-" + fault, 'b', 0L, 1_001L),
+                    automaticPolicy(), 1_001L);
+                String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+                    "yuqi", faultDb.executionDao().conversationCursor("yuqi"));
+                RoomExecutionStore injected = new RoomExecutionStore(
+                    faultDb, "device_gateway", boundary -> {}, fault);
+                assertThrows(IllegalStateException.class, () -> injected.createRoleDelete(
+                    "yuqi", "device_gateway", cursorChecksum,
+                    backupReceipt("yuqi", 1_900L + faultIndex), 2_000L + faultIndex, null));
+                assertEquals(0L, countRows(faultDb, "lifecycle_controls"));
+                assertEquals(2L, countRows(faultDb, "automatic_schedule_authorities"));
+                assertEquals(2L, countRows(faultDb, "automatic_schedule_outbox"));
+                assertEquals(2L, countRows(faultDb, "automatic_schedule_events"));
+                assertEquals("scheduled", faultDb.executionDao()
+                    .automaticScheduleAuthority(chat.streamKey).state);
+                assertEquals("scheduled", faultDb.executionDao()
+                    .automaticScheduleAuthority(moment.streamKey).state);
+                assertEquals("waiting", faultDb.executionDao()
+                    .automaticScheduleOutbox(chat.streamKey + ":1").state);
+                assertEquals("waiting", faultDb.executionDao()
+                    .automaticScheduleOutbox(moment.streamKey + ":1").state);
+            } finally {
+                faultDb.close();
+            }
+        }
+    }
+
+    @Test
+    public void roleDeleteRestoresExactQuarantinedPredecessorsBeforeOrderedDisableAndReopen()
+        throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String dbName = "task25-role-delete-quarantine-" + UUID.randomUUID().toString().replace("-", "");
+        AlExecutionDatabase fileDb = Room.databaseBuilder(context, AlExecutionDatabase.class, dbName)
+            .allowMainThreadQueries().build();
+        AlExecutionDatabase reopened = null;
+        try {
+            RoomExecutionStore first = new RoomExecutionStore(fileDb, "device_gateway");
+            first.getConversationCursor("yuqi");
+            AutomaticScheduleStore schedules = new AutomaticScheduleStore(fileDb, "device_gateway");
+            com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity chat = schedules.configure(
+                "yuqi", "chat", "00112233445566778899aabbccddeeff",
+                automaticSource("bootstrap", "role-delete-quarantine-chat", 'a', 0L, 1_000L),
+                automaticPolicy(), 1_000L);
+            com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity moment = schedules.configure(
+                "yuqi", "moment", "00112233445566778899aabbccddeeff",
+                automaticSource("bootstrap", "role-delete-quarantine-moment", 'b', 0L, 1_001L),
+                automaticPolicy(), 1_001L);
+            fileDb.getOpenHelper().getWritableDatabase().execSQL(
+                "UPDATE automatic_schedule_outbox SET state='quarantined', leaseId=?, leasedAt=?, "
+                    + "lastErrorCode=? WHERE outboxId=?",
+                new Object[] {"old-lease", 1_500L, "SCHEDULE_AUTHORITY_CONFLICT",
+                    chat.streamKey + ":1"});
+            fileDb.getOpenHelper().getWritableDatabase().execSQL(
+                "UPDATE automatic_schedule_authorities SET cloudSyncState='quarantined' WHERE streamKey=?",
+                new Object[] {chat.streamKey});
+            String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+                "yuqi", fileDb.executionDao().conversationCursor("yuqi"));
+            LifecycleControl control = first.createRoleDelete(
+                "yuqi", "device_gateway", cursorChecksum, backupReceipt("yuqi", 2_000L), 2_001L, null);
+
+            for (String kind : new String[] {"chat", "moment"}) {
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority =
+                    "chat".equals(kind) ? chat : moment;
+                AutomaticScheduleOutboxEntity predecessor = fileDb.executionDao()
+                    .automaticScheduleOutbox(authority.streamKey + ":1");
+                assertEquals("waiting", predecessor.state);
+                assertNull(predecessor.leaseId);
+                assertNull(predecessor.leasedAt);
+                assertEquals("", predecessor.lastErrorCode);
+                AutomaticScheduleOutboxEntity disable = fileDb.executionDao()
+                    .automaticScheduleOutbox(authority.streamKey + ":2");
+                JSONObject wire = new JSONObject(disable.payloadJson);
+                AutomaticScheduleContract.ValidatedTransition validated =
+                    AutomaticScheduleContract.validateTransition(wire);
+                JSONObject sourceBasis = new JSONObject()
+                    .put("characterId", "yuqi")
+                    .put("controlId", control.controlId)
+                    .put("controlChecksum", control.semanticChecksum)
+                    .put("kind", kind);
+                assertEquals("disable", wire.getString("operation"));
+                assertEquals(authority.activeJobId, wire.getString("expectedPreviousJobId"));
+                assertTrue(wire.isNull("jobId"));
+                assertTrue(wire.isNull("dueAt"));
+                assertTrue(wire.isNull("mode"));
+                assertEquals("lifecycle", wire.getString("sourceType"));
+                assertEquals("role_delete_" + control.controlId + "_" + kind,
+                    wire.getString("sourceId"));
+                assertEquals(BridgeAuthority.sha256CanonicalJson(sourceBasis),
+                    wire.getString("sourceChecksum"));
+                assertEquals(disable.payloadChecksum, validated.scheduleChecksum);
+                assertEquals(BridgeAuthority.canonicalJson(wire),
+                    BridgeAuthority.canonicalJson(validated.value));
+            }
+            fileDb.close();
+            fileDb = null;
+            reopened = Room.databaseBuilder(context, AlExecutionDatabase.class, dbName)
+                .allowMainThreadQueries().build();
+            RoomExecutionStore reopenedStore = new RoomExecutionStore(reopened, "device_gateway");
+            LifecycleControl replay = reopenedStore.createRoleDelete(
+                "yuqi", "device_gateway", cursorChecksum,
+                backupReceipt("yuqi", 2_000L), 2_002L, null);
+            assertEquals(control.controlId, replay.controlId);
+            assertEquals(1L, countRows(reopened, "lifecycle_controls"));
+            assertEquals("waiting", reopened.executionDao()
+                .automaticScheduleOutbox(chat.streamKey + ":1").state);
+            assertEquals("waiting", reopened.executionDao()
+                .automaticScheduleOutbox(chat.streamKey + ":2").state);
+            final List<String> sentOperations = new ArrayList<>();
+            HttpTransport transport = (url, headers, body) -> {
+                try {
+                    sentOperations.add(new JSONObject(body).getString("operation"));
+                } catch (Exception error) {
+                    throw new IllegalStateException("invalid sender test body", error);
+                }
+                return new HttpResponse(200, "application/json", "{\"ok\":true}");
+            };
+            AutomaticScheduleSender sender = new AutomaticScheduleSender(
+                reopened, transport, "https://timer.example/v2/schedule-transitions", () -> 5_000L);
+            assertEquals(AutomaticScheduleSender.Outcome.SYNCED, sender.flushOne(5_000L));
+            assertEquals(AutomaticScheduleSender.Outcome.SYNCED, sender.flushOne(5_001L));
+            assertEquals(Arrays.asList("schedule", "disable"), sentOperations);
+        } finally {
+            if (fileDb != null) fileDb.close();
+            if (reopened != null) reopened.close();
+            context.deleteDatabase(dbName);
+        }
+    }
+
+    @Test
+    public void roleDeleteRejectsMissingForeignOrChangedPredecessorWithoutAnyDisableWrite()
+        throws Exception {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String epoch = "00112233445566778899aabbccddeeff";
+        for (String mutation : new String[] {"missing", "checksum", "stream", "payload", "state"}) {
+            AlExecutionDatabase caseDb = Room.inMemoryDatabaseBuilder(
+                context, AlExecutionDatabase.class).allowMainThreadQueries().build();
+            try {
+                RoomExecutionStore baseline = new RoomExecutionStore(caseDb, "device_gateway");
+                baseline.getConversationCursor("yuqi");
+                AutomaticScheduleStore schedules = new AutomaticScheduleStore(caseDb, "device_gateway");
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity chat = schedules.configure(
+                    "yuqi", "chat", epoch,
+                    automaticSource("bootstrap", "role-delete-predecessor-" + mutation, 'a', 0L, 1_000L),
+                    automaticPolicy(), 1_000L);
+                schedules.configure("yuqi", "moment", epoch,
+                    automaticSource("bootstrap", "role-delete-predecessor-moment-" + mutation, 'b', 0L, 1_001L),
+                    automaticPolicy(), 1_001L);
+                String cursorChecksum = RoomExecutionStore.conversationCursorChecksum(
+                    "yuqi", caseDb.executionDao().conversationCursor("yuqi"));
+                if ("missing".equals(mutation)) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "DELETE FROM automatic_schedule_outbox WHERE outboxId=?",
+                        new Object[] {chat.streamKey + ":1"});
+                } else if ("checksum".equals(mutation)) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET payloadChecksum=? WHERE outboxId=?",
+                        new Object[] {repeat('f', 64), chat.streamKey + ":1"});
+                } else if ("stream".equals(mutation)) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET streamKey=? WHERE outboxId=?",
+                        new Object[] {"active:device_gateway:foreign:chat", chat.streamKey + ":1"});
+                } else if ("payload".equals(mutation)) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET payloadJson=? WHERE outboxId=?",
+                        new Object[] {"{}", chat.streamKey + ":1"});
+                } else {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET state='quarantined' WHERE outboxId=?",
+                        new Object[] {chat.streamKey + ":1"});
+                }
+                assertThrows(IllegalStateException.class, () -> baseline.createRoleDelete(
+                    "yuqi", "device_gateway", cursorChecksum,
+                    backupReceipt("yuqi", 2_100L), 2_101L, null));
+                assertEquals(0L, countRows(caseDb, "lifecycle_controls"));
+                assertEquals(2L, countRows(caseDb, "automatic_schedule_authorities"));
+                assertEquals("scheduled", caseDb.executionDao()
+                    .automaticScheduleAuthority(chat.streamKey).state);
+            } finally {
+                caseDb.close();
+            }
+        }
+    }
+
+    @Test
+    public void exactRemotePausedShellWithAutomaticTurnRecordsConflictWithoutRepair() {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        String epoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "yuqi", "chat", epoch,
+            automaticSource("bootstrap", "remote-turn-conflict", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE automatic_schedule_outbox SET state='synced' WHERE streamKey=?",
+            new Object[] { authority.streamKey });
+        store.submitTurn(new TurnSubmission(
+            RoomExecutionStore.automaticTurnId(authority.activeJobId), "yuqi",
+            "automatic-conflict-message", TurnKind.PROACTIVE_CHAT, "{}", "{}",
+            authority.activeJobId, 1_500L));
+        AutomaticScheduleSender.RemoteScheduleStatus remote =
+            new AutomaticScheduleSender.RemoteScheduleStatus(
+                "device_gateway", "yuqi", "chat", true, authority.owner, "paused",
+                authority.generation, null, null, null, authority.semanticChecksum,
+                epoch.substring(0, 8), 0L, 2_000L);
+        assertEquals(RoomExecutionStore.RemoteReconcileResult.CONFLICT,
+            store.reconcileRemotePausedScheduleIfExact(remote, 2_000L));
+        assertEquals("scheduled", database.executionDao()
+            .automaticScheduleAuthority(authority.streamKey).state);
+        assertEquals("synced", database.executionDao()
+            .automaticScheduleAuthority(authority.streamKey).cloudSyncState);
+        assertEquals(1L, countResultRows(database, "remote_conflict"));
+        assertEquals(0L, countResultRows(database, "remote_paused_requeued"));
+    }
+
+    @Test
+    public void exactRemotePausedShellRequeuesTheSameOutboxAtomically() {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        String epoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "yuqi", "chat", epoch,
+            automaticSource("bootstrap", "paused-shell", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE automatic_schedule_outbox SET state='synced' WHERE streamKey=?",
+            new Object[] { authority.streamKey });
+        AutomaticScheduleSender.RemoteScheduleStatus remote =
+            new AutomaticScheduleSender.RemoteScheduleStatus(
+                "device_gateway", "yuqi", "chat", true, "android-v1", "paused",
+                authority.generation, null, null, null, authority.semanticChecksum,
+                epoch.substring(0, 8), 0L, 2_000L);
+        assertTrue(store.requeueRemotePausedScheduleIfExact(remote, 2_000L));
+        assertEquals("waiting", database.executionDao()
+            .automaticScheduleOutbox(authority.streamKey + ":" + authority.generation).state);
+        assertEquals("waiting", database.executionDao()
+            .automaticScheduleAuthority(authority.streamKey).cloudSyncState);
+        assertEquals(2L, rowCount("automatic_schedule_events"));
+        assertFalse(store.requeueRemotePausedScheduleIfExact(
+            new AutomaticScheduleSender.RemoteScheduleStatus(
+                "device_gateway", "yuqi", "chat", true, "android-v1", "paused",
+                authority.generation, null, null, null, authority.semanticChecksum,
+                epoch.substring(0, 8), 1L, 2_001L), 2_001L));
+    }
+
+    @Test
+    public void remoteOwnerMismatchIsMetadataConflictAndGenerationZeroIsRejected() {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        String epoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "yuqi", "chat", epoch,
+            automaticSource("bootstrap", "remote-conflict", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE automatic_schedule_outbox SET state='synced' WHERE streamKey=?",
+            new Object[] { authority.streamKey });
+        AutomaticScheduleSender.RemoteScheduleStatus foreignOwner =
+            new AutomaticScheduleSender.RemoteScheduleStatus(
+                "device_gateway", "yuqi", "chat", true, "foreign-owner", "paused",
+                authority.generation, null, null, null, authority.semanticChecksum,
+                epoch.substring(0, 8), 0L, 2_000L);
+        assertFalse(store.requeueRemotePausedScheduleIfExact(foreignOwner, 2_000L));
+        assertEquals(2L, rowCount("automatic_schedule_events"));
+        Cursor conflict = database.getOpenHelper().getReadableDatabase().query(
+            "SELECT resultCode FROM automatic_schedule_events WHERE resultCode='remote_conflict'");
+        try {
+            assertTrue(conflict.moveToFirst());
+        } finally {
+            conflict.close();
+        }
+        AutomaticScheduleSender.RemoteScheduleStatus zeroGeneration =
+            new AutomaticScheduleSender.RemoteScheduleStatus(
+                "device_gateway", "yuqi", "chat", true, authority.owner, "paused",
+                0L, null, null, null, authority.semanticChecksum,
+                epoch.substring(0, 8), 0L, 3_000L);
+        assertFalse(store.requeueRemotePausedScheduleIfExact(zeroGeneration, 3_000L));
+    }
+
+    @Test
+    public void exactPausedRemoteWithMissingOrCorruptOutboxRecordsOneConflictWithoutRepair() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String[] mutations = {
+            "missing", "state", "outboxId", "streamKey", "generation",
+            "payloadChecksum", "payloadJson"
+        };
+        for (int index = 0; index < mutations.length; index += 1) {
+            AlExecutionDatabase caseDb = Room.inMemoryDatabaseBuilder(
+                context, AlExecutionDatabase.class).allowMainThreadQueries().build();
+            try {
+                String characterId = "remote-conflict-" + index;
+                String epoch = "00112233445566778899aabbccddeeff";
+                AutomaticScheduleStore schedules = new AutomaticScheduleStore(caseDb, "device_gateway");
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+                    characterId, "chat", epoch,
+                    automaticSource("bootstrap", "remote-conflict-" + mutations[index], 'a', 0L, 1_000L),
+                    automaticPolicy(), 1_000L);
+                String outboxId = authority.streamKey + ":" + authority.generation;
+                caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                    "UPDATE automatic_schedule_outbox SET state='synced' WHERE outboxId=?",
+                    new Object[] { outboxId });
+                if ("missing".equals(mutations[index])) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "DELETE FROM automatic_schedule_outbox WHERE outboxId=?",
+                        new Object[] { outboxId });
+                } else if ("state".equals(mutations[index])) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET state='waiting' WHERE outboxId=?",
+                        new Object[] { outboxId });
+                } else if ("outboxId".equals(mutations[index])) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET outboxId=? WHERE outboxId=?",
+                        new Object[] { "foreign-outbox-" + index, outboxId });
+                } else if ("streamKey".equals(mutations[index])) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET streamKey=? WHERE outboxId=?",
+                        new Object[] { "foreign-stream-" + index, outboxId });
+                } else if ("generation".equals(mutations[index])) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET generation=? WHERE outboxId=?",
+                        new Object[] { authority.generation + 1L, outboxId });
+                } else if ("payloadChecksum".equals(mutations[index])) {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET payloadChecksum=? WHERE outboxId=?",
+                        new Object[] { repeat('b', 64), outboxId });
+                } else {
+                    caseDb.getOpenHelper().getWritableDatabase().execSQL(
+                        "UPDATE automatic_schedule_outbox SET payloadJson=? WHERE outboxId=?",
+                        new Object[] { "{}", outboxId });
+                }
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity beforeAuthority =
+                    caseDb.executionDao().automaticScheduleAuthority(authority.streamKey);
+                String beforeOutboxSnapshot = outboxSnapshot(caseDb);
+                com.siyi.al.execution.db.AutomaticScheduleOutboxEntity beforeOutbox =
+                    caseDb.executionDao().automaticScheduleOutbox(outboxId);
+                AutomaticScheduleSender.RemoteScheduleStatus remote =
+                    new AutomaticScheduleSender.RemoteScheduleStatus(
+                        "device_gateway", characterId, "chat", true, authority.owner, "paused",
+                        authority.generation, null, null, null, authority.semanticChecksum,
+                        epoch.substring(0, 8), 0L, 2_000L);
+                RoomExecutionStore caseStore = new RoomExecutionStore(caseDb, "device_gateway");
+                assertEquals(RoomExecutionStore.RemoteReconcileResult.CONFLICT,
+                    caseStore.reconcileRemotePausedScheduleIfExact(remote, 2_000L));
+                com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity afterAuthority =
+                    caseDb.executionDao().automaticScheduleAuthority(authority.streamKey);
+                com.siyi.al.execution.db.AutomaticScheduleOutboxEntity afterOutbox =
+                    caseDb.executionDao().automaticScheduleOutbox(outboxId);
+                assertEquals(beforeAuthority.state, afterAuthority.state);
+                assertEquals(beforeAuthority.cloudSyncState, afterAuthority.cloudSyncState);
+                assertEquals(beforeAuthority.semanticJson, afterAuthority.semanticJson);
+                if (beforeOutbox == null) {
+                    assertNull(afterOutbox);
+                } else {
+                    assertNotNull(afterOutbox);
+                    assertEquals(beforeOutbox.outboxId, afterOutbox.outboxId);
+                    assertEquals(beforeOutbox.streamKey, afterOutbox.streamKey);
+                    assertEquals(beforeOutbox.generation, afterOutbox.generation);
+                    assertEquals(beforeOutbox.state, afterOutbox.state);
+                    assertEquals(beforeOutbox.payloadJson, afterOutbox.payloadJson);
+                    assertEquals(beforeOutbox.payloadChecksum, afterOutbox.payloadChecksum);
+                }
+                assertEquals(beforeOutboxSnapshot, outboxSnapshot(caseDb));
+                assertEquals(0L, countResultRows(caseDb, "remote_paused_requeued"));
+                assertEquals(1L, countResultRows(caseDb, "remote_conflict"));
+                assertEquals(RoomExecutionStore.RemoteReconcileResult.CONFLICT,
+                    caseStore.reconcileRemotePausedScheduleIfExact(remote, 2_001L));
+                assertEquals(1L, countResultRows(caseDb, "remote_conflict"));
+            } finally {
+                caseDb.close();
+            }
+        }
+    }
+
+    @Test
+    public void remoteConflictRemainsSingleAcrossCloseAndReopen() {
+        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
+        String databaseName = "remote-conflict-reopen-" + System.nanoTime();
+        String characterId = "remote-conflict-reopen";
+        String epoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority;
+        AlExecutionDatabase first = Room.databaseBuilder(
+            context, AlExecutionDatabase.class, databaseName).allowMainThreadQueries().build();
+        try {
+            authority = new AutomaticScheduleStore(first, "device_gateway").configure(
+                characterId, "chat", epoch,
+                automaticSource("bootstrap", "remote-conflict-reopen", 'a', 0L, 1_000L),
+                automaticPolicy(), 1_000L);
+            first.getOpenHelper().getWritableDatabase().execSQL(
+                "DELETE FROM automatic_schedule_outbox WHERE outboxId=?",
+                new Object[] { authority.streamKey + ":" + authority.generation });
+            AutomaticScheduleSender.RemoteScheduleStatus remote =
+                new AutomaticScheduleSender.RemoteScheduleStatus(
+                    "device_gateway", characterId, "chat", true, authority.owner, "paused",
+                    authority.generation, null, null, null, authority.semanticChecksum,
+                    epoch.substring(0, 8), 0L, 2_000L);
+            assertEquals(RoomExecutionStore.RemoteReconcileResult.CONFLICT,
+                new RoomExecutionStore(first, "device_gateway")
+                    .reconcileRemotePausedScheduleIfExact(remote, 2_000L));
+            assertEquals(1L, countResultRows(first, "remote_conflict"));
+        } finally {
+            first.close();
+        }
+        AlExecutionDatabase reopened = Room.databaseBuilder(
+            context, AlExecutionDatabase.class, databaseName).allowMainThreadQueries().build();
+        try {
+            AutomaticScheduleSender.RemoteScheduleStatus remote =
+                new AutomaticScheduleSender.RemoteScheduleStatus(
+                    "device_gateway", characterId, "chat", true, authority.owner, "paused",
+                    authority.generation, null, null, null, authority.semanticChecksum,
+                    epoch.substring(0, 8), 1L, 2_001L);
+            assertEquals(RoomExecutionStore.RemoteReconcileResult.CONFLICT,
+                new RoomExecutionStore(reopened, "device_gateway")
+                    .reconcileRemotePausedScheduleIfExact(remote, 2_001L));
+            assertEquals(1L, countResultRows(reopened, "remote_conflict"));
+            assertEquals("scheduled", reopened.executionDao()
+                .automaticScheduleAuthority(authority.streamKey).state);
+            assertEquals("synced", reopened.executionDao()
+                .automaticScheduleAuthority(authority.streamKey).cloudSyncState);
+            assertNull(reopened.executionDao().automaticScheduleOutbox(
+                authority.streamKey + ":" + authority.generation));
+        } finally {
+            reopened.close();
+            context.deleteDatabase(databaseName);
+        }
+    }
+
+    @Test
+    public void concurrentRemoteReconcilersHaveOneRequeueAndNoConflictEvent() throws Exception {
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        String epoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority = schedules.configure(
+            "yuqi", "chat", epoch,
+            automaticSource("bootstrap", "remote-concurrent", 'a', 0L, 1_000L),
+            automaticPolicy(), 1_000L);
+        database.getOpenHelper().getWritableDatabase().execSQL(
+            "UPDATE automatic_schedule_outbox SET state='synced' WHERE streamKey=?",
+            new Object[] { authority.streamKey });
+        AutomaticScheduleSender.RemoteScheduleStatus remote =
+            new AutomaticScheduleSender.RemoteScheduleStatus(
+                "device_gateway", "yuqi", "chat", true, authority.owner, "paused",
+                authority.generation, null, null, null, authority.semanticChecksum,
+                epoch.substring(0, 8), 0L, 2_000L);
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        try {
+            Future<RoomExecutionStore.RemoteReconcileResult> first = workers.submit(
+                () -> store.reconcileRemotePausedScheduleIfExact(remote, 2_000L));
+            Future<RoomExecutionStore.RemoteReconcileResult> second = workers.submit(
+                () -> store.reconcileRemotePausedScheduleIfExact(remote, 2_001L));
+            RoomExecutionStore.RemoteReconcileResult a = first.get(5, TimeUnit.SECONDS);
+            RoomExecutionStore.RemoteReconcileResult b = second.get(5, TimeUnit.SECONDS);
+            assertTrue((a == RoomExecutionStore.RemoteReconcileResult.RECOVERED
+                && b == RoomExecutionStore.RemoteReconcileResult.NOOP)
+                || (b == RoomExecutionStore.RemoteReconcileResult.RECOVERED
+                && a == RoomExecutionStore.RemoteReconcileResult.NOOP));
+            assertEquals(2L, rowCount("automatic_schedule_events"));
+        } finally {
+            workers.shutdownNow();
         }
     }
 
@@ -687,8 +1263,10 @@ public class RoomExecutionStoreTest {
         assertThrows(IllegalStateException.class, () -> configured.createRoleDelete(
             "yuqi", "device_gateway", cursorChecksum, changedReceipt, 404L, null));
         assertEquals(1L, rowCount("lifecycle_controls"));
+        assertThrows(IllegalStateException.class, () -> configured.createRoleDelete(
+            "yuqi", "foreign-peer", cursorChecksum, receipt, 405L, null));
         assertThrows(IllegalStateException.class, () -> configured.submitTurn(
-            yuqiThreeBubbleSubmission("late-after-role-delete", "msg-late-role-delete", 405L)));
+            yuqiThreeBubbleSubmission("late-after-role-delete", "msg-late-role-delete", 406L)));
         assertEquals(0L, rowCount("chat_turns"));
     }
 
@@ -1186,9 +1764,30 @@ public class RoomExecutionStoreTest {
     public void everyRoleDeleteBoundaryRollsBackTheControlReceiptAndRoleRows()
         throws Exception {
         CanonicalFixture fixture = commitCanonicalFixture("task20e-role-delete-fault", "visible", 500L);
+        AutomaticScheduleStore schedules = new AutomaticScheduleStore(database, "device_gateway");
+        String scheduleEpoch = "00112233445566778899aabbccddeeff";
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity protectedChat = schedules.configure(
+            "yuqi", "chat", scheduleEpoch,
+            automaticSource("bootstrap", "outer-boundary-chat", 'a', 0L, 501L),
+            automaticPolicy(), 501L);
+        com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity protectedMoment = schedules.configure(
+            "yuqi", "moment", scheduleEpoch,
+            automaticSource("bootstrap", "outer-boundary-moment", 'b', 0L, 502L),
+            automaticPolicy(), 502L);
         ConversationCursorEntity cursor = database.executionDao().conversationCursor("yuqi");
         String cursorChecksum = RoomExecutionStore.conversationCursorChecksum("yuqi", cursor);
         JSONObject receipt = backupReceipt("yuqi", 600L);
+        String[] roleTables = {
+            "chat_turns", "execution_attempts", "reply_parts", "yuqi_raw_messages",
+            "diagnostics", "change_events", "conversation_authorities", "conversation_cursors",
+            "yuqi_annotations", "memory_records", "yuqi_evidence_facts", "character_snapshots",
+            "role_plan_occurrences", "role_plan_history", "role_plans",
+            "role_notification_cancellations"
+        };
+        long[] roleCounts = new long[roleTables.length];
+        for (int index = 0; index < roleTables.length; index += 1) {
+            roleCounts[index] = rowCount(roleTables[index]);
+        }
         String[] boundaries = {
             "role_delete_control", "role_delete_turn_children", "role_delete_role_data",
             "role_delete_authority", "role_delete_lifecycle"
@@ -1205,6 +1804,17 @@ public class RoomExecutionStoreTest {
             assertNotNull(database.executionDao().conversationCursor("yuqi"));
             assertNotNull(database.executionDao().conversationAuthority(fixture.result.authorityLineageKey));
             assertEquals(0L, rowCount("lifecycle_controls"));
+            assertEquals(2L, rowCount("automatic_schedule_authorities"));
+            assertEquals(2L, rowCount("automatic_schedule_outbox"));
+            assertEquals(2L, rowCount("automatic_schedule_events"));
+            assertEquals("scheduled", database.executionDao()
+                .automaticScheduleAuthority(protectedChat.streamKey).state);
+            assertEquals("scheduled", database.executionDao()
+                .automaticScheduleAuthority(protectedMoment.streamKey).state);
+            for (int tableIndex = 0; tableIndex < roleTables.length; tableIndex += 1) {
+                assertEquals(roleTables[tableIndex], roleCounts[tableIndex],
+                    rowCount(roleTables[tableIndex]));
+            }
             assertEquals(cursorChecksum, RoomExecutionStore.conversationCursorChecksum(
                 "yuqi", database.executionDao().conversationCursor("yuqi")));
         }
@@ -5182,6 +5792,36 @@ public class RoomExecutionStoreTest {
     private static long countRows(AlExecutionDatabase target, String table) {
         Cursor cursor = target.getOpenHelper().getReadableDatabase().query(
             "SELECT COUNT(*) FROM " + table);
+        try {
+            assertTrue(cursor.moveToFirst());
+            return cursor.getLong(0);
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static String outboxSnapshot(AlExecutionDatabase target) {
+        Cursor cursor = target.getOpenHelper().getReadableDatabase().query(
+            "SELECT * FROM automatic_schedule_outbox ORDER BY outboxId");
+        StringBuilder snapshot = new StringBuilder();
+        try {
+            while (cursor.moveToNext()) {
+                for (int column = 0; column < cursor.getColumnCount(); column += 1) {
+                    snapshot.append(cursor.isNull(column) ? "<null>" : cursor.getString(column));
+                    snapshot.append('\u001f');
+                }
+                snapshot.append('\n');
+            }
+            return snapshot.toString();
+        } finally {
+            cursor.close();
+        }
+    }
+
+    private static long countResultRows(AlExecutionDatabase target, String resultCode) {
+        Cursor cursor = target.getOpenHelper().getReadableDatabase().query(
+            "SELECT COUNT(*) FROM automatic_schedule_events WHERE resultCode=?",
+            new String[] { resultCode });
         try {
             assertTrue(cursor.moveToFirst());
             return cursor.getLong(0);

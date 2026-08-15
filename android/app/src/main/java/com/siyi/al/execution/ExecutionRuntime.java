@@ -16,7 +16,23 @@ import com.siyi.al.execution.bridge.RoomBridgeMirror;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.json.JSONObject;
 
-final class ExecutionRuntime {
+public final class ExecutionRuntime {
+    public static final class ReconcileResult {
+        public enum Status { RECOVERED, NOOP, RETRYABLE, CONFLICT }
+        public final Status status;
+        public final int requeued;
+        private ReconcileResult(Status status, int requeued) {
+            this.status = status;
+            this.requeued = requeued;
+        }
+        public static ReconcileResult recovered(int count) {
+            return new ReconcileResult(Status.RECOVERED, count);
+        }
+        public static ReconcileResult noop() { return new ReconcileResult(Status.NOOP, 0); }
+        public static ReconcileResult retryable() { return new ReconcileResult(Status.RETRYABLE, 0); }
+        public static ReconcileResult conflict() { return new ReconcileResult(Status.CONFLICT, 0); }
+        public boolean shouldRetry() { return status == Status.RETRYABLE; }
+    }
     private static AutomaticScheduleSender automaticScheduleSender;
     private static String automaticScheduleEndpoint = "";
     private ExecutionRuntime() {}
@@ -90,6 +106,38 @@ final class ExecutionRuntime {
         }
         return completed;
     }
+
+    public static int reconcileRemotePausedSchedules(Context context) {
+        return reconcileRemotePausedSchedulesResult(context).requeued;
+    }
+
+    public static ReconcileResult reconcileRemotePausedSchedulesResult(Context context) {
+        AlExecutionDatabase database = AlExecutionDatabase.get(context);
+        AutomaticScheduleSender sender = createAutomaticScheduleSender(context, database);
+        if (sender == null) return ReconcileResult.noop();
+        RoomExecutionStore store = new RoomExecutionStore(database);
+        int requeued = 0;
+        int conflicts = 0;
+        int retryable = 0;
+        long now = System.currentTimeMillis();
+        for (com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity authority
+                : database.executionDao().scheduledAutomaticScheduleAuthorities()) {
+            try {
+                AutomaticScheduleSender.RemoteScheduleStatus remote = sender.fetchStatus(authority);
+                RoomExecutionStore.RemoteReconcileResult outcome =
+                    store.reconcileRemotePausedScheduleIfExact(remote, now);
+                if (outcome == RoomExecutionStore.RemoteReconcileResult.RECOVERED) requeued += 1;
+                if (outcome == RoomExecutionStore.RemoteReconcileResult.CONFLICT) conflicts += 1;
+            } catch (RuntimeException error) {
+                retryable += 1;
+            }
+        }
+        if (retryable > 0) return ReconcileResult.retryable();
+        if (conflicts > 0) return ReconcileResult.conflict();
+        if (requeued > 0) return ReconcileResult.recovered(requeued);
+        return ReconcileResult.noop();
+    }
+
 
     /** Return the next authority-outbox wake delay in seconds, or -1 when none/config absent. */
     static long nextAutomaticScheduleDelay(Context context) {
