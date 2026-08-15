@@ -7,9 +7,11 @@ process.env.TZ = 'Asia/Shanghai';
 const html = readFileSync('tavern-app/index.html', 'utf8');
 const script = html.match(/<script>([\s\S]*)<\/script>/)?.[1];
 const apiEndpointHelper = readFileSync('tavern-app/lib/api-endpoint.js', 'utf8');
+const appStateRecoveryHelper = readFileSync('tavern-app/lib/app-state-recovery.js', 'utf8');
 const rolePlanDomain = readFileSync('tavern-app/lib/role-plan-domain.js', 'utf8');
 const liveDirectorHelper = readFileSync('tavern-app/lib/live-chat-director.js', 'utf8');
 assert.ok(script, 'index.html should contain an inline app script');
+const executableScript = script.replace(/\nbootApp\(\);\n/, '\n');
 assert.match(html, /<script src="\.\/lib\/live-chat-director\.js"><\/script>/);
 const swScript = readFileSync('tavern-app/sw-v11.js', 'utf8');
 assert.match(swScript, /importScripts\('\.\/lib\/live-chat-director\.js'\)/);
@@ -180,6 +182,7 @@ assert.match(html, /<script src="\.\/lib\/role-plan-domain\.js"><\/script>/, 'ro
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-domain\.js[^\]]*\]/, 'role plan domain must be available offline');
 assert.match(html, /<script src="\.\/lib\/role-plan-repository\.js"><\/script>/, 'role plan repository must load before the inline app script');
 assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/role-plan-repository\.js[^\]]*\]/, 'role plan repository must be available offline');
+assert.match(swScript, /APP_SHELL = \[[^\]]*\.\/lib\/app-state-recovery\.js[^\]]*\]/, 'app recovery helper must be available offline');
 assert.match(script, /function getRolePlanRepository\(\)/, 'app must create one role plan repository over native Room or IndexedDB');
 assert.match(script, /async function applyRolePlanOperations\(/, 'chat and native results must persist hidden plan operations');
 assert.match(script, /async function syncRolePlanCloudJobs\(/, 'effective role plans must receive independent cloud wakes');
@@ -524,9 +527,10 @@ assert.match(swScript, /后台主动私聊/);
 assert.match(swScript, /后台朋友圈动态/);
 assert.match(swScript, /req\.onupgradeneeded/);
 assert.match(swScript, /ensure\('vectors'/);
-assert.match(swScript, /deleteObjectStore\('meta'\)/);
+assert.doesNotMatch(swScript, /deleteObjectStore\('meta'\)/);
+assert.match(swScript, /req\.transaction\.abort\(\)/);
 assert.match(swScript, /ensure\('meta', \[\['updatedAt', 'updatedAt'\]\]\)/);
-assert.match(script, /deleteObjectStore\('meta'\)/);
+assert.doesNotMatch(script, /deleteObjectStore\('meta'\)/);
 assert.match(script, /ensure\('meta', \[\['updatedAt', 'updatedAt'\]\]\)/);
 assert.match(script, /returnPromptDetails: true/);
 assert.match(script, /diagnostic = responseDiagnostic\(json, raw\)/);
@@ -899,9 +903,10 @@ const context = {
   },
 };
 const modelListFetch = context.fetch;
+context.window = {};
 
 vm.createContext(context);
-vm.runInContext(`${apiEndpointHelper}\n${liveDirectorHelper}\n${script}
+vm.runInContext(`${apiEndpointHelper}\n${appStateRecoveryHelper}\nwindow.ALAppStateRecovery = globalThis.ALAppStateRecovery;\n${liveDirectorHelper}\n${executableScript}
 globalThis.__appTest = {
   parseCharacterCard,
   buildCharPrompt,
@@ -1028,6 +1033,7 @@ globalThis.__appTest = {
   mirrorAppState,
   RP_PRESETS,
 };`, context);
+vm.runInContext("appStateRecoveryGuard.applyDecision({ mode: 'normal', frozen: false, source: 'local', reasonCode: '' })", context);
 
 assert.equal(vm.runInContext('typeof withCognitionV3Snapshot', context), 'function', 'Task15 must expose the bounded cognition-v3 semantic snapshot');
 assert.equal(vm.runInContext('typeof withLocalFallbackExecution', context), 'function', 'Task15 must expose the separate local fallback carrier');

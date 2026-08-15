@@ -250,3 +250,135 @@ test('mirror and legacy recovery screen models retain only safe role labels', ()
   assert.equal(legacy.roles[0].displayName, '虞栖');
 });
 
+function transactionHarness(initial = {}, initialMirror = null) {
+  const rows = new Map(Object.entries(initial));
+  const journal = new Map();
+  let mirror = structuredClone(initialMirror);
+  let unlocked = '';
+  return {
+    storage: {
+      getItem(key) { return rows.has(key) ? rows.get(key) : null; },
+      setItem(key, value) { rows.set(key, String(value)); },
+      removeItem(key) { rows.delete(key); }
+    },
+    journal: {
+      async get(key) { return journal.get(key) ?? null; },
+      async put(key, value) { journal.set(key, structuredClone(value)); }
+    },
+    async readMirror() { return structuredClone(mirror); },
+    async writeMirror(value) { mirror = structuredClone(value); },
+    async restoreMirror(value) { mirror = structuredClone(value); },
+    unlock(checksum) { unlocked = checksum; },
+    rows,
+    journalRows: journal,
+    get mirror() { return mirror; },
+    get unlocked() { return unlocked; }
+  };
+}
+
+const emptyRawState = {
+  rpchat_settings: JSON.stringify({ playerName: '青衫困' }),
+  rpchat_characters: '[]',
+  rpchat_chats: '{}',
+  rpchat_moments: '[]',
+  rpchat_app_state_updated_at: '1'
+};
+
+const recoveredState = {
+  settings: { playerName: '青衫困' },
+  characters: [{ id: 'yuqi', name: '虞栖' }],
+  allChats: { yuqi: { messages: [{ id: 'm1', role: 'user', content: '你好', time: 2 }] } },
+  allMoments: [],
+  updatedAt: 20
+};
+
+test('native role and message candidates use frozen cross-language checksums', async () => {
+  const { verifyNativeRoleCandidate, verifyNativeRecoveryMessage } = recoveryModule();
+  const role = {
+    characterId: 'yuqi', name: '虞栖', playerName: '青衫困', systemPrompt: '提示',
+    createdAt: 100, sourceSnapshotId: 'snap-1',
+    sourceChecksum: '3b015a2fed4f0868eae8de94a48289bf0d3775fc0e742be0b36b945264905663'
+  };
+  const message = {
+    messageId: 'm1', turnId: 't1', characterId: 'yuqi', speakerId: 'user',
+    speakerType: 'user', recipientId: 'yuqi', content: '你好', sentAt: 200,
+    origin: 'phone', deviceId: 'phone', deviceSeq: 1,
+    sourceChecksum: '4b0058f9adc0826e88cb141efd3fc525597a86f0b5edff0acf24a770578c7e65'
+  };
+  assert.equal((await verifyNativeRoleCandidate(role)).characterId, 'yuqi');
+  assert.equal((await verifyNativeRecoveryMessage(message)).messageId, 'm1');
+  await assert.rejects(() => verifyNativeRoleCandidate({ ...role, name: '篡改' }), /CHECKSUM_CONFLICT/);
+  await assert.rejects(() => verifyNativeRecoveryMessage({ ...message, content: '篡改' }), /CHECKSUM_CONFLICT/);
+});
+
+test('two-phase recovery commits verified state before unlocking writes', async () => {
+  const { runRecoveryTransaction } = recoveryModule();
+  const harness = transactionHarness(emptyRawState);
+  const result = await runRecoveryTransaction({
+    storage: harness.storage,
+    journal: harness.journal,
+    readMirror: () => harness.readMirror(),
+    writeMirror: value => harness.writeMirror(value),
+    restoreMirror: value => harness.restoreMirror(value),
+    unlock: checksum => harness.unlock(checksum),
+    source: 'native',
+    reasonCode: 'WEB_ROLE_DIRECTORY_MISSING',
+    targetState: recoveredState,
+    now: 100
+  });
+  assert.equal(result.state, 'committed');
+  assert.deepEqual(JSON.parse(harness.rows.get('rpchat_characters')), recoveredState.characters);
+  assert.deepEqual(harness.mirror.characters, recoveredState.characters);
+  assert.equal(harness.journalRows.get('recovery_candidate_v1').state, 'committed');
+  assert.equal(harness.unlocked, result.candidateChecksum);
+});
+
+test('a prepared recovery journal rolls back exact raw state after restart', async () => {
+  const { rollbackPreparedRecovery, sha256CanonicalJson } = recoveryModule();
+  const originalMirror = { characters: [{ id: 'prior' }], updatedAt: 1 };
+  const harness = transactionHarness(emptyRawState, originalMirror);
+  const mirrorBasis = { present: true, value: originalMirror };
+  await harness.journal.put('recovery_before_v1', emptyRawState);
+  await harness.journal.put('recovery_before_mirror_v1', {
+    version: 1,
+    ...mirrorBasis,
+    checksum: await sha256CanonicalJson(mirrorBasis)
+  });
+  await harness.journal.put('recovery_candidate_v1', {
+    version: 1, state: 'prepared', source: 'native', reasonCode: 'WEB_ROLE_DIRECTORY_MISSING',
+    beforeChecksum: await sha256CanonicalJson(emptyRawState),
+    candidateChecksum: 'a'.repeat(64), preparedAt: 100, committedAt: null
+  });
+  harness.storage.setItem('rpchat_characters', JSON.stringify([{ id: 'partial' }]));
+  await harness.writeMirror({ characters: [{ id: 'partial' }], updatedAt: 2 });
+  assert.equal(await rollbackPreparedRecovery({
+    storage: harness.storage,
+    journal: harness.journal,
+    restoreMirror: value => harness.restoreMirror(value)
+  }), true);
+  assert.deepEqual(Object.fromEntries(harness.rows), emptyRawState);
+  assert.deepEqual(harness.mirror, originalMirror);
+  assert.equal(harness.journalRows.get('recovery_candidate_v1').state, 'rolled_back');
+});
+
+test('faults at every pre-unlock boundary restore the exact prior raw state', async () => {
+  const { runRecoveryTransaction } = recoveryModule();
+  for (let boundary = 1; boundary <= 7; boundary += 1) {
+    const harness = transactionHarness(emptyRawState);
+    await assert.rejects(() => runRecoveryTransaction({
+      storage: harness.storage,
+      journal: harness.journal,
+      writeMirror: value => harness.writeMirror(value),
+      unlock: checksum => harness.unlock(checksum),
+      source: 'native',
+      reasonCode: 'WEB_ROLE_DIRECTORY_MISSING',
+      targetState: recoveredState,
+      now: 100,
+      faultAfter: boundary
+    }), new RegExp(`APP_STATE_RECOVERY_FAULT_${boundary}`));
+    assert.deepEqual(Object.fromEntries(harness.rows), emptyRawState, `boundary ${boundary}`);
+    assert.equal(harness.journalRows.get('recovery_candidate_v1').state, 'rolled_back');
+    assert.equal(harness.unlocked, '');
+  }
+});
+

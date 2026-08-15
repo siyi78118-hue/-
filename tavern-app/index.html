@@ -962,8 +962,8 @@ button.cell:active{background:#ececec}
 <script src="./lib/role-plan-domain.js"></script>
 <script src="./lib/role-plan-repository.js"></script>
 <script src="./lib/live-chat-director.js"></script>
-<script src="./lib/yuqi-core-preset.js"></script>
 <script src="./lib/app-state-recovery.js"></script>
+<script src="./lib/yuqi-core-preset.js"></script>
 <script>
 const AppStateRecovery = window.ALAppStateRecovery;
 if (!AppStateRecovery) throw new Error('APP_STATE_RECOVERY_MODULE_MISSING');
@@ -1680,7 +1680,8 @@ const MemoryDB = {
         ensure('profiles', [['charId', 'charId'], ['type', 'type'], ['createdAt', 'createdAt']]);
         ensure('vectors', [['charId', 'charId'], ['sourceId', 'sourceId'], ['sourceType', 'sourceType']]);
         if (db.objectStoreNames.contains('meta') && req.transaction.objectStore('meta').keyPath !== 'key') {
-          db.deleteObjectStore('meta');
+          req.transaction.abort();
+          return;
         }
         ensure('meta', [['updatedAt', 'updatedAt']]);
       };
@@ -5472,12 +5473,15 @@ function repairKnownDeliveredReplyStates(chats) {
   });
   return changed;
 }
-characters = characters.map(normalizeChar);
-DB.set('characters', characters);
-const scrubbedEmptyReplies = scrubEmptyReplyMessages(allChats);
-const repairedDeliveredReplies = repairKnownDeliveredReplyStates(allChats);
-if (scrubbedEmptyReplies || repairedDeliveredReplies) DB.set('chats', allChats);
-if (characters.some(char => char.id === YUQI_FIRST_PROFILE.id)) ensureYuqiFirstAcquaintance();
+function normalizeLoadedAppStateAfterRecoveryGate() {
+  appStateRecoveryGuard.assertWritable('post_recovery_normalization');
+  characters = characters.map(normalizeChar);
+  DB.set('characters', characters);
+  const scrubbedEmptyReplies = scrubEmptyReplyMessages(allChats);
+  const repairedDeliveredReplies = repairKnownDeliveredReplyStates(allChats);
+  if (scrubbedEmptyReplies || repairedDeliveredReplies) DB.set('chats', allChats);
+  if (characters.some(char => char.id === YUQI_FIRST_PROFILE.id)) ensureYuqiFirstAcquaintance();
+}
 
 function normalizePresetKey(key) {
   return key === 'custom' ? 'custom' : 'combined';
@@ -13702,15 +13706,60 @@ function appStateRecoveryLocalEvidence() {
   };
 }
 
-async function readExistingAppStateMirrorForRecovery() {
-  if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') {
-    return { unavailable: true };
+const APP_RECOVERY_JOURNAL_DB = 'al-app-recovery-v1';
+const APP_RECOVERY_JOURNAL_STORE = 'journal';
+const AppRecoveryJournal = {
+  dbPromise: null,
+  async open() {
+    if (typeof indexedDB === 'undefined') throw new Error('APP_STATE_RECOVERY_JOURNAL_UNAVAILABLE');
+    if (this.dbPromise) return this.dbPromise;
+    this.dbPromise = new Promise((resolve, reject) => {
+      const request = indexedDB.open(APP_RECOVERY_JOURNAL_DB, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(APP_RECOVERY_JOURNAL_STORE)) {
+          db.createObjectStore(APP_RECOVERY_JOURNAL_STORE, { keyPath: 'key' });
+          return;
+        }
+        if (request.transaction.objectStore(APP_RECOVERY_JOURNAL_STORE).keyPath !== 'key') {
+          request.transaction.abort();
+        }
+      };
+      request.onerror = () => reject(request.error || new Error('APP_STATE_RECOVERY_JOURNAL_OPEN_FAILED'));
+      request.onblocked = () => reject(new Error('APP_STATE_RECOVERY_JOURNAL_BLOCKED'));
+      request.onsuccess = () => resolve(request.result);
+    });
+    return this.dbPromise;
+  },
+  async get(key) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(APP_RECOVERY_JOURNAL_STORE, 'readonly');
+      const request = transaction.objectStore(APP_RECOVERY_JOURNAL_STORE).get(String(key));
+      request.onerror = () => reject(request.error || new Error('APP_STATE_RECOVERY_JOURNAL_READ_FAILED'));
+      request.onsuccess = () => resolve(request.result?.value ?? null);
+    });
+  },
+  async put(key, value) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(APP_RECOVERY_JOURNAL_STORE, 'readwrite');
+      transaction.objectStore(APP_RECOVERY_JOURNAL_STORE).put({ key: String(key), value });
+      transaction.oncomplete = () => resolve(value);
+      transaction.onerror = () => reject(transaction.error || new Error('APP_STATE_RECOVERY_JOURNAL_WRITE_FAILED'));
+      transaction.onabort = () => reject(transaction.error || new Error('APP_STATE_RECOVERY_JOURNAL_WRITE_ABORTED'));
+    });
   }
+};
+
+async function openExistingAppStateMirrorForRecovery() {
+  if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') return null;
   const databases = await indexedDB.databases();
   if (!databases.some(row => row?.name === MEMORY_DB_NAME)) return null;
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(MEMORY_DB_NAME);
     request.onerror = () => reject(request.error || new Error('APP_STATE_MIRROR_OPEN_FAILED'));
+    request.onblocked = () => reject(new Error('APP_STATE_MIRROR_BLOCKED'));
     request.onsuccess = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains('meta')) {
@@ -13718,13 +13767,64 @@ async function readExistingAppStateMirrorForRecovery() {
         resolve(null);
         return;
       }
-      const transaction = db.transaction('meta', 'readonly');
-      const get = transaction.objectStore('meta').get('app_state');
-      get.onerror = () => reject(get.error || new Error('APP_STATE_MIRROR_READ_FAILED'));
-      get.onsuccess = () => resolve(get.result?.value || null);
-      transaction.oncomplete = () => db.close();
-      transaction.onabort = () => db.close();
+      const probe = db.transaction('meta', 'readonly').objectStore('meta');
+      if (probe.keyPath !== 'key') {
+        db.close();
+        reject(new Error('APP_STATE_MIRROR_SCHEMA_CONFLICT'));
+        return;
+      }
+      resolve(db);
     };
+  });
+}
+
+async function readExistingAppStateMirrorForRecovery() {
+  if (typeof indexedDB === 'undefined' || typeof indexedDB.databases !== 'function') {
+    return { unavailable: true };
+  }
+  const db = await openExistingAppStateMirrorForRecovery();
+  if (!db) return null;
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction('meta', 'readonly');
+    const request = transaction.objectStore('meta').get('app_state');
+    request.onerror = () => reject(request.error || new Error('APP_STATE_MIRROR_READ_FAILED'));
+    request.onsuccess = () => resolve(request.result?.value || null);
+    transaction.oncomplete = () => db.close();
+    transaction.onabort = () => db.close();
+  });
+}
+
+async function writeExistingAppStateMirrorForRecovery(value) {
+  const db = await openExistingAppStateMirrorForRecovery();
+  if (!db) return false;
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction('meta', 'readwrite');
+    transaction.objectStore('meta').put({
+      key: 'app_state',
+      value: JSON.parse(JSON.stringify(value)),
+      updatedAt: Number(value?.updatedAt) || Date.now()
+    });
+    transaction.oncomplete = () => { db.close(); resolve(true); };
+    transaction.onerror = () => { db.close(); reject(transaction.error || new Error('APP_STATE_MIRROR_WRITE_FAILED')); };
+    transaction.onabort = () => { db.close(); reject(transaction.error || new Error('APP_STATE_MIRROR_WRITE_ABORTED')); };
+  });
+}
+
+async function restoreExistingAppStateMirrorForRecovery(value) {
+  const db = await openExistingAppStateMirrorForRecovery();
+  if (!db) return false;
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction('meta', 'readwrite');
+    const store = transaction.objectStore('meta');
+    if (value === null || value === undefined) store.delete('app_state');
+    else store.put({
+      key: 'app_state',
+      value: JSON.parse(JSON.stringify(value)),
+      updatedAt: Number(value?.updatedAt) || 0
+    });
+    transaction.oncomplete = () => { db.close(); resolve(true); };
+    transaction.onerror = () => { db.close(); reject(transaction.error || new Error('APP_STATE_MIRROR_RESTORE_FAILED')); };
+    transaction.onabort = () => { db.close(); reject(transaction.error || new Error('APP_STATE_MIRROR_RESTORE_ABORTED')); };
   });
 }
 
@@ -13741,7 +13841,207 @@ async function inspectNativeAppRecoveryState() {
   }
 }
 
+function assertAppRecoveryPageShape(page, characterId) {
+  const keys = ['contract', 'characterId', 'messages', 'nextAfterSentAt', 'nextAfterMessageId', 'done'];
+  if (!page || typeof page !== 'object' || Array.isArray(page)
+    || Object.keys(page).sort().join(',') !== keys.sort().join(',')
+    || page.contract !== 'android-app-recovery-message-page-v1'
+    || page.characterId !== characterId
+    || !Array.isArray(page.messages)
+    || typeof page.done !== 'boolean'
+    || !Number.isSafeInteger(page.nextAfterSentAt) || page.nextAfterSentAt < 0
+    || typeof page.nextAfterMessageId !== 'string') {
+    throw new Error('APP_STATE_RECOVERY_MESSAGE_PAGE_CONFLICT');
+  }
+}
+
+function compareAppRecoveryCursor(leftSentAt, leftMessageId, rightSentAt, rightMessageId) {
+  if (leftSentAt !== rightSentAt) return leftSentAt < rightSentAt ? -1 : 1;
+  if (leftMessageId === rightMessageId) return 0;
+  return leftMessageId < rightMessageId ? -1 : 1;
+}
+
+async function readNativeAppStateRecoveryCandidate(recoveryDecision) {
+  const plugin = nativeExecutionPlugin();
+  if (!plugin?.readAppRecoveryRoleCandidate || !plugin?.readAppRecoveryMessages) {
+    throw new Error('APP_STATE_RECOVERY_NATIVE_READER_UNAVAILABLE');
+  }
+  const roles = (recoveryDecision.native?.roles || []).filter(role => role?.candidateAvailable === true);
+  if (!roles.length || roles.length !== Number(recoveryDecision.native?.roleCount || 0)) {
+    throw new Error('APP_STATE_RECOVERY_NATIVE_CANDIDATE_INCOMPLETE');
+  }
+  const recoveredCharacters = [];
+  const recoveredChats = {};
+  let recoveredPlayerName = '';
+  for (const roleEvidence of roles) {
+    const characterId = String(roleEvidence.characterId || '');
+    const candidate = await AppStateRecovery.verifyNativeRoleCandidate(
+      await plugin.readAppRecoveryRoleCandidate({ characterId })
+    );
+    if (candidate.characterId !== characterId) {
+      throw new Error('APP_STATE_RECOVERY_ROLE_IDENTITY_CONFLICT');
+    }
+    if (!recoveredPlayerName && candidate.playerName) recoveredPlayerName = candidate.playerName;
+    const name = candidate.name || characterId;
+    recoveredCharacters.push({
+      id: characterId,
+      name,
+      description: '',
+      personality: '',
+      scenario: '',
+      firstMessage: '',
+      mesExample: '',
+      systemPrompt: '',
+      postHistoryInstructions: '',
+      tags: [],
+      avatar: name.slice(0, 1),
+      avatarData: null,
+      createdAt: candidate.createdAt,
+      recoveryPresentationIncomplete: true,
+      recoverySourceSnapshotId: candidate.sourceSnapshotId,
+      recoverySourceChecksum: candidate.sourceChecksum
+    });
+
+    const messages = [];
+    const seenMessageIds = new Set();
+    let afterSentAt = 0;
+    let afterMessageId = '';
+    let done = false;
+    for (let pageNumber = 0; pageNumber < 10000 && !done; pageNumber += 1) {
+      const page = await plugin.readAppRecoveryMessages({
+        characterId,
+        afterSentAt,
+        afterMessageId,
+        limit: 200
+      });
+      assertAppRecoveryPageShape(page, characterId);
+      let pageLastSentAt = afterSentAt;
+      let pageLastMessageId = afterMessageId;
+      for (const raw of page.messages) {
+        const message = await AppStateRecovery.verifyNativeRecoveryMessage(raw);
+        if (message.characterId !== characterId
+          || compareAppRecoveryCursor(message.sentAt, message.messageId, pageLastSentAt, pageLastMessageId) <= 0
+          || seenMessageIds.has(message.messageId)) {
+          throw new Error('APP_STATE_RECOVERY_MESSAGE_IDENTITY_CONFLICT');
+        }
+        if (message.speakerType === 'user') {
+          if (message.speakerId !== 'user' || message.recipientId !== characterId) {
+            throw new Error('APP_STATE_RECOVERY_MESSAGE_SPEAKER_CONFLICT');
+          }
+        } else if (message.speakerType === 'character') {
+          if (message.speakerId !== characterId || message.recipientId !== 'user') {
+            throw new Error('APP_STATE_RECOVERY_MESSAGE_SPEAKER_CONFLICT');
+          }
+        } else {
+          throw new Error('APP_STATE_RECOVERY_MESSAGE_SPEAKER_CONFLICT');
+        }
+        seenMessageIds.add(message.messageId);
+        messages.push({
+          id: message.messageId,
+          role: message.speakerType === 'user' ? 'user' : 'assistant',
+          content: message.content,
+          time: message.sentAt,
+          sourceTurnId: 'native:' + message.turnId,
+          nativeRecoveryChecksum: message.sourceChecksum
+        });
+        pageLastSentAt = message.sentAt;
+        pageLastMessageId = message.messageId;
+      }
+      if (page.nextAfterSentAt !== pageLastSentAt || page.nextAfterMessageId !== pageLastMessageId
+        || (!page.done && page.messages.length === 0)) {
+        throw new Error('APP_STATE_RECOVERY_MESSAGE_CURSOR_CONFLICT');
+      }
+      afterSentAt = page.nextAfterSentAt;
+      afterMessageId = page.nextAfterMessageId;
+      done = page.done;
+    }
+    if (!done) throw new Error('APP_STATE_RECOVERY_MESSAGE_PAGE_LIMIT');
+    recoveredChats[characterId] = {
+      messages,
+      charPrompt: '',
+      extraPrompt: '',
+      unread: 0,
+      recoveryPresentationIncomplete: true
+    };
+  }
+  return {
+    settings: recoveredPlayerName ? { playerName: recoveredPlayerName } : {},
+    characters: recoveredCharacters,
+    allChats: recoveredChats,
+    allMoments: [],
+    updatedAt: Date.now()
+  };
+}
+
+async function executeAppStateRecoveryCommit(recoveryDecision) {
+  let candidate;
+  if (recoveryDecision.source === 'native') {
+    candidate = await readNativeAppStateRecoveryCandidate(recoveryDecision);
+  } else if (recoveryDecision.source === 'mirror') {
+    candidate = recoveryDecision.mirror;
+  } else if (recoveryDecision.source === 'legacy') {
+    candidate = recoveryDecision.local;
+  } else {
+    throw new Error('APP_STATE_RECOVERY_SOURCE_CONFLICT');
+  }
+  if (!candidate || !Array.isArray(candidate.characters) || candidate.characters.length === 0) {
+    throw new Error('APP_STATE_RECOVERY_CANDIDATE_EMPTY');
+  }
+  const targetState = AppStateRecovery.mergeRecoveryState(
+    appStateRecoveryLocalEvidence(),
+    candidate
+  );
+  targetState.updatedAt = Date.now();
+  const result = await AppStateRecovery.runRecoveryTransaction({
+    storage: localStorage,
+    journal: AppRecoveryJournal,
+    readMirror: readExistingAppStateMirrorForRecovery,
+    writeMirror: writeExistingAppStateMirrorForRecovery,
+    restoreMirror: restoreExistingAppStateMirrorForRecovery,
+    unlock: checksum => appStateRecoveryGuard.unlockAfterVerifiedRecovery(checksum),
+    source: recoveryDecision.source,
+    reasonCode: recoveryDecision.reasonCode,
+    targetState
+  });
+  location.reload();
+  return result;
+}
+
 async function prepareAppStateRecovery() {
+  if (isNativeApp()) {
+    try {
+      const rolledBack = await AppStateRecovery.rollbackPreparedRecovery({
+        storage: localStorage,
+        journal: AppRecoveryJournal,
+        restoreMirror: restoreExistingAppStateMirrorForRecovery
+      });
+      if (rolledBack) {
+        const rollbackDecision = {
+          mode: 'rollback_complete',
+          frozen: true,
+          source: '',
+          reasonCode: 'INTERRUPTED_RECOVERY_ROLLED_BACK',
+          local: {}, mirror: null, native: { roleCount: 0 }
+        };
+        currentAppStateRecoveryDecision = rollbackDecision;
+        appStateRecoveryGuard.applyDecision(rollbackDecision);
+        location.reload();
+        return rollbackDecision;
+      }
+    } catch (error) {
+      console.error('[AL Recovery] interrupted recovery rollback failed:', error);
+      const conflictDecision = {
+        mode: 'diagnostic_only',
+        frozen: true,
+        source: '',
+        reasonCode: 'RECOVERY_JOURNAL_CONFLICT',
+        local: {}, mirror: null, native: { unavailable: true }
+      };
+      currentAppStateRecoveryDecision = conflictDecision;
+      appStateRecoveryGuard.applyDecision(conflictDecision);
+      return conflictDecision;
+    }
+  }
   const local = appStateRecoveryLocalEvidence();
   let mirror = null;
   try {
@@ -13870,6 +14170,7 @@ async function bootApp() {
     renderAppStateRecoveryBlocker(recoveryDecision);
     return;
   }
+  normalizeLoadedAppStateAfterRecoveryGate();
   const native = isNativeApp();
   if (native) {
     // Critical native execution wake-up paths must not wait behind optional

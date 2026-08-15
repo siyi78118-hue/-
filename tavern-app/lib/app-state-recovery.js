@@ -243,6 +243,274 @@
     };
   }
 
+  function canonicalJson(value) {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+    if (typeof value === 'object') {
+      return `{${Object.keys(value).sort().filter(key => value[key] !== undefined)
+        .map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+    }
+    if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw new Error('APP_STATE_RECOVERY_CANONICAL_NUMBER_INVALID');
+      return JSON.stringify(value);
+    }
+    if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+    throw new Error('APP_STATE_RECOVERY_CANONICAL_VALUE_INVALID');
+  }
+
+  async function sha256CanonicalJson(value) {
+    const text = canonicalJson(value);
+    if (typeof globalThis !== 'undefined' && globalThis.crypto?.subtle) {
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+      return [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+    }
+    if (typeof require === 'function') {
+      return require('node:crypto').createHash('sha256').update(text, 'utf8').digest('hex');
+    }
+    throw new Error('APP_STATE_RECOVERY_SHA256_UNAVAILABLE');
+  }
+
+  const RECOVERY_RAW_KEYS = Object.freeze([
+    'rpchat_settings',
+    'rpchat_characters',
+    'rpchat_chats',
+    'rpchat_moments',
+    'rpchat_app_state_updated_at'
+  ]);
+
+  function captureRecoveryRawState(storage) {
+    const snapshot = {};
+    for (const key of RECOVERY_RAW_KEYS) snapshot[key] = storage.getItem(key);
+    return snapshot;
+  }
+
+  function restoreRecoveryRawState(storage, snapshot) {
+    for (const key of RECOVERY_RAW_KEYS) {
+      if (snapshot[key] === null || snapshot[key] === undefined) storage.removeItem(key);
+      else storage.setItem(key, snapshot[key]);
+    }
+  }
+
+  function recoverySemanticState(targetState = {}) {
+    return {
+      settings: clone(targetState.settings || {}),
+      characters: clone(Array.isArray(targetState.characters) ? targetState.characters : []),
+      allChats: clone(targetState.allChats && typeof targetState.allChats === 'object'
+        ? targetState.allChats : {}),
+      allMoments: clone(Array.isArray(targetState.allMoments) ? targetState.allMoments : []),
+      updatedAt: safeCount(targetState.updatedAt)
+    };
+  }
+
+  function readRecoverySemanticState(storage) {
+    return recoverySemanticState({
+      settings: JSON.parse(storage.getItem('rpchat_settings') || '{}'),
+      characters: JSON.parse(storage.getItem('rpchat_characters') || '[]'),
+      allChats: JSON.parse(storage.getItem('rpchat_chats') || '{}'),
+      allMoments: JSON.parse(storage.getItem('rpchat_moments') || '[]'),
+      updatedAt: Number(storage.getItem('rpchat_app_state_updated_at')) || 0
+    });
+  }
+
+  function assertExactKeys(value, expected, label) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).sort().join(',') !== [...expected].sort().join(',')) {
+      throw new Error(`APP_STATE_RECOVERY_${label}_SHAPE_CONFLICT`);
+    }
+  }
+
+  function requireRecoveryString(value, key, allowEmpty = false) {
+    if (typeof value[key] !== 'string' || (!allowEmpty && !value[key])) {
+      throw new Error(`APP_STATE_RECOVERY_${key.toUpperCase()}_TYPE_CONFLICT`);
+    }
+  }
+
+  function requireRecoveryInteger(value, key) {
+    if (!Number.isSafeInteger(value[key]) || value[key] < 0) {
+      throw new Error(`APP_STATE_RECOVERY_${key.toUpperCase()}_TYPE_CONFLICT`);
+    }
+  }
+
+  async function verifyNativeRoleCandidate(candidate) {
+    const keys = ['characterId', 'name', 'playerName', 'systemPrompt', 'createdAt',
+      'sourceSnapshotId', 'sourceChecksum'];
+    assertExactKeys(candidate, keys, 'ROLE_CANDIDATE');
+    for (const key of ['characterId', 'name', 'playerName', 'sourceSnapshotId', 'sourceChecksum']) {
+      requireRecoveryString(candidate, key);
+    }
+    requireRecoveryString(candidate, 'systemPrompt', true);
+    requireRecoveryInteger(candidate, 'createdAt');
+    if (!/^[0-9a-f]{64}$/.test(candidate.sourceChecksum)) {
+      throw new Error('APP_STATE_RECOVERY_ROLE_CHECKSUM_CONFLICT');
+    }
+    const basis = clone(candidate);
+    delete basis.sourceChecksum;
+    if (await sha256CanonicalJson(basis) !== candidate.sourceChecksum) {
+      throw new Error('APP_STATE_RECOVERY_ROLE_CHECKSUM_CONFLICT');
+    }
+    return clone(candidate);
+  }
+
+  async function verifyNativeRecoveryMessage(message) {
+    const keys = ['messageId', 'turnId', 'characterId', 'speakerId', 'speakerType',
+      'recipientId', 'content', 'sentAt', 'origin', 'deviceId', 'deviceSeq', 'sourceChecksum'];
+    assertExactKeys(message, keys, 'MESSAGE_CANDIDATE');
+    for (const key of ['messageId', 'turnId', 'characterId', 'speakerId', 'speakerType',
+      'recipientId', 'origin', 'deviceId', 'sourceChecksum']) {
+      requireRecoveryString(message, key);
+    }
+    requireRecoveryString(message, 'content', true);
+    requireRecoveryInteger(message, 'sentAt');
+    requireRecoveryInteger(message, 'deviceSeq');
+    if (!/^[0-9a-f]{64}$/.test(message.sourceChecksum)) {
+      throw new Error('APP_STATE_RECOVERY_MESSAGE_CHECKSUM_CONFLICT');
+    }
+    const basis = clone(message);
+    delete basis.sourceChecksum;
+    if (await sha256CanonicalJson(basis) !== message.sourceChecksum) {
+      throw new Error('APP_STATE_RECOVERY_MESSAGE_CHECKSUM_CONFLICT');
+    }
+    return clone(message);
+  }
+
+  async function runRecoveryTransaction({
+    storage,
+    journal,
+    writeMirror,
+    readMirror,
+    restoreMirror,
+    unlock,
+    source,
+    reasonCode,
+    targetState,
+    now = Date.now(),
+    faultAfter = 0
+  } = {}) {
+    if (!storage?.getItem || !storage?.setItem || !storage?.removeItem
+      || !journal?.put || typeof writeMirror !== 'function' || typeof unlock !== 'function') {
+      throw new Error('APP_STATE_RECOVERY_ADAPTER_INVALID');
+    }
+    const semantic = recoverySemanticState(targetState);
+    const beforeRaw = captureRecoveryRawState(storage);
+    const beforeMirror = typeof readMirror === 'function' ? await readMirror() : null;
+    const beforeChecksum = await sha256CanonicalJson(beforeRaw);
+    const beforeMirrorRecord = {
+      version: 1,
+      present: beforeMirror !== null && beforeMirror !== undefined,
+      value: beforeMirror !== null && beforeMirror !== undefined ? clone(beforeMirror) : null
+    };
+    beforeMirrorRecord.checksum = await sha256CanonicalJson({
+      present: beforeMirrorRecord.present,
+      value: beforeMirrorRecord.value
+    });
+    const candidateChecksum = await sha256CanonicalJson(semantic);
+    let record = {
+      version: 1,
+      state: 'prepared',
+      source: String(source || ''),
+      reasonCode: String(reasonCode || ''),
+      beforeChecksum,
+      candidateChecksum,
+      preparedAt: safeCount(now),
+      committedAt: null
+    };
+    let mirrorWritten = false;
+    let unlocked = false;
+    const fault = boundary => {
+      if (Number(faultAfter) === boundary) throw new Error(`APP_STATE_RECOVERY_FAULT_${boundary}`);
+    };
+    try {
+      await journal.put('recovery_before_v1', beforeRaw);
+      await journal.put('recovery_before_mirror_v1', beforeMirrorRecord);
+      await journal.put('recovery_candidate_v1', record);
+      fault(1);
+
+      storage.setItem('rpchat_settings', JSON.stringify(semantic.settings));
+      storage.setItem('rpchat_characters', JSON.stringify(semantic.characters));
+      fault(2);
+      storage.setItem('rpchat_chats', JSON.stringify(semantic.allChats));
+      fault(3);
+      storage.setItem('rpchat_moments', JSON.stringify(semantic.allMoments));
+      storage.setItem('rpchat_app_state_updated_at', String(semantic.updatedAt));
+      fault(4);
+
+      const verified = readRecoverySemanticState(storage);
+      if (await sha256CanonicalJson(verified) !== candidateChecksum) {
+        throw new Error('APP_STATE_RECOVERY_VERIFY_CONFLICT');
+      }
+      fault(5);
+
+      await writeMirror(clone(semantic));
+      mirrorWritten = true;
+      fault(6);
+
+      record = { ...record, state: 'committed', committedAt: safeCount(now) };
+      await journal.put('recovery_candidate_v1', record);
+      fault(7);
+
+      unlock(candidateChecksum);
+      unlocked = true;
+      fault(8);
+      return clone(record);
+    } catch (error) {
+      if (!unlocked) {
+        restoreRecoveryRawState(storage, beforeRaw);
+        if (mirrorWritten && typeof restoreMirror === 'function') {
+          await restoreMirror(beforeMirror);
+        }
+        record = { ...record, state: 'rolled_back', committedAt: null };
+        await journal.put('recovery_candidate_v1', record);
+      }
+      throw error;
+    }
+  }
+
+  async function rollbackPreparedRecovery({ storage, journal, restoreMirror } = {}) {
+    if (!storage?.getItem || !storage?.setItem || !storage?.removeItem
+      || !journal?.get || !journal?.put) {
+      throw new Error('APP_STATE_RECOVERY_ADAPTER_INVALID');
+    }
+    const record = await journal.get('recovery_candidate_v1');
+    if (!record || record.state !== 'prepared') return false;
+    assertExactKeys(record, [
+      'version', 'state', 'source', 'reasonCode', 'beforeChecksum',
+      'candidateChecksum', 'preparedAt', 'committedAt'
+    ], 'JOURNAL');
+    if (record.version !== 1 || record.committedAt !== null
+      || !Number.isSafeInteger(record.preparedAt) || record.preparedAt < 0
+      || typeof record.source !== 'string' || !record.source
+      || typeof record.reasonCode !== 'string' || !record.reasonCode
+      || !/^[0-9a-f]{64}$/.test(record.beforeChecksum)
+      || !/^[0-9a-f]{64}$/.test(record.candidateChecksum)) {
+      throw new Error('APP_STATE_RECOVERY_JOURNAL_CONFLICT');
+    }
+    const beforeRaw = await journal.get('recovery_before_v1');
+    assertExactKeys(beforeRaw, RECOVERY_RAW_KEYS, 'BEFORE_SNAPSHOT');
+    if (await sha256CanonicalJson(beforeRaw) !== record.beforeChecksum) {
+      throw new Error('APP_STATE_RECOVERY_BEFORE_CHECKSUM_CONFLICT');
+    }
+    restoreRecoveryRawState(storage, beforeRaw);
+    const beforeMirrorRecord = await journal.get('recovery_before_mirror_v1');
+    if (beforeMirrorRecord !== null && typeof restoreMirror === 'function') {
+      assertExactKeys(beforeMirrorRecord, ['version', 'present', 'value', 'checksum'], 'MIRROR_SNAPSHOT');
+      if (beforeMirrorRecord.version !== 1 || typeof beforeMirrorRecord.present !== 'boolean'
+        || !/^[0-9a-f]{64}$/.test(beforeMirrorRecord.checksum)
+        || await sha256CanonicalJson({
+          present: beforeMirrorRecord.present,
+          value: beforeMirrorRecord.value
+        }) !== beforeMirrorRecord.checksum) {
+        throw new Error('APP_STATE_RECOVERY_MIRROR_SNAPSHOT_CONFLICT');
+      }
+      await restoreMirror(beforeMirrorRecord.present ? beforeMirrorRecord.value : null);
+    }
+    await journal.put('recovery_candidate_v1', {
+      ...record,
+      state: 'rolled_back',
+      committedAt: null
+    });
+    return true;
+  }
+
   function createWriteGuard() {
     let decisionState = decision('pending', true, '', 'APP_STATE_RECOVERY_FROZEN');
     let recoveryChecksum = '';
@@ -284,6 +552,12 @@
     buildRecoveryScreenModel,
     decideRecovery,
     mergeRecoveryState,
+    canonicalJson,
+    sha256CanonicalJson,
+    verifyNativeRoleCandidate,
+    verifyNativeRecoveryMessage,
+    runRecoveryTransaction,
+    rollbackPreparedRecovery,
     createWriteGuard
   });
 });

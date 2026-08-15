@@ -1859,3 +1859,42 @@ test('frozen phone recovery screen exposes only recovery and metadata-copy actio
   assert.match(screen, /databaseBytes/);
   assert.match(screen, /rawMessageCount/);
 });
+
+test('pre-boot recovery census runs before any normalization write', () => {
+  const preBoot = html.slice(
+    html.indexOf('function normalizePresetKey'),
+    html.indexOf('async function bootApp()')
+  );
+  assert.doesNotMatch(preBoot, /normalizeLoadedAppStateAfterRecoveryGate\(\);/,
+    'normalization must not execute at script load');
+  const normalizer = html.slice(
+    html.indexOf('function normalizeLoadedAppStateAfterRecoveryGate'),
+    html.indexOf('function normalizePresetKey')
+  );
+  assert.match(normalizer, /appStateRecoveryGuard\.assertWritable/);
+  const boot = html.slice(html.indexOf('async function bootApp()'), html.indexOf('bootApp();'));
+  assert.ok(
+    boot.indexOf('if (recoveryDecision.frozen)') < boot.indexOf('normalizeLoadedAppStateAfterRecoveryGate()'),
+    'normalization must run only after the frozen early return'
+  );
+});
+
+test('native recovery commit pages verified Room data through a separate recovery journal', () => {
+  const recovery = html.slice(
+    html.indexOf('const APP_RECOVERY_JOURNAL_DB'),
+    html.indexOf('async function syncFromServiceWorkerState')
+  );
+  assert.match(recovery, /readAppRecoveryRoleCandidate/);
+  assert.match(recovery, /readAppRecoveryMessages/);
+  assert.match(recovery, /verifyNativeRoleCandidate/);
+  assert.match(recovery, /verifyNativeRecoveryMessage/);
+  assert.match(recovery, /runRecoveryTransaction/);
+  assert.match(recovery, /al-app-recovery-v1/);
+  assert.doesNotMatch(recovery, /MemoryDB\.setMeta\('recovery_/);
+  assert.match(recovery, /location\.reload\(\)/);
+});
+
+test('MemoryDB upgrade never deletes an existing meta store during recovery', () => {
+  const open = html.slice(html.indexOf('async open()'), html.indexOf('readFallback()'));
+  assert.doesNotMatch(open, /deleteObjectStore\('meta'\)/);
+});

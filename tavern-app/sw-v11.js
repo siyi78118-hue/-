@@ -1,7 +1,7 @@
 importScripts('./lib/live-chat-director.js');
 
 const CACHE_NAME = 'rpchat-v120';
-const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './warm-modern.css', './lib/api-endpoint.js', './lib/role-plan-domain.js', './lib/role-plan-repository.js', './lib/live-chat-director.js', './sw-v11.js'];
+const APP_SHELL = ['./index.html', './manifest.json', './icon.svg', './warm-modern.css', './lib/api-endpoint.js', './lib/role-plan-domain.js', './lib/role-plan-repository.js', './lib/live-chat-director.js', './lib/app-state-recovery.js', './sw-v11.js'];
 const MEMORY_DB_NAME = 'ALMemoryDB';
 const MEMORY_DB_VERSION = 2;
 const PROACTIVE_JOB_KINDS = ['chat', 'moment'];
@@ -78,7 +78,8 @@ function openMemoryDB() {
       ensure('profiles', [['charId', 'charId'], ['type', 'type'], ['createdAt', 'createdAt']]);
       ensure('vectors', [['charId', 'charId'], ['sourceId', 'sourceId'], ['sourceType', 'sourceType']]);
       if (db.objectStoreNames.contains('meta') && req.transaction.objectStore('meta').keyPath !== 'key') {
-        db.deleteObjectStore('meta');
+        req.transaction.abort();
+        return;
       }
       ensure('meta', [['updatedAt', 'updatedAt']]);
     };
