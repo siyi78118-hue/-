@@ -200,7 +200,7 @@ test('cron defers an automatic authority job without writing the legacy timer ta
   assert.equal(deferred.jobId, automatic.jobId);
   assert.equal(deferred.awaitingAck, true);
   assert.ok(deferred.nextAttemptAt > Date.now());
-  assert.equal(store.deliveryProbe?.workerVersion, '2026-08-15.8');
+  assert.equal(store.deliveryProbe?.workerVersion, '2026-08-15.9');
   assert.equal(store.deliveryProbe?.stage, 'awaiting_phone_ack');
   assert.equal(store.deliveryProbe?.jobId, automatic.jobId);
   assert.deepEqual(
@@ -218,6 +218,42 @@ test('cron defers an automatic authority job without writing the legacy timer ta
     },
     'the phone must receive the exact Room/D1 claim token'
   );
+});
+
+test('a missing push subscription never consumes an automatic authority generation', async () => {
+  const store = new MemoryTimerStore();
+  const automatic = {
+    automaticAuthority: true,
+    streamKey: 'active:device-missing:char-a:chat',
+    authorityEpoch: '00112233445566778899aabbccddeeff',
+    generation: 7,
+    deviceId: 'device-missing',
+    charId: 'char-a',
+    kind: 'chat',
+    jobId: 'pro_missing_subscription_7',
+    dueAt: Date.now() - 60_000,
+    nextDeliveryAttemptAt: new Date(Date.now() - 60_000).toISOString(),
+    deliveryAttempts: 99
+  };
+  let deferred = null;
+  let acknowledged = 0;
+  store.dueJobs = async () => deferred ? [] : [structuredClone(automatic)];
+  store.claimAutomaticDelivery = async () => ({ claimed: true });
+  store.deferAutomaticDelivery = async input => {
+    deferred = structuredClone(input);
+    return { deferred: true };
+  };
+  store.ackAutomaticDelivery = async () => {
+    acknowledged += 1;
+    return { acknowledged: true };
+  };
+
+  await runCron(envFor(store));
+
+  assert.equal(acknowledged, 0, 'transport absence is not a phone acknowledgement');
+  assert.equal(deferred.streamKey, automatic.streamKey);
+  assert.equal(deferred.awaitingAck, false);
+  assert.ok(deferred.nextAttemptAt > Date.now());
 });
 
 test('manual push tests use an isolated job and never wait for automatic authority ACK', async () => {

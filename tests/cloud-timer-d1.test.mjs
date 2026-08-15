@@ -69,11 +69,12 @@ class SingleJobD1 {
 }
 
 class StreamAuthorityD1 {
-  constructor({ claimMetaChangesZero = false } = {}) {
+  constructor({ claimMetaChangesZero = false, mutationMetaChangesZero = false } = {}) {
     this.rows = new Map();
     this.legacyRows = new Map();
     this.writeCount = 0;
     this.claimMetaChangesZero = claimMetaChangesZero;
+    this.mutationMetaChangesZero = mutationMetaChangesZero;
   }
 
   async batch(statements) {
@@ -105,7 +106,9 @@ class StreamAuthorityD1 {
               schedule_checksum: args[12], delivery_attempts: 0, updated_at: args[13]
             });
             this.writeCount += 1;
-            return { meta: { changes: 1 } };
+            return this.mutationMetaChangesZero
+              ? { results: sql.includes('RETURNING logical_key') ? [{ logical_key: args[0] }] : [], meta: { changes: 0 } }
+              : { meta: { changes: 1 } };
           }
           if (sql.includes('UPDATE timer_stream_authorities')) {
             const current = this.rows.get(args[0]);
@@ -122,7 +125,9 @@ class StreamAuthorityD1 {
                   meta: { changes: 0 }
                 };
               }
-              return { meta: { changes: 1 } };
+              return this.mutationMetaChangesZero
+                ? { results: sql.includes('RETURNING logical_key') ? [{ logical_key: args[0] }] : [], meta: { changes: 0 } }
+                : { meta: { changes: 1 } };
             }
             if (sql.includes('delivery_attempts = delivery_attempts + 1')) {
               const matches = current && current.authority_epoch === args[1]
@@ -134,7 +139,9 @@ class StreamAuthorityD1 {
                 delivery_attempts: current.delivery_attempts + 1, updated_at: args[6]
               });
               this.writeCount += 1;
-              return { meta: { changes: 1 } };
+              return this.mutationMetaChangesZero
+                ? { results: sql.includes('RETURNING logical_key') ? [{ logical_key: args[0] }] : [], meta: { changes: 0 } }
+                : { meta: { changes: 1 } };
             }
             if (sql.includes('active_job_id = NULL')) {
               const matches = current && current.authority_epoch === args[1]
@@ -146,7 +153,9 @@ class StreamAuthorityD1 {
                 expected_previous_job_id: args[3], delivery_attempts: 0, updated_at: args[4]
               });
               this.writeCount += 1;
-              return { meta: { changes: 1 } };
+              return this.mutationMetaChangesZero
+                ? { results: sql.includes('RETURNING logical_key') ? [{ logical_key: args[0] }] : [], meta: { changes: 0 } }
+                : { meta: { changes: 1 } };
             }
             const matches = current
               && current.owner === args[10]
@@ -161,7 +170,9 @@ class StreamAuthorityD1 {
               delivery_attempts: 0, updated_at: args[8]
             });
             this.writeCount += 1;
-            return { meta: { changes: 1 } };
+            return this.mutationMetaChangesZero
+              ? { results: sql.includes('RETURNING logical_key') ? [{ logical_key: args[0] }] : [], meta: { changes: 0 } }
+              : { meta: { changes: 1 } };
           }
           throw new Error(`unexpected stream run SQL: ${sql}`);
         },
@@ -562,6 +573,49 @@ test('a D1 claim uses the returned CAS row when metadata reports zero changes', 
 
   assert.deepEqual(result, { claimed: true });
   assert.equal(db.rows.get(transition.streamKey).due_at, transition.dueAt + 60_000);
+});
+
+test('all automatic authority mutations use returned CAS rows when D1 reports zero metadata changes', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const first = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1({ mutationMetaChangesZero: true });
+  const store = createD1TimerStore(db);
+
+  assert.deepEqual(await store.transitionAutomaticStream(first), { idempotent: false });
+  const second = await nextTransition(first);
+  assert.deepEqual(await store.transitionAutomaticStream(second), { idempotent: false });
+  const identity = {
+    streamKey: second.streamKey,
+    authorityEpoch: second.authorityEpoch,
+    generation: second.generation,
+    jobId: second.jobId
+  };
+  assert.deepEqual(await store.deferAutomaticDelivery({
+    ...identity,
+    nextAttemptAt: second.dueAt + 60_000,
+    awaitingAck: true
+  }), { deferred: true });
+  assert.deepEqual(await store.ackAutomaticDelivery(identity), { acknowledged: true });
+  assert.equal(db.rows.get(first.streamKey).state, 'paused');
+});
+
+test('the phone may advance from a cloud-acknowledged generation using its delivered job as predecessor', async () => {
+  const fixture = JSON.parse(await readFile(new URL('./fixtures/automatic-schedule-authority-v1.json', import.meta.url), 'utf8'));
+  const first = fixture.vectors[0].transition;
+  const db = new StreamAuthorityD1();
+  const store = createD1TimerStore(db);
+  await store.transitionAutomaticStream(first);
+  await store.ackAutomaticDelivery({
+    streamKey: first.streamKey,
+    authorityEpoch: first.authorityEpoch,
+    generation: first.generation,
+    jobId: first.jobId
+  });
+
+  const second = await nextTransition(first);
+  assert.deepEqual(await store.transitionAutomaticStream(second), { idempotent: false });
+  assert.equal(db.rows.get(first.streamKey).generation, 2);
+  assert.equal(db.rows.get(first.streamKey).active_job_id, second.jobId);
 });
 
 test('automatic schedule contract freezes canonical bytes and rejects coerced native types', async () => {

@@ -30,7 +30,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Yuqi-Registration'
 };
-const CLOUD_TIMER_WORKER_VERSION = '2026-08-15.8';
+const CLOUD_TIMER_WORKER_VERSION = '2026-08-15.9';
 const FCM_ACK_MAX_ATTEMPTS = 8;
 const FIREBASE_FETCH_TIMEOUT_MS = 10_000;
 const PUSH_SUBSCRIPTION_TIMEOUT_MS = 10_000;
@@ -361,6 +361,9 @@ function timerStore(env) {
 
 function createD1TimerStore(db) {
   const parseJob = row => row?.payload_json ? JSON.parse(row.payload_json) : null;
+  const changedExactlyOne = result => Array.isArray(result?.results)
+    ? result.results.length === 1
+    : Number(result?.meta?.changes || 0) === 1;
   const automaticStream = async logicalKey => db.prepare(`SELECT logical_key, device_id, char_id, kind, owner,
       authority_epoch, generation, state, active_job_id, due_at, payload_json,
       expected_previous_job_id, schedule_checksum, delivery_attempts, updated_at
@@ -380,8 +383,13 @@ function createD1TimerStore(db) {
       if (current.schedule_checksum === input.scheduleChecksum) return 'idempotent';
       throw automaticConflict('SCHEDULE_CHECKSUM_CONFLICT', 'automatic schedule checksum conflict');
     }
+    const expectedPrevious = input.expectedPreviousJobId ?? null;
+    const validPredecessors = new Set([current.active_job_id ?? null]);
+    if (current.state === 'paused' && current.expected_previous_job_id != null) {
+      validPredecessors.add(current.expected_previous_job_id);
+    }
     if (input.generation !== Number(current.generation) + 1
-        || (current.active_job_id ?? null) !== (input.expectedPreviousJobId ?? null)) {
+        || !validPredecessors.has(expectedPrevious)) {
       throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
     }
     return 'advance';
@@ -426,7 +434,8 @@ function createD1TimerStore(db) {
            active_job_id, due_at, payload_json, expected_previous_job_id, schedule_checksum,
            delivery_attempts, updated_at)
           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?14)
-          ON CONFLICT(logical_key) DO NOTHING`)
+          ON CONFLICT(logical_key) DO NOTHING
+          RETURNING logical_key`)
           .bind(input.streamKey, input.deviceId, input.characterId, input.kind, input.owner,
             input.authorityEpoch, input.generation, state, activeJobId, dueAt, payloadJson,
             input.expectedPreviousJobId, input.scheduleChecksum, updatedAt);
@@ -435,7 +444,7 @@ function createD1TimerStore(db) {
           insertStatement,
           db.prepare('DELETE FROM timer_jobs WHERE logical_key = ?1').bind(input.streamKey)
         ]);
-        if (Number(inserted?.meta?.changes || 0) === 1) return { idempotent: false };
+        if (changedExactlyOne(inserted)) return { idempotent: false };
         const winner = await automaticStream(input.streamKey);
         if (winner && assertAutomaticTransition(winner, input) === 'idempotent') return { idempotent: true };
         throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
@@ -446,12 +455,13 @@ function createD1TimerStore(db) {
           expected_previous_job_id = ?7, schedule_checksum = ?8, delivery_attempts = 0, updated_at = ?9
         WHERE logical_key = ?1 AND owner = ?11 AND authority_epoch = ?12 AND generation = ?13
           AND ((active_job_id = ?14) OR (active_job_id IS NULL AND ?14 IS NULL))
-          AND schedule_checksum = ?15`)
+          AND schedule_checksum = ?15
+        RETURNING logical_key`)
         .bind(input.streamKey, input.generation, state, activeJobId, dueAt, payloadJson,
           input.expectedPreviousJobId, input.scheduleChecksum, updatedAt, null,
           current.owner, current.authority_epoch, current.generation, current.active_job_id,
           current.schedule_checksum).run();
-      if (Number(updated?.meta?.changes || 0) === 1) return { idempotent: false };
+      if (changedExactlyOne(updated)) return { idempotent: false };
       const winner = await automaticStream(input.streamKey);
       if (winner && assertAutomaticTransition(winner, input) === 'idempotent') return { idempotent: true };
       throw automaticConflict('SCHEDULE_GENERATION_CONFLICT', 'automatic schedule generation conflict');
@@ -487,10 +497,11 @@ function createD1TimerStore(db) {
       const updated = await db.prepare(`UPDATE timer_stream_authorities SET
           state = ?5, due_at = ?6, delivery_attempts = delivery_attempts + 1, updated_at = ?7
         WHERE logical_key = ?1 AND authority_epoch = ?2 AND generation = ?3
-          AND active_job_id = ?4 AND state IN ('scheduled', 'awaiting_ack')`)
+          AND active_job_id = ?4 AND state IN ('scheduled', 'awaiting_ack')
+        RETURNING logical_key`)
         .bind(input.streamKey, input.authorityEpoch, input.generation, input.jobId,
           nextState, input.nextAttemptAt, Date.now()).run();
-      if (Number(updated?.meta?.changes || 0) !== 1) {
+      if (!changedExactlyOne(updated)) {
         throw automaticConflict('SCHEDULE_STALE_DELIVERY', 'automatic schedule stale delivery');
       }
       return { deferred: true };
@@ -504,9 +515,10 @@ function createD1TimerStore(db) {
           state = 'paused', active_job_id = NULL, due_at = NULL, payload_json = NULL,
           expected_previous_job_id = ?4, delivery_attempts = 0, updated_at = ?5
         WHERE logical_key = ?1 AND authority_epoch = ?2 AND generation = ?3
-          AND active_job_id = ?4 AND state IN ('scheduled', 'awaiting_ack')`)
+          AND active_job_id = ?4 AND state IN ('scheduled', 'awaiting_ack')
+        RETURNING logical_key`)
         .bind(input.streamKey, input.authorityEpoch, input.generation, input.jobId, Date.now()).run();
-      if (Number(updated?.meta?.changes || 0) !== 1) {
+      if (!changedExactlyOne(updated)) {
         throw automaticConflict('SCHEDULE_STALE_DELIVERY', 'automatic schedule stale delivery');
       }
       return { acknowledged: true };
@@ -725,9 +737,8 @@ function minuteKey(ms) {
 
 async function deferForFcmAck(job, env) {
   const attempts = Math.max(0, Number(job.deliveryAttempts) || 0) + 1;
-  if (attempts > FCM_ACK_MAX_ATTEMPTS) {
-    if (job.automaticAuthority) await timerStore(env).ackAutomaticDelivery(automaticDeliveryIdentity(job));
-    else await cancelJob(job.jobId, env);
+  if (attempts > FCM_ACK_MAX_ATTEMPTS && !job.automaticAuthority) {
+    await cancelJob(job.jobId, env);
     await appendEvent(env, { type: 'ack-timeout', deviceId: shortId(job.deviceId), jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', attempts, ok: false, reason: 'phone did not acknowledge background generation' });
     return false;
   }
@@ -753,9 +764,8 @@ async function deferForFcmAck(job, env) {
 
 async function deferForDeliveryRetry(job, env, reason = '') {
   const attempts = Math.max(0, Number(job.deliveryAttempts) || 0) + 1;
-  if (attempts > FCM_ACK_MAX_ATTEMPTS) {
-    if (job.automaticAuthority) await timerStore(env).ackAutomaticDelivery(automaticDeliveryIdentity(job));
-    else await cancelJob(job.jobId, env);
+  if (attempts > FCM_ACK_MAX_ATTEMPTS && !job.automaticAuthority) {
+    await cancelJob(job.jobId, env);
     await appendEvent(env, {
       type: 'delivery-timeout',
       deviceId: shortId(job.deviceId),
@@ -804,7 +814,7 @@ async function deliverJob(job, env) {
     PUSH_SUBSCRIPTION_TIMEOUT_MS,
     () => store.getSubscription(job.deviceId)
   );
-  if (!target) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: false };
+  if (!target) return { ok: false, reason: 'missing subscription', jobId: job.jobId, retry: true };
   await recordDeliveryProbe(env, job, 'subscription_loaded');
   await recordDeliveryProbe(env, job, 'push_started');
   const result = await runStageWithTimeout(
@@ -835,7 +845,7 @@ async function deliverJob(job, env) {
   await recordDeliveryProbe(env, job, 'push_finished', { ok: !!result?.ok, reason: String(result?.reason || '').slice(0, 160) });
   if (result.expired) {
     await store.deleteSubscription(job.deviceId);
-    return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: false };
+    return { ok: false, reason: 'subscription expired', jobId: job.jobId, retry: true };
   }
   if (!result.ok) return { ok: false, reason: result.reason || 'push failed', jobId: job.jobId, retry: true };
   return { ok: true, jobId: job.jobId, charId: job.charId || '', kind: job.kind || '', test: !!job.test, retry: false, awaitingAck: !job.test && result.transport === 'fcm' && Number(target.backgroundAck) >= 1, transport: result.transport || '' };
