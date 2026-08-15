@@ -372,6 +372,45 @@ public interface AlExecutionDao {
     @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId ORDER BY sentAt DESC LIMIT :limit")
     List<RawMessageEntity> recentRawMessages(String characterId, int limit);
 
+    @Query("SELECT characterId FROM ("
+        + "SELECT characterId FROM character_snapshots "
+        + "UNION SELECT characterId FROM chat_turns "
+        + "UNION SELECT characterId FROM yuqi_raw_messages "
+        + "UNION SELECT characterId FROM memory_records "
+        + "UNION SELECT characterId FROM role_plans"
+        + ") AS recovery_roles WHERE characterId != '' AND NOT EXISTS ("
+        + "SELECT 1 FROM lifecycle_controls controls "
+        + "WHERE controls.characterId = recovery_roles.characterId "
+        + "AND controls.controlKind = 'role_delete_v1') "
+        + "ORDER BY characterId ASC")
+    List<String> appRecoveryCharacterIds();
+
+    @Query("SELECT * FROM character_snapshots WHERE characterId = :characterId "
+        + "ORDER BY createdAt DESC, snapshotId DESC LIMIT 1")
+    CharacterSnapshotEntity latestRecoverySnapshot(String characterId);
+
+    @Query("SELECT COUNT(*) FROM chat_turns WHERE characterId = :characterId")
+    long appRecoveryTurnCount(String characterId);
+
+    @Query("SELECT COUNT(*) FROM yuqi_raw_messages WHERE characterId = :characterId")
+    long appRecoveryRawMessageCount(String characterId);
+
+    @Query("SELECT COUNT(*) FROM reply_parts parts INNER JOIN chat_turns turns "
+        + "ON turns.turnId = parts.turnId WHERE turns.characterId = :characterId")
+    long appRecoveryReplyPartCount(String characterId);
+
+    @Query("SELECT COUNT(*) FROM memory_records WHERE characterId = :characterId")
+    long appRecoveryMemoryCount(String characterId);
+
+    @Query("SELECT COUNT(*) FROM role_plans WHERE characterId = :characterId")
+    long appRecoveryRolePlanCount(String characterId);
+
+    @Query("SELECT * FROM yuqi_raw_messages WHERE characterId = :characterId AND "
+        + "(sentAt > :afterSentAt OR (sentAt = :afterSentAt AND messageId > :afterMessageId)) "
+        + "ORDER BY sentAt ASC, messageId ASC LIMIT :limit")
+    List<RawMessageEntity> appRecoveryRawMessages(
+        String characterId, long afterSentAt, String afterMessageId, int limit);
+
     @Query("SELECT * FROM yuqi_raw_messages WHERE messageId = :messageId LIMIT 1")
     RawMessageEntity rawMessage(String messageId);
 

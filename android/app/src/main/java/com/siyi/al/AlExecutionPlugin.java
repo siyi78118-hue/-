@@ -45,6 +45,7 @@ import com.siyi.al.execution.RolePlanAlarmScheduler;
 import com.siyi.al.execution.AutomaticTaskAlarmScheduler;
 import com.siyi.al.execution.secure.AlSecretStore;
 import android.content.Context;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
@@ -656,6 +657,43 @@ public final class AlExecutionPlugin extends Plugin {
         execute(call, () -> {
             String characterId = required(call, "characterId");
             return conversationCursorResult(characterId, store.getConversationCursor(characterId));
+        });
+    }
+
+    @PluginMethod
+    public void inspectAppRecoveryState(PluginCall call) {
+        execute(call, () -> {
+            JSONObject census = store.inspectAppRecoveryState();
+            File database = applicationContext.getDatabasePath("al-execution.db");
+            File wal = new File(database.getPath() + "-wal");
+            File shm = new File(database.getPath() + "-shm");
+            return new JSObject(census.toString())
+                .put("databaseBytes", database.isFile() ? database.length() : 0L)
+                .put("walBytes", wal.isFile() ? wal.length() : 0L)
+                .put("shmBytes", shm.isFile() ? shm.length() : 0L);
+        });
+    }
+
+    @PluginMethod
+    public void readAppRecoveryRoleCandidate(PluginCall call) {
+        execute(call, () -> new JSObject(
+            store.readAppRecoveryRoleCandidate(required(call, "characterId")).toString()
+        ));
+    }
+
+    @PluginMethod
+    public void readAppRecoveryMessages(PluginCall call) {
+        execute(call, () -> {
+            String characterId = required(call, "characterId");
+            Long afterSentAt = call.getLong("afterSentAt", 0L);
+            String afterMessageId = optional(call, "afterMessageId", "");
+            Integer limit = call.getInt("limit", 100);
+            return new JSObject(store.readAppRecoveryMessages(
+                characterId,
+                afterSentAt == null ? 0L : afterSentAt,
+                afterMessageId,
+                limit == null ? 100 : limit
+            ).toString());
         });
     }
 

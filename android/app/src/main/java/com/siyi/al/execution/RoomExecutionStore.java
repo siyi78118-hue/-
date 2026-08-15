@@ -7,6 +7,7 @@ import com.siyi.al.execution.db.AutomaticScheduleAuthorityEntity;
 import com.siyi.al.execution.db.AutomaticScheduleEventEntity;
 import com.siyi.al.execution.db.AutomaticScheduleOutboxEntity;
 import com.siyi.al.execution.db.ChangeEventEntity;
+import com.siyi.al.execution.db.CharacterSnapshotEntity;
 import com.siyi.al.execution.db.ChatTurnEntity;
 import com.siyi.al.execution.db.ConversationAuthorityEntity;
 import com.siyi.al.execution.db.ConversationCursorEntity;
@@ -2433,6 +2434,130 @@ public final class RoomExecutionStore implements ExecutionStore, ExecutionEngine
     @Override
     public ConversationCursorEntity getConversationCursor(String characterId) {
         return dao.conversationCursor(requireCharacterId(characterId));
+    }
+
+    /**
+     * Returns metadata-only evidence about recoverable Android Room state.
+     * This method deliberately never returns prompts or message bodies.
+     */
+    public JSONObject inspectAppRecoveryState() {
+        AtomicReference<JSONObject> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            try {
+                JSONArray roles = new JSONArray();
+                for (String characterId : dao.appRecoveryCharacterIds()) {
+                    CharacterSnapshotEntity snapshot = dao.latestRecoverySnapshot(characterId);
+                    roles.put(new JSONObject()
+                        .put("characterId", characterId)
+                        .put("displayName", snapshot == null || snapshot.characterName.isEmpty()
+                            ? characterId : snapshot.characterName)
+                        .put("latestSnapshotAt", snapshot == null ? 0L : snapshot.createdAt)
+                        .put("turnCount", dao.appRecoveryTurnCount(characterId))
+                        .put("rawMessageCount", dao.appRecoveryRawMessageCount(characterId))
+                        .put("replyPartCount", dao.appRecoveryReplyPartCount(characterId))
+                        .put("memoryCount", dao.appRecoveryMemoryCount(characterId))
+                        .put("rolePlanCount", dao.appRecoveryRolePlanCount(characterId))
+                        .put("candidateAvailable", snapshot != null));
+                }
+                result.set(new JSONObject()
+                    .put("contract", "android-app-recovery-census-v1")
+                    .put("roleCount", roles.length())
+                    .put("roles", roles));
+            } catch (Exception error) {
+                throw new IllegalStateException("Android app recovery census conflict", error);
+            }
+        });
+        return result.get();
+    }
+
+    /** Returns one explicit role candidate, including prompt fields, without writing Room. */
+    public JSONObject readAppRecoveryRoleCandidate(String characterId) {
+        String safeCharacterId = requireCharacterId(characterId);
+        AtomicReference<JSONObject> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            if (!dao.roleDeleteControlsForCharacter(safeCharacterId).isEmpty()) {
+                throw new IllegalStateException("Android app recovery role is deleted");
+            }
+            CharacterSnapshotEntity snapshot = dao.latestRecoverySnapshot(safeCharacterId);
+            if (snapshot == null) {
+                throw new IllegalStateException("Android app recovery role candidate is unavailable");
+            }
+            try {
+                JSONObject basis = new JSONObject()
+                    .put("characterId", safeCharacterId)
+                    .put("name", snapshot.characterName)
+                    .put("playerName", snapshot.playerName)
+                    .put("systemPrompt", snapshot.systemPrompt)
+                    .put("createdAt", snapshot.createdAt)
+                    .put("sourceSnapshotId", snapshot.snapshotId);
+                result.set(new JSONObject(basis.toString())
+                    .put("sourceChecksum", BridgeAuthority.sha256CanonicalJson(basis)));
+            } catch (Exception error) {
+                throw new IllegalStateException("Android app recovery role projection conflict", error);
+            }
+        });
+        return result.get();
+    }
+
+    /** Returns a checksum-verified, stable page of raw messages for explicit recovery only. */
+    public JSONObject readAppRecoveryMessages(
+        String characterId, long afterSentAt, String afterMessageId, int limit
+    ) {
+        String safeCharacterId = requireCharacterId(characterId);
+        if (afterSentAt < 0L || afterSentAt > LifecycleControlSender.MAX_SAFE_INTEGER) {
+            throw new IllegalArgumentException("Android app recovery cursor is invalid");
+        }
+        String safeAfterMessageId = afterMessageId == null ? "" : afterMessageId;
+        int safeLimit = Math.max(1, Math.min(limit, 200));
+        AtomicReference<JSONObject> result = new AtomicReference<>();
+        database.runInTransaction(() -> {
+            if (!dao.roleDeleteControlsForCharacter(safeCharacterId).isEmpty()) {
+                throw new IllegalStateException("Android app recovery role is deleted");
+            }
+            List<RawMessageEntity> rows = dao.appRecoveryRawMessages(
+                safeCharacterId, afterSentAt, safeAfterMessageId, safeLimit + 1);
+            boolean done = rows.size() <= safeLimit;
+            int visibleCount = Math.min(rows.size(), safeLimit);
+            JSONArray messages = new JSONArray();
+            long nextAfterSentAt = afterSentAt;
+            String nextAfterMessageId = safeAfterMessageId;
+            try {
+                for (int index = 0; index < visibleCount; index += 1) {
+                    RawMessageEntity row = rows.get(index);
+                    String checksum = canonicalRawMessageChecksum(row);
+                    if (!checksum.equals(row.checksum)) {
+                        throw new IllegalStateException("Android app recovery message checksum conflict");
+                    }
+                    messages.put(new JSONObject()
+                        .put("messageId", row.messageId)
+                        .put("turnId", row.turnId)
+                        .put("characterId", row.characterId)
+                        .put("speakerId", row.speakerId)
+                        .put("speakerType", row.speakerType)
+                        .put("recipientId", row.recipientId)
+                        .put("content", row.content)
+                        .put("sentAt", row.sentAt)
+                        .put("origin", row.origin)
+                        .put("deviceId", row.deviceId)
+                        .put("deviceSeq", row.deviceSeq)
+                        .put("sourceChecksum", checksum));
+                    nextAfterSentAt = row.sentAt;
+                    nextAfterMessageId = row.messageId;
+                }
+                result.set(new JSONObject()
+                    .put("contract", "android-app-recovery-message-page-v1")
+                    .put("characterId", safeCharacterId)
+                    .put("messages", messages)
+                    .put("nextAfterSentAt", nextAfterSentAt)
+                    .put("nextAfterMessageId", nextAfterMessageId)
+                    .put("done", done));
+            } catch (RuntimeException error) {
+                throw error;
+            } catch (Exception error) {
+                throw new IllegalStateException("Android app recovery message projection conflict", error);
+            }
+        });
+        return result.get();
     }
 
     public JSONObject androidRoomBackupHead(String characterId, long capturedAt) {

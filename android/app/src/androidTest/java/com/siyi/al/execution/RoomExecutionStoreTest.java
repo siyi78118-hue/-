@@ -5200,6 +5200,83 @@ public class RoomExecutionStoreTest {
         assertEquals(null, database.executionDao().latestSnapshot("char-1:moment"));
     }
 
+    @Test
+    public void appRecoveryCensusIsReadOnlyExcludesDeletedRolesAndPagesMessages() throws Exception {
+        CharacterSnapshotEntity retained = new CharacterSnapshotEntity();
+        retained.snapshotId = "snapshot-yuqi-recovery";
+        retained.characterId = "yuqi";
+        retained.characterName = "虞栖";
+        retained.playerName = "青衫困";
+        retained.systemPrompt = "private role prompt";
+        retained.momentSystemPrompt = "";
+        retained.contextJson = "{}";
+        retained.chatConfigId = "chat-v1";
+        retained.memoryConfigId = "memory-v1";
+        retained.createdAt = 100L;
+        database.executionDao().upsertSnapshot(retained);
+
+        CharacterSnapshotEntity deleted = new CharacterSnapshotEntity();
+        deleted.snapshotId = "snapshot-deleted-recovery";
+        deleted.characterId = "deleted-role";
+        deleted.characterName = "已删除";
+        deleted.playerName = "青衫困";
+        deleted.systemPrompt = "must not return";
+        deleted.momentSystemPrompt = "";
+        deleted.contextJson = "{}";
+        deleted.chatConfigId = "chat-v1";
+        deleted.memoryConfigId = "memory-v1";
+        deleted.createdAt = 90L;
+        database.executionDao().upsertSnapshot(deleted);
+
+        RawMessageEntity first = foreignRawMessage(
+            "recovery-message-1", "recovery-turn", "device_gateway", 101L, 200L);
+        first.content = "secret chat text one";
+        first.checksum = RoomExecutionStore.canonicalRawMessageChecksum(first);
+        database.executionDao().insertRawMessage(first);
+        RawMessageEntity second = foreignRawMessage(
+            "recovery-message-2", "recovery-turn", "device_gateway", 102L, 200L);
+        second.content = "secret chat text two";
+        second.checksum = RoomExecutionStore.canonicalRawMessageChecksum(second);
+        database.executionDao().insertRawMessage(second);
+        insertRoleDeleteTombstone("deleted-role", 300L);
+
+        long snapshotsBefore = rowCount("character_snapshots");
+        long messagesBefore = rowCount("yuqi_raw_messages");
+        long controlsBefore = rowCount("lifecycle_controls");
+
+        JSONObject census = store.inspectAppRecoveryState();
+
+        assertEquals(1, census.getInt("roleCount"));
+        assertEquals("yuqi", census.getJSONArray("roles").getJSONObject(0).getString("characterId"));
+        assertEquals("虞栖", census.getJSONArray("roles").getJSONObject(0).getString("displayName"));
+        assertFalse(census.toString().contains("private role prompt"));
+        assertFalse(census.toString().contains("secret chat text"));
+
+        JSONObject candidate = store.readAppRecoveryRoleCandidate("yuqi");
+        assertEquals("yuqi", candidate.getString("characterId"));
+        assertEquals("虞栖", candidate.getString("name"));
+        assertEquals("private role prompt", candidate.getString("systemPrompt"));
+        assertTrue(candidate.getString("sourceChecksum").matches("[0-9a-f]{64}"));
+        assertThrows(IllegalStateException.class,
+            () -> store.readAppRecoveryRoleCandidate("deleted-role"));
+
+        JSONObject firstPage = store.readAppRecoveryMessages("yuqi", 0L, "", 1);
+        assertEquals(1, firstPage.getJSONArray("messages").length());
+        assertEquals("recovery-message-1",
+            firstPage.getJSONArray("messages").getJSONObject(0).getString("messageId"));
+        assertFalse(firstPage.getBoolean("done"));
+        JSONObject secondPage = store.readAppRecoveryMessages(
+            "yuqi", firstPage.getLong("nextAfterSentAt"),
+            firstPage.getString("nextAfterMessageId"), 1);
+        assertEquals("recovery-message-2",
+            secondPage.getJSONArray("messages").getJSONObject(0).getString("messageId"));
+        assertTrue(secondPage.getBoolean("done"));
+
+        assertEquals(snapshotsBefore, rowCount("character_snapshots"));
+        assertEquals(messagesBefore, rowCount("yuqi_raw_messages"));
+        assertEquals(controlsBefore, rowCount("lifecycle_controls"));
+    }
+
     private void prepareChatDone(String turnId, String attemptId) {
         store.markStage(turnId, attemptId, TurnState.MEMORY_RUNNING, AttemptStage.MEMORY, 3L);
         store.saveMemoryResult(turnId, attemptId, "无相关记忆", 3L);
