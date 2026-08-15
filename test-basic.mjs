@@ -679,7 +679,8 @@ assert.match(script, /\[语音消息 \$\{actualDuration\}秒，未转文字\]/);
 assert.match(swScript, /promptBlocks: prompt\.promptBlocks/);
 assert.match(script, /红包 24 小时未领取，已自动退回零钱/);
 assert.match(html, /id="screen-diagnostics"/);
-assert.match(html, /查看最近调用/);
+assert.match(html, /查看完整运行信息/);
+assert.match(html, /运行诊断/);
 assert.match(script, /function renderDiagnosticsScreen\(\)/);
 assert.match(html, /导出本机数据/);
 assert.match(html, /含 API Key、聊天、朋友圈和记忆库/);
@@ -2736,33 +2737,87 @@ assert.equal(proactiveConsumptionSingleFlightProbe.callsWhileBlocked, 1, '并发
 assert.equal(proactiveConsumptionSingleFlightProbe.calls, 1, '同一个jobId在同一轮唤醒中只能提交一次');
 assert.equal(proactiveConsumptionSingleFlightProbe.replacementSchedules, 0, '原生任务处理中不得被前台补排覆盖成新的随机时间');
 assert.ok(proactiveConsumptionSingleFlightProbe.processingAt > 0, '到期任务交给原生执行后必须持久标记为处理中');
+const cloudTimerStatusSummaryProbe = vm.runInContext(`(() => {
+  const savedWindow = globalThis.window;
+  const savedSettings = settings;
+  const savedCharacters = characters;
+  const savedChats = allChats;
+  const savedStatuses = [...nativeAutomaticScheduleStatuses.entries()];
+  try {
+    globalThis.window = globalThis;
+    globalThis.window.Capacitor = { isNativePlatform: () => true, Plugins: {} };
+    settings = {
+      ...settings,
+      proactiveEnabled: true,
+      cloudTimerEnabled: true,
+      pushSubscription: { endpoint: 'https://push.example' },
+      cloudTimerLastChatStatus: '<!doctype html><html>七月遗留错误</html>',
+      cloudTimerLastChatStatusAt: 1753228800000,
+      cloudTimerLastChatTrace: 'chat_old｜旧私聊链路',
+      cloudTimerLastChatTraceAt: 1753228800000,
+      cloudTimerWorkerStatus: '旧 Worker 技术状态',
+      cloudTimerWorkerStatusAt: 1753228800000,
+      lastChatApiHealthStatus: '旧聊天接口检测',
+      lastChatApiHealthAt: 1753228800000
+    };
+    characters = [{ id: 'status-role', name: '虞栖' }];
+    allChats = {
+      'status-role': {
+        messages: [{ id: 'status-message', role: 'user', content: '状态应该简洁', time: 1786757400000 }],
+        lastProactiveChatFailedAt: 1753228800000,
+        lastProactiveChatError: '<!doctype html><html>旧失败</html>'
+      }
+    };
+    nativeAutomaticScheduleStatuses.clear();
+    nativeAutomaticScheduleStatuses.set('status-role:chat', {
+      characterId: 'status-role', kind: 'chat', owner: 'android-v1', epochFingerprint: 'epoch1234',
+      generation: 8, state: 'scheduled', jobId: 'chat_current_8', dueAt: 1786762800000,
+      cloudSyncState: 'synced', lastChangeSource: 'proactive_terminal', lastChangedAt: 1786758000000
+    });
+    nativeAutomaticScheduleStatuses.set('status-role:moment', {
+      characterId: 'status-role', kind: 'moment', owner: 'android-v1', epochFingerprint: 'epoch1234',
+      generation: 9, state: 'scheduled', jobId: 'moment_current_9', dueAt: 1786766400000,
+      cloudSyncState: 'pending', lastChangeSource: 'migration_claim', lastChangedAt: 1786758060000
+    });
+    const summary = cloudTimerStatusText();
+    const diagnostic = typeof cloudTimerDiagnosticText === 'function' ? cloudTimerDiagnosticText() : '';
+    return { summary, diagnostic, lineCount: summary.split('\\n').filter(Boolean).length };
+  } finally {
+    settings = savedSettings;
+    characters = savedCharacters;
+    allChats = savedChats;
+    nativeAutomaticScheduleStatuses.clear();
+    for (const [key, value] of savedStatuses) nativeAutomaticScheduleStatuses.set(key, value);
+    globalThis.window = savedWindow;
+  }
+})()`, context);
+assert.ok(cloudTimerStatusSummaryProbe.lineCount <= 4, '设置页状态摘要最多四行');
+assert.match(cloudTimerStatusSummaryProbe.summary, /运行状态：正在同步/);
+assert.match(cloudTimerStatusSummaryProbe.summary, /下次私聊（虞栖）：/);
+assert.match(cloudTimerStatusSummaryProbe.summary, /下次朋友圈（虞栖）：/);
+assert.match(cloudTimerStatusSummaryProbe.summary, /同步：朋友圈等待云端/);
+assert.doesNotMatch(cloudTimerStatusSummaryProbe.summary, /任务代数|chat_current_8|私聊上次失败|<!doctype|最近调用|云闹钟版本|聊天接口检测/);
+assert.match(cloudTimerStatusSummaryProbe.diagnostic, /私聊任务代数：epoch1234\/8｜chat_current_8/);
+assert.match(cloudTimerStatusSummaryProbe.diagnostic, /<!doctype html>/);
+assert.match(cloudTimerStatusSummaryProbe.diagnostic, /云闹钟版本/);
 const cloudTimerStatusRenderRaceProbe = await vm.runInContext(`(async () => {
   const savedStatusText = cloudTimerStatusText;
   const savedLogs = getAllModelCallLogs;
-  const savedFormat = formatModelCallStatus;
   const savedGetElement = document.getElementById;
   const statusElement = { textContent: '' };
-  const pending = [];
-  let snapshot = '旧闹钟状态';
+  let logReads = 0;
   document.getElementById = id => id === 'cloud-timer-status' ? statusElement : savedGetElement.call(document, id);
-  cloudTimerStatusText = () => snapshot;
-  getAllModelCallLogs = () => new Promise(resolve => pending.push(resolve));
-  formatModelCallStatus = row => row?.label || '';
-  const oldRender = renderCloudTimerStatus();
-  snapshot = '最新闹钟状态';
-  const latestRender = renderCloudTimerStatus();
-  pending[1]([{ label: '最新调用' }]);
-  await latestRender;
-  pending[0]([{ label: '旧调用' }]);
-  await oldRender;
-  const result = statusElement.textContent;
+  cloudTimerStatusText = () => '最新闹钟摘要';
+  getAllModelCallLogs = async () => { logReads += 1; return [{ label: '不应读取的调用' }]; };
+  await renderCloudTimerStatus();
+  const result = { text: statusElement.textContent, logReads };
   cloudTimerStatusText = savedStatusText;
   getAllModelCallLogs = savedLogs;
-  formatModelCallStatus = savedFormat;
   document.getElementById = savedGetElement;
   return result;
 })()`, context);
-assert.equal(cloudTimerStatusRenderRaceProbe, '最新闹钟状态\n最新调用', '较晚完成的旧状态渲染不得覆盖最新闹钟状态');
+assert.equal(cloudTimerStatusRenderRaceProbe.text, '最新闹钟摘要');
+assert.equal(cloudTimerStatusRenderRaceProbe.logReads, 0, '设置页状态摘要不得再混入模型调用记录');
 const diceScheduleProbe = await vm.runInContext(`(async () => {
   const savedSettings = settings;
   const savedChats = allChats;

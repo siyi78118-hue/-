@@ -840,7 +840,7 @@ button.cell:active{background:#ececec}
           <div class="cell"><div class="cell-label">状态</div><div class="cell-body"><div class="hint" id="cloud-timer-status" style="padding:0;white-space:pre-line">云闹钟未检查。</div></div></div>
           <button class="cell" id="native-notification-status-row" onclick="checkNativeNotificationStatus({ toastResult: true })" type="button" style="display:none"><div class="cell-label">通知</div><div class="cell-body" id="native-notification-status">检查消息提醒</div><div class="mini">›</div></button>
           <button class="cell" id="native-notification-settings-row" onclick="openNativeNotificationSettings()" type="button" style="display:none"><div class="cell-label">系统</div><div class="cell-body">打开 AL 通知设置</div><div class="mini">›</div></button>
-          <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看最近调用</div><div class="mini">›</div></button>
+          <button class="cell" onclick="showScreen('diagnostics')" type="button"><div class="cell-label">诊断</div><div class="cell-body">查看完整运行信息</div><div class="mini">›</div></button>
           <button class="cell" onclick="checkForAppUpdate()" type="button"><div class="cell-label">版本</div><div class="cell-body">检查更新<span class="cell-note" id="app-version-note">正在读取当前版本</span></div><div class="mini">›</div></button>
         </div>
         <div class="cell-group">
@@ -925,7 +925,7 @@ button.cell:active{background:#ececec}
   <div id="screen-diagnostics" class="screen">
     <div class="topbar">
       <div class="top-left"><button class="icon-btn back-btn" onclick="showScreen('settings')">‹</button></div>
-      <div class="top-title">调用诊断</div>
+      <div class="top-title">运行诊断</div>
       <div class="top-right"><button class="top-text-btn" onclick="copyModelCallDiagnostics()" type="button">复制</button></div>
     </div>
     <div class="scroll">
@@ -6318,7 +6318,8 @@ function formatNativeDiagnosticRow(row = {}) {
 async function renderDiagnosticsScreen() {
   const list = document.getElementById('diagnostic-list');
   if (!list) return;
-  list.innerHTML = '<div class="empty">正在读取最近调用...</div>';
+  list.innerHTML = '<div class="empty">正在读取运行诊断...</div>';
+  const schedulerText = cloudTimerDiagnosticText();
   const logs = (await getAllModelCallLogs()).slice(0, 8);
   const plugin = nativeExecutionPlugin();
   const nativePage = plugin?.nativeDiagnostics
@@ -6329,10 +6330,16 @@ async function renderDiagnosticsScreen() {
     : { diagnostics: [] };
   const nativeRows = Array.isArray(nativePage?.diagnostics) ? nativePage.diagnostics : [];
   const deliveryStages = Array.isArray(nativePage?.deliveryStages) ? nativePage.deliveryStages : [];
-  if (!logs.length && !nativeRows.length && !deliveryStages.length) {
-    list.innerHTML = '<div class="empty">还没有模型调用记录</div>';
-    return;
-  }
+  const schedulerHtml = `<div class="diagnostic-item">
+    <div class="diagnostic-head">
+      <div>
+        <div class="diagnostic-title">主动消息调度</div>
+        <div class="diagnostic-meta">完整技术状态与历史记录</div>
+      </div>
+      <span class="diagnostic-state">已记录</span>
+    </div>
+    <div class="diagnostic-pre">${esc(schedulerText)}</div>
+  </div>`;
   const deliveryHtml = deliveryStages.length ? `<div class="diagnostic-item">
     <div class="diagnostic-head">
       <div>
@@ -6364,7 +6371,7 @@ async function renderDiagnosticsScreen() {
       return formatNativeDiagnosticRow(row);
     }).map(esc).join('\n')}</div>
   </div>` : '';
-  list.innerHTML = deliveryHtml + nativeHtml + logs.map((log, index) => {
+  const modelHtml = logs.length ? logs.map((log, index) => {
     const state = diagnosticState(log);
     const note = log.error || log.diagnostic || '';
     const metaParts = [
@@ -6389,12 +6396,14 @@ async function renderDiagnosticsScreen() {
       ${log.outputPreview ? `<details class="diagnostic-section"><summary>输出预览</summary><div class="diagnostic-pre">${esc(log.outputPreview)}</div></details>` : ''}
       ${log.systemPreview ? `<details class="diagnostic-section"><summary>系统提示预览</summary><div class="diagnostic-pre">${esc(log.systemPreview)}</div></details>` : ''}
     </div>`;
-  }).join('');
+  }).join('') : '<div class="empty">还没有模型调用记录</div>';
+  list.innerHTML = schedulerHtml + deliveryHtml + nativeHtml + modelHtml;
 }
 async function copyModelCallDiagnostics() {
   const logs = (await getAllModelCallLogs()).slice(0, 5);
-  if (!logs.length) { toast('还没有模型调用记录'); return; }
-  const text = logs.map(formatModelCallDiagnostic).join('\n\n---\n\n');
+  const schedulerText = cloudTimerDiagnosticText();
+  const modelText = logs.map(formatModelCallDiagnostic).join('\n\n---\n\n');
+  const text = [`主动消息调度\n${schedulerText}`, modelText].filter(Boolean).join('\n\n---\n\n');
   try {
     await navigator.clipboard.writeText(text);
   } catch {
@@ -6407,7 +6416,7 @@ async function copyModelCallDiagnostics() {
     document.execCommand('copy');
     area.remove();
   }
-  toast('已复制最近调用诊断');
+  toast('已复制运行诊断');
 }
 function clearModelCallLogs() {
   localStorage.removeItem('rpchat_call_logs');
@@ -10558,6 +10567,66 @@ function timerUrl(path) {
   return settings.timerEndpoint.replace(/\/+$/, '') + path;
 }
 function cloudTimerStatusText() {
+  const chatRows = getLatestChatRows();
+  const schedules = [];
+  if (isNativeApp()) {
+    const active = [...nativeAutomaticScheduleStatuses.values()]
+      .filter(status => (status.state === 'scheduled' || status.state === 'claimed') && Number(status.dueAt) > 0);
+    for (const kind of PROACTIVE_JOB_KINDS) {
+      const status = active.filter(item => item.kind === kind)
+        .sort((a, b) => Number(a.dueAt) - Number(b.dueAt))[0];
+      if (!status) continue;
+      schedules.push({
+        kind,
+        dueAt: Number(status.dueAt),
+        characterName: characters.find(item => item.id === status.characterId)?.name || status.characterId,
+        cloudSyncState: status.cloudSyncState || 'pending'
+      });
+    }
+  } else {
+    for (const kind of PROACTIVE_JOB_KINDS) {
+      const row = chatRows
+        .map(item => ({ char: item.char, job: item.chat?.[proactiveJobKey(kind)] }))
+        .filter(item => item.job?.dueAt)
+        .sort((a, b) => Date.parse(a.job.dueAt) - Date.parse(b.job.dueAt))[0];
+      if (!row) continue;
+      schedules.push({
+        kind,
+        dueAt: Date.parse(row.job.dueAt),
+        characterName: row.char.name,
+        cloudSyncState: row.job.cloudSyncState || (row.job.cloudJobId ? 'synced' : 'pending')
+      });
+    }
+  }
+
+  const pending = schedules.filter(item => item.cloudSyncState !== 'synced');
+  const rows = [];
+  const health = !settings.proactiveEnabled ? '主动消息未开启'
+    : !settings.cloudTimerEnabled ? '云闹钟未开启'
+      : !settings.pushSubscription ? '尚未绑定本机推送'
+        : pending.some(item => item.cloudSyncState === 'failed') ? '同步异常'
+          : pending.length ? '正在同步'
+            : '运行正常';
+  rows.push(`运行状态：${health}`);
+  for (const kind of PROACTIVE_JOB_KINDS) {
+    const schedule = schedules.find(item => item.kind === kind);
+    const label = kind === 'moment' ? '下次朋友圈' : '下次私聊';
+    rows.push(schedule
+      ? `${label}（${schedule.characterName}）：${formatFullTime(new Date(schedule.dueAt))}`
+      : `${label}：尚未安排`);
+  }
+  if (pending.length) {
+    const syncText = pending.map(item => {
+      const label = item.kind === 'moment' ? '朋友圈' : '私聊';
+      if (item.cloudSyncState === 'failed') return `${label}同步失败`;
+      if (item.cloudSyncState === 'syncing') return `${label}正在同步`;
+      return `${label}等待云端`;
+    }).join('｜');
+    rows.push(`同步：${syncText}`);
+  }
+  return rows.slice(0, 4).join('\n');
+}
+function cloudTimerDiagnosticText() {
   const rows = [];
   if (!settings.proactiveEnabled) rows.push('主动消息未开启。');
   else if (!settings.cloudTimerEnabled) rows.push('云闹钟未开启。');
@@ -10635,15 +10704,7 @@ async function renderCloudTimerStatus() {
   const el = document.getElementById('cloud-timer-status');
   if (!el) return;
   const revision = ++cloudTimerStatusRenderRevision;
-  const base = cloudTimerStatusText();
-  let content = base;
-  try {
-    const latestCall = (await getAllModelCallLogs())[0];
-    const callLine = formatModelCallStatus(latestCall);
-    if (callLine) content = `${base}\n${callLine}`;
-  } catch (err) {
-    console.warn('[AL CallLog] status render skipped:', err.message);
-  }
+  const content = cloudTimerStatusText();
   if (revision !== cloudTimerStatusRenderRevision) return;
   if (el.textContent !== content) el.textContent = content;
 }
